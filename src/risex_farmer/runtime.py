@@ -108,9 +108,29 @@ def _route_row(
     hedge_quote = observations.get((plan.hedge_venue, plan.hedge_market.venue_symbol))
     risex_source = None if risex_quote is None or risex_quote.funding is None else risex_quote.funding.source
     hedge_source = None if hedge_quote is None or hedge_quote.funding is None else hedge_quote.funding.source
-    marker = lambda source: (
-        "UNKNOWN" if source is None else
-        "PAPER_ASSUMPTION" if source.startswith("PAPER_ASSUMPTION") else "OFFICIAL"
+
+    def marker(observation: MarketObservation | None, source: str | None) -> str:
+        if (
+            observation is None
+            or observation.funding is None
+            or observation.funding.quality is FundingQuality.UNKNOWN
+        ):
+            return "UNKNOWN"
+        return (
+            "PAPER_ASSUMPTION"
+            if (source or "").startswith("PAPER_ASSUMPTION")
+            else "OFFICIAL"
+        )
+
+    contract_assumption = plan.risex_market.contract_type is ContractType.LINEAR
+    eligibility_assumption = bool(
+        risex_quote is not None and risex_quote.funding is not None
+        and risex_quote.funding.quality is not FundingQuality.UNKNOWN
+        and risex_quote.funding.eligibility_known
+    )
+    estimate_assumption = bool(
+        risex_quote is not None and risex_quote.funding is not None
+        and risex_quote.funding.quality is FundingQuality.ESTIMATED
     )
     risex_funding = None if plan.target_cycle is None else plan.target_cycle.risex_event.expected_cash_usd
     hedge_funding = None if plan.target_cycle is None else plan.target_cycle.hedge_event.expected_cash_usd
@@ -121,6 +141,10 @@ def _route_row(
         "hedge_venue": plan.hedge_venue.value,
         "direction": plan.direction.value,
         "entry_allowed": plan.entry_allowed,
+        "risex_contract_assumption_used": contract_assumption,
+        "risex_funding_eligibility_assumption_used": eligibility_assumption,
+        "risex_funding_estimate_assumption_used": estimate_assumption,
+        "paper_assumption_used": contract_assumption or eligibility_assumption or estimate_assumption,
         "blockers": list(plan.no_trade_reasons),
         "route_liquidity_usd": (
             None if plan.route is None else str(plan.route.route_liquidity_usd)
@@ -174,8 +198,8 @@ def _route_row(
             else str(plan.executable_unwind_net_pnl_usd)
         ),
         "source_quality": {
-            "risex_funding": {"source": risex_source, "marker": marker(risex_source)},
-            "hedge_funding": {"source": hedge_source, "marker": marker(hedge_source)},
+            "risex_funding": {"source": risex_source, "marker": marker(risex_quote, risex_source)},
+            "hedge_funding": {"source": hedge_source, "marker": marker(hedge_quote, hedge_source)},
             "risex_contract": "PAPER_ASSUMPTION" if plan.risex_market.contract_type is ContractType.LINEAR else "UNKNOWN",
         },
         "assumption_flags": _assumption_flags(),
@@ -222,7 +246,6 @@ class PublicPaperRuntime:
         self._last_readiness_evidence_at: dict[Venue, datetime] = {}
         self._extended_trade_sequences: dict[str, int] = {}
         self.next_health_check_at: datetime | None = None
-        self._last_risex_history_at: datetime | None = None
 
     async def __aenter__(self) -> PublicPaperRuntime:
         if self.adapters is None:
@@ -374,10 +397,19 @@ class PublicPaperRuntime:
         key = (market.venue, market.venue_symbol)
         volume = self.volumes.get(key)
         try:
-            book, funding = await asyncio.gather(
-                adapter.fetch_book(market.venue_symbol),
-                adapter.fetch_funding_quote(market, assumed_open_at=assumed_at),
-            )
+            if isinstance(adapter, RisexAdapter):
+                # The immutable contract becomes eligible only after both public
+                # book and recent-trade unit evidence are proven in this scan.
+                book = await adapter.fetch_book(market.venue_symbol)
+                market = await adapter.prime_recent_trade_evidence(market)
+                funding = await adapter.fetch_funding_quote(
+                    market, assumed_open_at=assumed_at
+                )
+            else:
+                book, funding = await asyncio.gather(
+                    adapter.fetch_book(market.venue_symbol),
+                    adapter.fetch_funding_quote(market, assumed_open_at=assumed_at),
+                )
             logical_at = self.clock.now()
             funding = _quote_for_open_time(funding, logical_at)
             stream = self.coordinator.stream(market.venue, market.venue_symbol)
@@ -476,6 +508,10 @@ class PublicPaperRuntime:
                             "canonical_asset": market.canonical_asset,
                             "hedge_venue": venue.value, "direction": direction.value,
                             "entry_allowed": False,
+                            "risex_contract_assumption_used": False,
+                            "risex_funding_eligibility_assumption_used": False,
+                            "risex_funding_estimate_assumption_used": False,
+                            "paper_assumption_used": False,
                             "blockers": [
                                 f"{missing.value}:{state.detail}"
                                 for missing, state in self.readiness.items() if not state.available
@@ -484,6 +520,7 @@ class PublicPaperRuntime:
                             "assumption_flags": _assumption_flags(),
                         })
             route_rows = tuple(unavailable_rows)
+        route_rows = route_rows[:15]
         self.repository.save_public_route_rows(logical_at=logical_at, rows=route_rows)
         unavailable = {
             venue.value: state.detail
@@ -622,15 +659,23 @@ class PublicPaperRuntime:
                 risex_adapter = None if self.adapters is None else self.adapters.get(Venue.RISEX)
                 position = self.lifecycle.snapshot.position
                 if isinstance(risex_adapter, RisexAdapter) and position is not None:
-                    since = self._last_risex_history_at or position.position_opened_at
+                    unresolved = [
+                        row.settlement_at for row in self.lifecycle.snapshot.settlements
+                        if row.venue is Venue.RISEX
+                        and row.status is not SettlementStatus.APPLIED_RATE
+                        and row.settlement_at >= position.position_opened_at
+                    ]
                     try:
-                        quotes = await risex_adapter.fetch_applied_funding_quotes(
-                            self.lifecycle.snapshot.risex_market, since=since,
-                            until=now, assumed_open_at=position.position_opened_at,
-                        )
+                        if not unresolved:
+                            quotes = ()
+                        else:
+                            since = max(position.position_opened_at, min(unresolved))
+                            quotes = await risex_adapter.fetch_applied_funding_quotes(
+                                self.lifecycle.snapshot.risex_market, since=since,
+                                until=now, assumed_open_at=position.position_opened_at,
+                            )
                         for quote in quotes:
                             await self._apply_funding_quote(quote)
-                        self._last_risex_history_at = now
                     except (aiohttp.ClientError, TimeoutError, ValueError, KeyError) as exc:
                         self._record(
                             "PUBLIC_FUNDING_HISTORY_UNAVAILABLE", at=now,
@@ -739,6 +784,27 @@ class PublicPaperRuntime:
                 return
         else:
             return
+        if self.broker is not None and self.broker.state.lifecycle_state is LifecycleState.ENTRY_MAKER_OPEN:
+            plan = active_order.route_plan
+            risex_observation = self.observations.get(
+                (Venue.RISEX, plan.risex_market.venue_symbol)
+            )
+            quote = None if risex_observation is None else risex_observation.funding
+            contract_used = plan.risex_market.contract_type is ContractType.LINEAR
+            eligibility_used = bool(
+                quote is not None and quote.quality is not FundingQuality.UNKNOWN
+                and quote.eligibility_known
+            )
+            estimate_used = bool(
+                quote is not None and quote.quality is FundingQuality.ESTIMATED
+            )
+            trade = replace(
+                trade,
+                risex_contract_assumption_used=contract_used,
+                risex_funding_eligibility_assumption_used=eligibility_used,
+                risex_funding_estimate_assumption_used=estimate_used,
+                paper_assumption_used=contract_used or eligibility_used or estimate_used,
+            )
         stream = self.coordinator.stream(trade.venue, trade.canonical_market)
         stream.connection_confirmed(at)
         if (

@@ -1046,6 +1046,10 @@ class PaperRepository:
                     "canonical_market": latest_trade.canonical_market,
                     "source_marker": latest_trade.source_marker,
                     "paper_assumptions": list(latest_trade.paper_assumptions),
+                    "risex_contract_assumption_used": latest_trade.risex_contract_assumption_used,
+                    "risex_funding_eligibility_assumption_used": latest_trade.risex_funding_eligibility_assumption_used,
+                    "risex_funding_estimate_assumption_used": latest_trade.risex_funding_estimate_assumption_used,
+                    "paper_assumption_used": latest_trade.paper_assumption_used,
                 }
             ),
             "last_runtime_event": (

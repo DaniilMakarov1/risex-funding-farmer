@@ -145,6 +145,39 @@ class RisexAdapter(PublicAdapter):
         data = require_mapping(payload.get("data", payload), "orderbook")
         return self.normalize_book(data, observed_at=datetime.now(UTC))
 
+    async def prime_recent_trade_evidence(
+        self, market: CanonicalMarket, *, limit: int = 20
+    ) -> CanonicalMarket:
+        """Prove public trade quantity units, then rebuild the immutable market."""
+        market_id = self._market_ids[market.venue_symbol]
+        payload = await self._get_json(
+            f"/v1/markets/id/{market_id}/trade-history",
+            params={"limit": str(limit)},
+        )
+        trades = require_list(
+            require_mapping(payload.get("data"), "data").get("trades"),
+            "data.trades",
+        )
+        if not trades:
+            self._trade_units_consistent.discard(market.venue_symbol)
+        all_valid = bool(trades)
+        for ordinal, raw in enumerate(trades, 1):
+            trade = require_mapping(raw, "trade history row")
+            self.normalize_trade(
+                {
+                    "market_id": market_id,
+                    "worker_timestamp": trade["time"],
+                    "data": trade,
+                },
+                received_at=datetime.now(UTC),
+                session_id="REST_TRADE_HISTORY",
+                ordinal=ordinal,
+            )
+            all_valid = all_valid and market.venue_symbol in self._trade_units_consistent
+        if not all_valid:
+            self._trade_units_consistent.discard(market.venue_symbol)
+        return self.normalize_market(self._raw_markets[market.venue_symbol])
+
     def normalize_book(self, data: Any, *, observed_at: datetime) -> OrderBook:
         data = require_mapping(data, "orderbook")
         market_id = str(data["market_id"])
@@ -164,10 +197,12 @@ class RisexAdapter(PublicAdapter):
         try:
             config = require_mapping(raw.get("config"), "market.config")
             step = decimal_value(config["step_size"], "step_size")
+            price_step = decimal_value(config["step_price"], "step_price")
             minimum = decimal_value(config["min_order_size"], "min_order_size")
             valid = bool(bids or asks) and all(
                 level.canonical_quantity >= minimum
                 and level.canonical_quantity / step == (level.canonical_quantity / step).to_integral_value()
+                and level.canonical_price / price_step == (level.canonical_price / price_step).to_integral_value()
                 for level in bids + asks
             )
         except (KeyError, TypeError, ValueError):
@@ -234,8 +269,13 @@ class RisexAdapter(PublicAdapter):
         try:
             config = require_mapping(raw.get("config"), "market.config")
             step = decimal_value(config["step_size"], "step_size")
+            price_step = decimal_value(config["step_price"], "step_price")
             minimum = decimal_value(config["min_order_size"], "min_order_size")
-            valid = quantity >= minimum and quantity / step == (quantity / step).to_integral_value()
+            valid = (
+                quantity >= minimum
+                and quantity / step == (quantity / step).to_integral_value()
+                and price / price_step == (price / price_step).to_integral_value()
+            )
         except (KeyError, TypeError, ValueError):
             valid = False
         (self._trade_units_consistent.add if valid else self._trade_units_consistent.discard)(market)

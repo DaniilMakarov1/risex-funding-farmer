@@ -1,11 +1,14 @@
 import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+import json
 from pathlib import Path
 
 import pytest
 
 from risex_farmer.exchanges.base import PublicAdapter, PublicDataUnavailable
+from risex_farmer.exchanges.risex import RisexAdapter
 from risex_farmer.models import (
     BookLevel,
     BookDelta,
@@ -59,6 +62,7 @@ class FakeAdapter(PublicAdapter):
         self.settlement_at = settlement_at
         self.available = available
         self.funding_cash = D(funding_cash)
+        self.funding_unknown = False
         self.calls: list[str] = []
         symbol = f"ABC-{venue.value}"
         self.market = CanonicalMarket(
@@ -79,7 +83,6 @@ class FakeAdapter(PublicAdapter):
             False,
             False,
         )
-
     def _ready(self, name: str) -> None:
         self.calls.append(name)
         if not self.available:
@@ -114,6 +117,10 @@ class FakeAdapter(PublicAdapter):
 
     async def fetch_funding_quote(self, market, *, assumed_open_at):
         self._ready("funding")
+        if self.funding_unknown:
+            return self.unknown_funding_quote(
+                market, observed_at=self.clock.now(), assumed_open_at=assumed_open_at
+            )
         return FundingCashQuote(
             self.venue,
             market.venue_symbol,
@@ -152,6 +159,84 @@ class FakeAdapter(PublicAdapter):
             "official-public-synthetic-shape",
         )
 
+
+class ManyFakeAdapter(FakeAdapter):
+    def __init__(self, venue: Venue, clock: FakeClock, *, settlement_at: datetime) -> None:
+        super().__init__(venue, clock, settlement_at=settlement_at)
+        self.many_markets = tuple(
+            replace(self.market, canonical_asset=f"A{index}", venue_symbol=f"A{index}-{venue.value}")
+            for index in range(5)
+        )
+
+    async def fetch_markets(self):
+        self._ready("markets")
+        return self.many_markets
+
+    async def fetch_volumes(self):
+        self._ready("volumes")
+        return tuple(
+            MarketVolume(self.venue, market.venue_symbol, D("1000000"), self.clock.now(), "official-shaped")
+            for market in self.many_markets
+        )
+
+
+class JsonResponse:
+    def __init__(self, payload):
+        self.payload = payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        return None
+
+    def raise_for_status(self):
+        return None
+
+    async def text(self):
+        return json.dumps(self.payload)
+
+
+class OfficialShapeRisexSession:
+    def __init__(self, settlement_at: datetime):
+        ns = str(int(settlement_at.timestamp() * 1_000_000_000))
+        self.market = {
+            "market_id": "7", "config": {"name": "ABC/USDC", "step_size": "1", "step_price": "1", "min_order_size": "1", "unlocked": True},
+            "base_asset_symbol": "ABC/USDC", "quote_asset_symbol": "USDC",
+            "underlying": "ABC/USDC", "display_name": "ABC/USDC",
+            "display_base_asset_symbol": "ABC/USDC", "active": True,
+            "quote_volume_24h": "1000000", "current_funding_rate": "0.05",
+            "mark_price": "100", "next_funding_time": ns,
+        }
+        self.book = {"market_id": "7", "bids": [{"price": "99", "quantity": "20"}], "asks": [{"price": "101", "quantity": "20"}]}
+        self.trades = [{"id": "recent", "price": "100", "size": "2", "time": ns, "maker_side": 0}]
+
+    def get(self, url: str, **_):
+        if url.endswith("/v1/markets"):
+            return JsonResponse({"data": {"markets": [self.market]}})
+        if url.endswith("/v1/orderbook"):
+            return JsonResponse({"data": self.book})
+        if "trade-history" in url:
+            return JsonResponse({"data": {"trades": self.trades}})
+        raise AssertionError(url)
+
+
+class DelayedAppliedRisexAdapter(RisexAdapter):
+    def __init__(self, settlement_at: datetime):
+        super().__init__(None)
+        self.settlement_at = settlement_at
+        self.calls: list[datetime] = []
+
+    async def fetch_applied_funding_quotes(self, market, *, since, until, assumed_open_at):
+        self.calls.append(since)
+        if len(self.calls) == 1:
+            return ()
+        return (FundingCashQuote(
+            Venue.RISEX, market.venue_symbol, until, assumed_open_at,
+            self.settlement_at, FundingQuality.APPLIED_RATE,
+            FundingAccrualMethod.SNAPSHOT_AT_SETTLEMENT, True,
+            D("-1"), D("1"), self.FUNDING_SOURCE,
+        ),)
 
 def adapters(clock: FakeClock, *, settlement_at: datetime, risex=True, funding="5"):
     return {
@@ -193,6 +278,37 @@ async def test_injected_ordinary_public_scan_builds_real_observations_and_diagno
 
 
 @pytest.mark.asyncio
+async def test_route_output_is_hard_limited_after_system_sort(tmp_path):
+    clock = FakeClock()
+    many = {
+        venue: ManyFakeAdapter(venue, clock, settlement_at=NOW + timedelta(minutes=5))
+        for venue in Venue
+    }
+    with PaperRepository(tmp_path / "route-limit.db") as repository:
+        result = await public_scan_once(repository, adapters=many, clock=clock)
+        persisted = repository.report(as_of=NOW)["latest_routes"]
+    assert len(result["routes"]) == 15
+    assert len(persisted) == 15
+
+
+@pytest.mark.asyncio
+async def test_same_scan_primes_official_shaped_risex_rest_evidence(tmp_path):
+    now = datetime.now(UTC)
+    clock = FakeClock(now)
+    target = now + timedelta(minutes=5)
+    fakes = adapters(clock, settlement_at=target)
+    fakes[Venue.RISEX] = RisexAdapter(OfficialShapeRisexSession(target))
+    with PaperRepository(tmp_path / "rest-prime.db") as repository:
+        result = await public_scan_once(repository, adapters=fakes)
+    assert result["routes"]
+    computed = [row for row in result["routes"] if row.get("canonical_quantity") is not None]
+    assert computed, result
+    assert computed[0]["risex_exact_q_entry_vwap_usd"] is not None
+    assert computed[0]["planned_maker_net_pnl_usd"] is not None
+    assert computed[0]["risex_contract_assumption_used"] is True
+
+
+@pytest.mark.asyncio
 async def test_venue_outage_is_specific_and_never_uses_empty_fail_closed_scan(tmp_path):
     clock = FakeClock()
     fakes = adapters(clock, settlement_at=NOW + timedelta(minutes=5), risex=False)
@@ -204,6 +320,17 @@ async def test_venue_outage_is_specific_and_never_uses_empty_fail_closed_scan(tm
     assert any("RISEX:PUBLIC_REST_UNAVAILABLE" in blocker for blocker in result["routes"][0]["blockers"])
     assert result["venue_readiness"]["RISEX"]["detail"].startswith("PUBLIC_REST_UNAVAILABLE")
     assert all("fail_closed_scan" not in call for fake in fakes.values() for call in fake.calls)
+
+
+@pytest.mark.asyncio
+async def test_unknown_official_risex_source_is_marked_unknown(tmp_path):
+    clock = FakeClock()
+    fakes = adapters(clock, settlement_at=NOW + timedelta(minutes=5))
+    fakes[Venue.RISEX].funding_unknown = True
+    with PaperRepository(tmp_path / "unknown-source.db") as repository:
+        result = await public_scan_once(repository, adapters=fakes, clock=clock)
+    assert result["routes"]
+    assert result["routes"][0]["source_quality"]["risex_funding"]["marker"] == "UNKNOWN"
 
 
 def test_runtime_has_no_private_auth_real_order_or_llm_surface() -> None:
@@ -362,7 +489,12 @@ async def test_healthy_public_trade_reaches_broker_and_deduplicates(tmp_path):
             assert runtime.lifecycle.snapshot.position is not None
             await runtime.deliver_trade(trade)
             count = repository.connection.execute("SELECT COUNT(*) FROM processed_trade_events").fetchone()[0]
+            evidence = repository.report(as_of=clock.now())["latest_trade_evidence"]
     assert count == 1
+    assert evidence["risex_contract_assumption_used"] is True
+    assert evidence["risex_funding_eligibility_assumption_used"] is True
+    assert evidence["risex_funding_estimate_assumption_used"] is True
+    assert evidence["paper_assumption_used"] is True
 
 
 @pytest.mark.asyncio
@@ -475,6 +607,33 @@ async def test_official_applied_settlement_replaces_estimate_and_report_has_assu
         "risex_assumed_funding_is_not_official_applied_funding",
     ):
         assert report["assumption_flags"][flag] is True
+
+
+@pytest.mark.asyncio
+async def test_delayed_risex_applied_history_keeps_unresolved_since_boundary(tmp_path):
+    clock = FakeClock()
+    target = NOW + timedelta(seconds=120)
+    with PaperRepository(tmp_path / "delayed-applied.db") as repository:
+        async with PublicPaperRuntime(
+            repository, adapters=adapters(clock, settlement_at=target), clock=clock,
+        ) as runtime:
+            await runtime.tick()
+            clock.advance(1)
+            order = runtime.broker.state.order
+            runtime.mark_trade_stream_connected(order.venue, order.canonical_market)
+            await runtime.deliver_trade(maker_trade(runtime, clock.now(), "delayed-entry"))
+            delayed = DelayedAppliedRisexAdapter(target)
+            runtime.adapters[Venue.RISEX] = delayed
+            runtime.next_health_check_at = NOW + timedelta(hours=1)
+            clock.value = target + timedelta(seconds=1)
+            runtime.next_position_monitor_at = clock.now()
+            await runtime.tick()
+            clock.advance(10)
+            runtime.next_position_monitor_at = clock.now()
+            await runtime.tick()
+            rows = [row for row in runtime.lifecycle.snapshot.settlements if row.venue is Venue.RISEX]
+    assert delayed.calls == [target, target]
+    assert len(rows) == 1 and rows[0].status is SettlementStatus.APPLIED_RATE
 
 
 @pytest.mark.asyncio

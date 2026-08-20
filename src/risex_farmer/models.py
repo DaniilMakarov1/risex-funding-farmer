@@ -257,3 +257,7 @@ class TradeEvidence:
     is_orderbook_match: bool | None
     source_marker: str = "OFFICIAL_PUBLIC"
     paper_assumptions: tuple[str, ...] = ()
+    risex_contract_assumption_used: bool = False
+    risex_funding_eligibility_assumption_used: bool = False
+    risex_funding_estimate_assumption_used: bool = False
+    paper_assumption_used: bool = False
