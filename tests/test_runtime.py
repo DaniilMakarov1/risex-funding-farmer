@@ -244,6 +244,53 @@ class GatedRecoveryAdapter(FakeAdapter):
         return await super().fetch_book(venue_symbol)
 
 
+class GatedExtendedAdapter(ExtendedAdapter):
+    def __init__(self, clock: FakeClock, *, settlement_at: datetime) -> None:
+        super().__init__(None)
+        fake = FakeAdapter(Venue.EXTENDED, clock, settlement_at=settlement_at)
+        self.clock = clock
+        self.settlement_at = settlement_at
+        self.market = fake.market
+        self.calls: list[str] = []
+        self.catalog_calls = 0
+        self.gate = asyncio.Event()
+        self.request_started = asyncio.Event()
+        self.cancelled = False
+
+    async def fetch_catalog(self):
+        self.catalog_calls += 1
+        self.calls.append("catalog")
+        if self.catalog_calls > 1:
+            self.request_started.set()
+            try:
+                await self.gate.wait()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+        volume = MarketVolume(
+            Venue.EXTENDED, self.market.venue_symbol, D("1000000"),
+            self.clock.now(), "official-shaped",
+        )
+        return (self.market,), (volume,)
+
+    async def fetch_book(self, venue_symbol: str):
+        self.calls.append("book")
+        return OrderBook(
+            Venue.EXTENDED, venue_symbol,
+            (BookLevel(D("99"), D("20")),),
+            (BookLevel(D("101"), D("20")),), self.clock.now(), None,
+        )
+
+    async def fetch_funding_quote(self, market, *, assumed_open_at):
+        self.calls.append("funding")
+        return FundingCashQuote(
+            Venue.EXTENDED, market.venue_symbol, self.clock.now(), assumed_open_at,
+            self.settlement_at, FundingQuality.PREDICTED,
+            FundingAccrualMethod.SNAPSHOT_AT_SETTLEMENT, True,
+            D("5"), D("5"), "official-shaped",
+        )
+
+
 class JsonResponse:
     def __init__(self, payload):
         self.payload = payload
@@ -313,6 +360,13 @@ def adapters(clock: FakeClock, *, settlement_at: datetime, risex=True, funding="
         )
         for venue in Venue
     }
+
+
+def confirm_public_streams(runtime: PublicPaperRuntime, at: datetime) -> None:
+    for venue, symbol in runtime.observations:
+        stream = runtime.coordinator.stream(venue, symbol)
+        stream.connected(at)
+        stream.connection_confirmed(at)
 
 
 @pytest.mark.asyncio
@@ -421,11 +475,16 @@ async def test_venue_outage_is_specific_and_never_uses_empty_fail_closed_scan(tm
     fakes = adapters(clock, settlement_at=NOW + timedelta(minutes=5), risex=False)
     with PaperRepository(tmp_path / "blocked.db") as repository:
         result = await public_scan_once(repository, adapters=fakes, clock=clock)
+        failure = json.loads(repository.connection.execute(
+            "SELECT detail FROM runtime_evidence "
+            "WHERE event_type='PUBLIC_REQUEST_FAILED' AND venue='RISEX' LIMIT 1"
+        ).fetchone()[0])
     assert result["status"] == "NO_TRADE"
     assert result["reason"] == "VENUE_SPECIFIC_BLOCKERS"
     assert result["routes"] and result["routes"][0]["rank"] is None
     assert any("RISEX:PUBLIC_REST_UNAVAILABLE" in blocker for blocker in result["routes"][0]["blockers"])
     assert result["venue_readiness"]["RISEX"]["detail"].startswith("PUBLIC_REST_UNAVAILABLE")
+    assert {"component", "endpoint_class", "exception_class", "elapsed_ms", "http_status"} <= failure.keys()
     assert all("fail_closed_scan" not in call for fake in fakes.values() for call in fake.calls)
 
 
@@ -469,6 +528,27 @@ async def test_readiness_evidence_is_transition_bounded(tmp_path):
     assert count == 1
 
 
+def test_component_readiness_is_symbol_scoped_and_obsolete_failures_are_removed(tmp_path):
+    clock = FakeClock()
+    with PaperRepository(tmp_path / "component-readiness.db") as repository:
+        runtime = PublicPaperRuntime(repository, adapters={}, clock=clock)
+        runtime._set_component_readiness(
+            Venue.EXTENDED, "catalog", True, "READY", clock.now()
+        )
+        for component in ("book", "trade", "funding", "connection"):
+            runtime._set_component_readiness(
+                Venue.EXTENDED, f"{component}:GOOD", True, "READY", clock.now()
+            )
+        runtime._set_component_readiness(
+            Venue.EXTENDED, "book:BAD", False, "GAP", clock.now()
+        )
+        assert runtime._symbol_components_available(Venue.EXTENDED, "GOOD")
+        assert not runtime._symbol_components_available(Venue.EXTENDED, "BAD")
+        assert runtime.readiness[Venue.EXTENDED].available
+        runtime._remove_obsolete_components(Venue.EXTENDED, {"GOOD"}, clock.now())
+    assert "book:BAD" not in runtime.component_readiness[Venue.EXTENDED]
+
+
 @pytest.mark.asyncio
 async def test_paper_run_persists_through_no_trade_until_explicit_stop(tmp_path):
     clock = FakeClock()
@@ -503,15 +583,16 @@ async def test_scheduling_full_focused_activation_and_strict_cutoff(tmp_path):
             first_scans = repository.connection.execute("SELECT COUNT(*) FROM scanner_snapshots").fetchone()[0]
             clock.advance(100)  # T-300 focused window.
             await runtime.tick()
-            await runtime._refresh_task
+            assert runtime._refresh_task is None
             clock.advance(10)
             await runtime.tick()
-            await runtime._refresh_task
+            assert runtime._refresh_task is None
             clock.advance(10)  # Full scan at +120.
             await runtime.tick()
             await runtime._refresh_task
             for _ in range(16):  # Focused cadence through exact T-120 activation.
                 clock.advance(10)
+                confirm_public_streams(runtime, clock.now())
                 await runtime.tick()
                 if runtime._refresh_task is not None:
                     await runtime._refresh_task
@@ -533,6 +614,44 @@ async def test_scheduling_full_focused_activation_and_strict_cutoff(tmp_path):
     assert NOW + timedelta(seconds=120) in recorded
     assert NOW + timedelta(seconds=280) in recorded
     assert NOW + timedelta(seconds=395) in recorded
+
+
+@pytest.mark.asyncio
+async def test_focused_and_active_ticks_make_zero_rest_calls_through_cutoff(tmp_path):
+    clock = FakeClock()
+    target = NOW + timedelta(seconds=300)
+    fakes = adapters(clock, settlement_at=target)
+    with PaperRepository(tmp_path / "focused-no-rest.db") as repository:
+        async with PublicPaperRuntime(repository, adapters=fakes, clock=clock) as runtime:
+            await runtime.tick()
+            runtime.next_full_scan_at = target + timedelta(hours=1)
+            baseline = {venue: tuple(adapter.calls) for venue, adapter in fakes.items()}
+            while clock.now() < target - timedelta(seconds=10):
+                clock.advance(10)
+                confirm_public_streams(runtime, clock.now())
+                await runtime.tick()
+            clock.advance(5)
+            confirm_public_streams(runtime, clock.now())
+            await runtime.tick()
+            scan_details = [
+                json.loads(row[0]) for row in repository.connection.execute(
+                    "SELECT detail FROM runtime_evidence WHERE event_type='PUBLIC_SCAN'"
+                )
+            ]
+            nado_disconnects = repository.connection.execute(
+                "SELECT COUNT(*) FROM runtime_evidence "
+                "WHERE event_type='PUBLIC_SOCKET_DISCONNECTED' AND venue='NADO'"
+            ).fetchone()[0]
+    assert all(tuple(adapter.calls) == baseline[venue] for venue, adapter in fakes.items())
+    assert {row["scan_kind"] for row in scan_details} <= {
+        "INITIAL", "FOCUSED", "RECOVERY",
+    }
+    assert all(row["observations_source"] == "LIVE_CACHE" for row in scan_details[1:])
+    assert all({
+        "scheduled_at", "started_at", "completed_at", "duration_ms",
+        "missed_deadline_ms", "scan_kind", "observations_source",
+    } <= row.keys() for row in scan_details)
+    assert nado_disconnects == 0
 
 
 @pytest.mark.asyncio
@@ -571,9 +690,8 @@ async def test_hung_refresh_never_moves_absolute_entry_deadlines(tmp_path):
     clock = FakeClock()
     target = NOW + timedelta(seconds=400)
     fakes = adapters(clock, settlement_at=target)
-    gated = GatedAdapter(Venue.RISEX, clock, settlement_at=target)
-    gated.block_catalog_after_calls = 2
-    fakes[Venue.RISEX] = gated
+    gated = GatedExtendedAdapter(clock, settlement_at=target)
+    fakes[Venue.EXTENDED] = gated
     stop = asyncio.Event()
 
     async def deadline_sleep(seconds: float) -> None:
@@ -592,9 +710,17 @@ async def test_hung_refresh_never_moves_absolute_entry_deadlines(tmp_path):
                 "SELECT logical_at FROM scanner_snapshots"
             )
         }
+        deadline_evaluations = [
+            repository.connection.execute(
+                "SELECT opportunity_count FROM scanner_snapshots WHERE logical_at=?",
+                (at.isoformat(),),
+            ).fetchone()[0]
+            for at in (target - timedelta(seconds=120), target - timedelta(seconds=5))
+        ]
     assert result["status"] == "STOPPED_SAFE"
     assert target - timedelta(seconds=120) in recorded
     assert target - timedelta(seconds=5) in recorded
+    assert deadline_evaluations == [4, 4]
     assert gated.cancelled
 
 
@@ -623,7 +749,7 @@ async def test_full_tick_coalesces_background_refresh_and_skips_missed_slots(tmp
                 "SELECT COUNT(*) FROM runtime_evidence "
                 "WHERE event_type='PUBLIC_REFRESH_COALESCED'"
             ).fetchone()[0]
-    assert coalesced >= 1
+    assert coalesced == 0
 
 
 @pytest.mark.asyncio
@@ -635,18 +761,25 @@ async def test_negative_candidate_focus_trace_and_late_winner_activation(tmp_pat
 
     async def trace_sleep(seconds: float) -> None:
         clock.value += timedelta(seconds=seconds)
+        confirm_public_streams(runtime, clock.now())
         if clock.now() == target - timedelta(seconds=100):
-            for adapter in fakes.values():
-                adapter.funding_cash = D("5")
+            for key, observation in tuple(runtime.observations.items()):
+                quote = replace(
+                    observation.funding,
+                    observed_at=clock.now(),
+                    long_cash_per_canonical_base_usd=D("5"),
+                    short_cash_per_canonical_base_usd=D("5"),
+                )
+                runtime.observations[key] = replace(observation, funding=quote)
         if clock.now() >= target - timedelta(seconds=90):
             stop.set()
         await asyncio.sleep(0)
 
     with PaperRepository(tmp_path / "negative-late-winner.db") as repository:
-        await public_paper_run(
-            repository, adapters=fakes, clock=clock,
-            stop_event=stop, sleep=trace_sleep,
-        )
+        async with PublicPaperRuntime(
+            repository, adapters=fakes, clock=clock, sleep=trace_sleep
+        ) as runtime:
+            await runtime.run(stop_event=stop)
         recorded = {
             datetime.fromisoformat(row[0])
             for row in repository.connection.execute(
@@ -886,16 +1019,53 @@ async def test_sequence_gap_fetches_snapshot_and_reconnect_restores_readiness(tm
         async with PublicPaperRuntime(repository, adapters=fakes, clock=clock) as runtime:
             await runtime.scan()
             market = fakes[Venue.EXTENDED].market
-            before = fakes[Venue.EXTENDED].calls.count("book")
             await runtime.apply_book_event(BookDelta(
                 Venue.EXTENDED, market.venue_symbol,
                 (BookLevel(D("100"), D("1")),), (), clock.now(), 3, 999,
             ))
-            recovery = runtime._recovery_tasks[(Venue.EXTENDED, market.venue_symbol)]
-            await recovery
+            adapter = ExtendedAdapter(None)
+            rest = adapter.normalize_book(
+                {
+                    "market": market.venue_symbol,
+                    "bid": [{"price": "99", "qty": "20"}],
+                    "ask": [{"price": "101", "qty": "20"}],
+                },
+                observed_at=clock.now(),
+            )
+            assert rest.sequence is None
+            await runtime.apply_book_event(rest)
+            assert (Venue.EXTENDED, market.venue_symbol) in runtime._recovery_buffers
+            await runtime.apply_book_event(adapter.normalize_book_message({
+                "type": "UPDATE", "seq": 11,
+                "ts": str(int(clock.now().timestamp() * 1000)),
+                "data": {
+                    "m": market.venue_symbol,
+                    "b": [{"p": "100", "q": "2"}], "a": [],
+                },
+            }))
+            snapshot = adapter.normalize_book_message({
+                "type": "SNAPSHOT", "seq": 10,
+                "ts": str(int(clock.now().timestamp() * 1000)),
+                "data": {
+                    "m": market.venue_symbol,
+                    "b": [{"p": "99", "q": "20"}],
+                    "a": [{"p": "101", "q": "20"}],
+                },
+            })
+            await runtime.apply_book_event(snapshot)
             state = runtime.readiness[Venue.EXTENDED]
-    assert fakes[Venue.EXTENDED].calls.count("book") == before + 1
+            book_resyncs = repository.connection.execute(
+                "SELECT COUNT(*) FROM runtime_evidence "
+                "WHERE event_type='PUBLIC_BOOK_RESYNC_REQUIRED'"
+            ).fetchone()[0]
+            socket_disconnects = repository.connection.execute(
+                "SELECT COUNT(*) FROM runtime_evidence "
+                "WHERE event_type='PUBLIC_SOCKET_DISCONNECTED'"
+            ).fetchone()[0]
+    assert fakes[Venue.EXTENDED].calls.count("book") == 1
+    assert runtime.coordinator.stream(Venue.EXTENDED, market.venue_symbol).book().sequence == 11
     assert state.available and state.detail == "PUBLIC_STREAM_RECOVERED"
+    assert book_resyncs == 1 and socket_disconnects == 0
 
 
 @pytest.mark.asyncio
@@ -919,7 +1089,11 @@ async def test_nado_recovery_buffers_and_replays_newer_continuous_delta(tmp_path
                 Venue.NADO, symbol,
                 (BookLevel(D("100"), D("2")),), (), clock.now(), 2, 1,
             ))
-            assert len(runtime._recovery_buffers[(Venue.NADO, symbol)]) == 1
+            await runtime.apply_book_event(BookDelta(
+                Venue.NADO, symbol,
+                (BookLevel(D("100"), D("3")),), (), clock.now(), 3, 2,
+            ))
+            assert len(runtime._recovery_buffers[(Venue.NADO, symbol)]) == 2
             gated.block_recovery = False
             gated.recovery_gate.set()
             await recovery
@@ -928,8 +1102,8 @@ async def test_nado_recovery_buffers_and_replays_newer_continuous_delta(tmp_path
                 "SELECT detail FROM runtime_evidence "
                 "WHERE event_type='PUBLIC_SNAPSHOT_RECOVERY_COMPLETED'"
             ).fetchone()
-    assert book.sequence == 2
-    assert json.loads(evidence["detail"])["replayed"] == 1
+    assert book.sequence == 3
+    assert json.loads(evidence["detail"])["replayed"] == 2
 
 
 @pytest.mark.asyncio
@@ -992,6 +1166,35 @@ async def test_extended_stream_registry_is_dynamic_deduplicated_and_lock_safe(tm
         runtime.broker = None
         await runtime.shutdown()
     assert symbols == {original.venue_symbol, added.venue_symbol}
+
+
+@pytest.mark.asyncio
+async def test_combined_streams_start_once_after_initial_catalog_recovery(tmp_path):
+    clock = FakeClock()
+    fakes = adapters(clock, settlement_at=NOW + timedelta(minutes=5))
+    with PaperRepository(tmp_path / "dynamic-combined.db") as repository:
+        runtime = PublicPaperRuntime(repository, adapters=fakes, clock=clock)
+        runtime._session = object()
+        runtime._stop_event = asyncio.Event()
+        await runtime._reconcile_combined_streams()
+        assert not runtime._stream_tasks
+        runtime.markets = {
+            Venue.RISEX: (fakes[Venue.RISEX].market,),
+            Venue.NADO: (fakes[Venue.NADO].market,),
+        }
+        for venue in (Venue.RISEX, Venue.NADO):
+            market = fakes[venue].market
+            runtime.volumes[(venue, market.venue_symbol)] = MarketVolume(
+                venue, market.venue_symbol, D("1000000"), NOW, "synthetic"
+            )
+        await runtime._reconcile_combined_streams()
+        first = dict(runtime._stream_tasks)
+        await runtime._reconcile_combined_streams()
+        assert runtime._stream_tasks == first
+        await runtime.shutdown()
+    assert {(key[0], key[2]) for key in first} == {
+        (Venue.RISEX, "combined"), (Venue.NADO, "combined")
+    }
 
 
 @pytest.mark.asyncio
