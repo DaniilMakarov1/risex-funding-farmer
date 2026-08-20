@@ -1,33 +1,43 @@
-# PAPER-001 — Core Models and Exact Economics
+# PAPER-002 — Official Market Data
 
 ## Goal
 
-Implement the exact core contracts and deterministic economics required by `SYSTEM_SPEC.md`. Do not implement venue adapters, networking, scanning, lifecycle orchestration, CLI behavior, or SQLite trading storage.
+Implement public REST/WebSocket adapters for RISEx, Extended, and Nado using only current official documentation and public APIs. Normalize metadata, books, trades, funding cash, settlement timing, and stream health into PAPER-001 contracts. No scanner, broker, lifecycle, CLI, authenticated endpoint, or trading functionality.
 
-## Deliverables
+## Mandatory Design Checkpoint
 
-- Immutable/dataclass domain contracts in `models.py` for canonical markets, books/depth, routes, funding quotes/cycles/settlements, fills/fees, data quality, and the five allowed lifecycle states.
-- Fixed paper configuration in `config.py`, represented with `Decimal` where numeric economics are involved.
-- Pure exact functions in `economics.py` for tick validation and maker placement, canonical quantity-step LCM and sizing, minimum-order eligibility, exact-quantity VWAP, venue fee calculation, funding cash, planned and actual long/short PnL, settlement authority/replacement, and applied-rate completeness.
-- Focused deterministic unit tests. No floats may enter economic calculations.
+Before code changes, inspect official sources and report to Architect:
+
+- exact official documentation/API URLs used for each venue;
+- public REST and WebSocket endpoints/messages for metadata, BBO/book, trades, funding, volume, heartbeat, snapshots, sequence/recovery, and applied funding where available;
+- unit, multiplier, price, quantity, funding, eligibility, and timestamp semantics with official evidence;
+- proposed normalization and explicit UNKNOWN/blocker fields;
+- fixture plan and any proven RISEx funding-semantics blocker.
+
+Do not implement until Architect explicitly approves the checkpoint. Do not use aggregators, UI scraping, manually copied live values, or other repositories/projects.
+
+## Deliverables after approval
+
+- Minimal async adapter contract and venue implementations in `exchanges/` plus coordination in `market_data.py`.
+- Official metadata normalization and parity eligibility; unknown evidence blocks entry.
+- REST snapshots/recovery and available WebSocket book/trade/funding/health processing.
+- Raw timestamps, official/synthetic trade keys, aggressor and orderbook-match normalization.
+- Per-stream connection/book/sequence health, documented heartbeat, stale/gap detection, and funding freshness.
+- Fixture-only deterministic CI tests; live smoke checks are opt-in.
 
 ## Acceptance tests
 
-- Decimal without float inputs.
-- Tick alignment and invalid BBO detection.
-- Maker placement at 1, 2, and 3+ tick spreads.
-- Canonical quantity LCM with multipliers 1, 1000, and fractional.
-- Minimum quantity and notional enforcement.
-- Exact VWAP and insufficient-depth result.
-- Nado minimum taker fee; normal fill-notional fees.
-- Correct LONG and SHORT PnL signs.
-- Funding cash-per-base multiplication exactly once.
-- `ESTIMATED` replaced by `APPLIED_RATE`, not added.
-- Applied-rate completeness and deterministic skipped events.
-- Actual closed PnL without double-counting fees.
+- Valid linear perpetual; spot/non-perpetual, RFQ, and off-hours exclusion.
+- Unknown multiplier and unknown funding eligibility.
+- Reconnect, sequence gap, heartbeat timeout, and incomplete recovery.
+- Official trade ID and deterministic synthetic key.
+- Aggressor normalization and `is_orderbook_match` true/false/unknown.
+- Extended percentage funding normalized to cash per canonical base.
+- Nado per-unit funding normalized without another price multiplication.
+- RISEx semantics blocker path when official evidence is insufficient.
 
 ## Constraints
 
-- Work only on `codex/paper-001` from accepted `main`.
-- Do not add application/network/storage functionality or new product rules.
+- Work on `codex/paper-002` from accepted `main`; no subagents or product-rule changes.
+- Keep all access public/unauthenticated; CI never depends on live services.
 - Run focused tests and full `pytest`, review the diff, commit, then report in at most 20 lines.
