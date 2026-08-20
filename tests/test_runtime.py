@@ -575,6 +575,60 @@ async def test_focus_cycle_survives_empty_scan_then_advances_after_cutoff(tmp_pa
     assert runtime.next_focused_scan_at is None
 
 
+@pytest.mark.asyncio
+async def test_fresh_nearer_cycle_replaces_unexpired_later_focus(tmp_path):
+    clock = FakeClock()
+    target = NOW + timedelta(seconds=400)
+    with PaperRepository(tmp_path / "focus-nearer-cycle.db") as repository:
+        async with PublicPaperRuntime(
+            repository,
+            adapters=adapters(clock, settlement_at=target, funding="0"),
+            clock=clock,
+        ) as runtime:
+            await runtime.tick()
+            original = runtime.last_scan
+            plan = original.evaluations[0]
+            cycle = plan.target_cycle
+            assert cycle is not None
+
+            def shifted(hours: int):
+                delta = timedelta(hours=hours)
+                return replace(
+                    cycle,
+                    cycle_id=f"{cycle.cycle_id}-{hours}",
+                    start_at=cycle.start_at + delta,
+                    end_at=cycle.end_at + delta,
+                    risex_event=replace(
+                        cycle.risex_event,
+                        settlement_at=cycle.risex_event.settlement_at + delta,
+                    ),
+                    hedge_event=replace(
+                        cycle.hedge_event,
+                        settlement_at=cycle.hedge_event.settlement_at + delta,
+                    ),
+                )
+
+            later = shifted(2)
+            earlier = shifted(1)
+            later_plan = replace(plan, target_cycle=later)
+            runtime.focused_cycle = None
+            runtime.last_scan = replace(
+                original, evaluations=(later_plan,), ranked_routes=(later_plan,), winner=None
+            )
+            assert runtime._refresh_focused_cycle(clock.now()) == later
+            runtime.next_focused_scan_at = clock.now() + timedelta(seconds=10)
+            earlier_plan = replace(plan, target_cycle=earlier)
+            runtime.last_scan = replace(
+                original,
+                evaluations=(later_plan, earlier_plan),
+                ranked_routes=(later_plan, earlier_plan),
+                winner=None,
+            )
+            selected = runtime._refresh_focused_cycle(clock.now())
+    assert selected == earlier
+    assert runtime.next_focused_scan_at is None
+
+
 def maker_trade(runtime: PublicPaperRuntime, at: datetime, key: str = "public-trade") -> TradeEvidence:
     order = runtime.broker.state.order
     version = order.active_version

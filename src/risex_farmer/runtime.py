@@ -798,17 +798,18 @@ class PublicPaperRuntime:
         )
 
     def _refresh_focused_cycle(self, now: datetime) -> TargetFundingCycle | None:
-        if self.focused_cycle is not None:
-            cutoff = activation_schedule(self.focused_cycle).cutoff_at
-            if now < cutoff:
-                return self.focused_cycle
-            self.focused_cycle = None
-            self.next_focused_scan_at = None
+        preserved = self.focused_cycle
+        if preserved is not None:
+            cutoff = activation_schedule(preserved).cutoff_at
+            if now >= cutoff:
+                preserved = None
+                self.focused_cycle = None
+                self.next_focused_scan_at = None
         if self.last_scan is None:
-            return None
+            return preserved
         candidates = self._fresh_focus_candidates(self.last_scan, now)
         if not candidates:
-            return None
+            return preserved
         selected = min(
             candidates,
             key=lambda plan: (
@@ -816,9 +817,12 @@ class PublicPaperRuntime:
                 plan.target_cycle.end_at,  # type: ignore[union-attr]
                 plan.target_cycle.cycle_id,  # type: ignore[union-attr]
             ),
-        )
-        self.focused_cycle = selected.target_cycle
-        return self.focused_cycle
+        ).target_cycle
+        assert selected is not None
+        if preserved is None or selected.start_at != preserved.start_at:
+            self.next_focused_scan_at = None
+        self.focused_cycle = selected
+        return selected
 
     async def deliver_trade(
         self,
