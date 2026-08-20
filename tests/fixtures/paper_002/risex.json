@@ -1,0 +1,44 @@
+{
+  "market": {
+    "market_id": "7",
+    "config": {
+      "name": "ABC/USDC",
+      "step_size": "0.01",
+      "step_price": "0.1",
+      "min_order_size": "0.05",
+      "unlocked": true
+    },
+    "quote_volume_24h": "1234.50",
+    "base_asset_symbol": "ABC/USDC",
+    "quote_asset_symbol": "USDC",
+    "active": true
+  },
+  "book": {
+    "market_id": "7",
+    "bids": [{"price": "99.9", "quantity": "2", "order_count": 1}],
+    "asks": [{"price": "100.1", "quantity": "3", "order_count": 1}]
+  },
+  "trade": {
+    "market_id": "7",
+    "block_timestamp": "1800000000000000000",
+    "timestamp": "1800000000000000100",
+    "data": {
+      "id": "maker-taker",
+      "maker_side": 0,
+      "price": "100",
+      "size": "0.5"
+    }
+  },
+  "book_update": {
+    "channel": "orderbook",
+    "type": "update",
+    "market_id": "7",
+    "worker_timestamp": "1800000000000000200",
+    "checksum": 123,
+    "data": {
+      "market_id": 7,
+      "bids": [{"price": "99.9", "quantity": "1", "order_count": 1}],
+      "asks": []
+    }
+  }
+}

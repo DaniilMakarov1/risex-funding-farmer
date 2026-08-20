@@ -1,0 +1,78 @@
+{
+  "market": {
+    "type": "perp",
+    "product_id": 9,
+    "symbol": "ABC-PERP",
+    "base_currency": "ABC",
+    "price_increment_x18": "100000000000000000",
+    "size_increment": "10000000000000000",
+    "min_size": "20000000000000000000",
+    "trading_status": "live",
+    "market_hours": null,
+    "price_feed": {
+      "oracle": {"primary": "stork"},
+      "spot_index": {"primary": "stork"}
+    }
+  },
+  "off_hours": {
+    "type": "perp",
+    "product_id": 10,
+    "symbol": "XYZ-PERP",
+    "price_increment_x18": "100000000000000000",
+    "size_increment": "10000000000000000",
+    "min_size": "20000000000000000000",
+    "trading_status": "soft_reduce_only",
+    "market_hours": {"is_open": false, "reason": "weekend"},
+    "price_feed": {
+      "oracle": {"primary": "pyth"},
+      "spot_index": {"primary": "pyth"}
+    }
+  },
+  "ticker": {
+    "ticker_id": "ABC-PERP_USDT0",
+    "base_currency": "ABC-PERP",
+    "quote_currency": "USDT0",
+    "quote_volume": 1234.50
+  },
+  "book": {
+    "product_id": 9,
+    "timestamp": "1800000000000000000",
+    "bids": [["99900000000000000000", "2000000000000000000"]],
+    "asks": [["100100000000000000000", "3000000000000000000"]]
+  },
+  "trade": {
+    "type": "trade",
+    "timestamp": "1800000000000000100",
+    "product_id": 9,
+    "price": "100000000000000000000",
+    "taker_qty": "500000000000000000",
+    "maker_qty": "500000000000000000",
+    "is_taker_buyer": true
+  },
+  "book_delta": {
+    "type": "book_depth",
+    "min_timestamp": "1800000000000000050",
+    "max_timestamp": "1800000000000000100",
+    "last_max_timestamp": "1800000000000000000",
+    "product_id": 9,
+    "bids": [["99900000000000000000", "1000000000000000000"]],
+    "asks": []
+  },
+  "funding_rate": {
+    "type": "funding_rate",
+    "timestamp": "1800014400000000000",
+    "product_id": 9,
+    "funding_rate_x18": "24000000000000000",
+    "update_time": "1800014400"
+  },
+  "funding_payment": {
+    "type": "funding_payment",
+    "timestamp": "1800014400000000000",
+    "product_id": 9,
+    "payment_amount": "0",
+    "open_interest": "1000000000000000000000",
+    "cumulative_funding_long_x18": "1200000000000000000",
+    "cumulative_funding_short_x18": "-1200000000000000000",
+    "dt": "3600000000000"
+  }
+}

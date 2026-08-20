@@ -89,7 +89,7 @@ class CanonicalMarket:
     venue_symbol: str
     market_type: MarketType
     contract_type: ContractType
-    base_multiplier: Decimal
+    base_multiplier: Decimal | None
     quote_asset: str
     settlement_asset: str
     tick_size_raw: Decimal
@@ -119,6 +119,18 @@ class OrderBook:
 
 
 @dataclass(frozen=True, slots=True)
+class BookDelta:
+    venue: Venue
+    canonical_market: str
+    bids: tuple[BookLevel, ...]
+    asks: tuple[BookLevel, ...]
+    observed_at: datetime
+    sequence: int | None = None
+    previous_sequence: int | None = None
+    checksum: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class ExactVwap:
     requested_quantity: Decimal
     filled_quantity: Decimal
@@ -138,6 +150,15 @@ class Route:
     hedge_venue: Venue
     direction: RouteDirection
     route_liquidity_usd: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class MarketVolume:
+    venue: Venue
+    canonical_market: str
+    quote_volume_usd: Decimal | None
+    observed_at: datetime
+    source: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,3 +241,17 @@ class StreamHealth:
     book_initialized: bool
     book_sequence_valid: bool
     data_quality: DataQuality
+
+
+@dataclass(frozen=True, slots=True)
+class TradeEvidence:
+    key: str
+    venue: Venue
+    canonical_market: str
+    exchange_at: datetime | None
+    receipt_at: datetime
+    raw_timestamp: str | int | None
+    canonical_quantity: Decimal
+    canonical_price: Decimal
+    aggressor_side: Side | None
+    is_orderbook_match: bool | None

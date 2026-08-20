@@ -1,0 +1,66 @@
+{
+  "market": {
+    "name": "ABC-USD",
+    "type": "PERPETUAL",
+    "assetName": "ABC",
+    "collateralAssetName": "USDC",
+    "active": true,
+    "status": "ACTIVE",
+    "isRfq": false,
+    "isOffHours": false,
+    "marketStats": {"dailyVolume": "1234.50"},
+    "tradingConfig": {
+      "minOrderSize": "0.05",
+      "minOrderSizeChange": "0.01",
+      "minPriceChange": "0.1"
+    }
+  },
+  "spot": {
+    "name": "ABC-USDC-SPOT",
+    "type": "SPOT",
+    "assetName": "ABC",
+    "collateralAssetName": "USDC",
+    "active": true,
+    "status": "ACTIVE",
+    "isRfq": false,
+    "isOffHours": false,
+    "tradingConfig": {
+      "minOrderSize": "0.05",
+      "minOrderSizeChange": "0.01",
+      "minPriceChange": "0.1"
+    }
+  },
+  "book": {
+    "market": "ABC-USD",
+    "bid": [{"price": "99.9", "qty": "2"}],
+    "ask": [{"price": "100.1", "qty": "3"}]
+  },
+  "trade": {
+    "i": 42,
+    "m": "ABC-USD",
+    "S": "SELL",
+    "tT": "TRADE",
+    "T": 1800000000000,
+    "p": "100",
+    "q": "0.5"
+  },
+  "book_delta": {
+    "ts": 1800000000000,
+    "type": "DELTA",
+    "seq": 2,
+    "data": {
+      "m": "ABC-USD",
+      "b": [{"p": "99.9", "q": "-1", "c": "1"}],
+      "a": []
+    }
+  },
+  "funding": {
+    "ts": 1800014400000,
+    "seq": 3,
+    "data": {
+      "m": "ABC-USD",
+      "T": 1800014400000,
+      "f": "0.001"
+    }
+  }
+}

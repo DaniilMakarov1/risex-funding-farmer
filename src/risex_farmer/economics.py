@@ -120,6 +120,8 @@ def minimum_order_eligible(
 ) -> bool:
     quantity = _decimal(canonical_quantity, "canonical_quantity")
     price = _decimal(canonical_price, "canonical_price")
+    if market.base_multiplier is None:
+        return False
     multiplier = _decimal(market.base_multiplier, "market.base_multiplier")
     minimum_quantity = _decimal(
         market.minimum_quantity_raw, "market.minimum_quantity_raw"
