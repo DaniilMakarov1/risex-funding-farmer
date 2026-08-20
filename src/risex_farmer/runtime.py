@@ -34,6 +34,7 @@ from .models import (
     RouteDirection,
     SettlementStatus,
     TradeEvidence,
+    TargetFundingCycle,
     Venue,
 )
 from .paper_broker import PaperEntryBroker, PaperEntryState
@@ -246,6 +247,7 @@ class PublicPaperRuntime:
         self._last_readiness_evidence_at: dict[Venue, datetime] = {}
         self._extended_trade_sequences: dict[str, int] = {}
         self.next_health_check_at: datetime | None = None
+        self.focused_cycle: TargetFundingCycle | None = None
 
     async def __aenter__(self) -> PublicPaperRuntime:
         if self.adapters is None:
@@ -638,6 +640,10 @@ class PublicPaperRuntime:
 
     async def tick(self, at: datetime | None = None) -> None:
         now = at or self.clock.now()
+        maker_was_active = bool(
+            self.broker is not None
+            and self.broker.state.lifecycle_state is LifecycleState.ENTRY_MAKER_OPEN
+        )
         if self.next_health_check_at is None or now >= self.next_health_check_at:
             for (venue, symbol), observation in tuple(self.observations.items()):
                 if (venue, symbol) not in self._trade_stream_ready:
@@ -647,6 +653,8 @@ class PublicPaperRuntime:
                 if confirmation is not None and now - confirmation > timedelta(seconds=25):
                     await self.mark_disconnected(venue, symbol, at=now, stream_kind="health")
             self.next_health_check_at = now + timedelta(seconds=10)
+        if maker_was_active and self.broker is None:
+            return
         if self.last_scan is None or self.next_full_scan_at is None or now >= self.next_full_scan_at:
             await self.scan()
             now = self.last_scan.logical_at
@@ -727,12 +735,24 @@ class PublicPaperRuntime:
                     seconds=self.config.focused_scan_seconds
                 )
             return
-        if not self.accepting_entries or self.last_scan is None or self.last_scan.winner is None:
+        if not self.accepting_entries or self.last_scan is None:
             return
-        plan = self.last_scan.winner
-        assert plan.target_cycle is not None
-        schedule = activation_schedule(plan.target_cycle)
-        focused_start = plan.target_cycle.start_at - timedelta(
+        expired_cycle = self.focused_cycle
+        cycle = self._refresh_focused_cycle(now)
+        if (
+            cycle is None
+            and expired_cycle is not None
+            and now >= activation_schedule(expired_cycle).cutoff_at
+        ):
+            # The cutoff wake performs one fresh discovery scan. It does not
+            # extend the expired cycle's focused cadence.
+            await self.scan()
+            now = self.last_scan.logical_at
+            cycle = self._refresh_focused_cycle(now)
+        if cycle is None:
+            return
+        schedule = activation_schedule(cycle)
+        focused_start = cycle.start_at - timedelta(
             seconds=self.config.focused_window_seconds
         )
         if now >= focused_start and (
@@ -740,14 +760,20 @@ class PublicPaperRuntime:
         ):
             await self.scan()
             now = self.last_scan.logical_at
-            plan = self.last_scan.winner
             self.next_focused_scan_at = now + timedelta(
                 seconds=self.config.focused_scan_seconds
             )
-            if plan is None or plan.target_cycle is None:
+            cycle = self._refresh_focused_cycle(now)
+            if cycle is None:
                 return
-            schedule = activation_schedule(plan.target_cycle)
-        if schedule.should_activate(now):
+            schedule = activation_schedule(cycle)
+        winner = self.last_scan.winner
+        if (
+            winner is not None
+            and winner.target_cycle is not None
+            and winner.target_cycle.start_at == cycle.start_at
+            and schedule.should_activate(now)
+        ):
             self._attempt_number += 1
             broker = PaperEntryBroker(config=self.config)
             await broker.activate(
@@ -758,6 +784,41 @@ class PublicPaperRuntime:
             self.broker = broker
             self.repository.save_decision(recorded_at=now, entry_state=broker.state)
             self._record("PAPER_ENTRY_ACTIVATED", at=now)
+
+    def _fresh_focus_candidates(
+        self, snapshot: ScanSnapshot, now: datetime
+    ) -> tuple[RoutePlan, ...]:
+        """Usable scanner-universe routes whose cycle has not reached cutoff."""
+        return tuple(
+            plan
+            for plan in snapshot.evaluations
+            if plan.universe_eligible
+            and plan.target_cycle is not None
+            and activation_schedule(plan.target_cycle).cutoff_at > now
+        )
+
+    def _refresh_focused_cycle(self, now: datetime) -> TargetFundingCycle | None:
+        if self.focused_cycle is not None:
+            cutoff = activation_schedule(self.focused_cycle).cutoff_at
+            if now < cutoff:
+                return self.focused_cycle
+            self.focused_cycle = None
+            self.next_focused_scan_at = None
+        if self.last_scan is None:
+            return None
+        candidates = self._fresh_focus_candidates(self.last_scan, now)
+        if not candidates:
+            return None
+        selected = min(
+            candidates,
+            key=lambda plan: (
+                plan.target_cycle.start_at,  # type: ignore[union-attr]
+                plan.target_cycle.end_at,  # type: ignore[union-attr]
+                plan.target_cycle.cycle_id,  # type: ignore[union-attr]
+            ),
+        )
+        self.focused_cycle = selected.target_cycle
+        return self.focused_cycle
 
     async def deliver_trade(
         self,
@@ -1209,6 +1270,8 @@ class PublicPaperRuntime:
             await asyncio.gather(*pending, return_exceptions=True)
 
     def _next_wakeup_at(self, now: datetime) -> datetime:
+        if self.broker is None:
+            self._refresh_focused_cycle(now)
         deadlines = [value for value in (
             self.next_full_scan_at, self.next_focused_scan_at,
             self.next_position_monitor_at, self.next_health_check_at,
@@ -1216,12 +1279,18 @@ class PublicPaperRuntime:
         if self.broker is not None and self.broker.state.order is not None:
             order = self.broker.state.order
             deadlines.extend(value for value in (order.created_at, order.cutoff_at) if value > now)
-        elif self.last_scan is not None and self.last_scan.winner is not None:
-            cycle = self.last_scan.winner.target_cycle
+        else:
+            cycle = self.focused_cycle
             if cycle is not None:
                 schedule = activation_schedule(cycle)
-                focused = cycle.start_at - timedelta(seconds=self.config.focused_window_seconds)
-                deadlines.extend(value for value in (focused, schedule.activation_at, schedule.cutoff_at) if value > now)
+                focused = cycle.start_at - timedelta(
+                    seconds=self.config.focused_window_seconds
+                )
+                deadlines.extend(
+                    value
+                    for value in (focused, schedule.activation_at, schedule.cutoff_at)
+                    if value > now
+                )
         return min(deadlines, default=now + timedelta(seconds=10))
 
     async def run(self, *, stop_event: asyncio.Event | None = None) -> dict[str, object]:

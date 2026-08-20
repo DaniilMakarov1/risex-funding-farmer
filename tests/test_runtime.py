@@ -453,6 +453,128 @@ async def test_run_loop_wakes_on_activation_and_cutoff_deadlines(tmp_path):
     assert target - timedelta(seconds=5) in recorded
 
 
+@pytest.mark.asyncio
+async def test_negative_candidate_focus_trace_and_late_winner_activation(tmp_path):
+    clock = FakeClock()
+    target = NOW + timedelta(seconds=400)
+    fakes = adapters(clock, settlement_at=target, funding="0")
+    stop = asyncio.Event()
+
+    async def trace_sleep(seconds: float) -> None:
+        clock.value += timedelta(seconds=seconds)
+        if clock.now() == target - timedelta(seconds=100):
+            for adapter in fakes.values():
+                adapter.funding_cash = D("5")
+        if clock.now() >= target - timedelta(seconds=90):
+            stop.set()
+        await asyncio.sleep(0)
+
+    with PaperRepository(tmp_path / "negative-late-winner.db") as repository:
+        await public_paper_run(
+            repository, adapters=fakes, clock=clock,
+            stop_event=stop, sleep=trace_sleep,
+        )
+        recorded = {
+            datetime.fromisoformat(row[0])
+            for row in repository.connection.execute(
+                "SELECT logical_at FROM scanner_snapshots"
+            )
+        }
+        activations = [
+            datetime.fromisoformat(row[0])
+            for row in repository.connection.execute(
+                "SELECT recorded_at FROM runtime_evidence "
+                "WHERE event_type='PAPER_ENTRY_ACTIVATED'"
+            )
+        ]
+    expected = {
+        target - timedelta(seconds=offset)
+        for offset in range(300, 99, -10)
+    }
+    assert expected <= recorded
+    assert activations == [target - timedelta(seconds=100)]
+
+
+@pytest.mark.asyncio
+async def test_negative_candidate_expires_at_cutoff_without_post_cutoff_focus(tmp_path):
+    clock = FakeClock()
+    target = NOW + timedelta(seconds=400)
+    stop = asyncio.Event()
+
+    async def trace_sleep(seconds: float) -> None:
+        clock.value += timedelta(seconds=seconds)
+        if clock.now() >= target + timedelta(seconds=20):
+            stop.set()
+        await asyncio.sleep(0)
+
+    with PaperRepository(tmp_path / "negative-cutoff.db") as repository:
+        await public_paper_run(
+            repository,
+            adapters=adapters(clock, settlement_at=target, funding="0"),
+            clock=clock, stop_event=stop, sleep=trace_sleep,
+        )
+        recorded = [
+            datetime.fromisoformat(row[0])
+            for row in repository.connection.execute(
+                "SELECT logical_at FROM scanner_snapshots"
+            )
+        ]
+        activation_count = repository.connection.execute(
+            "SELECT COUNT(*) FROM runtime_evidence "
+            "WHERE event_type='PAPER_ENTRY_ACTIVATED'"
+        ).fetchone()[0]
+    focused_trace = {
+        target - timedelta(seconds=offset)
+        for offset in range(300, 9, -10)
+    }
+    assert focused_trace <= set(recorded)
+    assert max(recorded) == target - timedelta(seconds=5)
+    assert activation_count == 0
+
+
+@pytest.mark.asyncio
+async def test_focus_cycle_survives_empty_scan_then_advances_after_cutoff(tmp_path):
+    clock = FakeClock()
+    target = NOW + timedelta(seconds=400)
+    with PaperRepository(tmp_path / "focus-cycle-state.db") as repository:
+        async with PublicPaperRuntime(
+            repository,
+            adapters=adapters(clock, settlement_at=target, funding="0"),
+            clock=clock,
+        ) as runtime:
+            await runtime.tick()
+            first = runtime._refresh_focused_cycle(clock.now())
+            assert first is not None
+            original = runtime.last_scan
+            runtime.last_scan = replace(original, evaluations=(), ranked_routes=(), winner=None)
+            assert runtime._refresh_focused_cycle(target - timedelta(seconds=6)) == first
+            plan = original.evaluations[0]
+            cycle = plan.target_cycle
+            assert cycle is not None
+            shift = timedelta(hours=1)
+            next_cycle = replace(
+                cycle,
+                cycle_id=f"{cycle.cycle_id}-next",
+                start_at=cycle.start_at + shift,
+                end_at=cycle.end_at + shift,
+                risex_event=replace(
+                    cycle.risex_event,
+                    settlement_at=cycle.risex_event.settlement_at + shift,
+                ),
+                hedge_event=replace(
+                    cycle.hedge_event,
+                    settlement_at=cycle.hedge_event.settlement_at + shift,
+                ),
+            )
+            next_plan = replace(plan, target_cycle=next_cycle)
+            runtime.last_scan = replace(
+                original, evaluations=(next_plan,), ranked_routes=(next_plan,), winner=None
+            )
+            selected = runtime._refresh_focused_cycle(target - timedelta(seconds=5))
+    assert selected == next_cycle
+    assert runtime.next_focused_scan_at is None
+
+
 def maker_trade(runtime: PublicPaperRuntime, at: datetime, key: str = "public-trade") -> TradeEvidence:
     order = runtime.broker.state.order
     version = order.active_version
