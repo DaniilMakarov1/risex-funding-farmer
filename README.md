@@ -46,4 +46,4 @@ risex-farmer --db paper.db paper-run --fixture tests/fixtures/paper_006/positive
 risex-farmer --db paper.db report
 ```
 
-See `SYSTEM_SPEC.md` for frozen product behavior, `STATUS.md` for the accepted baseline, and `NEXT_TASK.md` for the only active implementation task.
+See `SYSTEM_SPEC.md` for frozen product behavior, `STATUS.md` for the accepted baseline, and `NEXT_TASK.md` for the current authorization boundary.
