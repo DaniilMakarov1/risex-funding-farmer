@@ -166,7 +166,7 @@ class FundingCashQuote:
     venue: Venue
     canonical_market: str
     observed_at: datetime
-    assumed_position_opened_at: datetime
+    assumed_or_actual_position_opened_at: datetime
     settlement_at: datetime
     quality: FundingQuality
     accrual_method: FundingAccrualMethod
@@ -245,11 +245,11 @@ class StreamHealth:
 
 @dataclass(frozen=True, slots=True)
 class TradeEvidence:
-    key: str
+    trade_event_key: str
     venue: Venue
     canonical_market: str
-    exchange_at: datetime | None
-    receipt_at: datetime
+    exchange_timestamp: datetime | None
+    received_at: datetime
     raw_timestamp: str | int | None
     canonical_quantity: Decimal
     canonical_price: Decimal

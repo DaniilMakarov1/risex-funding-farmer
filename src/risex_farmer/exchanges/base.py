@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from datetime import UTC, datetime
-from decimal import Decimal
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal, ROUND_FLOOR
+from enum import StrEnum
 import json
 from typing import Any, Mapping
 
@@ -14,6 +16,21 @@ from risex_farmer.models import CanonicalMarket, FundingCashQuote, OrderBook, Tr
 
 
 JsonObject = Mapping[str, Any]
+# SYSTEM_SPEC polling cadence; venue wire-heartbeat intervals remain venue-specific.
+HEALTH_CHECK_CADENCE_SECONDS = 10
+
+
+class WebSocketFrameAction(StrEnum):
+    PING = "PING"
+    PONG = "PONG"
+    NONE = "NONE"
+
+
+@dataclass(frozen=True, slots=True)
+class PublicHeartbeatAction:
+    frame_action: WebSocketFrameAction
+    payload: bytes
+    connection_confirmed: bool
 
 
 class PublicDataUnavailable(RuntimeError):
@@ -93,7 +110,7 @@ class PublicAdapter(ABC):
 
     @abstractmethod
     def normalize_trade(
-        self, payload: JsonObject, *, receipt_at: datetime, session_id: str, ordinal: int
+        self, payload: JsonObject, *, received_at: datetime, session_id: str, ordinal: int
     ) -> TradeEvidence: ...
 
     @abstractmethod
@@ -135,10 +152,15 @@ def timestamp(value: Any, unit: str) -> datetime:
         "nanoseconds": Decimal("1000000000"),
     }
     try:
-        seconds = raw / divisors[unit]
+        divisor = divisors[unit]
     except KeyError as exc:
         raise ValueError(f"unsupported timestamp unit: {unit}") from exc
-    return datetime.fromtimestamp(float(seconds), tz=UTC)
+    total_microseconds = (raw * Decimal("1000000") / divisor).to_integral_value(
+        rounding=ROUND_FLOOR
+    )
+    whole_seconds, microseconds = divmod(int(total_microseconds), 1_000_000)
+    epoch = datetime(1970, 1, 1, tzinfo=UTC)
+    return epoch + timedelta(seconds=whole_seconds, microseconds=microseconds)
 
 
 def synthetic_trade_key(

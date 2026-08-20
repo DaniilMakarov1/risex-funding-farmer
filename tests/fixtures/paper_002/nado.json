@@ -74,5 +74,9 @@
     "cumulative_funding_long_x18": "1200000000000000000",
     "cumulative_funding_short_x18": "-1200000000000000000",
     "dt": "3600000000000"
+  },
+  "heartbeat": {
+    "client_ping_payload": "",
+    "server_pong_payload": "nado-probe"
   }
 }

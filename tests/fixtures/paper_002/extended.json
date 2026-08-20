@@ -62,5 +62,8 @@
       "T": 1800014400000,
       "f": "0.001"
     }
+  },
+  "heartbeat": {
+    "server_ping_payload": "extended-probe"
   }
 }

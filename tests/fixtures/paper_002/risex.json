@@ -40,5 +40,8 @@
       "bids": [{"price": "99.9", "quantity": "1", "order_count": 1}],
       "asks": []
     }
+  },
+  "heartbeat": {
+    "server_ping_payload": "risex-probe"
   }
 }

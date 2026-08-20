@@ -8,7 +8,12 @@ from typing import Any
 import pytest
 import aiohttp
 
-from risex_farmer.exchanges.base import PublicDataUnavailable
+from risex_farmer.exchanges.base import (
+    HEALTH_CHECK_CADENCE_SECONDS,
+    PublicDataUnavailable,
+    WebSocketFrameAction,
+    timestamp,
+)
 from risex_farmer.exchanges.extended import ExtendedAdapter
 from risex_farmer.exchanges.nado import NadoAdapter
 from risex_farmer.exchanges.risex import RisexAdapter
@@ -139,38 +144,40 @@ def test_trade_ids_aggressors_and_synthetic_keys() -> None:
     risex = RisexAdapter(None)
     risex.normalize_market(fixture("risex")["market"])
     r_trade = risex.normalize_trade(
-        fixture("risex")["trade"], receipt_at=NOW, session_id="s1", ordinal=1
+        fixture("risex")["trade"], received_at=NOW, session_id="s1", ordinal=1
     )
-    assert r_trade.key == "RISEX|ABC/USDC|maker-taker"
+    assert r_trade.trade_event_key == "RISEX|ABC/USDC|maker-taker"
     assert r_trade.aggressor_side is Side.SELL
     assert r_trade.is_orderbook_match is True
-    assert r_trade.exchange_at is not None
+    assert r_trade.exchange_timestamp is not None
+    assert r_trade.received_at == NOW
+    assert r_trade.raw_timestamp == fixture("risex")["trade"]["block_timestamp"]
 
     extended = ExtendedAdapter(None)
     e_trade = extended.normalize_trade(
-        fixture("extended")["trade"], receipt_at=NOW, session_id="s1", ordinal=1
+        fixture("extended")["trade"], received_at=NOW, session_id="s1", ordinal=1
     )
-    assert e_trade.key == "EXTENDED|ABC-USD|42"
+    assert e_trade.trade_event_key == "EXTENDED|ABC-USD|42"
     assert e_trade.aggressor_side is Side.SELL
     liquidation = deepcopy(fixture("extended")["trade"])
     liquidation["tT"] = "LIQUIDATION"
     assert ExtendedAdapter(None).normalize_trade(
-        liquidation, receipt_at=NOW, session_id="s1", ordinal=2
+        liquidation, received_at=NOW, session_id="s1", ordinal=2
     ).is_orderbook_match is False
     unknown = deepcopy(fixture("extended")["trade"])
     unknown.pop("tT")
     assert ExtendedAdapter(None).normalize_trade(
-        unknown, receipt_at=NOW, session_id="s1", ordinal=3
+        unknown, received_at=NOW, session_id="s1", ordinal=3
     ).is_orderbook_match is None
 
     nado = NadoAdapter(None)
     nado.normalize_market(fixture("nado")["market"])
     payload = fixture("nado")["trade"]
-    first = nado.normalize_trade(payload, receipt_at=NOW, session_id="s1", ordinal=1)
-    duplicate = nado.normalize_trade(payload, receipt_at=NOW, session_id="s1", ordinal=1)
-    next_event = nado.normalize_trade(payload, receipt_at=NOW, session_id="s1", ordinal=2)
-    assert first.key == duplicate.key
-    assert first.key != next_event.key
+    first = nado.normalize_trade(payload, received_at=NOW, session_id="s1", ordinal=1)
+    duplicate = nado.normalize_trade(payload, received_at=NOW, session_id="s1", ordinal=1)
+    next_event = nado.normalize_trade(payload, received_at=NOW, session_id="s1", ordinal=2)
+    assert first.trade_event_key == duplicate.trade_event_key
+    assert first.trade_event_key != next_event.trade_event_key
     assert first.aggressor_side is Side.BUY
     assert first.is_orderbook_match is True
 
@@ -188,6 +195,7 @@ def test_extended_and_nado_funding_conversion() -> None:
     )
     assert e_quote.long_cash_per_canonical_base_usd == D("-0.100")
     assert e_quote.short_cash_per_canonical_base_usd == D("0.100")
+    assert e_quote.assumed_or_actual_position_opened_at == NOW
     e_spot = extended.normalize_market(fixture("extended")["spot"])
     assert extended.funding_quote(
         e_spot,
@@ -260,8 +268,49 @@ def test_float_market_data_is_rejected() -> None:
     payload["p"] = 100.0
     with pytest.raises(TypeError, match="decimal string"):
         ExtendedAdapter(None).normalize_trade(
-            payload, receipt_at=NOW, session_id="s", ordinal=1
+            payload, received_at=NOW, session_id="s", ordinal=1
         )
+
+
+def test_nanosecond_timestamp_boundaries_floor_sub_microseconds() -> None:
+    exact_raw = 1_800_014_400_000_000_000
+    exact = timestamp(str(exact_raw), "nanoseconds")
+    before = timestamp(str(exact_raw - 1), "nanoseconds")
+    after = timestamp(str(exact_raw + 1), "nanoseconds")
+    assert exact == NOW
+    assert before == exact - timedelta(microseconds=1)
+    assert after == exact
+    assert before < exact <= after
+
+
+def test_public_websocket_heartbeat_actions() -> None:
+    assert HEALTH_CHECK_CADENCE_SECONDS == 10
+
+    risex_payload = fixture("risex")["heartbeat"]["server_ping_payload"].encode()
+    risex_action = RisexAdapter.handle_server_ping(risex_payload)
+    assert risex_action.frame_action is WebSocketFrameAction.PONG
+    assert risex_action.payload == risex_payload
+    assert risex_action.connection_confirmed
+
+    extended_payload = fixture("extended")["heartbeat"][
+        "server_ping_payload"
+    ].encode()
+    extended_action = ExtendedAdapter.handle_server_ping(extended_payload)
+    assert extended_action.frame_action is WebSocketFrameAction.PONG
+    assert extended_action.payload == extended_payload
+    assert extended_action.connection_confirmed
+
+    nado_data = fixture("nado")["heartbeat"]
+    nado_ping = NadoAdapter.client_ping_action(
+        nado_data["client_ping_payload"].encode()
+    )
+    assert nado_ping.frame_action is WebSocketFrameAction.PING
+    assert not nado_ping.connection_confirmed
+    nado_pong = NadoAdapter.handle_server_pong(
+        nado_data["server_pong_payload"].encode()
+    )
+    assert nado_pong.frame_action is WebSocketFrameAction.NONE
+    assert nado_pong.connection_confirmed
 
 
 def test_documented_book_delta_shapes_are_normalized() -> None:

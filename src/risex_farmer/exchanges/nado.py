@@ -24,6 +24,8 @@ from risex_farmer.models import (
 
 from .base import (
     PublicAdapter,
+    PublicHeartbeatAction,
+    WebSocketFrameAction,
     decimal_value,
     require_list,
     require_mapping,
@@ -180,7 +182,7 @@ class NadoAdapter(PublicAdapter):
         )
 
     def normalize_trade(
-        self, payload: Any, *, receipt_at: datetime, session_id: str, ordinal: int
+        self, payload: Any, *, received_at: datetime, session_id: str, ordinal: int
     ) -> TradeEvidence:
         trade = require_mapping(payload, "trade")
         product_id = int(trade["product_id"])
@@ -197,7 +199,7 @@ class NadoAdapter(PublicAdapter):
             Venue.NADO,
             market,
             timestamp(raw_time, "nanoseconds"),
-            receipt_at,
+            received_at,
             raw_time,
             quantity,
             price,
@@ -260,8 +262,8 @@ class NadoAdapter(PublicAdapter):
                 assumed_open_at=assumed_open_at,
             )
         update_time = int(message["update_time"])
-        settlement_at = datetime.fromtimestamp(
-            update_time - (update_time % 3600) + 3600, tz=UTC
+        settlement_at = timestamp(
+            update_time - (update_time % 3600) + 3600, "seconds"
         )
         return self.predicted_funding_quote(
             market,
@@ -291,8 +293,8 @@ class NadoAdapter(PublicAdapter):
             rate = require_mapping(rates[str(product_id)], "funding rate")
             price = require_mapping(prices[str(product_id)], "perp price")
             update_time = int(rate["update_time"])
-            settlement_at = datetime.fromtimestamp(
-                update_time - (update_time % 3600) + 3600, tz=UTC
+            settlement_at = timestamp(
+                update_time - (update_time % 3600) + 3600, "seconds"
             )
             return self.predicted_funding_quote(
                 market,
@@ -404,3 +406,11 @@ class NadoAdapter(PublicAdapter):
             "method": "subscribe",
             "stream": {"type": stream, "product_id": product_id},
         }
+
+    @staticmethod
+    def client_ping_action(payload: bytes = b"") -> PublicHeartbeatAction:
+        return PublicHeartbeatAction(WebSocketFrameAction.PING, payload, False)
+
+    @staticmethod
+    def handle_server_pong(payload: bytes = b"") -> PublicHeartbeatAction:
+        return PublicHeartbeatAction(WebSocketFrameAction.NONE, payload, True)

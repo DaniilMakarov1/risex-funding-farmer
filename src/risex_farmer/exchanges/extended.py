@@ -23,7 +23,15 @@ from risex_farmer.models import (
     Venue,
 )
 
-from .base import PublicAdapter, decimal_value, require_list, require_mapping, timestamp
+from .base import (
+    PublicAdapter,
+    PublicHeartbeatAction,
+    WebSocketFrameAction,
+    decimal_value,
+    require_list,
+    require_mapping,
+    timestamp,
+)
 
 
 class ExtendedAdapter(PublicAdapter):
@@ -134,7 +142,7 @@ class ExtendedAdapter(PublicAdapter):
         return BookDelta(Venue.EXTENDED, market, bids, asks, observed_at, sequence)
 
     def normalize_trade(
-        self, payload: Any, *, receipt_at: datetime, session_id: str, ordinal: int
+        self, payload: Any, *, received_at: datetime, session_id: str, ordinal: int
     ) -> TradeEvidence:
         trade = require_mapping(payload, "trade")
         market = str(trade["m"])
@@ -159,7 +167,7 @@ class ExtendedAdapter(PublicAdapter):
             Venue.EXTENDED,
             market,
             timestamp(raw_time, "milliseconds"),
-            receipt_at,
+            received_at,
             raw_time,
             quantity,
             price,
@@ -284,3 +292,7 @@ class ExtendedAdapter(PublicAdapter):
 
     def funding_stream_url(self, venue_symbol: str) -> str:
         return f"{self.ws_base}/funding/{quote(venue_symbol, safe='')}"
+
+    @staticmethod
+    def handle_server_ping(payload: bytes) -> PublicHeartbeatAction:
+        return PublicHeartbeatAction(WebSocketFrameAction.PONG, payload, True)

@@ -22,7 +22,15 @@ from risex_farmer.models import (
     Venue,
 )
 
-from .base import PublicAdapter, decimal_value, require_list, require_mapping, timestamp
+from .base import (
+    PublicAdapter,
+    PublicHeartbeatAction,
+    WebSocketFrameAction,
+    decimal_value,
+    require_list,
+    require_mapping,
+    timestamp,
+)
 
 
 class RisexAdapter(PublicAdapter):
@@ -136,7 +144,7 @@ class RisexAdapter(PublicAdapter):
         )
 
     def normalize_trade(
-        self, payload: Any, *, receipt_at: datetime, session_id: str, ordinal: int
+        self, payload: Any, *, received_at: datetime, session_id: str, ordinal: int
     ) -> TradeEvidence:
         outer = require_mapping(payload, "trade message")
         trade = require_mapping(outer.get("data", outer), "trade")
@@ -152,7 +160,9 @@ class RisexAdapter(PublicAdapter):
         else:
             aggressor = None
         raw_time = outer.get("block_timestamp", trade.get("time"))
-        exchange_at = timestamp(raw_time, "nanoseconds") if raw_time is not None else None
+        exchange_timestamp = (
+            timestamp(raw_time, "nanoseconds") if raw_time is not None else None
+        )
         trade_id = trade.get("id")
         key = f"RISEX|{market}|{trade_id}" if trade_id is not None else (
             f"RISEX|{session_id}|{raw_time}|{market}|{price}|{quantity}|"
@@ -162,8 +172,8 @@ class RisexAdapter(PublicAdapter):
             key,
             Venue.RISEX,
             market,
-            exchange_at,
-            receipt_at,
+            exchange_timestamp,
+            received_at,
             raw_time,
             quantity,
             price,
@@ -203,3 +213,7 @@ class RisexAdapter(PublicAdapter):
     @staticmethod
     def trades_subscription(market_ids: list[int]) -> dict[str, object]:
         return {"method": "subscribe", "params": {"channel": "trades", "market_ids": market_ids}}
+
+    @staticmethod
+    def handle_server_ping(payload: bytes) -> PublicHeartbeatAction:
+        return PublicHeartbeatAction(WebSocketFrameAction.PONG, payload, True)
