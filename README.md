@@ -26,8 +26,9 @@ pytest
 
 ## Commands
 
-The commands use a local SQLite paper database. With no fixture, commands fail
-closed when public data is unavailable or RISEx semantics remain unknown:
+The commands use a local SQLite paper database. With no fixture, `scan-once`
+performs a read-only public REST scan and `paper-run` maintains read-only public
+market-data streams until Ctrl+C or SIGTERM:
 
 ```bash
 risex-farmer --db paper.db scan-once
@@ -35,7 +36,16 @@ risex-farmer --db paper.db paper-run
 risex-farmer --db paper.db report
 ```
 
-`scan-once` evaluates the current official public-data opportunity set. `paper-run` runs the ordinary single-process simulator without LLM calls. `report` summarizes persisted paper evidence. An open position is never force-closed merely because a run ends.
+`scan-once` prints ranked eligible, negative, and specifically blocked routes.
+`paper-run` continues through `NO_TRADE` and venue outages, reconnecting public
+streams and failing affected routes closed. `report` summarizes persisted paper
+and runtime evidence. An open position is never force-closed merely because a
+run ends.
+
+RISEx contract quantity and forecast funding use visibly reported paper-only
+fallback assumptions. They are enabled only for this experiment and fail closed
+when public metadata, grids, stable-quote identity, price, rate, or schedule
+checks are inconsistent. They are never represented as official applied funding.
 
 Deterministic fixture mode is intended for CI and local paper verification and
 never accesses the network:

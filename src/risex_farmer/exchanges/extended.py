@@ -50,18 +50,29 @@ class ExtendedAdapter(PublicAdapter):
         rows = require_list(payload.get("data"), "data")
         return tuple(self.normalize_market(require_mapping(row, "market")) for row in rows)
 
+    async def fetch_volumes(self) -> tuple[MarketVolume, ...]:
+        payload = await self._get_json("/api/v1/info/markets")
+        rows = require_list(payload.get("data"), "data")
+        observed_at = datetime.now(UTC)
+        return tuple(self.normalize_volume(row, observed_at=observed_at) for row in rows)
+
     def normalize_market(self, row: Any) -> CanonicalMarket:
         row = require_mapping(row, "market")
         config = require_mapping(row.get("tradingConfig"), "market.tradingConfig")
         is_perpetual = row.get("type") == "PERPETUAL"
+        is_crypto = row.get("category") == "Crypto"
         status = str(row.get("status", ""))
         return CanonicalMarket(
             canonical_asset=str(row["assetName"]),
             venue=Venue.EXTENDED,
             venue_symbol=str(row["name"]),
             market_type=MarketType.PERPETUAL if is_perpetual else MarketType.SPOT,
-            contract_type=ContractType.LINEAR if is_perpetual else ContractType.OTHER,
-            base_multiplier=Decimal("1") if is_perpetual else None,
+            contract_type=(
+                ContractType.LINEAR
+                if is_perpetual and is_crypto
+                else ContractType.OTHER
+            ),
+            base_multiplier=Decimal("1") if is_perpetual and is_crypto else None,
             quote_asset=str(row["collateralAssetName"]),
             settlement_asset=str(row["collateralAssetName"]),
             tick_size_raw=decimal_value(config["minPriceChange"], "tradingConfig.minPriceChange"),
@@ -71,7 +82,7 @@ class ExtendedAdapter(PublicAdapter):
             minimum_quantity_raw=decimal_value(config["minOrderSize"], "tradingConfig.minOrderSize"),
             minimum_notional_usd=Decimal("0"),
             minimum_fee_notional_usd=None,
-            is_active=bool(row.get("active")) and status == "ACTIVE",
+            is_active=bool(row.get("active")) and status == "ACTIVE" and is_crypto,
             is_rfq=bool(row.get("isRfq")),
             is_off_hours=bool(row.get("isOffHours")),
         )

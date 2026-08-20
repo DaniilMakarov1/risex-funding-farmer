@@ -1,4 +1,4 @@
-"""Fixture-driven orchestration for CI and safe fail-closed command defaults."""
+"""Fixture-driven orchestration for deterministic CI runs."""
 
 from __future__ import annotations
 
@@ -145,10 +145,6 @@ async def fixture_scan(
     )
     hedge = _observation(Venue.EXTENDED, asset, logical_at, target)
     return await scan_once((risex, hedge), logical_at), (risex, hedge)
-
-
-async def fail_closed_scan() -> ScanSnapshot:
-    return await scan_once((), datetime.now(UTC))
 
 
 def _entry_trade(order, at: datetime) -> TradeEvidence:

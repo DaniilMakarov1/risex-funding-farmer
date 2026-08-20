@@ -93,6 +93,12 @@ class NadoAdapter(PublicAdapter):
             is_off_hours=is_off_hours,
         )
 
+    def product_id(self, venue_symbol: str) -> int:
+        return self._product_ids[venue_symbol]
+
+    def symbol_for_product(self, product_id: int) -> str:
+        return self._symbols_by_id.get(product_id, str(product_id))
+
     def normalize_volume(self, row: Any, *, observed_at: datetime) -> MarketVolume:
         row = require_mapping(row, "ticker")
         raw_volume = row.get("quote_volume")

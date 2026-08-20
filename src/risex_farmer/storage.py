@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pickle
+import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -195,6 +196,19 @@ CREATE TABLE IF NOT EXISTS runtime_state (
     lifecycle_state TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     payload BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS runtime_evidence (
+    evidence_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    recorded_at TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    venue TEXT,
+    detail TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS venue_readiness (
+    venue TEXT PRIMARY KEY,
+    updated_at TEXT NOT NULL,
+    available INTEGER NOT NULL,
+    detail TEXT NOT NULL
 );
 """
 
@@ -697,6 +711,43 @@ class PaperRepository:
         ).fetchone()
         return None if row is None else datetime.fromisoformat(row["updated_at"])
 
+    def record_runtime_evidence(
+        self,
+        *,
+        recorded_at: datetime,
+        event_type: str,
+        venue: str | None = None,
+        detail: dict[str, object] | None = None,
+    ) -> None:
+        """Persist bounded runtime transitions, never raw stream payloads."""
+        with self.transaction():
+            self.connection.execute(
+                "INSERT INTO runtime_evidence(recorded_at,event_type,venue,detail) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    _iso(recorded_at),
+                    event_type,
+                    venue,
+                    json.dumps(detail or {}, sort_keys=True, separators=(",", ":")),
+                ),
+            )
+
+    def set_venue_readiness(
+        self,
+        *,
+        venue: str,
+        updated_at: datetime,
+        available: bool,
+        detail: str,
+    ) -> None:
+        with self.transaction():
+            self.connection.execute(
+                """INSERT INTO venue_readiness VALUES (?, ?, ?, ?)
+                   ON CONFLICT(venue) DO UPDATE SET updated_at=excluded.updated_at,
+                   available=excluded.available, detail=excluded.detail""",
+                (venue, _iso(updated_at), int(available), detail),
+            )
+
     def report(self, *, as_of: datetime | None = None) -> dict[str, object]:
         as_of = as_of or datetime.now(UTC)
         scans = self.connection.execute(
@@ -823,6 +874,20 @@ class PaperRepository:
                 "position_id": None if position is None else position.position_id,
             }
         partial_cycles = self._applied_partial_cycle_count()
+        runtime_evidence = self.connection.execute(
+            "SELECT recorded_at,event_type,venue,detail FROM runtime_evidence "
+            "ORDER BY evidence_id"
+        ).fetchall()
+        latest_readiness = {
+            row["venue"]: {
+                "available": bool(row["available"]),
+                "detail": row["detail"],
+                "updated_at": row["updated_at"],
+            }
+            for row in self.connection.execute(
+                "SELECT venue,updated_at,available,detail FROM venue_readiness"
+            ).fetchall()
+        }
         normal_exit_fills = sum(
             closed.close_reason.value == "NORMAL_MAKER" for closed in closed_values
         )
@@ -933,6 +998,18 @@ class PaperRepository:
             "primary_trade_count": len(primary),
             "applied_trade_count": len(applied),
             "open_position": open_position,
+            "runtime_evidence_count": len(runtime_evidence),
+            "venue_readiness": latest_readiness,
+            "last_runtime_event": (
+                None
+                if not runtime_evidence
+                else {
+                    "recorded_at": runtime_evidence[-1]["recorded_at"],
+                    "event_type": runtime_evidence[-1]["event_type"],
+                    "venue": runtime_evidence[-1]["venue"],
+                    "detail": json.loads(runtime_evidence[-1]["detail"]),
+                }
+            ),
             "assumption_flags": {
                 "paper_only": True,
                 "taker_failure_and_latency_not_simulated": True,
@@ -945,6 +1022,11 @@ class PaperRepository:
                 "points_value_usd": "0",
                 "risex_fee_tier": "USER_CONFIGURED_TIER_3",
                 "nado_fees": "USER_CONFIGURED_ASSUMPTION",
+                "risex_paper_fallback_assumptions_enabled": True,
+                "risex_contract_and_quantity_are_paper_assumptions": True,
+                "risex_funding_eligibility_is_a_paper_assumption": True,
+                "risex_next_rate_estimate_is_a_paper_assumption": True,
+                "risex_assumed_funding_is_not_official_applied_funding": True,
             },
         }
 

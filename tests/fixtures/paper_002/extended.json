@@ -2,6 +2,7 @@
   "market": {
     "name": "ABC-USD",
     "type": "PERPETUAL",
+    "category": "Crypto",
     "assetName": "ABC",
     "collateralAssetName": "USDC",
     "active": true,
@@ -18,6 +19,7 @@
   "spot": {
     "name": "ABC-USDC-SPOT",
     "type": "SPOT",
+    "category": "Crypto",
     "assetName": "ABC",
     "collateralAssetName": "USDC",
     "active": true,

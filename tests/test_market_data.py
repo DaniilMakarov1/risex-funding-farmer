@@ -82,6 +82,10 @@ def test_market_normalization_and_exclusions() -> None:
     rfq = deepcopy(extended_data["market"])
     rfq["isRfq"] = True
     assert extended.normalize_market(rfq).is_rfq
+    rwa = deepcopy(extended_data["market"])
+    rwa["category"] = "RWA"
+    assert extended.normalize_market(rwa).contract_type is ContractType.OTHER
+    assert not extended.normalize_market(rwa).is_active
 
     nado = NadoAdapter(None)
     nado_data = fixture("nado")
@@ -126,18 +130,46 @@ async def test_extended_public_access_never_adds_auth_and_marks_rejection() -> N
     assert rejected.public_data_available is False
 
 
-def test_risex_multiplier_and_funding_are_explicitly_unknown() -> None:
+def test_risex_paper_fallback_is_explicit_and_unknown_funding_still_fails_closed() -> None:
     adapter = RisexAdapter(None)
     market = adapter.normalize_market(fixture("risex")["market"])
     quote = adapter.unknown_funding_quote(
         market, observed_at=NOW, assumed_open_at=NOW
     )
-    assert market.base_multiplier is None
-    assert market.contract_type is ContractType.OTHER
+    assert market.base_multiplier == D("1")
+    assert market.contract_type is ContractType.LINEAR
     assert quote.quality is FundingQuality.UNKNOWN
     assert not quote.eligibility_known
     assert quote.long_cash_per_canonical_base_usd is None
     assert quote.short_cash_per_canonical_base_usd is None
+
+
+@pytest.mark.asyncio
+async def test_risex_funding_fallback_is_labeled_and_consistency_gated() -> None:
+    adapter = RisexAdapter(None)
+    row = deepcopy(fixture("risex")["market"])
+    assumed_at = datetime.now(UTC)
+    settlement_at = assumed_at + timedelta(hours=1)
+    row.update(
+        {
+            "current_funding_rate": "0.001",
+            "mark_price": "100",
+            "next_funding_time": str(int(settlement_at.timestamp() * 1_000_000_000)),
+        }
+    )
+    market = adapter.normalize_market(row)
+    quote = await adapter.fetch_funding_quote(market, assumed_open_at=assumed_at)
+    assert quote.quality is FundingQuality.ESTIMATED
+    assert quote.source == "PAPER_ASSUMPTION:RISEX_PUBLIC_FALLBACK"
+    assert quote.long_cash_per_canonical_base_usd == D("-0.100")
+    inconsistent = deepcopy(row)
+    inconsistent["quote_asset_symbol"] = "EUR"
+    blocked_market = adapter.normalize_market(inconsistent)
+    blocked = await adapter.fetch_funding_quote(
+        blocked_market, assumed_open_at=assumed_at
+    )
+    assert blocked.quality is FundingQuality.UNKNOWN
+    assert blocked_market.base_multiplier is None
 
 
 def test_trade_ids_aggressors_and_synthetic_keys() -> None:

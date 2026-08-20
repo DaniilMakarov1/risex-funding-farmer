@@ -12,7 +12,14 @@ from typing import Any, Mapping
 
 import aiohttp
 
-from risex_farmer.models import CanonicalMarket, FundingCashQuote, OrderBook, TradeEvidence
+from risex_farmer.models import (
+    CanonicalMarket,
+    FundingCashQuote,
+    FundingSettlement,
+    MarketVolume,
+    OrderBook,
+    TradeEvidence,
+)
 
 
 JsonObject = Mapping[str, Any]
@@ -101,12 +108,25 @@ class PublicAdapter(ABC):
     async def fetch_markets(self) -> tuple[CanonicalMarket, ...]: ...
 
     @abstractmethod
+    async def fetch_volumes(self) -> tuple[MarketVolume, ...]: ...
+
+    @abstractmethod
     async def fetch_book(self, venue_symbol: str) -> OrderBook: ...
 
     @abstractmethod
     async def fetch_funding_quote(
         self, market: CanonicalMarket, *, assumed_open_at: datetime
     ) -> FundingCashQuote: ...
+
+    async def fetch_applied_settlements(
+        self,
+        market: CanonicalMarket,
+        *,
+        since: datetime,
+        until: datetime,
+    ) -> tuple[FundingSettlement, ...]:
+        """Return official history only when its public units are proven."""
+        return ()
 
     @abstractmethod
     def normalize_trade(

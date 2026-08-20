@@ -7,7 +7,8 @@ import asyncio
 import json
 from collections.abc import Sequence
 
-from .orchestrator import fail_closed_scan, fixture_scan, load_fixture, run_fixture
+from .orchestrator import fixture_scan, load_fixture, run_fixture
+from .runtime import public_paper_run, public_scan_once
 from .storage import PaperRepository
 
 
@@ -25,15 +26,7 @@ def _parser() -> argparse.ArgumentParser:
 
 async def _scan_once(repository: PaperRepository, fixture: str | None) -> dict[str, object]:
     if fixture is None:
-        snapshot = await fail_closed_scan()
-        repository.save_decision(
-            recorded_at=snapshot.logical_at, scan_snapshot=snapshot
-        )
-        return {
-            "status": "NO_TRADE",
-            "reason": "LIVE_PUBLIC_DATA_NOT_CONFIGURED_OR_RISEX_SEMANTICS_UNKNOWN",
-            "eligible_count": 0,
-        }
+        return await public_scan_once(repository)
     snapshot, observations = await fixture_scan(load_fixture(fixture))
     repository.save_decision(
         recorded_at=snapshot.logical_at,
@@ -53,15 +46,7 @@ async def _paper_run(
     repository: PaperRepository, fixture: str | None
 ) -> dict[str, object]:
     if fixture is None:
-        snapshot = await fail_closed_scan()
-        repository.save_decision(
-            recorded_at=snapshot.logical_at, scan_snapshot=snapshot
-        )
-        return {
-            "status": "STOPPED_SAFE",
-            "reason": "LIVE_PUBLIC_DATA_NOT_CONFIGURED_OR_RISEX_SEMANTICS_UNKNOWN",
-            "forced_close": False,
-        }
+        return await public_paper_run(repository)
     return await run_fixture(load_fixture(fixture), repository)
 
 

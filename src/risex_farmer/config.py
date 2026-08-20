@@ -32,6 +32,7 @@ class PaperConfig:
     paper_entry_min_planned_net_pnl_usd: Decimal = Decimal("0")
     btc_eth_hard_basis_expansion_rate: Decimal = Decimal("0.04")
     other_top5_hard_basis_expansion_rate: Decimal = Decimal("0.06")
+    risex_paper_fallback_assumptions_enabled: bool = True
 
 
 PAPER_CONFIG = PaperConfig()
@@ -64,3 +65,6 @@ POINTS_VALUE_USD = PAPER_CONFIG.points_value_usd
 PAPER_ENTRY_MIN_PLANNED_NET_PNL_USD = PAPER_CONFIG.paper_entry_min_planned_net_pnl_usd
 BTC_ETH_HARD_BASIS_EXPANSION_RATE = PAPER_CONFIG.btc_eth_hard_basis_expansion_rate
 OTHER_TOP5_HARD_BASIS_EXPANSION_RATE = PAPER_CONFIG.other_top5_hard_basis_expansion_rate
+RISEX_PAPER_FALLBACK_ASSUMPTIONS_ENABLED = (
+    PAPER_CONFIG.risex_paper_fallback_assumptions_enabled
+)

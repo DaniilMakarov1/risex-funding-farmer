@@ -240,14 +240,23 @@ async def test_persisted_restart_rules_cover_entry_exit_and_flat(
 
 def test_cli_commands_are_structured_and_network_free(tmp_path, capsys) -> None:
     database = tmp_path / "cli.db"
-    assert main(["--db", str(database), "scan-once"]) == 0
+    paper_database = tmp_path / "cli-paper.db"
+    assert main(
+        [
+            "--db",
+            str(database),
+            "scan-once",
+            "--fixture",
+            str(FIXTURES / "no_opportunity.json"),
+        ]
+    ) == 0
     no_live = json.loads(capsys.readouterr().out)
     assert no_live["status"] == "NO_TRADE"
 
     assert main(
         [
             "--db",
-            str(database),
+            str(paper_database),
             "paper-run",
             "--fixture",
             str(FIXTURES / "positive_closed.json"),
@@ -256,7 +265,7 @@ def test_cli_commands_are_structured_and_network_free(tmp_path, capsys) -> None:
     run = json.loads(capsys.readouterr().out)
     assert run["status"] == "CLOSED"
 
-    assert main(["--db", str(database), "report"]) == 0
+    assert main(["--db", str(paper_database), "report"]) == 0
     report = json.loads(capsys.readouterr().out)
     assert report["fills"] == 4
     assert report["assumption_flags"]["paper_only"] is True

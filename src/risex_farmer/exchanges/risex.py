@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -21,6 +21,7 @@ from risex_farmer.models import (
     TradeEvidence,
     Venue,
 )
+from risex_farmer.config import RISEX_PAPER_FALLBACK_ASSUMPTIONS_ENABLED
 
 from .base import (
     PublicAdapter,
@@ -36,11 +37,13 @@ from .base import (
 class RisexAdapter(PublicAdapter):
     MARKETS_SOURCE = "https://developer.rise.trade/reference/marketservice_getmarkets.md"
     FUNDING_SOURCE = "https://developer.rise.trade/reference/getfundingratehistory.md"
+    PAPER_ASSUMPTION_SOURCE = "PAPER_ASSUMPTION:RISEX_PUBLIC_FALLBACK"
 
     def __init__(self, session: Any) -> None:
         super().__init__(session, "https://api.rise.trade", "wss://ws.rise.trade/ws")
         self._market_ids: dict[str, str] = {}
         self._symbols_by_id: dict[str, str] = {}
+        self._raw_markets: dict[str, dict[str, Any]] = {}
 
     async def fetch_markets(self) -> tuple[CanonicalMarket, ...]:
         payload = await self._get_json("/v1/markets", params={"force_refresh": "true"})
@@ -49,6 +52,13 @@ class RisexAdapter(PublicAdapter):
         normalized = tuple(self.normalize_market(require_mapping(row, "market")) for row in markets)
         return normalized
 
+    async def fetch_volumes(self) -> tuple[MarketVolume, ...]:
+        payload = await self._get_json("/v1/markets", params={"force_refresh": "true"})
+        data = require_mapping(payload.get("data"), "data")
+        rows = require_list(data.get("markets"), "data.markets")
+        observed_at = datetime.now(UTC)
+        return tuple(self.normalize_volume(row, observed_at=observed_at) for row in rows)
+
     def normalize_market(self, row: dict[str, Any] | Any) -> CanonicalMarket:
         row = require_mapping(row, "market")
         config = require_mapping(row.get("config"), "market.config")
@@ -56,16 +66,32 @@ class RisexAdapter(PublicAdapter):
         symbol = str(config["name"])
         self._market_ids[symbol] = market_id
         self._symbols_by_id[market_id] = symbol
+        self._raw_markets[symbol] = dict(row)
+        quote = str(row.get("quote_asset_symbol") or "UNKNOWN")
+        raw_asset = str(row.get("base_asset_symbol") or row.get("underlying") or symbol)
+        canonical_asset = raw_asset.split("/")[0].split("-")[0]
+        positive_grid = all(
+            decimal_value(config[name], f"config.{name}") > 0
+            for name in ("step_price", "step_size", "min_order_size")
+        )
+        fallback_consistent = (
+            RISEX_PAPER_FALLBACK_ASSUMPTIONS_ENABLED
+            and bool(row.get("active", True))
+            and bool(config.get("unlocked", False))
+            and quote in {"USD", "USDC", "USDT", "USDT0"}
+            and bool(canonical_asset)
+            and positive_grid
+        )
         return CanonicalMarket(
-            canonical_asset=str(row.get("base_asset_symbol") or row.get("underlying") or symbol),
+            canonical_asset=canonical_asset,
             venue=Venue.RISEX,
             venue_symbol=symbol,
             market_type=MarketType.PERPETUAL,
-            # Official public metadata does not prove multiplier or linear parity.
-            contract_type=ContractType.OTHER,
-            base_multiplier=None,
-            quote_asset=str(row.get("quote_asset_symbol") or "UNKNOWN"),
-            settlement_asset=str(row.get("quote_asset_symbol") or "UNKNOWN"),
+            # Explicitly authorized paper fallback, never official contract evidence.
+            contract_type=ContractType.LINEAR if fallback_consistent else ContractType.OTHER,
+            base_multiplier=Decimal("1") if fallback_consistent else None,
+            quote_asset=quote,
+            settlement_asset=quote,
             tick_size_raw=decimal_value(config["step_price"], "config.step_price"),
             quantity_step_raw=decimal_value(config["step_size"], "config.step_size"),
             minimum_quantity_raw=decimal_value(config["min_order_size"], "config.min_order_size"),
@@ -201,10 +227,55 @@ class RisexAdapter(PublicAdapter):
     async def fetch_funding_quote(
         self, market: CanonicalMarket, *, assumed_open_at: datetime
     ) -> FundingCashQuote:
-        # Public values do not establish hypothetical accrual or eligibility.
-        return self.unknown_funding_quote(
-            market, observed_at=datetime.now(UTC), assumed_open_at=assumed_open_at
+        observed_at = datetime.now(UTC)
+        if (
+            not RISEX_PAPER_FALLBACK_ASSUMPTIONS_ENABLED
+            or market.base_multiplier != Decimal("1")
+            or market.contract_type is not ContractType.LINEAR
+        ):
+            return self.unknown_funding_quote(
+                market, observed_at=observed_at, assumed_open_at=assumed_open_at
+            )
+        raw = self._raw_markets.get(market.venue_symbol, {})
+        rate_raw = raw.get("funding_rate", raw.get("current_funding_rate"))
+        price_raw = raw.get("mark_price", raw.get("oracle_price", raw.get("index_price")))
+        next_raw = raw.get("next_funding_timestamp", raw.get("next_funding_time"))
+        try:
+            rate = decimal_value(rate_raw, "funding_rate")
+            price = decimal_value(price_raw, "funding_price")
+            if next_raw is None:
+                settlement_at = observed_at.replace(minute=0, second=0, microsecond=0)
+                settlement_at += timedelta(hours=1)
+            else:
+                integer = int(next_raw)
+                unit = "nanoseconds" if abs(integer) >= 10**17 else (
+                    "milliseconds" if abs(integer) >= 10**11 else "seconds"
+                )
+                settlement_at = timestamp(integer, unit)
+            if price <= 0 or settlement_at <= observed_at:
+                raise ValueError("inconsistent RISEx funding inputs")
+        except (KeyError, TypeError, ValueError):
+            return self.unknown_funding_quote(
+                market, observed_at=observed_at, assumed_open_at=assumed_open_at
+            )
+        cash = rate * price
+        eligible = assumed_open_at < settlement_at
+        return FundingCashQuote(
+            Venue.RISEX,
+            market.venue_symbol,
+            observed_at,
+            assumed_open_at,
+            settlement_at,
+            FundingQuality.ESTIMATED,
+            FundingAccrualMethod.SNAPSHOT_AT_SETTLEMENT,
+            True,
+            -cash if eligible else Decimal("0"),
+            cash if eligible else Decimal("0"),
+            self.PAPER_ASSUMPTION_SOURCE,
         )
+
+    def market_id(self, venue_symbol: str) -> int:
+        return int(self._market_ids[venue_symbol])
 
     @staticmethod
     def orderbook_subscription(market_ids: list[int]) -> dict[str, object]:
