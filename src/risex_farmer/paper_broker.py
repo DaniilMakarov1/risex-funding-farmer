@@ -397,6 +397,17 @@ class PaperEntryBroker:
         self._state = PaperEntryState()
         self._lock = asyncio.Lock()
 
+    @classmethod
+    def from_state(
+        cls,
+        state: PaperEntryState,
+        *,
+        config: PaperConfig = PAPER_CONFIG,
+    ) -> PaperEntryBroker:
+        broker = cls(config=config)
+        broker._state = state
+        return broker
+
     @property
     def state(self) -> PaperEntryState:
         return self._state

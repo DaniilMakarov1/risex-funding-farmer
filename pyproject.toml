@@ -9,6 +9,9 @@ description = "Paper-only delta-neutral funding strategy research"
 requires-python = ">=3.11"
 dependencies = ["aiohttp>=3.9,<4"]
 
+[project.scripts]
+risex-farmer = "risex_farmer.cli:main"
+
 [project.optional-dependencies]
 test = ["pytest>=8,<9", "pytest-asyncio>=0.23,<1"]
 

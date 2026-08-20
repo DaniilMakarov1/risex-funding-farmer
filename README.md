@@ -26,14 +26,24 @@ pytest
 
 ## Commands
 
-These commands are delivered incrementally by the fixed milestones and are not implemented by bootstrap:
+The commands use a local SQLite paper database. With no fixture, commands fail
+closed when public data is unavailable or RISEx semantics remain unknown:
 
 ```bash
-risex-farmer scan-once
-risex-farmer paper-run
-risex-farmer report
+risex-farmer --db paper.db scan-once
+risex-farmer --db paper.db paper-run
+risex-farmer --db paper.db report
 ```
 
 `scan-once` evaluates the current official public-data opportunity set. `paper-run` runs the ordinary single-process simulator without LLM calls. `report` summarizes persisted paper evidence. An open position is never force-closed merely because a run ends.
+
+Deterministic fixture mode is intended for CI and local paper verification and
+never accesses the network:
+
+```bash
+risex-farmer --db paper.db scan-once --fixture tests/fixtures/paper_006/no_opportunity.json
+risex-farmer --db paper.db paper-run --fixture tests/fixtures/paper_006/positive_closed.json
+risex-farmer --db paper.db report
+```
 
 See `SYSTEM_SPEC.md` for frozen product behavior, `STATUS.md` for the accepted baseline, and `NEXT_TASK.md` for the only active implementation task.

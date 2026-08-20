@@ -389,6 +389,19 @@ class LifecycleEngine:
             aggressive_started_at=aggressive_at,
         )
 
+    @classmethod
+    def from_snapshot(
+        cls,
+        snapshot: LifecycleSnapshot,
+        *,
+        config: PaperConfig = PAPER_CONFIG,
+    ) -> LifecycleEngine:
+        engine = cls.__new__(cls)
+        engine.config = config
+        engine._lock = asyncio.Lock()
+        engine._snapshot = snapshot
+        return engine
+
     @property
     def snapshot(self) -> LifecycleSnapshot:
         return self._snapshot
