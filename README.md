@@ -32,6 +32,7 @@ market-data streams until Ctrl+C or SIGTERM:
 
 ```bash
 risex-farmer --db paper.db scan-once
+risex-farmer --db paper.db scan-once --format json
 risex-farmer --db paper.db scan-once --format table
 risex-farmer --db paper.db paper-run
 risex-farmer --db paper.db report
