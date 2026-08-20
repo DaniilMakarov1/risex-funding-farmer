@@ -186,6 +186,21 @@ class ExtendedAdapter(PublicAdapter):
             is_orderbook_match,
         )
 
+    def normalize_trade_message(
+        self, payload: Any, *, received_at: datetime, session_id: str,
+        starting_ordinal: int,
+    ) -> tuple[int, tuple[TradeEvidence, ...]]:
+        """Normalize the documented ``{seq,data:[...]}`` public wrapper."""
+        message = require_mapping(payload, "public trades message")
+        rows = require_list(message.get("data"), "public trades message.data")
+        return int(message["seq"]), tuple(
+            self.normalize_trade(
+                row, received_at=received_at, session_id=session_id,
+                ordinal=starting_ordinal + index,
+            )
+            for index, row in enumerate(rows, 1)
+        )
+
     def funding_quote(
         self,
         market: CanonicalMarket,

@@ -68,6 +68,13 @@ CREATE TABLE IF NOT EXISTS scanner_snapshots (
     winner_asset TEXT,
     payload BLOB NOT NULL
 );
+CREATE TABLE IF NOT EXISTS public_route_rows (
+    logical_at TEXT NOT NULL,
+    rank INTEGER,
+    route_key TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    PRIMARY KEY (logical_at, route_key)
+);
 CREATE TABLE IF NOT EXISTS funding_quotes (
     venue TEXT NOT NULL,
     canonical_market TEXT NOT NULL,
@@ -748,6 +755,25 @@ class PaperRepository:
                 (venue, _iso(updated_at), int(available), detail),
             )
 
+    def save_public_route_rows(
+        self, *, logical_at: datetime, rows: tuple[dict[str, object], ...]
+    ) -> None:
+        """Replace the latest human-readable public scan evidence atomically."""
+        with self.transaction():
+            self.connection.execute("DELETE FROM public_route_rows")
+            self.connection.executemany(
+                "INSERT INTO public_route_rows VALUES (?, ?, ?, ?)",
+                (
+                    (
+                        _iso(logical_at),
+                        row.get("rank"),
+                        str(row["route_key"]),
+                        json.dumps(row, sort_keys=True, separators=(",", ":")),
+                    )
+                    for row in rows
+                ),
+            )
+
     def report(self, *, as_of: datetime | None = None) -> dict[str, object]:
         as_of = as_of or datetime.now(UTC)
         scans = self.connection.execute(
@@ -888,6 +914,18 @@ class PaperRepository:
                 "SELECT venue,updated_at,available,detail FROM venue_readiness"
             ).fetchall()
         }
+        latest_routes = [
+            json.loads(row["payload"])
+            for row in self.connection.execute(
+                "SELECT payload FROM public_route_rows "
+                "ORDER BY rank IS NULL, rank, route_key"
+            )
+        ]
+        latest_trade_row = self.connection.execute(
+            "SELECT payload FROM processed_trade_events WHERE payload IS NOT NULL "
+            "ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+        latest_trade = None if latest_trade_row is None else _load(latest_trade_row["payload"])
         normal_exit_fills = sum(
             closed.close_reason.value == "NORMAL_MAKER" for closed in closed_values
         )
@@ -1000,6 +1038,16 @@ class PaperRepository:
             "open_position": open_position,
             "runtime_evidence_count": len(runtime_evidence),
             "venue_readiness": latest_readiness,
+            "latest_routes": latest_routes,
+            "latest_trade_evidence": (
+                None if latest_trade is None else {
+                    "trade_event_key": latest_trade.trade_event_key,
+                    "venue": latest_trade.venue.value,
+                    "canonical_market": latest_trade.canonical_market,
+                    "source_marker": latest_trade.source_marker,
+                    "paper_assumptions": list(latest_trade.paper_assumptions),
+                }
+            ),
             "last_runtime_event": (
                 None
                 if not runtime_evidence

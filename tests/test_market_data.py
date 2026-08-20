@@ -136,12 +136,16 @@ def test_risex_paper_fallback_is_explicit_and_unknown_funding_still_fails_closed
     quote = adapter.unknown_funding_quote(
         market, observed_at=NOW, assumed_open_at=NOW
     )
-    assert market.base_multiplier == D("1")
-    assert market.contract_type is ContractType.LINEAR
+    assert market.base_multiplier is None
+    assert market.contract_type is ContractType.OTHER
     assert quote.quality is FundingQuality.UNKNOWN
     assert not quote.eligibility_known
     assert quote.long_cash_per_canonical_base_usd is None
     assert quote.short_cash_per_canonical_base_usd is None
+    synthetic = deepcopy(fixture("risex")["market"])
+    synthetic["config"]["name"] = "1000ABC/USDC"
+    synthetic["base_asset_symbol"] = "1000ABC/USDC"
+    assert RisexAdapter(None).normalize_market(synthetic).contract_type is ContractType.OTHER
 
 
 @pytest.mark.asyncio
@@ -157,10 +161,13 @@ async def test_risex_funding_fallback_is_labeled_and_consistency_gated() -> None
             "next_funding_time": str(int(settlement_at.timestamp() * 1_000_000_000)),
         }
     )
+    adapter.normalize_market(row)
+    adapter.normalize_book(fixture("risex")["book"], observed_at=assumed_at)
+    adapter.normalize_trade(fixture("risex")["trade"], received_at=assumed_at, session_id="proof", ordinal=1)
     market = adapter.normalize_market(row)
     quote = await adapter.fetch_funding_quote(market, assumed_open_at=assumed_at)
     assert quote.quality is FundingQuality.ESTIMATED
-    assert quote.source == "PAPER_ASSUMPTION:RISEX_PUBLIC_FALLBACK"
+    assert quote.source == "PAPER_ASSUMPTION_CURRENT_NEXT_RATE"
     assert quote.long_cash_per_canonical_base_usd == D("-0.100")
     inconsistent = deepcopy(row)
     inconsistent["quote_asset_symbol"] = "EUR"
@@ -170,6 +177,42 @@ async def test_risex_funding_fallback_is_labeled_and_consistency_gated() -> None
     )
     assert blocked.quality is FundingQuality.UNKNOWN
     assert blocked_market.base_multiplier is None
+
+
+@pytest.mark.asyncio
+async def test_risex_history_requires_stable_three_interval_cadence() -> None:
+    row = deepcopy(fixture("risex")["market"])
+    row.update({"mark_price": "100"})
+    interval = 3_600_000_000_000
+    future = int((datetime.now(UTC) + timedelta(hours=1)).timestamp() * 1_000_000_000)
+    records = [
+        {"start_time": str(future - interval * (index + 1)),
+         "end_time": str(future - interval * index), "funding_rate": "0.001"}
+        for index in range(3)
+    ]
+    session = FakeSession(FakeResponse({"data": {"records": records}}))
+    adapter = RisexAdapter(session)
+    adapter.normalize_market(row)
+    adapter.normalize_book(fixture("risex")["book"], observed_at=NOW)
+    adapter.normalize_trade(fixture("risex")["trade"], received_at=NOW, session_id="proof", ordinal=1)
+    market = adapter.normalize_market(row)
+    quote = await adapter.fetch_funding_quote(market, assumed_open_at=datetime.now(UTC))
+    assert quote.quality is FundingQuality.ESTIMATED
+    assert quote.source == "PAPER_ASSUMPTION_LAST_APPLIED_RATE"
+    assert session.calls[0][0].endswith("/v1/markets/id/7/funding-rate-history")
+    records[1]["start_time"] = str(int(records[1]["start_time"]) + 1)
+    blocked = await adapter.fetch_funding_quote(market, assumed_open_at=datetime.now(UTC))
+    assert blocked.quality is FundingQuality.UNKNOWN
+    records[1]["start_time"] = str(int(records[1]["end_time"]) - interval)
+    for record in records:
+        record["index_price"] = "100"
+    applied = await adapter.fetch_applied_funding_quotes(
+        market, since=datetime.now(UTC),
+        until=datetime.fromtimestamp(future / 1_000_000_000, UTC),
+        assumed_open_at=datetime.now(UTC) - timedelta(hours=1),
+    )
+    assert applied and applied[0].quality is FundingQuality.APPLIED_RATE
+    assert applied[0].source == adapter.FUNDING_SOURCE
 
 
 def test_trade_ids_aggressors_and_synthetic_keys() -> None:
@@ -184,6 +227,12 @@ def test_trade_ids_aggressors_and_synthetic_keys() -> None:
     assert r_trade.exchange_timestamp is not None
     assert r_trade.received_at == NOW
     assert r_trade.raw_timestamp == fixture("risex")["trade"]["block_timestamp"]
+    worker_only = deepcopy(fixture("risex")["trade"])
+    worker_only["worker_timestamp"] = worker_only.pop("block_timestamp")
+    safe = risex.normalize_trade(worker_only, received_at=NOW, session_id="s1", ordinal=2)
+    assert safe.raw_timestamp == worker_only["worker_timestamp"]
+    assert safe.exchange_timestamp is not None
+    assert "RISEX_WORKER_TIMESTAMP_USED_AS_SERVER_EVENT_TIME" in safe.paper_assumptions
 
     extended = ExtendedAdapter(None)
     e_trade = extended.normalize_trade(
@@ -191,6 +240,11 @@ def test_trade_ids_aggressors_and_synthetic_keys() -> None:
     )
     assert e_trade.trade_event_key == "EXTENDED|ABC-USD|42"
     assert e_trade.aggressor_side is Side.SELL
+    seq, wrapped = extended.normalize_trade_message(
+        {"seq": 2, "data": [fixture("extended")["trade"]]},
+        received_at=NOW, session_id="s1", starting_ordinal=0,
+    )
+    assert seq == 2 and wrapped == (e_trade,)
     liquidation = deepcopy(fixture("extended")["trade"])
     liquidation["tT"] = "LIQUIDATION"
     assert ExtendedAdapter(None).normalize_trade(
@@ -343,6 +397,9 @@ def test_public_websocket_heartbeat_actions() -> None:
     )
     assert nado_pong.frame_action is WebSocketFrameAction.NONE
     assert nado_pong.connection_confirmed
+    assert NadoAdapter.subscription("trade", 7) == {
+        "method": "subscribe", "stream": {"type": "trade", "product_id": 7}, "id": 7
+    }
 
 
 def test_documented_book_delta_shapes_are_normalized() -> None:
@@ -406,8 +463,11 @@ def test_nado_gap_and_risex_checksum_detection() -> None:
     nado.connected(NOW)
     nado.snapshot(book(Venue.NADO, 100))
     assert nado.nado_delta((), (), last_max_timestamp=100, max_timestamp=110, observed_at=NOW)
-    assert not nado.nado_delta(
+    assert nado.nado_delta(
         (), (), last_max_timestamp=109, max_timestamp=120, observed_at=NOW
+    )
+    assert not nado.nado_delta(
+        (), (), last_max_timestamp=121, max_timestamp=130, observed_at=NOW
     )
 
     risex = BookStream(Venue.RISEX, "ABC")

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from decimal import Decimal
+import re
 from typing import Any
 
 from risex_farmer.models import (
@@ -37,13 +38,17 @@ from .base import (
 class RisexAdapter(PublicAdapter):
     MARKETS_SOURCE = "https://developer.rise.trade/reference/marketservice_getmarkets.md"
     FUNDING_SOURCE = "https://developer.rise.trade/reference/getfundingratehistory.md"
-    PAPER_ASSUMPTION_SOURCE = "PAPER_ASSUMPTION:RISEX_PUBLIC_FALLBACK"
+    PAPER_ASSUMPTION_SOURCE = "PAPER_ASSUMPTION_CURRENT_NEXT_RATE"
+    HISTORY_ASSUMPTION_SOURCE = "PAPER_ASSUMPTION_LAST_APPLIED_RATE"
 
     def __init__(self, session: Any) -> None:
         super().__init__(session, "https://api.rise.trade", "wss://ws.rise.trade/ws")
         self._market_ids: dict[str, str] = {}
         self._symbols_by_id: dict[str, str] = {}
         self._raw_markets: dict[str, dict[str, Any]] = {}
+        self._metadata_consistent: set[str] = set()
+        self._book_units_consistent: set[str] = set()
+        self._trade_units_consistent: set[str] = set()
 
     async def fetch_markets(self) -> tuple[CanonicalMarket, ...]:
         payload = await self._get_json("/v1/markets", params={"force_refresh": "true"})
@@ -70,17 +75,32 @@ class RisexAdapter(PublicAdapter):
         quote = str(row.get("quote_asset_symbol") or "UNKNOWN")
         raw_asset = str(row.get("base_asset_symbol") or row.get("underlying") or symbol)
         canonical_asset = raw_asset.split("/")[0].split("-")[0]
-        positive_grid = all(
-            decimal_value(config[name], f"config.{name}") > 0
-            for name in ("step_price", "step_size", "min_order_size")
+        grids = {name: decimal_value(config[name], f"config.{name}") for name in ("step_price", "step_size", "min_order_size")}
+        exact_symbol = f"{canonical_asset}/{quote}"
+        mapping_consistent = all(str(value) == exact_symbol for value in (
+            symbol, raw_asset, row.get("underlying", exact_symbol),
+            row.get("display_name", exact_symbol), row.get("display_base_asset_symbol", exact_symbol),
+        ))
+        synthetic = bool(re.match(r"^\d", canonical_asset)) or any(
+            bool(row.get(name) or config.get(name)) for name in ("deprecated", "synthetic", "is_synthetic")
         )
+        multiple = grids["min_order_size"] / grids["step_size"]
+        multiplier = row.get("multiplier", config.get("multiplier"))
+        metadata_consistent = (
+            mapping_consistent and not synthetic and all(value > 0 for value in grids.values())
+            and multiple == multiple.to_integral_value()
+            and (multiplier is None or decimal_value(multiplier, "multiplier") == 1)
+        )
+        (self._metadata_consistent.add if metadata_consistent else self._metadata_consistent.discard)(symbol)
         fallback_consistent = (
             RISEX_PAPER_FALLBACK_ASSUMPTIONS_ENABLED
             and bool(row.get("active", True))
             and bool(config.get("unlocked", False))
             and quote in {"USD", "USDC", "USDT", "USDT0"}
             and bool(canonical_asset)
-            and positive_grid
+            and metadata_consistent
+            and symbol in self._book_units_consistent
+            and symbol in self._trade_units_consistent
         )
         return CanonicalMarket(
             canonical_asset=canonical_asset,
@@ -139,7 +159,21 @@ class RisexAdapter(PublicAdapter):
                 for level in require_list(data.get(name), name)
             )
 
-        return OrderBook(Venue.RISEX, symbol, levels("bids"), levels("asks"), observed_at)
+        bids, asks = levels("bids"), levels("asks")
+        raw = self._raw_markets.get(symbol, {})
+        try:
+            config = require_mapping(raw.get("config"), "market.config")
+            step = decimal_value(config["step_size"], "step_size")
+            minimum = decimal_value(config["min_order_size"], "min_order_size")
+            valid = bool(bids or asks) and all(
+                level.canonical_quantity >= minimum
+                and level.canonical_quantity / step == (level.canonical_quantity / step).to_integral_value()
+                for level in bids + asks
+            )
+        except (KeyError, TypeError, ValueError):
+            valid = False
+        (self._book_units_consistent.add if valid else self._book_units_consistent.discard)(symbol)
+        return OrderBook(Venue.RISEX, symbol, bids, asks, observed_at)
 
     def normalize_book_message(self, payload: Any) -> OrderBook | BookDelta:
         message = require_mapping(payload, "orderbook message")
@@ -185,7 +219,9 @@ class RisexAdapter(PublicAdapter):
             aggressor = Side.BUY
         else:
             aggressor = None
-        raw_time = outer.get("block_timestamp", trade.get("time"))
+        # Current public messages carry server worker time, not block time. It is
+        # retained and normalized explicitly; RISEx is never the maker cutoff leg.
+        raw_time = outer.get("block_timestamp", outer.get("worker_timestamp", trade.get("time")))
         exchange_timestamp = (
             timestamp(raw_time, "nanoseconds") if raw_time is not None else None
         )
@@ -194,6 +230,15 @@ class RisexAdapter(PublicAdapter):
             f"RISEX|{session_id}|{raw_time}|{market}|{price}|{quantity}|"
             f"{aggressor.value if aggressor is not None else 'UNKNOWN'}|{ordinal}"
         )
+        raw = self._raw_markets.get(market, {})
+        try:
+            config = require_mapping(raw.get("config"), "market.config")
+            step = decimal_value(config["step_size"], "step_size")
+            minimum = decimal_value(config["min_order_size"], "min_order_size")
+            valid = quantity >= minimum and quantity / step == (quantity / step).to_integral_value()
+        except (KeyError, TypeError, ValueError):
+            valid = False
+        (self._trade_units_consistent.add if valid else self._trade_units_consistent.discard)(market)
         return TradeEvidence(
             key,
             Venue.RISEX,
@@ -205,6 +250,11 @@ class RisexAdapter(PublicAdapter):
             price,
             aggressor,
             True,
+            "OFFICIAL_PUBLIC_WITH_PAPER_ASSUMPTIONS",
+            (
+                "RISEX_CONTRACT_AND_QUANTITY_UNITS_PAPER_ASSUMPTION",
+                *(() if "block_timestamp" in outer else ("RISEX_WORKER_TIMESTAMP_USED_AS_SERVER_EVENT_TIME",)),
+            ),
         )
 
     def unknown_funding_quote(
@@ -237,26 +287,25 @@ class RisexAdapter(PublicAdapter):
                 market, observed_at=observed_at, assumed_open_at=assumed_open_at
             )
         raw = self._raw_markets.get(market.venue_symbol, {})
-        rate_raw = raw.get("funding_rate", raw.get("current_funding_rate"))
+        rate_raw = raw.get("current_funding_rate")
         price_raw = raw.get("mark_price", raw.get("oracle_price", raw.get("index_price")))
         next_raw = raw.get("next_funding_timestamp", raw.get("next_funding_time"))
         try:
             rate = decimal_value(rate_raw, "funding_rate")
             price = decimal_value(price_raw, "funding_price")
             if next_raw is None:
-                settlement_at = observed_at.replace(minute=0, second=0, microsecond=0)
-                settlement_at += timedelta(hours=1)
-            else:
-                integer = int(next_raw)
-                unit = "nanoseconds" if abs(integer) >= 10**17 else (
-                    "milliseconds" if abs(integer) >= 10**11 else "seconds"
-                )
-                settlement_at = timestamp(integer, unit)
+                raise ValueError("official next funding time absent")
+            integer = int(next_raw)
+            unit = "nanoseconds" if abs(integer) >= 10**17 else (
+                "milliseconds" if abs(integer) >= 10**11 else "seconds"
+            )
+            settlement_at = timestamp(integer, unit)
             if price <= 0 or settlement_at <= observed_at:
                 raise ValueError("inconsistent RISEx funding inputs")
         except (KeyError, TypeError, ValueError):
-            return self.unknown_funding_quote(
-                market, observed_at=observed_at, assumed_open_at=assumed_open_at
+            return await self._history_funding_quote(
+                market, observed_at=observed_at, assumed_open_at=assumed_open_at,
+                price_raw=price_raw,
             )
         cash = rate * price
         eligible = assumed_open_at < settlement_at
@@ -273,6 +322,66 @@ class RisexAdapter(PublicAdapter):
             cash if eligible else Decimal("0"),
             self.PAPER_ASSUMPTION_SOURCE,
         )
+
+    async def _history_funding_quote(
+        self, market: CanonicalMarket, *, observed_at: datetime,
+        assumed_open_at: datetime, price_raw: Any,
+    ) -> FundingCashQuote:
+        try:
+            market_id = self._market_ids[market.venue_symbol]
+            payload = await self._get_json(f"/v1/markets/id/{market_id}/funding-rate-history")
+            records = require_list(require_mapping(payload.get("data"), "data").get("records"), "data.records")
+            recent = [require_mapping(row, "funding record") for row in records[:3]]
+            if len(recent) < 3:
+                raise ValueError("insufficient official history")
+            starts = [int(row["start_time"]) for row in recent]
+            ends = [int(row["end_time"]) for row in recent]
+            intervals = [end - start for start, end in zip(starts, ends)]
+            if len(set(intervals)) != 1 or intervals[0] <= 0 or not (
+                ends[1] == starts[0] and ends[2] == starts[1]
+            ):
+                raise ValueError("unstable official history cadence")
+            rate = decimal_value(recent[0]["funding_rate"], "funding_rate")
+            price = decimal_value(price_raw, "funding_price")
+            settlement_at = timestamp(ends[0] + intervals[0], "nanoseconds")
+            if price <= 0 or settlement_at <= observed_at:
+                raise ValueError("invalid official history estimate")
+        except (KeyError, TypeError, ValueError):
+            return self.unknown_funding_quote(market, observed_at=observed_at, assumed_open_at=assumed_open_at)
+        cash = rate * price
+        eligible = assumed_open_at < settlement_at
+        return FundingCashQuote(
+            Venue.RISEX, market.venue_symbol, observed_at, assumed_open_at,
+            settlement_at, FundingQuality.ESTIMATED,
+            FundingAccrualMethod.SNAPSHOT_AT_SETTLEMENT, True,
+            -cash if eligible else Decimal("0"), cash if eligible else Decimal("0"),
+            self.HISTORY_ASSUMPTION_SOURCE,
+        )
+
+    async def fetch_applied_funding_quotes(
+        self, market: CanonicalMarket, *, since: datetime, until: datetime,
+        assumed_open_at: datetime,
+    ) -> tuple[FundingCashQuote, ...]:
+        """Return official settled history in per-base cash units for reconciliation."""
+        market_id = self._market_ids[market.venue_symbol]
+        payload = await self._get_json(f"/v1/markets/id/{market_id}/funding-rate-history")
+        records = require_list(require_mapping(payload.get("data"), "data").get("records"), "data.records")
+        quotes: list[FundingCashQuote] = []
+        for raw in records:
+            row = require_mapping(raw, "funding record")
+            settlement_at = timestamp(int(row["end_time"]), "nanoseconds")
+            if settlement_at < since or settlement_at > until:
+                continue
+            cash = decimal_value(row["funding_rate"], "funding_rate") * decimal_value(row["index_price"], "index_price")
+            eligible = assumed_open_at < settlement_at
+            quotes.append(FundingCashQuote(
+                Venue.RISEX, market.venue_symbol, settlement_at, assumed_open_at,
+                settlement_at, FundingQuality.APPLIED_RATE,
+                FundingAccrualMethod.SNAPSHOT_AT_SETTLEMENT, True,
+                -cash if eligible else Decimal("0"), cash if eligible else Decimal("0"),
+                self.FUNDING_SOURCE,
+            ))
+        return tuple(quotes)
 
     def market_id(self, venue_symbol: str) -> int:
         return int(self._market_ids[venue_symbol])

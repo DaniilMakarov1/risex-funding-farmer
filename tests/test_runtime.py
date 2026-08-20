@@ -1,12 +1,14 @@
 import asyncio
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
 from risex_farmer.exchanges.base import PublicAdapter, PublicDataUnavailable
 from risex_farmer.models import (
     BookLevel,
+    BookDelta,
     CanonicalMarket,
     ContractType,
     FundingAccrualMethod,
@@ -175,8 +177,18 @@ async def test_injected_ordinary_public_scan_builds_real_observations_and_diagno
     assert result["routes"]
     assert len(result["routes"]) <= 15
     assert result["routes"][0]["planned_maker_net_pnl_usd"] is not None
+    assert result["routes"][0]["rank"] == 1
+    assert result["routes"][0]["seconds_to_earliest_funding"] == "300.0"
+    for key in (
+        "risex_exact_q_entry_vwap_usd", "risex_exact_q_exit_vwap_usd",
+        "hedge_maker_entry_price_usd", "planned_hedge_exit_price_usd",
+        "risex_funding_usd", "hedge_funding_usd", "net_funding_usd",
+    ):
+        assert result["routes"][0][key] is not None
     assert result["assumption_flags"]["risex_next_rate_estimate_is_a_paper_assumption"]
     assert report["runtime_evidence_count"] >= 4
+    assert report["latest_routes"] == result["routes"]
+    assert report["latest_routes"][0]["source_quality"]["risex_funding"]["marker"] == "PAPER_ASSUMPTION"
     assert all({"markets", "volumes", "book", "funding"} <= set(fake.calls) for fake in fakes.values())
 
 
@@ -188,8 +200,16 @@ async def test_venue_outage_is_specific_and_never_uses_empty_fail_closed_scan(tm
         result = await public_scan_once(repository, adapters=fakes, clock=clock)
     assert result["status"] == "NO_TRADE"
     assert result["reason"] == "VENUE_SPECIFIC_BLOCKERS"
+    assert result["routes"] and result["routes"][0]["rank"] is None
+    assert any("RISEX:PUBLIC_REST_UNAVAILABLE" in blocker for blocker in result["routes"][0]["blockers"])
     assert result["venue_readiness"]["RISEX"]["detail"].startswith("PUBLIC_REST_UNAVAILABLE")
     assert all("fail_closed_scan" not in call for fake in fakes.values() for call in fake.calls)
+
+
+def test_runtime_has_no_private_auth_real_order_or_llm_surface() -> None:
+    source = (Path(__file__).parents[1] / "src/risex_farmer/runtime.py").read_text()
+    forbidden = ("Authorization", "api_key", "private_endpoint", "place_order", "submit_order", "openai", "anthropic")
+    assert all(token not in source for token in forbidden)
 
 
 @pytest.mark.asyncio
@@ -275,6 +295,37 @@ async def test_scheduling_full_focused_activation_and_strict_cutoff(tmp_path):
     assert NOW + timedelta(seconds=395) in recorded
 
 
+@pytest.mark.asyncio
+async def test_run_loop_wakes_on_activation_and_cutoff_deadlines(tmp_path):
+    clock = FakeClock()
+    target = NOW + timedelta(seconds=400)
+    stop = asyncio.Event()
+    wakeups: list[datetime] = []
+
+    async def deadline_sleep(seconds: float) -> None:
+        clock.value += timedelta(seconds=seconds)
+        wakeups.append(clock.now())
+        if clock.now() >= target:
+            stop.set()
+        await asyncio.sleep(0)
+
+    with PaperRepository(tmp_path / "deadline-run.db") as repository:
+        result = await public_paper_run(
+            repository, adapters=adapters(clock, settlement_at=target),
+            clock=clock, stop_event=stop, sleep=deadline_sleep,
+        )
+        recorded = {
+            datetime.fromisoformat(row[0]) for row in repository.connection.execute(
+                "SELECT logical_at FROM scanner_snapshots"
+            )
+        }
+    assert result["status"] == "STOPPED_SAFE"
+    assert target - timedelta(seconds=120) in wakeups
+    assert target - timedelta(seconds=5) in wakeups
+    assert target - timedelta(seconds=120) in recorded
+    assert target - timedelta(seconds=5) in recorded
+
+
 def maker_trade(runtime: PublicPaperRuntime, at: datetime, key: str = "public-trade") -> TradeEvidence:
     order = runtime.broker.state.order
     version = order.active_version
@@ -347,6 +398,42 @@ async def test_disconnect_cancels_entry_and_position_gap_recovers_from_snapshot(
 
 
 @pytest.mark.asyncio
+async def test_sequence_gap_fetches_snapshot_and_reconnect_restores_readiness(tmp_path):
+    clock = FakeClock()
+    fakes = adapters(clock, settlement_at=NOW + timedelta(minutes=5))
+    with PaperRepository(tmp_path / "sequence-recovery.db") as repository:
+        async with PublicPaperRuntime(repository, adapters=fakes, clock=clock) as runtime:
+            await runtime.scan()
+            market = fakes[Venue.EXTENDED].market
+            before = fakes[Venue.EXTENDED].calls.count("book")
+            await runtime.apply_book_event(BookDelta(
+                Venue.EXTENDED, market.venue_symbol,
+                (BookLevel(D("100"), D("1")),), (), clock.now(), 3, 999,
+            ))
+            state = runtime.readiness[Venue.EXTENDED]
+    assert fakes[Venue.EXTENDED].calls.count("book") == before + 1
+    assert state.available and state.detail == "PUBLIC_STREAM_RECOVERED"
+
+
+@pytest.mark.asyncio
+async def test_health_confirmation_silence_cancels_active_entry(tmp_path):
+    clock = FakeClock()
+    with PaperRepository(tmp_path / "health-silence.db") as repository:
+        async with PublicPaperRuntime(
+            repository, adapters=adapters(clock, settlement_at=NOW + timedelta(seconds=120)), clock=clock,
+        ) as runtime:
+            await runtime.tick()
+            order = runtime.broker.state.order
+            runtime.mark_trade_stream_connected(order.venue, order.canonical_market)
+            runtime.next_health_check_at = clock.now() + timedelta(seconds=10)
+            clock.advance(26)
+            await runtime.tick()
+            state = runtime.readiness[order.venue]
+    assert runtime.broker is None
+    assert state.detail.startswith("PUBLIC_STREAM_DISCONNECTED:health:StreamGap")
+
+
+@pytest.mark.asyncio
 async def test_official_applied_settlement_replaces_estimate_and_report_has_assumptions(tmp_path):
     clock = FakeClock()
     target = NOW + timedelta(seconds=120)
@@ -409,6 +496,25 @@ async def test_safe_shutdown_cancels_only_virtual_entry_and_preserves_open_posit
     assert state.order.status.value == "CANCELLED"
     assert report["last_runtime_event"]["event_type"] == "STOPPED_SAFE"
     assert report["last_runtime_event"]["detail"]["forced_close"] is False
+
+
+@pytest.mark.asyncio
+async def test_safe_shutdown_preserves_actually_open_position(tmp_path):
+    clock = FakeClock()
+    with PaperRepository(tmp_path / "shutdown-open.db") as repository:
+        async with PublicPaperRuntime(
+            repository, adapters=adapters(clock, settlement_at=NOW + timedelta(seconds=120)), clock=clock,
+        ) as runtime:
+            await runtime.tick()
+            clock.advance(1)
+            order = runtime.broker.state.order
+            runtime.mark_trade_stream_connected(order.venue, order.canonical_market)
+            await runtime.deliver_trade(maker_trade(runtime, clock.now(), "open-at-shutdown"))
+            await runtime.shutdown()
+            state = repository.load_runtime()
+            report = repository.report(as_of=clock.now())
+    assert state.position is not None
+    assert report["last_runtime_event"]["detail"]["open_position_preserved"] is True
 
 
 @pytest.mark.asyncio

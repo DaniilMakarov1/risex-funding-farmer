@@ -255,3 +255,5 @@ class TradeEvidence:
     canonical_price: Decimal
     aggressor_side: Side | None
     is_orderbook_match: bool | None
+    source_marker: str = "OFFICIAL_PUBLIC"
+    paper_assumptions: tuple[str, ...] = ()

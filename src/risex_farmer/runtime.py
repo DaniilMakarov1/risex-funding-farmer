@@ -85,8 +85,38 @@ def _quote_for_open_time(
     return replace(quote, assumed_or_actual_position_opened_at=opened_at)
 
 
-def _route_row(plan: RoutePlan) -> dict[str, object]:
+def _route_rank_key(plan: RoutePlan) -> tuple[object, ...]:
+    assert plan.route is not None and plan.target_cycle is not None
+    assert plan.planned_maker_net_pnl_usd is not None
+    return (
+        -plan.planned_maker_net_pnl_usd,
+        -plan.route.route_liquidity_usd,
+        plan.target_cycle.start_at,
+        plan.canonical_asset,
+        plan.hedge_venue.value,
+        plan.direction.value,
+    )
+
+
+def _route_row(
+    plan: RoutePlan,
+    *,
+    rank: int | None,
+    observations: Mapping[tuple[Venue, str], MarketObservation],
+) -> dict[str, object]:
+    risex_quote = observations.get((Venue.RISEX, plan.risex_market.venue_symbol))
+    hedge_quote = observations.get((plan.hedge_venue, plan.hedge_market.venue_symbol))
+    risex_source = None if risex_quote is None or risex_quote.funding is None else risex_quote.funding.source
+    hedge_source = None if hedge_quote is None or hedge_quote.funding is None else hedge_quote.funding.source
+    marker = lambda source: (
+        "UNKNOWN" if source is None else
+        "PAPER_ASSUMPTION" if source.startswith("PAPER_ASSUMPTION") else "OFFICIAL"
+    )
+    risex_funding = None if plan.target_cycle is None else plan.target_cycle.risex_event.expected_cash_usd
+    hedge_funding = None if plan.target_cycle is None else plan.target_cycle.hedge_event.expected_cash_usd
     return {
+        "rank": rank,
+        "route_key": f"{plan.canonical_asset}|{plan.hedge_venue.value}|{plan.direction.value}",
         "canonical_asset": plan.canonical_asset,
         "hedge_venue": plan.hedge_venue.value,
         "direction": plan.direction.value,
@@ -98,6 +128,11 @@ def _route_row(plan: RoutePlan) -> dict[str, object]:
         "target_cycle_start": (
             None if plan.target_cycle is None else plan.target_cycle.start_at.isoformat()
         ),
+        "seconds_to_earliest_funding": (
+            None if plan.target_cycle is None else str(
+                Decimal(str((plan.target_cycle.start_at - plan.logical_at).total_seconds()))
+            )
+        ),
         "canonical_quantity": (
             None if plan.canonical_quantity is None else str(plan.canonical_quantity)
         ),
@@ -106,6 +141,15 @@ def _route_row(plan: RoutePlan) -> dict[str, object]:
             if plan.expected_target_cycle_funding_usd is None
             else str(plan.expected_target_cycle_funding_usd)
         ),
+        "risex_funding_usd": None if risex_funding is None else str(risex_funding),
+        "hedge_funding_usd": None if hedge_funding is None else str(hedge_funding),
+        "net_funding_usd": None if plan.expected_target_cycle_funding_usd is None else str(plan.expected_target_cycle_funding_usd),
+        "risex_entry_liquidity_role": "TAKER",
+        "risex_exact_q_entry_vwap_usd": None if plan.risex_entry_price is None else str(plan.risex_entry_price),
+        "risex_exact_q_exit_vwap_usd": None if plan.risex_exit_price is None else str(plan.risex_exit_price),
+        "hedge_entry_liquidity_role": "MAKER",
+        "hedge_maker_entry_price_usd": None if plan.hedge_entry_price is None else str(plan.hedge_entry_price),
+        "planned_hedge_exit_price_usd": None if plan.hedge_exit_price is None else str(plan.hedge_exit_price),
         "entry_execution_pnl_usd": (
             None
             if plan.planned_entry_execution_pnl_usd is None
@@ -130,12 +174,9 @@ def _route_row(plan: RoutePlan) -> dict[str, object]:
             else str(plan.executable_unwind_net_pnl_usd)
         ),
         "source_quality": {
-            "risex_funding": (
-                "UNKNOWN"
-                if plan.target_cycle is None
-                else "PAPER_ASSUMPTION_OR_OFFICIAL_APPLIED"
-            ),
-            "hedge_funding": "OFFICIAL_PUBLIC_OR_UNKNOWN",
+            "risex_funding": {"source": risex_source, "marker": marker(risex_source)},
+            "hedge_funding": {"source": hedge_source, "marker": marker(hedge_source)},
+            "risex_contract": "PAPER_ASSUMPTION" if plan.risex_market.contract_type is ContractType.LINEAR else "UNKNOWN",
         },
         "assumption_flags": _assumption_flags(),
     }
@@ -179,6 +220,9 @@ class PublicPaperRuntime:
         self._nado_cumulative_funding: dict[tuple[str, str], object] = {}
         self._trade_stream_ready: set[tuple[Venue, str]] = set()
         self._last_readiness_evidence_at: dict[Venue, datetime] = {}
+        self._extended_trade_sequences: dict[str, int] = {}
+        self.next_health_check_at: datetime | None = None
+        self._last_risex_history_at: datetime | None = None
 
     async def __aenter__(self) -> PublicPaperRuntime:
         if self.adapters is None:
@@ -265,7 +309,6 @@ class PublicPaperRuntime:
             for (venue, asset), market in by_venue_asset.items()
             if venue is Venue.RISEX
             and market.market_type is MarketType.PERPETUAL
-            and market.contract_type is ContractType.LINEAR
             and market.is_active
         }
         hedge_assets = {
@@ -404,21 +447,44 @@ class PublicPaperRuntime:
                 "assumption_flags": _assumption_flags(),
             },
         )
-        rows = sorted(
-            snapshot.evaluations,
-            key=lambda plan: (
-                not plan.entry_allowed,
-                plan.planned_maker_net_pnl_usd is None,
-                -(
-                    plan.planned_maker_net_pnl_usd
-                    if plan.planned_maker_net_pnl_usd is not None
-                    else Decimal("0")
-                ),
-                plan.canonical_asset,
-                plan.hedge_venue.value,
-                plan.direction.value,
-            ),
-        )[:15]
+        rankable = [
+            plan for plan in snapshot.evaluations
+            if plan.route is not None and plan.target_cycle is not None
+            and plan.planned_maker_net_pnl_usd is not None
+        ]
+        rankable.sort(key=_route_rank_key)
+        ranks = {id(plan): index for index, plan in enumerate(rankable, 1)}
+        blocked = sorted(
+            (plan for plan in snapshot.evaluations if id(plan) not in ranks),
+            key=lambda plan: (plan.canonical_asset, plan.hedge_venue.value, plan.direction.value),
+        )
+        rows = rankable + blocked
+        route_rows = tuple(
+            _route_row(plan, rank=ranks.get(id(plan)), observations=self.observations)
+            for plan in rows
+        )
+        if not route_rows:
+            unavailable_rows: list[dict[str, object]] = []
+            for venue in (Venue.EXTENDED, Venue.NADO):
+                for market in self.markets.get(venue, ()):
+                    if not market.is_active:
+                        continue
+                    for direction in RouteDirection:
+                        route_key = f"{market.canonical_asset}|{venue.value}|{direction.value}"
+                        unavailable_rows.append({
+                            "rank": None, "route_key": route_key,
+                            "canonical_asset": market.canonical_asset,
+                            "hedge_venue": venue.value, "direction": direction.value,
+                            "entry_allowed": False,
+                            "blockers": [
+                                f"{missing.value}:{state.detail}"
+                                for missing, state in self.readiness.items() if not state.available
+                            ] or ["REQUIRED_ROUTE_MARKET_UNAVAILABLE"],
+                            "source_quality": {"risex_contract": "UNKNOWN", "risex_funding": {"source": None, "marker": "UNKNOWN"}},
+                            "assumption_flags": _assumption_flags(),
+                        })
+            route_rows = tuple(unavailable_rows)
+        self.repository.save_public_route_rows(logical_at=logical_at, rows=route_rows)
         unavailable = {
             venue.value: state.detail
             for venue, state in self.readiness.items()
@@ -433,7 +499,7 @@ class PublicPaperRuntime:
             ),
             "eligible_count": sum(plan.entry_allowed for plan in snapshot.evaluations),
             "winner": None if snapshot.winner is None else snapshot.winner.canonical_asset,
-            "routes": [_route_row(plan) for plan in rows],
+            "routes": list(route_rows),
             "venue_readiness": {
                 venue.value: {
                     "available": state.available,
@@ -535,6 +601,15 @@ class PublicPaperRuntime:
 
     async def tick(self, at: datetime | None = None) -> None:
         now = at or self.clock.now()
+        if self.next_health_check_at is None or now >= self.next_health_check_at:
+            for (venue, symbol), observation in tuple(self.observations.items()):
+                if (venue, symbol) not in self._trade_stream_ready:
+                    continue
+                health = self.coordinator.stream(venue, symbol).health(now)
+                confirmation = health.last_connection_confirmation_at
+                if confirmation is not None and now - confirmation > timedelta(seconds=25):
+                    await self.mark_disconnected(venue, symbol, at=now, stream_kind="health")
+            self.next_health_check_at = now + timedelta(seconds=10)
         if self.last_scan is None or self.next_full_scan_at is None or now >= self.next_full_scan_at:
             await self.scan()
             now = self.last_scan.logical_at
@@ -544,6 +619,23 @@ class PublicPaperRuntime:
                 self.next_position_monitor_at is None
                 or now >= self.next_position_monitor_at
             ):
+                risex_adapter = None if self.adapters is None else self.adapters.get(Venue.RISEX)
+                position = self.lifecycle.snapshot.position
+                if isinstance(risex_adapter, RisexAdapter) and position is not None:
+                    since = self._last_risex_history_at or position.position_opened_at
+                    try:
+                        quotes = await risex_adapter.fetch_applied_funding_quotes(
+                            self.lifecycle.snapshot.risex_market, since=since,
+                            until=now, assumed_open_at=position.position_opened_at,
+                        )
+                        for quote in quotes:
+                            await self._apply_funding_quote(quote)
+                        self._last_risex_history_at = now
+                    except (aiohttp.ClientError, TimeoutError, ValueError, KeyError) as exc:
+                        self._record(
+                            "PUBLIC_FUNDING_HISTORY_UNAVAILABLE", at=now,
+                            venue=Venue.RISEX, detail={"exception_class": type(exc).__name__},
+                        )
                 risex, hedge = self._market_pair_observations(
                     self.lifecycle.snapshot.risex_market,
                     self.lifecycle.snapshot.hedge_market,
@@ -766,12 +858,18 @@ class PublicPaperRuntime:
             await self.deliver_settlement(settlement)
 
     async def mark_disconnected(
-        self, venue: Venue, symbol: str, *, at: datetime | None = None
+        self, venue: Venue, symbol: str, *, at: datetime | None = None,
+        stream_kind: str = "public", exception: BaseException | None = None,
     ) -> None:
         now = at or self.clock.now()
         self._trade_stream_ready.discard((venue, symbol))
         self.coordinator.stream(venue, symbol).disconnected()
-        self._set_readiness(venue, False, "PUBLIC_STREAM_DISCONNECTED", now)
+        exception_name = "StreamGap" if exception is None else type(exception).__name__
+        exception_detail = "" if exception is None else f":{str(exception)[:120]}"
+        self._set_readiness(
+            venue, False,
+            f"PUBLIC_STREAM_DISCONNECTED:{stream_kind}:{exception_name}{exception_detail}", now,
+        )
         if self.broker is not None and self.broker.state.lifecycle_state is LifecycleState.ENTRY_MAKER_OPEN:
             order = self.broker.state.order
             assert order is not None
@@ -842,14 +940,19 @@ class PublicPaperRuntime:
             return
         stream = self.coordinator.stream(event.venue, event.canonical_market)
         if not stream.apply_delta(event):
-            await self.mark_disconnected(event.venue, event.canonical_market, at=now)
+            await self.mark_disconnected(event.venue, event.canonical_market, at=now, stream_kind="book")
             assert self.adapters is not None
             try:
                 snapshot = await self.adapters[event.venue].fetch_book(
                     event.canonical_market
                 )
                 await self.recover_snapshot(snapshot, at=self.clock.now())
-            except (aiohttp.ClientError, TimeoutError, ValueError, KeyError):
+            except (aiohttp.ClientError, TimeoutError, ValueError, KeyError) as exc:
+                self._set_readiness(
+                    event.venue, False,
+                    f"PUBLIC_SNAPSHOT_RECOVERY_FAILED:book:{type(exc).__name__}:{str(exc)[:120]}",
+                    self.clock.now(),
+                )
                 return
         elif self.lifecycle is not None:
             self.next_position_monitor_at = now
@@ -867,7 +970,7 @@ class PublicPaperRuntime:
         delay = 1
         while self._stop_event is not None and not self._stop_event.is_set():
             try:
-                async with self._session.ws_connect(url, heartbeat=None) as ws:
+                async with self._session.ws_connect(url, heartbeat=None, autoping=False) as ws:
                     self.coordinator.stream(Venue.EXTENDED, symbol).connected(self.clock.now())
                     if kind == "trade":
                         self.mark_trade_stream_connected(Venue.EXTENDED, symbol)
@@ -886,15 +989,17 @@ class PublicPaperRuntime:
                         if kind == "book":
                             await self.apply_book_event(adapter.normalize_book_message(payload))
                         elif kind == "trade":
-                            ordinal += 1
-                            await self.deliver_trade(
-                                adapter.normalize_trade(
-                                    payload,
-                                    received_at=self.clock.now(),
-                                    session_id=str(id(ws)),
-                                    ordinal=ordinal,
-                                )
+                            sequence, trades = adapter.normalize_trade_message(
+                                payload, received_at=self.clock.now(),
+                                session_id=str(id(ws)), starting_ordinal=ordinal,
                             )
+                            previous = self._extended_trade_sequences.get(symbol)
+                            if previous is not None and sequence != previous + 1:
+                                raise ValueError("Extended trade sequence gap")
+                            self._extended_trade_sequences[symbol] = sequence
+                            for trade in trades:
+                                ordinal += 1
+                                await self.deliver_trade(trade)
                         else:
                             row = self.observations.get((Venue.EXTENDED, symbol))
                             if row is not None:
@@ -905,8 +1010,8 @@ class PublicPaperRuntime:
                                     assumed_open_at=self.clock.now(),
                                 )
                                 await self._apply_funding_quote(quote)
-            except Exception:
-                await self.mark_disconnected(Venue.EXTENDED, symbol)
+            except Exception as exc:
+                await self.mark_disconnected(Venue.EXTENDED, symbol, stream_kind=kind, exception=exc)
                 await self._sleep(delay)
                 delay = min(delay * 2, 30)
 
@@ -918,7 +1023,9 @@ class PublicPaperRuntime:
             return
         while self._stop_event is not None and not self._stop_event.is_set():
             try:
-                async with self._session.ws_connect(adapter.ws_base, heartbeat=10) as ws:
+                async with self._session.ws_connect(
+                    adapter.ws_base, heartbeat=10, autoping=False, compress=15
+                ) as ws:
                     if venue is Venue.RISEX:
                         ids = [adapter.market_id(symbol) for symbol in symbols]  # type: ignore[attr-defined]
                         await ws.send_json(adapter.orderbook_subscription(ids))  # type: ignore[attr-defined]
@@ -949,6 +1056,10 @@ class PublicPaperRuntime:
                         payload = json.loads(message.data, parse_float=Decimal)
                         ordinal += 1
                         kind = str(payload.get("channel", payload.get("type", ""))).lower()
+                        if venue is Venue.RISEX and str(payload.get("type", "")).lower() not in {"snapshot", "update"}:
+                            for symbol in symbols:
+                                self.coordinator.stream(venue, symbol).connection_confirmed(self.clock.now())
+                            continue
                         if "orderbook" in kind or "book_depth" in kind:
                             await self.apply_book_event(adapter.normalize_book_message(payload))  # type: ignore[attr-defined]
                         elif "trade" in kind:
@@ -994,9 +1105,9 @@ class PublicPaperRuntime:
                                 self._nado_cumulative_funding[(symbol, "long")] = payload.get("cumulative_funding_long_x18")
                                 self._nado_cumulative_funding[(symbol, "short")] = payload.get("cumulative_funding_short_x18")
                                 await self._apply_funding_quote(quote)
-            except Exception:
+            except Exception as exc:
                 for symbol in symbols:
-                    await self.mark_disconnected(venue, symbol)
+                    await self.mark_disconnected(venue, symbol, stream_kind="combined", exception=exc)
                 await self._sleep(delay)
                 delay = min(delay * 2, 30)
 
@@ -1031,6 +1142,22 @@ class PublicPaperRuntime:
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
 
+    def _next_wakeup_at(self, now: datetime) -> datetime:
+        deadlines = [value for value in (
+            self.next_full_scan_at, self.next_focused_scan_at,
+            self.next_position_monitor_at, self.next_health_check_at,
+        ) if value is not None and value > now]
+        if self.broker is not None and self.broker.state.order is not None:
+            order = self.broker.state.order
+            deadlines.extend(value for value in (order.created_at, order.cutoff_at) if value > now)
+        elif self.last_scan is not None and self.last_scan.winner is not None:
+            cycle = self.last_scan.winner.target_cycle
+            if cycle is not None:
+                schedule = activation_schedule(cycle)
+                focused = cycle.start_at - timedelta(seconds=self.config.focused_window_seconds)
+                deadlines.extend(value for value in (focused, schedule.activation_at, schedule.cutoff_at) if value > now)
+        return min(deadlines, default=now + timedelta(seconds=10))
+
     async def run(self, *, stop_event: asyncio.Event | None = None) -> dict[str, object]:
         self._stop_event = stop_event or asyncio.Event()
         loop = asyncio.get_running_loop()
@@ -1047,10 +1174,13 @@ class PublicPaperRuntime:
             self.next_full_scan_at = self.last_scan.logical_at + timedelta(
                 seconds=self.config.normal_scan_seconds
             )
+            self.next_health_check_at = self.last_scan.logical_at + timedelta(seconds=10)
             await self.start_streams()
             while not self._stop_event.is_set():
                 await self.tick()
-                await self._pause_or_stop(1)
+                now = self.clock.now()
+                delay = max(0.0, (self._next_wakeup_at(now) - now).total_seconds())
+                await self._pause_or_stop(delay)
         finally:
             for sig in installed:
                 loop.remove_signal_handler(sig)

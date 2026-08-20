@@ -411,6 +411,7 @@ class NadoAdapter(PublicAdapter):
         return {
             "method": "subscribe",
             "stream": {"type": stream, "product_id": product_id},
+            "id": 0 if product_id is None else product_id,
         }
 
     @staticmethod

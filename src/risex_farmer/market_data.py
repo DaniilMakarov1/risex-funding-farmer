@@ -113,11 +113,15 @@ class BookStream:
         max_timestamp: int,
         observed_at: datetime,
     ) -> bool:
-        if (
-            not self.book_initialized
-            or self._sequence is None
-            or last_max_timestamp != self._sequence
-        ):
+        if not self.book_initialized or self._sequence is None:
+            self.gap()
+            return False
+        # A REST recovery snapshot can fall inside the first buffered depth
+        # interval. Absolute updates safely bridge that interval; updates wholly
+        # older than the snapshot are ignored. A future previous timestamp is a gap.
+        if max_timestamp <= self._sequence:
+            return True
+        if last_max_timestamp > self._sequence:
             self.gap()
             return False
         self._apply_absolute(bids, asks)
