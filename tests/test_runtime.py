@@ -364,9 +364,18 @@ def adapters(clock: FakeClock, *, settlement_at: datetime, risex=True, funding="
 
 def confirm_public_streams(runtime: PublicPaperRuntime, at: datetime) -> None:
     for venue, symbol in runtime.observations:
-        stream = runtime.coordinator.stream(venue, symbol)
-        stream.connected(at)
-        stream.connection_confirmed(at)
+        runtime.mark_trade_stream_connected(venue, symbol, at=at)
+        runtime._live_book_ready.add((venue, symbol))
+
+
+async def activate_with_live_streams(
+    runtime: PublicPaperRuntime, clock: FakeClock
+) -> None:
+    await runtime.scan()
+    confirm_public_streams(runtime, clock.now())
+    clock.advance(1)
+    await runtime.tick()
+    assert runtime.broker is not None
 
 
 @pytest.mark.asyncio
@@ -484,7 +493,12 @@ async def test_venue_outage_is_specific_and_never_uses_empty_fail_closed_scan(tm
     assert result["routes"] and result["routes"][0]["rank"] is None
     assert any("RISEX:PUBLIC_REST_UNAVAILABLE" in blocker for blocker in result["routes"][0]["blockers"])
     assert result["venue_readiness"]["RISEX"]["detail"].startswith("PUBLIC_REST_UNAVAILABLE")
-    assert {"component", "endpoint_class", "exception_class", "elapsed_ms", "http_status"} <= failure.keys()
+    assert {
+        "component", "endpoint_class", "exception_class", "elapsed_ms", "http_status",
+        "retry_state", "retry_backoff_seconds",
+    } <= failure.keys()
+    assert failure["retry_state"] == "NEXT_ABSOLUTE_FULL_SLOT"
+    assert failure["retry_backoff_seconds"] == 120
     assert all("fail_closed_scan" not in call for fake in fakes.values() for call in fake.calls)
 
 
@@ -549,6 +563,24 @@ def test_component_readiness_is_symbol_scoped_and_obsolete_failures_are_removed(
     assert "book:BAD" not in runtime.component_readiness[Venue.EXTENDED]
 
 
+def test_component_reconcile_preserves_concrete_extended_failure_detail(tmp_path):
+    clock = FakeClock()
+    detail = "PUBLIC_REST_UNAVAILABLE:TimeoutError"
+    with PaperRepository(tmp_path / "component-failure-detail.db") as repository:
+        runtime = PublicPaperRuntime(repository, adapters={}, clock=clock)
+        runtime._set_component_readiness(
+            Venue.EXTENDED, "catalog", False, detail, clock.now()
+        )
+        runtime._set_component_readiness(
+            Venue.EXTENDED, "book:ABC-EXTENDED", True, "READY", clock.now()
+        )
+        runtime._remove_obsolete_components(
+            Venue.EXTENDED, {"ABC-EXTENDED"}, clock.now()
+        )
+    assert not runtime.readiness[Venue.EXTENDED].available
+    assert runtime.readiness[Venue.EXTENDED].detail == detail
+
+
 @pytest.mark.asyncio
 async def test_paper_run_persists_through_no_trade_until_explicit_stop(tmp_path):
     clock = FakeClock()
@@ -599,6 +631,7 @@ async def test_scheduling_full_focused_activation_and_strict_cutoff(tmp_path):
             assert runtime.broker is not None
             assert runtime.broker.state.lifecycle_state is LifecycleState.ENTRY_MAKER_OPEN
             clock.advance(115)  # Exact T-5 cutoff.
+            confirm_public_streams(runtime, clock.now())
             await runtime.tick()
             assert runtime.broker is None
             assert repository.load_runtime().lifecycle_state is LifecycleState.FLAT
@@ -609,11 +642,27 @@ async def test_scheduling_full_focused_activation_and_strict_cutoff(tmp_path):
                     "SELECT logical_at FROM scanner_snapshots"
                 ).fetchall()
             }
+            telemetry = [
+                json.loads(row[0])
+                for row in repository.connection.execute(
+                    "SELECT detail FROM runtime_evidence WHERE event_type='PUBLIC_SCAN'"
+                )
+            ]
     assert scans >= first_scans + 4
     assert {NOW, NOW + timedelta(seconds=100), NOW + timedelta(seconds=110)} <= recorded
     assert NOW + timedelta(seconds=120) in recorded
     assert NOW + timedelta(seconds=280) in recorded
     assert NOW + timedelta(seconds=395) in recorded
+    assert {"INITIAL", "FULL", "FOCUSED"} <= {
+        row["scan_kind"] for row in telemetry
+    }
+    assert all({
+        "scheduled_at", "started_at", "completed_at", "duration_ms",
+        "missed_deadline_ms", "scan_kind", "observations_source",
+    } <= row.keys() for row in telemetry)
+    assert {row["observations_source"] for row in telemetry} <= {
+        "REST_BOOTSTRAP", "LIVE_STREAM", "MIXED",
+    }
 
 
 @pytest.mark.asyncio
@@ -646,7 +695,11 @@ async def test_focused_and_active_ticks_make_zero_rest_calls_through_cutoff(tmp_
     assert {row["scan_kind"] for row in scan_details} <= {
         "INITIAL", "FOCUSED", "RECOVERY",
     }
-    assert all(row["observations_source"] == "LIVE_CACHE" for row in scan_details[1:])
+    assert scan_details[0]["observations_source"] == "REST_BOOTSTRAP"
+    assert {row["observations_source"] for row in scan_details[1:]} <= {
+        "MIXED", "LIVE_STREAM",
+    }
+    assert "LIVE_STREAM" in {row["observations_source"] for row in scan_details}
     assert all({
         "scheduled_at", "started_at", "completed_at", "duration_ms",
         "missed_deadline_ms", "scan_kind", "observations_source",
@@ -954,13 +1007,68 @@ def maker_trade(runtime: PublicPaperRuntime, at: datetime, key: str = "public-tr
 
 
 @pytest.mark.asyncio
+async def test_rest_bootstrap_cannot_activate_until_required_live_streams_are_ready(tmp_path):
+    clock = FakeClock()
+    target = NOW + timedelta(seconds=120)
+    with PaperRepository(tmp_path / "live-entry-gate.db") as repository:
+        async with PublicPaperRuntime(
+            repository, adapters=adapters(clock, settlement_at=target), clock=clock,
+        ) as runtime:
+            await runtime.tick()
+            assert runtime.broker is None
+            assert runtime.last_scan is not None and runtime.last_scan.winner is None
+            confirm_public_streams(runtime, clock.now())
+            clock.advance(10)
+            await runtime.tick()
+            assert runtime.broker is not None
+            event_count = repository.connection.execute(
+                "SELECT COUNT(*) FROM runtime_evidence "
+                "WHERE event_type='PAPER_ENTRY_ACTIVATED'"
+            ).fetchone()[0]
+    assert event_count == 1
+
+
+@pytest.mark.asyncio
+async def test_extended_socket_failures_are_component_aware(tmp_path):
+    clock = FakeClock()
+    fakes = adapters(clock, settlement_at=NOW + timedelta(minutes=5))
+    with PaperRepository(tmp_path / "extended-component-disconnect.db") as repository:
+        async with PublicPaperRuntime(repository, adapters=fakes, clock=clock) as runtime:
+            await runtime.scan()
+            symbol = fakes[Venue.EXTENDED].market.venue_symbol
+            runtime.mark_trade_stream_connected(Venue.EXTENDED, symbol)
+            runtime._live_book_ready.add((Venue.EXTENDED, symbol))
+            stream = runtime.coordinator.stream(Venue.EXTENDED, symbol)
+            before = stream.book()
+            assert before is not None and before.sequence == 1
+
+            await runtime.mark_disconnected(
+                Venue.EXTENDED, symbol, stream_kind="funding",
+                exception=TimeoutError("funding socket"),
+            )
+            assert stream.book() == before
+            assert (Venue.EXTENDED, symbol) in runtime._trade_stream_ready
+            assert runtime.component_readiness[Venue.EXTENDED][f"trade:{symbol}"].available
+            assert not runtime.component_readiness[Venue.EXTENDED][f"funding:{symbol}"].available
+
+            await runtime.mark_disconnected(
+                Venue.EXTENDED, symbol, stream_kind="trade",
+                exception=ConnectionError("trade socket"),
+            )
+            assert stream.book() == before
+            assert stream.book().sequence == 1
+            assert (Venue.EXTENDED, symbol) not in runtime._trade_stream_ready
+            assert not runtime.component_readiness[Venue.EXTENDED][f"trade:{symbol}"].available
+
+
+@pytest.mark.asyncio
 async def test_healthy_public_trade_reaches_broker_and_deduplicates(tmp_path):
     clock = FakeClock()
     target = NOW + timedelta(seconds=120)
     fakes = adapters(clock, settlement_at=target)
     with PaperRepository(tmp_path / "trade.db") as repository:
         async with PublicPaperRuntime(repository, adapters=fakes, clock=clock) as runtime:
-            await runtime.tick()
+            await activate_with_live_streams(runtime, clock)
             assert runtime.broker is not None
             clock.advance(1)
             order = runtime.broker.state.order
@@ -986,7 +1094,7 @@ async def test_disconnect_cancels_entry_and_position_gap_recovers_from_snapshot(
     fakes = adapters(clock, settlement_at=target)
     with PaperRepository(tmp_path / "gap.db") as repository:
         async with PublicPaperRuntime(repository, adapters=fakes, clock=clock) as runtime:
-            await runtime.tick()
+            await activate_with_live_streams(runtime, clock)
             order = runtime.broker.state.order
             await runtime.mark_disconnected(order.venue, order.canonical_market)
             assert runtime.broker is None
@@ -995,7 +1103,7 @@ async def test_disconnect_cancels_entry_and_position_gap_recovers_from_snapshot(
         clock = FakeClock()
         fakes = adapters(clock, settlement_at=target)
         async with PublicPaperRuntime(repository, adapters=fakes, clock=clock) as runtime:
-            await runtime.tick()
+            await activate_with_live_streams(runtime, clock)
             clock.advance(1)
             order = runtime.broker.state.order
             runtime.mark_trade_stream_connected(order.venue, order.canonical_market)
@@ -1006,6 +1114,12 @@ async def test_disconnect_cancels_entry_and_position_gap_recovers_from_snapshot(
             assert runtime.lifecycle.snapshot.gap_open
             clock.advance(1)
             snapshot = await fakes[hedge.venue].fetch_book(hedge.venue_symbol)
+            runtime.mark_trade_stream_connected(hedge.venue, hedge.venue_symbol)
+            for component in ("funding", "connection_combined"):
+                runtime._set_component_readiness(
+                    hedge.venue, f"{component}:{hedge.venue_symbol}", True,
+                    "PUBLIC_STREAM_CONNECTED", clock.now(),
+                )
             await runtime.recover_snapshot(snapshot)
             assert not runtime.lifecycle.snapshot.gap_open
             assert runtime.lifecycle.snapshot.data_quality.value == "DEGRADED"
@@ -1169,27 +1283,30 @@ async def test_extended_stream_registry_is_dynamic_deduplicated_and_lock_safe(tm
 
 
 @pytest.mark.asyncio
-async def test_combined_streams_start_once_after_initial_catalog_recovery(tmp_path):
+async def test_public_refresh_starts_combined_stream_once_after_catalog_recovery(tmp_path):
     clock = FakeClock()
     fakes = adapters(clock, settlement_at=NOW + timedelta(minutes=5))
+    fakes[Venue.NADO].available = False
     with PaperRepository(tmp_path / "dynamic-combined.db") as repository:
         runtime = PublicPaperRuntime(repository, adapters=fakes, clock=clock)
+        await runtime.scan()
         runtime._session = object()
         runtime._stop_event = asyncio.Event()
-        await runtime._reconcile_combined_streams()
-        assert not runtime._stream_tasks
-        runtime.markets = {
-            Venue.RISEX: (fakes[Venue.RISEX].market,),
-            Venue.NADO: (fakes[Venue.NADO].market,),
-        }
-        for venue in (Venue.RISEX, Venue.NADO):
-            market = fakes[venue].market
-            runtime.volumes[(venue, market.venue_symbol)] = MarketVolume(
-                venue, market.venue_symbol, D("1000000"), NOW, "synthetic"
-            )
-        await runtime._reconcile_combined_streams()
+
+        async def stable_combined(_venue, _adapter, _symbols):
+            await runtime._stop_event.wait()
+
+        runtime._combined_stream = stable_combined
+        await runtime._reconcile_streams()
+        assert not any(key[0] is Venue.NADO for key in runtime._stream_tasks)
+
+        fakes[Venue.NADO].available = True
+        await runtime._refresh_public_data()
         first = dict(runtime._stream_tasks)
-        await runtime._reconcile_combined_streams()
+        assert sum(
+            key[0] is Venue.NADO and key[2] == "combined" for key in first
+        ) == 1
+        await runtime._refresh_public_data()
         assert runtime._stream_tasks == first
         await runtime.shutdown()
     assert {(key[0], key[2]) for key in first} == {
@@ -1204,7 +1321,7 @@ async def test_health_confirmation_silence_cancels_active_entry(tmp_path):
         async with PublicPaperRuntime(
             repository, adapters=adapters(clock, settlement_at=NOW + timedelta(seconds=120)), clock=clock,
         ) as runtime:
-            await runtime.tick()
+            await activate_with_live_streams(runtime, clock)
             order = runtime.broker.state.order
             runtime.mark_trade_stream_connected(order.venue, order.canonical_market)
             runtime.next_health_check_at = clock.now() + timedelta(seconds=10)
@@ -1222,7 +1339,7 @@ async def test_official_applied_settlement_replaces_estimate_and_report_has_assu
     fakes = adapters(clock, settlement_at=target)
     with PaperRepository(tmp_path / "settlement.db") as repository:
         async with PublicPaperRuntime(repository, adapters=fakes, clock=clock) as runtime:
-            await runtime.tick()
+            await activate_with_live_streams(runtime, clock)
             clock.advance(1)
             order = runtime.broker.state.order
             runtime.mark_trade_stream_connected(order.venue, order.canonical_market)
@@ -1267,7 +1384,7 @@ async def test_delayed_risex_applied_history_keeps_unresolved_since_boundary(tmp
         async with PublicPaperRuntime(
             repository, adapters=adapters(clock, settlement_at=target), clock=clock,
         ) as runtime:
-            await runtime.tick()
+            await activate_with_live_streams(runtime, clock)
             clock.advance(1)
             order = runtime.broker.state.order
             runtime.mark_trade_stream_connected(order.venue, order.canonical_market)
@@ -1296,7 +1413,7 @@ async def test_safe_shutdown_cancels_only_virtual_entry_and_preserves_open_posit
             adapters=adapters(clock, settlement_at=target),
             clock=clock,
         ) as runtime:
-            await runtime.tick()
+            await activate_with_live_streams(runtime, clock)
             assert runtime.broker is not None
             await runtime.shutdown()
             state = repository.load_runtime()
@@ -1314,7 +1431,7 @@ async def test_safe_shutdown_preserves_actually_open_position(tmp_path):
         async with PublicPaperRuntime(
             repository, adapters=adapters(clock, settlement_at=NOW + timedelta(seconds=120)), clock=clock,
         ) as runtime:
-            await runtime.tick()
+            await activate_with_live_streams(runtime, clock)
             clock.advance(1)
             order = runtime.broker.state.order
             runtime.mark_trade_stream_connected(order.venue, order.canonical_market)
@@ -1337,7 +1454,7 @@ async def test_real_runtime_restart_restores_open_position_with_offline_gap(tmp_
             adapters=adapters(clock, settlement_at=target),
             clock=clock,
         ) as runtime:
-            await runtime.tick()
+            await activate_with_live_streams(runtime, clock)
             clock.advance(1)
             order = runtime.broker.state.order
             runtime.mark_trade_stream_connected(order.venue, order.canonical_market)

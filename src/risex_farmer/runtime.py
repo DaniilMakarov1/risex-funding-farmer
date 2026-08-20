@@ -280,6 +280,7 @@ class PublicPaperRuntime:
         self._attempt_number = 0
         self._nado_cumulative_funding: dict[tuple[str, str], object] = {}
         self._trade_stream_ready: set[tuple[Venue, str]] = set()
+        self._live_book_ready: set[tuple[Venue, str]] = set()
         self._last_readiness_evidence_at: dict[Venue, datetime] = {}
         self._extended_trade_sequences: dict[str, int] = {}
         self._combined_symbols: dict[Venue, tuple[str, ...]] = {}
@@ -398,10 +399,14 @@ class PublicPaperRuntime:
             all(row.available for row in rows) for rows in by_symbol.values()
         )
         available = (catalog is None or catalog.available) and symbol_ready
+        failed = next((row for row in components.values() if not row.available), None)
         self._set_readiness(
             venue,
             available,
-            "PUBLIC_COMPONENTS_RECONCILED",
+            (
+                "PUBLIC_COMPONENTS_RECONCILED"
+                if available or failed is None else failed.detail
+            ),
             at,
         )
 
@@ -446,6 +451,8 @@ class PublicPaperRuntime:
                         (self.clock.now() - at).total_seconds() * 1000
                     ),
                     "http_status": _http_status(exc),
+                    "retry_state": "NEXT_ABSOLUTE_FULL_SLOT",
+                    "retry_backoff_seconds": self.config.normal_scan_seconds,
                     "last_good_at": (
                         None if venue not in self._last_catalog_good_at
                         else self._last_catalog_good_at[venue].isoformat()
@@ -609,6 +616,8 @@ class PublicPaperRuntime:
                             (logical_at - request_started_at).total_seconds() * 1000
                         ),
                         "http_status": _http_status(exc),
+                        "retry_state": "NEXT_ABSOLUTE_FULL_SLOT",
+                        "retry_backoff_seconds": self.config.normal_scan_seconds,
                         "last_good_age_seconds": str(
                             Decimal(str((logical_at - existing.book.observed_at).total_seconds()))
                         ) if existing.book is not None else None,
@@ -641,6 +650,8 @@ class PublicPaperRuntime:
                         (logical_at - request_started_at).total_seconds() * 1000
                     ),
                     "http_status": _http_status(exc),
+                    "retry_state": "NEXT_ABSOLUTE_FULL_SLOT",
+                    "retry_backoff_seconds": self.config.normal_scan_seconds,
                 },
             )
 
@@ -676,20 +687,28 @@ class PublicPaperRuntime:
             ).health(logical_at)
             if not self._symbol_components_available(
                 observation.market.venue, observation.market.venue_symbol
+            ) or (
+                not refresh
+                and (observation.market.venue, observation.market.venue_symbol)
+                not in self._trade_stream_ready
             ):
                 health = replace(
                     health, stream_connected=False, data_quality=DataQuality.DEGRADED
                 )
             normalized.append(replace(observation, funding=funding, health=health))
         snapshot = await scan_once(normalized, logical_at, config=self.config)
-        self.last_scan = snapshot
-        self.repository.save_decision(
-            recorded_at=logical_at,
-            scan_snapshot=snapshot,
-            funding_quotes=tuple(
-                row.funding for row in normalized if row.funding is not None
-            ),
+        persist_scan = (
+            self.last_scan is None or self.last_scan.logical_at != logical_at
         )
+        self.last_scan = snapshot
+        if persist_scan:
+            self.repository.save_decision(
+                recorded_at=logical_at,
+                scan_snapshot=snapshot,
+                funding_quotes=tuple(
+                    row.funding for row in normalized if row.funding is not None
+                ),
+            )
         completed_at = self.clock.now()
         self._record(
             "PUBLIC_SCAN",
@@ -708,9 +727,7 @@ class PublicPaperRuntime:
                     0, int((started_at - scheduled_at).total_seconds() * 1000)
                 ),
                 "scan_kind": scan_kind,
-                "observations_source": (
-                    "REST_COMPLETE" if refresh else "LIVE_CACHE"
-                ),
+                "observations_source": self._observations_source(refresh),
             },
         )
         rankable = [
@@ -758,12 +775,14 @@ class PublicPaperRuntime:
                         })
             route_rows = tuple(unavailable_rows)
         route_rows = route_rows[:15]
-        self.repository.save_public_route_rows(logical_at=logical_at, rows=route_rows)
+        if persist_scan:
+            self.repository.save_public_route_rows(logical_at=logical_at, rows=route_rows)
         unavailable = {
             venue.value: state.detail
             for venue, state in self.readiness.items()
             if not state.available
         }
+
         return {
             "scan_at": logical_at.astimezone(UTC).isoformat(),
             "status": "OPPORTUNITY" if snapshot.winner is not None else "NO_TRADE",
@@ -803,6 +822,14 @@ class PublicPaperRuntime:
             },
             "assumption_flags": _assumption_flags(),
         }
+
+    def _observations_source(self, refresh: bool) -> str:
+        if refresh:
+            return "REST_BOOTSTRAP"
+        keys = set(self.observations)
+        if keys and keys <= self._trade_stream_ready and keys <= self._live_book_ready:
+            return "LIVE_STREAM"
+        return "MIXED"
 
     async def _refresh_public_data(self) -> None:
         assert self.adapters is not None
@@ -844,7 +871,15 @@ class PublicPaperRuntime:
     def _observation(self, venue: Venue, symbol: str, at: datetime) -> MarketObservation:
         row = self.observations[(venue, symbol)]
         stream = self.coordinator.stream(venue, symbol)
-        return replace(row, book=stream.book(), health=stream.health(at))
+        health = stream.health(at)
+        if (
+            not self._symbol_components_available(venue, symbol)
+            or (venue, symbol) not in self._trade_stream_ready
+        ):
+            health = replace(
+                health, stream_connected=False, data_quality=DataQuality.DEGRADED
+            )
+        return replace(row, book=stream.book(), health=health)
 
     def _route_observations(
         self, plan: RoutePlan, at: datetime
@@ -1276,7 +1311,8 @@ class PublicPaperRuntime:
             venue, f"trade:{symbol}", True, "PUBLIC_TRADE_STREAM_READY", now
         )
         self._set_component_readiness(
-            venue, f"connection:{symbol}", True, "PUBLIC_STREAM_CONNECTED", now
+            venue, f"connection_trade:{symbol}", True,
+            "PUBLIC_STREAM_CONNECTED", now
         )
 
     async def deliver_settlement(self, settlement: FundingSettlement) -> None:
@@ -1335,16 +1371,19 @@ class PublicPaperRuntime:
         stream_kind: str = "public", exception: BaseException | None = None,
     ) -> None:
         now = at or self.clock.now()
-        if stream_kind != "book":
+        invalidates_book = stream_kind in {"book", "combined", "health", "public"}
+        invalidates_trade = stream_kind in {"trade", "combined", "health", "public"}
+        if invalidates_trade:
             self._trade_stream_ready.discard((venue, symbol))
-        self.coordinator.stream(venue, symbol).disconnected()
+        if invalidates_book:
+            self._live_book_ready.discard((venue, symbol))
+            self.coordinator.stream(venue, symbol).disconnected()
         exception_name = "StreamGap" if exception is None else type(exception).__name__
         exception_detail = "" if exception is None else f":{str(exception)[:120]}"
-        affected = (
-            ("book", "trade", "funding", "connection")
-            if stream_kind in {"combined", "public", "health"}
-            else (stream_kind, "connection")
-        )
+        if stream_kind in {"combined", "public", "health"}:
+            affected = ("book", "trade", "funding", "connection_combined")
+        else:
+            affected = (stream_kind, f"connection_{stream_kind}")
         for component in affected:
             self._set_component_readiness(
                 venue, f"{component}:{symbol}", False,
@@ -1393,12 +1432,13 @@ class PublicPaperRuntime:
         stream.connected(now)
         stream.snapshot(book)
         stream.connection_confirmed(now)
+        self._live_book_ready.add((book.venue, book.canonical_market))
         self._set_component_readiness(
             book.venue, f"book:{book.canonical_market}", True,
             "PUBLIC_STREAM_RECOVERED", now,
         )
         self._set_component_readiness(
-            book.venue, f"connection:{book.canonical_market}", True,
+            book.venue, f"connection_book:{book.canonical_market}", True,
             "PUBLIC_STREAM_RECOVERED", now,
         )
         row = self.observations.get((book.venue, book.canonical_market))
@@ -1451,6 +1491,7 @@ class PublicPaperRuntime:
                     self._start_snapshot_recovery(event.venue, event.canonical_market)
                     return
                 await self.recover_snapshot(recovered, at=now)
+                self._live_book_ready.add(key)
                 self._record(
                     "PUBLIC_SNAPSHOT_RECOVERY_COMPLETED", at=now, venue=event.venue,
                     detail={
@@ -1462,6 +1503,7 @@ class PublicPaperRuntime:
                 )
             else:
                 await self.recover_snapshot(event, at=now)
+                self._live_book_ready.add(key)
             return
         if key in self._recovery_buffers:
             self._recovery_buffers[key].append(event)
@@ -1474,9 +1516,11 @@ class PublicPaperRuntime:
         if not stream.apply_delta(event):
             await self.mark_disconnected(event.venue, event.canonical_market, at=now, stream_kind="book")
             self._start_snapshot_recovery(event.venue, event.canonical_market)
-        elif self.lifecycle is not None:
-            self.next_position_monitor_at = now
-            await self.tick(now)
+        else:
+            self._live_book_ready.add(key)
+            if self.lifecycle is not None:
+                self.next_position_monitor_at = now
+                await self.tick(now)
 
     def _start_snapshot_recovery(self, venue: Venue, symbol: str) -> None:
         key = (venue, symbol)
@@ -1608,7 +1652,7 @@ class PublicPaperRuntime:
                     if kind == "trade":
                         self.mark_trade_stream_connected(Venue.EXTENDED, symbol)
                     self._set_component_readiness(
-                        Venue.EXTENDED, f"connection:{symbol}", True,
+                        Venue.EXTENDED, f"connection_{kind}:{symbol}", True,
                         "PUBLIC_STREAM_CONNECTED", self.clock.now(),
                     )
                     if kind != "book":
@@ -1679,8 +1723,15 @@ class PublicPaperRuntime:
                     for symbol in symbols:
                         self.coordinator.stream(venue, symbol).connected(self.clock.now())
                         self.mark_trade_stream_connected(venue, symbol)
+                        for component in ("funding", "connection_combined"):
+                            self._set_component_readiness(
+                                venue, f"{component}:{symbol}", True,
+                                "PUBLIC_STREAM_CONNECTED", self.clock.now(),
+                            )
                         await self.recover_snapshot(await adapter.fetch_book(symbol))
-                        for component in ("book", "trade", "funding", "connection"):
+                        for component in (
+                            "book", "trade", "funding", "connection_combined"
+                        ):
                             self._set_component_readiness(
                                 venue, f"{component}:{symbol}", True,
                                 "PUBLIC_STREAM_CONNECTED", self.clock.now(),
