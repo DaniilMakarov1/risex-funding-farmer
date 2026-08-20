@@ -230,6 +230,49 @@ def _fee(
     )
 
 
+def _maker_fee_split(
+    config: PaperConfig,
+    risex_market: CanonicalMarket,
+    hedge_market: CanonicalMarket,
+    quantity: Decimal,
+    risex_entry_price: Decimal,
+    hedge_entry_price: Decimal,
+    risex_exit_price: Decimal,
+    hedge_exit_price: Decimal,
+) -> tuple[Decimal, Decimal]:
+    entry = _fee(
+        config, risex_market, LiquidityRole.TAKER, quantity, risex_entry_price
+    ) + _fee(config, hedge_market, LiquidityRole.MAKER, quantity, hedge_entry_price)
+    exit_ = _fee(
+        config, risex_market, LiquidityRole.TAKER, quantity, risex_exit_price
+    ) + _fee(config, hedge_market, LiquidityRole.MAKER, quantity, hedge_exit_price)
+    return entry, exit_
+
+
+def planned_fee_split(
+    plan: RoutePlan, *, config: PaperConfig = PAPER_CONFIG
+) -> tuple[Decimal, Decimal] | None:
+    values = (
+        plan.canonical_quantity,
+        plan.risex_entry_price,
+        plan.hedge_entry_price,
+        plan.risex_exit_price,
+        plan.hedge_exit_price,
+    )
+    if any(value is None for value in values):
+        return None
+    quantity, risex_entry, hedge_entry, risex_exit, hedge_exit = values
+    assert quantity is not None and risex_entry is not None and hedge_entry is not None
+    assert risex_exit is not None and hedge_exit is not None
+    result = _maker_fee_split(
+        config, plan.risex_market, plan.hedge_market, quantity,
+        risex_entry, hedge_entry, risex_exit, hedge_exit,
+    )
+    if plan.planned_fees_usd is not None and sum(result, Decimal("0")) != plan.planned_fees_usd:
+        raise AssertionError("fee presentation split must equal planned total")
+    return result
+
+
 def _empty_plan(
     risex: MarketObservation,
     hedge: MarketObservation,
@@ -576,15 +619,11 @@ def evaluate_route(
             risex_entry_price,
             risex_exit_price,
         )
-    planned_fees = sum(
-        (
-            _fee(config, risex.market, LiquidityRole.TAKER, quantity, risex_entry_price),
-            _fee(config, hedge.market, LiquidityRole.MAKER, quantity, hedge_entry_price),
-            _fee(config, risex.market, LiquidityRole.TAKER, quantity, risex_exit_price),
-            _fee(config, hedge.market, LiquidityRole.MAKER, quantity, hedge_exit_price),
-        ),
-        Decimal("0"),
+    planned_entry_fees, planned_exit_fees = _maker_fee_split(
+        config, risex.market, hedge.market, quantity,
+        risex_entry_price, hedge_entry_price, risex_exit_price, hedge_exit_price,
     )
+    planned_fees = planned_entry_fees + planned_exit_fees
     planned_net = planned_maker_net_pnl_usd(
         expected_funding, execution, (planned_fees,)
     )

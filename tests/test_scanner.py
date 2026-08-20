@@ -27,6 +27,7 @@ from risex_farmer.scanner import (
     NoTradeReason,
     activation_schedule,
     evaluate_route,
+    planned_fee_split,
     scan_once,
     trade_precedes_cutoff,
 )
@@ -299,6 +300,9 @@ def test_negative_net_is_no_trade_and_non_negative_is_allowed() -> None:
         non_negative.planned_entry_execution_pnl_usd
         + non_negative.planned_exit_execution_pnl_usd
     )
+    fee_split = planned_fee_split(non_negative)
+    assert fee_split is not None
+    assert non_negative.planned_fees_usd == sum(fee_split, D("0"))
 
 
 @pytest.mark.asyncio

@@ -270,6 +270,10 @@ async def test_injected_ordinary_public_scan_builds_real_observations_and_diagno
         "risex_funding_usd", "hedge_funding_usd", "net_funding_usd",
     ):
         assert result["routes"][0][key] is not None
+    route = result["routes"][0]
+    assert D(route["planned_entry_fees_usd"]) + D(route["planned_exit_fees_usd"]) == D(
+        route["planned_fees_usd"]
+    )
     assert result["assumption_flags"]["risex_next_rate_estimate_is_a_paper_assumption"]
     assert report["runtime_evidence_count"] >= 4
     assert report["latest_routes"] == result["routes"]

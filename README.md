@@ -32,11 +32,15 @@ market-data streams until Ctrl+C or SIGTERM:
 
 ```bash
 risex-farmer --db paper.db scan-once
+risex-farmer --db paper.db scan-once --format table
 risex-farmer --db paper.db paper-run
 risex-farmer --db paper.db report
 ```
 
-`scan-once` prints ranked eligible, negative, and specifically blocked routes.
+`scan-once` defaults to backward-compatible JSON. Add `--format table` for a
+human-readable view of the same ordered routes (up to 15), including funding
+countdown, RISEx/hedge/net funding, entry/exit fee and execution components,
+expected net PnL, plain-language trade status, and public venue readiness.
 `paper-run` continues through `NO_TRADE` and venue outages, reconnecting public
 streams and failing affected routes closed. `report` summarizes persisted paper
 and runtime evidence. An open position is never force-closed merely because a

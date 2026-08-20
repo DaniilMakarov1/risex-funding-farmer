@@ -38,7 +38,14 @@ from .models import (
     Venue,
 )
 from .paper_broker import PaperEntryBroker, PaperEntryState
-from .scanner import MarketObservation, RoutePlan, ScanSnapshot, activation_schedule, scan_once
+from .scanner import (
+    MarketObservation,
+    RoutePlan,
+    ScanSnapshot,
+    activation_schedule,
+    planned_fee_split,
+    scan_once,
+)
 from .storage import PaperRepository
 
 
@@ -104,6 +111,7 @@ def _route_row(
     *,
     rank: int | None,
     observations: Mapping[tuple[Venue, str], MarketObservation],
+    config: PaperConfig = PAPER_CONFIG,
 ) -> dict[str, object]:
     risex_quote = observations.get((Venue.RISEX, plan.risex_market.venue_symbol))
     hedge_quote = observations.get((plan.hedge_venue, plan.hedge_market.venue_symbol))
@@ -135,6 +143,7 @@ def _route_row(
     )
     risex_funding = None if plan.target_cycle is None else plan.target_cycle.risex_event.expected_cash_usd
     hedge_funding = None if plan.target_cycle is None else plan.target_cycle.hedge_event.expected_cash_usd
+    fee_split = planned_fee_split(plan, config=config)
     return {
         "rank": rank,
         "route_key": f"{plan.canonical_asset}|{plan.hedge_venue.value}|{plan.direction.value}",
@@ -184,6 +193,12 @@ def _route_row(
             None
             if plan.planned_exit_execution_pnl_usd is None
             else str(plan.planned_exit_execution_pnl_usd)
+        ),
+        "planned_entry_fees_usd": (
+            None if fee_split is None else str(fee_split[0])
+        ),
+        "planned_exit_fees_usd": (
+            None if fee_split is None else str(fee_split[1])
         ),
         "planned_fees_usd": (
             None if plan.planned_fees_usd is None else str(plan.planned_fees_usd)
@@ -494,7 +509,10 @@ class PublicPaperRuntime:
         )
         rows = rankable + blocked
         route_rows = tuple(
-            _route_row(plan, rank=ranks.get(id(plan)), observations=self.observations)
+            _route_row(
+                plan, rank=ranks.get(id(plan)), observations=self.observations,
+                config=self.config,
+            )
             for plan in rows
         )
         if not route_rows:
@@ -530,6 +548,7 @@ class PublicPaperRuntime:
             if not state.available
         }
         return {
+            "scan_at": logical_at.astimezone(UTC).isoformat(),
             "status": "OPPORTUNITY" if snapshot.winner is not None else "NO_TRADE",
             "reason": (
                 None

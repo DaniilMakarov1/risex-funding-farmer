@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from risex_farmer.cli import main
+from risex_farmer.cli import _money, _reason, _scan_table, main
 from risex_farmer.lifecycle import LifecycleSnapshot
 from risex_farmer.models import LifecycleState, SettlementStatus, Side, TradeEvidence, Venue
 from risex_farmer.orchestrator import DEFAULT_LOGICAL_AT, load_fixture, run_fixture
@@ -255,6 +255,24 @@ def test_cli_commands_are_structured_and_network_free(tmp_path, capsys) -> None:
 
     assert main(
         [
+            "--db", str(database), "scan-once", "--format", "table",
+            "--fixture", str(FIXTURES / "no_opportunity.json"),
+        ]
+    ) == 0
+    table = capsys.readouterr().out
+    assert "Scan UTC:" in table and "NO TRADE" in table
+    assert "Readiness: RISEx: UNAVAILABLE | Extended: UNAVAILABLE | Nado: UNAVAILABLE" in table
+
+    assert main(
+        [
+            "--db", str(database), "scan-once", "--format", "json",
+            "--fixture", str(FIXTURES / "no_opportunity.json"),
+        ]
+    ) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "NO_TRADE"
+
+    assert main(
+        [
             "--db",
             str(paper_database),
             "paper-run",
@@ -269,3 +287,57 @@ def test_cli_commands_are_structured_and_network_free(tmp_path, capsys) -> None:
     report = json.loads(capsys.readouterr().out)
     assert report["fills"] == 4
     assert report["assumption_flags"]["paper_only"] is True
+
+
+def test_human_scan_table_exact_columns_labels_precision_and_narrow_width() -> None:
+    base = {
+        "rank": 1, "canonical_asset": "BTC",
+        "direction": "LONG_RISEX_SHORT_HEDGE", "hedge_venue": "EXTENDED",
+        "canonical_quantity": "0.006950000", "target_cycle_start": "2027-01-01T12:00:00+00:00",
+        "seconds_to_earliest_funding": "3661", "risex_funding_usd": "0.00001",
+        "hedge_funding_usd": "-0.123456", "net_funding_usd": "0.123466",
+        "planned_entry_fees_usd": "0.10", "planned_exit_fees_usd": "0.11",
+        "entry_execution_pnl_usd": "-0.2", "exit_execution_pnl_usd": "0.3",
+        "planned_maker_net_pnl_usd": "0.013", "entry_allowed": True, "blockers": [],
+    }
+    blocked = dict(
+        base, rank=2, canonical_asset="ETH", direction="SHORT_RISEX_LONG_HEDGE",
+        hedge_venue="NADO", entry_allowed=False,
+        blockers=["FUNDING_STALE", "INSUFFICIENT_EXACT_DEPTH", "SOMETHING_ODD"],
+        canonical_quantity=None, planned_maker_net_pnl_usd=None,
+    )
+    output = {
+        "scan_at": "2027-01-01T10:58:59+00:00", "status": "OPPORTUNITY",
+        "eligible_count": 1, "routes": [base, blocked],
+        "venue_readiness": {
+            "RISEX": {"available": True}, "EXTENDED": {"available": True},
+            "NADO": {"available": False},
+        },
+    }
+    wide = _scan_table(output, width=1000)
+    expected_headers = (
+        "Rank", "Asset", "Route", "Hedge", "Qty", "Funding At / T-",
+        "RISEx Funding $", "Hedge Funding $", "Net Funding $", "Entry Fee $",
+        "Exit Fee $", "Entry Execution PnL $", "Exit Execution PnL $",
+        "Expected Net PnL $", "Status",
+    )
+    assert all(header in wide for header in expected_headers)
+    assert "Scan UTC: 2027-01-01T10:58:59+00:00 | OPPORTUNITY | Eligible: 1" in wide
+    assert "Nearest funding UTC: 2027-01-01T12:00:00+00:00 / T-01:01:01" in wide
+    assert "RISEx: READY | Extended: READY | Nado: UNAVAILABLE" in wide
+    assert "R↑ / H↓" in wide and "R↓ / H↑" in wide
+    assert "TRADE" in wide
+    assert "NO TRADE — STALE DATA" in wide
+    assert _reason({"blockers": ["INSUFFICIENT_EXACT_DEPTH"]}) == "INSUFFICIENT DEPTH"
+    assert _reason({"blockers": ["FUNDING_UNKNOWN"]}) == "FUNDING UNKNOWN"
+    assert _reason({"blockers": ["SOMETHING_ODD"]}) == "SOMETHING ODD"
+    assert "Winner" not in wide and "Price" not in wide and "Diagnostics" not in wide
+    assert _money("0.00001") == "<0.0001"
+    assert _money(None) == "—"
+    narrow = _scan_table(output, width=72)
+    assert all(header in narrow for header in expected_headers)
+    assert narrow.index("Asset: BTC") < narrow.index("Asset: ETH")
+    fifteen = [dict(base, rank=index, canonical_asset=f"A{index:02d}") for index in range(1, 16)]
+    all_rows = _scan_table(dict(output, routes=fifteen), width=72)
+    assert all_rows.count("-- Route ") == 15
+    assert all_rows.index("Asset: A01") < all_rows.index("Asset: A15")
