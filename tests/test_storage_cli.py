@@ -41,6 +41,12 @@ async def test_fixture_only_e2e_runs(fixture, status, state, tmp_path) -> None:
         if status == "CLOSED":
             assert report["fills"] == 4
             assert report["open_position"] is None
+        if fixture == "positive_closed.json":
+            assert report["paper_orders"] == 1
+            assert report["maker_fills"] == 1
+            assert report["fill_rate"] == "1"
+            assert report["normal_exit_fills"] == 1
+            assert report["aggressive_exit_fills"] == 0
 
 
 @pytest.mark.asyncio
@@ -132,34 +138,36 @@ async def test_report_filters_primary_and_applied_metrics_and_computes_totals(
             )
         report = repository.report(as_of=DEFAULT_LOGICAL_AT + timedelta(hours=1))
 
-    assert report["normal_exits"] == 3
-    assert report["aggressive_exits"] == 2
+    assert report["normal_exit_fills"] == 3
+    assert report["aggressive_exit_fills"] == 2
     assert report["complete_trades"] == 4
     assert report["degraded_trades"] == 1
     assert report["primary_trade_count"] == 3
     assert report["applied_trade_count"] == 2
-    assert report["primary_win_rate"] == str(D("1") / D("3"))
-    assert report["applied_win_rate"] == "0.5"
+    assert report["simulated_win_rate"] == str(D("1") / D("3"))
+    assert report["applied_rate_win_rate"] == "0.5"
     assert report["simulated_closed_net_pnl_usd"] == "UNKNOWN"
     assert report["applied_rate_closed_net_pnl_usd"] == "UNKNOWN"
     assert D(report["virtual_risex_volume_usd"]) > 0
     assert D(report["pnl_per_1000_risex_volume_usd"]).is_finite()
     assert D(report["max_drawdown_usd"]) > 0
     assert D(report["planned_vs_actual_error_usd"]).is_finite()
-    assert report["funding_estimated"] == 1
-    assert report["funding_unresolved"] == 1
-    assert report["funding_applied_partial_cycles"] == 1
+    assert report["estimated_funding"] == 1
+    assert report["unresolved_settlements"] == 1
+    assert report["applied_rate_funding_partial"] == 1
+    assert report["eligible_opportunities"] == report["eligible_count"]
+    assert report["exit_wait_seconds"] == report["exit_duration_seconds"]
     assert report["cycles"] == 5
     assert all(
         flag in report["assumption_flags"]
         for flag in (
             "paper_only",
-            "taker_failure_latency_not_simulated",
+            "taker_failure_and_latency_not_simulated",
             "partial_fills_not_simulated",
             "queue_position_not_simulated",
             "cancel_replace_latency_not_simulated",
             "stablecoin_depeg_not_simulated",
-            "live_margin_liquidation_not_simulated",
+            "live_margin_and_liquidation_not_simulated",
             "expected_basis_convergence_pnl_usd",
             "points_value_usd",
             "risex_fee_tier",
@@ -170,12 +178,12 @@ async def test_report_filters_primary_and_applied_metrics_and_computes_totals(
         report["assumption_flags"][flag] is True
         for flag in (
             "paper_only",
-            "taker_failure_latency_not_simulated",
+            "taker_failure_and_latency_not_simulated",
             "partial_fills_not_simulated",
             "queue_position_not_simulated",
             "cancel_replace_latency_not_simulated",
             "stablecoin_depeg_not_simulated",
-            "live_margin_liquidation_not_simulated",
+            "live_margin_and_liquidation_not_simulated",
         )
     )
 

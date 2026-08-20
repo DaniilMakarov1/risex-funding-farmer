@@ -704,16 +704,17 @@ class PaperRepository:
             "COALESCE(SUM(eligible_count),0) eligible FROM scanner_snapshots"
         ).fetchone()
         order_rows = self.connection.execute(
-            "SELECT status, active_seconds, created_at FROM orders"
+            "SELECT order_kind, status, active_seconds, created_at FROM orders"
         ).fetchall()
-        order_count = len(order_rows)
-        filled_orders = sum(row["status"] == "FILLED" for row in order_rows)
-        active_seconds = Decimal("0")
-        for row in order_rows:
+        entry_order_rows = [row for row in order_rows if row["order_kind"] == "ENTRY"]
+        paper_orders = len(entry_order_rows)
+        maker_fills = sum(row["status"] == "FILLED" for row in entry_order_rows)
+        maker_active_seconds = Decimal("0")
+        for row in entry_order_rows:
             if row["active_seconds"] is not None:
-                active_seconds += Decimal(row["active_seconds"])
+                maker_active_seconds += Decimal(row["active_seconds"])
             elif row["status"] == "OPEN":
-                active_seconds += max(
+                maker_active_seconds += max(
                     Decimal("0"),
                     Decimal(
                         str(
@@ -822,28 +823,61 @@ class PaperRepository:
                 "position_id": None if position is None else position.position_id,
             }
         partial_cycles = self._applied_partial_cycle_count()
+        normal_exit_fills = sum(
+            closed.close_reason.value == "NORMAL_MAKER" for closed in closed_values
+        )
+        aggressive_exit_fills = sum(
+            closed.close_reason.value == "AGGRESSIVE_MAKER" for closed in closed_values
+        )
+        simulated_win_rate = (
+            UNKNOWN
+            if not primary
+            else str(
+                Decimal(
+                    sum(closed.simulated_closed_net_pnl_usd > 0 for closed in primary)
+                )
+                / Decimal(len(primary))
+            )
+        )
+        applied_rate_win_rate = (
+            UNKNOWN
+            if not applied
+            else str(
+                Decimal(
+                    sum(closed.applied_rate_closed_net_pnl_usd > 0 for closed in applied)
+                )
+                / Decimal(len(applied))
+            )
+        )
         return {
             "opportunities": scans["opportunities"],
+            "eligible_opportunities": scans["eligible"],
             "eligible_count": scans["eligible"],
-            "orders": order_count,
-            "filled_orders": filled_orders,
+            "paper_orders": paper_orders,
+            "maker_fills": maker_fills,
+            "orders": paper_orders,
+            "filled_orders": maker_fills,
             "fills": self.connection.execute("SELECT COUNT(*) FROM fills").fetchone()[0],
             "fill_rate": (
-                UNKNOWN if not order_count else str(Decimal(filled_orders) / Decimal(order_count))
+                UNKNOWN
+                if not paper_orders
+                else str(Decimal(maker_fills) / Decimal(paper_orders))
             ),
-            "order_active_seconds": str(active_seconds),
-            "normal_exits": sum(
-                closed.close_reason.value == "NORMAL_MAKER" for closed in closed_values
-            ),
-            "aggressive_exits": sum(
-                closed.close_reason.value == "AGGRESSIVE_MAKER" for closed in closed_values
-            ),
+            "maker_active_seconds": str(maker_active_seconds),
+            "order_active_seconds": str(maker_active_seconds),
+            "normal_exit_fills": normal_exit_fills,
+            "aggressive_exit_fills": aggressive_exit_fills,
+            "normal_exits": normal_exit_fills,
+            "aggressive_exits": aggressive_exit_fills,
             "hard_basis_exits": sum(
                 closed.close_reason.value == "HARD_BASIS" for closed in closed_values
             ),
             "funding_applied": funding_counts[SettlementStatus.APPLIED_RATE.value],
+            "estimated_funding": funding_counts[SettlementStatus.ESTIMATED.value],
             "funding_estimated": funding_counts[SettlementStatus.ESTIMATED.value],
+            "unresolved_settlements": funding_counts[SettlementStatus.UNRESOLVED.value],
             "funding_unresolved": funding_counts[SettlementStatus.UNRESOLVED.value],
+            "applied_rate_funding_partial": partial_cycles,
             "funding_applied_partial_cycles": partial_cycles,
             "simulated_recognized_funding_usd": known_total(
                 [closed.simulated_recognized_funding_usd for closed in closed_values]
@@ -865,27 +899,12 @@ class PaperRepository:
                 [closed.applied_rate_closed_net_pnl_usd for closed in closed_values]
             ),
             "primary_closed_net_pnl_usd": str(primary_net),
-            "primary_win_rate": (
-                UNKNOWN
-                if not primary
-                else str(
-                    Decimal(
-                        sum(closed.simulated_closed_net_pnl_usd > 0 for closed in primary)
-                    )
-                    / Decimal(len(primary))
-                )
-            ),
-            "applied_win_rate": (
-                UNKNOWN
-                if not applied
-                else str(
-                    Decimal(
-                        sum(closed.applied_rate_closed_net_pnl_usd > 0 for closed in applied)
-                    )
-                    / Decimal(len(applied))
-                )
-            ),
+            "simulated_win_rate": simulated_win_rate,
+            "primary_win_rate": simulated_win_rate,
+            "applied_rate_win_rate": applied_rate_win_rate,
+            "applied_win_rate": applied_rate_win_rate,
             "hold_duration_seconds": str(total_hold_seconds),
+            "exit_wait_seconds": str(total_exit_seconds),
             "exit_duration_seconds": str(total_exit_seconds),
             "funding_while_exiting_usd": known_total(
                 [closed.funding_while_exiting_usd for closed in closed_values]
@@ -916,12 +935,12 @@ class PaperRepository:
             "open_position": open_position,
             "assumption_flags": {
                 "paper_only": True,
-                "taker_failure_latency_not_simulated": True,
+                "taker_failure_and_latency_not_simulated": True,
                 "partial_fills_not_simulated": True,
                 "queue_position_not_simulated": True,
                 "cancel_replace_latency_not_simulated": True,
                 "stablecoin_depeg_not_simulated": True,
-                "live_margin_liquidation_not_simulated": True,
+                "live_margin_and_liquidation_not_simulated": True,
                 "expected_basis_convergence_pnl_usd": "0",
                 "points_value_usd": "0",
                 "risex_fee_tier": "USER_CONFIGURED_TIER_3",
