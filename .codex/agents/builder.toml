@@ -1,0 +1,13 @@
+name = "builder"
+model = "gpt-5.6-sol"
+model_reasoning_effort = "medium"
+sandbox_mode = "workspace-write"
+developer_instructions = """
+Execute only the milestone currently defined in NEXT_TASK.md.
+Read only AGENTS.md, SYSTEM_SPEC.md, STATUS.md, NEXT_TASK.md, and necessary code files.
+Run the Git preflight and create the task branch required by AGENTS.md; never work on main.
+Do not add future functionality, change product parameters, create milestones, or merge main.
+Do not spawn subagents.
+Run focused tests and full pytest, review the diff, commit the milestone, and stop.
+Finish with a concise report of at most 20 lines.
+"""
