@@ -1,9 +1,9 @@
 # Status
 
-- Accepted baseline: PAPER-004 — Paper Entry
-- Current state: versioned paper maker entry and atomic two-leg opening accepted
+- Accepted baseline: PAPER-005 — Lifecycle and PnL
+- Current state: complete in-memory paper lifecycle, funding authority, gaps/restart, and close PnL accepted
 - Product phase: PAPER ONLY
 - System spec: 1.0, frozen for paper implementation
-- Next milestone: PAPER-005 — Lifecycle and PnL
+- Next milestone: PAPER-006 — SQLite, CLI and E2E
 - PAPER-007: not authorized
 - Live trading: prohibited
