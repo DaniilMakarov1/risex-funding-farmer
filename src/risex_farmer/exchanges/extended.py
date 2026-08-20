@@ -46,15 +46,24 @@ class ExtendedAdapter(PublicAdapter):
         )
 
     async def fetch_markets(self) -> tuple[CanonicalMarket, ...]:
-        payload = await self._get_json("/api/v1/info/markets")
-        rows = require_list(payload.get("data"), "data")
-        return tuple(self.normalize_market(require_mapping(row, "market")) for row in rows)
+        markets, _ = await self.fetch_catalog()
+        return markets
 
-    async def fetch_volumes(self) -> tuple[MarketVolume, ...]:
+    async def fetch_catalog(
+        self,
+    ) -> tuple[tuple[CanonicalMarket, ...], tuple[MarketVolume, ...]]:
+        """Normalize both catalog views from the venue's single public payload."""
         payload = await self._get_json("/api/v1/info/markets")
         rows = require_list(payload.get("data"), "data")
         observed_at = datetime.now(UTC)
-        return tuple(self.normalize_volume(row, observed_at=observed_at) for row in rows)
+        return (
+            tuple(self.normalize_market(require_mapping(row, "market")) for row in rows),
+            tuple(self.normalize_volume(row, observed_at=observed_at) for row in rows),
+        )
+
+    async def fetch_volumes(self) -> tuple[MarketVolume, ...]:
+        _, volumes = await self.fetch_catalog()
+        return volumes
 
     def normalize_market(self, row: Any) -> CanonicalMarket:
         row = require_mapping(row, "market")

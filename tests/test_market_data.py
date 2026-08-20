@@ -130,6 +130,15 @@ async def test_extended_public_access_never_adds_auth_and_marks_rejection() -> N
     assert rejected.public_data_available is False
 
 
+@pytest.mark.asyncio
+async def test_extended_catalog_normalizes_markets_and_volumes_from_one_fetch() -> None:
+    session = FakeSession(FakeResponse({"data": [fixture("extended")["market"]]}))
+    markets, volumes = await ExtendedAdapter(session).fetch_catalog()
+    assert len(session.calls) == 1
+    assert markets[0].venue_symbol == volumes[0].canonical_market
+    assert volumes[0].quote_volume_usd == D("1234.50")
+
+
 def test_risex_paper_fallback_is_explicit_and_unknown_funding_still_fails_closed() -> None:
     adapter = RisexAdapter(None)
     market = adapter.normalize_market(fixture("risex")["market"])

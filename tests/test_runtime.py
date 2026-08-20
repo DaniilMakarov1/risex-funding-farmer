@@ -4,10 +4,12 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from risex_farmer.exchanges.base import PublicAdapter, PublicDataUnavailable
+from risex_farmer.exchanges.extended import ExtendedAdapter
 from risex_farmer.exchanges.risex import RisexAdapter
 from risex_farmer.models import (
     BookLevel,
@@ -180,6 +182,68 @@ class ManyFakeAdapter(FakeAdapter):
         )
 
 
+class GatedAdapter(FakeAdapter):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.block_catalog = False
+        self.block_catalog_after_calls: int | None = None
+        self.catalog_calls = 0
+        self.block_funding = False
+        self.gate = asyncio.Event()
+        self.request_started = asyncio.Event()
+        self.cancelled = False
+
+    async def _wait_if_blocked(self, blocked: bool) -> None:
+        if not blocked:
+            return
+        self.request_started.set()
+        try:
+            await self.gate.wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+
+    async def fetch_markets(self):
+        self.catalog_calls += 1
+        await self._wait_if_blocked(
+            self.block_catalog or (
+                self.block_catalog_after_calls is not None
+                and self.catalog_calls > self.block_catalog_after_calls
+            )
+        )
+        return await super().fetch_markets()
+
+    async def fetch_volumes(self):
+        self.catalog_calls += 1
+        await self._wait_if_blocked(
+            self.block_catalog or (
+                self.block_catalog_after_calls is not None
+                and self.catalog_calls > self.block_catalog_after_calls
+            )
+        )
+        return await super().fetch_volumes()
+
+    async def fetch_funding_quote(self, market, *, assumed_open_at):
+        await self._wait_if_blocked(self.block_funding)
+        return await super().fetch_funding_quote(
+            market, assumed_open_at=assumed_open_at
+        )
+
+
+class GatedRecoveryAdapter(FakeAdapter):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.block_recovery = False
+        self.recovery_started = asyncio.Event()
+        self.recovery_gate = asyncio.Event()
+
+    async def fetch_book(self, venue_symbol: str):
+        if self.block_recovery:
+            self.recovery_started.set()
+            await self.recovery_gate.wait()
+        return await super().fetch_book(venue_symbol)
+
+
 class JsonResponse:
     def __init__(self, payload):
         self.payload = payload
@@ -313,6 +377,45 @@ async def test_same_scan_primes_official_shaped_risex_rest_evidence(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_scan_once_waits_for_complete_rest_snapshot(tmp_path):
+    clock = FakeClock()
+    fakes = adapters(clock, settlement_at=NOW + timedelta(minutes=5))
+    gated = GatedAdapter(
+        Venue.EXTENDED, clock, settlement_at=NOW + timedelta(minutes=5)
+    )
+    gated.block_funding = True
+    fakes[Venue.EXTENDED] = gated
+    with PaperRepository(tmp_path / "synchronous-scan.db") as repository:
+        task = asyncio.create_task(
+            public_scan_once(repository, adapters=fakes, clock=clock)
+        )
+        await gated.request_started.wait()
+        assert not task.done()
+        gated.gate.set()
+        result = await task
+    assert result["routes"]
+    assert {"markets", "volumes", "book", "funding"} <= set(gated.calls)
+
+
+@pytest.mark.asyncio
+async def test_transient_catalog_failure_retains_last_good_and_fails_component(tmp_path):
+    clock = FakeClock()
+    fakes = adapters(clock, settlement_at=NOW + timedelta(minutes=5))
+    with PaperRepository(tmp_path / "last-good.db") as repository:
+        async with PublicPaperRuntime(repository, adapters=fakes, clock=clock) as runtime:
+            await runtime.scan()
+            before = runtime.markets[Venue.RISEX]
+            fakes[Venue.RISEX].available = False
+            await runtime._catalog(Venue.RISEX, fakes[Venue.RISEX])
+            assert runtime.markets[Venue.RISEX] == before
+            assert not runtime.readiness[Venue.RISEX].available
+            clock.advance(1)
+            result = await runtime.scan(refresh=False)
+            assert result["status"] == "NO_TRADE"
+    assert result["venue_readiness"]["RISEX"]["components"]["catalog"]["available"] is False
+
+
+@pytest.mark.asyncio
 async def test_venue_outage_is_specific_and_never_uses_empty_fail_closed_scan(tmp_path):
     clock = FakeClock()
     fakes = adapters(clock, settlement_at=NOW + timedelta(minutes=5), risex=False)
@@ -400,12 +503,18 @@ async def test_scheduling_full_focused_activation_and_strict_cutoff(tmp_path):
             first_scans = repository.connection.execute("SELECT COUNT(*) FROM scanner_snapshots").fetchone()[0]
             clock.advance(100)  # T-300 focused window.
             await runtime.tick()
+            await runtime._refresh_task
             clock.advance(10)
             await runtime.tick()
+            await runtime._refresh_task
             clock.advance(10)  # Full scan at +120.
             await runtime.tick()
-            clock.advance(160)  # Exact T-120 activation.
-            await runtime.tick()
+            await runtime._refresh_task
+            for _ in range(16):  # Focused cadence through exact T-120 activation.
+                clock.advance(10)
+                await runtime.tick()
+                if runtime._refresh_task is not None:
+                    await runtime._refresh_task
             assert runtime.broker is not None
             assert runtime.broker.state.lifecycle_state is LifecycleState.ENTRY_MAKER_OPEN
             clock.advance(115)  # Exact T-5 cutoff.
@@ -455,6 +564,66 @@ async def test_run_loop_wakes_on_activation_and_cutoff_deadlines(tmp_path):
     assert target - timedelta(seconds=5) in wakeups
     assert target - timedelta(seconds=120) in recorded
     assert target - timedelta(seconds=5) in recorded
+
+
+@pytest.mark.asyncio
+async def test_hung_refresh_never_moves_absolute_entry_deadlines(tmp_path):
+    clock = FakeClock()
+    target = NOW + timedelta(seconds=400)
+    fakes = adapters(clock, settlement_at=target)
+    gated = GatedAdapter(Venue.RISEX, clock, settlement_at=target)
+    gated.block_catalog_after_calls = 2
+    fakes[Venue.RISEX] = gated
+    stop = asyncio.Event()
+
+    async def deadline_sleep(seconds: float) -> None:
+        clock.value += timedelta(seconds=seconds)
+        if clock.now() >= target:
+            stop.set()
+        await asyncio.sleep(0)
+
+    with PaperRepository(tmp_path / "hung-refresh-deadline.db") as repository:
+        result = await public_paper_run(
+            repository, adapters=fakes, clock=clock, sleep=deadline_sleep,
+            stop_event=stop,
+        )
+        recorded = {
+            datetime.fromisoformat(row[0]) for row in repository.connection.execute(
+                "SELECT logical_at FROM scanner_snapshots"
+            )
+        }
+    assert result["status"] == "STOPPED_SAFE"
+    assert target - timedelta(seconds=120) in recorded
+    assert target - timedelta(seconds=5) in recorded
+    assert gated.cancelled
+
+
+@pytest.mark.asyncio
+async def test_full_tick_coalesces_background_refresh_and_skips_missed_slots(tmp_path):
+    clock = FakeClock()
+    target = NOW + timedelta(minutes=5)
+    fakes = adapters(clock, settlement_at=target)
+    gated = GatedAdapter(Venue.RISEX, clock, settlement_at=target)
+    fakes[Venue.RISEX] = gated
+    with PaperRepository(tmp_path / "single-flight.db") as repository:
+        async with PublicPaperRuntime(repository, adapters=fakes, clock=clock) as runtime:
+            await runtime.tick()
+            gated.block_catalog = True
+            runtime.next_full_scan_at = NOW + timedelta(seconds=120)
+            clock.value = NOW + timedelta(seconds=360)
+            await runtime.tick()
+            first = runtime._refresh_task
+            await gated.request_started.wait()
+            await runtime.tick()
+            assert runtime._refresh_task is first
+            assert runtime.next_full_scan_at == NOW + timedelta(seconds=480)
+            gated.gate.set()
+            await first
+            coalesced = repository.connection.execute(
+                "SELECT COUNT(*) FROM runtime_evidence "
+                "WHERE event_type='PUBLIC_REFRESH_COALESCED'"
+            ).fetchone()[0]
+    assert coalesced >= 1
 
 
 @pytest.mark.asyncio
@@ -722,9 +891,107 @@ async def test_sequence_gap_fetches_snapshot_and_reconnect_restores_readiness(tm
                 Venue.EXTENDED, market.venue_symbol,
                 (BookLevel(D("100"), D("1")),), (), clock.now(), 3, 999,
             ))
+            recovery = runtime._recovery_tasks[(Venue.EXTENDED, market.venue_symbol)]
+            await recovery
             state = runtime.readiness[Venue.EXTENDED]
     assert fakes[Venue.EXTENDED].calls.count("book") == before + 1
     assert state.available and state.detail == "PUBLIC_STREAM_RECOVERED"
+
+
+@pytest.mark.asyncio
+async def test_nado_recovery_buffers_and_replays_newer_continuous_delta(tmp_path):
+    clock = FakeClock()
+    target = NOW + timedelta(minutes=5)
+    fakes = adapters(clock, settlement_at=target)
+    gated = GatedRecoveryAdapter(Venue.NADO, clock, settlement_at=target)
+    fakes[Venue.NADO] = gated
+    with PaperRepository(tmp_path / "nado-buffered-recovery.db") as repository:
+        async with PublicPaperRuntime(repository, adapters=fakes, clock=clock) as runtime:
+            await runtime.scan()
+            symbol = gated.market.venue_symbol
+            gated.block_recovery = True
+            await runtime.apply_book_event(BookDelta(
+                Venue.NADO, symbol, (), (), clock.now(), 3, 999,
+            ))
+            recovery = runtime._recovery_tasks[(Venue.NADO, symbol)]
+            await gated.recovery_started.wait()
+            await runtime.apply_book_event(BookDelta(
+                Venue.NADO, symbol,
+                (BookLevel(D("100"), D("2")),), (), clock.now(), 2, 1,
+            ))
+            assert len(runtime._recovery_buffers[(Venue.NADO, symbol)]) == 1
+            gated.block_recovery = False
+            gated.recovery_gate.set()
+            await recovery
+            book = runtime.coordinator.stream(Venue.NADO, symbol).book()
+            evidence = repository.connection.execute(
+                "SELECT detail FROM runtime_evidence "
+                "WHERE event_type='PUBLIC_SNAPSHOT_RECOVERY_COMPLETED'"
+            ).fetchone()
+    assert book.sequence == 2
+    assert json.loads(evidence["detail"])["replayed"] == 1
+
+
+@pytest.mark.asyncio
+async def test_healthy_live_stream_background_refresh_does_not_install_rest_book(tmp_path):
+    clock = FakeClock()
+    fakes = adapters(clock, settlement_at=NOW + timedelta(minutes=5))
+    with PaperRepository(tmp_path / "healthy-stream-refresh.db") as repository:
+        async with PublicPaperRuntime(repository, adapters=fakes, clock=clock) as runtime:
+            await runtime.scan()
+            symbol = fakes[Venue.NADO].market.venue_symbol
+            runtime.mark_trade_stream_connected(Venue.NADO, symbol)
+            before = fakes[Venue.NADO].calls.count("book")
+            runtime._start_public_refresh()
+            await runtime._refresh_task
+    assert fakes[Venue.NADO].calls.count("book") == before
+
+
+@pytest.mark.asyncio
+async def test_extended_stream_registry_is_dynamic_deduplicated_and_lock_safe(tmp_path):
+    clock = FakeClock()
+    adapter = ExtendedAdapter(None)
+    original = FakeAdapter(
+        Venue.EXTENDED, clock, settlement_at=NOW + timedelta(minutes=5)
+    ).market
+    added = replace(original, canonical_asset="XYZ", venue_symbol="XYZ-EXTENDED")
+    with PaperRepository(tmp_path / "dynamic-extended.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={Venue.EXTENDED: adapter}, clock=clock
+        )
+        runtime._session = object()
+        runtime._stop_event = asyncio.Event()
+        runtime.markets[Venue.EXTENDED] = (original,)
+        risex_original = replace(
+            original, venue=Venue.RISEX, venue_symbol="ABC-RISEX"
+        )
+        risex_added = replace(
+            added, venue=Venue.RISEX, venue_symbol="XYZ-RISEX"
+        )
+        runtime.markets[Venue.RISEX] = (risex_original, risex_added)
+        for market in (original, added, risex_original, risex_added):
+            runtime.volumes[(market.venue, market.venue_symbol)] = MarketVolume(
+                market.venue, market.venue_symbol, D("1000000"), NOW, "synthetic"
+            )
+        await runtime._reconcile_extended_streams()
+        first = dict(runtime._stream_tasks)
+        await runtime._reconcile_extended_streams()
+        assert runtime._stream_tasks == first
+        runtime.broker = SimpleNamespace(state=SimpleNamespace(
+            lifecycle_state=LifecycleState.FLAT,
+            order=SimpleNamespace(route_plan=SimpleNamespace(
+                hedge_venue=Venue.EXTENDED, hedge_market=original,
+            )),
+        ))
+        runtime.markets[Venue.EXTENDED] = (added,)
+        await runtime._reconcile_extended_streams()
+        symbols = {
+            symbol for venue, symbol, _ in runtime._stream_tasks
+            if venue is Venue.EXTENDED
+        }
+        runtime.broker = None
+        await runtime.shutdown()
+    assert symbols == {original.venue_symbol, added.venue_symbol}
 
 
 @pytest.mark.asyncio
