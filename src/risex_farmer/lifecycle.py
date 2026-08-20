@@ -232,6 +232,22 @@ def _settlement_for_event(event: FundingEvent, opened_at: datetime) -> FundingSe
     )
 
 
+_SIMULATED_RESOLVED_STATUSES = frozenset(
+    {
+        SettlementStatus.ESTIMATED,
+        SettlementStatus.APPLIED_RATE,
+        SettlementStatus.SKIPPED_POSITION_NOT_OPEN,
+        SettlementStatus.SKIPPED_POSITION_CLOSED,
+    }
+)
+
+
+def _simulated_primary_complete(rows: tuple[FundingSettlement, ...]) -> bool:
+    return bool(rows) and all(
+        row.status in _SIMULATED_RESOLVED_STATUSES for row in rows
+    )
+
+
 def _aggressive_price(observation: MarketObservation, side: Side) -> Decimal | None:
     book = observation.book
     if book is None or not book.bids or not book.asks:
@@ -337,12 +353,13 @@ class LifecycleEngine:
         if position is None or order is None:
             raise ValueError("open lifecycle state requires position and entry order")
         settlements: tuple[FundingSettlement, ...] = ()
-        if position.target_cycle is not None:
+        evidence_cycle = position.target_cycle or order.route_plan.target_cycle
+        if evidence_cycle is not None:
             settlements = tuple(
                 sorted(
                     (
                         _settlement_for_event(event, position.position_opened_at)
-                        for event in _cycle_events(position.target_cycle)
+                        for event in _cycle_events(evidence_cycle)
                     ),
                     key=_settlement_sort_key,
                 )
@@ -446,7 +463,10 @@ class LifecycleEngine:
         rows = self._settlement_map()
         for event in _cycle_events(cycle):
             row = rows[event.venue, event.canonical_market, event.settlement_at]
-            if row.settlement_at > at or row.status is SettlementStatus.PENDING:
+            if row.settlement_at > at or row.status in {
+                SettlementStatus.PENDING,
+                SettlementStatus.UNRESOLVED,
+            }:
                 return False
             if authoritative_funding_cash_usd(row) is None:
                 return False
@@ -1156,7 +1176,7 @@ class LifecycleEngine:
                 else pair_pnl - self._snapshot.exit_start_pair_pnl_usd
             ),
             self._snapshot.data_quality,
-            self._snapshot.data_quality is DataQuality.COMPLETE,
+            False,
         )
         self._snapshot = replace(
             self._snapshot,
@@ -1179,8 +1199,11 @@ class LifecycleEngine:
             + closed.actual_pair_pnl_usd
             - closed.actual_fees_usd
         )
+        required_rows = self._snapshot.settlements
         applied_funding = (
-            recognized if applied_rate_complete(self._snapshot.settlements) else None
+            recognized
+            if required_rows and applied_rate_complete(required_rows)
+            else None
         )
         applied_net = (
             None
@@ -1209,5 +1232,9 @@ class LifecycleEngine:
                 applied_rate_funding_usd=applied_funding,
                 applied_rate_closed_net_pnl_usd=applied_net,
                 funding_while_exiting_usd=funding_while_exiting,
+                primary_metrics_valid=(
+                    closed.data_quality is DataQuality.COMPLETE
+                    and _simulated_primary_complete(required_rows)
+                ),
             ),
         )

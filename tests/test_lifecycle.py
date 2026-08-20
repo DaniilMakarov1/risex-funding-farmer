@@ -315,6 +315,42 @@ async def test_resolved_cycle_registers_only_one_current_next_cycle() -> None:
 
 
 @pytest.mark.asyncio
+async def test_unresolved_with_estimate_is_recognized_but_never_rolls_cycle() -> None:
+    engine = LifecycleEngine(await open_state())
+    rows = engine.snapshot.settlements
+    await engine.reconcile_settlement(
+        replace(rows[0], status=SettlementStatus.ESTIMATED, cash_usd=D("4"))
+    )
+    current = engine.snapshot.settlements[0]
+    await engine.reconcile_settlement(
+        replace(current, status=SettlementStatus.UNRESOLVED, cash_usd=None)
+    )
+    await engine.reconcile_settlement(
+        replace(rows[1], status=SettlementStatus.ESTIMATED, cash_usd=D("3"))
+    )
+    next_at = TARGET + timedelta(seconds=60)
+    next_cycle = TargetFundingCycle(
+        "must-not-roll",
+        next_at,
+        next_at,
+        0,
+        FundingEvent(Venue.RISEX, "ABC-RISEX", next_at, D("2"), True),
+        FundingEvent(Venue.EXTENDED, "ABC-EXTENDED", next_at, D("2"), True),
+    )
+    at = TARGET + timedelta(seconds=1)
+    await engine.evaluate(
+        evaluated_at=at,
+        risex_observation=observation(Venue.RISEX, at=at),
+        hedge_observation=observation(Venue.EXTENDED, at=at),
+        next_cycle=next_cycle,
+    )
+    assert engine.snapshot.samples[-1].lifecycle_recognized_funding_usd == D("7")
+    assert engine.snapshot.active_cycle.cycle_id != "must-not-roll"
+    assert len(engine.snapshot.settlements) == 2
+    assert engine.snapshot.lifecycle_state is LifecycleState.EXITING_NORMAL
+
+
+@pytest.mark.asyncio
 async def test_normal_to_aggressive_is_exact_sticky_and_reversion_is_forbidden() -> None:
     engine = LifecycleEngine(await open_state(recomputed_cash="0"))
     risex, hedge = fresh_pair(OPENED)
@@ -582,6 +618,7 @@ async def test_funding_during_exit_and_partial_applied_close_recompute() -> None
     assert closed.funding_while_exiting_usd == D("8")
     assert closed.simulated_recognized_funding_usd == D("8")
     assert closed.applied_rate_closed_net_pnl_usd is None
+    assert closed.primary_metrics_valid is True
 
     estimated = next(
         row for row in engine.snapshot.settlements
@@ -592,6 +629,67 @@ async def test_funding_during_exit_and_partial_applied_close_recompute() -> None
     )
     assert engine.snapshot.closed_trade.simulated_recognized_funding_usd == D("9")
     assert engine.snapshot.closed_trade.applied_rate_closed_net_pnl_usd is not None
+
+
+@pytest.mark.asyncio
+async def test_unknown_post_entry_funding_retains_required_keys_and_fails_closed() -> None:
+    state = await open_state(recomputed_cash=None)
+    assert state.position.target_cycle is None
+    engine = LifecycleEngine(state)
+    assert engine.snapshot.active_cycle is None
+    assert len(engine.snapshot.settlements) == 2
+    first = engine.snapshot.settlements[0]
+    await engine.reconcile_settlement(
+        replace(first, status=SettlementStatus.UNRESOLVED, cash_usd=None)
+    )
+    close_at = TARGET + timedelta(seconds=1)
+    await engine.evaluate(
+        evaluated_at=close_at,
+        risex_observation=observation(Venue.RISEX, at=close_at),
+        hedge_observation=observation(Venue.EXTENDED, at=close_at),
+    )
+    order = engine.snapshot.exit_order
+    await engine.process_exit_trade(
+        exit_trade("unknown-close", order.side, at=close_at),
+        observed_version_id=order.active_version.version_id,
+        processed_at=close_at,
+        risex_observation=observation(Venue.RISEX, at=close_at),
+        hedge_observation=observation(Venue.EXTENDED, at=close_at),
+    )
+    closed = engine.snapshot.closed_trade
+    assert {row.status for row in engine.snapshot.settlements} == {
+        SettlementStatus.PENDING,
+        SettlementStatus.UNRESOLVED,
+    }
+    assert closed.applied_rate_closed_net_pnl_usd is None
+    assert closed.primary_metrics_valid is False
+
+
+@pytest.mark.asyncio
+async def test_unknown_funding_future_close_skips_complete_required_key_set() -> None:
+    engine = LifecycleEngine(await open_state(recomputed_cash=None))
+    risex, hedge = fresh_pair(OPENED)
+    await engine.evaluate(
+        evaluated_at=OPENED,
+        risex_observation=risex,
+        hedge_observation=hedge,
+    )
+    order = engine.snapshot.exit_order
+    close_at = OPENED + timedelta(seconds=2)
+    await engine.process_exit_trade(
+        exit_trade("unknown-future-skip", order.side, at=close_at),
+        observed_version_id=order.active_version.version_id,
+        processed_at=close_at,
+        risex_observation=observation(Venue.RISEX, at=close_at),
+        hedge_observation=observation(Venue.EXTENDED, at=close_at),
+    )
+    assert len(engine.snapshot.settlements) == 2
+    assert all(
+        row.status is SettlementStatus.SKIPPED_POSITION_CLOSED
+        for row in engine.snapshot.settlements
+    )
+    assert engine.snapshot.closed_trade.applied_rate_closed_net_pnl_usd is not None
+    assert engine.snapshot.closed_trade.primary_metrics_valid is True
 
 
 @pytest.mark.asyncio
