@@ -1,43 +1,33 @@
-# PAPER-002 — Official Market Data
+# PAPER-003 — Scanner
 
 ## Goal
 
-Implement public REST/WebSocket adapters for RISEx, Extended, and Nado using only current official documentation and public APIs. Normalize metadata, books, trades, funding cash, settlement timing, and stream health into PAPER-001 contracts. No scanner, broker, lifecycle, CLI, authenticated endpoint, or trading functionality.
+Implement deterministic universe construction, route economics, target-cycle scheduling, activation, ranking, and `scan-once` service behavior over PAPER-001/002 contracts. Do not implement paper orders/fills, position lifecycle, SQLite trading storage, or final CLI wiring.
 
-## Mandatory Design Checkpoint
+## Deliverables
 
-Before code changes, inspect official sources and report to Architect:
-
-- exact official documentation/API URLs used for each venue;
-- public REST and WebSocket endpoints/messages for metadata, BBO/book, trades, funding, volume, heartbeat, snapshots, sequence/recovery, and applied funding where available;
-- unit, multiplier, price, quantity, funding, eligibility, and timestamp semantics with official evidence;
-- proposed normalization and explicit UNKNOWN/blocker fields;
-- fixture plan and any proven RISEx funding-semantics blocker.
-
-Do not implement until Architect explicitly approves the checkpoint. Do not use aggregators, UI scraping, manually copied live values, or other repositories/projects.
-
-## Deliverables after approval
-
-- Minimal async adapter contract and venue implementations in `exchanges/` plus coordination in `market_data.py`.
-- Official metadata normalization and parity eligibility; unknown evidence blocks entry.
-- REST snapshots/recovery and available WebSocket book/trade/funding/health processing.
-- Raw timestamps, official/synthetic trade keys, aggressor and orderbook-match normalization.
-- Per-stream connection/book/sequence health, documented heartbeat, stale/gap detection, and funding freshness.
-- Fixture-only deterministic CI tests; live smoke checks are opt-in.
+- Eligible RISEx↔Extended/Nado route construction with canonical parity, stablecoin, market-type/status, BBO/grid/minimum, funding freshness/eligibility, volume, and exact-depth gates.
+- Top-5 assets by max route liquidity and at most 20 routes.
+- TargetFundingCycle construction from both venue events.
+- Exact activation/cutoff scheduling: one-shot T−120, immediate startup evaluation only inside `5 < seconds_to_T < 120`, then 10-second focused cadence.
+- Planned entry/exit prices, exact common-step quantity, exact taker VWAP, fees, funding, planned execution/net PnL, executable unwind net PnL, and no-trade reasons.
+- Deterministic route ranking and one winner at a shared logical timestamp.
+- A small async `scan_once` interface returning a deterministic snapshot; no persistence or long-running CLI loop.
 
 ## Acceptance tests
 
-- Valid linear perpetual; spot/non-perpetual, RFQ, and off-hours exclusion.
-- Unknown multiplier and unknown funding eligibility.
-- Reconnect, sequence gap, heartbeat timeout, and incomplete recovery.
-- Official trade ID and deterministic synthetic key.
-- Aggressor normalization and `is_orderbook_match` true/false/unknown.
-- Extended percentage funding normalized to cash per canonical base.
-- Nado per-unit funding normalized without another price multiplication.
-- RISEx semantics blocker path when official evidence is insufficient.
+- Exact T−120 activation and startup at T−87.
+- Strict T−5 cutoff: exchange timestamp before counts even if received after; exact cutoff/after do not.
+- Simultaneous routes evaluated at one logical timestamp.
+- Deterministic tie-break in the frozen order.
+- Stale funding makes planned PnL UNKNOWN and entry forbidden.
+- Unknown parity/multiplier/funding eligibility and insufficient exact depth are ineligible.
+- Top-5/route-liquidity selection and maximum 20 routes.
+- Minimum quantity/notional and no common executable quantity produce NO TRADE.
+- Negative planned net PnL produces NO TRADE; non-negative permits eligibility.
 
 ## Constraints
 
-- Work on `codex/paper-002` from accepted `main`; no subagents or product-rule changes.
-- Keep all access public/unauthenticated; CI never depends on live services.
+- Work on `codex/paper-003` from accepted `main`; no subagents or product-rule changes.
+- Use synthetic fixture/domain inputs only; do not weaken PAPER-002 UNKNOWN blockers.
 - Run focused tests and full `pytest`, review the diff, commit, then report in at most 20 lines.
