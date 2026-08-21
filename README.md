@@ -63,8 +63,10 @@ risex-farmer --db paper.db paper-run
 
 Credentials are read only from the environment and must not be committed,
 logged, persisted, or placed in CLI arguments. Any explicit risk acceptance for
-a disclosed token is recorded without the token value. This integration is outbound-only: it
-does not poll `getUpdates`, accept commands, trigger scans, or place orders.
+a disclosed token is recorded without the token value. This integration is outbound-only: the
+application does not poll `getUpdates`, accept commands, trigger scans, or place orders.
+An Architect may use a separately authorized one-shot `getUpdates` diagnostic
+only to discover the configured destination; it is not part of `paper-run`.
 Delivery is best effort; a full queue or Telegram outage can drop messages so it
 cannot delay market-data processing, strategy deadlines, or safe shutdown.
 
