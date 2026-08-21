@@ -276,6 +276,9 @@ class PublicPaperRuntime:
         self._refresh_task: asyncio.Task[None] | None = None
         self._recovery_tasks: dict[tuple[Venue, str], asyncio.Task[None]] = {}
         self._recovery_buffers: dict[tuple[Venue, str], list[BookDelta]] = {}
+        self._pending_disconnect_episodes: dict[
+            tuple[Venue, str, str], datetime
+        ] = {}
         self._stop_event: asyncio.Event | None = None
         self._attempt_number = 0
         self._nado_cumulative_funding: dict[tuple[str, str], object] = {}
@@ -1371,6 +1374,9 @@ class PublicPaperRuntime:
         stream_kind: str = "public", exception: BaseException | None = None,
     ) -> None:
         now = at or self.clock.now()
+        self._pending_disconnect_episodes.setdefault(
+            (venue, symbol, stream_kind), now
+        )
         invalidates_book = stream_kind in {"book", "combined", "health", "public"}
         invalidates_trade = stream_kind in {"trade", "combined", "health", "public"}
         if invalidates_trade:
@@ -1426,6 +1432,25 @@ class PublicPaperRuntime:
                     recorded_at=now, lifecycle_snapshot=self.lifecycle.snapshot
                 )
 
+    def _mark_stream_reconnected(
+        self, venue: Venue, symbol: str, stream_kind: str, *, at: datetime
+    ) -> None:
+        episode = self._pending_disconnect_episodes.pop(
+            (venue, symbol, stream_kind), None
+        )
+        if episode is None:
+            return
+        self._record(
+            "PUBLIC_STREAM_RECONNECTED",
+            at=at,
+            venue=venue,
+            detail={
+                "market": symbol,
+                "stream_kind": stream_kind,
+                "recovered_at": at.isoformat(),
+            },
+        )
+
     async def recover_snapshot(self, book: OrderBook, *, at: datetime | None = None) -> None:
         now = at or self.clock.now()
         stream = self.coordinator.stream(book.venue, book.canonical_market)
@@ -1466,6 +1491,9 @@ class PublicPaperRuntime:
                 self.repository.save_decision(
                     recorded_at=now, lifecycle_snapshot=self.lifecycle.snapshot
                 )
+        self._mark_stream_reconnected(
+            book.venue, book.canonical_market, "book", at=now
+        )
 
     async def apply_book_event(self, event: OrderBook | BookDelta) -> None:
         now = self.clock.now()
@@ -1660,6 +1688,9 @@ class PublicPaperRuntime:
                             Venue.EXTENDED, f"{kind}:{symbol}", True,
                             "PUBLIC_STREAM_CONNECTED", self.clock.now(),
                         )
+                        self._mark_stream_reconnected(
+                            Venue.EXTENDED, symbol, kind, at=self.clock.now()
+                        )
                     delay = 1
                     ordinal = 0
                     async for message in ws:
@@ -1694,6 +1725,8 @@ class PublicPaperRuntime:
                                     assumed_open_at=self.clock.now(),
                                 )
                                 await self._apply_funding_quote(quote)
+                    if self._stop_event is None or not self._stop_event.is_set():
+                        raise ConnectionError("public websocket closed")
             except Exception as exc:
                 await self.mark_disconnected(Venue.EXTENDED, symbol, stream_kind=kind, exception=exc)
                 await self._sleep(delay)
@@ -1736,6 +1769,9 @@ class PublicPaperRuntime:
                                 venue, f"{component}:{symbol}", True,
                                 "PUBLIC_STREAM_CONNECTED", self.clock.now(),
                             )
+                        self._mark_stream_reconnected(
+                            venue, symbol, "combined", at=self.clock.now()
+                        )
                     delay = 1
                     ordinal = 0
                     async for message in ws:
@@ -1802,6 +1838,8 @@ class PublicPaperRuntime:
                                 self._nado_cumulative_funding[(symbol, "long")] = payload.get("cumulative_funding_long_x18")
                                 self._nado_cumulative_funding[(symbol, "short")] = payload.get("cumulative_funding_short_x18")
                                 await self._apply_funding_quote(quote)
+                    if self._stop_event is None or not self._stop_event.is_set():
+                        raise ConnectionError("public websocket closed")
             except Exception as exc:
                 for symbol in symbols:
                     await self.mark_disconnected(venue, symbol, stream_kind="combined", exception=exc)

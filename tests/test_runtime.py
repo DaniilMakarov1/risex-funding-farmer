@@ -244,6 +244,14 @@ class GatedRecoveryAdapter(FakeAdapter):
         return await super().fetch_book(venue_symbol)
 
 
+class CombinedFakeAdapter(FakeAdapter):
+    def product_id(self, symbol: str) -> str:
+        return symbol
+
+    def subscription(self, kind: str, product: str) -> dict[str, str]:
+        return {"kind": kind, "product": product}
+
+
 class GatedExtendedAdapter(ExtendedAdapter):
     def __init__(self, clock: FakeClock, *, settlement_at: datetime) -> None:
         super().__init__(None)
@@ -288,6 +296,41 @@ class GatedExtendedAdapter(ExtendedAdapter):
             self.settlement_at, FundingQuality.PREDICTED,
             FundingAccrualMethod.SNAPSHOT_AT_SETTLEMENT, True,
             D("5"), D("5"), "official-shaped",
+        )
+
+
+class ClosingWebSocket:
+    def __init__(self, stop_event: asyncio.Event, *, stop_on_iteration: bool) -> None:
+        self.stop_event = stop_event
+        self.stop_on_iteration = stop_on_iteration
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        return None
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self.stop_on_iteration:
+            self.stop_event.set()
+        raise StopAsyncIteration
+
+    async def send_json(self, _payload) -> None:
+        return None
+
+
+class ReconnectingSession:
+    def __init__(self, stop_event: asyncio.Event) -> None:
+        self.stop_event = stop_event
+        self.connections = 0
+
+    def ws_connect(self, *_args, **_kwargs):
+        self.connections += 1
+        return ClosingWebSocket(
+            self.stop_event, stop_on_iteration=self.connections == 2
         )
 
 
@@ -1193,11 +1236,19 @@ async def test_nado_recovery_buffers_and_replays_newer_continuous_delta(tmp_path
         async with PublicPaperRuntime(repository, adapters=fakes, clock=clock) as runtime:
             await runtime.scan()
             symbol = gated.market.venue_symbol
+            await runtime.recover_snapshot(await gated.fetch_book(symbol))
+            assert repository.connection.execute(
+                "SELECT COUNT(*) FROM runtime_evidence "
+                "WHERE event_type='PUBLIC_STREAM_RECONNECTED'"
+            ).fetchone()[0] == 0
+            baseline_book_calls = gated.calls.count("book")
             gated.block_recovery = True
             await runtime.apply_book_event(BookDelta(
                 Venue.NADO, symbol, (), (), clock.now(), 3, 999,
             ))
             recovery = runtime._recovery_tasks[(Venue.NADO, symbol)]
+            runtime._start_snapshot_recovery(Venue.NADO, symbol)
+            assert runtime._recovery_tasks[(Venue.NADO, symbol)] is recovery
             await gated.recovery_started.wait()
             await runtime.apply_book_event(BookDelta(
                 Venue.NADO, symbol,
@@ -1212,12 +1263,86 @@ async def test_nado_recovery_buffers_and_replays_newer_continuous_delta(tmp_path
             gated.recovery_gate.set()
             await recovery
             book = runtime.coordinator.stream(Venue.NADO, symbol).book()
+            await runtime.apply_book_event(replace(book, observed_at=clock.now()))
+            await runtime.apply_book_event(replace(book, observed_at=clock.now()))
             evidence = repository.connection.execute(
                 "SELECT detail FROM runtime_evidence "
                 "WHERE event_type='PUBLIC_SNAPSHOT_RECOVERY_COMPLETED'"
             ).fetchone()
+            reconnects = repository.connection.execute(
+                "SELECT venue,detail FROM runtime_evidence "
+                "WHERE event_type='PUBLIC_STREAM_RECONNECTED'"
+            ).fetchall()
     assert book.sequence == 3
+    assert gated.calls.count("book") == baseline_book_calls + 1
     assert json.loads(evidence["detail"])["replayed"] == 2
+    assert len(reconnects) == 1 and reconnects[0]["venue"] == "NADO"
+    assert json.loads(reconnects[0]["detail"]) == {
+        "market": symbol,
+        "stream_kind": "book",
+        "recovered_at": clock.now().isoformat(),
+    }
+
+
+@pytest.mark.asyncio
+async def test_clean_extended_ws_close_opens_one_episode_and_reconnects_once(tmp_path):
+    clock = FakeClock()
+    stop = asyncio.Event()
+    session = ReconnectingSession(stop)
+
+    async def no_delay(_seconds: float) -> None:
+        await asyncio.sleep(0)
+
+    with PaperRepository(tmp_path / "clean-ws-reconnect.db") as repository:
+        runtime = PublicPaperRuntime(repository, adapters={}, clock=clock, sleep=no_delay)
+        runtime._session = session
+        runtime._stop_event = stop
+        await runtime._extended_stream(
+            ExtendedAdapter(None), "ABC-EXTENDED", "trade"
+        )
+        reconnects = repository.connection.execute(
+            "SELECT venue,detail FROM runtime_evidence "
+            "WHERE event_type='PUBLIC_STREAM_RECONNECTED'"
+        ).fetchall()
+    assert session.connections == 2
+    assert len(reconnects) == 1 and reconnects[0]["venue"] == "EXTENDED"
+    assert json.loads(reconnects[0]["detail"]) == {
+        "market": "ABC-EXTENDED",
+        "stream_kind": "trade",
+        "recovered_at": NOW.isoformat(),
+    }
+
+
+@pytest.mark.asyncio
+async def test_combined_reconnect_emits_once_for_each_affected_market(tmp_path):
+    clock = FakeClock()
+    stop = asyncio.Event()
+    session = ReconnectingSession(stop)
+    symbols = ("ABC-NADO", "XYZ-NADO")
+    adapter = CombinedFakeAdapter(
+        Venue.NADO, clock, settlement_at=NOW + timedelta(minutes=5)
+    )
+
+    async def no_delay(_seconds: float) -> None:
+        await asyncio.sleep(0)
+
+    with PaperRepository(tmp_path / "combined-reconnect.db") as repository:
+        runtime = PublicPaperRuntime(repository, adapters={}, clock=clock, sleep=no_delay)
+        runtime._session = session
+        runtime._stop_event = stop
+        await runtime._combined_stream(Venue.NADO, adapter, symbols)
+        reconnects = [
+            json.loads(row[0])
+            for row in repository.connection.execute(
+                "SELECT detail FROM runtime_evidence "
+                "WHERE event_type='PUBLIC_STREAM_RECONNECTED' ORDER BY detail"
+            )
+        ]
+    assert session.connections == 2
+    assert reconnects == [
+        {"market": symbol, "stream_kind": "combined", "recovered_at": NOW.isoformat()}
+        for symbol in symbols
+    ]
 
 
 @pytest.mark.asyncio
