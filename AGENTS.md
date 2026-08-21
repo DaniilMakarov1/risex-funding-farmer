@@ -11,8 +11,8 @@ Only `AGENTS.md`, `SYSTEM_SPEC.md`, `STATUS.md`, `NEXT_TASK.md`, and `README.md`
 - Architect owns architecture, orchestration, review, acceptance, and source-of-truth updates.
 - Exactly one Builder may work at a time. Builder must not spawn agents.
 - Builder implements only the bounded milestone in `NEXT_TASK.md` and must not begin the next milestone.
-- Do not create milestones beyond BOOTSTRAP-000 and PAPER-001 through PAPER-006.
-- PAPER-007 and live work require a separate user decision.
+- Do not create milestones beyond BOOTSTRAP-000 and PAPER-001 through PAPER-006, except the explicitly authorized PAPER-007 experiment and TELEGRAM-001 outbound-notification milestone.
+- Any further paper milestone, Telegram expansion, or live work requires a separate user decision.
 
 ## Git workflow
 
@@ -30,7 +30,7 @@ Only `AGENTS.md`, `SYSTEM_SPEC.md`, `STATUS.md`, `NEXT_TASK.md`, and `README.md`
 - Python 3.11; one async process; `aiohttp`, `sqlite3`, `Decimal`, dataclasses, `pytest`, and `pytest-asyncio`.
 - Paper only: public endpoints and public market data. No API keys, authentication, account/private endpoints, real orders, collateral, positions, or live execution.
 - Use only official RISEx, Extended, and Nado sources. Unknown semantics or parity blocks entry; never guess.
-- Keep the implementation small. No compatibility layers, frameworks, services, dashboards, alerts, or functionality excluded by `SYSTEM_SPEC.md`.
+- Keep the implementation small. No compatibility layers, frameworks, services, dashboards, or functionality excluded by `SYSTEM_SPEC.md`. TELEGRAM-001 permits only the outbound notifications defined there, not a general alerting platform.
 - Product rules in frozen `SYSTEM_SPEC.md` change only for a proven official-API contradiction, implementation impossibility, or explicit user decision.
 - Never commit secrets, credentials, local databases, caches, or generated reports.
 
@@ -40,4 +40,4 @@ Only `AGENTS.md`, `SYSTEM_SPEC.md`, `STATUS.md`, `NEXT_TASK.md`, and `README.md`
 - CI tests use fixtures only; live smoke checks are opt-in.
 - Builder report is at most 20 lines and states branch, commit, tests, and material limitations.
 - Architect updates `STATUS.md` and `NEXT_TASK.md` only after acceptance.
-- After accepted PAPER-006, stop with `PAPER TRADER READY`.
+- After an accepted milestone, do not infer authorization for another milestone. PAPER-007 and TELEGRAM-001 proceed only within their explicit user-approved boundaries.

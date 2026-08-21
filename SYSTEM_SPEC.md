@@ -9,7 +9,7 @@ Research whether a delta-neutral funding strategy used to farm RISEx points can 
 
 Phase one is PAPER ONLY. Use official public RISEx, Extended, and Nado data. Never use real money, authenticated/private/account endpoints, trading keys, real orders or positions, collateral management, or live execution. Live is a separately specified future phase, not a switch.
 
-Build a small Python 3.11 application in one async process. Do not build a generic platform, event bus, plugin/DI framework, microservices, separate venue processes, Redis, Celery, dashboard, alerts, or LLM calls from `paper-run`.
+Build a small Python 3.11 application in one async process. Do not build a generic platform, event bus, plugin/DI framework, microservices, separate venue processes, Redis, Celery, dashboard, general alerting framework, or LLM calls from `paper-run`. The only notification exception is the bounded outbound Telegram delivery in section 20.
 
 ## 2. Fixed configuration
 
@@ -236,6 +236,20 @@ RISEx volume is absolute entry notional + absolute exit notional. Primary metric
 
 ## 19. Non-goals and delivery
 
-No live/authenticated trading, route switching, clips, partial-position lifecycle, queue/taker-failure simulation, dynamic sizing, leverage, basis convergence EV/forecasting, ML, long-range funding forecasts, points valuation, separate spread capture, stablecoin depeg, Telegram, dashboard, alerts, or generic infrastructure.
+No live/authenticated trading, route switching, clips, partial-position lifecycle, queue/taker-failure simulation, dynamic sizing, leverage, basis convergence EV/forecasting, ML, long-range funding forecasts, points valuation, separate spread capture, stablecoin depeg, inbound Telegram commands, Telegram-triggered scans, dashboard, general alerts, or generic infrastructure.
 
 Fixed milestones are BOOTSTRAP-000 and PAPER-001 through PAPER-006. PAPER-002, PAPER-004, and PAPER-005 require a design checkpoint in their `NEXT_TASK.md` before implementation. Tests follow the milestone matrix supplied by the product specification. After accepted PAPER-006 stop with `PAPER TRADER READY`. PAPER-007 staged execution requires a separate user decision and must not start automatically.
+
+## 20. Outbound Telegram notifications
+
+TELEGRAM-001 is an explicit user-authorized exception to the original Telegram non-goal. It is delivery-only and disabled by default.
+
+`PublicPaperRuntime` remains the sole owner of exchange data, Scanner results, economics, orders, positions, funding reconciliation, lifecycle decisions, and cadence. Telegram code must not import or invoke Scanner, exchange adapters, `scan-once`, SQLite/reporting, broker, or lifecycle decision logic. It must not expose inbound commands, `getUpdates`, a scheduler, web server, dashboard, or additional formulas.
+
+The runtime may enqueue an immutable notification only after an authoritative completed scan or persisted authoritative runtime/lifecycle transition. Minimum notifications are: paper-run started/ready; new eligible opportunity; material best-route change or disappearance; paper entry activation; paper position opened; funding received/reconciled; exit started; position closed with final PnL; critical data loss; data recovery; safe stop.
+
+Opportunity payloads carry authoritative values without recalculation: UTC scan/event time, ticker, both-venue route, and the selected plan's `planned_maker_net_pnl_usd`. Repeated focused scans with unchanged semantic state produce no notification. Event notifications deduplicate by stable authoritative event ID. Opportunity notifications deduplicate by route, target cycle, and displayed-cent PnL state; appearance, disappearance, route/cycle change, or a displayed-cent change may notify once.
+
+Delivery uses a bounded in-memory asyncio queue and a separate worker with finite timeout and finite attempts. Runtime enqueue is non-blocking; queue saturation or Telegram outage may drop a notification but must never delay scans, exact deadlines, lifecycle, or safe stop. A notification `event_id` is accepted into the queue at most once per process. Because Telegram `sendMessage` has no idempotency key, an ambiguous timeout is not retried; only an unambiguous pre-acceptance failure or explicit flood-control response may use the bounded retry allowance.
+
+Telegram is enabled only when an explicit environment flag is true and both a newly rotated bot token and destination chat ID are present. Secrets must never enter Git, SQLite, runtime evidence, notification payloads, logs, exceptions, or rendered messages. Previously disclosed tokens are compromised and prohibited.
