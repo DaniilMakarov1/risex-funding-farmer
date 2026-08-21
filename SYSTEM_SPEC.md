@@ -104,6 +104,8 @@ stream_connected, book_initialized, book_sequence_valid
 
 Perform documented heartbeat/ping every 10 seconds. A market is usable only with healthy connection, initialized book, and valid sequence. No trades/price motion alone is not stale. Data is stale when connection confirmation is older than 25 seconds, or immediately on disconnect, gap, uninitialized/incomplete recovery, or invalid BBO.
 
+Extended book, trade, and funding WebSockets are separate physical connections. Track connection confirmation and data readiness independently for each `(market, stream_kind)`; a ping or valid message confirms only its own socket, and `connection_combined` is not an Extended component. A stale Extended socket invalidates and reconnects only that stream while preserving one ordered physical disconnect/reconnect episode.
+
 Default funding maximum age is 120 seconds. A longer adapter cadence needs explicit official evidence, local comment, and test.
 
 Before entry, stale data makes planned PnL unknown and forbids entry. Cancel an active maker with `PAPER_ORDER_CANCELLED_DATA_STALE`; do not reconstruct missed fills.
@@ -121,6 +123,8 @@ Funding math belongs to adapters; core has no universal rate formula. `FundingAc
 Adapter output `FundingCashQuote` contains venue, canonical market, observation/open assumption/settlement times, quality (`PREDICTED`, `ESTIMATED`, `APPLIED_RATE`, `UNKNOWN`), accrual method, eligibility-known flag, long/short cash per canonical base USD, and source.
 
 Adapter converts venue semantics to cash per canonical base. Core calculates `leg_funding_usd = canonical_base_quantity × cash_per_canonical_base_usd` and never multiplies by price again. Unknown eligibility/semantics forbids entry with `FUNDING_ELIGIBILITY_UNKNOWN`.
+
+For Extended, the future Scanner quote comes only from the official REST market stats (`fundingRate`, `markPrice`, and future `nextFundingRate`). A funding WebSocket record is applied/history evidence: it never replaces the future `MarketObservation.funding`, never turns its event timestamp into a future settlement, and reconciles an open lifecycle only against the exact persisted venue/market/settlement identity. When public evidence cannot establish applied cash, retain `UNRESOLVED`; do not infer cash from a book midpoint or carry an applied rate into the next cycle.
 
 Before maker fill, `assumed_position_opened_at = current_evaluation_timestamp`: estimate full-position funding if opened now. Never use order creation as an open position, forecast a T−5 fill, or freeze the T−120 estimate. After full two-leg entry, `position_opened_at = risex_taker_fill_at` and funding is recomputed from actual open time.
 

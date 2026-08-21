@@ -1,10 +1,10 @@
 # Status
 
-- Accepted implementation: TELEGRAM-002-FIX-001 — Two-Decimal Bot Values @ `c59c54c4265b224ef1781492bf24b79b8987f382` + `b7c9564efa902e7bc82f40b55ed9ad05687f95e3`
-- Previous accepted implementation: PAPER-007-FIX-006 — RISEx Checksum Resubscribe Recovery @ `1333df09f2b94bd977dc007fb9fb2a0d0f5cac6f`
-- Active implementation task: PAPER-007-FIX-007 — Extended Expected Funding and Socket Health Separation
+- Accepted implementation: PAPER-007-FIX-007 — Extended Expected Funding and Socket Health Separation @ `77af66b9cb4662acd3055a6457b0fe53f667a256` + `ac5ac7ee6c27f629d389dcf283169c59bf276b9d` + `7e73bdcb1de5eb3be8ad457c6e7c9c1f0db3ae30`
+- Previous accepted implementation: TELEGRAM-002-FIX-001 — Two-Decimal Bot Values @ `c59c54c4265b224ef1781492bf24b79b8987f382` + `b7c9564efa902e7bc82f40b55ed9ad05687f95e3`
+- Active implementation task: none
 - PAPER-007 Stage A scheduling validation: PASS
-- PAPER-007 Stage B: running on accepted published FIX-006 with the same database and outbound Telegram enabled
+- PAPER-007 Stage B: stopped safely for FIX-007 acceptance; restart on accepted published FIX-007 is authorized
 - Preserved Stage B evidence: `paper-007-stage-a-fix002.db`, SHA-256 `6c9bddbf3e10e5690f8e5d5327adf5c35fad4f2044d96fdb9445b3bd567e68ff`
 - Product phase: PAPER ONLY
 - Live trading: prohibited
@@ -32,4 +32,4 @@ Independent Architect verification passed 71 focused and 171 full deterministic 
 
 TELEGRAM-002-FIX-001 is accepted after 178 deterministic tests. One presentation-only HALF_UP formatter renders FULL-digest and opportunity Expected PnL, closed-position final PnL, and funding cash with exactly two fractional digits; signed rounded zero is normalized to `0.00`. Authoritative Decimal values, Scanner/economics, persistence, decisions, scheduling, and dedupe semantics are unchanged. The preceding PID `60720` had already persisted `STOPPED_SAFE` with `forced_close=false`; Stage B resumed flat on the same database under PID `62578` in detached screen `risex-paper007-stageb-telegram-two-decimals`, with outbound Telegram enabled.
 
-PAPER-007-FIX-007 is authorized after independent code, official-documentation, and database review. Extended REST `/stats` provides the future expected funding quote (`fundingRate`, `markPrice`, `nextFundingRate`), while the funding WebSocket reports a calculated/applied record whose `T` is not a future settlement. Persisted scans changed from 8/10 numeric Extended routes to 0/10 after the WS APPLIED_RATE replaced the REST prediction. Extended book/trade/funding sockets also share one health timestamp and the generic health path creates an unrecoverable `connection_combined` component. The task must separate expected/applied funding and per-socket health without changing economics, cadence, timeout, Telegram presentation, or paper/live boundaries.
+PAPER-007-FIX-007 is accepted after 80 focused and 187 full deterministic tests, compileall, diff-check, and secret scan. Five new production-path tests fail on the pre-fix main and pass after the correction. Extended REST predictions remain the future Scanner quote; WebSocket applied records are inert without a position and exact, idempotent, and `UNRESOLVED` when authoritative cash is unavailable for an open settlement. Extended book/trade/funding socket health is isolated per market and stream with no `connection_combined` component. A public-only smoke completed INITIAL plus two FULL scans and stopped `STOPPED_SAFE`, but Extended's official catalog returned HTTP 200 too slowly to complete within the unchanged 30-second fail-closed timeout, so no real Extended funding WebSocket event was observed in that smoke.
