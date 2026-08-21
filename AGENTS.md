@@ -11,7 +11,7 @@ Only `AGENTS.md`, `SYSTEM_SPEC.md`, `STATUS.md`, `NEXT_TASK.md`, and `README.md`
 - Architect owns architecture, orchestration, review, acceptance, and source-of-truth updates.
 - Exactly one Builder may work at a time. Builder must not spawn agents.
 - Builder implements only the bounded milestone in `NEXT_TASK.md` and must not begin the next milestone.
-- Do not create milestones beyond BOOTSTRAP-000 and PAPER-001 through PAPER-006, except the explicitly authorized PAPER-007 experiment, TELEGRAM-001 outbound-notification work, bounded TELEGRAM-001-FIX-001 correction, TELEGRAM-002 full-scan digest, PAPER-007-FIX-004 public REST timeout correction, and PAPER-007-FIX-005 first-full funding-freshness correction.
+- Do not create milestones beyond BOOTSTRAP-000 and PAPER-001 through PAPER-006, except the explicitly authorized PAPER-007 experiment, TELEGRAM-001 outbound-notification work, bounded TELEGRAM-001-FIX-001 correction, TELEGRAM-002 full-scan digest, PAPER-007-FIX-004 public REST timeout correction, PAPER-007-FIX-005 first-full funding-freshness correction, and PAPER-007-FIX-006 RISEx checksum-resubscribe correction.
 - Any further paper milestone, Telegram expansion, or live work requires a separate user decision.
 
 ## Git workflow

@@ -108,6 +108,8 @@ Default funding maximum age is 120 seconds. A longer adapter cadence needs expli
 
 Before entry, stale data makes planned PnL unknown and forbids entry. Cancel an active maker with `PAPER_ORDER_CANCELLED_DATA_STALE`; do not reconstruct missed fills.
 
+RISEx orderbook checksum mismatch follows the official public WebSocket contract: keep the book unusable, unsubscribe and resubscribe the public `orderbook` channel, and accept the new ordered WebSocket snapshots before recovery. Do not combine a RISEx REST snapshot with buffered WebSocket deltas because the REST response has no ordering marker comparable to the stream's block/log position. This logical book resubscribe must not be persisted as a physical socket disconnect/reconnect.
+
 During an open position, a gap emits `MARKET_DATA_GAP_STARTED`, pauses normal HOLD/EXIT, preserves the position, and invents no price/VWAP. Recover a snapshot, emit `MARKET_DATA_GAP_ENDED`, then continue. Track `data_quality` COMPLETE/DEGRADED, gap flag/count/maximum duration, overlap with funding/exit, and primary-metric validity. Any open-position gap makes the trade DEGRADED and invalid for primary metrics.
 
 In EXITING, cancel the current exit version during a gap. After recovery create a new version; aggressive mode and `exiting_normal_started_at` are sticky and downtime counts in exit wait.

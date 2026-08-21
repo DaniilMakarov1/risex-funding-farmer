@@ -1,8 +1,8 @@
 # Status
 
-- Accepted implementation: PAPER-007-FIX-004 — Public REST Timeout 30 Seconds @ `7476946263cb68812482215282fc7f50fb73a97b`
-- Previous accepted implementation: TELEGRAM-002 — Full Scan Digest @ `4d59156cda36dc4b99e3c53d1805db873213d6f9`
-- Active implementation task: PAPER-007-FIX-005 — First Full-Scan Funding Freshness
+- Accepted implementation: PAPER-007-FIX-005 — First Full-Scan Funding Freshness @ `b5c1db0ec7f226914976f60a732ce9dfd58ff113`
+- Previous accepted implementation: PAPER-007-FIX-004 — Public REST Timeout 30 Seconds @ `7476946263cb68812482215282fc7f50fb73a97b`
+- Active implementation task: PAPER-007-FIX-006 — RISEx Checksum Resubscribe Recovery
 - PAPER-007 Stage A scheduling validation: PASS
 - PAPER-007 Stage B: running on accepted main with outbound Telegram enabled after a safe flat restart
 - Preserved Stage B evidence: `paper-007-stage-a-fix002.db`, SHA-256 `6c9bddbf3e10e5690f8e5d5327adf5c35fad4f2044d96fdb9445b3bd567e68ff`
@@ -20,4 +20,6 @@ TELEGRAM-002 is accepted after 167 deterministic tests. Each authoritative `FULL
 
 PAPER-007-FIX-004 is accepted after 168 deterministic tests. The shared public HTTP runtime total timeout is 30 seconds; endpoints, retry cadence, scheduling, economics, lifecycle, Telegram delivery, and paper/live boundaries are unchanged. PID `45479` stopped with `STOPPED_SAFE` and `forced_close=false`; Stage B resumed on the same database under PID `50755` in detached screen `risex-paper007-stageb-timeout30`. Extended's first accepted-code catalog request completed successfully in `18.022913` seconds with `PUBLIC_REST_READY`.
 
-PAPER-007-FIX-005 is explicitly authorized after persisted evidence showed the first post-restart `FULL` scan at `2026-08-21T08:56:17.562429Z` had zero known PnLs because the initial RISEx funding observations were about 130 seconds old under the unchanged 120-second freshness rule. The correction is limited to seeding the existing non-blocking single-flight refresh after readiness; the running Stage B remains untouched until implementation acceptance.
+PAPER-007-FIX-005 is accepted after 170 deterministic tests. Persisted evidence showed the first post-restart `FULL` scan at `2026-08-21T08:56:17.562429Z` had zero known PnLs because initial RISEx funding observations were about 130 seconds old under the unchanged 120-second freshness rule. Runtime now seeds the existing non-blocking single-flight refresh after readiness; a gated refresh cannot delay readiness, scan deadlines, or safe stop.
+
+PAPER-007-FIX-006 is explicitly authorized after live evidence showed repeated RISEx checksum gaps entering a high-frequency REST snapshot/buffer replay loop and leaving every route `BOOK_UNHEALTHY`. Current official RISEx documentation requires unsubscribe/resubscribe and a new WebSocket snapshot after checksum mismatch; the correction must follow that public contract without creating false physical socket lifecycle evidence. The running Stage B remains untouched until implementation acceptance.
