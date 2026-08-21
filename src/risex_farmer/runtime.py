@@ -329,10 +329,13 @@ class PublicPaperRuntime:
             "PUBLIC_SOCKET_DISCONNECTED", "PUBLIC_BOOK_RESYNC_REQUIRED",
             "PUBLIC_SNAPSHOT_RECOVERY_FAILED",
         }:
-            self._notify_event(
-                f"data-loss:{venue.value if venue else 'PUBLIC'}:{event_type}:{now.isoformat()}",
-                "CRITICAL_DATA_LOSS", now,
-                f"Critical public data loss: {venue.value if venue else 'PUBLIC'} {event_type}",
+            self._notify_outage(
+                event_type, degraded=True, venue=venue, detail=detail,
+                event_id=f"data-loss:{venue.value if venue else 'PUBLIC'}:"
+                f"{event_type}:{now.isoformat()}",
+                kind="CRITICAL_DATA_LOSS", occurred_at=now,
+                text=f"Critical public data loss: "
+                f"{venue.value if venue else 'PUBLIC'} {event_type}",
             )
         elif event_type in {
             "PUBLIC_SOCKET_RECONNECTED", "PUBLIC_SNAPSHOT_RECOVERY_COMPLETED",
@@ -341,11 +344,47 @@ class PublicPaperRuntime:
             recovery_id = episode or (
                 f"{venue.value if venue else 'PUBLIC'}:{event_type}:{now.isoformat()}"
             )
-            self._notify_event(
-                f"data-recovery:{recovery_id}",
-                "DATA_RECOVERY", now,
-                f"Public data recovered: {venue.value if venue else 'PUBLIC'} {event_type}",
+            self._notify_outage(
+                event_type, degraded=False, venue=venue, detail=detail,
+                event_id=f"data-recovery:{recovery_id}", kind="DATA_RECOVERY",
+                occurred_at=now,
+                text=f"Public data recovered: "
+                f"{venue.value if venue else 'PUBLIC'} {event_type}",
             )
+
+    def _notify_outage(
+        self,
+        event_type: str,
+        *,
+        degraded: bool,
+        venue: Venue | None,
+        detail: dict[str, object] | None,
+        event_id: str,
+        kind: str,
+        occurred_at: datetime,
+        text: str,
+    ) -> None:
+        if self.notifications is None:
+            return
+        detail = detail or {}
+        episode = detail.get("episode_id")
+        if episode is not None:
+            identity = f"episode:{episode}"
+        else:
+            market = detail.get(
+                "symbol", detail.get("market", detail.get("markets", "PUBLIC"))
+            )
+            component = (
+                detail.get("stream_kind", detail.get("stream", "book"))
+                if "SOCKET" in event_type
+                else "book"
+            )
+            identity = f"{venue.value if venue else 'PUBLIC'}:{market}:{component}"
+        self.notifications.outage(
+            identity,
+            degraded=degraded,
+            payload=NotificationPayload(event_id, kind, utc_time(occurred_at), text),
+        )
 
     def _notify_event(
         self, event_id: str, kind: str, at: datetime, text: str, **fields: object
@@ -380,12 +419,14 @@ class PublicPaperRuntime:
         pnl = plan.planned_maker_net_pnl_usd
         cents = str(pnl.quantize(Decimal("0.01")))
         state = (f"{plan.canonical_asset}:{route}", plan.target_cycle.cycle_id, cents)
+        scan_utc = utc_time(at).isoformat()
         self.notifications.opportunity(
             state,
             NotificationPayload(
                 f"opportunity:{state[0]}:{state[1]}:{state[2]}:{at.isoformat()}",
                 "ELIGIBLE_OPPORTUNITY", utc_time(at),
-                f"{plan.canonical_asset}: {route}; planned net PnL USD {pnl}",
+                f"{plan.canonical_asset} | {route} | Expected PnL: ${pnl} | "
+                f"Scan UTC: {scan_utc}",
                 ticker=plan.canonical_asset, route=route,
                 planned_maker_net_pnl_usd=pnl,
             ),
@@ -1460,7 +1501,8 @@ class PublicPaperRuntime:
                     f"funding:{after.venue.value}:{after.canonical_market}:"
                     f"{after.settlement_at.isoformat()}:{after.status.value}:{after.cash_usd}",
                     kind, at,
-                    f"Funding reconciled: {after.venue.value} {after.canonical_market} "
+                    f"Funding {'received' if kind == 'FUNDING_RECEIVED' else 'reconciled'}: "
+                    f"{after.venue.value} {after.canonical_market} "
                     f"{after.status.value} USD {after.cash_usd}",
                 )
 

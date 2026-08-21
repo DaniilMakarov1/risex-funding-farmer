@@ -838,7 +838,13 @@ async def test_opportunity_notifications_copy_authoritative_plan_and_dedupe(tmp_
     assert rows[0].ticker == winner.canonical_asset
     assert "RISEx" in rows[0].route and winner.hedge_venue.value in rows[0].route
     assert rows[0].planned_maker_net_pnl_usd == winner.planned_maker_net_pnl_usd
-    assert str(winner.planned_maker_net_pnl_usd) in rows[0].text
+    assert rows[0].text == (
+        f"{winner.canonical_asset} | {rows[0].route} | Expected PnL: "
+        f"${winner.planned_maker_net_pnl_usd} | Scan UTC: {NOW.isoformat()}"
+    )
+    assert "RISEx" in rows[0].text
+    assert winner.hedge_venue.value in rows[0].text
+    assert "LONG" in rows[0].text and "SHORT" in rows[0].text
     assert rows[1].route != rows[0].route
     assert rows[-1].route == rows[0].route
 
@@ -1389,6 +1395,10 @@ async def test_runtime_lifecycle_notifications_follow_persisted_transitions(tmp_
     closed = next(row for row in delivery.rows if row.kind == "POSITION_CLOSED")
     assert closed.final_pnl_usd == authoritative.simulated_closed_net_pnl_usd
     assert str(authoritative.simulated_closed_net_pnl_usd) in closed.text
+    received = next(row for row in delivery.rows if row.kind == "FUNDING_RECEIVED")
+    reconciled = next(row for row in delivery.rows if row.kind == "FUNDING_RECONCILED")
+    assert received.text.startswith("Funding received:")
+    assert reconciled.text.startswith("Funding reconciled:")
 
 
 @pytest.mark.asyncio
@@ -1496,6 +1506,88 @@ async def test_sequence_gap_fetches_snapshot_and_reconnect_restores_readiness(tm
     assert [row.kind for row in delivery.rows if row.kind in {
         "CRITICAL_DATA_LOSS", "DATA_RECOVERY"
     }] == [
+        "CRITICAL_DATA_LOSS", "DATA_RECOVERY",
+    ]
+
+
+def test_repeated_outage_evidence_deduplicates_notifications_by_semantic_episode(tmp_path):
+    clock = FakeClock()
+    delivery = CaptureNotifications()
+    with PaperRepository(tmp_path / "outage-notification-dedupe.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={}, clock=clock,
+            notifications=NotificationOutbox(delivery),
+        )
+        detail = {"symbol": "ABC-EXTENDED", "stream": "book"}
+        runtime._record(
+            "PUBLIC_BOOK_RESYNC_REQUIRED", at=clock.now(),
+            venue=Venue.EXTENDED, detail=detail,
+        )
+        clock.advance(1)
+        runtime._record(
+            "PUBLIC_SNAPSHOT_RECOVERY_FAILED", at=clock.now(),
+            venue=Venue.EXTENDED, detail=detail,
+        )
+        clock.advance(1)
+        runtime._record(
+            "PUBLIC_SNAPSHOT_RECOVERY_COMPLETED", at=clock.now(),
+            venue=Venue.EXTENDED, detail=detail,
+        )
+        clock.advance(1)
+        runtime._record(
+            "PUBLIC_SNAPSHOT_RECOVERY_COMPLETED", at=clock.now(),
+            venue=Venue.EXTENDED, detail=detail,
+        )
+        clock.advance(1)
+        runtime._record(
+            "PUBLIC_BOOK_RESYNC_REQUIRED", at=clock.now(),
+            venue=Venue.EXTENDED, detail=detail,
+        )
+        persisted = repository.connection.execute(
+            "SELECT event_type FROM runtime_evidence ORDER BY recorded_at"
+        ).fetchall()
+    assert [row[0] for row in persisted] == [
+        "PUBLIC_BOOK_RESYNC_REQUIRED", "PUBLIC_SNAPSHOT_RECOVERY_FAILED",
+        "PUBLIC_SNAPSHOT_RECOVERY_COMPLETED", "PUBLIC_SNAPSHOT_RECOVERY_COMPLETED",
+        "PUBLIC_BOOK_RESYNC_REQUIRED",
+    ]
+    assert [row.kind for row in delivery.rows] == [
+        "CRITICAL_DATA_LOSS", "DATA_RECOVERY", "CRITICAL_DATA_LOSS",
+    ]
+
+
+def test_socket_outage_notification_identity_uses_physical_episode_id(tmp_path):
+    clock = FakeClock()
+    delivery = CaptureNotifications()
+    detail = {
+        "episode_id": "EXTENDED:trade:episode-1",
+        "market": "ABC-EXTENDED",
+        "stream_kind": "trade",
+    }
+    with PaperRepository(tmp_path / "socket-notification-dedupe.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={}, clock=clock,
+            notifications=NotificationOutbox(delivery),
+        )
+        runtime._record(
+            "PUBLIC_SOCKET_DISCONNECTED", at=clock.now(),
+            venue=Venue.EXTENDED, detail=detail,
+        )
+        clock.advance(1)
+        runtime._record(
+            "PUBLIC_SOCKET_DISCONNECTED", at=clock.now(),
+            venue=Venue.EXTENDED, detail=detail,
+        )
+        clock.advance(1)
+        runtime._record(
+            "PUBLIC_SOCKET_RECONNECTED", at=clock.now(),
+            venue=Venue.EXTENDED, detail=detail,
+        )
+        count = repository.connection.execute(
+            "SELECT COUNT(*) FROM runtime_evidence WHERE event_type LIKE 'PUBLIC_SOCKET_%'"
+        ).fetchone()[0]
+    assert count == 3
+    assert [row.kind for row in delivery.rows] == [
         "CRITICAL_DATA_LOSS", "DATA_RECOVERY",
     ]
 

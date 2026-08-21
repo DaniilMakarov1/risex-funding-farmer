@@ -56,6 +56,7 @@ class NotificationOutbox:
         self._event_ids: set[str] = set()
         self._opportunity_state: tuple[str, str, str] | None = None
         self._opportunity_initialized = False
+        self._active_outages: set[str] = set()
 
     async def start(self) -> None:
         await self.delivery.start()
@@ -81,6 +82,19 @@ class NotificationOutbox:
         self._opportunity_state = state
         if payload is None or (previous is None and state is None):
             return False
+        return self.event(payload)
+
+    def outage(
+        self, identity: str, *, degraded: bool, payload: NotificationPayload
+    ) -> bool:
+        if degraded:
+            if identity in self._active_outages:
+                return False
+            self._active_outages.add(identity)
+        else:
+            if identity not in self._active_outages:
+                return False
+            self._active_outages.remove(identity)
         return self.event(payload)
 
 
