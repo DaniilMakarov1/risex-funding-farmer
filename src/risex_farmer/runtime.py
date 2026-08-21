@@ -2262,6 +2262,10 @@ class PublicPaperRuntime:
                 f"{self._notification_run_id}:ready", "RUNTIME_READY", ready_at,
                 "Paper runtime ready",
             )
+            # Initial REST observations can predate completion of a slow
+            # bootstrap. Seed the existing single-flight refresh now so the
+            # first 120-second FULL scan does not inherit that bootstrap age.
+            self._start_public_refresh()
             while not self._stop_event.is_set():
                 await self.tick()
                 now = self.clock.now()

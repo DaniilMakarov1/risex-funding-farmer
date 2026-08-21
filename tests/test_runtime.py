@@ -248,6 +248,32 @@ class GatedAdapter(FakeAdapter):
         )
 
 
+class SlowBootstrapFundingAdapter(FakeAdapter):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.funding_calls = 0
+        self.initial_observed_at: datetime | None = None
+        self.seeded_observed_at: datetime | None = None
+
+    async def fetch_funding_quote(self, market, *, assumed_open_at):
+        self.funding_calls += 1
+        if self.funding_calls == 1:
+            quote = await super().fetch_funding_quote(
+                market, assumed_open_at=assumed_open_at
+            )
+            self.initial_observed_at = quote.observed_at
+            self.clock.advance(10)
+            return quote
+        if self.funding_calls == 2:
+            self.clock.advance(1)
+        quote = await super().fetch_funding_quote(
+            market, assumed_open_at=assumed_open_at
+        )
+        if self.funding_calls == 2:
+            self.seeded_observed_at = quote.observed_at
+        return quote
+
+
 class GatedRecoveryAdapter(FakeAdapter):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -974,6 +1000,103 @@ async def test_full_scan_digest_retains_existing_fifteen_row_limit(tmp_path):
     assert len(result["routes"]) == 15
     assert len(digest.text.splitlines()[1:]) == 15
     assert len(digest.text) <= 4096
+
+
+@pytest.mark.asyncio
+async def test_startup_seed_refresh_keeps_first_full_digest_funding_fresh(
+    tmp_path, monkeypatch,
+):
+    clock = FakeClock()
+    stop = asyncio.Event()
+    fakes = adapters(clock, settlement_at=NOW + timedelta(minutes=10))
+    risex = SlowBootstrapFundingAdapter(
+        Venue.RISEX, clock, settlement_at=NOW + timedelta(minutes=10)
+    )
+    fakes[Venue.RISEX] = risex
+    delivery = CaptureNotifications()
+    captured: dict[str, PublicPaperRuntime] = {}
+
+    async def start_synthetic_streams(runtime: PublicPaperRuntime) -> None:
+        captured["runtime"] = runtime
+        confirm_public_streams(runtime, clock.now())
+
+    monkeypatch.setattr(PublicPaperRuntime, "start_streams", start_synthetic_streams)
+
+    with PaperRepository(tmp_path / "startup-seed-freshness.db") as repository:
+        async def drive(seconds: float) -> None:
+            full_count = repository.connection.execute(
+                "SELECT COUNT(*) FROM runtime_evidence WHERE event_type='PUBLIC_SCAN' "
+                "AND json_extract(detail,'$.scan_kind')='FULL'"
+            ).fetchone()[0]
+            if full_count:
+                stop.set()
+                await asyncio.sleep(0)
+                return
+            runtime = captured["runtime"]
+            task = runtime._refresh_task
+            if task is not None and not task.done():
+                await asyncio.wait_for(asyncio.shield(task), timeout=1)
+            clock.value += timedelta(seconds=seconds)
+            confirm_public_streams(runtime, clock.now())
+            await asyncio.sleep(0)
+
+        result = await public_paper_run(
+            repository, adapters=fakes, clock=clock, sleep=drive,
+            stop_event=stop, notifications=NotificationOutbox(delivery),
+        )
+
+    digest = next(row for row in delivery.rows if row.kind == "FULL_SCAN_DIGEST")
+    assert result["status"] == "STOPPED_SAFE"
+    assert risex.initial_observed_at is not None
+    assert risex.seeded_observed_at is not None
+    assert digest.occurred_at - risex.initial_observed_at > timedelta(seconds=120)
+    assert digest.occurred_at - risex.seeded_observed_at < timedelta(seconds=120)
+    assert "Expected PnL: UNKNOWN" not in digest.text
+    assert "Expected PnL: $" in digest.text
+
+
+@pytest.mark.asyncio
+async def test_startup_seed_refresh_never_blocks_ready_or_safe_stop(
+    tmp_path, monkeypatch,
+):
+    clock = FakeClock()
+    stop = asyncio.Event()
+    fakes = adapters(clock, settlement_at=NOW + timedelta(minutes=10))
+    gated = GatedAdapter(
+        Venue.RISEX, clock, settlement_at=NOW + timedelta(minutes=10)
+    )
+    gated.block_catalog_after_calls = 2
+    fakes[Venue.RISEX] = gated
+
+    async def start_synthetic_streams(runtime: PublicPaperRuntime) -> None:
+        confirm_public_streams(runtime, clock.now())
+
+    monkeypatch.setattr(PublicPaperRuntime, "start_streams", start_synthetic_streams)
+
+    async def stop_after_seed_starts(_seconds: float) -> None:
+        try:
+            await asyncio.wait_for(gated.request_started.wait(), timeout=0.2)
+        finally:
+            stop.set()
+        await asyncio.sleep(0)
+
+    with PaperRepository(tmp_path / "startup-seed-nonblocking.db") as repository:
+        result = await public_paper_run(
+            repository, adapters=fakes, clock=clock,
+            sleep=stop_after_seed_starts, stop_event=stop,
+        )
+        lifecycle = repository.connection.execute(
+            "SELECT event_type FROM runtime_evidence WHERE event_type IN "
+            "('PAPER_RUN_READY','PUBLIC_REFRESH_STARTED','STOPPED_SAFE') "
+            "ORDER BY evidence_id"
+        ).fetchall()
+
+    assert result == {"status": "STOPPED_SAFE", "forced_close": False}
+    assert gated.request_started.is_set()
+    assert gated.cancelled
+    assert [row["event_type"] for row in lifecycle] == [
+        "PAPER_RUN_READY", "PUBLIC_REFRESH_STARTED", "STOPPED_SAFE",
+    ]
 
 
 @pytest.mark.asyncio
