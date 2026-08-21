@@ -2,7 +2,7 @@
 
 - Accepted implementation: PAPER-007-FIX-004 — Public REST Timeout 30 Seconds @ `7476946263cb68812482215282fc7f50fb73a97b`
 - Previous accepted implementation: TELEGRAM-002 — Full Scan Digest @ `4d59156cda36dc4b99e3c53d1805db873213d6f9`
-- Active implementation task: none
+- Active implementation task: PAPER-007-FIX-005 — First Full-Scan Funding Freshness
 - PAPER-007 Stage A scheduling validation: PASS
 - PAPER-007 Stage B: running on accepted main with outbound Telegram enabled after a safe flat restart
 - Preserved Stage B evidence: `paper-007-stage-a-fix002.db`, SHA-256 `6c9bddbf3e10e5690f8e5d5327adf5c35fad4f2044d96fdb9445b3bd567e68ff`
@@ -19,3 +19,5 @@ The Architect used the newly authorized diagnostic `getUpdates` exception to dis
 TELEGRAM-002 is accepted after 167 deterministic tests. Each authoritative `FULL` scan now emits at most one bounded digest with up to 15 existing ordered route rows in `Ticker | Route | Expected PnL` form. INITIAL, FOCUSED, and RECOVERY scans do not emit this digest. Scanner results, scheduling, economics, persistence, adapters, and paper/live boundaries are unchanged.
 
 PAPER-007-FIX-004 is accepted after 168 deterministic tests. The shared public HTTP runtime total timeout is 30 seconds; endpoints, retry cadence, scheduling, economics, lifecycle, Telegram delivery, and paper/live boundaries are unchanged. PID `45479` stopped with `STOPPED_SAFE` and `forced_close=false`; Stage B resumed on the same database under PID `50755` in detached screen `risex-paper007-stageb-timeout30`. Extended's first accepted-code catalog request completed successfully in `18.022913` seconds with `PUBLIC_REST_READY`.
+
+PAPER-007-FIX-005 is explicitly authorized after persisted evidence showed the first post-restart `FULL` scan at `2026-08-21T08:56:17.562429Z` had zero known PnLs because the initial RISEx funding observations were about 130 seconds old under the unchanged 120-second freshness rule. The correction is limited to seeding the existing non-blocking single-flight refresh after readiness; the running Stage B remains untouched until implementation acceptance.
