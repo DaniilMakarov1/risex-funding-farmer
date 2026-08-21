@@ -213,6 +213,30 @@ async def test_flood_control_json_retry_after_seven_is_bounded_and_exact():
 
 
 @pytest.mark.asyncio
+async def test_flood_control_wait_outlives_request_timeout_then_retries():
+    completed_waits: list[float] = []
+    session = FakeSession([
+        FakeResponse(429, {"parameters": {"retry_after": 0.02}}),
+        FakeResponse(200),
+    ])
+
+    async def yielding_sleep(seconds: float) -> None:
+        await asyncio.sleep(seconds)
+        completed_waits.append(seconds)
+
+    delivery = TelegramDelivery(
+        "synthetic-token", "synthetic-chat", timeout_seconds=0.005,
+        max_attempts=2, session_factory=lambda: session, sleep=yielding_sleep,
+    )
+    await delivery.start()
+    delivery.enqueue(payload())
+    await drain(delivery)
+    await delivery.close()
+    assert completed_waits == [0.02]
+    assert len(session.calls) == 2
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("body", [
     ValueError("synthetic malformed response"),
     {},

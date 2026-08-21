@@ -161,6 +161,7 @@ class TelegramDelivery:
         url = f"https://api.telegram.org/bot{self.__token}/sendMessage"
         body = {"chat_id": self.__chat_id, "text": payload.text}
         for attempt in range(self._max_attempts):
+            flood_control_delay: float | None = None
             try:
                 async with asyncio.timeout(self._timeout_seconds):
                     async with self._session.post(url, json=body) as response:  # type: ignore[attr-defined]
@@ -171,9 +172,9 @@ class TelegramDelivery:
                             retry_after = await _telegram_retry_after(response)
                             if retry_after is None:
                                 return
-                            await self._sleep(retry_after)
-                            continue
-                        return
+                            flood_control_delay = retry_after
+                        else:
+                            return
             except asyncio.CancelledError:
                 raise
             except TimeoutError:
@@ -184,6 +185,8 @@ class TelegramDelivery:
                 await self._sleep(1.0)
             except Exception:
                 return
+            if flood_control_delay is not None:
+                await self._sleep(flood_control_delay)
 
 
 async def _telegram_retry_after(response: object) -> float | None:
