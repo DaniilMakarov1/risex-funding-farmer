@@ -1661,6 +1661,8 @@ class PublicPaperRuntime:
         self, symbol: str, kind: str, at: datetime, *, data_ready: bool
     ) -> None:
         self._extended_confirmed_at[symbol, kind] = at
+        if kind == "book":
+            self.coordinator.stream(Venue.EXTENDED, symbol).connected(at)
         self._set_component_readiness(
             Venue.EXTENDED, f"connection_{kind}:{symbol}", True,
             "PUBLIC_STREAM_CONFIRMED", at,

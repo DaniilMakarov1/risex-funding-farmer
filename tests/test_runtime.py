@@ -2598,6 +2598,53 @@ async def test_extended_health_is_per_socket_and_stale_restart_has_one_episode(
     assert json.loads(rows[0]["detail"])["episode_id"] == json.loads(rows[1]["detail"])["episode_id"]
 
 
+def test_extended_book_ping_refreshes_only_book_connection_health(tmp_path):
+    clock = FakeClock()
+    symbol = "ABC-EXTENDED"
+    with PaperRepository(tmp_path / "extended-book-ping-health.db") as repository:
+        runtime = PublicPaperRuntime(repository, adapters={}, clock=clock)
+        runtime._set_component_readiness(
+            Venue.EXTENDED, f"book:{symbol}", False,
+            "PUBLIC_BOOK_DATA_PENDING", clock.now(),
+        )
+        runtime._confirm_extended_stream(
+            symbol, "book", clock.now(), data_ready=False
+        )
+        stream = runtime.coordinator.stream(Venue.EXTENDED, symbol)
+        assert stream.health(clock.now()).data_quality is DataQuality.DEGRADED
+        assert not runtime.component_readiness[Venue.EXTENDED][f"book:{symbol}"].available
+
+        stream.snapshot(OrderBook(
+            Venue.EXTENDED, symbol,
+            (BookLevel(D("99"), D("20")),),
+            (BookLevel(D("101"), D("20")),), clock.now(), 1,
+        ))
+        runtime._confirm_extended_stream(
+            symbol, "book", clock.now(), data_ready=True
+        )
+        clock.advance(26)
+        runtime._confirm_extended_stream(
+            symbol, "book", clock.now(), data_ready=False
+        )
+        assert stream.health(clock.now()).data_quality is DataQuality.COMPLETE
+
+        clock.advance(26)
+        runtime._confirm_extended_stream(
+            symbol, "trade", clock.now(), data_ready=False
+        )
+        assert stream.health(clock.now()).data_quality is DataQuality.DEGRADED
+        runtime._confirm_extended_stream(
+            symbol, "book", clock.now(), data_ready=False
+        )
+        assert stream.health(clock.now()).data_quality is DataQuality.COMPLETE
+
+        clock.advance(26)
+        runtime._confirm_extended_stream(
+            symbol, "funding", clock.now(), data_ready=False
+        )
+        assert stream.health(clock.now()).data_quality is DataQuality.DEGRADED
+
+
 @pytest.mark.asyncio
 async def test_extended_valid_trade_restores_health_before_no_order_early_return(tmp_path):
     clock = FakeClock()
