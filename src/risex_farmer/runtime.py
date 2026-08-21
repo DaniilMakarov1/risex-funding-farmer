@@ -295,6 +295,7 @@ class PublicPaperRuntime:
         self._live_book_ready: set[tuple[Venue, str]] = set()
         self._last_readiness_evidence_at: dict[Venue, datetime] = {}
         self._extended_trade_sequences: dict[str, int] = {}
+        self._extended_confirmed_at: dict[tuple[str, str], datetime] = {}
         self._combined_symbols: dict[Venue, tuple[str, ...]] = {}
         self.next_health_check_at: datetime | None = None
         self.focused_cycle: TargetFundingCycle | None = None
@@ -1131,7 +1132,14 @@ class PublicPaperRuntime:
             and self.broker.state.lifecycle_state is LifecycleState.ENTRY_MAKER_OPEN
         )
         if self.next_health_check_at is None or now >= self.next_health_check_at:
+            await self._check_extended_health(now)
             for (venue, symbol), observation in tuple(self.observations.items()):
+                if (
+                    venue is Venue.EXTENDED
+                    and self.adapters is not None
+                    and isinstance(self.adapters.get(Venue.EXTENDED), ExtendedAdapter)
+                ):
+                    continue
                 if (venue, symbol) not in self._trade_stream_ready:
                     continue
                 health = self.coordinator.stream(venue, symbol).health(now)
@@ -1476,6 +1484,13 @@ class PublicPaperRuntime:
         self, venue: Venue, symbol: str, *, at: datetime | None = None
     ) -> None:
         now = at or self.clock.now()
+        if (
+            venue is Venue.EXTENDED
+            and self.adapters is not None
+            and isinstance(self.adapters.get(Venue.EXTENDED), ExtendedAdapter)
+        ):
+            self._confirm_extended_stream(symbol, "trade", now, data_ready=True)
+            return
         self._trade_stream_ready.add((venue, symbol))
         stream = self.coordinator.stream(venue, symbol)
         stream.connected(now)
@@ -1531,6 +1546,24 @@ class PublicPaperRuntime:
         ask = min(level.canonical_price for level in book.asks)
         return (bid + ask) / Decimal("2")
 
+    async def _apply_extended_funding_record(
+        self, settlement: FundingSettlement
+    ) -> None:
+        if settlement.venue is not Venue.EXTENDED or self.lifecycle is None:
+            return
+        required = {
+            row.key: row for row in self.lifecycle.snapshot.settlements
+        }
+        current = required.get(settlement.key)
+        if current is None or current.status in {
+            SettlementStatus.UNRESOLVED,
+            SettlementStatus.APPLIED_RATE,
+            SettlementStatus.SKIPPED_POSITION_NOT_OPEN,
+            SettlementStatus.SKIPPED_POSITION_CLOSED,
+        }:
+            return
+        await self.deliver_settlement(settlement)
+
     async def _apply_funding_quote(self, quote: FundingCashQuote) -> None:
         key = (quote.venue, quote.canonical_market)
         self._set_component_readiness(
@@ -1569,6 +1602,8 @@ class PublicPaperRuntime:
         stream_kind: str = "public", exception: BaseException | None = None,
     ) -> None:
         now = at or self.clock.now()
+        if venue is Venue.EXTENDED and stream_kind in {"book", "trade", "funding"}:
+            self._extended_confirmed_at.pop((symbol, stream_kind), None)
         invalidates_book = stream_kind in {"book", "combined", "health", "public"}
         invalidates_trade = stream_kind in {"trade", "combined", "health", "public"}
         if invalidates_trade:
@@ -1621,6 +1656,41 @@ class PublicPaperRuntime:
                 self.repository.save_decision(
                     recorded_at=now, lifecycle_snapshot=self.lifecycle.snapshot
                 )
+
+    def _confirm_extended_stream(
+        self, symbol: str, kind: str, at: datetime, *, data_ready: bool
+    ) -> None:
+        self._extended_confirmed_at[symbol, kind] = at
+        self._set_component_readiness(
+            Venue.EXTENDED, f"connection_{kind}:{symbol}", True,
+            "PUBLIC_STREAM_CONFIRMED", at,
+        )
+        if not data_ready:
+            return
+        if kind == "trade":
+            self._trade_stream_ready.add((Venue.EXTENDED, symbol))
+        elif kind == "book":
+            self._live_book_ready.add((Venue.EXTENDED, symbol))
+        self._set_component_readiness(
+            Venue.EXTENDED, f"{kind}:{symbol}", True,
+            f"PUBLIC_{kind.upper()}_STREAM_READY", at,
+        )
+
+    async def _check_extended_health(self, at: datetime) -> None:
+        stale = [
+            (symbol, kind)
+            for (symbol, kind), confirmed_at in self._extended_confirmed_at.items()
+            if (Venue.EXTENDED, symbol, kind) in self._stream_tasks
+            if at - confirmed_at > timedelta(seconds=25)
+        ]
+        for symbol, kind in sorted(stale):
+            identity = (Venue.EXTENDED, kind, (symbol,))
+            self._socket_disconnected(identity, at=at)
+            await self.mark_disconnected(
+                Venue.EXTENDED, symbol, at=at, stream_kind=kind,
+                exception=TimeoutError("public socket confirmation stale"),
+            )
+            await self._restart_extended_stream(symbol, kind)
 
     def _socket_disconnected(
         self,
@@ -1882,6 +1952,34 @@ class PublicPaperRuntime:
         finally:
             self._recovery_tasks.pop(key, None)
 
+    def _start_extended_stream(self, symbol: str, kind: str) -> None:
+        if (
+            self._session is None
+            or self.adapters is None
+            or self._stop_event is None
+            or self._stop_event.is_set()
+        ):
+            return
+        adapter = self.adapters.get(Venue.EXTENDED)
+        if not isinstance(adapter, ExtendedAdapter):
+            return
+        key = (Venue.EXTENDED, symbol, kind)
+        current = self._stream_tasks.get(key)
+        if current is not None and not current.done():
+            return
+        self._stream_tasks[key] = asyncio.create_task(
+            self._extended_stream(adapter, symbol, kind)
+        )
+
+    async def _restart_extended_stream(self, symbol: str, kind: str) -> None:
+        key = (Venue.EXTENDED, symbol, kind)
+        current = self._stream_tasks.get(key)
+        if current is not None and current is not asyncio.current_task():
+            current.cancel()
+            await asyncio.gather(current, return_exceptions=True)
+            self._stream_tasks.pop(key, None)
+        self._start_extended_stream(symbol, kind)
+
     async def _recover_snapshot_in_background(
         self, venue: Venue, symbol: str
     ) -> None:
@@ -1940,18 +2038,9 @@ class PublicPaperRuntime:
             try:
                 async with self._session.ws_connect(url, heartbeat=None, autoping=False) as ws:
                     session_established = True
-                    self.coordinator.stream(Venue.EXTENDED, symbol).connected(self.clock.now())
-                    if kind == "trade":
-                        self.mark_trade_stream_connected(Venue.EXTENDED, symbol)
-                    self._set_component_readiness(
-                        Venue.EXTENDED, f"connection_{kind}:{symbol}", True,
-                        "PUBLIC_STREAM_CONNECTED", self.clock.now(),
+                    self._confirm_extended_stream(
+                        symbol, kind, self.clock.now(), data_ready=False
                     )
-                    if kind != "book":
-                        self._set_component_readiness(
-                            Venue.EXTENDED, f"{kind}:{symbol}", True,
-                            "PUBLIC_STREAM_CONNECTED", self.clock.now(),
-                        )
                     self._socket_reconnected(
                         socket_identity, at=self.clock.now()
                     )
@@ -1960,13 +2049,21 @@ class PublicPaperRuntime:
                     async for message in ws:
                         if message.type is aiohttp.WSMsgType.PING:
                             await ws.pong(message.data)
-                            self.coordinator.stream(Venue.EXTENDED, symbol).connection_confirmed(self.clock.now())
+                            self._confirm_extended_stream(
+                                symbol, kind, self.clock.now(), data_ready=False
+                            )
                             continue
                         if message.type is not aiohttp.WSMsgType.TEXT:
                             continue
                         payload = json.loads(message.data, parse_float=Decimal)
                         if kind == "book":
-                            await self.apply_book_event(adapter.normalize_book_message(payload))
+                            healthy = await self.apply_book_event(
+                                adapter.normalize_book_message(payload)
+                            )
+                            if healthy:
+                                self._confirm_extended_stream(
+                                    symbol, kind, self.clock.now(), data_ready=True
+                                )
                         elif kind == "trade":
                             sequence, trades = adapter.normalize_trade_message(
                                 payload, received_at=self.clock.now(),
@@ -1976,19 +2073,23 @@ class PublicPaperRuntime:
                             if previous is not None and sequence != previous + 1:
                                 raise ValueError("Extended trade sequence gap")
                             self._extended_trade_sequences[symbol] = sequence
+                            self._confirm_extended_stream(
+                                symbol, kind, self.clock.now(), data_ready=True
+                            )
                             for trade in trades:
                                 ordinal += 1
                                 await self.deliver_trade(trade)
                         else:
                             row = self.observations.get((Venue.EXTENDED, symbol))
                             if row is not None:
-                                quote = adapter.normalize_funding_message(
-                                    payload,
-                                    row.market,
-                                    mark_price=self._book_mid(Venue.EXTENDED, symbol),
-                                    assumed_open_at=self.clock.now(),
+                                settlement = adapter.normalize_applied_funding_message(
+                                    payload, row.market,
                                 )
-                                await self._apply_funding_quote(quote)
+                                self._confirm_extended_stream(
+                                    symbol, kind, self.clock.now(), data_ready=True
+                                )
+                                if settlement is not None:
+                                    await self._apply_extended_funding_record(settlement)
                     if self._stop_event is None or not self._stop_event.is_set():
                         raise ConnectionError("public websocket closed")
             except asyncio.CancelledError:
@@ -2227,15 +2328,17 @@ class PublicPaperRuntime:
                     Venue.EXTENDED, f"book:{symbol}", False,
                     "PUBLIC_WS_SNAPSHOT_PENDING", self.clock.now(),
                 )
-            self._stream_tasks[key] = asyncio.create_task(
-                self._extended_stream(adapter, symbol, kind)
-            )
+            self._start_extended_stream(symbol, kind)
             self._record(
                 "PUBLIC_STREAM_ADDED", venue=Venue.EXTENDED,
                 detail={"symbol": symbol, "stream": kind},
             )
         removed = current - wanted
         for key in removed:
+            self._extended_confirmed_at.pop((key[1], key[2]), None)
+            if key[2] == "trade":
+                self._extended_trade_sequences.pop(key[1], None)
+                self._trade_stream_ready.discard((Venue.EXTENDED, key[1]))
             self._pending_socket_episodes.pop(
                 (Venue.EXTENDED, key[2], (key[1],)), None
             )

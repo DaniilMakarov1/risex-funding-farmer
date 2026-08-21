@@ -15,10 +15,12 @@ from risex_farmer.models import (
     FundingAccrualMethod,
     FundingCashQuote,
     FundingQuality,
+    FundingSettlement,
     MarketType,
     MarketVolume,
     OrderBook,
     Side,
+    SettlementStatus,
     TradeEvidence,
     Venue,
 )
@@ -252,31 +254,23 @@ class ExtendedAdapter(PublicAdapter):
             self.SOURCE,
         )
 
-    def normalize_funding_message(
+    def normalize_applied_funding_message(
         self,
         payload: Any,
         market: CanonicalMarket,
-        *,
-        mark_price: Any | None,
-        assumed_open_at: datetime,
-    ) -> FundingCashQuote:
+    ) -> FundingSettlement | None:
         message = require_mapping(payload, "funding message")
         data = require_mapping(message.get("data"), "funding message.data")
-        observed_at = timestamp(message["ts"], "milliseconds")
-        if str(data.get("m")) != market.venue_symbol or mark_price is None:
-            return self.unknown_funding_quote(
-                market,
-                observed_at=observed_at,
-                assumed_open_at=assumed_open_at,
-            )
-        return self.funding_quote(
-            market,
-            funding_rate=data["f"],
-            mark_price=mark_price,
-            observed_at=observed_at,
-            assumed_open_at=assumed_open_at,
-            settlement_at=timestamp(data["T"], "milliseconds"),
-            quality=FundingQuality.APPLIED_RATE,
+        timestamp(message["ts"], "milliseconds")
+        decimal_value(data["f"], "funding rate")
+        if str(data.get("m")) != market.venue_symbol:
+            return None
+        return FundingSettlement(
+            Venue.EXTENDED,
+            market.venue_symbol,
+            timestamp(data["T"], "milliseconds"),
+            SettlementStatus.UNRESOLVED,
+            None,
         )
 
     async def fetch_funding_quote(

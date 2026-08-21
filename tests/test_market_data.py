@@ -23,6 +23,7 @@ from risex_farmer.models import (
     ContractType,
     DataQuality,
     FundingQuality,
+    SettlementStatus,
     MarketType,
     OrderBook,
     Side,
@@ -300,20 +301,13 @@ def test_extended_and_nado_funding_conversion() -> None:
         assumed_open_at=NOW,
         settlement_at=NOW + timedelta(hours=1),
     ).quality is FundingQuality.UNKNOWN
-    e_applied = extended.normalize_funding_message(
+    e_applied = extended.normalize_applied_funding_message(
         fixture("extended")["funding"],
         e_market,
-        mark_price="100",
-        assumed_open_at=NOW - timedelta(hours=1),
     )
-    assert e_applied.quality is FundingQuality.APPLIED_RATE
-    assert e_applied.long_cash_per_canonical_base_usd == D("-0.100")
-    assert extended.normalize_funding_message(
-        fixture("extended")["funding"],
-        e_market,
-        mark_price=None,
-        assumed_open_at=NOW,
-    ).quality is FundingQuality.UNKNOWN
+    assert e_applied.status is SettlementStatus.UNRESOLVED
+    assert e_applied.cash_usd is None
+    assert e_applied.canonical_market == e_market.venue_symbol
 
     nado = NadoAdapter(None)
     n_market = nado.normalize_market(fixture("nado")["market"])

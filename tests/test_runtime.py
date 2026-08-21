@@ -409,6 +409,40 @@ class ReconnectingSession:
         )
 
 
+class TextWebSocket:
+    def __init__(self, stop_event: asyncio.Event, payloads) -> None:
+        self.stop_event = stop_event
+        self.messages = list(payloads)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        return None
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self.messages:
+            self.stop_event.set()
+            raise StopAsyncIteration
+        return SimpleNamespace(
+            type=aiohttp.WSMsgType.TEXT,
+            data=json.dumps(self.messages.pop(0)),
+        )
+
+
+class SingleWebSocketSession:
+    def __init__(self, websocket: TextWebSocket) -> None:
+        self.websocket = websocket
+        self.connections = 0
+
+    def ws_connect(self, *_args, **_kwargs):
+        self.connections += 1
+        return self.websocket
+
+
 def assert_socket_episode(rows):
     assert [row["event_type"] for row in rows] == [
         "PUBLIC_SOCKET_DISCONNECTED", "PUBLIC_SOCKET_RECONNECTED",
@@ -2447,6 +2481,255 @@ async def test_official_applied_settlement_replaces_estimate_and_report_has_assu
         "risex_assumed_funding_is_not_official_applied_funding",
     ):
         assert report["assumption_flags"][flag] is True
+
+
+@pytest.mark.asyncio
+async def test_extended_applied_record_preserves_future_quote_and_is_exact_idempotent(tmp_path):
+    clock = FakeClock()
+    target = NOW + timedelta(seconds=120)
+    fakes = adapters(clock, settlement_at=target)
+    with PaperRepository(tmp_path / "extended-applied-separation.db") as repository:
+        async with PublicPaperRuntime(repository, adapters=fakes, clock=clock) as runtime:
+            await runtime.scan()
+            confirm_public_streams(runtime, clock.now())
+            symbol = fakes[Venue.EXTENDED].market.venue_symbol
+            expected = runtime.observations[Venue.EXTENDED, symbol].funding
+            assert expected is not None and expected.quality is FundingQuality.PREDICTED
+            await runtime._apply_extended_funding_record(FundingSettlement(
+                Venue.EXTENDED, symbol, target,
+                SettlementStatus.UNRESOLVED, None,
+            ))
+            assert runtime.observations[Venue.EXTENDED, symbol].funding == expected
+            await runtime.scan(refresh=False, scan_kind="FULL")
+            plans = [
+                row for row in runtime.last_scan.evaluations
+                if row.hedge_venue is Venue.EXTENDED
+            ]
+            assert plans and plans[0].planned_maker_net_pnl_usd is not None
+            assert not {
+                "FUNDING_ELIGIBILITY_UNKNOWN", "FUNDING_OPEN_TIME_MISMATCH",
+            }.intersection(plans[0].no_trade_reasons)
+            assert repository.connection.execute(
+                "SELECT COUNT(*) FROM funding_settlements WHERE venue='EXTENDED'"
+            ).fetchone()[0] == 0
+
+            await activate_with_live_streams(runtime, clock)
+            clock.advance(1)
+            order = runtime.broker.state.order
+            runtime.mark_trade_stream_connected(order.venue, order.canonical_market)
+            await runtime.deliver_trade(maker_trade(runtime, clock.now(), "extended-entry"))
+            required = next(
+                row for row in runtime.lifecycle.snapshot.settlements
+                if row.venue is Venue.EXTENDED
+            )
+            mismatch = replace(required, settlement_at=required.settlement_at + timedelta(seconds=1))
+            await runtime._apply_extended_funding_record(mismatch)
+            await runtime._apply_extended_funding_record(replace(
+                required, status=SettlementStatus.UNRESOLVED, cash_usd=None,
+            ))
+            await runtime._apply_extended_funding_record(replace(
+                required, status=SettlementStatus.UNRESOLVED, cash_usd=None,
+            ))
+            rows = repository.connection.execute(
+                "SELECT settlement_at,status,cash_usd FROM funding_settlements "
+                "WHERE venue='EXTENDED' ORDER BY settlement_at"
+            ).fetchall()
+    assert [(row["settlement_at"], row["status"], row["cash_usd"]) for row in rows] == [
+        (required.settlement_at.isoformat(), "UNRESOLVED", None)
+    ]
+
+
+@pytest.mark.parametrize("stale_kind", ("book", "trade", "funding"))
+@pytest.mark.asyncio
+async def test_extended_health_is_per_socket_and_stale_restart_has_one_episode(
+    tmp_path, stale_kind,
+):
+    clock = FakeClock()
+    symbol = "ABC-EXTENDED"
+    with PaperRepository(tmp_path / "extended-health-isolation.db") as repository:
+        runtime = PublicPaperRuntime(repository, adapters={}, clock=clock)
+        runtime._stop_event = asyncio.Event()
+        for kind in ("book", "trade", "funding"):
+            runtime._confirm_extended_stream(symbol, kind, clock.now(), data_ready=True)
+        runtime._extended_confirmed_at[symbol, stale_kind] = clock.now() - timedelta(seconds=26)
+
+        async def waiting_stream():
+            await runtime._stop_event.wait()
+
+        tasks = {
+            kind: asyncio.create_task(waiting_stream())
+            for kind in ("book", "trade", "funding")
+        }
+        for kind, task in tasks.items():
+            runtime._stream_tasks[Venue.EXTENDED, symbol, kind] = task
+
+        restarted = []
+        runtime._start_extended_stream = lambda _symbol, kind: restarted.append(kind)
+        await runtime._check_extended_health(clock.now())
+        assert restarted == [stale_kind]
+        assert tasks[stale_kind].cancelled()
+        for kind in ("book", "trade", "funding"):
+            available = runtime.component_readiness[Venue.EXTENDED][f"{kind}:{symbol}"].available
+            connected = runtime.component_readiness[Venue.EXTENDED][f"connection_{kind}:{symbol}"].available
+            assert available is (kind != stale_kind)
+            assert connected is (kind != stale_kind)
+        assert not any(
+            name.startswith("connection_combined")
+            for name in runtime.component_readiness[Venue.EXTENDED]
+        )
+        runtime._confirm_extended_stream(symbol, stale_kind, clock.now(), data_ready=True)
+        runtime._socket_reconnected(
+            (Venue.EXTENDED, stale_kind, (symbol,)), at=clock.now()
+        )
+        assert runtime.component_readiness[Venue.EXTENDED][f"{stale_kind}:{symbol}"].available
+        assert runtime.component_readiness[Venue.EXTENDED][f"connection_{stale_kind}:{symbol}"].available
+        rows = repository.connection.execute(
+            "SELECT event_type,detail FROM runtime_evidence WHERE event_type LIKE "
+            "'PUBLIC_SOCKET_%' ORDER BY evidence_id"
+        ).fetchall()
+        runtime._stop_event.set()
+        for task in tasks.values():
+            task.cancel()
+        await asyncio.gather(*tasks.values(), return_exceptions=True)
+    assert [row["event_type"] for row in rows] == [
+        "PUBLIC_SOCKET_DISCONNECTED", "PUBLIC_SOCKET_RECONNECTED",
+    ]
+    assert json.loads(rows[0]["detail"])["episode_id"] == json.loads(rows[1]["detail"])["episode_id"]
+
+
+@pytest.mark.asyncio
+async def test_extended_valid_trade_restores_health_before_no_order_early_return(tmp_path):
+    clock = FakeClock()
+    stop = asyncio.Event()
+    adapter = GatedExtendedAdapter(clock, settlement_at=NOW + timedelta(minutes=5))
+    symbol = adapter.market.venue_symbol
+    payload = {
+        "seq": 1,
+        "data": [{
+            "i": 1, "m": symbol, "S": "SELL", "tT": "TRADE",
+            "T": int(NOW.timestamp() * 1000), "p": "100", "q": "1",
+        }],
+    }
+    session = SingleWebSocketSession(TextWebSocket(stop, [payload]))
+    with PaperRepository(tmp_path / "extended-trade-ready.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={Venue.EXTENDED: adapter}, clock=clock,
+        )
+        runtime._session = session
+        runtime._stop_event = stop
+        await runtime._extended_stream(adapter, symbol, "trade")
+    assert session.connections == 1
+    assert (Venue.EXTENDED, symbol) in runtime._trade_stream_ready
+    assert runtime.component_readiness[Venue.EXTENDED][f"trade:{symbol}"].available
+    assert runtime.component_readiness[Venue.EXTENDED][f"connection_trade:{symbol}"].available
+
+
+@pytest.mark.asyncio
+async def test_extended_funding_ws_path_does_not_replace_rest_expected_quote(tmp_path):
+    clock = FakeClock()
+    target = NOW + timedelta(minutes=5)
+    stop = asyncio.Event()
+    adapter = GatedExtendedAdapter(clock, settlement_at=target)
+    symbol = adapter.market.venue_symbol
+    session = SingleWebSocketSession(TextWebSocket(stop, [{
+        "ts": int(NOW.timestamp() * 1000), "seq": 1,
+        "data": {"m": symbol, "T": int(target.timestamp() * 1000), "f": "0.001"},
+    }]))
+    fakes = adapters(clock, settlement_at=target)
+    fakes[Venue.EXTENDED] = adapter
+    with PaperRepository(tmp_path / "extended-funding-ws-inert.db") as repository:
+        runtime = PublicPaperRuntime(repository, adapters=fakes, clock=clock)
+        await runtime.scan()
+        expected = runtime.observations[Venue.EXTENDED, symbol].funding
+        runtime._session = session
+        runtime._stop_event = stop
+        await runtime._extended_stream(adapter, symbol, "funding")
+        assert runtime.observations[Venue.EXTENDED, symbol].funding == expected
+        assert repository.connection.execute(
+            "SELECT COUNT(*) FROM funding_settlements WHERE venue='EXTENDED'"
+        ).fetchone()[0] == 0
+    assert session.connections == 1
+    assert runtime.component_readiness[Venue.EXTENDED][f"funding:{symbol}"].available
+    assert runtime.component_readiness[Venue.EXTENDED][f"connection_funding:{symbol}"].available
+
+
+@pytest.mark.asyncio
+async def test_two_extended_markets_keep_expected_funding_across_full_scans(tmp_path):
+    clock = FakeClock()
+    target = NOW + timedelta(minutes=5)
+
+    class TwoMarketExtendedAdapter(GatedExtendedAdapter):
+        def __init__(self):
+            super().__init__(clock, settlement_at=target)
+            self.rows = tuple(
+                replace(
+                    self.market, canonical_asset=f"A{index}",
+                    venue_symbol=f"A{index}-EXTENDED",
+                )
+                for index in range(2)
+            )
+
+        async def fetch_catalog(self):
+            return self.rows, tuple(
+                MarketVolume(
+                    Venue.EXTENDED, market.venue_symbol, D("1000000"),
+                    clock.now(), "official-shaped",
+                )
+                for market in self.rows
+            )
+
+        async def fetch_funding_quote(self, market, *, assumed_open_at):
+            return FundingCashQuote(
+                Venue.EXTENDED, market.venue_symbol, clock.now(), assumed_open_at,
+                target, FundingQuality.PREDICTED,
+                FundingAccrualMethod.SNAPSHOT_AT_SETTLEMENT, True,
+                D("5"), D("5"), "official-shaped",
+            )
+
+    extended = TwoMarketExtendedAdapter()
+    fakes = {
+        Venue.RISEX: ManyFakeAdapter(Venue.RISEX, clock, settlement_at=target),
+        Venue.EXTENDED: extended,
+        Venue.NADO: ManyFakeAdapter(Venue.NADO, clock, settlement_at=target),
+    }
+    with PaperRepository(tmp_path / "extended-two-market-full.db") as repository:
+        async with PublicPaperRuntime(repository, adapters=fakes, clock=clock) as runtime:
+            await runtime.scan()
+            confirm_public_streams(runtime, clock.now())
+            for market in extended.rows:
+                for kind in ("book", "trade", "funding"):
+                    runtime._confirm_extended_stream(
+                        market.venue_symbol, kind, clock.now(), data_ready=True
+                    )
+            clock.advance(1)
+            await runtime.scan(refresh=False, scan_kind="FULL")
+            for market in extended.rows:
+                record = extended.normalize_applied_funding_message({
+                    "ts": int(clock.now().timestamp() * 1000), "seq": 1,
+                    "data": {
+                        "m": market.venue_symbol,
+                        "T": int(target.timestamp() * 1000), "f": "0.001",
+                    },
+                }, market)
+                assert record is not None
+                await runtime._apply_extended_funding_record(record)
+            clock.advance(1)
+            await runtime.scan(refresh=False, scan_kind="FULL")
+            plans = [
+                plan for plan in runtime.last_scan.evaluations
+                if plan.hedge_venue is Venue.EXTENDED
+            ]
+            full_count = repository.connection.execute(
+                "SELECT COUNT(*) FROM runtime_evidence WHERE event_type='PUBLIC_SCAN' "
+                "AND json_extract(detail,'$.scan_kind')='FULL'"
+            ).fetchone()[0]
+    assert full_count == 2
+    assert len(plans) == 4
+    assert all(plan.planned_maker_net_pnl_usd is not None for plan in plans)
+    assert all(
+        "FUNDING_ELIGIBILITY_UNKNOWN" not in plan.no_trade_reasons
+        for plan in plans
+    )
 
 
 @pytest.mark.asyncio
