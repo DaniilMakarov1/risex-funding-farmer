@@ -1,11 +1,11 @@
 # Status
 
-- Accepted implementation: PAPER-007-FIX-008 — Public Evidence, Extended Catalog/Heartbeat, Full Digest, and Stop Semantics @ `f7140447237850b7436eb54e83ef53b1ff8edc06` + `e7d6f26dd5afad6400433b3c0f9ca1fc94095c79`
+- Candidate implementation: PAPER-007-FIX-008 @ `f7140447237850b7436eb54e83ef53b1ff8edc06` + `e7d6f26dd5afad6400433b3c0f9ca1fc94095c79`; final acceptance withdrawn after Stage B exposed a second-FULL `AssertionError`
 - Previous accepted implementation: PAPER-007-FIX-007 — Extended Expected Funding and Socket Health Separation @ `77af66b9cb4662acd3055a6457b0fe53f667a256` + `ac5ac7ee6c27f629d389dcf283169c59bf276b9d` + `7e73bdcb1de5eb3be8ad457c6e7c9c1f0db3ae30`
 - Previous accepted implementation: TELEGRAM-002-FIX-001 — Two-Decimal Bot Values @ `c59c54c4265b224ef1781492bf24b79b8987f382` + `b7c9564efa902e7bc82f40b55ed9ad05687f95e3`
-- Active implementation task: none
+- Active implementation task: PAPER-007-FIX-008 final corrective cycle
 - PAPER-007 Stage A scheduling validation: PASS
-- PAPER-007 Stage B: FIX-008 accepted; authorized to resume on the preserved database
+- PAPER-007 Stage B: stopped fail-closed with `RUNTIME_FATAL`; do not restart until final FIX-008 acceptance
 - Preserved Stage B evidence: `paper-007-stage-a-fix002.db`, SHA-256 `6c9bddbf3e10e5690f8e5d5327adf5c35fad4f2044d96fdb9445b3bd567e68ff`
 - Product phase: PAPER ONLY
 - Live trading: prohibited
@@ -40,3 +40,5 @@ Stage B resumed on the same database under PID `69724` in detached screen `risex
 PAPER-007-FIX-008 is explicitly authorized. Production evidence ended at `2026-08-21T11:42:11.815521Z` with `STOPPED_SAFE`, `forced_close=false`, no preserved position, database integrity `ok`, and orders/fills/positions/attempts `0/0/0/0`. The task is bounded to RISEx unit evidence, Extended catalog freshness and dedicated-socket heartbeat/lifecycle semantics, all-20 authoritative FULL digest rows with precise UNKNOWN reasons, and persisted stop cause. Economics, cadence, execution, funding, and paper/live boundaries remain unchanged.
 
 PAPER-007-FIX-008 is accepted after 178 focused and 224 full deterministic tests, compileall, diff-check, and secret scan. The below-minimum RISEx regression fails on the pre-fix baseline and passes after the correction, while off-grid evidence and planned-order minimums remain fail-closed. A public-only smoke completed 18 FULL scans plus 30 focused scans through T−120 and T−5. The official Extended full catalog eventually returned 360 markets; the filtered official request returned exactly BTC/ETH/HYPE/PUMP/SOL. Two subsequent FULL scans persisted 20 routes each with 20 numeric planned PnLs. Extended/Nado funding remained `PREDICTED`, RISEx remained explicit `ESTIMATED/PAPER_ASSUMPTION`, and the smoke stopped with `STOPPED_SAFE`, `forced_close=false`, integrity `ok`, and orders/fills/positions/attempts `0/0/0/0`. Three initial Extended universe attempts reached the bounded 60-second timeout before a later successful response; fresh-cache timeout behavior is deterministic-test verified. Economics and paper/live boundaries are unchanged.
+
+That preliminary acceptance was withdrawn after the required production restart exposed a second-FULL `AssertionError` at `2026-08-21T13:30:17.221171Z`. The runtime persisted `RUNTIME_FATAL` and `RUNTIME_STOPPED_FATAL`, remained flat, and created no orders, fills, positions, or attempts. The second and final permitted FIX cycle must reproduce the exact route/universe transition, replace the internal assertion with correct fail-closed production semantics, and add a production-path regression before Stage B can resume.
