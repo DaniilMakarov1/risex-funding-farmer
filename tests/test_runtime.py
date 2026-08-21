@@ -549,7 +549,11 @@ def adapters(clock: FakeClock, *, settlement_at: datetime, risex=True, funding="
 def confirm_public_streams(runtime: PublicPaperRuntime, at: datetime) -> None:
     for venue, symbol in runtime.observations:
         runtime.mark_trade_stream_connected(venue, symbol, at=at)
-        runtime._live_book_ready.add((venue, symbol))
+        if venue is Venue.EXTENDED:
+            runtime._confirm_extended_stream(symbol, "book", at, data_ready=True)
+            runtime._confirm_extended_stream(symbol, "funding", at, data_ready=False)
+        else:
+            runtime._live_book_ready.add((venue, symbol))
 
 
 async def activate_with_live_streams(
@@ -1671,7 +1675,12 @@ async def test_extended_socket_failures_are_component_aware(tmp_path):
             await runtime.scan()
             symbol = fakes[Venue.EXTENDED].market.venue_symbol
             runtime.mark_trade_stream_connected(Venue.EXTENDED, symbol)
-            runtime._live_book_ready.add((Venue.EXTENDED, symbol))
+            runtime._confirm_extended_stream(
+                symbol, "book", clock.now(), data_ready=True
+            )
+            runtime._confirm_extended_stream(
+                symbol, "funding", clock.now(), data_ready=False
+            )
             stream = runtime.coordinator.stream(Venue.EXTENDED, symbol)
             before = stream.book()
             assert before is not None and before.sequence == 1
@@ -1683,7 +1692,24 @@ async def test_extended_socket_failures_are_component_aware(tmp_path):
             assert stream.book() == before
             assert (Venue.EXTENDED, symbol) in runtime._trade_stream_ready
             assert runtime.component_readiness[Venue.EXTENDED][f"trade:{symbol}"].available
-            assert not runtime.component_readiness[Venue.EXTENDED][f"funding:{symbol}"].available
+            assert runtime.component_readiness[Venue.EXTENDED][f"funding:{symbol}"].available
+            assert not runtime.component_readiness[Venue.EXTENDED][
+                f"applied_funding:{symbol}"
+            ].available
+            await runtime.scan(refresh=False, scan_kind="FULL")
+            funding_plans = [
+                plan for plan in runtime.last_scan.evaluations
+                if plan.hedge_venue is Venue.EXTENDED
+            ]
+            assert funding_plans
+            assert all(
+                "FUNDING_STREAM_UNHEALTHY" in plan.no_trade_reasons
+                for plan in funding_plans
+            )
+            assert all(
+                "BOOK_UNHEALTHY" not in plan.no_trade_reasons
+                for plan in funding_plans
+            )
 
             await runtime.mark_disconnected(
                 Venue.EXTENDED, symbol, stream_kind="trade",
@@ -1693,6 +1719,20 @@ async def test_extended_socket_failures_are_component_aware(tmp_path):
             assert stream.book().sequence == 1
             assert (Venue.EXTENDED, symbol) not in runtime._trade_stream_ready
             assert not runtime.component_readiness[Venue.EXTENDED][f"trade:{symbol}"].available
+            await runtime.scan(refresh=False, scan_kind="FULL")
+            plans = [
+                plan for plan in runtime.last_scan.evaluations
+                if plan.hedge_venue is Venue.EXTENDED
+            ]
+            assert plans
+            assert all(
+                "TRADE_STREAM_UNHEALTHY" in plan.no_trade_reasons
+                for plan in plans
+            )
+            assert all(
+                "BOOK_UNHEALTHY" not in plan.no_trade_reasons
+                for plan in plans
+            )
 
 
 @pytest.mark.asyncio
@@ -2275,7 +2315,7 @@ async def test_extended_error_frame_persists_one_transport_episode(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_extended_trade_sequence_gap_has_zero_physical_socket_rows(tmp_path):
+async def test_extended_trade_sequence_is_monotonic_deduped_and_does_not_reconnect(tmp_path):
     clock = FakeClock()
     stop = asyncio.Event()
     timestamp_ms = str(int(NOW.timestamp() * 1000))
@@ -2284,19 +2324,18 @@ async def test_extended_trade_sequence_gap_has_zero_physical_socket_rows(tmp_pat
         "S": "SELL", "i": "trade-1", "tT": "TRADE",
     }
 
-    class SequenceGapSession:
-        connections = 0
+    websocket = TextWebSocket(stop, (
+        {"seq": 10, "data": [trade]},
+        {"seq": 12, "data": [{**trade, "i": "trade-2"}]},
+        {"seq": 12, "data": [{**trade, "i": "duplicate-sequence"}]},
+        {"seq": 11, "data": [{**trade, "i": "out-of-order"}]},
+        {"seq": 13, "data": [{**trade, "i": "trade-3"}]},
+    ))
+    session = SingleWebSocketSession(websocket)
+    delivered = []
 
-        def ws_connect(self, *_args, **_kwargs):
-            self.connections += 1
-            if self.connections == 1:
-                return TextWebSocket(stop, (
-                    {"seq": 1, "data": [trade]},
-                    {"seq": 3, "data": [{**trade, "i": "trade-2"}]},
-                ))
-            return ClosingWebSocket(stop, stop_on_iteration=True)
-
-    session = SequenceGapSession()
+    async def capture_trade(row) -> None:
+        delivered.append(row)
 
     async def no_delay(_seconds: float) -> None:
         await asyncio.sleep(0)
@@ -2307,6 +2346,7 @@ async def test_extended_trade_sequence_gap_has_zero_physical_socket_rows(tmp_pat
         )
         runtime._session = session
         runtime._stop_event = stop
+        runtime.deliver_trade = capture_trade
         await runtime._extended_stream(
             ExtendedAdapter(None), "ABC-EXTENDED", "trade"
         )
@@ -2314,8 +2354,123 @@ async def test_extended_trade_sequence_gap_has_zero_physical_socket_rows(tmp_pat
             "SELECT COUNT(*) FROM runtime_evidence "
             "WHERE event_type LIKE 'PUBLIC_SOCKET_%'"
         ).fetchone()[0]
-    assert session.connections == 2
+        discontinuities = repository.connection.execute(
+            "SELECT detail FROM runtime_evidence "
+            "WHERE event_type='PUBLIC_TRADE_SEQUENCE_DISCONTINUITY'"
+        ).fetchall()
+    assert session.connections == 1
     assert physical == 0
+    assert [row.trade_event_key for row in delivered] == [
+        "EXTENDED|ABC-EXTENDED|trade-1",
+        "EXTENDED|ABC-EXTENDED|trade-2",
+        "EXTENDED|ABC-EXTENDED|trade-3",
+    ]
+    assert len(discontinuities) == 1
+    assert json.loads(discontinuities[0]["detail"]) == {
+        "action": "ACCEPT_MONOTONIC",
+        "classification": "FORWARD_GAP",
+        "current_sequence": 12,
+        "previous_sequence": 10,
+        "stream": "trade",
+        "symbol": "ABC-EXTENDED",
+    }
+
+
+@pytest.mark.asyncio
+async def test_extended_trade_sequence_resets_for_each_physical_session(tmp_path):
+    clock = FakeClock()
+    stop = asyncio.Event()
+    timestamp_ms = str(int(NOW.timestamp() * 1000))
+
+    def payload(sequence, trade_id):
+        return {
+            "seq": sequence,
+            "data": [{
+                "m": "ABC-EXTENDED", "p": "100", "q": "1",
+                "T": timestamp_ms, "S": "SELL", "i": trade_id,
+                "tT": "TRADE",
+            }],
+        }
+
+    class SessionWebSocket(TextWebSocket):
+        def __init__(self, payloads, *, stop_on_eof):
+            super().__init__(stop, payloads)
+            self.stop_on_eof = stop_on_eof
+
+        async def __anext__(self):
+            if not self.messages:
+                if self.stop_on_eof:
+                    stop.set()
+                raise StopAsyncIteration
+            return SimpleNamespace(
+                type=aiohttp.WSMsgType.TEXT,
+                data=json.dumps(self.messages.pop(0)),
+            )
+
+    class TwoSession:
+        connections = 0
+
+        def ws_connect(self, *_args, **_kwargs):
+            self.connections += 1
+            if self.connections == 1:
+                return SessionWebSocket((payload(100, "old-session"),), stop_on_eof=False)
+            return SessionWebSocket((payload(1, "new-session"),), stop_on_eof=True)
+
+    session = TwoSession()
+    delivered = []
+
+    async def capture_trade(row) -> None:
+        delivered.append(row)
+
+    async def no_delay(_seconds: float) -> None:
+        await asyncio.sleep(0)
+
+    with PaperRepository(tmp_path / "trade-session-reset.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={}, clock=clock, sleep=no_delay,
+        )
+        runtime._session = session
+        runtime._stop_event = stop
+        runtime.deliver_trade = capture_trade
+        await runtime._extended_stream(
+            ExtendedAdapter(None), "ABC-EXTENDED", "trade"
+        )
+        discontinuities = repository.connection.execute(
+            "SELECT COUNT(*) FROM runtime_evidence "
+            "WHERE event_type='PUBLIC_TRADE_SEQUENCE_DISCONTINUITY'"
+        ).fetchone()[0]
+    assert session.connections == 2
+    assert [row.trade_event_key for row in delivered] == [
+        "EXTENDED|ABC-EXTENDED|old-session",
+        "EXTENDED|ABC-EXTENDED|new-session",
+    ]
+    assert discontinuities == 0
+
+
+@pytest.mark.asyncio
+async def test_extended_immediate_reconnect_failures_use_increasing_backoff(tmp_path):
+    clock = FakeClock()
+    stop = asyncio.Event()
+    session = ReconnectingSession(
+        stop, outcomes=("eof", "fail_context", "fail_context", "stop")
+    )
+    delays = []
+
+    async def capture_delay(seconds: float) -> None:
+        delays.append(seconds)
+        await asyncio.sleep(0)
+
+    with PaperRepository(tmp_path / "extended-backoff.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={}, clock=clock, sleep=capture_delay,
+        )
+        runtime._session = session
+        runtime._stop_event = stop
+        await runtime._extended_stream(
+            ExtendedAdapter(None), "ABC-EXTENDED", "funding"
+        )
+    assert session.connections == 4
+    assert delays == [1, 2, 4]
 
 
 @pytest.mark.asyncio
@@ -2742,7 +2897,10 @@ async def test_extended_health_is_per_socket_and_stale_restart_has_one_episode(
         assert restarted == [stale_kind]
         assert tasks[stale_kind].cancelled()
         for kind in ("book", "trade", "funding"):
-            available = runtime.component_readiness[Venue.EXTENDED][f"{kind}:{symbol}"].available
+            data_kind = "applied_funding" if kind == "funding" else kind
+            available = runtime.component_readiness[Venue.EXTENDED][
+                f"{data_kind}:{symbol}"
+            ].available
             connected = runtime.component_readiness[Venue.EXTENDED][f"connection_{kind}:{symbol}"].available
             assert available is (kind != stale_kind)
             assert connected is (kind != stale_kind)
@@ -2765,7 +2923,12 @@ async def test_extended_health_is_per_socket_and_stale_restart_has_one_episode(
         runtime._watchdog_restarted(
             (Venue.EXTENDED, stale_kind, (symbol,)), at=clock.now()
         )
-        assert runtime.component_readiness[Venue.EXTENDED][f"{stale_kind}:{symbol}"].available
+        stale_data_kind = (
+            "applied_funding" if stale_kind == "funding" else stale_kind
+        )
+        assert runtime.component_readiness[Venue.EXTENDED][
+            f"{stale_data_kind}:{symbol}"
+        ].available
         assert runtime.component_readiness[Venue.EXTENDED][f"connection_{stale_kind}:{symbol}"].available
         rows = repository.connection.execute(
             "SELECT event_type,detail FROM runtime_evidence WHERE event_type LIKE "
@@ -2933,11 +3096,12 @@ async def test_extended_funding_ws_path_does_not_replace_rest_expected_quote(tmp
         ).fetchone()[0] == 0
     assert session.connections == 1
     assert runtime.component_readiness[Venue.EXTENDED][f"funding:{symbol}"].available
+    assert runtime.component_readiness[Venue.EXTENDED][f"applied_funding:{symbol}"].available
     assert runtime.component_readiness[Venue.EXTENDED][f"connection_funding:{symbol}"].available
 
 
 @pytest.mark.asyncio
-async def test_extended_connection_only_is_blocked_until_each_data_stream_is_valid(tmp_path):
+async def test_extended_funding_connection_allows_quiet_applied_stream(tmp_path):
     clock = FakeClock()
     target = NOW + timedelta(minutes=5)
     adapter = GatedExtendedAdapter(clock, settlement_at=target)
@@ -2964,15 +3128,18 @@ async def test_extended_connection_only_is_blocked_until_each_data_stream_is_val
             )
         components = runtime.component_readiness[Venue.EXTENDED]
         assert set(components) >= {
-            f"{kind}:{symbol}" for kind in ("book", "trade", "funding")
+            f"{kind}:{symbol}" for kind in ("book", "trade", "funding", "applied_funding")
         } | {
             f"connection_{kind}:{symbol}" for kind in ("book", "trade", "funding")
         }
         assert all(
             components[f"connection_{kind}:{symbol}"].available
-            and not components[f"{kind}:{symbol}"].available
             for kind in ("book", "trade", "funding")
         )
+        assert not components[f"book:{symbol}"].available
+        assert not components[f"trade:{symbol}"].available
+        assert components[f"funding:{symbol}"].available
+        assert not components[f"applied_funding:{symbol}"].available
         await runtime.scan(refresh=False, scan_kind="FULL")
         before = next(
             row for row in runtime.last_scan.evaluations
@@ -2994,17 +3161,21 @@ async def test_extended_connection_only_is_blocked_until_each_data_stream_is_val
         ).planned_maker_net_pnl_usd is None
         assert components[f"book:{symbol}"].available
         assert not components[f"trade:{symbol}"].available
-        assert not components[f"funding:{symbol}"].available
+        assert not components[f"applied_funding:{symbol}"].available
 
         runtime._confirm_extended_stream(symbol, "trade", clock.now(), data_ready=True)
         clock.advance(1)
         await runtime.scan(refresh=False, scan_kind="FULL")
-        assert next(
+        after_trade = next(
             row for row in runtime.last_scan.evaluations
             if row.hedge_venue is Venue.EXTENDED
-        ).planned_maker_net_pnl_usd is None
+        )
+        assert after_trade.planned_maker_net_pnl_usd is not None
+        assert "FUNDING_STREAM_UNHEALTHY" not in after_trade.no_trade_reasons
+        assert "BOOK_UNHEALTHY" not in after_trade.no_trade_reasons
         assert components[f"trade:{symbol}"].available
-        assert not components[f"funding:{symbol}"].available
+        assert not components[f"applied_funding:{symbol}"].available
+        assert runtime.readiness[Venue.EXTENDED].available
 
         record = adapter.normalize_applied_funding_message({
             "ts": int(clock.now().timestamp() * 1000), "seq": 1,

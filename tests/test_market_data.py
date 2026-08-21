@@ -476,9 +476,37 @@ def test_extended_and_nado_funding_conversion() -> None:
         fixture("nado")["funding_rate"],
         n_market,
         index_price_x18="100000000000000000000",
+        received_at=NOW,
         assumed_open_at=NOW,
     )
     assert streamed.long_cash_per_canonical_base_usd == D("-0.100")
+
+    future_timestamp = deepcopy(fixture("nado")["funding_rate"])
+    future_timestamp["timestamp"] = str(
+        int((NOW + timedelta(seconds=2)).timestamp() * 1_000_000_000)
+    )
+    future_streamed = nado.normalize_funding_rate_message(
+        future_timestamp,
+        n_market,
+        index_price_x18="100000000000000000000",
+        received_at=NOW,
+        assumed_open_at=NOW,
+    )
+    assert future_streamed.observed_at == NOW
+    assert funding_is_fresh(future_streamed.observed_at, NOW)
+
+    past_timestamp = deepcopy(fixture("nado")["funding_rate"])
+    past_timestamp["timestamp"] = str(
+        int((NOW - timedelta(seconds=10)).timestamp() * 1_000_000_000)
+    )
+    past_streamed = nado.normalize_funding_rate_message(
+        past_timestamp,
+        n_market,
+        index_price_x18="100000000000000000000",
+        received_at=NOW,
+        assumed_open_at=NOW,
+    )
+    assert past_streamed.observed_at == NOW - timedelta(seconds=10)
 
     applied = nado.applied_cumulative_funding_quote(
         n_market,

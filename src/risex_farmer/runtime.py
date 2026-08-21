@@ -304,7 +304,6 @@ class PublicPaperRuntime:
         self._trade_stream_ready: set[tuple[Venue, str]] = set()
         self._live_book_ready: set[tuple[Venue, str]] = set()
         self._last_readiness_evidence_at: dict[Venue, datetime] = {}
-        self._extended_trade_sequences: dict[str, int] = {}
         self._extended_confirmed_at: dict[tuple[str, str], datetime] = {}
         self._combined_symbols: dict[Venue, tuple[str, ...]] = {}
         self.next_health_check_at: datetime | None = None
@@ -526,13 +525,20 @@ class PublicPaperRuntime:
         by_symbol: dict[str, list[VenueReadiness]] = {}
         for name, row in components.items():
             _, separator, symbol = name.partition(":")
-            if separator:
+            if separator and not (
+                venue is Venue.EXTENDED and name.startswith("applied_funding:")
+            ):
                 by_symbol.setdefault(symbol, []).append(row)
         symbol_ready = not by_symbol or any(
             all(row.available for row in rows) for rows in by_symbol.values()
         )
         available_now = (catalog is None or catalog.available) and symbol_ready
-        failed = next((row for row in components.values() if not row.available), None)
+        failed = next((
+            row for name, row in components.items()
+            if not row.available and not (
+                venue is Venue.EXTENDED and name.startswith("applied_funding:")
+            )
+        ), None)
         self._set_readiness(
             venue,
             available_now,
@@ -551,6 +557,24 @@ class PublicPaperRuntime:
             if name.endswith(f":{symbol}")
         )
 
+    def _extended_stream_components_available(
+        self, symbol: str, kind: str
+    ) -> bool:
+        components = self.component_readiness.get(Venue.EXTENDED, {})
+        return all(
+            row.available
+            for name, row in components.items()
+            if name in {f"{kind}:{symbol}", f"connection_{kind}:{symbol}"}
+        )
+
+    def _extended_stream_connection_available(
+        self, symbol: str, kind: str
+    ) -> bool:
+        row = self.component_readiness.get(Venue.EXTENDED, {}).get(
+            f"connection_{kind}:{symbol}"
+        )
+        return row is not None and row.available
+
     def _remove_obsolete_components(
         self, venue: Venue, relevant_symbols: set[str], at: datetime
     ) -> None:
@@ -565,13 +589,20 @@ class PublicPaperRuntime:
         by_symbol: dict[str, list[VenueReadiness]] = {}
         for name, row in components.items():
             _, separator, symbol = name.partition(":")
-            if separator:
+            if separator and not (
+                venue is Venue.EXTENDED and name.startswith("applied_funding:")
+            ):
                 by_symbol.setdefault(symbol, []).append(row)
         symbol_ready = not by_symbol or any(
             all(row.available for row in rows) for rows in by_symbol.values()
         )
         available = (catalog is None or catalog.available) and symbol_ready
-        failed = next((row for row in components.values() if not row.available), None)
+        failed = next((
+            row for name, row in components.items()
+            if not row.available and not (
+                venue is Venue.EXTENDED and name.startswith("applied_funding:")
+            )
+        ), None)
         self._set_readiness(
             venue,
             available,
@@ -1033,18 +1064,29 @@ class PublicPaperRuntime:
             health = self.coordinator.stream(
                 observation.market.venue, observation.market.venue_symbol
             ).health(logical_at)
-            if not self._symbol_components_available(
+            book_components_available = self._symbol_components_available(
                 observation.market.venue, observation.market.venue_symbol
-            ) or (
-                not refresh
-                and (observation.market.venue, observation.market.venue_symbol)
-                not in self._trade_stream_ready
-            ):
+            )
+            if observation.market.venue is Venue.EXTENDED:
+                book_components_available = self._extended_stream_components_available(
+                    observation.market.venue_symbol, "book"
+                )
+            if not book_components_available:
                 health = replace(
                     health, stream_connected=False, data_quality=DataQuality.DEGRADED
                 )
+            trade_stream_ready = refresh or (
+                observation.market.venue, observation.market.venue_symbol
+            ) in self._trade_stream_ready
+            funding_stream_ready = True
+            if observation.market.venue is Venue.EXTENDED:
+                funding_stream_ready = refresh or self._extended_stream_connection_available(
+                    observation.market.venue_symbol, "funding"
+                )
             normalized.append(replace(
-                observation, market=market, funding=funding, health=health
+                observation, market=market, funding=funding, health=health,
+                trade_stream_ready=trade_stream_ready,
+                funding_stream_ready=funding_stream_ready,
             ))
         snapshot = await scan_once(normalized, logical_at, config=self.config)
         persist_scan = (
@@ -1218,14 +1260,23 @@ class PublicPaperRuntime:
         row = self.observations[(venue, symbol)]
         stream = self.coordinator.stream(venue, symbol)
         health = stream.health(at)
-        if (
-            not self._symbol_components_available(venue, symbol)
-            or (venue, symbol) not in self._trade_stream_ready
-        ):
+        book_components_available = self._symbol_components_available(venue, symbol)
+        if venue is Venue.EXTENDED:
+            book_components_available = self._extended_stream_components_available(
+                symbol, "book"
+            )
+        if not book_components_available:
             health = replace(
                 health, stream_connected=False, data_quality=DataQuality.DEGRADED
             )
-        return replace(row, book=stream.book(), health=health)
+        return replace(
+            row, book=stream.book(), health=health,
+            trade_stream_ready=(venue, symbol) in self._trade_stream_ready,
+            funding_stream_ready=(
+                venue is not Venue.EXTENDED
+                or self._extended_stream_connection_available(symbol, "funding")
+            ),
+        )
 
     def _route_observations(
         self, plan: RoutePlan, at: datetime
@@ -1815,6 +1866,8 @@ class PublicPaperRuntime:
         exception_detail = "" if exception is None else f":{str(exception)[:120]}"
         if stream_kind in {"combined", "public", "health"}:
             affected = ("book", "trade", "funding", "connection_combined")
+        elif venue is Venue.EXTENDED and stream_kind == "funding":
+            affected = ("applied_funding", "connection_funding")
         else:
             affected = (stream_kind, f"connection_{stream_kind}")
         for component in affected:
@@ -1873,8 +1926,9 @@ class PublicPaperRuntime:
             self._trade_stream_ready.add((Venue.EXTENDED, symbol))
         elif kind == "book":
             self._live_book_ready.add((Venue.EXTENDED, symbol))
+        data_component = "applied_funding" if kind == "funding" else kind
         self._set_component_readiness(
-            Venue.EXTENDED, f"{kind}:{symbol}", True,
+            Venue.EXTENDED, f"{data_component}:{symbol}", True,
             f"PUBLIC_{kind.upper()}_STREAM_READY", at,
         )
 
@@ -2322,6 +2376,8 @@ class PublicPaperRuntime:
             try:
                 async with self._session.ws_connect(url, heartbeat=None, autoping=False) as ws:
                     session_established = True
+                    last_trade_sequence: int | None = None
+                    trade_discontinuity_recorded = False
                     self._confirm_extended_stream(
                         symbol, kind, self.clock.now(), data_ready=False
                     )
@@ -2331,18 +2387,19 @@ class PublicPaperRuntime:
                     self._watchdog_restarted(
                         socket_identity, at=self.clock.now()
                     )
-                    delay = 1
                     ordinal = 0
                     heartbeat = asyncio.create_task(self._extended_heartbeat(ws))
                     try:
                         async for message in ws:
                             if message.type is aiohttp.WSMsgType.PING:
                                 await ws.pong(message.data)
+                                delay = 1
                                 self._confirm_extended_stream(
                                     symbol, kind, self.clock.now(), data_ready=False
                                 )
                                 continue
                             if message.type is aiohttp.WSMsgType.PONG:
+                                delay = 1
                                 self._confirm_extended_stream(
                                     symbol, kind, self.clock.now(), data_ready=False
                                 )
@@ -2359,24 +2416,56 @@ class PublicPaperRuntime:
                                 healthy = await self.apply_book_event(
                                     adapter.normalize_book_message(payload)
                                 )
+                                delay = 1
                                 if healthy:
                                     self._confirm_extended_stream(
                                         symbol, kind, self.clock.now(), data_ready=True
                                     )
                             elif kind == "trade":
+                                received_at = self.clock.now()
                                 sequence, trades = adapter.normalize_trade_message(
-                                    payload, received_at=self.clock.now(),
+                                    payload, received_at=received_at,
                                     session_id=str(id(ws)), starting_ordinal=ordinal,
                                 )
-                                previous = self._extended_trade_sequences.get(symbol)
+                                ordinal += len(trades)
+                                previous = last_trade_sequence
                                 if previous is not None and sequence != previous + 1:
-                                    raise ValueError("Extended trade sequence gap")
-                                self._extended_trade_sequences[symbol] = sequence
+                                    if not trade_discontinuity_recorded:
+                                        forward = sequence > previous + 1
+                                        self._record(
+                                            "PUBLIC_TRADE_SEQUENCE_DISCONTINUITY",
+                                            at=received_at,
+                                            venue=Venue.EXTENDED,
+                                            detail={
+                                                "action": (
+                                                    "ACCEPT_MONOTONIC" if forward
+                                                    else "IGNORE_NON_MONOTONIC"
+                                                ),
+                                                "classification": (
+                                                    "FORWARD_GAP" if forward else (
+                                                        "DUPLICATE" if sequence == previous
+                                                        else "OUT_OF_ORDER"
+                                                    )
+                                                ),
+                                                "current_sequence": sequence,
+                                                "previous_sequence": previous,
+                                                "stream": "trade",
+                                                "symbol": symbol,
+                                            },
+                                        )
+                                        trade_discontinuity_recorded = True
+                                    if sequence <= previous:
+                                        delay = 1
+                                        self._confirm_extended_stream(
+                                            symbol, kind, received_at, data_ready=True
+                                        )
+                                        continue
+                                last_trade_sequence = sequence
+                                delay = 1
                                 self._confirm_extended_stream(
-                                    symbol, kind, self.clock.now(), data_ready=True
+                                    symbol, kind, received_at, data_ready=True
                                 )
                                 for trade in trades:
-                                    ordinal += 1
                                     await self.deliver_trade(trade)
                             else:
                                 row = self.observations.get((Venue.EXTENDED, symbol))
@@ -2384,6 +2473,7 @@ class PublicPaperRuntime:
                                     settlement = adapter.normalize_applied_funding_message(
                                         payload, row.market,
                                     )
+                                    delay = 1
                                     self._confirm_extended_stream(
                                         symbol, kind, self.clock.now(), data_ready=True
                                     )
@@ -2500,6 +2590,7 @@ class PublicPaperRuntime:
                             row = self.observations.get((venue, symbol))
                             mid = self._book_mid(venue, symbol)
                             if row is not None:
+                                received_at = self.clock.now()
                                 quote = adapter.normalize_funding_rate_message(  # type: ignore[attr-defined]
                                     payload,
                                     row.market,
@@ -2508,7 +2599,8 @@ class PublicPaperRuntime:
                                         if mid is None
                                         else str(mid * Decimal("1000000000000000000"))
                                     ),
-                                    assumed_open_at=self.clock.now(),
+                                    received_at=received_at,
+                                    assumed_open_at=received_at,
                                 )
                                 await self._apply_funding_quote(quote)
                         elif venue is Venue.NADO and "funding_payment" in kind:
@@ -2629,8 +2721,9 @@ class PublicPaperRuntime:
         )
         for key in sorted(wanted - current, key=lambda row: (row[1], row[2])):
             _, symbol, kind = key
+            data_component = "applied_funding" if kind == "funding" else kind
             self._set_component_readiness(
-                Venue.EXTENDED, f"{kind}:{symbol}", False,
+                Venue.EXTENDED, f"{data_component}:{symbol}", False,
                 f"PUBLIC_{kind.upper()}_DATA_PENDING", self.clock.now(),
             )
             self._set_component_readiness(
@@ -2648,7 +2741,6 @@ class PublicPaperRuntime:
         for key in removed:
             self._extended_confirmed_at.pop((key[1], key[2]), None)
             if key[2] == "trade":
-                self._extended_trade_sequences.pop(key[1], None)
                 self._trade_stream_ready.discard((Venue.EXTENDED, key[1]))
             self._pending_socket_episodes.pop(
                 (Venue.EXTENDED, key[2], (key[1],)), None

@@ -253,10 +253,12 @@ class NadoAdapter(PublicAdapter):
         market: CanonicalMarket,
         *,
         index_price_x18: Any | None,
+        received_at: datetime,
         assumed_open_at: datetime,
     ) -> FundingCashQuote:
         message = require_mapping(payload, "funding rate")
-        observed_at = timestamp(message["timestamp"], "nanoseconds")
+        source_observed_at = timestamp(message["timestamp"], "nanoseconds")
+        observed_at = min(source_observed_at, received_at)
         if (
             self._symbols_by_id.get(int(message["product_id"]))
             != market.venue_symbol

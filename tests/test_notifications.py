@@ -226,6 +226,7 @@ def test_full_scan_digest_splits_all_twenty_rows_without_loss() -> None:
     ("CATALOG_STALE", "Extended catalog"),
     ("MARKET_METADATA_STALE", "market metadata stale"),
     ("BOOK_UNHEALTHY", "book stream"),
+    ("TRADE_STREAM_UNHEALTHY", "trade stream"),
     ("FUNDING_ELIGIBILITY_UNKNOWN", "funding"),
 ))
 def test_full_scan_unknown_uses_human_authoritative_label(blocker, label):

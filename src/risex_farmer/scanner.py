@@ -51,6 +51,8 @@ class NoTradeReason:
     STABLECOIN_PARITY_UNKNOWN = "STABLECOIN_PARITY_UNKNOWN"
     VOLUME_UNKNOWN = "VOLUME_UNKNOWN"
     BOOK_UNHEALTHY = "BOOK_UNHEALTHY"
+    TRADE_STREAM_UNHEALTHY = "TRADE_STREAM_UNHEALTHY"
+    FUNDING_STREAM_UNHEALTHY = "FUNDING_STREAM_UNHEALTHY"
     INVALID_BBO = "INVALID_BBO"
     FUNDING_STALE = "FUNDING_STALE"
     FUNDING_ELIGIBILITY_UNKNOWN = "FUNDING_ELIGIBILITY_UNKNOWN"
@@ -69,6 +71,8 @@ class MarketObservation:
     book: OrderBook | None
     funding: FundingCashQuote | None
     health: StreamHealth | None
+    trade_stream_ready: bool = True
+    funding_stream_ready: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -426,6 +430,10 @@ def evaluate_route(
         max_silence_seconds=config.max_market_stream_silence_seconds,
     ):
         reasons.append(NoTradeReason.BOOK_UNHEALTHY)
+    if not risex.trade_stream_ready or not hedge.trade_stream_ready:
+        reasons.append(NoTradeReason.TRADE_STREAM_UNHEALTHY)
+    if not risex.funding_stream_ready or not hedge.funding_stream_ready:
+        reasons.append(NoTradeReason.FUNDING_STREAM_UNHEALTHY)
     for observation in (risex, hedge):
         funding = observation.funding
         if (

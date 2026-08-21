@@ -115,6 +115,8 @@ def _unknown_digest_label(blocker: str) -> str:
         return "Extended catalog"
     if "BOOK" in normalized or "DEPTH" in normalized:
         return "book stream"
+    if "TRADE" in normalized:
+        return "trade stream"
     if "FUNDING" in normalized:
         return "funding"
     if "RISEX" in normalized or "PARITY" in normalized or "MULTIPLIER" in normalized:
