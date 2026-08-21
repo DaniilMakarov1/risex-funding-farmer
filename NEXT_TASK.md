@@ -1,7 +1,7 @@
-# REAL PUBLIC PAPER TRADER READY
+# PAPER-007 — Staged Real-Public Paper Experiment
 
-PAPER-006-FIX — Real Public Scanner and Paper Runtime is accepted at implementation commit `05beec729eee29855ef9fad0c20c1e503649f15f`.
+PAPER-007-FIX-002 — Non-Blocking Public Data Runtime is accepted at implementation commit `25b6a0d34c867bbb891677d6dddfe94407849b38`.
 
-No implementation task is active. Ordinary `scan-once`, continuous `paper-run`, fixture mode, SQLite evidence, and `report` are accepted for paper-only public operation.
+No implementation task is active. PAPER-007 Stage A validation is authorized on a fresh experiment database. Stage B may begin only after Stage A PASS and must retain the accepted strategy unchanged.
 
-PAPER-007 is not authorized and must not start automatically. Live trading remains prohibited and requires a separate specification and explicit user decision.
+Paper-only public endpoints remain mandatory. Real orders, private/authenticated endpoints, credentials, API keys, and live trading remain prohibited.
