@@ -2508,6 +2508,7 @@ async def test_extended_applied_record_preserves_future_quote_and_is_exact_idemp
             assert plans and plans[0].planned_maker_net_pnl_usd is not None
             assert not {
                 "FUNDING_ELIGIBILITY_UNKNOWN", "FUNDING_OPEN_TIME_MISMATCH",
+                "TARGET_CYCLE_ELAPSED",
             }.intersection(plans[0].no_trade_reasons)
             assert repository.connection.execute(
                 "SELECT COUNT(*) FROM funding_settlements WHERE venue='EXTENDED'"
@@ -2654,6 +2655,105 @@ async def test_extended_funding_ws_path_does_not_replace_rest_expected_quote(tmp
 
 
 @pytest.mark.asyncio
+async def test_extended_connection_only_is_blocked_until_each_data_stream_is_valid(tmp_path):
+    clock = FakeClock()
+    target = NOW + timedelta(minutes=5)
+    adapter = GatedExtendedAdapter(clock, settlement_at=target)
+    fakes = adapters(clock, settlement_at=target)
+    fakes[Venue.EXTENDED] = adapter
+    symbol = adapter.market.venue_symbol
+    with PaperRepository(tmp_path / "extended-connection-only.db") as repository:
+        runtime = PublicPaperRuntime(repository, adapters=fakes, clock=clock)
+        await runtime.scan()
+        for venue, market_symbol in runtime.observations:
+            if venue is not Venue.EXTENDED:
+                runtime.mark_trade_stream_connected(venue, market_symbol, at=clock.now())
+                runtime._live_book_ready.add((venue, market_symbol))
+        runtime._session = object()
+        runtime._stop_event = asyncio.Event()
+        started = []
+        runtime._start_extended_stream = lambda market_symbol, kind: started.append(
+            (market_symbol, kind)
+        )
+        await runtime._reconcile_extended_streams()
+        for kind in ("book", "trade", "funding"):
+            runtime._confirm_extended_stream(
+                symbol, kind, clock.now(), data_ready=False
+            )
+        components = runtime.component_readiness[Venue.EXTENDED]
+        assert set(components) >= {
+            f"{kind}:{symbol}" for kind in ("book", "trade", "funding")
+        } | {
+            f"connection_{kind}:{symbol}" for kind in ("book", "trade", "funding")
+        }
+        assert all(
+            components[f"connection_{kind}:{symbol}"].available
+            and not components[f"{kind}:{symbol}"].available
+            for kind in ("book", "trade", "funding")
+        )
+        await runtime.scan(refresh=False, scan_kind="FULL")
+        before = next(
+            row for row in runtime.last_scan.evaluations
+            if row.hedge_venue is Venue.EXTENDED
+        )
+        assert before.planned_maker_net_pnl_usd is None
+
+        await runtime.apply_book_event(OrderBook(
+            Venue.EXTENDED, symbol,
+            (BookLevel(D("99"), D("20")),),
+            (BookLevel(D("101"), D("20")),), clock.now(), 1,
+        ))
+        runtime._confirm_extended_stream(symbol, "book", clock.now(), data_ready=True)
+        clock.advance(1)
+        await runtime.scan(refresh=False, scan_kind="FULL")
+        assert next(
+            row for row in runtime.last_scan.evaluations
+            if row.hedge_venue is Venue.EXTENDED
+        ).planned_maker_net_pnl_usd is None
+        assert components[f"book:{symbol}"].available
+        assert not components[f"trade:{symbol}"].available
+        assert not components[f"funding:{symbol}"].available
+
+        runtime._confirm_extended_stream(symbol, "trade", clock.now(), data_ready=True)
+        clock.advance(1)
+        await runtime.scan(refresh=False, scan_kind="FULL")
+        assert next(
+            row for row in runtime.last_scan.evaluations
+            if row.hedge_venue is Venue.EXTENDED
+        ).planned_maker_net_pnl_usd is None
+        assert components[f"trade:{symbol}"].available
+        assert not components[f"funding:{symbol}"].available
+
+        record = adapter.normalize_applied_funding_message({
+            "ts": int(clock.now().timestamp() * 1000), "seq": 1,
+            "data": {
+                "m": symbol, "T": int(target.timestamp() * 1000), "f": "0.001",
+            },
+        }, adapter.market)
+        assert record is not None
+        runtime._confirm_extended_stream(symbol, "funding", clock.now(), data_ready=True)
+        await runtime._apply_extended_funding_record(record)
+        clock.advance(1)
+        await runtime.scan(refresh=False, scan_kind="FULL")
+        after = next(
+            row for row in runtime.last_scan.evaluations
+            if row.hedge_venue is Venue.EXTENDED
+        )
+        assert after.planned_maker_net_pnl_usd is not None
+        assert all(
+            components[f"{name}:{symbol}"].available
+            for name in (
+                "book", "connection_book", "trade", "connection_trade",
+                "funding", "connection_funding",
+            )
+        )
+        await runtime.shutdown()
+    assert sorted(kind for market_symbol, kind in started) == [
+        "book", "funding", "trade",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_two_extended_markets_keep_expected_funding_across_full_scans(tmp_path):
     clock = FakeClock()
     target = NOW + timedelta(minutes=5)
@@ -2723,6 +2823,15 @@ async def test_two_extended_markets_keep_expected_funding_across_full_scans(tmp_
                 "SELECT COUNT(*) FROM runtime_evidence WHERE event_type='PUBLIC_SCAN' "
                 "AND json_extract(detail,'$.scan_kind')='FULL'"
             ).fetchone()[0]
+            for market in extended.rows:
+                components = runtime.component_readiness[Venue.EXTENDED]
+                assert all(
+                    components[f"{name}:{market.venue_symbol}"].available
+                    for name in (
+                        "book", "connection_book", "trade", "connection_trade",
+                        "funding", "connection_funding",
+                    )
+                )
     assert full_count == 2
     assert len(plans) == 4
     assert all(plan.planned_maker_net_pnl_usd is not None for plan in plans)

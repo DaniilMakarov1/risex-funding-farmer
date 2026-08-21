@@ -2322,12 +2322,16 @@ class PublicPaperRuntime:
         )
         for key in sorted(wanted - current, key=lambda row: (row[1], row[2])):
             _, symbol, kind = key
+            self._set_component_readiness(
+                Venue.EXTENDED, f"{kind}:{symbol}", False,
+                f"PUBLIC_{kind.upper()}_DATA_PENDING", self.clock.now(),
+            )
+            self._set_component_readiness(
+                Venue.EXTENDED, f"connection_{kind}:{symbol}", False,
+                f"PUBLIC_{kind.upper()}_CONNECTION_PENDING", self.clock.now(),
+            )
             if kind == "book":
                 self.coordinator.stream(Venue.EXTENDED, symbol).gap()
-                self._set_component_readiness(
-                    Venue.EXTENDED, f"book:{symbol}", False,
-                    "PUBLIC_WS_SNAPSHOT_PENDING", self.clock.now(),
-                )
             self._start_extended_stream(symbol, kind)
             self._record(
                 "PUBLIC_STREAM_ADDED", venue=Venue.EXTENDED,
