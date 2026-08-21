@@ -9,4 +9,4 @@
 - Product phase: PAPER ONLY
 - Live trading: prohibited
 
-FIX-003 is accepted after 132 deterministic tests and a short public-only smoke. Physical sockets now persist one ordered `PUBLIC_SOCKET_DISCONNECTED` / `PUBLIC_SOCKET_RECONNECTED` pair per episode; combined RISEx/Nado sockets use one ordered market-set identity, while book gaps retain only snapshot-recovery evidence. Stage A timing remains accepted and was not repeated.
+FIX-003 is accepted after 133 deterministic tests and a short public-only smoke. Physical sockets now persist one ordered `PUBLIC_SOCKET_DISCONNECTED` / `PUBLIC_SOCKET_RECONNECTED` pair per episode; combined RISEx/Nado sockets use one ordered market-set identity, while book gaps retain only snapshot-recovery evidence. Stage A timing remains accepted and was not repeated.
