@@ -276,9 +276,10 @@ class PublicPaperRuntime:
         self._refresh_task: asyncio.Task[None] | None = None
         self._recovery_tasks: dict[tuple[Venue, str], asyncio.Task[None]] = {}
         self._recovery_buffers: dict[tuple[Venue, str], list[BookDelta]] = {}
-        self._pending_disconnect_episodes: dict[
-            tuple[Venue, str, str], datetime
+        self._pending_socket_episodes: dict[
+            tuple[Venue, str, tuple[str, ...]], dict[str, object]
         ] = {}
+        self._socket_episode_number = 0
         self._stop_event: asyncio.Event | None = None
         self._attempt_number = 0
         self._nado_cumulative_funding: dict[tuple[str, str], object] = {}
@@ -1374,9 +1375,6 @@ class PublicPaperRuntime:
         stream_kind: str = "public", exception: BaseException | None = None,
     ) -> None:
         now = at or self.clock.now()
-        self._pending_disconnect_episodes.setdefault(
-            (venue, symbol, stream_kind), now
-        )
         invalidates_book = stream_kind in {"book", "combined", "health", "public"}
         invalidates_trade = stream_kind in {"trade", "combined", "health", "public"}
         if invalidates_trade:
@@ -1395,14 +1393,12 @@ class PublicPaperRuntime:
                 venue, f"{component}:{symbol}", False,
                 f"PUBLIC_STREAM_DISCONNECTED:{stream_kind}:{exception_name}{exception_detail}", now,
             )
-        self._record(
-            (
-                "PUBLIC_BOOK_RESYNC_REQUIRED"
-                if stream_kind == "book" else "PUBLIC_SOCKET_DISCONNECTED"
-            ),
-            at=now, venue=venue,
-            detail={"symbol": symbol, "stream": stream_kind},
-        )
+        if stream_kind == "book":
+            self._record(
+                "PUBLIC_BOOK_RESYNC_REQUIRED",
+                at=now, venue=venue,
+                detail={"symbol": symbol, "stream": stream_kind},
+            )
         if self.broker is not None and self.broker.state.lifecycle_state is LifecycleState.ENTRY_MAKER_OPEN:
             order = self.broker.state.order
             assert order is not None
@@ -1432,24 +1428,49 @@ class PublicPaperRuntime:
                     recorded_at=now, lifecycle_snapshot=self.lifecycle.snapshot
                 )
 
-    def _mark_stream_reconnected(
-        self, venue: Venue, symbol: str, stream_kind: str, *, at: datetime
+    def _socket_disconnected(
+        self,
+        identity: tuple[Venue, str, tuple[str, ...]],
+        *,
+        at: datetime,
     ) -> None:
-        episode = self._pending_disconnect_episodes.pop(
-            (venue, symbol, stream_kind), None
-        )
-        if episode is None:
+        if identity in self._pending_socket_episodes:
             return
+        venue, stream_kind, markets = identity
+        self._socket_episode_number += 1
+        detail: dict[str, object] = {
+            "episode_id": (
+                f"{venue.value}:{stream_kind}:{at.astimezone(UTC).isoformat()}:"
+                f"{self._socket_episode_number}"
+            ),
+            "stream_kind": stream_kind,
+        }
+        if stream_kind == "combined":
+            detail["markets"] = list(markets)
+        else:
+            detail["market"] = markets[0]
+        self._pending_socket_episodes[identity] = detail
         self._record(
-            "PUBLIC_STREAM_RECONNECTED",
+            "PUBLIC_SOCKET_DISCONNECTED",
             at=at,
             venue=venue,
-            detail={
-                "market": symbol,
-                "stream_kind": stream_kind,
-                "recovered_at": at.isoformat(),
-            },
+            detail=detail,
         )
+
+    def _socket_reconnected(
+        self,
+        identity: tuple[Venue, str, tuple[str, ...]],
+        *,
+        at: datetime,
+    ) -> None:
+        detail = self._pending_socket_episodes.pop(identity, None)
+        if detail is not None:
+            self._record(
+                "PUBLIC_SOCKET_RECONNECTED",
+                at=at,
+                venue=identity[0],
+                detail=detail,
+            )
 
     async def recover_snapshot(self, book: OrderBook, *, at: datetime | None = None) -> None:
         now = at or self.clock.now()
@@ -1491,10 +1512,6 @@ class PublicPaperRuntime:
                 self.repository.save_decision(
                     recorded_at=now, lifecycle_snapshot=self.lifecycle.snapshot
                 )
-        self._mark_stream_reconnected(
-            book.venue, book.canonical_market, "book", at=now
-        )
-
     async def apply_book_event(self, event: OrderBook | BookDelta) -> None:
         now = self.clock.now()
         self.coordinator.stream(event.venue, event.canonical_market).connection_confirmed(now)
@@ -1667,6 +1684,7 @@ class PublicPaperRuntime:
         self, adapter: ExtendedAdapter, symbol: str, kind: str
     ) -> None:
         assert self._session is not None
+        socket_identity = (Venue.EXTENDED, kind, (symbol,))
         url = {
             "book": adapter.orderbook_stream_url(symbol),
             "trade": adapter.trades_stream_url(symbol),
@@ -1674,8 +1692,10 @@ class PublicPaperRuntime:
         }[kind]
         delay = 1
         while self._stop_event is not None and not self._stop_event.is_set():
+            session_established = False
             try:
                 async with self._session.ws_connect(url, heartbeat=None, autoping=False) as ws:
+                    session_established = True
                     self.coordinator.stream(Venue.EXTENDED, symbol).connected(self.clock.now())
                     if kind == "trade":
                         self.mark_trade_stream_connected(Venue.EXTENDED, symbol)
@@ -1688,9 +1708,9 @@ class PublicPaperRuntime:
                             Venue.EXTENDED, f"{kind}:{symbol}", True,
                             "PUBLIC_STREAM_CONNECTED", self.clock.now(),
                         )
-                        self._mark_stream_reconnected(
-                            Venue.EXTENDED, symbol, kind, at=self.clock.now()
-                        )
+                    self._socket_reconnected(
+                        socket_identity, at=self.clock.now()
+                    )
                     delay = 1
                     ordinal = 0
                     async for message in ws:
@@ -1727,7 +1747,15 @@ class PublicPaperRuntime:
                                 await self._apply_funding_quote(quote)
                     if self._stop_event is None or not self._stop_event.is_set():
                         raise ConnectionError("public websocket closed")
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
+                if self._stop_event is not None and self._stop_event.is_set():
+                    break
+                if session_established:
+                    self._socket_disconnected(
+                        socket_identity, at=self.clock.now()
+                    )
                 await self.mark_disconnected(Venue.EXTENDED, symbol, stream_kind=kind, exception=exc)
                 await self._sleep(delay)
                 delay = min(delay * 2, 30)
@@ -1736,14 +1764,18 @@ class PublicPaperRuntime:
         self, venue: Venue, adapter: PublicAdapter, symbols: tuple[str, ...]
     ) -> None:
         assert self._session is not None
+        ordered_symbols = tuple(sorted(symbols))
+        socket_identity = (venue, "combined", ordered_symbols)
         delay = 1
         if not symbols:
             return
         while self._stop_event is not None and not self._stop_event.is_set():
+            session_established = False
             try:
                 async with self._session.ws_connect(
                     adapter.ws_base, heartbeat=10, autoping=False, compress=15
                 ) as ws:
+                    session_established = True
                     if venue is Venue.RISEX:
                         ids = [adapter.market_id(symbol) for symbol in symbols]  # type: ignore[attr-defined]
                         await ws.send_json(adapter.orderbook_subscription(ids))  # type: ignore[attr-defined]
@@ -1753,6 +1785,9 @@ class PublicPaperRuntime:
                             product = adapter.product_id(symbol)  # type: ignore[attr-defined]
                             for kind in ("book_depth", "trade", "funding_rate", "funding_payment"):
                                 await ws.send_json(adapter.subscription(kind, product))  # type: ignore[attr-defined]
+                    self._socket_reconnected(
+                        socket_identity, at=self.clock.now()
+                    )
                     for symbol in symbols:
                         self.coordinator.stream(venue, symbol).connected(self.clock.now())
                         self.mark_trade_stream_connected(venue, symbol)
@@ -1769,9 +1804,6 @@ class PublicPaperRuntime:
                                 venue, f"{component}:{symbol}", True,
                                 "PUBLIC_STREAM_CONNECTED", self.clock.now(),
                             )
-                        self._mark_stream_reconnected(
-                            venue, symbol, "combined", at=self.clock.now()
-                        )
                     delay = 1
                     ordinal = 0
                     async for message in ws:
@@ -1840,7 +1872,15 @@ class PublicPaperRuntime:
                                 await self._apply_funding_quote(quote)
                     if self._stop_event is None or not self._stop_event.is_set():
                         raise ConnectionError("public websocket closed")
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
+                if self._stop_event is not None and self._stop_event.is_set():
+                    break
+                if session_established:
+                    self._socket_disconnected(
+                        socket_identity, at=self.clock.now()
+                    )
                 for symbol in symbols:
                     await self.mark_disconnected(venue, symbol, stream_kind="combined", exception=exc)
                 await self._sleep(delay)
@@ -1889,6 +1929,9 @@ class PublicPaperRuntime:
             if wanted == current and task is not None and not task.done():
                 continue
             if task is not None:
+                self._pending_socket_episodes.pop(
+                    (venue, "combined", tuple(sorted(current))), None
+                )
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
                 self._stream_tasks.pop(key, None)
@@ -1940,6 +1983,9 @@ class PublicPaperRuntime:
             )
         removed = current - wanted
         for key in removed:
+            self._pending_socket_episodes.pop(
+                (Venue.EXTENDED, key[2], (key[1],)), None
+            )
             self._stream_tasks[key].cancel()
         if removed:
             await asyncio.gather(
@@ -2043,6 +2089,7 @@ class PublicPaperRuntime:
             await asyncio.gather(*owned, return_exceptions=True)
         self._stream_tasks.clear()
         self._recovery_tasks.clear()
+        self._pending_socket_episodes.clear()
         self._recovery_buffers.clear()
         self._refresh_task = None
 

@@ -300,9 +300,16 @@ class GatedExtendedAdapter(ExtendedAdapter):
 
 
 class ClosingWebSocket:
-    def __init__(self, stop_event: asyncio.Event, *, stop_on_iteration: bool) -> None:
+    def __init__(
+        self,
+        stop_event: asyncio.Event,
+        *,
+        stop_on_iteration: bool,
+        fail_subscription: bool = False,
+    ) -> None:
         self.stop_event = stop_event
         self.stop_on_iteration = stop_on_iteration
+        self.fail_subscription = fail_subscription
 
     async def __aenter__(self):
         return self
@@ -319,18 +326,35 @@ class ClosingWebSocket:
         raise StopAsyncIteration
 
     async def send_json(self, _payload) -> None:
+        if self.fail_subscription:
+            raise ConnectionError("synthetic subscription failure")
+
+
+class FailedConnection:
+    async def __aenter__(self):
+        raise ConnectionError("synthetic context failure")
+
+    async def __aexit__(self, *_):
         return None
 
 
 class ReconnectingSession:
-    def __init__(self, stop_event: asyncio.Event) -> None:
+    def __init__(
+        self, stop_event: asyncio.Event, outcomes: tuple[str, ...] = ("eof", "stop")
+    ) -> None:
         self.stop_event = stop_event
+        self.outcomes = outcomes
         self.connections = 0
 
     def ws_connect(self, *_args, **_kwargs):
+        outcome = self.outcomes[self.connections]
         self.connections += 1
+        if outcome == "fail_context":
+            return FailedConnection()
         return ClosingWebSocket(
-            self.stop_event, stop_on_iteration=self.connections == 2
+            self.stop_event,
+            stop_on_iteration=outcome == "stop",
+            fail_subscription=outcome == "fail_subscription",
         )
 
 
@@ -1219,10 +1243,15 @@ async def test_sequence_gap_fetches_snapshot_and_reconnect_restores_readiness(tm
                 "SELECT COUNT(*) FROM runtime_evidence "
                 "WHERE event_type='PUBLIC_SOCKET_DISCONNECTED'"
             ).fetchone()[0]
+            socket_reconnects = repository.connection.execute(
+                "SELECT COUNT(*) FROM runtime_evidence "
+                "WHERE event_type='PUBLIC_SOCKET_RECONNECTED'"
+            ).fetchone()[0]
     assert fakes[Venue.EXTENDED].calls.count("book") == 1
     assert runtime.coordinator.stream(Venue.EXTENDED, market.venue_symbol).book().sequence == 11
     assert state.available and state.detail == "PUBLIC_STREAM_RECOVERED"
-    assert book_resyncs == 1 and socket_disconnects == 0
+    assert book_resyncs == 1
+    assert socket_disconnects == 0 and socket_reconnects == 0
 
 
 @pytest.mark.asyncio
@@ -1239,7 +1268,8 @@ async def test_nado_recovery_buffers_and_replays_newer_continuous_delta(tmp_path
             await runtime.recover_snapshot(await gated.fetch_book(symbol))
             assert repository.connection.execute(
                 "SELECT COUNT(*) FROM runtime_evidence "
-                "WHERE event_type='PUBLIC_STREAM_RECONNECTED'"
+                "WHERE event_type IN "
+                "('PUBLIC_SOCKET_DISCONNECTED','PUBLIC_SOCKET_RECONNECTED')"
             ).fetchone()[0] == 0
             baseline_book_calls = gated.calls.count("book")
             gated.block_recovery = True
@@ -1269,23 +1299,19 @@ async def test_nado_recovery_buffers_and_replays_newer_continuous_delta(tmp_path
                 "SELECT detail FROM runtime_evidence "
                 "WHERE event_type='PUBLIC_SNAPSHOT_RECOVERY_COMPLETED'"
             ).fetchone()
-            reconnects = repository.connection.execute(
-                "SELECT venue,detail FROM runtime_evidence "
-                "WHERE event_type='PUBLIC_STREAM_RECONNECTED'"
-            ).fetchall()
+            socket_lifecycle_count = repository.connection.execute(
+                "SELECT COUNT(*) FROM runtime_evidence "
+                "WHERE event_type IN "
+                "('PUBLIC_SOCKET_DISCONNECTED','PUBLIC_SOCKET_RECONNECTED')"
+            ).fetchone()[0]
     assert book.sequence == 3
     assert gated.calls.count("book") == baseline_book_calls + 1
     assert json.loads(evidence["detail"])["replayed"] == 2
-    assert len(reconnects) == 1 and reconnects[0]["venue"] == "NADO"
-    assert json.loads(reconnects[0]["detail"]) == {
-        "market": symbol,
-        "stream_kind": "book",
-        "recovered_at": clock.now().isoformat(),
-    }
+    assert socket_lifecycle_count == 0
 
 
 @pytest.mark.asyncio
-async def test_clean_extended_ws_close_opens_one_episode_and_reconnects_once(tmp_path):
+async def test_extended_eof_persists_one_ordered_physical_socket_episode(tmp_path):
     clock = FakeClock()
     stop = asyncio.Event()
     session = ReconnectingSession(stop)
@@ -1300,25 +1326,33 @@ async def test_clean_extended_ws_close_opens_one_episode_and_reconnects_once(tmp
         await runtime._extended_stream(
             ExtendedAdapter(None), "ABC-EXTENDED", "trade"
         )
-        reconnects = repository.connection.execute(
-            "SELECT venue,detail FROM runtime_evidence "
-            "WHERE event_type='PUBLIC_STREAM_RECONNECTED'"
+        await runtime.shutdown()
+        lifecycle = repository.connection.execute(
+            "SELECT event_type,venue,detail FROM runtime_evidence "
+            "WHERE event_type IN "
+            "('PUBLIC_SOCKET_DISCONNECTED','PUBLIC_SOCKET_RECONNECTED') "
+            "ORDER BY evidence_id"
         ).fetchall()
     assert session.connections == 2
-    assert len(reconnects) == 1 and reconnects[0]["venue"] == "EXTENDED"
-    assert json.loads(reconnects[0]["detail"]) == {
-        "market": "ABC-EXTENDED",
-        "stream_kind": "trade",
-        "recovered_at": NOW.isoformat(),
-    }
+    assert [row["event_type"] for row in lifecycle] == [
+        "PUBLIC_SOCKET_DISCONNECTED", "PUBLIC_SOCKET_RECONNECTED",
+    ]
+    assert {row["venue"] for row in lifecycle} == {"EXTENDED"}
+    details = [json.loads(row["detail"]) for row in lifecycle]
+    assert details[0] == details[1]
+    assert details[0]["episode_id"].startswith("EXTENDED:trade:")
+    assert details[0]["stream_kind"] == "trade"
+    assert details[0]["market"] == "ABC-EXTENDED"
 
 
 @pytest.mark.asyncio
-async def test_combined_reconnect_emits_once_for_each_affected_market(tmp_path):
+async def test_combined_socket_uses_one_episode_for_sorted_market_set(tmp_path):
     clock = FakeClock()
     stop = asyncio.Event()
-    session = ReconnectingSession(stop)
-    symbols = ("ABC-NADO", "XYZ-NADO")
+    session = ReconnectingSession(
+        stop, outcomes=("eof", "fail_subscription", "stop")
+    )
+    symbols = ("XYZ-NADO", "ABC-NADO")
     adapter = CombinedFakeAdapter(
         Venue.NADO, clock, settlement_at=NOW + timedelta(minutes=5)
     )
@@ -1331,18 +1365,53 @@ async def test_combined_reconnect_emits_once_for_each_affected_market(tmp_path):
         runtime._session = session
         runtime._stop_event = stop
         await runtime._combined_stream(Venue.NADO, adapter, symbols)
-        reconnects = [
-            json.loads(row[0])
-            for row in repository.connection.execute(
-                "SELECT detail FROM runtime_evidence "
-                "WHERE event_type='PUBLIC_STREAM_RECONNECTED' ORDER BY detail"
-            )
-        ]
-    assert session.connections == 2
-    assert reconnects == [
-        {"market": symbol, "stream_kind": "combined", "recovered_at": NOW.isoformat()}
-        for symbol in symbols
+        lifecycle = repository.connection.execute(
+            "SELECT event_type,venue,detail FROM runtime_evidence "
+            "WHERE event_type IN "
+            "('PUBLIC_SOCKET_DISCONNECTED','PUBLIC_SOCKET_RECONNECTED') "
+            "ORDER BY evidence_id"
+        ).fetchall()
+    assert session.connections == 3
+    assert [row["event_type"] for row in lifecycle] == [
+        "PUBLIC_SOCKET_DISCONNECTED", "PUBLIC_SOCKET_RECONNECTED",
     ]
+    assert {row["venue"] for row in lifecycle} == {"NADO"}
+    details = [json.loads(row["detail"]) for row in lifecycle]
+    assert details[0] == details[1]
+    assert details[0]["episode_id"].startswith("NADO:combined:")
+    assert details[0]["stream_kind"] == "combined"
+    assert details[0]["markets"] == ["ABC-NADO", "XYZ-NADO"]
+
+
+@pytest.mark.asyncio
+async def test_failed_extended_reconnect_attempts_do_not_duplicate_episode(tmp_path):
+    clock = FakeClock()
+    stop = asyncio.Event()
+    session = ReconnectingSession(
+        stop, outcomes=("eof", "fail_context", "fail_context", "stop")
+    )
+
+    async def no_delay(_seconds: float) -> None:
+        await asyncio.sleep(0)
+
+    with PaperRepository(tmp_path / "failed-reconnects.db") as repository:
+        runtime = PublicPaperRuntime(repository, adapters={}, clock=clock, sleep=no_delay)
+        runtime._session = session
+        runtime._stop_event = stop
+        await runtime._extended_stream(
+            ExtendedAdapter(None), "ABC-EXTENDED", "funding"
+        )
+        lifecycle = repository.connection.execute(
+            "SELECT event_type,detail FROM runtime_evidence "
+            "WHERE event_type IN "
+            "('PUBLIC_SOCKET_DISCONNECTED','PUBLIC_SOCKET_RECONNECTED') "
+            "ORDER BY evidence_id"
+        ).fetchall()
+    assert session.connections == 4
+    assert [row["event_type"] for row in lifecycle] == [
+        "PUBLIC_SOCKET_DISCONNECTED", "PUBLIC_SOCKET_RECONNECTED",
+    ]
+    assert json.loads(lifecycle[0]["detail"]) == json.loads(lifecycle[1]["detail"])
 
 
 @pytest.mark.asyncio
@@ -1404,7 +1473,13 @@ async def test_extended_stream_registry_is_dynamic_deduplicated_and_lock_safe(tm
         }
         runtime.broker = None
         await runtime.shutdown()
+        socket_lifecycle_count = repository.connection.execute(
+            "SELECT COUNT(*) FROM runtime_evidence "
+            "WHERE event_type IN "
+            "('PUBLIC_SOCKET_DISCONNECTED','PUBLIC_SOCKET_RECONNECTED')"
+        ).fetchone()[0]
     assert symbols == {original.venue_symbol, added.venue_symbol}
+    assert socket_lifecycle_count == 0
 
 
 @pytest.mark.asyncio
