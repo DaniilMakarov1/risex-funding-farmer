@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 import os
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -28,6 +28,49 @@ class NotificationPayload:
     def __post_init__(self) -> None:
         if self.occurred_at.tzinfo is None:
             raise ValueError("notification time must be timezone-aware")
+
+
+def full_scan_digest_payload(
+    *,
+    scan_at: datetime,
+    opportunity: bool,
+    route_rows: Sequence[Mapping[str, object]],
+) -> NotificationPayload:
+    scan_utc = utc_time(scan_at)
+    status = "OPPORTUNITY" if opportunity else "NO TRADE"
+    lines = [f"Full Scan | Scan UTC: {scan_utc.isoformat()} | Status: {status}"]
+    for row in route_rows[:15]:
+        ticker = _bounded_digest_field(str(row.get("canonical_asset") or "UNKNOWN"), 48)
+        hedge = str(row.get("hedge_venue") or "UNKNOWN")
+        direction = row.get("direction")
+        if direction == "LONG_RISEX_SHORT_HEDGE":
+            route = f"RISEx LONG / {hedge} SHORT"
+        elif direction == "SHORT_RISEX_LONG_HEDGE":
+            route = f"RISEx SHORT / {hedge} LONG"
+        else:
+            route = f"RISEx UNKNOWN / {hedge} UNKNOWN"
+        route = _bounded_digest_field(route, 112)
+        pnl = row.get("planned_maker_net_pnl_usd")
+        pnl_field = (
+            "Expected PnL: UNKNOWN"
+            if pnl is None
+            else f"Expected PnL: ${pnl}"
+        )
+        lines.append(
+            f"{ticker} | {route} | {_bounded_digest_field(pnl_field, 92)}"
+        )
+    text = "\n".join(lines)
+    assert len(text) <= 4096
+    return NotificationPayload(
+        f"full-scan-digest:{scan_utc.isoformat()}",
+        "FULL_SCAN_DIGEST",
+        scan_utc,
+        text,
+    )
+
+
+def _bounded_digest_field(value: str, width: int) -> str:
+    return value if len(value) <= width else value[: width - 1] + "…"
 
 
 class NotificationDelivery(Protocol):

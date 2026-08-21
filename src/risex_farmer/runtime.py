@@ -37,7 +37,12 @@ from .models import (
     TargetFundingCycle,
     Venue,
 )
-from .notifications import NotificationOutbox, NotificationPayload, utc_time
+from .notifications import (
+    NotificationOutbox,
+    NotificationPayload,
+    full_scan_digest_payload,
+    utc_time,
+)
 from .paper_broker import PaperEntryBroker, PaperEntryState
 from .scanner import (
     MarketObservation,
@@ -923,6 +928,12 @@ class PublicPaperRuntime:
         if persist_scan:
             self.repository.save_public_route_rows(logical_at=logical_at, rows=route_rows)
             self._notify_opportunity(snapshot)
+            if self.notifications is not None and scan_kind == "FULL":
+                self.notifications.event(full_scan_digest_payload(
+                    scan_at=logical_at,
+                    opportunity=snapshot.winner is not None,
+                    route_rows=route_rows,
+                ))
         unavailable = {
             venue.value: state.detail
             for venue, state in self.readiness.items()

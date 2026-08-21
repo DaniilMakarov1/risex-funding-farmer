@@ -850,6 +850,122 @@ async def test_opportunity_notifications_copy_authoritative_plan_and_dedupe(tmp_
 
 
 @pytest.mark.asyncio
+async def test_full_scan_digest_uses_persisted_authoritative_route_rows_in_order(tmp_path):
+    clock = FakeClock()
+    fakes = adapters(clock, settlement_at=NOW + timedelta(minutes=5))
+    delivery = CaptureNotifications()
+    with PaperRepository(tmp_path / "full-scan-digest.db") as repository:
+        async with PublicPaperRuntime(
+            repository, adapters=fakes, clock=clock,
+            notifications=NotificationOutbox(delivery),
+        ) as runtime:
+            result = await runtime.scan(scan_kind="FULL")
+            digests = [row for row in delivery.rows if row.kind == "FULL_SCAN_DIGEST"]
+            persisted = repository.connection.execute(
+                "SELECT COUNT(*) FROM scanner_snapshots WHERE logical_at=?",
+                (NOW.isoformat(),),
+            ).fetchone()[0]
+
+    assert persisted == 1
+    assert len(digests) == 1
+    digest = digests[0]
+    assert digest.occurred_at == NOW
+    assert digest.text.splitlines()[0] == (
+        f"Full Scan | Scan UTC: {NOW.isoformat()} | Status: OPPORTUNITY"
+    )
+    route_lines = digest.text.splitlines()[1:]
+    assert len(route_lines) == len(result["routes"])
+    for line, route_row in zip(route_lines, result["routes"]):
+        risex_side = (
+            "LONG"
+            if route_row["direction"] == "LONG_RISEX_SHORT_HEDGE"
+            else "SHORT"
+        )
+        hedge_side = "SHORT" if risex_side == "LONG" else "LONG"
+        expected = (
+            f"{route_row['canonical_asset']} | RISEx {risex_side} / "
+            f"{route_row['hedge_venue']} {hedge_side} | Expected PnL: "
+            f"${route_row['planned_maker_net_pnl_usd']}"
+        )
+        assert line == expected
+
+
+@pytest.mark.asyncio
+async def test_full_scan_digest_keeps_negative_blocked_and_unknown_routes_visible(tmp_path):
+    clock = FakeClock()
+    fakes = adapters(
+        clock, settlement_at=NOW + timedelta(minutes=5), funding="0"
+    )
+    delivery = CaptureNotifications()
+    with PaperRepository(tmp_path / "full-scan-digest-blocked.db") as repository:
+        async with PublicPaperRuntime(
+            repository, adapters=fakes, clock=clock,
+            notifications=NotificationOutbox(delivery),
+        ) as runtime:
+            negative = await runtime.scan(scan_kind="FULL")
+            clock.advance(1)
+            for adapter in fakes.values():
+                adapter.funding_unknown = True
+            unknown = await runtime.scan(scan_kind="FULL")
+
+    digests = [row for row in delivery.rows if row.kind == "FULL_SCAN_DIGEST"]
+    assert len(digests) == 2
+    assert digests[0].text.splitlines()[0].endswith("Status: NO TRADE")
+    assert any(row["blockers"] for row in negative["routes"])
+    assert any(
+        D(row["planned_maker_net_pnl_usd"]) < 0
+        for row in negative["routes"]
+        if row["planned_maker_net_pnl_usd"] is not None
+    )
+    negative_lines = digests[0].text.splitlines()[1:]
+    assert len(negative_lines) == len(negative["routes"])
+    for line, row in zip(negative_lines, negative["routes"]):
+        assert line.startswith(f"{row['canonical_asset']} | RISEx ")
+        assert line.endswith(f"Expected PnL: ${row['planned_maker_net_pnl_usd']}")
+    assert any(row["planned_maker_net_pnl_usd"] is None for row in unknown["routes"])
+    assert len(digests[1].text.splitlines()[1:]) == len(unknown["routes"])
+    assert "Expected PnL: UNKNOWN" in digests[1].text
+
+
+@pytest.mark.asyncio
+async def test_full_scan_digest_never_emits_for_other_scan_kinds(tmp_path):
+    clock = FakeClock()
+    delivery = CaptureNotifications()
+    with PaperRepository(tmp_path / "non-full-scan-digest.db") as repository:
+        async with PublicPaperRuntime(
+            repository,
+            adapters=adapters(clock, settlement_at=NOW + timedelta(minutes=5)),
+            clock=clock, notifications=NotificationOutbox(delivery),
+        ) as runtime:
+            for kind in ("INITIAL", "FOCUSED", "RECOVERY"):
+                await runtime.scan(scan_kind=kind)
+                clock.advance(1)
+    assert not [row for row in delivery.rows if row.kind == "FULL_SCAN_DIGEST"]
+
+
+@pytest.mark.asyncio
+async def test_full_scan_digest_retains_existing_fifteen_row_limit(tmp_path):
+    clock = FakeClock()
+    fakes = {
+        venue: ManyFakeAdapter(
+            venue, clock, settlement_at=NOW + timedelta(minutes=5)
+        )
+        for venue in Venue
+    }
+    delivery = CaptureNotifications()
+    with PaperRepository(tmp_path / "full-scan-digest-fifteen.db") as repository:
+        async with PublicPaperRuntime(
+            repository, adapters=fakes, clock=clock,
+            notifications=NotificationOutbox(delivery),
+        ) as runtime:
+            result = await runtime.scan(scan_kind="FULL")
+    digest = next(row for row in delivery.rows if row.kind == "FULL_SCAN_DIGEST")
+    assert len(result["routes"]) == 15
+    assert len(digest.text.splitlines()[1:]) == 15
+    assert len(digest.text) <= 4096
+
+
+@pytest.mark.asyncio
 async def test_scheduling_full_focused_activation_and_strict_cutoff(tmp_path):
     clock = FakeClock()
     target = NOW + timedelta(seconds=400)

@@ -12,6 +12,7 @@ from risex_farmer.notifications import (
     NotificationOutbox,
     NotificationPayload,
     TelegramDelivery,
+    full_scan_digest_payload,
     outbox_from_environment,
 )
 
@@ -146,6 +147,41 @@ async def test_outbox_deduplicates_events_and_opportunity_semantic_state():
     assert [row.event_id for row in capture.rows] == [
         "event-1", "opportunity-1", "disappeared",
     ]
+
+
+def test_full_scan_digest_event_id_deduplicates_and_text_is_bounded():
+    rows = tuple({
+        "canonical_asset": f"ASSET-{index}-" + "X" * 100,
+        "hedge_venue": "EXTENDED-" + "Y" * 150,
+        "direction": (
+            "LONG_RISEX_SHORT_HEDGE"
+            if index % 2 == 0
+            else "SHORT_RISEX_LONG_HEDGE"
+        ),
+        "planned_maker_net_pnl_usd": "1." + "2" * 150,
+    } for index in range(20))
+    digest = full_scan_digest_payload(
+        scan_at=NOW, opportunity=True, route_rows=rows
+    )
+
+    class Capture:
+        def __init__(self):
+            self.rows = []
+        async def start(self): pass
+        def enqueue(self, row):
+            self.rows.append(row)
+            return True
+        async def close(self): pass
+
+    capture = Capture()
+    outbox = NotificationOutbox(capture)
+    assert outbox.event(digest)
+    assert not outbox.event(digest)
+    assert digest.event_id == f"full-scan-digest:{NOW.isoformat()}"
+    assert len(digest.text) <= 4096
+    route_lines = digest.text.splitlines()[1:]
+    assert len(route_lines) == 15
+    assert all(line.count(" | ") == 2 for line in route_lines)
 
 
 @pytest.mark.asyncio
