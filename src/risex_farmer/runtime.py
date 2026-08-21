@@ -40,6 +40,7 @@ from .models import (
 from .notifications import (
     NotificationOutbox,
     NotificationPayload,
+    format_telegram_money,
     full_scan_digest_payload,
     utc_time,
 )
@@ -433,7 +434,8 @@ class PublicPaperRuntime:
             NotificationPayload(
                 f"opportunity:{state[0]}:{state[1]}:{state[2]}:{at.isoformat()}",
                 "ELIGIBLE_OPPORTUNITY", utc_time(at),
-                f"{plan.canonical_asset} | {route} | Expected PnL: ${pnl} | "
+                f"{plan.canonical_asset} | {route} | "
+                f"Expected PnL: ${format_telegram_money(pnl)} | "
                 f"Scan UTC: {scan_utc}",
                 ticker=plan.canonical_asset, route=route,
                 planned_maker_net_pnl_usd=pnl,
@@ -463,7 +465,8 @@ class PublicPaperRuntime:
             self._notify_event(
                 f"position:{closed.position_id}:closed:{closed.closed_at.isoformat()}",
                 "POSITION_CLOSED", closed.closed_at,
-                f"Paper position closed: {closed.position_id}; final PnL USD {pnl}",
+                f"Paper position closed: {closed.position_id}; "
+                f"final PnL USD {format_telegram_money(pnl)}",
                 final_pnl=pnl,
             )
 
@@ -1517,7 +1520,7 @@ class PublicPaperRuntime:
                     kind, at,
                     f"Funding {'received' if kind == 'FUNDING_RECEIVED' else 'reconciled'}: "
                     f"{after.venue.value} {after.canonical_market} "
-                    f"{after.status.value} USD {after.cash_usd}",
+                    f"{after.status.value} USD {format_telegram_money(after.cash_usd)}",
                 )
 
     def _book_mid(self, venue: Venue, symbol: str) -> Decimal | None:

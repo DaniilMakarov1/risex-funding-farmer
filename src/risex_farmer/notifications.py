@@ -8,7 +8,7 @@ import os
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP, localcontext
 from typing import Protocol
 
 import aiohttp
@@ -28,6 +28,17 @@ class NotificationPayload:
     def __post_init__(self) -> None:
         if self.occurred_at.tzinfo is None:
             raise ValueError("notification time must be timezone-aware")
+
+
+def format_telegram_money(value: Decimal | str | None) -> str:
+    if value is None:
+        return "UNKNOWN"
+    number = value if isinstance(value, Decimal) else Decimal(value)
+    with localcontext() as context:
+        context.prec = max(
+            28, len(number.as_tuple().digits) + 2, number.adjusted() + 3
+        )
+        return str(number.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
 def full_scan_digest_payload(
@@ -51,10 +62,11 @@ def full_scan_digest_payload(
             route = f"RISEx UNKNOWN / {hedge} UNKNOWN"
         route = _bounded_digest_field(route, 112)
         pnl = row.get("planned_maker_net_pnl_usd")
-        pnl_field = (
-            "Expected PnL: UNKNOWN"
-            if pnl is None
-            else f"Expected PnL: ${pnl}"
+        pnl_display = format_telegram_money(
+            None if pnl is None else str(pnl)
+        )
+        pnl_field = "Expected PnL: " + (
+            "UNKNOWN" if pnl_display == "UNKNOWN" else f"${pnl_display}"
         )
         lines.append(
             f"{ticker} | {route} | {_bounded_digest_field(pnl_field, 92)}"

@@ -32,7 +32,11 @@ from risex_farmer.models import (
     Venue,
 )
 from risex_farmer.market_data import BookStream
-from risex_farmer.notifications import NotificationOutbox, TelegramDelivery
+from risex_farmer.notifications import (
+    NotificationOutbox,
+    TelegramDelivery,
+    format_telegram_money,
+)
 from risex_farmer.runtime import PublicPaperRuntime, public_paper_run, public_scan_once
 from risex_farmer.storage import PaperRepository
 
@@ -880,7 +884,8 @@ async def test_opportunity_notifications_copy_authoritative_plan_and_dedupe(tmp_
     assert rows[0].planned_maker_net_pnl_usd == winner.planned_maker_net_pnl_usd
     assert rows[0].text == (
         f"{winner.canonical_asset} | {rows[0].route} | Expected PnL: "
-        f"${winner.planned_maker_net_pnl_usd} | Scan UTC: {NOW.isoformat()}"
+        f"${format_telegram_money(winner.planned_maker_net_pnl_usd)} | "
+        f"Scan UTC: {NOW.isoformat()}"
     )
     assert "RISEx" in rows[0].text
     assert winner.hedge_venue.value in rows[0].text
@@ -925,7 +930,7 @@ async def test_full_scan_digest_uses_persisted_authoritative_route_rows_in_order
         expected = (
             f"{route_row['canonical_asset']} | RISEx {risex_side} / "
             f"{route_row['hedge_venue']} {hedge_side} | Expected PnL: "
-            f"${route_row['planned_maker_net_pnl_usd']}"
+            f"${format_telegram_money(route_row['planned_maker_net_pnl_usd'])}"
         )
         assert line == expected
 
@@ -961,7 +966,9 @@ async def test_full_scan_digest_keeps_negative_blocked_and_unknown_routes_visibl
     assert len(negative_lines) == len(negative["routes"])
     for line, row in zip(negative_lines, negative["routes"]):
         assert line.startswith(f"{row['canonical_asset']} | RISEx ")
-        assert line.endswith(f"Expected PnL: ${row['planned_maker_net_pnl_usd']}")
+        assert line.endswith(
+            f"Expected PnL: ${format_telegram_money(row['planned_maker_net_pnl_usd'])}"
+        )
     assert any(row["planned_maker_net_pnl_usd"] is None for row in unknown["routes"])
     assert len(digests[1].text.splitlines()[1:]) == len(unknown["routes"])
     assert "Expected PnL: UNKNOWN" in digests[1].text
@@ -1647,11 +1654,17 @@ async def test_runtime_lifecycle_notifications_follow_persisted_transitions(tmp_
         assert kinds.count(required) == 1
     closed = next(row for row in delivery.rows if row.kind == "POSITION_CLOSED")
     assert closed.final_pnl_usd == authoritative.simulated_closed_net_pnl_usd
-    assert str(authoritative.simulated_closed_net_pnl_usd) in closed.text
+    assert closed.text.endswith(
+        f"final PnL USD {format_telegram_money(authoritative.simulated_closed_net_pnl_usd)}"
+    )
     received = next(row for row in delivery.rows if row.kind == "FUNDING_RECEIVED")
     reconciled = next(row for row in delivery.rows if row.kind == "FUNDING_RECONCILED")
     assert received.text.startswith("Funding received:")
     assert reconciled.text.startswith("Funding reconciled:")
+    assert received.text.endswith("USD 3.13")
+    assert reconciled.text.endswith("USD 3.25")
+    assert received.event_id.endswith(":ESTIMATED:3.125")
+    assert reconciled.event_id.endswith(":APPLIED_RATE:3.25")
 
 
 @pytest.mark.asyncio
