@@ -27,7 +27,7 @@ NOW = datetime(2027, 8, 1, 12, tzinfo=UTC)
     (Decimal("7.1"), "7.10"),
     (Decimal("1.235"), "1.24"),
     (Decimal("-1.235"), "-1.24"),
-    (Decimal("-0.004"), "-0.00"),
+    (Decimal("-0.004"), "0.00"),
     (Decimal("-0.005"), "-0.01"),
 ))
 def test_telegram_money_has_exactly_two_fractional_digits(value, expected):

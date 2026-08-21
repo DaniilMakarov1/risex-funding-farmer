@@ -38,7 +38,8 @@ def format_telegram_money(value: Decimal | str | None) -> str:
         context.prec = max(
             28, len(number.as_tuple().digits) + 2, number.adjusted() + 3
         )
-        return str(number.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+        rounded = number.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        return "0.00" if rounded.is_zero() else str(rounded)
 
 
 def full_scan_digest_payload(
