@@ -3477,3 +3477,139 @@ async def test_real_runtime_restart_restores_open_position_with_offline_gap(tmp_
             assert restarted.lifecycle.snapshot.data_quality.value == "DEGRADED"
             assert "settlements" in restart_adapters[Venue.RISEX].calls
             assert "settlements" in restart_adapters[Venue.EXTENDED].calls
+
+
+@pytest.mark.asyncio
+async def test_nado_only_initial_then_extended_ready_next_full_has_twenty_routes(tmp_path):
+    clock = FakeClock()
+    target = NOW + timedelta(minutes=10)
+    risex = ManyFakeAdapter(Venue.RISEX, clock, settlement_at=target)
+    nado = ManyFakeAdapter(Venue.NADO, clock, settlement_at=target)
+    precise_tick = D("0.000000000000000001")
+    precise_step = D("0.000000000001")
+    risex.many_markets = tuple(replace(
+        market, tick_size_raw=precise_tick, quantity_step_raw=precise_step,
+        minimum_quantity_raw=precise_step, minimum_notional_usd=D("0"),
+    ) for market in risex.many_markets)
+
+    class TransitionExtended(ExtendedAdapter):
+        def __init__(self):
+            super().__init__(None)
+            source = ManyFakeAdapter(Venue.EXTENDED, clock, settlement_at=target)
+            self.rows = tuple(replace(
+                market, tick_size_raw=precise_tick,
+                quantity_step_raw=precise_step,
+                minimum_quantity_raw=precise_step,
+                minimum_notional_usd=D("0"),
+            ) for market in source.many_markets)
+            self.source = source
+            self.catalog_started = asyncio.Event()
+            self.catalog_gate = asyncio.Event()
+
+        def volumes(self, rows):
+            return tuple(MarketVolume(
+                Venue.EXTENDED, market.venue_symbol, D("1000000"),
+                clock.now(), "official-shaped",
+            ) for market in rows)
+
+        async def fetch_catalog(self):
+            self.catalog_started.set()
+            await self.catalog_gate.wait()
+            return self.rows, self.volumes(self.rows)
+
+        async def fetch_required_catalog(self, venue_symbols):
+            wanted = set(venue_symbols)
+            rows = tuple(row for row in self.rows if row.venue_symbol in wanted)
+            assert len(rows) == len(wanted)
+            return rows, self.volumes(rows)
+
+        async def fetch_book(self, venue_symbol):
+            return OrderBook(
+                Venue.EXTENDED, venue_symbol,
+                (BookLevel(D("8650.514169552906858181"), D("20")),),
+                (BookLevel(D("8651.509081348565110708"), D("20")),),
+                clock.now(), 1,
+            )
+
+        async def fetch_funding_quote(self, market, *, assumed_open_at):
+            return await self.source.fetch_funding_quote(
+                market, assumed_open_at=assumed_open_at,
+            )
+
+        def unknown_funding_quote(self, market, *, observed_at, assumed_open_at):
+            return self.source.unknown_funding_quote(
+                market, observed_at=observed_at, assumed_open_at=assumed_open_at,
+            )
+
+    extended = TransitionExtended()
+
+    async def precise_risex_book(venue_symbol):
+        return OrderBook(
+            Venue.RISEX, venue_symbol,
+            (BookLevel(D("8649.670545193748488977"), D("20")),),
+            (BookLevel(D("8650.561362195468293120"), D("20")),),
+            clock.now(), 1,
+        )
+
+    risex.fetch_book = precise_risex_book
+    with PaperRepository(tmp_path / "nado-to-extended-transition.db") as repository:
+        async with PublicPaperRuntime(
+            repository,
+            adapters={Venue.RISEX: risex, Venue.EXTENDED: extended, Venue.NADO: nado},
+            clock=clock,
+        ) as runtime:
+            runtime._stop_event = asyncio.Event()
+            initial = await runtime.scan(scan_kind="INITIAL")
+            await extended.catalog_started.wait()
+            assert len(initial["routes"]) == 10
+            assert {row["hedge_venue"] for row in initial["routes"]} == {"NADO"}
+
+            extended.catalog_gate.set()
+            assert runtime._extended_universe_task is not None
+            await runtime._extended_universe_task
+            await runtime._refresh_public_data()
+            for venue, symbol in tuple(runtime.observations):
+                adapter = runtime.adapters[venue]
+                await runtime.recover_snapshot(await adapter.fetch_book(symbol))
+                runtime.mark_trade_stream_connected(venue, symbol, at=clock.now())
+                if venue is Venue.EXTENDED:
+                    for kind in ("book", "trade", "funding"):
+                        runtime._confirm_extended_stream(
+                            symbol, kind, clock.now(), data_ready=True,
+                        )
+
+            runtime.next_full_scan_at = NOW + timedelta(seconds=120)
+            runtime.next_health_check_at = NOW + timedelta(seconds=130)
+            clock.advance(120)
+            for venue, symbol in runtime.observations:
+                runtime.coordinator.stream(venue, symbol).connection_confirmed(
+                    clock.now()
+                )
+                if venue is Venue.EXTENDED:
+                    for kind in ("book", "trade", "funding"):
+                        runtime._confirm_extended_stream(
+                            symbol, kind, clock.now(), data_ready=False,
+                        )
+            await runtime.tick(clock.now())
+            routes = repository.report(as_of=clock.now())["latest_routes"]
+            plans = runtime.last_scan.evaluations
+            fatal_count = repository.connection.execute(
+                "SELECT COUNT(*) FROM runtime_evidence "
+                "WHERE event_type IN ('RUNTIME_FATAL','RUNTIME_STOPPED_FATAL')"
+            ).fetchone()[0]
+            await runtime.shutdown()
+
+    assert len(plans) == len(routes) == 20
+    assert {row["hedge_venue"] for row in routes} == {"EXTENDED", "NADO"}
+    assert all(row["planned_maker_net_pnl_usd"] is not None for row in routes)
+    assert all(
+        plan.planned_entry_execution_pnl_usd
+        + plan.planned_exit_execution_pnl_usd
+        == plan.planned_execution_pnl_usd
+        for plan in plans
+    )
+    assert all(
+        set(row["blockers"]) <= {"PLANNED_NET_PNL_NEGATIVE"}
+        for row in routes
+    )
+    assert fatal_count == 0

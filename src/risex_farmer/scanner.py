@@ -437,9 +437,19 @@ def evaluate_route(
     if reasons:
         return _empty_plan(risex, hedge, direction, logical_at, reasons)
 
-    assert route_liquidity is not None
-    assert risex.book is not None and hedge.book is not None
-    assert risex.funding is not None and hedge.funding is not None
+    if route_liquidity is None:
+        return _empty_plan(
+            risex, hedge, direction, logical_at, (NoTradeReason.VOLUME_UNKNOWN,)
+        )
+    if risex.book is None or hedge.book is None:
+        return _empty_plan(
+            risex, hedge, direction, logical_at, (NoTradeReason.BOOK_UNHEALTHY,)
+        )
+    if risex.funding is None or hedge.funding is None:
+        return _empty_plan(
+            risex, hedge, direction, logical_at,
+            (NoTradeReason.FUNDING_ELIGIBILITY_UNKNOWN,),
+        )
     route = Route(
         risex.market.canonical_asset,
         risex.market,
@@ -499,8 +509,16 @@ def evaluate_route(
             risex, hedge, direction, logical_at, reasons, route=route
         )
 
-    assert risex.market.base_multiplier is not None
-    assert hedge.market.base_multiplier is not None
+    if (
+        risex.market.base_multiplier is None
+        or hedge.market.base_multiplier is None
+        or risex.market.base_multiplier <= 0
+        or hedge.market.base_multiplier <= 0
+    ):
+        return _empty_plan(
+            risex, hedge, direction, logical_at,
+            (NoTradeReason.PARITY_OR_MULTIPLIER_UNKNOWN,), route=route,
+        )
     try:
         common_step = common_canonical_quantity_step(
             (
@@ -580,8 +598,14 @@ def evaluate_route(
             (NoTradeReason.INSUFFICIENT_EXACT_DEPTH,),
             route=route,
         )
-    assert risex_entry.price is not None and risex_exit.price is not None
-    assert hedge_buy.price is not None and hedge_sell.price is not None
+    if (
+        risex_entry.price is None or risex_exit.price is None
+        or hedge_buy.price is None or hedge_sell.price is None
+    ):
+        return _empty_plan(
+            risex, hedge, direction, logical_at,
+            (NoTradeReason.INSUFFICIENT_EXACT_DEPTH,), route=route,
+        )
     if not (
         minimum_order_eligible(quantity, risex_entry.price, risex.market)
         and minimum_order_eligible(quantity, risex_exit.price, risex.market)
@@ -604,7 +628,6 @@ def evaluate_route(
     risex_exit_price = risex_exit.price
     if direction is RouteDirection.LONG_RISEX_SHORT_HEDGE:
         entry_execution = quantity * (hedge_entry_price - risex_entry_price)
-        exit_execution = quantity * (risex_exit_price - hedge_exit_price)
         execution = pair_price_pnl_usd(
             quantity,
             risex_entry_price,
@@ -614,7 +637,6 @@ def evaluate_route(
         )
     else:
         entry_execution = quantity * (risex_entry_price - hedge_entry_price)
-        exit_execution = quantity * (hedge_exit_price - risex_exit_price)
         execution = pair_price_pnl_usd(
             quantity,
             hedge_entry_price,
@@ -622,6 +644,10 @@ def evaluate_route(
             risex_entry_price,
             risex_exit_price,
         )
+    # Preserve the authoritative pair calculation while making its presentation
+    # split exact under finite Decimal precision. Algebraically equivalent
+    # regrouping can otherwise differ by one final-context ulp.
+    exit_execution = execution - entry_execution
     planned_entry_fees, planned_exit_fees = _maker_fee_split(
         config, risex.market, hedge.market, quantity,
         risex_entry_price, hedge_entry_price, risex_exit_price, hedge_exit_price,
@@ -664,8 +690,6 @@ def evaluate_route(
     unwind_net = unwind_execution - unwind_fees
     if planned_net < config.paper_entry_min_planned_net_pnl_usd:
         reasons.append(NoTradeReason.PLANNED_NET_PNL_NEGATIVE)
-    if entry_execution + exit_execution != execution:
-        raise AssertionError("planned execution components must equal total execution")
     return RoutePlan(
         canonical_asset=route.canonical_asset,
         risex_market=route.risex_market,
