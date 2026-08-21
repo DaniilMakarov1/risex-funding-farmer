@@ -10,6 +10,7 @@ from collections.abc import Sequence
 from datetime import UTC
 from decimal import Decimal, ROUND_HALF_UP
 
+from .notifications import outbox_from_environment
 from .orchestrator import fixture_scan, load_fixture, run_fixture
 from .runtime import public_paper_run, public_scan_once
 from .storage import PaperRepository
@@ -239,7 +240,10 @@ async def _paper_run(
     repository: PaperRepository, fixture: str | None
 ) -> dict[str, object]:
     if fixture is None:
-        return await public_paper_run(repository)
+        notifications = outbox_from_environment()
+        if notifications is None:
+            return await public_paper_run(repository)
+        return await public_paper_run(repository, notifications=notifications)
     return await run_fixture(load_fixture(fixture), repository)
 
 

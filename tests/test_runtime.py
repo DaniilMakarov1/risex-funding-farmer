@@ -29,12 +29,30 @@ from risex_farmer.models import (
     TradeEvidence,
     Venue,
 )
+from risex_farmer.notifications import NotificationOutbox, TelegramDelivery
 from risex_farmer.runtime import PublicPaperRuntime, public_paper_run, public_scan_once
 from risex_farmer.storage import PaperRepository
 
 
 D = Decimal
 NOW = datetime(2027, 8, 1, 12, tzinfo=UTC)
+
+
+class CaptureNotifications:
+    def __init__(self) -> None:
+        self.rows = []
+        self.started = False
+        self.closed = False
+
+    async def start(self) -> None:
+        self.started = True
+
+    def enqueue(self, payload) -> bool:
+        self.rows.append(payload)
+        return True
+
+    async def close(self) -> None:
+        self.closed = True
 
 
 class FakeClock:
@@ -690,6 +708,142 @@ async def test_paper_run_persists_through_no_trade_until_explicit_stop(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_paper_run_notifications_start_ready_and_safe_stop_after_evidence(tmp_path):
+    clock = FakeClock()
+    stop = asyncio.Event()
+    delivery = CaptureNotifications()
+    outbox = NotificationOutbox(delivery)
+
+    async def stop_after_first_wait(_seconds: float) -> None:
+        stop.set()
+        await asyncio.sleep(0)
+
+    with PaperRepository(tmp_path / "run-notifications.db") as repository:
+        result = await public_paper_run(
+            repository,
+            adapters=adapters(
+                clock, settlement_at=NOW + timedelta(minutes=5), funding="0"
+            ),
+            clock=clock,
+            stop_event=stop,
+            sleep=stop_after_first_wait,
+            notifications=outbox,
+        )
+        persisted = {
+            row[0] for row in repository.connection.execute(
+                "SELECT event_type FROM runtime_evidence"
+            )
+        }
+    assert result == {"status": "STOPPED_SAFE", "forced_close": False}
+    assert delivery.started and delivery.closed
+    assert [row.kind for row in delivery.rows if row.kind.startswith("RUNTIME_")] == [
+        "RUNTIME_STARTED", "RUNTIME_READY",
+    ]
+    assert [row.kind for row in delivery.rows][-1] == "SAFE_STOP"
+    assert {"PAPER_RUN_STARTED", "PAPER_RUN_READY", "STOPPED_SAFE"} <= persisted
+
+
+@pytest.mark.asyncio
+async def test_safe_stop_cancels_hung_telegram_delivery_without_waiting_for_timeout(tmp_path):
+    clock = FakeClock()
+    stop = asyncio.Event()
+
+    class HangingResponse:
+        async def __aenter__(self):
+            await asyncio.Event().wait()
+        async def __aexit__(self, *_args):
+            return False
+
+    class HangingSession:
+        closed = False
+        def post(self, *_args, **_kwargs):
+            return HangingResponse()
+        async def close(self):
+            self.closed = True
+
+    session = HangingSession()
+    delivery = TelegramDelivery(
+        "synthetic-token", "synthetic-chat", timeout_seconds=60,
+        session_factory=lambda: session,
+    )
+
+    async def stop_after_first_wait(_seconds: float) -> None:
+        stop.set()
+        await asyncio.sleep(0)
+
+    with PaperRepository(tmp_path / "safe-stop-notifications.db") as repository:
+        result = await asyncio.wait_for(public_paper_run(
+            repository,
+            adapters=adapters(
+                clock, settlement_at=NOW + timedelta(minutes=5), funding="0"
+            ),
+            clock=clock,
+            stop_event=stop,
+            sleep=stop_after_first_wait,
+            notifications=NotificationOutbox(delivery),
+        ), timeout=0.5)
+        evidence = "".join(
+            row[0] for row in repository.connection.execute(
+                "SELECT COALESCE(detail, '') FROM runtime_evidence"
+            )
+        )
+    assert result["status"] == "STOPPED_SAFE"
+    assert delivery._worker is None and session.closed
+    assert "synthetic-token" not in evidence and "synthetic-chat" not in evidence
+
+
+@pytest.mark.asyncio
+async def test_opportunity_notifications_copy_authoritative_plan_and_dedupe(tmp_path):
+    clock = FakeClock()
+    fakes = adapters(clock, settlement_at=NOW + timedelta(minutes=5))
+    delivery = CaptureNotifications()
+    with PaperRepository(tmp_path / "opportunity-notifications.db") as repository:
+        async with PublicPaperRuntime(
+            repository, adapters=fakes, clock=clock,
+            notifications=NotificationOutbox(delivery),
+        ) as runtime:
+            await runtime.scan()
+            winner = runtime.last_scan.winner
+            clock.advance(1)
+            await runtime.scan()
+            fakes[Venue.RISEX].funding_cash += D("0.000001")
+            clock.advance(1)
+            await runtime.scan()
+            subcent = runtime.last_scan.winner
+            assert subcent.planned_maker_net_pnl_usd != winner.planned_maker_net_pnl_usd
+            assert subcent.planned_maker_net_pnl_usd.quantize(D("0.01")) == (
+                winner.planned_maker_net_pnl_usd.quantize(D("0.01"))
+            )
+            fakes[winner.hedge_venue].funding_cash = D("0")
+            clock.advance(1)
+            await runtime.scan()
+            fakes[Venue.RISEX].funding_cash += D("0.02")
+            clock.advance(1)
+            await runtime.scan()
+            for adapter in fakes.values():
+                adapter.funding_cash = D("0")
+            clock.advance(1)
+            await runtime.scan()
+            fakes[Venue.RISEX].funding_cash = D("5")
+            fakes[winner.hedge_venue].funding_cash = D("5")
+            clock.advance(1)
+            await runtime.scan()
+
+    rows = [row for row in delivery.rows if row.kind.startswith("OPPORTUNITY") or row.kind == "ELIGIBLE_OPPORTUNITY"]
+    assert [row.kind for row in rows] == [
+        "ELIGIBLE_OPPORTUNITY", "ELIGIBLE_OPPORTUNITY",
+        "ELIGIBLE_OPPORTUNITY", "OPPORTUNITY_DISAPPEARED",
+        "ELIGIBLE_OPPORTUNITY",
+    ]
+    assert rows[0].ticker == winner.canonical_asset
+    assert "RISEx" in rows[0].route and winner.hedge_venue.value in rows[0].route
+    assert rows[0].planned_maker_net_pnl_usd == winner.planned_maker_net_pnl_usd
+    assert str(winner.planned_maker_net_pnl_usd) in rows[0].text
+    assert rows[1].route != rows[0].route
+    assert rows[-1].route == rows[0].route
+
+
+@pytest.mark.asyncio
 async def test_scheduling_full_focused_activation_and_strict_cutoff(tmp_path):
     clock = FakeClock()
     target = NOW + timedelta(seconds=400)
@@ -1173,6 +1327,71 @@ async def test_healthy_public_trade_reaches_broker_and_deduplicates(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_runtime_lifecycle_notifications_follow_persisted_transitions(tmp_path):
+    clock = FakeClock()
+    target = NOW + timedelta(seconds=120)
+    fakes = adapters(clock, settlement_at=target)
+    delivery = CaptureNotifications()
+    with PaperRepository(tmp_path / "lifecycle-notifications.db") as repository:
+        async with PublicPaperRuntime(
+            repository, adapters=fakes, clock=clock,
+            notifications=NotificationOutbox(delivery),
+        ) as runtime:
+            await activate_with_live_streams(runtime, clock)
+            assert "ENTRY_ACTIVATED" in [row.kind for row in delivery.rows]
+            for adapter in fakes.values():
+                adapter.funding_unknown = True
+            clock.advance(1)
+            entry = runtime.broker.state.order
+            runtime.mark_trade_stream_connected(entry.venue, entry.canonical_market)
+            await runtime.deliver_trade(
+                maker_trade(runtime, clock.now(), "notification-entry")
+            )
+            assert runtime.lifecycle is not None
+            runtime.next_position_monitor_at = clock.now()
+            await runtime.tick()
+            pending = runtime.lifecycle.snapshot.settlements[0]
+            await runtime.deliver_settlement(replace(
+                pending, status=SettlementStatus.ESTIMATED, cash_usd=D("3.125")
+            ))
+            applied = replace(
+                pending, status=SettlementStatus.APPLIED_RATE, cash_usd=D("3.25")
+            )
+            await runtime.deliver_settlement(applied)
+            await runtime.deliver_settlement(applied)
+            exit_order = runtime.lifecycle.snapshot.exit_order
+            assert exit_order is not None and exit_order.active_version is not None
+            runtime.mark_trade_stream_connected(
+                exit_order.venue, exit_order.canonical_market
+            )
+            tick = runtime.lifecycle.snapshot.hedge_market.tick_size_raw
+            exit_trade = TradeEvidence(
+                "notification-exit", exit_order.venue, exit_order.canonical_market,
+                clock.now(), clock.now(), "notification-exit-raw",
+                exit_order.canonical_quantity,
+                (
+                    exit_order.active_version.limit_price - tick
+                    if exit_order.side is Side.BUY
+                    else exit_order.active_version.limit_price + tick
+                ),
+                Side.SELL if exit_order.side is Side.BUY else Side.BUY,
+                True,
+            )
+            await runtime.deliver_trade(exit_trade)
+            authoritative = repository.load_runtime().closed_trade
+
+    kinds = [row.kind for row in delivery.rows]
+    for required in (
+        "ENTRY_ACTIVATED", "POSITION_OPENED", "EXIT_STARTED",
+        "FUNDING_RECEIVED", "FUNDING_RECONCILED", "POSITION_CLOSED",
+    ):
+        assert kinds.count(required) == 1
+    closed = next(row for row in delivery.rows if row.kind == "POSITION_CLOSED")
+    assert closed.final_pnl_usd == authoritative.simulated_closed_net_pnl_usd
+    assert str(authoritative.simulated_closed_net_pnl_usd) in closed.text
+
+
+@pytest.mark.asyncio
 async def test_disconnect_cancels_entry_and_position_gap_recovers_from_snapshot(tmp_path):
     clock = FakeClock()
     target = NOW + timedelta(seconds=120)
@@ -1214,8 +1433,12 @@ async def test_disconnect_cancels_entry_and_position_gap_recovers_from_snapshot(
 async def test_sequence_gap_fetches_snapshot_and_reconnect_restores_readiness(tmp_path):
     clock = FakeClock()
     fakes = adapters(clock, settlement_at=NOW + timedelta(minutes=5))
+    delivery = CaptureNotifications()
     with PaperRepository(tmp_path / "sequence-recovery.db") as repository:
-        async with PublicPaperRuntime(repository, adapters=fakes, clock=clock) as runtime:
+        async with PublicPaperRuntime(
+            repository, adapters=fakes, clock=clock,
+            notifications=NotificationOutbox(delivery),
+        ) as runtime:
             await runtime.scan()
             market = fakes[Venue.EXTENDED].market
             await runtime.apply_book_event(BookDelta(
@@ -1270,6 +1493,11 @@ async def test_sequence_gap_fetches_snapshot_and_reconnect_restores_readiness(tm
     assert state.available and state.detail == "PUBLIC_STREAM_RECOVERED"
     assert book_resyncs == 1
     assert socket_disconnects == 0 and socket_reconnects == 0
+    assert [row.kind for row in delivery.rows if row.kind in {
+        "CRITICAL_DATA_LOSS", "DATA_RECOVERY"
+    }] == [
+        "CRITICAL_DATA_LOSS", "DATA_RECOVERY",
+    ]
 
 
 @pytest.mark.asyncio

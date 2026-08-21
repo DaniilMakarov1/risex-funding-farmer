@@ -37,6 +37,7 @@ from .models import (
     TargetFundingCycle,
     Venue,
 )
+from .notifications import NotificationOutbox, NotificationPayload, utc_time
 from .paper_broker import PaperEntryBroker, PaperEntryState
 from .scanner import (
     MarketObservation,
@@ -252,6 +253,7 @@ class PublicPaperRuntime:
         clock: Clock | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         config: PaperConfig = PAPER_CONFIG,
+        notifications: NotificationOutbox | None = None,
     ) -> None:
         self.repository = repository
         self.config = config
@@ -292,6 +294,8 @@ class PublicPaperRuntime:
         self.focused_cycle: TargetFundingCycle | None = None
         self.component_readiness: dict[Venue, dict[str, VenueReadiness]] = {}
         self._last_catalog_good_at: dict[Venue, datetime] = {}
+        self.notifications = notifications
+        self._notification_run_id: str | None = None
 
     async def __aenter__(self) -> PublicPaperRuntime:
         if self.adapters is None:
@@ -320,6 +324,99 @@ class PublicPaperRuntime:
             venue=None if venue is None else venue.value,
             detail=detail,
         )
+        now = at or self.clock.now()
+        if event_type in {
+            "PUBLIC_SOCKET_DISCONNECTED", "PUBLIC_BOOK_RESYNC_REQUIRED",
+            "PUBLIC_SNAPSHOT_RECOVERY_FAILED",
+        }:
+            self._notify_event(
+                f"data-loss:{venue.value if venue else 'PUBLIC'}:{event_type}:{now.isoformat()}",
+                "CRITICAL_DATA_LOSS", now,
+                f"Critical public data loss: {venue.value if venue else 'PUBLIC'} {event_type}",
+            )
+        elif event_type in {
+            "PUBLIC_SOCKET_RECONNECTED", "PUBLIC_SNAPSHOT_RECOVERY_COMPLETED",
+        }:
+            episode = None if detail is None else detail.get("episode_id")
+            recovery_id = episode or (
+                f"{venue.value if venue else 'PUBLIC'}:{event_type}:{now.isoformat()}"
+            )
+            self._notify_event(
+                f"data-recovery:{recovery_id}",
+                "DATA_RECOVERY", now,
+                f"Public data recovered: {venue.value if venue else 'PUBLIC'} {event_type}",
+            )
+
+    def _notify_event(
+        self, event_id: str, kind: str, at: datetime, text: str, **fields: object
+    ) -> None:
+        if self.notifications is None:
+            return
+        self.notifications.event(NotificationPayload(
+            event_id, kind, utc_time(at), text,
+            ticker=fields.get("ticker"),  # type: ignore[arg-type]
+            route=fields.get("route"),  # type: ignore[arg-type]
+            final_pnl_usd=fields.get("final_pnl"),  # type: ignore[arg-type]
+        ))
+
+    def _notify_opportunity(self, snapshot: ScanSnapshot) -> None:
+        if self.notifications is None:
+            return
+        plan = snapshot.winner
+        at = snapshot.logical_at
+        if plan is None or plan.target_cycle is None or plan.planned_maker_net_pnl_usd is None:
+            self.notifications.opportunity(
+                None,
+                NotificationPayload(
+                    f"opportunity:disappeared:{at.isoformat()}",
+                    "OPPORTUNITY_DISAPPEARED", utc_time(at),
+                    "Eligible funding opportunity disappeared",
+                ),
+            )
+            return
+        risex_side = "LONG" if plan.direction is RouteDirection.LONG_RISEX_SHORT_HEDGE else "SHORT"
+        hedge_side = "SHORT" if risex_side == "LONG" else "LONG"
+        route = f"RISEx {risex_side} / {plan.hedge_venue.value} {hedge_side}"
+        pnl = plan.planned_maker_net_pnl_usd
+        cents = str(pnl.quantize(Decimal("0.01")))
+        state = (f"{plan.canonical_asset}:{route}", plan.target_cycle.cycle_id, cents)
+        self.notifications.opportunity(
+            state,
+            NotificationPayload(
+                f"opportunity:{state[0]}:{state[1]}:{state[2]}:{at.isoformat()}",
+                "ELIGIBLE_OPPORTUNITY", utc_time(at),
+                f"{plan.canonical_asset}: {route}; planned net PnL USD {pnl}",
+                ticker=plan.canonical_asset, route=route,
+                planned_maker_net_pnl_usd=pnl,
+            ),
+        )
+
+    def _notify_lifecycle_transition(
+        self, before: LifecycleSnapshot | None, after: LifecycleSnapshot, at: datetime
+    ) -> None:
+        position = after.position or (None if before is None else before.position)
+        before_state = None if before is None else before.lifecycle_state
+        if after.position is not None and (before is None or before.position is None):
+            self._notify_event(
+                f"position:{after.position.position_id}:opened", "POSITION_OPENED", at,
+                f"Paper position opened: {after.position.position_id}",
+            )
+        exiting = {LifecycleState.EXITING_NORMAL, LifecycleState.EXITING_AGGRESSIVE}
+        if after.lifecycle_state in exiting and before_state not in exiting and position is not None:
+            self._notify_event(
+                f"position:{position.position_id}:exit-started", "EXIT_STARTED", at,
+                f"Paper exit started: {position.position_id}",
+            )
+        closed = after.closed_trade
+        previous_closed = None if before is None else before.closed_trade
+        if closed is not None and previous_closed is None:
+            pnl = closed.simulated_closed_net_pnl_usd
+            self._notify_event(
+                f"position:{closed.position_id}:closed:{closed.closed_at.isoformat()}",
+                "POSITION_CLOSED", closed.closed_at,
+                f"Paper position closed: {closed.position_id}; final PnL USD {pnl}",
+                final_pnl=pnl,
+            )
 
     def _set_readiness(
         self, venue: Venue, available: bool, detail: str, at: datetime
@@ -781,6 +878,7 @@ class PublicPaperRuntime:
         route_rows = route_rows[:15]
         if persist_scan:
             self.repository.save_public_route_rows(logical_at=logical_at, rows=route_rows)
+            self._notify_opportunity(snapshot)
         unavailable = {
             venue.value: state.detail
             for venue, state in self.readiness.items()
@@ -1046,6 +1144,7 @@ class PublicPaperRuntime:
                     self.lifecycle.snapshot.hedge_market,
                     now,
                 )
+                before = self.lifecycle.snapshot
                 await self.lifecycle.evaluate(
                     evaluated_at=now,
                     risex_observation=risex,
@@ -1053,6 +1152,9 @@ class PublicPaperRuntime:
                 )
                 self.repository.save_decision(
                     recorded_at=now, lifecycle_snapshot=self.lifecycle.snapshot
+                )
+                self._notify_lifecycle_transition(
+                    before, self.lifecycle.snapshot, now
                 )
                 if self.lifecycle.snapshot.lifecycle_state is LifecycleState.FLAT:
                     self.lifecycle = None
@@ -1155,6 +1257,12 @@ class PublicPaperRuntime:
             self.broker = broker
             self.repository.save_decision(recorded_at=now, entry_state=broker.state)
             self._record("PAPER_ENTRY_ACTIVATED", at=now)
+            order = broker.state.order
+            assert order is not None
+            self._notify_event(
+                f"entry:{order.attempt_id}:activated", "ENTRY_ACTIVATED", now,
+                f"Paper entry activated: {order.attempt_id}",
+            )
 
     def _fresh_focus_candidates(
         self, snapshot: ScanSnapshot, now: datetime
@@ -1272,6 +1380,7 @@ class PublicPaperRuntime:
                 self.repository.save_decision(
                     recorded_at=at, lifecycle_snapshot=self.lifecycle.snapshot
                 )
+                self._notify_lifecycle_transition(None, self.lifecycle.snapshot, at)
                 self.broker = None
                 self.next_position_monitor_at = at + timedelta(
                     seconds=self.config.open_position_monitor_seconds
@@ -1288,6 +1397,7 @@ class PublicPaperRuntime:
                 self.lifecycle.snapshot.hedge_market,
                 at,
             )
+            before = self.lifecycle.snapshot
             await self.lifecycle.process_exit_trade(
                 trade,
                 observed_version_id=version,
@@ -1300,6 +1410,7 @@ class PublicPaperRuntime:
                 trade_events=(trade,),
                 lifecycle_snapshot=self.lifecycle.snapshot,
             )
+            self._notify_lifecycle_transition(before, self.lifecycle.snapshot, at)
             if self.lifecycle.snapshot.lifecycle_state is LifecycleState.FLAT:
                 self.lifecycle = None
 
@@ -1324,10 +1435,34 @@ class PublicPaperRuntime:
         if self.lifecycle is not None and settlement.key in {
             row.key for row in self.lifecycle.snapshot.settlements
         }:
+            before = next(
+                row for row in self.lifecycle.snapshot.settlements
+                if row.key == settlement.key
+            )
             await self.lifecycle.reconcile_settlement(settlement)
             self.repository.save_decision(
                 recorded_at=self.clock.now(), lifecycle_snapshot=self.lifecycle.snapshot
             )
+            after = next(
+                row for row in self.lifecycle.snapshot.settlements
+                if row.key == settlement.key
+            )
+            if (before.status, before.cash_usd) != (after.status, after.cash_usd):
+                at = self.clock.now()
+                kind = (
+                    "FUNDING_RECEIVED"
+                    if before.status in {
+                        SettlementStatus.PENDING, SettlementStatus.UNRESOLVED
+                    }
+                    else "FUNDING_RECONCILED"
+                )
+                self._notify_event(
+                    f"funding:{after.venue.value}:{after.canonical_market}:"
+                    f"{after.settlement_at.isoformat()}:{after.status.value}:{after.cash_usd}",
+                    kind, at,
+                    f"Funding reconciled: {after.venue.value} {after.canonical_market} "
+                    f"{after.status.value} USD {after.cash_usd}",
+                )
 
     def _book_mid(self, venue: Venue, symbol: str) -> Decimal | None:
         book = self.coordinator.stream(venue, symbol).book()
@@ -2042,6 +2177,13 @@ class PublicPaperRuntime:
 
     async def run(self, *, stop_event: asyncio.Event | None = None) -> dict[str, object]:
         self._stop_event = stop_event or asyncio.Event()
+        started_at = self.clock.now()
+        self._notification_run_id = f"paper-run:{started_at.isoformat()}"
+        self._record("PAPER_RUN_STARTED", at=started_at)
+        self._notify_event(
+            f"{self._notification_run_id}:started", "RUNTIME_STARTED", started_at,
+            "Paper runtime started",
+        )
         loop = asyncio.get_running_loop()
         installed: list[signal.Signals] = []
         for sig in (signal.SIGINT, signal.SIGTERM):
@@ -2058,6 +2200,12 @@ class PublicPaperRuntime:
             )
             self.next_health_check_at = self.last_scan.logical_at + timedelta(seconds=10)
             await self.start_streams()
+            ready_at = self.clock.now()
+            self._record("PAPER_RUN_READY", at=ready_at)
+            self._notify_event(
+                f"{self._notification_run_id}:ready", "RUNTIME_READY", ready_at,
+                "Paper runtime ready",
+            )
             while not self._stop_event.is_set():
                 await self.tick()
                 now = self.clock.now()
@@ -2082,6 +2230,11 @@ class PublicPaperRuntime:
             at=at,
             detail={"forced_close": False, "open_position_preserved": self.lifecycle is not None},
         )
+        if self._notification_run_id is not None:
+            self._notify_event(
+                f"{self._notification_run_id}:stopped", "SAFE_STOP", at,
+                "Paper runtime stopped safely",
+            )
         if self._stop_event is not None:
             self._stop_event.set()
         owned = list(self._stream_tasks.values())
@@ -2133,12 +2286,20 @@ async def public_paper_run(
     clock: Clock | None = None,
     stop_event: asyncio.Event | None = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    notifications: NotificationOutbox | None = None,
 ) -> dict[str, object]:
-    async with PublicPaperRuntime(
-        repository,
-        adapters=adapters,
-        session_factory=session_factory,
-        clock=clock,
-        sleep=sleep,
-    ) as runtime:
-        return await runtime.run(stop_event=stop_event)
+    if notifications is not None:
+        await notifications.start()
+    try:
+        async with PublicPaperRuntime(
+            repository,
+            adapters=adapters,
+            session_factory=session_factory,
+            clock=clock,
+            sleep=sleep,
+            notifications=notifications,
+        ) as runtime:
+            return await runtime.run(stop_event=stop_event)
+    finally:
+        if notifications is not None:
+            await notifications.close()

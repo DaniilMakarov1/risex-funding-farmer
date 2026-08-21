@@ -47,6 +47,26 @@ streams and failing affected routes closed. `report` summarizes persisted paper
 and runtime evidence. An open position is never force-closed merely because a
 run ends.
 
+### Optional outbound Telegram notifications
+
+Telegram delivery is disabled by default and does not change scanning or paper
+trading. To enable outbound `sendMessage` notifications for `paper-run`, create
+a newly rotated bot token, choose the destination chat, and set all three
+environment variables before starting a new run:
+
+```bash
+export RISEX_TELEGRAM_ENABLED=true
+export RISEX_TELEGRAM_BOT_TOKEN='newly-rotated-token'
+export RISEX_TELEGRAM_CHAT_ID='destination-chat-id'
+risex-farmer --db paper.db paper-run
+```
+
+Never reuse a token that has been disclosed. Credentials are read only from the
+environment and must not be committed. This integration is outbound-only: it
+does not poll `getUpdates`, accept commands, trigger scans, or place orders.
+Delivery is best effort; a full queue or Telegram outage can drop messages so it
+cannot delay market-data processing, strategy deadlines, or safe shutdown.
+
 RISEx contract quantity and forecast funding use visibly reported paper-only
 fallback assumptions. They are enabled only for this experiment and fail closed
 when public metadata, grids, stable-quote identity, price, rate, or schedule

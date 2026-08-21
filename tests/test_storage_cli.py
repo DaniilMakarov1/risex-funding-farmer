@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 import risex_farmer.cli as cli_module
-from risex_farmer.cli import _money, _reason, _scan_table, main
+from risex_farmer.cli import _money, _paper_run, _reason, _scan_table, main
 from risex_farmer.lifecycle import LifecycleSnapshot
 from risex_farmer.models import LifecycleState, SettlementStatus, Side, TradeEvidence, Venue
 from risex_farmer.orchestrator import DEFAULT_LOGICAL_AT, load_fixture, run_fixture
@@ -326,6 +326,40 @@ def test_default_and_explicit_json_preserve_route_semantics(
     explicit = json.loads(capsys.readouterr().out)
     assert default == explicit == result
     assert default["routes"][0]["risex_contract_assumption_used"] is True
+
+
+@pytest.mark.asyncio
+async def test_disabled_telegram_preserves_original_paper_run_call(tmp_path, monkeypatch):
+    calls = []
+
+    async def fake_public_paper_run(repository):
+        calls.append(repository)
+        return {"status": "STOPPED_SAFE", "forced_close": False}
+
+    monkeypatch.delenv("RISEX_TELEGRAM_ENABLED", raising=False)
+    monkeypatch.setattr(cli_module, "public_paper_run", fake_public_paper_run)
+    with PaperRepository(tmp_path / "disabled-telegram.db") as repository:
+        result = await _paper_run(repository, None)
+    assert result["status"] == "STOPPED_SAFE"
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_invalid_enabled_telegram_fails_before_runtime_start(tmp_path, monkeypatch):
+    started = False
+
+    async def fake_public_paper_run(*_args, **_kwargs):
+        nonlocal started
+        started = True
+
+    monkeypatch.setenv("RISEX_TELEGRAM_ENABLED", "true")
+    monkeypatch.delenv("RISEX_TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("RISEX_TELEGRAM_CHAT_ID", raising=False)
+    monkeypatch.setattr(cli_module, "public_paper_run", fake_public_paper_run)
+    with PaperRepository(tmp_path / "invalid-telegram.db") as repository:
+        with pytest.raises(RuntimeError, match="configuration is invalid"):
+            await _paper_run(repository, None)
+    assert not started
 
 
 def test_human_scan_table_exact_columns_labels_precision_and_narrow_width() -> None:
