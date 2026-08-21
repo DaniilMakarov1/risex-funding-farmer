@@ -2,7 +2,7 @@
 
 - Accepted implementation: TELEGRAM-002 — Full Scan Digest @ `4d59156cda36dc4b99e3c53d1805db873213d6f9`
 - Previous accepted implementation: TELEGRAM-001-FIX-001 — Flood-Control and Outage Dedupe @ `717b6350485d04567a3e915468c06a5ee6f53104`
-- Active implementation task: none
+- Active implementation task: PAPER-007-FIX-004 — Public REST Timeout 30 Seconds
 - PAPER-007 Stage A scheduling validation: PASS
 - PAPER-007 Stage B: running on accepted main with outbound Telegram enabled after a safe flat restart
 - Preserved Stage B evidence: `paper-007-stage-a-fix002.db`, SHA-256 `6c9bddbf3e10e5690f8e5d5327adf5c35fad4f2044d96fdb9445b3bd567e68ff`
@@ -17,3 +17,5 @@ TELEGRAM-001-FIX-001 is accepted after 162 deterministic tests. Bot API flood-co
 The Architect used the newly authorized diagnostic `getUpdates` exception to discover the destination without adding inbound runtime behavior. Stage B PID `42853` stopped with `STOPPED_SAFE` and `forced_close=false`; the same database resumed under PID `45479` in detached screen `risex-paper007-stageb-telegram-fullscan`. Initial STARTED/SCAN/READY persisted, the first accepted-code FULL scan completed at `2026-08-21T08:31:34.802108Z`, and orders/fills/open position remained zero.
 
 TELEGRAM-002 is accepted after 167 deterministic tests. Each authoritative `FULL` scan now emits at most one bounded digest with up to 15 existing ordered route rows in `Ticker | Route | Expected PnL` form. INITIAL, FOCUSED, and RECOVERY scans do not emit this digest. Scanner results, scheduling, economics, persistence, adapters, and paper/live boundaries are unchanged.
+
+PAPER-007-FIX-004 is explicitly authorized to increase the shared public HTTP runtime total timeout from 15 to 30 seconds. It must not alter endpoints, retry cadence, scheduling, economics, lifecycle, Telegram delivery, or paper/live boundaries. The running Stage B remains untouched until implementation acceptance.
