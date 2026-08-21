@@ -73,7 +73,7 @@ def full_scan_digest_payloads(
                 if isinstance(blockers, (list, tuple)) and blockers
                 else "AUTHORITATIVE_VALUE_UNAVAILABLE"
             )
-            pnl_field = f"Expected PnL: UNKNOWN ({blocker})"
+            pnl_field = f"Expected PnL: UNKNOWN — {_unknown_digest_label(blocker)}"
         else:
             pnl_field = f"Expected PnL: ${pnl_display}"
         route_lines.append(
@@ -105,6 +105,21 @@ def full_scan_digest_payloads(
             "FULL_SCAN_DIGEST", scan_utc, text,
         ))
     return tuple(payloads)
+
+
+def _unknown_digest_label(blocker: str) -> str:
+    normalized = blocker.upper()
+    if "MARKET_METADATA" in normalized:
+        return "market metadata stale"
+    if "CATALOG" in normalized:
+        return "Extended catalog"
+    if "BOOK" in normalized or "DEPTH" in normalized:
+        return "book stream"
+    if "FUNDING" in normalized:
+        return "funding"
+    if "RISEX" in normalized or "PARITY" in normalized or "MULTIPLIER" in normalized:
+        return "RISEx parity"
+    return "public evidence unavailable"
 
 
 def _bounded_digest_field(value: str, width: int) -> str:

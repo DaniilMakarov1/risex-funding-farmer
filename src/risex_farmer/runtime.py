@@ -65,6 +65,12 @@ class SystemClock:
         return datetime.now(UTC)
 
 
+class _PublicSocketClosed(ConnectionError):
+    def __init__(self, classification: str) -> None:
+        super().__init__(f"public websocket transport closed: {classification}")
+        self.classification = classification
+
+
 def _next_absolute_slot(
     scheduled_at: datetime, now: datetime, cadence_seconds: int
 ) -> datetime:
@@ -291,6 +297,7 @@ class PublicPaperRuntime:
             tuple[Venue, str, tuple[str, ...]], dict[str, object]
         ] = {}
         self._socket_episode_number = 0
+        self._watchdog_episode_number = 0
         self._stop_event: asyncio.Event | None = None
         self._attempt_number = 0
         self._nado_cumulative_funding: dict[tuple[str, str], object] = {}
@@ -311,7 +318,7 @@ class PublicPaperRuntime:
         self.notifications = notifications
         self._notification_run_id: str | None = None
         self._stop_cause: str | None = None
-        self._stop_requested_at: datetime | None = None
+        self._requested_at: datetime | None = None
         self._background_fatal: BaseException | None = None
 
     async def __aenter__(self) -> PublicPaperRuntime:
@@ -690,7 +697,7 @@ class PublicPaperRuntime:
                 "PUBLIC_REQUEST_COMPLETED", at=completed, venue=Venue.EXTENDED,
                 detail={
                     "component": "extended_universe",
-                    "timeout_seconds": self.config.extended_catalog_timeout_seconds,
+                    "timeout_seconds": self.config.extended_universe_request_timeout_seconds,
                 },
             )
         except asyncio.CancelledError:
@@ -705,7 +712,7 @@ class PublicPaperRuntime:
                 detail={
                     "component": "extended_universe", "endpoint_class": "catalog",
                     "exception_class": type(exc).__name__,
-                    "timeout_seconds": self.config.extended_catalog_timeout_seconds,
+                    "timeout_seconds": self.config.extended_universe_request_timeout_seconds,
                     "cache_state": (
                         "CACHED_LAST_GOOD" if self._extended_universe_at is not None
                         and self.clock.now() - self._extended_universe_at <= timedelta(
@@ -758,7 +765,7 @@ class PublicPaperRuntime:
                         if all(
                             symbol in self._extended_metadata_at
                             and self.clock.now() - self._extended_metadata_at[symbol]
-                            <= timedelta(seconds=self.config.extended_required_metadata_max_age_seconds)
+                            <= timedelta(seconds=self.config.extended_required_markets_max_age_seconds)
                             for symbol in symbols
                         ) else "FAIL_CLOSED"
                     ),
@@ -777,7 +784,7 @@ class PublicPaperRuntime:
             blockers.append("CATALOG_STALE")
         metadata_at = self._extended_metadata_at.get(market.venue_symbol)
         if metadata_at is None or at - metadata_at > timedelta(
-            seconds=self.config.extended_required_metadata_max_age_seconds
+            seconds=self.config.extended_required_markets_max_age_seconds
         ):
             blockers.append("MARKET_METADATA_STALE")
         return replace(market, evidence_blockers=tuple(dict.fromkeys(blockers)))
@@ -1203,7 +1210,7 @@ class PublicPaperRuntime:
         self._background_fatal = exception
         self._request_stop("RUNTIME_FATAL")
         self._record(
-            "RUNTIME_FATAL", at=self._stop_requested_at,
+            "RUNTIME_FATAL", at=self._requested_at,
             detail={"exception_class": type(exception).__name__},
         )
 
@@ -1880,7 +1887,10 @@ class PublicPaperRuntime:
         ]
         for symbol, kind in sorted(stale):
             identity = (Venue.EXTENDED, kind, (symbol,))
-            self._watchdog_stale(identity, at=at)
+            self._watchdog_stale(
+                identity, at=at,
+                last_confirmation=self._extended_confirmed_at[symbol, kind],
+            )
             await self.mark_disconnected(
                 Venue.EXTENDED, symbol, at=at, stream_kind=kind,
                 exception=TimeoutError("public socket confirmation stale"),
@@ -1888,15 +1898,24 @@ class PublicPaperRuntime:
             await self._restart_extended_stream(symbol, kind)
 
     def _watchdog_stale(
-        self, identity: tuple[Venue, str, tuple[str, ...]], *, at: datetime
+        self, identity: tuple[Venue, str, tuple[str, ...]], *, at: datetime,
+        last_confirmation: datetime,
     ) -> None:
         if identity in self._pending_watchdog_episodes:
             return
         venue, stream_kind, markets = identity
+        self._watchdog_episode_number += 1
         detail: dict[str, object] = {
-            "episode_id": f"watchdog:{venue.value}:{stream_kind}:{markets[0]}:{at.isoformat()}",
+            "episode_id": (
+                f"watchdog:{venue.value}:{stream_kind}:{markets[0]}:"
+                f"{at.isoformat()}:{self._watchdog_episode_number}"
+            ),
+            "stream_identity": f"{venue.value}:{stream_kind}:{markets[0]}",
             "stream_kind": stream_kind, "market": markets[0],
-            "stale_at": at.isoformat(),
+            "last_confirmation": last_confirmation.isoformat(),
+            "detected_at": at.isoformat(),
+            "stale_age": str(Decimal(str((at - last_confirmation).total_seconds()))),
+            "restart_reason": "CONFIRMATION_STALE",
         }
         self._pending_watchdog_episodes[identity] = detail
         self._record(
@@ -1919,6 +1938,9 @@ class PublicPaperRuntime:
         identity: tuple[Venue, str, tuple[str, ...]],
         *,
         at: datetime,
+        cause: str = "SOCKET_CLOSED",
+        exception_class: str | None = None,
+        close_classification: str | None = "EOF",
     ) -> None:
         if identity in self._pending_socket_episodes:
             return
@@ -1931,7 +1953,12 @@ class PublicPaperRuntime:
             ),
             "stream_kind": stream_kind,
             "disconnected_at": at.isoformat(),
+            "cause": cause,
         }
+        if exception_class is not None:
+            detail["exception_class"] = exception_class
+        if close_classification is not None:
+            detail["close_classification"] = close_classification
         if stream_kind == "combined":
             detail["markets"] = list(markets)
         else:
@@ -1961,6 +1988,26 @@ class PublicPaperRuntime:
                 at=at,
                 venue=identity[0],
                 detail=reconnect_detail,
+            )
+
+    def _record_transport_disconnect(
+        self,
+        identity: tuple[Venue, str, tuple[str, ...]],
+        *,
+        at: datetime,
+        exception: BaseException,
+    ) -> None:
+        if isinstance(exception, _PublicSocketClosed):
+            self._socket_disconnected(
+                identity, at=at, cause="SOCKET_CLOSED",
+                close_classification=exception.classification,
+            )
+        elif isinstance(
+            exception, (aiohttp.ClientConnectionError, ConnectionError, OSError)
+        ):
+            self._socket_disconnected(
+                identity, at=at, cause="TRANSPORT_EXCEPTION",
+                exception_class=type(exception).__name__, close_classification=None,
             )
 
     async def recover_snapshot(self, book: OrderBook, *, at: datetime | None = None) -> None:
@@ -2300,6 +2347,11 @@ class PublicPaperRuntime:
                                     symbol, kind, self.clock.now(), data_ready=False
                                 )
                                 continue
+                            if message.type in {
+                                aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING,
+                                aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR,
+                            }:
+                                raise _PublicSocketClosed(message.type.name)
                             if message.type is not aiohttp.WSMsgType.TEXT:
                                 continue
                             payload = json.loads(message.data, parse_float=Decimal)
@@ -2341,15 +2393,15 @@ class PublicPaperRuntime:
                         heartbeat.cancel()
                         await asyncio.gather(heartbeat, return_exceptions=True)
                     if self._stop_event is None or not self._stop_event.is_set():
-                        raise ConnectionError("public websocket closed")
+                        raise _PublicSocketClosed("EOF")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 if self._stop_event is not None and self._stop_event.is_set():
                     break
                 if session_established:
-                    self._socket_disconnected(
-                        socket_identity, at=self.clock.now()
+                    self._record_transport_disconnect(
+                        socket_identity, at=self.clock.now(), exception=exc,
                     )
                 await self.mark_disconnected(Venue.EXTENDED, symbol, stream_kind=kind, exception=exc)
                 await self._sleep(delay)
@@ -2411,6 +2463,11 @@ class PublicPaperRuntime:
                             for symbol in symbols:
                                 self.coordinator.stream(venue, symbol).connection_confirmed(self.clock.now())
                             continue
+                        if message.type in {
+                            aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING,
+                            aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR,
+                        }:
+                            raise _PublicSocketClosed(message.type.name)
                         if message.type is not aiohttp.WSMsgType.TEXT:
                             continue
                         payload = json.loads(message.data, parse_float=Decimal)
@@ -2472,7 +2529,7 @@ class PublicPaperRuntime:
                                 self._nado_cumulative_funding[(symbol, "short")] = payload.get("cumulative_funding_short_x18")
                                 await self._apply_funding_quote(quote)
                     if self._stop_event is None or not self._stop_event.is_set():
-                        raise ConnectionError("public websocket closed")
+                        raise _PublicSocketClosed("EOF")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -2482,8 +2539,8 @@ class PublicPaperRuntime:
                     for symbol in symbols:
                         self._recovery_buffers.pop((venue, symbol), None)
                 if session_established:
-                    self._socket_disconnected(
-                        socket_identity, at=self.clock.now()
+                    self._record_transport_disconnect(
+                        socket_identity, at=self.clock.now(), exception=exc,
                     )
                 for symbol in symbols:
                     await self.mark_disconnected(venue, symbol, stream_kind="combined", exception=exc)
@@ -2703,7 +2760,7 @@ class PublicPaperRuntime:
             if self._stop_cause != "RUNTIME_FATAL":
                 self._request_stop("RUNTIME_FATAL")
                 self._record(
-                    "RUNTIME_FATAL", at=self._stop_requested_at,
+                    "RUNTIME_FATAL", at=self._requested_at,
                     detail={"exception_class": type(exc).__name__},
                 )
             raise
@@ -2719,7 +2776,7 @@ class PublicPaperRuntime:
                 "SIGINT", "SIGTERM", "STOP_EVENT", "RUNTIME_FATAL",
                 "UNKNOWN_EXTERNAL_STOP",
             } else "UNKNOWN_EXTERNAL_STOP"
-            self._stop_requested_at = self.clock.now()
+            self._requested_at = self.clock.now()
         if self._stop_event is not None:
             self._stop_event.set()
 
@@ -2733,21 +2790,24 @@ class PublicPaperRuntime:
         if self.broker is not None and self.broker.state.lifecycle_state is LifecycleState.ENTRY_MAKER_OPEN:
             state = await self.broker.cancel_for_process_restart(restarted_at=at)
             self.repository.save_decision(recorded_at=at, entry_state=state)
+        stop_detail: dict[str, object] = {
+            "forced_close": False,
+            "open_position_preserved": self.lifecycle is not None,
+            "stop_cause": self._stop_cause,
+            "requested_at": (
+                None if self._requested_at is None
+                else self._requested_at.isoformat()
+            ),
+        }
+        if self._stop_cause in {"SIGINT", "SIGTERM"}:
+            stop_detail["signal"] = self._stop_cause
         self._record(
             (
                 "RUNTIME_STOPPED_FATAL"
                 if self._stop_cause == "RUNTIME_FATAL" else "STOPPED_SAFE"
             ),
             at=at,
-            detail={
-                "forced_close": False,
-                "open_position_preserved": self.lifecycle is not None,
-                "stop_cause": self._stop_cause,
-                "stop_requested_at": (
-                    None if self._stop_requested_at is None
-                    else self._stop_requested_at.isoformat()
-                ),
-            },
+            detail=stop_detail,
         )
         if self._notification_run_id is not None and self._stop_cause != "RUNTIME_FATAL":
             self._notify_event(

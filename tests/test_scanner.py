@@ -247,6 +247,11 @@ def test_insufficient_depth_minimums_and_zero_common_quantity_are_no_trade() -> 
     )
     assert NoTradeReason.MINIMUM_ORDER in below_minimum.no_trade_reasons
 
+    risex_below_minimum = plan(
+        risex=observation(Venue.RISEX, minimum_quantity="10")
+    )
+    assert NoTradeReason.MINIMUM_ORDER in risex_below_minimum.no_trade_reasons
+
     below_exit_notional = plan(
         risex=observation(Venue.RISEX, minimum_notional="500")
     )

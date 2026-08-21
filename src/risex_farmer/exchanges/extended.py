@@ -10,7 +10,7 @@ from urllib.parse import quote
 
 import aiohttp
 
-from risex_farmer.config import EXTENDED_CATALOG_TIMEOUT_SECONDS
+from risex_farmer.config import EXTENDED_UNIVERSE_REQUEST_TIMEOUT_SECONDS
 from risex_farmer.models import (
     BookLevel,
     BookDelta,
@@ -61,7 +61,7 @@ class ExtendedAdapter(PublicAdapter):
     ) -> tuple[tuple[CanonicalMarket, ...], tuple[MarketVolume, ...]]:
         """Normalize both catalog views from the venue's single public payload."""
         payload = await self._catalog_payload(
-            timeout_seconds=EXTENDED_CATALOG_TIMEOUT_SECONDS
+            timeout_seconds=EXTENDED_UNIVERSE_REQUEST_TIMEOUT_SECONDS
         )
         return self._normalize_catalog(payload)
 

@@ -365,10 +365,12 @@ class ClosingWebSocket:
         *,
         stop_on_iteration: bool,
         fail_subscription: bool = False,
+        message_type=None,
     ) -> None:
         self.stop_event = stop_event
         self.stop_on_iteration = stop_on_iteration
         self.fail_subscription = fail_subscription
+        self.message_type = message_type
 
     async def __aenter__(self):
         return self
@@ -380,6 +382,9 @@ class ClosingWebSocket:
         return self
 
     async def __anext__(self):
+        if self.message_type is not None:
+            message_type, self.message_type = self.message_type, None
+            return SimpleNamespace(type=message_type, data=None)
         if self.stop_on_iteration:
             self.stop_event.set()
         raise StopAsyncIteration
@@ -414,6 +419,7 @@ class ReconnectingSession:
             self.stop_event,
             stop_on_iteration=outcome == "stop",
             fail_subscription=outcome == "fail_subscription",
+            message_type=(aiohttp.WSMsgType.ERROR if outcome == "error" else None),
         )
 
 
@@ -795,7 +801,8 @@ async def test_paper_run_persists_through_no_trade_until_explicit_stop(tmp_path)
     assert result == {"status": "STOPPED_SAFE", "forced_close": False}
     assert report["last_runtime_event"]["event_type"] == "STOPPED_SAFE"
     assert stopped["stop_cause"] == "STOP_EVENT"
-    assert stopped["stop_requested_at"] == NOW.isoformat()
+    assert stopped["requested_at"] == NOW.isoformat()
+    assert "signal" not in stopped
 
 
 @pytest.mark.asyncio
@@ -847,7 +854,7 @@ async def test_internal_background_failure_requests_fatal_stop(tmp_path):
     ]
 
 
-@pytest.mark.parametrize("cause", ("SIGINT", "SIGTERM", None))
+@pytest.mark.parametrize("cause", ("SIGINT", "SIGTERM", "STOP_EVENT", None))
 @pytest.mark.asyncio
 async def test_shutdown_persists_bounded_signal_or_unknown_cause(tmp_path, cause):
     clock = FakeClock()
@@ -861,7 +868,11 @@ async def test_shutdown_persists_bounded_signal_or_unknown_cause(tmp_path, cause
             "SELECT detail FROM runtime_evidence WHERE event_type='STOPPED_SAFE'"
         ).fetchone()[0])
     assert detail["stop_cause"] == (cause or "UNKNOWN_EXTERNAL_STOP")
-    assert detail["stop_requested_at"] == NOW.isoformat()
+    assert detail["requested_at"] == NOW.isoformat()
+    if cause not in {"SIGINT", "SIGTERM"}:
+        assert "signal" not in detail
+    else:
+        assert detail["signal"] == cause
 
 
 @pytest.mark.asyncio
@@ -1080,7 +1091,7 @@ async def test_full_scan_digest_keeps_negative_blocked_and_unknown_routes_visibl
     for line, row in zip(negative_lines, negative["routes"]):
         assert line.startswith(f"{row['canonical_asset']} | RISEx ")
         if row["planned_maker_net_pnl_usd"] is None:
-            assert "Expected PnL: UNKNOWN (" in line
+            assert "Expected PnL: UNKNOWN — " in line
         else:
             assert line.endswith(
                 f"Expected PnL: ${format_telegram_money(row['planned_maker_net_pnl_usd'])}"
@@ -2228,6 +2239,83 @@ async def test_extended_eof_persists_one_ordered_physical_socket_episode(tmp_pat
     assert disconnected["episode_id"].startswith("EXTENDED:trade:")
     assert disconnected["stream_kind"] == reconnected["stream_kind"] == "trade"
     assert disconnected["market"] == reconnected["market"] == "ABC-EXTENDED"
+    assert disconnected["cause"] == "SOCKET_CLOSED"
+    assert disconnected["close_classification"] == "EOF"
+
+
+@pytest.mark.asyncio
+async def test_extended_error_frame_persists_one_transport_episode(tmp_path):
+    clock = FakeClock()
+    stop = asyncio.Event()
+    session = ReconnectingSession(stop, outcomes=("error", "stop"))
+
+    async def no_delay(_seconds: float) -> None:
+        await asyncio.sleep(0)
+
+    with PaperRepository(tmp_path / "error-ws-reconnect.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={}, clock=clock, sleep=no_delay,
+        )
+        runtime._session = session
+        runtime._stop_event = stop
+        await runtime._extended_stream(
+            ExtendedAdapter(None), "ABC-EXTENDED", "trade"
+        )
+        lifecycle = repository.connection.execute(
+            "SELECT recorded_at,event_type,venue,detail FROM runtime_evidence "
+            "WHERE event_type IN "
+            "('PUBLIC_SOCKET_DISCONNECTED','PUBLIC_SOCKET_RECONNECTED') "
+            "ORDER BY evidence_id"
+        ).fetchall()
+    assert session.connections == 2
+    disconnected, reconnected = assert_socket_episode(lifecycle)
+    assert disconnected["episode_id"] == reconnected["episode_id"]
+    assert disconnected["cause"] == "SOCKET_CLOSED"
+    assert disconnected["close_classification"] == "ERROR"
+
+
+@pytest.mark.asyncio
+async def test_extended_trade_sequence_gap_has_zero_physical_socket_rows(tmp_path):
+    clock = FakeClock()
+    stop = asyncio.Event()
+    timestamp_ms = str(int(NOW.timestamp() * 1000))
+    trade = {
+        "m": "ABC-EXTENDED", "p": "100", "q": "1", "T": timestamp_ms,
+        "S": "SELL", "i": "trade-1", "tT": "TRADE",
+    }
+
+    class SequenceGapSession:
+        connections = 0
+
+        def ws_connect(self, *_args, **_kwargs):
+            self.connections += 1
+            if self.connections == 1:
+                return TextWebSocket(stop, (
+                    {"seq": 1, "data": [trade]},
+                    {"seq": 3, "data": [{**trade, "i": "trade-2"}]},
+                ))
+            return ClosingWebSocket(stop, stop_on_iteration=True)
+
+    session = SequenceGapSession()
+
+    async def no_delay(_seconds: float) -> None:
+        await asyncio.sleep(0)
+
+    with PaperRepository(tmp_path / "logical-sequence-gap.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={}, clock=clock, sleep=no_delay,
+        )
+        runtime._session = session
+        runtime._stop_event = stop
+        await runtime._extended_stream(
+            ExtendedAdapter(None), "ABC-EXTENDED", "trade"
+        )
+        physical = repository.connection.execute(
+            "SELECT COUNT(*) FROM runtime_evidence "
+            "WHERE event_type LIKE 'PUBLIC_SOCKET_%'"
+        ).fetchone()[0]
+    assert session.connections == 2
+    assert physical == 0
 
 
 @pytest.mark.asyncio
@@ -2666,6 +2754,17 @@ async def test_extended_health_is_per_socket_and_stale_restart_has_one_episode(
         runtime._watchdog_restarted(
             (Venue.EXTENDED, stale_kind, (symbol,)), at=clock.now()
         )
+        replacement = asyncio.create_task(waiting_stream())
+        runtime._stream_tasks[Venue.EXTENDED, symbol, stale_kind] = replacement
+        tasks[stale_kind] = replacement
+        runtime._extended_confirmed_at[symbol, stale_kind] = (
+            clock.now() - timedelta(seconds=26)
+        )
+        await runtime._check_extended_health(clock.now())
+        runtime._confirm_extended_stream(symbol, stale_kind, clock.now(), data_ready=True)
+        runtime._watchdog_restarted(
+            (Venue.EXTENDED, stale_kind, (symbol,)), at=clock.now()
+        )
         assert runtime.component_readiness[Venue.EXTENDED][f"{stale_kind}:{symbol}"].available
         assert runtime.component_readiness[Venue.EXTENDED][f"connection_{stale_kind}:{symbol}"].available
         rows = repository.connection.execute(
@@ -2682,9 +2781,56 @@ async def test_extended_health_is_per_socket_and_stale_restart_has_one_episode(
         await asyncio.gather(*tasks.values(), return_exceptions=True)
     assert [row["event_type"] for row in rows] == [
         "PUBLIC_STREAM_CONFIRMATION_STALE", "PUBLIC_STREAM_RESTARTED",
+        "PUBLIC_STREAM_CONFIRMATION_STALE", "PUBLIC_STREAM_RESTARTED",
     ]
     assert physical_count == 0
     assert json.loads(rows[0]["detail"])["episode_id"] == json.loads(rows[1]["detail"])["episode_id"]
+    assert json.loads(rows[2]["detail"])["episode_id"] == json.loads(rows[3]["detail"])["episode_id"]
+    assert json.loads(rows[0]["detail"])["episode_id"] != json.loads(rows[2]["detail"])["episode_id"]
+    stale_detail = json.loads(rows[0]["detail"])
+    assert {
+        "stream_identity", "last_confirmation", "detected_at", "stale_age",
+        "restart_reason",
+    } <= set(stale_detail)
+    assert stale_detail["restart_reason"] == "CONFIRMATION_STALE"
+
+
+@pytest.mark.asyncio
+async def test_extended_quiet_heartbeat_keeps_each_stream_healthy_for_sixty_seconds(tmp_path):
+    clock = FakeClock()
+    symbol = "ABC-EXTENDED"
+    with PaperRepository(tmp_path / "extended-quiet-heartbeat.db") as repository:
+        runtime = PublicPaperRuntime(repository, adapters={}, clock=clock)
+        runtime._stop_event = asyncio.Event()
+
+        async def waiting_stream():
+            await runtime._stop_event.wait()
+
+        tasks = {}
+        for kind in ("book", "trade", "funding"):
+            runtime._confirm_extended_stream(symbol, kind, clock.now(), data_ready=True)
+            task = asyncio.create_task(waiting_stream())
+            runtime._stream_tasks[Venue.EXTENDED, symbol, kind] = task
+            tasks[kind] = task
+        for _ in range(6):
+            clock.advance(10)
+            for kind in ("book", "trade", "funding"):
+                runtime._confirm_extended_stream(
+                    symbol, kind, clock.now(), data_ready=False
+                )
+            await runtime._check_extended_health(clock.now())
+        assert repository.connection.execute(
+            "SELECT COUNT(*) FROM runtime_evidence WHERE event_type LIKE "
+            "'PUBLIC_STREAM_%' OR event_type LIKE 'PUBLIC_SOCKET_%'"
+        ).fetchone()[0] == 0
+        assert all(
+            runtime.component_readiness[Venue.EXTENDED][
+                f"connection_{kind}:{symbol}"
+            ].available
+            for kind in ("book", "trade", "funding")
+        )
+        runtime._stop_event.set()
+        await asyncio.gather(*tasks.values())
 
 
 def test_extended_book_ping_refreshes_only_book_connection_health(tmp_path):
@@ -2900,6 +3046,10 @@ def test_extended_catalog_and_metadata_ttl_edges_and_atomic_install(tmp_path):
         runtime = PublicPaperRuntime(
             repository, adapters={Venue.EXTENDED: adapter}, clock=clock,
         )
+        runtime._update_extended_catalog_readiness(NOW)
+        assert runtime.component_readiness[Venue.EXTENDED]["catalog"].detail == (
+            "CATALOG_UNAVAILABLE"
+        )
         runtime._install_extended_catalog((market,), (volume,), NOW, full=True)
         assert not runtime._extended_market_with_cache_blocker(
             market, NOW + timedelta(seconds=300)
@@ -2917,6 +3067,62 @@ def test_extended_catalog_and_metadata_ttl_edges_and_atomic_install(tmp_path):
         with pytest.raises(ValueError, match="volumes are incomplete"):
             runtime._install_extended_catalog((market,), (), clock.now(), full=True)
         assert runtime.markets[Venue.EXTENDED] == before
+        with pytest.raises(ValueError, match="volumes are incomplete"):
+            runtime._install_extended_catalog(
+                (market,), (volume, volume), clock.now(), full=False,
+            )
+        assert runtime.markets[Venue.EXTENDED] == before
+
+
+@pytest.mark.asyncio
+async def test_fresh_extended_cache_timeout_preserves_economics_without_book_failure(tmp_path):
+    clock = FakeClock()
+    target = NOW + timedelta(minutes=5)
+
+    class TimeoutAfterBootstrap(GatedExtendedAdapter):
+        fail_catalog = False
+
+        async def fetch_catalog(self):
+            if self.fail_catalog:
+                raise TimeoutError("synthetic bounded catalog timeout")
+            return await super().fetch_catalog()
+
+    extended = TimeoutAfterBootstrap(clock, settlement_at=target)
+    fakes = adapters(clock, settlement_at=target)
+    fakes[Venue.EXTENDED] = extended
+    with PaperRepository(tmp_path / "extended-cache-timeout.db") as repository:
+        async with PublicPaperRuntime(repository, adapters=fakes, clock=clock) as runtime:
+            await runtime.scan()
+            confirm_public_streams(runtime, clock.now())
+            for kind in ("book", "trade", "funding"):
+                runtime._confirm_extended_stream(
+                    extended.market.venue_symbol, kind, clock.now(), data_ready=True,
+                )
+            await runtime.scan(refresh=False, scan_kind="FULL")
+            before = next(
+                plan.planned_maker_net_pnl_usd
+                for plan in runtime.last_scan.evaluations
+                if plan.hedge_venue is Venue.EXTENDED
+            )
+            assert before is not None
+            extended.fail_catalog = True
+            await runtime._refresh_extended_universe()
+            await runtime.scan(refresh=False, scan_kind="FULL")
+            after = next(
+                plan for plan in runtime.last_scan.evaluations
+                if plan.hedge_venue is Venue.EXTENDED
+            )
+            evidence = repository.connection.execute(
+                "SELECT event_type,detail FROM runtime_evidence ORDER BY evidence_id"
+            ).fetchall()
+    assert after.planned_maker_net_pnl_usd == before
+    assert "BOOK_UNHEALTHY" not in after.no_trade_reasons
+    assert not any(row["event_type"].startswith("PUBLIC_SOCKET_") for row in evidence)
+    failed = [
+        json.loads(row["detail"]) for row in evidence
+        if row["event_type"] == "PUBLIC_REQUEST_FAILED"
+    ]
+    assert failed[-1]["cache_state"] == "CACHED_LAST_GOOD"
 
 
 @pytest.mark.asyncio
@@ -3045,6 +3251,44 @@ async def test_extended_universe_refresh_is_owned_single_flight_and_cancelled(tm
         await runtime.shutdown()
     assert first is not None and first.done()
     assert adapter.cancelled
+
+
+@pytest.mark.asyncio
+async def test_sixty_second_extended_universe_request_does_not_move_full_cadence(tmp_path):
+    clock = FakeClock()
+    target = NOW + timedelta(minutes=10)
+    extended = GatedExtendedAdapter(clock, settlement_at=target)
+    fakes = adapters(clock, settlement_at=target)
+    fakes[Venue.EXTENDED] = extended
+    with PaperRepository(tmp_path / "extended-universe-nonblocking.db") as repository:
+        async with PublicPaperRuntime(repository, adapters=fakes, clock=clock) as runtime:
+            await runtime.scan()
+            runtime._stop_event = asyncio.Event()
+            runtime.next_extended_catalog_at = NOW
+            runtime.next_full_scan_at = NOW
+            runtime.next_health_check_at = NOW + timedelta(hours=1)
+            await runtime.tick(NOW)
+            await extended.request_started.wait()
+            assert runtime._extended_universe_task is not None
+            assert not runtime._extended_universe_task.done()
+            clock.advance(60)
+            await runtime.tick(clock.now())
+            assert not runtime._extended_universe_task.done()
+            clock.advance(60)
+            await runtime.tick(clock.now())
+            scans = [
+                json.loads(row["detail"])
+                for row in repository.connection.execute(
+                    "SELECT detail FROM runtime_evidence "
+                    "WHERE event_type='PUBLIC_SCAN' ORDER BY evidence_id"
+                ).fetchall()
+            ]
+            await runtime.shutdown()
+    full_scheduled = [
+        row["scheduled_at"] for row in scans if row["scan_kind"] == "FULL"
+    ]
+    assert full_scheduled[-2:] == [NOW.isoformat(), (NOW + timedelta(seconds=120)).isoformat()]
+    assert extended.cancelled
 
 
 @pytest.mark.asyncio

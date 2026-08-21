@@ -218,7 +218,28 @@ def test_full_scan_digest_splits_all_twenty_rows_without_loss() -> None:
     assert all(len(payload.text) <= 4096 for payload in payloads)
     lines = [line for payload in payloads for line in payload.text.splitlines()[1:]]
     assert len(lines) == len(set(lines)) == 20
-    assert all("UNKNOWN (MARKET_METADATA_STALE:" in line for line in lines)
+    assert all("Expected PnL: UNKNOWN — market metadata stale" in line for line in lines)
+
+
+@pytest.mark.parametrize(("blocker", "label"), (
+    ("PARITY_OR_MULTIPLIER_UNKNOWN", "RISEx parity"),
+    ("CATALOG_STALE", "Extended catalog"),
+    ("MARKET_METADATA_STALE", "market metadata stale"),
+    ("BOOK_UNHEALTHY", "book stream"),
+    ("FUNDING_ELIGIBILITY_UNKNOWN", "funding"),
+))
+def test_full_scan_unknown_uses_human_authoritative_label(blocker, label):
+    payload = full_scan_digest_payloads(
+        scan_at=NOW, opportunity=False, route_rows=({
+            "canonical_asset": "ABC", "hedge_venue": "EXTENDED",
+            "direction": "LONG_RISEX_SHORT_HEDGE",
+            "planned_maker_net_pnl_usd": None, "blockers": [blocker],
+        },),
+    )[0]
+    line = payload.text.splitlines()[1]
+    assert line.endswith(f"Expected PnL: UNKNOWN — {label}")
+    assert line.count(" | ") == 2
+    assert blocker not in line
 
 
 @pytest.mark.asyncio

@@ -158,6 +158,14 @@ async def test_extended_required_catalog_repeats_market_query_and_is_atomic() ->
     with pytest.raises(ValueError, match="incomplete"):
         await incomplete.fetch_required_catalog(("ABC-USD", "XYZ-USD"))
 
+    duplicate = ExtendedAdapter(FakeSession(FakeResponse({"data": [abc, abc]})))
+    with pytest.raises(ValueError, match="incomplete"):
+        await duplicate.fetch_required_catalog(("ABC-USD",))
+
+    unexpected = ExtendedAdapter(FakeSession(FakeResponse({"data": [abc, xyz]})))
+    with pytest.raises(ValueError, match="incomplete"):
+        await unexpected.fetch_required_catalog(("ABC-USD",))
+
 
 def test_risex_paper_fallback_is_explicit_and_unknown_funding_still_fails_closed() -> None:
     adapter = RisexAdapter(None)
@@ -188,6 +196,97 @@ def test_risex_positive_grid_aligned_below_minimum_is_valid_unit_evidence() -> N
         session_id="below-minimum", ordinal=1,
     )
     assert adapter.normalize_market(row).contract_type is ContractType.LINEAR
+
+
+def test_risex_below_minimum_book_and_trade_evidence_are_independently_valid() -> None:
+    row = deepcopy(fixture("risex")["market"])
+    row["config"]["min_order_size"] = "10"
+    adapter = RisexAdapter(None)
+    adapter.normalize_market(row)
+    adapter.normalize_book(fixture("risex")["book"], observed_at=NOW)
+    book_only = adapter.normalize_market(row)
+    assert "RISEX_BOOK_UNIT_EVIDENCE_MISSING" not in book_only.evidence_blockers
+    assert "RISEX_TRADE_UNIT_EVIDENCE_MISSING" in book_only.evidence_blockers
+    adapter = RisexAdapter(None)
+    adapter.normalize_market(row)
+    adapter.normalize_trade(
+        fixture("risex")["trade"], received_at=NOW,
+        session_id="trade-only", ordinal=1,
+    )
+    trade_only = adapter.normalize_market(row)
+    assert "RISEX_TRADE_UNIT_EVIDENCE_MISSING" not in trade_only.evidence_blockers
+    assert "RISEX_BOOK_UNIT_EVIDENCE_MISSING" in trade_only.evidence_blockers
+
+
+@pytest.mark.parametrize(("surface", "field", "value", "blocker"), (
+    ("book", "quantity", "0", "RISEX_BOOK_QUANTITY_NONPOSITIVE"),
+    ("book", "quantity", "-1", "RISEX_BOOK_QUANTITY_NONPOSITIVE"),
+    ("book", "quantity", "2.005", "RISEX_BOOK_QUANTITY_OFF_STEP"),
+    ("book", "price", "100.05", "RISEX_BOOK_PRICE_OFF_TICK"),
+    ("trade", "size", "0", "RISEX_TRADE_QUANTITY_NONPOSITIVE"),
+    ("trade", "size", "-1", "RISEX_TRADE_QUANTITY_NONPOSITIVE"),
+    ("trade", "size", "2.005", "RISEX_TRADE_QUANTITY_OFF_STEP"),
+    ("trade", "price", "100.05", "RISEX_TRADE_PRICE_OFF_TICK"),
+))
+def test_risex_unit_validation_matrix(surface, field, value, blocker) -> None:
+    adapter = RisexAdapter(None)
+    row = fixture("risex")["market"]
+    adapter.normalize_market(row)
+    if surface == "book":
+        payload = deepcopy(fixture("risex")["book"])
+        payload["bids"][0][field] = value
+        adapter.normalize_book(payload, observed_at=NOW)
+    else:
+        payload = deepcopy(fixture("risex")["trade"])
+        payload["data"][field] = value
+        adapter.normalize_trade(
+            payload, received_at=NOW, session_id="matrix", ordinal=1,
+        )
+    assert blocker in adapter.normalize_market(row).evidence_blockers
+
+
+@pytest.mark.asyncio
+async def test_risex_empty_history_and_metadata_mismatches_are_precise() -> None:
+    row = fixture("risex")["market"]
+    adapter = RisexAdapter(FakeSession(FakeResponse({"data": {"trades": []}})))
+    market = adapter.normalize_market(row)
+    empty = await adapter.prime_recent_trade_evidence(market)
+    assert "RISEX_TRADE_UNIT_EVIDENCE_EMPTY" in empty.evidence_blockers
+
+    synthetic = deepcopy(row)
+    for field in (
+        "base_asset_symbol", "underlying", "display_name",
+        "display_base_asset_symbol",
+    ):
+        synthetic[field] = "1000ABC/USDC"
+    synthetic["config"]["name"] = "1000ABC/USDC"
+    assert "RISEX_SYNTHETIC_OR_DEPRECATED_PRODUCT" in RisexAdapter(None).normalize_market(
+        synthetic
+    ).evidence_blockers
+    multiplier = deepcopy(row)
+    multiplier["multiplier"] = "10"
+    assert "RISEX_MULTIPLIER_NOT_ONE" in RisexAdapter(None).normalize_market(
+        multiplier
+    ).evidence_blockers
+
+
+@pytest.mark.asyncio
+async def test_risex_two_below_minimum_windows_do_not_flicker() -> None:
+    row = deepcopy(fixture("risex")["market"])
+    row["config"]["min_order_size"] = "10"
+    session = FakeSession(FakeResponse({
+        "data": {"trades": [{
+            "price": "100", "size": "2", "time": "1800014400000000000",
+            "maker_side": 0,
+        }]}
+    }))
+    adapter = RisexAdapter(session)
+    market = adapter.normalize_market(row)
+    for _ in range(2):
+        adapter.normalize_book(fixture("risex")["book"], observed_at=NOW)
+        market = await adapter.prime_recent_trade_evidence(market)
+        assert market.contract_type is ContractType.LINEAR
+        assert not any("UNIT_EVIDENCE" in value for value in market.evidence_blockers)
 
 
 def test_risex_unit_evidence_has_precise_authoritative_blocker() -> None:
