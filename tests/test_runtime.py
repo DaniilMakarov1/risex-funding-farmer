@@ -1398,6 +1398,44 @@ async def test_combined_socket_uses_one_episode_for_sorted_market_set(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_simple_combined_eof_then_reconnect_is_one_socket_episode(tmp_path):
+    clock = FakeClock()
+    stop = asyncio.Event()
+    session = ReconnectingSession(stop, outcomes=("eof", "stop"))
+    symbols = ("XYZ-NADO", "ABC-NADO")
+    adapter = CombinedFakeAdapter(
+        Venue.NADO, clock, settlement_at=NOW + timedelta(minutes=5)
+    )
+
+    async def no_delay(_seconds: float) -> None:
+        await asyncio.sleep(0)
+
+    with PaperRepository(tmp_path / "simple-combined-reconnect.db") as repository:
+        runtime = PublicPaperRuntime(repository, adapters={}, clock=clock, sleep=no_delay)
+        runtime._session = session
+        runtime._stop_event = stop
+        await runtime._combined_stream(Venue.NADO, adapter, symbols)
+        lifecycle = repository.connection.execute(
+            "SELECT recorded_at,event_type,venue,detail FROM runtime_evidence "
+            "WHERE event_type IN "
+            "('PUBLIC_SOCKET_DISCONNECTED','PUBLIC_SOCKET_RECONNECTED') "
+            "ORDER BY evidence_id"
+        ).fetchall()
+
+    assert session.connections == 2
+    assert len(lifecycle) == 2
+    assert lifecycle[0]["event_type"] == "PUBLIC_SOCKET_DISCONNECTED"
+    assert lifecycle[1]["event_type"] == "PUBLIC_SOCKET_RECONNECTED"
+    assert {row["venue"] for row in lifecycle} == {"NADO"}
+    disconnected, reconnected = assert_socket_episode(lifecycle)
+    assert disconnected["episode_id"] == reconnected["episode_id"]
+    assert disconnected["stream_kind"] == reconnected["stream_kind"] == "combined"
+    assert disconnected["markets"] == reconnected["markets"] == [
+        "ABC-NADO", "XYZ-NADO",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_failed_extended_reconnect_attempts_do_not_duplicate_episode(tmp_path):
     clock = FakeClock()
     stop = asyncio.Event()
