@@ -1,9 +1,15 @@
-# No active implementation task
+# TELEGRAM-002-FIX-001 — Two-Decimal Bot Values
 
-PAPER-007-FIX-005 — First Full-Scan Funding Freshness is accepted at `b5c1db0ec7f226914976f60a732ce9dfd58ff113`.
+## Objective
 
-PAPER-007-FIX-006 — RISEx Checksum Resubscribe Recovery is accepted at `1333df09f2b94bd977dc007fb9fb2a0d0f5cac6f`.
+Render every monetary PnL/funding value shown in outbound Telegram text with exactly two digits after the decimal point.
 
-Stage B continues on published accepted FIX-006 under PID `60720` in detached screen `risex-paper007-stageb-fix006-telegram`, using `paper-007-stage-b-fix003-accepted.db`. Outbound Telegram is enabled from inherited environment; secrets are absent from commands, process titles, logs, Git, SQLite, and evidence. The first new FULL scan and digest source were verified. Do not force-close a position or start live trading.
+## Scope and acceptance
 
-No further implementation milestone is authorized.
+- Branch: `codex/telegram-002-fix-001-two-decimals` from current main.
+- Use one presentation-only Decimal formatter for FULL digest Expected PnL, eligible-opportunity Expected PnL, position-closed final PnL, and funding received/reconciled cash.
+- Numeric text must always contain exactly two fractional digits, including zero and negative values. UNKNOWN remains UNKNOWN.
+- Preserve full-precision values in notification payload fields, Scanner results, SQLite, evidence, and decision/dedupe inputs.
+- Add focused tests for rounding, trailing zeroes, negative/sub-cent values, UNKNOWN, and authoritative payload precision; run full pytest, compileall, and diff-check.
+- Do not change economics, fees, sizing, ranking, funding rules, cadence, lifecycle, adapters/endpoints, secrets, or paper/live boundaries.
+- Do not touch the active Stage B process/database during implementation or review. After acceptance, restart only if flat and safe.

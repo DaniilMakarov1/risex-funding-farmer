@@ -2,7 +2,7 @@
 
 - Accepted implementation: PAPER-007-FIX-006 — RISEx Checksum Resubscribe Recovery @ `1333df09f2b94bd977dc007fb9fb2a0d0f5cac6f`
 - Previous accepted implementation: PAPER-007-FIX-005 — First Full-Scan Funding Freshness @ `b5c1db0ec7f226914976f60a732ce9dfd58ff113`
-- Active implementation task: none
+- Active implementation task: TELEGRAM-002-FIX-001 — Two-Decimal Bot Values
 - PAPER-007 Stage A scheduling validation: PASS
 - PAPER-007 Stage B: running on accepted published FIX-006 with the same database and outbound Telegram enabled
 - Preserved Stage B evidence: `paper-007-stage-a-fix002.db`, SHA-256 `6c9bddbf3e10e5690f8e5d5327adf5c35fad4f2044d96fdb9445b3bd567e68ff`
@@ -29,3 +29,5 @@ PAPER-007-FIX-006 is accepted after 171 deterministic tests. A two-market combin
 The pre-fix PID `50755` later entered the confirmed RISEx REST-recovery storm, remained flat, and stopped `STOPPED_SAFE` with `forced_close=false`. The same database resumed on accepted FIX-006 under PID `58010` in detached screen `risex-paper007-stageb-fix006-no-telegram`. Startup refresh completed, all venues reached public readiness, and the first `FULL` scan at `2026-08-21T09:25:20.740721Z` had 8 authoritative numeric PnLs instead of zero; the remaining unknown routes retained explicit market/funding blockers. Telegram is disabled because the old detached session ended with its environment and no secret was copied into commands or logs.
 
 Independent Architect verification passed 71 focused and 171 full deterministic tests, compileall, diff-check, and secret scans. The six-commit local chain was published by ordinary fast-forward. At restart time PID `58010` and its screen had already exited; persisted evidence showed `STOPPED_SAFE` with `forced_close=false`, database integrity was `ok`, and orders/fills/open positions were `0/0/0`. Stage B resumed on the same database under PID `60720` in detached screen `risex-paper007-stageb-fix006-telegram`. STARTED, READY, and a bounded post-READY refresh completed; RISEx, Extended, and Nado reached readiness. The first new `FULL` scan completed at `2026-08-21T09:55:23.410050Z`; its 15-row Telegram digest source contained 6 numeric PnLs and 9 fail-closed UNKNOWN rows (4 market/parity blockers and 5 funding-eligibility/elapsed-cycle blockers). No natural RISEx checksum mismatch occurred after restart, and no RISEx REST snapshot-recovery storm or false socket lifecycle evidence was observed. Telegram delivery success remains intentionally unpersisted and requires recipient-side confirmation.
+
+TELEGRAM-002-FIX-001 is authorized only to render monetary values in outbound Telegram text with exactly two fractional digits. Authoritative Decimal values, Scanner/economics, persistence, decisions, scheduling, dedupe semantics, and the running Stage B remain unchanged until acceptance.
