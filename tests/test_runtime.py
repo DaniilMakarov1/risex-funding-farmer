@@ -685,6 +685,17 @@ def test_component_reconcile_preserves_concrete_extended_failure_detail(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_shared_public_runtime_session_has_thirty_second_timeout_and_closes(tmp_path):
+    with PaperRepository(tmp_path / "public-session-timeout.db") as repository:
+        async with PublicPaperRuntime(repository) as runtime:
+            session = runtime._session
+            assert session is not None
+            assert session.timeout.total == 30
+            assert not session.closed
+    assert session.closed
+
+
+@pytest.mark.asyncio
 async def test_paper_run_persists_through_no_trade_until_explicit_stop(tmp_path):
     clock = FakeClock()
     fakes = adapters(

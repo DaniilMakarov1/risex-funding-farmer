@@ -76,7 +76,7 @@ def _next_absolute_slot(
 
 
 def _public_session() -> aiohttp.ClientSession:
-    return aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
+    return aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
 
 
 def _http_status(exc: BaseException) -> int | None:
