@@ -100,6 +100,7 @@ class CanonicalMarket:
     is_active: bool
     is_rfq: bool
     is_off_hours: bool
+    evidence_blockers: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

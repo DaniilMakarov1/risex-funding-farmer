@@ -382,6 +382,9 @@ def evaluate_route(
         raise ValueError("route must be RISEx to Extended or Nado")
     reasons: list[str] = []
     markets = (risex.market, hedge.market)
+    reasons.extend(
+        blocker for market in markets for blocker in market.evidence_blockers
+    )
     if not all(_market_is_eligible(market) for market in markets):
         reasons.append(NoTradeReason.MARKET_INELIGIBLE)
     if (

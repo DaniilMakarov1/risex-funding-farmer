@@ -49,6 +49,7 @@ class RisexAdapter(PublicAdapter):
         self._metadata_consistent: set[str] = set()
         self._book_units_consistent: set[str] = set()
         self._trade_units_consistent: set[str] = set()
+        self._unit_blockers: dict[str, tuple[str, ...]] = {}
 
     async def fetch_markets(self) -> tuple[CanonicalMarket, ...]:
         payload = await self._get_json("/v1/markets", params={"force_refresh": "true"})
@@ -84,13 +85,28 @@ class RisexAdapter(PublicAdapter):
         synthetic = bool(re.match(r"^\d", canonical_asset)) or any(
             bool(row.get(name) or config.get(name)) for name in ("deprecated", "synthetic", "is_synthetic")
         )
-        multiple = grids["min_order_size"] / grids["step_size"]
+        grids_positive = all(value > 0 for value in grids.values())
+        multiple = (
+            grids["min_order_size"] / grids["step_size"]
+            if grids["step_size"] > 0 else None
+        )
         multiplier = row.get("multiplier", config.get("multiplier"))
         metadata_consistent = (
-            mapping_consistent and not synthetic and all(value > 0 for value in grids.values())
-            and multiple == multiple.to_integral_value()
+            mapping_consistent and not synthetic and grids_positive
+            and multiple is not None and multiple == multiple.to_integral_value()
             and (multiplier is None or decimal_value(multiplier, "multiplier") == 1)
         )
+        metadata_blockers: list[str] = []
+        if not mapping_consistent:
+            metadata_blockers.append("RISEX_SYMBOL_MAPPING_INCONSISTENT")
+        if synthetic:
+            metadata_blockers.append("RISEX_SYNTHETIC_OR_DEPRECATED_PRODUCT")
+        if not grids_positive:
+            metadata_blockers.append("RISEX_GRID_OR_MINIMUM_NONPOSITIVE")
+        if multiple is not None and multiple != multiple.to_integral_value():
+            metadata_blockers.append("RISEX_MINIMUM_NOT_STEP_ALIGNED")
+        if multiplier is not None and decimal_value(multiplier, "multiplier") != 1:
+            metadata_blockers.append("RISEX_MULTIPLIER_NOT_ONE")
         (self._metadata_consistent.add if metadata_consistent else self._metadata_consistent.discard)(symbol)
         fallback_consistent = (
             RISEX_PAPER_FALLBACK_ASSUMPTIONS_ENABLED
@@ -102,6 +118,15 @@ class RisexAdapter(PublicAdapter):
             and symbol in self._book_units_consistent
             and symbol in self._trade_units_consistent
         )
+        evidence_blockers = tuple(dict.fromkeys((
+            *metadata_blockers,
+            *(() if symbol in self._book_units_consistent else self._unit_blockers.get(
+                f"book:{symbol}", ("RISEX_BOOK_UNIT_EVIDENCE_MISSING",)
+            )),
+            *(() if symbol in self._trade_units_consistent else self._unit_blockers.get(
+                f"trade:{symbol}", ("RISEX_TRADE_UNIT_EVIDENCE_MISSING",)
+            )),
+        )))
         return CanonicalMarket(
             canonical_asset=canonical_asset,
             venue=Venue.RISEX,
@@ -120,6 +145,7 @@ class RisexAdapter(PublicAdapter):
             is_active=bool(row.get("active", True)) and bool(config.get("unlocked", False)),
             is_rfq=False,
             is_off_hours=False,
+            evidence_blockers=evidence_blockers,
         )
 
     def normalize_volume(self, row: Any, *, observed_at: datetime) -> MarketVolume:
@@ -161,6 +187,7 @@ class RisexAdapter(PublicAdapter):
         if not trades:
             self._trade_units_consistent.discard(market.venue_symbol)
         all_valid = bool(trades)
+        failure_blockers: list[str] = []
         for ordinal, raw in enumerate(trades, 1):
             trade = require_mapping(raw, "trade history row")
             self.normalize_trade(
@@ -173,9 +200,17 @@ class RisexAdapter(PublicAdapter):
                 session_id="REST_TRADE_HISTORY",
                 ordinal=ordinal,
             )
-            all_valid = all_valid and market.venue_symbol in self._trade_units_consistent
+            row_valid = market.venue_symbol in self._trade_units_consistent
+            if not row_valid:
+                failure_blockers.extend(self._unit_blockers.get(
+                    f"trade:{market.venue_symbol}", ()
+                ))
+            all_valid = all_valid and row_valid
         if not all_valid:
             self._trade_units_consistent.discard(market.venue_symbol)
+            self._unit_blockers[f"trade:{market.venue_symbol}"] = tuple(
+                dict.fromkeys(failure_blockers or ["RISEX_TRADE_UNIT_EVIDENCE_EMPTY"])
+            )
         return self.normalize_market(self._raw_markets[market.venue_symbol])
 
     def normalize_book(self, data: Any, *, observed_at: datetime) -> OrderBook:
@@ -198,15 +233,23 @@ class RisexAdapter(PublicAdapter):
             config = require_mapping(raw.get("config"), "market.config")
             step = decimal_value(config["step_size"], "step_size")
             price_step = decimal_value(config["step_price"], "step_price")
-            minimum = decimal_value(config["min_order_size"], "min_order_size")
-            valid = bool(bids or asks) and all(
-                level.canonical_quantity >= minimum
-                and level.canonical_quantity / step == (level.canonical_quantity / step).to_integral_value()
-                and level.canonical_price / price_step == (level.canonical_price / price_step).to_integral_value()
-                for level in bids + asks
-            )
+            levels_all = bids + asks
+            blockers: list[str] = []
+            if not levels_all:
+                blockers.append("RISEX_BOOK_UNIT_EVIDENCE_EMPTY")
+            if any(level.canonical_quantity <= 0 for level in levels_all):
+                blockers.append("RISEX_BOOK_QUANTITY_NONPOSITIVE")
+            if any(level.canonical_quantity / step != (level.canonical_quantity / step).to_integral_value() for level in levels_all):
+                blockers.append("RISEX_BOOK_QUANTITY_OFF_STEP")
+            if any(level.canonical_price <= 0 for level in levels_all):
+                blockers.append("RISEX_BOOK_PRICE_NONPOSITIVE")
+            if any(level.canonical_price / price_step != (level.canonical_price / price_step).to_integral_value() for level in levels_all):
+                blockers.append("RISEX_BOOK_PRICE_OFF_TICK")
+            valid = not blockers
         except (KeyError, TypeError, ValueError):
             valid = False
+            blockers = ["RISEX_BOOK_UNIT_EVIDENCE_INVALID"]
+        self._unit_blockers[f"book:{symbol}"] = tuple(blockers)
         (self._book_units_consistent.add if valid else self._book_units_consistent.discard)(symbol)
         return OrderBook(Venue.RISEX, symbol, bids, asks, observed_at)
 
@@ -270,14 +313,20 @@ class RisexAdapter(PublicAdapter):
             config = require_mapping(raw.get("config"), "market.config")
             step = decimal_value(config["step_size"], "step_size")
             price_step = decimal_value(config["step_price"], "step_price")
-            minimum = decimal_value(config["min_order_size"], "min_order_size")
-            valid = (
-                quantity >= minimum
-                and quantity / step == (quantity / step).to_integral_value()
-                and price / price_step == (price / price_step).to_integral_value()
-            )
+            blockers = []
+            if quantity <= 0:
+                blockers.append("RISEX_TRADE_QUANTITY_NONPOSITIVE")
+            if quantity / step != (quantity / step).to_integral_value():
+                blockers.append("RISEX_TRADE_QUANTITY_OFF_STEP")
+            if price <= 0:
+                blockers.append("RISEX_TRADE_PRICE_NONPOSITIVE")
+            if price / price_step != (price / price_step).to_integral_value():
+                blockers.append("RISEX_TRADE_PRICE_OFF_TICK")
+            valid = not blockers
         except (KeyError, TypeError, ValueError):
             valid = False
+            blockers = ["RISEX_TRADE_UNIT_EVIDENCE_INVALID"]
+        self._unit_blockers[f"trade:{market}"] = tuple(blockers)
         (self._trade_units_consistent.add if valid else self._trade_units_consistent.discard)(market)
         return TradeEvidence(
             key,

@@ -42,16 +42,16 @@ def format_telegram_money(value: Decimal | str | None) -> str:
         return "0.00" if rounded.is_zero() else str(rounded)
 
 
-def full_scan_digest_payload(
+def full_scan_digest_payloads(
     *,
     scan_at: datetime,
     opportunity: bool,
     route_rows: Sequence[Mapping[str, object]],
-) -> NotificationPayload:
+) -> tuple[NotificationPayload, ...]:
     scan_utc = utc_time(scan_at)
     status = "OPPORTUNITY" if opportunity else "NO TRADE"
-    lines = [f"Full Scan | Scan UTC: {scan_utc.isoformat()} | Status: {status}"]
-    for row in route_rows[:15]:
+    route_lines: list[str] = []
+    for row in route_rows:
         ticker = _bounded_digest_field(str(row.get("canonical_asset") or "UNKNOWN"), 48)
         hedge = str(row.get("hedge_venue") or "UNKNOWN")
         direction = row.get("direction")
@@ -66,20 +66,45 @@ def full_scan_digest_payload(
         pnl_display = format_telegram_money(
             None if pnl is None else str(pnl)
         )
-        pnl_field = "Expected PnL: " + (
-            "UNKNOWN" if pnl_display == "UNKNOWN" else f"${pnl_display}"
-        )
-        lines.append(
+        if pnl_display == "UNKNOWN":
+            blockers = row.get("blockers")
+            blocker = (
+                str(blockers[0])
+                if isinstance(blockers, (list, tuple)) and blockers
+                else "AUTHORITATIVE_VALUE_UNAVAILABLE"
+            )
+            pnl_field = f"Expected PnL: UNKNOWN ({blocker})"
+        else:
+            pnl_field = f"Expected PnL: ${pnl_display}"
+        route_lines.append(
             f"{ticker} | {route} | {_bounded_digest_field(pnl_field, 92)}"
         )
-    text = "\n".join(lines)
-    assert len(text) <= 4096
-    return NotificationPayload(
-        f"full-scan-digest:{scan_utc.isoformat()}",
-        "FULL_SCAN_DIGEST",
-        scan_utc,
-        text,
+    header_budget = len(
+        f"Full Scan 99/99 | Scan UTC: {scan_utc.isoformat()} | Status: {status}\n"
     )
+    groups: list[list[str]] = [[]]
+    current_length = header_budget
+    for line in route_lines:
+        added = len(line) + 1
+        if groups[-1] and current_length + added > 4096:
+            groups.append([])
+            current_length = header_budget
+        groups[-1].append(line)
+        current_length += added
+    total = len(groups)
+    payloads: list[NotificationPayload] = []
+    for index, group in enumerate(groups, 1):
+        header = (
+            f"Full Scan {index}/{total} | Scan UTC: {scan_utc.isoformat()} | "
+            f"Status: {status}"
+        )
+        text = "\n".join((header, *group))
+        assert len(text) <= 4096
+        payloads.append(NotificationPayload(
+            f"full-scan-digest:{scan_utc.isoformat()}:part:{index}:{total}",
+            "FULL_SCAN_DIGEST", scan_utc, text,
+        ))
+    return tuple(payloads)
 
 
 def _bounded_digest_field(value: str, width: int) -> str:

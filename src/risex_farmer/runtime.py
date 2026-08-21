@@ -14,7 +14,7 @@ from typing import Any, Protocol
 import aiohttp
 
 from .config import PAPER_CONFIG, PaperConfig
-from .exchanges.base import PublicAdapter
+from .exchanges.base import PublicAdapter, PublicDataUnavailable
 from .exchanges.extended import ExtendedAdapter
 from .exchanges.nado import NadoAdapter
 from .exchanges.risex import RisexAdapter
@@ -41,7 +41,7 @@ from .notifications import (
     NotificationOutbox,
     NotificationPayload,
     format_telegram_money,
-    full_scan_digest_payload,
+    full_scan_digest_payloads,
     utc_time,
 )
 from .paper_broker import PaperEntryBroker, PaperEntryState
@@ -287,6 +287,9 @@ class PublicPaperRuntime:
         self._pending_socket_episodes: dict[
             tuple[Venue, str, tuple[str, ...]], dict[str, object]
         ] = {}
+        self._pending_watchdog_episodes: dict[
+            tuple[Venue, str, tuple[str, ...]], dict[str, object]
+        ] = {}
         self._socket_episode_number = 0
         self._stop_event: asyncio.Event | None = None
         self._attempt_number = 0
@@ -301,8 +304,15 @@ class PublicPaperRuntime:
         self.focused_cycle: TargetFundingCycle | None = None
         self.component_readiness: dict[Venue, dict[str, VenueReadiness]] = {}
         self._last_catalog_good_at: dict[Venue, datetime] = {}
+        self._extended_universe_at: datetime | None = None
+        self._extended_metadata_at: dict[str, datetime] = {}
+        self._extended_universe_task: asyncio.Task[None] | None = None
+        self.next_extended_catalog_at: datetime | None = None
         self.notifications = notifications
         self._notification_run_id: str | None = None
+        self._stop_cause: str | None = None
+        self._stop_requested_at: datetime | None = None
+        self._background_fatal: BaseException | None = None
 
     async def __aenter__(self) -> PublicPaperRuntime:
         if self.adapters is None:
@@ -334,7 +344,7 @@ class PublicPaperRuntime:
         now = at or self.clock.now()
         if event_type in {
             "PUBLIC_SOCKET_DISCONNECTED", "PUBLIC_BOOK_RESYNC_REQUIRED",
-            "PUBLIC_SNAPSHOT_RECOVERY_FAILED",
+            "PUBLIC_SNAPSHOT_RECOVERY_FAILED", "PUBLIC_STREAM_CONFIRMATION_STALE",
         }:
             self._notify_outage(
                 event_type, degraded=True, venue=venue, detail=detail,
@@ -346,6 +356,7 @@ class PublicPaperRuntime:
             )
         elif event_type in {
             "PUBLIC_SOCKET_RECONNECTED", "PUBLIC_SNAPSHOT_RECOVERY_COMPLETED",
+            "PUBLIC_STREAM_RESTARTED",
         }:
             episode = None if detail is None else detail.get("episode_id")
             recovery_id = episode or (
@@ -525,7 +536,7 @@ class PublicPaperRuntime:
     def _symbol_components_available(self, venue: Venue, symbol: str) -> bool:
         components = self.component_readiness.get(venue, {})
         catalog = components.get("catalog")
-        if catalog is not None and not catalog.available:
+        if venue is not Venue.EXTENDED and catalog is not None and not catalog.available:
             return False
         return all(
             row.available
@@ -566,6 +577,10 @@ class PublicPaperRuntime:
 
     async def _catalog(self, venue: Venue, adapter: PublicAdapter) -> None:
         at = self.clock.now()
+        if isinstance(adapter, ExtendedAdapter) and self._stop_event is not None:
+            self._start_extended_universe_refresh()
+            self._update_extended_catalog_readiness(at)
+            return
         try:
             if isinstance(adapter, ExtendedAdapter):
                 markets, volumes = await adapter.fetch_catalog()
@@ -573,10 +588,13 @@ class PublicPaperRuntime:
                 markets, volumes = await asyncio.gather(
                     adapter.fetch_markets(), adapter.fetch_volumes()  # type: ignore[attr-defined]
                 )
-            self.markets[venue] = tuple(markets)
-            for volume in volumes:
-                self.volumes[(venue, volume.canonical_market)] = volume
             completed = self.clock.now()
+            if isinstance(adapter, ExtendedAdapter):
+                self._install_extended_catalog(markets, volumes, completed, full=True)
+            else:
+                self.markets[venue] = tuple(markets)
+                for volume in volumes:
+                    self.volumes[(venue, volume.canonical_market)] = volume
             self._last_catalog_good_at[venue] = completed
             self._set_component_readiness(
                 venue, "catalog", True, "PUBLIC_REST_READY", completed
@@ -590,7 +608,10 @@ class PublicPaperRuntime:
                     ))),
                 },
             )
-        except Exception as exc:
+        except (
+            aiohttp.ClientError, TimeoutError, OSError, PublicDataUnavailable,
+            ValueError, KeyError, TypeError,
+        ) as exc:
             self._set_component_readiness(
                 venue, "catalog", False,
                 f"PUBLIC_REST_UNAVAILABLE:{type(exc).__name__}", at,
@@ -613,6 +634,153 @@ class PublicPaperRuntime:
                     ),
                 },
             )
+
+    def _install_extended_catalog(
+        self, markets: tuple[Any, ...], volumes: tuple[MarketVolume, ...],
+        at: datetime, *, full: bool,
+    ) -> None:
+        symbols = tuple(market.venue_symbol for market in markets)
+        if not symbols or len(set(symbols)) != len(symbols):
+            raise ValueError("Extended catalog is empty or duplicated")
+        volume_map = {row.canonical_market: row for row in volumes}
+        if len(volume_map) != len(volumes) or set(volume_map) != set(symbols):
+            raise ValueError("Extended catalog volumes are incomplete")
+        if full:
+            self.markets[Venue.EXTENDED] = tuple(markets)
+            self._extended_universe_at = at
+            self._extended_metadata_at = {symbol: at for symbol in symbols}
+        else:
+            replacements = {market.venue_symbol: market for market in markets}
+            current = tuple(self.markets.get(Venue.EXTENDED, ()))
+            if not set(replacements) <= {market.venue_symbol for market in current}:
+                raise ValueError("required Extended metadata is outside universe")
+            self.markets[Venue.EXTENDED] = tuple(
+                replacements.get(market.venue_symbol, market) for market in current
+            )
+            for symbol in symbols:
+                self._extended_metadata_at[symbol] = at
+        for symbol, volume in volume_map.items():
+            self.volumes[Venue.EXTENDED, symbol] = volume
+
+    def _update_extended_catalog_readiness(self, at: datetime) -> None:
+        if self._extended_universe_at is None:
+            available, detail = False, "CATALOG_UNAVAILABLE"
+        elif at - self._extended_universe_at > timedelta(
+            seconds=self.config.extended_universe_max_age_seconds
+        ):
+            available, detail = False, "CATALOG_STALE"
+        else:
+            available, detail = True, "PUBLIC_EXTENDED_CATALOG_READY"
+        self._set_component_readiness(
+            Venue.EXTENDED, "catalog", available, detail, at
+        )
+
+    async def _refresh_extended_universe(self) -> None:
+        assert self.adapters is not None
+        adapter = self.adapters.get(Venue.EXTENDED)
+        if not isinstance(adapter, ExtendedAdapter):
+            return
+        try:
+            markets, volumes = await adapter.fetch_catalog()
+            completed = self.clock.now()
+            self._install_extended_catalog(markets, volumes, completed, full=True)
+            self._last_catalog_good_at[Venue.EXTENDED] = completed
+            self._update_extended_catalog_readiness(completed)
+            self._record(
+                "PUBLIC_REQUEST_COMPLETED", at=completed, venue=Venue.EXTENDED,
+                detail={
+                    "component": "extended_universe",
+                    "timeout_seconds": self.config.extended_catalog_timeout_seconds,
+                },
+            )
+        except asyncio.CancelledError:
+            raise
+        except (
+            aiohttp.ClientError, TimeoutError, OSError, PublicDataUnavailable,
+            ValueError, KeyError, TypeError,
+        ) as exc:
+            self._update_extended_catalog_readiness(self.clock.now())
+            self._record(
+                "PUBLIC_REQUEST_FAILED", venue=Venue.EXTENDED,
+                detail={
+                    "component": "extended_universe", "endpoint_class": "catalog",
+                    "exception_class": type(exc).__name__,
+                    "timeout_seconds": self.config.extended_catalog_timeout_seconds,
+                    "cache_state": (
+                        "CACHED_LAST_GOOD" if self._extended_universe_at is not None
+                        and self.clock.now() - self._extended_universe_at <= timedelta(
+                            seconds=self.config.extended_universe_max_age_seconds
+                        ) else "FAIL_CLOSED"
+                    ),
+                },
+            )
+        finally:
+            self._extended_universe_task = None
+
+    def _start_extended_universe_refresh(self) -> None:
+        if self._extended_universe_task is not None and not self._extended_universe_task.done():
+            return
+        self._extended_universe_task = asyncio.create_task(
+            self._refresh_extended_universe()
+        )
+        self._extended_universe_task.add_done_callback(self._background_task_done)
+
+    async def _refresh_extended_required(self) -> None:
+        assert self.adapters is not None
+        adapter = self.adapters.get(Venue.EXTENDED)
+        if not isinstance(adapter, ExtendedAdapter) or self._extended_universe_at is None:
+            return
+        symbols = tuple(sorted(self._required_extended_symbols()))
+        if not symbols:
+            return
+        try:
+            markets, volumes = await adapter.fetch_required_catalog(symbols)
+            self._install_extended_catalog(
+                markets, volumes, self.clock.now(), full=False
+            )
+            self._record(
+                "PUBLIC_REQUEST_COMPLETED", venue=Venue.EXTENDED,
+                detail={"component": "required_market_metadata", "symbols": list(symbols)},
+            )
+        except asyncio.CancelledError:
+            raise
+        except (
+            aiohttp.ClientError, TimeoutError, OSError, PublicDataUnavailable,
+            ValueError, KeyError, TypeError,
+        ) as exc:
+            self._record(
+                "PUBLIC_REQUEST_FAILED", venue=Venue.EXTENDED,
+                detail={
+                    "component": "required_market_metadata",
+                    "endpoint_class": "market_query", "exception_class": type(exc).__name__,
+                    "cache_state": (
+                        "CACHED_LAST_GOOD"
+                        if all(
+                            symbol in self._extended_metadata_at
+                            and self.clock.now() - self._extended_metadata_at[symbol]
+                            <= timedelta(seconds=self.config.extended_required_metadata_max_age_seconds)
+                            for symbol in symbols
+                        ) else "FAIL_CLOSED"
+                    ),
+                },
+            )
+
+    def _extended_market_with_cache_blocker(
+        self, market: Any, at: datetime
+    ) -> Any:
+        blockers = list(market.evidence_blockers)
+        if self._extended_universe_at is None:
+            blockers.append("CATALOG_UNAVAILABLE")
+        elif at - self._extended_universe_at > timedelta(
+            seconds=self.config.extended_universe_max_age_seconds
+        ):
+            blockers.append("CATALOG_STALE")
+        metadata_at = self._extended_metadata_at.get(market.venue_symbol)
+        if metadata_at is None or at - metadata_at > timedelta(
+            seconds=self.config.extended_required_metadata_max_age_seconds
+        ):
+            blockers.append("MARKET_METADATA_STALE")
+        return replace(market, evidence_blockers=tuple(dict.fromkeys(blockers)))
 
     def _candidate_markets(self) -> tuple[Any, ...]:
         by_venue_asset: dict[tuple[Venue, str], Any] = {}
@@ -671,7 +839,17 @@ class PublicPaperRuntime:
         if position is not None and position.route_key.canonical_asset not in selected:
             selected.append(position.route_key.canonical_asset)
         result = list(
-            by_venue_asset[(venue, asset)]
+            (
+                self._extended_market_with_cache_blocker(
+                    by_venue_asset[(venue, asset)], self.clock.now()
+                )
+                if (
+                    venue is Venue.EXTENDED
+                    and self.adapters is not None
+                    and isinstance(self.adapters.get(Venue.EXTENDED), ExtendedAdapter)
+                )
+                else by_venue_asset[(venue, asset)]
+            )
             for asset in selected
             for venue in (Venue.RISEX, Venue.EXTENDED, Venue.NADO)
             if (venue, asset) in by_venue_asset
@@ -833,6 +1011,15 @@ class PublicPaperRuntime:
         logical_at = self.clock.now()
         normalized: list[MarketObservation] = []
         for observation in self.observations.values():
+            market = observation.market
+            if (
+                market.venue is Venue.EXTENDED
+                and self.adapters is not None
+                and isinstance(self.adapters.get(Venue.EXTENDED), ExtendedAdapter)
+            ):
+                market = self._extended_market_with_cache_blocker(
+                    market, logical_at
+                )
             funding = observation.funding
             if funding is not None:
                 funding = _quote_for_open_time(funding, logical_at)
@@ -849,7 +1036,9 @@ class PublicPaperRuntime:
                 health = replace(
                     health, stream_connected=False, data_quality=DataQuality.DEGRADED
                 )
-            normalized.append(replace(observation, funding=funding, health=health))
+            normalized.append(replace(
+                observation, market=market, funding=funding, health=health
+            ))
         snapshot = await scan_once(normalized, logical_at, config=self.config)
         persist_scan = (
             self.last_scan is None or self.last_scan.logical_at != logical_at
@@ -903,41 +1092,15 @@ class PublicPaperRuntime:
             )
             for plan in rows
         )
-        if not route_rows:
-            unavailable_rows: list[dict[str, object]] = []
-            for venue in (Venue.EXTENDED, Venue.NADO):
-                for market in self.markets.get(venue, ()):
-                    if not market.is_active:
-                        continue
-                    for direction in RouteDirection:
-                        route_key = f"{market.canonical_asset}|{venue.value}|{direction.value}"
-                        unavailable_rows.append({
-                            "rank": None, "route_key": route_key,
-                            "canonical_asset": market.canonical_asset,
-                            "hedge_venue": venue.value, "direction": direction.value,
-                            "entry_allowed": False,
-                            "risex_contract_assumption_used": False,
-                            "risex_funding_eligibility_assumption_used": False,
-                            "risex_funding_estimate_assumption_used": False,
-                            "paper_assumption_used": False,
-                            "blockers": [
-                                f"{missing.value}:{state.detail}"
-                                for missing, state in self.readiness.items() if not state.available
-                            ] or ["REQUIRED_ROUTE_MARKET_UNAVAILABLE"],
-                            "source_quality": {"risex_contract": "UNKNOWN", "risex_funding": {"source": None, "marker": "UNKNOWN"}},
-                            "assumption_flags": _assumption_flags(),
-                        })
-            route_rows = tuple(unavailable_rows)
-        route_rows = route_rows[:15]
         if persist_scan:
             self.repository.save_public_route_rows(logical_at=logical_at, rows=route_rows)
             self._notify_opportunity(snapshot)
             if self.notifications is not None and scan_kind == "FULL":
-                self.notifications.event(full_scan_digest_payload(
-                    scan_at=logical_at,
-                    opportunity=snapshot.winner is not None,
+                for payload in full_scan_digest_payloads(
+                    scan_at=logical_at, opportunity=snapshot.winner is not None,
                     route_rows=route_rows,
-                ))
+                ):
+                    self.notifications.event(payload)
         unavailable = {
             venue.value: state.detail
             for venue, state in self.readiness.items()
@@ -998,8 +1161,14 @@ class PublicPaperRuntime:
         self._record("PUBLIC_REFRESH_STARTED", at=started)
         try:
             await asyncio.gather(
-                *(self._catalog(venue, adapter) for venue, adapter in self.adapters.items())
+                *(
+                    self._catalog(venue, adapter)
+                    for venue, adapter in self.adapters.items()
+                    if venue is not Venue.EXTENDED
+                )
             )
+            await self._refresh_extended_required()
+            self._update_extended_catalog_readiness(self.clock.now())
             assumed_at = self.clock.now()
             await asyncio.gather(*(
                 self._market_observation(market, assumed_at, background=True)
@@ -1017,17 +1186,26 @@ class PublicPaperRuntime:
             )
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
-            self._record(
-                "PUBLIC_REFRESH_FAILED", venue=None,
-                detail={"exception_class": type(exc).__name__},
-            )
 
     def _start_public_refresh(self) -> None:
         if self._refresh_task is not None and not self._refresh_task.done():
             self._record("PUBLIC_REFRESH_COALESCED")
             return
         self._refresh_task = asyncio.create_task(self._refresh_public_data())
+        self._refresh_task.add_done_callback(self._background_task_done)
+
+    def _background_task_done(self, task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            return
+        exception = task.exception()
+        if exception is None or self._stop_cause == "RUNTIME_FATAL":
+            return
+        self._background_fatal = exception
+        self._request_stop("RUNTIME_FATAL")
+        self._record(
+            "RUNTIME_FATAL", at=self._stop_requested_at,
+            detail={"exception_class": type(exception).__name__},
+        )
 
     def _observation(self, venue: Venue, symbol: str, at: datetime) -> MarketObservation:
         row = self.observations[(venue, symbol)]
@@ -1127,6 +1305,21 @@ class PublicPaperRuntime:
 
     async def tick(self, at: datetime | None = None) -> None:
         now = at or self.clock.now()
+        if (
+            self.next_extended_catalog_at is not None
+            and now >= self.next_extended_catalog_at
+        ):
+            scheduled_catalog = self.next_extended_catalog_at
+            self._start_extended_universe_refresh()
+            self.next_extended_catalog_at = _next_absolute_slot(
+                scheduled_catalog, now,
+                self.config.extended_universe_refresh_seconds,
+            )
+        if (
+            self.adapters is not None
+            and isinstance(self.adapters.get(Venue.EXTENDED), ExtendedAdapter)
+        ):
+            self._update_extended_catalog_readiness(now)
         maker_was_active = bool(
             self.broker is not None
             and self.broker.state.lifecycle_state is LifecycleState.ENTRY_MAKER_OPEN
@@ -1687,12 +1880,39 @@ class PublicPaperRuntime:
         ]
         for symbol, kind in sorted(stale):
             identity = (Venue.EXTENDED, kind, (symbol,))
-            self._socket_disconnected(identity, at=at)
+            self._watchdog_stale(identity, at=at)
             await self.mark_disconnected(
                 Venue.EXTENDED, symbol, at=at, stream_kind=kind,
                 exception=TimeoutError("public socket confirmation stale"),
             )
             await self._restart_extended_stream(symbol, kind)
+
+    def _watchdog_stale(
+        self, identity: tuple[Venue, str, tuple[str, ...]], *, at: datetime
+    ) -> None:
+        if identity in self._pending_watchdog_episodes:
+            return
+        venue, stream_kind, markets = identity
+        detail: dict[str, object] = {
+            "episode_id": f"watchdog:{venue.value}:{stream_kind}:{markets[0]}:{at.isoformat()}",
+            "stream_kind": stream_kind, "market": markets[0],
+            "stale_at": at.isoformat(),
+        }
+        self._pending_watchdog_episodes[identity] = detail
+        self._record(
+            "PUBLIC_STREAM_CONFIRMATION_STALE", at=at, venue=venue, detail=detail
+        )
+
+    def _watchdog_restarted(
+        self, identity: tuple[Venue, str, tuple[str, ...]], *, at: datetime
+    ) -> None:
+        detail = self._pending_watchdog_episodes.pop(identity, None)
+        if detail is None:
+            return
+        self._record(
+            "PUBLIC_STREAM_RESTARTED", at=at, venue=identity[0],
+            detail={**detail, "restarted_at": at.isoformat()},
+        )
 
     def _socket_disconnected(
         self,
@@ -1982,6 +2202,21 @@ class PublicPaperRuntime:
             self._stream_tasks.pop(key, None)
         self._start_extended_stream(symbol, kind)
 
+    async def _extended_heartbeat(self, ws: object) -> None:
+        try:
+            while self._stop_event is not None and not self._stop_event.is_set():
+                await self._sleep(10)
+                if self._stop_event.is_set():
+                    return
+                await ws.ping()  # type: ignore[attr-defined]
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            close = getattr(ws, "close", None)
+            if close is not None:
+                await close()
+            raise
+
     async def _recover_snapshot_in_background(
         self, venue: Venue, symbol: str
     ) -> None:
@@ -2046,52 +2281,65 @@ class PublicPaperRuntime:
                     self._socket_reconnected(
                         socket_identity, at=self.clock.now()
                     )
+                    self._watchdog_restarted(
+                        socket_identity, at=self.clock.now()
+                    )
                     delay = 1
                     ordinal = 0
-                    async for message in ws:
-                        if message.type is aiohttp.WSMsgType.PING:
-                            await ws.pong(message.data)
-                            self._confirm_extended_stream(
-                                symbol, kind, self.clock.now(), data_ready=False
-                            )
-                            continue
-                        if message.type is not aiohttp.WSMsgType.TEXT:
-                            continue
-                        payload = json.loads(message.data, parse_float=Decimal)
-                        if kind == "book":
-                            healthy = await self.apply_book_event(
-                                adapter.normalize_book_message(payload)
-                            )
-                            if healthy:
+                    heartbeat = asyncio.create_task(self._extended_heartbeat(ws))
+                    try:
+                        async for message in ws:
+                            if message.type is aiohttp.WSMsgType.PING:
+                                await ws.pong(message.data)
+                                self._confirm_extended_stream(
+                                    symbol, kind, self.clock.now(), data_ready=False
+                                )
+                                continue
+                            if message.type is aiohttp.WSMsgType.PONG:
+                                self._confirm_extended_stream(
+                                    symbol, kind, self.clock.now(), data_ready=False
+                                )
+                                continue
+                            if message.type is not aiohttp.WSMsgType.TEXT:
+                                continue
+                            payload = json.loads(message.data, parse_float=Decimal)
+                            if kind == "book":
+                                healthy = await self.apply_book_event(
+                                    adapter.normalize_book_message(payload)
+                                )
+                                if healthy:
+                                    self._confirm_extended_stream(
+                                        symbol, kind, self.clock.now(), data_ready=True
+                                    )
+                            elif kind == "trade":
+                                sequence, trades = adapter.normalize_trade_message(
+                                    payload, received_at=self.clock.now(),
+                                    session_id=str(id(ws)), starting_ordinal=ordinal,
+                                )
+                                previous = self._extended_trade_sequences.get(symbol)
+                                if previous is not None and sequence != previous + 1:
+                                    raise ValueError("Extended trade sequence gap")
+                                self._extended_trade_sequences[symbol] = sequence
                                 self._confirm_extended_stream(
                                     symbol, kind, self.clock.now(), data_ready=True
                                 )
-                        elif kind == "trade":
-                            sequence, trades = adapter.normalize_trade_message(
-                                payload, received_at=self.clock.now(),
-                                session_id=str(id(ws)), starting_ordinal=ordinal,
-                            )
-                            previous = self._extended_trade_sequences.get(symbol)
-                            if previous is not None and sequence != previous + 1:
-                                raise ValueError("Extended trade sequence gap")
-                            self._extended_trade_sequences[symbol] = sequence
-                            self._confirm_extended_stream(
-                                symbol, kind, self.clock.now(), data_ready=True
-                            )
-                            for trade in trades:
-                                ordinal += 1
-                                await self.deliver_trade(trade)
-                        else:
-                            row = self.observations.get((Venue.EXTENDED, symbol))
-                            if row is not None:
-                                settlement = adapter.normalize_applied_funding_message(
-                                    payload, row.market,
-                                )
-                                self._confirm_extended_stream(
-                                    symbol, kind, self.clock.now(), data_ready=True
-                                )
-                                if settlement is not None:
-                                    await self._apply_extended_funding_record(settlement)
+                                for trade in trades:
+                                    ordinal += 1
+                                    await self.deliver_trade(trade)
+                            else:
+                                row = self.observations.get((Venue.EXTENDED, symbol))
+                                if row is not None:
+                                    settlement = adapter.normalize_applied_funding_message(
+                                        payload, row.market,
+                                    )
+                                    self._confirm_extended_stream(
+                                        symbol, kind, self.clock.now(), data_ready=True
+                                    )
+                                    if settlement is not None:
+                                        await self._apply_extended_funding_record(settlement)
+                    finally:
+                        heartbeat.cancel()
+                        await asyncio.gather(heartbeat, return_exceptions=True)
                     if self._stop_event is None or not self._stop_event.is_set():
                         raise ConnectionError("public websocket closed")
             except asyncio.CancelledError:
@@ -2379,6 +2627,7 @@ class PublicPaperRuntime:
         deadlines = [value for value in (
             self.next_full_scan_at, self.next_focused_scan_at,
             self.next_position_monitor_at, self.next_health_check_at,
+            self.next_extended_catalog_at,
         ) if value is not None and value > now]
         if self.broker is not None and self.broker.state.order is not None:
             order = self.broker.state.order
@@ -2410,12 +2659,17 @@ class PublicPaperRuntime:
         installed: list[signal.Signals] = []
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
-                loop.add_signal_handler(sig, self._stop_event.set)
+                loop.add_signal_handler(
+                    sig, self._request_stop, sig.name
+                )
                 installed.append(sig)
             except (NotImplementedError, RuntimeError):
                 pass
         try:
             await self.scan()
+            self.next_extended_catalog_at = started_at + timedelta(
+                seconds=self.config.extended_universe_refresh_seconds
+            )
             await self._restore(self.last_scan.logical_at)
             self.next_full_scan_at = self.last_scan.logical_at + timedelta(
                 seconds=self.config.normal_scan_seconds
@@ -2437,26 +2691,65 @@ class PublicPaperRuntime:
                 now = self.clock.now()
                 delay = max(0.0, (self._next_wakeup_at(now) - now).total_seconds())
                 await self._pause_or_stop(delay)
+            if self._background_fatal is not None:
+                raise self._background_fatal
+            if self._stop_cause is None:
+                self._request_stop(
+                    "STOP_EVENT" if stop_event is not None else "UNKNOWN_EXTERNAL_STOP"
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if self._stop_cause != "RUNTIME_FATAL":
+                self._request_stop("RUNTIME_FATAL")
+                self._record(
+                    "RUNTIME_FATAL", at=self._stop_requested_at,
+                    detail={"exception_class": type(exc).__name__},
+                )
+            raise
         finally:
             for sig in installed:
                 loop.remove_signal_handler(sig)
             await self.shutdown()
         return {"status": "STOPPED_SAFE", "forced_close": False}
 
+    def _request_stop(self, cause: str) -> None:
+        if self._stop_cause is None:
+            self._stop_cause = cause if cause in {
+                "SIGINT", "SIGTERM", "STOP_EVENT", "RUNTIME_FATAL",
+                "UNKNOWN_EXTERNAL_STOP",
+            } else "UNKNOWN_EXTERNAL_STOP"
+            self._stop_requested_at = self.clock.now()
+        if self._stop_event is not None:
+            self._stop_event.set()
+
     async def shutdown(self) -> None:
         if not self.accepting_entries:
             return
         self.accepting_entries = False
         at = self.clock.now()
+        if self._stop_cause is None:
+            self._request_stop("UNKNOWN_EXTERNAL_STOP")
         if self.broker is not None and self.broker.state.lifecycle_state is LifecycleState.ENTRY_MAKER_OPEN:
             state = await self.broker.cancel_for_process_restart(restarted_at=at)
             self.repository.save_decision(recorded_at=at, entry_state=state)
         self._record(
-            "STOPPED_SAFE",
+            (
+                "RUNTIME_STOPPED_FATAL"
+                if self._stop_cause == "RUNTIME_FATAL" else "STOPPED_SAFE"
+            ),
             at=at,
-            detail={"forced_close": False, "open_position_preserved": self.lifecycle is not None},
+            detail={
+                "forced_close": False,
+                "open_position_preserved": self.lifecycle is not None,
+                "stop_cause": self._stop_cause,
+                "stop_requested_at": (
+                    None if self._stop_requested_at is None
+                    else self._stop_requested_at.isoformat()
+                ),
+            },
         )
-        if self._notification_run_id is not None:
+        if self._notification_run_id is not None and self._stop_cause != "RUNTIME_FATAL":
             self._notify_event(
                 f"{self._notification_run_id}:stopped", "SAFE_STOP", at,
                 "Paper runtime stopped safely",
@@ -2467,6 +2760,8 @@ class PublicPaperRuntime:
         if self._refresh_task is not None:
             owned.append(self._refresh_task)
         owned.extend(self._recovery_tasks.values())
+        if self._extended_universe_task is not None:
+            owned.append(self._extended_universe_task)
         for task in owned:
             task.cancel()
         if owned:
@@ -2474,8 +2769,10 @@ class PublicPaperRuntime:
         self._stream_tasks.clear()
         self._recovery_tasks.clear()
         self._pending_socket_episodes.clear()
+        self._pending_watchdog_episodes.clear()
         self._recovery_buffers.clear()
         self._refresh_task = None
+        self._extended_universe_task = None
 
     async def close(self) -> None:
         if self.accepting_entries or self._stream_tasks:

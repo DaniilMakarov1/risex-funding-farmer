@@ -138,6 +138,25 @@ async def test_extended_catalog_normalizes_markets_and_volumes_from_one_fetch() 
     assert len(session.calls) == 1
     assert markets[0].venue_symbol == volumes[0].canonical_market
     assert volumes[0].quote_volume_usd == D("1234.50")
+    assert session.calls[0][1]["timeout"].total == 60
+
+
+@pytest.mark.asyncio
+async def test_extended_required_catalog_repeats_market_query_and_is_atomic() -> None:
+    abc = fixture("extended")["market"]
+    xyz = deepcopy(abc)
+    xyz.update({"name": "XYZ-USD", "assetName": "XYZ"})
+    session = FakeSession(FakeResponse({"data": [xyz, abc]}))
+    markets, _ = await ExtendedAdapter(session).fetch_required_catalog(
+        ("ABC-USD", "XYZ-USD")
+    )
+    assert [market.venue_symbol for market in markets] == ["ABC-USD", "XYZ-USD"]
+    assert session.calls[0][1]["params"] == [
+        ("market", "ABC-USD"), ("market", "XYZ-USD"),
+    ]
+    incomplete = ExtendedAdapter(FakeSession(FakeResponse({"data": [abc]})))
+    with pytest.raises(ValueError, match="incomplete"):
+        await incomplete.fetch_required_catalog(("ABC-USD", "XYZ-USD"))
 
 
 def test_risex_paper_fallback_is_explicit_and_unknown_funding_still_fails_closed() -> None:
@@ -156,6 +175,39 @@ def test_risex_paper_fallback_is_explicit_and_unknown_funding_still_fails_closed
     synthetic["config"]["name"] = "1000ABC/USDC"
     synthetic["base_asset_symbol"] = "1000ABC/USDC"
     assert RisexAdapter(None).normalize_market(synthetic).contract_type is ContractType.OTHER
+
+
+def test_risex_positive_grid_aligned_below_minimum_is_valid_unit_evidence() -> None:
+    adapter = RisexAdapter(None)
+    row = deepcopy(fixture("risex")["market"])
+    row["config"]["min_order_size"] = "10"
+    assert adapter.normalize_market(row).contract_type is ContractType.OTHER
+    adapter.normalize_book(fixture("risex")["book"], observed_at=NOW)
+    adapter.normalize_trade(
+        fixture("risex")["trade"], received_at=NOW,
+        session_id="below-minimum", ordinal=1,
+    )
+    assert adapter.normalize_market(row).contract_type is ContractType.LINEAR
+
+
+def test_risex_unit_evidence_has_precise_authoritative_blocker() -> None:
+    adapter = RisexAdapter(None)
+    row = fixture("risex")["market"]
+    adapter.normalize_market(row)
+    off_grid = deepcopy(fixture("risex")["book"])
+    off_grid["bids"][0]["quantity"] = "2.005"
+    adapter.normalize_book(off_grid, observed_at=NOW)
+    adapter.normalize_trade(
+        fixture("risex")["trade"], received_at=NOW,
+        session_id="precise", ordinal=1,
+    )
+    blocked = adapter.normalize_market(row)
+    assert "RISEX_BOOK_QUANTITY_OFF_STEP" in blocked.evidence_blockers
+
+    zero_step = deepcopy(row)
+    zero_step["config"]["step_size"] = "0"
+    zero_grid = adapter.normalize_market(zero_step)
+    assert "RISEX_GRID_OR_MINIMUM_NONPOSITIVE" in zero_grid.evidence_blockers
 
 
 @pytest.mark.asyncio

@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 from urllib.parse import quote
 
+import aiohttp
+
+from risex_farmer.config import EXTENDED_CATALOG_TIMEOUT_SECONDS
 from risex_farmer.models import (
     BookLevel,
     BookDelta,
@@ -27,6 +31,7 @@ from risex_farmer.models import (
 
 from .base import (
     PublicAdapter,
+    PublicDataUnavailable,
     PublicHeartbeatAction,
     WebSocketFrameAction,
     decimal_value,
@@ -55,7 +60,59 @@ class ExtendedAdapter(PublicAdapter):
         self,
     ) -> tuple[tuple[CanonicalMarket, ...], tuple[MarketVolume, ...]]:
         """Normalize both catalog views from the venue's single public payload."""
-        payload = await self._get_json("/api/v1/info/markets")
+        payload = await self._catalog_payload(
+            timeout_seconds=EXTENDED_CATALOG_TIMEOUT_SECONDS
+        )
+        return self._normalize_catalog(payload)
+
+    async def fetch_required_catalog(
+        self, venue_symbols: tuple[str, ...]
+    ) -> tuple[tuple[CanonicalMarket, ...], tuple[MarketVolume, ...]]:
+        requested = tuple(dict.fromkeys(venue_symbols))
+        if not requested:
+            return (), ()
+        payload = await self._catalog_payload(
+            params=[("market", symbol) for symbol in requested]
+        )
+        markets, volumes = self._normalize_catalog(payload)
+        returned = tuple(market.venue_symbol for market in markets)
+        if len(set(returned)) != len(returned) or set(returned) != set(requested):
+            raise ValueError("required Extended metadata response is incomplete")
+        by_name = {market.venue_symbol: market for market in markets}
+        volume_by_name = {row.canonical_market: row for row in volumes}
+        return (
+            tuple(by_name[symbol] for symbol in requested),
+            tuple(volume_by_name[symbol] for symbol in requested),
+        )
+
+    async def _catalog_payload(
+        self, *, params: list[tuple[str, str]] | None = None,
+        timeout_seconds: int | None = None,
+    ) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {"params": params}
+        if timeout_seconds is not None:
+            kwargs["timeout"] = aiohttp.ClientTimeout(total=timeout_seconds)
+        try:
+            async with self._session.get(
+                f"{self.rest_base}/api/v1/info/markets", **kwargs
+            ) as response:
+                response.raise_for_status()
+                payload = json.loads(await response.text(), parse_float=Decimal)
+        except aiohttp.ClientResponseError as exc:
+            if exc.status in {401, 403}:
+                self.public_data_available = False
+                raise PublicDataUnavailable(
+                    "venue rejected unauthenticated public market data"
+                ) from exc
+            raise
+        if not isinstance(payload, dict):
+            raise ValueError("public endpoint returned a non-object payload")
+        self.public_data_available = True
+        return payload
+
+    def _normalize_catalog(
+        self, payload: dict[str, Any]
+    ) -> tuple[tuple[CanonicalMarket, ...], tuple[MarketVolume, ...]]:
         rows = require_list(payload.get("data"), "data")
         observed_at = datetime.now(UTC)
         return (

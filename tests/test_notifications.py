@@ -13,7 +13,7 @@ from risex_farmer.notifications import (
     NotificationPayload,
     TelegramDelivery,
     format_telegram_money,
-    full_scan_digest_payload,
+    full_scan_digest_payloads,
     outbox_from_environment,
 )
 
@@ -163,7 +163,7 @@ async def test_outbox_deduplicates_events_and_opportunity_semantic_state():
     ]
 
 
-def test_full_scan_digest_event_id_deduplicates_and_text_is_bounded():
+def test_full_scan_digest_part_event_ids_deduplicate_and_text_is_bounded():
     rows = tuple({
         "canonical_asset": f"ASSET-{index}-" + "X" * 100,
         "hedge_venue": "EXTENDED-" + "Y" * 150,
@@ -174,7 +174,7 @@ def test_full_scan_digest_event_id_deduplicates_and_text_is_bounded():
         ),
         "planned_maker_net_pnl_usd": "1." + "2" * 150,
     } for index in range(20))
-    digest = full_scan_digest_payload(
+    digests = full_scan_digest_payloads(
         scan_at=NOW, opportunity=True, route_rows=rows
     )
 
@@ -189,13 +189,36 @@ def test_full_scan_digest_event_id_deduplicates_and_text_is_bounded():
 
     capture = Capture()
     outbox = NotificationOutbox(capture)
-    assert outbox.event(digest)
-    assert not outbox.event(digest)
-    assert digest.event_id == f"full-scan-digest:{NOW.isoformat()}"
-    assert len(digest.text) <= 4096
-    route_lines = digest.text.splitlines()[1:]
-    assert len(route_lines) == 15
+    for digest in digests:
+        assert outbox.event(digest)
+        assert not outbox.event(digest)
+        assert len(digest.text) <= 4096
+    assert [row.event_id for row in digests] == [
+        f"full-scan-digest:{NOW.isoformat()}:part:{index}:{len(digests)}"
+        for index in range(1, len(digests) + 1)
+    ]
+    route_lines = [
+        line for digest in digests for line in digest.text.splitlines()[1:]
+    ]
+    assert len(route_lines) == 20
     assert all(line.count(" | ") == 2 for line in route_lines)
+
+
+def test_full_scan_digest_splits_all_twenty_rows_without_loss() -> None:
+    rows = tuple({
+        "canonical_asset": f"ASSET-{index}-" + "X" * 80,
+        "hedge_venue": "EXTENDED-" + "Y" * 100,
+        "direction": "LONG_RISEX_SHORT_HEDGE",
+        "planned_maker_net_pnl_usd": None,
+        "blockers": [f"MARKET_METADATA_STALE:{index}"],
+    } for index in range(20))
+    payloads = full_scan_digest_payloads(
+        scan_at=NOW, opportunity=False, route_rows=rows,
+    )
+    assert all(len(payload.text) <= 4096 for payload in payloads)
+    lines = [line for payload in payloads for line in payload.text.splitlines()[1:]]
+    assert len(lines) == len(set(lines)) == 20
+    assert all("UNKNOWN (MARKET_METADATA_STALE:" in line for line in lines)
 
 
 @pytest.mark.asyncio
