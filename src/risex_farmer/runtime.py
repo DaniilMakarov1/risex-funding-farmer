@@ -731,6 +731,15 @@ class PublicPaperRuntime:
                     "timeout_seconds": self.config.extended_universe_request_timeout_seconds,
                 },
             )
+            if self._stop_event is not None and not self._stop_event.is_set():
+                pending_refresh = self._refresh_task
+                if pending_refresh is not None and not pending_refresh.done():
+                    await asyncio.gather(pending_refresh, return_exceptions=True)
+                if (
+                    not self._stop_event.is_set()
+                    and self._background_fatal is None
+                ):
+                    self._start_public_refresh()
         except asyncio.CancelledError:
             raise
         except (

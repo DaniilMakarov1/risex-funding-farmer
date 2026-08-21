@@ -1197,6 +1197,46 @@ async def test_startup_seed_refresh_keeps_first_full_digest_funding_fresh(
 
 
 @pytest.mark.asyncio
+async def test_late_extended_universe_schedules_post_seed_refresh(tmp_path):
+    clock = FakeClock()
+    target = NOW + timedelta(minutes=10)
+    extended = GatedExtendedAdapter(clock, settlement_at=target)
+    fakes = adapters(clock, settlement_at=target)
+    fakes[Venue.EXTENDED] = extended
+    pending_gate = asyncio.Event()
+    started = []
+
+    async def pending_seed_refresh() -> None:
+        await pending_gate.wait()
+
+    async def no_combined_streams() -> None:
+        return None
+
+    with PaperRepository(tmp_path / "late-universe-refresh.db") as repository:
+        runtime = PublicPaperRuntime(repository, adapters=fakes, clock=clock)
+        runtime._session = object()
+        runtime._stop_event = asyncio.Event()
+        runtime._reconcile_combined_streams = no_combined_streams
+        runtime._start_extended_stream = lambda symbol, kind: started.append(
+            (symbol, kind)
+        )
+        runtime._refresh_task = asyncio.create_task(pending_seed_refresh())
+        universe_task = asyncio.create_task(runtime._refresh_extended_universe())
+        await asyncio.sleep(0)
+        pending_gate.set()
+        await universe_task
+        assert runtime._refresh_task is not None
+        await runtime._refresh_task
+
+    key = (Venue.EXTENDED, extended.market.venue_symbol)
+    assert key in runtime.observations
+    assert set(started) == {
+        (extended.market.venue_symbol, kind)
+        for kind in ("book", "trade", "funding")
+    }
+
+
+@pytest.mark.asyncio
 async def test_startup_seed_refresh_never_blocks_ready_or_safe_stop(
     tmp_path, monkeypatch,
 ):
