@@ -51,6 +51,11 @@ streams and failing affected routes closed. `report` summarizes persisted paper
 and runtime evidence. An open position is never force-closed merely because a
 run ends.
 
+On a RISEx orderbook checksum mismatch, `paper-run` follows the official public
+WebSocket recovery contract: it keeps affected books unusable, unsubscribes and
+resubscribes the orderbook channel, and accepts the new stream snapshots before
+resuming calculations. It does not combine unordered REST and WebSocket states.
+
 ### Optional outbound Telegram notifications
 
 Telegram delivery is disabled by default and does not change scanning or paper

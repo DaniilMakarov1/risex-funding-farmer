@@ -1,10 +1,10 @@
 # Status
 
-- Accepted implementation: PAPER-007-FIX-005 — First Full-Scan Funding Freshness @ `b5c1db0ec7f226914976f60a732ce9dfd58ff113`
-- Previous accepted implementation: PAPER-007-FIX-004 — Public REST Timeout 30 Seconds @ `7476946263cb68812482215282fc7f50fb73a97b`
-- Active implementation task: PAPER-007-FIX-006 — RISEx Checksum Resubscribe Recovery
+- Accepted implementation: PAPER-007-FIX-006 — RISEx Checksum Resubscribe Recovery @ `1333df09f2b94bd977dc007fb9fb2a0d0f5cac6f`
+- Previous accepted implementation: PAPER-007-FIX-005 — First Full-Scan Funding Freshness @ `b5c1db0ec7f226914976f60a732ce9dfd58ff113`
+- Active implementation task: none
 - PAPER-007 Stage A scheduling validation: PASS
-- PAPER-007 Stage B: running on accepted main with outbound Telegram enabled after a safe flat restart
+- PAPER-007 Stage B: running on the pre-FIX-005/FIX-006 process with outbound Telegram enabled; safe restart pending
 - Preserved Stage B evidence: `paper-007-stage-a-fix002.db`, SHA-256 `6c9bddbf3e10e5690f8e5d5327adf5c35fad4f2044d96fdb9445b3bd567e68ff`
 - Product phase: PAPER ONLY
 - Live trading: prohibited
@@ -23,3 +23,5 @@ PAPER-007-FIX-004 is accepted after 168 deterministic tests. The shared public H
 PAPER-007-FIX-005 is accepted after 170 deterministic tests. Persisted evidence showed the first post-restart `FULL` scan at `2026-08-21T08:56:17.562429Z` had zero known PnLs because initial RISEx funding observations were about 130 seconds old under the unchanged 120-second freshness rule. Runtime now seeds the existing non-blocking single-flight refresh after readiness; a gated refresh cannot delay readiness, scan deadlines, or safe stop.
 
 PAPER-007-FIX-006 is explicitly authorized after live evidence showed repeated RISEx checksum gaps entering a high-frequency REST snapshot/buffer replay loop and leaving every route `BOOK_UNHEALTHY`. Current official RISEx documentation requires unsubscribe/resubscribe and a new WebSocket snapshot after checksum mismatch; the correction must follow that public contract without creating false physical socket lifecycle evidence. The running Stage B remains untouched until implementation acceptance.
+
+PAPER-007-FIX-006 is accepted after 171 deterministic tests. A two-market combined-stream regression proves one checksum mismatch produces exactly one official unsubscribe/subscribe pair, buffers without a resubscribe burst until both new WebSocket snapshots arrive, resumes valid checksum updates, creates no REST recovery calls, and creates no physical socket lifecycle rows. A separate public-only smoke reached readiness with RISEx and Nado healthy, used no Telegram/private endpoints/orders/positions, and stopped `STOPPED_SAFE`; no natural RISEx checksum mismatch occurred during the short smoke. PID `50755` remains untouched on the pre-fix process until a safe restart.
