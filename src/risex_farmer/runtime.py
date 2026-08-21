@@ -1708,19 +1708,36 @@ class PublicPaperRuntime:
                 self.repository.save_decision(
                     recorded_at=now, lifecycle_snapshot=self.lifecycle.snapshot
                 )
-    async def apply_book_event(self, event: OrderBook | BookDelta) -> None:
+    async def apply_book_event(self, event: OrderBook | BookDelta) -> bool:
         now = self.clock.now()
         self.coordinator.stream(event.venue, event.canonical_market).connection_confirmed(now)
         key = (event.venue, event.canonical_market)
         if isinstance(event, OrderBook):
             if key in self._recovery_buffers:
+                if event.venue is Venue.RISEX:
+                    # The official resubscribe snapshot is an ordered WS
+                    # boundary. Messages buffered before it belong to the old
+                    # subscription and must not be replayed across that boundary.
+                    buffered = len(self._recovery_buffers.pop(key))
+                    await self.recover_snapshot(event, at=now)
+                    self._record(
+                        "PUBLIC_SNAPSHOT_RECOVERY_COMPLETED", at=now,
+                        venue=event.venue,
+                        detail={
+                            "symbol": event.canonical_market,
+                            "buffered": buffered,
+                            "replayed": 0,
+                            "source": "WS_RESUBSCRIBE_SNAPSHOT",
+                        },
+                    )
+                    return True
                 if event.venue is Venue.EXTENDED and event.sequence is None:
                     self._record(
                         "PUBLIC_REST_SNAPSHOT_IGNORED_FOR_WS_RESYNC",
                         at=now, venue=event.venue,
                         detail={"symbol": event.canonical_market},
                     )
-                    return
+                    return True
                 try:
                     recovered, buffered, replayed = self._install_recovery_snapshot(event)
                 except ValueError as exc:
@@ -1730,7 +1747,7 @@ class PublicPaperRuntime:
                         stream_kind="book", exception=exc,
                     )
                     self._start_snapshot_recovery(event.venue, event.canonical_market)
-                    return
+                    return False
                 await self.recover_snapshot(recovered, at=now)
                 self._live_book_ready.add(key)
                 self._record(
@@ -1745,23 +1762,51 @@ class PublicPaperRuntime:
             else:
                 await self.recover_snapshot(event, at=now)
                 self._live_book_ready.add(key)
-            return
+            return True
         if key in self._recovery_buffers:
             self._recovery_buffers[key].append(event)
             self._record(
                 "PUBLIC_RECOVERY_DELTA_BUFFERED", at=now, venue=event.venue,
                 detail={"symbol": event.canonical_market, "sequence": event.sequence},
             )
-            return
+            return True
         stream = self.coordinator.stream(event.venue, event.canonical_market)
         if not stream.apply_delta(event):
             await self.mark_disconnected(event.venue, event.canonical_market, at=now, stream_kind="book")
+            if event.venue is Venue.RISEX:
+                return False
             self._start_snapshot_recovery(event.venue, event.canonical_market)
+            return False
         else:
             self._live_book_ready.add(key)
             if self.lifecycle is not None:
                 self.next_position_monitor_at = now
                 await self.tick(now)
+        return True
+
+    async def _resubscribe_risex_orderbooks(
+        self,
+        ws: object,
+        adapter: PublicAdapter,
+        symbols: tuple[str, ...],
+        *,
+        triggering_symbol: str,
+    ) -> None:
+        now = self.clock.now()
+        for symbol in symbols:
+            if symbol != triggering_symbol:
+                await self.mark_disconnected(
+                    Venue.RISEX, symbol, at=now, stream_kind="book",
+                    exception=ValueError("orderbook channel resubscribe"),
+                )
+            self._recovery_buffers[(Venue.RISEX, symbol)] = []
+        market_ids = [adapter.market_id(symbol) for symbol in symbols]  # type: ignore[attr-defined]
+        self._record(
+            "PUBLIC_BOOK_RESYNC_STARTED", at=now, venue=Venue.RISEX,
+            detail={"symbols": list(symbols), "source": "WS_RESUBSCRIBE"},
+        )
+        await ws.send_json(adapter.orderbook_unsubscription())  # type: ignore[attr-defined]
+        await ws.send_json(adapter.orderbook_subscription(market_ids))  # type: ignore[attr-defined]
 
     def _start_snapshot_recovery(self, venue: Venue, symbol: str) -> None:
         key = (venue, symbol)
@@ -2022,7 +2067,13 @@ class PublicPaperRuntime:
                                 self.coordinator.stream(venue, symbol).connection_confirmed(self.clock.now())
                             continue
                         if "orderbook" in kind or "book_depth" in kind:
-                            await self.apply_book_event(adapter.normalize_book_message(payload))  # type: ignore[attr-defined]
+                            event = adapter.normalize_book_message(payload)  # type: ignore[attr-defined]
+                            healthy = await self.apply_book_event(event)
+                            if venue is Venue.RISEX and not healthy:
+                                await self._resubscribe_risex_orderbooks(
+                                    ws, adapter, symbols,
+                                    triggering_symbol=event.canonical_market,
+                                )
                         elif "trade" in kind:
                             await self.deliver_trade(
                                 adapter.normalize_trade(
@@ -2073,6 +2124,9 @@ class PublicPaperRuntime:
             except Exception as exc:
                 if self._stop_event is not None and self._stop_event.is_set():
                     break
+                if venue is Venue.RISEX:
+                    for symbol in symbols:
+                        self._recovery_buffers.pop((venue, symbol), None)
                 if session_established:
                     self._socket_disconnected(
                         socket_identity, at=self.clock.now()

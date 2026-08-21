@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import aiohttp
 import pytest
 
 from risex_farmer.exchanges.base import PublicAdapter, PublicDataUnavailable
@@ -16,6 +17,7 @@ from risex_farmer.models import (
     BookDelta,
     CanonicalMarket,
     ContractType,
+    DataQuality,
     FundingAccrualMethod,
     FundingCashQuote,
     FundingQuality,
@@ -29,6 +31,7 @@ from risex_farmer.models import (
     TradeEvidence,
     Venue,
 )
+from risex_farmer.market_data import BookStream
 from risex_farmer.notifications import NotificationOutbox, TelegramDelivery
 from risex_farmer.runtime import PublicPaperRuntime, public_paper_run, public_scan_once
 from risex_farmer.storage import PaperRepository
@@ -1896,6 +1899,172 @@ async def test_nado_recovery_buffers_and_replays_newer_continuous_delta(tmp_path
     assert gated.calls.count("book") == baseline_book_calls + 1
     assert json.loads(evidence["detail"])["replayed"] == 2
     assert socket_lifecycle_count == 0
+
+
+@pytest.mark.asyncio
+async def test_risex_checksum_gap_resubscribes_and_recovers_from_ws_snapshots(tmp_path):
+    clock = FakeClock()
+    stop = asyncio.Event()
+    symbols = ("AAA/USDC", "BBB/USDC")
+    market_ids = {symbols[0]: "1", symbols[1]: "2"}
+    timestamp_ns = str(int(clock.now().timestamp() * 1_000_000_000))
+
+    def levels(quantity: str = "20") -> dict[str, object]:
+        return {
+            "bids": [{"price": "99", "quantity": quantity}],
+            "asks": [{"price": "101", "quantity": "20"}],
+        }
+
+    checksum_book = BookStream(Venue.RISEX, symbols[0])
+    checksum_book.snapshot(OrderBook(
+        Venue.RISEX, symbols[0],
+        (BookLevel(D("99"), D("18")),),
+        (BookLevel(D("101"), D("20")),), clock.now(),
+    ))
+    valid_checksum = checksum_book.risex_checksum()
+    payloads = [
+        {
+            "channel": "orderbook", "type": "update", "market_id": "1",
+            "worker_timestamp": timestamp_ns, "checksum": 0,
+            "data": {"market_id": 1, **levels("18")},
+        },
+        {
+            "channel": "orderbook", "type": "update", "market_id": "1",
+            "worker_timestamp": timestamp_ns, "checksum": 0,
+            "data": {"market_id": 1, **levels("19")},
+        },
+        {
+            "method": "snapshot", "channel": "orderbook", "type": "snapshot",
+            "market_id": "1", "worker_timestamp": timestamp_ns,
+            "data": {"market_id": 1, **levels()},
+        },
+        {
+            "method": "snapshot", "channel": "orderbook", "type": "snapshot",
+            "market_id": "2", "worker_timestamp": timestamp_ns,
+            "data": {"market_id": 2, **levels()},
+        },
+        {
+            "channel": "orderbook", "type": "update", "market_id": "1",
+            "worker_timestamp": timestamp_ns, "checksum": valid_checksum,
+            "data": {
+                "market_id": 1,
+                "bids": [{"price": "99", "quantity": "18"}], "asks": [],
+            },
+        },
+    ]
+
+    class SyntheticRisexAdapter(RisexAdapter):
+        def __init__(self) -> None:
+            super().__init__(None)
+            self.book_calls = 0
+            self._market_ids = dict(market_ids)
+            self._symbols_by_id = {value: key for key, value in market_ids.items()}
+            self._raw_markets = {
+                symbol: {
+                    "market_id": market_id,
+                    "config": {
+                        "name": symbol, "step_size": "1",
+                        "step_price": "1", "min_order_size": "1",
+                    },
+                }
+                for symbol, market_id in market_ids.items()
+            }
+
+        async def fetch_book(self, venue_symbol: str) -> OrderBook:
+            self.book_calls += 1
+            return OrderBook(
+                Venue.RISEX, venue_symbol,
+                (BookLevel(D("99"), D("20")),),
+                (BookLevel(D("101"), D("20")),), clock.now(),
+            )
+
+    class TextMessage:
+        type = aiohttp.WSMsgType.TEXT
+
+        def __init__(self, payload: dict[str, object]) -> None:
+            self.data = json.dumps(payload)
+
+    class ScriptedWebSocket:
+        def __init__(self) -> None:
+            self.messages = [TextMessage(payload) for payload in payloads]
+            self.sent: list[dict[str, object]] = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self.messages:
+                stop.set()
+                raise StopAsyncIteration
+            return self.messages.pop(0)
+
+        async def send_json(self, payload: dict[str, object]) -> None:
+            self.sent.append(payload)
+
+        async def pong(self, _payload) -> None:
+            return None
+
+    class ScriptedSession:
+        def __init__(self, websocket: ScriptedWebSocket) -> None:
+            self.websocket = websocket
+            self.connections = 0
+
+        def ws_connect(self, *_args, **_kwargs):
+            self.connections += 1
+            return self.websocket
+
+    adapter = SyntheticRisexAdapter()
+    websocket = ScriptedWebSocket()
+    session = ScriptedSession(websocket)
+    with PaperRepository(tmp_path / "risex-ws-resubscribe.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={Venue.RISEX: adapter}, clock=clock,
+        )
+        runtime._session = session
+        runtime._stop_event = stop
+        await runtime._combined_stream(Venue.RISEX, adapter, symbols)
+        lifecycle = repository.connection.execute(
+            "SELECT event_type,detail FROM runtime_evidence WHERE event_type IN "
+            "('PUBLIC_BOOK_RESYNC_REQUIRED','PUBLIC_BOOK_RESYNC_STARTED',"
+            "'PUBLIC_SNAPSHOT_RECOVERY_STARTED','PUBLIC_SNAPSHOT_RECOVERY_COMPLETED',"
+            "'PUBLIC_SNAPSHOT_RECOVERY_FAILED','PUBLIC_SOCKET_DISCONNECTED',"
+            "'PUBLIC_SOCKET_RECONNECTED') ORDER BY evidence_id"
+        ).fetchall()
+
+    assert session.connections == 1
+    assert adapter.book_calls == len(symbols)
+    assert websocket.sent == [
+        adapter.orderbook_subscription([1, 2]),
+        adapter.trades_subscription([1, 2]),
+        adapter.orderbook_unsubscription(),
+        adapter.orderbook_subscription([1, 2]),
+    ]
+    assert [row["event_type"] for row in lifecycle] == [
+        "PUBLIC_BOOK_RESYNC_REQUIRED", "PUBLIC_BOOK_RESYNC_REQUIRED",
+        "PUBLIC_BOOK_RESYNC_STARTED", "PUBLIC_SNAPSHOT_RECOVERY_COMPLETED",
+        "PUBLIC_SNAPSHOT_RECOVERY_COMPLETED",
+    ]
+    completed = [
+        json.loads(row["detail"]) for row in lifecycle
+        if row["event_type"] == "PUBLIC_SNAPSHOT_RECOVERY_COMPLETED"
+    ]
+    assert {row["symbol"] for row in completed} == set(symbols)
+    assert {row["source"] for row in completed} == {"WS_RESUBSCRIBE_SNAPSHOT"}
+    assert sum(row["buffered"] for row in completed) == 1
+    assert all(row["replayed"] == 0 for row in completed)
+    assert runtime._recovery_buffers == {}
+    assert runtime._recovery_tasks == {}
+    assert all(
+        runtime.coordinator.stream(Venue.RISEX, symbol).health(clock.now()).data_quality
+        is DataQuality.COMPLETE
+        for symbol in symbols
+    )
 
 
 @pytest.mark.asyncio

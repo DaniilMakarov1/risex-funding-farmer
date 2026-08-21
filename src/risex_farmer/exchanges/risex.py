@@ -431,6 +431,10 @@ class RisexAdapter(PublicAdapter):
         return {"method": "subscribe", "params": {"channel": "orderbook", "market_ids": market_ids}}
 
     @staticmethod
+    def orderbook_unsubscription() -> dict[str, object]:
+        return {"method": "unsubscribe", "params": {"channel": "orderbook"}}
+
+    @staticmethod
     def trades_subscription(market_ids: list[int]) -> dict[str, object]:
         return {"method": "subscribe", "params": {"channel": "trades", "market_ids": market_ids}}
 
