@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -167,10 +168,10 @@ class TelegramDelivery:
                         if 200 <= status < 300:
                             return
                         if status == 429 and attempt + 1 < self._max_attempts:
-                            retry_after = min(
-                                float(response.headers.get("Retry-After", "0")), 30.0
-                            )
-                            await self._sleep(max(0, retry_after))
+                            retry_after = await _telegram_retry_after(response)
+                            if retry_after is None:
+                                return
+                            await self._sleep(retry_after)
                             continue
                         return
             except asyncio.CancelledError:
@@ -180,9 +181,22 @@ class TelegramDelivery:
             except aiohttp.ClientConnectorError:
                 if attempt + 1 >= self._max_attempts:
                     return
-                await self._sleep(0)
+                await self._sleep(1.0)
             except Exception:
                 return
+
+
+async def _telegram_retry_after(response: object) -> float | None:
+    try:
+        body = await response.json(content_type=None)  # type: ignore[attr-defined]
+        raw = body["parameters"]["retry_after"]
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            return None
+        if raw <= 0 or (isinstance(raw, float) and not math.isfinite(raw)):
+            return None
+        return float(min(raw, 30))
+    except Exception:
+        return None
 
 
 def outbox_from_environment(

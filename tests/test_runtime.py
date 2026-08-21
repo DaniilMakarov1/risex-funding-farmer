@@ -1681,6 +1681,65 @@ async def test_extended_eof_persists_one_ordered_physical_socket_episode(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_extended_book_eof_unifies_socket_and_resync_notification_episode(tmp_path):
+    clock = FakeClock()
+    stop = asyncio.Event()
+    session = ReconnectingSession(stop, outcomes=("eof", "stop"))
+    delivery = CaptureNotifications()
+    outbox = NotificationOutbox(delivery)
+
+    async def no_delay(_seconds: float) -> None:
+        await asyncio.sleep(0)
+
+    with PaperRepository(tmp_path / "book-ws-notification-reconnect.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={}, clock=clock, sleep=no_delay,
+            notifications=outbox,
+        )
+        runtime._session = session
+        runtime._stop_event = stop
+        await runtime._extended_stream(
+            ExtendedAdapter(None), "ABC-EXTENDED", "book"
+        )
+        evidence = repository.connection.execute(
+            "SELECT recorded_at,event_type,venue,detail FROM runtime_evidence "
+            "WHERE event_type IN "
+            "('PUBLIC_SOCKET_DISCONNECTED','PUBLIC_BOOK_RESYNC_REQUIRED',"
+            "'PUBLIC_SOCKET_RECONNECTED') ORDER BY evidence_id"
+        ).fetchall()
+        socket_rows = [
+            row for row in evidence if row["event_type"].startswith("PUBLIC_SOCKET_")
+        ]
+        assert [row["event_type"] for row in evidence] == [
+            "PUBLIC_SOCKET_DISCONNECTED", "PUBLIC_BOOK_RESYNC_REQUIRED",
+            "PUBLIC_SOCKET_RECONNECTED",
+        ]
+        disconnected, reconnected = assert_socket_episode(socket_rows)
+        assert disconnected["episode_id"] == reconnected["episode_id"]
+        assert disconnected["stream_kind"] == "book"
+        assert [row.kind for row in delivery.rows] == [
+            "CRITICAL_DATA_LOSS", "DATA_RECOVERY",
+        ]
+        assert outbox._active_outages == set()
+
+        clock.advance(1)
+        await runtime.mark_disconnected(
+            Venue.EXTENDED, "ABC-EXTENDED", stream_kind="book",
+            exception=ValueError("independent synthetic gap"),
+        )
+        assert [row.kind for row in delivery.rows] == [
+            "CRITICAL_DATA_LOSS", "DATA_RECOVERY", "CRITICAL_DATA_LOSS",
+        ]
+        assert outbox._active_outages == {"EXTENDED:ABC-EXTENDED:book"}
+        assert repository.connection.execute(
+            "SELECT COUNT(*) FROM runtime_evidence "
+            "WHERE event_type='PUBLIC_BOOK_RESYNC_REQUIRED'"
+        ).fetchone()[0] == 2
+        await runtime.shutdown()
+    assert session.connections == 2
+
+
+@pytest.mark.asyncio
 async def test_combined_socket_uses_one_episode_for_sorted_market_set(tmp_path):
     clock = FakeClock()
     stop = asyncio.Event()
@@ -1726,12 +1785,17 @@ async def test_simple_combined_eof_then_reconnect_is_one_socket_episode(tmp_path
     adapter = CombinedFakeAdapter(
         Venue.NADO, clock, settlement_at=NOW + timedelta(minutes=5)
     )
+    delivery = CaptureNotifications()
+    outbox = NotificationOutbox(delivery)
 
     async def no_delay(_seconds: float) -> None:
         await asyncio.sleep(0)
 
     with PaperRepository(tmp_path / "simple-combined-reconnect.db") as repository:
-        runtime = PublicPaperRuntime(repository, adapters={}, clock=clock, sleep=no_delay)
+        runtime = PublicPaperRuntime(
+            repository, adapters={}, clock=clock, sleep=no_delay,
+            notifications=outbox,
+        )
         runtime._session = session
         runtime._stop_event = stop
         await runtime._combined_stream(Venue.NADO, adapter, symbols)
@@ -1753,6 +1817,10 @@ async def test_simple_combined_eof_then_reconnect_is_one_socket_episode(tmp_path
     assert disconnected["markets"] == reconnected["markets"] == [
         "ABC-NADO", "XYZ-NADO",
     ]
+    assert [row.kind for row in delivery.rows] == [
+        "CRITICAL_DATA_LOSS", "DATA_RECOVERY",
+    ]
+    assert outbox._active_outages == set()
 
 
 @pytest.mark.asyncio

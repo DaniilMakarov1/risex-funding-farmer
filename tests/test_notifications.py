@@ -32,15 +32,20 @@ def payload(event_id: str = "event-1") -> NotificationPayload:
 
 
 class FakeResponse:
-    def __init__(self, status: int, headers: dict[str, str] | None = None) -> None:
+    def __init__(self, status: int, body: object | None = None) -> None:
         self.status = status
-        self.headers = headers or {}
+        self.body = body
 
     async def __aenter__(self):
         return self
 
     async def __aexit__(self, *args):
         return False
+
+    async def json(self, **_kwargs):
+        if isinstance(self.body, BaseException):
+            raise self.body
+        return self.body
 
 
 class RaisingResponse:
@@ -185,12 +190,89 @@ async def test_ambiguous_timeout_is_not_retried():
 
 
 @pytest.mark.asyncio
-async def test_flood_control_and_connector_failures_retry_only_within_bound():
+async def test_flood_control_json_retry_after_seven_is_bounded_and_exact():
+    sleeps: list[float] = []
+    session = FakeSession([
+        FakeResponse(429, {"parameters": {"retry_after": 7}}),
+        FakeResponse(200),
+    ])
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    delivery = TelegramDelivery(
+        "synthetic-token", "synthetic-chat", max_attempts=2,
+        session_factory=lambda: session, sleep=sleep,
+    )
+    await delivery.start()
+    delivery.enqueue(payload())
+    await drain(delivery)
+    await delivery.close()
+    assert len(session.calls) == 2
+    assert sleeps == [7.0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [
+    ValueError("synthetic malformed response"),
+    {},
+    {"parameters": {}},
+    {"parameters": {"retry_after": 0}},
+    {"parameters": {"retry_after": -1}},
+    {"parameters": {"retry_after": "7"}},
+    {"parameters": {"retry_after": float("nan")}},
+])
+async def test_invalid_or_nonpositive_flood_control_never_retries_immediately(
+    body,
+):
+    session = FakeSession([FakeResponse(429, body)])
+    sleeps: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    delivery = TelegramDelivery(
+        "synthetic-token", "synthetic-chat", max_attempts=3,
+        session_factory=lambda: session, sleep=sleep,
+    )
+    await delivery.start()
+    delivery.enqueue(payload())
+    await drain(delivery)
+    await delivery.close()
+    assert len(session.calls) == 1
+    assert sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_oversized_flood_control_caps_at_thirty_and_max_attempts_are_strict():
+    sleeps: list[float] = []
+    session = FakeSession([
+        FakeResponse(429, {"parameters": {"retry_after": 300}}),
+        FakeResponse(429, {"parameters": {"retry_after": 7}}),
+        FakeResponse(429, {"parameters": {"retry_after": 7}}),
+    ])
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    delivery = TelegramDelivery(
+        "synthetic-token", "synthetic-chat", max_attempts=3,
+        session_factory=lambda: session, sleep=sleep,
+    )
+    await delivery.start()
+    delivery.enqueue(payload())
+    await drain(delivery)
+    await delivery.close()
+    assert len(session.calls) == 3
+    assert sleeps == [30.0, 7.0]
+
+
+@pytest.mark.asyncio
+async def test_connector_failure_uses_positive_bounded_backoff():
     sleeps: list[float] = []
     connector_error = aiohttp.ClientConnectorError(None, OSError("synthetic"))
     session = FakeSession([
-        RaisingResponse(connector_error),
-        FakeResponse(429, {"Retry-After": "5"}),
+        RaisingResponse(connector_error), RaisingResponse(connector_error),
         FakeResponse(200),
     ])
 
@@ -206,7 +288,34 @@ async def test_flood_control_and_connector_failures_retry_only_within_bound():
     await drain(delivery)
     await delivery.close()
     assert len(session.calls) == 3
-    assert sleeps == [0, 5.0]
+    assert sleeps == [1.0, 1.0]
+
+
+@pytest.mark.asyncio
+async def test_response_description_and_secret_url_never_escape(caplog):
+    token = "synthetic-private-token"
+    chat = "synthetic-private-chat"
+    description = "synthetic confidential response description"
+    secret_url = f"https://api.telegram.org/bot{token}/sendMessage"
+    session = FakeSession([
+        FakeResponse(429, {
+            "ok": False,
+            "description": description,
+            "parameters": {"retry_after": 0},
+        }),
+        RaisingResponse(RuntimeError(f"{secret_url} {description}")),
+    ])
+    delivery = TelegramDelivery(token, chat, session_factory=lambda: session)
+    await delivery.start()
+    delivery.enqueue(payload())
+    delivery.enqueue(payload("event-2"))
+    await drain(delivery)
+    await delivery.close()
+    logs = caplog.text
+    assert token not in logs and chat not in logs and description not in logs
+    assert secret_url not in logs
+    assert token not in payload().text and chat not in payload().text
+    assert description not in payload().text
 
 
 @pytest.mark.asyncio

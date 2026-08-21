@@ -368,16 +368,19 @@ class PublicPaperRuntime:
             return
         detail = detail or {}
         episode = detail.get("episode_id")
-        if episode is not None:
+        stream_kind = detail.get("stream_kind", detail.get("stream", "book"))
+        market = detail.get(
+            "symbol", detail.get("market", detail.get("markets", "PUBLIC"))
+        )
+        if venue is Venue.EXTENDED and stream_kind == "book":
+            # One Extended book socket outage also emits logical book-resync
+            # evidence. Both describe the same notification state.
+            identity = f"{venue.value}:{market}:book"
+        elif episode is not None:
             identity = f"episode:{episode}"
         else:
-            market = detail.get(
-                "symbol", detail.get("market", detail.get("markets", "PUBLIC"))
-            )
             component = (
-                detail.get("stream_kind", detail.get("stream", "book"))
-                if "SOCKET" in event_type
-                else "book"
+                stream_kind if "SOCKET" in event_type else "book"
             )
             identity = f"{venue.value if venue else 'PUBLIC'}:{market}:{component}"
         self.notifications.outage(
