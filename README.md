@@ -26,6 +26,10 @@ pytest
 
 ## Commands
 
+The shared public HTTP runtime session uses a 30-second total request timeout so
+large, slow official responses can complete without changing scan cadence or
+retry scheduling.
+
 The commands use a local SQLite paper database. With no fixture, `scan-once`
 performs a read-only public REST scan and `paper-run` maintains read-only public
 market-data streams until Ctrl+C or SIGTERM:
