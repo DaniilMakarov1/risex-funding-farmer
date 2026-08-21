@@ -1,11 +1,11 @@
 # Status
 
-- Candidate implementation: PAPER-007-FIX-008 @ `f7140447237850b7436eb54e83ef53b1ff8edc06` + `e7d6f26dd5afad6400433b3c0f9ca1fc94095c79`; final acceptance withdrawn after Stage B exposed a second-FULL `AssertionError`
+- Accepted implementation: PAPER-007-FIX-008 @ `f7140447237850b7436eb54e83ef53b1ff8edc06` + `e7d6f26dd5afad6400433b3c0f9ca1fc94095c79` + `901586a852bfd1ed0f512f74969e8d4d308fcea3`
 - Previous accepted implementation: PAPER-007-FIX-007 — Extended Expected Funding and Socket Health Separation @ `77af66b9cb4662acd3055a6457b0fe53f667a256` + `ac5ac7ee6c27f629d389dcf283169c59bf276b9d` + `7e73bdcb1de5eb3be8ad457c6e7c9c1f0db3ae30`
 - Previous accepted implementation: TELEGRAM-002-FIX-001 — Two-Decimal Bot Values @ `c59c54c4265b224ef1781492bf24b79b8987f382` + `b7c9564efa902e7bc82f40b55ed9ad05687f95e3`
-- Active implementation task: PAPER-007-FIX-008 final corrective cycle
+- Active implementation task: none
 - PAPER-007 Stage A scheduling validation: PASS
-- PAPER-007 Stage B: stopped fail-closed with `RUNTIME_FATAL`; do not restart until final FIX-008 acceptance
+- PAPER-007 Stage B: final FIX-008 accepted; authorized to resume on the preserved database
 - Preserved Stage B evidence: `paper-007-stage-a-fix002.db`, SHA-256 `6c9bddbf3e10e5690f8e5d5327adf5c35fad4f2044d96fdb9445b3bd567e68ff`
 - Product phase: PAPER ONLY
 - Live trading: prohibited
@@ -41,4 +41,6 @@ PAPER-007-FIX-008 is explicitly authorized. Production evidence ended at `2026-0
 
 PAPER-007-FIX-008 is accepted after 178 focused and 224 full deterministic tests, compileall, diff-check, and secret scan. The below-minimum RISEx regression fails on the pre-fix baseline and passes after the correction, while off-grid evidence and planned-order minimums remain fail-closed. A public-only smoke completed 18 FULL scans plus 30 focused scans through T−120 and T−5. The official Extended full catalog eventually returned 360 markets; the filtered official request returned exactly BTC/ETH/HYPE/PUMP/SOL. Two subsequent FULL scans persisted 20 routes each with 20 numeric planned PnLs. Extended/Nado funding remained `PREDICTED`, RISEx remained explicit `ESTIMATED/PAPER_ASSUMPTION`, and the smoke stopped with `STOPPED_SAFE`, `forced_close=false`, integrity `ok`, and orders/fills/positions/attempts `0/0/0/0`. Three initial Extended universe attempts reached the bounded 60-second timeout before a later successful response; fresh-cache timeout behavior is deterministic-test verified. Economics and paper/live boundaries are unchanged.
 
-That preliminary acceptance was withdrawn after the required production restart exposed a second-FULL `AssertionError` at `2026-08-21T13:30:17.221171Z`. The runtime persisted `RUNTIME_FATAL` and `RUNTIME_STOPPED_FATAL`, remained flat, and created no orders, fills, positions, or attempts. The second and final permitted FIX cycle must reproduce the exact route/universe transition, replace the internal assertion with correct fail-closed production semantics, and add a production-path regression before Stage B can resume.
+That preliminary acceptance was withdrawn after the required production restart exposed a second-FULL `AssertionError` at `2026-08-21T13:30:17.221171Z`. The runtime persisted `RUNTIME_FATAL` and `RUNTIME_STOPPED_FATAL`, remained flat, and created no orders, fills, positions, or attempts. The second and final permitted FIX cycle was required to reproduce the exact route/universe transition, replace the internal assertion with correct fail-closed production semantics, and add a production-path regression before Stage B could resume.
+
+The final FIX-008 corrective cycle is accepted after 179 focused and 225 full deterministic tests. The new production-transition regression fails on candidate `e7d6f26` with the exact execution-component `AssertionError` and passes on `901586a`. Authoritative pair execution PnL is unchanged; the displayed exit component is the exact Decimal remainder after the entry component, and scanner preconditions use existing fail-closed blockers instead of runtime assertions. Compileall, diff-check, and secret scan pass. Stage B may resume only on this final accepted implementation.
