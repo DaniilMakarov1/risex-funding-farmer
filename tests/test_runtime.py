@@ -358,6 +358,24 @@ class ReconnectingSession:
         )
 
 
+def assert_socket_episode(rows):
+    assert [row["event_type"] for row in rows] == [
+        "PUBLIC_SOCKET_DISCONNECTED", "PUBLIC_SOCKET_RECONNECTED",
+    ]
+    disconnected = json.loads(rows[0]["detail"])
+    reconnected = json.loads(rows[1]["detail"])
+    assert disconnected == {
+        key: value for key, value in reconnected.items()
+        if key != "reconnected_at"
+    }
+    assert disconnected["disconnected_at"] == rows[0]["recorded_at"]
+    assert reconnected["reconnected_at"] == rows[1]["recorded_at"]
+    assert datetime.fromisoformat(reconnected["reconnected_at"]) >= datetime.fromisoformat(
+        disconnected["disconnected_at"]
+    )
+    return disconnected, reconnected
+
+
 class JsonResponse:
     def __init__(self, payload):
         self.payload = payload
@@ -1328,21 +1346,18 @@ async def test_extended_eof_persists_one_ordered_physical_socket_episode(tmp_pat
         )
         await runtime.shutdown()
         lifecycle = repository.connection.execute(
-            "SELECT event_type,venue,detail FROM runtime_evidence "
+            "SELECT recorded_at,event_type,venue,detail FROM runtime_evidence "
             "WHERE event_type IN "
             "('PUBLIC_SOCKET_DISCONNECTED','PUBLIC_SOCKET_RECONNECTED') "
             "ORDER BY evidence_id"
         ).fetchall()
     assert session.connections == 2
-    assert [row["event_type"] for row in lifecycle] == [
-        "PUBLIC_SOCKET_DISCONNECTED", "PUBLIC_SOCKET_RECONNECTED",
-    ]
     assert {row["venue"] for row in lifecycle} == {"EXTENDED"}
-    details = [json.loads(row["detail"]) for row in lifecycle]
-    assert details[0] == details[1]
-    assert details[0]["episode_id"].startswith("EXTENDED:trade:")
-    assert details[0]["stream_kind"] == "trade"
-    assert details[0]["market"] == "ABC-EXTENDED"
+    disconnected, reconnected = assert_socket_episode(lifecycle)
+    assert disconnected["episode_id"] == reconnected["episode_id"]
+    assert disconnected["episode_id"].startswith("EXTENDED:trade:")
+    assert disconnected["stream_kind"] == reconnected["stream_kind"] == "trade"
+    assert disconnected["market"] == reconnected["market"] == "ABC-EXTENDED"
 
 
 @pytest.mark.asyncio
@@ -1366,21 +1381,20 @@ async def test_combined_socket_uses_one_episode_for_sorted_market_set(tmp_path):
         runtime._stop_event = stop
         await runtime._combined_stream(Venue.NADO, adapter, symbols)
         lifecycle = repository.connection.execute(
-            "SELECT event_type,venue,detail FROM runtime_evidence "
+            "SELECT recorded_at,event_type,venue,detail FROM runtime_evidence "
             "WHERE event_type IN "
             "('PUBLIC_SOCKET_DISCONNECTED','PUBLIC_SOCKET_RECONNECTED') "
             "ORDER BY evidence_id"
         ).fetchall()
     assert session.connections == 3
-    assert [row["event_type"] for row in lifecycle] == [
-        "PUBLIC_SOCKET_DISCONNECTED", "PUBLIC_SOCKET_RECONNECTED",
-    ]
     assert {row["venue"] for row in lifecycle} == {"NADO"}
-    details = [json.loads(row["detail"]) for row in lifecycle]
-    assert details[0] == details[1]
-    assert details[0]["episode_id"].startswith("NADO:combined:")
-    assert details[0]["stream_kind"] == "combined"
-    assert details[0]["markets"] == ["ABC-NADO", "XYZ-NADO"]
+    disconnected, reconnected = assert_socket_episode(lifecycle)
+    assert disconnected["episode_id"] == reconnected["episode_id"]
+    assert disconnected["episode_id"].startswith("NADO:combined:")
+    assert disconnected["stream_kind"] == reconnected["stream_kind"] == "combined"
+    assert disconnected["markets"] == reconnected["markets"] == [
+        "ABC-NADO", "XYZ-NADO",
+    ]
 
 
 @pytest.mark.asyncio
@@ -1402,16 +1416,17 @@ async def test_failed_extended_reconnect_attempts_do_not_duplicate_episode(tmp_p
             ExtendedAdapter(None), "ABC-EXTENDED", "funding"
         )
         lifecycle = repository.connection.execute(
-            "SELECT event_type,detail FROM runtime_evidence "
+            "SELECT recorded_at,event_type,venue,detail FROM runtime_evidence "
             "WHERE event_type IN "
             "('PUBLIC_SOCKET_DISCONNECTED','PUBLIC_SOCKET_RECONNECTED') "
             "ORDER BY evidence_id"
         ).fetchall()
     assert session.connections == 4
-    assert [row["event_type"] for row in lifecycle] == [
-        "PUBLIC_SOCKET_DISCONNECTED", "PUBLIC_SOCKET_RECONNECTED",
-    ]
-    assert json.loads(lifecycle[0]["detail"]) == json.loads(lifecycle[1]["detail"])
+    assert {row["venue"] for row in lifecycle} == {"EXTENDED"}
+    disconnected, reconnected = assert_socket_episode(lifecycle)
+    assert disconnected["episode_id"] == reconnected["episode_id"]
+    assert disconnected["stream_kind"] == reconnected["stream_kind"] == "funding"
+    assert disconnected["market"] == reconnected["market"] == "ABC-EXTENDED"
 
 
 @pytest.mark.asyncio

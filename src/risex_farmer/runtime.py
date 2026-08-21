@@ -1444,6 +1444,7 @@ class PublicPaperRuntime:
                 f"{self._socket_episode_number}"
             ),
             "stream_kind": stream_kind,
+            "disconnected_at": at.isoformat(),
         }
         if stream_kind == "combined":
             detail["markets"] = list(markets)
@@ -1465,11 +1466,15 @@ class PublicPaperRuntime:
     ) -> None:
         detail = self._pending_socket_episodes.pop(identity, None)
         if detail is not None:
+            reconnect_detail = {
+                **detail,
+                "reconnected_at": at.isoformat(),
+            }
             self._record(
                 "PUBLIC_SOCKET_RECONNECTED",
                 at=at,
                 venue=identity[0],
-                detail=detail,
+                detail=reconnect_detail,
             )
 
     async def recover_snapshot(self, book: OrderBook, *, at: datetime | None = None) -> None:
