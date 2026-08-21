@@ -2,9 +2,9 @@
 
 - Accepted implementation: PAPER-007-FIX-007 — Extended Expected Funding and Socket Health Separation @ `77af66b9cb4662acd3055a6457b0fe53f667a256` + `ac5ac7ee6c27f629d389dcf283169c59bf276b9d` + `7e73bdcb1de5eb3be8ad457c6e7c9c1f0db3ae30`
 - Previous accepted implementation: TELEGRAM-002-FIX-001 — Two-Decimal Bot Values @ `c59c54c4265b224ef1781492bf24b79b8987f382` + `b7c9564efa902e7bc82f40b55ed9ad05687f95e3`
-- Active implementation task: none
+- Active implementation task: PAPER-007-FIX-008 — Public Evidence, Extended Catalog/Heartbeat, Full Digest, and Stop Semantics
 - PAPER-007 Stage A scheduling validation: PASS
-- PAPER-007 Stage B: running on accepted published FIX-007 with the existing database and outbound Telegram enabled
+- PAPER-007 Stage B: stopped safely on FIX-007; do not restart until FIX-008 acceptance
 - Preserved Stage B evidence: `paper-007-stage-a-fix002.db`, SHA-256 `6c9bddbf3e10e5690f8e5d5327adf5c35fad4f2044d96fdb9445b3bd567e68ff`
 - Product phase: PAPER ONLY
 - Live trading: prohibited
@@ -35,3 +35,5 @@ TELEGRAM-002-FIX-001 is accepted after 178 deterministic tests. One presentation
 PAPER-007-FIX-007 is accepted after 80 focused and 187 full deterministic tests, compileall, diff-check, and secret scan. Five new production-path tests fail on the pre-fix main and pass after the correction. Extended REST predictions remain the future Scanner quote; WebSocket applied records are inert without a position and exact, idempotent, and `UNRESOLVED` when authoritative cash is unavailable for an open settlement. Extended book/trade/funding socket health is isolated per market and stream with no `connection_combined` component. A public-only smoke completed INITIAL plus two FULL scans and stopped `STOPPED_SAFE`, but Extended's official catalog returned HTTP 200 too slowly to complete within the unchanged 30-second fail-closed timeout, so no real Extended funding WebSocket event was observed in that smoke.
 
 Stage B resumed on the same database under PID `69724` in detached screen `risex-paper007-stageb-fix007-telegram`. Extended initially remained unavailable after bounded catalog timeouts, then recovered through public data only. FULL scans completed at `2026-08-21T11:14:11.827501Z` and `2026-08-21T11:16:11.831054Z`; a real `PUBLIC_FUNDING_STREAM_READY` event occurred between them. The second FULL evaluated 10 Extended routes, retained 6 numeric planned PnLs, and had no `BOOK_UNHEALTHY`, `TARGET_CYCLE_ELAPSED`, or `FUNDING_ELIGIBILITY_UNKNOWN`; four BTC directions remained fail-closed for market/parity evidence. Expected quotes remained `PREDICTED` for `2026-08-21T12:00:00Z`, no applied settlement was invented, database integrity was `ok`, and orders/fills/open positions remained `0/0/0`.
+
+PAPER-007-FIX-008 is explicitly authorized. Production evidence ended at `2026-08-21T11:42:11.815521Z` with `STOPPED_SAFE`, `forced_close=false`, no preserved position, database integrity `ok`, and orders/fills/positions/attempts `0/0/0/0`. The task is bounded to RISEx unit evidence, Extended catalog freshness and dedicated-socket heartbeat/lifecycle semantics, all-20 authoritative FULL digest rows with precise UNKNOWN reasons, and persisted stop cause. Economics, cadence, execution, funding, and paper/live boundaries remain unchanged.

@@ -29,6 +29,10 @@ NORMAL_EXIT_AGGRESSIVE_AFTER_SECONDS = 10
 WEBSOCKET_HEALTH_CHECK_SECONDS = 10
 MAX_MARKET_STREAM_SILENCE_SECONDS = 25
 DEFAULT_MAX_FUNDING_DATA_AGE_SECONDS = 120
+EXTENDED_REQUIRED_MARKETS_MAX_AGE_SECONDS = 300
+EXTENDED_UNIVERSE_REFRESH_SECONDS = 600
+EXTENDED_UNIVERSE_MAX_AGE_SECONDS = 1200
+EXTENDED_UNIVERSE_REQUEST_TIMEOUT_SECONDS = 60
 RISEX_MAKER_FEE_RATE = 0.00005
 RISEX_TAKER_FEE_RATE = 0.00021
 EXTENDED_MAKER_FEE_RATE = 0
@@ -65,6 +69,8 @@ Eligible instruments are active, non-RFQ, non-off-hours, linear perpetuals only.
 
 A route requires matching canonical asset, known multiplier, equal normalized base exposure, linear perpetuals on both legs, and parity proven by official metadata. Adapters produce canonical USD price per base, base quantity, tick, and quantity step. `canonical_quantity = raw_venue_quantity × base_multiplier`; normalize contract-denominated prices too. Core never infers multiplier semantics.
 
+For the explicitly authorized RISEx paper fallback, public trade and nonzero order-book quantities prove units when they are strictly positive and exactly step-aligned, and prices are strictly positive and exactly tick-aligned. Public fills and residual book levels need not meet `minimum_quantity_raw`. Minimum quantity remains mandatory for every planned paper order and entry eligibility. Empty evidence, zero/negative values, off-grid values, synthetic products, multiplier mismatch, or inconsistent metadata fail closed with a precise unit-evidence blocker; assumption markers remain paper-only.
+
 For paper v1 only, 1 USD = 1 USDC = 1 USDT = 1 USDT0 for linear-perpetual parity, notional, fees, and PnL. Other quote/settlement assets are ineligible. Stablecoin depeg is not modeled.
 
 ## 5. Universe and routes
@@ -76,7 +82,7 @@ RISEx is one leg of every route. Hedge venue is Extended or Nado. Directions are
 - LONG RISEx / SHORT Nado
 - SHORT RISEx / LONG Nado
 
-`route_liquidity = min(risex_24h_quote_volume_usd, hedge_24h_quote_volume_usd)`. For each asset, `asset_liquidity` is the maximum eligible route liquidity. Select Top-5 assets by this value, at most 20 routes. Convert official base volume using that venue's official current price; if unreliable, exclude the market.
+`route_liquidity = min(risex_24h_quote_volume_usd, hedge_24h_quote_volume_usd)`. For each asset, `asset_liquidity` is the maximum eligible route liquidity. Select Top-5 assets by this value, exactly the available four directions per selected asset and at most 20 routes. Persist and deliver all evaluated directions; ranking does not truncate the evidence set. Convert official base volume using that venue's official current price; if unreliable, exclude the market.
 
 A route also needs valid BBO, canonical grids and minimums, a fresh funding quote and next funding timestamp, known eligibility, and exact-quantity taker depth in both directions on both venues.
 
@@ -104,7 +110,11 @@ stream_connected, book_initialized, book_sequence_valid
 
 Perform documented heartbeat/ping every 10 seconds. A market is usable only with healthy connection, initialized book, and valid sequence. No trades/price motion alone is not stale. Data is stale when connection confirmation is older than 25 seconds, or immediately on disconnect, gap, uninitialized/incomplete recovery, or invalid BBO.
 
-Extended book, trade, and funding WebSockets are separate physical connections. Track connection confirmation and data readiness independently for each `(market, stream_kind)`; a ping or valid message confirms only its own socket, and `connection_combined` is not an Extended component. A stale Extended socket invalidates and reconnects only that stream while preserving one ordered physical disconnect/reconnect episode.
+Extended book, trade, and funding WebSockets are separate physical connections. Track connection confirmation and data readiness independently for each `(market, stream_kind)`; a ping, pong, or valid message confirms only its own socket, and `connection_combined` is not an Extended component. Each physical socket owns one deterministic client heartbeat at 10-second intervals; server ping is answered within its documented deadline. Quiet market data is not stale while heartbeat confirmation is fresh.
+
+Only observed transport EOF/CLOSE/ERROR or a connection exception creates one ordered `PUBLIC_SOCKET_DISCONNECTED` / `PUBLIC_SOCKET_RECONNECTED` episode. A watchdog decision caused solely by confirmation age instead creates one deduplicated `PUBLIC_STREAM_CONFIRMATION_STALE` / `PUBLIC_STREAM_RESTARTED` episode and restarts only that stream. Sequence gaps retain only book-resync lifecycle evidence unless a physical transport event is separately observed. Shutdown/cancellation creates neither lifecycle.
+
+Extended catalog health is independent from book, trade, and funding health. A validated full universe catalog is refreshed in a non-blocking background task every 600 seconds with its own 60-second total timeout and may be used for at most 1200 seconds. Each normal public refresh requests only already-authoritatively-mapped required markets through repeated official `market` query parameters; required metadata may be used for at most 300 seconds. Replacement is atomic after complete validation. Transient failures within TTL persist explicit cached-last-good evidence and do not degrade healthy streams or funding. Startup without a validated universe fails Extended closed as `CATALOG_UNAVAILABLE`; expired universe or per-market metadata fails closed as `CATALOG_STALE` or `MARKET_METADATA_STALE`, never `BOOK_UNHEALTHY`. All other public requests retain the shared 30-second timeout, and catalog work never delays FULL/focused deadlines.
 
 Default funding maximum age is 120 seconds. A longer adapter cadence needs explicit official evidence, local comment, and test.
 
@@ -256,7 +266,9 @@ The runtime may enqueue an immutable notification only after an authoritative co
 
 Opportunity payloads carry authoritative values without recalculation: UTC scan/event time, ticker, both-venue route, and the selected plan's `planned_maker_net_pnl_usd`. Repeated focused scans with unchanged semantic state produce no notification. Event notifications deduplicate by stable authoritative event ID. Opportunity notifications deduplicate by route, target cycle, and displayed-cent PnL state; appearance, disappearance, route/cycle change, or a displayed-cent change may notify once.
 
-TELEGRAM-002 explicitly adds one digest after every completed and persisted `FULL` scan, but never after `INITIAL`, `FOCUSED`, or `RECOVERY` scans. The digest renders up to the same 15 already ordered authoritative route rows as three columns: `Ticker | Route | Expected PnL`. Route names both venues and sides; PnL is copied from `planned_maker_net_pnl_usd`, with `UNKNOWN` when absent. Rendering does not invoke Scanner or recalculate economics.
+TELEGRAM-002 explicitly adds a digest after every completed and persisted `FULL` scan, but never after `INITIAL`, `FOCUSED`, or `RECOVERY` scans. It renders every authoritative route row, up to all 20 directions, as three columns: `Ticker | Route | Expected PnL`. Route names both venues and sides; numeric PnL is copied from `planned_maker_net_pnl_usd`. An absent PnL renders `UNKNOWN` plus the shortest precise authoritative blocker in that same third field. Rendering does not invoke Scanner or recalculate economics. If needed, deterministic `Full Scan i/N` parts keep each whole route line ordered and unique, each message at most 4096 characters, and each event ID scoped by scan timestamp and part number.
+
+Runtime has no elapsed-time stop. `STOPPED_SAFE` records bounded `stop_cause`, known signal, request time, `forced_close`, and whether an open position was preserved. SIGINT, SIGTERM, and explicit stop events are distinguished. Fatal internal failure persists separate bounded fatal evidence with exception class and is not reported as an intentional user stop. Socket, heartbeat, refresh, recovery, and notification tasks are cancelled and awaited without fabricating disconnect/reconnect evidence.
 
 Delivery uses a bounded in-memory asyncio queue and a separate worker with finite timeout and finite attempts. Runtime enqueue is non-blocking; queue saturation or Telegram outage may drop a notification but must never delay scans, exact deadlines, lifecycle, or safe stop. A notification `event_id` is accepted into the queue at most once per process. Because Telegram `sendMessage` has no idempotency key, an ambiguous timeout is not retried; only an unambiguous pre-acceptance failure or explicit flood-control response may use the bounded retry allowance.
 
