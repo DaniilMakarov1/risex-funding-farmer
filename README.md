@@ -78,12 +78,22 @@ An Architect may use a separately authorized one-shot `getUpdates` diagnostic
 only to discover the configured destination; it is not part of `paper-run`.
 Delivery is best effort; a full queue or Telegram outage can drop messages so it
 cannot delay market-data processing, strategy deadlines, or safe shutdown.
-Every completed authoritative `FULL` scan sends one concise digest containing up
-to 15 existing ordered rows in `Ticker | Route | Expected PnL` form. The values
-come directly from the runtime's scanner result; Telegram does not recalculate
+Every completed authoritative `FULL` scan sends all 20 existing ordered route
+rows in `Ticker | Route | Expected PnL` form. Long messages are split into
+bounded numbered parts without splitting or duplicating a route. `UNKNOWN`
+includes a short authoritative blocker in the same third field. The values come
+directly from the runtime's scanner result; Telegram does not recalculate
 economics. Monetary values in Telegram text are displayed with exactly two
 fractional digits while authoritative Decimal values retain full precision.
 INITIAL, FOCUSED, and RECOVERY scans do not send this digest.
+
+Extended maintains a validated full-universe catalog in a non-blocking
+background task and refreshes only the five required official market mappings
+on normal public refreshes. Fresh last-good metadata survives transient catalog
+timeouts; expired metadata fails closed with catalog/metadata blockers rather
+than `BOOK_UNHEALTHY`. Dedicated book, trade, and funding sockets have isolated
+10-second heartbeat and readiness state. Physical transport lifecycle,
+watchdog restart, and logical book resync evidence remain distinct.
 
 RISEx contract quantity and forecast funding use visibly reported paper-only
 fallback assumptions. They are enabled only for this experiment and fail closed
