@@ -69,6 +69,10 @@ An Architect may use a separately authorized one-shot `getUpdates` diagnostic
 only to discover the configured destination; it is not part of `paper-run`.
 Delivery is best effort; a full queue or Telegram outage can drop messages so it
 cannot delay market-data processing, strategy deadlines, or safe shutdown.
+Every completed authoritative `FULL` scan sends one concise digest containing up
+to 15 existing ordered rows in `Ticker | Route | Expected PnL` form. The values
+come directly from the runtime's scanner result; Telegram does not recalculate
+economics. INITIAL, FOCUSED, and RECOVERY scans do not send this digest.
 
 RISEx contract quantity and forecast funding use visibly reported paper-only
 fallback assumptions. They are enabled only for this experiment and fail closed
