@@ -4,11 +4,11 @@
 - Previous accepted implementation: PAPER-007-FIX-005 — First Full-Scan Funding Freshness @ `b5c1db0ec7f226914976f60a732ce9dfd58ff113`
 - Active implementation task: none
 - PAPER-007 Stage A scheduling validation: PASS
-- PAPER-007 Stage B: running on accepted FIX-006 with the same database; outbound Telegram temporarily disabled
+- PAPER-007 Stage B: running on accepted published FIX-006 with the same database and outbound Telegram enabled
 - Preserved Stage B evidence: `paper-007-stage-a-fix002.db`, SHA-256 `6c9bddbf3e10e5690f8e5d5327adf5c35fad4f2044d96fdb9445b3bd567e68ff`
 - Product phase: PAPER ONLY
 - Live trading: prohibited
-- Telegram: code accepted, but delivery is disabled in the current process because the restart environment lacks token/chat ID
+- Telegram: enabled from inherited environment; runtime remains outbound-only
 
 FIX-003 is accepted after 133 deterministic tests and a short public-only smoke. Physical sockets now persist one ordered `PUBLIC_SOCKET_DISCONNECTED` / `PUBLIC_SOCKET_RECONNECTED` pair per episode; combined RISEx/Nado sockets use one ordered market-set identity, while book gaps retain only snapshot-recovery evidence. Stage A timing remains accepted and was not repeated.
 
@@ -27,3 +27,5 @@ PAPER-007-FIX-006 is explicitly authorized after live evidence showed repeated R
 PAPER-007-FIX-006 is accepted after 171 deterministic tests. A two-market combined-stream regression proves one checksum mismatch produces exactly one official unsubscribe/subscribe pair, buffers without a resubscribe burst until both new WebSocket snapshots arrive, resumes valid checksum updates, creates no REST recovery calls, and creates no physical socket lifecycle rows. A separate public-only smoke reached readiness with RISEx and Nado healthy, used no Telegram/private endpoints/orders/positions, and stopped `STOPPED_SAFE`; no natural RISEx checksum mismatch occurred during the short smoke. PID `50755` remains untouched on the pre-fix process until a safe restart.
 
 The pre-fix PID `50755` later entered the confirmed RISEx REST-recovery storm, remained flat, and stopped `STOPPED_SAFE` with `forced_close=false`. The same database resumed on accepted FIX-006 under PID `58010` in detached screen `risex-paper007-stageb-fix006-no-telegram`. Startup refresh completed, all venues reached public readiness, and the first `FULL` scan at `2026-08-21T09:25:20.740721Z` had 8 authoritative numeric PnLs instead of zero; the remaining unknown routes retained explicit market/funding blockers. Telegram is disabled because the old detached session ended with its environment and no secret was copied into commands or logs.
+
+Independent Architect verification passed 71 focused and 171 full deterministic tests, compileall, diff-check, and secret scans. The six-commit local chain was published by ordinary fast-forward. At restart time PID `58010` and its screen had already exited; persisted evidence showed `STOPPED_SAFE` with `forced_close=false`, database integrity was `ok`, and orders/fills/open positions were `0/0/0`. Stage B resumed on the same database under PID `60720` in detached screen `risex-paper007-stageb-fix006-telegram`. STARTED, READY, and a bounded post-READY refresh completed; RISEx, Extended, and Nado reached readiness. The first new `FULL` scan completed at `2026-08-21T09:55:23.410050Z`; its 15-row Telegram digest source contained 6 numeric PnLs and 9 fail-closed UNKNOWN rows (4 market/parity blockers and 5 funding-eligibility/elapsed-cycle blockers). No natural RISEx checksum mismatch occurred after restart, and no RISEx REST snapshot-recovery storm or false socket lifecycle evidence was observed. Telegram delivery success remains intentionally unpersisted and requires recipient-side confirmation.
