@@ -50,8 +50,8 @@ run ends.
 ### Optional outbound Telegram notifications
 
 Telegram delivery is disabled by default and does not change scanning or paper
-trading. To enable outbound `sendMessage` notifications for `paper-run`, create
-a newly rotated bot token, choose the destination chat, and set all three
+trading. To enable outbound `sendMessage` notifications for `paper-run`, choose
+a bot token and destination chat, and set all three
 environment variables before starting a new run:
 
 ```bash
@@ -61,8 +61,9 @@ export RISEX_TELEGRAM_CHAT_ID='destination-chat-id'
 risex-farmer --db paper.db paper-run
 ```
 
-Never reuse a token that has been disclosed. Credentials are read only from the
-environment and must not be committed. This integration is outbound-only: it
+Credentials are read only from the environment and must not be committed,
+logged, persisted, or placed in CLI arguments. Any explicit risk acceptance for
+a disclosed token is recorded without the token value. This integration is outbound-only: it
 does not poll `getUpdates`, accept commands, trigger scans, or place orders.
 Delivery is best effort; a full queue or Telegram outage can drop messages so it
 cannot delay market-data processing, strategy deadlines, or safe shutdown.
