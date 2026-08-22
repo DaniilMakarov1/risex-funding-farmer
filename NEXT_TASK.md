@@ -23,16 +23,20 @@ This slice adds no product functionality. Stage B and Telegram remain stopped. N
 
 - The main tick must never await slow public network refresh in a way that prevents health checks, position monitoring, T−120/T−5 activation, or 10-second FOCUSED scans.
 - When a FULL absolute slot is due, Runtime starts or joins the one owned deadline-critical observation refresh and defers that FULL until the refresh terminally succeeds or fails. Tick continues servicing FOCUSED, lifecycle, and health work while FULL is pending; those deadlines take precedence.
+- INITIAL preserves its existing public bootstrap behavior. FULL alone uses the due-refresh deferral rule. FOCUSED and RECOVERY never await catalog, metadata, or other public REST work; they use the already-published current, fresh last-good, pending, or unavailable component state under existing TTL/readiness semantics.
+- FOCUSED and RECOVERY may legitimately contain already-published component observations with different venue/component timestamps. They must not impose synchronized exchange timestamps or cross-venue all-or-nothing publication, but each scan still freezes one causal immutable input tuple and rejects any input timestamp later than its own `logical_at`.
 - If unavoidable, one minimal internal pending FULL-slot/task-consumption marker is permitted inside the existing Runtime scheduler. It is not product state or a new scheduler owner. It must contain one auditable absolute slot identity, be uniquely Runtime-owned and bounded, clear after the resulting scan, terminal refresh failure handling, cancellation, or stop, restore to none on restart, and create neither duplicate FULL nor duplicate refresh.
 - Missed FULL slots follow the existing absolute-slot coalescing policy and are never replayed in a burst. The persisted FULL evidence retains the original scheduled slot even when execution is deferred.
 - Unexpected internal/programmer errors remain governed by the existing fatal safety contract. They must not be converted into ordinary venue failure, stale cache, or UNKNOWN.
 
-## Single immutable FULL snapshot boundary
+## No-await immutable capture boundary for every Scanner run
 
-- FULL must not capture observations while its owned due refresh is partially in progress. After terminal completion, materialize one immutable tuple from the finished Runtime state: new observations for successful components and the existing honest last-good or unavailable state for failed components under frozen TTL/readiness rules. Legitimate component-level partial success is allowed and is not cross-venue corruption.
-- Capture `logical_at` only after the due deadline-critical refresh has terminally completed and immediately after materializing that immutable observation tuple. Every included `observed_at` must be less than or equal to this `logical_at`.
-- Scanner evaluation, `ScanSnapshot`, persisted funding quotes and public route rows, blocker/source-quality fields, and Telegram FULL payload all derive from that exact tuple and Scanner snapshot.
-- `_route_row` or equivalent rendering must not reread mutable `self.observations` after `scan_once`. A concurrent stream or refresh mutation between Scanner evaluation and route rendering must not alter the persisted row or Telegram payload for that FULL.
+- After any refresh prerequisite applicable to that scan kind, synchronously freeze/copy the raw Runtime observation references into a bounded local tuple. For FULL this occurs only after the owned due observation refresh terminally completes; INITIAL retains bootstrap; FOCUSED/RECOVERY have no REST prerequisite and freeze the already-published state immediately.
+- Without any intervening `await`, network call, callback, or mutable owner handoff, capture one `logical_at` immediately after freezing those raw references, then synchronously normalize the frozen tuple using that same `logical_at`.
+- Prove every included observation, book, and funding `observed_at` is less than or equal to the captured `logical_at`. A legitimate tuple may combine already-published fresh successes with valid last-good, pending, or unavailable components at differing observation times.
+- Scanner evaluation, `ScanSnapshot`, persisted funding quotes and public route rows, blocker/source-quality fields, and notifications all derive from that exact normalized tuple and Scanner snapshot without rereading mutable Runtime state.
+- `_route_row` or equivalent rendering must not reread `self.observations` after `scan_once`. A concurrent stream or refresh mutation after the no-await capture boundary must not alter persistence, public rows, or Telegram payload for that Scanner run.
+- There is no `await`, public request, lock spanning I/O, or network operation anywhere inside raw-reference freeze → `logical_at` capture → normalization. Do not add a staging cache, batch owner, or cross-venue transaction to implement this local value boundary.
 - Preserve existing repository ownership and transactions. Do not create a SQLite read model, event sourcing, batch observation cache, or cross-venue publication transaction.
 
 ## Mandatory RED and proof matrix
@@ -55,15 +59,15 @@ For an expected component timeout or official failure, prove no scan starvation 
 
 ### E. Scheduler priority under a slow refresh
 
-Hold the deadline-critical refresh for more than 25-30 seconds across multiple health, lifecycle, T−120/T−5, and 10-second FOCUSED deadlines. Tick must continue servicing them on the frozen schedule while one FULL slot remains pending. On release, exactly one FULL consumes the terminal result; missed slots are coalesced under existing policy and no burst occurs.
+Hold the deadline-critical FULL refresh for more than 25-30 seconds across multiple health, lifecycle, T−120/T−5, and 10-second FOCUSED deadlines. Tick must continue servicing them on the frozen schedule while one FULL slot remains pending. At least one FOCUSED scan executed during the in-flight refresh must freeze the already-published state on deadline, must not wait for REST, and must not consume an observation published after its captured `logical_at`. On release, exactly one FULL consumes the terminal result; missed slots are coalesced under existing policy and no burst occurs. Frozen economics and cadence remain unchanged.
 
 ### F. Catalog isolation and single-flight call counts
 
 Gate Extended full-universe and required-market metadata independently from observation refresh. Neither catalog path delays FULL/FOCUSED; fresh TTL cache or exact catalog/metadata blocker is used. Overlapping seed, FULL, catalog, and ordinary triggers preserve existing Runtime ownership and bounded endpoint call counts with no duplicate observation refresh or REST burst.
 
-### G. One tuple through Scanner, persistence, rows, and Telegram
+### G. One causal tuple through every Scanner run, persistence, rows, and Telegram
 
-After the immutable tuple is passed to `scan_once`, mutate live `self.observations` and stream state before route-row rendering. Scanner snapshot, persisted funding quotes, all public route fields including blocker/source quality, and Telegram FULL payload must remain derived from the captured tuple/snapshot. No later mutable reread may change that FULL.
+For INITIAL, FULL, FOCUSED, and RECOVERY, prove the synchronous raw-reference freeze, single `logical_at`, normalization, and timestamp validation sequence with no await inside the boundary. After the immutable tuple is passed to `scan_once`, mutate live `self.observations` and stream state before route-row rendering. Scanner snapshot, persisted funding quotes, all public route fields including blocker/source quality, and any notification payload must remain derived from the captured tuple/snapshot. No later mutable reread may change that Scanner run.
 
 ### H. Actual top-5 route-component matrix
 
@@ -93,7 +97,7 @@ Tracked presentation tests prove the FULL digest relays the exact persisted Scan
 
 - Use a new dedicated disposable empty DB outside Git for the Scanner/UNKNOWN/PnL run. Keep the root DB and preserved open-position archive untouched. R16 open-position preservation remains a separate deterministic disposable-copy audit, not part of this empty-DB public run.
 - Run 60-90 minutes across an hourly settlement boundary, Telegram disabled, with PID-only continuous supervision and only short measured read-only DB checkpoints. No reader transaction spans a sleep or deadline.
-- Persist and audit refresh due/start/terminal timestamps, the pending FULL absolute slot, and the exact resulting FULL snapshot `logical_at`, so refresh→snapshot causality is proved directly rather than inferred from nearby events.
+- Persist and audit refresh due/start/terminal timestamps, the pending FULL absolute slot, and the exact resulting FULL snapshot `logical_at`, so refresh→snapshot causality is proved directly rather than inferred from nearby events. For sampled INITIAL/FOCUSED/RECOVERY scans, also prove their no-await tuple capture and absence of future observations without adding continuous evidence volume.
 - Audit FULL/FOCUSED cadence, health/lifecycle deadlines, endpoint call counts, single-flight ownership, component successes/failures, numeric/UNKNOWN streaks, funding ages/cycles, future observations, route-row/Telegram-source identity, recovery/socket evidence, safe stop, integrity, and post-stop writes.
 - A settlement-boundary FULL may be deferred for its one owned observation refresh. The next completed FULL must be numeric when every official mandatory input is available and valid; an exact honest UNKNOWN remains acceptable for a real component failure or official old/elapsed cycle.
 - Telegram and authoritative Stage B remain stopped until deterministic and operational acceptance plus independent Chief Review. Only then may a separate decision consider restart.
