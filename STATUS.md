@@ -7,7 +7,7 @@
 - Accepted implementation: PAPER-007-FIX-008 @ `f7140447237850b7436eb54e83ef53b1ff8edc06` + `e7d6f26dd5afad6400433b3c0f9ca1fc94095c79` + `901586a852bfd1ed0f512f74969e8d4d308fcea3`
 - Previous accepted implementation: PAPER-007-FIX-007 — Extended Expected Funding and Socket Health Separation @ `77af66b9cb4662acd3055a6457b0fe53f667a256` + `ac5ac7ee6c27f629d389dcf283169c59bf276b9d` + `7e73bdcb1de5eb3be8ad457c6e7c9c1f0db3ae30`
 - Previous accepted implementation: TELEGRAM-002-FIX-001 — Two-Decimal Bot Values @ `c59c54c4265b224ef1781492bf24b79b8987f382` + `b7c9564efa902e7bc82f40b55ed9ad05687f95e3`
-- Active implementation task: none; the proposed next bounded corrective slice is held for Chief Reviewer plan review in `NEXT_TASK.md` and no Builder has started.
+- Active implementation task: PAPER-007-STABILIZATION-002; Chief Reviewer approved the bounded contract in `NEXT_TASK.md`. Exactly one Builder may begin with a tests-only RED phase from local `main`.
 - PAPER-007 Stage A scheduling validation: PASS
 - PAPER-007 Stage B: stopped; no rejected stabilization candidate has been run operationally
 - Preserved production evidence: `/Users/daniilmakarov/Desktop/risex-paper007-archives/paper-007-stage-b-fix003-accepted.pre-fix010-operational.db`, SHA-256 `93e9b6793e76cec227d0fe40799a70d0416518568b0c228fc0808a681497df80`; open position `public-1787381880-1:position` remains `EXITING_AGGRESSIVE`

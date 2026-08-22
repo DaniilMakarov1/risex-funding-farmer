@@ -1,6 +1,6 @@
 # PAPER-007-STABILIZATION-002 — Venue-Complete Recovery and Persisted Lifecycle Causality
 
-Status: proposed and held for Chief Reviewer plan review. No Builder may start until the Chief Reviewer accepts this bounded contract. PAPER-007-STABILIZATION-001 is `BLOCKED — TASK DID NOT CONVERGE`; rejected commits `e6c0bcc2415bb2b4b7b9b3d0026fd435b9db29c4` and `fc47b8a111503dc91d1347929ba32b7038f03d99` must not be merged, cherry-picked wholesale, or called accepted.
+Status: Chief-Reviewer-approved and active. This is the only implementation slice. PAPER-007-STABILIZATION-001 is `BLOCKED — TASK DID NOT CONVERGE`; rejected commits `e6c0bcc2415bb2b4b7b9b3d0026fd435b9db29c4` and `fc47b8a111503dc91d1347929ba32b7038f03d99` must not be merged, cherry-picked wholesale, or called accepted.
 
 This is one strictly corrective slice under the existing PAPER-007 stabilization authorization. It adds no product behavior, economics, formula, cadence, Telegram behavior, private endpoint, live capability, service, compatibility layer, flag, cache, or parallel state owner. Stage B and Telegram remain stopped.
 
@@ -24,4 +24,4 @@ Builder starts from current local `main`, writes production-shaped RED tests aga
 - Re-run the exact external Extended untagged/startup reproduction, all prior stabilization R1–R16 preservation cases, FIX-003/006/007/008/009/010 tests, repository races, full `pytest`, compileall, diff check, and tracked-secret scan.
 - R16 uses only a disposable copy of `/Users/daniilmakarov/Desktop/risex-paper007-archives/paper-007-stage-b-fix003-accepted.pre-fix010-operational.db`. The original must remain untouched with SHA-256 `93e9b6793e76cec227d0fe40799a70d0416518568b0c228fc0808a681497df80`; the distinct root DB must not be opened or mutated.
 
-Exactly one Builder may work after Chief Reviewer approval, on a new `codex/paper-007-stabilization-002` branch from local `main`, without spawning agents. Maximum two fix cycles. No merge, push, public endpoints, operational run, Stage B, Telegram, or global Scanner/UNKNOWN/PnL implementation before deterministic acceptance and independent Chief Review.
+Exactly one Builder may work on a new `codex/paper-007-stabilization-002` branch from local `main`, without spawning agents. Maximum two fix cycles. No merge, push, public endpoints, operational run, Stage B, Telegram, or global Scanner/UNKNOWN/PnL implementation before deterministic acceptance and independent Chief Review.
