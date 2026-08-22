@@ -316,15 +316,22 @@ async def test_open_lifecycle_checkpoint_is_bounded_and_hydrates_history(tmp_pat
         checkpoint_bytes = repository.connection.execute(
             "SELECT length(payload) FROM runtime_state WHERE singleton=1"
         ).fetchone()[0]
-        mutations = []
-        repository.connection.set_trace_callback(
-            lambda statement: mutations.append(statement)
-            if statement.lstrip().upper().startswith(("INSERT", "UPDATE", "REPLACE"))
-            else None
-        )
+        counts_before = {
+            table: repository.connection.execute(
+                f"SELECT COUNT(*) FROM {table}"
+            ).fetchone()[0]
+            for table in (
+                "position_samples", "lifecycle_events",
+                "funding_settlements", "processed_trade_events",
+            )
+        }
+        statements = []
+        repository.connection.set_trace_callback(statements.append)
         updated = replace(
             expanded,
-            samples=expanded.samples + (replace(sample, sampled_at=sample.sampled_at + timedelta(seconds=10)),),
+            samples=expanded.samples + (replace(
+                sample, sampled_at=sample.sampled_at + timedelta(seconds=1000)
+            ),),
             processed_trade_keys=expanded.processed_trade_keys | {"trade-1000"},
         )
         repository.save_decision(
@@ -335,11 +342,37 @@ async def test_open_lifecycle_checkpoint_is_bounded_and_hydrates_history(tmp_pat
         checkpoint_after = repository.connection.execute(
             "SELECT length(payload) FROM runtime_state WHERE singleton=1"
         ).fetchone()[0]
+        counts_after = {
+            table: repository.connection.execute(
+                f"SELECT COUNT(*) FROM {table}"
+            ).fetchone()[0]
+            for table in counts_before
+        }
         restored = repository.load_runtime()
     assert checkpoint_bytes < 20_000
     assert checkpoint_after < 20_000
     assert abs(checkpoint_after - checkpoint_bytes) < 1000
+    mutations = [
+        statement for statement in statements
+        if statement.lstrip().upper().startswith(("INSERT", "UPDATE", "REPLACE"))
+    ]
+    assert len(statements) <= 24
     assert len(mutations) <= 16
+    assert counts_after == {
+        **counts_before,
+        "position_samples": counts_before["position_samples"] + 1,
+        "processed_trade_events": counts_before["processed_trade_events"] + 1,
+    }
+    assert not any(
+        "FROM FUNDING_SETTLEMENTS" in statement.upper()
+        and "WHERE" not in statement.upper()
+        for statement in statements
+    )
+    assert not any(
+        "FROM PROCESSED_TRADE_EVENTS" in statement.upper()
+        and "WHERE" not in statement.upper()
+        for statement in statements
+    )
     assert restored.samples == updated.samples
     assert restored.events == updated.events
     assert restored.settlements == updated.settlements

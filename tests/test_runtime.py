@@ -1956,6 +1956,14 @@ async def test_concurrent_component_failures_form_one_aggregate_execution_gap(tm
             final = runtime.lifecycle.snapshot
             assert not final.gap_open
             assert final.gap_count == 1
+            stale_key = (hedge_key[0], hedge_key[1], "trade")
+            runtime._stream_generations[stale_key] = 2
+            before_stale = runtime.lifecycle.snapshot
+            await runtime.mark_disconnected(
+                *hedge_key, at=clock.now() - timedelta(seconds=5),
+                stream_kind="trade", stream_generation=1,
+            )
+            assert runtime.lifecycle.snapshot == before_stale
             event_times = [event.occurred_at for event in final.events]
             assert event_times == sorted(event_times)
             if final.exit_order is not None:
@@ -1969,6 +1977,9 @@ async def test_concurrent_component_failures_form_one_aggregate_execution_gap(tm
 async def test_production_shaped_zec_first_fill_chain_is_exact_and_single(tmp_path):
     clock = FakeClock()
     target = NOW + timedelta(seconds=120)
+    async def no_delay(_seconds: float) -> None:
+        await asyncio.sleep(0)
+
     fakes = adapters(clock, settlement_at=target)
     for venue, adapter in fakes.items():
         adapter.market = replace(
@@ -2012,7 +2023,7 @@ async def test_production_shaped_zec_first_fill_chain_is_exact_and_single(tmp_pa
     config = replace(PAPER_CONFIG, target_notional_per_leg_usd=D("480.6336"))
     with PaperRepository(tmp_path / "zec-production-shape.db") as repository:
         async with PublicPaperRuntime(
-            repository, adapters=fakes, clock=clock, config=config,
+            repository, adapters=fakes, clock=clock, config=config, sleep=no_delay,
         ) as runtime:
             await activate_with_live_streams(runtime, clock)
             order = runtime.broker.state.order
@@ -2037,6 +2048,70 @@ async def test_production_shaped_zec_first_fill_chain_is_exact_and_single(tmp_pa
             assert repository.connection.execute(
                 "SELECT COUNT(*) FROM fills"
             ).fetchone()[0] == 2
+            entry_fill_values = repository.connection.execute(
+                "SELECT notional_usd,fee_usd FROM fills ORDER BY fill_id"
+            ).fetchall()
+
+            extended_required = next(
+                row for row in runtime.lifecycle.snapshot.settlements
+                if row.venue is Venue.EXTENDED
+            )
+            await runtime.deliver_settlement(replace(
+                extended_required, status=SettlementStatus.APPLIED_RATE,
+                cash_usd=D("1.25"),
+            ))
+            await runtime.mark_disconnected(
+                Venue.EXTENDED, "ZEC-EXTENDED", stream_kind="funding",
+                exception=TimeoutError("synthetic funding outage"),
+            )
+            assert not runtime.lifecycle.snapshot.gap_open
+            await asyncio.gather(
+                runtime.mark_disconnected(
+                    Venue.EXTENDED, "ZEC-EXTENDED", stream_kind="book",
+                    exception=ConnectionError("synthetic book outage"),
+                ),
+                runtime.mark_disconnected(
+                    Venue.EXTENDED, "ZEC-EXTENDED", stream_kind="trade",
+                    exception=ConnectionError("synthetic trade outage"),
+                ),
+                runtime.mark_disconnected(
+                    Venue.RISEX, "ZEC-RISEX", stream_kind="book",
+                    exception=ValueError("synthetic checksum resubscribe"),
+                ),
+            )
+            assert runtime.lifecycle.snapshot.gap_open
+            assert runtime.lifecycle.snapshot.gap_count == 1
+
+            async def nado_timeout(_symbol):
+                raise TimeoutError("synthetic snapshot timeout")
+
+            fakes[Venue.NADO].fetch_book = nado_timeout
+            runtime._start_snapshot_recovery(Venue.NADO, "ZEC-NADO")
+            await runtime._recovery_tasks[Venue.NADO, "ZEC-NADO"]
+            evidence = repository.connection.execute(
+                "SELECT event_type FROM runtime_evidence ORDER BY evidence_id"
+            ).fetchall()
+            assert sum(
+                row["event_type"] == "PUBLIC_SNAPSHOT_RECOVERY_FAILED"
+                for row in evidence
+            ) == 1
+            assert not any(
+                row["event_type"] == "PUBLIC_RECOVERY_DELTA_BUFFERED"
+                for row in evidence
+            )
+            assert repository.connection.execute(
+                "SELECT COUNT(*) FROM completed_trades"
+            ).fetchone()[0] == 0
+            assert repository.connection.execute(
+                "SELECT notional_usd,fee_usd FROM fills ORDER BY fill_id"
+            ).fetchall() == entry_fill_values
+            applied = [
+                row for row in runtime.lifecycle.snapshot.settlements
+                if row.key == extended_required.key
+            ]
+            assert len(applied) == 1
+            assert applied[0].status is SettlementStatus.APPLIED_RATE
+            assert applied[0].cash_usd == D("1.25")
 
 
 @pytest.mark.asyncio
@@ -3892,6 +3967,76 @@ async def test_safe_stop_bounds_gated_io_and_high_rate_frames_with_open_exit(tmp
     assert restored.position is not None
     assert json.loads(stop_row["detail"])["forced_close"] is False
     assert after_stop == 0
+    assert integrity == "ok"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop_path", ("external", "SIGTERM"))
+async def test_run_cancels_blocked_tick_before_safe_shutdown(tmp_path, stop_path):
+    clock = FakeClock()
+    external_stop = asyncio.Event()
+    with PaperRepository(tmp_path / f"run-stop-{stop_path}.db") as repository:
+        await run_fixture({"scenario": "exiting_aggressive_open"}, repository)
+        runtime = PublicPaperRuntime(
+            repository, adapters=adapters(clock, settlement_at=NOW), clock=clock,
+        )
+        tick_started = asyncio.Event()
+        tick_cancelled = asyncio.Event()
+        gate = asyncio.Event()
+
+        async def gated_tick(_at=None):
+            tick_started.set()
+            try:
+                await gate.wait()
+            except asyncio.CancelledError:
+                tick_cancelled.set()
+                raise
+
+        runtime.tick = gated_tick
+        run_task = asyncio.create_task(runtime.run(stop_event=external_stop))
+        await tick_started.wait()
+
+        async def high_rate_frames():
+            symbol = "UNRELATED-RUN-PERP"
+            await runtime.recover_snapshot(OrderBook(
+                Venue.NADO, symbol, (BookLevel(D("10"), D("1")),),
+                (BookLevel(D("11"), D("1")),), clock.now(), 0,
+            ))
+            sequence = 1
+            while not runtime._stop_event.is_set():
+                await runtime.apply_book_event(BookDelta(
+                    Venue.NADO, symbol, (BookLevel(D("10"), D("1")),), (),
+                    clock.now(), sequence, sequence - 1,
+                ))
+                sequence += 1
+                if sequence % 100 == 0:
+                    await asyncio.sleep(0)
+
+        producer = asyncio.create_task(high_rate_frames())
+        runtime._stream_tasks[Venue.NADO, "run-load", "combined"] = producer
+        started = time.monotonic()
+        if stop_path == "external":
+            external_stop.set()
+        else:
+            runtime._request_stop("SIGTERM")
+        result = await asyncio.wait_for(run_task, timeout=2)
+        elapsed = time.monotonic() - started
+        rows = repository.connection.execute(
+            "SELECT evidence_id,event_type,detail FROM runtime_evidence "
+            "ORDER BY evidence_id"
+        ).fetchall()
+        restored = repository.load_runtime()
+        integrity = repository.connection.execute("PRAGMA integrity_check").fetchone()[0]
+    assert result == {"status": "STOPPED_SAFE", "forced_close": False}
+    assert tick_cancelled.is_set()
+    assert elapsed < 2
+    assert restored.position is not None
+    assert rows[-1]["event_type"] == "STOPPED_SAFE"
+    assert not any(
+        row["event_type"].startswith("PUBLIC_SOCKET_")
+        or row["event_type"].startswith("PUBLIC_STREAM_CONFIRMATION_")
+        for row in rows
+    )
     assert integrity == "ok"
 
 

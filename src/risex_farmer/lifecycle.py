@@ -606,10 +606,12 @@ class LifecycleEngine:
         order = self._snapshot.exit_order
         if order is None or order.active_version is None:
             return
+        active = order.active_version
+        causal_at = max(at, active.created_at, active.last_checked_at)
         version = replace(
-            order.active_version,
+            active,
             status=ExitVersionStatus.CANCELLED,
-            closed_at=at,
+            closed_at=causal_at,
             close_reason=reason,
         )
         order = replace(order, versions=order.versions[:-1] + (version,))

@@ -229,6 +229,27 @@ class PaperRepository:
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.executescript(SCHEMA)
+        self._settlement_cache: dict[
+            tuple[str, str, str], FundingSettlement
+        ] | None = None
+        self._processed_key_cache: set[str] | None = None
+
+    def _ensure_persistence_caches(self) -> None:
+        if self._settlement_cache is None:
+            self._settlement_cache = {
+                (row["venue"], row["canonical_market"], row["settlement_at"]):
+                _load(row["payload"])
+                for row in self.connection.execute(
+                    "SELECT venue,canonical_market,settlement_at,payload "
+                    "FROM funding_settlements"
+                )
+            }
+        if self._processed_key_cache is None:
+            self._processed_key_cache = {
+                row["trade_event_key"] for row in self.connection.execute(
+                    "SELECT trade_event_key FROM processed_trade_events"
+                )
+            }
 
     def close(self) -> None:
         self.connection.close()
@@ -246,6 +267,8 @@ class PaperRepository:
             yield self.connection
         except BaseException:
             self.connection.rollback()
+            self._settlement_cache = None
+            self._processed_key_cache = None
             raise
         else:
             self.connection.commit()
@@ -371,6 +394,7 @@ class PaperRepository:
             self._save_trade_event(trade)
 
     def _save_trade_event(self, trade: TradeEvidence) -> None:
+        self._ensure_persistence_caches()
         row = self.connection.execute(
             "SELECT payload FROM processed_trade_events WHERE trade_event_key=?",
             (trade.trade_event_key,),
@@ -398,20 +422,24 @@ class PaperRepository:
                 )
             elif existing != trade:
                 raise ValueError("conflicting duplicate trade event")
+        assert self._processed_key_cache is not None
+        self._processed_key_cache.add(trade.trade_event_key)
 
     def upsert_settlement(self, settlement: FundingSettlement) -> None:
         with self.transaction():
             self._upsert_settlement(settlement)
 
     def _upsert_settlement(self, settlement: FundingSettlement) -> None:
-        row = self.connection.execute(
-            "SELECT payload FROM funding_settlements WHERE venue=? AND canonical_market=? AND settlement_at=?",
-            (settlement.venue.value, settlement.canonical_market, _iso(settlement.settlement_at)),
-        ).fetchone()
-        if row is None:
+        self._ensure_persistence_caches()
+        assert self._settlement_cache is not None
+        key = (
+            settlement.venue.value, settlement.canonical_market,
+            _iso(settlement.settlement_at),
+        )
+        existing = self._settlement_cache.get(key)
+        if existing is None:
             current = settlement
         else:
-            existing = _load(row["payload"])
             if existing == settlement:
                 return
             if existing.status is settlement.status:
@@ -442,6 +470,7 @@ class PaperRepository:
                 _dump(current),
             ),
         )
+        self._settlement_cache[key] = current
 
     def _save_entry_state(self, state: PaperEntryState, at: datetime) -> None:
         order = state.order
@@ -458,6 +487,10 @@ class PaperRepository:
             self.connection.execute(
                 "INSERT OR IGNORE INTO processed_trade_events VALUES (?, NULL)", (key,)
             )
+        if state.processed_trade_keys:
+            self._ensure_persistence_caches()
+            assert self._processed_key_cache is not None
+            self._processed_key_cache.update(state.processed_trade_keys)
         self._save_runtime("ENTRY", state.lifecycle_state, at, state)
 
     def _save_entry_order(self, order: PaperEntryOrder) -> None:
@@ -565,6 +598,9 @@ class PaperRepository:
         )
 
     def _save_lifecycle(self, snapshot: LifecycleSnapshot, at: datetime) -> None:
+        self._ensure_persistence_caches()
+        assert self._settlement_cache is not None
+        assert self._processed_key_cache is not None
         position_id = (
             snapshot.position.position_id
             if snapshot.position is not None
@@ -579,31 +615,20 @@ class PaperRepository:
                     "INSERT OR IGNORE INTO position_cycles VALUES (?, ?)",
                     (position_id, snapshot.active_cycle.cycle_id),
                 )
-        persisted_settlements = {
-            (row["venue"], row["canonical_market"], row["settlement_at"]): row["payload"]
-            for row in self.connection.execute(
-                "SELECT venue,canonical_market,settlement_at,payload FROM funding_settlements"
-            )
-        }
         for settlement in snapshot.settlements:
             key = (
                 settlement.venue.value, settlement.canonical_market,
                 _iso(settlement.settlement_at),
             )
-            payload = persisted_settlements.get(key)
-            if payload is None or _load(payload) != settlement:
+            if self._settlement_cache.get(key) != settlement:
                 self._upsert_settlement(settlement)
         if position_id is not None:
-            persisted_keys = {
-                row["trade_event_key"] for row in self.connection.execute(
-                    "SELECT trade_event_key FROM processed_trade_events"
-                )
-            }
-            for key in snapshot.processed_trade_keys - persisted_keys:
+            for key in snapshot.processed_trade_keys - self._processed_key_cache:
                 self.connection.execute(
                     "INSERT INTO processed_trade_events VALUES (?, ?)",
                     (key, _dump(("POSITION_KEY", position_id))),
                 )
+                self._processed_key_cache.add(key)
         if snapshot.exit_order is not None:
             self._save_exit_order(snapshot.exit_order, position_id)
         if snapshot.position is not None:

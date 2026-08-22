@@ -1909,7 +1909,18 @@ class PublicPaperRuntime:
     async def mark_disconnected(
         self, venue: Venue, symbol: str, *, at: datetime | None = None,
         stream_kind: str = "public", exception: BaseException | None = None,
+        stream_generation: int | None = None,
     ) -> None:
+        generation_key = (
+            (venue, "*", "combined")
+            if stream_kind == "combined"
+            else (venue, symbol, stream_kind)
+        )
+        if (
+            stream_generation is not None
+            and self._stream_generations.get(generation_key, 0) != stream_generation
+        ):
+            return
         now = at or self.clock.now()
         if venue is Venue.EXTENDED and stream_kind in {"book", "trade", "funding"}:
             self._extended_confirmed_at.pop((symbol, stream_kind), None)
@@ -1956,6 +1967,12 @@ class PublicPaperRuntime:
                     self.broker = None
         if self.lifecycle is not None and (invalidates_book or invalidates_trade):
             async with self._position_event_lock:
+                if (
+                    stream_generation is not None
+                    and self._stream_generations.get(generation_key, 0)
+                    != stream_generation
+                ):
+                    return
                 lifecycle = self.lifecycle
                 if lifecycle is None:
                     return
@@ -1968,10 +1985,19 @@ class PublicPaperRuntime:
                     ),
                 }:
                     before = lifecycle.snapshot
-                    await lifecycle.start_gap(started_at=now)
+                    causal_at = self.clock.now()
+                    if before.events:
+                        causal_at = max(causal_at, before.events[-1].occurred_at)
+                    if before.exit_order is not None and before.exit_order.versions:
+                        active = before.exit_order.versions[-1]
+                        causal_at = max(
+                            causal_at, active.created_at, active.last_checked_at
+                        )
+                    await lifecycle.start_gap(started_at=causal_at)
                     if lifecycle.snapshot != before:
                         self.repository.save_decision(
-                            recorded_at=now, lifecycle_snapshot=lifecycle.snapshot
+                            recorded_at=causal_at,
+                            lifecycle_snapshot=lifecycle.snapshot,
                         )
 
     def _confirm_extended_stream(
@@ -2024,6 +2050,7 @@ class PublicPaperRuntime:
             await self.mark_disconnected(
                 Venue.EXTENDED, symbol, at=at, stream_kind=kind,
                 exception=TimeoutError("public socket confirmation stale"),
+                stream_generation=generation,
             )
             if (
                 self._stop_event.is_set()
@@ -2705,7 +2732,10 @@ class PublicPaperRuntime:
                     self._record_transport_disconnect(
                         socket_identity, at=self.clock.now(), exception=exc,
                     )
-                await self.mark_disconnected(Venue.EXTENDED, symbol, stream_kind=kind, exception=exc)
+                await self.mark_disconnected(
+                    Venue.EXTENDED, symbol, stream_kind=kind, exception=exc,
+                    stream_generation=generation,
+                )
                 await self._sleep(delay)
                 delay = min(delay * 2, 30)
 
@@ -2713,6 +2743,8 @@ class PublicPaperRuntime:
         self, venue: Venue, adapter: PublicAdapter, symbols: tuple[str, ...]
     ) -> None:
         assert self._session is not None
+        task_key = (venue, "*", "combined")
+        generation = self._stream_generations.get(task_key, 0)
         ordered_symbols = tuple(sorted(symbols))
         socket_identity = (venue, "combined", ordered_symbols)
         delay = 1
@@ -2839,6 +2871,15 @@ class PublicPaperRuntime:
             except Exception as exc:
                 if self._stop_event is not None and self._stop_event.is_set():
                     break
+                if (
+                    self._stream_generations.get(task_key, 0) != generation
+                    or (
+                        self._stream_tasks.get(task_key) is not None
+                        and self._stream_tasks.get(task_key)
+                        is not asyncio.current_task()
+                    )
+                ):
+                    return
                 if venue is Venue.RISEX:
                     for symbol in symbols:
                         self._recovery_buffers.pop((venue, symbol), None)
@@ -2847,7 +2888,10 @@ class PublicPaperRuntime:
                         socket_identity, at=self.clock.now(), exception=exc,
                     )
                 for symbol in symbols:
-                    await self.mark_disconnected(venue, symbol, stream_kind="combined", exception=exc)
+                    await self.mark_disconnected(
+                        venue, symbol, stream_kind="combined", exception=exc,
+                        stream_generation=generation,
+                    )
                 await self._sleep(delay)
                 delay = min(delay * 2, 30)
 
@@ -2903,6 +2947,9 @@ class PublicPaperRuntime:
             self._combined_symbols[venue] = wanted
             self._remove_obsolete_components(venue, set(wanted), self.clock.now())
             if wanted:
+                self._stream_generations[key] = (
+                    self._stream_generations.get(key, 0) + 1
+                )
                 self._stream_tasks[key] = asyncio.create_task(
                     self._combined_stream(venue, adapter, wanted)
                 )
@@ -2982,6 +3029,28 @@ class PublicPaperRuntime:
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
 
+    async def _tick_or_stop(self) -> bool:
+        """Run one tick while allowing an external stop to cancel its awaits."""
+        assert self._stop_event is not None
+        tick_task = asyncio.create_task(self.tick())
+        stop_task = asyncio.create_task(self._stop_event.wait())
+        try:
+            done, _ = await asyncio.wait(
+                (tick_task, stop_task), return_when=asyncio.FIRST_COMPLETED
+            )
+            if tick_task in done:
+                await tick_task
+                return False
+            tick_task.cancel()
+            await asyncio.gather(tick_task, return_exceptions=True)
+            return True
+        except asyncio.CancelledError:
+            tick_task.cancel()
+            raise
+        finally:
+            stop_task.cancel()
+            await asyncio.gather(stop_task, return_exceptions=True)
+
     def _next_wakeup_at(self, now: datetime) -> datetime:
         if self.broker is None:
             self._refresh_focused_cycle(now)
@@ -3048,7 +3117,8 @@ class PublicPaperRuntime:
             # first 120-second FULL scan does not inherit that bootstrap age.
             self._start_public_refresh()
             while not self._stop_event.is_set():
-                await self.tick()
+                if await self._tick_or_stop():
+                    break
                 now = self.clock.now()
                 delay = max(0.0, (self._next_wakeup_at(now) - now).total_seconds())
                 await self._pause_or_stop(delay)
