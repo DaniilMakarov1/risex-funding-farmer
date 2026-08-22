@@ -1,6 +1,6 @@
 # PAPER-007-STABILIZATION-003 — Authoritative Refresh→Snapshot→FULL Scan Ordering and Global UNKNOWN Matrix
 
-Status: `DRAFT — AWAITING CHIEF REVIEW`. This is the only proposed next strictly corrective slice under the existing PAPER-007 stabilization authorization. No Builder or implementation is active. PAPER-007-STABILIZATION-002 is scoped-accepted only for session/recovery/lifecycle causality, persistence atomicity, recovery ownership/evidence, shutdown, and public/paper safety at unchanged commit `ab9c4e9b04438d59c7897b8ed4b2972b2b811d5f`. Its overall cadence is inconclusive and whole-system Scanner/UNKNOWN/PnL readiness is not accepted.
+Status: `CHIEF-REVIEWER-APPROVED AND ACTIVE`. This is the only active strictly corrective slice under the existing PAPER-007 stabilization authorization. Exactly one Builder may implement only this contract under Architect control. PAPER-007-STABILIZATION-002 is scoped-accepted only for session/recovery/lifecycle causality, persistence atomicity, recovery ownership/evidence, shutdown, and public/paper safety at unchanged commit `ab9c4e9b04438d59c7897b8ed4b2972b2b811d5f`. Its overall cadence is inconclusive and whole-system Scanner/UNKNOWN/PnL readiness is not accepted.
 
 This slice adds no product functionality. Stage B and Telegram remain stopped. No runtime restart, public operational run, or Telegram run is authorized before deterministic implementation acceptance and independent Chief Review.
 
@@ -102,4 +102,4 @@ Tracked presentation tests prove the FULL digest relays the exact persisted Scan
 - A settlement-boundary FULL may be deferred for its one owned observation refresh. The next completed FULL must be numeric when every official mandatory input is available and valid; an exact honest UNKNOWN remains acceptable for a real component failure or official old/elapsed cycle.
 - Telegram and authoritative Stage B remain stopped until deterministic and operational acceptance plus independent Chief Review. Only then may a separate decision consider restart.
 
-No Builder may begin from this draft. Architect must first receive Chief approval or correction of this exact bounded contract.
+Exactly one Builder may begin from the activated current `main` under Architect control and only within this exact bounded contract.
