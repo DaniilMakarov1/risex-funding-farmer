@@ -282,6 +282,10 @@ class PaperRepository:
         trade_events: tuple[TradeEvidence, ...] = (),
         entry_state: PaperEntryState | None = None,
         lifecycle_snapshot: LifecycleSnapshot | None = None,
+        runtime_evidence: tuple[
+            tuple[datetime, str, str | None, dict[str, object]], ...
+        ] = (),
+        venue_readiness: tuple[str, datetime, bool, str] | None = None,
     ) -> None:
         if entry_state is not None and lifecycle_snapshot is not None:
             raise ValueError("one runtime state must be authoritative per decision")
@@ -296,6 +300,10 @@ class PaperRepository:
                 self._save_entry_state(entry_state, recorded_at)
             if lifecycle_snapshot is not None:
                 self._save_lifecycle(lifecycle_snapshot, recorded_at)
+            if venue_readiness is not None:
+                self._upsert_venue_readiness(*venue_readiness)
+            for evidence in runtime_evidence:
+                self._insert_runtime_evidence(*evidence)
 
     def _insert_exact(
         self,
@@ -897,16 +905,27 @@ class PaperRepository:
     ) -> None:
         """Persist bounded runtime transitions, never raw stream payloads."""
         with self.transaction():
-            self.connection.execute(
-                "INSERT INTO runtime_evidence(recorded_at,event_type,venue,detail) "
-                "VALUES (?, ?, ?, ?)",
-                (
-                    _iso(recorded_at),
-                    event_type,
-                    venue,
-                    json.dumps(detail or {}, sort_keys=True, separators=(",", ":")),
-                ),
+            self._insert_runtime_evidence(
+                recorded_at, event_type, venue, detail or {}
             )
+
+    def _insert_runtime_evidence(
+        self,
+        recorded_at: datetime,
+        event_type: str,
+        venue: str | None,
+        detail: dict[str, object],
+    ) -> None:
+        self.connection.execute(
+            "INSERT INTO runtime_evidence(recorded_at,event_type,venue,detail) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                _iso(recorded_at),
+                event_type,
+                venue,
+                json.dumps(detail, sort_keys=True, separators=(",", ":")),
+            ),
+        )
 
     def set_venue_readiness(
         self,
@@ -917,12 +936,17 @@ class PaperRepository:
         detail: str,
     ) -> None:
         with self.transaction():
-            self.connection.execute(
-                """INSERT INTO venue_readiness VALUES (?, ?, ?, ?)
-                   ON CONFLICT(venue) DO UPDATE SET updated_at=excluded.updated_at,
-                   available=excluded.available, detail=excluded.detail""",
-                (venue, _iso(updated_at), int(available), detail),
-            )
+            self._upsert_venue_readiness(venue, updated_at, available, detail)
+
+    def _upsert_venue_readiness(
+        self, venue: str, updated_at: datetime, available: bool, detail: str
+    ) -> None:
+        self.connection.execute(
+            """INSERT INTO venue_readiness VALUES (?, ?, ?, ?)
+               ON CONFLICT(venue) DO UPDATE SET updated_at=excluded.updated_at,
+               available=excluded.available, detail=excluded.detail""",
+            (venue, _iso(updated_at), int(available), detail),
+        )
 
     def save_public_route_rows(
         self, *, logical_at: datetime, rows: tuple[dict[str, object], ...]

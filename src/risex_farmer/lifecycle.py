@@ -406,6 +406,10 @@ class LifecycleEngine:
     def snapshot(self) -> LifecycleSnapshot:
         return self._snapshot
 
+    def publish_snapshot(self, snapshot: LifecycleSnapshot) -> None:
+        """Publish an already-persisted candidate without replacing this owner."""
+        self._snapshot = snapshot
+
     def _position(self) -> PaperPosition:
         position = self._snapshot.position
         if position is None:
@@ -1072,6 +1076,10 @@ class LifecycleEngine:
             if order is None or order.active_version is None:
                 return ExitTradeResult(
                     ExitTradeOutcome.IGNORED, self._snapshot, "NO_ACTIVE_EXIT_VERSION"
+                )
+            if observed_version_id != order.active_version.version_id:
+                return ExitTradeResult(
+                    ExitTradeOutcome.IGNORED, self._snapshot, "STALE_EXIT_VERSION"
                 )
             if trade.trade_event_key in self._snapshot.processed_trade_keys:
                 return ExitTradeResult(

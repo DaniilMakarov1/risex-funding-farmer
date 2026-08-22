@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 import json
 from pathlib import Path
+import sqlite3
 import time
 from types import SimpleNamespace
 
@@ -30,18 +31,21 @@ from risex_farmer.models import (
     OrderBook,
     SettlementStatus,
     Side,
+    StreamHealth,
     TradeEvidence,
     Venue,
 )
 from risex_farmer.market_data import BookStream
 from risex_farmer.lifecycle import LifecycleEngine
 from risex_farmer.notifications import (
+    NotificationPayload,
     NotificationOutbox,
     TelegramDelivery,
     format_telegram_money,
 )
 from risex_farmer.runtime import PublicPaperRuntime, public_paper_run, public_scan_once
 from risex_farmer.orchestrator import run_fixture
+from risex_farmer.scanner import MarketObservation
 from risex_farmer.storage import PaperRepository
 
 
@@ -469,7 +473,7 @@ def assert_socket_episode(rows):
     reconnected = json.loads(rows[1]["detail"])
     assert disconnected == {
         key: value for key, value in reconnected.items()
-        if key != "reconnected_at"
+        if key not in {"reconnected_at", "reconnected_stream_session_id"}
     }
     assert disconnected["disconnected_at"] == rows[0]["recorded_at"]
     assert reconnected["reconnected_at"] == rows[1]["recorded_at"]
@@ -550,12 +554,44 @@ def adapters(clock: FakeClock, *, settlement_at: datetime, risex=True, funding="
     }
 
 
+def confirm_extended_stream(
+    runtime: PublicPaperRuntime,
+    symbol: str,
+    kind: str,
+    at: datetime,
+    *,
+    data_ready: bool,
+) -> None:
+    key = (Venue.EXTENDED, symbol, kind)
+    session_id = runtime._stream_sessions.get(key)
+    if session_id is None:
+        session_id = runtime._new_stream_session(key)
+    PublicPaperRuntime._confirm_extended_stream(
+        runtime, symbol, kind, at,
+        data_ready=data_ready, stream_session_id=session_id,
+    )
+
+
+def stream_session(
+    runtime: PublicPaperRuntime, venue: Venue, symbol: str, kind: str
+):
+    key = (
+        (venue, "*", "combined")
+        if venue is not Venue.EXTENDED or kind == "combined"
+        else (venue, symbol, kind)
+    )
+    session_id = runtime._stream_sessions.get(key)
+    if session_id is None:
+        session_id = runtime._new_stream_session(key)
+    return session_id
+
+
 def confirm_public_streams(runtime: PublicPaperRuntime, at: datetime) -> None:
     for venue, symbol in runtime.observations:
         runtime.mark_trade_stream_connected(venue, symbol, at=at)
         if venue is Venue.EXTENDED:
-            runtime._confirm_extended_stream(symbol, "book", at, data_ready=True)
-            runtime._confirm_extended_stream(symbol, "funding", at, data_ready=False)
+            confirm_extended_stream(runtime, symbol, "book", at, data_ready=True)
+            confirm_extended_stream(runtime, symbol, "funding", at, data_ready=False)
         else:
             runtime._live_book_ready.add((venue, symbol))
 
@@ -1719,12 +1755,13 @@ async def test_extended_socket_failures_are_component_aware(tmp_path):
             await runtime.scan()
             symbol = fakes[Venue.EXTENDED].market.venue_symbol
             runtime.mark_trade_stream_connected(Venue.EXTENDED, symbol)
-            runtime._confirm_extended_stream(
+            confirm_extended_stream(runtime,
                 symbol, "book", clock.now(), data_ready=True
             )
-            runtime._confirm_extended_stream(
+            confirm_extended_stream(runtime,
                 symbol, "funding", clock.now(), data_ready=False
             )
+            runtime._new_stream_session((Venue.EXTENDED, symbol, "trade"))
             stream = runtime.coordinator.stream(Venue.EXTENDED, symbol)
             before = stream.book()
             assert before is not None and before.sequence == 1
@@ -1732,6 +1769,9 @@ async def test_extended_socket_failures_are_component_aware(tmp_path):
             await runtime.mark_disconnected(
                 Venue.EXTENDED, symbol, stream_kind="funding",
                 exception=TimeoutError("funding socket"),
+                stream_session_id=runtime._stream_sessions[
+                    (Venue.EXTENDED, symbol, "funding")
+                ],
             )
             assert stream.book() == before
             assert (Venue.EXTENDED, symbol) in runtime._trade_stream_ready
@@ -1758,6 +1798,9 @@ async def test_extended_socket_failures_are_component_aware(tmp_path):
             await runtime.mark_disconnected(
                 Venue.EXTENDED, symbol, stream_kind="trade",
                 exception=ConnectionError("trade socket"),
+                stream_session_id=runtime._stream_sessions[
+                    (Venue.EXTENDED, symbol, "trade")
+                ],
             )
             assert stream.book() == before
             assert stream.book().sequence == 1
@@ -1830,12 +1873,15 @@ async def test_runtime_lifecycle_notifications_follow_persisted_transitions(tmp_
             runtime.next_position_monitor_at = clock.now()
             await runtime.tick()
             pending = runtime.lifecycle.snapshot.settlements[0]
-            await runtime.deliver_settlement(replace(
+            estimated_at = clock.now()
+            estimated = replace(
                 pending, status=SettlementStatus.ESTIMATED, cash_usd=D("3.125")
-            ))
+            )
+            await runtime.deliver_settlement(estimated)
             applied = replace(
                 pending, status=SettlementStatus.APPLIED_RATE, cash_usd=D("3.25")
             )
+            applied_at = clock.now()
             await runtime.deliver_settlement(applied)
             await runtime.deliver_settlement(applied)
             exit_order = runtime.lifecycle.snapshot.exit_order
@@ -1872,12 +1918,22 @@ async def test_runtime_lifecycle_notifications_follow_persisted_transitions(tmp_
     )
     received = next(row for row in delivery.rows if row.kind == "FUNDING_RECEIVED")
     reconciled = next(row for row in delivery.rows if row.kind == "FUNDING_RECONCILED")
-    assert received.text.startswith("Funding received:")
-    assert reconciled.text.startswith("Funding reconciled:")
-    assert received.text.endswith("USD 3.13")
-    assert reconciled.text.endswith("USD 3.25")
-    assert received.event_id.endswith(":ESTIMATED:3.125")
-    assert reconciled.event_id.endswith(":APPLIED_RATE:3.25")
+    assert received == NotificationPayload(
+        f"funding:{pending.venue.value}:{pending.canonical_market}:"
+        f"{pending.settlement_at.isoformat()}:ESTIMATED:3.125",
+        "FUNDING_RECEIVED",
+        estimated_at,
+        f"Funding received: {pending.venue.value} {pending.canonical_market} "
+        "ESTIMATED USD 3.13",
+    )
+    assert reconciled == NotificationPayload(
+        f"funding:{pending.venue.value}:{pending.canonical_market}:"
+        f"{pending.settlement_at.isoformat()}:APPLIED_RATE:3.25",
+        "FUNDING_RECONCILED",
+        applied_at,
+        f"Funding reconciled: {pending.venue.value} {pending.canonical_market} "
+        "APPLIED_RATE USD 3.25",
+    )
 
 
 @pytest.mark.asyncio
@@ -1889,7 +1945,12 @@ async def test_disconnect_cancels_entry_and_position_gap_recovers_from_snapshot(
         async with PublicPaperRuntime(repository, adapters=fakes, clock=clock) as runtime:
             await activate_with_live_streams(runtime, clock)
             order = runtime.broker.state.order
-            await runtime.mark_disconnected(order.venue, order.canonical_market)
+            await runtime.mark_disconnected(
+                order.venue, order.canonical_market,
+                stream_session_id=stream_session(
+                    runtime, order.venue, order.canonical_market, "public"
+                ),
+            )
             assert runtime.broker is None
             assert repository.load_runtime().lifecycle_state is LifecycleState.FLAT
 
@@ -1903,7 +1964,12 @@ async def test_disconnect_cancels_entry_and_position_gap_recovers_from_snapshot(
             await runtime.deliver_trade(maker_trade(runtime, clock.now(), "gap-entry"))
             position = runtime.lifecycle.snapshot.position
             hedge = runtime.lifecycle.snapshot.hedge_market
-            await runtime.mark_disconnected(hedge.venue, hedge.venue_symbol)
+            await runtime.mark_disconnected(
+                hedge.venue, hedge.venue_symbol,
+                stream_session_id=stream_session(
+                    runtime, hedge.venue, hedge.venue_symbol, "public"
+                ),
+            )
             assert runtime.lifecycle.snapshot.gap_open
             clock.advance(1)
             snapshot = await fakes[hedge.venue].fetch_book(hedge.venue_symbol)
@@ -1934,12 +2000,25 @@ async def test_concurrent_component_failures_form_one_aggregate_execution_gap(tm
             risex_key = (Venue.RISEX, snapshot.risex_market.venue_symbol)
             hedge_key = (snapshot.hedge_market.venue, snapshot.hedge_market.venue_symbol)
             await runtime.mark_disconnected(
-                hedge_key[0], hedge_key[1], stream_kind="funding"
+                hedge_key[0], hedge_key[1], stream_kind="funding",
+                stream_session_id=stream_session(
+                    runtime, *hedge_key, "funding"
+                ),
             )
             assert not runtime.lifecycle.snapshot.gap_open
             await asyncio.gather(
-                runtime.mark_disconnected(*risex_key, stream_kind="book"),
-                runtime.mark_disconnected(*hedge_key, stream_kind="trade"),
+                runtime.mark_disconnected(
+                    *risex_key, stream_kind="book",
+                    stream_session_id=stream_session(
+                        runtime, *risex_key, "book"
+                    ),
+                ),
+                runtime.mark_disconnected(
+                    *hedge_key, stream_kind="trade",
+                    stream_session_id=stream_session(
+                        runtime, *hedge_key, "trade"
+                    ),
+                ),
             )
             assert runtime.lifecycle.snapshot.gap_count == 1
             assert runtime.lifecycle.snapshot.gap_open
@@ -1957,11 +2036,12 @@ async def test_concurrent_component_failures_form_one_aggregate_execution_gap(tm
             assert not final.gap_open
             assert final.gap_count == 1
             stale_key = (hedge_key[0], hedge_key[1], "trade")
-            runtime._stream_generations[stale_key] = 2
+            stale_session = stream_session(runtime, *stale_key)
+            runtime._new_stream_session(stale_key)
             before_stale = runtime.lifecycle.snapshot
             await runtime.mark_disconnected(
                 *hedge_key, at=clock.now() - timedelta(seconds=5),
-                stream_kind="trade", stream_generation=1,
+                stream_kind="trade", stream_session_id=stale_session,
             )
             assert runtime.lifecycle.snapshot == before_stale
             event_times = [event.occurred_at for event in final.events]
@@ -2063,20 +2143,32 @@ async def test_production_shaped_zec_first_fill_chain_is_exact_and_single(tmp_pa
             await runtime.mark_disconnected(
                 Venue.EXTENDED, "ZEC-EXTENDED", stream_kind="funding",
                 exception=TimeoutError("synthetic funding outage"),
+                stream_session_id=stream_session(
+                    runtime, Venue.EXTENDED, "ZEC-EXTENDED", "funding"
+                ),
             )
             assert not runtime.lifecycle.snapshot.gap_open
             await asyncio.gather(
                 runtime.mark_disconnected(
                     Venue.EXTENDED, "ZEC-EXTENDED", stream_kind="book",
                     exception=ConnectionError("synthetic book outage"),
+                    stream_session_id=stream_session(
+                        runtime, Venue.EXTENDED, "ZEC-EXTENDED", "book"
+                    ),
                 ),
                 runtime.mark_disconnected(
                     Venue.EXTENDED, "ZEC-EXTENDED", stream_kind="trade",
                     exception=ConnectionError("synthetic trade outage"),
+                    stream_session_id=stream_session(
+                        runtime, Venue.EXTENDED, "ZEC-EXTENDED", "trade"
+                    ),
                 ),
                 runtime.mark_disconnected(
                     Venue.RISEX, "ZEC-RISEX", stream_kind="book",
                     exception=ValueError("synthetic checksum resubscribe"),
+                    stream_session_id=stream_session(
+                        runtime, Venue.RISEX, "ZEC-RISEX", "book"
+                    ),
                 ),
             )
             assert runtime.lifecycle.snapshot.gap_open
@@ -2086,8 +2178,15 @@ async def test_production_shaped_zec_first_fill_chain_is_exact_and_single(tmp_pa
                 raise TimeoutError("synthetic snapshot timeout")
 
             fakes[Venue.NADO].fetch_book = nado_timeout
-            runtime._start_snapshot_recovery(Venue.NADO, "ZEC-NADO")
-            await runtime._recovery_tasks[Venue.NADO, "ZEC-NADO"]
+            nado_session = stream_session(
+                runtime, Venue.NADO, "ZEC-NADO", "book"
+            )
+            episode = runtime._start_snapshot_recovery(
+                Venue.NADO, "ZEC-NADO",
+                displaced_stream_session_id=nado_session,
+            )
+            assert episode.task is not None
+            await episode.task
             evidence = repository.connection.execute(
                 "SELECT event_type FROM runtime_evidence ORDER BY evidence_id"
             ).fetchall()
@@ -2126,10 +2225,13 @@ async def test_sequence_gap_fetches_snapshot_and_reconnect_restores_readiness(tm
         ) as runtime:
             await runtime.scan()
             market = fakes[Venue.EXTENDED].market
+            session_id = stream_session(
+                runtime, Venue.EXTENDED, market.venue_symbol, "book"
+            )
             await runtime.apply_book_event(BookDelta(
                 Venue.EXTENDED, market.venue_symbol,
                 (BookLevel(D("100"), D("1")),), (), clock.now(), 3, 999,
-            ))
+            ), stream_session_id=session_id)
             adapter = ExtendedAdapter(None)
             rest = adapter.normalize_book(
                 {
@@ -2140,8 +2242,14 @@ async def test_sequence_gap_fetches_snapshot_and_reconnect_restores_readiness(tm
                 observed_at=clock.now(),
             )
             assert rest.sequence is None
-            await runtime.apply_book_event(rest)
-            assert (Venue.EXTENDED, market.venue_symbol) in runtime._recovery_buffers
+            session_id = runtime._stream_sessions[
+                (Venue.EXTENDED, market.venue_symbol, "book")
+            ]
+            await runtime.apply_book_event(
+                rest, stream_session_id=session_id
+            )
+            episode = runtime._recoveries[Venue.EXTENDED, market.venue_symbol]
+            assert episode.terminal is None
             await runtime.apply_book_event(adapter.normalize_book_message({
                 "type": "UPDATE", "seq": 11,
                 "ts": str(int(clock.now().timestamp() * 1000)),
@@ -2149,7 +2257,7 @@ async def test_sequence_gap_fetches_snapshot_and_reconnect_restores_readiness(tm
                     "m": market.venue_symbol,
                     "b": [{"p": "100", "q": "2"}], "a": [],
                 },
-            }))
+            }), stream_session_id=session_id)
             snapshot = adapter.normalize_book_message({
                 "type": "SNAPSHOT", "seq": 10,
                 "ts": str(int(clock.now().timestamp() * 1000)),
@@ -2159,7 +2267,9 @@ async def test_sequence_gap_fetches_snapshot_and_reconnect_restores_readiness(tm
                     "a": [{"p": "101", "q": "20"}],
                 },
             })
-            await runtime.apply_book_event(snapshot)
+            await runtime.apply_book_event(
+                snapshot, stream_session_id=session_id
+            )
             state = runtime.readiness[Venue.EXTENDED]
             book_resyncs = repository.connection.execute(
                 "SELECT COUNT(*) FROM runtime_evidence "
@@ -2286,28 +2396,42 @@ async def test_nado_recovery_buffers_and_replays_newer_continuous_delta(tmp_path
             ).fetchone()[0] == 0
             baseline_book_calls = gated.calls.count("book")
             gated.block_recovery = True
+            session_id = runtime._new_stream_session(
+                (Venue.NADO, "*", "combined")
+            )
             await runtime.apply_book_event(BookDelta(
                 Venue.NADO, symbol, (), (), clock.now(), 3, 999,
-            ))
-            recovery = runtime._recovery_tasks[(Venue.NADO, symbol)]
-            runtime._start_snapshot_recovery(Venue.NADO, symbol)
-            assert runtime._recovery_tasks[(Venue.NADO, symbol)] is recovery
+            ), stream_session_id=session_id)
+            episode = runtime._recoveries[(Venue.NADO, symbol)]
+            recovery = episode.task
+            assert recovery is not None
+            runtime._start_snapshot_recovery(
+                Venue.NADO, symbol,
+                displaced_stream_session_id=session_id,
+            )
+            assert runtime._recoveries[(Venue.NADO, symbol)] is episode
             await gated.recovery_started.wait()
             await runtime.apply_book_event(BookDelta(
                 Venue.NADO, symbol,
                 (BookLevel(D("100"), D("2")),), (), clock.now(), 2, 1,
-            ))
+            ), stream_session_id=session_id)
             await runtime.apply_book_event(BookDelta(
                 Venue.NADO, symbol,
                 (BookLevel(D("100"), D("3")),), (), clock.now(), 3, 2,
-            ))
-            assert len(runtime._recovery_buffers[(Venue.NADO, symbol)]) == 2
+            ), stream_session_id=session_id)
+            assert len(episode.buffer) == 2
             gated.block_recovery = False
             gated.recovery_gate.set()
             await recovery
             book = runtime.coordinator.stream(Venue.NADO, symbol).book()
-            await runtime.apply_book_event(replace(book, observed_at=clock.now()))
-            await runtime.apply_book_event(replace(book, observed_at=clock.now()))
+            await runtime.apply_book_event(
+                replace(book, observed_at=clock.now()),
+                stream_session_id=session_id,
+            )
+            await runtime.apply_book_event(
+                replace(book, observed_at=clock.now()),
+                stream_session_id=session_id,
+            )
             evidence = repository.connection.execute(
                 "SELECT detail FROM runtime_evidence "
                 "WHERE event_type='PUBLIC_SNAPSHOT_RECOVERY_COMPLETED'"
@@ -2450,7 +2574,12 @@ async def test_risex_checksum_gap_resubscribes_and_recovers_from_ws_snapshots(tm
         )
         runtime._session = session
         runtime._stop_event = stop
-        await runtime._combined_stream(Venue.RISEX, adapter, symbols)
+        session_id = runtime._new_stream_session(
+            (Venue.RISEX, "*", "combined")
+        )
+        await runtime._combined_stream(
+            Venue.RISEX, adapter, symbols, session_id
+        )
         lifecycle = repository.connection.execute(
             "SELECT event_type,detail FROM runtime_evidence WHERE event_type IN "
             "('PUBLIC_BOOK_RESYNC_REQUIRED','PUBLIC_BOOK_RESYNC_STARTED',"
@@ -2469,6 +2598,8 @@ async def test_risex_checksum_gap_resubscribes_and_recovers_from_ws_snapshots(tm
     ]
     assert [row["event_type"] for row in lifecycle] == [
         "PUBLIC_BOOK_RESYNC_REQUIRED", "PUBLIC_BOOK_RESYNC_REQUIRED",
+        "PUBLIC_SNAPSHOT_RECOVERY_STARTED",
+        "PUBLIC_SNAPSHOT_RECOVERY_STARTED",
         "PUBLIC_BOOK_RESYNC_STARTED", "PUBLIC_SNAPSHOT_RECOVERY_COMPLETED",
         "PUBLIC_SNAPSHOT_RECOVERY_COMPLETED",
     ]
@@ -2480,8 +2611,8 @@ async def test_risex_checksum_gap_resubscribes_and_recovers_from_ws_snapshots(tm
     assert {row["source"] for row in completed} == {"WS_RESUBSCRIBE_SNAPSHOT"}
     assert sum(row["buffered"] for row in completed) == 1
     assert all(row["replayed"] == 0 for row in completed)
-    assert runtime._recovery_buffers == {}
-    assert runtime._recovery_tasks == {}
+    assert all(not episode.buffer for episode in runtime._recoveries.values())
+    assert all(episode.task is None for episode in runtime._recoveries.values())
     assert all(
         runtime.coordinator.stream(Venue.RISEX, symbol).health(clock.now()).data_quality
         is DataQuality.COMPLETE
@@ -2502,8 +2633,11 @@ async def test_extended_eof_persists_one_ordered_physical_socket_episode(tmp_pat
         runtime = PublicPaperRuntime(repository, adapters={}, clock=clock, sleep=no_delay)
         runtime._session = session
         runtime._stop_event = stop
+        session_id = runtime._new_stream_session(
+            (Venue.EXTENDED, "ABC-EXTENDED", "trade")
+        )
         await runtime._extended_stream(
-            ExtendedAdapter(None), "ABC-EXTENDED", "trade"
+            ExtendedAdapter(None), "ABC-EXTENDED", "trade", session_id
         )
         await runtime.shutdown()
         lifecycle = repository.connection.execute(
@@ -2538,8 +2672,11 @@ async def test_extended_error_frame_persists_one_transport_episode(tmp_path):
         )
         runtime._session = session
         runtime._stop_event = stop
+        session_id = runtime._new_stream_session(
+            (Venue.EXTENDED, "ABC-EXTENDED", "trade")
+        )
         await runtime._extended_stream(
-            ExtendedAdapter(None), "ABC-EXTENDED", "trade"
+            ExtendedAdapter(None), "ABC-EXTENDED", "trade", session_id
         )
         lifecycle = repository.connection.execute(
             "SELECT recorded_at,event_type,venue,detail FROM runtime_evidence "
@@ -2587,8 +2724,11 @@ async def test_extended_trade_sequence_is_monotonic_deduped_and_does_not_reconne
         runtime._session = session
         runtime._stop_event = stop
         runtime.deliver_trade = capture_trade
+        session_id = runtime._new_stream_session(
+            (Venue.EXTENDED, "ABC-EXTENDED", "trade")
+        )
         await runtime._extended_stream(
-            ExtendedAdapter(None), "ABC-EXTENDED", "trade"
+            ExtendedAdapter(None), "ABC-EXTENDED", "trade", session_id
         )
         physical = repository.connection.execute(
             "SELECT COUNT(*) FROM runtime_evidence "
@@ -2672,8 +2812,11 @@ async def test_extended_trade_sequence_resets_for_each_physical_session(tmp_path
         runtime._session = session
         runtime._stop_event = stop
         runtime.deliver_trade = capture_trade
+        session_id = runtime._new_stream_session(
+            (Venue.EXTENDED, "ABC-EXTENDED", "trade")
+        )
         await runtime._extended_stream(
-            ExtendedAdapter(None), "ABC-EXTENDED", "trade"
+            ExtendedAdapter(None), "ABC-EXTENDED", "trade", session_id
         )
         discontinuities = repository.connection.execute(
             "SELECT COUNT(*) FROM runtime_evidence "
@@ -2706,8 +2849,11 @@ async def test_extended_immediate_reconnect_failures_use_increasing_backoff(tmp_
         )
         runtime._session = session
         runtime._stop_event = stop
+        session_id = runtime._new_stream_session(
+            (Venue.EXTENDED, "ABC-EXTENDED", "funding")
+        )
         await runtime._extended_stream(
-            ExtendedAdapter(None), "ABC-EXTENDED", "funding"
+            ExtendedAdapter(None), "ABC-EXTENDED", "funding", session_id
         )
     assert session.connections == 4
     assert delays == [1, 2, 4]
@@ -2731,8 +2877,11 @@ async def test_extended_book_eof_unifies_socket_and_resync_notification_episode(
         )
         runtime._session = session
         runtime._stop_event = stop
+        session_id = runtime._new_stream_session(
+            (Venue.EXTENDED, "ABC-EXTENDED", "book")
+        )
         await runtime._extended_stream(
-            ExtendedAdapter(None), "ABC-EXTENDED", "book"
+            ExtendedAdapter(None), "ABC-EXTENDED", "book", session_id
         )
         evidence = repository.connection.execute(
             "SELECT recorded_at,event_type,venue,detail FROM runtime_evidence "
@@ -2759,6 +2908,9 @@ async def test_extended_book_eof_unifies_socket_and_resync_notification_episode(
         await runtime.mark_disconnected(
             Venue.EXTENDED, "ABC-EXTENDED", stream_kind="book",
             exception=ValueError("independent synthetic gap"),
+            stream_session_id=runtime._stream_sessions[
+                (Venue.EXTENDED, "ABC-EXTENDED", "book")
+            ],
         )
         assert [row.kind for row in delivery.rows] == [
             "CRITICAL_DATA_LOSS", "DATA_RECOVERY", "CRITICAL_DATA_LOSS",
@@ -2791,7 +2943,12 @@ async def test_combined_socket_uses_one_episode_for_sorted_market_set(tmp_path):
         runtime = PublicPaperRuntime(repository, adapters={}, clock=clock, sleep=no_delay)
         runtime._session = session
         runtime._stop_event = stop
-        await runtime._combined_stream(Venue.NADO, adapter, symbols)
+        session_id = runtime._new_stream_session(
+            (Venue.NADO, "*", "combined")
+        )
+        await runtime._combined_stream(
+            Venue.NADO, adapter, symbols, session_id
+        )
         lifecycle = repository.connection.execute(
             "SELECT recorded_at,event_type,venue,detail FROM runtime_evidence "
             "WHERE event_type IN "
@@ -2831,7 +2988,12 @@ async def test_simple_combined_eof_then_reconnect_is_one_socket_episode(tmp_path
         )
         runtime._session = session
         runtime._stop_event = stop
-        await runtime._combined_stream(Venue.NADO, adapter, symbols)
+        session_id = runtime._new_stream_session(
+            (Venue.NADO, "*", "combined")
+        )
+        await runtime._combined_stream(
+            Venue.NADO, adapter, symbols, session_id
+        )
         lifecycle = repository.connection.execute(
             "SELECT recorded_at,event_type,venue,detail FROM runtime_evidence "
             "WHERE event_type IN "
@@ -2847,6 +3009,19 @@ async def test_simple_combined_eof_then_reconnect_is_one_socket_episode(tmp_path
     disconnected, reconnected = assert_socket_episode(lifecycle)
     assert disconnected["episode_id"] == reconnected["episode_id"]
     assert disconnected["stream_kind"] == reconnected["stream_kind"] == "combined"
+    assert "stream_session_id" not in disconnected
+    assert "stream_session_id" not in reconnected
+    assert (
+        disconnected["disconnected_stream_session_id"]
+        == reconnected["disconnected_stream_session_id"]
+    )
+    assert reconnected["reconnected_stream_session_id"] == runtime._stream_sessions[
+        Venue.NADO, "*", "combined"
+    ].value
+    assert (
+        reconnected["reconnected_stream_session_id"]
+        != disconnected["disconnected_stream_session_id"]
+    )
     assert disconnected["markets"] == reconnected["markets"] == [
         "ABC-NADO", "XYZ-NADO",
     ]
@@ -2871,8 +3046,11 @@ async def test_failed_extended_reconnect_attempts_do_not_duplicate_episode(tmp_p
         runtime = PublicPaperRuntime(repository, adapters={}, clock=clock, sleep=no_delay)
         runtime._session = session
         runtime._stop_event = stop
+        session_id = runtime._new_stream_session(
+            (Venue.EXTENDED, "ABC-EXTENDED", "funding")
+        )
         await runtime._extended_stream(
-            ExtendedAdapter(None), "ABC-EXTENDED", "funding"
+            ExtendedAdapter(None), "ABC-EXTENDED", "funding", session_id
         )
         lifecycle = repository.connection.execute(
             "SELECT recorded_at,event_type,venue,detail FROM runtime_evidence "
@@ -2967,7 +3145,12 @@ async def test_public_refresh_starts_combined_stream_once_after_catalog_recovery
         runtime._session = object()
         runtime._stop_event = asyncio.Event()
 
-        async def stable_combined(_venue, _adapter, _symbols):
+        async def stable_combined(
+            _venue, _adapter, _symbols, stream_session_id
+        ):
+            assert runtime._owns_stream_session(
+                (_venue, "*", "combined"), stream_session_id
+            )
             await runtime._stop_event.wait()
 
         runtime._combined_stream = stable_combined
@@ -2997,11 +3180,15 @@ async def test_health_confirmation_silence_cancels_active_entry(tmp_path):
         ) as runtime:
             await activate_with_live_streams(runtime, clock)
             order = runtime.broker.state.order
-            runtime.mark_trade_stream_connected(order.venue, order.canonical_market)
+            market = order.route_plan.risex_market
+            runtime._new_stream_session((market.venue, "*", "combined"))
+            runtime.mark_trade_stream_connected(
+                market.venue, market.venue_symbol
+            )
             runtime.next_health_check_at = clock.now() + timedelta(seconds=10)
             clock.advance(26)
             await runtime.tick()
-            state = runtime.readiness[order.venue]
+            state = runtime.readiness[market.venue]
     assert runtime.broker is None
     assert state.detail.startswith("PUBLIC_STREAM_DISCONNECTED:health:StreamGap")
 
@@ -3118,7 +3305,7 @@ async def test_extended_health_is_per_socket_and_stale_restart_has_one_episode(
         runtime = PublicPaperRuntime(repository, adapters={}, clock=clock)
         runtime._stop_event = asyncio.Event()
         for kind in ("book", "trade", "funding"):
-            runtime._confirm_extended_stream(symbol, kind, clock.now(), data_ready=True)
+            confirm_extended_stream(runtime, symbol, kind, clock.now(), data_ready=True)
         runtime._extended_confirmed_at[symbol, stale_kind] = clock.now() - timedelta(seconds=26)
 
         async def waiting_stream():
@@ -3148,7 +3335,7 @@ async def test_extended_health_is_per_socket_and_stale_restart_has_one_episode(
             name.startswith("connection_combined")
             for name in runtime.component_readiness[Venue.EXTENDED]
         )
-        runtime._confirm_extended_stream(symbol, stale_kind, clock.now(), data_ready=True)
+        confirm_extended_stream(runtime, symbol, stale_kind, clock.now(), data_ready=True)
         runtime._watchdog_restarted(
             (Venue.EXTENDED, stale_kind, (symbol,)), at=clock.now()
         )
@@ -3159,7 +3346,7 @@ async def test_extended_health_is_per_socket_and_stale_restart_has_one_episode(
             clock.now() - timedelta(seconds=26)
         )
         await runtime._check_extended_health(clock.now())
-        runtime._confirm_extended_stream(symbol, stale_kind, clock.now(), data_ready=True)
+        confirm_extended_stream(runtime, symbol, stale_kind, clock.now(), data_ready=True)
         runtime._watchdog_restarted(
             (Venue.EXTENDED, stale_kind, (symbol,)), at=clock.now()
         )
@@ -3219,7 +3406,7 @@ async def test_simultaneous_stale_watchdog_mutation_is_generation_safe(tmp_path)
             task = asyncio.create_task(waiting_stream())
             tasks[kind] = task
             runtime._stream_tasks[key] = task
-            runtime._stream_generations[key] = 1
+            runtime._new_stream_session(key)
             runtime._extended_confirmed_at[symbol, kind] = (
                 clock.now() - timedelta(seconds=26)
             )
@@ -3228,7 +3415,9 @@ async def test_simultaneous_stale_watchdog_mutation_is_generation_safe(tmp_path)
         async def mutating_disconnect(venue, market, **kwargs):
             if kwargs.get("stream_kind") == "book":
                 runtime._extended_confirmed_at.pop((symbol, "trade"), None)
-                runtime._stream_generations[Venue.EXTENDED, symbol, "trade"] = 2
+                runtime._new_stream_session(
+                    (Venue.EXTENDED, symbol, "trade")
+                )
             await original(venue, market, **kwargs)
 
         runtime.mark_disconnected = mutating_disconnect
@@ -3263,14 +3452,14 @@ async def test_extended_quiet_heartbeat_keeps_each_stream_healthy_for_sixty_seco
 
         tasks = {}
         for kind in ("book", "trade", "funding"):
-            runtime._confirm_extended_stream(symbol, kind, clock.now(), data_ready=True)
+            confirm_extended_stream(runtime, symbol, kind, clock.now(), data_ready=True)
             task = asyncio.create_task(waiting_stream())
             runtime._stream_tasks[Venue.EXTENDED, symbol, kind] = task
             tasks[kind] = task
         for _ in range(6):
             clock.advance(10)
             for kind in ("book", "trade", "funding"):
-                runtime._confirm_extended_stream(
+                confirm_extended_stream(runtime,
                     symbol, kind, clock.now(), data_ready=False
                 )
             await runtime._check_extended_health(clock.now())
@@ -3297,7 +3486,7 @@ def test_extended_book_ping_refreshes_only_book_connection_health(tmp_path):
             Venue.EXTENDED, f"book:{symbol}", False,
             "PUBLIC_BOOK_DATA_PENDING", clock.now(),
         )
-        runtime._confirm_extended_stream(
+        confirm_extended_stream(runtime,
             symbol, "book", clock.now(), data_ready=False
         )
         stream = runtime.coordinator.stream(Venue.EXTENDED, symbol)
@@ -3309,27 +3498,27 @@ def test_extended_book_ping_refreshes_only_book_connection_health(tmp_path):
             (BookLevel(D("99"), D("20")),),
             (BookLevel(D("101"), D("20")),), clock.now(), 1,
         ))
-        runtime._confirm_extended_stream(
+        confirm_extended_stream(runtime,
             symbol, "book", clock.now(), data_ready=True
         )
         clock.advance(26)
-        runtime._confirm_extended_stream(
+        confirm_extended_stream(runtime,
             symbol, "book", clock.now(), data_ready=False
         )
         assert stream.health(clock.now()).data_quality is DataQuality.COMPLETE
 
         clock.advance(26)
-        runtime._confirm_extended_stream(
+        confirm_extended_stream(runtime,
             symbol, "trade", clock.now(), data_ready=False
         )
         assert stream.health(clock.now()).data_quality is DataQuality.DEGRADED
-        runtime._confirm_extended_stream(
+        confirm_extended_stream(runtime,
             symbol, "book", clock.now(), data_ready=False
         )
         assert stream.health(clock.now()).data_quality is DataQuality.COMPLETE
 
         clock.advance(26)
-        runtime._confirm_extended_stream(
+        confirm_extended_stream(runtime,
             symbol, "funding", clock.now(), data_ready=False
         )
         assert stream.health(clock.now()).data_quality is DataQuality.DEGRADED
@@ -3355,7 +3544,12 @@ async def test_extended_valid_trade_restores_health_before_no_order_early_return
         )
         runtime._session = session
         runtime._stop_event = stop
-        await runtime._extended_stream(adapter, symbol, "trade")
+        session_id = runtime._new_stream_session(
+            (Venue.EXTENDED, symbol, "trade")
+        )
+        await runtime._extended_stream(
+            adapter, symbol, "trade", session_id
+        )
     assert session.connections == 1
     assert (Venue.EXTENDED, symbol) in runtime._trade_stream_ready
     assert runtime.component_readiness[Venue.EXTENDED][f"trade:{symbol}"].available
@@ -3381,7 +3575,12 @@ async def test_extended_funding_ws_path_does_not_replace_rest_expected_quote(tmp
         expected = runtime.observations[Venue.EXTENDED, symbol].funding
         runtime._session = session
         runtime._stop_event = stop
-        await runtime._extended_stream(adapter, symbol, "funding")
+        session_id = runtime._new_stream_session(
+            (Venue.EXTENDED, symbol, "funding")
+        )
+        await runtime._extended_stream(
+            adapter, symbol, "funding", session_id
+        )
         assert runtime.observations[Venue.EXTENDED, symbol].funding == expected
         assert repository.connection.execute(
             "SELECT COUNT(*) FROM funding_settlements WHERE venue='EXTENDED'"
@@ -3415,7 +3614,7 @@ async def test_extended_funding_connection_allows_quiet_applied_stream(tmp_path)
         )
         await runtime._reconcile_extended_streams()
         for kind in ("book", "trade", "funding"):
-            runtime._confirm_extended_stream(
+            confirm_extended_stream(runtime,
                 symbol, kind, clock.now(), data_ready=False
             )
         components = runtime.component_readiness[Venue.EXTENDED]
@@ -3443,8 +3642,10 @@ async def test_extended_funding_connection_allows_quiet_applied_stream(tmp_path)
             Venue.EXTENDED, symbol,
             (BookLevel(D("99"), D("20")),),
             (BookLevel(D("101"), D("20")),), clock.now(), 1,
+        ), stream_session_id=stream_session(
+            runtime, Venue.EXTENDED, symbol, "book"
         ))
-        runtime._confirm_extended_stream(symbol, "book", clock.now(), data_ready=True)
+        confirm_extended_stream(runtime, symbol, "book", clock.now(), data_ready=True)
         clock.advance(1)
         await runtime.scan(refresh=False, scan_kind="FULL")
         assert next(
@@ -3455,7 +3656,7 @@ async def test_extended_funding_connection_allows_quiet_applied_stream(tmp_path)
         assert not components[f"trade:{symbol}"].available
         assert not components[f"applied_funding:{symbol}"].available
 
-        runtime._confirm_extended_stream(symbol, "trade", clock.now(), data_ready=True)
+        confirm_extended_stream(runtime, symbol, "trade", clock.now(), data_ready=True)
         clock.advance(1)
         await runtime.scan(refresh=False, scan_kind="FULL")
         after_trade = next(
@@ -3476,7 +3677,7 @@ async def test_extended_funding_connection_allows_quiet_applied_stream(tmp_path)
             },
         }, adapter.market)
         assert record is not None
-        runtime._confirm_extended_stream(symbol, "funding", clock.now(), data_ready=True)
+        confirm_extended_stream(runtime, symbol, "funding", clock.now(), data_ready=True)
         await runtime._apply_extended_funding_record(record)
         clock.advance(1)
         await runtime.scan(refresh=False, scan_kind="FULL")
@@ -3558,7 +3759,7 @@ async def test_fresh_extended_cache_timeout_preserves_economics_without_book_fai
             await runtime.scan()
             confirm_public_streams(runtime, clock.now())
             for kind in ("book", "trade", "funding"):
-                runtime._confirm_extended_stream(
+                confirm_extended_stream(runtime,
                     extended.market.venue_symbol, kind, clock.now(), data_ready=True,
                 )
             await runtime.scan(refresh=False, scan_kind="FULL")
@@ -3602,7 +3803,7 @@ async def test_extended_metadata_stale_is_precise_and_not_book_unhealthy(tmp_pat
             clock.advance(301)
             confirm_public_streams(runtime, clock.now())
             for kind in ("book", "trade", "funding"):
-                runtime._confirm_extended_stream(
+                confirm_extended_stream(runtime,
                     adapter.market.venue_symbol, kind, clock.now(), data_ready=True
                 )
             await runtime.scan(refresh=False, scan_kind="FULL")
@@ -3641,7 +3842,9 @@ async def test_extended_client_heartbeat_is_ten_seconds_and_owned(tmp_path):
             repository, adapters={}, clock=clock, sleep=controlled_sleep,
         )
         runtime._stop_event = stop
-        await runtime._extended_heartbeat(socket)
+        key = (Venue.EXTENDED, "ABC-EXTENDED", "book")
+        session_id = runtime._new_stream_session(key)
+        await runtime._extended_heartbeat(socket, key, session_id)
     assert sleeps == [10, 10]
     assert socket.pings == 1
 
@@ -3677,8 +3880,11 @@ async def test_extended_server_ping_and_client_pong_confirm_only_own_socket(tmp_
         runtime = PublicPaperRuntime(repository, adapters={}, clock=clock)
         runtime._session = session
         runtime._stop_event = stop
+        session_id = runtime._new_stream_session(
+            (Venue.EXTENDED, "ABC-EXTENDED", "trade")
+        )
         await runtime._extended_stream(
-            ExtendedAdapter(None), "ABC-EXTENDED", "trade"
+            ExtendedAdapter(None), "ABC-EXTENDED", "trade", session_id
         )
     assert socket.pongs == [b"server"]
     assert runtime._extended_confirmed_at["ABC-EXTENDED", "trade"] == NOW + timedelta(seconds=2)
@@ -3799,7 +4005,7 @@ async def test_two_extended_markets_keep_expected_funding_across_full_scans(tmp_
             confirm_public_streams(runtime, clock.now())
             for market in extended.rows:
                 for kind in ("book", "trade", "funding"):
-                    runtime._confirm_extended_stream(
+                    confirm_extended_stream(runtime,
                         market.venue_symbol, kind, clock.now(), data_ready=True
                     )
             clock.advance(1)
@@ -3931,6 +4137,9 @@ async def test_safe_stop_bounds_gated_io_and_high_rate_frames_with_open_exit(tmp
 
         async def high_rate_frames():
             symbol = "UNRELATED-PERP"
+            session_id = stream_session(
+                runtime, Venue.NADO, symbol, "combined"
+            )
             await runtime.recover_snapshot(OrderBook(
                 Venue.NADO, symbol, (BookLevel(D("10"), D("1")),),
                 (BookLevel(D("11"), D("1")),), clock.now(), 0,
@@ -3940,13 +4149,19 @@ async def test_safe_stop_bounds_gated_io_and_high_rate_frames_with_open_exit(tmp
                 await runtime.apply_book_event(BookDelta(
                     Venue.NADO, symbol, (BookLevel(D("10"), D("1")),), (),
                     clock.now(), sequence, sequence - 1,
-                ))
+                ), stream_session_id=session_id)
                 sequence += 1
                 if sequence % 100 == 0:
                     await asyncio.sleep(0)
 
         runtime._refresh_task = asyncio.create_task(gated_io())
-        runtime._recovery_tasks[Venue.NADO, "GATED"] = asyncio.create_task(gated_io())
+        gated_session = stream_session(
+            runtime, Venue.NADO, "GATED", "book"
+        )
+        gated_episode = runtime._new_recovery_episode(
+            (Venue.NADO, "GATED"), gated_session
+        )
+        gated_episode.task = asyncio.create_task(gated_io())
         runtime._stream_tasks[Venue.NADO, "*", "combined"] = asyncio.create_task(
             high_rate_frames()
         )
@@ -3998,6 +4213,9 @@ async def test_run_cancels_blocked_tick_before_safe_shutdown(tmp_path, stop_path
 
         async def high_rate_frames():
             symbol = "UNRELATED-RUN-PERP"
+            session_id = stream_session(
+                runtime, Venue.NADO, symbol, "combined"
+            )
             await runtime.recover_snapshot(OrderBook(
                 Venue.NADO, symbol, (BookLevel(D("10"), D("1")),),
                 (BookLevel(D("11"), D("1")),), clock.now(), 0,
@@ -4007,7 +4225,7 @@ async def test_run_cancels_blocked_tick_before_safe_shutdown(tmp_path, stop_path
                 await runtime.apply_book_event(BookDelta(
                     Venue.NADO, symbol, (BookLevel(D("10"), D("1")),), (),
                     clock.now(), sequence, sequence - 1,
-                ))
+                ), stream_session_id=session_id)
                 sequence += 1
                 if sequence % 100 == 0:
                     await asyncio.sleep(0)
@@ -4062,10 +4280,13 @@ async def test_unrelated_book_delta_does_not_evaluate_or_persist_open_position(t
                 (BookLevel(D("10"), D("1")),),
                 (BookLevel(D("11"), D("1")),), clock.now(), 1,
             ))
+            session_id = stream_session(
+                runtime, Venue.NADO, "UNRELATED-PERP", "combined"
+            )
             await runtime.apply_book_event(BookDelta(
                 Venue.NADO, "UNRELATED-PERP",
                 (BookLevel(D("10"), D("2")),), (), clock.now(), 2, 1,
-            ))
+            ), stream_session_id=session_id)
             assert runtime.lifecycle.snapshot == before
             assert repository.runtime_updated_at() == before_updated
 
@@ -4078,13 +4299,14 @@ async def test_ten_thousand_recovery_deltas_are_memory_bounded_and_episode_only(
             repository, adapters=adapters(clock, settlement_at=NOW), clock=clock,
         ) as runtime:
             key = (Venue.NADO, "BTC-PERP")
-            runtime._recovery_buffers[key] = []
+            session_id = stream_session(runtime, *key, "combined")
+            episode = runtime._new_recovery_episode(key, session_id)
             for sequence in range(1, 10_001):
                 await runtime.apply_book_event(BookDelta(
                     *key, (BookLevel(D("10"), D("1")),), (),
                     clock.now(), sequence, sequence - 1,
-                ))
-            assert len(runtime._recovery_buffers[key]) <= 2048
+                ), stream_session_id=session_id)
+            assert len(episode.buffer) <= 2048
             assert repository.connection.execute(
                 "SELECT COUNT(*) FROM runtime_evidence "
                 "WHERE event_type='PUBLIC_RECOVERY_DELTA_BUFFERED'"
@@ -4130,16 +4352,21 @@ async def test_overflow_rejects_pre_overflow_snapshot_and_uses_new_boundary(tmp_
         async with PublicPaperRuntime(repository, adapters=fakes, clock=clock) as runtime:
             runtime._stop_event = asyncio.Event()
             key = (Venue.NADO, "BTC-PERP")
-            runtime._start_snapshot_recovery(*key)
-            old_task = runtime._recovery_tasks[key]
+            session_id = stream_session(runtime, *key, "combined")
+            episode = runtime._start_snapshot_recovery(
+                *key, displaced_stream_session_id=session_id
+            )
+            old_task = episode.task
+            assert old_task is not None
             await first_started.wait()
             for sequence in range(1, 2050):
                 await runtime.apply_book_event(BookDelta(
                     *key, (BookLevel(D("2"), D("1")),), (),
                     clock.now(), sequence, sequence - 1,
-                ))
+                ), stream_session_id=session_id)
             await second_started.wait()
-            new_task = runtime._recovery_tasks[key]
+            new_task = episode.task
+            assert new_task is not None
             first_gate.set()
             second_gate.set()
             await asyncio.gather(old_task, return_exceptions=True)
@@ -4375,7 +4602,7 @@ async def test_nado_only_initial_then_extended_ready_next_full_has_twenty_routes
                 runtime.mark_trade_stream_connected(venue, symbol, at=clock.now())
                 if venue is Venue.EXTENDED:
                     for kind in ("book", "trade", "funding"):
-                        runtime._confirm_extended_stream(
+                        confirm_extended_stream(runtime,
                             symbol, kind, clock.now(), data_ready=True,
                         )
 
@@ -4388,7 +4615,7 @@ async def test_nado_only_initial_then_extended_ready_next_full_has_twenty_routes
                 )
                 if venue is Venue.EXTENDED:
                     for kind in ("book", "trade", "funding"):
-                        runtime._confirm_extended_stream(
+                        confirm_extended_stream(runtime,
                             symbol, kind, clock.now(), data_ready=False,
                         )
             await runtime.tick(clock.now())
@@ -4414,3 +4641,1892 @@ async def test_nado_only_initial_then_extended_ready_next_full_has_twenty_routes
         for row in routes
     )
     assert fatal_count == 0
+
+
+def _stabilization002_book(
+    venue: Venue,
+    symbol: str,
+    at: datetime,
+    sequence: int | None = 1,
+    *,
+    bid: str = "99",
+    ask: str = "101",
+    quantity: str = "20",
+) -> OrderBook:
+    return OrderBook(
+        venue, symbol,
+        (BookLevel(D(bid), D(quantity)),),
+        (BookLevel(D(ask), D(quantity)),), at, sequence,
+    )
+
+
+async def _stabilization002_seed_position_books(
+    runtime: PublicPaperRuntime, at: datetime
+) -> None:
+    lifecycle = runtime.lifecycle
+    assert lifecycle is not None
+    snapshot = lifecycle.snapshot
+    runtime.lifecycle = None
+    for market in (snapshot.risex_market, snapshot.hedge_market):
+        book = _stabilization002_book(
+            market.venue, market.venue_symbol, at, quantity="10"
+        )
+        runtime.observations[market.venue, market.venue_symbol] = MarketObservation(
+            market,
+            MarketVolume(
+                market.venue, market.venue_symbol, D("1000"), at, "fixture"
+            ),
+            book,
+            FundingCashQuote(
+                market.venue, market.venue_symbol, at, at,
+                at + timedelta(hours=1), FundingQuality.PREDICTED,
+                FundingAccrualMethod.SNAPSHOT_AT_SETTLEMENT, True,
+                D("0"), D("0"), "fixture",
+            ),
+            StreamHealth(at, at, True, True, True, DataQuality.COMPLETE),
+        )
+        await runtime.recover_snapshot(book, at=at)
+        runtime.mark_trade_stream_connected(
+            market.venue, market.venue_symbol, at=at
+        )
+    runtime.lifecycle = lifecycle
+
+
+async def _stabilization002_position_runtime(
+    repository: PaperRepository, clock: FakeClock
+) -> PublicPaperRuntime:
+    await run_fixture({"scenario": "exiting_aggressive_open"}, repository)
+    runtime = PublicPaperRuntime(
+        repository, adapters=adapters(clock, settlement_at=NOW), clock=clock
+    )
+    runtime.lifecycle = LifecycleEngine.from_snapshot(repository.load_runtime())
+    await _stabilization002_seed_position_books(runtime, NOW)
+    return runtime
+
+
+def _stabilization002_fail_save(repository: PaperRepository) -> None:
+    def fail_save(**_kwargs) -> None:
+        raise sqlite3.OperationalError("synthetic lifecycle checkpoint failure")
+
+    repository.save_decision = fail_save
+
+
+def _stabilization002_lifecycle_rows(repository: PaperRepository):
+    tables = (
+        "runtime_state", "positions", "orders", "order_versions",
+        "position_samples", "gaps", "lifecycle_events", "completed_trades",
+        "fills", "processed_trade_events",
+    )
+    return {
+        table: tuple(
+            tuple(row) for row in repository.connection.execute(
+                f"SELECT * FROM {table} ORDER BY rowid"
+            )
+        )
+        for table in tables
+    }
+
+
+def _stabilization002_recovery_events(repository: PaperRepository):
+    rows = repository.connection.execute(
+        "SELECT event_type, detail FROM runtime_evidence "
+        "WHERE event_type IN ('PUBLIC_SNAPSHOT_RECOVERY_STARTED', "
+        "'PUBLIC_SNAPSHOT_RECOVERY_FAILED', "
+        "'PUBLIC_SNAPSHOT_RECOVERY_COMPLETED') "
+        "ORDER BY evidence_id"
+    ).fetchall()
+    return [(row["event_type"], json.loads(row["detail"])) for row in rows]
+
+
+def _stabilization002_observable_state(runtime: PublicPaperRuntime):
+    component_rows = tuple(sorted(
+        (
+            venue.value, component, row.available, row.detail, row.updated_at,
+        )
+        for venue, components in runtime.component_readiness.items()
+        for component, row in components.items()
+    ))
+    venue_rows = tuple(sorted(
+        (venue.value, row.available, row.detail, row.updated_at)
+        for venue, row in runtime.readiness.items()
+    ))
+    projections = []
+    for venue, symbol in sorted(
+        runtime.observations, key=lambda key: (key[0].value, key[1])
+    ):
+        stream = runtime.coordinator.stream(venue, symbol)
+        projections.append((
+            venue.value, symbol, stream.book(), stream.health(runtime.clock.now()),
+            runtime.observations[venue, symbol],
+        ))
+    return (
+        component_rows,
+        venue_rows,
+        frozenset(runtime._trade_stream_ready),
+        frozenset(runtime._live_book_ready),
+        tuple(projections),
+    )
+
+
+def _stabilization002_assert_failed_recovery_successor(
+    runtime: PublicPaperRuntime,
+    repository: PaperRepository,
+    venue: Venue,
+    symbol: str,
+    failed,
+    successor_session,
+) -> None:
+    successor = runtime._recoveries[venue, symbol]
+    assert successor is not failed
+    assert successor.episode_id != failed.episode_id
+    assert successor.attempt_generation != failed.attempt_generation
+    assert successor.owned_stream_session_id == successor_session
+    assert successor.terminal == "COMPLETE"
+    assert runtime.coordinator.stream(venue, symbol).book() is not None
+    readiness = runtime.component_readiness[venue]
+    assert all(
+        readiness[f"{component}:{symbol}"].available
+        for component in ("book", "trade", "funding", "connection_combined")
+    )
+    events = _stabilization002_recovery_events(repository)
+    assert [event for event, _ in events] == [
+        "PUBLIC_SNAPSHOT_RECOVERY_STARTED",
+        "PUBLIC_SNAPSHOT_RECOVERY_FAILED",
+        "PUBLIC_SNAPSHOT_RECOVERY_STARTED",
+        "PUBLIC_SNAPSHOT_RECOVERY_COMPLETED",
+    ]
+    assert events[0][1]["episode_id"] != events[2][1]["episode_id"]
+    assert events[2][1]["stream_session_id"] == successor_session.value
+
+
+def _stabilization002_install_closing_socket(
+    runtime: PublicPaperRuntime,
+) -> None:
+    stop = asyncio.Event()
+    runtime._session = SingleWebSocketSession(
+        ClosingWebSocket(stop, stop_on_iteration=True)
+    )
+    runtime._stop_event = stop
+
+
+@pytest.mark.asyncio
+async def test_stabilization002_nado_failed_rest_recovery_restarts_on_physical_session(
+    tmp_path,
+):
+    clock = FakeClock()
+    symbol = "ABC-NADO"
+    adapter = CombinedFakeAdapter(Venue.NADO, clock, settlement_at=NOW)
+    fetch_calls = 0
+
+    async def fetch_book(_symbol):
+        nonlocal fetch_calls
+        fetch_calls += 1
+        if fetch_calls <= 3:
+            raise RuntimeError(f"snapshot failure {fetch_calls}")
+        return _stabilization002_book(Venue.NADO, symbol, clock.now(), 10)
+
+    async def no_delay(_seconds):
+        await asyncio.sleep(0)
+
+    adapter.fetch_book = fetch_book
+    with PaperRepository(tmp_path / "stabilization002-nado-liveness.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={Venue.NADO: adapter}, clock=clock,
+            sleep=no_delay,
+        )
+        runtime._stop_event = asyncio.Event()
+        stream_key = (Venue.NADO, "*", "combined")
+        first_session = runtime._new_stream_session(stream_key)
+        await runtime.recover_snapshot(
+            _stabilization002_book(Venue.NADO, symbol, clock.now()),
+            at=clock.now(),
+        )
+        assert not await runtime.apply_book_event(
+            BookDelta(
+                Venue.NADO, symbol, (), (), clock.now(), 3, 2,
+            ),
+            stream_session_id=first_session,
+        )
+        failed = runtime._recoveries[(Venue.NADO, symbol)]
+        assert failed.task is not None
+        await failed.task
+        assert failed.terminal == "FAILED"
+        assert fetch_calls == 3
+
+        _stabilization002_install_closing_socket(runtime)
+        successor_session = runtime._new_stream_session(stream_key)
+        await runtime._combined_stream(
+            Venue.NADO, adapter, (symbol,), successor_session
+        )
+
+        assert fetch_calls == 4
+        _stabilization002_assert_failed_recovery_successor(
+            runtime, repository, Venue.NADO, symbol, failed,
+            successor_session,
+        )
+
+
+@pytest.mark.asyncio
+async def test_stabilization002_obsolete_nado_recovery_cannot_publish_after_session_loss(
+    tmp_path,
+):
+    clock = FakeClock()
+    symbol = "ABC-NADO"
+    adapter = CombinedFakeAdapter(Venue.NADO, clock, settlement_at=NOW)
+    fetch_count = 0
+
+    async def fetch_book(_symbol):
+        nonlocal fetch_count
+        fetch_count += 1
+        sequence = 10 if fetch_count == 1 else 20
+        return _stabilization002_book(
+            Venue.NADO, symbol, clock.now(), sequence,
+            bid=str(90 + sequence), ask=str(92 + sequence),
+        )
+
+    adapter.fetch_book = fetch_book
+    built = asyncio.Event()
+    release_old = asyncio.Event()
+    with PaperRepository(tmp_path / "stabilization002-obsolete-publish.db") as repository:
+        runtime = await _stabilization002_position_runtime(repository, clock)
+        runtime.adapters[Venue.NADO] = adapter
+        runtime._stop_event = asyncio.Event()
+        stream_key = (Venue.NADO, "*", "combined")
+        first_session = runtime._new_stream_session(stream_key)
+        await runtime.recover_snapshot(
+            _stabilization002_book(Venue.NADO, symbol, clock.now()),
+            at=clock.now(),
+        )
+        original_publish_recovery_snapshot = runtime._publish_recovery_snapshot
+
+        async def gated_publish_recovery_snapshot(
+            key, episode, generation, recovered, **kwargs
+        ):
+            if (
+                key == (Venue.NADO, symbol)
+                and episode.owned_stream_session_id == first_session
+            ):
+                built.set()
+                try:
+                    await release_old.wait()
+                except asyncio.CancelledError:
+                    await release_old.wait()
+            return await original_publish_recovery_snapshot(
+                key, episode, generation, recovered, **kwargs
+            )
+
+        runtime._publish_recovery_snapshot = gated_publish_recovery_snapshot
+        assert not await runtime.apply_book_event(
+            BookDelta(Venue.NADO, symbol, (), (), clock.now(), 3, 2),
+            stream_session_id=first_session,
+        )
+        obsolete = runtime._recoveries[Venue.NADO, symbol]
+        assert obsolete.task is not None
+        await built.wait()
+
+        _stabilization002_install_closing_socket(runtime)
+        successor_session = runtime._new_stream_session(stream_key)
+        await runtime._combined_stream(
+            Venue.NADO, adapter, (symbol,), successor_session
+        )
+        before_release = _stabilization002_observable_state(runtime)
+        lifecycle_before = runtime.lifecycle.snapshot
+        evidence_before = repository.connection.execute(
+            "SELECT COUNT(*) FROM runtime_evidence"
+        ).fetchone()[0]
+        episode_before = runtime._recoveries[Venue.NADO, symbol]
+        terminal_before = episode_before.terminal
+
+        release_old.set()
+        await obsolete.task
+
+        assert _stabilization002_observable_state(runtime) == before_release
+        assert runtime.lifecycle.snapshot == lifecycle_before
+        assert repository.connection.execute(
+            "SELECT COUNT(*) FROM runtime_evidence"
+        ).fetchone()[0] == evidence_before
+        assert runtime._recoveries[Venue.NADO, symbol] is episode_before
+        assert episode_before.terminal == terminal_before
+        assert not any(
+            event == "PUBLIC_SNAPSHOT_RECOVERY_COMPLETED"
+            and detail["episode_id"] == obsolete.episode_id.value
+            for event, detail in _stabilization002_recovery_events(repository)
+        )
+
+
+@pytest.mark.asyncio
+async def test_stabilization002_active_nado_recovery_is_replaced_by_physical_session(
+    tmp_path,
+):
+    clock = FakeClock()
+    symbol = "ABC-NADO"
+    adapter = CombinedFakeAdapter(Venue.NADO, clock, settlement_at=NOW)
+    first_fetch_started = asyncio.Event()
+    release_first_fetch = asyncio.Event()
+    second_fetch_started = asyncio.Event()
+    release_second_fetch = asyncio.Event()
+    fetch_count = 0
+
+    async def fetch_book(_symbol):
+        nonlocal fetch_count
+        fetch_count += 1
+        if fetch_count == 1:
+            first_fetch_started.set()
+            try:
+                await release_first_fetch.wait()
+            except asyncio.CancelledError:
+                await release_first_fetch.wait()
+            sequence = 10
+        else:
+            second_fetch_started.set()
+            await release_second_fetch.wait()
+            sequence = 20
+        return _stabilization002_book(
+            Venue.NADO, symbol, clock.now(), sequence
+        )
+
+    adapter.fetch_book = fetch_book
+    with PaperRepository(tmp_path / "stabilization002-active-replaced.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={Venue.NADO: adapter}, clock=clock
+        )
+        runtime._stop_event = asyncio.Event()
+        stream_key = (Venue.NADO, "*", "combined")
+        first_session = runtime._new_stream_session(stream_key)
+        await runtime.recover_snapshot(
+            _stabilization002_book(Venue.NADO, symbol, clock.now()),
+            at=clock.now(),
+        )
+        assert not await runtime.apply_book_event(
+            BookDelta(Venue.NADO, symbol, (), (), clock.now(), 3, 2),
+            stream_session_id=first_session,
+        )
+        first = runtime._recoveries[Venue.NADO, symbol]
+        assert first.task is not None
+        await first_fetch_started.wait()
+
+        _stabilization002_install_closing_socket(runtime)
+        successor_session = runtime._new_stream_session(stream_key)
+        successor_reader = asyncio.create_task(runtime._combined_stream(
+            Venue.NADO, adapter, (symbol,), successor_session
+        ))
+        try:
+            await second_fetch_started.wait()
+            successor = runtime._recoveries[Venue.NADO, symbol]
+            assert successor is not first
+            assert successor.episode_id != first.episode_id
+            assert successor.attempt_generation != first.attempt_generation
+            assert successor.owned_stream_session_id == successor_session
+            readiness = runtime.component_readiness.get(Venue.NADO, {})
+            assert all(
+                (row := readiness.get(f"{component}:{symbol}")) is None
+                or not row.available
+                for component in (
+                    "book", "trade", "funding", "connection_combined"
+                )
+            )
+            release_second_fetch.set()
+            await successor_reader
+            successor = runtime._recoveries[Venue.NADO, symbol]
+            assert successor.terminal == "COMPLETE"
+            readiness = runtime.component_readiness[Venue.NADO]
+            assert all(
+                readiness[f"{component}:{symbol}"].available
+                for component in (
+                    "book", "trade", "funding", "connection_combined"
+                )
+            )
+            evidence_before_old_release = _stabilization002_recovery_events(
+                repository
+            )
+            release_first_fetch.set()
+            await first.task
+            assert (
+                _stabilization002_recovery_events(repository)
+                == evidence_before_old_release
+            )
+            assert runtime._recoveries[Venue.NADO, symbol] is successor
+            assert successor.terminal == "COMPLETE"
+            assert [event for event, _ in evidence_before_old_release] == [
+                "PUBLIC_SNAPSHOT_RECOVERY_STARTED",
+                "PUBLIC_SNAPSHOT_RECOVERY_STARTED",
+                "PUBLIC_SNAPSHOT_RECOVERY_COMPLETED",
+            ]
+        finally:
+            release_first_fetch.set()
+            release_second_fetch.set()
+            if not successor_reader.done():
+                successor_reader.cancel()
+            cleanup = [successor_reader]
+            if first.task is not None and not first.task.done():
+                first.task.cancel()
+            if first.task is not None:
+                cleanup.append(first.task)
+            await asyncio.gather(*cleanup, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_stabilization002_queued_extended_startup_snapshot_is_session_fenced(
+    tmp_path,
+):
+    clock = FakeClock()
+    delivered = asyncio.Event()
+
+    class StartupSnapshotSocket(TextWebSocket):
+        async def __anext__(self):
+            message = await super().__anext__()
+            delivered.set()
+            return message
+
+        async def ping(self):
+            return None
+
+    class ControlledSnapshotSocket:
+        def __init__(self, payload) -> None:
+            self.payload = payload
+            self.release_frame = asyncio.Event()
+            self.after_frame = asyncio.Event()
+            self.finish = asyncio.Event()
+            self.delivered = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self.delivered:
+                await self.release_frame.wait()
+                self.delivered = True
+                return SimpleNamespace(
+                    type=aiohttp.WSMsgType.TEXT,
+                    data=json.dumps(self.payload),
+                )
+            self.after_frame.set()
+            await self.finish.wait()
+            raise StopAsyncIteration
+
+        async def ping(self):
+            return None
+
+    with PaperRepository(tmp_path / "stabilization002-startup-fence.db") as repository:
+        runtime = await _stabilization002_position_runtime(repository, clock)
+        symbol = runtime.lifecycle.snapshot.hedge_market.venue_symbol
+        key = (Venue.EXTENDED, symbol, "book")
+        stream = runtime.coordinator.stream(Venue.EXTENDED, symbol)
+        stream.disconnected()
+        runtime._live_book_ready.discard((Venue.EXTENDED, symbol))
+        runtime._set_component_readiness(
+            Venue.EXTENDED, f"book:{symbol}", False,
+            "PUBLIC_BOOK_DATA_PENDING", clock.now(),
+        )
+        assert (Venue.EXTENDED, symbol) not in runtime._recoveries
+        timestamp_ms = str(int(clock.now().timestamp() * 1000))
+        payload = {
+            "type": "SNAPSHOT", "seq": 10, "ts": timestamp_ms,
+            "data": {
+                "m": symbol,
+                "b": [{"p": "89", "q": "20"}],
+                "a": [{"p": "91", "q": "20"}],
+            },
+        }
+        successor_payload = {
+            **payload, "seq": 20,
+            "data": {
+                "m": symbol,
+                "b": [{"p": "109", "q": "20"}],
+                "a": [{"p": "111", "q": "20"}],
+            },
+        }
+        first_stop = asyncio.Event()
+        runtime._session = SingleWebSocketSession(
+            StartupSnapshotSocket(first_stop, (payload,))
+        )
+        runtime._stop_event = first_stop
+        first_session = runtime._new_stream_session(key)
+        await runtime._position_event_lock.acquire()
+        first_reader = asyncio.create_task(runtime._extended_stream(
+            ExtendedAdapter(None), symbol, "book", first_session
+        ))
+        second_reader = None
+        try:
+            await delivered.wait()
+            await asyncio.sleep(0)
+            assert not first_reader.done()
+
+            successor_socket = ControlledSnapshotSocket(successor_payload)
+            second_transport = SingleWebSocketSession(successor_socket)
+            runtime._session = second_transport
+            runtime._stop_event = asyncio.Event()
+            second_session = runtime._new_stream_session(key)
+            second_reader = asyncio.create_task(runtime._extended_stream(
+                ExtendedAdapter(None), symbol, "book", second_session
+            ))
+            await asyncio.sleep(0)
+            assert second_transport.connections == 1
+            before_release = _stabilization002_observable_state(runtime)
+            lifecycle_before = runtime.lifecycle.snapshot
+            evidence_before = repository.connection.execute(
+                "SELECT COUNT(*) FROM runtime_evidence"
+            ).fetchone()[0]
+            book_before = stream.book()
+            health_before = stream.health(clock.now())
+
+            runtime._position_event_lock.release()
+            await first_reader
+
+            assert _stabilization002_observable_state(runtime) == before_release
+            assert runtime.lifecycle.snapshot == lifecycle_before
+            assert repository.connection.execute(
+                "SELECT COUNT(*) FROM runtime_evidence"
+            ).fetchone()[0] == evidence_before
+            assert stream.book() == book_before
+            assert stream.health(clock.now()) == health_before
+            assert (Venue.EXTENDED, symbol) not in runtime._live_book_ready
+            assert not runtime.component_readiness[Venue.EXTENDED][
+                f"book:{symbol}"
+            ].available
+            assert (Venue.EXTENDED, symbol) not in runtime._recoveries
+
+            successor_socket.release_frame.set()
+            await successor_socket.after_frame.wait()
+            successor_book = stream.book()
+            assert successor_book is not None
+            assert successor_book.sequence == 20
+            assert stream.health(clock.now()).stream_connected
+            assert stream.health(clock.now()).last_connection_confirmation_at == clock.now()
+            assert (Venue.EXTENDED, symbol) in runtime._live_book_ready
+            assert runtime.component_readiness[Venue.EXTENDED][
+                f"book:{symbol}"
+            ].available
+            assert runtime.readiness[Venue.EXTENDED].available
+            assert runtime.observations[Venue.EXTENDED, symbol].book == successor_book
+            assert (Venue.EXTENDED, symbol) not in runtime._recoveries
+            successor_socket.finish.set()
+            runtime._stop_event.set()
+            await second_reader
+        finally:
+            if runtime._position_event_lock.locked():
+                runtime._position_event_lock.release()
+            if not first_reader.done():
+                first_reader.cancel()
+            if second_reader is not None and not second_reader.done():
+                second_reader.cancel()
+            cleanup = [first_reader]
+            if second_reader is not None:
+                cleanup.append(second_reader)
+            await asyncio.gather(*cleanup, return_exceptions=True)
+
+
+class Stabilization002RisexAdapter(RisexAdapter):
+    def __init__(self, clock: FakeClock, symbol: str) -> None:
+        super().__init__(None)
+        self.clock = clock
+        self.symbol = symbol
+        self._market_ids = {symbol: "1"}
+        self._symbols_by_id = {"1": symbol}
+        self._raw_markets = {
+            symbol: {
+                "market_id": "1",
+                "config": {
+                    "name": symbol, "step_size": "1", "step_price": "1",
+                    "min_order_size": "1",
+                },
+            }
+        }
+
+    async def fetch_book(self, venue_symbol: str) -> OrderBook:
+        assert venue_symbol == self.symbol
+        return _stabilization002_book(
+            Venue.RISEX, venue_symbol, self.clock.now(), None
+        )
+
+
+@pytest.mark.asyncio
+async def test_stabilization002_risex_overflow_failed_recovery_restarts_on_ws_snapshot(
+    tmp_path,
+):
+    clock = FakeClock()
+    symbol = "ABC/USDC"
+    adapter = Stabilization002RisexAdapter(clock, symbol)
+
+    class SendSocket:
+        def __init__(self) -> None:
+            self.sent = []
+
+        async def send_json(self, payload) -> None:
+            self.sent.append(payload)
+
+    with PaperRepository(tmp_path / "stabilization002-risex-liveness.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={Venue.RISEX: adapter}, clock=clock
+        )
+        runtime._stop_event = asyncio.Event()
+        stream_key = (Venue.RISEX, "*", "combined")
+        failed_session = runtime._new_stream_session(stream_key)
+        await runtime._resubscribe_risex_orderbooks(
+            SendSocket(), adapter, (symbol,), triggering_symbol=symbol,
+            stream_session_id=failed_session,
+        )
+        failed = runtime._recoveries[(Venue.RISEX, symbol)]
+        for overflow in range(3):
+            for offset in range(2048):
+                sequence = overflow * 2049 + offset + 1
+                assert not await runtime.apply_book_event(
+                    BookDelta(
+                        Venue.RISEX, symbol, (), (), clock.now(), sequence,
+                        sequence - 1,
+                    ),
+                    stream_session_id=failed_session,
+                )
+            sequence = (overflow + 1) * 2049
+            assert not await runtime.apply_book_event(
+                BookDelta(
+                    Venue.RISEX, symbol, (), (), clock.now(), sequence,
+                    sequence - 1,
+                ),
+                stream_session_id=failed_session,
+            )
+        assert failed.terminal == "FAILED"
+        assert failed.overflows == 3
+
+        timestamp_ns = str(int(clock.now().timestamp() * 1_000_000_000))
+        snapshot_payload = {
+            "method": "snapshot", "channel": "orderbook", "type": "snapshot",
+            "market_id": "1", "worker_timestamp": timestamp_ns,
+            "data": {
+                "market_id": 1,
+                "bids": [{"price": "99", "quantity": "20"}],
+                "asks": [{"price": "101", "quantity": "20"}],
+            },
+        }
+
+        class SingleSnapshotSocket(TextWebSocket):
+            async def send_json(self, _payload):
+                return None
+
+            async def __anext__(self):
+                message = await super().__anext__()
+                self.stop_event.set()
+                return message
+
+        stop = asyncio.Event()
+        runtime._session = SingleWebSocketSession(
+            SingleSnapshotSocket(stop, (snapshot_payload,))
+        )
+        runtime._stop_event = stop
+        successor_session = runtime._new_stream_session(stream_key)
+        await runtime._combined_stream(
+            Venue.RISEX, adapter, (symbol,), successor_session
+        )
+
+        _stabilization002_assert_failed_recovery_successor(
+            runtime, repository, Venue.RISEX, symbol, failed,
+            successor_session,
+        )
+
+
+@pytest.mark.asyncio
+async def test_stabilization002_r1_recovery_repository_failure_is_atomic(
+    tmp_path,
+):
+    clock = FakeClock()
+    with PaperRepository(tmp_path / "stabilization002-r1-recovery-atomic.db") as repository:
+        runtime = await _stabilization002_position_runtime(repository, clock)
+        lifecycle = runtime.lifecycle
+        assert lifecycle is not None
+        await lifecycle.start_gap(started_at=clock.now())
+        repository.save_decision(
+            recorded_at=clock.now(), lifecycle_snapshot=lifecycle.snapshot
+        )
+        market = lifecycle.snapshot.risex_market
+        key = (market.venue, market.venue_symbol)
+        session_id = runtime._new_stream_session((Venue.RISEX, "*", "combined"))
+        episode = runtime._new_recovery_episode(key, session_id)
+        runtime._record_recovery_started(key, episode)
+        recovered = _stabilization002_book(
+            market.venue, market.venue_symbol, clock.now(), 60,
+            bid="98", ask="102", quantity="20",
+        )
+        lifecycle_before = lifecycle.snapshot
+        persisted_before = repository.load_runtime()
+        rows_before = _stabilization002_lifecycle_rows(repository)
+        observable_before = _stabilization002_observable_state(runtime)
+        evidence_before = repository.connection.execute(
+            "SELECT COUNT(*) FROM runtime_evidence"
+        ).fetchone()[0]
+        terminal_before = episode.terminal
+        original_save_lifecycle = repository._save_lifecycle
+        notifications = []
+        runtime._notify_outage = lambda *args, **kwargs: notifications.append(
+            (args, kwargs)
+        )
+
+        def fail_after_lifecycle_rows(snapshot, recorded_at):
+            original_save_lifecycle(snapshot, recorded_at)
+            raise sqlite3.OperationalError("synthetic post-lifecycle-write failure")
+
+        repository._save_lifecycle = fail_after_lifecycle_rows
+
+        with pytest.raises(sqlite3.OperationalError):
+            await runtime._publish_recovery_snapshot(
+                key,
+                episode,
+                episode.attempt_generation,
+                recovered,
+                at=clock.now(),
+                buffered=0,
+                replayed=0,
+                source="WS_RESUBSCRIBE_SNAPSHOT",
+            )
+
+        assert _stabilization002_lifecycle_rows(repository) == rows_before
+        assert repository.load_runtime() == persisted_before
+        assert lifecycle.snapshot == lifecycle_before
+        assert _stabilization002_observable_state(runtime) == observable_before
+        assert episode.terminal == terminal_before
+        assert repository.connection.execute(
+            "SELECT COUNT(*) FROM runtime_evidence"
+        ).fetchone()[0] == evidence_before
+        assert episode.buffer == []
+        assert notifications == []
+
+        repository._save_lifecycle = original_save_lifecycle
+        assert await runtime._publish_recovery_snapshot(
+            key, episode, episode.attempt_generation, recovered,
+            at=clock.now(), buffered=0, replayed=0,
+            source="WS_RESUBSCRIBE_SNAPSHOT",
+        )
+        assert episode.terminal == "COMPLETE"
+        assert repository.load_runtime() == lifecycle.snapshot
+        assert repository.connection.execute(
+            "SELECT COUNT(*) FROM runtime_evidence "
+            "WHERE event_type='PUBLIC_SNAPSHOT_RECOVERY_COMPLETED'"
+        ).fetchone()[0] == 1
+        assert len(notifications) == 1
+
+
+@pytest.mark.asyncio
+async def test_stabilization002_r1_terminal_evidence_failure_rolls_back_and_retries(
+    tmp_path,
+):
+    clock = FakeClock()
+    with PaperRepository(tmp_path / "stabilization002-r1-evidence-atomic.db") as repository:
+        runtime = await _stabilization002_position_runtime(repository, clock)
+        lifecycle = runtime.lifecycle
+        await lifecycle.start_gap(started_at=clock.now())
+        repository.save_decision(
+            recorded_at=clock.now(), lifecycle_snapshot=lifecycle.snapshot
+        )
+        market = lifecycle.snapshot.risex_market
+        key = (market.venue, market.venue_symbol)
+        session_id = runtime._new_stream_session((Venue.RISEX, "*", "combined"))
+        episode = runtime._new_recovery_episode(key, session_id)
+        runtime._record_recovery_started(key, episode)
+        recovered = _stabilization002_book(
+            market.venue, market.venue_symbol, clock.now(), 60,
+            bid="98", ask="102", quantity="20",
+        )
+        lifecycle_before = lifecycle.snapshot
+        persisted_before = repository.load_runtime()
+        rows_before = _stabilization002_lifecycle_rows(repository)
+        observable_before = _stabilization002_observable_state(runtime)
+        evidence_before = repository.connection.execute(
+            "SELECT COUNT(*) FROM runtime_evidence"
+        ).fetchone()[0]
+        original_insert = repository._insert_runtime_evidence
+        notifications = []
+        runtime._notify_outage = lambda *args, **kwargs: notifications.append(
+            (args, kwargs)
+        )
+
+        def fail_terminal_evidence(*args):
+            original_insert(*args)
+            raise sqlite3.OperationalError("synthetic terminal-evidence failure")
+
+        repository._insert_runtime_evidence = fail_terminal_evidence
+        with pytest.raises(sqlite3.OperationalError):
+            await runtime._publish_recovery_snapshot(
+                key, episode, episode.attempt_generation, recovered,
+                at=clock.now(), buffered=0, replayed=0,
+                source="WS_RESUBSCRIBE_SNAPSHOT",
+            )
+        assert _stabilization002_lifecycle_rows(repository) == rows_before
+        assert repository.load_runtime() == persisted_before
+        assert lifecycle.snapshot == lifecycle_before
+        assert _stabilization002_observable_state(runtime) == observable_before
+        assert episode.terminal is None and episode.buffer == []
+        assert repository.connection.execute(
+            "SELECT COUNT(*) FROM runtime_evidence"
+        ).fetchone()[0] == evidence_before
+        assert notifications == []
+
+        repository._insert_runtime_evidence = original_insert
+        assert await runtime._publish_recovery_snapshot(
+            key, episode, episode.attempt_generation, recovered,
+            at=clock.now(), buffered=0, replayed=0,
+            source="WS_RESUBSCRIBE_SNAPSHOT",
+        )
+        assert repository.load_runtime() == lifecycle.snapshot
+        assert repository.connection.execute(
+            "SELECT COUNT(*) FROM runtime_evidence "
+            "WHERE event_type='PUBLIC_SNAPSHOT_RECOVERY_COMPLETED'"
+        ).fetchone()[0] == 1
+        assert len(notifications) == 1
+
+
+@pytest.mark.asyncio
+async def test_stabilization002_r1_readiness_failure_rolls_back_and_retries(
+    tmp_path,
+):
+    clock = FakeClock()
+    with PaperRepository(tmp_path / "stabilization002-r1-readiness-atomic.db") as repository:
+        runtime = await _stabilization002_position_runtime(repository, clock)
+        lifecycle = runtime.lifecycle
+        await lifecycle.start_gap(started_at=clock.now())
+        repository.save_decision(
+            recorded_at=clock.now(), lifecycle_snapshot=lifecycle.snapshot
+        )
+        market = lifecycle.snapshot.risex_market
+        key = (market.venue, market.venue_symbol)
+        runtime._set_component_readiness(
+            market.venue, f"book:{market.venue_symbol}", False,
+            "PUBLIC_STREAM_GAP", clock.now(),
+        )
+        session_id = runtime._new_stream_session((Venue.RISEX, "*", "combined"))
+        episode = runtime._new_recovery_episode(key, session_id)
+        runtime._record_recovery_started(key, episode)
+        recovered = _stabilization002_book(
+            market.venue, market.venue_symbol, clock.now(), 60,
+            bid="98", ask="102", quantity="20",
+        )
+        lifecycle_before = lifecycle.snapshot
+        persisted_before = repository.load_runtime()
+        rows_before = _stabilization002_lifecycle_rows(repository)
+        observable_before = _stabilization002_observable_state(runtime)
+        buffer_before = tuple(episode.buffer)
+        evidence_before = repository.connection.execute(
+            "SELECT COUNT(*) FROM runtime_evidence"
+        ).fetchone()[0]
+        readiness_before = tuple(repository.connection.execute(
+            "SELECT venue,updated_at,available,detail FROM venue_readiness "
+            "WHERE venue=?", (market.venue.value,),
+        ).fetchone())
+        notifications = []
+        runtime._notify_outage = lambda *args, **kwargs: notifications.append(
+            (args, kwargs)
+        )
+        repository.connection.execute(
+            "CREATE TRIGGER fail_recovery_readiness BEFORE UPDATE ON venue_readiness "
+            "BEGIN SELECT RAISE(FAIL, 'synthetic readiness write failure'); END"
+        )
+
+        with pytest.raises(sqlite3.IntegrityError):
+            await runtime._publish_recovery_snapshot(
+                key, episode, episode.attempt_generation, recovered,
+                at=clock.now(), buffered=0, replayed=0,
+                source="WS_RESUBSCRIBE_SNAPSHOT",
+            )
+
+        assert _stabilization002_lifecycle_rows(repository) == rows_before
+        assert repository.load_runtime() == persisted_before
+        assert lifecycle.snapshot == lifecycle_before
+        assert _stabilization002_observable_state(runtime) == observable_before
+        assert episode.terminal is None
+        assert tuple(episode.buffer) == buffer_before
+        assert repository.connection.execute(
+            "SELECT COUNT(*) FROM runtime_evidence"
+        ).fetchone()[0] == evidence_before
+        assert tuple(repository.connection.execute(
+            "SELECT venue,updated_at,available,detail FROM venue_readiness "
+            "WHERE venue=?", (market.venue.value,),
+        ).fetchone()) == readiness_before
+        assert repository._settlement_cache is None
+        assert repository._processed_key_cache is None
+        assert notifications == []
+
+        repository.connection.execute("DROP TRIGGER fail_recovery_readiness")
+        component_before_success = dict(
+            runtime.component_readiness[market.venue]
+        )
+        assert await runtime._publish_recovery_snapshot(
+            key, episode, episode.attempt_generation, recovered,
+            at=clock.now(), buffered=0, replayed=0,
+            source="WS_RESUBSCRIBE_SNAPSHOT",
+        )
+        persisted_readiness = repository.connection.execute(
+            "SELECT updated_at,available,detail FROM venue_readiness WHERE venue=?",
+            (market.venue.value,),
+        ).fetchone()
+        live_readiness = runtime.readiness[market.venue]
+        changed_components = {
+            f"book:{market.venue_symbol}",
+            f"connection_book:{market.venue_symbol}",
+        }
+        assert {
+            name: row for name, row in runtime.component_readiness[market.venue].items()
+            if name not in changed_components
+        } == {
+            name: row for name, row in component_before_success.items()
+            if name not in changed_components
+        }
+        for name in changed_components:
+            row = runtime.component_readiness[market.venue][name]
+            assert (row.available, row.detail, row.updated_at) == (
+                True, "PUBLIC_STREAM_RECOVERED", clock.now()
+            )
+        assert persisted_readiness[0] == live_readiness.updated_at.isoformat()
+        assert bool(persisted_readiness[1]) is live_readiness.available is True
+        assert persisted_readiness[2] == live_readiness.detail == "PUBLIC_STREAM_RECOVERED"
+        assert repository.connection.execute(
+            "SELECT COUNT(*) FROM runtime_evidence "
+            "WHERE event_type='PUBLIC_SNAPSHOT_RECOVERY_COMPLETED'"
+        ).fetchone()[0] == 1
+        assert len(notifications) == 1
+
+
+@pytest.mark.asyncio
+async def test_stabilization002_r9_periodic_candidate_cannot_regress_later_gap(
+    tmp_path,
+):
+    clock = FakeClock()
+    with PaperRepository(tmp_path / "stabilization002-r9-frontier.db") as repository:
+        runtime = await _stabilization002_position_runtime(repository, clock)
+        runtime.next_health_check_at = NOW + timedelta(hours=1)
+        runtime.next_full_scan_at = NOW + timedelta(hours=1)
+        runtime.last_scan = SimpleNamespace(logical_at=NOW)
+        runtime.next_position_monitor_at = NOW
+        lifecycle = runtime.lifecycle
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        notifications = []
+        runtime._notify_lifecycle_transition = lambda *args: notifications.append(args)
+        original_evaluate = LifecycleEngine.evaluate
+
+        async def gated_candidate(engine, **kwargs):
+            if engine is not lifecycle:
+                entered.set()
+                await release.wait()
+            return await original_evaluate(engine, **kwargs)
+
+        LifecycleEngine.evaluate = gated_candidate
+        tick = asyncio.create_task(runtime.tick(NOW))
+        try:
+            await entered.wait()
+            later = NOW + timedelta(seconds=5)
+            clock.value = later
+            await lifecycle.start_gap(started_at=later)
+            repository.save_decision(
+                recorded_at=later, lifecycle_snapshot=lifecycle.snapshot
+            )
+            authoritative = lifecycle.snapshot
+            checkpoint_at = repository.runtime_updated_at()
+            release.set()
+            await tick
+        finally:
+            release.set()
+            LifecycleEngine.evaluate = original_evaluate
+        assert runtime.lifecycle is lifecycle
+        assert lifecycle.snapshot == authoritative
+        assert lifecycle.snapshot.gap_open
+        assert repository.load_runtime() == authoritative
+        assert repository.runtime_updated_at() == checkpoint_at == later
+        assert notifications == []
+
+
+@pytest.mark.asyncio
+async def test_stabilization002_r11_stale_exit_trade_is_wholly_inert(tmp_path):
+    clock = FakeClock()
+    with PaperRepository(tmp_path / "stabilization002-r11-stale-exit.db") as repository:
+        runtime = await _stabilization002_position_runtime(repository, clock)
+        lifecycle = runtime.lifecycle
+        before = lifecycle.snapshot
+        v1 = before.exit_order.active_version
+        runtime.mark_trade_stream_connected(
+            before.exit_order.venue, before.exit_order.canonical_market, at=NOW
+        )
+        stream = runtime.coordinator.stream(
+            before.exit_order.venue, before.exit_order.canonical_market
+        )
+        trade = TradeEvidence(
+            "stabilization002-r11-v1", before.exit_order.venue,
+            before.exit_order.canonical_market, NOW, NOW, "r11-v1",
+            before.exit_order.canonical_quantity,
+            v1.limit_price + before.hedge_market.tick_size_raw,
+            Side.BUY, True,
+        )
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        original_process = lifecycle.process_exit_trade
+
+        async def gated_process(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            return await original_process(*args, **kwargs)
+
+        lifecycle.process_exit_trade = gated_process
+        delivery = asyncio.create_task(runtime.deliver_trade(
+            trade, observed_version_id=v1.version_id, processed_at=NOW
+        ))
+        await entered.wait()
+        later = NOW + timedelta(seconds=20)
+        clock.value = later
+        risex = runtime._observation(
+            before.risex_market.venue, before.risex_market.venue_symbol, later
+        )
+        hedge = runtime._observation(
+            before.hedge_market.venue, before.hedge_market.venue_symbol, later
+        )
+        await lifecycle.evaluate(
+            evaluated_at=later,
+            risex_observation=replace(
+                risex, book=replace(risex.book, observed_at=later)
+            ),
+            hedge_observation=replace(hedge, book=replace(
+                hedge.book,
+                bids=(BookLevel(D("89"), D("10")),),
+                asks=(BookLevel(D("91"), D("10")),),
+                observed_at=later,
+            )),
+        )
+        assert lifecycle.snapshot.exit_order.active_version.version_id != v1.version_id
+        repository.save_decision(
+            recorded_at=later, lifecycle_snapshot=lifecycle.snapshot
+        )
+        authoritative = lifecycle.snapshot
+        rows_before_release = _stabilization002_lifecycle_rows(repository)
+        confirmation_before = stream.health(clock.now()).last_connection_confirmation_at
+        release.set()
+        await delivery
+        assert lifecycle.snapshot == authoritative
+        assert trade.trade_event_key not in lifecycle.snapshot.processed_trade_keys
+        assert _stabilization002_lifecycle_rows(repository) == rows_before_release
+        assert stream.health(clock.now()).last_connection_confirmation_at == confirmation_before
+        current = lifecycle.snapshot.exit_order.active_version
+        runtime.mark_trade_stream_connected(
+            lifecycle.snapshot.exit_order.venue,
+            lifecycle.snapshot.exit_order.canonical_market,
+            at=later,
+        )
+        await runtime.deliver_trade(
+            replace(
+                trade,
+                exchange_timestamp=later,
+                received_at=later,
+                canonical_price=current.limit_price
+                + lifecycle.snapshot.hedge_market.tick_size_raw,
+            ),
+            observed_version_id=current.version_id,
+            processed_at=later,
+        )
+        assert trade.trade_event_key in repository._processed_key_cache
+        assert repository.connection.execute(
+            "SELECT COUNT(*) FROM processed_trade_events WHERE trade_event_key=?",
+            (trade.trade_event_key,),
+        ).fetchone()[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_stabilization002_r12_ws_trade_keeps_receipt_version(tmp_path):
+    clock = FakeClock()
+    with PaperRepository(tmp_path / "stabilization002-r12-receipt-version.db") as repository:
+        runtime = await _stabilization002_position_runtime(repository, clock)
+        lifecycle = runtime.lifecycle
+        before = lifecycle.snapshot
+        v1 = before.exit_order.active_version
+        runtime.mark_trade_stream_connected(
+            before.exit_order.venue, before.exit_order.canonical_market, at=NOW
+        )
+        trade = TradeEvidence(
+            "stabilization002-r12-v1", before.exit_order.venue,
+            before.exit_order.canonical_market, NOW, NOW, "r12-v1",
+            before.exit_order.canonical_quantity,
+            v1.limit_price + before.hedge_market.tick_size_raw,
+            Side.BUY, True,
+        )
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        captured_versions = []
+        original_process = lifecycle.process_exit_trade
+
+        async def gated_process(*args, **kwargs):
+            captured_versions.append(kwargs["observed_version_id"])
+            entered.set()
+            await release.wait()
+            return await original_process(*args, **kwargs)
+
+        lifecycle.process_exit_trade = gated_process
+        delivery = asyncio.create_task(runtime.deliver_trade(trade))
+        await entered.wait()
+        later = NOW + timedelta(seconds=20)
+        clock.value = later
+        risex = runtime._observation(
+            before.risex_market.venue, before.risex_market.venue_symbol, later
+        )
+        hedge = runtime._observation(
+            before.hedge_market.venue, before.hedge_market.venue_symbol, later
+        )
+        await lifecycle.evaluate(
+            evaluated_at=later,
+            risex_observation=replace(
+                risex, book=replace(risex.book, observed_at=later)
+            ),
+            hedge_observation=replace(hedge, book=replace(
+                hedge.book,
+                bids=(BookLevel(D("89"), D("10")),),
+                asks=(BookLevel(D("91"), D("10")),),
+                observed_at=later,
+            )),
+        )
+        v2 = lifecycle.snapshot.exit_order.active_version
+        assert v2.version_id != v1.version_id
+        repository.save_decision(
+            recorded_at=later, lifecycle_snapshot=lifecycle.snapshot
+        )
+        release.set()
+        await delivery
+        assert captured_versions == [v1.version_id]
+        assert lifecycle.snapshot.exit_order.active_version.version_id == v2.version_id
+        assert trade.trade_event_key not in lifecycle.snapshot.processed_trade_keys
+        assert repository.connection.execute(
+            "SELECT COUNT(*) FROM processed_trade_events WHERE trade_event_key=?",
+            (trade.trade_event_key,),
+        ).fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_stabilization002_r13_obsolete_combined_trade_is_fully_inert(
+    tmp_path,
+):
+    clock = FakeClock()
+    with PaperRepository(tmp_path / "stabilization002-r13-combined-trade.db") as repository:
+        runtime, adapter = await _stabilization002_nado_entry_runtime(
+            repository, clock
+        )
+        order = runtime.broker.state.order
+        adapter.trade = maker_trade(runtime, clock.now(), "r13-obsolete-trade")
+        entered = asyncio.Event()
+        blocked = asyncio.Event()
+
+        async def gated_recompute(*_args, **_kwargs):
+            entered.set()
+            await blocked.wait()
+
+        runtime._recompute_funding = gated_recompute
+        stop = asyncio.Event()
+        runtime._session = Stabilization002ReplacementSession(
+            Stabilization002MessageSocket({"channel": "trade"}), stop
+        )
+        runtime._stop_event = stop
+        stream_key = (Venue.NADO, "*", "combined")
+        old_session = runtime._new_stream_session(stream_key)
+        old_task = asyncio.create_task(runtime._combined_stream(
+            Venue.NADO, adapter, (order.canonical_market,), old_session
+        ))
+        await entered.wait()
+        broker_before = runtime.broker.state
+        lifecycle_before = runtime.lifecycle
+        fills_before = repository.connection.execute(
+            "SELECT COUNT(*) FROM fills"
+        ).fetchone()[0]
+        receipts_before = repository.connection.execute(
+            "SELECT COUNT(*) FROM processed_trade_events"
+        ).fetchone()[0]
+        await _stabilization002_cancel_combined_for_real_replacement(
+            runtime, Venue.NADO, adapter, old_task
+        )
+        observable_after_replacement = _stabilization002_observable_state(runtime)
+        evidence_after_replacement = tuple(repository.connection.execute(
+            "SELECT event_type,detail FROM runtime_evidence ORDER BY evidence_id"
+        ).fetchall())
+        await asyncio.sleep(0)
+        assert runtime._stream_sessions[stream_key] != old_session
+        assert runtime.broker.state == broker_before
+        assert runtime.lifecycle is lifecycle_before
+        assert repository.connection.execute(
+            "SELECT COUNT(*) FROM fills"
+        ).fetchone()[0] == fills_before
+        assert repository.connection.execute(
+            "SELECT COUNT(*) FROM processed_trade_events"
+        ).fetchone()[0] == receipts_before
+        assert _stabilization002_observable_state(runtime) == observable_after_replacement
+        assert tuple(repository.connection.execute(
+            "SELECT event_type,detail FROM runtime_evidence ORDER BY evidence_id"
+        ).fetchall()) == evidence_after_replacement
+
+
+@pytest.mark.asyncio
+async def test_stabilization002_r14_shutdown_awaits_displaced_recovery(
+    tmp_path,
+):
+    clock = FakeClock()
+    with PaperRepository(tmp_path / "stabilization002-r14-shutdown.db") as repository:
+        runtime = await _stabilization002_position_runtime(repository, clock)
+        runtime._stop_event = asyncio.Event()
+        session_id = runtime._new_stream_session((Venue.NADO, "*", "combined"))
+        episode = runtime._new_recovery_episode(
+            (Venue.NADO, "R14-NADO"), session_id
+        )
+        started = asyncio.Event()
+        first_cancel = asyncio.Event()
+        never = asyncio.Event()
+
+        async def displaced_owner():
+            started.set()
+            try:
+                await never.wait()
+            except asyncio.CancelledError:
+                first_cancel.set()
+                await never.wait()
+
+        task = asyncio.create_task(displaced_owner())
+        episode.task = task
+        await started.wait()
+        runtime._retire_recovery_task(task)
+        episode.task = None
+        await first_cancel.wait()
+        assert task in runtime._retired_recovery_tasks
+        runtime._request_stop("SIGINT")
+        started_at = time.monotonic()
+        await asyncio.wait_for(runtime.shutdown(), timeout=2)
+        elapsed = time.monotonic() - started_at
+        evidence_before = tuple(repository.connection.execute(
+            "SELECT event_type,detail FROM runtime_evidence ORDER BY evidence_id"
+        ).fetchall())
+        changes_before = repository.connection.total_changes
+        await asyncio.sleep(0)
+        assert task.done()
+        assert not runtime._retired_recovery_tasks
+        assert elapsed < 2
+        assert evidence_before[-1]["event_type"] == "STOPPED_SAFE"
+        assert json.loads(evidence_before[-1]["detail"])["forced_close"] is False
+        assert repository.connection.total_changes == changes_before
+        assert tuple(repository.connection.execute(
+            "SELECT event_type,detail FROM runtime_evidence ORDER BY evidence_id"
+        ).fetchall()) == evidence_before
+
+
+@pytest.mark.asyncio
+async def test_stabilization002_r15_two_extended_recovery_cycles_are_distinct(
+    tmp_path,
+):
+    clock = FakeClock()
+    adapter = ExtendedAdapter(None)
+    symbol = "ABC-EXTENDED"
+    key = (Venue.EXTENDED, symbol)
+    stream_key = (Venue.EXTENDED, symbol, "book")
+
+    def ws_snapshot(sequence, price):
+        return adapter.normalize_book_message({
+            "type": "SNAPSHOT", "seq": sequence,
+            "ts": str(int(clock.now().timestamp() * 1000)),
+            "data": {
+                "m": symbol,
+                "b": [{"p": str(price), "q": "20"}],
+                "a": [{"p": str(price + 1), "q": "20"}],
+            },
+        })
+
+    with PaperRepository(tmp_path / "stabilization002-r15-extended.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={Venue.EXTENDED: CombinedFakeAdapter(
+                Venue.EXTENDED, clock, settlement_at=NOW
+            )}, clock=clock,
+        )
+        runtime._stop_event = asyncio.Event()
+        startup_one = runtime._new_stream_session(stream_key)
+        assert not await runtime.apply_book_event(
+            BookDelta(*key, (), (), clock.now(), 3, None),
+            stream_session_id=startup_one,
+        )
+        first = runtime._recoveries[key]
+        if first.task is not None:
+            await first.task
+        assert first.terminal is None
+        assert await runtime.apply_book_event(
+            ws_snapshot(10, 100),
+            stream_session_id=first.owned_stream_session_id,
+        )
+        assert first.terminal == "COMPLETE"
+
+        startup_two = runtime._new_stream_session(stream_key)
+        assert startup_two != startup_one
+        assert not await runtime.apply_book_event(
+            BookDelta(*key, (), (), clock.now(), 99, None),
+            stream_session_id=startup_two,
+        )
+        second = runtime._recoveries[key]
+        if second.task is not None:
+            await second.task
+        assert second.terminal is None
+        assert second is not first
+        assert second.episode_id != first.episode_id
+        assert second.attempt_generation != first.attempt_generation
+        assert second.owned_stream_session_id != first.owned_stream_session_id
+        assert await runtime.apply_book_event(
+            ws_snapshot(20, 200),
+            stream_session_id=second.owned_stream_session_id,
+        )
+        assert second.terminal == "COMPLETE"
+        events = _stabilization002_recovery_events(repository)
+        assert [event for event, _ in events] == [
+            "PUBLIC_SNAPSHOT_RECOVERY_STARTED",
+            "PUBLIC_SNAPSHOT_RECOVERY_COMPLETED",
+            "PUBLIC_SNAPSHOT_RECOVERY_STARTED",
+            "PUBLIC_SNAPSHOT_RECOVERY_COMPLETED",
+        ]
+        assert [detail["episode_id"] for _, detail in events] == [
+            first.episode_id.value,
+            first.episode_id.value,
+            second.episode_id.value,
+            second.episode_id.value,
+        ]
+
+
+@pytest.mark.asyncio
+async def test_stabilization002_periodic_evaluate_repository_failure_is_atomic(
+    tmp_path,
+):
+    clock = FakeClock()
+    with PaperRepository(tmp_path / "stabilization002-tick-atomic.db") as repository:
+        runtime = await _stabilization002_position_runtime(repository, clock)
+        runtime.next_health_check_at = NOW + timedelta(hours=1)
+        runtime.next_full_scan_at = NOW + timedelta(hours=1)
+        runtime.last_scan = SimpleNamespace(logical_at=NOW)
+        runtime.next_position_monitor_at = NOW
+        before = runtime.lifecycle.snapshot
+        persisted_before = repository.load_runtime()
+        scheduler_before = runtime.next_position_monitor_at
+        observable_before = _stabilization002_observable_state(runtime)
+        evidence_before = repository.connection.execute(
+            "SELECT COUNT(*) FROM runtime_evidence"
+        ).fetchone()[0]
+        notifications = []
+        runtime._notify_lifecycle_transition = lambda *args: notifications.append(args)
+        _stabilization002_fail_save(repository)
+        with pytest.raises(sqlite3.OperationalError):
+            await runtime.tick(NOW)
+        assert runtime.lifecycle.snapshot == before
+        assert repository.load_runtime() == persisted_before
+        assert notifications == []
+        assert runtime.next_position_monitor_at == scheduler_before
+        assert _stabilization002_observable_state(runtime) == observable_before
+        assert repository.connection.execute(
+            "SELECT COUNT(*) FROM runtime_evidence"
+        ).fetchone()[0] == evidence_before
+
+
+@pytest.mark.asyncio
+async def test_stabilization002_periodic_evaluate_post_write_failure_and_retry(
+    tmp_path,
+):
+    clock = FakeClock()
+    with PaperRepository(tmp_path / "stabilization002-post-write.db") as repository:
+        runtime = await _stabilization002_position_runtime(repository, clock)
+        runtime.next_health_check_at = NOW + timedelta(hours=1)
+        runtime.next_full_scan_at = NOW + timedelta(hours=1)
+        runtime.last_scan = SimpleNamespace(logical_at=NOW)
+        runtime.next_position_monitor_at = NOW
+        before = runtime.lifecycle.snapshot
+        scheduler_before = runtime.next_position_monitor_at
+        rows_before = _stabilization002_lifecycle_rows(repository)
+        notifications = []
+        runtime._notify_lifecycle_transition = lambda *args: notifications.append(args)
+        original_save_lifecycle = repository._save_lifecycle
+
+        def fail_after_candidate_rows(candidate, at):
+            original_save_lifecycle(candidate, at)
+            raise sqlite3.OperationalError("synthetic post-write commit failure")
+
+        repository._save_lifecycle = fail_after_candidate_rows
+        try:
+            with pytest.raises(sqlite3.OperationalError):
+                await runtime.tick(NOW)
+        finally:
+            repository._save_lifecycle = original_save_lifecycle
+
+        assert _stabilization002_lifecycle_rows(repository) == rows_before
+        assert repository.load_runtime() == before
+        assert repository._settlement_cache is None
+        assert repository._processed_key_cache is None
+        live_after_failure = runtime.lifecycle.snapshot
+        assert live_after_failure == before, {
+            "sample_counts": (
+                len(before.samples), len(live_after_failure.samples)
+            ),
+            "exit_version_counts": (
+                len(before.exit_order.versions),
+                len(live_after_failure.exit_order.versions),
+            ),
+        }
+        assert runtime.next_position_monitor_at == scheduler_before
+        assert notifications == []
+
+        await runtime.tick(NOW)
+
+        assert runtime.lifecycle is not None
+        after = runtime.lifecycle.snapshot
+        assert after == repository.load_runtime()
+        assert len(after.samples) == len(before.samples) + 1
+        assert len(notifications) == 1
+        rows_after = _stabilization002_lifecycle_rows(repository)
+        assert len(rows_after["runtime_state"]) == 1
+        assert len(rows_after["position_samples"]) == len(
+            rows_before["position_samples"]
+        ) + 1
+        assert len(rows_after["fills"]) == len(rows_before["fills"])
+        for table, primary_key_columns in {
+            "orders": (0,),
+            "order_versions": (0,),
+            "position_samples": (0, 1),
+            "gaps": (0, 1),
+            "lifecycle_events": (0, 1),
+            "completed_trades": (0,),
+            "fills": (0,),
+        }.items():
+            keys = tuple(
+                tuple(row[index] for index in primary_key_columns)
+                for row in rows_after[table]
+            )
+            assert len(keys) == len(set(keys))
+
+
+@pytest.mark.asyncio
+async def test_stabilization002_relevant_book_repository_failure_is_atomic(
+    tmp_path,
+):
+    clock = FakeClock()
+    with PaperRepository(tmp_path / "stabilization002-book-atomic.db") as repository:
+        runtime = await _stabilization002_position_runtime(repository, clock)
+        snapshot = runtime.lifecycle.snapshot
+        direction = snapshot.position.direction
+        if direction.value == "LONG_RISEX_SHORT_HEDGE":
+            prices = (("90", "92"), ("108", "110"))
+        else:
+            prices = (("108", "110"), ("90", "92"))
+        for market, (bid, ask) in zip(
+            (snapshot.risex_market, snapshot.hedge_market), prices
+        ):
+            runtime.coordinator.stream(market.venue, market.venue_symbol).snapshot(
+                _stabilization002_book(
+                    market.venue, market.venue_symbol, clock.now(), 50,
+                    bid=bid, ask=ask, quantity="100",
+                )
+            )
+        before = runtime.lifecycle.snapshot
+        persisted_before = repository.load_runtime()
+        scheduler_before = runtime.next_position_monitor_at
+        observable_before = _stabilization002_observable_state(runtime)
+        evidence_before = repository.connection.execute(
+            "SELECT COUNT(*) FROM runtime_evidence"
+        ).fetchone()[0]
+        notifications = []
+        runtime._notify_lifecycle_transition = lambda *args: notifications.append(args)
+        _stabilization002_fail_save(repository)
+        key = (snapshot.risex_market.venue, snapshot.risex_market.venue_symbol)
+        with pytest.raises(sqlite3.OperationalError):
+            await runtime._evaluate_relevant_book_event(key, NOW)
+        assert runtime.lifecycle is not None
+        assert runtime.lifecycle.snapshot == before
+        assert repository.load_runtime() == persisted_before
+        assert notifications == []
+        assert runtime.next_position_monitor_at == scheduler_before
+        assert _stabilization002_observable_state(runtime) == observable_before
+        assert repository.connection.execute(
+            "SELECT COUNT(*) FROM runtime_evidence"
+        ).fetchone()[0] == evidence_before
+
+
+@pytest.mark.asyncio
+async def test_stabilization002_disconnect_gap_repository_failure_is_atomic(
+    tmp_path,
+):
+    clock = FakeClock()
+    with PaperRepository(tmp_path / "stabilization002-gap-atomic.db") as repository:
+        runtime = await _stabilization002_position_runtime(repository, clock)
+        snapshot = runtime.lifecycle.snapshot
+        market = snapshot.risex_market
+        assert not snapshot.gap_open
+        disconnect_kwargs = {
+            "stream_session_id": runtime._new_stream_session(
+                (Venue.RISEX, "*", "combined")
+            )
+        }
+        clock.advance(11)
+        before = runtime.lifecycle.snapshot
+        persisted_before = repository.load_runtime()
+        scheduler_before = runtime.next_position_monitor_at
+        target_components = {
+            f"{name}:{market.venue_symbol}"
+            for name in ("book", "trade", "funding", "connection_combined")
+        }
+        other_components_before = tuple(sorted(
+            (venue.value, component, row.available, row.detail, row.updated_at)
+            for venue, components in runtime.component_readiness.items()
+            for component, row in components.items()
+            if not (venue is market.venue and component in target_components)
+        ))
+        stream = runtime.coordinator.stream(market.venue, market.venue_symbol)
+        book_before = stream.book()
+        health_before = stream.health(clock.now())
+        assert health_before.stream_connected
+        evidence_id_before = repository.connection.execute(
+            "SELECT COALESCE(MAX(evidence_id), 0) FROM runtime_evidence"
+        ).fetchone()[0]
+        notifications = []
+        runtime._notify_lifecycle_transition = lambda *args: notifications.append(args)
+        original_save_decision = repository.save_decision
+        _stabilization002_fail_save(repository)
+        try:
+            with pytest.raises(sqlite3.OperationalError):
+                await runtime.mark_disconnected(
+                    market.venue, market.venue_symbol, stream_kind="combined",
+                    **disconnect_kwargs,
+                )
+        finally:
+            repository.save_decision = original_save_decision
+        assert runtime.lifecycle.snapshot == before
+        assert repository.load_runtime() == persisted_before
+        assert notifications == []
+        assert runtime.next_position_monitor_at == scheduler_before
+        assert tuple(sorted(
+            (venue.value, component, row.available, row.detail, row.updated_at)
+            for venue, components in runtime.component_readiness.items()
+            for component, row in components.items()
+            if not (venue is market.venue and component in target_components)
+        )) == other_components_before
+        for component in target_components:
+            row = runtime.component_readiness[market.venue][component]
+            assert not row.available
+            assert row.detail.startswith("PUBLIC_STREAM_DISCONNECTED:combined:")
+        assert not runtime.readiness[market.venue].available
+        assert (market.venue, market.venue_symbol) not in runtime._trade_stream_ready
+        assert (market.venue, market.venue_symbol) not in runtime._live_book_ready
+        assert book_before is not None
+        assert stream.book() is None
+        disconnected_health = stream.health(clock.now())
+        assert not disconnected_health.stream_connected
+        assert not disconnected_health.book_initialized
+        assert not disconnected_health.book_sequence_valid
+        assert disconnected_health.data_quality is DataQuality.DEGRADED
+        evidence_after = repository.connection.execute(
+            "SELECT event_type, detail FROM runtime_evidence "
+            "WHERE evidence_id>? ORDER BY evidence_id",
+            (evidence_id_before,),
+        ).fetchall()
+        assert [row["event_type"] for row in evidence_after] == [
+            "VENUE_READINESS"
+        ]
+        assert json.loads(evidence_after[0]["detail"])["available"] is False
+
+        await runtime.mark_disconnected(
+            market.venue, market.venue_symbol, stream_kind="combined",
+            **disconnect_kwargs,
+        )
+        assert runtime.lifecycle is not None
+        committed = runtime.lifecycle.snapshot
+        assert committed.gap_open
+        assert len(committed.gaps) == len(before.gaps) + 1
+        assert len(committed.events) == len(before.events) + 1
+        assert repository.load_runtime() == committed
+        assert notifications == []
+
+
+class Stabilization002QueuedNadoAdapter(CombinedFakeAdapter):
+    def __init__(self, clock: FakeClock, *, settlement_at: datetime) -> None:
+        super().__init__(Venue.NADO, clock, settlement_at=settlement_at)
+        self.trade = None
+        self.quote = None
+
+    def symbol_for_product(self, _product: int) -> str:
+        return self.market.venue_symbol
+
+    def normalize_trade(self, _payload, **_kwargs):
+        assert self.trade is not None
+        return self.trade
+
+    def normalize_funding_rate_message(self, _payload, _market, **_kwargs):
+        assert self.quote is not None
+        return self.quote
+
+
+class Stabilization002MessageSocket:
+    def __init__(self, payload) -> None:
+        self.payload = payload
+        self.sent = []
+        self.delivered = False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        return None
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self.delivered:
+            await asyncio.Event().wait()
+        self.delivered = True
+        return SimpleNamespace(
+            type=aiohttp.WSMsgType.TEXT, data=json.dumps(self.payload)
+        )
+
+    async def send_json(self, payload) -> None:
+        self.sent.append(payload)
+
+
+class Stabilization002ReplacementSession:
+    def __init__(self, first_socket, stop: asyncio.Event) -> None:
+        self.first_socket = first_socket
+        self.stop = stop
+        self.connections = 0
+
+    def ws_connect(self, *_args, **_kwargs):
+        self.connections += 1
+        if self.connections == 1:
+            return self.first_socket
+        return ClosingWebSocket(self.stop, stop_on_iteration=True)
+
+
+async def _stabilization002_nado_entry_runtime(
+    repository: PaperRepository, clock: FakeClock
+):
+    fakes = adapters(clock, settlement_at=NOW + timedelta(minutes=2))
+    fakes[Venue.EXTENDED].available = False
+    nado = Stabilization002QueuedNadoAdapter(
+        clock, settlement_at=NOW + timedelta(minutes=2)
+    )
+    fakes[Venue.NADO] = nado
+    runtime = PublicPaperRuntime(repository, adapters=fakes, clock=clock)
+    await activate_with_live_streams(runtime, clock)
+    assert runtime.broker is not None
+    assert runtime.broker.state.order.venue is Venue.NADO
+    return runtime, nado
+
+
+async def _stabilization002_cancel_combined_for_real_replacement(
+    runtime: PublicPaperRuntime,
+    venue: Venue,
+    adapter: PublicAdapter,
+    old_task: asyncio.Task,
+) -> None:
+    key = (venue, "*", "combined")
+    runtime._stream_tasks[key] = old_task
+    runtime._combined_symbols[venue] = (f"OBSOLETE-{venue.value}",)
+    runtime.adapters = {venue: adapter}
+    await runtime._reconcile_combined_streams()
+    replacement = runtime._stream_tasks.get(key)
+    assert old_task.cancelled()
+    if replacement is not None:
+        replacement.cancel()
+        await asyncio.gather(replacement, return_exceptions=True)
+        runtime._stream_tasks.pop(key, None)
+
+
+@pytest.mark.asyncio
+async def test_stabilization002_queued_nado_trade_is_cancelled_on_real_replacement(
+    tmp_path,
+):
+    clock = FakeClock()
+    with PaperRepository(tmp_path / "stabilization002-queued-trade.db") as repository:
+        runtime, adapter = await _stabilization002_nado_entry_runtime(
+            repository, clock
+        )
+        order = runtime.broker.state.order
+        adapter.trade = maker_trade(runtime, clock.now(), "obsolete-combined-trade")
+        entered_commit = asyncio.Event()
+        never_release = asyncio.Event()
+
+        async def gated_recompute(*_args, **_kwargs):
+            entered_commit.set()
+            await never_release.wait()
+
+        runtime._recompute_funding = gated_recompute
+        stop = asyncio.Event()
+        socket = Stabilization002MessageSocket({"channel": "trade"})
+        runtime._session = Stabilization002ReplacementSession(socket, stop)
+        runtime._stop_event = stop
+        key = (Venue.NADO, "*", "combined")
+        old_session = runtime._new_stream_session(key)
+        old_task = asyncio.create_task(runtime._combined_stream(
+            Venue.NADO, adapter, (order.canonical_market,), old_session
+        ))
+        await entered_commit.wait()
+        state_before_replacement = runtime.broker.state
+        fills_before = repository.connection.execute(
+            "SELECT COUNT(*) FROM fills"
+        ).fetchone()[0]
+        receipts_before = repository.connection.execute(
+            "SELECT COUNT(*) FROM processed_trade_events"
+        ).fetchone()[0]
+
+        await _stabilization002_cancel_combined_for_real_replacement(
+            runtime, Venue.NADO, adapter, old_task
+        )
+
+        assert runtime.broker.state == state_before_replacement
+        assert repository.connection.execute(
+            "SELECT COUNT(*) FROM fills"
+        ).fetchone()[0] == fills_before
+        assert repository.connection.execute(
+            "SELECT COUNT(*) FROM processed_trade_events"
+        ).fetchone()[0] == receipts_before
+
+
+@pytest.mark.asyncio
+async def test_stabilization002_queued_nado_funding_is_cancelled_on_real_replacement(
+    tmp_path,
+):
+    clock = FakeClock()
+    with PaperRepository(tmp_path / "stabilization002-queued-funding.db") as repository:
+        runtime, adapter = await _stabilization002_nado_entry_runtime(
+            repository, clock
+        )
+        await runtime.deliver_trade(
+            maker_trade(runtime, clock.now(), "open-nado-position")
+        )
+        assert runtime.lifecycle is not None
+        assert runtime.broker is None
+        snapshot = runtime.lifecycle.snapshot
+        settlement = next(
+            row for row in snapshot.settlements if row.venue is Venue.NADO
+        )
+        adapter.quote = FundingCashQuote(
+            Venue.NADO, settlement.canonical_market, clock.now(),
+            snapshot.position.position_opened_at, settlement.settlement_at,
+            FundingQuality.APPLIED_RATE,
+            FundingAccrualMethod.SNAPSHOT_AT_SETTLEMENT, True,
+            D("1"), D("-1"), "official-shaped",
+        )
+        observation_before = runtime.observations[
+            Venue.NADO, settlement.canonical_market
+        ]
+        settlement_before = settlement
+        notifications = []
+        runtime._notify_event = lambda *args: notifications.append(args)
+
+        class GatedFundingSocket(Stabilization002MessageSocket):
+            def __init__(self, payload) -> None:
+                super().__init__(payload)
+                self.waiting_for_release = asyncio.Event()
+                self.release_delivery = asyncio.Event()
+                self.dispatch_boundary = asyncio.Event()
+
+            async def __anext__(self):
+                if self.delivered:
+                    await asyncio.Event().wait()
+                self.waiting_for_release.set()
+                await self.release_delivery.wait()
+                self.delivered = True
+                asyncio.get_running_loop().call_soon(
+                    self.dispatch_boundary.set
+                )
+                return SimpleNamespace(
+                    type=aiohttp.WSMsgType.TEXT,
+                    data=json.dumps(self.payload),
+                )
+
+        stop = asyncio.Event()
+        socket = GatedFundingSocket({
+            "channel": "funding_rate", "product_id": 1,
+        })
+        runtime._session = Stabilization002ReplacementSession(socket, stop)
+        runtime._stop_event = stop
+        key = (Venue.NADO, "*", "combined")
+        old_session = runtime._new_stream_session(key)
+        old_task = asyncio.create_task(runtime._combined_stream(
+            Venue.NADO, adapter, (settlement.canonical_market,), old_session
+        ))
+        await socket.waiting_for_release.wait()
+        await runtime._position_event_lock.acquire()
+        socket.release_delivery.set()
+        await socket.dispatch_boundary.wait()
+        observable_at_commit_gate = _stabilization002_observable_state(runtime)
+        funding_at_commit_gate = runtime.observations[
+            Venue.NADO, settlement.canonical_market
+        ].funding
+        evidence_id_at_commit_gate = repository.connection.execute(
+            "SELECT COALESCE(MAX(evidence_id), 0) FROM runtime_evidence"
+        ).fetchone()[0]
+        notifications_at_commit_gate = tuple(notifications)
+        try:
+            await _stabilization002_cancel_combined_for_real_replacement(
+                runtime, Venue.NADO, adapter, old_task
+            )
+        finally:
+            runtime._position_event_lock.release()
+
+        current = next(
+            row for row in runtime.lifecycle.snapshot.settlements
+            if row.key == settlement_before.key
+        )
+        assert current == settlement_before
+        assert repository.load_runtime() == snapshot
+        assert runtime.observations[
+            Venue.NADO, settlement.canonical_market
+        ].funding == observation_before.funding
+        assert funding_at_commit_gate == observation_before.funding
+        observable_after = _stabilization002_observable_state(runtime)
+        assert observable_after[0] == observable_at_commit_gate[0]
+        assert observable_after[2:] == observable_at_commit_gate[2:]
+        evidence_after_gate = repository.connection.execute(
+            "SELECT event_type FROM runtime_evidence WHERE evidence_id>? "
+            "ORDER BY evidence_id",
+            (evidence_id_at_commit_gate,),
+        ).fetchall()
+        assert [row["event_type"] for row in evidence_after_gate] == [
+            "PUBLIC_STREAM_RECONCILED"
+        ]
+        assert tuple(notifications) == notifications_at_commit_gate
+        assert notifications == []
+
+
+@pytest.mark.asyncio
+async def test_stabilization002_queued_risex_trade_dispatch_is_cancelled_on_replacement(
+    tmp_path,
+):
+    clock = FakeClock()
+    with PaperRepository(tmp_path / "stabilization002-queued-risex.db") as repository:
+        runtime = await _stabilization002_position_runtime(repository, clock)
+        symbol = runtime.lifecycle.snapshot.risex_market.venue_symbol
+        adapter = Stabilization002RisexAdapter(clock, symbol)
+        delivered = []
+        entered_dispatch = asyncio.Event()
+
+        async def gated_delivery(trade):
+            entered_dispatch.set()
+            await asyncio.Event().wait()
+            delivered.append(trade)
+
+        adapter.normalize_trade = lambda *_args, **_kwargs: TradeEvidence(
+            "obsolete-risex-trade", Venue.RISEX, symbol,
+            clock.now(), clock.now(), 1, D("1"), D("100"), Side.SELL, True,
+        )
+        runtime.deliver_trade = gated_delivery
+        stop = asyncio.Event()
+        socket = Stabilization002MessageSocket({
+            "channel": "trades", "type": "update",
+        })
+        runtime._session = Stabilization002ReplacementSession(socket, stop)
+        runtime._stop_event = stop
+        key = (Venue.RISEX, "*", "combined")
+        old_session = runtime._new_stream_session(key)
+        old_task = asyncio.create_task(runtime._combined_stream(
+            Venue.RISEX, adapter, (symbol,), old_session
+        ))
+        await entered_dispatch.wait()
+        await _stabilization002_cancel_combined_for_real_replacement(
+            runtime, Venue.RISEX, adapter, old_task
+        )
+        assert old_task.cancelled()
+        assert delivered == []
+        assert repository.connection.execute(
+            "SELECT COUNT(*) FROM processed_trade_events "
+            "WHERE trade_event_key='obsolete-risex-trade'"
+        ).fetchone()[0] == 0

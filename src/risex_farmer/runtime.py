@@ -19,7 +19,7 @@ from .exchanges.extended import ExtendedAdapter
 from .exchanges.nado import NadoAdapter
 from .exchanges.risex import RisexAdapter
 from .lifecycle import LifecycleEngine, LifecycleSnapshot
-from .market_data import MarketDataCoordinator
+from .market_data import BookStream, MarketDataCoordinator
 from .models import (
     BookDelta,
     ContractType,
@@ -33,6 +33,7 @@ from .models import (
     OrderBook,
     RouteDirection,
     SettlementStatus,
+    StreamHealth,
     TradeEvidence,
     TargetFundingCycle,
     Venue,
@@ -63,6 +64,47 @@ class Clock(Protocol):
 class SystemClock:
     def now(self) -> datetime:
         return datetime.now(UTC)
+
+
+@dataclass(frozen=True, slots=True)
+class StreamSessionId:
+    value: int
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryEpisodeId:
+    value: int
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryAttemptGeneration:
+    value: int
+
+
+@dataclass(slots=True)
+class RecoveryEpisode:
+    episode_id: RecoveryEpisodeId
+    attempt_generation: RecoveryAttemptGeneration
+    buffer: list[BookDelta]
+    owned_stream_session_id: StreamSessionId
+    task: asyncio.Task[None] | None = None
+    attempts: int = 0
+    overflows: int = 0
+    terminal: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryPublicationCandidate:
+    recovered: OrderBook
+    health: StreamHealth
+    observation: MarketObservation | None
+    components: tuple[tuple[str, VenueReadiness], ...]
+    venue_readiness: VenueReadiness
+    lifecycle_owner: LifecycleEngine | None
+    lifecycle_before: LifecycleSnapshot | None
+    lifecycle_after: LifecycleSnapshot | None
+    buffer: tuple[BookDelta, ...]
+    completion_detail: tuple[tuple[str, object], ...]
 
 
 class _PublicSocketClosed(ConnectionError):
@@ -288,11 +330,10 @@ class PublicPaperRuntime:
         self.accepting_entries = True
         self._stream_tasks: dict[tuple[Venue, str, str], asyncio.Task[None]] = {}
         self._refresh_task: asyncio.Task[None] | None = None
-        self._recovery_tasks: dict[tuple[Venue, str], asyncio.Task[None]] = {}
-        self._recovery_buffers: dict[tuple[Venue, str], list[BookDelta]] = {}
-        self._recovery_overflowed: set[tuple[Venue, str]] = set()
-        self._recovery_attempts: dict[tuple[Venue, str], int] = {}
-        self._recovery_generations: dict[tuple[Venue, str], int] = {}
+        self._recoveries: dict[tuple[Venue, str], RecoveryEpisode] = {}
+        self._retired_recovery_tasks: set[asyncio.Task[None]] = set()
+        self._recovery_episode_number = 0
+        self._recovery_attempt_number = 0
         self._pending_socket_episodes: dict[
             tuple[Venue, str, tuple[str, ...]], dict[str, object]
         ] = {}
@@ -308,7 +349,10 @@ class PublicPaperRuntime:
         self._live_book_ready: set[tuple[Venue, str]] = set()
         self._last_readiness_evidence_at: dict[Venue, datetime] = {}
         self._extended_confirmed_at: dict[tuple[str, str], datetime] = {}
-        self._stream_generations: dict[tuple[Venue, str, str], int] = {}
+        self._stream_sessions: dict[
+            tuple[Venue, str, str], StreamSessionId
+        ] = {}
+        self._stream_session_number = 0
         self._combined_symbols: dict[Venue, tuple[str, ...]] = {}
         self.next_health_check_at: datetime | None = None
         self.focused_cycle: TargetFundingCycle | None = None
@@ -325,6 +369,59 @@ class PublicPaperRuntime:
         self._background_fatal: BaseException | None = None
         self._position_event_lock = asyncio.Lock()
         self._shutdown_started = False
+
+    def _new_stream_session(
+        self, key: tuple[Venue, str, str]
+    ) -> StreamSessionId:
+        self._stream_session_number += 1
+        session_id = StreamSessionId(self._stream_session_number)
+        self._stream_sessions[key] = session_id
+        return session_id
+
+    def _owns_stream_session(
+        self, key: tuple[Venue, str, str], session_id: StreamSessionId
+    ) -> bool:
+        return self._stream_sessions.get(key) == session_id
+
+    def _new_recovery_episode(
+        self, key: tuple[Venue, str], session_id: StreamSessionId
+    ) -> RecoveryEpisode:
+        self._recovery_episode_number += 1
+        self._recovery_attempt_number += 1
+        episode = RecoveryEpisode(
+            RecoveryEpisodeId(self._recovery_episode_number),
+            RecoveryAttemptGeneration(self._recovery_attempt_number),
+            [],
+            session_id,
+        )
+        self._recoveries[key] = episode
+        return episode
+
+    def _owns_recovery(
+        self,
+        key: tuple[Venue, str],
+        episode: RecoveryEpisode,
+        generation: RecoveryAttemptGeneration,
+    ) -> bool:
+        venue, symbol = key
+        stream_key = (
+            (venue, symbol, "book")
+            if venue is Venue.EXTENDED else (venue, "*", "combined")
+        )
+        return (
+            self._recoveries.get(key) is episode
+            and episode.terminal is None
+            and episode.attempt_generation == generation
+            and self._stream_sessions.get(stream_key)
+            == episode.owned_stream_session_id
+        )
+
+    def _retire_recovery_task(self, task: asyncio.Task[None] | None) -> None:
+        if task is None or task.done() or task is asyncio.current_task():
+            return
+        task.cancel()
+        self._retired_recovery_tasks.add(task)
+        task.add_done_callback(self._retired_recovery_tasks.discard)
 
     async def __aenter__(self) -> PublicPaperRuntime:
         if self.adapters is None:
@@ -1451,7 +1548,14 @@ class PublicPaperRuntime:
                 health = self.coordinator.stream(venue, symbol).health(now)
                 confirmation = health.last_connection_confirmation_at
                 if confirmation is not None and now - confirmation > timedelta(seconds=25):
-                    await self.mark_disconnected(venue, symbol, at=now, stream_kind="health")
+                    session_id = self._stream_sessions.get(
+                        (venue, "*", "combined")
+                    )
+                    if session_id is not None:
+                        await self.mark_disconnected(
+                            venue, symbol, at=now, stream_kind="health",
+                            stream_session_id=session_id,
+                        )
             scheduled = self.next_health_check_at or now
             self.next_health_check_at = _next_absolute_slot(scheduled, now, 10)
         if maker_was_active and self.broker is None:
@@ -1515,24 +1619,28 @@ class PublicPaperRuntime:
                     lifecycle = self.lifecycle
                     if lifecycle is None:
                         return
-                    snapshot = lifecycle.snapshot
-                    risex, hedge = self._market_pair_observations(
-                        snapshot.risex_market, snapshot.hedge_market, now
-                    )
                     before = lifecycle.snapshot
-                    await lifecycle.evaluate(
+                    risex, hedge = self._market_pair_observations(
+                        before.risex_market, before.hedge_market, now
+                    )
+                    candidate = LifecycleEngine.from_snapshot(
+                        before, config=lifecycle.config
+                    )
+                    await candidate.evaluate(
                         evaluated_at=now,
                         risex_observation=risex,
                         hedge_observation=hedge,
                     )
+                    if self.lifecycle is not lifecycle or lifecycle.snapshot is not before:
+                        return
                     self.repository.save_decision(
-                        recorded_at=now, lifecycle_snapshot=lifecycle.snapshot
+                        recorded_at=now, lifecycle_snapshot=candidate.snapshot
                     )
-                    self._notify_lifecycle_transition(
-                        before, lifecycle.snapshot, now
-                    )
-                    if lifecycle.snapshot.lifecycle_state is LifecycleState.FLAT:
+                    lifecycle.publish_snapshot(candidate.snapshot)
+                    after = candidate.snapshot
+                    if after.lifecycle_state is LifecycleState.FLAT:
                         self.lifecycle = None
+                self._notify_lifecycle_transition(before, after, now)
                 scheduled = self.next_position_monitor_at or now
                 self.next_position_monitor_at = _next_absolute_slot(
                     scheduled, now, self.config.open_position_monitor_seconds
@@ -1686,6 +1794,7 @@ class PublicPaperRuntime:
         processed_at: datetime | None = None,
     ) -> None:
         at = processed_at or self.clock.now()
+        exit_receipt_version: str | None = None
         if self.broker is not None and self.broker.state.lifecycle_state is LifecycleState.ENTRY_MAKER_OPEN:
             active_order = self.broker.state.order
             assert active_order is not None
@@ -1699,6 +1808,15 @@ class PublicPaperRuntime:
             if (trade.venue, trade.canonical_market) != (
                 active_order.venue,
                 active_order.canonical_market,
+            ):
+                return
+            active_version = active_order.active_version
+            if active_version is None:
+                return
+            exit_receipt_version = observed_version_id or active_version.version_id
+            if (
+                observed_version_id is not None
+                and observed_version_id != active_version.version_id
             ):
                 return
         else:
@@ -1766,20 +1884,23 @@ class PublicPaperRuntime:
             active = order.active_version
             if active is None:
                 return
-            version = observed_version_id or active.version_id
+            assert exit_receipt_version is not None
+            version = exit_receipt_version
             risex, hedge = self._market_pair_observations(
                 self.lifecycle.snapshot.risex_market,
                 self.lifecycle.snapshot.hedge_market,
                 at,
             )
             before = self.lifecycle.snapshot
-            await self.lifecycle.process_exit_trade(
+            result = await self.lifecycle.process_exit_trade(
                 trade,
                 observed_version_id=version,
                 processed_at=at,
                 risex_observation=risex,
                 hedge_observation=hedge,
             )
+            if result.detail == "STALE_EXIT_VERSION":
+                return
             self.repository.save_decision(
                 recorded_at=at,
                 trade_events=(trade,),
@@ -1798,7 +1919,14 @@ class PublicPaperRuntime:
             and self.adapters is not None
             and isinstance(self.adapters.get(Venue.EXTENDED), ExtendedAdapter)
         ):
-            self._confirm_extended_stream(symbol, "trade", now, data_ready=True)
+            session_id = self._stream_sessions.get(
+                (Venue.EXTENDED, symbol, "trade")
+            )
+            if session_id is not None:
+                self._confirm_extended_stream(
+                    symbol, "trade", now, data_ready=True,
+                    stream_session_id=session_id,
+                )
             return
         self._trade_stream_ready.add((venue, symbol))
         stream = self.coordinator.stream(venue, symbol)
@@ -1829,23 +1957,31 @@ class PublicPaperRuntime:
                 row for row in self.lifecycle.snapshot.settlements
                 if row.key == settlement.key
             )
-            if (before.status, before.cash_usd) != (after.status, after.cash_usd):
-                at = self.clock.now()
-                kind = (
-                    "FUNDING_RECEIVED"
-                    if before.status in {
-                        SettlementStatus.PENDING, SettlementStatus.UNRESOLVED
-                    }
-                    else "FUNDING_RECONCILED"
-                )
-                self._notify_event(
-                    f"funding:{after.venue.value}:{after.canonical_market}:"
-                    f"{after.settlement_at.isoformat()}:{after.status.value}:{after.cash_usd}",
-                    kind, at,
-                    f"Funding {'received' if kind == 'FUNDING_RECEIVED' else 'reconciled'}: "
-                    f"{after.venue.value} {after.canonical_market} "
-                    f"{after.status.value} USD {format_telegram_money(after.cash_usd)}",
-                )
+            self._notify_settlement_transition(before, after, self.clock.now())
+
+    def _notify_settlement_transition(
+        self,
+        before: FundingSettlement,
+        after: FundingSettlement,
+        at: datetime,
+    ) -> None:
+        if (before.status, before.cash_usd) == (after.status, after.cash_usd):
+            return
+        kind = (
+            "FUNDING_RECEIVED"
+            if before.status in {
+                SettlementStatus.PENDING, SettlementStatus.UNRESOLVED
+            }
+            else "FUNDING_RECONCILED"
+        )
+        self._notify_event(
+            f"funding:{after.venue.value}:{after.canonical_market}:"
+            f"{after.settlement_at.isoformat()}:{after.status.value}:{after.cash_usd}",
+            kind, at,
+            f"Funding {'received' if kind == 'FUNDING_RECEIVED' else 'reconciled'}: "
+            f"{after.venue.value} {after.canonical_market} "
+            f"{after.status.value} USD {format_telegram_money(after.cash_usd)}",
+        )
 
     def _book_mid(self, venue: Venue, symbol: str) -> Decimal | None:
         book = self.coordinator.stream(venue, symbol).book()
@@ -1873,6 +2009,98 @@ class PublicPaperRuntime:
             return
         await self.deliver_settlement(settlement)
 
+    @staticmethod
+    def _funding_settlement_from_quote(
+        quote: FundingCashQuote, snapshot: LifecycleSnapshot
+    ) -> FundingSettlement | None:
+        position = snapshot.position
+        if quote.quality is not FundingQuality.APPLIED_RATE or position is None:
+            return None
+        risex_long = position.direction is RouteDirection.LONG_RISEX_SHORT_HEDGE
+        venue_long = risex_long if quote.venue is Venue.RISEX else not risex_long
+        cash_per_base = (
+            quote.long_cash_per_canonical_base_usd
+            if venue_long
+            else quote.short_cash_per_canonical_base_usd
+        )
+        if cash_per_base is None:
+            return None
+        return FundingSettlement(
+            quote.venue,
+            quote.canonical_market,
+            quote.settlement_at,
+            SettlementStatus.APPLIED_RATE,
+            position.canonical_quantity * cash_per_base,
+        )
+
+    async def _apply_nado_funding_quote(
+        self,
+        quote: FundingCashQuote,
+        stream_session_id: StreamSessionId,
+        cumulative_updates: tuple[tuple[tuple[str, str], object], ...],
+    ) -> None:
+        session_key = (Venue.NADO, "*", "combined")
+        notification: tuple[
+            FundingSettlement, FundingSettlement, datetime
+        ] | None = None
+        async with self._position_event_lock:
+            if not self._owns_stream_session(session_key, stream_session_id):
+                return
+            commit_at = self.clock.now()
+            key = (quote.venue, quote.canonical_market)
+            lifecycle = self.lifecycle
+            if lifecycle is not None:
+                before_snapshot = lifecycle.snapshot
+                settlement = self._funding_settlement_from_quote(
+                    quote, before_snapshot
+                )
+                if settlement is not None and settlement.key in {
+                    row.key for row in before_snapshot.settlements
+                }:
+                    before_settlement = next(
+                        row for row in before_snapshot.settlements
+                        if row.key == settlement.key
+                    )
+                    candidate = LifecycleEngine.from_snapshot(
+                        before_snapshot, config=lifecycle.config
+                    )
+                    await candidate.reconcile_settlement(settlement)
+                    if (
+                        not self._owns_stream_session(
+                            session_key, stream_session_id
+                        )
+                        or self.lifecycle is not lifecycle
+                        or lifecycle.snapshot is not before_snapshot
+                    ):
+                        return
+                    if candidate.snapshot != before_snapshot:
+                        self.repository.save_decision(
+                            recorded_at=commit_at,
+                            lifecycle_snapshot=candidate.snapshot,
+                        )
+                        lifecycle.publish_snapshot(candidate.snapshot)
+                        after_settlement = next(
+                            row for row in candidate.snapshot.settlements
+                            if row.key == settlement.key
+                        )
+                        notification = (
+                            before_settlement, after_settlement, commit_at
+                        )
+            for cumulative_key, value in cumulative_updates:
+                self._nado_cumulative_funding[cumulative_key] = value
+            observation = self.observations.get(key)
+            if observation is not None:
+                self.observations[key] = replace(observation, funding=quote)
+            self._set_component_readiness(
+                quote.venue,
+                f"funding:{quote.canonical_market}",
+                True,
+                "PUBLIC_FUNDING_STREAM_READY",
+                commit_at,
+            )
+        if notification is not None:
+            self._notify_settlement_transition(*notification)
+
     async def _apply_funding_quote(self, quote: FundingCashQuote) -> None:
         key = (quote.venue, quote.canonical_market)
         self._set_component_readiness(
@@ -1882,44 +2110,27 @@ class PublicPaperRuntime:
         observation = self.observations.get(key)
         if observation is not None:
             self.observations[key] = replace(observation, funding=quote)
-        if quote.quality is not FundingQuality.APPLIED_RATE or self.lifecycle is None:
+        if self.lifecycle is None:
             return
-        position = self.lifecycle.snapshot.position
-        if position is None:
-            return
-        risex_long = position.direction is RouteDirection.LONG_RISEX_SHORT_HEDGE
-        venue_long = risex_long if quote.venue is Venue.RISEX else not risex_long
-        cash_per_base = (
-            quote.long_cash_per_canonical_base_usd
-            if venue_long
-            else quote.short_cash_per_canonical_base_usd
+        settlement = self._funding_settlement_from_quote(
+            quote, self.lifecycle.snapshot
         )
-        if cash_per_base is None:
+        if settlement is None:
             return
-        settlement = FundingSettlement(
-            quote.venue,
-            quote.canonical_market,
-            quote.settlement_at,
-            SettlementStatus.APPLIED_RATE,
-            position.canonical_quantity * cash_per_base,
-        )
         if settlement.key in {row.key for row in self.lifecycle.snapshot.settlements}:
             await self.deliver_settlement(settlement)
 
     async def mark_disconnected(
         self, venue: Venue, symbol: str, *, at: datetime | None = None,
         stream_kind: str = "public", exception: BaseException | None = None,
-        stream_generation: int | None = None,
+        stream_session_id: StreamSessionId,
     ) -> None:
-        generation_key = (
+        session_key = (
             (venue, "*", "combined")
-            if stream_kind == "combined"
+            if venue is not Venue.EXTENDED or stream_kind == "combined"
             else (venue, symbol, stream_kind)
         )
-        if (
-            stream_generation is not None
-            and self._stream_generations.get(generation_key, 0) != stream_generation
-        ):
+        if not self._owns_stream_session(session_key, stream_session_id):
             return
         now = at or self.clock.now()
         if venue is Venue.EXTENDED and stream_kind in {"book", "trade", "funding"}:
@@ -1968,9 +2179,7 @@ class PublicPaperRuntime:
         if self.lifecycle is not None and (invalidates_book or invalidates_trade):
             async with self._position_event_lock:
                 if (
-                    stream_generation is not None
-                    and self._stream_generations.get(generation_key, 0)
-                    != stream_generation
+                    not self._owns_stream_session(session_key, stream_session_id)
                 ):
                     return
                 lifecycle = self.lifecycle
@@ -1993,16 +2202,35 @@ class PublicPaperRuntime:
                         causal_at = max(
                             causal_at, active.created_at, active.last_checked_at
                         )
-                    await lifecycle.start_gap(started_at=causal_at)
-                    if lifecycle.snapshot != before:
+                    candidate = LifecycleEngine.from_snapshot(
+                        before, config=lifecycle.config
+                    )
+                    await candidate.start_gap(started_at=causal_at)
+                    if (
+                        self.lifecycle is not lifecycle
+                        or lifecycle.snapshot is not before
+                        or not self._owns_stream_session(
+                            session_key, stream_session_id
+                        )
+                    ):
+                        return
+                    if candidate.snapshot != before:
                         self.repository.save_decision(
                             recorded_at=causal_at,
-                            lifecycle_snapshot=lifecycle.snapshot,
+                            lifecycle_snapshot=candidate.snapshot,
                         )
+                        lifecycle.publish_snapshot(candidate.snapshot)
+                    else:
+                        return
 
     def _confirm_extended_stream(
-        self, symbol: str, kind: str, at: datetime, *, data_ready: bool
+        self, symbol: str, kind: str, at: datetime, *, data_ready: bool,
+        stream_session_id: StreamSessionId,
     ) -> None:
+        if not self._owns_stream_session(
+            (Venue.EXTENDED, symbol, kind), stream_session_id
+        ):
+            return
         self._extended_confirmed_at[symbol, kind] = at
         if kind == "book":
             self.coordinator.stream(Venue.EXTENDED, symbol).connected(at)
@@ -2025,19 +2253,20 @@ class PublicPaperRuntime:
     async def _check_extended_health(self, at: datetime) -> None:
         stale = [
             (symbol, kind, confirmed_at,
-             self._stream_generations.get((Venue.EXTENDED, symbol, kind), 0),
+             self._stream_sessions.get((Venue.EXTENDED, symbol, kind)),
              self._stream_tasks.get((Venue.EXTENDED, symbol, kind)))
             for (symbol, kind), confirmed_at in self._extended_confirmed_at.items()
             if (Venue.EXTENDED, symbol, kind) in self._stream_tasks
             if at - confirmed_at > timedelta(seconds=25)
         ]
-        for symbol, kind, confirmed_at, generation, task in sorted(
+        for symbol, kind, confirmed_at, session_id, task in sorted(
             stale, key=lambda row: (row[0], row[1])
         ):
             key = (Venue.EXTENDED, symbol, kind)
             if (
                 self._stop_event is None or self._stop_event.is_set()
-                or self._stream_generations.get(key, 0) != generation
+                or session_id is None
+                or not self._owns_stream_session(key, session_id)
                 or self._stream_tasks.get(key) is not task
                 or self._extended_confirmed_at.get((symbol, kind)) != confirmed_at
             ):
@@ -2050,11 +2279,11 @@ class PublicPaperRuntime:
             await self.mark_disconnected(
                 Venue.EXTENDED, symbol, at=at, stream_kind=kind,
                 exception=TimeoutError("public socket confirmation stale"),
-                stream_generation=generation,
+                stream_session_id=session_id,
             )
             if (
                 self._stop_event.is_set()
-                or self._stream_generations.get(key, 0) != generation
+                or not self._owns_stream_session(key, session_id)
                 or self._stream_tasks.get(key) is not task
             ):
                 self._pending_watchdog_episodes.pop(identity, None)
@@ -2102,10 +2331,18 @@ class PublicPaperRuntime:
         identity: tuple[Venue, str, tuple[str, ...]],
         *,
         at: datetime,
+        stream_session_id: StreamSessionId,
         cause: str = "SOCKET_CLOSED",
         exception_class: str | None = None,
         close_classification: str | None = "EOF",
     ) -> None:
+        session_key = (
+            (identity[0], "*", "combined")
+            if identity[1] == "combined"
+            else (identity[0], identity[2][0], identity[1])
+        )
+        if not self._owns_stream_session(session_key, stream_session_id):
+            return
         if identity in self._pending_socket_episodes:
             return
         venue, stream_kind, markets = identity
@@ -2118,6 +2355,7 @@ class PublicPaperRuntime:
             "stream_kind": stream_kind,
             "disconnected_at": at.isoformat(),
             "cause": cause,
+            "disconnected_stream_session_id": stream_session_id.value,
         }
         if exception_class is not None:
             detail["exception_class"] = exception_class
@@ -2140,12 +2378,21 @@ class PublicPaperRuntime:
         identity: tuple[Venue, str, tuple[str, ...]],
         *,
         at: datetime,
+        stream_session_id: StreamSessionId,
     ) -> None:
+        session_key = (
+            (identity[0], "*", "combined")
+            if identity[1] == "combined"
+            else (identity[0], identity[2][0], identity[1])
+        )
+        if not self._owns_stream_session(session_key, stream_session_id):
+            return
         detail = self._pending_socket_episodes.pop(identity, None)
         if detail is not None:
             reconnect_detail = {
                 **detail,
                 "reconnected_at": at.isoformat(),
+                "reconnected_stream_session_id": stream_session_id.value,
             }
             self._record(
                 "PUBLIC_SOCKET_RECONNECTED",
@@ -2160,11 +2407,13 @@ class PublicPaperRuntime:
         *,
         at: datetime,
         exception: BaseException,
+        stream_session_id: StreamSessionId,
     ) -> None:
         if isinstance(exception, _PublicSocketClosed):
             self._socket_disconnected(
                 identity, at=at, cause="SOCKET_CLOSED",
                 close_classification=exception.classification,
+                stream_session_id=stream_session_id,
             )
         elif isinstance(
             exception, (aiohttp.ClientConnectionError, ConnectionError, OSError)
@@ -2172,10 +2421,13 @@ class PublicPaperRuntime:
             self._socket_disconnected(
                 identity, at=at, cause="TRANSPORT_EXCEPTION",
                 exception_class=type(exception).__name__, close_classification=None,
+                stream_session_id=stream_session_id,
             )
 
-    async def recover_snapshot(self, book: OrderBook, *, at: datetime | None = None) -> None:
-        now = at or self.clock.now()
+    async def _recover_snapshot_locked(
+        self, book: OrderBook, *, at: datetime
+    ) -> None:
+        now = at
         stream = self.coordinator.stream(book.venue, book.canonical_market)
         stream.connected(now)
         stream.snapshot(book)
@@ -2194,124 +2446,306 @@ class PublicPaperRuntime:
             self.observations[(book.venue, book.canonical_market)] = replace(
                 row, book=stream.book(), health=stream.health(now)
             )
-        if self.lifecycle is not None and self.lifecycle.snapshot.gap_open:
-            async with self._position_event_lock:
-                lifecycle = self.lifecycle
-                if lifecycle is not None and lifecycle.snapshot.gap_open:
-                    snapshot = lifecycle.snapshot
-                    risex, hedge = self._market_pair_observations(
-                        snapshot.risex_market, snapshot.hedge_market, now
-                    )
-                    execution_healthy = (
-                        risex.health is not None
-                        and hedge.health is not None
-                        and risex.health.data_quality is DataQuality.COMPLETE
-                        and hedge.health.data_quality is DataQuality.COMPLETE
-                        and (Venue.RISEX, snapshot.risex_market.venue_symbol)
-                        in self._trade_stream_ready
-                        and (
-                            snapshot.hedge_market.venue,
-                            snapshot.hedge_market.venue_symbol,
-                        ) in self._trade_stream_ready
-                    )
-                    if execution_healthy:
-                        await lifecycle.recover(
-                            recovered_at=now,
-                            risex_observation=risex,
-                            hedge_observation=hedge,
-                        )
-                        self.repository.save_decision(
-                            recorded_at=now, lifecycle_snapshot=lifecycle.snapshot
-                        )
-    async def apply_book_event(self, event: OrderBook | BookDelta) -> bool:
+        lifecycle = self.lifecycle
+        if lifecycle is None or not lifecycle.snapshot.gap_open:
+            return
+        snapshot = lifecycle.snapshot
+        risex, hedge = self._market_pair_observations(
+            snapshot.risex_market, snapshot.hedge_market, now
+        )
+        execution_healthy = (
+            risex.health is not None
+            and hedge.health is not None
+            and risex.health.data_quality is DataQuality.COMPLETE
+            and hedge.health.data_quality is DataQuality.COMPLETE
+            and (Venue.RISEX, snapshot.risex_market.venue_symbol)
+            in self._trade_stream_ready
+            and (
+                snapshot.hedge_market.venue,
+                snapshot.hedge_market.venue_symbol,
+            ) in self._trade_stream_ready
+        )
+        if execution_healthy:
+            await lifecycle.recover(
+                recovered_at=now,
+                risex_observation=risex,
+                hedge_observation=hedge,
+            )
+            self.repository.save_decision(
+                recorded_at=now, lifecycle_snapshot=lifecycle.snapshot
+            )
+
+    async def recover_snapshot(
+        self, book: OrderBook, *, at: datetime | None = None
+    ) -> bool:
+        now = at or self.clock.now()
+        async with self._position_event_lock:
+            await self._recover_snapshot_locked(book, at=now)
+        return True
+
+    async def _publish_recovery_snapshot(
+        self,
+        key: tuple[Venue, str],
+        episode: RecoveryEpisode,
+        generation: RecoveryAttemptGeneration,
+        recovered: OrderBook,
+        *,
+        at: datetime,
+        buffered: int,
+        replayed: int,
+        source: str,
+    ) -> bool:
+        venue, symbol = key
+        expected_buffer = tuple(episode.buffer)
+        projected_stream = BookStream(venue, symbol)
+        projected_stream.connected(at)
+        projected_stream.snapshot(recovered)
+        projected_stream.connection_confirmed(at)
+        health = projected_stream.health(at)
+        current_observation = self.observations.get(key)
+        projected_observation = (
+            None if current_observation is None
+            else replace(current_observation, book=recovered, health=health)
+        )
+        components = dict(self.component_readiness.get(venue, {}))
+        ready = VenueReadiness(True, "PUBLIC_STREAM_RECOVERED", at)
+        components[f"book:{symbol}"] = ready
+        components[f"connection_book:{symbol}"] = ready
+        catalog = components.get("catalog")
+        by_symbol: dict[str, list[VenueReadiness]] = {}
+        for name, row in components.items():
+            _, separator, component_symbol = name.partition(":")
+            if separator and not (
+                venue is Venue.EXTENDED and name.startswith("applied_funding:")
+            ):
+                by_symbol.setdefault(component_symbol, []).append(row)
+        symbol_ready = not by_symbol or any(
+            all(row.available for row in rows) for rows in by_symbol.values()
+        )
+        available = (catalog is None or catalog.available) and symbol_ready
+        failed = next((
+            row for name, row in components.items()
+            if not row.available and not (
+                venue is Venue.EXTENDED and name.startswith("applied_funding:")
+            )
+        ), None)
+        venue_readiness = VenueReadiness(
+            available,
+            "PUBLIC_STREAM_RECOVERED" if available or failed is None else failed.detail,
+            at,
+        )
+        lifecycle_owner = self.lifecycle
+        lifecycle_before = None if lifecycle_owner is None else lifecycle_owner.snapshot
+        lifecycle_after = lifecycle_before
+        if lifecycle_owner is not None and lifecycle_before is not None and lifecycle_before.gap_open:
+            def projected_row(row_venue: Venue, row_symbol: str) -> MarketObservation:
+                if (row_venue, row_symbol) == key and projected_observation is not None:
+                    return projected_observation
+                return self._observation(row_venue, row_symbol, at)
+
+            risex = projected_row(Venue.RISEX, lifecycle_before.risex_market.venue_symbol)
+            hedge = projected_row(
+                lifecycle_before.hedge_market.venue,
+                lifecycle_before.hedge_market.venue_symbol,
+            )
+            execution_healthy = (
+                risex.health is not None and hedge.health is not None
+                and risex.health.data_quality is DataQuality.COMPLETE
+                and hedge.health.data_quality is DataQuality.COMPLETE
+                and (Venue.RISEX, lifecycle_before.risex_market.venue_symbol)
+                in self._trade_stream_ready
+                and (lifecycle_before.hedge_market.venue,
+                     lifecycle_before.hedge_market.venue_symbol)
+                in self._trade_stream_ready
+            )
+            if execution_healthy:
+                detached = LifecycleEngine.from_snapshot(
+                    lifecycle_before, config=lifecycle_owner.config
+                )
+                await detached.recover(
+                    recovered_at=at,
+                    risex_observation=risex,
+                    hedge_observation=hedge,
+                )
+                lifecycle_after = detached.snapshot
+        detail = (
+            ("symbol", symbol), ("buffered", buffered),
+            ("replayed", replayed), ("source", source),
+            ("episode_id", episode.episode_id.value),
+            ("generation", generation.value),
+            ("stream_session_id", episode.owned_stream_session_id.value),
+        )
+        candidate = RecoveryPublicationCandidate(
+            recovered, health, projected_observation, tuple(components.items()),
+            venue_readiness, lifecycle_owner, lifecycle_before, lifecycle_after,
+            expected_buffer, detail,
+        )
+        async with self._position_event_lock:
+            if (
+                not self._owns_recovery(key, episode, generation)
+                or tuple(episode.buffer) != candidate.buffer
+                or self.lifecycle is not candidate.lifecycle_owner
+                or (candidate.lifecycle_owner is not None
+                    and candidate.lifecycle_owner.snapshot is not candidate.lifecycle_before)
+            ):
+                return False
+            completion_detail = dict(candidate.completion_detail)
+            self.repository.save_decision(
+                recorded_at=at,
+                lifecycle_snapshot=(candidate.lifecycle_after
+                    if candidate.lifecycle_after != candidate.lifecycle_before else None),
+                runtime_evidence=((at, "PUBLIC_SNAPSHOT_RECOVERY_COMPLETED",
+                                   venue.value, completion_detail),),
+                venue_readiness=(
+                    venue.value,
+                    candidate.venue_readiness.updated_at,
+                    candidate.venue_readiness.available,
+                    candidate.venue_readiness.detail,
+                ),
+            )
+            stream = self.coordinator.stream(venue, symbol)
+            stream.connected(at)
+            stream.snapshot(candidate.recovered)
+            stream.connection_confirmed(at)
+            self._live_book_ready.add(key)
+            self.component_readiness[venue] = dict(candidate.components)
+            self.readiness[venue] = candidate.venue_readiness
+            if candidate.observation is not None:
+                self.observations[key] = candidate.observation
+            if candidate.lifecycle_owner is not None and candidate.lifecycle_after is not None:
+                candidate.lifecycle_owner.publish_snapshot(candidate.lifecycle_after)
+            episode.terminal = "COMPLETE"
+            episode.buffer.clear()
+        self._notify_outage(
+            "PUBLIC_SNAPSHOT_RECOVERY_COMPLETED", degraded=False, venue=venue,
+            detail=completion_detail,
+            event_id=f"data-recovery:{episode.episode_id.value}",
+            kind="DATA_RECOVERY", occurred_at=at,
+            text=f"Public data recovered: {venue.value} PUBLIC_SNAPSHOT_RECOVERY_COMPLETED",
+        )
+        return True
+
+    async def apply_book_event(
+        self,
+        event: OrderBook | BookDelta,
+        *,
+        stream_session_id: StreamSessionId,
+    ) -> bool:
         if self._shutdown_started:
             return False
         now = self.clock.now()
-        self.coordinator.stream(event.venue, event.canonical_market).connection_confirmed(now)
         key = (event.venue, event.canonical_market)
+        stream_key = (
+            (event.venue, event.canonical_market, "book")
+            if event.venue is Venue.EXTENDED
+            else (event.venue, "*", "combined")
+        )
+        episode = self._recoveries.get(key)
+        active = episode is not None and episode.terminal is None
+        if episode is not None and episode.terminal == "FAILED":
+            return False
+        required_session = (
+            episode.owned_stream_session_id
+            if active else self._stream_sessions.get(stream_key)
+        )
+        if required_session != stream_session_id:
+            return False
+        if not active:
+            self.coordinator.stream(*key).connection_confirmed(now)
         if isinstance(event, OrderBook):
-            if key in self._recovery_buffers:
-                if event.venue is Venue.RISEX:
-                    # The official resubscribe snapshot is an ordered WS
-                    # boundary. Messages buffered before it belong to the old
-                    # subscription and must not be replayed across that boundary.
-                    buffered = len(self._recovery_buffers.pop(key))
-                    await self.recover_snapshot(event, at=now)
-                    self._record(
-                        "PUBLIC_SNAPSHOT_RECOVERY_COMPLETED", at=now,
-                        venue=event.venue,
-                        detail={
-                            "symbol": event.canonical_market,
-                            "buffered": buffered,
-                            "replayed": 0,
-                            "source": "WS_RESUBSCRIBE_SNAPSHOT",
-                        },
+            if not active:
+                async with self._position_event_lock:
+                    if not self._owns_stream_session(
+                        stream_key, stream_session_id
+                    ):
+                        return False
+                    await self._recover_snapshot_locked(event, at=now)
+                    return self._owns_stream_session(
+                        stream_key, stream_session_id
                     )
-                    return True
-                if event.venue is Venue.EXTENDED and event.sequence is None:
-                    self._record(
-                        "PUBLIC_REST_SNAPSHOT_IGNORED_FOR_WS_RESYNC",
-                        at=now, venue=event.venue,
-                        detail={"symbol": event.canonical_market},
-                    )
-                    return True
-                try:
-                    recovered, buffered, replayed = self._install_recovery_snapshot(event)
-                except ValueError as exc:
-                    self._recovery_buffers.pop(key, None)
-                    await self.mark_disconnected(
-                        event.venue, event.canonical_market, at=now,
-                        stream_kind="book", exception=exc,
-                    )
-                    self._start_snapshot_recovery(event.venue, event.canonical_market)
-                    return False
-                await self.recover_snapshot(recovered, at=now)
-                self._live_book_ready.add(key)
+            assert episode is not None
+            if event.venue is Venue.EXTENDED and event.sequence is None:
                 self._record(
-                    "PUBLIC_SNAPSHOT_RECOVERY_COMPLETED", at=now, venue=event.venue,
-                    detail={
-                        "symbol": event.canonical_market,
-                        "buffered": buffered,
-                        "replayed": replayed,
-                        "source": "WS_SNAPSHOT",
-                    },
+                    "PUBLIC_REST_SNAPSHOT_IGNORED_FOR_WS_RESYNC",
+                    at=now, venue=event.venue,
+                    detail={"symbol": event.canonical_market},
                 )
-            else:
-                await self.recover_snapshot(event, at=now)
-                self._live_book_ready.add(key)
-            return True
-        if key in self._recovery_buffers:
-            buffer = self._recovery_buffers[key]
-            if len(buffer) >= 2048:
-                buffer.clear()
-                self._recovery_overflowed.add(key)
-                self._recovery_generations[key] = (
-                    self._recovery_generations.get(key, 0) + 1
+                return False
+            try:
+                recovered, buffered, replayed = self._build_recovery_book(
+                    event, episode
                 )
-                obsolete = self._recovery_tasks.pop(key, None)
-                if obsolete is not None and obsolete is not asyncio.current_task():
-                    obsolete.cancel()
+            except ValueError as exc:
+                await self.mark_disconnected(
+                    event.venue, event.canonical_market, at=now,
+                    stream_kind="book", exception=exc,
+                    stream_session_id=stream_session_id,
+                )
+                if event.venue is not Venue.RISEX:
+                    self._restart_recovery_attempt(key, episode)
+                return False
+            return await self._publish_recovery_snapshot(
+                key, episode, episode.attempt_generation, recovered,
+                at=now, buffered=buffered, replayed=replayed,
+                source=(
+                    "WS_RESUBSCRIBE_SNAPSHOT"
+                    if event.venue is Venue.RISEX else "WS_SNAPSHOT"
+                ),
+            )
+        if active:
+            assert episode is not None
+            if len(episode.buffer) >= 2048:
+                episode.overflows += 1
+                episode.buffer.clear()
                 self.coordinator.stream(*key).gap()
                 self._set_component_readiness(
                     event.venue, f"book:{event.canonical_market}", False,
                     "PUBLIC_RECOVERY_BUFFER_OVERFLOW", now,
                 )
-                self._record(
-                    "PUBLIC_SNAPSHOT_RECOVERY_OVERFLOW", at=now,
-                    venue=event.venue,
-                    detail={"symbol": event.canonical_market, "capacity": 2048},
-                )
-                self._recovery_buffers.pop(key, None)
-                self._start_snapshot_recovery(*key)
-            elif key not in self._recovery_overflowed:
-                buffer.append(event)
-            return True
+                if episode.overflows == 1:
+                    self._record(
+                        "PUBLIC_SNAPSHOT_RECOVERY_OVERFLOW", at=now,
+                        venue=event.venue,
+                        detail={
+                            "symbol": event.canonical_market,
+                            "capacity": 2048,
+                            "episode_id": episode.episode_id.value,
+                            "generation": episode.attempt_generation.value,
+                        },
+                    )
+                if episode.overflows >= 3:
+                    self._retire_recovery_task(episode.task)
+                    episode.task = None
+                    episode.terminal = "FAILED"
+                    self._record(
+                        "PUBLIC_SNAPSHOT_RECOVERY_FAILED", at=now,
+                        venue=event.venue,
+                        detail={
+                            "symbol": event.canonical_market,
+                            "episode_id": episode.episode_id.value,
+                            "generation": episode.attempt_generation.value,
+                            "attempts": episode.attempts,
+                            "overflows": episode.overflows,
+                            "cause": "BUFFER_OVERFLOW_LIMIT",
+                        },
+                    )
+                elif event.venue is not Venue.RISEX:
+                    self._restart_recovery_attempt(key, episode)
+            else:
+                episode.buffer.append(event)
+            return False
         stream = self.coordinator.stream(event.venue, event.canonical_market)
         if not stream.apply_delta(event):
-            await self.mark_disconnected(event.venue, event.canonical_market, at=now, stream_kind="book")
+            await self.mark_disconnected(
+                event.venue, event.canonical_market, at=now,
+                stream_kind="book", stream_session_id=stream_session_id,
+            )
             if event.venue is Venue.RISEX:
                 return False
-            self._start_snapshot_recovery(event.venue, event.canonical_market)
+            self._start_snapshot_recovery(
+                event.venue, event.canonical_market,
+                displaced_stream_session_id=stream_session_id,
+            )
             return False
         else:
             self._live_book_ready.add(key)
@@ -2338,20 +2772,29 @@ class PublicPaperRuntime:
                 snapshot.risex_market, snapshot.hedge_market, at
             )
             before = lifecycle.snapshot
-            await lifecycle.evaluate(
+            candidate = LifecycleEngine.from_snapshot(
+                before, config=lifecycle.config
+            )
+            await candidate.evaluate(
                 evaluated_at=at,
                 risex_observation=risex,
                 hedge_observation=hedge,
                 record_sample=False,
                 hard_basis_only=True,
             )
-            if lifecycle.snapshot != before:
+            if self.lifecycle is not lifecycle or lifecycle.snapshot is not before:
+                return
+            if candidate.snapshot != before:
                 self.repository.save_decision(
-                    recorded_at=at, lifecycle_snapshot=lifecycle.snapshot
+                    recorded_at=at, lifecycle_snapshot=candidate.snapshot
                 )
-                self._notify_lifecycle_transition(before, lifecycle.snapshot, at)
-                if lifecycle.snapshot.lifecycle_state is LifecycleState.FLAT:
+                lifecycle.publish_snapshot(candidate.snapshot)
+                after = candidate.snapshot
+                if after.lifecycle_state is LifecycleState.FLAT:
                     self.lifecycle = None
+            else:
+                return
+        self._notify_lifecycle_transition(before, after, at)
 
     async def _resubscribe_risex_orderbooks(
         self,
@@ -2360,63 +2803,150 @@ class PublicPaperRuntime:
         symbols: tuple[str, ...],
         *,
         triggering_symbol: str,
+        stream_session_id: StreamSessionId,
     ) -> None:
         now = self.clock.now()
+        stream_key = (Venue.RISEX, "*", "combined")
+        if not self._owns_stream_session(stream_key, stream_session_id):
+            return
         for symbol in symbols:
             if symbol != triggering_symbol:
                 await self.mark_disconnected(
                     Venue.RISEX, symbol, at=now, stream_kind="book",
                     exception=ValueError("orderbook channel resubscribe"),
+                    stream_session_id=stream_session_id,
                 )
-            self._recovery_buffers[(Venue.RISEX, symbol)] = []
+                if not self._owns_stream_session(stream_key, stream_session_id):
+                    return
+        for symbol in symbols:
+            self._start_risex_recovery(symbol, stream_session_id)
         market_ids = [adapter.market_id(symbol) for symbol in symbols]  # type: ignore[attr-defined]
         self._record(
             "PUBLIC_BOOK_RESYNC_STARTED", at=now, venue=Venue.RISEX,
             detail={"symbols": list(symbols), "source": "WS_RESUBSCRIBE"},
         )
+        if not self._owns_stream_session(stream_key, stream_session_id):
+            return
         await ws.send_json(adapter.orderbook_unsubscription())  # type: ignore[attr-defined]
+        if not self._owns_stream_session(stream_key, stream_session_id):
+            return
         await ws.send_json(adapter.orderbook_subscription(market_ids))  # type: ignore[attr-defined]
 
-    def _start_snapshot_recovery(self, venue: Venue, symbol: str) -> None:
-        key = (venue, symbol)
-        if key in self._recovery_buffers:
-            return
-        self._recovery_buffers[key] = []
-        existing = self._recovery_tasks.get(key)
-        if existing is not None and not existing.done():
-            return
-        generation = self._recovery_generations.get(key, 0) + 1
-        self._recovery_generations[key] = generation
-        recovery = (
-            self._restart_extended_book_stream(venue, symbol, generation)
-            if venue is Venue.EXTENDED
-            else self._recover_snapshot_in_background(venue, symbol, generation)
-        )
-        self._recovery_tasks[key] = asyncio.create_task(
-            recovery
+    def _start_risex_recovery(
+        self, symbol: str, session_id: StreamSessionId
+    ) -> RecoveryEpisode:
+        key = (Venue.RISEX, symbol)
+        current = self._recoveries.get(key)
+        if (
+            current is not None
+            and current.terminal is None
+            and current.owned_stream_session_id == session_id
+        ):
+            return current
+        if current is not None:
+            self._retire_recovery_task(current.task)
+        episode = self._new_recovery_episode(key, session_id)
+        self._record_recovery_started(key, episode)
+        return episode
+
+    def _replace_displaced_combined_recoveries(
+        self,
+        venue: Venue,
+        symbols: tuple[str, ...],
+        stream_session_id: StreamSessionId,
+    ) -> tuple[str, ...]:
+        replaced: list[str] = []
+        for symbol in symbols:
+            key = (venue, symbol)
+            current = self._recoveries.get(key)
+            if current is None or current.terminal == "COMPLETE":
+                continue
+            if (
+                current.terminal is None
+                and current.owned_stream_session_id == stream_session_id
+            ):
+                continue
+            self._retire_recovery_task(current.task)
+            episode = self._new_recovery_episode(key, stream_session_id)
+            self._record_recovery_started(key, episode)
+            if venue is Venue.NADO:
+                self._spawn_recovery_task(
+                    key, episode,
+                    self._recover_snapshot_in_background(
+                        venue, symbol, episode
+                    ),
+                )
+            replaced.append(symbol)
+        return tuple(replaced)
+
+    def _record_recovery_started(
+        self, key: tuple[Venue, str], episode: RecoveryEpisode
+    ) -> None:
+        self._record(
+            "PUBLIC_SNAPSHOT_RECOVERY_STARTED", venue=key[0],
+            detail={
+                "symbol": key[1],
+                "episode_id": episode.episode_id.value,
+                "generation": episode.attempt_generation.value,
+                "stream_session_id": episode.owned_stream_session_id.value,
+            },
         )
 
-    def _install_recovery_snapshot(
-        self, snapshot: OrderBook, *, generation: int | None = None
+    def _start_snapshot_recovery(
+        self,
+        venue: Venue,
+        symbol: str,
+        *,
+        displaced_stream_session_id: StreamSessionId,
+    ) -> RecoveryEpisode:
+        key = (venue, symbol)
+        current = self._recoveries.get(key)
+        if current is not None and current.terminal is None:
+            return current
+        session_id = (
+            self._new_stream_session((venue, symbol, "book"))
+            if venue is Venue.EXTENDED else displaced_stream_session_id
+        )
+        episode = self._new_recovery_episode(key, session_id)
+        self._record_recovery_started(key, episode)
+        operation = (
+            self._restart_extended_book_stream(symbol, episode)
+            if venue is Venue.EXTENDED
+            else self._recover_snapshot_in_background(venue, symbol, episode)
+        )
+        self._spawn_recovery_task(key, episode, operation)
+        return episode
+
+    def _spawn_recovery_task(
+        self,
+        key: tuple[Venue, str],
+        episode: RecoveryEpisode,
+        operation: Awaitable[None],
+    ) -> None:
+        task = asyncio.create_task(operation)
+        episode.task = task
+
+        def release(done: asyncio.Task[None]) -> None:
+            if self._recoveries.get(key) is episode and episode.task is done:
+                episode.task = None
+            self._retired_recovery_tasks.discard(done)
+
+        task.add_done_callback(release)
+
+    def _build_recovery_book(
+        self, snapshot: OrderBook, episode: RecoveryEpisode
     ) -> tuple[OrderBook, int, int]:
-        """Install and drain the current buffer without yielding to the receiver."""
-        key = (snapshot.venue, snapshot.canonical_market)
-        if (
-            generation is not None
-            and self._recovery_generations.get(key) != generation
-        ):
-            raise ValueError("stale recovery generation")
-        if key in self._recovery_overflowed:
-            self._recovery_overflowed.discard(key)
-            self._recovery_buffers[key].clear()
-        stream = self.coordinator.stream(*key)
+        stream = BookStream(snapshot.venue, snapshot.canonical_market)
         stream.connected(self.clock.now())
         stream.snapshot(snapshot)
-        buffer = self._recovery_buffers[key]
-        buffered = len(buffer)
+        buffered = len(episode.buffer)
         replayed = 0
-        while buffer:
-            delta = buffer.pop(0)
+        if snapshot.sequence is None:
+            recovered = stream.book()
+            if recovered is None:
+                raise ValueError("snapshot recovery produced no book")
+            return recovered, buffered, replayed
+        for delta in episode.buffer:
             if (
                 snapshot.sequence is not None
                 and delta.sequence is not None
@@ -2429,39 +2959,37 @@ class PublicPaperRuntime:
         recovered = stream.book()
         if recovered is None:
             raise ValueError("snapshot recovery produced no book")
-        self._recovery_buffers.pop(key, None)
-        self._recovery_attempts.pop(key, None)
         return recovered, buffered, replayed
 
     async def _restart_extended_book_stream(
-        self, venue: Venue, symbol: str, generation: int | None = None
+        self, symbol: str, episode: RecoveryEpisode
     ) -> None:
-        key = (venue, symbol)
+        key = (Venue.EXTENDED, symbol)
         task_key = (Venue.EXTENDED, symbol, "book")
+        generation = episode.attempt_generation
+        if not self._owns_recovery(key, episode, generation):
+            return
         self._record(
-            "PUBLIC_BOOK_RESYNC_STARTED", venue=venue,
+            "PUBLIC_BOOK_RESYNC_STARTED", venue=Venue.EXTENDED,
             detail={"symbol": symbol, "source": "WS_RECONNECT"},
         )
-        try:
-            current = self._stream_tasks.get(task_key)
-            if current is not None and current is not asyncio.current_task():
-                current.cancel()
-                await asyncio.gather(current, return_exceptions=True)
-            adapter = None if self.adapters is None else self.adapters.get(venue)
-            if (
-                isinstance(adapter, ExtendedAdapter)
-                and self._stop_event is not None
-                and not self._stop_event.is_set()
-            ):
-                self._stream_tasks[task_key] = asyncio.create_task(
-                    self._extended_stream(adapter, symbol, "book")
+        current = self._stream_tasks.get(task_key)
+        if current is not None and current is not asyncio.current_task():
+            current.cancel()
+            await asyncio.gather(current, return_exceptions=True)
+        if not self._owns_recovery(key, episode, generation):
+            return
+        adapter = None if self.adapters is None else self.adapters.get(Venue.EXTENDED)
+        if (
+            isinstance(adapter, ExtendedAdapter)
+            and self._stop_event is not None
+            and not self._stop_event.is_set()
+        ):
+            self._stream_tasks[task_key] = asyncio.create_task(
+                self._extended_stream(
+                    adapter, symbol, "book", episode.owned_stream_session_id
                 )
-        finally:
-            if (
-                generation is None
-                or self._recovery_generations.get(key) == generation
-            ):
-                self._recovery_tasks.pop(key, None)
+            )
 
     def _start_extended_stream(self, symbol: str, kind: str) -> None:
         if (
@@ -2478,9 +3006,9 @@ class PublicPaperRuntime:
         current = self._stream_tasks.get(key)
         if current is not None and not current.done():
             return
-        self._stream_generations[key] = self._stream_generations.get(key, 0) + 1
+        session_id = self._new_stream_session(key)
         self._stream_tasks[key] = asyncio.create_task(
-            self._extended_stream(adapter, symbol, kind)
+            self._extended_stream(adapter, symbol, kind, session_id)
         )
 
     async def _restart_extended_stream(self, symbol: str, kind: str) -> None:
@@ -2492,13 +3020,25 @@ class PublicPaperRuntime:
             self._stream_tasks.pop(key, None)
         self._start_extended_stream(symbol, kind)
 
-    async def _extended_heartbeat(self, ws: object) -> None:
+    async def _extended_heartbeat(
+        self,
+        ws: object,
+        stream_key: tuple[Venue, str, str],
+        stream_session_id: StreamSessionId,
+    ) -> None:
         try:
             while self._stop_event is not None and not self._stop_event.is_set():
                 await self._sleep(10)
-                if self._stop_event.is_set():
+                if (
+                    self._stop_event.is_set()
+                    or not self._owns_stream_session(
+                        stream_key, stream_session_id
+                    )
+                ):
                     return
                 await ws.ping()  # type: ignore[attr-defined]
+                if not self._owns_stream_session(stream_key, stream_session_id):
+                    return
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -2508,92 +3048,88 @@ class PublicPaperRuntime:
             raise
 
     async def _recover_snapshot_in_background(
-        self, venue: Venue, symbol: str, generation: int | None = None
+        self, venue: Venue, symbol: str, episode: RecoveryEpisode
     ) -> None:
         key = (venue, symbol)
         assert self.adapters is not None
         started = self.clock.now()
-        self._record(
-            "PUBLIC_SNAPSHOT_RECOVERY_STARTED", at=started, venue=venue,
-            detail={"symbol": symbol},
+        generation = episode.attempt_generation
+        for attempt in range(1, 4):
+            try:
+                if not self._owns_recovery(key, episode, generation):
+                    return
+                episode.attempts = attempt
+                snapshot = await self.adapters[venue].fetch_book(symbol)
+                if not self._owns_recovery(key, episode, generation):
+                    return
+                recovered, buffered, replayed = self._build_recovery_book(
+                    snapshot, episode
+                )
+                if not self._owns_recovery(key, episode, generation):
+                    return
+                if not await self._publish_recovery_snapshot(
+                    key, episode, generation, recovered,
+                    at=self.clock.now(), buffered=buffered, replayed=replayed,
+                    source="REST_SNAPSHOT",
+                ):
+                    return
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if not self._owns_recovery(key, episode, generation):
+                    return
+                self._set_component_readiness(
+                    venue, f"stream:{symbol}:book", False,
+                    f"PUBLIC_SNAPSHOT_RECOVERY_FAILED:book:{type(exc).__name__}:"
+                    f"{str(exc)[:120]}", self.clock.now(),
+                )
+                delay = min(2 ** (attempt - 1), 30)
+                if attempt < 3:
+                    await self._sleep(delay)
+                    continue
+                episode.terminal = "FAILED"
+                self._record(
+                    "PUBLIC_SNAPSHOT_RECOVERY_FAILED", venue=venue,
+                    detail={
+                        "symbol": symbol,
+                        "episode_id": episode.episode_id.value,
+                        "generation": episode.attempt_generation.value,
+                        "exception_class": type(exc).__name__,
+                        "attempts": attempt,
+                        "retry_after_seconds": delay,
+                        "elapsed_seconds": str(Decimal(str(
+                            (self.clock.now() - started).total_seconds()
+                        ))),
+                    },
+                )
+
+    def _restart_recovery_attempt(
+        self, key: tuple[Venue, str], episode: RecoveryEpisode
+    ) -> None:
+        if self._recoveries.get(key) is not episode or episode.terminal is not None:
+            return
+        self._retire_recovery_task(episode.task)
+        episode.task = None
+        episode.buffer.clear()
+        self._recovery_attempt_number += 1
+        episode.attempt_generation = RecoveryAttemptGeneration(
+            self._recovery_attempt_number
         )
-        try:
-            for attempt in range(1, 4):
-                try:
-                    if (
-                        generation is not None
-                        and self._recovery_generations.get(key) != generation
-                    ):
-                        return
-                    snapshot = await self.adapters[venue].fetch_book(symbol)
-                    if (
-                        generation is not None
-                        and self._recovery_generations.get(key) != generation
-                    ):
-                        return
-                    recovered, buffered, replayed = self._install_recovery_snapshot(
-                        snapshot, generation=generation
-                    )
-                    await self.recover_snapshot(recovered, at=self.clock.now())
-                    self._recovery_attempts.pop(key, None)
-                    self._record(
-                        "PUBLIC_SNAPSHOT_RECOVERY_COMPLETED", venue=venue,
-                        detail={
-                            "symbol": symbol, "buffered": buffered,
-                            "replayed": replayed, "attempts": attempt,
-                            "elapsed_seconds": str(Decimal(str(
-                                (self.clock.now() - started).total_seconds()
-                            ))),
-                        },
-                    )
-                    break
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    if (
-                        generation is not None
-                        and self._recovery_generations.get(key) != generation
-                    ):
-                        return
-                    self._recovery_attempts[key] = attempt
-                    self._set_component_readiness(
-                        venue, f"stream:{symbol}:book", False,
-                        f"PUBLIC_SNAPSHOT_RECOVERY_FAILED:book:{type(exc).__name__}:"
-                        f"{str(exc)[:120]}", self.clock.now(),
-                    )
-                    delay = min(2 ** (attempt - 1), 30)
-                    if attempt < 3:
-                        await self._sleep(delay)
-                        continue
-                    self._record(
-                        "PUBLIC_SNAPSHOT_RECOVERY_FAILED", venue=venue,
-                        detail={
-                            "symbol": symbol,
-                            "exception_class": type(exc).__name__,
-                            "attempts": attempt,
-                            "retry_after_seconds": delay,
-                        },
-                    )
-        finally:
-            current_generation = (
-                generation is None
-                or self._recovery_generations.get(key) == generation
-            )
-            if (
-                current_generation
-                and key in self._recovery_buffers
-                and venue is not Venue.EXTENDED
-            ):
-                self._recovery_buffers.pop(key, None)
-            if current_generation:
-                self._recovery_tasks.pop(key, None)
+        self._spawn_recovery_task(
+            key, episode,
+            self._recover_snapshot_in_background(key[0], key[1], episode),
+        )
 
     async def _extended_stream(
-        self, adapter: ExtendedAdapter, symbol: str, kind: str
+        self,
+        adapter: ExtendedAdapter,
+        symbol: str,
+        kind: str,
+        stream_session_id: StreamSessionId,
     ) -> None:
         assert self._session is not None
         task_key = (Venue.EXTENDED, symbol, kind)
-        generation = self._stream_generations.get(task_key, 0)
         socket_identity = (Venue.EXTENDED, kind, (symbol,))
         url = {
             "book": adapter.orderbook_stream_url(symbol),
@@ -2602,36 +3138,73 @@ class PublicPaperRuntime:
         }[kind]
         delay = 1
         while self._stop_event is not None and not self._stop_event.is_set():
+            if not self._owns_stream_session(task_key, stream_session_id):
+                return
             session_established = False
             try:
                 async with self._session.ws_connect(url, heartbeat=None, autoping=False) as ws:
+                    if not self._owns_stream_session(task_key, stream_session_id):
+                        return
                     session_established = True
+                    if kind == "book":
+                        key = (Venue.EXTENDED, symbol)
+                        current = self._recoveries.get(key)
+                        if (
+                            self.coordinator.stream(*key).book() is not None
+                            or current is not None
+                        ) and (
+                            current is None
+                            or current.terminal is not None
+                            or current.owned_stream_session_id != stream_session_id
+                        ):
+                            if current is not None:
+                                self._retire_recovery_task(current.task)
+                            current = self._new_recovery_episode(
+                                key, stream_session_id
+                            )
+                            self._record_recovery_started(key, current)
                     last_trade_sequence: int | None = None
                     trade_discontinuity_recorded = False
                     self._confirm_extended_stream(
-                        symbol, kind, self.clock.now(), data_ready=False
+                        symbol, kind, self.clock.now(), data_ready=False,
+                        stream_session_id=stream_session_id,
                     )
                     self._socket_reconnected(
-                        socket_identity, at=self.clock.now()
+                        socket_identity, at=self.clock.now(),
+                        stream_session_id=stream_session_id,
                     )
+                    if not self._owns_stream_session(task_key, stream_session_id):
+                        return
                     self._watchdog_restarted(
                         socket_identity, at=self.clock.now()
                     )
                     ordinal = 0
-                    heartbeat = asyncio.create_task(self._extended_heartbeat(ws))
+                    heartbeat = asyncio.create_task(self._extended_heartbeat(
+                        ws, task_key, stream_session_id
+                    ))
                     try:
                         async for message in ws:
+                            if not self._owns_stream_session(
+                                task_key, stream_session_id
+                            ):
+                                return
                             if message.type is aiohttp.WSMsgType.PING:
                                 await ws.pong(message.data)
+                                if not self._owns_stream_session(
+                                    task_key, stream_session_id
+                                ):
+                                    return
                                 delay = 1
                                 self._confirm_extended_stream(
-                                    symbol, kind, self.clock.now(), data_ready=False
+                                    symbol, kind, self.clock.now(), data_ready=False,
+                                    stream_session_id=stream_session_id,
                                 )
                                 continue
                             if message.type is aiohttp.WSMsgType.PONG:
                                 delay = 1
                                 self._confirm_extended_stream(
-                                    symbol, kind, self.clock.now(), data_ready=False
+                                    symbol, kind, self.clock.now(), data_ready=False,
+                                    stream_session_id=stream_session_id,
                                 )
                                 continue
                             if message.type in {
@@ -2644,12 +3217,18 @@ class PublicPaperRuntime:
                             payload = json.loads(message.data, parse_float=Decimal)
                             if kind == "book":
                                 healthy = await self.apply_book_event(
-                                    adapter.normalize_book_message(payload)
+                                    adapter.normalize_book_message(payload),
+                                    stream_session_id=stream_session_id,
                                 )
+                                if not self._owns_stream_session(
+                                    task_key, stream_session_id
+                                ):
+                                    return
                                 delay = 1
                                 if healthy:
                                     self._confirm_extended_stream(
-                                        symbol, kind, self.clock.now(), data_ready=True
+                                        symbol, kind, self.clock.now(), data_ready=True,
+                                        stream_session_id=stream_session_id,
                                     )
                             elif kind == "trade":
                                 received_at = self.clock.now()
@@ -2687,15 +3266,21 @@ class PublicPaperRuntime:
                                     if sequence <= previous:
                                         delay = 1
                                         self._confirm_extended_stream(
-                                            symbol, kind, received_at, data_ready=True
+                                            symbol, kind, received_at, data_ready=True,
+                                            stream_session_id=stream_session_id,
                                         )
                                         continue
                                 last_trade_sequence = sequence
                                 delay = 1
                                 self._confirm_extended_stream(
-                                    symbol, kind, received_at, data_ready=True
+                                    symbol, kind, received_at, data_ready=True,
+                                    stream_session_id=stream_session_id,
                                 )
                                 for trade in trades:
+                                    if not self._owns_stream_session(
+                                        task_key, stream_session_id
+                                    ):
+                                        return
                                     await self.deliver_trade(trade)
                             else:
                                 row = self.observations.get((Venue.EXTENDED, symbol))
@@ -2705,9 +3290,14 @@ class PublicPaperRuntime:
                                     )
                                     delay = 1
                                     self._confirm_extended_stream(
-                                        symbol, kind, self.clock.now(), data_ready=True
+                                        symbol, kind, self.clock.now(), data_ready=True,
+                                        stream_session_id=stream_session_id,
                                     )
                                     if settlement is not None:
+                                        if not self._owns_stream_session(
+                                            task_key, stream_session_id
+                                        ):
+                                            return
                                         await self._apply_extended_funding_record(settlement)
                     finally:
                         heartbeat.cancel()
@@ -2720,7 +3310,7 @@ class PublicPaperRuntime:
                 if self._stop_event is not None and self._stop_event.is_set():
                     break
                 if (
-                    self._stream_generations.get(task_key, 0) != generation
+                    not self._owns_stream_session(task_key, stream_session_id)
                     or (
                         self._stream_tasks.get(task_key) is not None
                         and self._stream_tasks.get(task_key)
@@ -2731,65 +3321,136 @@ class PublicPaperRuntime:
                 if session_established:
                     self._record_transport_disconnect(
                         socket_identity, at=self.clock.now(), exception=exc,
+                        stream_session_id=stream_session_id,
                     )
                 await self.mark_disconnected(
                     Venue.EXTENDED, symbol, stream_kind=kind, exception=exc,
-                    stream_generation=generation,
+                    stream_session_id=stream_session_id,
                 )
+                if not self._owns_stream_session(task_key, stream_session_id):
+                    return
                 await self._sleep(delay)
+                if not self._owns_stream_session(task_key, stream_session_id):
+                    return
                 delay = min(delay * 2, 30)
+                stream_session_id = self._new_stream_session(task_key)
 
     async def _combined_stream(
-        self, venue: Venue, adapter: PublicAdapter, symbols: tuple[str, ...]
+        self,
+        venue: Venue,
+        adapter: PublicAdapter,
+        symbols: tuple[str, ...],
+        stream_session_id: StreamSessionId,
     ) -> None:
         assert self._session is not None
         task_key = (venue, "*", "combined")
-        generation = self._stream_generations.get(task_key, 0)
         ordered_symbols = tuple(sorted(symbols))
         socket_identity = (venue, "combined", ordered_symbols)
         delay = 1
         if not symbols:
             return
         while self._stop_event is not None and not self._stop_event.is_set():
+            if not self._owns_stream_session(task_key, stream_session_id):
+                return
             session_established = False
             try:
                 async with self._session.ws_connect(
                     adapter.ws_base, heartbeat=10, autoping=False, compress=15
                 ) as ws:
+                    if not self._owns_stream_session(task_key, stream_session_id):
+                        return
                     session_established = True
+                    replaced_recoveries = (
+                        self._replace_displaced_combined_recoveries(
+                            venue, symbols, stream_session_id
+                        )
+                    )
                     if venue is Venue.RISEX:
                         ids = [adapter.market_id(symbol) for symbol in symbols]  # type: ignore[attr-defined]
                         await ws.send_json(adapter.orderbook_subscription(ids))  # type: ignore[attr-defined]
+                        if not self._owns_stream_session(task_key, stream_session_id):
+                            return
                         await ws.send_json(adapter.trades_subscription(ids))  # type: ignore[attr-defined]
                     else:
                         for symbol in symbols:
                             product = adapter.product_id(symbol)  # type: ignore[attr-defined]
                             for kind in ("book_depth", "trade", "funding_rate", "funding_payment"):
                                 await ws.send_json(adapter.subscription(kind, product))  # type: ignore[attr-defined]
+                                if not self._owns_stream_session(
+                                    task_key, stream_session_id
+                                ):
+                                    return
                     self._socket_reconnected(
-                        socket_identity, at=self.clock.now()
+                        socket_identity, at=self.clock.now(),
+                        stream_session_id=stream_session_id,
                     )
+                    if not self._owns_stream_session(task_key, stream_session_id):
+                        return
+                    risex_resync = (
+                        venue is Venue.RISEX
+                        and bool(replaced_recoveries)
+                    )
+                    if risex_resync:
+                        await self._resubscribe_risex_orderbooks(
+                            ws, adapter, symbols,
+                            triggering_symbol=replaced_recoveries[0],
+                            stream_session_id=stream_session_id,
+                        )
                     for symbol in symbols:
-                        self.coordinator.stream(venue, symbol).connected(self.clock.now())
-                        self.mark_trade_stream_connected(venue, symbol)
-                        for component in ("funding", "connection_combined"):
-                            self._set_component_readiness(
-                                venue, f"{component}:{symbol}", True,
-                                "PUBLIC_STREAM_CONNECTED", self.clock.now(),
-                            )
-                        await self.recover_snapshot(await adapter.fetch_book(symbol))
-                        for component in (
-                            "book", "trade", "funding", "connection_combined"
+                        if not self._owns_stream_session(task_key, stream_session_id):
+                            return
+                        stream = self.coordinator.stream(venue, symbol)
+                        stream.connected(self.clock.now())
+                        book_ready = False
+                        if risex_resync:
+                            book_ready = False
+                        elif (
+                            venue is Venue.NADO
+                            and (episode := self._recoveries.get((venue, symbol)))
+                            is not None
+                            and episode.terminal is None
+                            and episode.owned_stream_session_id
+                            == stream_session_id
                         ):
-                            self._set_component_readiness(
-                                venue, f"{component}:{symbol}", True,
-                                "PUBLIC_STREAM_CONNECTED", self.clock.now(),
+                            if episode.task is not None:
+                                await episode.task
+                            if not self._owns_stream_session(
+                                task_key, stream_session_id
+                            ):
+                                return
+                            book_ready = episode.terminal == "COMPLETE"
+                        else:
+                            snapshot = await adapter.fetch_book(symbol)
+                            if not self._owns_stream_session(
+                                task_key, stream_session_id
+                            ):
+                                return
+                            book_ready = await self.apply_book_event(
+                                snapshot, stream_session_id=stream_session_id
                             )
+                        if book_ready:
+                            self.mark_trade_stream_connected(venue, symbol)
+                            for component in (
+                                "book", "trade", "funding",
+                                "connection_combined",
+                            ):
+                                self._set_component_readiness(
+                                    venue, f"{component}:{symbol}", True,
+                                    "PUBLIC_STREAM_CONNECTED", self.clock.now(),
+                                )
                     delay = 1
                     ordinal = 0
                     async for message in ws:
+                        if not self._owns_stream_session(
+                            task_key, stream_session_id
+                        ):
+                            return
                         if message.type is aiohttp.WSMsgType.PING:
                             await ws.pong(message.data)
+                            if not self._owns_stream_session(
+                                task_key, stream_session_id
+                            ):
+                                return
                             for symbol in symbols:
                                 self.coordinator.stream(venue, symbol).connection_confirmed(self.clock.now())
                             continue
@@ -2813,13 +3474,44 @@ class PublicPaperRuntime:
                             continue
                         if "orderbook" in kind or "book_depth" in kind:
                             event = adapter.normalize_book_message(payload)  # type: ignore[attr-defined]
-                            healthy = await self.apply_book_event(event)
-                            if venue is Venue.RISEX and not healthy:
+                            healthy = await self.apply_book_event(
+                                event, stream_session_id=stream_session_id
+                            )
+                            if not self._owns_stream_session(
+                                task_key, stream_session_id
+                            ):
+                                return
+                            episode = self._recoveries.get(
+                                (venue, event.canonical_market)
+                            )
+                            if (
+                                venue is Venue.RISEX and not healthy
+                                and (episode is None or episode.terminal is not None)
+                            ):
                                 await self._resubscribe_risex_orderbooks(
                                     ws, adapter, symbols,
                                     triggering_symbol=event.canonical_market,
+                                    stream_session_id=stream_session_id,
                                 )
+                            elif healthy:
+                                self.mark_trade_stream_connected(
+                                    venue, event.canonical_market
+                                )
+                                for component in (
+                                    "book", "trade", "funding",
+                                    "connection_combined",
+                                ):
+                                    self._set_component_readiness(
+                                        venue,
+                                        f"{component}:{event.canonical_market}",
+                                        True, "PUBLIC_STREAM_CONNECTED",
+                                        self.clock.now(),
+                                    )
                         elif "trade" in kind:
+                            if not self._owns_stream_session(
+                                task_key, stream_session_id
+                            ):
+                                return
                             await self.deliver_trade(
                                 adapter.normalize_trade(
                                     payload,
@@ -2828,6 +3520,10 @@ class PublicPaperRuntime:
                                     ordinal=ordinal,
                                 )
                             )
+                            if not self._owns_stream_session(
+                                task_key, stream_session_id
+                            ):
+                                return
                         elif venue is Venue.NADO and "funding_rate" in kind:
                             product = int(payload["product_id"])
                             symbol = adapter.symbol_for_product(product)  # type: ignore[attr-defined]
@@ -2846,7 +3542,13 @@ class PublicPaperRuntime:
                                     received_at=received_at,
                                     assumed_open_at=received_at,
                                 )
-                                await self._apply_funding_quote(quote)
+                                if not self._owns_stream_session(
+                                    task_key, stream_session_id
+                                ):
+                                    return
+                                await self._apply_nado_funding_quote(
+                                    quote, stream_session_id, ()
+                                )
                         elif venue is Venue.NADO and "funding_payment" in kind:
                             product = int(payload["product_id"])
                             symbol = adapter.symbol_for_product(product)  # type: ignore[attr-defined]
@@ -2861,9 +3563,28 @@ class PublicPaperRuntime:
                                     previous_short_x18=previous_short,
                                     assumed_open_at=self.clock.now(),
                                 )
-                                self._nado_cumulative_funding[(symbol, "long")] = payload.get("cumulative_funding_long_x18")
-                                self._nado_cumulative_funding[(symbol, "short")] = payload.get("cumulative_funding_short_x18")
-                                await self._apply_funding_quote(quote)
+                                if not self._owns_stream_session(
+                                    task_key, stream_session_id
+                                ):
+                                    return
+                                await self._apply_nado_funding_quote(
+                                    quote,
+                                    stream_session_id,
+                                    (
+                                        (
+                                            (symbol, "long"),
+                                            payload.get(
+                                                "cumulative_funding_long_x18"
+                                            ),
+                                        ),
+                                        (
+                                            (symbol, "short"),
+                                            payload.get(
+                                                "cumulative_funding_short_x18"
+                                            ),
+                                        ),
+                                    ),
+                                )
                     if self._stop_event is None or not self._stop_event.is_set():
                         raise _PublicSocketClosed("EOF")
             except asyncio.CancelledError:
@@ -2872,7 +3593,7 @@ class PublicPaperRuntime:
                 if self._stop_event is not None and self._stop_event.is_set():
                     break
                 if (
-                    self._stream_generations.get(task_key, 0) != generation
+                    not self._owns_stream_session(task_key, stream_session_id)
                     or (
                         self._stream_tasks.get(task_key) is not None
                         and self._stream_tasks.get(task_key)
@@ -2880,20 +3601,23 @@ class PublicPaperRuntime:
                     )
                 ):
                     return
-                if venue is Venue.RISEX:
-                    for symbol in symbols:
-                        self._recovery_buffers.pop((venue, symbol), None)
                 if session_established:
                     self._record_transport_disconnect(
                         socket_identity, at=self.clock.now(), exception=exc,
+                        stream_session_id=stream_session_id,
                     )
                 for symbol in symbols:
                     await self.mark_disconnected(
                         venue, symbol, stream_kind="combined", exception=exc,
-                        stream_generation=generation,
+                        stream_session_id=stream_session_id,
                     )
+                if not self._owns_stream_session(task_key, stream_session_id):
+                    return
                 await self._sleep(delay)
+                if not self._owns_stream_session(task_key, stream_session_id):
+                    return
                 delay = min(delay * 2, 30)
+                stream_session_id = self._new_stream_session(task_key)
 
     async def start_streams(self) -> None:
         if self._session is None or self.adapters is None:
@@ -2947,11 +3671,11 @@ class PublicPaperRuntime:
             self._combined_symbols[venue] = wanted
             self._remove_obsolete_components(venue, set(wanted), self.clock.now())
             if wanted:
-                self._stream_generations[key] = (
-                    self._stream_generations.get(key, 0) + 1
-                )
+                stream_session_id = self._new_stream_session(key)
                 self._stream_tasks[key] = asyncio.create_task(
-                    self._combined_stream(venue, adapter, wanted)
+                    self._combined_stream(
+                        venue, adapter, wanted, stream_session_id
+                    )
                 )
                 self._record(
                     "PUBLIC_STREAM_RECONCILED", venue=venue,
@@ -3170,7 +3894,11 @@ class PublicPaperRuntime:
         owned = list(self._stream_tasks.values())
         if self._refresh_task is not None:
             owned.append(self._refresh_task)
-        owned.extend(self._recovery_tasks.values())
+        owned.extend(
+            episode.task for episode in self._recoveries.values()
+            if episode.task is not None
+        )
+        owned.extend(self._retired_recovery_tasks)
         if self._extended_universe_task is not None:
             owned.append(self._extended_universe_task)
         for task in owned:
@@ -3203,13 +3931,11 @@ class PublicPaperRuntime:
                 "Paper runtime stopped safely",
             )
         self._stream_tasks.clear()
-        self._recovery_tasks.clear()
+        self._stream_sessions.clear()
+        self._recoveries.clear()
+        self._retired_recovery_tasks.clear()
         self._pending_socket_episodes.clear()
         self._pending_watchdog_episodes.clear()
-        self._recovery_buffers.clear()
-        self._recovery_overflowed.clear()
-        self._recovery_attempts.clear()
-        self._recovery_generations.clear()
         self._refresh_task = None
         self._extended_universe_task = None
 
