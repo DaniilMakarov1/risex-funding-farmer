@@ -27,6 +27,7 @@ from .models import (
     SettlementStatus,
     TargetFundingCycle,
     TradeEvidence,
+    Venue,
 )
 from .paper_broker import (
     PaperEntryOrder,
@@ -384,8 +385,19 @@ class PaperRepository:
                 "UPDATE processed_trade_events SET payload=? WHERE trade_event_key=?",
                 (_dump(trade), trade.trade_event_key),
             )
-        elif _load(row["payload"]) != trade:
-            raise ValueError("conflicting duplicate trade event")
+        else:
+            existing = _load(row["payload"])
+            if (
+                isinstance(existing, tuple)
+                and len(existing) == 2
+                and existing[0] == "POSITION_KEY"
+            ):
+                self.connection.execute(
+                    "UPDATE processed_trade_events SET payload=? WHERE trade_event_key=?",
+                    (_dump(trade), trade.trade_event_key),
+                )
+            elif existing != trade:
+                raise ValueError("conflicting duplicate trade event")
 
     def upsert_settlement(self, settlement: FundingSettlement) -> None:
         with self.transaction():
@@ -404,9 +416,19 @@ class PaperRepository:
                 return
             if existing.status is settlement.status:
                 raise ValueError("conflicting settlement authority")
-            current = replace_funding_settlement(
-                existing, settlement.status, settlement.cash_usd
-            )
+            if (
+                existing.venue is Venue.EXTENDED
+                and settlement.status is SettlementStatus.UNRESOLVED
+                and settlement.cash_usd is None
+                and existing.status in {
+                    SettlementStatus.PENDING, SettlementStatus.ESTIMATED
+                }
+            ):
+                current = settlement
+            else:
+                current = replace_funding_settlement(
+                    existing, settlement.status, settlement.cash_usd
+                )
         self.connection.execute(
             """INSERT INTO funding_settlements VALUES (?, ?, ?, ?, ?, ?)
                ON CONFLICT(venue, canonical_market, settlement_at) DO UPDATE SET
@@ -557,12 +579,31 @@ class PaperRepository:
                     "INSERT OR IGNORE INTO position_cycles VALUES (?, ?)",
                     (position_id, snapshot.active_cycle.cycle_id),
                 )
-        for settlement in snapshot.settlements:
-            self._upsert_settlement(settlement)
-        for key in snapshot.processed_trade_keys:
-            self.connection.execute(
-                "INSERT OR IGNORE INTO processed_trade_events VALUES (?, NULL)", (key,)
+        persisted_settlements = {
+            (row["venue"], row["canonical_market"], row["settlement_at"]): row["payload"]
+            for row in self.connection.execute(
+                "SELECT venue,canonical_market,settlement_at,payload FROM funding_settlements"
             )
+        }
+        for settlement in snapshot.settlements:
+            key = (
+                settlement.venue.value, settlement.canonical_market,
+                _iso(settlement.settlement_at),
+            )
+            payload = persisted_settlements.get(key)
+            if payload is None or _load(payload) != settlement:
+                self._upsert_settlement(settlement)
+        if position_id is not None:
+            persisted_keys = {
+                row["trade_event_key"] for row in self.connection.execute(
+                    "SELECT trade_event_key FROM processed_trade_events"
+                )
+            }
+            for key in snapshot.processed_trade_keys - persisted_keys:
+                self.connection.execute(
+                    "INSERT INTO processed_trade_events VALUES (?, ?)",
+                    (key, _dump(("POSITION_KEY", position_id))),
+                )
         if snapshot.exit_order is not None:
             self._save_exit_order(snapshot.exit_order, position_id)
         if snapshot.position is not None:
@@ -624,7 +665,8 @@ class PaperRepository:
         if snapshot.closed_trade is not None:
             self._save_closed(snapshot.closed_trade)
         checkpoint = replace(
-            snapshot, samples=(), events=(), gaps=(), exit_order=None
+            snapshot, samples=(), events=(), gaps=(), exit_order=None,
+            settlements=(), processed_trade_keys=frozenset(),
         )
         self._save_runtime("LIFECYCLE", snapshot.lifecycle_state, at, checkpoint)
 
@@ -766,6 +808,40 @@ class PaperRepository:
                 (position_id,),
             )
         )
+        settlements = tuple(
+            _load(item["payload"])
+            for item in self.connection.execute(
+                """SELECT DISTINCT s.payload,s.settlement_at,s.venue,s.canonical_market
+                   FROM position_cycles p
+                   JOIN funding_cycle_events e ON e.cycle_id=p.cycle_id
+                   JOIN funding_settlements s ON s.venue=e.venue
+                    AND s.canonical_market=e.canonical_market
+                    AND s.settlement_at=e.settlement_at
+                   WHERE p.position_id=?
+                   ORDER BY s.settlement_at,s.venue,s.canonical_market""",
+                (position_id,),
+            )
+        )
+        processed_keys: set[str] = set()
+        relevant_markets = {
+            (value.risex_market.venue, value.risex_market.venue_symbol),
+            (value.hedge_market.venue, value.hedge_market.venue_symbol),
+        }
+        for item in self.connection.execute(
+            "SELECT trade_event_key,payload FROM processed_trade_events "
+            "WHERE payload IS NOT NULL"
+        ):
+            payload = _load(item["payload"])
+            tagged = payload == ("POSITION_KEY", position_id)
+            evidence = (
+                isinstance(payload, TradeEvidence)
+                and (payload.venue, payload.canonical_market) in relevant_markets
+                and payload.exchange_timestamp
+                >= value.position.hedge_maker_fill_exchange_at
+            )
+            if tagged or evidence:
+                processed_keys.add(item["trade_event_key"])
+        processed_trade_keys = frozenset(processed_keys)
         exit_order = value.exit_order
         if exit_order is None:
             order_row = self.connection.execute(
@@ -776,7 +852,8 @@ class PaperRepository:
                 exit_order = _load(order_row["payload"])
         return replace(
             value, samples=samples, events=events, gaps=gaps,
-            exit_order=exit_order,
+            exit_order=exit_order, settlements=settlements,
+            processed_trade_keys=processed_trade_keys,
         )
 
     def runtime_updated_at(self) -> datetime | None:
@@ -988,11 +1065,17 @@ class PaperRepository:
                 "ORDER BY rank IS NULL, rank, route_key"
             )
         ]
-        latest_trade_row = self.connection.execute(
+        latest_trade_rows = self.connection.execute(
             "SELECT payload FROM processed_trade_events WHERE payload IS NOT NULL "
-            "ORDER BY rowid DESC LIMIT 1"
-        ).fetchone()
-        latest_trade = None if latest_trade_row is None else _load(latest_trade_row["payload"])
+            "ORDER BY rowid DESC"
+        ).fetchall()
+        latest_trade = next(
+            (
+                payload for row in latest_trade_rows
+                if isinstance((payload := _load(row["payload"])), TradeEvidence)
+            ),
+            None,
+        )
         normal_exit_fills = sum(
             closed.close_reason.value == "NORMAL_MAKER" for closed in closed_values
         )

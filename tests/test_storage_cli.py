@@ -294,14 +294,21 @@ def test_cli_commands_are_structured_and_network_free(tmp_path, capsys) -> None:
 @pytest.mark.asyncio
 async def test_open_lifecycle_checkpoint_is_bounded_and_hydrates_history(tmp_path) -> None:
     with PaperRepository(tmp_path / "bounded-checkpoint.db") as repository:
-        await run_fixture(load_fixture(FIXTURES / "open_position.json"), repository)
+        await run_fixture({"scenario": "exiting_aggressive_open"}, repository)
         state = repository.load_runtime()
         assert isinstance(state, LifecycleSnapshot)
         sample = PositionSample(
             DEFAULT_LOGICAL_AT, D("1"), D("2"), D("3"), D("4"),
             D("5"), D("6"), D("7"), DataQuality.COMPLETE,
         )
-        expanded = replace(state, samples=(sample,) * 1000)
+        expanded = replace(
+            state, samples=state.samples + tuple(
+                replace(sample, sampled_at=sample.sampled_at + timedelta(seconds=index))
+                for index in range(1000)
+            ),
+            processed_trade_keys=state.processed_trade_keys
+            | frozenset(f"trade-{index}" for index in range(1000)),
+        )
         repository.save_decision(
             recorded_at=DEFAULT_LOGICAL_AT + timedelta(hours=6),
             lifecycle_snapshot=expanded,
@@ -309,9 +316,35 @@ async def test_open_lifecycle_checkpoint_is_bounded_and_hydrates_history(tmp_pat
         checkpoint_bytes = repository.connection.execute(
             "SELECT length(payload) FROM runtime_state WHERE singleton=1"
         ).fetchone()[0]
+        mutations = []
+        repository.connection.set_trace_callback(
+            lambda statement: mutations.append(statement)
+            if statement.lstrip().upper().startswith(("INSERT", "UPDATE", "REPLACE"))
+            else None
+        )
+        updated = replace(
+            expanded,
+            samples=expanded.samples + (replace(sample, sampled_at=sample.sampled_at + timedelta(seconds=10)),),
+            processed_trade_keys=expanded.processed_trade_keys | {"trade-1000"},
+        )
+        repository.save_decision(
+            recorded_at=DEFAULT_LOGICAL_AT + timedelta(hours=6, seconds=10),
+            lifecycle_snapshot=updated,
+        )
+        repository.connection.set_trace_callback(None)
+        checkpoint_after = repository.connection.execute(
+            "SELECT length(payload) FROM runtime_state WHERE singleton=1"
+        ).fetchone()[0]
         restored = repository.load_runtime()
     assert checkpoint_bytes < 20_000
-    assert restored.samples == expanded.samples
+    assert checkpoint_after < 20_000
+    assert abs(checkpoint_after - checkpoint_bytes) < 1000
+    assert len(mutations) <= 16
+    assert restored.samples == updated.samples
+    assert restored.events == updated.events
+    assert restored.settlements == updated.settlements
+    assert restored.processed_trade_keys == updated.processed_trade_keys
+    assert restored.exit_order == updated.exit_order
 
 
 def test_default_and_explicit_json_preserve_route_semantics(

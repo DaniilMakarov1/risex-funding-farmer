@@ -468,6 +468,27 @@ class LifecycleEngine:
         )
         self._set_settlements(rows)
 
+    async def mark_extended_history_unresolved(
+        self, update: FundingSettlement
+    ) -> LifecycleSnapshot:
+        """Fail closed when official Extended applied history has no exact row."""
+        async with self._lock:
+            rows = self._settlement_map()
+            current = rows.get(update.key)
+            if (
+                current is None
+                or update.venue is not Venue.EXTENDED
+                or update.status is not SettlementStatus.UNRESOLVED
+                or update.cash_usd is not None
+                or current.status not in {
+                    SettlementStatus.PENDING, SettlementStatus.ESTIMATED
+                }
+            ):
+                return self._snapshot
+            rows[update.key] = update
+            self._set_settlements(rows)
+            return self._snapshot
+
     def _elapsed_settlements(self, at: datetime) -> tuple[FundingSettlement, ...]:
         return tuple(row for row in self._snapshot.settlements if row.settlement_at <= at)
 

@@ -292,6 +292,7 @@ class PublicPaperRuntime:
         self._recovery_buffers: dict[tuple[Venue, str], list[BookDelta]] = {}
         self._recovery_overflowed: set[tuple[Venue, str]] = set()
         self._recovery_attempts: dict[tuple[Venue, str], int] = {}
+        self._recovery_generations: dict[tuple[Venue, str], int] = {}
         self._pending_socket_episodes: dict[
             tuple[Venue, str, tuple[str, ...]], dict[str, object]
         ] = {}
@@ -1370,20 +1371,47 @@ class PublicPaperRuntime:
             return_exceptions=True,
         )
         required_keys = {row.key for row in runtime.settlements}
-        settlement_updates = tuple(
+        settlement_updates: list[FundingSettlement] = [
             update
             for result in history
             if not isinstance(result, BaseException)
             for update in result
-            if update.key in required_keys
-        )
+            if update.status == SettlementStatus.APPLIED_RATE
+            and update.key in required_keys
+        ]
+        applied_keys = {update.key for update in settlement_updates}
+        unresolved_updates: list[FundingSettlement] = []
+        for venue in (Venue.RISEX, runtime.hedge_market.venue):
+            for row in runtime.settlements:
+                if row.venue is not venue or row.key not in required_keys:
+                    continue
+                if (
+                    row.key not in applied_keys
+                    and
+                    venue is Venue.EXTENDED
+                    and row.settlement_at <= at
+                    and row.status in {
+                        SettlementStatus.PENDING,
+                        SettlementStatus.ESTIMATED,
+                    }
+                ):
+                    unresolved_updates.append(replace(
+                        row, status=SettlementStatus.UNRESOLVED, cash_usd=None,
+                    ))
         await engine.restart(
             last_known_at=last_known_at,
             recovered_at=at,
             risex_observation=risex,
             hedge_observation=hedge,
-            settlement_updates=settlement_updates,
+            settlement_updates=tuple(settlement_updates),
         )
+        # Settlement authority is independent of whether both execution books
+        # were fresh enough for gap recovery.
+        for update in settlement_updates:
+            await engine.reconcile_settlement(update)
+        for update in unresolved_updates:
+            if update.key not in applied_keys:
+                await engine.mark_extended_history_unresolved(update)
         self.lifecycle = engine
         self.repository.save_decision(recorded_at=at, lifecycle_snapshot=engine.snapshot)
         self._record("OPEN_POSITION_RESTORED", at=at)
@@ -2230,6 +2258,12 @@ class PublicPaperRuntime:
             if len(buffer) >= 2048:
                 buffer.clear()
                 self._recovery_overflowed.add(key)
+                self._recovery_generations[key] = (
+                    self._recovery_generations.get(key, 0) + 1
+                )
+                obsolete = self._recovery_tasks.pop(key, None)
+                if obsolete is not None and obsolete is not asyncio.current_task():
+                    obsolete.cancel()
                 self.coordinator.stream(*key).gap()
                 self._set_component_readiness(
                     event.venue, f"book:{event.canonical_market}", False,
@@ -2240,6 +2274,8 @@ class PublicPaperRuntime:
                     venue=event.venue,
                     detail={"symbol": event.canonical_market, "capacity": 2048},
                 )
+                self._recovery_buffers.pop(key, None)
+                self._start_snapshot_recovery(*key)
             elif key not in self._recovery_overflowed:
                 buffer.append(event)
             return True
@@ -2319,24 +2355,30 @@ class PublicPaperRuntime:
         if key in self._recovery_buffers:
             return
         self._recovery_buffers[key] = []
-        self._recovery_overflowed.discard(key)
         existing = self._recovery_tasks.get(key)
         if existing is not None and not existing.done():
             return
+        generation = self._recovery_generations.get(key, 0) + 1
+        self._recovery_generations[key] = generation
         recovery = (
-            self._restart_extended_book_stream(venue, symbol)
+            self._restart_extended_book_stream(venue, symbol, generation)
             if venue is Venue.EXTENDED
-            else self._recover_snapshot_in_background(venue, symbol)
+            else self._recover_snapshot_in_background(venue, symbol, generation)
         )
         self._recovery_tasks[key] = asyncio.create_task(
             recovery
         )
 
     def _install_recovery_snapshot(
-        self, snapshot: OrderBook
+        self, snapshot: OrderBook, *, generation: int | None = None
     ) -> tuple[OrderBook, int, int]:
         """Install and drain the current buffer without yielding to the receiver."""
         key = (snapshot.venue, snapshot.canonical_market)
+        if (
+            generation is not None
+            and self._recovery_generations.get(key) != generation
+        ):
+            raise ValueError("stale recovery generation")
         if key in self._recovery_overflowed:
             self._recovery_overflowed.discard(key)
             self._recovery_buffers[key].clear()
@@ -2365,7 +2407,7 @@ class PublicPaperRuntime:
         return recovered, buffered, replayed
 
     async def _restart_extended_book_stream(
-        self, venue: Venue, symbol: str
+        self, venue: Venue, symbol: str, generation: int | None = None
     ) -> None:
         key = (venue, symbol)
         task_key = (Venue.EXTENDED, symbol, "book")
@@ -2388,7 +2430,11 @@ class PublicPaperRuntime:
                     self._extended_stream(adapter, symbol, "book")
                 )
         finally:
-            self._recovery_tasks.pop(key, None)
+            if (
+                generation is None
+                or self._recovery_generations.get(key) == generation
+            ):
+                self._recovery_tasks.pop(key, None)
 
     def _start_extended_stream(self, symbol: str, kind: str) -> None:
         if (
@@ -2435,7 +2481,7 @@ class PublicPaperRuntime:
             raise
 
     async def _recover_snapshot_in_background(
-        self, venue: Venue, symbol: str
+        self, venue: Venue, symbol: str, generation: int | None = None
     ) -> None:
         key = (venue, symbol)
         assert self.adapters is not None
@@ -2447,8 +2493,20 @@ class PublicPaperRuntime:
         try:
             for attempt in range(1, 4):
                 try:
+                    if (
+                        generation is not None
+                        and self._recovery_generations.get(key) != generation
+                    ):
+                        return
                     snapshot = await self.adapters[venue].fetch_book(symbol)
-                    recovered, buffered, replayed = self._install_recovery_snapshot(snapshot)
+                    if (
+                        generation is not None
+                        and self._recovery_generations.get(key) != generation
+                    ):
+                        return
+                    recovered, buffered, replayed = self._install_recovery_snapshot(
+                        snapshot, generation=generation
+                    )
                     await self.recover_snapshot(recovered, at=self.clock.now())
                     self._recovery_attempts.pop(key, None)
                     self._record(
@@ -2465,6 +2523,11 @@ class PublicPaperRuntime:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
+                    if (
+                        generation is not None
+                        and self._recovery_generations.get(key) != generation
+                    ):
+                        return
                     self._recovery_attempts[key] = attempt
                     self._set_component_readiness(
                         venue, f"stream:{symbol}:book", False,
@@ -2485,9 +2548,18 @@ class PublicPaperRuntime:
                         },
                     )
         finally:
-            if key in self._recovery_buffers and venue is not Venue.EXTENDED:
+            current_generation = (
+                generation is None
+                or self._recovery_generations.get(key) == generation
+            )
+            if (
+                current_generation
+                and key in self._recovery_buffers
+                and venue is not Venue.EXTENDED
+            ):
                 self._recovery_buffers.pop(key, None)
-            self._recovery_tasks.pop(key, None)
+            if current_generation:
+                self._recovery_tasks.pop(key, None)
 
     async def _extended_stream(
         self, adapter: ExtendedAdapter, symbol: str, kind: str
@@ -3067,6 +3139,7 @@ class PublicPaperRuntime:
         self._recovery_buffers.clear()
         self._recovery_overflowed.clear()
         self._recovery_attempts.clear()
+        self._recovery_generations.clear()
         self._refresh_task = None
         self._extended_universe_task = None
 

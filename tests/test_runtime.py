@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 import json
 from pathlib import Path
+import time
 from types import SimpleNamespace
 
 import aiohttp
@@ -12,6 +13,7 @@ import pytest
 from risex_farmer.exchanges.base import PublicAdapter, PublicDataUnavailable
 from risex_farmer.exchanges.extended import ExtendedAdapter
 from risex_farmer.exchanges.risex import RisexAdapter
+from risex_farmer.config import PAPER_CONFIG
 from risex_farmer.models import (
     BookLevel,
     BookDelta,
@@ -32,12 +34,14 @@ from risex_farmer.models import (
     Venue,
 )
 from risex_farmer.market_data import BookStream
+from risex_farmer.lifecycle import LifecycleEngine
 from risex_farmer.notifications import (
     NotificationOutbox,
     TelegramDelivery,
     format_telegram_money,
 )
 from risex_farmer.runtime import PublicPaperRuntime, public_paper_run, public_scan_once
+from risex_farmer.orchestrator import run_fixture
 from risex_farmer.storage import PaperRepository
 
 
@@ -1915,6 +1919,127 @@ async def test_disconnect_cancels_entry_and_position_gap_recovers_from_snapshot(
 
 
 @pytest.mark.asyncio
+async def test_concurrent_component_failures_form_one_aggregate_execution_gap(tmp_path):
+    clock = FakeClock()
+    target = NOW + timedelta(seconds=120)
+    fakes = adapters(clock, settlement_at=target)
+    with PaperRepository(tmp_path / "aggregate-gap.db") as repository:
+        async with PublicPaperRuntime(repository, adapters=fakes, clock=clock) as runtime:
+            await activate_with_live_streams(runtime, clock)
+            clock.advance(1)
+            order = runtime.broker.state.order
+            runtime.mark_trade_stream_connected(order.venue, order.canonical_market)
+            await runtime.deliver_trade(maker_trade(runtime, clock.now(), "aggregate-gap-entry"))
+            snapshot = runtime.lifecycle.snapshot
+            risex_key = (Venue.RISEX, snapshot.risex_market.venue_symbol)
+            hedge_key = (snapshot.hedge_market.venue, snapshot.hedge_market.venue_symbol)
+            await runtime.mark_disconnected(
+                hedge_key[0], hedge_key[1], stream_kind="funding"
+            )
+            assert not runtime.lifecycle.snapshot.gap_open
+            await asyncio.gather(
+                runtime.mark_disconnected(*risex_key, stream_kind="book"),
+                runtime.mark_disconnected(*hedge_key, stream_kind="trade"),
+            )
+            assert runtime.lifecycle.snapshot.gap_count == 1
+            assert runtime.lifecycle.snapshot.gap_open
+            clock.advance(1)
+            runtime.mark_trade_stream_connected(*risex_key, at=clock.now())
+            await runtime.recover_snapshot(
+                await fakes[risex_key[0]].fetch_book(risex_key[1]), at=clock.now()
+            )
+            assert runtime.lifecycle.snapshot.gap_open
+            runtime.mark_trade_stream_connected(*hedge_key, at=clock.now())
+            await runtime.recover_snapshot(
+                await fakes[hedge_key[0]].fetch_book(hedge_key[1]), at=clock.now()
+            )
+            final = runtime.lifecycle.snapshot
+            assert not final.gap_open
+            assert final.gap_count == 1
+            event_times = [event.occurred_at for event in final.events]
+            assert event_times == sorted(event_times)
+            if final.exit_order is not None:
+                for version in final.exit_order.versions:
+                    assert version.created_at <= version.last_checked_at
+                    if version.closed_at is not None:
+                        assert version.last_checked_at <= version.closed_at
+
+
+@pytest.mark.asyncio
+async def test_production_shaped_zec_first_fill_chain_is_exact_and_single(tmp_path):
+    clock = FakeClock()
+    target = NOW + timedelta(seconds=120)
+    fakes = adapters(clock, settlement_at=target)
+    for venue, adapter in fakes.items():
+        adapter.market = replace(
+            adapter.market,
+            canonical_asset="ZEC",
+            venue_symbol=f"ZEC-{venue.value}",
+            tick_size_raw=D("0.001"),
+            quantity_step_raw=D("0.1"),
+            minimum_quantity_raw=D("0.1"),
+        )
+
+        async def funding(market, *, assumed_open_at, _adapter=adapter):
+            preferred_long = _adapter.venue is Venue.EXTENDED
+            return FundingCashQuote(
+                _adapter.venue, market.venue_symbol, clock.now(),
+                assumed_open_at, target,
+                FundingQuality.ESTIMATED
+                if _adapter.venue is Venue.RISEX else FundingQuality.PREDICTED,
+                FundingAccrualMethod.SNAPSHOT_AT_SETTLEMENT, True,
+                D("10") if preferred_long else D("-10"),
+                D("-10") if preferred_long else D("10"),
+                "official-public-synthetic-shape",
+            )
+
+        adapter.fetch_funding_quote = funding
+
+    async def risex_book(symbol):
+        return OrderBook(
+            Venue.RISEX, symbol, (BookLevel(D("800.53"), D("5")),),
+            (BookLevel(D("800.531"), D("5")),), clock.now(), 1,
+        )
+
+    async def extended_book(symbol):
+        return OrderBook(
+            Venue.EXTENDED, symbol, (BookLevel(D("801.056"), D("5")),),
+            (BookLevel(D("801.057"), D("5")),), clock.now(), 1,
+        )
+
+    fakes[Venue.RISEX].fetch_book = risex_book
+    fakes[Venue.EXTENDED].fetch_book = extended_book
+    config = replace(PAPER_CONFIG, target_notional_per_leg_usd=D("480.6336"))
+    with PaperRepository(tmp_path / "zec-production-shape.db") as repository:
+        async with PublicPaperRuntime(
+            repository, adapters=fakes, clock=clock, config=config,
+        ) as runtime:
+            await activate_with_live_streams(runtime, clock)
+            order = runtime.broker.state.order
+            assert order.side is Side.BUY
+            assert order.canonical_quantity == D("0.6")
+            assert order.active_version.limit_price == D("801.056")
+            clock.advance(1)
+            runtime.mark_trade_stream_connected(order.venue, order.canonical_market)
+            trade = TradeEvidence(
+                "zec-public-sell", Venue.EXTENDED, "ZEC-EXTENDED",
+                clock.now(), clock.now(), int(clock.now().timestamp() * 1_000_000_000),
+                D("1.5"), D("800.938"), Side.SELL, True,
+            )
+            await runtime.deliver_trade(trade)
+            position = runtime.lifecycle.snapshot.position
+            assert position.canonical_quantity == D("0.6")
+            assert position.hedge_maker_fill.canonical_price == D("801.056")
+            assert position.risex_taker_fill.canonical_price == D("800.53")
+            assert repository.connection.execute(
+                "SELECT COUNT(*) FROM positions"
+            ).fetchone()[0] == 1
+            assert repository.connection.execute(
+                "SELECT COUNT(*) FROM fills"
+            ).fetchone()[0] == 2
+
+
+@pytest.mark.asyncio
 async def test_sequence_gap_fetches_snapshot_and_reconnect_restores_readiness(tmp_path):
     clock = FakeClock()
     fakes = adapters(clock, settlement_at=NOW + timedelta(minutes=5))
@@ -2999,6 +3124,58 @@ async def test_extended_health_is_per_socket_and_stale_restart_has_one_episode(
 
 
 @pytest.mark.asyncio
+async def test_simultaneous_stale_watchdog_mutation_is_generation_safe(tmp_path):
+    clock = FakeClock()
+    symbol = "ABC-EXTENDED"
+    delivery = CaptureNotifications()
+    with PaperRepository(tmp_path / "watchdog-generation-race.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={}, clock=clock,
+            notifications=NotificationOutbox(delivery),
+        )
+        runtime._stop_event = asyncio.Event()
+
+        async def waiting_stream():
+            await runtime._stop_event.wait()
+
+        tasks = {}
+        for kind in ("book", "trade"):
+            key = (Venue.EXTENDED, symbol, kind)
+            task = asyncio.create_task(waiting_stream())
+            tasks[kind] = task
+            runtime._stream_tasks[key] = task
+            runtime._stream_generations[key] = 1
+            runtime._extended_confirmed_at[symbol, kind] = (
+                clock.now() - timedelta(seconds=26)
+            )
+        original = runtime.mark_disconnected
+
+        async def mutating_disconnect(venue, market, **kwargs):
+            if kwargs.get("stream_kind") == "book":
+                runtime._extended_confirmed_at.pop((symbol, "trade"), None)
+                runtime._stream_generations[Venue.EXTENDED, symbol, "trade"] = 2
+            await original(venue, market, **kwargs)
+
+        runtime.mark_disconnected = mutating_disconnect
+        restarted = []
+        runtime._start_extended_stream = lambda _symbol, kind: restarted.append(kind)
+        await runtime._check_extended_health(clock.now())
+        rows = repository.connection.execute(
+            "SELECT event_type FROM runtime_evidence ORDER BY evidence_id"
+        ).fetchall()
+        runtime._stop_event.set()
+        for task in tasks.values():
+            task.cancel()
+        await asyncio.gather(*tasks.values(), return_exceptions=True)
+    assert restarted == ["book"]
+    assert [row["event_type"] for row in rows].count(
+        "PUBLIC_STREAM_CONFIRMATION_STALE"
+    ) == 1
+    assert not any(row["event_type"].startswith("PUBLIC_SOCKET_") for row in rows)
+    assert [row.kind for row in delivery.rows].count("CRITICAL_DATA_LOSS") == 1
+
+
+@pytest.mark.asyncio
 async def test_extended_quiet_heartbeat_keeps_each_stream_healthy_for_sixty_seconds(tmp_path):
     clock = FakeClock()
     symbol = "ABC-EXTENDED"
@@ -3658,6 +3835,67 @@ async def test_safe_shutdown_preserves_actually_open_position(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_safe_stop_bounds_gated_io_and_high_rate_frames_with_open_exit(tmp_path):
+    clock = FakeClock()
+    with PaperRepository(tmp_path / "bounded-safe-stop.db") as repository:
+        await run_fixture({"scenario": "exiting_aggressive_open"}, repository)
+        state = repository.load_runtime()
+        runtime = PublicPaperRuntime(
+            repository, adapters=adapters(clock, settlement_at=NOW), clock=clock,
+        )
+        runtime.lifecycle = LifecycleEngine.from_snapshot(state)
+        runtime._stop_event = asyncio.Event()
+        position_hedge = state.hedge_market
+        assert position_hedge.venue_symbol in runtime._required_symbols(
+            position_hedge.venue
+        )
+        gate = asyncio.Event()
+
+        async def gated_io():
+            await gate.wait()
+
+        async def high_rate_frames():
+            symbol = "UNRELATED-PERP"
+            await runtime.recover_snapshot(OrderBook(
+                Venue.NADO, symbol, (BookLevel(D("10"), D("1")),),
+                (BookLevel(D("11"), D("1")),), clock.now(), 0,
+            ))
+            sequence = 1
+            while not runtime._stop_event.is_set():
+                await runtime.apply_book_event(BookDelta(
+                    Venue.NADO, symbol, (BookLevel(D("10"), D("1")),), (),
+                    clock.now(), sequence, sequence - 1,
+                ))
+                sequence += 1
+                if sequence % 100 == 0:
+                    await asyncio.sleep(0)
+
+        runtime._refresh_task = asyncio.create_task(gated_io())
+        runtime._recovery_tasks[Venue.NADO, "GATED"] = asyncio.create_task(gated_io())
+        runtime._stream_tasks[Venue.NADO, "*", "combined"] = asyncio.create_task(
+            high_rate_frames()
+        )
+        started = time.monotonic()
+        await asyncio.wait_for(runtime.shutdown(), timeout=2)
+        elapsed = time.monotonic() - started
+        stop_row = repository.connection.execute(
+            "SELECT evidence_id,detail FROM runtime_evidence "
+            "WHERE event_type='STOPPED_SAFE' ORDER BY evidence_id DESC LIMIT 1"
+        ).fetchone()
+        after_stop = repository.connection.execute(
+            "SELECT COUNT(*) FROM runtime_evidence WHERE evidence_id>?",
+            (stop_row["evidence_id"],),
+        ).fetchone()[0]
+        integrity = repository.connection.execute("PRAGMA integrity_check").fetchone()[0]
+        restored = repository.load_runtime()
+    assert elapsed < 2
+    assert restored.position is not None
+    assert json.loads(stop_row["detail"])["forced_close"] is False
+    assert after_stop == 0
+    assert integrity == "ok"
+
+
+@pytest.mark.asyncio
 async def test_unrelated_book_delta_does_not_evaluate_or_persist_open_position(tmp_path):
     clock = FakeClock()
     with PaperRepository(tmp_path / "unrelated-position-delta.db") as repository:
@@ -3713,6 +3951,69 @@ async def test_ten_thousand_recovery_deltas_are_memory_bounded_and_episode_only(
 
 
 @pytest.mark.asyncio
+async def test_overflow_rejects_pre_overflow_snapshot_and_uses_new_boundary(tmp_path):
+    clock = FakeClock()
+    fakes = adapters(clock, settlement_at=NOW)
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    first_gate = asyncio.Event()
+    second_gate = asyncio.Event()
+    calls = 0
+
+    async def gated_book(symbol):
+        nonlocal calls
+        calls += 1
+        call = calls
+        if call == 1:
+            first_started.set()
+            try:
+                await first_gate.wait()
+            except asyncio.CancelledError:
+                await first_gate.wait()
+            price = D("1")
+        else:
+            second_started.set()
+            await second_gate.wait()
+            price = D("10")
+        return OrderBook(
+            Venue.NADO, symbol, (BookLevel(price, D("1")),),
+            (BookLevel(price + 1, D("1")),), clock.now(), 0,
+        )
+
+    fakes[Venue.NADO].fetch_book = gated_book
+    with PaperRepository(tmp_path / "overflow-boundary.db") as repository:
+        async with PublicPaperRuntime(repository, adapters=fakes, clock=clock) as runtime:
+            runtime._stop_event = asyncio.Event()
+            key = (Venue.NADO, "BTC-PERP")
+            runtime._start_snapshot_recovery(*key)
+            old_task = runtime._recovery_tasks[key]
+            await first_started.wait()
+            for sequence in range(1, 2050):
+                await runtime.apply_book_event(BookDelta(
+                    *key, (BookLevel(D("2"), D("1")),), (),
+                    clock.now(), sequence, sequence - 1,
+                ))
+            await second_started.wait()
+            new_task = runtime._recovery_tasks[key]
+            first_gate.set()
+            second_gate.set()
+            await asyncio.gather(old_task, return_exceptions=True)
+            await new_task
+            book = runtime.coordinator.stream(*key).book()
+            rows = repository.connection.execute(
+                "SELECT event_type FROM runtime_evidence WHERE event_type LIKE "
+                "'PUBLIC_SNAPSHOT_RECOVERY_%' ORDER BY evidence_id"
+            ).fetchall()
+    assert book.bids[0].canonical_price == D("10")
+    assert [row["event_type"] for row in rows].count(
+        "PUBLIC_SNAPSHOT_RECOVERY_OVERFLOW"
+    ) == 1
+    assert [row["event_type"] for row in rows].count(
+        "PUBLIC_SNAPSHOT_RECOVERY_COMPLETED"
+    ) == 1
+
+
+@pytest.mark.asyncio
 async def test_real_runtime_restart_restores_open_position_with_offline_gap(tmp_path):
     clock = FakeClock()
     target = NOW + timedelta(seconds=120)
@@ -3743,6 +4044,91 @@ async def test_real_runtime_restart_restores_open_position_with_offline_gap(tmp_
             assert restarted.lifecycle.snapshot.data_quality.value == "DEGRADED"
             assert "settlements" in restart_adapters[Venue.RISEX].calls
             assert "settlements" in restart_adapters[Venue.EXTENDED].calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("history_outcome", ("empty", "error", "exact"))
+async def test_restart_extended_elapsed_history_is_exact_or_unresolved(
+    tmp_path, history_outcome,
+):
+    clock = FakeClock()
+    target = NOW + timedelta(seconds=120)
+    database = tmp_path / f"restart-history-{history_outcome}.db"
+    with PaperRepository(database) as repository:
+        async with PublicPaperRuntime(
+            repository, adapters=adapters(clock, settlement_at=target), clock=clock,
+        ) as runtime:
+            await activate_with_live_streams(runtime, clock)
+            clock.advance(1)
+            order = runtime.broker.state.order
+            runtime.mark_trade_stream_connected(order.venue, order.canonical_market)
+            await runtime.deliver_trade(maker_trade(runtime, clock.now(), "history-entry"))
+            risex = next(
+                row for row in runtime.lifecycle.snapshot.settlements
+                if row.venue is Venue.RISEX
+            )
+            extended = next(
+                row for row in runtime.lifecycle.snapshot.settlements
+                if row.venue is Venue.EXTENDED
+            )
+            assert extended.status is SettlementStatus.PENDING
+            opened_at = runtime.lifecycle.snapshot.position.position_opened_at
+            await runtime.deliver_settlement(replace(
+                risex, status=SettlementStatus.APPLIED_RATE, cash_usd=D("4.25")
+            ))
+            if history_outcome == "empty":
+                await runtime.deliver_settlement(replace(
+                    extended, status=SettlementStatus.ESTIMATED, cash_usd=D("9.5")
+                ))
+
+        clock.value = target + timedelta(seconds=1)
+        persisted_before = repository.load_runtime()
+        persisted_rows = {row.key: row for row in persisted_before.settlements}
+        assert persisted_rows[extended.key].status in {
+            SettlementStatus.PENDING, SettlementStatus.ESTIMATED,
+        }
+        restart_adapters = adapters(clock, settlement_at=target)
+        history_calls = []
+        history_rows = []
+
+        async def extended_history(_market, *, since, until):
+            history_calls.append((since, until))
+            assert since <= opened_at
+            if history_outcome == "error":
+                raise TimeoutError("synthetic history timeout")
+            if history_outcome == "exact":
+                history_rows.append(replace(
+                    extended, status=SettlementStatus.APPLIED_RATE,
+                    cash_usd=D("7.125"),
+                ))
+                return tuple(history_rows)
+            return ()
+
+        restart_adapters[Venue.EXTENDED].fetch_applied_settlements = extended_history
+        async with PublicPaperRuntime(
+            repository, adapters=restart_adapters, clock=clock,
+        ) as restarted:
+            await restarted.scan()
+            await restarted._restore(clock.now())
+            assert len(history_calls) == 1
+            if history_outcome == "exact":
+                assert len(history_rows) == 1
+            assert restarted.lifecycle.snapshot.hedge_market.venue is Venue.EXTENDED
+            rows = {row.key: row for row in restarted.lifecycle.snapshot.settlements}
+            if history_rows:
+                assert history_rows[0].key in rows
+            assert rows[risex.key].status is SettlementStatus.APPLIED_RATE
+            assert rows[risex.key].cash_usd == D("4.25")
+            if history_outcome == "exact":
+                assert rows[extended.key].status is SettlementStatus.APPLIED_RATE
+                assert rows[extended.key].cash_usd == D("7.125")
+            else:
+                assert rows[extended.key].status is SettlementStatus.UNRESOLVED
+                assert rows[extended.key].cash_usd is None
+            assert repository.connection.execute(
+                "SELECT COUNT(*) FROM funding_settlements WHERE venue='RISEX' "
+                "AND status='APPLIED_RATE'"
+            ).fetchone()[0] == 1
 
 
 @pytest.mark.asyncio
@@ -3827,6 +4213,10 @@ async def test_nado_only_initial_then_extended_ready_next_full_has_twenty_routes
             runtime._stop_event = asyncio.Event()
             initial = await runtime.scan(scan_kind="INITIAL")
             await extended.catalog_started.wait()
+            universe_task = runtime._extended_universe_task
+            runtime._start_extended_universe_refresh()
+            runtime._start_extended_universe_refresh()
+            assert runtime._extended_universe_task is universe_task
             assert len(initial["routes"]) == 10
             assert {row["hedge_venue"] for row in initial["routes"]} == {"NADO"}
 
