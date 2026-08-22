@@ -426,6 +426,8 @@ class LifecycleEngine:
     def _append_event(
         self, event_type: LifecycleEventType, at: datetime, detail: str | None = None
     ) -> None:
+        if self._snapshot.events and at < self._snapshot.events[-1].occurred_at:
+            raise ValueError("lifecycle event time cannot move backwards")
         self._snapshot = replace(
             self._snapshot,
             events=self._snapshot.events + (LifecycleEvent(event_type, at, detail),),
@@ -797,10 +799,14 @@ class LifecycleEngine:
         risex_observation: MarketObservation,
         hedge_observation: MarketObservation,
         next_cycle: TargetFundingCycle | None = None,
+        record_sample: bool = True,
+        hard_basis_only: bool = False,
     ) -> LifecycleSnapshot:
         async with self._lock:
             return self._evaluate_locked(
-                evaluated_at, risex_observation, hedge_observation, next_cycle
+                evaluated_at, risex_observation, hedge_observation, next_cycle,
+                record_sample=record_sample,
+                hard_basis_only=hard_basis_only,
             )
 
     def _evaluate_locked(
@@ -809,6 +815,9 @@ class LifecycleEngine:
         risex: MarketObservation,
         hedge: MarketObservation,
         next_cycle: TargetFundingCycle | None,
+        *,
+        record_sample: bool = True,
+        hard_basis_only: bool = False,
     ) -> LifecycleSnapshot:
         position = self._position()
         if self._snapshot.gap_open:
@@ -822,15 +831,18 @@ class LifecycleEngine:
             risex, hedge, self._snapshot.lifecycle_state
         )
         if risex_exit is None or hedge_taker is None:
+            if hard_basis_only:
+                return self._snapshot
             self._record_unavailable(at)
             if risex_exit is None:
                 self._cancel_exit_version(
                     ExitVersionReason.UNWIND_UNAVAILABLE, at
                 )
-            self._append_sample(
-                at, self._recognized_at(at), self._remaining_funding(at),
-                None, None, None, None
-            )
+            if record_sample:
+                self._append_sample(
+                    at, self._recognized_at(at), self._remaining_funding(at),
+                    None, None, None, None
+                )
             return self._snapshot
         self._snapshot = replace(self._snapshot, unwind_quote_unavailable=False)
         basis = _current_basis(position, risex_exit, hedge_taker)
@@ -859,14 +871,18 @@ class LifecycleEngine:
             )
             return self._snapshot
 
+        if hard_basis_only:
+            return self._snapshot
+
         self._maybe_register_next_cycle(at, next_cycle)
         maker_net, hold, unwind, recognized = self._planned_metrics(
             at, risex_exit, hedge_maker, hedge_taker
         )
         remaining = self._remaining_funding(at)
-        self._append_sample(
-            at, recognized, remaining, maker_net, hold, unwind, basis
-        )
+        if record_sample:
+            self._append_sample(
+                at, recognized, remaining, maker_net, hold, unwind, basis
+            )
         if (
             self._snapshot.lifecycle_state
             in {LifecycleState.EXITING_NORMAL, LifecycleState.EXITING_AGGRESSIVE}

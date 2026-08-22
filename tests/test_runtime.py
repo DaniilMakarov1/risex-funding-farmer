@@ -3658,6 +3658,61 @@ async def test_safe_shutdown_preserves_actually_open_position(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_unrelated_book_delta_does_not_evaluate_or_persist_open_position(tmp_path):
+    clock = FakeClock()
+    with PaperRepository(tmp_path / "unrelated-position-delta.db") as repository:
+        async with PublicPaperRuntime(
+            repository,
+            adapters=adapters(clock, settlement_at=NOW + timedelta(seconds=120)),
+            clock=clock,
+        ) as runtime:
+            await activate_with_live_streams(runtime, clock)
+            clock.advance(1)
+            order = runtime.broker.state.order
+            runtime.mark_trade_stream_connected(order.venue, order.canonical_market)
+            await runtime.deliver_trade(maker_trade(runtime, clock.now(), "unrelated-entry"))
+            assert runtime.lifecycle is not None
+            before = runtime.lifecycle.snapshot
+            before_updated = repository.runtime_updated_at()
+            await runtime.recover_snapshot(OrderBook(
+                Venue.NADO, "UNRELATED-PERP",
+                (BookLevel(D("10"), D("1")),),
+                (BookLevel(D("11"), D("1")),), clock.now(), 1,
+            ))
+            await runtime.apply_book_event(BookDelta(
+                Venue.NADO, "UNRELATED-PERP",
+                (BookLevel(D("10"), D("2")),), (), clock.now(), 2, 1,
+            ))
+            assert runtime.lifecycle.snapshot == before
+            assert repository.runtime_updated_at() == before_updated
+
+
+@pytest.mark.asyncio
+async def test_ten_thousand_recovery_deltas_are_memory_bounded_and_episode_only(tmp_path):
+    clock = FakeClock()
+    with PaperRepository(tmp_path / "bounded-recovery.db") as repository:
+        async with PublicPaperRuntime(
+            repository, adapters=adapters(clock, settlement_at=NOW), clock=clock,
+        ) as runtime:
+            key = (Venue.NADO, "BTC-PERP")
+            runtime._recovery_buffers[key] = []
+            for sequence in range(1, 10_001):
+                await runtime.apply_book_event(BookDelta(
+                    *key, (BookLevel(D("10"), D("1")),), (),
+                    clock.now(), sequence, sequence - 1,
+                ))
+            assert len(runtime._recovery_buffers[key]) <= 2048
+            assert repository.connection.execute(
+                "SELECT COUNT(*) FROM runtime_evidence "
+                "WHERE event_type='PUBLIC_RECOVERY_DELTA_BUFFERED'"
+            ).fetchone()[0] == 0
+            assert repository.connection.execute(
+                "SELECT COUNT(*) FROM runtime_evidence "
+                "WHERE event_type='PUBLIC_SNAPSHOT_RECOVERY_OVERFLOW'"
+            ).fetchone()[0] == 1
+
+
+@pytest.mark.asyncio
 async def test_real_runtime_restart_restores_open_position_with_offline_gap(tmp_path):
     clock = FakeClock()
     target = NOW + timedelta(seconds=120)

@@ -290,6 +290,8 @@ class PublicPaperRuntime:
         self._refresh_task: asyncio.Task[None] | None = None
         self._recovery_tasks: dict[tuple[Venue, str], asyncio.Task[None]] = {}
         self._recovery_buffers: dict[tuple[Venue, str], list[BookDelta]] = {}
+        self._recovery_overflowed: set[tuple[Venue, str]] = set()
+        self._recovery_attempts: dict[tuple[Venue, str], int] = {}
         self._pending_socket_episodes: dict[
             tuple[Venue, str, tuple[str, ...]], dict[str, object]
         ] = {}
@@ -305,6 +307,7 @@ class PublicPaperRuntime:
         self._live_book_ready: set[tuple[Venue, str]] = set()
         self._last_readiness_evidence_at: dict[Venue, datetime] = {}
         self._extended_confirmed_at: dict[tuple[str, str], datetime] = {}
+        self._stream_generations: dict[tuple[Venue, str, str], int] = {}
         self._combined_symbols: dict[Venue, tuple[str, ...]] = {}
         self.next_health_check_at: datetime | None = None
         self.focused_cycle: TargetFundingCycle | None = None
@@ -319,6 +322,8 @@ class PublicPaperRuntime:
         self._stop_cause: str | None = None
         self._requested_at: datetime | None = None
         self._background_fatal: BaseException | None = None
+        self._position_event_lock = asyncio.Lock()
+        self._shutdown_started = False
 
     async def __aenter__(self) -> PublicPaperRuntime:
         if self.adapters is None:
@@ -341,6 +346,10 @@ class PublicPaperRuntime:
         venue: Venue | None = None,
         detail: dict[str, object] | None = None,
     ) -> None:
+        if self._shutdown_started and event_type not in {
+            "STOPPED_SAFE", "RUNTIME_STOPPED_FATAL"
+        }:
+            return
         self.repository.record_runtime_evidence(
             recorded_at=at or self.clock.now(),
             event_type=event_type,
@@ -1342,12 +1351,21 @@ class PublicPaperRuntime:
         )
         assert self.adapters is not None
         last_known_at = self.repository.runtime_updated_at() or at
+        history_since = min(
+            (
+                row.settlement_at
+                for row in runtime.settlements
+                if row.status in {SettlementStatus.PENDING, SettlementStatus.UNRESOLVED}
+            ),
+            default=position.position_opened_at,
+        )
+        history_since = min(position.position_opened_at, history_since)
         history = await asyncio.gather(
             self.adapters[Venue.RISEX].fetch_applied_settlements(
-                runtime.risex_market, since=last_known_at, until=at
+                runtime.risex_market, since=history_since, until=at
             ),
             self.adapters[runtime.hedge_market.venue].fetch_applied_settlements(
-                runtime.hedge_market, since=last_known_at, until=at
+                runtime.hedge_market, since=history_since, until=at
             ),
             return_exceptions=True,
         )
@@ -1465,25 +1483,28 @@ class PublicPaperRuntime:
                             "PUBLIC_FUNDING_HISTORY_UNAVAILABLE", at=now,
                             venue=Venue.RISEX, detail={"exception_class": type(exc).__name__},
                         )
-                risex, hedge = self._market_pair_observations(
-                    self.lifecycle.snapshot.risex_market,
-                    self.lifecycle.snapshot.hedge_market,
-                    now,
-                )
-                before = self.lifecycle.snapshot
-                await self.lifecycle.evaluate(
-                    evaluated_at=now,
-                    risex_observation=risex,
-                    hedge_observation=hedge,
-                )
-                self.repository.save_decision(
-                    recorded_at=now, lifecycle_snapshot=self.lifecycle.snapshot
-                )
-                self._notify_lifecycle_transition(
-                    before, self.lifecycle.snapshot, now
-                )
-                if self.lifecycle.snapshot.lifecycle_state is LifecycleState.FLAT:
-                    self.lifecycle = None
+                async with self._position_event_lock:
+                    lifecycle = self.lifecycle
+                    if lifecycle is None:
+                        return
+                    snapshot = lifecycle.snapshot
+                    risex, hedge = self._market_pair_observations(
+                        snapshot.risex_market, snapshot.hedge_market, now
+                    )
+                    before = lifecycle.snapshot
+                    await lifecycle.evaluate(
+                        evaluated_at=now,
+                        risex_observation=risex,
+                        hedge_observation=hedge,
+                    )
+                    self.repository.save_decision(
+                        recorded_at=now, lifecycle_snapshot=lifecycle.snapshot
+                    )
+                    self._notify_lifecycle_transition(
+                        before, lifecycle.snapshot, now
+                    )
+                    if lifecycle.snapshot.lifecycle_state is LifecycleState.FLAT:
+                        self.lifecycle = None
                 scheduled = self.next_position_monitor_at or now
                 self.next_position_monitor_at = _next_absolute_slot(
                     scheduled, now, self.config.open_position_monitor_seconds
@@ -1905,19 +1926,25 @@ class PublicPaperRuntime:
                 self.last_scan = local
                 if self.broker.state.lifecycle_state is LifecycleState.FLAT:
                     self.broker = None
-        if self.lifecycle is not None:
-            position = self.lifecycle.snapshot.position
-            if position is not None and (venue, symbol) in {
-                (Venue.RISEX, self.lifecycle.snapshot.risex_market.venue_symbol),
-                (
-                    self.lifecycle.snapshot.hedge_market.venue,
-                    self.lifecycle.snapshot.hedge_market.venue_symbol,
-                ),
-            }:
-                await self.lifecycle.start_gap(started_at=now)
-                self.repository.save_decision(
-                    recorded_at=now, lifecycle_snapshot=self.lifecycle.snapshot
-                )
+        if self.lifecycle is not None and (invalidates_book or invalidates_trade):
+            async with self._position_event_lock:
+                lifecycle = self.lifecycle
+                if lifecycle is None:
+                    return
+                position = lifecycle.snapshot.position
+                if position is not None and (venue, symbol) in {
+                    (Venue.RISEX, lifecycle.snapshot.risex_market.venue_symbol),
+                    (
+                        lifecycle.snapshot.hedge_market.venue,
+                        lifecycle.snapshot.hedge_market.venue_symbol,
+                    ),
+                }:
+                    before = lifecycle.snapshot
+                    await lifecycle.start_gap(started_at=now)
+                    if lifecycle.snapshot != before:
+                        self.repository.save_decision(
+                            recorded_at=now, lifecycle_snapshot=lifecycle.snapshot
+                        )
 
     def _confirm_extended_stream(
         self, symbol: str, kind: str, at: datetime, *, data_ready: bool
@@ -1943,21 +1970,40 @@ class PublicPaperRuntime:
 
     async def _check_extended_health(self, at: datetime) -> None:
         stale = [
-            (symbol, kind)
+            (symbol, kind, confirmed_at,
+             self._stream_generations.get((Venue.EXTENDED, symbol, kind), 0),
+             self._stream_tasks.get((Venue.EXTENDED, symbol, kind)))
             for (symbol, kind), confirmed_at in self._extended_confirmed_at.items()
             if (Venue.EXTENDED, symbol, kind) in self._stream_tasks
             if at - confirmed_at > timedelta(seconds=25)
         ]
-        for symbol, kind in sorted(stale):
+        for symbol, kind, confirmed_at, generation, task in sorted(
+            stale, key=lambda row: (row[0], row[1])
+        ):
+            key = (Venue.EXTENDED, symbol, kind)
+            if (
+                self._stop_event is None or self._stop_event.is_set()
+                or self._stream_generations.get(key, 0) != generation
+                or self._stream_tasks.get(key) is not task
+                or self._extended_confirmed_at.get((symbol, kind)) != confirmed_at
+            ):
+                continue
             identity = (Venue.EXTENDED, kind, (symbol,))
             self._watchdog_stale(
                 identity, at=at,
-                last_confirmation=self._extended_confirmed_at[symbol, kind],
+                last_confirmation=confirmed_at,
             )
             await self.mark_disconnected(
                 Venue.EXTENDED, symbol, at=at, stream_kind=kind,
                 exception=TimeoutError("public socket confirmation stale"),
             )
+            if (
+                self._stop_event.is_set()
+                or self._stream_generations.get(key, 0) != generation
+                or self._stream_tasks.get(key) is not task
+            ):
+                self._pending_watchdog_episodes.pop(identity, None)
+                continue
             await self._restart_extended_stream(symbol, kind)
 
     def _watchdog_stale(
@@ -2094,26 +2140,37 @@ class PublicPaperRuntime:
                 row, book=stream.book(), health=stream.health(now)
             )
         if self.lifecycle is not None and self.lifecycle.snapshot.gap_open:
-            risex, hedge = self._market_pair_observations(
-                self.lifecycle.snapshot.risex_market,
-                self.lifecycle.snapshot.hedge_market,
-                now,
-            )
-            if (
-                risex.health is not None
-                and hedge.health is not None
-                and risex.health.data_quality is DataQuality.COMPLETE
-                and hedge.health.data_quality is DataQuality.COMPLETE
-            ):
-                await self.lifecycle.recover(
-                    recovered_at=now,
-                    risex_observation=risex,
-                    hedge_observation=hedge,
-                )
-                self.repository.save_decision(
-                    recorded_at=now, lifecycle_snapshot=self.lifecycle.snapshot
-                )
+            async with self._position_event_lock:
+                lifecycle = self.lifecycle
+                if lifecycle is not None and lifecycle.snapshot.gap_open:
+                    snapshot = lifecycle.snapshot
+                    risex, hedge = self._market_pair_observations(
+                        snapshot.risex_market, snapshot.hedge_market, now
+                    )
+                    execution_healthy = (
+                        risex.health is not None
+                        and hedge.health is not None
+                        and risex.health.data_quality is DataQuality.COMPLETE
+                        and hedge.health.data_quality is DataQuality.COMPLETE
+                        and (Venue.RISEX, snapshot.risex_market.venue_symbol)
+                        in self._trade_stream_ready
+                        and (
+                            snapshot.hedge_market.venue,
+                            snapshot.hedge_market.venue_symbol,
+                        ) in self._trade_stream_ready
+                    )
+                    if execution_healthy:
+                        await lifecycle.recover(
+                            recovered_at=now,
+                            risex_observation=risex,
+                            hedge_observation=hedge,
+                        )
+                        self.repository.save_decision(
+                            recorded_at=now, lifecycle_snapshot=lifecycle.snapshot
+                        )
     async def apply_book_event(self, event: OrderBook | BookDelta) -> bool:
+        if self._shutdown_started:
+            return False
         now = self.clock.now()
         self.coordinator.stream(event.venue, event.canonical_market).connection_confirmed(now)
         key = (event.venue, event.canonical_market)
@@ -2169,11 +2226,22 @@ class PublicPaperRuntime:
                 self._live_book_ready.add(key)
             return True
         if key in self._recovery_buffers:
-            self._recovery_buffers[key].append(event)
-            self._record(
-                "PUBLIC_RECOVERY_DELTA_BUFFERED", at=now, venue=event.venue,
-                detail={"symbol": event.canonical_market, "sequence": event.sequence},
-            )
+            buffer = self._recovery_buffers[key]
+            if len(buffer) >= 2048:
+                buffer.clear()
+                self._recovery_overflowed.add(key)
+                self.coordinator.stream(*key).gap()
+                self._set_component_readiness(
+                    event.venue, f"book:{event.canonical_market}", False,
+                    "PUBLIC_RECOVERY_BUFFER_OVERFLOW", now,
+                )
+                self._record(
+                    "PUBLIC_SNAPSHOT_RECOVERY_OVERFLOW", at=now,
+                    venue=event.venue,
+                    detail={"symbol": event.canonical_market, "capacity": 2048},
+                )
+            elif key not in self._recovery_overflowed:
+                buffer.append(event)
             return True
         stream = self.coordinator.stream(event.venue, event.canonical_market)
         if not stream.apply_delta(event):
@@ -2185,9 +2253,42 @@ class PublicPaperRuntime:
         else:
             self._live_book_ready.add(key)
             if self.lifecycle is not None:
-                self.next_position_monitor_at = now
-                await self.tick(now)
+                await self._evaluate_relevant_book_event(key, now)
         return True
+
+    async def _evaluate_relevant_book_event(
+        self, key: tuple[Venue, str], at: datetime
+    ) -> None:
+        """Serialize event-driven Hard Basis checks without periodic samples."""
+        async with self._position_event_lock:
+            lifecycle = self.lifecycle
+            if lifecycle is None:
+                return
+            snapshot = lifecycle.snapshot
+            required = {
+                (Venue.RISEX, snapshot.risex_market.venue_symbol),
+                (snapshot.hedge_market.venue, snapshot.hedge_market.venue_symbol),
+            }
+            if key not in required:
+                return
+            risex, hedge = self._market_pair_observations(
+                snapshot.risex_market, snapshot.hedge_market, at
+            )
+            before = lifecycle.snapshot
+            await lifecycle.evaluate(
+                evaluated_at=at,
+                risex_observation=risex,
+                hedge_observation=hedge,
+                record_sample=False,
+                hard_basis_only=True,
+            )
+            if lifecycle.snapshot != before:
+                self.repository.save_decision(
+                    recorded_at=at, lifecycle_snapshot=lifecycle.snapshot
+                )
+                self._notify_lifecycle_transition(before, lifecycle.snapshot, at)
+                if lifecycle.snapshot.lifecycle_state is LifecycleState.FLAT:
+                    self.lifecycle = None
 
     async def _resubscribe_risex_orderbooks(
         self,
@@ -2218,6 +2319,7 @@ class PublicPaperRuntime:
         if key in self._recovery_buffers:
             return
         self._recovery_buffers[key] = []
+        self._recovery_overflowed.discard(key)
         existing = self._recovery_tasks.get(key)
         if existing is not None and not existing.done():
             return
@@ -2235,6 +2337,9 @@ class PublicPaperRuntime:
     ) -> tuple[OrderBook, int, int]:
         """Install and drain the current buffer without yielding to the receiver."""
         key = (snapshot.venue, snapshot.canonical_market)
+        if key in self._recovery_overflowed:
+            self._recovery_overflowed.discard(key)
+            self._recovery_buffers[key].clear()
         stream = self.coordinator.stream(*key)
         stream.connected(self.clock.now())
         stream.snapshot(snapshot)
@@ -2256,6 +2361,7 @@ class PublicPaperRuntime:
         if recovered is None:
             raise ValueError("snapshot recovery produced no book")
         self._recovery_buffers.pop(key, None)
+        self._recovery_attempts.pop(key, None)
         return recovered, buffered, replayed
 
     async def _restart_extended_book_stream(
@@ -2299,6 +2405,7 @@ class PublicPaperRuntime:
         current = self._stream_tasks.get(key)
         if current is not None and not current.done():
             return
+        self._stream_generations[key] = self._stream_generations.get(key, 0) + 1
         self._stream_tasks[key] = asyncio.create_task(
             self._extended_stream(adapter, symbol, kind)
         )
@@ -2338,32 +2445,45 @@ class PublicPaperRuntime:
             detail={"symbol": symbol},
         )
         try:
-            snapshot = await self.adapters[venue].fetch_book(symbol)
-            recovered, buffered, replayed = self._install_recovery_snapshot(snapshot)
-            await self.recover_snapshot(recovered, at=self.clock.now())
-            self._record(
-                "PUBLIC_SNAPSHOT_RECOVERY_COMPLETED", venue=venue,
-                detail={
-                    "symbol": symbol,
-                    "buffered": buffered,
-                    "replayed": replayed,
-                    "elapsed_seconds": str(Decimal(str(
-                        (self.clock.now() - started).total_seconds()
-                    ))),
-                },
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            self._set_component_readiness(
-                venue, f"stream:{symbol}:book", False,
-                f"PUBLIC_SNAPSHOT_RECOVERY_FAILED:book:{type(exc).__name__}:{str(exc)[:120]}",
-                self.clock.now(),
-            )
-            self._record(
-                "PUBLIC_SNAPSHOT_RECOVERY_FAILED", venue=venue,
-                detail={"symbol": symbol, "exception_class": type(exc).__name__},
-            )
+            for attempt in range(1, 4):
+                try:
+                    snapshot = await self.adapters[venue].fetch_book(symbol)
+                    recovered, buffered, replayed = self._install_recovery_snapshot(snapshot)
+                    await self.recover_snapshot(recovered, at=self.clock.now())
+                    self._recovery_attempts.pop(key, None)
+                    self._record(
+                        "PUBLIC_SNAPSHOT_RECOVERY_COMPLETED", venue=venue,
+                        detail={
+                            "symbol": symbol, "buffered": buffered,
+                            "replayed": replayed, "attempts": attempt,
+                            "elapsed_seconds": str(Decimal(str(
+                                (self.clock.now() - started).total_seconds()
+                            ))),
+                        },
+                    )
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self._recovery_attempts[key] = attempt
+                    self._set_component_readiness(
+                        venue, f"stream:{symbol}:book", False,
+                        f"PUBLIC_SNAPSHOT_RECOVERY_FAILED:book:{type(exc).__name__}:"
+                        f"{str(exc)[:120]}", self.clock.now(),
+                    )
+                    delay = min(2 ** (attempt - 1), 30)
+                    if attempt < 3:
+                        await self._sleep(delay)
+                        continue
+                    self._record(
+                        "PUBLIC_SNAPSHOT_RECOVERY_FAILED", venue=venue,
+                        detail={
+                            "symbol": symbol,
+                            "exception_class": type(exc).__name__,
+                            "attempts": attempt,
+                            "retry_after_seconds": delay,
+                        },
+                    )
         finally:
             if key in self._recovery_buffers and venue is not Venue.EXTENDED:
                 self._recovery_buffers.pop(key, None)
@@ -2373,6 +2493,8 @@ class PublicPaperRuntime:
         self, adapter: ExtendedAdapter, symbol: str, kind: str
     ) -> None:
         assert self._session is not None
+        task_key = (Venue.EXTENDED, symbol, kind)
+        generation = self._stream_generations.get(task_key, 0)
         socket_identity = (Venue.EXTENDED, kind, (symbol,))
         url = {
             "book": adapter.orderbook_stream_url(symbol),
@@ -2498,6 +2620,15 @@ class PublicPaperRuntime:
             except Exception as exc:
                 if self._stop_event is not None and self._stop_event.is_set():
                     break
+                if (
+                    self._stream_generations.get(task_key, 0) != generation
+                    or (
+                        self._stream_tasks.get(task_key) is not None
+                        and self._stream_tasks.get(task_key)
+                        is not asyncio.current_task()
+                    )
+                ):
+                    return
                 if session_established:
                     self._record_transport_disconnect(
                         socket_identity, at=self.clock.now(), exception=exc,
@@ -2891,6 +3022,20 @@ class PublicPaperRuntime:
         if self.broker is not None and self.broker.state.lifecycle_state is LifecycleState.ENTRY_MAKER_OPEN:
             state = await self.broker.cancel_for_process_restart(restarted_at=at)
             self.repository.save_decision(recorded_at=at, entry_state=state)
+        self._shutdown_started = True
+        if self._stop_event is not None:
+            self._stop_event.set()
+        owned = list(self._stream_tasks.values())
+        if self._refresh_task is not None:
+            owned.append(self._refresh_task)
+        owned.extend(self._recovery_tasks.values())
+        if self._extended_universe_task is not None:
+            owned.append(self._extended_universe_task)
+        for task in owned:
+            task.cancel()
+        if owned:
+            await asyncio.gather(*owned, return_exceptions=True)
+        at = self.clock.now()
         stop_detail: dict[str, object] = {
             "forced_close": False,
             "open_position_preserved": self.lifecycle is not None,
@@ -2915,23 +3060,13 @@ class PublicPaperRuntime:
                 f"{self._notification_run_id}:stopped", "SAFE_STOP", at,
                 "Paper runtime stopped safely",
             )
-        if self._stop_event is not None:
-            self._stop_event.set()
-        owned = list(self._stream_tasks.values())
-        if self._refresh_task is not None:
-            owned.append(self._refresh_task)
-        owned.extend(self._recovery_tasks.values())
-        if self._extended_universe_task is not None:
-            owned.append(self._extended_universe_task)
-        for task in owned:
-            task.cancel()
-        if owned:
-            await asyncio.gather(*owned, return_exceptions=True)
         self._stream_tasks.clear()
         self._recovery_tasks.clear()
         self._pending_socket_episodes.clear()
         self._pending_watchdog_episodes.clear()
         self._recovery_buffers.clear()
+        self._recovery_overflowed.clear()
+        self._recovery_attempts.clear()
         self._refresh_task = None
         self._extended_universe_task = None
 

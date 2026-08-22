@@ -6,6 +6,7 @@ import pickle
 import json
 import sqlite3
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -574,23 +575,44 @@ class PaperRepository:
                 ),
             )
         if position_id is not None:
-            for index, sample in enumerate(snapshot.samples):
+            sample_count = self.connection.execute(
+                "SELECT COUNT(*) FROM position_samples WHERE position_id=?",
+                (position_id,),
+            ).fetchone()[0]
+            for index, sample in enumerate(
+                snapshot.samples[sample_count:], start=sample_count
+            ):
                 self.connection.execute(
-                    """INSERT INTO position_samples VALUES (?, ?, ?, ?)
-                       ON CONFLICT(position_id, sample_index) DO UPDATE SET payload=excluded.payload""",
+                    "INSERT INTO position_samples VALUES (?, ?, ?, ?)",
                     (position_id, index, _iso(sample.sampled_at), _dump(sample)),
                 )
+            persisted_gaps = {
+                row["started_at"]: row["ended_at"]
+                for row in self.connection.execute(
+                    "SELECT started_at,ended_at FROM gaps WHERE position_id=?",
+                    (position_id,),
+                )
+            }
             for gap in snapshot.gaps:
+                started_at = _iso(gap.started_at)
+                ended_at = _iso(gap.ended_at)
+                if started_at in persisted_gaps and persisted_gaps[started_at] == ended_at:
+                    continue
                 self.connection.execute(
                     """INSERT INTO gaps VALUES (?, ?, ?, ?)
                        ON CONFLICT(position_id, started_at) DO UPDATE SET
                        ended_at=excluded.ended_at, payload=excluded.payload""",
                     (position_id, _iso(gap.started_at), _iso(gap.ended_at), _dump(gap)),
                 )
-            for index, event in enumerate(snapshot.events):
+            event_count = self.connection.execute(
+                "SELECT COUNT(*) FROM lifecycle_events WHERE position_id=?",
+                (position_id,),
+            ).fetchone()[0]
+            for index, event in enumerate(
+                snapshot.events[event_count:], start=event_count
+            ):
                 self.connection.execute(
-                    """INSERT INTO lifecycle_events VALUES (?, ?, ?, ?, ?)
-                       ON CONFLICT(position_id, event_index) DO UPDATE SET payload=excluded.payload""",
+                    "INSERT INTO lifecycle_events VALUES (?, ?, ?, ?, ?)",
                     (
                         position_id,
                         index,
@@ -601,7 +623,10 @@ class PaperRepository:
                 )
         if snapshot.closed_trade is not None:
             self._save_closed(snapshot.closed_trade)
-        self._save_runtime("LIFECYCLE", snapshot.lifecycle_state, at, snapshot)
+        checkpoint = replace(
+            snapshot, samples=(), events=(), gaps=(), exit_order=None
+        )
+        self._save_runtime("LIFECYCLE", snapshot.lifecycle_state, at, checkpoint)
 
     def _save_exit_order(
         self, order: PaperExitOrder, position_id: str | None
@@ -631,7 +656,9 @@ class PaperRepository:
                 _dump(order),
             ),
         )
-        for version in order.versions:
+        # Only the active version and the version it may just have replaced can
+        # change. Older versions are immutable.
+        for version in order.versions[-2:]:
             self.connection.execute(
                 """INSERT INTO order_versions VALUES (?, ?, ?, ?, ?, ?)
                    ON CONFLICT(version_id) DO UPDATE SET status=excluded.status,
@@ -710,7 +737,47 @@ class PaperRepository:
         row = self.connection.execute(
             "SELECT payload FROM runtime_state WHERE singleton=1"
         ).fetchone()
-        return None if row is None else _load(row["payload"])
+        if row is None:
+            return None
+        value = _load(row["payload"])
+        if not isinstance(value, LifecycleSnapshot) or value.position is None:
+            return value
+        if value.samples or value.events or value.gaps:
+            return value
+        position_id = value.position.position_id
+        samples = tuple(
+            _load(item["payload"])
+            for item in self.connection.execute(
+                "SELECT payload FROM position_samples WHERE position_id=? ORDER BY sample_index",
+                (position_id,),
+            )
+        )
+        events = tuple(
+            _load(item["payload"])
+            for item in self.connection.execute(
+                "SELECT payload FROM lifecycle_events WHERE position_id=? ORDER BY event_index",
+                (position_id,),
+            )
+        )
+        gaps = tuple(
+            _load(item["payload"])
+            for item in self.connection.execute(
+                "SELECT payload FROM gaps WHERE position_id=? ORDER BY started_at",
+                (position_id,),
+            )
+        )
+        exit_order = value.exit_order
+        if exit_order is None:
+            order_row = self.connection.execute(
+                "SELECT payload FROM orders WHERE attempt_id=? AND order_kind='EXIT'",
+                (position_id,),
+            ).fetchone()
+            if order_row is not None:
+                exit_order = _load(order_row["payload"])
+        return replace(
+            value, samples=samples, events=events, gaps=gaps,
+            exit_order=exit_order,
+        )
 
     def runtime_updated_at(self) -> datetime | None:
         row = self.connection.execute(

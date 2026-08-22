@@ -8,8 +8,8 @@ import pytest
 
 import risex_farmer.cli as cli_module
 from risex_farmer.cli import _money, _paper_run, _reason, _scan_table, main
-from risex_farmer.lifecycle import LifecycleSnapshot
-from risex_farmer.models import LifecycleState, SettlementStatus, Side, TradeEvidence, Venue
+from risex_farmer.lifecycle import LifecycleSnapshot, PositionSample
+from risex_farmer.models import DataQuality, LifecycleState, SettlementStatus, Side, TradeEvidence, Venue
 from risex_farmer.orchestrator import DEFAULT_LOGICAL_AT, load_fixture, run_fixture
 from risex_farmer.paper_broker import PaperEntryState
 from risex_farmer.storage import PaperRepository
@@ -289,6 +289,29 @@ def test_cli_commands_are_structured_and_network_free(tmp_path, capsys) -> None:
     report = json.loads(capsys.readouterr().out)
     assert report["fills"] == 4
     assert report["assumption_flags"]["paper_only"] is True
+
+
+@pytest.mark.asyncio
+async def test_open_lifecycle_checkpoint_is_bounded_and_hydrates_history(tmp_path) -> None:
+    with PaperRepository(tmp_path / "bounded-checkpoint.db") as repository:
+        await run_fixture(load_fixture(FIXTURES / "open_position.json"), repository)
+        state = repository.load_runtime()
+        assert isinstance(state, LifecycleSnapshot)
+        sample = PositionSample(
+            DEFAULT_LOGICAL_AT, D("1"), D("2"), D("3"), D("4"),
+            D("5"), D("6"), D("7"), DataQuality.COMPLETE,
+        )
+        expanded = replace(state, samples=(sample,) * 1000)
+        repository.save_decision(
+            recorded_at=DEFAULT_LOGICAL_AT + timedelta(hours=6),
+            lifecycle_snapshot=expanded,
+        )
+        checkpoint_bytes = repository.connection.execute(
+            "SELECT length(payload) FROM runtime_state WHERE singleton=1"
+        ).fetchone()[0]
+        restored = repository.load_runtime()
+    assert checkpoint_bytes < 20_000
+    assert restored.samples == expanded.samples
 
 
 def test_default_and_explicit_json_preserve_route_semantics(
