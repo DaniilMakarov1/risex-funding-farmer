@@ -135,6 +135,18 @@ def _http_status(exc: BaseException) -> int | None:
     return status if isinstance(status, int) else None
 
 
+async def _gather_owned(*work: Awaitable[Any]) -> tuple[Any, ...]:
+    tasks = [asyncio.ensure_future(row) for row in work]
+    try:
+        return tuple(await asyncio.gather(*tasks))
+    except BaseException:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+
 @dataclass(slots=True)
 class VenueReadiness:
     available: bool
@@ -330,6 +342,7 @@ class PublicPaperRuntime:
         self.accepting_entries = True
         self._stream_tasks: dict[tuple[Venue, str, str], asyncio.Task[None]] = {}
         self._refresh_task: asyncio.Task[None] | None = None
+        self._pending_full_scan_at: datetime | None = None
         self._recoveries: dict[tuple[Venue, str], RecoveryEpisode] = {}
         self._retired_recovery_tasks: set[asyncio.Task[None]] = set()
         self._recovery_episode_number = 0
@@ -655,14 +668,8 @@ class PublicPaperRuntime:
 
     def _symbol_components_available(self, venue: Venue, symbol: str) -> bool:
         components = self.component_readiness.get(venue, {})
-        catalog = components.get("catalog")
-        if venue is not Venue.EXTENDED and catalog is not None and not catalog.available:
-            return False
-        return all(
-            row.available
-            for name, row in components.items()
-            if name.endswith(f":{symbol}")
-        )
+        book = components.get(f"book:{symbol}")
+        return book is None or book.available
 
     def _extended_stream_components_available(
         self, symbol: str, kind: str
@@ -723,14 +730,17 @@ class PublicPaperRuntime:
     async def _catalog(self, venue: Venue, adapter: PublicAdapter) -> None:
         at = self.clock.now()
         if isinstance(adapter, ExtendedAdapter) and self._stop_event is not None:
-            self._start_extended_universe_refresh()
+            self._start_background_catalog_refresh(
+                include_extended_universe=True,
+                include_normal_catalogs=False,
+            )
             self._update_extended_catalog_readiness(at)
             return
         try:
             if isinstance(adapter, ExtendedAdapter):
                 markets, volumes = await adapter.fetch_catalog()
             else:
-                markets, volumes = await asyncio.gather(
+                markets, volumes = await _gather_owned(
                     adapter.fetch_markets(), adapter.fetch_volumes()  # type: ignore[attr-defined]
                 )
             completed = self.clock.now()
@@ -820,64 +830,89 @@ class PublicPaperRuntime:
             Venue.EXTENDED, "catalog", available, detail, at
         )
 
-    async def _refresh_extended_universe(self) -> None:
+    async def _refresh_extended_universe(
+        self, *, include_universe: bool = True,
+        include_normal_catalogs: bool = True,
+    ) -> None:
         assert self.adapters is not None
         adapter = self.adapters.get(Venue.EXTENDED)
-        if not isinstance(adapter, ExtendedAdapter):
-            return
+        async def refresh_universe_catalog() -> None:
+            assert isinstance(adapter, ExtendedAdapter)
+            try:
+                markets, volumes = await adapter.fetch_catalog()
+                completed = self.clock.now()
+                self._install_extended_catalog(
+                    markets, volumes, completed, full=True
+                )
+                self._last_catalog_good_at[Venue.EXTENDED] = completed
+                self._update_extended_catalog_readiness(completed)
+                self._record(
+                    "PUBLIC_REQUEST_COMPLETED", at=completed,
+                    venue=Venue.EXTENDED,
+                    detail={
+                        "component": "extended_universe",
+                        "timeout_seconds": (
+                            self.config.extended_universe_request_timeout_seconds
+                        ),
+                    },
+                )
+            except asyncio.CancelledError:
+                raise
+            except (
+                aiohttp.ClientError, TimeoutError, OSError,
+                PublicDataUnavailable, ValueError, KeyError, TypeError,
+            ) as exc:
+                self._update_extended_catalog_readiness(self.clock.now())
+                self._record(
+                    "PUBLIC_REQUEST_FAILED", venue=Venue.EXTENDED,
+                    detail={
+                        "component": "extended_universe",
+                        "endpoint_class": "catalog",
+                        "exception_class": type(exc).__name__,
+                        "timeout_seconds": (
+                            self.config.extended_universe_request_timeout_seconds
+                        ),
+                        "cache_state": (
+                            "CACHED_LAST_GOOD"
+                            if self._extended_universe_at is not None
+                            and self.clock.now() - self._extended_universe_at
+                            <= timedelta(
+                                seconds=self.config.extended_universe_max_age_seconds
+                            ) else "FAIL_CLOSED"
+                        ),
+                    },
+                )
+
         try:
-            markets, volumes = await adapter.fetch_catalog()
-            completed = self.clock.now()
-            self._install_extended_catalog(markets, volumes, completed, full=True)
-            self._last_catalog_good_at[Venue.EXTENDED] = completed
-            self._update_extended_catalog_readiness(completed)
-            self._record(
-                "PUBLIC_REQUEST_COMPLETED", at=completed, venue=Venue.EXTENDED,
-                detail={
-                    "component": "extended_universe",
-                    "timeout_seconds": self.config.extended_universe_request_timeout_seconds,
-                },
-            )
-            if self._stop_event is not None and not self._stop_event.is_set():
-                pending_refresh = self._refresh_task
-                if pending_refresh is not None and not pending_refresh.done():
-                    await asyncio.gather(pending_refresh, return_exceptions=True)
-                if (
-                    not self._stop_event.is_set()
-                    and self._background_fatal is None
-                ):
-                    self._start_public_refresh()
-        except asyncio.CancelledError:
-            raise
-        except (
-            aiohttp.ClientError, TimeoutError, OSError, PublicDataUnavailable,
-            ValueError, KeyError, TypeError,
-        ) as exc:
-            self._update_extended_catalog_readiness(self.clock.now())
-            self._record(
-                "PUBLIC_REQUEST_FAILED", venue=Venue.EXTENDED,
-                detail={
-                    "component": "extended_universe", "endpoint_class": "catalog",
-                    "exception_class": type(exc).__name__,
-                    "timeout_seconds": self.config.extended_universe_request_timeout_seconds,
-                    "cache_state": (
-                        "CACHED_LAST_GOOD" if self._extended_universe_at is not None
-                        and self.clock.now() - self._extended_universe_at <= timedelta(
-                            seconds=self.config.extended_universe_max_age_seconds
-                        ) else "FAIL_CLOSED"
-                    ),
-                },
-            )
+            work: list[Awaitable[None]] = [self._refresh_extended_required()]
+            if include_normal_catalogs:
+                work.extend(
+                    self._catalog(venue, venue_adapter)
+                    for venue, venue_adapter in self.adapters.items()
+                    if venue is not Venue.EXTENDED
+                )
+            if include_universe and isinstance(adapter, ExtendedAdapter):
+                work.append(refresh_universe_catalog())
+            await _gather_owned(*work)
         finally:
             self._extended_universe_task = None
 
-    def _start_extended_universe_refresh(self) -> None:
+    def _start_background_catalog_refresh(
+        self, *, include_extended_universe: bool,
+        include_normal_catalogs: bool = True,
+    ) -> None:
         if self._extended_universe_task is not None and not self._extended_universe_task.done():
             return
         self._extended_universe_task = asyncio.create_task(
-            self._refresh_extended_universe()
+            self._refresh_extended_universe(
+                include_universe=include_extended_universe,
+                include_normal_catalogs=include_normal_catalogs,
+            )
         )
         self._extended_universe_task.add_done_callback(self._background_task_done)
+
+    def _start_extended_universe_refresh(self) -> None:
+        self._start_background_catalog_refresh(include_extended_universe=True)
 
     async def _refresh_extended_required(self) -> None:
         assert self.adapters is not None
@@ -1059,7 +1094,7 @@ class PublicPaperRuntime:
                         market, assumed_open_at=assumed_at
                     )
                 else:
-                    book, funding = await asyncio.gather(
+                    book, funding = await _gather_owned(
                         adapter.fetch_book(market.venue_symbol),
                         adapter.fetch_funding_quote(market, assumed_open_at=assumed_at),
                     )
@@ -1081,7 +1116,10 @@ class PublicPaperRuntime:
                     market.venue, f"{component}:{market.venue_symbol}", True,
                     "PUBLIC_MARKET_READY", logical_at,
                 )
-        except Exception as exc:
+        except (
+            aiohttp.ClientError, TimeoutError, OSError, PublicDataUnavailable,
+            ValueError, KeyError, TypeError,
+        ) as exc:
             logical_at = self.clock.now()
             if background and existing is not None:
                 failed_components = (
@@ -1153,18 +1191,19 @@ class PublicPaperRuntime:
         started_at = self.clock.now()
         scheduled_at = scheduled_at or started_at
         if refresh:
-            await asyncio.gather(
+            await _gather_owned(
                 *(self._catalog(venue, adapter) for venue, adapter in self.adapters.items())
             )
             self.observations.clear()
             assumed_at = self.clock.now()
             candidates = self._candidate_markets()
-            await asyncio.gather(
+            await _gather_owned(
                 *(self._market_observation(market, assumed_at) for market in candidates)
             )
         logical_at = self.clock.now()
+        captured = tuple(self.observations.values())
         normalized: list[MarketObservation] = []
-        for observation in self.observations.values():
+        for observation in captured:
             market = observation.market
             if (
                 market.venue is Venue.EXTENDED
@@ -1204,7 +1243,36 @@ class PublicPaperRuntime:
                 trade_stream_ready=trade_stream_ready,
                 funding_stream_ready=funding_stream_ready,
             ))
-        snapshot = await scan_once(normalized, logical_at, config=self.config)
+        normalized_tuple = tuple(normalized)
+        for observation in normalized_tuple:
+            timestamps = (
+                None if observation.book is None else observation.book.observed_at,
+                None if observation.funding is None else observation.funding.observed_at,
+                None if observation.health is None
+                else observation.health.last_market_event_at,
+                None if observation.health is None
+                else observation.health.last_connection_confirmation_at,
+            )
+            if any(at is not None and at > logical_at for at in timestamps):
+                raise RuntimeError("scan observation timestamp exceeds logical_at")
+        normalized_by_market = {
+            (row.market.venue, row.market.venue_symbol): row
+            for row in normalized_tuple
+        }
+        captured_keys = set(normalized_by_market)
+        observations_source = (
+            "REST_BOOTSTRAP"
+            if refresh else (
+                "LIVE_STREAM"
+                if captured_keys
+                and captured_keys <= self._trade_stream_ready
+                and captured_keys <= self._live_book_ready
+                else "MIXED"
+            )
+        )
+        snapshot = await scan_once(
+            normalized_tuple, logical_at, config=self.config
+        )
         persist_scan = (
             self.last_scan is None or self.last_scan.logical_at != logical_at
         )
@@ -1214,7 +1282,8 @@ class PublicPaperRuntime:
                 recorded_at=logical_at,
                 scan_snapshot=snapshot,
                 funding_quotes=tuple(
-                    row.funding for row in normalized if row.funding is not None
+                    row.funding
+                    for row in normalized_tuple if row.funding is not None
                 ),
             )
         completed_at = self.clock.now()
@@ -1235,7 +1304,7 @@ class PublicPaperRuntime:
                     0, int((started_at - scheduled_at).total_seconds() * 1000)
                 ),
                 "scan_kind": scan_kind,
-                "observations_source": self._observations_source(refresh),
+                "observations_source": observations_source,
             },
         )
         rankable = [
@@ -1252,7 +1321,8 @@ class PublicPaperRuntime:
         rows = rankable + blocked
         route_rows = tuple(
             _route_row(
-                plan, rank=ranks.get(id(plan)), observations=self.observations,
+                plan, rank=ranks.get(id(plan)),
+                observations=normalized_by_market,
                 config=self.config,
             )
             for plan in rows
@@ -1312,31 +1382,17 @@ class PublicPaperRuntime:
             "assumption_flags": _assumption_flags(),
         }
 
-    def _observations_source(self, refresh: bool) -> str:
-        if refresh:
-            return "REST_BOOTSTRAP"
-        keys = set(self.observations)
-        if keys and keys <= self._trade_stream_ready and keys <= self._live_book_ready:
-            return "LIVE_STREAM"
-        return "MIXED"
-
     async def _refresh_public_data(self) -> None:
         assert self.adapters is not None
         started = self.clock.now()
         self._record("PUBLIC_REFRESH_STARTED", at=started)
         try:
-            await asyncio.gather(
-                *(
-                    self._catalog(venue, adapter)
-                    for venue, adapter in self.adapters.items()
-                    if venue is not Venue.EXTENDED
-                )
-            )
-            await self._refresh_extended_required()
             self._update_extended_catalog_readiness(self.clock.now())
             assumed_at = self.clock.now()
-            await asyncio.gather(*(
-                self._market_observation(market, assumed_at, background=True)
+            await _gather_owned(*(
+                self._market_observation(
+                    market, assumed_at, background=True
+                )
                 for market in self._candidate_markets()
             ))
             await self._reconcile_streams()
@@ -1365,6 +1421,9 @@ class PublicPaperRuntime:
         exception = task.exception()
         if exception is None or self._stop_cause == "RUNTIME_FATAL":
             return
+        if task is self._refresh_task:
+            self._refresh_task = None
+            self._pending_full_scan_at = None
         self._background_fatal = exception
         self._request_stop("RUNTIME_FATAL")
         self._record(
@@ -1568,8 +1627,15 @@ class PublicPaperRuntime:
             self.next_full_scan_at = self.last_scan.logical_at + timedelta(
                 seconds=self.config.normal_scan_seconds
             )
-        elif now >= self.next_full_scan_at:
+        elif (
+            self._pending_full_scan_at is None
+            and now >= self.next_full_scan_at
+        ):
             scheduled = self.next_full_scan_at
+            self._pending_full_scan_at = scheduled
+            self.next_full_scan_at = _next_absolute_slot(
+                scheduled, now, self.config.normal_scan_seconds
+            )
             self._record(
                 "PUBLIC_SCAN_DEADLINE", at=now,
                 detail={
@@ -1578,13 +1644,29 @@ class PublicPaperRuntime:
                 },
             )
             self._start_public_refresh()
-            await self.scan(
-                refresh=False, scan_kind="FULL", scheduled_at=scheduled
+            self._start_background_catalog_refresh(
+                include_extended_universe=False
             )
-            now = self.last_scan.logical_at
-            self.next_full_scan_at = _next_absolute_slot(
-                scheduled, now, self.config.normal_scan_seconds
-            )
+        refresh = self._refresh_task
+        if (
+            self._pending_full_scan_at is not None
+            and refresh is not None
+            and refresh.done()
+        ):
+            scheduled = self._pending_full_scan_at
+            if refresh.cancelled() or refresh.exception() is not None:
+                self._pending_full_scan_at = None
+                self._refresh_task = None
+            else:
+                self._pending_full_scan_at = None
+                self._refresh_task = None
+                await self.scan(
+                    refresh=False, scan_kind="FULL", scheduled_at=scheduled
+                )
+                now = self.last_scan.logical_at
+                self.next_full_scan_at = _next_absolute_slot(
+                    scheduled, now, self.config.normal_scan_seconds
+                )
         if self.lifecycle is not None:
             if (
                 self.next_position_monitor_at is None
@@ -3840,6 +3922,9 @@ class PublicPaperRuntime:
             # bootstrap. Seed the existing single-flight refresh now so the
             # first 120-second FULL scan does not inherit that bootstrap age.
             self._start_public_refresh()
+            self._start_background_catalog_refresh(
+                include_extended_universe=False
+            )
             while not self._stop_event.is_set():
                 if await self._tick_or_stop():
                     break
@@ -3937,6 +4022,7 @@ class PublicPaperRuntime:
         self._pending_socket_episodes.clear()
         self._pending_watchdog_episodes.clear()
         self._refresh_task = None
+        self._pending_full_scan_at = None
         self._extended_universe_task = None
 
     async def close(self) -> None:

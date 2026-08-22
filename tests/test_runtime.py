@@ -3,6 +3,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 import json
+import pickle
 from pathlib import Path
 import sqlite3
 import time
@@ -1225,13 +1226,44 @@ async def test_startup_seed_refresh_keeps_first_full_digest_funding_fresh(
             repository, adapters=fakes, clock=clock, sleep=drive,
             stop_event=stop, notifications=NotificationOutbox(delivery),
         )
+        digest = next(
+            row for row in delivery.rows if row.kind == "FULL_SCAN_DIGEST"
+        )
+        full_quotes = tuple(
+            pickle.loads(payload)
+            for (payload,) in repository.connection.execute(
+                "SELECT payload FROM funding_quotes WHERE opened_at=?",
+                (digest.occurred_at.isoformat(),),
+            )
+        )
+        full_routes = repository.report(
+            as_of=digest.occurred_at
+        )["latest_routes"]
 
-    digest = next(row for row in delivery.rows if row.kind == "FULL_SCAN_DIGEST")
     assert result["status"] == "STOPPED_SAFE"
     assert risex.initial_observed_at is not None
     assert risex.seeded_observed_at is not None
     assert digest.occurred_at - risex.initial_observed_at > timedelta(seconds=120)
-    assert digest.occurred_at - risex.seeded_observed_at < timedelta(seconds=120)
+    assert len(full_quotes) == 3
+    assert all(
+        quote.observed_at <= digest.occurred_at
+        and digest.occurred_at - quote.observed_at <= timedelta(seconds=120)
+        for quote in full_quotes
+    )
+    quote_sources = {
+        (quote.venue.value, quote.canonical_market): quote.source
+        for quote in full_quotes
+    }
+    assert all(
+        row["source_quality"]["risex_funding"]["source"]
+        == quote_sources["RISEX", f"{row['canonical_asset']}-RISEX"]
+        and row["source_quality"]["hedge_funding"]["source"]
+        == quote_sources[
+            row["hedge_venue"],
+            f"{row['canonical_asset']}-{row['hedge_venue']}",
+        ]
+        for row in full_routes
+    )
     assert "Expected PnL: UNKNOWN" not in digest.text
     assert "Expected PnL: $" in digest.text
 
@@ -1261,10 +1293,18 @@ async def test_late_extended_universe_schedules_post_seed_refresh(tmp_path):
             (symbol, kind)
         )
         runtime._refresh_task = asyncio.create_task(pending_seed_refresh())
+        seed_task = runtime._refresh_task
         universe_task = asyncio.create_task(runtime._refresh_extended_universe())
         await asyncio.sleep(0)
         pending_gate.set()
         await universe_task
+        assert runtime._refresh_task is seed_task
+        await runtime._refresh_task
+        assert (
+            Venue.EXTENDED, extended.market.venue_symbol
+        ) not in runtime.observations
+        runtime._start_public_refresh()
+        assert runtime._refresh_task is not seed_task
         assert runtime._refresh_task is not None
         await runtime._refresh_task
 
@@ -3158,6 +3198,11 @@ async def test_public_refresh_starts_combined_stream_once_after_catalog_recovery
         assert not any(key[0] is Venue.NADO for key in runtime._stream_tasks)
 
         fakes[Venue.NADO].available = True
+        runtime._start_background_catalog_refresh(
+            include_extended_universe=False
+        )
+        assert runtime._extended_universe_task is not None
+        await runtime._extended_universe_task
         await runtime._refresh_public_data()
         first = dict(runtime._stream_tasks)
         assert sum(
@@ -3937,6 +3982,9 @@ async def test_sixty_second_extended_universe_request_does_not_move_full_cadence
             runtime.next_full_scan_at = NOW
             runtime.next_health_check_at = NOW + timedelta(hours=1)
             await runtime.tick(NOW)
+            assert runtime._refresh_task is not None
+            await runtime._refresh_task
+            await runtime.tick(NOW)
             await extended.request_started.wait()
             assert runtime._extended_universe_task is not None
             assert not runtime._extended_universe_task.done()
@@ -3945,6 +3993,10 @@ async def test_sixty_second_extended_universe_request_does_not_move_full_cadence
             assert not runtime._extended_universe_task.done()
             clock.advance(60)
             await runtime.tick(clock.now())
+            assert runtime._refresh_task is not None
+            await runtime._refresh_task
+            await runtime.tick(clock.now())
+            assert not runtime._extended_universe_task.done()
             scans = [
                 json.loads(row["detail"])
                 for row in repository.connection.execute(
@@ -4618,6 +4670,9 @@ async def test_nado_only_initial_then_extended_ready_next_full_has_twenty_routes
                         confirm_extended_stream(runtime,
                             symbol, kind, clock.now(), data_ready=False,
                         )
+            await runtime.tick(clock.now())
+            assert runtime._refresh_task is not None
+            await runtime._refresh_task
             await runtime.tick(clock.now())
             routes = repository.report(as_of=clock.now())["latest_routes"]
             plans = runtime.last_scan.evaluations
