@@ -1,33 +1,27 @@
-# PAPER-007-STABILIZATION-001 — Single-Owner Stream and Lifecycle Causality
+# PAPER-007-STABILIZATION-002 — Venue-Complete Recovery and Persisted Lifecycle Causality
 
-Status: user-authorized and active. This is the only implementation slice. It is a corrective audit label under the existing PAPER-007 paper scope, not new product functionality. Stage B and Telegram remain stopped.
+Status: proposed and held for Chief Reviewer plan review. No Builder may start until the Chief Reviewer accepts this bounded contract. PAPER-007-STABILIZATION-001 is `BLOCKED — TASK DID NOT CONVERGE`; rejected commits `e6c0bcc2415bb2b4b7b9b3d0026fd435b9db29c4` and `fc47b8a111503dc91d1347929ba32b7038f03d99` must not be merged, cherry-picked wholesale, or called accepted.
 
-Reconstruct the smallest independently reviewed correction from accepted baseline `53704869047e32b0357eaf4d3d32955fa0cf8b65`. Do not merge or cherry-pick rejected PAPER-007-FIX-011 commits `fd0a014`, `86566e0`, or `802fec2`. Remove or consolidate duplicate ownership before adding state. Do not change economics, thresholds, cadence, formulas, official API semantics, route selection, trade-through rules, Telegram behavior, or paper/live boundaries.
+This is one strictly corrective slice under the existing PAPER-007 stabilization authorization. It adds no product behavior, economics, formula, cadence, Telegram behavior, private endpoint, live capability, service, compatibility layer, flag, cache, or parallel state owner. Stage B and Telegram remain stopped.
 
-## Required implementation
+## Reconstruction boundary
 
-- Give every Extended physical book reader/session a captured, explicit, non-null monotonically unique `StreamSessionId` from startup through every reconnect. Every snapshot/delta and every mutation of book health, readiness, recovery, or evidence must prove that reader still owns the current session. `StreamSessionId` must be semantically distinct from `RecoveryEpisodeId` and recovery attempt generation; optional identity or fallback paths are prohibited.
-- Give each `(venue, market)` recovery exactly one owner containing its `RecoveryEpisodeId`, current attempt generation, phase, buffer, attempt/overflow counters, terminal result, and task ownership. This object replaces the existing parallel `_recovery_buffers`, `_recovery_overflowed`, `_recovery_attempts`, `_recovery_generations`, and `_recovery_tasks` episode state rather than coordinating them as a sixth owner. Keep only a minimal separate task registry if shutdown genuinely requires it, with explicit ownership and cleanup tests. For Extended, the episode explicitly owns one exact `StreamSessionId`; `None`, older, newer-unowned, startup-late, and obsolete-reconnect frames are inert.
-- A recovery restart task only transfers/establishes reader ownership. It cannot complete snapshot recovery. Exactly one START and one terminal COMPLETE or FAIL are recorded per episode; obsolete work cannot change book/readiness/evidence. Two sequential gap/reconnect cycles use distinct episode and session identities.
-- Preserve venue-specific behavior unchanged: Nado activates and replays its bounded REST snapshot buffer; RISEx waits for official unsubscribe/resubscribe WebSocket snapshots; Extended waits for its owned dedicated WebSocket snapshot.
-- Cancel and await current and displaced stream/recovery owners on replacement and shutdown. After the stop boundary, no task may write readiness, book, lifecycle, or evidence.
-- Preserve only the lifecycle corrections independently proven necessary: all-or-nothing lifecycle transitions, causal non-regressing commit time, stale exit-version rejection before key consumption, and atomic active-position settlement plus lifecycle checkpoint persistence. One runtime serialization frontier orders lifecycle commits; no network I/O, sleep, Telegram, or adapter call occurs while held.
+Builder starts from current local `main`, writes production-shaped RED tests against that baseline and, where the defect exists only in the rejected candidate, proves RED on a disposable detached checkout of `fc47b8a`. Builder reconstructs only independently proven useful code; rejected commits are evidence, not an implementation base.
+
+- Replace the five parallel recovery episode maps with one existing-owner `RecoveryEpisode` per `(venue, market)`, using distinct non-null `StreamSessionId`, `RecoveryEpisodeId`, and attempt generation types. A minimal displaced-task registry is allowed only for cancellation/await ownership and must clean itself and be empty after shutdown.
+- Make terminal `FAILED` inert but live for Extended, Nado, and RISEx. Each venue's next genuine physical startup/reconnect creates exactly one fresh episode and START under its existing venue-specific recovery semantics. Nado remains REST snapshot plus bounded replay; RISEx remains unsubscribe/resubscribe WebSocket snapshot; Extended remains its owned dedicated WebSocket snapshot.
+- In combined RISEx/Nado startup, treat `apply_book_event=False` as fail-closed: do not mark book, trade, funding, or combined connection data ready from the rejected snapshot. No frame, confirmation, readiness, book, evidence, or terminal mutation may cross a lost physical `StreamSessionId` boundary.
+- Under the existing position serialization frontier, periodic evaluation, relevant-book hard-basis evaluation, and disconnect gap opening must evaluate a detached `LifecycleEngine` candidate, persist the exact candidate checkpoint, then publish memory synchronously. Repository failure leaves lifecycle memory, persisted snapshot, notifications, and scheduler-visible state consistent with their pre-operation values. Do not hold the lock across adapter/network I/O, sleep, or Telegram.
+- Adversarially audit queued RISEx/Nado combined trade and funding work. If cancellation does not make obsolete work inert, carry the existing typed combined `StreamSessionId` to the current commit boundary and revalidate there; do not add another coordinator or owner. Obsolete queued work emits no post-replacement receipt evidence.
+- Reconstruct only the previously proven Extended session checks, detached recovery publication, stale exit-version rejection, settlement atomicity, causal commit time, and bounded shutdown behavior that are necessary for this contract. Remove redundant wrappers or branches; report production LOC and recovery state-owner count against `main`.
 
 ## Mandatory evidence
 
-Builder writes production-shaped RED tests first and demonstrates the exact Extended late untagged/startup reader failure on rejected `802fec2` or accepted baseline as appropriate, then PASS on the new branch.
+- RED on `fc47b8a`: real Nado three-attempt REST failure and real RISEx overflow terminalize `FAILED`; a new combined physical session currently creates no fresh episode/terminal, publishes no book, and falsely marks readiness.
+- RED on `fc47b8a`: injected SQLite failure after periodic evaluate, relevant-book hard-basis evaluate, and disconnect gap opening currently leaves live lifecycle changed while persistence remains old.
+- GREEN must prove both venue recovery cases produce ordered START/FAILED/START/COMPLETED with distinct episode/generation/session identity and no premature readiness.
+- GREEN must prove repository failure and cancellation leave lifecycle memory, SQLite, notifications, readiness, scheduling, fills, settlements, and evidence consistent at every affected commit boundary.
+- Re-run the exact external Extended untagged/startup reproduction, all prior stabilization R1–R16 preservation cases, FIX-003/006/007/008/009/010 tests, repository races, full `pytest`, compileall, diff check, and tracked-secret scan.
+- R16 uses only a disposable copy of `/Users/daniilmakarov/Desktop/risex-paper007-archives/paper-007-stage-b-fix003-accepted.pre-fix010-operational.db`. The original must remain untouched with SHA-256 `93e9b6793e76cec227d0fe40799a70d0416518568b0c228fc0808a681497df80`; the distinct root DB must not be opened or mutated.
 
-Acceptance requires R1–R15 from the rejected FIX-011 contract, including the exact external Extended reproduction, plus:
-
-- every physical Extended session has non-null identity and only the current/episode-owned identity can mutate state;
-- two sequential real-shaped Extended recovery cycles have distinct sessions/episodes and one START plus one terminal COMPLETE each;
-- restart-task completion is not recovery completion;
-- shutdown completes within two seconds with no post-stop writes;
-- Nado and RISEx recovery boundaries are unchanged;
-- all existing FIX-003, FIX-006, FIX-007, FIX-008, FIX-009, FIX-010, recovery, repository failure/cancellation, full-suite, compileall, diff, and tracked-secret checks pass;
-- Builder and Architect diff reviews list every duplicate recovery structure deleted or collapsed, justify any remaining task registry, and report whether production `runtime.py` recovery code/state count decreased. A net-new flag, coordinator, or optional fallback is rejection.
-- R16 runs only on a disposable copy of `/Users/daniilmakarov/Desktop/risex-paper007-archives/paper-007-stage-b-fix003-accepted.pre-fix010-operational.db`; the original archive must remain untouched and its verified SHA-256 `93e9b6793e76cec227d0fe40799a70d0416518568b0c228fc0808a681497df80` unchanged. The different root DB with SHA-256 `60b6c82a...` must not be opened, mutated, or treated as this archive.
-
-The Builder starts from current local `main` on `codex/paper-007-stabilization-001`, reports root/branch/HEAD/status before edits, must not spawn agents, and produces one bounded implementation commit. At most two Architect-requested fix cycles are allowed. Telegram stays disabled; use tmp/disposable databases only; no private/authenticated endpoints, keys, real orders, or live trading.
-
-Stop after this slice. The global Scanner/UNKNOWN/PnL ownership and blocker matrix is a separate strictly corrective slice only after this implementation is accepted; do not mix it into this branch.
+Exactly one Builder may work after Chief Reviewer approval, on a new `codex/paper-007-stabilization-002` branch from local `main`, without spawning agents. Maximum two fix cycles. No merge, push, public endpoints, operational run, Stage B, Telegram, or global Scanner/UNKNOWN/PnL implementation before deterministic acceptance and independent Chief Review.
