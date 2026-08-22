@@ -8,6 +8,7 @@ import pickle
 import pytest
 
 import risex_farmer.runtime as runtime_module
+from risex_farmer.exchanges.base import PublicDataUnavailable
 from risex_farmer.exchanges.extended import ExtendedAdapter
 from risex_farmer.models import (
     BookLevel,
@@ -54,6 +55,84 @@ def _full_scan_count(repository: PaperRepository) -> int:
 
 def _latest_routes(repository: PaperRepository) -> list[dict[str, object]]:
     return repository.report(as_of=BASE + timedelta(hours=2))["latest_routes"]
+
+
+class RunLoopSleep:
+    def __init__(self) -> None:
+        self.waits: list[tuple[float, asyncio.Event]] = []
+        self.tasks: list[asyncio.Task[None]] = []
+        self.cancelled = 0
+
+    async def __call__(self, seconds: float) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        self.tasks.append(task)
+        gate = asyncio.Event()
+        self.waits.append((seconds, gate))
+        try:
+            await gate.wait()
+        except asyncio.CancelledError:
+            self.cancelled += 1
+            raise
+
+    def release_latest(self) -> None:
+        assert self.waits
+        self.waits[-1][1].set()
+
+
+async def _spin_until(predicate, *, turns: int = 500) -> bool:
+    for _ in range(turns):
+        if predicate():
+            return True
+        await asyncio.sleep(0)
+    return predicate()
+
+
+async def _run_loop_ready(
+    repository: PaperRepository,
+    clock: FakeClock,
+    controlled: "ControlledFundingAdapter",
+    *,
+    target: datetime,
+):
+    fakes = adapters(clock, settlement_at=target)
+    fakes[Venue.RISEX] = controlled
+    sleeper = RunLoopSleep()
+    stop = asyncio.Event()
+    runtime = PublicPaperRuntime(
+        repository, adapters=fakes, clock=clock, sleep=sleeper
+    )
+
+    async def no_streams() -> None:
+        return None
+
+    runtime.start_streams = no_streams
+    run_task = asyncio.create_task(runtime.run(stop_event=stop))
+    assert await _spin_until(lambda: bool(sleeper.waits))
+    assert repository.connection.execute(
+        "SELECT COUNT(*) FROM runtime_evidence "
+        "WHERE event_type='PAPER_RUN_READY'"
+    ).fetchone()[0] == 1
+    assert await _spin_until(
+        lambda: runtime._refresh_task is not None
+        and runtime._refresh_task.done()
+    )
+    assert await _spin_until(
+        lambda: runtime._extended_universe_task is None
+        or runtime._extended_universe_task.done()
+    )
+    return runtime, fakes, sleeper, stop, run_task
+
+
+def _scan_details(repository: PaperRepository, kind: str) -> list[dict[str, object]]:
+    return [
+        json.loads(row[0])
+        for row in repository.connection.execute(
+            "SELECT detail FROM runtime_evidence WHERE event_type='PUBLIC_SCAN' "
+            "AND json_extract(detail,'$.scan_kind')=? ORDER BY evidence_id",
+            (kind,),
+        )
+    ]
 
 
 class ControlledFundingAdapter(FakeAdapter):
@@ -1538,3 +1617,258 @@ async def test_stabilization003_i_telegram_relays_only_persisted_full_rows(tmp_p
         assert line.endswith(
             "Expected PnL: UNKNOWN — " + unknown_labels[blocker]
         )
+
+
+@pytest.mark.asyncio
+async def test_stabilization003_run_loop_refresh_completion_wakes_due_full(tmp_path):
+    clock = FakeClock(BASE)
+    target = BASE + timedelta(hours=1)
+    controlled = ControlledFundingAdapter(Venue.RISEX, clock, settlement_at=target)
+    with PaperRepository(tmp_path / "run-loop-full-wake.db") as repository:
+        runtime, fakes, sleeper, stop, run_task = await _run_loop_ready(
+            repository, clock, controlled, target=target
+        )
+        refresh_before = repository.connection.execute(
+            "SELECT COUNT(*) FROM runtime_evidence WHERE event_type='PUBLIC_REFRESH_STARTED'"
+        ).fetchone()[0]
+        funding_before = {
+            venue: adapter.calls.count("funding")
+            for venue, adapter in fakes.items()
+        }
+        controlled.block_funding = True
+        scheduled = BASE + timedelta(seconds=120)
+        clock.value = scheduled
+        sleeper.release_latest()
+        assert await _spin_until(controlled.funding_started.is_set)
+        assert await _spin_until(lambda: len(sleeper.waits) >= 2)
+        refresh_owner = runtime._refresh_task
+        assert refresh_owner is not None and not refresh_owner.done()
+        ordinary_wait = sleeper.waits[-1]
+        clock.value = scheduled + timedelta(seconds=3)
+        controlled.funding_gate.set()
+        assert await _spin_until(refresh_owner.done)
+        woke = await _spin_until(lambda: _full_scan_count(repository) == 1, turns=100)
+        full_rows = _scan_details(repository, "FULL")
+        refresh_after = repository.connection.execute(
+            "SELECT COUNT(*) FROM runtime_evidence WHERE event_type='PUBLIC_REFRESH_STARTED'"
+        ).fetchone()[0]
+        stop.set()
+        result = await asyncio.wait_for(run_task, timeout=1)
+
+    assert ordinary_wait[1].is_set() is False
+    assert woke, {
+        "terminal_at": clock.now().isoformat(),
+        "full_count": len(full_rows),
+        "refresh_delta": refresh_after - refresh_before,
+        "sleep_waits": len(sleeper.waits),
+        "funding_calls": {
+            venue.value: adapter.calls.count("funding")
+            for venue, adapter in fakes.items()
+        },
+    }
+    assert result == {"status": "STOPPED_SAFE", "forced_close": False}
+    assert len(full_rows) == 1
+    assert full_rows[0]["scheduled_at"] == scheduled.isoformat()
+    assert full_rows[0]["started_at"] == clock.now().isoformat()
+    assert runtime.last_scan is not None and runtime.last_scan.logical_at == clock.now()
+    assert refresh_after == refresh_before + 1
+    assert len(sleeper.waits) <= 3
+    assert all(
+        adapter.calls.count("funding") == funding_before[venue] + 1
+        for venue, adapter in fakes.items()
+    )
+
+
+@pytest.mark.asyncio
+async def test_stabilization003_run_loop_deadlines_precede_refresh_completion(tmp_path):
+    clock = FakeClock(BASE)
+    target = BASE + timedelta(seconds=400)
+    controlled = ControlledFundingAdapter(Venue.RISEX, clock, settlement_at=target)
+    health: list[datetime] = []
+    with PaperRepository(tmp_path / "run-loop-deadline-priority.db") as repository:
+        runtime, _, sleeper, stop, run_task = await _run_loop_ready(
+            repository, clock, controlled, target=target
+        )
+        original_health = runtime._check_extended_health
+
+        async def observed_health(at: datetime) -> None:
+            health.append(at)
+            await original_health(at)
+
+        runtime._check_extended_health = observed_health
+        clock.value = BASE + timedelta(seconds=100)
+        sleeper.release_latest()
+        assert await _spin_until(lambda: bool(_scan_details(repository, "FOCUSED")))
+        assert await _spin_until(lambda: len(sleeper.waits) >= 2)
+        controlled.block_funding = True
+        clock.value = BASE + timedelta(seconds=120)
+        sleeper.release_latest()
+        assert await _spin_until(controlled.funding_started.is_set)
+        assert await _spin_until(lambda: len(sleeper.waits) >= 3)
+        refresh_owner = runtime._refresh_task
+        assert refresh_owner is not None and not refresh_owner.done()
+        for expected_waits, offset in ((4, 280), (5, 395)):
+            clock.value = BASE + timedelta(seconds=offset)
+            for key, observation in tuple(runtime.observations.items()):
+                runtime.observations[key] = replace(
+                    observation,
+                    funding=replace(observation.funding, observed_at=clock.now()),
+                )
+            confirm_public_streams(runtime, clock.now())
+            sleeper.release_latest()
+            assert await _spin_until(lambda: len(sleeper.waits) >= expected_waits)
+            assert runtime._refresh_task is refresh_owner and not refresh_owner.done()
+        state_at_cutoff = repository.load_runtime()
+        clock.value = BASE + timedelta(seconds=398)
+        controlled.funding_gate.set()
+        assert await _spin_until(refresh_owner.done)
+        woke = await _spin_until(lambda: _full_scan_count(repository) == 1, turns=100)
+        stop.set()
+        await asyncio.wait_for(run_task, timeout=1)
+        focused = _scan_details(repository, "FOCUSED")
+        activation_rows = repository.connection.execute(
+            "SELECT recorded_at FROM runtime_evidence "
+            "WHERE event_type='PAPER_ENTRY_ACTIVATED'"
+        ).fetchall()
+
+    assert health and health[-1] <= BASE + timedelta(seconds=395)
+    assert any(row["scheduled_at"] == (BASE + timedelta(seconds=100)).isoformat() for row in focused)
+    assert [row[0] for row in activation_rows] == [
+        (target - timedelta(seconds=120)).isoformat()
+    ]
+    assert isinstance(state_at_cutoff, PaperEntryState)
+    assert state_at_cutoff.lifecycle_state is LifecycleState.FLAT
+    assert state_at_cutoff.order is not None
+    assert state_at_cutoff.order.status is PaperOrderStatus.CANCELLED
+    assert state_at_cutoff.order.cancellation_reason is CancellationReason.CUTOFF
+    assert woke
+
+
+@pytest.mark.asyncio
+async def test_stabilization003_run_loop_stop_owns_refresh_and_local_wait(tmp_path):
+    clock = FakeClock(BASE)
+    target = BASE + timedelta(hours=1)
+    controlled = ControlledFundingAdapter(Venue.RISEX, clock, settlement_at=target)
+    with PaperRepository(tmp_path / "run-loop-stop.db") as repository:
+        runtime, _, sleeper, stop, run_task = await _run_loop_ready(
+            repository, clock, controlled, target=target
+        )
+        controlled.block_funding = True
+        clock.value = BASE + timedelta(seconds=120)
+        sleeper.release_latest()
+        assert await _spin_until(controlled.funding_started.is_set)
+        assert await _spin_until(lambda: len(sleeper.waits) >= 2)
+        writes_before = repository.connection.total_changes
+        stop.set()
+        result = await asyncio.wait_for(run_task, timeout=1)
+        writes_after = repository.connection.total_changes
+        await asyncio.sleep(0)
+        writes_quiescent = repository.connection.total_changes
+        full_count = _full_scan_count(repository)
+
+    assert result == {"status": "STOPPED_SAFE", "forced_close": False}
+    assert sleeper.cancelled == 1
+    assert controlled.cancelled
+    assert runtime._refresh_task is None
+    assert runtime._pending_full_scan_at is None
+    assert full_count == 0
+    assert writes_after > writes_before
+    assert writes_quiescent == writes_after
+
+
+@pytest.mark.asyncio
+async def test_stabilization003_run_loop_parent_cancel_cleans_local_waiters(
+    tmp_path, monkeypatch,
+):
+    clock = FakeClock(BASE)
+    target = BASE + timedelta(hours=1)
+    controlled = ControlledFundingAdapter(Venue.RISEX, clock, settlement_at=target)
+    shielded: list[asyncio.Future[object]] = []
+    original_shield = asyncio.shield
+
+    def captured_shield(value):
+        wrapper = original_shield(value)
+        shielded.append(wrapper)
+        return wrapper
+
+    monkeypatch.setattr(runtime_module.asyncio, "shield", captured_shield)
+    with PaperRepository(tmp_path / "run-loop-parent-cancel.db") as repository:
+        runtime, _, sleeper, _, run_task = await _run_loop_ready(
+            repository, clock, controlled, target=target
+        )
+        controlled.block_funding = True
+        clock.value = BASE + timedelta(seconds=120)
+        sleeper.release_latest()
+        assert await _spin_until(controlled.funding_started.is_set)
+        assert await _spin_until(lambda: len(sleeper.waits) >= 2 and bool(shielded))
+        refresh_owner = runtime._refresh_task
+        assert refresh_owner is not None and not refresh_owner.done()
+        local_sleep = sleeper.tasks[-1]
+        local_shield = shielded[-1]
+        writes_before = repository.connection.total_changes
+        run_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(run_task, timeout=1)
+        terminal_before_test_cleanup = (local_sleep.done(), local_shield.done())
+        writes_after = repository.connection.total_changes
+        await asyncio.sleep(0)
+        writes_quiescent = repository.connection.total_changes
+        leaked = [task for task in (local_sleep,) if not task.done()]
+        for task in leaked:
+            task.cancel()
+        await asyncio.gather(*leaked, return_exceptions=True)
+
+    assert terminal_before_test_cleanup == (True, True)
+    assert controlled.cancelled
+    assert refresh_owner.done()
+    assert runtime._refresh_task is None
+    assert runtime._pending_full_scan_at is None
+    assert writes_after > writes_before
+    assert writes_quiescent == writes_after
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("completion", ("success", "expected_failure", "fatal"))
+async def test_stabilization003_run_loop_terminal_refresh_wakeup_modes(
+    tmp_path, completion,
+):
+    clock = FakeClock(BASE)
+    target = BASE + timedelta(hours=1)
+    controlled = ControlledFundingAdapter(Venue.RISEX, clock, settlement_at=target)
+    with PaperRepository(tmp_path / f"run-loop-terminal-{completion}.db") as repository:
+        runtime, _, sleeper, stop, run_task = await _run_loop_ready(
+            repository, clock, controlled, target=target
+        )
+        controlled.block_funding = True
+        if completion == "expected_failure":
+            controlled.funding_error = PublicDataUnavailable("expected public outage")
+        elif completion == "fatal":
+            controlled.funding_error = RuntimeError("programmer defect")
+        scheduled = BASE + timedelta(seconds=120)
+        clock.value = scheduled
+        sleeper.release_latest()
+        assert await _spin_until(controlled.funding_started.is_set)
+        assert await _spin_until(lambda: len(sleeper.waits) >= 2)
+        owner = runtime._refresh_task
+        assert owner is not None
+        terminal_at = scheduled + timedelta(seconds=3)
+        clock.value = terminal_at
+        controlled.funding_gate.set()
+        assert await _spin_until(owner.done)
+        if completion == "fatal":
+            with pytest.raises(RuntimeError, match="programmer defect"):
+                await asyncio.wait_for(run_task, timeout=1)
+            full_count = _full_scan_count(repository)
+        else:
+            woke = await _spin_until(lambda: _full_scan_count(repository) == 1, turns=100)
+            stop.set()
+            await asyncio.wait_for(run_task, timeout=1)
+            full_count = _full_scan_count(repository)
+            assert woke
+            assert runtime.last_scan is not None and runtime.last_scan.logical_at == terminal_at
+        fatal_rows = repository.connection.execute(
+            "SELECT COUNT(*) FROM runtime_evidence WHERE event_type='RUNTIME_FATAL'"
+        ).fetchone()[0]
+
+    assert full_count == (0 if completion == "fatal" else 1)
+    assert fatal_rows == (1 if completion == "fatal" else 0)

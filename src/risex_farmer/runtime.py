@@ -3827,13 +3827,17 @@ class PublicPaperRuntime:
         assert self._stop_event is not None
         sleep_task = asyncio.create_task(self._sleep(seconds))
         stop_task = asyncio.create_task(self._stop_event.wait())
-        _, pending = await asyncio.wait(
-            (sleep_task, stop_task), return_when=asyncio.FIRST_COMPLETED
-        )
-        for task in pending:
-            task.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+        waiters: list[asyncio.Future[Any]] = [sleep_task, stop_task]
+        refresh = self._refresh_task
+        if self._pending_full_scan_at is not None and refresh is not None:
+            waiters.append(asyncio.ensure_future(asyncio.shield(refresh)))
+        try:
+            await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in waiters:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*waiters, return_exceptions=True)
 
     async def _tick_or_stop(self) -> bool:
         """Run one tick while allowing an external stop to cancel its awaits."""
