@@ -1,6 +1,6 @@
 # TESTNET-002-RISEX-SIGNER-FIX-001 — Additive Config and Hex Bitmap Parsing
 
-Status: `RED AUTHORIZED — NO LIVE INVOCATION`.
+Status: `ACCEPTED — ONE REPLACEMENT OPERATIONAL REGISTRATION AUTHORIZED; NO ORDERS`.
 
 Start from exact published `main == origin/main == 6d8eb17bd44eb17505fd0ca0ccb0b402286c239a` on `codex/testnet-002-risex-signer-fix-001`. The accepted signer implementation remains a deterministic candidate, but operational onboarding is blocked: its one authorized invocation failed before secret load/signing/claim/dispatch with zero POST because current official public response shapes are narrower than its parser assumptions.
 
@@ -25,3 +25,7 @@ Start from exact published `main == origin/main == 6d8eb17bd44eb17505fd0ca0ccb0b
 Only `src/risex_farmer/testnet_risex_signer.py` owns these response parsers. Expected production change is limited to `_identity` and `_nonce`; focused tests may change only `tests/test_testnet_risex_signer.py`. Any dependency or other production edit requires Architect justification before change. No compatibility layer, generic coercion, new state, retry, endpoint, service, or configuration is permitted.
 
 Exactly one Builder starts from the governance commit on this fresh branch, authors RED first, and must not spawn agents. Architect reviews RED before GREEN. One implementation commit and at most two fix cycles. Stop for Chief candidate review before merge, push, XLSX/credential access, secret load, signing, claim, registration, revoke, or any other live action. Preserve the existing credential and record exactly; do not generate, delete, reset, rename, replace, or expose them.
+
+## Accepted operational boundary
+
+The accepted chain is base `6d8eb17bd44eb17505fd0ca0ccb0b402286c239a`, governance `54010d7981e8751c002565a2109a4e1403dc42b4`, RED `2a84065c496e8eeb6e7102c1878c08c0f0e5c649`, implementation `8d76e6465480185840ac04b99ba6a98bdea71599`, and fix cycle 1 `079106d42a9a96d21003e73640e2fbdf0d00c750`. After ordinary fast-forward integration through the physical Desktop main checkout, push, exact import identity, full gates, and preserved signer metadata verification, the Architect may invoke registration exactly once for the existing signer. The approved main-wallet key is loaded only inside the accepted lazy callback after public gates and exact derived-address verification. There is at most one POST and no retry. ACTIVE requires a separate authoritative status/list check; an ambiguous dispatch permits at most five read-only checks over at most 60 seconds. Stop after reporting; no order, revoke, other venue, mainnet, real-funds, Scanner/runtime, Telegram, strategy, or economics action begins.
