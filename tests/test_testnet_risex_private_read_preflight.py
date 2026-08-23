@@ -132,12 +132,12 @@ def private_frames(*, orders=(), positions=()):
          "worker_timestamp": "1787572800000000000"},
         {"method": "snapshot", "channel": "positions", "type": "snapshot",
          "data": list(positions), "position_count": len(positions),
-         "worker_timestamp": "1787572800000000001"},
+         "worker_timestamp": "1787572800000000000"},
     )
 
 
 def test_exact_official_empty_private_snapshots_are_accepted():
-    PrivateReadPreflight._validate_private_frames(private_frames())
+    PrivateReadPreflight._validate_private_frames(private_frames(), NOW)
 
 
 @pytest.mark.parametrize("case", [
@@ -161,7 +161,18 @@ def test_nonofficial_or_contradictory_private_snapshot_schema_rejected(case):
     else:
         frames[2]["type"] = "update"
     with pytest.raises(ValueError):
-        PrivateReadPreflight._validate_private_frames(tuple(frames))
+        PrivateReadPreflight._validate_private_frames(tuple(frames), NOW)
+
+
+@pytest.mark.parametrize("worker_timestamp", [
+    "1", str(int((NOW + 6) * 1_000_000_000)),
+])
+def test_stale_or_future_private_snapshot_timestamp_rejected(worker_timestamp):
+    frames = list(copy.deepcopy(private_frames()))
+    frames[1]["worker_timestamp"] = worker_timestamp
+    frames[2]["worker_timestamp"] = worker_timestamp
+    with pytest.raises(ValueError):
+        PrivateReadPreflight._validate_private_frames(tuple(frames), NOW)
 
 
 async def public_barrier(tmp_path: Path, *, lifecycle_clear=lambda: True):

@@ -495,7 +495,7 @@ class PrivateReadPreflight:
                 {"method": "subscribe", "params": {"channel": "positions"}},
             )
             frames = await _await(private_exchange(WS_ORIGIN, outbound_plan))
-            self._validate_private_frames(frames)
+            self._validate_private_frames(frames, self._clock())
             private_age = self._clock() - private_started
             if private_age < 0 or private_age > MAX_AGE_SECONDS:
                 raise ValueError("private proof stale")
@@ -552,7 +552,7 @@ class PrivateReadPreflight:
         }
 
     @staticmethod
-    def _validate_private_frames(frames: Any) -> None:
+    def _validate_private_frames(frames: Any, now: float) -> None:
         if not isinstance(frames, (tuple, list)) or len(frames) != 3:
             raise ValueError("invalid private frames")
         auth, orders, positions = frames
@@ -594,5 +594,10 @@ class PrivateReadPreflight:
                 or int(worker_timestamp) <= 0
             ):
                 raise ValueError("invalid worker timestamp")
+            age_ns = Decimal(str(now)) * Decimal(1_000_000_000) - Decimal(
+                worker_timestamp
+            )
+            if age_ns < 0 or age_ns > Decimal(MAX_AGE_SECONDS * 1_000_000_000):
+                raise ValueError("stale worker timestamp")
         if order_data or position_data:
             raise ValueError("private state not flat")
