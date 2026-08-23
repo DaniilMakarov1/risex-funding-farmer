@@ -493,16 +493,28 @@ class DurableIntentStore:
 
     def _bind_identities(self, account: str, signer: str) -> None:
         with self.connection:
-            rows = dict(self.connection.execute(
+            binding_rows = list(self.connection.execute(
                 "SELECT key, value FROM terminal WHERE key IN ('account', 'signer')"
             ))
-            if rows and rows != {"account": account, "signer": signer}:
+            rows = dict(binding_rows)
+            if len(binding_rows) == 2:
+                if rows != {"account": account, "signer": signer}:
+                    raise LifecycleSafetyError("RISEx lifecycle identity rejected")
+                return
+            if binding_rows:
+                raise LifecycleSafetyError("RISEx lifecycle identity rejected")
+            journal_not_empty = any((
+                self.connection.execute("SELECT 1 FROM intents LIMIT 1").fetchone(),
+                self.connection.execute("SELECT 1 FROM cancels LIMIT 1").fetchone(),
+                self.connection.execute("SELECT 1 FROM terminal LIMIT 1").fetchone(),
+            ))
+            if journal_not_empty:
                 raise LifecycleSafetyError("RISEx lifecycle identity rejected")
             self.connection.execute(
-                "INSERT OR IGNORE INTO terminal VALUES ('account', ?)", (account,)
+                "INSERT INTO terminal VALUES ('account', ?)", (account,)
             )
             self.connection.execute(
-                "INSERT OR IGNORE INTO terminal VALUES ('signer', ?)", (signer,)
+                "INSERT INTO terminal VALUES ('signer', ?)", (signer,)
             )
 
     def redacted_evidence(self) -> dict[str, Any]:

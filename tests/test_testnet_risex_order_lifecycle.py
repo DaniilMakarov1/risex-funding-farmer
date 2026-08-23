@@ -820,6 +820,71 @@ def test_prepared_intent_has_no_terminal_bypass(lifecycle):
     assert lifecycle.store.get(intent.intent_id).dispatch_count == 0
 
 
+def test_durable_identity_binding_cannot_be_reinitialized(tmp_path):
+    path = tmp_path / "missing-both-bindings.sqlite3"
+    original = new_lifecycle(path)
+    intent = open_intent(original)
+    with original.store.connection:
+        original.store.connection.execute(
+            "DELETE FROM terminal WHERE key IN ('account', 'signer')"
+        )
+    original.store.close()
+    store = DurableIntentStore(path)
+    before = store.all()
+    with pytest.raises(LifecycleSafetyError):
+        Lifecycle(
+            store, now=lambda: NOW, router=ROUTER, authorization=AUTHORIZATION,
+            expected_account=OTHER_ACCOUNT, expected_signer=OTHER_SIGNER,
+        )
+    assert store.all() == before
+    assert store.get(intent.intent_id).dispatch_count == 0
+    assert dict(store.connection.execute(
+        "SELECT key, value FROM terminal WHERE key IN ('account', 'signer')"
+    )) == {}
+    store.close()
+
+    path = tmp_path / "missing-one-binding.sqlite3"
+    original = new_lifecycle(path)
+    open_intent(original)
+    with original.store.connection:
+        original.store.connection.execute("DELETE FROM terminal WHERE key='signer'")
+    original.store.close()
+    store = DurableIntentStore(path)
+    before = store.all()
+    with pytest.raises(LifecycleSafetyError):
+        Lifecycle(
+            store, now=lambda: NOW, router=ROUTER, authorization=AUTHORIZATION,
+            expected_account=ACCOUNT, expected_signer=SIGNER_ADDRESS,
+        )
+    assert store.all() == before
+    assert dict(store.connection.execute(
+        "SELECT key, value FROM terminal WHERE key IN ('account', 'signer')"
+    )) == {"account": ACCOUNT.lower()}
+    store.close()
+
+    for index, evidence_kind in enumerate(("terminal", "cancel")):
+        store = DurableIntentStore(tmp_path / f"unbound-{evidence_kind}-{index}.sqlite3")
+        with store.connection:
+            if evidence_kind == "terminal":
+                store.connection.execute(
+                    "INSERT INTO terminal VALUES ('opening_fill', '1')"
+                )
+            else:
+                store.connection.execute(
+                    "INSERT INTO cancels VALUES ('known-order', 'AMBIGUOUS', 1)"
+                )
+        with pytest.raises(LifecycleSafetyError):
+            Lifecycle(
+                store, now=lambda: NOW, router=ROUTER,
+                authorization=AUTHORIZATION, expected_account=ACCOUNT,
+                expected_signer=SIGNER_ADDRESS,
+            )
+        assert dict(store.connection.execute(
+            "SELECT key, value FROM terminal WHERE key IN ('account', 'signer')"
+        )) == {}
+        store.close()
+
+
 def test_dispatching_crash_reconciles_without_replay(lifecycle):
     class SyntheticCrash(BaseException):
         pass
