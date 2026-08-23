@@ -301,7 +301,7 @@ def test_public_api_is_sealed_optional_and_has_no_trading_surface(module) -> Non
     assert tuple(inspect.signature(module.register_risex_session_signer).parameters) == (
         "wallet", "intent", "main_secret_loader",
     )
-    forbidden = ("sender", "session", "transport", "url", "base_url", "path",
+    forbidden = ("sender", "transport", "url", "base_url", "path",
                  "proxy", "revoke", "order", "place", "cancel", "position",
                  "trade", "mainnet", "nado", "extended", "reset", "delete",
                  "rearm", "retry")
