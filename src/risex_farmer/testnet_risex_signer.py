@@ -514,11 +514,10 @@ async def _identity(session: aiohttp.ClientSession) -> None:
     if not 200 <= status < 300:
         raise _safety_error()
     config = _payload(body)
-    if set(config) != {"chain", "addresses"}:
-        raise _safety_error()
-    chain, addresses = config["chain"], config["addresses"]
+    chain, addresses = config.get("chain"), config.get("addresses")
     if (not isinstance(chain, dict) or not isinstance(addresses, dict)
-            or chain != {"name": "Rise Testnet", "chain_id": str(_CHAIN_ID)}
+            or chain.get("name") != "Rise Testnet"
+            or chain.get("chain_id") != str(_CHAIN_ID)
             or _normalize_address(addresses.get("auth")) != _AUTH):
         raise _safety_error()
     status, body = await _request_json(session, "GET", _EIP712_DOMAIN)
@@ -542,11 +541,14 @@ async def _nonce(session: aiohttp.ClientSession, account: str) -> _Nonce:
     anchor = data["nonce_anchor"]
     index = data["current_bitmap_index"]
     bitmap = data["bitmap"]
+    bitmap_digits = bitmap[2:] if isinstance(bitmap, str) and bitmap.startswith("0x") else ""
     if (not isinstance(anchor, str) or not anchor.isdigit()
             or not isinstance(index, int)
-            or not isinstance(bitmap, str) or not bitmap.isdigit()):
+            or not bitmap_digits
+            or not all(character in "0123456789abcdefABCDEF"
+                       for character in bitmap_digits)):
         raise _safety_error()
-    anchor_value, bitmap_value = int(anchor), int(bitmap)
+    anchor_value, bitmap_value = int(anchor), int(bitmap_digits, 16)
     if not 0 <= anchor_value < 2**48 - 1 or not 0 <= index <= 208:
         raise _safety_error()
     if not 0 <= bitmap_value < 2**256:

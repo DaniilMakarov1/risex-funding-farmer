@@ -151,7 +151,7 @@ class Scenario:
         self.config = _config()
         self.domain = _domain()
         self.nonce = _envelope(
-            {"nonce_anchor": "0", "current_bitmap_index": 0, "bitmap": "0"}
+            {"nonce_anchor": "0", "current_bitmap_index": 0, "bitmap": "0x0"}
         )
         self.nonce_sequence: list[dict[str, Any]] = []
         self.status = 0
@@ -674,10 +674,10 @@ async def test_identity_nonce_expiration_gates_precede_secret_load(
         scenario.final_url = URL("https://api.rise.trade/v1/system/config")
     elif mutation == "nonce-anchor":
         scenario.nonce = _envelope({"nonce_anchor": str(2**48 - 1),
-                                    "current_bitmap_index": 0, "bitmap": "0"})
+                                    "current_bitmap_index": 0, "bitmap": "0x0"})
     elif mutation == "nonce-index":
         scenario.nonce = _envelope({"nonce_anchor": "0",
-                                    "current_bitmap_index": 209, "bitmap": "0"})
+                                    "current_bitmap_index": 209, "bitmap": "0x0"})
     elif mutation == "nonce-bitmap":
         scenario.nonce = _envelope({"nonce_anchor": "0",
                                     "current_bitmap_index": 0, "bitmap": "bad"})
@@ -725,7 +725,7 @@ async def test_full_nonce_anchor_208_advances_anchor_and_uses_bit_zero(
     _seed_generated(module, disposable_home)
     scenario = transport(Scenario())
     scenario.nonce = _envelope({"nonce_anchor": "40", "current_bitmap_index": 208,
-                                "bitmap": str(2**208 - 1)})
+                                "bitmap": hex(2**208 - 1)})
     scenario.activate_after_post = True
     result = await module.register_risex_session_signer(
         MAIN_ADDRESS, intent=REGISTER_INTENT, main_secret_loader=lambda: MAIN_KEY
@@ -882,8 +882,8 @@ async def test_nonce_change_between_signing_and_dispatch_fails_without_claim(
     _seed_generated(module, disposable_home)
     scenario = transport(Scenario())
     scenario.nonce_sequence = [
-        _envelope({"nonce_anchor": "0", "current_bitmap_index": 0, "bitmap": "0"}),
-        _envelope({"nonce_anchor": "1", "current_bitmap_index": 0, "bitmap": "0"}),
+        _envelope({"nonce_anchor": "0", "current_bitmap_index": 0, "bitmap": "0x0"}),
+        _envelope({"nonce_anchor": "1", "current_bitmap_index": 0, "bitmap": "0x0"}),
     ]
     with pytest.raises(module.SignerSafetyError):
         await module.register_risex_session_signer(
