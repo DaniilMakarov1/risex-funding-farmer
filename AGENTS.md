@@ -40,7 +40,7 @@ Only `AGENTS.md`, `SYSTEM_SPEC.md`, `STATUS.md`, `NEXT_TASK.md`, and `README.md`
 - Before edits, Builder reports repository root, branch, HEAD, and short status.
 - Builder must not work on `main`, merge, rebase, rewrite history, or alter unrelated changes.
 - Builder runs focused tests and full `pytest`, reviews the diff, and creates one milestone commit.
-- Architect reviews the branch and either accepts, requests a fix in the same branch, or rejects it.
+- Architect reviews the candidate and either accepts it, requests an in-scope fix, or rejects it. Before rejection, fixes remain on the same branch. After rejection, that branch and its commits remain immutable audit history; a later correction may proceed only under an explicit Chief Coordinator gate on a fresh venue-specific branch/worktree from the exact centrally authorized base, within the same bounded milestone and scope.
 - Fix cycles have no fixed numerical limit. Each cycle is permitted only for a newly identified, concretely reproduced acceptance-breaking defect; it must remain within the same bounded milestone and scope and undergo a full repeated Architect and Chief Coordinator review. A fix cycle does not authorize product, live, credential, strategy, shared-core, or cross-venue expansion. Removing the numerical limit does not accept, alter, or reopen rejected branches or commits. If there is no concrete reproducible defect, no bounded progress, or the task genuinely does not converge, stop with `BLOCKED — TASK DID NOT CONVERGE`.
 - A venue Architect never integrates or pushes `main`; Chief Coordinator's central integration preserves the accepted Builder commit without rewriting it and follows the sequential lane gate above.
 
