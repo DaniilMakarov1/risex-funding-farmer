@@ -524,8 +524,11 @@ async def _identity(session: aiohttp.ClientSession) -> None:
     if not 200 <= status < 300:
         raise _safety_error()
     domain = _payload(body)
-    if domain != {"name": _DOMAIN_NAME, "version": _DOMAIN_VERSION,
-                  "chain_id": str(_CHAIN_ID), "verifying_contract": _AUTH}:
+    if (set(domain) != {"name", "version", "chain_id", "verifying_contract"}
+            or domain.get("name") != _DOMAIN_NAME
+            or domain.get("version") != _DOMAIN_VERSION
+            or domain.get("chain_id") != str(_CHAIN_ID)
+            or _normalize_address(domain.get("verifying_contract")) != _AUTH):
         raise _safety_error()
 
 
