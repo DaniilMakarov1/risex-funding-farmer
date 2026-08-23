@@ -440,6 +440,19 @@ async def bootstrap_risex_account(wallet: str, *, intent: str) -> BootstrapResul
                 identity = await _identity(session)
                 preflight = await _preflight_balance(session, expected_wallet, identity)
                 if preflight is not None and preflight.ready:
+                    if not _claim_in_home(home_fd):
+                        return BootstrapResult(
+                            BootstrapStatus.UNKNOWN_AMBIGUOUS,
+                            message="testnet deposit authorization is already consumed",
+                        )
+                    try:
+                        _mark_ready(home_fd)
+                    except BootstrapSafetyError:
+                        return BootstrapResult(
+                            BootstrapStatus.READY_UNVERIFIED,
+                            preflight.balance_raw,
+                            "authoritative balance is positive but local state is ambiguous",
+                        )
                     return BootstrapResult(
                         BootstrapStatus.ALREADY_READY,
                         preflight.balance_raw,

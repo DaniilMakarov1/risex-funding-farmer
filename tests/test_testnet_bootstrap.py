@@ -301,6 +301,9 @@ async def test_preflight_and_postcondition_are_authoritative(module, transport):
     assert result.status is module.BootstrapStatus.ALREADY_READY
     assert not posts(already)
 
+    home = module._passwd_home()
+    (home / MARKER).unlink()
+
     unverified = transport(Scenario(balances=["0"]))
     result = await module.bootstrap_risex_account(WALLET, intent="RISEX_TESTNET_DEPOSIT")
     assert result.status is module.BootstrapStatus.SUBMITTED_UNVERIFIED
@@ -308,7 +311,6 @@ async def test_preflight_and_postcondition_are_authoritative(module, transport):
     assert len(posts(unverified)) == 1
     assert posts(unverified)[0][2]["json"] == {"account": WALLET, "amount": "1000"}
 
-    home = module._passwd_home()
     (home / MARKER).unlink()
     if (home / READY_TEMP).exists():
         (home / READY_TEMP).unlink()
@@ -526,6 +528,42 @@ def observed_absent(request_id: str) -> dict[str, Any]:
         "error": {"code": "Internal", "message": "failed to get balance"},
         "request_id": request_id,
     }
+
+
+@pytest.mark.asyncio
+async def test_positive_preflight_durably_consumes_before_restart(
+    module, transport, private_passwd_home
+):
+    first = transport(Scenario(balances=["12"]))
+    result = await module.bootstrap_risex_account(WALLET, intent="RISEX_TESTNET_DEPOSIT")
+    assert result.status is module.BootstrapStatus.ALREADY_READY
+    assert not posts(first)
+    assert json.loads((private_passwd_home / MARKER).read_text()) == marker_payload("READY")
+
+    later = transport(Scenario(balance_responses=[(500, observed_absent("later-request"))]))
+    result = await module.bootstrap_risex_account(WALLET, intent="RISEX_TESTNET_DEPOSIT")
+    assert result.status is module.BootstrapStatus.READY_UNVERIFIED
+    assert not posts(later)
+
+
+@pytest.mark.asyncio
+async def test_positive_preflight_ready_failure_remains_spent_and_never_posts(
+    module, transport, private_passwd_home, monkeypatch
+):
+    real_replace = module.os.replace
+    monkeypatch.setattr(module.os, "replace", lambda *_args, **_kwargs:
+                        (_ for _ in ()).throw(OSError("synthetic READY failure")))
+    first = transport(Scenario(balances=["12"]))
+    result = await module.bootstrap_risex_account(WALLET, intent="RISEX_TESTNET_DEPOSIT")
+    assert result.status is module.BootstrapStatus.READY_UNVERIFIED
+    assert not posts(first)
+    assert json.loads((private_passwd_home / MARKER).read_text()) == marker_payload()
+
+    monkeypatch.setattr(module.os, "replace", real_replace)
+    later = transport(Scenario(balance_responses=exact_absent_then()))
+    result = await module.bootstrap_risex_account(WALLET, intent="RISEX_TESTNET_DEPOSIT")
+    assert result.status is module.BootstrapStatus.UNKNOWN_AMBIGUOUS
+    assert not posts(later)
 
 
 @pytest.mark.asyncio
