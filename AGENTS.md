@@ -8,26 +8,36 @@ Only `AGENTS.md`, `SYSTEM_SPEC.md`, `STATUS.md`, `NEXT_TASK.md`, and `README.md`
 
 ## Roles
 
-- The user-appointed Chief Reviewer formulates work only for the Architect and independently reviews the Architect's decisions and results. The Chief Reviewer does not direct the Builder or write implementation code.
-- The user permanently authorizes the Chief Reviewer to create or replace the single Architect session whenever Chief judges it necessary, without separate approval. At most one Architect may be active at a time, and every future Chief/Architect handoff context must repeat this standing authorization and limit. This changes no product or implementation scope.
-- Architect owns architecture, orchestration, review, acceptance, and source-of-truth updates.
-- Exactly one Builder may work at a time. Builder must not spawn agents.
+- A venue lane's user-appointed Chief Reviewer formulates work only for that lane's Architect and independently reviews the Architect's decisions and results. Chief does not direct the Builder or write implementation code.
+- The user permanently authorizes each lane's Chief Reviewer to create or replace that lane's sole Architect whenever Chief judges it necessary, without separate approval. At most one Architect may be active per lane and at most three venue-lane Architects project-wide. Every future Chief/Architect handoff context must repeat this standing authorization and limit. This changes no product or implementation scope.
+- Each venue-lane Architect owns that lane's architecture, orchestration, review, acceptance, and source-of-truth updates on its lane branch.
+- At most one Builder may work per venue lane and at most three Builders project-wide. A Builder may start only after that venue's Phase 0 and the central governance gate are accepted. Builder must not spawn agents.
 - Builder implements only the bounded milestone in `NEXT_TASK.md` and must not begin the next milestone.
 - Do not create milestones beyond BOOTSTRAP-000 and PAPER-001 through PAPER-006, except the explicitly authorized PAPER-007 experiment, TELEGRAM-001 outbound-notification work, bounded TELEGRAM-001-FIX-001 correction, TELEGRAM-002 full-scan digest and its bounded two-decimal display correction, PAPER-007-FIX-004 public REST timeout correction, PAPER-007-FIX-005 first-full funding-freshness correction, PAPER-007-FIX-006 RISEx checksum-resubscribe correction, PAPER-007-FIX-007 Extended expected/applied funding and socket-health separation, PAPER-007-FIX-008 public evidence/catalog/heartbeat/digest/stop correction, and PAPER-007-FIX-009 public stream/time/startup consistency correction.
 - The user's ongoing stabilization decision authorizes successive strictly bounded corrective slices needed to make the existing paper system correct, without repeated user selection of technical task numbers. Administrative stabilization labels and branches are audit identifiers, not new product milestones.
-- The user's explicit testnet decision authorizes accepted `TESTNET-001` account bootstrap/read-only connectivity, the accepted `TESTNET-002-RISEX-SIGNER-001` session signer, and successive strictly bounded RISEx-first recovery slices recorded in `NEXT_TASK.md`. A blocked slice authorizes no Builder or private/executing write. This does not authorize mainnet, real funds, Scanner/runtime strategy integration, Nado/Extended execution, or work around an unknown safe-flat contract.
+- The user's explicit testnet decision authorizes accepted `TESTNET-001` account bootstrap/read-only connectivity, the accepted `TESTNET-002-RISEX-SIGNER-001` session signer, and successive strictly bounded RISEx-first recovery slices recorded in `NEXT_TASK.md`. A blocked slice authorizes no Builder or private/executing write. This does not authorize mainnet, real funds, Scanner/runtime strategy integration, or work around an unknown safe-flat contract. Nado and Extended remain research-only under the parallel-lane gate below.
 - Any new product behavior, economics, strategy, API/private access, live work, or Telegram expansion still requires a separate explicit user decision.
+
+## Parallel venue lanes
+
+- Up to three venue lanes may exist: RISEx, Nado, and Extended. Each lane has at most one Architect and one Builder; the project-wide maxima are three venue-lane Architects and three Builders.
+- `NEXT_TASK.md` may contain at most one active bounded slice per venue and at most three active slices total. Each slice retains its venue-local scope, ownership, evidence, and acceptance boundary.
+- Every lane uses a separate worktree and branch from its exact authorized base. Branch and task identifiers must carry an unambiguous unique `risex`, `nado`, or `extended` venue/lane prefix.
+- Venue teams never merge or push `main`. Central integration is sequential: before each candidate, verify its exact base against current `main`; after integrating each accepted candidate, run the full suite before considering the next lane candidate.
+- Nado or Extended implementation may not edit shared Scanner, runtime, economics, strategy, or Telegram code. If either lane requires a shared-core edit, that lane stops and needs a separate central integration decision before any such change.
+- Every lane is testnet-only, with every potential exposure/notional `<= USD 500`; mainnet and real funds are prohibited. Operational success requires authoritative zero open orders and exact flatness. Ambiguous place, cancel, or close is never retried blindly and must reconcile through exact official identity.
+- Nado and Extended are currently research-only. No Builder may start in either lane until these parallel-lane rules are Chief-accepted and published to `main`, that venue's Phase 0 is accepted, and its separate central governance gate is accepted.
 
 ## Git workflow
 
-- `main` contains only Architect-accepted work.
-- Builder starts from current `main` and works on `codex/<milestone-lowercase>`.
+- `main` contains only centrally integrated, Architect-accepted and Chief-reviewed work.
+- Builder starts from the exact centrally authorized `main` and works on a separate `codex/<venue-or-lane-prefix>-<bounded-slice>` branch/worktree.
 - Before edits, Builder reports repository root, branch, HEAD, and short status.
 - Builder must not work on `main`, merge, rebase, rewrite history, or alter unrelated changes.
 - Builder runs focused tests and full `pytest`, reviews the diff, and creates one milestone commit.
 - Architect reviews the branch and either accepts, requests a fix in the same branch, or rejects it.
 - At most two fix cycles are allowed; otherwise stop with `BLOCKED — TASK DID NOT CONVERGE`.
-- Architect integrates accepted work to `main` without rewriting the Builder commit.
+- A venue Architect never integrates or pushes `main`; central integration preserves the accepted Builder commit without rewriting it and follows the sequential lane gate above.
 
 ## Scope and safety
 
@@ -45,4 +55,4 @@ Only `AGENTS.md`, `SYSTEM_SPEC.md`, `STATUS.md`, `NEXT_TASK.md`, and `README.md`
 - CI tests use fixtures only; live smoke checks are opt-in.
 - Builder report is at most 20 lines and states branch, commit, tests, and material limitations.
 - Architect updates `STATUS.md` and `NEXT_TASK.md` only after acceptance.
-- After an accepted stabilization slice, the Architect may authorize only the next strictly corrective slice required by evidence and must record exactly one active slice in `NEXT_TASK.md`. Do not infer authorization for product expansion; PAPER-007 and TELEGRAM remain within their explicit user-approved boundaries.
+- After an accepted stabilization slice, its venue Architect may authorize only the next strictly corrective slice required by evidence and must record at most one active slice for that venue in `NEXT_TASK.md`, subject to the three-slice project maximum. Do not infer authorization for product expansion; PAPER-007 and TELEGRAM remain within their explicit user-approved boundaries.
