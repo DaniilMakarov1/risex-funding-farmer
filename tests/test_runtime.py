@@ -3441,10 +3441,16 @@ async def test_extended_watchdog_rotation_does_not_block_due_full_tick(
     fakes[Venue.EXTENDED] = extended
     symbol = extended.market.venue_symbol
     key = (Venue.EXTENDED, symbol, "book")
+    timeout = 2
 
     with PaperRepository(tmp_path / "extended-watchdog-prompt-rotation.db") as repository:
         runtime = PublicPaperRuntime(repository, adapters=fakes, clock=clock)
-        await runtime.scan()
+        try:
+            await asyncio.wait_for(runtime.scan(), timeout=timeout)
+        except BaseException:
+            runtime._request_stop("STOP_EVENT")
+            await asyncio.wait_for(runtime.shutdown(), timeout=timeout)
+            raise
         assert isinstance(runtime.last_scan, ScanSnapshot)
         runtime._session = SimpleNamespace(closed=True)
         runtime._stop_event = asyncio.Event()
@@ -3519,7 +3525,9 @@ async def test_extended_watchdog_rotation_does_not_block_due_full_tick(
             health_arrivals += 1
             if health_arrivals == 3:
                 all_health_checks_arrived.set()
-            await all_health_checks_arrived.wait()
+            await asyncio.wait_for(
+                all_health_checks_arrived.wait(), timeout=timeout
+            )
             await original_mark_disconnected(*args, **kwargs)
 
         runtime.mark_disconnected = synchronized_mark_disconnected
@@ -3528,66 +3536,111 @@ async def test_extended_watchdog_rotation_does_not_block_due_full_tick(
             asyncio.create_task(runtime._check_extended_health(NOW))
             for _ in range(2)
         ]
-        await cancel_acknowledged.wait()
-        prompt_tasks, _ = await asyncio.wait(
-            {tick, *repeated_checks}, timeout=0.05
-        )
-        await asyncio.sleep(0)
-        successor_before_retirement = runtime._stream_tasks.get(key)
-        session_before_retirement = runtime._stream_sessions.get(key)
-        successors_before_retirement = len(successor_sessions)
-        deadline_before_retirement = repository.connection.execute(
-            "SELECT COUNT(*) FROM runtime_evidence "
-            "WHERE event_type='PUBLIC_SCAN_DEADLINE'"
-        ).fetchone()[0]
-        observable_before_retirement = (
-            dict(runtime.component_readiness[Venue.EXTENDED]),
-            runtime.readiness[Venue.EXTENDED],
-            runtime.coordinator.stream(Venue.EXTENDED, symbol).book(),
-            runtime.observations[Venue.EXTENDED, symbol],
-            dict(runtime._extended_confirmed_at),
-            tuple(repository.connection.execute(
-                "SELECT event_type,detail FROM runtime_evidence ORDER BY evidence_id"
-            ).fetchall()),
-        )
+        controlled_tasks = {tick, *repeated_checks, old_task}
 
-        release_retirement.set()
-        await asyncio.gather(tick, *repeated_checks)
-        await old_mutation_attempted.wait()
-        await asyncio.sleep(0)
-        observable_after_retirement = (
-            dict(runtime.component_readiness[Venue.EXTENDED]),
-            runtime.readiness[Venue.EXTENDED],
-            runtime.coordinator.stream(Venue.EXTENDED, symbol).book(),
-            runtime.observations[Venue.EXTENDED, symbol],
-            dict(runtime._extended_confirmed_at),
-            tuple(repository.connection.execute(
-                "SELECT event_type,detail FROM runtime_evidence ORDER BY evidence_id"
-            ).fetchall()),
-        )
-        successor_was_running = bool(
-            successor_before_retirement is not None
-            and not successor_before_retirement.done()
-        )
-        old_retirement = (
-            old_task.done(), old_task.cancelled(), old_task.exception()
-        )
-        old_owned_after_retirement = old_task in runtime._stream_tasks.values()
-        refresh_was_started = runtime._refresh_task is not None
-        await runtime._refresh_task
-        await runtime.tick(NOW)
-        post_gate_scan = runtime.last_scan
-        pending_full_scan_at = runtime._pending_full_scan_at
-        full_scans = repository.connection.execute(
-            "SELECT COUNT(*) FROM runtime_evidence "
-            "WHERE event_type='PUBLIC_SCAN' AND detail LIKE '%\"scan_kind\":\"FULL\"%'"
-        ).fetchone()[0]
-        socket_rows = repository.connection.execute(
-            "SELECT COUNT(*) FROM runtime_evidence "
-            "WHERE event_type LIKE 'PUBLIC_SOCKET_%'"
-        ).fetchone()[0]
-        runtime._request_stop("STOP_EVENT")
-        await runtime.shutdown()
+        def old_task_ownership_locations():
+            def contains_old_task(value, seen):
+                if value is old_task:
+                    return True
+                if isinstance(value, asyncio.Task) or id(value) in seen:
+                    return False
+                seen.add(id(value))
+                if isinstance(value, dict):
+                    return any(
+                        contains_old_task(item, seen)
+                        for pair in value.items() for item in pair
+                    )
+                if isinstance(value, (list, set, tuple)):
+                    return any(contains_old_task(item, seen) for item in value)
+                owned = getattr(value, "task", None)
+                return owned is old_task
+
+            return tuple(
+                name for name, value in vars(runtime).items()
+                if any(token in name for token in ("task", "stream", "recover"))
+                and contains_old_task(value, set())
+            )
+
+        try:
+            await asyncio.wait_for(
+                cancel_acknowledged.wait(), timeout=timeout
+            )
+            prompt_tasks, _ = await asyncio.wait(
+                {tick, *repeated_checks}, timeout=0.05
+            )
+            await asyncio.sleep(0)
+            successor_before_retirement = runtime._stream_tasks.get(key)
+            session_before_retirement = runtime._stream_sessions.get(key)
+            successors_before_retirement = len(successor_sessions)
+            deadline_before_retirement = repository.connection.execute(
+                "SELECT COUNT(*) FROM runtime_evidence "
+                "WHERE event_type='PUBLIC_SCAN_DEADLINE'"
+            ).fetchone()[0]
+            observable_before_retirement = (
+                dict(runtime.component_readiness[Venue.EXTENDED]),
+                runtime.readiness[Venue.EXTENDED],
+                runtime.coordinator.stream(Venue.EXTENDED, symbol).book(),
+                runtime.observations[Venue.EXTENDED, symbol],
+                dict(runtime._extended_confirmed_at),
+                tuple(repository.connection.execute(
+                    "SELECT event_type,detail FROM runtime_evidence ORDER BY evidence_id"
+                ).fetchall()),
+            )
+
+            release_retirement.set()
+            await asyncio.wait_for(
+                asyncio.gather(tick, *repeated_checks), timeout=timeout
+            )
+            await asyncio.wait_for(
+                old_mutation_attempted.wait(), timeout=timeout
+            )
+            await asyncio.sleep(0)
+            observable_after_retirement = (
+                dict(runtime.component_readiness[Venue.EXTENDED]),
+                runtime.readiness[Venue.EXTENDED],
+                runtime.coordinator.stream(Venue.EXTENDED, symbol).book(),
+                runtime.observations[Venue.EXTENDED, symbol],
+                dict(runtime._extended_confirmed_at),
+                tuple(repository.connection.execute(
+                    "SELECT event_type,detail FROM runtime_evidence ORDER BY evidence_id"
+                ).fetchall()),
+            )
+            successor_was_running = bool(
+                successor_before_retirement is not None
+                and not successor_before_retirement.done()
+            )
+            old_retirement = (
+                old_task.done(), old_task.cancelled(), old_task.exception()
+            )
+            old_ownership_after_retirement = old_task_ownership_locations()
+            refresh_was_started = runtime._refresh_task is not None
+            await asyncio.wait_for(runtime._refresh_task, timeout=timeout)
+            await asyncio.wait_for(runtime.tick(NOW), timeout=timeout)
+            post_gate_scan = runtime.last_scan
+            pending_full_scan_at = runtime._pending_full_scan_at
+            full_scans = repository.connection.execute(
+                "SELECT COUNT(*) FROM runtime_evidence "
+                "WHERE event_type='PUBLIC_SCAN' "
+                "AND detail LIKE '%\"scan_kind\":\"FULL\"%'"
+            ).fetchone()[0]
+            socket_rows = repository.connection.execute(
+                "SELECT COUNT(*) FROM runtime_evidence "
+                "WHERE event_type LIKE 'PUBLIC_SOCKET_%'"
+            ).fetchone()[0]
+        finally:
+            all_health_checks_arrived.set()
+            release_retirement.set()
+            for task in controlled_tasks:
+                if not task.done():
+                    task.cancel()
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*controlled_tasks, return_exceptions=True),
+                    timeout=timeout,
+                )
+            finally:
+                runtime._request_stop("STOP_EVENT")
+                await asyncio.wait_for(runtime.shutdown(), timeout=timeout)
 
     assert prompt_tasks == {tick, *repeated_checks}, {
         "completed_before_release": len(prompt_tasks),
@@ -3610,7 +3663,7 @@ async def test_extended_watchdog_rotation_does_not_block_due_full_tick(
     assert deadline_before_retirement == 1
     assert observable_after_retirement == observable_before_retirement
     assert old_retirement == (True, False, None)
-    assert not old_owned_after_retirement
+    assert old_ownership_after_retirement == ()
     assert refresh_was_started
     assert isinstance(post_gate_scan, ScanSnapshot)
     assert post_gate_scan.logical_at == NOW
@@ -3625,6 +3678,7 @@ async def test_extended_watchdog_delayed_retirement_exception_is_fatal(tmp_path)
     symbol = "ABC-EXTENDED"
     key = (Venue.EXTENDED, symbol, "book")
     adapter = ExtendedAdapter(None)
+    timeout = 2
     with PaperRepository(tmp_path / "extended-watchdog-retirement-error.db") as repository:
         runtime = PublicPaperRuntime(
             repository, adapters={Venue.EXTENDED: adapter}, clock=clock,
@@ -3653,18 +3707,46 @@ async def test_extended_watchdog_delayed_retirement_exception_is_fatal(tmp_path)
         restart = asyncio.create_task(
             runtime._restart_extended_stream(symbol, "book")
         )
-        await cancel_acknowledged.wait()
-        prompt, _ = await asyncio.wait({restart}, timeout=0.05)
-        release_retirement.set()
-        await restart
-        await asyncio.sleep(0)
-        stop_cause = runtime._stop_cause
-        fatal = repository.connection.execute(
-            "SELECT detail FROM runtime_evidence WHERE event_type='RUNTIME_FATAL'"
-        ).fetchall()
-        old_done = old_task.done()
-        old_exception = old_task.exception()
-        await runtime.shutdown()
+        controlled_tasks = {restart, old_task}
+        loop = asyncio.get_running_loop()
+        previous_exception_handler = loop.get_exception_handler()
+        loop_errors = []
+        loop.set_exception_handler(
+            lambda _loop, context: loop_errors.append(context)
+        )
+        try:
+            await asyncio.wait_for(
+                cancel_acknowledged.wait(), timeout=timeout
+            )
+            prompt, _ = await asyncio.wait({restart}, timeout=0.05)
+            release_retirement.set()
+            await asyncio.wait_for(restart, timeout=timeout)
+            old_completed, _ = await asyncio.wait(
+                {old_task}, timeout=timeout
+            )
+            await asyncio.sleep(0)
+            stop_cause = runtime._stop_cause
+            fatal = repository.connection.execute(
+                "SELECT detail FROM runtime_evidence "
+                "WHERE event_type='RUNTIME_FATAL'"
+            ).fetchall()
+            old_done = old_completed == {old_task}
+            old_exception_consumed = not old_task._log_traceback
+        finally:
+            release_retirement.set()
+            for task in controlled_tasks:
+                if not task.done():
+                    task.cancel()
+            try:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*controlled_tasks, return_exceptions=True),
+                        timeout=timeout,
+                    )
+                finally:
+                    await asyncio.wait_for(runtime.shutdown(), timeout=timeout)
+            finally:
+                loop.set_exception_handler(previous_exception_handler)
 
     assert prompt == {restart}, {
         "completed_before_release": len(prompt),
@@ -3677,7 +3759,8 @@ async def test_extended_watchdog_delayed_retirement_exception_is_fatal(tmp_path)
         "RuntimeError"
     ]
     assert old_done
-    assert isinstance(old_exception, RuntimeError)
+    assert old_exception_consumed
+    assert loop_errors == []
 
 
 @pytest.mark.asyncio
