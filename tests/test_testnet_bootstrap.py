@@ -7,6 +7,7 @@ import os
 import ssl
 import subprocess
 import sys
+import threading
 import traceback
 import json
 import stat
@@ -937,6 +938,40 @@ def test_subprocess_race_and_abrupt_restart_are_one_shot(module, private_passwd_
     output, error = replay.communicate(timeout=5)
     assert replay.returncode == 0, error
     assert output.strip() == "BLOCKED"
+
+
+def test_observer_during_exclusive_prewrite_publication_is_terminal_blocked(
+    module, monkeypatch
+):
+    entered_write = threading.Event()
+    release_write = threading.Event()
+    real_write = module.os.write
+    winner_ident: list[int] = []
+    outcome: list[object] = []
+
+    def gated_write(fd, data):
+        if threading.get_ident() == winner_ident[0] and not entered_write.is_set():
+            entered_write.set()
+            assert release_write.wait(timeout=3)
+        return real_write(fd, data)
+
+    def winner() -> None:
+        winner_ident.append(threading.get_ident())
+        try:
+            outcome.append(module._claim_first_deposit())
+        except BaseException as error:
+            outcome.append(error)
+
+    monkeypatch.setattr(module.os, "write", gated_write)
+    thread = threading.Thread(target=winner)
+    thread.start()
+    assert entered_write.wait(timeout=3)
+    observer = module._claim_first_deposit()
+    release_write.set()
+    thread.join(timeout=3)
+    assert not thread.is_alive()
+    assert observer is False
+    assert outcome == [True]
 
 
 @pytest.mark.parametrize("failure", [asyncio.TimeoutError(), EOFError(),

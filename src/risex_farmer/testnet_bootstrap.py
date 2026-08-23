@@ -168,7 +168,7 @@ def _existing_state(home_fd: int) -> str | None:
         return "SPENT_UNKNOWN"
     if marker == _READY_BYTES:
         return "READY"
-    raise _safety_error()
+    return "BLOCKED"
 
 
 def _claim_in_home(home_fd: int) -> bool:
