@@ -318,6 +318,47 @@ def test_partial_ioc_uses_exact_residual_without_rounding(lifecycle):
     assert third.size == Decimal("0.000037") and third.size_steps == 37
 
 
+def test_later_close_requires_durable_exact_reconciled_position(tmp_path):
+    for index, (drift, restart) in enumerate((
+        ("0.00008", True),
+        ("0.00002", False),
+    )):
+        candidate = new_lifecycle(tmp_path / f"position-lineage-{index}.sqlite3")
+        seed_filled(candidate)
+        first = prepare_close(candidate)
+        dispatch(candidate, first, "close-1")
+        candidate.reconcile(
+            first.intent_id,
+            exact_evidence("close-1", 201, position="0.0001"),
+        )
+        candidate._now = lambda: NOW + 2
+        second = prepare_close(
+            candidate, client_id=202, anchor=8, bitmap=5, observed=NOW + 2,
+        )
+        dispatch(candidate, second, "close-2")
+        candidate.reconcile(second.intent_id, exact_evidence(
+            "close-2", 202, filled="0.00006", position="0.00004",
+            observed=NOW + 2,
+        ))
+        path = candidate.store.path
+        if restart:
+            candidate.store.close()
+            candidate = new_lifecycle(path, now=NOW + 3)
+        else:
+            candidate._now = lambda: NOW + 3
+        before = candidate.store.all()
+        with pytest.raises(LifecycleSafetyError):
+            prepare_close(
+                candidate, position=drift, client_id=203, anchor=8, bitmap=6,
+                observed=NOW + 3,
+            )
+        after = candidate.store.all()
+        assert after == before
+        assert all(intent.dispatch_count == 1 for intent in after)
+        assert candidate.store.load_outcome() == Outcome.FAILED_HALTED_MANUAL_RECOVERY
+        candidate.store.close()
+
+
 def test_non_step_residual_halts_without_another_dispatch(lifecycle):
     seed_filled(lifecycle)
     first = prepare_close(lifecycle)

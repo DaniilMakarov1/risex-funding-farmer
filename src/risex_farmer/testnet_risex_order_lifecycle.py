@@ -372,13 +372,28 @@ class DurableIntentStore:
             else:
                 self.connection.execute("UPDATE intents SET state=? WHERE intent_id=?", (state, intent_id))
 
-    def _reconcile_intent(self, intent_id: str, order_id: str | None) -> None:
+    def _reconcile_intent(
+        self, intent_id: str, order_id: str | None, resulting_position: Decimal,
+    ) -> None:
         with self.connection:
             self.connection.execute(
                 "UPDATE intents SET state='TERMINAL', order_id=COALESCE(order_id, ?), "
                 "reconciled=1 WHERE intent_id=?",
                 (order_id, intent_id),
             )
+            self.connection.execute(
+                "INSERT INTO terminal VALUES (?, ?)",
+                (f"position:{intent_id}", str(resulting_position)),
+            )
+
+    def latest_reconciled_position(self) -> Decimal | None:
+        row = self.connection.execute(
+            "SELECT terminal.value FROM intents LEFT JOIN terminal "
+            "ON terminal.key = 'position:' || intents.intent_id "
+            "WHERE intents.state='TERMINAL' AND intents.reconciled=1 "
+            "ORDER BY intents.ordinal DESC LIMIT 1"
+        ).fetchone()
+        return None if row is None or row[0] is None else Decimal(str(row[0]))
 
     def _record_open_known(self, intent_id: str, order_id: str) -> None:
         with self.connection:
@@ -702,6 +717,9 @@ class Lifecycle:
         position = account.position
         if account.open_order_ids:
             self._reject(halt=True)
+        latest_position = self.store.latest_reconciled_position()
+        if latest_position is None or position != latest_position:
+            self._reject(halt=True)
         if position <= 0 or not _aligned(position, market.step):
             self._reject(halt=True)
         prior = [item for item in self.store.all() if item.kind == "CLOSE"]
@@ -936,7 +954,7 @@ class Lifecycle:
             expected_position = current.source_position - evidence.filled_size
             if evidence.filled_size > current.source_position or evidence.position != expected_position:
                 self._reject(halt=True)
-        self.store._reconcile_intent(intent_id, expected)
+        self.store._reconcile_intent(intent_id, expected, evidence.position)
         if current.kind == "OPEN" and evidence.filled_size == 0 and evidence.position == 0 and not evidence.open_order_ids:
             self.outcome = Outcome.COMPLETED_NO_FILL_FLAT
             self.store.persist_outcome(self.outcome)
