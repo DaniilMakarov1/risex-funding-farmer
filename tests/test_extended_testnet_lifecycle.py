@@ -100,7 +100,7 @@ def reopen(lifecycle):
     return ExtendedLifecycle(store=IntentStore(lifecycle.store.path), credential_loader=forbidden_loader)
 
 
-def filled_evidence(wire, *, now_ms=1_770_000_003_000):
+def filled_wire(wire, *, now_ms=1_770_000_003_000):
     changed = copy.deepcopy(wire)
     order = changed["filledOrder"]
     position = changed["position"]
@@ -113,13 +113,17 @@ def filled_evidence(wire, *, now_ms=1_770_000_003_000):
     changed["account"]["fills"] = [changed["fill"]]
     changed["stream"]["eventTime"] = now_ms
     changed["stream"]["receivedAt"] = now_ms
-    changed["stream"]["orders"] = [order]
-    changed["stream"]["positions"] = [position]
-    changed["stream"]["trades"] = [changed["fill"]]
-    return normalize_official_evidence(changed, now_ms=now_ms)
+    changed["stream"]["orders"] = [copy.deepcopy(order)]
+    changed["stream"]["positions"] = [copy.deepcopy(position)]
+    changed["stream"]["trades"] = [copy.deepcopy(changed["fill"])]
+    return changed
 
 
-def closed_evidence(wire, *, now_ms=1_770_000_020_000):
+def filled_evidence(wire, *, now_ms=1_770_000_003_000):
+    return normalize_official_evidence(filled_wire(wire, now_ms=now_ms), now_ms=now_ms)
+
+
+def closed_wire(wire, *, now_ms=1_770_000_020_000):
     changed = copy.deepcopy(wire)
     changed["account"]["serverTime"] = now_ms
     changed["account"]["observedAt"] = now_ms
@@ -130,9 +134,32 @@ def closed_evidence(wire, *, now_ms=1_770_000_020_000):
     changed["account"]["fills"] = [changed["fill"], changed["closeFill"]]
     changed["stream"]["eventTime"] = now_ms
     changed["stream"]["receivedAt"] = now_ms
-    changed["stream"]["orders"] = [changed["filledOrder"], changed["filledCloseOrder"]]
+    changed["stream"]["orders"] = [copy.deepcopy(changed["filledOrder"]), copy.deepcopy(changed["filledCloseOrder"])]
     changed["stream"]["positions"] = []
-    changed["stream"]["trades"] = [changed["fill"], changed["closeFill"]]
+    changed["stream"]["trades"] = [copy.deepcopy(changed["fill"]), copy.deepcopy(changed["closeFill"])]
+    return changed
+
+
+def closed_evidence(wire, *, now_ms=1_770_000_020_000):
+    return normalize_official_evidence(closed_wire(wire, now_ms=now_ms), now_ms=now_ms)
+
+
+def cancelled_evidence(wire, *, now_ms=1_770_000_003_000):
+    changed = copy.deepcopy(wire)
+    cancelled = copy.deepcopy(changed["filledOrder"])
+    cancelled.update(status="CANCELLED", filledQty="0", cancelledQty="0.001", averagePrice=None, payedFee="0")
+    changed["account"]["serverTime"] = now_ms
+    changed["account"]["observedAt"] = now_ms
+    changed["account"]["openOrders"] = []
+    changed["account"]["positions"] = []
+    changed["account"]["orderStatus"] = cancelled
+    changed["account"]["orderHistory"] = [cancelled]
+    changed["account"]["fills"] = []
+    changed["stream"]["eventTime"] = now_ms
+    changed["stream"]["receivedAt"] = now_ms
+    changed["stream"]["orders"] = [cancelled]
+    changed["stream"]["positions"] = []
+    changed["stream"]["trades"] = []
     return normalize_official_evidence(changed, now_ms=now_ms)
 
 
@@ -345,6 +372,10 @@ def test_preflight_requires_exact_market_account_and_stream_rest_agreement(
     for key in path[:-1]:
         target = target[key]
     target[path[-1]] = [changed["filledOrder"]] if bad_value == "FILLED_ORDER" else bad_value
+    if path == ("account", "balance", "availableForTrade"):
+        changed["stream"]["balance"]["availableForTrade"] = bad_value
+    elif path == ("account", "openOrders"):
+        changed["stream"]["orders"] = [copy.deepcopy(changed["filledOrder"])]
     with pytest.raises((ContractViolation, EvidenceViolation), match=reason):
         candidate = normalize_official_evidence(changed, now_ms=1_770_000_000_000)
         prepare_entry(lifecycle, candidate, changed)
@@ -690,6 +721,201 @@ def test_each_final_barrier_component_fails_closed(lifecycle, evidence, wire, bl
         lifecycle.reconcile(close.id, blocked)
     assert lifecycle.complete is False
     assert lifecycle.next_write(evidence) is None
+
+
+def test_claim_expiry_fence_uses_server_stream_and_observation_clocks(lifecycle, evidence, wire):
+    intent = prepare_entry(lifecycle, evidence, wire)
+    fence_time = intent.expiry_ms + 1
+    changed = copy.deepcopy(wire)
+    changed["account"]["serverTime"] = intent.expiry_ms - 1
+    changed["account"]["observedAt"] = fence_time
+    changed["book"]["eventTime"] = fence_time
+    changed["stream"]["eventTime"] = fence_time
+    changed["stream"]["receivedAt"] = fence_time
+    current = normalize_official_evidence(changed, now_ms=fence_time)
+    with pytest.raises((EvidenceViolation, LifecycleHalted), match="EXPIRED|TEMPORAL"):
+        lifecycle.claim_for_dispatch(intent.id, evidence=current)
+    assert lifecycle.store.get(intent.id).state == "PREPARED"
+    assert lifecycle.store.dispatch_count(intent.id) == 0
+
+
+def test_prepared_entry_cannot_reconcile_terminal_evidence(lifecycle, evidence, wire):
+    intent = prepare_entry(lifecycle, evidence, wire)
+    with pytest.raises(LifecycleHalted, match="CLAIMED"):
+        lifecycle.reconcile(intent.id, filled_evidence(wire))
+    assert lifecycle.store.get(intent.id).state == "PREPARED"
+    assert lifecycle.store.snapshot().lifecycle_state == "FLAT"
+
+
+@pytest.mark.parametrize(
+    ("first_kind", "second_kind"),
+    [("CANCEL", "CANCEL"), ("CANCEL", "MASS_CANCEL"), ("MASS_CANCEL", "CANCEL"), ("MASS_CANCEL", "MASS_CANCEL")],
+)
+def test_exactly_one_cancellation_action_total_per_target(
+    lifecycle, evidence, wire, first_kind, second_kind
+):
+    entry = claim_entry(lifecycle, evidence, wire)
+    first = lifecycle.prepare_cancellation(entry.id, kind=first_kind, evidence=evidence)
+    lifecycle.claim_for_dispatch(first.id, evidence=evidence)
+    before = lifecycle.store.snapshot()
+    with pytest.raises((IntentConflict, LifecycleHalted)):
+        lifecycle.prepare_cancellation(entry.id, kind=second_kind, evidence=evidence)
+    assert lifecycle.store.snapshot().intent_states == before.intent_states
+    assert lifecycle.store.dispatch_count(first.id) == 1
+
+
+@pytest.mark.parametrize("mismatch", ["BALANCE", "POSITION", "ORDER", "FILL"])
+def test_stream_and_rest_require_full_value_agreement(wire, mismatch):
+    changed = filled_wire(wire)
+    if mismatch == "BALANCE":
+        changed["stream"]["balance"]["availableForTrade"] = "1"
+    elif mismatch == "POSITION":
+        changed["stream"]["positions"][0]["size"] = "0.002"
+    elif mismatch == "ORDER":
+        changed["stream"]["orders"][0]["status"] = "NEW"
+    else:
+        changed["stream"]["trades"][0]["qty"] = "0.0005"
+    with pytest.raises(EvidenceViolation, match="STREAM_REST_DISAGREE"):
+        normalize_official_evidence(changed, now_ms=1_770_000_003_000)
+
+
+@pytest.mark.parametrize("mismatch", ["ORDER_ACCOUNT", "FILL_ACCOUNT", "POSITION_ACCOUNT", "MARKET", "SIDE", "ORDER_BINDING"])
+def test_reconciliation_rows_bind_exact_account_market_side_and_order(lifecycle, evidence, wire, mismatch):
+    entry = claim_entry(lifecycle, evidence, wire)
+    changed = filled_wire(wire)
+    order = changed["account"]["orderStatus"]
+    history = changed["account"]["orderHistory"][0]
+    stream_order = changed["stream"]["orders"][0]
+    fill = changed["account"]["fills"][0]
+    stream_fill = changed["stream"]["trades"][0]
+    position = changed["account"]["positions"][0]
+    stream_position = changed["stream"]["positions"][0]
+    if mismatch == "ORDER_ACCOUNT":
+        for row in (order, history, stream_order):
+            row["accountId"] = 7002
+    elif mismatch == "FILL_ACCOUNT":
+        fill["accountId"] = stream_fill["accountId"] = 7002
+    elif mismatch == "POSITION_ACCOUNT":
+        position["accountId"] = stream_position["accountId"] = 7002
+    elif mismatch == "MARKET":
+        fill["market"] = stream_fill["market"] = "ETH-USD"
+    elif mismatch == "SIDE":
+        fill["side"] = stream_fill["side"] = "SELL"
+    else:
+        fill["orderId"] = stream_fill["orderId"] = 99999
+    candidate = normalize_official_evidence(changed, now_ms=1_770_000_003_000)
+    with pytest.raises(LifecycleHalted):
+        lifecycle.reconcile(entry.id, candidate)
+    assert lifecycle.store.get(entry.id).state == "CLAIMED"
+
+
+@pytest.mark.parametrize("mismatch", ["PARTIAL_CLOSE", "ENTRY_CLOSE_ARITHMETIC"])
+def test_close_fill_and_entry_close_arithmetic_must_reconcile_exactly(
+    lifecycle, evidence, wire, mismatch
+):
+    entry = claim_entry(lifecycle, evidence, wire)
+    exposed = filled_evidence(wire)
+    lifecycle.reconcile(entry.id, exposed)
+    close = prepare_close(lifecycle, entry.id, exposed, wire)
+    lifecycle.claim_for_dispatch(close.id, evidence=exposed)
+    changed = closed_wire(wire, now_ms=close.expiry_ms + 1)
+    if mismatch == "PARTIAL_CLOSE":
+        for row in (changed["account"]["orderStatus"], changed["account"]["orderHistory"][1], changed["stream"]["orders"][1]):
+            row["filledQty"] = "0.0005"
+        changed["account"]["fills"][1]["qty"] = "0.0005"
+        changed["stream"]["trades"][1]["qty"] = "0.0005"
+    else:
+        for row in (changed["account"]["orderHistory"][0], changed["stream"]["orders"][0]):
+            row["filledQty"] = "0.0005"
+        changed["account"]["fills"][0]["qty"] = "0.0005"
+        changed["stream"]["trades"][0]["qty"] = "0.0005"
+    candidate = normalize_official_evidence(changed, now_ms=close.expiry_ms + 1)
+    with pytest.raises(LifecycleHalted):
+        lifecycle.reconcile(close.id, candidate)
+    assert lifecycle.complete is False
+
+
+def test_preflight_requires_both_sides_depth_and_bounded_worst_close(lifecycle, wire):
+    no_bid = copy.deepcopy(wire)
+    no_bid["book"]["bids"][0]["qty"] = "0"
+    with pytest.raises(EvidenceViolation, match="DEPTH_INSUFFICIENT"):
+        candidate = normalize_official_evidence(no_bid, now_ms=1_770_000_000_000)
+        prepare_entry(lifecycle, candidate, no_bid)
+
+    expensive_close = copy.deepcopy(wire)
+    expensive_close["close"]["price"] = "600000"
+    close_payload = build_limit_ioc_order(expensive_close["close"])
+    expensive_close["vectors"]["closeCanonicalPayloadDigest"] = canonical_payload_digest(close_payload)
+    with pytest.raises(EvidenceViolation, match="NOTIONAL_CAP"):
+        candidate = normalize_official_evidence(expensive_close, now_ms=1_770_000_000_000)
+        prepare_entry(lifecycle, candidate, expensive_close)
+
+
+@pytest.mark.parametrize("constraint", ["BALANCE", "NEGATIVE_FEE", "ZERO_LEVERAGE"])
+def test_preflight_requires_sufficient_balance_nonnegative_fee_and_positive_bounded_leverage(
+    lifecycle, wire, constraint
+):
+    changed = copy.deepcopy(wire)
+    if constraint == "BALANCE":
+        changed["account"]["balance"]["availableForTrade"] = "1"
+        changed["stream"]["balance"]["availableForTrade"] = "1"
+        reason = "BALANCE_INSUFFICIENT"
+    elif constraint == "NEGATIVE_FEE":
+        changed["account"]["fees"][0]["takerFeeRate"] = "-0.00025"
+        reason = "FEE"
+    else:
+        changed["account"]["leverage"][0]["leverage"] = "0"
+        reason = "LEVERAGE_INVALID"
+    with pytest.raises(EvidenceViolation, match=reason):
+        candidate = normalize_official_evidence(changed, now_ms=1_770_000_000_000)
+        prepare_entry(lifecycle, candidate, changed)
+
+
+def test_lifecycle_allows_only_one_entry_and_close_requires_zero_open_orders(lifecycle, evidence, wire):
+    entry = prepare_entry(lifecycle, evidence, wire)
+    with pytest.raises(LifecycleHalted, match="ENTRY_ALREADY_EXISTS"):
+        lifecycle.prepare_order(
+            nonce=1_700_000_002,
+            settlement_hash=323456789012345678901234567890,
+            market=wire["entry"]["market"],
+            side=wire["entry"]["side"],
+            qty=Decimal(wire["entry"]["qty"]),
+            price=Decimal(wire["entry"]["price"]),
+            expiry_ms=wire["entry"]["expiryEpochMillis"],
+            reduce_only=False,
+            evidence=evidence,
+        )
+    lifecycle.claim_for_dispatch(entry.id, evidence=evidence)
+    exposed = filled_evidence(wire)
+    lifecycle.reconcile(entry.id, exposed)
+    open_order = copy.deepcopy(wire["filledOrder"])
+    open_order.update(id=99999, externalId="99999", status="NEW", filledQty="0")
+    with pytest.raises(LifecycleHalted, match="OPEN_ORDER"):
+        prepare_close(lifecycle, entry.id, exposed.with_open_orders([open_order]), wire)
+
+
+@pytest.mark.parametrize("kind", ["CANCEL", "MASS_CANCEL"])
+def test_claimed_cancel_no_fill_terminalizes_then_completes_only_after_expiry(
+    lifecycle, evidence, wire, kind
+):
+    entry = claim_entry(lifecycle, evidence, wire)
+    cancel = lifecycle.prepare_cancellation(entry.id, kind=kind, evidence=evidence)
+    lifecycle.claim_for_dispatch(cancel.id, evidence=evidence)
+    cancelled = cancelled_evidence(wire)
+    first = lifecycle.reconcile(cancel.id, cancelled)
+    snapshot = lifecycle.store.snapshot()
+    assert snapshot.intent_states[entry.id] == "ENTRY_CANCELLED_NO_FILL"
+    assert snapshot.intent_states[cancel.id] == "RECONCILED_CANCELLED_NO_FILL"
+    assert first.complete is False
+    assert first.next_write is None
+    with pytest.raises(LifecycleHalted):
+        lifecycle.claim_for_dispatch(cancel.id, evidence=cancelled)
+
+    final = cancelled_evidence(wire, now_ms=cancel.expiry_ms + 1)
+    result = lifecycle.reconcile(cancel.id, final)
+    assert result.lifecycle_state == "COMPLETE"
+    assert result.complete is True
+    assert result.next_write is None
 
 
 def test_no_dispatch_or_state_mutation_shortcuts_are_exposed(lifecycle):

@@ -21,7 +21,6 @@ from typing import Any, Callable, Mapping, Sequence
 MAX_NOTIONAL_USD = Decimal("500")
 _MAX_AGE_MS = 30_000
 _MAX_ORDER_LIFETIME_MS = 60_000
-_ACTIVE_ORDER_STATUSES = frozenset({"NEW", "PARTIALLY_FILLED", "UNTRIGGERED"})
 
 SDK_PROVENANCE = MappingProxyType({
     "repository": "https://github.com/x10xchange/python_sdk",
@@ -310,8 +309,11 @@ def _validate_position_row(row: Any, label: str) -> dict[str, Any]:
     return deepcopy(_strict(row, _POSITION_KEYS, set(), label))
 
 
-def _ids(rows: Sequence[Mapping[str, Any]], key: str) -> tuple[Any, ...]:
-    return tuple(sorted(row[key] for row in rows))
+def _row_map(rows: Sequence[Mapping[str, Any]], key: str) -> dict[Any, Mapping[str, Any]]:
+    mapped = {row[key]: row for row in rows}
+    if len(mapped) != len(rows):
+        raise EvidenceViolation("STREAM_REST_DISAGREE")
+    return mapped
 
 
 def normalize_official_evidence(raw: Mapping[str, Any], *, now_ms: int) -> OfficialEvidence:
@@ -469,7 +471,7 @@ def normalize_official_evidence(raw: Mapping[str, Any], *, now_ms: int) -> Offic
         set(),
         "stream",
     )
-    _strict(stream["balance"], balance_keys, set(), "stream.balance")
+    stream_balance = deepcopy(_strict(stream["balance"], balance_keys, set(), "stream.balance"))
     stream_orders = tuple(_validate_order_row(row, "stream.order") for row in stream["orders"])
     stream_positions = tuple(_validate_position_row(row, "stream.position") for row in stream["positions"])
     stream_trades = tuple(_validate_fill_row(row, "stream.trade") for row in stream["trades"])
@@ -512,20 +514,17 @@ def normalize_official_evidence(raw: Mapping[str, Any], *, now_ms: int) -> Offic
     if canonical_payload_digest(close_payload) != vectors["closeCanonicalPayloadDigest"]:
         raise ContractViolation("CLOSE_DIGEST_MISMATCH")
 
-    history_external_ids = frozenset(row["externalId"] for row in history)
-    active_rest_orders = tuple(row for row in open_orders if row["status"] in _ACTIVE_ORDER_STATUSES)
-    active_stream_orders = tuple(
-        row
-        for row in stream_orders
-        if row["status"] in _ACTIVE_ORDER_STATUSES and row["externalId"] not in history_external_ids
-    )
-    if _ids(active_rest_orders, "externalId") != _ids(active_stream_orders, "externalId"):
-        raise EvidenceViolation("STREAM_REST_DISAGREE")
-    if _ids(positions, "id") != _ids(stream_positions, "id"):
-        raise EvidenceViolation("STREAM_REST_DISAGREE")
-    if fills and _ids(fills, "id") != _ids(stream_trades, "id"):
-        raise EvidenceViolation("STREAM_REST_DISAGREE")
-    if history and _ids(history, "externalId") != _ids(stream_orders, "externalId"):
+    rest_orders = _row_map((*history, *open_orders), "externalId")
+    if order_status is not None:
+        matching_status = rest_orders.get(order_status["externalId"])
+        if matching_status is None or matching_status != order_status:
+            raise EvidenceViolation("STREAM_REST_DISAGREE")
+    if (
+        balance != stream_balance
+        or rest_orders != _row_map(stream_orders, "externalId")
+        or _row_map(positions, "id") != _row_map(stream_positions, "id")
+        or _row_map(fills, "id") != _row_map(stream_trades, "id")
+    ):
         raise EvidenceViolation("STREAM_REST_DISAGREE")
     if now_ms - book["eventTime"] > _MAX_AGE_MS:
         raise EvidenceViolation("STALE_BOOK")
@@ -775,6 +774,13 @@ class ExtendedLifecycle:
             raise EvidenceViolation("STREAM_GAP")
         if not evidence.fresh:
             raise EvidenceViolation("STALE_EVIDENCE")
+        if not 0 <= evidence.now_ms - evidence.server_time_ms <= _MAX_AGE_MS:
+            raise EvidenceViolation("TEMPORAL_DISAGREEMENT")
+
+    @staticmethod
+    def _past_expiry(evidence: OfficialEvidence, expiry_ms: int, *, strict: bool = False) -> bool:
+        clocks = (evidence.server_time_ms, evidence.stream_event_ms, evidence.now_ms)
+        return all(clock > expiry_ms for clock in clocks) if strict else any(clock >= expiry_ms for clock in clocks)
 
     def _validate_entry(self, evidence: OfficialEvidence, *, qty: Decimal, price: Decimal) -> None:
         self._validate_common(evidence)
@@ -798,20 +804,34 @@ class ExtendedLifecycle:
         vector = evidence.entry_vector
         if qty != _decimal(vector["qty"], "entry.qty") or price != _decimal(vector["price"], "entry.price"):
             raise EvidenceViolation("ORDER_VECTOR_MISMATCH")
-        levels = evidence.book["asks"] if vector["side"] == "BUY" else evidence.book["bids"]
-        if not levels or _decimal(levels[0]["qty"], "depth") < qty:
+        if any(
+            not evidence.book[side]
+            or sum(
+                (_decimal(level["qty"], "depth") for level in evidence.book[side]),
+                Decimal(0),
+            )
+            < step
+            for side in ("bids", "asks")
+        ):
             raise EvidenceViolation("DEPTH_INSUFFICIENT")
         fee = next((row for row in evidence.fees if row["market"] == evidence.market_name), None)
-        if fee is None or _decimal(fee["takerFeeRate"], "fee") != _decimal(vector["fee"], "order.fee"):
+        fee_rate = _decimal(fee["takerFeeRate"], "fee") if fee is not None else Decimal(-1)
+        if fee is None or fee_rate < 0 or fee_rate != _decimal(vector["fee"], "order.fee"):
             raise EvidenceViolation("FEE_MISMATCH")
         leverage = next((row for row in evidence.leverage if row["market"] == evidence.market_name), None)
-        if leverage is None or _decimal(leverage["leverage"], "leverage") > _decimal(config["maxLeverage"], "maxLeverage"):
+        leverage_value = _decimal(leverage["leverage"], "leverage") if leverage is not None else Decimal(0)
+        if leverage is None or not 0 < leverage_value <= _decimal(config["maxLeverage"], "maxLeverage"):
             raise EvidenceViolation("LEVERAGE_INVALID")
-        if _decimal(evidence.balance["availableForTrade"], "availableForTrade") <= 0:
+        close_qty = _decimal(evidence.close_vector["qty"], "close.qty")
+        close_price = _decimal(evidence.close_vector["price"], "close.price")
+        entry_notional = qty * price
+        close_notional = close_qty * close_price
+        required_balance = entry_notional + close_notional + (entry_notional + close_notional) * fee_rate
+        if _decimal(evidence.balance["availableForTrade"], "availableForTrade") < required_balance:
             raise EvidenceViolation("BALANCE_INSUFFICIENT")
         if evidence.open_orders or evidence.positions:
             raise EvidenceViolation("NOT_FLAT")
-        if qty * price > MAX_NOTIONAL_USD:
+        if entry_notional > MAX_NOTIONAL_USD or close_notional > MAX_NOTIONAL_USD:
             raise EvidenceViolation("NOTIONAL_CAP")
 
     @staticmethod
@@ -843,6 +863,8 @@ class ExtendedLifecycle:
                 raise NonceViolation("NONCE_REUSE")
             if existing.external_id == external_id:
                 raise IntentConflict("EXTERNAL_ID_REUSE")
+        if any(existing.kind == "ENTRY" for existing in self.store._all()):
+            raise LifecycleHalted("ENTRY_ALREADY_EXISTS")
         self._validate_entry(evidence, qty=qty, price=price)
         vector = evidence.entry_vector
         if (
@@ -879,9 +901,9 @@ class ExtendedLifecycle:
         intent = self.store.get(intent_id)
         if intent.state != "PREPARED":
             raise LifecycleHalted("INTENT_NOT_PREPARED")
-        if evidence.server_time_ms >= intent.expiry_ms:
-            raise LifecycleHalted("EXPIRED")
         self._validate_common(evidence)
+        if self._past_expiry(evidence, intent.expiry_ms):
+            raise LifecycleHalted("EXPIRED")
         self._assert_binding(intent, evidence)
         if intent.kind == "ENTRY":
             self._validate_entry(evidence, qty=intent.qty, price=intent.price)
@@ -900,6 +922,11 @@ class ExtendedLifecycle:
             raise LifecycleHalted("ENTRY_NOT_CLAIMED")
         self._validate_common(evidence)
         self._assert_binding(entry, evidence)
+        if any(
+            existing.kind in {"CANCEL", "MASS_CANCEL"} and existing.target_id == entry.id
+            for existing in self.store._all()
+        ):
+            raise IntentConflict("CANCELLATION_ALREADY_EXISTS")
         if kind == "CANCEL":
             request = {
                 "method": "DELETE",
@@ -949,7 +976,16 @@ class ExtendedLifecycle:
     def _validate_close_evidence(self, intent: Intent, evidence: OfficialEvidence) -> None:
         self._validate_common(evidence)
         self._assert_binding(intent, evidence)
+        if evidence.open_orders:
+            raise LifecycleHalted("OPEN_ORDER_PRESENT")
         position = self._position(evidence)
+        expected_side = "LONG" if intent.side == "SELL" else "SHORT"
+        if (
+            position["accountId"] != intent.account_id
+            or position["market"] != intent.market
+            or position["side"] != expected_side
+        ):
+            raise LifecycleHalted("POSITION_BINDING_MISMATCH")
         size = _decimal(position["size"], "position.size")
         if size != intent.qty:
             raise LifecycleHalted("POSITION_SIZE_MISMATCH")
@@ -971,7 +1007,10 @@ class ExtendedLifecycle:
             raise LifecycleHalted("ENTRY_NOT_RECONCILED")
         self._validate_common(evidence)
         self._assert_binding(entry, evidence)
+        if evidence.open_orders:
+            raise LifecycleHalted("OPEN_ORDER_PRESENT")
         position = self._position(evidence)
+        self._validate_position_binding(entry, position)
         qty = _decimal(position["size"], "position.size")
         config = evidence.market["tradingConfig"]
         minimum = _decimal(config["minOrderSize"], "minimum")
@@ -1034,6 +1073,51 @@ class ExtendedLifecycle:
     def _matching_fills(order: Mapping[str, Any], evidence: OfficialEvidence) -> tuple[dict[str, Any], ...]:
         return tuple(row for row in evidence.fills if row["orderId"] == order["id"])
 
+    @staticmethod
+    def _validate_order_binding(intent: Intent, order: Mapping[str, Any]) -> None:
+        payload = intent.unsigned_api_payload
+        expected = {
+            "accountId": intent.account_id,
+            "externalId": intent.external_id,
+            "market": intent.market,
+            "type": payload["type"],
+            "side": intent.side,
+            "price": str(intent.price),
+            "qty": str(intent.qty),
+            "reduceOnly": intent.reduce_only,
+            "postOnly": payload["postOnly"],
+            "expiryTime": intent.expiry_ms,
+            "timeInForce": payload["timeInForce"],
+        }
+        if any(order[field] != value for field, value in expected.items()):
+            raise LifecycleHalted("ORDER_BINDING_MISMATCH")
+
+    def _validated_fills(
+        self, intent: Intent, order: Mapping[str, Any], evidence: OfficialEvidence
+    ) -> tuple[dict[str, Any], ...]:
+        self._validate_order_binding(intent, order)
+        fills = self._matching_fills(order, evidence)
+        for fill in fills:
+            if (
+                fill["accountId"] != intent.account_id
+                or fill["market"] != intent.market
+                or fill["side"] != intent.side
+                or fill["orderId"] != order["id"]
+                or _decimal(fill["qty"], "fill.qty") <= 0
+            ):
+                raise LifecycleHalted("FILL_BINDING_MISMATCH")
+        return fills
+
+    @staticmethod
+    def _validate_position_binding(intent: Intent, position: Mapping[str, Any]) -> None:
+        expected_side = "LONG" if intent.side == "BUY" else "SHORT"
+        if (
+            position["accountId"] != intent.account_id
+            or position["market"] != intent.market
+            or position["side"] != expected_side
+        ):
+            raise LifecycleHalted("POSITION_BINDING_MISMATCH")
+
     def _reconcile_entry(self, intent: Intent, evidence: OfficialEvidence) -> ReconciliationResult:
         if evidence.open_orders:
             raise LifecycleHalted("ORDER_OPEN_CONTRADICTION")
@@ -1043,11 +1127,12 @@ class ExtendedLifecycle:
             return ReconciliationResult(state, state == "COMPLETE")
         if status is None or history is None or status != history:
             raise LifecycleHalted("STATUS_HISTORY_CONTRADICTION")
-        fills = self._matching_fills(history, evidence)
+        fills = self._validated_fills(intent, history, evidence)
         filled_qty = sum((_decimal(row["qty"], "fill.qty") for row in fills), Decimal(0))
         if history["status"] not in {"FILLED", "PARTIALLY_FILLED"} or not fills:
             raise LifecycleHalted("ORDER_FILL_CONTRADICTION")
         position = self._position(evidence)
+        self._validate_position_binding(intent, position)
         position_qty = _decimal(position["size"], "position.size")
         if filled_qty != _decimal(history["filledQty"], "order.filledQty") or position_qty != filled_qty:
             raise LifecycleHalted("FILL_POSITION_CONTRADICTION")
@@ -1076,15 +1161,55 @@ class ExtendedLifecycle:
     def _reconcile_cancel(self, intent: Intent, evidence: OfficialEvidence) -> ReconciliationResult:
         target = self.store.get(intent.target_id or "")
         status, history = self._matching_order(target, evidence)
-        if status is None or history is None or status != history or history["status"] != "FILLED":
+        if status is None or history is None or status != history:
             raise LifecycleHalted("CANCEL_UNRESOLVED")
-        fills = self._matching_fills(history, evidence)
+        fills = self._validated_fills(target, history, evidence)
+        if history["status"] == "CANCELLED":
+            if (
+                fills
+                or evidence.positions
+                or evidence.open_orders
+                or _decimal(history["filledQty"], "order.filledQty") != 0
+                or _decimal(history["cancelledQty"], "order.cancelledQty") != target.qty
+            ):
+                raise LifecycleHalted("CANCEL_NO_FILL_CONTRADICTION")
+            if intent.state == "CLAIMED":
+                self.store._set_states(
+                    {intent.id: "RECONCILED_CANCELLED_NO_FILL", target.id: "ENTRY_CANCELLED_NO_FILL"},
+                    "FLAT_PENDING_EXPIRY",
+                )
+                return ReconciliationResult(
+                    "FLAT_PENDING_EXPIRY", False, reconciled_external_ids=frozenset({target.external_id})
+                )
+            all_intents = self.store._all()
+            final_safe = (
+                self._past_expiry(evidence, max(row.expiry_ms for row in all_intents), strict=True)
+                and not evidence.fills
+                and not evidence.positions
+                and not evidence.open_orders
+                and all(row.state not in {"PREPARED", "CLAIMED"} for row in all_intents)
+            )
+            lifecycle_state = "COMPLETE" if final_safe else "FLAT_PENDING_EXPIRY"
+            if final_safe:
+                self.store._set_states({}, lifecycle_state)
+            return ReconciliationResult(
+                lifecycle_state,
+                final_safe,
+                reconciled_external_ids=frozenset({target.external_id}),
+            )
+        if history["status"] != "FILLED":
+            raise LifecycleHalted("CANCEL_UNRESOLVED")
         if not fills:
             raise LifecycleHalted("CANCEL_FILL_MISSING")
         position = self._position(evidence)
+        self._validate_position_binding(target, position)
         filled_qty = sum((_decimal(row["qty"], "fill.qty") for row in fills), Decimal(0))
         position_qty = _decimal(position["size"], "position.size")
-        if filled_qty != position_qty:
+        if (
+            filled_qty != _decimal(history["filledQty"], "order.filledQty")
+            or filled_qty != position_qty
+            or filled_qty != target.qty
+        ):
             raise LifecycleHalted("CANCEL_FILL_POSITION_CONTRADICTION")
         self.store._set_states(
             {intent.id: "RECONCILED_NO_CANCEL_EFFECT", target.id: "ENTRY_RECONCILED"},
@@ -1108,8 +1233,12 @@ class ExtendedLifecycle:
         fill_ids: set[int] = set()
         for external_id in expected_external:
             order = history_by_external[external_id]
-            matches = self._matching_fills(order, evidence)
+            intent = next(row for row in order_intents if row.external_id == external_id)
+            matches = self._validated_fills(intent, order, evidence)
             if order["status"] != "FILLED" or not matches:
+                raise LifecycleHalted("FINAL_FILL_MISMATCH")
+            filled_qty = sum((_decimal(row["qty"], "fill.qty") for row in matches), Decimal(0))
+            if filled_qty != _decimal(order["filledQty"], "order.filledQty") or filled_qty != intent.qty:
                 raise LifecycleHalted("FINAL_FILL_MISMATCH")
             fill_ids.update(row["id"] for row in matches)
         if fill_ids != {row["id"] for row in evidence.fills}:
@@ -1117,6 +1246,8 @@ class ExtendedLifecycle:
         return expected_external, frozenset(fill_ids)
 
     def _reconcile_close(self, intent: Intent, evidence: OfficialEvidence) -> ReconciliationResult:
+        if evidence.open_orders:
+            raise LifecycleHalted("CLOSE_ORDER_OPEN_CONTRADICTION")
         status, history = self._matching_order(intent, evidence)
         if status is None or history is None or status != history:
             raise LifecycleHalted("CLOSE_STATUS_HISTORY_CONTRADICTION")
@@ -1125,15 +1256,30 @@ class ExtendedLifecycle:
             return ReconciliationResult("HALTED_CLOSE_REJECTED", False)
         if history["status"] != "FILLED":
             raise LifecycleHalted("CLOSE_NOT_FILLED")
-        fills = self._matching_fills(history, evidence)
+        fills = self._validated_fills(intent, history, evidence)
         if not fills:
             raise LifecycleHalted("CLOSE_FILL_MISSING")
+        close_qty = sum((_decimal(row["qty"], "fill.qty") for row in fills), Decimal(0))
+        if close_qty != _decimal(history["filledQty"], "order.filledQty") or close_qty != intent.qty:
+            raise LifecycleHalted("CLOSE_FILL_MISMATCH")
+        target = self.store.get(intent.target_id or "")
+        _, entry_history = self._matching_order(target, evidence)
+        if entry_history is None:
+            raise LifecycleHalted("ENTRY_HISTORY_MISSING")
+        entry_fills = self._validated_fills(target, entry_history, evidence)
+        entry_qty = sum((_decimal(row["qty"], "fill.qty") for row in entry_fills), Decimal(0))
+        if (
+            entry_qty != _decimal(entry_history["filledQty"], "entry.filledQty")
+            or entry_qty != target.qty
+            or entry_qty != close_qty
+        ):
+            raise LifecycleHalted("ENTRY_CLOSE_FILL_MISMATCH")
         if evidence.positions or evidence.stream_positions:
             raise LifecycleHalted("CLOSE_POSITION_NOT_FLAT")
-        self.store._set_states({intent.id: "CLOSE_RECONCILED"}, "EXPOSED")
         external_ids, fill_ids = self._final_identities(evidence)
+        self.store._set_states({intent.id: "CLOSE_RECONCILED"}, "EXPOSED")
         all_intents = self.store._all()
-        past_expiry = evidence.server_time_ms > max(row.expiry_ms for row in all_intents)
+        past_expiry = self._past_expiry(evidence, max(row.expiry_ms for row in all_intents), strict=True)
         final_safe = (
             past_expiry
             and evidence.connected
@@ -1157,6 +1303,9 @@ class ExtendedLifecycle:
         intent = self.store.get(intent_id)
         self._validate_common(evidence)
         self._assert_binding(intent, evidence)
+        recheck_states = {"CLOSE_RECONCILED", "RECONCILED_CANCELLED_NO_FILL"}
+        if intent.state != "CLAIMED" and intent.state not in recheck_states:
+            raise LifecycleHalted("INTENT_NOT_CLAIMED")
         if intent.kind == "ENTRY":
             return self._reconcile_entry(intent, evidence)
         if intent.kind in {"CANCEL", "MASS_CANCEL"}:
