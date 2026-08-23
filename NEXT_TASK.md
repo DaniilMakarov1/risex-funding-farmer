@@ -1,58 +1,85 @@
-# TESTNET-002-RISEX-ORDER-RECOVERY-001 — Execution-Faithful Reduce-Only Semantics Gate
+# TESTNET-002-RISEX-ORDER-LIFECYCLE-001 — Fixture-First Bounded Empirical Lifecycle
 
-Status: `BLOCKED — NO SAFE EMPIRICAL METHOD; NO BUILDER; NO CREDENTIAL, SIGNATURE, OR EXECUTING WRITE`.
+Status: `ACTIVE GOVERNANCE SLICE — USER-ACCEPTED BOUNDED TESTNET RISK; NO BUILDER UNTIL SEPARATE CHIEF COORDINATOR GATE; FIXTURE-ONLY; NO CREDENTIAL, SIGNATURE, LIVE NETWORK, OR POST`.
 
-Start from exact published `main == origin/main == 08053f2eaa5aad044eae4575babb9903049bb415` on `codex/testnet-002-risex-order-recovery-001`. Fixed approved wallet `0x20f9153e2eeba0ff7880fb5a23e976e8b2af56ee` has authoritative raw test balance `1000`, and preserved signer `0x6274d6d9f628ba89c36de4b71efa2c602b7f783b` is authoritatively `ACTIVE` from `2026-08-23T16:40:21Z` through `2026-09-22T15:46:50Z`. Older `CREATED` and pending-registration text is superseded. This is the active RISEx lane task.
+Start from exact published `main == origin/main == d5a4b78de599a9e808fd5aba13aa3d60e2925946` on `codex/risex-testnet-002-order-lifecycle-001-governance`. The fixed approved wallet has authoritative raw test balance `1000`, and its preserved session signer is authoritatively `ACTIVE` from `2026-08-23T16:40:21Z` through `2026-09-22T15:46:50Z`. The credential and signer record remain fixed outside Git and are never regenerated, reset, replaced, exposed, deleted, or revoked. This is the sole active RISEx lane slice.
 
-## Authorized question and invariant
+## Authority, ownership, and terminal contract
 
-Determine from current official RISEx evidence whether a state-free empirical method can authoritatively resolve all acceptance-blocking close semantics before any order may create exposure:
+- The user accepts that one later separately gated testnet experiment cannot guarantee atomic recovery. General operational success remains authoritative zero open orders plus exact flatness (`position.size == "0"`).
+- The sole narrow exception is terminal `FAILED_HALTED_MANUAL_RECOVERY`: after all bounded attempts, the later live experiment may leave only its minimum-size RISEx testnet exposure or a known experiment order unresolved. This is failure, never operational acceptance, exact-flat acceptance, lifecycle readiness, or strategy authorization.
+- The current milestone is fixture-only. One dedicated RISEx lifecycle controller owns preflight, state-based dispatch eligibility, reconciliation, recovery, and terminal classification. A dedicated local repository owns durable intent rows only. A direct official REST/EIP-712/ABI adapter owns request encoding and authoritative response normalization. The existing session signer is available only through an injected loader that remains uncalled in Builder tests.
+- The module is isolated from and is never imported by normal Farmer startup, Scanner, shared runtime, paper repository, economics, strategy, Telegram, Nado, or Extended.
 
-1. oversize reduce-only clips or rejects;
-2. below-minimum residual close exemption;
-3. whether every authoritative residual is step-divisible;
-4. accepted `reduce_only` combinations across `MARKET`/`LIMIT` and `IOC`/`FOK`;
-5. `MARKET` `price_ticks` and protection semantics;
-6. partial reduce-only residual behavior.
+Before every hypothetical signature or dispatch, commit one immutable intent containing:
 
-Only RISEx testnet and official sources are in scope. Any eventual experiment must cap every potential exposure/notional below or equal to USD 500, use exact venue evidence, never retry an ambiguous place/cancel/close blindly, and finish with authoritative zero open orders and exact flatness (`position.size == "0"`). Final operational safety is mandatory, not best effort. No mainnet, real funds, Nado, Extended, strategy, Scanner, Farmer/runtime, paper economics, Telegram, or XLSX/main-wallet access is permitted.
+- unique experiment ID, intent kind and ordinal;
+- unique nonzero `uint64 client_order_id` and a never-reused bitmap nonce pair;
+- canonical unsigned action/payload digest and exact market, side, type, TIF, flags, size, price bound, source-position identity, BBO evidence, and permit deadline;
+- durable `PREPARED` and then `DISPATCHING` state before the one transport call.
 
-## Independent official evidence
+A timeout, disconnect, cancellation, crash, or indeterminate response marks that identity `AMBIGUOUS`; the same intent, client ID, nonce, or payload is never replayed. A later intent requires the prior one to be terminal/reconciled or past its permit deadline with authoritative post-expiry state. Exact identities are retained only in the protected local recovery journal for matching; committed fixtures, ordinary logs, reports, exceptions, and review evidence redact wallet, signer, client/order/transaction identities, signatures, and payloads.
 
-- Official `POST /v1/orders/place` exposes `reduce_only`, `MARKET`/`LIMIT`, `GTC`/`GTT`/`FOK`/`IOC`, packed `uint88`, `RISE_PERPS_PLACE_ORDER_V1`, `VerifyWitness`, bitmap nonce, EIP-2098/base64 signature, and `client_order_id`, but does not define the six semantics above.
+## Accepted Phase-0 evidence
+
+- Official `POST /v1/orders/place` exposes `reduce_only`, `MARKET`/`LIMIT`, `GTC`/`GTT`/`FOK`/`IOC`, packed `uint88`, `RISE_PERPS_PLACE_ORDER_V1`, `VerifyWitness`, bitmap nonce, EIP-2098/base64 signature, and `client_order_id`, but does not fully define oversize handling, below-minimum close exemption, residual grid invariants, reduce-only TIF combinations, market protection, or partial-close residual behavior.
 - Official `POST /v1/orders/cancel` and the open/by-id/history/trade/position reads establish identity and reconciliation after dispatch; they do not guarantee that an exposed account can always close.
 - Official order state says `OPEN` is active and fillable. `post_only` ensures maker-only placement, not zero fill before cancellation.
 - The current official documentation index contains one order-shaped simulation: unsigned `POST /v1/portfolio/detail-preview`, documented as applying a hypothetical order without executing it for portfolio risk assessment. It exposes no contract claiming parity with Router validation or matching-engine execution.
 - Two bounded unsigned calls to that preview performed no execution. A normal minimum BTC hypothetical order produced preview position size `0.0001`; on the same authoritatively flat account, `reduce_only=true`, `LIMIT`, `FOK`, opposite side produced preview position size `-0.0001`. Thus preview accepts the flags but applies hypothetical signed size without enforcing live reduce-only semantics. It cannot prove any nonzero-position close behavior.
 - Immediate authoritative post-preview reads returned zero open BTC orders and zero BTC trades. The contemporaneous position command incorrectly parsed `.data.size` and returned `size:null` / `market_id:null`, so that command did not prove flatness. A later correctly parsed official read proved `.data.position.size == "0"`. During the bounded Chief fix checkpoint, a fresh correct-path read again returned `.data.position.size == "0"` (with the venue's flat placeholder `market_id == "0"`), and the official open-position list for the same public account/requested market was empty. This later evidence, not the misparsed immediate command, proves the exact-flat postcondition after the documented non-executing preview calls.
 - The official documentation index and error catalog expose no other execution-faithful simulation, callStatic, dry-run, or order-test endpoint and no normative error contract for the six unknowns.
+- Current official API Integration defines market `price_ticks` as the bound the order will not cross and requires `FOK` or `IOC` for market orders. Official order-type material defines `FOK` as all-or-none and `IOC` as immediate fill with remainder cancelled. The current official testnet UI constructs exact-authoritative-size reduce-only close orders, using an empirical `MARKET+FOK` path or a 30 bps price-bounded `LIMIT+IOC` path. These are sufficient primitives for a bounded empirical test under the user's risk decision, but they do not prove undocumented semantics or guarantee fill/flatness.
 
 Official sources: [documentation index](https://developer.rise.trade/llms.txt), [place order](https://developer.rise.trade/reference/orderservice_placeorder), [cancel order](https://developer.rise.trade/reference/orderservice_cancelorder), [portfolio detail preview](https://developer.rise.trade/reference/accountservice_getportfoliodetailswithorder), [orders channel](https://developer.rise.trade/reference/orders-channel), [open orders](https://developer.rise.trade/reference/orderservice_getopenorders), [trade history](https://developer.rise.trade/reference/getaccounttradehistory), [single-position read](https://developer.rise.trade/reference/accountservice_getposition), [open-position list](https://developer.rise.trade/reference/getallpositions), and [position contract](https://developer.rise.trade/reference/positions-channel).
 
 Governance-only audit commit `73068dc202c6c47607dc9c9b349001d4fb0edbf2` and branch `codex/testnet-002-risex-order-001` remain preserved unchanged, unmerged, and unpushed. They were independently reviewed and were not cherry-picked, merged, amended, rebased, or deleted.
 
-## Safety verdict
+## One fixture-first Builder milestone after the separate gate
 
-No currently documented safe empirical method exists. A flat-account reduce-only live probe can establish only behavior at position zero; it cannot distinguish oversize clipping from rejection against a nonzero position or establish residual exemption, grid, or partial-fill behavior. Creating a nonzero position to test those facts is circular because the unproven close contract is the only proposed recovery. The portfolio preview cannot validate the recovery order, and market liquidity, a price buffer, `post_only`, elapsed time, or an assumed `FOK` combination cannot guarantee exact flatness under the current official contract.
+- Add one isolated Python module and one focused fixture suite. The module may expose injected official query/execute, signer, clock, and durable-store boundaries, but no production credential invocation, live transport, CLI command, URL override, or live-smoke path.
+- Preflight fails before signer loading or hypothetical dispatch unless runtime-fetched official testnet host, chain, domain and Router identities match; the preserved signer status is `ACTIVE`; BTC/USDC is active/unlocked; tick, step and minimum are exact; two authoritative reads agree on zero open orders and `position.size == "0"`; no lifecycle intent or unexplained account state exists; and a fresh two-sided BBO has minimum-size depth inside a fixed test-only 30 bps adverse bound.
+- Opening size is exactly the current official BTC minimum, never a configurable size up to the cap. Its adverse-bound notional must be `<= USD 500`; any grid, depth, freshness, identity, or cap failure permits zero signatures and zero writes.
+- Permit at most one opening intent: fixed BUY, exact minimum size, price-bounded `MARKET+FOK`, `reduce_only=false`, `post_only=false`. `MARKET+FOK` is an empirical official API/current-UI-compatible contract, not guaranteed semantics.
+- Reconcile a normal or ambiguous opening solely by the persisted client/order identity, place response, order by ID, open orders, history, trades/fills, authoritative position, permit expiry, and fresh official state. Never replay. Terminal no-fill plus zero orders/exact flat is `COMPLETED_NO_FILL_FLAT`, not close-lifecycle acceptance.
+- After a fill, derive each close only from fresh authoritative signed `position.size`: opposite side, exact absolute size, no enlargement or rounding, `reduce_only=true`, and a new durable identity. Close intent 1 is price-bounded `MARKET+FOK`. If terminally rejected/no-fill and the fresh position remains nonzero, close intent 2 may use the official-UI-equivalent 30 bps price-bounded `LIMIT+IOC`. A partial result may permit close intent 3 only from the new exact authoritative residual and fresh BBO. At most three automatic close intents exist.
+- A later close requires the prior intent to be terminal/reconciled, a fresh position/open-order snapshot, fresh BBO/depth, and bound notional `<= USD 500`. Do not retry an unchanged deterministic rejection. A positive residual not exactly representable in current steps, unexplained position growth/sign change, stale evidence, or identity disagreement stops writes.
+- FOK/IOC are selected to avoid resting orders. Only an exact known order linked to this experiment may be cancelled, at most once per exact order ID. An ambiguous cancel is reconciled and never replayed; unrelated orders are never cancelled and force a halt. Maximum place dispatches are four: one opening plus three closes. Maximum cancels are four: at most one for each possible known experiment order.
+- `SUCCESS_CLOSED_FLAT` requires an observed opening fill/positive position, all experiment intents terminal/reconciled, zero open orders, and exact `position.size == "0"` on consistent final reads. Any remaining position/order, exhausted close/cancel budget, non-step residual, lost connectivity, or unresolved identity persists `FAILED_HALTED_MANUAL_RECOVERY`, stops every automated write, and produces redacted evidence plus operator-only official RISEx testnet UI full-close/read-only-verification instructions. The agent never accesses the main-wallet XLSX for manual recovery.
 
-Therefore this blocked task has no ownership handoff, durable trading intent, order nonce, or operational dispatch allowance. Maximum executing dispatch counts are place `0`, cancel `0`, and close `0`; maximum credential loads and signatures are `0`. No Builder, RED, fixture implementation, or live experiment is authorized.
+## Exact RED, fixture, and adversarial gates
 
-## Exact external evidence required to unblock
+On exact base `d5a4b78de599a9e808fd5aba13aa3d60e2925946`, `tests/test_testnet_risex_order_lifecycle.py` must first fail because the bounded module/behavior is absent. Its exact required regressions are:
 
-RISEx must provide at least one of:
+1. `test_preflight_blocks_before_signer_or_post`
+2. `test_intent_nonce_and_digest_are_durable_before_dispatch`
+3. `test_ambiguous_open_is_never_replayed`
+4. `test_open_is_exact_minimum_price_bounded_market_fok`
+5. `test_fok_no_fill_finishes_flat_without_close_acceptance`
+6. `test_first_close_uses_exact_authoritative_size_market_fok`
+7. `test_close_fallbacks_use_fresh_state_limit_ioc_and_stop_at_three`
+8. `test_partial_ioc_uses_exact_residual_without_rounding`
+9. `test_non_step_residual_halts_without_another_dispatch`
+10. `test_permit_expiry_prevents_delayed_ambiguous_replay`
+11. `test_known_open_order_is_cancelled_once_by_exact_id`
+12. `test_ambiguous_cancel_is_never_replayed`
+13. `test_unrelated_order_or_position_drift_halts_without_mutation`
+14. `test_disconnect_persists_failed_manual_recovery_and_stops_writes`
+15. `test_success_requires_observed_fill_zero_orders_and_exact_flat`
+16. `test_minimum_size_and_usd_cap_are_invariants`
+17. `test_secrets_signatures_payloads_and_identities_are_redacted`
 
-1. a documented execution-faithful, state-free test/callStatic/dry-run endpoint that uses the same Router and matching validation as live placement, can evaluate a supplied nonzero hypothetical position, defines non-mutation, and returns authoritative outcomes for all six semantics; or
-2. normative official contract documentation for all six semantics plus an exact, guaranteed close-to-flat primitive, including accepted order-type/time-in-force combinations, price protection, all-or-none/partial behavior, below-minimum and step-grid residual handling, and authoritative reconciliation identity.
+Fixtures must cover inactive signer, stale/malformed/off-grid market evidence, insufficient depth, cap failure, timeout before response, delayed order appearance, FOK reject/no-fill, IOC partial fill, below-minimum step-divisible residual, non-step-divisible residual, close rejection, unexpected order, cancel ambiguity, permit expiry, and connectivity loss while exposed. Adversarial contradictions across place/order/open/history/trade/position evidence may never grant another write or any success state.
 
-After that evidence exists, Architect must replace this blocker with one new strictly bounded governance slice defining exact ownership, one-shot durable intent, preconditions, dispatch maxima, no-retry reconciliation, fixture/adversarial/secret-isolation RED gates, USD 500 cap, and mandatory zero-orders/exact-flat live acceptance. Do not infer those semantics or activate implementation from a successful HTTP response.
+Secret isolation proves the real loader is never called; synthetic fixtures and disposable storage only; no credential, raw signature, payload, public account/signer/order identity, private endpoint, network, or POST appears in test output or Git. The Builder runs focused tests, the full clean Python 3.11 suite, compileall, `pip check`, import identity, diff/secret checks, and creates one implementation commit without governance, shared-core, or cross-venue edits.
 
 ## Current acceptance and stop gates
 
-- Exact old main independently passes 87 focused and 498 full Python 3.11 asyncio-debug tests, compileall, `pip check`, import-identity, clean-status, and diff checks in an isolated environment.
-- The central parallel-lane governance prerequisite is fulfilled at exact published `main == origin/main == de31ed4cbfe850705e59603cbd5346df4cf6d236`, and the Extended governance slice is published at `1426cdcf980e8920aba4a3a1f6767412c354f620`. This candidate records exactly three active bounded lane slices: the RISEx blocker above, the Extended fixture-only slice below, and the Nado fixture-only slice below. Each venue's Builder requires its separate Chief Coordinator gate.
-- Governance changes only governing sources and records the accepted `ACTIVE` signer fact, this one blocker, and the standing per-lane Architect/Builder authorization and limits.
-- Protected credential/record and `/Users/daniilmakarov/.risex-testnet-secrets/testnet-wallets-2026-08-23.xlsx` were not accessed during this recovery/governance slice; the accepted historical registration accessed the XLSX exactly once inside its approved lazy callback. Deterministic or governance work never reads credential bytes or wallet cells.
-- Stop for Chief Coordinator governance review before merge, push, Builder creation, credential access, signing, nonce consumption, durable trading claim, order placement/cancel, or any executing/private write.
+- Exact published base `main == origin/main == d5a4b78de599a9e808fd5aba13aa3d60e2925946` passed the Chief's clean Python 3.11 full suite with 498 tests.
+- This candidate records exactly three active bounded lane slices: the RISEx fixture-only lifecycle above and the existing Extended and Nado fixture-only slices below. Each venue's Builder requires its own separate Chief Coordinator gate.
+- This governance candidate authorizes no Builder. After central acceptance/publication, Chief Coordinator must separately authorize the sole RISEx Builder. After fixture implementation acceptance, another separate Chief Coordinator gate is mandatory before any credential access, real signer load, signature, private/live request, nonce consumption, or order/cancel/close POST.
+- Governance and deterministic work never read credential bytes or wallet cells. The protected signer record and main-wallet XLSX were not accessed during this governance slice.
+- Stop for Chief Coordinator governance review before merge, push, Builder creation, credential access, signing, nonce consumption, durable trading claim, order placement/cancel/close, or any executing/private write.
 
 # EXTENDED-TESTNET-001 — Fail-Closed Bounded Lifecycle Core
 

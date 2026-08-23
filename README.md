@@ -2,7 +2,7 @@
 
 A small, standalone paper trader for testing whether a delta-neutral RISEx-points funding strategy can produce non-negative trading PnL after configured fees and the documented paper execution model.
 
-The default product is **paper only**. It uses official public RISEx, Extended, and Nado market data. Separately governed optional testnet modules cover the accepted RISEx account bootstrap and accepted session-signer prerequisite; the preserved signer is operationally active. The active Extended and Nado slices are fixture-only designs of isolated fail-closed bounded lifecycle cores and have no credential, private-network, or live-write surface. The current RISEx order-semantics recovery gate is blocked, so mainnet, real funds, operational orders/positions, and strategy-driven execution remain outside the active specification.
+The default product is **paper only**. It uses official public RISEx, Extended, and Nado market data. Separately governed optional testnet modules cover the accepted RISEx account bootstrap and accepted session-signer prerequisite; the preserved signer is operationally active. The active RISEx, Extended, and Nado slices are fixture-only designs of isolated bounded lifecycle cores and have no credential, private-network, or live-write surface. Mainnet, real funds, operational orders/positions, and strategy-driven execution remain outside the active specification.
 
 ## Requirements
 
@@ -111,7 +111,9 @@ risex-farmer --db paper.db report
 
 See `SYSTEM_SPEC.md` for frozen product behavior, `STATUS.md` for the accepted baseline, and `NEXT_TASK.md` for the current authorization boundary.
 
-The optional TESTNET-002 signer prerequisite is not a CLI mode and is not imported by normal Farmer startup. Its accepted credential remains protected outside the repository and must not be regenerated, replaced, exposed, or revoked. The current order-recovery blocker authorizes no credential/XLSX access, signing, placement, cancellation, or position change.
+The optional TESTNET-002 signer prerequisite is not a CLI mode and is not imported by normal Farmer startup. Its accepted credential remains protected outside the repository and must not be regenerated, replaced, exposed, or revoked.
+
+`TESTNET-002-RISEX-ORDER-LIFECYCLE-001` is also not a CLI mode and must not be imported by normal Farmer startup. After central publication and a separate Chief Coordinator Builder gate, it permits only fixture-first implementation of one exact-minimum BTC testnet lifecycle with durable intent identity, no-blind-retry reconciliation, one opening, at most three state-based close intents, and exact-ID cancellation. Fixtures use synthetic values and an uncalled injected signer loader; this milestone authorizes no credential/XLSX access, real signature, private/live network, nonce consumption, or POST. Operational success remains zero open orders plus exact flatness. The narrow user-accepted later live-test risk may end `FAILED_HALTED_MANUAL_RECOVERY`; that failure is never operational acceptance or strategy readiness.
 
 `EXTENDED-TESTNET-001` is likewise not a CLI mode and must not be imported by normal Farmer startup. After a separate Chief Coordinator Builder gate, it is limited to fixture-first tests and an isolated module pinned to official Extended SDK commit `2130cdb1cd6e7b1867db83bd3af036572d258739`, with durable intent identity and fail-closed reconciliation to fresh zero-open-orders/exact-flat evidence. This milestone does not authorize credential access, private preflight, signing, deposits, authenticated traffic, live POSTs, operational orders/cancels/closes, or any shared paper-runtime change.
 
