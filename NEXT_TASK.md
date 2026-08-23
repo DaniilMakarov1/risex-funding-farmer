@@ -1,6 +1,8 @@
 # PAPER-007-STABILIZATION-007 — Cadence-safe Extended Watchdog Rotation
 
-Status: `GREEN AUTHORIZED — DETERMINISTIC REVIEW REQUIRED`.
+Status: `ACCEPTED — NO ACTIVE IMPLEMENTATION TASK`.
+
+The accepted exact chain is governance/RED `1ef052e4d5f261d1df7978e5b7be8a635f1473e9`, RED `52ef4e0c084e5cb6548a88233b8aa8511895813d`, RED fix `85bc126258efde9898c2718bb9669d94ff85adc9`, GREEN authorization `6fed84a804dabb6aedd960a7ae755208ff9d4ea0`, and implementation `daee86da4e17fa39b5ca11cb2914ed21e42b88cc`. Chief independently passed the two new production-path regressions and the full 324-test suite. Integration and one bounded public-paper validation with Telegram disabled are authorized; no further implementation, Stage B/Telegram restart, testnet, private/auth, or live work is authorized.
 
 This is one fresh corrective slice explicitly authorized by the user after STABILIZATION-005 and STABILIZATION-006 were blocked. It starts strictly from published `main == origin/main == 037c4df35de6cc8dfddce48a50b6c8af488b0908`. Failed 005/006 branches, commits, tests, samples, diffs, and quarantine objects are immutable audit history and must not be inspected, imported, copied, cherry-picked, or reused.
 
@@ -27,7 +29,7 @@ This is one fresh corrective slice explicitly authorized by the user after STABI
 - The same sole Builder may make the smallest `runtime.py`-only production correction; tests remain limited to `test_runtime.py`. Fence/remove old active ownership synchronously, install exactly one successor without waiting for retirement, and use only a minimal runtime-owned retirement collection/callback if necessary.
 - Normal completion removes retirement ownership and consumes cancellation. Unexpected exception is retrieved and routed once through existing `_background_fatal`, stop request, and one `RUNTIME_FATAL` row with its exception class. Preserve session fencing and logical/physical evidence separation.
 - Do not add config, capacity/task state machines, shutdown/session-close behavior, services, adapters, Scanner, storage/schema, cadence/economics, Telegram, auth, testnet, or live changes.
-- Run focused GREEN, all runtime and preservation tests, full pytest, compileall, diff/secret and pending-task checks. Architect reviews every production hunk. Stop for Chief candidate review before integration or operational work.
+- The focused GREEN, runtime/preservation suites, full 324-test suite, compileall, diff/secret, and pending-task checks passed Architect and Chief review. Integrate without rewriting history, publish `main`, then perform only the authorized bounded public-paper validation and report its evidence.
 - Maximum two later fix cycles. Do not merge, push, soak, restart Stage B/Telegram, or update acceptance governance before Chief decisions.
 
 ## Separate future real-money gate
