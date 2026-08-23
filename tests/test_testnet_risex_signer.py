@@ -83,6 +83,24 @@ def _config(*, chain: str = str(CHAIN_ID), auth: str = AUTH) -> dict[str, Any]:
     )
 
 
+def _observed_additive_config() -> dict[str, Any]:
+    return _envelope({
+        "addresses": {"auth": AUTH, "unrelated": {"future": True}},
+        "chain": {
+            "block_time": None,
+            "chain_id": str(CHAIN_ID),
+            "name": "Rise Testnet",
+            "rpc_endpoints": ["synthetic-unrelated"],
+            "selected_rpc": {"synthetic": True},
+        },
+        "is_maintenance_mode": False,
+        "maintenance_end_time": None,
+        "maintenance_message": {"synthetic": True},
+        "maintenance_phase": ["synthetic-unrelated"],
+        "maintenance_time": 0,
+    })
+
+
 def _domain(*, chain: str = str(CHAIN_ID), auth: str = AUTH,
             name: str = "RISEx", version: str = "1") -> dict[str, Any]:
     return _envelope(
@@ -287,6 +305,39 @@ def _use_fixture_wallet(monkeypatch: pytest.MonkeyPatch, module) -> None:
     monkeypatch.setattr(module, "_EXPECTED_WALLET", MAIN_ADDRESS.lower())
 
 
+async def _assert_rejected_before_sensitive_work(
+    module, monkeypatch: pytest.MonkeyPatch, home: Path, scenario: Scenario,
+) -> None:
+    sign_calls = claim_calls = loader_calls = 0
+    record_before = (home / RECORD).read_text()
+
+    def loader() -> bytes:
+        nonlocal loader_calls
+        loader_calls += 1
+        return MAIN_KEY
+
+    def sign(*_args: Any, **_kwargs: Any) -> str:
+        nonlocal sign_calls
+        sign_calls += 1
+        raise AssertionError("signing must remain unreachable")
+
+    def claim() -> bool:
+        nonlocal claim_calls
+        claim_calls += 1
+        raise AssertionError("durable claim must remain unreachable")
+
+    monkeypatch.setattr(module, "_sign_typed_data", sign)
+    monkeypatch.setattr(module, "_claim_registration", claim)
+    with pytest.raises(module.SignerSafetyError):
+        await module.register_risex_session_signer(
+            MAIN_ADDRESS, intent=REGISTER_INTENT, main_secret_loader=loader
+        )
+    assert (loader_calls, sign_calls, claim_calls) == (0, 0, 0)
+    assert json.loads((home / RECORD).read_text())["state"] == "CREATED"
+    assert (home / RECORD).read_text() == record_before
+    assert not _posts(scenario)
+
+
 def test_public_api_is_sealed_optional_and_has_no_trading_surface(module) -> None:
     assert module._ORIGIN == URL(ORIGIN)
     assert module._CHAIN_ID == CHAIN_ID
@@ -443,6 +494,158 @@ def test_async_and_process_generation_races_create_one_pair(
     ) for _ in range(6)]
     claims = [process.communicate(timeout=10)[0].strip() for process in claimers]
     assert claims.count("dispatch-token") == 1 and claims.count("blocked") == 5
+
+
+@pytest.mark.asyncio
+async def test_observed_additive_system_config_preserves_required_identity(
+    module, transport,
+) -> None:
+    scenario = transport(Scenario())
+    scenario.config = _observed_additive_config()
+    async with module._session() as session:
+        await module._identity(session)
+
+
+@pytest.mark.asyncio
+async def test_observed_operational_shapes_reach_only_main_secret_boundary(
+    module, monkeypatch: pytest.MonkeyPatch, disposable_home: Path, transport,
+) -> None:
+    _use_fixture_wallet(monkeypatch, module)
+    _seed_generated(module, disposable_home)
+    scenario = transport(Scenario())
+    scenario.config = _observed_additive_config()
+    scenario.nonce = _envelope({
+        "nonce_anchor": "0", "current_bitmap_index": 0, "bitmap": "0x0",
+    })
+    loaded = signed = claimed = 0
+    record_before = (disposable_home / RECORD).read_text()
+
+    def loader() -> bytes:
+        nonlocal loaded
+        loaded += 1
+        raise RuntimeError("synthetic loader stop")
+
+    def sign(*_args: Any, **_kwargs: Any) -> str:
+        nonlocal signed
+        signed += 1
+        raise AssertionError("signing must remain unreachable")
+
+    def claim() -> bool:
+        nonlocal claimed
+        claimed += 1
+        raise AssertionError("claim must remain unreachable")
+
+    monkeypatch.setattr(module, "_sign_typed_data", sign)
+    monkeypatch.setattr(module, "_claim_registration", claim)
+    with pytest.raises(module.SignerSafetyError):
+        await module.register_risex_session_signer(
+            MAIN_ADDRESS, intent=REGISTER_INTENT, main_secret_loader=loader
+        )
+    assert (loaded, signed, claimed) == (1, 0, 0)
+    assert (disposable_home / RECORD).read_text() == record_before
+    assert not _posts(scenario)
+
+
+@pytest.mark.parametrize("mutation", [
+    "data-missing", "data-wrong", "data-type", "chain-missing", "chain-wrong",
+    "chain-type",
+    "name-missing", "name-wrong", "name-type", "chain-id-missing",
+    "chain-id-wrong", "chain-id-type", "addresses-missing",
+    "addresses-wrong", "addresses-type", "auth-missing", "auth-wrong",
+    "auth-type",
+])
+@pytest.mark.asyncio
+async def test_required_config_identity_rejects_before_sensitive_work(
+    module, monkeypatch: pytest.MonkeyPatch, disposable_home: Path, transport,
+    mutation: str,
+) -> None:
+    _use_fixture_wallet(monkeypatch, module)
+    _seed_generated(module, disposable_home)
+    scenario = transport(Scenario())
+    config = _observed_additive_config()
+    data = config["data"]
+    if mutation == "data-missing":
+        del config["data"]
+    elif mutation == "data-wrong":
+        config["data"] = {"unrelated": True}
+    elif mutation == "data-type":
+        config["data"] = []
+    elif mutation == "chain-missing":
+        del data["chain"]
+    elif mutation == "chain-wrong":
+        data["chain"] = {"name": "Wrong", "chain_id": "1"}
+    elif mutation == "chain-type":
+        data["chain"] = []
+    elif mutation == "name-missing":
+        del data["chain"]["name"]
+    elif mutation == "name-wrong":
+        data["chain"]["name"] = "Wrong"
+    elif mutation == "name-type":
+        data["chain"]["name"] = ["Rise Testnet"]
+    elif mutation == "chain-id-missing":
+        del data["chain"]["chain_id"]
+    elif mutation == "chain-id-wrong":
+        data["chain"]["chain_id"] = "1"
+    elif mutation == "chain-id-type":
+        data["chain"]["chain_id"] = CHAIN_ID
+    elif mutation == "addresses-missing":
+        del data["addresses"]
+    elif mutation == "addresses-wrong":
+        data["addresses"] = {"auth": WRONG_AUTH}
+    elif mutation == "addresses-type":
+        data["addresses"] = []
+    elif mutation == "auth-missing":
+        del data["addresses"]["auth"]
+    elif mutation == "auth-wrong":
+        data["addresses"]["auth"] = WRONG_AUTH
+    else:
+        data["addresses"]["auth"] = {"address": AUTH}
+    scenario.config = config
+    await _assert_rejected_before_sensitive_work(
+        module, monkeypatch, disposable_home, scenario
+    )
+
+
+@pytest.mark.parametrize("bitmap,expected", [
+    ("0x0", 0),
+    ("0x7", 7),
+    ("0x" + "f" * 64, 2**256 - 1),
+])
+@pytest.mark.asyncio
+async def test_official_hex_bitmap_parses_exact_uint256(
+    module, transport, bitmap: str, expected: int,
+) -> None:
+    scenario = transport(Scenario())
+    scenario.nonce = _envelope({
+        "nonce_anchor": "40", "current_bitmap_index": 208, "bitmap": bitmap,
+    })
+    async with module._session() as session:
+        parsed = await module._nonce(session, MAIN_ADDRESS.lower())
+    assert parsed.observed_anchor == 40
+    assert parsed.observed_index == 208
+    assert parsed.observed_bitmap == expected
+    assert parsed.signed_anchor == 41 and parsed.signed_bitmap == 0
+
+
+@pytest.mark.parametrize("bitmap", [
+    "0x", "-0x1", "+0x1", " 0x1", "0x1 ", "0x1 0", "0xg", "0X0",
+    "0", 0, True, {"hex": "0x0"}, "0x1" + "0" * 64,
+])
+@pytest.mark.asyncio
+async def test_invalid_hex_bitmap_rejects_before_sensitive_work(
+    module, monkeypatch: pytest.MonkeyPatch, disposable_home: Path, transport,
+    bitmap: Any,
+) -> None:
+    _use_fixture_wallet(monkeypatch, module)
+    _seed_generated(module, disposable_home)
+    scenario = transport(Scenario())
+    scenario.config = _observed_additive_config()
+    scenario.nonce = _envelope({
+        "nonce_anchor": "0", "current_bitmap_index": 0, "bitmap": bitmap,
+    })
+    await _assert_rejected_before_sensitive_work(
+        module, monkeypatch, disposable_home, scenario
+    )
 
 
 @pytest.mark.parametrize("mutation", [
