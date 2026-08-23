@@ -72,8 +72,28 @@ class FixedEnvironment:
         }
 
     @classmethod
-    def assert_exact(cls, *, chain_id: int, endpoint: str) -> None:
-        if chain_id != cls.chain_id or endpoint != cls.endpoint:
+    def assert_exact(
+        cls,
+        *,
+        chain_id: int,
+        domain_name: str,
+        domain_version: str,
+        endpoint: str,
+        gateway: str,
+        gateway_ws: str,
+        archive: str,
+        trigger: str,
+    ) -> None:
+        if {
+            "chain_id": chain_id,
+            "domain_name": domain_name,
+            "domain_version": domain_version,
+            "endpoint": endpoint,
+            "gateway": gateway,
+            "gateway_ws": gateway_ws,
+            "archive": archive,
+            "trigger": trigger,
+        } != cls.as_dict():
             raise NadoContractError("Nado testnet environment identity mismatch")
 
 
@@ -354,7 +374,13 @@ class CatalogSnapshot:
 @dataclass(frozen=True)
 class AccountSnapshot:
     chain_id: int
+    domain_name: str
+    domain_version: str
     endpoint: str
+    gateway: str
+    gateway_ws: str
+    archive: str
+    trigger: str
     owner: str
     subaccount_name: str
     observed_at_ms: int
@@ -387,7 +413,16 @@ def _assert_authoritative_account(
     require_flat: bool,
 ) -> dict[int, Product]:
     products = catalog.by_id()
-    FixedEnvironment.assert_exact(chain_id=account.chain_id, endpoint=account.endpoint)
+    FixedEnvironment.assert_exact(
+        chain_id=account.chain_id,
+        domain_name=account.domain_name,
+        domain_version=account.domain_version,
+        endpoint=account.endpoint,
+        gateway=account.gateway,
+        gateway_ws=account.gateway_ws,
+        archive=account.archive,
+        trigger=account.trigger,
+    )
     _address_bytes(account.owner)
     encode_subaccount(account.owner, account.subaccount_name)
     if not account.fresh or account.authoritative_source != "engine":
@@ -531,6 +566,7 @@ class FillEvidence:
     digest: str
     product_id: int
     amount_x18: int
+    submission_idx: int
 
 
 @dataclass(frozen=True)
@@ -634,6 +670,31 @@ class IntentStore:
             )
             """
         )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS nado_lifecycle_state (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                status TEXT NOT NULL
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            INSERT OR IGNORE INTO nado_lifecycle_state (singleton, status)
+            VALUES (1, 'RUNNING')
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS nado_fill_evidence (
+                order_digest TEXT NOT NULL,
+                submission_idx TEXT NOT NULL,
+                product_id INTEGER NOT NULL,
+                amount_x18 TEXT NOT NULL,
+                PRIMARY KEY (order_digest, submission_idx)
+            )
+            """
+        )
         self._connection.commit()
 
     def prepare(self, intent: OrderIntent) -> None:
@@ -696,6 +757,37 @@ class IntentStore:
             raise NadoContractError("intent subaccount differs from canonical sender")
         try:
             with self._connection:
+                states = self.intent_states()
+                halted_cancel_recovery = (
+                    intent.kind == CANCEL_ALL
+                    and self.lifecycle_status() == HALTED
+                    and not any(existing.kind == CANCEL_ALL for existing, _ in states)
+                    and sum(existing.kind == ENTRY for existing, _ in states) == 1
+                    and any(
+                        existing.kind == ENTRY
+                        and state in {"RESTING", "PARTIAL", "AMBIGUOUS"}
+                        for existing, state in states
+                    )
+                )
+                if self.lifecycle_status() != RUNNING and not halted_cancel_recovery:
+                    raise NadoContractError("lifecycle is at a durable manual gate")
+                if intent.kind == ENTRY and self.count_kind(ENTRY):
+                    raise NadoContractError("one lifecycle permits exactly one entry")
+                if intent.kind == CANCEL_ALL and (
+                    sum(existing.kind == ENTRY for existing, _ in states) != 1
+                    or any(existing.kind == CANCEL_ALL for existing, _ in states)
+                    or not any(
+                        existing.kind == ENTRY
+                        and state in {"RESTING", "PARTIAL", "AMBIGUOUS"}
+                        for existing, state in states
+                    )
+                ):
+                    raise NadoContractError("cancel-all intent ordering is invalid")
+                if intent.kind == CLOSE and (
+                    sum(existing.kind == ENTRY for existing, _ in states) != 1
+                    or any(state != "RECONCILED" for _, state in states)
+                ):
+                    raise NadoContractError("close intent ordering is invalid")
                 self._connection.execute(
                     """
                     INSERT OR IGNORE INTO nado_lifecycle_identity (
@@ -798,12 +890,43 @@ class IntentStore:
 
     def mark_ambiguous(self, digest: str) -> None:
         self._mark(digest, "AMBIGUOUS")
+        self.halt()
 
     def mark_reconciled(self, digest: str) -> None:
         self._mark(digest, "RECONCILED")
 
     def mark_rejected(self, digest: str) -> None:
         self._mark(digest, "REJECTED")
+        if self.get(digest).kind == ENTRY:
+            self.halt()
+
+    def lifecycle_status(self) -> str:
+        row = self._connection.execute(
+            "SELECT status FROM nado_lifecycle_state WHERE singleton = 1"
+        ).fetchone()
+        if row is None:
+            raise NadoContractError("durable lifecycle status is missing")
+        return str(row[0])
+
+    def halt(self) -> None:
+        with self._connection:
+            self._connection.execute(
+                """
+                UPDATE nado_lifecycle_state SET status = 'HALTED'
+                WHERE singleton = 1 AND status != 'COMPLETE'
+                """
+            )
+
+    def mark_complete(self) -> None:
+        with self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE nado_lifecycle_state SET status = 'COMPLETE'
+                WHERE singleton = 1 AND status = 'RUNNING'
+                """
+            )
+        if cursor.rowcount != 1:
+            raise NadoContractError("halted lifecycle cannot become complete")
 
     def replace_payload(self, digest: str, payload: bytes) -> None:
         del digest, payload
@@ -828,6 +951,9 @@ class IntentStore:
             "SELECT digest, state FROM nado_intents ORDER BY rowid"
         ).fetchall()
         return tuple((self.get(row[0]), str(row[1])) for row in rows)
+
+    def intent_states(self) -> tuple[tuple[OrderIntent, str], ...]:
+        return self.intents()
 
     def count_kind(self, kind: str) -> int:
         return int(
@@ -855,6 +981,62 @@ class IntentStore:
     def latest_recv_time(self) -> int | None:
         return self._connection.execute("SELECT MAX(recv_time) FROM nado_intents").fetchone()[0]
 
+    @staticmethod
+    def _canonical_fill_map(
+        fills: tuple[FillEvidence, ...],
+    ) -> dict[tuple[str, int], FillEvidence]:
+        result: dict[tuple[str, int], FillEvidence] = {}
+        for fill in fills:
+            _hex_bytes(fill.digest, 32)
+            if type(fill.submission_idx) is not int or not 0 <= fill.submission_idx < 2**64:
+                raise NadoContractError("fill submission_idx is outside uint64")
+            if fill.amount_x18 == 0:
+                raise NadoContractError("fill amount must be nonzero")
+            identity = (fill.digest.lower(), fill.submission_idx)
+            if identity in result:
+                raise NadoContractError("duplicate fill identity in authoritative evidence")
+            result[identity] = fill
+        return result
+
+    def _record_fill_evidence(self, fills: tuple[FillEvidence, ...]) -> None:
+        canonical = self._canonical_fill_map(fills)
+        with self._connection:
+            for (digest, submission_idx), fill in canonical.items():
+                existing = self._connection.execute(
+                    """
+                    SELECT product_id, amount_x18 FROM nado_fill_evidence
+                    WHERE order_digest = ? AND submission_idx = ?
+                    """,
+                    (digest, str(submission_idx)),
+                ).fetchone()
+                expected = (fill.product_id, str(fill.amount_x18))
+                if existing is not None and existing != expected:
+                    raise NadoContractError("persisted fill identity is contradictory")
+                self._connection.execute(
+                    """
+                    INSERT OR IGNORE INTO nado_fill_evidence (
+                        order_digest, submission_idx, product_id, amount_x18
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (digest, str(submission_idx), fill.product_id, str(fill.amount_x18)),
+                )
+
+    def persisted_fill_map(self) -> dict[tuple[str, int], tuple[int, int]]:
+        rows = self._connection.execute(
+            """
+            SELECT order_digest, submission_idx, product_id, amount_x18
+            FROM nado_fill_evidence
+            """
+        ).fetchall()
+        return {
+            (str(row[0]), int(row[1])): (int(row[2]), int(row[3]))
+            for row in rows
+        }
+
+    def _contradictory(self) -> Reconciliation:
+        self.halt()
+        return Reconciliation.CONTRADICTORY
+
     def reconcile(
         self,
         digest: str,
@@ -868,22 +1050,23 @@ class IntentStore:
             _assert_intent_evidence_contract(
                 intent, catalog, evidence, now_ms=evidence.observed_at_ms
             )
+            self._record_fill_evidence(evidence.fills)
         except NadoContractError:
-            return Reconciliation.CONTRADICTORY
+            return self._contradictory()
         matching_orders = [order for order in evidence.orders if order.digest.lower() == digest.lower()]
         matching_fills = [fill for fill in evidence.fills if fill.digest.lower() == digest.lower()]
         if any(
             order.product_id != intent.product_id or order.nonce != intent.nonce
             for order in matching_orders
         ) or any(fill.product_id != intent.product_id for fill in matching_fills):
-            return Reconciliation.CONTRADICTORY
+            return self._contradictory()
         if len(matching_orders) > 1:
-            return Reconciliation.CONTRADICTORY
+            return self._contradictory()
         filled = sum(fill.amount_x18 for fill in matching_fills)
         position = account.cross_perp_amounts_x18.get(intent.product_id or -1, 0)
         if intent.kind == CANCEL_ALL:
             if matching_fills or matching_orders:
-                return Reconciliation.CONTRADICTORY
+                return self._contradictory()
             all_zero = not any(account.regular_orders_by_product.values())
             exact_cancel = (
                 evidence.exact_cancel_digest is not None
@@ -894,39 +1077,81 @@ class IntentStore:
                 return Reconciliation.CANCELLED
             self.mark_ambiguous(digest)
             return Reconciliation.AMBIGUOUS
+        if matching_orders and matching_orders[0].status != "OPEN":
+            return self._contradictory()
+        exact_terminal = (
+            evidence.terminal_digest is not None
+            and evidence.terminal_digest.lower() == digest.lower()
+        )
+        if exact_terminal and evidence.terminal_status not in {
+            "CANCELLED", "EXPIRED", "REJECTED"
+        }:
+            return self._contradictory()
+        if exact_terminal and matching_orders:
+            return self._contradictory()
         if matching_fills:
+            if any(
+                (fill.amount_x18 > 0) != (intent.amount_x18 > 0)
+                for fill in matching_fills
+            ) or abs(filled) > abs(intent.amount_x18):
+                return self._contradictory()
+            if exact_terminal and evidence.terminal_status == "REJECTED":
+                return self._contradictory()
             expected_position = filled
             if intent.kind == CLOSE:
                 expected_position = intent.starting_position_x18 + filled
             if position != expected_position:
-                return Reconciliation.CONTRADICTORY
+                return self._contradictory()
             if intent.kind == CLOSE and position == 0:
                 self.mark_reconciled(digest)
                 return Reconciliation.FILLED
             if intent.kind == ENTRY and abs(filled) >= abs(intent.amount_x18):
                 self.mark_reconciled(digest)
                 return Reconciliation.FILLED
+            if intent.kind == ENTRY and exact_terminal:
+                self.mark_reconciled(digest)
+                self.halt()
+                return Reconciliation(evidence.terminal_status)
+            if intent.kind == CLOSE and not matching_orders:
+                self.mark_reconciled(digest)
+                self.halt()
+                return Reconciliation.PARTIAL
             self._mark(digest, "PARTIAL")
+            self.halt()
             return Reconciliation.PARTIAL
         if matching_orders:
-            if matching_orders[0].status != "OPEN":
-                return Reconciliation.CONTRADICTORY
             self._mark(digest, "RESTING")
             return Reconciliation.RESTING
         if evidence.exact_rejection_digest and evidence.exact_rejection_digest.lower() == digest.lower():
             expected_position = intent.starting_position_x18 if intent.kind == CLOSE else 0
             if position != expected_position:
-                return Reconciliation.CONTRADICTORY
-            self.mark_rejected(digest)
+                return self._contradictory()
+            if intent.kind == CLOSE:
+                self.mark_reconciled(digest)
+                self.halt()
+            else:
+                self.mark_rejected(digest)
             return Reconciliation.REJECTED
         if evidence.terminal_digest and evidence.terminal_digest.lower() == digest.lower():
             terminal = evidence.terminal_status
             if terminal not in {"CANCELLED", "EXPIRED", "REJECTED"}:
-                return Reconciliation.CONTRADICTORY
+                return self._contradictory()
             expected_position = intent.starting_position_x18 if intent.kind == CLOSE else 0
             if position != expected_position:
-                return Reconciliation.CONTRADICTORY
-            self.mark_rejected(digest)
+                return self._contradictory()
+            if terminal in {"CANCELLED", "EXPIRED"} or intent.kind == CLOSE:
+                self.mark_reconciled(digest)
+                if (
+                    intent.kind == CLOSE
+                    and terminal in {"CANCELLED", "EXPIRED"}
+                    and self.count_kind(CLOSE) >= MAX_CLOSE_ATTEMPTS
+                    and position != 0
+                ):
+                    self.halt()
+            else:
+                self.mark_rejected(digest)
+            if intent.kind == CLOSE and terminal == "REJECTED":
+                self.halt()
             return Reconciliation(terminal)
         if evidence.duplicate_digest:
             self.mark_ambiguous(digest)
@@ -943,12 +1168,15 @@ class IntentStore:
         evidence: EngineEvidence,
     ) -> bool:
         intent = self.get(digest)
+        if self.lifecycle_status() != RUNNING:
+            return False
         try:
             _assert_intent_evidence_contract(intent, catalog, evidence, now_ms=now_ms)
         except NadoContractError:
             return False
         return (
-            self.state(digest) in {"RECONCILED", "REJECTED"}
+            self.state(digest) == "RECONCILED"
+            and self.count_kind(CLOSE) < MAX_CLOSE_ATTEMPTS
             and now_ms > intent.recv_time
             and not any(evidence.account.regular_orders_by_product.values())
             and not evidence.triggers.active_digests
@@ -982,11 +1210,13 @@ def _cancel_all_digest(sender: str, nonce: int) -> str:
 class LifecycleCore:
     def __init__(self, store: IntentStore) -> None:
         self.store = store
-        self._halted = False
 
     @property
     def status(self) -> str:
-        if self._halted or self.store.count_kind(CLOSE) >= MAX_CLOSE_ATTEMPTS:
+        durable = self.store.lifecycle_status()
+        if durable == COMPLETE:
+            return COMPLETE
+        if durable == HALTED or self.store.count_kind(CLOSE) >= MAX_CLOSE_ATTEMPTS:
             return HALTED
         return RUNNING
 
@@ -1001,13 +1231,31 @@ class LifecycleCore:
         salt: int,
         now_ms: int,
     ) -> OrderIntent:
-        self._assert_next_state_write(recv_time=recv_time, now_ms=now_ms)
+        if self.store.count_kind(CANCEL_ALL):
+            self.store.halt()
+            raise NadoContractError("parallel or repeated cancel-all is prohibited")
+        entry_records = [
+            (intent, state)
+            for intent, state in self.store.intent_states()
+            if intent.kind == ENTRY
+        ]
+        if len(entry_records) != 1 or entry_records[0][1] not in {
+            "RESTING", "PARTIAL", "AMBIGUOUS"
+        }:
+            self.store.halt()
+            raise NadoContractError("cancel-all requires one unresolved entry")
+        self._assert_recv_fence(recv_time=recv_time, now_ms=now_ms)
         _assert_authoritative_account(catalog, account, now_ms=now_ms, require_flat=False)
         _assert_trigger_snapshot(account, triggers, now_ms=now_ms)
         if triggers.active_digests or triggers.contradictions:
             raise NadoContractError("trigger state blocks cancel-all")
-        if not any(account.regular_orders_by_product.values()):
-            raise NadoContractError("cancel-all requires an unresolved regular order")
+        regular_digests = {
+            digest.lower()
+            for digests in account.regular_orders_by_product.values()
+            for digest in digests
+        }
+        if entry_records[0][0].digest.lower() not in regular_digests:
+            raise NadoContractError("cancel-all requires the exact unresolved entry order")
         if sender.lower() != encode_subaccount(account.owner, account.subaccount_name).lower():
             raise NadoContractError("cancel-all sender identity mismatch")
         nonce = build_order_nonce(recv_time, salt)
@@ -1086,6 +1334,11 @@ class LifecycleCore:
     def _assert_next_state_write(self, *, recv_time: int, now_ms: int) -> None:
         if self.status == HALTED:
             raise NadoContractError("lifecycle is halted at the manual gate")
+        if self.status == COMPLETE:
+            raise NadoContractError("lifecycle is already complete")
+        self._assert_recv_fence(recv_time=recv_time, now_ms=now_ms)
+
+    def _assert_recv_fence(self, *, recv_time: int, now_ms: int) -> None:
         prior_recv_time = self.store.latest_recv_time()
         if prior_recv_time is not None and now_ms <= prior_recv_time:
             raise NadoContractError("preceding signed recv_time has not elapsed")
@@ -1106,6 +1359,11 @@ class LifecycleCore:
     ) -> OrderIntent:
         try:
             self._assert_next_state_write(recv_time=recv_time, now_ms=now_ms)
+            states = self.store.intent_states()
+            if sum(intent.kind == ENTRY for intent, _ in states) != 1:
+                raise NadoContractError("close requires exactly one lifecycle entry")
+            if any(state != "RECONCILED" for _, state in states):
+                raise NadoContractError("all prior lifecycle intents must be reconciled")
             if self.store.count_kind(CLOSE) >= MAX_CLOSE_ATTEMPTS:
                 raise NadoContractError("three close attempts are exhausted")
             products = _assert_authoritative_account(
@@ -1178,7 +1436,7 @@ class LifecycleCore:
             self.store.prepare(intent)
             return intent
         except NadoContractError:
-            self._halted = True
+            self.store.halt()
             raise
 
 
@@ -1189,6 +1447,8 @@ def completion_barrier(
     evidence: EngineEvidence,
     now_ms: int,
 ) -> bool:
+    if store.lifecycle_status() != RUNNING:
+        return False
     try:
         _assert_authoritative_account(catalog, evidence.account, now_ms=now_ms, require_flat=True)
         _assert_trigger_snapshot(evidence.account, evidence.triggers, now_ms=now_ms)
@@ -1201,6 +1461,8 @@ def completion_barrier(
     if evidence.triggers.active_digests or evidence.orders:
         return False
     intents = store.intents()
+    if sum(intent.kind == ENTRY for intent, _ in intents) != 1:
+        return False
     try:
         for intent, _ in intents:
             _assert_intent_evidence_contract(
@@ -1209,6 +1471,17 @@ def completion_barrier(
     except NadoContractError:
         return False
     known_intents = {intent.digest.lower(): intent for intent, _ in intents}
+    try:
+        canonical_fills = store._canonical_fill_map(evidence.fills)
+    except NadoContractError:
+        store.halt()
+        return False
+    observed_fill_map = {
+        identity: (fill.product_id, fill.amount_x18)
+        for identity, fill in canonical_fills.items()
+    }
+    if observed_fill_map != store.persisted_fill_map():
+        return False
     net_fills: dict[int, int] = {}
     filled_by_digest: dict[str, int] = {}
     for fill in evidence.fills:
@@ -1231,4 +1504,8 @@ def completion_barrier(
     for intent, state in intents:
         if state != "RECONCILED" or now_ms <= intent.recv_time:
             return False
+    try:
+        store.mark_complete()
+    except NadoContractError:
+        return False
     return True
