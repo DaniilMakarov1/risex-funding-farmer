@@ -34,14 +34,14 @@ def module():
         pytest.fail("RED: published main has no sealed testnet bootstrap", pytrace=False)
 
 
-def config(chain: int = 11_155_931, name: str = "Rise Testnet") -> dict[str, Any]:
-    return {"data": {"name": name, "chain_id": chain,
-                     "contract_addresses": {"usdc": USDC, "auth": AUTH}}}
+def config(chain: str = "11155931", name: str = "Rise Testnet") -> dict[str, Any]:
+    return {"chain": {"name": name, "chain_id": chain},
+            "addresses": {"usdc": USDC, "auth": AUTH}}
 
 
-def domain(chain: int = 11_155_931, name: str = "RISEx") -> dict[str, Any]:
-    return {"data": {"name": name, "version": "1", "chain_id": chain,
-                     "verifying_contract": VERIFIER}}
+def domain(chain: str = "11155931", name: str = "RISEx") -> dict[str, Any]:
+    return {"name": name, "version": "1", "chain_id": chain,
+            "verifying_contract": VERIFIER}
 
 
 class SensitiveError(RuntimeError):
@@ -60,10 +60,11 @@ class Scenario:
     domain_body: Any = field(default_factory=domain)
     post_status: int = 200
     post_url: str | None = None
-    post_body: Any = field(default_factory=lambda: {"data": {"success": True}})
+    post_body: Any = field(default_factory=lambda: {"success": True})
     post_error: BaseException | None = None
     get_error: BaseException | None = None
     get_url: str | None = None
+    wrap_balance: bool = False
     calls: list[tuple[str, URL, dict[str, Any]]] = field(default_factory=list)
     session_kwargs: list[dict[str, Any]] = field(default_factory=list)
     closed: int = 0
@@ -141,6 +142,8 @@ class Session:
                   "/v1/auth/eip712-domain": self.scenario.domain_body}
         if requested.path == "/v1/account/balance":
             body = {"data": {"balance": self.scenario.balance()}}
+            if not self.scenario.wrap_balance:
+                body = body["data"]
         else:
             body = bodies.get(requested.path, {"error": "unexpected"})
         known = requested.path in bodies or requested.path == "/v1/account/balance"
@@ -216,7 +219,7 @@ async def test_read_only_cannot_write_or_obey_fixture_destination(module, transp
                                                                   monkeypatch):
     monkeypatch.setenv("HTTPS_PROXY", "https://production.invalid")
     body = config()
-    body["data"]["deposit_url"] = "https://api.rise.trade/v1/account/deposit"
+    body["chain"]["deposit_url"] = "https://api.rise.trade/v1/account/deposit"
     scenario = transport(Scenario(balances=["23"], config_body=body))
     state = await module.check_risex_account(WALLET)
     assert (state.ready, state.balance_raw) == (True, "23")
@@ -248,6 +251,22 @@ async def test_preflight_and_postcondition_are_authoritative(module, transport):
     assert sum(call[1].path.endswith("eip712-domain") for call in ready.calls) == 2
 
 
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.asyncio
+async def test_direct_or_single_data_envelope_is_accepted(wrapped, module, transport):
+    envelope = (lambda value: {"data": value}) if wrapped else (lambda value: value)
+    scenario = transport(Scenario(
+        balances=["0", "7"],
+        config_body=envelope(config()),
+        domain_body=envelope(domain()),
+        post_body=envelope({"success": True}),
+        wrap_balance=wrapped,
+    ))
+    result = await module.bootstrap_risex_account(WALLET, intent="RISEX_TESTNET_DEPOSIT")
+    assert (result.status, result.balance_raw) == (module.BootstrapStatus.READY, "7")
+    assert len(posts(scenario)) == 1
+
+
 @pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
 @pytest.mark.asyncio
 async def test_redirect_is_never_followed_or_submitted(status, module, transport):
@@ -268,8 +287,11 @@ async def test_production_final_url_is_never_submitted(module, transport):
 
 
 @pytest.mark.parametrize("change", [
-    {"config_body": config(chain=1)}, {"config_body": config(name="Rise")},
-    {"domain_body": domain(chain=1)}, {"domain_body": domain(name="RISK")},
+    {"config_body": config(chain="1")}, {"config_body": config(name="Rise")},
+    {"domain_body": domain(chain="1")}, {"domain_body": domain(name="RISK")},
+    {"config_body": config(chain=11_155_931)},
+    {"domain_body": domain(chain=11_155_931)},
+    {"config_body": {"data": config(), "extra": "ambiguous"}},
     {"get_url": "https://api.rise.trade/v1/system/config"},
     {"get_url": "https://api.testnet.rise.trade/v1/wrong"},
 ])
@@ -312,6 +334,14 @@ async def test_uncertain_post_failure_is_one_attempt(error, module, transport):
 @pytest.mark.asyncio
 async def test_malformed_post_is_one_attempt_and_ambiguous(module, transport):
     scenario = transport(Scenario(post_body=["not", "a", "mapping"]))
+    result = await module.bootstrap_risex_account(WALLET, intent="RISEX_TESTNET_DEPOSIT")
+    assert result.status is module.BootstrapStatus.UNKNOWN_AMBIGUOUS
+    assert len(posts(scenario)) == 1
+
+
+@pytest.mark.asyncio
+async def test_extra_data_envelope_after_post_is_ambiguous(module, transport):
+    scenario = transport(Scenario(post_body={"data": {"success": True}, "extra": "ambiguous"}))
     result = await module.bootstrap_risex_account(WALLET, intent="RISEX_TESTNET_DEPOSIT")
     assert result.status is module.BootstrapStatus.UNKNOWN_AMBIGUOUS
     assert len(posts(scenario)) == 1

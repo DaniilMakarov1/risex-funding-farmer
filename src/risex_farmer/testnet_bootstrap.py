@@ -75,8 +75,13 @@ def _mapping(value: object) -> dict[str, Any]:
     return value
 
 
-def _data(value: object) -> dict[str, Any]:
-    return _mapping(_mapping(value).get("data"))
+def _payload(value: object) -> dict[str, Any]:
+    root = _mapping(value)
+    if "data" not in root:
+        return root
+    if set(root) != {"data"}:
+        raise _safety_error()
+    return _mapping(root["data"])
 
 
 def _session() -> aiohttp.ClientSession:
@@ -115,12 +120,13 @@ async def _identity(session: aiohttp.ClientSession) -> _Identity:
     config_status, config_body = await _request_json(session, "GET", _SYSTEM_CONFIG)
     if not 200 <= config_status < 300:
         raise _safety_error()
-    config = _data(config_body)
-    contracts = _mapping(config.get("contract_addresses"))
-    usdc, auth = contracts.get("usdc"), contracts.get("auth")
+    config = _payload(config_body)
+    chain = _mapping(config.get("chain"))
+    addresses = _mapping(config.get("addresses"))
+    usdc, auth = addresses.get("usdc"), addresses.get("auth")
     if (
-        config.get("name") != "Rise Testnet"
-        or config.get("chain_id") != _CHAIN_ID
+        chain.get("name") != "Rise Testnet"
+        or chain.get("chain_id") != str(_CHAIN_ID)
         or not _valid_contract(usdc)
         or not _valid_contract(auth)
     ):
@@ -129,11 +135,11 @@ async def _identity(session: aiohttp.ClientSession) -> _Identity:
     domain_status, domain_body = await _request_json(session, "GET", _EIP712_DOMAIN)
     if not 200 <= domain_status < 300:
         raise _safety_error()
-    domain = _data(domain_body)
+    domain = _payload(domain_body)
     if (
         domain.get("name") != "RISEx"
         or domain.get("version") != "1"
-        or domain.get("chain_id") != _CHAIN_ID
+        or domain.get("chain_id") != str(_CHAIN_ID)
         or not _valid_contract(domain.get("verifying_contract"))
     ):
         raise _safety_error()
@@ -152,7 +158,7 @@ async def _balance(
     )
     if not 200 <= status < 300:
         raise _safety_error()
-    balance = _data(body).get("balance")
+    balance = _payload(body).get("balance")
     if not isinstance(balance, str) or not balance.isdigit():
         raise _safety_error()
     return AccountState(ready=int(balance) > 0, balance_raw=balance)
@@ -203,7 +209,7 @@ async def bootstrap_risex_account(wallet: str, *, intent: str) -> BootstrapResul
                 _ACCOUNT_DEPOSIT,
                 json={"account": expected_wallet, "amount": _DEPOSIT_AMOUNT},
             )
-            submitted = _data(body).get("success") is True
+            submitted = _payload(body).get("success") is True
             if 400 <= status < 500:
                 return BootstrapResult(
                     BootstrapStatus.REJECTED, message="testnet deposit rejected"
