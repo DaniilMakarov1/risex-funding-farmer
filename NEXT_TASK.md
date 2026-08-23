@@ -1,42 +1,31 @@
-# TESTNET-001-RECOVERY-001 — Module-Owned Transport and Verified Account Bootstrap
+# TESTNET-001-RECOVERY-005 — Direct Passwd-Home Marker
 
-Status: `ACCEPTED — BOUNDED RISEX OPERATIONAL BOOTSTRAP AUTHORIZED`.
+Status: `ACTIVE — RED FIRST; NO REAL MARKER OR POST`.
 
-The accepted exact chain is governance `51b65e41930c7558c7cff25ee0c7795c00c3dd55`, implementation `744dffc4534b2eb970bf4c0589f7282088f076df`, fix cycle 1 `a543239b971124ae3d4cc405abda6fb0e2b7867e`, and fix cycle 2 `603c2cf8174fc55a510197b65d52b6e27e35f82e`, based on published `main == origin/main == c28f40d6a1fc74c1795e26b77695ced2b21dc5a4`. Chief independently passed 43 focused and 367 full tests and found no acceptance blocker. The rejected TESTNET-001 implementation and branch remain blocked audit history and must not be inspected, imported, copied, cherry-picked, merged, pushed, or live-run.
+This strictly corrective slice starts from published `main == origin/main == c84cc882c027795bbe4ea15d5233c35b187216b9`. RECOVERY-004 is `BLOCKED — TASK DID NOT CONVERGE`; its branch and implementation/tests are failed audit history and must not be inspected, copied, cherry-picked, or reused.
 
-## Authorized operational acceptance
+## Exact ownership and design
 
-- Integrate and publish the accepted chain, prove `main == origin/main`, and rerun deterministic gates before network use.
-- Call `check_risex_account` first for the fixed approved public wallet. If ready, record `ALREADY_READY` and perform zero POSTs.
-- Otherwise call `bootstrap_risex_account` exactly once with the fixed explicit intent. `READY` requires an authoritative positive balance; `REJECTED` stops immediately. `SUBMITTED_UNVERIFIED` or `UNKNOWN_AMBIGUOUS` permits only at most five read-only checks over at most 60 seconds and never a second POST.
-- Report only public wallet, UTC request times/status classes, raw test balance, and readiness. Do not report response bodies. No XLSX, key, secret, credential, order, position, trade, mainnet endpoint, Farmer/paper runtime, or Telegram runtime is permitted.
-- Stop after the RISEx result and report to Chief. Nado and Extended remain explicit blockers and must not be worked around. TESTNET-002 must not start.
+- The existing optional bootstrap module remains the sole owner of fixed RISEx testnet destination, identity, balance, one deposit dispatch, and one-shot local authorization. Its public API accepts no path, environment, CLI, ledger, transport, reset, delete, rearm, or retry control.
+- The sole marker is fixed at `pwd.getpwuid(os.getuid()).pw_dir/.risex-funding-farmer-testnet-first-deposit-v1.json`. No directory hierarchy is created. Production opens the passwd home with `O_DIRECTORY|O_NOFOLLOW`, validates through `fstat` that it is a current-owner directory, and keeps that descriptor through claim and home-directory fsync. Tests may replace only a private passwd-home helper with a disposable existing directory.
+- Canonical metadata is exact: schema version `1`, venue `RISEx`, host `api.testnet.rise.trade`, chain `11155931`, approved wallet `0x20f9153e2eeba0ff7880fb5a23e976e8b2af56ee`, operation `FIRST_DEPOSIT`, amount `1000`, and state `SPENT_UNKNOWN` or `READY`.
+- Claim uses home-relative `O_CREAT|O_EXCL|O_NOFOLLOW`, exact mode `0600`, a current-owner regular single-link file, complete canonical `SPENT_UNKNOWN`, file fsync, then held home-directory fsync before any POST. Empty, partial, malformed, wrong-owner/type/mode/link, symlink, exclusive-create loss, or durability failure is terminal consumed/fail-closed and never reusable.
+- Existing marker always performs zero POST. Existing `SPENT_UNKNOWN` or invalid/uncertain state is non-ready. Existing `READY` performs exact identity and balance reads but returns ready only for a fresh positive authoritative balance; local state alone is never readiness.
+- Only an invocation with a freshly completed durable claim may dispatch the one fixed POST after exact identity/wallet revalidation. The exact observed preflight HTTP 500 tuple may reach this claim path but is never labeled `NOT_REGISTERED`; adjacent or generic errors fail before claim/POST.
+- READY transition uses one fixed exclusive temp file in the held home directory, canonical READY bytes, temp-file fsync, atomic same-directory rename, and home-directory fsync. Failure is non-ready and cannot authorize another POST. The product exposes no reset/delete/rearm operation.
+- Ordinary concurrent tasks/processes, restart, power loss, crash, cancellation, and network ambiguity are in scope. Intentional same-UID deletion/rename is outside the threat model and operationally prohibited.
 
-## Ownership and bounded design
+## RED and acceptance
 
-- Add one small optional testnet bootstrap module, isolated from normal Farmer imports and from runtime, Scanner, lifecycle, storage, Telegram, economics, and paper configuration. No framework, service, daemon, database, CLI-wide abstraction, SDK compatibility layer, or optional dependency is authorized.
-- RISEx is the only implementable onboarding path in this slice. The module owns exact constants for official testnet host `api.testnet.rise.trade`, chain `11155931`, paths, methods, and documented identity fields. It creates and closes its own `aiohttp` session with system CA verification, `trust_env=False`, finite total timeout, and `allow_redirects=False` on every request; validates response status and actual URL; and rejects every 3xx or destination mismatch.
-- The public API exposes no sender, transport, session, request, URL, base-URL override, or destination callback. Tests intercept only below this boundary through private monkeypatching. No custom SSL context, TLS bypass, redirect following, proxy inheritance, or caller-selected method/path is permitted.
-- RISEx bootstrap first verifies `GET /v1/system/config` and `GET /v1/auth/eip712-domain`, derives exact USDC from verified config, then reads `GET /v1/account/balance` for the expected wallet. Positive balance returns `ALREADY_READY` without a write. Otherwise an explicit one-venue/one-operation intent permits exactly one unsigned `POST /v1/account/deposit` with the documented wallet and amount; immediately before dispatch identity and wallet are revalidated.
-- POST success is not readiness. A bounded authoritative balance reread through the same owned safe transport must show positive balance to return `READY`. Confirmed write without observable readiness is `SUBMITTED_UNVERIFIED`; timeout, EOF, TLS failure, final-URL mismatch, redirect, cancellation-independent transport uncertainty, or malformed response after dispatch is non-ready/ambiguous and is never retried automatically. `CancelledError` propagates.
-- Nado signed onboarding remains fail-closed: do not hand-roll signing, downgrade accepted dependencies, or add an isolated subprocess/sidecar. Extended onboarding remains fail-closed until an official working chain-identity path is proved; do not equate REST hostname with chain identity or guess an RPC. Report exact manual/official prerequisites only.
-- No real XLSX access, secrets, credentials, private/account live query, registration, API-key creation, faucet/deposit write, test collateral, order/cancel/replace/position/trading method, mainnet endpoint, real funds, or Scanner/runtime integration occurs before Chief candidate acceptance and separate operational authorization.
-
-## RED and acceptance contract
-
-1. Exact published main lacks the sealed bootstrap and fails the newly authored tests; production remains untouched at the RED checkpoint.
-2. A response whose actual/final URL is production is rejected and never submitted. Statuses 301, 302, 303, 307, and 308 are rejected without following.
-3. Public API signatures cannot inject sender, transport, request, session, URL, base URL, method, path, proxy, or SSL context. Environment proxy/base-URL tricks cannot redirect requests; default CA verification remains enabled.
-4. Wrong host, path, method, chain, signing domain, or wallet mapping fails before any permitted secret/signer callback or write dispatch. RISEx's official unsigned faucet path introduces no production secret seam.
-5. Successful POST without an authoritative positive balance is never `READY`; already-ready preflight performs zero writes. The expected wallet, config-derived USDC, exact quantity, and postcondition are fixture-proved.
-6. Timeout, EOF, TLS failure, final-URL mismatch, malformed response, or cancellation after POST never causes a retry or success. Exactly one write attempt is made; uncertain outcomes are typed ambiguous/non-ready and cancellation propagates normally.
-7. Synthetic secret-bearing chained exceptions, SDK-like objects, response bodies, representations, stdout/stderr, and pytest output are redacted. No response body or low-level exception text enters a public result. No real secret fixture is used.
-8. No order, cancel, replace, position-creation, trading transaction, mainnet route, or generic endpoint dispatch is present or reachable. Read-only code cannot invoke a write even with malicious fixture data.
-9. Optional testnet code is not imported during normal Farmer startup. The existing 324-test paper suite remains unchanged; CI and Builder work are fixture-only and perform no live calls or writes.
-10. Run focused tests, full `pytest`, compileall, diff review, secret scan, import-identity check, and pending-task audit. Builder creates one implementation commit and reports in at most 20 lines; at most two Architect-directed fix cycles are allowed.
+1. Exact published main lacks the durable direct-home claim and fails newly authored fixture tests while production remains unchanged at RED.
+2. Prove exact ordering: exclusive marker create, complete write, marker fsync, home-directory fsync, then and only then POST. A failure/crash after create, write, file fsync, or home fsync leaves terminal consumed state and cannot replay.
+3. Under normal filesystem behavior, concurrent async calls and concurrent subprocesses yield exactly one claim and at most one POST. Restart after abrupt process exit cannot claim again.
+4. Existing empty, partial, malformed, mismatched, wrong-owner/type/mode/link, symlink, `SPENT_UNKNOWN`, `READY`, or abandoned temp state never permits a second POST. READY requires a fresh positive authoritative balance; unavailable/nonpositive balance is a non-trading blocker.
+5. Post-claim cancellation propagates and remains consumed. POST timeout/EOF/TLS/redirect/final-URL/malformed/4xx/5xx, postcondition failure, READY-update failure, or session-close failure is non-ready and never retried.
+6. Preserve sealed fixed HTTPS ownership, `trust_env=False`, default CA, no redirect, exact chain/domain/auth/token/wallet/amount, sanitized errors, one POST site, optional-import isolation, and no order/cancel/replace/position/trading/mainnet surface.
+7. Public source exposes no marker path or state override and no reset/delete/rearm/retry API. Builder and tests use only disposable private-home fixtures and perform no live network call or real-home filesystem mutation.
+8. Run focused asyncio-debug tests, subprocess race/crash cases, the accepted 367-test baseline plus new tests, compileall, diff, secret/import/one-POST/public-surface/pending-process checks. Production must be materially smaller than the rejected hierarchy design.
 
 ## Workflow boundary
 
-Exactly one Builder may author fresh RED tests and then, after Architect RED review, the smallest implementation. Expected production scope is one new optional module and tests in one new focused test file; any additional production file requires Architect justification before edit. Stop at the deterministic candidate checkpoint. Do not merge, push, read the real XLSX, create credentials, make private/live queries, perform onboarding/faucet/deposit, fund accounts, or start TESTNET-002 before Chief independent review.
-
-The user's later testnet-only order/cancel/close and manually armed strategy authorization is recorded but deferred. It does not authorize trading code in this slice and never authorizes mainnet or real funds.
+Exactly one fresh Builder may author fresh RED, stop for Architect review, then implement only after GREEN authorization. Expected scope is `src/risex_farmer/testnet_bootstrap.py` and `tests/test_testnet_bootstrap.py`; governance remains Architect-owned. One implementation commit and at most two fix cycles. Stop at Chief candidate review: no merge, push, real marker, live balance/deposit, XLSX, secret, Nado, Extended, TESTNET-002, Scanner/runtime, paper, Telegram, or economics work.
