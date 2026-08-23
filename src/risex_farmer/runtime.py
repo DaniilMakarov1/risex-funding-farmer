@@ -346,6 +346,7 @@ class PublicPaperRuntime:
         self.next_position_monitor_at: datetime | None = None
         self.accepting_entries = True
         self._stream_tasks: dict[tuple[Venue, str, str], asyncio.Task[None]] = {}
+        self._retired_stream_tasks: set[asyncio.Task[None]] = set()
         self._refresh_task: asyncio.Task[None] | None = None
         self._pending_full_scan_at: datetime | None = None
         self._recoveries: dict[tuple[Venue, str], RecoveryEpisode] = {}
@@ -1508,6 +1509,10 @@ class PublicPaperRuntime:
             "RUNTIME_FATAL", at=self._requested_at,
             detail={"exception_class": type(exception).__name__},
         )
+
+    def _retired_stream_task_done(self, task: asyncio.Task[None]) -> None:
+        self._retired_stream_tasks.discard(task)
+        self._background_task_done(task)
 
     def _observation(self, venue: Venue, symbol: str, at: datetime) -> MarketObservation:
         row = self.observations[(venue, symbol)]
@@ -3325,9 +3330,14 @@ class PublicPaperRuntime:
         key = (Venue.EXTENDED, symbol, kind)
         current = self._stream_tasks.get(key)
         if current is not None and current is not asyncio.current_task():
-            current.cancel()
-            await asyncio.gather(current, return_exceptions=True)
             self._stream_tasks.pop(key, None)
+            self._stream_sessions.pop(key, None)
+            self._start_extended_stream(symbol, kind)
+            current.cancel()
+            self._retired_stream_tasks.add(current)
+            current.add_done_callback(self._retired_stream_task_done)
+            await asyncio.sleep(0)
+            return
         self._start_extended_stream(symbol, kind)
 
     async def _extended_heartbeat(
@@ -4209,6 +4219,7 @@ class PublicPaperRuntime:
         if self._stop_event is not None:
             self._stop_event.set()
         owned = list(self._stream_tasks.values())
+        owned.extend(self._retired_stream_tasks)
         if self._refresh_task is not None:
             owned.append(self._refresh_task)
         owned.extend(
@@ -4248,6 +4259,7 @@ class PublicPaperRuntime:
                 "Paper runtime stopped safely",
             )
         self._stream_tasks.clear()
+        self._retired_stream_tasks.clear()
         self._stream_sessions.clear()
         self._recoveries.clear()
         self._retired_recovery_tasks.clear()

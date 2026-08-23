@@ -3455,6 +3455,8 @@ async def test_extended_watchdog_rotation_does_not_block_due_full_tick(
         runtime._session = SimpleNamespace(closed=True)
         runtime._stop_event = asyncio.Event()
         old_session = runtime._new_stream_session(key)
+        old_book = runtime.observations[Venue.EXTENDED, symbol].book
+        assert old_book is not None
         cancel_acknowledged = asyncio.Event()
         release_retirement = asyncio.Event()
         old_mutation_attempted = asyncio.Event()
@@ -3470,7 +3472,7 @@ async def test_extended_watchdog_rotation_does_not_block_due_full_tick(
                     stream_session_id=old_session,
                 )
                 stale_book = replace(
-                    runtime.observations[Venue.EXTENDED, symbol].book,
+                    old_book,
                     bids=(BookLevel(D("70"), D("20")),),
                     asks=(BookLevel(D("71"), D("20")),),
                     observed_at=clock.now(), sequence=777,
@@ -3574,8 +3576,16 @@ async def test_extended_watchdog_rotation_does_not_block_due_full_tick(
             successors_before_retirement = len(successor_sessions)
             deadline_before_retirement = repository.connection.execute(
                 "SELECT COUNT(*) FROM runtime_evidence "
-                "WHERE event_type='PUBLIC_SCAN_DEADLINE'"
+                "WHERE event_type='PUBLIC_SCAN_DEADLINE' "
+                "AND detail LIKE '%\"kind\":\"full\"%'"
             ).fetchone()[0]
+            refresh_before_retirement = runtime._refresh_task
+            if refresh_before_retirement is not None:
+                await asyncio.wait_for(
+                    refresh_before_retirement, timeout=timeout
+                )
+                await asyncio.wait_for(runtime.tick(NOW), timeout=timeout)
+                await asyncio.sleep(0)
             observable_before_retirement = (
                 dict(runtime.component_readiness[Venue.EXTENDED]),
                 runtime.readiness[Venue.EXTENDED],
@@ -3613,9 +3623,13 @@ async def test_extended_watchdog_rotation_does_not_block_due_full_tick(
                 old_task.done(), old_task.cancelled(), old_task.exception()
             )
             old_ownership_after_retirement = old_task_ownership_locations()
-            refresh_was_started = runtime._refresh_task is not None
-            await asyncio.wait_for(runtime._refresh_task, timeout=timeout)
-            await asyncio.wait_for(runtime.tick(NOW), timeout=timeout)
+            refresh_was_started = (
+                refresh_before_retirement is not None
+                or runtime._refresh_task is not None
+            )
+            if runtime._pending_full_scan_at is not None:
+                await asyncio.wait_for(runtime._refresh_task, timeout=timeout)
+                await asyncio.wait_for(runtime.tick(NOW), timeout=timeout)
             post_gate_scan = runtime.last_scan
             pending_full_scan_at = runtime._pending_full_scan_at
             full_scans = repository.connection.execute(
