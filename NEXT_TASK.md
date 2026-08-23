@@ -1,8 +1,16 @@
 # TESTNET-001-RECOVERY-001 — Module-Owned Transport and Verified Account Bootstrap
 
-Status: `ACTIVE — RED FIRST; NO LIVE OR SECRET-BEARING ACTION`.
+Status: `ACCEPTED — BOUNDED RISEX OPERATIONAL BOOTSTRAP AUTHORIZED`.
 
-This fresh administrative correction starts strictly from published `main == origin/main == c28f40d6a1fc74c1795e26b77695ced2b21dc5a4` on `codex/testnet-001-recovery-001`. The rejected TESTNET-001 implementation and branch remain blocked audit history and must not be inspected, imported, copied, cherry-picked, merged, pushed, or live-run.
+The accepted exact chain is governance `51b65e41930c7558c7cff25ee0c7795c00c3dd55`, implementation `744dffc4534b2eb970bf4c0589f7282088f076df`, fix cycle 1 `a543239b971124ae3d4cc405abda6fb0e2b7867e`, and fix cycle 2 `603c2cf8174fc55a510197b65d52b6e27e35f82e`, based on published `main == origin/main == c28f40d6a1fc74c1795e26b77695ced2b21dc5a4`. Chief independently passed 43 focused and 367 full tests and found no acceptance blocker. The rejected TESTNET-001 implementation and branch remain blocked audit history and must not be inspected, imported, copied, cherry-picked, merged, pushed, or live-run.
+
+## Authorized operational acceptance
+
+- Integrate and publish the accepted chain, prove `main == origin/main`, and rerun deterministic gates before network use.
+- Call `check_risex_account` first for the fixed approved public wallet. If ready, record `ALREADY_READY` and perform zero POSTs.
+- Otherwise call `bootstrap_risex_account` exactly once with the fixed explicit intent. `READY` requires an authoritative positive balance; `REJECTED` stops immediately. `SUBMITTED_UNVERIFIED` or `UNKNOWN_AMBIGUOUS` permits only at most five read-only checks over at most 60 seconds and never a second POST.
+- Report only public wallet, UTC request times/status classes, raw test balance, and readiness. Do not report response bodies. No XLSX, key, secret, credential, order, position, trade, mainnet endpoint, Farmer/paper runtime, or Telegram runtime is permitted.
+- Stop after the RISEx result and report to Chief. Nado and Extended remain explicit blockers and must not be worked around. TESTNET-002 must not start.
 
 ## Ownership and bounded design
 
