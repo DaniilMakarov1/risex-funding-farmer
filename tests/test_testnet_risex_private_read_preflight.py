@@ -292,6 +292,74 @@ async def test_redirect_final_url_and_envelope_schema_fail_closed(tmp_path, kind
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("observed_at", [
+    True, float("nan"), float("inf"), float("-inf"), "1787572800",
+])
+async def test_invalid_http_observation_scalar_blocks(tmp_path, observed_at):
+    clock = Clock()
+    transport = PublicTransport(clock)
+    transport.mutations["/v1/system/config"] = (
+        lambda response: replace(response, observed_at=observed_at)
+    )
+    store = PrivateReadStore(tmp_path / "observed.sqlite3")
+    controller = PrivateReadPreflight(
+        store, clock=clock, public_get=transport, lifecycle_clear=lambda: True,
+    )
+    assert await controller.run_public_barrier() is None
+    assert store.outcome() == Outcome.BLOCKED
+    store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", [
+    "status_true", "http_float", "redirect_zero", "lifecycle_one",
+])
+async def test_boolean_and_numeric_protocol_aliases_block(tmp_path, case):
+    clock = Clock()
+    transport = PublicTransport(clock)
+    lifecycle = lambda: True
+    if case == "status_true":
+        def status_alias(response):
+            body = copy.deepcopy(response.body)
+            body["data"]["status"] = True
+            return replace(response, body=body)
+        transport.mutations["/v1/auth/session-key-status"] = status_alias
+    elif case == "http_float":
+        transport.mutations["/v1/system/config"] = (
+            lambda response: replace(response, status=200.0)
+        )
+    elif case == "redirect_zero":
+        transport.mutations["/v1/system/config"] = (
+            lambda response: replace(response, redirected=0)
+        )
+    else:
+        lifecycle = lambda: 1
+    store = PrivateReadStore(tmp_path / "aliases.sqlite3")
+    controller = PrivateReadPreflight(
+        store, clock=clock, public_get=transport, lifecycle_clear=lifecycle,
+    )
+    assert await controller.run_public_barrier() is None
+    assert store.outcome() == Outcome.BLOCKED
+    store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("clock_value", [
+    True, float("nan"), float("inf"), float("-inf"), "1787572800",
+])
+async def test_invalid_injected_clock_scalar_blocks_public(tmp_path, clock_value):
+    clock = Clock(clock_value)
+    transport = PublicTransport(clock)
+    store = PrivateReadStore(tmp_path / "clock.sqlite3")
+    controller = PrivateReadPreflight(
+        store, clock=clock, public_get=transport, lifecycle_clear=lambda: True,
+    )
+    assert await controller.run_public_barrier() is None
+    assert store.outcome() == Outcome.BLOCKED
+    store.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("case", [
     "config", "domain", "inactive", "duplicate_signer", "market", "sweep_conflict",
 ])
@@ -731,6 +799,41 @@ async def test_private_barrier_clock_or_lifecycle_failure_precedes_loader(tmp_pa
     )
     assert result.outcome == Outcome.BLOCKED and loader_calls == 0
     assert store.outcome() == Outcome.BLOCKED
+    store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("clock_value", [
+    True, float("nan"), float("inf"), float("-inf"), "1787572800",
+])
+async def test_invalid_injected_clock_scalar_blocks_private_before_loader(
+    tmp_path, clock_value,
+):
+    controller, store, clock, _transport, barrier = await public_barrier(tmp_path)
+    clock.value = clock_value
+    loader_calls = 0
+
+    def loader():
+        nonlocal loader_calls
+        loader_calls += 1
+        return SyntheticCredential(SIGNER, b"fixture")
+
+    result = await controller.run_private_proof(
+        barrier, signer_loader=loader, nonce_get=lambda *_: None,
+        sign_register_v2=lambda *_: SIGNATURE,
+        private_exchange=lambda *_: private_frames(),
+    )
+    assert result.outcome == Outcome.BLOCKED and loader_calls == 0
+    store.close()
+
+
+def test_redacted_evidence_rejects_scalar_aliases_and_unknown_fields(tmp_path):
+    store = PrivateReadStore(tmp_path / "evidence-alias.sqlite3")
+    store.block(
+        public_get_count=True, private_nonce_count=-1, public_flat=1,
+        private_flat="true", unknown_count=2,
+    )
+    assert store.evidence() == {}
     store.close()
 
 

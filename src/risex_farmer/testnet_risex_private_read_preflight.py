@@ -12,6 +12,7 @@ from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from enum import Enum
 import inspect
 import json
+import math
 from pathlib import Path
 import sqlite3
 from typing import Any, Callable, Mapping, Sequence
@@ -134,14 +135,17 @@ class PrivateReadStore:
             return False
 
     def _terminal(self, outcome: Outcome, evidence: Mapping[str, Any]) -> None:
-        safe = {
-            key: value for key, value in evidence.items()
-            if key in {
-                "public_get_count", "private_nonce_count", "signature_count",
-                "auth_send_count", "orders_snapshot_count",
-                "positions_snapshot_count", "public_flat", "private_flat",
-            } and isinstance(value, (bool, int))
+        count_keys = {
+            "public_get_count", "private_nonce_count", "signature_count",
+            "auth_send_count", "orders_snapshot_count", "positions_snapshot_count",
         }
+        flat_keys = {"public_flat", "private_flat"}
+        safe = {}
+        for key, value in evidence.items():
+            if key in count_keys and type(value) is int and value >= 0:
+                safe[key] = value
+            elif key in flat_keys and type(value) is bool:
+                safe[key] = value
         current = self.outcome()
         if current in {Outcome.PASSED, Outcome.BLOCKED}:
             return
@@ -208,6 +212,18 @@ def _address(value: Any) -> str:
     return value.lower()
 
 
+def _finite_time(value: Any) -> float:
+    if type(value) not in {int, float}:
+        raise ValueError("invalid time scalar")
+    try:
+        normalized = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("invalid time scalar") from exc
+    if not math.isfinite(normalized):
+        raise ValueError("invalid time scalar")
+    return normalized
+
+
 def _utc_timestamp(value: str) -> float:
     if not isinstance(value, str) or not value.endswith("Z"):
         raise ValueError("invalid timestamp")
@@ -246,6 +262,9 @@ class PrivateReadPreflight:
         self._owner = object()
         self._barrier: _Barrier | None = None
 
+    def _now(self) -> float:
+        return _finite_time(self._clock())
+
     def _block(self, count: int = 0) -> None:
         self._barrier = None
         self._store.block(public_get_count=count)
@@ -261,7 +280,7 @@ class PrivateReadPreflight:
         try:
             if not self._store.start_public_attempt():
                 raise ValueError("public attempt already consumed")
-            if not self._lifecycle_clear():
+            if self._lifecycle_clear() is not True:
                 raise ValueError("unresolved lifecycle")
             sweeps = []
             for _ in range(2):
@@ -270,18 +289,18 @@ class PrivateReadPreflight:
                     count += 1
                     response = await _await(self._public_get(path, query))
                     responses[path] = self._validate_response(path, query, response)
-                    observations.append(response.observed_at)
+                    observations.append(_finite_time(response.observed_at))
                 sweeps.append(self._validate_sweep(responses))
             if (
-                sweeps[0] != sweeps[1] or not self._lifecycle_clear()
+                sweeps[0] != sweeps[1] or self._lifecycle_clear() is not True
                 or any(
-                    self._clock() - observed < 0
-                    or self._clock() - observed > MAX_AGE_SECONDS
+                    self._now() - observed < 0
+                    or self._now() - observed > MAX_AGE_SECONDS
                     for observed in observations
                 )
             ):
                 raise ValueError("inconsistent sweeps")
-            self._barrier = _Barrier(self._owner, self._clock())
+            self._barrier = _Barrier(self._owner, self._now())
             return self._barrier
         except Exception:
             self._block(count)
@@ -292,9 +311,11 @@ class PrivateReadPreflight:
     ) -> Any:
         if not isinstance(response, HttpResponse):
             raise ValueError("invalid response")
-        age = self._clock() - response.observed_at
+        observed_at = _finite_time(response.observed_at)
+        age = self._now() - observed_at
         if (
-            response.status != 200 or response.redirected
+            type(response.status) is not int or response.status != 200
+            or type(response.redirected) is not bool or response.redirected is not False
             or response.final_url != expected_url(path, query)
             or age < 0 or age > MAX_AGE_SECONDS
         ):
@@ -326,8 +347,14 @@ class PrivateReadPreflight:
         ):
             raise ValueError("domain mismatch")
 
-        status = _mapping(values["/v1/auth/session-key-status"])
-        if status != {"status": 1, "status_description": "Active"}:
+        status = _mapping(
+            values["/v1/auth/session-key-status"],
+            {"status", "status_description"},
+        )
+        if (
+            type(status["status"]) is not int or status["status"] != 1
+            or status["status_description"] != "Active"
+        ):
             raise ValueError("signer inactive")
         signer_data = _mapping(values["/v1/auth/signers"])
         signers = _list(signer_data.get("signers"))
@@ -345,7 +372,7 @@ class PrivateReadPreflight:
             != {key: value for key, value in expected_signer.items() if key != "signer"}
         ):
             raise ValueError("signer mismatch")
-        now = self._clock()
+        now = self._now()
         if not (_utc_timestamp(REGISTERED_AT) <= now < _utc_timestamp(SIGNER_EXPIRATION)):
             raise ValueError("signer outside active interval")
 
@@ -429,13 +456,13 @@ class PrivateReadPreflight:
         private_exchange: Callable[..., Any],
     ) -> PreflightResult:
         try:
-            barrier_age = self._clock() - barrier.issued_at
+            barrier_age = self._now() - _finite_time(barrier.issued_at)
             gate_valid = (
                 isinstance(barrier, _Barrier)
                 and barrier is self._barrier and barrier.owner is self._owner
                 and 0 <= barrier_age <= MAX_AGE_SECONDS
                 and self._store.outcome() is None
-                and self._lifecycle_clear()
+                and self._lifecycle_clear() is True
             )
         except Exception:
             gate_valid = False
@@ -443,7 +470,7 @@ class PrivateReadPreflight:
             self._block(18)
             return self._store.result()  # type: ignore[return-value]
         self._barrier = None
-        private_started = self._clock()
+        private_started = self._now()
         if not self._store._insert_claim():
             self._block(18)
             return self._store.result()  # type: ignore[return-value]
@@ -484,7 +511,7 @@ class PrivateReadPreflight:
                 "params": {
                     "account": ACCOUNT, "signer": SIGNER,
                     "message": "sign in with RISEx", "nonce": nonce,
-                    "expiration": int(self._clock()) + 365 * 24 * 60 * 60,
+                    "expiration": int(self._now()) + 365 * 24 * 60 * 60,
                     "signature": signature,
                 },
             }
@@ -495,8 +522,8 @@ class PrivateReadPreflight:
                 {"method": "subscribe", "params": {"channel": "positions"}},
             )
             frames = await _await(private_exchange(WS_ORIGIN, outbound_plan))
-            self._validate_private_frames(frames, self._clock())
-            private_age = self._clock() - private_started
+            self._validate_private_frames(frames, self._now())
+            private_age = self._now() - private_started
             if private_age < 0 or private_age > MAX_AGE_SECONDS:
                 raise ValueError("private proof stale")
             counts["orders_snapshot_count"] = 1
@@ -553,6 +580,7 @@ class PrivateReadPreflight:
 
     @staticmethod
     def _validate_private_frames(frames: Any, now: float) -> None:
+        now = _finite_time(now)
         if not isinstance(frames, (tuple, list)) or len(frames) != 3:
             raise ValueError("invalid private frames")
         auth, orders, positions = frames
