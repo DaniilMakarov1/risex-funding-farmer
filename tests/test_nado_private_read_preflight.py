@@ -4,6 +4,7 @@ import copy
 import importlib
 import json
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,7 @@ import pytest
 from risex_farmer.nado_private_read_preflight import (
     CLAIMED,
     FINALIZED,
+    MAX_FRESHNESS_MS,
     OBSERVED,
     FixedPreflightIdentity,
     NadoPreflightError,
@@ -69,9 +71,15 @@ class SyntheticObserver:
         self.allow_redirects = False
         self.tls_verified = True
         self.max_response_bytes = 65_536
+        self.timeout_ms = 5_000
+        self.typed_calls: list[dict[str, object] | None] = []
 
-    def observe(self, request: dict[str, object]) -> dict[str, object]:
+    def observe(
+        self, request: dict[str, object],
+        typed_data: dict[str, object] | None = None,
+    ) -> dict[str, object]:
         self.calls.append(copy.deepcopy(request))
+        self.typed_calls.append(copy.deepcopy(typed_data))
         if self.fail:
             raise TimeoutError("ambiguous synthetic dispatch")
         return copy.deepcopy(self.response)
@@ -100,6 +108,16 @@ def _config(contract: dict[str, object]) -> PreflightConfig:
 
 def _reader(contract: dict[str, object]) -> FixturePublicReader:
     return FixturePublicReader(list(contract["round_a"]) + list(contract["round_b"]))
+
+
+def _round_b_ending_at(
+    contract: dict[str, object], final_observed_ms: int,
+) -> list[dict[str, object]]:
+    responses = copy.deepcopy(list(contract["round_b"]))
+    shift = final_observed_ms - int(responses[-1]["observed_at_ms"])
+    for response in responses:
+        response["observed_at_ms"] = int(response["observed_at_ms"]) + shift
+    return responses
 
 
 def test_success_is_two_rounds_around_one_synthetic_observation_and_no_real_boundary(
@@ -173,6 +191,108 @@ def test_pins_identity_and_subaccount_are_exact(contract: dict[str, object]) -> 
         {"name": "sender", "type": "bytes32"},
         {"name": "recvTime", "type": "uint64"},
     ]
+
+
+@pytest.mark.parametrize(
+    ("balance_kind", "bad_key"),
+    [
+        ("spot_balances", "00"),
+        ("spot_balances", "+0"),
+        ("spot_balances", "x"),
+        ("spot_balances", 0),
+        ("spot_balances", True),
+        ("spot_balances", None),
+        ("perp_balances", "02"),
+        ("perp_balances", "+2"),
+        ("perp_balances", "x"),
+        ("perp_balances", 2),
+    ],
+)
+def test_balance_product_keys_must_be_canonical_decimal_strings(
+    tmp_path: Path, contract: dict[str, object], balance_kind: str, bad_key: object
+) -> None:
+    responses = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
+    account = responses[4]["body"]
+    balances = account[balance_kind]
+    original = "0" if balance_kind == "spot_balances" else "2"
+    balances[bad_key] = balances.pop(original)
+    observer = SyntheticObserver(dict(contract["trigger"]))
+    store = OneShotStore(tmp_path / f"bad-{balance_kind}-{bad_key}.sqlite3")
+    with pytest.raises(NadoPreflightError):
+        run_fixture_preflight(
+            config=_config(contract), public_reader=FixturePublicReader(responses),
+            synthetic_observer=observer, operational_observer=None, store=store,
+        )
+    assert observer.calls == []
+    assert store.state("fixture-invocation-001") == "NEW"
+
+
+def test_balance_product_key_aliases_cannot_collapse_coverage(
+    tmp_path: Path, contract: dict[str, object]
+) -> None:
+    responses = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
+    responses[4]["body"]["perp_balances"]["02"] = copy.deepcopy(
+        responses[4]["body"]["perp_balances"]["2"]
+    )
+    store = OneShotStore(tmp_path / "alias.sqlite3")
+    with pytest.raises(NadoPreflightError):
+        run_fixture_preflight(
+            config=_config(contract), public_reader=FixturePublicReader(responses),
+            synthetic_observer=SyntheticObserver(dict(contract["trigger"])),
+            operational_observer=None, store=store,
+        )
+    assert store.state("fixture-invocation-001") == "NEW"
+
+
+def test_one_shot_observation_binds_exact_typed_data_to_request(
+    tmp_path: Path, contract: dict[str, object]
+) -> None:
+    observer = SyntheticObserver(dict(contract["trigger"]))
+    run_fixture_preflight(
+        config=_config(contract), public_reader=_reader(contract),
+        synthetic_observer=observer, operational_observer=None,
+        store=OneShotStore(tmp_path / "typed.sqlite3"),
+    )
+    assert len(observer.calls) == len(observer.typed_calls) == 1
+    assert observer.typed_calls[0] == list_trigger_orders_typed_data(
+        str(observer.calls[0]["sender"]), int(observer.calls[0]["recv_time"])
+    )
+
+
+@pytest.mark.parametrize("timeout_ms", [0, 30_001])
+def test_synthetic_signed_timeout_policy_rejects_before_claim(
+    tmp_path: Path, contract: dict[str, object], timeout_ms: int
+) -> None:
+    observer = SyntheticObserver(dict(contract["trigger"]))
+    observer.timeout_ms = timeout_ms
+    store = OneShotStore(tmp_path / f"timeout-{timeout_ms}.sqlite3")
+    with pytest.raises(NadoPreflightError, match="transport policy"):
+        run_fixture_preflight(
+            config=_config(contract), public_reader=_reader(contract),
+            synthetic_observer=observer, operational_observer=None, store=store,
+        )
+    assert observer.calls == []
+    assert store.state("fixture-invocation-001") == "NEW"
+
+
+def test_signed_timeout_policy_is_required_and_operationally_bounded(
+    tmp_path: Path, contract: dict[str, object]
+) -> None:
+    observer = SyntheticObserver(dict(contract["trigger"]))
+    del observer.timeout_ms
+    store = OneShotStore(tmp_path / "missing-timeout.sqlite3")
+    with pytest.raises(NadoPreflightError, match="transport policy"):
+        run_fixture_preflight(
+            config=_config(contract), public_reader=_reader(contract),
+            synthetic_observer=observer, operational_observer=None, store=store,
+        )
+    forbidden = ForbiddenBoundary()
+    with pytest.raises(NadoPreflightError, match="transport policy"):
+        OperationalSignedObserver(
+            credential_loader=forbidden, derive_owner=forbidden, signer=forbidden,
+            server_time=forbidden, private_post=forbidden, timeout_ms=0,
+        )
+    assert forbidden.calls == 0
 
 
 @pytest.mark.parametrize("index", list(range(9)))
@@ -337,6 +457,109 @@ def test_round_b_failure_after_observation_resumes_without_second_signed_attempt
     )
     assert result.status == FINALIZED
     assert len(observer.calls) == 1
+
+
+def test_stale_observed_resume_halts_before_public_read_or_second_signature(
+    tmp_path: Path, contract: dict[str, object]
+) -> None:
+    store = OneShotStore(tmp_path / "stale-resume.sqlite3")
+    observer = SyntheticObserver(dict(contract["trigger"]))
+    with pytest.raises(NadoPreflightError):
+        run_fixture_preflight(
+            config=_config(contract),
+            public_reader=FixturePublicReader(list(contract["round_a"])),
+            synthetic_observer=observer, operational_observer=None, store=store,
+        )
+    assert store.state("fixture-invocation-001") == OBSERVED
+    assert len(observer.calls) == 1
+
+    next_day = replace(_config(contract), now_ms=_config(contract).now_ms + 86_400_000)
+    reader = FixturePublicReader(
+        _round_b_ending_at(contract, next_day.now_ms - 1)
+    )
+    with pytest.raises(NadoPreflightError, match="durable temporal"):
+        run_fixture_preflight(
+            config=next_day, public_reader=reader, synthetic_observer=observer,
+            operational_observer=None, store=store,
+        )
+    assert reader.calls == []
+    assert store.state("fixture-invocation-001") == OBSERVED
+    assert len(observer.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("age_ms", "accepted"),
+    [(MAX_FRESHNESS_MS, True), (MAX_FRESHNESS_MS + 1, False)],
+)
+def test_resumed_barrier_maximum_interval_edge_is_explicit(
+    tmp_path: Path, contract: dict[str, object], age_ms: int, accepted: bool
+) -> None:
+    store = OneShotStore(tmp_path / f"edge-{age_ms}.sqlite3")
+    observer = SyntheticObserver(dict(contract["trigger"]))
+    with pytest.raises(NadoPreflightError):
+        run_fixture_preflight(
+            config=_config(contract),
+            public_reader=FixturePublicReader(list(contract["round_a"])),
+            synthetic_observer=observer, operational_observer=None, store=store,
+        )
+    round_a_last = int(contract["round_a"][-1]["observed_at_ms"])
+    now_ms = round_a_last + age_ms
+    reader = FixturePublicReader(_round_b_ending_at(contract, now_ms))
+    config = replace(_config(contract), now_ms=now_ms)
+    if accepted:
+        assert run_fixture_preflight(
+            config=config, public_reader=reader, synthetic_observer=observer,
+            operational_observer=None, store=store,
+        ).status == FINALIZED
+        assert reader.calls
+    else:
+        with pytest.raises(NadoPreflightError, match="durable temporal"):
+            run_fixture_preflight(
+                config=config, public_reader=reader, synthetic_observer=observer,
+                operational_observer=None, store=store,
+            )
+        assert reader.calls == []
+        assert store.state("fixture-invocation-001") == OBSERVED
+    assert len(observer.calls) == 1
+
+
+def test_resumed_observed_evidence_rejects_clock_rollback_before_public_read(
+    tmp_path: Path, contract: dict[str, object]
+) -> None:
+    store = OneShotStore(tmp_path / "rollback.sqlite3")
+    observer = SyntheticObserver(dict(contract["trigger"]))
+    with pytest.raises(NadoPreflightError):
+        run_fixture_preflight(
+            config=_config(contract),
+            public_reader=FixturePublicReader(list(contract["round_a"])),
+            synthetic_observer=observer, operational_observer=None, store=store,
+        )
+    trigger_at = int(contract["trigger"]["observed_at_ms"])
+    reader = FixturePublicReader(list(contract["round_b"]))
+    with pytest.raises(NadoPreflightError, match="durable temporal"):
+        run_fixture_preflight(
+            config=replace(_config(contract), now_ms=trigger_at - 1),
+            public_reader=reader, synthetic_observer=observer,
+            operational_observer=None, store=store,
+        )
+    assert reader.calls == []
+    assert store.state("fixture-invocation-001") == OBSERVED
+    assert len(observer.calls) == 1
+
+
+def test_server_time_must_strictly_follow_round_a_before_observation(
+    tmp_path: Path, contract: dict[str, object]
+) -> None:
+    observer = SyntheticObserver(dict(contract["trigger"]))
+    observer.server_time_ms = int(contract["round_a"][-1]["observed_at_ms"])
+    store = OneShotStore(tmp_path / "server-order.sqlite3")
+    with pytest.raises(NadoPreflightError, match="ambiguous"):
+        run_fixture_preflight(
+            config=_config(contract), public_reader=_reader(contract),
+            synthetic_observer=observer, operational_observer=None, store=store,
+        )
+    assert observer.calls == []
+    assert store.state("fixture-invocation-001") == CLAIMED
 
 
 def test_round_b_resume_is_bound_to_full_subaccount_identity(

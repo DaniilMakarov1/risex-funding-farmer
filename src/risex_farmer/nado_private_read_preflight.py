@@ -153,9 +153,12 @@ class SyntheticSignedObserver(Protocol):
     trust_env: bool
     allow_redirects: bool
     tls_verified: bool
+    timeout_ms: int
     max_response_bytes: int
 
-    def observe(self, request: dict[str, object]) -> Mapping[str, object]: ...
+    def observe(
+        self, request: dict[str, object], typed_data: dict[str, object],
+    ) -> Mapping[str, object]: ...
 
 
 @dataclass(frozen=True)
@@ -171,6 +174,7 @@ class OperationalSignedObserver:
     trust_env: bool = False
     allow_redirects: bool = False
     tls_verified: bool = True
+    timeout_ms: int = 5_000
     max_response_bytes: int = 65_536
 
     def __post_init__(self) -> None:
@@ -179,6 +183,8 @@ class OperationalSignedObserver:
             or self.trust_env
             or self.allow_redirects
             or not self.tls_verified
+            or type(self.timeout_ms) is not int
+            or not 1 <= self.timeout_ms <= MAX_FRESHNESS_MS
             or type(self.max_response_bytes) is not int
             or not 1 <= self.max_response_bytes <= 1_048_576
         ):
@@ -371,6 +377,8 @@ def _observer_policy(observer: SyntheticSignedObserver) -> None:
         or observer.trust_env
         or observer.allow_redirects
         or not observer.tls_verified
+        or type(getattr(observer, "timeout_ms", None)) is not int
+        or not 1 <= getattr(observer, "timeout_ms", 0) <= MAX_FRESHNESS_MS
         or type(observer.max_response_bytes) is not int
         or not 1 <= observer.max_response_bytes <= 1_048_576
     ):
@@ -448,6 +456,26 @@ def _integer(value: object, label: str) -> int:
     return parsed
 
 
+def _product_key_map(value: object, label: str) -> dict[int, object]:
+    if not isinstance(value, Mapping):
+        raise NadoPreflightError(f"{label} coverage is unexplained")
+    normalized: dict[int, object] = {}
+    for key, item in value.items():
+        if (
+            type(key) is not str
+            or not key
+            or not key.isascii()
+            or not key.isdecimal()
+            or (len(key) > 1 and key.startswith("0"))
+        ):
+            raise NadoPreflightError(f"{label} product identity is noncanonical")
+        product_id = int(key)
+        if str(product_id) != key or product_id in normalized:
+            raise NadoPreflightError(f"{label} product identity is noncanonical")
+        normalized[product_id] = item
+    return normalized
+
+
 def _account(
     body: Mapping[str, object], sender: str,
     catalog: tuple[tuple[int, str, str], ...],
@@ -467,19 +495,23 @@ def _account(
     perp_ids = {product_id for product_id, _, kind in catalog if kind == "perp"}
     spots = body["spot_balances"]
     perps = body["perp_balances"]
-    if not isinstance(spots, Mapping) or {int(key) for key in spots} != spot_ids:
+    keyed_spots = _product_key_map(spots, "spot balance")
+    if set(keyed_spots) != spot_ids:
         raise NadoPreflightError("spot balance coverage is unexplained")
-    normalized_spots = {int(key): _integer(value, "spot balance") for key, value in spots.items()}
+    normalized_spots = {
+        key: _integer(value, "spot balance") for key, value in keyed_spots.items()
+    }
     if any(value < 0 for value in normalized_spots.values()):
         raise NadoPreflightError("negative spot balance")
     if normalized_spots.get(0, -1) < MIN_COLLATERAL_X18:
         raise NadoPreflightError("collateral floor is not met")
     if any(value for key, value in normalized_spots.items() if key != 0):
         raise NadoPreflightError("unexplained spot balance")
-    if not isinstance(perps, Mapping) or {int(key) for key in perps} != perp_ids:
+    keyed_perps = _product_key_map(perps, "cross-perp")
+    if set(keyed_perps) != perp_ids:
         raise NadoPreflightError("cross-perp coverage is incomplete")
     normalized_perps: dict[int, tuple[int, int]] = {}
-    for key, raw in perps.items():
+    for key, raw in keyed_perps.items():
         if not isinstance(raw, Mapping):
             raise NadoPreflightError("cross-perp schema mismatch")
         _exact_keys(raw, {"amount", "v_quote_balance"}, "cross-perp")
@@ -489,7 +521,7 @@ def _account(
             raise NadoPreflightError("cross-perp is not exactly flat")
         if v_quote != 0:
             raise NadoPreflightError("unexplained v_quote balance")
-        normalized_perps[int(key)] = (amount, v_quote)
+        normalized_perps[key] = (amount, v_quote)
     return {
         "health": health,
         "spots": normalized_spots,
@@ -662,10 +694,14 @@ def run_fixture_preflight(
             if (
                 synthetic_observer.server_time_ms > config.now_ms
                 or config.now_ms - synthetic_observer.server_time_ms > MAX_FRESHNESS_MS
+                or synthetic_observer.server_time_ms <= round_a.last_observed_ms
             ):
                 raise NadoPreflightError("server time is not fresh")
             request = _trigger_request(config.sender, synthetic_observer.server_time_ms)
-            response = synthetic_observer.observe(request)
+            typed_data = list_trigger_orders_typed_data(
+                config.sender, int(request["recv_time"])
+            )
+            response = synthetic_observer.observe(request, typed_data)
             trigger_hash, trigger_observed_ms = _trigger_zero(
                 response, config,
                 max_response_bytes=synthetic_observer.max_response_bytes,
@@ -700,9 +736,17 @@ def run_fixture_preflight(
         raise NadoPreflightError("durable trigger evidence is invalid")
     if trigger_observed_ms <= round_a_observed_ms:
         raise NadoPreflightError("durable temporal evidence is invalid")
+    if (
+        round_a_observed_ms > config.now_ms
+        or trigger_observed_ms > config.now_ms
+        or config.now_ms - round_a_observed_ms > MAX_FRESHNESS_MS
+    ):
+        raise NadoPreflightError("durable temporal evidence is not fresh")
     round_b = _round_b(public_reader, config)
     if round_b.first_observed_ms <= trigger_observed_ms:
         raise NadoPreflightError("public evidence temporal barrier mismatch")
+    if round_b.last_observed_ms - round_a_observed_ms > MAX_FRESHNESS_MS:
+        raise NadoPreflightError("public evidence temporal barrier is stale")
     if round_b.fingerprint != round_a_hash:
         raise NadoPreflightError("public rounds disagree")
     store.finalize(config.invocation_id, round_b.fingerprint)
