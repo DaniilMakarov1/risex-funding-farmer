@@ -19,8 +19,8 @@ from yarl import URL
 WALLET = "0x20f9153e2eeba0ff7880fb5a23e976e8b2af56ee"
 OTHER_WALLET = "0x1111111111111111111111111111111111111111"
 USDC = "0x2222222222222222222222222222222222222222"
-AUTH = "0x3333333333333333333333333333333333333333"
-VERIFIER = "0x4444444444444444444444444444444444444444"
+AUTH = "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+WRONG_VERIFIER = "0x4444444444444444444444444444444444444444"
 ORIGIN = "https://api.testnet.rise.trade"
 DEPOSIT = "/v1/account/deposit"
 SENSITIVE = "DO_NOT_USE_VALUE_7af81c9d"
@@ -39,9 +39,10 @@ def config(chain: str = "11155931", name: str = "Rise Testnet") -> dict[str, Any
             "addresses": {"usdc": USDC, "auth": AUTH}}
 
 
-def domain(chain: str = "11155931", name: str = "RISEx") -> dict[str, Any]:
+def domain(chain: str = "11155931", name: str = "RISEx",
+           verifier: str = AUTH) -> dict[str, Any]:
     return {"name": name, "version": "1", "chain_id": chain,
-            "verifying_contract": VERIFIER}
+            "verifying_contract": verifier}
 
 
 class SensitiveError(RuntimeError):
@@ -65,6 +66,9 @@ class Scenario:
     get_error: BaseException | None = None
     get_url: str | None = None
     wrap_balance: bool = False
+    balance_request_id: str | None = None
+    constructor_error: BaseException | None = None
+    close_error: BaseException | None = None
     calls: list[tuple[str, URL, dict[str, Any]]] = field(default_factory=list)
     session_kwargs: list[dict[str, Any]] = field(default_factory=list)
     closed: int = 0
@@ -125,6 +129,8 @@ class Session:
 
     async def close(self) -> None:
         self.scenario.closed += 1
+        if self.scenario.close_error is not None:
+            raise self.scenario.close_error
 
     def request(self, method: str, url: str | URL, **kwargs: Any) -> Request:
         method, requested = method.upper(), URL(url)
@@ -142,6 +148,8 @@ class Session:
                   "/v1/auth/eip712-domain": self.scenario.domain_body}
         if requested.path == "/v1/account/balance":
             body = {"data": {"balance": self.scenario.balance()}}
+            if self.scenario.balance_request_id is not None:
+                body["request_id"] = self.scenario.balance_request_id
             if not self.scenario.wrap_balance:
                 body = body["data"]
         else:
@@ -172,7 +180,10 @@ def transport(monkeypatch: pytest.MonkeyPatch, module):
         if not scenario.session_kwargs:
             assert not scenario.calls and scenario.closed == 0
             continue
-        assert scenario.closed == 1
+        if scenario.constructor_error is None:
+            assert scenario.closed == 1
+        else:
+            assert scenario.closed == 0 and not scenario.calls
         kwargs = scenario.session_kwargs[0]
         assert kwargs.get("trust_env") is False
         assert 0 < kwargs["timeout"].total <= 30
@@ -185,6 +196,9 @@ def transport(monkeypatch: pytest.MonkeyPatch, module):
 
 def _session(args: tuple[Any, ...], kwargs: dict[str, Any], scenario: Scenario) -> Session:
     assert not args
+    if scenario.constructor_error is not None:
+        scenario.session_kwargs.append(kwargs)
+        raise scenario.constructor_error
     return Session(scenario, **kwargs)
 
 
@@ -251,20 +265,37 @@ async def test_preflight_and_postcondition_are_authoritative(module, transport):
     assert sum(call[1].path.endswith("eip712-domain") for call in ready.calls) == 2
 
 
-@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("shape", ["direct", "data", "gateway"])
 @pytest.mark.asyncio
-async def test_direct_or_single_data_envelope_is_accepted(wrapped, module, transport):
-    envelope = (lambda value: {"data": value}) if wrapped else (lambda value: value)
+async def test_official_direct_and_gateway_envelopes_are_accepted(shape, module, transport):
+    def envelope(value):
+        if shape == "direct":
+            return value
+        wrapped = {"data": value}
+        if shape == "gateway":
+            wrapped["request_id"] = "req-fixture-1"
+        return wrapped
+
     scenario = transport(Scenario(
         balances=["0", "7"],
         config_body=envelope(config()),
         domain_body=envelope(domain()),
         post_body=envelope({"success": True}),
-        wrap_balance=wrapped,
+        wrap_balance=shape != "direct",
+        balance_request_id="req-fixture-2" if shape == "gateway" else None,
     ))
     result = await module.bootstrap_risex_account(WALLET, intent="RISEX_TESTNET_DEPOSIT")
     assert (result.status, result.balance_raw) == (module.BootstrapStatus.READY, "7")
     assert len(posts(scenario)) == 1
+
+
+@pytest.mark.asyncio
+async def test_domain_verifier_matches_auth_case_insensitively(module, transport):
+    upper_auth = "0x" + AUTH[2:].upper()
+    scenario = transport(Scenario(balances=["1"], domain_body=domain(verifier=upper_auth)))
+    state = await module.check_risex_account(WALLET)
+    assert state.ready is True
+    assert not posts(scenario)
 
 
 @pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
@@ -289,9 +320,12 @@ async def test_production_final_url_is_never_submitted(module, transport):
 @pytest.mark.parametrize("change", [
     {"config_body": config(chain="1")}, {"config_body": config(name="Rise")},
     {"domain_body": domain(chain="1")}, {"domain_body": domain(name="RISK")},
+    {"domain_body": domain(verifier=WRONG_VERIFIER)},
     {"config_body": config(chain=11_155_931)},
     {"domain_body": domain(chain=11_155_931)},
     {"config_body": {"data": config(), "extra": "ambiguous"}},
+    {"config_body": {"data": config(), "request_id": ""}},
+    {"config_body": {"data": config(), "request_id": 42}},
     {"get_url": "https://api.rise.trade/v1/system/config"},
     {"get_url": "https://api.testnet.rise.trade/v1/wrong"},
 ])
@@ -370,6 +404,47 @@ async def test_public_failures_redact_body_repr_chain_and_output(module, transpo
     captured = capsys.readouterr()
     assert SENSITIVE not in captured.out + captured.err
     assert read.closed == 1
+
+
+@pytest.mark.asyncio
+async def test_session_constructor_failure_is_sanitized_before_dispatch(module, transport):
+    constructor = transport(Scenario(constructor_error=SensitiveError()))
+    with pytest.raises(module.BootstrapSafetyError) as constructor_error:
+        await module.bootstrap_risex_account(WALLET, intent="RISEX_TESTNET_DEPOSIT")
+    assert SENSITIVE not in "".join(traceback.format_exception(constructor_error.value))
+    assert not posts(constructor)
+
+
+@pytest.mark.asyncio
+async def test_session_close_failure_is_sanitized_before_dispatch(module, transport):
+    before_post = transport(Scenario(balances=["1"], close_error=SensitiveError()))
+    with pytest.raises(module.BootstrapSafetyError) as close_error:
+        await module.bootstrap_risex_account(WALLET, intent="RISEX_TESTNET_DEPOSIT")
+    assert SENSITIVE not in "".join(traceback.format_exception(close_error.value))
+    assert not posts(before_post)
+
+
+@pytest.mark.asyncio
+async def test_session_close_failure_is_ambiguous_after_dispatch(module, transport):
+    after_post = transport(Scenario(balances=["0", "7"], close_error=SensitiveError()))
+    result = await module.bootstrap_risex_account(WALLET, intent="RISEX_TESTNET_DEPOSIT")
+    assert result.status is module.BootstrapStatus.UNKNOWN_AMBIGUOUS
+    assert SENSITIVE not in repr(result) + str(result)
+    assert len(posts(after_post)) == 1
+
+
+@pytest.mark.asyncio
+async def test_session_lifecycle_cancellation_propagates(module, transport):
+    transport(Scenario(constructor_error=asyncio.CancelledError()))
+    with pytest.raises(asyncio.CancelledError):
+        await module.bootstrap_risex_account(WALLET, intent="RISEX_TESTNET_DEPOSIT")
+
+    after_post = transport(Scenario(
+        balances=["0", "7"], close_error=asyncio.CancelledError()
+    ))
+    with pytest.raises(asyncio.CancelledError):
+        await module.bootstrap_risex_account(WALLET, intent="RISEX_TESTNET_DEPOSIT")
+    assert len(posts(after_post)) == 1
 
 
 def test_normal_farmer_import_does_not_load_optional_module() -> None:

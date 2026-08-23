@@ -79,7 +79,14 @@ def _payload(value: object) -> dict[str, Any]:
     root = _mapping(value)
     if "data" not in root:
         return root
-    if set(root) != {"data"}:
+    keys = set(root)
+    if keys == {"data"}:
+        return _mapping(root["data"])
+    if (
+        keys != {"data", "request_id"}
+        or not isinstance(root.get("request_id"), str)
+        or not root["request_id"]
+    ):
         raise _safety_error()
     return _mapping(root["data"])
 
@@ -141,6 +148,7 @@ async def _identity(session: aiohttp.ClientSession) -> _Identity:
         or domain.get("version") != "1"
         or domain.get("chain_id") != str(_CHAIN_ID)
         or not _valid_contract(domain.get("verifying_contract"))
+        or domain["verifying_contract"].lower() != auth.lower()
     ):
         raise _safety_error()
     assert isinstance(usdc, str)
@@ -173,7 +181,7 @@ async def check_risex_account(wallet: str) -> AccountState:
             identity = await _identity(session)
             return await _balance(session, expected_wallet, identity)
     except BootstrapSafetyError:
-        raise
+        raise _safety_error() from None
     except Exception:
         raise _safety_error() from None
 
@@ -184,67 +192,74 @@ async def bootstrap_risex_account(wallet: str, *, intent: str) -> BootstrapResul
     expected_wallet = _validate_wallet(wallet)
     if intent != _DEPOSIT_INTENT:
         raise _safety_error()
+    dispatched = False
+    try:
+        async with _session() as session:
+            try:
+                identity = await _identity(session)
+                preflight = await _balance(session, expected_wallet, identity)
+                if preflight.ready:
+                    return BootstrapResult(
+                        BootstrapStatus.ALREADY_READY,
+                        preflight.balance_raw,
+                        "authoritative balance already positive",
+                    )
+                identity = await _identity(session)
+                expected_wallet = _validate_wallet(expected_wallet)
+            except BootstrapSafetyError:
+                raise
+            except Exception:
+                raise _safety_error() from None
 
-    async with _session() as session:
-        try:
-            identity = await _identity(session)
-            preflight = await _balance(session, expected_wallet, identity)
-            if preflight.ready:
-                return BootstrapResult(
-                    BootstrapStatus.ALREADY_READY,
-                    preflight.balance_raw,
-                    "authoritative balance already positive",
+            try:
+                dispatched = True
+                status, body = await _request_json(
+                    session,
+                    "POST",
+                    _ACCOUNT_DEPOSIT,
+                    json={"account": expected_wallet, "amount": _DEPOSIT_AMOUNT},
                 )
-            identity = await _identity(session)
-            expected_wallet = _validate_wallet(expected_wallet)
-        except BootstrapSafetyError:
-            raise
-        except Exception:
-            raise _safety_error() from None
-
-        try:
-            status, body = await _request_json(
-                session,
-                "POST",
-                _ACCOUNT_DEPOSIT,
-                json={"account": expected_wallet, "amount": _DEPOSIT_AMOUNT},
-            )
-            submitted = _payload(body).get("success") is True
-            if 400 <= status < 500:
-                return BootstrapResult(
-                    BootstrapStatus.REJECTED, message="testnet deposit rejected"
-                )
-            if not 200 <= status < 300:
+                submitted = _payload(body).get("success") is True
+                if 400 <= status < 500:
+                    return BootstrapResult(
+                        BootstrapStatus.REJECTED, message="testnet deposit rejected"
+                    )
+                if not 200 <= status < 300 or not submitted:
+                    return BootstrapResult(
+                        BootstrapStatus.UNKNOWN_AMBIGUOUS,
+                        message="testnet deposit result is ambiguous",
+                    )
+            except Exception:
                 return BootstrapResult(
                     BootstrapStatus.UNKNOWN_AMBIGUOUS,
                     message="testnet deposit result is ambiguous",
                 )
-            if not submitted:
+
+            try:
+                postcondition = await _balance(session, expected_wallet, identity)
+            except Exception:
                 return BootstrapResult(
                     BootstrapStatus.UNKNOWN_AMBIGUOUS,
-                    message="testnet deposit result is ambiguous",
+                    message="authoritative balance could not be verified",
                 )
-        except Exception:
+            if postcondition.ready:
+                return BootstrapResult(
+                    BootstrapStatus.READY,
+                    postcondition.balance_raw,
+                    "authoritative balance is positive",
+                )
             return BootstrapResult(
-                BootstrapStatus.UNKNOWN_AMBIGUOUS,
-                message="testnet deposit result is ambiguous",
-            )
-
-        try:
-            postcondition = await _balance(session, expected_wallet, identity)
-        except Exception:
-            return BootstrapResult(
-                BootstrapStatus.UNKNOWN_AMBIGUOUS,
-                message="authoritative balance could not be verified",
-            )
-        if postcondition.ready:
-            return BootstrapResult(
-                BootstrapStatus.READY,
+                BootstrapStatus.SUBMITTED_UNVERIFIED,
                 postcondition.balance_raw,
-                "authoritative balance is positive",
+                "deposit accepted but authoritative balance is not positive",
             )
-        return BootstrapResult(
-            BootstrapStatus.SUBMITTED_UNVERIFIED,
-            postcondition.balance_raw,
-            "deposit accepted but authoritative balance is not positive",
-        )
+    except BootstrapSafetyError:
+        if not dispatched:
+            raise _safety_error() from None
+    except Exception:
+        if not dispatched:
+            raise _safety_error() from None
+    return BootstrapResult(
+        BootstrapStatus.UNKNOWN_AMBIGUOUS,
+        message="testnet deposit result is ambiguous",
+    )
