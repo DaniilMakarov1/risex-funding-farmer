@@ -36,7 +36,7 @@ def product() -> Product:
 
 @pytest.fixture
 def catalog(product: Product) -> CatalogSnapshot:
-    return CatalogSnapshot((product,), True, 1_700_000_000_000)
+    return CatalogSnapshot((product,), True, 1_700_000_000_000, True, "engine")
 
 
 @pytest.fixture
@@ -77,7 +77,11 @@ def _entry_intent(vector: dict[str, object]) -> OrderIntent:
 
 
 def _evidence(account: AccountSnapshot, triggers: TriggerSnapshot, observed: int) -> EngineEvidence:
-    return EngineEvidence(account, triggers, (), (), observed)
+    return EngineEvidence(
+        replace(account, observed_at_ms=observed),
+        replace(triggers, observed_at_ms=observed),
+        (), (), observed,
+    )
 
 
 def _resting_entry(
@@ -197,6 +201,28 @@ def test_preflight_rejects_every_environment_identity_mismatch(
             )
 
 
+@pytest.mark.parametrize(
+    "catalog_change",
+    [
+        {"observed_at_ms": 1_700_000_000_002},
+        {"fresh": False},
+        {"authoritative_source": "archive"},
+    ],
+)
+def test_preflight_rejects_future_or_non_authoritative_catalog_observation(
+    catalog: CatalogSnapshot, flat_account: AccountSnapshot,
+    zero_triggers: TriggerSnapshot, catalog_change: dict[str, object],
+) -> None:
+    now = 1_700_000_000_001
+    with pytest.raises(NadoContractError):
+        validate_entry_preflight(
+            catalog=replace(catalog, **catalog_change),
+            account=flat_account, triggers=zero_triggers, product_id=2,
+            entry_price_x18=35_000 * X18,
+            worst_close_price_x18=36_000 * X18, now_ms=now,
+        )
+
+
 def test_pinned_synthetic_digest_signature_and_signed_validation(vector: dict[str, object]) -> None:
     order = SyntheticOrderVector.from_fixture(vector)
     digest, signature = sign_synthetic_order(order, str(vector["synthetic_key"]))
@@ -303,9 +329,9 @@ def test_complete_dynamic_catalog_and_all_keys_are_mandatory(
 ) -> None:
     second = replace(product, product_id=4, symbol="ETH-PERP")
     for catalog in (
-        CatalogSnapshot((), True, 1_700_000_000_000),
-        CatalogSnapshot((product,), False, 1_700_000_000_000),
-        CatalogSnapshot((product, second), True, 1_700_000_000_000),
+        CatalogSnapshot((), True, 1_700_000_000_000, True, "engine"),
+        CatalogSnapshot((product,), False, 1_700_000_000_000, True, "engine"),
+        CatalogSnapshot((product, second), True, 1_700_000_000_000, True, "engine"),
     ):
         with pytest.raises(NadoContractError):
             validate_entry_preflight(
@@ -390,6 +416,82 @@ def test_place_ambiguous_state_survives_restart_and_cannot_replay(
         reopened.prepare_then_fixture_dispatch(intent, lambda _: "replay")
 
 
+def test_halted_place_ambiguity_allows_only_one_exact_resting_safety_cancel(
+    tmp_path: Path, vector: dict[str, object], product: Product,
+    catalog: CatalogSnapshot, flat_account: AccountSnapshot,
+    zero_triggers: TriggerSnapshot,
+) -> None:
+    def timeout(_: OrderIntent) -> str:
+        raise TimeoutError("fixture timeout")
+
+    entry = _entry_intent(vector)
+    store = IntentStore(tmp_path / "proved-resting.sqlite3")
+    with pytest.raises(TimeoutError):
+        store.prepare_then_fixture_dispatch(entry, timeout)
+    observed = entry.recv_time + 1
+    resting_account = replace(
+        flat_account,
+        regular_orders_by_product={2: (entry.digest,)},
+        observed_at_ms=observed,
+        snapshot_id="ambiguous-entry-now-resting",
+    )
+    resting_triggers = replace(zero_triggers, observed_at_ms=observed)
+    resting = replace(
+        _evidence(resting_account, resting_triggers, observed),
+        orders=(
+            OrderEvidence(
+                entry.digest, 2, entry.nonce, entry.amount_x18, "OPEN"
+            ),
+        ),
+    )
+    assert store.reconcile(
+        entry.digest, catalog=replace(catalog, observed_at_ms=observed),
+        evidence=resting,
+    ) == Reconciliation.RESTING
+    assert LifecycleCore(store).status == HALTED
+    cancel = LifecycleCore(store).prepare_cancel_all(
+        catalog=replace(catalog, observed_at_ms=observed),
+        account=resting_account, triggers=resting_triggers,
+        sender=str(vector["sender"]), recv_time=entry.recv_time + 2,
+        salt=918, now_ms=observed,
+    )
+    assert cancel.kind == CANCEL_ALL
+    assert LifecycleCore(store).status == HALTED
+    with pytest.raises(NadoContractError):
+        LifecycleCore(store).prepare_cancel_all(
+            catalog=replace(catalog, observed_at_ms=observed),
+            account=resting_account, triggers=resting_triggers,
+            sender=str(vector["sender"]), recv_time=entry.recv_time + 3,
+            salt=919, now_ms=observed,
+        )
+
+    unresolved = IntentStore(tmp_path / "unproved-ambiguous.sqlite3")
+    with pytest.raises(TimeoutError):
+        unresolved.prepare_then_fixture_dispatch(entry, timeout)
+    with pytest.raises(NadoContractError):
+        LifecycleCore(unresolved).prepare_cancel_all(
+            catalog=replace(catalog, observed_at_ms=observed),
+            account=resting_account, triggers=resting_triggers,
+            sender=str(vector["sender"]), recv_time=entry.recv_time + 2,
+            salt=920, now_ms=observed,
+        )
+    with pytest.raises(NadoContractError):
+        LifecycleCore(store).prepare_close(
+            catalog=replace(catalog, observed_at_ms=entry.recv_time + 3),
+            product=product,
+            account=replace(
+                flat_account, cross_perp_amounts_x18={2: entry.amount_x18},
+                observed_at_ms=entry.recv_time + 3,
+                snapshot_id="halted-cannot-close",
+            ),
+            triggers=replace(
+                zero_triggers, observed_at_ms=entry.recv_time + 3
+            ),
+            worst_price_x18=36_000 * X18, recv_time=entry.recv_time + 4,
+            salt=921, now_ms=entry.recv_time + 3,
+        )
+
+
 def test_lifecycle_prepare_entry_persists_exact_signed_validation(
     vector: dict[str, object], tmp_path: Path, catalog: CatalogSnapshot,
     flat_account: AccountSnapshot, zero_triggers: TriggerSnapshot,
@@ -405,6 +507,72 @@ def test_lifecycle_prepare_entry_persists_exact_signed_validation(
         now_ms=1_700_000_000_001,
     )
     assert store.get(digest) == intent and intent.kind == ENTRY
+
+
+def test_prewrite_inner_snapshots_cannot_reconcile_or_complete(
+    tmp_path: Path, vector: dict[str, object], catalog: CatalogSnapshot,
+    flat_account: AccountSnapshot, zero_triggers: TriggerSnapshot,
+) -> None:
+    store = IntentStore(tmp_path / "intents.sqlite3")
+    intent = _entry_intent(vector)
+    store.prepare(intent)
+    evidence = replace(
+        EngineEvidence(
+            flat_account, zero_triggers, (), (), intent.recv_time + 1
+        ),
+        terminal_digest=intent.digest, terminal_status="CANCELLED",
+    )
+    assert flat_account.observed_at_ms < intent.recv_time
+    assert zero_triggers.observed_at_ms < intent.recv_time
+    assert store.reconcile(
+        intent.digest, catalog=catalog, evidence=evidence
+    ) == Reconciliation.CONTRADICTORY
+    assert not completion_barrier(
+        store=store, catalog=catalog, evidence=evidence,
+        now_ms=intent.recv_time + 1,
+    )
+
+
+def test_prewrite_inner_snapshots_cannot_authorize_close(
+    tmp_path: Path, vector: dict[str, object], product: Product,
+    catalog: CatalogSnapshot, flat_account: AccountSnapshot,
+    zero_triggers: TriggerSnapshot,
+) -> None:
+    store = IntentStore(tmp_path / "intents.sqlite3")
+    entry, _, _, _ = _filled_entry(
+        store, vector, catalog, flat_account, zero_triggers, submission_idx=919
+    )
+    now = entry.recv_time + 1
+    prewrite_account = replace(
+        flat_account,
+        cross_perp_amounts_x18={2: entry.amount_x18},
+        observed_at_ms=entry.recv_time - 90_000,
+        snapshot_id="prewrite-position",
+    )
+    prewrite_triggers = replace(
+        zero_triggers, observed_at_ms=entry.recv_time - 90_000,
+        snapshot_id="prewrite-triggers",
+    )
+    with pytest.raises(NadoContractError):
+        LifecycleCore(store).prepare_close(
+            catalog=replace(catalog, observed_at_ms=now), product=product,
+            account=prewrite_account, triggers=prewrite_triggers,
+            worst_price_x18=36_000 * X18, recv_time=now + 1,
+            salt=919, now_ms=now,
+        )
+    assert store.count_kind(CLOSE) == 0
+    assert LifecycleCore(store).status == HALTED
+
+
+def test_public_store_has_no_unchecked_lifecycle_transition_methods(
+    tmp_path: Path,
+) -> None:
+    store = IntentStore(tmp_path / "intents.sqlite3")
+    for name in (
+        "mark_complete", "mark_reconciled", "mark_rejected", "mark_ambiguous"
+    ):
+        assert not hasattr(store, name)
+    assert LifecycleCore(store).status != COMPLETE
 
 
 def test_entry_rejects_signed_owner_a_with_owner_b_preflight(
@@ -424,7 +592,7 @@ def test_entry_rejects_signed_owner_a_with_owner_b_preflight(
         )
 
 
-def test_entry_reconciliation_resting_partial_full_reject_and_duplicate_ambiguity(
+def test_entry_reconciliation_resting_and_full_fill_are_exact(
     tmp_path: Path, vector: dict[str, object], catalog: CatalogSnapshot,
     flat_account: AccountSnapshot,
     zero_triggers: TriggerSnapshot,
@@ -432,17 +600,27 @@ def test_entry_reconciliation_resting_partial_full_reject_and_duplicate_ambiguit
     store = IntentStore(tmp_path / "intents.sqlite3")
     intent = _entry_intent(vector)
     store.prepare(intent)
-    base = _evidence(flat_account, zero_triggers, 1_700_000_000_001)
+    observed = intent.recv_time + 1
+    base = _evidence(
+        replace(
+            flat_account, regular_orders_by_product={2: (intent.digest,)}
+        ),
+        zero_triggers, observed,
+    )
     open_order = OrderEvidence(intent.digest, 2, intent.nonce, 10**16, "OPEN")
     assert store.reconcile(intent.digest, catalog=catalog, evidence=replace(base, orders=(open_order,))) == Reconciliation.RESTING
-    partial = FillEvidence(intent.digest, 2, 4 * 10**15, 1)
-    account = replace(flat_account, cross_perp_amounts_x18={2: 4 * 10**15})
-    assert store.reconcile(intent.digest, catalog=catalog, evidence=replace(base, account=account, fills=(partial,))) == Reconciliation.PARTIAL
+
+    full_store = IntentStore(tmp_path / "full.sqlite3")
+    full_store.prepare(intent)
     full = FillEvidence(intent.digest, 2, 10**16, 2)
-    account = replace(flat_account, cross_perp_amounts_x18={2: 10**16})
-    assert store.reconcile(intent.digest, catalog=catalog, evidence=replace(base, account=account, fills=(full,))) == Reconciliation.FILLED
-    assert store.reconcile(intent.digest, catalog=catalog, evidence=replace(base, exact_rejection_digest=intent.digest)) == Reconciliation.REJECTED
-    assert store.reconcile(intent.digest, catalog=catalog, evidence=replace(base, duplicate_digest=True)) == Reconciliation.AMBIGUOUS
+    full_evidence = _evidence(
+        replace(flat_account, cross_perp_amounts_x18={2: 10**16}),
+        zero_triggers, observed,
+    )
+    assert full_store.reconcile(
+        intent.digest, catalog=catalog,
+        evidence=replace(full_evidence, fills=(full,)),
+    ) == Reconciliation.FILLED
 
 
 def test_repeated_fill_identity_with_contradictory_payload_is_rejected(
@@ -474,6 +652,138 @@ def test_repeated_fill_identity_with_contradictory_payload_is_rejected(
         intent.digest, catalog=catalog, evidence=contradictory
     ) == Reconciliation.CONTRADICTORY
     assert store.state(intent.digest) == "PARTIAL"
+
+
+def test_unknown_foreign_fill_cannot_reconcile_or_allow_write(
+    tmp_path: Path, vector: dict[str, object], product: Product,
+    flat_account: AccountSnapshot, zero_triggers: TriggerSnapshot,
+) -> None:
+    second = replace(product, product_id=4, symbol="ETH-PERP")
+    intent = _entry_intent(vector)
+    catalog = CatalogSnapshot(
+        (product, second), True, intent.recv_time + 1, True, "engine"
+    )
+    store = IntentStore(tmp_path / "intents.sqlite3")
+    store.prepare(intent)
+    account = replace(
+        flat_account,
+        regular_orders_by_product={2: (), 4: ()},
+        cross_perp_amounts_x18={2: intent.amount_x18, 4: 0},
+        observed_at_ms=intent.recv_time + 1,
+        snapshot_id="two-product-filled",
+    )
+    triggers = replace(zero_triggers, observed_at_ms=intent.recv_time + 1)
+    evidence = replace(
+        _evidence(account, triggers, intent.recv_time + 1),
+        fills=(
+            FillEvidence(intent.digest, 2, intent.amount_x18, 920),
+            FillEvidence("0x" + "44" * 32, 4, 10**15, 921),
+        ),
+    )
+    assert store.reconcile(
+        intent.digest, catalog=catalog, evidence=evidence
+    ) == Reconciliation.CONTRADICTORY
+    assert LifecycleCore(store).status == HALTED
+    assert not store.write_allowed(
+        intent.digest, catalog=catalog, now_ms=intent.recv_time + 1,
+        evidence=evidence,
+    )
+
+
+def test_foreign_open_order_disagreeing_with_zero_account_map_halts(
+    tmp_path: Path, vector: dict[str, object], catalog: CatalogSnapshot,
+    flat_account: AccountSnapshot, zero_triggers: TriggerSnapshot,
+) -> None:
+    store = IntentStore(tmp_path / "intents.sqlite3")
+    entry, entry_fill, _, _ = _filled_entry(
+        store, vector, catalog, flat_account, zero_triggers, submission_idx=924
+    )
+    observed = entry.recv_time + 2
+    contradictory = replace(
+        _evidence(
+            replace(flat_account, observed_at_ms=observed),
+            replace(zero_triggers, observed_at_ms=observed), observed,
+        ),
+        orders=(
+            OrderEvidence(
+                "0x" + "55" * 32, 2, entry.nonce, entry.amount_x18, "OPEN"
+            ),
+        ),
+        fills=(entry_fill,),
+    )
+    assert store.reconcile(
+        entry.digest, catalog=replace(catalog, observed_at_ms=observed),
+        evidence=contradictory,
+    ) == Reconciliation.CONTRADICTORY
+    assert LifecycleCore(store).status == HALTED
+    assert not store.write_allowed(
+        entry.digest, catalog=replace(catalog, observed_at_ms=observed),
+        now_ms=observed, evidence=contradictory,
+    )
+
+
+def test_open_entry_requires_exact_signed_unfilled_arithmetic(
+    tmp_path: Path, vector: dict[str, object], catalog: CatalogSnapshot,
+    flat_account: AccountSnapshot, zero_triggers: TriggerSnapshot,
+) -> None:
+    store = IntentStore(tmp_path / "intents.sqlite3")
+    intent = _entry_intent(vector)
+    store.prepare(intent)
+    fill_amount = 4 * 10**15
+    observed = intent.recv_time + 1
+    evidence = replace(
+        _evidence(
+            replace(
+                flat_account, cross_perp_amounts_x18={2: fill_amount},
+                regular_orders_by_product={2: (intent.digest,)},
+                observed_at_ms=observed,
+            ),
+            replace(zero_triggers, observed_at_ms=observed), observed,
+        ),
+        orders=(
+            OrderEvidence(intent.digest, 2, intent.nonce, 5 * 10**15, "OPEN"),
+        ),
+        fills=(FillEvidence(intent.digest, 2, fill_amount, 922),),
+    )
+    assert store.reconcile(
+        intent.digest, catalog=replace(catalog, observed_at_ms=observed),
+        evidence=evidence,
+    ) == Reconciliation.CONTRADICTORY
+    assert LifecycleCore(store).status == HALTED
+
+
+def test_ioc_reduce_only_close_can_never_reconcile_as_resting(
+    tmp_path: Path, vector: dict[str, object], product: Product,
+    catalog: CatalogSnapshot, flat_account: AccountSnapshot,
+    zero_triggers: TriggerSnapshot,
+) -> None:
+    store = IntentStore(tmp_path / "intents.sqlite3")
+    entry, _, account, triggers = _filled_entry(
+        store, vector, catalog, flat_account, zero_triggers, submission_idx=923
+    )
+    close = LifecycleCore(store).prepare_close(
+        catalog=replace(catalog, observed_at_ms=entry.recv_time + 1),
+        product=product, account=account, triggers=triggers,
+        worst_price_x18=36_000 * X18, recv_time=entry.recv_time + 2,
+        salt=49, now_ms=entry.recv_time + 1,
+    )
+    observed = entry.recv_time + 3
+    evidence = replace(
+        _evidence(
+            replace(account, observed_at_ms=observed, snapshot_id="resting-close"),
+            replace(zero_triggers, observed_at_ms=observed), observed,
+        ),
+        orders=(
+            OrderEvidence(
+                close.digest, 2, close.nonce, close.amount_x18, "OPEN"
+            ),
+        ),
+    )
+    assert store.reconcile(
+        close.digest, catalog=replace(catalog, observed_at_ms=observed),
+        evidence=evidence,
+    ) == Reconciliation.CONTRADICTORY
+    assert LifecycleCore(store).status == HALTED
 
 
 @pytest.mark.parametrize("terminal", ["CANCELLED", "EXPIRED", "REJECTED"])
@@ -511,8 +821,9 @@ def test_cancelled_or_expired_unmatched_entry_is_reconciled_terminal_no_fill(
             intent.digest, catalog=catalog, evidence=evidence
         ) == Reconciliation(terminal)
         assert store.state(intent.digest) == "RECONCILED"
+        final_catalog = replace(catalog, observed_at_ms=now)
         assert completion_barrier(
-            store=store, catalog=catalog, evidence=evidence, now_ms=now
+            store=store, catalog=final_catalog, evidence=evidence, now_ms=now
         )
 
 
@@ -694,22 +1005,35 @@ def test_cancel_all_is_durable_empty_products_ambiguous_and_not_replayed(
         store, vector, catalog, flat_account, zero_triggers
     )
     recv = entry.recv_time + 2
+    write_catalog = replace(catalog, observed_at_ms=entry.recv_time + 1)
     with pytest.raises(NadoContractError):
         LifecycleCore(store).prepare_cancel_all(
-            catalog=catalog,
+            catalog=write_catalog,
             account=replace(account, regular_orders_by_product={2: ("0xother",)}),
             triggers=triggers, sender=str(vector["sender"]), recv_time=recv,
             salt=42, now_ms=entry.recv_time + 1,
         )
     assert store.count_kind(CANCEL_ALL) == 0
     intent = LifecycleCore(store).prepare_cancel_all(
-        catalog=catalog, account=account, triggers=triggers,
+        catalog=write_catalog, account=account, triggers=triggers,
         sender=str(vector["sender"]), recv_time=recv, salt=43,
         now_ms=entry.recv_time + 1,
     )
     assert intent.kind == CANCEL_ALL
     assert json.loads(intent.payload)["cancel_product_orders"]["tx"]["productIds"] == []
-    store.mark_ambiguous(intent.digest)
+    ambiguous_time = intent.recv_time + 1
+    assert store.reconcile(
+        intent.digest,
+        catalog=replace(catalog, observed_at_ms=ambiguous_time),
+        evidence=replace(
+            _evidence(account, triggers, ambiguous_time),
+            orders=(
+                OrderEvidence(
+                    entry.digest, 2, entry.nonce, entry.amount_x18, "OPEN"
+                ),
+            ),
+        ),
+    ) == Reconciliation.AMBIGUOUS
     with pytest.raises(NadoContractError):
         store.prepare(intent)
 
@@ -723,14 +1047,18 @@ def test_cancel_ambiguity_reconciles_only_after_recv_time_and_zero_orders(
         store, vector, catalog, flat_account, zero_triggers
     )
     recv = entry.recv_time + 2
+    write_catalog = replace(catalog, observed_at_ms=entry.recv_time + 1)
     intent = LifecycleCore(store).prepare_cancel_all(
-        catalog=catalog, account=account, triggers=triggers,
+        catalog=write_catalog, account=account, triggers=triggers,
         sender=str(vector["sender"]), recv_time=recv, salt=44,
         now_ms=entry.recv_time + 1,
     )
-    before = _evidence(flat_account, zero_triggers, recv)
-    assert store.reconcile(intent.digest, catalog=catalog, evidence=before) == Reconciliation.AMBIGUOUS
-    assert store.reconcile(intent.digest, catalog=catalog, evidence=replace(before, observed_at_ms=recv + 1)) == Reconciliation.CANCELLED
+    after = _evidence(flat_account, zero_triggers, recv + 1)
+    assert store.reconcile(
+        intent.digest,
+        catalog=replace(catalog, observed_at_ms=recv + 1),
+        evidence=after,
+    ) == Reconciliation.CANCELLED
 
 
 def test_reconciled_cancel_cannot_bypass_partial_entry_manual_gate(
@@ -756,38 +1084,21 @@ def test_reconciled_cancel_cannot_bypass_partial_entry_manual_gate(
         entry.digest, catalog=catalog,
         evidence=replace(
             _evidence(partial_account, partial_triggers, observed),
-            orders=(OrderEvidence(entry.digest, 2, entry.nonce, 6 * 10**15, "OPEN"),),
             fills=(partial_fill,),
         ),
-    ) == Reconciliation.PARTIAL
+    ) == Reconciliation.CONTRADICTORY
     assert LifecycleCore(store).status == HALTED
-    cancel = LifecycleCore(store).prepare_cancel_all(
-        catalog=catalog, account=partial_account, triggers=partial_triggers,
-        sender=str(vector["sender"]), recv_time=entry.recv_time + 2,
-        salt=45, now_ms=observed,
-    )
-    terminal_time = entry.recv_time + 3
-    cancelled = _evidence(
-        replace(
-            partial_account, regular_orders_by_product={2: ()},
-            observed_at_ms=terminal_time, snapshot_id="cancelled-partial-entry",
-        ),
-        replace(zero_triggers, observed_at_ms=terminal_time), terminal_time,
-    )
-    assert store.reconcile(
-        cancel.digest, catalog=catalog, evidence=cancelled
-    ) == Reconciliation.CANCELLED
-    assert store.state(entry.digest) == "PARTIAL"
     with pytest.raises(NadoContractError):
-        LifecycleCore(store).prepare_close(
-            catalog=catalog, product=product, account=cancelled.account,
-            triggers=cancelled.triggers, worst_price_x18=36_000 * X18,
-            recv_time=entry.recv_time + 4, salt=46, now_ms=terminal_time,
+        LifecycleCore(store).prepare_cancel_all(
+            catalog=replace(catalog, observed_at_ms=observed),
+            account=partial_account, triggers=partial_triggers,
+            sender=str(vector["sender"]), recv_time=entry.recv_time + 2,
+            salt=45, now_ms=observed,
         )
-    assert store.count_kind(CLOSE) == 0
+    assert store.count_kind(CANCEL_ALL) == 0
 
 
-def test_partial_residual_close_ioc_reduce_only_clamp_and_new_identity(
+def test_partial_resting_entry_cancel_terminal_close_reaches_exact_flat(
     tmp_path: Path, vector: dict[str, object], product: Product,
     catalog: CatalogSnapshot, flat_account: AccountSnapshot,
     zero_triggers: TriggerSnapshot,
@@ -795,21 +1106,88 @@ def test_partial_residual_close_ioc_reduce_only_clamp_and_new_identity(
     store = IntentStore(tmp_path / "intents.sqlite3")
     entry = _entry_intent(vector)
     store.prepare(entry)
-    store.mark_reconciled(entry.digest)
-    recv = entry.recv_time + 2
-    account = replace(
-        flat_account, cross_perp_amounts_x18={2: 4 * 10**15},
-        observed_at_ms=entry.recv_time + 1, snapshot_id="engine-close-1",
+    partial_amount = 4 * 10**15
+    entry_fill = FillEvidence(entry.digest, 2, partial_amount, 33)
+    partial_time = entry.recv_time + 1
+    partial_account = replace(
+        flat_account,
+        cross_perp_amounts_x18={2: partial_amount},
+        regular_orders_by_product={2: (entry.digest,)},
+        observed_at_ms=partial_time, snapshot_id="partial-entry-running",
     )
+    partial_triggers = replace(zero_triggers, observed_at_ms=partial_time)
+    partial_evidence = replace(
+        _evidence(partial_account, partial_triggers, partial_time),
+        orders=(
+            OrderEvidence(
+                entry.digest, 2, entry.nonce,
+                entry.amount_x18 - partial_amount, "OPEN",
+            ),
+        ),
+        fills=(entry_fill,),
+    )
+    assert store.reconcile(
+        entry.digest, catalog=replace(catalog, observed_at_ms=partial_time),
+        evidence=partial_evidence,
+    ) == Reconciliation.PARTIAL
+    assert LifecycleCore(store).status == RUNNING
+
+    cancel = LifecycleCore(store).prepare_cancel_all(
+        catalog=replace(catalog, observed_at_ms=partial_time),
+        account=partial_account, triggers=partial_triggers,
+        sender=str(vector["sender"]), recv_time=entry.recv_time + 2,
+        salt=47, now_ms=partial_time,
+    )
+    terminal_time = entry.recv_time + 3
+    terminal_account = replace(
+        partial_account, regular_orders_by_product={2: ()},
+        observed_at_ms=terminal_time, snapshot_id="partial-entry-terminal",
+    )
+    terminal_triggers = replace(zero_triggers, observed_at_ms=terminal_time)
+    terminal_catalog = replace(catalog, observed_at_ms=terminal_time)
+    cancel_evidence = replace(
+        _evidence(terminal_account, terminal_triggers, terminal_time),
+        fills=(entry_fill,), exact_cancel_digest=cancel.digest,
+    )
+    assert store.reconcile(
+        cancel.digest, catalog=terminal_catalog, evidence=cancel_evidence
+    ) == Reconciliation.CANCELLED
+    entry_terminal = replace(
+        cancel_evidence, terminal_digest=entry.digest,
+        terminal_status="CANCELLED",
+    )
+    assert store.reconcile(
+        entry.digest, catalog=terminal_catalog, evidence=entry_terminal
+    ) == Reconciliation.CANCELLED
+    assert LifecycleCore(store).status == RUNNING
+
     close = LifecycleCore(store).prepare_close(
-        catalog=catalog, product=product, account=account,
-        triggers=replace(zero_triggers, observed_at_ms=entry.recv_time + 1),
-        worst_price_x18=36_000 * X18, recv_time=recv, salt=100,
-        now_ms=entry.recv_time + 1,
+        catalog=terminal_catalog, product=product, account=terminal_account,
+        triggers=terminal_triggers, worst_price_x18=36_000 * X18,
+        recv_time=entry.recv_time + 4, salt=48, now_ms=terminal_time,
     )
-    assert (close.kind, close.amount_x18, close.appendix) == (CLOSE, -10**16, IOC_REDUCE_ONLY_APPENDIX)
-    assert close.clamp_expected and close.notional_x18 == 360 * X18
-    assert store.get(close.digest).snapshot_id == "engine-close-1"
+    assert (close.amount_x18, close.appendix, close.clamp_expected) == (
+        -10**16, IOC_REDUCE_ONLY_APPENDIX, True
+    )
+    final_time = entry.recv_time + 5
+    close_fill = FillEvidence(close.digest, 2, -partial_amount, 34)
+    final_catalog = replace(catalog, observed_at_ms=final_time)
+    final = replace(
+        _evidence(
+            replace(
+                flat_account, observed_at_ms=final_time,
+                snapshot_id="partial-entry-exact-flat",
+            ),
+            replace(zero_triggers, observed_at_ms=final_time), final_time,
+        ),
+        fills=(entry_fill, close_fill),
+    )
+    assert store.reconcile(
+        close.digest, catalog=final_catalog, evidence=final
+    ) == Reconciliation.FILLED
+    assert completion_barrier(
+        store=store, catalog=final_catalog, evidence=final, now_ms=final_time
+    )
 
 
 def test_close_fill_reconciles_from_recorded_starting_position_to_exact_zero(
@@ -823,7 +1201,8 @@ def test_close_fill_reconciles_from_recorded_starting_position_to_exact_zero(
     )
     recv = entry.recv_time + 2
     close = LifecycleCore(store).prepare_close(
-        catalog=catalog, product=product, account=account, triggers=triggers,
+        catalog=replace(catalog, observed_at_ms=entry.recv_time + 1),
+        product=product, account=account, triggers=triggers,
         worst_price_x18=36_000 * X18, recv_time=recv, salt=150,
         now_ms=entry.recv_time + 1,
     )
@@ -837,46 +1216,6 @@ def test_close_fill_reconciles_from_recorded_starting_position_to_exact_zero(
         close.digest, catalog=catalog,
         evidence=replace(evidence, fills=(entry_fill, fill)),
     ) == Reconciliation.FILLED
-
-
-def test_partial_entry_terminal_cancel_is_durable_manual_gate(
-    tmp_path: Path, vector: dict[str, object], product: Product,
-    catalog: CatalogSnapshot, flat_account: AccountSnapshot,
-    zero_triggers: TriggerSnapshot,
-) -> None:
-    store = IntentStore(tmp_path / "intents.sqlite3")
-    entry = _entry_intent(vector)
-    store.prepare(entry)
-    partial_amount = 4 * 10**15
-    partial_fill = FillEvidence(entry.digest, 2, partial_amount, 4)
-    partial_account = replace(
-        flat_account, cross_perp_amounts_x18={2: partial_amount},
-        observed_at_ms=entry.recv_time + 1, snapshot_id="entry-partial-terminal",
-    )
-    terminal = replace(
-        _evidence(
-            partial_account,
-            replace(zero_triggers, observed_at_ms=entry.recv_time + 1),
-            entry.recv_time + 1,
-        ),
-        fills=(partial_fill,), terminal_digest=entry.digest,
-        terminal_status="CANCELLED",
-    )
-    assert store.reconcile(
-        entry.digest, catalog=catalog, evidence=terminal
-    ) == Reconciliation.CANCELLED
-    assert store.state(entry.digest) == "RECONCILED"
-    assert LifecycleCore(store).status == HALTED
-    with pytest.raises(NadoContractError):
-        LifecycleCore(store).prepare_close(
-            catalog=catalog, product=product, account=partial_account,
-            triggers=terminal.triggers, worst_price_x18=36_000 * X18,
-            recv_time=entry.recv_time + 2, salt=600,
-            now_ms=entry.recv_time + 1,
-        )
-    assert store.count_kind(CLOSE) == 0
-    store.close()
-    assert LifecycleCore(IntentStore(tmp_path / "intents.sqlite3")).status == HALTED
 
 
 @pytest.mark.parametrize("first_outcome", ["PARTIAL", "REJECTED"])
@@ -906,7 +1245,8 @@ def test_partial_or_rejected_close_is_durable_manual_gate(
     ) == Reconciliation.FILLED
     core = LifecycleCore(store)
     first = core.prepare_close(
-        catalog=catalog, product=product, account=position,
+        catalog=replace(catalog, observed_at_ms=entry.recv_time + 1),
+        product=product, account=position,
         triggers=replace(zero_triggers, observed_at_ms=entry.recv_time + 1),
         worst_price_x18=36_000 * X18, recv_time=entry.recv_time + 2,
         salt=610, now_ms=entry.recv_time + 1,
@@ -991,7 +1331,7 @@ def test_verified_complete_overrides_three_attempt_exhaustion(
     for attempt in range(3):
         observed = entry.recv_time + 1 + attempt * 2
         close = core.prepare_close(
-            catalog=catalog, product=product,
+            catalog=replace(catalog, observed_at_ms=observed), product=product,
             account=replace(
                 current, observed_at_ms=observed,
                 snapshot_id=f"close-attempt-{attempt}",
@@ -1003,6 +1343,8 @@ def test_verified_complete_overrides_three_attempt_exhaustion(
             worst_price_x18=36_000 * X18, recv_time=observed + 1,
             salt=700 + attempt, now_ms=observed,
         )
+        if attempt == 2:
+            assert core.status == RUNNING
         result_time = observed + 2
         if attempt < 2:
             terminal = replace(
@@ -1040,7 +1382,8 @@ def test_verified_complete_overrides_three_attempt_exhaustion(
                 close.digest, catalog=catalog, evidence=final
             ) == Reconciliation.FILLED
     assert completion_barrier(
-        store=store, catalog=catalog, evidence=final, now_ms=result_time
+        store=store, catalog=replace(catalog, observed_at_ms=result_time),
+        evidence=final, now_ms=result_time
     )
     store.close()
     assert LifecycleCore(IntentStore(tmp_path / "intents.sqlite3")).status == COMPLETE
@@ -1059,7 +1402,8 @@ def test_each_close_attempt_requires_genuinely_newer_unconsumed_snapshot(
     core = LifecycleCore(store)
     first_account = replace(first_account, snapshot_id="engine-attempt-1")
     first = core.prepare_close(
-        catalog=catalog, product=product, account=first_account,
+        catalog=replace(catalog, observed_at_ms=entry.recv_time + 1),
+        product=product, account=first_account,
         triggers=first_triggers, worst_price_x18=36_000 * X18,
         recv_time=entry.recv_time + 2, salt=200,
         now_ms=entry.recv_time + 1,
@@ -1083,7 +1427,8 @@ def test_each_close_attempt_requires_genuinely_newer_unconsumed_snapshot(
     )
     with pytest.raises(NadoContractError):
         core.prepare_close(
-            catalog=catalog, product=product, account=reused,
+            catalog=replace(catalog, observed_at_ms=terminal_time),
+            product=product, account=reused,
             triggers=replace(zero_triggers, observed_at_ms=terminal_time),
             worst_price_x18=36_000 * X18,
             recv_time=entry.recv_time + 4, salt=201,
@@ -1104,7 +1449,7 @@ def test_third_no_fill_close_terminal_durably_exhausts_attempts(
     for attempt in range(3):
         observed = entry.recv_time + 1 + attempt * 2
         close = core.prepare_close(
-            catalog=catalog, product=product,
+            catalog=replace(catalog, observed_at_ms=observed), product=product,
             account=replace(
                 current,
                 observed_at_ms=observed, snapshot_id=f"engine-{attempt}",
@@ -1116,6 +1461,8 @@ def test_third_no_fill_close_terminal_durably_exhausts_attempts(
             worst_price_x18=36_000 * X18, recv_time=observed + 1,
             salt=300 + attempt, now_ms=observed,
         )
+        if attempt == 2:
+            assert core.status == RUNNING
         result_time = observed + 2
         terminal = replace(
             _evidence(
@@ -1151,13 +1498,15 @@ def test_off_grid_or_over_cap_close_halts(
 ) -> None:
     path = tmp_path / "intents.sqlite3"
     store = IntentStore(path)
-    entry = _entry_intent(vector)
-    store.prepare(entry)
-    store.mark_reconciled(entry.digest)
+    entry, _, _, _ = _filled_entry(
+        store, vector, catalog, flat_account, zero_triggers,
+        submission_idx=950 + int(position > 10**16 + 1),
+    )
     core = LifecycleCore(store)
     with pytest.raises(NadoContractError):
         core.prepare_close(
-            catalog=catalog, product=product,
+            catalog=replace(catalog, observed_at_ms=entry.recv_time + 1),
+            product=product,
             account=replace(
                 flat_account, cross_perp_amounts_x18={2: position},
                 observed_at_ms=entry.recv_time + 1,
@@ -1179,10 +1528,18 @@ def test_exact_final_barrier_and_adversarial_blockers(
     store = IntentStore(tmp_path / "intents.sqlite3")
     intent = _entry_intent(vector)
     store.prepare(intent)
-    store.mark_reconciled(intent.digest)
     now = intent.recv_time + 1
     evidence = _evidence(flat_account, zero_triggers, now)
-    assert completion_barrier(store=store, catalog=catalog, evidence=evidence, now_ms=now)
+    evidence = replace(
+        evidence, terminal_digest=intent.digest, terminal_status="CANCELLED"
+    )
+    final_catalog = replace(catalog, observed_at_ms=now)
+    assert store.reconcile(
+        intent.digest, catalog=final_catalog, evidence=evidence
+    ) == Reconciliation.CANCELLED
+    assert completion_barrier(
+        store=store, catalog=final_catalog, evidence=evidence, now_ms=now
+    )
     for bad in (
         replace(flat_account, regular_orders_by_product={2: ("0xopen",)}),
         replace(flat_account, cross_perp_amounts_x18={2: 1}),
@@ -1192,16 +1549,17 @@ def test_exact_final_barrier_and_adversarial_blockers(
         replace(flat_account, cross_perp_amounts_x18={}),
     ):
         assert not completion_barrier(
-            store=store, catalog=catalog, evidence=replace(evidence, account=bad), now_ms=now,
+            store=store, catalog=final_catalog,
+            evidence=replace(evidence, account=bad), now_ms=now,
         )
     assert not completion_barrier(
-        store=store, catalog=catalog,
+        store=store, catalog=final_catalog,
         evidence=replace(evidence, triggers=replace(zero_triggers, active_digests=("0xtrigger",))),
         now_ms=now,
     )
     other_account, other_triggers = _other_identity(flat_account, zero_triggers)
     assert not completion_barrier(
-        store=store, catalog=catalog,
+        store=store, catalog=final_catalog,
         evidence=_evidence(other_account, other_triggers, now), now_ms=now,
     )
 
@@ -1258,14 +1616,12 @@ def test_pending_ambiguous_unexpired_or_unknown_fill_never_complete(
     store.prepare(intent)
     evidence = _evidence(flat_account, zero_triggers, intent.recv_time + 1)
     assert not completion_barrier(store=store, catalog=catalog, evidence=evidence, now_ms=intent.recv_time - 1)
-    store.mark_ambiguous(intent.digest)
+    assert store.reconcile(
+        intent.digest,
+        catalog=replace(catalog, observed_at_ms=intent.recv_time + 1),
+        evidence=evidence,
+    ) == Reconciliation.AMBIGUOUS
     assert not completion_barrier(store=store, catalog=catalog, evidence=evidence, now_ms=intent.recv_time + 1)
-    store.mark_reconciled(intent.digest)
-    assert not completion_barrier(
-        store=store, catalog=catalog,
-        evidence=replace(evidence, fills=(FillEvidence("0x" + "ff" * 32, 2, 1, 11),)),
-        now_ms=intent.recv_time + 1,
-    )
 
 
 def test_duplicate_fill_identity_cannot_fabricate_net_zero_completion(
@@ -1274,33 +1630,33 @@ def test_duplicate_fill_identity_cannot_fabricate_net_zero_completion(
     zero_triggers: TriggerSnapshot,
 ) -> None:
     store = IntentStore(tmp_path / "intents.sqlite3")
-    entry = _entry_intent(vector)
-    store.prepare(entry)
-    store.mark_reconciled(entry.digest)
+    entry, entry_fill, account, triggers = _filled_entry(
+        store, vector, catalog, flat_account, zero_triggers, submission_idx=901
+    )
     close = LifecycleCore(store).prepare_close(
-        catalog=catalog, product=product,
-        account=replace(
-            flat_account, cross_perp_amounts_x18={2: 10**16},
-            observed_at_ms=entry.recv_time + 1,
-            snapshot_id="duplicate-fill-close",
-        ),
-        triggers=replace(zero_triggers, observed_at_ms=entry.recv_time + 1),
+        catalog=replace(catalog, observed_at_ms=entry.recv_time + 1),
+        product=product, account=account, triggers=triggers,
         worst_price_x18=36_000 * X18, recv_time=entry.recv_time + 2,
         salt=800, now_ms=entry.recv_time + 1,
     )
-    store.mark_reconciled(close.digest)
-    entry_half = FillEvidence(entry.digest, 2, 5 * 10**15, submission_idx=901)
     close_fill = FillEvidence(close.digest, 2, -10**16, submission_idx=902)
     now = entry.recv_time + 3
-    fabricated = replace(
+    valid = replace(
         _evidence(
             replace(flat_account, observed_at_ms=now),
             replace(zero_triggers, observed_at_ms=now), now,
         ),
-        fills=(entry_half, entry_half, close_fill),
+        fills=(entry_fill, close_fill),
+    )
+    final_catalog = replace(catalog, observed_at_ms=now)
+    assert store.reconcile(
+        close.digest, catalog=final_catalog, evidence=valid
+    ) == Reconciliation.FILLED
+    fabricated = replace(
+        valid, fills=(entry_fill, entry_fill, close_fill, close_fill),
     )
     assert not completion_barrier(
-        store=store, catalog=catalog, evidence=fabricated, now_ms=now
+        store=store, catalog=final_catalog, evidence=fabricated, now_ms=now
     )
     store.close()
     assert LifecycleCore(IntentStore(tmp_path / "intents.sqlite3")).status == HALTED
