@@ -1,0 +1,1170 @@
+"""Isolated fixture-only Extended testnet lifecycle contract.
+
+This module deliberately contains no transport, signing, or credential access.
+It persists only auth-free hypothetical request identities and reconciles them
+from injected official-wire evidence.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import sqlite3
+from copy import deepcopy
+from dataclasses import dataclass, replace
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from types import MappingProxyType
+from typing import Any, Callable, Mapping, Sequence
+
+
+MAX_NOTIONAL_USD = Decimal("500")
+_MAX_AGE_MS = 30_000
+_MAX_ORDER_LIFETIME_MS = 60_000
+_ACTIVE_ORDER_STATUSES = frozenset({"NEW", "PARTIALLY_FILLED", "UNTRIGGERED"})
+
+SDK_PROVENANCE = MappingProxyType({
+    "repository": "https://github.com/x10xchange/python_sdk",
+    "commit": "2130cdb1cd6e7b1867db83bd3af036572d258739",
+    "tree": "30046661d08eb18187911cacc0925021ba00bf68",
+})
+
+TESTNET_CONTRACT = MappingProxyType({
+    "apiBaseUrl": "https://api.starknet.sepolia.extended.exchange/api/v1",
+    "apiBaseOrderManagementUrl": "https://api.starknet.sepolia.extended.exchange/api/v1",
+    "streamUrl": "wss://api.starknet.sepolia.extended.exchange/stream.extended.exchange/v1",
+    "streamRpcUrl": "wss://api.starknet.sepolia.extended.exchange/stream.extended.exchange/v2/rpc",
+    "signingDomain": "starknet.sepolia.extended.exchange",
+    "starknetDomain": MappingProxyType({
+        "name": "Perpetuals",
+        "version": "v0",
+        "chainId": "SN_SEPOLIA",
+        "revision": "1",
+    }),
+})
+
+
+class ContractViolation(ValueError):
+    pass
+
+
+class EvidenceViolation(ValueError):
+    pass
+
+
+class NonceViolation(ContractViolation):
+    pass
+
+
+class IntentConflict(ContractViolation):
+    pass
+
+
+class LifecycleHalted(RuntimeError):
+    pass
+
+
+def _decimal(value: Any, field: str) -> Decimal:
+    if isinstance(value, bool):
+        raise EvidenceViolation(f"INVALID_DECIMAL:{field}")
+    try:
+        result = Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise EvidenceViolation(f"INVALID_DECIMAL:{field}") from exc
+    if not result.is_finite():
+        raise EvidenceViolation(f"INVALID_DECIMAL:{field}")
+    return result
+
+
+def _strict(value: Any, required: set[str], optional: set[str], label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise EvidenceViolation(f"WIRE_SCHEMA:{label}")
+    keys = set(value)
+    if not required <= keys or not keys <= required | optional:
+        raise EvidenceViolation(f"WIRE_SCHEMA:{label}")
+    return value
+
+
+_SETTLEMENT_KEYS = {"signature", "starkKey", "collateralPosition"}
+_ORDER_VECTOR_KEYS = {
+    "externalId",
+    "settlementHash",
+    "nonce",
+    "market",
+    "side",
+    "type",
+    "qty",
+    "price",
+    "reduceOnly",
+    "postOnly",
+    "timeInForce",
+    "expiryEpochMillis",
+    "fee",
+    "selfTradeProtectionLevel",
+    "settlement",
+}
+_ORDER_KEYS = {
+    "id",
+    "accountId",
+    "externalId",
+    "market",
+    "type",
+    "side",
+    "status",
+    "statusReason",
+    "price",
+    "averagePrice",
+    "qty",
+    "filledQty",
+    "cancelledQty",
+    "reduceOnly",
+    "postOnly",
+    "payedFee",
+    "createdTime",
+    "updatedTime",
+    "expiryTime",
+    "timeInForce",
+}
+_FILL_KEYS = {
+    "id",
+    "accountId",
+    "market",
+    "orderId",
+    "side",
+    "price",
+    "qty",
+    "value",
+    "fee",
+    "isTaker",
+    "tradeType",
+    "createdTime",
+}
+_POSITION_KEYS = {
+    "id",
+    "accountId",
+    "market",
+    "status",
+    "side",
+    "leverage",
+    "size",
+    "value",
+    "openPrice",
+    "markPrice",
+    "liquidationPrice",
+    "unrealisedPnl",
+    "realisedPnl",
+    "tpPrice",
+    "slPrice",
+    "adl",
+    "createdAt",
+    "updatedAt",
+}
+
+
+def _validate_nonce(nonce: Any) -> int:
+    if isinstance(nonce, bool) or not isinstance(nonce, int) or not 1 <= nonce <= 2**31 - 1:
+        raise NonceViolation("NONCE_OUT_OF_RANGE")
+    return nonce
+
+
+def build_limit_ioc_order(vector: Mapping[str, Any], server_time_ms: int | None = None) -> dict[str, Any]:
+    raw = _strict(dict(vector), _ORDER_VECTOR_KEYS, set(), "order_vector")
+    nonce = _validate_nonce(raw["nonce"])
+    external_id = str(raw["externalId"])
+    if external_id != str(raw["settlementHash"]):
+        raise ContractViolation("EXTERNAL_ID_SETTLEMENT_HASH_MISMATCH")
+    if raw["type"] != "LIMIT" or raw["timeInForce"] != "IOC":
+        raise ContractViolation("LIMIT_IOC_REQUIRED")
+    if raw["postOnly"] is not False or not isinstance(raw["reduceOnly"], bool):
+        raise ContractViolation("LIMIT_IOC_FLAGS_INVALID")
+    if raw["price"] is None or _decimal(raw["price"], "price") <= 0:
+        raise ContractViolation("PRICE_BOUND_REQUIRED")
+    if _decimal(raw["qty"], "qty") <= 0 or _decimal(raw["fee"], "fee") < 0:
+        raise ContractViolation("ORDER_AMOUNT_INVALID")
+    expiry = raw["expiryEpochMillis"]
+    if isinstance(expiry, bool) or not isinstance(expiry, int):
+        raise ContractViolation("EXPIRY_INVALID")
+    if server_time_ms is not None and not 0 < expiry - server_time_ms <= _MAX_ORDER_LIFETIME_MS:
+        raise ContractViolation("SHORT_EXPIRY_REQUIRED")
+    settlement = _strict(raw["settlement"], _SETTLEMENT_KEYS, set(), "settlement")
+    signature = _strict(settlement["signature"], {"r", "s"}, set(), "signature")
+    if not all(isinstance(signature[key], str) and signature[key].startswith("0x") for key in ("r", "s")):
+        raise ContractViolation("SIGNATURE_WIRE_INVALID")
+    if not isinstance(settlement["starkKey"], str) or not settlement["starkKey"].startswith("0x"):
+        raise ContractViolation("STARK_KEY_WIRE_INVALID")
+    if raw["side"] not in {"BUY", "SELL"} or raw["selfTradeProtectionLevel"] != "ACCOUNT":
+        raise ContractViolation("ORDER_WIRE_INVALID")
+    return {
+        "id": external_id,
+        "market": raw["market"],
+        "type": "LIMIT",
+        "side": raw["side"],
+        "qty": str(raw["qty"]),
+        "price": str(raw["price"]),
+        "reduceOnly": raw["reduceOnly"],
+        "postOnly": False,
+        "timeInForce": "IOC",
+        "expiryEpochMillis": expiry,
+        "fee": str(raw["fee"]),
+        "nonce": nonce,
+        "selfTradeProtectionLevel": "ACCOUNT",
+        "settlement": deepcopy(settlement),
+    }
+
+
+def canonical_payload_digest(payload: Mapping[str, Any]) -> str:
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def build_cancel_by_external_id(external_id: str, api_key: str) -> dict[str, Any]:
+    return {
+        "method": "DELETE",
+        "path": "/user/order",
+        "query": {"externalId": external_id},
+        "headers": {"X-Api-Key": api_key},
+        "json": None,
+    }
+
+
+def build_mass_cancel(external_ids: Sequence[str], api_key: str) -> dict[str, Any]:
+    return {
+        "method": "POST",
+        "path": "/user/order/massCancel",
+        "query": {},
+        "headers": {"X-Api-Key": api_key},
+        "json": {"externalOrderIds": list(external_ids), "cancelAll": False},
+    }
+
+
+@dataclass(frozen=True)
+class OfficialEvidence:
+    now_ms: int
+    server_time_ms: int
+    account_observed_ms: int
+    book_event_ms: int
+    stream_event_ms: int
+    stream_received_ms: int
+    connected: bool
+    gap_free: bool
+    account_id: int
+    l2_key: str
+    l2_vault: int
+    market_name: str
+    market: dict[str, Any]
+    book: dict[str, Any]
+    balance: dict[str, Any]
+    fees: tuple[dict[str, Any], ...]
+    leverage: tuple[dict[str, Any], ...]
+    open_orders: tuple[dict[str, Any], ...]
+    positions: tuple[dict[str, Any], ...]
+    order_status: dict[str, Any] | None
+    order_history: tuple[dict[str, Any], ...]
+    fills: tuple[dict[str, Any], ...]
+    stream_orders: tuple[dict[str, Any], ...]
+    stream_positions: tuple[dict[str, Any], ...]
+    stream_trades: tuple[dict[str, Any], ...]
+    entry_vector: dict[str, Any]
+    close_vector: dict[str, Any]
+    position_template: dict[str, Any]
+
+    @property
+    def fresh(self) -> bool:
+        stamps = (
+            self.account_observed_ms,
+            self.book_event_ms,
+            self.stream_event_ms,
+            self.stream_received_ms,
+        )
+        return all(0 <= self.now_ms - stamp <= _MAX_AGE_MS for stamp in stamps)
+
+    def with_server_time(self, server_time: int, *, observed_at: int) -> "OfficialEvidence":
+        return replace(self, now_ms=observed_at, server_time_ms=server_time, account_observed_ms=observed_at)
+
+    def with_account_identity(self, *, account_id: int) -> "OfficialEvidence":
+        return replace(self, account_id=account_id)
+
+    def with_market_name(self, market_name: str) -> "OfficialEvidence":
+        return replace(self, market_name=market_name)
+
+    def with_open_orders(self, orders: Sequence[dict[str, Any]]) -> "OfficialEvidence":
+        copied = tuple(deepcopy(list(orders)))
+        return replace(self, open_orders=copied, stream_orders=copied)
+
+    def with_position(self, *, size: Decimal, value: Decimal) -> "OfficialEvidence":
+        position = deepcopy(self.position_template)
+        position["size"] = str(size)
+        position["value"] = str(value)
+        return replace(self, positions=(position,), stream_positions=(deepcopy(position),))
+
+
+def _validate_order_row(row: Any, label: str) -> dict[str, Any]:
+    return deepcopy(_strict(row, _ORDER_KEYS, set(), label))
+
+
+def _validate_fill_row(row: Any, label: str) -> dict[str, Any]:
+    return deepcopy(_strict(row, _FILL_KEYS, set(), label))
+
+
+def _validate_position_row(row: Any, label: str) -> dict[str, Any]:
+    return deepcopy(_strict(row, _POSITION_KEYS, set(), label))
+
+
+def _ids(rows: Sequence[Mapping[str, Any]], key: str) -> tuple[Any, ...]:
+    return tuple(sorted(row[key] for row in rows))
+
+
+def normalize_official_evidence(raw: Mapping[str, Any], *, now_ms: int) -> OfficialEvidence:
+    root_keys = {
+        "provenance",
+        "contract",
+        "identity",
+        "market",
+        "book",
+        "account",
+        "stream",
+        "entry",
+        "close",
+        "vectors",
+        "filledOrder",
+        "fill",
+        "filledCloseOrder",
+        "closeFill",
+        "position",
+    }
+    data = _strict(dict(raw), root_keys, set(), "root")
+    if data["provenance"] != SDK_PROVENANCE or data["contract"] != TESTNET_CONTRACT:
+        raise ContractViolation("PINNED_OFFICIAL_CONTRACT_MISMATCH")
+
+    identity = _strict(data["identity"], {"accountId", "accountIndex", "l2Key", "l2Vault", "apiKey"}, set(), "identity")
+    market = _strict(
+        data["market"],
+        {
+            "name",
+            "type",
+            "assetName",
+            "assetPrecision",
+            "collateralAssetName",
+            "collateralAssetPrecision",
+            "active",
+            "isRfq",
+            "isOffHours",
+            "tradingHours",
+            "marketStats",
+            "tradingConfig",
+            "l2Config",
+        },
+        set(),
+        "market",
+    )
+    _strict(
+        market["marketStats"],
+        {
+            "dailyVolume",
+            "dailyVolumeBase",
+            "dailyPriceChange",
+            "dailyLow",
+            "dailyHigh",
+            "lastPrice",
+            "askPrice",
+            "bidPrice",
+            "markPrice",
+            "indexPrice",
+            "fundingRate",
+            "nextFundingRate",
+            "openInterest",
+            "openInterestBase",
+        },
+        set(),
+        "marketStats",
+    )
+    config = _strict(
+        market["tradingConfig"],
+        {
+            "minOrderSize",
+            "minOrderSizeChange",
+            "minPriceChange",
+            "maxMarketOrderValue",
+            "maxLimitOrderValue",
+            "maxPositionValue",
+            "maxLeverage",
+            "maxNumOrders",
+            "limitPriceCap",
+            "limitPriceFloor",
+            "riskFactorConfig",
+        },
+        set(),
+        "tradingConfig",
+    )
+    for index, risk in enumerate(config["riskFactorConfig"]):
+        _strict(risk, {"upperBound", "riskFactor"}, set(), f"riskFactorConfig[{index}]")
+    _strict(
+        market["l2Config"],
+        {"type", "collateralId", "collateralResolution", "syntheticId", "syntheticResolution"},
+        set(),
+        "l2Config",
+    )
+    book = _strict(data["book"], {"market", "eventTime", "bids", "asks"}, set(), "book")
+    for side in ("bids", "asks"):
+        for index, level in enumerate(book[side]):
+            _strict(level, {"price", "qty"}, set(), f"book.{side}[{index}]")
+
+    account = _strict(
+        data["account"],
+        {"observedAt", "serverTime", "info", "balance", "fees", "leverage", "openOrders", "positions"},
+        {"orderStatus", "orderHistory", "fills"},
+        "account",
+    )
+    info = _strict(
+        account["info"],
+        {"id", "description", "accountIndex", "status", "l2Key", "l2Vault", "bridgeStarknetAddress"},
+        set(),
+        "account.info",
+    )
+    balance_keys = {
+        "collateralName",
+        "balance",
+        "equity",
+        "availableForTrade",
+        "availableForWithdrawal",
+        "unrealisedPnl",
+        "initialMargin",
+        "marginRatio",
+        "updatedTime",
+        "spotEquity",
+        "spotEquityForAvailableForTrade",
+        "collateralReservedForSpotOrders",
+    }
+    balance = deepcopy(_strict(account["balance"], balance_keys, set(), "balance"))
+    fees = tuple(
+        deepcopy(_strict(row, {"market", "makerFeeRate", "takerFeeRate", "builderFeeRate"}, set(), "fee"))
+        for row in account["fees"]
+    )
+    leverage = tuple(
+        deepcopy(_strict(row, {"market", "leverage"}, set(), "leverage")) for row in account["leverage"]
+    )
+    open_orders = tuple(_validate_order_row(row, "openOrder") for row in account["openOrders"])
+    positions = tuple(_validate_position_row(row, "position") for row in account["positions"])
+    order_status = (
+        _validate_order_row(account["orderStatus"], "orderStatus") if account.get("orderStatus") is not None else None
+    )
+    history = tuple(_validate_order_row(row, "orderHistory") for row in account.get("orderHistory", []))
+    fills = tuple(_validate_fill_row(row, "fill") for row in account.get("fills", []))
+
+    stream = _strict(
+        data["stream"],
+        {
+            "accountId",
+            "l2Key",
+            "sequence",
+            "eventTime",
+            "receivedAt",
+            "gapFree",
+            "connected",
+            "orders",
+            "positions",
+            "trades",
+            "balance",
+        },
+        set(),
+        "stream",
+    )
+    _strict(stream["balance"], balance_keys, set(), "stream.balance")
+    stream_orders = tuple(_validate_order_row(row, "stream.order") for row in stream["orders"])
+    stream_positions = tuple(_validate_position_row(row, "stream.position") for row in stream["positions"])
+    stream_trades = tuple(_validate_fill_row(row, "stream.trade") for row in stream["trades"])
+
+    entry = deepcopy(_strict(data["entry"], _ORDER_VECTOR_KEYS, set(), "entry"))
+    close = deepcopy(_strict(data["close"], _ORDER_VECTOR_KEYS, set(), "close"))
+    entry_payload = build_limit_ioc_order(entry)
+    close_payload = build_limit_ioc_order(close)
+    vectors = _strict(data["vectors"], {"canonicalPayloadDigest", "closeCanonicalPayloadDigest"}, set(), "vectors")
+    _validate_order_row(data["filledOrder"], "filledOrder")
+    _validate_fill_row(data["fill"], "fillVector")
+    _validate_order_row(data["filledCloseOrder"], "filledCloseOrder")
+    _validate_fill_row(data["closeFill"], "closeFillVector")
+    position_template = _validate_position_row(data["position"], "positionVector")
+
+    if identity["accountId"] != info["id"] or identity["accountId"] != stream["accountId"]:
+        raise EvidenceViolation("ACCOUNT_IDENTITY_MISMATCH")
+    if identity["l2Key"] != info["l2Key"] or identity["l2Key"] != stream["l2Key"]:
+        raise EvidenceViolation("ACCOUNT_IDENTITY_MISMATCH")
+    if any(vector["settlement"]["starkKey"] != identity["l2Key"] for vector in (entry, close)):
+        raise EvidenceViolation("ACCOUNT_IDENTITY_MISMATCH")
+    if info["l2Vault"] != identity["l2Vault"] or any(
+        str(vector["settlement"]["collateralPosition"]) != str(identity["l2Vault"]) for vector in (entry, close)
+    ):
+        raise EvidenceViolation("ACCOUNT_IDENTITY_MISMATCH")
+    if market["name"] != book["market"] or any(vector["market"] != market["name"] for vector in (entry, close)):
+        raise EvidenceViolation("MARKET_IDENTITY_MISMATCH")
+
+    minimum = _decimal(config["minOrderSize"], "minimum")
+    step = _decimal(config["minOrderSizeChange"], "step")
+    tick = _decimal(config["minPriceChange"], "tick")
+    if minimum != step:
+        raise EvidenceViolation("MINIMUM_STEP_MISMATCH")
+    if _decimal(entry["qty"], "entry.qty") % step != 0:
+        raise EvidenceViolation("QTY_OFF_GRID")
+    if _decimal(entry["price"], "entry.price") % tick != 0:
+        raise EvidenceViolation("PRICE_OFF_GRID")
+    if canonical_payload_digest(entry_payload) != vectors["canonicalPayloadDigest"]:
+        raise ContractViolation("ENTRY_DIGEST_MISMATCH")
+    if canonical_payload_digest(close_payload) != vectors["closeCanonicalPayloadDigest"]:
+        raise ContractViolation("CLOSE_DIGEST_MISMATCH")
+
+    history_external_ids = frozenset(row["externalId"] for row in history)
+    active_rest_orders = tuple(row for row in open_orders if row["status"] in _ACTIVE_ORDER_STATUSES)
+    active_stream_orders = tuple(
+        row
+        for row in stream_orders
+        if row["status"] in _ACTIVE_ORDER_STATUSES and row["externalId"] not in history_external_ids
+    )
+    if _ids(active_rest_orders, "externalId") != _ids(active_stream_orders, "externalId"):
+        raise EvidenceViolation("STREAM_REST_DISAGREE")
+    if _ids(positions, "id") != _ids(stream_positions, "id"):
+        raise EvidenceViolation("STREAM_REST_DISAGREE")
+    if fills and _ids(fills, "id") != _ids(stream_trades, "id"):
+        raise EvidenceViolation("STREAM_REST_DISAGREE")
+    if history and _ids(history, "externalId") != _ids(stream_orders, "externalId"):
+        raise EvidenceViolation("STREAM_REST_DISAGREE")
+    if now_ms - book["eventTime"] > _MAX_AGE_MS:
+        raise EvidenceViolation("STALE_BOOK")
+
+    return OfficialEvidence(
+        now_ms=now_ms,
+        server_time_ms=account["serverTime"],
+        account_observed_ms=account["observedAt"],
+        book_event_ms=book["eventTime"],
+        stream_event_ms=stream["eventTime"],
+        stream_received_ms=stream["receivedAt"],
+        connected=stream["connected"],
+        gap_free=stream["gapFree"],
+        account_id=identity["accountId"],
+        l2_key=identity["l2Key"],
+        l2_vault=identity["l2Vault"],
+        market_name=market["name"],
+        market=deepcopy(market),
+        book=deepcopy(book),
+        balance=balance,
+        fees=fees,
+        leverage=leverage,
+        open_orders=open_orders,
+        positions=positions,
+        order_status=order_status,
+        order_history=history,
+        fills=fills,
+        stream_orders=stream_orders,
+        stream_positions=stream_positions,
+        stream_trades=stream_trades,
+        entry_vector=entry,
+        close_vector=close,
+        position_template=position_template,
+    )
+
+
+@dataclass(frozen=True)
+class Intent:
+    id: str
+    kind: str
+    state: str
+    nonce: int | None
+    external_id: str
+    payload_digest: str
+    unsigned_api_payload: dict[str, Any]
+    expiry_ms: int
+    account_id: int
+    l2_key: str
+    market: str
+    side: str | None
+    qty: Decimal
+    price: Decimal
+    reduce_only: bool
+    target_id: str | None = None
+    target_external_id: str | None = None
+    api_request: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class StoreSnapshot:
+    intent_states: dict[str, str]
+    lifecycle_state: str
+
+
+class IntentStore:
+    def __init__(self, path: Path | str):
+        self.path = Path(path)
+        self._initialize()
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.path)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    def _initialize(self) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS intents (
+                    id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    nonce INTEGER,
+                    external_id TEXT NOT NULL UNIQUE,
+                    payload_digest TEXT NOT NULL,
+                    unsigned_api_payload TEXT NOT NULL,
+                    expiry_ms INTEGER NOT NULL,
+                    account_id INTEGER NOT NULL,
+                    l2_key TEXT NOT NULL,
+                    market TEXT NOT NULL,
+                    side TEXT,
+                    qty TEXT NOT NULL,
+                    price TEXT NOT NULL,
+                    reduce_only INTEGER NOT NULL,
+                    target_id TEXT,
+                    target_external_id TEXT,
+                    api_request TEXT,
+                    dispatch_count INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS intents_nonce ON intents(nonce) WHERE nonce IS NOT NULL")
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS lifecycle (singleton INTEGER PRIMARY KEY CHECK(singleton=1), state TEXT NOT NULL)"
+            )
+            connection.execute("INSERT OR IGNORE INTO lifecycle(singleton, state) VALUES (1, 'FLAT')")
+
+    @staticmethod
+    def _intent(row: sqlite3.Row) -> Intent:
+        return Intent(
+            id=row["id"],
+            kind=row["kind"],
+            state=row["state"],
+            nonce=row["nonce"],
+            external_id=row["external_id"],
+            payload_digest=row["payload_digest"],
+            unsigned_api_payload=json.loads(row["unsigned_api_payload"]),
+            expiry_ms=row["expiry_ms"],
+            account_id=row["account_id"],
+            l2_key=row["l2_key"],
+            market=row["market"],
+            side=row["side"],
+            qty=Decimal(row["qty"]),
+            price=Decimal(row["price"]),
+            reduce_only=bool(row["reduce_only"]),
+            target_id=row["target_id"],
+            target_external_id=row["target_external_id"],
+            api_request=json.loads(row["api_request"]) if row["api_request"] is not None else None,
+        )
+
+    def _insert(self, intent: Intent) -> None:
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO intents(
+                        id, kind, state, nonce, external_id, payload_digest, unsigned_api_payload,
+                        expiry_ms, account_id, l2_key, market, side, qty, price, reduce_only,
+                        target_id, target_external_id, api_request
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        intent.id,
+                        intent.kind,
+                        intent.state,
+                        intent.nonce,
+                        intent.external_id,
+                        intent.payload_digest,
+                        json.dumps(intent.unsigned_api_payload, sort_keys=True, separators=(",", ":")),
+                        intent.expiry_ms,
+                        intent.account_id,
+                        intent.l2_key,
+                        intent.market,
+                        intent.side,
+                        str(intent.qty),
+                        str(intent.price),
+                        int(intent.reduce_only),
+                        intent.target_id,
+                        intent.target_external_id,
+                        json.dumps(intent.api_request, sort_keys=True, separators=(",", ":"))
+                        if intent.api_request is not None
+                        else None,
+                    ),
+                )
+        except sqlite3.IntegrityError as exc:
+            message = str(exc).lower()
+            if "nonce" in message:
+                raise NonceViolation("NONCE_REUSE") from exc
+            raise IntentConflict("EXTERNAL_ID_REUSE") from exc
+
+    def _claim(self, intent_id: str) -> None:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE intents SET state='CLAIMED', dispatch_count=dispatch_count+1 WHERE id=? AND state='PREPARED'",
+                (intent_id,),
+            )
+            if cursor.rowcount != 1:
+                raise LifecycleHalted("INTENT_NOT_PREPARED")
+
+    def _set_states(self, states: Mapping[str, str], lifecycle_state: str) -> None:
+        with self._connect() as connection:
+            for intent_id, state in states.items():
+                cursor = connection.execute("UPDATE intents SET state=? WHERE id=?", (state, intent_id))
+                if cursor.rowcount != 1:
+                    raise LifecycleHalted("INTENT_NOT_FOUND")
+            connection.execute("UPDATE lifecycle SET state=? WHERE singleton=1", (lifecycle_state,))
+
+    def get(self, intent_id: str) -> Intent:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM intents WHERE id=?", (intent_id,)).fetchone()
+        if row is None:
+            raise LifecycleHalted("INTENT_NOT_FOUND")
+        return self._intent(row)
+
+    def count(self) -> int:
+        with self._connect() as connection:
+            return int(connection.execute("SELECT COUNT(*) FROM intents").fetchone()[0])
+
+    def dispatch_count(self, intent_id: str) -> int:
+        with self._connect() as connection:
+            row = connection.execute("SELECT dispatch_count FROM intents WHERE id=?", (intent_id,)).fetchone()
+        if row is None:
+            raise LifecycleHalted("INTENT_NOT_FOUND")
+        return int(row[0])
+
+    def snapshot(self) -> StoreSnapshot:
+        with self._connect() as connection:
+            states = {row["id"]: row["state"] for row in connection.execute("SELECT id, state FROM intents")}
+            lifecycle_state = str(connection.execute("SELECT state FROM lifecycle WHERE singleton=1").fetchone()[0])
+        return StoreSnapshot(states, lifecycle_state)
+
+    def _all(self) -> tuple[Intent, ...]:
+        with self._connect() as connection:
+            rows = connection.execute("SELECT * FROM intents ORDER BY rowid").fetchall()
+        return tuple(self._intent(row) for row in rows)
+
+
+@dataclass(frozen=True)
+class ReconciliationResult:
+    lifecycle_state: str
+    complete: bool
+    next_write: None = None
+    filled_qty: Decimal = Decimal(0)
+    position_qty: Decimal = Decimal(0)
+    reconciled_external_ids: frozenset[str] = frozenset()
+    reconciled_fill_ids: frozenset[int] = frozenset()
+
+
+class ExtendedLifecycle:
+    def __init__(self, *, store: IntentStore, credential_loader: Callable[[], Any]):
+        self.store = store
+        self.__credential_loader = credential_loader
+
+    @property
+    def complete(self) -> bool:
+        return self.store.snapshot().lifecycle_state == "COMPLETE"
+
+    @staticmethod
+    def _grid(value: Decimal, step: Decimal) -> bool:
+        return value > 0 and value % step == 0
+
+    @staticmethod
+    def _validate_common(evidence: OfficialEvidence) -> None:
+        if not evidence.connected:
+            raise EvidenceViolation("STREAM_DISCONNECTED")
+        if not evidence.gap_free:
+            raise EvidenceViolation("STREAM_GAP")
+        if not evidence.fresh:
+            raise EvidenceViolation("STALE_EVIDENCE")
+
+    def _validate_entry(self, evidence: OfficialEvidence, *, qty: Decimal, price: Decimal) -> None:
+        self._validate_common(evidence)
+        market = evidence.market
+        config = market["tradingConfig"]
+        if not market["active"]:
+            raise EvidenceViolation("MARKET_INACTIVE")
+        if market["isRfq"]:
+            raise EvidenceViolation("RFQ_FORBIDDEN")
+        if market["type"] != "PERPETUAL":
+            raise EvidenceViolation("PERPETUAL_REQUIRED")
+        minimum = _decimal(config["minOrderSize"], "minimum")
+        step = _decimal(config["minOrderSizeChange"], "step")
+        tick = _decimal(config["minPriceChange"], "tick")
+        if minimum != step:
+            raise EvidenceViolation("MINIMUM_STEP_MISMATCH")
+        if not self._grid(qty, step):
+            raise EvidenceViolation("QTY_OFF_GRID")
+        if not self._grid(price, tick):
+            raise EvidenceViolation("PRICE_OFF_GRID")
+        vector = evidence.entry_vector
+        if qty != _decimal(vector["qty"], "entry.qty") or price != _decimal(vector["price"], "entry.price"):
+            raise EvidenceViolation("ORDER_VECTOR_MISMATCH")
+        levels = evidence.book["asks"] if vector["side"] == "BUY" else evidence.book["bids"]
+        if not levels or _decimal(levels[0]["qty"], "depth") < qty:
+            raise EvidenceViolation("DEPTH_INSUFFICIENT")
+        fee = next((row for row in evidence.fees if row["market"] == evidence.market_name), None)
+        if fee is None or _decimal(fee["takerFeeRate"], "fee") != _decimal(vector["fee"], "order.fee"):
+            raise EvidenceViolation("FEE_MISMATCH")
+        leverage = next((row for row in evidence.leverage if row["market"] == evidence.market_name), None)
+        if leverage is None or _decimal(leverage["leverage"], "leverage") > _decimal(config["maxLeverage"], "maxLeverage"):
+            raise EvidenceViolation("LEVERAGE_INVALID")
+        if _decimal(evidence.balance["availableForTrade"], "availableForTrade") <= 0:
+            raise EvidenceViolation("BALANCE_INSUFFICIENT")
+        if evidence.open_orders or evidence.positions:
+            raise EvidenceViolation("NOT_FLAT")
+        if qty * price > MAX_NOTIONAL_USD:
+            raise EvidenceViolation("NOTIONAL_CAP")
+
+    @staticmethod
+    def _assert_binding(intent: Intent, evidence: OfficialEvidence) -> None:
+        if intent.account_id != evidence.account_id or intent.l2_key != evidence.l2_key:
+            raise EvidenceViolation("ACCOUNT_IDENTITY_MISMATCH")
+        if intent.market != evidence.market_name:
+            raise EvidenceViolation("MARKET_IDENTITY_MISMATCH")
+
+    def prepare_order(
+        self,
+        *,
+        nonce: int | None,
+        settlement_hash: int,
+        market: str,
+        side: str,
+        qty: Decimal,
+        price: Decimal,
+        expiry_ms: int,
+        reduce_only: bool,
+        evidence: OfficialEvidence,
+    ) -> Intent:
+        nonce_value = _validate_nonce(nonce)
+        if qty * price > MAX_NOTIONAL_USD:
+            raise EvidenceViolation("NOTIONAL_CAP")
+        external_id = str(settlement_hash)
+        for existing in self.store._all():
+            if existing.nonce == nonce_value:
+                raise NonceViolation("NONCE_REUSE")
+            if existing.external_id == external_id:
+                raise IntentConflict("EXTERNAL_ID_REUSE")
+        self._validate_entry(evidence, qty=qty, price=price)
+        vector = evidence.entry_vector
+        if (
+            nonce_value != vector["nonce"]
+            or external_id != vector["externalId"]
+            or market != vector["market"]
+            or side != vector["side"]
+            or expiry_ms != vector["expiryEpochMillis"]
+            or reduce_only is not False
+        ):
+            raise ContractViolation("ORDER_VECTOR_MISMATCH")
+        payload = build_limit_ioc_order(vector, evidence.server_time_ms)
+        intent = Intent(
+            id=external_id,
+            kind="ENTRY",
+            state="PREPARED",
+            nonce=nonce_value,
+            external_id=external_id,
+            payload_digest=canonical_payload_digest(payload),
+            unsigned_api_payload=payload,
+            expiry_ms=expiry_ms,
+            account_id=evidence.account_id,
+            l2_key=evidence.l2_key,
+            market=market,
+            side=side,
+            qty=qty,
+            price=price,
+            reduce_only=False,
+        )
+        self.store._insert(intent)
+        return intent
+
+    def claim_for_dispatch(self, intent_id: str, *, evidence: OfficialEvidence) -> Intent:
+        intent = self.store.get(intent_id)
+        if intent.state != "PREPARED":
+            raise LifecycleHalted("INTENT_NOT_PREPARED")
+        if evidence.server_time_ms >= intent.expiry_ms:
+            raise LifecycleHalted("EXPIRED")
+        self._validate_common(evidence)
+        self._assert_binding(intent, evidence)
+        if intent.kind == "ENTRY":
+            self._validate_entry(evidence, qty=intent.qty, price=intent.price)
+        elif intent.kind == "CLOSE":
+            self._validate_close_evidence(intent, evidence)
+        self.store._claim(intent.id)
+        return self.store.get(intent.id)
+
+    def prepare_cancellation(
+        self, entry_id: str, *, kind: str, evidence: OfficialEvidence
+    ) -> Intent:
+        if kind not in {"CANCEL", "MASS_CANCEL"}:
+            raise ContractViolation("CANCEL_KIND_INVALID")
+        entry = self.store.get(entry_id)
+        if entry.kind != "ENTRY" or entry.state != "CLAIMED":
+            raise LifecycleHalted("ENTRY_NOT_CLAIMED")
+        self._validate_common(evidence)
+        self._assert_binding(entry, evidence)
+        if kind == "CANCEL":
+            request = {
+                "method": "DELETE",
+                "path": "/user/order",
+                "query": {"externalId": entry.external_id},
+                "json": None,
+            }
+        else:
+            request = {
+                "method": "POST",
+                "path": "/user/order/massCancel",
+                "query": {},
+                "json": {"externalOrderIds": [entry.external_id], "cancelAll": False},
+            }
+        intent_id = f"{kind}:{entry.external_id}"
+        intent = Intent(
+            id=intent_id,
+            kind=kind,
+            state="PREPARED",
+            nonce=None,
+            external_id=intent_id,
+            payload_digest=canonical_payload_digest(request),
+            unsigned_api_payload=request,
+            expiry_ms=entry.expiry_ms,
+            account_id=entry.account_id,
+            l2_key=entry.l2_key,
+            market=entry.market,
+            side=None,
+            qty=Decimal(0),
+            price=Decimal(0),
+            reduce_only=False,
+            target_id=entry.id,
+            target_external_id=entry.external_id,
+            api_request=request,
+        )
+        self.store._insert(intent)
+        return intent
+
+    def _position(self, evidence: OfficialEvidence) -> dict[str, Any]:
+        if len(evidence.positions) != 1 or len(evidence.stream_positions) != 1:
+            raise LifecycleHalted("AUTHORITATIVE_POSITION_REQUIRED")
+        position = evidence.positions[0]
+        if position != evidence.stream_positions[0]:
+            raise LifecycleHalted("POSITION_DISAGREEMENT")
+        return position
+
+    def _validate_close_evidence(self, intent: Intent, evidence: OfficialEvidence) -> None:
+        self._validate_common(evidence)
+        self._assert_binding(intent, evidence)
+        position = self._position(evidence)
+        size = _decimal(position["size"], "position.size")
+        if size != intent.qty:
+            raise LifecycleHalted("POSITION_SIZE_MISMATCH")
+        if abs(size * intent.price) > MAX_NOTIONAL_USD:
+            raise LifecycleHalted("NOTIONAL_CAP")
+
+    def prepare_close(
+        self,
+        *,
+        entry_id: str,
+        evidence: OfficialEvidence,
+        nonce: int,
+        settlement_hash: int,
+        price: Decimal,
+        expiry_ms: int,
+    ) -> Intent:
+        entry = self.store.get(entry_id)
+        if entry.kind != "ENTRY" or entry.state != "ENTRY_RECONCILED":
+            raise LifecycleHalted("ENTRY_NOT_RECONCILED")
+        self._validate_common(evidence)
+        self._assert_binding(entry, evidence)
+        position = self._position(evidence)
+        qty = _decimal(position["size"], "position.size")
+        config = evidence.market["tradingConfig"]
+        minimum = _decimal(config["minOrderSize"], "minimum")
+        step = _decimal(config["minOrderSizeChange"], "step")
+        if qty < minimum:
+            raise LifecycleHalted("SUB_MINIMUM_RESIDUAL")
+        if not self._grid(qty, step):
+            raise LifecycleHalted("OFF_GRID_RESIDUAL")
+        if abs(qty * price) > MAX_NOTIONAL_USD:
+            raise LifecycleHalted("NOTIONAL_CAP")
+        side = "SELL" if position["side"] == "LONG" else "BUY"
+        nonce_value = _validate_nonce(nonce)
+        external_id = str(settlement_hash)
+        for existing in self.store._all():
+            if existing.nonce == nonce_value:
+                raise NonceViolation("NONCE_REUSE")
+            if existing.external_id == external_id:
+                raise IntentConflict("EXTERNAL_ID_REUSE")
+        vector = evidence.close_vector
+        if (
+            nonce_value != vector["nonce"]
+            or external_id != vector["externalId"]
+            or side != vector["side"]
+            or qty != _decimal(vector["qty"], "close.qty")
+            or price != _decimal(vector["price"], "close.price")
+            or expiry_ms != vector["expiryEpochMillis"]
+            or vector["reduceOnly"] is not True
+        ):
+            raise ContractViolation("CLOSE_VECTOR_MISMATCH")
+        payload = build_limit_ioc_order(vector, evidence.server_time_ms)
+        intent = Intent(
+            id=external_id,
+            kind="CLOSE",
+            state="PREPARED",
+            nonce=nonce_value,
+            external_id=external_id,
+            payload_digest=canonical_payload_digest(payload),
+            unsigned_api_payload=payload,
+            expiry_ms=expiry_ms,
+            account_id=evidence.account_id,
+            l2_key=evidence.l2_key,
+            market=evidence.market_name,
+            side=side,
+            qty=qty,
+            price=price,
+            reduce_only=True,
+            target_id=entry.id,
+            target_external_id=entry.external_id,
+        )
+        self.store._insert(intent)
+        return intent
+
+    @staticmethod
+    def _matching_order(intent: Intent, evidence: OfficialEvidence) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        status = evidence.order_status if evidence.order_status and evidence.order_status["externalId"] == intent.external_id else None
+        history = next((row for row in evidence.order_history if row["externalId"] == intent.external_id), None)
+        return status, history
+
+    @staticmethod
+    def _matching_fills(order: Mapping[str, Any], evidence: OfficialEvidence) -> tuple[dict[str, Any], ...]:
+        return tuple(row for row in evidence.fills if row["orderId"] == order["id"])
+
+    def _reconcile_entry(self, intent: Intent, evidence: OfficialEvidence) -> ReconciliationResult:
+        if evidence.open_orders:
+            raise LifecycleHalted("ORDER_OPEN_CONTRADICTION")
+        status, history = self._matching_order(intent, evidence)
+        if status is None and history is None and not evidence.fills and not evidence.positions:
+            state = self.store.snapshot().lifecycle_state
+            return ReconciliationResult(state, state == "COMPLETE")
+        if status is None or history is None or status != history:
+            raise LifecycleHalted("STATUS_HISTORY_CONTRADICTION")
+        fills = self._matching_fills(history, evidence)
+        filled_qty = sum((_decimal(row["qty"], "fill.qty") for row in fills), Decimal(0))
+        if history["status"] not in {"FILLED", "PARTIALLY_FILLED"} or not fills:
+            raise LifecycleHalted("ORDER_FILL_CONTRADICTION")
+        position = self._position(evidence)
+        position_qty = _decimal(position["size"], "position.size")
+        if filled_qty != _decimal(history["filledQty"], "order.filledQty") or position_qty != filled_qty:
+            raise LifecycleHalted("FILL_POSITION_CONTRADICTION")
+        minimum = _decimal(evidence.market["tradingConfig"]["minOrderSize"], "minimum")
+        step = _decimal(evidence.market["tradingConfig"]["minOrderSizeChange"], "step")
+        if position_qty < minimum and position_qty * 2 == minimum:
+            lifecycle_state = "HALTED_SUB_MINIMUM_RESIDUAL"
+        elif not self._grid(position_qty, step):
+            lifecycle_state = "HALTED_OFF_GRID_RESIDUAL"
+        elif position_qty < minimum:
+            lifecycle_state = "HALTED_SUB_MINIMUM_RESIDUAL"
+        elif history["status"] == "PARTIALLY_FILLED":
+            lifecycle_state = "HALTED_PARTIAL_FILL_UNCERTAIN"
+        else:
+            lifecycle_state = "EXPOSED"
+        self.store._set_states({intent.id: "ENTRY_RECONCILED"}, lifecycle_state)
+        return ReconciliationResult(
+            lifecycle_state,
+            False,
+            filled_qty=filled_qty,
+            position_qty=position_qty,
+            reconciled_external_ids=frozenset({intent.external_id}),
+            reconciled_fill_ids=frozenset(row["id"] for row in fills),
+        )
+
+    def _reconcile_cancel(self, intent: Intent, evidence: OfficialEvidence) -> ReconciliationResult:
+        target = self.store.get(intent.target_id or "")
+        status, history = self._matching_order(target, evidence)
+        if status is None or history is None or status != history or history["status"] != "FILLED":
+            raise LifecycleHalted("CANCEL_UNRESOLVED")
+        fills = self._matching_fills(history, evidence)
+        if not fills:
+            raise LifecycleHalted("CANCEL_FILL_MISSING")
+        position = self._position(evidence)
+        filled_qty = sum((_decimal(row["qty"], "fill.qty") for row in fills), Decimal(0))
+        position_qty = _decimal(position["size"], "position.size")
+        if filled_qty != position_qty:
+            raise LifecycleHalted("CANCEL_FILL_POSITION_CONTRADICTION")
+        self.store._set_states(
+            {intent.id: "RECONCILED_NO_CANCEL_EFFECT", target.id: "ENTRY_RECONCILED"},
+            "EXPOSED",
+        )
+        return ReconciliationResult(
+            "EXPOSED",
+            False,
+            filled_qty=filled_qty,
+            position_qty=position_qty,
+            reconciled_external_ids=frozenset({target.external_id}),
+            reconciled_fill_ids=frozenset(row["id"] for row in fills),
+        )
+
+    def _final_identities(self, evidence: OfficialEvidence) -> tuple[frozenset[str], frozenset[int]]:
+        order_intents = tuple(intent for intent in self.store._all() if intent.kind in {"ENTRY", "CLOSE"})
+        expected_external = frozenset(intent.external_id for intent in order_intents)
+        history_by_external = {row["externalId"]: row for row in evidence.order_history}
+        if frozenset(history_by_external) != expected_external:
+            raise LifecycleHalted("FINAL_HISTORY_MISMATCH")
+        fill_ids: set[int] = set()
+        for external_id in expected_external:
+            order = history_by_external[external_id]
+            matches = self._matching_fills(order, evidence)
+            if order["status"] != "FILLED" or not matches:
+                raise LifecycleHalted("FINAL_FILL_MISMATCH")
+            fill_ids.update(row["id"] for row in matches)
+        if fill_ids != {row["id"] for row in evidence.fills}:
+            raise LifecycleHalted("UNRECONCILED_FILL")
+        return expected_external, frozenset(fill_ids)
+
+    def _reconcile_close(self, intent: Intent, evidence: OfficialEvidence) -> ReconciliationResult:
+        status, history = self._matching_order(intent, evidence)
+        if status is None or history is None or status != history:
+            raise LifecycleHalted("CLOSE_STATUS_HISTORY_CONTRADICTION")
+        if history["status"] == "REJECTED":
+            self.store._set_states({intent.id: "CLOSE_REJECTED"}, "HALTED_CLOSE_REJECTED")
+            return ReconciliationResult("HALTED_CLOSE_REJECTED", False)
+        if history["status"] != "FILLED":
+            raise LifecycleHalted("CLOSE_NOT_FILLED")
+        fills = self._matching_fills(history, evidence)
+        if not fills:
+            raise LifecycleHalted("CLOSE_FILL_MISSING")
+        if evidence.positions or evidence.stream_positions:
+            raise LifecycleHalted("CLOSE_POSITION_NOT_FLAT")
+        self.store._set_states({intent.id: "CLOSE_RECONCILED"}, "EXPOSED")
+        external_ids, fill_ids = self._final_identities(evidence)
+        all_intents = self.store._all()
+        past_expiry = evidence.server_time_ms > max(row.expiry_ms for row in all_intents)
+        final_safe = (
+            past_expiry
+            and evidence.connected
+            and evidence.gap_free
+            and evidence.fresh
+            and not evidence.open_orders
+            and not evidence.positions
+            and all(row.state not in {"PREPARED", "CLAIMED"} for row in all_intents)
+        )
+        lifecycle_state = "COMPLETE" if final_safe else "EXPOSED"
+        if lifecycle_state == "COMPLETE":
+            self.store._set_states({}, "COMPLETE")
+        return ReconciliationResult(
+            lifecycle_state,
+            lifecycle_state == "COMPLETE",
+            reconciled_external_ids=external_ids,
+            reconciled_fill_ids=fill_ids,
+        )
+
+    def reconcile(self, intent_id: str, evidence: OfficialEvidence) -> ReconciliationResult:
+        intent = self.store.get(intent_id)
+        self._validate_common(evidence)
+        self._assert_binding(intent, evidence)
+        if intent.kind == "ENTRY":
+            return self._reconcile_entry(intent, evidence)
+        if intent.kind in {"CANCEL", "MASS_CANCEL"}:
+            return self._reconcile_cancel(intent, evidence)
+        if intent.kind == "CLOSE":
+            return self._reconcile_close(intent, evidence)
+        raise LifecycleHalted("INTENT_KIND_INVALID")
+
+    def next_write(self, evidence: OfficialEvidence) -> None:
+        del evidence
+        return None
