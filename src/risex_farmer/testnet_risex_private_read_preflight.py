@@ -7,6 +7,7 @@ It proves a narrowly bounded fixture contract and exposes no executing operation
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from enum import Enum
 import inspect
@@ -207,6 +208,16 @@ def _address(value: Any) -> str:
     return value.lower()
 
 
+def _utc_timestamp(value: str) -> float:
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise ValueError("invalid timestamp")
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as exc:
+        raise ValueError("invalid timestamp") from exc
+    return parsed.timestamp()
+
+
 class PrivateReadPreflight:
     _REQUESTS = (
         ("/v1/system/config", ()),
@@ -334,6 +345,9 @@ class PrivateReadPreflight:
             != {key: value for key, value in expected_signer.items() if key != "signer"}
         ):
             raise ValueError("signer mismatch")
+        now = self._clock()
+        if not (_utc_timestamp(REGISTERED_AT) <= now < _utc_timestamp(SIGNER_EXPIRATION)):
+            raise ValueError("signer outside active interval")
 
         market_data = _mapping(values["/v1/markets"])
         markets = _list(market_data.get("markets"))
@@ -414,12 +428,18 @@ class PrivateReadPreflight:
         sign_register_v2: Callable[..., str],
         private_exchange: Callable[..., Any],
     ) -> PreflightResult:
-        if (
-            barrier is not self._barrier or barrier.owner is not self._owner
-            or self._clock() - barrier.issued_at > MAX_AGE_SECONDS
-            or self._store.outcome() is not None
-            or not self._lifecycle_clear()
-        ):
+        try:
+            barrier_age = self._clock() - barrier.issued_at
+            gate_valid = (
+                isinstance(barrier, _Barrier)
+                and barrier is self._barrier and barrier.owner is self._owner
+                and 0 <= barrier_age <= MAX_AGE_SECONDS
+                and self._store.outcome() is None
+                and self._lifecycle_clear()
+            )
+        except Exception:
+            gate_valid = False
+        if not gate_valid:
             self._block(18)
             return self._store.result()  # type: ignore[return-value]
         self._barrier = None
@@ -464,12 +484,17 @@ class PrivateReadPreflight:
                 "params": {
                     "account": ACCOUNT, "signer": SIGNER,
                     "message": "sign in with RISEx", "nonce": nonce,
-                    "expiration": int(self._clock()) + 60,
+                    "expiration": int(self._clock()) + 365 * 24 * 60 * 60,
                     "signature": signature,
                 },
             }
             counts["auth_send_count"] = 1
-            frames = await _await(private_exchange(WS_ORIGIN, frame))
+            outbound_plan = (
+                frame,
+                {"method": "subscribe", "params": {"channel": "orders"}},
+                {"method": "subscribe", "params": {"channel": "positions"}},
+            )
+            frames = await _await(private_exchange(WS_ORIGIN, outbound_plan))
             self._validate_private_frames(frames)
             private_age = self._clock() - private_started
             if private_age < 0 or private_age > MAX_AGE_SECONDS:
@@ -535,20 +560,39 @@ class PrivateReadPreflight:
             "method": "auth_v2", "status": "success",
         }:
             raise ValueError("authentication failed")
-        expected_orders = _mapping(orders, {"method", "channel", "account", "data"})
+        expected_orders = _mapping(
+            orders,
+            {"method", "channel", "type", "data", "order_count", "worker_timestamp"},
+        )
         expected_positions = _mapping(
-            positions, {"method", "channel", "account", "data"},
+            positions,
+            {"method", "channel", "type", "data", "position_count", "worker_timestamp"},
         )
         if (
             expected_orders.get("method") != "snapshot"
             or expected_orders.get("channel") != "orders"
-            or _address(expected_orders.get("account")) != ACCOUNT
+            or expected_orders.get("type") != "snapshot"
             or expected_positions.get("method") != "snapshot"
             or expected_positions.get("channel") != "positions"
-            or _address(expected_positions.get("account")) != ACCOUNT
+            or expected_positions.get("type") != "snapshot"
         ):
             raise ValueError("private identity mismatch")
-        order_data = _mapping(expected_orders.get("data"), {"orders"})
-        position_data = _mapping(expected_positions.get("data"), {"positions"})
-        if _list(order_data["orders"]) or _list(position_data["positions"]):
+        order_data = _list(expected_orders.get("data"))
+        position_data = _list(expected_positions.get("data"))
+        order_count = expected_orders.get("order_count")
+        position_count = expected_positions.get("position_count")
+        if (
+            isinstance(order_count, bool) or not isinstance(order_count, int)
+            or isinstance(position_count, bool) or not isinstance(position_count, int)
+            or order_count != len(order_data) or position_count != len(position_data)
+        ):
+            raise ValueError("private count mismatch")
+        for snapshot in (expected_orders, expected_positions):
+            worker_timestamp = snapshot.get("worker_timestamp")
+            if (
+                not isinstance(worker_timestamp, str) or not worker_timestamp.isdecimal()
+                or int(worker_timestamp) <= 0
+            ):
+                raise ValueError("invalid worker timestamp")
+        if order_data or position_data:
             raise ValueError("private state not flat")

@@ -28,7 +28,7 @@ from risex_farmer.testnet_risex_private_read_preflight import (
 )
 
 
-NOW = 1_800_000_000.0
+NOW = 1_787_572_800.0
 SIGNATURE = "0x" + "ab" * 65
 
 
@@ -127,11 +127,41 @@ def expected_public_calls():
 def private_frames(*, orders=(), positions=()):
     return (
         {"method": "auth_v2", "status": "success"},
-        {"method": "snapshot", "channel": "orders", "account": ACCOUNT,
-         "data": {"orders": list(orders)}},
-        {"method": "snapshot", "channel": "positions", "account": ACCOUNT,
-         "data": {"positions": list(positions)}},
+        {"method": "snapshot", "channel": "orders", "type": "snapshot",
+         "data": list(orders), "order_count": len(orders),
+         "worker_timestamp": "1787572800000000000"},
+        {"method": "snapshot", "channel": "positions", "type": "snapshot",
+         "data": list(positions), "position_count": len(positions),
+         "worker_timestamp": "1787572800000000001"},
     )
+
+
+def test_exact_official_empty_private_snapshots_are_accepted():
+    PrivateReadPreflight._validate_private_frames(private_frames())
+
+
+@pytest.mark.parametrize("case", [
+    "fabricated", "extra", "count", "timestamp", "channel", "type",
+])
+def test_nonofficial_or_contradictory_private_snapshot_schema_rejected(case):
+    frames = list(copy.deepcopy(private_frames()))
+    if case == "fabricated":
+        frames[1] = {
+            "method": "snapshot", "channel": "orders", "account": ACCOUNT,
+            "data": {"orders": []},
+        }
+    elif case == "extra":
+        frames[1]["account"] = ACCOUNT
+    elif case == "count":
+        frames[1]["order_count"] = 1
+    elif case == "timestamp":
+        frames[2]["worker_timestamp"] = "0"
+    elif case == "channel":
+        frames[1]["channel"] = "positions"
+    else:
+        frames[2]["type"] = "update"
+    with pytest.raises(ValueError):
+        PrivateReadPreflight._validate_private_frames(tuple(frames))
 
 
 async def public_barrier(tmp_path: Path, *, lifecycle_clear=lambda: True):
@@ -181,12 +211,19 @@ async def test_two_exact_public_sweeps_then_one_private_proof(tmp_path):
         }
         return SIGNATURE
 
-    async def socket(url, frame):
+    async def socket(url, outbound_plan):
         calls["socket"] += 1
         assert url == WS_ORIGIN
-        assert frame["method"] == "auth_v2"
-        assert frame["params"]["nonce"] == "0x0123"
-        assert frame["params"]["signature"] == SIGNATURE
+        assert outbound_plan == (
+            {"method": "auth_v2", "params": {
+                "account": ACCOUNT, "signer": SIGNER,
+                "message": "sign in with RISEx", "nonce": "0x0123",
+                "expiration": int(NOW) + 365 * 24 * 60 * 60,
+                "signature": SIGNATURE,
+            }},
+            {"method": "subscribe", "params": {"channel": "orders"}},
+            {"method": "subscribe", "params": {"channel": "positions"}},
+        )
         return private_frames()
 
     result = await controller.run_private_proof(
@@ -353,6 +390,20 @@ async def test_stale_public_evidence_blocks_at_five_second_barrier(tmp_path):
     store = PrivateReadStore(tmp_path / "stale.sqlite3")
     controller = PrivateReadPreflight(store, clock=clock, public_get=transport,
                                       lifecycle_clear=lambda: True)
+    assert await controller.run_public_barrier() is None
+    assert store.outcome() == Outcome.BLOCKED
+    store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("now", [1_787_503_220.0, 1_790_092_010.0])
+async def test_signer_not_yet_registered_or_expired_blocks(tmp_path, now):
+    clock = Clock(now)
+    transport = PublicTransport(clock)
+    store = PrivateReadStore(tmp_path / "temporal.sqlite3")
+    controller = PrivateReadPreflight(
+        store, clock=clock, public_get=transport, lifecycle_clear=lambda: True,
+    )
     assert await controller.run_public_barrier() is None
     assert store.outcome() == Outcome.BLOCKED
     store.close()
@@ -631,6 +682,44 @@ async def test_private_stage_rechecks_lifecycle_and_completion_freshness(tmp_pat
         sign_register_v2=lambda *_: SIGNATURE, private_exchange=slow_socket,
     )
     assert result.outcome == Outcome.BLOCKED and credential.closed
+    store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["negative_age", "lifecycle_exception"])
+async def test_private_barrier_clock_or_lifecycle_failure_precedes_loader(tmp_path, case):
+    clear = {"raise": False}
+
+    def lifecycle_clear():
+        if clear["raise"]:
+            raise RuntimeError("synthetic lifecycle read failure")
+        return True
+
+    clock = Clock()
+    transport = PublicTransport(clock)
+    store = PrivateReadStore(tmp_path / "private-gate.sqlite3")
+    controller = PrivateReadPreflight(
+        store, clock=clock, public_get=transport, lifecycle_clear=lifecycle_clear,
+    )
+    barrier = await controller.run_public_barrier()
+    if case == "negative_age":
+        clock.value -= 1
+    else:
+        clear["raise"] = True
+    loader_calls = 0
+
+    def loader():
+        nonlocal loader_calls
+        loader_calls += 1
+        return SyntheticCredential(SIGNER, b"fixture")
+
+    result = await controller.run_private_proof(
+        barrier, signer_loader=loader, nonce_get=lambda *_: None,
+        sign_register_v2=lambda *_: SIGNATURE,
+        private_exchange=lambda *_: private_frames(),
+    )
+    assert result.outcome == Outcome.BLOCKED and loader_calls == 0
+    assert store.outcome() == Outcome.BLOCKED
     store.close()
 
 
