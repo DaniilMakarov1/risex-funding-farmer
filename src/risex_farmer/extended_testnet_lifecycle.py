@@ -657,9 +657,14 @@ class IntentStore:
             api_request=json.loads(row["api_request"]) if row["api_request"] is not None else None,
         )
 
-    def _insert(self, intent: Intent) -> None:
+    def _insert(self, intent: Intent, *, expected_lifecycle: str, next_lifecycle: str) -> None:
         try:
             with self._connect() as connection:
+                lifecycle = str(
+                    connection.execute("SELECT state FROM lifecycle WHERE singleton=1").fetchone()[0]
+                )
+                if lifecycle != expected_lifecycle:
+                    raise LifecycleHalted("LIFECYCLE_STATE_MISMATCH")
                 connection.execute(
                     """
                     INSERT INTO intents(
@@ -691,20 +696,37 @@ class IntentStore:
                         else None,
                     ),
                 )
+                connection.execute(
+                    "UPDATE lifecycle SET state=? WHERE singleton=1", (next_lifecycle,)
+                )
         except sqlite3.IntegrityError as exc:
             message = str(exc).lower()
             if "nonce" in message:
                 raise NonceViolation("NONCE_REUSE") from exc
             raise IntentConflict("EXTERNAL_ID_REUSE") from exc
 
-    def _claim(self, intent_id: str) -> None:
+    def _claim(
+        self,
+        intent_id: str,
+        *,
+        expected_lifecycle: str,
+        next_lifecycle: str,
+    ) -> None:
         with self._connect() as connection:
+            lifecycle = str(
+                connection.execute("SELECT state FROM lifecycle WHERE singleton=1").fetchone()[0]
+            )
+            if lifecycle != expected_lifecycle:
+                raise LifecycleHalted("LIFECYCLE_STATE_MISMATCH")
             cursor = connection.execute(
                 "UPDATE intents SET state='CLAIMED', dispatch_count=dispatch_count+1 WHERE id=? AND state='PREPARED'",
                 (intent_id,),
             )
             if cursor.rowcount != 1:
                 raise LifecycleHalted("INTENT_NOT_PREPARED")
+            connection.execute(
+                "UPDATE lifecycle SET state=? WHERE singleton=1", (next_lifecycle,)
+            )
 
     def _set_states(self, states: Mapping[str, str], lifecycle_state: str) -> None:
         with self._connect() as connection:
@@ -763,6 +785,14 @@ class ExtendedLifecycle:
     @property
     def complete(self) -> bool:
         return self.store.snapshot().lifecycle_state == "COMPLETE"
+
+    def _require_lifecycle(self, *allowed: str) -> str:
+        state = self.store.snapshot().lifecycle_state
+        if state.startswith("HALTED_"):
+            raise LifecycleHalted("LIFECYCLE_HALTED")
+        if state not in allowed:
+            raise LifecycleHalted("LIFECYCLE_STATE_MISMATCH")
+        return state
 
     @staticmethod
     def _grid(value: Decimal, step: Decimal) -> bool:
@@ -917,6 +947,7 @@ class ExtendedLifecycle:
                 raise IntentConflict("EXTERNAL_ID_REUSE")
         if any(existing.kind == "ENTRY" for existing in self.store._all()):
             raise LifecycleHalted("ENTRY_ALREADY_EXISTS")
+        self._require_lifecycle("FLAT")
         self._validate_entry(evidence, qty=qty, price=price)
         vector = evidence.entry_vector
         if (
@@ -946,7 +977,11 @@ class ExtendedLifecycle:
             price=price,
             reduce_only=False,
         )
-        self.store._insert(intent)
+        self.store._insert(
+            intent,
+            expected_lifecycle="FLAT",
+            next_lifecycle="ENTRY_PREPARED",
+        )
         return intent
 
     def claim_for_dispatch(self, intent_id: str, *, evidence: OfficialEvidence) -> Intent:
@@ -956,13 +991,27 @@ class ExtendedLifecycle:
         self._validate_common(evidence)
         if self._past_expiry(evidence, intent.expiry_ms):
             raise LifecycleHalted("EXPIRED")
+        lifecycle_transition = {
+            "ENTRY": ("ENTRY_PREPARED", "ENTRY_AMBIGUOUS"),
+            "CANCEL": ("CANCEL_PREPARED", "CANCEL_AMBIGUOUS"),
+            "MASS_CANCEL": ("CANCEL_PREPARED", "CANCEL_AMBIGUOUS"),
+            "CLOSE": ("CLOSE_PREPARED", "CLOSE_AMBIGUOUS"),
+        }
+        if intent.kind not in lifecycle_transition:
+            raise LifecycleHalted("INTENT_KIND_INVALID")
+        expected_lifecycle, next_lifecycle = lifecycle_transition[intent.kind]
+        self._require_lifecycle(expected_lifecycle)
         self._assert_binding(intent, evidence)
         if intent.kind == "ENTRY":
             self._validate_entry(evidence, qty=intent.qty, price=intent.price)
             self._validate_intent_vector(intent, evidence)
         elif intent.kind == "CLOSE":
             self._validate_close_evidence(intent, evidence)
-        self.store._claim(intent.id)
+        self.store._claim(
+            intent.id,
+            expected_lifecycle=expected_lifecycle,
+            next_lifecycle=next_lifecycle,
+        )
         return self.store.get(intent.id)
 
     def prepare_cancellation(
@@ -973,6 +1022,7 @@ class ExtendedLifecycle:
         entry = self.store.get(entry_id)
         if entry.kind != "ENTRY" or entry.state != "CLAIMED":
             raise LifecycleHalted("ENTRY_NOT_CLAIMED")
+        self._require_lifecycle("ENTRY_AMBIGUOUS")
         self._validate_common(evidence)
         self._assert_binding(entry, evidence)
         if any(
@@ -1015,7 +1065,11 @@ class ExtendedLifecycle:
             target_external_id=entry.external_id,
             api_request=request,
         )
-        self.store._insert(intent)
+        self.store._insert(
+            intent,
+            expected_lifecycle="ENTRY_AMBIGUOUS",
+            next_lifecycle="CANCEL_PREPARED",
+        )
         return intent
 
     def _position(self, evidence: OfficialEvidence) -> dict[str, Any]:
@@ -1066,6 +1120,7 @@ class ExtendedLifecycle:
             raise LifecycleHalted("ENTRY_NOT_RECONCILED")
         if any(existing.kind == "CLOSE" for existing in self.store._all()):
             raise LifecycleHalted("CLOSE_ALREADY_EXISTS")
+        self._require_lifecycle("EXPOSED")
         self._assert_binding(entry, evidence)
         self._validate_common(evidence)
         if evidence.open_orders:
@@ -1115,7 +1170,11 @@ class ExtendedLifecycle:
             target_id=entry.id,
             target_external_id=entry.external_id,
         )
-        self.store._insert(intent)
+        self.store._insert(
+            intent,
+            expected_lifecycle="EXPOSED",
+            next_lifecycle="CLOSE_PREPARED",
+        )
         return intent
 
     @staticmethod
@@ -1154,6 +1213,8 @@ class ExtendedLifecycle:
         fills = self._matching_fills(order, evidence)
         fee_rate = _decimal(intent.unsigned_api_payload["fee"], "order.fee")
         total_fee = Decimal(0)
+        total_qty = Decimal(0)
+        total_value = Decimal(0)
         for fill in fills:
             fill_price = _decimal(fill["price"], "fill.price")
             fill_qty = _decimal(fill["qty"], "fill.qty")
@@ -1179,8 +1240,44 @@ class ExtendedLifecycle:
             ):
                 raise LifecycleHalted("FILL_ARITHMETIC_MISMATCH")
             total_fee += fill_fee
+            total_qty += fill_qty
+            total_value += fill_value
         if _decimal(order["payedFee"], "order.payedFee") != total_fee:
             raise LifecycleHalted("FILL_ARITHMETIC_MISMATCH")
+        filled_qty = _decimal(order["filledQty"], "order.filledQty")
+        cancelled_qty = _decimal(order["cancelledQty"], "order.cancelledQty")
+        average_price = (
+            _decimal(order["averagePrice"], "order.averagePrice")
+            if order["averagePrice"] is not None
+            else None
+        )
+        if order["status"] == "FILLED":
+            if (
+                total_qty != intent.qty
+                or filled_qty != intent.qty
+                or cancelled_qty != 0
+                or average_price is None
+                or average_price != total_value / total_qty
+            ):
+                raise LifecycleHalted("ORDER_ARITHMETIC_MISMATCH")
+        elif order["status"] == "PARTIALLY_FILLED":
+            if (
+                not 0 < total_qty <= intent.qty
+                or filled_qty != total_qty
+                or cancelled_qty < 0
+                or filled_qty + cancelled_qty > intent.qty
+                or average_price is None
+                or average_price != total_value / total_qty
+            ):
+                raise LifecycleHalted("ORDER_ARITHMETIC_MISMATCH")
+        elif order["status"] == "CANCELLED":
+            if (
+                fills
+                or filled_qty != 0
+                or cancelled_qty != intent.qty
+                or average_price is not None
+            ):
+                raise LifecycleHalted("ORDER_ARITHMETIC_MISMATCH")
         return fills
 
     @staticmethod
@@ -1381,20 +1478,56 @@ class ExtendedLifecycle:
             reconciled_fill_ids=fill_ids,
         )
 
+    def _all_fills_bind_persisted_orders(self, evidence: OfficialEvidence) -> bool:
+        persisted_external_ids = {
+            intent.external_id for intent in self.store._all() if intent.kind in {"ENTRY", "CLOSE"}
+        }
+        orders_by_id: dict[Any, str] = {}
+        observed_orders = (*evidence.open_orders, *evidence.order_history)
+        if evidence.order_status is not None:
+            observed_orders = (*observed_orders, evidence.order_status)
+        for order in observed_orders:
+            existing = orders_by_id.setdefault(order["id"], order["externalId"])
+            if existing != order["externalId"]:
+                return False
+        return all(
+            fill["orderId"] in orders_by_id
+            and orders_by_id[fill["orderId"]] in persisted_external_ids
+            for fill in evidence.fills
+        )
+
     def reconcile(self, intent_id: str, evidence: OfficialEvidence) -> ReconciliationResult:
         intent = self.store.get(intent_id)
         self._validate_common(evidence)
-        self._assert_binding(intent, evidence)
-        recheck_states = {"CLOSE_RECONCILED", "RECONCILED_CANCELLED_NO_FILL"}
-        if intent.state != "CLAIMED" and intent.state not in recheck_states:
-            raise LifecycleHalted("INTENT_NOT_CLAIMED")
-        if intent.kind == "ENTRY":
-            return self._reconcile_entry(intent, evidence)
-        if intent.kind in {"CANCEL", "MASS_CANCEL"}:
-            return self._reconcile_cancel(intent, evidence)
-        if intent.kind == "CLOSE":
-            return self._reconcile_close(intent, evidence)
-        raise LifecycleHalted("INTENT_KIND_INVALID")
+        current_lifecycle = self.store.snapshot().lifecycle_state
+        if current_lifecycle.startswith("HALTED_"):
+            raise LifecycleHalted("LIFECYCLE_HALTED")
+        try:
+            self._assert_binding(intent, evidence)
+            recheck_states = {"CLOSE_RECONCILED", "RECONCILED_CANCELLED_NO_FILL"}
+            if intent.state != "CLAIMED" and intent.state not in recheck_states:
+                raise LifecycleHalted("INTENT_NOT_CLAIMED")
+            if not self._all_fills_bind_persisted_orders(evidence):
+                self.store._set_states({}, "HALTED_UNEXPLAINED_FILL")
+                raise LifecycleHalted("UNEXPLAINED_FILL")
+            if intent.kind == "ENTRY":
+                return self._reconcile_entry(intent, evidence)
+            if intent.kind in {"CANCEL", "MASS_CANCEL"}:
+                return self._reconcile_cancel(intent, evidence)
+            if intent.kind == "CLOSE":
+                return self._reconcile_close(intent, evidence)
+            raise LifecycleHalted("INTENT_KIND_INVALID")
+        except (ContractViolation, EvidenceViolation, LifecycleHalted) as exc:
+            transient = {
+                "INTENT_NOT_CLAIMED",
+                "CANCEL_UNRESOLVED",
+                "CANCEL_FILL_MISSING",
+                "CLOSE_NOT_FILLED",
+            }
+            state = self.store.snapshot().lifecycle_state
+            if str(exc) not in transient and not state.startswith("HALTED_"):
+                self.store._set_states({}, "HALTED_RECONCILIATION_CONTRADICTION")
+            raise
 
     def next_write(self, evidence: OfficialEvidence) -> None:
         del evidence

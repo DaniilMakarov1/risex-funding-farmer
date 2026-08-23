@@ -751,7 +751,7 @@ def test_prepared_entry_cannot_reconcile_terminal_evidence(lifecycle, evidence, 
     with pytest.raises(LifecycleHalted, match="CLAIMED"):
         lifecycle.reconcile(intent.id, filled_evidence(wire))
     assert lifecycle.store.get(intent.id).state == "PREPARED"
-    assert lifecycle.store.snapshot().lifecycle_state == "FLAT"
+    assert lifecycle.store.snapshot().lifecycle_state == "ENTRY_PREPARED"
 
 
 @pytest.mark.parametrize(
@@ -1120,6 +1120,105 @@ def test_no_fill_cancel_can_be_revoked_by_late_exact_fill(lifecycle, evidence, w
     assert snapshot.intent_states[cancel.id] == "RECONCILED_NO_CANCEL_EFFECT"
     assert result.lifecycle_state == "EXPOSED"
     assert result.complete is False
+
+
+def test_fresh_reconciliation_contradiction_durably_disarms_every_write_gate(
+    lifecycle, evidence, wire
+):
+    entry = claim_entry(lifecycle, evidence, wire)
+    changed = filled_wire(wire)
+    for row in (
+        changed["account"]["orderStatus"],
+        changed["account"]["orderHistory"][0],
+        changed["stream"]["orders"][0],
+        changed["account"]["fills"][0],
+        changed["stream"]["trades"][0],
+        changed["account"]["positions"][0],
+        changed["stream"]["positions"][0],
+    ):
+        row["accountId"] = 7002
+    contradiction = normalize_official_evidence(changed, now_ms=1_770_000_003_000)
+    with pytest.raises(LifecycleHalted):
+        lifecycle.reconcile(entry.id, contradiction)
+    assert lifecycle.store.snapshot().lifecycle_state.startswith("HALTED_")
+    assert lifecycle.store.dispatch_count(entry.id) == 1
+
+    restarted = reopen(lifecycle)
+    with pytest.raises(LifecycleHalted, match="LIFECYCLE_HALTED"):
+        restarted.prepare_cancellation(entry.id, kind="CANCEL", evidence=evidence)
+    assert restarted.store.count() == 1
+    assert restarted.store.dispatch_count(entry.id) == 1
+
+
+def test_halted_partial_fill_can_never_prepare_or_claim_close(lifecycle, evidence, wire):
+    entry = claim_entry(lifecycle, evidence, wire)
+    changed = filled_wire(wire)
+    for row in (
+        changed["account"]["orderStatus"],
+        changed["account"]["orderHistory"][0],
+        changed["stream"]["orders"][0],
+    ):
+        row["status"] = "PARTIALLY_FILLED"
+    partial = normalize_official_evidence(changed, now_ms=1_770_000_003_000)
+    result = lifecycle.reconcile(entry.id, partial)
+    assert result.lifecycle_state == "HALTED_PARTIAL_FILL_UNCERTAIN"
+    assert lifecycle.store.get(entry.id).state == "ENTRY_RECONCILED"
+    with pytest.raises(LifecycleHalted, match="LIFECYCLE_HALTED"):
+        prepare_close(lifecycle, entry.id, partial, wire)
+    assert lifecycle.store.count() == 1
+    assert lifecycle.store.dispatch_count(entry.id) == 1
+
+
+@pytest.mark.parametrize("mismatch", ["AVERAGE_PRICE", "CANCELLED_QTY"])
+def test_close_terminal_average_and_quantity_arithmetic_must_be_exact(
+    lifecycle, evidence, wire, mismatch
+):
+    entry = claim_entry(lifecycle, evidence, wire)
+    exposed = filled_evidence(wire)
+    lifecycle.reconcile(entry.id, exposed)
+    close = prepare_close(lifecycle, entry.id, exposed, wire)
+    lifecycle.claim_for_dispatch(close.id, evidence=exposed)
+    changed = closed_wire(wire, now_ms=close.expiry_ms + 1)
+    rows = (
+        changed["account"]["orderStatus"],
+        changed["account"]["orderHistory"][1],
+        changed["stream"]["orders"][1],
+    )
+    if mismatch == "AVERAGE_PRICE":
+        for row in rows:
+            row["averagePrice"] = "1"
+    else:
+        for row in rows:
+            row["cancelledQty"] = "0.001"
+    contradiction = normalize_official_evidence(changed, now_ms=close.expiry_ms + 1)
+    with pytest.raises(LifecycleHalted, match="ARITHMETIC"):
+        lifecycle.reconcile(close.id, contradiction)
+    assert lifecycle.store.get(close.id).state == "CLAIMED"
+    assert lifecycle.store.snapshot().lifecycle_state.startswith("HALTED_")
+    assert lifecycle.store.dispatch_count(close.id) == 1
+
+
+def test_unexplained_fill_is_an_irreversible_durable_halt(lifecycle, evidence, wire):
+    entry = claim_entry(lifecycle, evidence, wire)
+    changed = filled_wire(wire)
+    unexplained = copy.deepcopy(changed["account"]["fills"][0])
+    unexplained.update(id=88888, orderId=99999)
+    changed["account"]["fills"].append(unexplained)
+    changed["stream"]["trades"].append(copy.deepcopy(unexplained))
+    contradiction = normalize_official_evidence(changed, now_ms=1_770_000_003_000)
+    with pytest.raises(LifecycleHalted, match="UNEXPLAINED_FILL"):
+        lifecycle.reconcile(entry.id, contradiction)
+    assert lifecycle.store.snapshot().lifecycle_state == "HALTED_UNEXPLAINED_FILL"
+    assert lifecycle.store.dispatch_count(entry.id) == 1
+
+    restarted = reopen(lifecycle)
+    with pytest.raises(LifecycleHalted, match="LIFECYCLE_HALTED"):
+        restarted.reconcile(entry.id, filled_evidence(wire))
+    with pytest.raises(LifecycleHalted, match="LIFECYCLE_HALTED"):
+        restarted.prepare_cancellation(entry.id, kind="MASS_CANCEL", evidence=evidence)
+    assert restarted.store.snapshot().lifecycle_state == "HALTED_UNEXPLAINED_FILL"
+    assert restarted.store.count() == 1
+    assert restarted.store.dispatch_count(entry.id) == 1
 
 
 def test_no_dispatch_or_state_mutation_shortcuts_are_exposed(lifecycle):
