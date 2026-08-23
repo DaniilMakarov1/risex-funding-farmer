@@ -18,6 +18,8 @@ ACCOUNT = "0x" + "44" * 20
 SIGNER_ADDRESS = "0x" + "55" * 20
 OTHER_ACCOUNT = "0x" + "66" * 20
 OTHER_SIGNER = "0x" + "77" * 20
+OTHER_ROUTER = "0x" + "88" * 20
+OTHER_AUTHORIZATION = "0x" + "99" * 20
 SIGNER = SyntheticSigner(SIGNER_ADDRESS)
 EXPECTED_ORDER_DATA = 1_180_591_648_218_017_079_298
 EXPECTED_ACTION_HASH = "5bd95300cc7edbc329d8cf8b3552c4a891920c4f51c3a6bbba960650142b71c1"
@@ -883,6 +885,64 @@ def test_durable_identity_binding_cannot_be_reinitialized(tmp_path):
             "SELECT key, value FROM terminal WHERE key IN ('account', 'signer')"
         )) == {}
         store.close()
+
+
+def test_durable_contract_binding_cannot_be_substituted(tmp_path):
+    for index, overrides in enumerate((
+        {"router": OTHER_ROUTER, "authorization": AUTHORIZATION},
+        {"router": ROUTER, "authorization": OTHER_AUTHORIZATION},
+    )):
+        path = tmp_path / f"contract-substitution-{index}.sqlite3"
+        original = new_lifecycle(path)
+        intent = open_intent(original)
+        original.store.close()
+        store = DurableIntentStore(path)
+        before = store.all()
+        with pytest.raises(LifecycleSafetyError):
+            Lifecycle(
+                store, now=lambda: NOW, expected_account=ACCOUNT,
+                expected_signer=SIGNER_ADDRESS, **overrides,
+            )
+        assert store.all() == before
+        assert store.get(intent.intent_id).dispatch_count == 0
+        store.close()
+
+    for index, missing_keys in enumerate((("router",), ("router", "authorization"))):
+        path = tmp_path / f"missing-contract-binding-{index}.sqlite3"
+        original = new_lifecycle(path)
+        intent = open_intent(original)
+        with original.store.connection:
+            placeholders = ",".join("?" for _ in missing_keys)
+            original.store.connection.execute(
+                f"DELETE FROM terminal WHERE key IN ({placeholders})", missing_keys,
+            )
+        original.store.close()
+        store = DurableIntentStore(path)
+        before_bindings = dict(store.connection.execute(
+            "SELECT key, value FROM terminal "
+            "WHERE key IN ('account', 'signer', 'router', 'authorization')"
+        ))
+        with pytest.raises(LifecycleSafetyError):
+            Lifecycle(
+                store, now=lambda: NOW, router=ROUTER,
+                authorization=AUTHORIZATION, expected_account=ACCOUNT,
+                expected_signer=SIGNER_ADDRESS,
+            )
+        assert store.get(intent.intent_id).dispatch_count == 0
+        assert dict(store.connection.execute(
+            "SELECT key, value FROM terminal "
+            "WHERE key IN ('account', 'signer', 'router', 'authorization')"
+        )) == before_bindings
+        store.close()
+
+    path = tmp_path / "exact-contract-restart.sqlite3"
+    original = new_lifecycle(path)
+    intent = open_intent(original)
+    original.store.close()
+    restarted = new_lifecycle(path)
+    restarted.dispatch(intent, SIGNER, lambda _: "exact-order")
+    assert restarted.store.get(intent.intent_id).dispatch_count == 1
+    restarted.store.close()
 
 
 def test_dispatching_crash_reconciles_without_replay(lifecycle):

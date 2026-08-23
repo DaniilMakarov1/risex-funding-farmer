@@ -491,14 +491,21 @@ class DurableIntentStore:
         valid_from, valid_until = str(row[0]).split(":", 1)
         return int(valid_from), int(valid_until)
 
-    def _bind_identities(self, account: str, signer: str) -> None:
+    def _bind_identities(
+        self, account: str, signer: str, router: str, authorization: str,
+    ) -> None:
         with self.connection:
             binding_rows = list(self.connection.execute(
-                "SELECT key, value FROM terminal WHERE key IN ('account', 'signer')"
+                "SELECT key, value FROM terminal WHERE key IN "
+                "('account', 'signer', 'router', 'authorization')"
             ))
             rows = dict(binding_rows)
-            if len(binding_rows) == 2:
-                if rows != {"account": account, "signer": signer}:
+            expected = {
+                "account": account, "signer": signer, "router": router,
+                "authorization": authorization,
+            }
+            if len(binding_rows) == 4:
+                if rows != expected:
                     raise LifecycleSafetyError("RISEx lifecycle identity rejected")
                 return
             if binding_rows:
@@ -510,11 +517,8 @@ class DurableIntentStore:
             ))
             if journal_not_empty:
                 raise LifecycleSafetyError("RISEx lifecycle identity rejected")
-            self.connection.execute(
-                "INSERT INTO terminal VALUES ('account', ?)", (account,)
-            )
-            self.connection.execute(
-                "INSERT INTO terminal VALUES ('signer', ?)", (signer,)
+            self.connection.executemany(
+                "INSERT INTO terminal VALUES (?, ?)", expected.items(),
             )
 
     def redacted_evidence(self) -> dict[str, Any]:
@@ -565,7 +569,10 @@ class Lifecycle:
         self._authorization = _address(authorization).lower()
         self._expected_account = _address(expected_account).lower()
         self._expected_signer = _address(expected_signer).lower()
-        store._bind_identities(self._expected_account, self._expected_signer)
+        store._bind_identities(
+            self._expected_account, self._expected_signer,
+            self._router, self._authorization,
+        )
         self.outcome = store.load_outcome()
         self.observed_opening_fill = store.opening_fill_observed()
         self._halted = self.outcome != Outcome.ACTIVE
