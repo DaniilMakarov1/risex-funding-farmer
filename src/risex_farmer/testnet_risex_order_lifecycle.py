@@ -444,6 +444,12 @@ class DurableIntentStore:
     def cancel_states(self) -> list[str]:
         return [row[0] for row in self.connection.execute("SELECT state FROM cancels")]
 
+    def cancel_state(self, order_id: str) -> str | None:
+        row = self.connection.execute(
+            "SELECT state FROM cancels WHERE order_id=?", (order_id,)
+        ).fetchone()
+        return None if row is None else str(row[0])
+
     def persist_outcome(self, outcome: Outcome) -> None:
         with self.connection:
             self.connection.execute(
@@ -974,6 +980,12 @@ class Lifecycle:
             expected_position = current.source_position - evidence.filled_size
             if evidence.filled_size > current.source_position or evidence.position != expected_position:
                 self._reject(halt=True)
+        if (
+            current.kind == "OPEN" and evidence.filled_size == 0
+            and expected is not None
+            and self.store.cancel_state(expected) not in {None, "TERMINAL"}
+        ):
+            self._reject()
         self.store._reconcile_intent(intent_id, expected, evidence.position)
         if current.kind == "OPEN" and evidence.filled_size == 0 and evidence.position == 0 and not evidence.open_order_ids:
             self.outcome = Outcome.COMPLETED_NO_FILL_FLAT

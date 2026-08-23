@@ -475,6 +475,42 @@ def test_ambiguous_cancel_is_never_replayed(lifecycle):
     ) == Outcome.FAILED_HALTED_MANUAL_RECOVERY
 
 
+def test_open_terminal_waits_for_exact_cancel_reconciliation(tmp_path):
+    for index, ambiguous_cancel in enumerate((False, True)):
+        candidate = new_lifecycle(tmp_path / f"cancel-barrier-{index}.sqlite3")
+        intent = open_intent(candidate)
+        candidate.dispatch(
+            intent, SIGNER, lambda _: (_ for _ in ()).throw(TimeoutError()),
+        )
+        candidate._now = lambda: NOW + 1
+        candidate.reconcile(intent.intent_id, exact_evidence(
+            "opening-order", 101, open_ids=("opening-order",), terminal=False,
+        ))
+        if ambiguous_cancel:
+            candidate.cancel_known(
+                "opening-order",
+                lambda _: (_ for _ in ()).throw(TimeoutError()),
+            )
+            expected_cancel_state = "AMBIGUOUS"
+        else:
+            candidate.cancel_known("opening-order", lambda _: None)
+            expected_cancel_state = "PENDING_RECONCILIATION"
+        terminal = exact_evidence("opening-order", 101)
+        with pytest.raises(LifecycleSafetyError):
+            candidate.reconcile(intent.intent_id, terminal)
+        assert candidate.store.get(intent.intent_id).state == "OPEN_KNOWN"
+        assert candidate.store.cancel_states() == [expected_cancel_state]
+        assert candidate.outcome == Outcome.ACTIVE
+        assert candidate.reconcile_cancel(
+            "opening-order", account(observed_at=NOW + 1),
+        )
+        assert candidate.reconcile(
+            intent.intent_id, terminal,
+        ) == Outcome.COMPLETED_NO_FILL_FLAT
+        assert candidate.store.cancel_states() == ["TERMINAL"]
+        candidate.store.close()
+
+
 def test_unrelated_order_or_position_drift_halts_without_mutation(lifecycle, tmp_path):
     contradictory = [
         {"by_id_order_id": "other-order"},
