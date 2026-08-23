@@ -1,31 +1,27 @@
-# TESTNET-002-RISEX-SIGNER-FIX-001 — Additive Config and Hex Bitmap Parsing
+# TESTNET-002-RISEX-SIGNER-FIX-002 — EIP-55 Domain Verifier Identity
 
-Status: `ACCEPTED — ONE REPLACEMENT OPERATIONAL REGISTRATION AUTHORIZED; NO ORDERS`.
+Status: `ACTIVE — DETERMINISTIC CORRECTION ONLY; NO LIVE INVOCATION`.
 
-Start from exact published `main == origin/main == 6d8eb17bd44eb17505fd0ca0ccb0b402286c239a` on `codex/testnet-002-risex-signer-fix-001`. The accepted signer implementation remains a deterministic candidate, but operational onboarding is blocked: its one authorized invocation failed before secret load/signing/claim/dispatch with zero POST because current official public response shapes are narrower than its parser assumptions.
+Start from exact published `main == origin/main == afc76b9fa3b602232ee9147a4a75bbc6975aea56` on fresh branch `codex/testnet-002-risex-signer-fix-002`. The prior replacement operational registration invoked the function exactly once and stopped fail-closed with zero POST before main-secret load, signing, durable claim, or dispatch. Official `/v1/auth/eip712-domain` returned approved contract `0x6DA86F486b5E6536358F5b122dBe184522CA0eE3`, whose normalized 20-byte identity equals lowercase approved `_AUTH`; current whole-object equality rejects its EIP-55 text spelling.
 
-## Proven correction
+## Bounded correction
 
-- `/v1/system/config` remains authoritative when `data`, `chain`, and `addresses` are objects containing exact `chain.name == "Rise Testnet"`, string `chain.chain_id == "11155931"`, and normalized `addresses.auth == 0x6da86f486b5e6536358f5b122dbe184522ca0ee3`. Ignore unrelated additive fields in those objects. Missing, wrong, or type-confused required fields fail closed.
-- Current official [`AuthService_GetNonceState` OpenAPI](https://developer.rise.trade/reference/authservice_getnoncestate.md) defines `bitmap` as a `0x`-prefixed hexadecimal string representing `uint256` and gives `0x7` as its example; the official testnet response for the approved wallet is `0x0`. Accept only canonical nonempty `0x[0-9a-fA-F]+`, bounded to `0 <= value < 2**256`. Reject whitespace, sign, empty prefix, non-hex, booleans, numbers, objects, overflow, and all other representations.
-- Preserve exact decimal-string `nonce_anchor`, integer `current_bitmap_index` bounds `0..208`, anchor overflow rejection, prescribed signed `nonce_anchor + 1`, and signed bitmap index `0`.
-- Do not change the exact host/final URL/redirect/TLS/domain/wallet/status/list/expiration/secret/signature/durability/one-POST/reconciliation gates or public API.
+- Keep the exact domain key set and exact `name`, `version`, and string `chain_id` checks.
+- Validate `verifying_contract` through the existing strict address normalizer and require normalized equality to approved `_AUTH`.
+- Do not accept extra or missing domain fields, wrong but well-formed addresses, malformed/type-confused verifiers, or wrong name/version/chain.
+- Change no config, nonce, endpoint, TLS, redirect/final-URL, wallet, status/list, expiration, signing, persistence, reconciliation, state, or transport behavior.
 
 ## Mandatory RED and acceptance
 
-1. Exact published baseline rejects the exact observed additive config and official `bitmap: "0x0"` before secret load and therefore cannot reach the governed registration path.
-2. Exact observed additive config and required identity nested among additional fields pass; missing/wrong/type-confused name, chain id, auth, chain, addresses, or data fail closed.
-3. Bitmap `0x0`, representative nonzero values, and the `2**256 - 1` boundary parse exactly. Empty prefix, sign, whitespace, non-hex, non-string, boolean, object, and `2**256` overflow fail closed.
-4. Every rejected response proves zero main-secret callback calls, zero signer signing, unchanged local `CREATED` record, and zero POST.
-5. Preserve all existing 444 tests, normal Farmer import isolation, exact one POST site, no revoke dispatch, and no order/cancel/position/trading/mainnet surface.
-6. Run focused tests with asyncio debug, full Python 3.11 pytest, compileall, diff-check, dependency/import isolation, secret scan, pending-process audit, and both worktree Git consistency.
+1. Exact published baseline rejects the exact current official EIP-55 verifier before reaching the synthetic main-secret loader.
+2. Candidate accepts that exact checksum spelling and reaches the loader boundary; the synthetic loader stops execution, proving zero signing, durable claim, record mutation, and POST.
+3. Wrong valid address, malformed/missing/non-string verifier, wrong name/version/chain, and extra/missing domain fields all fail before loader, signing, claim, record mutation, and POST.
+4. Address validation is strict 20-byte hex identity normalization, not arbitrary lowercasing.
+5. Preserve the real signer credential and record byte-for-byte: signer `0x6274d6d9f628ba89c36de4b71efa2c602b7f783b`, expiration `2026-09-22T15:46:50Z`, state `CREATED`; deterministic work never reads credential bytes or accesses XLSX/network.
+6. Run focused Python 3.11 tests with asyncio debug, full pytest, compileall, exact diff, dependency/import isolation, secret scan, one-POST/no-trading surface, pending-process, and both-worktree Git checks.
 
-## Ownership and workflow boundary
+## Ownership and workflow
 
-Only `src/risex_farmer/testnet_risex_signer.py` owns these response parsers. Expected production change is limited to `_identity` and `_nonce`; focused tests may change only `tests/test_testnet_risex_signer.py`. Any dependency or other production edit requires Architect justification before change. No compatibility layer, generic coercion, new state, retry, endpoint, service, or configuration is permitted.
+Production scope is only the EIP-712 domain portion of `_identity` in `src/risex_farmer/testnet_risex_signer.py`; tests may change only `tests/test_testnet_risex_signer.py`. Exactly one Builder starts after this governance commit, authors RED against the exact published baseline, then makes the smallest GREEN production edit in one implementation commit. Builder must not spawn agents. Architect independently reviews RED and every hunk. At most two fix cycles.
 
-Exactly one Builder starts from the governance commit on this fresh branch, authors RED first, and must not spawn agents. Architect reviews RED before GREEN. One implementation commit and at most two fix cycles. Stop for Chief candidate review before merge, push, XLSX/credential access, secret load, signing, claim, registration, revoke, or any other live action. Preserve the existing credential and record exactly; do not generate, delete, reset, rename, replace, or expose them.
-
-## Accepted operational boundary
-
-The accepted chain is base `6d8eb17bd44eb17505fd0ca0ccb0b402286c239a`, governance `54010d7981e8751c002565a2109a4e1403dc42b4`, RED `2a84065c496e8eeb6e7102c1878c08c0f0e5c649`, implementation `8d76e6465480185840ac04b99ba6a98bdea71599`, and fix cycle 1 `079106d42a9a96d21003e73640e2fbdf0d00c750`. After ordinary fast-forward integration through the physical Desktop main checkout, push, exact import identity, full gates, and preserved signer metadata verification, the Architect may invoke registration exactly once for the existing signer. The approved main-wallet key is loaded only inside the accepted lazy callback after public gates and exact derived-address verification. There is at most one POST and no retry. ACTIVE requires a separate authoritative status/list check; an ambiguous dispatch permits at most five read-only checks over at most 60 seconds. Stop after reporting; no order, revoke, other venue, mainnet, real-funds, Scanner/runtime, Telegram, strategy, or economics action begins.
+Stop for Chief candidate review before acceptance governance, merge, push, XLSX/credential access, secret load, signing, claim, registration, revoke, or live action. No order/cancel/position, Farmer/runtime/Scanner/Telegram, Nado/Extended, strategy/economics, mainnet, real funds, or new product behavior.
