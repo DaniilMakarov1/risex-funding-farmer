@@ -630,6 +630,8 @@ async def test_official_hex_bitmap_parses_exact_uint256(
 @pytest.mark.parametrize("bitmap", [
     "0x", "-0x1", "+0x1", " 0x1", "0x1 ", "0x1 0", "0xg", "0X0",
     "0", 0, True, {"hex": "0x0"}, "0x1" + "0" * 64,
+    pytest.param("0x" + "0" * 65, id="65-zero-digits"),
+    pytest.param("0x" + "0" * 100_000 + "1", id="overlong-zero-padded-one"),
 ])
 @pytest.mark.asyncio
 async def test_invalid_hex_bitmap_rejects_before_sensitive_work(

@@ -544,7 +544,7 @@ async def _nonce(session: aiohttp.ClientSession, account: str) -> _Nonce:
     bitmap_digits = bitmap[2:] if isinstance(bitmap, str) and bitmap.startswith("0x") else ""
     if (not isinstance(anchor, str) or not anchor.isdigit()
             or not isinstance(index, int)
-            or not bitmap_digits
+            or not 1 <= len(bitmap_digits) <= 64
             or not all(character in "0123456789abcdefABCDEF"
                        for character in bitmap_digits)):
         raise _safety_error()
