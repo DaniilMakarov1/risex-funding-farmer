@@ -247,6 +247,7 @@ class OfficialEvidence:
     connected: bool
     gap_free: bool
     account_id: int
+    account_status: str
     l2_key: str
     l2_vault: int
     market_name: str
@@ -539,6 +540,7 @@ def normalize_official_evidence(raw: Mapping[str, Any], *, now_ms: int) -> Offic
         connected=stream["connected"],
         gap_free=stream["gapFree"],
         account_id=identity["accountId"],
+        account_status=info["status"],
         l2_key=identity["l2Key"],
         l2_vault=identity["l2Vault"],
         market_name=market["name"],
@@ -782,7 +784,14 @@ class ExtendedLifecycle:
         clocks = (evidence.server_time_ms, evidence.stream_event_ms, evidence.now_ms)
         return all(clock > expiry_ms for clock in clocks) if strict else any(clock >= expiry_ms for clock in clocks)
 
-    def _validate_entry(self, evidence: OfficialEvidence, *, qty: Decimal, price: Decimal) -> None:
+    def _validate_order_gate(
+        self,
+        evidence: OfficialEvidence,
+        *,
+        vector: Mapping[str, Any],
+        qty: Decimal,
+        price: Decimal,
+    ) -> Decimal:
         self._validate_common(evidence)
         market = evidence.market
         config = market["tradingConfig"]
@@ -790,20 +799,26 @@ class ExtendedLifecycle:
             raise EvidenceViolation("MARKET_INACTIVE")
         if market["isRfq"]:
             raise EvidenceViolation("RFQ_FORBIDDEN")
+        if market["isOffHours"]:
+            raise EvidenceViolation("OFF_HOURS_FORBIDDEN")
         if market["type"] != "PERPETUAL":
             raise EvidenceViolation("PERPETUAL_REQUIRED")
+        if evidence.account_status != "ACTIVE":
+            raise EvidenceViolation("ACCOUNT_INACTIVE")
+        if evidence.balance["collateralName"] != market["collateralAssetName"]:
+            raise EvidenceViolation("COLLATERAL_MISMATCH")
         minimum = _decimal(config["minOrderSize"], "minimum")
         step = _decimal(config["minOrderSizeChange"], "step")
         tick = _decimal(config["minPriceChange"], "tick")
         if minimum != step:
             raise EvidenceViolation("MINIMUM_STEP_MISMATCH")
-        if not self._grid(qty, step):
-            raise EvidenceViolation("QTY_OFF_GRID")
+        if qty != minimum or _decimal(vector["qty"], "order.qty") != minimum:
+            raise EvidenceViolation("ONE_STEP_QTY_REQUIRED")
         if not self._grid(price, tick):
             raise EvidenceViolation("PRICE_OFF_GRID")
-        vector = evidence.entry_vector
-        if qty != _decimal(vector["qty"], "entry.qty") or price != _decimal(vector["price"], "entry.price"):
+        if price != _decimal(vector["price"], "order.price"):
             raise EvidenceViolation("ORDER_VECTOR_MISMATCH")
+        build_limit_ioc_order(vector, evidence.server_time_ms)
         if any(
             not evidence.book[side]
             or sum(
@@ -822,17 +837,36 @@ class ExtendedLifecycle:
         leverage_value = _decimal(leverage["leverage"], "leverage") if leverage is not None else Decimal(0)
         if leverage is None or not 0 < leverage_value <= _decimal(config["maxLeverage"], "maxLeverage"):
             raise EvidenceViolation("LEVERAGE_INVALID")
-        close_qty = _decimal(evidence.close_vector["qty"], "close.qty")
-        close_price = _decimal(evidence.close_vector["price"], "close.price")
-        entry_notional = qty * price
-        close_notional = close_qty * close_price
-        required_balance = entry_notional + close_notional + (entry_notional + close_notional) * fee_rate
+        notional = qty * price
+        required_balance = notional * (Decimal(1) + fee_rate)
         if _decimal(evidence.balance["availableForTrade"], "availableForTrade") < required_balance:
             raise EvidenceViolation("BALANCE_INSUFFICIENT")
+        if evidence.open_orders:
+            raise EvidenceViolation("OPEN_ORDER_PRESENT")
+        if notional > MAX_NOTIONAL_USD:
+            raise EvidenceViolation("NOTIONAL_CAP")
+        return fee_rate
+
+    def _validate_entry(self, evidence: OfficialEvidence, *, qty: Decimal, price: Decimal) -> None:
         if evidence.open_orders or evidence.positions:
             raise EvidenceViolation("NOT_FLAT")
-        if entry_notional > MAX_NOTIONAL_USD or close_notional > MAX_NOTIONAL_USD:
-            raise EvidenceViolation("NOTIONAL_CAP")
+        entry_fee = self._validate_order_gate(
+            evidence, vector=evidence.entry_vector, qty=qty, price=price
+        )
+        close_qty = _decimal(evidence.close_vector["qty"], "close.qty")
+        close_price = _decimal(evidence.close_vector["price"], "close.price")
+        close_fee = self._validate_order_gate(
+            evidence,
+            vector=evidence.close_vector,
+            qty=close_qty,
+            price=close_price,
+        )
+        if close_qty != qty:
+            raise EvidenceViolation("ONE_STEP_QTY_REQUIRED")
+        required_balance = qty * price * (Decimal(1) + entry_fee)
+        required_balance += close_qty * close_price * (Decimal(1) + close_fee)
+        if _decimal(evidence.balance["availableForTrade"], "availableForTrade") < required_balance:
+            raise EvidenceViolation("BALANCE_INSUFFICIENT")
 
     @staticmethod
     def _assert_binding(intent: Intent, evidence: OfficialEvidence) -> None:
@@ -840,6 +874,24 @@ class ExtendedLifecycle:
             raise EvidenceViolation("ACCOUNT_IDENTITY_MISMATCH")
         if intent.market != evidence.market_name:
             raise EvidenceViolation("MARKET_IDENTITY_MISMATCH")
+
+    @staticmethod
+    def _validate_intent_vector(intent: Intent, evidence: OfficialEvidence) -> None:
+        vector = evidence.entry_vector if intent.kind == "ENTRY" else evidence.close_vector
+        payload = build_limit_ioc_order(vector, evidence.server_time_ms)
+        if (
+            vector["nonce"] != intent.nonce
+            or vector["externalId"] != intent.external_id
+            or vector["market"] != intent.market
+            or vector["side"] != intent.side
+            or _decimal(vector["qty"], "order.qty") != intent.qty
+            or _decimal(vector["price"], "order.price") != intent.price
+            or vector["expiryEpochMillis"] != intent.expiry_ms
+            or vector["reduceOnly"] is not intent.reduce_only
+            or payload != intent.unsigned_api_payload
+            or canonical_payload_digest(payload) != intent.payload_digest
+        ):
+            raise ContractViolation("ORDER_VECTOR_MISMATCH")
 
     def prepare_order(
         self,
@@ -907,6 +959,7 @@ class ExtendedLifecycle:
         self._assert_binding(intent, evidence)
         if intent.kind == "ENTRY":
             self._validate_entry(evidence, qty=intent.qty, price=intent.price)
+            self._validate_intent_vector(intent, evidence)
         elif intent.kind == "CLOSE":
             self._validate_close_evidence(intent, evidence)
         self.store._claim(intent.id)
@@ -974,10 +1027,16 @@ class ExtendedLifecycle:
         return position
 
     def _validate_close_evidence(self, intent: Intent, evidence: OfficialEvidence) -> None:
-        self._validate_common(evidence)
         self._assert_binding(intent, evidence)
         if evidence.open_orders:
             raise LifecycleHalted("OPEN_ORDER_PRESENT")
+        self._validate_order_gate(
+            evidence,
+            vector=evidence.close_vector,
+            qty=intent.qty,
+            price=intent.price,
+        )
+        self._validate_intent_vector(intent, evidence)
         position = self._position(evidence)
         expected_side = "LONG" if intent.side == "SELL" else "SHORT"
         if (
@@ -1005,20 +1064,15 @@ class ExtendedLifecycle:
         entry = self.store.get(entry_id)
         if entry.kind != "ENTRY" or entry.state != "ENTRY_RECONCILED":
             raise LifecycleHalted("ENTRY_NOT_RECONCILED")
-        self._validate_common(evidence)
+        if any(existing.kind == "CLOSE" for existing in self.store._all()):
+            raise LifecycleHalted("CLOSE_ALREADY_EXISTS")
         self._assert_binding(entry, evidence)
+        self._validate_common(evidence)
         if evidence.open_orders:
             raise LifecycleHalted("OPEN_ORDER_PRESENT")
         position = self._position(evidence)
         self._validate_position_binding(entry, position)
         qty = _decimal(position["size"], "position.size")
-        config = evidence.market["tradingConfig"]
-        minimum = _decimal(config["minOrderSize"], "minimum")
-        step = _decimal(config["minOrderSizeChange"], "step")
-        if qty < minimum:
-            raise LifecycleHalted("SUB_MINIMUM_RESIDUAL")
-        if not self._grid(qty, step):
-            raise LifecycleHalted("OFF_GRID_RESIDUAL")
         if abs(qty * price) > MAX_NOTIONAL_USD:
             raise LifecycleHalted("NOTIONAL_CAP")
         side = "SELL" if position["side"] == "LONG" else "BUY"
@@ -1040,6 +1094,7 @@ class ExtendedLifecycle:
             or vector["reduceOnly"] is not True
         ):
             raise ContractViolation("CLOSE_VECTOR_MISMATCH")
+        self._validate_order_gate(evidence, vector=vector, qty=qty, price=price)
         payload = build_limit_ioc_order(vector, evidence.server_time_ms)
         intent = Intent(
             id=external_id,
@@ -1097,15 +1152,35 @@ class ExtendedLifecycle:
     ) -> tuple[dict[str, Any], ...]:
         self._validate_order_binding(intent, order)
         fills = self._matching_fills(order, evidence)
+        fee_rate = _decimal(intent.unsigned_api_payload["fee"], "order.fee")
+        total_fee = Decimal(0)
         for fill in fills:
+            fill_price = _decimal(fill["price"], "fill.price")
+            fill_qty = _decimal(fill["qty"], "fill.qty")
+            fill_value = _decimal(fill["value"], "fill.value")
+            fill_fee = _decimal(fill["fee"], "fill.fee")
             if (
                 fill["accountId"] != intent.account_id
                 or fill["market"] != intent.market
                 or fill["side"] != intent.side
                 or fill["orderId"] != order["id"]
-                or _decimal(fill["qty"], "fill.qty") <= 0
+                or fill_qty <= 0
+                or fill_price <= 0
+                or fill["isTaker"] is not True
+                or fill["tradeType"] != "TRADE"
             ):
                 raise LifecycleHalted("FILL_BINDING_MISMATCH")
+            if (
+                fill_value != fill_price * fill_qty
+                or fill_fee < 0
+                or fill_fee != fill_value * fee_rate
+                or (intent.side == "BUY" and fill_price > intent.price)
+                or (intent.side == "SELL" and fill_price < intent.price)
+            ):
+                raise LifecycleHalted("FILL_ARITHMETIC_MISMATCH")
+            total_fee += fill_fee
+        if _decimal(order["payedFee"], "order.payedFee") != total_fee:
+            raise LifecycleHalted("FILL_ARITHMETIC_MISMATCH")
         return fills
 
     @staticmethod
@@ -1181,6 +1256,13 @@ class ExtendedLifecycle:
                 return ReconciliationResult(
                     "FLAT_PENDING_EXPIRY", False, reconciled_external_ids=frozenset({target.external_id})
                 )
+            if (
+                len(evidence.order_history) != 1
+                or evidence.order_history[0]["externalId"] != target.external_id
+                or evidence.order_status is None
+                or evidence.order_status["externalId"] != target.external_id
+            ):
+                raise LifecycleHalted("FINAL_HISTORY_MISMATCH")
             all_intents = self.store._all()
             final_safe = (
                 self._past_expiry(evidence, max(row.expiry_ms for row in all_intents), strict=True)

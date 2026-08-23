@@ -144,7 +144,7 @@ def closed_evidence(wire, *, now_ms=1_770_000_020_000):
     return normalize_official_evidence(closed_wire(wire, now_ms=now_ms), now_ms=now_ms)
 
 
-def cancelled_evidence(wire, *, now_ms=1_770_000_003_000):
+def cancelled_wire(wire, *, now_ms=1_770_000_003_000):
     changed = copy.deepcopy(wire)
     cancelled = copy.deepcopy(changed["filledOrder"])
     cancelled.update(status="CANCELLED", filledQty="0", cancelledQty="0.001", averagePrice=None, payedFee="0")
@@ -160,7 +160,11 @@ def cancelled_evidence(wire, *, now_ms=1_770_000_003_000):
     changed["stream"]["orders"] = [cancelled]
     changed["stream"]["positions"] = []
     changed["stream"]["trades"] = []
-    return normalize_official_evidence(changed, now_ms=now_ms)
+    return changed
+
+
+def cancelled_evidence(wire, *, now_ms=1_770_000_003_000):
+    return normalize_official_evidence(cancelled_wire(wire, now_ms=now_ms), now_ms=now_ms)
 
 
 def test_full_sepolia_domain_and_pinned_official_provenance_are_exact(wire):
@@ -614,6 +618,9 @@ def test_partial_fill_accounting_halts_subminimum_or_offgrid_residual(
     changed["filledOrder"]["status"] = "PARTIALLY_FILLED"
     changed["filledOrder"]["filledQty"] = fill_qty
     changed["fill"]["qty"] = fill_qty
+    changed["fill"]["value"] = str(Decimal(fill_qty) * Decimal("40008"))
+    changed["fill"]["fee"] = str(Decimal(changed["fill"]["value"]) * Decimal("0.00025"))
+    changed["filledOrder"]["payedFee"] = changed["fill"]["fee"]
     changed["position"]["size"] = position_qty
     changed["position"]["value"] = str(Decimal(position_qty) * Decimal("40008"))
     partial = filled_evidence(changed)
@@ -916,6 +923,203 @@ def test_claimed_cancel_no_fill_terminalizes_then_completes_only_after_expiry(
     assert result.lifecycle_state == "COMPLETE"
     assert result.complete is True
     assert result.next_write is None
+
+
+@pytest.mark.parametrize("stage", ["PREPARE", "CLAIM"])
+def test_close_price_must_be_tick_aligned_at_prepare_and_claim(lifecycle, evidence, wire, stage):
+    entry = claim_entry(lifecycle, evidence, wire)
+    exposed = filled_evidence(wire)
+    lifecycle.reconcile(entry.id, exposed)
+    if stage == "PREPARE":
+        changed = copy.deepcopy(wire)
+        changed["close"]["price"] = "40000.5"
+        changed["vectors"]["closeCanonicalPayloadDigest"] = canonical_payload_digest(
+            build_limit_ioc_order(changed["close"])
+        )
+        candidate = filled_evidence(changed)
+        with pytest.raises((EvidenceViolation, ContractViolation), match="GRID|VECTOR"):
+            prepare_close(lifecycle, entry.id, candidate, changed)
+    else:
+        close = prepare_close(lifecycle, entry.id, exposed, wire)
+        changed = copy.deepcopy(wire)
+        changed["close"]["price"] = "40000.5"
+        changed["vectors"]["closeCanonicalPayloadDigest"] = canonical_payload_digest(
+            build_limit_ioc_order(changed["close"])
+        )
+        candidate = filled_evidence(changed)
+        with pytest.raises((EvidenceViolation, ContractViolation), match="GRID|VECTOR"):
+            lifecycle.claim_for_dispatch(close.id, evidence=candidate)
+        assert lifecycle.store.get(close.id).state == "PREPARED"
+
+
+@pytest.mark.parametrize("stage", ["PREPARE", "CLAIM"])
+@pytest.mark.parametrize(
+    "constraint",
+    [
+        "INACTIVE",
+        "RFQ",
+        "SPOT",
+        "NO_BIDS",
+        "OFF_HOURS",
+        "ACCOUNT",
+        "COLLATERAL",
+        "MIN_STEP",
+        "FEE",
+        "LEVERAGE",
+        "BALANCE",
+    ],
+)
+def test_close_revalidates_current_market_account_and_depth_gates(
+    lifecycle, evidence, wire, stage, constraint
+):
+    entry = claim_entry(lifecycle, evidence, wire)
+    exposed = filled_evidence(wire)
+    lifecycle.reconcile(entry.id, exposed)
+    close = prepare_close(lifecycle, entry.id, exposed, wire) if stage == "CLAIM" else None
+    changed = filled_wire(wire)
+    if constraint == "INACTIVE":
+        changed["market"]["active"] = False
+    elif constraint == "RFQ":
+        changed["market"]["isRfq"] = True
+    elif constraint == "SPOT":
+        changed["market"]["type"] = "SPOT"
+    elif constraint == "NO_BIDS":
+        changed["book"]["bids"] = []
+    elif constraint == "OFF_HOURS":
+        changed["market"]["isOffHours"] = True
+    elif constraint == "ACCOUNT":
+        changed["account"]["info"]["status"] = "DISABLED"
+    elif constraint == "COLLATERAL":
+        changed["account"]["balance"]["collateralName"] = "USDC"
+        changed["stream"]["balance"]["collateralName"] = "USDC"
+    elif constraint == "MIN_STEP":
+        changed["market"]["tradingConfig"]["minOrderSize"] = "0.0005"
+        changed["market"]["tradingConfig"]["minOrderSizeChange"] = "0.0005"
+    elif constraint == "FEE":
+        changed["account"]["fees"][0]["takerFeeRate"] = "0.0003"
+    elif constraint == "LEVERAGE":
+        changed["account"]["leverage"][0]["leverage"] = "0"
+    else:
+        changed["account"]["balance"]["availableForTrade"] = "1"
+        changed["stream"]["balance"]["availableForTrade"] = "1"
+    candidate = normalize_official_evidence(changed, now_ms=1_770_000_003_000)
+    with pytest.raises((EvidenceViolation, LifecycleHalted)):
+        if stage == "PREPARE":
+            prepare_close(lifecycle, entry.id, candidate, wire)
+        else:
+            lifecycle.claim_for_dispatch(close.id, evidence=candidate)
+    if close is not None:
+        assert lifecycle.store.get(close.id).state == "PREPARED"
+
+
+def test_rejected_close_can_never_rearm_a_second_close(lifecycle, evidence, wire):
+    entry = claim_entry(lifecycle, evidence, wire)
+    exposed = filled_evidence(wire)
+    lifecycle.reconcile(entry.id, exposed)
+    close = prepare_close(lifecycle, entry.id, exposed, wire)
+    lifecycle.claim_for_dispatch(close.id, evidence=exposed)
+    rejected_raw = closed_wire(wire, now_ms=1_770_000_006_000)
+    rejected = copy.deepcopy(rejected_raw["filledCloseOrder"])
+    rejected.update(status="REJECTED", statusReason="REDUCE_ONLY_FAILED", filledQty="0")
+    rejected_raw["account"]["orderStatus"] = rejected
+    rejected_raw["account"]["orderHistory"] = [rejected_raw["filledOrder"], rejected]
+    rejected_raw["account"]["fills"] = [rejected_raw["fill"]]
+    rejected_raw["account"]["positions"] = [rejected_raw["position"]]
+    rejected_raw["stream"]["orders"] = [copy.deepcopy(rejected_raw["filledOrder"]), copy.deepcopy(rejected)]
+    rejected_raw["stream"]["trades"] = [copy.deepcopy(rejected_raw["fill"])]
+    rejected_raw["stream"]["positions"] = [copy.deepcopy(rejected_raw["position"])]
+    rejected_evidence = normalize_official_evidence(rejected_raw, now_ms=1_770_000_006_000)
+    lifecycle.reconcile(close.id, rejected_evidence)
+
+    changed = copy.deepcopy(wire)
+    changed["close"]["nonce"] = 1_700_000_002
+    changed["close"]["settlementHash"] = 323456789012345678901234567890
+    changed["close"]["externalId"] = "323456789012345678901234567890"
+    changed["vectors"]["closeCanonicalPayloadDigest"] = canonical_payload_digest(
+        build_limit_ioc_order(changed["close"])
+    )
+    with pytest.raises(LifecycleHalted, match="CLOSE_ALREADY_EXISTS"):
+        prepare_close(lifecycle, entry.id, rejected_evidence, changed)
+    assert lifecycle.store.count() == 2
+
+
+def test_entry_and_close_vector_quantity_must_equal_exactly_one_minimum_step(lifecycle, wire):
+    changed = copy.deepcopy(wire)
+    for name, digest_name in (("entry", "canonicalPayloadDigest"), ("close", "closeCanonicalPayloadDigest")):
+        changed[name]["qty"] = "0.002"
+        changed["vectors"][digest_name] = canonical_payload_digest(build_limit_ioc_order(changed[name]))
+    candidate = normalize_official_evidence(changed, now_ms=1_770_000_000_000)
+    with pytest.raises(EvidenceViolation, match="ONE_STEP"):
+        prepare_entry(lifecycle, candidate, changed)
+
+
+@pytest.mark.parametrize("leg", ["ENTRY", "CLOSE"])
+@pytest.mark.parametrize("mismatch", ["VALUE", "FILL_FEE", "ORDER_FEE"])
+def test_fill_value_fee_and_order_fee_arithmetic_are_exact(lifecycle, evidence, wire, leg, mismatch):
+    entry = claim_entry(lifecycle, evidence, wire)
+    if leg == "ENTRY":
+        changed = filled_wire(wire)
+        if mismatch == "VALUE":
+            changed["account"]["fills"][0]["value"] = "1"
+            changed["stream"]["trades"][0]["value"] = "1"
+        elif mismatch == "FILL_FEE":
+            changed["account"]["fills"][0]["fee"] = "0"
+            changed["stream"]["trades"][0]["fee"] = "0"
+        else:
+            changed["account"]["orderStatus"]["payedFee"] = "0"
+            changed["stream"]["orders"][0]["payedFee"] = "0"
+        candidate = normalize_official_evidence(changed, now_ms=1_770_000_003_000)
+        with pytest.raises(LifecycleHalted, match="ARITHMETIC"):
+            lifecycle.reconcile(entry.id, candidate)
+        assert lifecycle.store.get(entry.id).state == "CLAIMED"
+    else:
+        exposed = filled_evidence(wire)
+        lifecycle.reconcile(entry.id, exposed)
+        close = prepare_close(lifecycle, entry.id, exposed, wire)
+        lifecycle.claim_for_dispatch(close.id, evidence=exposed)
+        changed = closed_wire(wire, now_ms=close.expiry_ms + 1)
+        if mismatch == "VALUE":
+            changed["account"]["fills"][1]["value"] = "1"
+            changed["stream"]["trades"][1]["value"] = "1"
+        elif mismatch == "FILL_FEE":
+            changed["account"]["fills"][1]["fee"] = "0"
+            changed["stream"]["trades"][1]["fee"] = "0"
+        else:
+            changed["account"]["orderStatus"]["payedFee"] = "0"
+            changed["stream"]["orders"][1]["payedFee"] = "0"
+        candidate = normalize_official_evidence(changed, now_ms=close.expiry_ms + 1)
+        with pytest.raises(LifecycleHalted, match="ARITHMETIC"):
+            lifecycle.reconcile(close.id, candidate)
+        assert lifecycle.complete is False
+
+
+def test_no_fill_final_barrier_rejects_unexpected_order_identity(lifecycle, evidence, wire):
+    entry = claim_entry(lifecycle, evidence, wire)
+    cancel = lifecycle.prepare_cancellation(entry.id, kind="CANCEL", evidence=evidence)
+    lifecycle.claim_for_dispatch(cancel.id, evidence=evidence)
+    lifecycle.reconcile(cancel.id, cancelled_evidence(wire))
+    changed = cancelled_wire(wire, now_ms=cancel.expiry_ms + 1)
+    unrelated = copy.deepcopy(changed["filledCloseOrder"])
+    unrelated.update(status="CANCELLED", filledQty="0", cancelledQty="0.001", averagePrice=None, payedFee="0")
+    changed["account"]["orderHistory"].append(unrelated)
+    changed["stream"]["orders"].append(copy.deepcopy(unrelated))
+    candidate = normalize_official_evidence(changed, now_ms=cancel.expiry_ms + 1)
+    with pytest.raises(LifecycleHalted, match="FINAL_HISTORY"):
+        lifecycle.reconcile(cancel.id, candidate)
+    assert lifecycle.complete is False
+
+
+def test_no_fill_cancel_can_be_revoked_by_late_exact_fill(lifecycle, evidence, wire):
+    entry = claim_entry(lifecycle, evidence, wire)
+    cancel = lifecycle.prepare_cancellation(entry.id, kind="CANCEL", evidence=evidence)
+    lifecycle.claim_for_dispatch(cancel.id, evidence=evidence)
+    lifecycle.reconcile(cancel.id, cancelled_evidence(wire))
+    result = lifecycle.reconcile(cancel.id, filled_evidence(wire))
+    snapshot = lifecycle.store.snapshot()
+    assert snapshot.intent_states[entry.id] == "ENTRY_RECONCILED"
+    assert snapshot.intent_states[cancel.id] == "RECONCILED_NO_CANCEL_EFFECT"
+    assert result.lifecycle_state == "EXPOSED"
+    assert result.complete is False
 
 
 def test_no_dispatch_or_state_mutation_shortcuts_are_exposed(lifecycle):
