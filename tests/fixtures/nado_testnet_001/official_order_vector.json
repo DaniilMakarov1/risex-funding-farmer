@@ -1,0 +1,32 @@
+{
+  "sources": {
+    "typescript_sdk": "315e4f23dadefeb2f86f713e423241e81467d4c3",
+    "rust_sdk": "e54118786b171a4325871d5bd17e5abae0e90c5a",
+    "contracts": "11c27b2851999f1b4f8cb4a7fbfcc9320253f12f"
+  },
+  "environment": {
+    "chain_id": 763373,
+    "domain_name": "Nado",
+    "domain_version": "0.0.1",
+    "endpoint": "0x698D87105274292B5673367DEC81874Ce3633Ac2",
+    "gateway": "https://gateway.test.nado.xyz/v1",
+    "gateway_ws": "wss://gateway.test.nado.xyz/v1/ws",
+    "archive": "https://archive.test.nado.xyz/v1",
+    "trigger": "https://trigger.test.nado.xyz/v1"
+  },
+  "synthetic_key": "0x0000000000000000000000000000000000000000000000000000000000000001",
+  "owner": "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf",
+  "subaccount_name": "default",
+  "sender": "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf64656661756c740000000000",
+  "product_id": 2,
+  "product_verifier": "0x0000000000000000000000000000000000000002",
+  "price_x18": "35000000000000000000000",
+  "amount_x18": "10000000000000000",
+  "expiration": 4294967295,
+  "recv_time": 1700000090000,
+  "salt": 42,
+  "nonce": "1782579294371840042",
+  "appendix": "1537",
+  "digest": "0x7c7c5346d84d18661816453221752af40230369c711737e5a78d0bf84f14520c",
+  "signature": "0xa31481570b7cb247bc941b606ea18d66ebb0786bc7bbefb5d494bc53a139aea76350360560d632a62f3d3f1e9466fc777b96e0728c5b948919a75f0c8b57ddc51c"
+}
