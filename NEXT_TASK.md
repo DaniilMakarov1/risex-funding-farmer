@@ -49,7 +49,7 @@ Governance-only audit commit `73068dc202c6c47607dc9c9b349001d4fb0edbf2` and bran
 
 ## Accepted RED, fixture, and adversarial gates
 
-On exact base `d5a4b78de599a9e808fd5aba13aa3d60e2925946`, `tests/test_testnet_risex_order_lifecycle.py` first failed because the bounded module/behavior was absent. The accepted unchanged chain through `4b323c6d` passes these required regressions:
+On exact authorized base `2f3dff295705e2494a057089b4d44edcca3c1b60`, `tests/test_testnet_risex_order_lifecycle.py` first failed because the bounded module/behavior was absent. The accepted unchanged chain from `97e5b32` through `4b323c6d` passes these required regressions:
 
 1. `test_preflight_blocks_before_signer_or_post`
 2. `test_intent_nonce_and_digest_are_durable_before_dispatch`
