@@ -21,6 +21,7 @@ from yarl import URL
 WALLET = "0x20f9153e2eeba0ff7880fb5a23e976e8b2af56ee"
 OTHER_WALLET = "0x1111111111111111111111111111111111111111"
 AUTH = "0x6da86f486b5e6536358f5b122dbe184522ca0ee3"
+OFFICIAL_CHECKSUM_AUTH = "0x6DA86F486b5E6536358F5b122dBe184522CA0eE3"
 WRONG_AUTH = "0x2222222222222222222222222222222222222222"
 ORIGIN = "https://api.testnet.rise.trade"
 CHAIN_ID = 11_155_931
@@ -514,6 +515,7 @@ async def test_observed_operational_shapes_reach_only_main_secret_boundary(
     _seed_generated(module, disposable_home)
     scenario = transport(Scenario())
     scenario.config = _observed_additive_config()
+    scenario.domain = _domain(auth=OFFICIAL_CHECKSUM_AUTH)
     scenario.nonce = _envelope({
         "nonce_anchor": "0", "current_bitmap_index": 0, "bitmap": "0x0",
     })
@@ -544,6 +546,60 @@ async def test_observed_operational_shapes_reach_only_main_secret_boundary(
     assert (loaded, signed, claimed) == (1, 0, 0)
     assert (disposable_home / RECORD).read_text() == record_before
     assert not _posts(scenario)
+
+
+@pytest.mark.parametrize("mutation", [
+    "verifier-wrong", "verifier-malformed-short", "verifier-malformed-hex",
+    "verifier-missing", "verifier-string-type-confused", "verifier-object",
+    "name-wrong", "name-type", "version-wrong", "version-type",
+    "chain-wrong", "chain-type", "extra-key", "missing-name",
+    "missing-version", "missing-chain",
+])
+@pytest.mark.asyncio
+async def test_domain_identity_rejects_before_sensitive_work(
+    module, monkeypatch: pytest.MonkeyPatch, disposable_home: Path, transport,
+    mutation: str,
+) -> None:
+    _use_fixture_wallet(monkeypatch, module)
+    _seed_generated(module, disposable_home)
+    scenario = transport(Scenario())
+    data = _domain(auth=OFFICIAL_CHECKSUM_AUTH)["data"]
+    if mutation == "verifier-wrong":
+        data["verifying_contract"] = WRONG_AUTH
+    elif mutation == "verifier-malformed-short":
+        data["verifying_contract"] = "0x6DA86F"
+    elif mutation == "verifier-malformed-hex":
+        data["verifying_contract"] = "0x" + "g" * 40
+    elif mutation == "verifier-missing":
+        del data["verifying_contract"]
+    elif mutation == "verifier-string-type-confused":
+        data["verifying_contract"] = 0
+    elif mutation == "verifier-object":
+        data["verifying_contract"] = {"address": OFFICIAL_CHECKSUM_AUTH}
+    elif mutation == "name-wrong":
+        data["name"] = "Wrong"
+    elif mutation == "name-type":
+        data["name"] = ["RISEx"]
+    elif mutation == "version-wrong":
+        data["version"] = "2"
+    elif mutation == "version-type":
+        data["version"] = 1
+    elif mutation == "chain-wrong":
+        data["chain_id"] = "1"
+    elif mutation == "chain-type":
+        data["chain_id"] = CHAIN_ID
+    elif mutation == "extra-key":
+        data["future"] = True
+    elif mutation == "missing-name":
+        del data["name"]
+    elif mutation == "missing-version":
+        del data["version"]
+    else:
+        del data["chain_id"]
+    scenario.domain = _envelope(data)
+    await _assert_rejected_before_sensitive_work(
+        module, monkeypatch, disposable_home, scenario
+    )
 
 
 @pytest.mark.parametrize("mutation", [
