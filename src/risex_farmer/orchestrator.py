@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .lifecycle import LifecycleEngine, LifecycleSnapshot, restart_paper_entry_state
 from .models import (
+    BookExecutionCapture,
     BookLevel,
     CanonicalMarket,
     ContractType,
@@ -36,6 +37,21 @@ from .storage import PaperRepository
 
 D = Decimal
 DEFAULT_LOGICAL_AT = datetime(2027, 7, 1, 12, tzinfo=UTC)
+
+
+def _fixture_capture(
+    observation: MarketObservation, decision_at: datetime, *, session_id: int
+) -> BookExecutionCapture:
+    assert observation.book is not None and observation.health is not None
+    return BookExecutionCapture(
+        observation.book,
+        observation.health,
+        observation.health.last_market_event_at or observation.book.observed_at,
+        decision_at,
+        session_id,
+        0,
+        1,
+    )
 
 
 def load_fixture(path: str | Path) -> dict[str, object]:
@@ -271,21 +287,26 @@ async def run_fixture(
     async def recompute(plan, actual_opened_at):
         return await _funding_recomputer(plan, actual_opened_at, post_entry_cash)
 
-    result = await broker.process_trade(
+    candidate_broker = broker.detached()
+    result = await candidate_broker.process_trade(
         trade,
         observed_version_id=broker.state.order.active_version.version_id,
         processed_at=opened_at,
         risex_observation=observations[0],
         hedge_observation=observations[1],
         recompute_funding=recompute,
+        risex_capture=_fixture_capture(
+            observations[0], opened_at, session_id=1
+        ),
     )
+    lifecycle = LifecycleEngine(result.state)
     repository.save_decision(
         recorded_at=opened_at,
         trade_events=(trade,),
         entry_state=result.state,
+        lifecycle_snapshot=lifecycle.snapshot,
+        fill_provenance=result.fill_provenance,
     )
-    lifecycle = LifecycleEngine(result.state)
-    repository.save_decision(recorded_at=opened_at, lifecycle_snapshot=lifecycle.snapshot)
     if scenario in {"open_position", "unknown_open_position"}:
         return {
             "status": "STOPPED_WITH_OPEN_POSITION",
@@ -330,11 +351,20 @@ async def run_fixture(
             hedge_observation=hedge,
         )
     else:
-        await lifecycle.evaluate(
+        candidate = lifecycle.detached()
+        await candidate.evaluate(
             evaluated_at=close_at,
             risex_observation=risex,
             hedge_observation=hedge,
+            risex_capture=_fixture_capture(risex, close_at, session_id=1),
+            hedge_capture=_fixture_capture(hedge, close_at, session_id=2),
         )
+        repository.save_decision(
+            recorded_at=close_at,
+            lifecycle_snapshot=candidate.snapshot,
+            fill_provenance=candidate.fill_provenance,
+        )
+        lifecycle.publish_candidate(candidate)
     if scenario in {"exiting_normal_open", "exiting_aggressive_open"}:
         repository.save_decision(
             recorded_at=close_at, lifecycle_snapshot=lifecycle.snapshot
@@ -347,18 +377,22 @@ async def run_fixture(
     if lifecycle.snapshot.lifecycle_state is not LifecycleState.FLAT:
         order = lifecycle.snapshot.exit_order
         exit_evidence = _exit_trade(order, close_at)
-        await lifecycle.process_exit_trade(
+        candidate = lifecycle.detached()
+        result = await candidate.process_exit_trade(
             exit_evidence,
             observed_version_id=order.active_version.version_id,
             processed_at=close_at,
             risex_observation=risex,
             hedge_observation=hedge,
+            risex_capture=_fixture_capture(risex, close_at, session_id=1),
         )
         repository.save_decision(
             recorded_at=close_at,
             trade_events=(exit_evidence,),
-            lifecycle_snapshot=lifecycle.snapshot,
+            lifecycle_snapshot=candidate.snapshot,
+            fill_provenance=result.fill_provenance,
         )
+        lifecycle.publish_candidate(candidate)
     else:
         repository.save_decision(
             recorded_at=close_at, lifecycle_snapshot=lifecycle.snapshot

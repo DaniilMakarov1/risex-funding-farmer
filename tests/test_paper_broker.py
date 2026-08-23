@@ -5,6 +5,7 @@ from decimal import Decimal
 import pytest
 
 from risex_farmer.models import (
+    BookExecutionCapture,
     BookLevel,
     CanonicalMarket,
     ContractType,
@@ -104,6 +105,13 @@ def observation(
         book,
         funding,
         health,
+    )
+
+
+def capture(row: MarketObservation, decision_at: datetime) -> BookExecutionCapture:
+    return BookExecutionCapture(
+        row.book, row.health, row.health.last_market_event_at,
+        decision_at, 1, 0, 1,
     )
 
 
@@ -226,6 +234,7 @@ async def test_trade_through_is_strict_and_dedup_is_global() -> None:
         risex_observation=risex,
         hedge_observation=hedge,
         recompute_funding=funding_recomputer(),
+        risex_capture=capture(risex, NOW + timedelta(seconds=3)),
     )
     assert completed.outcome is TradeProcessOutcome.OPENED
     assert broker.state.processed_trade_keys == {"equal", "wrong", "one", "two"}
@@ -322,9 +331,9 @@ async def test_fill_opens_both_legs_atomically_with_actual_times_and_fees() -> N
         ),
     )
     version_id = broker.state.order.active_version.version_id
-    opened_at = NOW + timedelta(seconds=3)
     exchange_at = NOW + timedelta(seconds=1)
     received_at = NOW + timedelta(seconds=20)
+    opened_at = received_at
     seen: list[datetime] = []
     result = await broker.process_trade(
         trade("fill", exchange_at=exchange_at, received_at=received_at),
@@ -333,6 +342,7 @@ async def test_fill_opens_both_legs_atomically_with_actual_times_and_fees() -> N
         risex_observation=risex,
         hedge_observation=hedge,
         recompute_funding=funding_recomputer(seen=seen),
+        risex_capture=capture(risex, opened_at),
     )
 
     position = result.state.position
@@ -379,6 +389,7 @@ async def test_unknown_or_equal_hold_value_exits_normally(recompute, expected_fu
         risex_observation=risex,
         hedge_observation=hedge,
         recompute_funding=recompute,
+        risex_capture=capture(risex, NOW + timedelta(seconds=3)),
     )
     assert result.state.position.remaining_target_funding_usd == expected_funding
     assert result.state.lifecycle_state is LifecycleState.EXITING_NORMAL
@@ -388,17 +399,21 @@ async def test_unknown_or_equal_hold_value_exits_normally(recompute, expected_fu
 async def test_cutoff_is_exchange_time_strict_even_when_receipt_is_late() -> None:
     broker, risex, hedge = await active_broker()
     cutoff = broker.state.order.cutoff_at
+    received_at = cutoff + timedelta(seconds=30)
+    risex = observation(Venue.RISEX, at=received_at)
+    hedge = observation(Venue.EXTENDED, at=received_at)
     result = await broker.process_trade(
         trade(
             "before",
             exchange_at=cutoff - timedelta(microseconds=1),
-            received_at=cutoff + timedelta(seconds=30),
+            received_at=received_at,
         ),
         observed_version_id=broker.state.order.active_version.version_id,
-        processed_at=NOW + timedelta(seconds=3),
+        processed_at=received_at,
         risex_observation=risex,
         hedge_observation=hedge,
         recompute_funding=funding_recomputer(),
+        risex_capture=capture(risex, received_at),
     )
     assert result.outcome is TradeProcessOutcome.OPENED
 

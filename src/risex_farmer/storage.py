@@ -21,11 +21,15 @@ from .lifecycle import (
 from .models import (
     DataQuality,
     Fill,
+    FillProvenance,
     FundingCashQuote,
     FundingSettlement,
     LifecycleState,
+    MakerFillProvenance,
     SettlementStatus,
+    Side,
     TargetFundingCycle,
+    TakerFillProvenance,
     TradeEvidence,
     Venue,
 )
@@ -161,6 +165,13 @@ CREATE TABLE IF NOT EXISTS fills (
     fee_usd TEXT NOT NULL,
     payload BLOB NOT NULL
 );
+CREATE TABLE IF NOT EXISTS fill_provenance (
+    fill_id TEXT PRIMARY KEY,
+    provenance_kind TEXT NOT NULL,
+    decision_at TEXT NOT NULL,
+    payload BLOB NOT NULL,
+    FOREIGN KEY (fill_id) REFERENCES fills(fill_id)
+);
 CREATE TABLE IF NOT EXISTS position_samples (
     position_id TEXT NOT NULL,
     sample_index INTEGER NOT NULL,
@@ -286,10 +297,28 @@ class PaperRepository:
             tuple[datetime, str, str | None, dict[str, object]], ...
         ] = (),
         venue_readiness: tuple[str, datetime, bool, str] | None = None,
+        fill_provenance: tuple[tuple[str, FillProvenance], ...] = (),
     ) -> None:
-        if entry_state is not None and lifecycle_snapshot is not None:
-            raise ValueError("one runtime state must be authoritative per decision")
+        if (
+            entry_state is not None
+            and lifecycle_snapshot is not None
+            and (
+                entry_state.position is None
+                or lifecycle_snapshot.position != entry_state.position
+            )
+        ):
+            raise ValueError("combined entry/lifecycle decision must share one position")
         with self.transaction():
+            existing_fill_ids = {
+                row["fill_id"]
+                for row in self.connection.execute("SELECT fill_id FROM fills")
+            }
+            existing_provenance_ids = {
+                row["fill_id"]
+                for row in self.connection.execute(
+                    "SELECT fill_id FROM fill_provenance"
+                )
+            }
             if scan_snapshot is not None:
                 self._save_scan(scan_snapshot)
             for quote in funding_quotes:
@@ -300,6 +329,20 @@ class PaperRepository:
                 self._save_entry_state(entry_state, recorded_at)
             if lifecycle_snapshot is not None:
                 self._save_lifecycle(lifecycle_snapshot, recorded_at)
+            for fill_id, provenance in fill_provenance:
+                self._save_fill_provenance(fill_id, provenance)
+            current_fill_ids = {
+                row["fill_id"]
+                for row in self.connection.execute("SELECT fill_id FROM fills")
+            }
+            new_fill_ids = current_fill_ids - existing_fill_ids
+            proof_ids = {fill_id for fill_id, _ in fill_provenance}
+            if len(proof_ids) != len(fill_provenance):
+                raise ValueError("duplicate fill provenance in one decision")
+            if new_fill_ids - proof_ids:
+                raise ValueError("every new fill requires causal provenance")
+            if proof_ids - new_fill_ids - existing_provenance_ids:
+                raise ValueError("legacy fills cannot receive later provenance")
             if venue_readiness is not None:
                 self._upsert_venue_readiness(*venue_readiness)
             for evidence in runtime_evidence:
@@ -603,6 +646,96 @@ class PaperRepository:
                 _dump(fill),
             ),
             fill,
+        )
+
+    def _save_fill_provenance(
+        self, fill_id: str, provenance: FillProvenance
+    ) -> None:
+        row = self.connection.execute(
+            "SELECT payload FROM fills WHERE fill_id=?", (fill_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError("fill provenance requires its fill in the same decision")
+        fill = _load(row["payload"])
+        if not isinstance(fill, Fill):
+            raise ValueError("fill provenance target is not a Fill")
+        if (
+            provenance.venue is not fill.venue
+            or provenance.canonical_market != fill.canonical_market
+            or provenance.side is not fill.side
+        ):
+            raise ValueError("fill provenance identity mismatch")
+        if isinstance(provenance, TakerFillProvenance):
+            notional = sum(
+                (level.canonical_price * level.canonical_quantity
+                 for level in provenance.consumed_levels),
+                Decimal("0"),
+            )
+            quantity = sum(
+                (level.canonical_quantity for level in provenance.consumed_levels),
+                Decimal("0"),
+            )
+            valid = (
+                provenance.observed_at <= provenance.decision_at
+                and provenance.received_at <= provenance.decision_at
+                and provenance.decision_at == fill.exchange_at == fill.receipt_at
+                and quantity > 0
+                and provenance.requested_quantity == provenance.executed_quantity
+                == fill.canonical_quantity == quantity
+                and provenance.notional_usd == notional
+                and provenance.vwap_price == notional / quantity
+                == fill.canonical_price
+                and all(level.canonical_price > 0 and level.canonical_quantity > 0
+                        for level in provenance.consumed_levels)
+            )
+            kind = "TAKER"
+        elif isinstance(provenance, MakerFillProvenance):
+            valid = (
+                provenance.limit_price == fill.canonical_price
+                and provenance.tick_size > 0
+                and provenance.decision_at >= fill.exchange_at
+                and provenance.decision_at >= fill.receipt_at
+                and bool(provenance.order_id and provenance.order_version_id)
+                and bool(provenance.qualifying_trades)
+                and provenance.qualifying_trades[-1].exchange_timestamp
+                == fill.exchange_at
+                and provenance.qualifying_trades[-1].received_at == fill.receipt_at
+                and sum((trade.canonical_quantity
+                         for trade in provenance.qualifying_trades), Decimal("0"))
+                >= fill.canonical_quantity
+                and all(
+                    trade.venue is fill.venue
+                    and trade.canonical_market == fill.canonical_market
+                    and trade.exchange_timestamp is not None
+                    and trade.exchange_timestamp <= provenance.decision_at
+                    and trade.received_at <= provenance.decision_at
+                    and trade.is_orderbook_match is True
+                    and (
+                        (fill.side is Side.BUY
+                         and trade.aggressor_side is Side.SELL
+                         and trade.canonical_price
+                         <= provenance.limit_price - provenance.tick_size)
+                        or
+                        (fill.side is Side.SELL
+                         and trade.aggressor_side is Side.BUY
+                         and trade.canonical_price
+                         >= provenance.limit_price + provenance.tick_size)
+                    )
+                    for trade in provenance.qualifying_trades
+                )
+            )
+            kind = "MAKER"
+        else:
+            raise TypeError("unsupported fill provenance")
+        if not valid:
+            raise ValueError("invalid causal fill provenance")
+        self._insert_exact(
+            "fill_provenance",
+            "fill_id=?",
+            (fill_id,),
+            "INSERT INTO fill_provenance VALUES (?, ?, ?, ?)",
+            (fill_id, kind, _iso(provenance.decision_at), _dump(provenance)),
+            provenance,
         )
 
     def _save_lifecycle(self, snapshot: LifecycleSnapshot, at: datetime) -> None:

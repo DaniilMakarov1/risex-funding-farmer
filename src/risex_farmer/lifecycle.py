@@ -19,17 +19,21 @@ from .economics import (
     spread_ticks,
 )
 from .models import (
+    BookExecutionCapture,
     CanonicalMarket,
     DataQuality,
     Fill,
+    FillProvenance,
     FundingEvent,
     FundingSettlement,
     LifecycleState,
     LiquidityRole,
+    MakerFillProvenance,
     RouteDirection,
     SettlementStatus,
     Side,
     TargetFundingCycle,
+    TakerFillProvenance,
     TradeEvidence,
     Venue,
 )
@@ -44,6 +48,7 @@ from .paper_broker import (
     _observation_is_fresh,
     _opposite,
     _pair_pnl,
+    _taker_provenance,
 )
 from .scanner import MarketObservation
 
@@ -211,6 +216,7 @@ class ExitTradeResult:
     outcome: ExitTradeOutcome
     snapshot: LifecycleSnapshot
     detail: str | None = None
+    fill_provenance: tuple[tuple[str, FillProvenance], ...] = ()
 
 
 def _settlement_sort_key(row: FundingSettlement) -> tuple[datetime, str, str]:
@@ -377,6 +383,8 @@ class LifecycleEngine:
         )
         self.config = config
         self._lock = asyncio.Lock()
+        self._fill_provenance: tuple[tuple[str, FillProvenance], ...] = ()
+        self._qualifying_trades: dict[str, tuple[TradeEvidence, ...]] = {}
         self._snapshot = LifecycleSnapshot(
             entry_state.lifecycle_state,
             position,
@@ -400,7 +408,14 @@ class LifecycleEngine:
         engine.config = config
         engine._lock = asyncio.Lock()
         engine._snapshot = snapshot
+        engine._fill_provenance = ()
+        engine._qualifying_trades = {}
         return engine
+
+    def detached(self) -> LifecycleEngine:
+        candidate = self.from_snapshot(self._snapshot, config=self.config)
+        candidate._qualifying_trades = dict(self._qualifying_trades)
+        return candidate
 
     @property
     def snapshot(self) -> LifecycleSnapshot:
@@ -409,6 +424,20 @@ class LifecycleEngine:
     def publish_snapshot(self, snapshot: LifecycleSnapshot) -> None:
         """Publish an already-persisted candidate without replacing this owner."""
         self._snapshot = snapshot
+        active = None if snapshot.exit_order is None else snapshot.exit_order.active_version
+        active_id = None if active is None else active.version_id
+        self._qualifying_trades = {
+            key: value for key, value in self._qualifying_trades.items()
+            if key == active_id
+        }
+
+    def publish_candidate(self, candidate: LifecycleEngine) -> None:
+        self._snapshot = candidate.snapshot
+        self._qualifying_trades = dict(candidate._qualifying_trades)
+
+    @property
+    def fill_provenance(self) -> tuple[tuple[str, FillProvenance], ...]:
+        return self._fill_provenance
 
     def _position(self) -> PaperPosition:
         position = self._snapshot.position
@@ -611,6 +640,7 @@ class LifecycleEngine:
         if order is None or order.active_version is None:
             return
         active = order.active_version
+        self._qualifying_trades.pop(active.version_id, None)
         causal_at = max(at, active.created_at, active.last_checked_at)
         version = replace(
             active,
@@ -670,6 +700,7 @@ class LifecycleEngine:
             self._new_exit_version(price, mode, at)
             return
         if aggressive_transition:
+            self._qualifying_trades.pop(active.version_id, None)
             closed = replace(
                 active,
                 status=ExitVersionStatus.REPLACED,
@@ -706,6 +737,7 @@ class LifecycleEngine:
             closed_at=at,
             close_reason=ExitVersionReason.PRICE_CHANGED,
         )
+        self._qualifying_trades.pop(active.version_id, None)
         self._snapshot = replace(
             self._snapshot,
             exit_order=replace(order, versions=order.versions[:-1] + (closed,)),
@@ -828,12 +860,17 @@ class LifecycleEngine:
         next_cycle: TargetFundingCycle | None = None,
         record_sample: bool = True,
         hard_basis_only: bool = False,
+        risex_capture: BookExecutionCapture | None = None,
+        hedge_capture: BookExecutionCapture | None = None,
     ) -> LifecycleSnapshot:
         async with self._lock:
+            self._fill_provenance = ()
             return self._evaluate_locked(
                 evaluated_at, risex_observation, hedge_observation, next_cycle,
                 record_sample=record_sample,
                 hard_basis_only=hard_basis_only,
+                risex_capture=risex_capture,
+                hedge_capture=hedge_capture,
             )
 
     def _evaluate_locked(
@@ -845,6 +882,8 @@ class LifecycleEngine:
         *,
         record_sample: bool = True,
         hard_basis_only: bool = False,
+        risex_capture: BookExecutionCapture | None = None,
+        hedge_capture: BookExecutionCapture | None = None,
     ) -> LifecycleSnapshot:
         position = self._position()
         if self._snapshot.gap_open:
@@ -880,21 +919,47 @@ class LifecycleEngine:
             else self.config.other_top5_hard_basis_expansion_rate
         )
         if adverse >= threshold:
+            risex_side = _opposite(position.risex_taker_fill.side)
+            hedge_side = _opposite(position.hedge_maker_fill.side)
+            risex_proof = _taker_provenance(
+                risex_capture,
+                risex_side,
+                position.canonical_quantity,
+                venue=self._snapshot.risex_market.venue,
+                canonical_market=self._snapshot.risex_market.venue_symbol,
+                config=self.config,
+            )
+            hedge_proof = _taker_provenance(
+                hedge_capture,
+                hedge_side,
+                position.canonical_quantity,
+                venue=self._snapshot.hedge_market.venue,
+                canonical_market=self._snapshot.hedge_market.venue_symbol,
+                config=self.config,
+            )
+            if risex_proof is None or hedge_proof is None:
+                self._record_unavailable(at)
+                return self._snapshot
             self._cancel_exit_version(ExitVersionReason.HARD_BASIS, at)
             hedge_fill = self._taker_fill(
                 self._snapshot.hedge_market,
-                _opposite(position.hedge_maker_fill.side),
-                hedge_taker,
+                hedge_side,
+                hedge_proof.vwap_price,
                 at,
             )
             risex_fill = self._taker_fill(
                 self._snapshot.risex_market,
-                _opposite(position.risex_taker_fill.side),
-                risex_exit,
+                risex_side,
+                risex_proof.vwap_price,
                 at,
             )
             self._close_locked(
                 hedge_fill, risex_fill, CloseReason.HARD_BASIS, at
+            )
+            position_id = position.position_id
+            self._fill_provenance = (
+                (f"{position_id}:hedge-exit", hedge_proof),
+                (f"{position_id}:risex-exit", risex_proof),
             )
             return self._snapshot
 
@@ -1069,8 +1134,10 @@ class LifecycleEngine:
         processed_at: datetime,
         risex_observation: MarketObservation,
         hedge_observation: MarketObservation,
+        risex_capture: BookExecutionCapture | None = None,
     ) -> ExitTradeResult:
         async with self._lock:
+            self._fill_provenance = ()
             self._position()
             order = self._snapshot.exit_order
             if order is None or order.active_version is None:
@@ -1094,12 +1161,24 @@ class LifecycleEngine:
                 return ExitTradeResult(
                     ExitTradeOutcome.IGNORED, self._snapshot, "TRADE_INELIGIBLE"
                 )
+            if (
+                trade.exchange_timestamp is None
+                or trade.exchange_timestamp > processed_at
+                or trade.received_at > processed_at
+            ):
+                return ExitTradeResult(
+                    ExitTradeOutcome.IGNORED, self._snapshot, "TRADE_FUTURE_DATED"
+                )
             active = order.active_version
             assert active is not None
+            qualifying_trades = self._qualifying_trades.get(
+                active.version_id, ()
+            ) + (trade,)
+            self._qualifying_trades[active.version_id] = qualifying_trades
             cumulative = active.cumulative_eligible_quantity + trade.canonical_quantity
             if cumulative < order.canonical_quantity:
                 active = replace(
-                    active, cumulative_eligible_quantity=cumulative
+                    active, cumulative_eligible_quantity=cumulative,
                 )
                 order = replace(
                     order, versions=order.versions[:-1] + (active,)
@@ -1118,12 +1197,16 @@ class LifecycleEngine:
                     ExitTradeOutcome.SUSPENDED, self._snapshot, "DATA_GAP"
                 )
             position = self._position()
-            risex_price = _exact_vwap(
-                risex_observation,
-                _opposite(position.risex_taker_fill.side),
+            risex_side = _opposite(position.risex_taker_fill.side)
+            taker_proof = _taker_provenance(
+                risex_capture,
+                risex_side,
                 position.canonical_quantity,
+                venue=self._snapshot.risex_market.venue,
+                canonical_market=self._snapshot.risex_market.venue_symbol,
+                config=self.config,
             )
-            if risex_price is None:
+            if taker_proof is None:
                 self._record_unavailable(processed_at)
                 self._cancel_exit_version(
                     ExitVersionReason.UNWIND_UNAVAILABLE, processed_at
@@ -1133,6 +1216,7 @@ class LifecycleEngine:
                     self._snapshot,
                     ExitVersionReason.UNWIND_UNAVAILABLE.value,
                 )
+            risex_price = taker_proof.vwap_price
             assert trade.exchange_timestamp is not None
             hedge_fee = _fee(
                 self.config,
@@ -1176,7 +1260,21 @@ class LifecycleEngine:
                 ),
             )
             self._close_locked(hedge_fill, risex_fill, reason, processed_at)
-            return ExitTradeResult(ExitTradeOutcome.CLOSED, self._snapshot)
+            maker_proof = MakerFillProvenance(
+                order.venue, order.canonical_market, order.side, order.order_id,
+                active.version_id, active.limit_price,
+                self._snapshot.hedge_market.tick_size_raw, qualifying_trades,
+                processed_at,
+            )
+            proofs = (
+                (f"{position.position_id}:hedge-exit", maker_proof),
+                (f"{position.position_id}:risex-exit", taker_proof),
+            )
+            self._fill_provenance = proofs
+            return ExitTradeResult(
+                ExitTradeOutcome.CLOSED, self._snapshot,
+                fill_provenance=proofs,
+            )
 
     def _mark_future_closed_skips(self, closed_at: datetime) -> None:
         rows = self._settlement_map()

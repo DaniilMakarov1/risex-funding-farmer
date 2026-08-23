@@ -18,20 +18,25 @@ from .economics import (
     venue_fee_amount_usd,
 )
 from .models import (
+    BookExecutionCapture,
+    BookLevel,
     CanonicalMarket,
     DataQuality,
     Fee,
     Fill,
+    FillProvenance,
     FundingCashQuote,
     FundingAccrualMethod,
     FundingEvent,
     FundingQuality,
     LifecycleState,
     LiquidityRole,
+    MakerFillProvenance,
     RouteDirection,
     Side,
     StreamHealth,
     TargetFundingCycle,
+    TakerFillProvenance,
     TradeEvidence,
     Venue,
 )
@@ -162,6 +167,7 @@ class TradeProcessResult:
     outcome: TradeProcessOutcome
     state: PaperEntryState
     detail: str | None = None
+    fill_provenance: tuple[tuple[str, FillProvenance], ...] = ()
 
 
 FundingRecomputer = Callable[
@@ -271,6 +277,63 @@ def _exact_vwap(
     except (TypeError, ValueError):
         return None
     return result.price if result.is_executable else None
+
+
+def _taker_provenance(
+    capture: BookExecutionCapture | None,
+    side: Side,
+    quantity: Decimal,
+    *,
+    venue: Venue,
+    canonical_market: str,
+    config: PaperConfig,
+) -> TakerFillProvenance | None:
+    if capture is None:
+        return None
+    book = capture.book
+    health = capture.health
+    at = capture.decision_at
+    if (
+        book.venue is not venue
+        or book.canonical_market != canonical_market
+        or book.observed_at > at
+        or capture.received_at > at
+        or quantity <= 0
+        or capture.stream_session_id < 0
+        or capture.recovery_generation < 0
+        or capture.book_revision < 0
+        or not health.stream_connected
+        or not health.book_initialized
+        or not health.book_sequence_valid
+        or health.data_quality is not DataQuality.COMPLETE
+        or health.last_connection_confirmation_at is None
+        or health.last_connection_confirmation_at > at
+        or at - health.last_connection_confirmation_at
+        > timedelta(seconds=config.max_market_stream_silence_seconds)
+    ):
+        return None
+    remaining = quantity
+    consumed: list[BookLevel] = []
+    levels = book.asks if side is Side.BUY else book.bids
+    notional = Decimal("0")
+    for level in levels:
+        if remaining <= 0:
+            break
+        if level.canonical_price <= 0 or level.canonical_quantity <= 0:
+            return None
+        used = min(remaining, level.canonical_quantity)
+        consumed.append(BookLevel(level.canonical_price, used))
+        notional += level.canonical_price * used
+        remaining -= used
+    if remaining != 0 or not consumed:
+        return None
+    price = notional / quantity
+    return TakerFillProvenance(
+        venue, canonical_market, side, capture.stream_session_id,
+        capture.recovery_generation, capture.book_revision, book.observed_at,
+        capture.received_at, at, book.sequence, capture.checksum,
+        tuple(consumed), quantity, quantity, notional, price,
+    )
 
 
 def _maker_price(
@@ -396,6 +459,7 @@ class PaperEntryBroker:
         self.config = config
         self._state = PaperEntryState()
         self._lock = asyncio.Lock()
+        self._qualifying_trades: dict[str, tuple[TradeEvidence, ...]] = {}
 
     @classmethod
     def from_state(
@@ -407,6 +471,11 @@ class PaperEntryBroker:
         broker = cls(config=config)
         broker._state = state
         return broker
+
+    def detached(self) -> PaperEntryBroker:
+        candidate = self.from_state(self._state, config=self.config)
+        candidate._qualifying_trades = dict(self._qualifying_trades)
+        return candidate
 
     @property
     def state(self) -> PaperEntryState:
@@ -487,6 +556,7 @@ class PaperEntryBroker:
             closed_at=cancelled_at,
             close_reason=reason.value,
         )
+        self._qualifying_trades.pop(current.version_id, None)
         order = replace(
             order,
             versions=order.versions[:-1] + (current,),
@@ -596,6 +666,7 @@ class PaperEntryBroker:
                     closed_at=evaluated_at,
                     close_reason=VersionCloseReason.PRICE_CHANGED.value,
                 )
+                self._qualifying_trades.pop(current.version_id, None)
                 number = current.number + 1
                 replacement = PaperOrderVersion(
                     f"{order.order_id}:v{number}",
@@ -652,6 +723,7 @@ class PaperEntryBroker:
         risex_observation: MarketObservation,
         hedge_observation: MarketObservation,
         recompute_funding: FundingRecomputer,
+        risex_capture: BookExecutionCapture | None = None,
     ) -> TradeProcessResult:
         async with self._lock:
             order = self._require_open_order()
@@ -668,11 +740,23 @@ class PaperEntryBroker:
                 return TradeProcessResult(
                     TradeProcessOutcome.IGNORED, self._state, "TRADE_INELIGIBLE"
                 )
+            if (
+                trade.exchange_timestamp is None
+                or trade.exchange_timestamp > processed_at
+                or trade.received_at > processed_at
+            ):
+                return TradeProcessResult(
+                    TradeProcessOutcome.IGNORED, self._state, "TRADE_FUTURE_DATED"
+                )
             current = order.active_version
+            qualifying_trades = self._qualifying_trades.get(
+                current.version_id, ()
+            ) + (trade,)
+            self._qualifying_trades[current.version_id] = qualifying_trades
             cumulative = current.cumulative_eligible_quantity + trade.canonical_quantity
             if cumulative < order.canonical_quantity:
                 current = replace(
-                    current, cumulative_eligible_quantity=cumulative
+                    current, cumulative_eligible_quantity=cumulative,
                 )
                 order = replace(
                     order, versions=order.versions[:-1] + (current,)
@@ -688,14 +772,18 @@ class PaperEntryBroker:
                 state = self._cancel_locked(CancellationReason.DATA_STALE, processed_at)
                 return TradeProcessResult(TradeProcessOutcome.CANCELLED, state)
             risex_side, _ = _entry_sides(order.route_plan.direction)
-            risex_entry_price = _exact_vwap(
-                risex_observation, risex_side, order.canonical_quantity
+            taker_proof = _taker_provenance(
+                risex_capture, risex_side, order.canonical_quantity,
+                venue=Venue.RISEX,
+                canonical_market=order.route_plan.risex_market.venue_symbol,
+                config=self.config,
             )
-            if risex_entry_price is None:
+            if taker_proof is None:
                 state = self._cancel_locked(
                     CancellationReason.RISEX_ENTRY_DEPTH_UNAVAILABLE, processed_at
                 )
                 return TradeProcessResult(TradeProcessOutcome.CANCELLED, state)
+            risex_entry_price = taker_proof.vwap_price
 
             quotes = await recompute_funding(order.route_plan, processed_at)
             assert trade.exchange_timestamp is not None
@@ -762,7 +850,24 @@ class PaperEntryBroker:
                 position,
                 self._state.processed_trade_keys,
             )
-            return TradeProcessResult(TradeProcessOutcome.OPENED, self._state)
+            maker_proof = MakerFillProvenance(
+                order.venue, order.canonical_market, order.side, order.order_id,
+                current.version_id, current.limit_price,
+                order.route_plan.hedge_market.tick_size_raw, qualifying_trades,
+                processed_at,
+            )
+            return TradeProcessResult(
+                TradeProcessOutcome.OPENED,
+                self._state,
+                fill_provenance=(
+                    (f"{position.position_id}:hedge-entry", maker_proof),
+                    (f"{position.position_id}:risex-entry", taker_proof),
+                ),
+            )
+
+    def publish_candidate(self, candidate: PaperEntryBroker) -> None:
+        self._state = candidate.state
+        self._qualifying_trades = dict(candidate._qualifying_trades)
 
     def _open_position(
         self,

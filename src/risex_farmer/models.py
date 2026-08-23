@@ -262,3 +262,53 @@ class TradeEvidence:
     risex_funding_eligibility_assumption_used: bool = False
     risex_funding_estimate_assumption_used: bool = False
     paper_assumption_used: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class BookExecutionCapture:
+    """Immutable public book input and its runtime ownership identity."""
+
+    book: OrderBook
+    health: StreamHealth
+    received_at: datetime
+    decision_at: datetime
+    stream_session_id: int
+    recovery_generation: int
+    book_revision: int
+    checksum: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MakerFillProvenance:
+    venue: Venue
+    canonical_market: str
+    side: Side
+    order_id: str
+    order_version_id: str
+    limit_price: Decimal
+    tick_size: Decimal
+    qualifying_trades: tuple[TradeEvidence, ...]
+    decision_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class TakerFillProvenance:
+    venue: Venue
+    canonical_market: str
+    side: Side
+    stream_session_id: int
+    recovery_generation: int
+    book_revision: int
+    observed_at: datetime
+    received_at: datetime
+    decision_at: datetime
+    sequence: int | None
+    checksum: int | None
+    consumed_levels: tuple[BookLevel, ...]
+    requested_quantity: Decimal
+    executed_quantity: Decimal
+    notional_usd: Decimal
+    vwap_price: Decimal
+
+
+FillProvenance = MakerFillProvenance | TakerFillProvenance

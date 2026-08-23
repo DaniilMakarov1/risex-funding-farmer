@@ -5716,14 +5716,15 @@ async def test_stabilization002_r11_stale_exit_trade_is_wholly_inert(tmp_path):
         )
         entered = asyncio.Event()
         release = asyncio.Event()
-        original_process = lifecycle.process_exit_trade
+        original_process = LifecycleEngine.process_exit_trade
 
-        async def gated_process(*args, **kwargs):
-            entered.set()
-            await release.wait()
-            return await original_process(*args, **kwargs)
+        async def gated_process(engine, *args, **kwargs):
+            if engine is not lifecycle:
+                entered.set()
+                await release.wait()
+            return await original_process(engine, *args, **kwargs)
 
-        lifecycle.process_exit_trade = gated_process
+        LifecycleEngine.process_exit_trade = gated_process
         delivery = asyncio.create_task(runtime.deliver_trade(
             trade, observed_version_id=v1.version_id, processed_at=NOW
         ))
@@ -5756,7 +5757,10 @@ async def test_stabilization002_r11_stale_exit_trade_is_wholly_inert(tmp_path):
         rows_before_release = _stabilization002_lifecycle_rows(repository)
         confirmation_before = stream.health(clock.now()).last_connection_confirmation_at
         release.set()
-        await delivery
+        try:
+            await delivery
+        finally:
+            LifecycleEngine.process_exit_trade = original_process
         assert lifecycle.snapshot == authoritative
         assert trade.trade_event_key not in lifecycle.snapshot.processed_trade_keys
         assert _stabilization002_lifecycle_rows(repository) == rows_before_release
@@ -5806,15 +5810,16 @@ async def test_stabilization002_r12_ws_trade_keeps_receipt_version(tmp_path):
         entered = asyncio.Event()
         release = asyncio.Event()
         captured_versions = []
-        original_process = lifecycle.process_exit_trade
+        original_process = LifecycleEngine.process_exit_trade
 
-        async def gated_process(*args, **kwargs):
-            captured_versions.append(kwargs["observed_version_id"])
-            entered.set()
-            await release.wait()
-            return await original_process(*args, **kwargs)
+        async def gated_process(engine, *args, **kwargs):
+            if engine is not lifecycle:
+                captured_versions.append(kwargs["observed_version_id"])
+                entered.set()
+                await release.wait()
+            return await original_process(engine, *args, **kwargs)
 
-        lifecycle.process_exit_trade = gated_process
+        LifecycleEngine.process_exit_trade = gated_process
         delivery = asyncio.create_task(runtime.deliver_trade(trade))
         await entered.wait()
         later = NOW + timedelta(seconds=20)
@@ -5843,7 +5848,10 @@ async def test_stabilization002_r12_ws_trade_keeps_receipt_version(tmp_path):
             recorded_at=later, lifecycle_snapshot=lifecycle.snapshot
         )
         release.set()
-        await delivery
+        try:
+            await delivery
+        finally:
+            LifecycleEngine.process_exit_trade = original_process
         assert captured_versions == [v1.version_id]
         assert lifecycle.snapshot.exit_order.active_version.version_id == v2.version_id
         assert trade.trade_event_key not in lifecycle.snapshot.processed_trade_keys

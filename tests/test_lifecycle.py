@@ -14,6 +14,7 @@ from risex_farmer.lifecycle import (
     restart_paper_entry_state,
 )
 from risex_farmer.models import (
+    BookExecutionCapture,
     BookLevel,
     CanonicalMarket,
     ContractType,
@@ -115,6 +116,13 @@ def observation(
     )
 
 
+def capture(row: MarketObservation, decision_at: datetime) -> BookExecutionCapture:
+    return BookExecutionCapture(
+        row.book, row.health, row.health.last_market_event_at,
+        decision_at, 1, 0, 1,
+    )
+
+
 async def open_state(
     *,
     direction: RouteDirection = RouteDirection.LONG_RISEX_SHORT_HEDGE,
@@ -178,6 +186,7 @@ async def open_state(
         risex_observation=risex,
         hedge_observation=hedge,
         recompute_funding=recompute,
+        risex_capture=capture(risex, OPENED),
     )
     return result.state
 
@@ -194,12 +203,22 @@ def exit_trade(
         Venue.EXTENDED,
         "ABC-EXTENDED",
         at,
-        at + timedelta(microseconds=1),
+        at,
         "synthetic-exit",
         D(quantity),
         D("99") if side is Side.BUY else D("101"),
         Side.SELL if side is Side.BUY else Side.BUY,
         True,
+    )
+
+
+async def process_exit_trade(engine: LifecycleEngine, trade, **kwargs):
+    return await engine.process_exit_trade(
+        trade,
+        risex_capture=capture(
+            kwargs["risex_observation"], kwargs["processed_at"]
+        ),
+        **kwargs,
     )
 
 
@@ -270,7 +289,7 @@ async def test_strict_open_and_close_settlement_eligibility_boundaries() -> None
     )
     order = engine.snapshot.exit_order
     closed_at = later.settlement_at
-    await engine.process_exit_trade(
+    await process_exit_trade(engine,
         exit_trade("boundary-close", order.side, at=closed_at),
         observed_version_id=order.active_version.version_id,
         processed_at=closed_at,
@@ -403,14 +422,14 @@ async def test_exit_trade_accumulates_dedups_and_closes_both_legs() -> None:
     )
     order = engine.snapshot.exit_order
     token = order.active_version.version_id
-    first = await engine.process_exit_trade(
+    first = await process_exit_trade(engine,
         exit_trade("one", order.side, quantity="2"),
         observed_version_id=token,
         processed_at=OPENED + timedelta(seconds=2),
         risex_observation=observation(Venue.RISEX, at=OPENED + timedelta(seconds=2)),
         hedge_observation=observation(Venue.EXTENDED, at=OPENED + timedelta(seconds=2)),
     )
-    duplicate = await engine.process_exit_trade(
+    duplicate = await process_exit_trade(engine,
         exit_trade("one", order.side, quantity="3"),
         observed_version_id=token,
         processed_at=OPENED + timedelta(seconds=2),
@@ -418,7 +437,7 @@ async def test_exit_trade_accumulates_dedups_and_closes_both_legs() -> None:
         hedge_observation=hedge,
     )
     closed_at = OPENED + timedelta(seconds=3)
-    second = await engine.process_exit_trade(
+    second = await process_exit_trade(engine,
         exit_trade("two", order.side, quantity="3", at=closed_at),
         observed_version_id=token,
         processed_at=closed_at,
@@ -451,7 +470,7 @@ async def test_aggressive_maker_can_close_but_has_no_taker_timeout() -> None:
     order = engine.snapshot.exit_order
     assert engine.snapshot.lifecycle_state is LifecycleState.EXITING_AGGRESSIVE
     assert engine.snapshot.position is not None
-    result = await engine.process_exit_trade(
+    result = await process_exit_trade(engine,
         exit_trade("aggressive-fill", order.side, at=at + timedelta(seconds=1)),
         observed_version_id=order.active_version.version_id,
         processed_at=at + timedelta(seconds=1),
@@ -514,6 +533,8 @@ async def test_hard_basis_closes_both_directions_at_exact_taker_quotes(direction
         evaluated_at=at,
         risex_observation=risex,
         hedge_observation=hedge,
+        risex_capture=capture(risex, at),
+        hedge_capture=capture(hedge, at),
     )
     assert engine.snapshot.lifecycle_state is LifecycleState.FLAT
     assert engine.snapshot.closed_trade.close_reason is CloseReason.HARD_BASIS
@@ -607,7 +628,7 @@ async def test_funding_during_exit_and_partial_applied_close_recompute() -> None
         hedge_observation=observation(Venue.EXTENDED, at=close_at),
     )
     order = engine.snapshot.exit_order
-    await engine.process_exit_trade(
+    await process_exit_trade(engine,
         exit_trade("funded-close", order.side, at=close_at),
         observed_version_id=order.active_version.version_id,
         processed_at=close_at,
@@ -649,7 +670,7 @@ async def test_unknown_post_entry_funding_retains_required_keys_and_fails_closed
         hedge_observation=observation(Venue.EXTENDED, at=close_at),
     )
     order = engine.snapshot.exit_order
-    await engine.process_exit_trade(
+    await process_exit_trade(engine,
         exit_trade("unknown-close", order.side, at=close_at),
         observed_version_id=order.active_version.version_id,
         processed_at=close_at,
@@ -676,7 +697,7 @@ async def test_unknown_funding_future_close_skips_complete_required_key_set() ->
     )
     order = engine.snapshot.exit_order
     close_at = OPENED + timedelta(seconds=2)
-    await engine.process_exit_trade(
+    await process_exit_trade(engine,
         exit_trade("unknown-future-skip", order.side, at=close_at),
         observed_version_id=order.active_version.version_id,
         processed_at=close_at,

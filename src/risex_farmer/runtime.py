@@ -21,6 +21,7 @@ from .exchanges.risex import RisexAdapter
 from .lifecycle import LifecycleEngine, LifecycleSnapshot
 from .market_data import BookStream, MarketDataCoordinator
 from .models import (
+    BookExecutionCapture,
     BookDelta,
     ContractType,
     DataQuality,
@@ -366,6 +367,9 @@ class PublicPaperRuntime:
             tuple[Venue, str, str], StreamSessionId
         ] = {}
         self._stream_session_number = 0
+        self._book_revisions: dict[tuple[Venue, str], int] = {}
+        self._book_recovery_generations: dict[tuple[Venue, str], int] = {}
+        self._book_checksums: dict[tuple[Venue, str], int | None] = {}
         self._combined_symbols: dict[Venue, tuple[str, ...]] = {}
         self.next_health_check_at: datetime | None = None
         self.focused_cycle: TargetFundingCycle | None = None
@@ -395,6 +399,69 @@ class PublicPaperRuntime:
         self, key: tuple[Venue, str, str], session_id: StreamSessionId
     ) -> bool:
         return self._stream_sessions.get(key) == session_id
+
+    @staticmethod
+    def _book_stream_key(venue: Venue, symbol: str) -> tuple[Venue, str, str]:
+        return (
+            (venue, symbol, "book")
+            if venue is Venue.EXTENDED else (venue, "*", "combined")
+        )
+
+    def _book_session_value(self, venue: Venue, symbol: str) -> int:
+        session = self._stream_sessions.get(self._book_stream_key(venue, symbol))
+        return 0 if session is None else session.value
+
+    def _book_generation_value(self, key: tuple[Venue, str]) -> int:
+        recovery = self._recoveries.get(key)
+        if recovery is not None and recovery.terminal is None:
+            return recovery.attempt_generation.value
+        return self._book_recovery_generations.get(key, 0)
+
+    def _bump_book_revision(
+        self,
+        key: tuple[Venue, str],
+        *,
+        recovery_generation: int | None = None,
+        checksum: int | None = None,
+    ) -> None:
+        self._book_revisions[key] = self._book_revisions.get(key, 0) + 1
+        if recovery_generation is not None:
+            self._book_recovery_generations[key] = recovery_generation
+        self._book_checksums[key] = checksum
+
+    def _execution_capture(
+        self, observation: MarketObservation, at: datetime
+    ) -> BookExecutionCapture | None:
+        book = observation.book
+        health = observation.health
+        if book is None or health is None:
+            return None
+        key = (book.venue, book.canonical_market)
+        return BookExecutionCapture(
+            book=book,
+            health=health,
+            received_at=health.last_market_event_at or book.observed_at,
+            decision_at=at,
+            stream_session_id=self._book_session_value(*key),
+            recovery_generation=self._book_generation_value(key),
+            book_revision=self._book_revisions.get(key, 0),
+            checksum=self._book_checksums.get(key),
+        )
+
+    def _captures_are_current(
+        self, *captures: BookExecutionCapture | None
+    ) -> bool:
+        for capture in captures:
+            if capture is None:
+                return False
+            key = (capture.book.venue, capture.book.canonical_market)
+            if (
+                self._book_session_value(*key) != capture.stream_session_id
+                or self._book_generation_value(key) != capture.recovery_generation
+                or self._book_revisions.get(key, 0) != capture.book_revision
+            ):
+                return False
+        return True
 
     def _new_recovery_episode(
         self, key: tuple[Venue, str], session_id: StreamSessionId
@@ -1105,6 +1172,13 @@ class PublicPaperRuntime:
                 stream.connected(logical_at)
                 stream.snapshot(book)
                 stream.connection_confirmed(logical_at)
+                self._bump_book_revision(
+                    key,
+                    checksum=(
+                        stream.risex_checksum()
+                        if market.venue is Venue.RISEX else None
+                    ),
+                )
             self.observations[key] = MarketObservation(
                 market, volume, stream.book(), funding, stream.health(logical_at)
             )
@@ -1705,20 +1779,28 @@ class PublicPaperRuntime:
                     risex, hedge = self._market_pair_observations(
                         before.risex_market, before.hedge_market, now
                     )
-                    candidate = LifecycleEngine.from_snapshot(
-                        before, config=lifecycle.config
-                    )
+                    candidate = lifecycle.detached()
+                    risex_capture = self._execution_capture(risex, now)
+                    hedge_capture = self._execution_capture(hedge, now)
                     await candidate.evaluate(
                         evaluated_at=now,
                         risex_observation=risex,
                         hedge_observation=hedge,
+                        risex_capture=risex_capture,
+                        hedge_capture=hedge_capture,
                     )
                     if self.lifecycle is not lifecycle or lifecycle.snapshot is not before:
                         return
+                    if candidate.fill_provenance and not self._captures_are_current(
+                        risex_capture, hedge_capture
+                    ):
+                        return
                     self.repository.save_decision(
-                        recorded_at=now, lifecycle_snapshot=candidate.snapshot
+                        recorded_at=now,
+                        lifecycle_snapshot=candidate.snapshot,
+                        fill_provenance=candidate.fill_provenance,
                     )
-                    lifecycle.publish_snapshot(candidate.snapshot)
+                    lifecycle.publish_candidate(candidate)
                     after = candidate.snapshot
                     if after.lifecycle_state is LifecycleState.FLAT:
                         self.lifecycle = None
@@ -1933,63 +2015,94 @@ class PublicPaperRuntime:
             self._record("TRADE_IGNORED_STREAM_UNHEALTHY", at=at, venue=trade.venue)
             return
         if self.broker is not None and self.broker.state.lifecycle_state is LifecycleState.ENTRY_MAKER_OPEN:
-            order = self.broker.state.order
+            broker = self.broker
+            before = broker.state
+            order = before.order
             assert order is not None
             version = observed_version_id or order.active_version.version_id
             risex, hedge = self._route_observations(order.route_plan, at)
-            result = await self.broker.process_trade(
+            risex_capture = self._execution_capture(risex, at)
+            candidate = broker.detached()
+            result = await candidate.process_trade(
                 trade,
                 observed_version_id=version,
                 processed_at=at,
                 risex_observation=risex,
                 hedge_observation=hedge,
                 recompute_funding=self._recompute_funding,
+                risex_capture=risex_capture,
+            )
+            if self.broker is not broker or broker.state is not before:
+                return
+            if result.fill_provenance and not self._captures_are_current(
+                risex_capture
+            ):
+                return
+            lifecycle_candidate = (
+                LifecycleEngine(result.state, config=self.config)
+                if result.state.position is not None else None
             )
             self.repository.save_decision(
                 recorded_at=at,
                 trade_events=(trade,),
                 entry_state=result.state,
+                lifecycle_snapshot=(
+                    None if lifecycle_candidate is None
+                    else lifecycle_candidate.snapshot
+                ),
+                fill_provenance=result.fill_provenance,
             )
             if result.state.position is not None:
-                self.lifecycle = LifecycleEngine(result.state, config=self.config)
-                self.repository.save_decision(
-                    recorded_at=at, lifecycle_snapshot=self.lifecycle.snapshot
-                )
+                self.lifecycle = lifecycle_candidate
                 self._notify_lifecycle_transition(None, self.lifecycle.snapshot, at)
                 self.broker = None
                 self.next_position_monitor_at = at + timedelta(
                     seconds=self.config.open_position_monitor_seconds
                 )
+            elif self.broker is broker and broker.state is before:
+                broker.publish_candidate(candidate)
             return
         if self.lifecycle is not None and self.lifecycle.snapshot.exit_order is not None:
-            order = self.lifecycle.snapshot.exit_order
+            lifecycle = self.lifecycle
+            before = lifecycle.snapshot
+            order = before.exit_order
             active = order.active_version
             if active is None:
                 return
             assert exit_receipt_version is not None
             version = exit_receipt_version
             risex, hedge = self._market_pair_observations(
-                self.lifecycle.snapshot.risex_market,
-                self.lifecycle.snapshot.hedge_market,
+                before.risex_market,
+                before.hedge_market,
                 at,
             )
-            before = self.lifecycle.snapshot
-            result = await self.lifecycle.process_exit_trade(
+            risex_capture = self._execution_capture(risex, at)
+            candidate = lifecycle.detached()
+            result = await candidate.process_exit_trade(
                 trade,
                 observed_version_id=version,
                 processed_at=at,
                 risex_observation=risex,
                 hedge_observation=hedge,
+                risex_capture=risex_capture,
             )
             if result.detail == "STALE_EXIT_VERSION":
+                return
+            if result.fill_provenance and not self._captures_are_current(
+                risex_capture
+            ):
+                return
+            if self.lifecycle is not lifecycle or lifecycle.snapshot is not before:
                 return
             self.repository.save_decision(
                 recorded_at=at,
                 trade_events=(trade,),
-                lifecycle_snapshot=self.lifecycle.snapshot,
+                lifecycle_snapshot=candidate.snapshot,
+                fill_provenance=result.fill_provenance,
             )
-            self._notify_lifecycle_transition(before, self.lifecycle.snapshot, at)
-            if self.lifecycle.snapshot.lifecycle_state is LifecycleState.FLAT:
+            lifecycle.publish_candidate(candidate)
+            self._notify_lifecycle_transition(before, candidate.snapshot, at)
+            if candidate.snapshot.lifecycle_state is LifecycleState.FLAT:
                 self.lifecycle = None
 
     def mark_trade_stream_connected(
@@ -2143,9 +2256,7 @@ class PublicPaperRuntime:
                         row for row in before_snapshot.settlements
                         if row.key == settlement.key
                     )
-                    candidate = LifecycleEngine.from_snapshot(
-                        before_snapshot, config=lifecycle.config
-                    )
+                    candidate = lifecycle.detached()
                     await candidate.reconcile_settlement(settlement)
                     if (
                         not self._owns_stream_session(
@@ -2160,7 +2271,7 @@ class PublicPaperRuntime:
                             recorded_at=commit_at,
                             lifecycle_snapshot=candidate.snapshot,
                         )
-                        lifecycle.publish_snapshot(candidate.snapshot)
+                        lifecycle.publish_candidate(candidate)
                         after_settlement = next(
                             row for row in candidate.snapshot.settlements
                             if row.key == settlement.key
@@ -2284,9 +2395,7 @@ class PublicPaperRuntime:
                         causal_at = max(
                             causal_at, active.created_at, active.last_checked_at
                         )
-                    candidate = LifecycleEngine.from_snapshot(
-                        before, config=lifecycle.config
-                    )
+                    candidate = lifecycle.detached()
                     await candidate.start_gap(started_at=causal_at)
                     if (
                         self.lifecycle is not lifecycle
@@ -2301,7 +2410,7 @@ class PublicPaperRuntime:
                             recorded_at=causal_at,
                             lifecycle_snapshot=candidate.snapshot,
                         )
-                        lifecycle.publish_snapshot(candidate.snapshot)
+                        lifecycle.publish_candidate(candidate)
                     else:
                         return
 
@@ -2514,6 +2623,10 @@ class PublicPaperRuntime:
         stream.connected(now)
         stream.snapshot(book)
         stream.connection_confirmed(now)
+        self._bump_book_revision(
+            (book.venue, book.canonical_market),
+            checksum=(stream.risex_checksum() if book.venue is Venue.RISEX else None),
+        )
         self._live_book_ready.add((book.venue, book.canonical_market))
         self._set_component_readiness(
             book.venue, f"book:{book.canonical_market}", True,
@@ -2689,6 +2802,11 @@ class PublicPaperRuntime:
             stream.connected(at)
             stream.snapshot(candidate.recovered)
             stream.connection_confirmed(at)
+            self._bump_book_revision(
+                key,
+                recovery_generation=generation.value,
+                checksum=(stream.risex_checksum() if venue is Venue.RISEX else None),
+            )
             self._live_book_ready.add(key)
             self.component_readiness[venue] = dict(candidate.components)
             self.readiness[venue] = candidate.venue_readiness
@@ -2830,6 +2948,7 @@ class PublicPaperRuntime:
             )
             return False
         else:
+            self._bump_book_revision(key, checksum=event.checksum)
             self._live_book_ready.add(key)
             if self.lifecycle is not None:
                 await self._evaluate_relevant_book_event(key, now)
@@ -2854,23 +2973,31 @@ class PublicPaperRuntime:
                 snapshot.risex_market, snapshot.hedge_market, at
             )
             before = lifecycle.snapshot
-            candidate = LifecycleEngine.from_snapshot(
-                before, config=lifecycle.config
-            )
+            candidate = lifecycle.detached()
+            risex_capture = self._execution_capture(risex, at)
+            hedge_capture = self._execution_capture(hedge, at)
             await candidate.evaluate(
                 evaluated_at=at,
                 risex_observation=risex,
                 hedge_observation=hedge,
                 record_sample=False,
                 hard_basis_only=True,
+                risex_capture=risex_capture,
+                hedge_capture=hedge_capture,
             )
             if self.lifecycle is not lifecycle or lifecycle.snapshot is not before:
                 return
+            if candidate.fill_provenance and not self._captures_are_current(
+                risex_capture, hedge_capture
+            ):
+                return
             if candidate.snapshot != before:
                 self.repository.save_decision(
-                    recorded_at=at, lifecycle_snapshot=candidate.snapshot
+                    recorded_at=at,
+                    lifecycle_snapshot=candidate.snapshot,
+                    fill_provenance=candidate.fill_provenance,
                 )
-                lifecycle.publish_snapshot(candidate.snapshot)
+                lifecycle.publish_candidate(candidate)
                 after = candidate.snapshot
                 if after.lifecycle_state is LifecycleState.FLAT:
                     self.lifecycle = None
