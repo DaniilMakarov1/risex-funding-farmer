@@ -1305,6 +1305,7 @@ class ExtendedLifecycle:
         value = _decimal(position["value"], "position.value")
         open_price = _decimal(position["openPrice"], "position.openPrice")
         mark_price = _decimal(position["markPrice"], "position.markPrice")
+        unrealised_pnl = _decimal(position["unrealisedPnl"], "position.unrealisedPnl")
         position_leverage = _decimal(position["leverage"], "position.leverage")
         account_leverage = next(
             (row for row in evidence.leverage if row["market"] == intent.market), None
@@ -1327,6 +1328,11 @@ class ExtendedLifecycle:
             ),
             Decimal(0),
         )
+        expected_unrealised_pnl = (
+            size * (mark_price - open_price)
+            if expected_side == "LONG"
+            else size * (open_price - mark_price)
+        )
         if (
             size <= 0
             or value <= 0
@@ -1338,6 +1344,7 @@ class ExtendedLifecycle:
             or value != abs(size * mark_price)
             or open_price != weighted_value / fill_qty
             or mark_price != _decimal(evidence.market["marketStats"]["markPrice"], "market.markPrice")
+            or unrealised_pnl != expected_unrealised_pnl
             or position_leverage != _decimal(account_leverage["leverage"], "account.leverage")
         ):
             raise LifecycleHalted("POSITION_EVIDENCE_MISMATCH")

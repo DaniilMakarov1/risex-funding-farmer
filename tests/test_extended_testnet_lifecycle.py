@@ -639,6 +639,9 @@ def test_partial_fill_accounting_halts_subminimum_or_offgrid_residual(
     changed["filledOrder"]["payedFee"] = changed["fill"]["fee"]
     changed["position"]["size"] = position_qty
     changed["position"]["value"] = str(Decimal(position_qty) * Decimal("40005"))
+    changed["position"]["unrealisedPnl"] = str(
+        Decimal(position_qty) * (Decimal("40005") - Decimal("40008"))
+    )
     partial = filled_evidence(changed)
     result = lifecycle.reconcile(entry.id, partial)
     assert result.filled_qty == Decimal(fill_qty)
@@ -1351,11 +1354,61 @@ def test_position_value_uses_current_mark_and_has_independent_usd_cap(lifecycle,
     for row in (changed["account"]["positions"][0], changed["stream"]["positions"][0]):
         row["markPrice"] = "600000"
         row["value"] = "600"
+        row["unrealisedPnl"] = str(Decimal("0.001") * (Decimal("600000") - Decimal("40008")))
     excessive = normalize_official_evidence(changed, now_ms=1_770_000_003_000)
     with pytest.raises(LifecycleHalted, match="NOTIONAL_CAP"):
         lifecycle.reconcile(entry.id, excessive)
     assert lifecycle.store.snapshot().lifecycle_state.startswith("HALTED_")
     assert lifecycle.store.dispatch_count(entry.id) == 1
+
+
+@pytest.mark.parametrize("bad_pnl", ["0", "0.003", "999999"])
+def test_entry_position_unrealised_pnl_must_match_side_aware_mark_formula(
+    lifecycle, evidence, wire, bad_pnl
+):
+    entry = claim_entry(lifecycle, evidence, wire)
+    changed = filled_wire(wire)
+    changed["account"]["positions"][0]["unrealisedPnl"] = bad_pnl
+    changed["stream"]["positions"][0]["unrealisedPnl"] = bad_pnl
+    contradiction = normalize_official_evidence(changed, now_ms=1_770_000_003_000)
+    with pytest.raises(LifecycleHalted, match="POSITION"):
+        lifecycle.reconcile(entry.id, contradiction)
+    assert lifecycle.store.get(entry.id).state == "CLAIMED"
+    assert lifecycle.store.snapshot().lifecycle_state.startswith("HALTED_")
+
+    restarted = reopen(lifecycle)
+    with pytest.raises(LifecycleHalted):
+        prepare_close(restarted, entry.id, filled_evidence(wire), wire)
+    assert restarted.store.count() == 1
+    assert restarted.store.dispatch_count(entry.id) == 1
+
+
+@pytest.mark.parametrize("stage", ["PREPARE", "CLAIM"])
+@pytest.mark.parametrize("bad_pnl", ["0", "0.003", "999999"])
+def test_close_prepare_and_claim_revalidate_exact_unrealised_pnl(
+    lifecycle, evidence, wire, stage, bad_pnl
+):
+    entry = claim_entry(lifecycle, evidence, wire)
+    exposed = filled_evidence(wire)
+    lifecycle.reconcile(entry.id, exposed)
+    close = prepare_close(lifecycle, entry.id, exposed, wire) if stage == "CLAIM" else None
+    changed = filled_wire(wire)
+    changed["account"]["positions"][0]["unrealisedPnl"] = bad_pnl
+    changed["stream"]["positions"][0]["unrealisedPnl"] = bad_pnl
+    contradiction = normalize_official_evidence(changed, now_ms=1_770_000_003_000)
+    with pytest.raises(LifecycleHalted, match="POSITION"):
+        if stage == "PREPARE":
+            prepare_close(lifecycle, entry.id, contradiction, wire)
+        else:
+            lifecycle.claim_for_dispatch(close.id, evidence=contradiction)
+    restarted = reopen(lifecycle)
+    assert restarted.store.dispatch_count(entry.id) == 1
+    if close is None:
+        assert restarted.store.count() == 1
+    else:
+        assert restarted.store.count() == 2
+        assert restarted.store.get(close.id).state == "PREPARED"
+        assert restarted.store.dispatch_count(close.id) == 0
 
 
 def test_no_dispatch_or_state_mutation_shortcuts_are_exposed(lifecycle):
