@@ -536,6 +536,52 @@ def test_success_requires_observed_fill_zero_orders_and_exact_flat(lifecycle, tm
     bad.store.close()
 
 
+def test_final_flat_must_match_durable_reconciled_position(tmp_path):
+    candidate = new_lifecycle(tmp_path / "final-position-lineage.sqlite3")
+    seed_filled(candidate)
+    closing = prepare_close(candidate)
+    dispatch(candidate, closing, "close-1")
+    candidate.reconcile(
+        closing.intent_id,
+        exact_evidence("close-1", 201, position="0.0001"),
+    )
+    path = candidate.store.path
+    candidate.store.close()
+    candidate = new_lifecycle(path, now=NOW + 2)
+    assert candidate.store.latest_reconciled_position() == Decimal("0.0001")
+    assert candidate.finalize(
+        account(observed_at=NOW + 2),
+    ) == Outcome.FAILED_HALTED_MANUAL_RECOVERY
+    assert candidate.store.load_outcome() == Outcome.FAILED_HALTED_MANUAL_RECOVERY
+    with pytest.raises(LifecycleSafetyError):
+        prepare_close(candidate, position="0.0001", observed=NOW + 2)
+    candidate.store.close()
+
+    for index, corrupt_value in enumerate((None, "not-a-position")):
+        corrupt = new_lifecycle(tmp_path / f"corrupt-final-lineage-{index}.sqlite3")
+        seed_filled(corrupt)
+        close = prepare_close(corrupt)
+        dispatch(corrupt, close, "close-1")
+        corrupt.reconcile(close.intent_id, exact_evidence(
+            "close-1", 201, filled="0.0001", position="0",
+        ))
+        with corrupt.store.connection:
+            if corrupt_value is None:
+                corrupt.store.connection.execute(
+                    "DELETE FROM terminal WHERE key=?", (f"position:{close.intent_id}",),
+                )
+            else:
+                corrupt.store.connection.execute(
+                    "UPDATE terminal SET value=? WHERE key=?",
+                    (corrupt_value, f"position:{close.intent_id}"),
+                )
+        assert corrupt.finalize(
+            account(observed_at=NOW + 1),
+        ) == Outcome.FAILED_HALTED_MANUAL_RECOVERY
+        assert corrupt.store.load_outcome() == Outcome.FAILED_HALTED_MANUAL_RECOVERY
+        corrupt.store.close()
+
+
 def test_minimum_size_and_usd_cap_are_invariants(lifecycle, tmp_path):
     assert ready(lifecycle).size == market().minimum
     with pytest.raises(LifecycleSafetyError):

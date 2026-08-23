@@ -8,7 +8,7 @@ tests; enabling real signing or transport requires a later governance gate.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 from enum import Enum
 import hashlib
 import json
@@ -393,7 +393,12 @@ class DurableIntentStore:
             "WHERE intents.state='TERMINAL' AND intents.reconciled=1 "
             "ORDER BY intents.ordinal DESC LIMIT 1"
         ).fetchone()
-        return None if row is None or row[0] is None else Decimal(str(row[0]))
+        if row is None or row[0] is None:
+            return None
+        try:
+            return Decimal(str(row[0]))
+        except (InvalidOperation, ValueError):
+            return None
 
     def _record_open_known(self, intent_id: str, order_id: str) -> None:
         with self.connection:
@@ -1014,9 +1019,11 @@ class Lifecycle:
         }:
             return self.outcome
         intents = self.store.all()
+        latest_position = self.store.latest_reconciled_position()
         if (
             self.observed_opening_fill and self._account_valid(account)
-            and account.position == 0
+            and latest_position == Decimal("0")
+            and account.position == latest_position
             and not account.open_order_ids and not account.unexplained
             and self._fresh(account.observed_at)
             and account.repeated_position == account.position
