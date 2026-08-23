@@ -8,6 +8,8 @@ import ssl
 import subprocess
 import sys
 import traceback
+import json
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -69,6 +71,8 @@ class Scenario:
     balance_request_id: str | None = None
     constructor_error: BaseException | None = None
     close_error: BaseException | None = None
+    balance_responses: list[tuple[int, Any]] = field(default_factory=list)
+    on_post: Any = None
     calls: list[tuple[str, URL, dict[str, Any]]] = field(default_factory=list)
     session_kwargs: list[dict[str, Any]] = field(default_factory=list)
     closed: int = 0
@@ -137,6 +141,8 @@ class Session:
         actual = requested.with_query(kwargs.get("params")) if kwargs.get("params") else requested
         self.scenario.calls.append((method, actual, kwargs))
         if method == "POST" and requested.path == DEPOSIT:
+            if self.scenario.on_post is not None:
+                self.scenario.on_post()
             response = Response(self.scenario.post_status,
                                 self.scenario.post_url or actual,
                                 self.scenario.post_body)
@@ -147,6 +153,10 @@ class Session:
         bodies = {"/v1/system/config": self.scenario.config_body,
                   "/v1/auth/eip712-domain": self.scenario.domain_body}
         if requested.path == "/v1/account/balance":
+            status = 200
+            if self.scenario.balance_responses:
+                status, body = self.scenario.balance_responses.pop(0)
+                return Request(Response(status, self.scenario.get_url or actual, body))
             body = {"data": {"balance": self.scenario.balance()}}
             if self.scenario.balance_request_id is not None:
                 body["request_id"] = self.scenario.balance_request_id
@@ -181,7 +191,7 @@ def transport(monkeypatch: pytest.MonkeyPatch, module):
             assert not scenario.calls and scenario.closed == 0
             continue
         if scenario.constructor_error is None:
-            assert scenario.closed == 1
+            assert scenario.closed == len(scenario.session_kwargs)
         else:
             assert scenario.closed == 0 and not scenario.calls
         kwargs = scenario.session_kwargs[0]
@@ -204,6 +214,47 @@ def _session(args: tuple[Any, ...], kwargs: dict[str, Any], scenario: Scenario) 
 
 def posts(scenario: Scenario):
     return [call for call in scenario.calls if call[0] == "POST"]
+
+
+MARKER = ".risex-funding-farmer-testnet-first-deposit-v1.json"
+READY_TEMP = MARKER + ".ready.tmp"
+OBSERVED_ABSENT = {
+    "error": {"code": "Internal", "message": "failed to get balance"},
+    "request_id": "req-fixture-stable",
+}
+
+
+def marker_payload(state: str = "SPENT_UNKNOWN") -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "venue": "RISEx",
+        "host": "api.testnet.rise.trade",
+        "chain_id": 11155931,
+        "wallet": WALLET,
+        "operation": "FIRST_DEPOSIT",
+        "amount": "1000",
+        "state": state,
+    }
+
+
+def write_marker(home: Path, payload: Any, *, mode: int = 0o600) -> Path:
+    path = home / MARKER
+    if isinstance(payload, bytes):
+        path.write_bytes(payload)
+    else:
+        path.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
+    path.chmod(mode)
+    return path
+
+
+@pytest.fixture(autouse=True)
+def private_passwd_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, module):
+    """All bootstrap tests use an existing disposable passwd-home directory."""
+
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    monkeypatch.setattr(module, "_passwd_home", lambda: home, raising=False)
+    return home
 
 
 def assert_testnet_calls(scenario: Scenario) -> None:
@@ -256,6 +307,11 @@ async def test_preflight_and_postcondition_are_authoritative(module, transport):
     assert result.status is not module.BootstrapStatus.READY
     assert len(posts(unverified)) == 1
     assert posts(unverified)[0][2]["json"] == {"account": WALLET, "amount": "1000"}
+
+    home = module._passwd_home()
+    (home / MARKER).unlink()
+    if (home / READY_TEMP).exists():
+        (home / READY_TEMP).unlink()
 
     ready = transport(Scenario(balances=["0", "9"]))
     result = await module.bootstrap_risex_account(WALLET, intent="RISEX_TESTNET_DEPOSIT")
@@ -456,3 +512,432 @@ def test_normal_farmer_import_does_not_load_optional_module() -> None:
     completed = subprocess.run([sys.executable, "-c", command], cwd=project, env=env,
                                check=True, capture_output=True, text=True, timeout=10)
     assert completed.stdout.strip() == str(project / "src/risex_farmer/__init__.py")
+
+
+# TESTNET-001-RECOVERY-005: direct passwd-home durable one-shot RED.
+
+
+def exact_absent_then(*responses: tuple[int, Any]) -> list[tuple[int, Any]]:
+    return [(500, OBSERVED_ABSENT), *responses]
+
+
+def observed_absent(request_id: str) -> dict[str, Any]:
+    return {
+        "error": {"code": "Internal", "message": "failed to get balance"},
+        "request_id": request_id,
+    }
+
+
+@pytest.mark.asyncio
+async def test_direct_home_claim_is_durable_before_the_only_post(
+    module, transport, private_passwd_home, monkeypatch
+):
+    events: list[str] = []
+    real_open, real_write, real_fsync = module.os.open, module.os.write, module.os.fsync
+
+    def tracked_open(path, flags, mode=0o777, *, dir_fd=None):
+        if path == MARKER and flags & os.O_CREAT:
+            assert flags & os.O_CREAT and flags & os.O_EXCL
+            assert getattr(os, "O_NOFOLLOW", 0) & flags
+            events.append("exclusive-create")
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    def tracked_write(fd, data):
+        events.append("complete-write")
+        return real_write(fd, data)
+
+    def tracked_fsync(fd):
+        events.append("home-fsync" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file-fsync")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(module.os, "open", tracked_open)
+    monkeypatch.setattr(module.os, "write", tracked_write)
+    monkeypatch.setattr(module.os, "fsync", tracked_fsync)
+    def at_post() -> None:
+        assert json.loads((private_passwd_home / MARKER).read_text()) == marker_payload()
+        events.append("post")
+
+    scenario = transport(Scenario(
+        balance_responses=exact_absent_then((200, {"balance": "0"})),
+        on_post=at_post,
+    ))
+
+    result = await module.bootstrap_risex_account(WALLET, intent="RISEX_TESTNET_DEPOSIT")
+
+    assert result.status is not module.BootstrapStatus.READY
+    assert len(posts(scenario)) == 1
+    assert events.index("exclusive-create") < events.index("complete-write")
+    assert events.index("complete-write") < events.index("file-fsync")
+    assert events.index("file-fsync") < events.index("home-fsync") < events.index("post")
+    marker = private_passwd_home / MARKER
+    assert marker.parent == private_passwd_home
+    assert json.loads(marker.read_text()) == marker_payload()
+    assert stat.S_IMODE(marker.stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize("boundary", ["create", "write", "file_fsync", "home_fsync"])
+def test_claim_boundary_failure_is_terminal_and_never_reusable(
+    boundary, module, private_passwd_home, monkeypatch
+):
+    real_write, real_fsync = module.os.write, module.os.fsync
+    fired = False
+
+    def failing_write(fd, data):
+        nonlocal fired
+        if boundary == "create" and not fired:
+            fired = True
+            raise OSError("synthetic crash after exclusive create")
+        if boundary == "write" and not fired:
+            fired = True
+            real_write(fd, data)
+            raise OSError("synthetic crash after partial write")
+        return real_write(fd, data)
+
+    def failing_fsync(fd):
+        nonlocal fired
+        is_dir = stat.S_ISDIR(os.fstat(fd).st_mode)
+        if not fired and ((boundary == "file_fsync" and not is_dir) or
+                          (boundary == "home_fsync" and is_dir)):
+            fired = True
+            raise OSError("synthetic durability failure")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(module.os, "write", failing_write)
+    monkeypatch.setattr(module.os, "fsync", failing_fsync)
+    with pytest.raises(module.BootstrapSafetyError):
+        module._claim_first_deposit()
+    monkeypatch.setattr(module.os, "write", real_write)
+    monkeypatch.setattr(module.os, "fsync", real_fsync)
+    try:
+        replay = module._claim_first_deposit()
+    except module.BootstrapSafetyError:
+        replay = False
+    assert replay is False
+    assert (private_passwd_home / MARKER).exists()
+
+
+@pytest.mark.asyncio
+async def test_existing_spent_or_invalid_marker_always_blocks_post(
+    module, transport, private_passwd_home
+):
+    invalids = [
+        marker_payload(), b"", b'{"schema_version":1',
+        marker_payload() | {"wallet": OTHER_WALLET},
+        marker_payload() | {"extra": "not canonical"},
+    ]
+    for value in invalids:
+        marker = private_passwd_home / MARKER
+        if marker.exists() or marker.is_symlink():
+            marker.unlink()
+        write_marker(private_passwd_home, value)
+        scenario = transport(Scenario(balance_responses=exact_absent_then()))
+        try:
+            result = await module.bootstrap_risex_account(
+                WALLET, intent="RISEX_TESTNET_DEPOSIT"
+            )
+        except module.BootstrapSafetyError as error:
+            assert str(error) == "RISEx testnet identity or response rejected"
+        else:
+            assert result.status is not module.BootstrapStatus.READY
+        assert not posts(scenario)
+
+
+@pytest.mark.parametrize("kind", ["symlink", "directory", "fifo", "wrong_mode", "hardlink"])
+def test_unsafe_existing_marker_fails_closed_at_access(
+    kind, module, private_passwd_home, tmp_path
+):
+    marker = private_passwd_home / MARKER
+    if kind == "symlink":
+        marker.symlink_to(tmp_path / "elsewhere")
+    elif kind == "directory":
+        marker.mkdir()
+    elif kind == "fifo":
+        os.mkfifo(marker)
+    else:
+        write_marker(private_passwd_home, marker_payload(), mode=0o644 if kind == "wrong_mode" else 0o600)
+        if kind == "hardlink":
+            os.link(marker, tmp_path / "second-link")
+    with pytest.raises(module.BootstrapSafetyError):
+        module._claim_first_deposit()
+
+
+def test_wrong_owner_marker_fails_closed_at_access(module, private_passwd_home, monkeypatch):
+    marker = write_marker(private_passwd_home, marker_payload())
+    real_fstat = module.os.fstat
+
+    def wrong_owner(fd):
+        result = real_fstat(fd)
+        if stat.S_ISREG(result.st_mode):
+            values = list(result)
+            values[4] = os.getuid() + 1
+            return os.stat_result(values)
+        return result
+
+    monkeypatch.setattr(module.os, "fstat", wrong_owner)
+    with pytest.raises(module.BootstrapSafetyError):
+        module._claim_first_deposit()
+    assert marker.exists()
+
+
+@pytest.mark.parametrize("kind", ["symlink", "file", "wrong_owner",
+                                  "no_o_directory", "no_o_nofollow"])
+def test_passwd_home_must_be_owned_real_directory_with_required_primitives(
+    kind, module, private_passwd_home, tmp_path, monkeypatch
+):
+    if kind in {"symlink", "file"}:
+        private_passwd_home.rmdir()
+        if kind == "symlink":
+            destination = tmp_path / "redirected-home"
+            destination.mkdir()
+            private_passwd_home.symlink_to(destination, target_is_directory=True)
+        else:
+            private_passwd_home.write_text("not a directory")
+    elif kind == "wrong_owner":
+        real_fstat = module.os.fstat
+
+        def wrong_home_owner(fd):
+            result = real_fstat(fd)
+            if stat.S_ISDIR(result.st_mode):
+                values = list(result)
+                values[4] = os.getuid() + 1
+                return os.stat_result(values)
+            return result
+
+        monkeypatch.setattr(module.os, "fstat", wrong_home_owner)
+    elif kind == "no_o_directory":
+        monkeypatch.setattr(module.os, "O_DIRECTORY", 0)
+    else:
+        monkeypatch.setattr(module.os, "O_NOFOLLOW", 0)
+    with pytest.raises(module.BootstrapSafetyError):
+        module._claim_first_deposit()
+
+
+def test_abandoned_ready_temp_without_marker_is_terminal_consumed(
+    module, private_passwd_home
+):
+    write_marker(private_passwd_home, marker_payload("READY"))
+    (private_passwd_home / MARKER).rename(private_passwd_home / READY_TEMP)
+    assert module._claim_first_deposit() is False
+    assert not (private_passwd_home / MARKER).exists()
+
+
+@pytest.mark.asyncio
+async def test_ready_marker_never_replays_and_is_not_readiness_authority(
+    module, transport, private_passwd_home
+):
+    write_marker(private_passwd_home, marker_payload("READY"))
+    positive = transport(Scenario(balances=["8"]))
+    ready = await module.bootstrap_risex_account(WALLET, intent="RISEX_TESTNET_DEPOSIT")
+    assert ready.status in {module.BootstrapStatus.READY, module.BootstrapStatus.ALREADY_READY}
+    assert not posts(positive)
+
+    (private_passwd_home / MARKER).write_text(
+        json.dumps(marker_payload("READY"), sort_keys=True, separators=(",", ":")) + "\n"
+    )
+    unavailable = transport(Scenario(balance_responses=[(500, OBSERVED_ABSENT)]))
+    result = await module.bootstrap_risex_account(WALLET, intent="RISEX_TESTNET_DEPOSIT")
+    assert result.status not in {module.BootstrapStatus.READY,
+                                 module.BootstrapStatus.ALREADY_READY}
+    assert not posts(unavailable)
+
+
+@pytest.mark.asyncio
+async def test_positive_postcondition_uses_same_home_atomic_ready_transition(
+    module, transport, private_passwd_home, monkeypatch
+):
+    events: list[str] = []
+    replaces: list[tuple[Any, Any]] = []
+    real_open, real_write = module.os.open, module.os.write
+    real_fsync, real_replace = module.os.fsync, module.os.replace
+
+    def tracked_open(path, flags, mode=0o777, *, dir_fd=None):
+        if path == READY_TEMP and flags & os.O_CREAT:
+            assert flags & os.O_CREAT and flags & os.O_EXCL
+            assert getattr(os, "O_NOFOLLOW", 0) & flags
+            events.append("temp-create")
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    def tracked_write(fd, data):
+        events.append("temp-write")
+        return real_write(fd, data)
+
+    def tracked_fsync(fd):
+        events.append("home-fsync" if stat.S_ISDIR(os.fstat(fd).st_mode) else "temp-fsync")
+        return real_fsync(fd)
+
+    def tracked_replace(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+        replaces.append((src, dst))
+        events.append("replace")
+        return real_replace(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    monkeypatch.setattr(module.os, "open", tracked_open)
+    monkeypatch.setattr(module.os, "write", tracked_write)
+    monkeypatch.setattr(module.os, "fsync", tracked_fsync)
+    monkeypatch.setattr(module.os, "replace", tracked_replace)
+    scenario = transport(Scenario(
+        balance_responses=exact_absent_then((200, {"balance": "9"}))
+    ))
+    result = await module.bootstrap_risex_account(WALLET, intent="RISEX_TESTNET_DEPOSIT")
+    assert result.status is module.BootstrapStatus.READY
+    assert len(posts(scenario)) == 1
+    assert replaces == [(READY_TEMP, MARKER)]
+    temp_create = events.index("temp-create")
+    assert temp_create < events.index("temp-write", temp_create)
+    temp_fsync = events.index("temp-fsync", temp_create)
+    replace = events.index("replace", temp_create)
+    assert events.index("temp-write", temp_create) < temp_fsync < replace
+    assert replace < events.index("home-fsync", replace)
+    assert json.loads((private_passwd_home / MARKER).read_text()) == marker_payload("READY")
+    assert not (private_passwd_home / READY_TEMP).exists()
+
+
+@pytest.mark.asyncio
+async def test_ready_transition_failure_stays_consumed_and_cannot_replay(
+    module, transport, private_passwd_home, monkeypatch
+):
+    real_replace = module.os.replace
+
+    def fail_replace(*_args, **_kwargs):
+        raise OSError("synthetic atomic READY update failure")
+
+    monkeypatch.setattr(module.os, "replace", fail_replace)
+    first = transport(Scenario(
+        balance_responses=exact_absent_then((200, {"balance": "9"}))
+    ))
+    result = await module.bootstrap_risex_account(WALLET, intent="RISEX_TESTNET_DEPOSIT")
+    assert result.status is not module.BootstrapStatus.READY
+    assert len(posts(first)) == 1
+    monkeypatch.setattr(module.os, "replace", real_replace)
+    replay = transport(Scenario(balance_responses=exact_absent_then()))
+    result = await module.bootstrap_risex_account(WALLET, intent="RISEX_TESTNET_DEPOSIT")
+    assert result.status is not module.BootstrapStatus.READY
+    assert not posts(replay)
+    assert json.loads((private_passwd_home / MARKER).read_text()) == marker_payload()
+
+
+@pytest.mark.parametrize("status,body", [
+    (400, OBSERVED_ABSENT), (404, OBSERVED_ABSENT), (502, OBSERVED_ABSENT),
+    (503, OBSERVED_ABSENT), (504, OBSERVED_ABSENT),
+    (500, {"error": {"code": "Other", "message": "failed to get balance"},
+           "request_id": "req-fixture-stable"}),
+    (500, {"error": {"code": "Internal", "message": "different"},
+           "request_id": "req-fixture-stable"}),
+    (500, {"error": {"code": "Internal", "message": "failed to get balance"}}),
+    (500, {"error": {"code": "Internal", "message": "failed to get balance"},
+           "request_id": ""}),
+    (500, {"error": {"code": "Internal", "message": "failed to get balance"},
+           "request_id": 42}),
+    (500, {"error": {"code": "Internal", "message": "failed to get balance"},
+           "request_id": "req-fixture-stable", "extra": 1}),
+    (500, {"error": {"code": "Internal", "message": "failed to get balance",
+                      "extra": 1}, "request_id": "req-fixture-stable"}),
+])
+@pytest.mark.asyncio
+async def test_only_exact_observed_preflight_error_can_reach_claim(
+    status, body, module, transport, private_passwd_home
+):
+    scenario = transport(Scenario(balance_responses=[(status, body)]))
+    with pytest.raises(module.BootstrapSafetyError):
+        await module.bootstrap_risex_account(WALLET, intent="RISEX_TESTNET_DEPOSIT")
+    assert not posts(scenario)
+    assert not (private_passwd_home / MARKER).exists()
+
+
+@pytest.mark.asyncio
+async def test_observed_preflight_accepts_any_nonempty_request_id_without_hardcoding(
+    module, transport
+):
+    scenario = transport(Scenario(balance_responses=[
+        (500, observed_absent("different-redacted-request-id")),
+        (200, {"balance": "0"}),
+    ]))
+    result = await module.bootstrap_risex_account(WALLET, intent="RISEX_TESTNET_DEPOSIT")
+    assert result.status is not module.BootstrapStatus.READY
+    assert len(posts(scenario)) == 1
+
+
+@pytest.mark.asyncio
+async def test_async_race_produces_one_claim_and_at_most_one_post(
+    module, transport
+):
+    scenario = transport(Scenario(
+        balance_responses=[(500, OBSERVED_ABSENT), (500, OBSERVED_ABSENT),
+                           (200, {"balance": "0"})]
+    ))
+    results = await asyncio.wait_for(asyncio.gather(*[
+        module.bootstrap_risex_account(WALLET, intent="RISEX_TESTNET_DEPOSIT")
+        for _ in range(2)
+    ]), timeout=3)
+    assert len(results) == 2
+    assert len(posts(scenario)) == 1
+
+
+def _claim_subprocess(project: Path, home: Path, *, abrupt: bool = False):
+    code = (
+        "import pathlib, risex_farmer.testnet_bootstrap as m;"
+        f"m._passwd_home=lambda:pathlib.Path({str(home)!r});"
+        "claimed=m._claim_first_deposit();"
+        + ("__import__('os')._exit(0)" if abrupt else "print('CLAIMED' if claimed else 'BLOCKED')")
+    )
+    env = os.environ | {"PYTHONPATH": str(project / "src")}
+    return subprocess.Popen([sys.executable, "-c", code], cwd=project, env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+
+def test_subprocess_race_and_abrupt_restart_are_one_shot(module, private_passwd_home):
+    project = Path(__file__).resolve().parents[1]
+    racers = [_claim_subprocess(project, private_passwd_home) for _ in range(2)]
+    outputs = [process.communicate(timeout=5) for process in racers]
+    assert all(process.returncode == 0 for process in racers), outputs
+    assert sorted(output.strip() for output, _ in outputs) == ["BLOCKED", "CLAIMED"]
+
+    (private_passwd_home / MARKER).unlink()
+    abrupt = _claim_subprocess(project, private_passwd_home, abrupt=True)
+    abrupt.communicate(timeout=5)
+    assert abrupt.returncode == 0
+    replay = _claim_subprocess(project, private_passwd_home)
+    output, error = replay.communicate(timeout=5)
+    assert replay.returncode == 0, error
+    assert output.strip() == "BLOCKED"
+
+
+@pytest.mark.parametrize("failure", [asyncio.TimeoutError(), EOFError(),
+                                      ssl.SSLError("synthetic")])
+@pytest.mark.asyncio
+async def test_postclaim_network_ambiguity_is_consumed_without_replay(
+    failure, module, transport, private_passwd_home
+):
+    first = transport(Scenario(balance_responses=exact_absent_then(), post_error=failure))
+    result = await module.bootstrap_risex_account(WALLET, intent="RISEX_TESTNET_DEPOSIT")
+    assert result.status is module.BootstrapStatus.UNKNOWN_AMBIGUOUS
+    assert len(posts(first)) == 1
+    replay = transport(Scenario(balance_responses=exact_absent_then()))
+    result = await module.bootstrap_risex_account(WALLET, intent="RISEX_TESTNET_DEPOSIT")
+    assert result.status is not module.BootstrapStatus.READY
+    assert not posts(replay)
+    assert (private_passwd_home / MARKER).exists()
+
+
+@pytest.mark.asyncio
+async def test_postclaim_cancellation_propagates_and_blocks_replay(
+    module, transport, private_passwd_home
+):
+    first = transport(Scenario(balance_responses=exact_absent_then(),
+                               post_error=asyncio.CancelledError()))
+    with pytest.raises(asyncio.CancelledError):
+        await module.bootstrap_risex_account(WALLET, intent="RISEX_TESTNET_DEPOSIT")
+    assert len(posts(first)) == 1
+    replay = transport(Scenario(balance_responses=exact_absent_then()))
+    await module.bootstrap_risex_account(WALLET, intent="RISEX_TESTNET_DEPOSIT")
+    assert not posts(replay)
+    assert (private_passwd_home / MARKER).exists()
+
+
+def test_no_public_path_reset_rearm_retry_or_trading_surface(module) -> None:
+    public = {name.lower() for name in vars(module) if not name.startswith("_")}
+    assert not public & {"marker", "ledger", "path", "home", "reset", "delete", "rearm",
+                         "retry", "order", "cancel", "replace", "position", "trade"}
+    source = Path(module.__file__).read_text().lower()
+    forbidden = ("$home", "expanduser", "getenv(", "environ", "mainnet", "place_order",
+                 "cancel_order", "replace_order", "reduce_only")
+    assert not any(token in source for token in forbidden)

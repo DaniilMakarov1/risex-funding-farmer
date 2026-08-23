@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import asyncio as _asyncio
 from dataclasses import dataclass
 from enum import Enum
+import json as _json
+import os
+from pathlib import Path as _Path
+import pwd as _pwd
+import stat as _stat
 from typing import Any
 
 import aiohttp
@@ -18,6 +24,8 @@ _EXPECTED_WALLET = "0x20f9153e2eeba0ff7880fb5a23e976e8b2af56ee"
 _DEPOSIT_INTENT = "RISEX_TESTNET_DEPOSIT"
 _DEPOSIT_AMOUNT = "1000"
 _TIMEOUT_SECONDS = 10
+_MARKER = ".risex-funding-farmer-testnet-first-deposit-v1.json"
+_READY_TEMP = _MARKER + ".ready.tmp"
 
 
 class BootstrapStatus(Enum):
@@ -26,6 +34,7 @@ class BootstrapStatus(Enum):
     SUBMITTED_UNVERIFIED = "SUBMITTED_UNVERIFIED"
     UNKNOWN_AMBIGUOUS = "UNKNOWN_AMBIGUOUS"
     REJECTED = "REJECTED"
+    READY_UNVERIFIED = "READY_UNVERIFIED"
 
 
 class BootstrapSafetyError(RuntimeError):
@@ -48,6 +57,177 @@ class BootstrapResult:
 @dataclass(frozen=True)
 class _Identity:
     usdc: str
+
+
+_MARKER_BASE = {
+    "schema_version": 1,
+    "venue": "RISEx",
+    "host": "api.testnet.rise.trade",
+    "chain_id": _CHAIN_ID,
+    "wallet": _EXPECTED_WALLET,
+    "operation": "FIRST_DEPOSIT",
+    "amount": _DEPOSIT_AMOUNT,
+}
+
+
+def _marker_bytes(state: str) -> bytes:
+    return (_json.dumps(
+        _MARKER_BASE | {"state": state}, sort_keys=True, separators=(",", ":")
+    ) + "\n").encode()
+
+
+_SPENT_BYTES = _marker_bytes("SPENT_UNKNOWN")
+_READY_BYTES = _marker_bytes("READY")
+
+
+def _passwd_home() -> _Path:
+    return _Path(_pwd.getpwuid(os.getuid()).pw_dir)
+
+
+def _required_open_flags() -> int:
+    directory = getattr(os, "O_DIRECTORY", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not directory or not nofollow:
+        raise _safety_error()
+    return directory | nofollow | getattr(os, "O_CLOEXEC", 0)
+
+
+def _open_home() -> int:
+    fd: int | None = None
+    try:
+        fd = os.open(_passwd_home(), os.O_RDONLY | _required_open_flags())
+        details = os.fstat(fd)
+        if not _stat.S_ISDIR(details.st_mode) or details.st_uid != os.getuid():
+            raise _safety_error()
+        return fd
+    except BootstrapSafetyError:
+        if fd is not None:
+            os.close(fd)
+        raise
+    except (OSError, TypeError, ValueError):
+        raise _safety_error() from None
+
+
+def _write_all(fd: int, payload: bytes) -> None:
+    written = 0
+    while written < len(payload):
+        count = os.write(fd, payload[written:])
+        if count <= 0:
+            raise OSError("short marker write")
+        written += count
+
+
+def _validate_file(fd: int) -> None:
+    details = os.fstat(fd)
+    if (
+        not _stat.S_ISREG(details.st_mode)
+        or details.st_uid != os.getuid()
+        or _stat.S_IMODE(details.st_mode) != 0o600
+        or details.st_nlink != 1
+    ):
+        raise _safety_error()
+
+
+def _read_entry(home_fd: int, name: str) -> bytes | None:
+    flags = (
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+        | _required_open_flags()
+    )
+    flags &= ~os.O_DIRECTORY
+    try:
+        fd = os.open(name, flags, dir_fd=home_fd)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise _safety_error() from None
+    try:
+        _validate_file(fd)
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > 4096:
+                raise _safety_error()
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _existing_state(home_fd: int) -> str | None:
+    marker = _read_entry(home_fd, _MARKER)
+    temporary = _read_entry(home_fd, _READY_TEMP)
+    if marker is None:
+        if temporary is not None:
+            return "BLOCKED"
+        return None
+    if marker == _SPENT_BYTES:
+        return "SPENT_UNKNOWN"
+    if marker == _READY_BYTES:
+        return "READY"
+    raise _safety_error()
+
+
+def _claim_in_home(home_fd: int) -> bool:
+    if _existing_state(home_fd) is not None:
+        return False
+    flags = (
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        fd = os.open(_MARKER, flags, 0o600, dir_fd=home_fd)
+    except FileExistsError:
+        return False
+    except OSError:
+        raise _safety_error() from None
+    try:
+        os.fchmod(fd, 0o600)
+        _validate_file(fd)
+        _write_all(fd, _SPENT_BYTES)
+        os.fsync(fd)
+        os.fsync(home_fd)
+    except (BootstrapSafetyError, OSError):
+        raise _safety_error() from None
+    finally:
+        os.close(fd)
+    return True
+
+
+def _claim_first_deposit() -> bool:
+    home_fd = _open_home()
+    try:
+        return _claim_in_home(home_fd)
+    finally:
+        os.close(home_fd)
+
+
+def _mark_ready(home_fd: int) -> None:
+    flags = (
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        fd = os.open(_READY_TEMP, flags, 0o600, dir_fd=home_fd)
+    except OSError:
+        raise _safety_error() from None
+    try:
+        os.fchmod(fd, 0o600)
+        _validate_file(fd)
+        _write_all(fd, _READY_BYTES)
+        os.fsync(fd)
+    except (BootstrapSafetyError, OSError):
+        raise _safety_error() from None
+    finally:
+        os.close(fd)
+    try:
+        os.replace(_READY_TEMP, _MARKER, src_dir_fd=home_fd, dst_dir_fd=home_fd)
+        os.fsync(home_fd)
+    except OSError:
+        raise _safety_error() from None
 
 
 def _safety_error() -> BootstrapSafetyError:
@@ -172,6 +352,36 @@ async def _balance(
     return AccountState(ready=int(balance) > 0, balance_raw=balance)
 
 
+async def _preflight_balance(
+    session: aiohttp.ClientSession, wallet: str, identity: _Identity
+) -> AccountState | None:
+    status, body = await _request_json(
+        session,
+        "GET",
+        _ACCOUNT_BALANCE,
+        params={"account": wallet, "token": identity.usdc},
+    )
+    if 200 <= status < 300:
+        balance = _payload(body).get("balance")
+        if not isinstance(balance, str) or not balance.isdigit():
+            raise _safety_error()
+        return AccountState(ready=int(balance) > 0, balance_raw=balance)
+    if (
+        status == 500
+        and isinstance(body, dict)
+        and set(body) == {"error", "request_id"}
+        and isinstance(body.get("request_id"), str)
+        and bool(body["request_id"])
+        and isinstance(body.get("error"), dict)
+        and body["error"] == {
+            "code": "Internal",
+            "message": "failed to get balance",
+        }
+    ):
+        return None
+    raise _safety_error()
+
+
 async def check_risex_account(wallet: str) -> AccountState:
     """Read the fixed RISEx testnet account without exposing transport controls."""
 
@@ -192,17 +402,53 @@ async def bootstrap_risex_account(wallet: str, *, intent: str) -> BootstrapResul
     expected_wallet = _validate_wallet(wallet)
     if intent != _DEPOSIT_INTENT:
         raise _safety_error()
+    home_fd = _open_home()
     dispatched = False
     try:
+        existing = _existing_state(home_fd)
+        if existing == "SPENT_UNKNOWN" or existing == "BLOCKED":
+            return BootstrapResult(
+                BootstrapStatus.UNKNOWN_AMBIGUOUS,
+                message="testnet deposit authorization is already consumed",
+            )
+        if existing == "READY":
+            try:
+                async with _session() as session:
+                    identity = await _identity(session)
+                    state = await _balance(session, expected_wallet, identity)
+            except _asyncio.CancelledError:
+                raise
+            except Exception:
+                return BootstrapResult(
+                    BootstrapStatus.READY_UNVERIFIED,
+                    message="local completion cannot verify authoritative balance",
+                )
+            if state.ready:
+                return BootstrapResult(
+                    BootstrapStatus.READY,
+                    state.balance_raw,
+                    "authoritative balance is positive",
+                )
+            return BootstrapResult(
+                BootstrapStatus.READY_UNVERIFIED,
+                state.balance_raw,
+                "authoritative balance is not positive",
+            )
+
         async with _session() as session:
             try:
                 identity = await _identity(session)
-                preflight = await _balance(session, expected_wallet, identity)
-                if preflight.ready:
+                preflight = await _preflight_balance(session, expected_wallet, identity)
+                if preflight is not None and preflight.ready:
                     return BootstrapResult(
                         BootstrapStatus.ALREADY_READY,
                         preflight.balance_raw,
                         "authoritative balance already positive",
+                    )
+                if not _claim_in_home(home_fd):
+                    return BootstrapResult(
+                        BootstrapStatus.UNKNOWN_AMBIGUOUS,
+                        message="testnet deposit authorization is already consumed",
                     )
                 identity = await _identity(session)
                 expected_wallet = _validate_wallet(expected_wallet)
@@ -243,11 +489,16 @@ async def bootstrap_risex_account(wallet: str, *, intent: str) -> BootstrapResul
                     message="authoritative balance could not be verified",
                 )
             if postcondition.ready:
-                return BootstrapResult(
-                    BootstrapStatus.READY,
-                    postcondition.balance_raw,
-                    "authoritative balance is positive",
-                )
+                try:
+                    _mark_ready(home_fd)
+                except BootstrapSafetyError:
+                    return BootstrapResult(
+                        BootstrapStatus.UNKNOWN_AMBIGUOUS,
+                        postcondition.balance_raw,
+                        "authoritative balance is positive but local state is ambiguous",
+                    )
+                return BootstrapResult(BootstrapStatus.READY, postcondition.balance_raw,
+                                       "authoritative balance is positive")
             return BootstrapResult(
                 BootstrapStatus.SUBMITTED_UNVERIFIED,
                 postcondition.balance_raw,
@@ -259,7 +510,7 @@ async def bootstrap_risex_account(wallet: str, *, intent: str) -> BootstrapResul
     except Exception:
         if not dispatched:
             raise _safety_error() from None
-    return BootstrapResult(
-        BootstrapStatus.UNKNOWN_AMBIGUOUS,
-        message="testnet deposit result is ambiguous",
-    )
+    finally:
+        os.close(home_fd)
+    return BootstrapResult(BootstrapStatus.UNKNOWN_AMBIGUOUS,
+                           message="testnet deposit result is ambiguous")
