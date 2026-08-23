@@ -531,6 +531,39 @@ def test_minimum_size_and_usd_cap_are_invariants(lifecycle, tmp_path):
     overflow.store.close()
 
 
+def test_preflight_is_immutable_and_bound_to_issuing_lifecycle(lifecycle, tmp_path):
+    validated = ready(lifecycle)
+    forged_values = (
+        replace(validated),
+        replace(validated, size=Decimal("0.0002")),
+        replace(validated, market=market(minimum=Decimal("0.0002"))),
+        replace(validated, account=account(account=OTHER_ACCOUNT)),
+        replace(validated, bbo=bbo(ask=Decimal("77963.5"))),
+    )
+    for forged in forged_values:
+        with pytest.raises(LifecycleSafetyError):
+            lifecycle.prepare_open(forged, 101, 7, 3, NOW + 30)
+        assert lifecycle.store.all() == []
+
+    other = new_lifecycle(tmp_path / "cross-lifecycle.sqlite3")
+    with pytest.raises(LifecycleSafetyError):
+        other.prepare_open(validated, 101, 7, 3, NOW + 30)
+    assert other.store.all() == []
+    other.store.close()
+
+    intent = lifecycle.prepare_open(validated, 101, 7, 3, NOW + 30)
+    assert intent.size == market().minimum
+    assert intent.price == Decimal("78217.0")
+    calls = []
+    with pytest.raises(LifecycleSafetyError):
+        lifecycle.dispatch(
+            replace(intent, size=Decimal("0.0002")), SIGNER,
+            lambda request: calls.append(request),
+        )
+    assert calls == []
+    assert lifecycle.store.get(intent.intent_id).dispatch_count == 0
+
+
 def test_secrets_signatures_payloads_and_identities_are_redacted(lifecycle):
     intent = open_intent(lifecycle)
     dispatch(lifecycle, intent, "fixture-order")

@@ -509,6 +509,7 @@ class Lifecycle:
         self.outcome = store.load_outcome()
         self.observed_opening_fill = store.opening_fill_observed()
         self._halted = self.outcome != Outcome.ACTIVE
+        self._issued_preflight: Preflight | None = None
 
     @property
     def close_count(self) -> int:
@@ -585,7 +586,9 @@ class Lifecycle:
         if bbo.bid_depth < market.minimum or bbo.ask_depth < market.minimum:
             self._reject()
         price = self._validate_bbo(market, bbo, "BUY", market.minimum)
-        return Preflight(market, account, bbo, market.minimum, price)
+        result = Preflight(market, account, bbo, market.minimum, price)
+        self._issued_preflight = result
+        return result
 
     def _prepare(
         self, *, kind: str, side: str, order_type: str, time_in_force: str,
@@ -637,16 +640,31 @@ class Lifecycle:
         self, preflight: Preflight, client_order_id: int, nonce_anchor: int,
         nonce_bitmap: int, expires_at: int,
     ) -> Intent:
-        if any(item.kind == "OPEN" for item in self.store.all()):
+        if (
+            preflight is not self._issued_preflight
+            or any(item.kind == "OPEN" for item in self.store.all())
+        ):
             self._reject()
-        return self._prepare(
+        self._validate_market(preflight.market)
+        self._validate_account(preflight.account)
+        if preflight.account.position != 0 or preflight.account.open_order_ids:
+            self._reject()
+        exact_size = preflight.market.minimum
+        exact_bound = self._validate_bbo(
+            preflight.market, preflight.bbo, "BUY", exact_size,
+        )
+        if preflight.size != exact_size or preflight.buy_bound != exact_bound:
+            self._reject()
+        intent = self._prepare(
             kind="OPEN", side="BUY", order_type="MARKET", time_in_force="FOK",
             reduce_only=False, market=preflight.market, bbo=preflight.bbo,
-            size=preflight.size, price=preflight.buy_bound,
+            size=exact_size, price=exact_bound,
             source_position=Decimal("0"), client_order_id=client_order_id,
             nonce_anchor=nonce_anchor, nonce_bitmap=nonce_bitmap,
             expires_at=expires_at,
         )
+        self._issued_preflight = None
+        return intent
 
     def prepare_close(
         self, market: MarketState, account: AccountState, bbo: BBO,
@@ -705,7 +723,10 @@ class Lifecycle:
         execute: Callable[[dict[str, Any]], str],
     ) -> None:
         current = self.store.get(intent.intent_id)
-        if self._halted or current.state != "PREPARED" or current.dispatch_count or self._now() >= current.expires_at:
+        if (
+            self._halted or intent != current or current.state != "PREPARED"
+            or current.dispatch_count or self._now() >= current.expires_at
+        ):
             self._reject()
         if (
             not isinstance(synthetic_signer, SyntheticSigner)
