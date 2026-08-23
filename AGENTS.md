@@ -9,12 +9,13 @@ Only `AGENTS.md`, `SYSTEM_SPEC.md`, `STATUS.md`, `NEXT_TASK.md`, and `README.md`
 ## Roles
 
 - The user-appointed Chief Reviewer formulates work only for the Architect and independently reviews the Architect's decisions and results. The Chief Reviewer does not direct the Builder or write implementation code.
+- The user permanently authorizes the Chief Reviewer to create or replace the single Architect session whenever Chief judges it necessary, without separate approval. At most one Architect may be active at a time, and every future Chief/Architect handoff context must repeat this standing authorization and limit. This changes no product or implementation scope.
 - Architect owns architecture, orchestration, review, acceptance, and source-of-truth updates.
 - Exactly one Builder may work at a time. Builder must not spawn agents.
 - Builder implements only the bounded milestone in `NEXT_TASK.md` and must not begin the next milestone.
 - Do not create milestones beyond BOOTSTRAP-000 and PAPER-001 through PAPER-006, except the explicitly authorized PAPER-007 experiment, TELEGRAM-001 outbound-notification work, bounded TELEGRAM-001-FIX-001 correction, TELEGRAM-002 full-scan digest and its bounded two-decimal display correction, PAPER-007-FIX-004 public REST timeout correction, PAPER-007-FIX-005 first-full funding-freshness correction, PAPER-007-FIX-006 RISEx checksum-resubscribe correction, PAPER-007-FIX-007 Extended expected/applied funding and socket-health separation, PAPER-007-FIX-008 public evidence/catalog/heartbeat/digest/stop correction, and PAPER-007-FIX-009 public stream/time/startup consistency correction.
 - The user's ongoing stabilization decision authorizes successive strictly bounded corrective slices needed to make the existing paper system correct, without repeated user selection of technical task numbers. Administrative stabilization labels and branches are audit identifiers, not new product milestones.
-- The user's explicit testnet decision authorizes accepted `TESTNET-001` account bootstrap/read-only connectivity and the separately governed `TESTNET-002-RISEX-SIGNER-001` session-signer prerequisite in `NEXT_TASK.md`. This does not authorize mainnet, real funds, Scanner/runtime strategy integration, orders, cancels, positions, or Nado/Extended execution.
+- The user's explicit testnet decision authorizes accepted `TESTNET-001` account bootstrap/read-only connectivity, the accepted `TESTNET-002-RISEX-SIGNER-001` session signer, and successive strictly bounded RISEx-first recovery slices recorded in `NEXT_TASK.md`. A blocked slice authorizes no Builder or private/executing write. This does not authorize mainnet, real funds, Scanner/runtime strategy integration, Nado/Extended execution, or work around an unknown safe-flat contract.
 - Any new product behavior, economics, strategy, API/private access, live work, or Telegram expansion still requires a separate explicit user decision.
 
 ## Git workflow
@@ -31,7 +32,7 @@ Only `AGENTS.md`, `SYSTEM_SPEC.md`, `STATUS.md`, `NEXT_TASK.md`, and `README.md`
 ## Scope and safety
 
 - Python 3.11; one async process; `aiohttp`, `sqlite3`, `Decimal`, dataclasses, `pytest`, and `pytest-asyncio`.
-- Paper remains the default product. The sole current private-write exception is the opt-in, one-shot RISEx testnet session-signer registration prerequisite in `NEXT_TASK.md`; mainnet, real funds, orders, positions, and strategy execution remain prohibited.
+- Paper remains the default product. The completed one-shot RISEx testnet signer registration is accepted operational history. Any later testnet private/executing write requires an independently accepted bounded task in `NEXT_TASK.md`; the current blocked recovery task permits none. Mainnet, real funds, and strategy execution remain prohibited.
 - Use only official RISEx, Extended, and Nado sources. Unknown semantics or parity blocks entry; never guess.
 - Keep the implementation small. No compatibility layers, frameworks, services, dashboards, or functionality excluded by `SYSTEM_SPEC.md`. TELEGRAM-001 permits only the outbound notifications defined there, not a general alerting platform.
 - Each fact, formula, and state has exactly one authoritative owner: adapters own venue normalization and funding semantics; runtime owns public data, cadence, and lifecycle orchestration; Scanner owns route blockers and PnL evaluation; repository owns persistence only; Telegram owns presentation and delivery only. When duplication or accumulated complexity causes a defect, remove or consolidate it before adding another flag, layer, cache, or state machine.
