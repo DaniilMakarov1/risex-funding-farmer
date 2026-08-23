@@ -16,7 +16,7 @@ from risex_farmer.nado_testnet_lifecycle import (
     SyntheticOrderVector, TriggerSnapshot, build_order_nonce,
     completion_barrier, order_digest, product_verifier,
     sign_synthetic_order, unpack_order_nonce, validate_entry_preflight,
-    verify_signed_validation, canonical_payload,
+    verify_signed_validation, canonical_payload, encode_subaccount,
     SOURCE_PINS,
 )
 
@@ -61,12 +61,24 @@ def _entry_intent(vector: dict[str, object]) -> OrderIntent:
     return OrderIntent(
         ENTRY, order.product_id, order.nonce, order.recv_time, order_digest(order),
         canonical_payload(order.as_payload()), order.amount_x18, order.appendix,
-        350 * X18,
+        350 * X18, sender=order.sender.lower(), owner=order.owner.lower(),
+        subaccount_name=order.subaccount_name,
     )
 
 
 def _evidence(account: AccountSnapshot, triggers: TriggerSnapshot, observed: int) -> EngineEvidence:
     return EngineEvidence(account, triggers, (), (), observed)
+
+
+def _other_identity(
+    flat_account: AccountSnapshot,
+    zero_triggers: TriggerSnapshot,
+) -> tuple[AccountSnapshot, TriggerSnapshot]:
+    owner = "0x000000000000000000000000000000000000000b"
+    return (
+        replace(flat_account, owner=owner, snapshot_id="engine-other-owner"),
+        replace(zero_triggers, owner=owner, snapshot_id="trigger-other-owner"),
+    )
 
 
 def test_module_is_not_imported_by_normal_package_startup() -> None:
@@ -93,16 +105,28 @@ def test_pinned_synthetic_digest_signature_and_signed_validation(vector: dict[st
     digest, signature = sign_synthetic_order(order, str(vector["synthetic_key"]))
     assert (digest, signature) == (vector["digest"], vector["signature"])
     assert verify_signed_validation(
-        order, signature=signature, validation_digest=digest,
-        validation_signature=signature, validation_valid=True,
+        order, signature=signature, validation_product_id=order.product_id,
+        validation_valid=True,
     )
     with pytest.raises(NadoContractError):
         verify_signed_validation(
-            order, signature=signature, validation_digest="0x" + "00" * 32,
-            validation_signature=signature, validation_valid=True,
+            order, signature=signature, validation_product_id=order.product_id,
+            validation_valid=False,
         )
     with pytest.raises(NadoContractError):
         sign_synthetic_order(order, "0x" + "02".zfill(64))
+
+
+def test_validate_order_rejects_mismatched_returned_product_id(vector: dict[str, object]) -> None:
+    order = SyntheticOrderVector.from_fixture(vector)
+    _, signature = sign_synthetic_order(order, str(vector["synthetic_key"]))
+    with pytest.raises(NadoContractError):
+        verify_signed_validation(
+            order,
+            signature=signature,
+            validation_product_id=order.product_id + 1,
+            validation_valid=True,
+        )
 
 
 def test_pinned_vector_matches_independent_eip712_library(vector: dict[str, object]) -> None:
@@ -259,6 +283,10 @@ def test_place_ambiguous_state_survives_restart_and_cannot_replay(
         store.prepare_then_fixture_dispatch(intent, timeout)
     store.close()
     reopened = IntentStore(path)
+    restored = reopened.get(intent.digest)
+    assert (restored.sender, restored.owner, restored.subaccount_name) == (
+        intent.sender, intent.owner, intent.subaccount_name
+    )
     assert reopened.state(intent.digest) == "AMBIGUOUS"
     assert reopened.get(intent.digest) == intent
     with pytest.raises(NadoContractError):
@@ -275,15 +303,33 @@ def test_lifecycle_prepare_entry_persists_exact_signed_validation(
     intent = LifecycleCore(store).prepare_entry(
         order=order, catalog=catalog, account=flat_account,
         triggers=zero_triggers, worst_close_price_x18=36_000 * X18,
-        signature=signature, validation_digest=digest,
-        validation_signature=signature, validation_valid=True,
+        signature=signature, validation_product_id=order.product_id,
+        validation_valid=True,
         now_ms=1_700_000_000_001,
     )
     assert store.get(digest) == intent and intent.kind == ENTRY
 
 
+def test_entry_rejects_signed_owner_a_with_owner_b_preflight(
+    vector: dict[str, object], tmp_path: Path, catalog: CatalogSnapshot,
+    flat_account: AccountSnapshot, zero_triggers: TriggerSnapshot,
+) -> None:
+    order = SyntheticOrderVector.from_fixture(vector)
+    digest, signature = sign_synthetic_order(order, str(vector["synthetic_key"]))
+    other_account, other_triggers = _other_identity(flat_account, zero_triggers)
+    with pytest.raises(NadoContractError):
+        LifecycleCore(IntentStore(tmp_path / "intents.sqlite3")).prepare_entry(
+            order=order, catalog=catalog, account=other_account,
+            triggers=other_triggers, worst_close_price_x18=36_000 * X18,
+            signature=signature, validation_product_id=order.product_id,
+            validation_valid=True,
+            now_ms=1_700_000_000_001,
+        )
+
+
 def test_entry_reconciliation_resting_partial_full_reject_and_duplicate_ambiguity(
-    tmp_path: Path, vector: dict[str, object], flat_account: AccountSnapshot,
+    tmp_path: Path, vector: dict[str, object], catalog: CatalogSnapshot,
+    flat_account: AccountSnapshot,
     zero_triggers: TriggerSnapshot,
 ) -> None:
     store = IntentStore(tmp_path / "intents.sqlite3")
@@ -291,20 +337,21 @@ def test_entry_reconciliation_resting_partial_full_reject_and_duplicate_ambiguit
     store.prepare(intent)
     base = _evidence(flat_account, zero_triggers, 1_700_000_000_001)
     open_order = OrderEvidence(intent.digest, 2, intent.nonce, 10**16, "OPEN")
-    assert store.reconcile(intent.digest, replace(base, orders=(open_order,))) == Reconciliation.RESTING
+    assert store.reconcile(intent.digest, catalog=catalog, evidence=replace(base, orders=(open_order,))) == Reconciliation.RESTING
     partial = FillEvidence(intent.digest, 2, 4 * 10**15)
     account = replace(flat_account, cross_perp_amounts_x18={2: 4 * 10**15})
-    assert store.reconcile(intent.digest, replace(base, account=account, fills=(partial,))) == Reconciliation.PARTIAL
+    assert store.reconcile(intent.digest, catalog=catalog, evidence=replace(base, account=account, fills=(partial,))) == Reconciliation.PARTIAL
     full = FillEvidence(intent.digest, 2, 10**16)
     account = replace(flat_account, cross_perp_amounts_x18={2: 10**16})
-    assert store.reconcile(intent.digest, replace(base, account=account, fills=(full,))) == Reconciliation.FILLED
-    assert store.reconcile(intent.digest, replace(base, exact_rejection_digest=intent.digest)) == Reconciliation.REJECTED
-    assert store.reconcile(intent.digest, replace(base, duplicate_digest=True)) == Reconciliation.AMBIGUOUS
+    assert store.reconcile(intent.digest, catalog=catalog, evidence=replace(base, account=account, fills=(full,))) == Reconciliation.FILLED
+    assert store.reconcile(intent.digest, catalog=catalog, evidence=replace(base, exact_rejection_digest=intent.digest)) == Reconciliation.REJECTED
+    assert store.reconcile(intent.digest, catalog=catalog, evidence=replace(base, duplicate_digest=True)) == Reconciliation.AMBIGUOUS
 
 
 @pytest.mark.parametrize("terminal", ["CANCELLED", "EXPIRED", "REJECTED"])
 def test_exact_engine_terminal_history_is_digest_scoped(
-    tmp_path: Path, vector: dict[str, object], flat_account: AccountSnapshot,
+    tmp_path: Path, vector: dict[str, object], catalog: CatalogSnapshot,
+    flat_account: AccountSnapshot,
     zero_triggers: TriggerSnapshot, terminal: str,
 ) -> None:
     store = IntentStore(tmp_path / "intents.sqlite3")
@@ -315,23 +362,91 @@ def test_exact_engine_terminal_history_is_digest_scoped(
         terminal_digest=intent.digest,
         terminal_status=terminal,
     )
-    assert store.reconcile(intent.digest, evidence) == Reconciliation(terminal)
+    assert store.reconcile(intent.digest, catalog=catalog, evidence=evidence) == Reconciliation(terminal)
 
 
 def test_contradiction_never_reconciles_or_allows_write(
-    tmp_path: Path, vector: dict[str, object], flat_account: AccountSnapshot,
+    tmp_path: Path, vector: dict[str, object], catalog: CatalogSnapshot,
+    flat_account: AccountSnapshot,
     zero_triggers: TriggerSnapshot,
 ) -> None:
     store = IntentStore(tmp_path / "intents.sqlite3")
     intent = _entry_intent(vector)
     store.prepare(intent)
     evidence = _evidence(replace(flat_account, contradictions=("conflict",)), zero_triggers, 1_700_000_000_001)
-    assert store.reconcile(intent.digest, evidence) == Reconciliation.CONTRADICTORY
-    assert not store.write_allowed(intent.digest, now_ms=intent.recv_time + 1, evidence=evidence)
+    assert store.reconcile(intent.digest, catalog=catalog, evidence=evidence) == Reconciliation.CONTRADICTORY
+    assert not store.write_allowed(intent.digest, catalog=catalog, now_ms=intent.recv_time + 1, evidence=evidence)
+
+
+def test_other_owner_or_incomplete_catalog_evidence_cannot_reconcile_or_allow_write(
+    tmp_path: Path, vector: dict[str, object], catalog: CatalogSnapshot,
+    flat_account: AccountSnapshot, zero_triggers: TriggerSnapshot,
+) -> None:
+    for account, triggers in (
+        _other_identity(flat_account, zero_triggers),
+        (
+            replace(flat_account, regular_orders_by_product={}, cross_perp_amounts_x18={}),
+            zero_triggers,
+        ),
+    ):
+        path = tmp_path / f"{account.snapshot_id}.sqlite3"
+        store = IntentStore(path)
+        intent = _entry_intent(vector)
+        store.prepare(intent)
+        evidence = replace(
+            _evidence(account, triggers, intent.recv_time + 1),
+            exact_rejection_digest=intent.digest,
+        )
+        assert store.reconcile(
+            intent.digest, catalog=catalog, evidence=evidence
+        ) == Reconciliation.CONTRADICTORY
+        assert store.state(intent.digest) == "PREPARED"
+        assert not store.write_allowed(
+            intent.digest,
+            catalog=catalog,
+            now_ms=intent.recv_time + 1,
+            evidence=evidence,
+        )
+
+
+def test_cross_intent_owner_swap_is_rejected_and_identity_survives_restart(
+    tmp_path: Path, vector: dict[str, object]
+) -> None:
+    path = tmp_path / "intents.sqlite3"
+    store = IntentStore(path)
+    first = _entry_intent(vector)
+    store.prepare(first)
+    store.close()
+    reopened = IntentStore(path)
+    restored = reopened.get(first.digest)
+    assert (restored.sender, restored.owner, restored.subaccount_name) == (
+        first.sender, first.owner, first.subaccount_name
+    )
+    order = SyntheticOrderVector.from_fixture(vector)
+    owner = "0x000000000000000000000000000000000000000b"
+    recv_time = order.recv_time + 1
+    swapped = replace(
+        order,
+        owner=owner,
+        sender=encode_subaccount(owner, order.subaccount_name),
+        recv_time=recv_time,
+        salt=order.salt + 1,
+        nonce=build_order_nonce(recv_time, order.salt + 1),
+    )
+    swapped_intent = OrderIntent(
+        ENTRY, swapped.product_id, swapped.nonce, swapped.recv_time,
+        order_digest(swapped), canonical_payload(swapped.as_payload()),
+        swapped.amount_x18, swapped.appendix, 350 * X18,
+        sender=swapped.sender, owner=swapped.owner,
+        subaccount_name=swapped.subaccount_name,
+    )
+    with pytest.raises(NadoContractError):
+        reopened.prepare(swapped_intent)
 
 
 def test_archive_or_indexer_identity_is_audit_only_and_cannot_resolve_ambiguity(
-    tmp_path: Path, vector: dict[str, object], flat_account: AccountSnapshot,
+    tmp_path: Path, vector: dict[str, object], catalog: CatalogSnapshot,
+    flat_account: AccountSnapshot,
     zero_triggers: TriggerSnapshot,
 ) -> None:
     store = IntentStore(tmp_path / "intents.sqlite3")
@@ -341,7 +456,7 @@ def test_archive_or_indexer_identity_is_audit_only_and_cannot_resolve_ambiguity(
         _evidence(flat_account, zero_triggers, intent.recv_time + 1),
         archive_digests=(intent.digest,),
     )
-    assert store.reconcile(intent.digest, evidence) == Reconciliation.AMBIGUOUS
+    assert store.reconcile(intent.digest, catalog=catalog, evidence=evidence) == Reconciliation.AMBIGUOUS
     assert store.state(intent.digest) == "AMBIGUOUS"
 
 
@@ -375,8 +490,8 @@ def test_cancel_ambiguity_reconciles_only_after_recv_time_and_zero_orders(
         sender=str(vector["sender"]), recv_time=recv, salt=44, now_ms=recv - 1,
     )
     before = _evidence(flat_account, zero_triggers, recv)
-    assert store.reconcile(intent.digest, before) == Reconciliation.AMBIGUOUS
-    assert store.reconcile(intent.digest, replace(before, observed_at_ms=recv + 1)) == Reconciliation.CANCELLED
+    assert store.reconcile(intent.digest, catalog=catalog, evidence=before) == Reconciliation.AMBIGUOUS
+    assert store.reconcile(intent.digest, catalog=catalog, evidence=replace(before, observed_at_ms=recv + 1)) == Reconciliation.CANCELLED
 
 
 def test_partial_residual_close_ioc_reduce_only_clamp_and_new_identity(
@@ -422,7 +537,7 @@ def test_close_fill_reconciles_from_recorded_starting_position_to_exact_zero(
         recv + 1,
     )
     fill = FillEvidence(close.digest, 2, -10**16)
-    assert store.reconcile(close.digest, replace(evidence, fills=(fill,))) == Reconciliation.FILLED
+    assert store.reconcile(close.digest, catalog=catalog, evidence=replace(evidence, fills=(fill,))) == Reconciliation.FILLED
 
 
 def test_each_close_attempt_requires_genuinely_newer_unconsumed_snapshot(
@@ -526,6 +641,11 @@ def test_exact_final_barrier_and_adversarial_blockers(
         store=store, catalog=catalog,
         evidence=replace(evidence, triggers=replace(zero_triggers, active_digests=("0xtrigger",))),
         now_ms=now,
+    )
+    other_account, other_triggers = _other_identity(flat_account, zero_triggers)
+    assert not completion_barrier(
+        store=store, catalog=catalog,
+        evidence=_evidence(other_account, other_triggers, now), now_ms=now,
     )
 
 

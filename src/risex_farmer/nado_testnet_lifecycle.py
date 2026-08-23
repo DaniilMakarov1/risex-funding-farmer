@@ -119,6 +119,22 @@ def encode_subaccount(owner: str, subaccount_name: str) -> str:
     return "0x" + (_address_bytes(owner) + name.ljust(12, b"\0")).hex()
 
 
+def decode_subaccount(sender: str) -> tuple[str, str]:
+    raw = _hex_bytes(sender, 32)
+    name_bytes = raw[20:]
+    name_raw, separator, padding = name_bytes.partition(b"\0")
+    if not name_raw or (separator and any(padding)):
+        raise NadoContractError("sender contains a noncanonical subaccount name")
+    try:
+        name = name_raw.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise NadoContractError("sender subaccount name is not ASCII") from exc
+    owner = "0x" + raw[:20].hex()
+    if encode_subaccount(owner, name).lower() != sender.lower():
+        raise NadoContractError("sender encoding is not canonical")
+    return owner, name
+
+
 def canonical_payload(payload: Mapping[str, object]) -> bytes:
     return json.dumps(
         payload,
@@ -274,15 +290,14 @@ def verify_signed_validation(
     order: SyntheticOrderVector,
     *,
     signature: str,
-    validation_digest: str,
-    validation_signature: str,
+    validation_product_id: int,
     validation_valid: bool,
 ) -> bool:
     digest = order_digest(order)
-    if not validation_valid or validation_digest.lower() != digest.lower():
-        raise NadoContractError("validate_order did not affirm the exact digest")
-    if validation_signature.lower() != signature.lower():
-        raise NadoContractError("validate_order signature identity mismatch")
+    if validation_valid is not True:
+        raise NadoContractError("validate_order did not return valid true")
+    if type(validation_product_id) is not int or validation_product_id != order.product_id:
+        raise NadoContractError("validate_order product identity mismatch")
     raw = _hex_bytes(signature, 65)
     if raw[64] not in (27, 28):
         raise NadoContractError("signature recovery id must be 27 or 28")
@@ -497,6 +512,9 @@ class OrderIntent:
     snapshot_id: str | None = None
     snapshot_observed_at_ms: int | None = None
     starting_position_x18: int = 0
+    sender: str = ""
+    owner: str = ""
+    subaccount_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -541,6 +559,40 @@ class Reconciliation(str, Enum):
     CONTRADICTORY = "CONTRADICTORY"
 
 
+def _assert_intent_evidence_contract(
+    intent: OrderIntent,
+    catalog: CatalogSnapshot,
+    evidence: EngineEvidence,
+    *,
+    now_ms: int,
+) -> dict[int, Product]:
+    products = _assert_authoritative_account(
+        catalog, evidence.account, now_ms=now_ms, require_flat=False
+    )
+    _assert_trigger_snapshot(evidence.account, evidence.triggers, now_ms=now_ms)
+    expected_sender = encode_subaccount(
+        evidence.account.owner, evidence.account.subaccount_name
+    )
+    if (
+        intent.sender.lower() != expected_sender.lower()
+        or intent.owner.lower() != evidence.account.owner.lower()
+        or intent.subaccount_name != evidence.account.subaccount_name
+        or evidence.triggers.owner.lower() != intent.owner.lower()
+        or evidence.triggers.subaccount_name != intent.subaccount_name
+    ):
+        raise NadoContractError("authoritative evidence lifecycle identity mismatch")
+    if (
+        evidence.observed_at_ms < evidence.account.observed_at_ms
+        or evidence.observed_at_ms < evidence.triggers.observed_at_ms
+    ):
+        raise NadoContractError("reconciliation envelope predates authoritative evidence")
+    if any(order.product_id not in products for order in evidence.orders):
+        raise NadoContractError("order evidence references a product outside the catalog")
+    if any(fill.product_id not in products for fill in evidence.fills):
+        raise NadoContractError("fill evidence references a product outside the catalog")
+    return products
+
+
 class IntentStore:
     """One durable owner for immutable signed-write intent identities."""
 
@@ -565,7 +617,20 @@ class IntentStore:
                 snapshot_id TEXT,
                 snapshot_observed_at_ms INTEGER,
                 starting_position_x18 TEXT NOT NULL,
+                sender TEXT NOT NULL,
+                owner TEXT NOT NULL,
+                subaccount_name TEXT NOT NULL,
                 state TEXT NOT NULL
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS nado_lifecycle_identity (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                sender TEXT NOT NULL,
+                owner TEXT NOT NULL,
+                subaccount_name TEXT NOT NULL
             )
             """
         )
@@ -577,16 +642,88 @@ class IntentStore:
         _hex_bytes(intent.digest, 32)
         if canonical_payload(json.loads(intent.payload)) != intent.payload:
             raise NadoContractError("intent payload is not canonical")
+        payload = json.loads(intent.payload)
+        try:
+            if intent.kind in {ENTRY, CLOSE}:
+                place = payload["place_order"]
+                order_payload = place["order"]
+                payload_sender = order_payload["sender"]
+                payload_nonce = int(order_payload["nonce"])
+                recv_time, salt = unpack_order_nonce(payload_nonce)
+                payload_order = SyntheticOrderVector(
+                    owner=decode_subaccount(payload_sender)[0],
+                    subaccount_name=decode_subaccount(payload_sender)[1],
+                    sender=payload_sender,
+                    product_id=int(place["product_id"]),
+                    price_x18=int(order_payload["priceX18"]),
+                    amount_x18=int(order_payload["amount"]),
+                    expiration=int(order_payload["expiration"]),
+                    recv_time=recv_time,
+                    salt=salt,
+                    nonce=payload_nonce,
+                    appendix=int(order_payload["appendix"]),
+                )
+                if (
+                    intent.product_id != payload_order.product_id
+                    or intent.amount_x18 != payload_order.amount_x18
+                    or intent.appendix != payload_order.appendix
+                    or intent.digest.lower() != order_digest(payload_order).lower()
+                ):
+                    raise NadoContractError("intent fields do not match signed order payload")
+            elif intent.kind == CANCEL_ALL:
+                tx = payload["cancel_product_orders"]["tx"]
+                payload_sender = tx["sender"]
+                payload_nonce = int(tx["nonce"])
+                if (
+                    intent.product_id is not None
+                    or tx["productIds"] != []
+                    or intent.digest.lower()
+                    != _cancel_all_digest(payload_sender, payload_nonce).lower()
+                ):
+                    raise NadoContractError("intent fields do not match cancel-all payload")
+            else:
+                raise NadoContractError("unsupported intent kind")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise NadoContractError("intent payload contract is invalid") from exc
+        if not isinstance(payload_sender, str) or payload_nonce != intent.nonce:
+            raise NadoContractError("intent payload sender or nonce mismatch")
+        owner, subaccount_name = decode_subaccount(payload_sender)
+        if intent.sender and intent.sender.lower() != payload_sender.lower():
+            raise NadoContractError("intent sender differs from canonical payload")
+        if intent.owner and intent.owner.lower() != owner.lower():
+            raise NadoContractError("intent owner differs from canonical sender")
+        if intent.subaccount_name and intent.subaccount_name != subaccount_name:
+            raise NadoContractError("intent subaccount differs from canonical sender")
         try:
             with self._connection:
+                self._connection.execute(
+                    """
+                    INSERT OR IGNORE INTO nado_lifecycle_identity (
+                        singleton, sender, owner, subaccount_name
+                    ) VALUES (1, ?, ?, ?)
+                    """,
+                    (payload_sender.lower(), owner.lower(), subaccount_name),
+                )
+                existing_identity = self._connection.execute(
+                    """
+                    SELECT sender, owner, subaccount_name
+                    FROM nado_lifecycle_identity WHERE singleton = 1
+                    """
+                ).fetchone()
+                if existing_identity != (
+                    payload_sender.lower(), owner.lower(), subaccount_name
+                ):
+                    raise NadoContractError(
+                        "lifecycle subaccount identity is immutable"
+                    )
                 self._connection.execute(
                     """
                     INSERT INTO nado_intents (
                         digest, nonce, recv_time, kind, product_id, payload,
                         amount_x18, appendix, notional_x18, clamp_expected,
                         snapshot_id, snapshot_observed_at_ms,
-                        starting_position_x18, state
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PREPARED')
+                        starting_position_x18, sender, owner, subaccount_name, state
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PREPARED')
                     """,
                     (
                         intent.digest.lower(),
@@ -602,6 +739,9 @@ class IntentStore:
                         intent.snapshot_id,
                         intent.snapshot_observed_at_ms,
                         str(intent.starting_position_x18),
+                        payload_sender.lower(),
+                        owner.lower(),
+                        subaccount_name,
                     ),
                 )
         except sqlite3.IntegrityError as exc:
@@ -612,7 +752,8 @@ class IntentStore:
             """
             SELECT kind, product_id, nonce, recv_time, digest, payload,
                    amount_x18, appendix, notional_x18, clamp_expected,
-                   snapshot_id, snapshot_observed_at_ms, starting_position_x18
+                   snapshot_id, snapshot_observed_at_ms, starting_position_x18,
+                   sender, owner, subaccount_name
             FROM nado_intents WHERE digest = ?
             """,
             (digest.lower(),),
@@ -633,6 +774,9 @@ class IntentStore:
             snapshot_id=row[10],
             snapshot_observed_at_ms=row[11],
             starting_position_x18=int(row[12]),
+            sender=row[13],
+            owner=row[14],
+            subaccount_name=row[15],
         )
 
     def _mark(self, digest: str, state: str) -> None:
@@ -711,18 +855,19 @@ class IntentStore:
     def latest_recv_time(self) -> int | None:
         return self._connection.execute("SELECT MAX(recv_time) FROM nado_intents").fetchone()[0]
 
-    def reconcile(self, digest: str, evidence: EngineEvidence) -> Reconciliation:
+    def reconcile(
+        self,
+        digest: str,
+        *,
+        catalog: CatalogSnapshot,
+        evidence: EngineEvidence,
+    ) -> Reconciliation:
         intent = self.get(digest)
         account = evidence.account
-        if (
-            not account.fresh
-            or account.authoritative_source != "engine"
-            or account.contradictions
-            or evidence.observed_at_ms < account.observed_at_ms
-        ):
-            return Reconciliation.CONTRADICTORY
         try:
-            _assert_trigger_snapshot(account, evidence.triggers, now_ms=evidence.observed_at_ms)
+            _assert_intent_evidence_contract(
+                intent, catalog, evidence, now_ms=evidence.observed_at_ms
+            )
         except NadoContractError:
             return Reconciliation.CONTRADICTORY
         matching_orders = [order for order in evidence.orders if order.digest.lower() == digest.lower()]
@@ -789,17 +934,24 @@ class IntentStore:
         self.mark_ambiguous(digest)
         return Reconciliation.AMBIGUOUS
 
-    def write_allowed(self, digest: str, *, now_ms: int, evidence: EngineEvidence) -> bool:
+    def write_allowed(
+        self,
+        digest: str,
+        *,
+        catalog: CatalogSnapshot,
+        now_ms: int,
+        evidence: EngineEvidence,
+    ) -> bool:
         intent = self.get(digest)
+        try:
+            _assert_intent_evidence_contract(intent, catalog, evidence, now_ms=now_ms)
+        except NadoContractError:
+            return False
         return (
             self.state(digest) in {"RECONCILED", "REJECTED"}
             and now_ms > intent.recv_time
-            and evidence.account.fresh
-            and evidence.account.authoritative_source == "engine"
-            and not evidence.account.contradictions
-            and evidence.triggers.fresh
-            and evidence.triggers.authoritative_source == "trigger"
-            and not evidence.triggers.contradictions
+            and not any(evidence.account.regular_orders_by_product.values())
+            and not evidence.triggers.active_digests
         )
 
 
@@ -867,6 +1019,9 @@ class LifecycleCore:
             recv_time=recv_time,
             digest=_cancel_all_digest(sender, nonce),
             payload=payload,
+            sender=sender.lower(),
+            owner=account.owner.lower(),
+            subaccount_name=account.subaccount_name,
         )
         self.store.prepare(intent)
         return intent
@@ -880,19 +1035,24 @@ class LifecycleCore:
         triggers: TriggerSnapshot,
         worst_close_price_x18: int,
         signature: str,
-        validation_digest: str,
-        validation_signature: str,
+        validation_product_id: int,
         validation_valid: bool,
         now_ms: int,
     ) -> OrderIntent:
         if order.appendix != POST_ONLY_APPENDIX:
             raise NadoContractError("entry must be post-only")
+        expected_sender = encode_subaccount(account.owner, account.subaccount_name)
+        if (
+            order.sender.lower() != expected_sender.lower()
+            or order.owner.lower() != account.owner.lower()
+            or order.subaccount_name != account.subaccount_name
+        ):
+            raise NadoContractError("signed order and preflight subaccount identity mismatch")
         self._assert_next_state_write(recv_time=order.recv_time, now_ms=now_ms)
         verify_signed_validation(
             order,
             signature=signature,
-            validation_digest=validation_digest,
-            validation_signature=validation_signature,
+            validation_product_id=validation_product_id,
             validation_valid=validation_valid,
         )
         plan = validate_entry_preflight(
@@ -916,6 +1076,9 @@ class LifecycleCore:
             amount_x18=order.amount_x18,
             appendix=order.appendix,
             notional_x18=plan.entry_notional_x18,
+            sender=order.sender.lower(),
+            owner=order.owner.lower(),
+            subaccount_name=order.subaccount_name,
         )
         self.store.prepare(intent)
         return intent
@@ -1008,6 +1171,9 @@ class LifecycleCore:
                 snapshot_id=account.snapshot_id,
                 snapshot_observed_at_ms=account.observed_at_ms,
                 starting_position_x18=position,
+                sender=order.sender.lower(),
+                owner=order.owner.lower(),
+                subaccount_name=order.subaccount_name,
             )
             self.store.prepare(intent)
             return intent
@@ -1035,6 +1201,13 @@ def completion_barrier(
     if evidence.triggers.active_digests or evidence.orders:
         return False
     intents = store.intents()
+    try:
+        for intent, _ in intents:
+            _assert_intent_evidence_contract(
+                intent, catalog, evidence, now_ms=now_ms
+            )
+    except NadoContractError:
+        return False
     known_intents = {intent.digest.lower(): intent for intent, _ in intents}
     net_fills: dict[int, int] = {}
     filled_by_digest: dict[str, int] = {}
