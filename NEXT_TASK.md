@@ -1,8 +1,18 @@
 # TESTNET-001-RECOVERY-005 — Direct Passwd-Home Marker
 
-Status: `ACTIVE — RED FIRST; NO REAL MARKER OR POST`.
+Status: `ACCEPTED — ONE BOUNDED RISEX OPERATIONAL BOOTSTRAP AUTHORIZED`.
 
 This strictly corrective slice starts from published `main == origin/main == c84cc882c027795bbe4ea15d5233c35b187216b9`. RECOVERY-004 is `BLOCKED — TASK DID NOT CONVERGE`; its branch and implementation/tests are failed audit history and must not be inspected, copied, cherry-picked, or reused.
+
+The accepted exact chain is governance `c62f193fb82ca2691a74e9347ea7d312cfa547fa`, implementation `99ab8c268c6e4655134e9ec2f7679bdc789d32a4`, fix cycle 1 `d8a4c22cc4e5ac45d7a61adff63cacd1e2f99316`, and fix cycle 2 `2ab3d221e35ede1839983cefbb2593767bba09ab`. Chief independently passed 87 focused and 411 full tests and found no deterministic blocker.
+
+## Authorized operational bootstrap
+
+- After linear integration, full deterministic gates, push, exact `main == origin/main`, exact worktree import identity, and proof that the fixed marker/temp are absent, call `bootstrap_risex_account` exactly once for the approved public wallet and exact intent.
+- The invocation may create the fixed durable marker and perform at most one unsigned testnet deposit POST. Never delete, rename, reset, rearm, or invoke bootstrap again.
+- `READY` or `ALREADY_READY` requires one separate authoritative read-only account check. `SUBMITTED_UNVERIFIED` or `UNKNOWN_AMBIGUOUS` permits only `check_risex_account`, at most five attempts over at most 60 seconds. Any positive balance establishes authoritative account readiness while the actual marker state remains unchanged.
+- If no positive balance is observed, stop with the marker's exact non-ready blocker and no second POST. Report only fixed public metadata, marker state/mode/type/owner, timestamps/status classes, and authoritative balance; never print response bodies or unrelated home contents.
+- No XLSX, key, credential, order, Nado, Extended, Farmer/paper/Telegram runtime, mainnet, TESTNET-002, or other work is authorized.
 
 ## Exact ownership and design
 
