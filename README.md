@@ -2,7 +2,7 @@
 
 A small, standalone paper trader for testing whether a delta-neutral RISEx-points funding strategy can produce non-negative trading PnL after configured fees and the documented paper execution model.
 
-The project is **paper only**. It uses official public RISEx, Extended, and Nado market data. It never uses trading keys, authenticated/private endpoints, real orders, collateral, or live positions. Live trading is not a mode switch and is outside this specification.
+The default product is **paper only**. It uses official public RISEx, Extended, and Nado market data. Separately governed optional testnet modules cover the accepted RISEx account bootstrap and the currently fixture-only RISEx session-signer prerequisite. Mainnet, real funds, orders, positions, and strategy-driven execution remain outside the active specification.
 
 ## Requirements
 
@@ -110,3 +110,5 @@ risex-farmer --db paper.db report
 ```
 
 See `SYSTEM_SPEC.md` for frozen product behavior, `STATUS.md` for the accepted baseline, and `NEXT_TASK.md` for the current authorization boundary.
+
+The optional TESTNET-002 signer prerequisite is not a CLI mode and is not imported by normal Farmer startup. Its deterministic candidate may use synthetic fixtures only; real signer generation, XLSX/key loading, signing, and live registration require later independent acceptance and explicit operational authorization.
