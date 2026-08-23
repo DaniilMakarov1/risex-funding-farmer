@@ -1,6 +1,6 @@
 # PAPER-007-STABILIZATION-007 — Cadence-safe Extended Watchdog Rotation
 
-Status: `RED ONLY — PRODUCTION IMPLEMENTATION NOT AUTHORIZED`.
+Status: `GREEN AUTHORIZED — DETERMINISTIC REVIEW REQUIRED`.
 
 This is one fresh corrective slice explicitly authorized by the user after STABILIZATION-005 and STABILIZATION-006 were blocked. It starts strictly from published `main == origin/main == 037c4df35de6cc8dfddce48a50b6c8af488b0908`. Failed 005/006 branches, commits, tests, samples, diffs, and quarantine objects are immutable audit history and must not be inspected, imported, copied, cherry-picked, or reused.
 
@@ -23,9 +23,11 @@ This is one fresh corrective slice explicitly authorized by the user after STABI
 
 ## Gates
 
-- Exactly one Builder may edit only `tests/test_runtime.py` for RED and must not spawn agents. RED must be newly authored from this clean baseline and substantially minimal; do not inspect or reuse failed slice work.
-- Reproduce exact old-main failure in a disposable copy with explicit worktree `PYTHONPATH` and import identity. Report exact test names/hunks, timing rationale, failure output, and successful post-gate fixture completion.
-- Run all existing runtime tests and focused EOF/heartbeat/cadence/open-position/Scanner/Telegram/safe-stop preservation. Create one RED-only commit and stop for Chief review before GREEN.
+- The accepted RED chain ends at `85bc126258efde9898c2718bb9669d94ff85adc9`: exact main blocks three concurrent cadence/health tasks until old retirement, then creates three successors; the valid post-gate tick completes one FULL without fixture exception or task leak. Unexpected delayed retirement failure currently produces no fatal evidence.
+- The same sole Builder may make the smallest `runtime.py`-only production correction; tests remain limited to `test_runtime.py`. Fence/remove old active ownership synchronously, install exactly one successor without waiting for retirement, and use only a minimal runtime-owned retirement collection/callback if necessary.
+- Normal completion removes retirement ownership and consumes cancellation. Unexpected exception is retrieved and routed once through existing `_background_fatal`, stop request, and one `RUNTIME_FATAL` row with its exception class. Preserve session fencing and logical/physical evidence separation.
+- Do not add config, capacity/task state machines, shutdown/session-close behavior, services, adapters, Scanner, storage/schema, cadence/economics, Telegram, auth, testnet, or live changes.
+- Run focused GREEN, all runtime and preservation tests, full pytest, compileall, diff/secret and pending-task checks. Architect reviews every production hunk. Stop for Chief candidate review before integration or operational work.
 - Maximum two later fix cycles. Do not merge, push, soak, restart Stage B/Telegram, or update acceptance governance before Chief decisions.
 
 ## Separate future real-money gate
