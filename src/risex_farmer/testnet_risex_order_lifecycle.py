@@ -443,6 +443,24 @@ class DurableIntentStore:
             "SELECT 1 FROM terminal WHERE key='opening_fill'"
         ).fetchone() is not None
 
+    def _record_snapshot_window(
+        self, intent_id: str, valid_from: int, valid_until: int,
+    ) -> None:
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO terminal VALUES (?, ?)",
+                (f"snapshot:{intent_id}", f"{valid_from}:{valid_until}"),
+            )
+
+    def snapshot_window(self, intent_id: str) -> tuple[int, int] | None:
+        row = self.connection.execute(
+            "SELECT value FROM terminal WHERE key=?", (f"snapshot:{intent_id}",)
+        ).fetchone()
+        if row is None:
+            return None
+        valid_from, valid_until = str(row[0]).split(":", 1)
+        return int(valid_from), int(valid_until)
+
     def _bind_identities(self, account: str, signer: str) -> None:
         with self.connection:
             rows = dict(self.connection.execute(
@@ -577,6 +595,7 @@ class Lifecycle:
         return price
 
     def preflight(self, market: MarketState, account: AccountState, bbo: BBO) -> Preflight:
+        self._issued_preflight = None
         if self._halted or self.store.all():
             self._reject()
         self._validate_market(market)
@@ -592,9 +611,9 @@ class Lifecycle:
 
     def _prepare(
         self, *, kind: str, side: str, order_type: str, time_in_force: str,
-        reduce_only: bool, market: MarketState, bbo: BBO, size: Decimal, price: Decimal,
-        source_position: Decimal, client_order_id: int, nonce_anchor: int,
-        nonce_bitmap: int, expires_at: int,
+        reduce_only: bool, market: MarketState, account: AccountState, bbo: BBO,
+        size: Decimal, price: Decimal, source_position: Decimal,
+        client_order_id: int, nonce_anchor: int, nonce_bitmap: int, expires_at: int,
     ) -> Intent:
         if (
             self._halted or expires_at <= self._now()
@@ -622,26 +641,31 @@ class Lifecycle:
         _encoded, action_hash = encode_place_action(
             order_data=order_data, client_order_id=client_order_id,
         )
-        bbo_digest = _evidence_digest({
-            "bid": str(bbo.bid), "ask": str(bbo.ask),
-            "bid_depth": str(bbo.bid_depth), "ask_depth": str(bbo.ask_depth),
-            "observed_at": bbo.observed_at,
+        snapshot_digest = _evidence_digest({
+            "market": repr(market), "account": repr(account), "bbo": repr(bbo),
         })
         intent = Intent(
             str(uuid.uuid4()), ordinal, kind, client_order_id, nonce_anchor,
-            nonce_bitmap, action_hash.hex(), bbo_digest, "PREPARED", side, order_type,
+            nonce_bitmap, action_hash.hex(), snapshot_digest, "PREPARED", side, order_type,
             time_in_force, reduce_only, False, market.market_id, size, size_steps,
             price, price_ticks, source_position, expires_at,
         )
         self.store._add(intent)
+        observed_times = (market.observed_at, account.observed_at, bbo.observed_at)
+        self.store._record_snapshot_window(
+            intent.intent_id, max(observed_times),
+            min(observed_times) + MAX_AGE_SECONDS,
+        )
         return intent
 
     def prepare_open(
         self, preflight: Preflight, client_order_id: int, nonce_anchor: int,
         nonce_bitmap: int, expires_at: int,
     ) -> Intent:
+        issued_preflight = self._issued_preflight
+        self._issued_preflight = None
         if (
-            preflight is not self._issued_preflight
+            preflight is not issued_preflight
             or any(item.kind == "OPEN" for item in self.store.all())
         ):
             self._reject()
@@ -657,13 +681,13 @@ class Lifecycle:
             self._reject()
         intent = self._prepare(
             kind="OPEN", side="BUY", order_type="MARKET", time_in_force="FOK",
-            reduce_only=False, market=preflight.market, bbo=preflight.bbo,
+            reduce_only=False, market=preflight.market, account=preflight.account,
+            bbo=preflight.bbo,
             size=exact_size, price=exact_bound,
             source_position=Decimal("0"), client_order_id=client_order_id,
             nonce_anchor=nonce_anchor, nonce_bitmap=nonce_bitmap,
             expires_at=expires_at,
         )
-        self._issued_preflight = None
         return intent
 
     def prepare_close(
@@ -699,7 +723,8 @@ class Lifecycle:
             kind="CLOSE", side=side,
             order_type="MARKET" if number == 1 else "LIMIT",
             time_in_force="FOK" if number == 1 else "IOC", reduce_only=True,
-            market=market, bbo=bbo, size=position, price=price, source_position=position,
+            market=market, account=account, bbo=bbo, size=position, price=price,
+            source_position=position,
             client_order_id=client_order_id, nonce_anchor=nonce_anchor,
             nonce_bitmap=nonce_bitmap, expires_at=expires_at,
         )
@@ -723,9 +748,12 @@ class Lifecycle:
         execute: Callable[[dict[str, Any]], str],
     ) -> None:
         current = self.store.get(intent.intent_id)
+        snapshot_window = self.store.snapshot_window(intent.intent_id)
         if (
             self._halted or intent != current or current.state != "PREPARED"
             or current.dispatch_count or self._now() >= current.expires_at
+            or snapshot_window is None
+            or not snapshot_window[0] <= self._now() <= snapshot_window[1]
         ):
             self._reject()
         if (

@@ -532,19 +532,20 @@ def test_minimum_size_and_usd_cap_are_invariants(lifecycle, tmp_path):
 
 
 def test_preflight_is_immutable_and_bound_to_issuing_lifecycle(lifecycle, tmp_path):
-    validated = ready(lifecycle)
     forged_values = (
-        replace(validated),
-        replace(validated, size=Decimal("0.0002")),
-        replace(validated, market=market(minimum=Decimal("0.0002"))),
-        replace(validated, account=account(account=OTHER_ACCOUNT)),
-        replace(validated, bbo=bbo(ask=Decimal("77963.5"))),
+        lambda value: replace(value),
+        lambda value: replace(value, size=Decimal("0.0002")),
+        lambda value: replace(value, market=market(minimum=Decimal("0.0002"))),
+        lambda value: replace(value, account=account(account=OTHER_ACCOUNT)),
+        lambda value: replace(value, bbo=bbo(ask=Decimal("77963.5"))),
     )
-    for forged in forged_values:
+    for forge in forged_values:
+        validated = ready(lifecycle)
         with pytest.raises(LifecycleSafetyError):
-            lifecycle.prepare_open(forged, 101, 7, 3, NOW + 30)
+            lifecycle.prepare_open(forge(validated), 101, 7, 3, NOW + 30)
         assert lifecycle.store.all() == []
 
+    validated = ready(lifecycle)
     other = new_lifecycle(tmp_path / "cross-lifecycle.sqlite3")
     with pytest.raises(LifecycleSafetyError):
         other.prepare_open(validated, 101, 7, 3, NOW + 30)
@@ -562,6 +563,55 @@ def test_preflight_is_immutable_and_bound_to_issuing_lifecycle(lifecycle, tmp_pa
         )
     assert calls == []
     assert lifecycle.store.get(intent.intent_id).dispatch_count == 0
+
+
+def test_failed_refresh_or_consume_revokes_preflight_token(tmp_path):
+    invalid_accounts = (
+        account(position=Decimal("0.0001"), repeated_position=Decimal("0.0001")),
+        account(observed_at=NOW - 6),
+        account(signer_status="INACTIVE"),
+    )
+    for index, invalid_account in enumerate(invalid_accounts):
+        candidate = new_lifecycle(tmp_path / f"revoked-refresh-{index}.sqlite3")
+        old = ready(candidate)
+        with pytest.raises(LifecycleSafetyError):
+            candidate.preflight(market(), invalid_account, bbo())
+        with pytest.raises(LifecycleSafetyError):
+            candidate.prepare_open(old, 101, 7, 3, NOW + 30)
+        assert candidate.store.all() == []
+        candidate.store.close()
+
+    candidate = new_lifecycle(tmp_path / "revoked-consume.sqlite3")
+    original = ready(candidate)
+    with pytest.raises(LifecycleSafetyError):
+        candidate.prepare_open(
+            replace(original, size=Decimal("0.0002")), 101, 7, 3, NOW + 30,
+        )
+    with pytest.raises(LifecycleSafetyError):
+        candidate.prepare_open(original, 101, 7, 3, NOW + 30)
+    assert candidate.store.all() == []
+    candidate.store.close()
+
+
+def test_dispatch_rejects_stale_bound_open_snapshot(lifecycle):
+    opening = open_intent(lifecycle)
+    lifecycle._now = lambda: NOW + 6
+    open_calls = []
+    with pytest.raises(LifecycleSafetyError):
+        lifecycle.dispatch(opening, SIGNER, lambda value: open_calls.append(value))
+    assert open_calls == []
+    assert lifecycle.store.get(opening.intent_id).dispatch_count == 0
+
+
+def test_dispatch_rejects_stale_bound_close_snapshot(lifecycle):
+    seed_filled(lifecycle)
+    closing = prepare_close(lifecycle)
+    lifecycle._now = lambda: NOW + 7
+    close_calls = []
+    with pytest.raises(LifecycleSafetyError):
+        lifecycle.dispatch(closing, SIGNER, lambda value: close_calls.append(value))
+    assert close_calls == []
+    assert lifecycle.store.get(closing.intent_id).dispatch_count == 0
 
 
 def test_secrets_signatures_payloads_and_identities_are_redacted(lifecycle):
