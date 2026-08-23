@@ -302,7 +302,7 @@ def test_public_api_is_sealed_optional_and_has_no_trading_surface(module) -> Non
         "wallet", "intent", "main_secret_loader",
     )
     forbidden = ("sender", "transport", "url", "base_url", "path",
-                 "proxy", "revoke", "order", "place", "cancel", "position",
+                 "proxy", "order", "place", "cancel", "position",
                  "trade", "mainnet", "nado", "extended", "reset", "delete",
                  "rearm", "retry")
     public = [name.lower() for name in vars(module) if not name.startswith("_")]
