@@ -1221,6 +1221,124 @@ def test_unexplained_fill_is_an_irreversible_durable_halt(lifecycle, evidence, w
     assert restarted.store.dispatch_count(entry.id) == 1
 
 
+def test_claimed_cancel_cannot_be_bypassed_by_reconciling_entry_id(
+    lifecycle, evidence, wire
+):
+    entry = claim_entry(lifecycle, evidence, wire)
+    cancel = lifecycle.prepare_cancellation(entry.id, kind="CANCEL", evidence=evidence)
+    lifecycle.claim_for_dispatch(cancel.id, evidence=evidence)
+    terminal = filled_evidence(wire)
+    before = lifecycle.store.snapshot()
+    with pytest.raises(LifecycleHalted, match="ROUTE"):
+        lifecycle.reconcile(entry.id, terminal)
+    assert lifecycle.store.snapshot() == before
+    assert lifecycle.store.dispatch_count(entry.id) == 1
+    assert lifecycle.store.dispatch_count(cancel.id) == 1
+
+    restarted = reopen(lifecycle)
+    with pytest.raises(LifecycleHalted):
+        prepare_close(restarted, entry.id, terminal, wire)
+    result = restarted.reconcile(cancel.id, terminal)
+    snapshot = restarted.store.snapshot()
+    assert result.lifecycle_state == "EXPOSED"
+    assert snapshot.intent_states[entry.id] == "ENTRY_RECONCILED"
+    assert snapshot.intent_states[cancel.id] == "RECONCILED_NO_CANCEL_EFFECT"
+    close = prepare_close(restarted, entry.id, terminal, wire)
+    restarted.claim_for_dispatch(close.id, evidence=terminal)
+    assert restarted.store.dispatch_count(cancel.id) == 1
+    assert restarted.store.dispatch_count(close.id) == 1
+
+
+@pytest.mark.parametrize("terminal_kind", ["FILLED", "CANCELLED"])
+def test_prepared_cancel_terminal_evidence_supersedes_without_dispatch(
+    lifecycle, evidence, wire, terminal_kind
+):
+    entry = claim_entry(lifecycle, evidence, wire)
+    cancel = lifecycle.prepare_cancellation(entry.id, kind="MASS_CANCEL", evidence=evidence)
+    terminal = filled_evidence(wire) if terminal_kind == "FILLED" else cancelled_evidence(wire)
+    with pytest.raises(LifecycleHalted, match="TERMINAL_EVIDENCE"):
+        lifecycle.claim_for_dispatch(cancel.id, evidence=terminal)
+    assert lifecycle.store.get(cancel.id).state == "PREPARED"
+    assert lifecycle.store.dispatch_count(cancel.id) == 0
+
+    result = lifecycle.reconcile(cancel.id, terminal)
+    restarted = reopen(lifecycle)
+    snapshot = restarted.store.snapshot()
+    assert snapshot.intent_states[cancel.id] == "SUPERSEDED_NOT_DISPATCHED"
+    assert restarted.store.dispatch_count(cancel.id) == 0
+    if terminal_kind == "FILLED":
+        assert snapshot.intent_states[entry.id] == "ENTRY_RECONCILED"
+        assert result.lifecycle_state == "EXPOSED"
+    else:
+        assert snapshot.intent_states[entry.id] == "ENTRY_CANCELLED_NO_FILL"
+        assert result.lifecycle_state == "FLAT_PENDING_EXPIRY"
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("status", "CLOSED"),
+        ("size", "0"),
+        ("size", "-0.001"),
+        ("size", "0.002"),
+        ("value", "0"),
+        ("value", "-40.008"),
+        ("value", "999999"),
+        ("openPrice", "0"),
+        ("openPrice", "-40008"),
+        ("openPrice", "1"),
+        ("markPrice", "0"),
+        ("markPrice", "-40005"),
+        ("markPrice", "1"),
+    ],
+)
+def test_entry_position_must_be_exact_open_authoritative_evidence(
+    lifecycle, evidence, wire, field, bad_value
+):
+    entry = claim_entry(lifecycle, evidence, wire)
+    changed = filled_wire(wire)
+    changed["account"]["positions"][0][field] = bad_value
+    changed["stream"]["positions"][0][field] = bad_value
+    contradiction = normalize_official_evidence(changed, now_ms=1_770_000_003_000)
+    with pytest.raises(LifecycleHalted):
+        lifecycle.reconcile(entry.id, contradiction)
+    assert lifecycle.store.get(entry.id).state == "CLAIMED"
+    assert lifecycle.store.snapshot().lifecycle_state.startswith("HALTED_")
+    assert lifecycle.store.dispatch_count(entry.id) == 1
+
+    restarted = reopen(lifecycle)
+    with pytest.raises(LifecycleHalted):
+        prepare_close(restarted, entry.id, filled_evidence(wire), wire)
+    assert restarted.store.count() == 1
+    assert restarted.store.dispatch_count(entry.id) == 1
+
+
+@pytest.mark.parametrize("stage", ["PREPARE", "CLAIM"])
+@pytest.mark.parametrize(("field", "bad_value"), [("status", "CLOSED"), ("value", "999999")])
+def test_close_prepare_and_claim_revalidate_exact_open_position(
+    lifecycle, evidence, wire, stage, field, bad_value
+):
+    entry = claim_entry(lifecycle, evidence, wire)
+    exposed = filled_evidence(wire)
+    lifecycle.reconcile(entry.id, exposed)
+    close = prepare_close(lifecycle, entry.id, exposed, wire) if stage == "CLAIM" else None
+    changed = filled_wire(wire)
+    changed["account"]["positions"][0][field] = bad_value
+    changed["stream"]["positions"][0][field] = bad_value
+    contradiction = normalize_official_evidence(changed, now_ms=1_770_000_003_000)
+    with pytest.raises(LifecycleHalted, match="POSITION"):
+        if stage == "PREPARE":
+            prepare_close(lifecycle, entry.id, contradiction, wire)
+        else:
+            lifecycle.claim_for_dispatch(close.id, evidence=contradiction)
+    restarted = reopen(lifecycle)
+    if close is None:
+        assert restarted.store.count() == 1
+    else:
+        assert restarted.store.get(close.id).state == "PREPARED"
+        assert restarted.store.dispatch_count(close.id) == 0
+
+
 def test_no_dispatch_or_state_mutation_shortcuts_are_exposed(lifecycle):
     forbidden_lifecycle = {
         "dispatch_once",

@@ -1007,6 +1007,16 @@ class ExtendedLifecycle:
             self._validate_intent_vector(intent, evidence)
         elif intent.kind == "CLOSE":
             self._validate_close_evidence(intent, evidence)
+        elif intent.kind in {"CANCEL", "MASS_CANCEL"}:
+            target = self.store.get(intent.target_id or "")
+            status, history = self._matching_order(target, evidence)
+            if (
+                status is not None
+                and history is not None
+                and status == history
+                and history["status"] in {"FILLED", "CANCELLED"}
+            ):
+                raise LifecycleHalted("TERMINAL_EVIDENCE_REQUIRES_RECONCILIATION")
         self.store._claim(
             intent.id,
             expected_lifecycle=expected_lifecycle,
@@ -1092,13 +1102,8 @@ class ExtendedLifecycle:
         )
         self._validate_intent_vector(intent, evidence)
         position = self._position(evidence)
-        expected_side = "LONG" if intent.side == "SELL" else "SHORT"
-        if (
-            position["accountId"] != intent.account_id
-            or position["market"] != intent.market
-            or position["side"] != expected_side
-        ):
-            raise LifecycleHalted("POSITION_BINDING_MISMATCH")
+        entry = self.store.get(intent.target_id or "")
+        self._validate_position_binding(entry, position, evidence)
         size = _decimal(position["size"], "position.size")
         if size != intent.qty:
             raise LifecycleHalted("POSITION_SIZE_MISMATCH")
@@ -1118,6 +1123,8 @@ class ExtendedLifecycle:
         entry = self.store.get(entry_id)
         if entry.kind != "ENTRY" or entry.state != "ENTRY_RECONCILED":
             raise LifecycleHalted("ENTRY_NOT_RECONCILED")
+        if any(intent.state in {"PREPARED", "CLAIMED"} for intent in self.store._all()):
+            raise LifecycleHalted("OUTSTANDING_INTENT")
         if any(existing.kind == "CLOSE" for existing in self.store._all()):
             raise LifecycleHalted("CLOSE_ALREADY_EXISTS")
         self._require_lifecycle("EXPOSED")
@@ -1126,10 +1133,10 @@ class ExtendedLifecycle:
         if evidence.open_orders:
             raise LifecycleHalted("OPEN_ORDER_PRESENT")
         position = self._position(evidence)
-        self._validate_position_binding(entry, position)
         qty = _decimal(position["size"], "position.size")
         if abs(qty * price) > MAX_NOTIONAL_USD:
             raise LifecycleHalted("NOTIONAL_CAP")
+        self._validate_position_binding(entry, position, evidence)
         side = "SELL" if position["side"] == "LONG" else "BUY"
         nonce_value = _validate_nonce(nonce)
         external_id = str(settlement_hash)
@@ -1280,15 +1287,61 @@ class ExtendedLifecycle:
                 raise LifecycleHalted("ORDER_ARITHMETIC_MISMATCH")
         return fills
 
-    @staticmethod
-    def _validate_position_binding(intent: Intent, position: Mapping[str, Any]) -> None:
+    def _validate_position_binding(
+        self,
+        intent: Intent,
+        position: Mapping[str, Any],
+        evidence: OfficialEvidence,
+    ) -> None:
         expected_side = "LONG" if intent.side == "BUY" else "SHORT"
         if (
             position["accountId"] != intent.account_id
             or position["market"] != intent.market
             or position["side"] != expected_side
+            or position["status"] != "OPENED"
         ):
             raise LifecycleHalted("POSITION_BINDING_MISMATCH")
+        size = _decimal(position["size"], "position.size")
+        value = _decimal(position["value"], "position.value")
+        open_price = _decimal(position["openPrice"], "position.openPrice")
+        mark_price = _decimal(position["markPrice"], "position.markPrice")
+        position_leverage = _decimal(position["leverage"], "position.leverage")
+        account_leverage = next(
+            (row for row in evidence.leverage if row["market"] == intent.market), None
+        )
+        if account_leverage is None:
+            raise LifecycleHalted("POSITION_EVIDENCE_MISMATCH")
+        history = next(
+            (row for row in evidence.order_history if row["externalId"] == intent.external_id),
+            None,
+        )
+        if history is None:
+            raise LifecycleHalted("POSITION_EVIDENCE_MISMATCH")
+        fills = self._validated_fills(intent, history, evidence)
+        fill_qty = sum((_decimal(row["qty"], "fill.qty") for row in fills), Decimal(0))
+        fill_value = sum((_decimal(row["value"], "fill.value") for row in fills), Decimal(0))
+        weighted_value = sum(
+            (
+                _decimal(row["price"], "fill.price")
+                * _decimal(row["qty"], "fill.qty")
+                for row in fills
+            ),
+            Decimal(0),
+        )
+        if (
+            size <= 0
+            or value <= 0
+            or open_price <= 0
+            or mark_price <= 0
+            or position_leverage <= 0
+            or not fills
+            or size != fill_qty
+            or value != fill_value
+            or open_price != weighted_value / fill_qty
+            or mark_price != _decimal(evidence.market["marketStats"]["markPrice"], "market.markPrice")
+            or position_leverage != _decimal(account_leverage["leverage"], "account.leverage")
+        ):
+            raise LifecycleHalted("POSITION_EVIDENCE_MISMATCH")
 
     def _reconcile_entry(self, intent: Intent, evidence: OfficialEvidence) -> ReconciliationResult:
         if evidence.open_orders:
@@ -1304,7 +1357,7 @@ class ExtendedLifecycle:
         if history["status"] not in {"FILLED", "PARTIALLY_FILLED"} or not fills:
             raise LifecycleHalted("ORDER_FILL_CONTRADICTION")
         position = self._position(evidence)
-        self._validate_position_binding(intent, position)
+        self._validate_position_binding(intent, position, evidence)
         position_qty = _decimal(position["size"], "position.size")
         if filled_qty != _decimal(history["filledQty"], "order.filledQty") or position_qty != filled_qty:
             raise LifecycleHalted("FILL_POSITION_CONTRADICTION")
@@ -1332,6 +1385,7 @@ class ExtendedLifecycle:
 
     def _reconcile_cancel(self, intent: Intent, evidence: OfficialEvidence) -> ReconciliationResult:
         target = self.store.get(intent.target_id or "")
+        superseded = intent.state == "PREPARED"
         status, history = self._matching_order(target, evidence)
         if status is None or history is None or status != history:
             raise LifecycleHalted("CANCEL_UNRESOLVED")
@@ -1345,9 +1399,14 @@ class ExtendedLifecycle:
                 or _decimal(history["cancelledQty"], "order.cancelledQty") != target.qty
             ):
                 raise LifecycleHalted("CANCEL_NO_FILL_CONTRADICTION")
-            if intent.state == "CLAIMED":
+            if intent.state in {"CLAIMED", "PREPARED"}:
+                action_state = (
+                    "SUPERSEDED_NOT_DISPATCHED"
+                    if superseded
+                    else "RECONCILED_CANCELLED_NO_FILL"
+                )
                 self.store._set_states(
-                    {intent.id: "RECONCILED_CANCELLED_NO_FILL", target.id: "ENTRY_CANCELLED_NO_FILL"},
+                    {intent.id: action_state, target.id: "ENTRY_CANCELLED_NO_FILL"},
                     "FLAT_PENDING_EXPIRY",
                 )
                 return ReconciliationResult(
@@ -1381,7 +1440,7 @@ class ExtendedLifecycle:
         if not fills:
             raise LifecycleHalted("CANCEL_FILL_MISSING")
         position = self._position(evidence)
-        self._validate_position_binding(target, position)
+        self._validate_position_binding(target, position, evidence)
         filled_qty = sum((_decimal(row["qty"], "fill.qty") for row in fills), Decimal(0))
         position_qty = _decimal(position["size"], "position.size")
         if (
@@ -1391,7 +1450,10 @@ class ExtendedLifecycle:
         ):
             raise LifecycleHalted("CANCEL_FILL_POSITION_CONTRADICTION")
         self.store._set_states(
-            {intent.id: "RECONCILED_NO_CANCEL_EFFECT", target.id: "ENTRY_RECONCILED"},
+            {
+                intent.id: "SUPERSEDED_NOT_DISPATCHED" if superseded else "RECONCILED_NO_CANCEL_EFFECT",
+                target.id: "ENTRY_RECONCILED",
+            },
             "EXPOSED",
         )
         return ReconciliationResult(
@@ -1496,6 +1558,24 @@ class ExtendedLifecycle:
             for fill in evidence.fills
         )
 
+    @staticmethod
+    def _validate_reconciliation_route(intent: Intent, lifecycle_state: str) -> None:
+        allowed_pairs = {
+            ("ENTRY", "CLAIMED", "ENTRY_AMBIGUOUS"),
+            ("CANCEL", "CLAIMED", "CANCEL_AMBIGUOUS"),
+            ("MASS_CANCEL", "CLAIMED", "CANCEL_AMBIGUOUS"),
+            ("CANCEL", "PREPARED", "CANCEL_PREPARED"),
+            ("MASS_CANCEL", "PREPARED", "CANCEL_PREPARED"),
+            ("CANCEL", "RECONCILED_CANCELLED_NO_FILL", "FLAT_PENDING_EXPIRY"),
+            ("MASS_CANCEL", "RECONCILED_CANCELLED_NO_FILL", "FLAT_PENDING_EXPIRY"),
+            ("CANCEL", "SUPERSEDED_NOT_DISPATCHED", "FLAT_PENDING_EXPIRY"),
+            ("MASS_CANCEL", "SUPERSEDED_NOT_DISPATCHED", "FLAT_PENDING_EXPIRY"),
+            ("CLOSE", "CLAIMED", "CLOSE_AMBIGUOUS"),
+            ("CLOSE", "CLOSE_RECONCILED", "EXPOSED"),
+        }
+        if (intent.kind, intent.state, lifecycle_state) not in allowed_pairs:
+            raise LifecycleHalted("ACTION_ROUTE_MISMATCH")
+
     def reconcile(self, intent_id: str, evidence: OfficialEvidence) -> ReconciliationResult:
         intent = self.store.get(intent_id)
         self._validate_common(evidence)
@@ -1503,10 +1583,21 @@ class ExtendedLifecycle:
         if current_lifecycle.startswith("HALTED_"):
             raise LifecycleHalted("LIFECYCLE_HALTED")
         try:
-            self._assert_binding(intent, evidence)
             recheck_states = {"CLOSE_RECONCILED", "RECONCILED_CANCELLED_NO_FILL"}
-            if intent.state != "CLAIMED" and intent.state not in recheck_states:
+            prepared_cancel = intent.kind in {"CANCEL", "MASS_CANCEL"} and intent.state == "PREPARED"
+            superseded_cancel = (
+                intent.kind in {"CANCEL", "MASS_CANCEL"}
+                and intent.state == "SUPERSEDED_NOT_DISPATCHED"
+            )
+            if (
+                intent.state != "CLAIMED"
+                and intent.state not in recheck_states
+                and not prepared_cancel
+                and not superseded_cancel
+            ):
                 raise LifecycleHalted("INTENT_NOT_CLAIMED")
+            self._validate_reconciliation_route(intent, current_lifecycle)
+            self._assert_binding(intent, evidence)
             if not self._all_fills_bind_persisted_orders(evidence):
                 self.store._set_states({}, "HALTED_UNEXPLAINED_FILL")
                 raise LifecycleHalted("UNEXPLAINED_FILL")
@@ -1520,6 +1611,7 @@ class ExtendedLifecycle:
         except (ContractViolation, EvidenceViolation, LifecycleHalted) as exc:
             transient = {
                 "INTENT_NOT_CLAIMED",
+                "ACTION_ROUTE_MISMATCH",
                 "CANCEL_UNRESOLVED",
                 "CANCEL_FILL_MISSING",
                 "CLOSE_NOT_FILLED",
