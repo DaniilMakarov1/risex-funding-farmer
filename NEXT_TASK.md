@@ -1,37 +1,34 @@
-# PAPER-007-STABILIZATION-007 — Cadence-safe Extended Watchdog Rotation
+# TESTNET-001-RECOVERY-001 — Module-Owned Transport and Verified Account Bootstrap
 
-Status: `ACCEPTED — NO ACTIVE IMPLEMENTATION TASK`.
+Status: `ACTIVE — RED FIRST; NO LIVE OR SECRET-BEARING ACTION`.
 
-The accepted exact chain is governance/RED `1ef052e4d5f261d1df7978e5b7be8a635f1473e9`, RED `52ef4e0c084e5cb6548a88233b8aa8511895813d`, RED fix `85bc126258efde9898c2718bb9669d94ff85adc9`, GREEN authorization `6fed84a804dabb6aedd960a7ae755208ff9d4ea0`, and implementation `daee86da4e17fa39b5ca11cb2914ed21e42b88cc`. Chief independently passed the two new production-path regressions and the full 324-test suite. Integration and one bounded public-paper validation with Telegram disabled are authorized; no further implementation, Stage B/Telegram restart, testnet, private/auth, or live work is authorized.
+This fresh administrative correction starts strictly from published `main == origin/main == c28f40d6a1fc74c1795e26b77695ced2b21dc5a4` on `codex/testnet-001-recovery-001`. The rejected TESTNET-001 implementation and branch remain blocked audit history and must not be inspected, imported, copied, cherry-picked, merged, pushed, or live-run.
 
-This is one fresh corrective slice explicitly authorized by the user after STABILIZATION-005 and STABILIZATION-006 were blocked. It starts strictly from published `main == origin/main == 037c4df35de6cc8dfddce48a50b6c8af488b0908`. Failed 005/006 branches, commits, tests, samples, diffs, and quarantine objects are immutable audit history and must not be inspected, imported, copied, cherry-picked, or reused.
+## Ownership and bounded design
 
-## Narrow contract
+- Add one small optional testnet bootstrap module, isolated from normal Farmer imports and from runtime, Scanner, lifecycle, storage, Telegram, economics, and paper configuration. No framework, service, daemon, database, CLI-wide abstraction, SDK compatibility layer, or optional dependency is authorized.
+- RISEx is the only implementable onboarding path in this slice. The module owns exact constants for official testnet host `api.testnet.rise.trade`, chain `11155931`, paths, methods, and documented identity fields. It creates and closes its own `aiohttp` session with system CA verification, `trust_env=False`, finite total timeout, and `allow_redirects=False` on every request; validates response status and actual URL; and rejects every 3xx or destination mismatch.
+- The public API exposes no sender, transport, session, request, URL, base-URL override, or destination callback. Tests intercept only below this boundary through private monkeypatching. No custom SSL context, TLS bypass, redirect following, proxy inheritance, or caller-selected method/path is permitted.
+- RISEx bootstrap first verifies `GET /v1/system/config` and `GET /v1/auth/eip712-domain`, derives exact USDC from verified config, then reads `GET /v1/account/balance` for the expected wallet. Positive balance returns `ALREADY_READY` without a write. Otherwise an explicit one-venue/one-operation intent permits exactly one unsigned `POST /v1/account/deposit` with the documented wallet and amount; immediately before dispatch identity and wallet are revalidated.
+- POST success is not readiness. A bounded authoritative balance reread through the same owned safe transport must show positive balance to return `READY`. Confirmed write without observable readiness is `SUBMITTED_UNVERIFIED`; timeout, EOF, TLS failure, final-URL mismatch, redirect, cancellation-independent transport uncertainty, or malformed response after dispatch is non-ready/ambiguous and is never retried automatically. `CancelledError` propagates.
+- Nado signed onboarding remains fail-closed: do not hand-roll signing, downgrade accepted dependencies, or add an isolated subprocess/sidecar. Extended onboarding remains fail-closed until an official working chain-identity path is proved; do not equate REST hostname with chain identity or guess an RPC. Report exact manual/official prerequisites only.
+- No real XLSX access, secrets, credentials, private/account live query, registration, API-key creation, faucet/deposit write, test collateral, order/cancel/replace/position/trading method, mainnet endpoint, real funds, or Scanner/runtime integration occurs before Chief candidate acceptance and separate operational authorization.
 
-- Runtime remains the sole cadence, Extended session, watchdog, and transport-task owner. Fix only the proven defect that `tick()` synchronously waits for an old Extended transport task to retire and therefore delays scan and open-position cadence.
-- Fence the old session before successor activation, install exactly one successor, and prevent all old-session publication after fencing. Watchdog stale/restarted evidence remains logical and must not fabricate `PUBLIC_SOCKET_*` lifecycle rows.
-- Collect normal delayed cancellation when it eventually completes, removing ownership and consuming expected cancellation without warning or leak. Surface a genuine unexpected retirement exception through existing runtime evidence/error semantics.
-- Preserve the accepted shutdown implementation: runtime stop cancels and awaits owned tasks as it already does. Do not add fatal shutdown semantics, session-close budgets, task-cap state machines, config constants, process-kill behavior, or tests for a coroutine that suppresses `CancelledError` forever. Such a coroutine remains an external process-supervision limitation.
-- Production scope is only `src/risex_farmer/runtime.py`; tests only `tests/test_runtime.py`. No adapter, storage schema, lifecycle, Scanner, Telegram, economics, heartbeat, timeout, private/auth/live, or broad refactor change.
+## RED and acceptance contract
 
-## Newly authored RED requirements
+1. Exact published main lacks the sealed bootstrap and fails the newly authored tests; production remains untouched at the RED checkpoint.
+2. A response whose actual/final URL is production is rejected and never submitted. Statuses 301, 302, 303, 307, and 308 are rejected without following.
+3. Public API signatures cannot inject sender, transport, request, session, URL, base URL, method, path, proxy, or SSL context. Environment proxy/base-URL tricks cannot redirect requests; default CA verification remains enabled.
+4. Wrong host, path, method, chain, signing domain, or wallet mapping fails before any permitted secret/signer callback or write dispatch. RISEx's official unsigned faucet path introduces no production secret seam.
+5. Successful POST without an authoritative positive balance is never `READY`; already-ready preflight performs zero writes. The expected wallet, config-derived USDC, exact quantity, and postcondition are fixture-proved.
+6. Timeout, EOF, TLS failure, final-URL mismatch, malformed response, or cancellation after POST never causes a retry or success. Exactly one write attempt is made; uncertain outcomes are typed ambiguous/non-ready and cancellation propagates normally.
+7. Synthetic secret-bearing chained exceptions, SDK-like objects, response bodies, representations, stdout/stderr, and pytest output are redacted. No response body or low-level exception text enters a public result. No real secret fixture is used.
+8. No order, cancel, replace, position-creation, trading transaction, mainnet route, or generic endpoint dispatch is present or reachable. Read-only code cannot invoke a write even with malicious fixture data.
+9. Optional testnet code is not imported during normal Farmer startup. The existing 324-test paper suite remains unchanged; CI and Builder work are fixture-only and perform no live calls or writes.
+10. Run focused tests, full `pytest`, compileall, diff review, secret scan, import-identity check, and pending-task audit. Builder creates one implementation commit and reports in at most 20 lines; at most two Architect-directed fix cycles are allowed.
 
-1. Exercise the real `tick()` -> `_check_extended_health()` -> `_restart_extended_stream()` path with an old task that acknowledges cancellation but remains briefly gated. Exact accepted main must leave the due `PUBLIC_SCAN_DEADLINE` blocked until gate release.
-2. Use a real valid `ScanSnapshot`. After release, exact main must complete the rest of `tick()` without fixture exception, pending-task warning, or leak.
-3. Specify prompt candidate return, old-session fencing, and exactly one successor before old retirement completes.
-4. Specify idempotence under repeated concurrent health checks and prove the fenced old task cannot mutate readiness, book, observation, confirmation, or logical/physical evidence.
-5. Specify eventual removal and outcome consumption for normal delayed retirement; a genuine unexpected exception uses existing runtime evidence/error behavior without redesigning shutdown.
-6. Preserve true EOF one-disconnect/one-reconnect, heartbeat/PING/PONG, absolute FULL cadence, open-position evaluation, Scanner/`UNKNOWN`, Telegram, economics, and all existing safe-stop tests.
+## Workflow boundary
 
-## Gates
+Exactly one Builder may author fresh RED tests and then, after Architect RED review, the smallest implementation. Expected production scope is one new optional module and tests in one new focused test file; any additional production file requires Architect justification before edit. Stop at the deterministic candidate checkpoint. Do not merge, push, read the real XLSX, create credentials, make private/live queries, perform onboarding/faucet/deposit, fund accounts, or start TESTNET-002 before Chief independent review.
 
-- The accepted RED chain ends at `85bc126258efde9898c2718bb9669d94ff85adc9`: exact main blocks three concurrent cadence/health tasks until old retirement, then creates three successors; the valid post-gate tick completes one FULL without fixture exception or task leak. Unexpected delayed retirement failure currently produces no fatal evidence.
-- The same sole Builder may make the smallest `runtime.py`-only production correction; tests remain limited to `test_runtime.py`. Fence/remove old active ownership synchronously, install exactly one successor without waiting for retirement, and use only a minimal runtime-owned retirement collection/callback if necessary.
-- Normal completion removes retirement ownership and consumes cancellation. Unexpected exception is retrieved and routed once through existing `_background_fatal`, stop request, and one `RUNTIME_FATAL` row with its exception class. Preserve session fencing and logical/physical evidence separation.
-- Do not add config, capacity/task state machines, shutdown/session-close behavior, services, adapters, Scanner, storage/schema, cadence/economics, Telegram, auth, testnet, or live changes.
-- The focused GREEN, runtime/preservation suites, full 324-test suite, compileall, diff/secret, and pending-task checks passed Architect and Chief review. Integrate without rewriting history, publish `main`, then perform only the authorized bounded public-paper validation and report its evidence.
-- Maximum two later fix cycles. Do not merge, push, soak, restart Stage B/Telegram, or update acceptance governance before Chief decisions.
-
-## Separate future real-money gate
-
-The user's future real-money request is recorded only as requiring a separate Chief-approved design and security review. No credentials, accounts, authentication, private endpoints, live orders, or real-money implementation are in scope here.
+The user's later testnet-only order/cancel/close and manually armed strategy authorization is recorded but deferred. It does not authorize trading code in this slice and never authorizes mainnet or real funds.
