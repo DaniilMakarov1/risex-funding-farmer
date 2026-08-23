@@ -13,7 +13,12 @@ dependencies = ["aiohttp>=3.9,<4"]
 risex-farmer = "risex_farmer.cli:main"
 
 [project.optional-dependencies]
-test = ["pytest>=8,<9", "pytest-asyncio>=0.23,<1"]
+test = [
+    "pytest>=8,<9",
+    "pytest-asyncio>=0.23,<1",
+    "eth-account>=0.13,<0.14",
+]
+testnet-risex = ["eth-account>=0.13,<0.14"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
