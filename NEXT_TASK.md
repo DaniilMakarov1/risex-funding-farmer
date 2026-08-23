@@ -1,33 +1,44 @@
-# PAPER-007-STABILIZATION-004 — Atomic Causal Fill Provenance
+# PAPER-007-STABILIZATION-005 — Public Data Instability Causal Diagnosis
 
-Status: `AUTHORIZED — ONE BOUNDED CORRECTIVE SLICE`.
+Status: `PHASE 0 ONLY — IMPLEMENTATION NOT AUTHORIZED`.
 
-Builder starts from accepted `origin/main` `b73fd3c8dac7cba7dc434475d3eefa77d64b0880` on `codex/paper-007-stabilization-004`. The quarantined `bbb7c4ec397842531c30afef64793076a491b05a` refactor branch and its stashed `tests/test_scanner.py` work are rejected inputs: do not inspect further, copy, merge, rebase, or otherwise use them. Implement only atomic causal public-market provenance for every newly simulated paper fill and position close. Do not begin another slice.
+STABILIZATION-004 is accepted at exact commits `59c87bd26496ea15c75104b37a8f05ac6d20f0a1`, `63413b046233b185cbc60f03e19649218632d527`, and `c18161675b104627a8364deff9f3efbae0f403dc`. Continue as one bounded administrative corrective slice only to determine whether the accepted operational run proves a local public-data stability defect. Do not create a Builder, edit production code, or start RED/GREEN until the Architect presents Phase 0 evidence and the Chief Reviewer explicitly authorizes implementation. If the evidence supports only venue, network, host, sleep/wake, or otherwise external behavior, stop and report without inventing a correction.
 
-## Ownership and minimal design boundary
+## Evidence boundary
 
-- Runtime/lifecycle remains the sole decision owner; adapters retain venue normalization; Scanner retains route blockers and economics; repository persists only; Telegram remains delivery-only.
-- Carry the same immutable trade or order-book input used by the decision through fill construction into one repository transaction. Do not reread mutable book state, recompute later, or add a cache, service, event bus, state machine, or parallel owner.
-- Use one small additive provenance contract and additive SQLite persistence compatible with archived databases and pickles. Never mutate an archive. Legacy fills may lack provenance; every fill newly created by this implementation must have it.
-- A maker proof records venue/market/side, owned order/version/limit, all qualifying public trade identities needed to prove cumulative trade-through, exchange and receipt/observation timestamps, price, quantity, aggressor and order-book-match semantics, plus causal decision/fill time.
-- A taker proof records venue/market/side, current public book stream session and recovery generation, observed and received timestamps, logical/decision time, sequence and checksum when available, exact consumed depth levels, requested and executed quantity, notional, and exact VWAP/fill price.
-- The existing book owner must capture identity and immutable depth together. A later mutable-book replacement must not alter or validate an earlier decision. Quiet books remain usable under the existing heartbeat rule; this slice does not invent a book-event age TTL.
-- Fill, provenance, processed trade key, owned order/version, lifecycle state, position or completed trade, and close settlements affected by the decision persist in one atomic transaction. Publish the in-memory decision only after persistence succeeds. No member of that decision may survive repository failure or cancellation alone.
-- Fail closed before a fill when provenance is missing, future-dated, disconnected/stale by existing health rules, owned by an obsolete session or recovery generation, for the wrong venue/market/side/version, or lacks exact requested depth. Enforce `observed_at <= causal_decision_at` and exact requested = executed quantity.
-- Preserve fill dedupe, settlement uniqueness, exact two-leg quantity conservation, Decimal fees/funding/PnL formulas, cadence, routes, thresholds, Scanner `UNKNOWN`, refresh/socket behavior, Telegram behavior, public-only paper boundary, and all frozen `SYSTEM_SPEC.md` economics.
+- The accepted 24-minute operational run produced 45 new Extended physical `SOCKET_CLOSED/EOF` disconnects: book 11, funding 17, trade 17. Every exact `episode_id` eventually had one persisted reconnect; unmatched episodes at safe stop were zero.
+- The same run produced 30 new public `TimeoutError` rows: Extended 14, Nado 14, and RISEx 2. Scanner persisted one INITIAL and eight FULL scans, 206 evaluations, zero eligible routes, four `VOLUME_UNKNOWN`, and transient book/trade/funding unhealthy blockers. Final venue readiness was available for all venues.
+- These are observations, not a diagnosis. Do not assume a client reconnect storm, heartbeat error, timeout ownership defect, server policy, official API behavior, Mac sleep, local network failure, or event-loop stall.
+- Use only this repository, its accepted Git history, the preserved accepted operational evidence, locally available host/network/sleep signals, and official RISEx, Extended, or Nado contracts. Do not inspect or reuse the quarantined refactor branch/stash, other repositories, Radar, or old projects. Any validation must prove imports resolve to the intended clean worktree rather than the global editable install.
 
-## Mandatory RED and acceptance matrix
+## Phase 0 ownership map and required evidence
 
-A. On exact old main, a fixture shaped like rejected restart/close evidence fails an independent audit because maker and taker causal provenance is absent.
-B. Candidate persistence alone independently proves maker eligibility and exact taker consumed depth, requested/executed quantity, notional, and VWAP for entry, normal/aggressive exit, and Hard Basis fills.
-C. Focused production-path tests prove future observation, unhealthy/stale ownership, obsolete session, obsolete recovery generation, wrong venue/market/side/version, missing/insufficient depth, and post-decision mutable-book replacement cannot fill; a healthy quiet unchanged book retains existing semantics.
-D. Injected repository exception and cancellation roll back the complete entry or close decision: no fill, provenance, processed key, order/version transition, position/lifecycle transition, settlement mutation, or completed trade survives alone, and in-memory authority is not published.
-E. Replay of the same trade, fill identity, or settlement cannot duplicate a fill, provenance row, close, or authoritative settlement.
-F. Entry and close legs conserve the exact canonical quantity, and persisted fills alone reproduce unchanged pair PnL, fees, recognized funding, and closed net PnL.
-G. Preserve scanner/`UNKNOWN`, refresh, socket/recovery, settlement, reporting, safe-stop, and Telegram deterministic suites.
-H. Run focused RED on old main and candidate, then full `pytest`, `compileall`, diff review, secret scan, and async task/quiescence checks. Builder reviews the diff and creates exactly one implementation commit; report is at most 20 lines.
-I. R16 uses a fresh disposable copy of the original archive whose SHA-256 is `93e9b6793e76cec227d0fe40799a70d0416518568b0c228fc0808a681497df80`. The original hash must remain unchanged. The inherited `EXITING_AGGRESSIVE` position may close only when every new fill has complete causal provenance; otherwise it remains safely open and fail-closed.
+- Physical socket owner: runtime public-stream connection loop. Establish exact connection-open, confirmation, heartbeat, disconnect, backoff, reconnect, session, and episode timelines without adding another owner.
+- Public request owner: runtime refresh/single-flight request orchestration; adapters own venue request semantics. Establish endpoint/component, attempt, start/end, timeout duration, retry/backoff, concurrent request count, refresh ownership, and terminal outcome for every timeout.
+- Cadence owner: runtime. Correlate refreshes, scans, deadline lateness, socket episodes, recovery work, and any event-loop scheduling stalls without changing absolute cadence.
+- Scanner remains the sole blocker/`UNKNOWN` owner. Report every per-scan blocker distribution exactly; genuine unavailable official data must remain fail-closed and may remain `UNKNOWN`.
+- Host/environment evidence is diagnostic only. Correlate locally available sleep/wake, process signals, network transitions, and wall-clock/monotonic discontinuities with explicit confidence and gaps; absence of evidence is not proof of absence.
+- Compare captured behavior only with current official venue public contracts. Distinguish documented server close/heartbeat/reconnect behavior from a client/protocol mismatch; cite exact official evidence and do not infer undocumented requirements.
 
-## Post-deterministic operational gate
+## Falsifiable hypotheses
 
-Only after deterministic acceptance, use a fresh disposable copy of the original archive with Telegram disabled and public paper data only. Run until the inherited position closes or a bounded materially informative window ends. Independently reconstruct every new fill identity, causal time, depth consumption, VWAP, quantities, fees, funding, and PnL from persistence; then safe-stop and prove SQLite integrity, no post-stop writes, and task/process quiescence. Diagnose the prior external SIGINT and possible Mac sleep only as a separate operational observation; do not add a speculative daemon/service. No Stage B or Telegram restart, merge, or push before independent Chief Reviewer approval.
+1. The client creates a reconnect storm through duplicate connection owners, premature heartbeat closure, stale-session interference, or incorrect reconnect pairing. Falsifier: one owner per stream/session, server/transport EOF precedes each retry, official heartbeat deadlines are met, and no overlapping client-created reconnect exists.
+2. Refresh orchestration causes request timeouts or event-loop starvation through unbounded concurrency, serial coupling, duplicate single-flight ownership, or work that blocks socket heartbeats/scans. Falsifier: bounded independent tasks, expected timeout duration, responsive event loop, and no causal alignment beyond external latency.
+3. Retry/backoff implementation contradicts the official venue contract or collapses into burst retries. Falsifier: persisted attempt spacing and connection lifetimes match the accepted code and official limits, with no client-side burst.
+4. Host sleep/wake or network transitions caused the observed clusters. Falsifier: continuous host/network evidence across each episode with no matching discontinuity; confirmation requires positive local evidence, not the user's hypothesis alone.
+5. The observations are expected external/server/network behavior correctly isolated by existing fail-closed recovery. Confirmation requires exact episode pairing, bounded retries, preserved cadence, no duplicate state owner, and recovery without invented freshness.
+
+## Mandatory Phase 0 output and proposed RED boundary
+
+- Reconstruct every new disconnect/reconnect episode in chronological order, including venue, stream, market, session, lifetime, cause/classification, heartbeat or PING/PONG evidence, retry delay, reconnect time, and unmatched/overlapping ownership checks.
+- Reconstruct every new request timeout with endpoint/component, attempt, duration, concurrent refresh/socket context, configured timeout/backoff, later recovery, and correlation to scanner deadline or event-loop delay.
+- Inspect the accepted reconnect, heartbeat, refresh, timeout, safe-stop, and Scanner tests and production owners for a specific contract mismatch. Record exact production files that would be unavoidable; prefer zero files when no defect is proven.
+- Present a concise causal timeline, ownership map, evidence gaps, hypothesis verdicts, and exact production-shaped RED tests that fail on accepted main only if a local defect is established. A RED plan must identify the current incorrect behavior and invariant, not merely assert fewer disconnects or zero `UNKNOWN`.
+- Any later correction must preserve economics, Decimal formulas, routes, thresholds, Scanner semantics, absolute cadence, Telegram boundaries, public/paper-only safety, and single ownership. Prefer removing duplicated state over adding a cache, flag, task, or service.
+- Mandatory later operational outcome, only if Chief authorizes GREEN: a bounded awake-machine public soak with exact episode pairing, no client-caused reconnect storm, timeout isolation, safe stop/quiescence, and complete per-scan blocker/`UNKNOWN` distribution. Genuine official-data unavailability remains visible.
+
+## Stop gates
+
+- Stop after Phase 0 and request Chief review before creating the single allowed Builder.
+- Stop without implementation if causality is external, environmental, undocumented, ambiguous, or not reproducible as a local invariant violation.
+- Do not restart long-running Stage B or Telegram, mutate archives, commit databases/logs/secrets, merge speculative work, or begin another stabilization slice.
