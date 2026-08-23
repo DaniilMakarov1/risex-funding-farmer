@@ -1,14 +1,14 @@
 # TESTNET-002-RISEX-ORDER-LIFECYCLE-001 — Fixture-First Bounded Empirical Lifecycle
 
-Status: `ACTIVE GOVERNANCE SLICE — USER-ACCEPTED BOUNDED TESTNET RISK; NO BUILDER UNTIL SEPARATE CHIEF COORDINATOR GATE; FIXTURE-ONLY; NO CREDENTIAL, SIGNATURE, LIVE NETWORK, OR POST`.
+Status: `ACTIVE GOVERNANCE SLICE — FIXTURE CORE CENTRALLY ACCEPTED; PRIVATE-READ PREFLIGHT GOVERNANCE ONLY; NO BUILDER OR CREDENTIAL/PRIVATE ACTION UNTIL SEPARATE CHIEF COORDINATOR GATE; NO LIVE WRITE`.
 
-Start from exact published `main == origin/main == d5a4b78de599a9e808fd5aba13aa3d60e2925946` on `codex/risex-testnet-002-order-lifecycle-001-governance`. The fixed approved wallet has authoritative raw test balance `1000`, and its preserved session signer is authoritatively `ACTIVE` from `2026-08-23T16:40:21Z` through `2026-09-22T15:46:50Z`. The credential and signer record remain fixed outside Git and are never regenerated, reset, replaced, exposed, deleted, or revoked. This is the sole active RISEx lane slice.
+Start this governance-only continuation from exact published `main == origin/main == 998b0c3df188f1fe8a90d7091688e2c6ae0f0479` on `codex/risex-testnet-002-private-read-governance-001`. The fixed approved wallet has authoritative raw test balance `1000`, and its preserved session signer is authoritatively `ACTIVE` from `2026-08-23T16:40:21Z` through `2026-09-22T15:46:50Z`. The credential and signer record remain fixed outside Git and are never regenerated, reset, replaced, exposed, deleted, or revoked. This remains the sole active RISEx lane slice and creates no new product milestone.
 
 ## Authority, ownership, and terminal contract
 
 - The user accepts that one later separately gated testnet experiment cannot guarantee atomic recovery. General operational success remains authoritative zero open orders plus exact flatness (`position.size == "0"`).
 - The sole narrow exception is terminal `FAILED_HALTED_MANUAL_RECOVERY`: after all bounded attempts, the later live experiment may leave only its minimum-size RISEx testnet exposure or a known experiment order unresolved. This is failure, never operational acceptance, exact-flat acceptance, lifecycle readiness, or strategy authorization.
-- The current milestone is fixture-only. One dedicated RISEx lifecycle controller owns preflight, state-based dispatch eligibility, reconciliation, recovery, and terminal classification. A dedicated local repository owns durable intent rows only. A direct official REST/EIP-712/ABI adapter owns request encoding and authoritative response normalization. The existing session signer is available only through an injected loader that remains uncalled in Builder tests.
+- The fixture core is centrally accepted. One dedicated RISEx lifecycle controller owns preflight, state-based dispatch eligibility, reconciliation, recovery, and terminal classification. A dedicated local repository owns durable intent rows only. A direct official REST/EIP-712/ABI adapter owns request encoding and authoritative response normalization. The existing session signer remains available only through its injected loader; this governance candidate does not call it.
 - The module is isolated from and is never imported by normal Farmer startup, Scanner, shared runtime, paper repository, economics, strategy, Telegram, Nado, or Extended.
 
 Before every hypothetical signature or dispatch, commit one immutable intent containing:
@@ -35,9 +35,9 @@ Official sources: [documentation index](https://developer.rise.trade/llms.txt), 
 
 Governance-only audit commit `73068dc202c6c47607dc9c9b349001d4fb0edbf2` and branch `codex/testnet-002-risex-order-001` remain preserved unchanged, unmerged, and unpushed. They were independently reviewed and were not cherry-picked, merged, amended, rebased, or deleted.
 
-## One fixture-first Builder milestone after the separate gate
+## Centrally accepted fixture core
 
-- Add one isolated Python module and one focused fixture suite. The module may expose injected official query/execute, signer, clock, and durable-store boundaries, but no production credential invocation, live transport, CLI command, URL override, or live-smoke path.
+- The unchanged Builder chain through `4b323c6dd4980bd3574c14bfcdc4d414f5749f4d` added one isolated Python module and one focused fixture suite with injected official query/execute, signer, clock, and durable-store boundaries and no production credential invocation, live transport, CLI command, URL override, or live-smoke path. It was centrally published as the second parent of merge `998b0c3df188f1fe8a90d7091688e2c6ae0f0479`.
 - Preflight fails before signer loading or hypothetical dispatch unless runtime-fetched official testnet host, chain, domain and Router identities match; the preserved signer status is `ACTIVE`; BTC/USDC is active/unlocked; tick, step and minimum are exact; two authoritative reads agree on zero open orders and `position.size == "0"`; no lifecycle intent or unexplained account state exists; and a fresh two-sided BBO has minimum-size depth inside a fixed test-only 30 bps adverse bound.
 - Opening size is exactly the current official BTC minimum, never a configurable size up to the cap. Its adverse-bound notional must be `<= USD 500`; any grid, depth, freshness, identity, or cap failure permits zero signatures and zero writes.
 - Permit at most one opening intent: fixed BUY, exact minimum size, price-bounded `MARKET+FOK`, `reduce_only=false`, `post_only=false`. `MARKET+FOK` is an empirical official API/current-UI-compatible contract, not guaranteed semantics.
@@ -47,9 +47,9 @@ Governance-only audit commit `73068dc202c6c47607dc9c9b349001d4fb0edbf2` and bran
 - FOK/IOC are selected to avoid resting orders. Only an exact known order linked to this experiment may be cancelled, at most once per exact order ID. An ambiguous cancel is reconciled and never replayed; unrelated orders are never cancelled and force a halt. Maximum place dispatches are four: one opening plus three closes. Maximum cancels are four: at most one for each possible known experiment order.
 - `SUCCESS_CLOSED_FLAT` requires an observed opening fill/positive position, all experiment intents terminal/reconciled, zero open orders, and exact `position.size == "0"` on consistent final reads. Any remaining position/order, exhausted close/cancel budget, non-step residual, lost connectivity, or unresolved identity persists `FAILED_HALTED_MANUAL_RECOVERY`, stops every automated write, and produces redacted evidence plus operator-only official RISEx testnet UI full-close/read-only-verification instructions. The agent never accesses the main-wallet XLSX for manual recovery.
 
-## Exact RED, fixture, and adversarial gates
+## Accepted RED, fixture, and adversarial gates
 
-On exact base `d5a4b78de599a9e808fd5aba13aa3d60e2925946`, `tests/test_testnet_risex_order_lifecycle.py` must first fail because the bounded module/behavior is absent. Its exact required regressions are:
+On exact base `d5a4b78de599a9e808fd5aba13aa3d60e2925946`, `tests/test_testnet_risex_order_lifecycle.py` first failed because the bounded module/behavior was absent. The accepted unchanged chain through `4b323c6d` passes these required regressions:
 
 1. `test_preflight_blocks_before_signer_or_post`
 2. `test_intent_nonce_and_digest_are_durable_before_dispatch`
@@ -71,15 +71,38 @@ On exact base `d5a4b78de599a9e808fd5aba13aa3d60e2925946`, `tests/test_testnet_ri
 
 Fixtures must cover inactive signer, stale/malformed/off-grid market evidence, insufficient depth, cap failure, timeout before response, delayed order appearance, FOK reject/no-fill, IOC partial fill, below-minimum step-divisible residual, non-step-divisible residual, close rejection, unexpected order, cancel ambiguity, permit expiry, and connectivity loss while exposed. Adversarial contradictions across place/order/open/history/trade/position evidence may never grant another write or any success state.
 
-Secret isolation proves the real loader is never called; synthetic fixtures and disposable storage only; no credential, raw signature, payload, public account/signer/order identity, private endpoint, network, or POST appears in test output or Git. The Builder runs focused tests, the full clean Python 3.11 suite, compileall, `pip check`, import identity, diff/secret checks, and creates one implementation commit without governance, shared-core, or cross-venue edits.
+Secret isolation proves the real loader is never called; synthetic fixtures and disposable storage only; no credential, raw signature, payload, public account/signer/order identity, private endpoint, network, or POST appears in test output or Git. Chief acceptance passed 30 focused and 528 full candidate tests; central combined verification passed 90 focused and 588 full tests, with the accepted implementation chain unchanged and no shared-core or cross-venue edit.
+
+## Next bounded credentials/private-read preflight gate
+
+The exact identities are fixed: REST origin `https://api.testnet.rise.trade`, chain `11155931`, EIP-712 domain `RISEx` version `1`, Authorization `0x6da86f486b5e6536358f5b122dbe184522ca0ee3`, RISExUniversalRouter `0x980b8621b8e03c3f396e1dc34c00b14d84f2a20f`, approved account `0x20f9153e2eeba0ff7880fb5a23e976e8b2af56ee`, and session signer `0x6274d6d9f628ba89c36de4b71efa2c602b7f783b`. Every comparison normalizes address case but requires exact address identity.
+
+Before any credential load, perform two complete sequential public sweeps, A and B, with at most 18 GET requests total and no endpoint retry. Each sweep contains exactly one `GET /v1/system/config`, `/v1/auth/eip712-domain`, `/v1/auth/session-key-status?account=...&signer=...`, `/v1/auth/signers?account=...`, `/v1/markets?force_refresh=true&market_ids=1`, `/v1/orderbook?market_id=1`, account-wide `/v1/orders/open?account=...`, `/v1/account/position?account=...&market_id=1`, and `/v1/positions?account=...`.
+
+Both sweeps must independently agree on all of the following or stop before the secret boundary:
+
+- exact host, chain, domain, Authorization and Router identities above, no redirect or maintenance mode;
+- session status exactly `status == 1` and `status_description == "Active"`, plus exactly one matching signer-list row with `status == "Active"`, the accepted registration/expiration identity, and no duplicate;
+- exactly one active and unlocked BTC/USDC market `1` with `step_size == "0.000001"`, `step_price == "0.1"`, and `min_order_size == "0.0001"`;
+- positive tick-aligned `bid < ask`, cumulative bid and ask depth within the fixed 30 bps adverse bound each at least `0.0001`, and exact-minimum adverse-bound notional `<= USD 500`;
+- account-wide open-order result empty, correctly parsed `.data.position.size == "0"` for BTC, and the open-position list empty; `side` and the venue's flat placeholder `market_id` never substitute for the exact size check;
+- no unfinished lifecycle intent, unexplained identity/state, stale observation, malformed envelope, or disagreement between sweeps. All arming evidence must remain within the accepted five-second freshness window.
+
+Only after this governance is centrally accepted and published, both public sweeps pass, and Chief Coordinator separately authorizes the operational private-read gate may the Architect run one short-lived one-shot private proof: exactly one invocation of the existing session-signer loader; no protected main-wallet XLSX access; at most one `GET /v1/auth/nonce?account=...`; one `RegisterV2` signature from the existing session signer using the freshly fetched exact domain; one `auth_v2` frame; and one account-scoped `orders` plus one account-scoped `positions` snapshot. The snapshots must agree with public sweep B on zero active orders and exact flatness. There is no reconnect, auth retry, second nonce, second signature, legacy-auth fallback, order permit, trading bitmap nonce, REST POST, order, cancel, close, or other write.
+
+Current official WebSocket pages conflict: the specific current FE-to-BE implementation documents `wss://api.testnet.rise.trade/ws/`, backend nonce and `auth_v2`, while the generic WebSocket page documents `wss://ws.testnet.rise.trade/ws` and legacy timestamp-based `auth`. The bounded empirical gate pins only the specific `auth_v2` path; it does not infer that the legacy page is obsolete. Connection failure, auth rejection, timeout, different host/schema, subscription error, missing snapshot, or REST/private contradiction closes the socket, unloads the credential, records a redacted `PREFLIGHT_BLOCKED`, and permits no fallback or retry.
+
+The accepted loader's owner-only regular-file, no-follow and exact derived-address checks remain the sole secret boundary. Credential bytes, raw signature, nonce, auth frame, raw private response, and unredacted account/signer/order identity never enter argv, environment, Git, fixtures, ordinary logs, reports, databases, or retained artifacts. Evidence is allowlisted to public contract values, timestamps, counts, match booleans and a redacted verdict. This preflight creates no durable trading intent and cannot claim lifecycle or strategy readiness.
+
+Official sources: [system config](https://developer.rise.trade/reference/apiservice_getsystemconfig), [EIP-712 domain](https://developer.rise.trade/reference/authservice_geteip712domain), [session-key status](https://developer.rise.trade/reference/authservice_getsessionkeystatus), [signer list](https://developer.rise.trade/reference/authservice_listsigners), [markets](https://developer.rise.trade/reference/marketservice_getmarkets), [orderbook](https://developer.rise.trade/reference/getorderbooklevels), [open orders](https://developer.rise.trade/reference/orderservice_getopenorders), [single position](https://developer.rise.trade/reference/accountservice_getposition), [open positions](https://developer.rise.trade/reference/getallpositions), [specific `auth_v2` implementation](https://developer.rise.trade/reference/javascripttypescript), [generic WebSocket contract](https://developer.rise.trade/reference/endpoints), [orders channel](https://developer.rise.trade/reference/orders-channel), and [positions channel](https://developer.rise.trade/reference/positions-channel).
 
 ## Current acceptance and stop gates
 
-- Exact published base `main == origin/main == d5a4b78de599a9e808fd5aba13aa3d60e2925946` passed the Chief's clean Python 3.11 full suite with 498 tests.
-- This candidate records exactly three active bounded lane slices: the RISEx fixture-only lifecycle above and the existing Extended and Nado fixture-only slices below. Each venue's Builder requires its own separate Chief Coordinator gate.
-- This governance candidate authorizes no Builder. After central acceptance/publication, Chief Coordinator must separately authorize the sole RISEx Builder. After fixture implementation acceptance, another separate Chief Coordinator gate is mandatory before any credential access, real signer load, signature, private/live request, nonce consumption, or order/cancel/close POST.
+- Exact published base `main == origin/main == 998b0c3df188f1fe8a90d7091688e2c6ae0f0479` contains the centrally accepted unchanged RISEx fixture chain through `4b323c6d`. Chief acceptance passed 30 focused and 528 full candidate tests; central combined verification passed 90 focused and 588 full tests.
+- This candidate records exactly three active bounded lane slices: the existing RISEx lifecycle with its next private-read preflight gate and the existing Extended and Nado lifecycle slices below. It creates no new product milestone.
+- This governance candidate authorizes no Builder. Any implementation change needed for preflight stops and requires a separate Chief Coordinator Builder gate. Publication alone also authorizes no credential load, auth nonce, real signature, private request, or private WebSocket: Chief Coordinator must separately authorize the exact one-shot operational gate above. A later distinct live-write gate remains mandatory before any trading bitmap nonce, durable trading claim, order/cancel/close POST, or exact-flat operational acceptance.
 - Governance and deterministic work never read credential bytes or wallet cells. The protected signer record and main-wallet XLSX were not accessed during this governance slice.
-- Stop for Chief Coordinator governance review before merge, push, Builder creation, credential access, signing, nonce consumption, durable trading claim, order placement/cancel/close, or any executing/private write.
+- Stop for Chief Coordinator governance review before merge, push, Builder creation, credential access, signing, nonce consumption, private request, WebSocket authentication, durable trading claim, order placement/cancel/close, or any executing/private write.
 
 # EXTENDED-TESTNET-001 — Fail-Closed Bounded Lifecycle Core
 
