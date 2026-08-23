@@ -1,6 +1,6 @@
 # TESTNET-002-RISEX-SIGNER-001 — Session-Signer Prerequisite
 
-Status: `PHASE 0 COMPLETE — FIXTURE-FIRST RED AUTHORIZED; NO LIVE ACTION`.
+Status: `DETERMINISTIC ACCEPT — ONE OPERATIONAL SIGNER REGISTRATION AUTHORIZED; NO ORDERS`.
 
 Start from exact published `main == origin/main == f59f654a6d24434d351f5f4489b2ed641fb2288c` on `codex/testnet-002-risex-signer-001`. TESTNET-001 is accepted and operationally complete: the fixed public RISEx wallet is authoritatively READY with raw test balance `1000`, one deposit POST, and an immutable READY bootstrap marker. A bounded official read found zero registered session signers, so signer onboarding is a mandatory prerequisite to the separately authorized order lifecycle.
 
@@ -35,6 +35,10 @@ Start from exact published `main == origin/main == f59f654a6d24434d351f5f4489b2e
 8. Exact revoke typed data/request construction and account-signature recovery are fixture-tested, but public production surface has no revoke dispatch. It also contains no order/place/cancel/position/trading/mainnet/Nado/Extended method.
 9. Sealed `aiohttp` transport owns DNS/TLS, uses default CA, `trust_env=False`, no redirects, exact final URL, finite timeout, one POST site, and normal cancellation propagation. Builder/CI makes no live call and never touches the real home or XLSX.
 10. Run focused asyncio/subprocess/crash tests, all 411 preservation tests plus new tests, full pytest, compileall, diff, secret, import-isolation, one-register-site, no-trading-surface, and pending-process/task checks.
+
+## Accepted operational boundary
+
+After fast-forward integration, full deterministic gates, push, and proof that `main == origin/main`, the Architect may generate exactly one fixed session signer and invoke registration exactly once for the approved RISEx testnet wallet. The main-wallet secret is loaded only in memory from the protected external XLSX after public identity/status/nonce gates and an exact derived-address match. ACTIVE requires a separate authoritative `check_risex_session_signer`; SPENT_UNKNOWN permits at most five read-only checks over at most 60 seconds and never another POST. The fixed credential and record are never deleted, reset, regenerated, or revoked. Stop after reporting the operational result; no order probe begins in this slice.
 
 ## Workflow boundary
 
