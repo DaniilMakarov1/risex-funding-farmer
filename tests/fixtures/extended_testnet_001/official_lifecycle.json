@@ -270,7 +270,7 @@
     "side": "LONG",
     "leverage": "2",
     "size": "0.001",
-    "value": "40.008",
+    "value": "40.005",
     "openPrice": "40008",
     "markPrice": "40005",
     "liquidationPrice": null,

@@ -1319,7 +1319,6 @@ class ExtendedLifecycle:
             raise LifecycleHalted("POSITION_EVIDENCE_MISMATCH")
         fills = self._validated_fills(intent, history, evidence)
         fill_qty = sum((_decimal(row["qty"], "fill.qty") for row in fills), Decimal(0))
-        fill_value = sum((_decimal(row["value"], "fill.value") for row in fills), Decimal(0))
         weighted_value = sum(
             (
                 _decimal(row["price"], "fill.price")
@@ -1336,12 +1335,14 @@ class ExtendedLifecycle:
             or position_leverage <= 0
             or not fills
             or size != fill_qty
-            or value != fill_value
+            or value != abs(size * mark_price)
             or open_price != weighted_value / fill_qty
             or mark_price != _decimal(evidence.market["marketStats"]["markPrice"], "market.markPrice")
             or position_leverage != _decimal(account_leverage["leverage"], "account.leverage")
         ):
             raise LifecycleHalted("POSITION_EVIDENCE_MISMATCH")
+        if value > MAX_NOTIONAL_USD:
+            raise LifecycleHalted("NOTIONAL_CAP")
 
     def _reconcile_entry(self, intent: Intent, evidence: OfficialEvidence) -> ReconciliationResult:
         if evidence.open_orders:

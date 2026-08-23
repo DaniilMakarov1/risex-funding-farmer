@@ -29,6 +29,22 @@ from risex_farmer.extended_testnet_lifecycle import (
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "extended_testnet_001" / "official_lifecycle.json"
 
+POSITION_ADVERSE_CASES = [
+    ("status", "CLOSED"),
+    ("size", "0"),
+    ("size", "-0.001"),
+    ("size", "0.002"),
+    ("value", "0"),
+    ("value", "-40.005"),
+    ("value", "999999"),
+    ("openPrice", "0"),
+    ("openPrice", "-40008"),
+    ("openPrice", "1"),
+    ("markPrice", "0"),
+    ("markPrice", "-40005"),
+    ("markPrice", "1"),
+]
+
 
 @pytest.fixture
 def wire():
@@ -622,7 +638,7 @@ def test_partial_fill_accounting_halts_subminimum_or_offgrid_residual(
     changed["fill"]["fee"] = str(Decimal(changed["fill"]["value"]) * Decimal("0.00025"))
     changed["filledOrder"]["payedFee"] = changed["fill"]["fee"]
     changed["position"]["size"] = position_qty
-    changed["position"]["value"] = str(Decimal(position_qty) * Decimal("40008"))
+    changed["position"]["value"] = str(Decimal(position_qty) * Decimal("40005"))
     partial = filled_evidence(changed)
     result = lifecycle.reconcile(entry.id, partial)
     assert result.filled_qty == Decimal(fill_qty)
@@ -1274,24 +1290,7 @@ def test_prepared_cancel_terminal_evidence_supersedes_without_dispatch(
         assert result.lifecycle_state == "FLAT_PENDING_EXPIRY"
 
 
-@pytest.mark.parametrize(
-    ("field", "bad_value"),
-    [
-        ("status", "CLOSED"),
-        ("size", "0"),
-        ("size", "-0.001"),
-        ("size", "0.002"),
-        ("value", "0"),
-        ("value", "-40.008"),
-        ("value", "999999"),
-        ("openPrice", "0"),
-        ("openPrice", "-40008"),
-        ("openPrice", "1"),
-        ("markPrice", "0"),
-        ("markPrice", "-40005"),
-        ("markPrice", "1"),
-    ],
-)
+@pytest.mark.parametrize(("field", "bad_value"), POSITION_ADVERSE_CASES)
 def test_entry_position_must_be_exact_open_authoritative_evidence(
     lifecycle, evidence, wire, field, bad_value
 ):
@@ -1314,7 +1313,7 @@ def test_entry_position_must_be_exact_open_authoritative_evidence(
 
 
 @pytest.mark.parametrize("stage", ["PREPARE", "CLAIM"])
-@pytest.mark.parametrize(("field", "bad_value"), [("status", "CLOSED"), ("value", "999999")])
+@pytest.mark.parametrize(("field", "bad_value"), POSITION_ADVERSE_CASES)
 def test_close_prepare_and_claim_revalidate_exact_open_position(
     lifecycle, evidence, wire, stage, field, bad_value
 ):
@@ -1337,6 +1336,26 @@ def test_close_prepare_and_claim_revalidate_exact_open_position(
     else:
         assert restarted.store.get(close.id).state == "PREPARED"
         assert restarted.store.dispatch_count(close.id) == 0
+
+
+def test_position_value_uses_current_mark_and_has_independent_usd_cap(lifecycle, evidence, wire):
+    position = wire["position"]
+    assert Decimal(position["value"]) == abs(
+        Decimal(position["size"]) * Decimal(position["markPrice"])
+    )
+    assert Decimal(position["value"]) != Decimal(wire["fill"]["value"])
+
+    entry = claim_entry(lifecycle, evidence, wire)
+    changed = filled_wire(wire)
+    changed["market"]["marketStats"]["markPrice"] = "600000"
+    for row in (changed["account"]["positions"][0], changed["stream"]["positions"][0]):
+        row["markPrice"] = "600000"
+        row["value"] = "600"
+    excessive = normalize_official_evidence(changed, now_ms=1_770_000_003_000)
+    with pytest.raises(LifecycleHalted, match="NOTIONAL_CAP"):
+        lifecycle.reconcile(entry.id, excessive)
+    assert lifecycle.store.snapshot().lifecycle_state.startswith("HALTED_")
+    assert lifecycle.store.dispatch_count(entry.id) == 1
 
 
 def test_no_dispatch_or_state_mutation_shortcuts_are_exposed(lifecycle):
