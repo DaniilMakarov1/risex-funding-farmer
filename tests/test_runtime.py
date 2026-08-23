@@ -46,7 +46,7 @@ from risex_farmer.notifications import (
 )
 from risex_farmer.runtime import PublicPaperRuntime, public_paper_run, public_scan_once
 from risex_farmer.orchestrator import run_fixture
-from risex_farmer.scanner import MarketObservation
+from risex_farmer.scanner import MarketObservation, ScanSnapshot
 from risex_farmer.storage import PaperRepository
 
 
@@ -3428,6 +3428,256 @@ async def test_extended_health_is_per_socket_and_stale_restart_has_one_episode(
         "restart_reason",
     } <= set(stale_detail)
     assert stale_detail["restart_reason"] == "CONFIRMATION_STALE"
+
+
+@pytest.mark.asyncio
+async def test_extended_watchdog_rotation_does_not_block_due_full_tick(
+    tmp_path,
+):
+    clock = FakeClock()
+    target = NOW + timedelta(minutes=5)
+    fakes = adapters(clock, settlement_at=target)
+    extended = GatedExtendedAdapter(clock, settlement_at=target)
+    fakes[Venue.EXTENDED] = extended
+    symbol = extended.market.venue_symbol
+    key = (Venue.EXTENDED, symbol, "book")
+
+    with PaperRepository(tmp_path / "extended-watchdog-prompt-rotation.db") as repository:
+        runtime = PublicPaperRuntime(repository, adapters=fakes, clock=clock)
+        await runtime.scan()
+        assert isinstance(runtime.last_scan, ScanSnapshot)
+        runtime._session = SimpleNamespace(closed=True)
+        runtime._stop_event = asyncio.Event()
+        old_session = runtime._new_stream_session(key)
+        cancel_acknowledged = asyncio.Event()
+        release_retirement = asyncio.Event()
+        old_mutation_attempted = asyncio.Event()
+
+        async def delayed_old_stream():
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancel_acknowledged.set()
+                await release_retirement.wait()
+                runtime._confirm_extended_stream(
+                    symbol, "book", clock.now(), data_ready=True,
+                    stream_session_id=old_session,
+                )
+                stale_book = replace(
+                    runtime.observations[Venue.EXTENDED, symbol].book,
+                    bids=(BookLevel(D("70"), D("20")),),
+                    asks=(BookLevel(D("71"), D("20")),),
+                    observed_at=clock.now(), sequence=777,
+                )
+                await runtime.apply_book_event(
+                    stale_book, stream_session_id=old_session
+                )
+                runtime._socket_disconnected(
+                    (Venue.EXTENDED, "book", (symbol,)),
+                    at=clock.now(), stream_session_id=old_session,
+                )
+                await runtime.mark_disconnected(
+                    Venue.EXTENDED, symbol, at=clock.now(), stream_kind="book",
+                    exception=RuntimeError("obsolete transport mutation"),
+                    stream_session_id=old_session,
+                )
+                if runtime._owns_stream_session(key, old_session):
+                    runtime._watchdog_restarted(
+                        (Venue.EXTENDED, "book", (symbol,)), at=clock.now()
+                    )
+                old_mutation_attempted.set()
+
+        old_task = asyncio.create_task(delayed_old_stream())
+        runtime._stream_tasks[key] = old_task
+        successor_sessions = []
+
+        async def replacement_stream(_adapter, market, kind, session_id):
+            if (market, kind) == (symbol, "book"):
+                successor_sessions.append(session_id)
+            runtime._confirm_extended_stream(
+                market, kind, clock.now(), data_ready=True,
+                stream_session_id=session_id,
+            )
+            runtime._watchdog_restarted(
+                (Venue.EXTENDED, kind, (market,)), at=clock.now()
+            )
+            await runtime._stop_event.wait()
+
+        runtime._extended_stream = replacement_stream
+        runtime._extended_confirmed_at[symbol, "book"] = (
+            NOW - timedelta(seconds=26)
+        )
+        runtime.next_health_check_at = NOW
+        runtime.next_full_scan_at = NOW
+
+        original_mark_disconnected = runtime.mark_disconnected
+        health_arrivals = 0
+        all_health_checks_arrived = asyncio.Event()
+
+        async def synchronized_mark_disconnected(*args, **kwargs):
+            nonlocal health_arrivals
+            health_arrivals += 1
+            if health_arrivals == 3:
+                all_health_checks_arrived.set()
+            await all_health_checks_arrived.wait()
+            await original_mark_disconnected(*args, **kwargs)
+
+        runtime.mark_disconnected = synchronized_mark_disconnected
+        tick = asyncio.create_task(runtime.tick(NOW))
+        repeated_checks = [
+            asyncio.create_task(runtime._check_extended_health(NOW))
+            for _ in range(2)
+        ]
+        await cancel_acknowledged.wait()
+        prompt_tasks, _ = await asyncio.wait(
+            {tick, *repeated_checks}, timeout=0.05
+        )
+        await asyncio.sleep(0)
+        successor_before_retirement = runtime._stream_tasks.get(key)
+        session_before_retirement = runtime._stream_sessions.get(key)
+        successors_before_retirement = len(successor_sessions)
+        deadline_before_retirement = repository.connection.execute(
+            "SELECT COUNT(*) FROM runtime_evidence "
+            "WHERE event_type='PUBLIC_SCAN_DEADLINE'"
+        ).fetchone()[0]
+        observable_before_retirement = (
+            dict(runtime.component_readiness[Venue.EXTENDED]),
+            runtime.readiness[Venue.EXTENDED],
+            runtime.coordinator.stream(Venue.EXTENDED, symbol).book(),
+            runtime.observations[Venue.EXTENDED, symbol],
+            dict(runtime._extended_confirmed_at),
+            tuple(repository.connection.execute(
+                "SELECT event_type,detail FROM runtime_evidence ORDER BY evidence_id"
+            ).fetchall()),
+        )
+
+        release_retirement.set()
+        await asyncio.gather(tick, *repeated_checks)
+        await old_mutation_attempted.wait()
+        await asyncio.sleep(0)
+        observable_after_retirement = (
+            dict(runtime.component_readiness[Venue.EXTENDED]),
+            runtime.readiness[Venue.EXTENDED],
+            runtime.coordinator.stream(Venue.EXTENDED, symbol).book(),
+            runtime.observations[Venue.EXTENDED, symbol],
+            dict(runtime._extended_confirmed_at),
+            tuple(repository.connection.execute(
+                "SELECT event_type,detail FROM runtime_evidence ORDER BY evidence_id"
+            ).fetchall()),
+        )
+        successor_was_running = bool(
+            successor_before_retirement is not None
+            and not successor_before_retirement.done()
+        )
+        old_retirement = (
+            old_task.done(), old_task.cancelled(), old_task.exception()
+        )
+        old_owned_after_retirement = old_task in runtime._stream_tasks.values()
+        refresh_was_started = runtime._refresh_task is not None
+        await runtime._refresh_task
+        await runtime.tick(NOW)
+        post_gate_scan = runtime.last_scan
+        pending_full_scan_at = runtime._pending_full_scan_at
+        full_scans = repository.connection.execute(
+            "SELECT COUNT(*) FROM runtime_evidence "
+            "WHERE event_type='PUBLIC_SCAN' AND detail LIKE '%\"scan_kind\":\"FULL\"%'"
+        ).fetchone()[0]
+        socket_rows = repository.connection.execute(
+            "SELECT COUNT(*) FROM runtime_evidence "
+            "WHERE event_type LIKE 'PUBLIC_SOCKET_%'"
+        ).fetchone()[0]
+        runtime._request_stop("STOP_EVENT")
+        await runtime.shutdown()
+
+    assert prompt_tasks == {tick, *repeated_checks}, {
+        "completed_before_release": len(prompt_tasks),
+        "deadline_before_release": deadline_before_retirement,
+        "successors_before_old_retirement": successors_before_retirement,
+        "successors_total": len(successor_sessions),
+        "post_gate_full_scan_valid": (
+            isinstance(post_gate_scan, ScanSnapshot)
+            and post_gate_scan.logical_at == NOW
+            and pending_full_scan_at is None
+            and full_scans == 1
+        ),
+    }
+    assert successor_before_retirement is not None
+    assert successor_before_retirement is not old_task
+    assert successor_was_running
+    assert session_before_retirement != old_session
+    assert successors_before_retirement == 1
+    assert len(successor_sessions) == 1
+    assert deadline_before_retirement == 1
+    assert observable_after_retirement == observable_before_retirement
+    assert old_retirement == (True, False, None)
+    assert not old_owned_after_retirement
+    assert refresh_was_started
+    assert isinstance(post_gate_scan, ScanSnapshot)
+    assert post_gate_scan.logical_at == NOW
+    assert pending_full_scan_at is None
+    assert full_scans == 1
+    assert socket_rows == 0
+
+
+@pytest.mark.asyncio
+async def test_extended_watchdog_delayed_retirement_exception_is_fatal(tmp_path):
+    clock = FakeClock()
+    symbol = "ABC-EXTENDED"
+    key = (Venue.EXTENDED, symbol, "book")
+    adapter = ExtendedAdapter(None)
+    with PaperRepository(tmp_path / "extended-watchdog-retirement-error.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={Venue.EXTENDED: adapter}, clock=clock,
+        )
+        runtime._session = SimpleNamespace(closed=True)
+        runtime._stop_event = asyncio.Event()
+        runtime._new_stream_session(key)
+        cancel_acknowledged = asyncio.Event()
+        release_retirement = asyncio.Event()
+
+        async def failing_old_stream():
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancel_acknowledged.set()
+                await release_retirement.wait()
+                raise RuntimeError("synthetic delayed retirement failure")
+
+        old_task = asyncio.create_task(failing_old_stream())
+        runtime._stream_tasks[key] = old_task
+
+        async def replacement_stream(_adapter, _symbol, _kind, _session_id):
+            await runtime._stop_event.wait()
+
+        runtime._extended_stream = replacement_stream
+        restart = asyncio.create_task(
+            runtime._restart_extended_stream(symbol, "book")
+        )
+        await cancel_acknowledged.wait()
+        prompt, _ = await asyncio.wait({restart}, timeout=0.05)
+        release_retirement.set()
+        await restart
+        await asyncio.sleep(0)
+        stop_cause = runtime._stop_cause
+        fatal = repository.connection.execute(
+            "SELECT detail FROM runtime_evidence WHERE event_type='RUNTIME_FATAL'"
+        ).fetchall()
+        old_done = old_task.done()
+        old_exception = old_task.exception()
+        await runtime.shutdown()
+
+    assert prompt == {restart}, {
+        "completed_before_release": len(prompt),
+        "post_gate_old_done": old_done,
+        "post_gate_stop_cause": stop_cause,
+        "post_gate_fatal_rows": len(fatal),
+    }
+    assert stop_cause == "RUNTIME_FATAL"
+    assert [json.loads(row["detail"])["exception_class"] for row in fatal] == [
+        "RuntimeError"
+    ]
+    assert old_done
+    assert isinstance(old_exception, RuntimeError)
 
 
 @pytest.mark.asyncio
