@@ -15,7 +15,10 @@ NOW = 1_800_000_000
 ROUTER = "0x" + "22" * 20
 AUTHORIZATION = "0x" + "33" * 20
 ACCOUNT = "0x" + "44" * 20
-SIGNER = SyntheticSigner()
+SIGNER_ADDRESS = "0x" + "55" * 20
+OTHER_ACCOUNT = "0x" + "66" * 20
+OTHER_SIGNER = "0x" + "77" * 20
+SIGNER = SyntheticSigner(SIGNER_ADDRESS)
 EXPECTED_ORDER_DATA = 1_180_591_648_218_017_079_298
 EXPECTED_ACTION_HASH = "5bd95300cc7edbc329d8cf8b3552c4a891920c4f51c3a6bbba960650142b71c1"
 EXPECTED_ABI = (
@@ -42,7 +45,8 @@ def market(**changes):
 
 def account(**changes):
     value = AccountState(
-        signer_status="ACTIVE", position=Decimal("0"), open_order_ids=(),
+        account=ACCOUNT, signer=SIGNER_ADDRESS, signer_status="ACTIVE",
+        position=Decimal("0"), open_order_ids=(),
         repeated_open_order_ids=(), repeated_position=Decimal("0"),
         unexplained=False, observed_at=NOW,
     )
@@ -63,6 +67,7 @@ def lifecycle(tmp_path):
     store = DurableIntentStore(tmp_path / "fixture.sqlite3")
     instance = Lifecycle(
         store, now=lambda: NOW, router=ROUTER, authorization=AUTHORIZATION,
+        expected_account=ACCOUNT, expected_signer=SIGNER_ADDRESS,
     )
     yield instance
     instance.store.close()
@@ -70,6 +75,14 @@ def lifecycle(tmp_path):
 
 def ready(lifecycle):
     return lifecycle.preflight(market(), account(), bbo())
+
+
+def new_lifecycle(path, now=NOW):
+    store = DurableIntentStore(path)
+    return Lifecycle(
+        store, now=lambda: now, router=ROUTER, authorization=AUTHORIZATION,
+        expected_account=ACCOUNT, expected_signer=SIGNER_ADDRESS,
+    )
 
 
 def open_intent(lifecycle, *, client_id=101, anchor=7, bitmap=3, expires=NOW + 30):
@@ -80,8 +93,9 @@ def exact_evidence(order_id, client_id, *, filled="0", position="0",
                    observed=NOW + 1, open_ids=(), terminal=True):
     has_fill = Decimal(filled) > 0
     return Evidence(
-        order_id, client_id, terminal, Decimal(filled), Decimal(position),
-        tuple(open_ids), observed, order_id, (order_id,),
+        ACCOUNT, SIGNER_ADDRESS, "ACTIVE", order_id, client_id, terminal,
+        Decimal(filled), Decimal(position), tuple(open_ids), observed,
+        order_id, (order_id,), (client_id,),
         (order_id,) if has_fill else (), (client_id,) if has_fill else (),
     )
 
@@ -120,6 +134,8 @@ def test_preflight_blocks_before_signer_or_post(lifecycle):
         (market(observed_at=NOW - 6), account(), bbo()),
         (market(tick=Decimal("0.3")), account(), bbo()),
         (market(), account(signer_status="INACTIVE"), bbo()),
+        (market(), account(account=OTHER_ACCOUNT), bbo()),
+        (market(), account(signer=OTHER_SIGNER), bbo()),
         (market(), account(repeated_position=Decimal("0.0001")), bbo()),
         (market(), account(), bbo(ask_depth=Decimal("0.000099"))),
         (market(), account(), bbo(bid_depth=Decimal("0.000099"))),
@@ -158,7 +174,10 @@ def test_ambiguous_open_is_never_replayed(lifecycle, tmp_path):
     assert lifecycle.store.get(intent.intent_id).state == "AMBIGUOUS"
     with pytest.raises(LifecycleSafetyError):
         lifecycle.dispatch(intent, SIGNER, lambda _: "replay")
-    no_identity = Evidence(None, 101, True, Decimal("0"), Decimal("0"), (), NOW + 1)
+    no_identity = Evidence(
+        ACCOUNT, SIGNER_ADDRESS, "ACTIVE", None, 101, True,
+        Decimal("0"), Decimal("0"), (), NOW + 1,
+    )
     lifecycle._now = lambda: NOW + 1
     with pytest.raises(LifecycleSafetyError):
         lifecycle.reconcile(intent.intent_id, no_identity)
@@ -169,6 +188,7 @@ def test_ambiguous_open_is_never_replayed(lifecycle, tmp_path):
     store = DurableIntentStore(tmp_path / "delayed.sqlite3")
     delayed = Lifecycle(
         store, now=lambda: NOW, router=ROUTER, authorization=AUTHORIZATION,
+        expected_account=ACCOUNT, expected_signer=SIGNER_ADDRESS,
     )
     delayed_intent = open_intent(delayed)
     delayed.dispatch(
@@ -184,7 +204,7 @@ def test_ambiguous_open_is_never_replayed(lifecycle, tmp_path):
 
 def test_open_is_exact_minimum_price_bounded_market_fok(lifecycle):
     intent = open_intent(lifecycle)
-    request = lifecycle.unsigned_request(intent.intent_id, market=market(), account=ACCOUNT)
+    request = lifecycle.unsigned_request(intent.intent_id, market=market())
     assert intent.size == Decimal("0.0001") and intent.price == Decimal("78217.0")
     assert (intent.size_steps, intent.price_ticks) == (100, 782170)
     assert request["header_flags"] == HEADER_FLAGS == 0x05
@@ -201,6 +221,19 @@ def test_open_is_exact_minimum_price_bounded_market_fok(lifecycle):
         "hash": "0x" + EXPECTED_ACTION_HASH, "nonceAnchor": 7,
         "nonceBitmap": 3, "deadline": NOW + 30,
     }
+    assert request["dispatchable"] is False and request["signature"] is None
+    assert request["body"] == {
+        "market_id": 1, "size_steps": 100, "price_ticks": 782170,
+        "side": 0, "order_type": 0, "time_in_force": 2,
+        "post_only": False, "reduce_only": False, "stp_mode": 0,
+        "client_order_id": 101, "account": ACCOUNT.lower(),
+        "signer": SIGNER_ADDRESS.lower(), "nonce_anchor": "7",
+        "nonce_bitmap_index": 3, "deadline": NOW + 30,
+    }
+    with pytest.raises(TypeError):
+        lifecycle.unsigned_request(
+            intent.intent_id, market=market(), account=OTHER_ACCOUNT,
+        )
 
 
 def test_fok_no_fill_finishes_flat_without_close_acceptance(lifecycle):
@@ -211,7 +244,7 @@ def test_fok_no_fill_finishes_flat_without_close_acceptance(lifecycle):
     assert result == Outcome.COMPLETED_NO_FILL_FLAT and lifecycle.close_count == 0
 
 
-def test_first_close_uses_exact_authoritative_size_market_fok(lifecycle):
+def test_first_close_uses_exact_authoritative_size_market_fok(lifecycle, tmp_path):
     seed_filled(lifecycle)
     path = lifecycle.store.path
     lifecycle.store.close()
@@ -219,6 +252,7 @@ def test_first_close_uses_exact_authoritative_size_market_fok(lifecycle):
     recovered = Lifecycle(
         lifecycle.store, now=lambda: NOW + 1, router=ROUTER,
         authorization=AUTHORIZATION,
+        expected_account=ACCOUNT, expected_signer=SIGNER_ADDRESS,
     )
     assert recovered.observed_opening_fill
     intent = prepare_close(recovered)
@@ -226,6 +260,19 @@ def test_first_close_uses_exact_authoritative_size_market_fok(lifecycle):
         "SELL", Decimal("0.0001"), "MARKET", "FOK",
     )
     assert intent.reduce_only and intent.source_position == Decimal("0.0001")
+    bad = new_lifecycle(tmp_path / "bad-close-identity.sqlite3")
+    seed_filled(bad)
+    with pytest.raises(LifecycleSafetyError):
+        bad.prepare_close(
+            market(observed_at=NOW + 1),
+            account(
+                account=OTHER_ACCOUNT, position=Decimal("0.0001"),
+                repeated_position=Decimal("0.0001"), observed_at=NOW + 1,
+            ),
+            bbo(observed_at=NOW + 1), 201, 8, 4, NOW + 40,
+        )
+    assert bad.store.load_outcome() == Outcome.FAILED_HALTED_MANUAL_RECOVERY
+    bad.store.close()
 
 
 def test_close_fallbacks_use_fresh_state_limit_ioc_and_stop_at_three(lifecycle):
@@ -283,41 +330,68 @@ def test_non_step_residual_halts_without_another_dispatch(lifecycle):
     assert lifecycle.outcome == Outcome.FAILED_HALTED_MANUAL_RECOVERY
 
 
-def test_permit_expiry_prevents_delayed_ambiguous_replay(lifecycle):
+def test_permit_expiry_prevents_delayed_ambiguous_replay(lifecycle, tmp_path):
     intent = open_intent(lifecycle, expires=NOW + 1)
     lifecycle._now = lambda: NOW + 2
     with pytest.raises(LifecycleSafetyError):
         lifecycle.dispatch(intent, SIGNER, lambda _: "late")
     assert lifecycle.store.get(intent.intent_id).dispatch_count == 0
+    boundary = new_lifecycle(tmp_path / "deadline-60.sqlite3")
+    assert open_intent(boundary, expires=NOW + 60).expires_at == NOW + 60
+    boundary.store.close()
+    for index, deadline in enumerate((NOW + 61, 2**32 + 5)):
+        rejected = new_lifecycle(tmp_path / f"deadline-reject-{index}.sqlite3")
+        with pytest.raises(LifecycleSafetyError):
+            open_intent(rejected, expires=deadline)
+        assert rejected.store.all() == []
+        rejected.store.close()
 
 
 def test_known_open_order_is_cancelled_once_by_exact_id(lifecycle):
     intent = open_intent(lifecycle)
-    dispatch(lifecycle, intent, "opening-order")
+    lifecycle.dispatch(
+        intent, SIGNER, lambda _: (_ for _ in ()).throw(TimeoutError()),
+    )
+    assert lifecycle.store.get(intent.intent_id).order_id is None
+    lifecycle._now = lambda: NOW + 1
+    open_known = exact_evidence(
+        "opening-order", 101, open_ids=("opening-order",), terminal=False,
+    )
+    assert lifecycle.reconcile(intent.intent_id, open_known) == Outcome.ACTIVE
+    assert lifecycle.store.get(intent.intent_id).state == "OPEN_KNOWN"
     calls = []
     lifecycle.cancel_known("opening-order", lambda value: calls.append(value))
     assert lifecycle.store.cancel_states() == ["PENDING_RECONCILIATION"]
     with pytest.raises(LifecycleSafetyError):
         lifecycle.cancel_known("opening-order", lambda value: calls.append(value))
-    lifecycle._now = lambda: NOW + 1
     assert lifecycle.reconcile_cancel("opening-order", account(observed_at=NOW + 1))
+    assert lifecycle.reconcile(
+        intent.intent_id, exact_evidence("opening-order", 101),
+    ) == Outcome.COMPLETED_NO_FILL_FLAT
     assert calls == ["opening-order"]
 
 
 def test_ambiguous_cancel_is_never_replayed(lifecycle):
     seed_filled(lifecycle)
-    lifecycle.cancel_known(
-        "opening-order", lambda _: (_ for _ in ()).throw(TimeoutError()),
-    )
-    with pytest.raises(LifecycleSafetyError):
-        lifecycle.cancel_known("opening-order", lambda _: None)
-    assert lifecycle.store.cancel_states() == ["AMBIGUOUS"]
     closing = prepare_close(lifecycle)
     dispatch(lifecycle, closing, "close-1")
-    lifecycle.reconcile(closing.intent_id, exact_evidence(
-        "close-1", 201, filled="0.0001", position="0",
-    ))
-    assert lifecycle.finalize(account(observed_at=NOW + 1)) == Outcome.FAILED_HALTED_MANUAL_RECOVERY
+    assert lifecycle.reconcile(
+        closing.intent_id,
+        exact_evidence(
+            "close-1", 201, position="0.0001", open_ids=("close-1",),
+            terminal=False,
+        ),
+    ) == Outcome.ACTIVE
+    lifecycle.cancel_known(
+        "close-1", lambda _: (_ for _ in ()).throw(TimeoutError()),
+    )
+    with pytest.raises(LifecycleSafetyError):
+        lifecycle.cancel_known("close-1", lambda _: None)
+    assert lifecycle.store.cancel_states() == ["AMBIGUOUS"]
+    assert lifecycle.finalize(
+        account(position=Decimal("0.0001"), repeated_position=Decimal("0.0001"),
+                observed_at=NOW + 1),
+    ) == Outcome.FAILED_HALTED_MANUAL_RECOVERY
 
 
 def test_unrelated_order_or_position_drift_halts_without_mutation(lifecycle, tmp_path):
@@ -326,6 +400,14 @@ def test_unrelated_order_or_position_drift_halts_without_mutation(lifecycle, tmp
         {"history_order_ids": ("opening-order", "other-order")},
         {"trade_order_ids": ("other-order",)},
         {"trade_client_order_ids": (999,)},
+        {"history_client_order_ids": (999,)},
+        {"filled_size": Decimal("0"), "position": Decimal("0"),
+         "trade_order_ids": ("opening-order",),
+         "trade_client_order_ids": (101,)},
+        {"open_order_ids": ("opening-order", "unrelated-order"),
+         "terminal": False, "filled_size": Decimal("0"),
+         "position": Decimal("0"), "trade_order_ids": (),
+         "trade_client_order_ids": ()},
         {"open_order_ids": ("unrelated-order",)},
         {"position": Decimal("-0.0001")},
     ]
@@ -333,6 +415,7 @@ def test_unrelated_order_or_position_drift_halts_without_mutation(lifecycle, tmp
         store = DurableIntentStore(tmp_path / f"contradiction-{index}.sqlite3")
         candidate = Lifecycle(
             store, now=lambda: NOW, router=ROUTER, authorization=AUTHORIZATION,
+            expected_account=ACCOUNT, expected_signer=SIGNER_ADDRESS,
         )
         intent = open_intent(candidate)
         dispatch(candidate, intent, "opening-order")
@@ -364,6 +447,7 @@ def test_disconnect_persists_failed_manual_recovery_and_stops_writes(lifecycle):
     restarted = Lifecycle(
         lifecycle.store, now=lambda: NOW + 2, router=ROUTER,
         authorization=AUTHORIZATION,
+        expected_account=ACCOUNT, expected_signer=SIGNER_ADDRESS,
     )
     assert restarted.outcome == Outcome.FAILED_HALTED_MANUAL_RECOVERY
     with pytest.raises(LifecycleSafetyError):
@@ -386,6 +470,7 @@ def test_success_requires_observed_fill_zero_orders_and_exact_flat(lifecycle, tm
     store = DurableIntentStore(tmp_path / "success.sqlite3")
     good = Lifecycle(
         store, now=lambda: NOW, router=ROUTER, authorization=AUTHORIZATION,
+        expected_account=ACCOUNT, expected_signer=SIGNER_ADDRESS,
     )
     seed_filled(good)
     close = prepare_close(good)
@@ -396,8 +481,21 @@ def test_success_requires_observed_fill_zero_orders_and_exact_flat(lifecycle, tm
     assert good.finalize(account(observed_at=NOW + 1)) == Outcome.SUCCESS_CLOSED_FLAT
     store.close()
 
+    bad = new_lifecycle(tmp_path / "bad-final-identity.sqlite3")
+    seed_filled(bad)
+    bad_close = prepare_close(bad)
+    dispatch(bad, bad_close, "close-1")
+    bad.reconcile(bad_close.intent_id, exact_evidence(
+        "close-1", 201, filled="0.0001", position="0",
+    ))
+    assert bad.finalize(
+        account(signer=OTHER_SIGNER, observed_at=NOW + 1),
+    ) == Outcome.FAILED_HALTED_MANUAL_RECOVERY
+    assert bad.store.load_outcome() == Outcome.FAILED_HALTED_MANUAL_RECOVERY
+    bad.store.close()
 
-def test_minimum_size_and_usd_cap_are_invariants(lifecycle):
+
+def test_minimum_size_and_usd_cap_are_invariants(lifecycle, tmp_path):
     assert ready(lifecycle).size == market().minimum
     with pytest.raises(LifecycleSafetyError):
         lifecycle.preflight(
@@ -422,6 +520,15 @@ def test_minimum_size_and_usd_cap_are_invariants(lifecycle):
     ))
     with pytest.raises(LifecycleSafetyError):
         prepare_close(lifecycle, client_id=202, anchor=7, bitmap=3)
+    maximum = new_lifecycle(tmp_path / "uint64-max.sqlite3")
+    max_intent = open_intent(maximum, client_id=2**64 - 1)
+    assert maximum.store.get(max_intent.intent_id).client_order_id == 2**64 - 1
+    maximum.store.close()
+    overflow = new_lifecycle(tmp_path / "uint64-overflow.sqlite3")
+    with pytest.raises(LifecycleSafetyError):
+        open_intent(overflow, client_id=2**64)
+    assert overflow.store.all() == []
+    overflow.store.close()
 
 
 def test_secrets_signatures_payloads_and_identities_are_redacted(lifecycle):
@@ -452,6 +559,16 @@ def test_prepared_intent_has_no_terminal_bypass(lifecycle):
     with pytest.raises(LifecycleSafetyError):
         lifecycle.dispatch(intent, object(), lambda _: "must-not-dispatch")
     assert lifecycle.store.get(intent.intent_id).dispatch_count == 0
+    with pytest.raises(LifecycleSafetyError):
+        lifecycle.dispatch(
+            intent, SyntheticSigner(OTHER_SIGNER), lambda _: "must-not-dispatch",
+        )
+    with pytest.raises(LifecycleSafetyError):
+        Lifecycle(
+            lifecycle.store, now=lambda: NOW, router=ROUTER,
+            authorization=AUTHORIZATION, expected_account=OTHER_ACCOUNT,
+            expected_signer=SIGNER_ADDRESS,
+        )
     lifecycle._now = lambda: NOW + 1
     assert lifecycle.finalize(account(observed_at=NOW + 1)) == Outcome.FAILED_HALTED_MANUAL_RECOVERY
     assert lifecycle.store.get(intent.intent_id).dispatch_count == 0
@@ -469,5 +586,8 @@ def test_dispatching_crash_reconciles_without_replay(lifecycle):
     with pytest.raises(LifecycleSafetyError):
         lifecycle.dispatch(intent, SIGNER, lambda _: "replay")
     lifecycle._now = lambda: NOW + 31
-    no_identity = Evidence(None, 101, True, Decimal("0"), Decimal("0"), (), NOW + 31)
+    no_identity = Evidence(
+        ACCOUNT, SIGNER_ADDRESS, "ACTIVE", None, 101, True,
+        Decimal("0"), Decimal("0"), (), NOW + 31,
+    )
     assert lifecycle.reconcile(intent.intent_id, no_identity) == Outcome.COMPLETED_NO_FILL_FLAT

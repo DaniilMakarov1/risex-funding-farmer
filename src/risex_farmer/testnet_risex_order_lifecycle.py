@@ -25,6 +25,7 @@ OFFICIAL_DOMAIN_VERSION = "1"
 MAX_NOTIONAL_USD = Decimal("500")
 BOUND_BPS = Decimal("30")
 MAX_AGE_SECONDS = 5
+MAX_PERMIT_SECONDS = 60
 HEADER_FLAGS = 0x05
 PLACE_ACTION = "RISE_PERPS_PLACE_ORDER_V1"
 VERIFY_WITNESS_TYPE = (
@@ -64,6 +65,8 @@ class MarketState:
 
 @dataclass(frozen=True)
 class AccountState:
+    account: str
+    signer: str
     signer_status: str
     position: Decimal
     open_order_ids: tuple[str, ...]
@@ -121,11 +124,15 @@ class Intent:
 
 @dataclass(frozen=True)
 class SyntheticSigner:
+    signer: str
     fixture_only: bool = True
 
 
 @dataclass(frozen=True)
 class Evidence:
+    account: str
+    signer: str
+    signer_status: str
     order_id: str | None
     client_order_id: int
     terminal: bool
@@ -135,16 +142,9 @@ class Evidence:
     observed_at: int
     by_id_order_id: str | None = None
     history_order_ids: tuple[str, ...] = ()
+    history_client_order_ids: tuple[int, ...] = ()
     trade_order_ids: tuple[str, ...] = ()
     trade_client_order_ids: tuple[int, ...] = ()
-
-    @classmethod
-    def terminal_flat(cls, order_id: str, client_order_id: int, observed_at: int) -> "Evidence":
-        return cls(
-            order_id, client_order_id, True, Decimal("0"), Decimal("0"), (),
-            observed_at, order_id, (order_id,), (), (),
-        )
-
 
 def _keccak(value: bytes) -> bytes:
     try:
@@ -278,7 +278,7 @@ CREATE TABLE IF NOT EXISTS intents (
     intent_id TEXT PRIMARY KEY,
     ordinal INTEGER NOT NULL,
     kind TEXT NOT NULL,
-    client_order_id INTEGER NOT NULL UNIQUE,
+    client_order_id TEXT NOT NULL UNIQUE,
     nonce INTEGER NOT NULL,
     nonce_bitmap INTEGER NOT NULL,
     payload_digest TEXT NOT NULL UNIQUE,
@@ -333,7 +333,7 @@ class DurableIntentStore:
                     "INSERT INTO intents VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         intent.intent_id, intent.ordinal, intent.kind,
-                        intent.client_order_id, intent.nonce, intent.nonce_bitmap,
+                        str(intent.client_order_id), intent.nonce, intent.nonce_bitmap,
                         intent.payload_digest, intent.bbo_digest, intent.state,
                         intent.side, intent.order_type,
                         intent.time_in_force, int(intent.reduce_only),
@@ -380,10 +380,23 @@ class DurableIntentStore:
                 (order_id, intent_id),
             )
 
+    def _record_open_known(self, intent_id: str, order_id: str) -> None:
+        with self.connection:
+            self.connection.execute(
+                "UPDATE intents SET state='OPEN_KNOWN', order_id=? WHERE intent_id=?",
+                (order_id, intent_id),
+            )
+
     def known_order(self, order_id: str) -> bool:
         return self.connection.execute(
             "SELECT 1 FROM intents WHERE order_id=?", (order_id,)
         ).fetchone() is not None
+
+    def order_state(self, order_id: str) -> str | None:
+        row = self.connection.execute(
+            "SELECT state FROM intents WHERE order_id=?", (order_id,)
+        ).fetchone()
+        return None if row is None else str(row[0])
 
     def _reserve_cancel(self, order_id: str) -> None:
         try:
@@ -430,6 +443,20 @@ class DurableIntentStore:
             "SELECT 1 FROM terminal WHERE key='opening_fill'"
         ).fetchone() is not None
 
+    def _bind_identities(self, account: str, signer: str) -> None:
+        with self.connection:
+            rows = dict(self.connection.execute(
+                "SELECT key, value FROM terminal WHERE key IN ('account', 'signer')"
+            ))
+            if rows and rows != {"account": account, "signer": signer}:
+                raise LifecycleSafetyError("RISEx lifecycle identity rejected")
+            self.connection.execute(
+                "INSERT OR IGNORE INTO terminal VALUES ('account', ?)", (account,)
+            )
+            self.connection.execute(
+                "INSERT OR IGNORE INTO terminal VALUES ('signer', ?)", (signer,)
+            )
+
     def redacted_evidence(self) -> dict[str, Any]:
         rows = self.all()
         return {
@@ -441,7 +468,7 @@ class DurableIntentStore:
 
 def _intent(row: tuple[Any, ...]) -> Intent:
     return Intent(
-        intent_id=row[0], ordinal=row[1], kind=row[2], client_order_id=row[3],
+        intent_id=row[0], ordinal=row[1], kind=row[2], client_order_id=int(row[3]),
         nonce=row[4], nonce_bitmap=row[5], payload_digest=row[6],
         bbo_digest=row[7], state=row[8], side=row[9], order_type=row[10],
         time_in_force=row[11], reduce_only=bool(row[12]), post_only=bool(row[13]),
@@ -470,12 +497,15 @@ def _evidence_digest(fields: dict[str, Any]) -> str:
 class Lifecycle:
     def __init__(
         self, store: DurableIntentStore, *, now: Callable[[], int], router: str,
-        authorization: str,
+        authorization: str, expected_account: str, expected_signer: str,
     ) -> None:
         self.store = store
         self._now = now
         self._router = _address(router).lower()
         self._authorization = _address(authorization).lower()
+        self._expected_account = _address(expected_account).lower()
+        self._expected_signer = _address(expected_signer).lower()
+        store._bind_identities(self._expected_account, self._expected_signer)
         self.outcome = store.load_outcome()
         self.observed_opening_fill = store.opening_fill_observed()
         self._halted = self.outcome != Outcome.ACTIVE
@@ -493,6 +523,26 @@ class Lifecycle:
 
     def _fresh(self, observed_at: int) -> bool:
         return 0 <= self._now() - observed_at <= MAX_AGE_SECONDS
+
+    def _account_valid(self, value: AccountState) -> bool:
+        try:
+            account = _address(value.account).lower()
+            signer = _address(value.signer).lower()
+        except LifecycleSafetyError:
+            return False
+        return not (
+            account != self._expected_account
+            or signer != self._expected_signer
+            or value.signer_status != "ACTIVE"
+            or not self._fresh(value.observed_at)
+            or value.position != value.repeated_position
+            or value.open_order_ids != value.repeated_open_order_ids
+            or value.unexplained
+        )
+
+    def _validate_account(self, value: AccountState) -> None:
+        if not self._account_valid(value):
+            self._reject(halt=bool(self.store.all()))
 
     def _validate_market(self, value: MarketState) -> None:
         router = _address(value.router).lower()
@@ -529,12 +579,8 @@ class Lifecycle:
         if self._halted or self.store.all():
             self._reject()
         self._validate_market(market)
-        if (
-            account.signer_status != "ACTIVE" or account.position != 0
-            or account.repeated_position != account.position
-            or account.open_order_ids or account.repeated_open_order_ids
-            or account.unexplained or not self._fresh(account.observed_at)
-        ):
+        self._validate_account(account)
+        if account.position != 0 or account.open_order_ids:
             self._reject()
         if bbo.bid_depth < market.minimum or bbo.ask_depth < market.minimum:
             self._reject()
@@ -550,6 +596,9 @@ class Lifecycle:
         if (
             self._halted or expires_at <= self._now()
         ):
+            self._reject()
+        expires_at = _uint(expires_at, 32, "permit deadline")
+        if expires_at > self._now() + MAX_PERMIT_SECONDS:
             self._reject()
         client_order_id = _uint(client_order_id, 64, "client_order_id")
         nonce_anchor = _uint(nonce_anchor, 48, "nonce_anchor")
@@ -607,14 +656,17 @@ class Lifecycle:
         if self._halted or not self.observed_opening_fill or self.close_count >= 3:
             self._reject(halt=self.close_count >= 3)
         self._validate_market(market)
+        self._validate_account(account)
         position = account.position
-        if not self._fresh(account.observed_at) or account.unexplained or account.open_order_ids:
+        if account.open_order_ids:
             self._reject(halt=True)
         if position <= 0 or not _aligned(position, market.step):
             self._reject(halt=True)
         prior = [item for item in self.store.all() if item.kind == "CLOSE"]
         unfinished = [item for item in self.store.all() if item.state != "TERMINAL"]
-        if unfinished:
+        if unfinished or any(
+            state != "TERMINAL" for state in self.store.cancel_states()
+        ):
             self._reject(halt=True)
         if prior and (prior[-1].state != "TERMINAL" or position > prior[-1].source_position):
             self._reject(halt=True)
@@ -655,7 +707,11 @@ class Lifecycle:
         current = self.store.get(intent.intent_id)
         if self._halted or current.state != "PREPARED" or current.dispatch_count or self._now() >= current.expires_at:
             self._reject()
-        if not isinstance(synthetic_signer, SyntheticSigner) or not synthetic_signer.fixture_only:
+        if (
+            not isinstance(synthetic_signer, SyntheticSigner)
+            or not synthetic_signer.fixture_only
+            or _address(synthetic_signer.signer).lower() != self._expected_signer
+        ):
             self._reject()
         self.store._update_state(intent.intent_id, "DISPATCHING", increment=True)
         try:
@@ -688,7 +744,7 @@ class Lifecycle:
         }
 
     def unsigned_request(
-        self, intent_id: str, *, market: MarketState, account: str,
+        self, intent_id: str, *, market: MarketState,
     ) -> dict[str, Any]:
         self._validate_market(market)
         value = self.store.get(intent_id)
@@ -704,7 +760,7 @@ class Lifecycle:
         if action_hash.hex() != value.payload_digest:
             self._reject(halt=True)
         witness = verify_witness_typed_data(
-            account=account, market=market, action_hash=action_hash,
+            account=self._expected_account, market=market, action_hash=action_hash,
             nonce_anchor=value.nonce, nonce_bitmap=value.nonce_bitmap,
             deadline=value.expires_at,
         )
@@ -715,24 +771,46 @@ class Lifecycle:
             "action_hash": action_hash,
             "permit": witness,
             "body": {
-                "order": self.unsigned_action(intent_id),
-                "permit": {
-                    "account": account, "target": market.router,
-                    "hash": "0x" + action_hash.hex(),
-                    "nonce_anchor": str(value.nonce),
-                    "nonce_bitmap_index": value.nonce_bitmap,
-                    "deadline": value.expires_at,
-                },
+                "market_id": value.market_id,
+                "size_steps": value.size_steps,
+                "price_ticks": value.price_ticks,
+                "side": {"BUY": 0, "SELL": 1}[value.side],
+                "order_type": {"MARKET": 0, "LIMIT": 1}[value.order_type],
+                "time_in_force": {
+                    "GTC": 0, "GTT": 1, "FOK": 2, "IOC": 3,
+                }[value.time_in_force],
+                "post_only": value.post_only,
+                "reduce_only": value.reduce_only,
+                "stp_mode": 0,
+                "client_order_id": value.client_order_id,
+                "account": self._expected_account,
+                "signer": self._expected_signer,
+                "nonce_anchor": str(value.nonce),
+                "nonce_bitmap_index": value.nonce_bitmap,
+                "deadline": value.expires_at,
             },
+            "signature": None,
+            "dispatchable": False,
         }
 
     def reconcile(self, intent_id: str, evidence: Evidence) -> Outcome:
         current = self.store.get(intent_id)
         if current.dispatch_count != 1 or current.state not in {
-            "DISPATCHING", "DISPATCHED", "AMBIGUOUS",
+            "DISPATCHING", "DISPATCHED", "AMBIGUOUS", "OPEN_KNOWN",
         }:
             self._reject()
-        if evidence.client_order_id != current.client_order_id or not self._fresh(evidence.observed_at):
+        try:
+            evidence_account = _address(evidence.account).lower()
+            evidence_signer = _address(evidence.signer).lower()
+        except LifecycleSafetyError:
+            self._reject(halt=True)
+        if (
+            evidence_account != self._expected_account
+            or evidence_signer != self._expected_signer
+            or evidence.signer_status != "ACTIVE"
+            or evidence.client_order_id != current.client_order_id
+            or not self._fresh(evidence.observed_at)
+        ):
             self._reject(halt=True)
         observed_ids = {
             value for value in (
@@ -742,7 +820,7 @@ class Lifecycle:
         }
         if any(value != current.client_order_id for value in evidence.trade_client_order_ids):
             self._reject(halt=True)
-        if evidence.open_order_ids:
+        if any(value != current.client_order_id for value in evidence.history_client_order_ids):
             self._reject(halt=True)
         expected = current.order_id
         if expected is not None and (observed_ids - {expected}):
@@ -751,11 +829,32 @@ class Lifecycle:
             if len(observed_ids) != 1:
                 self._reject(halt=True)
             expected = next(iter(observed_ids))
+        if evidence.open_order_ids:
+            open_known = (
+                expected is not None
+                and evidence.open_order_ids == (expected,)
+                and not evidence.terminal
+                and evidence.by_id_order_id == expected
+                and evidence.history_order_ids == (expected,)
+                and evidence.history_client_order_ids == (current.client_order_id,)
+                and evidence.filled_size == 0
+                and not evidence.trade_order_ids
+                and not evidence.trade_client_order_ids
+                and evidence.position == (
+                    Decimal("0") if current.kind == "OPEN"
+                    else current.source_position
+                )
+            )
+            if not open_known:
+                self._reject(halt=True)
+            self.store._record_open_known(intent_id, expected)
+            return self.outcome
         if expected is None:
             safe_no_identity = (
                 self._now() > current.expires_at and evidence.terminal
                 and evidence.filled_size == 0 and evidence.position == 0
                 and not evidence.open_order_ids and not evidence.history_order_ids
+                and not evidence.history_client_order_ids
                 and not evidence.trade_order_ids
                 and not evidence.trade_client_order_ids
             )
@@ -766,9 +865,15 @@ class Lifecycle:
                 self._reject()
             if evidence.by_id_order_id != expected or expected not in evidence.history_order_ids:
                 self._reject(halt=True)
+            if current.client_order_id not in evidence.history_client_order_ids:
+                self._reject(halt=True)
             if evidence.filled_size > 0 and expected not in evidence.trade_order_ids:
                 self._reject(halt=True)
             if evidence.filled_size > 0 and current.client_order_id not in evidence.trade_client_order_ids:
+                self._reject(halt=True)
+            if evidence.filled_size == 0 and (
+                evidence.trade_order_ids or evidence.trade_client_order_ids
+            ):
                 self._reject(halt=True)
         if evidence.filled_size < 0 or evidence.position < 0:
             self._reject(halt=True)
@@ -795,7 +900,10 @@ class Lifecycle:
         return self.outcome
 
     def cancel_known(self, order_id: str, execute: Callable[[str], Any]) -> None:
-        if self._halted or not self.store.known_order(order_id):
+        if (
+            self._halted or not self.store.known_order(order_id)
+            or self.store.order_state(order_id) != "OPEN_KNOWN"
+        ):
             self._reject()
         self.store._reserve_cancel(order_id)
         try:
@@ -808,12 +916,7 @@ class Lifecycle:
     def reconcile_cancel(self, order_id: str, account: AccountState) -> bool:
         if not self.store.known_order(order_id) or self.store.cancel_count(order_id) != 1:
             self._reject()
-        if (
-            not self._fresh(account.observed_at)
-            or account.open_order_ids != account.repeated_open_order_ids
-            or account.unexplained
-        ):
-            self._reject(halt=True)
+        self._validate_account(account)
         if account.open_order_ids:
             if account.open_order_ids == (order_id,):
                 return False
@@ -845,7 +948,8 @@ class Lifecycle:
             return self.outcome
         intents = self.store.all()
         if (
-            self.observed_opening_fill and account.position == 0
+            self.observed_opening_fill and self._account_valid(account)
+            and account.position == 0
             and not account.open_order_ids and not account.unexplained
             and self._fresh(account.observed_at)
             and account.repeated_position == account.position
