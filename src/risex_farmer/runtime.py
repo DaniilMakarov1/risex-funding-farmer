@@ -25,6 +25,7 @@ from .models import (
     BookDelta,
     ContractType,
     DataQuality,
+    FillProvenance,
     FundingCashQuote,
     FundingQuality,
     FundingSettlement,
@@ -102,8 +103,11 @@ class RecoveryPublicationCandidate:
     components: tuple[tuple[str, VenueReadiness], ...]
     venue_readiness: VenueReadiness
     lifecycle_owner: LifecycleEngine | None
+    lifecycle_candidate: LifecycleEngine | None
     lifecycle_before: LifecycleSnapshot | None
     lifecycle_after: LifecycleSnapshot | None
+    execution_captures: tuple[BookExecutionCapture, ...]
+    fill_provenance: tuple[tuple[str, FillProvenance], ...]
     buffer: tuple[BookDelta, ...]
     completion_detail: tuple[tuple[str, object], ...]
 
@@ -1577,9 +1581,6 @@ class PublicPaperRuntime:
         engine = LifecycleEngine.from_snapshot(runtime, config=self.config)
         position = runtime.position
         assert position is not None
-        risex, hedge = self._market_pair_observations(
-            runtime.risex_market, runtime.hedge_market, at
-        )
         assert self.adapters is not None
         last_known_at = self.repository.runtime_updated_at() or at
         history_since = min(
@@ -1628,12 +1629,19 @@ class PublicPaperRuntime:
                     unresolved_updates.append(replace(
                         row, status=SettlementStatus.UNRESOLVED, cash_usd=None,
                     ))
+        risex, hedge = self._market_pair_observations(
+            runtime.risex_market, runtime.hedge_market, at
+        )
+        risex_capture = self._execution_capture(risex, at)
+        hedge_capture = self._execution_capture(hedge, at)
         await engine.restart(
             last_known_at=last_known_at,
             recovered_at=at,
             risex_observation=risex,
             hedge_observation=hedge,
             settlement_updates=tuple(settlement_updates),
+            risex_capture=risex_capture,
+            hedge_capture=hedge_capture,
         )
         # Settlement authority is independent of whether both execution books
         # were fresh enough for gap recovery.
@@ -1642,8 +1650,20 @@ class PublicPaperRuntime:
         for update in unresolved_updates:
             if update.key not in applied_keys:
                 await engine.mark_extended_history_unresolved(update)
-        self.lifecycle = engine
-        self.repository.save_decision(recorded_at=at, lifecycle_snapshot=engine.snapshot)
+        if engine.fill_provenance and not self._captures_are_current(
+            risex_capture, hedge_capture
+        ):
+            return
+        self.repository.save_decision(
+            recorded_at=at,
+            lifecycle_snapshot=engine.snapshot,
+            fill_provenance=engine.fill_provenance,
+        )
+        self.lifecycle = (
+            None
+            if engine.snapshot.lifecycle_state is LifecycleState.FLAT
+            else engine
+        )
         self._record("OPEN_POSITION_RESTORED", at=at)
 
     async def tick(self, at: datetime | None = None) -> None:
@@ -2661,14 +2681,31 @@ class PublicPaperRuntime:
             ) in self._trade_stream_ready
         )
         if execution_healthy:
-            await lifecycle.recover(
+            before = lifecycle.snapshot
+            candidate = lifecycle.detached()
+            risex_capture = self._execution_capture(risex, now)
+            hedge_capture = self._execution_capture(hedge, now)
+            await candidate.recover(
                 recovered_at=now,
                 risex_observation=risex,
                 hedge_observation=hedge,
+                risex_capture=risex_capture,
+                hedge_capture=hedge_capture,
             )
+            if self.lifecycle is not lifecycle or lifecycle.snapshot is not before:
+                return
+            if candidate.fill_provenance and not self._captures_are_current(
+                risex_capture, hedge_capture
+            ):
+                return
             self.repository.save_decision(
-                recorded_at=now, lifecycle_snapshot=lifecycle.snapshot
+                recorded_at=now,
+                lifecycle_snapshot=candidate.snapshot,
+                fill_provenance=candidate.fill_provenance,
             )
+            lifecycle.publish_candidate(candidate)
+            if candidate.snapshot.lifecycle_state is LifecycleState.FLAT:
+                self.lifecycle = None
 
     async def recover_snapshot(
         self, book: OrderBook, *, at: datetime | None = None
@@ -2730,8 +2767,11 @@ class PublicPaperRuntime:
             at,
         )
         lifecycle_owner = self.lifecycle
+        lifecycle_candidate = None
         lifecycle_before = None if lifecycle_owner is None else lifecycle_owner.snapshot
         lifecycle_after = lifecycle_before
+        execution_captures: tuple[BookExecutionCapture, ...] = ()
+        fill_provenance: tuple[tuple[str, FillProvenance], ...] = ()
         if lifecycle_owner is not None and lifecycle_before is not None and lifecycle_before.gap_open:
             def projected_row(row_venue: Venue, row_symbol: str) -> MarketObservation:
                 if (row_venue, row_symbol) == key and projected_observation is not None:
@@ -2754,15 +2794,48 @@ class PublicPaperRuntime:
                 in self._trade_stream_ready
             )
             if execution_healthy:
-                detached = LifecycleEngine.from_snapshot(
-                    lifecycle_before, config=lifecycle_owner.config
-                )
-                await detached.recover(
+                def recovery_capture(
+                    observation: MarketObservation,
+                ) -> BookExecutionCapture | None:
+                    if observation.book is None or observation.health is None:
+                        return None
+                    observation_key = (
+                        observation.book.venue,
+                        observation.book.canonical_market,
+                    )
+                    if observation_key != key:
+                        return self._execution_capture(observation, at)
+                    return BookExecutionCapture(
+                        observation.book,
+                        observation.health,
+                        observation.health.last_market_event_at
+                        or observation.book.observed_at,
+                        at,
+                        episode.owned_stream_session_id.value,
+                        generation.value,
+                        self._book_revisions.get(key, 0) + 1,
+                        (
+                            projected_stream.risex_checksum()
+                            if venue is Venue.RISEX else None
+                        ),
+                    )
+
+                risex_capture = recovery_capture(risex)
+                hedge_capture = recovery_capture(hedge)
+                lifecycle_candidate = lifecycle_owner.detached()
+                await lifecycle_candidate.recover(
                     recovered_at=at,
                     risex_observation=risex,
                     hedge_observation=hedge,
+                    risex_capture=risex_capture,
+                    hedge_capture=hedge_capture,
                 )
-                lifecycle_after = detached.snapshot
+                lifecycle_after = lifecycle_candidate.snapshot
+                execution_captures = tuple(
+                    capture for capture in (risex_capture, hedge_capture)
+                    if capture is not None
+                )
+                fill_provenance = lifecycle_candidate.fill_provenance
         detail = (
             ("symbol", symbol), ("buffered", buffered),
             ("replayed", replayed), ("source", source),
@@ -2772,8 +2845,9 @@ class PublicPaperRuntime:
         )
         candidate = RecoveryPublicationCandidate(
             recovered, health, projected_observation, tuple(components.items()),
-            venue_readiness, lifecycle_owner, lifecycle_before, lifecycle_after,
-            expected_buffer, detail,
+            venue_readiness, lifecycle_owner, lifecycle_candidate,
+            lifecycle_before, lifecycle_after, execution_captures,
+            fill_provenance, expected_buffer, detail,
         )
         async with self._position_event_lock:
             if (
@@ -2784,11 +2858,28 @@ class PublicPaperRuntime:
                     and candidate.lifecycle_owner.snapshot is not candidate.lifecycle_before)
             ):
                 return False
+            if candidate.fill_provenance:
+                for capture in candidate.execution_captures:
+                    capture_key = (
+                        capture.book.venue, capture.book.canonical_market
+                    )
+                    if capture_key == key:
+                        if (
+                            capture.stream_session_id
+                            != episode.owned_stream_session_id.value
+                            or capture.recovery_generation != generation.value
+                            or capture.book_revision
+                            != self._book_revisions.get(key, 0) + 1
+                        ):
+                            return False
+                    elif not self._captures_are_current(capture):
+                        return False
             completion_detail = dict(candidate.completion_detail)
             self.repository.save_decision(
                 recorded_at=at,
                 lifecycle_snapshot=(candidate.lifecycle_after
                     if candidate.lifecycle_after != candidate.lifecycle_before else None),
+                fill_provenance=candidate.fill_provenance,
                 runtime_evidence=((at, "PUBLIC_SNAPSHOT_RECOVERY_COMPLETED",
                                    venue.value, completion_detail),),
                 venue_readiness=(
@@ -2812,8 +2903,18 @@ class PublicPaperRuntime:
             self.readiness[venue] = candidate.venue_readiness
             if candidate.observation is not None:
                 self.observations[key] = candidate.observation
-            if candidate.lifecycle_owner is not None and candidate.lifecycle_after is not None:
-                candidate.lifecycle_owner.publish_snapshot(candidate.lifecycle_after)
+            if (
+                candidate.lifecycle_owner is not None
+                and candidate.lifecycle_candidate is not None
+            ):
+                candidate.lifecycle_owner.publish_candidate(
+                    candidate.lifecycle_candidate
+                )
+                if (
+                    candidate.lifecycle_candidate.snapshot.lifecycle_state
+                    is LifecycleState.FLAT
+                ):
+                    self.lifecycle = None
             episode.terminal = "COMPLETE"
             episode.buffer.clear()
         self._notify_outage(

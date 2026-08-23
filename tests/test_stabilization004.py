@@ -14,6 +14,7 @@ from risex_farmer.models import (
     BookLevel,
     DataQuality,
     LifecycleState,
+    MakerFillProvenance,
     MarketVolume,
     OrderBook,
     RouteDirection,
@@ -556,3 +557,141 @@ async def test_normal_close_replay_conserves_fills_fees_funding_and_pnl(tmp_path
     assert closed.simulated_closed_net_pnl_usd == (
         closed.simulated_recognized_funding_usd + pair - fees
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("forgery", ("order", "duplicate-trade", "missing-trade"))
+async def test_repository_rejects_unowned_maker_provenance(tmp_path, forgery):
+    with PaperRepository(tmp_path / f"maker-{forgery}.db") as repository:
+        original_save = repository.save_decision
+
+        def forge(**kwargs):
+            forged = []
+            for fill_id, proof in kwargs.get("fill_provenance", ()):
+                if isinstance(proof, MakerFillProvenance):
+                    if forgery == "order":
+                        proof = replace(
+                            proof,
+                            order_id="forged-order",
+                            order_version_id="forged-version",
+                        )
+                    elif forgery == "duplicate-trade":
+                        proof = replace(
+                            proof,
+                            qualifying_trades=(
+                                proof.qualifying_trades[0],
+                                proof.qualifying_trades[0],
+                            ),
+                        )
+                    else:
+                        proof = replace(
+                            proof,
+                            qualifying_trades=(replace(
+                                proof.qualifying_trades[0],
+                                trade_event_key="not-persisted",
+                            ),),
+                        )
+                forged.append((fill_id, proof))
+            kwargs["fill_provenance"] = tuple(forged)
+            return original_save(**kwargs)
+
+        repository.save_decision = forge
+        with pytest.raises(ValueError, match="provenance"):
+            await run_fixture({"scenario": "open_position"}, repository)
+
+        assert repository.connection.execute(
+            "SELECT COUNT(*) FROM fills"
+        ).fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_direct_recovery_hard_basis_commits_two_taker_proofs(tmp_path):
+    clock = FakeClock()
+    with PaperRepository(tmp_path / "recovery-hard-basis.db") as repository:
+        runtime = await _stabilization002_position_runtime(repository, clock)
+        lifecycle = runtime.lifecycle
+        before = lifecycle.snapshot
+        position = before.position
+        at = NOW
+        if position.direction is RouteDirection.LONG_RISEX_SHORT_HEDGE:
+            risex = _position_observation(before.risex_market, at, bid="50", ask="51")
+            hedge = _position_observation(before.hedge_market, at, bid="150", ask="151")
+        else:
+            risex = _position_observation(before.risex_market, at, bid="150", ask="151")
+            hedge = _position_observation(before.hedge_market, at, bid="50", ask="51")
+
+        runtime.lifecycle = None
+        await runtime.recover_snapshot(risex.book, at=at)
+        await runtime.recover_snapshot(hedge.book, at=at)
+        runtime.lifecycle = lifecycle
+        await lifecycle.start_gap(started_at=at)
+        repository.save_decision(
+            recorded_at=at, lifecycle_snapshot=lifecycle.snapshot
+        )
+
+        await runtime.recover_snapshot(risex.book, at=at)
+
+        assert runtime.lifecycle is None
+        restored = repository.load_runtime()
+        assert restored.lifecycle_state is LifecycleState.FLAT
+        assert restored.closed_trade.close_reason is CloseReason.HARD_BASIS
+        rows = repository.connection.execute(
+            "SELECT p.provenance_kind,p.payload FROM fill_provenance p "
+            "JOIN fills f USING(fill_id) "
+            "WHERE f.leg IN ('HEDGE_EXIT','RISEX_EXIT')"
+        ).fetchall()
+        assert len(rows) == 2
+        assert {row["provenance_kind"] for row in rows} == {"TAKER"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    (sqlite3.OperationalError("recovery commit failure"), asyncio.CancelledError()),
+    ids=("exception", "cancellation"),
+)
+async def test_direct_recovery_failure_publishes_no_lifecycle_candidate(
+    tmp_path, failure
+):
+    clock = FakeClock()
+    with PaperRepository(tmp_path / "recovery-rollback.db") as repository:
+        runtime = await _stabilization002_position_runtime(repository, clock)
+        lifecycle = runtime.lifecycle
+        await lifecycle.start_gap(started_at=NOW)
+        repository.save_decision(
+            recorded_at=NOW, lifecycle_snapshot=lifecycle.snapshot
+        )
+        before = lifecycle.snapshot
+        market = before.risex_market
+        book = runtime.coordinator.stream(
+            market.venue, market.venue_symbol
+        ).book()
+
+        def fail_save(**_kwargs):
+            raise failure
+
+        repository.save_decision = fail_save
+        with pytest.raises(type(failure)):
+            await runtime.recover_snapshot(book, at=NOW)
+
+        assert runtime.lifecycle is lifecycle
+        assert lifecycle.snapshot == before
+
+
+@pytest.mark.asyncio
+async def test_startup_restart_failure_publishes_no_lifecycle(tmp_path):
+    clock = FakeClock()
+    with PaperRepository(tmp_path / "restart-rollback.db") as repository:
+        runtime = await _stabilization002_position_runtime(repository, clock)
+        runtime.lifecycle = None
+        before = repository.load_runtime()
+
+        def fail_save(**_kwargs):
+            raise sqlite3.OperationalError("restart commit failure")
+
+        repository.save_decision = fail_save
+        with pytest.raises(sqlite3.OperationalError):
+            await runtime._restore(NOW)
+
+        assert runtime.lifecycle is None
+        assert repository.load_runtime() == before

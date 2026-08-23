@@ -345,11 +345,20 @@ async def run_fixture(
         close_at = opened_at + timedelta(seconds=1)
         risex = _observation(Venue.RISEX, asset, close_at, target)
         hedge = _observation(Venue.EXTENDED, asset, close_at, target)
-        await lifecycle.recover(
+        candidate = lifecycle.detached()
+        await candidate.recover(
             recovered_at=close_at,
             risex_observation=risex,
             hedge_observation=hedge,
+            risex_capture=_fixture_capture(risex, close_at, session_id=1),
+            hedge_capture=_fixture_capture(hedge, close_at, session_id=2),
         )
+        repository.save_decision(
+            recorded_at=close_at,
+            lifecycle_snapshot=candidate.snapshot,
+            fill_provenance=candidate.fill_provenance,
+        )
+        lifecycle.publish_candidate(candidate)
     else:
         candidate = lifecycle.detached()
         await candidate.evaluate(
@@ -438,9 +447,13 @@ async def _restart_fixture(
         recovered_at=recovered_at,
         risex_observation=risex,
         hedge_observation=hedge,
+        risex_capture=_fixture_capture(risex, recovered_at, session_id=1),
+        hedge_capture=_fixture_capture(hedge, recovered_at, session_id=2),
     )
     repository.save_decision(
-        recorded_at=recovered_at, lifecycle_snapshot=engine.snapshot
+        recorded_at=recovered_at,
+        lifecycle_snapshot=engine.snapshot,
+        fill_provenance=engine.fill_provenance,
     )
     return {
         "status": "RESTARTED",

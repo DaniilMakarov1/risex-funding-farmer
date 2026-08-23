@@ -1027,8 +1027,11 @@ class LifecycleEngine:
         hedge_observation: MarketObservation,
         next_cycle: TargetFundingCycle | None = None,
         settlement_updates: tuple[FundingSettlement, ...] = (),
+        risex_capture: BookExecutionCapture | None = None,
+        hedge_capture: BookExecutionCapture | None = None,
     ) -> LifecycleSnapshot:
         async with self._lock:
+            self._fill_provenance = ()
             if not _observation_is_fresh(
                 risex_observation, recovered_at, self.config
             ) or not _observation_is_fresh(
@@ -1039,7 +1042,9 @@ class LifecycleEngine:
             for update in settlement_updates:
                 self._reconcile_locked(update)
             return self._evaluate_locked(
-                recovered_at, risex_observation, hedge_observation, next_cycle
+                recovered_at, risex_observation, hedge_observation, next_cycle,
+                risex_capture=risex_capture,
+                hedge_capture=hedge_capture,
             )
 
     async def restart(
@@ -1051,8 +1056,11 @@ class LifecycleEngine:
         hedge_observation: MarketObservation,
         next_cycle: TargetFundingCycle | None = None,
         settlement_updates: tuple[FundingSettlement, ...] = (),
+        risex_capture: BookExecutionCapture | None = None,
+        hedge_capture: BookExecutionCapture | None = None,
     ) -> LifecycleSnapshot:
         async with self._lock:
+            self._fill_provenance = ()
             self._position()
             self._cancel_exit_version(
                 ExitVersionReason.PROCESS_RESTART, recovered_at
@@ -1068,7 +1076,9 @@ class LifecycleEngine:
             for update in settlement_updates:
                 self._reconcile_locked(update)
             return self._evaluate_locked(
-                recovered_at, risex_observation, hedge_observation, next_cycle
+                recovered_at, risex_observation, hedge_observation, next_cycle,
+                risex_capture=risex_capture,
+                hedge_capture=hedge_capture,
             )
 
     def _taker_fill(

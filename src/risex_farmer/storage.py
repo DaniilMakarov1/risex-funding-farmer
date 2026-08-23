@@ -690,8 +690,65 @@ class PaperRepository:
             )
             kind = "TAKER"
         elif isinstance(provenance, MakerFillProvenance):
+            order_row = self.connection.execute(
+                "SELECT status,payload FROM orders WHERE order_id=?",
+                (provenance.order_id,),
+            ).fetchone()
+            version_row = self.connection.execute(
+                "SELECT order_id,status,cumulative_quantity,payload "
+                "FROM order_versions WHERE version_id=?",
+                (provenance.order_version_id,),
+            ).fetchone()
+            order = None if order_row is None else _load(order_row["payload"])
+            version = None if version_row is None else _load(version_row["payload"])
+            trade_keys = tuple(
+                trade.trade_event_key for trade in provenance.qualifying_trades
+            )
+            persisted_trades = tuple(
+                self.connection.execute(
+                    "SELECT payload FROM processed_trade_events "
+                    "WHERE trade_event_key=?",
+                    (trade.trade_event_key,),
+                ).fetchone()
+                for trade in provenance.qualifying_trades
+            )
+            order_owned = (
+                isinstance(order, (PaperEntryOrder, PaperExitOrder))
+                and order.order_id == provenance.order_id
+                and order.venue is fill.venue
+                and order.canonical_market == fill.canonical_market
+                and order.side is fill.side
+                and order.canonical_quantity == fill.canonical_quantity
+                and version in order.versions
+                and getattr(version, "version_id", None)
+                == provenance.order_version_id
+                and getattr(version, "limit_price", None) == provenance.limit_price
+                and getattr(version, "cumulative_eligible_quantity", None)
+                == fill.canonical_quantity
+                and getattr(getattr(version, "status", None), "value", None)
+                == "FILLED"
+                and order_row["status"] == "FILLED"
+                and version_row is not None
+                and version_row["order_id"] == provenance.order_id
+                and version_row["status"] == "FILLED"
+                and Decimal(version_row["cumulative_quantity"])
+                == fill.canonical_quantity
+            )
+            trades_owned = (
+                len(set(trade_keys)) == len(trade_keys)
+                and all(
+                    row is not None
+                    and row["payload"] is not None
+                    and _load(row["payload"]) == trade
+                    for row, trade in zip(
+                        persisted_trades, provenance.qualifying_trades
+                    )
+                )
+            )
             valid = (
-                provenance.limit_price == fill.canonical_price
+                order_owned
+                and trades_owned
+                and provenance.limit_price == fill.canonical_price
                 and provenance.tick_size > 0
                 and provenance.decision_at >= fill.exchange_at
                 and provenance.decision_at >= fill.receipt_at
