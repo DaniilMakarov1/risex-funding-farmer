@@ -386,11 +386,14 @@ class PrivateReadPreflight:
             market.get("market_id") != "1" or market.get("active") is not True
             or market.get("base_asset_symbol") != "BTC"
             or market.get("quote_asset_symbol") != "USDC"
-            or market_config != {
-                "name": "BTC/USDC", "unlocked": True,
-                "step_size": "0.000001", "step_price": "0.1",
-                "min_order_size": "0.0001",
+            or set(market_config) != {
+                "name", "unlocked", "step_size", "step_price", "min_order_size",
             }
+            or market_config.get("name") != "BTC/USDC"
+            or market_config.get("unlocked") is not True
+            or market_config.get("step_size") != "0.000001"
+            or market_config.get("step_price") != "0.1"
+            or market_config.get("min_order_size") != "0.0001"
         ):
             raise ValueError("market mismatch")
 

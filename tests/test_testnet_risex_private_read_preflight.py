@@ -312,7 +312,7 @@ async def test_invalid_http_observation_scalar_blocks(tmp_path, observed_at):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("case", [
-    "status_true", "http_float", "redirect_zero", "lifecycle_one",
+    "status_true", "http_float", "redirect_zero", "lifecycle_one", "unlocked_one",
 ])
 async def test_boolean_and_numeric_protocol_aliases_block(tmp_path, case):
     clock = Clock()
@@ -332,8 +332,14 @@ async def test_boolean_and_numeric_protocol_aliases_block(tmp_path, case):
         transport.mutations["/v1/system/config"] = (
             lambda response: replace(response, redirected=0)
         )
-    else:
+    elif case == "lifecycle_one":
         lifecycle = lambda: 1
+    else:
+        def unlocked_alias(response):
+            body = copy.deepcopy(response.body)
+            body["data"]["markets"][0]["config"]["unlocked"] = 1
+            return replace(response, body=body)
+        transport.mutations["/v1/markets"] = unlocked_alias
     store = PrivateReadStore(tmp_path / "aliases.sqlite3")
     controller = PrivateReadPreflight(
         store, clock=clock, public_get=transport, lifecycle_clear=lifecycle,
