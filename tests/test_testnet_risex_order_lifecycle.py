@@ -202,6 +202,46 @@ def test_ambiguous_open_is_never_replayed(lifecycle, tmp_path):
     store.close()
 
 
+def test_malformed_order_identity_halts_after_dispatch(tmp_path):
+    for index, response in enumerate(("", "   ", 123)):
+        candidate = new_lifecycle(tmp_path / f"bad-dispatch-id-{index}.sqlite3")
+        intent = open_intent(candidate)
+        candidate.dispatch(intent, SIGNER, lambda _: response)
+        persisted = candidate.store.get(intent.intent_id)
+        assert persisted.dispatch_count == 1 and persisted.state == "AMBIGUOUS"
+        assert candidate.store.load_outcome() == Outcome.ACTIVE
+        with pytest.raises(LifecycleSafetyError):
+            candidate.dispatch(intent, SIGNER, lambda _: "replay")
+        candidate._now = lambda: NOW + 1
+        assert candidate.reconcile(
+            intent.intent_id, exact_evidence("authoritative-order", 101),
+        ) == Outcome.COMPLETED_NO_FILL_FLAT
+        candidate.store.close()
+
+    malformed_surfaces = (
+        {"order_id": ""},
+        {"by_id_order_id": "   "},
+        {"history_order_ids": (123,)},
+        {"trade_order_ids": (" ",)},
+        {"open_order_ids": (123,), "terminal": False},
+    )
+    for index, changes in enumerate(malformed_surfaces):
+        candidate = new_lifecycle(tmp_path / f"bad-evidence-id-{index}.sqlite3")
+        intent = open_intent(candidate)
+        candidate.dispatch(
+            intent, SIGNER, lambda _: (_ for _ in ()).throw(TimeoutError()),
+        )
+        candidate._now = lambda: NOW + 1
+        evidence = replace(
+            exact_evidence("authoritative-order", 101), **changes,
+        )
+        with pytest.raises(LifecycleSafetyError):
+            candidate.reconcile(intent.intent_id, evidence)
+        assert candidate.store.load_outcome() == Outcome.FAILED_HALTED_MANUAL_RECOVERY
+        assert candidate.store.get(intent.intent_id).state != "TERMINAL"
+        candidate.store.close()
+
+
 def test_open_is_exact_minimum_price_bounded_market_fok(lifecycle):
     intent = open_intent(lifecycle)
     request = lifecycle.unsigned_request(intent.intent_id, market=market())

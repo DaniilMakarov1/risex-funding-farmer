@@ -160,6 +160,10 @@ def _uint(value: int, bits: int, name: str) -> int:
     return value
 
 
+def _valid_order_id(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
 def _address(value: str) -> str:
     if not isinstance(value, str) or len(value) != 42 or not value.startswith("0x"):
         raise LifecycleSafetyError("RISEx address rejected")
@@ -576,6 +580,7 @@ class Lifecycle:
             or not self._fresh(value.observed_at)
             or value.position != value.repeated_position
             or value.open_order_ids != value.repeated_open_order_ids
+            or any(not _valid_order_id(item) for item in value.open_order_ids)
             or value.unexplained
         )
 
@@ -791,7 +796,7 @@ class Lifecycle:
         except Exception:
             self.store._update_state(intent.intent_id, "AMBIGUOUS")
             return
-        if not isinstance(order_id, str) or not order_id:
+        if not _valid_order_id(order_id):
             self.store._update_state(intent.intent_id, "AMBIGUOUS")
             return
         self.store._update_state(intent.intent_id, "DISPATCHED", order_id=order_id)
@@ -884,6 +889,16 @@ class Lifecycle:
             or not self._fresh(evidence.observed_at)
         ):
             self._reject(halt=True)
+        scalar_ids = (evidence.order_id, evidence.by_id_order_id)
+        tuple_ids = (
+            *evidence.history_order_ids, *evidence.trade_order_ids,
+            *evidence.open_order_ids,
+        )
+        if (
+            any(value is not None and not _valid_order_id(value) for value in scalar_ids)
+            or any(not _valid_order_id(value) for value in tuple_ids)
+        ):
+            self._reject(halt=True)
         observed_ids = {
             value for value in (
                 evidence.order_id, evidence.by_id_order_id,
@@ -972,6 +987,8 @@ class Lifecycle:
         return self.outcome
 
     def cancel_known(self, order_id: str, execute: Callable[[str], Any]) -> None:
+        if not _valid_order_id(order_id):
+            self._reject(halt=bool(self.store.all()))
         if (
             self._halted or not self.store.known_order(order_id)
             or self.store.order_state(order_id) != "OPEN_KNOWN"
@@ -986,7 +1003,11 @@ class Lifecycle:
         self.store._set_cancel_state(order_id, "PENDING_RECONCILIATION")
 
     def reconcile_cancel(self, order_id: str, account: AccountState) -> bool:
-        if not self.store.known_order(order_id) or self.store.cancel_count(order_id) != 1:
+        if not _valid_order_id(order_id):
+            self._reject(halt=bool(self.store.all()))
+        if (
+            not self.store.known_order(order_id) or self.store.cancel_count(order_id) != 1
+        ):
             self._reject()
         self._validate_account(account)
         if account.open_order_ids:
