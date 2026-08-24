@@ -1,84 +1,54 @@
 # Agent rules
 
-This is a new standalone paper-only research project. Do not inspect, import, or copy other repositories, local projects, old RISEx/Radar code, or old architecture documents.
+This standalone project must not inspect, import, or copy other repositories or old RISEx/Radar material.
 
 ## Sources of truth
 
-Only `AGENTS.md`, `SYSTEM_SPEC.md`, `STATUS.md`, `NEXT_TASK.md`, and `README.md` govern the project. Git history is the task history. Do not create other governance or task-history documents.
+Only `AGENTS.md`, `SYSTEM_SPEC.md`, `STATUS.md`, `NEXT_TASK.md`, and `README.md` govern the project; Git is the history. Do not create other governance/history files.
 
-- `AGENTS.md` contains only stable process, role, safety, and acceptance rules.
-- `SYSTEM_SPEC.md` contains frozen product behavior and invariants.
-- `STATUS.md` is a concise current accepted-state and blocker snapshot, not a chronology.
-- `NEXT_TASK.md` contains only the currently authorized bounded slice for each venue plus its acceptance boundary.
-- `README.md` contains stable operator documentation, not current SHAs, task state, or acceptance history.
-- Completed and rejected task detail remains in Git history and must not be copied forward into active governance unless it is still material to a current safety gate.
+- `AGENTS.md`: stable process and safety rules.
+- `SYSTEM_SPEC.md`: durable product behavior and invariants.
+- `STATUS.md`: concise current accepted state and blockers.
+- `NEXT_TASK.md`: one current bounded slice per venue.
+- `README.md`: stable operator documentation.
 
-## Roles
+## Roles and models
 
-- The permanent chain is user -> one Chief Coordinator/Reviewer -> at most one Builder per venue lane. Architect sessions are disabled; they may return only by a new explicit user decision after Chief explains a concrete need.
-- Chief defines each bounded objective, authorizes and directs Builders, independently reviews scope/diff/evidence, accepts or rejects candidates, alone integrates and pushes `main`, runs operational gates, and keeps the sources of truth current. Chief never writes implementation code, and a Builder report is never acceptance.
-- Start a fresh Builder session for every fresh candidate branch, including every post-rejection correction. A Builder checkpoint is never acceptance or a reason to leave a lane without its next action.
-- Rotate Chief only at a clean handoff after an operational gate or several central integrations: `main` is published and clean, no write/candidate is in flight, and concise current state is recorded in the existing sources of truth. Never rotate by an arbitrary token threshold or during an ambiguous operation.
-- Operate in token-efficient accelerated mode. A handoff contains only venue, objective, exact base, tier, allowed files, forbidden scope, acceptance conditions, and required evidence; agents read the sources of truth locally. Checkpoints contain only changed evidence, exact tip, verdict, blocker, and one next action. The path is Chief start -> Builder candidate -> Chief acceptance/integration -> Chief operational gate when required. Do not repeat accepted evidence without new contradiction.
-- Parallelize every safe independent research, fixture, review, and private-read preparation action across venue lanes. Keep sequential only the operations explicitly required to be sequential: central `main` integrations and testnet order/write lifecycles. Prefer one bounded correction that closes all currently reproduced in-scope defects over serial micro-cycles, while preserving RED-before-GREEN evidence and immutable rejected history.
-- Verification is proportional to the gate. Focused tests and targeted adverse reproduction are sufficient for ordinary correction checkpoints. Each distinct defect needs one genuine RED reproducer. The final candidate needs one clean full Python 3.11 suite and dependency check tied to its exact tree/SHA; all roles reuse immutable evidence unless it is missing, untrusted, contradicted, or the tree changed. After exact fast-forward integration do not duplicate the full run. Retain every credential/private/write/exact-flat safety check.
-- Use three compact verification tiers, each proved in one combined gate rather than separate sub-approvals. Tier A, fixture-only: scope/import isolation, affected focused/adverse tests, and one final-candidate full-suite result. Tier B, credential/private-read: Tier A plus one sealed fixed-destination operation whose credential confinement and durable ambiguous-outcome handling are proved together. Tier C, live-write/order: Tier B plus one bounded exact-identity lifecycle with authoritative pre-state and final zero-orders/exact-flat barriers. A higher tier inherits the lower tier; do not repeat already accepted lower-tier evidence unless its code or contract changed.
-- The user permanently authorizes Chief to create, replace, or release the sole Builder without repeated approval. At most one Builder may be active per lane and three project-wide.
-- A Builder may start only after Phase 0 and the Chief start gate, must not spawn agents, and implements only the active bounded slice under Chief direction. Chief authorization is required for start and final acceptance.
-- Mandatory Chief Coordinator gates are consolidated to: (1) one start gate combining bounded design and Builder authorization; (2) one candidate gate combining implementation acceptance and sequential `main` integration, including any already-declared shared-core exception; and (3) one operational gate per credential/private action or live-write lifecycle, with its terminal exact-flat/zero-order verdict included in that same gate. Phase 0 remains separate only for a genuinely new venue. An unexpected shared-core expansion stops before editing and requires a revised start gate.
-- Builder implements only the bounded milestone in `NEXT_TASK.md` and must not begin the next milestone.
-- Work only within milestones already authorized by `SYSTEM_SPEC.md` and the active bounded slices in `NEXT_TASK.md`. Corrective branch labels are audit identifiers, not product milestones. A new product behavior, strategy, venue, or milestone requires an explicit user decision.
-- The user's ongoing stabilization decision authorizes successive strictly bounded corrective slices needed to make the existing paper system correct, without repeated user selection of technical task numbers. Administrative stabilization labels and branches are audit identifiers, not new product milestones.
-- The user's testnet decision authorizes the three venue lifecycle programs only through the exact active boundaries in `NEXT_TASK.md`. Deterministic acceptance never authorizes credential loading, private traffic, signatures, or writes. Each credential/private-read action and each later live-write lifecycle requires its own Chief Coordinator gate. A blocked or ambiguous one-shot is never retried or rearmed unless the accepted contract explicitly proves that no request was dispatched and a new bounded gate is recorded.
-- Any new product behavior, economics, strategy, API/private access, live work, or Telegram expansion still requires a separate explicit user decision.
-- Infrastructure expansion is frozen to the minimum corrections required to complete the three accepted venue lifecycles safely. Do not add frameworks, generalized execution abstractions, dashboards, new venues, execution features, or shared runtime behavior merely to prepare for future strategy work.
-- After RISEx, Nado, and Extended each independently prove the separately gated minimal testnet place/reconcile/cancel/close lifecycle and authoritative zero open orders plus exact flatness, stop lifecycle infrastructure work. The next task is a separately governed strategy-testnet measurement using the already accepted strategy; it must measure opportunity frequency, planned-versus-actual execution, fees, resolved funding, and complete net PnL. Degraded or unresolved observations never count as profitability evidence.
+- Chain: user -> one Chief Coordinator/Reviewer -> at most one Builder per venue. Architect sessions are disabled; one temporary non-implementing auditor is allowed only for a genuinely high-risk gate and returns one verdict.
+- Chief defines bounded objectives, directs Builders, independently reviews and accepts/rejects candidates, alone integrates/pushes `main`, owns operational gates and governance, and never writes implementation code. Builder reports are not acceptance.
+- Builders implement only their bounded slice, never self-accept, merge/push `main`, or spawn agents. Use a fresh Builder session and branch for each fresh candidate, including post-rejection corrections.
+- Chief and Builders use GPT-5.6 Sol `medium`. `high`, `xhigh`, `max`, and Pro modes are prohibited.
+- User permanently authorizes Chief to create, replace, or release Builders. Maximum: one Builder per RISEx/Nado/Extended lane and three project-wide.
+- Rotate Chief only at a clean handoff: published clean `main`, no candidate/write in flight, and current state recorded.
 
-## Model routing
+## Workflow and Git
 
-- Chief Coordinator/Reviewer uses GPT-5.6 Sol with `medium` reasoning.
-- Builders use GPT-5.6 Sol `medium` by default. GPT-5.6 Terra `medium` is permitted only for a fully specified mechanical local transformation whose correctness is completely decided by existing tests and requires no API/schema interpretation, architecture, state-machine reasoning, credential/signing work, or operational judgment. GPT-5.6 Luna `low` or `medium` may perform mechanical read-only summarization but never architecture, implementation acceptance, or an operational verdict.
-- `high`, `xhigh`, `max`, and Pro reasoning modes are prohibited project-wide for every role and model. New or replacement agents must be created with an explicit permitted model and effort rather than inheriting an unknown or higher setting.
-- Model choice changes neither authority nor gates: Chief directs Builder work and independently accepts every candidate and operational result.
+- Each handoff states only venue, objective, exact base, verification level, allowed/forbidden scope, acceptance, and required evidence. Checkpoints contain only changed evidence, exact tip, verdict/blocker, and next action.
+- Parallelize independent research and implementation. Integrate `main` and execute testnet writes sequentially. Never leave an unblocked lane without a next action.
+- Builder uses a separate `codex/<venue>-<slice>` branch/worktree from the exact authorized `main`; before edits it reports root, branch, HEAD, and status. It never rebases, rewrites history, or changes unrelated files.
+- Builder runs focused/adverse tests while developing and one clean Python 3.11 full suite plus dependency/surface checks on the final SHA. Reuse trusted evidence for an unchanged tree; any code change invalidates it. Exact fast-forward integration needs no duplicate suite.
+- Chief reviews scope, diff, official/observed contract evidence, tests, and Git before preserving the candidate commit on `main`. Rejected history stays immutable; a reproduced in-scope defect gets a fresh correction branch. Stop if bounded work does not converge.
+- Only active `NEXT_TASK.md` slices are authorized. Unexpected shared-core or product expansion stops for a revised Chief gate; new product behavior, economics, strategy, venue, private access, or live work requires explicit user authority.
 
-## Parallel venue lanes
+## Verification levels
 
-- Up to three venue lanes may exist: RISEx, Nado, and Extended. Each lane has at most one Builder; the project-wide maximum is three.
-- `NEXT_TASK.md` may contain at most one active bounded slice per venue and at most three active slices total. Each slice retains its venue-local scope, ownership, evidence, and acceptance boundary.
-- Every lane uses a separate worktree and branch from its exact authorized base. Branch and task identifiers must carry an unambiguous unique `risex`, `nado`, or `extended` venue/lane prefix. Chief Coordinator keeps each lane's identity and state separate and never authorizes cross-venue edits.
-- Read-only research and independent venue implementation may proceed in parallel. Testnet order operations and `main` integration are sequential, one lane at a time.
-- Chief Coordinator keeps every unblocked venue lane moving in parallel. Completion or attention from one lane is handled immediately without pausing the other lanes; a lane may be left idle only when it is waiting at an explicit Chief gate, waiting on an already-running bounded action, or has a recorded concrete blocker.
-- Venue teams never merge or push `main`. Chief Coordinator owns the sequential central integration gate: before each candidate, verify its exact base against current `main`; after integration, reuse the exact tested candidate evidence for an unchanged fast-forward tree and rerun the full suite only when integration produced a different tree.
-- Nado or Extended implementation may not edit shared Scanner, runtime, economics, strategy, or Telegram code. If either lane requires a shared-core edit, that lane stops and needs a separate central integration decision before any such change.
-- Every lane is testnet-only, with every potential exposure/notional `<= USD 500`; mainnet and real funds are prohibited. Operational success requires authoritative zero open orders and exact flatness. Ambiguous place, cancel, or close is never retried blindly and must reconcile through exact official identity. The sole narrow exception is the user-accepted empirical risk in `TESTNET-002-RISEX-ORDER-LIFECYCLE-001`: after its later separately gated live experiment, bounded recovery may stop as `FAILED_HALTED_MANUAL_RECOVERY` with only the minimum-size RISEx testnet exposure or a known experiment order still unresolved. That outcome is failure, never operational acceptance, exact-flat acceptance, or strategy readiness.
-- Accepted venue history and the sole current follow-up for each lane live in `STATUS.md` and `NEXT_TASK.md`. No Builder starts until the venue governance candidate is published to `main` and Chief separately authorizes it.
+- **A — logic/fixtures:** focused tests, one regression per distinct bug/risk, and one final-candidate full suite. No operational ceremony.
+- **B — authenticated read-only:** correct environment/account, secure credentials, critical semantic validation, bounded timeout, redaction, and fail-closed readiness. A proven read-only timeout may use a fresh bounded retry/reconnect; do not impose write-style exactly-once semantics without evidence of a durable side effect.
+- **C — testnet write:** exact environment/account, notional `<= USD 500`, durable unique write identity before dispatch, no blind replay of an ambiguous write, authoritative identity reconciliation, and final zero relevant open orders plus exact flatness. Unrelated account state or contradiction stops writes. Unexpected behavior may halt for manual testnet recovery; that is failure, never acceptance.
+- **D — mainnet:** future separately authorized production hardening. Do not front-load comprehensive automatic recovery, liquidation/margin, observability, or real-money controls into A/B/C.
+- Operational run identity is runtime data in a protected durable journal, not normally a source constant or Git commit. Write-intent identity remains separate and durable before every dispatch.
 
-## Git workflow
+## Evidence and testing philosophy
 
-- `main` contains only centrally integrated Chief-accepted work.
-- Builder starts from the exact centrally authorized `main` and works on a separate `codex/<venue-or-lane-prefix>-<bounded-slice>` branch/worktree.
-- Before edits, Builder reports repository root, branch, HEAD, and short status.
-- Builder must not work on `main`, merge, rebase, rewrite history, or alter unrelated changes.
-- Builder runs focused tests while developing, reviews the diff, creates the bounded candidate commit, and produces the full `pytest` plus dependency-check evidence once for the final candidate SHA. A later code change invalidates that evidence and requires one new final-candidate run; intermediate fix commits use only the affected focused/adverse tests.
-- Chief reviews Builder work. Before rejection, fixes remain on the same branch. After rejection, that branch and its commits remain immutable; a later correction requires a fresh venue branch/worktree from the exact authorized base within the same bounded scope.
-- Fix cycles have no fixed numerical limit. Each cycle is permitted only for a newly identified, concretely reproduced acceptance-breaking defect; it must remain within the same bounded milestone and scope and repeat the affected focused/adverse review. Full-suite and dependency evidence is regenerated only when a corrected final candidate is ready. A fix cycle does not authorize product, live, credential, strategy, shared-core, or cross-venue expansion. Removing the numerical limit does not accept, alter, or reopen rejected branches or commits. If there is no concrete reproducible defect, no bounded progress, or the task genuinely does not converge, stop with `BLOCKED — TASK DID NOT CONVERGE`.
-- Only Chief integrates or pushes `main`, preserving accepted commits without rewriting them.
+- Use official sources and observed testnet evidence. Observe uncertainty through public data, then bounded authenticated read-only access, then the smallest safe testnet write when only execution can answer it. Unknown write-safety semantics block writes; never guess.
+- Validate incoming responses strictly on required safety semantics but tolerate additive irrelevant fields. Outgoing signed/canonical payloads remain exact closed-world contracts.
+- Tests protect distinct risks, not a target count. Keep unique economics, arithmetic, identity, signing, secret, write-before-dispatch, no-replay, reconciliation, restart/ambiguous-write, zero-order, and exact-flat coverage; consolidate equivalent malformed-input, harmless-read interruption/counter, shared-storage, redaction, and historical-RED cases.
+- Do not model hypothetical venue behavior without official, observed, or defect evidence. Safe halt plus manual recovery is sufficient for an unforeseen first-lifecycle testnet failure.
 
-## Scope and safety
+## Scope and completion
 
-- Python 3.11; one async process; `aiohttp`, `sqlite3`, `Decimal`, dataclasses, `pytest`, and `pytest-asyncio`.
-- Paper remains the default product. Current testnet steps are only those explicitly bounded in `NEXT_TASK.md`. Public checks precede every secret boundary; credential/private reads and order/cancel/close writes require separate Chief Coordinator operational gates. Mainnet, real funds, and strategy execution remain prohibited until their separately authorized phase.
-- Use only official RISEx, Extended, and Nado sources. Unknown semantics or parity blocks operational acceptance; never guess. The bounded RISEx empirical slice may fixture-test only its exact official API/ABI and current official-UI-compatible contract under the explicit user risk decision, and no empirical outcome generalizes undocumented semantics.
-- Keep the implementation small. No compatibility layers, frameworks, services, dashboards, or functionality excluded by `SYSTEM_SPEC.md`. TELEGRAM-001 permits only the outbound notifications defined there, not a general alerting platform.
-- Each fact, formula, and state has exactly one authoritative owner: adapters own venue normalization and funding semantics; runtime owns public data, cadence, and lifecycle orchestration; Scanner owns route blockers and PnL evaluation; repository owns persistence only; Telegram owns presentation and delivery only. When duplication or accumulated complexity causes a defect, remove or consolidate it before adding another flag, layer, cache, or state machine.
-- Product rules in frozen `SYSTEM_SPEC.md` change only for a proven official-API contradiction, implementation impossibility, or explicit user decision.
-- Never commit secrets, credentials, local databases, caches, or generated reports.
-
-## Milestone completion
-
-- Preserve exact arithmetic and funding/PnL invariants even when simplifying code or documentation.
-- CI tests use fixtures only; live smoke checks are opt-in.
-- Consolidate redundant deterministic cases when the same invariant, transition, and failure boundary are already proved equivalently. Keep one clear representative per distinct behavior and retain every unique credential, interruption, ambiguity, no-blind-retry, identity, write, and exact-flat safety boundary. Never optimize for a lower test count by deleting unique risk coverage.
-- Builder report is at most 10 lines and states branch, exact candidate SHA, focused/full evidence, and material limitations.
-- Chief owns accepted-state updates; Builder changes `STATUS.md`/`NEXT_TASK.md` only when the bounded handoff explicitly includes them and only after acceptance evidence exists.
-- After an accepted slice, Chief authorizes only the next strictly necessary action and keeps at most one active slice per venue and three project-wide. Do not infer product expansion.
+- Paper remains default. Testnet modules stay isolated from normal startup. Mainnet, real funds, and strategy execution are prohibited until separately authorized; secrets never enter Git, arguments, logs, reports, databases, or fixtures.
+- Keep venue authentication, signing, wire identity, order/cancel/close, position, and funding semantics venue-specific until all three first lifecycles provide evidence. Do not add frameworks, generic execution platforms, services, dashboards, or speculative abstractions.
+- Nado/Extended do not edit shared Scanner, runtime, economics, strategy, or Telegram without a separate central decision. Product invariants in `SYSTEM_SPEC.md` change only by explicit user decision or proven official contradiction/impossibility.
+- RISEx, Nado, and Extended must each prove one bounded testnet place/reconcile/cancel/close lifecycle ending with authoritative zero orders and exact flatness. Then stop infrastructure expansion, perform one bounded commonality review, and open a separate strategy-testnet measurement task.
+- Chief owns `STATUS.md`/`NEXT_TASK.md`. Keep them current and concise; completed detail stays in Git and operational journals.

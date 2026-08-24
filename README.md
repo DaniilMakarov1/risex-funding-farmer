@@ -74,8 +74,6 @@ Credentials are read only from the environment and must not be committed,
 logged, persisted, or placed in CLI arguments. Any explicit risk acceptance for
 a disclosed token is recorded without the token value. This integration is outbound-only: the
 application does not poll `getUpdates`, accept commands, trigger scans, or place orders.
-An Architect may use a separately authorized one-shot `getUpdates` diagnostic
-only to discover the configured destination; it is not part of `paper-run`.
 Delivery is best effort; a full queue or Telegram outage can drop messages so it
 cannot delay market-data processing, strategy deadlines, or safe shutdown.
 Every completed authoritative `FULL` scan sends all 20 existing ordered route
@@ -111,6 +109,6 @@ risex-farmer --db paper.db report
 
 See `SYSTEM_SPEC.md` for frozen product behavior, `STATUS.md` for the accepted baseline, and `NEXT_TASK.md` for the current authorization boundary.
 
-The RISEx, Extended, and Nado lifecycle modules are not CLI modes and must not be imported by normal Farmer startup. Deterministic fixtures never access credentials or the network. Every real credential/private-read action and every testnet place/cancel/close action requires a distinct operational gate, uses official identity, remains at or below USD 500 notional, and fails closed on ambiguity without a blind retry. Venue success requires authoritative zero open orders and exact flatness.
+The RISEx, Extended, and Nado lifecycle modules are not CLI modes and must not be imported by normal Farmer startup. Their verification levels and safety gates are defined once in `AGENTS.md`; current venue state and work live only in `STATUS.md` and `NEXT_TASK.md`.
 
 Strategy-driven testnet execution is a later, separate measurement task. It starts only after all three venue lifecycles are independently accepted and records opportunity frequency, planned-versus-actual execution, fees, resolved funding, and complete net PnL; degraded or unresolved trades do not support profitability claims.

@@ -1,28 +1,27 @@
 # Active bounded tasks
 
-One slice per venue. Secrets stay outside Git and reports. Private reads and writes run sequentially and never retry an ambiguous operation.
+One slice per venue. Apply the A/B/C levels and safety core from `AGENTS.md`; operational run IDs are data, not source milestones.
 
-## RISEx — preserve the fixture/live boundary
+## RISEx — minimal Level C operational binding
 
-Status: `BLOCKED — FROZEN FIXTURE MILESTONE HAS NO LIVE OPERATIONAL PATH`.
+Status: `READY FOR CHIEF START GATE`.
 
-- The official identity chain and fixture lifecycle are accepted, but `SYSTEM_SPEC.md` section 25 explicitly excludes a production credential invocation, private/live transport, CLI, and live-smoke path from this milestone. Do not create an operational adapter by governance inference.
-- A new explicit user decision is required before the minimum sealed Tier C production binding may be specified or implemented. Until then do not load credentials, sign, dispatch, or run live traffic; all accepted invocations remain consumed.
+- Add only the isolated credential/signing/official-transport binding needed to run the accepted lifecycle with runtime run identity; do not change lifecycle semantics, shared code, strategy, or paper behavior.
+- Candidate acceptance requires official contract evidence, focused Level C regressions, and one final full suite. A later separate Chief operational gate controls the single minimum-size testnet write lifecycle.
 
-## Nado — resume public preflight diagnosis
+## Nado — capture official catalog semantics
 
-Status: `BLOCKED — HTTP 200 RECEIVED WITHOUT CATALOG-SHAPE EVIDENCE`.
+Status: `READY FOR BOUNDED PUBLIC OBSERVATION`.
 
-- The post-cooldown credential-free request is consumed and must not be retried: it proved gateway availability but the diagnostic collector did not capture a complete response body or schema.
-- Any later catalog capture requires a fresh separately gated credential-free operation and a fresh Builder session. Until complete official shape evidence exists, do not correct fixtures by inference.
-- Do not read credentials or create op004 until the public contract passes.
+- Perform one fresh credential-free official catalog read with bounded timeout/size and normal HTTP decoding. Capture only sanitized required field/type semantics; a read failure may use the bounded Level B policy, never a write-style replay rule.
+- Change code only if observed semantics contradict it. Do not load credentials until the critical catalog/account contract validates.
 
-## Extended — wait for official stream recovery
+## Extended — resume authenticated read-only readiness
 
-Status: `BLOCKED — OFFICIAL TESTNET ACCOUNT STREAM RETURNED HTTP 503`.
+Status: `WAITING FOR OFFICIAL STREAM AVAILABILITY`.
 
-- Private-read op004 is consumed after its first stream-open attempt failed before completion. Do not reuse its invocation or store and do not retry it.
-- After a demonstrated external-state change, confirm the current official testnet account stream is available without loading credentials. Only then may a fresh Builder bind one new unique invocation/store from the then-current published `main`; the resulting private-read operation requires a new separate Chief gate.
+- Check the official stream endpoint with one credential-free bounded handshake. If service is available, run one fresh bounded authenticated read using runtime journal identity; do not edit source merely to increment an operation number.
+- Validate required account/order/position semantics and authoritative zero orders/exact flatness. Add code/tests only for an observed contract defect.
 
 ## Completion
 
