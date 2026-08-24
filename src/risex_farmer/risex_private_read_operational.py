@@ -43,7 +43,7 @@ STORE_BASENAME = ".risex-funding-farmer-risex-private-read-20260824-new-op-008.s
 FIXED_STORE_PATH = Path(
     "/Users/daniilmakarov/.risex-funding-farmer-risex-private-read-20260824-new-op-008.sqlite3"
 )
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 _APPLICATION_ID = 0x52585052
 _MAX_BYTES = 1_048_576
 _DEADLINE_SECONDS = 5
@@ -99,9 +99,12 @@ _PRIVATE_COUNTERS = (
     "orders_subscribe",
     "orders_snapshot",
     "positions_subscribe",
-    "positions_receive",
-    "positions_parse",
-    "positions_schema",
+    "positions_ack_receive",
+    "positions_ack_parse",
+    "positions_ack_validate",
+    "positions_snapshot_receive",
+    "positions_snapshot_parse",
+    "positions_snapshot_schema",
     "positions_flat",
     "positions_freshness",
     "positions_followup_guard",
@@ -130,11 +133,17 @@ _REASON_VALUES = frozenset({
     "auth_v2_malformed",
     "auth_v2_schema_invalid",
     "auth_v2_error",
-    "positions_timeout",
-    "positions_close",
-    "positions_binary",
-    "positions_malformed",
-    "positions_schema_invalid",
+    "positions_ack_timeout",
+    "positions_ack_close",
+    "positions_ack_binary",
+    "positions_ack_malformed",
+    "positions_ack_schema_invalid",
+    "positions_ack_error",
+    "positions_snapshot_timeout",
+    "positions_snapshot_close",
+    "positions_snapshot_binary",
+    "positions_snapshot_malformed",
+    "positions_snapshot_schema_invalid",
     "positions_not_flat",
     "positions_stale",
     "positions_followup_frame",
@@ -142,7 +151,7 @@ _REASON_VALUES = frozenset({
 _LEDGER_SCHEMA = (
     "CREATE TABLE run ("
     "singleton INTEGER PRIMARY KEY CHECK(singleton=1),"
-    "schema_version INTEGER NOT NULL CHECK(schema_version=5),"
+    "schema_version INTEGER NOT NULL CHECK(schema_version=6),"
     "invocation_id TEXT NOT NULL CHECK(length(invocation_id)>0),"
     "store_path_sha256 TEXT NOT NULL CHECK(length(store_path_sha256)=64),"
     "state TEXT NOT NULL CHECK(state IN "
@@ -239,7 +248,7 @@ class _PositionsFailure(Exception):
     def __init__(self, reason: str, classifier: str | None = None) -> None:
         if reason not in _REASON_VALUES or not reason.startswith("positions_"):
             raise ValueError("positions failure reason")
-        if (reason == "positions_schema_invalid") != (
+        if (reason == "positions_snapshot_schema_invalid") != (
             classifier in _POSITIONS_SCHEMA_CLASSIFIERS
         ):
             raise ValueError("positions failure classifier")
@@ -521,7 +530,9 @@ class DurableCounterLedger:
         if terminal:
             if auth_shape_present != (row[8] == "auth_v2_schema_invalid"):
                 raise ValueError("auth_v2 shape terminal")
-            if positions_shape_present != (row[8] == "positions_schema_invalid"):
+            if positions_shape_present != (
+                row[8] == "positions_snapshot_schema_invalid"
+            ):
                 raise ValueError("positions shape terminal")
         elif auth_shape_present and not (
             row[3] == "CLAIMED"
@@ -533,9 +544,9 @@ class DurableCounterLedger:
             raise ValueError("auth_v2 shape stage")
         elif positions_shape_present and not (
             row[3] == "CLAIMED"
-            and counters["positions_receive"] == (1, 1)
-            and counters["positions_parse"] == (1, 1)
-            and counters["positions_schema"] == (1, 0)
+            and counters["positions_snapshot_receive"] == (1, 1)
+            and counters["positions_snapshot_parse"] == (1, 1)
+            and counters["positions_snapshot_schema"] == (1, 0)
             and counters["positions_flat"] == (0, 0)
         ):
             raise ValueError("positions shape stage")
@@ -567,8 +578,12 @@ class DurableCounterLedger:
             "validation_failed", "cancelled", "interrupted_nonterminal",
             "auth_v2_timeout", "auth_v2_close", "auth_v2_binary",
             "auth_v2_malformed", "auth_v2_schema_invalid", "auth_v2_error",
-            "positions_timeout", "positions_close", "positions_binary",
-            "positions_malformed", "positions_schema_invalid",
+            "positions_ack_timeout", "positions_ack_close",
+            "positions_ack_binary", "positions_ack_malformed",
+            "positions_ack_schema_invalid", "positions_ack_error",
+            "positions_snapshot_timeout", "positions_snapshot_close",
+            "positions_snapshot_binary", "positions_snapshot_malformed",
+            "positions_snapshot_schema_invalid",
             "positions_not_flat", "positions_stale", "positions_followup_frame",
         }:
             raise ValueError("unknown invariant")
@@ -699,9 +714,9 @@ class DurableCounterLedger:
             raise ValueError("positions shape")
         counters = self._counter_rows()
         if (
-            counters["positions_receive"] != (1, 1)
-            or counters["positions_parse"] != (1, 1)
-            or counters["positions_schema"] != (1, 0)
+            counters["positions_snapshot_receive"] != (1, 1)
+            or counters["positions_snapshot_parse"] != (1, 1)
+            or counters["positions_snapshot_schema"] != (1, 0)
             or counters["positions_flat"] != (0, 0)
         ):
             raise ValueError("positions shape stage")
@@ -753,7 +768,7 @@ class DurableCounterLedger:
         ):
             result = Result.UNKNOWN
             reason = "validation_failed"
-        if reason == "positions_schema_invalid" and not (
+        if reason == "positions_snapshot_schema_invalid" and not (
             row[11] in _POSITIONS_SCHEMA_CLASSIFIERS
             and row[12] is not None
             and row[13] is not None
@@ -783,19 +798,25 @@ class DurableCounterLedger:
                 "THEN auth_v2_shape ELSE NULL END,"
                 "auth_v2_shape_sha256=CASE WHEN ?='auth_v2_schema_invalid' "
                 "THEN auth_v2_shape_sha256 ELSE NULL END,"
-                "positions_schema_classifier=CASE WHEN ?='positions_schema_invalid' "
+                "positions_schema_classifier=CASE WHEN "
+                "?='positions_snapshot_schema_invalid' "
                 "THEN positions_schema_classifier ELSE NULL END,"
-                "positions_shape=CASE WHEN ?='positions_schema_invalid' "
+                "positions_shape=CASE WHEN ?='positions_snapshot_schema_invalid' "
                 "THEN positions_shape ELSE NULL END,"
-                "positions_shape_sha256=CASE WHEN ?='positions_schema_invalid' "
+                "positions_shape_sha256=CASE WHEN "
+                "?='positions_snapshot_schema_invalid' "
                 "THEN positions_shape_sha256 ELSE NULL END,"
-                "positions_method_class=CASE WHEN ?='positions_schema_invalid' "
+                "positions_method_class=CASE WHEN "
+                "?='positions_snapshot_schema_invalid' "
                 "THEN positions_method_class ELSE NULL END,"
-                "positions_channel_class=CASE WHEN ?='positions_schema_invalid' "
+                "positions_channel_class=CASE WHEN "
+                "?='positions_snapshot_schema_invalid' "
                 "THEN positions_channel_class ELSE NULL END,"
-                "positions_type_class=CASE WHEN ?='positions_schema_invalid' "
+                "positions_type_class=CASE WHEN "
+                "?='positions_snapshot_schema_invalid' "
                 "THEN positions_type_class ELSE NULL END,"
-                "positions_status_class=CASE WHEN ?='positions_schema_invalid' "
+                "positions_status_class=CASE WHEN "
+                "?='positions_snapshot_schema_invalid' "
                 "THEN positions_status_class ELSE NULL END WHERE singleton=1",
                 (
                     result.value, time.time_ns(), reason, reason, reason,
@@ -1284,13 +1305,44 @@ def _parse_auth_v2(raw: Any) -> Any:
         raise _AuthV2Failure("auth_v2_malformed") from None
 
 
+def _parse_positions_ack(raw: Any) -> Any:
+    if type(raw) is not str:
+        raise _PositionsFailure("positions_ack_malformed")
+    try:
+        encoded = raw.encode("utf-8", errors="strict")
+        if len(encoded) > _MAX_BYTES:
+            raise ValueError("private transport rejected")
+        return _strict_json(encoded)
+    except Exception:
+        raise _PositionsFailure("positions_ack_malformed") from None
+
+
+def _validate_positions_ack(value: Any) -> Mapping[str, str]:
+    if (
+        type(value) is not dict
+        or value.get("method") != "subscribe"
+        or value.get("status") not in {"success", "error"}
+    ):
+        raise _PositionsFailure("positions_ack_schema_invalid")
+    status = value.get("status")
+    if status == "error":
+        raise _PositionsFailure("positions_ack_error")
+    if (
+        type(value.get("data")) is not dict
+        or type(value.get("channel")) is not str
+        or type(value.get("type")) is not str
+    ):
+        raise _PositionsFailure("positions_ack_schema_invalid")
+    return {"method": "subscribe", "status": "success"}
+
+
 def _parse_positions_snapshot(raw: Any) -> Any:
     if type(raw) is not str:
-        raise _PositionsFailure("positions_malformed")
+        raise _PositionsFailure("positions_snapshot_malformed")
     try:
         return _strict_json(raw.encode("utf-8", errors="strict"))
     except Exception:
-        raise _PositionsFailure("positions_malformed") from None
+        raise _PositionsFailure("positions_snapshot_malformed") from None
 
 
 def _validate_auth_v2_schema(value: Any) -> Mapping[str, Any]:
@@ -1457,27 +1509,35 @@ class FixedRisexPrivateReadTransport:
             {"method": "subscribe", "params": {"channel": "positions"}}
         )
 
-    async def positions_receive(self) -> str:
+    async def _positions_receive(self, prefix: str) -> str:
+        if prefix not in {"positions_ack", "positions_snapshot"}:
+            raise ValueError("private transport rejected")
         if self._socket is None:
             raise ValueError("private transport rejected")
         try:
             incoming = await self._socket.receive(timeout=_DEADLINE_SECONDS)
         except asyncio.TimeoutError:
-            raise _PositionsFailure("positions_timeout") from None
+            raise _PositionsFailure(f"{prefix}_timeout") from None
         except Exception:
-            raise _PositionsFailure("positions_close") from None
+            raise _PositionsFailure(f"{prefix}_close") from None
         if incoming.type is aiohttp.WSMsgType.BINARY:
-            raise _PositionsFailure("positions_binary")
+            raise _PositionsFailure(f"{prefix}_binary")
         if incoming.type in {
             aiohttp.WSMsgType.CLOSE,
             aiohttp.WSMsgType.CLOSING,
             aiohttp.WSMsgType.CLOSED,
             aiohttp.WSMsgType.ERROR,
         }:
-            raise _PositionsFailure("positions_close")
+            raise _PositionsFailure(f"{prefix}_close")
         if incoming.type is not aiohttp.WSMsgType.TEXT or type(incoming.data) is not str:
-            raise _PositionsFailure("positions_malformed")
+            raise _PositionsFailure(f"{prefix}_malformed")
         return incoming.data
+
+    async def positions_ack_receive(self) -> str:
+        return await self._positions_receive("positions_ack")
+
+    async def positions_snapshot_receive(self) -> str:
+        return await self._positions_receive("positions_snapshot")
 
     async def positions_followup_guard(self) -> None:
         if self._socket is None:
@@ -1487,7 +1547,7 @@ class FixedRisexPrivateReadTransport:
         except asyncio.TimeoutError:
             return None
         except Exception:
-            raise _PositionsFailure("positions_close") from None
+            raise _PositionsFailure("positions_snapshot_close") from None
         if extra is not None:
             raise _PositionsFailure("positions_followup_frame")
         return None
@@ -1817,34 +1877,57 @@ async def _execute(
             _none,
             dependencies.crash_hook,
         )
-        positions_raw = await _phase(
+        positions_ack_raw = await _phase(
             ledger,
-            "positions_receive",
-            transport.positions_receive,
+            "positions_ack_receive",
+            transport.positions_ack_receive,
             _identity,
             dependencies.crash_hook,
         )
-        positions_parsed = await _phase(
+        positions_ack_parsed = await _phase(
             ledger,
-            "positions_parse",
-            lambda: _parse_positions_snapshot(positions_raw),
+            "positions_ack_parse",
+            lambda: _parse_positions_ack(positions_ack_raw),
+            _identity,
+            dependencies.crash_hook,
+        )
+        positions_ack = await _phase(
+            ledger,
+            "positions_ack_validate",
+            lambda: _validate_positions_ack(positions_ack_parsed),
+            _identity,
+            dependencies.crash_hook,
+        )
+        del positions_ack
+        positions_snapshot_raw = await _phase(
+            ledger,
+            "positions_snapshot_receive",
+            transport.positions_snapshot_receive,
+            _identity,
+            dependencies.crash_hook,
+        )
+        positions_snapshot_parsed = await _phase(
+            ledger,
+            "positions_snapshot_parse",
+            lambda: _parse_positions_snapshot(positions_snapshot_raw),
             _identity,
             dependencies.crash_hook,
         )
         try:
             positions_decoded = await _phase(
                 ledger,
-                "positions_schema",
-                lambda: _decode_positions_snapshot(positions_parsed),
+                "positions_snapshot_schema",
+                lambda: _decode_positions_snapshot(positions_snapshot_parsed),
                 _identity,
                 dependencies.crash_hook,
             )
         except _PositionsFailure as failure:
-            if failure.reason == "positions_schema_invalid":
+            if failure.reason == "positions_snapshot_schema_invalid":
                 assert failure.classifier is not None
                 ledger.record_positions_shape(
-                    failure.classifier, *_positions_shape(positions_parsed),
-                    *_positions_semantic_classes(positions_parsed),
+                    failure.classifier,
+                    *_positions_shape(positions_snapshot_parsed),
+                    *_positions_semantic_classes(positions_snapshot_parsed),
                 )
             raise
         positions_flat = await _phase(
@@ -1908,13 +1991,13 @@ def _decode_positions_snapshot(value: Any) -> tuple[tuple[Any, ...], str]:
         )
     except Exception:
         raise _PositionsFailure(
-            "positions_schema_invalid", "top_envelope",
+            "positions_snapshot_schema_invalid", "top_envelope",
         ) from None
     try:
         sizes = PrivateReadPreflight._decode_position_sizes(data)
     except Exception:
         raise _PositionsFailure(
-            "positions_schema_invalid", "first_or_later_row",
+            "positions_snapshot_schema_invalid", "first_or_later_row",
         ) from None
     return sizes, worker_timestamp
 

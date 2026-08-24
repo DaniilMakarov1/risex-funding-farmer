@@ -112,12 +112,14 @@ class SyntheticTransport:
     def __init__(
         self, calls: list[str], *, public_mutator=None,
         auth_response='{"method":"auth_v2","status":"success"}',
+        positions_ack_response=None,
         positions_response=None,
     ) -> None:
         self._calls = calls
         self._public_index = 0
         self._public_mutator = public_mutator
         self._auth_response = auth_response
+        self._positions_ack_response = positions_ack_response
         self._positions_response = positions_response
 
     async def public_get(self, index: int) -> HttpResponse:
@@ -169,8 +171,21 @@ class SyntheticTransport:
     async def positions_subscribe(self) -> None:
         self._calls.append("positions_subscribe")
 
-    async def positions_receive(self):
-        self._calls.append("positions_receive")
+    async def positions_ack_receive(self):
+        self._calls.append("positions_ack_receive")
+        value = self._positions_ack_response
+        if value is not None:
+            return value
+        return json.dumps({
+            "method": "subscribe",
+            "status": "success",
+            "data": {},
+            "channel": "empirical-channel",
+            "type": "empirical-type",
+        }, separators=(",", ":"))
+
+    async def positions_snapshot_receive(self):
+        self._calls.append("positions_snapshot_receive")
         value = self._positions_response
         if value is not None:
             return value
@@ -238,13 +253,31 @@ class _PositionsSocketTransport(SyntheticTransport):
         transport._socket = self._positions_socket
         return transport
 
-    async def positions_receive(self):
-        self._calls.append("positions_receive")
-        return await self._fixed().positions_receive()
+    async def positions_snapshot_receive(self):
+        self._calls.append("positions_snapshot_receive")
+        return await self._fixed().positions_snapshot_receive()
 
     async def positions_followup_guard(self):
         self._calls.append("positions_followup_guard")
         return await self._fixed().positions_followup_guard()
+
+
+class _PositionsAckSocketTransport(SyntheticTransport):
+    def __init__(self, calls, socket) -> None:
+        super().__init__(calls)
+        self._positions_ack_socket = socket
+
+    async def positions_ack_receive(self):
+        self._calls.append("positions_ack_receive")
+        transport = object.__new__(FixedRisexPrivateReadTransport)
+        transport._socket = self._positions_ack_socket
+        return await transport.positions_ack_receive()
+
+
+class _PositionsSequenceSocketTransport(_PositionsSocketTransport):
+    async def positions_ack_receive(self):
+        self._calls.append("positions_ack_receive")
+        return await self._fixed().positions_ack_receive()
 
 
 class _Body:
@@ -323,7 +356,8 @@ def test_production_transport_and_capability_surfaces_are_narrow():
         "REST_ORIGIN", "WS_URL", "TRUST_ENV", "ALLOW_REDIRECTS",
         "DEADLINE_SECONDS", "PUBLIC_REQUEST_COUNT", "public_get", "nonce_get",
         "auth_v2_dispatch", "auth_v2_receive", "orders_subscribe", "orders_snapshot",
-        "positions_subscribe", "positions_receive", "positions_followup_guard", "close",
+        "positions_subscribe", "positions_ack_receive", "positions_snapshot_receive",
+        "positions_followup_guard", "close",
     }
     source = Path(__file__).parents[1] / "src/risex_farmer/risex_private_read_operational.py"
     text = source.read_text()
@@ -459,7 +493,7 @@ async def test_success_has_exact_sequence_full_counters_and_agreeing_barriers(tm
     path = tmp_path / "fixture.sqlite3"
     report = await _run_fixture(dependencies(tmp_path, calls))
     assert report.result is Result.PASSED
-    assert report.schema_version == 5
+    assert report.schema_version == 6
     assert report.auth_v2_shape is None
     assert report.auth_v2_shape_sha256 is None
     assert report.positions_schema_classifier is None
@@ -471,17 +505,17 @@ async def test_success_has_exact_sequence_full_counters_and_agreeing_barriers(tm
     assert report.positions_status_class is None
     assert report.barrier_a_fingerprint == report.barrier_b_fingerprint
     assert set(report.counters) == set(_COUNTER_NAMES)
-    assert len(_COUNTER_NAMES) == 41
-    assert len(operational._PRIVATE_COUNTERS) == 21
+    assert len(_COUNTER_NAMES) == 44
+    assert len(operational._PRIVATE_COUNTERS) == 24
     assert all(value == {"attempts": 1, "completions": 1} for value in report.counters.values())
     assert calls[:9] == [f"public_a_{index:02d}" for index in range(1, 10)]
-    assert calls[9:22] == [
+    assert calls[9:23] == [
         "source_load", "capability_open", "derive", "nonce_get", "sign",
         "auth_v2_dispatch", "auth_v2_receive", "orders_subscribe", "orders_snapshot",
-        "positions_subscribe", "positions_receive", "positions_followup_guard",
-        "capability_close",
+        "positions_subscribe", "positions_ack_receive", "positions_snapshot_receive",
+        "positions_followup_guard", "capability_close",
     ]
-    assert calls[22:31] == [f"public_b_{index:02d}" for index in range(1, 10)]
+    assert calls[23:32] == [f"public_b_{index:02d}" for index in range(1, 10)]
     assert calls[-2:] == ["source_close", "transport_close"]
     assert path.stat().st_mode & 0o777 == 0o600
     persisted = path.read_bytes().decode("latin1")
@@ -490,7 +524,7 @@ async def test_success_has_exact_sequence_full_counters_and_agreeing_barriers(tm
     database = sqlite3.connect(path)
     try:
         assert database.execute("PRAGMA integrity_check").fetchone() == ("ok",)
-        assert database.execute("PRAGMA user_version").fetchone() == (5,)
+        assert database.execute("PRAGMA user_version").fetchone() == (6,)
     finally:
         database.close()
 
@@ -841,6 +875,47 @@ async def test_nonterminal_shape_restart_clears_witness_without_effects(tmp_path
 @pytest.mark.parametrize(
     ("message_type", "timeout", "reason"),
     (
+        (None, True, "positions_ack_timeout"),
+        (operational.aiohttp.WSMsgType.CLOSE, False, "positions_ack_close"),
+        (operational.aiohttp.WSMsgType.ERROR, False, "positions_ack_close"),
+        (operational.aiohttp.WSMsgType.BINARY, False, "positions_ack_binary"),
+        (operational.aiohttp.WSMsgType.PING, False, "positions_ack_malformed"),
+    ),
+)
+async def test_positions_ack_receive_outcomes_are_redacted_and_stop_sequence(
+    tmp_path, message_type, timeout, reason,
+):
+    calls: list[str] = []
+    secret = "ack-server-controlled-frame-data"
+    outcome = asyncio.TimeoutError if timeout else type(
+        "Message", (), {"type": message_type, "data": secret},
+    )()
+    socket = _SequenceSocket(outcome)
+    report = await _run_fixture(dependencies(
+        tmp_path,
+        calls,
+        transport_factory=lambda: _PositionsAckSocketTransport(calls, socket),
+    ))
+    assert report.result is Result.UNKNOWN and report.reason == reason
+    assert report.counters["positions_ack_receive"] == {
+        "attempts": 1, "completions": 0,
+    }
+    assert report.counters["positions_ack_parse"] == {
+        "attempts": 0, "completions": 0,
+    }
+    assert report.counters["positions_snapshot_receive"] == {
+        "attempts": 0, "completions": 0,
+    }
+    assert socket.receives == 1
+    persisted = (tmp_path / "fixture.sqlite3").read_bytes().decode("latin1")
+    assert secret not in persisted and secret not in json.dumps(report.as_dict())
+    assert not any(call.startswith("public_b_") for call in calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message_type", "timeout", "reason"),
+    (
         (None, True, "auth_v2_timeout"),
         (operational.aiohttp.WSMsgType.CLOSE, False, "auth_v2_close"),
         (operational.aiohttp.WSMsgType.ERROR, False, "auth_v2_close"),
@@ -893,7 +968,9 @@ async def test_official_closed_position_row_completes_split_positions_phases(tmp
     ))
     assert report.result is Result.PASSED and report.reason == "complete"
     for phase in (
-        "positions_receive", "positions_parse", "positions_schema",
+        "positions_ack_receive", "positions_ack_parse", "positions_ack_validate",
+        "positions_snapshot_receive", "positions_snapshot_parse",
+        "positions_snapshot_schema",
         "positions_flat", "positions_freshness", "positions_followup_guard",
     ):
         assert report.counters[phase] == {"attempts": 1, "completions": 1}
@@ -906,21 +983,21 @@ async def test_official_closed_position_row_completes_split_positions_phases(tmp
 @pytest.mark.parametrize(
     ("raw", "reason", "failed_phase"),
     (
-        ('{"method":"snapshot",', "positions_malformed", "positions_parse"),
+        ('{"method":"snapshot",', "positions_snapshot_malformed", "positions_snapshot_parse"),
         (positions_frame(method="update"),
-         "positions_schema_invalid", "positions_schema"),
+         "positions_snapshot_schema_invalid", "positions_snapshot_schema"),
         (positions_frame(position_count=1),
-         "positions_schema_invalid", "positions_schema"),
+         "positions_snapshot_schema_invalid", "positions_snapshot_schema"),
         (positions_frame(extra=True),
-         "positions_schema_invalid", "positions_schema"),
+         "positions_snapshot_schema_invalid", "positions_snapshot_schema"),
         (positions_frame(worker_timestamp="0"),
-         "positions_schema_invalid", "positions_schema"),
+         "positions_snapshot_schema_invalid", "positions_snapshot_schema"),
         (positions_frame({**OFFICIAL_CLOSED_POSITION, "account": "0x" + "22" * 20}),
-         "positions_schema_invalid", "positions_schema"),
+         "positions_snapshot_schema_invalid", "positions_snapshot_schema"),
         (positions_frame({**OFFICIAL_CLOSED_POSITION, "market_id": "0"}),
-         "positions_schema_invalid", "positions_schema"),
+         "positions_snapshot_schema_invalid", "positions_snapshot_schema"),
         (positions_frame({**OFFICIAL_CLOSED_POSITION, "size": "not-decimal"}),
-         "positions_schema_invalid", "positions_schema"),
+         "positions_snapshot_schema_invalid", "positions_snapshot_schema"),
         (positions_frame({**OFFICIAL_CLOSED_POSITION, "size": "0.000001"}),
          "positions_not_flat", "positions_flat"),
         (positions_frame(worker_timestamp="1"),
@@ -941,7 +1018,9 @@ async def test_positions_failures_are_split_redacted_and_terminal(
     assert report.result is Result.UNKNOWN and report.reason == reason
     assert report.counters[failed_phase] == {"attempts": 1, "completions": 0}
     ordered = (
-        "positions_receive", "positions_parse", "positions_schema",
+        "positions_ack_receive", "positions_ack_parse", "positions_ack_validate",
+        "positions_snapshot_receive", "positions_snapshot_parse",
+        "positions_snapshot_schema",
         "positions_flat", "positions_freshness", "positions_followup_guard",
     )
     for phase in ordered[ordered.index(failed_phase) + 1:]:
@@ -949,7 +1028,7 @@ async def test_positions_failures_are_split_redacted_and_terminal(
     assert report.counters["capability_close"] == {"attempts": 1, "completions": 1}
     assert report.counters["terminal_persist"] == {"attempts": 1, "completions": 1}
     assert report.auth_v2_shape is None and report.auth_v2_shape_sha256 is None
-    if reason == "positions_schema_invalid":
+    if reason == "positions_snapshot_schema_invalid":
         assert report.positions_schema_classifier in {
             "top_envelope", "first_or_later_row",
         }
@@ -1010,11 +1089,11 @@ async def test_positions_top_extra_is_not_accepted_and_persists_only_safe_shape(
         transport_factory=lambda: SyntheticTransport(calls, positions_response=raw),
     ))
     assert report.result is Result.UNKNOWN
-    assert report.reason == "positions_schema_invalid"
+    assert report.reason == "positions_snapshot_schema_invalid"
     assert report.positions_schema_classifier == "top_envelope"
     assert report.positions_shape is not None
     assert report.positions_shape.endswith('],"other_key":"present"}')
-    assert report.counters["positions_schema"] == {"attempts": 1, "completions": 0}
+    assert report.counters["positions_snapshot_schema"] == {"attempts": 1, "completions": 0}
     assert report.counters["positions_flat"] == {"attempts": 0, "completions": 0}
     serialized = json.dumps(report.as_dict(), sort_keys=True)
     persisted = (tmp_path / "fixture.sqlite3").read_bytes().decode("latin1")
@@ -1025,7 +1104,7 @@ async def test_positions_top_extra_is_not_accepted_and_persists_only_safe_shape(
 
 
 @pytest.mark.asyncio
-async def test_positions_ack_like_frame_persists_only_fixed_semantic_classes(
+async def test_positions_ack_is_canonicalized_and_extras_are_never_persisted(
     tmp_path,
 ):
     assert "status" not in operational._POSITIONS_SHAPE_TOP_KEYS
@@ -1046,29 +1125,25 @@ async def test_positions_ack_like_frame_persists_only_fixed_semantic_classes(
         "data": {"server-payload-secret": "server-value-secret"},
         "server-unknown-key-secret": "server-unknown-value-secret",
     }, separators=(",", ":"))
-    message = type(
-        "Message", (), {"type": operational.aiohttp.WSMsgType.TEXT, "data": raw},
-    )()
-    socket = _SequenceSocket(message, AssertionError("second receive"))
+    assert operational._validate_positions_ack(
+        operational._parse_positions_ack(raw)
+    ) == {"method": "subscribe", "status": "success"}
     report = await _run_fixture(dependencies(
         tmp_path,
         calls,
-        transport_factory=lambda: _PositionsSocketTransport(calls, socket),
+        transport_factory=lambda: SyntheticTransport(
+            calls, positions_ack_response=raw,
+        ),
     ))
-    assert report.result is Result.UNKNOWN
-    assert report.reason == "positions_schema_invalid"
-    assert report.positions_schema_classifier == "top_envelope"
-    assert (
-        report.positions_method_class,
-        report.positions_channel_class,
-        report.positions_type_class,
-        report.positions_status_class,
-    ) == ("subscribe", "positions", "success", "success")
-    assert report.positions_shape is not None
-    assert "status" not in report.positions_shape
-    assert report.counters["positions_schema"] == {"attempts": 1, "completions": 0}
-    assert report.counters["positions_flat"] == {"attempts": 0, "completions": 0}
-    assert socket.receives == 1
+    assert report.result is Result.PASSED and report.reason == "complete"
+    assert report.positions_schema_classifier is None
+    assert report.positions_shape is None
+    assert report.counters["positions_ack_validate"] == {
+        "attempts": 1, "completions": 1,
+    }
+    assert report.counters["positions_snapshot_schema"] == {
+        "attempts": 1, "completions": 1,
+    }
     serialized = json.dumps(report.as_dict(), sort_keys=True)
     persisted = (tmp_path / "fixture.sqlite3").read_bytes().decode("latin1")
     for forbidden in (
@@ -1077,6 +1152,115 @@ async def test_positions_ack_like_frame_persists_only_fixed_semantic_classes(
     ):
         assert forbidden not in serialized
         assert forbidden not in persisted
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raw", "reason", "failed_phase"),
+    (
+        ('{"method":"subscribe",', "positions_ack_malformed", "positions_ack_parse"),
+        ('{"method":"subscribe","method":"subscribe","status":"success",'
+         '"data":{},"channel":"x","type":"y"}',
+         "positions_ack_malformed", "positions_ack_parse"),
+        ('{"method":"subscribe","status":NaN,"data":{},'
+         '"channel":"x","type":"y"}',
+         "positions_ack_malformed", "positions_ack_parse"),
+        (json.dumps({
+            "method": "snapshot", "status": "success", "data": {},
+            "channel": "positions", "type": "snapshot",
+        }), "positions_ack_schema_invalid", "positions_ack_validate"),
+        (json.dumps({
+            "method": "subscribe", "status": "success", "data": [],
+            "channel": "positions", "type": "success",
+        }), "positions_ack_schema_invalid", "positions_ack_validate"),
+        (json.dumps({
+            "method": "subscribe", "status": "success", "data": {},
+            "channel": 7, "type": "success",
+        }), "positions_ack_schema_invalid", "positions_ack_validate"),
+        (json.dumps({
+            "method": "subscribe", "status": "success", "data": {},
+            "channel": "positions", "type": None,
+        }), "positions_ack_schema_invalid", "positions_ack_validate"),
+        (json.dumps({
+            "method": "subscribe", "status": "error", "data": {},
+            "channel": "server-channel-secret", "type": "server-type-secret",
+        }), "positions_ack_error", "positions_ack_validate"),
+        (json.dumps({
+            "method": "subscribe", "status": "error",
+            "server-error-secret": "server-error-value-secret",
+        }), "positions_ack_error", "positions_ack_validate"),
+    ),
+)
+async def test_positions_ack_failures_are_terminal_redacted_and_never_read_snapshot(
+    tmp_path, raw, reason, failed_phase,
+):
+    calls: list[str] = []
+    report = await _run_fixture(dependencies(
+        tmp_path,
+        calls,
+        transport_factory=lambda: SyntheticTransport(
+            calls, positions_ack_response=raw,
+        ),
+    ))
+    assert report.result is Result.UNKNOWN and report.reason == reason
+    assert report.counters[failed_phase] == {"attempts": 1, "completions": 0}
+    assert report.counters["positions_snapshot_receive"] == {
+        "attempts": 0, "completions": 0,
+    }
+    assert "positions_snapshot_receive" not in calls
+    assert report.positions_schema_classifier is None
+    assert report.positions_shape is None and report.positions_shape_sha256 is None
+    serialized = json.dumps(report.as_dict(), sort_keys=True)
+    persisted = (tmp_path / "fixture.sqlite3").read_bytes().decode("latin1")
+    for forbidden in (
+        raw, "server-channel-secret", "server-type-secret",
+        "server-error-secret", "server-error-value-secret",
+    ):
+        assert forbidden not in serialized and forbidden not in persisted
+
+    restarted = await _run_fixture(dependencies(
+        tmp_path,
+        [],
+        source_factory=lambda: (_ for _ in ()).throw(AssertionError("source")),
+        transport_factory=lambda: (_ for _ in ()).throw(AssertionError("transport")),
+    ))
+    assert restarted == report
+
+
+def test_positions_ack_parser_enforces_existing_fixed_frame_bound(monkeypatch):
+    monkeypatch.setattr(operational, "_MAX_BYTES", 32)
+    with pytest.raises(operational._PositionsFailure) as failure:
+        operational._parse_positions_ack("x" * 33)
+    assert failure.value.reason == "positions_ack_malformed"
+
+
+@pytest.mark.asyncio
+async def test_valid_ack_followed_by_second_ack_is_snapshot_schema_invalid(tmp_path):
+    calls: list[str] = []
+    second = json.dumps({
+        "method": "subscribe", "status": "success", "data": {},
+        "channel": "second-channel-secret", "type": "second-type-secret",
+    }, separators=(",", ":"))
+    report = await _run_fixture(dependencies(
+        tmp_path,
+        calls,
+        transport_factory=lambda: SyntheticTransport(
+            calls, positions_response=second,
+        ),
+    ))
+    assert report.result is Result.UNKNOWN
+    assert report.reason == "positions_snapshot_schema_invalid"
+    assert report.counters["positions_ack_validate"] == {
+        "attempts": 1, "completions": 1,
+    }
+    assert report.counters["positions_snapshot_schema"] == {
+        "attempts": 1, "completions": 0,
+    }
+    assert report.positions_schema_classifier == "top_envelope"
+    serialized = json.dumps(report.as_dict(), sort_keys=True)
+    persisted = (tmp_path / "fixture.sqlite3").read_bytes().decode("latin1")
+    for forbidden in (second, "second-channel-secret", "second-type-secret"):
+        assert forbidden not in serialized and forbidden not in persisted
 
 
 @pytest.mark.parametrize(
@@ -1141,7 +1325,7 @@ async def test_positions_top_missing_type_and_empty_shape_are_bounded(
         calls,
         transport_factory=lambda: SyntheticTransport(calls, positions_response=raw),
     ))
-    assert report.reason == "positions_schema_invalid"
+    assert report.reason == "positions_snapshot_schema_invalid"
     assert report.positions_schema_classifier == "top_envelope"
     assert expected_fragment in report.positions_shape
     assert "wrong-value-secret" not in report.positions_shape
@@ -1159,7 +1343,7 @@ async def test_positions_missing_first_row_field_is_structural_only(tmp_path):
         calls,
         transport_factory=lambda: SyntheticTransport(calls, positions_response=raw),
     ))
-    assert report.reason == "positions_schema_invalid"
+    assert report.reason == "positions_snapshot_schema_invalid"
     assert report.positions_schema_classifier == "first_or_later_row"
     assert '["size",' not in report.positions_shape
     assert raw not in (tmp_path / "fixture.sqlite3").read_bytes().decode("latin1")
@@ -1183,7 +1367,7 @@ async def test_positions_row_classifier_uses_first_row_shape_without_index_or_va
         transport_factory=lambda: SyntheticTransport(calls, positions_response=raw),
     ))
     assert report.result is Result.UNKNOWN
-    assert report.reason == "positions_schema_invalid"
+    assert report.reason == "positions_snapshot_schema_invalid"
     assert report.positions_schema_classifier == "first_or_later_row"
     expected, digest = operational._positions_shape(json.loads(
         positions_frame(OFFICIAL_CLOSED_POSITION)
@@ -1258,7 +1442,7 @@ async def test_positions_shape_limits_collapse_to_constant_witness(
         calls,
         transport_factory=lambda: SyntheticTransport(calls, positions_response=raw),
     ))
-    assert report.reason == "positions_schema_invalid"
+    assert report.reason == "positions_snapshot_schema_invalid"
     assert report.positions_schema_classifier == "first_or_later_row"
     assert report.positions_shape == '{"shape":"limit_exceeded"}'
     assert report.positions_shape_sha256 == hashlib.sha256(
@@ -1284,7 +1468,7 @@ async def test_positions_shape_corruption_rejects_store_without_effects(
         calls,
         transport_factory=lambda: SyntheticTransport(calls, positions_response=raw),
     ))
-    assert first.reason == "positions_schema_invalid"
+    assert first.reason == "positions_snapshot_schema_invalid"
     database = sqlite3.connect(tmp_path / "fixture.sqlite3")
     if mutation == "classifier":
         database.execute(
@@ -1345,7 +1529,7 @@ async def test_nonterminal_positions_shape_restart_clears_witness_without_effect
     ledger.set_claimed("1" * 64)
     for name in operational._PRIVATE_COUNTERS:
         ledger.attempt(name)
-        if name == "positions_schema":
+        if name == "positions_snapshot_schema":
             break
         ledger.complete(name)
     descriptor, digest = operational._positions_shape({
@@ -1382,11 +1566,11 @@ async def test_nonterminal_positions_shape_restart_clears_witness_without_effect
 @pytest.mark.parametrize(
     ("message_type", "timeout", "reason"),
     (
-        (None, True, "positions_timeout"),
-        (operational.aiohttp.WSMsgType.CLOSE, False, "positions_close"),
-        (operational.aiohttp.WSMsgType.ERROR, False, "positions_close"),
-        (operational.aiohttp.WSMsgType.BINARY, False, "positions_binary"),
-        (operational.aiohttp.WSMsgType.PING, False, "positions_malformed"),
+        (None, True, "positions_snapshot_timeout"),
+        (operational.aiohttp.WSMsgType.CLOSE, False, "positions_snapshot_close"),
+        (operational.aiohttp.WSMsgType.ERROR, False, "positions_snapshot_close"),
+        (operational.aiohttp.WSMsgType.BINARY, False, "positions_snapshot_binary"),
+        (operational.aiohttp.WSMsgType.PING, False, "positions_snapshot_malformed"),
     ),
 )
 async def test_positions_receive_outcomes_are_fixed_redacted_and_terminal(
@@ -1404,8 +1588,8 @@ async def test_positions_receive_outcomes_are_fixed_redacted_and_terminal(
         transport_factory=lambda: _PositionsSocketTransport(calls, socket),
     ))
     assert report.result is Result.UNKNOWN and report.reason == reason
-    assert report.counters["positions_receive"] == {"attempts": 1, "completions": 0}
-    assert report.counters["positions_parse"] == {"attempts": 0, "completions": 0}
+    assert report.counters["positions_snapshot_receive"] == {"attempts": 1, "completions": 0}
+    assert report.counters["positions_snapshot_parse"] == {"attempts": 0, "completions": 0}
     assert report.positions_schema_classifier is None
     assert report.positions_shape is None and report.positions_shape_sha256 is None
     assert report.positions_method_class is None
@@ -1473,18 +1657,25 @@ async def test_positions_followup_frame_is_unknown_and_never_persisted(tmp_path)
 @pytest.mark.asyncio
 async def test_fixed_positions_receive_and_quiet_followup_complete(tmp_path):
     calls: list[str] = []
+    ack = json.dumps({
+        "method": "subscribe", "status": "success", "data": {},
+        "channel": "empirical-channel", "type": "empirical-type",
+    }, separators=(",", ":"))
     raw = positions_frame(OFFICIAL_CLOSED_POSITION)
-    first = type(
+    ack_message = type(
+        "Message", (), {"type": operational.aiohttp.WSMsgType.TEXT, "data": ack},
+    )()
+    snapshot_message = type(
         "Message", (), {"type": operational.aiohttp.WSMsgType.TEXT, "data": raw},
     )()
-    socket = _SequenceSocket(first, asyncio.TimeoutError)
+    socket = _SequenceSocket(ack_message, snapshot_message, asyncio.TimeoutError)
     report = await _run_fixture(dependencies(
         tmp_path,
         calls,
-        transport_factory=lambda: _PositionsSocketTransport(calls, socket),
+        transport_factory=lambda: _PositionsSequenceSocketTransport(calls, socket),
     ))
     assert report.result is Result.PASSED and report.reason == "complete"
-    assert socket.receives == 2
+    assert socket.receives == 3
 
 
 def test_positions_end_to_end_freshness_has_fixed_redacted_failure():
@@ -1708,7 +1899,7 @@ async def test_store_counter_schema_path_and_file_corruption_fail_without_effect
         elif mutation == "schema":
             database.execute("ALTER TABLE run ADD COLUMN unexpected TEXT")
         else:
-            database.execute("PRAGMA user_version=6")
+            database.execute("PRAGMA user_version=7")
         database.commit()
         database.close()
     elif mutation == "mode":
