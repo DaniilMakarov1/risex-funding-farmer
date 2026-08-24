@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 import json
+import math
 import os
 from pathlib import Path
 import pwd
@@ -51,7 +52,7 @@ def _safe_file(path: Path) -> bool:
     )
 
 
-def _strict_json(raw: str | bytes | bytearray) -> Any:
+def _strict_json(raw: str) -> Any:
     def reject_constant(_value: str) -> Any:
         raise ValueError("non-finite JSON number rejected")
 
@@ -63,9 +64,16 @@ def _strict_json(raw: str | bytes | bytearray) -> Any:
             result[key] = value
         return result
 
+    def finite_float(value: str) -> float:
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise ValueError("non-finite JSON conversion rejected")
+        return parsed
+
     try:
         return json.loads(
-            raw, parse_constant=reject_constant, object_pairs_hook=unique_object,
+            raw, parse_constant=reject_constant, parse_float=finite_float,
+            object_pairs_hook=unique_object,
         )
     except Exception:
         raise ValueError("strict JSON rejected") from None
@@ -118,7 +126,7 @@ class SealedTransport:
         if len(raw) > self.MAX_BYTES:
             raise ValueError("bounded response rejected")
         try:
-            return _strict_json(raw)
+            return _strict_json(raw.decode("utf-8", errors="strict"))
         except Exception:
             raise ValueError("strict JSON rejected") from None
 

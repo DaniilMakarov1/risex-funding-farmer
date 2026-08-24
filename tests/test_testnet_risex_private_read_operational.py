@@ -9,7 +9,8 @@ import sqlite3
 import pytest
 
 from risex_farmer.testnet_risex_private_read_preflight import (
-    Outcome, PrivateReadPreflight, PrivateReadStore,
+    SIGNER, HttpResponse, Outcome, PrivateReadPreflight,
+    PrivateReadStore, SyntheticCredential, _Barrier, expected_url,
 )
 from risex_farmer.testnet_risex_private_read_operational import (
     LifecycleClearBinding,
@@ -254,7 +255,12 @@ async def test_public_transport_rejects_unaccepted_endpoint_before_session():
     (b'{"data":{"value":NaN},"request_id":"x"}',
      b'{"data":{"value":Infinity},"request_id":"x"}',
      b'{"data":{"value":-Infinity},"request_id":"x"}',
-     b'{"data":{"nested":{"key":1,"key":2}},"request_id":"x"}'),
+     b'{"data":{"nested":{"key":1,"key":2}},"request_id":"x"}',
+     b'{"data":{"value":1e999},"request_id":"x"}',
+     b'{"data":{"value":-1e999},"request_id":"x"}',
+     b'{"data":{"nested":{"value":1e999}},"request_id":"x"}',
+     '{"data":{},"request_id":"x"}'.encode("utf-16"),
+     '{"data":{},"request_id":"x"}'.encode("utf-32")),
 )
 async def test_raw_http_json_rejection_blocks_redacted_without_followup(tmp_path, raw):
     target = "https://api.testnet.rise.trade/v1/system/config"
@@ -299,7 +305,7 @@ async def test_raw_http_json_rejection_blocks_redacted_without_followup(tmp_path
     assert json.loads(journal_path.read_text()) == {
         "schema_version": 1, "result": "PREFLIGHT_BLOCKED",
     }
-    assert raw.decode() not in journal_path.read_text()
+    assert raw.hex() not in journal_path.read_text()
 
 
 class _Message:
@@ -330,6 +336,8 @@ class _WsSession:
     "raw", ('{"method":"auth_v2","status":NaN}',
             '{"method":"auth_v2","status":Infinity}',
             '{"method":"auth_v2","status":-Infinity}',
+            '{"method":"auth_v2","status":1e999}',
+            '{"method":"auth_v2","nested":{"status":-1e999}}',
             '{"method":"auth_v2","status":"success","status":"other"}'),
 )
 async def test_raw_ws_json_rejection_closes_once_without_retry_or_next_frame(raw):
@@ -347,3 +355,47 @@ async def test_raw_ws_json_rejection_closes_once_without_retry_or_next_frame(raw
     assert session.calls == 1
     assert socket.closed and socket.exited
     assert socket.received == 1 and len(socket.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_ws_overflow_blocks_private_proof_without_additional_secret_actions(tmp_path):
+    now = 1_800_000_000.0
+    store = PrivateReadStore(tmp_path / "private.sqlite")
+    controller = PrivateReadPreflight(
+        store, clock=lambda: now, public_get=lambda *_args: None,
+        lifecycle_clear=lambda: True,
+    )
+    barrier = _Barrier(controller._owner, now)
+    controller._barrier = barrier
+    counts = {"loader": 0, "nonce": 0, "signature": 0}
+    credential = SyntheticCredential(SIGNER, b"synthetic")
+    def loader():
+        counts["loader"] += 1
+        return credential
+    async def nonce_get(path, query):
+        counts["nonce"] += 1
+        return HttpResponse(
+            200, expected_url(path, query),
+            {"data": {"nonce": "0x0001"}, "request_id": "fixture"},
+            now, False,
+        )
+    def signature(*_args):
+        counts["signature"] += 1
+        return "0x" + "11" * 65
+    socket = _Socket(['{"method":"auth_v2","status":1e999}'])
+    transport = object.__new__(SealedTransport)
+    session = _WsSession(socket)
+    transport._session = session
+    try:
+        result = await controller.run_private_proof(
+            barrier, signer_loader=loader, nonce_get=nonce_get,
+            sign_register_v2=signature,
+            private_exchange=transport._private_exchange,
+        )
+    finally:
+        store.close()
+    assert result.outcome == Outcome.BLOCKED and credential.closed
+    assert counts == {"loader": 1, "nonce": 1, "signature": 1}
+    assert session.calls == 1 and socket.received == len(socket.sent) == 1
+    assert socket.closed and socket.exited
+    assert "1e999" not in str(result.evidence)
