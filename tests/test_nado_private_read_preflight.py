@@ -3,35 +3,18 @@ from __future__ import annotations
 import copy
 import importlib
 import json
+import math
 import sqlite3
 from dataclasses import replace
 from pathlib import Path
+from typing import Callable
 
 import pytest
 
-from risex_farmer.nado_private_read_preflight import (
-    CLAIMED,
-    FINALIZED,
-    MAX_FRESHNESS_MS,
-    OBSERVED,
-    FixedPreflightIdentity,
-    NadoPreflightError,
-    OneShotStore,
-    OperationalSignedObserver,
-    PreflightConfig,
-    SOURCE_PINS,
-    encode_subaccount,
-    list_trigger_orders_typed_data,
-    run_fixture_preflight,
-)
+import risex_farmer.nado_private_read_preflight as nado
 
 
-FIXTURE = (
-    Path(__file__).parent
-    / "fixtures"
-    / "nado_private_read_preflight"
-    / "official_contract.json"
-)
+FIXTURE = Path(__file__).parent / "fixtures/nado_private_read_preflight/official_contract.json"
 
 
 @pytest.fixture
@@ -39,732 +22,565 @@ def contract() -> dict[str, object]:
     return json.loads(FIXTURE.read_text())
 
 
-class FixturePublicReader:
-    def __init__(self, responses: list[dict[str, object]]) -> None:
-        self.responses = copy.deepcopy(responses)
-        self.calls: list[str] = []
-        self.gateway_url = "https://gateway.test.nado.xyz/v1/query"
-        self.trust_env = False
-        self.allow_redirects = False
-        self.tls_verified = True
-        self.max_response_bytes = 65_536
-        self.timeout_ms = 5_000
-        self.max_response_bytes = 65_536
-
-    def read(self, operation: str) -> dict[str, object]:
-        self.calls.append(operation)
-        if not self.responses:
-            raise AssertionError("unexpected public read")
-        response = self.responses.pop(0)
-        assert response["op"] == operation
-        return response
+def _config(contract: dict[str, object], **changes: object) -> object:
+    values = {
+        "owner": contract["owner"], "subaccount_name": contract["subaccount_name"],
+        "sender": contract["sender"], "invocation_id": "fixture-invocation-001",
+        "exclusive_owner_lease": True, "direct_owner_eoa": True,
+        "now_ms": 1_700_000_000_025,
+    }
+    values.update(changes)
+    return nado.PreflightConfig(**values)
 
 
-class SyntheticObserver:
-    def __init__(self, response: dict[str, object], *, fail: bool = False) -> None:
-        self.response = copy.deepcopy(response)
-        self.fail = fail
+class PublicFixture:
+    def __init__(self, entries: list[dict[str, object]]) -> None:
+        self.entries = copy.deepcopy(entries)
         self.calls: list[dict[str, object]] = []
-        self.server_time_ms = int(response["observed_at_ms"])
-        self.trigger_url = "https://trigger.test.nado.xyz/v1/query"
-        self.trust_env = False
-        self.allow_redirects = False
-        self.tls_verified = True
-        self.max_response_bytes = 65_536
-        self.timeout_ms = 5_000
-        self.typed_calls: list[dict[str, object] | None] = []
+        self.policies: list[object] = []
+        self.fail_at: int | None = None
 
-    def observe(
-        self, request: dict[str, object],
-        typed_data: dict[str, object] | None = None,
-    ) -> dict[str, object]:
+    def __call__(self, url: str, request: dict[str, object], policy: object) -> object:
         self.calls.append(copy.deepcopy(request))
-        self.typed_calls.append(copy.deepcopy(typed_data))
+        self.policies.append(policy)
+        if self.fail_at == len(self.calls) - 1:
+            raise RuntimeError("RAW_SECRET_PUBLIC")
+        if not self.entries:
+            raise AssertionError("unexpected public callback")
+        entry = self.entries.pop(0)
+        request_type = request.get("type")
+        operation = (
+            f"open_orders:{request.get('product_id')}"
+            if request_type == "open_orders" else request_type
+        )
+        assert operation == entry["op"]
+        assert url == nado.FixedPreflightIdentity.gateway_query
+        return nado.ObservedResponse(
+            url=url, final_url=url, http_status=200,
+            observed_at_ms=entry["observed_at_ms"], payload=entry["response"],
+        )
+
+
+class SignedFixture:
+    def __init__(self, trigger: dict[str, object]) -> None:
+        self.trigger = copy.deepcopy(trigger)
+        self.calls: list[dict[str, object]] = []
+        self.policies: list[object] = []
+        self.fail = False
+
+    def __call__(self, url: str, request: dict[str, object], policy: object) -> object:
+        self.calls.append(copy.deepcopy(request))
+        self.policies.append(policy)
         if self.fail:
-            raise TimeoutError("ambiguous synthetic dispatch")
-        return copy.deepcopy(self.response)
+            raise RuntimeError("RAW_SECRET_SIGNED_TRANSPORT")
+        return nado.ObservedResponse(
+            url=url, final_url=url, http_status=200,
+            observed_at_ms=self.trigger["observed_at_ms"],
+            payload=self.trigger["response"],
+        )
 
 
-class ForbiddenBoundary:
-    def __init__(self) -> None:
-        self.calls = 0
+class Calls:
+    def __init__(self, contract: dict[str, object]) -> None:
+        self.contract = contract
+        self.loader = 0
+        self.derive = 0
+        self.time = 0
+        self.sign = 0
+        self.typed: list[dict[str, object]] = []
+        self.fail_stage: str | None = None
 
-    def __call__(self, *_args: object, **_kwargs: object) -> object:
-        self.calls += 1
-        raise AssertionError("real credential/signing/network boundary reached in CI")
+    def _fail(self, stage: str) -> None:
+        if self.fail_stage == stage:
+            raise RuntimeError(f"RAW_SECRET_{stage.upper()}")
+
+    def load(self) -> object:
+        self.loader += 1
+        self._fail("loader")
+        return object()
+
+    def derive_owner(self, credential: object) -> str:
+        self.derive += 1
+        self._fail("derive")
+        return str(self.contract["owner"])
+
+    def server_time(self) -> int:
+        self.time += 1
+        self._fail("time")
+        return int(self.contract["trigger"]["observed_at_ms"])
+
+    def signer(self, credential: object, typed_data: dict[str, object]) -> str:
+        self.sign += 1
+        self.typed.append(copy.deepcopy(typed_data))
+        self._fail("signer")
+        return str(self.contract["signature"])
 
 
-def _config(contract: dict[str, object]) -> PreflightConfig:
-    return PreflightConfig(
-        owner=str(contract["owner"]),
-        subaccount_name=str(contract["subaccount_name"]),
-        sender=str(contract["sender"]),
-        invocation_id="fixture-invocation-001",
-        exclusive_owner_lease=True,
-        direct_owner_eoa=True,
-        now_ms=1_700_000_000_025,
+def _public(entries: list[dict[str, object]], **policy: object) -> tuple[object, PublicFixture]:
+    callback = PublicFixture(entries)
+    return nado.SealedPublicTransport(callback=callback, **policy), callback
+
+
+def _signed(trigger: dict[str, object], **policy: object) -> tuple[object, SignedFixture]:
+    callback = SignedFixture(trigger)
+    return nado.SealedSignedTransport(callback=callback, **policy), callback
+
+
+def _run(
+    tmp_path: Path, contract: dict[str, object], *,
+    public_entries: list[dict[str, object]] | None = None,
+    store: object | None = None, config: object | None = None,
+    calls: Calls | None = None, public: object | None = None,
+    signed: object | None = None,
+) -> tuple[object, object, Calls, PublicFixture | None, SignedFixture | None]:
+    public_callback = None
+    signed_callback = None
+    if public is None:
+        public, public_callback = _public(
+            list(contract["round_a"]) + list(contract["round_b"])
+            if public_entries is None else public_entries
+        )
+    if signed is None:
+        signed, signed_callback = _signed(dict(contract["trigger"]))
+    store = store or nado.OneShotStore(tmp_path / "intent.sqlite3")
+    calls = calls or Calls(contract)
+    result = nado.run_private_read_preflight(
+        config=config or _config(contract), public_transport=public,
+        credential_loader=calls.load, derive_owner=calls.derive_owner,
+        server_time=calls.server_time, signer=calls.signer,
+        signed_transport=signed, store=store,
     )
+    return result, store, calls, public_callback, signed_callback
 
 
-def _reader(contract: dict[str, object]) -> FixturePublicReader:
-    return FixturePublicReader(list(contract["round_a"]) + list(contract["round_b"]))
+def _assert_sanitized(error: BaseException, sentinel: str = "RAW_SECRET") -> None:
+    assert sentinel not in str(error)
+    assert sentinel not in repr(error)
+    assert error.__cause__ is None
+    assert error.__context__ is None
 
 
-def _round_b_ending_at(
-    contract: dict[str, object], final_observed_ms: int,
-) -> list[dict[str, object]]:
-    responses = copy.deepcopy(list(contract["round_b"]))
-    shift = final_observed_ms - int(responses[-1]["observed_at_ms"])
-    for response in responses:
-        response["observed_at_ms"] = int(response["observed_at_ms"]) + shift
-    return responses
-
-
-def test_success_is_two_rounds_around_one_synthetic_observation_and_no_real_boundary(
+def test_exact_official_wire_success_and_one_shot_request(
     tmp_path: Path, contract: dict[str, object]
 ) -> None:
-    reader = _reader(contract)
-    synthetic = SyntheticObserver(dict(contract["trigger"]))
-    forbidden_loader = ForbiddenBoundary()
-    forbidden_transport = ForbiddenBoundary()
-    operational = OperationalSignedObserver(
-        credential_loader=forbidden_loader,
-        derive_owner=forbidden_loader,
-        signer=forbidden_loader,
-        server_time=forbidden_transport,
-        private_post=forbidden_transport,
-    )
-    store = OneShotStore(tmp_path / "intent.sqlite3")
-
-    result = run_fixture_preflight(
-        config=_config(contract),
-        public_reader=reader,
-        synthetic_observer=synthetic,
-        operational_observer=operational,
-        store=store,
-    )
-
-    assert result.status == FINALIZED
+    result, store, calls, public, signed = _run(tmp_path, contract)
+    assert result.status == nado.FINALIZED
     assert result.zero_regular_orders and result.exact_flat and result.zero_trigger_history
-    assert len(synthetic.calls) == 1
-    assert synthetic.calls[0] == {
+    assert (calls.loader, calls.derive, calls.time, calls.sign) == (1, 1, 1, 1)
+    assert signed is not None and len(signed.calls) == 1
+    expected = {
         "type": "list_trigger_orders",
-        "sender": contract["sender"],
-        "recv_time": 1_700_000_030_010,
-        "limit": 1,
+        "tx": {"sender": contract["sender"], "recvTime": 1_700_000_030_010},
+        "signature": contract["signature"], "limit": 1,
     }
-    assert forbidden_loader.calls == forbidden_transport.calls == 0
-    assert store.state("fixture-invocation-001") == FINALIZED
-    assert reader.calls == [entry["op"] for entry in contract["round_a"] + contract["round_b"]]
-    with pytest.raises(NadoPreflightError, match="already finalized"):
-        run_fixture_preflight(
-            config=_config(contract), public_reader=_reader(contract),
-            synthetic_observer=synthetic, operational_observer=operational, store=store,
-        )
-    assert len(synthetic.calls) == 1
-    persisted = (tmp_path / "intent.sqlite3").read_bytes()
-    assert str(contract["owner"]).encode() not in persisted
-    assert str(contract["sender"]).encode() not in persisted
-
-
-def test_pins_identity_and_subaccount_are_exact(contract: dict[str, object]) -> None:
-    assert SOURCE_PINS == contract["sources"]
-    assert FixedPreflightIdentity.as_dict() == contract["environment"]
-    assert encode_subaccount(str(contract["owner"]), "default") == contract["sender"]
-    for bad in ("", "more-than-twelve", "nul\0name", "défaut"):
-        with pytest.raises(NadoPreflightError):
-            encode_subaccount(str(contract["owner"]), bad)
-    with pytest.raises(NadoPreflightError):
-        _config(contract).__class__(
-            owner=str(contract["owner"]), subaccount_name="default",
-            sender="0x" + "00" * 32, invocation_id="x",
-            exclusive_owner_lease=True, direct_owner_eoa=True,
-            now_ms=1_700_000_000_025,
-        )
-    typed = list_trigger_orders_typed_data(str(contract["sender"]), 1_700_000_030_010)
-    assert typed["primaryType"] == "ListTriggerOrders"
-    assert typed["domain"] == {
-        "name": "Nado", "version": "0.0.1", "chainId": 763373,
-        "verifyingContract": "0x698D87105274292B5673367DEC81874Ce3633Ac2",
-    }
-    assert typed["types"]["ListTriggerOrders"] == [
-        {"name": "sender", "type": "bytes32"},
-        {"name": "recvTime", "type": "uint64"},
+    assert signed.calls == [expected]
+    assert calls.typed == [nado.list_trigger_orders_typed_data(
+        str(contract["sender"]), 1_700_000_030_010
+    )]
+    assert store.state("fixture-invocation-001") == nado.FINALIZED
+    assert public is not None and len(public.calls) == 22
+    expected_policy = nado.TransportPolicy(True, False, False, 5_000, 65_536)
+    assert set(public.policies) == {expected_policy}
+    assert signed.policies == [expected_policy]
+    assert public.calls[:6] == [
+        {"type": "contracts"}, {"type": "status"}, {"type": "all_products"},
+        {"type": "linked_signer", "sender": contract["sender"]},
+        {"type": "subaccount_info", "subaccount": contract["sender"]},
+        {"type": "open_orders", "sender": contract["sender"], "product_id": 0},
     ]
 
 
-@pytest.mark.parametrize(
-    ("balance_kind", "bad_key"),
-    [
-        ("spot_balances", "00"),
-        ("spot_balances", "+0"),
-        ("spot_balances", "x"),
-        ("spot_balances", 0),
-        ("spot_balances", True),
-        ("spot_balances", None),
-        ("perp_balances", "02"),
-        ("perp_balances", "+2"),
-        ("perp_balances", "x"),
-        ("perp_balances", 2),
-    ],
-)
-def test_balance_product_keys_must_be_canonical_decimal_strings(
-    tmp_path: Path, contract: dict[str, object], balance_kind: str, bad_key: object
+def test_pins_identity_and_official_fixture_shapes(contract: dict[str, object]) -> None:
+    assert nado.SOURCE_PINS == contract["sources"]
+    assert nado.FixedPreflightIdentity.as_dict() == contract["environment"]
+    contracts = contract["round_a"][0]["response"]
+    products = contract["round_a"][2]["response"]
+    account = contract["round_a"][4]["response"]
+    isolated = contract["round_a"][8]["response"]
+    assert set(contracts) == set(products) == set(account) == set(isolated) == {"status", "data"}
+    assert set(contracts["data"]) == {"chain_id", "endpoint_addr"}
+    assert set(products["data"]) == {"spot_products", "perp_products"}
+    assert isinstance(account["data"]["spot_balances"], list)
+    assert isinstance(account["data"]["perp_balances"], list)
+    assert set(isolated["data"]) == {"isolated_positions"}
+    assert set(contract["trigger"]["response"]["data"]) == {"orders"}
+
+
+@pytest.mark.parametrize("bad", [1, 0, "true", None])
+@pytest.mark.parametrize("field", ["exclusive_owner_lease", "direct_owner_eoa"])
+def test_config_boolean_aliases_are_rejected(
+    contract: dict[str, object], field: str, bad: object
 ) -> None:
-    responses = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
-    account = responses[4]["body"]
-    balances = account[balance_kind]
-    original = "0" if balance_kind == "spot_balances" else "2"
-    balances[bad_key] = balances.pop(original)
-    observer = SyntheticObserver(dict(contract["trigger"]))
-    store = OneShotStore(tmp_path / f"bad-{balance_kind}-{bad_key}.sqlite3")
-    with pytest.raises(NadoPreflightError):
-        run_fixture_preflight(
-            config=_config(contract), public_reader=FixturePublicReader(responses),
-            synthetic_observer=observer, operational_observer=None, store=store,
-        )
-    assert observer.calls == []
-    assert store.state("fixture-invocation-001") == "NEW"
-
-
-def test_balance_product_key_aliases_cannot_collapse_coverage(
-    tmp_path: Path, contract: dict[str, object]
-) -> None:
-    responses = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
-    responses[4]["body"]["perp_balances"]["02"] = copy.deepcopy(
-        responses[4]["body"]["perp_balances"]["2"]
-    )
-    store = OneShotStore(tmp_path / "alias.sqlite3")
-    with pytest.raises(NadoPreflightError):
-        run_fixture_preflight(
-            config=_config(contract), public_reader=FixturePublicReader(responses),
-            synthetic_observer=SyntheticObserver(dict(contract["trigger"])),
-            operational_observer=None, store=store,
-        )
-    assert store.state("fixture-invocation-001") == "NEW"
-
-
-def test_one_shot_observation_binds_exact_typed_data_to_request(
-    tmp_path: Path, contract: dict[str, object]
-) -> None:
-    observer = SyntheticObserver(dict(contract["trigger"]))
-    run_fixture_preflight(
-        config=_config(contract), public_reader=_reader(contract),
-        synthetic_observer=observer, operational_observer=None,
-        store=OneShotStore(tmp_path / "typed.sqlite3"),
-    )
-    assert len(observer.calls) == len(observer.typed_calls) == 1
-    assert observer.typed_calls[0] == list_trigger_orders_typed_data(
-        str(observer.calls[0]["sender"]), int(observer.calls[0]["recv_time"])
-    )
-
-
-@pytest.mark.parametrize("timeout_ms", [0, 30_001])
-def test_synthetic_signed_timeout_policy_rejects_before_claim(
-    tmp_path: Path, contract: dict[str, object], timeout_ms: int
-) -> None:
-    observer = SyntheticObserver(dict(contract["trigger"]))
-    observer.timeout_ms = timeout_ms
-    store = OneShotStore(tmp_path / f"timeout-{timeout_ms}.sqlite3")
-    with pytest.raises(NadoPreflightError, match="transport policy"):
-        run_fixture_preflight(
-            config=_config(contract), public_reader=_reader(contract),
-            synthetic_observer=observer, operational_observer=None, store=store,
-        )
-    assert observer.calls == []
-    assert store.state("fixture-invocation-001") == "NEW"
-
-
-def test_signed_timeout_policy_is_required_and_operationally_bounded(
-    tmp_path: Path, contract: dict[str, object]
-) -> None:
-    observer = SyntheticObserver(dict(contract["trigger"]))
-    del observer.timeout_ms
-    store = OneShotStore(tmp_path / "missing-timeout.sqlite3")
-    with pytest.raises(NadoPreflightError, match="transport policy"):
-        run_fixture_preflight(
-            config=_config(contract), public_reader=_reader(contract),
-            synthetic_observer=observer, operational_observer=None, store=store,
-        )
-    forbidden = ForbiddenBoundary()
-    with pytest.raises(NadoPreflightError, match="transport policy"):
-        OperationalSignedObserver(
-            credential_loader=forbidden, derive_owner=forbidden, signer=forbidden,
-            server_time=forbidden, private_post=forbidden, timeout_ms=0,
-        )
-    assert forbidden.calls == 0
-
-
-@pytest.mark.parametrize("index", list(range(9)))
-def test_every_round_a_public_failure_precedes_claim_and_observation(
-    tmp_path: Path, contract: dict[str, object], index: int
-) -> None:
-    responses = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
-    responses[index]["status"] = 403
-    reader = FixturePublicReader(responses)
-    synthetic = SyntheticObserver(dict(contract["trigger"]))
-    store = OneShotStore(tmp_path / f"intent-{index}.sqlite3")
-    with pytest.raises(NadoPreflightError, match="public transport rejected"):
-        run_fixture_preflight(
-            config=_config(contract), public_reader=reader,
-            synthetic_observer=synthetic, operational_observer=None, store=store,
-        )
-    assert synthetic.calls == []
-    assert store.state("fixture-invocation-001") == "NEW"
+    with pytest.raises(nado.NadoPreflightError):
+        _config(contract, **{field: bad})
 
 
 @pytest.mark.parametrize(
-    ("op", "mutation", "message"),
-    [
-        ("contracts", lambda b: b.update(chain_id=1), "identity"),
-        ("contracts", lambda b: b.update(endpoint="0x" + "00" * 20), "identity"),
-        ("status", lambda b: b.update(status="inactive"), "active"),
-        ("linked_signer", lambda b: b.update(linked_signer="0x" + "01" * 20), "linked signer"),
-        ("subaccount_info", lambda b: b.update(exists=False), "exist"),
-        ("subaccount_info", lambda b: b.update(health="0"), "health"),
-        ("subaccount_info", lambda b: b["spot_balances"].update({"0":"-1"}), "negative"),
-        ("subaccount_info", lambda b: b["spot_balances"].update({"0":"4999999999999999999"}), "collateral"),
-        ("subaccount_info", lambda b: b["perp_balances"].pop("4"), "cross-perp"),
-        ("subaccount_info", lambda b: b["perp_balances"]["2"].update(amount="1"), "flat"),
-        ("subaccount_info", lambda b: b["perp_balances"]["2"].update(v_quote_balance="1"), "v_quote"),
-        ("open_orders:2", lambda b: b["orders"].append({"digest":"0x01"}), "regular order"),
-        ("isolated_positions", lambda b: b["positions"].append({"product_id":2}), "isolated"),
-    ],
+    ("field", "bad"),
+    [("trust_env", 0), ("allow_redirects", 0), ("tls_verified", 1),
+     ("timeout_ms", True), ("timeout_ms", 0), ("timeout_ms", 30_001),
+     ("max_response_bytes", True), ("max_response_bytes", 0)],
 )
-def test_round_a_contract_defects_fail_before_claim(
-    tmp_path: Path, contract: dict[str, object], op: str,
-    mutation: object, message: str,
+@pytest.mark.parametrize("kind", ["public", "signed"])
+def test_module_owned_transport_policy_rejects_scalar_aliases_before_callbacks(
+    contract: dict[str, object], kind: str, field: str, bad: object
 ) -> None:
-    responses = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
-    target = next(item for item in responses[:9] if item["op"] == op)
-    mutation(target["body"])
-    store = OneShotStore(tmp_path / "intent.sqlite3")
-    observer = SyntheticObserver(dict(contract["trigger"]))
-    with pytest.raises(NadoPreflightError, match=message):
-        run_fixture_preflight(
-            config=_config(contract), public_reader=FixturePublicReader(responses),
-            synthetic_observer=observer, operational_observer=None, store=store,
-        )
-    assert observer.calls == []
-    assert store.state("fixture-invocation-001") == "NEW"
+    callback: Callable[..., object] = PublicFixture([]) if kind == "public" else SignedFixture(dict(contract["trigger"]))
+    cls = nado.SealedPublicTransport if kind == "public" else nado.SealedSignedTransport
+    with pytest.raises(nado.NadoPreflightError, match="transport policy"):
+        cls(callback=callback, **{field: bad})
+    assert callback.calls == []
 
 
-def test_catalog_must_be_complete_duplicate_free_and_cover_orders(
-    tmp_path: Path, contract: dict[str, object]
+@pytest.mark.parametrize("bad", [200.0, True, "200", 403])
+def test_http_status_is_exact_integer_200_before_claim(
+    tmp_path: Path, contract: dict[str, object], bad: object
 ) -> None:
-    for alter in ("incomplete", "duplicate", "missing_order"):
-        responses = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
-        catalog = responses[2]["body"]
-        if alter == "incomplete":
-            catalog["complete"] = False
-        elif alter == "duplicate":
-            catalog["products"].append(copy.deepcopy(catalog["products"][-1]))
-        else:
-            responses.pop(6)
-        store = OneShotStore(tmp_path / f"{alter}.sqlite3")
-        with pytest.raises((NadoPreflightError, AssertionError)):
-            run_fixture_preflight(
-                config=_config(contract), public_reader=FixturePublicReader(responses),
-                synthetic_observer=SyntheticObserver(dict(contract["trigger"])),
-                operational_observer=None, store=store,
-            )
-        assert store.state("fixture-invocation-001") == "NEW"
-
-
-def test_ambiguous_signed_observation_is_claimed_and_never_retried(
-    tmp_path: Path, contract: dict[str, object]
-) -> None:
-    store = OneShotStore(tmp_path / "intent.sqlite3")
-    observer = SyntheticObserver(dict(contract["trigger"]), fail=True)
-    forbidden = ForbiddenBoundary()
-    operational = OperationalSignedObserver(
-        credential_loader=forbidden, derive_owner=forbidden, signer=forbidden,
-        server_time=forbidden, private_post=forbidden,
-    )
-    with pytest.raises(NadoPreflightError, match="ambiguous") as captured:
-        run_fixture_preflight(
-            config=_config(contract), public_reader=_reader(contract),
-            synthetic_observer=observer, operational_observer=operational, store=store,
-        )
-    assert captured.value.__cause__ is None
-    assert store.state("fixture-invocation-001") == CLAIMED
-    assert len(observer.calls) == 1
-    with pytest.raises(NadoPreflightError, match="already claimed"):
-        run_fixture_preflight(
-            config=_config(contract), public_reader=_reader(contract),
-            synthetic_observer=observer, operational_observer=operational, store=store,
-        )
-    assert len(observer.calls) == 1
-    assert forbidden.calls == 0
-
-
-def test_claim_conflict_is_atomic_across_store_connections(tmp_path: Path) -> None:
-    path = tmp_path / "intent.sqlite3"
-    first = OneShotStore(path)
-    second = OneShotStore(path)
-    first.claim("same-invocation", "a" * 64, "b" * 64, 1)
-    with pytest.raises(NadoPreflightError, match="already claimed"):
-        second.claim("same-invocation", "a" * 64, "b" * 64, 1)
-    assert first.state("same-invocation") == second.state("same-invocation") == CLAIMED
+    class BadPublic(PublicFixture):
+        def __call__(self, url: str, request: dict[str, object], policy: object) -> object:
+            observed = super().__call__(url, request, policy)
+            return replace(observed, http_status=bad)
+    callback = BadPublic(list(contract["round_a"]) + list(contract["round_b"]))
+    public = nado.SealedPublicTransport(callback=callback)
+    store = nado.OneShotStore(tmp_path / "http.sqlite3")
+    with pytest.raises(nado.NadoPreflightError):
+        _run(tmp_path, contract, public=public, store=store)
+    assert store.state("fixture-invocation-001") == nado.NEW
 
 
 @pytest.mark.parametrize(
     "mutation",
-    [
-        lambda response: response.update(status=403),
-        lambda response: response.update(final_url="https://wrong.test/v1/query"),
-        lambda response: response["body"].update(sender="0x" + "00" * 32),
-        lambda response: response["body"]["orders"].append({"digest":"0x01"}),
-        lambda response: response.update(observed_at_ms=1_699_999_900_000),
-        lambda response: response["body"].update(unexpected=True),
-    ],
+    [lambda r: r.update(status=200), lambda r: r.update(status="Success"),
+     lambda r: r.update(extra=True), lambda r: r.pop("data")],
 )
-def test_bad_or_nonzero_trigger_observation_is_ambiguous_and_not_replayed(
-    tmp_path: Path, contract: dict[str, object], mutation: object
+def test_wire_envelope_is_exact_status_success_data(
+    tmp_path: Path, contract: dict[str, object], mutation: Callable[[dict[str, object]], object]
 ) -> None:
-    response = copy.deepcopy(dict(contract["trigger"]))
-    mutation(response)
-    store = OneShotStore(tmp_path / "intent.sqlite3")
-    observer = SyntheticObserver(response)
-    observer.server_time_ms = int(contract["trigger"]["observed_at_ms"])
-    with pytest.raises(NadoPreflightError):
-        run_fixture_preflight(
-            config=_config(contract), public_reader=_reader(contract),
-            synthetic_observer=observer, operational_observer=None, store=store,
-        )
-    assert store.state("fixture-invocation-001") == CLAIMED
-    assert len(observer.calls) == 1
+    entries = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
+    mutation(entries[0]["response"])
+    store = nado.OneShotStore(tmp_path / "envelope.sqlite3")
+    with pytest.raises(nado.NadoPreflightError):
+        _run(tmp_path, contract, public_entries=entries, store=store)
+    assert store.state("fixture-invocation-001") == nado.NEW
 
 
-def test_round_b_failure_after_observation_resumes_without_second_signed_attempt(
-    tmp_path: Path, contract: dict[str, object]
+@pytest.mark.parametrize("bad", [763373, 763373.0, True, "0763373", "+763373", "763373 "])
+def test_contract_chain_is_canonical_official_string(
+    tmp_path: Path, contract: dict[str, object], bad: object
 ) -> None:
-    first = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
-    first[12]["status"] = 403
-    store = OneShotStore(tmp_path / "intent.sqlite3")
-    observer = SyntheticObserver(dict(contract["trigger"]))
-    with pytest.raises(NadoPreflightError):
-        run_fixture_preflight(
-            config=_config(contract), public_reader=FixturePublicReader(first),
-            synthetic_observer=observer, operational_observer=None, store=store,
-        )
-    assert store.state("fixture-invocation-001") == OBSERVED
-    assert len(observer.calls) == 1
-    result = run_fixture_preflight(
-        config=_config(contract),
-        public_reader=FixturePublicReader(list(contract["round_b"])),
-        synthetic_observer=observer, operational_observer=None, store=store,
-    )
-    assert result.status == FINALIZED
-    assert len(observer.calls) == 1
+    entries = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
+    entries[0]["response"]["data"]["chain_id"] = bad
+    store = nado.OneShotStore(tmp_path / f"chain-{bad}.sqlite3")
+    with pytest.raises(nado.NadoPreflightError):
+        _run(tmp_path, contract, public_entries=entries, store=store)
+    assert store.state("fixture-invocation-001") == nado.NEW
 
 
-def test_stale_observed_resume_halts_before_public_read_or_second_signature(
-    tmp_path: Path, contract: dict[str, object]
+@pytest.mark.parametrize("bad", [0.0, False, "0", None])
+def test_product_id_rejects_float_bool_and_string_aliases(
+    tmp_path: Path, contract: dict[str, object], bad: object
 ) -> None:
-    store = OneShotStore(tmp_path / "stale-resume.sqlite3")
-    observer = SyntheticObserver(dict(contract["trigger"]))
-    with pytest.raises(NadoPreflightError):
-        run_fixture_preflight(
-            config=_config(contract),
-            public_reader=FixturePublicReader(list(contract["round_a"])),
-            synthetic_observer=observer, operational_observer=None, store=store,
-        )
-    assert store.state("fixture-invocation-001") == OBSERVED
-    assert len(observer.calls) == 1
-
-    next_day = replace(_config(contract), now_ms=_config(contract).now_ms + 86_400_000)
-    reader = FixturePublicReader(
-        _round_b_ending_at(contract, next_day.now_ms - 1)
-    )
-    with pytest.raises(NadoPreflightError, match="durable temporal"):
-        run_fixture_preflight(
-            config=next_day, public_reader=reader, synthetic_observer=observer,
-            operational_observer=None, store=store,
-        )
-    assert reader.calls == []
-    assert store.state("fixture-invocation-001") == OBSERVED
-    assert len(observer.calls) == 1
+    entries = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
+    entries[2]["response"]["data"]["spot_products"][0]["product_id"] = bad
+    store = nado.OneShotStore(tmp_path / f"product-{bad}.sqlite3")
+    with pytest.raises(nado.NadoPreflightError):
+        _run(tmp_path, contract, public_entries=entries, store=store)
+    assert store.state("fixture-invocation-001") == nado.NEW
 
 
 @pytest.mark.parametrize(
-    ("age_ms", "accepted"),
-    [(MAX_FRESHNESS_MS, True), (MAX_FRESHNESS_MS + 1, False)],
+    ("path", "bad"),
+    [("health", 1), ("health", "01"), ("health", "NaN"),
+     ("amount", 0), ("amount", "00"), ("amount", "Infinity"),
+     ("v_quote_balance", 0), ("v_quote_balance", "-0"),
+     ("perp_count", 2), ("perp_count", True), ("perp_count", "garbage"),
+     ("perp_count", "NaN"), ("perp_count", "Infinity"),
+     ("perp_count", math.nan), ("perp_count", math.inf)],
 )
-def test_resumed_barrier_maximum_interval_edge_is_explicit(
-    tmp_path: Path, contract: dict[str, object], age_ms: int, accepted: bool
+def test_account_decimal_scalars_are_exact_official_strings(
+    tmp_path: Path, contract: dict[str, object], path: str, bad: object
 ) -> None:
-    store = OneShotStore(tmp_path / f"edge-{age_ms}.sqlite3")
-    observer = SyntheticObserver(dict(contract["trigger"]))
-    with pytest.raises(NadoPreflightError):
-        run_fixture_preflight(
-            config=_config(contract),
-            public_reader=FixturePublicReader(list(contract["round_a"])),
-            synthetic_observer=observer, operational_observer=None, store=store,
-        )
-    round_a_last = int(contract["round_a"][-1]["observed_at_ms"])
-    now_ms = round_a_last + age_ms
-    reader = FixturePublicReader(_round_b_ending_at(contract, now_ms))
-    config = replace(_config(contract), now_ms=now_ms)
-    if accepted:
-        assert run_fixture_preflight(
-            config=config, public_reader=reader, synthetic_observer=observer,
-            operational_observer=None, store=store,
-        ).status == FINALIZED
-        assert reader.calls
+    entries = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
+    data = entries[4]["response"]["data"]
+    if path == "amount":
+        data["perp_balances"][0]["balance"]["amount"] = bad
+    elif path == "v_quote_balance":
+        data["perp_balances"][0]["balance"]["v_quote_balance"] = bad
     else:
-        with pytest.raises(NadoPreflightError, match="durable temporal"):
-            run_fixture_preflight(
-                config=config, public_reader=reader, synthetic_observer=observer,
-                operational_observer=None, store=store,
-            )
-        assert reader.calls == []
-        assert store.state("fixture-invocation-001") == OBSERVED
-    assert len(observer.calls) == 1
+        data[path] = bad
+    store = nado.OneShotStore(tmp_path / f"scalar-{path}-{bad}.sqlite3")
+    with pytest.raises(nado.NadoPreflightError):
+        _run(tmp_path, contract, public_entries=entries, store=store)
+    assert store.state("fixture-invocation-001") == nado.NEW
 
 
-def test_resumed_observed_evidence_rejects_clock_rollback_before_public_read(
+def test_complete_catalog_account_vector_and_perp_count_must_agree(
     tmp_path: Path, contract: dict[str, object]
 ) -> None:
-    store = OneShotStore(tmp_path / "rollback.sqlite3")
-    observer = SyntheticObserver(dict(contract["trigger"]))
-    with pytest.raises(NadoPreflightError):
-        run_fixture_preflight(
-            config=_config(contract),
-            public_reader=FixturePublicReader(list(contract["round_a"])),
-            synthetic_observer=observer, operational_observer=None, store=store,
-        )
-    trigger_at = int(contract["trigger"]["observed_at_ms"])
-    reader = FixturePublicReader(list(contract["round_b"]))
-    with pytest.raises(NadoPreflightError, match="durable temporal"):
-        run_fixture_preflight(
-            config=replace(_config(contract), now_ms=trigger_at - 1),
-            public_reader=reader, synthetic_observer=observer,
-            operational_observer=None, store=store,
-        )
-    assert reader.calls == []
-    assert store.state("fixture-invocation-001") == OBSERVED
-    assert len(observer.calls) == 1
+    for label, mutate in (
+        ("missing-perp", lambda d: d["perp_balances"].pop()),
+        ("duplicate", lambda d: d["perp_balances"].append(copy.deepcopy(d["perp_balances"][0]))),
+        ("count", lambda d: d.update(perp_count="1")),
+        ("nonflat", lambda d: d["perp_balances"][0]["balance"].update(amount="1")),
+        ("vquote", lambda d: d["perp_balances"][0]["balance"].update(v_quote_balance="1")),
+    ):
+        entries = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
+        mutate(entries[4]["response"]["data"])
+        store = nado.OneShotStore(tmp_path / f"vector-{label}.sqlite3")
+        with pytest.raises(nado.NadoPreflightError):
+            _run(tmp_path, contract, public_entries=entries, store=store)
+        assert store.state("fixture-invocation-001") == nado.NEW
 
 
-def test_server_time_must_strictly_follow_round_a_before_observation(
+def test_public_contract_failure_never_reaches_sensitive_callbacks(
     tmp_path: Path, contract: dict[str, object]
 ) -> None:
-    observer = SyntheticObserver(dict(contract["trigger"]))
-    observer.server_time_ms = int(contract["round_a"][-1]["observed_at_ms"])
-    store = OneShotStore(tmp_path / "server-order.sqlite3")
-    with pytest.raises(NadoPreflightError, match="ambiguous"):
-        run_fixture_preflight(
-            config=_config(contract), public_reader=_reader(contract),
-            synthetic_observer=observer, operational_observer=None, store=store,
+    entries = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
+    entries[2]["response"]["data"]["spot_products"][0]["product_id"] = False
+    public, _ = _public(entries)
+    signed, signed_callback = _signed(dict(contract["trigger"]))
+    calls = Calls(contract)
+    store = nado.OneShotStore(tmp_path / "pre-sensitive.sqlite3")
+    with pytest.raises(nado.NadoPreflightError):
+        _run(
+            tmp_path, contract, public=public, signed=signed, calls=calls, store=store
         )
-    assert observer.calls == []
-    assert store.state("fixture-invocation-001") == CLAIMED
+    assert (calls.loader, calls.derive, calls.time, calls.sign) == (0, 0, 0, 0)
+    assert signed_callback.calls == []
+    assert store.state("fixture-invocation-001") == nado.NEW
 
 
-def test_round_b_resume_is_bound_to_full_subaccount_identity(
+def test_no_invented_sender_echo_or_normalized_containers_are_accepted(
     tmp_path: Path, contract: dict[str, object]
 ) -> None:
-    responses = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
-    responses[12]["status"] = 403
-    store = OneShotStore(tmp_path / "identity.sqlite3")
-    observer = SyntheticObserver(dict(contract["trigger"]))
-    with pytest.raises(NadoPreflightError):
-        run_fixture_preflight(
-            config=_config(contract), public_reader=FixturePublicReader(responses),
-            synthetic_observer=observer, operational_observer=None, store=store,
-        )
-    other_owner = "0x0000000000000000000000000000000000000002"
-    other = PreflightConfig(
-        owner=other_owner, subaccount_name="default",
-        sender=encode_subaccount(other_owner, "default"),
-        invocation_id="fixture-invocation-001", exclusive_owner_lease=True,
-        direct_owner_eoa=True, now_ms=1_700_000_000_025,
+    for index, invented in (
+        (5, {"sender": contract["sender"], "product_id": 0, "orders": []}),
+        (8, {"sender": contract["sender"], "positions": []}),
+    ):
+        entries = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
+        entries[index]["response"]["data"] = invented
+        with pytest.raises(nado.NadoPreflightError):
+            _run(tmp_path, contract, public_entries=entries,
+                 store=nado.OneShotStore(tmp_path / f"invented-{index}.sqlite3"))
+
+
+@pytest.mark.parametrize("stage", ["public_a", "loader", "derive", "time", "signer", "signed", "public_b"])
+def test_every_external_callback_exception_is_fully_sanitized_and_state_bounded(
+    tmp_path: Path, contract: dict[str, object], stage: str
+) -> None:
+    public_callback = PublicFixture(list(contract["round_a"]) + list(contract["round_b"]))
+    public_callback.fail_at = 0 if stage == "public_a" else (9 if stage == "public_b" else None)
+    public = nado.SealedPublicTransport(callback=public_callback)
+    signed_callback = SignedFixture(dict(contract["trigger"]))
+    signed_callback.fail = stage == "signed"
+    signed = nado.SealedSignedTransport(callback=signed_callback)
+    calls = Calls(contract)
+    if stage in {"loader", "derive", "time", "signer"}:
+        calls.fail_stage = stage
+    store = nado.OneShotStore(tmp_path / f"sanitize-{stage}.sqlite3")
+    with pytest.raises(nado.NadoPreflightError) as captured:
+        _run(tmp_path, contract, public=public, signed=signed, calls=calls, store=store)
+    _assert_sanitized(captured.value)
+    expected = nado.NEW if stage == "public_a" else (nado.OBSERVED if stage == "public_b" else nado.CLAIMED)
+    assert store.state("fixture-invocation-001") == expected
+    assert len(signed_callback.calls) <= 1 and calls.sign <= 1
+    if stage in {"public_a", "public_b"}:
+        assert _run(
+            tmp_path, contract, public=public, signed=signed, calls=calls, store=store
+        )[0].status == nado.FINALIZED
+    else:
+        with pytest.raises(nado.NadoPreflightError):
+            _run(tmp_path, contract, public=public, signed=signed, calls=calls, store=store)
+    assert len(signed_callback.calls) <= 1 and calls.sign <= 1
+
+
+def test_round_b_resume_uses_observed_evidence_without_second_sensitive_callback(
+    tmp_path: Path, contract: dict[str, object]
+) -> None:
+    store = nado.OneShotStore(tmp_path / "resume.sqlite3")
+    first_public, first_callback = _public(list(contract["round_a"]) + list(contract["round_b"]))
+    first_callback.fail_at = 9
+    signed, signed_callback = _signed(dict(contract["trigger"]))
+    calls = Calls(contract)
+    with pytest.raises(nado.NadoPreflightError):
+        _run(tmp_path, contract, public=first_public, signed=signed, calls=calls, store=store)
+    assert store.state("fixture-invocation-001") == nado.OBSERVED
+    resume_public, _ = _public(list(contract["round_b"]))
+    result, *_ = _run(
+        tmp_path, contract, public=resume_public, signed=signed, calls=calls, store=store
     )
-    reader = FixturePublicReader(list(contract["round_b"]))
-    with pytest.raises(NadoPreflightError, match="identity mismatch"):
-        run_fixture_preflight(
-            config=other, public_reader=reader, synthetic_observer=observer,
-            operational_observer=None, store=store,
-        )
-    assert reader.calls == []
-    assert len(observer.calls) == 1
+    assert result.status == nado.FINALIZED
+    assert (calls.loader, calls.derive, calls.time, calls.sign) == (1, 1, 1, 1)
+    assert len(signed_callback.calls) == 1
 
 
-def test_corrupt_durable_trigger_evidence_never_finalizes(
+@pytest.mark.parametrize("defect", ["http", "wire", "extra", "nonzero", "redirect"])
+def test_signed_response_defects_consume_claim_and_never_replay(
+    tmp_path: Path, contract: dict[str, object], defect: str
+) -> None:
+    class BadSigned(SignedFixture):
+        def __call__(self, url: str, request: dict[str, object], policy: object) -> object:
+            observed = super().__call__(url, request, policy)
+            if defect == "http":
+                return replace(observed, http_status=403)
+            if defect == "redirect":
+                return replace(observed, final_url="https://wrong.test/query")
+            payload = copy.deepcopy(observed.payload)
+            if defect == "wire":
+                payload["status"] = "failure"
+            elif defect == "extra":
+                payload["data"]["sender"] = contract["sender"]
+            else:
+                payload["data"]["orders"] = [{"digest": "0x01"}]
+            return replace(observed, payload=payload)
+
+    callback = BadSigned(dict(contract["trigger"]))
+    signed = nado.SealedSignedTransport(callback=callback)
+    calls = Calls(contract)
+    store = nado.OneShotStore(tmp_path / f"signed-{defect}.sqlite3")
+    with pytest.raises(nado.NadoPreflightError):
+        _run(tmp_path, contract, signed=signed, calls=calls, store=store)
+    assert store.state("fixture-invocation-001") == nado.CLAIMED
+    assert len(callback.calls) == calls.sign == 1
+    with pytest.raises(nado.NadoPreflightError, match="cannot be retried"):
+        _run(tmp_path, contract, signed=signed, calls=calls, store=store)
+    assert len(callback.calls) == calls.sign == 1
+
+
+@pytest.mark.parametrize("defect", ["fingerprint", "order", "catalog", "linked"])
+def test_round_b_contradiction_remains_observed_and_never_reobserves(
+    tmp_path: Path, contract: dict[str, object], defect: str
+) -> None:
+    entries = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
+    if defect == "fingerprint":
+        entries[13]["response"]["data"]["health"] = "2"
+    elif defect == "order":
+        entries[10]["response"]["data"]["orders"] = [{"digest": "0x01"}]
+    elif defect == "catalog":
+        entries[20]["response"]["data"]["perp_products"][0]["symbol"] = "XBT-PERP"
+    else:
+        entries[21]["response"]["data"]["linked_signer"] = "0x" + "01" * 20
+    signed, callback = _signed(dict(contract["trigger"]))
+    calls = Calls(contract)
+    store = nado.OneShotStore(tmp_path / f"round-b-{defect}.sqlite3")
+    with pytest.raises(nado.NadoPreflightError):
+        _run(tmp_path, contract, public_entries=entries, signed=signed,
+             calls=calls, store=store)
+    assert store.state("fixture-invocation-001") == nado.OBSERVED
+    assert len(callback.calls) == calls.sign == 1
+
+
+def test_corrupt_durable_digest_or_identity_halts_before_round_b(
     tmp_path: Path, contract: dict[str, object]
 ) -> None:
-    responses = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
-    responses[12]["status"] = 403
-    path = tmp_path / "corrupt.sqlite3"
-    store = OneShotStore(path)
-    observer = SyntheticObserver(dict(contract["trigger"]))
-    with pytest.raises(NadoPreflightError):
-        run_fixture_preflight(
-            config=_config(contract), public_reader=FixturePublicReader(responses),
-            synthetic_observer=observer, operational_observer=None, store=store,
-        )
-    with sqlite3.connect(path) as connection:
-        connection.execute(
-            "UPDATE nado_preflight_one_shot SET trigger_hash = ?",
-            ("0" * 64,),
-        )
-    reader = FixturePublicReader(list(contract["round_b"]))
-    with pytest.raises(NadoPreflightError, match="trigger evidence"):
-        run_fixture_preflight(
-            config=_config(contract), public_reader=reader,
-            synthetic_observer=observer, operational_observer=None, store=store,
-        )
-    assert reader.calls == []
-    assert len(observer.calls) == 1
-
-
-def test_round_b_identity_catalog_or_state_disagreement_never_finalizes(
-    tmp_path: Path, contract: dict[str, object]
-) -> None:
-    for label, index, mutate in (
-        ("catalog", 20, lambda b: b["products"][1].update(symbol="XBT-PERP")),
-        ("orders", 11, lambda b: b["orders"].append({"digest":"0x01"})),
-        ("linked", 21, lambda b: b.update(linked_signer="0x" + "01" * 20)),
-    ):
-        responses = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
-        mutate(responses[index]["body"])
-        store = OneShotStore(tmp_path / f"{label}.sqlite3")
-        observer = SyntheticObserver(dict(contract["trigger"]))
-        with pytest.raises(NadoPreflightError):
-            run_fixture_preflight(
-                config=_config(contract), public_reader=FixturePublicReader(responses),
-                synthetic_observer=observer, operational_observer=None, store=store,
+    for column in ("trigger_hash", "identity_tag"):
+        path = tmp_path / f"corrupt-{column}.sqlite3"
+        store = nado.OneShotStore(path)
+        first, _ = _public(list(contract["round_a"]))
+        signed, callback = _signed(dict(contract["trigger"]))
+        calls = Calls(contract)
+        with pytest.raises(nado.NadoPreflightError):
+            _run(tmp_path, contract, public=first, signed=signed, calls=calls, store=store)
+        with sqlite3.connect(path) as connection:
+            connection.execute(
+                f"UPDATE nado_preflight_one_shot SET {column} = ?", ("0" * 64,)
             )
-        assert store.state("fixture-invocation-001") == OBSERVED
-        assert len(observer.calls) == 1
+        resume, public_callback = _public(list(contract["round_b"]))
+        with pytest.raises(nado.NadoPreflightError):
+            _run(tmp_path, contract, public=resume, signed=signed,
+                 calls=calls, store=store)
+        assert public_callback.calls == []
+        assert len(callback.calls) == calls.sign == 1
 
 
-@pytest.mark.parametrize(
-    ("op", "mutation"),
-    [
-        ("subaccount_info", lambda b: b.update(exists=False)),
-        ("subaccount_info", lambda b: b["perp_balances"]["4"].update(amount="1")),
-        ("subaccount_info", lambda b: b["perp_balances"]["4"].update(v_quote_balance="1")),
-        ("isolated_positions", lambda b: b["positions"].append({"product_id":4})),
-        ("contracts", lambda b: b.update(chain_id=1)),
-        ("status", lambda b: b.update(status="inactive")),
-    ],
-)
-def test_every_round_b_safety_predicate_blocks_finalization(
-    tmp_path: Path, contract: dict[str, object], op: str, mutation: object
+def _round_b_ending_at(contract: dict[str, object], final_ms: int) -> list[dict[str, object]]:
+    entries = copy.deepcopy(list(contract["round_b"]))
+    shift = final_ms - int(entries[-1]["observed_at_ms"])
+    for entry in entries:
+        entry["observed_at_ms"] = int(entry["observed_at_ms"]) + shift
+    return entries
+
+
+@pytest.mark.parametrize("age,accepted", [(30_000, True), (30_001, False), (86_400_000, False)])
+def test_observed_resume_freshness_fence_is_inclusive_and_precedes_round_b(
+    tmp_path: Path, contract: dict[str, object], age: int, accepted: bool
 ) -> None:
-    responses = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
-    target = next(item for item in responses[9:] if item["op"] == op)
-    mutation(target["body"])
-    store = OneShotStore(tmp_path / f"round-b-{op}.sqlite3")
-    observer = SyntheticObserver(dict(contract["trigger"]))
-    with pytest.raises(NadoPreflightError):
-        run_fixture_preflight(
-            config=_config(contract), public_reader=FixturePublicReader(responses),
-            synthetic_observer=observer, operational_observer=None, store=store,
-        )
-    assert store.state("fixture-invocation-001") == OBSERVED
-    assert len(observer.calls) == 1
+    store = nado.OneShotStore(tmp_path / f"fresh-{age}.sqlite3")
+    public, _ = _public(list(contract["round_a"]))
+    signed, signed_callback = _signed(dict(contract["trigger"]))
+    calls = Calls(contract)
+    with pytest.raises(nado.NadoPreflightError):
+        _run(tmp_path, contract, public=public, signed=signed, calls=calls, store=store)
+    round_a_last = int(contract["round_a"][-1]["observed_at_ms"])
+    now = round_a_last + age
+    resume, resume_callback = _public(_round_b_ending_at(contract, now))
+    if accepted:
+        assert _run(tmp_path, contract, public=resume, signed=signed, calls=calls,
+                    store=store, config=_config(contract, now_ms=now))[0].status == nado.FINALIZED
+    else:
+        with pytest.raises(nado.NadoPreflightError):
+            _run(tmp_path, contract, public=resume, signed=signed, calls=calls,
+                 store=store, config=_config(contract, now_ms=now))
+        assert resume_callback.calls == []
+        assert store.state("fixture-invocation-001") == nado.OBSERVED
+    assert len(signed_callback.calls) == 1 and calls.sign == 1
 
 
-def test_public_transport_is_sealed_fresh_and_strict_schema(
+def test_clock_rollback_and_server_before_round_a_fail_without_second_attempt(
     tmp_path: Path, contract: dict[str, object]
 ) -> None:
-    for label, mutation in (
-        ("redirect", lambda r: r.update(final_url="https://gateway.test.nado.xyz/v1/query/")),
-        ("stale", lambda r: r.update(observed_at_ms=1_699_999_900_000)),
-        ("future", lambda r: r.update(observed_at_ms=1_700_000_000_026)),
-        ("schema", lambda r: r["body"].update(unexpected=True)),
-    ):
-        responses = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
-        mutation(responses[0])
-        store = OneShotStore(tmp_path / f"{label}.sqlite3")
-        with pytest.raises(NadoPreflightError):
-            run_fixture_preflight(
-                config=_config(contract), public_reader=FixturePublicReader(responses),
-                synthetic_observer=SyntheticObserver(dict(contract["trigger"])),
-                operational_observer=None, store=store,
-            )
-        assert store.state("fixture-invocation-001") == "NEW"
+    calls = Calls(contract)
+    calls.server_time = lambda: int(contract["round_a"][-1]["observed_at_ms"])
+    signed, signed_callback = _signed(dict(contract["trigger"]))
+    store = nado.OneShotStore(tmp_path / "server-order.sqlite3")
+    with pytest.raises(nado.NadoPreflightError):
+        _run(tmp_path, contract, calls=calls, signed=signed, store=store)
+    assert store.state("fixture-invocation-001") == nado.CLAIMED
+    assert signed_callback.calls == [] and calls.sign == 0
+
+    clean_calls = Calls(contract)
+    clean_store = nado.OneShotStore(tmp_path / "rollback.sqlite3")
+    first, _ = _public(list(contract["round_a"]))
+    clean_signed, clean_signed_callback = _signed(dict(contract["trigger"]))
+    with pytest.raises(nado.NadoPreflightError):
+        _run(tmp_path, contract, public=first, signed=clean_signed,
+             calls=clean_calls, store=clean_store)
+    resume, callback = _public(list(contract["round_b"]))
+    with pytest.raises(nado.NadoPreflightError):
+        _run(tmp_path, contract, public=resume, signed=clean_signed,
+             calls=clean_calls, store=clean_store,
+             config=_config(contract, now_ms=int(contract["trigger"]["observed_at_ms"])-1))
+    assert callback.calls == [] and len(clean_signed_callback.calls) == 1
 
 
-def test_transport_policy_and_temporal_barrier_fail_closed(
+def test_signature_and_identity_are_strict_and_durable_identity_is_redacted(
     tmp_path: Path, contract: dict[str, object]
 ) -> None:
-    for label, alter in (
-        ("proxy", lambda reader, observer: setattr(reader, "trust_env", True)),
-        ("redirects", lambda reader, observer: setattr(reader, "allow_redirects", True)),
-        ("tls", lambda reader, observer: setattr(reader, "tls_verified", False)),
-        ("fallback", lambda reader, observer: setattr(reader, "gateway_url", "https://other.test/query")),
-        ("trigger_proxy", lambda reader, observer: setattr(observer, "trust_env", True)),
-    ):
-        reader = _reader(contract)
-        observer = SyntheticObserver(dict(contract["trigger"]))
-        alter(reader, observer)
-        store = OneShotStore(tmp_path / f"{label}.sqlite3")
-        with pytest.raises(NadoPreflightError):
-            run_fixture_preflight(
-                config=_config(contract), public_reader=reader,
-                synthetic_observer=observer, operational_observer=None, store=store,
-            )
-        assert observer.calls == []
-        assert store.state("fixture-invocation-001") == "NEW"
-
-    responses = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
-    responses[9]["observed_at_ms"] = 1_700_000_000_009
-    store = OneShotStore(tmp_path / "temporal.sqlite3")
-    observer = SyntheticObserver(dict(contract["trigger"]))
-    with pytest.raises(NadoPreflightError, match="temporal"):
-        run_fixture_preflight(
-            config=_config(contract), public_reader=FixturePublicReader(responses),
-            synthetic_observer=observer, operational_observer=None, store=store,
-        )
-    assert store.state("fixture-invocation-001") == OBSERVED
-    assert len(observer.calls) == 1
+    for bad in (True, "0x01", "11" * 65, "0x" + "gg" * 65):
+        calls = Calls(contract)
+        calls.signer = lambda credential, typed, value=bad: value
+        store = nado.OneShotStore(tmp_path / f"signature-{str(bad)[:8]}.sqlite3")
+        with pytest.raises(nado.NadoPreflightError):
+            _run(tmp_path, contract, calls=calls, store=store)
+        assert store.state("fixture-invocation-001") == nado.CLAIMED
+    path = tmp_path / "redacted.sqlite3"
+    _run(tmp_path, contract, store=nado.OneShotStore(path))
+    persisted = path.read_bytes()
+    assert str(contract["owner"]).encode() not in persisted
+    assert str(contract["sender"]).encode() not in persisted
+    assert str(contract["signature"]).encode() not in persisted
 
 
-def test_response_size_and_server_time_fail_before_signed_dispatch(
-    tmp_path: Path, contract: dict[str, object]
-) -> None:
-    reader = _reader(contract)
-    reader.max_response_bytes = 16
-    observer = SyntheticObserver(dict(contract["trigger"]))
-    store = OneShotStore(tmp_path / "size.sqlite3")
-    with pytest.raises(NadoPreflightError, match="size"):
-        run_fixture_preflight(
-            config=_config(contract), public_reader=reader,
-            synthetic_observer=observer, operational_observer=None, store=store,
-        )
-    assert observer.calls == []
-    assert store.state("fixture-invocation-001") == "NEW"
-
-    reader = _reader(contract)
-    observer = SyntheticObserver(dict(contract["trigger"]))
-    observer.server_time_ms = 1_700_000_000_026
-    store = OneShotStore(tmp_path / "clock.sqlite3")
-    with pytest.raises(NadoPreflightError, match="ambiguous"):
-        run_fixture_preflight(
-            config=_config(contract), public_reader=reader,
-            synthetic_observer=observer, operational_observer=None, store=store,
-        )
-    assert observer.calls == []
-    assert store.state("fixture-invocation-001") == CLAIMED
-
-
-def test_module_is_isolated_and_has_no_ambient_secret_or_network_surface() -> None:
+def test_module_is_disarmed_and_has_no_ambient_network_or_secret_surface() -> None:
     package = importlib.import_module("risex_farmer")
     module = importlib.import_module("risex_farmer.nado_private_read_preflight")
     assert "nado_private_read_preflight" not in Path(package.__file__).read_text()
     source = Path(module.__file__).read_text()
     for forbidden in (
-        "aiohttp", "requests", "urllib", "os.environ", "getenv(",
-        "open(", "Path.home", "XLSX", "seed phrase", "socket",
-        "http.client", "subprocess", "urlopen", "ClientSession",
+        "aiohttp", "requests", "urllib", "os.environ", "getenv(", "Path.home",
+        "XLSX", "seed phrase", "socket", "http.client", "subprocess", "urlopen",
+        "ClientSession",
     ):
         assert forbidden not in source
-    fixture_entry = source[source.index("def run_fixture_preflight("):]
-    assert "operational_observer.observe" not in fixture_entry
-    assert ".credential_loader" not in fixture_entry
-    assert "del operational_observer" in fixture_entry
-    assert "PRAGMA synchronous=FULL" in source
+    assert "gateway.test.nado.xyz" in source and "trigger.test.nado.xyz" in source
+    assert "OperationalSignedObserver" not in source

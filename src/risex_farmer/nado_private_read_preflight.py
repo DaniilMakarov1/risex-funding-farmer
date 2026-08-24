@@ -1,9 +1,8 @@
-"""Disarmed, fixture-driven Nado private-read preflight contract.
+"""Disarmed, injected Nado testnet private-read preflight.
 
-There is no ambient credential, filesystem, HTTP, CLI, or normal Farmer import
-surface here.  All reads and the one signed observation are supplied by the
-caller.  CI uses the synthetic observer path; the operational boundary is an
-injected object and is deliberately unreachable from ``run_fixture_preflight``.
+The module owns transport identity and policy but contains no HTTP, credential,
+or signing implementation.  Every external action is an injected callback.
+It is not imported by Farmer startup and CI supplies only synthetic callbacks.
 """
 
 from __future__ import annotations
@@ -13,7 +12,7 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Mapping, Protocol
+from typing import Callable, Mapping
 
 
 NEW = "NEW"
@@ -32,7 +31,7 @@ SOURCE_PINS = {
 
 
 class NadoPreflightError(RuntimeError):
-    """A fail-closed identity, evidence, or one-shot-state violation."""
+    """A sanitized fail-closed contract or durable-state violation."""
 
 
 class FixedPreflightIdentity:
@@ -57,25 +56,25 @@ class FixedPreflightIdentity:
         }
 
 
-def _address_bytes(address: str) -> bytes:
-    if not isinstance(address, str) or not address.startswith("0x"):
+def _address_bytes(address: object) -> bytes:
+    if type(address) is not str or not address.startswith("0x"):
         raise NadoPreflightError("owner address is invalid")
     try:
         raw = bytes.fromhex(address[2:])
-    except ValueError as exc:
-        raise NadoPreflightError("owner address is invalid") from exc
+    except ValueError:
+        raise NadoPreflightError("owner address is invalid") from None
     if len(raw) != 20 or raw == b"\0" * 20:
         raise NadoPreflightError("owner address is invalid")
     return raw
 
 
-def _bytes32(value: str) -> bytes:
-    if not isinstance(value, str) or not value.startswith("0x"):
+def _bytes32(value: object) -> bytes:
+    if type(value) is not str or not value.startswith("0x"):
         raise NadoPreflightError("subaccount identity is invalid")
     try:
         raw = bytes.fromhex(value[2:])
-    except ValueError as exc:
-        raise NadoPreflightError("subaccount identity is invalid") from exc
+    except ValueError:
+        raise NadoPreflightError("subaccount identity is invalid") from None
     if len(raw) != 32:
         raise NadoPreflightError("subaccount identity is invalid")
     return raw
@@ -84,27 +83,32 @@ def _bytes32(value: str) -> bytes:
 def encode_subaccount(owner: str, subaccount_name: str) -> str:
     try:
         name = subaccount_name.encode("ascii")
-    except (AttributeError, UnicodeEncodeError) as exc:
-        raise NadoPreflightError("subaccount name is invalid") from exc
+    except (AttributeError, UnicodeEncodeError):
+        raise NadoPreflightError("subaccount name is invalid") from None
     if not 1 <= len(name) <= 12 or b"\0" in name:
         raise NadoPreflightError("subaccount name is invalid")
     return "0x" + (_address_bytes(owner) + name.ljust(12, b"\0")).hex()
 
 
 def _canonical(value: object) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii")
+    try:
+        return json.dumps(
+            value, sort_keys=True, separators=(",", ":"), allow_nan=False,
+        ).encode("ascii")
+    except (TypeError, ValueError, UnicodeError):
+        raise NadoPreflightError("external response is not canonical JSON") from None
 
 
 def _digest(value: object) -> str:
     return hashlib.sha256(_canonical(value)).hexdigest()
 
 
-def _redacted_identity(sender: str) -> str:
-    return _identity_hash(sender)[:16]
-
-
 def _identity_hash(sender: str) -> str:
     return hashlib.sha256(_bytes32(sender)).hexdigest()
+
+
+def _identity_tag(sender: str) -> str:
+    return _identity_hash(sender)[:16]
 
 
 @dataclass(frozen=True)
@@ -123,89 +127,113 @@ class PreflightConfig:
             != self.sender.lower()
         ):
             raise NadoPreflightError("subaccount identity mismatch")
-        if not self.invocation_id or not self.exclusive_owner_lease:
-            raise NadoPreflightError("exclusive invocation identity is required")
-        if len(self.invocation_id) > 64 or not all(
-            character.isascii() and (character.isalnum() or character in "._-")
-            for character in self.invocation_id
+        if type(self.exclusive_owner_lease) is not bool or not self.exclusive_owner_lease:
+            raise NadoPreflightError("exclusive owner lease is required")
+        if type(self.direct_owner_eoa) is not bool or not self.direct_owner_eoa:
+            raise NadoPreflightError("direct owner EOA is required")
+        if (
+            type(self.invocation_id) is not str
+            or not self.invocation_id
+            or len(self.invocation_id) > 64
+            or not all(
+                character.isascii()
+                and (character.isalnum() or character in "._-")
+                for character in self.invocation_id
+            )
         ):
             raise NadoPreflightError("invocation identity is invalid")
-        if not self.direct_owner_eoa:
-            raise NadoPreflightError("direct owner EOA is required")
         if type(self.now_ms) is not int or self.now_ms <= 0:
             raise NadoPreflightError("reference time is invalid")
 
 
-class PublicReader(Protocol):
-    gateway_url: str
-    trust_env: bool
-    allow_redirects: bool
-    tls_verified: bool
-    timeout_ms: int
-    max_response_bytes: int
+@dataclass(frozen=True)
+class ObservedResponse:
+    """Injected observation metadata plus an unmodified official wire payload."""
 
-    def read(self, operation: str) -> Mapping[str, object]: ...
-
-
-class SyntheticSignedObserver(Protocol):
-    server_time_ms: int
-    trigger_url: str
-    trust_env: bool
-    allow_redirects: bool
-    tls_verified: bool
-    timeout_ms: int
-    max_response_bytes: int
-
-    def observe(
-        self, request: dict[str, object], typed_data: dict[str, object],
-    ) -> Mapping[str, object]: ...
+    url: object
+    final_url: object
+    http_status: object
+    observed_at_ms: object
+    payload: object
 
 
 @dataclass(frozen=True)
-class OperationalSignedObserver:
-    """Disarmed injected operational boundary, never selected by fixture runs."""
+class TransportPolicy:
+    tls_verified: bool
+    trust_env: bool
+    allow_redirects: bool
+    timeout_ms: int
+    max_response_bytes: int
 
-    credential_loader: Callable[[], object]
-    derive_owner: Callable[[object], str]
-    signer: Callable[[object, Mapping[str, object]], object]
-    server_time: Callable[[], int]
-    private_post: Callable[[Mapping[str, object], object], Mapping[str, object]]
-    trigger_url: str = FixedPreflightIdentity.trigger_query
+
+def _invoke(callback: Callable[..., object], *args: object) -> tuple[bool, object | None]:
+    try:
+        return True, callback(*args)
+    except BaseException:
+        return False, None
+
+
+@dataclass(frozen=True)
+class _SealedTransport:
+    callback: Callable[..., object]
     trust_env: bool = False
     allow_redirects: bool = False
     tls_verified: bool = True
     timeout_ms: int = 5_000
     max_response_bytes: int = 65_536
 
+    expected_url = ""
+    failure_label = "external transport failed"
+
     def __post_init__(self) -> None:
         if (
-            self.trigger_url != FixedPreflightIdentity.trigger_query
+            not callable(self.callback)
+            or type(self.trust_env) is not bool
             or self.trust_env
+            or type(self.allow_redirects) is not bool
             or self.allow_redirects
+            or type(self.tls_verified) is not bool
             or not self.tls_verified
             or type(self.timeout_ms) is not int
             or not 1 <= self.timeout_ms <= MAX_FRESHNESS_MS
             or type(self.max_response_bytes) is not int
             or not 1 <= self.max_response_bytes <= 1_048_576
         ):
-            raise NadoPreflightError("signed transport policy mismatch")
+            raise NadoPreflightError("transport policy mismatch")
 
-    def observe(self, *, owner: str, sender: str) -> Mapping[str, object]:
-        try:
-            credential = self.credential_loader()
-            if self.derive_owner(credential).lower() != owner.lower():
-                raise NadoPreflightError("credential owner identity mismatch")
-            server_ms = self.server_time()
-            if type(server_ms) is not int or server_ms <= 0:
-                raise NadoPreflightError("server time is invalid")
-            request = _trigger_request(sender, server_ms)
-            typed = list_trigger_orders_typed_data(sender, int(request["recv_time"]))
-            signature = self.signer(credential, typed)
-            return self.private_post(request, signature)
-        except NadoPreflightError:
-            raise
-        except BaseException:
-            raise NadoPreflightError("signed observation boundary failed") from None
+    def send(self, request: Mapping[str, object]) -> ObservedResponse:
+        if not isinstance(request, Mapping):
+            raise NadoPreflightError("request schema mismatch")
+        policy = TransportPolicy(
+            self.tls_verified, self.trust_env, self.allow_redirects,
+            self.timeout_ms, self.max_response_bytes,
+        )
+        ok, raw = _invoke(self.callback, self.expected_url, dict(request), policy)
+        if not ok:
+            raise NadoPreflightError(self.failure_label)
+        if type(raw) is not ObservedResponse:
+            raise NadoPreflightError("transport observation schema mismatch")
+        if raw.url != self.expected_url or raw.final_url != self.expected_url:
+            raise NadoPreflightError("transport host or redirect mismatch")
+        if type(raw.http_status) is not int or raw.http_status != 200:
+            raise NadoPreflightError("transport HTTP status rejected")
+        if type(raw.observed_at_ms) is not int or raw.observed_at_ms <= 0:
+            raise NadoPreflightError("transport observation time is invalid")
+        if len(_canonical(raw.payload)) > self.max_response_bytes:
+            raise NadoPreflightError("transport response size exceeded")
+        return raw
+
+
+@dataclass(frozen=True)
+class SealedPublicTransport(_SealedTransport):
+    expected_url = FixedPreflightIdentity.gateway_query
+    failure_label = "public transport callback failed"
+
+
+@dataclass(frozen=True)
+class SealedSignedTransport(_SealedTransport):
+    expected_url = FixedPreflightIdentity.trigger_query
+    failure_label = "signed transport callback failed"
 
 
 class OneShotStore:
@@ -237,25 +265,25 @@ class OneShotStore:
         return NEW if row is None else str(row[0])
 
     def claim(
-        self, invocation_id: str, identity_tag: str, round_a_hash: str,
+        self, invocation_id: str, identity_hash: str, round_a_hash: str,
         round_a_observed_ms: int,
     ) -> None:
         try:
             with self._connection:
                 self._connection.execute(
                     "INSERT INTO nado_preflight_one_shot VALUES (?, ?, ?, ?, ?, NULL, NULL)",
-                    (invocation_id, CLAIMED, identity_tag, round_a_hash, round_a_observed_ms),
+                    (invocation_id, CLAIMED, identity_hash, round_a_hash, round_a_observed_ms),
                 )
         except sqlite3.IntegrityError:
             raise NadoPreflightError("signed observation is already claimed") from None
 
-    def observe(self, invocation_id: str, trigger_hash: str, observed_at_ms: int) -> None:
+    def observe(self, invocation_id: str, trigger_hash: str, observed_ms: int) -> None:
         with self._connection:
             cursor = self._connection.execute(
                 """UPDATE nado_preflight_one_shot
                    SET state = ?, trigger_hash = ?, trigger_observed_ms = ?
                    WHERE invocation_id = ? AND state = ?""",
-                (OBSERVED, trigger_hash, observed_at_ms, invocation_id, CLAIMED),
+                (OBSERVED, trigger_hash, observed_ms, invocation_id, CLAIMED),
             )
         if cursor.rowcount != 1:
             raise NadoPreflightError("one-shot claim cannot be observed")
@@ -269,7 +297,9 @@ class OneShotStore:
                FROM nado_preflight_one_shot WHERE invocation_id = ?""",
             (invocation_id,),
         ).fetchone()
-        return None if row is None else (
+        if row is None:
+            return None
+        return (
             str(row[0]), str(row[1]), str(row[2]), int(row[3]),
             None if row[4] is None else str(row[4]),
             None if row[5] is None else int(row[5]),
@@ -308,81 +338,167 @@ def _exact_keys(value: Mapping[str, object], expected: set[str], label: str) -> 
         raise NadoPreflightError(f"{label} schema mismatch")
 
 
-def _envelope(
-    response: Mapping[str, object], *, operation: str | None, expected_url: str,
-    now_ms: int, max_response_bytes: int,
-) -> tuple[Mapping[str, object], int]:
-    try:
-        encoded_size = len(_canonical(response))
-    except (TypeError, ValueError):
-        raise NadoPreflightError("transport body schema mismatch") from None
-    if encoded_size > max_response_bytes:
-        raise NadoPreflightError("transport response size exceeded")
-    keys = {"url", "final_url", "status", "observed_at_ms", "body"}
-    if operation is not None:
-        keys.add("op")
-    _exact_keys(response, keys, "transport")
-    if operation is not None and response["op"] != operation:
-        raise NadoPreflightError("public operation identity mismatch")
-    if response["url"] != expected_url or response["final_url"] != expected_url:
-        raise NadoPreflightError("transport host or redirect mismatch")
-    if response["status"] != 200:
-        raise NadoPreflightError("public transport rejected")
-    observed = response["observed_at_ms"]
-    if (
-        type(observed) is not int
-        or observed > now_ms
-        or now_ms - observed > MAX_FRESHNESS_MS
-    ):
+def _wire_data(observation: ObservedResponse, now_ms: int) -> tuple[Mapping[str, object], int]:
+    observed = observation.observed_at_ms
+    if observed > now_ms or now_ms - observed > MAX_FRESHNESS_MS:
         raise NadoPreflightError("transport observation is not fresh")
-    body = response["body"]
-    if not isinstance(body, Mapping):
-        raise NadoPreflightError("transport body schema mismatch")
-    return body, observed
+    payload = observation.payload
+    if type(payload) is not dict:
+        raise NadoPreflightError("wire envelope schema mismatch")
+    _exact_keys(payload, {"status", "data"}, "wire envelope")
+    if type(payload["status"]) is not str or payload["status"] != "success":
+        raise NadoPreflightError("wire status is not success")
+    data = payload["data"]
+    if type(data) is not dict:
+        raise NadoPreflightError("wire data schema mismatch")
+    return data, observed
 
 
-def _read(
-    reader: PublicReader, operation: str, *, now_ms: int,
+def _query(
+    transport: SealedPublicTransport, request: Mapping[str, object], now_ms: int,
 ) -> tuple[Mapping[str, object], int]:
-    try:
-        response = reader.read(operation)
-    except NadoPreflightError:
-        raise
-    except Exception:
-        raise NadoPreflightError("public read failed") from None
-    return _envelope(
-        response, operation=operation,
-        expected_url=FixedPreflightIdentity.gateway_query, now_ms=now_ms,
-        max_response_bytes=reader.max_response_bytes,
+    return _wire_data(transport.send(request), now_ms)
+
+
+def _strict_uint(value: object, label: str) -> int:
+    if type(value) is not int or value < 0:
+        raise NadoPreflightError(f"{label} is invalid")
+    return value
+
+
+def _decimal(value: object, label: str, *, signed: bool = True) -> int:
+    if type(value) is not str or not value or not value.isascii():
+        raise NadoPreflightError(f"{label} is invalid")
+    negative = value.startswith("-")
+    digits = value[1:] if negative else value
+    if (
+        not digits
+        or not all("0" <= character <= "9" for character in digits)
+        or (len(digits) > 1 and digits.startswith("0"))
+        or (negative and (not signed or digits == "0"))
+    ):
+        raise NadoPreflightError(f"{label} is noncanonical")
+    return int(value)
+
+
+def _contracts(data: Mapping[str, object]) -> None:
+    _exact_keys(data, {"chain_id", "endpoint_addr"}, "contracts")
+    chain = _decimal(data["chain_id"], "chain id", signed=False)
+    endpoint = data["endpoint_addr"]
+    if chain != FixedPreflightIdentity.chain_id or (
+        type(endpoint) is not str
+        or endpoint.lower() != FixedPreflightIdentity.endpoint.lower()
+    ):
+        raise NadoPreflightError("contracts identity mismatch")
+
+
+def _status(data: Mapping[str, object]) -> None:
+    _exact_keys(data, {"status"}, "engine status")
+    if type(data["status"]) is not str or data["status"] != "active":
+        raise NadoPreflightError("engine is not active")
+
+
+def _catalog(data: Mapping[str, object]) -> tuple[tuple[int, str, str], ...]:
+    _exact_keys(data, {"spot_products", "perp_products"}, "all products")
+    products: dict[int, tuple[int, str, str]] = {}
+    for kind, field in (("spot", "spot_products"), ("perp", "perp_products")):
+        raw_products = data[field]
+        if type(raw_products) is not list:
+            raise NadoPreflightError("product catalog schema mismatch")
+        for raw in raw_products:
+            if type(raw) is not dict:
+                raise NadoPreflightError("product schema mismatch")
+            _exact_keys(raw, {"product_id", "symbol"}, "product")
+            product_id = _strict_uint(raw["product_id"], "product id")
+            symbol = raw["symbol"]
+            if type(symbol) is not str or not symbol or product_id in products:
+                raise NadoPreflightError("product identity is invalid or duplicate")
+            products[product_id] = (product_id, symbol, kind)
+    if not products or products.get(0) != (0, "USDT0", "spot"):
+        raise NadoPreflightError("official collateral identity mismatch")
+    return tuple(products[key] for key in sorted(products))
+
+
+def _linked(data: Mapping[str, object]) -> None:
+    _exact_keys(data, {"linked_signer"}, "linked signer")
+    signer = data["linked_signer"]
+    if type(signer) is not str or signer.lower() != ZERO_ADDRESS:
+        raise NadoPreflightError("linked signer is not zero")
+
+
+def _balance_entries(
+    raw: object, label: str, expected_ids: set[int], *, perp: bool,
+) -> dict[int, tuple[int, int]]:
+    if type(raw) is not list:
+        raise NadoPreflightError(f"{label} array is required")
+    parsed: dict[int, tuple[int, int]] = {}
+    for entry in raw:
+        if type(entry) is not dict:
+            raise NadoPreflightError(f"{label} schema mismatch")
+        _exact_keys(entry, {"product_id", "balance"}, label)
+        product_id = _strict_uint(entry["product_id"], f"{label} product id")
+        if product_id in parsed:
+            raise NadoPreflightError(f"{label} product is duplicate")
+        balance = entry["balance"]
+        if type(balance) is not dict:
+            raise NadoPreflightError(f"{label} balance schema mismatch")
+        expected = {"amount", "v_quote_balance"} if perp else {"amount"}
+        _exact_keys(balance, expected, f"{label} balance")
+        amount = _decimal(balance["amount"], f"{label} amount")
+        v_quote = _decimal(balance["v_quote_balance"], "v_quote") if perp else 0
+        parsed[product_id] = (amount, v_quote)
+    if set(parsed) != expected_ids:
+        raise NadoPreflightError(f"{label} coverage is incomplete")
+    return parsed
+
+
+def _account(
+    data: Mapping[str, object], sender: str,
+    catalog: tuple[tuple[int, str, str], ...],
+) -> dict[str, object]:
+    _exact_keys(
+        data,
+        {"subaccount", "exists", "health", "spot_balances", "perp_balances", "perp_count"},
+        "subaccount info",
     )
+    subaccount = data["subaccount"]
+    if type(subaccount) is not str or subaccount.lower() != sender.lower():
+        raise NadoPreflightError("subaccount identity mismatch")
+    if type(data["exists"]) is not bool or not data["exists"]:
+        raise NadoPreflightError("subaccount does not exist")
+    health = _decimal(data["health"], "health")
+    if health <= 0:
+        raise NadoPreflightError("health is not positive")
+    spot_ids = {item[0] for item in catalog if item[2] == "spot"}
+    perp_ids = {item[0] for item in catalog if item[2] == "perp"}
+    spots = _balance_entries(data["spot_balances"], "spot balance", spot_ids, perp=False)
+    perps = _balance_entries(data["perp_balances"], "cross-perp", perp_ids, perp=True)
+    if spots.get(0, (-1, 0))[0] < MIN_COLLATERAL_X18:
+        raise NadoPreflightError("collateral floor is not met")
+    if any(amount < 0 for amount, _ in spots.values()):
+        raise NadoPreflightError("negative spot balance")
+    if any(amount for product_id, (amount, _) in spots.items() if product_id != 0):
+        raise NadoPreflightError("unexplained spot balance")
+    if any(amount != 0 for amount, _ in perps.values()):
+        raise NadoPreflightError("cross-perp is not exactly flat")
+    if any(v_quote != 0 for _, v_quote in perps.values()):
+        raise NadoPreflightError("unexplained v_quote balance")
+    perp_count = _decimal(data["perp_count"], "perp count", signed=False)
+    if perp_count != len(perps):
+        raise NadoPreflightError("perp count contradicts complete vector")
+    return {"health": health, "spots": spots, "perps": perps}
 
 
-def _reader_policy(reader: PublicReader) -> None:
-    if (
-        reader.gateway_url != FixedPreflightIdentity.gateway_query
-        or reader.trust_env
-        or reader.allow_redirects
-        or not reader.tls_verified
-        or type(reader.timeout_ms) is not int
-        or reader.timeout_ms <= 0
-        or type(reader.max_response_bytes) is not int
-        or not 1 <= reader.max_response_bytes <= 1_048_576
-    ):
-        raise NadoPreflightError("public transport policy mismatch")
+def _orders(data: Mapping[str, object]) -> None:
+    _exact_keys(data, {"orders"}, "regular orders")
+    if type(data["orders"]) is not list or data["orders"]:
+        raise NadoPreflightError("regular order exists or response is invalid")
 
 
-def _observer_policy(observer: SyntheticSignedObserver) -> None:
-    if (
-        observer.trigger_url != FixedPreflightIdentity.trigger_query
-        or observer.trust_env
-        or observer.allow_redirects
-        or not observer.tls_verified
-        or type(getattr(observer, "timeout_ms", None)) is not int
-        or not 1 <= getattr(observer, "timeout_ms", 0) <= MAX_FRESHNESS_MS
-        or type(observer.max_response_bytes) is not int
-        or not 1 <= observer.max_response_bytes <= 1_048_576
-    ):
-        raise NadoPreflightError("signed transport policy mismatch")
+def _isolated(data: Mapping[str, object]) -> None:
+    _exact_keys(data, {"isolated_positions"}, "isolated positions")
+    if type(data["isolated_positions"]) is not list or data["isolated_positions"]:
+        raise NadoPreflightError("isolated position exists or response is invalid")
 
 
 def _temporal(observed: list[int]) -> None:
@@ -390,238 +506,83 @@ def _temporal(observed: list[int]) -> None:
         raise NadoPreflightError("public evidence temporal order mismatch")
 
 
-def _validate_contracts(body: Mapping[str, object]) -> None:
-    _exact_keys(body, {"chain_id", "endpoint"}, "contracts")
-    if (
-        body["chain_id"] != FixedPreflightIdentity.chain_id
-        or str(body["endpoint"]).lower() != FixedPreflightIdentity.endpoint.lower()
-    ):
-        raise NadoPreflightError("contracts identity mismatch")
-
-
-def _validate_status(body: Mapping[str, object]) -> None:
-    _exact_keys(body, {"status"}, "status")
-    if body["status"] != "active":
-        raise NadoPreflightError("engine is not active")
-
-
-def _catalog(body: Mapping[str, object]) -> tuple[tuple[int, str, str], ...]:
-    _exact_keys(body, {"complete", "products"}, "catalog")
-    if body["complete"] is not True or not isinstance(body["products"], list):
-        raise NadoPreflightError("complete catalog is required")
-    products: dict[int, tuple[int, str, str]] = {}
-    for raw in body["products"]:
-        if not isinstance(raw, Mapping):
-            raise NadoPreflightError("catalog schema mismatch")
-        _exact_keys(raw, {"product_id", "symbol", "product_type"}, "product")
-        product_id = raw["product_id"]
-        symbol = raw["symbol"]
-        product_type = raw["product_type"]
-        if (
-            type(product_id) is not int
-            or not 0 <= product_id < 2**32
-            or not isinstance(symbol, str)
-            or not symbol
-            or product_type not in ("spot", "perp")
-            or product_id in products
-        ):
-            raise NadoPreflightError("duplicate or invalid catalog product")
-        products[product_id] = (product_id, symbol, str(product_type))
-    if not products or products.get(0) != (0, "USDT0", "spot"):
-        raise NadoPreflightError("official collateral product identity mismatch")
-    return tuple(products[key] for key in sorted(products))
-
-
-def _sender(body: Mapping[str, object], expected: str) -> None:
-    if str(body.get("sender", "")).lower() != expected.lower():
-        raise NadoPreflightError("subaccount identity mismatch")
-
-
-def _linked_signer(body: Mapping[str, object], sender: str) -> None:
-    _exact_keys(body, {"sender", "linked_signer"}, "linked signer")
-    _sender(body, sender)
-    if str(body["linked_signer"]).lower() != ZERO_ADDRESS:
-        raise NadoPreflightError("linked signer is not zero")
-
-
-def _integer(value: object, label: str) -> int:
-    if isinstance(value, bool):
-        raise NadoPreflightError(f"{label} is invalid")
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError) as exc:
-        raise NadoPreflightError(f"{label} is invalid") from exc
-    if str(parsed) != str(value):
-        raise NadoPreflightError(f"{label} is noncanonical")
-    return parsed
-
-
-def _product_key_map(value: object, label: str) -> dict[int, object]:
-    if not isinstance(value, Mapping):
-        raise NadoPreflightError(f"{label} coverage is unexplained")
-    normalized: dict[int, object] = {}
-    for key, item in value.items():
-        if (
-            type(key) is not str
-            or not key
-            or not key.isascii()
-            or not key.isdecimal()
-            or (len(key) > 1 and key.startswith("0"))
-        ):
-            raise NadoPreflightError(f"{label} product identity is noncanonical")
-        product_id = int(key)
-        if str(product_id) != key or product_id in normalized:
-            raise NadoPreflightError(f"{label} product identity is noncanonical")
-        normalized[product_id] = item
-    return normalized
-
-
-def _account(
-    body: Mapping[str, object], sender: str,
-    catalog: tuple[tuple[int, str, str], ...],
-) -> dict[str, object]:
-    _exact_keys(
-        body,
-        {"sender", "exists", "health", "spot_balances", "perp_balances", "perp_count"},
-        "account",
-    )
-    _sender(body, sender)
-    if body["exists"] is not True:
-        raise NadoPreflightError("subaccount does not exist")
-    health = _integer(body["health"], "health")
-    if health <= 0:
-        raise NadoPreflightError("health is not positive")
-    spot_ids = {product_id for product_id, _, kind in catalog if kind == "spot"}
-    perp_ids = {product_id for product_id, _, kind in catalog if kind == "perp"}
-    spots = body["spot_balances"]
-    perps = body["perp_balances"]
-    keyed_spots = _product_key_map(spots, "spot balance")
-    if set(keyed_spots) != spot_ids:
-        raise NadoPreflightError("spot balance coverage is unexplained")
-    normalized_spots = {
-        key: _integer(value, "spot balance") for key, value in keyed_spots.items()
-    }
-    if any(value < 0 for value in normalized_spots.values()):
-        raise NadoPreflightError("negative spot balance")
-    if normalized_spots.get(0, -1) < MIN_COLLATERAL_X18:
-        raise NadoPreflightError("collateral floor is not met")
-    if any(value for key, value in normalized_spots.items() if key != 0):
-        raise NadoPreflightError("unexplained spot balance")
-    keyed_perps = _product_key_map(perps, "cross-perp")
-    if set(keyed_perps) != perp_ids:
-        raise NadoPreflightError("cross-perp coverage is incomplete")
-    normalized_perps: dict[int, tuple[int, int]] = {}
-    for key, raw in keyed_perps.items():
-        if not isinstance(raw, Mapping):
-            raise NadoPreflightError("cross-perp schema mismatch")
-        _exact_keys(raw, {"amount", "v_quote_balance"}, "cross-perp")
-        amount = _integer(raw["amount"], "cross-perp amount")
-        v_quote = _integer(raw["v_quote_balance"], "v_quote")
-        if amount != 0:
-            raise NadoPreflightError("cross-perp is not exactly flat")
-        if v_quote != 0:
-            raise NadoPreflightError("unexplained v_quote balance")
-        normalized_perps[key] = (amount, v_quote)
-    return {
-        "health": health,
-        "spots": normalized_spots,
-        "perps": normalized_perps,
-    }
-
-
-def _orders(body: Mapping[str, object], sender: str, product_id: int) -> None:
-    _exact_keys(body, {"sender", "product_id", "orders"}, "regular orders")
-    _sender(body, sender)
-    if body["product_id"] != product_id:
-        raise NadoPreflightError("regular-order product identity mismatch")
-    if body["orders"] != []:
-        raise NadoPreflightError("regular order exists")
-
-
-def _isolated(body: Mapping[str, object], sender: str) -> None:
-    _exact_keys(body, {"sender", "positions"}, "isolated positions")
-    _sender(body, sender)
-    if body["positions"] != []:
-        raise NadoPreflightError("isolated position exists")
-
-
-def _round_a(reader: PublicReader, config: PreflightConfig) -> _RoundEvidence:
+def _round_a(transport: SealedPublicTransport, config: PreflightConfig) -> _RoundEvidence:
     observed: list[int] = []
-    contracts, at = _read(reader, "contracts", now_ms=config.now_ms)
-    observed.append(at)
-    _validate_contracts(contracts)
-    status, at = _read(reader, "status", now_ms=config.now_ms)
-    observed.append(at)
-    _validate_status(status)
-    products_body, at = _read(reader, "all_products", now_ms=config.now_ms)
-    observed.append(at)
-    products = _catalog(products_body)
-    linked, at = _read(reader, "linked_signer", now_ms=config.now_ms)
-    observed.append(at)
-    _linked_signer(linked, config.sender)
-    account_body, at = _read(reader, "subaccount_info", now_ms=config.now_ms)
-    observed.append(at)
-    account = _account(account_body, config.sender, products)
+    data, at = _query(transport, {"type": "contracts"}, config.now_ms)
+    observed.append(at); _contracts(data)
+    data, at = _query(transport, {"type": "status"}, config.now_ms)
+    observed.append(at); _status(data)
+    data, at = _query(transport, {"type": "all_products"}, config.now_ms)
+    observed.append(at); products = _catalog(data)
+    data, at = _query(
+        transport, {"type": "linked_signer", "sender": config.sender}, config.now_ms,
+    )
+    observed.append(at); _linked(data)
+    data, at = _query(
+        transport, {"type": "subaccount_info", "subaccount": config.sender}, config.now_ms,
+    )
+    observed.append(at); account = _account(data, config.sender, products)
     for product_id, _, _ in products:
-        orders, at = _read(reader, f"open_orders:{product_id}", now_ms=config.now_ms)
-        observed.append(at)
-        _orders(orders, config.sender, product_id)
-    isolated, at = _read(reader, "isolated_positions", now_ms=config.now_ms)
-    observed.append(at)
-    _isolated(isolated, config.sender)
+        data, at = _query(
+            transport,
+            {"type": "open_orders", "sender": config.sender, "product_id": product_id},
+            config.now_ms,
+        )
+        observed.append(at); _orders(data)
+    data, at = _query(
+        transport, {"type": "isolated_positions", "subaccount": config.sender},
+        config.now_ms,
+    )
+    observed.append(at); _isolated(data)
     _temporal(observed)
     return _RoundEvidence(
         _digest({"catalog": products, "account": account}), observed[0], observed[-1]
     )
 
 
-def _round_b(reader: PublicReader, config: PreflightConfig) -> _RoundEvidence:
+def _round_b(transport: SealedPublicTransport, config: PreflightConfig) -> _RoundEvidence:
     observed: list[int] = []
-    products_body, at = _read(reader, "all_products", now_ms=config.now_ms)
-    observed.append(at)
-    products = _catalog(products_body)
+    data, at = _query(transport, {"type": "all_products"}, config.now_ms)
+    observed.append(at); products = _catalog(data)
     for product_id, _, _ in products:
-        orders, at = _read(reader, f"open_orders:{product_id}", now_ms=config.now_ms)
-        observed.append(at)
-        _orders(orders, config.sender, product_id)
-    account_body, at = _read(reader, "subaccount_info", now_ms=config.now_ms)
-    observed.append(at)
-    account = _account(account_body, config.sender, products)
-    isolated, at = _read(reader, "isolated_positions", now_ms=config.now_ms)
-    observed.append(at)
-    _isolated(isolated, config.sender)
+        data, at = _query(
+            transport,
+            {"type": "open_orders", "sender": config.sender, "product_id": product_id},
+            config.now_ms,
+        )
+        observed.append(at); _orders(data)
+    data, at = _query(
+        transport, {"type": "subaccount_info", "subaccount": config.sender}, config.now_ms,
+    )
+    observed.append(at); account = _account(data, config.sender, products)
+    data, at = _query(
+        transport, {"type": "isolated_positions", "subaccount": config.sender},
+        config.now_ms,
+    )
+    observed.append(at); _isolated(data)
     for product_id, _, _ in products:
-        orders, at = _read(reader, f"open_orders:{product_id}", now_ms=config.now_ms)
-        observed.append(at)
-        _orders(orders, config.sender, product_id)
-    contracts, at = _read(reader, "contracts", now_ms=config.now_ms)
+        data, at = _query(
+            transport,
+            {"type": "open_orders", "sender": config.sender, "product_id": product_id},
+            config.now_ms,
+        )
+        observed.append(at); _orders(data)
+    data, at = _query(transport, {"type": "contracts"}, config.now_ms)
+    observed.append(at); _contracts(data)
+    data, at = _query(transport, {"type": "status"}, config.now_ms)
+    observed.append(at); _status(data)
+    data, at = _query(transport, {"type": "all_products"}, config.now_ms)
     observed.append(at)
-    _validate_contracts(contracts)
-    status, at = _read(reader, "status", now_ms=config.now_ms)
-    observed.append(at)
-    _validate_status(status)
-    final_products_body, at = _read(reader, "all_products", now_ms=config.now_ms)
-    observed.append(at)
-    if _catalog(final_products_body) != products:
+    if _catalog(data) != products:
         raise NadoPreflightError("round-B catalog changed")
-    linked, at = _read(reader, "linked_signer", now_ms=config.now_ms)
-    observed.append(at)
-    _linked_signer(linked, config.sender)
+    data, at = _query(
+        transport, {"type": "linked_signer", "sender": config.sender}, config.now_ms,
+    )
+    observed.append(at); _linked(data)
     _temporal(observed)
     return _RoundEvidence(
         _digest({"catalog": products, "account": account}), observed[0], observed[-1]
     )
-
-
-def _trigger_request(sender: str, server_time_ms: int) -> dict[str, object]:
-    if type(server_time_ms) is not int or server_time_ms <= 0:
-        raise NadoPreflightError("server time is invalid")
-    return {
-        "type": "list_trigger_orders",
-        "sender": sender,
-        "recv_time": server_time_ms + 30_000,
-        "limit": 1,
-    }
 
 
 def list_trigger_orders_typed_data(sender: str, recv_time: int) -> dict[str, object]:
@@ -652,67 +613,92 @@ def list_trigger_orders_typed_data(sender: str, recv_time: int) -> dict[str, obj
     }
 
 
+def _callback_value(
+    callback: Callable[..., object], *args: object, label: str,
+) -> object:
+    ok, value = _invoke(callback, *args)
+    if not ok:
+        raise NadoPreflightError(f"{label} callback failed")
+    return value
+
+
+def _signature(value: object) -> str:
+    if type(value) is not str or not value.startswith("0x"):
+        raise NadoPreflightError("signature is invalid")
+    try:
+        raw = bytes.fromhex(value[2:])
+    except ValueError:
+        raise NadoPreflightError("signature is invalid") from None
+    if len(raw) != 65:
+        raise NadoPreflightError("signature is invalid")
+    return value
+
+
 def _trigger_zero(
-    response: Mapping[str, object], config: PreflightConfig, *, max_response_bytes: int,
+    observation: ObservedResponse, config: PreflightConfig,
 ) -> tuple[str, int]:
-    body, observed = _envelope(
-        response, operation=None, expected_url=FixedPreflightIdentity.trigger_query,
-        now_ms=config.now_ms, max_response_bytes=max_response_bytes,
-    )
-    _exact_keys(body, {"sender", "orders"}, "trigger response")
-    _sender(body, config.sender)
-    if body["orders"] != []:
+    data, observed = _wire_data(observation, config.now_ms)
+    _exact_keys(data, {"orders"}, "trigger orders")
+    if type(data["orders"]) is not list or data["orders"]:
         raise NadoPreflightError("trigger history is not zero")
-    return (
-        _digest({"identity": _redacted_identity(config.sender), "orders_empty": True}),
-        observed,
-    )
+    return _digest({"identity": _identity_tag(config.sender), "orders_empty": True}), observed
 
 
-def run_fixture_preflight(
+def run_private_read_preflight(
     *,
     config: PreflightConfig,
-    public_reader: PublicReader,
-    synthetic_observer: SyntheticSignedObserver,
-    operational_observer: OperationalSignedObserver | None,
+    public_transport: SealedPublicTransport,
+    credential_loader: Callable[[], object],
+    derive_owner: Callable[[object], str],
+    server_time: Callable[[], int],
+    signer: Callable[[object, dict[str, object]], str],
+    signed_transport: SealedSignedTransport,
     store: OneShotStore,
 ) -> PreflightResult:
-    """Run only the deterministic fixture path; operational observer stays inert."""
-    del operational_observer
-    identity_tag = _redacted_identity(config.sender)
-    durable_identity_hash = _identity_hash(config.sender)
-    _reader_policy(public_reader)
-    _observer_policy(synthetic_observer)
+    """Run the injected one-shot private-read barrier; no callback is ambient."""
+    if type(public_transport) is not SealedPublicTransport:
+        raise NadoPreflightError("public transport boundary mismatch")
+    if type(signed_transport) is not SealedSignedTransport:
+        raise NadoPreflightError("signed transport boundary mismatch")
+    identity_hash = _identity_hash(config.sender)
+    identity_tag = _identity_tag(config.sender)
     evidence = store.evidence(config.invocation_id)
     if evidence is None:
-        round_a = _round_a(public_reader, config)
+        round_a = _round_a(public_transport, config)
         store.claim(
-            config.invocation_id, durable_identity_hash, round_a.fingerprint,
+            config.invocation_id, identity_hash, round_a.fingerprint,
             round_a.last_observed_ms,
         )
-        try:
-            if (
-                synthetic_observer.server_time_ms > config.now_ms
-                or config.now_ms - synthetic_observer.server_time_ms > MAX_FRESHNESS_MS
-                or synthetic_observer.server_time_ms <= round_a.last_observed_ms
-            ):
-                raise NadoPreflightError("server time is not fresh")
-            request = _trigger_request(config.sender, synthetic_observer.server_time_ms)
-            typed_data = list_trigger_orders_typed_data(
-                config.sender, int(request["recv_time"])
-            )
-            response = synthetic_observer.observe(request, typed_data)
-            trigger_hash, trigger_observed_ms = _trigger_zero(
-                response, config,
-                max_response_bytes=synthetic_observer.max_response_bytes,
-            )
-            if (
-                trigger_observed_ms < synthetic_observer.server_time_ms
-                or trigger_observed_ms <= round_a.last_observed_ms
-            ):
-                raise NadoPreflightError("signed observation temporal order mismatch")
-        except BaseException:
-            raise NadoPreflightError("signed observation is ambiguous and cannot be retried") from None
+        credential = _callback_value(credential_loader, label="credential loader")
+        derived = _callback_value(derive_owner, credential, label="owner derivation")
+        if (
+            type(derived) is not str
+            or _address_bytes(derived) != _address_bytes(config.owner)
+        ):
+            raise NadoPreflightError("credential owner identity mismatch")
+        server_ms = _callback_value(server_time, label="server time")
+        if (
+            type(server_ms) is not int
+            or server_ms <= round_a.last_observed_ms
+            or server_ms > config.now_ms
+            or config.now_ms - server_ms > MAX_FRESHNESS_MS
+        ):
+            raise NadoPreflightError("server time is invalid or out of order")
+        recv_time = server_ms + MAX_FRESHNESS_MS
+        typed_data = list_trigger_orders_typed_data(config.sender, recv_time)
+        signature = _signature(
+            _callback_value(signer, credential, typed_data, label="signer")
+        )
+        request = {
+            "type": "list_trigger_orders",
+            "tx": {"sender": config.sender, "recvTime": recv_time},
+            "signature": signature,
+            "limit": 1,
+        }
+        observation = signed_transport.send(request)
+        trigger_hash, trigger_observed_ms = _trigger_zero(observation, config)
+        if trigger_observed_ms < server_ms or trigger_observed_ms <= round_a.last_observed_ms:
+            raise NadoPreflightError("signed observation temporal order mismatch")
         store.observe(config.invocation_id, trigger_hash, trigger_observed_ms)
         evidence = store.evidence(config.invocation_id)
     if evidence is None:
@@ -721,28 +707,25 @@ def run_fixture_preflight(
         state, stored_identity, round_a_hash, round_a_observed_ms,
         trigger_hash, trigger_observed_ms,
     ) = evidence
-    if stored_identity != durable_identity_hash:
+    if stored_identity != identity_hash:
         raise NadoPreflightError("durable one-shot identity mismatch")
     if state == CLAIMED:
-        raise NadoPreflightError("signed observation is already claimed and ambiguous")
+        raise NadoPreflightError("signed observation is claimed and cannot be retried")
     if state == FINALIZED:
         raise NadoPreflightError("preflight invocation is already finalized")
     if state != OBSERVED or trigger_hash is None or trigger_observed_ms is None:
         raise NadoPreflightError("durable one-shot state is invalid")
-    expected_trigger_hash = _digest(
-        {"identity": identity_tag, "orders_empty": True}
-    )
+    expected_trigger_hash = _digest({"identity": identity_tag, "orders_empty": True})
     if trigger_hash != expected_trigger_hash:
         raise NadoPreflightError("durable trigger evidence is invalid")
-    if trigger_observed_ms <= round_a_observed_ms:
-        raise NadoPreflightError("durable temporal evidence is invalid")
     if (
-        round_a_observed_ms > config.now_ms
+        trigger_observed_ms <= round_a_observed_ms
+        or round_a_observed_ms > config.now_ms
         or trigger_observed_ms > config.now_ms
         or config.now_ms - round_a_observed_ms > MAX_FRESHNESS_MS
     ):
-        raise NadoPreflightError("durable temporal evidence is not fresh")
-    round_b = _round_b(public_reader, config)
+        raise NadoPreflightError("durable temporal evidence is invalid or stale")
+    round_b = _round_b(public_transport, config)
     if round_b.first_observed_ms <= trigger_observed_ms:
         raise NadoPreflightError("public evidence temporal barrier mismatch")
     if round_b.last_observed_ms - round_a_observed_ms > MAX_FRESHNESS_MS:
