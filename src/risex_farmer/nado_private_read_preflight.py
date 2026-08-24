@@ -41,6 +41,20 @@ SOURCE_PINS = {
     "typescript_sdk": "315e4f23dadefeb2f86f713e423241e81467d4c3",
     "rust_sdk": "e54118786b171a4325871d5bd17e5abae0e90c5a",
     "contracts": "11c27b2851999f1b4f8cb4a7fbfcc9320253f12f",
+    "python_sdk": "15e8d93e54ce4024b093bae5b9be8e26853fb0e0",
+}
+
+PYTHON_SDK_PRODUCT_MODEL_PIN = {
+    "version": "2.0.0",
+    "commit": "15e8d93e54ce4024b093bae5b9be8e26853fb0e0",
+    "source": (
+        "https://github.com/nadohq/nado-python-sdk/blob/"
+        "15e8d93e54ce4024b093bae5b9be8e26853fb0e0/"
+        "nado_protocol/engine_client/types/models.py"
+    ),
+    "source_sha256": "ee898b96366ff6664373c3cd512190c04c2edc23ae855aa0aa15b8d7c3cdd166",
+    "wheel_sha256": "17aa59a1b72a1ebd544a49ffbf2c9236beed1b7535a1ab5c39679bbaa4002ee5",
+    "sdist_sha256": "40281e99398f6729bc4b98ab2a257c6f946cd7b61baf2e72c1ca976432b794d0",
 }
 
 SEMANTIC_SOURCE_PINS = {
@@ -787,12 +801,13 @@ def _status(data: object) -> None:
 _RISK_KEYS = {
     "long_weight_initial_x18", "short_weight_initial_x18",
     "long_weight_maintenance_x18", "short_weight_maintenance_x18",
-    "large_position_penalty_x18",
+    "price_x18",
 }
 _BOOK_KEYS = {"size_increment", "price_increment_x18", "min_size", "collected_fees"}
 _SPOT_CONFIG_KEYS = {
     "token", "interest_inflection_util_x18", "interest_floor_x18",
-    "interest_small_cap_x18", "interest_large_cap_x18", "min_deposit_rate_x18",
+    "interest_small_cap_x18", "interest_large_cap_x18", "withdraw_fee_x18",
+    "min_deposit_rate_x18",
 }
 _SPOT_STATE_KEYS = {
     "cumulative_deposits_multiplier_x18", "cumulative_borrows_multiplier_x18",
@@ -815,12 +830,14 @@ def _decimal_object(raw: object, keys: set[str], label: str) -> dict[str, object
 def _product(raw: object, kind: str) -> tuple[int, str, str]:
     product = _object(raw, f"{kind} product")
     common = {"product_id", "oracle_price_x18", "risk", "state", "book_info"}
-    expected = common | ({"config"} if kind == "spot" else {"index_price_x18"})
+    expected = common | ({"config"} if kind == "spot" else set())
     _exact_keys(product, expected, f"{kind} product")
     product_id = _strict_uint(product["product_id"], "product id")
     if _decimal(product["oracle_price_x18"], "oracle price", signed=False) <= 0:
         raise NadoPreflightError("oracle price is not positive")
-    _decimal_object(product["risk"], _RISK_KEYS, "risk")
+    risk = _decimal_object(product["risk"], _RISK_KEYS, "risk")
+    if _decimal(risk["price_x18"], "risk price", signed=False) <= 0:
+        raise NadoPreflightError("risk price is not positive")
     _decimal_object(product["book_info"], _BOOK_KEYS, "book info")
     if kind == "spot":
         config = _object(product["config"], "spot config")
@@ -830,8 +847,6 @@ def _product(raw: object, kind: str) -> tuple[int, str, str]:
             _decimal(config[key], f"spot config {key}")
         _decimal_object(product["state"], _SPOT_STATE_KEYS, "spot state")
     else:
-        if _decimal(product["index_price_x18"], "index price", signed=False) <= 0:
-            raise NadoPreflightError("index price is not positive")
         _decimal_object(product["state"], _PERP_STATE_KEYS, "perp state")
     return product_id, kind, _digest(product)
 

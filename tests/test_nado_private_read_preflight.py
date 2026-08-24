@@ -277,6 +277,7 @@ def test_trigger_typed_data_exact_pinned_shape(contract: dict[str, object]) -> N
 
 def test_pins_identity_and_official_fixture_shapes(contract: dict[str, object]) -> None:
     assert nado.SOURCE_PINS == contract["sources"]
+    assert nado.PYTHON_SDK_PRODUCT_MODEL_PIN == contract["python_sdk_product_model"]
     assert nado.SEMANTIC_SOURCE_PINS == contract["semantic_sources"]
     assert nado.FixedPreflightIdentity.as_dict() == contract["environment"]
     contracts = contract["round_a"][0]["response"]
@@ -301,8 +302,13 @@ def test_pins_identity_and_official_fixture_shapes(contract: dict[str, object]) 
         "product_id", "oracle_price_x18", "risk", "config", "state", "book_info"
     }
     assert set(products["data"]["perp_products"][0]) == {
-        "product_id", "oracle_price_x18", "index_price_x18", "risk", "state", "book_info"
+        "product_id", "oracle_price_x18", "risk", "state", "book_info"
     }
+    assert set(products["data"]["spot_products"][0]["risk"]) == {
+        "long_weight_initial_x18", "short_weight_initial_x18",
+        "long_weight_maintenance_x18", "short_weight_maintenance_x18", "price_x18",
+    }
+    assert "withdraw_fee_x18" in products["data"]["spot_products"][0]["config"]
     assert isinstance(account["data"]["spot_balances"], list)
     assert isinstance(account["data"]["perp_balances"], list)
     assert len(account["data"]["healths"]) == 3
@@ -499,8 +505,8 @@ def test_product_id_rejects_float_bool_and_string_aliases(
         ("spot_products", "config", "interest_floor_x18", "00"),
         ("spot_products", "state", "total_borrows_normalized", "Infinity"),
         ("spot_products", "book_info", "min_size", 1.0),
-        ("perp_products", "product", "index_price_x18", False),
-        ("perp_products", "risk", "large_position_penalty_x18", "NaN"),
+        ("spot_products", "config", "withdraw_fee_x18", False),
+        ("perp_products", "risk", "price_x18", "NaN"),
         ("perp_products", "state", "open_interest", 0),
         ("perp_products", "book_info", "collected_fees", "-0"),
     ],
@@ -514,6 +520,32 @@ def test_full_product_nested_scalars_are_strict_pinned_schema(
     target = product if section == "product" else product[section]
     target[field] = bad
     store = nado.OneShotStore(tmp_path / f"nested-{kind}-{section}-{field}.sqlite3")
+    with pytest.raises(nado.NadoPreflightError):
+        _run(tmp_path, contract, public_entries=entries, store=store)
+    assert store.state("fixture-invocation-001") == nado.NEW
+
+
+@pytest.mark.parametrize(
+    "defect",
+    ["legacy-risk", "missing-risk-price", "zero-risk-price", "missing-withdraw-fee", "perp-index"],
+)
+def test_current_official_product_schema_rejects_drift(
+    tmp_path: Path, contract: dict[str, object], defect: str,
+) -> None:
+    entries = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
+    products = entries[2]["response"]["data"]
+    if defect == "legacy-risk":
+        risk = products["spot_products"][0]["risk"]
+        risk["large_position_penalty_x18"] = risk.pop("price_x18")
+    elif defect == "missing-risk-price":
+        products["perp_products"][0]["risk"].pop("price_x18")
+    elif defect == "zero-risk-price":
+        products["perp_products"][0]["risk"]["price_x18"] = "0"
+    elif defect == "missing-withdraw-fee":
+        products["spot_products"][0]["config"].pop("withdraw_fee_x18")
+    else:
+        products["perp_products"][0]["index_price_x18"] = "1"
+    store = nado.OneShotStore(tmp_path / f"official-product-drift-{defect}.sqlite3")
     with pytest.raises(nado.NadoPreflightError):
         _run(tmp_path, contract, public_entries=entries, store=store)
     assert store.state("fixture-invocation-001") == nado.NEW
@@ -538,7 +570,7 @@ def test_full_pinned_account_schema_and_embedded_catalog_are_required(
     elif defect == "pre-state":
         data["pre_state"] = None
     else:
-        data["perp_products"][0]["index_price_x18"] = "1"
+        data["perp_products"][0]["risk"]["price_x18"] = "1"
     store = nado.OneShotStore(tmp_path / f"account-schema-{defect}.sqlite3")
     with pytest.raises(nado.NadoPreflightError):
         _run(tmp_path, contract, public_entries=entries, store=store)
@@ -1412,22 +1444,23 @@ def test_operational_binding_has_fixed_read_only_surface() -> None:
 
     source = inspect.getsource(operational)
     assert tuple(inspect.signature(operational.run).parameters) == ()
-    assert operational.INVOCATION_ID == "nado-private-read-20260824-new-op-002"
+    assert operational.INVOCATION_ID == "nado-private-read-20260824-new-op-003"
     assert operational.STORE_BASENAME == (
-        ".risex-funding-farmer-nado-private-read-20260824-new-op-002.sqlite3"
+        ".risex-funding-farmer-nado-private-read-20260824-new-op-003.sqlite3"
     )
     assert operational.SUBACCOUNT_NAME == "default"
     assert operational.EXPECTED_PATH_HASH == (
-        "bf927fcd24fc6010fe74465d704f9af3ec4745aa08fab9c67d82433182c47e1b"
+        "f15a2af5b4a440eb10bc35752c387ed942deb1115ee99a619e3dcee1ad0dfbaa"
     )
-    assert "op-001" not in operational.INVOCATION_ID
-    assert "op-001" not in operational.STORE_BASENAME
+    for consumed in ("op-001", "op-002"):
+        assert consumed not in operational.INVOCATION_ID
+        assert consumed not in operational.STORE_BASENAME
     assert "nado_private_read_operational" not in Path(risex_farmer.__file__).read_text()
     for forbidden in ("/execute", "retry", "proxy=", "os.environ", "argparse"):
         assert forbidden not in source
 
 
-def test_op002_store_collision_cannot_rearm_fixed_invocation(tmp_path: Path) -> None:
+def test_op003_store_collision_cannot_rearm_fixed_invocation(tmp_path: Path) -> None:
     import risex_farmer.nado_private_read_operational as operational
 
     path = tmp_path / operational.STORE_BASENAME
