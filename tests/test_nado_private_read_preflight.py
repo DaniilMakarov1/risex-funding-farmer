@@ -1461,3 +1461,212 @@ def test_fixed_store_preparation_is_full_sync_owned_and_no_follow(tmp_path: Path
     rejected.symlink_to(target)
     with pytest.raises(nado.NadoPreflightError):
         operational._prepare_store(rejected)
+
+
+@pytest.mark.parametrize("cancel_phase", nado.COUNTER_PHASES)
+@pytest.mark.parametrize("when", ["before", "after"])
+@pytest.mark.asyncio
+async def test_counted_cancellation_barriers_stop_every_following_effect(
+    tmp_path: Path, contract: dict[str, object], monkeypatch: pytest.MonkeyPatch,
+    cancel_phase: str, when: str,
+) -> None:
+    import risex_farmer.nado_private_read_operational as operational
+
+    events: list[str] = []
+
+    def schedule(phase: str) -> None:
+        if when == "after" and phase == cancel_phase:
+            task = asyncio.current_task()
+            assert task is not None
+            asyncio.get_running_loop().call_soon(task.cancel)
+
+    class CancelStore(nado.OneShotStore):
+        def count(self, invocation_id: str, phase: str, completion: bool = False) -> None:
+            super().count(invocation_id, phase, completion)
+            if when == "before" and not completion and phase == cancel_phase:
+                task = asyncio.current_task()
+                assert task is not None
+                asyncio.get_running_loop().call_soon(task.cancel)
+
+    class Public:
+        def __init__(self) -> None:
+            self.entries = list(contract["round_a"]) + list(contract["round_b"])
+            self.a_count = len(contract["round_a"])
+            self.index = 0
+
+        async def send_async(self, request: object) -> object:
+            phase = "public_a" if self.index < self.a_count else "public_b"
+            events.append(phase)
+            entry = self.entries[self.index]
+            self.index += 1
+            schedule(phase)
+            return nado.ObservedResponse(
+                url=nado.FixedPreflightIdentity.gateway_query,
+                final_url=nado.FixedPreflightIdentity.gateway_query,
+                http_status=200, observed_at_ms=entry["observed_at_ms"],
+                payload=entry["response"],
+            )
+
+    class TimeTransport:
+        async def send_async(self, request: object) -> object:
+            events.append("server_time"); schedule("server_time")
+            return nado.ObservedResponse(
+                url=nado.FixedPreflightIdentity.gateway_edge_query,
+                final_url=nado.FixedPreflightIdentity.gateway_edge_query,
+                http_status=200, observed_at_ms=1_700_000_000_008,
+                payload=contract["wire"]["time"],
+            )
+
+    class TriggerTransport:
+        async def send_async(self, request: object) -> object:
+            events.append("trigger_dispatch"); schedule("trigger_dispatch")
+            return nado.ObservedResponse(
+                url=nado.FixedPreflightIdentity.trigger_query,
+                final_url=nado.FixedPreflightIdentity.trigger_query,
+                http_status=200,
+                observed_at_ms=contract["trigger"]["observed_at_ms"],
+                payload=contract["trigger"]["response"],
+            )
+
+    class Handle:
+        closed = 0
+
+        def derive_owner(self) -> str:
+            events.append("derive"); schedule("derive")
+            return str(contract["owner"])
+
+        def sign_list_trigger_orders(self, typed: dict[str, object]) -> str:
+            events.append("sign"); schedule("sign")
+            return str(contract["signature"])
+
+        def close(self) -> None:
+            self.closed += 1
+
+    handle = Handle()
+
+    def load() -> object:
+        events.append("loader"); schedule("loader"); return handle
+
+    def recover(typed: dict[str, object], signature: str) -> str:
+        events.append("recover"); schedule("recover"); return str(contract["owner"])
+
+    original_trigger_zero = nado._trigger_zero
+
+    def trigger_zero(*args: object, **kwargs: object) -> object:
+        events.append("trigger_observation")
+        result = original_trigger_zero(*args, **kwargs)
+        schedule("trigger_observation")
+        return result
+
+    monkeypatch.setattr(nado, "_trigger_zero", trigger_zero)
+    monkeypatch.setattr(nado, "_system_clock_ms", lambda: 1_700_000_000_025)
+    store = CancelStore(tmp_path / f"cancel-{cancel_phase}-{when}.sqlite3")
+    config = _config(contract)
+    with pytest.raises(asyncio.CancelledError):
+        await operational._fixture_run(
+            config=config, store=store, capability_loader=load,
+            recover_owner=recover, path_hash="path-hash",
+            transports=(Public(), TimeTransport(), TriggerTransport()),
+        )
+    report = store.terminal_report(config.invocation_id)
+    assert report is not None and report["status"] == nado.UNKNOWN
+    assert report["counters"][f"{cancel_phase}_attempts"] == 1
+    assert report["counters"][f"{cancel_phase}_completions"] == 0
+    assert report["reason"] == (
+        "AMBIGUOUS_DISPATCH"
+        if cancel_phase in {"trigger_dispatch", "trigger_observation"}
+        else "CANCELLED"
+    )
+    expected_close = int(cancel_phase != "public_a" and not (
+        cancel_phase == "loader" and when == "before"
+    ))
+    assert handle.closed == expected_close
+    before_restart = list(events)
+    restarted = await operational._fixture_run(
+        config=config, store=store,
+        capability_loader=lambda: (_ for _ in ()).throw(AssertionError()),
+        recover_owner=lambda typed, signature: (_ for _ in ()).throw(AssertionError()),
+        path_hash="path-hash",
+        transports=(Public(), TimeTransport(), TriggerTransport()),
+    )
+    assert restarted == report and events == before_restart
+
+
+@pytest.mark.parametrize("cancel_phase", ["loader", "derive", "sign", "recover"])
+@pytest.mark.asyncio
+async def test_sync_callback_cancelled_error_propagates_and_closes(
+    tmp_path: Path, contract: dict[str, object], monkeypatch: pytest.MonkeyPatch,
+    cancel_phase: str,
+) -> None:
+    import risex_farmer.nado_private_read_operational as operational
+
+    class Public:
+        def __init__(self) -> None:
+            self.entries = list(contract["round_a"]) + list(contract["round_b"])
+
+        async def send_async(self, request: object) -> object:
+            entry = self.entries.pop(0)
+            return nado.ObservedResponse(
+                url=nado.FixedPreflightIdentity.gateway_query,
+                final_url=nado.FixedPreflightIdentity.gateway_query,
+                http_status=200, observed_at_ms=entry["observed_at_ms"],
+                payload=entry["response"],
+            )
+
+    class TimeTransport:
+        async def send_async(self, request: object) -> object:
+            return nado.ObservedResponse(
+                url=nado.FixedPreflightIdentity.gateway_edge_query,
+                final_url=nado.FixedPreflightIdentity.gateway_edge_query,
+                http_status=200, observed_at_ms=1_700_000_000_008,
+                payload=contract["wire"]["time"],
+            )
+
+    class TriggerTransport:
+        async def send_async(self, request: object) -> object:
+            return nado.ObservedResponse(
+                url=nado.FixedPreflightIdentity.trigger_query,
+                final_url=nado.FixedPreflightIdentity.trigger_query,
+                http_status=200,
+                observed_at_ms=contract["trigger"]["observed_at_ms"],
+                payload=contract["trigger"]["response"],
+            )
+
+    class Handle:
+        closed = 0
+
+        def derive_owner(self) -> str:
+            if cancel_phase == "derive": raise asyncio.CancelledError
+            return str(contract["owner"])
+
+        def sign_list_trigger_orders(self, typed: dict[str, object]) -> str:
+            if cancel_phase == "sign": raise asyncio.CancelledError
+            return str(contract["signature"])
+
+        def close(self) -> None:
+            self.closed += 1
+
+    handle = Handle()
+
+    def load() -> object:
+        if cancel_phase == "loader": raise asyncio.CancelledError
+        return handle
+
+    def recover(typed: dict[str, object], signature: str) -> str:
+        if cancel_phase == "recover": raise asyncio.CancelledError
+        return str(contract["owner"])
+
+    monkeypatch.setattr(nado, "_system_clock_ms", lambda: 1_700_000_000_025)
+    store = nado.OneShotStore(tmp_path / f"raised-cancel-{cancel_phase}.sqlite3")
+    config = _config(contract)
+    with pytest.raises(asyncio.CancelledError):
+        await operational._fixture_run(
+            config=config, store=store, capability_loader=load,
+            recover_owner=recover, path_hash="path-hash",
+            transports=(Public(), TimeTransport(), TriggerTransport()),
+        )
+    report = store.terminal_report(config.invocation_id)
+    assert report is not None and report["reason"] == "CANCELLED"
+    assert report["counters"][f"{cancel_phase}_attempts"] == 1
+    assert report["counters"][f"{cancel_phase}_completions"] == 0
+    assert handle.closed == int(cancel_phase != "loader")

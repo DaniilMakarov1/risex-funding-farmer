@@ -1045,6 +1045,7 @@ async def _operational_round(
         while True:
             if before is not None:
                 before()
+                await asyncio.sleep(0)
             observation = await transport.send_async(request)
             await asyncio.sleep(0)
             decoded = _wire_data(observation, _system_clock_ms)
@@ -1053,10 +1054,12 @@ async def _operational_round(
             except StopIteration:
                 if after is not None:
                     after()
+                    await asyncio.sleep(0)
                 raise
             else:
                 if after is not None:
                     after()
+                    await asyncio.sleep(0)
     except StopIteration as completed:
         return completed.value
 
@@ -1107,6 +1110,17 @@ def _callback_value(
     if not ok:
         raise NadoPreflightError(f"{label} callback failed")
     return value
+
+
+def _counted_callback(
+    callback: Callable[..., object], *args: object, label: str,
+) -> object:
+    try:
+        return callback(*args)
+    except asyncio.CancelledError:
+        raise
+    except BaseException:
+        raise NadoPreflightError(f"{label} callback failed") from None
 
 
 def _signature(value: object) -> str:
@@ -1386,41 +1400,56 @@ async def _run_counted_operational_private_read(
         )
 
         store.count(invocation_id, "loader")
-        handle = _callback_value(capability_loader, label="credential loader")
+        await asyncio.sleep(0)
+        handle = _counted_callback(capability_loader, label="credential loader")
+        await asyncio.sleep(0)
         if not callable(getattr(handle, "derive_owner", None)) or not callable(
             getattr(handle, "sign_list_trigger_orders", None)
         ) or not callable(getattr(handle, "close", None)):
             raise NadoPreflightError("credential capability is invalid")
         store.count(invocation_id, "loader", True)
+        await asyncio.sleep(0)
 
         store.count(invocation_id, "derive")
-        derived = _callback_value(handle.derive_owner, label="owner derivation")
+        await asyncio.sleep(0)
+        derived = _counted_callback(handle.derive_owner, label="owner derivation")
+        await asyncio.sleep(0)
         if type(derived) is not str or _address_bytes(derived) != _address_bytes(config.owner):
             raise NadoPreflightError("credential owner identity mismatch")
         store.count(invocation_id, "derive", True)
+        await asyncio.sleep(0)
 
         store.count(invocation_id, "server_time")
+        await asyncio.sleep(0)
         time_observation = await time_transport.send_async({"type": "time"})
+        await asyncio.sleep(0)
         server_ms = _server_time_observation(time_observation, _system_clock_ms)
         if server_ms <= round_a.last_observed_ms:
             raise NadoPreflightError("server time is invalid or out of order")
         store.count(invocation_id, "server_time", True)
+        await asyncio.sleep(0)
 
         recv_time = str(server_ms + MAX_FRESHNESS_MS)
         typed_data = list_trigger_orders_typed_data(config.sender, recv_time)
         store.count(invocation_id, "sign")
-        signature = _signature(_callback_value(
+        await asyncio.sleep(0)
+        signature = _signature(_counted_callback(
             handle.sign_list_trigger_orders, typed_data, label="signer",
         ))
+        await asyncio.sleep(0)
         store.count(invocation_id, "sign", True)
+        await asyncio.sleep(0)
 
         store.count(invocation_id, "recover")
-        recovered = _callback_value(
+        await asyncio.sleep(0)
+        recovered = _counted_callback(
             recover_owner, typed_data, signature, label="signature recovery",
         )
+        await asyncio.sleep(0)
         if type(recovered) is not str or _address_bytes(recovered) != _address_bytes(config.owner):
             raise NadoPreflightError("signature owner identity mismatch")
         store.count(invocation_id, "recover", True)
+        await asyncio.sleep(0)
 
         request = {
             "type": "list_trigger_orders",
@@ -1429,16 +1458,23 @@ async def _run_counted_operational_private_read(
             "limit": 1,
         }
         store.count(invocation_id, "trigger_dispatch")
+        await asyncio.sleep(0)
         observation = await trigger_transport.send_async(request)
+        await asyncio.sleep(0)
         store.count(invocation_id, "trigger_dispatch", True)
+        await asyncio.sleep(0)
         store.count(invocation_id, "trigger_observation")
+        await asyncio.sleep(0)
         trigger_hash, trigger_observed_ms = _trigger_zero(
             observation, config, _system_clock_ms,
         )
+        await asyncio.sleep(0)
         if trigger_observed_ms < server_ms or trigger_observed_ms <= round_a.last_observed_ms:
             raise NadoPreflightError("signed observation temporal order mismatch")
         store.count(invocation_id, "trigger_observation", True)
+        await asyncio.sleep(0)
         store.observe(invocation_id, trigger_hash, trigger_observed_ms)
+        await asyncio.sleep(0)
 
         round_b = await _operational_round_b(
             public_transport, config,
@@ -1469,7 +1505,14 @@ async def _run_counted_operational_private_read(
             raise NadoPreflightError("durable counter totals disagree")
         store.finalize(invocation_id, round_b.fingerprint)
     except asyncio.CancelledError:
-        store.terminalize_unknown(invocation_id, "CANCELLED")
+        counters = store.counters(invocation_id)
+        reason = (
+            "AMBIGUOUS_DISPATCH"
+            if counters["trigger_dispatch_attempts"]
+            > counters["trigger_observation_completions"]
+            else "CANCELLED"
+        )
+        store.terminalize_unknown(invocation_id, reason)
         raise
     except BaseException:
         try:
