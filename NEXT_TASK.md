@@ -26,24 +26,32 @@ Forbidden:
 
 Remaining action: authenticate the local Git transport and fast-forward `origin/main` to the exact accepted Builder commit without recreating or rewriting it. The correction proves deterministic contract parity only. Any later private-read invocation requires a new explicit operational gate and a new one-shot identity; the consumed invocation is never reused.
 
-## Nado — durable-result reconciliation
+## Nado — new one-shot read-only Trigger Query governance
 
-Status: `BLOCKED — ORIGINAL OPERATIONAL STORE/EVIDENCE NOT FOUND; NO NEW CALL`.
+Status: `ARCHITECT ACCEPTED GOVERNANCE CANDIDATE — AWAITS SEPARATE CHIEF OPERATIONAL GATE; NO CALL AUTHORIZED`.
 
-Objective: determine what the prior operational turn actually dispatched and observed before deciding whether any later gate is possible.
+Objective: perform one new Nado private-read preflight as an operation separate from the permanently unknown prior invocation. This is not a retry and does not reclassify, recover, replay, or reuse any old action or evidence.
 
-Authorized work:
+Fixed new operation identity:
 
-- Read only existing redacted evidence, durable state, and request/loader/signature counters.
-- Classify the invocation as not armed, armed but undispatched, publicly blocked, privately ambiguous, or finalized, with exact supporting counters and terminal state.
-- Report missing evidence as unknown rather than inferring success or permission to retry.
+- Invocation ID: `nado-private-read-20260824-new-op-001`.
+- Absolute durable SQLite path: `/Users/daniilmakarov/.risex-funding-farmer-nado-private-read-20260824-new-op-001.sqlite3`.
+- Redacted report path: `<passwd-home>/.risex-funding-farmer-nado-private-read-20260824-new-op-001.sqlite3`; SHA-256 of the exact absolute path: `ec98ed1b3781034e0436b37a634f4f87164510d077df1c3a5e7dc4a0e4d35b2d`.
+- The path was absent and the invocation ID was absent from the repository during this governance review. A later operational gate must recheck both facts, open only this explicit non-temporary path, verify `PRAGMA synchronous=FULL` and durable state `NEW`, and record only the redacted path/hash plus `NEW` before any loader or network call. Any existing, mismatched, uncertain, or non-`NEW` state blocks the operation; it is never reset, repaired, deleted, or rearmed.
 
-Forbidden:
+Required one-shot sequence after, and only after, the separate Chief operational gate:
 
-- Any network request, credential load, signature, replay, rearm, state deletion, repair, or write.
-- Proxy/VPN circumvention, alternate hosts, browser/support fallback, or shared-core edits.
+1. Run complete public Round A through the fixed official test gateway before the secret boundary. Require the exact chain/domain/Endpoint, active engine, stable complete catalog, zero linked signer, adequate collateral and health, zero regular orders for every catalog product, every complete cross-perpetual amount and `v_quote_balance` exactly zero, and no isolated position.
+2. Durably transition `NEW -> CLAIMED` with the fixed invocation identity and Round-A fingerprint. Then perform exactly one opaque owner-key load, one owner derivation and exact match, one new official server-time Query, one fresh `recvTime`, one EIP-712 `ListTriggerOrders` sign, and one exact recover-to-owner check. The accepted implementation uses `recvTime = fresh server time + 30 seconds`, within the gate maximum of 100 seconds; no old time, signature, or typed data may be reused.
+3. Send exactly one read-only `list_trigger_orders` request to `POST https://trigger.test.nado.xyz/v1/query`, unfiltered except `limit=1`. It is Trigger Query, not Execute. `POST /execute`, order, cancel, close, deposit, faucet, account mutation, and every other write are prohibited.
+4. A successful exact response with `orders=[]` durably transitions `CLAIMED -> OBSERVED`. Then complete public Round B and require it to agree with Round A while independently proving zero regular orders, complete exact cross-perpetual flatness, no isolated position, zero linked signer, stable identity/catalog, and active engine. Only that agreement may transition `OBSERVED -> FINALIZED`.
 
-Acceptance: recover the exact original injected store/evidence path and report its terminal state plus loader/public/time/signature/trigger/round-B counters. Only proof that the sensitive request was not dispatched can permit formulation of a new bounded gate. Without that evidence the lane remains fail-closed `UNKNOWN`; there is no retry authority.
+Failure and acceptance boundary:
+
+- Verified TLS, exact fixed hosts and final URLs, `trust_env=False`, `proxy=None`, redirects disabled, finite deadlines, bounded strict JSON, and direct ownership remain mandatory. There is no retry, replay, re-sign, fallback, alternate host, proxy/VPN circumvention, browser workaround, repair, or second invocation under this gate.
+- Any timeout, disconnect, cancellation, HTTP/schema/identity/time failure, nonempty or contradictory state, or ambiguity at or after the sole signed Query is terminal `UNKNOWN`; preserve the store and stop. `CLAIMED` is never re-entered. An incomplete `OBSERVED` is failure under this gate and is not resumed without a new explicit Chief decision; the signed Query is never repeated.
+- Success is only durable `FINALIZED` plus agreeing fresh public rounds, zero regular orders for the complete catalog, zero trigger orders, every cross-perpetual amount and `v_quote_balance` exactly zero, and no isolated position. Report the redacted path/hash, invocation ID, terminal state, and redacted public/time/loader/derive/sign/recover/trigger/Round-B counters; retain no key, signature, full identity, signed body, or raw private response.
+- Existing accepted code is unchanged and no Builder is needed. This governance candidate authorizes no store creation, network request, credential load, real signature, private Query, `/execute`, order, cancel, close, or other write. A passing read is not lifecycle completion, live-write authorization, exact-flat operational acceptance, strategy readiness, mainnet permission, or real-funds permission.
 
 ## Extended — one-shot operational private-read gate
 

@@ -19,7 +19,9 @@
 
 - The fixture lifecycle core and deterministic sealed private-read preflight are accepted and published through `bf6271797919f98ff77c7fe59e1b680ab6bcb3b1`; accepted implementation tip is `d193689c630ee9a1fadf2b032cf49ad96d0e3fb4`.
 - The last operational private-read turn returned no authoritative redacted verdict. A bounded read-only search of the repository, Nado worktrees, project-named hidden home artifacts, and project/Nado-named temporary evidence found no operational store. The only SQLite hit was an explicitly synthetic cancellation reproduction and was excluded.
-- The authoritative classification is `UNKNOWN — OPERATIONAL DURABLE EVIDENCE MISSING`. Absence of a discovered store does not prove that nothing was dispatched. No repeat network request, key load, signature, replay, or write is authorized unless the original injected store path and counters are recovered and prove an undispatched state.
+- The old invocation remains permanently `UNKNOWN — OPERATIONAL DURABLE EVIDENCE MISSING`. Absence of its store does not prove that nothing was dispatched, and its invocation ID, store, signature, and `recvTime` must never be reused or treated as retry authority.
+- An Architect-accepted governance candidate now defines one genuinely new read-only `list_trigger_orders` Query with a new invocation ID and a new durable store. Official pinned Nado SDK sources separate Trigger Query at `POST [TRIGGER_ENDPOINT]/query` from Execute at `POST [TRIGGER_ENDPOINT]/execute`; the accepted module's fresh server-time-derived 30-second `recvTime` is stricter than the 100-second gate maximum. The existing sealed implementation is sufficient, so no Builder or implementation change is active.
+- The new operation still requires a separate Chief Coordinator operational gate before its store creation, public traffic, owner-key load, signature, or private Query. This candidate performs none of those actions and does not alter the old `UNKNOWN` classification.
 - Nado has not proved an operational order lifecycle, authoritative zero open orders, or exact flatness.
 
 ## Extended
