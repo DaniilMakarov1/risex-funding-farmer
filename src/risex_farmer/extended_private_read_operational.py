@@ -31,8 +31,8 @@ from .extended_private_read_preflight import (
 )
 
 
-INVOCATION_ID = "extended-private-read-20260824-new-op-001"
-STORE_BASENAME = ".risex-funding-farmer-extended-private-read-20260824-new-op-001.sqlite3"
+INVOCATION_ID = "extended-private-read-20260824-new-op-002"
+STORE_BASENAME = ".risex-funding-farmer-extended-private-read-20260824-new-op-002.sqlite3"
 API_KEY_BASENAME = ".risex-funding-farmer-extended-api-key-v1"
 IDENTITY_BASENAME = ".risex-funding-farmer-extended-identity-v1.json"
 SCHEMA_VERSION = 2
