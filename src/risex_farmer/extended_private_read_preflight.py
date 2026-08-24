@@ -621,6 +621,8 @@ async def _execute(
             await stream.close()
             if effect_ledger is not None:
                 effect_ledger.observed("stream_close")
+            if getattr(stream, "closed", False) is not True:
+                raise PreflightViolation("STREAM_CLOSE_FAILED")
             if effect_ledger is not None:
                 effect_ledger.complete("stream_close")
         except Exception:
