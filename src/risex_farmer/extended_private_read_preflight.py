@@ -139,10 +139,28 @@ class PreflightStore:
                 CREATE TABLE IF NOT EXISTS extended_private_read_preflight (
                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                     state TEXT NOT NULL,
-                    evidence TEXT
+                    evidence TEXT,
+                    schema_version INTEGER NOT NULL DEFAULT 1,
+                    phase TEXT NOT NULL DEFAULT 'LEGACY',
+                    counters TEXT NOT NULL DEFAULT '{}'
                 )
                 """
             )
+            columns = {
+                row[1] for row in connection.execute(
+                    "PRAGMA table_info(extended_private_read_preflight)"
+                )
+            }
+            for definition in (
+                "schema_version INTEGER NOT NULL DEFAULT 1",
+                "phase TEXT NOT NULL DEFAULT 'LEGACY'",
+                "counters TEXT NOT NULL DEFAULT '{}'",
+            ):
+                name = definition.split()[0]
+                if name not in columns:
+                    connection.execute(
+                        f"ALTER TABLE extended_private_read_preflight ADD COLUMN {definition}"
+                    )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path)
@@ -191,7 +209,10 @@ class PreflightStore:
             ).fetchone()
             if row is None:
                 connection.execute(
-                    "INSERT INTO extended_private_read_preflight VALUES (1, 'RUNNING', NULL)"
+                    """
+                    INSERT INTO extended_private_read_preflight
+                    (singleton, state, evidence) VALUES (1, 'RUNNING', NULL)
+                    """
                 )
                 return None
             state, evidence = row
@@ -211,6 +232,33 @@ class PreflightStore:
             ).rowcount
             if changed != 1:
                 raise PreflightViolation("DURABLE_STATE_CONFLICT")
+
+    def recover_interrupted(self) -> dict[str, Any] | None:
+        """Return exact ledger fields for a consumed nonterminal invocation.
+
+        The legacy fixture controller does not resume such a row.  The isolated
+        operational controller uses this read-only surface to classify a process
+        interruption without invoking a credential, clock, or transport.
+        """
+
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT state, schema_version, phase, counters
+                FROM extended_private_read_preflight WHERE singleton=1
+                """
+            ).fetchone()
+        if row is None or row[0] != "RUNNING":
+            return None
+        try:
+            counters = json.loads(row[3])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise PreflightViolation("DURABLE_EVIDENCE_INVALID") from exc
+        if type(row[1]) is not int or type(row[2]) is not str or type(counters) is not dict:
+            raise PreflightViolation("DURABLE_EVIDENCE_INVALID")
+        return {
+            "schema_version": row[1], "phase": row[2], "counters": counters,
+        }
 
 
 def _exact_object(value: Any, keys: set[str], reason: str) -> dict[str, Any]:
@@ -273,14 +321,19 @@ def _validate_transport(value: Any, *, url: str) -> None:
         raise PreflightViolation("TRANSPORT_CONTRACT_MISMATCH")
 
 
-def _validate_account(value: Any) -> None:
+def _validate_account(value: Any, identity_matcher: Any = None) -> None:
     account = _exact_object(value, _ACCOUNT_KEYS, "REST_ACCOUNT_MALFORMED")
-    if (
-        account["id"] != ACCOUNT_ID
-        or account["accountIndex"] != ACCOUNT_INDEX
-        or account["l2Key"] != L2_KEY
-        or account["l2Vault"] != L2_VAULT
-    ):
+    identity_matches = (
+        identity_matcher is not None
+        and identity_matcher.matches_account(account) is True
+    ) or (
+        identity_matcher is None
+        and account["id"] == ACCOUNT_ID
+        and account["accountIndex"] == ACCOUNT_INDEX
+        and account["l2Key"] == L2_KEY
+        and account["l2Vault"] == L2_VAULT
+    )
+    if not identity_matches:
         raise PreflightViolation("ACCOUNT_IDENTITY_MISMATCH")
     if account["status"] != "ACTIVE":
         raise PreflightViolation("ACCOUNT_INACTIVE")
@@ -288,7 +341,7 @@ def _validate_account(value: Any) -> None:
         raise PreflightViolation("REST_ACCOUNT_MALFORMED")
 
 
-def _validate_wrapper(body: Any, path: str) -> None:
+def _validate_wrapper(body: Any, path: str, identity_matcher: Any = None) -> None:
     wrapper = _exact_object(
         body, {"status", "data", "error", "pagination"}, "REST_WRAPPER_MALFORMED"
     )
@@ -297,7 +350,7 @@ def _validate_wrapper(body: Any, path: str) -> None:
     if path == "/user/account/info":
         if wrapper["pagination"] is not None:
             raise PreflightViolation("REST_PAGINATION_INVALID")
-        _validate_account(wrapper["data"])
+        _validate_account(wrapper["data"], identity_matcher)
         return
     if type(wrapper["data"]) is not list:
         raise PreflightViolation("REST_LIST_MALFORMED")
@@ -315,7 +368,8 @@ def _validate_wrapper(body: Any, path: str) -> None:
 
 async def _rest_round(
     transport: Any, api_key: str, round_name: str, clock_ms: Any,
-    counters: _Counters, clock_state: _ClockState,
+    counters: _Counters, clock_state: _ClockState, identity_matcher: Any = None,
+    effect_ledger: Any = None,
 ) -> list[int]:
     observations: list[int] = []
     for path in _REST_PATHS:
@@ -327,7 +381,12 @@ async def _rest_round(
             headers={_API_HEADER: api_key},
         )
         counters.rest_calls += 1
+        effect = f"rest_{round_name.lower()}_{path.rsplit('/', 1)[-1]}"
+        if effect_ledger is not None:
+            effect_ledger.attempt(effect)
         reply = await transport.get(request)
+        if effect_ledger is not None:
+            effect_ledger.observed(effect)
         reply = _exact_object(
             reply, {"status", "final_url", "observed_at_ms", "body", "transport"}, "REST_REPLY_MALFORMED"
         )
@@ -338,12 +397,16 @@ async def _rest_round(
             raise PreflightViolation("REST_REDIRECT_FORBIDDEN")
         observed = reply["observed_at_ms"]
         _fresh_current(observed, clock_ms, counters, clock_state)
-        _validate_wrapper(reply["body"], path)
+        _validate_wrapper(reply["body"], path, identity_matcher)
+        if effect_ledger is not None:
+            effect_ledger.complete(effect)
         observations.append(observed)
     return observations
 
 
-def _validate_stream_frame(raw: Any, previous: int | None) -> int:
+def _validate_stream_frame(
+    raw: Any, previous: int | None, identity_matcher: Any = None
+) -> int:
     frame = _exact_object(
         raw, {"type", "data", "error", "ts", "seq"}, "STREAM_MALFORMED_FRAME"
     )
@@ -379,7 +442,12 @@ def _validate_stream_frame(raw: Any, previous: int | None) -> int:
         for row in data["spotBalances"]:
             spot = _exact_object(row, _SPOT_KEYS, "STREAM_SPOT_BALANCE_MALFORMED")
             if (
-                spot["accountId"] != ACCOUNT_ID or type(spot["asset"]) is not str
+                (
+                    identity_matcher.matches_spot_account_id(spot["accountId"])
+                    if identity_matcher is not None
+                    else spot["accountId"] == ACCOUNT_ID
+                ) is not True
+                or type(spot["asset"]) is not str
                 or not _integer(spot["updatedAt"])
                 or any(
                     spot[key] is not None and not _decimal_string(spot[key])
@@ -405,7 +473,8 @@ def _validate_stream_frame(raw: Any, previous: int | None) -> int:
 
 
 async def _consume_stream(
-    stream: Any, counters: _Counters, state: _StreamState
+    stream: Any, counters: _Counters, state: _StreamState,
+    identity_matcher: Any = None,
 ) -> None:
     while True:
         try:
@@ -417,39 +486,66 @@ async def _consume_stream(
         except (ConnectionError, OSError) as exc:
             raise PreflightViolation("STREAM_DISCONNECTED") from exc
         counters.stream_frames += 1
-        state.previous_sequence = _validate_stream_frame(raw, state.previous_sequence)
+        state.previous_sequence = _validate_stream_frame(
+            raw, state.previous_sequence, identity_matcher
+        )
 
 
-async def _load_api_key(loader: Any) -> str:
+async def _load_api_key(loader: Any, effect_ledger: Any = None) -> str:
+    if effect_ledger is not None:
+        effect_ledger.attempt("loader")
     loaded = loader()
     if inspect.isawaitable(loaded):
         loaded = await loaded
+    if effect_ledger is not None:
+        effect_ledger.observed("loader")
     if type(loaded) is not str or not loaded:
         raise PreflightViolation("CREDENTIAL_INVALID")
+    if effect_ledger is not None:
+        effect_ledger.complete("loader")
     return loaded
 
 
 async def _execute(
-    credential_loader: Any, transport: Any, clock_ms: Any, counters: _Counters
+    credential_loader: Any, transport: Any, clock_ms: Any, counters: _Counters,
+    identity_matcher: Any = None, effect_ledger: Any = None,
 ) -> PreflightResult:
-    api_key = await _load_api_key(credential_loader)
+    api_key = await _load_api_key(credential_loader, effect_ledger)
     clock_state = _ClockState()
-    round_a = await _rest_round(transport, api_key, "A", clock_ms, counters, clock_state)
+    round_a = await _rest_round(
+        transport, api_key, "A", clock_ms, counters, clock_state, identity_matcher,
+        effect_ledger,
+    )
+    if effect_ledger is not None:
+        effect_ledger.attempt("stream_open")
     stream = await transport.open_stream(
         StreamRequest(url=STREAM_URL, headers={_API_HEADER: api_key})
     )
+    if effect_ledger is not None:
+        effect_ledger.observed("stream_open")
+    if effect_ledger is not None:
+        effect_ledger.complete("stream_open")
     state = _StreamState()
     consumer: asyncio.Task[None] | None = None
     failure: PreflightViolation | None = None
     try:
+        if effect_ledger is not None:
+            effect_ledger.attempt("stream_upgrade")
         _validate_transport(getattr(stream, "upgrade_metadata", None), url=STREAM_URL)
         if getattr(stream, "outbound_frames", None) != []:
             raise PreflightViolation("STREAM_OUTBOUND_FORBIDDEN")
         if getattr(stream, "reconnect_count", 0) != 0:
             raise PreflightViolation("STREAM_RECONNECT_FORBIDDEN")
-        consumer = asyncio.create_task(_consume_stream(stream, counters, state))
+        if effect_ledger is not None:
+            effect_ledger.complete("stream_upgrade")
+        consumer = asyncio.create_task(
+            _consume_stream(stream, counters, state, identity_matcher)
+        )
         round_b_task = asyncio.create_task(
-            _rest_round(transport, api_key, "B", clock_ms, counters, clock_state)
+            _rest_round(
+                transport, api_key, "B", clock_ms, counters, clock_state,
+                identity_matcher, effect_ledger,
+            )
         )
         done, _ = await asyncio.wait(
             {consumer, round_b_task}, return_when=asyncio.FIRST_COMPLETED
@@ -466,7 +562,13 @@ async def _execute(
         if min(round_b) <= max(round_a):
             raise PreflightViolation("REST_ROUNDS_NOT_ORDERED")
         try:
+            if effect_ledger is not None:
+                effect_ledger.attempt("barrier_request")
             barrier = await stream.final_barrier()
+            if effect_ledger is not None:
+                effect_ledger.observed("barrier_request")
+            if effect_ledger is not None:
+                effect_ledger.complete("barrier_request")
         except StopAsyncIteration as exc:
             raise PreflightViolation("STREAM_ENDED_EARLY") from exc
         except (ConnectionError, OSError) as exc:
@@ -476,6 +578,8 @@ async def _execute(
             {"connected", "same_connection", "outbound_frames", "reconnect_count", "frames", "transport", "observed_at_ms"},
             "STREAM_BARRIER_UNVERIFIABLE",
         )
+        if effect_ledger is not None:
+            effect_ledger.attempt("barrier_validation")
         _validate_transport(barrier["transport"], url=STREAM_URL)
         _fresh_current(barrier["observed_at_ms"], clock_ms, counters, clock_state)
         if not _integer(barrier["observed_at_ms"]) or barrier["observed_at_ms"] < max(round_b):
@@ -491,13 +595,17 @@ async def _execute(
         await consumer
         for raw in barrier["frames"]:
             counters.stream_frames += 1
-            state.previous_sequence = _validate_stream_frame(raw, state.previous_sequence)
+            state.previous_sequence = _validate_stream_frame(
+                raw, state.previous_sequence, identity_matcher
+            )
         if getattr(stream, "closed", False):
             raise PreflightViolation("STREAM_ENDED_EARLY")
         if getattr(stream, "outbound_frames", None) != []:
             raise PreflightViolation("STREAM_OUTBOUND_FORBIDDEN")
         if getattr(stream, "reconnect_count", 0) != 0:
             raise PreflightViolation("STREAM_RECONNECT_FORBIDDEN")
+        if effect_ledger is not None:
+            effect_ledger.complete("barrier_validation")
     except PreflightViolation as exc:
         failure = exc
     finally:
@@ -508,7 +616,13 @@ async def _execute(
             except asyncio.CancelledError:
                 pass
         try:
+            if effect_ledger is not None:
+                effect_ledger.attempt("stream_close")
             await stream.close()
+            if effect_ledger is not None:
+                effect_ledger.observed("stream_close")
+            if effect_ledger is not None:
+                effect_ledger.complete("stream_close")
         except Exception:
             if failure is None:
                 failure = PreflightViolation("STREAM_CLOSE_FAILED")
@@ -521,7 +635,8 @@ async def _execute(
 
 
 async def run_preflight(
-    *, store: PreflightStore, credential_loader: Any, transport: Any, clock_ms: Any
+    *, store: PreflightStore, credential_loader: Any, transport: Any, clock_ms: Any,
+    identity_matcher: Any = None,
 ) -> PreflightResult:
     """Consume the fixture one-shot and persist one redacted terminal verdict."""
 
@@ -530,7 +645,9 @@ async def run_preflight(
         return existing
     counters = _Counters()
     try:
-        result = await _execute(credential_loader, transport, clock_ms, counters)
+        result = await _execute(
+            credential_loader, transport, clock_ms, counters, identity_matcher
+        )
     except asyncio.CancelledError:
         result = PreflightResult(
             "BLOCKED", "CANCELLED", counters.rest_calls, counters.stream_frames, False,
