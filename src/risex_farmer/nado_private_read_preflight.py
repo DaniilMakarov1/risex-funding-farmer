@@ -122,6 +122,8 @@ class PreflightConfig:
     now_ms: int
 
     def __post_init__(self) -> None:
+        if type(self.sender) is not str:
+            raise NadoPreflightError("subaccount identity is invalid")
         if (
             encode_subaccount(self.owner, self.subaccount_name).lower()
             != self.sender.lower()
@@ -213,7 +215,12 @@ class _SealedTransport:
             raise NadoPreflightError(self.failure_label)
         if type(raw) is not ObservedResponse:
             raise NadoPreflightError("transport observation schema mismatch")
-        if raw.url != self.expected_url or raw.final_url != self.expected_url:
+        if (
+            type(raw.url) is not str
+            or type(raw.final_url) is not str
+            or raw.url != self.expected_url
+            or raw.final_url != self.expected_url
+        ):
             raise NadoPreflightError("transport host or redirect mismatch")
         if type(raw.http_status) is not int or raw.http_status != 200:
             raise NadoPreflightError("transport HTTP status rejected")
@@ -338,7 +345,7 @@ def _exact_keys(value: Mapping[str, object], expected: set[str], label: str) -> 
         raise NadoPreflightError(f"{label} schema mismatch")
 
 
-def _wire_data(observation: ObservedResponse, now_ms: int) -> tuple[Mapping[str, object], int]:
+def _wire_data(observation: ObservedResponse, now_ms: int) -> tuple[object, int]:
     observed = observation.observed_at_ms
     if observed > now_ms or now_ms - observed > MAX_FRESHNESS_MS:
         raise NadoPreflightError("transport observation is not fresh")
@@ -348,21 +355,24 @@ def _wire_data(observation: ObservedResponse, now_ms: int) -> tuple[Mapping[str,
     _exact_keys(payload, {"status", "data"}, "wire envelope")
     if type(payload["status"]) is not str or payload["status"] != "success":
         raise NadoPreflightError("wire status is not success")
-    data = payload["data"]
-    if type(data) is not dict:
-        raise NadoPreflightError("wire data schema mismatch")
-    return data, observed
+    return payload["data"], observed
 
 
 def _query(
     transport: SealedPublicTransport, request: Mapping[str, object], now_ms: int,
-) -> tuple[Mapping[str, object], int]:
+) -> tuple[object, int]:
     return _wire_data(transport.send(request), now_ms)
 
 
 def _strict_uint(value: object, label: str) -> int:
-    if type(value) is not int or value < 0:
+    if type(value) is not int or not 0 <= value < 2**32:
         raise NadoPreflightError(f"{label} is invalid")
+    return value
+
+
+def _object(value: object, label: str) -> dict[str, object]:
+    if type(value) is not dict:
+        raise NadoPreflightError(f"{label} schema mismatch")
     return value
 
 
@@ -381,7 +391,8 @@ def _decimal(value: object, label: str, *, signed: bool = True) -> int:
     return int(value)
 
 
-def _contracts(data: Mapping[str, object]) -> None:
+def _contracts(raw_data: object) -> None:
+    data = _object(raw_data, "contracts")
     _exact_keys(data, {"chain_id", "endpoint_addr"}, "contracts")
     chain = _decimal(data["chain_id"], "chain id", signed=False)
     endpoint = data["endpoint_addr"]
@@ -392,13 +403,65 @@ def _contracts(data: Mapping[str, object]) -> None:
         raise NadoPreflightError("contracts identity mismatch")
 
 
-def _status(data: Mapping[str, object]) -> None:
-    _exact_keys(data, {"status"}, "engine status")
-    if type(data["status"]) is not str or data["status"] != "active":
+def _status(data: object) -> None:
+    if type(data) is not str or data != "active":
         raise NadoPreflightError("engine is not active")
 
 
-def _catalog(data: Mapping[str, object]) -> tuple[tuple[int, str, str], ...]:
+_RISK_KEYS = {
+    "long_weight_initial_x18", "short_weight_initial_x18",
+    "long_weight_maintenance_x18", "short_weight_maintenance_x18",
+    "large_position_penalty_x18",
+}
+_BOOK_KEYS = {"size_increment", "price_increment_x18", "min_size", "collected_fees"}
+_SPOT_CONFIG_KEYS = {
+    "token", "interest_inflection_util_x18", "interest_floor_x18",
+    "interest_small_cap_x18", "interest_large_cap_x18", "min_deposit_rate_x18",
+}
+_SPOT_STATE_KEYS = {
+    "cumulative_deposits_multiplier_x18", "cumulative_borrows_multiplier_x18",
+    "total_deposits_normalized", "total_borrows_normalized",
+}
+_PERP_STATE_KEYS = {
+    "cumulative_funding_long_x18", "cumulative_funding_short_x18",
+    "available_settle", "open_interest",
+}
+
+
+def _decimal_object(raw: object, keys: set[str], label: str) -> dict[str, object]:
+    value = _object(raw, label)
+    _exact_keys(value, keys, label)
+    for key in keys:
+        _decimal(value[key], f"{label} {key}")
+    return value
+
+
+def _product(raw: object, kind: str) -> tuple[int, str, str]:
+    product = _object(raw, f"{kind} product")
+    common = {"product_id", "oracle_price_x18", "risk", "state", "book_info"}
+    expected = common | ({"config"} if kind == "spot" else {"index_price_x18"})
+    _exact_keys(product, expected, f"{kind} product")
+    product_id = _strict_uint(product["product_id"], "product id")
+    if _decimal(product["oracle_price_x18"], "oracle price", signed=False) <= 0:
+        raise NadoPreflightError("oracle price is not positive")
+    _decimal_object(product["risk"], _RISK_KEYS, "risk")
+    _decimal_object(product["book_info"], _BOOK_KEYS, "book info")
+    if kind == "spot":
+        config = _object(product["config"], "spot config")
+        _exact_keys(config, _SPOT_CONFIG_KEYS, "spot config")
+        _address_bytes(config["token"])
+        for key in _SPOT_CONFIG_KEYS - {"token"}:
+            _decimal(config[key], f"spot config {key}")
+        _decimal_object(product["state"], _SPOT_STATE_KEYS, "spot state")
+    else:
+        if _decimal(product["index_price_x18"], "index price", signed=False) <= 0:
+            raise NadoPreflightError("index price is not positive")
+        _decimal_object(product["state"], _PERP_STATE_KEYS, "perp state")
+    return product_id, kind, _digest(product)
+
+
+def _catalog(raw_data: object) -> tuple[tuple[int, str, str], ...]:
+    data = _object(raw_data, "all products")
     _exact_keys(data, {"spot_products", "perp_products"}, "all products")
     products: dict[int, tuple[int, str, str]] = {}
     for kind, field in (("spot", "spot_products"), ("perp", "perp_products")):
@@ -406,20 +469,20 @@ def _catalog(data: Mapping[str, object]) -> tuple[tuple[int, str, str], ...]:
         if type(raw_products) is not list:
             raise NadoPreflightError("product catalog schema mismatch")
         for raw in raw_products:
-            if type(raw) is not dict:
-                raise NadoPreflightError("product schema mismatch")
-            _exact_keys(raw, {"product_id", "symbol"}, "product")
-            product_id = _strict_uint(raw["product_id"], "product id")
-            symbol = raw["symbol"]
-            if type(symbol) is not str or not symbol or product_id in products:
+            parsed = _product(raw, kind)
+            product_id = parsed[0]
+            if product_id in products:
                 raise NadoPreflightError("product identity is invalid or duplicate")
-            products[product_id] = (product_id, symbol, kind)
-    if not products or products.get(0) != (0, "USDT0", "spot"):
+            products[product_id] = parsed
+    if not products or products.get(0, (None, None, None))[1] != "spot":
         raise NadoPreflightError("official collateral identity mismatch")
+    if set(products) != set(range(len(products))):
+        raise NadoPreflightError("product catalog coverage is not contiguous")
     return tuple(products[key] for key in sorted(products))
 
 
-def _linked(data: Mapping[str, object]) -> None:
+def _linked(raw_data: object) -> None:
+    data = _object(raw_data, "linked signer")
     _exact_keys(data, {"linked_signer"}, "linked signer")
     signer = data["linked_signer"]
     if type(signer) is not str or signer.lower() != ZERO_ADDRESS:
@@ -442,10 +505,18 @@ def _balance_entries(
         balance = entry["balance"]
         if type(balance) is not dict:
             raise NadoPreflightError(f"{label} balance schema mismatch")
-        expected = {"amount", "v_quote_balance"} if perp else {"amount"}
+        expected = (
+            {"amount", "v_quote_balance", "last_cumulative_funding_x18"}
+            if perp else {"amount"}
+        )
         _exact_keys(balance, expected, f"{label} balance")
         amount = _decimal(balance["amount"], f"{label} amount")
         v_quote = _decimal(balance["v_quote_balance"], "v_quote") if perp else 0
+        if perp:
+            _decimal(
+                balance["last_cumulative_funding_x18"],
+                "last cumulative funding",
+            )
         parsed[product_id] = (amount, v_quote)
     if set(parsed) != expected_ids:
         raise NadoPreflightError(f"{label} coverage is incomplete")
@@ -453,12 +524,17 @@ def _balance_entries(
 
 
 def _account(
-    data: Mapping[str, object], sender: str,
+    raw_data: object, sender: str,
     catalog: tuple[tuple[int, str, str], ...],
 ) -> dict[str, object]:
+    data = _object(raw_data, "subaccount info")
     _exact_keys(
         data,
-        {"subaccount", "exists", "health", "spot_balances", "perp_balances", "perp_count"},
+        {
+            "exists", "subaccount", "spot_count", "perp_count", "healths",
+            "health_contributions", "spot_balances", "perp_balances",
+            "spot_products", "perp_products",
+        },
         "subaccount info",
     )
     subaccount = data["subaccount"]
@@ -466,11 +542,38 @@ def _account(
         raise NadoPreflightError("subaccount identity mismatch")
     if type(data["exists"]) is not bool or not data["exists"]:
         raise NadoPreflightError("subaccount does not exist")
-    health = _decimal(data["health"], "health")
-    if health <= 0:
-        raise NadoPreflightError("health is not positive")
-    spot_ids = {item[0] for item in catalog if item[2] == "spot"}
-    perp_ids = {item[0] for item in catalog if item[2] == "perp"}
+    if _catalog({
+        "spot_products": data["spot_products"],
+        "perp_products": data["perp_products"],
+    }) != catalog:
+        raise NadoPreflightError("embedded product catalog disagrees")
+    healths = data["healths"]
+    if type(healths) is not list or len(healths) != 3:
+        raise NadoPreflightError("health breakdown triple is required")
+    normalized_healths: list[tuple[int, int, int]] = []
+    for raw_health in healths:
+        health = _object(raw_health, "health breakdown")
+        _exact_keys(health, {"health", "assets", "liabilities"}, "health breakdown")
+        parsed = (
+            _decimal(health["health"], "health"),
+            _decimal(health["assets"], "health assets"),
+            _decimal(health["liabilities"], "health liabilities"),
+        )
+        if parsed[0] <= 0 or parsed[1] < 0 or parsed[2] < 0:
+            raise NadoPreflightError("health breakdown is not positive")
+        normalized_healths.append(parsed)
+    contributions = data["health_contributions"]
+    if type(contributions) is not list or len(contributions) != len(catalog):
+        raise NadoPreflightError("health contribution coverage is incomplete")
+    normalized_contributions: list[tuple[int, int, int]] = []
+    for raw_contribution in contributions:
+        if type(raw_contribution) is not list or len(raw_contribution) != 3:
+            raise NadoPreflightError("health contribution triple is required")
+        normalized_contributions.append(tuple(
+            _decimal(value, "health contribution") for value in raw_contribution
+        ))
+    spot_ids = {item[0] for item in catalog if item[1] == "spot"}
+    perp_ids = {item[0] for item in catalog if item[1] == "perp"}
     spots = _balance_entries(data["spot_balances"], "spot balance", spot_ids, perp=False)
     perps = _balance_entries(data["perp_balances"], "cross-perp", perp_ids, perp=True)
     if spots.get(0, (-1, 0))[0] < MIN_COLLATERAL_X18:
@@ -483,19 +586,35 @@ def _account(
         raise NadoPreflightError("cross-perp is not exactly flat")
     if any(v_quote != 0 for _, v_quote in perps.values()):
         raise NadoPreflightError("unexplained v_quote balance")
-    perp_count = _decimal(data["perp_count"], "perp count", signed=False)
-    if perp_count != len(perps):
-        raise NadoPreflightError("perp count contradicts complete vector")
-    return {"health": health, "spots": spots, "perps": perps}
+    spot_count = _strict_uint(data["spot_count"], "spot count")
+    perp_count = _strict_uint(data["perp_count"], "perp count")
+    if spot_count != len(spots) or perp_count != len(perps):
+        raise NadoPreflightError("balance counts contradict complete vectors")
+    return {
+        "healths": normalized_healths,
+        "health_contributions": normalized_contributions,
+        "spots": spots,
+        "perps": perps,
+    }
 
 
-def _orders(data: Mapping[str, object]) -> None:
-    _exact_keys(data, {"orders"}, "regular orders")
+def _orders(raw_data: object, sender: str, product_id: int) -> None:
+    data = _object(raw_data, "subaccount orders")
+    _exact_keys(data, {"sender", "product_id", "orders"}, "subaccount orders")
+    echoed_sender = data["sender"]
+    echoed_product = _strict_uint(data["product_id"], "order product id")
+    if (
+        type(echoed_sender) is not str
+        or echoed_sender.lower() != sender.lower()
+        or echoed_product != product_id
+    ):
+        raise NadoPreflightError("subaccount orders identity mismatch")
     if type(data["orders"]) is not list or data["orders"]:
         raise NadoPreflightError("regular order exists or response is invalid")
 
 
-def _isolated(data: Mapping[str, object]) -> None:
+def _isolated(raw_data: object) -> None:
+    data = _object(raw_data, "isolated positions")
     _exact_keys(data, {"isolated_positions"}, "isolated positions")
     if type(data["isolated_positions"]) is not list or data["isolated_positions"]:
         raise NadoPreflightError("isolated position exists or response is invalid")
@@ -515,7 +634,7 @@ def _round_a(transport: SealedPublicTransport, config: PreflightConfig) -> _Roun
     data, at = _query(transport, {"type": "all_products"}, config.now_ms)
     observed.append(at); products = _catalog(data)
     data, at = _query(
-        transport, {"type": "linked_signer", "sender": config.sender}, config.now_ms,
+        transport, {"type": "linked_signer", "subaccount": config.sender}, config.now_ms,
     )
     observed.append(at); _linked(data)
     data, at = _query(
@@ -525,10 +644,10 @@ def _round_a(transport: SealedPublicTransport, config: PreflightConfig) -> _Roun
     for product_id, _, _ in products:
         data, at = _query(
             transport,
-            {"type": "open_orders", "sender": config.sender, "product_id": product_id},
+            {"type": "subaccount_orders", "sender": config.sender, "product_id": product_id},
             config.now_ms,
         )
-        observed.append(at); _orders(data)
+        observed.append(at); _orders(data, config.sender, product_id)
     data, at = _query(
         transport, {"type": "isolated_positions", "subaccount": config.sender},
         config.now_ms,
@@ -547,10 +666,10 @@ def _round_b(transport: SealedPublicTransport, config: PreflightConfig) -> _Roun
     for product_id, _, _ in products:
         data, at = _query(
             transport,
-            {"type": "open_orders", "sender": config.sender, "product_id": product_id},
+            {"type": "subaccount_orders", "sender": config.sender, "product_id": product_id},
             config.now_ms,
         )
-        observed.append(at); _orders(data)
+        observed.append(at); _orders(data, config.sender, product_id)
     data, at = _query(
         transport, {"type": "subaccount_info", "subaccount": config.sender}, config.now_ms,
     )
@@ -563,10 +682,10 @@ def _round_b(transport: SealedPublicTransport, config: PreflightConfig) -> _Roun
     for product_id, _, _ in products:
         data, at = _query(
             transport,
-            {"type": "open_orders", "sender": config.sender, "product_id": product_id},
+            {"type": "subaccount_orders", "sender": config.sender, "product_id": product_id},
             config.now_ms,
         )
-        observed.append(at); _orders(data)
+        observed.append(at); _orders(data, config.sender, product_id)
     data, at = _query(transport, {"type": "contracts"}, config.now_ms)
     observed.append(at); _contracts(data)
     data, at = _query(transport, {"type": "status"}, config.now_ms)
@@ -576,7 +695,7 @@ def _round_b(transport: SealedPublicTransport, config: PreflightConfig) -> _Roun
     if _catalog(data) != products:
         raise NadoPreflightError("round-B catalog changed")
     data, at = _query(
-        transport, {"type": "linked_signer", "sender": config.sender}, config.now_ms,
+        transport, {"type": "linked_signer", "subaccount": config.sender}, config.now_ms,
     )
     observed.append(at); _linked(data)
     _temporal(observed)
@@ -637,7 +756,8 @@ def _signature(value: object) -> str:
 def _trigger_zero(
     observation: ObservedResponse, config: PreflightConfig,
 ) -> tuple[str, int]:
-    data, observed = _wire_data(observation, config.now_ms)
+    raw_data, observed = _wire_data(observation, config.now_ms)
+    data = _object(raw_data, "trigger orders")
     _exact_keys(data, {"orders"}, "trigger orders")
     if type(data["orders"]) is not list or data["orders"]:
         raise NadoPreflightError("trigger history is not zero")
