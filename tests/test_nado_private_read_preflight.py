@@ -1203,3 +1203,261 @@ async def test_owned_http_transport_enforces_real_deadline_and_cancellation(
     assert 4.5 <= time.monotonic() - started < 7
     _assert_sanitized(captured.value)
     assert len(session.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_counted_operational_adapter_exact_sequence_and_terminal_report(
+    tmp_path: Path, contract: dict[str, object], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import risex_farmer.nado_private_read_operational as operational
+
+    plan: list[tuple[str, object]] = [
+        (nado.FixedPreflightIdentity.gateway_query, entry["response"])
+        for entry in contract["round_a"]
+    ]
+    plan += [
+        (nado.FixedPreflightIdentity.gateway_edge_query, contract["wire"]["time"]),
+        (nado.FixedPreflightIdentity.trigger_query, contract["trigger"]["response"]),
+    ]
+    plan += [
+        (nado.FixedPreflightIdentity.gateway_query, entry["response"])
+        for entry in contract["round_b"]
+    ]
+    sessions: list[_HttpSession] = []
+
+    def session_factory(**kwargs: object) -> object:
+        url, payload = plan[len(sessions)]
+        raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        session = _HttpSession(_HttpResponse(raw, url=url))
+        sessions.append(session)
+        return session
+
+    now = 1_700_000_000_025
+    clock_values: list[int] = []
+    for entry in contract["round_a"]:
+        clock_values.extend([int(entry["observed_at_ms"]), now])
+    clock_values.extend([1_700_000_000_008, now, now])
+    clock_values.extend([int(contract["trigger"]["observed_at_ms"]), now])
+    for entry in contract["round_b"]:
+        clock_values.extend([int(entry["observed_at_ms"]), now])
+    monkeypatch.setattr(nado.aiohttp, "ClientSession", session_factory)
+    monkeypatch.setattr(nado, "_system_clock_ms", lambda: clock_values.pop(0))
+
+    calls = Calls(contract)
+
+    class Handle:
+        closed = 0
+
+        def derive_owner(self) -> str:
+            return calls.derive_owner(object())
+
+        def sign_list_trigger_orders(self, typed: dict[str, object]) -> str:
+            return calls.signer(object(), typed)
+
+        def close(self) -> None:
+            self.closed += 1
+
+    handle = Handle()
+    store = nado.OneShotStore(tmp_path / "counted-success.sqlite3")
+    report = await operational._fixture_run(
+        config=_config(contract), store=store, capability_loader=lambda: handle,
+        recover_owner=calls.recover_owner, path_hash="fixture-path-hash",
+        transports=(nado._OperationalGatewayTransport(),
+                    nado._OperationalTimeTransport(),
+                    nado._OperationalTriggerTransport()),
+    )
+    assert report["status"] == nado.FINALIZED
+    assert report["product_count"] == 2
+    counters = report["counters"]
+    assert counters["public_a_attempts"] == counters["public_a_completions"] == 8
+    assert counters["public_b_attempts"] == counters["public_b_completions"] == 11
+    for phase in nado.COUNTER_PHASES[1:-1]:
+        assert counters[f"{phase}_attempts"] == 1
+        assert counters[f"{phase}_completions"] == 1
+    assert handle.closed == 1 and len(sessions) == 21 and not clock_values
+    assert "signature" not in json.dumps(report).lower()
+
+
+@pytest.mark.asyncio
+async def test_counted_interrupted_new_is_terminal_zero_effect(
+    tmp_path: Path, contract: dict[str, object],
+) -> None:
+    import risex_farmer.nado_private_read_operational as operational
+
+    store = nado.OneShotStore(tmp_path / "interrupted.sqlite3")
+    config = _config(contract)
+    store.begin(config.invocation_id, "identity-hash", "path-hash")
+    store.count(config.invocation_id, "public_a")
+    effects = {"load": 0, "network": 0}
+
+    class NeverTransport:
+        async def send_async(self, request: object) -> object:
+            effects["network"] += 1
+            raise AssertionError("network must remain unused")
+
+    def load() -> object:
+        effects["load"] += 1
+        raise AssertionError("loader must remain unused")
+
+    report = await operational._fixture_run(
+        config=config, store=store, capability_loader=load,
+        recover_owner=lambda typed, signature: str(contract["owner"]),
+        path_hash="path-hash",
+        transports=(NeverTransport(), NeverTransport(), NeverTransport()),
+    )
+    assert report["status"] == nado.UNKNOWN
+    assert report["reason"] == "INTERRUPTED"
+    assert report["counters"]["public_a_attempts"] == 1
+    assert effects == {"load": 0, "network": 0}
+
+
+def test_operational_binding_has_fixed_read_only_surface() -> None:
+    import risex_farmer
+    import risex_farmer.nado_private_read_operational as operational
+
+    source = inspect.getsource(operational)
+    assert tuple(inspect.signature(operational.run).parameters) == ()
+    assert operational.INVOCATION_ID == "nado-private-read-20260824-new-op-001"
+    assert operational.SUBACCOUNT_NAME == "default"
+    assert operational.EXPECTED_PATH_HASH == (
+        "ec98ed1b3781034e0436b37a634f4f87164510d077df1c3a5e7dc4a0e4d35b2d"
+    )
+    assert "nado_private_read_operational" not in Path(risex_farmer.__file__).read_text()
+    for forbidden in ("/execute", "retry", "proxy=", "os.environ", "argparse"):
+        assert forbidden not in source
+
+
+def test_counter_schema_corruption_fails_closed(tmp_path: Path) -> None:
+    path = tmp_path / "corrupt-count.sqlite3"
+    store = nado.OneShotStore(path)
+    store.begin("fixture", "identity", "path")
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE nado_preflight_one_shot SET counters_json=?",
+            ('{"public_a_attempts":-1}',),
+        )
+    with pytest.raises(nado.NadoPreflightError):
+        store.terminal_report("fixture")
+
+
+@pytest.mark.parametrize("phase", nado.COUNTER_PHASES)
+@pytest.mark.parametrize("completed", [False, True])
+@pytest.mark.asyncio
+async def test_process_death_counter_recovery_is_zero_effect_and_terminal(
+    tmp_path: Path, contract: dict[str, object], phase: str, completed: bool,
+) -> None:
+    import risex_farmer.nado_private_read_operational as operational
+
+    store = nado.OneShotStore(tmp_path / f"death-{phase}-{completed}.sqlite3")
+    config = _config(contract)
+    store.begin(config.invocation_id, "identity-hash", "path-hash")
+    with store._connection:
+        state = nado.OBSERVED if phase == "public_b" else (
+            nado.NEW if phase == "public_a" else nado.CLAIMED
+        )
+        store._connection.execute(
+            "UPDATE nado_preflight_one_shot SET state=? WHERE invocation_id=?",
+            (state, config.invocation_id),
+        )
+    store.count(config.invocation_id, phase)
+    if completed:
+        store.count(config.invocation_id, phase, True)
+    effects = {"load": 0, "network": 0}
+
+    class NeverTransport:
+        async def send_async(self, request: object) -> object:
+            effects["network"] += 1
+            raise AssertionError
+
+    def load() -> object:
+        effects["load"] += 1
+        raise AssertionError
+
+    first = await operational._fixture_run(
+        config=config, store=store, capability_loader=load,
+        recover_owner=lambda typed, signature: str(contract["owner"]),
+        path_hash="path-hash",
+        transports=(NeverTransport(), NeverTransport(), NeverTransport()),
+    )
+    second = await operational._fixture_run(
+        config=config, store=store, capability_loader=load,
+        recover_owner=lambda typed, signature: str(contract["owner"]),
+        path_hash="path-hash",
+        transports=(NeverTransport(), NeverTransport(), NeverTransport()),
+    )
+    assert first == second and first["status"] == nado.UNKNOWN
+    assert first["counters"][f"{phase}_attempts"] == 1
+    assert first["counters"][f"{phase}_completions"] == int(completed)
+    if phase == "trigger_dispatch" and not completed:
+        assert first["reason"] == "AMBIGUOUS_DISPATCH"
+    assert effects == {"load": 0, "network": 0}
+
+
+def test_opaque_owner_capability_exact_operation_and_zeroize() -> None:
+    import risex_farmer.nado_private_read_operational as operational
+
+    secret = bytes.fromhex("11" * 32)
+    owner = Account.from_key(secret).address.lower()
+    sender = nado.encode_subaccount(owner, "default")
+    handle = operational._OwnerKeyCapability(secret, sender)
+    typed = nado.list_trigger_orders_typed_data(sender, "1700000030009")
+    assert handle.derive_owner() == owner
+    signature = handle.sign_list_trigger_orders(typed)
+    assert operational._recover_owner(typed, signature) == owner
+    assert not any(
+        name for name in dir(handle)
+        if name in {"key", "secret", "path", "fd", "sign", "sign_typed_data"}
+    )
+    handle.close()
+    with pytest.raises(nado.NadoPreflightError):
+        handle.derive_owner()
+
+
+def test_fixed_source_rejects_mode_symlink_and_noncanonical_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import risex_farmer.nado_private_read_operational as operational
+
+    monkeypatch.setattr(operational, "_home", lambda: tmp_path)
+    owner = Account.from_key(bytes.fromhex("22" * 32)).address.lower()
+    identity = tmp_path / operational.IDENTITY_BASENAME
+    identity.write_text(json.dumps({
+        "owner": owner, "subaccount_name": "default",
+    }, sort_keys=True, separators=(",", ":")))
+    identity.chmod(0o600)
+    assert operational._strict_identity() == (
+        owner, nado.encode_subaccount(owner, "default"),
+    )
+    identity.chmod(0o644)
+    with pytest.raises(nado.NadoPreflightError):
+        operational._strict_identity()
+    identity.unlink()
+    target = tmp_path / "identity-target"
+    target.write_text("{}")
+    target.chmod(0o600)
+    identity.symlink_to(target)
+    with pytest.raises(nado.NadoPreflightError):
+        operational._strict_identity()
+
+
+def test_fixed_store_preparation_is_full_sync_owned_and_no_follow(tmp_path: Path) -> None:
+    import risex_farmer.nado_private_read_operational as operational
+
+    path = tmp_path / "fixture-store.sqlite3"
+    store = operational._prepare_store(path)
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert store._connection.execute("PRAGMA synchronous").fetchone()[0] == 2
+    store.close()
+
+    rejected = tmp_path / "rejected.sqlite3"
+    rejected.write_bytes(b"")
+    rejected.chmod(0o644)
+    with pytest.raises(nado.NadoPreflightError):
+        operational._prepare_store(rejected)
+    rejected.unlink()
+    target = tmp_path / "target.sqlite3"
+    target.write_bytes(b"")
+    target.chmod(0o600)
+    rejected.symlink_to(target)
+    with pytest.raises(nado.NadoPreflightError):
+        operational._prepare_store(rejected)

@@ -19,6 +19,7 @@ test = [
     "eth-account>=0.13,<0.14",
 ]
 testnet-risex = ["eth-account>=0.13,<0.14"]
+testnet-nado = ["eth-account>=0.13,<0.14"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
