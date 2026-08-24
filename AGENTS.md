@@ -38,7 +38,7 @@ Only `AGENTS.md`, `SYSTEM_SPEC.md`, `STATUS.md`, `NEXT_TASK.md`, and `README.md`
 ## Model routing
 
 - Chief Coordinator and every venue Architect use GPT-5.6 Sol with `medium` reasoning. A temporary auditor, if indispensable, also uses GPT-5.6 Sol `medium`.
-- Builders use GPT-5.6 Terra `medium` by default and GPT-5.6 Sol `medium` only for credential, signing, durable-ambiguity, or live-lifecycle code. GPT-5.6 Luna `low` or `medium` may perform mechanical read-only summarization but never architecture, implementation acceptance, or an operational verdict.
+- Builders use GPT-5.6 Sol `medium` by default. GPT-5.6 Terra `medium` is permitted only for a fully specified mechanical local transformation whose correctness is completely decided by existing tests and requires no API/schema interpretation, architecture, state-machine reasoning, credential/signing work, or operational judgment. GPT-5.6 Luna `low` or `medium` may perform mechanical read-only summarization but never architecture, implementation acceptance, or an operational verdict.
 - `high`, `xhigh`, `max`, and Pro reasoning modes are prohibited project-wide for every role and model. New or replacement agents must be created with an explicit permitted model and effort rather than inheriting an unknown or higher setting.
 - Model choice changes neither authority nor gates: the selected route owner directs Builder work, and Chief independently accepts every candidate and operational result.
 
