@@ -10,7 +10,8 @@
 ### RISEx
 
 - Private-read op011 passed with complete counters, authoritative zero orders, and exact flatness; all invocations through op011 are consumed.
-- Current official REST/WebSocket documentation now proves the exact `client_order_id` to composite order, wide/resting order, fill, cancel, and account-position reconciliation path. A fixture-only correction is next; no live write or retry is authorized.
+- The accepted fixture lifecycle now binds `client_order_id` to composite, wide, and resting order identities, matching order/fill records, the exact cancel action/body identity split, and a fresh authoritative market position. It preserves durable no-replay and terminal zero-order/exact-flat barriers.
+- The next slice is an isolated fixture-tested Tier C operational adapter candidate. No credential access, signature, request dispatch, or live write is authorized before that candidate is independently accepted and receives its own one-shot Chief operational gate.
 
 ### Nado
 

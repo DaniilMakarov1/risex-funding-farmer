@@ -2,12 +2,13 @@
 
 One slice per venue. Secrets stay outside Git and reports. Private reads and writes run sequentially and never retry an ambiguous operation.
 
-## RISEx — bind the proved official order identity
+## RISEx — prepare the sealed Tier C operational adapter
 
-Status: `READY FOR TIER C FIXTURE START GATE`.
+Status: `READY FOR TIER C OPERATIONAL-ADAPTER START GATE`.
 
-- From the then-current published `main`, prepare one isolated RED-before-GREEN fixture candidate that binds the documented `client_order_id` to the composite order ID, wide/resting order IDs, order/fill records, exact cancel action identity, and fresh authoritative account position required by the accepted lifecycle.
-- Use only current official RISEx REST/WebSocket/UI-contract sources. Preserve durable no-replay/no-blind-retry barriers and the minimum-notional `<= USD 500` contract. Do not access credentials, sign, dispatch, or add a live transport.
+- From the then-current published `main`, prepare one isolated RED-before-GREEN candidate that wires the accepted fixture lifecycle into one sealed fixed-destination testnet operation with durable counters and terminal evidence for preflight, credential load, place, exact identity reconciliation, bounded cancel/close, and the final authoritative zero-order/exact-flat barrier.
+- Development and tests use synthetic credentials, fixture responses, and disposable stores only. Preserve one durable identity/nonce/digest before every dispatch, no blind retry, at most one exact known-order cancel, at most three fresh-position-derived close intents, and notional `<= USD 500`.
+- Use only current official RISEx REST/WebSocket/UI-contract sources. Do not load real credentials, sign, dispatch, run live traffic, or change Scanner/runtime/repository/economics/strategy/Telegram. A separately accepted candidate and a separate Chief operational gate are required before one live testnet lifecycle.
 
 ## Nado — resume public preflight diagnosis
 
