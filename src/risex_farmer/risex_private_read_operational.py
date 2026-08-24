@@ -43,10 +43,19 @@ STORE_BASENAME = ".risex-funding-farmer-risex-private-read-20260824-new-op-003.s
 FIXED_STORE_PATH = Path(
     "/Users/daniilmakarov/.risex-funding-farmer-risex-private-read-20260824-new-op-003.sqlite3"
 )
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _APPLICATION_ID = 0x52585052
 _MAX_BYTES = 1_048_576
 _DEADLINE_SECONDS = 5
+_AUTH_SHAPE_SAFE_KEYS = frozenset({
+    "method", "status", "data", "result", "response", "payload", "type",
+    "error", "code",
+})
+_AUTH_SHAPE_MAX_DEPTH = 3
+_AUTH_SHAPE_MAX_NODES = 32
+_AUTH_SHAPE_MAX_FIELDS = 9
+_AUTH_SHAPE_MAX_BYTES = 512
+_AUTH_SHAPE_LIMIT = '{"shape":"limit_exceeded"}'
 
 _PUBLIC_REQUESTS = tuple(PrivateReadPreflight._REQUESTS)
 _PUBLIC_A_COUNTERS = tuple(
@@ -97,7 +106,7 @@ _REASON_VALUES = frozenset({
 _LEDGER_SCHEMA = (
     "CREATE TABLE run ("
     "singleton INTEGER PRIMARY KEY CHECK(singleton=1),"
-    "schema_version INTEGER NOT NULL CHECK(schema_version=1),"
+    "schema_version INTEGER NOT NULL CHECK(schema_version=2),"
     "invocation_id TEXT NOT NULL CHECK(length(invocation_id)>0),"
     "store_path_sha256 TEXT NOT NULL CHECK(length(store_path_sha256)=64),"
     "state TEXT NOT NULL CHECK(state IN "
@@ -106,7 +115,9 @@ _LEDGER_SCHEMA = (
     "barrier_b_fingerprint TEXT,"
     "started_at_ns INTEGER NOT NULL,"
     "finished_at_ns INTEGER,"
-    "reason TEXT);"
+    "reason TEXT,"
+    "auth_v2_shape TEXT,"
+    "auth_v2_shape_sha256 TEXT);"
     "CREATE TABLE phase_counter ("
     "name TEXT PRIMARY KEY,"
     "attempts INTEGER NOT NULL CHECK(attempts IN (0,1)),"
@@ -132,6 +143,8 @@ class OperationalReport:
     barrier_a_fingerprint: str | None
     barrier_b_fingerprint: str | None
     reason: str
+    auth_v2_shape: str | None
+    auth_v2_shape_sha256: str | None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -144,6 +157,8 @@ class OperationalReport:
             "barrier_a_fingerprint": self.barrier_a_fingerprint,
             "barrier_b_fingerprint": self.barrier_b_fingerprint,
             "reason": self.reason,
+            "auth_v2_shape": self.auth_v2_shape,
+            "auth_v2_shape_sha256": self.auth_v2_shape_sha256,
         }
 
 
@@ -328,7 +343,7 @@ class DurableCounterLedger:
             self._db.execute(f"PRAGMA application_id={_APPLICATION_ID}")
             self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             self._db.execute(
-                "INSERT INTO run VALUES(1,?,?,?,?,?,?,?,NULL,NULL)",
+                "INSERT INTO run VALUES(1,?,?,?,?,?,?,?,NULL,NULL,NULL,NULL)",
                 (
                     SCHEMA_VERSION,
                     self.invocation_id,
@@ -363,7 +378,8 @@ class DurableCounterLedger:
         if run_columns != (
             "singleton", "schema_version", "invocation_id", "store_path_sha256",
             "state", "barrier_a_fingerprint", "barrier_b_fingerprint",
-            "started_at_ns", "finished_at_ns", "reason",
+            "started_at_ns", "finished_at_ns", "reason", "auth_v2_shape",
+            "auth_v2_shape_sha256",
         ) or counter_columns != ("name", "attempts", "completions"):
             raise ValueError("schema")
         if self._db.execute("SELECT COUNT(*) FROM run").fetchone() != (1,):
@@ -386,6 +402,11 @@ class DurableCounterLedger:
             ))
             or (row[8] is not None and row[8] not in _REASON_VALUES)
             or (row[3] in _TERMINAL_STATES) != (row[7] is not None and row[8] is not None)
+            or ((row[9] is None) != (row[10] is None))
+            or (
+                row[9] is not None
+                and not _valid_auth_v2_shape(str(row[9]), str(row[10]))
+            )
         ):
             raise ValueError("identity")
         counters = self._counter_rows()
@@ -405,6 +426,18 @@ class DurableCounterLedger:
             raise ValueError("counter state")
         terminal = row[3] in _TERMINAL_STATES
         terminal_counter = counters["terminal_persist"]
+        shape_present = row[9] is not None
+        if terminal:
+            if shape_present != (row[8] == "auth_v2_schema_invalid"):
+                raise ValueError("auth_v2 shape terminal")
+        elif shape_present and not (
+            row[3] == "CLAIMED"
+            and counters["auth_v2_receive"] == (1, 1)
+            and counters["auth_v2_parse"] == (1, 1)
+            and counters["auth_v2_validate"] == (1, 0)
+            and counters["auth_v2_status"] == (0, 0)
+        ):
+            raise ValueError("auth_v2 shape stage")
         if counters["final_agreement"] == (1, 1) and row[4] != row[5]:
             raise ValueError("agreement invariant")
         if terminal:
@@ -440,7 +473,7 @@ class DurableCounterLedger:
         row = self._db.execute(
             "SELECT schema_version,invocation_id,store_path_sha256,state,"
             "barrier_a_fingerprint,barrier_b_fingerprint,started_at_ns,"
-            "finished_at_ns,reason "
+            "finished_at_ns,reason,auth_v2_shape,auth_v2_shape_sha256 "
             "FROM run WHERE singleton=1"
         ).fetchone()
         if row is None:
@@ -516,6 +549,28 @@ class DurableCounterLedger:
     def has_mismatch(self) -> bool:
         return any(a != c for a, c in self._counter_rows().values())
 
+    def record_auth_v2_shape(self, descriptor: str, digest: str) -> None:
+        if not _valid_auth_v2_shape(descriptor, digest):
+            raise ValueError("auth_v2 shape")
+        counters = self._counter_rows()
+        if (
+            counters["auth_v2_receive"] != (1, 1)
+            or counters["auth_v2_parse"] != (1, 1)
+            or counters["auth_v2_validate"] != (1, 0)
+            or counters["auth_v2_status"] != (0, 0)
+        ):
+            raise ValueError("auth_v2 shape stage")
+        with self._db:
+            changed = self._db.execute(
+                "UPDATE run SET auth_v2_shape=?,auth_v2_shape_sha256=? "
+                "WHERE singleton=1 AND state='CLAIMED' "
+                "AND auth_v2_shape IS NULL AND auth_v2_shape_sha256 IS NULL",
+                (descriptor, digest),
+            ).rowcount
+        if changed != 1:
+            raise ValueError("auth_v2 shape state")
+        self._validate()
+
     def finalize(
         self,
         result: Result,
@@ -538,6 +593,13 @@ class DurableCounterLedger:
         ):
             result = Result.UNKNOWN
             reason = "validation_failed"
+        if reason == "auth_v2_schema_invalid" and not (
+            row[9] is not None
+            and row[10] is not None
+            and _valid_auth_v2_shape(str(row[9]), str(row[10]))
+        ):
+            result = Result.UNKNOWN
+            reason = "validation_failed"
         attempts, completions = self._counter_rows()["terminal_persist"]
         if attempts == 0:
             self.attempt("terminal_persist")
@@ -551,8 +613,12 @@ class DurableCounterLedger:
             crash_hook("before_completion", "terminal_persist")
         with self._db:
             self._db.execute(
-                "UPDATE run SET state=?,finished_at_ns=?,reason=? WHERE singleton=1",
-                (result.value, time.time_ns(), reason),
+                "UPDATE run SET state=?,finished_at_ns=?,reason=?,"
+                "auth_v2_shape=CASE WHEN ?='auth_v2_schema_invalid' "
+                "THEN auth_v2_shape ELSE NULL END,"
+                "auth_v2_shape_sha256=CASE WHEN ?='auth_v2_schema_invalid' "
+                "THEN auth_v2_shape_sha256 ELSE NULL END WHERE singleton=1",
+                (result.value, time.time_ns(), reason, reason, reason),
             )
             changed = self._db.execute(
                 "UPDATE phase_counter SET completions=1 WHERE name='terminal_persist' "
@@ -581,6 +647,8 @@ class DurableCounterLedger:
             barrier_a_fingerprint=row[4],
             barrier_b_fingerprint=row[5],
             reason=str(row[8]),
+            auth_v2_shape=None if row[9] is None else str(row[9]),
+            auth_v2_shape_sha256=None if row[10] is None else str(row[10]),
         )
 
     def close(self) -> None:
@@ -593,6 +661,105 @@ def _fingerprint(value: Any) -> bool:
         and len(value) == 64
         and all(character in "0123456789abcdef" for character in value)
     )
+
+
+class _AuthShapeLimit(Exception):
+    pass
+
+
+def _auth_v2_shape(value: Any) -> tuple[str, str]:
+    nodes = 0
+
+    def walk(current: Any, depth: int) -> Any:
+        nonlocal nodes
+        nodes += 1
+        if depth > _AUTH_SHAPE_MAX_DEPTH or nodes > _AUTH_SHAPE_MAX_NODES:
+            raise _AuthShapeLimit
+        if current is None:
+            return "null"
+        if type(current) is bool:
+            return "boolean"
+        if type(current) in {int, float}:
+            return "number"
+        if type(current) is str:
+            return "string"
+        if type(current) is list:
+            return "array"
+        if type(current) is not dict or len(current) > _AUTH_SHAPE_MAX_FIELDS:
+            raise _AuthShapeLimit
+        safe = sorted(key for key in current if key in _AUTH_SHAPE_SAFE_KEYS)
+        shaped: dict[str, Any] = {
+            "object": [[key, walk(current[key], depth + 1)] for key in safe],
+        }
+        if len(safe) != len(current):
+            shaped["other_key"] = "present"
+        return shaped
+
+    try:
+        shaped = walk(value, 0)
+        descriptor = json.dumps(
+            shaped, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+        )
+        if len(descriptor.encode("ascii")) > _AUTH_SHAPE_MAX_BYTES:
+            raise _AuthShapeLimit
+    except _AuthShapeLimit:
+        descriptor = _AUTH_SHAPE_LIMIT
+    return descriptor, hashlib.sha256(descriptor.encode("ascii")).hexdigest()
+
+
+def _valid_auth_v2_shape(descriptor: str, digest: str) -> bool:
+    if (
+        type(descriptor) is not str
+        or not _fingerprint(digest)
+        or len(descriptor.encode("utf-8")) > _AUTH_SHAPE_MAX_BYTES
+        or hashlib.sha256(descriptor.encode("utf-8")).hexdigest() != digest
+    ):
+        return False
+    if descriptor == _AUTH_SHAPE_LIMIT:
+        return True
+    try:
+        parsed = json.loads(descriptor)
+        if descriptor != json.dumps(
+            parsed, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+        ):
+            return False
+    except Exception:
+        return False
+
+    nodes = 0
+
+    def valid_shape(current: Any, depth: int) -> bool:
+        nonlocal nodes
+        nodes += 1
+        if depth > _AUTH_SHAPE_MAX_DEPTH or nodes > _AUTH_SHAPE_MAX_NODES:
+            return False
+        if type(current) is str and current in {
+            "null", "boolean", "number", "string", "array",
+        }:
+            return True
+        if type(current) is not dict or set(current) not in (
+            {"object"}, {"object", "other_key"},
+        ):
+            return False
+        if current.get("other_key", "present") != "present":
+            return False
+        fields = current.get("object")
+        if type(fields) is not list or len(fields) > _AUTH_SHAPE_MAX_FIELDS:
+            return False
+        keys: list[str] = []
+        for field in fields:
+            if (
+                type(field) is not list
+                or len(field) != 2
+                or type(field[0]) is not str
+                or field[0] not in _AUTH_SHAPE_SAFE_KEYS
+                or not valid_shape(field[1], depth + 1)
+            ):
+                return False
+            keys.append(field[0])
+        return keys == sorted(set(keys))
+
+    return valid_shape(parsed, 0)
 
 
 class _SignOnlyCapability:
@@ -1173,13 +1340,18 @@ async def _execute(
             _identity,
             dependencies.crash_hook,
         )
-        auth_validated = await _phase(
-            ledger,
-            "auth_v2_validate",
-            lambda: _validate_auth_v2_schema(auth_parsed),
-            _identity,
-            dependencies.crash_hook,
-        )
+        try:
+            auth_validated = await _phase(
+                ledger,
+                "auth_v2_validate",
+                lambda: _validate_auth_v2_schema(auth_parsed),
+                _identity,
+                dependencies.crash_hook,
+            )
+        except _AuthV2Failure as failure:
+            if failure.reason == "auth_v2_schema_invalid":
+                ledger.record_auth_v2_shape(*_auth_v2_shape(auth_parsed))
+            raise
         await _phase(
             ledger,
             "auth_v2_status",
@@ -1300,6 +1472,8 @@ async def _run(dependencies: _Dependencies) -> OperationalReport:
             None,
             None,
             "store_rejected",
+            None,
+            None,
         )
     source: Any = None
     transport: Any = None

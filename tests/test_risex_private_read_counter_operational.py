@@ -390,6 +390,8 @@ async def test_success_has_exact_sequence_full_counters_and_agreeing_barriers(tm
     path = tmp_path / "fixture.sqlite3"
     report = await _run_fixture(dependencies(tmp_path, calls))
     assert report.result is Result.PASSED
+    assert report.auth_v2_shape is None
+    assert report.auth_v2_shape_sha256 is None
     assert report.barrier_a_fingerprint == report.barrier_b_fingerprint
     assert set(report.counters) == set(_COUNTER_NAMES)
     assert all(value == {"attempts": 1, "completions": 1} for value in report.counters.values())
@@ -408,7 +410,7 @@ async def test_success_has_exact_sequence_full_counters_and_agreeing_barriers(tm
     database = sqlite3.connect(path)
     try:
         assert database.execute("PRAGMA integrity_check").fetchone() == ("ok",)
-        assert database.execute("PRAGMA user_version").fetchone() == (1,)
+        assert database.execute("PRAGMA user_version").fetchone() == (2,)
     finally:
         database.close()
 
@@ -443,6 +445,12 @@ async def test_auth_ack_failures_are_durable_redacted_and_never_subscribe(
     assert report.counters["auth_v2_receive"] == {"attempts": 1, "completions": 1}
     assert report.counters[failed_phase] == {"attempts": 1, "completions": 0}
     assert "orders_subscribe" not in calls and "positions_subscribe" not in calls
+    if reason == "auth_v2_schema_invalid":
+        assert report.auth_v2_shape is not None
+        assert report.auth_v2_shape_sha256 is not None
+    else:
+        assert report.auth_v2_shape is None
+        assert report.auth_v2_shape_sha256 is None
     persisted = (tmp_path / "fixture.sqlite3").read_bytes().decode("latin1")
     assert raw not in persisted
 
@@ -454,6 +462,185 @@ async def test_auth_ack_failures_are_durable_redacted_and_never_subscribe(
         transport_factory=lambda: (_ for _ in ()).throw(AssertionError("transport")),
     ))
     assert restarted == report and restart_calls == []
+
+
+@pytest.mark.asyncio
+async def test_schema_invalid_auth_ack_persists_only_bounded_structural_witness(
+    tmp_path,
+):
+    calls: list[str] = []
+    raw = '{"method":"auth_v2","status":"success","data":{"code":7}}'
+    report = await _run_fixture(dependencies(
+        tmp_path,
+        calls,
+        transport_factory=lambda: SyntheticTransport(calls, auth_response=raw),
+    ))
+    assert report.result is Result.UNKNOWN
+    assert report.reason == "auth_v2_schema_invalid"
+    assert report.auth_v2_shape == (
+        '{"object":[["data",{"object":[["code","number"]]}],'
+        '["method","string"],["status","string"]]}'
+    )
+    assert report.auth_v2_shape_sha256 == hashlib.sha256(
+        report.auth_v2_shape.encode("ascii")
+    ).hexdigest()
+    assert raw not in (tmp_path / "fixture.sqlite3").read_bytes().decode("latin1")
+    assert "auth_v2" not in report.auth_v2_shape
+
+    restart_calls: list[str] = []
+    restarted = await _run_fixture(dependencies(
+        tmp_path,
+        restart_calls,
+        source_factory=lambda: (_ for _ in ()).throw(AssertionError("source")),
+        transport_factory=lambda: (_ for _ in ()).throw(AssertionError("transport")),
+    ))
+    assert restarted == report and restart_calls == []
+
+
+@pytest.mark.asyncio
+async def test_auth_shape_masks_unknown_keys_values_arrays_and_lengths(tmp_path):
+    assert operational._AUTH_SHAPE_SAFE_KEYS == {
+        "method", "status", "data", "result", "response", "payload", "type",
+        "error", "code",
+    }
+    assert (
+        operational._AUTH_SHAPE_MAX_DEPTH,
+        operational._AUTH_SHAPE_MAX_NODES,
+        operational._AUTH_SHAPE_MAX_FIELDS,
+        operational._AUTH_SHAPE_MAX_BYTES,
+    ) == (3, 32, 9, 512)
+    calls: list[str] = []
+    secrets = {
+        "unknown-key-containing-server-value": "unknown-value-secret",
+        "request_id": "request-id-secret",
+    }
+    raw = json.dumps({
+        "method": "method-value-secret",
+        "status": "status-value-secret",
+        "data": {
+            "code": "code-value-secret",
+            "payload": ["array-secret-1", "array-secret-2"],
+            **secrets,
+        },
+        "key-name-is-a-secret-value": {"result": "nested-secret"},
+    }, separators=(",", ":"))
+    report = await _run_fixture(dependencies(
+        tmp_path,
+        calls,
+        transport_factory=lambda: SyntheticTransport(calls, auth_response=raw),
+    ))
+    assert report.reason == "auth_v2_schema_invalid"
+    assert report.auth_v2_shape == (
+        '{"object":[["data",{"object":[["code","string"],'
+        '["payload","array"]],"other_key":"present"}],'
+        '["method","string"],["status","string"]],"other_key":"present"}'
+    )
+    serialized = json.dumps(report.as_dict(), sort_keys=True)
+    persisted = (tmp_path / "fixture.sqlite3").read_bytes().decode("latin1")
+    for forbidden in (
+        raw, "unknown-key-containing-server-value", "unknown-value-secret",
+        "request_id", "request-id-secret", "method-value-secret",
+        "status-value-secret", "code-value-secret", "array-secret-1",
+        "array-secret-2", "key-name-is-a-secret-value", "nested-secret",
+    ):
+        assert forbidden not in report.auth_v2_shape
+        assert forbidden not in serialized
+        assert forbidden not in persisted
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", (
+    {f"unknown-{index}": None for index in range(10)},
+    {"data": {"data": {"data": {"data": None}}}},
+    {key: {"code": None, "error": None}
+     for key in operational._AUTH_SHAPE_SAFE_KEYS},
+    {key: {nested: None for nested in operational._AUTH_SHAPE_SAFE_KEYS}
+     for key in operational._AUTH_SHAPE_SAFE_KEYS},
+))
+async def test_auth_shape_limits_collapse_to_one_constant_witness(tmp_path, value):
+    calls: list[str] = []
+    raw = json.dumps(value, separators=(",", ":"))
+    report = await _run_fixture(dependencies(
+        tmp_path,
+        calls,
+        transport_factory=lambda: SyntheticTransport(calls, auth_response=raw),
+    ))
+    assert report.result is Result.UNKNOWN
+    assert report.reason == "auth_v2_schema_invalid"
+    assert report.auth_v2_shape == '{"shape":"limit_exceeded"}'
+    assert len(report.auth_v2_shape.encode("ascii")) <= 512
+    assert raw not in (tmp_path / "fixture.sqlite3").read_bytes().decode("latin1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ("shape", "digest", "forbidden_grammar"))
+async def test_auth_shape_corruption_rejects_store_without_effects(tmp_path, mutation):
+    calls: list[str] = []
+    raw = '{"method":"auth_v2","status":"success","extra":true}'
+    first = await _run_fixture(dependencies(
+        tmp_path,
+        calls,
+        transport_factory=lambda: SyntheticTransport(calls, auth_response=raw),
+    ))
+    assert first.reason == "auth_v2_schema_invalid"
+    database = sqlite3.connect(tmp_path / "fixture.sqlite3")
+    if mutation == "shape":
+        database.execute(
+            "UPDATE run SET auth_v2_shape='\"string\"' WHERE singleton=1"
+        )
+    elif mutation == "digest":
+        database.execute(
+            "UPDATE run SET auth_v2_shape_sha256=? WHERE singleton=1", ("0" * 64,)
+        )
+    else:
+        forbidden = '{"object":[["server-secret-key","string"]]}'
+        database.execute(
+            "UPDATE run SET auth_v2_shape=?,auth_v2_shape_sha256=? WHERE singleton=1",
+            (forbidden, hashlib.sha256(forbidden.encode()).hexdigest()),
+        )
+    database.commit()
+    database.close()
+    calls.clear()
+    report = await _run_fixture(dependencies(
+        tmp_path,
+        calls,
+        source_factory=lambda: (_ for _ in ()).throw(AssertionError("source")),
+        transport_factory=lambda: (_ for _ in ()).throw(AssertionError("transport")),
+    ))
+    assert report.result is Result.UNKNOWN and report.reason == "store_rejected"
+    assert report.auth_v2_shape is None and report.auth_v2_shape_sha256 is None
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_nonterminal_shape_restart_clears_witness_without_effects(tmp_path):
+    path = tmp_path / "fixture.sqlite3"
+    ledger = DurableCounterLedger(path, "synthetic-risex-private-read")
+    for name in operational._PUBLIC_A_COUNTERS:
+        ledger.attempt(name)
+        ledger.complete(name)
+    ledger.set_claimed("1" * 64)
+    for name in operational._PRIVATE_COUNTERS:
+        ledger.attempt(name)
+        if name == "auth_v2_validate":
+            break
+        ledger.complete(name)
+    descriptor, digest = operational._auth_v2_shape({"extra": "secret-value"})
+    ledger.record_auth_v2_shape(descriptor, digest)
+    ledger.close()
+
+    calls: list[str] = []
+    report = await _run_fixture(dependencies(
+        tmp_path,
+        calls,
+        source_factory=lambda: (_ for _ in ()).throw(AssertionError("source")),
+        transport_factory=lambda: (_ for _ in ()).throw(AssertionError("transport")),
+    ))
+    assert report.result is Result.UNKNOWN
+    assert report.reason == "interrupted_nonterminal"
+    assert report.auth_v2_shape is None and report.auth_v2_shape_sha256 is None
+    assert "secret-value" not in path.read_bytes().decode("latin1")
+    assert calls == []
 
 
 @pytest.mark.asyncio
@@ -481,6 +668,8 @@ async def test_auth_receive_outcomes_are_durable_redacted_and_terminal(
         transport_factory=lambda: _AuthReceiveTransport(calls, socket),
     ))
     assert report.result is Result.UNKNOWN and report.reason == reason
+    assert report.auth_v2_shape is None
+    assert report.auth_v2_shape_sha256 is None
     assert report.counters["auth_v2_receive"] == {"attempts": 1, "completions": 0}
     assert socket.receives == 1
     assert "orders_subscribe" not in calls and "positions_subscribe" not in calls
@@ -708,7 +897,7 @@ async def test_store_counter_schema_path_and_file_corruption_fail_without_effect
         elif mutation == "schema":
             database.execute("ALTER TABLE run ADD COLUMN unexpected TEXT")
         else:
-            database.execute("PRAGMA user_version=2")
+            database.execute("PRAGMA user_version=3")
         database.commit()
         database.close()
     elif mutation == "mode":
