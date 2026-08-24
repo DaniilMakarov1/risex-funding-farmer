@@ -25,11 +25,17 @@ NEW = "NEW"
 CLAIMED = "CLAIMED"
 OBSERVED = "OBSERVED"
 FINALIZED = "FINALIZED"
+UNKNOWN = "UNKNOWN"
 ZERO_ADDRESS = "0x" + "00" * 20
 MIN_COLLATERAL_X18 = 5 * 10**18
 MAX_FRESHNESS_MS = 30_000
 HTTP_TIMEOUT_SECONDS = 5.0
 MAX_RESPONSE_BYTES = 65_536
+LEDGER_SCHEMA_VERSION = 2
+COUNTER_PHASES = (
+    "public_a", "loader", "derive", "server_time", "sign", "recover",
+    "trigger_dispatch", "trigger_observation", "public_b",
+)
 
 SOURCE_PINS = {
     "typescript_sdk": "315e4f23dadefeb2f86f713e423241e81467d4c3",
@@ -259,6 +265,10 @@ def _system_clock_ms() -> int:
     return time.time_ns() // 1_000_000
 
 
+def _durable_now_ms() -> int:
+    return time.time_ns() // 1_000_000
+
+
 def _strict_json(raw: bytes) -> object:
     try:
         text = raw.decode("utf-8", errors="strict")
@@ -368,14 +378,95 @@ class OneShotStore:
                 invocation_id TEXT PRIMARY KEY,
                 state TEXT NOT NULL,
                 identity_tag TEXT NOT NULL,
-                round_a_hash TEXT NOT NULL,
-                round_a_observed_ms INTEGER NOT NULL,
+                round_a_hash TEXT,
+                round_a_observed_ms INTEGER,
                 trigger_hash TEXT,
-                trigger_observed_ms INTEGER
+                trigger_observed_ms INTEGER,
+                schema_version INTEGER NOT NULL DEFAULT 2,
+                path_hash TEXT NOT NULL DEFAULT '',
+                product_count INTEGER,
+                round_b_hash TEXT,
+                reason TEXT NOT NULL DEFAULT '',
+                counters_json TEXT NOT NULL DEFAULT '{}',
+                terminal_ms INTEGER
             )
             """
         )
         self._connection.commit()
+
+    @staticmethod
+    def _empty_counters() -> dict[str, int]:
+        return {
+            f"{phase}_{suffix}": 0
+            for phase in COUNTER_PHASES for suffix in ("attempts", "completions")
+        }
+
+    def begin(self, invocation_id: str, identity_hash: str, path_hash: str) -> None:
+        counters = json.dumps(self._empty_counters(), sort_keys=True, separators=(",", ":"))
+        try:
+            with self._connection:
+                self._connection.execute(
+                    """INSERT INTO nado_preflight_one_shot
+                       (invocation_id,state,identity_tag,round_a_hash,
+                        round_a_observed_ms,trigger_hash,trigger_observed_ms,
+                        schema_version,path_hash,product_count,round_b_hash,
+                        reason,counters_json,terminal_ms)
+                       VALUES (?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, NULL, NULL, '', ?, NULL)""",
+                    (invocation_id, NEW, identity_hash, LEDGER_SCHEMA_VERSION,
+                     path_hash, counters),
+                )
+        except sqlite3.IntegrityError:
+            raise NadoPreflightError("one-shot invocation already exists") from None
+
+    def count(self, invocation_id: str, phase: str, completion: bool = False) -> None:
+        if phase not in COUNTER_PHASES:
+            raise NadoPreflightError("counter phase is invalid")
+        key = f"{phase}_{'completions' if completion else 'attempts'}"
+        with self._connection:
+            row = self._connection.execute(
+                "SELECT counters_json FROM nado_preflight_one_shot WHERE invocation_id = ?",
+                (invocation_id,),
+            ).fetchone()
+            if row is None:
+                raise NadoPreflightError("durable counter identity is unavailable")
+            try:
+                counters = json.loads(str(row[0]))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                raise NadoPreflightError("durable counters are corrupt") from None
+            if counters != {name: counters.get(name) for name in self._empty_counters()}:
+                raise NadoPreflightError("durable counter schema mismatch")
+            if any(type(value) is not int or value < 0 for value in counters.values()):
+                raise NadoPreflightError("durable counter is invalid")
+            if completion and counters[key] >= counters[f"{phase}_attempts"]:
+                raise NadoPreflightError("counter completion has no attempt")
+            counters[key] += 1
+            self._connection.execute(
+                "UPDATE nado_preflight_one_shot SET counters_json = ? WHERE invocation_id = ?",
+                (json.dumps(counters, sort_keys=True, separators=(",", ":")), invocation_id),
+            )
+
+    def counters(self, invocation_id: str) -> dict[str, int]:
+        row = self._connection.execute(
+            "SELECT schema_version,counters_json FROM nado_preflight_one_shot WHERE invocation_id = ?",
+            (invocation_id,),
+        ).fetchone()
+        if row is None or row[0] != LEDGER_SCHEMA_VERSION:
+            raise NadoPreflightError("durable counter schema mismatch")
+        try:
+            counters = json.loads(str(row[1]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise NadoPreflightError("durable counters are corrupt") from None
+        expected = self._empty_counters()
+        if set(counters) != set(expected) or any(
+            type(value) is not int or value < 0 for value in counters.values()
+        ):
+            raise NadoPreflightError("durable counter schema mismatch")
+        if any(
+            counters[f"{phase}_completions"] > counters[f"{phase}_attempts"]
+            for phase in COUNTER_PHASES
+        ):
+            raise NadoPreflightError("durable counter ordering is invalid")
+        return dict(counters)
 
     def state(self, invocation_id: str) -> str:
         row = self._connection.execute(
@@ -391,11 +482,29 @@ class OneShotStore:
         try:
             with self._connection:
                 self._connection.execute(
-                    "INSERT INTO nado_preflight_one_shot VALUES (?, ?, ?, ?, ?, NULL, NULL)",
+                    """INSERT INTO nado_preflight_one_shot
+                       (invocation_id,state,identity_tag,round_a_hash,
+                        round_a_observed_ms,trigger_hash,trigger_observed_ms)
+                       VALUES (?, ?, ?, ?, ?, NULL, NULL)""",
                     (invocation_id, CLAIMED, identity_hash, round_a_hash, round_a_observed_ms),
                 )
         except sqlite3.IntegrityError:
             raise NadoPreflightError("signed observation is already claimed") from None
+
+    def claim_started(
+        self, invocation_id: str, round_a_hash: str, round_a_observed_ms: int,
+        product_count: int,
+    ) -> None:
+        with self._connection:
+            cursor = self._connection.execute(
+                """UPDATE nado_preflight_one_shot
+                   SET state=?,round_a_hash=?,round_a_observed_ms=?,product_count=?
+                   WHERE invocation_id=? AND state=?""",
+                (CLAIMED, round_a_hash, round_a_observed_ms, product_count,
+                 invocation_id, NEW),
+            )
+        if cursor.rowcount != 1:
+            raise NadoPreflightError("one-shot claim cannot be recorded")
 
     def observe(self, invocation_id: str, trigger_hash: str, observed_ms: int) -> None:
         with self._connection:
@@ -428,13 +537,65 @@ class OneShotStore:
     def finalize(self, invocation_id: str, round_b_hash: str) -> None:
         with self._connection:
             cursor = self._connection.execute(
-                """UPDATE nado_preflight_one_shot SET state = ?
+                """UPDATE nado_preflight_one_shot
+                   SET state = ?, round_b_hash = ?, terminal_ms = ?
                    WHERE invocation_id = ? AND state = ? AND round_a_hash = ?
                          AND trigger_hash IS NOT NULL""",
-                (FINALIZED, invocation_id, OBSERVED, round_b_hash),
+                (FINALIZED, round_b_hash, _durable_now_ms(), invocation_id,
+                 OBSERVED, round_b_hash),
             )
         if cursor.rowcount != 1:
             raise NadoPreflightError("public rounds disagree or observation is incomplete")
+
+    def terminalize_unknown(self, invocation_id: str, reason: str) -> None:
+        bounded = reason if reason in {
+            "INTERRUPTED", "CANCELLED", "VALIDATION_FAILED", "AMBIGUOUS_DISPATCH",
+        } else "VALIDATION_FAILED"
+        with self._connection:
+            cursor = self._connection.execute(
+                """UPDATE nado_preflight_one_shot SET state=?,reason=?,terminal_ms=?
+                   WHERE invocation_id=? AND state IN (?,?,?)""",
+                (UNKNOWN, bounded, _durable_now_ms(), invocation_id,
+                 NEW, CLAIMED, OBSERVED),
+            )
+        if cursor.rowcount != 1:
+            raise NadoPreflightError("terminal report cannot be persisted")
+
+    def terminal_report(self, invocation_id: str) -> dict[str, object] | None:
+        row = self._connection.execute(
+            """SELECT state,identity_tag,path_hash,product_count,reason,
+                      round_a_hash,trigger_hash,round_b_hash,terminal_ms
+               FROM nado_preflight_one_shot WHERE invocation_id=?""",
+            (invocation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        if str(row[0]) not in {NEW, CLAIMED, OBSERVED, FINALIZED, UNKNOWN}:
+            raise NadoPreflightError("durable state is invalid")
+        if str(row[0]) in {FINALIZED, UNKNOWN} and (
+            type(row[8]) is not int or row[8] <= 0
+        ):
+            raise NadoPreflightError("durable terminal time is invalid")
+        if row[3] is not None and (type(row[3]) is not int or row[3] <= 0):
+            raise NadoPreflightError("durable product count is invalid")
+        counters = self.counters(invocation_id)
+        return {
+            "schema_version": LEDGER_SCHEMA_VERSION,
+            "invocation_id": invocation_id,
+            "status": str(row[0]),
+            "identity_tag": str(row[1])[:16],
+            "path_hash": str(row[2]),
+            "product_count": row[3],
+            "reason": str(row[4]),
+            "round_a_tag": None if row[5] is None else str(row[5])[:16],
+            "trigger_tag": None if row[6] is None else str(row[6])[:16],
+            "round_b_tag": None if row[7] is None else str(row[7])[:16],
+            "terminal_ms": row[8],
+            "counters": counters,
+        }
+
+    def close(self) -> None:
+        self._connection.close()
 
 
 @dataclass(frozen=True)
@@ -451,6 +612,7 @@ class _RoundEvidence:
     fingerprint: str
     first_observed_ms: int
     last_observed_ms: int
+    product_count: int
 
 
 def _exact_keys(value: Mapping[str, object], expected: set[str], label: str) -> None:
@@ -801,7 +963,8 @@ def _round_a_contract(
     observed.append(at); _isolated(data)
     _temporal(observed)
     return _RoundEvidence(
-        _digest({"catalog": products, "account": account}), observed[0], observed[-1]
+        _digest({"catalog": products, "account": account}), observed[0], observed[-1],
+        len(products),
     )
 
 
@@ -839,7 +1002,8 @@ def _round_b_contract(
     observed.append(at); _linked(data)
     _temporal(observed)
     return _RoundEvidence(
-        _digest({"catalog": products, "account": account}), observed[0], observed[-1]
+        _digest({"catalog": products, "account": account}), observed[0], observed[-1],
+        len(products),
     )
 
 
@@ -873,27 +1037,47 @@ def _round_b(
 async def _operational_round(
     contract: Generator[dict[str, object], tuple[object, int], _RoundEvidence],
     transport: _OperationalGatewayTransport,
+    before: Callable[[], None] | None = None,
+    after: Callable[[], None] | None = None,
 ) -> _RoundEvidence:
     try:
         request = next(contract)
         while True:
+            if before is not None:
+                before()
+                await asyncio.sleep(0)
             observation = await transport.send_async(request)
             await asyncio.sleep(0)
-            request = contract.send(_wire_data(observation, _system_clock_ms))
+            decoded = _wire_data(observation, _system_clock_ms)
+            try:
+                request = contract.send(decoded)
+            except StopIteration:
+                if after is not None:
+                    after()
+                    await asyncio.sleep(0)
+                raise
+            else:
+                if after is not None:
+                    after()
+                    await asyncio.sleep(0)
     except StopIteration as completed:
         return completed.value
 
 
 async def _operational_round_a(
     transport: _OperationalGatewayTransport, config: PreflightConfig,
+    before: Callable[[], None] | None = None,
+    after: Callable[[], None] | None = None,
 ) -> _RoundEvidence:
-    return await _operational_round(_round_a_contract(config), transport)
+    return await _operational_round(_round_a_contract(config), transport, before, after)
 
 
 async def _operational_round_b(
     transport: _OperationalGatewayTransport, config: PreflightConfig,
+    before: Callable[[], None] | None = None,
+    after: Callable[[], None] | None = None,
 ) -> _RoundEvidence:
-    return await _operational_round(_round_b_contract(config), transport)
+    return await _operational_round(_round_b_contract(config), transport, before, after)
 
 
 def list_trigger_orders_typed_data(sender: str, recv_time: str) -> dict[str, object]:
@@ -926,6 +1110,17 @@ def _callback_value(
     if not ok:
         raise NadoPreflightError(f"{label} callback failed")
     return value
+
+
+def _counted_callback(
+    callback: Callable[..., object], *args: object, label: str,
+) -> object:
+    try:
+        return callback(*args)
+    except asyncio.CancelledError:
+        raise
+    except BaseException:
+        raise NadoPreflightError(f"{label} callback failed") from None
 
 
 def _signature(value: object) -> str:
@@ -1154,3 +1349,209 @@ async def run_operational_private_read_preflight(
         raise NadoPreflightError("public rounds disagree")
     store.finalize(config.invocation_id, round_b.fingerprint)
     return PreflightResult(FINALIZED, identity_tag, True, True, True)
+
+
+async def _run_counted_operational_private_read(
+    *,
+    config: PreflightConfig,
+    capability_loader: Callable[[], object],
+    recover_owner: Callable[[dict[str, object], str], str],
+    store: OneShotStore,
+    path_hash: str,
+    _transports: tuple[object, object, object] | None = None,
+) -> dict[str, object]:
+    """Private adapter seam for the sealed production launcher and fixtures.
+
+    Existing durable identity always produces a zero-effect report.  It is never
+    resumed, repaired, or rearmed.
+    """
+    invocation_id = config.invocation_id
+    existing_state = store.state(invocation_id)
+    if existing_state != NEW or store.terminal_report(invocation_id) is not None:
+        if existing_state in {NEW, CLAIMED, OBSERVED}:
+            counters = store.counters(invocation_id)
+            reason = (
+                "AMBIGUOUS_DISPATCH"
+                if counters["trigger_dispatch_attempts"]
+                > counters["trigger_observation_completions"]
+                else "INTERRUPTED"
+            )
+            store.terminalize_unknown(invocation_id, reason)
+        report = store.terminal_report(invocation_id)
+        if report is None:
+            raise NadoPreflightError("durable report is unavailable")
+        return report
+
+    store.begin(invocation_id, _identity_hash(config.sender), path_hash)
+    public_transport, time_transport, trigger_transport = _transports or (
+        _OperationalGatewayTransport(), _OperationalTimeTransport(),
+        _OperationalTriggerTransport(),
+    )
+    handle: object | None = None
+    ready_to_finalize = False
+    close_failed = False
+    try:
+        round_a = await _operational_round_a(
+            public_transport, config,
+            lambda: store.count(invocation_id, "public_a"),
+            lambda: store.count(invocation_id, "public_a", True),
+        )
+        store.claim_started(
+            invocation_id, round_a.fingerprint, round_a.last_observed_ms,
+            round_a.product_count,
+        )
+
+        store.count(invocation_id, "loader")
+        await asyncio.sleep(0)
+        handle = _counted_callback(capability_loader, label="credential loader")
+        await asyncio.sleep(0)
+        if not callable(getattr(handle, "derive_owner", None)) or not callable(
+            getattr(handle, "sign_list_trigger_orders", None)
+        ) or not callable(getattr(handle, "close", None)):
+            raise NadoPreflightError("credential capability is invalid")
+        store.count(invocation_id, "loader", True)
+        await asyncio.sleep(0)
+
+        store.count(invocation_id, "derive")
+        await asyncio.sleep(0)
+        derived = _counted_callback(handle.derive_owner, label="owner derivation")
+        await asyncio.sleep(0)
+        if type(derived) is not str or _address_bytes(derived) != _address_bytes(config.owner):
+            raise NadoPreflightError("credential owner identity mismatch")
+        store.count(invocation_id, "derive", True)
+        await asyncio.sleep(0)
+
+        store.count(invocation_id, "server_time")
+        await asyncio.sleep(0)
+        time_observation = await time_transport.send_async({"type": "time"})
+        await asyncio.sleep(0)
+        server_ms = _server_time_observation(time_observation, _system_clock_ms)
+        if server_ms <= round_a.last_observed_ms:
+            raise NadoPreflightError("server time is invalid or out of order")
+        store.count(invocation_id, "server_time", True)
+        await asyncio.sleep(0)
+
+        recv_time = str(server_ms + MAX_FRESHNESS_MS)
+        typed_data = list_trigger_orders_typed_data(config.sender, recv_time)
+        store.count(invocation_id, "sign")
+        await asyncio.sleep(0)
+        signature = _signature(_counted_callback(
+            handle.sign_list_trigger_orders, typed_data, label="signer",
+        ))
+        await asyncio.sleep(0)
+        store.count(invocation_id, "sign", True)
+        await asyncio.sleep(0)
+
+        store.count(invocation_id, "recover")
+        await asyncio.sleep(0)
+        recovered = _counted_callback(
+            recover_owner, typed_data, signature, label="signature recovery",
+        )
+        await asyncio.sleep(0)
+        if type(recovered) is not str or _address_bytes(recovered) != _address_bytes(config.owner):
+            raise NadoPreflightError("signature owner identity mismatch")
+        store.count(invocation_id, "recover", True)
+        await asyncio.sleep(0)
+
+        request = {
+            "type": "list_trigger_orders",
+            "tx": {"sender": config.sender, "recvTime": recv_time},
+            "signature": signature,
+            "limit": 1,
+        }
+        store.count(invocation_id, "trigger_dispatch")
+        await asyncio.sleep(0)
+        observation = await trigger_transport.send_async(request)
+        await asyncio.sleep(0)
+        store.count(invocation_id, "trigger_dispatch", True)
+        await asyncio.sleep(0)
+        store.count(invocation_id, "trigger_observation")
+        await asyncio.sleep(0)
+        trigger_hash, trigger_observed_ms = _trigger_zero(
+            observation, config, _system_clock_ms,
+        )
+        await asyncio.sleep(0)
+        if trigger_observed_ms < server_ms or trigger_observed_ms <= round_a.last_observed_ms:
+            raise NadoPreflightError("signed observation temporal order mismatch")
+        store.count(invocation_id, "trigger_observation", True)
+        await asyncio.sleep(0)
+        store.observe(invocation_id, trigger_hash, trigger_observed_ms)
+        await asyncio.sleep(0)
+
+        round_b = await _operational_round_b(
+            public_transport, config,
+            lambda: store.count(invocation_id, "public_b"),
+            lambda: store.count(invocation_id, "public_b", True),
+        )
+        if (
+            round_b.first_observed_ms <= trigger_observed_ms
+            or round_b.last_observed_ms - round_a.last_observed_ms > MAX_FRESHNESS_MS
+            or round_b.fingerprint != round_a.fingerprint
+            or round_b.product_count != round_a.product_count
+        ):
+            raise NadoPreflightError("public rounds disagree or temporal barrier failed")
+        counters = store.counters(invocation_id)
+        expected_a = round_a.product_count + 6
+        expected_b = 2 * round_a.product_count + 7
+        if (
+            counters["public_a_attempts"] != expected_a
+            or counters["public_a_completions"] != expected_a
+            or counters["public_b_attempts"] != expected_b
+            or counters["public_b_completions"] != expected_b
+            or any(
+                counters[f"{phase}_{suffix}"] != 1
+                for phase in COUNTER_PHASES[1:-1]
+                for suffix in ("attempts", "completions")
+            )
+        ):
+            raise NadoPreflightError("durable counter totals disagree")
+        ready_to_finalize = True
+    except asyncio.CancelledError:
+        counters = store.counters(invocation_id)
+        reason = (
+            "AMBIGUOUS_DISPATCH"
+            if counters["trigger_dispatch_attempts"]
+            > counters["trigger_observation_completions"]
+            else "CANCELLED"
+        )
+        store.terminalize_unknown(invocation_id, reason)
+        raise
+    except BaseException:
+        try:
+            counters = store.counters(invocation_id)
+            reason = (
+                "AMBIGUOUS_DISPATCH"
+                if counters["trigger_dispatch_attempts"]
+                > counters["trigger_dispatch_completions"]
+                else "VALIDATION_FAILED"
+            )
+            store.terminalize_unknown(invocation_id, reason)
+        except BaseException:
+            pass
+    finally:
+        if handle is not None:
+            try:
+                handle.close()
+                await asyncio.sleep(0)
+            except asyncio.CancelledError:
+                if store.state(invocation_id) in {NEW, CLAIMED, OBSERVED}:
+                    counters = store.counters(invocation_id)
+                    reason = (
+                        "AMBIGUOUS_DISPATCH"
+                        if counters["trigger_dispatch_attempts"]
+                        > counters["trigger_observation_completions"]
+                        else "CANCELLED"
+                    )
+                    store.terminalize_unknown(invocation_id, reason)
+                raise
+            except BaseException:
+                close_failed = True
+    if ready_to_finalize:
+        if close_failed:
+            store.terminalize_unknown(invocation_id, "VALIDATION_FAILED")
+        else:
+            store.finalize(invocation_id, round_b.fingerprint)
+    report = store.terminal_report(invocation_id)
+    if report is None:
+        raise NadoPreflightError("durable report is unavailable")
+    return report
