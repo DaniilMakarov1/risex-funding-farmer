@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "method": "GET",
+  "url": "https://api.starknet.sepolia.extended.exchange/api/v1/user/account/info",
+  "body_max_bytes": 65536,
+  "shape_max_depth": 3,
+  "shape_max_keys": 16,
+  "descriptor_max_bytes": 4096,
+  "allowed_field_names": [
+    "accountIndex",
+    "bridgeStarknetAddress",
+    "data",
+    "description",
+    "error",
+    "id",
+    "l2Key",
+    "l2Vault",
+    "pagination",
+    "status"
+  ],
+  "allowed_type_classes": [
+    "array",
+    "boolean",
+    "integer",
+    "null",
+    "number",
+    "object",
+    "string"
+  ],
+  "effects": ["loader", "account_info", "terminal"]
+}
