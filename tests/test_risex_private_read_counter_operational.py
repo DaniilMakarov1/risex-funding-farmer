@@ -485,7 +485,7 @@ async def test_success_has_exact_sequence_full_counters_and_agreeing_barriers(tm
     path = tmp_path / "fixture.sqlite3"
     report = await _run_fixture(dependencies(tmp_path, calls))
     assert report.result is Result.PASSED
-    assert report.schema_version == 7
+    assert report.schema_version == 8
     assert report.auth_v2_shape is None
     assert report.auth_v2_shape_sha256 is None
     assert report.positions_schema_classifier is None
@@ -516,7 +516,7 @@ async def test_success_has_exact_sequence_full_counters_and_agreeing_barriers(tm
     database = sqlite3.connect(path)
     try:
         assert database.execute("PRAGMA integrity_check").fetchone() == ("ok",)
-        assert database.execute("PRAGMA user_version").fetchone() == (7,)
+        assert database.execute("PRAGMA user_version").fetchone() == (8,)
     finally:
         database.close()
 
@@ -1726,7 +1726,7 @@ async def test_nonflat_public_barrier_b_blocks_after_private_observation(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_barrier_fingerprint_disagreement_is_terminal_unknown(tmp_path):
+async def test_independently_valid_changed_book_completes_both_barriers(tmp_path):
     calls: list[str] = []
 
     def mutate(round_name, path, body):
@@ -1739,9 +1739,13 @@ async def test_barrier_fingerprint_disagreement_is_terminal_unknown(tmp_path):
         calls,
         transport_factory=lambda: SyntheticTransport(calls, public_mutator=mutate),
     ))
-    assert report.result is Result.UNKNOWN
+    assert report.result is Result.PASSED and report.reason == "complete"
     assert report.barrier_a_fingerprint != report.barrier_b_fingerprint
-    assert report.counters["final_agreement"] == {"attempts": 1, "completions": 0}
+    assert report.counters["final_agreement"] == {"attempts": 1, "completions": 1}
+    assert all(
+        value == {"attempts": 1, "completions": 1}
+        for value in report.counters.values()
+    )
 
 
 _NONTERMINAL_PHASES = tuple(name for name in _COUNTER_NAMES if name != "terminal_persist")
@@ -1848,7 +1852,10 @@ async def test_process_death_recovers_exact_counters_and_restart_has_zero_effect
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "mutation",
-    ("counter", "passed_missing_phase", "schema", "version", "mode", "symlink", "bytes"),
+    (
+        "counter", "passed_missing_phase", "barrier_a", "barrier_b",
+        "schema", "version", "mode", "symlink", "bytes",
+    ),
 )
 async def test_store_counter_schema_path_and_file_corruption_fail_without_effects(
     tmp_path, mutation,
@@ -1856,7 +1863,10 @@ async def test_store_counter_schema_path_and_file_corruption_fail_without_effect
     calls: list[str] = []
     path = tmp_path / "fixture.sqlite3"
     assert (await _run_fixture(dependencies(tmp_path, calls))).result is Result.PASSED
-    if mutation in {"counter", "passed_missing_phase", "schema", "version"}:
+    if mutation in {
+        "counter", "passed_missing_phase", "barrier_a", "barrier_b",
+        "schema", "version",
+    }:
         database = sqlite3.connect(path)
         if mutation == "counter":
             database.execute("PRAGMA ignore_check_constraints=ON")
@@ -1868,10 +1878,15 @@ async def test_store_counter_schema_path_and_file_corruption_fail_without_effect
                 "UPDATE phase_counter SET attempts=0,completions=0 "
                 "WHERE name='nonce_get'"
             )
+        elif mutation in {"barrier_a", "barrier_b"}:
+            database.execute(
+                f"UPDATE run SET {mutation}_fingerprint='not-a-fingerprint' "
+                "WHERE singleton=1"
+            )
         elif mutation == "schema":
             database.execute("ALTER TABLE run ADD COLUMN unexpected TEXT")
         else:
-            database.execute("PRAGMA user_version=8")
+            database.execute("PRAGMA user_version=9")
         database.commit()
         database.close()
     elif mutation == "mode":

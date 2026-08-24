@@ -43,7 +43,7 @@ STORE_BASENAME = ".risex-funding-farmer-risex-private-read-20260824-new-op-010.s
 FIXED_STORE_PATH = Path(
     "/Users/daniilmakarov/.risex-funding-farmer-risex-private-read-20260824-new-op-010.sqlite3"
 )
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 _APPLICATION_ID = 0x52585052
 _MAX_BYTES = 1_048_576
 _DEADLINE_SECONDS = 5
@@ -149,7 +149,7 @@ _REASON_VALUES = frozenset({
 _LEDGER_SCHEMA = (
     "CREATE TABLE run ("
     "singleton INTEGER PRIMARY KEY CHECK(singleton=1),"
-    "schema_version INTEGER NOT NULL CHECK(schema_version=7),"
+    "schema_version INTEGER NOT NULL CHECK(schema_version=8),"
     "invocation_id TEXT NOT NULL CHECK(length(invocation_id)>0),"
     "store_path_sha256 TEXT NOT NULL CHECK(length(store_path_sha256)=64),"
     "state TEXT NOT NULL CHECK(state IN "
@@ -548,8 +548,6 @@ class DurableCounterLedger:
             and counters["positions_flat"] == (0, 0)
         ):
             raise ValueError("positions shape stage")
-        if counters["final_agreement"] == (1, 1) and row[4] != row[5]:
-            raise ValueError("agreement invariant")
         if terminal:
             if terminal_counter != (1, 1):
                 raise ValueError("terminal counter")
@@ -559,7 +557,7 @@ class DurableCounterLedger:
             row[8] != "complete"
             or stage != "OBSERVED"
             or row[4] is None
-            or row[4] != row[5]
+            or row[5] is None
             or any(counters[name] != (1, 1) for name in _COUNTER_NAMES)
         ):
             raise ValueError("passed invariant")
@@ -750,7 +748,7 @@ class DurableCounterLedger:
         if result is Result.PASSED and (
             row[3] != "OBSERVED"
             or row[4] is None
-            or row[4] != row[5]
+            or row[5] is None
             or any(
                 counters[name] != (1, 1)
                 for name in _COUNTER_NAMES
@@ -1953,7 +1951,9 @@ async def _execute(
         ledger,
         "final_agreement",
         lambda: (fingerprint_a, fingerprint_b),
-        lambda value: value if value[0] == value[1] else _raise("barrier disagreement"),
+        lambda value: value if all(_fingerprint(item) for item in value) else (
+            _raise("barrier evidence rejected")
+        ),
         dependencies.crash_hook,
     )
 
