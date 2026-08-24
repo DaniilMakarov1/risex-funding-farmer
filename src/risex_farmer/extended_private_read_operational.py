@@ -175,7 +175,6 @@ def _validate_private_path(path: Path, *, may_create: bool) -> None:
         not stat.S_ISDIR(parent_stat.st_mode)
         or parent.is_symlink()
         or parent_stat.st_uid != os.getuid()
-        or stat.S_IMODE(parent_stat.st_mode) & 0o077
     ):
         raise PreflightViolation("STORE_PARENT_INVALID")
     try:

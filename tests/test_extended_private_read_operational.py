@@ -7,12 +7,14 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import stat
 import subprocess
 import sys
 from types import SimpleNamespace
 
 import pytest
 from aiohttp import WSMsgType
+import risex_farmer.extended_private_read_operational as operational
 
 from risex_farmer.extended_private_read_preflight import (
     ACCOUNT_ID,
@@ -81,9 +83,10 @@ def _meta(url):
 
 
 class _Stream:
-    def __init__(self, timeline, *, close_error=None):
+    def __init__(self, timeline, *, close_error=None, silent_close=False):
         self.timeline = timeline
         self.close_error = close_error
+        self.silent_close = silent_close
         self.upgrade_metadata = _meta(STREAM_URL)
         self.outbound_frames = []
         self.reconnect_count = 0
@@ -108,19 +111,25 @@ class _Stream:
 
     async def close(self):
         self.timeline.append("CLOSE")
-        self.closed = True
         if self.close_error:
             raise self.close_error
+        if not self.silent_close:
+            self.closed = True
 
 
 class _Transport:
-    def __init__(self, *, identity_offset=0, fail_b_path=None, close_error=None):
+    def __init__(
+        self, *, identity_offset=0, fail_b_path=None, close_error=None,
+        silent_close=False,
+    ):
         self.timeline = []
         self.get_calls = []
         self.open_calls = []
         self.identity_offset = identity_offset
         self.fail_b_path = fail_b_path
-        self.stream = _Stream(self.timeline, close_error=close_error)
+        self.stream = _Stream(
+            self.timeline, close_error=close_error, silent_close=silent_close
+        )
 
     async def get(self, request):
         self.timeline.append(f"GET_{request.round_name}_{request.path}")
@@ -356,6 +365,53 @@ async def test_process_death_immediately_after_external_effect_is_unknown(tmp_pa
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "effect",
+    [
+        "loader", "rest_a_info", "rest_a_orders", "rest_a_positions",
+        "stream_open", "stream_upgrade", "rest_b_info", "rest_b_orders",
+        "rest_b_positions", "barrier_request", "barrier_validation",
+        "stream_close",
+    ],
+)
+async def test_process_death_after_nonterminal_completion_is_unknown(tmp_path, effect):
+    def hook(current, point):
+        if (current, point) == (effect, "after_completion"):
+            raise _ProcessDeath
+
+    with pytest.raises(_ProcessDeath):
+        await _run(tmp_path, hook=hook)
+    source, transport, clock = _Source(), _Transport(), _Clock()
+    recovered = await _run_fixture_operational_private_read(
+        store=_OperationalStore(tmp_path / "operational.sqlite3"),
+        credential_source=source, transport=transport, clock_ms=clock,
+    )
+    assert recovered.status == "UNKNOWN"
+    assert recovered.counters[f"{effect}_attempts"] == 1
+    assert recovered.counters[f"{effect}_completions"] == 1
+    assert source.calls == 0 and transport.get_calls == [] and clock.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_process_death_after_terminal_completion_replays_terminal_only(tmp_path):
+    def hook(current, point):
+        if (current, point) == ("terminal_persistence", "after_completion"):
+            raise _ProcessDeath
+
+    with pytest.raises(_ProcessDeath):
+        await _run(tmp_path, hook=hook)
+    source, transport, clock = _Source(), _Transport(), _Clock()
+    recovered = await _run_fixture_operational_private_read(
+        store=_OperationalStore(tmp_path / "operational.sqlite3"),
+        credential_source=source, transport=transport, clock_ms=clock,
+    )
+    assert recovered.status == "READY"
+    assert recovered.counters["terminal_persistence_attempts"] == 1
+    assert recovered.counters["terminal_persistence_completions"] == 1
+    assert source.calls == 0 and transport.get_calls == [] and clock.calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "effect,point",
     [
         *((effect, "after_attempt") for effect in (
@@ -406,6 +462,13 @@ async def test_incomplete_round_b_and_ambiguous_close_are_fail_closed(tmp_path):
     assert (result.status, result.reason) == ("BLOCKED", "STREAM_CLOSE_FAILED")
     assert result.counters["stream_close_attempts"] == 1
     assert result.counters["stream_close_completions"] == 0
+    (tmp_path / "silent-close").mkdir(mode=0o700)
+    result, _, _, _ = await _run(
+        tmp_path / "silent-close", transport=_Transport(silent_close=True)
+    )
+    assert (result.status, result.reason) == ("BLOCKED", "STREAM_CLOSE_FAILED")
+    assert result.counters["stream_close_attempts"] == 1
+    assert result.counters["stream_close_completions"] == 0
 
 
 @pytest.mark.asyncio
@@ -444,11 +507,148 @@ async def test_direct_stream_barrier_requires_matching_protocol_pong_and_closes(
     assert socket.closed and stream.closed
 
 
-def test_store_rejects_permissions_symlink_and_schema_corruption(tmp_path):
-    bad_parent = tmp_path / "wide"
-    bad_parent.mkdir(mode=0o755)
-    with pytest.raises(Exception, match="STORE_PARENT_INVALID"):
-        _OperationalStore(bad_parent / "store.sqlite3")
+def _identity_document():
+    return {
+        "id": ACCOUNT_ID, "accountIndex": ACCOUNT_INDEX,
+        "l2Key": L2_KEY, "l2Vault": L2_VAULT,
+    }
+
+
+def _write_source_files(home, *, key=b"fixture-key-only", identity=None):
+    key_path = home / operational.API_KEY_BASENAME
+    identity_path = home / operational.IDENTITY_BASENAME
+    key_path.write_bytes(key)
+    identity_path.write_text(json.dumps(identity or _identity_document()))
+    key_path.chmod(0o600)
+    identity_path.chmod(0o600)
+    return key_path, identity_path
+
+
+def test_passwd_home_source_uses_exact_files_once_nofollow_and_zeroizes(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "passwd-home"
+    home.mkdir(mode=0o755)
+    home.chmod(0o755)
+    key_path, identity_path = _write_source_files(home)
+    monkeypatch.setattr(operational, "_passwd_home", lambda: home)
+    original_open = operational.os.open
+    opened = []
+
+    def recording_open(path, flags, *args):
+        opened.append((Path(path), flags))
+        return original_open(path, flags, *args)
+
+    monkeypatch.setattr(operational.os, "open", recording_open)
+    capability = _PasswdHomeCredentialSource().open()
+    assert [item[0] for item in opened] == [identity_path, key_path]
+    assert all(item[1] & os.O_NOFOLLOW for item in opened)
+    assert capability.x_api_key_header_value() == "fixture-key-only"
+    assert capability.matches_account(_account())
+    assert capability.matches_spot_account_id(ACCOUNT_ID)
+    key_buffer = capability._key
+    capability.close()
+    assert set(key_buffer) == {0}
+    assert capability._identity == {}
+    with pytest.raises(Exception, match="CREDENTIAL_CLOSED"):
+        capability.x_api_key_header_value()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "missing_identity", "missing_key", "identity_mode", "key_mode",
+        "identity_symlink", "key_symlink", "identity_directory", "key_directory",
+        "identity_extra", "identity_missing", "identity_type", "identity_json",
+        "identity_oversize", "key_oversize", "key_empty", "key_whitespace",
+        "key_non_utf8",
+    ],
+)
+async def test_passwd_home_source_adverse_files_block_before_transport(
+    tmp_path, monkeypatch, defect
+):
+    home = tmp_path / "passwd-home"
+    home.mkdir(mode=0o755)
+    home.chmod(0o755)
+    key_path, identity_path = _write_source_files(home)
+    if defect == "missing_identity":
+        identity_path.unlink()
+    elif defect == "missing_key":
+        key_path.unlink()
+    elif defect == "identity_mode":
+        identity_path.chmod(0o644)
+    elif defect == "key_mode":
+        key_path.chmod(0o644)
+    elif defect == "identity_symlink":
+        identity_path.unlink()
+        target = home / "identity-target"
+        target.write_text(json.dumps(_identity_document()))
+        target.chmod(0o600)
+        identity_path.symlink_to(target)
+    elif defect == "key_symlink":
+        key_path.unlink()
+        target = home / "key-target"
+        target.write_bytes(b"fixture-key-only")
+        target.chmod(0o600)
+        key_path.symlink_to(target)
+    elif defect == "identity_directory":
+        identity_path.unlink()
+        identity_path.mkdir(mode=0o700)
+    elif defect == "key_directory":
+        key_path.unlink()
+        key_path.mkdir(mode=0o700)
+    elif defect == "identity_extra":
+        value = _identity_document()
+        value["extra"] = 1
+        identity_path.write_text(json.dumps(value))
+    elif defect == "identity_missing":
+        value = _identity_document()
+        value.pop("l2Vault")
+        identity_path.write_text(json.dumps(value))
+    elif defect == "identity_type":
+        value = _identity_document()
+        value["accountIndex"] = True
+        identity_path.write_text(json.dumps(value))
+    elif defect == "identity_json":
+        identity_path.write_text("not-json")
+    elif defect == "identity_oversize":
+        value = _identity_document()
+        value["l2Key"] = "x" * 3000
+        identity_path.write_text(json.dumps(value))
+    elif defect == "key_oversize":
+        key_path.write_bytes(b"x" * 513)
+    elif defect == "key_empty":
+        key_path.write_bytes(b"")
+    elif defect == "key_whitespace":
+        key_path.write_bytes(b" fixture-key-only")
+    elif defect == "key_non_utf8":
+        key_path.write_bytes(b"\xff")
+    monkeypatch.setattr(operational, "_passwd_home", lambda: home)
+    transport = _Transport()
+    result = await _run_fixture_operational_private_read(
+        store=_OperationalStore(tmp_path / "operation.sqlite3"),
+        credential_source=_PasswdHomeCredentialSource(), transport=transport,
+        clock_ms=_Clock(),
+    )
+    assert result.status == "BLOCKED"
+    assert transport.get_calls == [] and transport.open_calls == []
+    durable = (tmp_path / "operation.sqlite3").read_bytes()
+    assert b"fixture-key-only" not in durable
+    assert str(home).encode() not in durable
+
+
+def test_store_accepts_owned_0755_home_but_rejects_bad_file_and_symlink(tmp_path):
+    passwd_home = tmp_path / "passwd-home"
+    passwd_home.mkdir(mode=0o755)
+    passwd_home.chmod(0o755)
+    store = _OperationalStore(passwd_home / "store.sqlite3")
+    assert stat.S_IMODE(store.path.stat().st_mode) == 0o600
+    bad_mode = passwd_home / "bad-mode.sqlite3"
+    bad_mode.write_bytes(b"")
+    bad_mode.chmod(0o644)
+    with pytest.raises(Exception, match="STORE_FILE_INVALID"):
+        _OperationalStore(bad_mode)
     target = tmp_path / "target.sqlite3"
     target.write_bytes(b"")
     target.chmod(0o600)
@@ -456,6 +656,9 @@ def test_store_rejects_permissions_symlink_and_schema_corruption(tmp_path):
     link.symlink_to(target)
     with pytest.raises(Exception, match="STORE_FILE_INVALID"):
         _OperationalStore(link)
+
+
+def test_store_rejects_schema_corruption(tmp_path):
     path = tmp_path / "corrupt.sqlite3"
     store = _OperationalStore(path)
     with sqlite3.connect(store.path) as connection:
