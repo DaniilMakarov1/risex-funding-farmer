@@ -1,0 +1,71 @@
+{
+  "sources": {
+    "typescript_sdk": "315e4f23dadefeb2f86f713e423241e81467d4c3",
+    "rust_sdk": "e54118786b171a4325871d5bd17e5abae0e90c5a",
+    "contracts": "11c27b2851999f1b4f8cb4a7fbfcc9320253f12f"
+  },
+  "environment": {"chain_id":763373,"domain_name":"Nado","domain_version":"0.0.1","endpoint":"0x698D87105274292B5673367DEC81874Ce3633Ac2","gateway":"https://gateway.test.nado.xyz/v1","trigger":"https://trigger.test.nado.xyz/v1"},
+  "owner": "0x0000000000000000000000000000000000000001",
+  "subaccount_name": "default",
+  "sender": "0x000000000000000000000000000000000000000164656661756c740000000000",
+  "signature": "0x1111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111",
+  "signature_vector": {
+    "synthetic_private_key": "0x0101010101010101010101010101010101010101010101010101010101010101",
+    "owner": "0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1",
+    "sender": "0x1a642f0e3c3af545e7acbd38b07251b3990914f164656661756c740000000000",
+    "recv_time": "1700000030010",
+    "digest": "0x8d05d1fa393494839362d0b63e74d44ed4812cf2e6f299c4853f8f000b4b077e",
+    "signature": "0x0c663eceeb7a8d43c413e5826b6cbe52f15f8baf43a3679ee9967e48f6e406d31365984afba8030158c5f94417c424789312f0a512b7ca803421a69c81187d541c",
+    "request": {"type":"list_trigger_orders","tx":{"sender":"0x1a642f0e3c3af545e7acbd38b07251b3990914f164656661756c740000000000","recvTime":"1700000030010"},"signature":"0x0c663eceeb7a8d43c413e5826b6cbe52f15f8baf43a3679ee9967e48f6e406d31365984afba8030158c5f94417c424789312f0a512b7ca803421a69c81187d541c","limit":1}
+  },
+  "wire": {
+    "contracts": {"status":"success","data":{"chain_id":"763373","endpoint_addr":"0x698D87105274292B5673367DEC81874Ce3633Ac2"}},
+    "status": {"status":"success","data":"active"},
+    "all_products": {"status":"success","data":{
+      "spot_products":[{
+        "product_id":0,"oracle_price_x18":"1000000000000000000",
+        "risk":{"long_weight_initial_x18":"1000000000000000000","short_weight_initial_x18":"1000000000000000000","long_weight_maintenance_x18":"1000000000000000000","short_weight_maintenance_x18":"1000000000000000000","large_position_penalty_x18":"0"},
+        "config":{"token":"0x0000000000000000000000000000000000000002","interest_inflection_util_x18":"800000000000000000","interest_floor_x18":"0","interest_small_cap_x18":"100000000000000000","interest_large_cap_x18":"1000000000000000000","min_deposit_rate_x18":"0"},
+        "state":{"cumulative_deposits_multiplier_x18":"1000000000000000000","cumulative_borrows_multiplier_x18":"1000000000000000000","total_deposits_normalized":"5000000000000000000","total_borrows_normalized":"0"},
+        "book_info":{"size_increment":"1000000000000000","price_increment_x18":"1000000000000000","min_size":"1000000000000000","collected_fees":"0"}
+      }],
+      "perp_products":[{
+        "product_id":1,"oracle_price_x18":"2000000000000000000000","index_price_x18":"2000000000000000000000",
+        "risk":{"long_weight_initial_x18":"900000000000000000","short_weight_initial_x18":"1100000000000000000","long_weight_maintenance_x18":"950000000000000000","short_weight_maintenance_x18":"1050000000000000000","large_position_penalty_x18":"0"},
+        "state":{"cumulative_funding_long_x18":"0","cumulative_funding_short_x18":"0","available_settle":"0","open_interest":"0"},
+        "book_info":{"size_increment":"1000000000000000","price_increment_x18":"1000000000000000","min_size":"1000000000000000","collected_fees":"0"}
+      }]
+    }},
+    "linked_signer": {"status":"success","data":{"linked_signer":"0x0000000000000000000000000000000000000000"}},
+    "subaccount_info": {"status":"success","data":{
+      "exists":true,"subaccount":"0x000000000000000000000000000000000000000164656661756c740000000000","spot_count":1,"perp_count":1,
+      "healths":[{"health":"5000000000000000000","assets":"5000000000000000000","liabilities":"0"},{"health":"5000000000000000000","assets":"5000000000000000000","liabilities":"0"},{"health":"5000000000000000000","assets":"5000000000000000000","liabilities":"0"}],
+      "health_contributions":[["5000000000000000000","5000000000000000000","5000000000000000000"],["0","0","0"]],
+      "spot_balances":[{"product_id":0,"balance":{"amount":"5000000000000000000"}}],
+      "perp_balances":[{"product_id":1,"balance":{"amount":"0","v_quote_balance":"0","last_cumulative_funding_x18":"0"}}],
+      "spot_products":[{
+        "product_id":0,"oracle_price_x18":"1000000000000000000",
+        "risk":{"long_weight_initial_x18":"1000000000000000000","short_weight_initial_x18":"1000000000000000000","long_weight_maintenance_x18":"1000000000000000000","short_weight_maintenance_x18":"1000000000000000000","large_position_penalty_x18":"0"},
+        "config":{"token":"0x0000000000000000000000000000000000000002","interest_inflection_util_x18":"800000000000000000","interest_floor_x18":"0","interest_small_cap_x18":"100000000000000000","interest_large_cap_x18":"1000000000000000000","min_deposit_rate_x18":"0"},
+        "state":{"cumulative_deposits_multiplier_x18":"1000000000000000000","cumulative_borrows_multiplier_x18":"1000000000000000000","total_deposits_normalized":"5000000000000000000","total_borrows_normalized":"0"},
+        "book_info":{"size_increment":"1000000000000000","price_increment_x18":"1000000000000000","min_size":"1000000000000000","collected_fees":"0"}
+      }],
+      "perp_products":[{
+        "product_id":1,"oracle_price_x18":"2000000000000000000000","index_price_x18":"2000000000000000000000",
+        "risk":{"long_weight_initial_x18":"900000000000000000","short_weight_initial_x18":"1100000000000000000","long_weight_maintenance_x18":"950000000000000000","short_weight_maintenance_x18":"1050000000000000000","large_position_penalty_x18":"0"},
+        "state":{"cumulative_funding_long_x18":"0","cumulative_funding_short_x18":"0","available_settle":"0","open_interest":"0"},
+        "book_info":{"size_increment":"1000000000000000","price_increment_x18":"1000000000000000","min_size":"1000000000000000","collected_fees":"0"}
+      }]
+    }},
+    "isolated_positions": {"status":"success","data":{"isolated_positions":[]}},
+    "time": {"status":"success","method":"time","server_time":"1700000000009"},
+    "trigger": {"status":"success","data":{"orders":[]}}
+  },
+  "round_a": [
+    {"op":"contracts","observed_at_ms":1700000000000},{"op":"status","observed_at_ms":1700000000001},{"op":"all_products","observed_at_ms":1700000000002},{"op":"linked_signer","observed_at_ms":1700000000003},{"op":"subaccount_info","observed_at_ms":1700000000004},{"op":"subaccount_orders:0","observed_at_ms":1700000000005},{"op":"subaccount_orders:1","observed_at_ms":1700000000006},{"op":"isolated_positions","observed_at_ms":1700000000007}
+  ],
+  "trigger": {"observed_at_ms":1700000000010},
+  "round_b": [
+    {"op":"all_products","observed_at_ms":1700000000011},{"op":"subaccount_orders:0","observed_at_ms":1700000000012},{"op":"subaccount_orders:1","observed_at_ms":1700000000013},{"op":"subaccount_info","observed_at_ms":1700000000014},{"op":"isolated_positions","observed_at_ms":1700000000015},{"op":"subaccount_orders:0","observed_at_ms":1700000000016},{"op":"subaccount_orders:1","observed_at_ms":1700000000017},{"op":"contracts","observed_at_ms":1700000000018},{"op":"status","observed_at_ms":1700000000019},{"op":"all_products","observed_at_ms":1700000000020},{"op":"linked_signer","observed_at_ms":1700000000021}
+  ]
+}
