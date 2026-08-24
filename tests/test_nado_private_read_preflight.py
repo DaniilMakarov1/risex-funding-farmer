@@ -1068,6 +1068,78 @@ async def test_operational_runner_exact_owned_sequence_with_synthetic_boundaries
     assert json.loads(sessions[9].calls[0][1]["data"])["tx"]["recvTime"] == "1700000030009"
 
 
+@pytest.mark.parametrize("stage", ["derive", "recover"])
+@pytest.mark.asyncio
+async def test_callback_scheduled_cancellation_precedes_next_external_effect(
+    tmp_path: Path, contract: dict[str, object], monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    plan: list[tuple[str, object]] = [
+        (nado.FixedPreflightIdentity.gateway_query, entry["response"])
+        for entry in contract["round_a"]
+    ]
+    plan.append((nado.FixedPreflightIdentity.gateway_edge_query, contract["wire"]["time"]))
+    plan.append((nado.FixedPreflightIdentity.trigger_query, contract["trigger"]["response"]))
+    plan.extend(
+        (nado.FixedPreflightIdentity.gateway_query, entry["response"])
+        for entry in contract["round_b"]
+    )
+    sessions: list[_HttpSession] = []
+
+    def session_factory(**kwargs: object) -> object:
+        url, payload = plan[len(sessions)]
+        raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        session = _HttpSession(_HttpResponse(raw, url=url))
+        sessions.append(session)
+        return session
+
+    now = 1_700_000_000_025
+    clock_values: list[int] = []
+    for entry in contract["round_a"]:
+        clock_values.extend([int(entry["observed_at_ms"]), now])
+    clock_values.extend([1_700_000_000_008, now, now])
+    clock_values.extend([int(contract["trigger"]["observed_at_ms"]), now, now])
+    for entry in contract["round_b"]:
+        clock_values.extend([int(entry["observed_at_ms"]), now])
+
+    monkeypatch.setattr(nado.aiohttp, "ClientSession", session_factory)
+    monkeypatch.setattr(nado, "_system_clock_ms", lambda: clock_values.pop(0))
+    calls = Calls(contract)
+
+    def cancel_current() -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        asyncio.get_running_loop().call_soon(task.cancel)
+
+    def derive(credential: object) -> str:
+        calls.derive += 1
+        if stage == "derive":
+            cancel_current()
+        return str(contract["owner"])
+
+    def recover(typed: dict[str, object], signature: str) -> str:
+        calls.recover += 1
+        if stage == "recover":
+            cancel_current()
+        return str(contract["owner"])
+
+    store = nado.OneShotStore(tmp_path / f"callback-cancel-{stage}.sqlite3")
+    with pytest.raises(asyncio.CancelledError):
+        await nado.run_operational_private_read_preflight(
+            config=_config(contract), credential_loader=calls.load,
+            derive_owner=derive, signer=calls.signer,
+            recover_owner=recover, store=store,
+        )
+    urls = [session.calls[0][0] for session in sessions]
+    assert nado.FixedPreflightIdentity.trigger_query not in urls
+    if stage == "derive":
+        assert nado.FixedPreflightIdentity.gateway_edge_query not in urls
+        assert (calls.loader, calls.derive, calls.sign, calls.recover) == (1, 1, 0, 0)
+    else:
+        assert (calls.loader, calls.derive, calls.sign, calls.recover) == (1, 1, 1, 1)
+    assert store.state("fixture-invocation-001") == nado.CLAIMED
+
+
 @pytest.mark.parametrize("phase", ["before", "round-a"])
 @pytest.mark.asyncio
 async def test_operational_cancellation_stops_without_sensitive_or_trigger_work(

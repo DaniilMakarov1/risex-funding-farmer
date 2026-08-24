@@ -878,6 +878,7 @@ async def _operational_round(
         request = next(contract)
         while True:
             observation = await transport.send_async(request)
+            await asyncio.sleep(0)
             request = contract.send(_wire_data(observation, _system_clock_ms))
     except StopIteration as completed:
         return completed.value
@@ -1083,7 +1084,9 @@ async def run_operational_private_read_preflight(
             or _address_bytes(derived) != _address_bytes(config.owner)
         ):
             raise NadoPreflightError("credential owner identity mismatch")
+        await asyncio.sleep(0)
         time_observation = await time_transport.send_async({"type": "time"})
+        await asyncio.sleep(0)
         server_ms = _server_time_observation(time_observation, _system_clock_ms)
         if server_ms <= round_a.last_observed_ms:
             raise NadoPreflightError("server time is invalid or out of order")
@@ -1102,6 +1105,7 @@ async def run_operational_private_read_preflight(
             or _address_bytes(recovered) != _address_bytes(config.owner)
         ):
             raise NadoPreflightError("signature owner identity mismatch")
+        await asyncio.sleep(0)
         request = {
             "type": "list_trigger_orders",
             "tx": {"sender": config.sender, "recvTime": recv_time},
@@ -1109,6 +1113,7 @@ async def run_operational_private_read_preflight(
             "limit": 1,
         }
         observation = await signed_transport.send_async(request)
+        await asyncio.sleep(0)
         trigger_hash, trigger_observed_ms = _trigger_zero(
             observation, config, _system_clock_ms,
         )
