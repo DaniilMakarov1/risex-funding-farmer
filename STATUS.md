@@ -11,6 +11,7 @@
 - The signer prerequisite, fixture lifecycle core, deterministic private-read path, and operational adapter are accepted.
 - The single authorized operational private-read invocation stopped fail closed during its public phase after exactly nine public GETs. Durable evidence reports `PREFLIGHT_BLOCKED`; no credential load, nonce, signature, private request, order, cancel, close, or other write occurred.
 - One bounded public-only diagnostic sweep proved all nine official endpoints available with HTTP 200 and identified three concrete stale fixture/decoder contracts: signer-row fields and expiration representation, full market symbol/config fields, and orderbook level fields including official `order_count`. Existing public normalization independently corroborates the market and book shape mismatch.
+- Official OpenAPI enumerates candidate fields and types but does not define exact emitted/required key sets. The active correction therefore permits narrowly evidence-driven public schema capture of only the three affected endpoints, retaining redacted key/type structure and no identities or values; it does not permit a private-preflight retry.
 - The consumed one-shot remains immutable and must not be reset, rearmed, or retried. The active action is a fixture-only correction of those three strict decoders after central publication and a separate Builder gate.
 - RISEx has not proved an operational order lifecycle, authoritative zero open orders, or exact flatness.
 

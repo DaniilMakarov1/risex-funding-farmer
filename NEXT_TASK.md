@@ -15,11 +15,12 @@ Required deterministic contract:
 - Validate the full official BTC/USDC market symbol and the exact current documented config fields while retaining market identity, active/unlocked state, price/size grids, and minimum size.
 - Validate the exact current documented orderbook level fields, including `order_count` when present in the official contract, while retaining nonempty depth, ordering, grid, spread, freshness, and notional gates.
 - Unknown or undocumented fields remain fail closed; do not replace exact contracts with permissive arbitrary-key acceptance.
+- When pinned official sources do not define required/emitted key sets, the Architect may authorize only evidence-driven public schema capture for these same three endpoints. Each request must correspond to one concrete missing contract and persist only redacted key/type structure; account/signer identities, prices, quantities, request IDs, and values are not retained. Stop when the missing contract is established; repeated or exploratory sweeps are prohibited.
 - Add genuine RED-before-GREEN regressions for all three observed shape classes, run the focused private-preflight suite, full clean Python 3.11 suite, dependency check, diff review, and secret scan.
 
 Forbidden:
 
-- Any new diagnostic network sweep; reset, rearm, or retry of the consumed operational invocation.
+- Reset, rearm, or retry of the consumed operational invocation; any private or write request presented as schema capture.
 - Signer or credential loading, nonce/signature creation, private traffic, or any write.
 - Add fallbacks, alternate hosts, browser/support workarounds, strategy behavior, or shared-runtime expansion.
 
