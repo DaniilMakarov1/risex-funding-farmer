@@ -139,6 +139,24 @@ def test_captured_public_contract_shape_is_accepted(path, validator):
     assert result is not None
 
 
+def test_official_market_contract_accepts_zero_open_interest_limit():
+    data = current_public_contract("/v1/markets")
+    data["markets"][0]["config"]["open_interest_limit"] = "0"
+
+    assert PrivateReadPreflight._validate_market(data, NOW) is not None
+
+
+@pytest.mark.parametrize("value", [
+    "-1", "-0", "00", "01", "+1", "1e3", "NaN", "Infinity", 0, 1, None,
+])
+def test_market_contract_rejects_invalid_open_interest_limit(value):
+    data = current_public_contract("/v1/markets")
+    data["markets"][0]["config"]["open_interest_limit"] = value
+
+    with pytest.raises(ValueError):
+        PrivateReadPreflight._validate_market(data, NOW)
+
+
 @pytest.mark.parametrize("path,validator,mutation", [
     ("/v1/auth/signers", "_validate_signers", "missing"),
     ("/v1/auth/signers", "_validate_signers", "extra"),

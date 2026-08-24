@@ -204,6 +204,25 @@ def _decimal(value: Any) -> Decimal:
     return result
 
 
+def _canonical_nonnegative_decimal(value: Any) -> Decimal:
+    if not isinstance(value, str) or not value:
+        raise ValueError("invalid nonnegative decimal")
+    whole, separator, fraction = value.partition(".")
+    if (
+        not whole.isascii() or not whole.isdecimal()
+        or (whole != "0" and whole.startswith("0"))
+        or (separator and (
+            not fraction or not fraction.isascii() or not fraction.isdecimal()
+        ))
+        or "." in fraction
+    ):
+        raise ValueError("invalid nonnegative decimal")
+    result = _decimal(value)
+    if result < 0:
+        raise ValueError("invalid nonnegative decimal")
+    return result
+
+
 def _canonical_uint(value: Any, *, bits: int = 64) -> int:
     if (
         not isinstance(value, str) or not value
@@ -501,10 +520,11 @@ class PrivateReadPreflight:
             raise ValueError("invalid market time")
         for field in {
             "maintenance_margin_factor", "max_leverage", "min_order_size",
-            "open_interest_limit", "step_price", "step_size",
+            "step_price", "step_size",
         }:
             if _decimal(config[field]) <= 0:
                 raise ValueError("nonpositive market config")
+        _canonical_nonnegative_decimal(config["open_interest_limit"])
         return market
 
     @staticmethod
