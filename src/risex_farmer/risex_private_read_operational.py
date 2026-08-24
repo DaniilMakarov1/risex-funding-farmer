@@ -60,7 +60,10 @@ _PRIVATE_COUNTERS = (
     "register_v2_construct",
     "sign_register_v2",
     "auth_v2_dispatch",
-    "auth_v2_ack",
+    "auth_v2_receive",
+    "auth_v2_parse",
+    "auth_v2_validate",
+    "auth_v2_status",
     "orders_subscribe",
     "orders_snapshot",
     "positions_subscribe",
@@ -84,6 +87,12 @@ _REASON_VALUES = frozenset({
     "cancelled",
     "interrupted_nonterminal",
     "store_rejected",
+    "auth_v2_timeout",
+    "auth_v2_close",
+    "auth_v2_binary",
+    "auth_v2_malformed",
+    "auth_v2_schema_invalid",
+    "auth_v2_error",
 })
 _LEDGER_SCHEMA = (
     "CREATE TABLE run ("
@@ -140,6 +149,16 @@ class OperationalReport:
 
 class _StoreRejected(Exception):
     pass
+
+
+class _AuthV2Failure(Exception):
+    """Fixed redacted auth outcome; never carries server-controlled data."""
+
+    def __init__(self, reason: str) -> None:
+        if reason not in _REASON_VALUES or not reason.startswith("auth_v2_"):
+            raise ValueError("auth_v2 failure reason")
+        self.reason = reason
+        super().__init__(reason)
 
 
 class _SimulatedProcessDeath(BaseException):
@@ -412,6 +431,8 @@ class DurableCounterLedger:
             raise ValueError("blocked invariant")
         if row[3] == "UNKNOWN" and row[8] not in {
             "validation_failed", "cancelled", "interrupted_nonterminal",
+            "auth_v2_timeout", "auth_v2_close", "auth_v2_binary",
+            "auth_v2_malformed", "auth_v2_schema_invalid", "auth_v2_error",
         }:
             raise ValueError("unknown invariant")
 
@@ -688,6 +709,39 @@ def _strict_json(raw: bytes) -> Any:
         raise ValueError("private transport rejected") from None
 
 
+def _parse_auth_v2(raw: Any) -> Any:
+    if type(raw) is not str:
+        raise _AuthV2Failure("auth_v2_malformed")
+    try:
+        encoded = raw.encode("utf-8", errors="strict")
+        return _strict_json(encoded)
+    except _AuthV2Failure:
+        raise
+    except Exception:
+        raise _AuthV2Failure("auth_v2_malformed") from None
+
+
+def _validate_auth_v2_schema(value: Any) -> Mapping[str, Any]:
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != {"method", "status"}
+        or value.get("method") != "auth_v2"
+        or value.get("status") not in {"success", "error"}
+    ):
+        raise _AuthV2Failure("auth_v2_schema_invalid")
+    return value
+
+
+def _require_auth_v2_success(value: Mapping[str, Any]) -> Mapping[str, Any]:
+    if value.get("status") == "error":
+        raise _AuthV2Failure("auth_v2_error")
+    try:
+        PrivateReadPreflight._validate_auth_frame(value)
+    except Exception:
+        raise _AuthV2Failure("auth_v2_schema_invalid") from None
+    return value
+
+
 async def _abort_redirect(_session: Any, _context: Any, _params: Any) -> None:
     raise ValueError("private transport redirect rejected")
 
@@ -795,8 +849,25 @@ class FixedRisexPrivateReadTransport:
             raise ValueError("private transport rejected")
         return _strict_json(incoming.data.encode("utf-8"))
 
-    async def auth_v2_ack(self) -> Any:
-        return await self._receive()
+    async def auth_v2_receive(self) -> str:
+        if self._socket is None:
+            raise ValueError("private transport rejected")
+        try:
+            incoming = await self._socket.receive(timeout=_DEADLINE_SECONDS)
+        except asyncio.TimeoutError:
+            raise _AuthV2Failure("auth_v2_timeout") from None
+        if incoming.type is aiohttp.WSMsgType.BINARY:
+            raise _AuthV2Failure("auth_v2_binary")
+        if incoming.type in {
+            aiohttp.WSMsgType.CLOSE,
+            aiohttp.WSMsgType.CLOSING,
+            aiohttp.WSMsgType.CLOSED,
+            aiohttp.WSMsgType.ERROR,
+        }:
+            raise _AuthV2Failure("auth_v2_close")
+        if incoming.type is not aiohttp.WSMsgType.TEXT or type(incoming.data) is not str:
+            raise _AuthV2Failure("auth_v2_malformed")
+        return incoming.data
 
     async def orders_subscribe(self) -> None:
         if self._socket is None:
@@ -1088,11 +1159,32 @@ async def _execute(
             _none,
             dependencies.crash_hook,
         )
+        auth_raw = await _phase(
+            ledger,
+            "auth_v2_receive",
+            transport.auth_v2_receive,
+            _identity,
+            dependencies.crash_hook,
+        )
+        auth_parsed = await _phase(
+            ledger,
+            "auth_v2_parse",
+            lambda: _parse_auth_v2(auth_raw),
+            _identity,
+            dependencies.crash_hook,
+        )
+        auth_validated = await _phase(
+            ledger,
+            "auth_v2_validate",
+            lambda: _validate_auth_v2_schema(auth_parsed),
+            _identity,
+            dependencies.crash_hook,
+        )
         await _phase(
             ledger,
-            "auth_v2_ack",
-            transport.auth_v2_ack,
-            lambda value: (PrivateReadPreflight._validate_auth_frame(value), value)[1],
+            "auth_v2_status",
+            lambda: _require_auth_v2_success(auth_validated),
+            _identity,
             dependencies.crash_hook,
         )
         await _phase(
@@ -1231,6 +1323,9 @@ async def _run(dependencies: _Dependencies) -> OperationalReport:
         except asyncio.CancelledError:
             result = Result.UNKNOWN
             reason = "cancelled"
+        except _AuthV2Failure as failure:
+            result = Result.UNKNOWN
+            reason = failure.reason
         except Exception:
             result = Result.UNKNOWN if ledger.has_mismatch() else Result.BLOCKED
             reason = "validation_failed"

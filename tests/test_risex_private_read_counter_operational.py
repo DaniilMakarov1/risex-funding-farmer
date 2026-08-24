@@ -80,10 +80,14 @@ class SyntheticSource:
 
 
 class SyntheticTransport:
-    def __init__(self, calls: list[str], *, public_mutator=None) -> None:
+    def __init__(
+        self, calls: list[str], *, public_mutator=None,
+        auth_response='{"method":"auth_v2","status":"success"}',
+    ) -> None:
         self._calls = calls
         self._public_index = 0
         self._public_mutator = public_mutator
+        self._auth_response = auth_response
 
     async def public_get(self, index: int) -> HttpResponse:
         round_name = "a" if self._public_index < 9 else "b"
@@ -113,9 +117,9 @@ class SyntheticTransport:
         assert frame["params"]["account"] == ACCOUNT
         assert frame["params"]["signer"] == SIGNER
 
-    async def auth_v2_ack(self):
-        self._calls.append("auth_v2_ack")
-        return {"method": "auth_v2", "status": "success"}
+    async def auth_v2_receive(self):
+        self._calls.append("auth_v2_receive")
+        return self._auth_response
 
     async def orders_subscribe(self) -> None:
         self._calls.append("orders_subscribe")
@@ -147,6 +151,31 @@ class SyntheticTransport:
 
     async def close(self) -> None:
         self._calls.append("transport_close")
+
+
+class _AuthReceiveSocket:
+    def __init__(self, message=None, *, timeout=False) -> None:
+        self._message = message
+        self._timeout = timeout
+        self.receives = 0
+
+    async def receive(self, **_kwargs):
+        self.receives += 1
+        if self._timeout:
+            raise asyncio.TimeoutError
+        return self._message
+
+
+class _AuthReceiveTransport(SyntheticTransport):
+    def __init__(self, calls, socket) -> None:
+        super().__init__(calls)
+        self._auth_socket = socket
+
+    async def auth_v2_receive(self):
+        self._calls.append("auth_v2_receive")
+        transport = object.__new__(FixedRisexPrivateReadTransport)
+        transport._socket = self._auth_socket
+        return await transport.auth_v2_receive()
 
 
 class _Body:
@@ -224,7 +253,7 @@ def test_production_transport_and_capability_surfaces_are_narrow():
     assert public_transport == {
         "REST_ORIGIN", "WS_URL", "TRUST_ENV", "ALLOW_REDIRECTS",
         "DEADLINE_SECONDS", "PUBLIC_REQUEST_COUNT", "public_get", "nonce_get",
-        "auth_v2_dispatch", "auth_v2_ack", "orders_subscribe", "orders_snapshot",
+        "auth_v2_dispatch", "auth_v2_receive", "orders_subscribe", "orders_snapshot",
         "positions_subscribe", "positions_snapshot", "close",
     }
     source = Path(__file__).parents[1] / "src/risex_farmer/risex_private_read_operational.py"
@@ -367,7 +396,7 @@ async def test_success_has_exact_sequence_full_counters_and_agreeing_barriers(tm
     assert calls[:9] == [f"public_a_{index:02d}" for index in range(1, 10)]
     assert calls[9:21] == [
         "source_load", "capability_open", "derive", "nonce_get", "sign",
-        "auth_v2_dispatch", "auth_v2_ack", "orders_subscribe", "orders_snapshot",
+        "auth_v2_dispatch", "auth_v2_receive", "orders_subscribe", "orders_snapshot",
         "positions_subscribe", "positions_snapshot", "capability_close",
     ]
     assert calls[21:30] == [f"public_b_{index:02d}" for index in range(1, 10)]
@@ -382,6 +411,90 @@ async def test_success_has_exact_sequence_full_counters_and_agreeing_barriers(tm
         assert database.execute("PRAGMA user_version").fetchone() == (1,)
     finally:
         database.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raw", "reason", "failed_phase"),
+    (
+        ('{"method":"auth_v2",', "auth_v2_malformed", "auth_v2_parse"),
+        ('{"method":"auth_v2","status":"success","status":"error"}',
+         "auth_v2_malformed", "auth_v2_parse"),
+        ('{"method":"auth_v2","status":"success","extra":true}',
+         "auth_v2_schema_invalid", "auth_v2_validate"),
+        ('{"method":"auth","status":"success"}',
+         "auth_v2_schema_invalid", "auth_v2_validate"),
+        ('{"method":"auth_v2","status":"unknown"}',
+         "auth_v2_schema_invalid", "auth_v2_validate"),
+        ('{"method":"auth_v2","status":"error"}',
+         "auth_v2_error", "auth_v2_status"),
+    ),
+)
+async def test_auth_ack_failures_are_durable_redacted_and_never_subscribe(
+    tmp_path, raw, reason, failed_phase,
+):
+    calls: list[str] = []
+    report = await _run_fixture(dependencies(
+        tmp_path,
+        calls,
+        transport_factory=lambda: SyntheticTransport(calls, auth_response=raw),
+    ))
+    assert report.result is Result.UNKNOWN and report.reason == reason
+    assert report.counters["auth_v2_receive"] == {"attempts": 1, "completions": 1}
+    assert report.counters[failed_phase] == {"attempts": 1, "completions": 0}
+    assert "orders_subscribe" not in calls and "positions_subscribe" not in calls
+    persisted = (tmp_path / "fixture.sqlite3").read_bytes().decode("latin1")
+    assert raw not in persisted
+
+    restart_calls: list[str] = []
+    restarted = await _run_fixture(dependencies(
+        tmp_path,
+        restart_calls,
+        source_factory=lambda: (_ for _ in ()).throw(AssertionError("source")),
+        transport_factory=lambda: (_ for _ in ()).throw(AssertionError("transport")),
+    ))
+    assert restarted == report and restart_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message_type", "timeout", "reason"),
+    (
+        (None, True, "auth_v2_timeout"),
+        (operational.aiohttp.WSMsgType.CLOSE, False, "auth_v2_close"),
+        (operational.aiohttp.WSMsgType.ERROR, False, "auth_v2_close"),
+        (operational.aiohttp.WSMsgType.BINARY, False, "auth_v2_binary"),
+    ),
+)
+async def test_auth_receive_outcomes_are_durable_redacted_and_terminal(
+    tmp_path, message_type, timeout, reason,
+):
+    calls: list[str] = []
+    secret = "server-controlled-frame-data"
+    message = None if timeout else type(
+        "Message", (), {"type": message_type, "data": secret},
+    )()
+    socket = _AuthReceiveSocket(message, timeout=timeout)
+    report = await _run_fixture(dependencies(
+        tmp_path,
+        calls,
+        transport_factory=lambda: _AuthReceiveTransport(calls, socket),
+    ))
+    assert report.result is Result.UNKNOWN and report.reason == reason
+    assert report.counters["auth_v2_receive"] == {"attempts": 1, "completions": 0}
+    assert socket.receives == 1
+    assert "orders_subscribe" not in calls and "positions_subscribe" not in calls
+    persisted = (tmp_path / "fixture.sqlite3").read_bytes().decode("latin1")
+    assert secret not in persisted and secret not in json.dumps(report.as_dict())
+
+    restart_calls: list[str] = []
+    restarted = await _run_fixture(dependencies(
+        tmp_path,
+        restart_calls,
+        source_factory=lambda: (_ for _ in ()).throw(AssertionError("source")),
+        transport_factory=lambda: (_ for _ in ()).throw(AssertionError("transport")),
+    ))
+    assert restarted == report and restart_calls == []
 
 
 @pytest.mark.asyncio
