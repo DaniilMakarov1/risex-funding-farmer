@@ -723,6 +723,23 @@ class PrivateReadPreflight:
     def _validate_private_snapshot(
         frame: Any, *, channel: str, count_field: str, now: float,
     ) -> None:
+        data, worker_timestamp = PrivateReadPreflight._decode_private_snapshot(
+            frame, channel=channel, count_field=count_field,
+        )
+        if channel == "orders":
+            if data:
+                raise ValueError("private state not flat")
+        elif channel == "positions":
+            sizes = PrivateReadPreflight._decode_position_sizes(data)
+            PrivateReadPreflight._validate_position_sizes_flat(sizes)
+        else:
+            raise ValueError("private identity mismatch")
+        PrivateReadPreflight._validate_snapshot_freshness(worker_timestamp, now)
+
+    @staticmethod
+    def _decode_private_snapshot(
+        frame: Any, *, channel: str, count_field: str,
+    ) -> tuple[tuple[Any, ...], str]:
         expected = _mapping(
             frame,
             {"method", "channel", "type", "data", count_field, "worker_timestamp"},
@@ -746,10 +763,35 @@ class PrivateReadPreflight:
             or int(worker_timestamp) <= 0
         ):
             raise ValueError("invalid worker timestamp")
-        age_ns = Decimal(str(now)) * Decimal(1_000_000_000) - Decimal(
-            worker_timestamp
+        return tuple(data), worker_timestamp
+
+    @staticmethod
+    def _decode_position_sizes(data: tuple[Any, ...]) -> tuple[Decimal, ...]:
+        sizes: list[Decimal] = []
+        markets: set[int] = set()
+        for value in data:
+            row = _mapping(value)
+            if not {"account", "market_id", "size"} <= set(row):
+                raise ValueError("invalid position schema")
+            if _address(row.get("account")) != ACCOUNT:
+                raise ValueError("private identity mismatch")
+            market_id = _canonical_uint(row.get("market_id"), bits=16)
+            if market_id <= 0 or market_id in markets:
+                raise ValueError("private identity mismatch")
+            markets.add(market_id)
+            sizes.append(_decimal(row.get("size")))
+        return tuple(sizes)
+
+    @staticmethod
+    def _validate_position_sizes_flat(sizes: tuple[Decimal, ...]) -> None:
+        if any(size != 0 for size in sizes):
+            raise ValueError("private state not flat")
+
+    @staticmethod
+    def _validate_snapshot_freshness(worker_timestamp: str, now: float) -> None:
+        current = _finite_time(now)
+        age_ns = Decimal(str(current)) * Decimal(1_000_000_000) - Decimal(
+            worker_timestamp,
         )
         if age_ns < 0 or age_ns > Decimal(MAX_AGE_SECONDS * 1_000_000_000):
             raise ValueError("stale worker timestamp")
-        if data:
-            raise ValueError("private state not flat")

@@ -43,7 +43,7 @@ STORE_BASENAME = ".risex-funding-farmer-risex-private-read-20260824-new-op-005.s
 FIXED_STORE_PATH = Path(
     "/Users/daniilmakarov/.risex-funding-farmer-risex-private-read-20260824-new-op-005.sqlite3"
 )
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _APPLICATION_ID = 0x52585052
 _MAX_BYTES = 1_048_576
 _DEADLINE_SECONDS = 5
@@ -76,7 +76,12 @@ _PRIVATE_COUNTERS = (
     "orders_subscribe",
     "orders_snapshot",
     "positions_subscribe",
-    "positions_snapshot",
+    "positions_receive",
+    "positions_parse",
+    "positions_schema",
+    "positions_flat",
+    "positions_freshness",
+    "positions_followup_guard",
     "capability_close",
 )
 _PUBLIC_B_COUNTERS = tuple(
@@ -102,11 +107,19 @@ _REASON_VALUES = frozenset({
     "auth_v2_malformed",
     "auth_v2_schema_invalid",
     "auth_v2_error",
+    "positions_timeout",
+    "positions_close",
+    "positions_binary",
+    "positions_malformed",
+    "positions_schema_invalid",
+    "positions_not_flat",
+    "positions_stale",
+    "positions_followup_frame",
 })
 _LEDGER_SCHEMA = (
     "CREATE TABLE run ("
     "singleton INTEGER PRIMARY KEY CHECK(singleton=1),"
-    "schema_version INTEGER NOT NULL CHECK(schema_version=2),"
+    "schema_version INTEGER NOT NULL CHECK(schema_version=3),"
     "invocation_id TEXT NOT NULL CHECK(length(invocation_id)>0),"
     "store_path_sha256 TEXT NOT NULL CHECK(length(store_path_sha256)=64),"
     "state TEXT NOT NULL CHECK(state IN "
@@ -172,6 +185,16 @@ class _AuthV2Failure(Exception):
     def __init__(self, reason: str) -> None:
         if reason not in _REASON_VALUES or not reason.startswith("auth_v2_"):
             raise ValueError("auth_v2 failure reason")
+        self.reason = reason
+        super().__init__(reason)
+
+
+class _PositionsFailure(Exception):
+    """Fixed redacted positions outcome; never carries server-controlled data."""
+
+    def __init__(self, reason: str) -> None:
+        if reason not in _REASON_VALUES or not reason.startswith("positions_"):
+            raise ValueError("positions failure reason")
         self.reason = reason
         super().__init__(reason)
 
@@ -466,6 +489,9 @@ class DurableCounterLedger:
             "validation_failed", "cancelled", "interrupted_nonterminal",
             "auth_v2_timeout", "auth_v2_close", "auth_v2_binary",
             "auth_v2_malformed", "auth_v2_schema_invalid", "auth_v2_error",
+            "positions_timeout", "positions_close", "positions_binary",
+            "positions_malformed", "positions_schema_invalid",
+            "positions_not_flat", "positions_stale", "positions_followup_frame",
         }:
             raise ValueError("unknown invariant")
 
@@ -888,6 +914,15 @@ def _parse_auth_v2(raw: Any) -> Any:
         raise _AuthV2Failure("auth_v2_malformed") from None
 
 
+def _parse_positions_snapshot(raw: Any) -> Any:
+    if type(raw) is not str:
+        raise _PositionsFailure("positions_malformed")
+    try:
+        return _strict_json(raw.encode("utf-8", errors="strict"))
+    except Exception:
+        raise _PositionsFailure("positions_malformed") from None
+
+
 def _validate_auth_v2_schema(value: Any) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise _AuthV2Failure("auth_v2_schema_invalid")
@@ -1052,15 +1087,40 @@ class FixedRisexPrivateReadTransport:
             {"method": "subscribe", "params": {"channel": "positions"}}
         )
 
-    async def positions_snapshot(self) -> Any:
-        value = await self._receive()
+    async def positions_receive(self) -> str:
+        if self._socket is None:
+            raise ValueError("private transport rejected")
+        try:
+            incoming = await self._socket.receive(timeout=_DEADLINE_SECONDS)
+        except asyncio.TimeoutError:
+            raise _PositionsFailure("positions_timeout") from None
+        except Exception:
+            raise _PositionsFailure("positions_close") from None
+        if incoming.type is aiohttp.WSMsgType.BINARY:
+            raise _PositionsFailure("positions_binary")
+        if incoming.type in {
+            aiohttp.WSMsgType.CLOSE,
+            aiohttp.WSMsgType.CLOSING,
+            aiohttp.WSMsgType.CLOSED,
+            aiohttp.WSMsgType.ERROR,
+        }:
+            raise _PositionsFailure("positions_close")
+        if incoming.type is not aiohttp.WSMsgType.TEXT or type(incoming.data) is not str:
+            raise _PositionsFailure("positions_malformed")
+        return incoming.data
+
+    async def positions_followup_guard(self) -> None:
+        if self._socket is None:
+            raise ValueError("private transport rejected")
         try:
             extra = await self._socket.receive(timeout=0.01)
         except asyncio.TimeoutError:
-            extra = None
+            return None
+        except Exception:
+            raise _PositionsFailure("positions_close") from None
         if extra is not None:
-            raise ValueError("private transport rejected")
-        return value
+            raise _PositionsFailure("positions_followup_frame")
+        return None
 
     async def close(self) -> None:
         if self._socket is not None:
@@ -1387,13 +1447,48 @@ async def _execute(
             _none,
             dependencies.crash_hook,
         )
+        positions_raw = await _phase(
+            ledger,
+            "positions_receive",
+            transport.positions_receive,
+            _identity,
+            dependencies.crash_hook,
+        )
+        positions_parsed = await _phase(
+            ledger,
+            "positions_parse",
+            lambda: _parse_positions_snapshot(positions_raw),
+            _identity,
+            dependencies.crash_hook,
+        )
+        positions_decoded = await _phase(
+            ledger,
+            "positions_schema",
+            lambda: _decode_positions_snapshot(positions_parsed),
+            _identity,
+            dependencies.crash_hook,
+        )
+        positions_flat = await _phase(
+            ledger,
+            "positions_flat",
+            lambda: _validate_positions_flat(positions_decoded),
+            _identity,
+            dependencies.crash_hook,
+        )
         await _phase(
             ledger,
-            "positions_snapshot",
-            transport.positions_snapshot,
-            lambda value: _validate_positions_snapshot(
-                value, validator._now(), private_started,
+            "positions_freshness",
+            lambda: _validate_positions_freshness(
+                positions_flat, validator._now(), private_started,
             ),
+            _identity,
+            dependencies.crash_hook,
+        )
+        await _phase(
+            ledger,
+            "positions_followup_guard",
+            transport.positions_followup_guard,
+            _none,
             dependencies.crash_hook,
         )
     except _SimulatedProcessDeath:
@@ -1427,17 +1522,38 @@ def _raise(message: str) -> Any:
     raise ValueError(message)
 
 
-def _validate_positions_snapshot(value: Any, now: float, started_at: float) -> Any:
-    PrivateReadPreflight._validate_private_snapshot(
-        value,
-        channel="positions",
-        count_field="position_count",
-        now=now,
-    )
-    elapsed = now - started_at
-    if not math.isfinite(elapsed) or elapsed < 0 or elapsed > MAX_AGE_SECONDS:
-        raise ValueError("private observation stale")
-    return value
+def _decode_positions_snapshot(value: Any) -> tuple[tuple[Any, ...], str]:
+    try:
+        data, worker_timestamp = PrivateReadPreflight._decode_private_snapshot(
+            value, channel="positions", count_field="position_count",
+        )
+        sizes = PrivateReadPreflight._decode_position_sizes(data)
+    except Exception:
+        raise _PositionsFailure("positions_schema_invalid") from None
+    return sizes, worker_timestamp
+
+
+def _validate_positions_flat(
+    decoded: tuple[tuple[Any, ...], str],
+) -> tuple[tuple[Any, ...], str]:
+    try:
+        PrivateReadPreflight._validate_position_sizes_flat(decoded[0])
+    except Exception:
+        raise _PositionsFailure("positions_not_flat") from None
+    return decoded
+
+
+def _validate_positions_freshness(
+    decoded: tuple[tuple[Any, ...], str], now: float, started_at: float,
+) -> tuple[tuple[Any, ...], str]:
+    try:
+        PrivateReadPreflight._validate_snapshot_freshness(decoded[1], now)
+        elapsed = now - started_at
+        if not math.isfinite(elapsed) or elapsed < 0 or elapsed > MAX_AGE_SECONDS:
+            raise ValueError("private observation stale")
+    except Exception:
+        raise _PositionsFailure("positions_stale") from None
+    return decoded
 
 
 def _open_exact_capability(source: Any) -> Any:
@@ -1497,6 +1613,9 @@ async def _run(dependencies: _Dependencies) -> OperationalReport:
             result = Result.UNKNOWN
             reason = "cancelled"
         except _AuthV2Failure as failure:
+            result = Result.UNKNOWN
+            reason = failure.reason
+        except _PositionsFailure as failure:
             result = Result.UNKNOWN
             reason = failure.reason
         except Exception:

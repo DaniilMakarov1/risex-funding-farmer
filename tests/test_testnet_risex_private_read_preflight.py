@@ -296,6 +296,65 @@ def test_exact_official_empty_private_snapshots_are_accepted():
     PrivateReadPreflight._validate_private_frames(private_frames(), NOW)
 
 
+def test_official_closed_position_row_is_authoritatively_flat():
+    closed = {
+        "account": ACCOUNT,
+        "market_id": "1",
+        "size": "0",
+        "quote_amount": "0",
+        "side": "SELL",
+        "margin_mode": 0,
+        "leverage": "11",
+        "avg_entry_price": "0",
+        "isolated_usdc_balance": "0",
+        "last_funding_payment": "-1.25",
+        "unsettled_funding": "0",
+        "block_number": "0",
+        "log_index": "0",
+        "worker_timestamp": "0",
+    }
+    PrivateReadPreflight._validate_private_frames(
+        private_frames(positions=(closed,)), NOW,
+    )
+
+
+@pytest.mark.parametrize("mutation", (
+    "nonzero", "invalid_size", "account", "market", "duplicate_market",
+))
+def test_position_rows_fail_closed_on_nonflat_or_invalid_identity(mutation):
+    closed = {
+        "account": ACCOUNT,
+        "market_id": "1",
+        "size": "0",
+    }
+    rows = [closed]
+    if mutation == "nonzero":
+        closed["size"] = "-0.000001"
+    elif mutation == "invalid_size":
+        closed["size"] = "not-decimal"
+    elif mutation == "account":
+        closed["account"] = "0x" + "22" * 20
+    elif mutation == "market":
+        closed["market_id"] = "0"
+    else:
+        rows.append(dict(closed))
+    with pytest.raises(ValueError):
+        PrivateReadPreflight._validate_private_frames(
+            private_frames(positions=tuple(rows)), NOW,
+        )
+
+
+def test_checksum_case_account_and_negative_zero_are_flat():
+    closed = {
+        "account": "0x" + ACCOUNT[2:].upper(),
+        "market_id": "1",
+        "size": "-0",
+    }
+    PrivateReadPreflight._validate_private_frames(
+        private_frames(positions=(closed,)), NOW,
+    )
+
+
 @pytest.mark.parametrize("case", [
     "fabricated", "extra", "count", "timestamp", "channel", "type",
 ])

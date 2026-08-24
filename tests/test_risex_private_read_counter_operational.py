@@ -39,6 +39,35 @@ from tests.test_testnet_risex_private_read_preflight import NOW, public_bodies
 
 
 SIGNATURE = "0x" + "11" * 65
+OFFICIAL_CLOSED_POSITION = {
+    "account": ACCOUNT,
+    "market_id": "1",
+    "size": "0",
+    "quote_amount": "0",
+    "side": "SELL",
+    "margin_mode": 0,
+    "leverage": "11",
+    "avg_entry_price": "0",
+    "isolated_usdc_balance": "0",
+    "last_funding_payment": "-1.25",
+    "unsettled_funding": "0",
+    "block_number": "0",
+    "log_index": "0",
+    "worker_timestamp": "0",
+}
+
+
+def positions_frame(*rows, **changes):
+    value = {
+        "method": "snapshot",
+        "channel": "positions",
+        "type": "snapshot",
+        "data": list(rows),
+        "position_count": len(rows),
+        "worker_timestamp": str(int(NOW * 1_000_000_000)),
+    }
+    value.update(changes)
+    return json.dumps(value, separators=(",", ":"))
 
 
 class SyntheticSignOnlyCapability:
@@ -83,11 +112,13 @@ class SyntheticTransport:
     def __init__(
         self, calls: list[str], *, public_mutator=None,
         auth_response='{"method":"auth_v2","status":"success"}',
+        positions_response=None,
     ) -> None:
         self._calls = calls
         self._public_index = 0
         self._public_mutator = public_mutator
         self._auth_response = auth_response
+        self._positions_response = positions_response
 
     async def public_get(self, index: int) -> HttpResponse:
         round_name = "a" if self._public_index < 9 else "b"
@@ -138,16 +169,22 @@ class SyntheticTransport:
     async def positions_subscribe(self) -> None:
         self._calls.append("positions_subscribe")
 
-    async def positions_snapshot(self):
-        self._calls.append("positions_snapshot")
-        return {
+    async def positions_receive(self):
+        self._calls.append("positions_receive")
+        value = self._positions_response
+        if value is not None:
+            return value
+        return json.dumps({
             "method": "snapshot",
             "channel": "positions",
             "type": "snapshot",
             "data": [],
             "position_count": 0,
             "worker_timestamp": str(int(NOW * 1_000_000_000)),
-        }
+        }, separators=(",", ":"))
+
+    async def positions_followup_guard(self) -> None:
+        self._calls.append("positions_followup_guard")
 
     async def close(self) -> None:
         self._calls.append("transport_close")
@@ -176,6 +213,38 @@ class _AuthReceiveTransport(SyntheticTransport):
         transport = object.__new__(FixedRisexPrivateReadTransport)
         transport._socket = self._auth_socket
         return await transport.auth_v2_receive()
+
+
+class _SequenceSocket:
+    def __init__(self, *outcomes) -> None:
+        self._outcomes = list(outcomes)
+        self.receives = 0
+
+    async def receive(self, **_kwargs):
+        self.receives += 1
+        outcome = self._outcomes.pop(0)
+        if outcome is asyncio.TimeoutError:
+            raise asyncio.TimeoutError
+        return outcome
+
+
+class _PositionsSocketTransport(SyntheticTransport):
+    def __init__(self, calls, socket) -> None:
+        super().__init__(calls)
+        self._positions_socket = socket
+
+    def _fixed(self):
+        transport = object.__new__(FixedRisexPrivateReadTransport)
+        transport._socket = self._positions_socket
+        return transport
+
+    async def positions_receive(self):
+        self._calls.append("positions_receive")
+        return await self._fixed().positions_receive()
+
+    async def positions_followup_guard(self):
+        self._calls.append("positions_followup_guard")
+        return await self._fixed().positions_followup_guard()
 
 
 class _Body:
@@ -254,7 +323,7 @@ def test_production_transport_and_capability_surfaces_are_narrow():
         "REST_ORIGIN", "WS_URL", "TRUST_ENV", "ALLOW_REDIRECTS",
         "DEADLINE_SECONDS", "PUBLIC_REQUEST_COUNT", "public_get", "nonce_get",
         "auth_v2_dispatch", "auth_v2_receive", "orders_subscribe", "orders_snapshot",
-        "positions_subscribe", "positions_snapshot", "close",
+        "positions_subscribe", "positions_receive", "positions_followup_guard", "close",
     }
     source = Path(__file__).parents[1] / "src/risex_farmer/risex_private_read_operational.py"
     text = source.read_text()
@@ -394,14 +463,17 @@ async def test_success_has_exact_sequence_full_counters_and_agreeing_barriers(tm
     assert report.auth_v2_shape_sha256 is None
     assert report.barrier_a_fingerprint == report.barrier_b_fingerprint
     assert set(report.counters) == set(_COUNTER_NAMES)
+    assert len(_COUNTER_NAMES) == 41
+    assert len(operational._PRIVATE_COUNTERS) == 21
     assert all(value == {"attempts": 1, "completions": 1} for value in report.counters.values())
     assert calls[:9] == [f"public_a_{index:02d}" for index in range(1, 10)]
-    assert calls[9:21] == [
+    assert calls[9:22] == [
         "source_load", "capability_open", "derive", "nonce_get", "sign",
         "auth_v2_dispatch", "auth_v2_receive", "orders_subscribe", "orders_snapshot",
-        "positions_subscribe", "positions_snapshot", "capability_close",
+        "positions_subscribe", "positions_receive", "positions_followup_guard",
+        "capability_close",
     ]
-    assert calls[21:30] == [f"public_b_{index:02d}" for index in range(1, 10)]
+    assert calls[22:31] == [f"public_b_{index:02d}" for index in range(1, 10)]
     assert calls[-2:] == ["source_close", "transport_close"]
     assert path.stat().st_mode & 0o777 == 0o600
     persisted = path.read_bytes().decode("latin1")
@@ -410,7 +482,7 @@ async def test_success_has_exact_sequence_full_counters_and_agreeing_barriers(tm
     database = sqlite3.connect(path)
     try:
         assert database.execute("PRAGMA integrity_check").fetchone() == ("ok",)
-        assert database.execute("PRAGMA user_version").fetchone() == (2,)
+        assert database.execute("PRAGMA user_version").fetchone() == (3,)
     finally:
         database.close()
 
@@ -797,6 +869,197 @@ async def test_auth_receive_outcomes_are_durable_redacted_and_terminal(
 
 
 @pytest.mark.asyncio
+async def test_official_closed_position_row_completes_split_positions_phases(tmp_path):
+    calls: list[str] = []
+    raw = positions_frame(OFFICIAL_CLOSED_POSITION)
+    report = await _run_fixture(dependencies(
+        tmp_path,
+        calls,
+        transport_factory=lambda: SyntheticTransport(
+            calls, positions_response=raw,
+        ),
+    ))
+    assert report.result is Result.PASSED and report.reason == "complete"
+    for phase in (
+        "positions_receive", "positions_parse", "positions_schema",
+        "positions_flat", "positions_freshness", "positions_followup_guard",
+    ):
+        assert report.counters[phase] == {"attempts": 1, "completions": 1}
+    persisted = (tmp_path / "fixture.sqlite3").read_bytes().decode("latin1")
+    assert raw not in persisted
+    assert ACCOUNT not in persisted
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raw", "reason", "failed_phase"),
+    (
+        ('{"method":"snapshot",', "positions_malformed", "positions_parse"),
+        (positions_frame(method="update"),
+         "positions_schema_invalid", "positions_schema"),
+        (positions_frame(position_count=1),
+         "positions_schema_invalid", "positions_schema"),
+        (positions_frame(extra=True),
+         "positions_schema_invalid", "positions_schema"),
+        (positions_frame(worker_timestamp="0"),
+         "positions_schema_invalid", "positions_schema"),
+        (positions_frame({**OFFICIAL_CLOSED_POSITION, "account": "0x" + "22" * 20}),
+         "positions_schema_invalid", "positions_schema"),
+        (positions_frame({**OFFICIAL_CLOSED_POSITION, "market_id": "0"}),
+         "positions_schema_invalid", "positions_schema"),
+        (positions_frame({**OFFICIAL_CLOSED_POSITION, "size": "not-decimal"}),
+         "positions_schema_invalid", "positions_schema"),
+        (positions_frame({**OFFICIAL_CLOSED_POSITION, "size": "0.000001"}),
+         "positions_not_flat", "positions_flat"),
+        (positions_frame(worker_timestamp="1"),
+         "positions_stale", "positions_freshness"),
+        (positions_frame(worker_timestamp=str(int((NOW + 6) * 1_000_000_000))),
+         "positions_stale", "positions_freshness"),
+    ),
+)
+async def test_positions_failures_are_split_redacted_and_terminal(
+    tmp_path, raw, reason, failed_phase,
+):
+    calls: list[str] = []
+    report = await _run_fixture(dependencies(
+        tmp_path,
+        calls,
+        transport_factory=lambda: SyntheticTransport(calls, positions_response=raw),
+    ))
+    assert report.result is Result.UNKNOWN and report.reason == reason
+    assert report.counters[failed_phase] == {"attempts": 1, "completions": 0}
+    ordered = (
+        "positions_receive", "positions_parse", "positions_schema",
+        "positions_flat", "positions_freshness", "positions_followup_guard",
+    )
+    for phase in ordered[ordered.index(failed_phase) + 1:]:
+        assert report.counters[phase] == {"attempts": 0, "completions": 0}
+    assert report.counters["capability_close"] == {"attempts": 1, "completions": 1}
+    assert report.counters["terminal_persist"] == {"attempts": 1, "completions": 1}
+    assert report.auth_v2_shape is None and report.auth_v2_shape_sha256 is None
+    assert not any(call.startswith("public_b_") for call in calls)
+    persisted = (tmp_path / "fixture.sqlite3").read_bytes().decode("latin1")
+    assert raw not in persisted
+    assert ACCOUNT not in persisted
+
+    restart_calls: list[str] = []
+    restarted = await _run_fixture(dependencies(
+        tmp_path,
+        restart_calls,
+        source_factory=lambda: (_ for _ in ()).throw(AssertionError("source")),
+        transport_factory=lambda: (_ for _ in ()).throw(AssertionError("transport")),
+    ))
+    assert restarted == report and restart_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message_type", "timeout", "reason"),
+    (
+        (None, True, "positions_timeout"),
+        (operational.aiohttp.WSMsgType.CLOSE, False, "positions_close"),
+        (operational.aiohttp.WSMsgType.ERROR, False, "positions_close"),
+        (operational.aiohttp.WSMsgType.BINARY, False, "positions_binary"),
+        (operational.aiohttp.WSMsgType.PING, False, "positions_malformed"),
+    ),
+)
+async def test_positions_receive_outcomes_are_fixed_redacted_and_terminal(
+    tmp_path, message_type, timeout, reason,
+):
+    calls: list[str] = []
+    secret = "positions-server-controlled-frame-data"
+    outcome = asyncio.TimeoutError if timeout else type(
+        "Message", (), {"type": message_type, "data": secret},
+    )()
+    socket = _SequenceSocket(outcome)
+    report = await _run_fixture(dependencies(
+        tmp_path,
+        calls,
+        transport_factory=lambda: _PositionsSocketTransport(calls, socket),
+    ))
+    assert report.result is Result.UNKNOWN and report.reason == reason
+    assert report.counters["positions_receive"] == {"attempts": 1, "completions": 0}
+    assert report.counters["positions_parse"] == {"attempts": 0, "completions": 0}
+    assert socket.receives == 1
+    persisted = (tmp_path / "fixture.sqlite3").read_bytes().decode("latin1")
+    assert secret not in persisted and secret not in json.dumps(report.as_dict())
+    assert not any(call.startswith("public_b_") for call in calls)
+
+    restart_calls: list[str] = []
+    restarted = await _run_fixture(dependencies(
+        tmp_path,
+        restart_calls,
+        source_factory=lambda: (_ for _ in ()).throw(AssertionError("source")),
+        transport_factory=lambda: (_ for _ in ()).throw(AssertionError("transport")),
+    ))
+    assert restarted == report and restart_calls == []
+
+
+@pytest.mark.asyncio
+async def test_positions_followup_frame_is_unknown_and_never_persisted(tmp_path):
+    calls: list[str] = []
+    raw = positions_frame()
+    secret = "positions-unexpected-followup-secret"
+    first = type(
+        "Message", (), {"type": operational.aiohttp.WSMsgType.TEXT, "data": raw},
+    )()
+    extra = type(
+        "Message", (), {"type": operational.aiohttp.WSMsgType.TEXT, "data": secret},
+    )()
+    socket = _SequenceSocket(first, extra)
+    report = await _run_fixture(dependencies(
+        tmp_path,
+        calls,
+        transport_factory=lambda: _PositionsSocketTransport(calls, socket),
+    ))
+    assert report.result is Result.UNKNOWN
+    assert report.reason == "positions_followup_frame"
+    assert report.counters["positions_freshness"] == {"attempts": 1, "completions": 1}
+    assert report.counters["positions_followup_guard"] == {
+        "attempts": 1, "completions": 0,
+    }
+    persisted = (tmp_path / "fixture.sqlite3").read_bytes().decode("latin1")
+    assert secret not in persisted and secret not in json.dumps(report.as_dict())
+    assert not any(call.startswith("public_b_") for call in calls)
+
+    restart_calls: list[str] = []
+    restarted = await _run_fixture(dependencies(
+        tmp_path,
+        restart_calls,
+        source_factory=lambda: (_ for _ in ()).throw(AssertionError("source")),
+        transport_factory=lambda: (_ for _ in ()).throw(AssertionError("transport")),
+    ))
+    assert restarted == report and restart_calls == []
+
+
+@pytest.mark.asyncio
+async def test_fixed_positions_receive_and_quiet_followup_complete(tmp_path):
+    calls: list[str] = []
+    raw = positions_frame(OFFICIAL_CLOSED_POSITION)
+    first = type(
+        "Message", (), {"type": operational.aiohttp.WSMsgType.TEXT, "data": raw},
+    )()
+    socket = _SequenceSocket(first, asyncio.TimeoutError)
+    report = await _run_fixture(dependencies(
+        tmp_path,
+        calls,
+        transport_factory=lambda: _PositionsSocketTransport(calls, socket),
+    ))
+    assert report.result is Result.PASSED and report.reason == "complete"
+    assert socket.receives == 2
+
+
+def test_positions_end_to_end_freshness_has_fixed_redacted_failure():
+    current = NOW + 6
+    worker_timestamp = str(int(current * 1_000_000_000))
+    with pytest.raises(operational._PositionsFailure) as failure:
+        operational._validate_positions_freshness(
+            ((), worker_timestamp), current, NOW,
+        )
+    assert failure.value.reason == "positions_stale"
+
+
+@pytest.mark.asyncio
 async def test_terminal_restart_returns_same_report_with_zero_effects(tmp_path):
     calls: list[str] = []
     first = await _run_fixture(dependencies(tmp_path, calls))
@@ -1007,7 +1270,7 @@ async def test_store_counter_schema_path_and_file_corruption_fail_without_effect
         elif mutation == "schema":
             database.execute("ALTER TABLE run ADD COLUMN unexpected TEXT")
         else:
-            database.execute("PRAGMA user_version=3")
+            database.execute("PRAGMA user_version=4")
         database.commit()
         database.close()
     elif mutation == "mode":
