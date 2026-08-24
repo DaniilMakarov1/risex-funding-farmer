@@ -2,19 +2,18 @@
 
 ## Central baseline
 
-- Local `main` is `e6bb562cc22750554ec0c69d67e6fc425a99cbe5`; Python 3.11 full suite: `1537 passed`; isolated dependency check: clean.
-- `origin/main` is still `ed6b0f076200b4f5316cd2341e8d8a3e0e16c8b1`. Publication is blocked only by missing local GitHub authentication.
-- RISEx, Nado, and Extended fixture lifecycle cores and isolated private-read operational adapters are integrated locally.
+- Published `main == origin/main == 867ac006c7f92bbbf9529ff4385b7ae1f08036fe`.
+- RISEx, Nado, and Extended fixture lifecycle cores and isolated private-read operational adapters are integrated on published `main`.
 - Paper remains the default product. No strategy execution, mainnet, real funds, deposits, or ungated private/write traffic is authorized.
 
 ## Venue readiness
 
 ### RISEx
 
-- The first operational private-read invocation ended fail closed in public barrier A: `BLOCKED — validation_failed` after exactly nine public GETs.
-- Durable counters prove zero credential loads, signatures, private requests, orders, cancels, closes, or other writes.
-- Public-only diagnosis found an official canonical zero `open_interest_limit`; the strict bounded decoder correction is accepted and integrated at `e6bb562`.
-- The consumed invocation and store are immutable and must never be reset, rearmed, or retried. A fresh identity needs a new pre-arm and operational gate.
+- The one-shot op011 private-read gate is operationally accepted on the exact published tree: schema 8, `PASSED — complete`, all 43 counters complete, both strict public sweeps complete, and the authenticated orders plus fresh official positions snapshots prove zero orders and exact flatness. Both redacted public fingerprints are canonical and may differ; all structural witnesses are null.
+- Every RISEx private-read invocation/store through op011 is consumed and immutable. None may be reset, rearmed, retried, or used as authority for a write.
+- Private-read readiness is accepted. The fixture-only bounded RISEx lifecycle is integrated, but no production live-write candidate, Builder, credential access, signature, nonce consumption, order, cancel, or close is authorized yet.
+- The sole next RISEx gate is a separate Tier C candidate for the already-approved minimum-size testnet lifecycle. Success still requires authoritative zero open orders and exact flatness; `FAILED_HALTED_MANUAL_RECOVERY` is failure and never readiness.
 
 ### Nado
 
