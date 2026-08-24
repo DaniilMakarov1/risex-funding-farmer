@@ -21,7 +21,6 @@ from risex_farmer.testnet_risex_private_read_preflight import (
     REGISTERED_AT,
     ROUTER,
     SIGNER,
-    SIGNER_EXPIRATION,
     SyntheticCredential,
     WS_ORIGIN,
     expected_url,
@@ -62,27 +61,61 @@ def public_bodies():
         }),
         "/v1/auth/signers": envelope({"signers": [{
             "signer": SIGNER,
+            "label": "RISEx Funding Farmer testnet probe",
             "status": "Active",
             "registered_at": REGISTERED_AT,
-            "expiration": SIGNER_EXPIRATION,
+            "expiration": "1790092010",
         }]}),
-        "/v1/markets": envelope({"markets": [{
-            "market_id": "1",
-            "active": True,
-            "base_asset_symbol": "BTC",
-            "quote_asset_symbol": "USDC",
-            "config": {
-                "name": "BTC/USDC",
-                "unlocked": True,
-                "step_size": "0.000001",
-                "step_price": "0.1",
-                "min_order_size": "0.0001",
-            },
-        }]}),
+        "/v1/markets": envelope({
+            "cached_at": "1787572800000000000",
+            "markets": [{
+                "accumulated_funding": "0",
+                "active": True,
+                "base_asset_symbol": "BTC/USDC",
+                "change_24h": "0.01",
+                "config": {
+                    "maintenance_margin_factor": "0.05",
+                    "max_leverage": "20",
+                    "min_order_size": "0.0001",
+                    "name": "BTC/USDC",
+                    "open_interest_limit": "1000",
+                    "quote": "USDC",
+                    "step_price": "0.1",
+                    "step_size": "0.000001",
+                    "unlocked": True,
+                },
+                "current_funding_rate": "0.0001",
+                "display_base_asset_symbol": "BTC/USDC",
+                "display_name": "BTC/USDC",
+                "funding_interval": "3600",
+                "funding_rate_8h": "0.0008",
+                "high_24h": "79000",
+                "index_price": "77963.3",
+                "last_cumulative_funding": "0",
+                "last_price": "77963.3",
+                "low_24h": "76000",
+                "mark_price": "77963.4",
+                "market_id": "1",
+                "max_position_size": "1",
+                "next_funding_time": "1787576400000000000",
+                "open_interest": "100",
+                "post_only": False,
+                "predicted_funding_rate": "0.0001",
+                "quote_asset_symbol": "USDC",
+                "quote_volume_24h": "1000000",
+                "underlying": "BTC/USDC",
+            }],
+        }),
         "/v1/orderbook": envelope({
             "market_id": "1",
-            "bids": [{"price": "77963.3", "quantity": "0.0001"}],
-            "asks": [{"price": "77963.4", "quantity": "0.0001"}],
+            "bids": [{
+                "order_count": 1, "price": "77963.3", "quantity": "0.0001",
+            }],
+            "asks": [{
+                "order_count": 1, "price": "77963.4", "quantity": "0.0001",
+            }],
+            "total_asks": "1",
+            "total_bids": "1",
         }),
         "/v1/orders/open": envelope({"orders": []}),
         "/v1/account/position": envelope({
@@ -90,6 +123,111 @@ def public_bodies():
         }),
         "/v1/positions": envelope({"positions": []}),
     }
+
+
+def current_public_contract(path):
+    return copy.deepcopy(public_bodies()[path]["data"])
+
+
+@pytest.mark.parametrize("path,validator", [
+    ("/v1/auth/signers", "_validate_signers"),
+    ("/v1/markets", "_validate_market"),
+    ("/v1/orderbook", "_validate_book"),
+])
+def test_captured_public_contract_shape_is_accepted(path, validator):
+    result = getattr(PrivateReadPreflight, validator)(current_public_contract(path), NOW)
+    assert result is not None
+
+
+@pytest.mark.parametrize("path,validator,mutation", [
+    ("/v1/auth/signers", "_validate_signers", "missing"),
+    ("/v1/auth/signers", "_validate_signers", "extra"),
+    ("/v1/auth/signers", "_validate_signers", "wrong_type"),
+    ("/v1/markets", "_validate_market", "missing"),
+    ("/v1/markets", "_validate_market", "extra"),
+    ("/v1/markets", "_validate_market", "wrong_type"),
+    ("/v1/orderbook", "_validate_book", "missing"),
+    ("/v1/orderbook", "_validate_book", "extra"),
+    ("/v1/orderbook", "_validate_book", "wrong_type"),
+])
+def test_captured_public_contract_rejects_schema_drift(path, validator, mutation):
+    data = current_public_contract(path)
+    if path == "/v1/auth/signers":
+        target = data["signers"][0]
+        field = "label"
+    elif path == "/v1/markets":
+        target = data["markets"][0]
+        field = "display_name"
+    else:
+        target = data["bids"][0]
+        field = "order_count"
+    if mutation == "missing":
+        target.pop(field)
+    elif mutation == "extra":
+        target["undocumented"] = "rejected"
+    else:
+        target[field] = True if field == "order_count" else 1
+    with pytest.raises(ValueError):
+        getattr(PrivateReadPreflight, validator)(data, NOW)
+
+
+@pytest.mark.parametrize("case", [
+    "signer_data_extra", "expiration_noncanonical", "market_data_extra",
+    "config_missing", "cached_at_wrong_type", "post_only_integer",
+    "funding_nonfinite", "book_total_noncanonical",
+    "order_count_zero", "quote_empty", "quote_nonstring",
+])
+def test_captured_public_contract_rejects_nested_and_scalar_drift(case):
+    if case.startswith("signer") or case.startswith("expiration"):
+        data = current_public_contract("/v1/auth/signers")
+        if case == "signer_data_extra":
+            data["undocumented"] = []
+        else:
+            data["signers"][0]["expiration"] = "01790092010"
+        validator = PrivateReadPreflight._validate_signers
+    elif case.startswith("book") or case.startswith("order_count"):
+        data = current_public_contract("/v1/orderbook")
+        if case == "book_total_noncanonical":
+            data["total_asks"] = "01"
+        else:
+            data["asks"][0]["order_count"] = 0
+        validator = PrivateReadPreflight._validate_book
+    else:
+        data = current_public_contract("/v1/markets")
+        if case == "market_data_extra":
+            data["undocumented"] = None
+        elif case == "config_missing":
+            data["markets"][0]["config"].pop("max_leverage")
+        elif case == "cached_at_wrong_type":
+            data["cached_at"] = 1787572800000000000
+        elif case == "post_only_integer":
+            data["markets"][0]["post_only"] = 0
+        elif case == "quote_empty":
+            data["markets"][0]["config"]["quote"] = ""
+        elif case == "quote_nonstring":
+            data["markets"][0]["config"]["quote"] = 1
+        else:
+            data["markets"][0]["current_funding_rate"] = "NaN"
+        validator = PrivateReadPreflight._validate_market
+    with pytest.raises(ValueError):
+        validator(data, NOW)
+
+
+def test_orderbook_totals_may_include_levels_before_response_limit():
+    data = current_public_contract("/v1/orderbook")
+    data["total_bids"] = "2"
+    data["total_asks"] = "3"
+    bids, asks = PrivateReadPreflight._validate_book(data, NOW)
+    assert len(bids) == len(asks) == 1
+
+
+def test_orderbook_totals_cannot_be_less_than_returned_levels():
+    data = current_public_contract("/v1/orderbook")
+    data["bids"].append({
+        "order_count": 1, "price": "77963.2", "quantity": "0.0001",
+    })
+    with pytest.raises(ValueError):
+        PrivateReadPreflight._validate_book(data, NOW)
 
 
 class PublicTransport:

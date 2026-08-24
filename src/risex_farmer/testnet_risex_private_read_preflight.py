@@ -29,7 +29,8 @@ ROUTER = "0x980b8621b8e03c3f396e1dc34c00b14d84f2a20f"
 ACCOUNT = "0x20f9153e2eeba0ff7880fb5a23e976e8b2af56ee"
 SIGNER = "0x6274d6d9f628ba89c36de4b71efa2c602b7f783b"
 REGISTERED_AT = "2026-08-23T16:40:21Z"
-SIGNER_EXPIRATION = "2026-09-22T15:46:50Z"
+SIGNER_EXPIRATION = "1790092010"
+SIGNER_LABEL = "RISEx Funding Farmer testnet probe"
 
 MAX_AGE_SECONDS = 5
 MAX_NOTIONAL = Decimal("500")
@@ -203,6 +204,19 @@ def _decimal(value: Any) -> Decimal:
     return result
 
 
+def _canonical_uint(value: Any, *, bits: int = 64) -> int:
+    if (
+        not isinstance(value, str) or not value
+        or (value != "0" and value.startswith("0")) or not value.isascii()
+        or not value.isdecimal()
+    ):
+        raise ValueError("invalid unsigned integer")
+    result = int(value)
+    if result >= 2**bits:
+        raise ValueError("invalid unsigned integer")
+    return result
+
+
 def _address(value: Any) -> str:
     if (
         not isinstance(value, str) or len(value) != 42 or not value.startswith("0x")
@@ -235,6 +249,20 @@ def _utc_timestamp(value: str) -> float:
 
 
 class PrivateReadPreflight:
+    _SIGNER_KEYS = {"expiration", "label", "registered_at", "signer", "status"}
+    _MARKET_KEYS = {
+        "accumulated_funding", "active", "base_asset_symbol", "change_24h",
+        "config", "current_funding_rate", "display_base_asset_symbol",
+        "display_name", "funding_interval", "funding_rate_8h", "high_24h",
+        "index_price", "last_cumulative_funding", "last_price", "low_24h",
+        "mark_price", "market_id", "max_position_size", "next_funding_time",
+        "open_interest", "post_only", "predicted_funding_rate",
+        "quote_asset_symbol", "quote_volume_24h", "underlying",
+    }
+    _MARKET_CONFIG_KEYS = {
+        "maintenance_margin_factor", "max_leverage", "min_order_size", "name",
+        "open_interest_limit", "quote", "step_price", "step_size", "unlocked",
+    }
     _REQUESTS = (
         ("/v1/system/config", ()),
         ("/v1/auth/eip712-domain", ()),
@@ -356,52 +384,10 @@ class PrivateReadPreflight:
             or status["status_description"] != "Active"
         ):
             raise ValueError("signer inactive")
-        signer_data = _mapping(values["/v1/auth/signers"])
-        signers = _list(signer_data.get("signers"))
-        expected_signer = {
-            "signer": SIGNER, "status": "Active", "registered_at": REGISTERED_AT,
-            "expiration": SIGNER_EXPIRATION,
-        }
-        if len(signers) != 1:
-            raise ValueError("signer mismatch")
-        signer_row = _mapping(signers[0])
-        if (
-            set(signer_row) != set(expected_signer)
-            or _address(signer_row.get("signer")) != SIGNER
-            or {key: signer_row.get(key) for key in expected_signer if key != "signer"}
-            != {key: value for key, value in expected_signer.items() if key != "signer"}
-        ):
-            raise ValueError("signer mismatch")
         now = self._now()
-        if not (_utc_timestamp(REGISTERED_AT) <= now < _utc_timestamp(SIGNER_EXPIRATION)):
-            raise ValueError("signer outside active interval")
-
-        market_data = _mapping(values["/v1/markets"])
-        markets = _list(market_data.get("markets"))
-        if len(markets) != 1:
-            raise ValueError("market mismatch")
-        market = _mapping(markets[0])
-        market_config = _mapping(market.get("config"))
-        if (
-            market.get("market_id") != "1" or market.get("active") is not True
-            or market.get("base_asset_symbol") != "BTC"
-            or market.get("quote_asset_symbol") != "USDC"
-            or set(market_config) != {
-                "name", "unlocked", "step_size", "step_price", "min_order_size",
-            }
-            or market_config.get("name") != "BTC/USDC"
-            or market_config.get("unlocked") is not True
-            or market_config.get("step_size") != "0.000001"
-            or market_config.get("step_price") != "0.1"
-            or market_config.get("min_order_size") != "0.0001"
-        ):
-            raise ValueError("market mismatch")
-
-        book = _mapping(values["/v1/orderbook"])
-        if book.get("market_id") != "1":
-            raise ValueError("book identity mismatch")
-        bids = self._levels(book.get("bids"))
-        asks = self._levels(book.get("asks"))
+        self._validate_signers(values["/v1/auth/signers"], now)
+        self._validate_market(values["/v1/markets"], now)
+        bids, asks = self._validate_book(values["/v1/orderbook"], now)
         if (
             any(left[0] <= right[0] for left, right in zip(bids, bids[1:]))
             or any(left[0] >= right[0] for left, right in zip(asks, asks[1:]))
@@ -436,11 +422,122 @@ class PrivateReadPreflight:
         return (best_bid, best_ask, tuple(bids), tuple(asks))
 
     @staticmethod
+    def _validate_signers(value: Any, now: float) -> tuple[str, int]:
+        signer_data = _mapping(value, {"signers"})
+        signers = _list(signer_data["signers"])
+        if len(signers) != 1:
+            raise ValueError("signer mismatch")
+        signer = _mapping(signers[0], PrivateReadPreflight._SIGNER_KEYS)
+        if (
+            _address(signer["signer"]) != SIGNER
+            or signer["label"] != SIGNER_LABEL
+            or signer["status"] != "Active"
+            or signer["registered_at"] != REGISTERED_AT
+            or signer["expiration"] != SIGNER_EXPIRATION
+        ):
+            raise ValueError("signer mismatch")
+        registered_at = _utc_timestamp(signer["registered_at"])
+        expiration = _canonical_uint(signer["expiration"])
+        if not registered_at <= _finite_time(now) < expiration:
+            raise ValueError("signer outside active interval")
+        return signer["signer"], expiration
+
+    @staticmethod
+    def _validate_market(value: Any, now: float) -> Mapping[str, Any]:
+        del now
+        market_data = _mapping(value, {"cached_at", "markets"})
+        if _canonical_uint(market_data["cached_at"]) == 0:
+            raise ValueError("invalid market cache time")
+        markets = _list(market_data["markets"])
+        if len(markets) != 1:
+            raise ValueError("market mismatch")
+        market = _mapping(markets[0], PrivateReadPreflight._MARKET_KEYS)
+        config = _mapping(market["config"], PrivateReadPreflight._MARKET_CONFIG_KEYS)
+        string_fields = PrivateReadPreflight._MARKET_KEYS - {
+            "active", "config", "post_only",
+        }
+        config_string_fields = PrivateReadPreflight._MARKET_CONFIG_KEYS - {"unlocked"}
+        if (
+            any(not isinstance(market[field], str) for field in string_fields)
+            or any(not isinstance(config[field], str) for field in config_string_fields)
+            or type(market["active"]) is not bool or market["active"] is not True
+            or type(market["post_only"]) is not bool
+            or type(config["unlocked"]) is not bool or config["unlocked"] is not True
+        ):
+            raise ValueError("market field type mismatch")
+        full_symbol = "BTC/USDC"
+        if (
+            market["market_id"] != "1"
+            or market["quote_asset_symbol"] != "USDC" or not config["quote"]
+            or any(market[field] != full_symbol for field in {
+                "base_asset_symbol", "display_base_asset_symbol", "display_name",
+                "underlying",
+            })
+            or config["name"] != full_symbol
+            or config["step_size"] != "0.000001"
+            or config["step_price"] != "0.1"
+            or config["min_order_size"] != "0.0001"
+        ):
+            raise ValueError("market mismatch")
+        signed_decimal_fields = {
+            "accumulated_funding", "change_24h", "current_funding_rate",
+            "funding_rate_8h", "last_cumulative_funding", "predicted_funding_rate",
+        }
+        positive_decimal_fields = {
+            "high_24h", "index_price", "last_price", "low_24h", "mark_price",
+            "max_position_size",
+        }
+        nonnegative_decimal_fields = {"open_interest", "quote_volume_24h"}
+        for field in signed_decimal_fields:
+            _decimal(market[field])
+        if any(_decimal(market[field]) <= 0 for field in positive_decimal_fields):
+            raise ValueError("nonpositive market field")
+        if any(_decimal(market[field]) < 0 for field in nonnegative_decimal_fields):
+            raise ValueError("negative market field")
+        if (
+            _canonical_uint(market["funding_interval"]) == 0
+            or _canonical_uint(market["next_funding_time"]) == 0
+        ):
+            raise ValueError("invalid market time")
+        for field in {
+            "maintenance_margin_factor", "max_leverage", "min_order_size",
+            "open_interest_limit", "step_price", "step_size",
+        }:
+            if _decimal(config[field]) <= 0:
+                raise ValueError("nonpositive market config")
+        return market
+
+    @staticmethod
+    def _validate_book(
+        value: Any, now: float,
+    ) -> tuple[tuple[tuple[Decimal, Decimal], ...], tuple[tuple[Decimal, Decimal], ...]]:
+        del now
+        book = _mapping(
+            value, {"asks", "bids", "market_id", "total_asks", "total_bids"},
+        )
+        if book["market_id"] != "1":
+            raise ValueError("book identity mismatch")
+        bids = PrivateReadPreflight._levels(book["bids"])
+        asks = PrivateReadPreflight._levels(book["asks"])
+        if (
+            _canonical_uint(book["total_bids"]) < len(bids)
+            or _canonical_uint(book["total_asks"]) < len(asks)
+        ):
+            raise ValueError("book total mismatch")
+        return bids, asks
+
+    @staticmethod
     def _levels(value: Any) -> tuple[tuple[Decimal, Decimal], ...]:
         levels = _list(value)
         parsed = []
         for raw in levels:
-            level = _mapping(raw, {"price", "quantity"})
+            level = _mapping(raw, {"order_count", "price", "quantity"})
+            if (
+                isinstance(level["order_count"], bool)
+                or not isinstance(level["order_count"], int)
+                or level["order_count"] <= 0
+            ):
+                raise ValueError("invalid order count")
             price, quantity = _decimal(level["price"]), _decimal(level["quantity"])
             if price <= 0 or quantity <= 0 or price % TICK or quantity % STEP:
                 raise ValueError("invalid book grid")
