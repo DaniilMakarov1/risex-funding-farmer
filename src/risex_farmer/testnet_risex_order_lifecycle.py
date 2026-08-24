@@ -120,8 +120,6 @@ class Intent:
     expires_at: int
     dispatch_count: int = 0
     order_id: str | None = None
-    wide_order_id: int | None = None
-    resting_order_id: int | None = None
     reconciled: bool = False
 
 
@@ -367,8 +365,6 @@ CREATE TABLE IF NOT EXISTS intents (
     expires_at INTEGER NOT NULL,
     dispatch_count INTEGER NOT NULL DEFAULT 0,
     order_id TEXT UNIQUE,
-    wide_order_id TEXT,
-    resting_order_id TEXT,
     reconciled INTEGER NOT NULL DEFAULT 0,
     UNIQUE(nonce, nonce_bitmap)
 );
@@ -409,7 +405,7 @@ class DurableIntentStore:
         try:
             with self.connection:
                 self.connection.execute(
-                    "INSERT INTO intents VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO intents VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         intent.intent_id, intent.ordinal, intent.kind,
                         str(intent.client_order_id), intent.nonce, intent.nonce_bitmap,
@@ -419,10 +415,7 @@ class DurableIntentStore:
                         int(intent.post_only), intent.market_id, str(intent.size),
                         intent.size_steps, str(intent.price), intent.price_ticks,
                         str(intent.source_position), intent.expires_at,
-                        intent.dispatch_count, intent.order_id,
-                        None if intent.wide_order_id is None else str(intent.wide_order_id),
-                        None if intent.resting_order_id is None else str(intent.resting_order_id),
-                        int(intent.reconciled),
+                        intent.dispatch_count, intent.order_id, int(intent.reconciled),
                     ),
                 )
         except sqlite3.IntegrityError:
@@ -466,11 +459,15 @@ class DurableIntentStore:
                 )
             else:
                 self.connection.execute(
-                    "UPDATE intents SET state='TERMINAL', order_id=?, wide_order_id=?, "
-                    "resting_order_id=?, reconciled=1 WHERE intent_id=?",
+                    "UPDATE intents SET state='TERMINAL', order_id=?, reconciled=1 "
+                    "WHERE intent_id=?",
+                    (record.order_id, intent_id),
+                )
+                self.connection.executemany(
+                    "INSERT OR REPLACE INTO terminal VALUES (?, ?)",
                     (
-                        record.order_id, str(record.wide_order_id),
-                        str(record.resting_order_id), intent_id,
+                        (f"wide:{intent_id}", str(record.wide_order_id)),
+                        (f"resting:{intent_id}", str(record.resting_order_id)),
                     ),
                 )
             self.connection.execute(
@@ -495,11 +492,14 @@ class DurableIntentStore:
     def _record_open_known(self, intent_id: str, record: OrderRecord) -> None:
         with self.connection:
             self.connection.execute(
-                "UPDATE intents SET state='OPEN_KNOWN', order_id=?, wide_order_id=?, "
-                "resting_order_id=? WHERE intent_id=?",
+                "UPDATE intents SET state='OPEN_KNOWN', order_id=? WHERE intent_id=?",
+                (record.order_id, intent_id),
+            )
+            self.connection.executemany(
+                "INSERT OR REPLACE INTO terminal VALUES (?, ?)",
                 (
-                    record.order_id, str(record.wide_order_id),
-                    str(record.resting_order_id), intent_id,
+                    (f"wide:{intent_id}", str(record.wide_order_id)),
+                    (f"resting:{intent_id}", str(record.resting_order_id)),
                 ),
             )
 
@@ -516,8 +516,12 @@ class DurableIntentStore:
 
     def order_identity(self, order_id: str) -> OrderRecord | None:
         row = self.connection.execute(
-            "SELECT order_id, wide_order_id, resting_order_id, client_order_id "
-            "FROM intents WHERE order_id=?", (order_id,)
+            "SELECT intents.order_id, wide.value, resting.value, "
+            "intents.client_order_id FROM intents "
+            "LEFT JOIN terminal AS wide ON wide.key='wide:' || intents.intent_id "
+            "LEFT JOIN terminal AS resting "
+            "ON resting.key='resting:' || intents.intent_id "
+            "WHERE intents.order_id=?", (order_id,)
         ).fetchone()
         if row is None or row[1] is None or row[2] is None:
             return None
@@ -660,10 +664,7 @@ def _intent(row: tuple[Any, ...]) -> Intent:
         market_id=row[14], size=Decimal(row[15]), size_steps=row[16],
         price=Decimal(row[17]), price_ticks=row[18],
         source_position=Decimal(row[19]), expires_at=row[20],
-        dispatch_count=row[21], order_id=row[22],
-        wide_order_id=None if row[23] is None else int(row[23]),
-        resting_order_id=None if row[24] is None else int(row[24]),
-        reconciled=bool(row[25]),
+        dispatch_count=row[21], order_id=row[22], reconciled=bool(row[23]),
     )
 
 
@@ -1074,10 +1075,10 @@ class Lifecycle:
         )
         if expected_record is not None and any(record != expected_record for record in order_records):
             self._reject(halt=True)
-        if expected_record is not None and (
-            current.wide_order_id not in {None, expected_record.wide_order_id}
-            or current.resting_order_id not in {None, expected_record.resting_order_id}
-        ):
+        bound_record = (
+            None if expected is None else self.store.order_identity(expected)
+        )
+        if bound_record is not None and expected_record != bound_record:
             self._reject(halt=True)
         if evidence.open_orders:
             open_known = (

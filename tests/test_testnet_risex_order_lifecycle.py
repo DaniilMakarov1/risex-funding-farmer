@@ -1073,10 +1073,9 @@ def test_official_order_identity_chain_contract_is_explicit(lifecycle):
         OPENING_ORDER, 101, open_ids=(OPENING_ORDER,), terminal=False,
     )
     assert lifecycle.reconcile(intent.intent_id, evidence) == Outcome.ACTIVE
-    persisted = lifecycle.store.get(intent.intent_id)
-    assert persisted.order_id == OPENING_ORDER
-    assert persisted.wide_order_id == 113
-    assert persisted.resting_order_id == 113 >> 1
+    assert lifecycle.store.order_identity(OPENING_ORDER) == OrderRecord(
+        OPENING_ORDER, 113, 113 >> 1, 101,
+    )
 
 
 def test_official_cancel_action_encoding_is_explicit():
