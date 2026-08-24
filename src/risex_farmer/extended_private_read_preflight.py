@@ -28,9 +28,10 @@ L2_VAULT = 7001003
 
 _API_HEADER = "X-Api-Key"
 _REST_PATHS = ("/user/account/info", "/user/orders", "/user/positions")
-_ACCOUNT_REQUIRED_KEYS = {"accountIndex", "status", "l2Key", "l2Vault"}
-_ACCOUNT_OPTIONAL_KEYS = {"description", "bridgeStarknetAddress"}
-_ACCOUNT_ID_KEYS = {"accountId", "id"}
+_ACCOUNT_KEYS = {
+    "accountId", "accountIndex", "accountIndexForKeyGeneration",
+    "bridgeStarknetAddress", "description", "l2Key", "l2Vault", "status",
+}
 _STREAM_TYPES = {
     "BALANCE", "SPOT_BALANCE", "ORDER", "POSITION", "TRADE",
 }
@@ -321,43 +322,27 @@ def _validate_transport(value: Any, *, url: str) -> None:
 
 
 def _validate_account(value: Any, identity_matcher: Any = None) -> None:
-    if type(value) is not dict:
-        raise PreflightViolation("REST_ACCOUNT_MALFORMED")
-    present_ids = _ACCOUNT_ID_KEYS.intersection(value)
-    allowed = _ACCOUNT_REQUIRED_KEYS | _ACCOUNT_OPTIONAL_KEYS | _ACCOUNT_ID_KEYS
+    value = _exact_object(value, _ACCOUNT_KEYS, "REST_ACCOUNT_MALFORMED")
     if (
-        len(present_ids) != 1
-        or not _ACCOUNT_REQUIRED_KEYS.issubset(value)
-        or not set(value).issubset(allowed)
-    ):
-        raise PreflightViolation("REST_ACCOUNT_MALFORMED")
-    account_id = value[next(iter(present_ids))]
-    if (
-        not _integer(account_id)
+        not _integer(value["accountId"])
         or not _integer(value["accountIndex"])
+        or not _integer(value["accountIndexForKeyGeneration"])
+        or type(value["bridgeStarknetAddress"]) is not str
+        or not value["bridgeStarknetAddress"]
+        or type(value["description"]) is not str
         or type(value["l2Key"]) is not str
         or not value["l2Key"]
-        or not _integer(value["l2Vault"])
-        or (
-            "description" in value
-            and type(value["description"]) is not str
-        )
-        or (
-            "bridgeStarknetAddress" in value
-            and value["bridgeStarknetAddress"] is not None
-            and (
-                type(value["bridgeStarknetAddress"]) is not str
-                or not value["bridgeStarknetAddress"]
-            )
-        )
+        or type(value["l2Vault"]) is not str
+        or not value["l2Vault"].isdecimal()
+        or type(value["status"]) is not str
     ):
         raise PreflightViolation("REST_ACCOUNT_MALFORMED")
     account = {
-        "id": account_id,
+        "id": value["accountId"],
         "accountIndex": value["accountIndex"],
         "status": value["status"],
         "l2Key": value["l2Key"],
-        "l2Vault": value["l2Vault"],
+        "l2Vault": int(value["l2Vault"]),
     }
     identity_matches = (
         identity_matcher is not None
@@ -376,6 +361,16 @@ def _validate_account(value: Any, identity_matcher: Any = None) -> None:
 
 
 def _validate_wrapper(body: Any, path: str, identity_matcher: Any = None) -> None:
+    if path == "/user/account/info":
+        body = _exact_object(
+            body, {"status", "data"}, "REST_WRAPPER_MALFORMED"
+        )
+        if type(body["status"]) is not str:
+            raise PreflightViolation("REST_WRAPPER_MALFORMED")
+        if body["status"] != "OK":
+            raise PreflightViolation("REST_RESPONSE_ERROR")
+        _validate_account(body["data"], identity_matcher)
+        return
     if (
         type(body) is not dict
         or not {"status", "data"}.issubset(body)
@@ -384,11 +379,6 @@ def _validate_wrapper(body: Any, path: str, identity_matcher: Any = None) -> Non
         raise PreflightViolation("REST_WRAPPER_MALFORMED")
     if body["status"] != "OK" or body.get("error") is not None:
         raise PreflightViolation("REST_RESPONSE_ERROR")
-    if path == "/user/account/info":
-        if body.get("pagination") is not None:
-            raise PreflightViolation("REST_PAGINATION_INVALID")
-        _validate_account(body["data"], identity_matcher)
-        return
     if type(body["data"]) is not list:
         raise PreflightViolation("REST_LIST_MALFORMED")
     if body.get("pagination") is not None:

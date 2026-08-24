@@ -67,6 +67,22 @@ def _account():
     }
 
 
+def _account_response():
+    return {
+        "status": "OK",
+        "data": {
+            "accountId": ACCOUNT_ID,
+            "accountIndex": ACCOUNT_INDEX,
+            "accountIndexForKeyGeneration": ACCOUNT_INDEX,
+            "bridgeStarknetAddress": "0xabc123",
+            "description": "synthetic",
+            "l2Key": L2_KEY,
+            "l2Vault": str(L2_VAULT),
+            "status": "ACTIVE",
+        },
+    }
+
+
 def _meta(url):
     return {
         "actual_url": url, "method": "GET",
@@ -137,9 +153,8 @@ class _Transport:
         if request.round_name == "B" and request.path == self.fail_b_path:
             raise ConnectionError("synthetic private response")
         if request.path == "/user/account/info":
-            body = _account()
-            body["id"] += self.identity_offset
-            payload = _wrapped(body)
+            payload = _account_response()
+            payload["data"]["accountId"] += self.identity_offset
         else:
             payload = _wrapped([], count=0)
         return {

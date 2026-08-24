@@ -170,7 +170,7 @@ class FixtureTransport:
             metadata_mutation=metadata_mutation,
         )
         self.responses = {
-            "/user/account/info": wrapped(data["account"]),
+            "/user/account/info": data["accountResponse"],
             "/user/orders": wrapped([], count=0),
             "/user/positions": wrapped([], count=0),
         }
@@ -271,45 +271,72 @@ async def test_ready_uses_exact_v1_path_header_and_no_application_frames(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_captured_account_envelope_exact_shape_is_accepted(tmp_path):
+    assert contract()["accountResponse"] == {
+        "status": "OK",
+        "data": {
+            "accountId": 7001,
+            "accountIndex": 3,
+            "accountIndexForKeyGeneration": 3,
+            "bridgeStarknetAddress": "0xabc123",
+            "description": "synthetic fixture account",
+            "l2Key": "0x12345",
+            "l2Vault": "7001003",
+            "status": "ACTIVE",
+        },
+    }
+    result, _, _ = await execute(tmp_path)
+    assert result.status == "READY_FIXTURE"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "alias,error_member,pagination_member,description_member,bridge_member",
+    "defect",
     [
-        ("accountId", _UNSET, _UNSET, _UNSET, _UNSET),
-        ("id", None, _UNSET, "official account", _UNSET),
-        ("accountId", _UNSET, None, _UNSET, None),
-        ("accountId", None, None, "official account", "0xabc123"),
+        "unknown_wrapper", "error_member", "pagination_member",
+        "missing_account_index_for_key_generation", "unknown_account",
+        "account_id_bool", "account_index_string", "key_generation_null",
+        "bridge_null", "description_null", "l2_key_null", "l2_vault_integer",
+        "status_null",
     ],
 )
-async def test_official_account_wrapper_and_optional_shapes_are_accepted(
-    tmp_path, alias, error_member, pagination_member, description_member,
-    bridge_member,
+async def test_captured_account_envelope_unknown_fields_and_types_block(
+    tmp_path, defect,
 ):
     def mutate(request, body):
         if request.path != "/user/account/info":
             return body
-        if error_member is _UNSET:
-            body.pop("error")
+        if defect == "unknown_wrapper":
+            body["unknown"] = None
+        elif defect == "error_member":
+            body["error"] = None
+        elif defect == "pagination_member":
+            body["pagination"] = None
+        elif defect == "missing_account_index_for_key_generation":
+            body["data"].pop("accountIndexForKeyGeneration")
+        elif defect == "unknown_account":
+            body["data"]["unknown"] = None
         else:
-            body["error"] = error_member
-        if pagination_member is _UNSET:
-            body.pop("pagination")
-        else:
-            body["pagination"] = pagination_member
-        account = body["data"]
-        if alias == "id":
-            account["id"] = account.pop("accountId")
-        if description_member is _UNSET:
-            account.pop("description")
-        else:
-            account["description"] = description_member
-        if bridge_member is _UNSET:
-            account.pop("bridgeStarknetAddress")
-        else:
-            account["bridgeStarknetAddress"] = bridge_member
+            field, value = {
+                "account_id_bool": ("accountId", True),
+                "account_index_string": ("accountIndex", "3"),
+                "key_generation_null": ("accountIndexForKeyGeneration", None),
+                "bridge_null": ("bridgeStarknetAddress", None),
+                "description_null": ("description", None),
+                "l2_key_null": ("l2Key", None),
+                "l2_vault_integer": ("l2Vault", 7001003),
+                "status_null": ("status", None),
+            }[defect]
+            body["data"][field] = value
         return body
 
     result, _, _ = await execute(tmp_path, FixtureTransport(mutation=mutate))
-    assert result.status == "READY_FIXTURE"
+    expected_reason = (
+        "REST_WRAPPER_MALFORMED"
+        if defect in {"unknown_wrapper", "error_member", "pagination_member"}
+        else "REST_ACCOUNT_MALFORMED"
+    )
+    assert (result.status, result.reason) == ("BLOCKED", expected_reason)
 
 
 @pytest.mark.asyncio
@@ -338,8 +365,8 @@ async def test_official_zero_list_wrappers_accept_absent_or_null_optionals(
         ("missing_status", "REST_WRAPPER_MALFORMED"),
         ("missing_data", "REST_WRAPPER_MALFORMED"),
         ("unknown_wrapper", "REST_WRAPPER_MALFORMED"),
-        ("nonnull_error", "REST_RESPONSE_ERROR"),
-        ("nonnull_account_pagination", "REST_PAGINATION_INVALID"),
+        ("nonnull_error", "REST_WRAPPER_MALFORMED"),
+        ("nonnull_account_pagination", "REST_WRAPPER_MALFORMED"),
         ("missing_alias", "REST_ACCOUNT_MALFORMED"),
         ("duplicate_equal_alias", "REST_ACCOUNT_MALFORMED"),
         ("duplicate_conflicting_alias", "REST_ACCOUNT_MALFORMED"),
@@ -350,7 +377,7 @@ async def test_official_zero_list_wrappers_accept_absent_or_null_optionals(
         ("identity_mismatch", "ACCOUNT_IDENTITY_MISMATCH"),
     ],
 )
-async def test_account_wrapper_alias_and_identity_contradictions_block(
+async def test_account_wrapper_and_identity_contradictions_block(
     tmp_path, defect, reason,
 ):
     def mutate(request, body):

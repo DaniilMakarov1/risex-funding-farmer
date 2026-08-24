@@ -26,13 +26,17 @@
     "l2Key": "0x12345",
     "l2Vault": 7001003
   },
-  "account": {
-    "accountId": 7001,
-    "description": "synthetic fixture account",
-    "accountIndex": 3,
-    "status": "ACTIVE",
-    "l2Key": "0x12345",
-    "l2Vault": 7001003,
-    "bridgeStarknetAddress": null
+  "accountResponse": {
+    "status": "OK",
+    "data": {
+      "accountId": 7001,
+      "accountIndex": 3,
+      "accountIndexForKeyGeneration": 3,
+      "bridgeStarknetAddress": "0xabc123",
+      "description": "synthetic fixture account",
+      "l2Key": "0x12345",
+      "l2Vault": "7001003",
+      "status": "ACTIVE"
+    }
   }
 }
