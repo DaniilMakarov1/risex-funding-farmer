@@ -19,6 +19,9 @@ from risex_farmer.extended_private_read_preflight import (
 
 FIXTURE = Path(__file__).parent / "fixtures/extended_private_read_preflight/official_contract.json"
 API_KEY = "synthetic-api-key-never-persisted"
+_EOF = object()
+_BARRIER = object()
+_UNSET = object()
 
 
 def contract():
@@ -30,16 +33,27 @@ def wrapped(data, *, count=None):
     return {"status": "OK", "data": data, "error": None, "pagination": pagination}
 
 
-def frame(seq, *, kind="BALANCE", orders=None, positions=None, trades=None):
+def frame(seq, *, kind="BALANCE", orders=_UNSET, positions=_UNSET, trades=_UNSET):
+    data = {"orders": None, "positions": None, "trades": None, "balance": None, "spotBalances": None}
+    if kind == "BALANCE":
+        data["balance"] = {}
+    elif kind == "SPOT_BALANCE":
+        data["spotBalances"] = []
+    elif kind == "ORDER":
+        data["orders"] = [] if orders is _UNSET else orders
+    elif kind == "POSITION":
+        data["positions"] = [] if positions is _UNSET else positions
+    elif kind == "TRADE":
+        data["trades"] = [] if trades is _UNSET else trades
+    if orders is not _UNSET:
+        data["orders"] = orders
+    if positions is not _UNSET:
+        data["positions"] = positions
+    if trades is not _UNSET:
+        data["trades"] = trades
     return {
         "type": kind,
-        "data": {
-            "orders": [] if orders is None else orders,
-            "positions": [] if positions is None else positions,
-            "trades": [] if trades is None else trades,
-            "balance": None,
-            "spotBalances": None,
-        },
+        "data": data,
         "error": None,
         "ts": 1770000000100 + seq,
         "seq": seq,
@@ -48,7 +62,9 @@ def frame(seq, *, kind="BALANCE", orders=None, positions=None, trades=None):
 
 class FixtureStream:
     def __init__(self, frames, timeline, *, outbound=None, reconnects=0):
-        self.frames = list(frames)
+        self.queue = asyncio.Queue()
+        for item in frames:
+            self.queue.put_nowait(item)
         self.timeline = timeline
         self.outbound_frames = [] if outbound is None else list(outbound)
         self.reconnect_count = reconnects
@@ -57,10 +73,13 @@ class FixtureStream:
     async def recv(self):
         self.timeline.append("RECV")
         await asyncio.sleep(0)
-        if not self.frames:
+        item = await self.queue.get()
+        if item is _BARRIER:
+            self.barrier_complete = True
+            raise StopAsyncIteration
+        if item is _EOF:
             self.closed = True
             raise StopAsyncIteration
-        item = self.frames.pop(0)
         if isinstance(item, BaseException):
             self.closed = True
             raise item
@@ -68,21 +87,17 @@ class FixtureStream:
 
     async def final_barrier(self):
         self.timeline.append("BARRIER")
-        await asyncio.sleep(0)
-        if not self.frames:
-            self.closed = True
-            raise StopAsyncIteration
-        remaining, self.frames = self.frames, []
-        if isinstance(remaining[0], BaseException):
-            self.closed = True
-            raise remaining[0]
+        self.queue.put_nowait(_BARRIER)
         return {
             "connected": True,
             "same_connection": True,
             "outbound_frames": copy.deepcopy(self.outbound_frames),
             "reconnect_count": self.reconnect_count,
-            "frames": copy.deepcopy(remaining),
+            "frames": [],
         }
+
+    def push(self, item):
+        self.queue.put_nowait(item)
 
     async def close(self):
         self.timeline.append("CLOSE")
@@ -90,13 +105,16 @@ class FixtureStream:
 
 
 class FixtureTransport:
-    def __init__(self, *, frames=None, outbound=None, reconnects=0, mutation=None):
+    def __init__(
+        self, *, frames=None, outbound=None, reconnects=0, mutation=None,
+        inject_at=None, inject_item=None,
+    ):
         data = contract()
         self.timeline = []
         self.open_calls = []
         self.get_calls = []
         self.stream = FixtureStream(
-            [frame(n) for n in range(40, 45)] if frames is None else frames,
+            [] if frames is None else frames,
             self.timeline,
             outbound=outbound, reconnects=reconnects,
         )
@@ -106,10 +124,15 @@ class FixtureTransport:
             "/user/positions": wrapped([], count=0),
         }
         self.mutation = mutation
+        self.inject_at = inject_at
+        self.inject_item = inject_item
 
     async def get(self, request):
         self.timeline.append(f"GET_{request.round_name}_{request.path}")
         self.get_calls.append(request)
+        if self.inject_at == (request.round_name, request.path):
+            self.stream.push(self.inject_item)
+            await asyncio.Event().wait()
         body = copy.deepcopy(self.responses[request.path])
         if self.mutation:
             body = self.mutation(request, body)
@@ -159,6 +182,7 @@ async def test_ready_uses_exact_v1_path_header_and_no_application_frames(tmp_pat
     assert request.direct_tls and not request.trust_env and not request.allow_redirects
     assert transport.stream.outbound_frames == []
     assert transport.stream.reconnect_count == 0
+    assert result.stream_frames == 0
     assert len(transport.get_calls) == 6
     assert all(call.method == "GET" for call in transport.get_calls)
     assert all(
@@ -179,15 +203,15 @@ async def test_round_a_finishes_before_one_stream_spans_round_b_and_final_barrie
     assert timeline.index("OPEN") > max(i for i, item in enumerate(timeline) if item.startswith("GET_A_"))
     assert timeline.index("OPEN") < min(i for i, item in enumerate(timeline) if item.startswith("GET_B_"))
     assert timeline.count("OPEN") == 1
-    assert timeline.count("RECV") == 4
+    assert timeline.count("RECV") == 1
     assert timeline.count("BARRIER") == 1
     assert timeline[-1] == "CLOSE"
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("frame_count", [0, 1, 3, 4])
-async def test_early_stream_end_before_during_round_b_or_final_barrier_blocks(tmp_path, frame_count):
-    result, _, _ = await execute(tmp_path, FixtureTransport(frames=[frame(n) for n in range(40, 40 + frame_count)]))
+@pytest.mark.parametrize("transport", [FixtureTransport(frames=[_EOF]), FixtureTransport(inject_at=("B", "/user/orders"), inject_item=_EOF)])
+async def test_early_stream_end_before_or_during_round_b_blocks(tmp_path, transport):
+    result, _, _ = await execute(tmp_path, transport)
     assert result.status == "BLOCKED"
     assert result.reason == "STREAM_ENDED_EARLY"
 
@@ -196,9 +220,9 @@ async def test_early_stream_end_before_during_round_b_or_final_barrier_blocks(tm
 @pytest.mark.parametrize(
     "bad_frame,reason",
     [
-        (frame(42, orders=[{"id": 1}]), "STREAM_ORDER_ACTIVITY"),
-        (frame(42, positions=[{"id": 2}]), "STREAM_POSITION_ACTIVITY"),
-        (frame(42, trades=[{"id": 3}]), "STREAM_TRADE_ACTIVITY"),
+        (frame(42, kind="ORDER", orders=[{"id": 1}]), "STREAM_ORDER_ACTIVITY"),
+        (frame(42, kind="POSITION", positions=[{"id": 2}]), "STREAM_POSITION_ACTIVITY"),
+        (frame(42, kind="TRADE", trades=[{"id": 3}]), "STREAM_TRADE_ACTIVITY"),
         (frame(43), "STREAM_SEQUENCE_GAP"),
         (frame(41), "STREAM_SEQUENCE_DUPLICATE"),
         (frame(40), "STREAM_SEQUENCE_REGRESSION"),
@@ -215,11 +239,38 @@ async def test_transient_activity_sequence_and_bad_frames_block(tmp_path, bad_fr
 
 
 @pytest.mark.asyncio
-async def test_final_barrier_drains_every_intermediate_frame(tmp_path):
-    frames = [frame(n) for n in range(40, 46)]
-    frames.append(frame(46, positions=[{"id": 99}]))
-    result, _, _ = await execute(tmp_path, FixtureTransport(frames=frames))
+async def test_activity_injected_during_slow_round_b_is_counted_and_terminal(tmp_path):
+    transport = FixtureTransport(
+        inject_at=("B", "/user/orders"),
+        inject_item=frame(40, kind="POSITION", positions=[{"id": 99}]),
+    )
+    store = PreflightStore(tmp_path / "preflight.sqlite")
+    loader = Loader()
+    result = await run_preflight(store=store, credential_loader=loader, transport=transport, now_ms=1770000000500)
     assert (result.status, result.reason) == ("BLOCKED", "STREAM_POSITION_ACTIVITY")
+    assert (result.rest_calls, result.stream_frames) == (5, 1)
+    replay_loader, replay_transport = Loader(), FixtureTransport()
+    replay = await run_preflight(store=store, credential_loader=replay_loader, transport=replay_transport, now_ms=1770000000600)
+    assert replay == result
+    assert replay_loader.calls == 0 and replay_transport.get_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad",
+    [
+        frame(40, kind="ORDER", orders=None),
+        frame(40, kind="POSITION", positions=None),
+        frame(40, kind="TRADE", trades=None),
+        frame(40, kind="BALANCE", orders=[]),
+        frame(40, kind="ORDER", positions=[]),
+        {"type": "DEPOSIT", "data": {"orders": None, "positions": None, "trades": None, "balance": None, "spotBalances": None}, "error": None, "ts": 1, "seq": 40},
+    ],
+)
+async def test_type_payload_contradictions_and_unproven_types_block(tmp_path, bad):
+    result, _, _ = await execute(tmp_path, FixtureTransport(frames=[bad]))
+    assert result.status == "BLOCKED"
+    assert result.reason in {"STREAM_TYPE_PAYLOAD_MISMATCH", "STREAM_UNKNOWN_FRAME"}
 
 
 @pytest.mark.asyncio
@@ -305,6 +356,7 @@ async def test_cancellation_is_durably_terminal_and_cannot_replay(tmp_path):
         store=store, credential_loader=replay_loader, transport=replay_transport, now_ms=1770000000600
     )
     assert (result.status, result.reason) == ("BLOCKED", "CANCELLED")
+    assert (result.rest_calls, result.stream_frames) == (1, 0)
     assert replay_loader.calls == 0 and replay_transport.get_calls == [] and replay_transport.open_calls == []
 
 

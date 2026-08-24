@@ -32,8 +32,7 @@ _ACCOUNT_KEYS = {
     "bridgeStarknetAddress",
 }
 _STREAM_TYPES = {
-    "BALANCE", "SPOT_BALANCE", "DEPOSIT", "ORDER", "POSITION", "TRADE",
-    "TRANSFER", "WITHDRAWAL",
+    "BALANCE", "SPOT_BALANCE", "ORDER", "POSITION", "TRADE",
 }
 _STREAM_DATA_KEYS = {"orders", "positions", "trades", "balance", "spotBalances"}
 _MAX_OBSERVATION_AGE_MS = 5_000
@@ -89,6 +88,17 @@ class PreflightResult:
             sort_keys=True,
             separators=(",", ":"),
         )
+
+
+@dataclass
+class _Counters:
+    rest_calls: int = 0
+    stream_frames: int = 0
+
+
+@dataclass
+class _StreamState:
+    previous_sequence: int | None = None
 
 
 class PreflightStore:
@@ -209,7 +219,9 @@ def _validate_wrapper(body: Any, path: str) -> None:
         raise PreflightViolation(reason)
 
 
-async def _rest_round(transport: Any, api_key: str, round_name: str, now_ms: int) -> list[int]:
+async def _rest_round(
+    transport: Any, api_key: str, round_name: str, now_ms: int, counters: _Counters
+) -> list[int]:
     observations: list[int] = []
     for path in _REST_PATHS:
         request = RestRequest(
@@ -219,6 +231,7 @@ async def _rest_round(transport: Any, api_key: str, round_name: str, now_ms: int
             round_name=round_name,
             headers={_API_HEADER: api_key},
         )
+        counters.rest_calls += 1
         reply = await transport.get(request)
         reply = _exact_object(
             reply, {"status", "final_url", "observed_at_ms", "body"}, "REST_REPLY_MALFORMED"
@@ -244,21 +257,27 @@ def _validate_stream_frame(raw: Any, previous: int | None) -> int:
     if frame["error"] is not None or not _integer(frame["ts"]) or not _integer(frame["seq"]):
         raise PreflightViolation("STREAM_MALFORMED_FRAME")
     data = _exact_object(frame["data"], _STREAM_DATA_KEYS, "STREAM_MALFORMED_FRAME")
-    if any(
-        data[key] is not None and type(data[key]) is not list
-        for key in ("orders", "positions", "trades")
-    ):
-        raise PreflightViolation("STREAM_MALFORMED_FRAME")
-    if data["orders"]:
+    matching = {
+        "ORDER": "orders",
+        "POSITION": "positions",
+        "TRADE": "trades",
+        "BALANCE": "balance",
+        "SPOT_BALANCE": "spotBalances",
+    }[frame["type"]]
+    for key in _STREAM_DATA_KEYS:
+        value = data[key]
+        if key == matching:
+            required_type = dict if key == "balance" else list
+            if type(value) is not required_type:
+                raise PreflightViolation("STREAM_TYPE_PAYLOAD_MISMATCH")
+        elif value is not None:
+            raise PreflightViolation("STREAM_TYPE_PAYLOAD_MISMATCH")
+    if frame["type"] == "ORDER" and data["orders"]:
         raise PreflightViolation("STREAM_ORDER_ACTIVITY")
-    if data["positions"]:
+    if frame["type"] == "POSITION" and data["positions"]:
         raise PreflightViolation("STREAM_POSITION_ACTIVITY")
-    if data["trades"]:
+    if frame["type"] == "TRADE" and data["trades"]:
         raise PreflightViolation("STREAM_TRADE_ACTIVITY")
-    if data["balance"] is not None and type(data["balance"]) is not dict:
-        raise PreflightViolation("STREAM_MALFORMED_FRAME")
-    if data["spotBalances"] is not None and type(data["spotBalances"]) is not list:
-        raise PreflightViolation("STREAM_MALFORMED_FRAME")
     sequence = frame["seq"]
     if previous is not None:
         if sequence == previous:
@@ -270,16 +289,20 @@ def _validate_stream_frame(raw: Any, previous: int | None) -> int:
     return sequence
 
 
-async def _receive(stream: Any, previous: int | None) -> int:
-    if getattr(stream, "closed", False):
-        raise PreflightViolation("STREAM_ENDED_EARLY")
-    try:
-        raw = await stream.recv()
-    except StopAsyncIteration as exc:
-        raise PreflightViolation("STREAM_ENDED_EARLY") from exc
-    except (ConnectionError, OSError) as exc:
-        raise PreflightViolation("STREAM_DISCONNECTED") from exc
-    return _validate_stream_frame(raw, previous)
+async def _consume_stream(
+    stream: Any, counters: _Counters, state: _StreamState
+) -> None:
+    while True:
+        try:
+            raw = await stream.recv()
+        except StopAsyncIteration as exc:
+            if getattr(stream, "barrier_complete", False) is True:
+                return
+            raise PreflightViolation("STREAM_ENDED_EARLY") from exc
+        except (ConnectionError, OSError) as exc:
+            raise PreflightViolation("STREAM_DISCONNECTED") from exc
+        counters.stream_frames += 1
+        state.previous_sequence = _validate_stream_frame(raw, state.previous_sequence)
 
 
 async def _load_api_key(loader: Any) -> str:
@@ -291,46 +314,38 @@ async def _load_api_key(loader: Any) -> str:
     return loaded
 
 
-async def _execute(credential_loader: Any, transport: Any, now_ms: int) -> PreflightResult:
+async def _execute(
+    credential_loader: Any, transport: Any, now_ms: int, counters: _Counters
+) -> PreflightResult:
     api_key = await _load_api_key(credential_loader)
-    round_a = await _rest_round(transport, api_key, "A", now_ms)
+    round_a = await _rest_round(transport, api_key, "A", now_ms, counters)
     stream = await transport.open_stream(
         StreamRequest(url=STREAM_URL, headers={_API_HEADER: api_key})
     )
-    frames = 0
-    previous: int | None = None
+    state = _StreamState()
+    consumer: asyncio.Task[None] | None = None
     failure: PreflightViolation | None = None
     try:
         if getattr(stream, "outbound_frames", None) != []:
             raise PreflightViolation("STREAM_OUTBOUND_FORBIDDEN")
         if getattr(stream, "reconnect_count", 0) != 0:
             raise PreflightViolation("STREAM_RECONNECT_FORBIDDEN")
-        previous = await _receive(stream, previous)
-        frames += 1
-
-        round_b: list[int] = []
-        for path in _REST_PATHS:
-            request = RestRequest(
-                method="GET", url=f"{REST_BASE_URL}{path}", path=path,
-                round_name="B", headers={_API_HEADER: api_key},
-            )
-            reply = await transport.get(request)
-            reply = _exact_object(
-                reply, {"status", "final_url", "observed_at_ms", "body"},
-                "REST_REPLY_MALFORMED",
-            )
-            if reply["status"] != 200 or reply["final_url"] != request.url:
-                raise PreflightViolation(
-                    "REST_HTTP_STATUS" if reply["status"] != 200 else "REST_REDIRECT_FORBIDDEN"
-                )
-            observed = reply["observed_at_ms"]
-            if not _integer(observed) or observed > now_ms or now_ms - observed > _MAX_OBSERVATION_AGE_MS:
-                raise PreflightViolation("REST_EVIDENCE_STALE")
-            _validate_wrapper(reply["body"], path)
-            round_b.append(observed)
-            previous = await _receive(stream, previous)
-            frames += 1
-
+        consumer = asyncio.create_task(_consume_stream(stream, counters, state))
+        round_b_task = asyncio.create_task(
+            _rest_round(transport, api_key, "B", now_ms, counters)
+        )
+        done, _ = await asyncio.wait(
+            {consumer, round_b_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if consumer in done:
+            round_b_task.cancel()
+            try:
+                await round_b_task
+            except asyncio.CancelledError:
+                pass
+            await consumer
+            raise PreflightViolation("STREAM_ENDED_EARLY")
+        round_b = await round_b_task
         if min(round_b) <= max(round_a):
             raise PreflightViolation("REST_ROUNDS_NOT_ORDERED")
         try:
@@ -350,11 +365,12 @@ async def _execute(credential_loader: Any, transport: Any, now_ms: int) -> Prefl
             raise PreflightViolation("STREAM_OUTBOUND_FORBIDDEN")
         if barrier["reconnect_count"] != 0:
             raise PreflightViolation("STREAM_RECONNECT_FORBIDDEN")
-        if type(barrier["frames"]) is not list or not barrier["frames"]:
-            raise PreflightViolation("STREAM_ENDED_EARLY")
+        if type(barrier["frames"]) is not list:
+            raise PreflightViolation("STREAM_BARRIER_UNVERIFIABLE")
+        await consumer
         for raw in barrier["frames"]:
-            previous = _validate_stream_frame(raw, previous)
-            frames += 1
+            counters.stream_frames += 1
+            state.previous_sequence = _validate_stream_frame(raw, state.previous_sequence)
         if getattr(stream, "closed", False):
             raise PreflightViolation("STREAM_ENDED_EARLY")
         if getattr(stream, "outbound_frames", None) != []:
@@ -364,6 +380,12 @@ async def _execute(credential_loader: Any, transport: Any, now_ms: int) -> Prefl
     except PreflightViolation as exc:
         failure = exc
     finally:
+        if consumer is not None and not consumer.done():
+            consumer.cancel()
+            try:
+                await consumer
+            except asyncio.CancelledError:
+                pass
         try:
             await stream.close()
         except Exception:
@@ -371,7 +393,10 @@ async def _execute(credential_loader: Any, transport: Any, now_ms: int) -> Prefl
                 failure = PreflightViolation("STREAM_CLOSE_FAILED")
     if failure is not None:
         raise failure
-    return PreflightResult("READY_FIXTURE", "FIXTURE_CONTRACT_PROVED", 6, frames, True)
+    return PreflightResult(
+        "READY_FIXTURE", "FIXTURE_CONTRACT_PROVED",
+        counters.rest_calls, counters.stream_frames, True,
+    )
 
 
 async def run_preflight(
@@ -382,16 +407,24 @@ async def run_preflight(
     existing = store.claim()
     if existing is not None:
         return existing
+    counters = _Counters()
     try:
-        result = await _execute(credential_loader, transport, now_ms)
+        result = await _execute(credential_loader, transport, now_ms, counters)
     except asyncio.CancelledError:
-        result = PreflightResult("BLOCKED", "CANCELLED", 0, 0, False)
+        result = PreflightResult(
+            "BLOCKED", "CANCELLED", counters.rest_calls, counters.stream_frames, False
+        )
         store.terminal(result)
         raise
     except PreflightViolation as exc:
-        result = PreflightResult("BLOCKED", str(exc), 0, 0, False)
+        result = PreflightResult(
+            "BLOCKED", str(exc), counters.rest_calls, counters.stream_frames, False
+        )
     except Exception:
-        result = PreflightResult("BLOCKED", "UNEXPECTED_FAILURE", 0, 0, False)
+        result = PreflightResult(
+            "BLOCKED", "UNEXPECTED_FAILURE", counters.rest_calls,
+            counters.stream_frames, False,
+        )
     store.terminal(result)
     return result
 
