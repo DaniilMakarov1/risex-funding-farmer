@@ -10,7 +10,7 @@
 ### RISEx
 
 - Private-read op011 passed with complete counters, authoritative zero orders, and exact flatness; all invocations through op011 are consumed.
-- Tier C remains blocked until official sources prove the exact place/cancel identity mapping needed for deterministic reconciliation. No live write or retry is authorized.
+- Current official REST/WebSocket documentation now proves the exact `client_order_id` to composite order, wide/resting order, fill, cancel, and account-position reconciliation path. A fixture-only correction is next; no live write or retry is authorized.
 
 ### Nado
 
@@ -20,7 +20,7 @@
 ### Extended
 
 - The fixed identity and API-key capability are securely provisioned. Account-shape witness op003 completed `CAPTURED` with every counter exactly `1/1` and no write.
-- The official account response is `{status, data}`, with the accepted account fields inside `data`. The next candidate must correct only this fixture/private-read parsing boundary before a fresh one-shot private-read gate.
+- The exact `{status, data}` account parser correction is accepted and published with fail-closed field/type handling preserved. Witness op003 and private-read operations through op002 remain consumed; the next step is one fresh fixed private-read binding before a separately gated one-shot operation.
 
 ## Exit condition
 
