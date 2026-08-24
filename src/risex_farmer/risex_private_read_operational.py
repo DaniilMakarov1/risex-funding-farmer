@@ -43,7 +43,7 @@ STORE_BASENAME = ".risex-funding-farmer-risex-private-read-20260824-new-op-007.s
 FIXED_STORE_PATH = Path(
     "/Users/daniilmakarov/.risex-funding-farmer-risex-private-read-20260824-new-op-007.sqlite3"
 )
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 _APPLICATION_ID = 0x52585052
 _MAX_BYTES = 1_048_576
 _DEADLINE_SECONDS = 5
@@ -68,6 +68,12 @@ _POSITIONS_SHAPE_ROW_KEYS = frozenset({
 _POSITIONS_SCHEMA_CLASSIFIERS = frozenset({
     "top_envelope", "first_or_later_row",
 })
+_POSITIONS_METHOD_CLASSES = frozenset({"snapshot", "subscribe", "other"})
+_POSITIONS_CHANNEL_CLASSES = frozenset({"positions", "other"})
+_POSITIONS_TYPE_CLASSES = frozenset({
+    "snapshot", "update", "success", "error", "other",
+})
+_POSITIONS_STATUS_CLASSES = frozenset({"absent", "success", "error", "other"})
 _POSITIONS_SHAPE_MAX_DEPTH = 3
 _POSITIONS_SHAPE_MAX_NODES = 32
 _POSITIONS_SHAPE_MAX_FIELDS = 20
@@ -136,7 +142,7 @@ _REASON_VALUES = frozenset({
 _LEDGER_SCHEMA = (
     "CREATE TABLE run ("
     "singleton INTEGER PRIMARY KEY CHECK(singleton=1),"
-    "schema_version INTEGER NOT NULL CHECK(schema_version=4),"
+    "schema_version INTEGER NOT NULL CHECK(schema_version=5),"
     "invocation_id TEXT NOT NULL CHECK(length(invocation_id)>0),"
     "store_path_sha256 TEXT NOT NULL CHECK(length(store_path_sha256)=64),"
     "state TEXT NOT NULL CHECK(state IN "
@@ -150,7 +156,11 @@ _LEDGER_SCHEMA = (
     "auth_v2_shape_sha256 TEXT,"
     "positions_schema_classifier TEXT,"
     "positions_shape TEXT,"
-    "positions_shape_sha256 TEXT);"
+    "positions_shape_sha256 TEXT,"
+    "positions_method_class TEXT,"
+    "positions_channel_class TEXT,"
+    "positions_type_class TEXT,"
+    "positions_status_class TEXT);"
     "CREATE TABLE phase_counter ("
     "name TEXT PRIMARY KEY,"
     "attempts INTEGER NOT NULL CHECK(attempts IN (0,1)),"
@@ -181,6 +191,10 @@ class OperationalReport:
     positions_schema_classifier: str | None
     positions_shape: str | None
     positions_shape_sha256: str | None
+    positions_method_class: str | None
+    positions_channel_class: str | None
+    positions_type_class: str | None
+    positions_status_class: str | None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -198,6 +212,10 @@ class OperationalReport:
             "positions_schema_classifier": self.positions_schema_classifier,
             "positions_shape": self.positions_shape,
             "positions_shape_sha256": self.positions_shape_sha256,
+            "positions_method_class": self.positions_method_class,
+            "positions_channel_class": self.positions_channel_class,
+            "positions_type_class": self.positions_type_class,
+            "positions_status_class": self.positions_status_class,
         }
 
 
@@ -398,7 +416,7 @@ class DurableCounterLedger:
             self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             self._db.execute(
                 "INSERT INTO run VALUES(1,?,?,?,?,?,?,?,NULL,NULL,NULL,NULL,"
-                "NULL,NULL,NULL)",
+                "NULL,NULL,NULL,NULL,NULL,NULL,NULL)",
                 (
                     SCHEMA_VERSION,
                     self.invocation_id,
@@ -435,7 +453,9 @@ class DurableCounterLedger:
             "state", "barrier_a_fingerprint", "barrier_b_fingerprint",
             "started_at_ns", "finished_at_ns", "reason", "auth_v2_shape",
             "auth_v2_shape_sha256", "positions_schema_classifier",
-            "positions_shape", "positions_shape_sha256",
+            "positions_shape", "positions_shape_sha256", "positions_method_class",
+            "positions_channel_class", "positions_type_class",
+            "positions_status_class",
         ) or counter_columns != ("name", "attempts", "completions"):
             raise ValueError("schema")
         if self._db.execute("SELECT COUNT(*) FROM run").fetchone() != (1,):
@@ -464,12 +484,16 @@ class DurableCounterLedger:
                 and not _valid_auth_v2_shape(str(row[9]), str(row[10]))
             )
             or not (
-                (row[11] is None and row[12] is None and row[13] is None)
+                all(row[index] is None for index in range(11, 18))
                 or (
                     row[11] in _POSITIONS_SCHEMA_CLASSIFIERS
                     and row[12] is not None
                     and row[13] is not None
                     and _valid_positions_shape(str(row[12]), str(row[13]))
+                    and row[14] in _POSITIONS_METHOD_CLASSES
+                    and row[15] in _POSITIONS_CHANNEL_CLASSES
+                    and row[16] in _POSITIONS_TYPE_CLASSES
+                    and row[17] in _POSITIONS_STATUS_CLASSES
                 )
             )
             or (row[9] is not None and row[11] is not None)
@@ -554,7 +578,9 @@ class DurableCounterLedger:
             "SELECT schema_version,invocation_id,store_path_sha256,state,"
             "barrier_a_fingerprint,barrier_b_fingerprint,started_at_ns,"
             "finished_at_ns,reason,auth_v2_shape,auth_v2_shape_sha256,"
-            "positions_schema_classifier,positions_shape,positions_shape_sha256 "
+            "positions_schema_classifier,positions_shape,positions_shape_sha256,"
+            "positions_method_class,positions_channel_class,positions_type_class,"
+            "positions_status_class "
             "FROM run WHERE singleton=1"
         ).fetchone()
         if row is None:
@@ -653,11 +679,22 @@ class DurableCounterLedger:
         self._validate()
 
     def record_positions_shape(
-        self, classifier: str, descriptor: str, digest: str,
+        self,
+        classifier: str,
+        descriptor: str,
+        digest: str,
+        method_class: str,
+        channel_class: str,
+        type_class: str,
+        status_class: str,
     ) -> None:
         if (
             classifier not in _POSITIONS_SCHEMA_CLASSIFIERS
             or not _valid_positions_shape(descriptor, digest)
+            or method_class not in _POSITIONS_METHOD_CLASSES
+            or channel_class not in _POSITIONS_CHANNEL_CLASSES
+            or type_class not in _POSITIONS_TYPE_CLASSES
+            or status_class not in _POSITIONS_STATUS_CLASSES
         ):
             raise ValueError("positions shape")
         counters = self._counter_rows()
@@ -671,10 +708,17 @@ class DurableCounterLedger:
         with self._db:
             changed = self._db.execute(
                 "UPDATE run SET positions_schema_classifier=?,positions_shape=?,"
-                "positions_shape_sha256=? WHERE singleton=1 AND state='CLAIMED' "
+                "positions_shape_sha256=?,positions_method_class=?,"
+                "positions_channel_class=?,positions_type_class=?,"
+                "positions_status_class=? WHERE singleton=1 AND state='CLAIMED' "
                 "AND positions_schema_classifier IS NULL AND positions_shape IS NULL "
-                "AND positions_shape_sha256 IS NULL",
-                (classifier, descriptor, digest),
+                "AND positions_shape_sha256 IS NULL AND positions_method_class IS NULL "
+                "AND positions_channel_class IS NULL AND positions_type_class IS NULL "
+                "AND positions_status_class IS NULL",
+                (
+                    classifier, descriptor, digest, method_class, channel_class,
+                    type_class, status_class,
+                ),
             ).rowcount
         if changed != 1:
             raise ValueError("positions shape state")
@@ -714,6 +758,10 @@ class DurableCounterLedger:
             and row[12] is not None
             and row[13] is not None
             and _valid_positions_shape(str(row[12]), str(row[13]))
+            and row[14] in _POSITIONS_METHOD_CLASSES
+            and row[15] in _POSITIONS_CHANNEL_CLASSES
+            and row[16] in _POSITIONS_TYPE_CLASSES
+            and row[17] in _POSITIONS_STATUS_CLASSES
         ):
             result = Result.UNKNOWN
             reason = "validation_failed"
@@ -740,10 +788,18 @@ class DurableCounterLedger:
                 "positions_shape=CASE WHEN ?='positions_schema_invalid' "
                 "THEN positions_shape ELSE NULL END,"
                 "positions_shape_sha256=CASE WHEN ?='positions_schema_invalid' "
-                "THEN positions_shape_sha256 ELSE NULL END WHERE singleton=1",
+                "THEN positions_shape_sha256 ELSE NULL END,"
+                "positions_method_class=CASE WHEN ?='positions_schema_invalid' "
+                "THEN positions_method_class ELSE NULL END,"
+                "positions_channel_class=CASE WHEN ?='positions_schema_invalid' "
+                "THEN positions_channel_class ELSE NULL END,"
+                "positions_type_class=CASE WHEN ?='positions_schema_invalid' "
+                "THEN positions_type_class ELSE NULL END,"
+                "positions_status_class=CASE WHEN ?='positions_schema_invalid' "
+                "THEN positions_status_class ELSE NULL END WHERE singleton=1",
                 (
                     result.value, time.time_ns(), reason, reason, reason,
-                    reason, reason, reason,
+                    reason, reason, reason, reason, reason, reason, reason,
                 ),
             )
             changed = self._db.execute(
@@ -778,6 +834,10 @@ class DurableCounterLedger:
             positions_schema_classifier=None if row[11] is None else str(row[11]),
             positions_shape=None if row[12] is None else str(row[12]),
             positions_shape_sha256=None if row[13] is None else str(row[13]),
+            positions_method_class=None if row[14] is None else str(row[14]),
+            positions_channel_class=None if row[15] is None else str(row[15]),
+            positions_type_class=None if row[16] is None else str(row[16]),
+            positions_status_class=None if row[17] is None else str(row[17]),
         )
 
     def close(self) -> None:
@@ -1073,6 +1133,29 @@ def _valid_positions_shape(descriptor: str, digest: str) -> bool:
     return valid_object(
         parsed, _POSITIONS_SHAPE_TOP_KEYS, 0, valid_top_value,
     )
+
+
+def _positions_semantic_classes(value: Any) -> tuple[str, str, str, str]:
+    top = value if type(value) is dict else {}
+
+    def fixed_class(name: str, allowed: frozenset[str]) -> str:
+        candidate = top.get(name)
+        if (
+            type(candidate) is str
+            and candidate in allowed
+            and candidate not in {"absent", "other"}
+        ):
+            return candidate
+        return "other"
+
+    method_class = fixed_class("method", _POSITIONS_METHOD_CLASSES)
+    channel_class = fixed_class("channel", _POSITIONS_CHANNEL_CLASSES)
+    type_class = fixed_class("type", _POSITIONS_TYPE_CLASSES)
+    if "status" not in top:
+        status_class = "absent"
+    else:
+        status_class = fixed_class("status", _POSITIONS_STATUS_CLASSES)
+    return method_class, channel_class, type_class, status_class
 
 
 class _SignOnlyCapability:
@@ -1761,6 +1844,7 @@ async def _execute(
                 assert failure.classifier is not None
                 ledger.record_positions_shape(
                     failure.classifier, *_positions_shape(positions_parsed),
+                    *_positions_semantic_classes(positions_parsed),
                 )
             raise
         positions_flat = await _phase(
@@ -1889,6 +1973,10 @@ async def _run(dependencies: _Dependencies) -> OperationalReport:
             None,
             None,
             "store_rejected",
+            None,
+            None,
+            None,
+            None,
             None,
             None,
             None,

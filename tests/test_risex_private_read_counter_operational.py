@@ -459,12 +459,16 @@ async def test_success_has_exact_sequence_full_counters_and_agreeing_barriers(tm
     path = tmp_path / "fixture.sqlite3"
     report = await _run_fixture(dependencies(tmp_path, calls))
     assert report.result is Result.PASSED
-    assert report.schema_version == 4
+    assert report.schema_version == 5
     assert report.auth_v2_shape is None
     assert report.auth_v2_shape_sha256 is None
     assert report.positions_schema_classifier is None
     assert report.positions_shape is None
     assert report.positions_shape_sha256 is None
+    assert report.positions_method_class is None
+    assert report.positions_channel_class is None
+    assert report.positions_type_class is None
+    assert report.positions_status_class is None
     assert report.barrier_a_fingerprint == report.barrier_b_fingerprint
     assert set(report.counters) == set(_COUNTER_NAMES)
     assert len(_COUNTER_NAMES) == 41
@@ -486,7 +490,7 @@ async def test_success_has_exact_sequence_full_counters_and_agreeing_barriers(tm
     database = sqlite3.connect(path)
     try:
         assert database.execute("PRAGMA integrity_check").fetchone() == ("ok",)
-        assert database.execute("PRAGMA user_version").fetchone() == (4,)
+        assert database.execute("PRAGMA user_version").fetchone() == (5,)
     finally:
         database.close()
 
@@ -533,6 +537,10 @@ async def test_auth_ack_failures_are_durable_redacted_and_never_subscribe(
     else:
         assert report.auth_v2_shape is None
         assert report.auth_v2_shape_sha256 is None
+    assert report.positions_method_class is None
+    assert report.positions_channel_class is None
+    assert report.positions_type_class is None
+    assert report.positions_status_class is None
     persisted = (tmp_path / "fixture.sqlite3").read_bytes().decode("latin1")
     assert raw not in persisted
 
@@ -949,10 +957,18 @@ async def test_positions_failures_are_split_redacted_and_terminal(
         assert report.positions_shape_sha256 == hashlib.sha256(
             report.positions_shape.encode("ascii")
         ).hexdigest()
+        assert report.positions_method_class in operational._POSITIONS_METHOD_CLASSES
+        assert report.positions_channel_class in operational._POSITIONS_CHANNEL_CLASSES
+        assert report.positions_type_class in operational._POSITIONS_TYPE_CLASSES
+        assert report.positions_status_class in operational._POSITIONS_STATUS_CLASSES
     else:
         assert report.positions_schema_classifier is None
         assert report.positions_shape is None
         assert report.positions_shape_sha256 is None
+        assert report.positions_method_class is None
+        assert report.positions_channel_class is None
+        assert report.positions_type_class is None
+        assert report.positions_status_class is None
     assert not any(call.startswith("public_b_") for call in calls)
     persisted = (tmp_path / "fixture.sqlite3").read_bytes().decode("latin1")
     assert raw not in persisted
@@ -1006,6 +1022,85 @@ async def test_positions_top_extra_is_not_accepted_and_persists_only_safe_shape(
         assert forbidden not in report.positions_shape
         assert forbidden not in serialized
         assert forbidden not in persisted
+
+
+@pytest.mark.asyncio
+async def test_positions_ack_like_frame_persists_only_fixed_semantic_classes(
+    tmp_path,
+):
+    assert "status" not in operational._POSITIONS_SHAPE_TOP_KEYS
+    assert operational._POSITIONS_METHOD_CLASSES == {"snapshot", "subscribe", "other"}
+    assert operational._POSITIONS_CHANNEL_CLASSES == {"positions", "other"}
+    assert operational._POSITIONS_TYPE_CLASSES == {
+        "snapshot", "update", "success", "error", "other",
+    }
+    assert operational._POSITIONS_STATUS_CLASSES == {
+        "absent", "success", "error", "other",
+    }
+    calls: list[str] = []
+    raw = json.dumps({
+        "method": "subscribe",
+        "channel": "positions",
+        "type": "success",
+        "status": "success",
+        "data": {"server-payload-secret": "server-value-secret"},
+        "server-unknown-key-secret": "server-unknown-value-secret",
+    }, separators=(",", ":"))
+    message = type(
+        "Message", (), {"type": operational.aiohttp.WSMsgType.TEXT, "data": raw},
+    )()
+    socket = _SequenceSocket(message, AssertionError("second receive"))
+    report = await _run_fixture(dependencies(
+        tmp_path,
+        calls,
+        transport_factory=lambda: _PositionsSocketTransport(calls, socket),
+    ))
+    assert report.result is Result.UNKNOWN
+    assert report.reason == "positions_schema_invalid"
+    assert report.positions_schema_classifier == "top_envelope"
+    assert (
+        report.positions_method_class,
+        report.positions_channel_class,
+        report.positions_type_class,
+        report.positions_status_class,
+    ) == ("subscribe", "positions", "success", "success")
+    assert report.positions_shape is not None
+    assert "status" not in report.positions_shape
+    assert report.counters["positions_schema"] == {"attempts": 1, "completions": 0}
+    assert report.counters["positions_flat"] == {"attempts": 0, "completions": 0}
+    assert socket.receives == 1
+    serialized = json.dumps(report.as_dict(), sort_keys=True)
+    persisted = (tmp_path / "fixture.sqlite3").read_bytes().decode("latin1")
+    for forbidden in (
+        raw, "server-payload-secret", "server-value-secret",
+        "server-unknown-key-secret", "server-unknown-value-secret",
+    ):
+        assert forbidden not in serialized
+        assert forbidden not in persisted
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    (
+        ({"method": "snapshot"}, ("snapshot", "other", "other", "absent")),
+        ({"method": "subscribe"}, ("subscribe", "other", "other", "absent")),
+        ({"method": None}, ("other", "other", "other", "absent")),
+        ({"channel": "positions"}, ("other", "positions", "other", "absent")),
+        ({"channel": 7}, ("other", "other", "other", "absent")),
+        ({"type": "snapshot"}, ("other", "other", "snapshot", "absent")),
+        ({"type": "update"}, ("other", "other", "update", "absent")),
+        ({"type": "success"}, ("other", "other", "success", "absent")),
+        ({"type": "error"}, ("other", "other", "error", "absent")),
+        ({"type": []}, ("other", "other", "other", "absent")),
+        ({"status": "success"}, ("other", "other", "other", "success")),
+        ({"status": "error"}, ("other", "other", "other", "error")),
+        ({"status": "absent"}, ("other", "other", "other", "other")),
+        ({"status": False}, ("other", "other", "other", "other")),
+        ([], ("other", "other", "other", "absent")),
+    ),
+)
+def test_positions_semantic_classes_are_exact_fixed_enums(value, expected):
+    assert operational._positions_semantic_classes(value) == expected
 
 
 @pytest.mark.asyncio
@@ -1174,7 +1269,10 @@ async def test_positions_shape_limits_collapse_to_constant_witness(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "mutation", ("classifier", "shape", "digest", "grammar", "partial"),
+    "mutation", (
+        "classifier", "shape", "digest", "grammar", "method", "channel",
+        "type", "status", "partial_shape", "partial_semantic",
+    ),
 )
 async def test_positions_shape_corruption_rejects_store_without_effects(
     tmp_path, mutation,
@@ -1205,8 +1303,17 @@ async def test_positions_shape_corruption_rejects_store_without_effects(
             "WHERE singleton=1",
             (forbidden, hashlib.sha256(forbidden.encode()).hexdigest()),
         )
-    else:
+    elif mutation in {"method", "channel", "type", "status"}:
+        database.execute(
+            f"UPDATE run SET positions_{mutation}_class='server-secret' "
+            "WHERE singleton=1"
+        )
+    elif mutation == "partial_shape":
         database.execute("UPDATE run SET positions_shape=NULL WHERE singleton=1")
+    else:
+        database.execute(
+            "UPDATE run SET positions_status_class=NULL WHERE singleton=1"
+        )
     database.commit()
     database.close()
     calls.clear()
@@ -1219,6 +1326,10 @@ async def test_positions_shape_corruption_rejects_store_without_effects(
     assert report.result is Result.UNKNOWN and report.reason == "store_rejected"
     assert report.positions_schema_classifier is None
     assert report.positions_shape is None and report.positions_shape_sha256 is None
+    assert report.positions_method_class is None
+    assert report.positions_channel_class is None
+    assert report.positions_type_class is None
+    assert report.positions_status_class is None
     assert calls == []
 
 
@@ -1240,7 +1351,12 @@ async def test_nonterminal_positions_shape_restart_clears_witness_without_effect
     descriptor, digest = operational._positions_shape({
         "method": "server-secret", "data": [{"size": "server-secret"}],
     })
-    ledger.record_positions_shape("top_envelope", descriptor, digest)
+    ledger.record_positions_shape(
+        "top_envelope", descriptor, digest,
+        *operational._positions_semantic_classes({
+            "method": "server-secret", "data": [{"size": "server-secret"}],
+        }),
+    )
     ledger.close()
 
     calls: list[str] = []
@@ -1254,6 +1370,10 @@ async def test_nonterminal_positions_shape_restart_clears_witness_without_effect
     assert report.reason == "interrupted_nonterminal"
     assert report.positions_schema_classifier is None
     assert report.positions_shape is None and report.positions_shape_sha256 is None
+    assert report.positions_method_class is None
+    assert report.positions_channel_class is None
+    assert report.positions_type_class is None
+    assert report.positions_status_class is None
     assert "server-secret" not in path.read_bytes().decode("latin1")
     assert calls == []
 
@@ -1288,6 +1408,10 @@ async def test_positions_receive_outcomes_are_fixed_redacted_and_terminal(
     assert report.counters["positions_parse"] == {"attempts": 0, "completions": 0}
     assert report.positions_schema_classifier is None
     assert report.positions_shape is None and report.positions_shape_sha256 is None
+    assert report.positions_method_class is None
+    assert report.positions_channel_class is None
+    assert report.positions_type_class is None
+    assert report.positions_status_class is None
     assert socket.receives == 1
     persisted = (tmp_path / "fixture.sqlite3").read_bytes().decode("latin1")
     assert secret not in persisted and secret not in json.dumps(report.as_dict())
@@ -1328,6 +1452,10 @@ async def test_positions_followup_frame_is_unknown_and_never_persisted(tmp_path)
     }
     assert report.positions_schema_classifier is None
     assert report.positions_shape is None and report.positions_shape_sha256 is None
+    assert report.positions_method_class is None
+    assert report.positions_channel_class is None
+    assert report.positions_type_class is None
+    assert report.positions_status_class is None
     persisted = (tmp_path / "fixture.sqlite3").read_bytes().decode("latin1")
     assert secret not in persisted and secret not in json.dumps(report.as_dict())
     assert not any(call.startswith("public_b_") for call in calls)
@@ -1580,7 +1708,7 @@ async def test_store_counter_schema_path_and_file_corruption_fail_without_effect
         elif mutation == "schema":
             database.execute("ALTER TABLE run ADD COLUMN unexpected TEXT")
         else:
-            database.execute("PRAGMA user_version=5")
+            database.execute("PRAGMA user_version=6")
         database.commit()
         database.close()
     elif mutation == "mode":
