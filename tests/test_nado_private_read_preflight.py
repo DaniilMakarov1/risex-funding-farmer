@@ -186,13 +186,26 @@ def test_exact_official_wire_success_and_one_shot_request(
     assert signed is not None and len(signed.calls) == 1
     expected = {
         "type": "list_trigger_orders",
-        "tx": {"sender": contract["sender"], "recvTime": 1_700_000_030_010},
+        "tx": {"sender": contract["sender"], "recvTime": "1700000030010"},
         "signature": contract["signature"], "limit": 1,
     }
     assert signed.calls == [expected]
-    assert calls.typed == [nado.list_trigger_orders_typed_data(
-        str(contract["sender"]), 1_700_000_030_010
-    )]
+    assert calls.typed == [{
+        "types": {
+            "ListTriggerOrders": [
+                {"name": "sender", "type": "bytes32"},
+                {"name": "recvTime", "type": "uint64"},
+            ],
+        },
+        "primaryType": "ListTriggerOrders",
+        "domain": {
+            "name": "Nado",
+            "version": "0.0.1",
+            "chainId": 763373,
+            "verifyingContract": "0x698D87105274292B5673367DEC81874Ce3633Ac2",
+        },
+        "message": {"sender": contract["sender"], "recvTime": "1700000030010"},
+    }]
     assert store.state("fixture-invocation-001") == nado.FINALIZED
     assert public is not None and len(public.calls) == 19
     expected_policy = nado.TransportPolicy(True, False, False, 5_000, 65_536)
@@ -206,6 +219,27 @@ def test_exact_official_wire_success_and_one_shot_request(
         {"type": "subaccount_orders", "sender": contract["sender"], "product_id": 1},
         {"type": "isolated_positions", "subaccount": contract["sender"]},
     ]
+
+
+@pytest.mark.parametrize(
+    "recv_time",
+    [1_700_000_030_010, True, "", "01", "+1", "-1", "1 ", str(2**64)],
+)
+def test_trigger_typed_data_rejects_noncanonical_recv_time(
+    contract: dict[str, object], recv_time: object,
+) -> None:
+    with pytest.raises(nado.NadoPreflightError, match="trigger receive time"):
+        nado.list_trigger_orders_typed_data(str(contract["sender"]), recv_time)
+
+
+def test_trigger_typed_data_exact_pinned_shape(contract: dict[str, object]) -> None:
+    typed = nado.list_trigger_orders_typed_data(
+        str(contract["sender"]), "1700000030010"
+    )
+    assert set(typed["types"]) == {"ListTriggerOrders"}
+    assert typed["message"] == {
+        "sender": contract["sender"], "recvTime": "1700000030010",
+    }
 
 
 def test_pins_identity_and_official_fixture_shapes(contract: dict[str, object]) -> None:

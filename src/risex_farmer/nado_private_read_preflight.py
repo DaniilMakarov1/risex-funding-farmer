@@ -704,18 +704,13 @@ def _round_b(transport: SealedPublicTransport, config: PreflightConfig) -> _Roun
     )
 
 
-def list_trigger_orders_typed_data(sender: str, recv_time: int) -> dict[str, object]:
+def list_trigger_orders_typed_data(sender: str, recv_time: str) -> dict[str, object]:
     _bytes32(sender)
-    if type(recv_time) is not int or not 0 <= recv_time < 2**64:
+    parsed_recv_time = _decimal(recv_time, "trigger receive time", signed=False)
+    if parsed_recv_time >= 2**64:
         raise NadoPreflightError("trigger receive time is invalid")
     return {
         "types": {
-            "EIP712Domain": [
-                {"name": "name", "type": "string"},
-                {"name": "version", "type": "string"},
-                {"name": "chainId", "type": "uint256"},
-                {"name": "verifyingContract", "type": "address"},
-            ],
             "ListTriggerOrders": [
                 {"name": "sender", "type": "bytes32"},
                 {"name": "recvTime", "type": "uint64"},
@@ -804,7 +799,7 @@ def run_private_read_preflight(
             or config.now_ms - server_ms > MAX_FRESHNESS_MS
         ):
             raise NadoPreflightError("server time is invalid or out of order")
-        recv_time = server_ms + MAX_FRESHNESS_MS
+        recv_time = str(server_ms + MAX_FRESHNESS_MS)
         typed_data = list_trigger_orders_typed_data(config.sender, recv_time)
         signature = _signature(
             _callback_value(signer, credential, typed_data, label="signer")
