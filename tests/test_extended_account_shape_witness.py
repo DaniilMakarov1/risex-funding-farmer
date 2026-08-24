@@ -141,6 +141,21 @@ def test_descriptor_contains_only_allowlisted_names_closed_types_and_unknown_cou
     assert types <= witness.ALLOWED_TYPE_CLASSES
 
 
+def test_sdk_openapi_account_identity_fields_keep_names_and_types_not_values():
+    body = _body(
+        accountId=93847561029384756,
+        accountIndexForKeyGeneration=None,
+    )
+    descriptor = witness._describe_body(body)
+    fields = descriptor["fields"]["data"]["fields"]
+    assert fields["accountId"] == {"type": "integer"}
+    assert fields["accountIndexForKeyGeneration"] == {"type": "null"}
+    encoded = json.dumps(descriptor, sort_keys=True, separators=(",", ":"))
+    assert "93847561029384756" not in encoded
+    assert "accountId" in encoded
+    assert "accountIndexForKeyGeneration" in encoded
+
+
 def test_unknown_names_values_and_array_lengths_do_not_change_descriptor():
     left = _body(**{"unknownAlpha": ["one"]})
     right = _body(**{"unknownBeta": {"nested": 1}})

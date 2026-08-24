@@ -7,7 +7,9 @@
   "shape_max_keys": 16,
   "descriptor_max_bytes": 4096,
   "allowed_field_names": [
+    "accountId",
     "accountIndex",
+    "accountIndexForKeyGeneration",
     "bridgeStarknetAddress",
     "data",
     "description",
