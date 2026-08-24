@@ -9,12 +9,12 @@ Status: `READY FOR USER LEVEL C BINDING AUTHORIZATION`.
 - No Builder for the credential/signing/live-transport binding starts until explicit user authorization is recorded; this correction does not grant it. Once authorized, add only the isolated binding needed to run the accepted lifecycle with runtime run identity; do not change lifecycle semantics, shared code, strategy, or paper behavior.
 - Candidate acceptance requires official contract evidence, focused Level C regressions, and one final full suite. A later separate Chief operational gate controls the single minimum-size testnet write lifecycle.
 
-## Nado — fresh authenticated private read
+## Nado — preserve failed private-read boundary
 
-Status: `READY FOR LEVEL B OPERATIONAL GATE`.
+Status: `BLOCKED — PUBLIC CATALOG FAILURE UNCLASSIFIED`.
 
-- Run exactly one fresh sealed Nado authenticated read-only operation with its runtime journal identity. It may load only the fixed provisioned capability and may sign only the accepted `list_trigger_orders` read contract; no account mutation or write is authorized.
-- Require complete public/account validation and a durable terminal report. Any semantic, authentication, terminal, or ambiguous outcome stops without rearm or write; a transport-only retry is never implicit and remains subject to the Level B two-attempt ceiling.
+- Preserve the terminal runtime row and do not retry, rearm, load credentials, or dispatch a private/write request. The failed `all_products` step is not proved transport-only and therefore cannot use the Level B retry allowance.
+- No Builder starts without a new bounded gate backed by concrete official evidence that distinguishes transport failure from catalog validation drift; do not infer a code defect from the generic terminal reason.
 
 ## Extended — resume authenticated read-only readiness
 
