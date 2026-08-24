@@ -2,31 +2,26 @@
 
 ## Central baseline
 
-- Published `main == origin/main == 867ac006c7f92bbbf9529ff4385b7ae1f08036fe`.
-- RISEx, Nado, and Extended fixture lifecycle cores and isolated private-read operational adapters are integrated on published `main`.
-- Paper remains the default product. No strategy execution, mainnet, real funds, deposits, or ungated private/write traffic is authorized.
+- Published `main == origin/main`; Git is the exact accepted-history authority.
+- All three fixture lifecycle cores are integrated. Paper remains default; no venue is strategy-ready.
 
 ## Venue readiness
 
 ### RISEx
 
-- The one-shot op011 private-read gate is operationally accepted on the exact published tree: schema 8, `PASSED — complete`, all 43 counters complete, both strict public sweeps complete, and the authenticated orders plus fresh official positions snapshots prove zero orders and exact flatness. Both redacted public fingerprints are canonical and may differ; all structural witnesses are null.
-- Every RISEx private-read invocation/store through op011 is consumed and immutable. None may be reset, rearmed, retried, or used as authority for a write.
-- Private-read readiness is accepted. The fixture-only bounded RISEx lifecycle is integrated, but no production live-write candidate, Builder, credential access, signature, nonce consumption, order, cancel, or close is authorized yet.
-- The sole next RISEx gate is a separate Tier C candidate for the already-approved minimum-size testnet lifecycle. Success still requires authoritative zero open orders and exact flatness; `FAILED_HALTED_MANUAL_RECOVERY` is failure and never readiness.
+- Private-read op011 passed with complete counters, authoritative zero orders, and exact flatness; all invocations through op011 are consumed.
+- Tier C remains blocked until official sources prove the exact place/cancel identity mapping needed for deterministic reconciliation. No live write or retry is authorized.
 
 ### Nado
 
-- Deterministic private-read and operational adapter are integrated.
-- The earlier invocation without durable evidence remains permanently `UNKNOWN`; its identity, signature, timing, and any associated artifacts must never be reused as retry authority.
-- The fixed invocation/store remain unused. Operation is blocked because the fixed owner identity and 32-byte sign-only credential capability are not securely provisioned as owned regular `0600` files.
+- The fixed identity is securely provisioned; Ink Sepolia gas and test USDT0 collateral are available, with exactly 10 test USDT0 deposited.
+- Private-read op003 stopped before credentials after a public catalog mismatch. A later single official public diagnosis received HTTP 403 and made no code change. The next action waits for public gateway availability; consumed invocations are never reused.
 
 ### Extended
 
-- Deterministic private-read and operational adapter are integrated.
-- The fixed invocation/store remain unused. Operation is blocked because the fixed API-key capability and account/subaccount identity are not securely provisioned as owned regular `0600` files.
+- The fixed identity and API-key capability are securely provisioned. Account-shape witness op003 completed `CAPTURED` with every counter exactly `1/1` and no write.
+- The official account response is `{status, data}`, with the accepted account fields inside `data`. The next candidate must correct only this fixture/private-read parsing boundary before a fresh one-shot private-read gate.
 
 ## Exit condition
 
-- No venue is strategy-ready yet: none has passed its real bounded testnet place/reconcile/cancel/close gate with authoritative zero open orders and exact flatness.
-- After all three venues pass independently, infrastructure work stops and a separate strategy-testnet measurement task may begin.
+- Each venue must independently pass one bounded testnet place/reconcile/cancel/close lifecycle ending in authoritative zero open orders and exact flatness. Only then may a separate strategy-testnet task begin.
