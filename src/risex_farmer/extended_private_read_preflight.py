@@ -10,6 +10,7 @@ import asyncio
 import inspect
 import json
 import sqlite3
+from decimal import Decimal, InvalidOperation
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -36,6 +37,21 @@ _STREAM_TYPES = {
 }
 _STREAM_DATA_KEYS = {"orders", "positions", "trades", "balance", "spotBalances"}
 _MAX_OBSERVATION_AGE_MS = 5_000
+_TRANSPORT_KEYS = {
+    "actual_url", "method", "header_names", "direct_tls", "trust_env", "proxy",
+    "redirects", "retries", "fallbacks",
+}
+_BALANCE_KEYS = {
+    "collateralName", "balance", "equity", "availableForTrade",
+    "availableForWithdrawal", "unrealisedPnl", "initialMargin", "marginRatio",
+    "updatedTime", "spotEquity", "spotEquityForAvailableForTrade",
+    "collateralReservedForSpotOrders",
+}
+_SPOT_KEYS = {
+    "accountId", "asset", "balance", "indexPrice", "notionalValue",
+    "contributionFactor", "equityContribution", "availableToWithdraw", "absolutePnl",
+    "pnlPercentage", "averageEntryPrice", "updatedAt",
+}
 
 
 class PreflightViolation(Exception):
@@ -131,6 +147,20 @@ class PreflightStore:
             "identity_verified", "reason", "rest_calls", "status", "stream_frames"
         }:
             raise PreflightViolation("DURABLE_EVIDENCE_INVALID")
+        if (
+            type(value["status"]) is not str
+            or value["status"] not in {"READY_FIXTURE", "BLOCKED"}
+            or type(value["reason"]) is not str or not value["reason"]
+            or type(value["rest_calls"]) is not int or value["rest_calls"] < 0
+            or type(value["stream_frames"]) is not int or value["stream_frames"] < 0
+            or type(value["identity_verified"]) is not bool
+            or (value["status"] == "READY_FIXTURE" and (
+                value["reason"] != "FIXTURE_CONTRACT_PROVED"
+                or value["rest_calls"] != 6 or not value["identity_verified"]
+            ))
+            or (value["status"] == "BLOCKED" and value["identity_verified"])
+        ):
+            raise PreflightViolation("DURABLE_EVIDENCE_INVALID")
         return PreflightResult(
             status=value["status"],
             reason=value["reason"],
@@ -177,6 +207,27 @@ def _exact_object(value: Any, keys: set[str], reason: str) -> dict[str, Any]:
 
 def _integer(value: Any) -> bool:
     return type(value) is int and value >= 0
+
+
+def _decimal_string(value: Any) -> bool:
+    if type(value) is not str:
+        return False
+    try:
+        return Decimal(value).is_finite()
+    except InvalidOperation:
+        return False
+
+
+def _validate_transport(value: Any, *, url: str) -> None:
+    meta = _exact_object(value, _TRANSPORT_KEYS, "TRANSPORT_METADATA_MALFORMED")
+    if (
+        meta["actual_url"] != url or meta["method"] != "GET"
+        or meta["header_names"] != [_API_HEADER]
+        or meta["direct_tls"] is not True or meta["trust_env"] is not False
+        or meta["proxy"] is not None or meta["redirects"] != 0
+        or meta["retries"] != 0 or meta["fallbacks"] != 0
+    ):
+        raise PreflightViolation("TRANSPORT_CONTRACT_MISMATCH")
 
 
 def _validate_account(value: Any) -> None:
@@ -234,8 +285,9 @@ async def _rest_round(
         counters.rest_calls += 1
         reply = await transport.get(request)
         reply = _exact_object(
-            reply, {"status", "final_url", "observed_at_ms", "body"}, "REST_REPLY_MALFORMED"
+            reply, {"status", "final_url", "observed_at_ms", "body", "transport"}, "REST_REPLY_MALFORMED"
         )
+        _validate_transport(reply["transport"], url=request.url)
         if reply["status"] != 200:
             raise PreflightViolation("REST_HTTP_STATUS")
         if reply["final_url"] != request.url:
@@ -272,6 +324,26 @@ def _validate_stream_frame(raw: Any, previous: int | None) -> int:
                 raise PreflightViolation("STREAM_TYPE_PAYLOAD_MISMATCH")
         elif value is not None:
             raise PreflightViolation("STREAM_TYPE_PAYLOAD_MISMATCH")
+    if frame["type"] == "BALANCE":
+        balance = _exact_object(data["balance"], _BALANCE_KEYS, "STREAM_BALANCE_MALFORMED")
+        if (
+            type(balance["collateralName"]) is not str
+            or not _integer(balance["updatedTime"])
+            or any(not _decimal_string(balance[key]) for key in _BALANCE_KEYS - {"collateralName", "updatedTime"})
+        ):
+            raise PreflightViolation("STREAM_BALANCE_MALFORMED")
+    if frame["type"] == "SPOT_BALANCE":
+        for row in data["spotBalances"]:
+            spot = _exact_object(row, _SPOT_KEYS, "STREAM_SPOT_BALANCE_MALFORMED")
+            if (
+                spot["accountId"] != ACCOUNT_ID or type(spot["asset"]) is not str
+                or not _integer(spot["updatedAt"])
+                or any(
+                    spot[key] is not None and not _decimal_string(spot[key])
+                    for key in _SPOT_KEYS - {"accountId", "asset", "updatedAt"}
+                )
+            ):
+                raise PreflightViolation("STREAM_SPOT_BALANCE_MALFORMED")
     if frame["type"] == "ORDER" and data["orders"]:
         raise PreflightViolation("STREAM_ORDER_ACTIVITY")
     if frame["type"] == "POSITION" and data["positions"]:
@@ -326,6 +398,7 @@ async def _execute(
     consumer: asyncio.Task[None] | None = None
     failure: PreflightViolation | None = None
     try:
+        _validate_transport(getattr(stream, "upgrade_metadata", None), url=STREAM_URL)
         if getattr(stream, "outbound_frames", None) != []:
             raise PreflightViolation("STREAM_OUTBOUND_FORBIDDEN")
         if getattr(stream, "reconnect_count", 0) != 0:
@@ -356,9 +429,10 @@ async def _execute(
             raise PreflightViolation("STREAM_DISCONNECTED") from exc
         barrier = _exact_object(
             barrier,
-            {"connected", "same_connection", "outbound_frames", "reconnect_count", "frames"},
+            {"connected", "same_connection", "outbound_frames", "reconnect_count", "frames", "transport"},
             "STREAM_BARRIER_UNVERIFIABLE",
         )
+        _validate_transport(barrier["transport"], url=STREAM_URL)
         if barrier["connected"] is not True or barrier["same_connection"] is not True:
             raise PreflightViolation("STREAM_ENDED_EARLY")
         if barrier["outbound_frames"] != []:

@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import sqlite3
 
 import pytest
 
@@ -33,10 +34,28 @@ def wrapped(data, *, count=None):
     return {"status": "OK", "data": data, "error": None, "pagination": pagination}
 
 
+def transport_meta(url):
+    return {
+        "actual_url": url, "method": "GET", "header_names": ["X-Api-Key"],
+        "direct_tls": True, "trust_env": False, "proxy": None, "redirects": 0,
+        "retries": 0, "fallbacks": 0,
+    }
+
+
+def balance():
+    return {
+        "collateralName": "USD", "balance": "1000", "equity": "1000",
+        "availableForTrade": "900", "availableForWithdrawal": "900",
+        "unrealisedPnl": "0", "initialMargin": "0", "marginRatio": "0",
+        "updatedTime": 1770000000100, "spotEquity": "0",
+        "spotEquityForAvailableForTrade": "0", "collateralReservedForSpotOrders": "0",
+    }
+
+
 def frame(seq, *, kind="BALANCE", orders=_UNSET, positions=_UNSET, trades=_UNSET):
     data = {"orders": None, "positions": None, "trades": None, "balance": None, "spotBalances": None}
     if kind == "BALANCE":
-        data["balance"] = {}
+        data["balance"] = balance()
     elif kind == "SPOT_BALANCE":
         data["spotBalances"] = []
     elif kind == "ORDER":
@@ -61,7 +80,7 @@ def frame(seq, *, kind="BALANCE", orders=_UNSET, positions=_UNSET, trades=_UNSET
 
 
 class FixtureStream:
-    def __init__(self, frames, timeline, *, outbound=None, reconnects=0):
+    def __init__(self, frames, timeline, *, outbound=None, reconnects=0, barrier_override=None, metadata_mutation=None):
         self.queue = asyncio.Queue()
         for item in frames:
             self.queue.put_nowait(item)
@@ -69,6 +88,9 @@ class FixtureStream:
         self.outbound_frames = [] if outbound is None else list(outbound)
         self.reconnect_count = reconnects
         self.closed = False
+        self.upgrade_metadata = transport_meta(STREAM_URL)
+        self.barrier_override = barrier_override
+        self.metadata_mutation = metadata_mutation
 
     async def recv(self):
         self.timeline.append("RECV")
@@ -87,14 +109,22 @@ class FixtureStream:
 
     async def final_barrier(self):
         self.timeline.append("BARRIER")
+        if isinstance(self.barrier_override, BaseException):
+            raise self.barrier_override
         self.queue.put_nowait(_BARRIER)
-        return {
+        value = {
             "connected": True,
             "same_connection": True,
             "outbound_frames": copy.deepcopy(self.outbound_frames),
             "reconnect_count": self.reconnect_count,
             "frames": [],
+            "transport": transport_meta(STREAM_URL),
         }
+        if self.barrier_override:
+            value.update(copy.deepcopy(self.barrier_override))
+        if self.metadata_mutation:
+            self.metadata_mutation(value["transport"])
+        return value
 
     def push(self, item):
         self.queue.put_nowait(item)
@@ -107,7 +137,7 @@ class FixtureStream:
 class FixtureTransport:
     def __init__(
         self, *, frames=None, outbound=None, reconnects=0, mutation=None,
-        inject_at=None, inject_item=None,
+        inject_at=None, inject_item=None, barrier_override=None, metadata_mutation=None,
     ):
         data = contract()
         self.timeline = []
@@ -116,7 +146,8 @@ class FixtureTransport:
         self.stream = FixtureStream(
             [] if frames is None else frames,
             self.timeline,
-            outbound=outbound, reconnects=reconnects,
+            outbound=outbound, reconnects=reconnects, barrier_override=barrier_override,
+            metadata_mutation=metadata_mutation,
         )
         self.responses = {
             "/user/account/info": wrapped(data["account"]),
@@ -126,6 +157,9 @@ class FixtureTransport:
         self.mutation = mutation
         self.inject_at = inject_at
         self.inject_item = inject_item
+        self.metadata_mutation = metadata_mutation
+        if metadata_mutation:
+            metadata_mutation(self.stream.upgrade_metadata)
 
     async def get(self, request):
         self.timeline.append(f"GET_{request.round_name}_{request.path}")
@@ -136,12 +170,16 @@ class FixtureTransport:
         body = copy.deepcopy(self.responses[request.path])
         if self.mutation:
             body = self.mutation(request, body)
-        return {
+        reply = {
             "status": 200,
             "final_url": request.url,
             "observed_at_ms": 1770000000000 + (0 if request.round_name == "A" else 200),
             "body": body,
+            "transport": transport_meta(request.url),
         }
+        if self.metadata_mutation:
+            self.metadata_mutation(reply["transport"])
+        return reply
 
     async def open_stream(self, request):
         self.timeline.append("OPEN")
@@ -271,6 +309,82 @@ async def test_type_payload_contradictions_and_unproven_types_block(tmp_path, ba
     result, _, _ = await execute(tmp_path, FixtureTransport(frames=[bad]))
     assert result.status == "BLOCKED"
     assert result.reason in {"STREAM_TYPE_PAYLOAD_MISMATCH", "STREAM_UNKNOWN_FRAME"}
+
+
+@pytest.mark.asyncio
+async def test_balance_and_spot_balance_are_exhaustively_decoded(tmp_path):
+    bad_balance = frame(40)
+    bad_balance["data"]["balance"].pop("equity")
+    extra_balance = frame(40)
+    extra_balance["data"]["balance"]["extra"] = "0"
+    nan_balance = frame(40)
+    nan_balance["data"]["balance"]["balance"] = "NaN"
+    spot = frame(40, kind="SPOT_BALANCE")
+    spot["data"]["spotBalances"] = [{
+        "accountId": ACCOUNT_ID + 1, "asset": "USDC", "balance": "1", "indexPrice": "1",
+        "notionalValue": "1", "contributionFactor": "1", "equityContribution": "1",
+        "availableToWithdraw": None, "absolutePnl": None, "pnlPercentage": None,
+        "averageEntryPrice": None, "updatedAt": 1770000000100,
+    }]
+    for index, bad in enumerate((bad_balance, extra_balance, nan_balance, spot)):
+        result, _, _ = await execute(tmp_path / str(index), FixtureTransport(frames=[bad]))
+        assert result.status == "BLOCKED"
+        assert result.reason in {"STREAM_BALANCE_MALFORMED", "STREAM_SPOT_BALANCE_MALFORMED"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("actual_url", "wss://wrong.invalid/v1/account"), ("method", "POST"),
+        ("header_names", ["Authorization"]), ("direct_tls", False),
+        ("trust_env", True), ("proxy", "http://proxy.invalid"),
+        ("redirects", 1), ("retries", 1), ("fallbacks", 1),
+    ],
+)
+async def test_actual_transport_metadata_mismatch_blocks(tmp_path, key, value):
+    def mutate(meta):
+        meta[key] = value
+    result, _, _ = await execute(tmp_path, FixtureTransport(metadata_mutation=mutate))
+    assert (result.status, result.reason) == ("BLOCKED", "TRANSPORT_CONTRACT_MISMATCH")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "override,reason,initial",
+    [
+        (StopAsyncIteration(), "STREAM_ENDED_EARLY", []),
+        (ConnectionError("end"), "STREAM_DISCONNECTED", []),
+        ({"connected": False}, "STREAM_ENDED_EARLY", []),
+        ({"same_connection": False}, "STREAM_ENDED_EARLY", []),
+        ({"extra": 1}, "STREAM_BARRIER_UNVERIFIABLE", []),
+        ({"outbound_frames": [{"method": "subscribe"}]}, "STREAM_OUTBOUND_FORBIDDEN", []),
+        ({"reconnect_count": 1}, "STREAM_RECONNECT_FORBIDDEN", []),
+        ({"frames": [frame(41, kind="POSITION", positions=[{"id": 1}])]}, "STREAM_POSITION_ACTIVITY", []),
+        ({"frames": [frame(42)]}, "STREAM_SEQUENCE_GAP", [frame(40)]),
+        ({"frames": [frame(40)]}, "STREAM_SEQUENCE_DUPLICATE", [frame(40)]),
+        ({"frames": [frame(39)]}, "STREAM_SEQUENCE_REGRESSION", [frame(40)]),
+    ],
+)
+async def test_final_barrier_adverse_contracts_block(tmp_path, override, reason, initial):
+    result, _, _ = await execute(tmp_path, FixtureTransport(frames=initial, barrier_override=override))
+    assert (result.status, result.reason) == ("BLOCKED", reason)
+
+
+@pytest.mark.asyncio
+async def test_corrupt_terminal_evidence_never_replays_or_returns_ready(tmp_path):
+    store = PreflightStore(tmp_path / "preflight.sqlite")
+    first, _, _ = await execute(tmp_path)
+    assert first.status == "READY_FIXTURE"
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            "UPDATE extended_private_read_preflight SET evidence=? WHERE singleton=1",
+            ('{"identity_verified":"yes","reason":"FIXTURE_CONTRACT_PROVED","rest_calls":6,"status":"READY_FIXTURE","stream_frames":0}',),
+        )
+    loader, transport = Loader(), FixtureTransport()
+    with pytest.raises(Exception, match="DURABLE_EVIDENCE_INVALID"):
+        await run_preflight(store=store, credential_loader=loader, transport=transport, now_ms=1770000000600)
+    assert loader.calls == 0 and transport.get_calls == [] and transport.open_calls == []
 
 
 @pytest.mark.asyncio
