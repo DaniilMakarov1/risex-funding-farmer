@@ -93,6 +93,7 @@ class PreflightResult:
     rest_calls: int
     stream_frames: int
     identity_verified: bool
+    clock_calls: int
 
     def evidence(self) -> str:
         return json.dumps(
@@ -102,6 +103,7 @@ class PreflightResult:
                 "rest_calls": self.rest_calls,
                 "status": self.status,
                 "stream_frames": self.stream_frames,
+                "clock_calls": self.clock_calls,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -112,11 +114,17 @@ class PreflightResult:
 class _Counters:
     rest_calls: int = 0
     stream_frames: int = 0
+    clock_calls: int = 0
 
 
 @dataclass
 class _StreamState:
     previous_sequence: int | None = None
+
+
+@dataclass
+class _ClockState:
+    previous_current: int | None = None
 
 
 class PreflightStore:
@@ -146,7 +154,8 @@ class PreflightStore:
     def _decode(raw: str) -> PreflightResult:
         value = json.loads(raw)
         if set(value) != {
-            "identity_verified", "reason", "rest_calls", "status", "stream_frames"
+            "identity_verified", "reason", "rest_calls", "status", "stream_frames",
+            "clock_calls",
         }:
             raise PreflightViolation("DURABLE_EVIDENCE_INVALID")
         if (
@@ -155,10 +164,12 @@ class PreflightStore:
             or type(value["reason"]) is not str or not value["reason"]
             or type(value["rest_calls"]) is not int or value["rest_calls"] < 0
             or type(value["stream_frames"]) is not int or value["stream_frames"] < 0
+            or type(value["clock_calls"]) is not int or value["clock_calls"] < 0
             or type(value["identity_verified"]) is not bool
             or (value["status"] == "READY_FIXTURE" and (
                 value["reason"] != "FIXTURE_CONTRACT_PROVED"
-                or value["rest_calls"] != 6 or not value["identity_verified"]
+                or value["rest_calls"] != 6 or value["clock_calls"] != 7
+                or not value["identity_verified"]
             ))
             or (value["status"] == "BLOCKED" and value["identity_verified"])
         ):
@@ -169,6 +180,7 @@ class PreflightStore:
             rest_calls=value["rest_calls"],
             stream_frames=value["stream_frames"],
             identity_verified=value["identity_verified"],
+            clock_calls=value["clock_calls"],
         )
 
     def claim(self) -> PreflightResult | None:
@@ -209,6 +221,23 @@ def _exact_object(value: Any, keys: set[str], reason: str) -> dict[str, Any]:
 
 def _integer(value: Any) -> bool:
     return type(value) is int and value >= 0
+
+
+def _fresh_current(
+    observed: Any, clock_ms: Any, counters: _Counters, clock_state: _ClockState
+) -> int:
+    counters.clock_calls += 1
+    current = clock_ms()
+    if not _integer(current) or not _integer(observed):
+        raise PreflightViolation("CLOCK_EVIDENCE_INVALID")
+    if clock_state.previous_current is not None and current < clock_state.previous_current:
+        raise PreflightViolation("CLOCK_REGRESSION")
+    clock_state.previous_current = current
+    if observed > current:
+        raise PreflightViolation("EVIDENCE_FROM_FUTURE")
+    if current - observed > _MAX_OBSERVATION_AGE_MS:
+        raise PreflightViolation("EVIDENCE_STALE")
+    return current
 
 
 def _decimal_string(value: Any) -> bool:
@@ -285,7 +314,8 @@ def _validate_wrapper(body: Any, path: str) -> None:
 
 
 async def _rest_round(
-    transport: Any, api_key: str, round_name: str, now_ms: int, counters: _Counters
+    transport: Any, api_key: str, round_name: str, clock_ms: Any,
+    counters: _Counters, clock_state: _ClockState,
 ) -> list[int]:
     observations: list[int] = []
     for path in _REST_PATHS:
@@ -307,8 +337,7 @@ async def _rest_round(
         if reply["final_url"] != request.url:
             raise PreflightViolation("REST_REDIRECT_FORBIDDEN")
         observed = reply["observed_at_ms"]
-        if not _integer(observed) or observed > now_ms or now_ms - observed > _MAX_OBSERVATION_AGE_MS:
-            raise PreflightViolation("REST_EVIDENCE_STALE")
+        _fresh_current(observed, clock_ms, counters, clock_state)
         _validate_wrapper(reply["body"], path)
         observations.append(observed)
     return observations
@@ -401,10 +430,11 @@ async def _load_api_key(loader: Any) -> str:
 
 
 async def _execute(
-    credential_loader: Any, transport: Any, now_ms: int, counters: _Counters
+    credential_loader: Any, transport: Any, clock_ms: Any, counters: _Counters
 ) -> PreflightResult:
     api_key = await _load_api_key(credential_loader)
-    round_a = await _rest_round(transport, api_key, "A", now_ms, counters)
+    clock_state = _ClockState()
+    round_a = await _rest_round(transport, api_key, "A", clock_ms, counters, clock_state)
     stream = await transport.open_stream(
         StreamRequest(url=STREAM_URL, headers={_API_HEADER: api_key})
     )
@@ -419,7 +449,7 @@ async def _execute(
             raise PreflightViolation("STREAM_RECONNECT_FORBIDDEN")
         consumer = asyncio.create_task(_consume_stream(stream, counters, state))
         round_b_task = asyncio.create_task(
-            _rest_round(transport, api_key, "B", now_ms, counters)
+            _rest_round(transport, api_key, "B", clock_ms, counters, clock_state)
         )
         done, _ = await asyncio.wait(
             {consumer, round_b_task}, return_when=asyncio.FIRST_COMPLETED
@@ -443,10 +473,13 @@ async def _execute(
             raise PreflightViolation("STREAM_DISCONNECTED") from exc
         barrier = _exact_object(
             barrier,
-            {"connected", "same_connection", "outbound_frames", "reconnect_count", "frames", "transport"},
+            {"connected", "same_connection", "outbound_frames", "reconnect_count", "frames", "transport", "observed_at_ms"},
             "STREAM_BARRIER_UNVERIFIABLE",
         )
         _validate_transport(barrier["transport"], url=STREAM_URL)
+        _fresh_current(barrier["observed_at_ms"], clock_ms, counters, clock_state)
+        if not _integer(barrier["observed_at_ms"]) or barrier["observed_at_ms"] < max(round_b):
+            raise PreflightViolation("STREAM_BARRIER_TIME_INVALID")
         if barrier["connected"] is not True or barrier["same_connection"] is not True:
             raise PreflightViolation("STREAM_ENDED_EARLY")
         if barrier["outbound_frames"] != []:
@@ -483,12 +516,12 @@ async def _execute(
         raise failure
     return PreflightResult(
         "READY_FIXTURE", "FIXTURE_CONTRACT_PROVED",
-        counters.rest_calls, counters.stream_frames, True,
+        counters.rest_calls, counters.stream_frames, True, counters.clock_calls,
     )
 
 
 async def run_preflight(
-    *, store: PreflightStore, credential_loader: Any, transport: Any, now_ms: int
+    *, store: PreflightStore, credential_loader: Any, transport: Any, clock_ms: Any
 ) -> PreflightResult:
     """Consume the fixture one-shot and persist one redacted terminal verdict."""
 
@@ -497,21 +530,23 @@ async def run_preflight(
         return existing
     counters = _Counters()
     try:
-        result = await _execute(credential_loader, transport, now_ms, counters)
+        result = await _execute(credential_loader, transport, clock_ms, counters)
     except asyncio.CancelledError:
         result = PreflightResult(
-            "BLOCKED", "CANCELLED", counters.rest_calls, counters.stream_frames, False
+            "BLOCKED", "CANCELLED", counters.rest_calls, counters.stream_frames, False,
+            counters.clock_calls,
         )
         store.terminal(result)
         raise
     except PreflightViolation as exc:
         result = PreflightResult(
-            "BLOCKED", str(exc), counters.rest_calls, counters.stream_frames, False
+            "BLOCKED", str(exc), counters.rest_calls, counters.stream_frames, False,
+            counters.clock_calls,
         )
     except Exception:
         result = PreflightResult(
             "BLOCKED", "UNEXPECTED_FAILURE", counters.rest_calls,
-            counters.stream_frames, False,
+            counters.stream_frames, False, counters.clock_calls,
         )
     store.terminal(result)
     return result

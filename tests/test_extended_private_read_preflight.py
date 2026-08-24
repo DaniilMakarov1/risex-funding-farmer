@@ -127,6 +127,7 @@ class FixtureStream:
             "reconnect_count": self.reconnect_count,
             "frames": [],
             "transport": transport_meta(STREAM_URL),
+            "observed_at_ms": 1770000000300,
         }
         if self.barrier_override:
             value.update(copy.deepcopy(self.barrier_override))
@@ -146,6 +147,7 @@ class FixtureTransport:
     def __init__(
         self, *, frames=None, outbound=None, reconnects=0, mutation=None,
         inject_at=None, inject_item=None, barrier_override=None, metadata_mutation=None,
+        observed_mutation=None,
     ):
         data = contract()
         self.timeline = []
@@ -166,6 +168,7 @@ class FixtureTransport:
         self.inject_at = inject_at
         self.inject_item = inject_item
         self.metadata_mutation = metadata_mutation
+        self.observed_mutation = observed_mutation
         if metadata_mutation:
             metadata_mutation(self.stream.upgrade_metadata)
 
@@ -185,6 +188,8 @@ class FixtureTransport:
             "body": body,
             "transport": transport_meta(request.url),
         }
+        if self.observed_mutation:
+            reply["observed_at_ms"] = self.observed_mutation(request, reply["observed_at_ms"])
         if self.metadata_mutation:
             self.metadata_mutation(reply["transport"])
         return reply
@@ -204,14 +209,27 @@ class Loader:
         return API_KEY
 
 
-async def execute(tmp_path, transport=None, loader=None):
+class Clock:
+    def __init__(self, values=None):
+        self.values = iter(values or (
+            [1770000000100] * 3 + [1770000000300] * 3 + [1770000000400]
+        ))
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        return next(self.values)
+
+
+async def execute(tmp_path, transport=None, loader=None, clock=None):
     transport = transport or FixtureTransport()
     loader = loader or Loader()
+    clock = clock or Clock()
     result = await run_preflight(
         store=PreflightStore(tmp_path / "preflight.sqlite"),
         credential_loader=loader,
         transport=transport,
-        now_ms=1770000000500,
+        clock_ms=clock,
     )
     return result, transport, loader
 
@@ -229,6 +247,7 @@ async def test_ready_uses_exact_v1_path_header_and_no_application_frames(tmp_pat
     assert transport.stream.outbound_frames == []
     assert transport.stream.reconnect_count == 0
     assert result.stream_frames == 0
+    assert result.clock_calls == 7
     assert len(transport.get_calls) == 6
     assert all(call.method == "GET" for call in transport.get_calls)
     assert all(
@@ -285,6 +304,17 @@ async def test_transient_activity_sequence_and_bad_frames_block(tmp_path, bad_fr
 
 
 @pytest.mark.asyncio
+async def test_server_frame_ts_is_typed_but_not_rest_freshness_authority(tmp_path):
+    server_frame = frame(40)
+    server_frame["ts"] = 9999999999999
+    result, _, _ = await execute(tmp_path, FixtureTransport(frames=[server_frame]))
+    assert result.status == "READY_FIXTURE"
+    server_frame["ts"] = True
+    result, _, _ = await execute(tmp_path / "bool", FixtureTransport(frames=[server_frame]))
+    assert (result.status, result.reason) == ("BLOCKED", "STREAM_MALFORMED_FRAME")
+
+
+@pytest.mark.asyncio
 async def test_activity_injected_during_slow_round_b_is_counted_and_terminal(tmp_path):
     transport = FixtureTransport(
         inject_at=("B", "/user/orders"),
@@ -292,13 +322,16 @@ async def test_activity_injected_during_slow_round_b_is_counted_and_terminal(tmp
     )
     store = PreflightStore(tmp_path / "preflight.sqlite")
     loader = Loader()
-    result = await run_preflight(store=store, credential_loader=loader, transport=transport, now_ms=1770000000500)
+    result = await run_preflight(store=store, credential_loader=loader, transport=transport, clock_ms=Clock())
     assert (result.status, result.reason) == ("BLOCKED", "STREAM_POSITION_ACTIVITY")
     assert (result.rest_calls, result.stream_frames) == (5, 1)
+    assert result.clock_calls == 4
     replay_loader, replay_transport = Loader(), FixtureTransport()
-    replay = await run_preflight(store=store, credential_loader=replay_loader, transport=replay_transport, now_ms=1770000000600)
+    replay_clock = Clock()
+    replay = await run_preflight(store=store, credential_loader=replay_loader, transport=replay_transport, clock_ms=replay_clock)
     assert replay == result
     assert replay_loader.calls == 0 and replay_transport.get_calls == []
+    assert replay_clock.calls == 0
 
 
 @pytest.mark.asyncio
@@ -364,6 +397,41 @@ async def test_actual_transport_metadata_mismatch_blocks(tmp_path, key, value):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("round_name,mode", [("A", "stale"), ("A", "future"), ("B", "stale"), ("B", "future")])
+async def test_each_rest_round_rejects_stale_or_future_observations(tmp_path, round_name, mode):
+    def mutate(request, observed):
+        if request.round_name != round_name:
+            return observed
+        return 1769999990000 if mode == "stale" else 1770000001000
+    result, _, _ = await execute(tmp_path, FixtureTransport(observed_mutation=mutate))
+    assert result.status == "BLOCKED"
+    assert result.reason == ("EVIDENCE_STALE" if mode == "stale" else "EVIDENCE_FROM_FUTURE")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("observed", [True, "1770000000000"])
+async def test_non_integer_rest_observation_blocks(tmp_path, observed):
+    result, _, _ = await execute(
+        tmp_path, FixtureTransport(observed_mutation=lambda request, value: observed)
+    )
+    assert (result.status, result.reason) == ("BLOCKED", "CLOCK_EVIDENCE_INVALID")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("current", [True, "1770000000100"])
+async def test_non_integer_current_clock_blocks(tmp_path, current):
+    result, _, _ = await execute(tmp_path, clock=Clock([current]))
+    assert (result.status, result.reason) == ("BLOCKED", "CLOCK_EVIDENCE_INVALID")
+
+
+@pytest.mark.asyncio
+async def test_current_clock_regression_blocks(tmp_path):
+    values = [1770000000100] * 3 + [1770000000050]
+    result, _, _ = await execute(tmp_path, clock=Clock(values))
+    assert (result.status, result.reason) == ("BLOCKED", "CLOCK_REGRESSION")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "override,reason,initial",
     [
@@ -374,6 +442,10 @@ async def test_actual_transport_metadata_mismatch_blocks(tmp_path, key, value):
         ({"extra": 1}, "STREAM_BARRIER_UNVERIFIABLE", []),
         ({"outbound_frames": [{"method": "subscribe"}]}, "STREAM_OUTBOUND_FORBIDDEN", []),
         ({"reconnect_count": 1}, "STREAM_RECONNECT_FORBIDDEN", []),
+        ({"observed_at_ms": 1769999990000}, "EVIDENCE_STALE", []),
+        ({"observed_at_ms": 1770000001000}, "EVIDENCE_FROM_FUTURE", []),
+        ({"observed_at_ms": True}, "CLOCK_EVIDENCE_INVALID", []),
+        ({"observed_at_ms": 1770000000100}, "STREAM_BARRIER_TIME_INVALID", []),
         ({"frames": [frame(41, kind="POSITION", positions=[{"id": 1}])]}, "STREAM_POSITION_ACTIVITY", []),
         ({"frames": [frame(42)]}, "STREAM_SEQUENCE_GAP", [frame(40)]),
         ({"frames": [frame(40)]}, "STREAM_SEQUENCE_DUPLICATE", [frame(40)]),
@@ -396,9 +468,11 @@ async def test_corrupt_terminal_evidence_never_replays_or_returns_ready(tmp_path
             ('{"identity_verified":"yes","reason":"FIXTURE_CONTRACT_PROVED","rest_calls":6,"status":"READY_FIXTURE","stream_frames":0}',),
         )
     loader, transport = Loader(), FixtureTransport()
+    corrupt_clock = Clock()
     with pytest.raises(Exception, match="DURABLE_EVIDENCE_INVALID"):
-        await run_preflight(store=store, credential_loader=loader, transport=transport, now_ms=1770000000600)
+        await run_preflight(store=store, credential_loader=loader, transport=transport, clock_ms=corrupt_clock)
     assert loader.calls == 0 and transport.get_calls == [] and transport.open_calls == []
+    assert corrupt_clock.calls == 0
 
 
 @pytest.mark.asyncio
@@ -445,13 +519,15 @@ async def test_terminal_restart_makes_zero_loader_or_transport_calls_and_evidenc
     store = PreflightStore(tmp_path / "preflight.sqlite")
     loader = Loader()
     transport = FixtureTransport()
-    first = await run_preflight(store=store, credential_loader=loader, transport=transport, now_ms=1770000000500)
+    first = await run_preflight(store=store, credential_loader=loader, transport=transport, clock_ms=Clock())
     assert first.status == "READY_FIXTURE"
     second_loader = Loader()
     second_transport = FixtureTransport()
-    second = await run_preflight(store=store, credential_loader=second_loader, transport=second_transport, now_ms=1770000000600)
+    second_clock = Clock()
+    second = await run_preflight(store=store, credential_loader=second_loader, transport=second_transport, clock_ms=second_clock)
     assert second == first
     assert second_loader.calls == 0 and second_transport.get_calls == [] and second_transport.open_calls == []
+    assert second_clock.calls == 0
     evidence = (tmp_path / "preflight.sqlite").read_bytes()
     assert API_KEY.encode() not in evidence
     assert b"synthetic fixture account" not in evidence
@@ -472,7 +548,7 @@ async def test_cancellation_is_durably_terminal_and_cannot_replay(tmp_path):
     loader = Loader()
     transport = BlockingTransport()
     task = asyncio.create_task(
-        run_preflight(store=store, credential_loader=loader, transport=transport, now_ms=1770000000500)
+        run_preflight(store=store, credential_loader=loader, transport=transport, clock_ms=Clock())
     )
     await transport.started.wait()
     task.cancel()
@@ -480,12 +556,15 @@ async def test_cancellation_is_durably_terminal_and_cannot_replay(tmp_path):
         await task
     replay_loader = Loader()
     replay_transport = FixtureTransport()
+    replay_clock = Clock()
     result = await run_preflight(
-        store=store, credential_loader=replay_loader, transport=replay_transport, now_ms=1770000000600
+        store=store, credential_loader=replay_loader, transport=replay_transport, clock_ms=replay_clock
     )
     assert (result.status, result.reason) == ("BLOCKED", "CANCELLED")
     assert (result.rest_calls, result.stream_frames) == (1, 0)
+    assert result.clock_calls == 0
     assert replay_loader.calls == 0 and replay_transport.get_calls == [] and replay_transport.open_calls == []
+    assert replay_clock.calls == 0
 
 
 def test_module_is_not_imported_by_normal_startup():
