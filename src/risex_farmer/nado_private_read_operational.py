@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import pwd
+import secrets
 import stat
 from typing import Callable
 
@@ -23,13 +24,12 @@ from .nado_private_read_preflight import (
 )
 
 
-INVOCATION_ID = "nado-private-read-20260824-new-op-003"
-STORE_BASENAME = ".risex-funding-farmer-nado-private-read-20260824-new-op-003.sqlite3"
+STORE_BASENAME = ".risex-funding-farmer-nado-private-read-runs-v1.sqlite3"
 KEY_BASENAME = ".risex-funding-farmer-nado-owner-key-v1"
 IDENTITY_BASENAME = ".risex-funding-farmer-nado-owner-v1"
 SUBACCOUNT_NAME = "default"
 REDACTED_STORE_PATH = "<passwd-home>/" + STORE_BASENAME
-EXPECTED_PATH_HASH = "f15a2af5b4a440eb10bc35752c387ed942deb1115ee99a619e3dcee1ad0dfbaa"
+EXPECTED_PATH_HASH = "8aabcb7a53b1e87f0ca3a0799e71acbdd7aed936218a6f8e1b20cef58e1b2341"
 MAX_IDENTITY_BYTES = 160
 
 
@@ -42,6 +42,10 @@ def _production_store_path() -> Path:
     if hashlib.sha256(os.fsencode(path)).hexdigest() != EXPECTED_PATH_HASH:
         raise NadoPreflightError("fixed store identity mismatch")
     return path
+
+
+def _new_runtime_run_id() -> str:
+    return "nado-read-" + secrets.token_hex(16)
 
 
 def _open_owned_file_once(basename: str, maximum: int) -> bytes:
@@ -198,11 +202,11 @@ def _prepare_store(path: Path) -> OneShotStore:
 
 
 async def run() -> dict[str, object]:
-    """Run the exact fixed production operation; requires a separate Chief gate."""
+    """Run one fresh production observation; requires a separate Chief gate."""
     owner, sender = _strict_identity()
     config = PreflightConfig(
         owner=owner, subaccount_name=SUBACCOUNT_NAME, sender=sender,
-        invocation_id=INVOCATION_ID, exclusive_owner_lease=True,
+        invocation_id=_new_runtime_run_id(), exclusive_owner_lease=True,
         direct_owner_eoa=True,
     )
     store = _prepare_store(_production_store_path())

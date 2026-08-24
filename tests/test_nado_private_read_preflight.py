@@ -1438,38 +1438,91 @@ async def test_counted_interrupted_new_is_terminal_zero_effect(
     assert effects == {"load": 0, "network": 0}
 
 
-def test_operational_binding_has_fixed_read_only_surface() -> None:
+def test_operational_binding_has_runtime_read_only_surface() -> None:
     import risex_farmer
     import risex_farmer.nado_private_read_operational as operational
 
     source = inspect.getsource(operational)
     assert tuple(inspect.signature(operational.run).parameters) == ()
-    assert operational.INVOCATION_ID == "nado-private-read-20260824-new-op-003"
+    assert not hasattr(operational, "INVOCATION_ID")
     assert operational.STORE_BASENAME == (
-        ".risex-funding-farmer-nado-private-read-20260824-new-op-003.sqlite3"
+        ".risex-funding-farmer-nado-private-read-runs-v1.sqlite3"
     )
     assert operational.SUBACCOUNT_NAME == "default"
     assert operational.EXPECTED_PATH_HASH == (
-        "f15a2af5b4a440eb10bc35752c387ed942deb1115ee99a619e3dcee1ad0dfbaa"
+        "8aabcb7a53b1e87f0ca3a0799e71acbdd7aed936218a6f8e1b20cef58e1b2341"
     )
-    for consumed in ("op-001", "op-002"):
-        assert consumed not in operational.INVOCATION_ID
+    for consumed in ("op-001", "op-002", "op-003", "20260824"):
         assert consumed not in operational.STORE_BASENAME
+        assert consumed not in source
     assert "nado_private_read_operational" not in Path(risex_farmer.__file__).read_text()
     for forbidden in ("/execute", "retry", "proxy=", "os.environ", "argparse"):
         assert forbidden not in source
 
 
-def test_op003_store_collision_cannot_rearm_fixed_invocation(tmp_path: Path) -> None:
+def test_runtime_run_id_allocator_is_fresh_and_preflight_valid(
+    contract: dict[str, object],
+) -> None:
+    import risex_farmer.nado_private_read_operational as operational
+
+    run_ids = {operational._new_runtime_run_id() for _ in range(32)}
+    assert len(run_ids) == 32
+    for run_id in run_ids:
+        assert run_id.startswith("nado-read-")
+        _config(contract, invocation_id=run_id)
+
+
+@pytest.mark.asyncio
+async def test_runtime_ids_are_fresh_and_durable_in_one_protected_journal(
+    tmp_path: Path, contract: dict[str, object], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import risex_farmer.nado_private_read_operational as operational
+
+    path = tmp_path / operational.STORE_BASENAME
+    run_ids = iter(("nado-read-a", "nado-read-b"))
+    observed: list[str] = []
+
+    async def fixture_adapter(**kwargs: object) -> dict[str, object]:
+        config = kwargs["config"]
+        store = kwargs["store"]
+        assert isinstance(config, nado.PreflightConfig)
+        assert isinstance(store, nado.OneShotStore)
+        store.begin(config.invocation_id, "identity", str(kwargs["path_hash"]))
+        observed.append(config.invocation_id)
+        return {"status": nado.FINALIZED, "invocation_id": config.invocation_id}
+
+    monkeypatch.setattr(operational, "_new_runtime_run_id", lambda: next(run_ids))
+    monkeypatch.setattr(operational, "_strict_identity", lambda: (
+        str(contract["owner"]), str(contract["sender"]),
+    ))
+    monkeypatch.setattr(operational, "_production_store_path", lambda: path)
+    monkeypatch.setattr(
+        operational, "_run_counted_operational_private_read", fixture_adapter,
+    )
+
+    first = await operational.run()
+    second = await operational.run()
+
+    assert first["invocation_id"] == "nado-read-a"
+    assert second["invocation_id"] == "nado-read-b"
+    assert observed == ["nado-read-a", "nado-read-b"]
+    assert path.stat().st_mode & 0o777 == 0o600
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT invocation_id FROM nado_preflight_one_shot ORDER BY rowid"
+        ).fetchall() == [("nado-read-a",), ("nado-read-b",)]
+
+
+def test_runtime_id_collision_cannot_rearm_invocation(tmp_path: Path) -> None:
     import risex_farmer.nado_private_read_operational as operational
 
     path = tmp_path / operational.STORE_BASENAME
     first = operational._prepare_store(path)
-    first.begin(operational.INVOCATION_ID, "identity", "path")
+    first.begin("nado-read-collision", "identity", "path")
     first.close()
     collided = operational._prepare_store(path)
     with pytest.raises(nado.NadoPreflightError, match="already exists"):
-        collided.begin(operational.INVOCATION_ID, "identity", "path")
+        collided.begin("nado-read-collision", "identity", "path")
     collided.close()
 
 
