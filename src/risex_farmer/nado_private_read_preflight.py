@@ -1522,7 +1522,7 @@ async def _run_counted_operational_private_read(
             reason = (
                 "AMBIGUOUS_DISPATCH"
                 if counters["trigger_dispatch_attempts"]
-                > counters["trigger_observation_completions"]
+                > counters["trigger_dispatch_completions"]
                 else "VALIDATION_FAILED"
             )
             store.terminalize_unknown(invocation_id, reason)
