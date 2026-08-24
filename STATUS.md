@@ -11,7 +11,7 @@
 
 - Private-read op011 passed with complete counters, authoritative zero orders, and exact flatness; all invocations through op011 are consumed.
 - The accepted fixture lifecycle now binds `client_order_id` to composite, wide, and resting order identities, matching order/fill records, the exact cancel action/body identity split, and a fresh authoritative market position. It preserves durable no-replay and terminal zero-order/exact-flat barriers.
-- The next slice is an isolated fixture-tested Tier C operational adapter candidate. No credential access, signature, request dispatch, or live write is authorized before that candidate is independently accepted and receives its own one-shot Chief operational gate.
+- The frozen milestone remains fixture-only and contains no accepted production credential, signing, or live-transport binding. A live lifecycle cannot start until an explicit user decision authorizes that minimal expansion; no credential access, signature, request dispatch, or live write is authorized.
 
 ### Nado
 

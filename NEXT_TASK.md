@@ -2,13 +2,12 @@
 
 One slice per venue. Secrets stay outside Git and reports. Private reads and writes run sequentially and never retry an ambiguous operation.
 
-## RISEx — prepare the sealed Tier C operational adapter
+## RISEx — preserve the fixture/live boundary
 
-Status: `READY FOR TIER C OPERATIONAL-ADAPTER START GATE`.
+Status: `BLOCKED — FROZEN FIXTURE MILESTONE HAS NO LIVE OPERATIONAL PATH`.
 
-- From the then-current published `main`, prepare one isolated RED-before-GREEN candidate that wires the accepted fixture lifecycle into one sealed fixed-destination testnet operation with durable counters and terminal evidence for preflight, credential load, place, exact identity reconciliation, bounded cancel/close, and the final authoritative zero-order/exact-flat barrier.
-- Development and tests use synthetic credentials, fixture responses, and disposable stores only. Preserve one durable identity/nonce/digest before every dispatch, no blind retry, at most one exact known-order cancel, at most three fresh-position-derived close intents, and notional `<= USD 500`.
-- Use only current official RISEx REST/WebSocket/UI-contract sources. Do not load real credentials, sign, dispatch, run live traffic, or change Scanner/runtime/repository/economics/strategy/Telegram. A separately accepted candidate and a separate Chief operational gate are required before one live testnet lifecycle.
+- The official identity chain and fixture lifecycle are accepted, but `SYSTEM_SPEC.md` section 25 explicitly excludes a production credential invocation, private/live transport, CLI, and live-smoke path from this milestone. Do not create an operational adapter by governance inference.
+- A new explicit user decision is required before the minimum sealed Tier C production binding may be specified or implemented. Until then do not load credentials, sign, dispatch, or run live traffic; all accepted invocations remain consumed.
 
 ## Nado — resume public preflight diagnosis
 
