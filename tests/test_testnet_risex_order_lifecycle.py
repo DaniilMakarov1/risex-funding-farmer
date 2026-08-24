@@ -6,9 +6,10 @@ from decimal import Decimal
 import pytest
 
 from risex_farmer.testnet_risex_order_lifecycle import (
-    AccountState, BBO, DurableIntentStore, Evidence, HEADER_FLAGS, Lifecycle,
-    LifecycleSafetyError, MarketState, Outcome, SyntheticSigner,
-    encode_place_action, pack_order_data,
+    AccountState, BBO, CANCEL_ACTION, DurableIntentStore, Evidence, FillRecord,
+    HEADER_FLAGS, Lifecycle, LifecycleSafetyError, MarketState, OrderRecord,
+    Outcome, SyntheticSigner, encode_cancel_action, encode_place_action,
+    pack_order_data,
 )
 
 NOW = 1_800_000_000
@@ -31,6 +32,31 @@ EXPECTED_ABI = (
     "0000000000000000000000000000000000000000000000000000000000000065"
     "0000000000000000000000000000000000000000000000000000000000000000"
 )
+EXPECTED_CANCEL_ABI = (
+    "5b9cc6280e71dfbb2c676ca979b5dac4a65a90e224b393011adb1c9d93b05a83"
+    "0000000000000000000000000000000000000000000000000000000000000001"
+    "0000000000000000000000000000000000000000000000000000000000000038"
+)
+EXPECTED_CANCEL_ACTION_HASH = (
+    "5639550dec6707e1923c9f0a1b555d2edc00cdce23d52a6c8cbab80f07554921"
+)
+
+
+def composite_order_id(wide_order_id, block_number, log_index):
+    return f"0x{wide_order_id:016x}{block_number:016x}{log_index:016x}"
+
+
+OPENING_ORDER = composite_order_id(113, 100, 1)
+CLOSE_1 = composite_order_id(115, 101, 2)
+CLOSE_2 = composite_order_id(117, 102, 3)
+CLOSE_3 = composite_order_id(119, 103, 4)
+AUTHORITATIVE_ORDER = composite_order_id(121, 104, 5)
+OTHER_ORDER = composite_order_id(123, 105, 6)
+
+
+def order_record(order_id, client_id):
+    wide_order_id = int.from_bytes(bytes.fromhex(order_id[2:18]), "big")
+    return OrderRecord(order_id, wide_order_id, wide_order_id >> 1, client_id)
 
 
 def market(**changes):
@@ -94,11 +120,15 @@ def open_intent(lifecycle, *, client_id=101, anchor=7, bitmap=3, expires=NOW + 3
 def exact_evidence(order_id, client_id, *, filled="0", position="0",
                    observed=NOW + 1, open_ids=(), terminal=True):
     has_fill = Decimal(filled) > 0
+    record = order_record(order_id, client_id)
     return Evidence(
-        ACCOUNT, SIGNER_ADDRESS, "ACTIVE", order_id, client_id, terminal,
-        Decimal(filled), Decimal(position), tuple(open_ids), observed,
-        order_id, (order_id,), (client_id,),
-        (order_id,) if has_fill else (), (client_id,) if has_fill else (),
+        account=ACCOUNT, signer=SIGNER_ADDRESS, signer_status="ACTIVE",
+        terminal=terminal, filled_size=Decimal(filled),
+        position=Decimal(position), observed_at=observed, position_market_id=1,
+        by_id_order=record,
+        open_orders=tuple(order_record(item, client_id) for item in open_ids),
+        history_orders=(record,),
+        fills=(FillRecord(order_id, client_id),) if has_fill else (),
     )
 
 
@@ -108,13 +138,21 @@ def dispatch(lifecycle, intent, order_id):
     assert persisted.dispatch_count == 1 and persisted.state == "DISPATCHED"
 
 
+def cancel(lifecycle, order_id, execute, *, observed=NOW + 1):
+    lifecycle.cancel_known(
+        order_id, market=market(observed_at=observed), nonce_anchor=9,
+        nonce_bitmap=0, expires_at=NOW + 40, synthetic_signer=SIGNER,
+        execute=execute,
+    )
+
+
 def seed_filled(lifecycle):
     opening = open_intent(lifecycle)
-    dispatch(lifecycle, opening, "opening-order")
+    dispatch(lifecycle, opening, OPENING_ORDER)
     lifecycle._now = lambda: NOW + 1
     lifecycle.reconcile(
         opening.intent_id,
-        exact_evidence("opening-order", 101, filled="0.0001", position="0.0001"),
+        exact_evidence(OPENING_ORDER, 101, filled="0.0001", position="0.0001"),
     )
     return opening
 
@@ -161,13 +199,13 @@ def test_intent_nonce_and_digest_are_durable_before_dispatch(lifecycle):
     seen = []
     lifecycle.dispatch(
         intent, SIGNER,
-        lambda _: seen.append(lifecycle.store.get(intent.intent_id)) or "order-1",
+        lambda _: seen.append(lifecycle.store.get(intent.intent_id)) or AUTHORITATIVE_ORDER,
     )
     persisted = seen[0]
     assert persisted.state == "DISPATCHING" and persisted.dispatch_count == 1
     assert (persisted.nonce, persisted.nonce_bitmap) == (7, 3)
     assert persisted.payload_digest == EXPECTED_ACTION_HASH
-    assert lifecycle.store.get(intent.intent_id).order_id == "order-1"
+    assert lifecycle.store.get(intent.intent_id).order_id == AUTHORITATIVE_ORDER
 
 
 def test_ambiguous_open_is_never_replayed(lifecycle, tmp_path):
@@ -177,8 +215,9 @@ def test_ambiguous_open_is_never_replayed(lifecycle, tmp_path):
     with pytest.raises(LifecycleSafetyError):
         lifecycle.dispatch(intent, SIGNER, lambda _: "replay")
     no_identity = Evidence(
-        ACCOUNT, SIGNER_ADDRESS, "ACTIVE", None, 101, True,
-        Decimal("0"), Decimal("0"), (), NOW + 1,
+        account=ACCOUNT, signer=SIGNER_ADDRESS, signer_status="ACTIVE",
+        terminal=True, filled_size=Decimal("0"), position=Decimal("0"),
+        observed_at=NOW + 1, position_market_id=1,
     )
     lifecycle._now = lambda: NOW + 1
     with pytest.raises(LifecycleSafetyError):
@@ -199,7 +238,7 @@ def test_ambiguous_open_is_never_replayed(lifecycle, tmp_path):
     )
     delayed._now = lambda: NOW + 1
     assert delayed.reconcile(
-        delayed_intent.intent_id, exact_evidence("delayed-order", 101),
+        delayed_intent.intent_id, exact_evidence(AUTHORITATIVE_ORDER, 101),
     ) == Outcome.COMPLETED_NO_FILL_FLAT
     store.close()
 
@@ -216,16 +255,16 @@ def test_malformed_order_identity_halts_after_dispatch(tmp_path):
             candidate.dispatch(intent, SIGNER, lambda _: "replay")
         candidate._now = lambda: NOW + 1
         assert candidate.reconcile(
-            intent.intent_id, exact_evidence("authoritative-order", 101),
+            intent.intent_id, exact_evidence(AUTHORITATIVE_ORDER, 101),
         ) == Outcome.COMPLETED_NO_FILL_FLAT
         candidate.store.close()
 
     malformed_surfaces = (
-        {"order_id": ""},
-        {"by_id_order_id": "   "},
-        {"history_order_ids": (123,)},
-        {"trade_order_ids": (" ",)},
-        {"open_order_ids": (123,), "terminal": False},
+        {"by_id_order": OrderRecord("", 121, 60, 101)},
+        {"by_id_order": OrderRecord(AUTHORITATIVE_ORDER, 999, 499, 101)},
+        {"history_orders": (OrderRecord(AUTHORITATIVE_ORDER, 121, 61, 101),)},
+        {"fills": (FillRecord(" ", 101),)},
+        {"open_orders": (123,), "terminal": False},
     )
     for index, changes in enumerate(malformed_surfaces):
         candidate = new_lifecycle(tmp_path / f"bad-evidence-id-{index}.sqlite3")
@@ -235,7 +274,7 @@ def test_malformed_order_identity_halts_after_dispatch(tmp_path):
         )
         candidate._now = lambda: NOW + 1
         evidence = replace(
-            exact_evidence("authoritative-order", 101), **changes,
+            exact_evidence(AUTHORITATIVE_ORDER, 101), **changes,
         )
         with pytest.raises(LifecycleSafetyError):
             candidate.reconcile(intent.intent_id, evidence)
@@ -280,9 +319,9 @@ def test_open_is_exact_minimum_price_bounded_market_fok(lifecycle):
 
 def test_fok_no_fill_finishes_flat_without_close_acceptance(lifecycle):
     intent = open_intent(lifecycle)
-    dispatch(lifecycle, intent, "opening-order")
+    dispatch(lifecycle, intent, OPENING_ORDER)
     lifecycle._now = lambda: NOW + 1
-    result = lifecycle.reconcile(intent.intent_id, exact_evidence("opening-order", 101))
+    result = lifecycle.reconcile(intent.intent_id, exact_evidence(OPENING_ORDER, 101))
     assert result == Outcome.COMPLETED_NO_FILL_FLAT and lifecycle.close_count == 0
 
 
@@ -320,20 +359,20 @@ def test_first_close_uses_exact_authoritative_size_market_fok(lifecycle, tmp_pat
 def test_close_fallbacks_use_fresh_state_limit_ioc_and_stop_at_three(lifecycle):
     seed_filled(lifecycle)
     first = prepare_close(lifecycle)
-    dispatch(lifecycle, first, "close-1")
-    lifecycle.reconcile(first.intent_id, exact_evidence("close-1", 201, position="0.0001"))
+    dispatch(lifecycle, first, CLOSE_1)
+    lifecycle.reconcile(first.intent_id, exact_evidence(CLOSE_1, 201, position="0.0001"))
     lifecycle._now = lambda: NOW + 2
     second = prepare_close(lifecycle, client_id=202, anchor=8, bitmap=5, observed=NOW + 2)
-    dispatch(lifecycle, second, "close-2")
+    dispatch(lifecycle, second, CLOSE_2)
     lifecycle.reconcile(second.intent_id, exact_evidence(
-        "close-2", 202, filled="0.00006", position="0.00004", observed=NOW + 2,
+        CLOSE_2, 202, filled="0.00006", position="0.00004", observed=NOW + 2,
     ))
     lifecycle._now = lambda: NOW + 3
     third = prepare_close(lifecycle, position="0.00004", client_id=203,
                           anchor=8, bitmap=6, observed=NOW + 3)
-    dispatch(lifecycle, third, "close-3")
+    dispatch(lifecycle, third, CLOSE_3)
     lifecycle.reconcile(third.intent_id, exact_evidence(
-        "close-3", 203, position="0.00004", observed=NOW + 3,
+        CLOSE_3, 203, position="0.00004", observed=NOW + 3,
     ))
     assert [(x.order_type, x.time_in_force) for x in (first, second, third)] == [
         ("MARKET", "FOK"), ("LIMIT", "IOC"), ("LIMIT", "IOC"),
@@ -346,13 +385,13 @@ def test_close_fallbacks_use_fresh_state_limit_ioc_and_stop_at_three(lifecycle):
 def test_partial_ioc_uses_exact_residual_without_rounding(lifecycle):
     seed_filled(lifecycle)
     first = prepare_close(lifecycle)
-    dispatch(lifecycle, first, "close-1")
-    lifecycle.reconcile(first.intent_id, exact_evidence("close-1", 201, position="0.0001"))
+    dispatch(lifecycle, first, CLOSE_1)
+    lifecycle.reconcile(first.intent_id, exact_evidence(CLOSE_1, 201, position="0.0001"))
     lifecycle._now = lambda: NOW + 2
     second = prepare_close(lifecycle, client_id=202, anchor=8, bitmap=5, observed=NOW + 2)
-    dispatch(lifecycle, second, "close-2")
+    dispatch(lifecycle, second, CLOSE_2)
     lifecycle.reconcile(second.intent_id, exact_evidence(
-        "close-2", 202, filled="0.000063", position="0.000037", observed=NOW + 2,
+        CLOSE_2, 202, filled="0.000063", position="0.000037", observed=NOW + 2,
     ))
     lifecycle._now = lambda: NOW + 3
     third = prepare_close(lifecycle, position="0.000037", client_id=203,
@@ -368,18 +407,18 @@ def test_later_close_requires_durable_exact_reconciled_position(tmp_path):
         candidate = new_lifecycle(tmp_path / f"position-lineage-{index}.sqlite3")
         seed_filled(candidate)
         first = prepare_close(candidate)
-        dispatch(candidate, first, "close-1")
+        dispatch(candidate, first, CLOSE_1)
         candidate.reconcile(
             first.intent_id,
-            exact_evidence("close-1", 201, position="0.0001"),
+            exact_evidence(CLOSE_1, 201, position="0.0001"),
         )
         candidate._now = lambda: NOW + 2
         second = prepare_close(
             candidate, client_id=202, anchor=8, bitmap=5, observed=NOW + 2,
         )
-        dispatch(candidate, second, "close-2")
+        dispatch(candidate, second, CLOSE_2)
         candidate.reconcile(second.intent_id, exact_evidence(
-            "close-2", 202, filled="0.00006", position="0.00004",
+            CLOSE_2, 202, filled="0.00006", position="0.00004",
             observed=NOW + 2,
         ))
         path = candidate.store.path
@@ -404,8 +443,8 @@ def test_later_close_requires_durable_exact_reconciled_position(tmp_path):
 def test_non_step_residual_halts_without_another_dispatch(lifecycle):
     seed_filled(lifecycle)
     first = prepare_close(lifecycle)
-    dispatch(lifecycle, first, "close-1")
-    lifecycle.reconcile(first.intent_id, exact_evidence("close-1", 201, position="0.0001"))
+    dispatch(lifecycle, first, CLOSE_1)
+    lifecycle.reconcile(first.intent_id, exact_evidence(CLOSE_1, 201, position="0.0001"))
     lifecycle._now = lambda: NOW + 2
     with pytest.raises(LifecycleSafetyError):
         prepare_close(lifecycle, position="0.0000375", client_id=202,
@@ -438,38 +477,57 @@ def test_known_open_order_is_cancelled_once_by_exact_id(lifecycle):
     assert lifecycle.store.get(intent.intent_id).order_id is None
     lifecycle._now = lambda: NOW + 1
     open_known = exact_evidence(
-        "opening-order", 101, open_ids=("opening-order",), terminal=False,
+        OPENING_ORDER, 101, open_ids=(OPENING_ORDER,), terminal=False,
     )
     assert lifecycle.reconcile(intent.intent_id, open_known) == Outcome.ACTIVE
     assert lifecycle.store.get(intent.intent_id).state == "OPEN_KNOWN"
     calls = []
-    lifecycle.cancel_known("opening-order", lambda value: calls.append(value))
+    cancel(lifecycle, OPENING_ORDER, lambda value: calls.append(value))
     assert lifecycle.store.cancel_states() == ["PENDING_RECONCILIATION"]
     with pytest.raises(LifecycleSafetyError):
-        lifecycle.cancel_known("opening-order", lambda value: calls.append(value))
-    assert lifecycle.reconcile_cancel("opening-order", account(observed_at=NOW + 1))
+        cancel(lifecycle, OPENING_ORDER, lambda value: calls.append(value))
+    assert lifecycle.reconcile_cancel(OPENING_ORDER, account(observed_at=NOW + 1))
     assert lifecycle.reconcile(
-        intent.intent_id, exact_evidence("opening-order", 101),
+        intent.intent_id, exact_evidence(OPENING_ORDER, 101),
     ) == Outcome.COMPLETED_NO_FILL_FLAT
-    assert calls == ["opening-order"]
+    assert len(calls) == 1
+    request = calls[0]
+    assert request["action"] == CANCEL_ACTION
+    assert set(request["body"]) == {"market_id", "order_id", "permit"}
+    assert request["body"]["order_id"] == OPENING_ORDER
+    assert request["resting_order_id"] == 113 >> 1
+    assert request["body"]["market_id"] == request["market_id"] == 1
+    assert request["body"]["permit"] == {
+        "account": ACCOUNT.lower(), "signer": SIGNER_ADDRESS.lower(),
+        "nonce_anchor": "9", "nonce_bitmap_index": 0,
+        "deadline": NOW + 40, "signature": None,
+    }
+    assert request["abi_encoded"].hex() == EXPECTED_CANCEL_ABI
+    assert request["action_hash"].hex() == EXPECTED_CANCEL_ACTION_HASH
+    assert request["dispatchable"] is False and request["signature"] is None
+    cancel_row = lifecycle.store.connection.execute(
+        "SELECT order_id, wide_order_id, resting_order_id, payload_digest, "
+        "dispatch_count FROM cancels"
+    ).fetchone()
+    assert cancel_row == (
+        OPENING_ORDER, "113", "56", EXPECTED_CANCEL_ACTION_HASH, 1,
+    )
 
 
 def test_ambiguous_cancel_is_never_replayed(lifecycle):
     seed_filled(lifecycle)
     closing = prepare_close(lifecycle)
-    dispatch(lifecycle, closing, "close-1")
+    dispatch(lifecycle, closing, CLOSE_1)
     assert lifecycle.reconcile(
         closing.intent_id,
         exact_evidence(
-            "close-1", 201, position="0.0001", open_ids=("close-1",),
+            CLOSE_1, 201, position="0.0001", open_ids=(CLOSE_1,),
             terminal=False,
         ),
     ) == Outcome.ACTIVE
-    lifecycle.cancel_known(
-        "close-1", lambda _: (_ for _ in ()).throw(TimeoutError()),
-    )
+    cancel(lifecycle, CLOSE_1, lambda _: (_ for _ in ()).throw(TimeoutError()))
     with pytest.raises(LifecycleSafetyError):
-        lifecycle.cancel_known("close-1", lambda _: None)
+        cancel(lifecycle, CLOSE_1, lambda _: None)
     assert lifecycle.store.cancel_states() == ["AMBIGUOUS"]
     assert lifecycle.finalize(
         account(position=Decimal("0.0001"), repeated_position=Decimal("0.0001"),
@@ -486,25 +544,25 @@ def test_open_terminal_waits_for_exact_cancel_reconciliation(tmp_path):
         )
         candidate._now = lambda: NOW + 1
         candidate.reconcile(intent.intent_id, exact_evidence(
-            "opening-order", 101, open_ids=("opening-order",), terminal=False,
+            OPENING_ORDER, 101, open_ids=(OPENING_ORDER,), terminal=False,
         ))
         if ambiguous_cancel:
-            candidate.cancel_known(
-                "opening-order",
+            cancel(
+                candidate, OPENING_ORDER,
                 lambda _: (_ for _ in ()).throw(TimeoutError()),
             )
             expected_cancel_state = "AMBIGUOUS"
         else:
-            candidate.cancel_known("opening-order", lambda _: None)
+            cancel(candidate, OPENING_ORDER, lambda _: None)
             expected_cancel_state = "PENDING_RECONCILIATION"
-        terminal = exact_evidence("opening-order", 101)
+        terminal = exact_evidence(OPENING_ORDER, 101)
         with pytest.raises(LifecycleSafetyError):
             candidate.reconcile(intent.intent_id, terminal)
         assert candidate.store.get(intent.intent_id).state == "OPEN_KNOWN"
         assert candidate.store.cancel_states() == [expected_cancel_state]
         assert candidate.outcome == Outcome.ACTIVE
         assert candidate.reconcile_cancel(
-            "opening-order", account(observed_at=NOW + 1),
+            OPENING_ORDER, account(observed_at=NOW + 1),
         )
         assert candidate.reconcile(
             intent.intent_id, terminal,
@@ -514,21 +572,23 @@ def test_open_terminal_waits_for_exact_cancel_reconciliation(tmp_path):
 
 
 def test_unrelated_order_or_position_drift_halts_without_mutation(lifecycle, tmp_path):
+    opening = order_record(OPENING_ORDER, 101)
+    other = order_record(OTHER_ORDER, 101)
     contradictory = [
-        {"by_id_order_id": "other-order"},
-        {"history_order_ids": ("opening-order", "other-order")},
-        {"trade_order_ids": ("other-order",)},
-        {"trade_client_order_ids": (999,)},
-        {"history_client_order_ids": (999,)},
+        {"by_id_order": other},
+        {"history_orders": (opening, other)},
+        {"fills": (FillRecord(OTHER_ORDER, 101),)},
+        {"fills": (FillRecord(OPENING_ORDER, 999),)},
+        {"history_orders": (replace(opening, client_order_id=999),)},
         {"filled_size": Decimal("0"), "position": Decimal("0"),
-         "trade_order_ids": ("opening-order",),
-         "trade_client_order_ids": (101,)},
-        {"open_order_ids": ("opening-order", "unrelated-order"),
+         "fills": (FillRecord(OPENING_ORDER, 101),)},
+        {"open_orders": (opening, other),
          "terminal": False, "filled_size": Decimal("0"),
-         "position": Decimal("0"), "trade_order_ids": (),
-         "trade_client_order_ids": ()},
-        {"open_order_ids": ("unrelated-order",)},
+         "position": Decimal("0"), "fills": ()},
+        {"open_orders": (other,)},
         {"position": Decimal("-0.0001")},
+        {"position_market_id": 2},
+        {"observed_at": NOW - 6},
     ]
     for index, changes in enumerate(contradictory):
         store = DurableIntentStore(tmp_path / f"contradiction-{index}.sqlite3")
@@ -537,11 +597,11 @@ def test_unrelated_order_or_position_drift_halts_without_mutation(lifecycle, tmp
             expected_account=ACCOUNT, expected_signer=SIGNER_ADDRESS,
         )
         intent = open_intent(candidate)
-        dispatch(candidate, intent, "opening-order")
+        dispatch(candidate, intent, OPENING_ORDER)
         candidate._now = lambda: NOW + 1
         evidence = replace(
             exact_evidence(
-                "opening-order", 101, filled="0.0001", position="0.0001",
+                OPENING_ORDER, 101, filled="0.0001", position="0.0001",
             ),
             **changes,
         )
@@ -549,14 +609,14 @@ def test_unrelated_order_or_position_drift_halts_without_mutation(lifecycle, tmp
             candidate.reconcile(intent.intent_id, evidence)
         assert candidate.outcome == Outcome.FAILED_HALTED_MANUAL_RECOVERY
         with pytest.raises(LifecycleSafetyError):
-            candidate.cancel_known("opening-order", lambda _: None)
+            cancel(candidate, OPENING_ORDER, lambda _: None)
         store.close()
 
 
 def test_disconnect_persists_failed_manual_recovery_and_stops_writes(lifecycle):
     seed_filled(lifecycle)
     report = lifecycle.halt_manual(
-        account(position=Decimal("0.0001"), open_order_ids=("opening-order",)),
+        account(position=Decimal("0.0001"), open_order_ids=(OPENING_ORDER,)),
         "connectivity_lost",
     )
     assert report["order_ids"] == ["[REDACTED]"]
@@ -576,9 +636,9 @@ def test_disconnect_persists_failed_manual_recovery_and_stops_writes(lifecycle):
 def test_success_requires_observed_fill_zero_orders_and_exact_flat(lifecycle, tmp_path):
     seed_filled(lifecycle)
     closing = prepare_close(lifecycle)
-    dispatch(lifecycle, closing, "close-1")
+    dispatch(lifecycle, closing, CLOSE_1)
     lifecycle.reconcile(closing.intent_id, exact_evidence(
-        "close-1", 201, filled="0.0001", position="0",
+        CLOSE_1, 201, filled="0.0001", position="0",
     ))
     lifecycle._now = lambda: NOW + 100
     assert lifecycle.finalize(account(observed_at=NOW)) == Outcome.FAILED_HALTED_MANUAL_RECOVERY
@@ -593,9 +653,9 @@ def test_success_requires_observed_fill_zero_orders_and_exact_flat(lifecycle, tm
     )
     seed_filled(good)
     close = prepare_close(good)
-    dispatch(good, close, "close-1")
+    dispatch(good, close, CLOSE_1)
     good.reconcile(close.intent_id, exact_evidence(
-        "close-1", 201, filled="0.0001", position="0",
+        CLOSE_1, 201, filled="0.0001", position="0",
     ))
     assert good.finalize(account(observed_at=NOW + 1)) == Outcome.SUCCESS_CLOSED_FLAT
     store.close()
@@ -603,9 +663,9 @@ def test_success_requires_observed_fill_zero_orders_and_exact_flat(lifecycle, tm
     bad = new_lifecycle(tmp_path / "bad-final-identity.sqlite3")
     seed_filled(bad)
     bad_close = prepare_close(bad)
-    dispatch(bad, bad_close, "close-1")
+    dispatch(bad, bad_close, CLOSE_1)
     bad.reconcile(bad_close.intent_id, exact_evidence(
-        "close-1", 201, filled="0.0001", position="0",
+        CLOSE_1, 201, filled="0.0001", position="0",
     ))
     assert bad.finalize(
         account(signer=OTHER_SIGNER, observed_at=NOW + 1),
@@ -618,10 +678,10 @@ def test_final_flat_must_match_durable_reconciled_position(tmp_path):
     candidate = new_lifecycle(tmp_path / "final-position-lineage.sqlite3")
     seed_filled(candidate)
     closing = prepare_close(candidate)
-    dispatch(candidate, closing, "close-1")
+    dispatch(candidate, closing, CLOSE_1)
     candidate.reconcile(
         closing.intent_id,
-        exact_evidence("close-1", 201, position="0.0001"),
+        exact_evidence(CLOSE_1, 201, position="0.0001"),
     )
     path = candidate.store.path
     candidate.store.close()
@@ -639,9 +699,9 @@ def test_final_flat_must_match_durable_reconciled_position(tmp_path):
         corrupt = new_lifecycle(tmp_path / f"corrupt-final-lineage-{index}.sqlite3")
         seed_filled(corrupt)
         close = prepare_close(corrupt)
-        dispatch(corrupt, close, "close-1")
+        dispatch(corrupt, close, CLOSE_1)
         corrupt.reconcile(close.intent_id, exact_evidence(
-            "close-1", 201, filled="0.0001", position="0",
+            CLOSE_1, 201, filled="0.0001", position="0",
         ))
         with corrupt.store.connection:
             if corrupt_value is None:
@@ -678,10 +738,10 @@ def test_minimum_size_and_usd_cap_are_invariants(lifecycle, tmp_path):
                 order_type="MARKET", time_in_force="FOK",
             )
     intent = open_intent(lifecycle)
-    dispatch(lifecycle, intent, "opening-order")
+    dispatch(lifecycle, intent, OPENING_ORDER)
     lifecycle._now = lambda: NOW + 1
     lifecycle.reconcile(intent.intent_id, exact_evidence(
-        "opening-order", 101, filled="0.0001", position="0.0001",
+        OPENING_ORDER, 101, filled="0.0001", position="0.0001",
     ))
     with pytest.raises(LifecycleSafetyError):
         prepare_close(lifecycle, client_id=202, anchor=7, bitmap=3)
@@ -781,13 +841,13 @@ def test_dispatch_rejects_stale_bound_close_snapshot(lifecycle):
 
 def test_secrets_signatures_payloads_and_identities_are_redacted(lifecycle):
     intent = open_intent(lifecycle)
-    dispatch(lifecycle, intent, "fixture-order")
+    dispatch(lifecycle, intent, OPENING_ORDER)
     report = lifecycle.halt_manual(
-        account(position=Decimal("0.0001"), open_order_ids=("fixture-order",)),
+        account(position=Decimal("0.0001"), open_order_ids=(OPENING_ORDER,)),
         "fixture-secret-signature-payload",
     )
     rendered = repr(report) + repr(lifecycle.store.redacted_evidence())
-    for forbidden in ("fixture-secret", "signature", "payload", "fixture-order", ROUTER):
+    for forbidden in ("fixture-secret", "signature", "payload", OPENING_ORDER, ROUTER):
         assert forbidden not in rendered
     assert "official RISEx testnet UI" in report["manual_recovery"]
 
@@ -873,7 +933,9 @@ def test_durable_identity_binding_cannot_be_reinitialized(tmp_path):
                 )
             else:
                 store.connection.execute(
-                    "INSERT INTO cancels VALUES ('known-order', 'AMBIGUOUS', 1)"
+                    "INSERT INTO cancels VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (OPENING_ORDER, 1, "113", "56", 9, 0, "digest", NOW + 30,
+                     "AMBIGUOUS", 1),
                 )
         with pytest.raises(LifecycleSafetyError):
             Lifecycle(
@@ -940,7 +1002,7 @@ def test_durable_contract_binding_cannot_be_substituted(tmp_path):
     intent = open_intent(original)
     original.store.close()
     restarted = new_lifecycle(path)
-    restarted.dispatch(intent, SIGNER, lambda _: "exact-order")
+    restarted.dispatch(intent, SIGNER, lambda _: AUTHORITATIVE_ORDER)
     assert restarted.store.get(intent.intent_id).dispatch_count == 1
     restarted.store.close()
 
@@ -958,7 +1020,71 @@ def test_dispatching_crash_reconciles_without_replay(lifecycle):
         lifecycle.dispatch(intent, SIGNER, lambda _: "replay")
     lifecycle._now = lambda: NOW + 31
     no_identity = Evidence(
-        ACCOUNT, SIGNER_ADDRESS, "ACTIVE", None, 101, True,
-        Decimal("0"), Decimal("0"), (), NOW + 31,
+        account=ACCOUNT, signer=SIGNER_ADDRESS, signer_status="ACTIVE",
+        terminal=True, filled_size=Decimal("0"), position=Decimal("0"),
+        observed_at=NOW + 31, position_market_id=1,
     )
     assert lifecycle.reconcile(intent.intent_id, no_identity) == Outcome.COMPLETED_NO_FILL_FLAT
+
+
+def test_cancel_dispatching_crash_is_durable_and_never_replayed(lifecycle):
+    class SyntheticCrash(BaseException):
+        pass
+
+    intent = open_intent(lifecycle)
+    lifecycle.dispatch(
+        intent, SIGNER, lambda _: (_ for _ in ()).throw(TimeoutError()),
+    )
+    lifecycle._now = lambda: NOW + 1
+    lifecycle.reconcile(
+        intent.intent_id,
+        exact_evidence(
+            OPENING_ORDER, 101, open_ids=(OPENING_ORDER,), terminal=False,
+        ),
+    )
+    with pytest.raises(SyntheticCrash):
+        cancel(
+            lifecycle, OPENING_ORDER,
+            lambda _: (_ for _ in ()).throw(SyntheticCrash()),
+        )
+    assert lifecycle.store.cancel_state(OPENING_ORDER) == "DISPATCHING"
+    assert lifecycle.store.cancel_count(OPENING_ORDER) == 1
+    path = lifecycle.store.path
+    lifecycle.store.close()
+    restarted = new_lifecycle(path, now=NOW + 1)
+    lifecycle.store = restarted.store
+    replay_calls = []
+    with pytest.raises(LifecycleSafetyError):
+        cancel(restarted, OPENING_ORDER, lambda value: replay_calls.append(value))
+    assert replay_calls == []
+    assert restarted.store.cancel_count(OPENING_ORDER) == 1
+    assert restarted.reconcile_cancel(
+        OPENING_ORDER, account(observed_at=NOW + 1),
+    )
+
+
+def test_official_order_identity_chain_contract_is_explicit(lifecycle):
+    intent = open_intent(lifecycle)
+    lifecycle.dispatch(
+        intent, SIGNER, lambda _: (_ for _ in ()).throw(TimeoutError()),
+    )
+    lifecycle._now = lambda: NOW + 1
+    evidence = exact_evidence(
+        OPENING_ORDER, 101, open_ids=(OPENING_ORDER,), terminal=False,
+    )
+    assert lifecycle.reconcile(intent.intent_id, evidence) == Outcome.ACTIVE
+    persisted = lifecycle.store.get(intent.intent_id)
+    assert persisted.order_id == OPENING_ORDER
+    assert persisted.wide_order_id == 113
+    assert persisted.resting_order_id == 113 >> 1
+
+
+def test_official_cancel_action_encoding_is_explicit():
+    encoded, action_hash = encode_cancel_action(
+        market_id=1, resting_order_id=113 >> 1,
+    )
+    assert len(encoded) == 96
+    assert encoded[32:64] == (1).to_bytes(32, "big")
+    assert encoded[64:96] == (113 >> 1).to_bytes(32, "big")
+    assert encoded.hex() == EXPECTED_CANCEL_ABI
+    assert action_hash.hex() == EXPECTED_CANCEL_ACTION_HASH

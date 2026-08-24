@@ -28,6 +28,7 @@ MAX_AGE_SECONDS = 5
 MAX_PERMIT_SECONDS = 60
 HEADER_FLAGS = 0x05
 PLACE_ACTION = "RISE_PERPS_PLACE_ORDER_V1"
+CANCEL_ACTION = "RISE_PERPS_CANCEL_ORDER_V1"
 VERIFY_WITNESS_TYPE = (
     "VerifyWitness(address account,address target,bytes32 hash,uint48 nonceAnchor,"
     "uint8 nonceBitmap,uint32 deadline)"
@@ -119,6 +120,8 @@ class Intent:
     expires_at: int
     dispatch_count: int = 0
     order_id: str | None = None
+    wide_order_id: int | None = None
+    resting_order_id: int | None = None
     reconciled: bool = False
 
 
@@ -129,22 +132,33 @@ class SyntheticSigner:
 
 
 @dataclass(frozen=True)
+class OrderRecord:
+    order_id: str
+    wide_order_id: int
+    resting_order_id: int
+    client_order_id: int
+
+
+@dataclass(frozen=True)
+class FillRecord:
+    order_id: str
+    client_order_id: int
+
+
+@dataclass(frozen=True)
 class Evidence:
     account: str
     signer: str
     signer_status: str
-    order_id: str | None
-    client_order_id: int
     terminal: bool
     filled_size: Decimal
     position: Decimal
-    open_order_ids: tuple[str, ...]
     observed_at: int
-    by_id_order_id: str | None = None
-    history_order_ids: tuple[str, ...] = ()
-    history_client_order_ids: tuple[int, ...] = ()
-    trade_order_ids: tuple[str, ...] = ()
-    trade_client_order_ids: tuple[int, ...] = ()
+    position_market_id: int
+    by_id_order: OrderRecord | None = None
+    open_orders: tuple[OrderRecord, ...] = ()
+    history_orders: tuple[OrderRecord, ...] = ()
+    fills: tuple[FillRecord, ...] = ()
 
 def _keccak(value: bytes) -> bytes:
     try:
@@ -160,8 +174,48 @@ def _uint(value: int, bits: int, name: str) -> int:
     return value
 
 
+def _composite_wide_order_id(value: Any) -> int:
+    if (
+        not isinstance(value, str) or len(value) != 50
+        or not value.startswith("0x")
+    ):
+        raise LifecycleSafetyError("RISEx composite order identity rejected")
+    try:
+        raw = bytes.fromhex(value[2:])
+    except ValueError:
+        raise LifecycleSafetyError("RISEx composite order identity rejected") from None
+    if len(raw) != 24:
+        raise LifecycleSafetyError("RISEx composite order identity rejected")
+    return int.from_bytes(raw[:8], "big")
+
+
 def _valid_order_id(value: Any) -> bool:
-    return isinstance(value, str) and bool(value.strip())
+    try:
+        _composite_wide_order_id(value)
+    except LifecycleSafetyError:
+        return False
+    return True
+
+
+def _validate_order_record(value: Any) -> None:
+    if not isinstance(value, OrderRecord):
+        raise LifecycleSafetyError("RISEx order record identity rejected")
+    wide_order_id = _composite_wide_order_id(value.order_id)
+    if (
+        value.wide_order_id != wide_order_id
+        or _uint(value.wide_order_id, 64, "wide_order_id") != wide_order_id
+        or _uint(value.resting_order_id, 64, "resting_order_id")
+        != wide_order_id >> 1
+        or _uint(value.client_order_id, 64, "client_order_id") == 0
+    ):
+        raise LifecycleSafetyError("RISEx order record identity rejected")
+
+
+def _validate_fill_record(value: Any) -> None:
+    if not isinstance(value, FillRecord) or not _valid_order_id(value.order_id):
+        raise LifecycleSafetyError("RISEx fill record identity rejected")
+    if _uint(value.client_order_id, 64, "client_order_id") == 0:
+        raise LifecycleSafetyError("RISEx fill record identity rejected")
 
 
 def _address(value: str) -> str:
@@ -229,6 +283,17 @@ def encode_place_action(
         _abi_word(builder_id, 16),
         _abi_word(client_order_id, 64),
         _abi_word(ttl_units, 16),
+    ))
+    return encoded, _keccak(encoded)
+
+
+def encode_cancel_action(*, market_id: int, resting_order_id: int) -> tuple[bytes, bytes]:
+    market_id = _uint(market_id, 16, "market_id")
+    resting_order_id = _uint(resting_order_id, 64, "resting_order_id")
+    encoded = b"".join((
+        _abi_word(_keccak(CANCEL_ACTION.encode())),
+        _abi_word(market_id, 256),
+        _abi_word(resting_order_id, 256),
     ))
     return encoded, _keccak(encoded)
 
@@ -302,13 +367,23 @@ CREATE TABLE IF NOT EXISTS intents (
     expires_at INTEGER NOT NULL,
     dispatch_count INTEGER NOT NULL DEFAULT 0,
     order_id TEXT UNIQUE,
+    wide_order_id TEXT,
+    resting_order_id TEXT,
     reconciled INTEGER NOT NULL DEFAULT 0,
     UNIQUE(nonce, nonce_bitmap)
 );
 CREATE TABLE IF NOT EXISTS cancels (
     order_id TEXT PRIMARY KEY,
+    market_id INTEGER NOT NULL,
+    wide_order_id TEXT NOT NULL,
+    resting_order_id TEXT NOT NULL,
+    nonce INTEGER NOT NULL,
+    nonce_bitmap INTEGER NOT NULL,
+    payload_digest TEXT NOT NULL UNIQUE,
+    expires_at INTEGER NOT NULL,
     state TEXT NOT NULL,
-    dispatch_count INTEGER NOT NULL
+    dispatch_count INTEGER NOT NULL,
+    UNIQUE(nonce, nonce_bitmap)
 );
 CREATE TABLE IF NOT EXISTS terminal (
     key TEXT PRIMARY KEY,
@@ -334,7 +409,7 @@ class DurableIntentStore:
         try:
             with self.connection:
                 self.connection.execute(
-                    "INSERT INTO intents VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO intents VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         intent.intent_id, intent.ordinal, intent.kind,
                         str(intent.client_order_id), intent.nonce, intent.nonce_bitmap,
@@ -344,7 +419,10 @@ class DurableIntentStore:
                         int(intent.post_only), intent.market_id, str(intent.size),
                         intent.size_steps, str(intent.price), intent.price_ticks,
                         str(intent.source_position), intent.expires_at,
-                        intent.dispatch_count, intent.order_id, int(intent.reconciled),
+                        intent.dispatch_count, intent.order_id,
+                        None if intent.wide_order_id is None else str(intent.wide_order_id),
+                        None if intent.resting_order_id is None else str(intent.resting_order_id),
+                        int(intent.reconciled),
                     ),
                 )
         except sqlite3.IntegrityError:
@@ -377,14 +455,24 @@ class DurableIntentStore:
                 self.connection.execute("UPDATE intents SET state=? WHERE intent_id=?", (state, intent_id))
 
     def _reconcile_intent(
-        self, intent_id: str, order_id: str | None, resulting_position: Decimal,
+        self, intent_id: str, record: OrderRecord | None,
+        resulting_position: Decimal,
     ) -> None:
         with self.connection:
-            self.connection.execute(
-                "UPDATE intents SET state='TERMINAL', order_id=COALESCE(order_id, ?), "
-                "reconciled=1 WHERE intent_id=?",
-                (order_id, intent_id),
-            )
+            if record is None:
+                self.connection.execute(
+                    "UPDATE intents SET state='TERMINAL', reconciled=1 WHERE intent_id=?",
+                    (intent_id,),
+                )
+            else:
+                self.connection.execute(
+                    "UPDATE intents SET state='TERMINAL', order_id=?, wide_order_id=?, "
+                    "resting_order_id=?, reconciled=1 WHERE intent_id=?",
+                    (
+                        record.order_id, str(record.wide_order_id),
+                        str(record.resting_order_id), intent_id,
+                    ),
+                )
             self.connection.execute(
                 "INSERT INTO terminal VALUES (?, ?)",
                 (f"position:{intent_id}", str(resulting_position)),
@@ -404,11 +492,15 @@ class DurableIntentStore:
         except (InvalidOperation, ValueError):
             return None
 
-    def _record_open_known(self, intent_id: str, order_id: str) -> None:
+    def _record_open_known(self, intent_id: str, record: OrderRecord) -> None:
         with self.connection:
             self.connection.execute(
-                "UPDATE intents SET state='OPEN_KNOWN', order_id=? WHERE intent_id=?",
-                (order_id, intent_id),
+                "UPDATE intents SET state='OPEN_KNOWN', order_id=?, wide_order_id=?, "
+                "resting_order_id=? WHERE intent_id=?",
+                (
+                    record.order_id, str(record.wide_order_id),
+                    str(record.resting_order_id), intent_id,
+                ),
             )
 
     def known_order(self, order_id: str) -> bool:
@@ -422,11 +514,40 @@ class DurableIntentStore:
         ).fetchone()
         return None if row is None else str(row[0])
 
-    def _reserve_cancel(self, order_id: str) -> None:
+    def order_identity(self, order_id: str) -> OrderRecord | None:
+        row = self.connection.execute(
+            "SELECT order_id, wide_order_id, resting_order_id, client_order_id "
+            "FROM intents WHERE order_id=?", (order_id,)
+        ).fetchone()
+        if row is None or row[1] is None or row[2] is None:
+            return None
+        return OrderRecord(row[0], int(row[1]), int(row[2]), int(row[3]))
+
+    def intent_for_order(self, order_id: str) -> Intent | None:
+        row = self.connection.execute(
+            "SELECT * FROM intents WHERE order_id=?", (order_id,)
+        ).fetchone()
+        return None if row is None else _intent(row)
+
+    def _reserve_cancel(
+        self, record: OrderRecord, market_id: int, nonce: int,
+        nonce_bitmap: int, payload_digest: str, expires_at: int,
+    ) -> None:
         try:
             with self.connection:
+                reused = self.connection.execute(
+                    "SELECT 1 FROM intents WHERE nonce=? AND nonce_bitmap=?",
+                    (nonce, nonce_bitmap),
+                ).fetchone()
+                if reused is not None:
+                    raise LifecycleSafetyError("RISEx cancel nonce replay rejected")
                 self.connection.execute(
-                    "INSERT INTO cancels VALUES (?, 'DISPATCHING', 1)", (order_id,)
+                    "INSERT INTO cancels VALUES (?,?,?,?,?,?,?,?,'DISPATCHING',1)",
+                    (
+                        record.order_id, market_id, str(record.wide_order_id),
+                        str(record.resting_order_id), nonce, nonce_bitmap,
+                        payload_digest, expires_at,
+                    ),
                 )
         except sqlite3.IntegrityError:
             raise LifecycleSafetyError("RISEx cancel replay rejected") from None
@@ -539,7 +660,10 @@ def _intent(row: tuple[Any, ...]) -> Intent:
         market_id=row[14], size=Decimal(row[15]), size_steps=row[16],
         price=Decimal(row[17]), price_ticks=row[18],
         source_position=Decimal(row[19]), expires_at=row[20],
-        dispatch_count=row[21], order_id=row[22], reconciled=bool(row[23]),
+        dispatch_count=row[21], order_id=row[22],
+        wide_order_id=None if row[23] is None else int(row[23]),
+        resting_order_id=None if row[24] is None else int(row[24]),
+        reconciled=bool(row[25]),
     )
 
 
@@ -904,36 +1028,40 @@ class Lifecycle:
         try:
             evidence_account = _address(evidence.account).lower()
             evidence_signer = _address(evidence.signer).lower()
+            evidence_market_id = _uint(
+                evidence.position_market_id, 16, "position market_id",
+            )
         except LifecycleSafetyError:
             self._reject(halt=True)
         if (
             evidence_account != self._expected_account
             or evidence_signer != self._expected_signer
             or evidence.signer_status != "ACTIVE"
-            or evidence.client_order_id != current.client_order_id
+            or evidence_market_id != current.market_id
             or not self._fresh(evidence.observed_at)
         ):
             self._reject(halt=True)
-        scalar_ids = (evidence.order_id, evidence.by_id_order_id)
-        tuple_ids = (
-            *evidence.history_order_ids, *evidence.trade_order_ids,
-            *evidence.open_order_ids,
+        order_records = tuple(
+            value for value in (
+                evidence.by_id_order, *evidence.open_orders,
+                *evidence.history_orders,
+            ) if value is not None
         )
-        if (
-            any(value is not None and not _valid_order_id(value) for value in scalar_ids)
-            or any(not _valid_order_id(value) for value in tuple_ids)
-        ):
+        try:
+            for record in order_records:
+                _validate_order_record(record)
+            for fill in evidence.fills:
+                _validate_fill_record(fill)
+        except LifecycleSafetyError:
+            self._reject(halt=True)
+        if any(record.client_order_id != current.client_order_id for record in order_records):
+            self._reject(halt=True)
+        if any(fill.client_order_id != current.client_order_id for fill in evidence.fills):
             self._reject(halt=True)
         observed_ids = {
-            value for value in (
-                evidence.order_id, evidence.by_id_order_id,
-                *evidence.history_order_ids, *evidence.trade_order_ids,
-            ) if value is not None
+            *(record.order_id for record in order_records),
+            *(fill.order_id for fill in evidence.fills),
         }
-        if any(value != current.client_order_id for value in evidence.trade_client_order_ids):
-            self._reject(halt=True)
-        if any(value != current.client_order_id for value in evidence.history_client_order_ids):
-            self._reject(halt=True)
         expected = current.order_id
         if expected is not None and (observed_ids - {expected}):
             self._reject(halt=True)
@@ -941,17 +1069,25 @@ class Lifecycle:
             if len(observed_ids) != 1:
                 self._reject(halt=True)
             expected = next(iter(observed_ids))
-        if evidence.open_order_ids:
+        expected_record = next(
+            (record for record in order_records if record.order_id == expected), None,
+        )
+        if expected_record is not None and any(record != expected_record for record in order_records):
+            self._reject(halt=True)
+        if expected_record is not None and (
+            current.wide_order_id not in {None, expected_record.wide_order_id}
+            or current.resting_order_id not in {None, expected_record.resting_order_id}
+        ):
+            self._reject(halt=True)
+        if evidence.open_orders:
             open_known = (
-                expected is not None
-                and evidence.open_order_ids == (expected,)
+                expected_record is not None
+                and evidence.open_orders == (expected_record,)
                 and not evidence.terminal
-                and evidence.by_id_order_id == expected
-                and evidence.history_order_ids == (expected,)
-                and evidence.history_client_order_ids == (current.client_order_id,)
+                and evidence.by_id_order == expected_record
+                and evidence.history_orders == (expected_record,)
                 and evidence.filled_size == 0
-                and not evidence.trade_order_ids
-                and not evidence.trade_client_order_ids
+                and not evidence.fills
                 and evidence.position == (
                     Decimal("0") if current.kind == "OPEN"
                     else current.source_position
@@ -959,33 +1095,30 @@ class Lifecycle:
             )
             if not open_known:
                 self._reject(halt=True)
-            self.store._record_open_known(intent_id, expected)
+            self.store._record_open_known(intent_id, expected_record)
             return self.outcome
         if expected is None:
             safe_no_identity = (
                 self._now() > current.expires_at and evidence.terminal
                 and evidence.filled_size == 0 and evidence.position == 0
-                and not evidence.open_order_ids and not evidence.history_order_ids
-                and not evidence.history_client_order_ids
-                and not evidence.trade_order_ids
-                and not evidence.trade_client_order_ids
+                and not order_records and not evidence.fills
             )
             if not safe_no_identity:
                 self._reject()
         else:
-            if not evidence.terminal or expected in evidence.open_order_ids:
+            if not evidence.terminal or evidence.open_orders or expected_record is None:
                 self._reject()
-            if evidence.by_id_order_id != expected or expected not in evidence.history_order_ids:
-                self._reject(halt=True)
-            if current.client_order_id not in evidence.history_client_order_ids:
-                self._reject(halt=True)
-            if evidence.filled_size > 0 and expected not in evidence.trade_order_ids:
-                self._reject(halt=True)
-            if evidence.filled_size > 0 and current.client_order_id not in evidence.trade_client_order_ids:
-                self._reject(halt=True)
-            if evidence.filled_size == 0 and (
-                evidence.trade_order_ids or evidence.trade_client_order_ids
+            if (
+                evidence.by_id_order != expected_record
+                or expected_record not in evidence.history_orders
             ):
+                self._reject(halt=True)
+            if evidence.filled_size > 0 and (
+                not evidence.fills
+                or any(fill.order_id != expected for fill in evidence.fills)
+            ):
+                self._reject(halt=True)
+            if evidence.filled_size == 0 and evidence.fills:
                 self._reject(halt=True)
         if evidence.filled_size < 0 or evidence.position < 0:
             self._reject(halt=True)
@@ -1005,8 +1138,8 @@ class Lifecycle:
             and self.store.cancel_state(expected) not in {None, "TERMINAL"}
         ):
             self._reject()
-        self.store._reconcile_intent(intent_id, expected, evidence.position)
-        if current.kind == "OPEN" and evidence.filled_size == 0 and evidence.position == 0 and not evidence.open_order_ids:
+        self.store._reconcile_intent(intent_id, expected_record, evidence.position)
+        if current.kind == "OPEN" and evidence.filled_size == 0 and evidence.position == 0 and not evidence.open_orders:
             self.outcome = Outcome.COMPLETED_NO_FILL_FLAT
             self.store.persist_outcome(self.outcome)
             self._halted = True
@@ -1017,17 +1150,69 @@ class Lifecycle:
                 self.store._set_opening_fill_observed()
         return self.outcome
 
-    def cancel_known(self, order_id: str, execute: Callable[[str], Any]) -> None:
+    def cancel_known(
+        self, order_id: str, *, market: MarketState, nonce_anchor: int,
+        nonce_bitmap: int, expires_at: int, synthetic_signer: Any,
+        execute: Callable[[dict[str, Any]], Any],
+    ) -> None:
         if not _valid_order_id(order_id):
             self._reject(halt=bool(self.store.all()))
+        self._validate_market(market)
+        nonce_anchor = _uint(nonce_anchor, 48, "nonce_anchor")
+        nonce_bitmap = _uint(nonce_bitmap, 8, "nonce_bitmap")
+        expires_at = _uint(expires_at, 32, "permit deadline")
         if (
-            self._halted or not self.store.known_order(order_id)
-            or self.store.order_state(order_id) != "OPEN_KNOWN"
+            nonce_bitmap > 207 or expires_at <= self._now()
+            or expires_at > self._now() + MAX_PERMIT_SECONDS
+            or not isinstance(synthetic_signer, SyntheticSigner)
+            or not synthetic_signer.fixture_only
+            or _address(synthetic_signer.signer).lower() != self._expected_signer
         ):
             self._reject()
-        self.store._reserve_cancel(order_id)
+        record = self.store.order_identity(order_id)
+        owner = self.store.intent_for_order(order_id)
+        if (
+            self._halted or owner is None or owner.state != "OPEN_KNOWN"
+            or record is None or market.market_id != owner.market_id
+        ):
+            self._reject()
+        _validate_order_record(record)
+        encoded, action_hash = encode_cancel_action(
+            market_id=market.market_id, resting_order_id=record.resting_order_id,
+        )
+        witness = verify_witness_typed_data(
+            account=self._expected_account, market=market, action_hash=action_hash,
+            nonce_anchor=nonce_anchor, nonce_bitmap=nonce_bitmap,
+            deadline=expires_at,
+        )
+        self.store._reserve_cancel(
+            record, market.market_id, nonce_anchor, nonce_bitmap,
+            action_hash.hex(), expires_at,
+        )
+        request = {
+            "action": CANCEL_ACTION,
+            "market_id": market.market_id,
+            "resting_order_id": record.resting_order_id,
+            "abi_encoded": encoded,
+            "action_hash": action_hash,
+            "permit": witness,
+            "body": {
+                "market_id": market.market_id,
+                "order_id": record.order_id,
+                "permit": {
+                    "account": self._expected_account,
+                    "signer": self._expected_signer,
+                    "nonce_anchor": str(nonce_anchor),
+                    "nonce_bitmap_index": nonce_bitmap,
+                    "deadline": expires_at,
+                    "signature": None,
+                },
+            },
+            "signature": None,
+            "dispatchable": False,
+        }
         try:
-            execute(order_id)
+            execute(request)
         except Exception:
             self.store._set_cancel_state(order_id, "AMBIGUOUS")
             return
