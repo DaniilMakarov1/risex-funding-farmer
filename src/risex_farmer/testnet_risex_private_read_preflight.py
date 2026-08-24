@@ -684,48 +684,52 @@ class PrivateReadPreflight:
         if not isinstance(frames, (tuple, list)) or len(frames) != 3:
             raise ValueError("invalid private frames")
         auth, orders, positions = frames
-        if _mapping(auth, {"method", "status"}) != {
+        PrivateReadPreflight._validate_auth_frame(auth)
+        PrivateReadPreflight._validate_private_snapshot(
+            orders, channel="orders", count_field="order_count", now=now,
+        )
+        PrivateReadPreflight._validate_private_snapshot(
+            positions, channel="positions", count_field="position_count", now=now,
+        )
+
+    @staticmethod
+    def _validate_auth_frame(frame: Any) -> None:
+        if _mapping(frame, {"method", "status"}) != {
             "method": "auth_v2", "status": "success",
         }:
             raise ValueError("authentication failed")
-        expected_orders = _mapping(
-            orders,
-            {"method", "channel", "type", "data", "order_count", "worker_timestamp"},
-        )
-        expected_positions = _mapping(
-            positions,
-            {"method", "channel", "type", "data", "position_count", "worker_timestamp"},
+
+    @staticmethod
+    def _validate_private_snapshot(
+        frame: Any, *, channel: str, count_field: str, now: float,
+    ) -> None:
+        expected = _mapping(
+            frame,
+            {"method", "channel", "type", "data", count_field, "worker_timestamp"},
         )
         if (
-            expected_orders.get("method") != "snapshot"
-            or expected_orders.get("channel") != "orders"
-            or expected_orders.get("type") != "snapshot"
-            or expected_positions.get("method") != "snapshot"
-            or expected_positions.get("channel") != "positions"
-            or expected_positions.get("type") != "snapshot"
+            expected.get("method") != "snapshot"
+            or expected.get("channel") != channel
+            or expected.get("type") != "snapshot"
         ):
             raise ValueError("private identity mismatch")
-        order_data = _list(expected_orders.get("data"))
-        position_data = _list(expected_positions.get("data"))
-        order_count = expected_orders.get("order_count")
-        position_count = expected_positions.get("position_count")
+        data = _list(expected.get("data"))
+        count = expected.get(count_field)
         if (
-            isinstance(order_count, bool) or not isinstance(order_count, int)
-            or isinstance(position_count, bool) or not isinstance(position_count, int)
-            or order_count != len(order_data) or position_count != len(position_data)
+            isinstance(count, bool) or not isinstance(count, int)
+            or count != len(data)
         ):
             raise ValueError("private count mismatch")
-        for snapshot in (expected_orders, expected_positions):
-            worker_timestamp = snapshot.get("worker_timestamp")
-            if (
-                not isinstance(worker_timestamp, str) or not worker_timestamp.isdecimal()
-                or int(worker_timestamp) <= 0
-            ):
-                raise ValueError("invalid worker timestamp")
-            age_ns = Decimal(str(now)) * Decimal(1_000_000_000) - Decimal(
-                worker_timestamp
-            )
-            if age_ns < 0 or age_ns > Decimal(MAX_AGE_SECONDS * 1_000_000_000):
-                raise ValueError("stale worker timestamp")
-        if order_data or position_data:
+        worker_timestamp = expected.get("worker_timestamp")
+        if (
+            not isinstance(worker_timestamp, str) or not worker_timestamp.isdecimal()
+            or int(worker_timestamp) <= 0
+        ):
+            raise ValueError("invalid worker timestamp")
+        age_ns = Decimal(str(now)) * Decimal(1_000_000_000) - Decimal(
+            worker_timestamp
+        )
+        if age_ns < 0 or age_ns > Decimal(MAX_AGE_SECONDS * 1_000_000_000):
+            raise ValueError("stale worker timestamp")
+        if data:
             raise ValueError("private state not flat")
