@@ -43,7 +43,7 @@ STORE_BASENAME = ".risex-funding-farmer-risex-private-read-20260824-new-op-009.s
 FIXED_STORE_PATH = Path(
     "/Users/daniilmakarov/.risex-funding-farmer-risex-private-read-20260824-new-op-009.sqlite3"
 )
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 _APPLICATION_ID = 0x52585052
 _MAX_BYTES = 1_048_576
 _DEADLINE_SECONDS = 5
@@ -107,7 +107,6 @@ _PRIVATE_COUNTERS = (
     "positions_snapshot_schema",
     "positions_flat",
     "positions_freshness",
-    "positions_followup_guard",
     "capability_close",
 )
 _PUBLIC_B_COUNTERS = tuple(
@@ -146,12 +145,11 @@ _REASON_VALUES = frozenset({
     "positions_snapshot_schema_invalid",
     "positions_not_flat",
     "positions_stale",
-    "positions_followup_frame",
 })
 _LEDGER_SCHEMA = (
     "CREATE TABLE run ("
     "singleton INTEGER PRIMARY KEY CHECK(singleton=1),"
-    "schema_version INTEGER NOT NULL CHECK(schema_version=6),"
+    "schema_version INTEGER NOT NULL CHECK(schema_version=7),"
     "invocation_id TEXT NOT NULL CHECK(length(invocation_id)>0),"
     "store_path_sha256 TEXT NOT NULL CHECK(length(store_path_sha256)=64),"
     "state TEXT NOT NULL CHECK(state IN "
@@ -584,7 +582,7 @@ class DurableCounterLedger:
             "positions_snapshot_timeout", "positions_snapshot_close",
             "positions_snapshot_binary", "positions_snapshot_malformed",
             "positions_snapshot_schema_invalid",
-            "positions_not_flat", "positions_stale", "positions_followup_frame",
+            "positions_not_flat", "positions_stale",
         }:
             raise ValueError("unknown invariant")
 
@@ -1539,19 +1537,6 @@ class FixedRisexPrivateReadTransport:
     async def positions_snapshot_receive(self) -> str:
         return await self._positions_receive("positions_snapshot")
 
-    async def positions_followup_guard(self) -> None:
-        if self._socket is None:
-            raise ValueError("private transport rejected")
-        try:
-            extra = await self._socket.receive(timeout=0.01)
-        except asyncio.TimeoutError:
-            return None
-        except Exception:
-            raise _PositionsFailure("positions_snapshot_close") from None
-        if extra is not None:
-            raise _PositionsFailure("positions_followup_frame")
-        return None
-
     async def close(self) -> None:
         if self._socket is not None:
             await self._socket.close()
@@ -1944,13 +1929,6 @@ async def _execute(
                 positions_flat, validator._now(), private_started,
             ),
             _identity,
-            dependencies.crash_hook,
-        )
-        await _phase(
-            ledger,
-            "positions_followup_guard",
-            transport.positions_followup_guard,
-            _none,
             dependencies.crash_hook,
         )
     except _SimulatedProcessDeath:
