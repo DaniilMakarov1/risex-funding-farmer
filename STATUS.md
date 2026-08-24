@@ -11,8 +11,8 @@
 - The signer prerequisite, fixture lifecycle core, deterministic private-read path, and operational adapter are accepted.
 - The single authorized operational private-read invocation stopped fail closed during its public phase after exactly nine public GETs. Durable evidence reports `PREFLIGHT_BLOCKED`; no credential load, nonce, signature, private request, order, cancel, close, or other write occurred.
 - One bounded public-only diagnostic sweep proved all nine official endpoints available with HTTP 200 and identified three concrete stale fixture/decoder contracts: signer-row fields and expiration representation, full market symbol/config fields, and orderbook level fields including official `order_count`. Existing public normalization independently corroborates the market and book shape mismatch.
-- Official OpenAPI enumerates candidate fields and types but does not define exact emitted/required key sets. The active correction therefore permits narrowly evidence-driven public schema capture of only the three affected endpoints, retaining redacted key/type structure and no identities or values; it does not permit a private-preflight retry.
-- The consumed one-shot remains immutable and must not be reset, rearmed, or retried. The active action is a fixture-only correction of those three strict decoders after central publication and a separate Builder gate.
+- Official OpenAPI enumerates candidate fields and types but does not define exact emitted/required key sets. Exactly three narrowly evidence-driven public schema captures established the affected closed key/type structures without retaining identities or values.
+- The consumed one-shot remains immutable and must not be reset, rearmed, or retried. The strict decoder correction is Architect-accepted and independently Chief-accepted at `6c530eb9a0b13050b66e385325f767f6d45f2c10`; 1087 full tests and the dependency check pass. It is integrated into local `main`, but exact publication is blocked until local GitHub CLI authentication is completed. The connected GitHub contents API cannot preserve the accepted local commit object.
 - RISEx has not proved an operational order lifecycle, authoritative zero open orders, or exact flatness.
 
 ## Nado
@@ -25,7 +25,7 @@
 ## Extended
 
 - Phase 0 and the fixture lifecycle core are accepted and published.
-- The isolated private-read governance candidate is centrally accepted. The sole Extended Architect is ready for a separate Builder gate for the fixture-only private-read implementation. No credential load, authenticated request, stream connection, signature, or write is currently authorized.
+- The first isolated private-read implementation candidate is rejected and immutable. Independent official-source review resolved its apparent stream contradiction: official v1 uses exactly `/stream.extended.exchange/v1/account` with `X-Api-Key` during the WebSocket upgrade and has no application-level subscribe/ack exchange; JSON-RPC subscribe/ack belongs to the distinct v2 RPC protocol. The active correction must keep the v1 stream gap-free through REST round B and use it only as an intervening-activity barrier. No credential load, authenticated request, stream connection, signature, or write is currently authorized.
 - Extended has not proved an operational order lifecycle, authoritative zero open orders, or exact flatness.
 
 ## Exit condition

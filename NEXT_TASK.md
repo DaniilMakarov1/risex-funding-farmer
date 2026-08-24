@@ -2,11 +2,11 @@
 
 At most one slice is active per venue. These slices may proceed in parallel, but central `main` integration and all testnet write lifecycles remain sequential. No task below authorizes strategy work, mainnet, real funds, deposits, or an order/cancel/close write.
 
-## RISEx — strict public decoder/fixture correction
+## RISEx — publish accepted strict public decoder correction
 
-Status: `READY FOR SEPARATE BUILDER GATE`.
+Status: `ACCEPTED AND INTEGRATED LOCALLY — PUBLICATION BLOCKED BY GITHUB CLI AUTH`.
 
-Objective after that gate: correct only the three stale public response contracts that caused the consumed private-read preflight's public-phase `PREFLIGHT_BLOCKED` result.
+Accepted implementation commit: `6c530eb9a0b13050b66e385325f767f6d45f2c10` on exact base `ed6b0f076200b4f5316cd2341e8d8a3e0e16c8b1`. Independent Chief gates passed: genuine three-case old-base RED, 136 focused tests, 1087 full tests, clean dependency check, exact diff and secret/import/network-surface review.
 
 Required deterministic contract:
 
@@ -24,7 +24,7 @@ Forbidden:
 - Signer or credential loading, nonce/signature creation, private traffic, or any write.
 - Add fallbacks, alternate hosts, browser/support workarounds, strategy behavior, or shared-runtime expansion.
 
-Acceptance: Architect acceptance followed by independent Chief Coordinator review, sequential central integration, full suite, and publication. The correction proves deterministic contract parity only. Any later private-read invocation requires a new explicit operational gate and a new one-shot identity; the consumed invocation is never reused.
+Remaining action: authenticate the local Git transport and fast-forward `origin/main` to the exact accepted Builder commit without recreating or rewriting it. The correction proves deterministic contract parity only. Any later private-read invocation requires a new explicit operational gate and a new one-shot identity; the consumed invocation is never reused.
 
 ## Nado — durable-result reconciliation
 
@@ -57,8 +57,9 @@ Required deterministic contract:
 
 - Exact account/subaccount identity and API-key-only opaque loader behind a durable one-shot boundary.
 - Verified direct TLS, fixed official host, no proxy inheritance, redirects, fallback, retry, reconnect, or replay.
-- Complete private REST round A, one gap-free account-stream snapshot, then complete REST round B.
-- Strict exhaustive decoding and pagination; fresh agreeing observations must independently prove zero open orders and no open positions.
+- Complete private REST round A, one continuously gap-free account-stream observation window, then complete REST round B while that stream remains active through the final barrier.
+- Use the official v1 account stream exactly: connect once to `/stream.extended.exchange/v1/account` with the API key in the `X-Api-Key` upgrade header. The v1 protocol has no application-level subscribe request or acknowledgement; sending or accepting an RPC subscribe exchange is a protocol mismatch and must fail closed.
+- Strict exhaustive REST decoding and pagination; fresh agreeing REST observations must independently prove zero open orders and no open positions. The stream is an intervening-activity barrier: every frame and sequence is validated, and any order/position activity, gap, duplicate, regression, disconnect, reconnect, malformed frame, or early end blocks readiness.
 - Durable terminal state and fully redacted evidence; restart after terminal state makes zero loader or network calls.
 - Genuine RED-before-GREEN fixtures, adverse-path coverage, focused tests, full clean Python 3.11 suite, dependency check, and isolated imports only.
 
