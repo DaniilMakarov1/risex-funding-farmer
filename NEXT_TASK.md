@@ -16,12 +16,12 @@ Status: `BLOCKED — OFFICIAL PUBLIC GATEWAY RETURNED HTTP 403`.
 - After a genuine external-state change or cooldown, perform exactly one credential-free official public catalog query from a fresh Builder session. If successful, reproduce and correct the remaining op003 catalog mismatch with fixtures; if still forbidden, stop without retry.
 - Do not read credentials or create op004 until the public contract passes.
 
-## Extended — rotate the private-read one-shot
+## Extended — run private-read op004 once
 
-Status: `READY FOR TIER B OPERATION BINDING START GATE`.
+Status: `READY FOR TIER B OPERATIONAL GATE`.
 
-- From current published `main`, use a fresh GPT-5.6 Sol Medium Builder to rotate only the sealed Extended private-read invocation/store binding to one unique unconsumed operation. Use `extended-private-read-20260824-new-op-004` so neither consumed private-read operations nor account-shape witness op003 can be confused or reused.
-- Deterministic acceptance remains fixture-only and must preserve the accepted parser, fixed destination, credential confinement, counters, interruption/ambiguity barriers, redaction, and normal-startup isolation. After publication, Chief may separately gate exactly one private-read operation; success requires complete counters, fresh REST/stream agreement, authoritative zero orders, and exact flatness.
+- From clean published `main`, Chief may gate exactly one invocation of sealed `extended-private-read-20260824-new-op-004`; no consumed invocation or store may be reused and no retry follows an ambiguous outcome.
+- Success requires every durable counter complete, fresh same-connection REST/stream agreement, authoritative zero orders, and exact flatness. Any blocked, unknown, partial-counter, transport, identity, or schema outcome stops without another private request.
 
 ## Completion
 

@@ -20,7 +20,7 @@
 ### Extended
 
 - The fixed identity and API-key capability are securely provisioned. Account-shape witness op003 completed `CAPTURED` with every counter exactly `1/1` and no write.
-- The exact `{status, data}` account parser correction is accepted and published with fail-closed field/type handling preserved. Witness op003 and private-read operations through op002 remain consumed; the next step is one fresh fixed private-read binding before a separately gated one-shot operation.
+- The exact `{status, data}` parser correction and fresh sealed private-read op004 binding are accepted. Witness op003 and private-read operations through op002 remain consumed; op004 is unconsumed and awaits one separately gated private-read operation.
 
 ## Exit condition
 
