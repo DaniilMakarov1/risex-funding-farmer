@@ -43,6 +43,51 @@ SOURCE_PINS = {
     "contracts": "11c27b2851999f1b4f8cb4a7fbfcc9320253f12f",
 }
 
+SEMANTIC_SOURCE_PINS = {
+    "gateway_query_envelope": (
+        "https://docs.nado.xyz/developer-resources/api/gateway/queries"
+    ),
+    "gateway_contracts": (
+        "https://docs.nado.xyz/developer-resources/api/gateway/queries/contracts"
+    ),
+    "gateway_status": (
+        "https://docs.nado.xyz/developer-resources/api/gateway/queries/status"
+    ),
+    "gateway_all_products": (
+        "https://docs.nado.xyz/developer-resources/api/gateway/queries/all-products"
+    ),
+    "gateway_linked_signer": (
+        "https://docs.nado.xyz/developer-resources/api/gateway/queries/linked-signer"
+    ),
+    "gateway_subaccount_info": (
+        "https://docs.nado.xyz/developer-resources/api/gateway/queries/"
+        "subaccount-info"
+    ),
+    "gateway_subaccount_orders": (
+        "https://docs.nado.xyz/developer-resources/api/gateway/queries/"
+        "subaccount-orders"
+    ),
+    "gateway_isolated_positions": (
+        "https://docs.nado.xyz/developer-resources/api/gateway/queries/"
+        "isolated-positions"
+    ),
+    "trigger_list_orders": (
+        "https://docs.nado.xyz/developer-resources/api/trigger/queries/"
+        "list-trigger-orders"
+    ),
+}
+
+GATEWAY_REQUEST_TYPES = {
+    "contracts": "query_contracts",
+    "status": "query_status",
+    "all_products": "query_all_products",
+    "linked_signer": "query_linked_signer",
+    "subaccount_info": "query_subaccount_info",
+    "subaccount_orders": "query_subaccount_orders",
+    "isolated_positions": "query_isolated_positions",
+}
+TRIGGER_LIST_REQUEST_TYPE = "query_list_trigger_orders"
+
 
 class NadoPreflightError(RuntimeError):
     """A sanitized fail-closed contract or durable-state violation."""
@@ -639,21 +684,37 @@ def _fresh_observation(
 
 def _wire_data(
     observation: ObservedResponse, clock_ms: Callable[[], int],
+    expected_request_type: str,
 ) -> tuple[object, int]:
     observed = _fresh_observation(observation, clock_ms)
     payload = observation.payload
     if type(payload) is not dict:
         raise NadoPreflightError("wire envelope schema mismatch")
-    _exact_keys(payload, {"status", "data"}, "wire envelope")
+    _exact_keys(payload, {"status", "data", "request_type"}, "wire envelope")
     if type(payload["status"]) is not str or payload["status"] != "success":
         raise NadoPreflightError("wire status is not success")
+    if (
+        type(expected_request_type) is not str
+        or type(payload["request_type"]) is not str
+        or payload["request_type"] != expected_request_type
+    ):
+        raise NadoPreflightError("wire request type mismatch")
     return payload["data"], observed
+
+
+def _gateway_request_type(request: Mapping[str, object]) -> str:
+    request_type = request.get("type")
+    if type(request_type) is not str or request_type not in GATEWAY_REQUEST_TYPES:
+        raise NadoPreflightError("gateway request type mismatch")
+    return GATEWAY_REQUEST_TYPES[request_type]
 
 
 def _query(
     transport: object, request: Mapping[str, object], clock_ms: Callable[[], int],
 ) -> tuple[object, int]:
-    return _wire_data(transport.send(request), clock_ms)
+    return _wire_data(
+        transport.send(request), clock_ms, _gateway_request_type(request),
+    )
 
 
 def _server_time(
@@ -1043,12 +1104,15 @@ async def _operational_round(
     try:
         request = next(contract)
         while True:
+            expected_request_type = _gateway_request_type(request)
             if before is not None:
                 before()
                 await asyncio.sleep(0)
             observation = await transport.send_async(request)
             await asyncio.sleep(0)
-            decoded = _wire_data(observation, _system_clock_ms)
+            decoded = _wire_data(
+                observation, _system_clock_ms, expected_request_type,
+            )
             try:
                 request = contract.send(decoded)
             except StopIteration:
@@ -1139,7 +1203,9 @@ def _trigger_zero(
     observation: ObservedResponse, config: PreflightConfig,
     clock_ms: Callable[[], int],
 ) -> tuple[str, int]:
-    raw_data, observed = _wire_data(observation, clock_ms)
+    raw_data, observed = _wire_data(
+        observation, clock_ms, TRIGGER_LIST_REQUEST_TYPE,
+    )
     data = _object(raw_data, "trigger orders")
     _exact_keys(data, {"orders"}, "trigger orders")
     if type(data["orders"]) is not list or data["orders"]:

@@ -36,6 +36,7 @@ def contract() -> dict[str, object]:
                     "sender": contract["sender"], "product_id": product_id,
                     "orders": [],
                 },
+                "request_type": "query_subaccount_orders",
             }
         else:
             response = contract["wire"][operation]
@@ -276,12 +277,22 @@ def test_trigger_typed_data_exact_pinned_shape(contract: dict[str, object]) -> N
 
 def test_pins_identity_and_official_fixture_shapes(contract: dict[str, object]) -> None:
     assert nado.SOURCE_PINS == contract["sources"]
+    assert nado.SEMANTIC_SOURCE_PINS == contract["semantic_sources"]
     assert nado.FixedPreflightIdentity.as_dict() == contract["environment"]
     contracts = contract["round_a"][0]["response"]
     products = contract["round_a"][2]["response"]
     account = contract["round_a"][4]["response"]
     isolated = contract["round_a"][7]["response"]
-    assert set(contracts) == set(products) == set(account) == set(isolated) == {"status", "data"}
+    assert set(contracts) == set(products) == set(account) == set(isolated) == {
+        "status", "data", "request_type",
+    }
+    assert {
+        entry["op"].split(":", 1)[0]: entry["response"]["request_type"]
+        for entry in contract["round_a"]
+    } == nado.GATEWAY_REQUEST_TYPES
+    assert contract["trigger"]["response"]["request_type"] == (
+        nado.TRIGGER_LIST_REQUEST_TYPE
+    )
     assert set(contracts["data"]) == {"chain_id", "endpoint_addr"}
     assert contract["round_a"][1]["response"]["data"] == "active"
     assert set(products["data"]) == {"spot_products", "perp_products"}
@@ -384,7 +395,7 @@ def test_http_status_is_exact_integer_200_before_claim(
     [lambda r: r.update(status=200), lambda r: r.update(status="Success"),
      lambda r: r.update(extra=True), lambda r: r.pop("data")],
 )
-def test_wire_envelope_is_exact_status_success_data(
+def test_wire_envelope_is_exact_status_success_data_and_request_type(
     tmp_path: Path, contract: dict[str, object], mutation: Callable[[dict[str, object]], object]
 ) -> None:
     entries = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
@@ -393,6 +404,67 @@ def test_wire_envelope_is_exact_status_success_data(
     with pytest.raises(nado.NadoPreflightError):
         _run(tmp_path, contract, public_entries=entries, store=store)
     assert store.state("fixture-invocation-001") == nado.NEW
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [None, 1, True, "query_status", "contracts", "QUERY_CONTRACTS"],
+)
+def test_gateway_request_type_is_exact_and_bound_to_call_site(
+    tmp_path: Path, contract: dict[str, object], bad: object,
+) -> None:
+    entries = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
+    if bad is None:
+        entries[0]["response"].pop("request_type")
+    else:
+        entries[0]["response"]["request_type"] = bad
+    store = nado.OneShotStore(tmp_path / f"request-type-{bad}.sqlite3")
+    with pytest.raises(nado.NadoPreflightError):
+        _run(tmp_path, contract, public_entries=entries, store=store)
+    assert store.state("fixture-invocation-001") == nado.NEW
+
+
+@pytest.mark.parametrize("index", range(8))
+def test_every_round_a_request_type_is_bound_before_sensitive_work(
+    tmp_path: Path, contract: dict[str, object], index: int,
+) -> None:
+    entries = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
+    entries[index]["response"]["request_type"] = "query_status"
+    if entries[index]["op"] == "status":
+        entries[index]["response"]["request_type"] = "query_contracts"
+    calls = Calls(contract)
+    signed, signed_callback = _signed(dict(contract["trigger"]))
+    store = nado.OneShotStore(tmp_path / f"round-a-request-type-{index}.sqlite3")
+    with pytest.raises(nado.NadoPreflightError):
+        _run(
+            tmp_path, contract, public_entries=entries, calls=calls,
+            signed=signed, store=store,
+        )
+    assert store.state("fixture-invocation-001") == nado.NEW
+    assert (calls.loader, calls.derive, calls.sign, calls.recover) == (0, 0, 0, 0)
+    assert signed_callback.calls == []
+
+
+@pytest.mark.parametrize("round_b_index", range(11))
+def test_every_round_b_request_type_is_bound_without_sensitive_replay(
+    tmp_path: Path, contract: dict[str, object], round_b_index: int,
+) -> None:
+    entries = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
+    index = len(contract["round_a"]) + round_b_index
+    entries[index]["response"]["request_type"] = "query_status"
+    if entries[index]["op"] == "status":
+        entries[index]["response"]["request_type"] = "query_contracts"
+    calls = Calls(contract)
+    signed, signed_callback = _signed(dict(contract["trigger"]))
+    store = nado.OneShotStore(tmp_path / f"round-b-request-type-{round_b_index}.sqlite3")
+    with pytest.raises(nado.NadoPreflightError):
+        _run(
+            tmp_path, contract, public_entries=entries, calls=calls,
+            signed=signed, store=store,
+        )
+    assert store.state("fixture-invocation-001") == nado.OBSERVED
+    assert (calls.loader, calls.derive, calls.sign, calls.recover) == (1, 1, 1, 1)
+    assert len(signed_callback.calls) == 1
 
 
 @pytest.mark.parametrize("bad", [763373, 763373.0, True, "0763373", "+763373", "763373 "])
@@ -616,7 +688,9 @@ def test_round_b_resume_uses_observed_evidence_without_second_sensitive_callback
     assert len(signed_callback.calls) == 1
 
 
-@pytest.mark.parametrize("defect", ["http", "wire", "extra", "nonzero", "redirect"])
+@pytest.mark.parametrize(
+    "defect", ["http", "wire", "request-type", "extra", "nonzero", "redirect"],
+)
 def test_signed_response_defects_consume_claim_and_never_replay(
     tmp_path: Path, contract: dict[str, object], defect: str
 ) -> None:
@@ -630,6 +704,8 @@ def test_signed_response_defects_consume_claim_and_never_replay(
             payload = copy.deepcopy(observed.payload)
             if defect == "wire":
                 payload["status"] = "failure"
+            elif defect == "request-type":
+                payload["request_type"] = "query_subaccount_orders"
             elif defect == "extra":
                 payload["data"]["sender"] = contract["sender"]
             else:
@@ -1336,14 +1412,32 @@ def test_operational_binding_has_fixed_read_only_surface() -> None:
 
     source = inspect.getsource(operational)
     assert tuple(inspect.signature(operational.run).parameters) == ()
-    assert operational.INVOCATION_ID == "nado-private-read-20260824-new-op-001"
+    assert operational.INVOCATION_ID == "nado-private-read-20260824-new-op-002"
+    assert operational.STORE_BASENAME == (
+        ".risex-funding-farmer-nado-private-read-20260824-new-op-002.sqlite3"
+    )
     assert operational.SUBACCOUNT_NAME == "default"
     assert operational.EXPECTED_PATH_HASH == (
-        "ec98ed1b3781034e0436b37a634f4f87164510d077df1c3a5e7dc4a0e4d35b2d"
+        "bf927fcd24fc6010fe74465d704f9af3ec4745aa08fab9c67d82433182c47e1b"
     )
+    assert "op-001" not in operational.INVOCATION_ID
+    assert "op-001" not in operational.STORE_BASENAME
     assert "nado_private_read_operational" not in Path(risex_farmer.__file__).read_text()
     for forbidden in ("/execute", "retry", "proxy=", "os.environ", "argparse"):
         assert forbidden not in source
+
+
+def test_op002_store_collision_cannot_rearm_fixed_invocation(tmp_path: Path) -> None:
+    import risex_farmer.nado_private_read_operational as operational
+
+    path = tmp_path / operational.STORE_BASENAME
+    first = operational._prepare_store(path)
+    first.begin(operational.INVOCATION_ID, "identity", "path")
+    first.close()
+    collided = operational._prepare_store(path)
+    with pytest.raises(nado.NadoPreflightError, match="already exists"):
+        collided.begin(operational.INVOCATION_ID, "identity", "path")
+    collided.close()
 
 
 def test_counter_schema_corruption_fails_closed(tmp_path: Path) -> None:

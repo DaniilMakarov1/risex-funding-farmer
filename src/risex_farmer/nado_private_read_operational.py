@@ -23,13 +23,13 @@ from .nado_private_read_preflight import (
 )
 
 
-INVOCATION_ID = "nado-private-read-20260824-new-op-001"
-STORE_BASENAME = ".risex-funding-farmer-nado-private-read-20260824-new-op-001.sqlite3"
+INVOCATION_ID = "nado-private-read-20260824-new-op-002"
+STORE_BASENAME = ".risex-funding-farmer-nado-private-read-20260824-new-op-002.sqlite3"
 KEY_BASENAME = ".risex-funding-farmer-nado-owner-key-v1"
 IDENTITY_BASENAME = ".risex-funding-farmer-nado-owner-v1"
 SUBACCOUNT_NAME = "default"
 REDACTED_STORE_PATH = "<passwd-home>/" + STORE_BASENAME
-EXPECTED_PATH_HASH = "ec98ed1b3781034e0436b37a634f4f87164510d077df1c3a5e7dc4a0e4d35b2d"
+EXPECTED_PATH_HASH = "bf927fcd24fc6010fe74465d704f9af3ec4745aa08fab9c67d82433182c47e1b"
 MAX_IDENTITY_BYTES = 160
 
 

@@ -4,6 +4,17 @@
     "rust_sdk": "e54118786b171a4325871d5bd17e5abae0e90c5a",
     "contracts": "11c27b2851999f1b4f8cb4a7fbfcc9320253f12f"
   },
+  "semantic_sources": {
+    "gateway_query_envelope": "https://docs.nado.xyz/developer-resources/api/gateway/queries",
+    "gateway_contracts": "https://docs.nado.xyz/developer-resources/api/gateway/queries/contracts",
+    "gateway_status": "https://docs.nado.xyz/developer-resources/api/gateway/queries/status",
+    "gateway_all_products": "https://docs.nado.xyz/developer-resources/api/gateway/queries/all-products",
+    "gateway_linked_signer": "https://docs.nado.xyz/developer-resources/api/gateway/queries/linked-signer",
+    "gateway_subaccount_info": "https://docs.nado.xyz/developer-resources/api/gateway/queries/subaccount-info",
+    "gateway_subaccount_orders": "https://docs.nado.xyz/developer-resources/api/gateway/queries/subaccount-orders",
+    "gateway_isolated_positions": "https://docs.nado.xyz/developer-resources/api/gateway/queries/isolated-positions",
+    "trigger_list_orders": "https://docs.nado.xyz/developer-resources/api/trigger/queries/list-trigger-orders"
+  },
   "environment": {"chain_id":763373,"domain_name":"Nado","domain_version":"0.0.1","endpoint":"0x698D87105274292B5673367DEC81874Ce3633Ac2","gateway":"https://gateway.test.nado.xyz/v1","trigger":"https://trigger.test.nado.xyz/v1"},
   "owner": "0x0000000000000000000000000000000000000001",
   "subaccount_name": "default",
@@ -19,8 +30,8 @@
     "request": {"type":"list_trigger_orders","tx":{"sender":"0x1a642f0e3c3af545e7acbd38b07251b3990914f164656661756c740000000000","recvTime":"1700000030010"},"signature":"0x0c663eceeb7a8d43c413e5826b6cbe52f15f8baf43a3679ee9967e48f6e406d31365984afba8030158c5f94417c424789312f0a512b7ca803421a69c81187d541c","limit":1}
   },
   "wire": {
-    "contracts": {"status":"success","data":{"chain_id":"763373","endpoint_addr":"0x698D87105274292B5673367DEC81874Ce3633Ac2"}},
-    "status": {"status":"success","data":"active"},
+    "contracts": {"status":"success","data":{"chain_id":"763373","endpoint_addr":"0x698D87105274292B5673367DEC81874Ce3633Ac2"},"request_type":"query_contracts"},
+    "status": {"status":"success","data":"active","request_type":"query_status"},
     "all_products": {"status":"success","data":{
       "spot_products":[{
         "product_id":0,"oracle_price_x18":"1000000000000000000",
@@ -35,8 +46,8 @@
         "state":{"cumulative_funding_long_x18":"0","cumulative_funding_short_x18":"0","available_settle":"0","open_interest":"0"},
         "book_info":{"size_increment":"1000000000000000","price_increment_x18":"1000000000000000","min_size":"1000000000000000","collected_fees":"0"}
       }]
-    }},
-    "linked_signer": {"status":"success","data":{"linked_signer":"0x0000000000000000000000000000000000000000"}},
+    },"request_type":"query_all_products"},
+    "linked_signer": {"status":"success","data":{"linked_signer":"0x0000000000000000000000000000000000000000"},"request_type":"query_linked_signer"},
     "subaccount_info": {"status":"success","data":{
       "exists":true,"subaccount":"0x000000000000000000000000000000000000000164656661756c740000000000","spot_count":1,"perp_count":1,
       "healths":[{"health":"5000000000000000000","assets":"5000000000000000000","liabilities":"0"},{"health":"5000000000000000000","assets":"5000000000000000000","liabilities":"0"},{"health":"5000000000000000000","assets":"5000000000000000000","liabilities":"0"}],
@@ -56,10 +67,10 @@
         "state":{"cumulative_funding_long_x18":"0","cumulative_funding_short_x18":"0","available_settle":"0","open_interest":"0"},
         "book_info":{"size_increment":"1000000000000000","price_increment_x18":"1000000000000000","min_size":"1000000000000000","collected_fees":"0"}
       }]
-    }},
-    "isolated_positions": {"status":"success","data":{"isolated_positions":[]}},
+    },"request_type":"query_subaccount_info"},
+    "isolated_positions": {"status":"success","data":{"isolated_positions":[]},"request_type":"query_isolated_positions"},
     "time": {"status":"success","method":"time","server_time":"1700000000009"},
-    "trigger": {"status":"success","data":{"orders":[]}}
+    "trigger": {"status":"success","data":{"orders":[]},"request_type":"query_list_trigger_orders"}
   },
   "round_a": [
     {"op":"contracts","observed_at_ms":1700000000000},{"op":"status","observed_at_ms":1700000000001},{"op":"all_products","observed_at_ms":1700000000002},{"op":"linked_signer","observed_at_ms":1700000000003},{"op":"subaccount_info","observed_at_ms":1700000000004},{"op":"subaccount_orders:0","observed_at_ms":1700000000005},{"op":"subaccount_orders:1","observed_at_ms":1700000000006},{"op":"isolated_positions","observed_at_ms":1700000000007}
