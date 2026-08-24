@@ -11,9 +11,10 @@ Status: `BLOCKED — FROZEN FIXTURE MILESTONE HAS NO LIVE OPERATIONAL PATH`.
 
 ## Nado — resume public preflight diagnosis
 
-Status: `BLOCKED — OFFICIAL PUBLIC GATEWAY RETURNED HTTP 403`.
+Status: `BLOCKED — HTTP 200 RECEIVED WITHOUT CATALOG-SHAPE EVIDENCE`.
 
-- After a genuine external-state change or cooldown, perform exactly one credential-free official public catalog query from a fresh Builder session. If successful, reproduce and correct the remaining op003 catalog mismatch with fixtures; if still forbidden, stop without retry.
+- The post-cooldown credential-free request is consumed and must not be retried: it proved gateway availability but the diagnostic collector did not capture a complete response body or schema.
+- Any later catalog capture requires a fresh separately gated credential-free operation and a fresh Builder session. Until complete official shape evidence exists, do not correct fixtures by inference.
 - Do not read credentials or create op004 until the public contract passes.
 
 ## Extended — wait for official stream recovery

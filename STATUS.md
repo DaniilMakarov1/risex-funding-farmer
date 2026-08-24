@@ -16,7 +16,7 @@
 ### Nado
 
 - The fixed identity is securely provisioned; Ink Sepolia gas and test USDT0 collateral are available, with exactly 10 test USDT0 deposited.
-- Private-read op003 stopped before credentials after a public catalog mismatch. A later single official public diagnosis received HTTP 403 and made no code change. The next action waits for public gateway availability; consumed invocations are never reused.
+- Private-read op003 stopped before credentials after a public catalog mismatch. After cooldown, one later credential-free official catalog request received HTTP 200, but its bounded diagnostic collector ended on a partial gzip read before capturing the response structure. No retry occurred; gateway availability is proved, catalog shape is not, and consumed invocations are never reused.
 
 ### Extended
 
