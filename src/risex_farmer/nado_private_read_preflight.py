@@ -1388,6 +1388,8 @@ async def _run_counted_operational_private_read(
         _OperationalTriggerTransport(),
     )
     handle: object | None = None
+    ready_to_finalize = False
+    close_failed = False
     try:
         round_a = await _operational_round_a(
             public_transport, config,
@@ -1503,7 +1505,7 @@ async def _run_counted_operational_private_read(
             )
         ):
             raise NadoPreflightError("durable counter totals disagree")
-        store.finalize(invocation_id, round_b.fingerprint)
+        ready_to_finalize = True
     except asyncio.CancelledError:
         counters = store.counters(invocation_id)
         reason = (
@@ -1520,7 +1522,7 @@ async def _run_counted_operational_private_read(
             reason = (
                 "AMBIGUOUS_DISPATCH"
                 if counters["trigger_dispatch_attempts"]
-                > counters["trigger_dispatch_completions"]
+                > counters["trigger_observation_completions"]
                 else "VALIDATION_FAILED"
             )
             store.terminalize_unknown(invocation_id, reason)
@@ -1530,8 +1532,25 @@ async def _run_counted_operational_private_read(
         if handle is not None:
             try:
                 handle.close()
+                await asyncio.sleep(0)
+            except asyncio.CancelledError:
+                if store.state(invocation_id) in {NEW, CLAIMED, OBSERVED}:
+                    counters = store.counters(invocation_id)
+                    reason = (
+                        "AMBIGUOUS_DISPATCH"
+                        if counters["trigger_dispatch_attempts"]
+                        > counters["trigger_observation_completions"]
+                        else "CANCELLED"
+                    )
+                    store.terminalize_unknown(invocation_id, reason)
+                raise
             except BaseException:
-                pass
+                close_failed = True
+    if ready_to_finalize:
+        if close_failed:
+            store.terminalize_unknown(invocation_id, "VALIDATION_FAILED")
+        else:
+            store.finalize(invocation_id, round_b.fingerprint)
     report = store.terminal_report(invocation_id)
     if report is None:
         raise NadoPreflightError("durable report is unavailable")

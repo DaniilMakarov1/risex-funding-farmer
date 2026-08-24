@@ -1205,9 +1205,11 @@ async def test_owned_http_transport_enforces_real_deadline_and_cancellation(
     assert len(session.calls) == 1
 
 
+@pytest.mark.parametrize("close_fails", [False, True])
 @pytest.mark.asyncio
 async def test_counted_operational_adapter_exact_sequence_and_terminal_report(
     tmp_path: Path, contract: dict[str, object], monkeypatch: pytest.MonkeyPatch,
+    close_fails: bool,
 ) -> None:
     import risex_farmer.nado_private_read_operational as operational
 
@@ -1256,6 +1258,8 @@ async def test_counted_operational_adapter_exact_sequence_and_terminal_report(
 
         def close(self) -> None:
             self.closed += 1
+            if close_fails:
+                raise RuntimeError("RAW_SECRET_CLOSE")
 
     handle = Handle()
     store = nado.OneShotStore(tmp_path / "counted-success.sqlite3")
@@ -1266,7 +1270,9 @@ async def test_counted_operational_adapter_exact_sequence_and_terminal_report(
                     nado._OperationalTimeTransport(),
                     nado._OperationalTriggerTransport()),
     )
-    assert report["status"] == nado.FINALIZED
+    assert report["status"] == (nado.UNKNOWN if close_fails else nado.FINALIZED)
+    if close_fails:
+        assert report["reason"] == "VALIDATION_FAILED"
     assert report["product_count"] == 2
     counters = report["counters"]
     assert counters["public_a_attempts"] == counters["public_a_completions"] == 8
@@ -1276,6 +1282,19 @@ async def test_counted_operational_adapter_exact_sequence_and_terminal_report(
         assert counters[f"{phase}_completions"] == 1
     assert handle.closed == 1 and len(sessions) == 21 and not clock_values
     assert "signature" not in json.dumps(report).lower()
+    if close_fails:
+        before_restart = len(sessions)
+        restarted = await operational._fixture_run(
+            config=_config(contract), store=store,
+            capability_loader=lambda: (_ for _ in ()).throw(AssertionError()),
+            recover_owner=lambda typed, signature: (_ for _ in ()).throw(AssertionError()),
+            path_hash="fixture-path-hash",
+            transports=(nado._OperationalGatewayTransport(),
+                        nado._OperationalTimeTransport(),
+                        nado._OperationalTriggerTransport()),
+        )
+        assert restarted == report and len(sessions) == before_restart
+        assert handle.closed == 1
 
 
 @pytest.mark.asyncio
