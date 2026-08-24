@@ -6,7 +6,8 @@
       "x10/config.py",
       "x10/clients/stream/stream_client.py",
       "x10/clients/stream/stream_connection.py",
-      "x10/clients/rest/modules/account_module.py"
+      "x10/clients/rest/modules/account_module.py",
+      "x10/utils/http.py"
     ]
   },
   "contract": {

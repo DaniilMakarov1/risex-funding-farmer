@@ -39,7 +39,9 @@ _STREAM_DATA_KEYS = {"orders", "positions", "trades", "balance", "spotBalances"}
 _MAX_OBSERVATION_AGE_MS = 5_000
 _TRANSPORT_KEYS = {
     "actual_url", "method", "header_names", "direct_tls", "trust_env", "proxy",
-    "redirects", "retries", "fallbacks",
+    "redirects", "retries", "fallbacks", "api_key_header_count",
+    "authorization_present", "credential_in_query", "credential_in_body",
+    "application_frames_sent",
 }
 _BALANCE_KEYS = {
     "collateralName", "balance", "equity", "availableForTrade",
@@ -220,12 +222,24 @@ def _decimal_string(value: Any) -> bool:
 
 def _validate_transport(value: Any, *, url: str) -> None:
     meta = _exact_object(value, _TRANSPORT_KEYS, "TRANSPORT_METADATA_MALFORMED")
+    expected_headers = (
+        ["User-Agent", _API_HEADER]
+        if url == STREAM_URL
+        else ["Accept", "Content-Type", "User-Agent", _API_HEADER]
+    )
     if (
         meta["actual_url"] != url or meta["method"] != "GET"
-        or meta["header_names"] != [_API_HEADER]
+        or meta["header_names"] != expected_headers
+        or meta["api_key_header_count"] != 1
+        or type(meta["api_key_header_count"]) is not int
+        or meta["authorization_present"] is not False
+        or meta["credential_in_query"] is not False
+        or meta["credential_in_body"] is not False
+        or meta["application_frames_sent"] is not False
         or meta["direct_tls"] is not True or meta["trust_env"] is not False
         or meta["proxy"] is not None or meta["redirects"] != 0
         or meta["retries"] != 0 or meta["fallbacks"] != 0
+        or any(type(meta[key]) is not int for key in ("redirects", "retries", "fallbacks"))
     ):
         raise PreflightViolation("TRANSPORT_CONTRACT_MISMATCH")
 

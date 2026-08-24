@@ -35,10 +35,18 @@ def wrapped(data, *, count=None):
 
 
 def transport_meta(url):
+    headers = (
+        ["User-Agent", "X-Api-Key"]
+        if url == STREAM_URL
+        else ["Accept", "Content-Type", "User-Agent", "X-Api-Key"]
+    )
     return {
-        "actual_url": url, "method": "GET", "header_names": ["X-Api-Key"],
+        "actual_url": url, "method": "GET", "header_names": headers,
         "direct_tls": True, "trust_env": False, "proxy": None, "redirects": 0,
         "retries": 0, "fallbacks": 0,
+        "api_key_header_count": 1, "authorization_present": False,
+        "credential_in_query": False, "credential_in_body": False,
+        "application_frames_sent": False,
     }
 
 
@@ -337,9 +345,15 @@ async def test_balance_and_spot_balance_are_exhaustively_decoded(tmp_path):
     "key,value",
     [
         ("actual_url", "wss://wrong.invalid/v1/account"), ("method", "POST"),
-        ("header_names", ["Authorization"]), ("direct_tls", False),
+        ("header_names", ["Authorization"]), ("header_names", []),
+        ("header_names", ["User-Agent", "X-Api-Key", "Extra"]),
+        ("api_key_header_count", 0), ("api_key_header_count", 2),
+        ("authorization_present", True), ("credential_in_query", True),
+        ("credential_in_body", True), ("application_frames_sent", True),
+        ("direct_tls", False),
         ("trust_env", True), ("proxy", "http://proxy.invalid"),
         ("redirects", 1), ("retries", 1), ("fallbacks", 1),
+        ("redirects", False), ("retries", False), ("fallbacks", False),
     ],
 )
 async def test_actual_transport_metadata_mismatch_blocks(tmp_path, key, value):
