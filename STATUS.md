@@ -3,7 +3,7 @@
 ## Central baseline
 
 - Paper remains the default product. Strategy execution, mainnet, real funds, and ungated private or write traffic are prohibited.
-- The central baseline includes the accepted Extended private-read governance and the compact active-governance state. Its post-integration Python 3.11 suite passed with 1062 tests and `pip check` passed.
+- The central baseline includes the accepted deterministic Extended sealed private-read implementation at `1551cb328ca1cf41bc4c4a49541c7e5f301ec5e6`. Its post-integration Python 3.11 suite passed with 1159 tests and `pip check` passed.
 - The RISEx, Nado, and Extended deterministic lifecycle cores are centrally accepted. Infrastructure is frozen except for corrections strictly necessary to finish the three minimal operational lifecycles safely.
 
 ## RISEx
@@ -25,7 +25,8 @@
 ## Extended
 
 - Phase 0 and the fixture lifecycle core are accepted and published.
-- The first isolated private-read implementation candidate is rejected and immutable. Independent official-source review resolved its apparent stream contradiction: official v1 uses exactly `/stream.extended.exchange/v1/account` with `X-Api-Key` during the WebSocket upgrade and has no application-level subscribe/ack exchange; JSON-RPC subscribe/ack belongs to the distinct v2 RPC protocol. The active correction must keep the v1 stream gap-free through REST round B and use it only as an intervening-activity barrier. No credential load, authenticated request, stream connection, signature, or write is currently authorized.
+- The deterministic sealed private-read implementation is Architect-accepted, independently Chief-accepted, and integrated into local `main` at `1551cb328ca1cf41bc4c4a49541c7e5f301ec5e6` on exact base `dc83bb209bb8c51194e2e0eda3c42166db9a59ba`. Acceptance evidence is 72 focused tests, 1159 full clean Python 3.11 tests, and a clean dependency check. It pins official v1 `/stream.extended.exchange/v1/account`, uses `X-Api-Key` only in the upgrade header with no application-level subscribe/ack, keeps one gap-free activity barrier active through exhaustive REST round B and the final barrier, applies response-time freshness checks, and persists redacted one-shot terminal evidence.
+- Publication is blocked solely because the local HTTPS Git transport lacks GitHub credentials; `origin/main` remains `ed6b0f076200b4f5316cd2341e8d8a3e0e16c8b1`. No real credential load, private REST request, WebSocket connection, signature, or write was performed or is authorized. Any later real private REST plus v1 stream invocation requires a separate Chief operational gate with a new durable one-shot identity.
 - Extended has not proved an operational order lifecycle, authoritative zero open orders, or exact flatness.
 
 ## Exit condition
