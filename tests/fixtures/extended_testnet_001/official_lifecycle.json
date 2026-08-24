@@ -1,0 +1,285 @@
+{
+  "provenance": {
+    "repository": "https://github.com/x10xchange/python_sdk",
+    "commit": "2130cdb1cd6e7b1867db83bd3af036572d258739",
+    "tree": "30046661d08eb18187911cacc0925021ba00bf68"
+  },
+  "contract": {
+    "apiBaseUrl": "https://api.starknet.sepolia.extended.exchange/api/v1",
+    "apiBaseOrderManagementUrl": "https://api.starknet.sepolia.extended.exchange/api/v1",
+    "streamUrl": "wss://api.starknet.sepolia.extended.exchange/stream.extended.exchange/v1",
+    "streamRpcUrl": "wss://api.starknet.sepolia.extended.exchange/stream.extended.exchange/v2/rpc",
+    "signingDomain": "starknet.sepolia.extended.exchange",
+    "starknetDomain": {
+      "name": "Perpetuals",
+      "version": "v0",
+      "chainId": "SN_SEPOLIA",
+      "revision": "1"
+    }
+  },
+  "identity": {
+    "accountId": 7001,
+    "accountIndex": 3,
+    "l2Key": "0x12345",
+    "l2Vault": 7001003,
+    "apiKey": "fixture-api-key-0001"
+  },
+  "market": {
+    "name": "BTC-USD",
+    "type": "PERPETUAL",
+    "assetName": "BTC",
+    "assetPrecision": 6,
+    "collateralAssetName": "USD",
+    "collateralAssetPrecision": 6,
+    "active": true,
+    "isRfq": false,
+    "isOffHours": false,
+    "tradingHours": "CONTINUOUS",
+    "marketStats": {
+      "dailyVolume": "1000000",
+      "dailyVolumeBase": "25",
+      "dailyPriceChange": "0.01",
+      "dailyLow": "39000",
+      "dailyHigh": "41000",
+      "lastPrice": "40005",
+      "askPrice": "40010",
+      "bidPrice": "40000",
+      "markPrice": "40005",
+      "indexPrice": "40004",
+      "fundingRate": "0.0001",
+      "nextFundingRate": 1770000000000,
+      "openInterest": "100",
+      "openInterestBase": "2.5"
+    },
+    "tradingConfig": {
+      "minOrderSize": "0.001",
+      "minOrderSizeChange": "0.001",
+      "minPriceChange": "1",
+      "maxMarketOrderValue": "500000",
+      "maxLimitOrderValue": "500000",
+      "maxPositionValue": "500000",
+      "maxLeverage": "20",
+      "maxNumOrders": 100,
+      "limitPriceCap": "50000",
+      "limitPriceFloor": "30000",
+      "riskFactorConfig": [
+        {"upperBound": "500000", "riskFactor": "0.05"}
+      ]
+    },
+    "l2Config": {
+      "type": "STARKEX",
+      "collateralId": "0x55534443",
+      "collateralResolution": 1000000,
+      "syntheticId": "0x425443",
+      "syntheticResolution": 1000000
+    }
+  },
+  "book": {
+    "market": "BTC-USD",
+    "eventTime": 1770000000000,
+    "bids": [{"price": "40000", "qty": "0.010"}],
+    "asks": [{"price": "40010", "qty": "0.010"}]
+  },
+  "account": {
+    "observedAt": 1770000000000,
+    "serverTime": 1770000000000,
+    "info": {
+      "id": 7001,
+      "description": "synthetic fixture account",
+      "accountIndex": 3,
+      "status": "ACTIVE",
+      "l2Key": "0x12345",
+      "l2Vault": 7001003,
+      "bridgeStarknetAddress": null
+    },
+    "balance": {
+      "collateralName": "USD",
+      "balance": "1000",
+      "equity": "1000",
+      "availableForTrade": "900",
+      "availableForWithdrawal": "900",
+      "unrealisedPnl": "0",
+      "initialMargin": "0",
+      "marginRatio": "0",
+      "updatedTime": 1770000000000,
+      "spotEquity": "0",
+      "spotEquityForAvailableForTrade": "0",
+      "collateralReservedForSpotOrders": "0"
+    },
+    "fees": [
+      {
+        "market": "BTC-USD",
+        "makerFeeRate": "0",
+        "takerFeeRate": "0.00025",
+        "builderFeeRate": "0"
+      }
+    ],
+    "leverage": [{"market": "BTC-USD", "leverage": "2"}],
+    "openOrders": [],
+    "positions": []
+  },
+  "stream": {
+    "accountId": 7001,
+    "l2Key": "0x12345",
+    "sequence": 44,
+    "eventTime": 1770000000000,
+    "receivedAt": 1770000000000,
+    "gapFree": true,
+    "connected": true,
+    "orders": [],
+    "positions": [],
+    "trades": [],
+    "balance": {
+      "collateralName": "USD",
+      "balance": "1000",
+      "equity": "1000",
+      "availableForTrade": "900",
+      "availableForWithdrawal": "900",
+      "unrealisedPnl": "0",
+      "initialMargin": "0",
+      "marginRatio": "0",
+      "updatedTime": 1770000000000,
+      "spotEquity": "0",
+      "spotEquityForAvailableForTrade": "0",
+      "collateralReservedForSpotOrders": "0"
+    }
+  },
+  "entry": {
+    "externalId": "123456789012345678901234567890",
+    "settlementHash": 123456789012345678901234567890,
+    "nonce": 1700000001,
+    "market": "BTC-USD",
+    "side": "BUY",
+    "type": "LIMIT",
+    "qty": "0.001",
+    "price": "40010",
+    "reduceOnly": false,
+    "postOnly": false,
+    "timeInForce": "IOC",
+    "expiryEpochMillis": 1770000015000,
+    "fee": "0.00025",
+    "selfTradeProtectionLevel": "ACCOUNT",
+    "settlement": {
+      "signature": {"r": "0x111", "s": "0x222"},
+      "starkKey": "0x12345",
+      "collateralPosition": "7001003"
+    }
+  },
+  "close": {
+    "externalId": "223456789012345678901234567890",
+    "settlementHash": 223456789012345678901234567890,
+    "nonce": 2147483647,
+    "market": "BTC-USD",
+    "side": "SELL",
+    "type": "LIMIT",
+    "qty": "0.001",
+    "price": "40000",
+    "reduceOnly": true,
+    "postOnly": false,
+    "timeInForce": "IOC",
+    "expiryEpochMillis": 1770000018000,
+    "fee": "0.00025",
+    "selfTradeProtectionLevel": "ACCOUNT",
+    "settlement": {
+      "signature": {"r": "0x333", "s": "0x444"},
+      "starkKey": "0x12345",
+      "collateralPosition": "7001003"
+    }
+  },
+  "vectors": {
+    "canonicalPayloadDigest": "b07e6eb1858919691ee31fa8935080e0258ef3ba8bb94957989dd1c020e16815",
+    "closeCanonicalPayloadDigest": "ceced9e30d601684b2bcf96ce3973c6f839d09295ccb8f33289917879da39a0c"
+  },
+  "filledOrder": {
+    "id": 90001,
+    "accountId": 7001,
+    "externalId": "123456789012345678901234567890",
+    "market": "BTC-USD",
+    "type": "LIMIT",
+    "side": "BUY",
+    "status": "FILLED",
+    "statusReason": "NONE",
+    "price": "40010",
+    "averagePrice": "40008",
+    "qty": "0.001",
+    "filledQty": "0.001",
+    "cancelledQty": "0",
+    "reduceOnly": false,
+    "postOnly": false,
+    "payedFee": "0.010002",
+    "createdTime": 1770000001000,
+    "updatedTime": 1770000002000,
+    "expiryTime": 1770000015000,
+    "timeInForce": "IOC"
+  },
+  "fill": {
+    "id": 80001,
+    "accountId": 7001,
+    "market": "BTC-USD",
+    "orderId": 90001,
+    "side": "BUY",
+    "price": "40008",
+    "qty": "0.001",
+    "value": "40.008",
+    "fee": "0.010002",
+    "isTaker": true,
+    "tradeType": "TRADE",
+    "createdTime": 1770000002000
+  },
+  "filledCloseOrder": {
+    "id": 90002,
+    "accountId": 7001,
+    "externalId": "223456789012345678901234567890",
+    "market": "BTC-USD",
+    "type": "LIMIT",
+    "side": "SELL",
+    "status": "FILLED",
+    "statusReason": "NONE",
+    "price": "40000",
+    "averagePrice": "40000",
+    "qty": "0.001",
+    "filledQty": "0.001",
+    "cancelledQty": "0",
+    "reduceOnly": true,
+    "postOnly": false,
+    "payedFee": "0.010000",
+    "createdTime": 1770000004000,
+    "updatedTime": 1770000005000,
+    "expiryTime": 1770000018000,
+    "timeInForce": "IOC"
+  },
+  "closeFill": {
+    "id": 80002,
+    "accountId": 7001,
+    "market": "BTC-USD",
+    "orderId": 90002,
+    "side": "SELL",
+    "price": "40000",
+    "qty": "0.001",
+    "value": "40.000",
+    "fee": "0.010000",
+    "isTaker": true,
+    "tradeType": "TRADE",
+    "createdTime": 1770000005000
+  },
+  "position": {
+    "id": 60001,
+    "accountId": 7001,
+    "market": "BTC-USD",
+    "status": "OPENED",
+    "side": "LONG",
+    "leverage": "2",
+    "size": "0.001",
+    "value": "40.005",
+    "openPrice": "40008",
+    "markPrice": "40005",
+    "liquidationPrice": null,
+    "unrealisedPnl": "-0.003",
+    "realisedPnl": "0",
+    "tpPrice": null,
+    "slPrice": null,
+    "adl": null,
+    "createdAt": 1770000002000,
+    "updatedAt": 1770000003000
+  }
+}
