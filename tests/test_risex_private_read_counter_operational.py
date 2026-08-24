@@ -422,11 +422,17 @@ async def test_success_has_exact_sequence_full_counters_and_agreeing_barriers(tm
         ('{"method":"auth_v2",', "auth_v2_malformed", "auth_v2_parse"),
         ('{"method":"auth_v2","status":"success","status":"error"}',
          "auth_v2_malformed", "auth_v2_parse"),
-        ('{"method":"auth_v2","status":"success","extra":true}',
-         "auth_v2_schema_invalid", "auth_v2_validate"),
         ('{"method":"auth","status":"success"}',
          "auth_v2_schema_invalid", "auth_v2_validate"),
         ('{"method":"auth_v2","status":"unknown"}',
+         "auth_v2_schema_invalid", "auth_v2_validate"),
+        ('{"status":"success","extra":true}',
+         "auth_v2_schema_invalid", "auth_v2_validate"),
+        ('{"method":"auth_v2","extra":true}',
+         "auth_v2_schema_invalid", "auth_v2_validate"),
+        ('{"method":7,"status":"success","extra":true}',
+         "auth_v2_schema_invalid", "auth_v2_validate"),
+        ('{"method":"auth_v2","status":true,"extra":true}',
          "auth_v2_schema_invalid", "auth_v2_validate"),
         ('{"method":"auth_v2","status":"error"}',
          "auth_v2_error", "auth_v2_status"),
@@ -465,11 +471,115 @@ async def test_auth_ack_failures_are_durable_redacted_and_never_subscribe(
 
 
 @pytest.mark.asyncio
+async def test_official_handler_parity_accepts_observed_envelope_and_drops_extras(
+    tmp_path, monkeypatch,
+):
+    calls: list[str] = []
+    extra_key = "server-controlled-extra-key"
+    extra_value = "server-controlled-extra-value"
+    raw = json.dumps({
+        "method": "auth_v2",
+        "status": "success",
+        "data": {extra_key: extra_value},
+        "request_id": "server-controlled-request-id",
+    }, separators=(",", ":"))
+    downstream = []
+    original_validate = PrivateReadPreflight._validate_auth_frame
+
+    def capture_canonical(frame):
+        downstream.append(frame)
+        return original_validate(frame)
+
+    monkeypatch.setattr(
+        PrivateReadPreflight, "_validate_auth_frame", staticmethod(capture_canonical),
+    )
+    report = await _run_fixture(dependencies(
+        tmp_path,
+        calls,
+        transport_factory=lambda: SyntheticTransport(calls, auth_response=raw),
+    ))
+    assert report.result is Result.PASSED and report.reason == "complete"
+    assert report.auth_v2_shape is None and report.auth_v2_shape_sha256 is None
+    assert "orders_subscribe" in calls and "positions_subscribe" in calls
+    canonical = operational._validate_auth_v2_schema(json.loads(raw))
+    assert canonical == {"method": "auth_v2", "status": "success"}
+    assert set(canonical) == {"method", "status"}
+    assert downstream == [{"method": "auth_v2", "status": "success"}]
+    serialized = json.dumps(report.as_dict(), sort_keys=True)
+    persisted = (tmp_path / "fixture.sqlite3").read_bytes().decode("latin1")
+    for forbidden in (
+        raw, extra_key, extra_value, "request_id", "server-controlled-request-id",
+    ):
+        assert forbidden not in serialized
+        assert forbidden not in persisted
+
+
+def test_auth_validator_does_not_iterate_or_traverse_extra_fields():
+    class NoIteration(dict):
+        def __iter__(self):
+            raise AssertionError("frame iterated")
+
+        def keys(self):
+            raise AssertionError("frame keys traversed")
+
+        def items(self):
+            raise AssertionError("frame items traversed")
+
+        def values(self):
+            raise AssertionError("frame values traversed")
+
+    extra = object()
+    frame = NoIteration(
+        method="auth_v2", status="success", data=extra, request_id=extra,
+    )
+    canonical = operational._validate_auth_v2_schema(frame)
+    assert canonical == {"method": "auth_v2", "status": "success"}
+    assert extra is frame.get("data") and extra is frame.get("request_id")
+
+
+@pytest.mark.asyncio
+async def test_official_error_with_extras_is_unknown_without_witness_or_subscribe(
+    tmp_path,
+):
+    calls: list[str] = []
+    secret = "server-controlled-error-extra"
+    raw = json.dumps({
+        "method": "auth_v2",
+        "status": "error",
+        "data": {"error": secret},
+        "request_id": "server-controlled-request-id",
+    }, separators=(",", ":"))
+    report = await _run_fixture(dependencies(
+        tmp_path,
+        calls,
+        transport_factory=lambda: SyntheticTransport(calls, auth_response=raw),
+    ))
+    assert report.result is Result.UNKNOWN and report.reason == "auth_v2_error"
+    assert report.counters["auth_v2_validate"] == {"attempts": 1, "completions": 1}
+    assert report.counters["auth_v2_status"] == {"attempts": 1, "completions": 0}
+    assert report.auth_v2_shape is None and report.auth_v2_shape_sha256 is None
+    assert "orders_subscribe" not in calls and "positions_subscribe" not in calls
+    serialized = json.dumps(report.as_dict(), sort_keys=True)
+    persisted = (tmp_path / "fixture.sqlite3").read_bytes().decode("latin1")
+    for forbidden in (raw, secret, "request_id", "server-controlled-request-id"):
+        assert forbidden not in serialized and forbidden not in persisted
+
+    restart_calls: list[str] = []
+    restarted = await _run_fixture(dependencies(
+        tmp_path,
+        restart_calls,
+        source_factory=lambda: (_ for _ in ()).throw(AssertionError("source")),
+        transport_factory=lambda: (_ for _ in ()).throw(AssertionError("transport")),
+    ))
+    assert restarted == report and restart_calls == []
+
+
+@pytest.mark.asyncio
 async def test_schema_invalid_auth_ack_persists_only_bounded_structural_witness(
     tmp_path,
 ):
     calls: list[str] = []
-    raw = '{"method":"auth_v2","status":"success","data":{"code":7}}'
+    raw = '{"method":"auth_v2","status":"unknown","data":{"code":7}}'
     report = await _run_fixture(dependencies(
         tmp_path,
         calls,
@@ -576,7 +686,7 @@ async def test_auth_shape_limits_collapse_to_one_constant_witness(tmp_path, valu
 @pytest.mark.parametrize("mutation", ("shape", "digest", "forbidden_grammar"))
 async def test_auth_shape_corruption_rejects_store_without_effects(tmp_path, mutation):
     calls: list[str] = []
-    raw = '{"method":"auth_v2","status":"success","extra":true}'
+    raw = '{"method":"auth_v2","status":"unknown","extra":true}'
     first = await _run_fixture(dependencies(
         tmp_path,
         calls,

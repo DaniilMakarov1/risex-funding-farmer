@@ -889,14 +889,13 @@ def _parse_auth_v2(raw: Any) -> Any:
 
 
 def _validate_auth_v2_schema(value: Any) -> Mapping[str, Any]:
-    if (
-        not isinstance(value, Mapping)
-        or set(value) != {"method", "status"}
-        or value.get("method") != "auth_v2"
-        or value.get("status") not in {"success", "error"}
-    ):
+    if not isinstance(value, Mapping):
         raise _AuthV2Failure("auth_v2_schema_invalid")
-    return value
+    method = value.get("method")
+    status = value.get("status")
+    if method != "auth_v2" or status not in {"success", "error"}:
+        raise _AuthV2Failure("auth_v2_schema_invalid")
+    return {"method": "auth_v2", "status": status}
 
 
 def _require_auth_v2_success(value: Mapping[str, Any]) -> Mapping[str, Any]:
