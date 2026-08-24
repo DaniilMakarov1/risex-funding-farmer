@@ -50,29 +50,30 @@ Deterministic acceptance:
 
 This governance candidate creates no Builder and authorizes no fixed-store creation, credential access, network, real signature, private Query, `/execute`, order, cancel, close, or other write. The fixed invocation/path remain unused until implementation acceptance, sequential central integration/publication, and a later separate Chief operational gate.
 
-## Extended — one-shot operational private-read gate
+## Extended — operational adapter and durable counter correction
 
-Status: `DETERMINISTIC IMPLEMENTATION ACCEPTED AND INTEGRATED LOCALLY — PUBLICATION BLOCKED; NO OPERATIONAL CALL AUTHORIZED`.
+Status: `ARCHITECT GOVERNANCE CANDIDATE — AWAITS CHIEF ACCEPTANCE AND SEPARATE BUILDER AUTHORIZATION; NO OPERATIONAL CALL AUTHORIZED`.
 
-Accepted implementation: `1551cb328ca1cf41bc4c4a49541c7e5f301ec5e6` on exact base `dc83bb209bb8c51194e2e0eda3c42166db9a59ba`. Acceptance evidence is 72 focused tests, 1159 full clean Python 3.11 tests, a clean dependency check, and clean scope, diff, secret, import, and network-surface review. Publication is blocked because local HTTPS Git transport lacks GitHub credentials; `origin/main` remains `ed6b0f076200b4f5316cd2341e8d8a3e0e16c8b1`.
+Objective: correct exactly two reproduced blockers inside existing `EXTENDED-TESTNET-001`: add a truthful isolated production binding and one-command opt-in launcher for the accepted sealed private-read function, and make every required attempt/completion counter authoritatively recoverable after interruption. This is corrective infrastructure only, not a new lifecycle or product behavior.
 
-Next boundary: before any real credential or private traffic, the Chief Coordinator must separately authorize exactly one read-only invocation against one fixed Extended Sepolia subaccount using the accepted implementation and a new unique durable one-shot identity. This task records the gate boundary only; it does not authorize the invocation.
+Authorized implementation scope after a separate Chief Builder gate:
 
-Required preflight for that later gate:
+- Add one isolated Extended operational-adapter module and focused tests, plus only the minimum Extended private-read store/controller changes required for the counter ledger. The module is never imported by package startup or `risex-farmer`; its sole production entry is the explicit opt-in module launcher `python -m risex_farmer.extended_private_read_operational`. The production binding exposes no caller-selected store path, invocation ID, identity, URL, method, transport, proxy, timeout, retry, reconnect, fallback, or write surface.
+- Accept exactly one Chief-designated opaque local API-key source capability. The later Builder gate must supply the source class and the already-approved fixed non-secret account/subaccount identity for production pinning, without placing actual API-key or account identity values in governance. Absence or mismatch fails closed. The API key is loaded once and may appear only in the `X-Api-Key` request/upgrade header; the source class, source location, key value, full identity, private response, and headers never enter Git, SQLite, CLI arguments, environment dumps, logs, exceptions, or reports. Tests use only a synthetic source and synthetic identity through a private fixture seam.
+- The production binding owns invocation ID `extended-private-read-20260824-new-op-001` and absolute store path `/Users/daniilmakarov/.risex-funding-farmer-extended-private-read-20260824-new-op-001.sqlite3`; production exposes no override and the Builder must never create that store. These identifiers remain unused until implementation acceptance, integration/publication, and a later operational gate.
+- Bind only the accepted Sepolia REST origin and exact `/user/account/info`, `/user/orders`, and `/user/positions` paths once in round A and once in round B, plus one connection to official v1 `/stream.extended.exchange/v1/account`. Use verified direct TLS, exact final URLs, `trust_env=False`, `proxy=None`, redirects disabled, fixed bounded deadlines, and no retry, reconnect, fallback, replay, application-level subscribe/ack, POST, generic request method, order, cancel, close-position, deposit, or other write surface.
+- Preserve the accepted sequence: loader once, complete three-GET round A, one `X-Api-Key` upgrade stream, complete three-GET round B while that same gap-free stream remains active, final barrier, then stream close. Existing strict identity, pagination, freshness, zero-order, exact-flat, activity, sequence, disconnect, and redaction gates remain unchanged.
+- Extend the durable `PRAGMA synchronous=FULL` one-shot record with a schema version, fixed invocation/config identity evidence, phase, and nonnegative attempt/completion counters for loader, each of the six REST requests and validated responses, stream open and validated upgrade, final barrier request and validation, stream close, and terminal persistence. Commit each attempt before its external effect and each completion only after exact validation; never infer completion from an attempt.
+- A later launcher encountering interrupted `RUNNING` reports redacted `UNKNOWN` with the exact durable phase/counters and performs zero loader, clock, REST, or stream effects. Terminal restart returns the same redacted result with zero effects. No state is reset, deleted, repaired, resumed, rearmed, or replayed.
 
-- Verify the exact accepted and published implementation commit, fixed account/subaccount identity, injected durable store path, and new unused one-shot identity without exposing credential values.
-- Authorize only the API-key loader, exactly six authenticated GETs (the three pinned exhaustive REST resources once in each round), and one official v1 account stream connection required by the accepted contract.
-- Preserve direct TLS, exact official hosts and paths, API key solely in the `X-Api-Key` upgrade header, no application-level subscribe/ack, and no proxy, redirect, fallback, retry, reconnect, or replay.
-- Keep the stream active from complete REST round A through complete round B and the final barrier; fail closed on any activity, sequence defect, malformed frame, disconnect, early end, stale/future REST evidence, disagreement, nonzero order, or non-flat position.
-- Persist only redacted durable terminal evidence and exact loader/REST/stream counters. Any terminal, blocked, or ambiguous result is not rearmed or retried; restart after terminal state must make zero loader or network calls.
+Deterministic acceptance:
 
-Forbidden before and during gate formulation:
+- Genuine old-base RED must independently prove the absence of the production opt-in launcher and the absence of authoritative counter recovery from interrupted `RUNNING`.
+- GREEN fixtures must prove the exact six-GET/one-stream sequence and counter totals, fixed binding with no production overrides, source load-once and identity mismatch, interruption/cancellation immediately before and after every external effect, process-death classification at every durable phase, incomplete round B, ambiguous stream open/barrier/close, terminal restart, store/schema/path/permission/symlink corruption, and complete secret/identity/private-response redaction.
+- Run the focused Extended lifecycle/private-read/adapter suites, full clean Python 3.11 suite, dependency check, exact diff review, and secret/import/network-surface scans. CI and Builder verification remain fixture-only with synthetic credentials, identities, transports, and disposable paths.
+- Builder scope is limited to the isolated Extended adapter, minimum Extended private-read durable-ledger correction, and focused fixtures/tests. No governance file change belongs in the Builder commit; no shared Scanner/runtime/repository/economics/strategy/Telegram, RISEx, Nado, paper CLI, lifecycle order logic, framework, or generalized credential/execution abstraction may change.
 
-- Credential access, private REST traffic, WebSocket connection, or any other operational network action.
-- Signing, POST, order, cancel, close, deposit, or any write.
-- A Builder, implementation change, shared Scanner/runtime/economics/strategy/Telegram change, or operational-readiness claim.
-
-Acceptance for the later operational gate: Chief Coordinator independently verifies publication, the exact injected identities and store path, redaction, counter expectations, and the absence of any broader authority, then explicitly authorizes one invocation. Deterministic fixture acceptance alone does not prove operational private-read readiness or permit a call.
+This governance candidate creates no Builder and authorizes no fixed-store creation, credential access, private REST traffic, WebSocket connection, signing, POST, order, cancel, close, deposit, or other write. A later real invocation requires implementation acceptance, sequential central integration/publication, and a separate Chief operational gate.
 
 ## Infrastructure freeze and transition
 
