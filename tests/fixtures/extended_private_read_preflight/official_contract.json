@@ -1,0 +1,35 @@
+{
+  "provenance": {
+    "repository": "https://github.com/x10xchange/python_sdk",
+    "commit": "2130cdb1cd6e7b1867db83bd3af036572d258739",
+    "sources": [
+      "x10/config.py",
+      "x10/clients/stream/stream_client.py",
+      "x10/clients/stream/stream_connection.py",
+      "x10/clients/rest/modules/account_module.py"
+    ]
+  },
+  "contract": {
+    "restBaseUrl": "https://api.starknet.sepolia.extended.exchange/api/v1",
+    "streamUrl": "wss://api.starknet.sepolia.extended.exchange/stream.extended.exchange/v1/account",
+    "apiHeader": "X-Api-Key",
+    "accountInfoPath": "/user/account/info",
+    "openOrdersPath": "/user/orders",
+    "positionsPath": "/user/positions"
+  },
+  "identity": {
+    "accountId": 7001,
+    "accountIndex": 3,
+    "l2Key": "0x12345",
+    "l2Vault": 7001003
+  },
+  "account": {
+    "id": 7001,
+    "description": "synthetic fixture account",
+    "accountIndex": 3,
+    "status": "ACTIVE",
+    "l2Key": "0x12345",
+    "l2Vault": 7001003,
+    "bridgeStarknetAddress": null
+  }
+}
