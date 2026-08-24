@@ -327,16 +327,16 @@ def dependencies(tmp_path, calls, **changes):
 
 
 def test_new_fixed_identity_launcher_and_normal_startup_isolation():
-    assert INVOCATION_ID == "risex-private-read-20260824-new-op-008"
+    assert INVOCATION_ID == "risex-private-read-20260824-new-op-009"
     assert STORE_BASENAME == (
-        ".risex-funding-farmer-risex-private-read-20260824-new-op-008.sqlite3"
+        ".risex-funding-farmer-risex-private-read-20260824-new-op-009.sqlite3"
     )
     assert str(FIXED_STORE_PATH) == (
         "/Users/daniilmakarov/.risex-funding-farmer-"
-        "risex-private-read-20260824-new-op-008.sqlite3"
+        "risex-private-read-20260824-new-op-009.sqlite3"
     )
     assert hashlib.sha256(os.fsencode(str(FIXED_STORE_PATH))).hexdigest() == (
-        "108ecd3fb8d7ab516053b389e4eb80a66e69ca2297636854c38a5b263ef3c78d"
+        "caaac746fcb555e30a069d670322d00c668599f6410310fb102991749fad91c1"
     )
     assert not inspect.signature(OperationalPrivateRead).parameters
     module_source = Path(__file__).parents[1] / "src/risex_farmer/risex_private_read_operational.py"
