@@ -409,6 +409,8 @@ def normalize_official_evidence(raw: Mapping[str, Any], *, now_ms: int) -> Offic
     )
     book = _strict(data["book"], {"market", "eventTime", "bids", "asks"}, set(), "book")
     for side in ("bids", "asks"):
+        if not isinstance(book[side], list):
+            raise EvidenceViolation(f"WIRE_SCHEMA:book.{side}")
         for index, level in enumerate(book[side]):
             _strict(level, {"price", "qty"}, set(), f"book.{side}[{index}]")
 
@@ -809,6 +811,42 @@ class ExtendedLifecycle:
         if not 0 <= evidence.now_ms - evidence.server_time_ms <= _MAX_AGE_MS:
             raise EvidenceViolation("TEMPORAL_DISAGREEMENT")
 
+    @classmethod
+    def _validated_book(
+        cls,
+        evidence: OfficialEvidence,
+        *,
+        tick: Decimal,
+        step: Decimal,
+    ) -> dict[str, tuple[tuple[Decimal, Decimal], ...]]:
+        parsed: dict[str, tuple[tuple[Decimal, Decimal], ...]] = {}
+        for side in ("bids", "asks"):
+            levels = tuple(
+                (
+                    _decimal(level["price"], f"book.{side}.price"),
+                    _decimal(level["qty"], f"book.{side}.qty"),
+                )
+                for level in evidence.book[side]
+            )
+            if not levels:
+                raise EvidenceViolation("DEPTH_INSUFFICIENT")
+            if any(level_qty == 0 for _, level_qty in levels):
+                raise EvidenceViolation("DEPTH_INSUFFICIENT")
+            if any(
+                not cls._grid(level_price, tick) or not cls._grid(level_qty, step)
+                for level_price, level_qty in levels
+            ):
+                raise EvidenceViolation("BOOK_LEVEL_INVALID")
+            prices = tuple(level_price for level_price, _ in levels)
+            if side == "bids" and any(left <= right for left, right in zip(prices, prices[1:])):
+                raise EvidenceViolation("BOOK_ORDER_INVALID")
+            if side == "asks" and any(left >= right for left, right in zip(prices, prices[1:])):
+                raise EvidenceViolation("BOOK_ORDER_INVALID")
+            parsed[side] = levels
+        if parsed["bids"][0][0] >= parsed["asks"][0][0]:
+            raise EvidenceViolation("BOOK_CROSSED")
+        return parsed
+
     @staticmethod
     def _past_expiry(evidence: OfficialEvidence, expiry_ms: int, *, strict: bool = False) -> bool:
         clocks = (evidence.server_time_ms, evidence.stream_event_ms, evidence.now_ms)
@@ -840,7 +878,7 @@ class ExtendedLifecycle:
         minimum = _decimal(config["minOrderSize"], "minimum")
         step = _decimal(config["minOrderSizeChange"], "step")
         tick = _decimal(config["minPriceChange"], "tick")
-        if minimum != step:
+        if minimum <= 0 or step <= 0 or tick <= 0 or minimum != step:
             raise EvidenceViolation("MINIMUM_STEP_MISMATCH")
         if qty != minimum or _decimal(vector["qty"], "order.qty") != minimum:
             raise EvidenceViolation("ONE_STEP_QTY_REQUIRED")
@@ -849,15 +887,25 @@ class ExtendedLifecycle:
         if price != _decimal(vector["price"], "order.price"):
             raise EvidenceViolation("ORDER_VECTOR_MISMATCH")
         build_limit_ioc_order(vector, evidence.server_time_ms)
+        notional = qty * price
+        if notional > MAX_NOTIONAL_USD:
+            raise EvidenceViolation("NOTIONAL_CAP")
+        book = self._validated_book(evidence, tick=tick, step=step)
         if any(
-            not evidence.book[side]
-            or sum(
-                (_decimal(level["qty"], "depth") for level in evidence.book[side]),
-                Decimal(0),
-            )
-            < step
+            sum((level_qty for _, level_qty in book[side]), Decimal(0)) < step
             for side in ("bids", "asks")
         ):
+            raise EvidenceViolation("DEPTH_INSUFFICIENT")
+        executable_side = "asks" if vector["side"] == "BUY" else "bids"
+        executable_qty = sum(
+            (
+                level_qty
+                for level_price, level_qty in book[executable_side]
+                if (level_price <= price if vector["side"] == "BUY" else level_price >= price)
+            ),
+            Decimal(0),
+        )
+        if executable_qty < qty:
             raise EvidenceViolation("DEPTH_INSUFFICIENT")
         fee = next((row for row in evidence.fees if row["market"] == evidence.market_name), None)
         fee_rate = _decimal(fee["takerFeeRate"], "fee") if fee is not None else Decimal(-1)
@@ -867,14 +915,11 @@ class ExtendedLifecycle:
         leverage_value = _decimal(leverage["leverage"], "leverage") if leverage is not None else Decimal(0)
         if leverage is None or not 0 < leverage_value <= _decimal(config["maxLeverage"], "maxLeverage"):
             raise EvidenceViolation("LEVERAGE_INVALID")
-        notional = qty * price
         required_balance = notional * (Decimal(1) + fee_rate)
         if _decimal(evidence.balance["availableForTrade"], "availableForTrade") < required_balance:
             raise EvidenceViolation("BALANCE_INSUFFICIENT")
         if evidence.open_orders:
             raise EvidenceViolation("OPEN_ORDER_PRESENT")
-        if notional > MAX_NOTIONAL_USD:
-            raise EvidenceViolation("NOTIONAL_CAP")
         return fee_rate
 
     def _validate_entry(self, evidence: OfficialEvidence, *, qty: Decimal, price: Decimal) -> None:

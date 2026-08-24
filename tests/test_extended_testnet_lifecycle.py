@@ -877,6 +877,163 @@ def test_preflight_requires_both_sides_depth_and_bounded_worst_close(lifecycle, 
         prepare_entry(lifecycle, candidate, expensive_close)
 
 
+@pytest.mark.parametrize(
+    "stage",
+    ["ENTRY_PREPARE", "ENTRY_CLAIM", "CLOSE_PREPARE", "CLOSE_CLAIM"],
+)
+def test_ioc_requires_side_aware_executable_depth_at_every_write_gate(
+    lifecycle, evidence, wire, stage
+):
+    entry = None
+    close = None
+    if stage != "ENTRY_PREPARE":
+        entry = prepare_entry(lifecycle, evidence, wire)
+    if stage in {"CLOSE_PREPARE", "CLOSE_CLAIM"}:
+        lifecycle.claim_for_dispatch(entry.id, evidence=evidence)
+        exposed = filled_evidence(wire)
+        lifecycle.reconcile(entry.id, exposed)
+        if stage == "CLOSE_CLAIM":
+            close = prepare_close(lifecycle, entry.id, exposed, wire)
+
+    changed = filled_wire(wire) if stage.startswith("CLOSE") else copy.deepcopy(wire)
+    changed["book"]["bids"] = [{"price": "100", "qty": "0.001"}]
+    changed["book"]["asks"] = [{"price": "50000", "qty": "0.001"}]
+    now_ms = 1_770_000_003_000 if stage.startswith("CLOSE") else 1_770_000_000_000
+    candidate = normalize_official_evidence(changed, now_ms=now_ms)
+
+    def attempt(target_lifecycle):
+        if stage == "ENTRY_PREPARE":
+            prepare_entry(target_lifecycle, candidate, wire)
+        elif stage == "ENTRY_CLAIM":
+            target_lifecycle.claim_for_dispatch(entry.id, evidence=candidate)
+        elif stage == "CLOSE_PREPARE":
+            prepare_close(target_lifecycle, entry.id, candidate, wire)
+        else:
+            target_lifecycle.claim_for_dispatch(close.id, evidence=candidate)
+
+    with pytest.raises(EvidenceViolation, match="DEPTH_INSUFFICIENT"):
+        attempt(lifecycle)
+
+    restarted = reopen(lifecycle)
+    with pytest.raises(EvidenceViolation, match="DEPTH_INSUFFICIENT"):
+        attempt(restarted)
+    assert restarted.next_write(candidate) is None
+    if stage == "ENTRY_PREPARE":
+        assert restarted.store.count() == 0
+        assert restarted.store.snapshot().lifecycle_state == "FLAT"
+    elif stage == "ENTRY_CLAIM":
+        assert restarted.store.count() == 1
+        assert restarted.store.get(entry.id).state == "PREPARED"
+        assert restarted.store.dispatch_count(entry.id) == 0
+    elif stage == "CLOSE_PREPARE":
+        assert restarted.store.count() == 1
+        assert restarted.store.snapshot().lifecycle_state == "EXPOSED"
+        assert restarted.store.dispatch_count(entry.id) == 1
+    else:
+        assert restarted.store.count() == 2
+        assert restarted.store.get(close.id).state == "PREPARED"
+        assert restarted.store.dispatch_count(close.id) == 0
+
+
+@pytest.mark.parametrize("missing_side", ["ENTRY", "RECOVERY_CLOSE"])
+def test_entry_preflight_requires_executable_entry_and_recovery_depth(
+    lifecycle, wire, missing_side
+):
+    changed = copy.deepcopy(wire)
+    if missing_side == "ENTRY":
+        changed["book"]["asks"][0]["price"] = "50000"
+    else:
+        changed["book"]["bids"][0]["price"] = "100"
+    candidate = normalize_official_evidence(changed, now_ms=1_770_000_000_000)
+    with pytest.raises(EvidenceViolation, match="DEPTH_INSUFFICIENT"):
+        prepare_entry(lifecycle, candidate, wire)
+    assert lifecycle.store.count() == 0
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "MISSING_FIELD",
+        "NON_LIST_BIDS",
+        "BOOL_PRICE",
+        "BOOL_QTY",
+        "NONFINITE_PRICE",
+        "NONFINITE_QTY",
+        "ZERO_PRICE",
+        "ZERO_QTY",
+        "NEGATIVE_PRICE",
+        "NEGATIVE_QTY",
+        "OFF_GRID_PRICE",
+        "OFF_GRID_QTY",
+        "UNSORTED_BIDS",
+        "UNSORTED_ASKS",
+        "DUPLICATE_BIDS",
+        "DUPLICATE_ASKS",
+        "LOCKED",
+        "CROSSED",
+    ],
+)
+def test_order_book_levels_are_strict_positive_gridded_ordered_and_uncrossed(
+    lifecycle, wire, case
+):
+    changed = copy.deepcopy(wire)
+    if case == "MISSING_FIELD":
+        del changed["book"]["bids"][0]["qty"]
+    elif case == "NON_LIST_BIDS":
+        changed["book"]["bids"] = {"price": "40000", "qty": "0.001"}
+    elif case == "BOOL_PRICE":
+        changed["book"]["bids"][0]["price"] = True
+    elif case == "BOOL_QTY":
+        changed["book"]["asks"][0]["qty"] = False
+    elif case == "NONFINITE_PRICE":
+        changed["book"]["bids"][0]["price"] = "NaN"
+    elif case == "NONFINITE_QTY":
+        changed["book"]["asks"][0]["qty"] = "Infinity"
+    elif case == "ZERO_PRICE":
+        changed["book"]["bids"][0]["price"] = "0"
+    elif case == "ZERO_QTY":
+        changed["book"]["asks"][0]["qty"] = "0"
+    elif case == "NEGATIVE_PRICE":
+        changed["book"]["bids"][0]["price"] = "-40000"
+    elif case == "NEGATIVE_QTY":
+        changed["book"]["asks"][0]["qty"] = "-0.001"
+    elif case == "OFF_GRID_PRICE":
+        changed["book"]["bids"][0]["price"] = "40000.5"
+    elif case == "OFF_GRID_QTY":
+        changed["book"]["asks"][0]["qty"] = "0.0015"
+    elif case == "UNSORTED_BIDS":
+        changed["book"]["bids"] = [
+            {"price": "39999", "qty": "0.001"},
+            {"price": "40000", "qty": "0.001"},
+        ]
+    elif case == "UNSORTED_ASKS":
+        changed["book"]["asks"] = [
+            {"price": "40011", "qty": "0.001"},
+            {"price": "40010", "qty": "0.001"},
+        ]
+    elif case == "DUPLICATE_BIDS":
+        changed["book"]["bids"].append({"price": "40000", "qty": "0.001"})
+    elif case == "DUPLICATE_ASKS":
+        changed["book"]["asks"].append({"price": "40010", "qty": "0.001"})
+    elif case == "LOCKED":
+        changed["book"]["bids"][0]["price"] = "40010"
+    elif case == "CROSSED":
+        changed["book"]["bids"][0]["price"] = "40011"
+
+    def attempt(target_lifecycle):
+        candidate = normalize_official_evidence(changed, now_ms=1_770_000_000_000)
+        prepare_entry(target_lifecycle, candidate, wire)
+
+    with pytest.raises(EvidenceViolation):
+        attempt(lifecycle)
+    assert lifecycle.store.count() == 0
+    restarted = reopen(lifecycle)
+    with pytest.raises(EvidenceViolation):
+        attempt(restarted)
+    assert restarted.store.count() == 0
+    assert restarted.store.snapshot().lifecycle_state == "FLAT"
+
+
 @pytest.mark.parametrize("constraint", ["BALANCE", "NEGATIVE_FEE", "ZERO_LEVERAGE"])
 def test_preflight_requires_sufficient_balance_nonnegative_fee_and_positive_bounded_leverage(
     lifecycle, wire, constraint
