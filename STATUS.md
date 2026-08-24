@@ -16,7 +16,8 @@
 ### Nado
 
 - The fixed identity is securely provisioned; Ink Sepolia gas and test USDT0 collateral are available, with exactly 10 test USDT0 deposited.
-- A credential-free official catalog request reached HTTP 200 but ended on a partial gzip read before capturing response semantics. Gateway availability is proved; a fresh bounded read-only observation may retry without a source-code run-ID change.
+- A fresh credential-free official catalog observation completed on its first transport attempt. Its complete uniform spot/perpetual structure exactly matches the accepted parser and fixtures, so no catalog code change is required.
+- Before the next authenticated read, the source-bound runner needs one minimal venue-local Level B runtime-run-ID decoupling candidate; no credential was loaded and no account/write request occurred.
 
 ### Extended
 

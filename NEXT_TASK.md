@@ -9,12 +9,12 @@ Status: `READY FOR USER LEVEL C BINDING AUTHORIZATION`.
 - No Builder for the credential/signing/live-transport binding starts until explicit user authorization is recorded; this correction does not grant it. Once authorized, add only the isolated binding needed to run the accepted lifecycle with runtime run identity; do not change lifecycle semantics, shared code, strategy, or paper behavior.
 - Candidate acceptance requires official contract evidence, focused Level C regressions, and one final full suite. A later separate Chief operational gate controls the single minimum-size testnet write lifecycle.
 
-## Nado — capture official catalog semantics
+## Nado — decouple authenticated-read runtime identity
 
-Status: `READY FOR BOUNDED PUBLIC OBSERVATION`.
+Status: `READY FOR LEVEL B RUNTIME-RUN-ID START GATE`.
 
-- Perform one fresh credential-free official catalog observation with bounded timeout/size and normal HTTP decoding. It may contain the initial transport attempt plus at most one transport-only retry under the Level B rule. Capture only sanitized required field/type semantics; never apply a write-style replay rule.
-- Change code only if observed semantics contradict it. Do not load credentials until the critical catalog/account contract validates.
+- From current published `main`, make only the smallest Nado-local change that replaces the source-bound private-read invocation/store identity with a fresh durable runtime run identity while preserving the accepted account/parser contract and all write-intent boundaries. Do not refactor other venues or shared journals.
+- Candidate work is fixture-only: no credential load, signature, private/live request, account mutation, or write. After acceptance, a separate Level B operational gate controls the fresh authenticated read.
 
 ## Extended — resume authenticated read-only readiness
 
