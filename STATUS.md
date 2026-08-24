@@ -17,7 +17,7 @@
 
 - The fixed identity is securely provisioned; Ink Sepolia gas and test USDT0 collateral are available, with exactly 10 test USDT0 deposited.
 - A fresh credential-free official catalog observation completed on its first transport attempt. Its complete uniform spot/perpetual structure exactly matches the accepted parser and fixtures, so no catalog code change is required.
-- Before the next authenticated read, the source-bound runner needs one minimal venue-local Level B runtime-run-ID decoupling candidate; no credential was loaded and no account/write request occurred.
+- The Nado-local private-read runner now allocates each operational run identity at runtime in one protected durable journal while preserving its no-rearm and ambiguity barriers. Deterministic acceptance passed `1839` tests in the isolated Python 3.11/aiohttp 3.12.15 environment; no credential or network action occurred.
 
 ### Extended
 
