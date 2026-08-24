@@ -684,12 +684,12 @@ def test_store_rejects_schema_corruption(tmp_path):
 
 
 def test_fixed_production_binding_and_normal_startup_isolation():
-    assert INVOCATION_ID == "extended-private-read-20260824-new-op-002"
+    assert INVOCATION_ID == "extended-private-read-20260824-new-op-004"
     assert operational.STORE_BASENAME == (
-        ".risex-funding-farmer-extended-private-read-20260824-new-op-002.sqlite3"
+        ".risex-funding-farmer-extended-private-read-20260824-new-op-004.sqlite3"
     )
     assert operational._CONFIG_HASH == (
-        "cf9d3cb40557103b08d42b202a7012e5d94ad12aef89cbba0aaa43526684dc65"
+        "10249ca9f0bc30da7439ddd11c1caede447e422420de08bf9f7bddc7dd3e6fe5"
     )
     assert list(inspect.signature(_PasswdHomeCredentialSource).parameters) == []
     module = importlib.import_module("risex_farmer.extended_private_read_operational")
