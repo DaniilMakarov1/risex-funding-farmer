@@ -1,8 +1,10 @@
 import asyncio
+import copy
 import inspect
 import json
 import os
 from pathlib import Path
+import sqlite3
 
 import pytest
 
@@ -12,8 +14,10 @@ from risex_farmer.testnet_risex_private_read_operational import (
     OperationalAttempt,
     OperationalJournal,
     SealedTransport,
+    SessionSignerCredential,
     fixture_adapter,
     _credential_from_secret,
+    _canonical_lifecycle_database,
 )
 
 
@@ -35,6 +39,10 @@ def test_lifecycle_binding_initializes_once_and_rejects_any_nonpristine_state(tm
     binding = LifecycleClearBinding._fixture(path)
     assert binding() is True
     assert binding() is True
+    assert path.stat().st_mode & 0o777 == 0o600
+    canonical = sqlite3.connect(path)
+    assert _canonical_lifecycle_database(canonical) is True
+    canonical.close()
     db = __import__("sqlite3").connect(path)
     db.execute(
         "INSERT INTO intents VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -42,6 +50,49 @@ def test_lifecycle_binding_initializes_once_and_rejects_any_nonpristine_state(tm
          "FOK", 0, 0, 1, "0.0001", 100, "1", 10, "0", 1, 0, None, 0),
     )
     db.commit(); db.close()
+    assert binding() is False
+
+
+def test_lifecycle_binding_rejects_spoofed_noncanonical_schema(tmp_path):
+    path = tmp_path / "spoof.sqlite"
+    db = sqlite3.connect(path)
+    db.executescript(
+        "CREATE TABLE intents(x TEXT);"
+        "CREATE TABLE cancels(x TEXT);"
+        "CREATE TABLE terminal(key TEXT, value TEXT);"
+    )
+    db.executemany(
+        "INSERT INTO terminal VALUES (?, ?)",
+        (("account", "0x20f9153e2eeba0ff7880fb5a23e976e8b2af56ee"),
+         ("signer", "0x6274d6d9f628ba89c36de4b71efa2c602b7f783b"),
+         ("router", "0x980b8621b8e03c3f396e1dc34c00b14d84f2a20f"),
+         ("authorization", "0x6da86f486b5e6536358f5b122dbe184522ca0ee3"),
+         ("account", "0x20f9153e2eeba0ff7880fb5a23e976e8b2af56ee")),
+    )
+    db.commit(); db.close(); path.chmod(0o600)
+    assert LifecycleClearBinding._fixture(path)() is False
+
+
+@pytest.mark.parametrize("mutation", ["extra", "wrong", "corrupt", "mode", "symlink"])
+def test_lifecycle_binding_rejects_noncanonical_or_unsafe_file(tmp_path, mutation):
+    path = tmp_path / "lifecycle.sqlite"
+    binding = LifecycleClearBinding._fixture(path)
+    assert binding() is True
+    if mutation in {"extra", "wrong"}:
+        db = sqlite3.connect(path)
+        if mutation == "extra":
+            db.execute("INSERT INTO terminal VALUES ('unexpected', 'evidence')")
+        else:
+            db.execute("UPDATE terminal SET value='wrong' WHERE key='router'")
+        db.commit(); db.close()
+    elif mutation == "corrupt":
+        path.write_bytes(b"not a sqlite database")
+    elif mutation == "mode":
+        path.chmod(0o644)
+    else:
+        target = tmp_path / "target.sqlite"
+        path.rename(target)
+        path.symlink_to(target)
     assert binding() is False
     path.unlink()
     assert binding() is False
@@ -99,6 +150,33 @@ def test_signer_only_handle_requires_derived_identity_and_zeroizes():
         _credential_from_secret(secret, "0x" + "22" * 20)
     handle.close()
     assert handle.closed and handle.material == b"" and len(handle._secret) == 0
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("domain", "type", "account", "signer", "message", "expiration", "nonce"),
+)
+def test_signer_only_handle_rejects_every_noncanonical_register_v2(mutation):
+    from risex_farmer.testnet_risex_private_read_preflight import PrivateReadPreflight
+    secret = bytes.fromhex("11" * 32)
+    handle = SessionSignerCredential(
+        "0x6274d6d9f628ba89c36de4b71efa2c602b7f783b", secret,
+    )
+    try:
+        canonical = PrivateReadPreflight._typed_data("0x0001")
+        assert handle.sign_register_v2(canonical).startswith("0x")
+        altered = copy.deepcopy(canonical)
+        if mutation == "domain": altered["domain"]["name"] = "other"
+        elif mutation == "type": altered["types"]["RegisterV2"][0]["type"] = "bytes32"
+        elif mutation == "account": altered["message"]["account"] = "0x" + "22" * 20
+        elif mutation == "signer": altered["message"]["signer"] = "0x" + "22" * 20
+        elif mutation == "message": altered["message"]["message"] = "other"
+        elif mutation == "expiration": altered["message"]["expiration"] = 1
+        else: altered["message"]["nonce"] = "01"
+        with pytest.raises(ValueError, match="rejected"):
+            handle.sign_register_v2(altered)
+    finally:
+        handle.close()
 
 
 class _Content:

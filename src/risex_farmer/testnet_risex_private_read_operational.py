@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import pwd
+import sqlite3
 import ssl
 import stat
 import tempfile
@@ -20,7 +21,7 @@ from typing import Any, Awaitable, Callable, Sequence
 
 import aiohttp
 
-from .testnet_risex_order_lifecycle import DurableIntentStore
+from .testnet_risex_order_lifecycle import DurableIntentStore, _SCHEMA
 from .testnet_risex_private_read_preflight import (
     ACCOUNT, AUTHORIZATION, HttpResponse, Outcome, PreflightResult,
     PrivateReadPreflight, PrivateReadStore, REST_ORIGIN, ROUTER, SIGNER,
@@ -173,20 +174,19 @@ class LifecycleClearBinding:
             try:
                 if not existed:
                     store._bind_identities(ACCOUNT, SIGNER, ROUTER, AUTHORIZATION)
-                tables = {
-                    row[0] for row in store.connection.execute(
-                        "SELECT name FROM sqlite_master WHERE type='table'"
-                    )
-                }
-                if tables != {"intents", "cancels", "terminal"}:
+                if not _canonical_lifecycle_database(store.connection):
                     return False
                 intents = store.connection.execute("SELECT COUNT(*) FROM intents").fetchone()[0]
                 cancels = store.connection.execute("SELECT COUNT(*) FROM cancels").fetchone()[0]
                 terminal = dict(store.connection.execute("SELECT key,value FROM terminal"))
-                return intents == 0 and cancels == 0 and terminal == {
+                pristine = intents == 0 and cancels == 0 and terminal == {
                     "account": ACCOUNT, "signer": SIGNER,
                     "router": ROUTER, "authorization": AUTHORIZATION,
                 }
+                if pristine and not existed:
+                    store.connection.execute("PRAGMA wal_checkpoint(FULL)")
+                    _fsync_file_and_parent(self._path)
+                return pristine
             finally:
                 store.close()
         except Exception:
@@ -200,7 +200,13 @@ class SessionSignerCredential(SyntheticCredential):
         self._secret = bytearray(secret)
 
     def sign_register_v2(self, typed_data: dict[str, Any]) -> str:
-        if self.closed or typed_data.get("primaryType") != "RegisterV2":
+        try:
+            nonce = typed_data["message"]["nonce"]
+            canonical_nonce = PrivateReadPreflight._nonce(nonce)
+            canonical = PrivateReadPreflight._typed_data(canonical_nonce)
+        except Exception:
+            raise ValueError("signer operation rejected") from None
+        if self.closed or nonce != canonical_nonce or typed_data != canonical:
             raise ValueError("signer operation rejected")
         return _signer._sign_typed_data(bytes(self._secret), typed_data)
 
@@ -351,3 +357,47 @@ def _prepare_sqlite_file(path: Path) -> bool:
         return _safe_file(path)
     except OSError:
         return False
+
+
+def _sqlite_catalog(connection: sqlite3.Connection) -> tuple[tuple[Any, ...], ...]:
+    return tuple(connection.execute(
+        "SELECT type,name,tbl_name,COALESCE(sql,'') FROM sqlite_master "
+        "ORDER BY type,name,tbl_name,sql"
+    ))
+
+
+def _expected_lifecycle_catalog() -> tuple[tuple[Any, ...], ...]:
+    expected = sqlite3.connect(":memory:")
+    try:
+        expected.executescript(_SCHEMA)
+        return _sqlite_catalog(expected)
+    finally:
+        expected.close()
+
+
+def _canonical_lifecycle_database(connection: sqlite3.Connection) -> bool:
+    try:
+        integrity = connection.execute("PRAGMA integrity_check").fetchall()
+        foreign_keys = connection.execute("PRAGMA foreign_key_check").fetchall()
+        user_version = connection.execute("PRAGMA user_version").fetchone()
+        application_id = connection.execute("PRAGMA application_id").fetchone()
+        return (
+            integrity == [("ok",)] and not foreign_keys
+            and user_version == (0,) and application_id == (0,)
+            and _sqlite_catalog(connection) == _expected_lifecycle_catalog()
+        )
+    except sqlite3.DatabaseError:
+        return False
+
+
+def _fsync_file_and_parent(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
