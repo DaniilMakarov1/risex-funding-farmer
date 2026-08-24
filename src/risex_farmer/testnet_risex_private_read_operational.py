@@ -51,6 +51,26 @@ def _safe_file(path: Path) -> bool:
     )
 
 
+def _strict_json(raw: str | bytes | bytearray) -> Any:
+    def reject_constant(_value: str) -> Any:
+        raise ValueError("non-finite JSON number rejected")
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON object key rejected")
+            result[key] = value
+        return result
+
+    try:
+        return json.loads(
+            raw, parse_constant=reject_constant, object_pairs_hook=unique_object,
+        )
+    except Exception:
+        raise ValueError("strict JSON rejected") from None
+
+
 class SealedTransport:
     REST_ORIGIN = REST_ORIGIN
     WS_URL = WS_ORIGIN
@@ -98,7 +118,7 @@ class SealedTransport:
         if len(raw) > self.MAX_BYTES:
             raise ValueError("bounded response rejected")
         try:
-            return json.loads(raw.decode("utf-8"))
+            return _strict_json(raw)
         except Exception:
             raise ValueError("strict JSON rejected") from None
 
@@ -125,7 +145,7 @@ class SealedTransport:
                 if incoming.type is not aiohttp.WSMsgType.TEXT:
                     raise ValueError("websocket frame rejected")
                 try:
-                    frames.append(json.loads(incoming.data))
+                    frames.append(_strict_json(incoming.data))
                 except Exception:
                     raise ValueError("websocket JSON rejected") from None
             try:

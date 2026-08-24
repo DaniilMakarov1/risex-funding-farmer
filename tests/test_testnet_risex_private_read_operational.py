@@ -8,7 +8,9 @@ import sqlite3
 
 import pytest
 
-from risex_farmer.testnet_risex_private_read_preflight import Outcome
+from risex_farmer.testnet_risex_private_read_preflight import (
+    Outcome, PrivateReadPreflight, PrivateReadStore,
+)
 from risex_farmer.testnet_risex_private_read_operational import (
     LifecycleClearBinding,
     OperationalAttempt,
@@ -189,14 +191,16 @@ class _Response:
     content_length = None
     history = ()
     def __init__(self, url, body=b'{"data":{},"request_id":"x"}'):
-        self.url = url; self.content = _Content(body)
+        self.url = url; self.content = _Content(body); self.exited = False
     async def __aenter__(self): return self
-    async def __aexit__(self, *_args): return None
+    async def __aexit__(self, *_args): self.exited = True
 
 
 class _Session:
-    def __init__(self, response): self.response = response; self.call = None
-    def get(self, *args, **kwargs): self.call = (args, kwargs); return self.response
+    def __init__(self, response):
+        self.response = response; self.call = None; self.calls = 0
+    def get(self, *args, **kwargs):
+        self.calls += 1; self.call = (args, kwargs); return self.response
 
 
 @pytest.mark.asyncio
@@ -242,3 +246,104 @@ async def test_public_transport_rejects_unaccepted_endpoint_before_session():
     transport._session = object()
     with pytest.raises(ValueError, match="surface"):
         await transport.public_get("/v1/orders/place", ())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raw",
+    (b'{"data":{"value":NaN},"request_id":"x"}',
+     b'{"data":{"value":Infinity},"request_id":"x"}',
+     b'{"data":{"value":-Infinity},"request_id":"x"}',
+     b'{"data":{"nested":{"key":1,"key":2}},"request_id":"x"}'),
+)
+async def test_raw_http_json_rejection_blocks_redacted_without_followup(tmp_path, raw):
+    target = "https://api.testnet.rise.trade/v1/system/config"
+    transport = object.__new__(SealedTransport)
+    session = _Session(_Response(target, raw))
+    transport._session = session
+    with pytest.raises(ValueError, match="JSON"):
+        await transport.public_get("/v1/system/config", ())
+    assert session.call[0] == (target,)
+    second = object.__new__(SealedTransport)
+    second_session = _Session(_Response(target, raw))
+    second._session = second_session
+    counts = {"loader": 0, "signature": 0, "socket": 0}
+    store = PrivateReadStore(tmp_path / "state.sqlite")
+    controller = PrivateReadPreflight(
+        store, clock=__import__("time").time,
+        public_get=second.public_get, lifecycle_clear=lambda: True,
+    )
+    def loader(): counts["loader"] += 1
+    def signature(*_args): counts["signature"] += 1
+    async def socket(*_args): counts["socket"] += 1
+    async def run_once():
+        barrier = await controller.run_public_barrier()
+        if barrier is not None:
+            return await controller.run_private_proof(
+                barrier, signer_loader=loader, nonce_get=second.public_get,
+                sign_register_v2=signature, private_exchange=socket,
+            )
+        return store.result()
+    journal_path = tmp_path / "attempt.json"
+    try:
+        result = await fixture_adapter(
+            journal=OperationalJournal._fixture(journal_path), runner=run_once,
+        ).run()
+    finally:
+        store.close()
+    assert result.outcome == Outcome.BLOCKED
+    assert second_session.call[0] == (target,)
+    assert session.calls == second_session.calls == 1
+    assert session.response.exited and second_session.response.exited
+    assert counts == {"loader": 0, "signature": 0, "socket": 0}
+    assert json.loads(journal_path.read_text()) == {
+        "schema_version": 1, "result": "PREFLIGHT_BLOCKED",
+    }
+    assert raw.decode() not in journal_path.read_text()
+
+
+class _Message:
+    type = __import__("aiohttp").WSMsgType.TEXT
+    def __init__(self, data): self.data = data
+
+
+class _Socket:
+    def __init__(self, incoming):
+        self.incoming = list(incoming); self.sent = []; self.received = 0
+        self.closed = False; self.exited = False
+    async def __aenter__(self): return self
+    async def __aexit__(self, *_args): self.exited = True; self.closed = True
+    async def send_json(self, value): self.sent.append(value)
+    async def receive(self, **_kwargs):
+        self.received += 1
+        return _Message(self.incoming.pop(0))
+    async def close(self): self.closed = True
+
+
+class _WsSession:
+    def __init__(self, socket): self.socket = socket; self.calls = 0
+    def ws_connect(self, *_args, **_kwargs): self.calls += 1; return self.socket
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raw", ('{"method":"auth_v2","status":NaN}',
+            '{"method":"auth_v2","status":Infinity}',
+            '{"method":"auth_v2","status":-Infinity}',
+            '{"method":"auth_v2","status":"success","status":"other"}'),
+)
+async def test_raw_ws_json_rejection_closes_once_without_retry_or_next_frame(raw):
+    outbound = (
+        {"method": "auth_v2", "params": {}},
+        {"method": "subscribe", "params": {"channel": "orders"}},
+        {"method": "subscribe", "params": {"channel": "positions"}},
+    )
+    socket = _Socket([raw])
+    transport = object.__new__(SealedTransport)
+    session = _WsSession(socket)
+    transport._session = session
+    with pytest.raises(ValueError, match="JSON"):
+        await transport._private_exchange(SealedTransport.WS_URL, outbound)
+    assert session.calls == 1
+    assert socket.closed and socket.exited
+    assert socket.received == 1 and len(socket.sent) == 1
