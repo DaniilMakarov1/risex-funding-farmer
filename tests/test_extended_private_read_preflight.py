@@ -29,6 +29,16 @@ def contract():
     return json.loads(FIXTURE.read_text())
 
 
+def test_pinned_provenance_includes_response_semantic_owners():
+    provenance = contract()["provenance"]
+    assert provenance["repository"] == "https://github.com/x10xchange/python_sdk"
+    assert provenance["commit"] == "2130cdb1cd6e7b1867db83bd3af036572d258739"
+    assert {
+        "x10/models/account.py",
+        "x10/models/http.py",
+    } <= set(provenance["sources"])
+
+
 def wrapped(data, *, count=None):
     pagination = None if count is None else {"cursor": None, "count": count}
     return {"status": "OK", "data": data, "error": None, "pagination": pagination}
@@ -258,6 +268,124 @@ async def test_ready_uses_exact_v1_path_header_and_no_application_frames(tmp_pat
         and call.retry_count == 0
         for call in transport.get_calls
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "alias,error_member,pagination_member,description_member,bridge_member",
+    [
+        ("accountId", _UNSET, _UNSET, _UNSET, _UNSET),
+        ("id", None, _UNSET, "official account", _UNSET),
+        ("accountId", _UNSET, None, _UNSET, None),
+        ("accountId", None, None, "official account", "0xabc123"),
+    ],
+)
+async def test_official_account_wrapper_and_optional_shapes_are_accepted(
+    tmp_path, alias, error_member, pagination_member, description_member,
+    bridge_member,
+):
+    def mutate(request, body):
+        if request.path != "/user/account/info":
+            return body
+        if error_member is _UNSET:
+            body.pop("error")
+        else:
+            body["error"] = error_member
+        if pagination_member is _UNSET:
+            body.pop("pagination")
+        else:
+            body["pagination"] = pagination_member
+        account = body["data"]
+        if alias == "id":
+            account["id"] = account.pop("accountId")
+        if description_member is _UNSET:
+            account.pop("description")
+        else:
+            account["description"] = description_member
+        if bridge_member is _UNSET:
+            account.pop("bridgeStarknetAddress")
+        else:
+            account["bridgeStarknetAddress"] = bridge_member
+        return body
+
+    result, _, _ = await execute(tmp_path, FixtureTransport(mutation=mutate))
+    assert result.status == "READY_FIXTURE"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pagination_member", [_UNSET, None])
+async def test_official_zero_list_wrappers_accept_absent_or_null_optionals(
+    tmp_path, pagination_member,
+):
+    def mutate(request, body):
+        if request.path == "/user/account/info":
+            return body
+        body.pop("error")
+        if pagination_member is _UNSET:
+            body.pop("pagination")
+        else:
+            body["pagination"] = pagination_member
+        return body
+
+    result, _, _ = await execute(tmp_path, FixtureTransport(mutation=mutate))
+    assert result.status == "READY_FIXTURE"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "defect,reason",
+    [
+        ("missing_status", "REST_WRAPPER_MALFORMED"),
+        ("missing_data", "REST_WRAPPER_MALFORMED"),
+        ("unknown_wrapper", "REST_WRAPPER_MALFORMED"),
+        ("nonnull_error", "REST_RESPONSE_ERROR"),
+        ("nonnull_account_pagination", "REST_PAGINATION_INVALID"),
+        ("missing_alias", "REST_ACCOUNT_MALFORMED"),
+        ("duplicate_equal_alias", "REST_ACCOUNT_MALFORMED"),
+        ("duplicate_conflicting_alias", "REST_ACCOUNT_MALFORMED"),
+        ("description_null", "REST_ACCOUNT_MALFORMED"),
+        ("bridge_empty", "REST_ACCOUNT_MALFORMED"),
+        ("bridge_nonstring", "REST_ACCOUNT_MALFORMED"),
+        ("inactive", "ACCOUNT_INACTIVE"),
+        ("identity_mismatch", "ACCOUNT_IDENTITY_MISMATCH"),
+    ],
+)
+async def test_account_wrapper_alias_and_identity_contradictions_block(
+    tmp_path, defect, reason,
+):
+    def mutate(request, body):
+        if request.path != "/user/account/info":
+            return body
+        if defect == "missing_status":
+            body.pop("status")
+        elif defect == "missing_data":
+            body.pop("data")
+        elif defect == "unknown_wrapper":
+            body["unknown"] = None
+        elif defect == "nonnull_error":
+            body["error"] = {"code": 1, "message": "synthetic"}
+        elif defect == "nonnull_account_pagination":
+            body["pagination"] = {"cursor": None, "count": 1}
+        elif defect == "missing_alias":
+            body["data"].pop("accountId")
+        elif defect == "duplicate_equal_alias":
+            body["data"]["id"] = body["data"]["accountId"]
+        elif defect == "duplicate_conflicting_alias":
+            body["data"]["id"] = body["data"]["accountId"] + 1
+        elif defect == "description_null":
+            body["data"]["description"] = None
+        elif defect == "bridge_empty":
+            body["data"]["bridgeStarknetAddress"] = ""
+        elif defect == "bridge_nonstring":
+            body["data"]["bridgeStarknetAddress"] = 1
+        elif defect == "inactive":
+            body["data"]["status"] = "INACTIVE"
+        elif defect == "identity_mismatch":
+            body["data"]["accountId"] += 1
+        return body
+
+    result, _, _ = await execute(tmp_path, FixtureTransport(mutation=mutate))
+    assert (result.status, result.reason) == ("BLOCKED", reason)
 
 
 @pytest.mark.asyncio
@@ -499,7 +627,8 @@ async def test_rounds_are_fresh_exhaustive_exact_identity_zero_and_flat(tmp_path
 
     def wrong_identity(request, body):
         if request.path == "/user/account/info":
-            body["data"]["id"] = ACCOUNT_ID + 1
+            identity_key = "accountId" if "accountId" in body["data"] else "id"
+            body["data"][identity_key] = ACCOUNT_ID + 1
         return body
     result, _, _ = await execute(tmp_path / "identity", FixtureTransport(mutation=wrong_identity))
     assert (result.status, result.reason) == ("BLOCKED", "ACCOUNT_IDENTITY_MISMATCH")

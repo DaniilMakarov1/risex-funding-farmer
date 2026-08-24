@@ -28,10 +28,9 @@ L2_VAULT = 7001003
 
 _API_HEADER = "X-Api-Key"
 _REST_PATHS = ("/user/account/info", "/user/orders", "/user/positions")
-_ACCOUNT_KEYS = {
-    "id", "description", "accountIndex", "status", "l2Key", "l2Vault",
-    "bridgeStarknetAddress",
-}
+_ACCOUNT_REQUIRED_KEYS = {"accountIndex", "status", "l2Key", "l2Vault"}
+_ACCOUNT_OPTIONAL_KEYS = {"description", "bridgeStarknetAddress"}
+_ACCOUNT_ID_KEYS = {"accountId", "id"}
 _STREAM_TYPES = {
     "BALANCE", "SPOT_BALANCE", "ORDER", "POSITION", "TRADE",
 }
@@ -322,7 +321,44 @@ def _validate_transport(value: Any, *, url: str) -> None:
 
 
 def _validate_account(value: Any, identity_matcher: Any = None) -> None:
-    account = _exact_object(value, _ACCOUNT_KEYS, "REST_ACCOUNT_MALFORMED")
+    if type(value) is not dict:
+        raise PreflightViolation("REST_ACCOUNT_MALFORMED")
+    present_ids = _ACCOUNT_ID_KEYS.intersection(value)
+    allowed = _ACCOUNT_REQUIRED_KEYS | _ACCOUNT_OPTIONAL_KEYS | _ACCOUNT_ID_KEYS
+    if (
+        len(present_ids) != 1
+        or not _ACCOUNT_REQUIRED_KEYS.issubset(value)
+        or not set(value).issubset(allowed)
+    ):
+        raise PreflightViolation("REST_ACCOUNT_MALFORMED")
+    account_id = value[next(iter(present_ids))]
+    if (
+        not _integer(account_id)
+        or not _integer(value["accountIndex"])
+        or type(value["l2Key"]) is not str
+        or not value["l2Key"]
+        or not _integer(value["l2Vault"])
+        or (
+            "description" in value
+            and type(value["description"]) is not str
+        )
+        or (
+            "bridgeStarknetAddress" in value
+            and value["bridgeStarknetAddress"] is not None
+            and (
+                type(value["bridgeStarknetAddress"]) is not str
+                or not value["bridgeStarknetAddress"]
+            )
+        )
+    ):
+        raise PreflightViolation("REST_ACCOUNT_MALFORMED")
+    account = {
+        "id": account_id,
+        "accountIndex": value["accountIndex"],
+        "status": value["status"],
+        "l2Key": value["l2Key"],
+        "l2Vault": value["l2Vault"],
+    }
     identity_matches = (
         identity_matcher is not None
         and identity_matcher.matches_account(account) is True
@@ -337,31 +373,33 @@ def _validate_account(value: Any, identity_matcher: Any = None) -> None:
         raise PreflightViolation("ACCOUNT_IDENTITY_MISMATCH")
     if account["status"] != "ACTIVE":
         raise PreflightViolation("ACCOUNT_INACTIVE")
-    if type(account["description"]) is not str or account["bridgeStarknetAddress"] is not None:
-        raise PreflightViolation("REST_ACCOUNT_MALFORMED")
 
 
 def _validate_wrapper(body: Any, path: str, identity_matcher: Any = None) -> None:
-    wrapper = _exact_object(
-        body, {"status", "data", "error", "pagination"}, "REST_WRAPPER_MALFORMED"
-    )
-    if wrapper["status"] != "OK" or wrapper["error"] is not None:
+    if (
+        type(body) is not dict
+        or not {"status", "data"}.issubset(body)
+        or not set(body).issubset({"status", "data", "error", "pagination"})
+    ):
+        raise PreflightViolation("REST_WRAPPER_MALFORMED")
+    if body["status"] != "OK" or body.get("error") is not None:
         raise PreflightViolation("REST_RESPONSE_ERROR")
     if path == "/user/account/info":
-        if wrapper["pagination"] is not None:
+        if body.get("pagination") is not None:
             raise PreflightViolation("REST_PAGINATION_INVALID")
-        _validate_account(wrapper["data"], identity_matcher)
+        _validate_account(body["data"], identity_matcher)
         return
-    if type(wrapper["data"]) is not list:
+    if type(body["data"]) is not list:
         raise PreflightViolation("REST_LIST_MALFORMED")
-    page = _exact_object(
-        wrapper["pagination"], {"cursor", "count"}, "REST_PAGINATION_INVALID"
-    )
-    if page["cursor"] is not None:
-        raise PreflightViolation("REST_PAGINATION_INCOMPLETE")
-    if type(page["count"]) is not int or page["count"] != len(wrapper["data"]):
-        raise PreflightViolation("REST_PAGINATION_INVALID")
-    if wrapper["data"]:
+    if body.get("pagination") is not None:
+        page = _exact_object(
+            body["pagination"], {"cursor", "count"}, "REST_PAGINATION_INVALID"
+        )
+        if page["cursor"] is not None:
+            raise PreflightViolation("REST_PAGINATION_INCOMPLETE")
+        if type(page["count"]) is not int or page["count"] != len(body["data"]):
+            raise PreflightViolation("REST_PAGINATION_INVALID")
+    if body["data"]:
         reason = "REST_OPEN_ORDER_PRESENT" if path == "/user/orders" else "REST_POSITION_PRESENT"
         raise PreflightViolation(reason)
 

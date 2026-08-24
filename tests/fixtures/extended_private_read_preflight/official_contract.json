@@ -7,6 +7,8 @@
       "x10/clients/stream/stream_client.py",
       "x10/clients/stream/stream_connection.py",
       "x10/clients/rest/modules/account_module.py",
+      "x10/models/account.py",
+      "x10/models/http.py",
       "x10/utils/http.py"
     ]
   },
@@ -25,7 +27,7 @@
     "l2Vault": 7001003
   },
   "account": {
-    "id": 7001,
+    "accountId": 7001,
     "description": "synthetic fixture account",
     "accountIndex": 3,
     "status": "ACTIVE",
