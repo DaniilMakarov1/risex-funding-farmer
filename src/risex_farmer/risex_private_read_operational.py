@@ -38,10 +38,10 @@ from .testnet_risex_private_read_preflight import (
 )
 
 
-INVOCATION_ID = "risex-private-read-20260824-new-op-006"
-STORE_BASENAME = ".risex-funding-farmer-risex-private-read-20260824-new-op-006.sqlite3"
+INVOCATION_ID = "risex-private-read-20260824-new-op-007"
+STORE_BASENAME = ".risex-funding-farmer-risex-private-read-20260824-new-op-007.sqlite3"
 FIXED_STORE_PATH = Path(
-    "/Users/daniilmakarov/.risex-funding-farmer-risex-private-read-20260824-new-op-006.sqlite3"
+    "/Users/daniilmakarov/.risex-funding-farmer-risex-private-read-20260824-new-op-007.sqlite3"
 )
 SCHEMA_VERSION = 4
 _APPLICATION_ID = 0x52585052
