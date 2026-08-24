@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import importlib
+import inspect
 import json
 import math
 import sqlite3
+import ssl
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Callable
 
 import pytest
+from eth_account import Account
+from eth_account.messages import encode_typed_data
 
 import risex_farmer.nado_private_read_preflight as nado
 
@@ -43,7 +49,6 @@ def _config(contract: dict[str, object], **changes: object) -> object:
         "owner": contract["owner"], "subaccount_name": contract["subaccount_name"],
         "sender": contract["sender"], "invocation_id": "fixture-invocation-001",
         "exclusive_owner_lease": True, "direct_owner_eoa": True,
-        "now_ms": 1_700_000_000_025,
     }
     values.update(changes)
     return nado.PreflightConfig(**values)
@@ -96,13 +101,30 @@ class SignedFixture:
         )
 
 
+class TimeFixture:
+    def __init__(self, contract: dict[str, object]) -> None:
+        self.response = copy.deepcopy(contract["wire"]["time"])
+        self.calls: list[dict[str, object]] = []
+        self.fail = False
+
+    def __call__(self, url: str, request: dict[str, object], policy: object) -> object:
+        self.calls.append(copy.deepcopy(request))
+        if self.fail:
+            raise RuntimeError("RAW_SECRET_TIME_TRANSPORT")
+        assert url == nado.FixedPreflightIdentity.gateway_edge_query
+        return nado.ObservedResponse(
+            url=url, final_url=url, http_status=200,
+            observed_at_ms=1_700_000_000_008, payload=self.response,
+        )
+
+
 class Calls:
     def __init__(self, contract: dict[str, object]) -> None:
         self.contract = contract
         self.loader = 0
         self.derive = 0
-        self.time = 0
         self.sign = 0
+        self.recover = 0
         self.typed: list[dict[str, object]] = []
         self.fail_stage: str | None = None
 
@@ -120,16 +142,16 @@ class Calls:
         self._fail("derive")
         return str(self.contract["owner"])
 
-    def server_time(self) -> int:
-        self.time += 1
-        self._fail("time")
-        return int(self.contract["trigger"]["observed_at_ms"])
-
     def signer(self, credential: object, typed_data: dict[str, object]) -> str:
         self.sign += 1
         self.typed.append(copy.deepcopy(typed_data))
         self._fail("signer")
         return str(self.contract["signature"])
+
+    def recover_owner(self, typed_data: dict[str, object], signature: str) -> str:
+        self.recover += 1
+        self._fail("recover")
+        return str(self.contract["owner"])
 
 
 def _public(entries: list[dict[str, object]], **policy: object) -> tuple[object, PublicFixture]:
@@ -142,12 +164,18 @@ def _signed(trigger: dict[str, object], **policy: object) -> tuple[object, Signe
     return nado.SealedSignedTransport(callback=callback, **policy), callback
 
 
+def _time(contract: dict[str, object], **policy: object) -> tuple[object, TimeFixture]:
+    callback = TimeFixture(contract)
+    return nado.SealedTimeTransport(callback=callback, **policy), callback
+
+
 def _run(
     tmp_path: Path, contract: dict[str, object], *,
     public_entries: list[dict[str, object]] | None = None,
     store: object | None = None, config: object | None = None,
     calls: Calls | None = None, public: object | None = None,
-    signed: object | None = None,
+    signed: object | None = None, time_transport: object | None = None,
+    clock_ms: Callable[[], int] | None = None,
 ) -> tuple[object, object, Calls, PublicFixture | None, SignedFixture | None]:
     public_callback = None
     signed_callback = None
@@ -158,13 +186,17 @@ def _run(
         )
     if signed is None:
         signed, signed_callback = _signed(dict(contract["trigger"]))
+    if time_transport is None:
+        time_transport, _ = _time(contract)
     store = store or nado.OneShotStore(tmp_path / "intent.sqlite3")
     calls = calls or Calls(contract)
-    result = nado.run_private_read_preflight(
+    result = nado.run_fixture_preflight(
         config=config or _config(contract), public_transport=public,
+        time_transport=time_transport,
         credential_loader=calls.load, derive_owner=calls.derive_owner,
-        server_time=calls.server_time, signer=calls.signer,
-        signed_transport=signed, store=store,
+        signer=calls.signer, recover_owner=calls.recover_owner,
+        signed_transport=signed,
+        clock_ms=clock_ms or (lambda: 1_700_000_000_025), store=store,
     )
     return result, store, calls, public_callback, signed_callback
 
@@ -182,11 +214,11 @@ def test_exact_official_wire_success_and_one_shot_request(
     result, store, calls, public, signed = _run(tmp_path, contract)
     assert result.status == nado.FINALIZED
     assert result.zero_regular_orders and result.exact_flat and result.zero_trigger_history
-    assert (calls.loader, calls.derive, calls.time, calls.sign) == (1, 1, 1, 1)
+    assert (calls.loader, calls.derive, calls.sign, calls.recover) == (1, 1, 1, 1)
     assert signed is not None and len(signed.calls) == 1
     expected = {
         "type": "list_trigger_orders",
-        "tx": {"sender": contract["sender"], "recvTime": "1700000030010"},
+        "tx": {"sender": contract["sender"], "recvTime": "1700000030009"},
         "signature": contract["signature"], "limit": 1,
     }
     assert signed.calls == [expected]
@@ -204,7 +236,7 @@ def test_exact_official_wire_success_and_one_shot_request(
             "chainId": 763373,
             "verifyingContract": "0x698D87105274292B5673367DEC81874Ce3633Ac2",
         },
-        "message": {"sender": contract["sender"], "recvTime": "1700000030010"},
+        "message": {"sender": contract["sender"], "recvTime": "1700000030009"},
     }]
     assert store.state("fixture-invocation-001") == nado.FINALIZED
     assert public is not None and len(public.calls) == 19
@@ -459,8 +491,6 @@ def test_subaccount_orders_exact_echo_and_scalar_type_are_required(
      ("amount", 0), ("amount", "00"), ("amount", "Infinity"),
      ("v_quote_balance", 0), ("v_quote_balance", "-0"),
      ("last_cumulative_funding_x18", 0),
-     ("perp_count", "1"), ("perp_count", True), ("perp_count", 1.0),
-     ("perp_count", math.nan), ("perp_count", math.inf),
      ("spot_count", "1"), ("spot_count", False), ("spot_count", 1.0)],
 )
 def test_account_decimal_scalars_are_exact_official_strings(
@@ -480,13 +510,12 @@ def test_account_decimal_scalars_are_exact_official_strings(
     assert store.state("fixture-invocation-001") == nado.NEW
 
 
-def test_complete_catalog_account_vector_and_perp_count_must_agree(
+def test_complete_catalog_account_vector_must_be_exact_flat(
     tmp_path: Path, contract: dict[str, object]
 ) -> None:
     for label, mutate in (
         ("missing-perp", lambda d: d["perp_balances"].pop()),
         ("duplicate", lambda d: d["perp_balances"].append(copy.deepcopy(d["perp_balances"][0]))),
-        ("count", lambda d: d.update(perp_count=0)),
         ("nonflat", lambda d: d["perp_balances"][0]["balance"].update(amount="1")),
         ("vquote", lambda d: d["perp_balances"][0]["balance"].update(v_quote_balance="1")),
     ):
@@ -511,7 +540,7 @@ def test_public_contract_failure_never_reaches_sensitive_callbacks(
         _run(
             tmp_path, contract, public=public, signed=signed, calls=calls, store=store
         )
-    assert (calls.loader, calls.derive, calls.time, calls.sign) == (0, 0, 0, 0)
+    assert (calls.loader, calls.derive, calls.sign, calls.recover) == (0, 0, 0, 0)
     assert signed_callback.calls == []
     assert store.state("fixture-invocation-001") == nado.NEW
 
@@ -530,7 +559,9 @@ def test_no_invented_normalized_containers_are_accepted(
                  store=nado.OneShotStore(tmp_path / f"invented-{index}.sqlite3"))
 
 
-@pytest.mark.parametrize("stage", ["public_a", "loader", "derive", "time", "signer", "signed", "public_b"])
+@pytest.mark.parametrize(
+    "stage", ["public_a", "loader", "derive", "time", "signer", "recover", "signed", "public_b"]
+)
 def test_every_external_callback_exception_is_fully_sanitized_and_state_bounded(
     tmp_path: Path, contract: dict[str, object], stage: str
 ) -> None:
@@ -540,23 +571,28 @@ def test_every_external_callback_exception_is_fully_sanitized_and_state_bounded(
     signed_callback = SignedFixture(dict(contract["trigger"]))
     signed_callback.fail = stage == "signed"
     signed = nado.SealedSignedTransport(callback=signed_callback)
+    time_transport, time_callback = _time(contract)
+    time_callback.fail = stage == "time"
     calls = Calls(contract)
-    if stage in {"loader", "derive", "time", "signer"}:
+    if stage in {"loader", "derive", "signer", "recover"}:
         calls.fail_stage = stage
     store = nado.OneShotStore(tmp_path / f"sanitize-{stage}.sqlite3")
     with pytest.raises(nado.NadoPreflightError) as captured:
-        _run(tmp_path, contract, public=public, signed=signed, calls=calls, store=store)
+        _run(tmp_path, contract, public=public, time_transport=time_transport,
+             signed=signed, calls=calls, store=store)
     _assert_sanitized(captured.value)
     expected = nado.NEW if stage == "public_a" else (nado.OBSERVED if stage == "public_b" else nado.CLAIMED)
     assert store.state("fixture-invocation-001") == expected
     assert len(signed_callback.calls) <= 1 and calls.sign <= 1
     if stage in {"public_a", "public_b"}:
         assert _run(
-            tmp_path, contract, public=public, signed=signed, calls=calls, store=store
+            tmp_path, contract, public=public, time_transport=time_transport,
+            signed=signed, calls=calls, store=store
         )[0].status == nado.FINALIZED
     else:
         with pytest.raises(nado.NadoPreflightError):
-            _run(tmp_path, contract, public=public, signed=signed, calls=calls, store=store)
+            _run(tmp_path, contract, public=public, time_transport=time_transport,
+                 signed=signed, calls=calls, store=store)
     assert len(signed_callback.calls) <= 1 and calls.sign <= 1
 
 
@@ -576,7 +612,7 @@ def test_round_b_resume_uses_observed_evidence_without_second_sensitive_callback
         tmp_path, contract, public=resume_public, signed=signed, calls=calls, store=store
     )
     assert result.status == nado.FINALIZED
-    assert (calls.loader, calls.derive, calls.time, calls.sign) == (1, 1, 1, 1)
+    assert (calls.loader, calls.derive, calls.sign, calls.recover) == (1, 1, 1, 1)
     assert len(signed_callback.calls) == 1
 
 
@@ -682,11 +718,13 @@ def test_observed_resume_freshness_fence_is_inclusive_and_precedes_round_b(
     resume, resume_callback = _public(_round_b_ending_at(contract, now))
     if accepted:
         assert _run(tmp_path, contract, public=resume, signed=signed, calls=calls,
-                    store=store, config=_config(contract, now_ms=now))[0].status == nado.FINALIZED
+                    store=store, config=_config(contract),
+                    clock_ms=lambda: now)[0].status == nado.FINALIZED
     else:
         with pytest.raises(nado.NadoPreflightError):
             _run(tmp_path, contract, public=resume, signed=signed, calls=calls,
-                 store=store, config=_config(contract, now_ms=now))
+                 store=store, config=_config(contract),
+                 clock_ms=lambda: now)
         assert resume_callback.calls == []
         assert store.state("fixture-invocation-001") == nado.OBSERVED
     assert len(signed_callback.calls) == 1 and calls.sign == 1
@@ -696,11 +734,13 @@ def test_clock_rollback_and_server_before_round_a_fail_without_second_attempt(
     tmp_path: Path, contract: dict[str, object]
 ) -> None:
     calls = Calls(contract)
-    calls.server_time = lambda: int(contract["round_a"][-1]["observed_at_ms"])
+    time_transport, time_callback = _time(contract)
+    time_callback.response["server_time"] = str(contract["round_a"][-1]["observed_at_ms"])
     signed, signed_callback = _signed(dict(contract["trigger"]))
     store = nado.OneShotStore(tmp_path / "server-order.sqlite3")
     with pytest.raises(nado.NadoPreflightError):
-        _run(tmp_path, contract, calls=calls, signed=signed, store=store)
+        _run(tmp_path, contract, calls=calls, time_transport=time_transport,
+             signed=signed, store=store)
     assert store.state("fixture-invocation-001") == nado.CLAIMED
     assert signed_callback.calls == [] and calls.sign == 0
 
@@ -715,7 +755,8 @@ def test_clock_rollback_and_server_before_round_a_fail_without_second_attempt(
     with pytest.raises(nado.NadoPreflightError):
         _run(tmp_path, contract, public=resume, signed=clean_signed,
              calls=clean_calls, store=clean_store,
-             config=_config(contract, now_ms=int(contract["trigger"]["observed_at_ms"])-1))
+             config=_config(contract),
+             clock_ms=lambda: int(contract["trigger"]["observed_at_ms"])-1)
     assert callback.calls == [] and len(clean_signed_callback.calls) == 1
 
 
@@ -743,10 +784,350 @@ def test_module_is_disarmed_and_has_no_ambient_network_or_secret_surface() -> No
     assert "nado_private_read_preflight" not in Path(package.__file__).read_text()
     source = Path(module.__file__).read_text()
     for forbidden in (
-        "aiohttp", "requests", "urllib", "os.environ", "getenv(", "Path.home",
+        "requests", "urllib", "os.environ", "getenv(", "Path.home",
         "XLSX", "seed phrase", "socket", "http.client", "subprocess", "urlopen",
-        "ClientSession",
     ):
         assert forbidden not in source
     assert "gateway.test.nado.xyz" in source and "trigger.test.nado.xyz" in source
-    assert "OperationalSignedObserver" not in source
+    assert "run_operational_private_read_preflight" in source
+    assert "run_operational_private_read_preflight" not in Path(package.__file__).read_text()
+
+
+def test_exact_edge_time_wire_uses_explicit_observation_clock(
+    tmp_path: Path, contract: dict[str, object]
+) -> None:
+    time_transport, time_callback = _time(contract)
+    result, *_ = _run(
+        tmp_path, contract, time_transport=time_transport,
+        config=_config(contract), clock_ms=lambda: 1_700_000_000_025,
+    )
+    assert result.status == nado.FINALIZED
+    assert time_callback.calls == [{"type": "time"}]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [lambda p: p.update(data="1700000000009"),
+     lambda p: p.update(id=1), lambda p: p.update(method="Time"),
+     lambda p: p.update(server_time=1_700_000_000_009),
+     lambda p: p.update(server_time="01700000000009")],
+)
+def test_edge_time_envelope_is_exact_and_fails_before_signing(
+    tmp_path: Path, contract: dict[str, object],
+    mutation: Callable[[dict[str, object]], object],
+) -> None:
+    time_transport, callback = _time(contract)
+    mutation(callback.response)
+    calls = Calls(contract)
+    signed, signed_callback = _signed(dict(contract["trigger"]))
+    store = nado.OneShotStore(tmp_path / "bad-edge-time.sqlite3")
+    with pytest.raises(nado.NadoPreflightError):
+        _run(tmp_path, contract, time_transport=time_transport, calls=calls,
+             signed=signed, store=store)
+    assert store.state("fixture-invocation-001") == nado.CLAIMED
+    assert calls.sign == calls.recover == 0 and signed_callback.calls == []
+
+
+def test_signature_recovery_mismatch_halts_before_signed_post(
+    tmp_path: Path, contract: dict[str, object]
+) -> None:
+    calls = Calls(contract)
+    calls.recover_owner = lambda typed, signature: "0x" + "02" * 20
+    signed, signed_callback = _signed(dict(contract["trigger"]))
+    store = nado.OneShotStore(tmp_path / "signature-mismatch.sqlite3")
+    with pytest.raises(nado.NadoPreflightError, match="signature owner"):
+        _run(tmp_path, contract, calls=calls, signed=signed, store=store)
+    assert store.state("fixture-invocation-001") == nado.CLAIMED
+    assert signed_callback.calls == [] and calls.sign == 1
+
+
+def test_perp_count_is_non_authoritative_when_full_perp_vector_is_exact_flat(
+    tmp_path: Path, contract: dict[str, object]
+) -> None:
+    for value in (0, 999, -1, True, 1.0, "garbage", None, {}, []):
+        entries = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
+        entries[4]["response"]["data"]["perp_count"] = value
+        entries[11]["response"]["data"]["perp_count"] = value
+        result, *_ = _run(
+            tmp_path, contract, public_entries=entries,
+            store=nado.OneShotStore(tmp_path / f"ignored-perp-count-{value}.sqlite3"),
+        )
+        assert result.status == nado.FINALIZED
+
+
+def test_pinned_synthetic_list_trigger_orders_signature_vector(
+    contract: dict[str, object]
+) -> None:
+    vector = contract["signature_vector"]
+    typed = nado.list_trigger_orders_typed_data(vector["sender"], vector["recv_time"])
+    signable = encode_typed_data(full_message=typed)
+    signed = Account.sign_message(signable, vector["synthetic_private_key"])
+    assert "0x" + signed.message_hash.hex() == vector["digest"]
+    assert "0x" + signed.signature.hex() == vector["signature"]
+    assert Account.recover_message(signable, signature=vector["signature"]) == vector["owner"]
+    assert vector["request"] == {
+        "type": "list_trigger_orders",
+        "tx": {"sender": vector["sender"], "recvTime": vector["recv_time"]},
+        "signature": vector["signature"], "limit": 1,
+    }
+
+
+class _RawContent:
+    def __init__(self, raw: bytes, *, never: bool = False, events: list[str] | None = None):
+        self.raw = raw
+        self.never = never
+        self.events = events if events is not None else []
+        self.offset = 0
+        self.cancelled = False
+
+    async def read(self, size: int) -> bytes:
+        self.events.append("read")
+        if self.never:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+        if self.offset >= len(self.raw):
+            return b""
+        chunk = self.raw[self.offset:self.offset + size]
+        self.offset += len(chunk)
+        return chunk
+
+
+class _HttpResponse:
+    def __init__(self, raw: bytes, *, url: str, status: object = 200,
+                 never: bool = False, events: list[str] | None = None):
+        self.url = url
+        self.status = status
+        self.content = _RawContent(raw, never=never, events=events)
+
+    async def __aenter__(self) -> object:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        return None
+
+
+class _HttpSession:
+    def __init__(self, response: _HttpResponse):
+        self.response = response
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    async def __aenter__(self) -> object:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        return None
+
+    def post(self, url: str, **kwargs: object) -> _HttpResponse:
+        self.calls.append((url, dict(kwargs)))
+        return self.response
+
+
+@pytest.mark.asyncio
+async def test_owned_http_transport_seals_post_tls_session_and_observation_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    raw = b'{"status":"success","data":"active"}'
+    response = _HttpResponse(
+        raw, url=nado.FixedPreflightIdentity.gateway_query, events=events,
+    )
+    session = _HttpSession(response)
+    session_kwargs: list[dict[str, object]] = []
+
+    def session_factory(**kwargs: object) -> object:
+        session_kwargs.append(kwargs)
+        return session
+
+    def clock() -> int:
+        events.append("clock")
+        return 1_700_000_000_100
+
+    monkeypatch.setattr(nado.aiohttp, "ClientSession", session_factory)
+    monkeypatch.setattr(nado, "_system_clock_ms", clock)
+    observed = await nado._OperationalGatewayTransport().send_async({"type": "status"})
+    assert observed.payload == {"status": "success", "data": "active"}
+    assert observed.observed_at_ms == 1_700_000_000_100
+    assert events[-1] == "clock" and events.index("clock") > events.index("read")
+    assert session_kwargs[0]["trust_env"] is False
+    assert session_kwargs[0]["timeout"].total == 5.0
+    assert session.calls[0][0] == nado.FixedPreflightIdentity.gateway_query
+    kwargs = session.calls[0][1]
+    assert kwargs["data"] == b'{"type":"status"}'
+    assert kwargs["headers"] == {"Content-Type": "application/json"}
+    assert kwargs["allow_redirects"] is False and kwargs["proxy"] is None
+    assert isinstance(kwargs["ssl"], ssl.SSLContext)
+    assert kwargs["ssl"].check_hostname and kwargs["ssl"].verify_mode == ssl.CERT_REQUIRED
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [b"\xff", b"{", b'{"status":NaN}', b'{"status":"success","status":"success"}'],
+)
+@pytest.mark.asyncio
+async def test_owned_http_transport_rejects_non_strict_utf8_or_json_once(
+    monkeypatch: pytest.MonkeyPatch, raw: bytes,
+) -> None:
+    session = _HttpSession(_HttpResponse(raw, url=nado.FixedPreflightIdentity.gateway_query))
+    monkeypatch.setattr(nado.aiohttp, "ClientSession", lambda **kwargs: session)
+    with pytest.raises(nado.NadoPreflightError) as captured:
+        await nado._OperationalGatewayTransport().send_async({"type": "status"})
+    _assert_sanitized(captured.value)
+    assert len(session.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_owned_http_transport_rejects_oversize_redirect_and_http_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for response in (
+        _HttpResponse(b"x" * 65_537, url=nado.FixedPreflightIdentity.gateway_query),
+        _HttpResponse(b"{}", url=nado.FixedPreflightIdentity.trigger_query),
+        _HttpResponse(b"{}", url=nado.FixedPreflightIdentity.gateway_query, status=200.0),
+    ):
+        session = _HttpSession(response)
+        monkeypatch.setattr(nado.aiohttp, "ClientSession", lambda **kwargs: session)
+        with pytest.raises(nado.NadoPreflightError):
+            await nado._OperationalGatewayTransport().send_async({"type": "status"})
+        assert len(session.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_owned_http_transport_rejects_noncanonical_request_before_post(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _HttpSession(_HttpResponse(b"{}", url=nado.FixedPreflightIdentity.gateway_query))
+    monkeypatch.setattr(nado.aiohttp, "ClientSession", lambda **kwargs: session)
+    with pytest.raises(nado.NadoPreflightError) as captured:
+        await nado._OperationalGatewayTransport().send_async({"value": math.nan})
+    _assert_sanitized(captured.value)
+    assert session.calls == []
+
+
+def test_operational_runner_and_transport_constructors_have_no_policy_bypass() -> None:
+    assert "now_ms" not in inspect.signature(nado.PreflightConfig).parameters
+    assert tuple(inspect.signature(nado._OperationalGatewayTransport).parameters) == ()
+    assert tuple(inspect.signature(nado._OperationalTimeTransport).parameters) == ()
+    assert tuple(inspect.signature(nado._OperationalTriggerTransport).parameters) == ()
+    parameters = inspect.signature(nado.run_operational_private_read_preflight).parameters
+    assert not ({"transport", "url", "policy", "clock", "callback"} & set(parameters))
+
+
+@pytest.mark.asyncio
+async def test_operational_runner_exact_owned_sequence_with_synthetic_boundaries(
+    tmp_path: Path, contract: dict[str, object], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan: list[tuple[str, object]] = []
+    for entry in contract["round_a"]:
+        plan.append((nado.FixedPreflightIdentity.gateway_query, entry["response"]))
+    plan.append((nado.FixedPreflightIdentity.gateway_edge_query, contract["wire"]["time"]))
+    plan.append((nado.FixedPreflightIdentity.trigger_query, contract["trigger"]["response"]))
+    for entry in contract["round_b"]:
+        plan.append((nado.FixedPreflightIdentity.gateway_query, entry["response"]))
+    sessions: list[_HttpSession] = []
+
+    def session_factory(**kwargs: object) -> object:
+        url, payload = plan[len(sessions)]
+        raw = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), allow_nan=False,
+        ).encode()
+        session = _HttpSession(_HttpResponse(raw, url=url))
+        sessions.append(session)
+        return session
+
+    clock_values: list[int] = []
+    now = 1_700_000_000_025
+    for entry in contract["round_a"]:
+        clock_values.extend([int(entry["observed_at_ms"]), now])
+    clock_values.extend([1_700_000_000_008, now, now])
+    clock_values.extend([int(contract["trigger"]["observed_at_ms"]), now, now])
+    for entry in contract["round_b"]:
+        clock_values.extend([int(entry["observed_at_ms"]), now])
+
+    def clock() -> int:
+        assert clock_values
+        return clock_values.pop(0)
+
+    monkeypatch.setattr(nado.aiohttp, "ClientSession", session_factory)
+    monkeypatch.setattr(nado, "_system_clock_ms", clock)
+    calls = Calls(contract)
+    store = nado.OneShotStore(tmp_path / "operational-success.sqlite3")
+    result = await nado.run_operational_private_read_preflight(
+        config=_config(contract), credential_loader=calls.load,
+        derive_owner=calls.derive_owner, signer=calls.signer,
+        recover_owner=calls.recover_owner, store=store,
+    )
+    assert result.status == nado.FINALIZED and not clock_values
+    assert (calls.loader, calls.derive, calls.sign, calls.recover) == (1, 1, 1, 1)
+    assert len(sessions) == 21 and all(len(session.calls) == 1 for session in sessions)
+    assert sessions[8].calls[0][0] == nado.FixedPreflightIdentity.gateway_edge_query
+    assert json.loads(sessions[8].calls[0][1]["data"]) == {"type": "time"}
+    assert sessions[9].calls[0][0] == nado.FixedPreflightIdentity.trigger_query
+    assert json.loads(sessions[9].calls[0][1]["data"])["tx"]["recvTime"] == "1700000030009"
+
+
+@pytest.mark.parametrize("phase", ["before", "round-a"])
+@pytest.mark.asyncio
+async def test_operational_cancellation_stops_without_sensitive_or_trigger_work(
+    tmp_path: Path, contract: dict[str, object], monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    events: list[str] = []
+    response = _HttpResponse(
+        b"", url=nado.FixedPreflightIdentity.gateway_query,
+        never=True, events=events,
+    )
+    session = _HttpSession(response)
+    monkeypatch.setattr(nado.aiohttp, "ClientSession", lambda **kwargs: session)
+    sensitive = {"load": 0, "sign": 0, "recover": 0}
+
+    def load() -> object:
+        sensitive["load"] += 1
+        return object()
+
+    def sign(credential: object, typed: dict[str, object]) -> str:
+        sensitive["sign"] += 1
+        return str(contract["signature"])
+
+    def recover(typed: dict[str, object], signature: str) -> str:
+        sensitive["recover"] += 1
+        return str(contract["owner"])
+
+    store = nado.OneShotStore(tmp_path / f"cancel-{phase}.sqlite3")
+    task = asyncio.create_task(nado.run_operational_private_read_preflight(
+        config=_config(contract), credential_loader=load,
+        derive_owner=lambda credential: str(contract["owner"]), signer=sign,
+        recover_owner=recover, store=store,
+    ))
+    if phase == "round-a":
+        for _ in range(100):
+            if events:
+                break
+            await asyncio.sleep(0)
+        assert events == ["read"]
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert sensitive == {"load": 0, "sign": 0, "recover": 0}
+    assert store.state("fixture-invocation-001") == nado.NEW
+    assert len(session.calls) <= 1
+    if phase == "round-a":
+        assert response.content.cancelled
+
+
+@pytest.mark.asyncio
+async def test_owned_http_transport_enforces_real_deadline_and_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _HttpSession(_HttpResponse(
+        b"", url=nado.FixedPreflightIdentity.gateway_query, never=True,
+    ))
+    monkeypatch.setattr(nado.aiohttp, "ClientSession", lambda **kwargs: session)
+    started = time.monotonic()
+    with pytest.raises(nado.NadoPreflightError) as captured:
+        await nado._OperationalGatewayTransport().send_async({"type": "status"})
+    assert 4.5 <= time.monotonic() - started < 7
+    _assert_sanitized(captured.value)
+    assert len(session.calls) == 1

@@ -9,6 +9,15 @@
   "subaccount_name": "default",
   "sender": "0x000000000000000000000000000000000000000164656661756c740000000000",
   "signature": "0x1111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111",
+  "signature_vector": {
+    "synthetic_private_key": "0x0101010101010101010101010101010101010101010101010101010101010101",
+    "owner": "0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1",
+    "sender": "0x1a642f0e3c3af545e7acbd38b07251b3990914f164656661756c740000000000",
+    "recv_time": "1700000030010",
+    "digest": "0x8d05d1fa393494839362d0b63e74d44ed4812cf2e6f299c4853f8f000b4b077e",
+    "signature": "0x0c663eceeb7a8d43c413e5826b6cbe52f15f8baf43a3679ee9967e48f6e406d31365984afba8030158c5f94417c424789312f0a512b7ca803421a69c81187d541c",
+    "request": {"type":"list_trigger_orders","tx":{"sender":"0x1a642f0e3c3af545e7acbd38b07251b3990914f164656661756c740000000000","recvTime":"1700000030010"},"signature":"0x0c663eceeb7a8d43c413e5826b6cbe52f15f8baf43a3679ee9967e48f6e406d31365984afba8030158c5f94417c424789312f0a512b7ca803421a69c81187d541c","limit":1}
+  },
   "wire": {
     "contracts": {"status":"success","data":{"chain_id":"763373","endpoint_addr":"0x698D87105274292B5673367DEC81874Ce3633Ac2"}},
     "status": {"status":"success","data":"active"},
@@ -49,6 +58,7 @@
       }]
     }},
     "isolated_positions": {"status":"success","data":{"isolated_positions":[]}},
+    "time": {"status":"success","method":"time","server_time":"1700000000009"},
     "trigger": {"status":"success","data":{"orders":[]}}
   },
   "round_a": [

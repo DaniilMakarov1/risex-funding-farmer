@@ -1,18 +1,24 @@
-"""Disarmed, injected Nado testnet private-read preflight.
+"""Disarmed Nado testnet private-read preflight.
 
-The module owns transport identity and policy but contains no HTTP, credential,
-or signing implementation.  Every external action is an injected callback.
-It is not imported by Farmer startup and CI supplies only synthetic callbacks.
+The deterministic core accepts only sealed fixture transports.  The additive
+operational entry point owns its exact HTTP transports and system clock, but is
+not imported by Farmer startup.  Credentials and signing remain explicit
+injected capabilities and CI supplies synthetic callbacks only.
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import ssl
 import sqlite3
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Callable, Generator, Mapping
+
+import aiohttp
 
 
 NEW = "NEW"
@@ -22,6 +28,8 @@ FINALIZED = "FINALIZED"
 ZERO_ADDRESS = "0x" + "00" * 20
 MIN_COLLATERAL_X18 = 5 * 10**18
 MAX_FRESHNESS_MS = 30_000
+HTTP_TIMEOUT_SECONDS = 5.0
+MAX_RESPONSE_BYTES = 65_536
 
 SOURCE_PINS = {
     "typescript_sdk": "315e4f23dadefeb2f86f713e423241e81467d4c3",
@@ -42,6 +50,7 @@ class FixedPreflightIdentity:
     gateway = "https://gateway.test.nado.xyz/v1"
     trigger = "https://trigger.test.nado.xyz/v1"
     gateway_query = gateway + "/query"
+    gateway_edge_query = gateway + "/edge/query"
     trigger_query = trigger + "/query"
 
     @classmethod
@@ -119,7 +128,6 @@ class PreflightConfig:
     invocation_id: str
     exclusive_owner_lease: bool
     direct_owner_eoa: bool
-    now_ms: int
 
     def __post_init__(self) -> None:
         if type(self.sender) is not str:
@@ -144,8 +152,6 @@ class PreflightConfig:
             )
         ):
             raise NadoPreflightError("invocation identity is invalid")
-        if type(self.now_ms) is not int or self.now_ms <= 0:
-            raise NadoPreflightError("reference time is invalid")
 
 
 @dataclass(frozen=True)
@@ -241,6 +247,113 @@ class SealedPublicTransport(_SealedTransport):
 class SealedSignedTransport(_SealedTransport):
     expected_url = FixedPreflightIdentity.trigger_query
     failure_label = "signed transport callback failed"
+
+
+@dataclass(frozen=True)
+class SealedTimeTransport(_SealedTransport):
+    expected_url = FixedPreflightIdentity.gateway_edge_query
+    failure_label = "time transport callback failed"
+
+
+def _system_clock_ms() -> int:
+    return time.time_ns() // 1_000_000
+
+
+def _strict_json(raw: bytes) -> object:
+    try:
+        text = raw.decode("utf-8", errors="strict")
+
+        def reject_constant(value: str) -> object:
+            raise ValueError(value)
+
+        def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+            result: dict[str, object] = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate key")
+                result[key] = value
+            return result
+
+        return json.loads(
+            text, parse_constant=reject_constant, object_pairs_hook=unique_object,
+        )
+    except (UnicodeError, json.JSONDecodeError, ValueError):
+        raise NadoPreflightError("transport response is not strict JSON") from None
+
+
+def _new_aiohttp_session() -> aiohttp.ClientSession:
+    return aiohttp.ClientSession(
+        trust_env=False,
+        timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SECONDS),
+    )
+
+
+class _OperationalFixedHostTransport:
+    expected_url = ""
+    failure_label = "operational transport failed"
+
+    async def send_async(self, request: Mapping[str, object]) -> ObservedResponse:
+        if not isinstance(request, Mapping):
+            raise NadoPreflightError("request schema mismatch")
+        failed = False
+        try:
+            request_body = dict(request)
+            encoded_request = _canonical(request_body)
+            tls = ssl.create_default_context()
+            async with asyncio.timeout(HTTP_TIMEOUT_SECONDS):
+                async with _new_aiohttp_session() as session:
+                    async with session.post(
+                        self.expected_url,
+                        data=encoded_request,
+                        headers={"Content-Type": "application/json"},
+                        allow_redirects=False,
+                        proxy=None,
+                        ssl=tls,
+                    ) as response:
+                        if type(response.status) is not int or response.status != 200:
+                            raise NadoPreflightError("transport HTTP status rejected")
+                        if str(response.url) != self.expected_url:
+                            raise NadoPreflightError("transport host or redirect mismatch")
+                        raw = bytearray()
+                        while True:
+                            remaining = MAX_RESPONSE_BYTES + 1 - len(raw)
+                            chunk = await response.content.read(min(16_384, remaining))
+                            raw.extend(chunk)
+                            if len(raw) > MAX_RESPONSE_BYTES:
+                                raise NadoPreflightError("transport response size exceeded")
+                            if not chunk:
+                                break
+                        payload = _strict_json(bytes(raw))
+                        observed_at_ms = _system_clock_ms()
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
+            failed = True
+        if failed:
+            raise NadoPreflightError(self.failure_label)
+        if type(observed_at_ms) is not int or observed_at_ms <= 0:
+            raise NadoPreflightError("transport observation time is invalid")
+        return ObservedResponse(
+            url=self.expected_url,
+            final_url=self.expected_url,
+            http_status=200,
+            observed_at_ms=observed_at_ms,
+            payload=payload,
+        )
+
+class _OperationalGatewayTransport(_OperationalFixedHostTransport):
+    expected_url = FixedPreflightIdentity.gateway_query
+    failure_label = "operational gateway transport failed"
+
+
+class _OperationalTimeTransport(_OperationalFixedHostTransport):
+    expected_url = FixedPreflightIdentity.gateway_edge_query
+    failure_label = "operational time transport failed"
+
+
+class _OperationalTriggerTransport(_OperationalFixedHostTransport):
+    expected_url = FixedPreflightIdentity.trigger_query
+    failure_label = "operational trigger transport failed"
 
 
 class OneShotStore:
@@ -345,10 +458,27 @@ def _exact_keys(value: Mapping[str, object], expected: set[str], label: str) -> 
         raise NadoPreflightError(f"{label} schema mismatch")
 
 
-def _wire_data(observation: ObservedResponse, now_ms: int) -> tuple[object, int]:
+def _clock(clock_ms: Callable[[], int]) -> int:
+    ok, value = _invoke(clock_ms)
+    if not ok or type(value) is not int or value <= 0:
+        raise NadoPreflightError("owned clock failed")
+    return value
+
+
+def _fresh_observation(
+    observation: ObservedResponse, clock_ms: Callable[[], int],
+) -> int:
     observed = observation.observed_at_ms
+    now_ms = _clock(clock_ms)
     if observed > now_ms or now_ms - observed > MAX_FRESHNESS_MS:
         raise NadoPreflightError("transport observation is not fresh")
+    return observed
+
+
+def _wire_data(
+    observation: ObservedResponse, clock_ms: Callable[[], int],
+) -> tuple[object, int]:
+    observed = _fresh_observation(observation, clock_ms)
     payload = observation.payload
     if type(payload) is not dict:
         raise NadoPreflightError("wire envelope schema mismatch")
@@ -359,9 +489,32 @@ def _wire_data(observation: ObservedResponse, now_ms: int) -> tuple[object, int]
 
 
 def _query(
-    transport: SealedPublicTransport, request: Mapping[str, object], now_ms: int,
+    transport: object, request: Mapping[str, object], clock_ms: Callable[[], int],
 ) -> tuple[object, int]:
-    return _wire_data(transport.send(request), now_ms)
+    return _wire_data(transport.send(request), clock_ms)
+
+
+def _server_time(
+    transport: object, clock_ms: Callable[[], int],
+) -> int:
+    return _server_time_observation(transport.send({"type": "time"}), clock_ms)
+
+
+def _server_time_observation(
+    observation: ObservedResponse, clock_ms: Callable[[], int],
+) -> int:
+    _fresh_observation(observation, clock_ms)
+    payload = _object(observation.payload, "time envelope")
+    _exact_keys(payload, {"status", "method", "server_time"}, "time envelope")
+    if payload["status"] != "success" or type(payload["status"]) is not str:
+        raise NadoPreflightError("time status is not success")
+    if payload["method"] != "time" or type(payload["method"]) is not str:
+        raise NadoPreflightError("time method mismatch")
+    server_ms = _decimal(payload["server_time"], "server time", signed=False)
+    now_ms = _clock(clock_ms)
+    if server_ms > now_ms or now_ms - server_ms > MAX_FRESHNESS_MS:
+        raise NadoPreflightError("server time is not fresh")
+    return server_ms
 
 
 def _strict_uint(value: object, label: str) -> int:
@@ -587,8 +740,7 @@ def _account(
     if any(v_quote != 0 for _, v_quote in perps.values()):
         raise NadoPreflightError("unexplained v_quote balance")
     spot_count = _strict_uint(data["spot_count"], "spot count")
-    perp_count = _strict_uint(data["perp_count"], "perp count")
-    if spot_count != len(spots) or perp_count != len(perps):
+    if spot_count != len(spots):
         raise NadoPreflightError("balance counts contradict complete vectors")
     return {
         "healths": normalized_healths,
@@ -625,33 +777,27 @@ def _temporal(observed: list[int]) -> None:
         raise NadoPreflightError("public evidence temporal order mismatch")
 
 
-def _round_a(transport: SealedPublicTransport, config: PreflightConfig) -> _RoundEvidence:
+def _round_a_contract(
+    config: PreflightConfig,
+) -> Generator[dict[str, object], tuple[object, int], _RoundEvidence]:
     observed: list[int] = []
-    data, at = _query(transport, {"type": "contracts"}, config.now_ms)
+    data, at = yield {"type": "contracts"}
     observed.append(at); _contracts(data)
-    data, at = _query(transport, {"type": "status"}, config.now_ms)
+    data, at = yield {"type": "status"}
     observed.append(at); _status(data)
-    data, at = _query(transport, {"type": "all_products"}, config.now_ms)
+    data, at = yield {"type": "all_products"}
     observed.append(at); products = _catalog(data)
-    data, at = _query(
-        transport, {"type": "linked_signer", "subaccount": config.sender}, config.now_ms,
-    )
+    data, at = yield {"type": "linked_signer", "subaccount": config.sender}
     observed.append(at); _linked(data)
-    data, at = _query(
-        transport, {"type": "subaccount_info", "subaccount": config.sender}, config.now_ms,
-    )
+    data, at = yield {"type": "subaccount_info", "subaccount": config.sender}
     observed.append(at); account = _account(data, config.sender, products)
     for product_id, _, _ in products:
-        data, at = _query(
-            transport,
-            {"type": "subaccount_orders", "sender": config.sender, "product_id": product_id},
-            config.now_ms,
-        )
+        data, at = yield {
+            "type": "subaccount_orders", "sender": config.sender,
+            "product_id": product_id,
+        }
         observed.append(at); _orders(data, config.sender, product_id)
-    data, at = _query(
-        transport, {"type": "isolated_positions", "subaccount": config.sender},
-        config.now_ms,
-    )
+    data, at = yield {"type": "isolated_positions", "subaccount": config.sender}
     observed.append(at); _isolated(data)
     _temporal(observed)
     return _RoundEvidence(
@@ -659,49 +805,94 @@ def _round_a(transport: SealedPublicTransport, config: PreflightConfig) -> _Roun
     )
 
 
-def _round_b(transport: SealedPublicTransport, config: PreflightConfig) -> _RoundEvidence:
+def _round_b_contract(
+    config: PreflightConfig,
+) -> Generator[dict[str, object], tuple[object, int], _RoundEvidence]:
     observed: list[int] = []
-    data, at = _query(transport, {"type": "all_products"}, config.now_ms)
+    data, at = yield {"type": "all_products"}
     observed.append(at); products = _catalog(data)
     for product_id, _, _ in products:
-        data, at = _query(
-            transport,
-            {"type": "subaccount_orders", "sender": config.sender, "product_id": product_id},
-            config.now_ms,
-        )
+        data, at = yield {
+            "type": "subaccount_orders", "sender": config.sender,
+            "product_id": product_id,
+        }
         observed.append(at); _orders(data, config.sender, product_id)
-    data, at = _query(
-        transport, {"type": "subaccount_info", "subaccount": config.sender}, config.now_ms,
-    )
+    data, at = yield {"type": "subaccount_info", "subaccount": config.sender}
     observed.append(at); account = _account(data, config.sender, products)
-    data, at = _query(
-        transport, {"type": "isolated_positions", "subaccount": config.sender},
-        config.now_ms,
-    )
+    data, at = yield {"type": "isolated_positions", "subaccount": config.sender}
     observed.append(at); _isolated(data)
     for product_id, _, _ in products:
-        data, at = _query(
-            transport,
-            {"type": "subaccount_orders", "sender": config.sender, "product_id": product_id},
-            config.now_ms,
-        )
+        data, at = yield {
+            "type": "subaccount_orders", "sender": config.sender,
+            "product_id": product_id,
+        }
         observed.append(at); _orders(data, config.sender, product_id)
-    data, at = _query(transport, {"type": "contracts"}, config.now_ms)
+    data, at = yield {"type": "contracts"}
     observed.append(at); _contracts(data)
-    data, at = _query(transport, {"type": "status"}, config.now_ms)
+    data, at = yield {"type": "status"}
     observed.append(at); _status(data)
-    data, at = _query(transport, {"type": "all_products"}, config.now_ms)
+    data, at = yield {"type": "all_products"}
     observed.append(at)
     if _catalog(data) != products:
         raise NadoPreflightError("round-B catalog changed")
-    data, at = _query(
-        transport, {"type": "linked_signer", "subaccount": config.sender}, config.now_ms,
-    )
+    data, at = yield {"type": "linked_signer", "subaccount": config.sender}
     observed.append(at); _linked(data)
     _temporal(observed)
     return _RoundEvidence(
         _digest({"catalog": products, "account": account}), observed[0], observed[-1]
     )
+
+
+def _round(
+    contract: Generator[dict[str, object], tuple[object, int], _RoundEvidence],
+    transport: SealedPublicTransport,
+    clock_ms: Callable[[], int],
+) -> _RoundEvidence:
+    try:
+        request = next(contract)
+        while True:
+            request = contract.send(_query(transport, request, clock_ms))
+    except StopIteration as completed:
+        return completed.value
+
+
+def _round_a(
+    transport: SealedPublicTransport, config: PreflightConfig,
+    clock_ms: Callable[[], int],
+) -> _RoundEvidence:
+    return _round(_round_a_contract(config), transport, clock_ms)
+
+
+def _round_b(
+    transport: SealedPublicTransport, config: PreflightConfig,
+    clock_ms: Callable[[], int],
+) -> _RoundEvidence:
+    return _round(_round_b_contract(config), transport, clock_ms)
+
+
+async def _operational_round(
+    contract: Generator[dict[str, object], tuple[object, int], _RoundEvidence],
+    transport: _OperationalGatewayTransport,
+) -> _RoundEvidence:
+    try:
+        request = next(contract)
+        while True:
+            observation = await transport.send_async(request)
+            request = contract.send(_wire_data(observation, _system_clock_ms))
+    except StopIteration as completed:
+        return completed.value
+
+
+async def _operational_round_a(
+    transport: _OperationalGatewayTransport, config: PreflightConfig,
+) -> _RoundEvidence:
+    return await _operational_round(_round_a_contract(config), transport)
+
+
+async def _operational_round_b(
+    transport: _OperationalGatewayTransport, config: PreflightConfig,
+) -> _RoundEvidence:
+    return await _operational_round(_round_b_contract(config), transport)
 
 
 def list_trigger_orders_typed_data(sender: str, recv_time: str) -> dict[str, object]:
@@ -750,8 +941,9 @@ def _signature(value: object) -> str:
 
 def _trigger_zero(
     observation: ObservedResponse, config: PreflightConfig,
+    clock_ms: Callable[[], int],
 ) -> tuple[str, int]:
-    raw_data, observed = _wire_data(observation, config.now_ms)
+    raw_data, observed = _wire_data(observation, clock_ms)
     data = _object(raw_data, "trigger orders")
     _exact_keys(data, {"orders"}, "trigger orders")
     if type(data["orders"]) is not list or data["orders"]:
@@ -759,27 +951,31 @@ def _trigger_zero(
     return _digest({"identity": _identity_tag(config.sender), "orders_empty": True}), observed
 
 
-def run_private_read_preflight(
+def run_fixture_preflight(
     *,
     config: PreflightConfig,
-    public_transport: SealedPublicTransport,
+    public_transport: object,
+    time_transport: object,
     credential_loader: Callable[[], object],
     derive_owner: Callable[[object], str],
-    server_time: Callable[[], int],
     signer: Callable[[object, dict[str, object]], str],
-    signed_transport: SealedSignedTransport,
+    recover_owner: Callable[[dict[str, object], str], str],
+    signed_transport: object,
+    clock_ms: Callable[[], int],
     store: OneShotStore,
 ) -> PreflightResult:
-    """Run the injected one-shot private-read barrier; no callback is ambient."""
+    """Run the deterministic fixture barrier; never an operational readiness claim."""
     if type(public_transport) is not SealedPublicTransport:
         raise NadoPreflightError("public transport boundary mismatch")
+    if type(time_transport) is not SealedTimeTransport:
+        raise NadoPreflightError("time transport boundary mismatch")
     if type(signed_transport) is not SealedSignedTransport:
         raise NadoPreflightError("signed transport boundary mismatch")
     identity_hash = _identity_hash(config.sender)
     identity_tag = _identity_tag(config.sender)
     evidence = store.evidence(config.invocation_id)
     if evidence is None:
-        round_a = _round_a(public_transport, config)
+        round_a = _round_a(public_transport, config, clock_ms)
         store.claim(
             config.invocation_id, identity_hash, round_a.fingerprint,
             round_a.last_observed_ms,
@@ -791,19 +987,22 @@ def run_private_read_preflight(
             or _address_bytes(derived) != _address_bytes(config.owner)
         ):
             raise NadoPreflightError("credential owner identity mismatch")
-        server_ms = _callback_value(server_time, label="server time")
-        if (
-            type(server_ms) is not int
-            or server_ms <= round_a.last_observed_ms
-            or server_ms > config.now_ms
-            or config.now_ms - server_ms > MAX_FRESHNESS_MS
-        ):
+        server_ms = _server_time(time_transport, clock_ms)
+        if server_ms <= round_a.last_observed_ms:
             raise NadoPreflightError("server time is invalid or out of order")
         recv_time = str(server_ms + MAX_FRESHNESS_MS)
         typed_data = list_trigger_orders_typed_data(config.sender, recv_time)
         signature = _signature(
             _callback_value(signer, credential, typed_data, label="signer")
         )
+        recovered = _callback_value(
+            recover_owner, typed_data, signature, label="signature recovery"
+        )
+        if (
+            type(recovered) is not str
+            or _address_bytes(recovered) != _address_bytes(config.owner)
+        ):
+            raise NadoPreflightError("signature owner identity mismatch")
         request = {
             "type": "list_trigger_orders",
             "tx": {"sender": config.sender, "recvTime": recv_time},
@@ -811,7 +1010,7 @@ def run_private_read_preflight(
             "limit": 1,
         }
         observation = signed_transport.send(request)
-        trigger_hash, trigger_observed_ms = _trigger_zero(observation, config)
+        trigger_hash, trigger_observed_ms = _trigger_zero(observation, config, clock_ms)
         if trigger_observed_ms < server_ms or trigger_observed_ms <= round_a.last_observed_ms:
             raise NadoPreflightError("signed observation temporal order mismatch")
         store.observe(config.invocation_id, trigger_hash, trigger_observed_ms)
@@ -833,14 +1032,115 @@ def run_private_read_preflight(
     expected_trigger_hash = _digest({"identity": identity_tag, "orders_empty": True})
     if trigger_hash != expected_trigger_hash:
         raise NadoPreflightError("durable trigger evidence is invalid")
+    now_ms = _clock(clock_ms)
     if (
         trigger_observed_ms <= round_a_observed_ms
-        or round_a_observed_ms > config.now_ms
-        or trigger_observed_ms > config.now_ms
-        or config.now_ms - round_a_observed_ms > MAX_FRESHNESS_MS
+        or round_a_observed_ms > now_ms
+        or trigger_observed_ms > now_ms
+        or now_ms - round_a_observed_ms > MAX_FRESHNESS_MS
     ):
         raise NadoPreflightError("durable temporal evidence is invalid or stale")
-    round_b = _round_b(public_transport, config)
+    round_b = _round_b(public_transport, config, clock_ms)
+    if round_b.first_observed_ms <= trigger_observed_ms:
+        raise NadoPreflightError("public evidence temporal barrier mismatch")
+    if round_b.last_observed_ms - round_a_observed_ms > MAX_FRESHNESS_MS:
+        raise NadoPreflightError("public evidence temporal barrier is stale")
+    if round_b.fingerprint != round_a_hash:
+        raise NadoPreflightError("public rounds disagree")
+    store.finalize(config.invocation_id, round_b.fingerprint)
+    return PreflightResult(FINALIZED, identity_tag, True, True, True)
+
+
+async def run_operational_private_read_preflight(
+    *,
+    config: PreflightConfig,
+    credential_loader: Callable[[], object],
+    derive_owner: Callable[[object], str],
+    signer: Callable[[object, dict[str, object]], str],
+    recover_owner: Callable[[dict[str, object], str], str],
+    store: OneShotStore,
+) -> PreflightResult:
+    """Explicit disarmed entry point; no startup module imports or invokes it."""
+    public_transport = _OperationalGatewayTransport()
+    time_transport = _OperationalTimeTransport()
+    signed_transport = _OperationalTriggerTransport()
+    identity_hash = _identity_hash(config.sender)
+    identity_tag = _identity_tag(config.sender)
+    evidence = store.evidence(config.invocation_id)
+    if evidence is None:
+        round_a = await _operational_round_a(public_transport, config)
+        await asyncio.sleep(0)
+        store.claim(
+            config.invocation_id, identity_hash, round_a.fingerprint,
+            round_a.last_observed_ms,
+        )
+        await asyncio.sleep(0)
+        credential = _callback_value(credential_loader, label="credential loader")
+        await asyncio.sleep(0)
+        derived = _callback_value(derive_owner, credential, label="owner derivation")
+        if (
+            type(derived) is not str
+            or _address_bytes(derived) != _address_bytes(config.owner)
+        ):
+            raise NadoPreflightError("credential owner identity mismatch")
+        time_observation = await time_transport.send_async({"type": "time"})
+        server_ms = _server_time_observation(time_observation, _system_clock_ms)
+        if server_ms <= round_a.last_observed_ms:
+            raise NadoPreflightError("server time is invalid or out of order")
+        recv_time = str(server_ms + MAX_FRESHNESS_MS)
+        typed_data = list_trigger_orders_typed_data(config.sender, recv_time)
+        await asyncio.sleep(0)
+        signature = _signature(
+            _callback_value(signer, credential, typed_data, label="signer")
+        )
+        await asyncio.sleep(0)
+        recovered = _callback_value(
+            recover_owner, typed_data, signature, label="signature recovery"
+        )
+        if (
+            type(recovered) is not str
+            or _address_bytes(recovered) != _address_bytes(config.owner)
+        ):
+            raise NadoPreflightError("signature owner identity mismatch")
+        request = {
+            "type": "list_trigger_orders",
+            "tx": {"sender": config.sender, "recvTime": recv_time},
+            "signature": signature,
+            "limit": 1,
+        }
+        observation = await signed_transport.send_async(request)
+        trigger_hash, trigger_observed_ms = _trigger_zero(
+            observation, config, _system_clock_ms,
+        )
+        if trigger_observed_ms < server_ms or trigger_observed_ms <= round_a.last_observed_ms:
+            raise NadoPreflightError("signed observation temporal order mismatch")
+        store.observe(config.invocation_id, trigger_hash, trigger_observed_ms)
+        evidence = store.evidence(config.invocation_id)
+    if evidence is None:
+        raise NadoPreflightError("durable one-shot evidence is unavailable")
+    (
+        state, stored_identity, round_a_hash, round_a_observed_ms,
+        trigger_hash, trigger_observed_ms,
+    ) = evidence
+    if stored_identity != identity_hash:
+        raise NadoPreflightError("durable one-shot identity mismatch")
+    if state == CLAIMED:
+        raise NadoPreflightError("signed observation is claimed and cannot be retried")
+    if state == FINALIZED:
+        raise NadoPreflightError("preflight invocation is already finalized")
+    if state != OBSERVED or trigger_hash is None or trigger_observed_ms is None:
+        raise NadoPreflightError("durable one-shot state is invalid")
+    if trigger_hash != _digest({"identity": identity_tag, "orders_empty": True}):
+        raise NadoPreflightError("durable trigger evidence is invalid")
+    now_ms = _clock(_system_clock_ms)
+    if (
+        trigger_observed_ms <= round_a_observed_ms
+        or round_a_observed_ms > now_ms
+        or trigger_observed_ms > now_ms
+        or now_ms - round_a_observed_ms > MAX_FRESHNESS_MS
+    ):
+        raise NadoPreflightError("durable temporal evidence is invalid or stale")
+    round_b = await _operational_round_b(public_transport, config)
     if round_b.first_observed_ms <= trigger_observed_ms:
         raise NadoPreflightError("public evidence temporal barrier mismatch")
     if round_b.last_observed_ms - round_a_observed_ms > MAX_FRESHNESS_MS:
