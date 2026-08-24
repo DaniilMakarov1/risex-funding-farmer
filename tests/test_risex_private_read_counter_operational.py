@@ -459,8 +459,12 @@ async def test_success_has_exact_sequence_full_counters_and_agreeing_barriers(tm
     path = tmp_path / "fixture.sqlite3"
     report = await _run_fixture(dependencies(tmp_path, calls))
     assert report.result is Result.PASSED
+    assert report.schema_version == 4
     assert report.auth_v2_shape is None
     assert report.auth_v2_shape_sha256 is None
+    assert report.positions_schema_classifier is None
+    assert report.positions_shape is None
+    assert report.positions_shape_sha256 is None
     assert report.barrier_a_fingerprint == report.barrier_b_fingerprint
     assert set(report.counters) == set(_COUNTER_NAMES)
     assert len(_COUNTER_NAMES) == 41
@@ -482,7 +486,7 @@ async def test_success_has_exact_sequence_full_counters_and_agreeing_barriers(tm
     database = sqlite3.connect(path)
     try:
         assert database.execute("PRAGMA integrity_check").fetchone() == ("ok",)
-        assert database.execute("PRAGMA user_version").fetchone() == (3,)
+        assert database.execute("PRAGMA user_version").fetchone() == (4,)
     finally:
         database.close()
 
@@ -937,6 +941,18 @@ async def test_positions_failures_are_split_redacted_and_terminal(
     assert report.counters["capability_close"] == {"attempts": 1, "completions": 1}
     assert report.counters["terminal_persist"] == {"attempts": 1, "completions": 1}
     assert report.auth_v2_shape is None and report.auth_v2_shape_sha256 is None
+    if reason == "positions_schema_invalid":
+        assert report.positions_schema_classifier in {
+            "top_envelope", "first_or_later_row",
+        }
+        assert report.positions_shape is not None
+        assert report.positions_shape_sha256 == hashlib.sha256(
+            report.positions_shape.encode("ascii")
+        ).hexdigest()
+    else:
+        assert report.positions_schema_classifier is None
+        assert report.positions_shape is None
+        assert report.positions_shape_sha256 is None
     assert not any(call.startswith("public_b_") for call in calls)
     persisted = (tmp_path / "fixture.sqlite3").read_bytes().decode("latin1")
     assert raw not in persisted
@@ -950,6 +966,296 @@ async def test_positions_failures_are_split_redacted_and_terminal(
         transport_factory=lambda: (_ for _ in ()).throw(AssertionError("transport")),
     ))
     assert restarted == report and restart_calls == []
+
+
+@pytest.mark.asyncio
+async def test_positions_top_extra_is_not_accepted_and_persists_only_safe_shape(
+    tmp_path,
+):
+    assert operational._POSITIONS_SHAPE_TOP_KEYS == {
+        "method", "channel", "type", "data", "position_count",
+        "worker_timestamp",
+    }
+    assert operational._POSITIONS_SHAPE_ROW_KEYS == set(OFFICIAL_CLOSED_POSITION)
+    assert (
+        operational._POSITIONS_SHAPE_MAX_DEPTH,
+        operational._POSITIONS_SHAPE_MAX_NODES,
+        operational._POSITIONS_SHAPE_MAX_FIELDS,
+        operational._POSITIONS_SHAPE_MAX_BYTES,
+    ) == (3, 32, 20, 768)
+    calls: list[str] = []
+    raw = positions_frame(
+        OFFICIAL_CLOSED_POSITION,
+        **{"unknown-key-secret": "unknown-value-secret"},
+    )
+    report = await _run_fixture(dependencies(
+        tmp_path,
+        calls,
+        transport_factory=lambda: SyntheticTransport(calls, positions_response=raw),
+    ))
+    assert report.result is Result.UNKNOWN
+    assert report.reason == "positions_schema_invalid"
+    assert report.positions_schema_classifier == "top_envelope"
+    assert report.positions_shape is not None
+    assert report.positions_shape.endswith('],"other_key":"present"}')
+    assert report.counters["positions_schema"] == {"attempts": 1, "completions": 0}
+    assert report.counters["positions_flat"] == {"attempts": 0, "completions": 0}
+    serialized = json.dumps(report.as_dict(), sort_keys=True)
+    persisted = (tmp_path / "fixture.sqlite3").read_bytes().decode("latin1")
+    for forbidden in (raw, "unknown-key-secret", "unknown-value-secret", ACCOUNT):
+        assert forbidden not in report.positions_shape
+        assert forbidden not in serialized
+        assert forbidden not in persisted
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("frame", "expected_fragment"),
+    (
+        (
+            {
+                "method": "snapshot", "type": "snapshot", "data": [],
+                "position_count": 0, "worker_timestamp": "1",
+            },
+            '["data",{"array":"empty"}]',
+        ),
+        (
+            {
+                "method": "snapshot", "channel": "positions", "type": "snapshot",
+                "data": {}, "position_count": 0, "worker_timestamp": "1",
+            },
+            '["data","object"]',
+        ),
+        (
+            {
+                "method": "wrong-value-secret", "channel": "positions",
+                "type": "snapshot", "data": [], "position_count": 0,
+                "worker_timestamp": "1",
+            },
+            '["method","string"]',
+        ),
+    ),
+)
+async def test_positions_top_missing_type_and_empty_shape_are_bounded(
+    tmp_path, frame, expected_fragment,
+):
+    calls: list[str] = []
+    raw = json.dumps(frame, separators=(",", ":"))
+    report = await _run_fixture(dependencies(
+        tmp_path,
+        calls,
+        transport_factory=lambda: SyntheticTransport(calls, positions_response=raw),
+    ))
+    assert report.reason == "positions_schema_invalid"
+    assert report.positions_schema_classifier == "top_envelope"
+    assert expected_fragment in report.positions_shape
+    assert "wrong-value-secret" not in report.positions_shape
+    assert len(report.positions_shape.encode("ascii")) <= 768
+
+
+@pytest.mark.asyncio
+async def test_positions_missing_first_row_field_is_structural_only(tmp_path):
+    calls: list[str] = []
+    row = dict(OFFICIAL_CLOSED_POSITION)
+    row.pop("size")
+    raw = positions_frame(row)
+    report = await _run_fixture(dependencies(
+        tmp_path,
+        calls,
+        transport_factory=lambda: SyntheticTransport(calls, positions_response=raw),
+    ))
+    assert report.reason == "positions_schema_invalid"
+    assert report.positions_schema_classifier == "first_or_later_row"
+    assert '["size",' not in report.positions_shape
+    assert raw not in (tmp_path / "fixture.sqlite3").read_bytes().decode("latin1")
+
+
+@pytest.mark.asyncio
+async def test_positions_row_classifier_uses_first_row_shape_without_index_or_values(
+    tmp_path,
+):
+    calls: list[str] = []
+    later = {
+        **OFFICIAL_CLOSED_POSITION,
+        "market_id": "2",
+        "size": "later-size-value-secret",
+        "later-unknown-key-secret": "later-unknown-value-secret",
+    }
+    raw = positions_frame(OFFICIAL_CLOSED_POSITION, later)
+    report = await _run_fixture(dependencies(
+        tmp_path,
+        calls,
+        transport_factory=lambda: SyntheticTransport(calls, positions_response=raw),
+    ))
+    assert report.result is Result.UNKNOWN
+    assert report.reason == "positions_schema_invalid"
+    assert report.positions_schema_classifier == "first_or_later_row"
+    expected, digest = operational._positions_shape(json.loads(
+        positions_frame(OFFICIAL_CLOSED_POSITION)
+    ))
+    assert report.positions_shape == expected
+    assert report.positions_shape_sha256 == digest
+    serialized = json.dumps(report.as_dict(), sort_keys=True)
+    persisted = (tmp_path / "fixture.sqlite3").read_bytes().decode("latin1")
+    for forbidden in (
+        raw, "later-size-value-secret", "later-unknown-key-secret",
+        "later-unknown-value-secret", ACCOUNT, "market_id\":\"2",
+    ):
+        assert forbidden not in report.positions_shape
+        assert forbidden not in serialized
+        assert forbidden not in persisted
+    assert "index" not in report.positions_schema_classifier
+
+
+@pytest.mark.asyncio
+async def test_positions_first_row_type_tags_are_value_free_and_containers_opaque(
+    tmp_path,
+):
+    calls: list[str] = []
+    row = {
+        **OFFICIAL_CLOSED_POSITION,
+        "account": "account-value-secret",
+        "market_id": {"nested-market-value-secret": ["array-content-secret"]},
+        "size": ["size-array-content-secret"],
+        "row-unknown-key-secret": "row-unknown-value-secret",
+    }
+    raw = positions_frame(row)
+    report = await _run_fixture(dependencies(
+        tmp_path,
+        calls,
+        transport_factory=lambda: SyntheticTransport(calls, positions_response=raw),
+    ))
+    assert report.positions_schema_classifier == "first_or_later_row"
+    assert '["account","string"]' in report.positions_shape
+    assert '["market_id","object"]' in report.positions_shape
+    assert '["size","array"]' in report.positions_shape
+    assert '"other_key":"present"' in report.positions_shape
+    serialized = json.dumps(report.as_dict(), sort_keys=True)
+    persisted = (tmp_path / "fixture.sqlite3").read_bytes().decode("latin1")
+    for forbidden in (
+        raw, "account-value-secret", "nested-market-value-secret",
+        "array-content-secret", "size-array-content-secret",
+        "row-unknown-key-secret", "row-unknown-value-secret",
+    ):
+        assert forbidden not in report.positions_shape
+        assert forbidden not in serialized
+        assert forbidden not in persisted
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("limit_name", "limit_value"),
+    (
+        ("_POSITIONS_SHAPE_MAX_DEPTH", 1),
+        ("_POSITIONS_SHAPE_MAX_NODES", 2),
+        ("_POSITIONS_SHAPE_MAX_FIELDS", 5),
+        ("_POSITIONS_SHAPE_MAX_BYTES", 32),
+    ),
+)
+async def test_positions_shape_limits_collapse_to_constant_witness(
+    tmp_path, monkeypatch, limit_name, limit_value,
+):
+    monkeypatch.setattr(operational, limit_name, limit_value)
+    calls: list[str] = []
+    raw = positions_frame({**OFFICIAL_CLOSED_POSITION, "size": []})
+    report = await _run_fixture(dependencies(
+        tmp_path,
+        calls,
+        transport_factory=lambda: SyntheticTransport(calls, positions_response=raw),
+    ))
+    assert report.reason == "positions_schema_invalid"
+    assert report.positions_schema_classifier == "first_or_later_row"
+    assert report.positions_shape == '{"shape":"limit_exceeded"}'
+    assert report.positions_shape_sha256 == hashlib.sha256(
+        report.positions_shape.encode("ascii")
+    ).hexdigest()
+    assert raw not in (tmp_path / "fixture.sqlite3").read_bytes().decode("latin1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation", ("classifier", "shape", "digest", "grammar", "partial"),
+)
+async def test_positions_shape_corruption_rejects_store_without_effects(
+    tmp_path, mutation,
+):
+    calls: list[str] = []
+    raw = positions_frame({**OFFICIAL_CLOSED_POSITION, "size": []})
+    first = await _run_fixture(dependencies(
+        tmp_path,
+        calls,
+        transport_factory=lambda: SyntheticTransport(calls, positions_response=raw),
+    ))
+    assert first.reason == "positions_schema_invalid"
+    database = sqlite3.connect(tmp_path / "fixture.sqlite3")
+    if mutation == "classifier":
+        database.execute(
+            "UPDATE run SET positions_schema_classifier='row-7' WHERE singleton=1"
+        )
+    elif mutation == "shape":
+        database.execute("UPDATE run SET positions_shape='\"object\"' WHERE singleton=1")
+    elif mutation == "digest":
+        database.execute(
+            "UPDATE run SET positions_shape_sha256=? WHERE singleton=1", ("0" * 64,)
+        )
+    elif mutation == "grammar":
+        forbidden = '{"object":[["server-secret-key","string"]]}'
+        database.execute(
+            "UPDATE run SET positions_shape=?,positions_shape_sha256=? "
+            "WHERE singleton=1",
+            (forbidden, hashlib.sha256(forbidden.encode()).hexdigest()),
+        )
+    else:
+        database.execute("UPDATE run SET positions_shape=NULL WHERE singleton=1")
+    database.commit()
+    database.close()
+    calls.clear()
+    report = await _run_fixture(dependencies(
+        tmp_path,
+        calls,
+        source_factory=lambda: (_ for _ in ()).throw(AssertionError("source")),
+        transport_factory=lambda: (_ for _ in ()).throw(AssertionError("transport")),
+    ))
+    assert report.result is Result.UNKNOWN and report.reason == "store_rejected"
+    assert report.positions_schema_classifier is None
+    assert report.positions_shape is None and report.positions_shape_sha256 is None
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_nonterminal_positions_shape_restart_clears_witness_without_effects(
+    tmp_path,
+):
+    path = tmp_path / "fixture.sqlite3"
+    ledger = DurableCounterLedger(path, "synthetic-risex-private-read")
+    for name in operational._PUBLIC_A_COUNTERS:
+        ledger.attempt(name)
+        ledger.complete(name)
+    ledger.set_claimed("1" * 64)
+    for name in operational._PRIVATE_COUNTERS:
+        ledger.attempt(name)
+        if name == "positions_schema":
+            break
+        ledger.complete(name)
+    descriptor, digest = operational._positions_shape({
+        "method": "server-secret", "data": [{"size": "server-secret"}],
+    })
+    ledger.record_positions_shape("top_envelope", descriptor, digest)
+    ledger.close()
+
+    calls: list[str] = []
+    report = await _run_fixture(dependencies(
+        tmp_path,
+        calls,
+        source_factory=lambda: (_ for _ in ()).throw(AssertionError("source")),
+        transport_factory=lambda: (_ for _ in ()).throw(AssertionError("transport")),
+    ))
+    assert report.result is Result.UNKNOWN
+    assert report.reason == "interrupted_nonterminal"
+    assert report.positions_schema_classifier is None
+    assert report.positions_shape is None and report.positions_shape_sha256 is None
+    assert "server-secret" not in path.read_bytes().decode("latin1")
+    assert calls == []
 
 
 @pytest.mark.asyncio
@@ -980,6 +1286,8 @@ async def test_positions_receive_outcomes_are_fixed_redacted_and_terminal(
     assert report.result is Result.UNKNOWN and report.reason == reason
     assert report.counters["positions_receive"] == {"attempts": 1, "completions": 0}
     assert report.counters["positions_parse"] == {"attempts": 0, "completions": 0}
+    assert report.positions_schema_classifier is None
+    assert report.positions_shape is None and report.positions_shape_sha256 is None
     assert socket.receives == 1
     persisted = (tmp_path / "fixture.sqlite3").read_bytes().decode("latin1")
     assert secret not in persisted and secret not in json.dumps(report.as_dict())
@@ -1018,6 +1326,8 @@ async def test_positions_followup_frame_is_unknown_and_never_persisted(tmp_path)
     assert report.counters["positions_followup_guard"] == {
         "attempts": 1, "completions": 0,
     }
+    assert report.positions_schema_classifier is None
+    assert report.positions_shape is None and report.positions_shape_sha256 is None
     persisted = (tmp_path / "fixture.sqlite3").read_bytes().decode("latin1")
     assert secret not in persisted and secret not in json.dumps(report.as_dict())
     assert not any(call.startswith("public_b_") for call in calls)
@@ -1270,7 +1580,7 @@ async def test_store_counter_schema_path_and_file_corruption_fail_without_effect
         elif mutation == "schema":
             database.execute("ALTER TABLE run ADD COLUMN unexpected TEXT")
         else:
-            database.execute("PRAGMA user_version=4")
+            database.execute("PRAGMA user_version=5")
         database.commit()
         database.close()
     elif mutation == "mode":

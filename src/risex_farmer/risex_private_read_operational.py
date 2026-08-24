@@ -43,7 +43,7 @@ STORE_BASENAME = ".risex-funding-farmer-risex-private-read-20260824-new-op-006.s
 FIXED_STORE_PATH = Path(
     "/Users/daniilmakarov/.risex-funding-farmer-risex-private-read-20260824-new-op-006.sqlite3"
 )
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 _APPLICATION_ID = 0x52585052
 _MAX_BYTES = 1_048_576
 _DEADLINE_SECONDS = 5
@@ -56,6 +56,23 @@ _AUTH_SHAPE_MAX_NODES = 32
 _AUTH_SHAPE_MAX_FIELDS = 9
 _AUTH_SHAPE_MAX_BYTES = 512
 _AUTH_SHAPE_LIMIT = '{"shape":"limit_exceeded"}'
+_POSITIONS_SHAPE_TOP_KEYS = frozenset({
+    "method", "channel", "type", "data", "position_count", "worker_timestamp",
+})
+_POSITIONS_SHAPE_ROW_KEYS = frozenset({
+    "account", "market_id", "size", "quote_amount", "side", "margin_mode",
+    "leverage", "avg_entry_price", "isolated_usdc_balance",
+    "last_funding_payment", "unsettled_funding", "block_number", "log_index",
+    "worker_timestamp",
+})
+_POSITIONS_SCHEMA_CLASSIFIERS = frozenset({
+    "top_envelope", "first_or_later_row",
+})
+_POSITIONS_SHAPE_MAX_DEPTH = 3
+_POSITIONS_SHAPE_MAX_NODES = 32
+_POSITIONS_SHAPE_MAX_FIELDS = 20
+_POSITIONS_SHAPE_MAX_BYTES = 768
+_POSITIONS_SHAPE_LIMIT = '{"shape":"limit_exceeded"}'
 
 _PUBLIC_REQUESTS = tuple(PrivateReadPreflight._REQUESTS)
 _PUBLIC_A_COUNTERS = tuple(
@@ -119,7 +136,7 @@ _REASON_VALUES = frozenset({
 _LEDGER_SCHEMA = (
     "CREATE TABLE run ("
     "singleton INTEGER PRIMARY KEY CHECK(singleton=1),"
-    "schema_version INTEGER NOT NULL CHECK(schema_version=3),"
+    "schema_version INTEGER NOT NULL CHECK(schema_version=4),"
     "invocation_id TEXT NOT NULL CHECK(length(invocation_id)>0),"
     "store_path_sha256 TEXT NOT NULL CHECK(length(store_path_sha256)=64),"
     "state TEXT NOT NULL CHECK(state IN "
@@ -130,7 +147,10 @@ _LEDGER_SCHEMA = (
     "finished_at_ns INTEGER,"
     "reason TEXT,"
     "auth_v2_shape TEXT,"
-    "auth_v2_shape_sha256 TEXT);"
+    "auth_v2_shape_sha256 TEXT,"
+    "positions_schema_classifier TEXT,"
+    "positions_shape TEXT,"
+    "positions_shape_sha256 TEXT);"
     "CREATE TABLE phase_counter ("
     "name TEXT PRIMARY KEY,"
     "attempts INTEGER NOT NULL CHECK(attempts IN (0,1)),"
@@ -158,6 +178,9 @@ class OperationalReport:
     reason: str
     auth_v2_shape: str | None
     auth_v2_shape_sha256: str | None
+    positions_schema_classifier: str | None
+    positions_shape: str | None
+    positions_shape_sha256: str | None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -172,6 +195,9 @@ class OperationalReport:
             "reason": self.reason,
             "auth_v2_shape": self.auth_v2_shape,
             "auth_v2_shape_sha256": self.auth_v2_shape_sha256,
+            "positions_schema_classifier": self.positions_schema_classifier,
+            "positions_shape": self.positions_shape,
+            "positions_shape_sha256": self.positions_shape_sha256,
         }
 
 
@@ -192,10 +218,15 @@ class _AuthV2Failure(Exception):
 class _PositionsFailure(Exception):
     """Fixed redacted positions outcome; never carries server-controlled data."""
 
-    def __init__(self, reason: str) -> None:
+    def __init__(self, reason: str, classifier: str | None = None) -> None:
         if reason not in _REASON_VALUES or not reason.startswith("positions_"):
             raise ValueError("positions failure reason")
+        if (reason == "positions_schema_invalid") != (
+            classifier in _POSITIONS_SCHEMA_CLASSIFIERS
+        ):
+            raise ValueError("positions failure classifier")
         self.reason = reason
+        self.classifier = classifier
         super().__init__(reason)
 
 
@@ -366,7 +397,8 @@ class DurableCounterLedger:
             self._db.execute(f"PRAGMA application_id={_APPLICATION_ID}")
             self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             self._db.execute(
-                "INSERT INTO run VALUES(1,?,?,?,?,?,?,?,NULL,NULL,NULL,NULL)",
+                "INSERT INTO run VALUES(1,?,?,?,?,?,?,?,NULL,NULL,NULL,NULL,"
+                "NULL,NULL,NULL)",
                 (
                     SCHEMA_VERSION,
                     self.invocation_id,
@@ -402,7 +434,8 @@ class DurableCounterLedger:
             "singleton", "schema_version", "invocation_id", "store_path_sha256",
             "state", "barrier_a_fingerprint", "barrier_b_fingerprint",
             "started_at_ns", "finished_at_ns", "reason", "auth_v2_shape",
-            "auth_v2_shape_sha256",
+            "auth_v2_shape_sha256", "positions_schema_classifier",
+            "positions_shape", "positions_shape_sha256",
         ) or counter_columns != ("name", "attempts", "completions"):
             raise ValueError("schema")
         if self._db.execute("SELECT COUNT(*) FROM run").fetchone() != (1,):
@@ -430,6 +463,16 @@ class DurableCounterLedger:
                 row[9] is not None
                 and not _valid_auth_v2_shape(str(row[9]), str(row[10]))
             )
+            or not (
+                (row[11] is None and row[12] is None and row[13] is None)
+                or (
+                    row[11] in _POSITIONS_SCHEMA_CLASSIFIERS
+                    and row[12] is not None
+                    and row[13] is not None
+                    and _valid_positions_shape(str(row[12]), str(row[13]))
+                )
+            )
+            or (row[9] is not None and row[11] is not None)
         ):
             raise ValueError("identity")
         counters = self._counter_rows()
@@ -449,11 +492,14 @@ class DurableCounterLedger:
             raise ValueError("counter state")
         terminal = row[3] in _TERMINAL_STATES
         terminal_counter = counters["terminal_persist"]
-        shape_present = row[9] is not None
+        auth_shape_present = row[9] is not None
+        positions_shape_present = row[11] is not None
         if terminal:
-            if shape_present != (row[8] == "auth_v2_schema_invalid"):
+            if auth_shape_present != (row[8] == "auth_v2_schema_invalid"):
                 raise ValueError("auth_v2 shape terminal")
-        elif shape_present and not (
+            if positions_shape_present != (row[8] == "positions_schema_invalid"):
+                raise ValueError("positions shape terminal")
+        elif auth_shape_present and not (
             row[3] == "CLAIMED"
             and counters["auth_v2_receive"] == (1, 1)
             and counters["auth_v2_parse"] == (1, 1)
@@ -461,6 +507,14 @@ class DurableCounterLedger:
             and counters["auth_v2_status"] == (0, 0)
         ):
             raise ValueError("auth_v2 shape stage")
+        elif positions_shape_present and not (
+            row[3] == "CLAIMED"
+            and counters["positions_receive"] == (1, 1)
+            and counters["positions_parse"] == (1, 1)
+            and counters["positions_schema"] == (1, 0)
+            and counters["positions_flat"] == (0, 0)
+        ):
+            raise ValueError("positions shape stage")
         if counters["final_agreement"] == (1, 1) and row[4] != row[5]:
             raise ValueError("agreement invariant")
         if terminal:
@@ -499,7 +553,8 @@ class DurableCounterLedger:
         row = self._db.execute(
             "SELECT schema_version,invocation_id,store_path_sha256,state,"
             "barrier_a_fingerprint,barrier_b_fingerprint,started_at_ns,"
-            "finished_at_ns,reason,auth_v2_shape,auth_v2_shape_sha256 "
+            "finished_at_ns,reason,auth_v2_shape,auth_v2_shape_sha256,"
+            "positions_schema_classifier,positions_shape,positions_shape_sha256 "
             "FROM run WHERE singleton=1"
         ).fetchone()
         if row is None:
@@ -597,6 +652,34 @@ class DurableCounterLedger:
             raise ValueError("auth_v2 shape state")
         self._validate()
 
+    def record_positions_shape(
+        self, classifier: str, descriptor: str, digest: str,
+    ) -> None:
+        if (
+            classifier not in _POSITIONS_SCHEMA_CLASSIFIERS
+            or not _valid_positions_shape(descriptor, digest)
+        ):
+            raise ValueError("positions shape")
+        counters = self._counter_rows()
+        if (
+            counters["positions_receive"] != (1, 1)
+            or counters["positions_parse"] != (1, 1)
+            or counters["positions_schema"] != (1, 0)
+            or counters["positions_flat"] != (0, 0)
+        ):
+            raise ValueError("positions shape stage")
+        with self._db:
+            changed = self._db.execute(
+                "UPDATE run SET positions_schema_classifier=?,positions_shape=?,"
+                "positions_shape_sha256=? WHERE singleton=1 AND state='CLAIMED' "
+                "AND positions_schema_classifier IS NULL AND positions_shape IS NULL "
+                "AND positions_shape_sha256 IS NULL",
+                (classifier, descriptor, digest),
+            ).rowcount
+        if changed != 1:
+            raise ValueError("positions shape state")
+        self._validate()
+
     def finalize(
         self,
         result: Result,
@@ -626,6 +709,14 @@ class DurableCounterLedger:
         ):
             result = Result.UNKNOWN
             reason = "validation_failed"
+        if reason == "positions_schema_invalid" and not (
+            row[11] in _POSITIONS_SCHEMA_CLASSIFIERS
+            and row[12] is not None
+            and row[13] is not None
+            and _valid_positions_shape(str(row[12]), str(row[13]))
+        ):
+            result = Result.UNKNOWN
+            reason = "validation_failed"
         attempts, completions = self._counter_rows()["terminal_persist"]
         if attempts == 0:
             self.attempt("terminal_persist")
@@ -643,8 +734,17 @@ class DurableCounterLedger:
                 "auth_v2_shape=CASE WHEN ?='auth_v2_schema_invalid' "
                 "THEN auth_v2_shape ELSE NULL END,"
                 "auth_v2_shape_sha256=CASE WHEN ?='auth_v2_schema_invalid' "
-                "THEN auth_v2_shape_sha256 ELSE NULL END WHERE singleton=1",
-                (result.value, time.time_ns(), reason, reason, reason),
+                "THEN auth_v2_shape_sha256 ELSE NULL END,"
+                "positions_schema_classifier=CASE WHEN ?='positions_schema_invalid' "
+                "THEN positions_schema_classifier ELSE NULL END,"
+                "positions_shape=CASE WHEN ?='positions_schema_invalid' "
+                "THEN positions_shape ELSE NULL END,"
+                "positions_shape_sha256=CASE WHEN ?='positions_schema_invalid' "
+                "THEN positions_shape_sha256 ELSE NULL END WHERE singleton=1",
+                (
+                    result.value, time.time_ns(), reason, reason, reason,
+                    reason, reason, reason,
+                ),
             )
             changed = self._db.execute(
                 "UPDATE phase_counter SET completions=1 WHERE name='terminal_persist' "
@@ -675,6 +775,9 @@ class DurableCounterLedger:
             reason=str(row[8]),
             auth_v2_shape=None if row[9] is None else str(row[9]),
             auth_v2_shape_sha256=None if row[10] is None else str(row[10]),
+            positions_schema_classifier=None if row[11] is None else str(row[11]),
+            positions_shape=None if row[12] is None else str(row[12]),
+            positions_shape_sha256=None if row[13] is None else str(row[13]),
         )
 
     def close(self) -> None:
@@ -786,6 +889,190 @@ def _valid_auth_v2_shape(descriptor: str, digest: str) -> bool:
         return keys == sorted(set(keys))
 
     return valid_shape(parsed, 0)
+
+
+class _PositionsShapeLimit(Exception):
+    pass
+
+
+_POSITIONS_TYPE_TAGS = frozenset({
+    "null", "boolean", "number", "string", "array", "object",
+})
+
+
+def _positions_shape(value: Any) -> tuple[str, str]:
+    nodes = 0
+    fields = 0
+
+    def bump(depth: int) -> None:
+        nonlocal nodes
+        nodes += 1
+        if depth > _POSITIONS_SHAPE_MAX_DEPTH or nodes > _POSITIONS_SHAPE_MAX_NODES:
+            raise _PositionsShapeLimit
+
+    def tag(current: Any, depth: int) -> str:
+        bump(depth)
+        if current is None:
+            return "null"
+        if type(current) is bool:
+            return "boolean"
+        if type(current) in {int, float}:
+            return "number"
+        if type(current) is str:
+            return "string"
+        if type(current) is list:
+            return "array"
+        if type(current) is dict:
+            return "object"
+        raise _PositionsShapeLimit
+
+    def shaped_object(
+        current: dict[str, Any], safe_keys: frozenset[str], depth: int,
+        value_shape: Callable[[str, Any, int], Any],
+    ) -> dict[str, Any]:
+        nonlocal fields
+        bump(depth)
+        safe = sorted(key for key in current if key in safe_keys)
+        fields += len(safe)
+        if fields > _POSITIONS_SHAPE_MAX_FIELDS:
+            raise _PositionsShapeLimit
+        shaped: dict[str, Any] = {
+            "object": [
+                [key, value_shape(key, current[key], depth + 1)] for key in safe
+            ],
+        }
+        if len(safe) != len(current):
+            shaped["other_key"] = "present"
+        return shaped
+
+    def row_shape(current: Any, depth: int) -> Any:
+        if type(current) is not dict:
+            return tag(current, depth)
+        return shaped_object(
+            current, _POSITIONS_SHAPE_ROW_KEYS, depth,
+            lambda _key, item, item_depth: tag(item, item_depth),
+        )
+
+    def top_value(key: str, current: Any, depth: int) -> Any:
+        if key != "data" or type(current) is not list:
+            return tag(current, depth)
+        bump(depth)
+        if not current:
+            return {"array": "empty"}
+        return {
+            "array": "nonempty",
+            "first": row_shape(current[0], depth + 1),
+        }
+
+    try:
+        if type(value) is dict:
+            shaped = shaped_object(
+                value, _POSITIONS_SHAPE_TOP_KEYS, 0, top_value,
+            )
+        else:
+            shaped = tag(value, 0)
+        descriptor = json.dumps(
+            shaped, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+        )
+        if len(descriptor.encode("ascii")) > _POSITIONS_SHAPE_MAX_BYTES:
+            raise _PositionsShapeLimit
+    except _PositionsShapeLimit:
+        descriptor = _POSITIONS_SHAPE_LIMIT
+    return descriptor, hashlib.sha256(descriptor.encode("ascii")).hexdigest()
+
+
+def _valid_positions_shape(descriptor: str, digest: str) -> bool:
+    if (
+        type(descriptor) is not str
+        or not _fingerprint(digest)
+        or len(descriptor.encode("utf-8")) > _POSITIONS_SHAPE_MAX_BYTES
+        or hashlib.sha256(descriptor.encode("utf-8")).hexdigest() != digest
+    ):
+        return False
+    if descriptor == _POSITIONS_SHAPE_LIMIT:
+        return True
+    try:
+        parsed = json.loads(descriptor)
+        if descriptor != json.dumps(
+            parsed, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+        ):
+            return False
+    except Exception:
+        return False
+
+    nodes = 0
+    fields = 0
+
+    def bump(depth: int) -> bool:
+        nonlocal nodes
+        nodes += 1
+        return depth <= _POSITIONS_SHAPE_MAX_DEPTH and nodes <= _POSITIONS_SHAPE_MAX_NODES
+
+    def valid_tag(current: Any, depth: int, *, object_allowed: bool = True) -> bool:
+        return (
+            bump(depth)
+            and type(current) is str
+            and current in _POSITIONS_TYPE_TAGS
+            and (object_allowed or current != "object")
+        )
+
+    def valid_object(
+        current: Any, safe_keys: frozenset[str], depth: int,
+        value_validator: Callable[[str, Any, int], bool],
+    ) -> bool:
+        nonlocal fields
+        if not bump(depth) or type(current) is not dict or set(current) not in (
+            {"object"}, {"object", "other_key"},
+        ) or current.get("other_key", "present") != "present":
+            return False
+        entries = current.get("object")
+        if type(entries) is not list:
+            return False
+        fields += len(entries)
+        if fields > _POSITIONS_SHAPE_MAX_FIELDS:
+            return False
+        keys: list[str] = []
+        for entry in entries:
+            if (
+                type(entry) is not list
+                or len(entry) != 2
+                or type(entry[0]) is not str
+                or entry[0] not in safe_keys
+                or not value_validator(entry[0], entry[1], depth + 1)
+            ):
+                return False
+            keys.append(entry[0])
+        return keys == sorted(set(keys))
+
+    def valid_row(current: Any, depth: int) -> bool:
+        if type(current) is not dict:
+            return valid_tag(current, depth, object_allowed=False)
+        return valid_object(
+            current, _POSITIONS_SHAPE_ROW_KEYS, depth,
+            lambda _key, item, item_depth: valid_tag(item, item_depth),
+        )
+
+    def valid_top_value(key: str, current: Any, depth: int) -> bool:
+        if key != "data" or type(current) is not dict:
+            return valid_tag(current, depth)
+        array_kind = current.get("array")
+        if (
+            not bump(depth)
+            or type(array_kind) is not str
+            or array_kind not in {"empty", "nonempty"}
+        ):
+            return False
+        if array_kind == "empty":
+            return set(current) == {"array"}
+        return set(current) == {"array", "first"} and valid_row(
+            current["first"], depth + 1,
+        )
+
+    if type(parsed) is not dict:
+        return valid_tag(parsed, 0, object_allowed=False)
+    return valid_object(
+        parsed, _POSITIONS_SHAPE_TOP_KEYS, 0, valid_top_value,
+    )
 
 
 class _SignOnlyCapability:
@@ -1461,13 +1748,21 @@ async def _execute(
             _identity,
             dependencies.crash_hook,
         )
-        positions_decoded = await _phase(
-            ledger,
-            "positions_schema",
-            lambda: _decode_positions_snapshot(positions_parsed),
-            _identity,
-            dependencies.crash_hook,
-        )
+        try:
+            positions_decoded = await _phase(
+                ledger,
+                "positions_schema",
+                lambda: _decode_positions_snapshot(positions_parsed),
+                _identity,
+                dependencies.crash_hook,
+            )
+        except _PositionsFailure as failure:
+            if failure.reason == "positions_schema_invalid":
+                assert failure.classifier is not None
+                ledger.record_positions_shape(
+                    failure.classifier, *_positions_shape(positions_parsed),
+                )
+            raise
         positions_flat = await _phase(
             ledger,
             "positions_flat",
@@ -1527,9 +1822,16 @@ def _decode_positions_snapshot(value: Any) -> tuple[tuple[Any, ...], str]:
         data, worker_timestamp = PrivateReadPreflight._decode_private_snapshot(
             value, channel="positions", count_field="position_count",
         )
+    except Exception:
+        raise _PositionsFailure(
+            "positions_schema_invalid", "top_envelope",
+        ) from None
+    try:
         sizes = PrivateReadPreflight._decode_position_sizes(data)
     except Exception:
-        raise _PositionsFailure("positions_schema_invalid") from None
+        raise _PositionsFailure(
+            "positions_schema_invalid", "first_or_later_row",
+        ) from None
     return sizes, worker_timestamp
 
 
@@ -1587,6 +1889,9 @@ async def _run(dependencies: _Dependencies) -> OperationalReport:
             None,
             None,
             "store_rejected",
+            None,
+            None,
+            None,
             None,
             None,
         )
