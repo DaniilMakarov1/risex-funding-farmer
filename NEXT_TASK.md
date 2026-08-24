@@ -16,12 +16,12 @@ Status: `BLOCKED — OFFICIAL PUBLIC GATEWAY RETURNED HTTP 403`.
 - After a genuine external-state change or cooldown, perform exactly one credential-free official public catalog query from a fresh Builder session. If successful, reproduce and correct the remaining op003 catalog mismatch with fixtures; if still forbidden, stop without retry.
 - Do not read credentials or create op004 until the public contract passes.
 
-## Extended — run private-read op004 once
+## Extended — wait for official stream recovery
 
-Status: `READY FOR TIER B OPERATIONAL GATE`.
+Status: `BLOCKED — OFFICIAL TESTNET ACCOUNT STREAM RETURNED HTTP 503`.
 
-- From clean published `main`, Chief may gate exactly one invocation of sealed `extended-private-read-20260824-new-op-004`; no consumed invocation or store may be reused and no retry follows an ambiguous outcome.
-- Success requires every durable counter complete, fresh same-connection REST/stream agreement, authoritative zero orders, and exact flatness. Any blocked, unknown, partial-counter, transport, identity, or schema outcome stops without another private request.
+- Private-read op004 is consumed after its first stream-open attempt failed before completion. Do not reuse its invocation or store and do not retry it.
+- After a demonstrated external-state change, confirm the current official testnet account stream is available without loading credentials. Only then may a fresh Builder bind one new unique invocation/store from the then-current published `main`; the resulting private-read operation requires a new separate Chief gate.
 
 ## Completion
 

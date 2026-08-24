@@ -20,7 +20,8 @@
 ### Extended
 
 - The fixed identity and API-key capability are securely provisioned. Account-shape witness op003 completed `CAPTURED` with every counter exactly `1/1` and no write.
-- The exact `{status, data}` parser correction and fresh sealed private-read op004 binding are accepted. Witness op003 and private-read operations through op002 remain consumed; op004 is unconsumed and awaits one separately gated private-read operation.
+- The exact `{status, data}` parser correction is accepted. Sealed private-read op004 is consumed and durably `BLOCKED`: all three first REST reads completed, then the first stream-open attempt failed before completion; no stream frame, second REST pass, barrier, or write occurred.
+- A single credential-free diagnosis of the same current official testnet stream endpoint returned HTTP 503 from its load balancer. The lane waits for a demonstrated external recovery before a fresh invocation/store binding; op004 is never reused or retried.
 
 ## Exit condition
 
