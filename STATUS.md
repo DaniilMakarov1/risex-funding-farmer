@@ -41,6 +41,7 @@
 - The next fresh Level B passed the five-request public account prefix for the first time, then stopped with sanitized `SCHEMA` on the first public `subaccount_orders` request for product 0. Credential loader, derivation, signing, private trigger, and write counters all remained zero; its runtime row is terminal and immutable.
 - The separate orders diagnostic stopped earlier than `data` validation with `wire envelope schema mismatch`, proving current `subaccount_orders` uses a top-level envelope different from accepted `{status,data,request_type}`. That observation is terminal; no order content or identity was retained.
 - The narrower envelope observation showed this is the venue's explicit error shape `{status,request_type,error_code,error}`, not a successful response-shape drift. The API is rejecting `subaccount_orders` for collateral product 0; the runner currently misclassifies that semantic API rejection as `SCHEMA`.
+- The bounded error diagnostic classified venue error code `2015`: no market exists for the supplied product/ticker ID. Product 0 is the fixed USDT0 collateral product and must remain in account/balance safety coverage, but it is not a market and must not receive a `subaccount_orders` market query. This is not authentication or rate limiting.
 
 ### Extended
 
