@@ -2,13 +2,13 @@
 
 One slice per venue. Apply the A/B/C levels and safety core from `AGENTS.md`; operational run IDs are data, not source milestones.
 
-## RISEx — wait for public book normalization
+## RISEx — remove the testnet-only maximum-spread rejection
 
-Status: `WAITING FOR EXTERNAL MARKET STATE`.
+Status: `AUTHORIZED FIXTURE CORRECTION`.
 
 - The local lifecycle database is recovered and repeatedly passes `LifecycleClearBinding`; its exact protected pre-recovery backup and the immutable consumed runtime row remain preserved.
-- The latest public BTC/USDC book was not crossed but had an approximately 18.83% spread against the accepted 0.30% safety bound. Wait for a later external market-state change; do not weaken the bound or repeat the authenticated gate while this blocker persists.
-- After a credential-free book observation passes the existing bound, perform one fresh Level B run with another durable runtime ID. Do not dispatch an order, cancel, close, account mutation, or any other write.
+- In a fresh visible RISEx Builder worktree, remove only the maximum-spread rejection from the isolated RISEx testnet public/private-read and lifecycle path. Preserve fresh authoritative BBO, bid below ask, positive exact tick alignment, exact quantity/depth, price bounds, notional, durable identities, no-replay, reconciliation, and terminal zero-order/exact-flat checks; do not change paper or mainnet behavior.
+- After accepted implementation and one fresh Level B run, proceed sequentially to the already-defined minimum-notional Level C lifecycle if and only if Level B is ready and pre-state remains safe.
 
 ## Nado — identify authoritative market-bearing products
 

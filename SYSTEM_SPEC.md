@@ -278,6 +278,8 @@ Before every order/cancel/close dispatch, persist a unique venue-correct write i
 
 First-lifecycle success requires correct authenticated pre-state, one minimum bounded real order path, authoritative outcome reconciliation, any necessary cancel/close, and final authoritative zero relevant open orders plus exact flatness. Venue-specific authentication, signing, wire, nonce, and lifecycle semantics remain separate and must follow official or observed evidence.
 
+For the first bounded RISEx testnet lifecycle, current testnet liquidity may have an arbitrarily wide positive spread. A maximum-spread threshold is not a write-safety gate there: use only a fresh authoritative non-crossed BBO with positive tick-aligned prices and sufficient step-aligned depth for the exact price-bounded order. This exception is testnet-only and does not change paper execution economics or authorize any mainnet behavior.
+
 ### Current first-lifecycle write contracts
 
 - **RISEx:** one minimum-size price-bounded `MARKET+FOK` opening; close from fresh authoritative exact position size, first as reduce-only price-bounded `MARKET+FOK` and later accepted state-based fallback as reduce-only price-bounded `LIMIT+IOC`; at most three automatic close attempts; one exact cancel only for an exact known experiment order, never account-wide cancellation. Every write has a new durable identity and ambiguous writes are never blindly replayed; success is zero relevant open orders plus exact flatness.

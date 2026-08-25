@@ -4,7 +4,7 @@
 
 - Published `main == origin/main`; Git is the exact accepted-history authority.
 - All three fixture lifecycle cores are integrated. Paper remains default; no venue is strategy-ready.
-- User permanently authorizes bounded venue-local diagnostics, read-only gates, and recoverable local operational-database recovery without repeated approval. Testnet writes, mainnet, real funds, account mutation, and product/economic changes remain separately governed.
+- User permanently authorizes bounded venue-local diagnostics, read-only gates, and recoverable local operational-database recovery without repeated approval. The three already-defined first-lifecycle testnet writes are authorized sequentially within their existing safety contracts; mainnet, real funds, unrelated account mutation, and further product/economic changes remain separately governed.
 
 ## Venue readiness
 
@@ -16,7 +16,7 @@
 - The observed lifecycle-clear rejection now has an accepted distinct sanitized safety classification that persists before every public, credential, signing, private, and write effect and remains terminal across restart.
 - Read-only recovery inspection found one obsolete empty three-column `cancels` table; integrity, identities, and zero intents/cancels were otherwise correct. A protected exact backup was verified before the table was transactionally replaced with the accepted canonical schema. `LifecycleClearBinding` now passes repeatedly, and the consumed private-read runtime database remained byte-identical.
 - The fresh Level B run completed all nine first-barrier public requests, then stopped on an unclassified public-sweep semantic failure before source load, credential access, signing, or private dispatch. Its new runtime row is terminal and immutable; no retry or write occurred.
-- Separate credential-free diagnostics showed the BTC/USDC BBO was not literally crossed, but its spread was about 18.83% against the accepted 0.30% safety bound. This is current testnet liquidity, not a database, credential, rate-limit, or parser defect; do not weaken the bound.
+- Separate credential-free diagnostics showed the BTC/USDC BBO was not literally crossed, but its spread was about 18.83%. The user explicitly accepted arbitrary current testnet spread for the first bounded lifecycle because the purpose is execution-contract proof with test assets. The previous 0.30% maximum-spread blocker is removed only for this isolated RISEx testnet path; authoritative non-crossed BBO, exact grids/depth, price bounds, notional, identity, reconciliation, zero-order, and exact-flat safeguards remain mandatory.
 
 ### Nado
 
