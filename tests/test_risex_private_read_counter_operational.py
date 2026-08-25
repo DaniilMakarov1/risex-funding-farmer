@@ -1835,6 +1835,50 @@ async def test_terminal_restart_returns_same_report_with_zero_effects(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_lifecycle_not_clear_is_durable_safety_before_every_effect(tmp_path):
+    calls: list[str] = []
+
+    def lifecycle_clear():
+        calls.append("lifecycle_clear")
+        return False
+
+    def forbidden_factory():
+        calls.append("factory")
+        raise AssertionError("effect factory must remain unopened")
+
+    first = await _run_fixture(dependencies(
+        tmp_path,
+        calls,
+        lifecycle_clear=lifecycle_clear,
+        source_factory=forbidden_factory,
+        transport_factory=forbidden_factory,
+    ))
+
+    assert first.result is Result.BLOCKED
+    assert first.reason == "lifecycle_not_clear_safety"
+    assert calls == ["lifecycle_clear"]
+    assert first.counters["terminal_persist"] == {
+        "attempts": 1, "completions": 1,
+    }
+    assert all(
+        value == {"attempts": 0, "completions": 0}
+        for name, value in first.counters.items()
+        if name != "terminal_persist"
+    )
+
+    calls.clear()
+    second = await _run_fixture(dependencies(
+        tmp_path,
+        calls,
+        lifecycle_clear=lambda: calls.append("rearmed") or True,
+        source_factory=forbidden_factory,
+        transport_factory=forbidden_factory,
+    ))
+    assert second == first
+    assert calls == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("factory", ("source", "transport"))
 async def test_fixture_factory_failure_is_terminal_and_redacted(tmp_path, factory):
     calls: list[str] = []
