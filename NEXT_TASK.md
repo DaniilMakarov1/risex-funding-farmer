@@ -10,12 +10,12 @@ Status: `WAITING FOR EXTERNAL MARKET STATE`.
 - The latest public BTC/USDC book was not crossed but had an approximately 18.83% spread against the accepted 0.30% safety bound. Wait for a later external market-state change; do not weaken the bound or repeat the authenticated gate while this blocker persists.
 - After a credential-free book observation passes the existing bound, perform one fresh Level B run with another durable runtime ID. Do not dispatch an order, cancel, close, account mutation, or any other write.
 
-## Nado — fresh Level B after market-query correction
+## Nado — identify authoritative market-bearing products
 
-Status: `AUTHORIZED LEVEL B READ-ONLY GATE`.
+Status: `AUTHORIZED CREDENTIAL-FREE DIAGNOSTIC GATE`.
 
-- Perform one fresh operational Level B run from exact published `main` with a new durable runtime ID. Public checks must complete before credential load; the only signed request is the accepted read-only trigger-order query.
-- Preserve sanitized failure classes and no replay of a complete failure. Do not mutate account state or dispatch any order, cancel, close, deposit, withdrawal, or other write.
+- Do not retry the terminal Level B run or infer further non-market IDs from individual error responses. Using official Nado documentation and one bounded credential-free current observation, identify the authoritative endpoint/field that distinguishes market-bearing product IDs from account-only products; retain only aggregate counts and public IDs needed for contract evidence.
+- Do not load credentials, derive/sign, dispatch private operations, mutate account state, or write. Any implementation must be a fresh visible Nado Builder slice and must preserve complete account-product safety while binding zero-order queries to the authoritative market set.
 
 ## Extended — wait for account-stream access resolution
 

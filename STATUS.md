@@ -43,6 +43,7 @@
 - The narrower envelope observation showed this is the venue's explicit error shape `{status,request_type,error_code,error}`, not a successful response-shape drift. The API is rejecting `subaccount_orders` for collateral product 0; the runner currently misclassifies that semantic API rejection as `SCHEMA`.
 - The bounded error diagnostic classified venue error code `2015`: no market exists for the supplied product/ticker ID. Product 0 is the fixed USDT0 collateral product and must remain in account/balance safety coverage, but it is not a market and must not receive a `subaccount_orders` market query. This is not authentication or rate limiting.
 - The accepted Nado correction retains product 0 in every collateral/account safety vector, excludes it only from market-order queries, and queries each non-collateral product exactly once per public round. Independent focused review passed 266 tests and the clean Python 3.11 full suite passed 1,921 tests.
+- The next fresh Level B completed 12 of 13 attempted first-round public requests, then another non-collateral product failed at `subaccount_orders` with sanitized `SCHEMA`; every credential/sign/private/write counter remained zero. Product catalog membership is therefore not sufficient proof that a product has a market. Do not exclude IDs one by one or retry until an authoritative current market-bearing set is observed.
 
 ### Extended
 
