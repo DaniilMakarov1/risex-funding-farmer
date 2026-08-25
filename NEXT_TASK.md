@@ -10,12 +10,12 @@ Status: `AUTHORIZED OPERATIONAL IMPLEMENTATION`.
 - Preserve the accepted minimum-size price-bounded `MARKET+FOK` opening and fresh-position reduce-only close sequence/fallback/attempt ceiling. Do not create a general framework, CLI mode in normal startup, paper/mainnet behavior, strategy, or cross-venue abstraction. Tests use injected transports only; the Builder must not load real credentials or execute a network/write gate.
 - After acceptance, Chief runs the runner once sequentially under the already-authorized `<= USD 500` Level C gate. Unexpected behavior halts for manual testnet recovery and is failure, never acceptance.
 
-## Nado — exclude the special NLP vault token from orderbook queries
+## Nado — tolerate the additive server-time correlation field
 
 Status: `AUTHORIZED FIXTURE CORRECTION`.
 
-- In a fresh visible Nado Builder worktree, preserve product 11 (`NLP_USDT0`) in catalog/account/balance/health safety coverage but exclude it only from regular `subaccount_orders` orderbook queries, alongside collateral product 0. Bind this narrowly to the fixed testnet contract and add distinct regression/adverse evidence; do not generalize from ticker guesses or relax any other product coverage.
-- After accepted implementation, perform one fresh Level B run. Do not dispatch a write unless it reaches full readiness; then the already-authorized minimum-notional Level C lifecycle may proceed sequentially under the existing Nado contract.
+- In a fresh visible Nado Builder worktree, allow only the observed additive top-level `id` field in the fixed gateway `server_time` response while retaining mandatory exact types/values for `status`, `method`, and canonical fresh `server_time`. Reject removal of required fields, unexpected other additions, non-null/malformed `id` unless official semantics prove it valid, duplicates, stale/future time, and every existing transport/host/size rule.
+- After accepted implementation, perform one fresh Level B. Do not dispatch a write unless it reaches full readiness; then the already-authorized minimum-notional Level C lifecycle may proceed sequentially under the existing Nado contract.
 
 ## Extended — provider/API Management resolution required
 
