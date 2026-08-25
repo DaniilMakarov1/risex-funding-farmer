@@ -10,19 +10,19 @@ Status: `AUTHORIZED FIXTURE CORRECTION`.
 - In a fresh visible RISEx Builder worktree, remove only the maximum-spread rejection from the isolated RISEx testnet public/private-read and lifecycle path. Preserve fresh authoritative BBO, bid below ask, positive exact tick alignment, exact quantity/depth, price bounds, notional, durable identities, no-replay, reconciliation, and terminal zero-order/exact-flat checks; do not change paper or mainnet behavior.
 - After accepted implementation and one fresh Level B run, proceed sequentially to the already-defined minimum-notional Level C lifecycle if and only if Level B is ready and pre-state remains safe.
 
-## Nado — identify authoritative market-bearing products
+## Nado — exclude the special NLP vault token from orderbook queries
 
-Status: `AUTHORIZED CREDENTIAL-FREE DIAGNOSTIC GATE`.
+Status: `AUTHORIZED FIXTURE CORRECTION`.
 
-- Do not retry the terminal Level B run or infer further non-market IDs from individual error responses. Using official Nado documentation and one bounded credential-free current observation, identify the authoritative endpoint/field that distinguishes market-bearing product IDs from account-only products; retain only aggregate counts and public IDs needed for contract evidence.
-- Do not load credentials, derive/sign, dispatch private operations, mutate account state, or write. Any implementation must be a fresh visible Nado Builder slice and must preserve complete account-product safety while binding zero-order queries to the authoritative market set.
+- In a fresh visible Nado Builder worktree, preserve product 11 (`NLP_USDT0`) in catalog/account/balance/health safety coverage but exclude it only from regular `subaccount_orders` orderbook queries, alongside collateral product 0. Bind this narrowly to the fixed testnet contract and add distinct regression/adverse evidence; do not generalize from ticker guesses or relax any other product coverage.
+- After accepted implementation, perform one fresh Level B run. Do not dispatch a write unless it reaches full readiness; then the already-authorized minimum-notional Level C lifecycle may proceed sequentially under the existing Nado contract.
 
-## Extended — wait for account-stream access resolution
+## Extended — reproduce account-stream access with the exact official SDK
 
-Status: `BLOCKED ON EXTERNAL ACCESS / USER AUTHORITY`.
+Status: `AUTHORIZED FINAL AUTHENTICATED DIAGNOSTIC`.
 
-- The official-SDK-conformant authenticated account-stream handshake still returns HTTP 403 while the same API key succeeds on authenticated REST. Do not repeat the gate or change code speculatively. Resolution now requires provider-side stream access normalization or separately authorized API-key reprovisioning/rotation through Extended API Management.
-- After that external change, perform one fresh Level B run with another durable runtime ID. Do not send application frames beyond the accepted passive protocol/barrier behavior, sign, mutate account state, or dispatch any write.
+- In one isolated temporary Python environment, use the published official Extended Python SDK 2.5.0 and its exact testnet `StreamClient` account subscription with the existing protected REST-valid API key. Retain only package version, fixed host/path, sanitized HTTP/error class, and whether the upgrade/first passive frame succeeded; do not print the key or account data, rotate/reprovision credentials, sign, mutate account state, or write.
+- If the official SDK also receives HTTP 403, stop retries and report provider-side key/account-stream entitlement, environment/key generation, or ingress policy as the remaining causes for the user to check in Extended API Management/support. If it succeeds, open a fresh visible Extended Builder only for the concrete local transport difference, then rerun Level B.
 
 ## Completion
 
