@@ -10,12 +10,12 @@ Status: `WAITING FOR EXTERNAL MARKET STATE`.
 - The latest public BTC/USDC book was not crossed but had an approximately 18.83% spread against the accepted 0.30% safety bound. Wait for a later external market-state change; do not weaken the bound or repeat the authenticated gate while this blocker persists.
 - After a credential-free book observation passes the existing bound, perform one fresh Level B run with another durable runtime ID. Do not dispatch an order, cancel, close, account mutation, or any other write.
 
-## Nado — classify current `subaccount_info` safety predicate
+## Nado — correct live catalog and sparse contribution checks
 
-Status: `AUTHORIZED CREDENTIAL-FREE DIAGNOSTIC GATE`.
+Status: `AUTHORIZED FIXTURE CORRECTION`.
 
-- The latest Level B runtime row is terminal and must not be replayed. Make one separate credential-free diagnostic using current complete public `all_products` and `subaccount_info` observations, and retain only the sanitized failing validation predicate plus bounded aggregate catalog/balance/health coverage needed to distinguish product drift from actual account risk. Never retain a raw body or account identity.
-- Allow one retry only for a qualifying transport failure before a valid observation. Do not load credentials, derive/sign, dispatch a private trigger request, mutate account state, or write. Open code only for a concrete observed contract defect.
+- From exact published `main`, make the smallest Nado-local change that preserves strict validation of each complete embedded product snapshot and cross-response product identity/kind/coverage/config safety while tolerating documented live state/book/oracle changes between sequential `all_products` and `subaccount_info` responses. Also validate `health_contributions` by official sparse product-ID indexing rather than contiguous product count, including explicit treatment of unused index slots. Do not weaken duplicate, collateral, balance, health, signing, counter, or no-rearm checks.
+- Add focused regressions for permitted volatile drift and sparse contribution indexing, plus forbidden identity/kind/config/coverage/unused-slot contradictions. Do not load credentials, derive/sign, dispatch a private trigger request, mutate account state, or write during development. A later Level B run requires another fresh durable runtime ID after independent acceptance.
 
 ## Extended — wait for account-stream access resolution
 
