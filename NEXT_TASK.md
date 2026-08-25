@@ -2,12 +2,12 @@
 
 One slice per venue. Apply the A/B/C levels and safety core from `AGENTS.md`; operational run IDs are data, not source milestones.
 
-## RISEx — minimal Level C operational binding
+## RISEx — fresh authoritative pre-write barrier
 
-Status: `READY FOR LEVEL C BINDING START GATE`.
+Status: `READY FOR LEVEL B RUNTIME-RUN-ID START GATE`.
 
-- Add only the isolated credential/signing/official-live-transport binding needed to run the accepted lifecycle with runtime run identity; do not change lifecycle semantics, shared code, strategy, paper behavior, or authorize a write from candidate acceptance alone.
-- Candidate acceptance requires official contract evidence, focused Level C regressions, and one final full suite. A later separate Chief operational gate controls the single minimum-size testnet write lifecycle.
+- Make only the smallest RISEx-local correction that replaces the consumed source-bound private-read invocation/store identity with fresh runtime run identities in one protected durable journal. Preserve the accepted read sequence, counters, parsers, credential confinement, lifecycle-clear barrier, and every write-intent identity; do not touch the accepted Level C binding or lifecycle semantics.
+- Candidate work is fixture-only with no credential load, signature, network/private request, nonce consumption, or write. After acceptance, a separate Level B gate must freshly verify official config/domain/router/authorization, active signer, zero orders, and exact flatness before any later Level C write gate.
 
 ## Nado — classify Level B public failure
 
