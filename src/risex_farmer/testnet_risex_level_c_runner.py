@@ -207,7 +207,8 @@ class _ProductionReadCapability:
             raise LifecycleSafetyError("RISEx Level C minimum rejected")
         return market, bbo
 
-    async def _full_public_prestate(self) -> None:
+    async def _full_public_prestate(self) -> int:
+        last_sweep_observed: list[float] = []
         for _ in range(2):
             responses: dict[str, Any] = {}
             observed: list[float] = []
@@ -221,6 +222,8 @@ class _ProductionReadCapability:
             now = self._clock()
             if any(not 0 <= now - item <= 5 for item in observed):
                 raise LifecycleSafetyError("RISEx Level C public prestate stale")
+            last_sweep_observed = observed
+        return int(min(last_sweep_observed))
 
     def _allow_recovered_lifecycle(self) -> None:
         self._prestate_verified = True
@@ -436,14 +439,18 @@ class _ProductionReadCapability:
 
     async def _pump_until(
         self, condition: Callable[[], bool], *, expected_client: int | None = None,
-    ) -> None:
+        allow_absence: bool = False,
+    ) -> bool:
         await self._ensure_subscribed()
         for _ in range(8):
             if condition():
-                return
+                return True
             await self._demux_once(expected_client)
-        if not condition():
-            raise LifecycleSafetyError("RISEx Level C stream observation unavailable")
+        if condition():
+            return True
+        if allow_absence:
+            return False
+        raise LifecycleSafetyError("RISEx Level C stream observation unavailable")
 
     async def _account(self) -> AccountState:
         await self._pump_until(
@@ -518,10 +525,40 @@ class _ProductionReadCapability:
         position_sequence = self._position[3] if self._position is not None else 0
         row = self._updates.pop(intent.client_order_id, None)
         if row is None:
-            await self._pump_until(
+            observed = await self._pump_until(
                 lambda: intent.client_order_id in self._updates,
-                expected_client=intent.client_order_id,
+                expected_client=intent.client_order_id, allow_absence=True,
             )
+            if not observed:
+                exact_no_identity_open = (
+                    intent.kind == "OPEN" and intent.order_type == "MARKET"
+                    and intent.time_in_force == "FOK"
+                    and not intent.reduce_only and not intent.post_only
+                    and intent.order_id is None and intent.dispatch_count == 1
+                    and intent.state in {"DISPATCHING", "DISPATCHED", "AMBIGUOUS"}
+                )
+                if not exact_no_identity_open:
+                    raise LifecycleSafetyError(
+                        "RISEx Level C stream observation unavailable"
+                    )
+                wait_seconds = intent.expires_at + 1 - self._clock()
+                if wait_seconds > 61:
+                    raise LifecycleSafetyError(
+                        "RISEx Level C intent expiry unavailable"
+                    )
+                if wait_seconds > 0:
+                    await asyncio.sleep(wait_seconds)
+                if self._clock() <= intent.expires_at:
+                    raise LifecycleSafetyError(
+                        "RISEx Level C intent not expired"
+                    )
+                observed_at = await self._full_public_prestate()
+                return Evidence(
+                    account=ACCOUNT, signer=SIGNER, signer_status="ACTIVE",
+                    terminal=True, filled_size=Decimal("0"),
+                    position=Decimal("0"), observed_at=observed_at,
+                    position_market_id=1,
+                )
             row = self._updates.pop(intent.client_order_id, None)
         if row is None:
             raise LifecycleSafetyError("RISEx Level C order outcome unavailable")
