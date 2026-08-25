@@ -2,26 +2,26 @@
 
 One slice per venue. Apply the A/B/C levels and safety core from `AGENTS.md`; operational run IDs are data, not source milestones.
 
-## RISEx — recover local lifecycle database
+## RISEx — resume authenticated read-only readiness
 
-Status: `AUTHORIZED LOCAL RECOVERY GATE`.
+Status: `READY FOR FRESH LEVEL B GATE`.
 
-- Inspect the noncanonical lifecycle database read-only, identify the exact canonicality failure, and preserve the consumed runtime row as immutable evidence. Before any mutation, create and verify a protected recoverable backup; then perform only the smallest venue-local repair, migration, or replacement needed for a fresh canonical runtime database.
-- This gate performs no network request, credential access, signing, private read, or write. Prove the recovered database passes `LifecycleClearBinding` and that the historical failed database and runtime row remain recoverable. A fresh Level B observation is a later separate gate.
+- The local lifecycle database is recovered and repeatedly passes `LifecycleClearBinding`; its exact protected pre-recovery backup and the immutable consumed runtime row remain preserved.
+- Perform one fresh authenticated read-only observation with the accepted runtime-run-ID, counter, identity, redaction, and bounded-transport contracts. Allow only the initial attempt plus one retry after a qualifying transport failure before a valid observation. Do not dispatch an order, cancel, close, account mutation, or any other write.
 
-## Nado — identify public safety predicate
+## Nado — accept sparse official product IDs
 
-Status: `AUTHORIZED CREDENTIAL-FREE DIAGNOSTIC GATE`.
+Status: `READY FOR LEVEL A FIXTURE CORRECTION`.
 
-- Make one new bounded credential-free `all_products` diagnostic that records only the sanitized failing predicate/phase and required aggregate semantic evidence, never a raw body. Allow the initial attempt plus one retry only for a transport failure before a valid observation; any HTTP, schema, identity, or safety result is terminal.
-- Do not load credentials, sign, dispatch a private request, mutate account state, or write. If the public contract passes, a later authenticated Level B gate may proceed under the standing read-only authority; add code/tests only for a concrete observed contract defect.
+- Make the smallest Nado-local fixture candidate that accepts unique non-negative product IDs as the authoritative set returned by official `all_products`, without requiring `set(range(len(products)))`. Preserve strict product schemas, unique IDs, product 0 collateral identity, exact account/product coverage, request ordering, failure classes, signing, counters, no-rearm, and every runtime/write identity.
+- Prove the observed sparse-ID shape is accepted while duplicate, negative, malformed, missing-collateral, and cross-response product mismatches still fail closed. Candidate work performs no network, credential load, signing, private dispatch, account mutation, or write. After acceptance, perform a fresh Level B read-only gate.
 
-## Extended — diagnose official stream availability
+## Extended — bind current official testnet stream
 
-Status: `AUTHORIZED CREDENTIAL-FREE AVAILABILITY DIAGNOSTIC`.
+Status: `READY FOR LEVEL A FIXTURE CORRECTION`.
 
-- Make one fresh credential-free DNS/TLS/WebSocket availability diagnostic against the exact official testnet account-stream endpoint. Allow the initial attempt plus one retry only after a transport failure before a valid HTTP observation; HTTP 503 or another complete HTTP/semantic result is terminal. Preserve only sanitized DNS/TLS/HTTP class and bounded endpoint identity, never credentials or response bodies.
-- If the endpoint is available, first make the smallest Extended-local runtime-run-ID decoupling candidate if the accepted runner remains source-bound, then perform a fresh authenticated read under the standing Level B authority. Add code/tests only for an observed contract defect.
+- Make one Extended-local fixture candidate that replaces the obsolete testnet stream host with the current official SDK testnet `stream_url` while preserving the exact `/account` path, direct TLS, `X-Api-Key` header-only authentication, no redirects/fallbacks, response semantics, and normal-startup isolation. Update only affected Extended fixtures/tests/source evidence.
+- In the same bounded readiness candidate, replace the source-bound private-read invocation/store milestone with a fresh durable runtime run ID without changing account identity or any write identity. Candidate work performs no network, credential load, authenticated dispatch, signing, account mutation, or write. After acceptance, perform a fresh Level B read-only gate.
 
 ## Completion
 
