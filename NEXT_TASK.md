@@ -10,12 +10,12 @@ Status: `WAITING FOR EXTERNAL MARKET STATE`.
 - The latest public BTC/USDC book was not crossed but had an approximately 18.83% spread against the accepted 0.30% safety bound. Wait for a later external market-state change; do not weaken the bound or repeat the authenticated gate while this blocker persists.
 - After a credential-free book observation passes the existing bound, perform one fresh Level B run with another durable runtime ID. Do not dispatch an order, cancel, close, account mutation, or any other write.
 
-## Nado — identify live field in full public sequence
+## Nado — remove live risk price from stable hash
 
-Status: `AUTHORIZED CREDENTIAL-FREE DIAGNOSTIC GATE`.
+Status: `AUTHORIZED FIXTURE CORRECTION`.
 
-- Reproduce the exact credential-free public prefix through `linked_signer` and `subaccount_info` once. Retain only the sanitized first predicate and bounded product section/field names whose values differ between the complete catalog snapshots; never retain values, bodies, or account identity. Treat the complete observation as terminal.
-- Do not load credentials, derive/sign, dispatch a private trigger request, mutate account state, or write. Open a fresh visible Nado Builder only if this proves another concrete local contract defect.
+- From exact published `main`, make the smallest Nado-local change that continues to require and strictly validate a positive canonical `risk.price_x18` in every product snapshot but excludes that observed live price from cross-snapshot stable comparison. Preserve stable risk weights, spot config, identity, kind, coverage, sparse contributions, and every account-risk gate.
+- Add focused regressions accepting only cross-snapshot `risk.price_x18` drift while rejecting malformed/nonpositive per-snapshot prices and stable risk-weight/config contradictions. Do not load credentials, derive/sign, dispatch private operations, mutate account state, or write during development. A later Level B run requires a fresh runtime ID after independent acceptance.
 
 ## Extended — wait for account-stream access resolution
 
