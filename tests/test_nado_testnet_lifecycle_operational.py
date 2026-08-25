@@ -7,6 +7,7 @@ import importlib
 import inspect
 import json
 from pathlib import Path
+import sqlite3
 import zlib
 
 import pytest
@@ -22,6 +23,7 @@ from risex_farmer.nado_testnet_lifecycle_operational import (
     RUN_STORE_BASENAME, SealedLifecycleRunner, TARGET_PRODUCT_ID,
     _fixture_run, run,
 )
+from risex_farmer.nado_private_read_preflight import MAX_FRESHNESS_MS
 
 
 X18 = 10**18
@@ -162,6 +164,70 @@ def test_operational_parser_reuses_accepted_aggregate_account_contract() -> None
     regular, orders = io._orders(fixture["wire"]["orders"]["data"], products)
     assert set(regular) == set(products)
     assert not any(regular.values()) and orders == []
+
+
+def test_trigger_read_reuses_fresh_server_time_envelope(monkeypatch) -> None:
+    module = importlib.import_module("risex_farmer.nado_testnet_lifecycle_operational")
+    now_ms = 1_700_000_000_500
+    server_ms = now_ms - 200
+    old_recv = now_ms + module.RECV_WINDOW_MS
+    requests = []
+
+    class TriggerCapability:
+        def sign_list_trigger_orders(self, typed):
+            return "0x" + "11" * 65
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(module, "_load_owner_capability", lambda _sender: TriggerCapability())
+    monkeypatch.setattr(module, "_recover_owner", lambda _typed, _signature: OWNER)
+    io = OperationalVenueIO(OWNER, SENDER)
+    io.now_ms = lambda: now_ms
+
+    def trigger_response(recv: int):
+        if recv == old_recv:
+            return {
+                "status": "failure", "request_type": "query_list_trigger_orders",
+                "error_code": 1000, "error": "expired",
+            }
+        assert recv == server_ms + MAX_FRESHNESS_MS
+        return {
+            "status": "success", "request_type": "query_list_trigger_orders",
+            "data": {"orders": []},
+        }
+
+    assert trigger_response(old_recv) == {
+        "status": "failure", "request_type": "query_list_trigger_orders",
+        "error_code": 1000, "error": "expired",
+    }
+
+    def post(host, path, body):
+        requests.append((host, path, body))
+        if path == "/v1/edge/query":
+            return {
+                "status": "success", "method": "time", "id": None,
+                "server_time": str(server_ms),
+            }
+        return trigger_response(int(body["tx"]["recvTime"]))
+
+    io._post = post
+    assert io._triggers() == ()
+    assert requests == [
+        ("gateway.test.nado.xyz", "/v1/edge/query", {"type": "time"}),
+        (
+            "trigger.test.nado.xyz", "/v1/query",
+            {
+                "type": "list_trigger_orders",
+                "tx": {
+                    "sender": SENDER,
+                    "recvTime": str(server_ms + MAX_FRESHNESS_MS),
+                },
+                "signature": "0x" + "11" * 65,
+                "limit": 500,
+            },
+        ),
+    ]
 
 
 def test_place_write_binding_emits_exact_full_official_payload() -> None:
@@ -399,6 +465,46 @@ def test_restart_with_existing_or_ambiguous_intent_never_dispatches(tmp_path: Pa
             owner=OWNER, sender=SENDER,
         )
     assert len(io.dispatch_states) == writes
+
+
+def test_prewrite_blocked_runtime_row_allows_fresh_retry_without_erasing_history(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "nado.sqlite"
+    blocked = FixtureIO("RESTING")
+    blocked.observe = lambda _digests: (_ for _ in ()).throw(
+        OperationalSafetyError("synthetic pre-write block")
+    )
+    with pytest.raises(OperationalSafetyError, match="pre-write"):
+        _fixture_run(
+            path=path, io=blocked, capability_loader=capability,
+            owner=OWNER, sender=SENDER,
+        )
+
+    connection = sqlite3.connect(path)
+    try:
+        first_rows = connection.execute(
+            "SELECT run_id, state FROM nado_runtime_runs ORDER BY rowid"
+        ).fetchall()
+        assert len(first_rows) == 1 and first_rows[0][1] == "STARTED"
+        assert connection.execute("SELECT COUNT(*) FROM nado_intents").fetchone() == (0,)
+    finally:
+        connection.close()
+
+    report, store = run_fixture(tmp_path, FixtureIO("RESTING"))
+    store.close()
+    assert report.status == COMPLETE
+    connection = sqlite3.connect(path)
+    try:
+        rows = connection.execute(
+            "SELECT run_id, state FROM nado_runtime_runs ORDER BY rowid"
+        ).fetchall()
+        assert len(rows) == 2
+        assert rows[0] == first_rows[0]
+        assert rows[0][0] != rows[1][0]
+        assert [state for _, state in rows] == ["STARTED", "STARTED"]
+    finally:
+        connection.close()
 
 
 def test_close_residual_stops_after_three_durable_attempts(tmp_path: Path) -> None:
