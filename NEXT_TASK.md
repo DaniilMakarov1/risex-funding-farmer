@@ -2,13 +2,13 @@
 
 One slice per venue. Apply the A/B/C levels and safety core from `AGENTS.md`; operational run IDs are data, not source milestones.
 
-## RISEx — remove the testnet-only maximum-spread rejection
+## RISEx — bind the accepted lifecycle into one sealed Level C runner
 
-Status: `AUTHORIZED FIXTURE CORRECTION`.
+Status: `AUTHORIZED OPERATIONAL IMPLEMENTATION`.
 
-- The local lifecycle database is recovered and repeatedly passes `LifecycleClearBinding`; its exact protected pre-recovery backup and the immutable consumed runtime row remain preserved.
-- In a fresh visible RISEx Builder worktree, remove only the maximum-spread rejection from the isolated RISEx testnet public/private-read and lifecycle path. Preserve fresh authoritative BBO, bid below ask, positive exact tick alignment, exact quantity/depth, price bounds, notional, durable identities, no-replay, reconciliation, and terminal zero-order/exact-flat checks; do not change paper or mainnet behavior.
-- After accepted implementation and one fresh Level B run, proceed sequentially to the already-defined minimum-notional Level C lifecycle if and only if Level B is ready and pre-state remains safe.
+- The corrected fresh Level B is accepted and ready. In a fresh visible RISEx Builder worktree, add the smallest sealed opt-in operational runner that composes the already-accepted fixed account/environment, authoritative fresh market/account reads, recovered lifecycle store, `OperationalBinding`, and lifecycle reconciliation into the exact first-lifecycle contract. It must persist the runtime run ID and every unique intent before dispatch, never replay an ambiguous write, stop on unrelated/contradictory state, and end only on authoritative zero relevant orders plus exact flatness.
+- Preserve the accepted minimum-size price-bounded `MARKET+FOK` opening and fresh-position reduce-only close sequence/fallback/attempt ceiling. Do not create a general framework, CLI mode in normal startup, paper/mainnet behavior, strategy, or cross-venue abstraction. Tests use injected transports only; the Builder must not load real credentials or execute a network/write gate.
+- After acceptance, Chief runs the runner once sequentially under the already-authorized `<= USD 500` Level C gate. Unexpected behavior halts for manual testnet recovery and is failure, never acceptance.
 
 ## Nado — exclude the special NLP vault token from orderbook queries
 
