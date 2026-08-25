@@ -10,12 +10,12 @@ Status: `WAITING FOR EXTERNAL MARKET STATE`.
 - The latest public BTC/USDC book was not crossed but had an approximately 18.83% spread against the accepted 0.30% safety bound. Wait for a later external market-state change; do not weaken the bound or repeat the authenticated gate while this blocker persists.
 - After a credential-free book observation passes the existing bound, perform one fresh Level B run with another durable runtime ID. Do not dispatch an order, cancel, close, account mutation, or any other write.
 
-## Nado — fresh Level B after account-shape corrections
+## Nado — classify next account safety predicate
 
-Status: `AUTHORIZED LEVEL B READ-ONLY GATE`.
+Status: `AUTHORIZED CREDENTIAL-FREE DIAGNOSTIC GATE`.
 
-- On exact published `main`, perform one fresh operational Level B run with a new durable runtime ID. Public checks must complete before any credential load; preserve the initial-attempt-plus-one-transport-retry rule and sanitized failure classes.
-- Do not mutate account state or dispatch any order, cancel, close, deposit, withdrawal, or other write. A complete schema/auth/identity/safety result is terminal and must not be replayed.
+- The latest runtime row is terminal and must not be replayed. Make one separate credential-free observation of complete current `all_products` and `subaccount_info`, run the accepted validators, and retain only the sanitized first failing predicate plus bounded booleans/counts needed to distinguish remaining contract drift from actual collateral/position/health risk. Never retain a raw body or account identity.
+- Allow one retry only for a qualifying transport failure before a valid observation. Do not load credentials, derive/sign, dispatch a private trigger request, mutate account state, or write. Open code only for a concrete observed contract defect.
 
 ## Extended — wait for account-stream access resolution
 
