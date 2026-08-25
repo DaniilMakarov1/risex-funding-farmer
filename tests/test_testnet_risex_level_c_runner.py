@@ -461,6 +461,134 @@ def test_production_stream_is_bounded_and_rejects_foreign_updates():
     assert foreign.orders_subscriptions == foreign.positions_subscriptions == 1
 
 
+def test_production_no_event_no_identity_waits_for_expiry_then_proves_zero_flat(
+    monkeypatch,
+):
+    class Resource:
+        def close(self):
+            return None
+
+    class Transport:
+        def __init__(self):
+            self.frames = [position_frame() for _ in range(8)]
+            self.receives = 0
+
+        async def _receive(self):
+            self.receives += 1
+            return self.frames.pop(0)
+
+        async def close(self):
+            return None
+
+    current = [NOW]
+    sleeps = []
+
+    async def advance(seconds):
+        sleeps.append(seconds)
+        current[0] += seconds
+
+    transport = Transport()
+    capability = operational._ProductionReadCapability(
+        Resource(), Resource(), transport, lambda: current[0],
+    )
+    capability._subscribed = True
+    capability._orders = ()
+    capability._position = (Decimal("0"), False, NOW * 1_000_000_000, 1)
+    capability._stream_sequence = 1
+    barriers = []
+
+    async def repeated_zero_flat_barrier():
+        barriers.append(current[0])
+        return int(current[0])
+
+    capability._full_public_prestate = repeated_zero_flat_barrier
+    monkeypatch.setattr(operational.asyncio, "sleep", advance)
+    intent = replace(
+        opening_intent(lifecycle_state="AMBIGUOUS"),
+        order_id=None, expires_at=NOW + 60,
+    )
+    evidence = asyncio.run(capability.evidence(intent))
+    assert transport.receives == 8
+    assert sleeps == [61] and current[0] == NOW + 61
+    assert barriers == [NOW + 61]
+    assert evidence == Evidence(
+        account=ACCOUNT, signer=SIGNER, signer_status="ACTIVE",
+        terminal=True, filled_size=Decimal("0"), position=Decimal("0"),
+        observed_at=NOW + 61, position_market_id=1,
+    )
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"kind": "CLOSE", "reduce_only": True},
+        {"order_id": ORDER_IDS[0]},
+        {"order_type": "LIMIT", "time_in_force": "IOC"},
+    ],
+)
+def test_production_no_event_fallback_rejects_non_observed_vectors(change):
+    class Resource:
+        def close(self):
+            return None
+
+    class Transport:
+        def __init__(self):
+            self.frames = [position_frame() for _ in range(8)]
+
+        async def _receive(self):
+            return self.frames.pop(0)
+
+        async def close(self):
+            return None
+
+    capability = operational._ProductionReadCapability(
+        Resource(), Resource(), Transport(), lambda: NOW,
+    )
+    capability._subscribed = True
+    capability._orders = ()
+    capability._position = (Decimal("0"), False, NOW * 1_000_000_000, 1)
+    capability._stream_sequence = 1
+    values = {"order_id": None, "expires_at": NOW + 60, **change}
+    intent = replace(opening_intent(lifecycle_state="AMBIGUOUS"), **values)
+    with pytest.raises(operational.LifecycleSafetyError, match="unavailable"):
+        asyncio.run(capability.evidence(intent))
+
+
+def test_production_no_event_fallback_rejects_zero_flat_barrier_contradiction():
+    class Resource:
+        def close(self):
+            return None
+
+    class Transport:
+        def __init__(self):
+            self.frames = [position_frame() for _ in range(8)]
+
+        async def _receive(self):
+            return self.frames.pop(0)
+
+        async def close(self):
+            return None
+
+    capability = operational._ProductionReadCapability(
+        Resource(), Resource(), Transport(), lambda: NOW,
+    )
+    capability._subscribed = True
+    capability._orders = ()
+    capability._position = (Decimal("0"), False, NOW * 1_000_000_000, 1)
+    capability._stream_sequence = 1
+
+    async def contradiction():
+        raise operational.LifecycleSafetyError("RISEx Level C public prestate stale")
+
+    capability._full_public_prestate = contradiction
+    intent = replace(
+        opening_intent(lifecycle_state="AMBIGUOUS"),
+        order_id=None, expires_at=NOW - 1,
+    )
+    with pytest.raises(operational.LifecycleSafetyError, match="prestate stale"):
+        asyncio.run(capability.evidence(intent))
+
+
 def test_production_prestate_requires_two_complete_fresh_zero_flat_sweeps():
     class Resource:
         def close(self):
