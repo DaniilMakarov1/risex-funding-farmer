@@ -26,7 +26,6 @@ from risex_farmer.extended_private_read_preflight import (
     PreflightStore,
 )
 from risex_farmer.extended_private_read_operational import (
-    INVOCATION_ID,
     _OperationalStore,
     _PasswdHomeCredentialSource,
     _DirectStream,
@@ -683,17 +682,13 @@ def test_store_rejects_schema_corruption(tmp_path):
         _OperationalStore(path)
 
 
-def test_fixed_production_binding_and_normal_startup_isolation():
-    assert INVOCATION_ID == "extended-private-read-20260824-new-op-004"
+def test_runtime_production_binding_and_normal_startup_isolation():
     assert operational.STORE_BASENAME == (
-        ".risex-funding-farmer-extended-private-read-20260824-new-op-004.sqlite3"
-    )
-    assert operational._CONFIG_HASH == (
-        "10249ca9f0bc30da7439ddd11c1caede447e422420de08bf9f7bddc7dd3e6fe5"
+        ".risex-funding-farmer-extended-private-read-runs-v1.sqlite3"
     )
     assert list(inspect.signature(_PasswdHomeCredentialSource).parameters) == []
     module = importlib.import_module("risex_farmer.extended_private_read_operational")
-    assert module.__all__ == ["INVOCATION_ID", "main"]
+    assert module.__all__ == ["main"]
     assert list(inspect.signature(module._production_run).parameters) == []
     source = Path(module.__file__).read_text()
     assert REST_BASE_URL == "https://api.starknet.sepolia.extended.exchange/api/v1"
@@ -712,3 +707,44 @@ def test_fixed_production_binding_and_normal_startup_isolation():
         env={**os.environ, "PYTHONPATH": str(Path(__file__).parents[1] / "src")},
     )
     assert completed.returncode == 0, completed.stderr
+
+
+def test_runtime_run_id_allocator_is_fresh_and_source_milestone_free():
+    run_ids = {operational._new_runtime_run_id() for _ in range(32)}
+    assert len(run_ids) == 32
+    assert all(run_id.startswith("extended-read-") for run_id in run_ids)
+    source = Path(operational.__file__).read_text()
+    assert not hasattr(operational, "INVOCATION_ID")
+    for consumed in ("new-op-004", "20260824"):
+        assert consumed not in operational.STORE_BASENAME
+        assert consumed not in source
+
+
+@pytest.mark.asyncio
+async def test_fresh_runtime_rows_are_durable_and_historical_row_is_immutable(tmp_path):
+    path = tmp_path / "runtime-runs.sqlite3"
+    first = await _run_fixture_operational_private_read(
+        store=_OperationalStore(path, "extended-read-a"),
+        credential_source=_Source(), transport=_Transport(), clock_ms=_Clock(),
+    )
+    with sqlite3.connect(path) as connection:
+        historical = connection.execute(
+            "SELECT * FROM extended_private_read_operation WHERE invocation_id=?",
+            ("extended-read-a",),
+        ).fetchone()
+    second = await _run_fixture_operational_private_read(
+        store=_OperationalStore(path, "extended-read-b"),
+        credential_source=_Source(), transport=_Transport(), clock_ms=_Clock(),
+    )
+    with sqlite3.connect(path) as connection:
+        rows = connection.execute(
+            "SELECT invocation_id FROM extended_private_read_operation ORDER BY rowid"
+        ).fetchall()
+        preserved = connection.execute(
+            "SELECT * FROM extended_private_read_operation WHERE invocation_id=?",
+            ("extended-read-a",),
+        ).fetchone()
+    assert first.invocation_id == "extended-read-a"
+    assert second.invocation_id == "extended-read-b"
+    assert rows == [("extended-read-a",), ("extended-read-b",)]
+    assert preserved == historical

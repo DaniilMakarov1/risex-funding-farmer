@@ -186,6 +186,9 @@ def cancelled_evidence(wire, *, now_ms=1_770_000_003_000):
 def test_full_sepolia_domain_and_pinned_official_provenance_are_exact(wire):
     assert SDK_PROVENANCE == wire["provenance"]
     assert TESTNET_CONTRACT == wire["contract"]
+    assert TESTNET_CONTRACT["streamUrl"] == (
+        "wss://starknet.sepolia.extended.exchange/stream.extended.exchange/v1"
+    )
     assert TESTNET_CONTRACT["starknetDomain"] == {
         "name": "Perpetuals",
         "version": "v0",
@@ -199,6 +202,10 @@ def test_full_sepolia_domain_and_pinned_official_provenance_are_exact(wire):
     [
         (("provenance", "commit"), "0" * 40),
         (("contract", "apiBaseUrl"), "https://api.starknet.extended.exchange/api/v1"),
+        (("contract", "streamUrl"), (
+            "wss://api.starknet.sepolia.extended.exchange/"
+            "stream.extended.exchange/v1"
+        )),
         (("contract", "signingDomain"), "extended.exchange"),
         (("contract", "starknetDomain", "name"), "Extended"),
         (("contract", "starknetDomain", "version"), "1"),

@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import pwd
+import secrets
 import sqlite3
 import stat
 import sys
@@ -31,11 +32,10 @@ from .extended_private_read_preflight import (
 )
 
 
-INVOCATION_ID = "extended-private-read-20260824-new-op-004"
-STORE_BASENAME = ".risex-funding-farmer-extended-private-read-20260824-new-op-004.sqlite3"
+STORE_BASENAME = ".risex-funding-farmer-extended-private-read-runs-v1.sqlite3"
 API_KEY_BASENAME = ".risex-funding-farmer-extended-api-key-v1"
 IDENTITY_BASENAME = ".risex-funding-farmer-extended-identity-v1.json"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _TIMEOUT_SECONDS = 10
 _MAX_JSON_BYTES = 1_048_576
 _IDENTITY_KEYS = {"id", "accountIndex", "l2Key", "l2Vault"}
@@ -47,19 +47,28 @@ _EFFECTS = (
     "barrier_request", "barrier_validation", "stream_close",
     "terminal_persistence",
 )
-_CONFIG_HASH = hashlib.sha256(
-    json.dumps(
-        {
-            "invocation": INVOCATION_ID,
-            "rest_base": REST_BASE_URL,
-            "rest_paths": ["/user/account/info", "/user/orders", "/user/positions"],
-            "stream": STREAM_URL,
-            "timeout_seconds": _TIMEOUT_SECONDS,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode()
-).hexdigest()
+
+
+def _new_runtime_run_id() -> str:
+    return "extended-read-" + secrets.token_hex(16)
+
+
+def _config_hash(invocation_id: str) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            {
+                "invocation": invocation_id,
+                "rest_base": REST_BASE_URL,
+                "rest_paths": [
+                    "/user/account/info", "/user/orders", "/user/positions",
+                ],
+                "stream": STREAM_URL,
+                "timeout_seconds": _TIMEOUT_SECONDS,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
 
 
 def _empty_counters() -> dict[str, int]:
@@ -99,8 +108,8 @@ class OperationalResult:
     stream_frames: int
     clock_calls: int
     identity_verified: bool
-    invocation_id: str = INVOCATION_ID
-    config_hash: str = _CONFIG_HASH
+    invocation_id: str
+    config_hash: str
 
     def evidence(self) -> str:
         return json.dumps(
@@ -121,7 +130,9 @@ class OperationalResult:
         )
 
 
-def _decode_result(raw: Any) -> OperationalResult:
+def _decode_result(
+    raw: Any, *, invocation_id: str, config_hash: str,
+) -> OperationalResult:
     try:
         value = json.loads(raw)
     except (TypeError, json.JSONDecodeError) as exc:
@@ -135,8 +146,8 @@ def _decode_result(raw: Any) -> OperationalResult:
         raise PreflightViolation("DURABLE_EVIDENCE_INVALID")
     counters = _decode_counters(json.dumps(value["counters"]))
     if (
-        value["invocation_id"] != INVOCATION_ID
-        or value["config_hash"] != _CONFIG_HASH
+        value["invocation_id"] != invocation_id
+        or value["config_hash"] != config_hash
         or value["status"] not in {"READY", "BLOCKED", "UNKNOWN"}
         or type(value["reason"]) is not str or not value["reason"]
         or type(value["phase"]) is not str or not value["phase"]
@@ -162,6 +173,7 @@ def _decode_result(raw: Any) -> OperationalResult:
         counters=counters, rest_calls=value["rest_calls"],
         stream_frames=value["stream_frames"], clock_calls=value["clock_calls"],
         identity_verified=value["identity_verified"],
+        invocation_id=invocation_id, config_hash=config_hash,
     )
 
 
@@ -194,8 +206,12 @@ def _validate_private_path(path: Path, *, may_create: bool) -> None:
 class _OperationalStore:
     """Versioned FULL-synchronous, never-resumable effect ledger."""
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, invocation_id: str = "extended-read-fixture"):
         self.path = Path(path)
+        if type(invocation_id) is not str or not invocation_id:
+            raise PreflightViolation("DURABLE_IDENTITY_INVALID")
+        self.invocation_id = invocation_id
+        self.config_hash = _config_hash(invocation_id)
         _validate_private_path(self.path, may_create=True)
         if not self.path.exists():
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -209,9 +225,8 @@ class _OperationalStore:
                 connection.execute(
                     """
                     CREATE TABLE IF NOT EXISTS extended_private_read_operation (
-                        singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                        invocation_id TEXT PRIMARY KEY,
                         schema_version INTEGER NOT NULL,
-                        invocation_id TEXT NOT NULL,
                         config_hash TEXT NOT NULL,
                         state TEXT NOT NULL,
                         phase TEXT NOT NULL,
@@ -226,7 +241,7 @@ class _OperationalStore:
                     )
                 )
                 if columns != (
-                    "singleton", "schema_version", "invocation_id", "config_hash",
+                    "invocation_id", "schema_version", "config_hash",
                     "state", "phase", "counters", "evidence",
                 ):
                     raise PreflightViolation("DURABLE_SCHEMA_INVALID")
@@ -259,14 +274,15 @@ class _OperationalStore:
                 """
                 SELECT schema_version, invocation_id, config_hash, state, phase,
                        counters, evidence
-                FROM extended_private_read_operation WHERE singleton=1
-                """
+                FROM extended_private_read_operation WHERE invocation_id=?
+                """,
+                (self.invocation_id,),
             ).fetchone()
             if row is None:
                 connection.execute(
-                    "INSERT INTO extended_private_read_operation VALUES (1,?,?,?,?,?,?,NULL)",
+                    "INSERT INTO extended_private_read_operation VALUES (?,?,?,?,?,?,NULL)",
                     (
-                        SCHEMA_VERSION, INVOCATION_ID, _CONFIG_HASH, "RUNNING",
+                        self.invocation_id, SCHEMA_VERSION, self.config_hash, "RUNNING",
                         "STARTED", json.dumps(_empty_counters(), sort_keys=True),
                     ),
                 )
@@ -274,17 +290,21 @@ class _OperationalStore:
         schema, invocation, config, state, phase, raw_counters, evidence = row
         if schema != SCHEMA_VERSION:
             raise PreflightViolation("DURABLE_SCHEMA_INVALID")
-        if invocation != INVOCATION_ID or config != _CONFIG_HASH:
+        if invocation != self.invocation_id or config != self.config_hash:
             raise PreflightViolation("DURABLE_IDENTITY_MISMATCH")
         counters = _decode_counters(raw_counters)
         if state == "TERMINAL" and type(evidence) is str:
-            result = _decode_result(evidence)
+            result = _decode_result(
+                evidence, invocation_id=self.invocation_id,
+                config_hash=self.config_hash,
+            )
             if dict(result.counters) != counters or result.phase != phase:
                 raise PreflightViolation("DURABLE_EVIDENCE_INVALID")
             return result
         if state == "RUNNING" and evidence is None:
             return OperationalResult(
                 "UNKNOWN", "INTERRUPTED_RUNNING", phase, counters, 0, 0, 0, False,
+                self.invocation_id, self.config_hash,
             )
         raise PreflightViolation("DURABLE_STATE_INVALID")
 
@@ -294,7 +314,9 @@ class _OperationalStore:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT state,counters FROM extended_private_read_operation WHERE singleton=1"
+                "SELECT state,counters FROM extended_private_read_operation "
+                "WHERE invocation_id=?",
+                (self.invocation_id,),
             ).fetchone()
             if row is None or row[0] != "RUNNING":
                 raise PreflightViolation("DURABLE_STATE_CONFLICT")
@@ -308,14 +330,17 @@ class _OperationalStore:
                 raise PreflightViolation("DURABLE_COUNTERS_INVALID")
             counters[key] += 1
             connection.execute(
-                "UPDATE extended_private_read_operation SET phase=?,counters=? WHERE singleton=1",
-                (effect.upper(), json.dumps(counters, sort_keys=True)),
+                "UPDATE extended_private_read_operation SET phase=?,counters=? "
+                "WHERE invocation_id=?",
+                (effect.upper(), json.dumps(counters, sort_keys=True), self.invocation_id),
             )
 
     def snapshot(self) -> tuple[str, dict[str, int]]:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT phase,counters FROM extended_private_read_operation WHERE singleton=1"
+                "SELECT phase,counters FROM extended_private_read_operation "
+                "WHERE invocation_id=?",
+                (self.invocation_id,),
             ).fetchone()
         if row is None:
             raise PreflightViolation("DURABLE_STATE_INVALID")
@@ -334,7 +359,7 @@ class _OperationalStore:
         terminal = OperationalResult(
             result.status, result.reason, "TERMINAL", counters,
             result.rest_calls, result.stream_frames, result.clock_calls,
-            result.identity_verified,
+            result.identity_verified, self.invocation_id, self.config_hash,
         )
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -344,15 +369,18 @@ class _OperationalStore:
             terminal = OperationalResult(
                 terminal.status, terminal.reason, "TERMINAL", counters,
                 terminal.rest_calls, terminal.stream_frames, terminal.clock_calls,
-                terminal.identity_verified,
+                terminal.identity_verified, self.invocation_id, self.config_hash,
             )
             changed = connection.execute(
                 """
                 UPDATE extended_private_read_operation
                 SET state='TERMINAL',phase='TERMINAL',counters=?,evidence=?
-                WHERE singleton=1 AND state='RUNNING'
+                WHERE invocation_id=? AND state='RUNNING'
                 """,
-                (json.dumps(counters, sort_keys=True), terminal.evidence()),
+                (
+                    json.dumps(counters, sort_keys=True), terminal.evidence(),
+                    self.invocation_id,
+                ),
             ).rowcount
             if changed != 1:
                 raise PreflightViolation("DURABLE_STATE_CONFLICT")
@@ -447,23 +475,26 @@ async def _run_fixture_operational_private_read(
         result = OperationalResult(
             "READY", "OPERATIONAL_CONTRACT_PROVED", "FINALIZING",
             store.snapshot()[1], proved.rest_calls, proved.stream_frames,
-            proved.clock_calls, True,
+            proved.clock_calls, True, store.invocation_id, store.config_hash,
         )
     except asyncio.CancelledError:
         cancelled = True
         result = OperationalResult(
             "BLOCKED", "CANCELLED", store.snapshot()[0], store.snapshot()[1],
             counters.rest_calls, counters.stream_frames, counters.clock_calls, False,
+            store.invocation_id, store.config_hash,
         )
     except PreflightViolation as exc:
         result = OperationalResult(
             "BLOCKED", str(exc), store.snapshot()[0], store.snapshot()[1],
             counters.rest_calls, counters.stream_frames, counters.clock_calls, False,
+            store.invocation_id, store.config_hash,
         )
     except Exception:
         result = OperationalResult(
             "BLOCKED", "UNEXPECTED_FAILURE", store.snapshot()[0], store.snapshot()[1],
             counters.rest_calls, counters.stream_frames, counters.clock_calls, False,
+            store.invocation_id, store.config_hash,
         )
     finally:
         try:
@@ -473,7 +504,8 @@ async def _run_fixture_operational_private_read(
                 result = OperationalResult(
                     "BLOCKED", "CAPABILITY_CLOSE_FAILED", store.snapshot()[0],
                     store.snapshot()[1], counters.rest_calls, counters.stream_frames,
-                    counters.clock_calls, False,
+                    counters.clock_calls, False, store.invocation_id,
+                    store.config_hash,
                 )
     if result is None:
         raise PreflightViolation("UNEXPECTED_FAILURE")
@@ -724,7 +756,7 @@ async def _production_run() -> OperationalResult:
     store_path = home / STORE_BASENAME
     if str(store_path) != "/Users/daniilmakarov/" + STORE_BASENAME:
         raise PreflightViolation("PRODUCTION_HOME_MISMATCH")
-    store = _OperationalStore(store_path)
+    store = _OperationalStore(store_path, _new_runtime_run_id())
     transport = _DirectTransport()
     try:
         return await _run_fixture_operational_private_read(
@@ -753,4 +785,4 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-__all__ = ["INVOCATION_ID", "main"]
+__all__ = ["main"]

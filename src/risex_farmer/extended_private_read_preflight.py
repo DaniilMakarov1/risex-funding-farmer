@@ -18,7 +18,7 @@ from typing import Any, Mapping
 
 REST_BASE_URL = "https://api.starknet.sepolia.extended.exchange/api/v1"
 STREAM_URL = (
-    "wss://api.starknet.sepolia.extended.exchange/"
+    "wss://starknet.sepolia.extended.exchange/"
     "stream.extended.exchange/v1/account"
 )
 ACCOUNT_ID = 7001

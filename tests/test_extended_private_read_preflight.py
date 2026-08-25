@@ -252,6 +252,11 @@ async def test_ready_uses_exact_v1_path_header_and_no_application_frames(tmp_pat
     assert len(transport.open_calls) == 1
     request = transport.open_calls[0]
     assert request.url == STREAM_URL == contract()["contract"]["streamUrl"]
+    assert request.url == (
+        "wss://starknet.sepolia.extended.exchange/"
+        "stream.extended.exchange/v1/account"
+    )
+    assert not request.url.startswith("wss://api.starknet.sepolia.extended.exchange/")
     assert request.headers == {"X-Api-Key": API_KEY}
     assert request.direct_tls and not request.trust_env and not request.allow_redirects
     assert transport.stream.outbound_frames == []

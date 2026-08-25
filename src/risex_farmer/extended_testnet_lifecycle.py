@@ -31,7 +31,7 @@ SDK_PROVENANCE = MappingProxyType({
 TESTNET_CONTRACT = MappingProxyType({
     "apiBaseUrl": "https://api.starknet.sepolia.extended.exchange/api/v1",
     "apiBaseOrderManagementUrl": "https://api.starknet.sepolia.extended.exchange/api/v1",
-    "streamUrl": "wss://api.starknet.sepolia.extended.exchange/stream.extended.exchange/v1",
+    "streamUrl": "wss://starknet.sepolia.extended.exchange/stream.extended.exchange/v1",
     "streamRpcUrl": "wss://api.starknet.sepolia.extended.exchange/stream.extended.exchange/v2/rpc",
     "signingDomain": "starknet.sepolia.extended.exchange",
     "starknetDomain": MappingProxyType({
