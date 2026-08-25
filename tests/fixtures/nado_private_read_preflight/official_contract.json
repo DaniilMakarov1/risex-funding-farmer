@@ -78,7 +78,7 @@
       }]
     },"request_type":"query_subaccount_info"},
     "isolated_positions": {"status":"success","data":{"isolated_positions":[]},"request_type":"query_isolated_positions"},
-    "time": {"status":"success","method":"time","server_time":"1700000000009"},
+    "time": {"status":"success","method":"time","id":null,"server_time":"1700000000009"},
     "trigger": {"status":"success","data":{"orders":[]},"request_type":"query_list_trigger_orders"}
   },
   "round_a": [

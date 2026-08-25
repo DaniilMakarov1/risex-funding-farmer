@@ -1215,14 +1215,28 @@ def test_exact_edge_time_wire_uses_explicit_observation_clock(
     assert time_callback.calls == [{"type": "time"}]
 
 
+def test_edge_time_legacy_envelope_without_correlation_id_remains_valid(
+    tmp_path: Path, contract: dict[str, object]
+) -> None:
+    time_transport, time_callback = _time(contract)
+    time_callback.response.pop("id")
+    assert _run(tmp_path, contract, time_transport=time_transport)[0].status == nado.FINALIZED
+
+
 @pytest.mark.parametrize(
     "mutation",
-    [lambda p: p.update(data="1700000000009"),
-     lambda p: p.update(id=1), lambda p: p.update(method="Time"),
+    [lambda p: p.pop("status"), lambda p: p.pop("method"),
+     lambda p: p.pop("server_time"),
+     lambda p: p.update(data="1700000000009"),
+     lambda p: p.update(id=1), lambda p: p.update(id="null"),
+     lambda p: p.update(id=False), lambda p: p.update(id={}),
+     lambda p: p.update(method="Time"),
      lambda p: p.update(server_time=1_700_000_000_009),
-     lambda p: p.update(server_time="01700000000009")],
+     lambda p: p.update(server_time="01700000000009"),
+     lambda p: p.update(server_time="1699999969994"),
+     lambda p: p.update(server_time="1700000000026")],
 )
-def test_edge_time_envelope_is_exact_and_fails_before_signing(
+def test_edge_time_envelope_is_bounded_and_fails_before_signing(
     tmp_path: Path, contract: dict[str, object],
     mutation: Callable[[dict[str, object]], object],
 ) -> None:

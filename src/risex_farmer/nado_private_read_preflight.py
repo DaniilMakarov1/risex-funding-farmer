@@ -814,7 +814,11 @@ def _server_time_observation(
 ) -> int:
     _fresh_observation(observation, clock_ms)
     payload = _object(observation.payload, "time envelope")
-    _exact_keys(payload, {"status", "method", "server_time"}, "time envelope")
+    required = {"status", "method", "server_time"}
+    if not required <= set(payload) or not set(payload) - required <= {"id"}:
+        raise NadoPreflightError("time envelope schema mismatch")
+    if "id" in payload and payload["id"] is not None:
+        raise NadoPreflightError("time id is invalid")
     if payload["status"] != "success" or type(payload["status"]) is not str:
         raise NadoPreflightError("time status is not success")
     if payload["method"] != "time" or type(payload["method"]) is not str:
