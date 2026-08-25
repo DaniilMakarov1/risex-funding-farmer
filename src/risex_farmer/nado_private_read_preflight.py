@@ -917,8 +917,6 @@ def _catalog(raw_data: object) -> tuple[tuple[int, str, str], ...]:
             products[product_id] = parsed
     if not products or products.get(0, (None, None, None))[1] != "spot":
         raise NadoPreflightError("official collateral identity mismatch")
-    if set(products) != set(range(len(products))):
-        raise NadoPreflightError("product catalog coverage is not contiguous")
     return tuple(products[key] for key in sorted(products))
 
 

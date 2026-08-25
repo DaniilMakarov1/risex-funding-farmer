@@ -249,7 +249,7 @@ def test_exact_official_wire_success_and_one_shot_request(
         {"type": "linked_signer", "subaccount": contract["sender"]},
         {"type": "subaccount_info", "subaccount": contract["sender"]},
         {"type": "subaccount_orders", "sender": contract["sender"], "product_id": 0},
-        {"type": "subaccount_orders", "sender": contract["sender"], "product_id": 1},
+        {"type": "subaccount_orders", "sender": contract["sender"], "product_id": 2},
         {"type": "isolated_positions", "subaccount": contract["sender"]},
     ]
 
@@ -304,6 +304,8 @@ def test_pins_identity_and_official_fixture_shapes(contract: dict[str, object]) 
     assert set(products["data"]["perp_products"][0]) == {
         "product_id", "oracle_price_x18", "risk", "state", "book_info"
     }
+    assert [product["product_id"] for product in products["data"]["spot_products"]] == [0]
+    assert [product["product_id"] for product in products["data"]["perp_products"]] == [2]
     assert set(products["data"]["spot_products"][0]["risk"]) == {
         "long_weight_initial_x18", "short_weight_initial_x18",
         "long_weight_maintenance_x18", "short_weight_maintenance_x18", "price_x18",
@@ -495,6 +497,39 @@ def test_product_id_rejects_float_bool_and_string_aliases(
     with pytest.raises(nado.NadoPreflightError):
         _run(tmp_path, contract, public_entries=entries, store=store)
     assert store.state("fixture-invocation-001") == nado.NEW
+
+
+@pytest.mark.parametrize(
+    "defect", ["duplicate", "negative", "malformed", "missing-collateral"],
+)
+def test_sparse_catalog_keeps_product_identity_fail_closed(
+    contract: dict[str, object], defect: str,
+) -> None:
+    data = copy.deepcopy(contract["wire"]["all_products"]["data"])
+    if defect == "duplicate":
+        data["perp_products"][0]["product_id"] = 0
+    elif defect == "negative":
+        data["perp_products"][0]["product_id"] = -1
+    elif defect == "malformed":
+        data["perp_products"][0]["product_id"] = "2"
+    else:
+        data["spot_products"][0]["product_id"] = 1
+    with pytest.raises(nado.NadoPreflightError):
+        nado._catalog(data)
+
+
+@pytest.mark.parametrize("response", ["embedded-account", "round-b"])
+def test_sparse_product_ids_must_match_across_responses(
+    tmp_path: Path, contract: dict[str, object], response: str,
+) -> None:
+    entries = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
+    index = 4 if response == "embedded-account" else 17
+    entries[index]["response"]["data"]["perp_products"][0]["product_id"] = 3
+    store = nado.OneShotStore(tmp_path / f"sparse-mismatch-{response}.sqlite3")
+    with pytest.raises(nado.NadoPreflightError):
+        _run(tmp_path, contract, public_entries=entries, store=store)
+    expected = nado.NEW if response == "embedded-account" else nado.OBSERVED
+    assert store.state("fixture-invocation-001") == expected
 
 
 @pytest.mark.parametrize(
