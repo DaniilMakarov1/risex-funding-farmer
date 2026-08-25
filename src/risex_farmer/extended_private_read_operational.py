@@ -617,13 +617,17 @@ class _PasswdHomeCredentialSource:
         return _LocalCapability(key, identity)
 
 
-def _transport_metadata(url: str) -> dict[str, Any]:
+def _transport_metadata(
+    url: str, *, header_names: tuple[str, ...] | None = None
+) -> dict[str, Any]:
+    reported_header_names = (
+        list(header_names)
+        if header_names is not None
+        else ["Accept", "Content-Type", "User-Agent", "X-Api-Key"]
+    )
     return {
         "actual_url": url, "method": "GET",
-        "header_names": (
-            ["User-Agent", "X-Api-Key"] if url == STREAM_URL
-            else ["Accept", "Content-Type", "User-Agent", "X-Api-Key"]
-        ),
+        "header_names": reported_header_names,
         "direct_tls": True, "trust_env": False, "proxy": None,
         "redirects": 0, "retries": 0, "fallbacks": 0,
         "api_key_header_count": 1, "authorization_present": False,
@@ -635,11 +639,18 @@ def _transport_metadata(url: str) -> dict[str, Any]:
 class _DirectStream:
     _END = object()
 
-    def __init__(self, socket: aiohttp.ClientWebSocketResponse):
+    def __init__(
+        self,
+        socket: aiohttp.ClientWebSocketResponse,
+        request_header_names: tuple[str, ...],
+    ):
         self._socket = socket
         self._queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=64)
         self._reader = asyncio.create_task(self._read())
-        self.upgrade_metadata = _transport_metadata(STREAM_URL)
+        self._request_header_names = request_header_names
+        self.upgrade_metadata = _transport_metadata(
+            STREAM_URL, header_names=request_header_names
+        )
         self.outbound_frames: list[Any] = []
         self.reconnect_count = 0
         self.closed = False
@@ -694,7 +705,9 @@ class _DirectStream:
             "connected": not self._socket.closed,
             "same_connection": True,
             "outbound_frames": [], "reconnect_count": 0, "frames": [],
-            "transport": _transport_metadata(STREAM_URL),
+            "transport": _transport_metadata(
+                STREAM_URL, header_names=self._request_header_names
+            ),
             "observed_at_ms": int(time.time() * 1000),
         }
 
@@ -746,7 +759,7 @@ class _DirectTransport:
         if str(socket._response.url) != request.url:
             await socket.close()
             raise PreflightViolation("STREAM_REDIRECT_FORBIDDEN")
-        return _DirectStream(socket)
+        return _DirectStream(socket, tuple(request.headers))
 
     async def close(self) -> None:
         await self._session.close()

@@ -257,7 +257,11 @@ async def test_ready_uses_exact_v1_path_header_and_no_application_frames(tmp_pat
         "stream.extended.exchange/v1/account"
     )
     assert not request.url.startswith("wss://api.starknet.sepolia.extended.exchange/")
-    assert request.headers == {"X-Api-Key": API_KEY}
+    assert request.headers == {
+        "User-Agent": "X10PythonTradingClient/2.5.0",
+        "X-Api-Key": API_KEY,
+    }
+    assert transport.stream.upgrade_metadata["header_names"] == list(request.headers)
     assert request.direct_tls and not request.trust_env and not request.allow_redirects
     assert transport.stream.outbound_frames == []
     assert transport.stream.reconnect_count == 0

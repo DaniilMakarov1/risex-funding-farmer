@@ -246,6 +246,14 @@ async def test_success_has_exact_sequence_and_all_effect_counters(tmp_path):
     assert set(result.counters.values()) == {1}
     assert all(call.method == "GET" for call in transport.get_calls)
     assert all(call.headers == {"X-Api-Key": "synthetic-secret-only"} for call in transport.get_calls)
+    stream_request = transport.open_calls[0]
+    assert stream_request.headers == {
+        "User-Agent": "X10PythonTradingClient/2.5.0",
+        "X-Api-Key": "synthetic-secret-only",
+    }
+    assert transport.stream.upgrade_metadata["header_names"] == list(
+        stream_request.headers
+    )
 
 
 @pytest.mark.asyncio
@@ -511,8 +519,16 @@ async def test_direct_stream_barrier_requires_matching_protocol_pong_and_closes(
             self.closed = True
 
     socket = Socket()
-    stream = _DirectStream(socket)
+    request_headers = {
+        "User-Agent": "X10PythonTradingClient/2.5.0",
+        "X-Api-Key": "direct-stream-secret",
+    }
+    stream = _DirectStream(socket, tuple(request_headers))
+    assert stream.upgrade_metadata["header_names"] == list(request_headers)
+    assert "direct-stream-secret" not in json.dumps(stream.upgrade_metadata)
     barrier = await stream.final_barrier()
+    assert barrier["transport"]["header_names"] == list(request_headers)
+    assert "direct-stream-secret" not in json.dumps(barrier)
     assert barrier["connected"] and barrier["same_connection"]
     assert barrier["outbound_frames"] == []
     with pytest.raises(StopAsyncIteration):

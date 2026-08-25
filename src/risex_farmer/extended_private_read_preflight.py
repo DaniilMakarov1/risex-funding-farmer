@@ -27,6 +27,7 @@ L2_KEY = "0x12345"
 L2_VAULT = 7001003
 
 _API_HEADER = "X-Api-Key"
+_SDK_USER_AGENT = "X10PythonTradingClient/2.5.0"
 _REST_PATHS = ("/user/account/info", "/user/orders", "/user/positions")
 _ACCOUNT_KEYS = {
     "accountId", "accountIndex", "accountIndexForKeyGeneration",
@@ -547,7 +548,10 @@ async def _execute(
     if effect_ledger is not None:
         effect_ledger.attempt("stream_open")
     stream = await transport.open_stream(
-        StreamRequest(url=STREAM_URL, headers={_API_HEADER: api_key})
+        StreamRequest(
+            url=STREAM_URL,
+            headers={"User-Agent": _SDK_USER_AGENT, _API_HEADER: api_key},
+        )
     )
     if effect_ledger is not None:
         effect_ledger.observed("stream_open")
