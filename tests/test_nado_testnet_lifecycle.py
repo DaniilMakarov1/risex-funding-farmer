@@ -324,6 +324,51 @@ def test_x18_grid_minimum_notional_and_post_only_preflight(
             )
 
 
+@pytest.mark.parametrize(
+    ("product_id", "minimum_amount_x18", "step_x18"),
+    (
+        (38, 100 * X18, 500 * X18),
+        (40, 100 * X18, 200 * X18),
+        (56, 100 * X18, 200 * X18),
+    ),
+)
+def test_complete_catalog_accepts_observed_unrelated_minimum_step_shapes(
+    product: Product,
+    product_id: int,
+    minimum_amount_x18: int,
+    step_x18: int,
+) -> None:
+    observed = replace(
+        product,
+        product_id=product_id,
+        symbol=f"PRODUCT-{product_id}",
+        minimum_amount_x18=minimum_amount_x18,
+        step_x18=step_x18,
+    )
+    assert CatalogSnapshot(
+        (observed,), True, 1_700_000_000_000, True, "engine"
+    ).by_id() == {product_id: observed}
+
+
+def test_target_preflight_rejects_off_step_minimum_amount(
+    product: Product,
+    flat_account: AccountSnapshot,
+    zero_triggers: TriggerSnapshot,
+) -> None:
+    target = replace(product, minimum_amount_x18=100 * X18, step_x18=500 * X18)
+    catalog = CatalogSnapshot((target,), True, 1_700_000_000_000, True, "engine")
+    with pytest.raises(NadoContractError, match="minimum amount is off"):
+        validate_entry_preflight(
+            catalog=catalog,
+            account=flat_account,
+            triggers=zero_triggers,
+            product_id=2,
+            entry_price_x18=35_000 * X18,
+            worst_close_price_x18=36_000 * X18,
+            now_ms=1_700_000_000_001,
+        )
+
+
 def test_complete_dynamic_catalog_and_all_keys_are_mandatory(
     product: Product, flat_account: AccountSnapshot, zero_triggers: TriggerSnapshot,
 ) -> None:
@@ -784,6 +829,32 @@ def test_ioc_reduce_only_close_can_never_reconcile_as_resting(
         evidence=evidence,
     ) == Reconciliation.CONTRADICTORY
     assert LifecycleCore(store).status == HALTED
+
+
+def test_close_rejects_off_step_clamped_target_minimum_before_prepare(
+    tmp_path: Path, vector: dict[str, object], product: Product,
+    catalog: CatalogSnapshot, flat_account: AccountSnapshot,
+    zero_triggers: TriggerSnapshot,
+) -> None:
+    store = IntentStore(tmp_path / "intents.sqlite3")
+    entry, _, account, triggers = _filled_entry(
+        store, vector, catalog, flat_account, zero_triggers, submission_idx=924
+    )
+    target = replace(product, minimum_amount_x18=12 * 10**15, step_x18=5 * 10**15)
+    with pytest.raises(NadoContractError, match="close amount is off"):
+        LifecycleCore(store).prepare_close(
+            catalog=CatalogSnapshot(
+                (target,), True, entry.recv_time + 1, True, "engine"
+            ),
+            product=target,
+            account=account,
+            triggers=triggers,
+            worst_price_x18=36_000 * X18,
+            recv_time=entry.recv_time + 2,
+            salt=50,
+            now_ms=entry.recv_time + 1,
+        )
+    assert store.intents() == ((entry, "RECONCILED"),)
 
 
 @pytest.mark.parametrize("terminal", ["CANCELLED", "EXPIRED", "REJECTED"])
