@@ -2,12 +2,12 @@
 
 One slice per venue. Apply the A/B/C levels and safety core from `AGENTS.md`; operational run IDs are data, not source milestones.
 
-## RISEx — fresh authoritative pre-write barrier
+## RISEx — fresh authenticated pre-write barrier
 
-Status: `READY FOR LEVEL B RUNTIME-RUN-ID START GATE`.
+Status: `READY FOR LEVEL B OPERATIONAL GATE`.
 
-- Make only the smallest RISEx-local correction that replaces the consumed source-bound private-read invocation/store identity with fresh runtime run identities in one protected durable journal. Preserve the accepted read sequence, counters, parsers, credential confinement, lifecycle-clear barrier, and every write-intent identity; do not touch the accepted Level C binding or lifecycle semantics.
-- Candidate work is fixture-only with no credential load, signature, network/private request, nonce consumption, or write. After acceptance, a separate Level B gate must freshly verify official config/domain/router/authorization, active signer, zero orders, and exact flatness before any later Level C write gate.
+- Run one fresh sealed RISEx authenticated private-read operation with its runtime journal identity. It may load only the fixed provisioned signer capability for the accepted auth contract and must freshly verify official config/domain/router/authorization, active signer, zero orders, exact flatness, and lifecycle-clear state; no order/cancel/close write is authorized.
+- Require a complete durable terminal report. Any semantic, authentication, identity, safety, unclassified, or ambiguous outcome stops without rearm or write; only a separately classified transport-only failure may use the Level B retry ceiling. A successful read enables a later separate Level C operational gate but never dispatches it automatically.
 
 ## Nado — classify Level B public failure
 
