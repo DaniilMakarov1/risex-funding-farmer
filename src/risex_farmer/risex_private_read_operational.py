@@ -124,6 +124,7 @@ _TERMINAL_STATES = frozenset({"PASSED", "BLOCKED", "UNKNOWN"})
 _REASON_VALUES = frozenset({
     "complete",
     "validation_failed",
+    "lifecycle_not_clear_safety",
     "cancelled",
     "interrupted_nonterminal",
     "store_rejected",
@@ -610,7 +611,7 @@ class DurableCounterLedger:
         ):
             raise ValueError("passed invariant")
         if row[3] == "BLOCKED" and (
-            row[8] != "validation_failed"
+            row[8] not in {"validation_failed", "lifecycle_not_clear_safety"}
             or all(
                 counters[name] == (1, 1)
                 for name in _COUNTER_NAMES
@@ -1776,8 +1777,6 @@ async def _execute(
     source: Any,
     transport: Any,
 ) -> None:
-    if dependencies.lifecycle_clear() is not True:
-        raise ValueError("lifecycle rejected")
     validator = PrivateReadPreflight(
         ledger,  # validation helpers do not access the legacy store
         clock=dependencies.clock,
@@ -2115,11 +2114,15 @@ async def _run(dependencies: _Dependencies) -> OperationalReport:
         reason = "validation_failed"
         abrupt = False
         try:
-            source = dependencies.source_factory()
-            transport = dependencies.transport_factory()
-            await _execute(dependencies, ledger, source, transport)
-            result = Result.PASSED
-            reason = "complete"
+            if dependencies.lifecycle_clear() is not True:
+                result = Result.BLOCKED
+                reason = "lifecycle_not_clear_safety"
+            else:
+                source = dependencies.source_factory()
+                transport = dependencies.transport_factory()
+                await _execute(dependencies, ledger, source, transport)
+                result = Result.PASSED
+                reason = "complete"
         except _SimulatedProcessDeath:
             abrupt = True
             raise
