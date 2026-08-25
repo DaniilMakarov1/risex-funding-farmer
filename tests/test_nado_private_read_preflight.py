@@ -242,7 +242,8 @@ def test_exact_official_wire_success_and_one_shot_request(
     assert store.state("fixture-invocation-001") == nado.FINALIZED
     assert public is not None and len(public.calls) == 19
     expected_policy = nado.TransportPolicy(True, False, False, 5_000, 65_536)
-    assert set(public.policies) == {expected_policy}
+    subaccount_policy = nado.TransportPolicy(True, False, False, 5_000, 1_048_576)
+    assert set(public.policies) == {expected_policy, subaccount_policy}
     assert signed.policies == [expected_policy]
     assert public.calls[:8] == [
         {"type": "contracts"}, {"type": "status"}, {"type": "all_products"},
@@ -1135,6 +1136,40 @@ async def test_owned_http_transport_rejects_oversize_redirect_and_http_alias(
         with pytest.raises(nado.NadoPreflightError):
             await nado._OperationalGatewayTransport().send_async({"type": "status"})
         assert len(session.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("gateway_request", "body_bytes", "accepted"),
+    [
+        ({"type": "status"}, 65_536, True),
+        ({"type": "status"}, 65_537, False),
+        ({"type": "subaccount_info", "subaccount": "synthetic"}, 1_048_576, True),
+        ({"type": "subaccount_info", "subaccount": "synthetic"}, 1_048_577, False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_gateway_response_limits_are_request_local_and_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    gateway_request: dict[str, object],
+    body_bytes: int,
+    accepted: bool,
+) -> None:
+    prefix, suffix = b'{"padding":"', b'"}'
+    padding_bytes = body_bytes - len(prefix) - len(suffix)
+    raw = prefix + b"x" * padding_bytes + suffix
+    assert len(raw) == body_bytes
+    session = _HttpSession(
+        _HttpResponse(raw, url=nado.FixedPreflightIdentity.gateway_query)
+    )
+    monkeypatch.setattr(nado.aiohttp, "ClientSession", lambda **kwargs: session)
+
+    if accepted:
+        observed = await nado._OperationalGatewayTransport().send_async(gateway_request)
+        assert observed.payload == {"padding": "x" * padding_bytes}
+    else:
+        with pytest.raises(nado.NadoPreflightError, match="response size exceeded"):
+            await nado._OperationalGatewayTransport().send_async(gateway_request)
+    assert len(session.calls) == 1
 
 
 @pytest.mark.asyncio
