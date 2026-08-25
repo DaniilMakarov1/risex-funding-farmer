@@ -418,12 +418,7 @@ class DurableCounterLedger:
             self._validate_schema()
             run_ids = self._validate_rows(allow_empty=created_file)
             if self.invocation_id not in run_ids:
-                if any(
-                    self._row(run_id)[3] not in _TERMINAL_STATES
-                    for run_id in run_ids
-                ):
-                    raise ValueError("unfinished run")
-                self._create_run()
+                self._create_run(allow_empty=created_file)
                 self.created = True
             self._validate()
         except (sqlite3.DatabaseError, ValueError, TypeError):
@@ -439,9 +434,17 @@ class DurableCounterLedger:
             self._db.execute(f"PRAGMA application_id={_APPLICATION_ID}")
             self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
-    def _create_run(self) -> None:
+    def _create_run(self, *, allow_empty: bool) -> None:
         now = time.time_ns()
-        with self._db:
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            self._validate_schema()
+            run_ids = self._validate_rows(allow_empty=allow_empty)
+            if self.invocation_id in run_ids or any(
+                self._row(run_id)[3] not in _TERMINAL_STATES
+                for run_id in run_ids
+            ):
+                raise ValueError("run claim rejected")
             self._db.execute(
                 "INSERT INTO run VALUES(?,?,?,?,?,?,?,NULL,NULL,NULL,NULL,"
                 "NULL,NULL,NULL,NULL,NULL,NULL,NULL)",
@@ -459,6 +462,11 @@ class DurableCounterLedger:
                 "INSERT INTO phase_counter VALUES(?,?,0,0)",
                 ((self.invocation_id, name) for name in _COUNTER_NAMES),
             )
+            self._validate_rows()
+            self._db.commit()
+        except BaseException:
+            self._db.rollback()
+            raise
 
     def _validate_schema(self) -> None:
         if self._db.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:

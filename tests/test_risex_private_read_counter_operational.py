@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import copy
 import hashlib
 import inspect
@@ -8,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import threading
 
 import pytest
 
@@ -581,20 +583,89 @@ async def test_two_fresh_runtime_ids_are_durable_rows_in_one_protected_journal(
 
 
 @pytest.mark.asyncio
-async def test_unfinished_runtime_row_cannot_rearm_under_a_fresh_id(tmp_path):
+@pytest.mark.parametrize(
+    "run_ids", (
+        ("risex-read-fresh-a", "risex-read-fresh-b"),
+        ("risex-read-collision", "risex-read-collision"),
+    ),
+)
+async def test_concurrent_runtime_claim_is_one_atomic_row(tmp_path, run_ids):
+    path = tmp_path / "fixture.sqlite3"
+    assert (await _run_fixture(dependencies(
+        tmp_path, [], invocation_id="risex-read-terminal",
+    ))).result is Result.PASSED
+    barrier = threading.Barrier(2)
+
+    class RacingLedger(DurableCounterLedger):
+        def _create_run(self, *, allow_empty):
+            barrier.wait(timeout=5)
+            return super()._create_run(allow_empty=allow_empty)
+
+    def open_run(run_id):
+        try:
+            ledger = RacingLedger(path, run_id)
+            ledger.close()
+            return "opened", run_id
+        except BaseException as failure:
+            return "rejected", failure
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(open_run, run_ids))
+    opened = [value for status, value in results if status == "opened"]
+    rejected = [value for status, value in results if status == "rejected"]
+    assert len(opened) == 1 and len(rejected) == 1
+    assert isinstance(rejected[0], operational._StoreRejected)
+
+    with sqlite3.connect(path) as database:
+        rows = database.execute(
+            "SELECT invocation_id,state FROM run ORDER BY invocation_id"
+        ).fetchall()
+        assert len(rows) == 2
+        assert ("risex-read-terminal", "PASSED") in rows
+        fresh = [row for row in rows if row[0] != "risex-read-terminal"]
+        assert len(fresh) == 1 and fresh[0][1] == "NEW"
+        counter_rows = {
+            invocation_id: (count, attempts, completions)
+            for invocation_id, count, attempts, completions in database.execute(
+            "SELECT invocation_id,COUNT(*),SUM(attempts),SUM(completions) "
+            "FROM phase_counter GROUP BY invocation_id ORDER BY invocation_id"
+            )
+        }
+        assert counter_rows == {
+            fresh[0][0]: (len(_COUNTER_NAMES), 0, 0),
+            "risex-read-terminal": (
+                len(_COUNTER_NAMES), len(_COUNTER_NAMES), len(_COUNTER_NAMES),
+            ),
+        }
+        assert database.execute(
+            "SELECT COUNT(*) FROM phase_counter AS counter LEFT JOIN run "
+            "USING(invocation_id) WHERE run.invocation_id IS NULL"
+        ).fetchone() == (0,)
+
+
+def test_unfinished_runtime_row_blocks_concurrent_fresh_ids_without_effects(tmp_path):
     path = tmp_path / "fixture.sqlite3"
     ledger = DurableCounterLedger(path, "risex-read-interrupted")
     ledger.close()
-    calls: list[str] = []
-    report = await _run_fixture(dependencies(
-        tmp_path, calls, invocation_id="risex-read-fresh",
-    ))
-    assert report.result is Result.UNKNOWN and report.reason == "store_rejected"
-    assert calls == []
+
+    def open_run(run_id):
+        try:
+            return DurableCounterLedger(path, run_id)
+        except BaseException as failure:
+            return failure
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(
+            open_run, ("risex-read-fresh-a", "risex-read-fresh-b"),
+        ))
+    assert all(isinstance(value, operational._StoreRejected) for value in results)
     with sqlite3.connect(path) as database:
         assert database.execute(
             "SELECT invocation_id FROM run"
         ).fetchall() == [("risex-read-interrupted",)]
+        assert database.execute(
+            "SELECT COUNT(*),SUM(attempts),SUM(completions) FROM phase_counter"
+        ).fetchone() == (len(_COUNTER_NAMES), 0, 0)
 
 
 @pytest.mark.asyncio
