@@ -28,19 +28,7 @@ def contract() -> dict[str, object]:
     contract = json.loads(FIXTURE.read_text())
     for entry in list(contract["round_a"]) + list(contract["round_b"]):
         operation = str(entry["op"])
-        if operation.startswith("subaccount_orders:"):
-            product_id = int(operation.split(":", 1)[1])
-            response = {
-                "status": "success",
-                "data": {
-                    "sender": contract["sender"], "product_id": product_id,
-                    "orders": [],
-                },
-                "request_type": "query_subaccount_orders",
-            }
-        else:
-            response = contract["wire"][operation]
-        entry["response"] = copy.deepcopy(response)
+        entry["response"] = copy.deepcopy(contract["wire"][operation])
     contract["trigger"]["response"] = copy.deepcopy(contract["wire"]["trigger"])
     return contract
 
@@ -70,11 +58,7 @@ class PublicFixture:
         if not self.entries:
             raise AssertionError("unexpected public callback")
         entry = self.entries.pop(0)
-        request_type = request.get("type")
-        operation = (
-            f"subaccount_orders:{request.get('product_id')}"
-            if request_type == "subaccount_orders" else request_type
-        )
+        operation = request.get("type")
         assert operation == entry["op"]
         assert url == nado.FixedPreflightIdentity.gateway_query
         return nado.ObservedResponse(
@@ -249,13 +233,13 @@ def test_exact_official_wire_success_and_one_shot_request(
         {"type": "contracts"}, {"type": "status"}, {"type": "all_products"},
         {"type": "linked_signer", "subaccount": contract["sender"]},
         {"type": "subaccount_info", "subaccount": contract["sender"]},
-        {"type": "subaccount_orders", "sender": contract["sender"], "product_id": 2},
+        {"type": "orders", "sender": contract["sender"], "product_ids": [2]},
         {"type": "isolated_positions", "subaccount": contract["sender"]},
     ]
-    order_calls = [call for call in public.calls if call["type"] == "subaccount_orders"]
+    order_calls = [call for call in public.calls if call["type"] == "orders"]
     assert order_calls == [
-        {"type": "subaccount_orders", "sender": contract["sender"], "product_id": 2},
-        {"type": "subaccount_orders", "sender": contract["sender"], "product_id": 2},
+        {"type": "orders", "sender": contract["sender"], "product_ids": [2]},
+        {"type": "orders", "sender": contract["sender"], "product_ids": [2]},
     ]
 
 
@@ -273,11 +257,13 @@ def _drive_public_contract(
             data = products
         elif request_type == "subaccount_info":
             data = account
-        elif request_type == "subaccount_orders":
+        elif request_type == "orders":
             data = {
                 "sender": contract["sender"],
-                "product_id": request["product_id"],
-                "orders": [],
+                "product_orders": [
+                    {"product_id": product_id, "orders": []}
+                    for product_id in request["product_ids"]
+                ],
             }
         else:
             data = contract["wire"][request_type]["data"]
@@ -330,11 +316,11 @@ def test_fixed_non_orderbook_products_are_excluded_and_every_market_is_queried_o
     )
 
     for calls in (round_a_calls, round_b_calls):
-        queried = [call["product_id"] for call in calls
-                   if call["type"] == "subaccount_orders"]
-        assert queried == [2, 12]
-        assert 0 not in queried
-        assert 11 not in queried
+        order_calls = [call for call in calls if call["type"] == "orders"]
+        assert order_calls == [{
+            "type": "orders", "sender": contract["sender"],
+            "product_ids": [2, 12],
+        }]
     assert round_a.product_count == round_b.product_count == 4
     assert round_a.fingerprint == round_b.fingerprint
 
@@ -389,7 +375,7 @@ def test_collateral_product_remains_fail_closed_account_safety(
                 else contract["wire"][request_type]["data"]
             )
             request = generator.send((copy.deepcopy(data), len(calls)))
-    assert all(call["type"] != "subaccount_orders" for call in calls)
+    assert all(call["type"] != "orders" for call in calls)
 
 
 @pytest.mark.parametrize(
@@ -878,12 +864,80 @@ def test_full_pinned_account_schema_and_embedded_catalog_are_required(
 
 
 @pytest.mark.parametrize("field,bad", [("sender", "0x" + "00" * 32), ("product_id", 0), ("product_id", 0.0)])
-def test_subaccount_orders_exact_echo_and_scalar_type_are_required(
+def test_orders_exact_echo_and_scalar_type_are_required(
     tmp_path: Path, contract: dict[str, object], field: str, bad: object
 ) -> None:
     entries = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
-    entries[5]["response"]["data"][field] = bad
+    target = entries[5]["response"]["data"]
+    if field == "sender":
+        target[field] = bad
+    else:
+        target["product_orders"][0][field] = bad
     store = nado.OneShotStore(tmp_path / f"orders-echo-{field}-{bad}.sqlite3")
+    with pytest.raises(nado.NadoPreflightError):
+        _run(tmp_path, contract, public_entries=entries, store=store)
+    assert store.state("fixture-invocation-001") == nado.NEW
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "missing", "addition", "duplicate", "wrong-id", "product-orders-type",
+        "item-type", "item-extra", "orders-type", "nonempty", "sender-case",
+        "outer-extra",
+    ],
+)
+def test_aggregate_orders_requires_exact_unique_empty_product_coverage(
+    contract: dict[str, object], defect: str,
+) -> None:
+    sender = str(contract["sender"])
+    data: object = {
+        "sender": sender,
+        "product_orders": [
+            {"product_id": 2, "orders": []},
+            {"product_id": 12, "orders": []},
+        ],
+    }
+    assert isinstance(data, dict)
+    if defect == "missing":
+        data["product_orders"].pop()
+    elif defect == "addition":
+        data["product_orders"].append({"product_id": 13, "orders": []})
+    elif defect == "duplicate":
+        data["product_orders"][1]["product_id"] = 2
+    elif defect == "wrong-id":
+        data["product_orders"][1]["product_id"] = 13
+    elif defect == "product-orders-type":
+        data["product_orders"] = ()
+    elif defect == "item-type":
+        data["product_orders"][0] = []
+    elif defect == "item-extra":
+        data["product_orders"][0]["extra"] = None
+    elif defect == "orders-type":
+        data["product_orders"][0]["orders"] = ()
+    elif defect == "nonempty":
+        data["product_orders"][0]["orders"] = [{"digest": "0x01"}]
+    elif defect == "sender-case":
+        data["sender"] = sender.upper().replace("0X", "0x")
+    else:
+        data["extra"] = None
+    with pytest.raises(nado.NadoPreflightError):
+        nado._orders(data, sender, (2, 12))
+
+
+@pytest.mark.parametrize("defect", ["failure", "request-type"])
+def test_aggregate_orders_requires_exact_success_envelope(
+    tmp_path: Path, contract: dict[str, object], defect: str,
+) -> None:
+    entries = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
+    if defect == "failure":
+        entries[5]["response"] = {
+            "status": "failure", "request_type": "query_orders",
+            "error_code": 2015, "error": "redacted fixture",
+        }
+    else:
+        entries[5]["response"]["request_type"] = "query_subaccount_orders"
+    store = nado.OneShotStore(tmp_path / f"orders-envelope-{defect}.sqlite3")
     with pytest.raises(nado.NadoPreflightError):
         _run(tmp_path, contract, public_entries=entries, store=store)
     assert store.state("fixture-invocation-001") == nado.NEW
@@ -1037,7 +1091,7 @@ def test_signed_response_defects_consume_claim_and_never_replay(
             if defect == "wire":
                 payload["status"] = "failure"
             elif defect == "request-type":
-                payload["request_type"] = "query_subaccount_orders"
+                payload["request_type"] = "query_orders"
             elif defect == "extra":
                 payload["data"]["sender"] = contract["sender"]
             else:
@@ -1065,7 +1119,9 @@ def test_round_b_contradiction_remains_observed_and_never_reobserves(
     if defect == "fingerprint":
         entries[9]["response"]["data"]["healths"][0]["health"] = "2"
     elif defect == "order":
-        entries[8]["response"]["data"]["orders"] = [{"digest": "0x01"}]
+        entries[8]["response"]["data"]["product_orders"][0]["orders"] = [
+            {"digest": "0x01"}
+        ]
     elif defect == "catalog":
         entries[13]["response"]["data"]["perp_products"][0]["risk"][
             "long_weight_initial_x18"

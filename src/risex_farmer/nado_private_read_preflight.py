@@ -84,9 +84,9 @@ SEMANTIC_SOURCE_PINS = {
         "https://docs.nado.xyz/developer-resources/api/gateway/queries/"
         "subaccount-info"
     ),
-    "gateway_subaccount_orders": (
+    "gateway_orders": (
         "https://docs.nado.xyz/developer-resources/api/gateway/queries/"
-        "subaccount-orders"
+        "orders"
     ),
     "gateway_isolated_positions": (
         "https://docs.nado.xyz/developer-resources/api/gateway/queries/"
@@ -104,7 +104,7 @@ GATEWAY_REQUEST_TYPES = {
     "all_products": "query_all_products",
     "linked_signer": "query_linked_signer",
     "subaccount_info": "query_subaccount_info",
-    "subaccount_orders": "query_subaccount_orders",
+    "orders": "query_orders",
     "isolated_positions": "query_isolated_positions",
 }
 TRIGGER_LIST_REQUEST_TYPE = "query_list_trigger_orders"
@@ -1072,19 +1072,26 @@ def _account(
     }
 
 
-def _orders(raw_data: object, sender: str, product_id: int) -> None:
-    data = _object(raw_data, "subaccount orders")
-    _exact_keys(data, {"sender", "product_id", "orders"}, "subaccount orders")
-    echoed_sender = data["sender"]
-    echoed_product = _strict_uint(data["product_id"], "order product id")
-    if (
-        type(echoed_sender) is not str
-        or echoed_sender.lower() != sender.lower()
-        or echoed_product != product_id
-    ):
-        raise NadoPreflightError("subaccount orders identity mismatch")
-    if type(data["orders"]) is not list or data["orders"]:
-        raise NadoPreflightError("regular order exists or response is invalid")
+def _orders(raw_data: object, sender: str, product_ids: tuple[int, ...]) -> None:
+    data = _object(raw_data, "orders")
+    _exact_keys(data, {"sender", "product_orders"}, "orders")
+    if type(data["sender"]) is not str or data["sender"] != sender:
+        raise NadoPreflightError("orders sender identity mismatch")
+    product_orders = data["product_orders"]
+    if type(product_orders) is not list or len(product_orders) != len(product_ids):
+        raise NadoPreflightError("orders product coverage mismatch")
+    observed_ids: list[int] = []
+    for raw_product_orders in product_orders:
+        item = _object(raw_product_orders, "product orders")
+        _exact_keys(item, {"product_id", "orders"}, "product orders")
+        product_id = _strict_uint(item["product_id"], "order product id")
+        if product_id in observed_ids:
+            raise NadoPreflightError("orders product identity is duplicate")
+        observed_ids.append(product_id)
+        if type(item["orders"]) is not list or item["orders"]:
+            raise NadoPreflightError("regular order exists or response is invalid")
+    if tuple(sorted(observed_ids)) != product_ids:
+        raise NadoPreflightError("orders product coverage mismatch")
 
 
 def _isolated(raw_data: object) -> None:
@@ -1113,14 +1120,15 @@ def _round_a_contract(
     observed.append(at); _linked(data)
     data, at = yield {"type": "subaccount_info", "subaccount": config.sender}
     observed.append(at); account = _account(data, config.sender, products)
-    for product_id, _, _ in products:
-        if product_id in _NON_ORDERBOOK_PRODUCT_IDS:
-            continue
-        data, at = yield {
-            "type": "subaccount_orders", "sender": config.sender,
-            "product_id": product_id,
-        }
-        observed.append(at); _orders(data, config.sender, product_id)
+    product_ids = tuple(
+        product_id for product_id, _, _ in products
+        if product_id not in _NON_ORDERBOOK_PRODUCT_IDS
+    )
+    data, at = yield {
+        "type": "orders", "sender": config.sender,
+        "product_ids": list(product_ids),
+    }
+    observed.append(at); _orders(data, config.sender, product_ids)
     data, at = yield {"type": "isolated_positions", "subaccount": config.sender}
     observed.append(at); _isolated(data)
     _temporal(observed)
@@ -1136,14 +1144,15 @@ def _round_b_contract(
     observed: list[int] = []
     data, at = yield {"type": "all_products"}
     observed.append(at); products = _catalog(data)
-    for product_id, _, _ in products:
-        if product_id in _NON_ORDERBOOK_PRODUCT_IDS:
-            continue
-        data, at = yield {
-            "type": "subaccount_orders", "sender": config.sender,
-            "product_id": product_id,
-        }
-        observed.append(at); _orders(data, config.sender, product_id)
+    product_ids = tuple(
+        product_id for product_id, _, _ in products
+        if product_id not in _NON_ORDERBOOK_PRODUCT_IDS
+    )
+    data, at = yield {
+        "type": "orders", "sender": config.sender,
+        "product_ids": list(product_ids),
+    }
+    observed.append(at); _orders(data, config.sender, product_ids)
     data, at = yield {"type": "subaccount_info", "subaccount": config.sender}
     observed.append(at); account = _account(data, config.sender, products)
     data, at = yield {"type": "isolated_positions", "subaccount": config.sender}
@@ -1654,9 +1663,8 @@ async def _run_counted_operational_private_read(
         ):
             raise NadoPreflightError("public rounds disagree or temporal barrier failed")
         counters = store.counters(invocation_id)
-        market_count = round_a.product_count - 1
-        expected_a = market_count + 6
-        expected_b = market_count + 7
+        expected_a = 7
+        expected_b = 8
         if (
             counters["public_a_attempts"] != expected_a
             or counters["public_a_completions"] != expected_a

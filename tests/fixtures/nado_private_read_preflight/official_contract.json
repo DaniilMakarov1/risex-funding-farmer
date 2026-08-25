@@ -20,7 +20,7 @@
     "gateway_all_products": "https://docs.nado.xyz/developer-resources/api/gateway/queries/all-products",
     "gateway_linked_signer": "https://docs.nado.xyz/developer-resources/api/gateway/queries/linked-signer",
     "gateway_subaccount_info": "https://docs.nado.xyz/developer-resources/api/gateway/queries/subaccount-info",
-    "gateway_subaccount_orders": "https://docs.nado.xyz/developer-resources/api/gateway/queries/subaccount-orders",
+    "gateway_orders": "https://docs.nado.xyz/developer-resources/api/gateway/queries/orders",
     "gateway_isolated_positions": "https://docs.nado.xyz/developer-resources/api/gateway/queries/isolated-positions",
     "trigger_list_orders": "https://docs.nado.xyz/developer-resources/api/trigger/queries/list-trigger-orders"
   },
@@ -77,15 +77,16 @@
         "book_info":{"size_increment":"1000000000000000","price_increment_x18":"1000000000000000","min_size":"1000000000000000","collected_fees":"0"}
       }]
     },"request_type":"query_subaccount_info"},
+    "orders": {"status":"success","data":{"sender":"0x000000000000000000000000000000000000000164656661756c740000000000","product_orders":[{"product_id":2,"orders":[]}]},"request_type":"query_orders"},
     "isolated_positions": {"status":"success","data":{"isolated_positions":[]},"request_type":"query_isolated_positions"},
     "time": {"status":"success","method":"time","id":null,"server_time":"1700000000009"},
     "trigger": {"status":"success","data":{"orders":[]},"request_type":"query_list_trigger_orders"}
   },
   "round_a": [
-    {"op":"contracts","observed_at_ms":1700000000000},{"op":"status","observed_at_ms":1700000000001},{"op":"all_products","observed_at_ms":1700000000002},{"op":"linked_signer","observed_at_ms":1700000000003},{"op":"subaccount_info","observed_at_ms":1700000000004},{"op":"subaccount_orders:2","observed_at_ms":1700000000006},{"op":"isolated_positions","observed_at_ms":1700000000007}
+    {"op":"contracts","observed_at_ms":1700000000000},{"op":"status","observed_at_ms":1700000000001},{"op":"all_products","observed_at_ms":1700000000002},{"op":"linked_signer","observed_at_ms":1700000000003},{"op":"subaccount_info","observed_at_ms":1700000000004},{"op":"orders","observed_at_ms":1700000000006},{"op":"isolated_positions","observed_at_ms":1700000000007}
   ],
   "trigger": {"observed_at_ms":1700000000010},
   "round_b": [
-    {"op":"all_products","observed_at_ms":1700000000011},{"op":"subaccount_orders:2","observed_at_ms":1700000000013},{"op":"subaccount_info","observed_at_ms":1700000000014},{"op":"isolated_positions","observed_at_ms":1700000000015},{"op":"contracts","observed_at_ms":1700000000018},{"op":"status","observed_at_ms":1700000000019},{"op":"all_products","observed_at_ms":1700000000020},{"op":"linked_signer","observed_at_ms":1700000000021}
+    {"op":"all_products","observed_at_ms":1700000000011},{"op":"orders","observed_at_ms":1700000000013},{"op":"subaccount_info","observed_at_ms":1700000000014},{"op":"isolated_positions","observed_at_ms":1700000000015},{"op":"contracts","observed_at_ms":1700000000018},{"op":"status","observed_at_ms":1700000000019},{"op":"all_products","observed_at_ms":1700000000020},{"op":"linked_signer","observed_at_ms":1700000000021}
   ]
 }
