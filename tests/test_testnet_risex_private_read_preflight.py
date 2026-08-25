@@ -623,8 +623,8 @@ async def test_public_identity_and_cross_sweep_contradictions_block(tmp_path, ca
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("case", ["tick", "depth", "bound", "cap"])
-async def test_grid_depth_bound_and_notional_cap_fail_closed(tmp_path, case):
+@pytest.mark.parametrize("case", ["tick", "depth", "crossed", "cap"])
+async def test_grid_depth_crossed_book_and_notional_cap_fail_closed(tmp_path, case):
     clock = Clock()
     transport = PublicTransport(clock)
 
@@ -634,8 +634,8 @@ async def test_grid_depth_bound_and_notional_cap_fail_closed(tmp_path, case):
             body["data"]["asks"][0]["price"] = "77963.45"
         elif case == "depth":
             body["data"]["asks"][0]["quantity"] = "0.000099"
-        elif case == "bound":
-            body["data"]["asks"] = [{"price": "90000.0", "quantity": "1"}]
+        elif case == "crossed":
+            body["data"]["asks"] = [{"price": "77963.3", "quantity": "1"}]
         else:
             body["data"]["asks"] = [{"price": "6000000.0", "quantity": "1"}]
             body["data"]["bids"] = [{"price": "5999999.9", "quantity": "1"}]
@@ -647,6 +647,30 @@ async def test_grid_depth_bound_and_notional_cap_fail_closed(tmp_path, case):
                                       lifecycle_clear=lambda: True)
     assert await controller.run_public_barrier() is None
     assert store.outcome() == Outcome.BLOCKED
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_wide_positive_spread_passes_public_private_read_barrier(tmp_path):
+    clock = Clock()
+    transport = PublicTransport(clock)
+
+    def widen_spread(response):
+        body = copy.deepcopy(response.body)
+        body["data"]["asks"] = [{
+            "order_count": 1, "price": "90000.0", "quantity": "0.0001",
+        }]
+        return replace(response, body=body)
+
+    transport.mutations["/v1/orderbook"] = widen_spread
+    store = PrivateReadStore(tmp_path / "wide-spread.sqlite3")
+    controller = PrivateReadPreflight(
+        store, clock=clock, public_get=transport, lifecycle_clear=lambda: True,
+    )
+
+    assert await controller.run_public_barrier() is not None
+    assert len(transport.calls) == 18
+    assert store.outcome() is None
     store.close()
 
 
