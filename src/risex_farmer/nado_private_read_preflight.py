@@ -31,6 +31,7 @@ MIN_COLLATERAL_X18 = 5 * 10**18
 MAX_FRESHNESS_MS = 30_000
 HTTP_TIMEOUT_SECONDS = 5.0
 MAX_RESPONSE_BYTES = 65_536
+SUBACCOUNT_INFO_MAX_RESPONSE_BYTES = 1_048_576
 LEDGER_SCHEMA_VERSION = 2
 COUNTER_PHASES = (
     "public_a", "loader", "derive", "server_time", "sign", "recover",
@@ -284,6 +285,9 @@ class _SealedTransport:
     expected_url = ""
     failure_label = "external transport failed"
 
+    def _response_limit(self, request: Mapping[str, object]) -> int:
+        return self.max_response_bytes
+
     def __post_init__(self) -> None:
         if (
             not callable(self.callback)
@@ -303,9 +307,10 @@ class _SealedTransport:
     def send(self, request: Mapping[str, object]) -> ObservedResponse:
         if not isinstance(request, Mapping):
             raise NadoPreflightError("request schema mismatch")
+        response_limit = self._response_limit(request)
         policy = TransportPolicy(
             self.tls_verified, self.trust_env, self.allow_redirects,
-            self.timeout_ms, self.max_response_bytes,
+            self.timeout_ms, response_limit,
         )
         ok, raw = _invoke(self.callback, self.expected_url, dict(request), policy)
         if not ok:
@@ -323,7 +328,7 @@ class _SealedTransport:
             raise NadoPreflightError("transport HTTP status rejected")
         if type(raw.observed_at_ms) is not int or raw.observed_at_ms <= 0:
             raise NadoPreflightError("transport observation time is invalid")
-        if len(_canonical(raw.payload)) > self.max_response_bytes:
+        if len(_canonical(raw.payload)) > response_limit:
             raise NadoPreflightError("transport response size exceeded")
         return raw
 
@@ -332,6 +337,11 @@ class _SealedTransport:
 class SealedPublicTransport(_SealedTransport):
     expected_url = FixedPreflightIdentity.gateway_query
     failure_label = "public transport callback failed"
+
+    def _response_limit(self, request: Mapping[str, object]) -> int:
+        if type(request.get("type")) is str and request["type"] == "subaccount_info":
+            return max(self.max_response_bytes, SUBACCOUNT_INFO_MAX_RESPONSE_BYTES)
+        return self.max_response_bytes
 
 
 @dataclass(frozen=True)
@@ -387,6 +397,9 @@ class _OperationalFixedHostTransport:
     expected_url = ""
     failure_label = "operational transport failed"
 
+    def _response_limit(self, request: Mapping[str, object]) -> int:
+        return MAX_RESPONSE_BYTES
+
     async def send_async(self, request: Mapping[str, object]) -> ObservedResponse:
         if not isinstance(request, Mapping):
             raise NadoPreflightError("request schema mismatch")
@@ -394,6 +407,7 @@ class _OperationalFixedHostTransport:
         try:
             request_body = dict(request)
             encoded_request = _canonical(request_body)
+            response_limit = self._response_limit(request_body)
             tls = ssl.create_default_context()
             async with asyncio.timeout(HTTP_TIMEOUT_SECONDS):
                 async with _new_aiohttp_session() as session:
@@ -411,10 +425,10 @@ class _OperationalFixedHostTransport:
                             raise NadoPreflightError("transport host or redirect mismatch")
                         raw = bytearray()
                         while True:
-                            remaining = MAX_RESPONSE_BYTES + 1 - len(raw)
+                            remaining = response_limit + 1 - len(raw)
                             chunk = await response.content.read(min(16_384, remaining))
                             raw.extend(chunk)
-                            if len(raw) > MAX_RESPONSE_BYTES:
+                            if len(raw) > response_limit:
                                 raise NadoPreflightError("transport response size exceeded")
                             if not chunk:
                                 break
@@ -441,6 +455,11 @@ class _OperationalFixedHostTransport:
 class _OperationalGatewayTransport(_OperationalFixedHostTransport):
     expected_url = FixedPreflightIdentity.gateway_query
     failure_label = "operational gateway transport failed"
+
+    def _response_limit(self, request: Mapping[str, object]) -> int:
+        if type(request.get("type")) is str and request["type"] == "subaccount_info":
+            return SUBACCOUNT_INFO_MAX_RESPONSE_BYTES
+        return MAX_RESPONSE_BYTES
 
 
 class _OperationalTimeTransport(_OperationalFixedHostTransport):
