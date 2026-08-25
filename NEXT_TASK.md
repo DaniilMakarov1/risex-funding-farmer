@@ -2,21 +2,19 @@
 
 One slice per venue. Apply the A/B/C levels and safety core from `AGENTS.md`; operational run IDs are data, not source milestones.
 
-## RISEx — automate observed no-event/no-fill reconciliation
+## RISEx — final sequential Level C lifecycle
 
-Status: `AUTHORIZED OBSERVED-DEFECT CORRECTION`.
+Status: `READY FOR AUTHORIZED LEVEL C INVOCATION`.
 
-- The first live runner invocation dispatched one intent once and then received no terminal order event. Post-expiry authenticated/private and full public evidence proved no order identity, zero open orders, exact flatness, and no unrelated state; local recovery completed through the accepted safe-no-identity lifecycle rule.
-- In a fresh visible RISEx Builder worktree, make only the production runner consume that same authoritative post-expiry evidence after bounded event absence and reconcile `COMPLETED_NO_FILL_FLAT` without replay. Any pre-expiry, open-order, nonflat, unexplained, stale, or contradictory observation remains manual recovery. Preserve every write, close, and safety contract.
-- After acceptance, Chief may run one further sequential RISEx testnet lifecycle to seek evidence of the filled-position close path; no repeat is allowed from ambiguous state.
+- The accepted runner now handles both eight valid nonmatching frames and an ordinary quiet receive timeout after validated initial zero-order/flat snapshots through the same post-expiry double public barrier, without replay.
+- Chief may archive only the exact terminal recovered local database and run one further sequential lifecycle after Nado is terminal. Accept automatic `COMPLETED_NO_FILL_FLAT` as safe placement/no-fill evidence; a fill must additionally prove reconcile/cancel/close, authoritative zero orders, and exact flatness. No repeat is allowed from ambiguous state.
 
-## Nado — correct signed trigger-read freshness window
+## Nado — sequential Level C lifecycle
 
-Status: `AUTHORIZED OBSERVED-DEFECT CORRECTION`.
+Status: `READY FOR AUTHORIZED LEVEL C INVOCATION`.
 
-- The accepted sealed runner's first live invocation stopped before any intent or venue write because its signed trigger query used the 100 ms write receive window. A fresh standalone Level B with the same credentials immediately finalized; its accepted signed read uses server time plus 30,000 ms.
-- In a fresh visible Nado Builder worktree, reuse the accepted signed trigger-read time semantics and keep the 100 ms value only where the existing write contract requires it. Preserve strict response validation, no retry, no trigger write, and the empty pre-write runtime history; an invocation with zero intents is safe to retry without deleting its journal row.
-- After acceptance, Chief runs the sealed runner once sequentially under the already-authorized `<= USD 500` Level C gate.
+- The signed trigger read now uses the accepted 30,000 ms window; the actual write retains its 100 ms contract. Current catalog minima are accepted as published, while the actual target opening and clamped closing amounts remain exactly step-aligned and fully safety-checked.
+- Both prior invocations stopped with zero intents and zero venue writes. Chief runs the sealed runner once sequentially under the already-authorized `<= USD 500` Level C gate; any new pre-write defect may receive one bounded venue-local diagnosis, while an ambiguous write stops without replay.
 
 ## Extended — provider/API Management resolution required
 
