@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 from decimal import Decimal
 import inspect
 import json
@@ -11,13 +12,14 @@ import pytest
 
 from risex_farmer.testnet_risex_order_lifecycle import (
     AccountState, BBO, DurableIntentStore, Evidence, Lifecycle,
-    LifecycleSafetyError, MarketState, OrderRecord,
+    LifecycleSafetyError, MarketState, OrderRecord, SyntheticSigner,
 )
 from risex_farmer.testnet_risex_order_lifecycle_operational import (
     ACCOUNT, AUTHORIZATION, CANCEL_PATH, OFFICIAL_CHAIN_ID,
     OFFICIAL_DOMAIN_NAME, OFFICIAL_DOMAIN_VERSION, PLACE_PATH, REST_ORIGIN,
     ROUTER, RUN_JOURNAL_NAME, SIGNER, OperationalBinding, RuntimeRunJournal,
     SealedWriteTransport, SessionOrderCredential, _credential_from_secret,
+    _signed_cancel, _signed_place,
 )
 
 
@@ -30,6 +32,8 @@ def composite_order_id(wide: int, block: int, log: int) -> str:
 
 
 OPEN_ORDER = composite_order_id(113, 100, 1)
+OTHER_ORDER = composite_order_id(115, 101, 2)
+OTHER_ACCOUNT = "0x" + "66" * 20
 
 
 def order_record(order_id: str, client_order_id: int) -> OrderRecord:
@@ -236,6 +240,41 @@ def test_place_is_signed_only_after_durable_intent_and_dispatch_claim(tmp_path):
     lifecycle.store.close()
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "body_market", "body_client", "order_data", "abi", "action_hash",
+        "permit_hash", "permit_account", "permit_target", "nonce", "bitmap",
+        "deadline",
+    ),
+)
+def test_place_rejects_any_action_permit_or_body_substitution_before_transport(
+    tmp_path, mutation,
+):
+    lifecycle, _binding, _transport, signer = fixture(tmp_path)
+    intent = lifecycle.prepare_open(
+        lifecycle.preflight(market(), account(signer), bbo()), 101, 7, 3, NOW + 30,
+    )
+    request = copy.deepcopy(lifecycle.unsigned_request(intent.intent_id, market=market()))
+    if mutation == "body_market": request["body"]["market_id"] = 2
+    elif mutation == "body_client": request["body"]["client_order_id"] = 102
+    elif mutation == "order_data": request["order_data"] += 1
+    elif mutation == "abi": request["abi_encoded"] = b"\x00" * len(request["abi_encoded"])
+    elif mutation == "action_hash": request["action_hash"] = b"\x00" * 32
+    elif mutation == "permit_hash": request["permit"]["message"]["hash"] = "0x" + "00" * 32
+    elif mutation == "permit_account": request["permit"]["message"]["account"] = OTHER_ACCOUNT
+    elif mutation == "permit_target": request["permit"]["message"]["target"] = OTHER_ACCOUNT
+    elif mutation == "nonce": request["body"]["nonce_anchor"] = "8"
+    elif mutation == "bitmap": request["body"]["nonce_bitmap_index"] = 4
+    else: request["body"]["deadline"] += 1
+    credential = _credential_from_secret(SECRET, signer)
+    try:
+        with pytest.raises(LifecycleSafetyError):
+            _signed_place(request, credential, signer)
+    finally:
+        credential.close(); lifecycle.store.close()
+
+
 def test_ambiguous_post_is_never_replayed_and_credential_is_zeroized(tmp_path):
     lifecycle, binding, transport, signer = fixture(tmp_path)
     intent = lifecycle.prepare_open(
@@ -282,6 +321,59 @@ def test_cancel_signs_resting_identity_but_posts_exact_composite_identity(tmp_pa
     assert lifecycle.store.cancel_state(OPEN_ORDER) == "PENDING_RECONCILIATION"
     assert lifecycle.reconcile_cancel(OPEN_ORDER, account(signer)) is True
     lifecycle.store.close()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "request_market", "resting", "abi", "action_hash", "body_market",
+        "body_order", "permit_hash", "permit_account", "permit_target", "nonce",
+        "bitmap", "deadline",
+    ),
+)
+def test_cancel_rejects_any_action_permit_or_body_substitution_before_transport(
+    tmp_path, mutation,
+):
+    lifecycle, _binding, _transport, signer = fixture(tmp_path)
+    opening = lifecycle.prepare_open(
+        lifecycle.preflight(market(), account(signer), bbo()), 101, 7, 3, NOW + 30,
+    )
+    lifecycle.dispatch(opening, SyntheticSigner(signer), lambda _: OPEN_ORDER)
+    record = order_record(OPEN_ORDER, 101)
+    lifecycle.reconcile(
+        opening.intent_id,
+        Evidence(
+            account=ACCOUNT, signer=signer, signer_status="ACTIVE", terminal=False,
+            filled_size=Decimal("0"), position=Decimal("0"), observed_at=NOW,
+            position_market_id=1, by_id_order=record, open_orders=(record,),
+            history_orders=(record,),
+        ),
+    )
+    captured = []
+    lifecycle.cancel_known(
+        OPEN_ORDER, market=market(), nonce_anchor=8, nonce_bitmap=4,
+        expires_at=NOW + 30, synthetic_signer=SyntheticSigner(signer),
+        execute=lambda request: captured.append(copy.deepcopy(request)),
+    )
+    request = captured[0]
+    if mutation == "request_market": request["market_id"] = 2
+    elif mutation == "resting": request["resting_order_id"] += 1
+    elif mutation == "abi": request["abi_encoded"] = b"\x00" * len(request["abi_encoded"])
+    elif mutation == "action_hash": request["action_hash"] = b"\x00" * 32
+    elif mutation == "body_market": request["body"]["market_id"] = 2
+    elif mutation == "body_order": request["body"]["order_id"] = OTHER_ORDER
+    elif mutation == "permit_hash": request["permit"]["message"]["hash"] = "0x" + "00" * 32
+    elif mutation == "permit_account": request["permit"]["message"]["account"] = OTHER_ACCOUNT
+    elif mutation == "permit_target": request["permit"]["message"]["target"] = OTHER_ACCOUNT
+    elif mutation == "nonce": request["body"]["permit"]["nonce_anchor"] = "9"
+    elif mutation == "bitmap": request["body"]["permit"]["nonce_bitmap_index"] = 5
+    else: request["body"]["permit"]["deadline"] += 1
+    credential = _credential_from_secret(SECRET, signer)
+    try:
+        with pytest.raises(LifecycleSafetyError):
+            _signed_cancel(request, credential, signer)
+    finally:
+        credential.close(); lifecycle.store.close()
 
 
 class FakeResponse:

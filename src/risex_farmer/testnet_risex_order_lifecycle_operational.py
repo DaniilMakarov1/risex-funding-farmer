@@ -3,6 +3,9 @@
 This venue-local module is absent from normal startup.  It adds only a durable
 runtime run identity, the provisioned session-signer operation, and the two
 official write transports consumed by ``testnet_risex_order_lifecycle``.
+
+Construction is not write authority.  A separate operational gate must first
+refresh and verify the official config/domain/router/authorization identities.
 """
 
 from __future__ import annotations
@@ -20,10 +23,11 @@ import uuid
 
 from . import testnet_risex_signer as _signer
 from .testnet_risex_order_lifecycle import (
-    CANCEL_ACTION, OFFICIAL_CHAIN_ID, OFFICIAL_DOMAIN_NAME,
+    CANCEL_ACTION, HEADER_FLAGS, OFFICIAL_CHAIN_ID, OFFICIAL_DOMAIN_NAME,
     OFFICIAL_DOMAIN_VERSION, Intent, Lifecycle,
     LifecycleSafetyError, MarketState, SyntheticSigner, _address,
-    _valid_order_id,
+    _composite_wide_order_id, _valid_order_id, encode_cancel_action,
+    encode_place_action, pack_order_data,
 )
 from .testnet_risex_private_read_operational import (
     SessionSignerCredential, _fsync_file_and_parent, _home,
@@ -282,6 +286,22 @@ def _load_session_signer_only() -> SessionOrderCredential:
         material.clear()
 
 
+def _permit_matches(
+    typed: dict[str, Any], *, account: str, signer: str, nonce_anchor: str,
+    nonce_bitmap: int, deadline: int, action_hash: bytes, expected_signer: str,
+) -> bool:
+    canonical = _canonical_typed_data(typed)
+    message = canonical["message"]
+    return (
+        account == ACCOUNT and signer == expected_signer
+        and message["account"] == account and message["target"] == ROUTER
+        and message["hash"] == "0x" + action_hash.hex()
+        and nonce_anchor == str(message["nonceAnchor"])
+        and nonce_bitmap == message["nonceBitmap"]
+        and deadline == message["deadline"]
+    )
+
+
 def _signed_place(
     request: dict[str, Any], credential: SessionOrderCredential,
     expected_signer: str,
@@ -299,10 +319,39 @@ def _signed_place(
     try:
         body = request["body"]
         if (
+            type(body.get("side")) is not int
+            or type(body.get("order_type")) is not int
+            or type(body.get("time_in_force")) is not int
+            or type(body.get("stp_mode")) is not int
+            or type(body.get("post_only")) is not bool
+            or type(body.get("reduce_only")) is not bool
+        ):
+            raise ValueError
+        order_data = pack_order_data(
+            market_id=body["market_id"], size_steps=body["size_steps"],
+            price_ticks=body["price_ticks"], side={0: "BUY", 1: "SELL"}[body["side"]],
+            post_only=body["post_only"], reduce_only=body["reduce_only"],
+            order_type={0: "MARKET", 1: "LIMIT"}[body["order_type"]],
+            time_in_force={0: "GTC", 1: "GTT", 2: "FOK", 3: "IOC"}[
+                body["time_in_force"]
+            ],
+        )
+        encoded, action_hash = encode_place_action(
+            order_data=order_data, client_order_id=body["client_order_id"],
+        )
+        if (
             set(request) != expected_keys or set(body) != body_keys
             or request["signature"] is not None or request["dispatchable"] is not False
-            or body["account"] != ACCOUNT or body["signer"] != expected_signer
+            or body["stp_mode"] != 0 or request["header_flags"] != HEADER_FLAGS
+            or request["order_data"] != order_data or request["abi_encoded"] != encoded
+            or request["action_hash"] != action_hash
             or credential.signer != expected_signer
+            or not _permit_matches(
+                request["permit"], account=body["account"], signer=body["signer"],
+                nonce_anchor=body["nonce_anchor"],
+                nonce_bitmap=body["nonce_bitmap_index"], deadline=body["deadline"],
+                action_hash=action_hash, expected_signer=expected_signer,
+            )
         ):
             raise ValueError
         signature = credential.sign_permit(request["permit"])
@@ -337,6 +386,10 @@ def _signed_cancel(
             raise ValueError
         body = request["body"]
         permit = body["permit"]
+        encoded, action_hash = encode_cancel_action(
+            market_id=request["market_id"],
+            resting_order_id=request["resting_order_id"],
+        )
         if (
             set(body) != {"market_id", "order_id", "permit"}
             or set(permit) != {
@@ -345,8 +398,17 @@ def _signed_cancel(
             }
             or permit["signature"] is not None or request["signature"] is not None
             or request["dispatchable"] is not False
-            or permit["account"] != ACCOUNT or permit["signer"] != expected_signer
+            or body["market_id"] != request["market_id"]
+            or _composite_wide_order_id(body["order_id"]) >> 1
+            != request["resting_order_id"]
+            or request["abi_encoded"] != encoded or request["action_hash"] != action_hash
             or credential.signer != expected_signer
+            or not _permit_matches(
+                request["permit"], account=permit["account"],
+                signer=permit["signer"], nonce_anchor=permit["nonce_anchor"],
+                nonce_bitmap=permit["nonce_bitmap_index"], deadline=permit["deadline"],
+                action_hash=action_hash, expected_signer=expected_signer,
+            )
         ):
             raise ValueError
         signature = credential.sign_permit(request["permit"])
