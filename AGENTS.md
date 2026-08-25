@@ -16,6 +16,8 @@ Only `AGENTS.md`, `SYSTEM_SPEC.md`, `STATUS.md`, `NEXT_TASK.md`, and `README.md`
 
 - Chain: user -> one Chief Coordinator/Reviewer -> at most one Builder per venue. Architect sessions are disabled; one temporary non-implementing auditor is allowed only for a genuinely high-risk gate and returns one verdict.
 - Chief defines bounded objectives, directs Builders, independently reviews and accepts/rejects candidates, alone integrates/pushes `main`, owns operational gates and governance, and never writes implementation code. Builder reports are not acceptance.
+- Changes to agent roles, authority boundaries, acceptance or merge ownership, user-authorization requirements, or safety-gate authority require explicit user approval. Chief may maintain governance and current-state records within those approved boundaries but may not expand its own authority.
+- Chief owns the objective, authorized scope, product/safety constraints, required evidence, and acceptance criteria. Builder owns implementation choices within that exact bounded slice and must stop and escalate a concrete conflict with governing repository rules, official/observed venue evidence, or safety requirements rather than expand scope or implement a known-bad instruction.
 - Builders implement only their bounded slice, never self-accept, merge/push `main`, or spawn agents. Use a fresh Builder session and branch for each fresh candidate, including post-rejection corrections.
 - Chief and Builders use GPT-5.6 Sol `medium`. `high`, `xhigh`, `max`, and Pro modes are prohibited.
 - User permanently authorizes Chief to create, replace, or release Builders. Maximum: one Builder per RISEx/Nado/Extended lane and three project-wide.
