@@ -27,6 +27,7 @@
 - A fresh credential-free `all_products` diagnostic received a valid transport/envelope but stopped because current product IDs are not contiguous. Official documentation treats the returned IDs as the valid set and does not require contiguity, so this is an observed Nado-local parser defect, not a rate limit or credential failure. No credentials, signing, private dispatch, or write occurred.
 - The accepted Nado correction now treats unique non-negative product IDs returned by official `all_products` as the authoritative sparse set while retaining exact collateral, duplicate, malformed, account-coverage, cross-response, counter, signing, and no-rearm safety checks.
 - The next fresh Level B run passed contracts, status, sparse `all_products`, and linked-signer public checks, then stopped with sanitized `SCHEMA` on public `subaccount_info`. Credential loader, derivation, signing, private trigger dispatch, and writes remained unused; its runtime row is terminal and immutable.
+- The first separate credential-free schema diagnostic confirmed the failure is in the public-response prefix but did not retain enough bounded envelope evidence to identify the exact field mismatch. That diagnostic is terminal and will not be replayed; one narrower envelope-shape observation is required before deciding whether code is defective.
 
 ### Extended
 
@@ -35,6 +36,7 @@
 - A fresh credential-free handshake confirmed that the old source-bound testnet stream host resolves and completes TLS but returns HTTP 503. Current official SDK configuration instead names `wss://starknet.sepolia.extended.exchange/stream.extended.exchange/v1`; its account path returned HTTP 403 without an API key, proving the current host is available and enforcing authentication. This is an observed Extended-local endpoint drift, not a rate limit; no credentials or frames were sent.
 - The accepted Extended correction binds the current official testnet stream host and allocates a fresh durable runtime run ID in a protected multi-row journal while preserving historical rows, account/write identities, direct TLS, header-only API-key authentication, and normal-startup isolation.
 - The next fresh Level B run completed credential load and all three first REST reads, then failed during the authenticated stream open before upgrade validation or any frame. The durable result is sanitized `UNEXPECTED_FAILURE`; no signing, account mutation, or write occurred, and the new runtime row is terminal and immutable.
+- A separate authenticated handshake classified the current account-stream response as HTTP 403, not rate-limit HTTP 429. Official SDK source sends both `X-Api-Key` and an explicit SDK `User-Agent`; the accepted runner actually supplies only `X-Api-Key` while claiming both header names in evidence. This is a concrete implementation/attestation mismatch requiring one SDK-conformant handshake observation before any correction is opened.
 
 ## Exit condition
 
