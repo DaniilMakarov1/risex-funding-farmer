@@ -15,6 +15,7 @@
 - The isolated Level C credential/signing/fixed-write-transport binding is accepted with exact signed-action/submitted-body linkage and remains absent from normal startup. A fresh pre-state gate stopped before network/auth on a noncanonical local lifecycle database; its terminal runtime row is immutable and no write was dispatched.
 - The observed lifecycle-clear rejection now has an accepted distinct sanitized safety classification that persists before every public, credential, signing, private, and write effect and remains terminal across restart.
 - Read-only recovery inspection found one obsolete empty three-column `cancels` table; integrity, identities, and zero intents/cancels were otherwise correct. A protected exact backup was verified before the table was transactionally replaced with the accepted canonical schema. `LifecycleClearBinding` now passes repeatedly, and the consumed private-read runtime database remained byte-identical.
+- The fresh Level B run completed all nine first-barrier public requests, then stopped on an unclassified public-sweep semantic failure before source load, credential access, signing, or private dispatch. Its new runtime row is terminal and immutable; no retry or write occurred.
 
 ### Nado
 

@@ -2,12 +2,13 @@
 
 One slice per venue. Apply the A/B/C levels and safety core from `AGENTS.md`; operational run IDs are data, not source milestones.
 
-## RISEx — resume authenticated read-only readiness
+## RISEx — identify public-sweep predicate
 
-Status: `READY FOR FRESH LEVEL B GATE`.
+Status: `AUTHORIZED CREDENTIAL-FREE DIAGNOSTIC GATE`.
 
 - The local lifecycle database is recovered and repeatedly passes `LifecycleClearBinding`; its exact protected pre-recovery backup and the immutable consumed runtime row remain preserved.
-- Perform one fresh authenticated read-only observation with the accepted runtime-run-ID, counter, identity, redaction, and bounded-transport contracts. Allow only the initial attempt plus one retry after a qualifying transport failure before a valid observation. Do not dispatch an order, cancel, close, account mutation, or any other write.
+- Make one separate credential-free reproduction of the nine-request public sweep that records only the sanitized failing validation phase/predicate and bounded aggregate semantic evidence, never raw bodies or account identity. Allow one retry only for a qualifying transport failure before a valid observation; a complete HTTP/schema/safety result is terminal.
+- Do not load the credential source, derive/sign, dispatch a private request, mutate account state, or write. Add code/tests only for a concrete observed contract defect; a later authenticated run must use another fresh durable runtime ID.
 
 ## Nado — accept sparse official product IDs
 
