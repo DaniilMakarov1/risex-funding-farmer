@@ -10,12 +10,12 @@ Status: `WAITING FOR EXTERNAL MARKET STATE`.
 - The latest public BTC/USDC book was not crossed but had an approximately 18.83% spread against the accepted 0.30% safety bound. Wait for a later external market-state change; do not weaken the bound or repeat the authenticated gate while this blocker persists.
 - After a credential-free book observation passes the existing bound, perform one fresh Level B run with another durable runtime ID. Do not dispatch an order, cancel, close, account mutation, or any other write.
 
-## Nado — remove live risk price from stable hash
+## Nado — fresh Level B after live-price correction
 
-Status: `AUTHORIZED FIXTURE CORRECTION`.
+Status: `AUTHORIZED LEVEL B READ-ONLY GATE`.
 
-- From exact published `main`, make the smallest Nado-local change that continues to require and strictly validate a positive canonical `risk.price_x18` in every product snapshot but excludes that observed live price from cross-snapshot stable comparison. Preserve stable risk weights, spot config, identity, kind, coverage, sparse contributions, and every account-risk gate.
-- Add focused regressions accepting only cross-snapshot `risk.price_x18` drift while rejecting malformed/nonpositive per-snapshot prices and stable risk-weight/config contradictions. Do not load credentials, derive/sign, dispatch private operations, mutate account state, or write during development. A later Level B run requires a fresh runtime ID after independent acceptance.
+- Perform one fresh operational Level B run from exact published `main` with a new durable runtime ID. Public checks must complete before credential load; the only signed request is the accepted read-only trigger-order query.
+- Preserve the initial-attempt-plus-one-transport-retry rule and sanitized failure classes. Do not mutate account state or dispatch any order, cancel, close, deposit, withdrawal, or other write. A complete failure is terminal and must not be replayed.
 
 ## Extended — wait for account-stream access resolution
 
