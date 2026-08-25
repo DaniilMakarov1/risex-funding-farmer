@@ -533,6 +533,95 @@ def test_sparse_product_ids_must_match_across_responses(
     assert store.state("fixture-invocation-001") == expected
 
 
+def test_complete_product_snapshots_allow_volatile_cross_response_drift(
+    tmp_path: Path, contract: dict[str, object],
+) -> None:
+    entries = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
+    snapshots = (
+        entries[4]["response"]["data"],
+        entries[8]["response"]["data"],
+        entries[11]["response"]["data"],
+        entries[17]["response"]["data"],
+    )
+    for offset, snapshot in enumerate(snapshots, start=1):
+        spot = snapshot["spot_products"][0]
+        perp = snapshot["perp_products"][0]
+        spot["oracle_price_x18"] = str(10**18 + offset)
+        spot["state"]["total_deposits_normalized"] = str(offset)
+        spot["book_info"]["collected_fees"] = str(offset)
+        perp["oracle_price_x18"] = str(2 * 10**18 + offset)
+        perp["state"]["open_interest"] = str(offset)
+        perp["book_info"]["collected_fees"] = str(offset)
+    result, *_ = _run(
+        tmp_path, contract, public_entries=entries,
+        store=nado.OneShotStore(tmp_path / "volatile-product-drift.sqlite3"),
+    )
+    assert result.status == nado.FINALIZED
+
+
+@pytest.mark.parametrize("field", ["risk", "config"])
+def test_stable_product_config_must_match_across_complete_snapshots(
+    tmp_path: Path, contract: dict[str, object], field: str,
+) -> None:
+    entries = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
+    embedded_spot = entries[4]["response"]["data"]["spot_products"][0]
+    if field == "risk":
+        embedded_spot["risk"]["long_weight_initial_x18"] = "1"
+    else:
+        embedded_spot["config"]["withdraw_fee_x18"] = "1"
+    store = nado.OneShotStore(tmp_path / f"stable-product-{field}.sqlite3")
+    with pytest.raises(nado.NadoPreflightError, match="embedded product catalog"):
+        _run(tmp_path, contract, public_entries=entries, store=store)
+    assert store.state("fixture-invocation-001") == nado.NEW
+
+
+@pytest.mark.parametrize("defect", ["kind", "coverage"])
+def test_product_kind_and_coverage_must_match_across_complete_snapshots(
+    tmp_path: Path, contract: dict[str, object], defect: str,
+) -> None:
+    entries = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
+    embedded = entries[4]["response"]["data"]
+    if defect == "kind":
+        replacement = copy.deepcopy(embedded["spot_products"][0])
+        replacement["product_id"] = 2
+        embedded["spot_products"].append(replacement)
+        embedded["perp_products"].clear()
+    else:
+        embedded["perp_products"].clear()
+    store = nado.OneShotStore(tmp_path / f"product-{defect}.sqlite3")
+    with pytest.raises(nado.NadoPreflightError, match="embedded product catalog"):
+        _run(tmp_path, contract, public_entries=entries, store=store)
+    assert store.state("fixture-invocation-001") == nado.NEW
+
+
+def test_health_contributions_use_sparse_product_id_slots(
+    contract: dict[str, object],
+) -> None:
+    catalog = nado._catalog(contract["wire"]["all_products"]["data"])
+    account = nado._account(
+        contract["wire"]["subaccount_info"]["data"],
+        str(contract["sender"]), catalog,
+    )
+    assert len(account["health_contributions"]) == 3
+    assert account["health_contributions"][1] == (0, 0, 0)
+
+
+@pytest.mark.parametrize("defect", ["short", "long", "unused-nonzero"])
+def test_sparse_health_contribution_coverage_and_unused_slots_fail_closed(
+    contract: dict[str, object], defect: str,
+) -> None:
+    catalog = nado._catalog(contract["wire"]["all_products"]["data"])
+    account = copy.deepcopy(contract["wire"]["subaccount_info"]["data"])
+    if defect == "short":
+        account["health_contributions"].pop()
+    elif defect == "long":
+        account["health_contributions"].append(["0", "0", "0"])
+    else:
+        account["health_contributions"][1][2] = "1"
+    with pytest.raises(nado.NadoPreflightError):
+        nado._account(account, str(contract["sender"]), catalog)
+
+
 @pytest.mark.parametrize(
     ("kind", "section", "field", "bad"),
     [
@@ -803,7 +892,9 @@ def test_round_b_contradiction_remains_observed_and_never_reobserves(
     elif defect == "order":
         entries[9]["response"]["data"]["orders"] = [{"digest": "0x01"}]
     elif defect == "catalog":
-        entries[17]["response"]["data"]["perp_products"][0]["oracle_price_x18"] = "1"
+        entries[17]["response"]["data"]["perp_products"][0]["risk"][
+            "long_weight_initial_x18"
+        ] = "1"
     else:
         entries[18]["response"]["data"]["linked_signer"] = "0x" + "01" * 20
     signed, callback = _signed(dict(contract["trigger"]))

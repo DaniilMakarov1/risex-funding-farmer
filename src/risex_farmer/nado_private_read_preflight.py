@@ -917,7 +917,10 @@ def _product(raw: object, kind: str) -> tuple[int, str, str]:
         _decimal_object(product["state"], _SPOT_STATE_KEYS, "spot state")
     else:
         _decimal_object(product["state"], _PERP_STATE_KEYS, "perp state")
-    return product_id, kind, _digest(product)
+    stable_config = {"risk": risk}
+    if kind == "spot":
+        stable_config["config"] = config
+    return product_id, kind, _digest(stable_config)
 
 
 def _catalog(raw_data: object) -> tuple[tuple[int, str, str], ...]:
@@ -1021,15 +1024,20 @@ def _account(
             raise NadoPreflightError("health breakdown is not positive")
         normalized_healths.append(parsed)
     contributions = data["health_contributions"]
-    if type(contributions) is not list or len(contributions) != len(catalog):
+    catalog_ids = {item[0] for item in catalog}
+    contribution_slots = max(catalog_ids) + 1
+    if type(contributions) is not list or len(contributions) != contribution_slots:
         raise NadoPreflightError("health contribution coverage is incomplete")
     normalized_contributions: list[tuple[int, int, int]] = []
-    for raw_contribution in contributions:
+    for product_id, raw_contribution in enumerate(contributions):
         if type(raw_contribution) is not list or len(raw_contribution) != 3:
             raise NadoPreflightError("health contribution triple is required")
-        normalized_contributions.append(tuple(
+        parsed_contribution = tuple(
             _decimal(value, "health contribution") for value in raw_contribution
-        ))
+        )
+        if product_id not in catalog_ids and parsed_contribution != (0, 0, 0):
+            raise NadoPreflightError("unused health contribution slot is nonzero")
+        normalized_contributions.append(parsed_contribution)
     spot_ids = {item[0] for item in catalog if item[1] == "spot"}
     perp_ids = {item[0] for item in catalog if item[1] == "perp"}
     spots = _balance_entries(data["spot_balances"], "spot balance", spot_ids, perp=False)

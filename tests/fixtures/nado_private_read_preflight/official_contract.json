@@ -60,7 +60,7 @@
     "subaccount_info": {"status":"success","data":{
       "exists":true,"subaccount":"0x000000000000000000000000000000000000000164656661756c740000000000","spot_count":1,"perp_count":1,
       "healths":[{"health":"5000000000000000000","assets":"5000000000000000000","liabilities":"0"},{"health":"5000000000000000000","assets":"5000000000000000000","liabilities":"0"},{"health":"5000000000000000000","assets":"5000000000000000000","liabilities":"0"}],
-      "health_contributions":[["5000000000000000000","5000000000000000000","5000000000000000000"],["0","0","0"]],
+      "health_contributions":[["5000000000000000000","5000000000000000000","5000000000000000000"],["0","0","0"],["0","0","0"]],
       "spot_balances":[{"product_id":0,"balance":{"amount":"5000000000000000000"}}],
       "perp_balances":[{"product_id":2,"balance":{"amount":"0","v_quote_balance":"0","last_cumulative_funding_x18":"0"}}],
       "spot_products":[{
