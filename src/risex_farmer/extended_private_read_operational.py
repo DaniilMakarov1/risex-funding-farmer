@@ -1,7 +1,8 @@
 """Explicit one-shot Extended Sepolia private-read operational binding.
 
 This module is intentionally absent from normal package startup.  Its production
-entry has no configuration arguments and owns one fixed invocation and store.
+entry has no configuration arguments and allocates a fresh runtime run identity
+in one fixed protected journal.
 """
 
 from __future__ import annotations
