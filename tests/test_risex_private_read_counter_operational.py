@@ -21,7 +21,6 @@ from risex_farmer.testnet_risex_private_read_preflight import (
 )
 from risex_farmer.risex_private_read_operational import (
     FIXED_STORE_PATH,
-    INVOCATION_ID,
     STORE_BASENAME,
     DurableCounterLedger,
     FixedRisexPrivateReadTransport,
@@ -33,6 +32,7 @@ from risex_farmer.risex_private_read_operational import (
     _SignOnlyCapability,
     _SimulatedProcessDeath,
     _fixture_operational_private_read,
+    _new_runtime_run_id,
     _run_fixture,
 )
 from tests.test_testnet_risex_private_read_preflight import NOW, public_bodies
@@ -318,25 +318,42 @@ def dependencies(tmp_path, calls, **changes):
     return _fixture_operational_private_read(**values)
 
 
-def test_new_fixed_identity_launcher_and_normal_startup_isolation():
-    assert INVOCATION_ID == "risex-private-read-20260824-new-op-011"
+def test_runtime_identity_launcher_and_normal_startup_isolation():
+    assert not hasattr(operational, "INVOCATION_ID")
     assert STORE_BASENAME == (
-        ".risex-funding-farmer-risex-private-read-20260824-new-op-011.sqlite3"
+        ".risex-funding-farmer-risex-private-read-runs-v1.sqlite3"
     )
     assert str(FIXED_STORE_PATH) == (
         "/Users/daniilmakarov/.risex-funding-farmer-"
-        "risex-private-read-20260824-new-op-011.sqlite3"
+        "risex-private-read-runs-v1.sqlite3"
     )
     assert hashlib.sha256(os.fsencode(str(FIXED_STORE_PATH))).hexdigest() == (
-        "f14b1bc6e28e88107bc2f65406781c52c4ab8e849939ace37381feb041bc4e53"
+        "67061fd398cd3d6fe3daf7f6d4fd6e75486236a4e9ac3562afd3dedb9050073a"
     )
     assert not inspect.signature(OperationalPrivateRead).parameters
+    assert not inspect.signature(OperationalPrivateRead.run).parameters.keys() - {"self"}
     module_source = Path(__file__).parents[1] / "src/risex_farmer/risex_private_read_operational.py"
-    assert 'if __name__ == "__main__"' in module_source.read_text()
+    source = module_source.read_text()
+    assert 'if __name__ == "__main__"' in source
+    for consumed in ("op-011", "20260824"):
+        assert consumed not in STORE_BASENAME
+        assert consumed not in source
     for normal in ("src/risex_farmer/__init__.py", "src/risex_farmer/cli.py"):
         assert "risex_private_read_operational" not in (
             Path(__file__).parents[1] / normal
         ).read_text()
+
+
+def test_runtime_run_ids_are_cryptographically_fresh_and_constructor_owned():
+    run_ids = {_new_runtime_run_id() for _ in range(32)}
+    assert len(run_ids) == 32
+    assert all(
+        value.startswith("risex-read-") and len(value) == len("risex-read-") + 32
+        for value in run_ids
+    )
+    first = OperationalPrivateRead()
+    second = OperationalPrivateRead()
+    assert first._dependencies.invocation_id != second._dependencies.invocation_id
 
 
 def test_production_transport_and_capability_surfaces_are_narrow():
@@ -485,7 +502,7 @@ async def test_success_has_exact_sequence_full_counters_and_agreeing_barriers(tm
     path = tmp_path / "fixture.sqlite3"
     report = await _run_fixture(dependencies(tmp_path, calls))
     assert report.result is Result.PASSED
-    assert report.schema_version == 8
+    assert report.schema_version == 9
     assert report.auth_v2_shape is None
     assert report.auth_v2_shape_sha256 is None
     assert report.positions_schema_classifier is None
@@ -516,9 +533,68 @@ async def test_success_has_exact_sequence_full_counters_and_agreeing_barriers(tm
     database = sqlite3.connect(path)
     try:
         assert database.execute("PRAGMA integrity_check").fetchone() == ("ok",)
-        assert database.execute("PRAGMA user_version").fetchone() == (8,)
+        assert database.execute("PRAGMA user_version").fetchone() == (9,)
     finally:
         database.close()
+
+
+@pytest.mark.asyncio
+async def test_two_fresh_runtime_ids_are_durable_rows_in_one_protected_journal(
+    tmp_path,
+):
+    path = tmp_path / "fixture.sqlite3"
+    first_calls: list[str] = []
+    second_calls: list[str] = []
+    first = await _run_fixture(dependencies(
+        tmp_path, first_calls, invocation_id="risex-read-a",
+    ))
+    second = await _run_fixture(dependencies(
+        tmp_path, second_calls, invocation_id="risex-read-b",
+    ))
+
+    assert first.result is Result.PASSED and second.result is Result.PASSED
+    assert first.invocation_id == "risex-read-a"
+    assert second.invocation_id == "risex-read-b"
+    assert path.stat().st_mode & 0o777 == 0o600
+    with sqlite3.connect(path) as database:
+        assert database.execute(
+            "SELECT invocation_id FROM run ORDER BY invocation_id"
+        ).fetchall() == [("risex-read-a",), ("risex-read-b",)]
+        assert database.execute(
+            "SELECT invocation_id,COUNT(*) FROM phase_counter "
+            "GROUP BY invocation_id ORDER BY invocation_id"
+        ).fetchall() == [
+            ("risex-read-a", len(_COUNTER_NAMES)),
+            ("risex-read-b", len(_COUNTER_NAMES)),
+        ]
+
+    collision_calls: list[str] = []
+    collided = await _run_fixture(dependencies(
+        tmp_path,
+        collision_calls,
+        invocation_id="risex-read-a",
+        source_factory=lambda: (_ for _ in ()).throw(AssertionError("source")),
+        transport_factory=lambda: (_ for _ in ()).throw(AssertionError("transport")),
+    ))
+    assert collided == first
+    assert collision_calls == []
+
+
+@pytest.mark.asyncio
+async def test_unfinished_runtime_row_cannot_rearm_under_a_fresh_id(tmp_path):
+    path = tmp_path / "fixture.sqlite3"
+    ledger = DurableCounterLedger(path, "risex-read-interrupted")
+    ledger.close()
+    calls: list[str] = []
+    report = await _run_fixture(dependencies(
+        tmp_path, calls, invocation_id="risex-read-fresh",
+    ))
+    assert report.result is Result.UNKNOWN and report.reason == "store_rejected"
+    assert calls == []
+    with sqlite3.connect(path) as database:
+        assert database.execute(
+            "SELECT invocation_id FROM run"
+        ).fetchall() == [("risex-read-interrupted",)]
 
 
 @pytest.mark.asyncio
@@ -806,16 +882,19 @@ async def test_auth_shape_corruption_rejects_store_without_effects(tmp_path, mut
     database = sqlite3.connect(tmp_path / "fixture.sqlite3")
     if mutation == "shape":
         database.execute(
-            "UPDATE run SET auth_v2_shape='\"string\"' WHERE singleton=1"
+            "UPDATE run SET auth_v2_shape='\"string\"' "
+            "WHERE invocation_id='synthetic-risex-private-read'"
         )
     elif mutation == "digest":
         database.execute(
-            "UPDATE run SET auth_v2_shape_sha256=? WHERE singleton=1", ("0" * 64,)
+            "UPDATE run SET auth_v2_shape_sha256=? "
+            "WHERE invocation_id='synthetic-risex-private-read'", ("0" * 64,)
         )
     else:
         forbidden = '{"object":[["server-secret-key","string"]]}'
         database.execute(
-            "UPDATE run SET auth_v2_shape=?,auth_v2_shape_sha256=? WHERE singleton=1",
+            "UPDATE run SET auth_v2_shape=?,auth_v2_shape_sha256=? "
+            "WHERE invocation_id='synthetic-risex-private-read'",
             (forbidden, hashlib.sha256(forbidden.encode()).hexdigest()),
         )
     database.commit()
@@ -1464,31 +1543,40 @@ async def test_positions_shape_corruption_rejects_store_without_effects(
     database = sqlite3.connect(tmp_path / "fixture.sqlite3")
     if mutation == "classifier":
         database.execute(
-            "UPDATE run SET positions_schema_classifier='row-7' WHERE singleton=1"
+            "UPDATE run SET positions_schema_classifier='row-7' "
+            "WHERE invocation_id='synthetic-risex-private-read'"
         )
     elif mutation == "shape":
-        database.execute("UPDATE run SET positions_shape='\"object\"' WHERE singleton=1")
+        database.execute(
+            "UPDATE run SET positions_shape='\"object\"' "
+            "WHERE invocation_id='synthetic-risex-private-read'"
+        )
     elif mutation == "digest":
         database.execute(
-            "UPDATE run SET positions_shape_sha256=? WHERE singleton=1", ("0" * 64,)
+            "UPDATE run SET positions_shape_sha256=? "
+            "WHERE invocation_id='synthetic-risex-private-read'", ("0" * 64,)
         )
     elif mutation == "grammar":
         forbidden = '{"object":[["server-secret-key","string"]]}'
         database.execute(
             "UPDATE run SET positions_shape=?,positions_shape_sha256=? "
-            "WHERE singleton=1",
+            "WHERE invocation_id='synthetic-risex-private-read'",
             (forbidden, hashlib.sha256(forbidden.encode()).hexdigest()),
         )
     elif mutation in {"method", "channel", "type", "status"}:
         database.execute(
             f"UPDATE run SET positions_{mutation}_class='server-secret' "
-            "WHERE singleton=1"
+            "WHERE invocation_id='synthetic-risex-private-read'"
         )
     elif mutation == "partial_shape":
-        database.execute("UPDATE run SET positions_shape=NULL WHERE singleton=1")
+        database.execute(
+            "UPDATE run SET positions_shape=NULL "
+            "WHERE invocation_id='synthetic-risex-private-read'"
+        )
     else:
         database.execute(
-            "UPDATE run SET positions_status_class=NULL WHERE singleton=1"
+            "UPDATE run SET positions_status_class=NULL "
+            "WHERE invocation_id='synthetic-risex-private-read'"
         )
     database.commit()
     database.close()
@@ -1881,12 +1969,12 @@ async def test_store_counter_schema_path_and_file_corruption_fail_without_effect
         elif mutation in {"barrier_a", "barrier_b"}:
             database.execute(
                 f"UPDATE run SET {mutation}_fingerprint='not-a-fingerprint' "
-                "WHERE singleton=1"
+                "WHERE invocation_id='synthetic-risex-private-read'"
             )
         elif mutation == "schema":
             database.execute("ALTER TABLE run ADD COLUMN unexpected TEXT")
         else:
-            database.execute("PRAGMA user_version=9")
+            database.execute("PRAGMA user_version=10")
         database.commit()
         database.close()
     elif mutation == "mode":

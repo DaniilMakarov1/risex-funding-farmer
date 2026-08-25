@@ -1,8 +1,9 @@
 """Explicit one-shot RISEx private-read operational launcher.
 
-This module is intentionally absent from normal startup.  Production owns one
-fixed invocation and accepts no path, identity, transport, URL, retry, or write
-override.  Tests enter only through the private fixture factory at the bottom.
+This module is intentionally absent from normal startup.  Production allocates
+one fresh durable run identity and accepts no path, identity, transport, URL,
+retry, or write override.  Tests enter only through the private fixture factory
+at the bottom.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import math
 import os
 from pathlib import Path
 import pwd
+import secrets
 import sqlite3
 import ssl
 import stat
@@ -38,12 +40,11 @@ from .testnet_risex_private_read_preflight import (
 )
 
 
-INVOCATION_ID = "risex-private-read-20260824-new-op-011"
-STORE_BASENAME = ".risex-funding-farmer-risex-private-read-20260824-new-op-011.sqlite3"
+STORE_BASENAME = ".risex-funding-farmer-risex-private-read-runs-v1.sqlite3"
 FIXED_STORE_PATH = Path(
-    "/Users/daniilmakarov/.risex-funding-farmer-risex-private-read-20260824-new-op-011.sqlite3"
+    "/Users/daniilmakarov/.risex-funding-farmer-risex-private-read-runs-v1.sqlite3"
 )
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 _APPLICATION_ID = 0x52585052
 _MAX_BYTES = 1_048_576
 _DEADLINE_SECONDS = 5
@@ -148,9 +149,8 @@ _REASON_VALUES = frozenset({
 })
 _LEDGER_SCHEMA = (
     "CREATE TABLE run ("
-    "singleton INTEGER PRIMARY KEY CHECK(singleton=1),"
-    "schema_version INTEGER NOT NULL CHECK(schema_version=8),"
-    "invocation_id TEXT NOT NULL CHECK(length(invocation_id)>0),"
+    "invocation_id TEXT PRIMARY KEY CHECK(length(invocation_id)>0),"
+    "schema_version INTEGER NOT NULL CHECK(schema_version=9),"
     "store_path_sha256 TEXT NOT NULL CHECK(length(store_path_sha256)=64),"
     "state TEXT NOT NULL CHECK(state IN "
     "('NEW','CLAIMED','OBSERVED','PASSED','BLOCKED','UNKNOWN'))"
@@ -169,11 +169,17 @@ _LEDGER_SCHEMA = (
     "positions_type_class TEXT,"
     "positions_status_class TEXT);"
     "CREATE TABLE phase_counter ("
-    "name TEXT PRIMARY KEY,"
+    "invocation_id TEXT NOT NULL REFERENCES run(invocation_id),"
+    "name TEXT NOT NULL,"
     "attempts INTEGER NOT NULL CHECK(attempts IN (0,1)),"
     "completions INTEGER NOT NULL CHECK(completions IN (0,1)),"
-    "CHECK(completions<=attempts));"
+    "CHECK(completions<=attempts),"
+    "PRIMARY KEY(invocation_id,name));"
 )
+
+
+def _new_runtime_run_id() -> str:
+    return "risex-read-" + secrets.token_hex(16)
 
 
 class Result(str, Enum):
@@ -377,12 +383,13 @@ def _reachable_stage(
 
 
 class DurableCounterLedger:
-    """Single-use FULL-synchronous ledger with one counter row per effect."""
+    """Multi-run FULL-synchronous ledger with one counter row per effect."""
 
     def __init__(self, path: Path, invocation_id: str) -> None:
         self.path = Path(path)
         self.invocation_id = invocation_id
         self.created = False
+        created_file = False
         if not self.path.is_absolute() or not self.path.parent.is_dir():
             raise _StoreRejected("store_rejected")
         if not self.path.exists():
@@ -396,17 +403,28 @@ class DurableCounterLedger:
                 os.fsync(fd)
                 os.close(fd)
                 _fsync_parent(self.path)
-                self.created = True
+                created_file = True
             except OSError:
                 raise _StoreRejected("store_rejected") from None
         if not _safe_existing_file(self.path):
             raise _StoreRejected("store_rejected")
         try:
             self._db = sqlite3.connect(self.path)
+            self._db.execute("PRAGMA foreign_keys=ON")
             self._db.execute("PRAGMA journal_mode=DELETE")
             self._db.execute("PRAGMA synchronous=FULL")
-            if self.created:
+            if created_file:
                 self._initialize()
+            self._validate_schema()
+            run_ids = self._validate_rows(allow_empty=created_file)
+            if self.invocation_id not in run_ids:
+                if any(
+                    self._row(run_id)[3] not in _TERMINAL_STATES
+                    for run_id in run_ids
+                ):
+                    raise ValueError("unfinished run")
+                self._create_run()
+                self.created = True
             self._validate()
         except (sqlite3.DatabaseError, ValueError, TypeError):
             try:
@@ -416,17 +434,20 @@ class DurableCounterLedger:
             raise _StoreRejected("store_rejected") from None
 
     def _initialize(self) -> None:
-        now = time.time_ns()
         with self._db:
             self._db.executescript(_LEDGER_SCHEMA)
             self._db.execute(f"PRAGMA application_id={_APPLICATION_ID}")
             self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+
+    def _create_run(self) -> None:
+        now = time.time_ns()
+        with self._db:
             self._db.execute(
-                "INSERT INTO run VALUES(1,?,?,?,?,?,?,?,NULL,NULL,NULL,NULL,"
+                "INSERT INTO run VALUES(?,?,?,?,?,?,?,NULL,NULL,NULL,NULL,"
                 "NULL,NULL,NULL,NULL,NULL,NULL,NULL)",
                 (
-                    SCHEMA_VERSION,
                     self.invocation_id,
+                    SCHEMA_VERSION,
                     _path_hash(self.path),
                     "NEW",
                     None,
@@ -435,11 +456,11 @@ class DurableCounterLedger:
                 ),
             )
             self._db.executemany(
-                "INSERT INTO phase_counter VALUES(?,0,0)",
-                ((name,) for name in _COUNTER_NAMES),
+                "INSERT INTO phase_counter VALUES(?,?,0,0)",
+                ((self.invocation_id, name) for name in _COUNTER_NAMES),
             )
 
-    def _validate(self) -> None:
+    def _validate_schema(self) -> None:
         if self._db.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
             raise ValueError("integrity")
         if self._db.execute("PRAGMA application_id").fetchone() != (_APPLICATION_ID,):
@@ -456,25 +477,44 @@ class DurableCounterLedger:
             row[1] for row in self._db.execute("PRAGMA table_info(phase_counter)")
         )
         if run_columns != (
-            "singleton", "schema_version", "invocation_id", "store_path_sha256",
+            "invocation_id", "schema_version", "store_path_sha256",
             "state", "barrier_a_fingerprint", "barrier_b_fingerprint",
             "started_at_ns", "finished_at_ns", "reason", "auth_v2_shape",
             "auth_v2_shape_sha256", "positions_schema_classifier",
             "positions_shape", "positions_shape_sha256", "positions_method_class",
             "positions_channel_class", "positions_type_class",
             "positions_status_class",
-        ) or counter_columns != ("name", "attempts", "completions"):
+        ) or counter_columns != (
+            "invocation_id", "name", "attempts", "completions",
+        ):
             raise ValueError("schema")
-        if self._db.execute("SELECT COUNT(*) FROM run").fetchone() != (1,):
+
+    def _validate(self) -> None:
+        self._validate_schema()
+        run_ids = self._validate_rows()
+        if self.invocation_id not in run_ids:
+            raise ValueError("identity")
+
+    def _validate_rows(self, *, allow_empty: bool = False) -> tuple[str, ...]:
+        run_count = self._db.execute("SELECT COUNT(*) FROM run").fetchone()[0]
+        if type(run_count) is not int or run_count < (0 if allow_empty else 1):
             raise ValueError("cardinality")
         if self._db.execute("SELECT COUNT(*) FROM phase_counter").fetchone() != (
-            len(_COUNTER_NAMES),
+            run_count * len(_COUNTER_NAMES),
         ):
             raise ValueError("cardinality")
-        row = self._row()
+        run_ids = tuple(str(row[0]) for row in self._db.execute(
+            "SELECT invocation_id FROM run ORDER BY invocation_id"
+        ))
+        for invocation_id in run_ids:
+            self._validate_run(invocation_id)
+        return run_ids
+
+    def _validate_run(self, invocation_id: str) -> None:
+        row = self._row(invocation_id)
         if (
             row[0] != SCHEMA_VERSION
-            or row[1] != self.invocation_id
+            or row[1] != invocation_id
             or row[2] != _path_hash(self.path)
             or row[3] not in {"NEW", "CLAIMED", "OBSERVED", *_TERMINAL_STATES}
             or (row[4] is not None and not _fingerprint(row[4]))
@@ -506,7 +546,7 @@ class DurableCounterLedger:
             or (row[9] is not None and row[11] is not None)
         ):
             raise ValueError("identity")
-        counters = self._counter_rows()
+        counters = self._counter_rows(invocation_id)
         if set(counters) != set(_COUNTER_NAMES):
             raise ValueError("counters")
         for attempts, completions in counters.values():
@@ -584,7 +624,8 @@ class DurableCounterLedger:
         }:
             raise ValueError("unknown invariant")
 
-    def _row(self) -> tuple[Any, ...]:
+    def _row(self, invocation_id: str | None = None) -> tuple[Any, ...]:
+        selected = self.invocation_id if invocation_id is None else invocation_id
         row = self._db.execute(
             "SELECT schema_version,invocation_id,store_path_sha256,state,"
             "barrier_a_fingerprint,barrier_b_fingerprint,started_at_ns,"
@@ -592,17 +633,23 @@ class DurableCounterLedger:
             "positions_schema_classifier,positions_shape,positions_shape_sha256,"
             "positions_method_class,positions_channel_class,positions_type_class,"
             "positions_status_class "
-            "FROM run WHERE singleton=1"
+            "FROM run WHERE invocation_id=?",
+            (selected,),
         ).fetchone()
         if row is None:
             raise ValueError("missing run")
         return row
 
-    def _counter_rows(self) -> dict[str, tuple[int, int]]:
+    def _counter_rows(
+        self, invocation_id: str | None = None,
+    ) -> dict[str, tuple[int, int]]:
+        selected = self.invocation_id if invocation_id is None else invocation_id
         return {
             name: (attempts, completions)
             for name, attempts, completions in self._db.execute(
-                "SELECT name,attempts,completions FROM phase_counter"
+                "SELECT name,attempts,completions FROM phase_counter "
+                "WHERE invocation_id=?",
+                (selected,),
             )
         }
 
@@ -616,8 +663,8 @@ class DurableCounterLedger:
         with self._db:
             changed = self._db.execute(
                 "UPDATE phase_counter SET attempts=1 WHERE name=? "
-                "AND attempts=0 AND completions=0",
-                (name,),
+                "AND invocation_id=? AND attempts=0 AND completions=0",
+                (name, self.invocation_id),
             ).rowcount
         if changed != 1:
             raise ValueError("phase already attempted")
@@ -626,8 +673,8 @@ class DurableCounterLedger:
         with self._db:
             changed = self._db.execute(
                 "UPDATE phase_counter SET completions=1 WHERE name=? "
-                "AND attempts=1 AND completions=0",
-                (name,),
+                "AND invocation_id=? AND attempts=1 AND completions=0",
+                (name, self.invocation_id),
             ).rowcount
         if changed != 1:
             raise ValueError("phase not attempted")
@@ -638,8 +685,8 @@ class DurableCounterLedger:
         with self._db:
             changed = self._db.execute(
                 "UPDATE run SET state='CLAIMED',barrier_a_fingerprint=? "
-                "WHERE singleton=1 AND state='NEW'",
-                (fingerprint,),
+                "WHERE invocation_id=? AND state='NEW'",
+                (fingerprint, self.invocation_id),
             ).rowcount
         if changed != 1:
             raise ValueError("state")
@@ -647,7 +694,9 @@ class DurableCounterLedger:
     def set_observed(self) -> None:
         with self._db:
             changed = self._db.execute(
-                "UPDATE run SET state='OBSERVED' WHERE singleton=1 AND state='CLAIMED'",
+                "UPDATE run SET state='OBSERVED' "
+                "WHERE invocation_id=? AND state='CLAIMED'",
+                (self.invocation_id,),
             ).rowcount
         if changed != 1:
             raise ValueError("state")
@@ -658,8 +707,9 @@ class DurableCounterLedger:
         with self._db:
             changed = self._db.execute(
                 "UPDATE run SET barrier_b_fingerprint=? "
-                "WHERE singleton=1 AND state='OBSERVED' AND barrier_b_fingerprint IS NULL",
-                (fingerprint,),
+                "WHERE invocation_id=? AND state='OBSERVED' "
+                "AND barrier_b_fingerprint IS NULL",
+                (fingerprint, self.invocation_id),
             ).rowcount
         if changed != 1:
             raise ValueError("state")
@@ -681,9 +731,9 @@ class DurableCounterLedger:
         with self._db:
             changed = self._db.execute(
                 "UPDATE run SET auth_v2_shape=?,auth_v2_shape_sha256=? "
-                "WHERE singleton=1 AND state='CLAIMED' "
+                "WHERE invocation_id=? AND state='CLAIMED' "
                 "AND auth_v2_shape IS NULL AND auth_v2_shape_sha256 IS NULL",
-                (descriptor, digest),
+                (descriptor, digest, self.invocation_id),
             ).rowcount
         if changed != 1:
             raise ValueError("auth_v2 shape state")
@@ -721,14 +771,14 @@ class DurableCounterLedger:
                 "UPDATE run SET positions_schema_classifier=?,positions_shape=?,"
                 "positions_shape_sha256=?,positions_method_class=?,"
                 "positions_channel_class=?,positions_type_class=?,"
-                "positions_status_class=? WHERE singleton=1 AND state='CLAIMED' "
+                "positions_status_class=? WHERE invocation_id=? AND state='CLAIMED' "
                 "AND positions_schema_classifier IS NULL AND positions_shape IS NULL "
                 "AND positions_shape_sha256 IS NULL AND positions_method_class IS NULL "
                 "AND positions_channel_class IS NULL AND positions_type_class IS NULL "
                 "AND positions_status_class IS NULL",
                 (
                     classifier, descriptor, digest, method_class, channel_class,
-                    type_class, status_class,
+                    type_class, status_class, self.invocation_id,
                 ),
             ).rowcount
         if changed != 1:
@@ -813,15 +863,17 @@ class DurableCounterLedger:
                 "THEN positions_type_class ELSE NULL END,"
                 "positions_status_class=CASE WHEN "
                 "?='positions_snapshot_schema_invalid' "
-                "THEN positions_status_class ELSE NULL END WHERE singleton=1",
+                "THEN positions_status_class ELSE NULL END WHERE invocation_id=?",
                 (
                     result.value, time.time_ns(), reason, reason, reason,
                     reason, reason, reason, reason, reason, reason, reason,
+                    self.invocation_id,
                 ),
             )
             changed = self._db.execute(
                 "UPDATE phase_counter SET completions=1 WHERE name='terminal_persist' "
-                "AND attempts=1 AND completions=0"
+                "AND invocation_id=? AND attempts=1 AND completions=0",
+                (self.invocation_id,),
             ).rowcount
             if changed != 1:
                 raise ValueError("terminal counter")
@@ -1615,7 +1667,7 @@ class OperationalPrivateRead:
             raise RuntimeError("fixed production identity unavailable")
         self._dependencies = _Dependencies(
             path=path,
-            invocation_id=INVOCATION_ID,
+            invocation_id=_new_runtime_run_id(),
             source_factory=PasswdHomeSessionSignerCapabilitySource,
             transport_factory=FixedRisexPrivateReadTransport,
             clock=time.time,
