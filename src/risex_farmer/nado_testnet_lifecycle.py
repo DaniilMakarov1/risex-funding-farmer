@@ -973,6 +973,28 @@ class IntentStore:
         self._mark(intent.digest, "DISPATCHED")
         return result
 
+    def dispatch_prepared(
+        self,
+        digest: str,
+        dispatch: Callable[[OrderIntent], str],
+    ) -> str:
+        """Dispatch one already-durable intent exactly once.
+
+        The operational binding deliberately prepares through ``LifecycleCore``
+        before obtaining a signature.  Any exception after this boundary is an
+        ambiguous write and permanently closes the automatic gate.
+        """
+        intent = self.get(digest)
+        if self.state(digest) != "PREPARED" or self.lifecycle_status() != RUNNING:
+            raise NadoContractError("only one prepared intent may be dispatched")
+        try:
+            result = dispatch(intent)
+        except BaseException:
+            self._mark_ambiguous(digest)
+            raise
+        self._mark(digest, "DISPATCHED")
+        return result
+
     def intents(self) -> tuple[tuple[OrderIntent, str], ...]:
         rows = self._connection.execute(
             "SELECT digest, state FROM nado_intents ORDER BY rowid"
