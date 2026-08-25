@@ -39,6 +39,7 @@
 - The exact full-prefix diagnostic proved product IDs and kinds remained identical while 12 of 90 products changed only live fields: spot/perpetual `oracle_price_x18`, selected `state` fields, and `risk.price_x18`. The validator already tolerates oracle/state drift but still includes the strictly validated positive `risk.price_x18` in its cross-snapshot stable hash, causing the repeated false mismatch.
 - The accepted Nado correction keeps `risk.price_x18` mandatory, canonical, and positive in every snapshot but excludes only that observed live value from the stable cross-snapshot hash; risk weights and spot configuration remain stable inputs. Independent focused review passed 268 tests and the clean Python 3.11 full suite passed 1,923 tests.
 - The next fresh Level B passed the five-request public account prefix for the first time, then stopped with sanitized `SCHEMA` on the first public `subaccount_orders` request for product 0. Credential loader, derivation, signing, private trigger, and write counters all remained zero; its runtime row is terminal and immutable.
+- The separate orders diagnostic stopped earlier than `data` validation with `wire envelope schema mismatch`, proving current `subaccount_orders` uses a top-level envelope different from accepted `{status,data,request_type}`. That observation is terminal; no order content or identity was retained.
 
 ### Extended
 
