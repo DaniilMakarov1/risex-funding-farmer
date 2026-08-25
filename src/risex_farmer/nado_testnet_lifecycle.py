@@ -349,8 +349,6 @@ class Product:
             self.minimum_notional_x18,
         ) <= 0:
             raise NadoContractError("product grid and minimums must be positive")
-        if self.minimum_amount_x18 % self.step_x18:
-            raise NadoContractError("minimum amount is off the product step")
 
 
 @dataclass(frozen=True)
@@ -1579,6 +1577,8 @@ class LifecycleCore:
                 raise NadoContractError("aggressive limit is off the price tick")
             clamp_expected = absolute_position < product.minimum_amount_x18
             submitted_amount = max(absolute_position, product.minimum_amount_x18)
+            if submitted_amount % product.step_x18:
+                raise NadoContractError("close amount is off the x18 product step")
             notional = _notional_x18(worst_price_x18, submitted_amount)
             if notional < product.minimum_notional_x18 or notional > MAX_NOTIONAL_X18:
                 raise NadoContractError("close notional violates minimum or USD 500 cap")
