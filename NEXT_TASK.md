@@ -10,11 +10,11 @@ Status: `AUTHORIZED OPERATIONAL IMPLEMENTATION`.
 - Preserve the accepted minimum-size price-bounded `MARKET+FOK` opening and fresh-position reduce-only close sequence/fallback/attempt ceiling. Do not create a general framework, CLI mode in normal startup, paper/mainnet behavior, strategy, or cross-venue abstraction. Tests use injected transports only; the Builder must not load real credentials or execute a network/write gate.
 - After acceptance, Chief runs the runner once sequentially under the already-authorized `<= USD 500` Level C gate. Unexpected behavior halts for manual testnet recovery and is failure, never acceptance.
 
-## Nado — tolerate the additive server-time correlation field
+## Nado — use the official aggregate open-orders query
 
 Status: `AUTHORIZED FIXTURE CORRECTION`.
 
-- In a fresh visible Nado Builder worktree, allow only the observed additive top-level `id` field in the fixed gateway `server_time` response while retaining mandatory exact types/values for `status`, `method`, and canonical fresh `server_time`. Reject removal of required fields, unexpected other additions, non-null/malformed `id` unless official semantics prove it valid, duplicates, stale/future time, and every existing transport/host/size rule.
+- In a fresh visible Nado Builder worktree, replace each per-product `subaccount_orders` sweep with one official `type: orders` request containing the exact sorted catalog IDs minus only fixed non-orderbook products 0 and 11. Validate exact sender echo, complete unique one-to-one `product_orders` coverage, each echoed product ID, and an empty strict `orders` list for every requested product; reject omissions, additions, duplicates, malformed identities/orders, failure envelopes, and catalog drift. Preserve complete account/balance/health coverage and all other barriers.
 - After accepted implementation, perform one fresh Level B. Do not dispatch a write unless it reaches full readiness; then the already-authorized minimum-notional Level C lifecycle may proceed sequentially under the existing Nado contract.
 
 ## Extended — provider/API Management resolution required
