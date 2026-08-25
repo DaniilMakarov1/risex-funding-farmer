@@ -288,19 +288,37 @@ def _drive_public_contract(
             return calls, completed.value
 
 
-def test_collateral_is_not_market_queried_and_every_market_is_queried_once_per_round(
+def _add_nlp_vault_and_neighbor_market(
+    contract: dict[str, object],
+) -> tuple[dict[str, object], dict[str, object]]:
+    products = copy.deepcopy(contract["wire"]["all_products"]["data"])
+    nlp_product = copy.deepcopy(products["spot_products"][0])
+    nlp_product["product_id"] = 11
+    nlp_product["config"]["token"] = "0x000000000000000000000000000000000000000b"
+    products["spot_products"].append(nlp_product)
+    neighbor_market = copy.deepcopy(products["perp_products"][0])
+    neighbor_market["product_id"] = 12
+    products["perp_products"].append(neighbor_market)
+
+    account = copy.deepcopy(contract["wire"]["subaccount_info"]["data"])
+    account["spot_products"] = copy.deepcopy(products["spot_products"])
+    account["perp_products"] = copy.deepcopy(products["perp_products"])
+    nlp_balance = copy.deepcopy(account["spot_balances"][0])
+    nlp_balance["product_id"] = 11
+    nlp_balance["balance"]["amount"] = "0"
+    account["spot_balances"].append(nlp_balance)
+    account["spot_count"] = 2
+    neighbor_balance = copy.deepcopy(account["perp_balances"][0])
+    neighbor_balance["product_id"] = 12
+    account["perp_balances"].append(neighbor_balance)
+    account["health_contributions"].extend([["0", "0", "0"]] * 10)
+    return products, account
+
+
+def test_fixed_non_orderbook_products_are_excluded_and_every_market_is_queried_once(
     contract: dict[str, object],
 ) -> None:
-    products = copy.deepcopy(contract["wire"]["all_products"]["data"])
-    second_perp = copy.deepcopy(products["perp_products"][0])
-    second_perp["product_id"] = 5
-    products["perp_products"].append(second_perp)
-    account = copy.deepcopy(contract["wire"]["subaccount_info"]["data"])
-    account["perp_products"] = copy.deepcopy(products["perp_products"])
-    second_balance = copy.deepcopy(account["perp_balances"][0])
-    second_balance["product_id"] = 5
-    account["perp_balances"].append(second_balance)
-    account["health_contributions"].extend([["0", "0", "0"]] * 3)
+    products, account = _add_nlp_vault_and_neighbor_market(contract)
 
     round_a_calls, round_a = _drive_public_contract(
         nado._round_a_contract(_config(contract)), contract,
@@ -314,10 +332,42 @@ def test_collateral_is_not_market_queried_and_every_market_is_queried_once_per_r
     for calls in (round_a_calls, round_b_calls):
         queried = [call["product_id"] for call in calls
                    if call["type"] == "subaccount_orders"]
-        assert queried == [2, 5]
+        assert queried == [2, 12]
         assert 0 not in queried
-    assert round_a.product_count == round_b.product_count == 3
+        assert 11 not in queried
+    assert round_a.product_count == round_b.product_count == 4
     assert round_a.fingerprint == round_b.fingerprint
+
+
+@pytest.mark.parametrize("defect", ["missing-nlp-balance", "short-health-vector"])
+def test_nlp_vault_remains_in_account_balance_and_health_safety_coverage(
+    contract: dict[str, object], defect: str,
+) -> None:
+    products, account = _add_nlp_vault_and_neighbor_market(contract)
+    if defect == "missing-nlp-balance":
+        account["spot_balances"] = [
+            balance for balance in account["spot_balances"]
+            if balance["product_id"] != 11
+        ]
+        account["spot_count"] = 1
+    else:
+        account["health_contributions"].pop()
+
+    generator = nado._round_a_contract(_config(contract))
+    request = next(generator)
+    with pytest.raises(
+        nado.NadoPreflightError,
+        match=("spot balance coverage" if defect == "missing-nlp-balance"
+               else "health contribution coverage"),
+    ):
+        while True:
+            request_type = request["type"]
+            data = (
+                products if request_type == "all_products"
+                else account if request_type == "subaccount_info"
+                else contract["wire"][request_type]["data"]
+            )
+            request = generator.send((copy.deepcopy(data), 1))
 
 
 def test_collateral_product_remains_fail_closed_account_safety(

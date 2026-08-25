@@ -40,6 +40,9 @@ COUNTER_PHASES = (
 FAILURE_CLASSES = frozenset({
     "TRANSPORT", "HTTP", "SCHEMA", "AUTH", "IDENTITY", "SAFETY",
 })
+# Fixed Ink Sepolia contract exceptions: USDT0 collateral has no market, and
+# NLP_USDT0 is a vault-share product whose official interface is mint/lock/burn.
+_NON_ORDERBOOK_PRODUCT_IDS = frozenset({0, 11})
 
 SOURCE_PINS = {
     "typescript_sdk": "315e4f23dadefeb2f86f713e423241e81467d4c3",
@@ -1107,7 +1110,7 @@ def _round_a_contract(
     data, at = yield {"type": "subaccount_info", "subaccount": config.sender}
     observed.append(at); account = _account(data, config.sender, products)
     for product_id, _, _ in products:
-        if product_id == 0:
+        if product_id in _NON_ORDERBOOK_PRODUCT_IDS:
             continue
         data, at = yield {
             "type": "subaccount_orders", "sender": config.sender,
@@ -1130,7 +1133,7 @@ def _round_b_contract(
     data, at = yield {"type": "all_products"}
     observed.append(at); products = _catalog(data)
     for product_id, _, _ in products:
-        if product_id == 0:
+        if product_id in _NON_ORDERBOOK_PRODUCT_IDS:
             continue
         data, at = yield {
             "type": "subaccount_orders", "sender": config.sender,
