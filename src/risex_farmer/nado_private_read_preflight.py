@@ -917,7 +917,9 @@ def _product(raw: object, kind: str) -> tuple[int, str, str]:
         _decimal_object(product["state"], _SPOT_STATE_KEYS, "spot state")
     else:
         _decimal_object(product["state"], _PERP_STATE_KEYS, "perp state")
-    stable_config = {"risk": risk}
+    stable_config = {
+        "risk": {key: risk[key] for key in _RISK_KEYS - {"price_x18"}},
+    }
     if kind == "spot":
         stable_config["config"] = config
     return product_id, kind, _digest(stable_config)

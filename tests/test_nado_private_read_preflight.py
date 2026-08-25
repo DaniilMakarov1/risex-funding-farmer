@@ -559,6 +559,44 @@ def test_complete_product_snapshots_allow_volatile_cross_response_drift(
     assert result.status == nado.FINALIZED
 
 
+def test_complete_product_snapshots_allow_only_risk_price_drift(
+    tmp_path: Path, contract: dict[str, object],
+) -> None:
+    entries = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
+    for offset, snapshot_index in enumerate((2, 4, 8, 11, 17), start=1):
+        products = entries[snapshot_index]["response"]["data"]
+        products["spot_products"][0]["risk"]["price_x18"] = str(
+            3 * 10**18 + offset
+        )
+        products["perp_products"][0]["risk"]["price_x18"] = str(
+            4 * 10**18 + offset
+        )
+    result, *_ = _run(
+        tmp_path, contract, public_entries=entries,
+        store=nado.OneShotStore(tmp_path / "risk-price-drift.sqlite3"),
+    )
+    assert result.status == nado.FINALIZED
+
+
+@pytest.mark.parametrize("snapshot_index", [2, 4, 8, 11, 17])
+@pytest.mark.parametrize("bad_price", ["NaN", "0", "-1"])
+def test_each_complete_product_snapshot_requires_canonical_positive_risk_price(
+    tmp_path: Path, contract: dict[str, object], snapshot_index: int,
+    bad_price: str,
+) -> None:
+    entries = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
+    entries[snapshot_index]["response"]["data"]["perp_products"][0]["risk"][
+        "price_x18"
+    ] = bad_price
+    store = nado.OneShotStore(
+        tmp_path / f"risk-price-{snapshot_index}-{bad_price}.sqlite3"
+    )
+    with pytest.raises(nado.NadoPreflightError):
+        _run(tmp_path, contract, public_entries=entries, store=store)
+    expected = nado.NEW if snapshot_index < 8 else nado.OBSERVED
+    assert store.state("fixture-invocation-001") == expected
+
+
 @pytest.mark.parametrize("field", ["risk", "config"])
 def test_stable_product_config_must_match_across_complete_snapshots(
     tmp_path: Path, contract: dict[str, object], field: str,
@@ -695,7 +733,7 @@ def test_full_pinned_account_schema_and_embedded_catalog_are_required(
     elif defect == "pre-state":
         data["pre_state"] = None
     else:
-        data["perp_products"][0]["risk"]["price_x18"] = "1"
+        data["perp_products"][0]["risk"]["long_weight_initial_x18"] = "1"
     store = nado.OneShotStore(tmp_path / f"account-schema-{defect}.sqlite3")
     with pytest.raises(nado.NadoPreflightError):
         _run(tmp_path, contract, public_entries=entries, store=store)
