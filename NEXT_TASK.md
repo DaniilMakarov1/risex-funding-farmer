@@ -2,12 +2,12 @@
 
 One slice per venue. Apply the A/B/C levels and safety core from `AGENTS.md`; operational run IDs are data, not source milestones.
 
-## RISEx — identify public-sweep predicate
+## RISEx — distinguish order-book safety predicate
 
 Status: `AUTHORIZED CREDENTIAL-FREE DIAGNOSTIC GATE`.
 
 - The local lifecycle database is recovered and repeatedly passes `LifecycleClearBinding`; its exact protected pre-recovery backup and the immutable consumed runtime row remain preserved.
-- Make one separate credential-free reproduction of the nine-request public sweep that records only the sanitized failing validation phase/predicate and bounded aggregate semantic evidence, never raw bodies or account identity. Allow one retry only for a qualifying transport failure before a valid observation; a complete HTTP/schema/safety result is terminal.
+- Make one separate credential-free observation of the exact accepted BTC/USDC public orderbook and retain only bounded aggregate evidence sufficient to distinguish `best_bid >= best_ask` from `best_ask > best_bid * (1 + MAX_BOUND_FRACTION)`, never raw levels or account identity. Allow one retry only for a qualifying transport failure before a valid observation; a complete HTTP/schema/safety result is terminal.
 - Do not load the credential source, derive/sign, dispatch a private request, mutate account state, or write. Add code/tests only for a concrete observed contract defect; a later authenticated run must use another fresh durable runtime ID.
 
 ## Nado — accept sparse official product IDs

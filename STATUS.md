@@ -16,6 +16,7 @@
 - The observed lifecycle-clear rejection now has an accepted distinct sanitized safety classification that persists before every public, credential, signing, private, and write effect and remains terminal across restart.
 - Read-only recovery inspection found one obsolete empty three-column `cancels` table; integrity, identities, and zero intents/cancels were otherwise correct. A protected exact backup was verified before the table was transactionally replaced with the accepted canonical schema. `LifecycleClearBinding` now passes repeatedly, and the consumed private-read runtime database remained byte-identical.
 - The fresh Level B run completed all nine first-barrier public requests, then stopped on an unclassified public-sweep semantic failure before source load, credential access, signing, or private dispatch. Its new runtime row is terminal and immutable; no retry or write occurred.
+- A separate credential-free reproduction localized that failure to the accepted BTC/USDC order-book `crossed book` predicate after all nine responses validated. The current predicate combines a literal crossed BBO with an over-wide bounded spread, so one aggregate-only book diagnostic remains before deciding whether this is market state or a contract defect.
 
 ### Nado
 
