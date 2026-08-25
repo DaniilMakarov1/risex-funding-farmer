@@ -29,6 +29,7 @@
 - The next fresh Level B run passed contracts, status, sparse `all_products`, and linked-signer public checks, then stopped with sanitized `SCHEMA` on public `subaccount_info`. Credential loader, derivation, signing, private trigger dispatch, and writes remained unused; its runtime row is terminal and immutable.
 - The first separate credential-free schema diagnostic confirmed the failure is in the public-response prefix but did not retain enough bounded envelope evidence to identify the exact field mismatch. That diagnostic is terminal and will not be replayed; one narrower envelope-shape observation is required before deciding whether code is defective.
 - The narrower observation stopped deterministically because the current public `subaccount_info` response exceeded the accepted 65,536-byte transport ceiling before a complete body could be retained. Official documentation confirms this response includes account balances plus complete spot and perpetual product structures. This is an observed Nado-local response-size compatibility defect, not credentials or rate limiting; the basic query has weight 2.
+- The accepted Nado correction gives only `subaccount_info` a finite 1,048,576-byte ceiling; all unrelated responses retain 65,536 bytes and strict JSON, fixed-host, timeout, redirect, freshness, and fail-closed protections. Focused review passed 243 tests and the synchronized clean Python 3.11 suite passed 1,898 tests.
 
 ### Extended
 
@@ -39,6 +40,7 @@
 - The next fresh Level B run completed credential load and all three first REST reads, then failed during the authenticated stream open before upgrade validation or any frame. The durable result is sanitized `UNEXPECTED_FAILURE`; no signing, account mutation, or write occurred, and the new runtime row is terminal and immutable.
 - A separate authenticated handshake classified the current account-stream response as HTTP 403, not rate-limit HTTP 429. Official SDK source sends both `X-Api-Key` and an explicit SDK `User-Agent`; the accepted runner actually supplies only `X-Api-Key` while claiming both header names in evidence. This is a concrete implementation/attestation mismatch requiring one SDK-conformant handshake observation before any correction is opened.
 - The SDK-conformant handshake, using the official `X10PythonTradingClient/2.5.0` user-agent form and the existing valid REST API key, still returned HTTP 403 before upgrade and sent no frame. The missing explicit user-agent is a local implementation/attestation defect but not the cause of the 403; the remaining blocker is external account-stream access/ingress authorization, not quota exhaustion.
+- The accepted Extended correction now sends the official SDK user-agent explicitly with `X-Api-Key` and derives sanitized header-name evidence from the actual request. Focused review passed 205 tests and the synchronized clean Python 3.11 suite passed 1,898 tests. It does not clear the external HTTP 403 account-stream blocker.
 
 ## Exit condition
 

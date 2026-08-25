@@ -10,19 +10,19 @@ Status: `WAITING FOR EXTERNAL MARKET STATE`.
 - The latest public BTC/USDC book was not crossed but had an approximately 18.83% spread against the accepted 0.30% safety bound. Wait for a later external market-state change; do not weaken the bound or repeat the authenticated gate while this blocker persists.
 - After a credential-free book observation passes the existing bound, perform one fresh Level B run with another durable runtime ID. Do not dispatch an order, cancel, close, account mutation, or any other write.
 
-## Nado — accept bounded current `subaccount_info` size
+## Nado — fresh Level B after accepted response ceiling
 
-Status: `AUTHORIZED FIXTURE CORRECTION`.
+Status: `AUTHORIZED LEVEL B READ-ONLY GATE`.
 
-- From exact published `main`, make the smallest Nado-local change that gives current complete public `subaccount_info` responses a finite defensible ceiling above 65,536 bytes while retaining strict JSON, timeout, redirect, host, freshness, and fail-closed checks. Keep unrelated public responses bounded and add focused boundary/oversize regressions for the distinct risk.
-- Do not load credentials, derive/sign, dispatch a private trigger request, mutate account state, or write during development. After independent acceptance, a later Level B run must use another fresh durable runtime ID.
+- On exact published `main`, perform one fresh operational Level B run with a new durable runtime ID. Public checks must complete before any credential load; preserve the initial-attempt-plus-one-transport-retry rule and sanitized failure classes.
+- Do not mutate account state or dispatch any order, cancel, close, deposit, withdrawal, or other write. A complete schema/auth/identity/safety result is terminal and must not be replayed.
 
-## Extended — make stream headers truthful and SDK-conformant
+## Extended — wait for account-stream access resolution
 
-Status: `AUTHORIZED FIXTURE CORRECTION`.
+Status: `BLOCKED ON EXTERNAL ACCESS / USER AUTHORITY`.
 
-- From exact published `main`, make the smallest Extended-local change so the actual account-stream handshake explicitly sends the official SDK user-agent form together with `X-Api-Key`, and the reported header-name evidence exactly reflects the actual request. Add focused regressions for exact headers and secret redaction; do not change endpoint, account identity, frame behavior, retry policy, or REST semantics.
-- The SDK-conformant diagnostic still returned HTTP 403, so this correction must not claim operational readiness. Do not send application frames, sign, mutate account state, or dispatch an order, cancel, close, or any other write. A later full read requires a separate external-state/account-access gate and fresh durable runtime ID.
+- The official-SDK-conformant authenticated account-stream handshake still returns HTTP 403 while the same API key succeeds on authenticated REST. Do not repeat the gate or change code speculatively. Resolution now requires provider-side stream access normalization or separately authorized API-key reprovisioning/rotation through Extended API Management.
+- After that external change, perform one fresh Level B run with another durable runtime ID. Do not send application frames beyond the accepted passive protocol/barrier behavior, sign, mutate account state, or dispatch any write.
 
 ## Completion
 
