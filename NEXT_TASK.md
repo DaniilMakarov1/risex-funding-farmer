@@ -2,26 +2,26 @@
 
 One slice per venue. Apply the A/B/C levels and safety core from `AGENTS.md`; operational run IDs are data, not source milestones.
 
-## RISEx — await separate local recovery authority
+## RISEx — recover local lifecycle database
 
-Status: `WAITING FOR USER AUTHORITY`.
+Status: `AUTHORIZED LOCAL RECOVERY GATE`.
 
-- The distinct sanitized lifecycle-clear safety classification is accepted. Preserve the consumed runtime row and do not repair, delete, migrate, or replace the noncanonical operational lifecycle database without a separately authorized recovery gate.
-- Do not authorize a fresh private-read runtime row, credential access, signing, network request, or write. The next bounded action must be an explicit user decision between continued halt and a separately specified local recovery path; any later Level B observation is another gate.
+- Inspect the noncanonical lifecycle database read-only, identify the exact canonicality failure, and preserve the consumed runtime row as immutable evidence. Before any mutation, create and verify a protected recoverable backup; then perform only the smallest venue-local repair, migration, or replacement needed for a fresh canonical runtime database.
+- This gate performs no network request, credential access, signing, private read, or write. Prove the recovered database passes `LifecycleClearBinding` and that the historical failed database and runtime row remain recoverable. A fresh Level B observation is a later separate gate.
 
-## Nado — halt after public safety failure
+## Nado — identify public safety predicate
 
-Status: `BLOCKED — DIAGNOSTIC SAFETY FAILURE`.
+Status: `AUTHORIZED CREDENTIAL-FREE DIAGNOSTIC GATE`.
 
-- The accepted credential-free gate ended on its first attempt with sanitized `SAFETY`; this is a complete terminal result, not a transport failure, so its retry allowance was not used. Do not replay it, load credentials, sign, dispatch a private request, mutate account state, or write.
-- A later action requires a separately bounded diagnostic gate with enough official or newly observed evidence to distinguish the safety predicate without preserving a raw body. Authenticated access remains unauthorized until a fresh public gate succeeds; add code/tests only for a concrete observed contract defect.
+- Make one new bounded credential-free `all_products` diagnostic that records only the sanitized failing predicate/phase and required aggregate semantic evidence, never a raw body. Allow the initial attempt plus one retry only for a transport failure before a valid observation; any HTTP, schema, identity, or safety result is terminal.
+- Do not load credentials, sign, dispatch a private request, mutate account state, or write. If the public contract passes, a later authenticated Level B gate may proceed under the standing read-only authority; add code/tests only for a concrete observed contract defect.
 
-## Extended — resume authenticated read-only readiness
+## Extended — diagnose official stream availability
 
-Status: `WAITING FOR OFFICIAL STREAM AVAILABILITY`.
+Status: `AUTHORIZED CREDENTIAL-FREE AVAILABILITY DIAGNOSTIC`.
 
-- Wait for a later external-state change; the latest credential-free handshake gate exhausted its transport allowance and ended on HTTP 503. After recovery, if the accepted runner is still source-bound, first make one minimal Level B runtime-run-ID decoupling candidate; then perform the fresh authenticated read under a separate operational gate.
-- Validate required account/order/position semantics and authoritative zero orders/exact flatness. Add code/tests only for an observed contract defect.
+- Make one fresh credential-free DNS/TLS/WebSocket availability diagnostic against the exact official testnet account-stream endpoint. Allow the initial attempt plus one retry only after a transport failure before a valid HTTP observation; HTTP 503 or another complete HTTP/semantic result is terminal. Preserve only sanitized DNS/TLS/HTTP class and bounded endpoint identity, never credentials or response bodies.
+- If the endpoint is available, first make the smallest Extended-local runtime-run-ID decoupling candidate if the accepted runner remains source-bound, then perform a fresh authenticated read under the standing Level B authority. Add code/tests only for an observed contract defect.
 
 ## Completion
 

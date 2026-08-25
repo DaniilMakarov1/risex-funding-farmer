@@ -4,6 +4,7 @@
 
 - Published `main == origin/main`; Git is the exact accepted-history authority.
 - All three fixture lifecycle cores are integrated. Paper remains default; no venue is strategy-ready.
+- User permanently authorizes bounded venue-local diagnostics, read-only gates, and recoverable local operational-database recovery without repeated approval. Testnet writes, mainnet, real funds, account mutation, and product/economic changes remain separately governed.
 
 ## Venue readiness
 
