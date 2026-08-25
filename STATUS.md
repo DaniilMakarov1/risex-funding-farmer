@@ -16,7 +16,7 @@
 - The observed lifecycle-clear rejection now has an accepted distinct sanitized safety classification that persists before every public, credential, signing, private, and write effect and remains terminal across restart.
 - Read-only recovery inspection found one obsolete empty three-column `cancels` table; integrity, identities, and zero intents/cancels were otherwise correct. A protected exact backup was verified before the table was transactionally replaced with the accepted canonical schema. `LifecycleClearBinding` now passes repeatedly, and the consumed private-read runtime database remained byte-identical.
 - The fresh Level B run completed all nine first-barrier public requests, then stopped on an unclassified public-sweep semantic failure before source load, credential access, signing, or private dispatch. Its new runtime row is terminal and immutable; no retry or write occurred.
-- A separate credential-free reproduction localized that failure to the accepted BTC/USDC order-book `crossed book` predicate after all nine responses validated. The current predicate combines a literal crossed BBO with an over-wide bounded spread, so one aggregate-only book diagnostic remains before deciding whether this is market state or a contract defect.
+- Separate credential-free diagnostics showed the BTC/USDC BBO was not literally crossed, but its spread was about 18.83% against the accepted 0.30% safety bound. This is current testnet liquidity, not a database, credential, rate-limit, or parser defect; do not weaken the bound.
 
 ### Nado
 
@@ -25,12 +25,14 @@
 - Runtime run identity is accepted. The latest Level B run stopped on public `all_products` before credential access; its historical runtime row remains immutable.
 - The accepted private-read report now durably distinguishes sanitized `TRANSPORT`, `HTTP`, `SCHEMA`, `AUTH`, `IDENTITY`, and `SAFETY` failures without raw bodies, secrets, signatures, or account identity.
 - A fresh credential-free `all_products` diagnostic received a valid transport/envelope but stopped because current product IDs are not contiguous. Official documentation treats the returned IDs as the valid set and does not require contiguity, so this is an observed Nado-local parser defect, not a rate limit or credential failure. No credentials, signing, private dispatch, or write occurred.
+- The accepted Nado correction now treats unique non-negative product IDs returned by official `all_products` as the authoritative sparse set while retaining exact collateral, duplicate, malformed, account-coverage, cross-response, counter, signing, and no-rearm safety checks.
 
 ### Extended
 
 - The fixed identity and API-key capability are securely provisioned. The accepted account-shape witness completed `CAPTURED` with every counter exactly `1/1` and no write.
 - The exact `{status, data}` parser correction is accepted. The latest private read completed its first REST pass, then the official account stream returned HTTP 503 before any frame; no write occurred.
 - A fresh credential-free handshake confirmed that the old source-bound testnet stream host resolves and completes TLS but returns HTTP 503. Current official SDK configuration instead names `wss://starknet.sepolia.extended.exchange/stream.extended.exchange/v1`; its account path returned HTTP 403 without an API key, proving the current host is available and enforcing authentication. This is an observed Extended-local endpoint drift, not a rate limit; no credentials or frames were sent.
+- The accepted Extended correction binds the current official testnet stream host and allocates a fresh durable runtime run ID in a protected multi-row journal while preserving historical rows, account/write identities, direct TLS, header-only API-key authentication, and normal-startup isolation.
 
 ## Exit condition
 
