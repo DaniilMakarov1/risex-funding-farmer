@@ -518,6 +518,109 @@ def test_production_no_event_no_identity_waits_for_expiry_then_proves_zero_flat(
     )
 
 
+def test_production_quiet_timeout_after_initial_zero_snapshots_uses_barrier(
+    monkeypatch,
+):
+    class Resource:
+        def close(self):
+            return None
+
+    class Transport:
+        def __init__(self):
+            self.frames = [
+                {
+                    "method": "subscribe", "status": "success", "data": {},
+                    "channel": "orders", "type": "success",
+                },
+                orders_snapshot(),
+                {
+                    "method": "subscribe", "status": "success", "data": {},
+                    "channel": "positions", "type": "success",
+                },
+                position_frame(kind="snapshot"),
+            ]
+            self.receives = self.orders_subscriptions = self.positions_subscriptions = 0
+
+        async def orders_subscribe(self):
+            self.orders_subscriptions += 1
+
+        async def positions_subscribe(self):
+            self.positions_subscriptions += 1
+
+        async def _receive(self):
+            self.receives += 1
+            if self.frames:
+                return self.frames.pop(0)
+            raise TimeoutError
+
+        async def close(self):
+            return None
+
+    current = [NOW]
+    sleeps = []
+
+    async def advance(seconds):
+        sleeps.append(seconds)
+        current[0] += seconds
+
+    transport = Transport()
+    capability = operational._ProductionReadCapability(
+        Resource(), Resource(), transport, lambda: current[0],
+    )
+    assert asyncio.run(capability._account()) == account()
+    barriers = []
+
+    async def repeated_zero_flat_barrier():
+        barriers.append(current[0])
+        return int(current[0])
+
+    capability._full_public_prestate = repeated_zero_flat_barrier
+    monkeypatch.setattr(operational.asyncio, "sleep", advance)
+    intent = replace(
+        opening_intent(lifecycle_state="AMBIGUOUS"),
+        order_id=None, expires_at=NOW + 60,
+    )
+    evidence = asyncio.run(capability.evidence(intent))
+    assert transport.receives == 5
+    assert transport.orders_subscriptions == transport.positions_subscriptions == 1
+    assert sleeps == [61] and barriers == [NOW + 61]
+    assert evidence.terminal and evidence.filled_size == evidence.position == 0
+    assert evidence.by_id_order is None
+
+
+@pytest.mark.parametrize("failure", [ConnectionResetError, TimeoutError])
+def test_production_no_event_timeout_fallback_rejects_disconnect_or_missing_snapshot(
+    failure,
+):
+    class Resource:
+        def close(self):
+            return None
+
+    class Transport:
+        async def _receive(self):
+            raise failure
+
+        async def close(self):
+            return None
+
+    capability = operational._ProductionReadCapability(
+        Resource(), Resource(), Transport(), lambda: NOW,
+    )
+    capability._subscribed = True
+    capability._orders = ()
+    capability._position = (Decimal("0"), False, NOW * 1_000_000_000, 1)
+    capability._stream_sequence = 1
+    if failure is ConnectionResetError:
+        capability._orders_snapshot_received = True
+        capability._position_snapshot_received = True
+    intent = replace(
+        opening_intent(lifecycle_state="AMBIGUOUS"),
+        order_id=None, expires_at=NOW + 60,
+    )
+    with pytest.raises(failure):
+        asyncio.run(capability.evidence(intent))
+
+
 @pytest.mark.parametrize(
     "change",
     [

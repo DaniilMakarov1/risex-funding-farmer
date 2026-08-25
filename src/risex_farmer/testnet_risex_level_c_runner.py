@@ -111,6 +111,8 @@ class _ProductionReadCapability:
         self._named_subscribe_acks: set[str] = set()
         self._orders: tuple[Mapping[str, Any], ...] | None = None
         self._position: tuple[Decimal, bool, int, int] | None = None
+        self._orders_snapshot_received = False
+        self._position_snapshot_received = False
         self._stream_sequence = 0
         self._closed = False
         self._prestate_verified = False
@@ -412,6 +414,7 @@ class _ProductionReadCapability:
                 if self._orders is not None:
                     raise LifecycleSafetyError("RISEx Level C duplicate orders snapshot")
                 self._orders, _ = self._orders_frame(value)
+                self._orders_snapshot_received = True
             elif value.get("type") == "update":
                 rows, _ = self._order_update(value)
                 if (
@@ -434,6 +437,8 @@ class _ProductionReadCapability:
             self._position = (
                 position, unexplained, timestamp, self._stream_sequence,
             )
+            if value.get("type") == "snapshot":
+                self._position_snapshot_received = True
         else:
             raise LifecycleSafetyError("RISEx Level C unrelated stream frame")
 
@@ -525,18 +530,29 @@ class _ProductionReadCapability:
         position_sequence = self._position[3] if self._position is not None else 0
         row = self._updates.pop(intent.client_order_id, None)
         if row is None:
-            observed = await self._pump_until(
-                lambda: intent.client_order_id in self._updates,
-                expected_client=intent.client_order_id, allow_absence=True,
+            exact_no_identity_open = (
+                intent.kind == "OPEN" and intent.order_type == "MARKET"
+                and intent.time_in_force == "FOK"
+                and not intent.reduce_only and not intent.post_only
+                and intent.order_id is None and intent.dispatch_count == 1
+                and intent.state in {"DISPATCHING", "DISPATCHED", "AMBIGUOUS"}
             )
-            if not observed:
-                exact_no_identity_open = (
-                    intent.kind == "OPEN" and intent.order_type == "MARKET"
-                    and intent.time_in_force == "FOK"
-                    and not intent.reduce_only and not intent.post_only
-                    and intent.order_id is None and intent.dispatch_count == 1
-                    and intent.state in {"DISPATCHING", "DISPATCHED", "AMBIGUOUS"}
+            try:
+                observed = await self._pump_until(
+                    lambda: intent.client_order_id in self._updates,
+                    expected_client=intent.client_order_id, allow_absence=True,
                 )
+            except TimeoutError:
+                initial_zero_flat_snapshots = (
+                    self._orders_snapshot_received
+                    and self._position_snapshot_received
+                    and self._orders == () and self._position is not None
+                    and self._position[:2] == (Decimal("0"), False)
+                )
+                if not exact_no_identity_open or not initial_zero_flat_snapshots:
+                    raise
+                observed = False
+            if not observed:
                 if not exact_no_identity_open:
                     raise LifecycleSafetyError(
                         "RISEx Level C stream observation unavailable"
