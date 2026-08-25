@@ -1405,6 +1405,189 @@ async def test_counted_operational_adapter_exact_sequence_and_terminal_report(
         assert handle.closed == 1
 
 
+@pytest.mark.parametrize(
+    ("failure_kind", "expected_class"),
+    (("transport", "TRANSPORT"), ("all_products_schema", "SCHEMA")),
+)
+@pytest.mark.asyncio
+async def test_level_b_public_failure_class_distinguishes_transport_from_catalog_schema(
+    tmp_path: Path, contract: dict[str, object], failure_kind: str,
+    expected_class: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import risex_farmer.nado_private_read_operational as operational
+
+    class Public:
+        def __init__(self) -> None:
+            self.entries = iter(contract["round_a"])
+            self.requests: list[str] = []
+
+        async def send_async(self, request: object) -> object:
+            assert isinstance(request, dict)
+            request_type = str(request["type"])
+            self.requests.append(request_type)
+            if request_type == "all_products":
+                if failure_kind == "transport":
+                    raise nado.NadoPreflightError(
+                        "operational gateway transport failed"
+                    )
+                entry = next(self.entries)
+                return nado.ObservedResponse(
+                    url=nado.FixedPreflightIdentity.gateway_query,
+                    final_url=nado.FixedPreflightIdentity.gateway_query,
+                    http_status=200,
+                    observed_at_ms=entry["observed_at_ms"],
+                    payload={"status": "success", "data": {}},
+                )
+            entry = next(self.entries)
+            return nado.ObservedResponse(
+                url=nado.FixedPreflightIdentity.gateway_query,
+                final_url=nado.FixedPreflightIdentity.gateway_query,
+                http_status=200,
+                observed_at_ms=entry["observed_at_ms"],
+                payload=entry["response"],
+            )
+
+    class Never:
+        async def send_async(self, request: object) -> object:
+            raise AssertionError("sensitive transport must remain unused")
+
+    effects = {"loader": 0, "recover": 0}
+
+    def load() -> object:
+        effects["loader"] += 1
+        raise AssertionError("credential loader must remain unused")
+
+    def recover(typed: dict[str, object], signature: str) -> str:
+        effects["recover"] += 1
+        raise AssertionError("signature recovery must remain unused")
+
+    public = Public()
+    config = _config(contract)
+    monkeypatch.setattr(nado, "_system_clock_ms", lambda: 1_700_000_000_025)
+    store = nado.OneShotStore(tmp_path / f"level-b-{failure_kind}.sqlite3")
+    report = await operational._fixture_run(
+        config=config,
+        store=store,
+        capability_loader=load,
+        recover_owner=recover,
+        path_hash="fixture-path-hash",
+        transports=(public, Never(), Never()),
+    )
+
+    assert public.requests == ["contracts", "status", "all_products"]
+    assert effects == {"loader": 0, "recover": 0}
+    assert report["status"] == nado.UNKNOWN
+    assert report["reason"] == "VALIDATION_FAILED"
+    assert report["failure_class"] == expected_class
+    assert report["counters"]["public_a_attempts"] == 3
+    assert report["counters"]["public_a_completions"] == 2
+    assert all(
+        report["counters"][f"{phase}_{suffix}"] == 0
+        for phase in nado.COUNTER_PHASES[1:]
+        for suffix in ("attempts", "completions")
+    )
+    assert not ({"payload", "signature", "owner", "sender"} & set(report))
+
+    restarted = await operational._fixture_run(
+        config=config,
+        store=store,
+        capability_loader=load,
+        recover_owner=recover,
+        path_hash="fixture-path-hash",
+        transports=(Never(), Never(), Never()),
+    )
+    assert restarted == report
+    assert effects == {"loader": 0, "recover": 0}
+
+
+@pytest.mark.parametrize(
+    ("sanitized_error", "expected_class"),
+    (
+        ("operational gateway transport failed", "TRANSPORT"),
+        ("transport HTTP status rejected", "HTTP"),
+        ("product catalog schema mismatch", "SCHEMA"),
+        ("credential loader failed", "AUTH"),
+        ("subaccount identity mismatch", "IDENTITY"),
+        ("public evidence temporal order mismatch", "SAFETY"),
+    ),
+)
+def test_level_b_all_sanitized_failure_classes_are_closed_and_durable(
+    tmp_path: Path, sanitized_error: str, expected_class: str,
+) -> None:
+    invocation_id = f"fixture-{expected_class.lower()}"
+    store = nado.OneShotStore(tmp_path / f"{expected_class.lower()}.sqlite3")
+    store.begin(invocation_id, "opaque-identity-tag", "fixture-path-hash")
+
+    failure_class = nado._sanitized_failure_class(
+        nado.NadoPreflightError(sanitized_error)
+    )
+    store.terminalize_unknown(
+        invocation_id, "VALIDATION_FAILED", failure_class,
+    )
+    report = store.terminal_report(invocation_id)
+
+    assert failure_class == expected_class
+    assert nado.FAILURE_CLASSES == {
+        "TRANSPORT", "HTTP", "SCHEMA", "AUTH", "IDENTITY", "SAFETY",
+    }
+    assert report is not None
+    assert report["failure_class"] == expected_class
+    serialized = json.dumps(report, sort_keys=True).lower()
+    assert sanitized_error.lower() not in serialized
+    for forbidden in ("raw", "body", "secret", "signature", "account identity"):
+        assert forbidden not in serialized
+
+
+def test_level_b_additive_failure_class_preserves_historical_terminal_row(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "historical.sqlite3"
+    counters = json.dumps(
+        nado.OneShotStore._empty_counters(), sort_keys=True, separators=(",", ":"),
+    )
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """CREATE TABLE nado_preflight_one_shot (
+                invocation_id TEXT PRIMARY KEY, state TEXT NOT NULL,
+                identity_tag TEXT NOT NULL, round_a_hash TEXT,
+                round_a_observed_ms INTEGER, trigger_hash TEXT,
+                trigger_observed_ms INTEGER, schema_version INTEGER NOT NULL,
+                path_hash TEXT NOT NULL, product_count INTEGER,
+                round_b_hash TEXT, reason TEXT NOT NULL,
+                counters_json TEXT NOT NULL, terminal_ms INTEGER
+            )"""
+        )
+        connection.execute(
+            "INSERT INTO nado_preflight_one_shot VALUES "
+            "(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "historical", nado.UNKNOWN, "opaque-tag", None, None, None, None,
+                nado.LEDGER_SCHEMA_VERSION, "fixed-path", None, None,
+                "VALIDATION_FAILED", counters, 1_700_000_000_000,
+            ),
+        )
+        before = connection.execute(
+            "SELECT * FROM nado_preflight_one_shot"
+        ).fetchone()
+
+    store = nado.OneShotStore(path)
+    report = store.terminal_report("historical")
+    with sqlite3.connect(path) as connection:
+        after = connection.execute(
+            """SELECT invocation_id,state,identity_tag,round_a_hash,
+                      round_a_observed_ms,trigger_hash,trigger_observed_ms,
+                      schema_version,path_hash,product_count,round_b_hash,
+                      reason,counters_json,terminal_ms
+               FROM nado_preflight_one_shot"""
+        ).fetchone()
+
+    assert after == before
+    assert report is not None
+    assert report["status"] == nado.UNKNOWN
+    assert report["reason"] == "VALIDATION_FAILED"
+    assert report["failure_class"] is None
+
+
 @pytest.mark.asyncio
 async def test_counted_interrupted_new_is_terminal_zero_effect(
     tmp_path: Path, contract: dict[str, object],

@@ -36,6 +36,9 @@ COUNTER_PHASES = (
     "public_a", "loader", "derive", "server_time", "sign", "recover",
     "trigger_dispatch", "trigger_observation", "public_b",
 )
+FAILURE_CLASSES = frozenset({
+    "TRANSPORT", "HTTP", "SCHEMA", "AUTH", "IDENTITY", "SAFETY",
+})
 
 SOURCE_PINS = {
     "typescript_sdk": "315e4f23dadefeb2f86f713e423241e81467d4c3",
@@ -105,6 +108,29 @@ TRIGGER_LIST_REQUEST_TYPE = "query_list_trigger_orders"
 
 class NadoPreflightError(RuntimeError):
     """A sanitized fail-closed contract or durable-state violation."""
+
+
+def _sanitized_failure_class(error: BaseException) -> str:
+    """Classify only the bounded sanitized exception, never external data."""
+    message = str(error).lower() if isinstance(error, NadoPreflightError) else ""
+    if "http status" in message:
+        return "HTTP"
+    if any(term in message for term in (
+        "schema", "strict json", "canonical json", "response size",
+    )):
+        return "SCHEMA"
+    if any(term in message for term in (
+        "identity", "owner mismatch", "subaccount mismatch",
+    )):
+        return "IDENTITY"
+    if any(term in message for term in (
+        "credential", "signer", "sign operation", "signature",
+        "signing capability", "capability is invalid", "owner derivation",
+    )):
+        return "AUTH"
+    if "transport" in message:
+        return "TRANSPORT"
+    return "SAFETY"
 
 
 class FixedPreflightIdentity:
@@ -364,7 +390,7 @@ class _OperationalFixedHostTransport:
     async def send_async(self, request: Mapping[str, object]) -> ObservedResponse:
         if not isinstance(request, Mapping):
             raise NadoPreflightError("request schema mismatch")
-        failed = False
+        failure_message: str | None = None
         try:
             request_body = dict(request)
             encoded_request = _canonical(request_body)
@@ -396,10 +422,12 @@ class _OperationalFixedHostTransport:
                         observed_at_ms = _system_clock_ms()
         except asyncio.CancelledError:
             raise
+        except NadoPreflightError as error:
+            failure_message = str(error)
         except BaseException:
-            failed = True
-        if failed:
-            raise NadoPreflightError(self.failure_label)
+            failure_message = self.failure_label
+        if failure_message is not None:
+            raise NadoPreflightError(failure_message)
         if type(observed_at_ms) is not int or observed_at_ms <= 0:
             raise NadoPreflightError("transport observation time is invalid")
         return ObservedResponse(
@@ -446,11 +474,23 @@ class OneShotStore:
                 product_count INTEGER,
                 round_b_hash TEXT,
                 reason TEXT NOT NULL DEFAULT '',
+                failure_class TEXT NOT NULL DEFAULT '',
                 counters_json TEXT NOT NULL DEFAULT '{}',
                 terminal_ms INTEGER
             )
             """
         )
+        columns = {
+            str(row[1])
+            for row in self._connection.execute(
+                "PRAGMA table_info(nado_preflight_one_shot)"
+            ).fetchall()
+        }
+        if "failure_class" not in columns:
+            self._connection.execute(
+                "ALTER TABLE nado_preflight_one_shot "
+                "ADD COLUMN failure_class TEXT NOT NULL DEFAULT ''"
+            )
         self._connection.commit()
 
     @staticmethod
@@ -606,15 +646,20 @@ class OneShotStore:
         if cursor.rowcount != 1:
             raise NadoPreflightError("public rounds disagree or observation is incomplete")
 
-    def terminalize_unknown(self, invocation_id: str, reason: str) -> None:
+    def terminalize_unknown(
+        self, invocation_id: str, reason: str, failure_class: str = "SAFETY",
+    ) -> None:
         bounded = reason if reason in {
             "INTERRUPTED", "CANCELLED", "VALIDATION_FAILED", "AMBIGUOUS_DISPATCH",
         } else "VALIDATION_FAILED"
+        if failure_class not in FAILURE_CLASSES:
+            raise NadoPreflightError("failure class is invalid")
         with self._connection:
             cursor = self._connection.execute(
-                """UPDATE nado_preflight_one_shot SET state=?,reason=?,terminal_ms=?
+                """UPDATE nado_preflight_one_shot
+                   SET state=?,reason=?,failure_class=?,terminal_ms=?
                    WHERE invocation_id=? AND state IN (?,?,?)""",
-                (UNKNOWN, bounded, _durable_now_ms(), invocation_id,
+                (UNKNOWN, bounded, failure_class, _durable_now_ms(), invocation_id,
                  NEW, CLAIMED, OBSERVED),
             )
         if cursor.rowcount != 1:
@@ -623,7 +668,8 @@ class OneShotStore:
     def terminal_report(self, invocation_id: str) -> dict[str, object] | None:
         row = self._connection.execute(
             """SELECT state,identity_tag,path_hash,product_count,reason,
-                      round_a_hash,trigger_hash,round_b_hash,terminal_ms
+                      round_a_hash,trigger_hash,round_b_hash,terminal_ms,
+                      failure_class
                FROM nado_preflight_one_shot WHERE invocation_id=?""",
             (invocation_id,),
         ).fetchone()
@@ -637,6 +683,9 @@ class OneShotStore:
             raise NadoPreflightError("durable terminal time is invalid")
         if row[3] is not None and (type(row[3]) is not int or row[3] <= 0):
             raise NadoPreflightError("durable product count is invalid")
+        failure_class = str(row[9])
+        if failure_class and failure_class not in FAILURE_CLASSES:
+            raise NadoPreflightError("durable failure class is invalid")
         counters = self.counters(invocation_id)
         return {
             "schema_version": LEDGER_SCHEMA_VERSION,
@@ -646,6 +695,7 @@ class OneShotStore:
             "path_hash": str(row[2]),
             "product_count": row[3],
             "reason": str(row[4]),
+            "failure_class": failure_class or None,
             "round_a_tag": None if row[5] is None else str(row[5])[:16],
             "trigger_tag": None if row[6] is None else str(row[6])[:16],
             "round_b_tag": None if row[7] is None else str(row[7])[:16],
@@ -1597,7 +1647,7 @@ async def _run_counted_operational_private_read(
         )
         store.terminalize_unknown(invocation_id, reason)
         raise
-    except BaseException:
+    except BaseException as error:
         try:
             counters = store.counters(invocation_id)
             reason = (
@@ -1606,7 +1656,9 @@ async def _run_counted_operational_private_read(
                 > counters["trigger_dispatch_completions"]
                 else "VALIDATION_FAILED"
             )
-            store.terminalize_unknown(invocation_id, reason)
+            store.terminalize_unknown(
+                invocation_id, reason, _sanitized_failure_class(error),
+            )
         except BaseException:
             pass
     finally:
@@ -1629,7 +1681,9 @@ async def _run_counted_operational_private_read(
                 close_failed = True
     if ready_to_finalize:
         if close_failed:
-            store.terminalize_unknown(invocation_id, "VALIDATION_FAILED")
+            store.terminalize_unknown(
+                invocation_id, "VALIDATION_FAILED", "SAFETY",
+            )
         else:
             store.finalize(invocation_id, round_b.fingerprint)
     report = store.terminal_report(invocation_id)
