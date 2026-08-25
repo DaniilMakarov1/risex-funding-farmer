@@ -11,13 +11,15 @@
 
 - Accepted private-read evidence has complete counters, authoritative zero orders, and exact flatness; its historical run identities remain immutable.
 - The accepted fixture lifecycle now binds `client_order_id` to composite, wide, and resting order identities, matching order/fill records, the exact cancel action/body identity split, and a fresh authoritative market position. It preserves durable no-replay and terminal zero-order/exact-flat barriers.
-- The isolated Level C credential/signing/fixed-write-transport binding is accepted with exact signed-action/submitted-body linkage and remains absent from normal startup. A fresh pre-state gate stopped before network/auth on a noncanonical local lifecycle database; its terminal runtime row is immutable and no write was dispatched. The next action is fixture-only classification of that fail-closed rejection, not a retry or database repair.
+- The isolated Level C credential/signing/fixed-write-transport binding is accepted with exact signed-action/submitted-body linkage and remains absent from normal startup. A fresh pre-state gate stopped before network/auth on a noncanonical local lifecycle database; its terminal runtime row is immutable and no write was dispatched.
+- The observed lifecycle-clear rejection now has an accepted distinct sanitized safety classification that persists before every public, credential, signing, private, and write effect and remains terminal across restart. Local database recovery and any fresh authenticated observation require separate authority; no retry or repair is active.
 
 ### Nado
 
 - The fixed identity is securely provisioned; Ink Sepolia gas and test USDT0 collateral are available, with exactly 10 test USDT0 deposited.
 - A fresh credential-free official catalog observation completed on its first transport attempt. Its complete uniform spot/perpetual structure exactly matches the accepted parser and fixtures, so no catalog code change is required.
-- Runtime run identity is accepted. The latest Level B run stopped on public `all_products` before credential access because its terminal result did not distinguish transport from catalog validation failure; the runtime row remains immutable and no retry is authorized.
+- Runtime run identity is accepted. The latest Level B run stopped on public `all_products` before credential access; its historical runtime row remains immutable.
+- The accepted private-read report now durably distinguishes sanitized `TRANSPORT`, `HTTP`, `SCHEMA`, `AUTH`, `IDENTITY`, and `SAFETY` failures without raw bodies, secrets, signatures, or account identity. A separate credential-free `all_products` diagnostic gate is next; authenticated access remains unauthorized until it succeeds.
 
 ### Extended
 

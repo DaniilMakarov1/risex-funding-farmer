@@ -2,19 +2,19 @@
 
 One slice per venue. Apply the A/B/C levels and safety core from `AGENTS.md`; operational run IDs are data, not source milestones.
 
-## RISEx — classify local lifecycle-clear rejection
+## RISEx — await separate local recovery authority
 
-Status: `READY FOR LEVEL A FIXTURE START GATE`.
+Status: `WAITING FOR USER AUTHORITY`.
 
-- Make one fixture-only candidate that records the observed lifecycle-clear rejection as a distinct sanitized safety failure instead of generic `validation_failed`. Preserve the consumed runtime row, no-rearm boundary, counter ordering, fail-closed predicate, and every transport/signing/write contract.
-- Prove the classified terminal result occurs before every public, credential, signing, private, and write effect. Do not inspect secrets, access the network, repair/delete/migrate the operational lifecycle database, or authorize a new private-read runtime row. Local recovery and any fresh Level B observation remain separate gates after acceptance.
+- The distinct sanitized lifecycle-clear safety classification is accepted. Preserve the consumed runtime row and do not repair, delete, migrate, or replace the noncanonical operational lifecycle database without a separately authorized recovery gate.
+- Do not authorize a fresh private-read runtime row, credential access, signing, network request, or write. The next bounded action must be an explicit user decision between continued halt and a separately specified local recovery path; any later Level B observation is another gate.
 
-## Nado — classify Level B public failure
+## Nado — diagnose public `all_products`
 
-Status: `READY FOR LEVEL B FIXTURE START GATE`.
+Status: `READY FOR CREDENTIAL-FREE DIAGNOSTIC GATE`.
 
-- Make only the smallest Nado-local correction that gives the durable private-read report a sanitized failure class sufficient to distinguish transport, HTTP, catalog schema, authentication, identity, and safety failures. Preserve the existing terminal row, no-rearm boundary, request sequence, parser, signing contract, and runtime/write identities; store no raw body, secret, signature, or account identity.
-- Candidate work is fixture-only and must prove distinct transport-versus-`all_products` schema outcomes. It performs no network request, credential load, signing, private dispatch, account mutation, or write. After acceptance, a separate credential-free diagnostic gate may observe `all_products`; authenticated access remains unauthorized until that public gate succeeds.
+- Make one bounded credential-free observation of the official `all_products` response through the accepted Nado parser and sanitized failure classifier. Allow only the initial transport attempt plus one retry, and only for a transport failure before a valid observation; HTTP, schema, identity, or safety failure is terminal.
+- Do not load credentials, sign, dispatch a private request, mutate account state, or write. Preserve only the bounded sanitized result and required semantic evidence, never a raw body. Authenticated access remains unauthorized until this gate succeeds; add code/tests only for a newly observed contract defect.
 
 ## Extended — resume authenticated read-only readiness
 
