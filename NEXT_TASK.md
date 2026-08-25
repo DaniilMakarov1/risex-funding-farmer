@@ -10,12 +10,13 @@ Status: `AUTHORIZED OPERATIONAL IMPLEMENTATION`.
 - Preserve the accepted minimum-size price-bounded `MARKET+FOK` opening and fresh-position reduce-only close sequence/fallback/attempt ceiling. Do not create a general framework, CLI mode in normal startup, paper/mainnet behavior, strategy, or cross-venue abstraction. Tests use injected transports only; the Builder must not load real credentials or execute a network/write gate.
 - After acceptance, Chief runs the runner once sequentially under the already-authorized `<= USD 500` Level C gate. Unexpected behavior halts for manual testnet recovery and is failure, never acceptance.
 
-## Nado — use the official aggregate open-orders query
+## Nado — bind the accepted lifecycle into one sealed Level C runner
 
-Status: `AUTHORIZED FIXTURE CORRECTION`.
+Status: `AUTHORIZED OPERATIONAL IMPLEMENTATION`.
 
-- In a fresh visible Nado Builder worktree, replace each per-product `subaccount_orders` sweep with one official `type: orders` request containing the exact sorted catalog IDs minus only fixed non-orderbook products 0 and 11. Validate exact sender echo, complete unique one-to-one `product_orders` coverage, each echoed product ID, and an empty strict `orders` list for every requested product; reject omissions, additions, duplicates, malformed identities/orders, failure envelopes, and catalog drift. Preserve complete account/balance/health coverage and all other barriers.
-- After accepted implementation, perform one fresh Level B. Do not dispatch a write unless it reaches full readiness; then the already-authorized minimum-notional Level C lifecycle may proceed sequentially under the existing Nado contract.
+- The fresh Level B is accepted and ready. In a fresh visible Nado Builder worktree, add the smallest sealed opt-in zero-argument operational runner that composes the fixed Ink Sepolia account/capability, accepted aggregate zero-order/account evidence, `nado_testnet_lifecycle` contracts, durable nonce/digest/write identity, and official gateway/trigger transports into the defined minimum-size post-only entry, exact cancel/reconciliation, fresh-position reduce-only aggressive IOC close, and final zero regular/trigger orders plus exact flatness.
+- Persist every runtime/write identity before dispatch, never replay ambiguous/in-flight writes, stop on unrelated/contradictory state, and cap automatic close attempts at three before manual recovery. Reuse accepted signing/query semantics; no generic engine, normal-startup mode, strategy, cross-venue abstraction, or mainnet behavior. Builder tests use injected transports only and must not load real credentials or dispatch a network/write gate.
+- After acceptance, Chief runs the sealed runner once sequentially under the already-authorized `<= USD 500` Level C gate.
 
 ## Extended — provider/API Management resolution required
 
