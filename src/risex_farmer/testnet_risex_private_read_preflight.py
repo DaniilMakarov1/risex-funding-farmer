@@ -413,7 +413,7 @@ class PrivateReadPreflight:
         ):
             raise ValueError("unordered book")
         best_bid, best_ask = bids[0][0], asks[0][0]
-        if best_bid >= best_ask or best_ask > best_bid * (Decimal(1) + MAX_BOUND_FRACTION):
+        if best_bid >= best_ask:
             raise ValueError("crossed book")
         adverse_ask = (
             (best_ask * (Decimal(1) + MAX_BOUND_FRACTION) / TICK)

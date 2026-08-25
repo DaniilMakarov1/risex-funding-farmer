@@ -317,6 +317,17 @@ def test_open_is_exact_minimum_price_bounded_market_fok(lifecycle):
         )
 
 
+def test_wide_positive_spread_preserves_exact_lifecycle_price_bound(lifecycle):
+    wide_bbo = bbo(ask=Decimal("90000.0"))
+
+    preflight = lifecycle.preflight(market(), account(), wide_bbo)
+    intent = lifecycle.prepare_open(preflight, 101, 7, 3, NOW + 30)
+
+    assert intent.size == Decimal("0.0001")
+    assert intent.price == Decimal("90270.0")
+    assert intent.size * intent.price <= Decimal("500")
+
+
 def test_fok_no_fill_finishes_flat_without_close_acceptance(lifecycle):
     intent = open_intent(lifecycle)
     dispatch(lifecycle, intent, OPENING_ORDER)
