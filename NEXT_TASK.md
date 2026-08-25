@@ -17,12 +17,12 @@ Status: `AUTHORIZED FIXTURE CORRECTION`.
 - In a fresh visible Nado Builder worktree, preserve product 11 (`NLP_USDT0`) in catalog/account/balance/health safety coverage but exclude it only from regular `subaccount_orders` orderbook queries, alongside collateral product 0. Bind this narrowly to the fixed testnet contract and add distinct regression/adverse evidence; do not generalize from ticker guesses or relax any other product coverage.
 - After accepted implementation, perform one fresh Level B run. Do not dispatch a write unless it reaches full readiness; then the already-authorized minimum-notional Level C lifecycle may proceed sequentially under the existing Nado contract.
 
-## Extended — reproduce account-stream access with the exact official SDK
+## Extended — provider/API Management resolution required
 
-Status: `AUTHORIZED FINAL AUTHENTICATED DIAGNOSTIC`.
+Status: `BLOCKED ON EXTERNAL ACCOUNT-STREAM ACCESS`.
 
-- In one isolated temporary Python environment, use the published official Extended Python SDK 2.5.0 and its exact testnet `StreamClient` account subscription with the existing protected REST-valid API key. Retain only package version, fixed host/path, sanitized HTTP/error class, and whether the upgrade/first passive frame succeeded; do not print the key or account data, rotate/reprovision credentials, sign, mutate account state, or write.
-- If the official SDK also receives HTTP 403, stop retries and report provider-side key/account-stream entitlement, environment/key generation, or ingress policy as the remaining causes for the user to check in Extended API Management/support. If it succeeds, open a fresh visible Extended Builder only for the concrete local transport difference, then rerun Level B.
+- Stop automated retries: published SDK 2.5.0 plus compatible `websockets` reaches its source-configured old account-stream host and receives HTTP 503, while current official source/accepted runner reaches the new host and receives HTTP 403 with the same REST-valid key. No local transport correction is evidenced.
+- User/provider action: in Extended Testnet API Management confirm the key was generated for the current Starknet Sepolia account/environment and is enabled for private account WebSocket streams; if the UI exposes no stream permission, ask Extended support to reconcile the PyPI 2.5.0 testnet stream host with current source and explain/clear the new-host 403 for this REST-valid key. Key rotation/reprovisioning remains unauthorized until the user chooses it. After provider-side change, rerun one fresh Level B before any write.
 
 ## Completion
 
