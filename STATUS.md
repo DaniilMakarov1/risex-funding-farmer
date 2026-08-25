@@ -30,6 +30,7 @@
 - The first separate credential-free schema diagnostic confirmed the failure is in the public-response prefix but did not retain enough bounded envelope evidence to identify the exact field mismatch. That diagnostic is terminal and will not be replayed; one narrower envelope-shape observation is required before deciding whether code is defective.
 - The narrower observation stopped deterministically because the current public `subaccount_info` response exceeded the accepted 65,536-byte transport ceiling before a complete body could be retained. Official documentation confirms this response includes account balances plus complete spot and perpetual product structures. This is an observed Nado-local response-size compatibility defect, not credentials or rate limiting; the basic query has weight 2.
 - The accepted Nado correction gives only `subaccount_info` a finite 1,048,576-byte ceiling; all unrelated responses retain 65,536 bytes and strict JSON, fixed-host, timeout, redirect, freshness, and fail-closed protections. Focused review passed 243 tests and the synchronized clean Python 3.11 suite passed 1,898 tests.
+- The next fresh Level B run again completed four of five first-round public requests, then stopped on public `subaccount_info`, now as sanitized `SAFETY` rather than response-size `SCHEMA`. Credential loading, derivation, signing, private trigger dispatch, and writes all remained at zero; its fresh runtime row is terminal and immutable.
 
 ### Extended
 
