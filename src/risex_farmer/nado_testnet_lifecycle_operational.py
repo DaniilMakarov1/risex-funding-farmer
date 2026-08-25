@@ -33,7 +33,8 @@ from .nado_private_read_operational import (
     _strict_identity, run as _accepted_private_read,
 )
 from .nado_private_read_preflight import (
-    FixedPreflightIdentity, list_trigger_orders_typed_data,
+    MAX_FRESHNESS_MS, FixedPreflightIdentity, NadoPreflightError,
+    ObservedResponse, _server_time_observation, list_trigger_orders_typed_data,
 )
 from .nado_testnet_lifecycle import (
     ACTIVE_PERP, CANCEL_ALL, CLOSE, COMPLETE, ENTRY,
@@ -838,9 +839,26 @@ class OperationalVenueIO:
         return result
 
     def _triggers(self) -> tuple[str, ...]:
+        time_payload = self._post(
+            _GATEWAY_HOST, "/v1/edge/query", {"type": "time"},
+        )
+        observed_at_ms = self.now_ms()
+        try:
+            server_ms = _server_time_observation(
+                ObservedResponse(
+                    url=FixedPreflightIdentity.gateway_edge_query,
+                    final_url=FixedPreflightIdentity.gateway_edge_query,
+                    http_status=200,
+                    observed_at_ms=observed_at_ms,
+                    payload=time_payload,
+                ),
+                self.now_ms,
+            )
+        except NadoPreflightError:
+            raise OperationalSafetyError("server time response rejected") from None
         capability = _load_owner_capability(self.sender)
         try:
-            recv = str(self.now_ms() + RECV_WINDOW_MS)
+            recv = str(server_ms + MAX_FRESHNESS_MS)
             typed = list_trigger_orders_typed_data(self.sender, recv)
             signature = capability.sign_list_trigger_orders(typed)
             if _recover_owner(typed, signature) != self.owner:
