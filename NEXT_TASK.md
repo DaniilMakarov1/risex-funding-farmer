@@ -9,12 +9,12 @@ Status: `WAITING FOR USER AUTHORITY`.
 - The distinct sanitized lifecycle-clear safety classification is accepted. Preserve the consumed runtime row and do not repair, delete, migrate, or replace the noncanonical operational lifecycle database without a separately authorized recovery gate.
 - Do not authorize a fresh private-read runtime row, credential access, signing, network request, or write. The next bounded action must be an explicit user decision between continued halt and a separately specified local recovery path; any later Level B observation is another gate.
 
-## Nado — diagnose public `all_products`
+## Nado — halt after public safety failure
 
-Status: `READY FOR CREDENTIAL-FREE DIAGNOSTIC GATE`.
+Status: `BLOCKED — DIAGNOSTIC SAFETY FAILURE`.
 
-- Make one bounded credential-free observation of the official `all_products` response through the accepted Nado parser and sanitized failure classifier. Allow only the initial transport attempt plus one retry, and only for a transport failure before a valid observation; HTTP, schema, identity, or safety failure is terminal.
-- Do not load credentials, sign, dispatch a private request, mutate account state, or write. Preserve only the bounded sanitized result and required semantic evidence, never a raw body. Authenticated access remains unauthorized until this gate succeeds; add code/tests only for a newly observed contract defect.
+- The accepted credential-free gate ended on its first attempt with sanitized `SAFETY`; this is a complete terminal result, not a transport failure, so its retry allowance was not used. Do not replay it, load credentials, sign, dispatch a private request, mutate account state, or write.
+- A later action requires a separately bounded diagnostic gate with enough official or newly observed evidence to distinguish the safety predicate without preserving a raw body. Authenticated access remains unauthorized until a fresh public gate succeeds; add code/tests only for a concrete observed contract defect.
 
 ## Extended — resume authenticated read-only readiness
 

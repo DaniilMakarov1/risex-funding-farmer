@@ -19,7 +19,8 @@
 - The fixed identity is securely provisioned; Ink Sepolia gas and test USDT0 collateral are available, with exactly 10 test USDT0 deposited.
 - A fresh credential-free official catalog observation completed on its first transport attempt. Its complete uniform spot/perpetual structure exactly matches the accepted parser and fixtures, so no catalog code change is required.
 - Runtime run identity is accepted. The latest Level B run stopped on public `all_products` before credential access; its historical runtime row remains immutable.
-- The accepted private-read report now durably distinguishes sanitized `TRANSPORT`, `HTTP`, `SCHEMA`, `AUTH`, `IDENTITY`, and `SAFETY` failures without raw bodies, secrets, signatures, or account identity. A separate credential-free `all_products` diagnostic gate is next; authenticated access remains unauthorized until it succeeds.
+- The accepted private-read report now durably distinguishes sanitized `TRANSPORT`, `HTTP`, `SCHEMA`, `AUTH`, `IDENTITY`, and `SAFETY` failures without raw bodies, secrets, signatures, or account identity.
+- The separate credential-free `all_products` diagnostic ended on its first attempt with sanitized `SAFETY`. The result was terminal, so no retry was made; no credentials, signing, private dispatch, or write occurred. Authenticated access remains unauthorized, and another public observation requires a separate diagnostic gate rather than replay of this one.
 
 ### Extended
 
