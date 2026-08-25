@@ -240,19 +240,106 @@ def test_exact_official_wire_success_and_one_shot_request(
         "message": {"sender": contract["sender"], "recvTime": "1700000030009"},
     }]
     assert store.state("fixture-invocation-001") == nado.FINALIZED
-    assert public is not None and len(public.calls) == 19
+    assert public is not None and len(public.calls) == 15
     expected_policy = nado.TransportPolicy(True, False, False, 5_000, 65_536)
     subaccount_policy = nado.TransportPolicy(True, False, False, 5_000, 1_048_576)
     assert set(public.policies) == {expected_policy, subaccount_policy}
     assert signed.policies == [expected_policy]
-    assert public.calls[:8] == [
+    assert public.calls[:7] == [
         {"type": "contracts"}, {"type": "status"}, {"type": "all_products"},
         {"type": "linked_signer", "subaccount": contract["sender"]},
         {"type": "subaccount_info", "subaccount": contract["sender"]},
-        {"type": "subaccount_orders", "sender": contract["sender"], "product_id": 0},
         {"type": "subaccount_orders", "sender": contract["sender"], "product_id": 2},
         {"type": "isolated_positions", "subaccount": contract["sender"]},
     ]
+    order_calls = [call for call in public.calls if call["type"] == "subaccount_orders"]
+    assert order_calls == [
+        {"type": "subaccount_orders", "sender": contract["sender"], "product_id": 2},
+        {"type": "subaccount_orders", "sender": contract["sender"], "product_id": 2},
+    ]
+
+
+def _drive_public_contract(
+    generator: object, contract: dict[str, object], *, account: dict[str, object],
+    products: dict[str, object],
+) -> tuple[list[dict[str, object]], object]:
+    calls: list[dict[str, object]] = []
+    request = next(generator)
+    observed_at = 0
+    while True:
+        calls.append(copy.deepcopy(request))
+        request_type = request["type"]
+        if request_type == "all_products":
+            data = products
+        elif request_type == "subaccount_info":
+            data = account
+        elif request_type == "subaccount_orders":
+            data = {
+                "sender": contract["sender"],
+                "product_id": request["product_id"],
+                "orders": [],
+            }
+        else:
+            data = contract["wire"][request_type]["data"]
+        observed_at += 1
+        try:
+            request = generator.send((copy.deepcopy(data), observed_at))
+        except StopIteration as completed:
+            return calls, completed.value
+
+
+def test_collateral_is_not_market_queried_and_every_market_is_queried_once_per_round(
+    contract: dict[str, object],
+) -> None:
+    products = copy.deepcopy(contract["wire"]["all_products"]["data"])
+    second_perp = copy.deepcopy(products["perp_products"][0])
+    second_perp["product_id"] = 5
+    products["perp_products"].append(second_perp)
+    account = copy.deepcopy(contract["wire"]["subaccount_info"]["data"])
+    account["perp_products"] = copy.deepcopy(products["perp_products"])
+    second_balance = copy.deepcopy(account["perp_balances"][0])
+    second_balance["product_id"] = 5
+    account["perp_balances"].append(second_balance)
+    account["health_contributions"].extend([["0", "0", "0"]] * 3)
+
+    round_a_calls, round_a = _drive_public_contract(
+        nado._round_a_contract(_config(contract)), contract,
+        account=account, products=products,
+    )
+    round_b_calls, round_b = _drive_public_contract(
+        nado._round_b_contract(_config(contract)), contract,
+        account=account, products=products,
+    )
+
+    for calls in (round_a_calls, round_b_calls):
+        queried = [call["product_id"] for call in calls
+                   if call["type"] == "subaccount_orders"]
+        assert queried == [2, 5]
+        assert 0 not in queried
+    assert round_a.product_count == round_b.product_count == 3
+    assert round_a.fingerprint == round_b.fingerprint
+
+
+def test_collateral_product_remains_fail_closed_account_safety(
+    contract: dict[str, object],
+) -> None:
+    products = copy.deepcopy(contract["wire"]["all_products"]["data"])
+    account = copy.deepcopy(contract["wire"]["subaccount_info"]["data"])
+    account["spot_balances"][0]["balance"]["amount"] = "0"
+    generator = nado._round_a_contract(_config(contract))
+    calls: list[dict[str, object]] = []
+    request = next(generator)
+    with pytest.raises(nado.NadoPreflightError, match="collateral floor"):
+        while True:
+            calls.append(copy.deepcopy(request))
+            request_type = request["type"]
+            data = (
+                products if request_type == "all_products"
+                else account if request_type == "subaccount_info"
+                else contract["wire"][request_type]["data"]
+            )
+            request = generator.send((copy.deepcopy(data), len(calls)))
+    assert all(call["type"] != "subaccount_orders" for call in calls)
 
 
 @pytest.mark.parametrize(
@@ -284,7 +371,7 @@ def test_pins_identity_and_official_fixture_shapes(contract: dict[str, object]) 
     contracts = contract["round_a"][0]["response"]
     products = contract["round_a"][2]["response"]
     account = contract["round_a"][4]["response"]
-    isolated = contract["round_a"][7]["response"]
+    isolated = contract["round_a"][6]["response"]
     assert set(contracts) == set(products) == set(account) == set(isolated) == {
         "status", "data", "request_type",
     }
@@ -433,7 +520,7 @@ def test_gateway_request_type_is_exact_and_bound_to_call_site(
     assert store.state("fixture-invocation-001") == nado.NEW
 
 
-@pytest.mark.parametrize("index", range(8))
+@pytest.mark.parametrize("index", range(7))
 def test_every_round_a_request_type_is_bound_before_sensitive_work(
     tmp_path: Path, contract: dict[str, object], index: int,
 ) -> None:
@@ -454,7 +541,7 @@ def test_every_round_a_request_type_is_bound_before_sensitive_work(
     assert signed_callback.calls == []
 
 
-@pytest.mark.parametrize("round_b_index", range(11))
+@pytest.mark.parametrize("round_b_index", range(8))
 def test_every_round_b_request_type_is_bound_without_sensitive_replay(
     tmp_path: Path, contract: dict[str, object], round_b_index: int,
 ) -> None:
@@ -524,7 +611,7 @@ def test_sparse_product_ids_must_match_across_responses(
     tmp_path: Path, contract: dict[str, object], response: str,
 ) -> None:
     entries = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
-    index = 4 if response == "embedded-account" else 17
+    index = 4 if response == "embedded-account" else 13
     entries[index]["response"]["data"]["perp_products"][0]["product_id"] = 3
     store = nado.OneShotStore(tmp_path / f"sparse-mismatch-{response}.sqlite3")
     with pytest.raises(nado.NadoPreflightError):
@@ -539,9 +626,9 @@ def test_complete_product_snapshots_allow_volatile_cross_response_drift(
     entries = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
     snapshots = (
         entries[4]["response"]["data"],
-        entries[8]["response"]["data"],
-        entries[11]["response"]["data"],
-        entries[17]["response"]["data"],
+        entries[7]["response"]["data"],
+        entries[9]["response"]["data"],
+        entries[13]["response"]["data"],
     )
     for offset, snapshot in enumerate(snapshots, start=1):
         spot = snapshot["spot_products"][0]
@@ -563,7 +650,7 @@ def test_complete_product_snapshots_allow_only_risk_price_drift(
     tmp_path: Path, contract: dict[str, object],
 ) -> None:
     entries = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
-    for offset, snapshot_index in enumerate((2, 4, 8, 11, 17), start=1):
+    for offset, snapshot_index in enumerate((2, 4, 7, 9, 13), start=1):
         products = entries[snapshot_index]["response"]["data"]
         products["spot_products"][0]["risk"]["price_x18"] = str(
             3 * 10**18 + offset
@@ -578,7 +665,7 @@ def test_complete_product_snapshots_allow_only_risk_price_drift(
     assert result.status == nado.FINALIZED
 
 
-@pytest.mark.parametrize("snapshot_index", [2, 4, 8, 11, 17])
+@pytest.mark.parametrize("snapshot_index", [2, 4, 7, 9, 13])
 @pytest.mark.parametrize("bad_price", ["NaN", "0", "-1"])
 def test_each_complete_product_snapshot_requires_canonical_positive_risk_price(
     tmp_path: Path, contract: dict[str, object], snapshot_index: int,
@@ -593,7 +680,7 @@ def test_each_complete_product_snapshot_requires_canonical_positive_risk_price(
     )
     with pytest.raises(nado.NadoPreflightError):
         _run(tmp_path, contract, public_entries=entries, store=store)
-    expected = nado.NEW if snapshot_index < 8 else nado.OBSERVED
+    expected = nado.NEW if snapshot_index < 7 else nado.OBSERVED
     assert store.state("fixture-invocation-001") == expected
 
 
@@ -740,7 +827,7 @@ def test_full_pinned_account_schema_and_embedded_catalog_are_required(
     assert store.state("fixture-invocation-001") == nado.NEW
 
 
-@pytest.mark.parametrize("field,bad", [("sender", "0x" + "00" * 32), ("product_id", 2), ("product_id", 0.0)])
+@pytest.mark.parametrize("field,bad", [("sender", "0x" + "00" * 32), ("product_id", 0), ("product_id", 0.0)])
 def test_subaccount_orders_exact_echo_and_scalar_type_are_required(
     tmp_path: Path, contract: dict[str, object], field: str, bad: object
 ) -> None:
@@ -817,7 +904,7 @@ def test_no_invented_normalized_containers_are_accepted(
 ) -> None:
     for index, invented in (
         (5, {"orders": []}),
-        (7, {"sender": contract["sender"], "positions": []}),
+        (6, {"sender": contract["sender"], "positions": []}),
     ):
         entries = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
         entries[index]["response"]["data"] = invented
@@ -833,7 +920,7 @@ def test_every_external_callback_exception_is_fully_sanitized_and_state_bounded(
     tmp_path: Path, contract: dict[str, object], stage: str
 ) -> None:
     public_callback = PublicFixture(list(contract["round_a"]) + list(contract["round_b"]))
-    public_callback.fail_at = 0 if stage == "public_a" else (8 if stage == "public_b" else None)
+    public_callback.fail_at = 0 if stage == "public_a" else (7 if stage == "public_b" else None)
     public = nado.SealedPublicTransport(callback=public_callback)
     signed_callback = SignedFixture(dict(contract["trigger"]))
     signed_callback.fail = stage == "signed"
@@ -868,7 +955,7 @@ def test_round_b_resume_uses_observed_evidence_without_second_sensitive_callback
 ) -> None:
     store = nado.OneShotStore(tmp_path / "resume.sqlite3")
     first_public, first_callback = _public(list(contract["round_a"]) + list(contract["round_b"]))
-    first_callback.fail_at = 9
+    first_callback.fail_at = 8
     signed, signed_callback = _signed(dict(contract["trigger"]))
     calls = Calls(contract)
     with pytest.raises(nado.NadoPreflightError):
@@ -926,15 +1013,15 @@ def test_round_b_contradiction_remains_observed_and_never_reobserves(
 ) -> None:
     entries = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
     if defect == "fingerprint":
-        entries[11]["response"]["data"]["healths"][0]["health"] = "2"
+        entries[9]["response"]["data"]["healths"][0]["health"] = "2"
     elif defect == "order":
-        entries[9]["response"]["data"]["orders"] = [{"digest": "0x01"}]
+        entries[8]["response"]["data"]["orders"] = [{"digest": "0x01"}]
     elif defect == "catalog":
-        entries[17]["response"]["data"]["perp_products"][0]["risk"][
+        entries[13]["response"]["data"]["perp_products"][0]["risk"][
             "long_weight_initial_x18"
         ] = "1"
     else:
-        entries[18]["response"]["data"]["linked_signer"] = "0x" + "01" * 20
+        entries[14]["response"]["data"]["linked_signer"] = "0x" + "01" * 20
     signed, callback = _signed(dict(contract["trigger"]))
     calls = Calls(contract)
     store = nado.OneShotStore(tmp_path / f"round-b-{defect}.sqlite3")
@@ -1120,7 +1207,7 @@ def test_perp_count_is_non_authoritative_when_full_perp_vector_is_exact_flat(
     for value in (0, 999, -1, True, 1.0, "garbage", None, {}, []):
         entries = copy.deepcopy(list(contract["round_a"]) + list(contract["round_b"]))
         entries[4]["response"]["data"]["perp_count"] = value
-        entries[11]["response"]["data"]["perp_count"] = value
+        entries[9]["response"]["data"]["perp_count"] = value
         result, *_ = _run(
             tmp_path, contract, public_entries=entries,
             store=nado.OneShotStore(tmp_path / f"ignored-perp-count-{value}.sqlite3"),
@@ -1368,11 +1455,11 @@ async def test_operational_runner_exact_owned_sequence_with_synthetic_boundaries
     )
     assert result.status == nado.FINALIZED and not clock_values
     assert (calls.loader, calls.derive, calls.sign, calls.recover) == (1, 1, 1, 1)
-    assert len(sessions) == 21 and all(len(session.calls) == 1 for session in sessions)
-    assert sessions[8].calls[0][0] == nado.FixedPreflightIdentity.gateway_edge_query
-    assert json.loads(sessions[8].calls[0][1]["data"]) == {"type": "time"}
-    assert sessions[9].calls[0][0] == nado.FixedPreflightIdentity.trigger_query
-    assert json.loads(sessions[9].calls[0][1]["data"])["tx"]["recvTime"] == "1700000030009"
+    assert len(sessions) == 17 and all(len(session.calls) == 1 for session in sessions)
+    assert sessions[7].calls[0][0] == nado.FixedPreflightIdentity.gateway_edge_query
+    assert json.loads(sessions[7].calls[0][1]["data"]) == {"type": "time"}
+    assert sessions[8].calls[0][0] == nado.FixedPreflightIdentity.trigger_query
+    assert json.loads(sessions[8].calls[0][1]["data"])["tx"]["recvTime"] == "1700000030009"
 
 
 @pytest.mark.parametrize("stage", ["derive", "recover"])
@@ -1582,12 +1669,12 @@ async def test_counted_operational_adapter_exact_sequence_and_terminal_report(
         assert report["reason"] == "VALIDATION_FAILED"
     assert report["product_count"] == 2
     counters = report["counters"]
-    assert counters["public_a_attempts"] == counters["public_a_completions"] == 8
-    assert counters["public_b_attempts"] == counters["public_b_completions"] == 11
+    assert counters["public_a_attempts"] == counters["public_a_completions"] == 7
+    assert counters["public_b_attempts"] == counters["public_b_completions"] == 8
     for phase in nado.COUNTER_PHASES[1:-1]:
         assert counters[f"{phase}_attempts"] == 1
         assert counters[f"{phase}_completions"] == 1
-    assert handle.closed == 1 and len(sessions) == 21 and not clock_values
+    assert handle.closed == 1 and len(sessions) == 17 and not clock_values
     assert "signature" not in json.dumps(report).lower()
     if close_fails:
         before_restart = len(sessions)

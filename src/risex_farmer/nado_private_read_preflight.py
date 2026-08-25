@@ -1107,6 +1107,8 @@ def _round_a_contract(
     data, at = yield {"type": "subaccount_info", "subaccount": config.sender}
     observed.append(at); account = _account(data, config.sender, products)
     for product_id, _, _ in products:
+        if product_id == 0:
+            continue
         data, at = yield {
             "type": "subaccount_orders", "sender": config.sender,
             "product_id": product_id,
@@ -1128,6 +1130,8 @@ def _round_b_contract(
     data, at = yield {"type": "all_products"}
     observed.append(at); products = _catalog(data)
     for product_id, _, _ in products:
+        if product_id == 0:
+            continue
         data, at = yield {
             "type": "subaccount_orders", "sender": config.sender,
             "product_id": product_id,
@@ -1137,12 +1141,6 @@ def _round_b_contract(
     observed.append(at); account = _account(data, config.sender, products)
     data, at = yield {"type": "isolated_positions", "subaccount": config.sender}
     observed.append(at); _isolated(data)
-    for product_id, _, _ in products:
-        data, at = yield {
-            "type": "subaccount_orders", "sender": config.sender,
-            "product_id": product_id,
-        }
-        observed.append(at); _orders(data, config.sender, product_id)
     data, at = yield {"type": "contracts"}
     observed.append(at); _contracts(data)
     data, at = yield {"type": "status"}
@@ -1649,8 +1647,9 @@ async def _run_counted_operational_private_read(
         ):
             raise NadoPreflightError("public rounds disagree or temporal barrier failed")
         counters = store.counters(invocation_id)
-        expected_a = round_a.product_count + 6
-        expected_b = 2 * round_a.product_count + 7
+        market_count = round_a.product_count - 1
+        expected_a = market_count + 6
+        expected_b = market_count + 7
         if (
             counters["public_a_attempts"] != expected_a
             or counters["public_a_completions"] != expected_a
