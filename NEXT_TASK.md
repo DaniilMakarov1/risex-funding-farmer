@@ -20,7 +20,7 @@ Status: `READY FOR LEVEL B FIXTURE START GATE`.
 
 Status: `WAITING FOR OFFICIAL STREAM AVAILABILITY`.
 
-- Check the official stream endpoint with one credential-free bounded handshake. After recovery, if the accepted runner is still source-bound, first make one minimal Level B runtime-run-ID decoupling candidate; then perform the fresh authenticated read under a separate operational gate.
+- Wait for a later external-state change; the latest credential-free handshake gate exhausted its transport allowance and ended on HTTP 503. After recovery, if the accepted runner is still source-bound, first make one minimal Level B runtime-run-ID decoupling candidate; then perform the fresh authenticated read under a separate operational gate.
 - Validate required account/order/position semantics and authoritative zero orders/exact flatness. Add code/tests only for an observed contract defect.
 
 ## Completion

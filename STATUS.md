@@ -23,7 +23,7 @@
 
 - The fixed identity and API-key capability are securely provisioned. The accepted account-shape witness completed `CAPTURED` with every counter exactly `1/1` and no write.
 - The exact `{status, data}` parser correction is accepted. The latest private read completed its first REST pass, then the official account stream returned HTTP 503 before any frame; no write occurred.
-- After endpoint recovery, a fresh bounded Level B observation may run with a new runtime journal row. The prior evidence remains immutable but does not make a proven read-only transport failure irreversible.
+- A fresh credential-free availability gate ended with DNS transport failure and then the sole allowed retry returned HTTP 503 before upgrade. No credentials or frames were sent. The endpoint remains unavailable; stop without further attempts until a later external-state change.
 
 ## Exit condition
 
