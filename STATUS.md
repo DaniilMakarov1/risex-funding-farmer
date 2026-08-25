@@ -11,7 +11,7 @@
 
 - Accepted private-read evidence has complete counters, authoritative zero orders, and exact flatness; its historical run identities remain immutable.
 - The accepted fixture lifecycle now binds `client_order_id` to composite, wide, and resting order identities, matching order/fill records, the exact cancel action/body identity split, and a fresh authoritative market position. It preserves durable no-replay and terminal zero-order/exact-flat barriers.
-- The remaining work is the minimum isolated Level C credential/signing/live-transport binding and one bounded empirical lifecycle. That binding awaits explicit user authorization; this governance correction grants none.
+- The minimum isolated Level C credential/signing/live-transport binding is explicitly authorized. Its deterministic candidate remains separate from the later Chief-gated single bounded empirical lifecycle; mainnet and real funds remain unauthorized.
 
 ### Nado
 

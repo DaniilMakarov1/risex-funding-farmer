@@ -4,9 +4,9 @@ One slice per venue. Apply the A/B/C levels and safety core from `AGENTS.md`; op
 
 ## RISEx — minimal Level C operational binding
 
-Status: `READY FOR USER LEVEL C BINDING AUTHORIZATION`.
+Status: `READY FOR LEVEL C BINDING START GATE`.
 
-- No Builder for the credential/signing/live-transport binding starts until explicit user authorization is recorded; this correction does not grant it. Once authorized, add only the isolated binding needed to run the accepted lifecycle with runtime run identity; do not change lifecycle semantics, shared code, strategy, or paper behavior.
+- Add only the isolated credential/signing/official-live-transport binding needed to run the accepted lifecycle with runtime run identity; do not change lifecycle semantics, shared code, strategy, paper behavior, or authorize a write from candidate acceptance alone.
 - Candidate acceptance requires official contract evidence, focused Level C regressions, and one final full suite. A later separate Chief operational gate controls the single minimum-size testnet write lifecycle.
 
 ## Nado — classify Level B public failure
