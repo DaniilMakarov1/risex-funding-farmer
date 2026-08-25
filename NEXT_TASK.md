@@ -2,20 +2,20 @@
 
 One slice per venue. Apply the A/B/C levels and safety core from `AGENTS.md`; operational run IDs are data, not source milestones.
 
-## RISEx — bind the accepted lifecycle into one sealed Level C runner
+## RISEx — automate observed no-event/no-fill reconciliation
 
-Status: `AUTHORIZED OPERATIONAL IMPLEMENTATION`.
+Status: `AUTHORIZED OBSERVED-DEFECT CORRECTION`.
 
-- The corrected fresh Level B is accepted and ready. In a fresh visible RISEx Builder worktree, add the smallest sealed opt-in operational runner that composes the already-accepted fixed account/environment, authoritative fresh market/account reads, recovered lifecycle store, `OperationalBinding`, and lifecycle reconciliation into the exact first-lifecycle contract. It must persist the runtime run ID and every unique intent before dispatch, never replay an ambiguous write, stop on unrelated/contradictory state, and end only on authoritative zero relevant orders plus exact flatness.
-- Preserve the accepted minimum-size price-bounded `MARKET+FOK` opening and fresh-position reduce-only close sequence/fallback/attempt ceiling. Do not create a general framework, CLI mode in normal startup, paper/mainnet behavior, strategy, or cross-venue abstraction. Tests use injected transports only; the Builder must not load real credentials or execute a network/write gate.
-- After acceptance, Chief runs the runner once sequentially under the already-authorized `<= USD 500` Level C gate. Unexpected behavior halts for manual testnet recovery and is failure, never acceptance.
+- The first live runner invocation dispatched one intent once and then received no terminal order event. Post-expiry authenticated/private and full public evidence proved no order identity, zero open orders, exact flatness, and no unrelated state; local recovery completed through the accepted safe-no-identity lifecycle rule.
+- In a fresh visible RISEx Builder worktree, make only the production runner consume that same authoritative post-expiry evidence after bounded event absence and reconcile `COMPLETED_NO_FILL_FLAT` without replay. Any pre-expiry, open-order, nonflat, unexplained, stale, or contradictory observation remains manual recovery. Preserve every write, close, and safety contract.
+- After acceptance, Chief may run one further sequential RISEx testnet lifecycle to seek evidence of the filled-position close path; no repeat is allowed from ambiguous state.
 
-## Nado — bind the accepted lifecycle into one sealed Level C runner
+## Nado — correct signed trigger-read freshness window
 
-Status: `AUTHORIZED OPERATIONAL IMPLEMENTATION`.
+Status: `AUTHORIZED OBSERVED-DEFECT CORRECTION`.
 
-- The fresh Level B is accepted and ready. In a fresh visible Nado Builder worktree, add the smallest sealed opt-in zero-argument operational runner that composes the fixed Ink Sepolia account/capability, accepted aggregate zero-order/account evidence, `nado_testnet_lifecycle` contracts, durable nonce/digest/write identity, and official gateway/trigger transports into the defined minimum-size post-only entry, exact cancel/reconciliation, fresh-position reduce-only aggressive IOC close, and final zero regular/trigger orders plus exact flatness.
-- Persist every runtime/write identity before dispatch, never replay ambiguous/in-flight writes, stop on unrelated/contradictory state, and cap automatic close attempts at three before manual recovery. Reuse accepted signing/query semantics; no generic engine, normal-startup mode, strategy, cross-venue abstraction, or mainnet behavior. Builder tests use injected transports only and must not load real credentials or dispatch a network/write gate.
+- The accepted sealed runner's first live invocation stopped before any intent or venue write because its signed trigger query used the 100 ms write receive window. A fresh standalone Level B with the same credentials immediately finalized; its accepted signed read uses server time plus 30,000 ms.
+- In a fresh visible Nado Builder worktree, reuse the accepted signed trigger-read time semantics and keep the 100 ms value only where the existing write contract requires it. Preserve strict response validation, no retry, no trigger write, and the empty pre-write runtime history; an invocation with zero intents is safe to retry without deleting its journal row.
 - After acceptance, Chief runs the sealed runner once sequentially under the already-authorized `<= USD 500` Level C gate.
 
 ## Extended — provider/API Management resolution required
