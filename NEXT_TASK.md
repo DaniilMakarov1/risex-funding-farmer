@@ -10,12 +10,12 @@ Status: `WAITING FOR EXTERNAL MARKET STATE`.
 - The latest public BTC/USDC book was not crossed but had an approximately 18.83% spread against the accepted 0.30% safety bound. Wait for a later external market-state change; do not weaken the bound or repeat the authenticated gate while this blocker persists.
 - After a credential-free book observation passes the existing bound, perform one fresh Level B run with another durable runtime ID. Do not dispatch an order, cancel, close, account mutation, or any other write.
 
-## Nado — exclude collateral from market-order queries
+## Nado — fresh Level B after market-query correction
 
-Status: `AUTHORIZED FIXTURE CORRECTION`.
+Status: `AUTHORIZED LEVEL B READ-ONLY GATE`.
 
-- From exact published `main`, make the smallest Nado-local change that retains fixed collateral product 0 in catalog, balance, health, and exact-flat safety checks but excludes it from `subaccount_orders` market queries in both public rounds. Preserve all other product coverage, order-zero, identity, temporal, counter, signing, and no-rearm checks.
-- Add focused regressions proving collateral remains safety-validated and is never queried as a market, while every non-collateral market product is still queried exactly once per round and contradictions remain fail-closed. Do not load credentials, derive/sign, dispatch private operations, mutate account state, or write during development. A later Level B run requires a fresh runtime ID after independent acceptance.
+- Perform one fresh operational Level B run from exact published `main` with a new durable runtime ID. Public checks must complete before credential load; the only signed request is the accepted read-only trigger-order query.
+- Preserve sanitized failure classes and no replay of a complete failure. Do not mutate account state or dispatch any order, cancel, close, deposit, withdrawal, or other write.
 
 ## Extended — wait for account-stream access resolution
 
