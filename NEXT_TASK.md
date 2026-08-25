@@ -2,19 +2,20 @@
 
 One slice per venue. Apply the A/B/C levels and safety core from `AGENTS.md`; operational run IDs are data, not source milestones.
 
-## RISEx — final sequential Level C lifecycle
+## RISEx — filled-path decision required
 
-Status: `READY FOR AUTHORIZED LEVEL C INVOCATION`.
+Status: `BLOCKED AFTER THREE SAFE NO-FILL INVOCATIONS`.
 
-- The accepted runner now handles both eight valid nonmatching frames and an ordinary quiet receive timeout after validated initial zero-order/flat snapshots through the same post-expiry double public barrier, without replay.
-- Chief may archive only the exact terminal recovered local database and run one further sequential lifecycle after Nado is terminal. Accept automatic `COMPLETED_NO_FILL_FLAT` as safe placement/no-fill evidence; a fill must additionally prove reconcile/cancel/close, authoritative zero orders, and exact flatness. No repeat is allowed from ambiguous state.
+- The third invocation dispatched once and reached terminal zero-fill/zero-position evidence; after a final-barrier transport stop, two independent authenticated observations and public sweeps proved zero orders/exact flatness and Chief recovered only the local outcome from a protected backup.
+- Do not repeat the unchanged opening. Durable dispatch/no-replay/no-fill reconciliation is evidenced, but cancel/close remains unproven because all three FOK openings produced no fill. Any new fill-seeking order behavior is a separate bounded product/economic decision.
 
 ## Nado — sequential Level C lifecycle
 
-Status: `READY FOR AUTHORIZED LEVEL C INVOCATION`.
+Status: `BLOCKED ON FIXED PRODUCT MINIMUM NOTIONAL`.
 
 - The signed trigger read now uses the accepted 30,000 ms window; the actual write retains its 100 ms contract. Current catalog minima are accepted as published, while the actual target opening and clamped closing amounts remain exactly step-aligned and fully safety-checked.
-- Both prior invocations stopped with zero intents and zero venue writes. Chief runs the sealed runner once sequentially under the already-authorized `<= USD 500` Level C gate; any new pre-write defect may receive one bounded venue-local diagnosis, while an ambiguous write stops without replay.
+- All three invocations stopped with zero intents and zero venue writes. Fixed BTC product 2 now has a minimum notional far above USD 500; credentials/private access and signing remain valid.
+- User decision required: authorize a fresh visible Nado Builder to replace only the sealed testnet target with one current sub-USD-500 perpetual. Recommended: product 20 `MON-PERP_USDT0` (observed minimum about USD 2.90); product 30 `PUMP-PERP_USDT0` is a lower-notional alternative. Preserve the fixed environment/account, USD 500 ceiling, durable identity, exact step checks, reconciliation, zero-order, and exact-flat contracts.
 
 ## Extended — provider/API Management resolution required
 
