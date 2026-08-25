@@ -10,12 +10,12 @@ Status: `WAITING FOR EXTERNAL MARKET STATE`.
 - The latest public BTC/USDC book was not crossed but had an approximately 18.83% spread against the accepted 0.30% safety bound. Wait for a later external market-state change; do not weaken the bound or repeat the authenticated gate while this blocker persists.
 - After a credential-free book observation passes the existing bound, perform one fresh Level B run with another durable runtime ID. Do not dispatch an order, cancel, close, account mutation, or any other write.
 
-## Nado — correct live catalog and sparse contribution checks
+## Nado — fresh Level B after account-shape corrections
 
-Status: `AUTHORIZED FIXTURE CORRECTION`.
+Status: `AUTHORIZED LEVEL B READ-ONLY GATE`.
 
-- From exact published `main`, make the smallest Nado-local change that preserves strict validation of each complete embedded product snapshot and cross-response product identity/kind/coverage/config safety while tolerating documented live state/book/oracle changes between sequential `all_products` and `subaccount_info` responses. Also validate `health_contributions` by official sparse product-ID indexing rather than contiguous product count, including explicit treatment of unused index slots. Do not weaken duplicate, collateral, balance, health, signing, counter, or no-rearm checks.
-- Add focused regressions for permitted volatile drift and sparse contribution indexing, plus forbidden identity/kind/config/coverage/unused-slot contradictions. Do not load credentials, derive/sign, dispatch a private trigger request, mutate account state, or write during development. A later Level B run requires another fresh durable runtime ID after independent acceptance.
+- On exact published `main`, perform one fresh operational Level B run with a new durable runtime ID. Public checks must complete before any credential load; preserve the initial-attempt-plus-one-transport-retry rule and sanitized failure classes.
+- Do not mutate account state or dispatch any order, cancel, close, deposit, withdrawal, or other write. A complete schema/auth/identity/safety result is terminal and must not be replayed.
 
 ## Extended — wait for account-stream access resolution
 
