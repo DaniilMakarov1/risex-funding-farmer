@@ -17,8 +17,7 @@
 
 - The fixed identity is securely provisioned; Ink Sepolia gas and test USDT0 collateral are available, with exactly 10 test USDT0 deposited.
 - A fresh credential-free official catalog observation completed on its first transport attempt. Its complete uniform spot/perpetual structure exactly matches the accepted parser and fixtures, so no catalog code change is required.
-- The Nado-local private-read runner now allocates each operational run identity at runtime in one protected durable journal while preserving its no-rearm and ambiguity barriers. Deterministic acceptance passed `1839` tests in the isolated Python 3.11/aiohttp 3.12.15 environment; no credential or network action occurred.
-- The first fresh Level B run is terminal `UNKNOWN / VALIDATION_FAILED`: public round A stopped on `all_products` at `3` attempts and `2` completions, before credential load, signing, or private dispatch (`0/0` throughout). Its runtime row is immutable; the outcome does not prove a transport-only retry condition.
+- Runtime run identity is accepted. The latest Level B run stopped on public `all_products` before credential access because its terminal result did not distinguish transport from catalog validation failure; the runtime row remains immutable and no retry is authorized.
 
 ### Extended
 

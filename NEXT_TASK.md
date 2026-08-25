@@ -9,12 +9,12 @@ Status: `READY FOR USER LEVEL C BINDING AUTHORIZATION`.
 - No Builder for the credential/signing/live-transport binding starts until explicit user authorization is recorded; this correction does not grant it. Once authorized, add only the isolated binding needed to run the accepted lifecycle with runtime run identity; do not change lifecycle semantics, shared code, strategy, or paper behavior.
 - Candidate acceptance requires official contract evidence, focused Level C regressions, and one final full suite. A later separate Chief operational gate controls the single minimum-size testnet write lifecycle.
 
-## Nado — preserve failed private-read boundary
+## Nado — classify Level B public failure
 
-Status: `BLOCKED — PUBLIC CATALOG FAILURE UNCLASSIFIED`.
+Status: `READY FOR LEVEL B FIXTURE START GATE`.
 
-- Preserve the terminal runtime row and do not retry, rearm, load credentials, or dispatch a private/write request. The failed `all_products` step is not proved transport-only and therefore cannot use the Level B retry allowance.
-- No Builder starts without a new bounded gate backed by concrete official evidence that distinguishes transport failure from catalog validation drift; do not infer a code defect from the generic terminal reason.
+- Make only the smallest Nado-local correction that gives the durable private-read report a sanitized failure class sufficient to distinguish transport, HTTP, catalog schema, authentication, identity, and safety failures. Preserve the existing terminal row, no-rearm boundary, request sequence, parser, signing contract, and runtime/write identities; store no raw body, secret, signature, or account identity.
+- Candidate work is fixture-only and must prove distinct transport-versus-`all_products` schema outcomes. It performs no network request, credential load, signing, private dispatch, account mutation, or write. After acceptance, a separate credential-free diagnostic gate may observe `all_products`; authenticated access remains unauthorized until that public gate succeeds.
 
 ## Extended — resume authenticated read-only readiness
 
