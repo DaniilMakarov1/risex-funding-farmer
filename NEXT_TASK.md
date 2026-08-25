@@ -10,19 +10,19 @@ Status: `WAITING FOR EXTERNAL MARKET STATE`.
 - The latest public BTC/USDC book was not crossed but had an approximately 18.83% spread against the accepted 0.30% safety bound. Wait for a later external market-state change; do not weaken the bound or repeat the authenticated gate while this blocker persists.
 - After a credential-free book observation passes the existing bound, perform one fresh Level B run with another durable runtime ID. Do not dispatch an order, cancel, close, account mutation, or any other write.
 
-## Nado — resume authenticated read-only readiness
+## Nado — identify `subaccount_info` schema defect
 
-Status: `READY FOR FRESH LEVEL B GATE`.
+Status: `AUTHORIZED CREDENTIAL-FREE DIAGNOSTIC GATE`.
 
-- Perform one fresh authenticated read-only observation with the accepted sparse product-set, runtime-run-ID, failure-class, counter, identity, redaction, and bounded-transport contracts. Allow only the initial attempt plus one retry after a qualifying transport failure before a valid observation.
-- Validate exact account state, zero regular/trigger orders, and exact flatness. Do not mutate account state or dispatch an order, cancel, close, or any other write.
+- Make one separate credential-free reproduction through the exact public sequence ending at `subaccount_info` and retain only the sanitized failing schema phase/predicate plus bounded aggregate field/product coverage, never a raw body or account identity. Allow one retry only for a qualifying transport failure before a valid observation; a complete HTTP/schema/safety result is terminal.
+- Do not load credentials, derive/sign, dispatch a private trigger request, mutate account state, or write. Add code/tests only for a concrete observed contract defect; a later authenticated run must use another fresh durable runtime ID.
 
-## Extended — resume authenticated read-only readiness
+## Extended — classify authenticated stream-open failure
 
-Status: `READY FOR FRESH LEVEL B GATE`.
+Status: `AUTHORIZED LEVEL B DIAGNOSTIC GATE`.
 
-- Perform one fresh authenticated read-only observation with the accepted current official stream host, fresh durable runtime run ID, header-only API key, counter, identity, redaction, and bounded-transport contracts. Allow only the initial attempt plus one retry after a qualifying transport failure before a valid observation.
-- Validate required account/order/position semantics and authoritative zero orders/exact flatness. Do not sign, mutate account state, or dispatch an order, cancel, close, or any other write.
+- Make one separate authenticated read-only handshake diagnostic against the accepted current official account-stream URL and retain only sanitized transport/HTTP/status classification and bounded endpoint identity, never the API key, headers, or response body. Allow one retry only for a qualifying DNS/TLS/connection failure before a valid HTTP observation; a complete HTTP/auth/safety result is terminal.
+- Do not send application frames, sign, mutate account state, or dispatch an order, cancel, close, or any other write. Add code/tests only for a concrete observed contract defect; a later full read must use another fresh durable runtime ID.
 
 ## Completion
 
