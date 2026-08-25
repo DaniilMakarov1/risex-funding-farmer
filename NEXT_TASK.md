@@ -2,12 +2,12 @@
 
 One slice per venue. Apply the A/B/C levels and safety core from `AGENTS.md`; operational run IDs are data, not source milestones.
 
-## RISEx — fresh authenticated pre-write barrier
+## RISEx — classify local lifecycle-clear rejection
 
-Status: `READY FOR LEVEL B OPERATIONAL GATE`.
+Status: `READY FOR LEVEL A FIXTURE START GATE`.
 
-- Run one fresh sealed RISEx authenticated private-read operation with its runtime journal identity. It may load only the fixed provisioned signer capability for the accepted auth contract and must freshly verify official config/domain/router/authorization, active signer, zero orders, exact flatness, and lifecycle-clear state; no order/cancel/close write is authorized.
-- Require a complete durable terminal report. Any semantic, authentication, identity, safety, unclassified, or ambiguous outcome stops without rearm or write; only a separately classified transport-only failure may use the Level B retry ceiling. A successful read enables a later separate Level C operational gate but never dispatches it automatically.
+- Make one fixture-only candidate that records the observed lifecycle-clear rejection as a distinct sanitized safety failure instead of generic `validation_failed`. Preserve the consumed runtime row, no-rearm boundary, counter ordering, fail-closed predicate, and every transport/signing/write contract.
+- Prove the classified terminal result occurs before every public, credential, signing, private, and write effect. Do not inspect secrets, access the network, repair/delete/migrate the operational lifecycle database, or authorize a new private-read runtime row. Local recovery and any fresh Level B observation remain separate gates after acceptance.
 
 ## Nado — classify Level B public failure
 

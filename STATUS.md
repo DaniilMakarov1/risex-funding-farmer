@@ -11,7 +11,7 @@
 
 - Accepted private-read evidence has complete counters, authoritative zero orders, and exact flatness; its historical run identities remain immutable.
 - The accepted fixture lifecycle now binds `client_order_id` to composite, wide, and resting order identities, matching order/fill records, the exact cancel action/body identity split, and a fresh authoritative market position. It preserves durable no-replay and terminal zero-order/exact-flat barriers.
-- The isolated Level C credential/signing/fixed-write-transport binding is accepted with exact signed-action/submitted-body linkage and remains absent from normal startup. The private-read runner now allocates atomic fresh runtime rows in one protected durable journal while blocking collision or unfinished-run rearm; the next action is a separately gated fresh authoritative pre-state, and no write has been dispatched.
+- The isolated Level C credential/signing/fixed-write-transport binding is accepted with exact signed-action/submitted-body linkage and remains absent from normal startup. A fresh pre-state gate stopped before network/auth on a noncanonical local lifecycle database; its terminal runtime row is immutable and no write was dispatched. The next action is fixture-only classification of that fail-closed rejection, not a retry or database repair.
 
 ### Nado
 
