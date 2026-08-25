@@ -10,19 +10,19 @@ Status: `WAITING FOR EXTERNAL MARKET STATE`.
 - The latest public BTC/USDC book was not crossed but had an approximately 18.83% spread against the accepted 0.30% safety bound. Wait for a later external market-state change; do not weaken the bound or repeat the authenticated gate while this blocker persists.
 - After a credential-free book observation passes the existing bound, perform one fresh Level B run with another durable runtime ID. Do not dispatch an order, cancel, close, account mutation, or any other write.
 
-## Nado — isolate `subaccount_info` envelope mismatch
+## Nado — accept bounded current `subaccount_info` size
 
-Status: `AUTHORIZED CREDENTIAL-FREE DIAGNOSTIC GATE`.
+Status: `AUTHORIZED FIXTURE CORRECTION`.
 
-- The prior schema diagnostic is terminal and must not be replayed. Make one new, narrower credential-free request to public `subaccount_info` and retain only top-level key names, bounded value types, response status/request-type class, and presence/absence flags needed to locate the envelope mismatch; never retain values from `data`, a raw body, or account identity. Allow one retry only for a qualifying transport failure before a valid observation; a complete HTTP/schema/safety result is terminal.
-- Do not load credentials, derive/sign, dispatch a private trigger request, mutate account state, or write. Add code/tests only for a concrete observed contract defect; a later authenticated run must use another fresh durable runtime ID.
+- From exact published `main`, make the smallest Nado-local change that gives current complete public `subaccount_info` responses a finite defensible ceiling above 65,536 bytes while retaining strict JSON, timeout, redirect, host, freshness, and fail-closed checks. Keep unrelated public responses bounded and add focused boundary/oversize regressions for the distinct risk.
+- Do not load credentials, derive/sign, dispatch a private trigger request, mutate account state, or write during development. After independent acceptance, a later Level B run must use another fresh durable runtime ID.
 
-## Extended — test official-SDK handshake conformance
+## Extended — make stream headers truthful and SDK-conformant
 
-Status: `AUTHORIZED LEVEL B DIAGNOSTIC GATE`.
+Status: `AUTHORIZED FIXTURE CORRECTION`.
 
-- The prior authenticated HTTP 403 diagnostic is terminal and must not be replayed. Make one new authenticated read-only handshake against the accepted current official account-stream URL using the official SDK's explicit `User-Agent` form together with the existing header-only API key. Retain only sanitized transport/HTTP/status classification and bounded endpoint identity, never the API key or response body. Allow one retry only for a qualifying DNS/TLS/connection failure before a valid HTTP observation; a complete HTTP/auth/safety result is terminal.
-- Do not send application frames, sign, mutate account state, or dispatch an order, cancel, close, or any other write. Add code/tests only for a concrete observed contract defect; a later full read must use another fresh durable runtime ID.
+- From exact published `main`, make the smallest Extended-local change so the actual account-stream handshake explicitly sends the official SDK user-agent form together with `X-Api-Key`, and the reported header-name evidence exactly reflects the actual request. Add focused regressions for exact headers and secret redaction; do not change endpoint, account identity, frame behavior, retry policy, or REST semantics.
+- The SDK-conformant diagnostic still returned HTTP 403, so this correction must not claim operational readiness. Do not send application frames, sign, mutate account state, or dispatch an order, cancel, close, or any other write. A later full read requires a separate external-state/account-access gate and fresh durable runtime ID.
 
 ## Completion
 
