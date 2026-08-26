@@ -54,7 +54,10 @@ RUN_STORE_BASENAME = ".risex-funding-farmer-nado-level-c-v1.sqlite3"
 REDACTED_STORE_PATH = "<passwd-home>/" + RUN_STORE_BASENAME
 TARGET_PRODUCT_ID = 44
 TARGET_TICKER_ID = "SKR-PERP_USDT0"
-RECV_WINDOW_MS = 100
+# Official Nado Python SDK 2.0.0's nado_protocol.utils.gen_order_nonce(
+# recv_time_ms=None) fences an order at the current UTC receive timestamp plus
+# 90 seconds.
+RECV_WINDOW_MS = 90_000
 HTTP_TIMEOUT_SECONDS = 5.0
 MAX_RESPONSE_BYTES = 1_048_576
 RECONCILE_READ_ATTEMPTS = 5

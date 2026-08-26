@@ -24,7 +24,8 @@ from risex_farmer.nado_testnet_lifecycle_operational import (
     DurableExecuteFailure, DurableOperationalFailure, OperationalSafetyError,
     OperationalVenueIO,
     OwnerOrderCapability, REDACTED_STORE_PATH, RUN_STORE_BASENAME,
-    SealedLifecycleRunner, TARGET_PRODUCT_ID, TARGET_TICKER_ID, _fixture_run, run,
+    RECV_WINDOW_MS, SealedLifecycleRunner, TARGET_PRODUCT_ID, TARGET_TICKER_ID,
+    _fixture_run, run,
 )
 from risex_farmer.nado_private_read_preflight import MAX_FRESHNESS_MS
 
@@ -57,7 +58,7 @@ class FixtureIO:
         )
 
     def now_ms(self) -> int:
-        self.clock += 101
+        self.clock += RECV_WINDOW_MS + 1
         return self.clock
 
     def terminal_status(self, digest: str):
@@ -143,6 +144,47 @@ class FixtureIO:
             catalog, evidence, product,
             7_765_000_000_000_000, 7_766_000_000_000_000,
         )
+
+
+class ReceiveWindowFixtureIO(FixtureIO):
+    """Keep sealed-runner receive-window tests fast while recording fencing."""
+
+    def __init__(self, entry: str = "RESTING", close: tuple[str, ...] = ("FILLED",)) -> None:
+        super().__init__(entry, close)
+        self.last_now_ms: int | None = None
+        self.write_timings: list[tuple[str, int, int]] = []
+
+    def now_ms(self) -> int:
+        self.clock += RECV_WINDOW_MS + 1
+        self.last_now_ms = self.clock
+        return self.clock
+
+    def dispatch(self, intent, signature) -> str:
+        assert self.last_now_ms is not None
+        self.write_timings.append((intent.kind, self.last_now_ms, intent.recv_time))
+        return super().dispatch(intent, signature)
+
+
+def assert_nonce_and_digest_binding(intent: OrderIntent) -> None:
+    salt = intent.nonce & ((1 << 20) - 1)
+    assert intent.nonce == build_order_nonce(intent.recv_time, salt)
+    payload = json.loads(intent.payload)
+    if intent.kind == "CANCEL_ALL":
+        transaction = payload["cancel_product_orders"]["tx"]
+        assert int(transaction["nonce"]) == intent.nonce
+        return
+    operation = payload["place_order"]
+    wire_order = operation["order"]
+    assert int(operation["product_id"]) == intent.product_id
+    assert int(wire_order["nonce"]) == intent.nonce
+    order = SyntheticOrderVector(
+        intent.owner, intent.subaccount_name, wire_order["sender"],
+        int(operation["product_id"]), int(wire_order["priceX18"]),
+        int(wire_order["amount"]), int(wire_order["expiration"]),
+        intent.recv_time, salt, int(wire_order["nonce"]),
+        int(wire_order["appendix"]),
+    )
+    assert order_digest(order) == intent.digest
 
 
 def run_fixture(tmp_path: Path, io: FixtureIO):
@@ -280,7 +322,7 @@ def test_entry_rejects_same_product_id_with_wrong_v2_ticker() -> None:
     )
     module = importlib.import_module("risex_farmer.nado_testnet_lifecycle_operational")
     with pytest.raises(OperationalSafetyError, match="product identity"):
-        module._entry_order(observed, OWNER, SENDER, io.now_ms() + 100)
+        module._entry_order(observed, OWNER, SENDER, io.now_ms() + RECV_WINDOW_MS)
 
 
 def test_entry_is_smallest_tick_aligned_ten_percent_buffered_ioc_buy() -> None:
@@ -288,7 +330,7 @@ def test_entry_is_smallest_tick_aligned_ten_percent_buffered_ioc_buy() -> None:
     observed = io.observe(())
     order = importlib.import_module(
         "risex_farmer.nado_testnet_lifecycle_operational"
-    )._entry_order(observed, OWNER, SENDER, io.now_ms() + 100)
+    )._entry_order(observed, OWNER, SENDER, io.now_ms() + RECV_WINDOW_MS)
     assert order.product_id == TARGET_PRODUCT_ID
     assert order.price_x18 == 8_543_000_000_000_000
     assert order.price_x18 % observed.product.tick_x18 == 0
@@ -303,16 +345,72 @@ def test_entry_buffer_rounds_exact_ten_percent_bound_without_extra_tick() -> Non
     observed = replace(io.observe(()), ask_x18=8_000_000_000_000_000)
     order = importlib.import_module(
         "risex_farmer.nado_testnet_lifecycle_operational"
-    )._entry_order(observed, OWNER, SENDER, io.now_ms() + 100)
+    )._entry_order(observed, OWNER, SENDER, io.now_ms() + RECV_WINDOW_MS)
     assert order.price_x18 == 8_800_000_000_000_000
     assert order.amount_x18 == 12_900 * X18
+
+
+def test_sealed_order_receive_window_matches_sdk_and_forbids_legacy_100_ms() -> None:
+    assert RECV_WINDOW_MS == 90_000
+    assert RECV_WINDOW_MS != 100
+
+
+def test_entry_cancel_close_use_sdk_window_and_bind_nonce_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = importlib.import_module(
+        "risex_farmer.nado_testnet_lifecycle_operational"
+    )
+    monkeypatch.setattr(module, "_salt", lambda: 7)
+
+    def run_at(path: Path, initial_clock: int):
+        io = ReceiveWindowFixtureIO("PARTIAL")
+        io.clock = initial_clock
+        _fixture_run(
+            path=path, io=io, capability_loader=capability,
+            owner=OWNER, sender=SENDER,
+        )
+        store = IntentStore(path)
+        try:
+            intents = tuple(intent for intent, _state in store.intents())
+        finally:
+            store.close()
+        return io, intents
+
+    first_io, first_intents = run_at(
+        tmp_path / "first.sqlite", 1_700_000_000_000
+    )
+    second_io, second_intents = run_at(
+        tmp_path / "second.sqlite", 1_700_000_000_001
+    )
+    expected_kinds = ("ENTRY", "CANCEL_ALL", "CLOSE")
+    assert tuple(intent.kind for intent in first_intents) == expected_kinds
+    assert tuple(intent.kind for intent in second_intents) == expected_kinds
+
+    for io in (first_io, second_io):
+        assert tuple(kind for kind, _issued, _recv in io.write_timings) == expected_kinds
+        assert tuple(
+            recv - issued for _kind, issued, recv in io.write_timings
+        ) == (90_000, 90_000, 90_000)
+        assert all(
+            recv - issued != 100 for _kind, issued, recv in io.write_timings
+        )
+
+    for first, second in zip(first_intents, second_intents):
+        assert_nonce_and_digest_binding(first)
+        assert_nonce_and_digest_binding(second)
+        assert first.recv_time != second.recv_time
+        assert first.nonce != second.nonce
+        # With the same salt and all other fixture inputs fixed, moving only
+        # receive time must move every durable intent digest, including cancel.
+        assert first.digest != second.digest
 
 
 def test_trigger_read_reuses_fresh_server_time_envelope(monkeypatch) -> None:
     module = importlib.import_module("risex_farmer.nado_testnet_lifecycle_operational")
     now_ms = 1_700_000_000_500
     server_ms = now_ms - 200
-    old_recv = now_ms + module.RECV_WINDOW_MS
+    stale_recv = server_ms + MAX_FRESHNESS_MS - 1
     requests = []
 
     class TriggerCapability:
@@ -328,7 +426,7 @@ def test_trigger_read_reuses_fresh_server_time_envelope(monkeypatch) -> None:
     io.now_ms = lambda: now_ms
 
     def trigger_response(recv: int):
-        if recv == old_recv:
+        if recv == stale_recv:
             return {
                 "status": "failure", "request_type": "query_list_trigger_orders",
                 "error_code": 1000, "error": "expired",
@@ -339,7 +437,7 @@ def test_trigger_read_reuses_fresh_server_time_envelope(monkeypatch) -> None:
             "data": {"orders": []},
         }
 
-    assert trigger_response(old_recv) == {
+    assert trigger_response(stale_recv) == {
         "status": "failure", "request_type": "query_list_trigger_orders",
         "error_code": 1000, "error": "expired",
     }
