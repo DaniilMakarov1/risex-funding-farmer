@@ -15,7 +15,8 @@ from risex_farmer.nado_testnet_lifecycle import (
     OrderEvidence, OrderIntent, Product, Reconciliation,
     SyntheticOrderVector, TriggerSnapshot, build_order_nonce,
     completion_barrier, order_digest, product_verifier,
-    sign_synthetic_order, unpack_order_nonce, validate_entry_preflight,
+    sign_synthetic_order, smallest_executable_amount, unpack_order_nonce,
+    validate_entry_preflight,
     verify_signed_validation, canonical_payload, encode_subaccount,
     SOURCE_PINS,
 )
@@ -315,13 +316,32 @@ def test_x18_grid_minimum_notional_and_post_only_preflight(
     )
     assert (plan.amount_x18, plan.appendix) == (10**16, POST_ONLY_APPENDIX)
     assert (plan.entry_notional_x18, plan.close_notional_x18) == (350 * X18, 360 * X18)
-    for entry_price in (35_000 * X18 + 1, 51_000 * X18):
-        with pytest.raises(NadoContractError):
-            validate_entry_preflight(
-                catalog=catalog, account=flat_account, triggers=zero_triggers,
-                product_id=2, entry_price_x18=entry_price,
-                worst_close_price_x18=51_000 * X18, now_ms=1_700_000_000_001,
-            )
+    with pytest.raises(NadoContractError):
+        validate_entry_preflight(
+            catalog=catalog, account=flat_account, triggers=zero_triggers,
+            product_id=2, entry_price_x18=35_000 * X18 + 1,
+            worst_close_price_x18=51_000 * X18, now_ms=1_700_000_000_001,
+        )
+
+    uncapped = validate_entry_preflight(
+        catalog=catalog, account=flat_account, triggers=zero_triggers,
+        product_id=2, entry_price_x18=51_000 * X18,
+        worst_close_price_x18=52_000 * X18, now_ms=1_700_000_000_001,
+    )
+    assert uncapped.entry_notional_x18 == 510 * X18
+
+
+def test_smallest_executable_amount_rounds_up_to_minimum_notional_and_step() -> None:
+    skr = Product(
+        44, "SKR-PERP_USDT0", ACTIVE_PERP, True,
+        10**12, 50 * X18, 100 * X18, 5 * X18,
+    )
+    price = 7_765_000_000_000_000
+    amount = smallest_executable_amount(
+        skr, prices_x18=(price, 7_766_000_000_000_000)
+    )
+    assert amount == 650 * X18
+    assert price * amount // X18 == 5_047_250_000_000_000_000
 
 
 @pytest.mark.parametrize(
@@ -841,7 +861,7 @@ def test_close_rejects_off_step_clamped_target_minimum_before_prepare(
         store, vector, catalog, flat_account, zero_triggers, submission_idx=924
     )
     target = replace(product, minimum_amount_x18=12 * 10**15, step_x18=5 * 10**15)
-    with pytest.raises(NadoContractError, match="close amount is off"):
+    with pytest.raises(NadoContractError, match="minimum amount is off"):
         LifecycleCore(store).prepare_close(
             catalog=CatalogSnapshot(
                 (target,), True, entry.recv_time + 1, True, "engine"
@@ -1561,17 +1581,17 @@ def test_third_no_fill_close_terminal_durably_exhausts_attempts(
     assert LifecycleCore(IntentStore(tmp_path / "intents.sqlite3")).status == HALTED
 
 
-@pytest.mark.parametrize("position", [10**16 + 1, 2 * 10**16])
-def test_off_grid_or_over_cap_close_halts(
+def test_off_grid_close_halts(
     tmp_path: Path, vector: dict[str, object], product: Product,
     catalog: CatalogSnapshot,
-    flat_account: AccountSnapshot, zero_triggers: TriggerSnapshot, position: int,
+    flat_account: AccountSnapshot, zero_triggers: TriggerSnapshot,
 ) -> None:
+    position = 10**16 + 1
     path = tmp_path / "intents.sqlite3"
     store = IntentStore(path)
     entry, _, _, _ = _filled_entry(
         store, vector, catalog, flat_account, zero_triggers,
-        submission_idx=950 + int(position > 10**16 + 1),
+        submission_idx=950,
     )
     core = LifecycleCore(store)
     with pytest.raises(NadoContractError):
@@ -1583,13 +1603,40 @@ def test_off_grid_or_over_cap_close_halts(
                 observed_at_ms=entry.recv_time + 1,
             ),
             triggers=replace(zero_triggers, observed_at_ms=entry.recv_time + 1),
-            worst_price_x18=(36_000 if position % 10**15 else 30_000) * X18,
+            worst_price_x18=36_000 * X18,
             recv_time=entry.recv_time + 2, salt=400,
             now_ms=entry.recv_time + 1,
         )
     assert core.status == HALTED
     core.store.close()
     assert LifecycleCore(IntentStore(path)).status == HALTED
+
+
+def test_step_aligned_close_has_no_fixed_usd_ceiling(
+    tmp_path: Path, vector: dict[str, object], product: Product,
+    catalog: CatalogSnapshot,
+    flat_account: AccountSnapshot, zero_triggers: TriggerSnapshot,
+) -> None:
+    store = IntentStore(tmp_path / "intents.sqlite3")
+    entry, _, _, _ = _filled_entry(
+        store, vector, catalog, flat_account, zero_triggers, submission_idx=951
+    )
+    position = 2 * 10**16
+    core = LifecycleCore(store)
+    close = core.prepare_close(
+        catalog=replace(catalog, observed_at_ms=entry.recv_time + 1),
+        product=product,
+        account=replace(
+            flat_account, cross_perp_amounts_x18={2: position},
+            observed_at_ms=entry.recv_time + 1,
+        ),
+        triggers=replace(zero_triggers, observed_at_ms=entry.recv_time + 1),
+        worst_price_x18=30_000 * X18,
+        recv_time=entry.recv_time + 2, salt=400,
+        now_ms=entry.recv_time + 1,
+    )
+    assert close.notional_x18 == 600 * X18
+    assert core.status == RUNNING
 
 
 def test_exact_final_barrier_and_adversarial_blockers(
