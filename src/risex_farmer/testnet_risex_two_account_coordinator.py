@@ -86,6 +86,7 @@ MARKET_MINIMUM = OFFICIAL_MARKET_MINIMUM
 _POSITION_ATOMIC_SCALE = 10**18
 _POSITION_ATOMIC_STEP = int(MARKET_STEP * Decimal(_POSITION_ATOMIC_SCALE))
 _MAX_POSITION_ATOMIC = 2**255 - 1
+_MAX_PORTFOLIO_POSITION_SIZE = Decimal(2**32 - 1) * MARKET_STEP
 
 # The counterparty account is intentionally not a selectable CLI/config value.
 # Its fixed public account is derived from the one protected wallet source and
@@ -1818,8 +1819,13 @@ def _portfolio_position_rows(value: Any) -> tuple[tuple[int, Decimal], ...]:
             market_id = int(row["market_id"])
         except Exception:
             raise CoordinatorSafetyError("RISEx portfolio position row rejected") from None
-        size = _atomic_position_size(row["size"])
-        if market_id <= 0 or market_id in seen or size % MARKET_STEP:
+        size = _decimal(row["size"], nonnegative=False)
+        if (
+            market_id <= 0
+            or market_id in seen
+            or abs(size) > _MAX_PORTFOLIO_POSITION_SIZE
+            or size % MARKET_STEP
+        ):
             raise CoordinatorSafetyError("RISEx portfolio position row rejected")
         seen.add(market_id)
         result.append((market_id, size))

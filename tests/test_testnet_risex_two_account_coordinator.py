@@ -30,6 +30,7 @@ from risex_farmer.testnet_risex_two_account_coordinator import (
     FixedRisexTwoAccountVenue,
     HISTORY_PATH,
     MAX_AGE_SECONDS,
+    MARKET_STEP,
     MarketObservation,
     NonceState,
     OrderHistoryPropagationMismatch,
@@ -65,6 +66,7 @@ from risex_farmer.testnet_risex_two_account_coordinator import (
     _portfolio_position_rows,
     _response_data,
     _is_monotonic_order_visibility,
+    _MAX_PORTFOLIO_POSITION_SIZE,
     _validate_order,
     _validate_unsigned_cancel,
     _validate_unsigned_place,
@@ -1781,7 +1783,7 @@ def test_portfolio_details_require_positive_normal_state_and_position_binding():
     with pytest.raises(CoordinatorSafetyError):
         _parse_portfolio(broken, identity, NOW)
     broken = json.loads(json.dumps(value))
-    broken["positions"][2]["size"] = "1000000000000000"
+    broken["positions"][2]["size"] = "0.001"
     portfolio, broken_positions = _parse_portfolio(broken, identity, NOW)
     assert portfolio.account == ACCOUNT
     assert broken_positions[2] == (3, Decimal("0.001"))
@@ -1801,9 +1803,58 @@ def test_full_position_sources_decode_canonical_18_decimal_atomic_sizes(raw, exp
     assert _position_rows({
         "positions": [{"account": ACCOUNT, "market_id": "2", "size": raw}],
     }, identity) == ((2, expected),)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    (
+        ("0", Decimal("0")),
+        ("0.1", Decimal("0.1")),
+        ("-0.1", Decimal("-0.1")),
+        ("0.001", Decimal("0.001")),
+    ),
+)
+def test_full_position_sources_and_point_route_agree_on_endpoint_units(raw, expected):
+    identity = _primary_identity()
+    atomic = {
+        "0": "0",
+        "0.1": "100000000000000000",
+        "-0.1": "-100000000000000000",
+        "0.001": "1000000000000000",
+    }[raw]
+    assert _position_rows({
+        "positions": [{"account": ACCOUNT, "market_id": "2", "size": atomic}],
+    }, identity) == ((2, expected),)
     assert _portfolio_position_rows([
         {"market_id": "2", "size": raw},
     ]) == ((2, expected),)
+    assert _point_position(
+        {"market_id": "2", "size": raw}, identity,
+    ) == (2, expected)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        "100000000000000000", "-100000000000000000", "1e17", "-1e17",
+        "0.1005", "NaN", "Infinity", "-Infinity",
+    ),
+)
+def test_portfolio_position_rows_reject_atomic_ambiguous_off_grid_and_nonfinite_sizes(raw):
+    with pytest.raises(CoordinatorSafetyError):
+        _portfolio_position_rows([{"market_id": 2, "size": raw}])
+
+
+def test_portfolio_position_rows_use_the_strict_uint32_size_bound():
+    maximum = _MAX_PORTFOLIO_POSITION_SIZE
+    assert _portfolio_position_rows([
+        {"market_id": 2, "size": str(maximum)},
+        {"market_id": 3, "size": str(-maximum)},
+    ]) == ((2, maximum), (3, -maximum))
+    with pytest.raises(CoordinatorSafetyError):
+        _portfolio_position_rows([
+            {"market_id": 2, "size": str(maximum + MARKET_STEP)},
+        ])
 
 
 @pytest.mark.parametrize(
@@ -1819,8 +1870,6 @@ def test_full_position_sources_reject_decimal_ambiguous_off_grid_and_bounded_siz
         _position_rows({
             "positions": [{"account": ACCOUNT, "market_id": 2, "size": raw}],
         }, identity)
-    with pytest.raises(CoordinatorSafetyError):
-        _portfolio_position_rows([{"market_id": 2, "size": raw}])
 
 
 def test_atomic_position_size_accepts_only_the_signed_int256_grid_bounds():
@@ -1852,7 +1901,7 @@ def test_fixed_account_adapter_accepts_market_zero_alias_only_after_atomic_cross
     transport = _FlatAccountReads(
         point_market_id="0", point_size="0.1",
         positions=((2, atomic),),
-        portfolio_positions=((2, atomic),),
+        portfolio_positions=((2, "0.1"),),
     )
     snapshot, _, _ = asyncio.run(
         _flat_read_venue(transport)._account(AccountRole.PRIMARY, include_private=False),
@@ -1869,34 +1918,34 @@ def test_fixed_account_adapter_accepts_market_zero_alias_only_after_atomic_cross
         pytest.param(
             {
                 "positions": ((2, "100000000000000000"),),
-                "portfolio_positions": ((2, "200000000000000000"),),
+                "portfolio_positions": ((2, "0.2"),),
             }, id="full-read-disagreement",
         ),
         pytest.param(
             {
                 "positions": ((2, "100000000000000000"), (3, "1000000000000000")),
-                "portfolio_positions": ((2, "100000000000000000"), (3, "1000000000000000")),
+                "portfolio_positions": ((2, "0.1"), (3, "0.001")),
             }, id="unrelated-nonzero-state",
         ),
         pytest.param(
             {
                 "point_size": "0.1005",
                 "positions": ((2, "100000000000000000"),),
-                "portfolio_positions": ((2, "100000000000000000"),),
+                "portfolio_positions": ((2, "0.1"),),
             }, id="point-off-grid",
         ),
         pytest.param(
             {
                 "point_account": COUNTERPARTY,
                 "positions": ((2, "100000000000000000"),),
-                "portfolio_positions": ((2, "100000000000000000"),),
+                "portfolio_positions": ((2, "0.1"),),
             }, id="point-account-contradiction",
         ),
         pytest.param(
             {
                 "positions": ((2, "100000000000000000"),),
                 "positions_account": COUNTERPARTY,
-                "portfolio_positions": ((2, "100000000000000000"),),
+                "portfolio_positions": ((2, "0.1"),),
             }, id="full-account-contradiction",
         ),
         pytest.param(
@@ -1908,25 +1957,31 @@ def test_fixed_account_adapter_accepts_market_zero_alias_only_after_atomic_cross
         pytest.param(
             {
                 "positions": ((2, "100000000000000000"),),
-                "portfolio_positions": ((2, "0.1"),),
-            }, id="mixed-full-units",
+                "portfolio_positions": ((2, "100000000000000000"),),
+            }, id="portfolio-atomic-unit",
+        ),
+        pytest.param(
+            {
+                "positions": ((2, "100000000000000000"),),
+                "portfolio_positions": ((2, "1e17"),),
+            }, id="portfolio-ambiguous-unit",
         ),
         pytest.param(
             {
                 "positions": ((2, "100000000000000001"),),
-                "portfolio_positions": ((2, "100000000000000001"),),
+                "portfolio_positions": ((2, "0.1"),),
             }, id="off-grid-full-unit",
         ),
         pytest.param(
             {
                 "positions": ((0, "100000000000000000"),),
-                "portfolio_positions": ((0, "100000000000000000"),),
+                "portfolio_positions": ((0, "0.1"),),
             }, id="full-market-zero-is-not-an-alias",
         ),
         pytest.param(
             {
                 "positions": ((2, "100000000000000000"), (2, "0")),
-                "portfolio_positions": ((2, "100000000000000000"),),
+                "portfolio_positions": ((2, "0.1"),),
             }, id="duplicate-full-market",
         ),
     ),
@@ -2031,7 +2086,7 @@ def test_fixed_account_adapter_normalizes_flat_position_variants():
                     for market_id, size in portfolio_positions
                 ]
                 if self.mismatch:
-                    positions[2]["size"] = "1000000000000000"
+                    positions[2]["size"] = "0.001"
                 data = {
                     "account": account,
                     "positions": positions,
