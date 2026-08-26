@@ -4,11 +4,11 @@ One slice per venue. Apply the A/B/C levels and safety core from `AGENTS.md`; op
 
 ## RISEx — fill-seeking taker lifecycle
 
-Status: `AUTHORIZED LEVEL C CORRECTION AND INVOCATION`.
+Status: `AUTHORIZED OBSERVED-WRITE CORRECTION`.
 
-- The third invocation dispatched once and reached terminal zero-fill/zero-position evidence; after a final-barrier transport stop, two independent authenticated observations and public sweeps proved zero orders/exact flatness and Chief recovered only the local outcome from a protected backup.
-- In a fresh visible RISEx Builder worktree, make the smallest venue-local change that uses current testnet liquidity to place a bounded taker opening which can fill, then preserves reconcile/cancel/close and terminal zero-order/exact-flat gates. Current spread and test-asset notional are not blockers. Do not repeat the unchanged no-fill order or weaken identity/no-replay controls.
-- After acceptance, Chief runs one sequential lifecycle from a fresh durable run identity and performs recoverable local database recovery as needed.
+- The accepted bounded crossing `LIMIT+IOC` opening dispatched once but again terminated with zero fill and exact flatness; its local terminal outcome was recovered only after two fresh authoritative zero-order/flat/consumed-nonce observations. Do not repeat it unchanged.
+- In a fresh visible RISEx Builder worktree, preserve sanitized explicit place-response failure evidence and select the smallest officially/observably supported taker opening actually capable of filling. The testnet spread is not a blocker. Preserve minimum/grid/depth checks, durable identity before dispatch, no replay, authoritative reconciliation, bounded close, and final zero relevant orders plus exact flatness.
+- After acceptance, Chief archives only the exact recovered terminal database and runs one fresh sequential lifecycle.
 
 ## Nado — sequential Level C lifecycle
 
@@ -22,10 +22,11 @@ Status: `AUTHORIZED OBSERVED-WRITE CORRECTION`.
 
 ## Extended — wallet/API Management setup and lifecycle
 
-Status: `READY FOR FRESH LEVEL B; PROVIDER STREAM LIKELY BLOCKED`.
+Status: `PROVIDER STREAM BLOCKED; REPORTING CORRECTION AUTHORIZED`.
 
 - Existing local owner/Stark identities and the sole subaccount match; testnet claim completed, balance is readable, and zero orders/positions are authoritative. A fresh REST-valid API key reproduced v1 HTTP 503 and v2 RPC HTTP 404, excluding wallet, collateral, stale key, and quota causes.
-- Run one fresh Level B against the accepted current official v1 host/parser. If HTTP 503 persists, stop automated retries and report the provider-side v1/v2 outage; no Level C write is allowed until an authenticated private stream succeeds.
+- The fresh Level B completed its first three REST reads but failed before stream upgrade/frame and persisted only `UNEXPECTED_FAILURE`. Automated stream retries are stopped. In a fresh visible Extended Builder worktree, make only the local Level B reporting correction that classifies WebSocket handshake/HTTP and pre-upgrade transport failures into the required sanitized failure classes; do not make authenticated calls or change the accepted host/parser/account semantics.
+- Extended Level C remains prohibited until a future authenticated private stream succeeds.
 
 ## Completion
 
