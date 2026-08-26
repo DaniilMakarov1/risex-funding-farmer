@@ -2027,8 +2027,10 @@ class SealedLifecycleRunner:
             settlement_identity=signed.settlement_hash or claimed.settlement_identity,
         )
         self.stage = "CLOSE_DISPATCH" if close else "ENTRY_DISPATCH"
-        if self.io.now_ms() >= durable.expiry_ms:
+        dispatch_now_ms = self.io.now_ms()
+        if dispatch_now_ms >= durable.expiry_ms:
             _fail("WRITE_INTENT_EXPIRED")
+        _validate_fresh(self._last_observation, dispatch_now_ms)
         self.writes += 1
         try:
             receipt = self.io.place_order(durable, signed.payload)

@@ -416,6 +416,45 @@ def test_signed_dispatch_rechecks_observation_freshness_before_claim(tmp_path, n
     assert io.place_calls == []
 
 
+def test_post_bind_freshness_recheck_prevents_place_and_persists_recoverable_intent(
+    tmp_path, no_sleep,
+):
+    io = FixtureIO()
+    path = tmp_path / "post-bind-dispatch-freshness.sqlite3"
+
+    class ClockAdvancingSigner(FakeSigner):
+        def sign_order(self, intent, market):
+            signed = super().sign_order(intent, market)
+            # Keep the signed intent's expiry in the future while making the
+            # original observation too old for the post-bind write gate.
+            io.clock = intent.expiry_ms - 2_000
+            return signed
+
+    signer = ClockAdvancingSigner()
+    with pytest.raises(OperationalSafetyError, match="FRESH_REST_OBSERVATION_REQUIRED"):
+        _fixture_run(
+            path=path, io=io, capability=signer, identity=IDENTITY,
+        )
+
+    store = OperationalIntentStore(path)
+    intent = store.all()[0]
+    assert intent.state == "CLAIMED"
+    assert intent.dispatch_count == 1
+    assert intent.payload is not None and intent.payload_digest
+    assert store.lifecycle_state() == "HALTED_FRESH_REST_OBSERVATION_REQUIRED"
+    assert io.place_calls == []
+    runtime = RuntimeRunJournal(path).snapshot()
+    assert runtime is not None
+    assert runtime["state"] == "BLOCKED"
+    assert runtime["stage"] == "ENTRY_DISPATCH"
+
+    with pytest.raises(OperationalSafetyError, match="RUNTIME_ALREADY_TERMINAL"):
+        _fixture_run(
+            path=path, io=io, capability=FakeSigner(), identity=IDENTITY,
+        )
+    assert io.place_calls == []
+
+
 def test_identity_accepts_observed_account_id_and_canonical_l2_vault_string():
     account = _account(_base_fixture())
     account["accountId"] = account.pop("id")
