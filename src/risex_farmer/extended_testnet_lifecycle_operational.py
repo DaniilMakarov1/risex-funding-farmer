@@ -13,6 +13,7 @@ identity barriers required by the lifecycle contract.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -26,6 +27,7 @@ import sqlite3
 import ssl
 import stat
 import sys
+from threading import Lock
 import time
 from typing import Any, Callable, Mapping, Protocol, Sequence
 from urllib.parse import quote, urlencode, urlsplit
@@ -64,6 +66,10 @@ SHORT_EXPIRY_MS = 15_000
 HTTP_TIMEOUT_SECONDS = 10.0
 MAX_RECONCILE_READS = 5
 RECONCILE_SLEEP_SECONDS = 0.20
+_REQUIRED_REST_RECEIPTS = frozenset({
+    "account", "balance", "market", "book", "fees", "leverage",
+    "open_orders", "positions", "order_history", "trades",
+})
 
 OK = "OK"
 ACTIVE = "ACTIVE"
@@ -1041,6 +1047,7 @@ class RestObservation:
     stream_frames: int = 0
     fingerprint: str | None = None
     book_observed_at_ms: int | None = None
+    receipt_times_ms: Mapping[str, int] = field(default_factory=dict)
 
     @property
     def semantic_fingerprint(self) -> str:
@@ -1273,12 +1280,29 @@ def _validate_fresh(observation: RestObservation, now_ms: int) -> None:
             and 0 <= now_ms - observation.book_observed_at_ms <= MAX_FRESHNESS_MS
         )
     )
+    receipt_times = observation.receipt_times_ms
+    if receipt_times:
+        receipts_fresh = isinstance(receipt_times, Mapping) and (
+            _REQUIRED_REST_RECEIPTS <= set(receipt_times)
+            and all(
+                type(receipt) is int
+                and receipt > 0
+                and 0 <= now_ms - receipt <= MAX_FRESHNESS_MS
+                for receipt in receipt_times.values()
+            )
+            and observation.book_observed_at_ms == receipt_times.get("book")
+        )
+    else:
+        # Dependency-injected fixture IO has one aggregate observation clock;
+        # production REST observations always carry the per-response map.
+        receipts_fresh = True
     if (
         type(observation.observed_at_ms) is not int
         or observation.observed_at_ms <= 0
         or not 0 <= now_ms - observation.observed_at_ms <= MAX_FRESHNESS_MS
         or not server_fresh
         or not book_fresh
+        or not receipts_fresh
         or observation.stream_frames != 0
     ):
         _fail("FRESH_REST_OBSERVATION_REQUIRED")
@@ -1297,10 +1321,12 @@ class OperationalVenueIO:
         self._capability = capability
         self._transport = transport or ExtendedRestTransport(capability.api_key())
         self._clock = clock or (lambda: time.time_ns() // 1_000_000)
+        self._clock_lock = Lock()
         self.stream_frames = 0
 
     def now_ms(self) -> int:
-        return int(self._clock())
+        with self._clock_lock:
+            return int(self._clock())
 
     def open_stream(self) -> None:
         _fail("STREAM_UNAVAILABLE", "SAFETY")
@@ -1323,8 +1349,17 @@ class OperationalVenueIO:
                 raise AmbiguousWrite() from None
             _fail(error.code, error.failure_class)
 
-    def _object(self, path: str, *, code: str, allow_404: bool = False) -> Mapping[str, Any] | None:
+    def _object(
+        self,
+        path: str,
+        *,
+        code: str,
+        allow_404: bool = False,
+        receipt: Callable[[int], None] | None = None,
+    ) -> Mapping[str, Any] | None:
         value = self._request("GET", path, allow_404=allow_404)
+        if receipt is not None:
+            receipt(self.now_ms())
         if value is None:
             return None
         return _unwrap_object(value, code)
@@ -1336,6 +1371,7 @@ class OperationalVenueIO:
         query: Sequence[tuple[str, Any]] = (),
         code: str,
         allow_404: bool = False,
+        receipt: Callable[[int], None] | None = None,
     ) -> tuple[Mapping[str, Any], ...]:
         rows: list[Mapping[str, Any]] = []
         cursor: int | None = None
@@ -1352,6 +1388,8 @@ class OperationalVenueIO:
             value = self._request(
                 "GET", path, query=tuple(page_query), allow_404=allow_404
             )
+            if receipt is not None:
+                receipt(self.now_ms())
             if value is None:
                 return ()
             page_rows, next_cursor = _list_data(
@@ -1367,6 +1405,17 @@ class OperationalVenueIO:
             seen_cursors.add(next_cursor)
             cursor = next_cursor
         _fail("PAGINATION_UNBOUNDED")
+
+    @staticmethod
+    def _timed_read(
+        reader: Callable[[Callable[[int], None]], Any],
+    ) -> tuple[Any, int]:
+        receipts: list[int] = []
+        value = reader(receipts.append)
+        if not receipts:
+            _fail("REST_RECEIPT_MISSING", "SAFETY")
+        # A paginated response is only as fresh as its oldest page.
+        return value, min(receipts)
 
     @staticmethod
     def _market(value: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -1439,53 +1488,113 @@ class OperationalVenueIO:
         return normalized
 
     def observe(self, intents: Sequence[OrderIntent]) -> RestObservation:
-        account = self._object("/user/account/info", code="ACCOUNT_SCHEMA")
+        account, account_receipt = self._timed_read(
+            lambda receipt: self._object(
+                "/user/account/info", code="ACCOUNT_SCHEMA", receipt=receipt,
+            )
+        )
         if account is None or not self._capability.identity.matches_account(account):
             _fail("ACCOUNT_IDENTITY_MISMATCH", "IDENTITY")
         if account.get("status") != ACTIVE:
             _fail("ACCOUNT_INACTIVE")
-        balance = self._object("/user/balance", code="BALANCE_SCHEMA")
-        if balance is None:
-            _fail("BALANCE_SCHEMA", "SCHEMA")
-        market_rows = self._list(
-            "/info/markets", query=(("market", TARGET_MARKET),), code="MARKET_LIST_SCHEMA"
-        )
-        if len(market_rows) != 1:
-            _fail("TARGET_MARKET_UNIQUE")
-        market = self._market(market_rows[0])
-        raw_book = self._object(
-            f"/info/markets/{quote(TARGET_MARKET, safe='')}/orderbook", code="BOOK_SCHEMA"
-        )
-        if raw_book is None:
-            _fail("BOOK_SCHEMA", "SCHEMA")
-        book_observed_at = self.now_ms()
-        book = self._book(raw_book, market)
-        fees = self._list(
-            "/user/fees", query=(("market", TARGET_MARKET),), code="FEE_LIST_SCHEMA"
-        )
-        leverage = self._list(
-            "/user/leverage", query=(("market", TARGET_MARKET),), code="LEVERAGE_LIST_SCHEMA"
-        )
-        open_orders = self._list("/user/orders", code="OPEN_ORDER_LIST_SCHEMA")
-        positions = self._list("/user/positions", code="POSITION_LIST_SCHEMA")
-        history = self._list("/user/orders/history", code="ORDER_HISTORY_LIST_SCHEMA")
-        trades = self._list("/user/trades", code="TRADE_LIST_SCHEMA")
-        exact_by_id: dict[str, Mapping[str, Any]] = {}
-        exact_by_external: dict[str, tuple[Mapping[str, Any], ...]] = {}
+        readers: dict[str, Callable[[Callable[[int], None]], Any]] = {
+            "balance": lambda receipt: self._object(
+                "/user/balance", code="BALANCE_SCHEMA", receipt=receipt,
+            ),
+            "market": lambda receipt: self._list(
+                "/info/markets", query=(("market", TARGET_MARKET),),
+                code="MARKET_LIST_SCHEMA", receipt=receipt,
+            ),
+            "book": lambda receipt: self._object(
+                f"/info/markets/{quote(TARGET_MARKET, safe='')}/orderbook",
+                code="BOOK_SCHEMA", receipt=receipt,
+            ),
+            "fees": lambda receipt: self._list(
+                "/user/fees", query=(("market", TARGET_MARKET),),
+                code="FEE_LIST_SCHEMA", receipt=receipt,
+            ),
+            "leverage": lambda receipt: self._list(
+                "/user/leverage", query=(("market", TARGET_MARKET),),
+                code="LEVERAGE_LIST_SCHEMA", receipt=receipt,
+            ),
+            "open_orders": lambda receipt: self._list(
+                "/user/orders", code="OPEN_ORDER_LIST_SCHEMA", receipt=receipt,
+            ),
+            "positions": lambda receipt: self._list(
+                "/user/positions", code="POSITION_LIST_SCHEMA", receipt=receipt,
+            ),
+            "order_history": lambda receipt: self._list(
+                "/user/orders/history", code="ORDER_HISTORY_LIST_SCHEMA", receipt=receipt,
+            ),
+            "trades": lambda receipt: self._list(
+                "/user/trades", code="TRADE_LIST_SCHEMA", receipt=receipt,
+            ),
+        }
         for intent in intents:
             if intent.kind not in {"ENTRY", "CLOSE"}:
                 continue
             if intent.venue_order_id is not None:
-                exact = self._object(
-                    f"/user/orders/{quote(intent.venue_order_id, safe='')}",
-                    code="EXACT_ORDER_SCHEMA", allow_404=True,
+                order_id = intent.venue_order_id
+                readers[f"exact_id:{order_id}"] = lambda receipt, order_id=order_id: self._object(
+                    f"/user/orders/{quote(order_id, safe='')}",
+                    code="EXACT_ORDER_SCHEMA", allow_404=True, receipt=receipt,
                 )
+            external_id = intent.external_id
+            readers[f"exact_external:{external_id}"] = lambda receipt, external_id=external_id: self._list(
+                f"/user/orders/external/{quote(external_id, safe='')}",
+                code="EXACT_EXTERNAL_ORDER_SCHEMA", allow_404=True, receipt=receipt,
+            )
+
+        with ThreadPoolExecutor(max_workers=min(32, len(readers))) as executor:
+            futures = {
+                key: executor.submit(self._timed_read, reader)
+                for key, reader in readers.items()
+            }
+            results = {key: future.result() for key, future in futures.items()}
+
+        balance, balance_receipt = results["balance"]
+        if balance is None:
+            _fail("BALANCE_SCHEMA", "SCHEMA")
+        market_rows, market_receipt = results["market"]
+        if len(market_rows) != 1:
+            _fail("TARGET_MARKET_UNIQUE")
+        market = self._market(market_rows[0])
+        raw_book, book_receipt = results["book"]
+        if raw_book is None:
+            _fail("BOOK_SCHEMA", "SCHEMA")
+        book = self._book(raw_book, market)
+        fees, fees_receipt = results["fees"]
+        leverage, leverage_receipt = results["leverage"]
+        open_orders, open_orders_receipt = results["open_orders"]
+        positions, positions_receipt = results["positions"]
+        history, history_receipt = results["order_history"]
+        trades, trades_receipt = results["trades"]
+        exact_by_id: dict[str, Mapping[str, Any]] = {}
+        exact_by_external: dict[str, tuple[Mapping[str, Any], ...]] = {}
+        receipt_times_ms = {
+            "account": account_receipt,
+            "balance": balance_receipt,
+            "market": market_receipt,
+            "book": book_receipt,
+            "fees": fees_receipt,
+            "leverage": leverage_receipt,
+            "open_orders": open_orders_receipt,
+            "positions": positions_receipt,
+            "order_history": history_receipt,
+            "trades": trades_receipt,
+        }
+        for intent in intents:
+            if intent.kind not in {"ENTRY", "CLOSE"}:
+                continue
+            if intent.venue_order_id is not None:
+                key = f"exact_id:{intent.venue_order_id}"
+                exact, exact_receipt = results[key]
+                receipt_times_ms[key] = exact_receipt
                 if exact is not None:
                     exact_by_id[intent.venue_order_id] = exact
-            external_rows = self._list(
-                f"/user/orders/external/{quote(intent.external_id, safe='')}",
-                code="EXACT_EXTERNAL_ORDER_SCHEMA", allow_404=True,
-            )
+            key = f"exact_external:{intent.external_id}"
+            external_rows, external_receipt = results[key]
+            receipt_times_ms[key] = external_receipt
             exact_by_external[intent.external_id] = external_rows
         observed_at = self.now_ms()
         observation = RestObservation(
@@ -1502,7 +1611,8 @@ class OperationalVenueIO:
             trades=tuple(dict(row) for row in trades),
             exact_by_id=exact_by_id, exact_by_external=exact_by_external,
             stream_frames=0,
-            book_observed_at_ms=book_observed_at,
+            book_observed_at_ms=book_receipt,
+            receipt_times_ms=receipt_times_ms,
         )
         _validate_fresh(observation, observed_at)
         return observation
@@ -1902,10 +2012,11 @@ class SealedLifecycleRunner:
     def _dispatch_signed_order(self, intent: OrderIntent, *, close: bool = False) -> OrderIntent:
         expected = "CLOSE_PREPARED" if close else "ENTRY_PREPARED"
         next_state = "CLOSE_AMBIGUOUS" if close else "ENTRY_AMBIGUOUS"
-        claimed = self.store.claim(intent.id, expected_lifecycle=expected, next_lifecycle=next_state)
-        self.stage = "CLOSE_SIGNATURE" if close else "ENTRY_SIGNATURE"
         if self._last_observation is None:
             _fail("SIGNING_MARKET_MISSING")
+        _validate_fresh(self._last_observation, self.io.now_ms())
+        claimed = self.store.claim(intent.id, expected_lifecycle=expected, next_lifecycle=next_state)
+        self.stage = "CLOSE_SIGNATURE" if close else "ENTRY_SIGNATURE"
         signed = self.capability.sign_order(claimed, self._last_observation.market)
         if not isinstance(signed, SignedOrder) or not isinstance(signed.payload, Mapping):
             _fail("SIGNER_RESULT_SCHEMA", "AUTH")

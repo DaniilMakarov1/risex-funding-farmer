@@ -6,6 +6,7 @@ import inspect
 import json
 from pathlib import Path
 from decimal import Decimal
+import time
 
 import pytest
 
@@ -294,13 +295,125 @@ def test_rest_observation_rejects_book_stale_by_completion_without_server_clock(
                 return wrapped([])
             raise AssertionError(path)
 
-    clock_values = iter((1_770_000_000_000, 1_770_000_000_000 + MAX_FRESHNESS_MS + 1))
+    clock_calls = [0]
+
+    def clock():
+        clock_calls[0] += 1
+        return (
+            1_770_000_000_000
+            if clock_calls[0] <= 10
+            else 1_770_000_000_000 + MAX_FRESHNESS_MS + 1
+        )
+
     capability = type("Capability", (), {"identity": IDENTITY})()
     io = OperationalVenueIO(
-        capability, transport=Transport(), clock=lambda: next(clock_values),
+        capability, transport=Transport(), clock=clock,
     )
     with pytest.raises(OperationalSafetyError, match="FRESH_REST_OBSERVATION_REQUIRED"):
         io.observe(())
+
+
+def test_production_shaped_delayed_rest_reads_require_every_receipt_to_be_fresh():
+    wire = _base_fixture()
+    wire["account"]["info"]["accountId"] = wire["account"]["info"].pop("id")
+    wire["account"]["info"]["l2Vault"] = str(IDENTITY.l2_vault)
+
+    def wrapped(data, *, paginated=False):
+        value = {"status": "OK", "data": data}
+        if paginated:
+            value["pagination"] = {"cursor": None, "count": len(data)}
+        return value
+
+    class DelayedTransport:
+        def request(self, method, path, *, query=(), body=None, allow_404=False):
+            # The old sequential order receives the book around 2 seconds in,
+            # then spends more than five seconds on the remaining reads.
+            time.sleep(0.51 if path in {
+                "/user/account/info", "/user/balance", "/info/markets",
+                f"/info/markets/{TARGET_MARKET}/orderbook",
+            } else 0.90)
+            if path == "/user/account/info":
+                return wrapped(_account(wire))
+            if path == "/user/balance":
+                return wrapped(copy.deepcopy(wire["account"]["balance"]))
+            if path == "/info/markets":
+                return wrapped([copy.deepcopy(wire["market"])], paginated=True)
+            if path.endswith("/orderbook"):
+                return wrapped(copy.deepcopy(wire["book"]))
+            if path == "/user/fees":
+                return wrapped(copy.deepcopy(wire["account"]["fees"]), paginated=True)
+            if path == "/user/leverage":
+                return wrapped(copy.deepcopy(wire["account"]["leverage"]), paginated=True)
+            if path in {"/user/orders", "/user/positions", "/user/orders/history", "/user/trades"}:
+                return wrapped([])
+            raise AssertionError(path)
+
+    capability = type("Capability", (), {"identity": IDENTITY})()
+    io = OperationalVenueIO(capability, transport=DelayedTransport())
+    observation = io.observe(())
+    now_ms = io.now_ms()
+    assert observation.receipt_times_ms
+    assert all(
+        0 <= now_ms - receipt <= MAX_FRESHNESS_MS
+        for receipt in observation.receipt_times_ms.values()
+    )
+
+
+def test_production_shaped_delayed_mutable_state_receipt_fails_closed():
+    wire = _base_fixture()
+    wire["account"]["info"]["accountId"] = wire["account"]["info"].pop("id")
+    wire["account"]["info"]["l2Vault"] = str(IDENTITY.l2_vault)
+
+    def wrapped(data, *, paginated=False):
+        value = {"status": "OK", "data": data}
+        if paginated:
+            value["pagination"] = {"cursor": None, "count": len(data)}
+        return value
+
+    class DelayedMutableTransport:
+        def request(self, method, path, *, query=(), body=None, allow_404=False):
+            # The book is the final response, so its receipt is fresh.  The
+            # position response is intentionally old by the time that final
+            # response arrives; the old aggregate gate incorrectly accepted it.
+            time.sleep(6.00 if path.endswith("/orderbook") else 0.05)
+            if path == "/user/account/info":
+                return wrapped(_account(wire))
+            if path == "/user/balance":
+                return wrapped(copy.deepcopy(wire["account"]["balance"]))
+            if path == "/info/markets":
+                return wrapped([copy.deepcopy(wire["market"])], paginated=True)
+            if path.endswith("/orderbook"):
+                return wrapped(copy.deepcopy(wire["book"]))
+            if path == "/user/fees":
+                return wrapped(copy.deepcopy(wire["account"]["fees"]), paginated=True)
+            if path == "/user/leverage":
+                return wrapped(copy.deepcopy(wire["account"]["leverage"]), paginated=True)
+            if path in {"/user/orders", "/user/positions", "/user/orders/history", "/user/trades"}:
+                return wrapped([])
+            raise AssertionError(path)
+
+    capability = type("Capability", (), {"identity": IDENTITY})()
+    io = OperationalVenueIO(capability, transport=DelayedMutableTransport())
+    with pytest.raises(OperationalSafetyError, match="FRESH_REST_OBSERVATION_REQUIRED"):
+        io.observe(())
+
+
+def test_signed_dispatch_rechecks_observation_freshness_before_claim(tmp_path, no_sleep):
+    io = FixtureIO()
+    path = tmp_path / "dispatch-freshness.sqlite3"
+    store = OperationalIntentStore(path)
+    runner = SealedLifecycleRunner(
+        store=store, journal=RuntimeRunJournal(path), io=io,
+        capability=FakeSigner(), identity=IDENTITY,
+    )
+    observation = io.observe(())
+    runner._last_observation = observation
+    entry = runner._prepare_entry(observation)
+    io.clock = observation.observed_at_ms + MAX_FRESHNESS_MS + 1
+    with pytest.raises(OperationalSafetyError, match="FRESH_REST_OBSERVATION_REQUIRED"):
+        runner._dispatch_signed_order(entry)
+    assert store.get(entry.id).state == "PREPARED"
+    assert io.place_calls == []
 
 
 def test_identity_accepts_observed_account_id_and_canonical_l2_vault_string():
