@@ -11,7 +11,7 @@ Status: `OBSERVED TESTNET ZERO-FILL BLOCKER`.
 
 ## Nado — sequential Level C lifecycle
 
-Status: `AUTHORIZED MINIMUM-SEMANTICS/COLLATERAL CORRECTION`.
+Status: `READY FOR ONE SEQUENTIAL LEVEL C`.
 
 - The signed trigger read now uses the accepted 30,000 ms window; the actual write retains its 100 ms contract. Current catalog minima are accepted as published, while the actual target opening and clamped closing amounts remain exactly step-aligned and fully safety-checked.
 - All three invocations stopped with zero intents and zero venue writes. Fixed BTC product 2 now has a minimum notional far above USD 500; credentials/private access and signing remain valid.
@@ -19,8 +19,8 @@ Status: `AUTHORIZED MINIMUM-SEMANTICS/COLLATERAL CORRECTION`.
 - The accepted exact-ask and tick-aligned 10%-buffered IOC attempts each dispatched once and received complete venue rejection code 2011. The latest durable `REJECTED/HALTED` state prevents replay; exact post-window reads prove zero orders, positions, and fills plus `query_order` code 2020/not found.
 - Official current semantics denominate `min_size` in USDT0. Every current live perpetual publishes a 100-USDT0 minimum, while the runner misreads that field as a base amount, separately hard-codes USD 5, and submitted about USD 5.55 against only about 10 USDT0 collateral. Product 44 is currently `live`, so spread and market status are excluded.
 - The official SDK testnet mint/approve/deposit path completed and authoritative engine state now shows about 210 USDT0 collateral/health, zero liabilities, and zero exposure. No further faucet or deposit action is needed before the next lifecycle.
-- In a fresh visible Nado Builder worktree, correct only the current USDT0-denominated minimum-size binding and its focused regressions while preserving the accepted 10%-buffered IOC, exact product identity, signing, durable intent-before-dispatch, ambiguity no-replay, bounded close, and final zero-order/exact-flat barriers. Do not perform a write.
-- After acceptance, Chief archives the exact terminal database, proves authoritative zero/flat pre-state, and runs one fresh sequential lifecycle.
+- The accepted correction binds `min_size` to quote minimum notional and derives the least step-aligned base amount satisfying it at entry and close bounds. The rejected terminal database is archived byte-identically and the active lifecycle path is fresh.
+- Chief may prove one fresh authoritative zero-order/exact-flat pre-state and run exactly one sequential sealed lifecycle. Do not replay an ambiguous write; reconcile any complete terminal result and require final zero regular/trigger orders plus exact flatness.
 
 ## Extended — wallet/API Management setup and lifecycle
 
