@@ -17,12 +17,13 @@ Status: `LEVEL C COMPLETE`.
 
 ## Extended — wallet/API Management setup and lifecycle
 
-Status: `PROVIDER STREAM BLOCKED`.
+Status: `REST FALLBACK CORRECTION READY`.
 
 - Existing local owner/Stark identities and the sole subaccount match; testnet claim completed, balance is readable, and zero orders/positions are authoritative. A fresh REST-valid API key reproduced v1 HTTP 503 and v2 RPC HTTP 404, excluding wallet, collateral, stale key, and quota causes.
 - The local Level B runner now durably classifies pre-upgrade failures as sanitized `HTTP` or `TRANSPORT`; automated stream retries remain stopped after the observed provider v1 HTTP 503 and v2 HTTP 404.
-- Current official SDK 2.5.0 source still names the exact v1/v2 endpoints and authentication headers already tested, so there is no changed external evidence and no remaining evidenced local correction. REST-only lifecycle substitution is forbidden by the required agreeing stream/REST barrier.
-- Extended Level C remains prohibited until a future authenticated private stream succeeds.
+- Credential-free probes prove the whole testnet WebSocket ingress fails before authentication (official API host HTTP 503; documented CDN host HTTP 403), while the same mainnet public stream works. Authenticated testnet REST account, orders, positions, trades, and history all return HTTP 200/`OK` and authoritative zero state.
+- Open one fresh Luna-max Extended Builder from current `main` to replace only the testnet stream barrier with two bounded agreeing strict REST rounds. Bind the durable external ID, returned Extended order ID, exact order/history rows, matching trades carrying both identities, zero open orders, and exact flatness; require complete bounded pagination and reject unrelated state. Preserve credential isolation, signing, nonce/expiry, no replay, IOC/reduce-only lifecycle, and normal-startup isolation. Do not claim mainnet readiness from this fallback.
+- After Chief acceptance, run a fresh REST-only Level B. Only then authorize one sequential Extended Level C lifecycle.
 
 ## Completion
 
