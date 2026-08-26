@@ -627,7 +627,7 @@ def test_exact_market_lookup_allows_one_row_without_pagination(pagination_member
     ) == ([{"name": TARGET_MARKET}], None)
 
 
-def test_single_unpaginated_exception_is_scoped_to_exact_market_lookup():
+def test_single_unpaginated_exception_is_scoped_to_exact_lookup_routes():
     class SingleUnpaginated:
         def request(self, method, path, *, query=(), body=None, allow_404=False):
             assert method == "GET"
@@ -640,10 +640,104 @@ def test_single_unpaginated_exception_is_scoped_to_exact_market_lookup():
     assert io._list(
         "/info/markets", query=(("market", TARGET_MARKET),), code="MARKET_LIST_SCHEMA"
     ) == ({"id": 1},)
+    assert io._list(
+        "/user/fees", query=(("market", TARGET_MARKET),), code="FEE_LIST_SCHEMA"
+    ) == ({"id": 1},)
+    assert io._list(
+        "/user/leverage", query=(("market", TARGET_MARKET),), code="LEVERAGE_LIST_SCHEMA"
+    ) == ({"id": 1},)
     with pytest.raises(OperationalSafetyError, match="NONEMPTY_PAGINATION_REQUIRED"):
         io._list("/info/markets", code="MARKET_LIST_SCHEMA")
     with pytest.raises(OperationalSafetyError, match="NONEMPTY_PAGINATION_REQUIRED"):
+        io._list("/user/fees", code="FEE_LIST_SCHEMA")
+    with pytest.raises(OperationalSafetyError, match="NONEMPTY_PAGINATION_REQUIRED"):
+        io._list("/user/leverage", code="LEVERAGE_LIST_SCHEMA")
+    with pytest.raises(OperationalSafetyError, match="NONEMPTY_PAGINATION_REQUIRED"):
         io._list("/user/orders", code="ORDER_LIST_SCHEMA")
+
+
+@pytest.mark.parametrize("path", ["/user/fees", "/user/leverage"])
+@pytest.mark.parametrize("pagination_member", ["absent", None], ids=["absent", "null"])
+def test_exact_setting_lookup_allows_one_row_without_pagination(path, pagination_member):
+    response_body = {"status": "OK", "data": [{"market": TARGET_MARKET, "id": 1}]}
+    if pagination_member != "absent":
+        response_body["pagination"] = pagination_member
+
+    class SingleUnpaginated:
+        def request(self, method, requested_path, *, query=(), body=None, allow_404=False):
+            assert method == "GET" and requested_path == path
+            assert tuple(query) == (("market", TARGET_MARKET), ("limit", 256))
+            return response_body
+
+    capability = type("Capability", (), {"api_key": lambda self: "key", "identity": IDENTITY})()
+    io = OperationalVenueIO(
+        capability, transport=SingleUnpaginated(), clock=lambda: 1770000000000
+    )
+    assert io._list(
+        path, query=(("market", TARGET_MARKET),), code="SETTING_LIST_SCHEMA"
+    ) == ({"market": TARGET_MARKET, "id": 1},)
+
+
+@pytest.mark.parametrize("path", ["/user/fees", "/user/leverage"])
+@pytest.mark.parametrize(
+    "response_body",
+    [
+        {"status": "OK", "data": [{"id": 1}, {"id": 2}]},
+        {
+            "status": "OK",
+            "data": [{"id": 1}],
+            "pagination": {"cursor": None, "count": 2},
+        },
+        {
+            "status": "OK",
+            "data": [{"id": 1}],
+            "pagination": {"cursor": 0, "count": 1},
+        },
+    ],
+)
+def test_exact_setting_lookup_rejects_multiple_or_contradictory_forms(
+    path, response_body,
+):
+    class MalformedSettingResponse:
+        def request(self, method, requested_path, *, query=(), body=None, allow_404=False):
+            assert method == "GET" and requested_path == path
+            assert tuple(query) == (("market", TARGET_MARKET), ("limit", 256))
+            return response_body
+
+    capability = type("Capability", (), {"api_key": lambda self: "key", "identity": IDENTITY})()
+    io = OperationalVenueIO(
+        capability, transport=MalformedSettingResponse(), clock=lambda: 1770000000000
+    )
+    with pytest.raises(OperationalSafetyError):
+        io._list(path, query=(("market", TARGET_MARKET),), code="SETTING_LIST_SCHEMA")
+
+
+@pytest.mark.parametrize(
+    "path,query",
+    [
+        ("/info/markets", ()),
+        ("/info/markets", (("market", "ETH-USD"),)),
+        ("/info/markets", (("market", TARGET_MARKET), ("foo", "bar"))),
+        ("/user/fees", ()),
+        ("/user/fees", (("market", "ETH-USD"),)),
+        ("/user/fees", (("market", TARGET_MARKET), ("foo", "bar"))),
+        ("/user/leverage", ()),
+        ("/user/leverage", (("market", "ETH-USD"),)),
+        ("/user/leverage", (("market", TARGET_MARKET), ("foo", "bar"))),
+    ],
+)
+def test_single_unpaginated_lookup_requires_exact_fixed_market_query(path, query):
+    class SingleUnpaginated:
+        def request(self, method, requested_path, *, query=(), body=None, allow_404=False):
+            assert method == "GET" and requested_path == path
+            return {"status": "OK", "data": [{"id": 1}]}
+
+    capability = type("Capability", (), {"api_key": lambda self: "key", "identity": IDENTITY})()
+    io = OperationalVenueIO(
+        capability, transport=SingleUnpaginated(), clock=lambda: 1770000000000
+    )
+    with pytest.raises(OperationalSafetyError, match="NONEMPTY_PAGINATION_REQUIRED"):
+        io._list(path, query=query, code="LIST_SCHEMA")
 
 
 @pytest.mark.parametrize(
@@ -653,11 +747,10 @@ def test_single_unpaginated_exception_is_scoped_to_exact_market_lookup():
         ("/user/positions", ()),
         ("/user/orders/history", ()),
         ("/user/trades", ()),
-        ("/user/fees", (("market", TARGET_MARKET),)),
-        ("/user/leverage", (("market", TARGET_MARKET),)),
+        ("/user/orders/external/123", ()),
     ],
 )
-def test_nonempty_private_lists_still_require_pagination(path, query):
+def test_nonempty_reconciliation_lists_still_require_pagination(path, query):
     class SingleUnpaginated:
         def request(self, method, requested_path, *, query=(), body=None, allow_404=False):
             assert method == "GET" and requested_path == path
@@ -690,6 +783,38 @@ def test_unpaginated_exact_market_still_runs_market_identity_validation():
     )
     with pytest.raises(OperationalSafetyError, match="MARKET_SAFETY_GATE"):
         io._market(rows[0])
+
+
+@pytest.mark.parametrize(
+    "field,bad_rows,reason",
+    [
+        ("fees", (), "TAKER_FEE_UNIQUE"),
+        ("fees", ({"market": "ETH-USD", "takerFeeRate": "0.00025"},), "TAKER_FEE_UNIQUE"),
+        ("fees", ({"market": TARGET_MARKET, "takerFeeRate": "not-a-number"},), "TAKER_FEE_SCHEMA"),
+        ("leverage", (), "LEVERAGE_INVALID"),
+        ("leverage", ({"market": "ETH-USD", "leverage": "10"},), "LEVERAGE_INVALID"),
+        ("leverage", ({"market": TARGET_MARKET, "leverage": "not-a-number"},), "LEVERAGE_SCHEMA"),
+        ("leverage", ({"market": TARGET_MARKET, "leverage": "0"},), "LEVERAGE_INVALID"),
+    ],
+)
+def test_setting_rows_keep_downstream_market_and_numeric_safety_gates(
+    tmp_path, field, bad_rows, reason,
+):
+    io = FixtureIO()
+    store = OperationalIntentStore(tmp_path / f"{field}-{reason}.sqlite3")
+    runner = SealedLifecycleRunner(
+        store=store,
+        journal=RuntimeRunJournal(tmp_path / f"{field}-{reason}.sqlite3"),
+        io=io,
+        capability=FakeSigner(),
+        identity=IDENTITY,
+    )
+    observation = io.observe(())
+    bad = copy.copy(observation)
+    object.__setattr__(bad, field, tuple(bad_rows))
+    with pytest.raises(OperationalSafetyError, match=reason):
+        runner._prepare_entry(bad)
+    assert store.all() == ()
 
 
 @pytest.mark.parametrize(

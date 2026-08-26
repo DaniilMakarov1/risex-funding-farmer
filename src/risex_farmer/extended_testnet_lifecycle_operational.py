@@ -1339,7 +1339,7 @@ class OperationalVenueIO:
         cursor: int | None = None
         seen_cursors: set[int] = set()
         allow_single_unpaginated = (
-            path == "/info/markets"
+            path in {"/info/markets", "/user/fees", "/user/leverage"}
             and tuple(query) == (("market", TARGET_MARKET),)
         )
         for page in range(MAX_REST_PAGES):
