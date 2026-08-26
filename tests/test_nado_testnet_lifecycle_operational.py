@@ -21,9 +21,9 @@ from risex_farmer.nado_testnet_lifecycle import (
     order_digest,
 )
 from risex_farmer.nado_testnet_lifecycle_operational import (
-    OperationalSafetyError, OperationalVenueIO, OwnerOrderCapability, REDACTED_STORE_PATH,
-    RUN_STORE_BASENAME, SealedLifecycleRunner, TARGET_PRODUCT_ID, TARGET_TICKER_ID,
-    _fixture_run, run,
+    DurableExecuteFailure, OperationalSafetyError, OperationalVenueIO,
+    OwnerOrderCapability, REDACTED_STORE_PATH, RUN_STORE_BASENAME,
+    SealedLifecycleRunner, TARGET_PRODUCT_ID, TARGET_TICKER_ID, _fixture_run, run,
 )
 from risex_farmer.nado_private_read_preflight import MAX_FRESHNESS_MS
 
@@ -241,15 +241,28 @@ def test_entry_rejects_same_product_id_with_wrong_v2_ticker() -> None:
         module._entry_order(observed, OWNER, SENDER, io.now_ms() + 100)
 
 
-def test_entry_is_bounded_ioc_buy_at_fresh_ask() -> None:
+def test_entry_is_smallest_tick_aligned_ten_percent_buffered_ioc_buy() -> None:
     io = FixtureIO()
     observed = io.observe(())
     order = importlib.import_module(
         "risex_farmer.nado_testnet_lifecycle_operational"
     )._entry_order(observed, OWNER, SENDER, io.now_ms() + 100)
     assert order.product_id == TARGET_PRODUCT_ID
-    assert order.price_x18 == observed.ask_x18
+    assert order.price_x18 == 8_543_000_000_000_000
+    assert order.price_x18 % observed.product.tick_x18 == 0
+    assert order.price_x18 * 100 >= observed.ask_x18 * 110
+    assert (order.price_x18 - observed.product.tick_x18) * 100 < observed.ask_x18 * 110
     assert order.appendix == IOC_APPENDIX
+    assert order.amount_x18 == 650 * X18
+
+
+def test_entry_buffer_rounds_exact_ten_percent_bound_without_extra_tick() -> None:
+    io = FixtureIO()
+    observed = replace(io.observe(()), ask_x18=8_000_000_000_000_000)
+    order = importlib.import_module(
+        "risex_farmer.nado_testnet_lifecycle_operational"
+    )._entry_order(observed, OWNER, SENDER, io.now_ms() + 100)
+    assert order.price_x18 == 8_800_000_000_000_000
     assert order.amount_x18 == 650 * X18
 
 
@@ -478,6 +491,61 @@ def test_terminal_execute_rejection_is_sanitized_durable_and_not_ambiguous(
     finally:
         store.close()
     assert b"RAW_VENUE_DETAIL" not in path.read_bytes()
+
+
+def test_runner_propagates_only_durable_terminal_rejection_class_and_code(
+    tmp_path: Path,
+) -> None:
+    io = FixtureIO()
+
+    def reject(_intent, _signature):
+        raise ExecuteFailure(EXECUTE_VENUE_REJECTION, 2011)
+
+    io.dispatch = reject
+    with pytest.raises(DurableExecuteFailure) as caught:
+        _fixture_run(
+            path=tmp_path / "sealed-rejection.sqlite", io=io,
+            capability_loader=capability, owner=OWNER, sender=SENDER,
+        )
+    assert caught.value.failure_class == EXECUTE_VENUE_REJECTION
+    assert caught.value.venue_code == 2011
+
+    store = IntentStore(tmp_path / "sealed-rejection.sqlite")
+    try:
+        intent, state = store.intents()[0]
+        assert state == "REJECTED"
+        assert store.lifecycle_status() == HALTED
+        assert store.execute_failure(intent.digest) == (EXECUTE_VENUE_REJECTION, 2011)
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("failure_class", "venue_code"),
+    [
+        (EXECUTE_VENUE_REJECTION, 2011),
+        (EXECUTE_TRANSPORT_AMBIGUITY, None),
+        (EXECUTE_RESPONSE_AMBIGUITY, None),
+    ],
+)
+def test_outer_sealed_report_preserves_execute_failure_class_and_code(
+    monkeypatch, capsys, failure_class: str, venue_code: int | None,
+) -> None:
+    module = importlib.import_module("risex_farmer.nado_testnet_lifecycle_operational")
+    monkeypatch.setattr(
+        module, "run",
+        lambda: (_ for _ in ()).throw(
+            DurableExecuteFailure(failure_class, venue_code)
+        ),
+    )
+    module.main()
+    assert json.loads(capsys.readouterr().out) == {
+        "schema_version": 1,
+        "status": "BLOCKED",
+        "path": REDACTED_STORE_PATH,
+        "reason": failure_class,
+        "venue_code": venue_code,
+    }
 
 
 @pytest.mark.parametrize(

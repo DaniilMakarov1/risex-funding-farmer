@@ -66,6 +66,15 @@ class OperationalSafetyError(RuntimeError):
     """Sanitized terminal operational failure."""
 
 
+class DurableExecuteFailure(OperationalSafetyError):
+    """Sanitized execute failure recovered from the durable intent journal."""
+
+    def __init__(self, failure_class: str, venue_code: int | None) -> None:
+        self.failure_class = failure_class
+        self.venue_code = venue_code
+        super().__init__(failure_class)
+
+
 @dataclass(frozen=True)
 class LiveObservation:
     catalog: CatalogSnapshot
@@ -268,8 +277,12 @@ def _entry_order(observation: LiveObservation, owner: str, sender: str, recv: in
         raise OperationalSafetyError("fresh non-crossed tick-aligned BBO required")
     salt = _salt()
     amount = smallest_executable_amount(product, prices_x18=(bid, ask))
+    buffered_ask = (ask * 110 + 99) // 100
+    price = (
+        (buffered_ask + product.tick_x18 - 1) // product.tick_x18
+    ) * product.tick_x18
     return SyntheticOrderVector(
-        owner, SUBACCOUNT_NAME, sender, TARGET_PRODUCT_ID, ask,
+        owner, SUBACCOUNT_NAME, sender, TARGET_PRODUCT_ID, price,
         amount, UINT32_MAX, recv, salt,
         build_order_nonce(recv, salt), IOC_APPENDIX,
     )
@@ -307,7 +320,13 @@ class SealedLifecycleRunner:
                     intent.digest, lambda durable: self.io.dispatch(durable, signature)
                 )
             except ExecuteFailure as error:
-                raise OperationalSafetyError(str(error)) from None
+                persisted = self.store.execute_failure(intent.digest)
+                expected = (error.failure_class, error.venue_code)
+                if persisted != expected:
+                    raise OperationalSafetyError(
+                        "durable execute failure evidence mismatch"
+                    ) from None
+                raise DurableExecuteFailure(*persisted) from None
             self.writes += 1
             if returned.lower() != intent.digest.lower():
                 self.store.halt()
@@ -995,6 +1014,11 @@ class OperationalVenueIO:
 def main() -> None:
     try:
         report = run()
+    except DurableExecuteFailure as error:
+        report = {
+            "schema_version": 1, "status": "BLOCKED", "path": REDACTED_STORE_PATH,
+            "reason": error.failure_class, "venue_code": error.venue_code,
+        }
     except BaseException:
         report = {
             "schema_version": 1, "status": "BLOCKED", "path": REDACTED_STORE_PATH,
