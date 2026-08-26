@@ -15,6 +15,7 @@ from risex_farmer.testnet_risex_private_read_preflight import (
     DOMAIN_NAME,
     DOMAIN_VERSION,
     HttpResponse,
+    MAX_AGE_SECONDS,
     MARKET_ID,
     MARKET_SYMBOL,
     MINIMUM,
@@ -827,7 +828,7 @@ async def test_signer_not_yet_registered_or_expired_blocks(tmp_path, now):
 
 
 @pytest.mark.asyncio
-async def test_earliest_public_evidence_must_still_be_fresh_after_sweep_b(tmp_path):
+async def test_sequentially_fresh_public_evidence_may_span_five_seconds(tmp_path):
     clock = Clock()
     transport = PublicTransport(clock)
 
@@ -841,8 +842,72 @@ async def test_earliest_public_evidence_must_still_be_fresh_after_sweep_b(tmp_pa
     controller = PrivateReadPreflight(
         store, clock=clock, public_get=transport, lifecycle_clear=lambda: True,
     )
-    assert await controller.run_public_barrier() is None
-    assert len(transport.calls) == 18 and store.outcome() == Outcome.BLOCKED
+    barrier = await controller.run_public_barrier()
+    assert barrier is not None
+    assert clock.value - NOW > MAX_AGE_SECONDS
+    assert len(transport.calls) == 18 and store.outcome() is None
+    store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["stale", "future"])
+async def test_delayed_stale_or_future_response_blocks_before_private_effects(
+    tmp_path, kind,
+):
+    clock = Clock()
+    transport = PublicTransport(clock)
+
+    def delayed(response):
+        clock.value += 0.4
+        return response
+
+    for path, _query in expected_public_calls():
+        transport.mutations[path] = delayed
+
+    def delayed_bad(response):
+        clock.value += 0.4
+        observed_at = (
+            clock.value - MAX_AGE_SECONDS - 0.1
+            if kind == "stale" else clock.value + 0.1
+        )
+        return replace(response, observed_at=observed_at)
+
+    transport.mutations[(0, "/v1/orderbook")] = delayed_bad
+    store = PrivateReadStore(tmp_path / f"delayed-{kind}.sqlite3")
+    controller = PrivateReadPreflight(
+        store, clock=clock, public_get=transport, lifecycle_clear=lambda: True,
+    )
+    private_effects = []
+
+    def loader():
+        private_effects.append("loader")
+        return SyntheticCredential(SIGNER, b"fixture")
+
+    async def nonce_get(_path, _query):
+        private_effects.append("nonce")
+        return HttpResponse(
+            200, expected_url("/v1/auth/nonce", (("account", ACCOUNT),)),
+            envelope({"nonce": "0x1"}), clock(), False,
+        )
+
+    def sign(_credential, _typed_data):
+        private_effects.append("sign")
+        return SIGNATURE
+
+    async def socket(_url, _outbound):
+        private_effects.append("socket")
+        return private_frames()
+
+    barrier = await controller.run_public_barrier()
+    if barrier is not None:
+        await controller.run_private_proof(
+            barrier, signer_loader=loader, nonce_get=nonce_get,
+            sign_register_v2=sign, private_exchange=socket,
+        )
+    assert barrier is None
+    assert len(transport.calls) == 6
+    assert private_effects == []
+    assert store.outcome() == Outcome.BLOCKED
     store.close()
 
 

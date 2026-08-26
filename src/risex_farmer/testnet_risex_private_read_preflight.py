@@ -325,7 +325,6 @@ class PrivateReadPreflight:
                 self._block(18)
             return None
         count = 0
-        observations: list[float] = []
         try:
             if not self._store.start_public_attempt():
                 raise ValueError("public attempt already consumed")
@@ -338,15 +337,9 @@ class PrivateReadPreflight:
                     count += 1
                     response = await _await(self._public_get(path, query))
                     responses[path] = self._validate_response(path, query, response)
-                    observations.append(_finite_time(response.observed_at))
                 sweeps.append(self._validate_sweep(responses))
             if (
                 sweeps[0] != sweeps[1] or self._lifecycle_clear() is not True
-                or any(
-                    self._now() - observed < 0
-                    or self._now() - observed > MAX_AGE_SECONDS
-                    for observed in observations
-                )
             ):
                 raise ValueError("inconsistent sweeps")
             self._barrier = _Barrier(self._owner, self._now())
