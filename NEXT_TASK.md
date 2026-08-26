@@ -19,7 +19,7 @@ Status: `LEVEL C COMPLETE`.
 
 ## Extended — wallet/API Management setup and lifecycle
 
-Status: `ENTRY FILLED; RECOVERY CLOSE BLOCKED ON CURRENT-POSITIONS PAGINATION DEFECT`.
+Status: `ENTRY FILLED; RECOVERY CLOSE BLOCKED ON EXACT-EXTERNAL LOOKUP PAGINATION DEFECT`.
 
 - Existing local owner/Stark identities and the sole subaccount match; testnet claim completed, balance is readable, and zero orders/positions are authoritative. A fresh REST-valid API key reproduced v1 HTTP 503 and v2 RPC HTTP 404, excluding wallet, collateral, stale key, and quota causes.
 - The local Level B runner now durably classifies pre-upgrade failures as sanitized `HTTP` or `TRANSPORT`; automated stream retries remain stopped after the observed provider v1 HTTP 503 and v2 HTTP 404.
@@ -30,6 +30,8 @@ Status: `ENTRY FILLED; RECOVERY CLOSE BLOCKED ON CURRENT-POSITIONS PAGINATION DE
 - The price-ratio correction is accepted and published. One fresh Level B passed, then exactly one sealed Level C entry was accepted and fully filled at `0.0001 BTC`; exact order, external identity, history, trade, zero-open-order, and exact-long-position evidence agree. The active journal is protected and the entry must never replay.
 - The runner halted only because its generic list validator requires pagination for a nonempty `/user/positions` response. Official Extended documentation defines that endpoint as the complete set of open positions, with no cursor/limit parameters and a non-paginated general response. Open one fresh visible Luna-max Builder from current `main` to permit bounded nonempty absent/null pagination only for current positions. Preserve exact account/market/side/size validation, unrelated-position rejection, strict pagination for orders history/trades and other paginated routes, freshness, durable identity, no-replay, and final barriers; do not change product, order type, shared core, or other venues.
 - After Chief review/integration, preserve a byte-identical backup of the active database, obtain fresh authoritative evidence, and use only the minimum guarded local recovery justified by the already-proven fill. Mark the entry reconciled without dispatch, then prepare and dispatch at most one new durable reduce-only close identity. Never replay the entry. Any ambiguous close halts for authoritative reconciliation; completion requires two independent authoritative zero-open-order and exact-flat rounds.
+- The current-positions correction is accepted and its focused/full verification passed. The protected active database backup is byte-identical. A fresh post-correction read stopped before mutation/write only because `/user/orders/external/{externalId}` returned its documented unpaginated nonempty exact-lookup list. Official documentation exposes no pagination parameters and shows a GeneralResponse list for this route.
+- Open one fresh visible Luna-max Builder from current `main` to permit absent/null pagination only for the exact external-ID lookup path. Preserve the exact one-row identity binding, bounded list size, strict pagination for orders history/trades and all documented paginated endpoints, and every existing freshness/unrelated-state/no-replay/final barrier. After acceptance, resume the same protected database recovery and at-most-one reduce-only close; never replay the entry.
 
 ## Completion
 
