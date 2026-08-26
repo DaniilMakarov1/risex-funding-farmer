@@ -1347,19 +1347,6 @@ def _require_recent(response: _HTTPObservation, now: int, label: str) -> None:
         raise CoordinatorSafetyError(f"RISEx {label} response stale")
 
 
-def _response_list(response: _HTTPObservation, key: str) -> tuple[Mapping[str, Any], ...]:
-    data = _response_data(response)
-    if isinstance(data, list):
-        rows = data
-    elif isinstance(data, Mapping) and isinstance(data.get(key), list):
-        rows = data[key]
-    else:
-        raise CoordinatorSafetyError("RISEx REST list schema rejected")
-    if not all(isinstance(row, Mapping) for row in rows):
-        raise CoordinatorSafetyError("RISEx REST list row rejected")
-    return tuple(rows)
-
-
 async def _paged_rows(
     transport: Any, path: str, identity: RoleIdentity, key: str,
     now: Callable[[], int],
@@ -1412,6 +1399,31 @@ def _mapped_enum(value: Any, values: Mapping[Any, str], label: str) -> str:
     raise CoordinatorSafetyError(f"RISEx {label} rejected")
 
 
+def _compact_uint(value: Any, *, bits: int, label: str) -> int:
+    if type(value) is int:
+        parsed = value
+    elif (
+        isinstance(value, str)
+        and value.isascii()
+        and value.isdecimal()
+        and (value == "0" or not value.startswith("0"))
+    ):
+        parsed = int(value)
+    else:
+        raise CoordinatorSafetyError(f"RISEx compact {label} rejected")
+    if not 0 <= parsed < 2**bits:
+        raise CoordinatorSafetyError(f"RISEx compact {label} rejected")
+    return parsed
+
+
+def _compact_enum(value: Any, values: Mapping[int, str], label: str) -> str:
+    parsed = _compact_uint(value, bits=8, label=label)
+    mapped = values.get(parsed)
+    if mapped is not None:
+        return mapped
+    raise CoordinatorSafetyError(f"RISEx compact {label} rejected")
+
+
 def _parse_book_rows(value: Any, observed_at: int) -> BookObservation:
     if not isinstance(value, Mapping) or str(value.get("market_id")) != str(MARKET_ID):
         raise CoordinatorSafetyError("RISEx REST book identity rejected")
@@ -1434,6 +1446,92 @@ def _parse_book_rows(value: Any, observed_at: int) -> BookObservation:
         bid=levels["bids"][0].price,
         ask=levels["asks"][0].price,
         bids=tuple(levels["bids"]), asks=tuple(levels["asks"]), observed_at=observed_at,
+    )
+
+
+_COMPACT_OPEN_ORDER_FIELDS = {
+    "account", "client_order_id", "market_id", "order_id", "order_type",
+    "post_only", "price_ticks", "reduce_only", "resting_order_id", "side",
+    "size_steps", "time_in_force", "wide_order_id",
+}
+
+
+def _parse_compact_open_order_row(
+    row: Mapping[str, Any], identity: RoleIdentity, observed_at: int,
+) -> RestOrder:
+    if not isinstance(row, Mapping) or not _COMPACT_OPEN_ORDER_FIELDS <= set(row):
+        raise CoordinatorSafetyError("RISEx compact open order schema rejected")
+    try:
+        order_id = row["order_id"]
+        if not isinstance(order_id, str) or not _valid_order_id(order_id):
+            raise ValueError
+        wide = _compact_uint(row["wide_order_id"], bits=64, label="wide order identity")
+        resting = _compact_uint(
+            row["resting_order_id"], bits=64, label="resting order identity",
+        )
+        client = _compact_uint(
+            row["client_order_id"], bits=64, label="client order identity",
+        )
+        market_id = _compact_uint(row["market_id"], bits=16, label="market identity")
+        account = _address(row["account"]).lower()
+        if account != identity.account.lower() or market_id != MARKET_ID:
+            raise CoordinatorSafetyError("RISEx compact open order identity rejected")
+        if _wide_order_id(order_id) != wide or resting != wide >> 1:
+            raise CoordinatorSafetyError("RISEx compact open order composite rejected")
+        side = _compact_enum(row["side"], {0: "BUY", 1: "SELL"}, "order side")
+        order_type = _compact_enum(
+            row["order_type"], {0: "MARKET", 1: "LIMIT"}, "order type",
+        )
+        tif = _compact_enum(
+            row["time_in_force"], {0: "GTC", 1: "GTT", 2: "FOK", 3: "IOC"},
+            "order time-in-force",
+        )
+        size_steps = _compact_uint(row["size_steps"], bits=32, label="size")
+        price_ticks = _compact_uint(row["price_ticks"], bits=24, label="price")
+        if type(row["post_only"]) is not bool or type(row["reduce_only"]) is not bool:
+            raise ValueError
+        size = Decimal(format((Decimal(size_steps) * MARKET_STEP).normalize(), "f"))
+        price = Decimal(format((Decimal(price_ticks) * MARKET_TICK).normalize(), "f"))
+        order = RestOrder(
+            order_id=order_id, wide_order_id=wide, resting_order_id=resting,
+            client_order_id=client, market_id=market_id, account=account,
+            side=side, order_type=order_type, time_in_force=tif, status="OPEN",
+            size=size, filled_size=Decimal("0"), price=price,
+            post_only=row["post_only"], reduce_only=row["reduce_only"],
+            observed_at=observed_at,
+        )
+    except CoordinatorSafetyError:
+        raise
+    except Exception:
+        raise CoordinatorSafetyError("RISEx compact open order value rejected") from None
+    _validate_order(order, identity, observed_at)
+    return order
+
+
+def _parse_open_orders(
+    response: _HTTPObservation, identity: RoleIdentity,
+) -> tuple[RestOrder, ...]:
+    data = _response_data(response)
+    if (
+        not isinstance(data, Mapping)
+        or not {"account", "market_id", "orders", "total_orders"} <= set(data)
+        or not isinstance(data["orders"], list)
+    ):
+        raise CoordinatorSafetyError("RISEx compact open orders schema rejected")
+    try:
+        account = _address(data["account"]).lower()
+    except Exception:
+        raise CoordinatorSafetyError("RISEx compact open orders identity rejected") from None
+    if account != identity.account.lower():
+        raise CoordinatorSafetyError("RISEx compact open orders identity rejected")
+    if _compact_uint(data["market_id"], bits=16, label="open market") != 0:
+        raise CoordinatorSafetyError("RISEx compact open orders market rejected")
+    total_orders = _compact_uint(data["total_orders"], bits=32, label="open count")
+    if total_orders > MAX_BASELINE_HISTORY_ROWS or len(data["orders"]) > MAX_BASELINE_HISTORY_ROWS:
+        raise CoordinatorSafetyError("RISEx compact open orders bound rejected")
+    return tuple(
+        _parse_compact_open_order_row(row, identity, response.observed_at)
+        for row in data["orders"]
     )
 
 
@@ -2901,10 +2999,7 @@ class FixedRisexTwoAccountVenue:
         signers = _response_data(signers_response)
         self._active_signer(status, signers, identity)
         _require_recent(open_response, self._now(), "open orders")
-        open_orders = tuple(
-            _parse_order_row(row, identity, open_response.observed_at)
-            for row in _response_list(open_response, "orders")
-        )
+        open_orders = _parse_open_orders(open_response, identity)
         history_orders = tuple(
             _parse_order_row(row, identity, history_at) for row in history_rows
         )
@@ -3348,6 +3443,8 @@ class TwoAccountCoordinator:
         }
         observed_orders = {order.order_id: list(_order_history_evidence(order)) for order in account.history_orders}
         observed_trades = {trade.trade_id: list(_trade_history_evidence(trade)) for trade in account.trades}
+        if any(order.order_id not in known_orders for order in account.open_orders):
+            raise CoordinatorSafetyError("RISEx unrelated open order state rejected")
         candidate_trade_ids = {
             trade.trade_id for trade in account.trades
             if trade.order_id in known_orders

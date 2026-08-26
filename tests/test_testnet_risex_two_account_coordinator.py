@@ -45,6 +45,7 @@ from risex_farmer.testnet_risex_two_account_coordinator import (
     WriteResult,
     _HTTPObservation,
     _paged_rows,
+    _parse_open_orders,
     _parse_order_row,
     _parse_portfolio,
     _parse_trade_row,
@@ -622,6 +623,26 @@ def test_complete_two_account_lifecycle_is_sequential_and_reduce_only(tmp_path: 
     assert report.final_rounds == 2
 
 
+def test_post_baseline_unknown_open_order_halts_before_lifecycle_progress(tmp_path: Path):
+    observations, rounds = lifecycle_observations()
+    unknown = order(
+        wide=409, client=4009, account=COUNTERPARTY, side="BUY",
+        order_type="LIMIT", tif="GTC", status="OPEN", price="2999.01",
+        post_only=True,
+    )
+    original = observations[1].accounts[AccountRole.COUNTERPARTY]
+    observations[1] = replace(observations[1], accounts={
+        AccountRole.PRIMARY: observations[1].accounts[AccountRole.PRIMARY],
+        AccountRole.COUNTERPARTY: replace(
+            original, open_orders=(*original.open_orders, unknown),
+        ),
+    })
+    venue = LifecycleVenue(observations, rounds)
+    report = asyncio.run(make_lifecycle(tmp_path, venue).run())
+    assert report.result is CoordinatorResult.FAILED_HALTED_MANUAL_RECOVERY
+    assert [role for role, _ in venue.place_calls] == [AccountRole.COUNTERPARTY]
+
+
 def test_partial_mutual_fill_halts_before_second_maker(tmp_path: Path):
     observations, rounds = lifecycle_observations()
     bad = observations[2]
@@ -743,6 +764,156 @@ def _raw_order(item: RestOrder) -> dict[str, object]:
         "reduce_only": item.reduce_only,
         "is_liquidation": False,
     }
+
+
+def _raw_compact_open_order(item: RestOrder, *, strings: bool = False) -> dict[str, object]:
+    values: dict[str, object] = {
+        "account": item.account,
+        "client_order_id": item.client_order_id,
+        "market_id": item.market_id,
+        "order_id": item.order_id,
+        "order_type": {"MARKET": 0, "LIMIT": 1}[item.order_type],
+        "post_only": item.post_only,
+        "price_ticks": int(item.price / Decimal("0.01")),
+        "reduce_only": item.reduce_only,
+        "resting_order_id": item.resting_order_id,
+        "side": {"BUY": 0, "SELL": 1}[item.side],
+        "size_steps": int(item.size / Decimal("0.001")),
+        "time_in_force": {"GTC": 0, "IOC": 3}[item.time_in_force],
+        "wide_order_id": item.wide_order_id,
+    }
+    if strings:
+        for key in (
+            "client_order_id", "market_id", "order_type", "price_ticks",
+            "resting_order_id", "side", "size_steps", "time_in_force",
+            "wide_order_id",
+        ):
+            values[key] = str(values[key])
+    return values
+
+
+def _open_orders_response(
+    account: str, orders: tuple[dict[str, object], ...] = (), *,
+    market_id: object = "0", total_orders: object = "0",
+) -> _HTTPObservation:
+    return _HTTPObservation(
+        200, "", {"data": {
+            "account": account,
+            "market_id": market_id,
+            "orders": list(orders),
+            "total_orders": total_orders,
+        }, "request_id": "/v1/orders/open"}, NOW,
+    )
+
+
+def test_compact_open_order_fixture_binds_observed_contract_and_synthesizes_state():
+    item = order(
+        wide=0x339EF, client=11160469709073598394, account=ACCOUNT,
+        side="SELL", order_type="LIMIT", tif="GTC", status="OPEN",
+        price="2363.04", post_only=True,
+    )
+    parsed = _parse_open_orders(
+        _open_orders_response(ACCOUNT, (_raw_compact_open_order(item),)),
+        _primary_identity(),
+    )
+    assert len(parsed) == 1
+    assert parsed[0].order_id == item.order_id
+    assert parsed[0].status == "OPEN"
+    assert parsed[0].filled_size == Decimal("0")
+    assert parsed[0].size == Decimal("0.1")
+    assert parsed[0].price == Decimal("2363.04")
+
+
+@pytest.mark.parametrize("strings", [False, True])
+@pytest.mark.parametrize("market_id", [0, "0"])
+def test_compact_open_order_accepts_canonical_uint_string_forms(strings, market_id):
+    item = order(
+        wide=205, client=4205, account=ACCOUNT, side="SELL",
+        order_type="LIMIT", tif="GTC", status="OPEN", price="2363.04",
+        post_only=True,
+    )
+    parsed = _parse_open_orders(
+        _open_orders_response(
+            ACCOUNT, (_raw_compact_open_order(item, strings=strings),),
+            market_id=market_id, total_orders=0,
+        ),
+        _primary_identity(),
+    )
+    assert parsed[0].client_order_id == 4205
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda data: data.pop("account"), id="missing-account"),
+        pytest.param(lambda data: data.__setitem__("account", "not-an-address"), id="malformed-account"),
+        pytest.param(lambda data: data.__setitem__("account", COUNTERPARTY), id="unrelated-account"),
+        pytest.param(lambda data: data.__setitem__("market_id", "2"), id="filtered-market"),
+        pytest.param(lambda data: data.__setitem__("market_id", "00"), id="noncanonical-market"),
+        pytest.param(lambda data: data.__setitem__("total_orders", "00"), id="noncanonical-count"),
+        pytest.param(lambda data: data.__setitem__("total_orders", -1), id="negative-count"),
+        pytest.param(lambda data: data.__setitem__("total_orders", 257), id="oversized-count"),
+        pytest.param(lambda data: data.__setitem__("orders", {}), id="orders-not-list"),
+        pytest.param(lambda data: data.pop("total_orders"), id="missing-count"),
+    ],
+)
+def test_compact_open_order_wrapper_rejects_identity_market_and_count_contradictions(mutate):
+    item = order(
+        wide=206, client=4206, account=ACCOUNT, side="SELL",
+        order_type="LIMIT", tif="GTC", status="OPEN", price="2363.04",
+        post_only=True,
+    )
+    response = _open_orders_response(ACCOUNT, (_raw_compact_open_order(item),))
+    data = copy.deepcopy(response.body["data"])
+    mutate(data)
+    broken = replace(response, body={"data": data, "request_id": "/v1/orders/open"})
+    with pytest.raises(CoordinatorSafetyError):
+        _parse_open_orders(broken, _primary_identity())
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda row: row.pop("price_ticks"), id="missing-field"),
+        pytest.param(lambda row: row.__setitem__("side", 2), id="side-enum"),
+        pytest.param(lambda row: row.__setitem__("side", "SELL"), id="named-side-enum"),
+        pytest.param(lambda row: row.__setitem__("order_type", 2), id="type-enum"),
+        pytest.param(lambda row: row.__setitem__("time_in_force", 4), id="tif-enum"),
+        pytest.param(lambda row: row.__setitem__("size_steps", "100.0"), id="size-grid"),
+        pytest.param(lambda row: row.__setitem__("price_ticks", "236304.0"), id="price-grid"),
+        pytest.param(lambda row: row.__setitem__("post_only", "true"), id="post-only-flag"),
+        pytest.param(lambda row: row.__setitem__("reduce_only", 0), id="reduce-only-flag"),
+        pytest.param(lambda row: row.__setitem__("wide_order_id", "208"), id="wide-identity"),
+        pytest.param(lambda row: row.__setitem__("resting_order_id", "102"), id="resting-identity"),
+        pytest.param(lambda row: row.__setitem__("order_id", "0x" + "00" * 24), id="composite-identity"),
+    ],
+)
+def test_compact_open_order_row_rejects_malformed_missing_enum_grid_and_composite_fields(mutate):
+    item = order(
+        wide=207, client=4207, account=ACCOUNT, side="SELL",
+        order_type="LIMIT", tif="GTC", status="OPEN", price="2363.04",
+        post_only=True,
+    )
+    row = _raw_compact_open_order(item)
+    mutate(row)
+    with pytest.raises(CoordinatorSafetyError):
+        _parse_open_orders(
+            _open_orders_response(ACCOUNT, (row,)), _primary_identity(),
+        )
+
+
+def test_compact_open_order_row_accepts_additive_irrelevant_fields():
+    item = order(
+        wide=208, client=4208, account=ACCOUNT, side="SELL",
+        order_type="LIMIT", tif="GTC", status="OPEN", price="2363.04",
+        post_only=True,
+    )
+    row = _raw_compact_open_order(item)
+    row["unexpected"] = {"venue": "ignored"}
+    parsed = _parse_open_orders(
+        _open_orders_response(ACCOUNT, (row,)), _primary_identity(),
+    )
+    assert parsed[0].order_id == item.order_id
 
 
 def test_official_rest_trade_and_market_order_contracts_are_sealed():
@@ -1119,9 +1290,14 @@ def test_fixed_account_adapter_normalizes_flat_position_variants():
     )
 
     class FlatReads:
-        def __init__(self, *, mismatch: bool = False):
+        def __init__(
+            self, *, mismatch: bool = False, open_order: RestOrder | None = None,
+            exact_order: RestOrder | None = None,
+        ):
             self.calls: list[tuple[str, tuple[tuple[str, str], ...]]] = []
             self.mismatch = mismatch
+            self.open_order = open_order
+            self.exact_order = exact_order if exact_order is not None else open_order
 
         async def get(self, path, query=()):
             query = tuple(query)
@@ -1138,7 +1314,17 @@ def test_fixed_account_adapter_normalizes_flat_position_variants():
             elif path == "/v1/auth/signers":
                 data = {"signers": [{"signer": signer, "status": "Active"}]}
             elif path == "/v1/orders/open":
-                data = {"orders": []}
+                data = {
+                    "account": account, "market_id": "0",
+                    "orders": [] if self.open_order is None else [
+                        _raw_compact_open_order(self.open_order),
+                    ],
+                    "total_orders": "0",
+                }
+            elif path.startswith("/v1/orders/by-id/"):
+                if self.exact_order is None:
+                    raise AssertionError(path)
+                data = {"order": _raw_order(self.exact_order)}
             elif path == HISTORY_PATH:
                 data = {"orders": [], "page": 1, "has_next_page": False}
             elif path == TRADES_PATH:
@@ -1211,6 +1397,53 @@ def test_fixed_account_adapter_normalizes_flat_position_variants():
     )
     with pytest.raises(CoordinatorSafetyError):
         asyncio.run(mismatch_venue._account(AccountRole.PRIMARY, include_private=False))
+
+    open_order = order(
+        wide=408, client=4008, account=ACCOUNT, side="SELL",
+        order_type="LIMIT", tif="GTC", status="OPEN", price="2363.04",
+        post_only=True,
+    )
+    open_transport = FlatReads(open_order=open_order)
+    open_venue = FixedRisexTwoAccountVenue(
+        identities={
+            AccountRole.PRIMARY: primary,
+            AccountRole.COUNTERPARTY: counterparty,
+        },
+        credential_loaders={
+            AccountRole.PRIMARY: lambda: None,
+            AccountRole.COUNTERPARTY: lambda: None,
+        },
+        transport=open_transport,
+        now=lambda: NOW,
+        known_order_ids={AccountRole.PRIMARY: (open_order.order_id,)},
+    )
+    snapshot, _, _ = asyncio.run(
+        open_venue._account(AccountRole.PRIMARY, include_private=False),
+    )
+    assert snapshot.open_orders[0].order_id == open_order.order_id
+    assert (
+        ORDER_LOOKUP_PATH_TEMPLATE.format(order_id=open_order.order_id), ()
+    ) in open_transport.calls
+
+    disagreement = replace(open_order, price=Decimal("2363.05"))
+    disagreement_transport = FlatReads(
+        open_order=open_order, exact_order=disagreement,
+    )
+    disagreement_venue = FixedRisexTwoAccountVenue(
+        identities={
+            AccountRole.PRIMARY: primary,
+            AccountRole.COUNTERPARTY: counterparty,
+        },
+        credential_loaders={
+            AccountRole.PRIMARY: lambda: None,
+            AccountRole.COUNTERPARTY: lambda: None,
+        },
+        transport=disagreement_transport,
+        now=lambda: NOW,
+        known_order_ids={AccountRole.PRIMARY: (open_order.order_id,)},
+    )
+    with pytest.raises(CoordinatorSafetyError):
+        asyncio.run(disagreement_venue._account(AccountRole.PRIMARY, include_private=False))
 
     assert _point_position(
         {"position": {"market_id": "0", "size": "0"}}, primary,
