@@ -83,6 +83,9 @@ MARKET_SYMBOL = OFFICIAL_MARKET_SYMBOL
 MARKET_TICK = OFFICIAL_MARKET_TICK
 MARKET_STEP = OFFICIAL_MARKET_STEP
 MARKET_MINIMUM = OFFICIAL_MARKET_MINIMUM
+_POSITION_ATOMIC_SCALE = 10**18
+_POSITION_ATOMIC_STEP = int(MARKET_STEP * Decimal(_POSITION_ATOMIC_SCALE))
+_MAX_POSITION_ATOMIC = 2**255 - 1
 
 # The counterparty account is intentionally not a selectable CLI/config value.
 # Its fixed public account is derived from the one protected wallet source and
@@ -116,6 +119,14 @@ COUNTERPARTY_REGISTRATION_EXPIRATION = 1819294121
 
 class CoordinatorSafetyError(RuntimeError):
     """Sanitized fail-closed coordinator rejection."""
+
+
+class OrderHistoryPropagationMismatch(CoordinatorSafetyError):
+    """One bounded exact-order/history status-visibility propagation mismatch."""
+
+    def __init__(self, order_id: str):
+        self.order_id = order_id
+        super().__init__("RISEx exact order/history propagation mismatch")
 
 
 class AccountRole(str, Enum):
@@ -1148,6 +1159,30 @@ def _validate_order(order: RestOrder, identity: RoleIdentity, now: int) -> None:
         raise CoordinatorSafetyError("RISEx order grid rejected")
 
 
+_ACCOUNT_LIKE_TRADE_FIELDS = ("wallet_address", "sender", "account")
+
+
+def _trade_account(
+    row: Mapping[str, Any], identity: RoleIdentity, *, allow_missing: bool,
+) -> str:
+    present = tuple(
+        field for field in _ACCOUNT_LIKE_TRADE_FIELDS if field in row
+    )
+    if not present:
+        if allow_missing:
+            return identity.account
+        raise CoordinatorSafetyError("RISEx REST trade identity rejected")
+    values: list[str] = []
+    for field in present:
+        try:
+            values.append(_address(row[field]).lower())
+        except Exception:
+            raise CoordinatorSafetyError("RISEx REST trade identity rejected") from None
+    if any(value != identity.account for value in values):
+        raise CoordinatorSafetyError("RISEx REST trade identity rejected")
+    return identity.account
+
+
 def _validate_trade(trade: RestTrade, identity: RoleIdentity, now: int) -> None:
     trade_parts = trade.trade_id.split("-")
     if (
@@ -1340,6 +1375,19 @@ def _order_immutable_evidence(order: RestOrder) -> tuple[Any, ...]:
         order.side, order.order_type, order.time_in_force,
         str(order.size), str(order.price), order.post_only, order.reduce_only,
     )
+
+
+def _is_monotonic_order_visibility(
+    history_order: RestOrder, exact_order: RestOrder,
+) -> bool:
+    """Allow only history lagging a later exact lookup on status/filled fields."""
+    if _order_immutable_evidence(history_order) != _order_immutable_evidence(exact_order):
+        return False
+    if exact_order.status == history_order.status:
+        return exact_order.filled_size >= history_order.filled_size
+    if history_order.status != "OPEN" or exact_order.status not in {"FILLED", "CANCELLED"}:
+        return False
+    return exact_order.filled_size >= history_order.filled_size
 
 
 def _trade_history_evidence(trade: RestTrade) -> tuple[Any, ...]:
@@ -1654,7 +1702,10 @@ def _parse_order_row(row: Mapping[str, Any], identity: RoleIdentity, observed_at
     return order
 
 
-def _parse_trade_row(row: Mapping[str, Any], identity: RoleIdentity, observed_at: int) -> RestTrade:
+def _parse_trade_row(
+    row: Mapping[str, Any], identity: RoleIdentity, observed_at: int, *,
+    account_scoped: bool = False,
+) -> RestTrade:
     try:
         trade_id = row.get("id")
         order_id = row.get("order_id")
@@ -1663,9 +1714,9 @@ def _parse_trade_row(row: Mapping[str, Any], identity: RoleIdentity, observed_at
         trade = RestTrade(
             trade_id=str(trade_id), order_id=str(order_id),
             client_order_id=int(row["client_order_id"]), market_id=int(row["market_id"]),
-            account=_address(
-                row.get("wallet_address", row.get("sender", row.get("account")))
-            ).lower(),
+            account=_trade_account(
+                row, identity, allow_missing=account_scoped,
+            ),
             side=_mapped_enum(row["side"], {0: "BUY", 1: "SELL"}, "trade side"),
             size=_decimal(row["size"], positive=True),
             price=_decimal(row["price"], positive=True), observed_at=observed_at,
@@ -1676,6 +1727,36 @@ def _parse_trade_row(row: Mapping[str, Any], identity: RoleIdentity, observed_at
         raise CoordinatorSafetyError("RISEx REST trade value rejected") from None
     _validate_trade(trade, identity, observed_at)
     return trade
+
+
+def _atomic_position_size(value: Any) -> Decimal:
+    """Decode the fixed-point integer used by the full position sources."""
+    if not isinstance(value, str) or not value.isascii():
+        raise CoordinatorSafetyError("RISEx REST atomic position size rejected")
+    digits = value[1:] if value.startswith("-") else value
+    if (
+        not digits
+        or not digits.isdecimal()
+        or (len(digits) > 1 and digits.startswith("0"))
+        or (value.startswith("-") and digits == "0")
+    ):
+        raise CoordinatorSafetyError("RISEx REST atomic position size rejected")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise CoordinatorSafetyError("RISEx REST atomic position size rejected") from None
+    if (
+        not -_MAX_POSITION_ATOMIC <= parsed <= _MAX_POSITION_ATOMIC
+        or str(parsed) != value
+        or parsed % _POSITION_ATOMIC_STEP != 0
+    ):
+        raise CoordinatorSafetyError("RISEx REST atomic position size rejected")
+    absolute = str(abs(parsed))
+    return Decimal((
+        1 if parsed < 0 else 0,
+        tuple(int(character) for character in absolute),
+        -18,
+    ))
 
 
 def _position_rows(value: Any, identity: RoleIdentity) -> tuple[tuple[int, Decimal], ...]:
@@ -1693,7 +1774,7 @@ def _position_rows(value: Any, identity: RoleIdentity) -> tuple[tuple[int, Decim
         if _address(row["account"]).lower() != identity.account:
             raise CoordinatorSafetyError("RISEx REST position identity rejected")
         market_id = int(row["market_id"])
-        size = _decimal(row["size"], nonnegative=False)
+        size = _atomic_position_size(row["size"])
         if market_id <= 0 or market_id in seen or size % MARKET_STEP:
             raise CoordinatorSafetyError("RISEx REST position contradiction")
         seen.add(market_id)
@@ -1701,15 +1782,16 @@ def _position_rows(value: Any, identity: RoleIdentity) -> tuple[tuple[int, Decim
     return tuple(result)
 
 
-def _point_position(value: Any, identity: RoleIdentity) -> tuple[int, Decimal]:
+def _point_position(
+    value: Any, identity: RoleIdentity, *, allow_route_alias: bool = False,
+) -> tuple[int, Decimal]:
     if isinstance(value, Mapping) and isinstance(value.get("position"), Mapping):
         value = value["position"]
     if not isinstance(value, Mapping) or not {"market_id", "size"} <= set(value):
         raise CoordinatorSafetyError("RISEx REST point position schema rejected")
-    if "account" in value and _address(value["account"]).lower() != identity.account:
-        raise CoordinatorSafetyError("RISEx REST point position identity rejected")
+    _trade_account(value, identity, allow_missing=True)
     try:
-        market_id = int(value["market_id"])
+        market_id = _compact_uint(value["market_id"], bits=16, label="point position market")
     except Exception:
         raise CoordinatorSafetyError("RISEx REST point position schema rejected") from None
     size = _decimal(value["size"], nonnegative=False)
@@ -1717,6 +1799,8 @@ def _point_position(value: Any, identity: RoleIdentity) -> tuple[int, Decimal]:
         raise CoordinatorSafetyError("RISEx REST point position grid rejected")
     if market_id == 0 and size == 0:
         return MARKET_ID, Decimal("0")
+    if market_id == 0 and allow_route_alias:
+        return 0, size
     if market_id != MARKET_ID:
         raise CoordinatorSafetyError("RISEx REST point position market rejected")
     return market_id, size
@@ -1734,7 +1818,7 @@ def _portfolio_position_rows(value: Any) -> tuple[tuple[int, Decimal], ...]:
             market_id = int(row["market_id"])
         except Exception:
             raise CoordinatorSafetyError("RISEx portfolio position row rejected") from None
-        size = _decimal(row["size"], nonnegative=False)
+        size = _atomic_position_size(row["size"])
         if market_id <= 0 or market_id in seen or size % MARKET_STEP:
             raise CoordinatorSafetyError("RISEx portfolio position row rejected")
         seen.add(market_id)
@@ -2317,6 +2401,112 @@ class PairJournal:
                 "UPDATE intents SET state=?,filled_size=?,reconciled=? WHERE intent_id=?",
                 (state, str(filled_size), int(state == "TERMINAL"), intent_id),
             )
+        _fsync_file_and_parent(self.path)
+        return self.intent(intent_id)
+
+    def recover_entry_fill(
+        self, intent_id: str, *, filled_size: Decimal, trade_id: str, price: Decimal,
+    ) -> DurableIntent:
+        """Atomically recover this journal's one sealed, already-dispatched entry."""
+        current = self.intent(intent_id)
+        expected_step = (
+            "ENTRY_MAKER" if self.identity.role is AccountRole.COUNTERPARTY
+            else "ENTRY_TAKER"
+        )
+        if (
+            self.phase is not Phase.HALTED
+            or self.outcome != "HALTED"
+            or len(self.intents()) != 1
+            or self.cancels()
+            or current.step != expected_step
+            or current.dispatch_count != 1
+            or current.state not in {"DISPATCHED", "RESTING", "TERMINAL"}
+            or current.order_id is None
+            or not _valid_order_id(current.order_id)
+            or current.reconciled != (current.state == "TERMINAL")
+            or current.filled_size not in {None, Decimal("0"), current.size}
+            or len(current.payload_digest) != 64
+            or any(character not in "0123456789abcdef" for character in current.payload_digest)
+            or len(current.bbo_digest) != 64
+            or any(character not in "0123456789abcdef" for character in current.bbo_digest)
+            or self.terminal(f"place:{current.intent_id}") != WriteResultClass.ACCEPTED.value
+        ):
+            raise CoordinatorSafetyError("RISEx entry recovery journal rejected")
+        if self.identity.role is AccountRole.COUNTERPARTY:
+            expected = ("SELL", "LIMIT", "GTC", False, True)
+        else:
+            expected = ("BUY", "MARKET", "IOC", False, False)
+        if (
+            current.side, current.order_type, current.time_in_force,
+            current.reduce_only, current.post_only,
+        ) != expected:
+            raise CoordinatorSafetyError("RISEx entry recovery intent rejected")
+        if (
+            current.market_id != MARKET_ID
+            or current.size != MARKET_MINIMUM
+            or current.source_position != 0
+            or current.price <= 0
+            or current.price % MARKET_TICK
+        ):
+            raise CoordinatorSafetyError("RISEx entry recovery intent rejected")
+        try:
+            filled_size = _decimal(filled_size, nonnegative=True)
+            price = _decimal(price, positive=True)
+            nonce = NonceState(current.nonce_anchor, current.nonce_bitmap)
+            nonce.validate()
+            if not isinstance(trade_id, str):
+                raise ValueError
+            trade_parts = trade_id.split("-")
+            if (
+                filled_size != current.size
+                or price % MARKET_TICK
+                or len(trade_parts) != 2
+                or not all(_valid_order_id(part) for part in trade_parts)
+                or current.order_id not in trade_parts
+            ):
+                raise ValueError
+        except (CoordinatorSafetyError, ValueError):
+            raise CoordinatorSafetyError("RISEx entry recovery evidence rejected") from None
+        expected_terminals = {
+            "trade:ENTRY": trade_id,
+            "price:ENTRY": str(price),
+        }
+        for key, value in expected_terminals.items():
+            existing = self.terminal(key)
+            if existing is not None and existing != value:
+                raise CoordinatorSafetyError("RISEx entry recovery evidence rejected")
+        try:
+            with self._db:
+                self._db.execute(
+                    "UPDATE intents SET state='TERMINAL',filled_size=?,reconciled=1 "
+                    "WHERE intent_id=? AND state IN ('DISPATCHED','RESTING','TERMINAL') "
+                    "AND dispatch_count=1",
+                    (str(filled_size), intent_id),
+                )
+                row = self._db.execute(
+                    "SELECT state FROM intents WHERE intent_id=?", (intent_id,)
+                ).fetchone()
+                if row is None or row[0] != "TERMINAL":
+                    raise CoordinatorSafetyError("RISEx entry recovery journal rejected")
+                for key, value in expected_terminals.items():
+                    self._db.execute(
+                        "INSERT OR IGNORE INTO terminal(key,value) VALUES (?,?)",
+                        (key, value),
+                    )
+                phase_changed = self._db.execute(
+                    "UPDATE meta SET value=? WHERE key='phase' AND value=?",
+                    (Phase.ENTRY_RECONCILED.value, Phase.HALTED.value),
+                ).rowcount
+                outcome_changed = self._db.execute(
+                    "UPDATE meta SET value=? WHERE key='outcome' AND value=?",
+                    ("ACTIVE", "HALTED"),
+                ).rowcount
+                if phase_changed != 1 or outcome_changed != 1:
+                    raise CoordinatorSafetyError("RISEx entry recovery journal rejected")
+        except CoordinatorSafetyError:
+            raise
+        except Exception:
+            raise CoordinatorSafetyError("RISEx entry recovery journal rejected") from None
         _fsync_file_and_parent(self.path)
         return self.intent(intent_id)
 
@@ -3071,9 +3261,12 @@ class FixedRisexTwoAccountVenue:
             _parse_order_row(row, identity, history_at) for row in history_rows
         )
         trades = tuple(
-            _parse_trade_row(row, identity, trades_at) for row in trade_rows
+            _parse_trade_row(
+                row, identity, trades_at, account_scoped=True,
+            ) for row in trade_rows
         )
         listed_by_id: dict[str, RestOrder] = {}
+        history_by_id = {item.order_id: item for item in history_orders}
         for item in (*open_orders, *history_orders):
             existing = listed_by_id.get(item.order_id)
             if existing is not None:
@@ -3086,14 +3279,26 @@ class FixedRisexTwoAccountVenue:
             self._lookup_order(identity, order_id) for order_id in lookup_order_ids
         ))
         lookup_by_id: dict[str, RestOrder] = {}
+        propagation_order_id: str | None = None
         for order_id, exact in zip(lookup_order_ids, lookup_values):
             listed = listed_by_id.get(order_id)
-            if listed is None or _order_history_evidence(listed) != _order_history_evidence(exact):
+            if listed is None:
                 raise CoordinatorSafetyError("RISEx exact order/list disagreement")
+            if _order_history_evidence(listed) != _order_history_evidence(exact):
+                history_order = history_by_id.get(order_id)
+                if (
+                    history_order is None
+                    or propagation_order_id is not None
+                    or not _is_monotonic_order_visibility(history_order, exact)
+                ):
+                    raise CoordinatorSafetyError("RISEx exact order/list disagreement")
+                propagation_order_id = order_id
             lookup_by_id[order_id] = exact
+        if propagation_order_id is not None:
+            raise OrderHistoryPropagationMismatch(propagation_order_id)
         _require_recent(point_response, self._now(), "point position")
         point = _point_position(
-            _response_data(point_response), identity,
+            _response_data(point_response), identity, allow_route_alias=True,
         )
         _require_recent(positions_response, self._now(), "positions")
         positions = _position_rows(
@@ -3103,13 +3308,21 @@ class FixedRisexTwoAccountVenue:
         portfolio, portfolio_positions = _parse_portfolio(
             _response_data(portfolio_response), identity, portfolio_response.observed_at,
         )
-        point_map = _normalize_position_map((point,))
         position_map = _normalize_position_map(positions)
         portfolio_map = _normalize_position_map(portfolio_positions)
-        if position_map.get(MARKET_ID, Decimal("0")) != point_map[MARKET_ID]:
-            raise CoordinatorSafetyError("RISEx position reads disagree")
         if not _position_maps_agree(position_map, portfolio_map):
             raise CoordinatorSafetyError("RISEx portfolio positions disagree")
+        if point[0] == 0:
+            if (
+                point[1] == 0
+                or position_map.get(MARKET_ID, Decimal("0")) != point[1]
+                or portfolio_map.get(MARKET_ID, Decimal("0")) != point[1]
+            ):
+                raise CoordinatorSafetyError("RISEx point position alias corroboration rejected")
+            point = (MARKET_ID, point[1])
+        point_map = _normalize_position_map((point,))
+        if position_map.get(MARKET_ID, Decimal("0")) != point_map[MARKET_ID]:
+            raise CoordinatorSafetyError("RISEx position reads disagree")
         merged_positions = {**position_map, **portfolio_map}
         if any(
             market_id != MARKET_ID and size != 0
@@ -3470,6 +3683,62 @@ class TwoAccountCoordinator:
                 self._validate_history_scope(role, observation.accounts[role])
         return observation
 
+    def _place_resample_used(self, intent: DurableIntent) -> bool:
+        key = f"place_resample:{intent.intent_id}"
+        values = tuple(
+            journal.terminal(key) for journal in self._journals.values()
+        )
+        if values[0] != values[1] or values[0] not in {None, "USED"}:
+            raise CoordinatorSafetyError("RISEx propagation resample journal rejected")
+        return values[0] == "USED"
+
+    def _mark_place_resample_used(self, intent: DurableIntent) -> None:
+        key = f"place_resample:{intent.intent_id}"
+        if self._place_resample_used(intent):
+            return
+        self._journals[AccountRole.PRIMARY].set_terminal(key, "USED")
+        self._journals[AccountRole.COUNTERPARTY].set_terminal(key, "USED")
+
+    def _place_propagation_order_ids(self, intent: DurableIntent) -> frozenset[str]:
+        if intent.order_id is None or not _valid_order_id(intent.order_id):
+            raise CoordinatorSafetyError("RISEx propagation order identity rejected")
+        allowed = {intent.order_id}
+        paired_step = {
+            "ENTRY_TAKER": "ENTRY_MAKER",
+            "EXIT_TAKER": "EXIT_MAKER",
+        }.get(intent.step)
+        if paired_step is not None:
+            paired = self._journals[AccountRole.COUNTERPARTY].by_step(paired_step)
+            if (
+                paired is None
+                or paired.order_id is None
+                or not _valid_order_id(paired.order_id)
+            ):
+                raise CoordinatorSafetyError("RISEx propagation pair identity rejected")
+            allowed.add(paired.order_id)
+        elif intent.step not in {"ENTRY_MAKER", "EXIT_MAKER"}:
+            raise CoordinatorSafetyError("RISEx propagation step rejected")
+        return frozenset(allowed)
+
+    async def _observe_after_place(self, intent: DurableIntent) -> VenueObservation:
+        """Allow one fresh full read only for the classified propagation defect."""
+        try:
+            return await self._observe()
+        except OrderHistoryPropagationMismatch as error:
+            if (
+                not isinstance(error.order_id, str)
+                or error.order_id not in self._place_propagation_order_ids(intent)
+            ):
+                raise CoordinatorSafetyError(
+                    "RISEx unrelated order/history propagation mismatch"
+                ) from None
+            if self._place_resample_used(intent):
+                raise CoordinatorSafetyError(
+                    "RISEx exact order/history propagation resample exhausted"
+                ) from None
+            self._mark_place_resample_used(intent)
+            return await self._observe()
+
     def _bind_baseline_history(self, role: AccountRole, account: AccountSnapshot) -> None:
         journal = self._journals[role]
         payload = _history_payload(account)
@@ -3536,6 +3805,159 @@ class TwoAccountCoordinator:
             if not _account_zero(value) or value.unexplained:
                 raise CoordinatorSafetyError("RISEx initial state is not exact zero")
             self._bind_baseline_history(role, value)
+
+    def recover_entry_fill(self, observation: VenueObservation) -> VenueObservation:
+        """Recover only the sealed two-account entry fill, without venue effects."""
+        primary_journal = self._journals[AccountRole.PRIMARY]
+        counterparty_journal = self._journals[AccountRole.COUNTERPARTY]
+        if (
+            primary_journal.phase is not Phase.HALTED
+            or counterparty_journal.phase is not Phase.HALTED
+            or primary_journal.outcome != "HALTED"
+            or counterparty_journal.outcome != "HALTED"
+        ):
+            raise CoordinatorSafetyError("RISEx entry recovery requires halted journals")
+        self._validate_observation(observation, private=False)
+        for role, journal in self._journals.items():
+            if journal.terminal("baseline_history") is None:
+                raise CoordinatorSafetyError("RISEx entry recovery baseline missing")
+            self._validate_history_scope(role, observation.accounts[role])
+            if (
+                journal.cancels()
+                or journal.terminal("trade:EXIT") is not None
+                or journal.terminal("price:EXIT") is not None
+            ):
+                raise CoordinatorSafetyError("RISEx entry recovery exit state rejected")
+
+        primary_intents = primary_journal.intents()
+        counterparty_intents = counterparty_journal.intents()
+        if len(primary_intents) != 1 or len(counterparty_intents) != 1:
+            raise CoordinatorSafetyError("RISEx entry recovery intent count rejected")
+        primary_intent = primary_intents[0]
+        counterparty_intent = counterparty_intents[0]
+        fixed_intents = (
+            (
+                AccountRole.PRIMARY, primary_intent, "ENTRY_TAKER",
+                "BUY", "MARKET", "IOC", False, False,
+            ),
+            (
+                AccountRole.COUNTERPARTY, counterparty_intent, "ENTRY_MAKER",
+                "SELL", "LIMIT", "GTC", False, True,
+            ),
+        )
+        for role, intent, step, side, order_type, tif, reduce_only, post_only in fixed_intents:
+            if (
+                intent.ordinal != 1
+                or intent.step != step
+                or intent.dispatch_count != 1
+                or intent.order_id is None
+                or not _valid_order_id(intent.order_id)
+                or intent.side != side
+                or intent.order_type != order_type
+                or intent.time_in_force != tif
+                or intent.reduce_only is not reduce_only
+                or intent.post_only is not post_only
+                or intent.market_id != MARKET_ID
+                or intent.size != MARKET_MINIMUM
+                or intent.source_position != 0
+                or intent.filled_size not in {None, Decimal("0"), MARKET_MINIMUM}
+                or intent.state not in {"DISPATCHED", "RESTING", "TERMINAL"}
+            ):
+                raise CoordinatorSafetyError("RISEx entry recovery intent rejected")
+            NonceState(intent.nonce_anchor, intent.nonce_bitmap).validate()
+
+        expected_terminal_trade: str | None = None
+        expected_terminal_price: str | None = None
+        for key in ("trade:ENTRY", "price:ENTRY"):
+            primary_value = primary_journal.terminal(key)
+            counterparty_value = counterparty_journal.terminal(key)
+            if primary_value != counterparty_value:
+                raise CoordinatorSafetyError("RISEx entry recovery terminal mismatch")
+            if key == "trade:ENTRY":
+                expected_terminal_trade = primary_value
+            else:
+                expected_terminal_price = primary_value
+
+        primary_order = _order_for(
+            observation.accounts[AccountRole.PRIMARY], primary_intent.client_order_id,
+        )
+        counterparty_order = _order_for(
+            observation.accounts[AccountRole.COUNTERPARTY], counterparty_intent.client_order_id,
+        )
+        if (
+            primary_order is None
+            or counterparty_order is None
+            or primary_order.order_id != primary_intent.order_id
+            or counterparty_order.order_id != counterparty_intent.order_id
+            or observation.accounts[AccountRole.PRIMARY].open_orders
+            or observation.accounts[AccountRole.COUNTERPARTY].open_orders
+            or observation.accounts[AccountRole.PRIMARY].position != Decimal("0.1")
+            or observation.accounts[AccountRole.COUNTERPARTY].position != Decimal("-0.1")
+        ):
+            raise CoordinatorSafetyError("RISEx entry recovery current state rejected")
+        self._ensure_order_matches(primary_intent, primary_order, AccountRole.PRIMARY)
+        self._ensure_order_matches(counterparty_intent, counterparty_order, AccountRole.COUNTERPARTY)
+        if (
+            primary_order.status != "FILLED"
+            or counterparty_order.status != "FILLED"
+            or primary_order.filled_size != MARKET_MINIMUM
+            or counterparty_order.filled_size != MARKET_MINIMUM
+        ):
+            raise CoordinatorSafetyError("RISEx entry recovery fill rejected")
+        primary_trades = _trades_for(observation.accounts[AccountRole.PRIMARY], primary_order)
+        counterparty_trades = _trades_for(
+            observation.accounts[AccountRole.COUNTERPARTY], counterparty_order,
+        )
+        if len(primary_trades) != 1 or len(counterparty_trades) != 1:
+            raise CoordinatorSafetyError("RISEx entry recovery trade evidence rejected")
+        primary_trade, counterparty_trade = primary_trades[0], counterparty_trades[0]
+        expected_trade_id = f"{counterparty_order.order_id}-{primary_order.order_id}"
+        if (
+            primary_trade.trade_id != expected_trade_id
+            or counterparty_trade.trade_id != expected_trade_id
+            or primary_trade.order_id != primary_order.order_id
+            or counterparty_trade.order_id != counterparty_order.order_id
+            or primary_trade.client_order_id != primary_intent.client_order_id
+            or counterparty_trade.client_order_id != counterparty_intent.client_order_id
+            or primary_trade.side != primary_intent.side
+            or counterparty_trade.side != counterparty_intent.side
+            or primary_trade.side == counterparty_trade.side
+            or primary_trade.market_id != MARKET_ID
+            or counterparty_trade.market_id != MARKET_ID
+            or primary_trade.size != MARKET_MINIMUM
+            or counterparty_trade.size != MARKET_MINIMUM
+            or primary_trade.size != counterparty_trade.size
+            or primary_trade.price != counterparty_trade.price
+            or primary_trade.price != counterparty_intent.price
+            or primary_trade.price > primary_intent.price
+        ):
+            raise CoordinatorSafetyError("RISEx entry recovery trade identity rejected")
+        trade_id = expected_trade_id
+        trade_price = str(primary_trade.price)
+        if (
+            expected_terminal_trade is not None
+            and expected_terminal_trade != trade_id
+        ) or (
+            expected_terminal_price is not None
+            and expected_terminal_price != trade_price
+        ):
+            raise CoordinatorSafetyError("RISEx entry recovery terminal evidence rejected")
+
+        primary_journal.recover_entry_fill(
+            primary_intent.intent_id, filled_size=MARKET_MINIMUM,
+            trade_id=trade_id, price=primary_trade.price,
+        )
+        counterparty_journal.recover_entry_fill(
+            counterparty_intent.intent_id, filled_size=MARKET_MINIMUM,
+            trade_id=trade_id, price=primary_trade.price,
+        )
+        if (
+            self.phase is not Phase.ENTRY_RECONCILED
+            or primary_journal.outcome != "ACTIVE"
+            or counterparty_journal.outcome != "ACTIVE"
+        ):
+            raise CoordinatorSafetyError("RISEx entry recovery transition rejected")
+        return observation
 
     def _journal_intent(self, role: AccountRole, step: str) -> DurableIntent:
         intent = self._journals[role].by_step(step)
@@ -3782,7 +4204,11 @@ class TwoAccountCoordinator:
         if self.phase is Phase.ENTRY_MAKER_PREPARED:
             intent = await self._dispatch_place(AccountRole.COUNTERPARTY, intent, observation.market)
             self._set_phase(Phase.ENTRY_MAKER_DISPATCHED)
-        observation = await self._observe()
+        observation = await (
+            self._observe_after_place(intent)
+            if self.phase is Phase.ENTRY_MAKER_DISPATCHED
+            else self._observe()
+        )
         intent = self._journal_intent(AccountRole.COUNTERPARTY, "ENTRY_MAKER")
         self._prove_resting(AccountRole.COUNTERPARTY, intent, observation)
         self._set_phase(Phase.ENTRY_MAKER_RESTING)
@@ -3808,9 +4234,15 @@ class TwoAccountCoordinator:
         else:
             taker = self._journal_intent(AccountRole.PRIMARY, "ENTRY_TAKER")
         if self.phase is Phase.ENTRY_PREPARED:
-            await self._dispatch_place(AccountRole.PRIMARY, taker, observation.market)
+            taker = await self._dispatch_place(
+                AccountRole.PRIMARY, taker, observation.market,
+            )
             self._set_phase(Phase.ENTRY_DISPATCHED)
-        observation = await self._observe()
+        observation = await (
+            self._observe_after_place(taker)
+            if self.phase is Phase.ENTRY_DISPATCHED
+            else self._observe()
+        )
         taker = self._journal_intent(AccountRole.PRIMARY, "ENTRY_TAKER")
         maker = self._journal_intent(AccountRole.COUNTERPARTY, "ENTRY_MAKER")
         residue = self._pair_fill(
@@ -3850,9 +4282,15 @@ class TwoAccountCoordinator:
         else:
             intent = self._journal_intent(AccountRole.COUNTERPARTY, "EXIT_MAKER")
         if self.phase is Phase.EXIT_MAKER_PREPARED:
-            await self._dispatch_place(AccountRole.COUNTERPARTY, intent, observation.market)
+            intent = await self._dispatch_place(
+                AccountRole.COUNTERPARTY, intent, observation.market,
+            )
             self._set_phase(Phase.EXIT_MAKER_DISPATCHED)
-        observation = await self._observe()
+        observation = await (
+            self._observe_after_place(intent)
+            if self.phase is Phase.EXIT_MAKER_DISPATCHED
+            else self._observe()
+        )
         intent = self._journal_intent(AccountRole.COUNTERPARTY, "EXIT_MAKER")
         self._prove_bid_resting(intent, observation)
         self._set_phase(Phase.EXIT_MAKER_RESTING)
@@ -3881,9 +4319,15 @@ class TwoAccountCoordinator:
         else:
             taker = self._journal_intent(AccountRole.PRIMARY, "EXIT_TAKER")
         if self.phase is Phase.EXIT_PREPARED:
-            await self._dispatch_place(AccountRole.PRIMARY, taker, observation.market)
+            taker = await self._dispatch_place(
+                AccountRole.PRIMARY, taker, observation.market,
+            )
             self._set_phase(Phase.EXIT_DISPATCHED)
-        observation = await self._observe()
+        observation = await (
+            self._observe_after_place(taker)
+            if self.phase is Phase.EXIT_DISPATCHED
+            else self._observe()
+        )
         taker = self._journal_intent(AccountRole.PRIMARY, "EXIT_TAKER")
         residue = self._pair_fill(
             AccountRole.COUNTERPARTY, maker,
@@ -4056,7 +4500,18 @@ class TwoAccountCoordinator:
                 return self._report(CoordinatorResult.FAILED_HALTED_MANUAL_RECOVERY)
             if self._journals[AccountRole.PRIMARY].pending_writes() or self._journals[AccountRole.COUNTERPARTY].pending_writes():
                 raise CoordinatorSafetyError("RISEx pending ambiguous write requires recovery")
-            observation = await self._observe()
+            dispatched = {
+                Phase.ENTRY_MAKER_DISPATCHED: (AccountRole.COUNTERPARTY, "ENTRY_MAKER"),
+                Phase.ENTRY_DISPATCHED: (AccountRole.PRIMARY, "ENTRY_TAKER"),
+                Phase.EXIT_MAKER_DISPATCHED: (AccountRole.COUNTERPARTY, "EXIT_MAKER"),
+                Phase.EXIT_DISPATCHED: (AccountRole.PRIMARY, "EXIT_TAKER"),
+            }.get(current)
+            if dispatched is None:
+                observation = await self._observe()
+            else:
+                observation = await self._observe_after_place(
+                    self._journal_intent(*dispatched),
+                )
             if current is Phase.START:
                 self._zero_state(observation)
                 self._set_phase(Phase.INITIAL_ZERO)

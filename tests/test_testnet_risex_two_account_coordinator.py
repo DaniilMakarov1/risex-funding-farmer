@@ -32,6 +32,7 @@ from risex_farmer.testnet_risex_two_account_coordinator import (
     MAX_AGE_SECONDS,
     MarketObservation,
     NonceState,
+    OrderHistoryPropagationMismatch,
     Phase,
     PortfolioState,
     ORDER_LOOKUP_PATH_TEMPLATE,
@@ -54,12 +55,16 @@ from risex_farmer.testnet_risex_two_account_coordinator import (
     _parse_trade_row,
     _require_recent,
     _all_orders,
+    _atomic_position_size,
     _decode_counterparty_secret,
     _normalize_position_map,
     _order_for,
     _point_position,
     _position_maps_agree,
+    _position_rows,
+    _portfolio_position_rows,
     _response_data,
+    _is_monotonic_order_visibility,
     _validate_order,
     _validate_unsigned_cancel,
     _validate_unsigned_place,
@@ -513,6 +518,35 @@ class LifecycleVenue(FakeVenue):
         return WriteResult.accepted(order_id=self.accepted_order_ids[len(self.place_calls) - 1])
 
 
+class PropagatingLifecycleVenue(LifecycleVenue):
+    def __init__(
+        self, observations, rounds, *, propagation_failures=0,
+        propagation_order_id=None, propagation_after_place=None,
+    ):
+        super().__init__(observations, rounds)
+        self.propagation_failures = propagation_failures
+        self.propagation_order_id = propagation_order_id
+        self.propagation_after_place = propagation_after_place
+        self.observe_calls = 0
+
+    async def observe(self):
+        self.observe_calls += 1
+        if (
+            self.propagation_failures
+            and self.place_calls
+            and (
+                self.propagation_after_place is None
+                or len(self.place_calls) == self.propagation_after_place
+            )
+        ):
+            self.propagation_failures -= 1
+            order_id = self.propagation_order_id or self.accepted_order_ids[
+                len(self.place_calls) - 1
+            ]
+            raise OrderHistoryPropagationMismatch(order_id)
+        return await super().observe()
+
+
 def lifecycle_observations(*, second_final_book: BookObservation | None = None):
     maker_entry = order(
         wide=201, client=1001, account=COUNTERPARTY, side="SELL",
@@ -602,6 +636,27 @@ def make_lifecycle(tmp_path: Path, venue: LifecycleVenue):
     )
 
 
+def _halted_entry_coordinator(tmp_path: Path):
+    valid_observations, rounds = lifecycle_observations()
+    bad_observations = list(valid_observations)
+    bad = bad_observations[2]
+    primary = bad.accounts[AccountRole.PRIMARY]
+    bad_primary = replace(
+        primary,
+        history_orders=(replace(primary.history_orders[0], filled_size=Decimal("0.05")),),
+        trades=(replace(primary.trades[0], size=Decimal("0.05")),),
+    )
+    bad_observations[2] = replace(bad, accounts={
+        AccountRole.PRIMARY: with_private(bad_primary),
+        AccountRole.COUNTERPARTY: bad.accounts[AccountRole.COUNTERPARTY],
+    })
+    venue = LifecycleVenue(bad_observations, rounds)
+    coordinator = make_lifecycle(tmp_path, venue)
+    report = asyncio.run(coordinator.run())
+    assert report.result is CoordinatorResult.FAILED_HALTED_MANUAL_RECOVERY
+    return coordinator, venue, valid_observations, rounds
+
+
 def test_complete_two_account_lifecycle_is_sequential_and_reduce_only(tmp_path: Path):
     observations, rounds = lifecycle_observations()
     venue = LifecycleVenue(observations, rounds)
@@ -625,6 +680,212 @@ def test_complete_two_account_lifecycle_is_sequential_and_reduce_only(tmp_path: 
     assert exit_maker_request["reduce_only"] is True
     assert exit_request["side"] == 1 and exit_request["reduce_only"] is True
     assert report.final_rounds == 2
+
+
+def test_exact_order_history_propagation_mismatch_allows_one_fresh_resample(tmp_path: Path):
+    observations, rounds = lifecycle_observations()
+    venue = PropagatingLifecycleVenue(
+        observations, rounds, propagation_failures=1,
+    )
+    coordinator = make_lifecycle(tmp_path, venue)
+    report = asyncio.run(coordinator.run())
+    assert report.result is CoordinatorResult.COMPLETE
+    assert venue.observe_calls == 6
+    assert len(venue.place_calls) == 4
+    entry_maker = coordinator._journals[AccountRole.COUNTERPARTY].by_step("ENTRY_MAKER")
+    assert entry_maker is not None
+    assert coordinator._journals[AccountRole.PRIMARY].terminal(
+        f"place_resample:{entry_maker.intent_id}"
+    ) == "USED"
+    assert coordinator._journals[AccountRole.COUNTERPARTY].terminal(
+        f"place_resample:{entry_maker.intent_id}"
+    ) == "USED"
+
+
+def test_taker_propagation_mismatch_allows_current_taker_or_paired_maker(tmp_path: Path):
+    observations, rounds = lifecycle_observations()
+    paired_maker_id = observations[2].accounts[
+        AccountRole.COUNTERPARTY
+    ].history_orders[0].order_id
+    venue = PropagatingLifecycleVenue(
+        observations, rounds, propagation_failures=1,
+        propagation_order_id=paired_maker_id, propagation_after_place=2,
+    )
+    coordinator = make_lifecycle(tmp_path, venue)
+    report = asyncio.run(coordinator.run())
+    assert report.result is CoordinatorResult.COMPLETE
+    assert venue.observe_calls == 6
+    entry_taker = coordinator._journals[AccountRole.PRIMARY].by_step("ENTRY_TAKER")
+    assert entry_taker is not None
+    assert coordinator._journals[AccountRole.PRIMARY].terminal(
+        f"place_resample:{entry_taker.intent_id}"
+    ) == "USED"
+
+
+def test_exact_order_history_propagation_mismatch_halts_after_one_resample(tmp_path: Path):
+    observations, rounds = lifecycle_observations()
+    venue = PropagatingLifecycleVenue(
+        observations, rounds, propagation_failures=2,
+    )
+    coordinator = make_lifecycle(tmp_path, venue)
+    report = asyncio.run(coordinator.run())
+    assert report.result is CoordinatorResult.FAILED_HALTED_MANUAL_RECOVERY
+    assert report.failure_code == "RISEx exact order/history propagation mismatch"
+    assert venue.observe_calls == 3
+    assert [role for role, _ in venue.place_calls] == [AccountRole.COUNTERPARTY]
+    assert coordinator.phase is Phase.HALTED
+
+
+def test_older_stage_propagation_mismatch_is_terminal_without_resample(tmp_path: Path):
+    observations, rounds = lifecycle_observations()
+    older_entry_order_id = observations[2].accounts[
+        AccountRole.COUNTERPARTY
+    ].history_orders[0].order_id
+    venue = PropagatingLifecycleVenue(
+        observations, rounds, propagation_failures=1,
+        propagation_order_id=older_entry_order_id, propagation_after_place=3,
+    )
+    coordinator = make_lifecycle(tmp_path, venue)
+    report = asyncio.run(coordinator.run())
+    assert report.result is CoordinatorResult.FAILED_HALTED_MANUAL_RECOVERY
+    assert report.failure_code == "RISEx unrelated order/history propagation mismatch"
+    assert venue.observe_calls == 4
+    assert [role for role, _ in venue.place_calls] == [
+        AccountRole.COUNTERPARTY, AccountRole.PRIMARY, AccountRole.COUNTERPARTY,
+    ]
+    exit_maker = coordinator._journals[AccountRole.COUNTERPARTY].by_step("EXIT_MAKER")
+    assert exit_maker is not None
+    assert coordinator._journals[AccountRole.PRIMARY].terminal(
+        f"place_resample:{exit_maker.intent_id}"
+    ) is None
+    assert coordinator._journals[AccountRole.COUNTERPARTY].terminal(
+        f"place_resample:{exit_maker.intent_id}"
+    ) is None
+
+
+def test_order_history_propagation_classifier_is_monotonic_and_immutable():
+    history = order(
+        wide=430, client=4030, account=ACCOUNT, side="BUY",
+        order_type="LIMIT", tif="GTC", status="OPEN", price="2999.01",
+    )
+    assert _is_monotonic_order_visibility(
+        history, replace(history, filled_size=Decimal("0.1")),
+    )
+    assert _is_monotonic_order_visibility(
+        history, replace(history, status="FILLED", filled_size=Decimal("0.1")),
+    )
+    assert _is_monotonic_order_visibility(
+        history, replace(history, status="CANCELLED"),
+    )
+    assert not _is_monotonic_order_visibility(
+        replace(history, status="FILLED", filled_size=Decimal("0.1")), history,
+    )
+    assert not _is_monotonic_order_visibility(
+        replace(history, filled_size=Decimal("0.1")),
+        replace(history, filled_size=Decimal("0.05")),
+    )
+    assert not _is_monotonic_order_visibility(
+        history, replace(history, price=Decimal("2999.02")),
+    )
+    assert not _is_monotonic_order_visibility(
+        replace(history, status="CANCELLED"),
+        replace(history, status="FILLED", filled_size=Decimal("0.1")),
+    )
+
+
+def test_fixed_account_adapter_classifies_only_history_status_visibility_lag():
+    history = order(
+        wide=431, client=4031, account=ACCOUNT, side="BUY",
+        order_type="LIMIT", tif="GTC", status="OPEN", price="2999.01",
+    )
+    exact = replace(history, status="FILLED", filled_size=Decimal("0.1"))
+    transport = _FlatAccountReads(
+        history_orders=(history,), exact_order=exact,
+    )
+    with pytest.raises(OrderHistoryPropagationMismatch) as captured:
+        asyncio.run(
+            _flat_read_venue(
+                transport, known_order_ids=(history.order_id,)
+            )._account(AccountRole.PRIMARY, include_private=False),
+        )
+    assert captured.value.order_id == history.order_id
+
+    regression = _FlatAccountReads(
+        history_orders=(replace(history, status="FILLED", filled_size=Decimal("0.1")),),
+        exact_order=history,
+    )
+    with pytest.raises(CoordinatorSafetyError) as captured:
+        asyncio.run(
+            _flat_read_venue(
+                regression, known_order_ids=(history.order_id,)
+            )._account(AccountRole.PRIMARY, include_private=False),
+        )
+    assert not isinstance(captured.value, OrderHistoryPropagationMismatch)
+
+
+def test_entry_recovery_accepts_exact_fill_and_resumed_run_only_writes_exits(tmp_path: Path):
+    coordinator, initial_venue, valid_observations, rounds = _halted_entry_coordinator(tmp_path)
+    coordinator.recover_entry_fill(valid_observations[2])
+    assert coordinator.phase is Phase.ENTRY_RECONCILED
+    assert all(
+        coordinator._journals[role].outcome == "ACTIVE"
+        for role in (AccountRole.PRIMARY, AccountRole.COUNTERPARTY)
+    )
+    assert all(
+        coordinator._journals[role].by_step(
+            "ENTRY_TAKER" if role is AccountRole.PRIMARY else "ENTRY_MAKER"
+        ).state == "TERMINAL"
+        for role in (AccountRole.PRIMARY, AccountRole.COUNTERPARTY)
+    )
+    exit_maker_id = valid_observations[3].accounts[
+        AccountRole.COUNTERPARTY
+    ].open_orders[0].order_id
+    exit_taker_id = next(
+        item.order_id for item in valid_observations[4].accounts[AccountRole.PRIMARY].history_orders
+        if item.client_order_id == 2002
+    )
+    resumed_venue = LifecycleVenue(
+        [valid_observations[2], valid_observations[3], valid_observations[4]], rounds,
+        accepted_order_ids=(exit_maker_id, exit_taker_id),
+    )
+    coordinator._venue = resumed_venue
+    report = asyncio.run(coordinator.run())
+    assert report.result is CoordinatorResult.COMPLETE
+    assert [role for role, _ in initial_venue.place_calls] == [
+        AccountRole.COUNTERPARTY, AccountRole.PRIMARY,
+    ]
+    assert [role for role, _ in resumed_venue.place_calls] == [
+        AccountRole.COUNTERPARTY, AccountRole.PRIMARY,
+    ]
+    assert coordinator._journals[AccountRole.PRIMARY].by_step("ENTRY_TAKER").dispatch_count == 1
+    assert coordinator._journals[AccountRole.COUNTERPARTY].by_step("ENTRY_MAKER").dispatch_count == 1
+    assert coordinator._journals[AccountRole.PRIMARY].by_step("EXIT_TAKER").reduce_only is True
+    assert coordinator._journals[AccountRole.COUNTERPARTY].by_step("EXIT_MAKER").reduce_only is True
+
+
+def test_entry_recovery_rejects_mismatch_without_writes_and_cannot_replay(tmp_path: Path):
+    coordinator, venue, valid_observations, _ = _halted_entry_coordinator(tmp_path)
+    valid = valid_observations[2]
+    primary = valid.accounts[AccountRole.PRIMARY]
+    mismatched = replace(primary, position=Decimal("0"))
+    bad = replace(valid, accounts={
+        AccountRole.PRIMARY: with_private(mismatched),
+        AccountRole.COUNTERPARTY: valid.accounts[AccountRole.COUNTERPARTY],
+    })
+    with pytest.raises(CoordinatorSafetyError):
+        coordinator.recover_entry_fill(bad)
+    assert coordinator.phase is Phase.HALTED
+    assert [role for role, _ in venue.place_calls] == [
+        AccountRole.COUNTERPARTY, AccountRole.PRIMARY,
+    ]
+    assert coordinator._journals[AccountRole.PRIMARY].by_step("ENTRY_TAKER").state == "DISPATCHED"
+    assert coordinator._journals[AccountRole.COUNTERPARTY].by_step("ENTRY_MAKER").state == "RESTING"
+    coordinator.recover_entry_fill(valid)
+    with pytest.raises(CoordinatorSafetyError):
+        coordinator.recover_entry_fill(valid)
+    assert [role for role, _ in venue.place_calls] == [
+        AccountRole.COUNTERPARTY, AccountRole.PRIMARY,
+    ]
 
 
 def test_post_baseline_unknown_open_order_halts_before_lifecycle_progress(tmp_path: Path):
@@ -768,6 +1029,129 @@ def _raw_order(item: RestOrder) -> dict[str, object]:
         "reduce_only": item.reduce_only,
         "is_liquidation": False,
     }
+
+
+class _FlatAccountReads:
+    """Fixture-only REST reads for the fixed account adapter."""
+
+    def __init__(
+        self, *, open_orders: tuple[RestOrder, ...] = (),
+        history_orders: tuple[RestOrder, ...] = (),
+        exact_order: RestOrder | None = None,
+        trade_rows: tuple[dict[str, object], ...] = (),
+        point_market_id: str = "0", point_size: str = "0",
+        point_account: str | None = None,
+        positions: tuple[tuple[int, str], ...] = (),
+        positions_account: str | None = None,
+        portfolio_positions: tuple[tuple[int, str], ...] | None = None,
+    ):
+        self.calls: list[tuple[str, tuple[tuple[str, str], ...]]] = []
+        self.open_orders = open_orders
+        self.history_orders = history_orders
+        self.exact_order = exact_order
+        self.trade_rows = trade_rows
+        self.point_market_id = point_market_id
+        self.point_size = point_size
+        self.point_account = point_account
+        self.positions = positions
+        self.positions_account = positions_account
+        self.portfolio_positions = portfolio_positions
+
+    async def get(self, path, query=()):
+        query = tuple(query)
+        self.calls.append((path, query))
+        params = dict(query)
+        account = params.get("account")
+        if account is None and path.startswith("/v1/nonce-state/"):
+            account = path.rsplit("/", 1)[-1]
+        signer = SIGNER if account == ACCOUNT else FIXED_COUNTERPARTY_SIGNER
+        if path == "/v1/auth/session-key-status":
+            data = {"status": 1, "status_description": "Active"}
+        elif path == "/v1/auth/signers":
+            data = {"signers": [{"signer": signer, "status": "Active"}]}
+        elif path == "/v1/orders/open":
+            data = {
+                "account": account, "market_id": "0",
+                "orders": [_raw_compact_open_order(item) for item in self.open_orders],
+                "total_orders": str(len(self.open_orders)),
+            }
+        elif path.startswith("/v1/orders/by-id/"):
+            if self.exact_order is None:
+                raise AssertionError(path)
+            data = {"order": _raw_order(self.exact_order)}
+        elif path == HISTORY_PATH:
+            data = {
+                "orders": [_raw_order(item) for item in self.history_orders],
+                "page": 1, "has_next_page": False,
+            }
+        elif path == TRADES_PATH:
+            data = {
+                "trades": list(self.trade_rows),
+                "page": 1, "has_next_page": False,
+            }
+        elif path == "/v1/account/position":
+            point = {
+                "market_id": self.point_market_id, "size": self.point_size,
+            }
+            if self.point_account is not None:
+                point["account"] = self.point_account
+            data = {"position": point}
+        elif path == "/v1/positions":
+            position_account = self.positions_account or account
+            data = {"positions": [
+                {
+                    "account": position_account,
+                    "market_id": market_id,
+                    "size": size,
+                }
+                for market_id, size in self.positions
+            ]}
+        elif path == PORTFOLIO_PATH:
+            portfolio_positions = self.portfolio_positions
+            if portfolio_positions is None:
+                portfolio_positions = tuple(
+                    (market_id, "0") for market_id in range(1, 20)
+                )
+            data = {
+                "account": account,
+                "positions": [
+                    {"market_id": market_id, "size": size}
+                    for market_id, size in portfolio_positions
+                ],
+                "summary": {
+                    "usdc_balance": "1000", "free_collateral": "1000",
+                    "total_account_value": "1000", "in_liquidation": False,
+                    "risk_level": "NORMAL",
+                },
+            }
+        elif path.startswith("/v1/nonce-state/"):
+            data = {
+                "nonce_anchor": "1", "current_bitmap_index": 0,
+                "bitmap": "0x0",
+            }
+        else:
+            raise AssertionError(path)
+        return _HTTPObservation(200, "", {"data": data, "request_id": path}, NOW)
+
+
+def _flat_read_venue(transport: _FlatAccountReads, *, known_order_ids=()):
+    counterparty = RoleIdentity(
+        AccountRole.COUNTERPARTY, FIXED_COUNTERPARTY_ACCOUNT,
+        FIXED_COUNTERPARTY_SIGNER, "key", "marker", "journal",
+    )
+    return FixedRisexTwoAccountVenue(
+        identities={
+            AccountRole.PRIMARY: _primary_identity(),
+            AccountRole.COUNTERPARTY: counterparty,
+        },
+        credential_loaders={
+            AccountRole.PRIMARY: lambda: None,
+            AccountRole.COUNTERPARTY: lambda: None,
+        },
+        transport=transport,
+        now=lambda: NOW,
+        known_order_ids={AccountRole.PRIMARY: tuple(known_order_ids)},
+    )
 
 
 def _raw_compact_open_order(item: RestOrder, *, strings: bool = False) -> dict[str, object]:
@@ -952,6 +1336,123 @@ def test_official_rest_trade_and_market_order_contracts_are_sealed():
             "market_id": 2, "wallet_address": ACCOUNT,
             "side": "BUY", "size": "0.1", "price": "2999.01",
         }, _primary_identity(), NOW)
+
+
+def test_account_scoped_trade_binds_omitted_identity_and_tolerates_additive_fields():
+    item = order(
+        wide=420, client=4020, account=ACCOUNT, side="BUY",
+        order_type="MARKET", tif="IOC", status="FILLED", price="0",
+        filled="0.1",
+    )
+    row = {
+        "id": f"{item.order_id}-{item.order_id}",
+        "order_id": item.order_id,
+        "client_order_id": item.client_order_id,
+        "market_id": 2,
+        "side": "BUY",
+        "size": "0.1",
+        "price": "2999.01",
+        "ignored": {"additive": True},
+    }
+    with pytest.raises(CoordinatorSafetyError):
+        _parse_trade_row(row, _primary_identity(), NOW)
+    parsed = _parse_trade_row(
+        row, _primary_identity(), NOW, account_scoped=True,
+    )
+    assert parsed.account == ACCOUNT
+    for field in ("wallet_address", "sender", "account"):
+        with_identity = dict(row, **{field: ACCOUNT})
+        assert _parse_trade_row(
+            with_identity, _primary_identity(), NOW, account_scoped=True,
+        ).account == ACCOUNT
+
+
+@pytest.mark.parametrize("field", ["wallet_address", "sender", "account"])
+def test_account_scoped_trade_rejects_conflicting_or_malformed_identity(field):
+    item = order(
+        wide=421, client=4021, account=ACCOUNT, side="BUY",
+        order_type="MARKET", tif="IOC", status="FILLED", price="0",
+        filled="0.1",
+    )
+    row = {
+        "id": f"{item.order_id}-{item.order_id}",
+        "order_id": item.order_id,
+        "client_order_id": item.client_order_id,
+        "market_id": 2,
+        "side": "BUY",
+        "size": "0.1",
+        "price": "2999.01",
+        field: COUNTERPARTY if field != "sender" else "not-an-address",
+    }
+    with pytest.raises(CoordinatorSafetyError):
+        _parse_trade_row(row, _primary_identity(), NOW, account_scoped=True)
+
+
+def test_account_scoped_trade_rejects_conflicting_multiple_identity_fields():
+    item = order(
+        wide=422, client=4022, account=ACCOUNT, side="BUY",
+        order_type="MARKET", tif="IOC", status="FILLED", price="0",
+        filled="0.1",
+    )
+    row = {
+        "id": f"{item.order_id}-{item.order_id}",
+        "order_id": item.order_id,
+        "client_order_id": item.client_order_id,
+        "market_id": 2,
+        "wallet_address": ACCOUNT,
+        "sender": COUNTERPARTY,
+        "side": "BUY",
+        "size": "0.1",
+        "price": "2999.01",
+    }
+    with pytest.raises(CoordinatorSafetyError):
+        _parse_trade_row(row, _primary_identity(), NOW, account_scoped=True)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["id", "order_id", "client_order_id", "market_id", "side", "size", "price"],
+)
+def test_account_scoped_trade_still_requires_every_identity_and_economic_field(field):
+    item = order(
+        wide=423, client=4023, account=ACCOUNT, side="BUY",
+        order_type="MARKET", tif="IOC", status="FILLED", price="0",
+        filled="0.1",
+    )
+    row = {
+        "id": f"{item.order_id}-{item.order_id}",
+        "order_id": item.order_id,
+        "client_order_id": item.client_order_id,
+        "market_id": 2,
+        "side": "BUY",
+        "size": "0.1",
+        "price": "2999.01",
+    }
+    row.pop(field)
+    with pytest.raises(CoordinatorSafetyError):
+        _parse_trade_row(row, _primary_identity(), NOW, account_scoped=True)
+
+
+def test_fixed_account_adapter_binds_omitted_trade_identity_on_sealed_read():
+    item = order(
+        wide=424, client=4024, account=ACCOUNT, side="BUY",
+        order_type="MARKET", tif="IOC", status="FILLED", price="0",
+        filled="0.1",
+    )
+    transport = _FlatAccountReads(trade_rows=(
+        {
+            "id": f"{item.order_id}-{item.order_id}",
+            "order_id": item.order_id,
+            "client_order_id": item.client_order_id,
+            "market_id": 2,
+            "side": "BUY", "size": "0.1", "price": "2999.01",
+            "venue_additive": "ignored",
+        },
+    ))
+    snapshot, _, _ = asyncio.run(
+        _flat_read_venue(transport)._account(AccountRole.PRIMARY, include_private=False),
+    )
+    assert snapshot.trades[0].account == ACCOUNT
 
 
 def test_market_order_binding_accepts_zero_or_signed_bound_only(tmp_path: Path):
@@ -1280,10 +1781,165 @@ def test_portfolio_details_require_positive_normal_state_and_position_binding():
     with pytest.raises(CoordinatorSafetyError):
         _parse_portfolio(broken, identity, NOW)
     broken = json.loads(json.dumps(value))
-    broken["positions"][2]["size"] = "0.001"
+    broken["positions"][2]["size"] = "1000000000000000"
     portfolio, broken_positions = _parse_portfolio(broken, identity, NOW)
     assert portfolio.account == ACCOUNT
     assert broken_positions[2] == (3, Decimal("0.001"))
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    (
+        ("0", Decimal("0")),
+        ("1000000000000000", Decimal("0.001")),
+        ("100000000000000000", Decimal("0.1")),
+        ("-100000000000000000", Decimal("-0.1")),
+    ),
+)
+def test_full_position_sources_decode_canonical_18_decimal_atomic_sizes(raw, expected):
+    identity = _primary_identity()
+    assert _position_rows({
+        "positions": [{"account": ACCOUNT, "market_id": "2", "size": raw}],
+    }, identity) == ((2, expected),)
+    assert _portfolio_position_rows([
+        {"market_id": "2", "size": raw},
+    ]) == ((2, expected),)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        "0.1", "-0.1", "+100000000000000000", "01",
+        "-0", "1e17", "100000000000000001", str(2**255),
+    ),
+)
+def test_full_position_sources_reject_decimal_ambiguous_off_grid_and_bounded_sizes(raw):
+    identity = _primary_identity()
+    with pytest.raises(CoordinatorSafetyError):
+        _position_rows({
+            "positions": [{"account": ACCOUNT, "market_id": 2, "size": raw}],
+        }, identity)
+    with pytest.raises(CoordinatorSafetyError):
+        _portfolio_position_rows([{"market_id": 2, "size": raw}])
+
+
+def test_atomic_position_size_accepts_only_the_signed_int256_grid_bounds():
+    step = 10**15
+    maximum = (2**255 - 1) // step * step
+    assert _atomic_position_size(str(maximum))
+    assert _atomic_position_size(str(-maximum))
+    with pytest.raises(CoordinatorSafetyError):
+        _atomic_position_size(str(maximum + step))
+    with pytest.raises(CoordinatorSafetyError):
+        _atomic_position_size(str(-maximum - step))
+
+
+def test_point_position_remains_human_decimal_and_route_alias_is_not_global():
+    identity = _primary_identity()
+    assert _point_position({"market_id": "2", "size": "0.1"}, identity) == (
+        2, Decimal("0.1"),
+    )
+    assert _point_position(
+        {"market_id": "0", "size": "0.1"}, identity, allow_route_alias=True,
+    ) == (0, Decimal("0.1"))
+    assert _point_position(
+        {"market_id": "2", "size": "100000000000000000"}, identity,
+    ) == (2, Decimal("100000000000000000"))
+
+
+def test_fixed_account_adapter_accepts_market_zero_alias_only_after_atomic_cross_read():
+    atomic = "100000000000000000"
+    transport = _FlatAccountReads(
+        point_market_id="0", point_size="0.1",
+        positions=((2, atomic),),
+        portfolio_positions=((2, atomic),),
+    )
+    snapshot, _, _ = asyncio.run(
+        _flat_read_venue(transport)._account(AccountRole.PRIMARY, include_private=False),
+    )
+    assert snapshot.position == Decimal("0.1")
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    (
+        pytest.param(
+            {}, id="missing-corroboration",
+        ),
+        pytest.param(
+            {
+                "positions": ((2, "100000000000000000"),),
+                "portfolio_positions": ((2, "200000000000000000"),),
+            }, id="full-read-disagreement",
+        ),
+        pytest.param(
+            {
+                "positions": ((2, "100000000000000000"), (3, "1000000000000000")),
+                "portfolio_positions": ((2, "100000000000000000"), (3, "1000000000000000")),
+            }, id="unrelated-nonzero-state",
+        ),
+        pytest.param(
+            {
+                "point_size": "0.1005",
+                "positions": ((2, "100000000000000000"),),
+                "portfolio_positions": ((2, "100000000000000000"),),
+            }, id="point-off-grid",
+        ),
+        pytest.param(
+            {
+                "point_account": COUNTERPARTY,
+                "positions": ((2, "100000000000000000"),),
+                "portfolio_positions": ((2, "100000000000000000"),),
+            }, id="point-account-contradiction",
+        ),
+        pytest.param(
+            {
+                "positions": ((2, "100000000000000000"),),
+                "positions_account": COUNTERPARTY,
+                "portfolio_positions": ((2, "100000000000000000"),),
+            }, id="full-account-contradiction",
+        ),
+        pytest.param(
+            {
+                "positions": ((2, "0.1"),),
+                "portfolio_positions": ((2, "0.1"),),
+            }, id="decimal-full-unit",
+        ),
+        pytest.param(
+            {
+                "positions": ((2, "100000000000000000"),),
+                "portfolio_positions": ((2, "0.1"),),
+            }, id="mixed-full-units",
+        ),
+        pytest.param(
+            {
+                "positions": ((2, "100000000000000001"),),
+                "portfolio_positions": ((2, "100000000000000001"),),
+            }, id="off-grid-full-unit",
+        ),
+        pytest.param(
+            {
+                "positions": ((0, "100000000000000000"),),
+                "portfolio_positions": ((0, "100000000000000000"),),
+            }, id="full-market-zero-is-not-an-alias",
+        ),
+        pytest.param(
+            {
+                "positions": ((2, "100000000000000000"), (2, "0")),
+                "portfolio_positions": ((2, "100000000000000000"),),
+            }, id="duplicate-full-market",
+        ),
+    ),
+)
+def test_fixed_account_adapter_rejects_unproven_or_ambiguous_market_zero_alias(kwargs):
+    params = {"point_market_id": "0", "point_size": "0.1", **kwargs}
+    transport = _FlatAccountReads(**params)
+    with pytest.raises(CoordinatorSafetyError):
+        asyncio.run(
+            _flat_read_venue(transport)._account(
+                AccountRole.PRIMARY, include_private=False,
+            ),
+        )
 
 
 def test_fixed_account_adapter_normalizes_flat_position_variants():
@@ -1297,11 +1953,24 @@ def test_fixed_account_adapter_normalizes_flat_position_variants():
         def __init__(
             self, *, mismatch: bool = False, open_order: RestOrder | None = None,
             exact_order: RestOrder | None = None,
+            history_order: RestOrder | None = None,
+            point_market_id: str = "0", point_size: str = "0",
+            point_account: str | None = None,
+            positions: tuple[tuple[int, str], ...] = (),
+            portfolio_positions: tuple[tuple[int, str], ...] | None = None,
+            trade_rows: tuple[dict[str, object], ...] = (),
         ):
             self.calls: list[tuple[str, tuple[tuple[str, str], ...]]] = []
             self.mismatch = mismatch
             self.open_order = open_order
             self.exact_order = exact_order if exact_order is not None else open_order
+            self.history_order = history_order
+            self.point_market_id = point_market_id
+            self.point_size = point_size
+            self.point_account = point_account
+            self.positions = positions
+            self.portfolio_positions = portfolio_positions
+            self.trade_rows = trade_rows
 
         async def get(self, path, query=()):
             query = tuple(query)
@@ -1330,20 +1999,39 @@ def test_fixed_account_adapter_normalizes_flat_position_variants():
                     raise AssertionError(path)
                 data = {"order": _raw_order(self.exact_order)}
             elif path == HISTORY_PATH:
-                data = {"orders": [], "page": 1, "has_next_page": False}
+                data = {
+                    "orders": [] if self.history_order is None else [
+                        _raw_order(self.history_order),
+                    ],
+                    "page": 1, "has_next_page": False,
+                }
             elif path == TRADES_PATH:
-                data = {"trades": [], "page": 1, "has_next_page": False}
+                data = {
+                    "trades": list(self.trade_rows),
+                    "page": 1, "has_next_page": False,
+                }
             elif path == "/v1/account/position":
-                data = {"position": {"market_id": "0", "size": "0"}}
+                point = {
+                    "market_id": self.point_market_id, "size": self.point_size,
+                }
+                if self.point_account is not None:
+                    point["account"] = self.point_account
+                data = {"position": point}
             elif path == "/v1/positions":
-                data = {"positions": []}
+                data = {"positions": [
+                    {"account": account, "market_id": market_id, "size": size}
+                    for market_id, size in self.positions
+                ]}
             elif path == PORTFOLIO_PATH:
+                portfolio_positions = self.portfolio_positions
+                if portfolio_positions is None:
+                    portfolio_positions = tuple((market_id, "0") for market_id in range(1, 20))
                 positions = [
-                    {"market_id": market_id, "size": "0"}
-                    for market_id in range(1, 20)
+                    {"market_id": market_id, "size": size}
+                    for market_id, size in portfolio_positions
                 ]
                 if self.mismatch:
-                    positions[2]["size"] = "0.001"
+                    positions[2]["size"] = "1000000000000000"
                 data = {
                     "account": account,
                     "positions": positions,
