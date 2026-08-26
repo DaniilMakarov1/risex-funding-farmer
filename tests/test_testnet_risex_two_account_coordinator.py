@@ -439,6 +439,24 @@ def with_private(value: AccountSnapshot) -> AccountSnapshot:
     )
 
 
+def with_private_positions(
+    value: AccountSnapshot, snapshot: tuple[tuple[int, Decimal], ...],
+    updates: tuple[tuple[int, Decimal], ...] = (),
+) -> AccountSnapshot:
+    return replace(
+        value,
+        private=PrivateEventEvidence(
+            account=value.account,
+            auth_status="success",
+            orders_snapshot=value.open_orders,
+            positions_snapshot=snapshot,
+            orders_updates=value.open_orders,
+            positions_updates=updates,
+            observed_at=NOW,
+        ),
+    )
+
+
 def pair_observation(
     primary: AccountSnapshot,
     counterparty: AccountSnapshot,
@@ -820,6 +838,99 @@ def test_private_snapshot_must_match_rest_current_state(tmp_path: Path):
     bad = replace(base, private=bad_private)
     with pytest.raises(CoordinatorSafetyError):
         coordinator._validate_observation(observation(primary=bad))
+
+
+def test_private_position_snapshots_allow_observed_additive_zero_rows_and_absence(
+    tmp_path: Path,
+):
+    primary = with_private_positions(
+        account_snapshot(AccountRole.PRIMARY),
+        ((1, Decimal("0")), (29, Decimal("0")), (2, Decimal("0"))),
+    )
+    counterparty = with_private_positions(account_snapshot(AccountRole.COUNTERPARTY), ())
+    coordinator = TwoAccountCoordinator._fixture(
+        venue=FakeVenue(),
+        primary_journal=tmp_path / "primary.sqlite3",
+        counterparty_journal=tmp_path / "counterparty.sqlite3",
+        now=lambda: NOW,
+    )
+    coordinator._validate_observation(
+        observation(primary=primary, counterparty=counterparty),
+    )
+
+
+def test_private_position_snapshot_reconciles_fixed_market_to_rest_position(
+    tmp_path: Path,
+):
+    primary = with_private_positions(
+        account_snapshot(AccountRole.PRIMARY, position="0.1"),
+        ((1, Decimal("0")), (29, Decimal("0")), (2, Decimal("0.1"))),
+    )
+    coordinator = TwoAccountCoordinator._fixture(
+        venue=FakeVenue(),
+        primary_journal=tmp_path / "primary.sqlite3",
+        counterparty_journal=tmp_path / "counterparty.sqlite3",
+        now=lambda: NOW,
+    )
+    coordinator._validate_observation(observation(primary=primary))
+
+
+def test_private_position_snapshot_absence_means_zero_against_rest_position(
+    tmp_path: Path,
+):
+    primary = with_private_positions(
+        account_snapshot(AccountRole.PRIMARY, position="0.1"), (),
+    )
+    coordinator = TwoAccountCoordinator._fixture(
+        venue=FakeVenue(),
+        primary_journal=tmp_path / "primary.sqlite3",
+        counterparty_journal=tmp_path / "counterparty.sqlite3",
+        now=lambda: NOW,
+    )
+    with pytest.raises(CoordinatorSafetyError):
+        coordinator._validate_observation(observation(primary=primary))
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        ((1, Decimal("0.001")), (2, Decimal("0"))),
+        ((1, Decimal("0")), (1, Decimal("0")), (2, Decimal("0"))),
+        ((2, Decimal("0.1")),),
+        ((29, Decimal("0.0005")), (2, Decimal("0"))),
+        ((0, Decimal("0")), (2, Decimal("0"))),
+    ],
+    ids=["unrelated-nonzero", "duplicate-market", "fixed-mismatch", "off-grid", "nonpositive-market"],
+)
+def test_private_position_snapshots_reject_untrusted_rows(
+    tmp_path: Path, snapshot: tuple[tuple[int, Decimal], ...],
+):
+    primary = with_private_positions(account_snapshot(AccountRole.PRIMARY), snapshot)
+    coordinator = TwoAccountCoordinator._fixture(
+        venue=FakeVenue(),
+        primary_journal=tmp_path / "primary.sqlite3",
+        counterparty_journal=tmp_path / "counterparty.sqlite3",
+        now=lambda: NOW,
+    )
+    with pytest.raises(CoordinatorSafetyError):
+        coordinator._validate_observation(observation(primary=primary))
+
+
+def test_private_position_updates_reject_contradictory_fixed_market_state(
+    tmp_path: Path,
+):
+    primary = with_private_positions(
+        account_snapshot(AccountRole.PRIMARY), (),
+        updates=((2, Decimal("0")), (2, Decimal("0.1"))),
+    )
+    coordinator = TwoAccountCoordinator._fixture(
+        venue=FakeVenue(),
+        primary_journal=tmp_path / "primary.sqlite3",
+        counterparty_journal=tmp_path / "counterparty.sqlite3",
+        now=lambda: NOW,
+    )
+    with pytest.raises(CoordinatorSafetyError):
+        coordinator._validate_observation(observation(primary=primary))
 
 
 def test_rest_open_history_overlap_is_allowed_only_when_semantically_equal(tmp_path: Path):

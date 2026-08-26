@@ -935,6 +935,21 @@ def _aligned(value: Decimal, step: Decimal) -> bool:
     return step > 0 and value > 0 and value % step == 0
 
 
+def _private_market_id(value: Any) -> int:
+    if type(value) is int:
+        market_id = value
+    elif (
+        isinstance(value, str) and value.isascii() and value.isdecimal()
+        and (value == "0" or not value.startswith("0"))
+    ):
+        market_id = int(value)
+    else:
+        raise CoordinatorSafetyError("RISEx private position identity rejected")
+    if not 0 < market_id < 2**16:
+        raise CoordinatorSafetyError("RISEx private position identity rejected")
+    return market_id
+
+
 def _wide_order_id(order_id: str) -> int:
     if not _valid_order_id(order_id):
         raise CoordinatorSafetyError("RISEx order identity rejected")
@@ -1087,6 +1102,38 @@ def _validate_trade(trade: RestTrade, identity: RoleIdentity, now: int) -> None:
         raise CoordinatorSafetyError("RISEx trade grid rejected")
 
 
+def _validate_private_position_rows(
+    rows: Sequence[tuple[int, Decimal]], *,
+    allow_unrelated_zero: bool, require_unique: bool,
+) -> None:
+    seen: dict[int, Decimal] = {}
+    try:
+        iterator = iter(rows)
+        for row in iterator:
+            if not isinstance(row, (tuple, list)) or len(row) != 2:
+                raise CoordinatorSafetyError("RISEx private position schema rejected")
+            market_id, raw_size = row
+            if type(market_id) is not int or not 0 < market_id < 2**16:
+                raise CoordinatorSafetyError("RISEx private position identity rejected")
+            size = _decimal(raw_size, nonnegative=False)
+            if size % MARKET_STEP:
+                raise CoordinatorSafetyError("RISEx private position grid rejected")
+            previous = seen.get(market_id)
+            if previous is not None:
+                if require_unique or previous != size:
+                    raise CoordinatorSafetyError("RISEx private position contradiction")
+                continue
+            if market_id != MARKET_ID and (
+                not allow_unrelated_zero or size != 0
+            ):
+                raise CoordinatorSafetyError("RISEx unrelated private position rejected")
+            seen[market_id] = size
+    except CoordinatorSafetyError:
+        raise
+    except Exception:
+        raise CoordinatorSafetyError("RISEx private position schema rejected") from None
+
+
 def _validate_private(value: PrivateEventEvidence, identity: RoleIdentity, now: int) -> None:
     if (
         value.account.lower() != identity.account
@@ -1096,10 +1143,12 @@ def _validate_private(value: PrivateEventEvidence, identity: RoleIdentity, now: 
         raise CoordinatorSafetyError("RISEx private event evidence rejected")
     for order in (*value.orders_snapshot, *value.orders_updates):
         _validate_order(order, identity, now)
-    for rows in (value.positions_snapshot, value.positions_updates):
-        for market_id, size in rows:
-            if market_id != MARKET_ID or not _decimal(size, nonnegative=False).is_finite():
-                raise CoordinatorSafetyError("RISEx private position evidence rejected")
+    _validate_private_position_rows(
+        value.positions_snapshot, allow_unrelated_zero=True, require_unique=True,
+    )
+    _validate_private_position_rows(
+        value.positions_updates, allow_unrelated_zero=False, require_unique=False,
+    )
 
 
 def _validate_account(value: AccountSnapshot, identity: RoleIdentity, now: int, *, private: bool = True) -> None:
@@ -1615,11 +1664,14 @@ def _parse_private_snapshot(
             raise CoordinatorSafetyError("RISEx private position schema rejected")
         if _address(row["account"]).lower() != identity.account:
             raise CoordinatorSafetyError("RISEx private position identity rejected")
-        market_id = int(row["market_id"])
+        market_id = _private_market_id(row["market_id"])
         if market_id <= 0 or market_id in seen:
             raise CoordinatorSafetyError("RISEx private position contradiction")
         seen.add(market_id)
         positions.append((market_id, _decimal(row["size"], nonnegative=False)))
+    _validate_private_position_rows(
+        tuple(positions), allow_unrelated_zero=True, require_unique=True,
+    )
     return tuple(positions)
 
 
@@ -1630,8 +1682,9 @@ def _parse_private_update(
         frame.get("channel") != channel or frame.get("type") != "update"
         or not isinstance(frame.get("data"), list)
         or not isinstance(frame.get("worker_timestamp"), str)
-        or str(frame.get("market_id")) != str(MARKET_ID)
     ):
+        raise CoordinatorSafetyError("RISEx private update schema rejected")
+    if _private_market_id(frame.get("market_id")) != MARKET_ID:
         raise CoordinatorSafetyError("RISEx private update schema rejected")
     try:
         timestamp_ns = int(frame["worker_timestamp"])
@@ -1652,10 +1705,13 @@ def _parse_private_update(
             raise CoordinatorSafetyError("RISEx private position update rejected")
         if _address(row["account"]).lower() != identity.account:
             raise CoordinatorSafetyError("RISEx private position identity rejected")
-        market_id = int(row["market_id"])
+        market_id = _private_market_id(row["market_id"])
         if market_id != MARKET_ID:
             raise CoordinatorSafetyError("RISEx private position market rejected")
         positions.append((market_id, _decimal(row["size"], nonnegative=False)))
+    _validate_private_position_rows(
+        tuple(positions), allow_unrelated_zero=False, require_unique=True,
+    )
     return tuple(positions)
 
 
