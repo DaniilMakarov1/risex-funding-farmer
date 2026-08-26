@@ -21,7 +21,8 @@ from risex_farmer.nado_testnet_lifecycle import (
     order_digest, smallest_executable_amount,
 )
 from risex_farmer.nado_testnet_lifecycle_operational import (
-    DurableExecuteFailure, OperationalSafetyError, OperationalVenueIO,
+    DurableExecuteFailure, DurableOperationalFailure, OperationalSafetyError,
+    OperationalVenueIO,
     OwnerOrderCapability, REDACTED_STORE_PATH, RUN_STORE_BASENAME,
     SealedLifecycleRunner, TARGET_PRODUCT_ID, TARGET_TICKER_ID, _fixture_run, run,
 )
@@ -152,6 +153,22 @@ def run_fixture(tmp_path: Path, io: FixtureIO):
     # inspect through a fresh connection after the runner closes its owner
     io.store = IntentStore(path)
     return result, io.store
+
+
+def runtime_terminal(path: Path) -> tuple[tuple[object, ...], tuple[object, ...]]:
+    connection = sqlite3.connect(path)
+    try:
+        runtime = connection.execute(
+            "SELECT state, failure_class, stage FROM nado_runtime_runs "
+            "ORDER BY rowid"
+        ).fetchall()
+        lifecycle = connection.execute(
+            "SELECT status FROM nado_lifecycle_state WHERE singleton = 1"
+        ).fetchall()
+        assert connection.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+        return tuple(runtime), tuple(lifecycle)
+    finally:
+        connection.close()
 
 
 def test_zero_argument_surface_and_normal_startup_isolation() -> None:
@@ -573,6 +590,25 @@ def test_outer_sealed_report_preserves_execute_failure_class_and_code(
     }
 
 
+def test_outer_sealed_report_sanitizes_unknown_failure_without_generic_reason(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = importlib.import_module(
+        "risex_farmer.nado_testnet_lifecycle_operational"
+    )
+    monkeypatch.setattr(
+        module, "run",
+        lambda: (_ for _ in ()).throw(RuntimeError("RAW_OUTER_FAILURE")),
+    )
+    module.main()
+    report = json.loads(capsys.readouterr().out)
+    assert report == {
+        "schema_version": 1, "status": "BLOCKED", "path": REDACTED_STORE_PATH,
+        "reason": "UNEXPECTED_FAILURE", "stage": "OUTER",
+    }
+    assert "RAW_OUTER_FAILURE" not in json.dumps(report)
+
+
 @pytest.mark.parametrize(
     ("response", "failure_class"),
     [
@@ -671,6 +707,25 @@ def test_v2_pairs_transport_is_fixed_get_without_request_body() -> None:
     assert connection.request_args[:3] == ("GET", "/v2/pairs", None)
 
 
+def test_transport_failure_class_retains_http_and_schema_boundaries() -> None:
+    module = importlib.import_module(
+        "risex_farmer.nado_testnet_lifecycle_operational"
+    )
+    http_connection = _Connection(_Response(b"{}", None))
+    http_connection.response.status = 503
+    io = OperationalVenueIO(OWNER, SENDER)
+    io._connection_factory = lambda _host: http_connection
+    with pytest.raises(OperationalSafetyError, match="HTTP status") as http_error:
+        io._post("gateway.test.nado.xyz", "/v1/query", {"type": "status"})
+    assert module._failure_class(http_error.value) == "HTTP"
+
+    schema_connection = _Connection(_Response(b"not-json", None))
+    io._connection_factory = lambda _host: schema_connection
+    with pytest.raises(OperationalSafetyError, match="schema") as schema_error:
+        io._post("gateway.test.nado.xyz", "/v1/query", {"type": "status"})
+    assert module._failure_class(schema_error.value) == "SCHEMA"
+
+
 @pytest.mark.parametrize("encoding", ["compress", "gzip, br", "x-gzip"])
 def test_transport_rejects_unknown_or_composed_content_encoding(encoding: str) -> None:
     connection = _Connection(_Response(b"{}", encoding))
@@ -740,44 +795,157 @@ def test_restart_with_existing_or_ambiguous_intent_never_dispatches(tmp_path: Pa
     assert len(io.dispatch_states) == writes
 
 
-def test_prewrite_blocked_runtime_row_allows_fresh_retry_without_erasing_history(
+def test_prewrite_blocked_runtime_row_is_terminal_without_inventing_intent(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "nado.sqlite"
     blocked = FixtureIO("RESTING")
     blocked.observe = lambda _digests: (_ for _ in ()).throw(
-        OperationalSafetyError("synthetic pre-write block")
+        RuntimeError("RAW_UNKNOWN_PRE_INTENT_FAILURE")
     )
-    with pytest.raises(OperationalSafetyError, match="pre-write"):
+    with pytest.raises(DurableOperationalFailure) as caught:
         _fixture_run(
             path=path, io=blocked, capability_loader=capability,
             owner=OWNER, sender=SENDER,
         )
+    assert caught.value.failure_class == "UNEXPECTED_FAILURE"
+    assert caught.value.stage == "LIVE_OBSERVATION"
 
+    assert runtime_terminal(path) == (
+        (("BLOCKED", "UNEXPECTED_FAILURE", "LIVE_OBSERVATION"),),
+        (("HALTED",),),
+    )
+    with pytest.raises(DurableOperationalFailure) as retry:
+        _fixture_run(
+            path=path, io=FixtureIO("RESTING"), capability_loader=capability,
+            owner=OWNER, sender=SENDER,
+        )
+    assert retry.value.failure_class == "UNEXPECTED_FAILURE"
+    assert retry.value.stage == "RUNNER_STARTUP"
+    runtime, lifecycle = runtime_terminal(path)
+    assert len(runtime) == 2
+    assert all(row[0] == "BLOCKED" for row in runtime)
+    assert lifecycle == (("HALTED",),)
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "failure_class", "stage"),
+    [
+        ("observe_transport", "TRANSPORT", "LIVE_OBSERVATION"),
+        ("observe_unknown", "UNEXPECTED_FAILURE", "LIVE_OBSERVATION"),
+        ("derive_identity", "IDENTITY", "ORDER_DERIVATION"),
+        ("preflight_safety", "SAFETY", "ENTRY_PREFLIGHT"),
+        ("signature_auth", "AUTH", "ENTRY_SIGNATURE"),
+        ("validation_auth", "AUTH", "ENTRY_VALIDATION"),
+        ("prepare_contract", "SAFETY", "ENTRY_PREPARATION"),
+        ("prepare_unknown", "UNEXPECTED_FAILURE", "ENTRY_PREPARATION"),
+    ],
+)
+def test_each_pre_intent_stage_persists_only_sanitized_terminal_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_kind: str,
+    failure_class: str, stage: str,
+) -> None:
+    module = importlib.import_module(
+        "risex_farmer.nado_testnet_lifecycle_operational"
+    )
+    io = FixtureIO("RESTING")
+    loader = capability
+    if failure_kind == "observe_transport":
+        io.observe = lambda _digests: (_ for _ in ()).throw(
+            OperationalSafetyError("transport outcome requires manual recovery")
+        )
+    elif failure_kind == "observe_unknown":
+        io.observe = lambda _digests: (_ for _ in ()).throw(
+            RuntimeError("RAW_UNKNOWN_OBSERVATION")
+        )
+    elif failure_kind == "derive_identity":
+        monkeypatch.setattr(
+            module, "_entry_order",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                OperationalSafetyError("fixed target product identity unavailable")
+            ),
+        )
+    elif failure_kind == "preflight_safety":
+        monkeypatch.setattr(
+            module, "validate_entry_preflight",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                module.NadoPreflightError("public evidence temporal order mismatch")
+            ),
+        )
+    elif failure_kind == "signature_auth":
+        loader = lambda _owner: (_ for _ in ()).throw(
+            OperationalSafetyError("owner capability unavailable")
+        )
+    elif failure_kind == "validation_auth":
+        io.validate_order = lambda *_args: (_ for _ in ()).throw(
+            OperationalSafetyError("signed order validation failed")
+        )
+    elif failure_kind == "prepare_contract":
+        monkeypatch.setattr(
+            module.LifecycleCore, "prepare_entry",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                module.NadoContractError("entry preflight contract rejected")
+            ),
+        )
+    elif failure_kind == "prepare_unknown":
+        monkeypatch.setattr(
+            module.LifecycleCore, "prepare_entry",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("RAW_UNKNOWN_PREPARE_FAILURE")
+            ),
+        )
+    else:
+        raise AssertionError(failure_kind)
+
+    path = tmp_path / f"{failure_kind}.sqlite"
+    with pytest.raises(DurableOperationalFailure) as caught:
+        _fixture_run(
+            path=path, io=io, capability_loader=loader,
+            owner=OWNER, sender=SENDER,
+        )
+    assert (caught.value.failure_class, caught.value.stage) == (failure_class, stage)
+    assert runtime_terminal(path) == (
+        (("BLOCKED", failure_class, stage),),
+        (("HALTED",),),
+    )
     connection = sqlite3.connect(path)
     try:
-        first_rows = connection.execute(
-            "SELECT run_id, state FROM nado_runtime_runs ORDER BY rowid"
-        ).fetchall()
-        assert len(first_rows) == 1 and first_rows[0][1] == "STARTED"
         assert connection.execute("SELECT COUNT(*) FROM nado_intents").fetchone() == (0,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM nado_execute_failures"
+        ).fetchone() == (0,)
     finally:
         connection.close()
 
-    report, store = run_fixture(tmp_path, FixtureIO("RESTING"))
-    store.close()
-    assert report.status == COMPLETE
-    connection = sqlite3.connect(path)
-    try:
-        rows = connection.execute(
-            "SELECT run_id, state FROM nado_runtime_runs ORDER BY rowid"
-        ).fetchall()
-        assert len(rows) == 2
-        assert rows[0] == first_rows[0]
-        assert rows[0][0] != rows[1][0]
-        assert [state for _, state in rows] == ["STARTED", "STARTED"]
-    finally:
-        connection.close()
+
+def test_embedded_private_read_barrier_class_is_returned_and_durable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = importlib.import_module(
+        "risex_farmer.nado_testnet_lifecycle_operational"
+    )
+    path = tmp_path / "sealed-private-read.sqlite"
+    monkeypatch.setattr(module, "_strict_identity", lambda: (OWNER, SENDER))
+    monkeypatch.setattr(module, "_production_store_path", lambda: path)
+
+    async def blocked_private_read():
+        return {
+            "status": "BLOCKED", "failure_class": "SCHEMA",
+            "reason": "RAW_PRIVATE_READ_DETAIL",
+        }
+
+    monkeypatch.setattr(module, "_accepted_private_read", blocked_private_read)
+    module.main()
+    report = json.loads(capsys.readouterr().out)
+    assert report == {
+        "schema_version": 1, "status": "BLOCKED", "path": REDACTED_STORE_PATH,
+        "reason": "SCHEMA", "stage": "PRIVATE_READ_BARRIER",
+    }
+    assert runtime_terminal(path) == (
+        (("BLOCKED", "SCHEMA", "PRIVATE_READ_BARRIER"),),
+        (("HALTED",),),
+    )
+    assert b"RAW_PRIVATE_READ_DETAIL" not in path.read_bytes()
 
 
 def test_close_residual_stops_after_three_durable_attempts(tmp_path: Path) -> None:

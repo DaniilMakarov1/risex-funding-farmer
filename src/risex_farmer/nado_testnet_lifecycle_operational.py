@@ -33,15 +33,17 @@ from .nado_private_read_operational import (
     _strict_identity, run as _accepted_private_read,
 )
 from .nado_private_read_preflight import (
-    MAX_FRESHNESS_MS, FixedPreflightIdentity, NadoPreflightError,
-    ObservedResponse, _server_time_observation, list_trigger_orders_typed_data,
+    FAILURE_CLASSES, MAX_FRESHNESS_MS, FixedPreflightIdentity, NadoPreflightError,
+    ObservedResponse, _sanitized_failure_class as _preflight_failure_class,
+    _server_time_observation, list_trigger_orders_typed_data,
 )
 from .nado_testnet_lifecycle import (
     ACTIVE_PERP, CANCEL_ALL, CLOSE, COMPLETE, ENTRY,
     EXECUTE_RESPONSE_AMBIGUITY, EXECUTE_TRANSPORT_AMBIGUITY,
     EXECUTE_VENUE_REJECTION, IOC_APPENDIX, MAX_CLOSE_ATTEMPTS, UINT32_MAX,
     AccountSnapshot, CatalogSnapshot, EngineEvidence, IntentStore,
-    ExecuteFailure, LifecycleCore, OrderEvidence, OrderIntent, Product, Reconciliation,
+    ExecuteFailure, LifecycleCore, NadoContractError, OrderEvidence, OrderIntent,
+    Product, Reconciliation,
     SyntheticOrderVector, TriggerSnapshot, build_order_nonce,
     completion_barrier, order_digest, smallest_executable_amount,
     validate_entry_preflight,
@@ -60,10 +62,27 @@ RECONCILE_READ_INTERVAL_SECONDS = 1.0
 _GATEWAY_HOST = "gateway.test.nado.xyz"
 _ARCHIVE_HOST = "archive.test.nado.xyz"
 _TRIGGER_HOST = "trigger.test.nado.xyz"
+UNEXPECTED_FAILURE = "UNEXPECTED_FAILURE"
 
 
 class OperationalSafetyError(RuntimeError):
     """Sanitized terminal operational failure."""
+
+
+class DurableOperationalFailure(OperationalSafetyError):
+    """Sanitized failure persisted after the runtime journal began."""
+
+    def __init__(self, failure_class: str, stage: str) -> None:
+        if (
+            type(failure_class) is not str
+            or failure_class not in FAILURE_CLASSES | {UNEXPECTED_FAILURE}
+        ):
+            raise ValueError("unsupported operational failure class")
+        if type(stage) is not str or stage not in _RUNTIME_STAGES:
+            raise ValueError("unsupported operational stage")
+        self.failure_class = failure_class
+        self.stage = stage
+        super().__init__(failure_class)
 
 
 class DurableExecuteFailure(OperationalSafetyError):
@@ -111,6 +130,62 @@ class OperationalReport:
         }
 
 
+_RUNTIME_FAILURE_CLASSES = frozenset(FAILURE_CLASSES) | frozenset({
+    EXECUTE_RESPONSE_AMBIGUITY,
+    EXECUTE_TRANSPORT_AMBIGUITY,
+    EXECUTE_VENUE_REJECTION,
+    UNEXPECTED_FAILURE,
+})
+
+_RUNTIME_STAGES = frozenset({
+    "PRIVATE_READ_BARRIER", "LIVE_OBSERVATION", "ORDER_DERIVATION",
+    "ENTRY_PREFLIGHT", "ENTRY_SIGNATURE", "ENTRY_VALIDATION",
+    "ENTRY_PREPARATION", "DISPATCH", "RECONCILIATION",
+    "CANCEL_PREPARATION", "CLOSE_PREPARATION", "FINAL_BARRIER",
+    "RUNNER_STARTUP", "OUTER",
+})
+
+
+def _failure_class(error: BaseException | object) -> str:
+    """Return only a bounded class; never persist or report exception text."""
+    explicit = getattr(error, "failure_class", None)
+    if type(explicit) is str and explicit in _RUNTIME_FAILURE_CLASSES:
+        return explicit
+    if isinstance(error, NadoPreflightError):
+        classified = _preflight_failure_class(error)
+        return classified if classified in FAILURE_CLASSES else UNEXPECTED_FAILURE
+    if isinstance(error, NadoContractError):
+        return "SAFETY"
+    if isinstance(error, OperationalSafetyError):
+        message = str(error).lower()
+        if "http status" in message:
+            return "HTTP"
+        if any(term in message for term in (
+            "schema", "strict json", "canonical json", "response size",
+            "content encoding",
+        )):
+            return "SCHEMA"
+        if any(term in message for term in (
+            "identity", "subaccount", "linked signer", "owner mismatch",
+        )):
+            return "IDENTITY"
+        if any(term in message for term in (
+            "credential", "capability", "sign", "signature",
+        )):
+            return "AUTH"
+        if "transport" in message:
+            return "TRANSPORT"
+    return UNEXPECTED_FAILURE
+
+
+def _report_failure_class(report: object) -> str:
+    if type(report) is dict:
+        failure_class = report.get("failure_class")
+        if type(failure_class) is str and failure_class in FAILURE_CLASSES:
+            return failure_class
+    return UNEXPECTED_FAILURE
+
+
 class VenueIO(Protocol):
     def now_ms(self) -> int: ...
     def observe(self, digests: tuple[str, ...]) -> LiveObservation: ...
@@ -124,6 +199,26 @@ class RuntimeRunJournal:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
 
+    @staticmethod
+    def _ensure_schema(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS nado_runtime_runs ("
+            "run_id TEXT PRIMARY KEY, created_at_ms INTEGER NOT NULL, "
+            "state TEXT NOT NULL, failure_class TEXT, stage TEXT)"
+        )
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(nado_runtime_runs)")
+        }
+        if "failure_class" not in columns:
+            connection.execute(
+                "ALTER TABLE nado_runtime_runs ADD COLUMN failure_class TEXT"
+            )
+        if "stage" not in columns:
+            connection.execute(
+                "ALTER TABLE nado_runtime_runs ADD COLUMN stage TEXT"
+            )
+
     def begin(self, created_at_ms: int) -> str:
         if type(created_at_ms) is not int or created_at_ms <= 0:
             raise OperationalSafetyError("runtime journal rejected")
@@ -133,13 +228,11 @@ class RuntimeRunJournal:
         try:
             connection.execute("PRAGMA synchronous=FULL")
             with connection:
+                self._ensure_schema(connection)
                 connection.execute(
-                    "CREATE TABLE IF NOT EXISTS nado_runtime_runs ("
-                    "run_id TEXT PRIMARY KEY, created_at_ms INTEGER NOT NULL, "
-                    "state TEXT NOT NULL)"
-                )
-                connection.execute(
-                    "INSERT INTO nado_runtime_runs VALUES (?, ?, 'STARTED')",
+                    "INSERT INTO nado_runtime_runs "
+                    "(run_id, created_at_ms, state, failure_class, stage) "
+                    "VALUES (?, ?, 'STARTED', NULL, NULL)",
                     (run_id, created_at_ms),
                 )
         except sqlite3.DatabaseError:
@@ -148,6 +241,48 @@ class RuntimeRunJournal:
             connection.close()
         _fsync(self.path)
         return run_id
+
+    def terminalize(self, run_id: str, failure_class: str, stage: str) -> None:
+        if (
+            type(run_id) is not str
+            or not run_id
+            or type(failure_class) is not str
+            or type(stage) is not str
+            or failure_class not in _RUNTIME_FAILURE_CLASSES
+            or stage not in _RUNTIME_STAGES
+        ):
+            raise OperationalSafetyError("runtime journal rejected")
+        _prepare_file(self.path)
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.execute("PRAGMA synchronous=FULL")
+            with connection:
+                self._ensure_schema(connection)
+                row = connection.execute(
+                    "SELECT state, failure_class, stage FROM nado_runtime_runs "
+                    "WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()
+                if row is None:
+                    raise OperationalSafetyError("runtime journal rejected")
+                if row[0] == "BLOCKED":
+                    if row[1] != failure_class or row[2] != stage:
+                        raise OperationalSafetyError("runtime journal terminal conflict")
+                    return
+                if row[0] != "STARTED":
+                    raise OperationalSafetyError("runtime journal terminal conflict")
+                changed = connection.execute(
+                    "UPDATE nado_runtime_runs SET state = 'BLOCKED', "
+                    "failure_class = ?, stage = ? WHERE run_id = ? AND state = 'STARTED'",
+                    (failure_class, stage, run_id),
+                )
+                if changed.rowcount != 1:
+                    raise OperationalSafetyError("runtime journal terminal conflict")
+        except sqlite3.DatabaseError:
+            raise OperationalSafetyError("runtime journal rejected") from None
+        finally:
+            connection.close()
+        _fsync(self.path)
 
 
 def _home() -> Path:
@@ -308,8 +443,17 @@ class SealedLifecycleRunner:
         self.capability_loader = capability_loader
         self.owner = owner.lower()
         self.sender = sender.lower()
+        self.journal = journal
         self.run_id = journal.begin(io.now_ms())
+        self.stage = "RUNNER_STARTUP"
         self.writes = 0
+
+    def terminalize(self, failure_class: str, stage: str | None = None) -> None:
+        selected_stage = self.stage if stage is None else stage
+        if selected_stage not in _RUNTIME_STAGES:
+            selected_stage = "OUTER"
+        self.store.halt()
+        self.journal.terminalize(self.run_id, failure_class, selected_stage)
 
     def _dispatch(self, intent: OrderIntent) -> None:
         capability = self.capability_loader(self.owner)
@@ -380,16 +524,20 @@ class SealedLifecycleRunner:
     def run(self) -> OperationalReport:
         if self.store.intents() or self.store.lifecycle_status() != "RUNNING":
             raise OperationalSafetyError("existing lifecycle requires manual recovery")
+        self.stage = "LIVE_OBSERVATION"
         initial = self._observe()
         issued_at = self.io.now_ms()
         recv = issued_at + RECV_WINDOW_MS
+        self.stage = "ORDER_DERIVATION"
         order = _entry_order(initial, self.owner, self.sender, recv)
+        self.stage = "ENTRY_PREFLIGHT"
         validate_entry_preflight(
             catalog=initial.catalog, account=initial.evidence.account,
             triggers=initial.evidence.triggers, product_id=TARGET_PRODUCT_ID,
             entry_price_x18=order.price_x18,
             worst_close_price_x18=initial.bid_x18, now_ms=issued_at,
         )
+        self.stage = "ENTRY_SIGNATURE"
         capability = self.capability_loader(self.owner)
         try:
             signature = capability.sign(OrderIntent(
@@ -399,9 +547,11 @@ class SealedLifecycleRunner:
                 order.appendix, sender=order.sender, owner=order.owner,
                 subaccount_name=order.subaccount_name,
             ))
+            self.stage = "ENTRY_VALIDATION"
             valid = self.io.validate_order(order, signature)
         finally:
             capability.close()
+        self.stage = "ENTRY_PREPARATION"
         entry = self.core.prepare_entry(
             order=order, catalog=initial.catalog, account=initial.evidence.account,
             triggers=initial.evidence.triggers,
@@ -409,17 +559,22 @@ class SealedLifecycleRunner:
             validation_product_id=order.product_id, validation_valid=valid,
             now_ms=issued_at,
         )
+        self.stage = "DISPATCH"
         self._dispatch(entry)
+        self.stage = "RECONCILIATION"
         outcome, observed = self._reconcile(entry)
         if outcome is Reconciliation.RESTING or outcome is Reconciliation.PARTIAL:
             issued_at = self.io.now_ms()
             recv = issued_at + RECV_WINDOW_MS
+            self.stage = "CANCEL_PREPARATION"
             cancel = self.core.prepare_cancel_all(
                 catalog=observed.catalog, account=observed.evidence.account,
                 triggers=observed.evidence.triggers, sender=self.sender,
                 recv_time=recv, salt=_salt(), now_ms=issued_at,
             )
+            self.stage = "DISPATCH"
             self._dispatch(cancel)
+            self.stage = "RECONCILIATION"
             outcome, observed = self._reconcile(cancel)
             if outcome is not Reconciliation.CANCELLED:
                 raise OperationalSafetyError("exact entry cancellation unresolved")
@@ -432,13 +587,16 @@ class SealedLifecycleRunner:
                 raise OperationalSafetyError("three close attempts exhausted")
             issued_at = self.io.now_ms()
             recv = issued_at + RECV_WINDOW_MS
+            self.stage = "CLOSE_PREPARATION"
             close = self.core.prepare_close(
                 catalog=observed.catalog, product=observed.product,
                 account=observed.evidence.account, triggers=observed.evidence.triggers,
                 worst_price_x18=observed.bid_x18, recv_time=recv, salt=_salt(),
                 now_ms=issued_at,
             )
+            self.stage = "DISPATCH"
             self._dispatch(close)
+            self.stage = "RECONCILIATION"
             close_outcome, observed = self._reconcile(close)
             if close_outcome in {Reconciliation.PARTIAL, Reconciliation.REJECTED}:
                 raise OperationalSafetyError("close requires manual recovery")
@@ -446,6 +604,7 @@ class SealedLifecycleRunner:
                 Reconciliation.FILLED, Reconciliation.CANCELLED, Reconciliation.EXPIRED,
             }:
                 raise OperationalSafetyError("close outcome unresolved")
+        self.stage = "FINAL_BARRIER"
         final = self._observe()
         complete = completion_barrier(
             store=self.store, catalog=final.catalog, evidence=final.evidence,
@@ -460,6 +619,36 @@ class SealedLifecycleRunner:
         )
 
 
+def _latest_execute_failure(
+    runner: SealedLifecycleRunner,
+) -> tuple[str, int | None] | None:
+    try:
+        for intent, _state in reversed(runner.store.intents()):
+            failure = runner.store.execute_failure(intent.digest)
+            if failure is not None:
+                return failure
+    except BaseException:
+        return None
+    return None
+
+
+def _persist_runner_failure(
+    runner: SealedLifecycleRunner, error: BaseException,
+) -> tuple[str, tuple[str, int | None] | None]:
+    persisted_execute = _latest_execute_failure(runner)
+    if isinstance(error, DurableExecuteFailure):
+        failure_class = error.failure_class
+    elif persisted_execute is not None:
+        failure_class = persisted_execute[0]
+    elif isinstance(error, DurableOperationalFailure):
+        failure_class = error.failure_class
+    else:
+        failure_class = _failure_class(error)
+    stage = error.stage if isinstance(error, DurableOperationalFailure) else runner.stage
+    runner.terminalize(failure_class, stage)
+    return failure_class, persisted_execute
+
+
 def _fixture_run(
     *, path: Path, io: VenueIO,
     capability_loader: Callable[[str], OwnerOrderCapability], owner: str, sender: str,
@@ -472,10 +661,25 @@ def _fixture_run(
             setattr(io, "store", store)
         except BaseException:
             pass
-        return SealedLifecycleRunner(
+        runner = SealedLifecycleRunner(
             store=store, journal=RuntimeRunJournal(path), io=io,
             capability_loader=capability_loader, owner=owner, sender=sender,
-        ).run()
+        )
+        try:
+            return runner.run()
+        except DurableOperationalFailure as error:
+            _persist_runner_failure(runner, error)
+            raise
+        except DurableExecuteFailure as error:
+            _persist_runner_failure(runner, error)
+            raise
+        except BaseException as error:
+            failure_class, persisted_execute = _persist_runner_failure(runner, error)
+            if not runner.store.intents():
+                raise DurableOperationalFailure(failure_class, runner.stage) from None
+            if persisted_execute is not None:
+                raise error
+            raise
     finally:
         store.close()
 
@@ -486,6 +690,7 @@ def run() -> dict[str, object]:
     path = _production_store_path()
     _prepare_file(path)
     store = IntentStore(path)
+    runner: SealedLifecycleRunner | None = None
     try:
         # The network observer is deliberately constructed here so importing
         # this module remains inert and normal startup cannot reach Level C.
@@ -494,11 +699,33 @@ def run() -> dict[str, object]:
             store=store, journal=RuntimeRunJournal(path), io=io,
             capability_loader=_load_capability, owner=owner, sender=sender,
         )
+        runner.stage = "PRIVATE_READ_BARRIER"
         preflight = asyncio.run(_accepted_private_read())
         if preflight.get("status") != "FINALIZED":
-            raise OperationalSafetyError("accepted private-read barrier failed")
+            raise DurableOperationalFailure(
+                _report_failure_class(preflight), "PRIVATE_READ_BARRIER",
+            )
         report = runner.run()
         return report.sanitized()
+    except DurableOperationalFailure as error:
+        if runner is None:
+            raise
+        _persist_runner_failure(runner, error)
+        raise
+    except DurableExecuteFailure as error:
+        if runner is None:
+            raise
+        _persist_runner_failure(runner, error)
+        raise
+    except BaseException as error:
+        if runner is None:
+            raise
+        failure_class, persisted_execute = _persist_runner_failure(runner, error)
+        if not store.intents():
+            raise DurableOperationalFailure(failure_class, runner.stage) from None
+        if persisted_execute is not None:
+            raise DurableExecuteFailure(*persisted_execute) from None
+        raise
     finally:
         store.close()
 
@@ -750,15 +977,20 @@ class OperationalVenueIO:
                 if declared is not None and (
                     not declared.isdigit() or int(declared) > MAX_RESPONSE_BYTES
                 ):
-                    raise ValueError
+                    raise OperationalSafetyError("transport response schema rejected")
                 raw = response.read(MAX_RESPONSE_BYTES + 1)
-                if not 200 <= response.status < 300 or len(raw) > MAX_RESPONSE_BYTES:
-                    raise ValueError
+                if len(raw) > MAX_RESPONSE_BYTES:
+                    raise OperationalSafetyError("transport response size exceeded")
+                if not 200 <= response.status < 300:
+                    raise OperationalSafetyError("HTTP status rejected")
                 content_encoding = response.getheader("Content-Encoding")
             finally:
                 connection.close()
             decoded = self._decode_response(raw, content_encoding)
-            return json.loads(decoded.decode("utf-8"))
+            try:
+                return json.loads(decoded.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                raise OperationalSafetyError("response schema rejected") from None
         except OperationalSafetyError:
             raise
         except BaseException:
@@ -1021,10 +1253,15 @@ def main() -> None:
             "schema_version": 1, "status": "BLOCKED", "path": REDACTED_STORE_PATH,
             "reason": error.failure_class, "venue_code": error.venue_code,
         }
-    except BaseException:
+    except DurableOperationalFailure as error:
         report = {
             "schema_version": 1, "status": "BLOCKED", "path": REDACTED_STORE_PATH,
-            "reason": "OPERATIONAL_PREREQUISITE_FAILED",
+            "reason": error.failure_class, "stage": error.stage,
+        }
+    except BaseException as error:
+        report = {
+            "schema_version": 1, "status": "BLOCKED", "path": REDACTED_STORE_PATH,
+            "reason": _failure_class(error), "stage": "OUTER",
         }
     print(json.dumps(report, sort_keys=True, separators=(",", ":")))
 
