@@ -50,7 +50,7 @@ def test_lifecycle_binding_initializes_once_and_rejects_any_nonpristine_state(tm
     db.execute(
         "INSERT INTO intents VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         ("x", 1, "OPEN", "1", 1, 0, "d", "b", "PREPARED", "BUY", "MARKET",
-         "FOK", 0, 0, 1, "0.0001", 100, "1", 10, "0", 1, 0, None, 0),
+         "FOK", 0, 0, 29, "25", 250, "0.80240", 80240, "0", 1, 0, None, 0),
     )
     db.commit(); db.close()
     assert binding() is False
@@ -222,11 +222,11 @@ async def test_public_transport_rejects_redirect_final_url_and_bounds_body():
 
 @pytest.mark.asyncio
 async def test_public_transport_owns_get_method_proxy_redirect_and_exact_query():
-    target = "https://api.testnet.rise.trade/v1/orderbook?market_id=1"
+    target = "https://api.testnet.rise.trade/v1/orderbook?market_id=29"
     transport = object.__new__(SealedTransport)
     session = _Session(_Response(target))
     transport._session = session
-    response = await transport.public_get("/v1/orderbook", (("market_id", "1"),))
+    response = await transport.public_get("/v1/orderbook", (("market_id", "29"),))
     assert response.final_url == target
     assert session.call == ((target,), {"allow_redirects": False, "proxy": None})
 

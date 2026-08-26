@@ -35,9 +35,11 @@ SIGNER_LABEL = "RISEx Funding Farmer testnet probe"
 MAX_AGE_SECONDS = 5
 MAX_NOTIONAL = Decimal("500")
 MAX_BOUND_FRACTION = Decimal("0.003")
-MINIMUM = Decimal("0.0001")
-STEP = Decimal("0.000001")
-TICK = Decimal("0.1")
+MARKET_ID = 29
+MARKET_SYMBOL = "ONDO/USDC"
+MINIMUM = Decimal("25")
+STEP = Decimal("0.1")
+TICK = Decimal("0.00001")
 
 
 class Outcome(str, Enum):
@@ -287,10 +289,10 @@ class PrivateReadPreflight:
         ("/v1/auth/eip712-domain", ()),
         ("/v1/auth/session-key-status", (("account", ACCOUNT), ("signer", SIGNER))),
         ("/v1/auth/signers", (("account", ACCOUNT),)),
-        ("/v1/markets", (("force_refresh", "true"), ("market_ids", "1"))),
-        ("/v1/orderbook", (("market_id", "1"),)),
+        ("/v1/markets", (("force_refresh", "true"), ("market_ids", "29"))),
+        ("/v1/orderbook", (("market_id", "29"),)),
         ("/v1/orders/open", (("account", ACCOUNT),)),
-        ("/v1/account/position", (("account", ACCOUNT), ("market_id", "1"))),
+        ("/v1/account/position", (("account", ACCOUNT), ("market_id", "29"))),
         ("/v1/positions", (("account", ACCOUNT),)),
     )
 
@@ -484,18 +486,18 @@ class PrivateReadPreflight:
             or type(config["unlocked"]) is not bool or config["unlocked"] is not True
         ):
             raise ValueError("market field type mismatch")
-        full_symbol = "BTC/USDC"
+        full_symbol = MARKET_SYMBOL
         if (
-            market["market_id"] != "1"
+            market["market_id"] != str(MARKET_ID)
             or market["quote_asset_symbol"] != "USDC" or not config["quote"]
             or any(market[field] != full_symbol for field in {
                 "base_asset_symbol", "display_base_asset_symbol", "display_name",
                 "underlying",
             })
             or config["name"] != full_symbol
-            or config["step_size"] != "0.000001"
-            or config["step_price"] != "0.1"
-            or config["min_order_size"] != "0.0001"
+            or config["step_size"] != str(STEP)
+            or config["step_price"] != str(TICK)
+            or config["min_order_size"] != str(MINIMUM)
         ):
             raise ValueError("market mismatch")
         signed_decimal_fields = {
@@ -535,7 +537,7 @@ class PrivateReadPreflight:
         book = _mapping(
             value, {"asks", "bids", "market_id", "total_asks", "total_bids"},
         )
-        if book["market_id"] != "1":
+        if book["market_id"] != str(MARKET_ID):
             raise ValueError("book identity mismatch")
         bids = PrivateReadPreflight._levels(book["bids"])
         asks = PrivateReadPreflight._levels(book["asks"])

@@ -36,23 +36,23 @@ def record(value: str, client: int) -> OrderRecord:
     return OrderRecord(value, wide, wide >> 1, client)
 
 
-def order_update(*, client=101, status="ORDER_STATUS_FILLED", filled="0.0001"):
+def order_update(*, client=101, status="ORDER_STATUS_FILLED", filled="25"):
     return {
-        "channel": "orders", "type": "update", "market_id": "1",
+        "channel": "orders", "type": "update", "market_id": "29",
         "worker_timestamp": str(int(NOW * 1_000_000_000)),
         "data": [{
             "id": ORDER_IDS[0], "wide_order_id": "113",
             "resting_order_id": "56", "client_order_id": str(client),
-            "market_id": "1", "sender": ACCOUNT, "side": "BUY",
+            "market_id": "29", "sender": ACCOUNT, "side": "BUY",
             "type": "MARKET", "time_in_force": "IOC", "status": status,
-            "size": "0.0001", "filled_size": filled, "post_only": False,
+            "size": "25", "filled_size": filled, "post_only": False,
             "reduce_only": False, "is_liquidation": False,
         }],
     }
 
 
 def position_frame(size="0", *, kind="update"):
-    row = {"account": ACCOUNT, "market_id": "1", "size": size}
+    row = {"account": ACCOUNT, "market_id": "29", "size": size}
     timestamp = str(int(NOW * 1_000_000_000))
     if kind == "snapshot":
         return {
@@ -60,7 +60,7 @@ def position_frame(size="0", *, kind="update"):
             "data": [row], "position_count": 1, "worker_timestamp": timestamp,
         }
     return {
-        "channel": "positions", "type": "update", "market_id": "1",
+        "channel": "positions", "type": "update", "market_id": "29",
         "data": [row], "block_number": 123, "log_index": 1,
         "worker_timestamp": timestamp,
     }
@@ -77,8 +77,8 @@ def orders_snapshot():
 def opening_intent(*, lifecycle_state="OPEN_KNOWN"):
     return Intent(
         "intent", 1, "OPEN", 101, 7, 3, "a" * 64, "b" * 64,
-        lifecycle_state, "BUY", "MARKET", "IOC", False, False, 1,
-        Decimal("0.0001"), 100, Decimal("0"), 0,
+        lifecycle_state, "BUY", "MARKET", "IOC", False, False, 29,
+        Decimal("25"), 250, Decimal("0.80240"), 80240,
         Decimal("0"), NOW + 60, 1, ORDER_IDS[0], False,
     )
 
@@ -87,9 +87,9 @@ def market(now: int = NOW) -> MarketState:
     return MarketState(
         host="api.testnet.rise.trade", chain_id=11_155_931,
         domain_name="RISEx", domain_version="1", router=ROUTER,
-        authorization=AUTHORIZATION, market_id=1, symbol="BTC/USDC",
-        active=True, unlocked=True, tick=Decimal("0.1"),
-        step=Decimal("0.000001"), minimum=Decimal("0.0001"),
+        authorization=AUTHORIZATION, market_id=29, symbol="ONDO/USDC",
+        active=True, unlocked=True, tick=Decimal("0.00001"),
+        step=Decimal("0.1"), minimum=Decimal("25"),
         observed_at=now,
     )
 
@@ -111,8 +111,8 @@ def state(
     return AuthoritativeState(
         market(now), account(position, orders, now),
         BBO(
-            bid=Decimal("77982.9"), ask=Decimal("77983.0"),
-            bid_depth=Decimal("0.001"), ask_depth=Decimal("0.001"),
+            bid=Decimal("0.79900"), ask=Decimal("0.80000"),
+            bid_depth=Decimal("25"), ask_depth=Decimal("25"),
             observed_at=now,
         ),
         nonce_anchor, nonce_bitmap,
@@ -125,7 +125,7 @@ def terminal(intent, *, filled: str, position: str, now: int = NOW) -> Evidence:
     return Evidence(
         account=ACCOUNT, signer=SIGNER, signer_status="ACTIVE",
         terminal=True, filled_size=amount, position=Decimal(position),
-        observed_at=now, position_market_id=1, by_id_order=item,
+        observed_at=now, position_market_id=29, by_id_order=item,
         history_orders=(item,),
         fills=(FillRecord(item.order_id, item.client_order_id),) if amount else (),
     )
@@ -341,18 +341,18 @@ def test_production_capability_emits_authoritative_state_and_exact_evidence():
 
     intent = Intent(
         "intent", 1, "OPEN", 101, 7, 3, "a" * 64, "b" * 64,
-        "DISPATCHED", "BUY", "MARKET", "IOC", False, False, 1,
-        Decimal("0.0001"), 100, Decimal("0"), 0,
+        "DISPATCHED", "BUY", "MARKET", "IOC", False, False, 29,
+        Decimal("25"), 250, Decimal("0.80240"), 80240,
         Decimal("0"), NOW + 60, 1, ORDER_IDS[0], False,
     )
     capability._subscribed = True
     capability._updates[101] = order_update()["data"][0]
     capability._position = (Decimal("0"), False, NOW * 1_000_000_000, 1)
     capability._stream_sequence = 1
-    transport.frames = [position_frame("0.0001")]
+    transport.frames = [position_frame("25")]
     evidence = asyncio.run(capability.evidence(intent))
-    assert evidence.terminal and evidence.position == Decimal("0.0001")
-    assert evidence.filled_size == Decimal("0.0001")
+    assert evidence.terminal and evidence.position == Decimal("25")
+    assert evidence.filled_size == Decimal("25")
     assert evidence.by_id_order == record(ORDER_IDS[0], 101)
 
 
@@ -397,15 +397,15 @@ def test_production_stream_demuxes_interleaved_frames_without_resubscribe():
 
     intent = Intent(
         "intent", 1, "OPEN", 101, 7, 3, "a" * 64, "b" * 64,
-        "DISPATCHED", "BUY", "MARKET", "IOC", False, False, 1,
-        Decimal("0.0001"), 100, Decimal("0"), 0,
+        "DISPATCHED", "BUY", "MARKET", "IOC", False, False, 29,
+        Decimal("25"), 250, Decimal("0.80240"), 80240,
         Decimal("0"), NOW + 60, 1, ORDER_IDS[0], False,
     )
-    transport.frames.extend([position_frame("0.0001"), order_update()])
+    transport.frames.extend([position_frame("25"), order_update()])
     evidence = asyncio.run(capability.evidence(intent))
-    assert evidence.position == Decimal("0.0001") and evidence.terminal
+    assert evidence.position == Decimal("25") and evidence.terminal
     current = asyncio.run(capability._account())
-    assert current.position == Decimal("0.0001") and not current.open_order_ids
+    assert current.position == Decimal("25") and not current.open_order_ids
     assert transport.orders_subscriptions == transport.positions_subscriptions == 1
 
 
@@ -442,7 +442,7 @@ def test_production_stream_is_bounded_and_rejects_foreign_updates():
     assert bounded.orders_subscriptions == bounded.positions_subscriptions == 1
 
     contradictory = Transport([
-        position_frame(kind="snapshot"), position_frame("0.0001"),
+        position_frame(kind="snapshot"), position_frame("25"),
     ])
     capability = operational._ProductionReadCapability(
         Resource(), Resource(), contradictory, lambda: NOW,
@@ -515,7 +515,7 @@ def test_production_no_event_no_identity_waits_for_expiry_then_proves_zero_flat(
     assert evidence == Evidence(
         account=ACCOUNT, signer=SIGNER, signer_status="ACTIVE",
         terminal=True, filled_size=Decimal("0"), position=Decimal("0"),
-        observed_at=NOW + 61, position_market_id=1,
+        observed_at=NOW + 61, position_market_id=29,
     )
 
 
@@ -735,7 +735,7 @@ def test_production_prestate_requires_two_complete_fresh_zero_flat_sweeps():
 def test_pre_state_contradiction_blocks_before_any_intent_or_dispatch(tmp_path):
     binding = Binding()
     candidate = runner(tmp_path, binding)
-    capability = Capability([state(position="0.0001")], lambda _: pytest.fail())
+    capability = Capability([state(position="25")], lambda _: pytest.fail())
     report = asyncio.run(candidate.run(capability))
     assert report.result is RunnerResult.BLOCKED_BEFORE_WRITE
     assert report.intent_count == report.dispatch_count == 0
@@ -762,11 +762,11 @@ def test_fill_then_close_is_durable_price_bounded_and_finishes_zero_flat(tmp_pat
 
     def evidence(intent):
         if intent.kind == "OPEN":
-            return terminal(intent, filled="0.0001", position="0.0001")
-        return terminal(intent, filled="0.0001", position="0")
+            return terminal(intent, filled="25", position="25")
+        return terminal(intent, filled="25", position="0")
 
     capability = Capability(
-        [state(), state("0.0001"), state()], evidence,
+        [state(), state("25"), state()], evidence,
     )
     report = asyncio.run(candidate.run(capability))
     intents = candidate._store.all()
@@ -812,22 +812,22 @@ def test_close_fallback_uses_exact_residual_and_halts_at_three_attempts(tmp_path
     binding = Binding()
     candidate = runner(tmp_path, binding)
     positions = iter((
-        ("0.0001", "0.0001"),
-        ("0", "0.0001"),
-        ("0.00006", "0.00004"),
-        ("0", "0.00004"),
+        ("25", "25"),
+        ("0", "25"),
+        ("15", "10"),
+        ("0", "10"),
     ))
     capability = Capability(
-        [state(), state("0.0001"), state("0.0001"), state("0.00004")],
+        [state(), state("25"), state("25"), state("10")],
         lambda intent: terminal(intent, filled=(pair := next(positions))[0], position=pair[1]),
     )
     report = asyncio.run(candidate.run(capability))
     closes = [item for item in candidate._store.all() if item.kind == "CLOSE"]
     assert report.result is RunnerResult.FAILED_HALTED_MANUAL_RECOVERY
     assert [(item.order_type, item.time_in_force, item.size) for item in closes] == [
-        ("MARKET", "FOK", Decimal("0.0001")),
-        ("LIMIT", "IOC", Decimal("0.0001")),
-        ("LIMIT", "IOC", Decimal("0.00004")),
+        ("MARKET", "FOK", Decimal("25")),
+        ("LIMIT", "IOC", Decimal("25")),
+        ("LIMIT", "IOC", Decimal("10")),
     ]
     assert len(binding.calls) == 4 and report.manual_recovery
 
@@ -863,13 +863,13 @@ def test_exact_known_resting_order_is_cancelled_once_before_terminal_no_fill(tmp
             return Evidence(
                 account=ACCOUNT, signer=SIGNER, signer_status="ACTIVE",
                 terminal=False, filled_size=Decimal("0"), position=Decimal("0"),
-                observed_at=NOW, position_market_id=1, by_id_order=item,
+                observed_at=NOW, position_market_id=29, by_id_order=item,
                 open_orders=(item,), history_orders=(item,),
             )
         return Evidence(
             account=ACCOUNT, signer=SIGNER, signer_status="ACTIVE",
             terminal=True, filled_size=Decimal("0"), position=Decimal("0"),
-            observed_at=NOW, position_market_id=1, by_id_order=item,
+            observed_at=NOW, position_market_id=29, by_id_order=item,
             history_orders=(item,),
         )
 
@@ -1009,7 +1009,7 @@ def test_process_interruption_leaves_dispatch_claim_and_restart_only_reconciles(
         lambda intent: Evidence(
             account=ACCOUNT, signer=SIGNER, signer_status="ACTIVE",
             terminal=True, filled_size=Decimal("0"), position=Decimal("0"),
-            observed_at=NOW + 61, position_market_id=1,
+            observed_at=NOW + 61, position_market_id=29,
         ),
     )
     report = asyncio.run(reopened.run(capability))
@@ -1054,12 +1054,12 @@ def test_final_nonflat_or_unrelated_state_fails_manual_recovery(tmp_path):
 
     def evidence(intent):
         return terminal(
-            intent, filled="0.0001",
-            position="0.0001" if intent.kind == "OPEN" else "0",
+            intent, filled="25",
+            position="25" if intent.kind == "OPEN" else "0",
         )
 
     capability = Capability(
-        [state(), state("0.0001"), state(orders=(ORDER_IDS[4],))], evidence,
+        [state(), state("25"), state(orders=(ORDER_IDS[4],))], evidence,
     )
     report = asyncio.run(candidate.run(capability))
     assert report.result is RunnerResult.FAILED_HALTED_MANUAL_RECOVERY

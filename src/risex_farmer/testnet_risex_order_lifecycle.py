@@ -22,6 +22,11 @@ OFFICIAL_HOST = "api.testnet.rise.trade"
 OFFICIAL_CHAIN_ID = 11_155_931
 OFFICIAL_DOMAIN_NAME = "RISEx"
 OFFICIAL_DOMAIN_VERSION = "1"
+OFFICIAL_MARKET_ID = 29
+OFFICIAL_MARKET_SYMBOL = "ONDO/USDC"
+OFFICIAL_MARKET_TICK = Decimal("0.00001")
+OFFICIAL_MARKET_STEP = Decimal("0.1")
+OFFICIAL_MARKET_MINIMUM = Decimal("25")
 MAX_NOTIONAL_USD = Decimal("500")
 BOUND_BPS = Decimal("30")
 MAX_AGE_SECONDS = 5
@@ -834,9 +839,13 @@ class Lifecycle:
             value.host != OFFICIAL_HOST or value.chain_id != OFFICIAL_CHAIN_ID
             or value.domain_name != OFFICIAL_DOMAIN_NAME
             or value.domain_version != OFFICIAL_DOMAIN_VERSION
-            or router != self._router or value.market_id != 1
+            or router != self._router or value.market_id != OFFICIAL_MARKET_ID
             or authorization != self._authorization
-            or value.symbol != "BTC/USDC" or not value.active or not value.unlocked
+            or value.symbol != OFFICIAL_MARKET_SYMBOL
+            or value.tick != OFFICIAL_MARKET_TICK
+            or value.step != OFFICIAL_MARKET_STEP
+            or value.minimum != OFFICIAL_MARKET_MINIMUM
+            or not value.active or not value.unlocked
             or not self._fresh(value.observed_at) or value.tick <= 0 or value.step <= 0
             or not _aligned(value.minimum, value.step)
         ):

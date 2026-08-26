@@ -46,9 +46,9 @@ def market() -> MarketState:
     return MarketState(
         host="api.testnet.rise.trade", chain_id=OFFICIAL_CHAIN_ID,
         domain_name=OFFICIAL_DOMAIN_NAME, domain_version=OFFICIAL_DOMAIN_VERSION,
-        router=ROUTER, authorization=AUTHORIZATION, market_id=1,
-        symbol="BTC/USDC", active=True, unlocked=True, tick=Decimal("0.1"),
-        step=Decimal("0.000001"), minimum=Decimal("0.0001"), observed_at=NOW,
+        router=ROUTER, authorization=AUTHORIZATION, market_id=29,
+        symbol="ONDO/USDC", active=True, unlocked=True, tick=Decimal("0.00001"),
+        step=Decimal("0.1"), minimum=Decimal("25"), observed_at=NOW,
     )
 
 
@@ -63,8 +63,8 @@ def account(signer: str, *, position: str = "0") -> AccountState:
 
 def bbo() -> BBO:
     return BBO(
-        bid=Decimal("77982.9"), ask=Decimal("77983.0"),
-        bid_depth=Decimal("0.001"), ask_depth=Decimal("0.001"), observed_at=NOW,
+        bid=Decimal("0.79900"), ask=Decimal("0.80000"),
+        bid_depth=Decimal("25"), ask_depth=Decimal("25"), observed_at=NOW,
     )
 
 
@@ -225,7 +225,7 @@ def test_place_is_signed_only_after_durable_intent_and_dispatch_claim(tmp_path):
     assert persisted.state == "DISPATCHED" and persisted.order_id == OPEN_ORDER
     path, body = transport.calls[0]
     assert path == PLACE_PATH
-    assert body["price_ticks"] == intent.price_ticks == 782170
+    assert body["price_ticks"] == intent.price_ticks == 80240
     assert set(body) == {
         "market_id", "size_steps", "price_ticks", "side", "post_only",
         "reduce_only", "stp_mode", "order_type", "time_in_force",
@@ -311,7 +311,7 @@ def test_cancel_signs_resting_identity_but_posts_exact_composite_identity(tmp_pa
         Evidence(
             account=ACCOUNT, signer=signer, signer_status="ACTIVE", terminal=False,
             filled_size=Decimal("0"), position=Decimal("0"), observed_at=NOW,
-            position_market_id=1, by_id_order=record, open_orders=(record,),
+            position_market_id=29, by_id_order=record, open_orders=(record,),
             history_orders=(record,),
         ),
     )
@@ -350,7 +350,7 @@ def test_cancel_rejects_any_action_permit_or_body_substitution_before_transport(
         Evidence(
             account=ACCOUNT, signer=signer, signer_status="ACTIVE", terminal=False,
             filled_size=Decimal("0"), position=Decimal("0"), observed_at=NOW,
-            position_market_id=1, by_id_order=record, open_orders=(record,),
+            position_market_id=29, by_id_order=record, open_orders=(record,),
             history_orders=(record,),
         ),
     )

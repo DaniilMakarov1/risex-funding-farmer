@@ -39,8 +39,8 @@ from .testnet_risex_private_read_operational import (
     _safe_file,
 )
 from .testnet_risex_private_read_preflight import (
-    ACCOUNT, AUTHORIZATION, MAX_BOUND_FRACTION, MINIMUM, REST_ORIGIN,
-    ROUTER, SIGNER, PrivateReadPreflight,
+    ACCOUNT, AUTHORIZATION, MARKET_ID, MARKET_SYMBOL, MAX_BOUND_FRACTION,
+    MINIMUM, REST_ORIGIN, ROUTER, SIGNER, STEP, TICK, PrivateReadPreflight,
 )
 
 
@@ -179,11 +179,12 @@ class _ProductionReadCapability:
         market_response = await self._transport.public_get(4)
         book_response = await self._transport.public_get(5)
         market_data = self._validator._validate_response(
-            "/v1/markets", (("force_refresh", "true"), ("market_ids", "1")),
+            "/v1/markets", (("force_refresh", "true"),
+                              ("market_ids", str(MARKET_ID))),
             market_response,
         )
         book_data = self._validator._validate_response(
-            "/v1/orderbook", (("market_id", "1"),), book_response,
+            "/v1/orderbook", (("market_id", str(MARKET_ID)),), book_response,
         )
         parsed_market = PrivateReadPreflight._validate_market(
             market_data, self._clock(),
@@ -198,7 +199,7 @@ class _ProductionReadCapability:
         market = MarketState(
             host=REST_ORIGIN.removeprefix("https://"), chain_id=11_155_931,
             domain_name="RISEx", domain_version="1", router=ROUTER,
-            authorization=AUTHORIZATION, market_id=1, symbol="BTC/USDC",
+            authorization=AUTHORIZATION, market_id=MARKET_ID, symbol=MARKET_SYMBOL,
             active=parsed_market["active"],
             unlocked=parsed_market["config"]["unlocked"],
             tick=Decimal(parsed_market["config"]["step_price"]),
@@ -212,8 +213,11 @@ class _ProductionReadCapability:
             ask_depth=sum(size for price, size in asks if price <= upper),
             observed_at=int(book_response.observed_at),
         )
-        if market.minimum != MINIMUM:
-            raise LifecycleSafetyError("RISEx Level C minimum rejected")
+        if (
+            market.tick != TICK or market.step != STEP
+            or market.minimum != MINIMUM
+        ):
+            raise LifecycleSafetyError("RISEx Level C grid or minimum rejected")
         return market, bbo
 
     async def _full_public_prestate(self) -> int:
@@ -249,7 +253,7 @@ class _ProductionReadCapability:
             raise LifecycleSafetyError("RISEx Level C order schema rejected")
         if (
             not _valid_order_id(value["id"])
-            or str(value["market_id"]) != "1"
+            or str(value["market_id"]) != str(MARKET_ID)
             or str(value["sender"]).lower() != ACCOUNT
             or value["status"] not in {
                 "ORDER_STATUS_OPEN", "ORDER_STATUS_FILLED",
@@ -295,7 +299,8 @@ class _ProductionReadCapability:
     ) -> tuple[tuple[Mapping[str, Any], ...], int]:
         if (
             not isinstance(value, Mapping) or value.get("channel") != "orders"
-            or value.get("type") != "update" or str(value.get("market_id")) != "1"
+            or value.get("type") != "update"
+            or str(value.get("market_id")) != str(MARKET_ID)
             or not isinstance(value.get("data"), list)
             or not isinstance(value.get("worker_timestamp"), str)
         ):
@@ -324,7 +329,7 @@ class _ProductionReadCapability:
                     "log_index", "worker_timestamp",
                 }
                 or value.get("channel") != "positions"
-                or str(value.get("market_id")) != "1"
+                or str(value.get("market_id")) != str(MARKET_ID)
                 or not isinstance(value.get("data"), list)
                 or not isinstance(value.get("block_number"), int)
                 or not isinstance(value.get("log_index"), int)
@@ -361,7 +366,7 @@ class _ProductionReadCapability:
             if market_id <= 0 or market_id in markets or not size.is_finite():
                 raise LifecycleSafetyError("RISEx Level C position rejected")
             markets.add(market_id)
-            if market_id == 1:
+            if market_id == MARKET_ID:
                 position = size
             elif size != 0:
                 unexplained = True
@@ -582,7 +587,7 @@ class _ProductionReadCapability:
                     account=ACCOUNT, signer=SIGNER, signer_status="ACTIVE",
                     terminal=True, filled_size=Decimal("0"),
                     position=Decimal("0"), observed_at=observed_at,
-                    position_market_id=1,
+                    position_market_id=MARKET_ID,
                 )
             row = self._updates.pop(intent.client_order_id, None)
         if row is None:
@@ -616,7 +621,7 @@ class _ProductionReadCapability:
             account=ACCOUNT, signer=SIGNER, signer_status="ACTIVE",
             terminal=terminal, filled_size=filled, position=position,
             observed_at=int(Decimal(observed_ns) / Decimal(1_000_000_000)),
-            position_market_id=1, by_id_order=order,
+            position_market_id=MARKET_ID, by_id_order=order,
             open_orders=() if terminal else (order,), history_orders=(order,),
             fills=(FillRecord(order.order_id, intent.client_order_id),)
             if filled > 0 else (),
