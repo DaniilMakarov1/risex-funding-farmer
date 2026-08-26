@@ -1263,6 +1263,61 @@ def _list_data(
     return list(rows), cursor
 
 
+def _limit_price_config(
+    market: Mapping[str, Any],
+) -> tuple[Decimal, Decimal, Decimal, Decimal]:
+    if not isinstance(market, Mapping):
+        _fail("MARKET_SCHEMA", "SCHEMA")
+    config = market.get("tradingConfig")
+    stats = market.get("marketStats")
+    if not isinstance(config, Mapping) or not isinstance(stats, Mapping):
+        _fail("MARKET_SCHEMA", "SCHEMA")
+    mark_price = _decimal(stats.get("markPrice"), "MARK_PRICE_SCHEMA")
+    cap = _decimal(config.get("limitPriceCap"), "PRICE_CAP_SCHEMA")
+    floor = _decimal(config.get("limitPriceFloor"), "PRICE_FLOOR_SCHEMA")
+    tick = _decimal(config.get("minPriceChange"), "PRICE_TICK_SCHEMA")
+    if mark_price <= 0:
+        _fail("MARK_PRICE_INVALID")
+    if not 0 <= cap <= 1:
+        _fail("PRICE_CAP_INVALID")
+    if not 0 <= floor <= 1:
+        _fail("PRICE_FLOOR_INVALID")
+    if tick <= 0:
+        _fail("PRICE_TICK_INVALID")
+    return mark_price, cap, floor, tick
+
+
+def _validate_limit_price(
+    observation: RestObservation,
+    *,
+    side: str,
+    price: Decimal,
+) -> None:
+    mark_price, cap, floor, tick = _limit_price_config(observation.market)
+    actual_price = _decimal(price, "PRICE_SCHEMA")
+    try:
+        tick_aligned = actual_price % tick == 0
+    except (InvalidOperation, ValueError):
+        tick_aligned = False
+    if actual_price <= 0 or not tick_aligned:
+        _fail("PRICE_OFF_GRID")
+    try:
+        if side == "BUY":
+            bound = mark_price * (Decimal(1) + cap)
+            invalid = actual_price > bound
+        elif side == "SELL":
+            bound = mark_price * (Decimal(1) - floor)
+            invalid = actual_price < bound
+        else:
+            _fail("ORDER_SIDE_INVALID")
+    except (InvalidOperation, OverflowError):
+        _fail("PRICE_BOUND_INVALID")
+    if not bound.is_finite():
+        _fail("PRICE_BOUND_INVALID")
+    if invalid:
+        _fail("PRICE_BOUND_INVALID")
+
+
 def _validate_fresh(observation: RestObservation, now_ms: int) -> None:
     server_fresh = (
         observation.server_time_ms is None
@@ -1448,6 +1503,7 @@ class OperationalVenueIO:
             or max_leverage <= 0
         ):
             _fail("MARKET_SAFETY_GATE")
+        _limit_price_config(value)
         return value
 
     @staticmethod
@@ -1984,10 +2040,7 @@ class SealedLifecycleRunner:
             or self._top_level_qty(observation.book["bids"]) < qty
         ):
             _fail("TOP_LEVEL_DEPTH_INSUFFICIENT")
-        cap = _decimal(config.get("limitPriceCap"), "PRICE_CAP_SCHEMA")
-        floor = _decimal(config.get("limitPriceFloor"), "PRICE_FLOOR_SCHEMA")
-        if price < floor or price > cap:
-            _fail("PRICE_BOUND_INVALID")
+        _validate_limit_price(observation, side="BUY", price=price)
         if qty * price > MAX_NOTIONAL_USD:
             _fail("NOTIONAL_CAP")
         if observation.balance.get("collateralName") != observation.market.get("collateralAssetName"):
@@ -2217,14 +2270,14 @@ class SealedLifecycleRunner:
         size = _decimal(position["size"], "POSITION_SIZE_SCHEMA")
         bid, ask = self._book_prices(observation)
         price = bid if position["side"] == "LONG" else ask
-        config = observation.market["tradingConfig"]
         close_levels = observation.book["bids"] if position["side"] == "LONG" else observation.book["asks"]
         if self._top_level_qty(close_levels) < size:
             _fail("TOP_LEVEL_DEPTH_INSUFFICIENT")
-        cap = _decimal(config.get("limitPriceCap"), "PRICE_CAP_SCHEMA")
-        floor = _decimal(config.get("limitPriceFloor"), "PRICE_FLOOR_SCHEMA")
-        if price < floor or price > cap:
-            _fail("PRICE_BOUND_INVALID")
+        _validate_limit_price(
+            observation,
+            side="SELL" if position["side"] == "LONG" else "BUY",
+            price=price,
+        )
         if size * price > MAX_NOTIONAL_USD:
             _fail("NOTIONAL_CAP")
         fee_rows = tuple(row for row in observation.fees if row.get("market") == TARGET_MARKET)

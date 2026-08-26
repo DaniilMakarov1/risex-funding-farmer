@@ -60,8 +60,8 @@
       "maxPositionValue": "500000",
       "maxLeverage": "20",
       "maxNumOrders": 100,
-      "limitPriceCap": "50000",
-      "limitPriceFloor": "30000",
+      "limitPriceCap": "0.05",
+      "limitPriceFloor": "0.05",
       "riskFactorConfig": [
         {"upperBound": "500000", "riskFactor": "0.05"}
       ]

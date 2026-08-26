@@ -626,6 +626,125 @@ def test_close_rejects_deeper_depth_when_top_bid_cannot_fill_exact_position(tmp_
     assert [item.kind for item in store.all()] == ["ENTRY"]
 
 
+@pytest.mark.parametrize(
+    ("ask", "allowed"),
+    [("42005", True), ("42006", False)],
+)
+def test_entry_uses_mark_relative_buy_price_cap(tmp_path, no_sleep, ask, allowed):
+    io = FixtureIO()
+    path = tmp_path / f"buy-cap-{ask}.sqlite3"
+    store = OperationalIntentStore(path)
+    runner = SealedLifecycleRunner(
+        store=store, journal=RuntimeRunJournal(path),
+        io=io, capability=FakeSigner(), identity=IDENTITY,
+    )
+    observation = io.observe(())
+    book = copy.deepcopy(observation.book)
+    book["asks"] = [{"price": ask, "qty": "0.010"}]
+    candidate = copy.copy(observation)
+    object.__setattr__(candidate, "book", book)
+    if allowed:
+        intent = runner._prepare_entry(candidate)
+        assert intent.side == "BUY"
+        assert intent.price == Decimal(ask)
+    else:
+        with pytest.raises(OperationalSafetyError, match="PRICE_BOUND_INVALID"):
+            runner._prepare_entry(candidate)
+        assert store.all() == ()
+
+
+@pytest.mark.parametrize(
+    ("bid", "allowed"),
+    [("38005", True), ("38004", False)],
+)
+def test_close_uses_mark_relative_sell_price_floor(tmp_path, no_sleep, bid, allowed):
+    io = FixtureIO()
+    path = tmp_path / f"sell-floor-{bid}.sqlite3"
+    store = OperationalIntentStore(path)
+    runner = SealedLifecycleRunner(
+        store=store, journal=RuntimeRunJournal(path),
+        io=io, capability=FakeSigner(), identity=IDENTITY,
+    )
+    initial = io.observe(())
+    runner._last_observation = initial
+    entry = runner._prepare_entry(initial)
+    store.claim(entry.id, expected_lifecycle="ENTRY_PREPARED", next_lifecycle="ENTRY_AMBIGUOUS")
+    signed = runner.capability.sign_order(store.get(entry.id), initial.market)
+    store.bind_signed(entry.id, payload=signed.payload, payload_digest=canonical_digest(signed.payload))
+    store.mark_accepted(entry.id, "90001", entry.external_id)
+    store.mark_reconciled(entry.id)
+    io.phase = "ENTRY_FILLED"
+    filled = io.observe((store.get(entry.id),))
+    book = copy.deepcopy(filled.book)
+    book["bids"] = [{"price": bid, "qty": "0.010"}]
+    candidate = copy.copy(filled)
+    object.__setattr__(candidate, "book", book)
+    if allowed:
+        close = runner._prepare_close(entry, candidate)
+        assert close.side == "SELL"
+        assert close.price == Decimal(bid)
+    else:
+        with pytest.raises(OperationalSafetyError, match="PRICE_BOUND_INVALID"):
+            runner._prepare_close(entry, candidate)
+        assert [item.kind for item in store.all()] == ["ENTRY"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "reason"),
+    [
+        (("marketStats", "markPrice"), None, "MARK_PRICE_SCHEMA"),
+        (("marketStats", "markPrice"), "0", "MARK_PRICE_INVALID"),
+        (("marketStats", "markPrice"), "-1", "MARK_PRICE_INVALID"),
+        (("marketStats", "markPrice"), "not-a-price", "MARK_PRICE_SCHEMA"),
+        (("tradingConfig", "limitPriceCap"), "-0.01", "PRICE_CAP_INVALID"),
+        (("tradingConfig", "limitPriceCap"), "1.01", "PRICE_CAP_INVALID"),
+        (("tradingConfig", "limitPriceCap"), "not-a-ratio", "PRICE_CAP_SCHEMA"),
+        (("tradingConfig", "limitPriceFloor"), "-0.01", "PRICE_FLOOR_INVALID"),
+        (("tradingConfig", "limitPriceFloor"), "1.01", "PRICE_FLOOR_INVALID"),
+        (("tradingConfig", "limitPriceFloor"), "not-a-ratio", "PRICE_FLOOR_SCHEMA"),
+    ],
+)
+def test_limit_price_rejects_bad_mark_or_ratio_configuration(
+    tmp_path, no_sleep, field, value, reason,
+):
+    io = FixtureIO()
+    path = tmp_path / "invalid-price-config.sqlite3"
+    store = OperationalIntentStore(path)
+    runner = SealedLifecycleRunner(
+        store=store, journal=RuntimeRunJournal(path),
+        io=io, capability=FakeSigner(), identity=IDENTITY,
+    )
+    observation = io.observe(())
+    market = copy.deepcopy(observation.market)
+    target = market
+    for key in field[:-1]:
+        target = target[key]
+    target[field[-1]] = value
+    candidate = copy.copy(observation)
+    object.__setattr__(candidate, "market", market)
+    with pytest.raises(OperationalSafetyError, match=reason):
+        runner._prepare_entry(candidate)
+    assert store.all() == ()
+
+
+def test_limit_price_requires_tick_aligned_actual_price(tmp_path, no_sleep):
+    io = FixtureIO()
+    path = tmp_path / "off-grid-price.sqlite3"
+    store = OperationalIntentStore(path)
+    runner = SealedLifecycleRunner(
+        store=store, journal=RuntimeRunJournal(path),
+        io=io, capability=FakeSigner(), identity=IDENTITY,
+    )
+    observation = io.observe(())
+    book = copy.deepcopy(observation.book)
+    book["asks"] = [{"price": "40010.5", "qty": "0.010"}]
+    candidate = copy.copy(observation)
+    object.__setattr__(candidate, "book", book)
+    with pytest.raises(OperationalSafetyError, match="PRICE_OFF_GRID"):
+        runner._prepare_entry(candidate)
+    assert store.all() == ()
+
+
 def test_ambiguous_place_is_durable_and_never_replayed(tmp_path, no_sleep):
     class AmbiguousIO(FixtureIO):
         def place_order(self, intent, payload):
