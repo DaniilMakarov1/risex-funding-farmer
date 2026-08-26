@@ -4,11 +4,12 @@ One slice per venue. Apply the A/B/C levels and safety core from `AGENTS.md`; op
 
 ## RISEx — fill-seeking taker lifecycle
 
-Status: `PRICE-BOUND PROVED; ALTERNATE EXECUTABLE PRODUCT CORRECTION READY`.
+Status: `ETH ZERO-FILL CLOSED; BLOCKED ON CURRENT TESTNET MATCHING`.
 
 - The accepted BUY `MARKET+IOC` now sends the exact validated ask-side adverse bound and the venue accepted its authoritative identity, but the BTC/USDC order still reconciled terminal zero-fill/flat. Two independent final observations and protected local recovery completed with no replay or venue recovery write. Do not repeat BTC unchanged.
-- Current public evidence shows unlocked ONDO/USDC market 29 with five ask orders and materially broader aggregate depth, unlike the persistent single-ask BTC book. Open one fresh Luna-max Builder from current `main` to retarget only the isolated sealed lifecycle and its venue-local fixtures/constants to fixed market 29 and its current official grid/minimum. Preserve signing, bounded price derivation, durable identity, no replay, reconciliation, reduce-only close, and final zero-order/exact-flat barriers; do not introduce dynamic product selection or shared execution abstractions.
-- After Chief review/integration, require a fresh authoritative zero-order/exact-flat pre-state and exactly one sequential sealed Level C lifecycle. Any further zero fill requires new matching evidence rather than another unchanged write.
+- The accepted fixed ONDO attempt dispatched once, received an authoritative order ID, reconciled terminal zero-fill, and ended with two independent zero-order/exact-flat/consumed-nonce observations plus protected local outcome recovery. Do not repeat ONDO unchanged. Its displayed book was stale as execution evidence: latest public trade was about 31 hours old.
+- The accepted fixed ETH/USDC market-2 correction passed its full verification. One fresh pre-state proved zero orders/exact flatness; exactly one minimum `0.1` `MARKET+IOC` was accepted with an authoritative order ID, reconciled terminal zero-fill/flat, and consumed its nonce. Two independent final observations again proved zero orders, exact flatness, and no unexplained state; protected local outcome recovery completed with no replay or venue recovery write.
+- Do not repeat BTC, ONDO, ETH, or select another RISEx product without materially new execution evidence. The remaining blocker is current testnet matching, not signing, bound encoding, identity, or reconciliation. Keep this lane idle while Extended advances.
 
 ## Nado — sequential Level C lifecycle
 

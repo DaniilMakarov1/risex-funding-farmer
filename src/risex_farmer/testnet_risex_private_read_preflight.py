@@ -35,9 +35,11 @@ SIGNER_LABEL = "RISEx Funding Farmer testnet probe"
 MAX_AGE_SECONDS = 5
 MAX_NOTIONAL = Decimal("500")
 MAX_BOUND_FRACTION = Decimal("0.003")
-MINIMUM = Decimal("0.0001")
-STEP = Decimal("0.000001")
-TICK = Decimal("0.1")
+MARKET_ID = 2
+MARKET_SYMBOL = "ETH/USDC"
+MINIMUM = Decimal("0.1")
+STEP = Decimal("0.001")
+TICK = Decimal("0.01")
 
 
 class Outcome(str, Enum):
@@ -287,10 +289,10 @@ class PrivateReadPreflight:
         ("/v1/auth/eip712-domain", ()),
         ("/v1/auth/session-key-status", (("account", ACCOUNT), ("signer", SIGNER))),
         ("/v1/auth/signers", (("account", ACCOUNT),)),
-        ("/v1/markets", (("force_refresh", "true"), ("market_ids", "1"))),
-        ("/v1/orderbook", (("market_id", "1"),)),
+        ("/v1/markets", (("force_refresh", "true"), ("market_ids", str(MARKET_ID)))),
+        ("/v1/orderbook", (("market_id", str(MARKET_ID)),)),
         ("/v1/orders/open", (("account", ACCOUNT),)),
-        ("/v1/account/position", (("account", ACCOUNT), ("market_id", "1"))),
+        ("/v1/account/position", (("account", ACCOUNT), ("market_id", str(MARKET_ID)))),
         ("/v1/positions", (("account", ACCOUNT),)),
     )
 
@@ -323,7 +325,6 @@ class PrivateReadPreflight:
                 self._block(18)
             return None
         count = 0
-        observations: list[float] = []
         try:
             if not self._store.start_public_attempt():
                 raise ValueError("public attempt already consumed")
@@ -336,15 +337,9 @@ class PrivateReadPreflight:
                     count += 1
                     response = await _await(self._public_get(path, query))
                     responses[path] = self._validate_response(path, query, response)
-                    observations.append(_finite_time(response.observed_at))
                 sweeps.append(self._validate_sweep(responses))
             if (
                 sweeps[0] != sweeps[1] or self._lifecycle_clear() is not True
-                or any(
-                    self._now() - observed < 0
-                    or self._now() - observed > MAX_AGE_SECONDS
-                    for observed in observations
-                )
             ):
                 raise ValueError("inconsistent sweeps")
             self._barrier = _Barrier(self._owner, self._now())
@@ -484,18 +479,18 @@ class PrivateReadPreflight:
             or type(config["unlocked"]) is not bool or config["unlocked"] is not True
         ):
             raise ValueError("market field type mismatch")
-        full_symbol = "BTC/USDC"
+        full_symbol = MARKET_SYMBOL
         if (
-            market["market_id"] != "1"
+            market["market_id"] != str(MARKET_ID)
             or market["quote_asset_symbol"] != "USDC" or not config["quote"]
             or any(market[field] != full_symbol for field in {
                 "base_asset_symbol", "display_base_asset_symbol", "display_name",
                 "underlying",
             })
             or config["name"] != full_symbol
-            or config["step_size"] != "0.000001"
-            or config["step_price"] != "0.1"
-            or config["min_order_size"] != "0.0001"
+            or config["step_size"] != str(STEP)
+            or config["step_price"] != str(TICK)
+            or config["min_order_size"] != str(MINIMUM)
         ):
             raise ValueError("market mismatch")
         signed_decimal_fields = {
@@ -503,10 +498,11 @@ class PrivateReadPreflight:
             "funding_rate_8h", "last_cumulative_funding", "predicted_funding_rate",
         }
         positive_decimal_fields = {
-            "high_24h", "index_price", "last_price", "low_24h", "mark_price",
-            "max_position_size",
+            "index_price", "last_price", "mark_price", "max_position_size",
         }
-        nonnegative_decimal_fields = {"open_interest", "quote_volume_24h"}
+        nonnegative_decimal_fields = {
+            "high_24h", "low_24h", "open_interest", "quote_volume_24h",
+        }
         for field in signed_decimal_fields:
             _decimal(market[field])
         if any(_decimal(market[field]) <= 0 for field in positive_decimal_fields):
@@ -535,7 +531,7 @@ class PrivateReadPreflight:
         book = _mapping(
             value, {"asks", "bids", "market_id", "total_asks", "total_bids"},
         )
-        if book["market_id"] != "1":
+        if book["market_id"] != str(MARKET_ID):
             raise ValueError("book identity mismatch")
         bids = PrivateReadPreflight._levels(book["bids"])
         asks = PrivateReadPreflight._levels(book["asks"])

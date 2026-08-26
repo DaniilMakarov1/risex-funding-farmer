@@ -15,13 +15,19 @@ from risex_farmer.testnet_risex_private_read_preflight import (
     DOMAIN_NAME,
     DOMAIN_VERSION,
     HttpResponse,
+    MAX_AGE_SECONDS,
+    MARKET_ID,
+    MARKET_SYMBOL,
+    MINIMUM,
     Outcome,
     PrivateReadPreflight,
     PrivateReadStore,
     REGISTERED_AT,
     ROUTER,
     SIGNER,
+    STEP,
     SyntheticCredential,
+    TICK,
     WS_ORIGIN,
     expected_url,
 )
@@ -71,50 +77,54 @@ def public_bodies():
             "markets": [{
                 "accumulated_funding": "0",
                 "active": True,
-                "base_asset_symbol": "BTC/USDC",
+                "base_asset_symbol": "ETH/USDC",
                 "change_24h": "0.01",
                 "config": {
                     "maintenance_margin_factor": "0.05",
                     "max_leverage": "20",
-                    "min_order_size": "0.0001",
-                    "name": "BTC/USDC",
+                    "min_order_size": "0.1",
+                    "name": "ETH/USDC",
                     "open_interest_limit": "1000",
                     "quote": "USDC",
-                    "step_price": "0.1",
-                    "step_size": "0.000001",
+                    "step_price": "0.01",
+                    "step_size": "0.001",
                     "unlocked": True,
                 },
                 "current_funding_rate": "0.0001",
-                "display_base_asset_symbol": "BTC/USDC",
-                "display_name": "BTC/USDC",
+                "display_base_asset_symbol": "ETH/USDC",
+                "display_name": "ETH/USDC",
                 "funding_interval": "3600",
                 "funding_rate_8h": "0.0008",
-                "high_24h": "79000",
-                "index_price": "77963.3",
+                "high_24h": "3200.00",
+                "index_price": "3000.00",
                 "last_cumulative_funding": "0",
-                "last_price": "77963.3",
-                "low_24h": "76000",
-                "mark_price": "77963.4",
-                "market_id": "1",
-                "max_position_size": "1",
+                "last_price": "3000.00",
+                "low_24h": "2800.00",
+                "mark_price": "3000.00",
+                "market_id": "2",
+                "max_position_size": "1000000",
                 "next_funding_time": "1787576400000000000",
                 "open_interest": "100",
                 "post_only": False,
                 "predicted_funding_rate": "0.0001",
                 "quote_asset_symbol": "USDC",
                 "quote_volume_24h": "1000000",
-                "underlying": "BTC/USDC",
+                "underlying": "ETH/USDC",
             }],
         }),
         "/v1/orderbook": envelope({
-            "market_id": "1",
+            "market_id": "2",
             "bids": [{
-                "order_count": 1, "price": "77963.3", "quantity": "0.0001",
+                "order_count": 1, "price": "2999.00", "quantity": "0.1",
             }],
-            "asks": [{
-                "order_count": 1, "price": "77963.4", "quantity": "0.0001",
-            }],
-            "total_asks": "1",
+            "asks": [
+                {"order_count": 1, "price": "3000.00", "quantity": "0.1"},
+                {"order_count": 1, "price": "3000.01", "quantity": "0.1"},
+                {"order_count": 1, "price": "3000.02", "quantity": "0.1"},
+                {"order_count": 1, "price": "3000.03", "quantity": "0.1"},
+                {"order_count": 1, "price": "3000.04", "quantity": "0.1"},
+            ],
+            "total_asks": "5",
             "total_bids": "1",
         }),
         "/v1/orders/open": envelope({"orders": []}),
@@ -137,6 +147,104 @@ def current_public_contract(path):
 def test_captured_public_contract_shape_is_accepted(path, validator):
     result = getattr(PrivateReadPreflight, validator)(current_public_contract(path), NOW)
     assert result is not None
+
+
+def test_fixed_eth_market_binds_id_symbol_grid_minimum_and_depth():
+    data = current_public_contract("/v1/markets")
+    market = data["markets"][0]
+    config = market["config"]
+    book = current_public_contract("/v1/orderbook")
+
+    assert (MARKET_ID, MARKET_SYMBOL, TICK, STEP, MINIMUM) == (
+        2, "ETH/USDC", Decimal("0.01"), Decimal("0.001"), Decimal("0.1"),
+    )
+    assert market["market_id"] == "2" and market["base_asset_symbol"] == "ETH/USDC"
+    assert config["step_price"] == "0.01"
+    assert config["step_size"] == "0.001"
+    assert config["min_order_size"] == "0.1"
+    assert book["market_id"] == "2" and len(book["asks"]) == 5
+    assert all(level["quantity"] == "0.1" for level in book["asks"])
+
+
+def test_market_accepts_zero_unused_24h_high_and_low_statistics():
+    data = current_public_contract("/v1/markets")
+    market = data["markets"][0]
+    market["high_24h"] = "0"
+    market["low_24h"] = "0"
+
+    assert PrivateReadPreflight._validate_market(data, NOW) is not None
+
+
+@pytest.mark.parametrize("field", ["high_24h", "low_24h"])
+@pytest.mark.parametrize("value", ["-0.00001", "NaN", "Infinity", "not-a-decimal", 0])
+def test_market_rejects_invalid_24h_statistics(field, value):
+    data = current_public_contract("/v1/markets")
+    data["markets"][0][field] = value
+
+    with pytest.raises(ValueError):
+        PrivateReadPreflight._validate_market(data, NOW)
+
+
+@pytest.mark.parametrize(
+    "field", ["index_price", "mark_price", "last_price", "max_position_size"],
+)
+def test_market_rejects_zero_execution_critical_fields(field):
+    data = current_public_contract("/v1/markets")
+    data["markets"][0][field] = "0"
+
+    with pytest.raises(ValueError):
+        PrivateReadPreflight._validate_market(data, NOW)
+
+
+@pytest.mark.parametrize("mutation", [
+    "market_id", "symbol", "step_price", "step_size", "minimum",
+])
+def test_previous_fixed_market_contract_is_rejected(mutation):
+    data = current_public_contract("/v1/markets")
+    market = data["markets"][0]
+    if mutation == "market_id":
+        market["market_id"] = "1"
+    elif mutation == "symbol":
+        market["base_asset_symbol"] = "BTC/USDC"
+    elif mutation == "step_price":
+        market["config"]["step_price"] = "0.1"
+    elif mutation == "step_size":
+        market["config"]["step_size"] = "0.000001"
+    else:
+        market["config"]["min_order_size"] = "0.0001"
+
+    with pytest.raises(ValueError):
+        PrivateReadPreflight._validate_market(data, NOW)
+
+
+def test_stale_ondo_market_and_book_identity_are_rejected():
+    data = current_public_contract("/v1/markets")
+    market = data["markets"][0]
+    for field in (
+        "base_asset_symbol", "display_base_asset_symbol", "display_name",
+        "underlying",
+    ):
+        market[field] = "ONDO/USDC"
+    market["market_id"] = "29"
+    market["config"].update({
+        "name": "ONDO/USDC", "step_price": "0.00001",
+        "step_size": "0.1", "min_order_size": "25",
+    })
+    with pytest.raises(ValueError):
+        PrivateReadPreflight._validate_market(data, NOW)
+
+    book = current_public_contract("/v1/orderbook")
+    book["market_id"] = "29"
+    with pytest.raises(ValueError):
+        PrivateReadPreflight._validate_book(book, NOW)
+
+
+def test_previous_fixed_book_market_id_is_rejected():
+    data = current_public_contract("/v1/orderbook")
+    data["market_id"] = "1"
+
+    with pytest.raises(ValueError):
+        PrivateReadPreflight._validate_book(data, NOW)
 
 
 def test_official_market_contract_accepts_zero_open_interest_limit():
@@ -234,15 +342,15 @@ def test_captured_public_contract_rejects_nested_and_scalar_drift(case):
 def test_orderbook_totals_may_include_levels_before_response_limit():
     data = current_public_contract("/v1/orderbook")
     data["total_bids"] = "2"
-    data["total_asks"] = "3"
+    data["total_asks"] = "6"
     bids, asks = PrivateReadPreflight._validate_book(data, NOW)
-    assert len(bids) == len(asks) == 1
+    assert len(bids) == 1 and len(asks) == 5
 
 
 def test_orderbook_totals_cannot_be_less_than_returned_levels():
     data = current_public_contract("/v1/orderbook")
     data["bids"].append({
-        "order_count": 1, "price": "77963.2", "quantity": "0.0001",
+        "order_count": 1, "price": "2998.00", "quantity": "0.1",
     })
     with pytest.raises(ValueError):
         PrivateReadPreflight._validate_book(data, NOW)
@@ -272,10 +380,10 @@ def expected_public_calls():
         ("/v1/auth/eip712-domain", ()),
         ("/v1/auth/session-key-status", account + (("signer", SIGNER),)),
         ("/v1/auth/signers", account),
-        ("/v1/markets", (("force_refresh", "true"), ("market_ids", "1"))),
-        ("/v1/orderbook", (("market_id", "1"),)),
+        ("/v1/markets", (("force_refresh", "true"), ("market_ids", "2"))),
+        ("/v1/orderbook", (("market_id", "2"),)),
         ("/v1/orders/open", account),
-        ("/v1/account/position", account + (("market_id", "1"),)),
+        ("/v1/account/position", account + (("market_id", "2"),)),
         ("/v1/positions", account),
     ]
 
@@ -299,7 +407,7 @@ def test_exact_official_empty_private_snapshots_are_accepted():
 def test_official_closed_position_row_is_authoritatively_flat():
     closed = {
         "account": ACCOUNT,
-        "market_id": "1",
+        "market_id": "2",
         "size": "0",
         "quote_amount": "0",
         "side": "SELL",
@@ -324,12 +432,12 @@ def test_official_closed_position_row_is_authoritatively_flat():
 def test_position_rows_fail_closed_on_nonflat_or_invalid_identity(mutation):
     closed = {
         "account": ACCOUNT,
-        "market_id": "1",
+        "market_id": "2",
         "size": "0",
     }
     rows = [closed]
     if mutation == "nonzero":
-        closed["size"] = "-0.000001"
+        closed["size"] = "-0.1"
     elif mutation == "invalid_size":
         closed["size"] = "not-decimal"
     elif mutation == "account":
@@ -347,7 +455,7 @@ def test_position_rows_fail_closed_on_nonflat_or_invalid_identity(mutation):
 def test_checksum_case_account_and_negative_zero_are_flat():
     closed = {
         "account": "0x" + ACCOUNT[2:].upper(),
-        "market_id": "1",
+        "market_id": "2",
         "size": "-0",
     }
     PrivateReadPreflight._validate_private_frames(
@@ -601,7 +709,7 @@ async def test_public_identity_and_cross_sweep_contradictions_block(tmp_path, ca
         elif case == "market":
             body["data"]["markets"][0]["active"] = False
         else:
-            body["data"]["asks"][0]["price"] = "77963.5"
+            body["data"]["asks"][0]["price"] = "3000.50"
         return replace(response, body=body)
 
     paths = {
@@ -631,14 +739,22 @@ async def test_grid_depth_crossed_book_and_notional_cap_fail_closed(tmp_path, ca
     def mutate(response):
         body = copy.deepcopy(response.body)
         if case == "tick":
-            body["data"]["asks"][0]["price"] = "77963.45"
+            body["data"]["asks"][0]["price"] = "3000.005"
         elif case == "depth":
-            body["data"]["asks"][0]["quantity"] = "0.000099"
+            body["data"]["asks"] = [{
+                "order_count": 1, "price": "3000.00", "quantity": "0.099",
+            }]
         elif case == "crossed":
-            body["data"]["asks"] = [{"price": "77963.3", "quantity": "1"}]
+            body["data"]["asks"] = [{
+                "order_count": 1, "price": "2999.00", "quantity": "0.1",
+            }]
         else:
-            body["data"]["asks"] = [{"price": "6000000.0", "quantity": "1"}]
-            body["data"]["bids"] = [{"price": "5999999.9", "quantity": "1"}]
+            body["data"]["asks"] = [{
+                "order_count": 1, "price": "5000.00", "quantity": "0.1",
+            }]
+            body["data"]["bids"] = [{
+                "order_count": 1, "price": "4990.00", "quantity": "0.1",
+            }]
         return replace(response, body=body)
 
     transport.mutations["/v1/orderbook"] = mutate
@@ -658,7 +774,7 @@ async def test_wide_positive_spread_passes_public_private_read_barrier(tmp_path)
     def widen_spread(response):
         body = copy.deepcopy(response.body)
         body["data"]["asks"] = [{
-            "order_count": 1, "price": "90000.0", "quantity": "0.0001",
+            "order_count": 1, "price": "3050.00", "quantity": "0.1",
         }]
         return replace(response, body=body)
 
@@ -688,9 +804,9 @@ async def test_public_flatness_and_lifecycle_evidence_fail_closed(tmp_path, case
             if case == "open":
                 body["data"]["orders"] = [{"order_id": "fixture-order"}]
             elif case == "position":
-                body["data"]["position"]["size"] = "0.0001"
+                body["data"]["position"]["size"] = "0.1"
             else:
-                body["data"]["positions"] = [{"size": "0.0001"}]
+                body["data"]["positions"] = [{"size": "0.1"}]
             return replace(response, body=body)
 
         transport.mutations[path] = mutate
@@ -734,7 +850,7 @@ async def test_signer_not_yet_registered_or_expired_blocks(tmp_path, now):
 
 
 @pytest.mark.asyncio
-async def test_earliest_public_evidence_must_still_be_fresh_after_sweep_b(tmp_path):
+async def test_sequentially_fresh_public_evidence_may_span_five_seconds(tmp_path):
     clock = Clock()
     transport = PublicTransport(clock)
 
@@ -748,8 +864,72 @@ async def test_earliest_public_evidence_must_still_be_fresh_after_sweep_b(tmp_pa
     controller = PrivateReadPreflight(
         store, clock=clock, public_get=transport, lifecycle_clear=lambda: True,
     )
-    assert await controller.run_public_barrier() is None
-    assert len(transport.calls) == 18 and store.outcome() == Outcome.BLOCKED
+    barrier = await controller.run_public_barrier()
+    assert barrier is not None
+    assert clock.value - NOW > MAX_AGE_SECONDS
+    assert len(transport.calls) == 18 and store.outcome() is None
+    store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["stale", "future"])
+async def test_delayed_stale_or_future_response_blocks_before_private_effects(
+    tmp_path, kind,
+):
+    clock = Clock()
+    transport = PublicTransport(clock)
+
+    def delayed(response):
+        clock.value += 0.4
+        return response
+
+    for path, _query in expected_public_calls():
+        transport.mutations[path] = delayed
+
+    def delayed_bad(response):
+        clock.value += 0.4
+        observed_at = (
+            clock.value - MAX_AGE_SECONDS - 0.1
+            if kind == "stale" else clock.value + 0.1
+        )
+        return replace(response, observed_at=observed_at)
+
+    transport.mutations[(0, "/v1/orderbook")] = delayed_bad
+    store = PrivateReadStore(tmp_path / f"delayed-{kind}.sqlite3")
+    controller = PrivateReadPreflight(
+        store, clock=clock, public_get=transport, lifecycle_clear=lambda: True,
+    )
+    private_effects = []
+
+    def loader():
+        private_effects.append("loader")
+        return SyntheticCredential(SIGNER, b"fixture")
+
+    async def nonce_get(_path, _query):
+        private_effects.append("nonce")
+        return HttpResponse(
+            200, expected_url("/v1/auth/nonce", (("account", ACCOUNT),)),
+            envelope({"nonce": "0x1"}), clock(), False,
+        )
+
+    def sign(_credential, _typed_data):
+        private_effects.append("sign")
+        return SIGNATURE
+
+    async def socket(_url, _outbound):
+        private_effects.append("socket")
+        return private_frames()
+
+    barrier = await controller.run_public_barrier()
+    if barrier is not None:
+        await controller.run_private_proof(
+            barrier, signer_loader=loader, nonce_get=nonce_get,
+            sign_register_v2=sign, private_exchange=socket,
+        )
+    assert barrier is None
+    assert len(transport.calls) == 6
+    assert private_effects == []
+    assert store.outcome() == Outcome.BLOCKED
     store.close()
 
 
@@ -856,7 +1036,7 @@ async def test_private_frames_and_public_private_conflicts_block(tmp_path, case)
         elif case == "orders_nonempty":
             frames = list(private_frames(orders=({"order_id": "fixture-order"},)))
         elif case == "position_nonzero":
-            frames = list(private_frames(positions=({"size": "0.0001"},)))
+            frames = list(private_frames(positions=({"size": "0.1"},)))
         return tuple(frames)
 
     result = await controller.run_private_proof(
