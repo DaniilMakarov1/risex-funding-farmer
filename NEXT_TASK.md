@@ -4,11 +4,10 @@ One slice per venue. Apply the A/B/C levels and safety core from `AGENTS.md`; op
 
 ## RISEx — fill-seeking taker lifecycle
 
-Status: `AUTHORIZED OBSERVED-WRITE CORRECTION`.
+Status: `OBSERVED TESTNET ZERO-FILL BLOCKER`.
 
-- The accepted bounded crossing `LIMIT+IOC` opening dispatched once but again terminated with zero fill and exact flatness; its local terminal outcome was recovered only after two fresh authoritative zero-order/flat/consumed-nonce observations. Do not repeat it unchanged.
-- In a fresh visible RISEx Builder worktree, preserve sanitized explicit place-response failure evidence and select the smallest officially/observably supported taker opening actually capable of filling. The testnet spread is not a blocker. Preserve minimum/grid/depth checks, durable identity before dispatch, no replay, authoritative reconciliation, bounded close, and final zero relevant orders plus exact flatness.
-- After acceptance, Chief archives only the exact terminal rejected database and runs one fresh sequential lifecycle.
+- The official minimum-size `MARKET+IOC` opening was accepted with an order ID and reconciled terminal, but filled zero and remained exactly flat; two fresh authoritative observations confirmed zero orders, consumed nonce, and exact flatness before local outcome recovery. Place/signing/taker encoding is proved. Do not repeat the same vector without materially changed public/testnet liquidity or new official execution evidence.
+- RISEx remains short of the required filled-position close proof; no infrastructure expansion is authorized solely to work around absent testnet matching.
 
 ## Nado — sequential Level C lifecycle
 
@@ -23,10 +22,10 @@ Status: `AUTHORIZED OBSERVED-WRITE CORRECTION`.
 
 ## Extended — wallet/API Management setup and lifecycle
 
-Status: `PROVIDER STREAM BLOCKED; REPORTING CORRECTION AUTHORIZED`.
+Status: `PROVIDER STREAM BLOCKED`.
 
 - Existing local owner/Stark identities and the sole subaccount match; testnet claim completed, balance is readable, and zero orders/positions are authoritative. A fresh REST-valid API key reproduced v1 HTTP 503 and v2 RPC HTTP 404, excluding wallet, collateral, stale key, and quota causes.
-- The fresh Level B completed its first three REST reads but failed before stream upgrade/frame and persisted only `UNEXPECTED_FAILURE`. Automated stream retries are stopped. In a fresh visible Extended Builder worktree, make only the local Level B reporting correction that classifies WebSocket handshake/HTTP and pre-upgrade transport failures into the required sanitized failure classes; do not make authenticated calls or change the accepted host/parser/account semantics.
+- The local Level B runner now durably classifies pre-upgrade failures as sanitized `HTTP` or `TRANSPORT`; automated stream retries remain stopped after the observed provider v1 HTTP 503 and v2 HTTP 404.
 - Extended Level C remains prohibited until a future authenticated private stream succeeds.
 
 ## Completion

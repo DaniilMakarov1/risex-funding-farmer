@@ -8,8 +8,8 @@ import pytest
 from risex_farmer.testnet_risex_order_lifecycle import (
     AccountState, BBO, CANCEL_ACTION, DurableIntentStore, Evidence, FillRecord,
     HEADER_FLAGS, Lifecycle, LifecycleSafetyError, MarketState, OrderRecord,
-    Outcome, SyntheticSigner, encode_cancel_action, encode_place_action,
-    pack_order_data,
+    Outcome, PlaceResponseFailure, PlaceResultClass, SyntheticSigner,
+    encode_cancel_action, encode_place_action, pack_order_data,
 )
 
 NOW = 1_800_000_000
@@ -22,12 +22,12 @@ OTHER_SIGNER = "0x" + "77" * 20
 OTHER_ROUTER = "0x" + "88" * 20
 OTHER_AUTHORIZATION = "0x" + "99" * 20
 SIGNER = SyntheticSigner(SIGNER_ADDRESS)
-EXPECTED_ORDER_DATA = 1_180_591_648_218_017_085_442
-EXPECTED_ACTION_HASH = "ee1058ee762d6614bf31b0d75949cacb9c7bf5a9d7817e2c190315df2bbc1085"
+EXPECTED_ORDER_DATA = 1_180_591_648_205_202_010_114
+EXPECTED_ACTION_HASH = "68a89e2b3f45389782286dc0de79a1641e34f5d498edd9742fff88d5e3d040e0"
 EXPECTED_ABI = (
     "1d442a680326a08fbf310b367c5c0194ca94bbc644dc507e0b816b055ccfa2b9"
     "0000000000000000000000000000000000000000000000000000000000000005"
-    "00000000000000000000000000000000000000000000004000001902fbd6b802"
+    "0000000000000000000000000000000000000000000000400000190000003002"
     "0000000000000000000000000000000000000000000000000000000000000000"
     "0000000000000000000000000000000000000000000000000000000000000065"
     "0000000000000000000000000000000000000000000000000000000000000000"
@@ -136,6 +136,9 @@ def dispatch(lifecycle, intent, order_id):
     lifecycle.dispatch(intent, SIGNER, lambda _: order_id)
     persisted = lifecycle.store.get(intent.intent_id)
     assert persisted.dispatch_count == 1 and persisted.state == "DISPATCHED"
+    assert lifecycle.store.place_result(intent.intent_id) == (
+        PlaceResultClass.ACCEPTED, "ORDER_ID_ACCEPTED",
+    )
 
 
 def cancel(lifecycle, order_id, execute, *, observed=NOW + 1):
@@ -283,11 +286,11 @@ def test_malformed_order_identity_halts_after_dispatch(tmp_path):
         candidate.store.close()
 
 
-def test_open_is_exact_minimum_price_bounded_crossing_limit_ioc(lifecycle):
+def test_open_is_exact_minimum_depth_checked_market_ioc(lifecycle):
     intent = open_intent(lifecycle)
     request = lifecycle.unsigned_request(intent.intent_id, market=market())
-    assert intent.size == Decimal("0.0001") and intent.price == Decimal("78217.0")
-    assert (intent.size_steps, intent.price_ticks) == (100, 782170)
+    assert intent.size == Decimal("0.0001") and intent.price == Decimal("0")
+    assert (intent.size_steps, intent.price_ticks) == (100, 0)
     assert request["header_flags"] == HEADER_FLAGS == 0x05
     assert request["order_data"] == EXPECTED_ORDER_DATA
     assert request["abi_encoded"].hex() == EXPECTED_ABI
@@ -304,8 +307,8 @@ def test_open_is_exact_minimum_price_bounded_crossing_limit_ioc(lifecycle):
     }
     assert request["dispatchable"] is False and request["signature"] is None
     assert request["body"] == {
-        "market_id": 1, "size_steps": 100, "price_ticks": 782170,
-        "side": 0, "order_type": 1, "time_in_force": 3,
+        "market_id": 1, "size_steps": 100, "price_ticks": 0,
+        "side": 0, "order_type": 0, "time_in_force": 3,
         "post_only": False, "reduce_only": False, "stp_mode": 0,
         "client_order_id": 101, "account": ACCOUNT.lower(),
         "signer": SIGNER_ADDRESS.lower(), "nonce_anchor": "7",
@@ -324,8 +327,47 @@ def test_wide_positive_spread_preserves_exact_lifecycle_price_bound(lifecycle):
     intent = lifecycle.prepare_open(preflight, 101, 7, 3, NOW + 30)
 
     assert intent.size == Decimal("0.0001")
-    assert intent.price == Decimal("90270.0")
-    assert intent.size * intent.price <= Decimal("500")
+    assert preflight.buy_bound == Decimal("90270.0")
+    assert preflight.size * preflight.buy_bound <= Decimal("500")
+    assert intent.order_type == "MARKET" and intent.time_in_force == "IOC"
+    assert intent.price == Decimal("0") and intent.price_ticks == 0
+
+
+def test_place_result_distinguishes_terminal_rejection_from_transport_ambiguity(
+    tmp_path,
+):
+    rejected = new_lifecycle(tmp_path / "rejected.sqlite3")
+    rejected_intent = open_intent(rejected)
+    rejected.dispatch(
+        rejected_intent, SIGNER,
+        lambda _: (_ for _ in ()).throw(PlaceResponseFailure(
+            PlaceResultClass.TERMINAL_VENUE_REJECTION, "HTTP_400",
+        )),
+    )
+    assert rejected.store.get(rejected_intent.intent_id).state == "VENUE_REJECTED"
+    assert rejected.store.place_result(rejected_intent.intent_id) == (
+        PlaceResultClass.TERMINAL_VENUE_REJECTION, "HTTP_400",
+    )
+    path = rejected.store.path
+    rejected.store.close()
+    restarted_store = DurableIntentStore(path)
+    assert restarted_store.place_result(rejected_intent.intent_id) == (
+        PlaceResultClass.TERMINAL_VENUE_REJECTION, "HTTP_400",
+    )
+    restarted_store.close()
+
+    ambiguous = new_lifecycle(tmp_path / "ambiguous.sqlite3")
+    ambiguous_intent = open_intent(ambiguous)
+    ambiguous.dispatch(
+        ambiguous_intent, SIGNER,
+        lambda _: (_ for _ in ()).throw(TimeoutError()),
+    )
+    assert ambiguous.store.get(ambiguous_intent.intent_id).state == "AMBIGUOUS"
+    assert ambiguous.store.place_result(ambiguous_intent.intent_id) == (
+        PlaceResultClass.LOCAL_FAILURE,
+        "UNCLASSIFIED_LOCAL_FAILURE",
+    )
+    ambiguous.store.close()
 
 
 def test_fok_no_fill_finishes_flat_without_close_acceptance(lifecycle):
@@ -790,7 +832,8 @@ def test_preflight_is_immutable_and_bound_to_issuing_lifecycle(lifecycle, tmp_pa
 
     intent = lifecycle.prepare_open(validated, 101, 7, 3, NOW + 30)
     assert intent.size == market().minimum
-    assert intent.price == Decimal("78217.0")
+    assert validated.buy_bound == Decimal("78217.0")
+    assert intent.price == Decimal("0")
     calls = []
     with pytest.raises(LifecycleSafetyError):
         lifecycle.dispatch(

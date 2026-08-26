@@ -25,7 +25,7 @@ from typing import Any, Callable, Mapping
 from .testnet_risex_order_lifecycle import (
     AccountState, BBO, DurableIntentStore, Evidence, FillRecord, Intent,
     Lifecycle, LifecycleSafetyError, MarketState, OrderRecord, Outcome,
-    _valid_order_id,
+    PlaceResultClass, _valid_order_id,
 )
 from .testnet_risex_order_lifecycle_operational import OperationalBinding
 from .risex_private_read_operational import (
@@ -68,6 +68,8 @@ class RunnerReport:
     dispatch_count: int
     close_attempts: int
     manual_recovery: bool
+    opening_place_result: PlaceResultClass | None = None
+    opening_place_failure: str | None = None
 
     def sanitized(self) -> dict[str, Any]:
         return {
@@ -77,6 +79,11 @@ class RunnerReport:
             "dispatch_count": self.dispatch_count,
             "close_attempts": self.close_attempts,
             "manual_recovery": self.manual_recovery,
+            "opening_place_result": (
+                None if self.opening_place_result is None
+                else self.opening_place_result.value
+            ),
+            "opening_place_failure": self.opening_place_failure,
         }
 
 
@@ -531,11 +538,13 @@ class _ProductionReadCapability:
         row = self._updates.pop(intent.client_order_id, None)
         if row is None:
             exact_no_identity_open = (
-                intent.kind == "OPEN" and intent.order_type == "LIMIT"
+                intent.kind == "OPEN" and intent.order_type == "MARKET"
                 and intent.time_in_force == "IOC"
                 and not intent.reduce_only and not intent.post_only
                 and intent.order_id is None and intent.dispatch_count == 1
-                and intent.state in {"DISPATCHING", "DISPATCHED", "AMBIGUOUS"}
+                and intent.state in {
+                    "DISPATCHING", "DISPATCHED", "AMBIGUOUS", "VENUE_REJECTED",
+                }
             )
             try:
                 observed = await self._pump_until(
@@ -680,6 +689,10 @@ class RisexLevelCRunner:
 
     def _report(self, result: RunnerResult, *, manual: bool = False) -> RunnerReport:
         intents = self._store.all()
+        opening = next((item for item in intents if item.kind == "OPEN"), None)
+        place_result = (
+            None if opening is None else self._store.place_result(opening.intent_id)
+        )
         return RunnerReport(
             run_id=self._binding.run_id,
             result=result,
@@ -687,6 +700,8 @@ class RisexLevelCRunner:
             dispatch_count=sum(item.dispatch_count for item in intents),
             close_attempts=sum(item.kind == "CLOSE" for item in intents),
             manual_recovery=manual,
+            opening_place_result=(None if place_result is None else place_result[0]),
+            opening_place_failure=(None if place_result is None else place_result[1]),
         )
 
     def _dispatch_prepared(

@@ -44,7 +44,7 @@ def order_update(*, client=101, status="ORDER_STATUS_FILLED", filled="0.0001"):
             "id": ORDER_IDS[0], "wide_order_id": "113",
             "resting_order_id": "56", "client_order_id": str(client),
             "market_id": "1", "sender": ACCOUNT, "side": "BUY",
-            "type": "LIMIT", "time_in_force": "IOC", "status": status,
+            "type": "MARKET", "time_in_force": "IOC", "status": status,
             "size": "0.0001", "filled_size": filled, "post_only": False,
             "reduce_only": False, "is_liquidation": False,
         }],
@@ -77,8 +77,8 @@ def orders_snapshot():
 def opening_intent(*, lifecycle_state="OPEN_KNOWN"):
     return Intent(
         "intent", 1, "OPEN", 101, 7, 3, "a" * 64, "b" * 64,
-        lifecycle_state, "BUY", "LIMIT", "IOC", False, False, 1,
-        Decimal("0.0001"), 100, Decimal("78217.0"), 782170,
+        lifecycle_state, "BUY", "MARKET", "IOC", False, False, 1,
+        Decimal("0.0001"), 100, Decimal("0"), 0,
         Decimal("0"), NOW + 60, 1, ORDER_IDS[0], False,
     )
 
@@ -287,6 +287,7 @@ def test_zero_argument_entrypoint_returns_sanitized_bounded_report(monkeypatch):
         "result": "COMPLETED_NO_FILL_FLAT", "run_id": "runtime-only",
         "intent_count": 1, "dispatch_count": 1, "close_attempts": 0,
         "manual_recovery": False,
+        "opening_place_result": None, "opening_place_failure": None,
     }
 
 
@@ -340,8 +341,8 @@ def test_production_capability_emits_authoritative_state_and_exact_evidence():
 
     intent = Intent(
         "intent", 1, "OPEN", 101, 7, 3, "a" * 64, "b" * 64,
-        "DISPATCHED", "BUY", "LIMIT", "IOC", False, False, 1,
-        Decimal("0.0001"), 100, Decimal("78217.0"), 782170,
+        "DISPATCHED", "BUY", "MARKET", "IOC", False, False, 1,
+        Decimal("0.0001"), 100, Decimal("0"), 0,
         Decimal("0"), NOW + 60, 1, ORDER_IDS[0], False,
     )
     capability._subscribed = True
@@ -396,8 +397,8 @@ def test_production_stream_demuxes_interleaved_frames_without_resubscribe():
 
     intent = Intent(
         "intent", 1, "OPEN", 101, 7, 3, "a" * 64, "b" * 64,
-        "DISPATCHED", "BUY", "LIMIT", "IOC", False, False, 1,
-        Decimal("0.0001"), 100, Decimal("78217.0"), 782170,
+        "DISPATCHED", "BUY", "MARKET", "IOC", False, False, 1,
+        Decimal("0.0001"), 100, Decimal("0"), 0,
         Decimal("0"), NOW + 60, 1, ORDER_IDS[0], False,
     )
     transport.frames.extend([position_frame("0.0001"), order_update()])
@@ -772,7 +773,7 @@ def test_fill_then_close_is_durable_price_bounded_and_finishes_zero_flat(tmp_pat
     assert report.result is RunnerResult.SUCCESS_CLOSED_FLAT
     assert report.dispatch_count == 2 and report.close_attempts == 1
     assert [(item.kind, item.order_type, item.time_in_force, item.reduce_only) for item in intents] == [
-        ("OPEN", "LIMIT", "IOC", False),
+        ("OPEN", "MARKET", "IOC", False),
         ("CLOSE", "MARKET", "FOK", True),
     ]
     assert all(item.size * item.price <= Decimal("500") for item in intents)

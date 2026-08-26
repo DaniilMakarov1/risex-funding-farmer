@@ -25,7 +25,8 @@ from . import testnet_risex_signer as _signer
 from .testnet_risex_order_lifecycle import (
     CANCEL_ACTION, HEADER_FLAGS, OFFICIAL_CHAIN_ID, OFFICIAL_DOMAIN_NAME,
     OFFICIAL_DOMAIN_VERSION, Intent, Lifecycle,
-    LifecycleSafetyError, MarketState, SyntheticSigner, _address,
+    LifecycleSafetyError, MarketState, PlaceResponseFailure, PlaceResultClass,
+    SyntheticSigner, _address,
     _composite_wide_order_id, _valid_order_id, encode_cancel_action,
     encode_place_action, pack_order_data,
 )
@@ -158,16 +159,46 @@ class SealedWriteTransport:
             )
             response = connection.getresponse()
             declared = response.getheader("Content-Length")
-            if declared is not None and int(declared) > self.MAX_BYTES:
-                raise LifecycleSafetyError("RISEx write response rejected")
+            if declared is not None:
+                try:
+                    declared_size = int(declared)
+                except (TypeError, ValueError):
+                    raise PlaceResponseFailure(
+                        PlaceResultClass.RESPONSE_AMBIGUITY,
+                        "INVALID_CONTENT_LENGTH",
+                    ) from None
+                if declared_size < 0 or declared_size > self.MAX_BYTES:
+                    raise PlaceResponseFailure(
+                        PlaceResultClass.RESPONSE_AMBIGUITY,
+                        "OVERSIZED_RESPONSE",
+                    )
             raw = response.read(self.MAX_BYTES + 1)
-            if len(raw) > self.MAX_BYTES or not 200 <= response.status < 300:
-                raise LifecycleSafetyError("RISEx write outcome requires reconciliation")
-            return _strict_json(raw.decode("utf-8", errors="strict"))
-        except LifecycleSafetyError:
+            if len(raw) > self.MAX_BYTES:
+                raise PlaceResponseFailure(
+                    PlaceResultClass.RESPONSE_AMBIGUITY, "OVERSIZED_RESPONSE",
+                )
+            if not 200 <= response.status < 300:
+                result_class = (
+                    PlaceResultClass.TERMINAL_VENUE_REJECTION
+                    if 400 <= response.status < 500 and response.status != 408
+                    else PlaceResultClass.RESPONSE_AMBIGUITY
+                )
+                raise PlaceResponseFailure(
+                    result_class, f"HTTP_{response.status}",
+                )
+            try:
+                return _strict_json(raw.decode("utf-8", errors="strict"))
+            except Exception:
+                raise PlaceResponseFailure(
+                    PlaceResultClass.RESPONSE_AMBIGUITY,
+                    "MALFORMED_SUCCESS_RESPONSE",
+                ) from None
+        except PlaceResponseFailure:
             raise
         except Exception:
-            raise LifecycleSafetyError("RISEx write outcome requires reconciliation") from None
+            raise PlaceResponseFailure(
+                PlaceResultClass.TRANSPORT_AMBIGUITY, "TRANSPORT_FAILURE",
+            ) from None
         finally:
             connection.close()
 
@@ -176,9 +207,15 @@ class SealedWriteTransport:
         try:
             order_id = response["data"]["order_id"]
         except (KeyError, TypeError):
-            raise LifecycleSafetyError("RISEx place response requires reconciliation") from None
+            raise PlaceResponseFailure(
+                PlaceResultClass.RESPONSE_AMBIGUITY,
+                "MISSING_ORDER_ID",
+            ) from None
         if not _valid_order_id(order_id):
-            raise LifecycleSafetyError("RISEx place response requires reconciliation")
+            raise PlaceResponseFailure(
+                PlaceResultClass.RESPONSE_AMBIGUITY,
+                "INVALID_ORDER_ID",
+            )
         return order_id
 
     def cancel(self, body: dict[str, Any]) -> Any:
