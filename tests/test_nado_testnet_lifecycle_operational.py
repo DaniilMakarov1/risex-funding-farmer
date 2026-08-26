@@ -18,7 +18,7 @@ from risex_farmer.nado_testnet_lifecycle import (
     AccountSnapshot, CatalogSnapshot, EngineEvidence, ExecuteFailure, FillEvidence,
     FixedEnvironment, IntentStore, OrderEvidence, Product, OrderIntent,
     SyntheticOrderVector, TriggerSnapshot, build_order_nonce, canonical_payload,
-    order_digest,
+    order_digest, smallest_executable_amount,
 )
 from risex_farmer.nado_testnet_lifecycle_operational import (
     DurableExecuteFailure, OperationalSafetyError, OperationalVenueIO,
@@ -52,7 +52,7 @@ class FixtureIO:
         self.dispatch_states: list[str] = []
         self.product = Product(
             TARGET_PRODUCT_ID, TARGET_TICKER_ID, ACTIVE_PERP, True,
-            10**12, 50 * X18, 100 * X18, 5 * X18,
+            10**12, 50 * X18, 50 * X18, 100 * X18,
         )
 
     def now_ms(self) -> int:
@@ -180,6 +180,31 @@ def test_operational_parser_reuses_accepted_aggregate_account_contract() -> None
     assert not any(regular.values()) and orders == []
 
 
+def test_current_min_size_binds_to_quote_notional_and_one_base_step() -> None:
+    io = OperationalVenueIO(OWNER, SENDER)
+    products = io._products(
+        {
+            "spot_products": [],
+            "perp_products": [{
+                "product_id": TARGET_PRODUCT_ID,
+                "book_info": {
+                    "price_increment_x18": str(10**12),
+                    "size_increment": str(50 * X18),
+                    "min_size": str(100 * X18),
+                },
+            }],
+        },
+        {TARGET_PRODUCT_ID: TARGET_TICKER_ID},
+    )
+    product = products[TARGET_PRODUCT_ID]
+    assert product.minimum_amount_x18 == product.step_x18 == 50 * X18
+    assert product.minimum_notional_x18 == 100 * X18
+    assert smallest_executable_amount(
+        product,
+        prices_x18=(7_765_000_000_000_000, 7_766_000_000_000_000),
+    ) == 12_900 * X18
+
+
 def test_v2_pair_identity_binds_exact_selected_regular_perpetual() -> None:
     io = OperationalVenueIO(OWNER, SENDER)
     pairs = io._pairs([{
@@ -253,7 +278,7 @@ def test_entry_is_smallest_tick_aligned_ten_percent_buffered_ioc_buy() -> None:
     assert order.price_x18 * 100 >= observed.ask_x18 * 110
     assert (order.price_x18 - observed.product.tick_x18) * 100 < observed.ask_x18 * 110
     assert order.appendix == IOC_APPENDIX
-    assert order.amount_x18 == 650 * X18
+    assert order.amount_x18 == 12_900 * X18
 
 
 def test_entry_buffer_rounds_exact_ten_percent_bound_without_extra_tick() -> None:
@@ -263,7 +288,7 @@ def test_entry_buffer_rounds_exact_ten_percent_bound_without_extra_tick() -> Non
         "risex_farmer.nado_testnet_lifecycle_operational"
     )._entry_order(observed, OWNER, SENDER, io.now_ms() + 100)
     assert order.price_x18 == 8_800_000_000_000_000
-    assert order.amount_x18 == 650 * X18
+    assert order.amount_x18 == 12_900 * X18
 
 
 def test_trigger_read_reuses_fresh_server_time_envelope(monkeypatch) -> None:
