@@ -42,14 +42,15 @@ from .nado_testnet_lifecycle import (
     AccountSnapshot, CatalogSnapshot, EngineEvidence, IntentStore,
     LifecycleCore, OrderEvidence, OrderIntent, Product, Reconciliation,
     SyntheticOrderVector, TriggerSnapshot, build_order_nonce,
-    completion_barrier, order_digest,
+    completion_barrier, order_digest, smallest_executable_amount,
     validate_entry_preflight,
 )
 
 
 RUN_STORE_BASENAME = ".risex-funding-farmer-nado-level-c-v1.sqlite3"
 REDACTED_STORE_PATH = "<passwd-home>/" + RUN_STORE_BASENAME
-TARGET_PRODUCT_ID = 2
+TARGET_PRODUCT_ID = 44
+TARGET_TICKER_ID = "SKR-PERP_USDT0"
 RECV_WINDOW_MS = 100
 HTTP_TIMEOUT_SECONDS = 5.0
 MAX_RESPONSE_BYTES = 1_048_576
@@ -255,15 +256,20 @@ def _salt() -> int:
 
 def _entry_order(observation: LiveObservation, owner: str, sender: str, recv: int) -> SyntheticOrderVector:
     product = observation.product
-    if product.product_id != TARGET_PRODUCT_ID:
-        raise OperationalSafetyError("fixed target product unavailable")
+    if (
+        product.product_id != TARGET_PRODUCT_ID
+        or product.symbol != TARGET_TICKER_ID
+        or product.product_type != ACTIVE_PERP
+    ):
+        raise OperationalSafetyError("fixed target product identity unavailable")
     bid, ask = observation.bid_x18, observation.ask_x18
     if bid <= 0 or ask <= bid or bid % product.tick_x18 or ask % product.tick_x18:
         raise OperationalSafetyError("fresh non-crossed tick-aligned BBO required")
     salt = _salt()
+    amount = smallest_executable_amount(product, prices_x18=(bid, ask))
     return SyntheticOrderVector(
         owner, SUBACCOUNT_NAME, sender, TARGET_PRODUCT_ID, bid,
-        product.minimum_amount_x18, UINT32_MAX, recv, salt,
+        amount, UINT32_MAX, recv, salt,
         build_order_nonce(recv, salt), POST_ONLY_APPENDIX,
     )
 
@@ -513,8 +519,16 @@ class OperationalVenueIO:
         )
         if set(linked) != {"linked_signer"} or linked["linked_signer"] != "0x" + "00" * 20:
             raise OperationalSafetyError("unrelated linked signer state")
+        raw_pairs = self._get(_GATEWAY_HOST, "/v2/pairs")
+        pairs = self._pairs(raw_pairs)
         raw_products = self._gateway({"type": "all_products"}, "query_all_products")
-        products = self._products(raw_products)
+        products = self._products(raw_products, pairs)
+        target = products.get(TARGET_PRODUCT_ID)
+        if (
+            target is None or target.product_type != ACTIVE_PERP
+            or target.symbol != TARGET_TICKER_ID
+        ):
+            raise OperationalSafetyError("fixed target product identity unavailable")
         product_ids = tuple(sorted(products))
         raw_orders = self._gateway(
             {"type": "orders", "sender": self.sender, "product_ids": list(product_ids)},
@@ -581,7 +595,7 @@ class OperationalVenueIO:
         )
         return LiveObservation(
             CatalogSnapshot(tuple(products.values()), True, observed, True, "engine"),
-            evidence, products[TARGET_PRODUCT_ID], bid, ask,
+            evidence, target, bid, ask,
         )
 
     def validate_order(self, order: SyntheticOrderVector, signature: str) -> bool:
@@ -677,11 +691,19 @@ class OperationalVenueIO:
         return parsed
 
     def _post(self, host: str, path: str, body: dict[str, object]) -> object:
+        encoded = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("ascii")
+        return self._request("POST", host, path, encoded)
+
+    def _get(self, host: str, path: str) -> object:
+        return self._request("GET", host, path, None)
+
+    def _request(
+        self, method: str, host: str, path: str, body: bytes | None
+    ) -> object:
         try:
-            encoded = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("ascii")
             connection = self._connection_factory(host)
             try:
-                connection.request("POST", path, encoded, {
+                connection.request(method, path, body, {
                     "Content-Type": "application/json", "Accept": "application/json",
                     "Accept-Encoding": "gzip, br, deflate",
                 })
@@ -750,10 +772,34 @@ class OperationalVenueIO:
             raise OperationalSafetyError("gateway response schema mismatch")
         return envelope["data"]
 
-    def _products(self, raw: object) -> dict[int, Product]:
+    def _pairs(self, raw: object) -> dict[int, str]:
+        if type(raw) is not list or not raw:
+            raise OperationalSafetyError("V2 pair identity schema mismatch")
+        result: dict[int, str] = {}
+        for pair in raw:
+            if type(pair) is not dict or set(pair) != {
+                "product_id", "ticker_id", "base", "quote",
+            }:
+                raise OperationalSafetyError("V2 pair identity schema mismatch")
+            product_id = pair["product_id"]
+            ticker, base, quote = pair["ticker_id"], pair["base"], pair["quote"]
+            if (
+                type(product_id) is not int or product_id < 0
+                or type(ticker) is not str or not ticker
+                or type(base) is not str or not base
+                or type(quote) is not str or not quote
+                or ticker != f"{base}_{quote}"
+                or product_id in result
+            ):
+                raise OperationalSafetyError("V2 pair identity schema mismatch")
+            result[product_id] = ticker
+        return result
+
+    def _products(self, raw: object, pairs: dict[int, str]) -> dict[int, Product]:
         if type(raw) is not dict or set(raw) != {"spot_products", "perp_products"}:
             raise OperationalSafetyError("catalog schema mismatch")
         result: dict[int, Product] = {}
+        catalog_ids: set[int] = set()
         for kind, field in (("SPOT", "spot_products"), (ACTIVE_PERP, "perp_products")):
             if type(raw[field]) is not list:
                 raise OperationalSafetyError("catalog schema mismatch")
@@ -761,8 +807,14 @@ class OperationalVenueIO:
                 if type(item) is not dict or type(item.get("product_id")) is not int:
                     raise OperationalSafetyError("catalog product schema mismatch")
                 product_id = item["product_id"]
+                if product_id in catalog_ids:
+                    raise OperationalSafetyError("duplicate catalog product")
+                catalog_ids.add(product_id)
                 if product_id in {0, 11}:
                     continue
+                symbol = pairs.get(product_id)
+                if symbol is None:
+                    raise OperationalSafetyError("catalog V2 identity coverage mismatch")
                 book = item.get("book_info")
                 if type(book) is not dict:
                     raise OperationalSafetyError("catalog grid schema mismatch")
@@ -772,11 +824,11 @@ class OperationalVenueIO:
                 if product_id in result:
                     raise OperationalSafetyError("duplicate catalog product")
                 result[product_id] = Product(
-                    product_id, f"PRODUCT-{product_id}", kind, True, tick, step,
+                    product_id, symbol, kind, True, tick, step,
                     minimum, 5 * 10**18,
                 )
-        if TARGET_PRODUCT_ID not in result or result[TARGET_PRODUCT_ID].product_type != ACTIVE_PERP:
-            raise OperationalSafetyError("fixed target product unavailable")
+        if set(pairs) != catalog_ids - {0}:
+            raise OperationalSafetyError("catalog V2 identity coverage mismatch")
         return result
 
     def _orders(self, raw: object, products: dict[int, Product]):

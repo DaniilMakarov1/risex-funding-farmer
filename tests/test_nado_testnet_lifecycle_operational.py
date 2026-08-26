@@ -20,7 +20,7 @@ from risex_farmer.nado_testnet_lifecycle import (
 )
 from risex_farmer.nado_testnet_lifecycle_operational import (
     OperationalSafetyError, OperationalVenueIO, OwnerOrderCapability, REDACTED_STORE_PATH,
-    RUN_STORE_BASENAME, SealedLifecycleRunner, TARGET_PRODUCT_ID,
+    RUN_STORE_BASENAME, SealedLifecycleRunner, TARGET_PRODUCT_ID, TARGET_TICKER_ID,
     _fixture_run, run,
 )
 from risex_farmer.nado_private_read_preflight import MAX_FRESHNESS_MS
@@ -48,8 +48,10 @@ class FixtureIO:
         self.intents = []
         self.terminals: dict[str, str] = {}
         self.dispatch_states: list[str] = []
-        self.product = Product(2, "BTC-PERP", ACTIVE_PERP, True, 10 * X18,
-                               10**15, 10**16, 5 * X18)
+        self.product = Product(
+            TARGET_PRODUCT_ID, TARGET_TICKER_ID, ACTIVE_PERP, True,
+            10**12, 50 * X18, 100 * X18, 5 * X18,
+        )
 
     def now_ms(self) -> int:
         self.clock += 101
@@ -83,22 +85,22 @@ class FixtureIO:
         self.clock += 101
         product = self.product
         catalog = CatalogSnapshot((product,), True, self.clock, True, "engine")
-        regular = {2: ()}
+        regular = {TARGET_PRODUCT_ID: ()}
         position = 0
         orders = ()
         fills = []
         if self.intents:
             entry = self.intents[0]
             if self.phase == "RESTING":
-                regular = {2: (entry.digest,)}
-                orders = (OrderEvidence(entry.digest, 2, entry.nonce,
+                regular = {TARGET_PRODUCT_ID: (entry.digest,)}
+                orders = (OrderEvidence(entry.digest, TARGET_PRODUCT_ID, entry.nonce,
                                         entry.amount_x18, "OPEN"),)
             elif self.phase == "PARTIAL":
-                filled = entry.amount_x18 // 2
-                regular = {2: (entry.digest,)}
-                orders = (OrderEvidence(entry.digest, 2, entry.nonce,
+                filled = entry.amount_x18 - self.product.step_x18
+                regular = {TARGET_PRODUCT_ID: (entry.digest,)}
+                orders = (OrderEvidence(entry.digest, TARGET_PRODUCT_ID, entry.nonce,
                                         entry.amount_x18 - filled, "OPEN"),)
-                fills.append(FillEvidence(entry.digest, 2, filled, 1))
+                fills.append(FillEvidence(entry.digest, TARGET_PRODUCT_ID, filled, 1))
                 position = filled
             elif self.entry_result in {"FILLED", "PARTIAL"} or self.phase in {
                 "FILLED", "CANCELLED", "EXPIRED"
@@ -106,9 +108,9 @@ class FixtureIO:
                 if self.entry_result in {"FILLED", "PARTIAL"}:
                     filled = (
                         entry.amount_x18 if self.entry_result == "FILLED"
-                        else entry.amount_x18 // 2
+                        else entry.amount_x18 - self.product.step_x18
                     )
-                    fills.append(FillEvidence(entry.digest, 2, filled, 1))
+                    fills.append(FillEvidence(entry.digest, TARGET_PRODUCT_ID, filled, 1))
                     position = filled
                 if any(item.kind == "CLOSE" for item in self.intents):
                     for index, item in enumerate(
@@ -116,13 +118,15 @@ class FixtureIO:
                     ):
                         if item.digest in self.terminals:
                             continue
-                        fills.append(FillEvidence(item.digest, 2, -position, index))
+                        fills.append(FillEvidence(
+                            item.digest, TARGET_PRODUCT_ID, -position, index
+                        ))
                         position = 0
         account = AccountSnapshot(
             763373, "Nado", "0.0.1", FixedEnvironment.endpoint,
             FixedEnvironment.gateway, FixedEnvironment.gateway_ws,
             FixedEnvironment.archive, FixedEnvironment.trigger, OWNER, "default",
-            self.clock, True, "engine", regular, {2: position}, (),
+            self.clock, True, "engine", regular, {TARGET_PRODUCT_ID: position}, (),
             snapshot_id=f"snapshot-{self.clock}",
         )
         trigger = TriggerSnapshot(
@@ -132,7 +136,10 @@ class FixtureIO:
         evidence = EngineEvidence(account, trigger, orders, tuple(fills), self.clock)
         return importlib.import_module(
             "risex_farmer.nado_testnet_lifecycle_operational"
-        ).LiveObservation(catalog, evidence, product, 35_000 * X18, 35_010 * X18)
+        ).LiveObservation(
+            catalog, evidence, product,
+            7_765_000_000_000_000, 7_766_000_000_000_000,
+        )
 
 
 def run_fixture(tmp_path: Path, io: FixtureIO):
@@ -156,14 +163,56 @@ def test_zero_argument_surface_and_normal_startup_isolation() -> None:
 def test_operational_parser_reuses_accepted_aggregate_account_contract() -> None:
     fixture = json.loads(PRIVATE_FIXTURE.read_text())
     io = OperationalVenueIO(str(fixture["owner"]), str(fixture["sender"]))
-    products = io._products(fixture["wire"]["all_products"]["data"])
-    assert TARGET_PRODUCT_ID in products
-    assert products[TARGET_PRODUCT_ID].product_type == ACTIVE_PERP
+    raw_products = fixture["wire"]["all_products"]["data"]
+    pairs = {
+        item["product_id"]: f"PRODUCT-{item['product_id']}_USDT0"
+        for field in ("spot_products", "perp_products")
+        for item in raw_products[field]
+        if item["product_id"] != 0
+    }
+    products = io._products(raw_products, pairs)
     account = fixture["wire"]["subaccount_info"]["data"]
     assert not any(io._positions(account, products).values())
     regular, orders = io._orders(fixture["wire"]["orders"]["data"], products)
     assert set(regular) == set(products)
     assert not any(regular.values()) and orders == []
+
+
+def test_v2_pair_identity_binds_exact_selected_regular_perpetual() -> None:
+    io = OperationalVenueIO(OWNER, SENDER)
+    pairs = io._pairs([{
+        "product_id": TARGET_PRODUCT_ID,
+        "ticker_id": TARGET_TICKER_ID,
+        "base": "SKR-PERP",
+        "quote": "USDT0",
+    }])
+    assert pairs == {TARGET_PRODUCT_ID: TARGET_TICKER_ID}
+    for changed in (
+        {"ticker_id": "PUMP-PERP_USDT0"},
+        {"base": "PUMP-PERP"},
+        {"quote": "USDC"},
+        {"extra": "field"},
+    ):
+        invalid = {
+            "product_id": TARGET_PRODUCT_ID,
+            "ticker_id": TARGET_TICKER_ID,
+            "base": "SKR-PERP",
+            "quote": "USDT0",
+        }
+        invalid.update(changed)
+        with pytest.raises(OperationalSafetyError, match="V2 pair identity"):
+            io._pairs([invalid])
+
+
+def test_entry_rejects_same_product_id_with_wrong_v2_ticker() -> None:
+    io = FixtureIO()
+    observed = io.observe(())
+    observed = replace(
+        observed, product=replace(observed.product, symbol="PUMP-PERP_USDT0")
+    )
+    module = importlib.import_module("risex_farmer.nado_testnet_lifecycle_operational")
+    with pytest.raises(OperationalSafetyError, match="product identity"):
+        module._entry_order(observed, OWNER, SENDER, io.now_ms() + 100)
 
 
 def test_trigger_read_reuses_fresh_server_time_envelope(monkeypatch) -> None:
@@ -234,11 +283,12 @@ def test_place_write_binding_emits_exact_full_official_payload() -> None:
     io = OperationalVenueIO(OWNER, SENDER)
     recv, salt = 1_700_000_000_100, 7
     order = SyntheticOrderVector(
-        OWNER, "default", SENDER, 2, 35_000 * X18, 10**16, 2**32 - 1,
+        OWNER, "default", SENDER, TARGET_PRODUCT_ID, 7_765_000_000_000_000,
+        650 * X18, 2**32 - 1,
         recv, salt, build_order_nonce(recv, salt), 1537,
     )
     intent = OrderIntent(
-        "ENTRY", 2, order.nonce, recv, order_digest(order),
+        "ENTRY", TARGET_PRODUCT_ID, order.nonce, recv, order_digest(order),
         canonical_payload(order.as_payload()), order.amount_x18, order.appendix,
         sender=SENDER, owner=OWNER, subaccount_name="default",
     )
@@ -257,7 +307,7 @@ def test_place_write_binding_emits_exact_full_official_payload() -> None:
     operation = captured["body"]["place_order"]
     assert captured["body"] == {
         "place_order": {
-            "product_id": 2,
+            "product_id": TARGET_PRODUCT_ID,
             "order": order.as_payload()["place_order"]["order"],
             "signature": signature,
             "digest": intent.digest,
@@ -284,7 +334,9 @@ def test_cancel_write_binding_emits_exact_payload_and_validates_resting_entry() 
     entry_nonce = build_order_nonce(1_700_000_000_000, 7)
     remaining = 10**16
     io._resting_orders = {
-        entry_digest: OrderEvidence(entry_digest, 2, entry_nonce, remaining, "OPEN")
+        entry_digest: OrderEvidence(
+            entry_digest, TARGET_PRODUCT_ID, entry_nonce, remaining, "OPEN"
+        )
     }
     intent = _cancel_intent()
     captured = {}
@@ -293,7 +345,8 @@ def test_cancel_write_binding_emits_exact_payload_and_validates_resting_entry() 
         return {
             "status": "success", "request_type": "execute_cancel_product_orders",
             "data": {"cancelled_orders": [{
-                "digest": entry_digest, "product_id": 2, "sender": SENDER,
+                "digest": entry_digest, "product_id": TARGET_PRODUCT_ID,
+                "sender": SENDER,
                 "nonce": str(entry_nonce), "unfilled_amount": str(remaining),
                 "additive": "ignored response field",
             }]},
@@ -330,10 +383,12 @@ def test_cancel_response_rejects_non_exact_resting_entry(field: str, wrong: obje
     entry_nonce = build_order_nonce(1_700_000_000_000, 7)
     remaining = 10**16
     io._resting_orders = {
-        entry_digest: OrderEvidence(entry_digest, 2, entry_nonce, remaining, "OPEN")
+        entry_digest: OrderEvidence(
+            entry_digest, TARGET_PRODUCT_ID, entry_nonce, remaining, "OPEN"
+        )
     }
     cancelled = {
-        "digest": entry_digest, "product_id": 2, "sender": SENDER,
+        "digest": entry_digest, "product_id": TARGET_PRODUCT_ID, "sender": SENDER,
         "nonce": str(entry_nonce), "unfilled_amount": str(remaining),
     }
     cancelled[field] = wrong
@@ -398,6 +453,16 @@ def test_transport_requests_and_strictly_decodes_required_encodings(
     assert connection.request_args[3]["Accept-Encoding"] == "gzip, br, deflate"
 
 
+def test_v2_pairs_transport_is_fixed_get_without_request_body() -> None:
+    raw = b'[{"product_id":44,"ticker_id":"SKR-PERP_USDT0",' \
+          b'"base":"SKR-PERP","quote":"USDT0"}]'
+    connection = _Connection(_Response(raw, None))
+    io = OperationalVenueIO(OWNER, SENDER)
+    io._connection_factory = lambda _host: connection
+    assert io._get("gateway.test.nado.xyz", "/v2/pairs")[0]["product_id"] == 44
+    assert connection.request_args[:3] == ("GET", "/v2/pairs", None)
+
+
 @pytest.mark.parametrize("encoding", ["compress", "gzip, br", "x-gzip"])
 def test_transport_rejects_unknown_or_composed_content_encoding(encoding: str) -> None:
     connection = _Connection(_Response(b"{}", encoding))
@@ -445,7 +510,7 @@ def test_partial_post_only_fill_is_cancelled_then_clamped_close_uses_residual(
         assert report.status == COMPLETE and report.writes == 3
         entry, cancel, close = [intent for intent, _ in store.intents()]
         assert [entry.kind, cancel.kind, close.kind] == ["ENTRY", "CANCEL_ALL", "CLOSE"]
-        assert close.starting_position_x18 == entry.amount_x18 // 2
+        assert close.starting_position_x18 == entry.amount_x18 - io.product.step_x18
         assert close.clamp_expected is True
         assert close.amount_x18 == -entry.amount_x18
         fills = store.persisted_fill_map()
@@ -556,7 +621,9 @@ def test_unrelated_prestate_stops_before_capability_or_dispatch(tmp_path: Path) 
     original = io.observe
     def unrelated(digests):
         value = original(digests)
-        account = replace(value.evidence.account, cross_perp_amounts_x18={2: X18})
+        account = replace(
+            value.evidence.account, cross_perp_amounts_x18={TARGET_PRODUCT_ID: X18}
+        )
         return replace(value, evidence=replace(value.evidence, account=account))
     io.observe = unrelated
     loads = 0

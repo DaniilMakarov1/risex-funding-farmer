@@ -20,7 +20,6 @@ from eth_keys.datatypes import Signature
 
 
 X18 = 10**18
-MAX_NOTIONAL_X18 = 500 * X18
 MAX_CLOSE_ATTEMPTS = 3
 UINT32_MAX = 2**32 - 1
 _ONLY_SYNTHETIC_PRIVATE_KEY = bytes.fromhex("00" * 31 + "01")
@@ -498,6 +497,26 @@ def _notional_x18(price_x18: int, amount_x18: int) -> int:
     return numerator // X18
 
 
+def smallest_executable_amount(
+    product: Product, *, prices_x18: tuple[int, ...]
+) -> int:
+    """Return the least step-aligned amount executable at every supplied price."""
+    product.assert_contract()
+    if product.minimum_amount_x18 % product.step_x18:
+        raise NadoContractError("minimum amount is off the x18 product step")
+    if not prices_x18:
+        raise NadoContractError("at least one execution price is required")
+    for price_x18 in prices_x18:
+        if price_x18 <= 0 or price_x18 % product.tick_x18:
+            raise NadoContractError("price is off the x18 product tick")
+    limiting_price = min(prices_x18)
+    required_for_notional = (
+        product.minimum_notional_x18 * X18 + limiting_price - 1
+    ) // limiting_price
+    required = max(product.minimum_amount_x18, required_for_notional)
+    return ((required + product.step_x18 - 1) // product.step_x18) * product.step_x18
+
+
 @dataclass(frozen=True)
 class EntryPlan:
     product_id: int
@@ -528,18 +547,13 @@ def validate_entry_preflight(
     product = products.get(product_id)
     if product is None or not product.active or product.product_type != ACTIVE_PERP:
         raise NadoContractError("target must be an active perpetual")
-    for price in (entry_price_x18, worst_close_price_x18):
-        if price <= 0 or price % product.tick_x18:
-            raise NadoContractError("price is off the x18 product tick")
-    amount = product.minimum_amount_x18
-    if amount % product.step_x18:
-        raise NadoContractError("minimum amount is off the x18 product step")
+    amount = smallest_executable_amount(
+        product, prices_x18=(entry_price_x18, worst_close_price_x18)
+    )
     entry_notional = _notional_x18(entry_price_x18, amount)
     close_notional = _notional_x18(worst_close_price_x18, amount)
     if min(entry_notional, close_notional) < product.minimum_notional_x18:
         raise NadoContractError("order is below product minimum notional")
-    if max(entry_notional, close_notional) > MAX_NOTIONAL_X18:
-        raise NadoContractError("entry or recovery exceeds USD 500")
     return EntryPlan(
         product_id=product_id,
         amount_x18=amount,
@@ -1575,13 +1589,16 @@ class LifecycleCore:
                 raise NadoContractError("authoritative residual is off the amount step")
             if worst_price_x18 <= 0 or worst_price_x18 % product.tick_x18:
                 raise NadoContractError("aggressive limit is off the price tick")
-            clamp_expected = absolute_position < product.minimum_amount_x18
-            submitted_amount = max(absolute_position, product.minimum_amount_x18)
+            executable_minimum = smallest_executable_amount(
+                product, prices_x18=(worst_price_x18,)
+            )
+            submitted_amount = max(absolute_position, executable_minimum)
+            clamp_expected = absolute_position < submitted_amount
             if submitted_amount % product.step_x18:
                 raise NadoContractError("close amount is off the x18 product step")
             notional = _notional_x18(worst_price_x18, submitted_amount)
-            if notional < product.minimum_notional_x18 or notional > MAX_NOTIONAL_X18:
-                raise NadoContractError("close notional violates minimum or USD 500 cap")
+            if notional < product.minimum_notional_x18:
+                raise NadoContractError("close notional violates minimum")
             signed_amount = -submitted_amount if position > 0 else submitted_amount
             nonce = build_order_nonce(recv_time, salt)
             order = SyntheticOrderVector(
