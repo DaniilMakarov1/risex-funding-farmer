@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import copy
+from concurrent.futures import ThreadPoolExecutor
 import importlib
 import inspect
 import json
 from pathlib import Path
 from decimal import Decimal
+from threading import Barrier, Lock
 import time
 
 import pytest
@@ -453,6 +455,89 @@ def test_post_bind_freshness_recheck_prevents_place_and_persists_recoverable_int
             path=path, io=io, capability=FakeSigner(), identity=IDENTITY,
         )
     assert io.place_calls == []
+
+
+def test_direct_rest_transport_is_thread_safe_and_fail_closed():
+    class Response:
+        def __init__(self, status, body):
+            self.status = status
+            self._body = json.dumps(body).encode()
+
+        def read(self, _limit):
+            return self._body
+
+    class Connection:
+        def __init__(self, connection_id, *, barrier=None, error=None, status=200):
+            self.connection_id = connection_id
+            self.barrier = barrier
+            self.error = error
+            self.status = status
+            self.closed = False
+            self.request_args = None
+
+        def request(self, method, path, *, body=None, headers=None):
+            self.request_args = (method, path, body, headers)
+            if self.barrier is not None:
+                self.barrier.wait(timeout=2)
+
+        def getresponse(self):
+            if self.error is not None:
+                raise self.error
+            if self.status != 200:
+                return Response(self.status, {"status": "ERROR", "data": {}})
+            return Response(200, {"status": "OK", "data": {"id": self.connection_id}})
+
+        def close(self):
+            self.closed = True
+
+    transport = importlib.import_module(
+        "risex_farmer.extended_testnet_lifecycle_operational"
+    ).ExtendedRestTransport("fixture-api-key")
+    barrier = Barrier(8)
+    factory_lock = Lock()
+    connections = []
+
+    def factory():
+        with factory_lock:
+            connection_id = len(connections)
+            connection = Connection(connection_id, barrier=barrier)
+            connections.append(connection)
+            return connection
+
+    transport._connection_factory = factory
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(
+            executor.map(
+                lambda index: transport.request("GET", f"/user/orders/{index}"),
+                range(8),
+            )
+        )
+    assert {result["data"]["id"] for result in results} == set(range(8))
+    assert len(connections) == 8
+    assert all(connection.closed for connection in connections)
+    assert all(
+        connection.request_args[3]["X-Api-Key"] == "fixture-api-key"
+        for connection in connections
+    )
+
+    failing_connection = Connection(
+        9, error=ConnectionResetError("sensitive transport detail")
+    )
+    transport._connection_factory = lambda: failing_connection
+    with pytest.raises(RestFailure) as transport_failure:
+        transport.request("GET", "/user/orders")
+    assert transport_failure.value.code == "REST_TRANSPORT"
+    assert transport_failure.value.failure_class == "TRANSPORT"
+    assert "sensitive" not in str(transport_failure.value)
+    assert failing_connection.closed
+
+    http_failure_connection = Connection(10, status=503)
+    transport._connection_factory = lambda: http_failure_connection
+    with pytest.raises(RestFailure) as http_failure:
+        transport.request("GET", "/user/orders")
+    assert http_failure.value.code == "REST_HTTP_STATUS"
+    assert http_failure.value.failure_class == "HTTP"
+    assert http_failure_connection.closed
 
 
 def test_identity_accepts_observed_account_id_and_canonical_l2_vault_string():
