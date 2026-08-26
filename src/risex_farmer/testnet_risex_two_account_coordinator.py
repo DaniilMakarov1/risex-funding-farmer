@@ -2284,6 +2284,64 @@ def market_for_contract(market: MarketObservation) -> Any:
     )
 
 
+def _fixed_contract_market() -> Any:
+    from .testnet_risex_order_lifecycle import MarketState
+
+    return MarketState(
+        host=OFFICIAL_HOST,
+        chain_id=OFFICIAL_CHAIN_ID,
+        domain_name=OFFICIAL_DOMAIN_NAME,
+        domain_version=OFFICIAL_DOMAIN_VERSION,
+        router=ROUTER,
+        authorization=AUTHORIZATION,
+        market_id=MARKET_ID,
+        symbol=MARKET_SYMBOL,
+        active=True,
+        unlocked=True,
+        tick=MARKET_TICK,
+        step=MARKET_STEP,
+        minimum=MARKET_MINIMUM,
+        observed_at=0,
+    )
+
+
+def _expected_permit(
+    identity: RoleIdentity, action_hash: bytes,
+    nonce_anchor: int, nonce_bitmap: int, deadline: int,
+) -> dict[str, Any]:
+    try:
+        return verify_witness_typed_data(
+            account=identity.account,
+            market=_fixed_contract_market(),
+            action_hash=action_hash,
+            nonce_anchor=nonce_anchor,
+            nonce_bitmap=nonce_bitmap,
+            deadline=deadline,
+        )
+    except Exception:
+        raise CoordinatorSafetyError("RISEx permit binding rejected") from None
+
+
+def _wire_uint(value: Any, bits: int, label: str) -> int:
+    try:
+        return _uint(value, bits, label)
+    except Exception:
+        raise CoordinatorSafetyError("RISEx wire integer rejected") from None
+
+
+def _wire_nonce_anchor(value: Any) -> int:
+    if not isinstance(value, str) or not value or str(int(value)) != value:
+        raise CoordinatorSafetyError("RISEx nonce anchor binding rejected")
+    return _wire_uint(int(value), 48, "nonce_anchor")
+
+
+def _wire_deadline(value: Any) -> int:
+    deadline = _wire_uint(value, 32, "deadline")
+    if deadline == 0:
+        raise CoordinatorSafetyError("RISEx deadline binding rejected")
+    return deadline
+
+
 def unsigned_place_request(
     intent: DurableIntent, *, identity: RoleIdentity, market: MarketObservation,
 ) -> dict[str, Any]:
@@ -2379,57 +2437,169 @@ def unsigned_cancel_request(
 
 
 def _validate_unsigned_place(request: Mapping[str, Any], identity: RoleIdentity) -> None:
-    if (
-        set(request) != {
-            "action", "header_flags", "order_data", "abi_encoded", "action_hash",
-            "action_digest", "permit", "body", "signature", "dispatchable",
-        }
-        or request["action"] != PLACE_ACTION
-        or request["header_flags"] != HEADER_FLAGS
-        or request["signature"] is not None
-        or request["dispatchable"] is not False
-        or not isinstance(request["action_hash"], bytes)
-        or len(request["action_hash"]) != 32
-        or request["action_digest"] != request["action_hash"].hex()
-    ):
-        raise CoordinatorSafetyError("RISEx place request binding rejected")
-    body = request["body"]
-    if (
-        not isinstance(body, Mapping)
-        or set(body) != {
-            "market_id", "size_steps", "price_ticks", "side", "order_type",
-            "time_in_force", "post_only", "reduce_only", "stp_mode",
-            "client_order_id", "account", "signer", "nonce_anchor",
-            "nonce_bitmap_index", "deadline",
-        }
-        or body["account"].lower() != identity.account
-        or body["signer"].lower() != identity.signer
-    ):
-        raise CoordinatorSafetyError("RISEx place identity binding rejected")
+    try:
+        if (
+            set(request) != {
+                "action", "header_flags", "order_data", "abi_encoded", "action_hash",
+                "action_digest", "permit", "body", "signature", "dispatchable",
+            }
+            or request["action"] != PLACE_ACTION
+            or request["header_flags"] != HEADER_FLAGS
+            or request["signature"] is not None
+            or request["dispatchable"] is not False
+            or type(request["order_data"]) is not int
+            or type(request["abi_encoded"]) is not bytes
+            or type(request["action_hash"]) is not bytes
+            or len(request["action_hash"]) != 32
+            or type(request["action_digest"]) is not str
+            or request["action_digest"] != request["action_hash"].hex()
+        ):
+            raise CoordinatorSafetyError("RISEx place request binding rejected")
+        body = request["body"]
+        if (
+            not isinstance(body, Mapping)
+            or set(body) != {
+                "market_id", "size_steps", "price_ticks", "side", "order_type",
+                "time_in_force", "post_only", "reduce_only", "stp_mode",
+                "client_order_id", "account", "signer", "nonce_anchor",
+                "nonce_bitmap_index", "deadline",
+            }
+            or type(body["market_id"]) is not int
+            or body["market_id"] != MARKET_ID
+            or type(body["size_steps"]) is not int
+            or type(body["price_ticks"]) is not int
+            or type(body["side"]) is not int
+            or type(body["order_type"]) is not int
+            or type(body["time_in_force"]) is not int
+            or type(body["post_only"]) is not bool
+            or type(body["reduce_only"]) is not bool
+            or type(body["stp_mode"]) is not int
+            or body["stp_mode"] != 0
+            or type(body["client_order_id"]) is not int
+            or type(body["account"]) is not str
+            or body["account"] != identity.account
+            or type(body["signer"]) is not str
+            or body["signer"] != identity.signer
+        ):
+            raise CoordinatorSafetyError("RISEx place identity binding rejected")
+        size_steps = _wire_uint(body["size_steps"], 32, "size_steps")
+        if size_steps < int(MARKET_MINIMUM / MARKET_STEP):
+            raise CoordinatorSafetyError("RISEx place size binding rejected")
+        price_ticks = _wire_uint(body["price_ticks"], 24, "price_ticks")
+        if price_ticks == 0:
+            raise CoordinatorSafetyError("RISEx place price binding rejected")
+        side = {0: "BUY", 1: "SELL"}.get(body["side"])
+        order_type = {0: "MARKET", 1: "LIMIT"}.get(body["order_type"])
+        time_in_force = {0: "GTC", 3: "IOC"}.get(body["time_in_force"])
+        if side is None or order_type is None or time_in_force is None:
+            raise CoordinatorSafetyError("RISEx place enum binding rejected")
+        if (
+            (order_type == "MARKET" and (time_in_force != "IOC" or body["post_only"]))
+            or (order_type == "LIMIT" and (time_in_force != "GTC" or not body["post_only"]))
+        ):
+            raise CoordinatorSafetyError("RISEx place liquidity binding rejected")
+        client_order_id = _wire_uint(body["client_order_id"], 64, "client_order_id")
+        if client_order_id == 0:
+            raise CoordinatorSafetyError("RISEx place client binding rejected")
+        nonce_anchor = _wire_nonce_anchor(body["nonce_anchor"])
+        nonce_bitmap = _wire_uint(body["nonce_bitmap_index"], 8, "nonce_bitmap")
+        if nonce_bitmap > 207:
+            raise CoordinatorSafetyError("RISEx place nonce binding rejected")
+        deadline = _wire_deadline(body["deadline"])
+        order_data = pack_order_data(
+            market_id=MARKET_ID, size_steps=size_steps, price_ticks=price_ticks,
+            side=side, post_only=body["post_only"], reduce_only=body["reduce_only"],
+            order_type=order_type, time_in_force=time_in_force,
+        )
+        encoded, action_hash = encode_place_action(
+            order_data=order_data, client_order_id=client_order_id,
+        )
+        expected_permit = _expected_permit(
+            identity, action_hash, nonce_anchor, nonce_bitmap, deadline,
+        )
+        if (
+            request["order_data"] != order_data
+            or request["abi_encoded"] != encoded
+            or request["action_hash"] != action_hash
+            or request["permit"] != expected_permit
+            or body["nonce_anchor"] != str(expected_permit["message"]["nonceAnchor"])
+            or body["nonce_bitmap_index"] != expected_permit["message"]["nonceBitmap"]
+            or body["deadline"] != expected_permit["message"]["deadline"]
+        ):
+            raise CoordinatorSafetyError("RISEx place canonical binding rejected")
+    except CoordinatorSafetyError:
+        raise
+    except Exception:
+        raise CoordinatorSafetyError("RISEx place request binding rejected") from None
 
 
 def _validate_unsigned_cancel(request: Mapping[str, Any], identity: RoleIdentity) -> None:
-    if (
-        set(request) != {
-            "action", "market_id", "resting_order_id", "abi_encoded", "action_hash",
-            "permit", "body", "signature", "dispatchable",
-        }
-        or request["action"] != CANCEL_ACTION
-        or request["signature"] is not None
-        or request["dispatchable"] is not False
-    ):
-        raise CoordinatorSafetyError("RISEx cancel request binding rejected")
-    body = request["body"]
-    permit = body.get("permit") if isinstance(body, Mapping) else None
-    if (
-        not isinstance(body, Mapping)
-        or set(body) != {"market_id", "order_id", "permit"}
-        or not isinstance(permit, Mapping)
-        or permit.get("account", "").lower() != identity.account
-        or permit.get("signer", "").lower() != identity.signer
-        or permit.get("signature") is not None
-    ):
-        raise CoordinatorSafetyError("RISEx cancel identity binding rejected")
+    try:
+        if (
+            set(request) != {
+                "action", "market_id", "resting_order_id", "abi_encoded", "action_hash",
+                "permit", "body", "signature", "dispatchable",
+            }
+            or request["action"] != CANCEL_ACTION
+            or request["signature"] is not None
+            or request["dispatchable"] is not False
+            or type(request["market_id"]) is not int
+            or type(request["resting_order_id"]) is not int
+            or type(request["abi_encoded"]) is not bytes
+            or type(request["action_hash"]) is not bytes
+            or len(request["action_hash"]) != 32
+        ):
+            raise CoordinatorSafetyError("RISEx cancel request binding rejected")
+        market_id = _wire_uint(request["market_id"], 16, "market_id")
+        if market_id != MARKET_ID:
+            raise CoordinatorSafetyError("RISEx cancel market binding rejected")
+        resting_order_id = _wire_uint(request["resting_order_id"], 64, "resting_order_id")
+        body = request["body"]
+        permit = body.get("permit") if isinstance(body, Mapping) else None
+        if (
+            not isinstance(body, Mapping)
+            or set(body) != {"market_id", "order_id", "permit"}
+            or body["market_id"] != market_id
+            or not isinstance(body["order_id"], str)
+            or not _valid_order_id(body["order_id"])
+            or not isinstance(permit, Mapping)
+            or set(permit) != {
+                "account", "signer", "nonce_anchor", "nonce_bitmap_index",
+                "deadline", "signature",
+            }
+            or permit["account"] != identity.account
+            or permit["signer"] != identity.signer
+            or permit["signature"] is not None
+        ):
+            raise CoordinatorSafetyError("RISEx cancel identity binding rejected")
+        if _wide_order_id(body["order_id"]) >> 1 != resting_order_id:
+            raise CoordinatorSafetyError("RISEx cancel resting identity rejected")
+        nonce_anchor = _wire_nonce_anchor(permit["nonce_anchor"])
+        nonce_bitmap = _wire_uint(permit["nonce_bitmap_index"], 8, "nonce_bitmap")
+        if nonce_bitmap > 207:
+            raise CoordinatorSafetyError("RISEx cancel nonce binding rejected")
+        deadline = _wire_deadline(permit["deadline"])
+        encoded, action_hash = encode_cancel_action(
+            market_id=market_id, resting_order_id=resting_order_id,
+        )
+        expected_permit = _expected_permit(
+            identity, action_hash, nonce_anchor, nonce_bitmap, deadline,
+        )
+        if (
+            request["market_id"] != market_id
+            or request["resting_order_id"] != resting_order_id
+            or request["abi_encoded"] != encoded
+            or request["action_hash"] != action_hash
+            or request["permit"] != expected_permit
+            or permit["nonce_anchor"] != str(expected_permit["message"]["nonceAnchor"])
+            or permit["nonce_bitmap_index"] != expected_permit["message"]["nonceBitmap"]
+            or permit["deadline"] != expected_permit["message"]["deadline"]
+        ):
+            raise CoordinatorSafetyError("RISEx cancel canonical binding rejected")
+    except CoordinatorSafetyError:
+        raise
+    except Exception:
+        raise CoordinatorSafetyError("RISEx cancel request binding rejected") from None
 
 
 def _validate_unsigned_auth_frame(frame: Mapping[str, Any], identity: RoleIdentity) -> None:
@@ -3612,32 +3782,28 @@ class TwoAccountCoordinator:
                     raise CoordinatorSafetyError("RISEx final zero-flat barrier rejected")
                 self._prove_final_account(role, account)
             fingerprint = _canonical_digest({
-                "market": {
-                    "market_id": observation.market.market_id,
-                    "bid": str(observation.market.book.bid),
-                    "ask": str(observation.market.book.ask),
-                    "bids": tuple((str(item.price), str(item.quantity), item.order_count) for item in observation.market.book.bids),
-                    "asks": tuple((str(item.price), str(item.quantity), item.order_count) for item in observation.market.book.asks),
-                },
                 "accounts": {
                     role.value: {
                         "account": observation.accounts[role].account,
+                        "signer": observation.accounts[role].signer,
+                        "signer_status": observation.accounts[role].signer_status,
                         "position": str(observation.accounts[role].position),
-                        "open_orders": tuple(item.order_id for item in observation.accounts[role].open_orders),
+                        "open_orders": tuple(sorted(
+                            _order_history_evidence(item)
+                            for item in observation.accounts[role].open_orders
+                        )),
                         "history_orders": tuple(sorted(
-                            (
-                                item.order_id, item.client_order_id, item.status,
-                                str(item.filled_size), str(item.price),
-                            )
+                            _order_history_evidence(item)
                             for item in observation.accounts[role].history_orders
                         )),
                         "trades": tuple(sorted(
-                            (
-                                item.trade_id, item.order_id,
-                                item.client_order_id, str(item.size), str(item.price),
-                            )
+                            _trade_history_evidence(item)
                             for item in observation.accounts[role].trades
                         )),
+                        "portfolio": {
+                            "in_liquidation": observation.accounts[role].portfolio.in_liquidation,
+                            "risk_level": observation.accounts[role].portfolio.risk_level,
+                        },
                     }
                     for role in (AccountRole.PRIMARY, AccountRole.COUNTERPARTY)
                 },

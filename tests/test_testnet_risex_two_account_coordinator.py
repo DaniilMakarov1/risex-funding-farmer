@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 from dataclasses import replace
 from decimal import Decimal
 import json
@@ -21,6 +22,7 @@ from risex_farmer.testnet_risex_two_account_coordinator import (
     CoordinatorSafetyError,
     CoordinatorResult,
     DurableIntent,
+    DurableCancel,
     FixedRisexTwoAccountTransport,
     FixedRisexTwoAccountVenue,
     HISTORY_PATH,
@@ -54,6 +56,10 @@ from risex_farmer.testnet_risex_two_account_coordinator import (
     _point_position,
     _position_maps_agree,
     _validate_order,
+    _validate_unsigned_cancel,
+    _validate_unsigned_place,
+    unsigned_cancel_request,
+    unsigned_place_request,
 )
 from risex_farmer.testnet_risex_private_read_preflight import (
     ACCOUNT,
@@ -252,6 +258,170 @@ def trade(*, trade_id: str, item: RestOrder, side: str, price: str):
         price=Decimal(price),
         observed_at=NOW,
     )
+
+
+def _unsigned_place_fixture():
+    identity = _primary_identity()
+    intent = DurableIntent(
+        intent_id="intent-place",
+        ordinal=1,
+        step="ENTRY_TAKER",
+        client_order_id=4013,
+        nonce_anchor=1,
+        nonce_bitmap=0,
+        payload_digest="payload",
+        bbo_digest="b" * 64,
+        state="PREPARED",
+        side="BUY",
+        order_type="MARKET",
+        time_in_force="IOC",
+        reduce_only=False,
+        post_only=False,
+        market_id=2,
+        size=Decimal("0.1"),
+        price=Decimal("3008.01"),
+        source_position=Decimal("0"),
+        expires_at=NOW + 30,
+        dispatch_count=0,
+        order_id=None,
+        filled_size=None,
+        reconciled=False,
+    )
+    return identity, unsigned_place_request(intent, identity=identity, market=market())
+
+
+def _unsigned_cancel_fixture():
+    identity = _primary_identity()
+    resting = order(
+        wide=413, client=4013, account=ACCOUNT, side="SELL",
+        order_type="LIMIT", tif="GTC", status="OPEN", price="2999.01",
+        post_only=True,
+    )
+    cancel = DurableCancel(
+        cancel_id="cancel-resting",
+        intent_id="intent-maker",
+        order_id=resting.order_id,
+        market_id=2,
+        resting_order_id=resting.resting_order_id,
+        nonce_anchor=1,
+        nonce_bitmap=0,
+        payload_digest="payload-cancel",
+        expires_at=NOW + 30,
+        state="PREPARED",
+        dispatch_count=0,
+    )
+    return identity, unsigned_cancel_request(cancel, identity=identity, market=market())
+
+
+def _flip_first_byte(value: bytes) -> bytes:
+    return bytes((value[0] ^ 1,)) + value[1:]
+
+
+def test_unsigned_place_and_cancel_requests_bind_the_canonical_contract():
+    place_identity, place = _unsigned_place_fixture()
+    cancel_identity, cancel = _unsigned_cancel_fixture()
+    _validate_unsigned_place(place, place_identity)
+    _validate_unsigned_cancel(cancel, cancel_identity)
+
+
+@pytest.mark.parametrize(
+    "label, mutate",
+    [
+        pytest.param("side", lambda request: request["body"].__setitem__("side", 1), id="side"),
+        pytest.param("order_type", lambda request: request["body"].__setitem__("order_type", 1), id="order-type"),
+        pytest.param("time_in_force", lambda request: request["body"].__setitem__("time_in_force", 0), id="time-in-force"),
+        pytest.param("post_only", lambda request: request["body"].__setitem__("post_only", True), id="post-only"),
+        pytest.param("reduce_only", lambda request: request["body"].__setitem__("reduce_only", True), id="reduce-only"),
+        pytest.param("size_steps", lambda request: request["body"].__setitem__("size_steps", 101), id="size-steps"),
+        pytest.param("price_ticks", lambda request: request["body"].__setitem__("price_ticks", 300802), id="price-ticks"),
+        pytest.param("client_order_id", lambda request: request["body"].__setitem__("client_order_id", 4014), id="client-order-id"),
+        pytest.param("market_id", lambda request: request["body"].__setitem__("market_id", 3), id="market-id"),
+        pytest.param("nonce_anchor", lambda request: request["body"].__setitem__("nonce_anchor", "2"), id="nonce-anchor"),
+        pytest.param("nonce_bitmap", lambda request: request["body"].__setitem__("nonce_bitmap_index", 1), id="nonce-bitmap"),
+        pytest.param("deadline", lambda request: request["body"].__setitem__("deadline", NOW + 31), id="deadline"),
+        pytest.param("account", lambda request: request["body"].__setitem__("account", COUNTERPARTY), id="account"),
+        pytest.param("signer", lambda request: request["body"].__setitem__("signer", COUNTERPARTY_SIGNER), id="signer"),
+        pytest.param("header_flags", lambda request: request.__setitem__("header_flags", 0), id="header-flags"),
+        pytest.param("order_data", lambda request: request.__setitem__("order_data", request["order_data"] + 1), id="order-data"),
+        pytest.param("abi_encoded", lambda request: request.__setitem__("abi_encoded", _flip_first_byte(request["abi_encoded"])), id="abi-encoded"),
+        pytest.param("action_hash", lambda request: request.__setitem__("action_hash", b"\\x00" * 32), id="action-hash"),
+        pytest.param("action_digest", lambda request: request.__setitem__("action_digest", "0" * 64), id="action-digest"),
+        pytest.param("permit_hash", lambda request: request["permit"]["message"].__setitem__("hash", "0x" + "00" * 32), id="permit-hash"),
+        pytest.param("permit_nonce_anchor", lambda request: request["permit"]["message"].__setitem__("nonceAnchor", 2), id="permit-nonce-anchor"),
+        pytest.param("permit_deadline", lambda request: request["permit"]["message"].__setitem__("deadline", NOW + 31), id="permit-deadline"),
+    ],
+)
+def test_unsigned_place_rejects_any_canonical_mutation(label, mutate):
+    identity, request = _unsigned_place_fixture()
+    mutated = copy.deepcopy(request)
+    mutate(mutated)
+    with pytest.raises(CoordinatorSafetyError):
+        _validate_unsigned_place(mutated, identity)
+
+
+@pytest.mark.parametrize(
+    "label, mutate",
+    [
+        pytest.param("action", lambda request: request.__setitem__("action", "other"), id="action"),
+        pytest.param("market_id", lambda request: request.__setitem__("market_id", 3), id="market-id"),
+        pytest.param("resting_order_id", lambda request: request.__setitem__("resting_order_id", request["resting_order_id"] + 1), id="resting-order-id"),
+        pytest.param("abi_encoded", lambda request: request.__setitem__("abi_encoded", _flip_first_byte(request["abi_encoded"])), id="abi-encoded"),
+        pytest.param("action_hash", lambda request: request.__setitem__("action_hash", b"\\x00" * 32), id="action-hash"),
+        pytest.param("body_market_id", lambda request: request["body"].__setitem__("market_id", 3), id="body-market-id"),
+        pytest.param("body_order_id", lambda request: request["body"].__setitem__("order_id", order(
+            wide=415, client=4015, account=ACCOUNT, side="SELL", order_type="LIMIT",
+            tif="GTC", status="OPEN", price="2999.01", post_only=True,
+        ).order_id), id="body-order-id"),
+        pytest.param("account", lambda request: request["body"]["permit"].__setitem__("account", COUNTERPARTY), id="account"),
+        pytest.param("signer", lambda request: request["body"]["permit"].__setitem__("signer", COUNTERPARTY_SIGNER), id="signer"),
+        pytest.param("nonce_anchor", lambda request: request["body"]["permit"].__setitem__("nonce_anchor", "2"), id="nonce-anchor"),
+        pytest.param("nonce_bitmap", lambda request: request["body"]["permit"].__setitem__("nonce_bitmap_index", 1), id="nonce-bitmap"),
+        pytest.param("deadline", lambda request: request["body"]["permit"].__setitem__("deadline", NOW + 31), id="deadline"),
+        pytest.param("permit_hash", lambda request: request["permit"]["message"].__setitem__("hash", "0x" + "00" * 32), id="permit-hash"),
+        pytest.param("permit_nonce_anchor", lambda request: request["permit"]["message"].__setitem__("nonceAnchor", 2), id="permit-nonce-anchor"),
+        pytest.param("permit_deadline", lambda request: request["permit"]["message"].__setitem__("deadline", NOW + 31), id="permit-deadline"),
+    ],
+)
+def test_unsigned_cancel_rejects_any_canonical_mutation(label, mutate):
+    identity, request = _unsigned_cancel_fixture()
+    mutated = copy.deepcopy(request)
+    mutate(mutated)
+    with pytest.raises(CoordinatorSafetyError):
+        _validate_unsigned_cancel(mutated, identity)
+
+
+def test_adapter_rejects_unsigned_mutations_before_credential_load():
+    counterparty = RoleIdentity(
+        AccountRole.COUNTERPARTY, FIXED_COUNTERPARTY_ACCOUNT,
+        FIXED_COUNTERPARTY_SIGNER, "key", "marker", "journal",
+    )
+    loaded: list[bool] = []
+
+    def load_credential():
+        loaded.append(True)
+        raise AssertionError("credential must not be loaded")
+
+    venue = FixedRisexTwoAccountVenue(
+        identities={
+            AccountRole.PRIMARY: _primary_identity(),
+            AccountRole.COUNTERPARTY: counterparty,
+        },
+        credential_loaders={
+            AccountRole.PRIMARY: load_credential,
+            AccountRole.COUNTERPARTY: load_credential,
+        },
+        transport=object(),
+        now=lambda: NOW,
+    )
+    place_identity, place = _unsigned_place_fixture()
+    place["body"]["side"] = 1
+    with pytest.raises(CoordinatorSafetyError):
+        asyncio.run(venue.place(place_identity.role, place))
+    cancel_identity, cancel = _unsigned_cancel_fixture()
+    cancel["resting_order_id"] += 1
+    with pytest.raises(CoordinatorSafetyError):
+        asyncio.run(venue.cancel(cancel_identity.role, cancel))
+    assert loaded == []
 
 
 def with_private(value: AccountSnapshot) -> AccountSnapshot:
@@ -469,7 +639,7 @@ def test_process_death_after_durable_dispatch_never_replays(tmp_path: Path):
     assert recovery_venue.place_calls == []
 
 
-def test_final_rest_round_mismatch_halts(tmp_path: Path):
+def test_final_rest_round_allows_fresh_bbo_change(tmp_path: Path):
     observations, rounds = lifecycle_observations(
         second_final_book=BookObservation(
             bid=Decimal("2998.99"), ask=Decimal("2999.01"),
@@ -477,6 +647,56 @@ def test_final_rest_round_mismatch_halts(tmp_path: Path):
             asks=(BookLevel(Decimal("2999.01"), Decimal("1"), 1),), observed_at=NOW,
         ),
     )
+    report = asyncio.run(make_lifecycle(tmp_path, LifecycleVenue(observations, rounds)).run())
+    assert report.result is CoordinatorResult.COMPLETE
+    assert report.final_rounds == 2
+
+
+def test_final_rest_round_allows_positive_balance_settlement(tmp_path: Path):
+    observations, rounds = lifecycle_observations()
+    final = rounds[1]
+    primary = final.accounts[AccountRole.PRIMARY]
+    assert primary.portfolio is not None
+    settled = replace(
+        primary.portfolio,
+        usdc_balance=Decimal("999.50"),
+        free_collateral=Decimal("998.50"),
+        total_account_value=Decimal("999.75"),
+    )
+    rounds[1] = replace(final, accounts={
+        AccountRole.PRIMARY: replace(primary, portfolio=settled),
+        AccountRole.COUNTERPARTY: final.accounts[AccountRole.COUNTERPARTY],
+    })
+    report = asyncio.run(make_lifecycle(tmp_path, LifecycleVenue(observations, rounds)).run())
+    assert report.result is CoordinatorResult.COMPLETE
+    assert report.final_rounds == 2
+
+
+@pytest.mark.parametrize("kind", ["position", "order", "trade"])
+def test_final_rest_round_account_discrepancy_halts(tmp_path: Path, kind: str):
+    observations, rounds = lifecycle_observations()
+    final = rounds[1]
+    primary = final.accounts[AccountRole.PRIMARY]
+    if kind == "position":
+        changed = replace(primary, position=Decimal("0.001"))
+    elif kind == "order":
+        extra = order(
+            wide=415, client=4015, account=ACCOUNT, side="BUY",
+            order_type="MARKET", tif="IOC", status="FILLED", price="0",
+            filled="0.1",
+        )
+        changed = replace(primary, history_orders=(*primary.history_orders, extra))
+    else:
+        extra = trade(
+            trade_id=f"{primary.history_orders[0].order_id}-{primary.history_orders[0].order_id}",
+            item=primary.history_orders[0], side="BUY", price="2999.01",
+        )
+        changed = replace(primary, trades=(*primary.trades, extra))
+    rounds[1] = replace(final, accounts={
+        AccountRole.PRIMARY: changed,
+        AccountRole.COUNTERPARTY: final.accounts[AccountRole.COUNTERPARTY],
+    })
+
     report = asyncio.run(make_lifecycle(tmp_path, LifecycleVenue(observations, rounds)).run())
     assert report.result is CoordinatorResult.FAILED_HALTED_MANUAL_RECOVERY
     assert report.final_rounds == 1
