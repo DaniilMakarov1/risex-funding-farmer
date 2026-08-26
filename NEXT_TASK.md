@@ -11,14 +11,15 @@ Status: `OBSERVED TESTNET ZERO-FILL BLOCKER`.
 
 ## Nado — sequential Level C lifecycle
 
-Status: `AUTHORIZED OBSERVED-WRITE CORRECTION`.
+Status: `AUTHORIZED MINIMUM-SEMANTICS/COLLATERAL CORRECTION`.
 
 - The signed trigger read now uses the accepted 30,000 ms window; the actual write retains its 100 ms contract. Current catalog minima are accepted as published, while the actual target opening and clamped closing amounts remain exactly step-aligned and fully safety-checked.
 - All three invocations stopped with zero intents and zero venue writes. Fixed BTC product 2 now has a minimum notional far above USD 500; credentials/private access and signing remain valid.
 - Product 44 `SKR-PERP_USDT0` is accepted at the current smallest executable 650-SKR amount. Its first post-only execute halted ambiguous; exact post-window order query returned code 2020/not found and repeated authoritative zero-order/zero-fill/exact-flat evidence allowed protected local completion recovery without replay.
-- The accepted exact-ask IOC correction dispatched once and received complete venue rejection code 2011; the durable `REJECTED/HALTED` state prevents replay. Account collateral/health is about 10 USDT0 and all orders/positions remain zero. Official current quickstart guidance for a market buy uses IOC with a price 10% above the current price.
-- In a fresh visible Nado Builder worktree, use the smallest tick-aligned official 10%-buffered IOC buy bound and make the outer sealed report preserve the already-durable sanitized venue-rejection class/code instead of collapsing it into `OPERATIONAL_PREREQUISITE_FAILED`. Preserve exact product identity, signing, durable intent-before-dispatch, ambiguity no-replay, bounded close, and final zero-order/exact-flat barriers.
-- After acceptance, Chief archives only the exact recovered terminal database and runs one fresh sequential lifecycle.
+- The accepted exact-ask and tick-aligned 10%-buffered IOC attempts each dispatched once and received complete venue rejection code 2011. The latest durable `REJECTED/HALTED` state prevents replay; exact post-window reads prove zero orders, positions, and fills plus `query_order` code 2020/not found.
+- Official current semantics denominate `min_size` in USDT0. Every current live perpetual publishes a 100-USDT0 minimum, while the runner misreads that field as a base amount, separately hard-codes USD 5, and submitted about USD 5.55 against only about 10 USDT0 collateral. Product 44 is currently `live`, so spread and market status are excluded.
+- In a fresh visible Nado Builder worktree, correct only the current USDT0-denominated minimum-size binding and its focused regressions while preserving the accepted 10%-buffered IOC, exact product identity, signing, durable intent-before-dispatch, ambiguity no-replay, bounded close, and final zero-order/exact-flat barriers. Do not perform a write.
+- After acceptance, Chief obtains and deposits enough free testnet USDT0 through the official Nado testnet path, archives the exact terminal database, proves authoritative zero/flat pre-state, and runs one fresh sequential lifecycle.
 
 ## Extended — wallet/API Management setup and lifecycle
 
