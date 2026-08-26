@@ -55,6 +55,7 @@ _SPOT_KEYS = {
     "contributionFactor", "equityContribution", "availableToWithdraw", "absolutePnl",
     "pnlPercentage", "averageEntryPrice", "updatedAt",
 }
+_MAX_FALLBACK_PAGE_ITEMS = 256
 
 
 class PreflightViolation(Exception):
@@ -128,6 +129,12 @@ class _ClockState:
     previous_current: int | None = None
 
 
+@dataclass(frozen=True)
+class _RestRound:
+    observations: tuple[int, ...]
+    fingerprint: str
+
+
 class PreflightStore:
     """A single-use SQLite terminal record containing redacted evidence only."""
 
@@ -179,7 +186,7 @@ class PreflightStore:
             raise PreflightViolation("DURABLE_EVIDENCE_INVALID")
         if (
             type(value["status"]) is not str
-            or value["status"] not in {"READY_FIXTURE", "BLOCKED"}
+            or value["status"] not in {"READY_FIXTURE", "READY_REST_FALLBACK", "BLOCKED"}
             or type(value["reason"]) is not str or not value["reason"]
             or type(value["rest_calls"]) is not int or value["rest_calls"] < 0
             or type(value["stream_frames"]) is not int or value["stream_frames"] < 0
@@ -188,6 +195,12 @@ class PreflightStore:
             or (value["status"] == "READY_FIXTURE" and (
                 value["reason"] != "FIXTURE_CONTRACT_PROVED"
                 or value["rest_calls"] != 6 or value["clock_calls"] != 7
+                or not value["identity_verified"]
+            ))
+            or (value["status"] == "READY_REST_FALLBACK" and (
+                value["reason"] != "REST_FALLBACK_CONTRACT_PROVED"
+                or value["rest_calls"] != 6 or value["clock_calls"] != 6
+                or value["stream_frames"] != 0
                 or not value["identity_verified"]
             ))
             or (value["status"] == "BLOCKED" and value["identity_verified"])
@@ -431,6 +444,130 @@ async def _rest_round(
             effect_ledger.complete(effect)
         observations.append(observed)
     return observations
+
+
+def _validate_fallback_list_wrapper(
+    body: Any, path: str, identity_matcher: Any = None,
+) -> dict[str, Any]:
+    if (
+        type(body) is not dict
+        or not {"status", "data", "pagination"}.issubset(body)
+        or not set(body).issubset({"status", "data", "error", "pagination"})
+    ):
+        raise PreflightViolation("REST_WRAPPER_MALFORMED")
+    if body["status"] != "OK" or body.get("error") is not None:
+        raise PreflightViolation("REST_RESPONSE_ERROR")
+    if type(body["data"]) is not list:
+        raise PreflightViolation("REST_LIST_MALFORMED")
+    page = body["pagination"]
+    if type(page) is not dict or set(page) != {"cursor", "count"}:
+        raise PreflightViolation("REST_PAGINATION_INVALID")
+    if page["cursor"] is not None:
+        raise PreflightViolation("REST_PAGINATION_INCOMPLETE")
+    if (
+        type(page["count"]) is not int
+        or page["count"] < 0
+        or page["count"] > _MAX_FALLBACK_PAGE_ITEMS
+        or page["count"] != len(body["data"])
+    ):
+        raise PreflightViolation("REST_PAGINATION_INVALID")
+    if body["data"]:
+        reason = "REST_OPEN_ORDER_PRESENT" if path == "/user/orders" else "REST_POSITION_PRESENT"
+        raise PreflightViolation(reason)
+    return {
+        "status": body["status"],
+        "data": [],
+        "error": body.get("error"),
+        "pagination": {"cursor": None, "count": page["count"]},
+    }
+
+
+async def _rest_fallback_round(
+    transport: Any, api_key: str, round_name: str, clock_ms: Any,
+    counters: _Counters, clock_state: _ClockState, identity_matcher: Any = None,
+    effect_ledger: Any = None,
+) -> _RestRound:
+    observations: list[int] = []
+    snapshots: list[dict[str, Any]] = []
+    for path in _REST_PATHS:
+        request = RestRequest(
+            method="GET",
+            url=f"{REST_BASE_URL}{path}",
+            path=path,
+            round_name=round_name,
+            headers={_API_HEADER: api_key},
+        )
+        counters.rest_calls += 1
+        effect = f"rest_{round_name.lower()}_{path.rsplit('/', 1)[-1]}"
+        if effect_ledger is not None:
+            effect_ledger.attempt(effect)
+        try:
+            reply = await transport.get(request)
+        except (ConnectionError, TimeoutError, OSError) as exc:
+            raise PreflightViolation("TRANSPORT") from exc
+        if effect_ledger is not None:
+            effect_ledger.observed(effect)
+        reply = _exact_object(
+            reply,
+            {"status", "final_url", "observed_at_ms", "body", "transport"},
+            "REST_REPLY_MALFORMED",
+        )
+        _validate_transport(reply["transport"], url=request.url)
+        if reply["status"] != 200:
+            raise PreflightViolation("REST_HTTP_STATUS")
+        if reply["final_url"] != request.url:
+            raise PreflightViolation("REST_REDIRECT_FORBIDDEN")
+        observed = reply["observed_at_ms"]
+        _fresh_current(observed, clock_ms, counters, clock_state)
+        if path == "/user/account/info":
+            _validate_wrapper(reply["body"], path, identity_matcher)
+            canonical = {
+                "status": reply["body"]["status"],
+                "data": reply["body"]["data"],
+            }
+        else:
+            canonical = _validate_fallback_list_wrapper(
+                reply["body"], path, identity_matcher
+            )
+        if effect_ledger is not None:
+            effect_ledger.complete(effect)
+        observations.append(observed)
+        snapshots.append(canonical)
+    return _RestRound(
+        tuple(observations),
+        json.dumps(snapshots, sort_keys=True, separators=(",", ":")),
+    )
+
+
+async def _execute_rest_fallback(
+    credential_loader: Any, transport: Any, clock_ms: Any, counters: _Counters,
+    identity_matcher: Any = None, effect_ledger: Any = None,
+) -> PreflightResult:
+    """Run the testnet-only replacement for the unavailable account stream.
+
+    The stream implementation above remains the separate readiness contract.
+    This path deliberately performs two complete REST observations in series,
+    with no WebSocket open, retry, or best-effort reconciliation.
+    """
+
+    api_key = await _load_api_key(credential_loader, effect_ledger)
+    clock_state = _ClockState()
+    round_a = await _rest_fallback_round(
+        transport, api_key, "A", clock_ms, counters, clock_state,
+        identity_matcher, effect_ledger,
+    )
+    round_b = await _rest_fallback_round(
+        transport, api_key, "B", clock_ms, counters, clock_state,
+        identity_matcher, effect_ledger,
+    )
+    if min(round_b.observations) <= max(round_a.observations):
+        raise PreflightViolation("REST_ROUNDS_NOT_ORDERED")
+    if round_a.fingerprint != round_b.fingerprint:
+        raise PreflightViolation("REST_ROUNDS_DISAGREE")
+    return PreflightResult(
+        "READY_REST_FALLBACK", "REST_FALLBACK_CONTRACT_PROVED",
+        counters.rest_calls, counters.stream_frames, True, counters.clock_calls,
+    )
 
 
 def _validate_stream_frame(
@@ -714,7 +851,50 @@ async def run_preflight(
     return result
 
 
+async def run_rest_fallback(
+    *, store: PreflightStore, credential_loader: Any, transport: Any, clock_ms: Any,
+    identity_matcher: Any = None,
+) -> PreflightResult:
+    """Run the isolated Extended-testnet REST-only Level-B fallback.
+
+    A terminal record is replayed without touching credentials, clocks, or
+    transport.  A nonterminal invocation is terminalized as blocked and is
+    never resumed, matching the stream preflight's one-shot safety rule.
+    """
+
+    existing = store.claim()
+    if existing is not None:
+        return existing
+    counters = _Counters()
+    cancelled = False
+    try:
+        result = await _execute_rest_fallback(
+            credential_loader, transport, clock_ms, counters, identity_matcher
+        )
+    except asyncio.CancelledError:
+        cancelled = True
+        result = PreflightResult(
+            "BLOCKED", "CANCELLED", counters.rest_calls, counters.stream_frames,
+            False, counters.clock_calls,
+        )
+    except PreflightViolation as exc:
+        result = PreflightResult(
+            "BLOCKED", str(exc), counters.rest_calls, counters.stream_frames,
+            False, counters.clock_calls,
+        )
+    except Exception:
+        result = PreflightResult(
+            "BLOCKED", "UNEXPECTED_FAILURE", counters.rest_calls,
+            counters.stream_frames, False, counters.clock_calls,
+        )
+    store.terminal(result)
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
+
+
 __all__ = [
     "ACCOUNT_ID", "REST_BASE_URL", "STREAM_URL", "PreflightResult",
     "PreflightStore", "RestRequest", "StreamRequest", "run_preflight",
+    "run_rest_fallback",
 ]

@@ -21,6 +21,7 @@ from typing import Any, Callable, Mapping, Sequence
 MAX_NOTIONAL_USD = Decimal("500")
 _MAX_AGE_MS = 30_000
 _MAX_ORDER_LIFETIME_MS = 60_000
+_MAX_REST_PAGE_ITEMS = 256
 
 SDK_PROVENANCE = MappingProxyType({
     "repository": "https://github.com/x10xchange/python_sdk",
@@ -127,6 +128,7 @@ _ORDER_KEYS = {
 _FILL_KEYS = {
     "id",
     "accountId",
+    "externalId",
     "market",
     "orderId",
     "side",
@@ -267,15 +269,24 @@ class OfficialEvidence:
     entry_vector: dict[str, Any]
     close_vector: dict[str, Any]
     position_template: dict[str, Any]
+    rest_rounds: tuple[RestRoundEvidence, ...] = ()
+    mode: str = "STREAM"
 
     @property
     def fresh(self) -> bool:
-        stamps = (
-            self.account_observed_ms,
-            self.book_event_ms,
-            self.stream_event_ms,
-            self.stream_received_ms,
-        )
+        if self.mode == "REST_FALLBACK":
+            stamps = tuple(
+                stamp
+                for round_evidence in self.rest_rounds
+                for stamp in (round_evidence.observed_at_ms, round_evidence.server_time_ms)
+            ) + (self.book_event_ms,)
+        else:
+            stamps = (
+                self.account_observed_ms,
+                self.book_event_ms,
+                self.stream_event_ms,
+                self.stream_received_ms,
+            )
         return all(0 <= self.now_ms - stamp <= _MAX_AGE_MS for stamp in stamps)
 
     def with_server_time(self, server_time: int, *, observed_at: int) -> "OfficialEvidence":
@@ -310,6 +321,20 @@ def _validate_position_row(row: Any, label: str) -> dict[str, Any]:
     return deepcopy(_strict(row, _POSITION_KEYS, set(), label))
 
 
+@dataclass(frozen=True)
+class RestRoundEvidence:
+    observed_at_ms: int
+    server_time_ms: int
+    account: dict[str, Any]
+    open_orders: tuple[dict[str, Any], ...]
+    positions: tuple[dict[str, Any], ...]
+    order_status: dict[str, Any] | None
+    order_history: tuple[dict[str, Any], ...]
+    trades: tuple[dict[str, Any], ...]
+    pagination: dict[str, dict[str, Any]]
+    fingerprint: str
+
+
 def _row_map(rows: Sequence[Mapping[str, Any]], key: str) -> dict[Any, Mapping[str, Any]]:
     mapped = {row[key]: row for row in rows}
     if len(mapped) != len(rows):
@@ -318,6 +343,8 @@ def _row_map(rows: Sequence[Mapping[str, Any]], key: str) -> dict[Any, Mapping[s
 
 
 def normalize_official_evidence(raw: Mapping[str, Any], *, now_ms: int) -> OfficialEvidence:
+    if isinstance(raw, Mapping) and "restRounds" in raw and "stream" not in raw:
+        return normalize_rest_fallback_evidence(raw, now_ms=now_ms)
     root_keys = {
         "provenance",
         "contract",
@@ -565,6 +592,326 @@ def normalize_official_evidence(raw: Mapping[str, Any], *, now_ms: int) -> Offic
     )
 
 
+def _validate_rest_round(
+    raw: Any,
+    *,
+    identity: Mapping[str, Any],
+    market_name: str,
+    expected_external_ids: frozenset[str],
+    now_ms: int,
+) -> RestRoundEvidence:
+    round_data = _strict(
+        raw,
+        {
+            "observedAt",
+            "serverTime",
+            "account",
+            "openOrders",
+            "positions",
+            "orderStatus",
+            "orderHistory",
+            "trades",
+            "pagination",
+        },
+        set(),
+        "rest.round",
+    )
+    for field in ("observedAt", "serverTime"):
+        value = round_data[field]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise EvidenceViolation(f"REST_TIMESTAMP_INVALID:{field}")
+        if value > now_ms:
+            raise EvidenceViolation("EVIDENCE_FROM_FUTURE")
+        if now_ms - value > _MAX_AGE_MS:
+            raise EvidenceViolation("STALE_EVIDENCE")
+
+    account = _strict(
+        round_data["account"],
+        {"info", "balance", "fees", "leverage"},
+        set(),
+        "rest.round.account",
+    )
+    info = _strict(
+        account["info"],
+        {
+            "id",
+            "description",
+            "accountIndex",
+            "status",
+            "l2Key",
+            "l2Vault",
+            "bridgeStarknetAddress",
+        },
+        set(),
+        "rest.round.account.info",
+    )
+    if (
+        info["id"] != identity["accountId"]
+        or info["accountIndex"] != identity["accountIndex"]
+        or info["l2Key"] != identity["l2Key"]
+        or info["l2Vault"] != identity["l2Vault"]
+    ):
+        raise EvidenceViolation("ACCOUNT_IDENTITY_MISMATCH")
+    if info["status"] != "ACTIVE":
+        raise EvidenceViolation("ACCOUNT_INACTIVE")
+    balance_keys = {
+        "collateralName",
+        "balance",
+        "equity",
+        "availableForTrade",
+        "availableForWithdrawal",
+        "unrealisedPnl",
+        "initialMargin",
+        "marginRatio",
+        "updatedTime",
+        "spotEquity",
+        "spotEquityForAvailableForTrade",
+        "collateralReservedForSpotOrders",
+    }
+    balance = deepcopy(_strict(account["balance"], balance_keys, set(), "rest.balance"))
+    if type(account["fees"]) is not list or type(account["leverage"]) is not list:
+        raise EvidenceViolation("WIRE_SCHEMA:rest.account")
+    fees = tuple(
+        deepcopy(_strict(row, {"market", "makerFeeRate", "takerFeeRate", "builderFeeRate"}, set(), "rest.fee"))
+        for row in account["fees"]
+    )
+    leverage = tuple(
+        deepcopy(_strict(row, {"market", "leverage"}, set(), "rest.leverage"))
+        for row in account["leverage"]
+    )
+
+    list_fields = ("openOrders", "positions", "orderHistory", "trades")
+    if any(type(round_data[field]) is not list for field in list_fields):
+        raise EvidenceViolation("WIRE_SCHEMA:rest.round.list")
+    open_orders = tuple(_validate_order_row(row, "rest.openOrder") for row in round_data["openOrders"])
+    positions = tuple(_validate_position_row(row, "rest.position") for row in round_data["positions"])
+    order_history = tuple(
+        _validate_order_row(row, "rest.orderHistory") for row in round_data["orderHistory"]
+    )
+    trades = tuple(_validate_fill_row(row, "rest.trade") for row in round_data["trades"])
+    order_status = (
+        _validate_order_row(round_data["orderStatus"], "rest.orderStatus")
+        if round_data["orderStatus"] is not None
+        else None
+    )
+
+    all_orders = (*open_orders, *order_history)
+    orders_by_external: dict[str, dict[str, Any]] = {}
+    orders_by_id: dict[int, dict[str, Any]] = {}
+    for row in all_orders:
+        if (
+            type(row["id"]) is not int
+            or row["id"] < 0
+            or type(row["externalId"]) is not str
+            or not row["externalId"]
+        ):
+            raise EvidenceViolation("REST_ORDER_IDENTITY_INVALID")
+        if row["accountId"] != identity["accountId"] or row["market"] != market_name:
+            raise EvidenceViolation("UNRELATED_ORDER")
+        if row["externalId"] not in expected_external_ids:
+            raise EvidenceViolation("UNRELATED_ORDER")
+        if row["externalId"] in orders_by_external or row["id"] in orders_by_id:
+            raise EvidenceViolation("REST_ORDER_IDENTITY_CONTRADICTION")
+        orders_by_external[row["externalId"]] = row
+        orders_by_id[row["id"]] = row
+    if order_status is not None:
+        if (
+            type(order_status["id"]) is not int
+            or order_status["id"] < 0
+            or type(order_status["externalId"]) is not str
+            or not order_status["externalId"]
+            or order_status["accountId"] != identity["accountId"]
+            or order_status["market"] != market_name
+            or order_status["externalId"] not in expected_external_ids
+        ):
+            raise EvidenceViolation("REST_ORDER_IDENTITY_INVALID")
+        if orders_by_external.get(order_status["externalId"]) != order_status:
+            raise EvidenceViolation("REST_ORDER_STATUS_HISTORY_DISAGREE")
+
+    for row in positions:
+        if row["accountId"] != identity["accountId"] or row["market"] != market_name:
+            raise EvidenceViolation("UNRELATED_POSITION")
+    for row in trades:
+        if (
+            type(row["id"]) is not int
+            or row["id"] < 0
+            or type(row["orderId"]) is not int
+            or row["orderId"] < 0
+            or type(row["externalId"]) is not str
+            or not row["externalId"]
+        ):
+            raise EvidenceViolation("REST_TRADE_IDENTITY_INVALID")
+        if row["accountId"] != identity["accountId"] or row["market"] != market_name:
+            raise EvidenceViolation("UNRELATED_TRADE")
+        if row["externalId"] not in expected_external_ids:
+            raise EvidenceViolation("UNRELATED_TRADE")
+        order = orders_by_id.get(row["orderId"])
+        if order is None or order["externalId"] != row["externalId"]:
+            raise EvidenceViolation("REST_TRADE_ORDER_MISMATCH")
+
+    pagination_raw = _strict(
+        round_data["pagination"],
+        {"openOrders", "positions", "orderHistory", "trades"},
+        set(),
+        "rest.pagination",
+    )
+    pagination: dict[str, dict[str, Any]] = {}
+    for field in list_fields:
+        page = _strict(
+            pagination_raw[field],
+            {"cursor", "count"},
+            set(),
+            f"rest.pagination.{field}",
+        )
+        if page["cursor"] is not None:
+            raise EvidenceViolation("REST_PAGINATION_INCOMPLETE")
+        if (
+            type(page["count"]) is not int
+            or page["count"] < 0
+            or page["count"] > _MAX_REST_PAGE_ITEMS
+            or page["count"] != len(round_data[field])
+        ):
+            raise EvidenceViolation("REST_PAGINATION_INVALID")
+        pagination[field] = {"cursor": None, "count": page["count"]}
+
+    account_copy = {
+        "info": deepcopy(info),
+        "balance": balance,
+        "fees": [deepcopy(row) for row in fees],
+        "leverage": [deepcopy(row) for row in leverage],
+    }
+    fingerprint = json.dumps(
+        {
+            "account": account_copy,
+            "openOrders": list(open_orders),
+            "positions": list(positions),
+            "orderStatus": deepcopy(order_status),
+            "orderHistory": list(order_history),
+            "trades": list(trades),
+            "pagination": pagination,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return RestRoundEvidence(
+        observed_at_ms=round_data["observedAt"],
+        server_time_ms=round_data["serverTime"],
+        account=account_copy,
+        open_orders=open_orders,
+        positions=positions,
+        order_status=deepcopy(order_status),
+        order_history=order_history,
+        trades=trades,
+        pagination=pagination,
+        fingerprint=fingerprint,
+    )
+
+
+def normalize_rest_fallback_evidence(
+    raw: Mapping[str, Any], *, now_ms: int
+) -> OfficialEvidence:
+    """Normalize two complete REST snapshots for the testnet-only fallback.
+
+    This intentionally synthesizes no stream facts from the network.  The
+    existing stream normalizer remains the separate readiness contract; the
+    lifecycle receives the second REST snapshot only after both snapshots have
+    passed identity, pagination, freshness, and exact-agreement checks.
+    """
+
+    root_keys = {
+        "provenance",
+        "contract",
+        "identity",
+        "market",
+        "book",
+        "entry",
+        "close",
+        "vectors",
+        "filledOrder",
+        "fill",
+        "filledCloseOrder",
+        "closeFill",
+        "position",
+        "restRounds",
+    }
+    data = _strict(dict(raw), root_keys, {"account"}, "rest_fallback.root")
+    identity = _strict(
+        data["identity"],
+        {"accountId", "accountIndex", "l2Key", "l2Vault", "apiKey"},
+        set(),
+        "rest_fallback.identity",
+    )
+    entry = _strict(data["entry"], _ORDER_VECTOR_KEYS, set(), "entry")
+    close = _strict(data["close"], _ORDER_VECTOR_KEYS, set(), "close")
+    expected_external_ids = frozenset(
+        {str(entry["externalId"]), str(close["externalId"])}
+    )
+    if len(expected_external_ids) != 2:
+        raise ContractViolation("EXTERNAL_ID_COLLISION")
+    if entry["nonce"] == close["nonce"]:
+        raise NonceViolation("NONCE_REUSE")
+    market = data["market"]
+    if type(market) is not dict or type(market.get("name")) is not str:
+        raise EvidenceViolation("MARKET_IDENTITY_MISMATCH")
+    if type(data["restRounds"]) is not list or len(data["restRounds"]) != 2:
+        raise EvidenceViolation("REST_ROUNDS_REQUIRED")
+    if isinstance(now_ms, bool) or not isinstance(now_ms, int) or now_ms < 0:
+        raise EvidenceViolation("REST_TIMESTAMP_INVALID:now")
+    rounds = tuple(
+        _validate_rest_round(
+            item,
+            identity=identity,
+            market_name=market["name"],
+            expected_external_ids=expected_external_ids,
+            now_ms=now_ms,
+        )
+        for item in data["restRounds"]
+    )
+    if rounds[1].observed_at_ms <= rounds[0].observed_at_ms:
+        raise EvidenceViolation("REST_ROUNDS_NOT_ORDERED")
+    if rounds[0].fingerprint != rounds[1].fingerprint:
+        raise EvidenceViolation("REST_ROUNDS_DISAGREE")
+
+    latest = rounds[1]
+    account = {
+        "observedAt": latest.observed_at_ms,
+        "serverTime": latest.server_time_ms,
+        **deepcopy(latest.account),
+        "openOrders": deepcopy(list(latest.open_orders)),
+        "positions": deepcopy(list(latest.positions)),
+        "orderStatus": deepcopy(latest.order_status),
+        "orderHistory": deepcopy(list(latest.order_history)),
+        "fills": deepcopy(list(latest.trades)),
+    }
+    stream = {
+        "accountId": identity["accountId"],
+        "l2Key": identity["l2Key"],
+        "sequence": 0,
+        "eventTime": latest.observed_at_ms,
+        "receivedAt": latest.observed_at_ms,
+        "gapFree": False,
+        # These compatibility fields are derived from REST and are not a
+        # stream-readiness claim.  REST_FALLBACK lifecycle gates use the
+        # round evidence directly.
+        "connected": False,
+        "orders": deepcopy(list((*latest.order_history, *latest.open_orders))),
+        "positions": deepcopy(list(latest.positions)),
+        "trades": deepcopy(list(latest.trades)),
+        "balance": deepcopy(latest.account["balance"]),
+    }
+    candidate = {
+        key: deepcopy(value) for key, value in data.items() if key != "restRounds"
+    }
+    candidate["account"] = account
+    candidate["stream"] = stream
+    normalized = normalize_official_evidence(candidate, now_ms=now_ms)
+    return replace(
+        normalized,
+        rest_rounds=rounds,
+        mode="REST_FALLBACK",
+    )
+
+
 @dataclass(frozen=True)
 class Intent:
     id: str
@@ -802,6 +1149,28 @@ class ExtendedLifecycle:
 
     @staticmethod
     def _validate_common(evidence: OfficialEvidence) -> None:
+        if evidence.mode == "REST_FALLBACK":
+            if len(evidence.rest_rounds) != 2:
+                raise EvidenceViolation("REST_ROUNDS_REQUIRED")
+            if evidence.rest_rounds[1].observed_at_ms <= evidence.rest_rounds[0].observed_at_ms:
+                raise EvidenceViolation("REST_ROUNDS_NOT_ORDERED")
+            if evidence.rest_rounds[0].fingerprint != evidence.rest_rounds[1].fingerprint:
+                raise EvidenceViolation("REST_ROUNDS_DISAGREE")
+            latest = evidence.rest_rounds[1]
+            if (
+                tuple(evidence.open_orders) != latest.open_orders
+                or tuple(evidence.positions) != latest.positions
+                or evidence.order_status != latest.order_status
+                or tuple(evidence.order_history) != latest.order_history
+                or tuple(evidence.fills) != latest.trades
+                or evidence.balance != latest.account["balance"]
+                or tuple(evidence.fees) != tuple(latest.account["fees"])
+                or tuple(evidence.leverage) != tuple(latest.account["leverage"])
+            ):
+                raise EvidenceViolation("REST_ROUNDS_DISAGREE")
+            if not evidence.fresh:
+                raise EvidenceViolation("STALE_EVIDENCE")
+            return
         if not evidence.connected:
             raise EvidenceViolation("STREAM_DISCONNECTED")
         if not evidence.gap_free:
@@ -1128,9 +1497,13 @@ class ExtendedLifecycle:
         return intent
 
     def _position(self, evidence: OfficialEvidence) -> dict[str, Any]:
-        if len(evidence.positions) != 1 or len(evidence.stream_positions) != 1:
+        if len(evidence.positions) != 1:
             raise LifecycleHalted("AUTHORITATIVE_POSITION_REQUIRED")
         position = evidence.positions[0]
+        if evidence.mode == "REST_FALLBACK":
+            return position
+        if len(evidence.stream_positions) != 1:
+            raise LifecycleHalted("AUTHORITATIVE_POSITION_REQUIRED")
         if position != evidence.stream_positions[0]:
             raise LifecycleHalted("POSITION_DISAGREEMENT")
         return position
@@ -1274,6 +1647,7 @@ class ExtendedLifecycle:
             fill_fee = _decimal(fill["fee"], "fill.fee")
             if (
                 fill["accountId"] != intent.account_id
+                or fill["externalId"] != order["externalId"]
                 or fill["market"] != intent.market
                 or fill["side"] != intent.side
                 or fill["orderId"] != order["id"]
@@ -1568,16 +1942,19 @@ class ExtendedLifecycle:
             or entry_qty != close_qty
         ):
             raise LifecycleHalted("ENTRY_CLOSE_FILL_MISMATCH")
-        if evidence.positions or evidence.stream_positions:
+        if evidence.positions or (
+            evidence.mode != "REST_FALLBACK" and evidence.stream_positions
+        ):
             raise LifecycleHalted("CLOSE_POSITION_NOT_FLAT")
         external_ids, fill_ids = self._final_identities(evidence)
         self.store._set_states({intent.id: "CLOSE_RECONCILED"}, "EXPOSED")
         all_intents = self.store._all()
         past_expiry = self._past_expiry(evidence, max(row.expiry_ms for row in all_intents), strict=True)
+        stream_barrier = evidence.connected and evidence.gap_free
+        rest_barrier = evidence.mode == "REST_FALLBACK"
         final_safe = (
             past_expiry
-            and evidence.connected
-            and evidence.gap_free
+            and (stream_barrier or rest_barrier)
             and evidence.fresh
             and not evidence.open_orders
             and not evidence.positions
@@ -1608,6 +1985,7 @@ class ExtendedLifecycle:
         return all(
             fill["orderId"] in orders_by_id
             and orders_by_id[fill["orderId"]] in persisted_external_ids
+            and fill["externalId"] == orders_by_id[fill["orderId"]]
             for fill in evidence.fills
         )
 

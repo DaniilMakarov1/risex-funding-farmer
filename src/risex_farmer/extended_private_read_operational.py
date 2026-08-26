@@ -30,6 +30,7 @@ from .extended_private_read_preflight import (
     PreflightViolation,
     _Counters,
     _execute,
+    _execute_rest_fallback,
 )
 
 
@@ -39,6 +40,8 @@ IDENTITY_BASENAME = ".risex-funding-farmer-extended-identity-v1.json"
 SCHEMA_VERSION = 3
 _TIMEOUT_SECONDS = 10
 _MAX_JSON_BYTES = 1_048_576
+_STREAM_MODE = "stream"
+_REST_FALLBACK_MODE = "rest_fallback"
 _IDENTITY_KEYS = {"id", "accountIndex", "l2Key", "l2Vault"}
 _EFFECTS = (
     "loader",
@@ -54,21 +57,23 @@ def _new_runtime_run_id() -> str:
     return "extended-read-" + secrets.token_hex(16)
 
 
-def _config_hash(invocation_id: str) -> str:
+def _config_hash(invocation_id: str, mode: str = _STREAM_MODE) -> str:
+    if mode not in {_STREAM_MODE, _REST_FALLBACK_MODE}:
+        raise PreflightViolation("DURABLE_MODE_INVALID")
+    config = {
+        "invocation": invocation_id,
+        "rest_base": REST_BASE_URL,
+        "rest_paths": [
+            "/user/account/info", "/user/orders", "/user/positions",
+        ],
+        "stream": STREAM_URL,
+        "timeout_seconds": _TIMEOUT_SECONDS,
+    }
+    # Preserve the byte-stable hash for historical stream rows.
+    if mode != _STREAM_MODE:
+        config["mode"] = mode
     return hashlib.sha256(
-        json.dumps(
-            {
-                "invocation": invocation_id,
-                "rest_base": REST_BASE_URL,
-                "rest_paths": [
-                    "/user/account/info", "/user/orders", "/user/positions",
-                ],
-                "stream": STREAM_URL,
-                "timeout_seconds": _TIMEOUT_SECONDS,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
+        json.dumps(config, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
 
 
@@ -132,7 +137,7 @@ class OperationalResult:
 
 
 def _decode_result(
-    raw: Any, *, invocation_id: str, config_hash: str,
+    raw: Any, *, invocation_id: str, config_hash: str, mode: str = _STREAM_MODE,
 ) -> OperationalResult:
     try:
         value = json.loads(raw)
@@ -146,6 +151,33 @@ def _decode_result(
     if type(value) is not dict or set(value) != keys:
         raise PreflightViolation("DURABLE_EVIDENCE_INVALID")
     counters = _decode_counters(json.dumps(value["counters"]))
+    stream_ready = (
+        value["reason"] == "OPERATIONAL_CONTRACT_PROVED"
+        and value["rest_calls"] == 6
+        and value["clock_calls"] == 7
+        and value["identity_verified"] is True
+        and set(counters.values()) == {1}
+    )
+    fallback_effects = {
+        "loader",
+        "rest_a_info", "rest_a_orders", "rest_a_positions",
+        "rest_b_info", "rest_b_orders", "rest_b_positions",
+        "terminal_persistence",
+    }
+    fallback_ready = (
+        value["reason"] == "REST_FALLBACK_CONTRACT_PROVED"
+        and value["rest_calls"] == 6
+        and value["stream_frames"] == 0
+        and value["clock_calls"] == 6
+        and value["identity_verified"] is True
+        and all(
+            counters[f"{effect}_{suffix}"] == (
+                1 if effect in fallback_effects else 0
+            )
+            for effect in _EFFECTS
+            for suffix in ("attempts", "completions")
+        )
+    )
     if (
         value["invocation_id"] != invocation_id
         or value["config_hash"] != config_hash
@@ -157,15 +189,9 @@ def _decode_result(
             type(value[key]) is not int or value[key] < 0
             for key in ("rest_calls", "stream_frames", "clock_calls")
         )
-        or (
-            value["status"] == "READY"
-            and (
-                value["reason"] != "OPERATIONAL_CONTRACT_PROVED"
-                or value["rest_calls"] != 6 or value["clock_calls"] != 7
-                or value["identity_verified"] is not True
-                or set(counters.values()) != {1}
-            )
-        )
+        or (value["status"] == "READY" and not (
+            stream_ready if mode == _STREAM_MODE else fallback_ready
+        ))
         or (value["status"] == "BLOCKED" and value["identity_verified"] is not False)
     ):
         raise PreflightViolation("DURABLE_EVIDENCE_INVALID")
@@ -207,12 +233,20 @@ def _validate_private_path(path: Path, *, may_create: bool) -> None:
 class _OperationalStore:
     """Versioned FULL-synchronous, never-resumable effect ledger."""
 
-    def __init__(self, path: str | Path, invocation_id: str = "extended-read-fixture"):
+    def __init__(
+        self,
+        path: str | Path,
+        invocation_id: str = "extended-read-fixture",
+        mode: str = _STREAM_MODE,
+    ):
         self.path = Path(path)
         if type(invocation_id) is not str or not invocation_id:
             raise PreflightViolation("DURABLE_IDENTITY_INVALID")
+        if mode not in {_STREAM_MODE, _REST_FALLBACK_MODE}:
+            raise PreflightViolation("DURABLE_MODE_INVALID")
         self.invocation_id = invocation_id
-        self.config_hash = _config_hash(invocation_id)
+        self.mode = mode
+        self.config_hash = _config_hash(invocation_id, mode)
         _validate_private_path(self.path, may_create=True)
         if not self.path.exists():
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -297,7 +331,7 @@ class _OperationalStore:
         if state == "TERMINAL" and type(evidence) is str:
             result = _decode_result(
                 evidence, invocation_id=self.invocation_id,
-                config_hash=self.config_hash,
+                config_hash=self.config_hash, mode=self.mode,
             )
             if dict(result.counters) != counters or result.phase != phase:
                 raise PreflightViolation("DURABLE_EVIDENCE_INVALID")
@@ -470,11 +504,21 @@ async def _run_fixture_operational_private_read(
     result: OperationalResult | None = None
     cancelled = False
     try:
-        proved: PreflightResult = await _execute(
+        executor = (
+            _execute_rest_fallback
+            if store.mode == _REST_FALLBACK_MODE
+            else _execute
+        )
+        proved: PreflightResult = await executor(
             loaded.load, transport, clock_ms, counters, loaded, ledger
         )
+        ready_reason = (
+            "REST_FALLBACK_CONTRACT_PROVED"
+            if store.mode == _REST_FALLBACK_MODE
+            else "OPERATIONAL_CONTRACT_PROVED"
+        )
         result = OperationalResult(
-            "READY", "OPERATIONAL_CONTRACT_PROVED", "FINALIZING",
+            "READY", ready_reason, "FINALIZING",
             store.snapshot()[1], proved.rest_calls, proved.stream_frames,
             proved.clock_calls, True, store.invocation_id, store.config_hash,
         )
@@ -733,22 +777,29 @@ class _DirectTransport:
         )
 
     async def get(self, request: Any) -> dict[str, Any]:
-        async with self._session.get(
-            request.url, headers=dict(request.headers), allow_redirects=False,
-            proxy=None,
-        ) as response:
-            raw = await response.content.read(_MAX_JSON_BYTES + 1)
-            if len(raw) > _MAX_JSON_BYTES:
-                raise PreflightViolation("REST_REPLY_MALFORMED")
-            try:
-                body = json.loads(raw)
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise PreflightViolation("REST_REPLY_MALFORMED") from exc
-            return {
-                "status": response.status, "final_url": str(response.url),
-                "observed_at_ms": int(time.time() * 1000), "body": body,
-                "transport": _transport_metadata(str(response.url)),
-            }
+        try:
+            async with self._session.get(
+                request.url, headers=dict(request.headers), allow_redirects=False,
+                proxy=None,
+            ) as response:
+                raw = await response.content.read(_MAX_JSON_BYTES + 1)
+                if len(raw) > _MAX_JSON_BYTES:
+                    raise PreflightViolation("REST_REPLY_MALFORMED")
+                try:
+                    body = json.loads(raw)
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise PreflightViolation("REST_REPLY_MALFORMED") from exc
+                return {
+                    "status": response.status, "final_url": str(response.url),
+                    "observed_at_ms": int(time.time() * 1000), "body": body,
+                    "transport": _transport_metadata(str(response.url)),
+                }
+        except PreflightViolation:
+            raise
+        except (aiohttp.ClientConnectionError, asyncio.TimeoutError, OSError) as exc:
+            raise PreflightViolation("TRANSPORT") from exc
+        except aiohttp.ClientError as exc:
+            raise PreflightViolation("TRANSPORT") from exc
 
     async def open_stream(self, request: Any) -> _DirectStream:
         try:
@@ -775,7 +826,9 @@ async def _production_run() -> OperationalResult:
     store_path = home / STORE_BASENAME
     if str(store_path) != "/Users/daniilmakarov/" + STORE_BASENAME:
         raise PreflightViolation("PRODUCTION_HOME_MISMATCH")
-    store = _OperationalStore(store_path, _new_runtime_run_id())
+    store = _OperationalStore(
+        store_path, _new_runtime_run_id(), mode=_REST_FALLBACK_MODE
+    )
     transport = _DirectTransport()
     try:
         return await _run_fixture_operational_private_read(
