@@ -4,11 +4,12 @@ One slice per venue. Apply the A/B/C levels and safety core from `AGENTS.md`; op
 
 ## RISEx — fill-seeking taker lifecycle
 
-Status: `PRICE-BOUND PROVED; ALTERNATE EXECUTABLE PRODUCT CORRECTION READY`.
+Status: `ONDO BINDING ACCEPTED; 24H STATISTICS CORRECTION READY`.
 
 - The accepted BUY `MARKET+IOC` now sends the exact validated ask-side adverse bound and the venue accepted its authoritative identity, but the BTC/USDC order still reconciled terminal zero-fill/flat. Two independent final observations and protected local recovery completed with no replay or venue recovery write. Do not repeat BTC unchanged.
-- Current public evidence shows unlocked ONDO/USDC market 29 with five ask orders and materially broader aggregate depth, unlike the persistent single-ask BTC book. Open one fresh Luna-max Builder from current `main` to retarget only the isolated sealed lifecycle and its venue-local fixtures/constants to fixed market 29 and its current official grid/minimum. Preserve signing, bounded price derivation, durable identity, no replay, reconciliation, reduce-only close, and final zero-order/exact-flat barriers; do not introduce dynamic product selection or shared execution abstractions.
-- After Chief review/integration, require a fresh authoritative zero-order/exact-flat pre-state and exactly one sequential sealed Level C lifecycle. Any further zero fill requires new matching evidence rather than another unchanged write.
+- The accepted sealed lifecycle is fixed to ONDO/USDC market 29 and its exact current grid/minimum. Its first fresh public Level B sweep stopped before signature/write only because current official ONDO metadata reports unused 24-hour high/low statistics as zero; index/mark/last, open interest, volume, book, grid, identity, and account state are otherwise valid.
+- Open one fresh Luna-max Builder from current `main` to classify only `high_24h` and `low_24h` as finite nonnegative statistics in this RISEx testnet validator. Preserve strict positivity for index/mark/last/max-position and every active/unlocked, identity, freshness, non-crossed BBO, exact grid/depth, notional/price-bound, signing, durable identity, no-replay, reconciliation, reduce-only close, zero-order, and exact-flat gate. Do not contact live services or alter product selection.
+- After Chief review/integration, archive the blocked local Level-B runtime recoverably, require one fresh authoritative zero-order/exact-flat Level B, and then exactly one sequential sealed Level C lifecycle. Any further zero fill requires new matching evidence rather than another unchanged write.
 
 ## Nado — sequential Level C lifecycle
 
