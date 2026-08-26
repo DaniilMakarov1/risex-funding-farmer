@@ -494,14 +494,30 @@ async def test_current_sdk_optional_envelope_and_payload_fields_are_accepted(tmp
 
 
 @pytest.mark.asyncio
-async def test_unknown_envelope_or_payload_fields_still_block(tmp_path):
+async def test_additive_unknown_envelope_and_payload_fields_are_ignored(tmp_path):
     extra_envelope = frame(40)
-    extra_envelope["unknown"] = None
+    extra_envelope["unknown"] = {"future": True}
     extra_payload = frame(40)
-    extra_payload["data"]["unknown"] = None
-    for index, bad in enumerate((extra_envelope, extra_payload)):
-        result, _, _ = await execute(tmp_path / str(index), FixtureTransport(frames=[bad]))
-        assert (result.status, result.reason) == ("BLOCKED", "STREAM_MALFORMED_FRAME")
+    extra_payload["data"]["unknown"] = ["future"]
+    for index, current in enumerate((extra_envelope, extra_payload)):
+        result, _, _ = await execute(
+            tmp_path / str(index), FixtureTransport(frames=[current])
+        )
+        assert result.status == "READY_FIXTURE"
+
+
+@pytest.mark.asyncio
+async def test_additive_unknown_spot_balance_members_are_ignored(tmp_path):
+    current = frame(40, kind="SPOT_BALANCE")
+    current["data"]["spotBalances"] = [{
+        "accountId": ACCOUNT_ID, "asset": "USDC", "balance": "1", "indexPrice": "1",
+        "notionalValue": "1", "contributionFactor": "1", "equityContribution": "1",
+        "availableToWithdraw": None, "absolutePnl": None, "pnlPercentage": None,
+        "averageEntryPrice": None, "updatedAt": 1770000000100,
+        "futureMetric": {"ignored": True},
+    }]
+    result, _, _ = await execute(tmp_path, FixtureTransport(frames=[current]))
+    assert result.status == "READY_FIXTURE"
 
 
 @pytest.mark.asyncio

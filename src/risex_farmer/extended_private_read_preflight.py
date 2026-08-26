@@ -437,12 +437,7 @@ def _validate_stream_frame(
     raw: Any, previous: int | None, identity_matcher: Any = None
 ) -> int:
     required_frame_keys = {"type", "data", "ts", "seq"}
-    allowed_frame_keys = required_frame_keys | {"error"}
-    if (
-        type(raw) is not dict
-        or not required_frame_keys.issubset(raw)
-        or not set(raw).issubset(allowed_frame_keys)
-    ):
+    if type(raw) is not dict or not required_frame_keys.issubset(raw):
         raise PreflightViolation("STREAM_MALFORMED_FRAME")
     frame = raw
     if frame["type"] not in _STREAM_TYPES:
@@ -461,11 +456,7 @@ def _validate_stream_frame(
         "SPOT_BALANCE": "spotBalances",
     }[frame["type"]]
     data = frame["data"]
-    if (
-        type(data) is not dict
-        or matching not in data
-        or not set(data).issubset(_STREAM_DATA_KEYS)
-    ):
+    if type(data) is not dict or matching not in data:
         raise PreflightViolation("STREAM_MALFORMED_FRAME")
     for key in _STREAM_DATA_KEYS:
         value = data.get(key)
