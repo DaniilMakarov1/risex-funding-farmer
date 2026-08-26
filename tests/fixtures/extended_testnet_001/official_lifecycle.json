@@ -215,6 +215,7 @@
   "fill": {
     "id": 80001,
     "accountId": 7001,
+    "externalId": "123456789012345678901234567890",
     "market": "BTC-USD",
     "orderId": 90001,
     "side": "BUY",
@@ -251,6 +252,7 @@
   "closeFill": {
     "id": 80002,
     "accountId": 7001,
+    "externalId": "223456789012345678901234567890",
     "market": "BTC-USD",
     "orderId": 90002,
     "side": "SELL",

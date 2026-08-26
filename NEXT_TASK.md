@@ -18,13 +18,14 @@ Status: `LEVEL C COMPLETE`.
 
 ## Extended — wallet/API Management setup and lifecycle
 
-Status: `REST FALLBACK CORRECTION READY`.
+Status: `REST LEVEL B COMPLETE; LEVEL C OPERATIONAL BINDING READY`.
 
 - Existing local owner/Stark identities and the sole subaccount match; testnet claim completed, balance is readable, and zero orders/positions are authoritative. A fresh REST-valid API key reproduced v1 HTTP 503 and v2 RPC HTTP 404, excluding wallet, collateral, stale key, and quota causes.
 - The local Level B runner now durably classifies pre-upgrade failures as sanitized `HTTP` or `TRANSPORT`; automated stream retries remain stopped after the observed provider v1 HTTP 503 and v2 HTTP 404.
 - Credential-free probes prove the whole testnet WebSocket ingress fails before authentication (official API host HTTP 503; documented CDN host HTTP 403), while the same mainnet public stream works. Authenticated testnet REST account, orders, positions, trades, and history all return HTTP 200/`OK` and authoritative zero state.
-- Open one fresh Luna-max Extended Builder from current `main` to replace only the testnet stream barrier with two bounded agreeing strict REST rounds. Bind the durable external ID, returned Extended order ID, exact order/history rows, matching trades carrying both identities, zero open orders, and exact flatness; require complete bounded pagination and reject unrelated state. Preserve credential isolation, signing, nonce/expiry, no replay, IOC/reduce-only lifecycle, and normal-startup isolation. Do not claim mainnet readiness from this fallback.
-- After Chief acceptance, run a fresh REST-only Level B. Only then authorize one sequential Extended Level C lifecycle.
+- The accepted testnet-only REST fallback opens no stream, permits missing pagination only for exact empty lists, and preserves strict two-round identity/reconciliation barriers. One fresh production Level B completed six authenticated reads with verified identity, agreeing zero orders/positions, zero stream effects, and durable terminal `READY`.
+- Open one fresh Luna-max Builder from current `main` to bind the already-accepted fixture lifecycle to the official Extended testnet write/REST transports and protected credentials. Preserve durable nonce/external identity before dispatch, price-bounded short-expiry IOC entry, exact returned-order/trade identity reconciliation, no blind replay, reduce-only close from fresh exact position, strict pagination for every nonempty list, and final two-round zero-order/exact-flat REST barrier. Keep it Extended-local and testnet-only; do not contact live services or generalize execution infrastructure.
+- After Chief review/integration, require one fresh REST Level B and exactly one sequential sealed Level C lifecycle. Any ambiguous write halts for authoritative reconciliation; success requires final authoritative zero orders and exact flatness.
 
 ## Completion
 
