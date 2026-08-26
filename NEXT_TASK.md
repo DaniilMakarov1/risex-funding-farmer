@@ -11,7 +11,7 @@ Status: `OBSERVED TESTNET ZERO-FILL BLOCKER`.
 
 ## Nado — sequential Level C lifecycle
 
-Status: `OBSERVED VENUE REJECTION BLOCKER`.
+Status: `HTTP LIVE-OBSERVATION BLOCKED`.
 
 - The signed trigger read now uses the accepted 30,000 ms window; the actual write retains its 100 ms contract. Current catalog minima are accepted as published, while the actual target opening and clamped closing amounts remain exactly step-aligned and fully safety-checked.
 - All three invocations stopped with zero intents and zero venue writes. Fixed BTC product 2 now has a minimum notional far above USD 500; credentials/private access and signing remain valid.
@@ -22,7 +22,8 @@ Status: `OBSERVED VENUE REJECTION BLOCKER`.
 - The accepted correction binds `min_size` to quote minimum notional and derives the least step-aligned base amount satisfying it at entry and close bounds. The rejected terminal database is archived byte-identically and the active lifecycle path is fresh.
 - The accepted reporting correction durably classifies and terminalizes pre-intent failures without changing execute ambiguity or write semantics. Both unused pre-intent databases are preserved byte-identically.
 - The next sealed invocation dispatched one corrected-minimum IOC exactly once and received complete venue rejection code 2011. Durable state is `REJECTED/HALTED`; fresh Level B plus a digest-bound observation prove zero regular/trigger orders, zero matching fills, and exact flatness. Do not replay it.
-- Official SDK 2.0.0 confirms IOC appendix 513 and defaults the order nonce receive deadline to 90 seconds. The runner uses only 100 ms while signing, durable preparation/fsync, capability reload, and HTTPS dispatch still remain ahead of venue receipt. A fresh visible Nado Builder may correct only this SDK-conformance mismatch and its fixture coverage; no authenticated run or write is permitted in that task. Chief must independently accept the candidate and archive the terminal rejection database before defining at most one further sequential Level C gate.
+- The accepted SDK-conformance correction uses the official 90-second order receive deadline consistently for entry, cancel, and close, with nonce/digest binding and all existing write/reconciliation barriers unchanged. The terminal 100-ms rejection database is preserved byte-identically and cannot replay.
+- The one post-correction sealed invocation finalized embedded Level B, then stopped with sanitized `HTTP` at the first Level C `LIVE_OBSERVATION`. Durable state is `BLOCKED/HALTED` with zero intents or writes and passing integrity. Do not retry Level C until a separately bounded read-only diagnostic proves materially changed endpoint evidence; a complete HTTP failure is terminal, not a transport-retry condition.
 
 ## Extended — wallet/API Management setup and lifecycle
 
