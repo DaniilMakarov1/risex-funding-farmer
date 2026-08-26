@@ -7,7 +7,9 @@ from decimal import Decimal
 import json
 import os
 from pathlib import Path
+import ssl
 
+import aiohttp
 import pytest
 
 from risex_farmer.testnet_risex_two_account_coordinator import (
@@ -15,6 +17,7 @@ from risex_farmer.testnet_risex_two_account_coordinator import (
     AccountSnapshot,
     BookLevel,
     BookObservation,
+    CANCEL_PATH,
     COUNTERPARTY_ACCOUNT as FIXED_COUNTERPARTY_ACCOUNT,
     COUNTERPARTY_REGISTRATION_EXPIRATION,
     COUNTERPARTY_SIGNER as FIXED_COUNTERPARTY_SIGNER,
@@ -56,6 +59,7 @@ from risex_farmer.testnet_risex_two_account_coordinator import (
     _order_for,
     _point_position,
     _position_maps_agree,
+    _response_data,
     _validate_order,
     _validate_unsigned_cancel,
     _validate_unsigned_place,
@@ -1502,6 +1506,247 @@ def test_fixed_rest_paths_and_counterparty_marker_are_sealed(tmp_path: Path, mon
     marker["state"] = "REVOKED"
     with pytest.raises(CoordinatorSafetyError):
         module._load_counterparty_registration_marker()
+
+
+class _RetryContent:
+    def __init__(self, outcome):
+        self.outcome = outcome
+
+    async def read(self, limit):
+        if isinstance(self.outcome, BaseException):
+            raise self.outcome
+        return self.outcome[:limit]
+
+
+class _RetryResponse:
+    def __init__(self, url, *, body, status=200, content_length=None):
+        self.url = url
+        self.status = status
+        self.history = ()
+        self.content = _RetryContent(body)
+        self.content_length = (
+            len(body) if content_length is None and isinstance(body, bytes)
+            else content_length
+        )
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return None
+
+
+class _RetrySession:
+    def __init__(self, *, get_outcomes=(), post_outcomes=()):
+        self.get_outcomes = list(get_outcomes)
+        self.post_outcomes = list(post_outcomes)
+        self.get_calls = []
+        self.post_calls = []
+
+    def get(self, url, **kwargs):
+        self.get_calls.append((url, kwargs))
+        outcome = self.get_outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    def post(self, url, **kwargs):
+        self.post_calls.append((url, kwargs))
+        outcome = self.post_outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
+def _retry_transport(session):
+    transport = object.__new__(FixedRisexTwoAccountTransport)
+    transport._accounts = frozenset({ACCOUNT, FIXED_COUNTERPARTY_ACCOUNT})
+    transport._session = session
+    return transport
+
+
+def _retry_response(transport, body, *, status=200, path="/v1/system/config"):
+    return _RetryResponse(
+        transport.REST_ORIGIN + path, body=body, status=status,
+    )
+
+
+VALID_RETRY_BODY = b'{"data":{},"request_id":"ok"}'
+
+
+def test_fixed_transport_get_success_uses_one_attempt():
+    session = _RetrySession()
+    transport = _retry_transport(session)
+    session.get_outcomes = [_retry_response(transport, VALID_RETRY_BODY)]
+
+    response = asyncio.run(transport.get("/v1/system/config"))
+
+    assert response.body == {"data": {}, "request_id": "ok"}
+    assert len(session.get_calls) == 1
+    assert session.get_calls[0][1] == {
+        "allow_redirects": False, "proxy": None,
+    }
+
+
+@pytest.mark.parametrize(
+    "failure",
+    (
+        TimeoutError("timeout"),
+        aiohttp.ClientConnectionError("disconnect"),
+        ConnectionResetError("reset"),
+    ),
+)
+def test_fixed_transport_get_retries_initial_pre_response_connect_or_timeout(failure):
+    session = _RetrySession()
+    transport = _retry_transport(session)
+    session.get_outcomes = [
+        failure, _retry_response(transport, VALID_RETRY_BODY),
+    ]
+
+    response = asyncio.run(transport.get("/v1/system/config"))
+
+    assert response.body == {"data": {}, "request_id": "ok"}
+    assert len(session.get_calls) == 2
+
+
+def test_fixed_transport_get_retries_aiohttp_partial_body_then_succeeds():
+    session = _RetrySession()
+    transport = _retry_transport(session)
+    session.get_outcomes = [
+        _retry_response(
+            transport, aiohttp.ClientPayloadError("premature EOF"),
+        ),
+        _retry_response(transport, VALID_RETRY_BODY),
+    ]
+
+    response = asyncio.run(transport.get("/v1/system/config"))
+
+    assert response.body == {"data": {}, "request_id": "ok"}
+    assert len(session.get_calls) == 2
+
+
+@pytest.mark.parametrize("raw", (b"", b" \r\n", b'{"data":'))
+def test_fixed_transport_get_retries_one_incomplete_json_document(raw):
+    session = _RetrySession()
+    transport = _retry_transport(session)
+    session.get_outcomes = [
+        _retry_response(transport, raw),
+        _retry_response(transport, VALID_RETRY_BODY),
+    ]
+
+    response = asyncio.run(transport.get("/v1/system/config"))
+
+    assert response.body == {"data": {}, "request_id": "ok"}
+    assert len(session.get_calls) == 2
+
+
+def test_fixed_transport_get_stops_after_two_pre_response_transport_failures():
+    session = _RetrySession()
+    transport = _retry_transport(session)
+    session.get_outcomes = [
+        TimeoutError("first"), aiohttp.ClientConnectionError("second"),
+    ]
+
+    with pytest.raises(CoordinatorSafetyError, match="transport failed"):
+        asyncio.run(transport.get("/v1/system/config"))
+
+    assert len(session.get_calls) == 2
+
+
+def test_fixed_transport_get_does_not_retry_tls_failure():
+    session = _RetrySession()
+    transport = _retry_transport(session)
+    session.get_outcomes = [ssl.SSLError("certificate verification failed")]
+
+    with pytest.raises(CoordinatorSafetyError, match="transport failed"):
+        asyncio.run(transport.get("/v1/system/config"))
+
+    assert len(session.get_calls) == 1
+
+
+def test_fixed_transport_get_stops_after_two_incomplete_json_documents():
+    session = _RetrySession()
+    transport = _retry_transport(session)
+    session.get_outcomes = [
+        _retry_response(transport, b'{"data":'),
+        _retry_response(transport, b'{"data":'),
+    ]
+
+    with pytest.raises(CoordinatorSafetyError, match="response JSON rejected"):
+        asyncio.run(transport.get("/v1/system/config"))
+
+    assert len(session.get_calls) == 2
+
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        b"not-json",
+        b'{"data":{},"data":{}}',
+        b'{"data":NaN}',
+        b'{"data":Infinity}',
+        b'{"data":-Infinity}',
+        b'{"data":1e999}',
+    ),
+)
+def test_fixed_transport_get_complete_invalid_json_does_not_retry(raw):
+    session = _RetrySession()
+    transport = _retry_transport(session)
+    session.get_outcomes = [_retry_response(transport, raw)]
+
+    with pytest.raises(CoordinatorSafetyError, match="response JSON rejected"):
+        asyncio.run(transport.get("/v1/system/config"))
+
+    assert len(session.get_calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("status", "raw"),
+    (
+        (503, VALID_RETRY_BODY),
+        (200, b'{"data":{}}'),
+    ),
+)
+def test_fixed_transport_get_http_and_schema_semantics_do_not_retry(status, raw):
+    session = _RetrySession()
+    transport = _retry_transport(session)
+    session.get_outcomes = [_retry_response(transport, raw, status=status)]
+
+    response = asyncio.run(transport.get("/v1/system/config"))
+    with pytest.raises(CoordinatorSafetyError, match="rejected"):
+        _response_data(response)
+
+    assert len(session.get_calls) == 1
+
+
+@pytest.mark.parametrize("path", (PLACE_PATH, CANCEL_PATH))
+@pytest.mark.parametrize("outcome", ("transport", "json", "status"))
+def test_fixed_transport_post_paths_remain_single_attempt(path, outcome):
+    session = _RetrySession()
+    transport = _retry_transport(session)
+    if outcome == "transport":
+        session.post_outcomes = [ConnectionResetError("reset")]
+        expected = "write transport ambiguous"
+    elif outcome == "json":
+        session.post_outcomes = [
+            _retry_response(transport, b"not-json", path=path),
+        ]
+        expected = "response JSON rejected"
+    else:
+        session.post_outcomes = [
+            _retry_response(
+                transport, VALID_RETRY_BODY, status=503, path=path,
+            ),
+        ]
+        expected = None
+
+    if expected is None:
+        response = asyncio.run(transport.post(path, {"value": 1}))
+        assert response.status == 503
+    else:
+        with pytest.raises(CoordinatorSafetyError, match=expected):
+            asyncio.run(transport.post(path, {"value": 1}))
+    assert len(session.post_calls) == 1
 
 
 def test_counterparty_key_decoder_accepts_only_canonical_lower_hex(tmp_path: Path):

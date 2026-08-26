@@ -699,7 +699,15 @@ class _HTTPObservation:
     observed_at: int
 
 
-def _strict_json_bytes(raw: bytes) -> Any:
+class _RetryableGetFailure(Exception):
+    """Internal marker for one eligible GET transport/body failure."""
+
+    def __init__(self, kind: str) -> None:
+        super().__init__(kind)
+        self.kind = kind
+
+
+def _strict_json_loads(raw: bytes) -> Any:
     def reject_constant(_value: str) -> Any:
         raise ValueError
 
@@ -717,19 +725,42 @@ def _strict_json_bytes(raw: bytes) -> Any:
             raise ValueError
         return parsed
 
+    return json.loads(
+        raw.decode("utf-8", errors="strict"),
+        parse_constant=reject_constant,
+        parse_float=finite_float,
+        object_pairs_hook=unique_object,
+    )
+
+
+def _strict_json_bytes(raw: bytes) -> Any:
     try:
-        return json.loads(
-            raw.decode("utf-8", errors="strict"),
-            parse_constant=reject_constant,
-            parse_float=finite_float,
-            object_pairs_hook=unique_object,
-        )
+        return _strict_json_loads(raw)
+    except Exception:
+        raise CoordinatorSafetyError("RISEx response JSON rejected") from None
+
+
+def _json_decode_error_is_incomplete(error: json.JSONDecodeError) -> bool:
+    document = error.doc
+    significant_end = len(document.rstrip(" \t\r\n"))
+    if significant_end == 0:
+        return True
+    return error.pos >= significant_end or error.msg.startswith("Unterminated string")
+
+
+def _strict_get_json_bytes(raw: bytes) -> Any:
+    try:
+        return _strict_json_loads(raw)
+    except json.JSONDecodeError as error:
+        if _json_decode_error_is_incomplete(error):
+            raise _RetryableGetFailure("json") from None
+        raise CoordinatorSafetyError("RISEx response JSON rejected") from None
     except Exception:
         raise CoordinatorSafetyError("RISEx response JSON rejected") from None
 
 
 class FixedRisexTwoAccountTransport:
-    """Fixed direct-TLS REST and auth_v2 transport; no retry or redirect."""
+    """Fixed direct-TLS REST and auth_v2 transport with bounded GET recovery."""
 
     REST_ORIGIN = REST_ORIGIN
     WS_ORIGIN = WS_ORIGIN
@@ -814,10 +845,23 @@ class FixedRisexTwoAccountTransport:
                 raise CoordinatorSafetyError("RISEx position read surface rejected")
         return self.REST_ORIGIN + path + ("?" + urlencode(query) if query else "")
 
-    async def get(self, path: str, query: Sequence[tuple[str, str]] = ()) -> _HTTPObservation:
-        target = self._target(path, query)
+    @staticmethod
+    def _is_retryable_get_transport_error(error: Exception) -> bool:
+        if isinstance(error, (
+            aiohttp.ClientResponseError, aiohttp.InvalidURL,
+            aiohttp.ClientSSLError, ssl.SSLError,
+        )) or isinstance(getattr(error, "os_error", None), ssl.SSLError):
+            return False
+        return isinstance(error, (
+            aiohttp.ClientError, asyncio.IncompleteReadError,
+            TimeoutError, OSError, EOFError,
+        ))
+
+    async def _get_attempt(self, target: str) -> _HTTPObservation:
+        response_status: int | None = None
         try:
             async with self._session.get(target, allow_redirects=False, proxy=None) as response:
+                response_status = response.status
                 if response.history or str(response.url) != target:
                     raise CoordinatorSafetyError("RISEx REST redirect rejected")
                 if response.content_length is not None and response.content_length > self.MAX_BYTES:
@@ -825,11 +869,34 @@ class FixedRisexTwoAccountTransport:
                 raw = await response.content.read(self.MAX_BYTES + 1)
                 if len(raw) > self.MAX_BYTES:
                     raise CoordinatorSafetyError("RISEx REST response bound rejected")
-                return _HTTPObservation(response.status, str(response.url), _strict_json_bytes(raw), int(time.time()))
+                body = (
+                    _strict_get_json_bytes(raw)
+                    if response.status == 200
+                    else _strict_json_bytes(raw)
+                )
+                return _HTTPObservation(response.status, str(response.url), body, int(time.time()))
+        except _RetryableGetFailure:
+            raise
         except CoordinatorSafetyError:
             raise
-        except Exception:
-            raise CoordinatorSafetyError("RISEx REST transport failed") from None
+        except Exception as error:
+            if response_status not in {None, 200} or not self._is_retryable_get_transport_error(error):
+                raise CoordinatorSafetyError("RISEx REST transport failed") from None
+            raise _RetryableGetFailure("transport") from None
+
+    async def get(self, path: str, query: Sequence[tuple[str, str]] = ()) -> _HTTPObservation:
+        target = self._target(path, query)
+        for attempt in range(2):
+            try:
+                return await self._get_attempt(target)
+            except _RetryableGetFailure as failure:
+                if attempt == 1:
+                    message = (
+                        "RISEx response JSON rejected"
+                        if failure.kind == "json"
+                        else "RISEx REST transport failed"
+                    )
+                    raise CoordinatorSafetyError(message) from None
 
     async def post(self, path: str, body: Mapping[str, Any]) -> _HTTPObservation:
         if path not in {PLACE_PATH, CANCEL_PATH} or not isinstance(body, Mapping):
