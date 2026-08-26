@@ -18,8 +18,9 @@ Status: `AUTHORIZED MINIMUM-SEMANTICS/COLLATERAL CORRECTION`.
 - Product 44 `SKR-PERP_USDT0` is accepted at the current smallest executable 650-SKR amount. Its first post-only execute halted ambiguous; exact post-window order query returned code 2020/not found and repeated authoritative zero-order/zero-fill/exact-flat evidence allowed protected local completion recovery without replay.
 - The accepted exact-ask and tick-aligned 10%-buffered IOC attempts each dispatched once and received complete venue rejection code 2011. The latest durable `REJECTED/HALTED` state prevents replay; exact post-window reads prove zero orders, positions, and fills plus `query_order` code 2020/not found.
 - Official current semantics denominate `min_size` in USDT0. Every current live perpetual publishes a 100-USDT0 minimum, while the runner misreads that field as a base amount, separately hard-codes USD 5, and submitted about USD 5.55 against only about 10 USDT0 collateral. Product 44 is currently `live`, so spread and market status are excluded.
+- The official SDK testnet mint/approve/deposit path completed and authoritative engine state now shows about 210 USDT0 collateral/health, zero liabilities, and zero exposure. No further faucet or deposit action is needed before the next lifecycle.
 - In a fresh visible Nado Builder worktree, correct only the current USDT0-denominated minimum-size binding and its focused regressions while preserving the accepted 10%-buffered IOC, exact product identity, signing, durable intent-before-dispatch, ambiguity no-replay, bounded close, and final zero-order/exact-flat barriers. Do not perform a write.
-- After acceptance, Chief obtains and deposits enough free testnet USDT0 through the official Nado testnet path, archives the exact terminal database, proves authoritative zero/flat pre-state, and runs one fresh sequential lifecycle.
+- After acceptance, Chief archives the exact terminal database, proves authoritative zero/flat pre-state, and runs one fresh sequential lifecycle.
 
 ## Extended — wallet/API Management setup and lifecycle
 
