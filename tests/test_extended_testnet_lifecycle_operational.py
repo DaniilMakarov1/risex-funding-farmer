@@ -1005,6 +1005,82 @@ def test_current_positions_allow_any_bounded_nonempty_rows_without_pagination(pa
     ) == tuple(rows)
 
 
+@pytest.mark.parametrize("pagination_member", ["absent", None], ids=["absent", "null"])
+def test_exact_external_lookup_allows_one_row_without_pagination_and_sends_no_page_query(
+    pagination_member,
+):
+    response_body = {"status": "OK", "data": [{"id": 1}]}
+    if pagination_member != "absent":
+        response_body["pagination"] = pagination_member
+
+    class ExactExternalLookup:
+        def __init__(self):
+            self.calls = []
+
+        def request(self, method, requested_path, *, query=(), body=None, allow_404=False):
+            self.calls.append((method, requested_path, tuple(query)))
+            assert method == "GET"
+            assert requested_path == "/user/orders/external/123"
+            assert tuple(query) == ()
+            return response_body
+
+    transport = ExactExternalLookup()
+    capability = type("Capability", (), {"api_key": lambda self: "key", "identity": IDENTITY})()
+    io = OperationalVenueIO(
+        capability, transport=transport, clock=lambda: 1770000000000
+    )
+    assert io._list(
+        "/user/orders/external/123", code="EXACT_EXTERNAL_ORDER_SCHEMA"
+    ) == ({"id": 1},)
+    assert transport.calls == [("GET", "/user/orders/external/123", ())]
+
+
+def test_exact_external_lookup_rejects_duplicate_rows_as_identity_ambiguity():
+    class DuplicateExactExternalLookup:
+        def request(self, method, requested_path, *, query=(), body=None, allow_404=False):
+            assert method == "GET"
+            assert requested_path == "/user/orders/external/123"
+            assert tuple(query) == ()
+            return {"status": "OK", "data": [{"id": 1}, {"id": 2}]}
+
+    capability = type("Capability", (), {"api_key": lambda self: "key", "identity": IDENTITY})()
+    io = OperationalVenueIO(
+        capability,
+        transport=DuplicateExactExternalLookup(),
+        clock=lambda: 1770000000000,
+    )
+    with pytest.raises(OperationalSafetyError, match="EXACT_EXTERNAL_ORDER_AMBIGUOUS"):
+        io._list("/user/orders/external/123", code="EXACT_EXTERNAL_ORDER_SCHEMA")
+
+
+@pytest.mark.parametrize(
+    "pagination",
+    [
+        {},
+        {"count": 1},
+        {"cursor": 0, "count": 1},
+        {"cursor": None, "count": 2},
+        {"cursor": 9, "count": 1},
+    ],
+)
+def test_exact_external_lookup_rejects_malformed_or_followable_pagination(pagination):
+    class MalformedExactExternalLookup:
+        def request(self, method, requested_path, *, query=(), body=None, allow_404=False):
+            assert method == "GET"
+            assert requested_path == "/user/orders/external/123"
+            assert tuple(query) == ()
+            return {"status": "OK", "data": [{"id": 1}], "pagination": pagination}
+
+    capability = type("Capability", (), {"api_key": lambda self: "key", "identity": IDENTITY})()
+    io = OperationalVenueIO(
+        capability,
+        transport=MalformedExactExternalLookup(),
+        clock=lambda: 1770000000000,
+    )
+    with pytest.raises(OperationalSafetyError):
+        io._list("/user/orders/external/123", code="EXACT_EXTERNAL_ORDER_SCHEMA")
+
+
 @pytest.mark.parametrize(
     "response_body",
     [
@@ -1157,7 +1233,6 @@ def test_single_unpaginated_lookup_requires_exact_fixed_market_query(path, query
         ("/user/positions/history", ()),
         ("/user/orders/history", ()),
         ("/user/trades", ()),
-        ("/user/orders/external/123", ()),
     ],
 )
 def test_nonempty_reconciliation_lists_still_require_pagination(path, query):

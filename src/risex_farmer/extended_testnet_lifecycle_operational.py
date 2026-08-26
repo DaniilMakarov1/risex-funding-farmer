@@ -1433,16 +1433,27 @@ class OperationalVenueIO:
         rows: list[Mapping[str, Any]] = []
         cursor: int | None = None
         seen_cursors: set[int] = set()
+        exact_external_lookup = (
+            path.startswith("/user/orders/external/")
+            and path.count("/") == 4
+            and bool(path.rsplit("/", 1)[-1])
+        )
+        if exact_external_lookup and query:
+            _fail("EXACT_EXTERNAL_QUERY_INVALID", "SCHEMA")
         allow_nonempty_unpaginated = path == "/user/positions"
         allow_single_unpaginated = (
-            path in {"/info/markets", "/user/fees", "/user/leverage"}
-            and tuple(query) == (("market", TARGET_MARKET),)
+            (
+                path in {"/info/markets", "/user/fees", "/user/leverage"}
+                and tuple(query) == (("market", TARGET_MARKET),)
+            )
+            or exact_external_lookup
         )
         for page in range(MAX_REST_PAGES):
             page_query = list(query)
-            page_query.append(("limit", MAX_REST_PAGE_ITEMS))
-            if cursor is not None:
-                page_query.append(("cursor", cursor))
+            if not exact_external_lookup:
+                page_query.append(("limit", MAX_REST_PAGE_ITEMS))
+                if cursor is not None:
+                    page_query.append(("cursor", cursor))
             value = self._request(
                 "GET", path, query=tuple(page_query), allow_404=allow_404
             )
@@ -1452,9 +1463,16 @@ class OperationalVenueIO:
                 return ()
             page_rows, next_cursor = _list_data(
                 value, code,
-                allow_nonempty_unpaginated=allow_nonempty_unpaginated,
+                allow_nonempty_unpaginated=(
+                    allow_nonempty_unpaginated or exact_external_lookup
+                ),
                 allow_single_unpaginated=allow_single_unpaginated,
             )
+            if exact_external_lookup:
+                if len(page_rows) > 1:
+                    _fail("EXACT_EXTERNAL_ORDER_AMBIGUOUS", "IDENTITY")
+                if next_cursor is not None:
+                    _fail("EXACT_EXTERNAL_PAGINATION_UNEXPECTED", "SAFETY")
             rows.extend(page_rows)
             if len(rows) > MAX_REST_PAGE_ITEMS:
                 _fail("PAGINATION_BOUND_EXCEEDED")
