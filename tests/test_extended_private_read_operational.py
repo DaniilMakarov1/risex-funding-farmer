@@ -168,6 +168,26 @@ class _Transport:
         return self.stream
 
 
+class _FailingWebSocketSession:
+    def __init__(self, error):
+        self.error = error
+
+    async def ws_connect(self, *args, **kwargs):
+        raise self.error
+
+
+class _DirectOpenFailureTransport(_Transport):
+    def __init__(self, error):
+        super().__init__()
+        self.direct = object.__new__(operational._DirectTransport)
+        self.direct._session = _FailingWebSocketSession(error)
+
+    async def open_stream(self, request):
+        self.timeline.append("OPEN")
+        self.open_calls.append(request)
+        return await self.direct.open_stream(request)
+
+
 class _Capability:
     def __init__(self, *, account_id=ACCOUNT_ID, secret="synthetic-secret-only"):
         self.account_id = account_id
@@ -491,6 +511,43 @@ async def test_incomplete_round_b_and_ambiguous_close_are_fail_closed(tmp_path):
     assert (result.status, result.reason) == ("BLOCKED", "STREAM_CLOSE_FAILED")
     assert result.counters["stream_close_attempts"] == 1
     assert result.counters["stream_close_completions"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error,expected_class",
+    [
+        (
+            operational.aiohttp.WSServerHandshakeError(
+                None, (), status=503, message="private handshake response"
+            ),
+            "HTTP",
+        ),
+        (
+            operational.aiohttp.ServerDisconnectedError(
+                "private pre-upgrade disconnect"
+            ),
+            "TRANSPORT",
+        ),
+        (TimeoutError("private pre-upgrade timeout"), "TRANSPORT"),
+    ],
+)
+async def test_stream_open_failures_persist_sanitized_class(
+    tmp_path, error, expected_class
+):
+    result, _, _, _ = await _run(
+        tmp_path, transport=_DirectOpenFailureTransport(error)
+    )
+    assert (result.status, result.reason) == ("BLOCKED", expected_class)
+    assert result.counters["stream_open_attempts"] == 1
+    assert result.counters["stream_open_completions"] == 0
+    assert json.loads(result.evidence())["reason"] == expected_class
+    with sqlite3.connect(tmp_path / "operational.sqlite3") as connection:
+        durable = connection.execute(
+            "SELECT evidence FROM extended_private_read_operation"
+        ).fetchone()[0]
+    assert json.loads(durable)["reason"] == expected_class
+    assert "private" not in durable
 
 
 @pytest.mark.asyncio
