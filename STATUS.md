@@ -4,7 +4,7 @@
 
 - Git `main` is the exact accepted-history authority and is published to `origin/main` after every accepted Chief checkpoint.
 - All three fixture lifecycle cores are integrated. Paper remains default; no venue is strategy-ready.
-- User permanently authorizes bounded venue-local diagnostics, read-only gates, and recoverable local operational-database recovery without repeated approval. The three already-defined first-lifecycle testnet writes are authorized sequentially within their existing safety contracts; mainnet, real funds, unrelated account mutation, and further product/economic changes remain separately governed.
+- User permanently authorizes bounded venue-local diagnostics, authenticated testnet access, wallet/account/API setup, faucet funding, product/economic selection, sequential testnet writes, and recoverable local operational-database recovery for RISEx, Nado, and Extended without repeated approval. These wallets are testnet-only; current spreads and minimum notionals are not blockers and have no fixed USD ceiling. Mainnet, real funds, strategy execution, and unrelated accounts remain separately governed.
 
 ## Venue readiness
 
