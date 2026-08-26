@@ -451,7 +451,7 @@ def _validate_fallback_list_wrapper(
 ) -> dict[str, Any]:
     if (
         type(body) is not dict
-        or not {"status", "data", "pagination"}.issubset(body)
+        or not {"status", "data"}.issubset(body)
         or not set(body).issubset({"status", "data", "error", "pagination"})
     ):
         raise PreflightViolation("REST_WRAPPER_MALFORMED")
@@ -459,7 +459,17 @@ def _validate_fallback_list_wrapper(
         raise PreflightViolation("REST_RESPONSE_ERROR")
     if type(body["data"]) is not list:
         raise PreflightViolation("REST_LIST_MALFORMED")
-    page = body["pagination"]
+    data = body["data"]
+    page = body.get("pagination")
+    if page is None:
+        if data:
+            raise PreflightViolation("REST_PAGINATION_INCOMPLETE")
+        return {
+            "status": body["status"],
+            "data": [],
+            "error": body.get("error"),
+            "pagination": {"cursor": None, "count": 0},
+        }
     if type(page) is not dict or set(page) != {"cursor", "count"}:
         raise PreflightViolation("REST_PAGINATION_INVALID")
     if page["cursor"] is not None:
@@ -468,10 +478,10 @@ def _validate_fallback_list_wrapper(
         type(page["count"]) is not int
         or page["count"] < 0
         or page["count"] > _MAX_FALLBACK_PAGE_ITEMS
-        or page["count"] != len(body["data"])
+        or page["count"] != len(data)
     ):
         raise PreflightViolation("REST_PAGINATION_INVALID")
-    if body["data"]:
+    if data:
         reason = "REST_OPEN_ORDER_PRESENT" if path == "/user/orders" else "REST_POSITION_PRESENT"
         raise PreflightViolation(reason)
     return {

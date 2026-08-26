@@ -32,6 +32,7 @@ from risex_farmer.extended_testnet_lifecycle import (
 
 FIXTURE = Path(__file__).parent / "fixtures/extended_testnet_001/official_lifecycle.json"
 API_KEY = "synthetic-api-key-never-persisted"
+_MISSING = object()
 
 
 def _meta(url):
@@ -299,6 +300,90 @@ async def test_rest_fallback_uses_two_sequential_fresh_rounds_without_stream(tmp
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "pagination_member", [_MISSING, None], ids=["absent", "null"]
+)
+async def test_rest_fallback_accepts_absent_or_null_pagination_for_exact_empty_lists(
+    tmp_path, pagination_member,
+):
+    def mutate(request, body):
+        if request.path == "/user/account/info":
+            return body
+        body.pop("error")
+        if pagination_member is _MISSING:
+            body.pop("pagination")
+        else:
+            body["pagination"] = pagination_member
+        return body
+
+    transport = _Transport(mutation=mutate)
+    result = await run_rest_fallback(
+        store=PreflightStore(tmp_path / "preflight.sqlite"),
+        credential_loader=_Loader(),
+        transport=transport,
+        clock_ms=_Clock(),
+    )
+
+    assert (result.status, result.reason) == (
+        "READY_REST_FALLBACK",
+        "REST_FALLBACK_CONTRACT_PROVED",
+    )
+    assert result.rest_calls == 6 and result.clock_calls == 6
+    assert transport.open_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "pagination_member", [_MISSING, None], ids=["absent", "null"]
+)
+async def test_rest_fallback_rejects_nonempty_lists_without_complete_pagination(
+    tmp_path, pagination_member,
+):
+    def mutate(request, body):
+        if request.round_name == "B" and request.path == "/user/orders":
+            body["data"] = [{"id": 99}]
+            if pagination_member is _MISSING:
+                body.pop("pagination")
+            else:
+                body["pagination"] = pagination_member
+        return body
+
+    result = await run_rest_fallback(
+        store=PreflightStore(tmp_path / "preflight.sqlite"),
+        credential_loader=_Loader(),
+        transport=_Transport(mutation=mutate),
+        clock_ms=_Clock(),
+    )
+
+    assert (result.status, result.reason) == (
+        "BLOCKED", "REST_PAGINATION_INCOMPLETE"
+    )
+
+
+@pytest.mark.asyncio
+async def test_rest_fallback_rejects_unknown_wrapper_key_for_empty_unpaginated_list(
+    tmp_path,
+):
+    def mutate(request, body):
+        if request.round_name == "B" and request.path == "/user/orders":
+            body.pop("error")
+            body.pop("pagination")
+            body["unknown"] = None
+        return body
+
+    result = await run_rest_fallback(
+        store=PreflightStore(tmp_path / "preflight.sqlite"),
+        credential_loader=_Loader(),
+        transport=_Transport(mutation=mutate),
+        clock_ms=_Clock(),
+    )
+
+    assert (result.status, result.reason) == (
+        "BLOCKED", "REST_WRAPPER_MALFORMED"
+    )
+
+
+@pytest.mark.asyncio
 async def test_operational_rest_fallback_preserves_durable_stream_history_shape(tmp_path):
     path = tmp_path / "operational.sqlite3"
     transport = _Transport()
@@ -330,6 +415,80 @@ async def test_operational_rest_fallback_preserves_durable_stream_history_shape(
         clock_ms=_Clock(),
     )
     assert replay == result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "pagination_member", [_MISSING, None], ids=["absent", "null"]
+)
+async def test_operational_fallback_persists_empty_wrapper_counters_and_forbids_replay(
+    tmp_path, pagination_member,
+):
+    def mutate(request, body):
+        if request.path == "/user/account/info":
+            return body
+        body.pop("error")
+        if pagination_member is _MISSING:
+            body.pop("pagination")
+        else:
+            body["pagination"] = pagination_member
+        return body
+
+    class _CountingSource(_Source):
+        def __init__(self):
+            self.calls = 0
+
+        def open(self):
+            self.calls += 1
+            return super().open()
+
+    path = tmp_path / "operational.sqlite3"
+    source = _CountingSource()
+    result = await _run_fixture_operational_private_read(
+        store=_OperationalStore(path, "extended-read-fallback", mode="rest_fallback"),
+        credential_source=source,
+        transport=_Transport(mutation=mutate),
+        clock_ms=_Clock(),
+    )
+
+    fallback_effects = (
+        "loader",
+        "rest_a_info", "rest_a_orders", "rest_a_positions",
+        "rest_b_info", "rest_b_orders", "rest_b_positions",
+        "terminal_persistence",
+    )
+    stream_effects = (
+        "stream_open", "stream_upgrade", "barrier_request",
+        "barrier_validation", "stream_close",
+    )
+    assert (result.status, result.reason, result.phase) == (
+        "READY", "REST_FALLBACK_CONTRACT_PROVED", "TERMINAL"
+    )
+    assert result.rest_calls == 6 and result.stream_frames == 0
+    assert result.clock_calls == 6
+    assert all(
+        result.counters[f"{effect}_{suffix}"] == 1
+        for effect in fallback_effects
+        for suffix in ("attempts", "completions")
+    )
+    assert all(
+        result.counters[f"{effect}_{suffix}"] == 0
+        for effect in stream_effects
+        for suffix in ("attempts", "completions")
+    )
+    assert source.calls == 1
+
+    replay_source = _CountingSource()
+    replay_transport = _Transport()
+    replay = await _run_fixture_operational_private_read(
+        store=_OperationalStore(path, "extended-read-fallback", mode="rest_fallback"),
+        credential_source=replay_source,
+        transport=replay_transport,
+        clock_ms=_Clock(),
+    )
+    assert replay == result
+    assert replay_source.calls == 0
+    assert replay_transport.get_calls == [] and replay_transport.open_calls == []
 
 
 @pytest.mark.asyncio
