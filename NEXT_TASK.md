@@ -4,12 +4,14 @@ One slice per venue. Apply the A/B/C levels and safety core from `AGENTS.md`; op
 
 ## RISEx — fill-seeking taker lifecycle
 
-Status: `ETH ZERO-FILL CLOSED; BLOCKED ON CURRENT TESTNET MATCHING`.
+Status: `READY FOR CONTROLLED TWO-ACCOUNT TESTNET LIFECYCLE BINDING`.
 
 - The accepted BUY `MARKET+IOC` now sends the exact validated ask-side adverse bound and the venue accepted its authoritative identity, but the BTC/USDC order still reconciled terminal zero-fill/flat. Two independent final observations and protected local recovery completed with no replay or venue recovery write. Do not repeat BTC unchanged.
 - The accepted fixed ONDO attempt dispatched once, received an authoritative order ID, reconciled terminal zero-fill, and ended with two independent zero-order/exact-flat/consumed-nonce observations plus protected local outcome recovery. Do not repeat ONDO unchanged. Its displayed book was stale as execution evidence: latest public trade was about 31 hours old.
 - The accepted fixed ETH/USDC market-2 correction passed its full verification. One fresh pre-state proved zero orders/exact flatness; exactly one minimum `0.1` `MARKET+IOC` was accepted with an authoritative order ID, reconciled terminal zero-fill/flat, and consumed its nonce. Two independent final observations again proved zero orders, exact flatness, and no unexplained state; protected local outcome recovery completed with no replay or venue recovery write.
 - Do not repeat BTC, ONDO, ETH, or select another RISEx product without materially new execution evidence. The remaining blocker is current testnet matching, not signing, bound encoding, identity, or reconciliation. Keep this lane idle while Extended advances.
+- The user now explicitly authorizes one securely isolated Chief-created RISEx testnet-only counterparty account. Open one visible Luna-max Builder from current `main` to implement a sealed ETH/USDC two-account coordinator without changing the existing single-account evidence: durable maker SELL identity before dispatch; authoritative resting-order proof; exact primary BUY IOC binding; authoritative fill/position reconciliation on both accounts; durable counterparty reduce-only BUY identity; exact primary reduce-only SELL IOC; cancel/reconcile any residue; and final two-round zero-order/exact-flat proof for both accounts.
+- The counterparty uses the official first-deposit registration and signer-registration contracts with separate protected credentials. All writes are sequential and minimum-size; no blind replay, dynamic product selection, strategy behavior, shared OMS, mainnet endpoint, real asset, or third account is allowed. Unknown cross-account matching semantics or any unrelated state halts before the next write.
 
 ## Nado — sequential Level C lifecycle
 
