@@ -617,6 +617,100 @@ def test_nonempty_lists_require_complete_bounded_pagination(body):
         _list_data(body, "LIST_SCHEMA")
 
 
+@pytest.mark.parametrize("pagination_member", ["absent", None], ids=["absent", "null"])
+def test_exact_market_lookup_allows_one_row_without_pagination(pagination_member):
+    body = {"status": "OK", "data": [{"name": TARGET_MARKET}]}
+    if pagination_member != "absent":
+        body["pagination"] = pagination_member
+    assert _list_data(
+        body, "MARKET_LIST_SCHEMA", allow_single_unpaginated=True
+    ) == ([{"name": TARGET_MARKET}], None)
+
+
+def test_single_unpaginated_exception_is_scoped_to_exact_market_lookup():
+    class SingleUnpaginated:
+        def request(self, method, path, *, query=(), body=None, allow_404=False):
+            assert method == "GET"
+            return {"status": "OK", "data": [{"id": 1}]}
+
+    capability = type("Capability", (), {"api_key": lambda self: "key", "identity": IDENTITY})()
+    io = OperationalVenueIO(
+        capability, transport=SingleUnpaginated(), clock=lambda: 1770000000000
+    )
+    assert io._list(
+        "/info/markets", query=(("market", TARGET_MARKET),), code="MARKET_LIST_SCHEMA"
+    ) == ({"id": 1},)
+    with pytest.raises(OperationalSafetyError, match="NONEMPTY_PAGINATION_REQUIRED"):
+        io._list("/info/markets", code="MARKET_LIST_SCHEMA")
+    with pytest.raises(OperationalSafetyError, match="NONEMPTY_PAGINATION_REQUIRED"):
+        io._list("/user/orders", code="ORDER_LIST_SCHEMA")
+
+
+@pytest.mark.parametrize(
+    "path,query",
+    [
+        ("/user/orders", ()),
+        ("/user/positions", ()),
+        ("/user/orders/history", ()),
+        ("/user/trades", ()),
+        ("/user/fees", (("market", TARGET_MARKET),)),
+        ("/user/leverage", (("market", TARGET_MARKET),)),
+    ],
+)
+def test_nonempty_private_lists_still_require_pagination(path, query):
+    class SingleUnpaginated:
+        def request(self, method, requested_path, *, query=(), body=None, allow_404=False):
+            assert method == "GET" and requested_path == path
+            return {"status": "OK", "data": [{"id": 1}]}
+
+    capability = type("Capability", (), {"api_key": lambda self: "key", "identity": IDENTITY})()
+    io = OperationalVenueIO(
+        capability, transport=SingleUnpaginated(), clock=lambda: 1770000000000
+    )
+    with pytest.raises(OperationalSafetyError, match="NONEMPTY_PAGINATION_REQUIRED"):
+        io._list(path, query=query, code="LIST_SCHEMA")
+
+
+def test_unpaginated_exact_market_still_runs_market_identity_validation():
+    wire = _base_fixture()
+    wrong_market = copy.deepcopy(wire["market"])
+    wrong_market["name"] = "ETH-USD"
+
+    class SingleUnpaginated:
+        def request(self, method, path, *, query=(), body=None, allow_404=False):
+            assert path == "/info/markets"
+            return {"status": "OK", "data": [wrong_market]}
+
+    capability = type("Capability", (), {"api_key": lambda self: "key", "identity": IDENTITY})()
+    io = OperationalVenueIO(
+        capability, transport=SingleUnpaginated(), clock=lambda: 1770000000000
+    )
+    rows = io._list(
+        "/info/markets", query=(("market", TARGET_MARKET),), code="MARKET_LIST_SCHEMA"
+    )
+    with pytest.raises(OperationalSafetyError, match="MARKET_SAFETY_GATE"):
+        io._market(rows[0])
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"status": "OK", "data": [{"name": TARGET_MARKET}, {"name": TARGET_MARKET}]},
+        {
+            "status": "OK", "data": [{"name": TARGET_MARKET}],
+            "pagination": {"cursor": None, "count": 2},
+        },
+        {
+            "status": "OK", "data": [{"name": TARGET_MARKET}],
+            "pagination": {"cursor": 0, "count": 1},
+        },
+    ],
+)
+def test_exact_market_exception_rejects_multiple_or_contradictory_pagination(body):
+    with pytest.raises(OperationalSafetyError):
+        _list_data(body, "MARKET_LIST_SCHEMA", allow_single_unpaginated=True)
+
+
 def test_empty_lists_allow_absent_or_null_pagination_only():
     assert _list_data({"status": "OK", "data": []}, "LIST_SCHEMA") == ([], None)
     assert _list_data({"status": "OK", "data": [], "pagination": None}, "LIST_SCHEMA") == ([], None)
