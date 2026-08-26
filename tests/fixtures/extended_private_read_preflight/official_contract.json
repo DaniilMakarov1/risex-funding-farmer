@@ -14,7 +14,7 @@
   },
   "contract": {
     "restBaseUrl": "https://api.starknet.sepolia.extended.exchange/api/v1",
-    "streamUrl": "wss://starknet.sepolia.extended.exchange/stream.extended.exchange/v1/account",
+    "streamUrl": "wss://api.starknet.sepolia.extended.exchange/stream.extended.exchange/v1/account",
     "apiHeader": "X-Api-Key",
     "accountInfoPath": "/user/account/info",
     "openOrdersPath": "/user/orders",

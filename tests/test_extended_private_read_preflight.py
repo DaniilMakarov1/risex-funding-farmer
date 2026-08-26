@@ -253,10 +253,9 @@ async def test_ready_uses_exact_v1_path_header_and_no_application_frames(tmp_pat
     request = transport.open_calls[0]
     assert request.url == STREAM_URL == contract()["contract"]["streamUrl"]
     assert request.url == (
-        "wss://starknet.sepolia.extended.exchange/"
+        "wss://api.starknet.sepolia.extended.exchange/"
         "stream.extended.exchange/v1/account"
     )
-    assert not request.url.startswith("wss://api.starknet.sepolia.extended.exchange/")
     assert request.headers == {
         "User-Agent": "X10PythonTradingClient/2.5.0",
         "X-Api-Key": API_KEY,
@@ -479,6 +478,33 @@ async def test_server_frame_ts_is_typed_but_not_rest_freshness_authority(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_current_sdk_optional_envelope_and_payload_fields_are_accepted(tmp_path):
+    current = frame(40)
+    current.pop("error")
+    current["data"] = {"balance": current["data"]["balance"]}
+    current["data"]["balance"].update(
+        {
+            "withdrawableUnrealisedPnl": "0",
+            "exposure": "0",
+            "leverage": "0",
+        }
+    )
+    result, _, _ = await execute(tmp_path, FixtureTransport(frames=[current]))
+    assert result.status == "READY_FIXTURE"
+
+
+@pytest.mark.asyncio
+async def test_unknown_envelope_or_payload_fields_still_block(tmp_path):
+    extra_envelope = frame(40)
+    extra_envelope["unknown"] = None
+    extra_payload = frame(40)
+    extra_payload["data"]["unknown"] = None
+    for index, bad in enumerate((extra_envelope, extra_payload)):
+        result, _, _ = await execute(tmp_path / str(index), FixtureTransport(frames=[bad]))
+        assert (result.status, result.reason) == ("BLOCKED", "STREAM_MALFORMED_FRAME")
+
+
+@pytest.mark.asyncio
 async def test_activity_injected_during_slow_round_b_is_counted_and_terminal(tmp_path):
     transport = FixtureTransport(
         inject_at=("B", "/user/orders"),
@@ -520,8 +546,6 @@ async def test_type_payload_contradictions_and_unproven_types_block(tmp_path, ba
 async def test_balance_and_spot_balance_are_exhaustively_decoded(tmp_path):
     bad_balance = frame(40)
     bad_balance["data"]["balance"].pop("equity")
-    extra_balance = frame(40)
-    extra_balance["data"]["balance"]["extra"] = "0"
     nan_balance = frame(40)
     nan_balance["data"]["balance"]["balance"] = "NaN"
     spot = frame(40, kind="SPOT_BALANCE")
@@ -531,7 +555,7 @@ async def test_balance_and_spot_balance_are_exhaustively_decoded(tmp_path):
         "availableToWithdraw": None, "absolutePnl": None, "pnlPercentage": None,
         "averageEntryPrice": None, "updatedAt": 1770000000100,
     }]
-    for index, bad in enumerate((bad_balance, extra_balance, nan_balance, spot)):
+    for index, bad in enumerate((bad_balance, nan_balance, spot)):
         result, _, _ = await execute(tmp_path / str(index), FixtureTransport(frames=[bad]))
         assert result.status == "BLOCKED"
         assert result.reason in {"STREAM_BALANCE_MALFORMED", "STREAM_SPOT_BALANCE_MALFORMED"}

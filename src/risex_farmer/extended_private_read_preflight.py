@@ -18,7 +18,7 @@ from typing import Any, Mapping
 
 REST_BASE_URL = "https://api.starknet.sepolia.extended.exchange/api/v1"
 STREAM_URL = (
-    "wss://starknet.sepolia.extended.exchange/"
+    "wss://api.starknet.sepolia.extended.exchange/"
     "stream.extended.exchange/v1/account"
 )
 ACCOUNT_ID = 7001
@@ -436,14 +436,23 @@ async def _rest_round(
 def _validate_stream_frame(
     raw: Any, previous: int | None, identity_matcher: Any = None
 ) -> int:
-    frame = _exact_object(
-        raw, {"type", "data", "error", "ts", "seq"}, "STREAM_MALFORMED_FRAME"
-    )
+    required_frame_keys = {"type", "data", "ts", "seq"}
+    allowed_frame_keys = required_frame_keys | {"error"}
+    if (
+        type(raw) is not dict
+        or not required_frame_keys.issubset(raw)
+        or not set(raw).issubset(allowed_frame_keys)
+    ):
+        raise PreflightViolation("STREAM_MALFORMED_FRAME")
+    frame = raw
     if frame["type"] not in _STREAM_TYPES:
         raise PreflightViolation("STREAM_UNKNOWN_FRAME")
-    if frame["error"] is not None or not _integer(frame["ts"]) or not _integer(frame["seq"]):
+    if (
+        frame.get("error") is not None
+        or not _integer(frame["ts"])
+        or not _integer(frame["seq"])
+    ):
         raise PreflightViolation("STREAM_MALFORMED_FRAME")
-    data = _exact_object(frame["data"], _STREAM_DATA_KEYS, "STREAM_MALFORMED_FRAME")
     matching = {
         "ORDER": "orders",
         "POSITION": "positions",
@@ -451,8 +460,15 @@ def _validate_stream_frame(
         "BALANCE": "balance",
         "SPOT_BALANCE": "spotBalances",
     }[frame["type"]]
+    data = frame["data"]
+    if (
+        type(data) is not dict
+        or matching not in data
+        or not set(data).issubset(_STREAM_DATA_KEYS)
+    ):
+        raise PreflightViolation("STREAM_MALFORMED_FRAME")
     for key in _STREAM_DATA_KEYS:
-        value = data[key]
+        value = data.get(key)
         if key == matching:
             required_type = dict if key == "balance" else list
             if type(value) is not required_type:
@@ -460,7 +476,9 @@ def _validate_stream_frame(
         elif value is not None:
             raise PreflightViolation("STREAM_TYPE_PAYLOAD_MISMATCH")
     if frame["type"] == "BALANCE":
-        balance = _exact_object(data["balance"], _BALANCE_KEYS, "STREAM_BALANCE_MALFORMED")
+        balance = data["balance"]
+        if type(balance) is not dict or not _BALANCE_KEYS.issubset(balance):
+            raise PreflightViolation("STREAM_BALANCE_MALFORMED")
         if (
             type(balance["collateralName"]) is not str
             or not _integer(balance["updatedTime"])
@@ -469,7 +487,9 @@ def _validate_stream_frame(
             raise PreflightViolation("STREAM_BALANCE_MALFORMED")
     if frame["type"] == "SPOT_BALANCE":
         for row in data["spotBalances"]:
-            spot = _exact_object(row, _SPOT_KEYS, "STREAM_SPOT_BALANCE_MALFORMED")
+            if type(row) is not dict or not _SPOT_KEYS.issubset(row):
+                raise PreflightViolation("STREAM_SPOT_BALANCE_MALFORMED")
+            spot = row
             if (
                 (
                     identity_matcher.matches_spot_account_id(spot["accountId"])
