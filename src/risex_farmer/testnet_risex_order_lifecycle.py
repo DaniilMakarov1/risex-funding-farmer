@@ -39,6 +39,38 @@ class LifecycleSafetyError(RuntimeError):
     """A bounded, identity-free fail-closed rejection."""
 
 
+class PlaceResultClass(str, Enum):
+    ACCEPTED = "ACCEPTED"
+    TERMINAL_VENUE_REJECTION = "TERMINAL_VENUE_REJECTION"
+    TRANSPORT_AMBIGUITY = "TRANSPORT_AMBIGUITY"
+    RESPONSE_AMBIGUITY = "RESPONSE_AMBIGUITY"
+    LOCAL_FAILURE = "LOCAL_FAILURE"
+
+
+class PlaceResponseFailure(LifecycleSafetyError):
+    """A sanitized place outcome which is safe to retain durably."""
+
+    def __init__(self, result_class: PlaceResultClass, failure_code: str) -> None:
+        if (
+            result_class not in {
+                PlaceResultClass.TERMINAL_VENUE_REJECTION,
+                PlaceResultClass.TRANSPORT_AMBIGUITY,
+                PlaceResultClass.RESPONSE_AMBIGUITY,
+            }
+            or not isinstance(failure_code, str)
+            or not failure_code
+            or len(failure_code) > 64
+            or any(
+                character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789"
+                for character in failure_code
+            )
+        ):
+            raise LifecycleSafetyError("RISEx place result class rejected")
+        super().__init__("RISEx place outcome requires reconciliation")
+        self.result_class = result_class
+        self.failure_code = failure_code
+
+
 class Outcome(str, Enum):
     ACTIVE = "ACTIVE"
     COMPLETED_NO_FILL_FLAT = "COMPLETED_NO_FILL_FLAT"
@@ -249,8 +281,10 @@ def pack_order_data(
     market_id = _uint(market_id, 16, "market_id")
     size_steps = _uint(size_steps, 32, "size_steps")
     price_ticks = _uint(price_ticks, 24, "price_ticks")
-    if size_steps == 0 or price_ticks == 0:
+    if size_steps == 0:
         raise LifecycleSafetyError("RISEx zero order field rejected")
+    if order_type == "LIMIT" and price_ticks == 0:
+        raise LifecycleSafetyError("RISEx order price/type rejected")
     flags = (
         side_code | (int(post_only) << 1) | (int(reduce_only) << 2)
         | (type_code << 5) | (tif_code << 6)
@@ -446,6 +480,61 @@ class DurableIntentStore:
                 )
             else:
                 self.connection.execute("UPDATE intents SET state=? WHERE intent_id=?", (state, intent_id))
+
+    def _record_place_result(
+        self, intent_id: str, result_class: PlaceResultClass, failure_code: str,
+        *, state: str, order_id: str | None = None,
+    ) -> None:
+        if not isinstance(result_class, PlaceResultClass):
+            raise LifecycleSafetyError("RISEx place result class rejected")
+        if (
+            not isinstance(failure_code, str) or not failure_code
+            or len(failure_code) > 64
+            or any(
+                character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789"
+                for character in failure_code
+            )
+        ):
+            raise LifecycleSafetyError("RISEx place result class rejected")
+        rows = (
+            (f"place_result:{intent_id}", result_class.value),
+            (f"place_failure:{intent_id}", failure_code),
+        )
+        try:
+            with self.connection:
+                self.connection.executemany(
+                    "INSERT INTO terminal(key, value) VALUES (?, ?)", rows,
+                )
+                if order_id is None:
+                    updated = self.connection.execute(
+                        "UPDATE intents SET state=? WHERE intent_id=? AND state='DISPATCHING'",
+                        (state, intent_id),
+                    )
+                else:
+                    updated = self.connection.execute(
+                        "UPDATE intents SET state=?, order_id=? "
+                        "WHERE intent_id=? AND state='DISPATCHING'",
+                        (state, order_id, intent_id),
+                    )
+                if updated.rowcount != 1:
+                    raise sqlite3.IntegrityError
+        except sqlite3.IntegrityError:
+            raise LifecycleSafetyError("RISEx place result already recorded") from None
+
+    def place_result(self, intent_id: str) -> tuple[PlaceResultClass, str] | None:
+        rows = dict(self.connection.execute(
+            "SELECT key, value FROM terminal WHERE key IN (?, ?)",
+            (f"place_result:{intent_id}", f"place_failure:{intent_id}"),
+        ))
+        if not rows:
+            return None
+        try:
+            return (
+                PlaceResultClass(rows[f"place_result:{intent_id}"]),
+                rows[f"place_failure:{intent_id}"],
+            )
+        except (KeyError, ValueError):
+            raise LifecycleSafetyError("RISEx place result record rejected") from None
 
     def _reconcile_intent(
         self, intent_id: str, record: OrderRecord | None,
@@ -855,10 +944,10 @@ class Lifecycle:
         if preflight.size != exact_size or preflight.buy_bound != exact_bound:
             self._reject()
         intent = self._prepare(
-            kind="OPEN", side="BUY", order_type="LIMIT", time_in_force="IOC",
+            kind="OPEN", side="BUY", order_type="MARKET", time_in_force="IOC",
             reduce_only=False, market=preflight.market, account=preflight.account,
             bbo=preflight.bbo,
-            size=exact_size, price=exact_bound,
+            size=exact_size, price=Decimal("0"),
             source_position=Decimal("0"), client_order_id=client_order_id,
             nonce_anchor=nonce_anchor, nonce_bitmap=nonce_bitmap,
             expires_at=expires_at,
@@ -943,13 +1032,35 @@ class Lifecycle:
         self.store._update_state(intent.intent_id, "DISPATCHING", increment=True)
         try:
             order_id = execute({"intent": "[REDACTED]", "digest": current.payload_digest})
+        except PlaceResponseFailure as failure:
+            state = (
+                "VENUE_REJECTED"
+                if failure.result_class is PlaceResultClass.TERMINAL_VENUE_REJECTION
+                else "AMBIGUOUS"
+            )
+            self.store._record_place_result(
+                intent.intent_id, failure.result_class, failure.failure_code,
+                state=state,
+            )
+            return
         except Exception:
-            self.store._update_state(intent.intent_id, "AMBIGUOUS")
+            self.store._record_place_result(
+                intent.intent_id, PlaceResultClass.LOCAL_FAILURE,
+                "UNCLASSIFIED_LOCAL_FAILURE",
+                state="AMBIGUOUS",
+            )
             return
         if not _valid_order_id(order_id):
-            self.store._update_state(intent.intent_id, "AMBIGUOUS")
+            self.store._record_place_result(
+                intent.intent_id, PlaceResultClass.RESPONSE_AMBIGUITY,
+                "INVALID_ORDER_ID",
+                state="AMBIGUOUS",
+            )
             return
-        self.store._update_state(intent.intent_id, "DISPATCHED", order_id=order_id)
+        self.store._record_place_result(
+            intent.intent_id, PlaceResultClass.ACCEPTED, "ORDER_ID_ACCEPTED",
+            state="DISPATCHED", order_id=order_id,
+        )
 
     def unsigned_action(self, intent_id: str) -> dict[str, Any]:
         """Return the exact synthetic-boundary fields used by official place encoding."""
@@ -1023,7 +1134,8 @@ class Lifecycle:
     def reconcile(self, intent_id: str, evidence: Evidence) -> Outcome:
         current = self.store.get(intent_id)
         if current.dispatch_count != 1 or current.state not in {
-            "DISPATCHING", "DISPATCHED", "AMBIGUOUS", "OPEN_KNOWN",
+            "DISPATCHING", "DISPATCHED", "AMBIGUOUS", "VENUE_REJECTED",
+            "OPEN_KNOWN",
         }:
             self._reject()
         try:

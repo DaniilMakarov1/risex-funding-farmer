@@ -12,7 +12,8 @@ import pytest
 
 from risex_farmer.testnet_risex_order_lifecycle import (
     AccountState, BBO, DurableIntentStore, Evidence, Lifecycle,
-    LifecycleSafetyError, MarketState, OrderRecord, SyntheticSigner,
+    LifecycleSafetyError, MarketState, OrderRecord, PlaceResponseFailure,
+    PlaceResultClass, SyntheticSigner,
 )
 from risex_farmer.testnet_risex_order_lifecycle_operational import (
     ACCOUNT, AUTHORIZATION, CANCEL_PATH, OFFICIAL_CHAIN_ID,
@@ -287,6 +288,9 @@ def test_ambiguous_post_is_never_replayed_and_credential_is_zeroized(tmp_path):
     transport.fail = True
     binding.dispatch_place(lifecycle, intent, market())
     assert lifecycle.store.get(intent.intent_id).state == "AMBIGUOUS"
+    assert lifecycle.store.place_result(intent.intent_id) == (
+        PlaceResultClass.LOCAL_FAILURE, "UNCLASSIFIED_LOCAL_FAILURE",
+    )
     with pytest.raises(LifecycleSafetyError):
         binding.dispatch_place(lifecycle, intent, market())
     assert len(transport.calls) == 1 and len(issued) == 1
@@ -416,11 +420,65 @@ def test_transport_owns_exact_post_surface_has_no_retry_and_bounds_response():
         transport._post("https://other.invalid/", {})
     failing = FakeConnection(FakeResponse(status=307))
     transport._connection_factory = lambda: failing
-    with pytest.raises(LifecycleSafetyError, match="reconciliation"):
+    with pytest.raises(PlaceResponseFailure) as redirect:
         transport.place({})
+    assert (redirect.value.result_class, redirect.value.failure_code) == (
+        PlaceResultClass.RESPONSE_AMBIGUITY, "HTTP_307",
+    )
     assert len(failing.calls) == 1
     oversized = FakeConnection(FakeResponse(length=str(SealedWriteTransport.MAX_BYTES + 1)))
     transport._connection_factory = lambda: oversized
-    with pytest.raises(LifecycleSafetyError, match="response"):
+    with pytest.raises(PlaceResponseFailure) as too_large:
         transport.place({})
+    assert (too_large.value.result_class, too_large.value.failure_code) == (
+        PlaceResultClass.RESPONSE_AMBIGUITY, "OVERSIZED_RESPONSE",
+    )
     assert len(oversized.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_class"),
+    (
+        (400, PlaceResultClass.TERMINAL_VENUE_REJECTION),
+        (401, PlaceResultClass.TERMINAL_VENUE_REJECTION),
+        (408, PlaceResultClass.RESPONSE_AMBIGUITY),
+        (500, PlaceResultClass.RESPONSE_AMBIGUITY),
+    ),
+)
+def test_place_http_result_class_is_sanitized_and_never_retains_body(
+    status, expected_class,
+):
+    transport = SealedWriteTransport()
+    response = FakeResponse(status=status, body=b'{"secret":"must-not-survive"}')
+    connection = FakeConnection(response)
+    transport._connection_factory = lambda: connection
+    with pytest.raises(PlaceResponseFailure) as failure:
+        transport.place({})
+    assert failure.value.result_class is expected_class
+    assert failure.value.failure_code == f"HTTP_{status}"
+    assert "secret" not in str(failure.value) and connection.closed
+
+
+def test_place_transport_and_malformed_success_are_distinct_ambiguities():
+    class FailingConnection(FakeConnection):
+        def request(self, *args, **kwargs):
+            raise ConnectionResetError("sensitive transport detail")
+
+    transport = SealedWriteTransport()
+    transport._connection_factory = lambda: FailingConnection(FakeResponse())
+    with pytest.raises(PlaceResponseFailure) as transport_failure:
+        transport.place({})
+    assert (
+        transport_failure.value.result_class,
+        transport_failure.value.failure_code,
+    ) == (PlaceResultClass.TRANSPORT_AMBIGUITY, "TRANSPORT_FAILURE")
+    assert "sensitive" not in str(transport_failure.value)
+
+    malformed = FakeConnection(FakeResponse(body=b'{"data":{}}'))
+    transport._connection_factory = lambda: malformed
+    with pytest.raises(PlaceResponseFailure) as response_failure:
+        transport.place({})
+    assert (
+        response_failure.value.result_class,
+        response_failure.value.failure_code,
+    ) == (PlaceResultClass.RESPONSE_AMBIGUITY, "MISSING_ORDER_ID")
