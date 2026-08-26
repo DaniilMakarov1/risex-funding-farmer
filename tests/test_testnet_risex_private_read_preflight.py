@@ -165,6 +165,36 @@ def test_fixed_ondo_market_binds_id_symbol_grid_minimum_and_depth():
     assert all(level["quantity"] == "25" for level in book["asks"])
 
 
+def test_market_accepts_zero_unused_24h_high_and_low_statistics():
+    data = current_public_contract("/v1/markets")
+    market = data["markets"][0]
+    market["high_24h"] = "0"
+    market["low_24h"] = "0"
+
+    assert PrivateReadPreflight._validate_market(data, NOW) is not None
+
+
+@pytest.mark.parametrize("field", ["high_24h", "low_24h"])
+@pytest.mark.parametrize("value", ["-0.00001", "NaN", "Infinity", "not-a-decimal", 0])
+def test_market_rejects_invalid_24h_statistics(field, value):
+    data = current_public_contract("/v1/markets")
+    data["markets"][0][field] = value
+
+    with pytest.raises(ValueError):
+        PrivateReadPreflight._validate_market(data, NOW)
+
+
+@pytest.mark.parametrize(
+    "field", ["index_price", "mark_price", "last_price", "max_position_size"],
+)
+def test_market_rejects_zero_execution_critical_fields(field):
+    data = current_public_contract("/v1/markets")
+    data["markets"][0][field] = "0"
+
+    with pytest.raises(ValueError):
+        PrivateReadPreflight._validate_market(data, NOW)
+
+
 @pytest.mark.parametrize("mutation", [
     "market_id", "symbol", "step_price", "step_size", "minimum",
 ])

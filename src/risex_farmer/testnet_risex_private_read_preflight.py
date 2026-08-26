@@ -505,10 +505,11 @@ class PrivateReadPreflight:
             "funding_rate_8h", "last_cumulative_funding", "predicted_funding_rate",
         }
         positive_decimal_fields = {
-            "high_24h", "index_price", "last_price", "low_24h", "mark_price",
-            "max_position_size",
+            "index_price", "last_price", "mark_price", "max_position_size",
         }
-        nonnegative_decimal_fields = {"open_interest", "quote_volume_24h"}
+        nonnegative_decimal_fields = {
+            "high_24h", "low_24h", "open_interest", "quote_volume_24h",
+        }
         for field in signed_decimal_fields:
             _decimal(market[field])
         if any(_decimal(market[field]) <= 0 for field in positive_decimal_fields):
