@@ -13,10 +13,12 @@ import zlib
 import pytest
 
 from risex_farmer.nado_testnet_lifecycle import (
-    ACTIVE_PERP, COMPLETE, HALTED, AccountSnapshot, CatalogSnapshot,
-    EngineEvidence, FillEvidence, FixedEnvironment, IntentStore, OrderEvidence, Product,
-    OrderIntent, SyntheticOrderVector, TriggerSnapshot, build_order_nonce,
-    canonical_payload, order_digest,
+    ACTIVE_PERP, COMPLETE, EXECUTE_RESPONSE_AMBIGUITY,
+    EXECUTE_TRANSPORT_AMBIGUITY, EXECUTE_VENUE_REJECTION, HALTED, IOC_APPENDIX,
+    AccountSnapshot, CatalogSnapshot, EngineEvidence, ExecuteFailure, FillEvidence,
+    FixedEnvironment, IntentStore, OrderEvidence, Product, OrderIntent,
+    SyntheticOrderVector, TriggerSnapshot, build_order_nonce, canonical_payload,
+    order_digest,
 )
 from risex_farmer.nado_testnet_lifecycle_operational import (
     OperationalSafetyError, OperationalVenueIO, OwnerOrderCapability, REDACTED_STORE_PATH,
@@ -239,6 +241,18 @@ def test_entry_rejects_same_product_id_with_wrong_v2_ticker() -> None:
         module._entry_order(observed, OWNER, SENDER, io.now_ms() + 100)
 
 
+def test_entry_is_bounded_ioc_buy_at_fresh_ask() -> None:
+    io = FixtureIO()
+    observed = io.observe(())
+    order = importlib.import_module(
+        "risex_farmer.nado_testnet_lifecycle_operational"
+    )._entry_order(observed, OWNER, SENDER, io.now_ms() + 100)
+    assert order.product_id == TARGET_PRODUCT_ID
+    assert order.price_x18 == observed.ask_x18
+    assert order.appendix == IOC_APPENDIX
+    assert order.amount_x18 == 650 * X18
+
+
 def test_trigger_read_reuses_fresh_server_time_envelope(monkeypatch) -> None:
     module = importlib.import_module("risex_farmer.nado_testnet_lifecycle_operational")
     now_ms = 1_700_000_000_500
@@ -420,8 +434,85 @@ def test_cancel_response_rejects_non_exact_resting_entry(field: str, wrong: obje
         "status": "success", "request_type": "execute_cancel_product_orders",
         "data": {"cancelled_orders": [cancelled]},
     }
-    with pytest.raises(OperationalSafetyError, match="exact cancellation"):
+    with pytest.raises(ExecuteFailure, match=EXECUTE_RESPONSE_AMBIGUITY):
         io.dispatch(_cancel_intent(), "0x" + "33" * 65)
+
+
+def _prepared_execute_intent(path: Path) -> tuple[IntentStore, OrderIntent]:
+    recv, salt = 1_700_000_000_100, 7
+    order = SyntheticOrderVector(
+        OWNER, "default", SENDER, TARGET_PRODUCT_ID, 7_766_000_000_000_000,
+        650 * X18, 2**32 - 1, recv, salt, build_order_nonce(recv, salt),
+        IOC_APPENDIX,
+    )
+    intent = OrderIntent(
+        "ENTRY", TARGET_PRODUCT_ID, order.nonce, recv, order_digest(order),
+        canonical_payload(order.as_payload()), order.amount_x18, order.appendix,
+        sender=SENDER, owner=OWNER, subaccount_name="default",
+    )
+    store = IntentStore(path)
+    store.prepare(intent)
+    return store, intent
+
+
+def test_terminal_execute_rejection_is_sanitized_durable_and_not_ambiguous(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "rejected.sqlite"
+    store, intent = _prepared_execute_intent(path)
+    io = OperationalVenueIO(OWNER, SENDER)
+    io._post = lambda *_args: {
+        "status": "failure", "request_type": "execute_place_order",
+        "error_code": 2020, "error": "RAW_VENUE_DETAIL",
+        "additive": {"raw": "ignored"},
+    }
+    try:
+        with pytest.raises(ExecuteFailure, match=EXECUTE_VENUE_REJECTION) as caught:
+            store.dispatch_prepared(
+                intent.digest, lambda durable: io.dispatch(durable, "0x" + "11" * 65)
+            )
+        assert "RAW_VENUE_DETAIL" not in str(caught.value)
+        assert store.state(intent.digest) == "REJECTED"
+        assert store.lifecycle_status() == HALTED
+        assert store.execute_failure(intent.digest) == (EXECUTE_VENUE_REJECTION, 2020)
+    finally:
+        store.close()
+    assert b"RAW_VENUE_DETAIL" not in path.read_bytes()
+
+
+@pytest.mark.parametrize(
+    ("response", "failure_class"),
+    [
+        (TimeoutError("RAW_TRANSPORT_DETAIL"), EXECUTE_TRANSPORT_AMBIGUITY),
+        ({"status": "success"}, EXECUTE_RESPONSE_AMBIGUITY),
+    ],
+)
+def test_ambiguous_execute_failure_class_is_durable_and_never_replayable(
+    tmp_path: Path, response: object, failure_class: str,
+) -> None:
+    path = tmp_path / f"{failure_class}.sqlite"
+    store, intent = _prepared_execute_intent(path)
+    io = OperationalVenueIO(OWNER, SENDER)
+    if isinstance(response, BaseException):
+        io._post = lambda *_args: (_ for _ in ()).throw(response)
+    else:
+        io._post = lambda *_args: response
+    try:
+        with pytest.raises(ExecuteFailure, match=failure_class) as caught:
+            store.dispatch_prepared(
+                intent.digest, lambda durable: io.dispatch(durable, "0x" + "11" * 65)
+            )
+        assert "RAW_TRANSPORT_DETAIL" not in str(caught.value)
+        assert store.state(intent.digest) == "AMBIGUOUS"
+        assert store.lifecycle_status() == HALTED
+        assert store.execute_failure(intent.digest) == (failure_class, None)
+        with pytest.raises(Exception, match="prepared intent"):
+            store.dispatch_prepared(
+                intent.digest, lambda durable: io.dispatch(durable, "0x" + "11" * 65)
+            )
+    finally:
+        store.close()
+    assert b"RAW_TRANSPORT_DETAIL" not in path.read_bytes()
 
 
 class _Response:
@@ -496,7 +587,7 @@ def test_transport_rejects_unknown_or_composed_content_encoding(encoding: str) -
         io._post("gateway.test.nado.xyz", "/v1/query", {"type": "status"})
 
 
-def test_post_only_no_fill_is_exactly_cancelled_and_finishes_flat(tmp_path: Path) -> None:
+def test_unexpected_resting_ioc_is_exactly_cancelled_and_finishes_flat(tmp_path: Path) -> None:
     io = FixtureIO("RESTING")
     report, store = run_fixture(tmp_path, io)
     try:
@@ -516,7 +607,7 @@ def test_full_entry_uses_fresh_position_reduce_only_ioc_close(tmp_path: Path) ->
     try:
         assert report.status == COMPLETE and report.writes == 2
         entry, close = [intent for intent, _ in store.intents()]
-        assert entry.kind == "ENTRY" and entry.appendix == 1537
+        assert entry.kind == "ENTRY" and entry.appendix == IOC_APPENDIX
         assert close.kind == "CLOSE" and close.appendix == 2561
         assert close.starting_position_x18 == entry.amount_x18
         assert close.amount_x18 == -entry.amount_x18
@@ -525,7 +616,7 @@ def test_full_entry_uses_fresh_position_reduce_only_ioc_close(tmp_path: Path) ->
         store.close()
 
 
-def test_partial_post_only_fill_is_cancelled_then_clamped_close_uses_residual(
+def test_partial_ioc_fill_is_cancelled_then_clamped_close_uses_residual(
     tmp_path: Path,
 ) -> None:
     io = FixtureIO("PARTIAL")

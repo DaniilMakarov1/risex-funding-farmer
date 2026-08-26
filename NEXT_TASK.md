@@ -8,7 +8,7 @@ Status: `AUTHORIZED OBSERVED-WRITE CORRECTION`.
 
 - The accepted bounded crossing `LIMIT+IOC` opening dispatched once but again terminated with zero fill and exact flatness; its local terminal outcome was recovered only after two fresh authoritative zero-order/flat/consumed-nonce observations. Do not repeat it unchanged.
 - In a fresh visible RISEx Builder worktree, preserve sanitized explicit place-response failure evidence and select the smallest officially/observably supported taker opening actually capable of filling. The testnet spread is not a blocker. Preserve minimum/grid/depth checks, durable identity before dispatch, no replay, authoritative reconciliation, bounded close, and final zero relevant orders plus exact flatness.
-- After acceptance, Chief archives only the exact recovered terminal database and runs one fresh sequential lifecycle.
+- After acceptance, Chief archives only the exact terminal rejected database and runs one fresh sequential lifecycle.
 
 ## Nado — sequential Level C lifecycle
 
@@ -17,7 +17,8 @@ Status: `AUTHORIZED OBSERVED-WRITE CORRECTION`.
 - The signed trigger read now uses the accepted 30,000 ms window; the actual write retains its 100 ms contract. Current catalog minima are accepted as published, while the actual target opening and clamped closing amounts remain exactly step-aligned and fully safety-checked.
 - All three invocations stopped with zero intents and zero venue writes. Fixed BTC product 2 now has a minimum notional far above USD 500; credentials/private access and signing remain valid.
 - Product 44 `SKR-PERP_USDT0` is accepted at the current smallest executable 650-SKR amount. Its first post-only execute halted ambiguous; exact post-window order query returned code 2020/not found and repeated authoritative zero-order/zero-fill/exact-flat evidence allowed protected local completion recovery without replay.
-- In a fresh visible Nado Builder worktree, make only the smallest correction that (a) uses a bounded taker opening capable of filling and (b) preserves a sanitized explicit execute failure class/evidence needed to distinguish terminal venue rejection from transport ambiguity without retaining raw bodies or weakening no-replay. Preserve exact product identity, signing, durable intent-before-dispatch, bounded cancel/close, and final zero-order/exact-flat barriers.
+- The accepted exact-ask IOC correction dispatched once and received complete venue rejection code 2011; the durable `REJECTED/HALTED` state prevents replay. Account collateral/health is about 10 USDT0 and all orders/positions remain zero. Official current quickstart guidance for a market buy uses IOC with a price 10% above the current price.
+- In a fresh visible Nado Builder worktree, use the smallest tick-aligned official 10%-buffered IOC buy bound and make the outer sealed report preserve the already-durable sanitized venue-rejection class/code instead of collapsing it into `OPERATIONAL_PREREQUISITE_FAILED`. Preserve exact product identity, signing, durable intent-before-dispatch, ambiguity no-replay, bounded close, and final zero-order/exact-flat barriers.
 - After acceptance, Chief archives only the exact recovered terminal database and runs one fresh sequential lifecycle.
 
 ## Extended — wallet/API Management setup and lifecycle
