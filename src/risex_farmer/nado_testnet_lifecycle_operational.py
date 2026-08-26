@@ -777,9 +777,9 @@ class OperationalVenueIO:
             raise OperationalSafetyError("V2 pair identity schema mismatch")
         result: dict[int, str] = {}
         for pair in raw:
-            if type(pair) is not dict or set(pair) != {
+            if type(pair) is not dict or not {
                 "product_id", "ticker_id", "base", "quote",
-            }:
+            } <= set(pair):
                 raise OperationalSafetyError("V2 pair identity schema mismatch")
             product_id = pair["product_id"]
             ticker, base, quote = pair["ticker_id"], pair["base"], pair["quote"]

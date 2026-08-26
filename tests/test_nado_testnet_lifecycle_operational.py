@@ -185,13 +185,13 @@ def test_v2_pair_identity_binds_exact_selected_regular_perpetual() -> None:
         "ticker_id": TARGET_TICKER_ID,
         "base": "SKR-PERP",
         "quote": "USDT0",
+        "additive_irrelevant": {"ignored": True},
     }])
     assert pairs == {TARGET_PRODUCT_ID: TARGET_TICKER_ID}
     for changed in (
         {"ticker_id": "PUMP-PERP_USDT0"},
         {"base": "PUMP-PERP"},
         {"quote": "USDC"},
-        {"extra": "field"},
     ):
         invalid = {
             "product_id": TARGET_PRODUCT_ID,
@@ -202,6 +202,30 @@ def test_v2_pair_identity_binds_exact_selected_regular_perpetual() -> None:
         invalid.update(changed)
         with pytest.raises(OperationalSafetyError, match="V2 pair identity"):
             io._pairs([invalid])
+
+
+@pytest.mark.parametrize("missing", ["product_id", "ticker_id", "base", "quote"])
+def test_v2_pair_identity_rejects_missing_required_field(missing: str) -> None:
+    pair = {
+        "product_id": TARGET_PRODUCT_ID,
+        "ticker_id": TARGET_TICKER_ID,
+        "base": "SKR-PERP",
+        "quote": "USDT0",
+    }
+    pair.pop(missing)
+    with pytest.raises(OperationalSafetyError, match="V2 pair identity"):
+        OperationalVenueIO(OWNER, SENDER)._pairs([pair])
+
+
+def test_v2_pair_identity_rejects_duplicate_product_id() -> None:
+    pair = {
+        "product_id": TARGET_PRODUCT_ID,
+        "ticker_id": TARGET_TICKER_ID,
+        "base": "SKR-PERP",
+        "quote": "USDT0",
+    }
+    with pytest.raises(OperationalSafetyError, match="V2 pair identity"):
+        OperationalVenueIO(OWNER, SENDER)._pairs([pair, dict(pair)])
 
 
 def test_entry_rejects_same_product_id_with_wrong_v2_ticker() -> None:
