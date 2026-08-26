@@ -22,12 +22,12 @@ OTHER_SIGNER = "0x" + "77" * 20
 OTHER_ROUTER = "0x" + "88" * 20
 OTHER_AUTHORIZATION = "0x" + "99" * 20
 SIGNER = SyntheticSigner(SIGNER_ADDRESS)
-EXPECTED_ORDER_DATA = 1_180_591_648_218_017_079_298
-EXPECTED_ACTION_HASH = "5bd95300cc7edbc329d8cf8b3552c4a891920c4f51c3a6bbba960650142b71c1"
+EXPECTED_ORDER_DATA = 1_180_591_648_218_017_085_442
+EXPECTED_ACTION_HASH = "ee1058ee762d6614bf31b0d75949cacb9c7bf5a9d7817e2c190315df2bbc1085"
 EXPECTED_ABI = (
     "1d442a680326a08fbf310b367c5c0194ca94bbc644dc507e0b816b055ccfa2b9"
     "0000000000000000000000000000000000000000000000000000000000000005"
-    "00000000000000000000000000000000000000000000004000001902fbd6a002"
+    "00000000000000000000000000000000000000000000004000001902fbd6b802"
     "0000000000000000000000000000000000000000000000000000000000000000"
     "0000000000000000000000000000000000000000000000000000000000000065"
     "0000000000000000000000000000000000000000000000000000000000000000"
@@ -283,7 +283,7 @@ def test_malformed_order_identity_halts_after_dispatch(tmp_path):
         candidate.store.close()
 
 
-def test_open_is_exact_minimum_price_bounded_market_fok(lifecycle):
+def test_open_is_exact_minimum_price_bounded_crossing_limit_ioc(lifecycle):
     intent = open_intent(lifecycle)
     request = lifecycle.unsigned_request(intent.intent_id, market=market())
     assert intent.size == Decimal("0.0001") and intent.price == Decimal("78217.0")
@@ -305,7 +305,7 @@ def test_open_is_exact_minimum_price_bounded_market_fok(lifecycle):
     assert request["dispatchable"] is False and request["signature"] is None
     assert request["body"] == {
         "market_id": 1, "size_steps": 100, "price_ticks": 782170,
-        "side": 0, "order_type": 0, "time_in_force": 2,
+        "side": 0, "order_type": 1, "time_in_force": 3,
         "post_only": False, "reduce_only": False, "stp_mode": 0,
         "client_order_id": 101, "account": ACCOUNT.lower(),
         "signer": SIGNER_ADDRESS.lower(), "nonce_anchor": "7",
