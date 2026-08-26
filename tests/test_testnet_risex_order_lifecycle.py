@@ -22,12 +22,12 @@ OTHER_SIGNER = "0x" + "77" * 20
 OTHER_ROUTER = "0x" + "88" * 20
 OTHER_AUTHORIZATION = "0x" + "99" * 20
 SIGNER = SyntheticSigner(SIGNER_ADDRESS)
-EXPECTED_ORDER_DATA = 1_180_591_648_205_202_010_114
-EXPECTED_ACTION_HASH = "68a89e2b3f45389782286dc0de79a1641e34f5d498edd9742fff88d5e3d040e0"
+EXPECTED_ORDER_DATA = 1_180_591_648_218_017_083_394
+EXPECTED_ACTION_HASH = "88237aaefd30ac389c5139a541cad646827e1b70ed8a519e29c985ddf9ba260b"
 EXPECTED_ABI = (
     "1d442a680326a08fbf310b367c5c0194ca94bbc644dc507e0b816b055ccfa2b9"
     "0000000000000000000000000000000000000000000000000000000000000005"
-    "0000000000000000000000000000000000000000000000400000190000003002"
+    "00000000000000000000000000000000000000000000004000001902fbd6b002"
     "0000000000000000000000000000000000000000000000000000000000000000"
     "0000000000000000000000000000000000000000000000000000000000000065"
     "0000000000000000000000000000000000000000000000000000000000000000"
@@ -289,8 +289,8 @@ def test_malformed_order_identity_halts_after_dispatch(tmp_path):
 def test_open_is_exact_minimum_depth_checked_market_ioc(lifecycle):
     intent = open_intent(lifecycle)
     request = lifecycle.unsigned_request(intent.intent_id, market=market())
-    assert intent.size == Decimal("0.0001") and intent.price == Decimal("0")
-    assert (intent.size_steps, intent.price_ticks) == (100, 0)
+    assert intent.size == Decimal("0.0001") and intent.price == Decimal("78217.0")
+    assert (intent.size_steps, intent.price_ticks) == (100, 782170)
     assert request["header_flags"] == HEADER_FLAGS == 0x05
     assert request["order_data"] == EXPECTED_ORDER_DATA
     assert request["abi_encoded"].hex() == EXPECTED_ABI
@@ -307,7 +307,7 @@ def test_open_is_exact_minimum_depth_checked_market_ioc(lifecycle):
     }
     assert request["dispatchable"] is False and request["signature"] is None
     assert request["body"] == {
-        "market_id": 1, "size_steps": 100, "price_ticks": 0,
+        "market_id": 1, "size_steps": 100, "price_ticks": 782170,
         "side": 0, "order_type": 0, "time_in_force": 3,
         "post_only": False, "reduce_only": False, "stp_mode": 0,
         "client_order_id": 101, "account": ACCOUNT.lower(),
@@ -330,7 +330,28 @@ def test_wide_positive_spread_preserves_exact_lifecycle_price_bound(lifecycle):
     assert preflight.buy_bound == Decimal("90270.0")
     assert preflight.size * preflight.buy_bound <= Decimal("500")
     assert intent.order_type == "MARKET" and intent.time_in_force == "IOC"
-    assert intent.price == Decimal("0") and intent.price_ticks == 0
+    assert intent.price == preflight.buy_bound == Decimal("90270.0")
+    assert intent.price_ticks == 902700
+    assert lifecycle.unsigned_action(intent.intent_id)["price_ticks"] == 902700
+    request = lifecycle.unsigned_request(intent.intent_id, market=market())
+    assert request["body"]["price_ticks"] == 902700
+
+
+def test_market_open_binds_adverse_bound_in_action_and_submitted_body(lifecycle):
+    preflight = ready(lifecycle)
+    intent = lifecycle.prepare_open(preflight, 101, 7, 3, NOW + 30)
+    expected_ticks = int(preflight.buy_bound / preflight.market.tick)
+
+    assert intent.price == preflight.buy_bound
+    assert intent.price_ticks == expected_ticks
+    assert lifecycle.unsigned_action(intent.intent_id)["price_ticks"] == expected_ticks
+    request = lifecycle.unsigned_request(intent.intent_id, market=preflight.market)
+    assert request["order_data"] == pack_order_data(
+        market_id=1, size_steps=100, price_ticks=expected_ticks,
+        side="BUY", post_only=False, reduce_only=False,
+        order_type="MARKET", time_in_force="IOC",
+    )
+    assert request["body"]["price_ticks"] == expected_ticks
 
 
 def test_place_result_distinguishes_terminal_rejection_from_transport_ambiguity(
@@ -833,7 +854,7 @@ def test_preflight_is_immutable_and_bound_to_issuing_lifecycle(lifecycle, tmp_pa
     intent = lifecycle.prepare_open(validated, 101, 7, 3, NOW + 30)
     assert intent.size == market().minimum
     assert validated.buy_bound == Decimal("78217.0")
-    assert intent.price == Decimal("0")
+    assert intent.price == validated.buy_bound
     calls = []
     with pytest.raises(LifecycleSafetyError):
         lifecycle.dispatch(

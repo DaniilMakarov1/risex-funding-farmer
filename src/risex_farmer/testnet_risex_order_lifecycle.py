@@ -947,7 +947,7 @@ class Lifecycle:
             kind="OPEN", side="BUY", order_type="MARKET", time_in_force="IOC",
             reduce_only=False, market=preflight.market, account=preflight.account,
             bbo=preflight.bbo,
-            size=exact_size, price=Decimal("0"),
+            size=exact_size, price=exact_bound,
             source_position=Decimal("0"), client_order_id=client_order_id,
             nonce_anchor=nonce_anchor, nonce_bitmap=nonce_bitmap,
             expires_at=expires_at,
