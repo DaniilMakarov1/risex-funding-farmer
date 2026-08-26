@@ -77,31 +77,31 @@ def public_bodies():
             "markets": [{
                 "accumulated_funding": "0",
                 "active": True,
-                "base_asset_symbol": "ONDO/USDC",
+                "base_asset_symbol": "ETH/USDC",
                 "change_24h": "0.01",
                 "config": {
                     "maintenance_margin_factor": "0.05",
                     "max_leverage": "20",
-                    "min_order_size": "25",
-                    "name": "ONDO/USDC",
+                    "min_order_size": "0.1",
+                    "name": "ETH/USDC",
                     "open_interest_limit": "1000",
                     "quote": "USDC",
-                    "step_price": "0.00001",
-                    "step_size": "0.1",
+                    "step_price": "0.01",
+                    "step_size": "0.001",
                     "unlocked": True,
                 },
                 "current_funding_rate": "0.0001",
-                "display_base_asset_symbol": "ONDO/USDC",
-                "display_name": "ONDO/USDC",
+                "display_base_asset_symbol": "ETH/USDC",
+                "display_name": "ETH/USDC",
                 "funding_interval": "3600",
                 "funding_rate_8h": "0.0008",
-                "high_24h": "0.90000",
-                "index_price": "0.80000",
+                "high_24h": "3200.00",
+                "index_price": "3000.00",
                 "last_cumulative_funding": "0",
-                "last_price": "0.80000",
-                "low_24h": "0.70000",
-                "mark_price": "0.80000",
-                "market_id": "29",
+                "last_price": "3000.00",
+                "low_24h": "2800.00",
+                "mark_price": "3000.00",
+                "market_id": "2",
                 "max_position_size": "1000000",
                 "next_funding_time": "1787576400000000000",
                 "open_interest": "100",
@@ -109,20 +109,20 @@ def public_bodies():
                 "predicted_funding_rate": "0.0001",
                 "quote_asset_symbol": "USDC",
                 "quote_volume_24h": "1000000",
-                "underlying": "ONDO/USDC",
+                "underlying": "ETH/USDC",
             }],
         }),
         "/v1/orderbook": envelope({
-            "market_id": "29",
+            "market_id": "2",
             "bids": [{
-                "order_count": 1, "price": "0.79900", "quantity": "25",
+                "order_count": 1, "price": "2999.00", "quantity": "0.1",
             }],
             "asks": [
-                {"order_count": 1, "price": "0.80000", "quantity": "25"},
-                {"order_count": 1, "price": "0.80010", "quantity": "25"},
-                {"order_count": 1, "price": "0.80020", "quantity": "25"},
-                {"order_count": 1, "price": "0.80030", "quantity": "25"},
-                {"order_count": 1, "price": "0.80040", "quantity": "25"},
+                {"order_count": 1, "price": "3000.00", "quantity": "0.1"},
+                {"order_count": 1, "price": "3000.01", "quantity": "0.1"},
+                {"order_count": 1, "price": "3000.02", "quantity": "0.1"},
+                {"order_count": 1, "price": "3000.03", "quantity": "0.1"},
+                {"order_count": 1, "price": "3000.04", "quantity": "0.1"},
             ],
             "total_asks": "5",
             "total_bids": "1",
@@ -149,21 +149,21 @@ def test_captured_public_contract_shape_is_accepted(path, validator):
     assert result is not None
 
 
-def test_fixed_ondo_market_binds_id_symbol_grid_minimum_and_depth():
+def test_fixed_eth_market_binds_id_symbol_grid_minimum_and_depth():
     data = current_public_contract("/v1/markets")
     market = data["markets"][0]
     config = market["config"]
     book = current_public_contract("/v1/orderbook")
 
     assert (MARKET_ID, MARKET_SYMBOL, TICK, STEP, MINIMUM) == (
-        29, "ONDO/USDC", Decimal("0.00001"), Decimal("0.1"), Decimal("25"),
+        2, "ETH/USDC", Decimal("0.01"), Decimal("0.001"), Decimal("0.1"),
     )
-    assert market["market_id"] == "29" and market["base_asset_symbol"] == "ONDO/USDC"
-    assert config["step_price"] == "0.00001"
-    assert config["step_size"] == "0.1"
-    assert config["min_order_size"] == "25"
-    assert book["market_id"] == "29" and len(book["asks"]) == 5
-    assert all(level["quantity"] == "25" for level in book["asks"])
+    assert market["market_id"] == "2" and market["base_asset_symbol"] == "ETH/USDC"
+    assert config["step_price"] == "0.01"
+    assert config["step_size"] == "0.001"
+    assert config["min_order_size"] == "0.1"
+    assert book["market_id"] == "2" and len(book["asks"]) == 5
+    assert all(level["quantity"] == "0.1" for level in book["asks"])
 
 
 def test_market_accepts_zero_unused_24h_high_and_low_statistics():
@@ -215,6 +215,28 @@ def test_previous_fixed_market_contract_is_rejected(mutation):
 
     with pytest.raises(ValueError):
         PrivateReadPreflight._validate_market(data, NOW)
+
+
+def test_stale_ondo_market_and_book_identity_are_rejected():
+    data = current_public_contract("/v1/markets")
+    market = data["markets"][0]
+    for field in (
+        "base_asset_symbol", "display_base_asset_symbol", "display_name",
+        "underlying",
+    ):
+        market[field] = "ONDO/USDC"
+    market["market_id"] = "29"
+    market["config"].update({
+        "name": "ONDO/USDC", "step_price": "0.00001",
+        "step_size": "0.1", "min_order_size": "25",
+    })
+    with pytest.raises(ValueError):
+        PrivateReadPreflight._validate_market(data, NOW)
+
+    book = current_public_contract("/v1/orderbook")
+    book["market_id"] = "29"
+    with pytest.raises(ValueError):
+        PrivateReadPreflight._validate_book(book, NOW)
 
 
 def test_previous_fixed_book_market_id_is_rejected():
@@ -328,7 +350,7 @@ def test_orderbook_totals_may_include_levels_before_response_limit():
 def test_orderbook_totals_cannot_be_less_than_returned_levels():
     data = current_public_contract("/v1/orderbook")
     data["bids"].append({
-        "order_count": 1, "price": "0.79800", "quantity": "25",
+        "order_count": 1, "price": "2998.00", "quantity": "0.1",
     })
     with pytest.raises(ValueError):
         PrivateReadPreflight._validate_book(data, NOW)
@@ -358,10 +380,10 @@ def expected_public_calls():
         ("/v1/auth/eip712-domain", ()),
         ("/v1/auth/session-key-status", account + (("signer", SIGNER),)),
         ("/v1/auth/signers", account),
-        ("/v1/markets", (("force_refresh", "true"), ("market_ids", "29"))),
-        ("/v1/orderbook", (("market_id", "29"),)),
+        ("/v1/markets", (("force_refresh", "true"), ("market_ids", "2"))),
+        ("/v1/orderbook", (("market_id", "2"),)),
         ("/v1/orders/open", account),
-        ("/v1/account/position", account + (("market_id", "29"),)),
+        ("/v1/account/position", account + (("market_id", "2"),)),
         ("/v1/positions", account),
     ]
 
@@ -385,7 +407,7 @@ def test_exact_official_empty_private_snapshots_are_accepted():
 def test_official_closed_position_row_is_authoritatively_flat():
     closed = {
         "account": ACCOUNT,
-        "market_id": "29",
+        "market_id": "2",
         "size": "0",
         "quote_amount": "0",
         "side": "SELL",
@@ -410,7 +432,7 @@ def test_official_closed_position_row_is_authoritatively_flat():
 def test_position_rows_fail_closed_on_nonflat_or_invalid_identity(mutation):
     closed = {
         "account": ACCOUNT,
-        "market_id": "29",
+        "market_id": "2",
         "size": "0",
     }
     rows = [closed]
@@ -433,7 +455,7 @@ def test_position_rows_fail_closed_on_nonflat_or_invalid_identity(mutation):
 def test_checksum_case_account_and_negative_zero_are_flat():
     closed = {
         "account": "0x" + ACCOUNT[2:].upper(),
-        "market_id": "29",
+        "market_id": "2",
         "size": "-0",
     }
     PrivateReadPreflight._validate_private_frames(
@@ -687,7 +709,7 @@ async def test_public_identity_and_cross_sweep_contradictions_block(tmp_path, ca
         elif case == "market":
             body["data"]["markets"][0]["active"] = False
         else:
-            body["data"]["asks"][0]["price"] = "0.80050"
+            body["data"]["asks"][0]["price"] = "3000.50"
         return replace(response, body=body)
 
     paths = {
@@ -717,21 +739,21 @@ async def test_grid_depth_crossed_book_and_notional_cap_fail_closed(tmp_path, ca
     def mutate(response):
         body = copy.deepcopy(response.body)
         if case == "tick":
-            body["data"]["asks"][0]["price"] = "0.800005"
+            body["data"]["asks"][0]["price"] = "3000.005"
         elif case == "depth":
             body["data"]["asks"] = [{
-                "order_count": 1, "price": "0.80000", "quantity": "24.9",
+                "order_count": 1, "price": "3000.00", "quantity": "0.099",
             }]
         elif case == "crossed":
             body["data"]["asks"] = [{
-                "order_count": 1, "price": "0.79900", "quantity": "25",
+                "order_count": 1, "price": "2999.00", "quantity": "0.1",
             }]
         else:
             body["data"]["asks"] = [{
-                "order_count": 1, "price": "30.00000", "quantity": "25",
+                "order_count": 1, "price": "5000.00", "quantity": "0.1",
             }]
             body["data"]["bids"] = [{
-                "order_count": 1, "price": "29.90000", "quantity": "25",
+                "order_count": 1, "price": "4990.00", "quantity": "0.1",
             }]
         return replace(response, body=body)
 
@@ -752,7 +774,7 @@ async def test_wide_positive_spread_passes_public_private_read_barrier(tmp_path)
     def widen_spread(response):
         body = copy.deepcopy(response.body)
         body["data"]["asks"] = [{
-            "order_count": 1, "price": "0.90000", "quantity": "25",
+            "order_count": 1, "price": "3050.00", "quantity": "0.1",
         }]
         return replace(response, body=body)
 

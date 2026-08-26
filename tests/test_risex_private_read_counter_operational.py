@@ -17,6 +17,7 @@ import risex_farmer.risex_private_read_operational as operational
 from risex_farmer.testnet_risex_private_read_preflight import (
     ACCOUNT,
     HttpResponse,
+    MARKET_ID,
     PrivateReadPreflight,
     SIGNER,
     expected_url,
@@ -43,7 +44,7 @@ from tests.test_testnet_risex_private_read_preflight import NOW, public_bodies
 SIGNATURE = "0x" + "11" * 65
 OFFICIAL_CLOSED_POSITION = {
     "account": ACCOUNT,
-    "market_id": "29",
+    "market_id": str(MARKET_ID),
     "size": "0",
     "quote_amount": "0",
     "side": "SELL",
@@ -1779,7 +1780,7 @@ async def test_fixed_positions_leaves_official_queued_update_unconsumed(tmp_path
     update_raw = json.dumps({
         "channel": "positions",
         "type": "update",
-        "market_id": "29",
+        "market_id": str(MARKET_ID),
         "data": [{
             **OFFICIAL_CLOSED_POSITION,
             "block_number": "123",
@@ -1934,8 +1935,8 @@ async def test_independently_valid_changed_book_completes_both_barriers(tmp_path
 
     def mutate(round_name, path, body):
         if round_name == "b" and path == "/v1/orderbook":
-            body["data"]["bids"][0]["price"] = "0.79899"
-            body["data"]["asks"][0]["price"] = "0.80005"
+            body["data"]["bids"][0]["price"] = "2998.99"
+            body["data"]["asks"][-1]["price"] = "3000.05"
 
     report = await _run_fixture(dependencies(
         tmp_path,

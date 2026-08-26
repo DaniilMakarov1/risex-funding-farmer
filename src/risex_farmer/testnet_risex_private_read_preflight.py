@@ -35,11 +35,11 @@ SIGNER_LABEL = "RISEx Funding Farmer testnet probe"
 MAX_AGE_SECONDS = 5
 MAX_NOTIONAL = Decimal("500")
 MAX_BOUND_FRACTION = Decimal("0.003")
-MARKET_ID = 29
-MARKET_SYMBOL = "ONDO/USDC"
-MINIMUM = Decimal("25")
-STEP = Decimal("0.1")
-TICK = Decimal("0.00001")
+MARKET_ID = 2
+MARKET_SYMBOL = "ETH/USDC"
+MINIMUM = Decimal("0.1")
+STEP = Decimal("0.001")
+TICK = Decimal("0.01")
 
 
 class Outcome(str, Enum):
@@ -289,10 +289,10 @@ class PrivateReadPreflight:
         ("/v1/auth/eip712-domain", ()),
         ("/v1/auth/session-key-status", (("account", ACCOUNT), ("signer", SIGNER))),
         ("/v1/auth/signers", (("account", ACCOUNT),)),
-        ("/v1/markets", (("force_refresh", "true"), ("market_ids", "29"))),
-        ("/v1/orderbook", (("market_id", "29"),)),
+        ("/v1/markets", (("force_refresh", "true"), ("market_ids", str(MARKET_ID)))),
+        ("/v1/orderbook", (("market_id", str(MARKET_ID)),)),
         ("/v1/orders/open", (("account", ACCOUNT),)),
-        ("/v1/account/position", (("account", ACCOUNT), ("market_id", "29"))),
+        ("/v1/account/position", (("account", ACCOUNT), ("market_id", str(MARKET_ID)))),
         ("/v1/positions", (("account", ACCOUNT),)),
     )
 
