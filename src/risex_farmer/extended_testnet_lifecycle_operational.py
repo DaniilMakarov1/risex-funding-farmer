@@ -1248,6 +1248,7 @@ def _list_data(
     value: Mapping[str, Any],
     code: str,
     *,
+    allow_nonempty_unpaginated: bool = False,
     allow_single_unpaginated: bool = False,
 ) -> tuple[list[Mapping[str, Any]], int | None]:
     if value.get("status") != OK or "data" not in value or not isinstance(value["data"], list):
@@ -1255,9 +1256,10 @@ def _list_data(
     rows = value["data"]
     if any(not isinstance(row, Mapping) for row in rows):
         _fail(code, "SCHEMA")
-    if allow_single_unpaginated and len(rows) == 1 and (
-        "pagination" not in value or value["pagination"] is None
-    ):
+    if (
+        (allow_nonempty_unpaginated and bool(rows))
+        or (allow_single_unpaginated and len(rows) == 1)
+    ) and ("pagination" not in value or value["pagination"] is None):
         return list(rows), None
     cursor = _validate_page_meta(value, len(rows), nonempty=bool(rows))
     return list(rows), cursor
@@ -1431,6 +1433,7 @@ class OperationalVenueIO:
         rows: list[Mapping[str, Any]] = []
         cursor: int | None = None
         seen_cursors: set[int] = set()
+        allow_nonempty_unpaginated = path == "/user/positions"
         allow_single_unpaginated = (
             path in {"/info/markets", "/user/fees", "/user/leverage"}
             and tuple(query) == (("market", TARGET_MARKET),)
@@ -1448,7 +1451,9 @@ class OperationalVenueIO:
             if value is None:
                 return ()
             page_rows, next_cursor = _list_data(
-                value, code, allow_single_unpaginated=allow_single_unpaginated
+                value, code,
+                allow_nonempty_unpaginated=allow_nonempty_unpaginated,
+                allow_single_unpaginated=allow_single_unpaginated,
             )
             rows.extend(page_rows)
             if len(rows) > MAX_REST_PAGE_ITEMS:

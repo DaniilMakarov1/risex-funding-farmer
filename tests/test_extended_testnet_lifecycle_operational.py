@@ -983,6 +983,60 @@ def test_exact_market_lookup_allows_one_row_without_pagination(pagination_member
     ) == ([{"name": TARGET_MARKET}], None)
 
 
+@pytest.mark.parametrize("pagination_member", ["absent", None], ids=["absent", "null"])
+def test_current_positions_allow_any_bounded_nonempty_rows_without_pagination(pagination_member):
+    rows = [{"id": 1}, {"id": 2}]
+    response_body = {"status": "OK", "data": rows}
+    if pagination_member != "absent":
+        response_body["pagination"] = pagination_member
+
+    class CurrentPositions:
+        def request(self, method, requested_path, *, query=(), body=None, allow_404=False):
+            assert method == "GET" and requested_path == "/user/positions"
+            assert tuple(query) == (("limit", 256),)
+            return response_body
+
+    capability = type("Capability", (), {"api_key": lambda self: "key", "identity": IDENTITY})()
+    io = OperationalVenueIO(
+        capability, transport=CurrentPositions(), clock=lambda: 1770000000000
+    )
+    assert io._list(
+        "/user/positions", code="POSITION_LIST_SCHEMA"
+    ) == tuple(rows)
+
+
+@pytest.mark.parametrize(
+    "response_body",
+    [
+        {"status": "OK", "data": [{"id": 1}], "pagination": {}},
+        {
+            "status": "OK", "data": [{"id": 1}],
+            "pagination": {"count": 1},
+        },
+        {
+            "status": "OK", "data": [{"id": 1}],
+            "pagination": {"cursor": 0, "count": 1},
+        },
+        {
+            "status": "OK", "data": [{"id": 1}],
+            "pagination": {"cursor": None, "count": 2},
+        },
+    ],
+)
+def test_current_positions_exception_does_not_relax_provided_pagination(response_body):
+    class MalformedCurrentPositions:
+        def request(self, method, requested_path, *, query=(), body=None, allow_404=False):
+            assert method == "GET" and requested_path == "/user/positions"
+            return response_body
+
+    capability = type("Capability", (), {"api_key": lambda self: "key", "identity": IDENTITY})()
+    io = OperationalVenueIO(
+        capability, transport=MalformedCurrentPositions(), clock=lambda: 1770000000000
+    )
+    with pytest.raises(OperationalSafetyError):
+        io._list("/user/positions", code="POSITION_LIST_SCHEMA")
+
+
 def test_single_unpaginated_exception_is_scoped_to_exact_lookup_routes():
     class SingleUnpaginated:
         def request(self, method, path, *, query=(), body=None, allow_404=False):
@@ -1100,7 +1154,7 @@ def test_single_unpaginated_lookup_requires_exact_fixed_market_query(path, query
     "path,query",
     [
         ("/user/orders", ()),
-        ("/user/positions", ()),
+        ("/user/positions/history", ()),
         ("/user/orders/history", ()),
         ("/user/trades", ()),
         ("/user/orders/external/123", ()),
@@ -1249,7 +1303,10 @@ def test_pagination_count_and_cursor_bounds_are_strict():
         _validate_page_meta({"pagination": {"cursor": None, "count": 257}}, 257, nonempty=True)
 
 
-def test_close_rejects_stale_or_wrong_position_before_signing(tmp_path):
+@pytest.mark.parametrize(
+    "position_rows", [(), ({}, {})], ids=["no-position", "multiple-positions"]
+)
+def test_close_requires_exactly_one_expected_position_before_signing(tmp_path, position_rows):
     io = FixtureIO()
     signer = FakeSigner()
     store = OperationalIntentStore(tmp_path / "close.sqlite3")
@@ -1265,7 +1322,7 @@ def test_close_rejects_stale_or_wrong_position_before_signing(tmp_path):
     store.mark_accepted(entry.id, "90001", entry.external_id)
     store.mark_reconciled(entry.id)
     bad = runner._last_observation
-    object.__setattr__(bad, "positions", ())
+    object.__setattr__(bad, "positions", position_rows)
     with pytest.raises(OperationalSafetyError, match="AUTHORITATIVE_POSITION_REQUIRED"):
         runner._prepare_close(entry, bad)
 
