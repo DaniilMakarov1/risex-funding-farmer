@@ -334,18 +334,19 @@ def test_x18_grid_minimum_notional_and_post_only_preflight(
 def test_smallest_executable_amount_rounds_up_to_minimum_notional_and_step() -> None:
     skr = Product(
         44, "SKR-PERP_USDT0", ACTIVE_PERP, True,
-        10**12, 50 * X18, 100 * X18, 5 * X18,
+        10**12, 50 * X18, 50 * X18, 100 * X18,
     )
     price = 7_765_000_000_000_000
     amount = smallest_executable_amount(
         skr, prices_x18=(price, 7_766_000_000_000_000)
     )
-    assert amount == 650 * X18
-    assert price * amount // X18 == 5_047_250_000_000_000_000
+    assert amount == 12_900 * X18
+    assert amount % skr.step_x18 == 0
+    assert price * amount // X18 == 100_168_500_000_000_000_000
 
 
 @pytest.mark.parametrize(
-    ("product_id", "minimum_amount_x18", "step_x18"),
+    ("product_id", "minimum_notional_x18", "step_x18"),
     (
         (38, 100 * X18, 500 * X18),
         (40, 100 * X18, 200 * X18),
@@ -355,38 +356,47 @@ def test_smallest_executable_amount_rounds_up_to_minimum_notional_and_step() -> 
 def test_complete_catalog_accepts_observed_unrelated_minimum_step_shapes(
     product: Product,
     product_id: int,
-    minimum_amount_x18: int,
+    minimum_notional_x18: int,
     step_x18: int,
 ) -> None:
     observed = replace(
         product,
         product_id=product_id,
         symbol=f"PRODUCT-{product_id}",
-        minimum_amount_x18=minimum_amount_x18,
         step_x18=step_x18,
+        minimum_amount_x18=step_x18,
+        minimum_notional_x18=minimum_notional_x18,
     )
     assert CatalogSnapshot(
         (observed,), True, 1_700_000_000_000, True, "engine"
     ).by_id() == {product_id: observed}
 
 
-def test_target_preflight_rejects_off_step_minimum_amount(
+def test_target_preflight_rounds_quote_minimum_to_step_at_entry_and_close_bounds(
     product: Product,
     flat_account: AccountSnapshot,
     zero_triggers: TriggerSnapshot,
 ) -> None:
-    target = replace(product, minimum_amount_x18=100 * X18, step_x18=500 * X18)
+    target = replace(
+        product,
+        step_x18=5 * 10**15,
+        minimum_amount_x18=5 * 10**15,
+        minimum_notional_x18=100 * X18,
+    )
     catalog = CatalogSnapshot((target,), True, 1_700_000_000_000, True, "engine")
-    with pytest.raises(NadoContractError, match="minimum amount is off"):
-        validate_entry_preflight(
-            catalog=catalog,
-            account=flat_account,
-            triggers=zero_triggers,
-            product_id=2,
-            entry_price_x18=35_000 * X18,
-            worst_close_price_x18=36_000 * X18,
-            now_ms=1_700_000_000_001,
-        )
+    plan = validate_entry_preflight(
+        catalog=catalog,
+        account=flat_account,
+        triggers=zero_triggers,
+        product_id=2,
+        entry_price_x18=35_000 * X18,
+        worst_close_price_x18=36_000 * X18,
+        now_ms=1_700_000_000_001,
+    )
+    assert plan.amount_x18 == 5 * 10**15
+    assert plan.amount_x18 % target.step_x18 == 0
+    assert plan.entry_notional_x18 >= target.minimum_notional_x18
+    assert plan.close_notional_x18 >= target.minimum_notional_x18
 
 
 def test_complete_dynamic_catalog_and_all_keys_are_mandatory(

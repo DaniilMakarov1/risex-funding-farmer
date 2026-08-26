@@ -858,12 +858,14 @@ class OperationalVenueIO:
                     raise OperationalSafetyError("catalog grid schema mismatch")
                 tick = self._integer(book.get("price_increment_x18"), "price tick", positive=True)
                 step = self._integer(book.get("size_increment"), "amount step", positive=True)
-                minimum = self._integer(book.get("min_size"), "minimum amount", positive=True)
+                minimum_notional = self._integer(
+                    book.get("min_size"), "minimum notional", positive=True
+                )
                 if product_id in result:
                     raise OperationalSafetyError("duplicate catalog product")
                 result[product_id] = Product(
                     product_id, symbol, kind, True, tick, step,
-                    minimum, 5 * 10**18,
+                    step, minimum_notional,
                 )
         if set(pairs) != catalog_ids - {0}:
             raise OperationalSafetyError("catalog V2 identity coverage mismatch")
