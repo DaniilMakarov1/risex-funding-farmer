@@ -855,7 +855,7 @@ class Lifecycle:
         if preflight.size != exact_size or preflight.buy_bound != exact_bound:
             self._reject()
         intent = self._prepare(
-            kind="OPEN", side="BUY", order_type="MARKET", time_in_force="FOK",
+            kind="OPEN", side="BUY", order_type="LIMIT", time_in_force="IOC",
             reduce_only=False, market=preflight.market, account=preflight.account,
             bbo=preflight.bbo,
             size=exact_size, price=exact_bound,

@@ -531,8 +531,8 @@ class _ProductionReadCapability:
         row = self._updates.pop(intent.client_order_id, None)
         if row is None:
             exact_no_identity_open = (
-                intent.kind == "OPEN" and intent.order_type == "MARKET"
-                and intent.time_in_force == "FOK"
+                intent.kind == "OPEN" and intent.order_type == "LIMIT"
+                and intent.time_in_force == "IOC"
                 and not intent.reduce_only and not intent.post_only
                 and intent.order_id is None and intent.dispatch_count == 1
                 and intent.state in {"DISPATCHING", "DISPATCHED", "AMBIGUOUS"}

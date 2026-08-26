@@ -44,7 +44,7 @@ def order_update(*, client=101, status="ORDER_STATUS_FILLED", filled="0.0001"):
             "id": ORDER_IDS[0], "wide_order_id": "113",
             "resting_order_id": "56", "client_order_id": str(client),
             "market_id": "1", "sender": ACCOUNT, "side": "BUY",
-            "type": "MARKET", "time_in_force": "FOK", "status": status,
+            "type": "LIMIT", "time_in_force": "IOC", "status": status,
             "size": "0.0001", "filled_size": filled, "post_only": False,
             "reduce_only": False, "is_liquidation": False,
         }],
@@ -77,7 +77,7 @@ def orders_snapshot():
 def opening_intent(*, lifecycle_state="OPEN_KNOWN"):
     return Intent(
         "intent", 1, "OPEN", 101, 7, 3, "a" * 64, "b" * 64,
-        lifecycle_state, "BUY", "MARKET", "FOK", False, False, 1,
+        lifecycle_state, "BUY", "LIMIT", "IOC", False, False, 1,
         Decimal("0.0001"), 100, Decimal("78217.0"), 782170,
         Decimal("0"), NOW + 60, 1, ORDER_IDS[0], False,
     )
@@ -340,7 +340,7 @@ def test_production_capability_emits_authoritative_state_and_exact_evidence():
 
     intent = Intent(
         "intent", 1, "OPEN", 101, 7, 3, "a" * 64, "b" * 64,
-        "DISPATCHED", "BUY", "MARKET", "FOK", False, False, 1,
+        "DISPATCHED", "BUY", "LIMIT", "IOC", False, False, 1,
         Decimal("0.0001"), 100, Decimal("78217.0"), 782170,
         Decimal("0"), NOW + 60, 1, ORDER_IDS[0], False,
     )
@@ -396,7 +396,7 @@ def test_production_stream_demuxes_interleaved_frames_without_resubscribe():
 
     intent = Intent(
         "intent", 1, "OPEN", 101, 7, 3, "a" * 64, "b" * 64,
-        "DISPATCHED", "BUY", "MARKET", "FOK", False, False, 1,
+        "DISPATCHED", "BUY", "LIMIT", "IOC", False, False, 1,
         Decimal("0.0001"), 100, Decimal("78217.0"), 782170,
         Decimal("0"), NOW + 60, 1, ORDER_IDS[0], False,
     )
@@ -626,7 +626,7 @@ def test_production_no_event_timeout_fallback_rejects_disconnect_or_missing_snap
     [
         {"kind": "CLOSE", "reduce_only": True},
         {"order_id": ORDER_IDS[0]},
-        {"order_type": "LIMIT", "time_in_force": "IOC"},
+        {"order_type": "MARKET", "time_in_force": "FOK"},
     ],
 )
 def test_production_no_event_fallback_rejects_non_observed_vectors(change):
@@ -772,7 +772,7 @@ def test_fill_then_close_is_durable_price_bounded_and_finishes_zero_flat(tmp_pat
     assert report.result is RunnerResult.SUCCESS_CLOSED_FLAT
     assert report.dispatch_count == 2 and report.close_attempts == 1
     assert [(item.kind, item.order_type, item.time_in_force, item.reduce_only) for item in intents] == [
-        ("OPEN", "MARKET", "FOK", False),
+        ("OPEN", "LIMIT", "IOC", False),
         ("CLOSE", "MARKET", "FOK", True),
     ]
     assert all(item.size * item.price <= Decimal("500") for item in intents)
