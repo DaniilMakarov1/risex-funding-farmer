@@ -1076,8 +1076,8 @@ class IntentStore:
         """Dispatch one already-durable intent exactly once.
 
         The operational binding deliberately prepares through ``LifecycleCore``
-        before obtaining a signature.  Any exception after this boundary is an
-        ambiguous write and permanently closes the automatic gate.
+        before obtaining a signature.  A complete venue rejection is terminal;
+        every ambiguous outcome permanently closes the automatic gate.
         """
         intent = self.get(digest)
         if self.state(digest) != "PREPARED" or self.lifecycle_status() != RUNNING:
