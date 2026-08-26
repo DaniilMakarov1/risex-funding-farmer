@@ -38,9 +38,10 @@ from .nado_private_read_preflight import (
 )
 from .nado_testnet_lifecycle import (
     ACTIVE_PERP, CANCEL_ALL, CLOSE, COMPLETE, ENTRY,
-    MAX_CLOSE_ATTEMPTS, POST_ONLY_APPENDIX, UINT32_MAX,
+    EXECUTE_RESPONSE_AMBIGUITY, EXECUTE_TRANSPORT_AMBIGUITY,
+    EXECUTE_VENUE_REJECTION, IOC_APPENDIX, MAX_CLOSE_ATTEMPTS, UINT32_MAX,
     AccountSnapshot, CatalogSnapshot, EngineEvidence, IntentStore,
-    LifecycleCore, OrderEvidence, OrderIntent, Product, Reconciliation,
+    ExecuteFailure, LifecycleCore, OrderEvidence, OrderIntent, Product, Reconciliation,
     SyntheticOrderVector, TriggerSnapshot, build_order_nonce,
     completion_barrier, order_digest, smallest_executable_amount,
     validate_entry_preflight,
@@ -268,9 +269,9 @@ def _entry_order(observation: LiveObservation, owner: str, sender: str, recv: in
     salt = _salt()
     amount = smallest_executable_amount(product, prices_x18=(bid, ask))
     return SyntheticOrderVector(
-        owner, SUBACCOUNT_NAME, sender, TARGET_PRODUCT_ID, bid,
+        owner, SUBACCOUNT_NAME, sender, TARGET_PRODUCT_ID, ask,
         amount, UINT32_MAX, recv, salt,
-        build_order_nonce(recv, salt), POST_ONLY_APPENDIX,
+        build_order_nonce(recv, salt), IOC_APPENDIX,
     )
 
 
@@ -301,9 +302,12 @@ class SealedLifecycleRunner:
         capability = self.capability_loader(self.owner)
         try:
             signature = capability.sign(intent)
-            returned = self.store.dispatch_prepared(
-                intent.digest, lambda durable: self.io.dispatch(durable, signature)
-            )
+            try:
+                returned = self.store.dispatch_prepared(
+                    intent.digest, lambda durable: self.io.dispatch(durable, signature)
+                )
+            except ExecuteFailure as error:
+                raise OperationalSafetyError(str(error)) from None
             self.writes += 1
             if returned.lower() != intent.digest.lower():
                 self.store.halt()
@@ -365,7 +369,7 @@ class SealedLifecycleRunner:
             catalog=initial.catalog, account=initial.evidence.account,
             triggers=initial.evidence.triggers, product_id=TARGET_PRODUCT_ID,
             entry_price_x18=order.price_x18,
-            worst_close_price_x18=initial.ask_x18, now_ms=issued_at,
+            worst_close_price_x18=initial.bid_x18, now_ms=issued_at,
         )
         capability = self.capability_loader(self.owner)
         try:
@@ -382,7 +386,7 @@ class SealedLifecycleRunner:
         entry = self.core.prepare_entry(
             order=order, catalog=initial.catalog, account=initial.evidence.account,
             triggers=initial.evidence.triggers,
-            worst_close_price_x18=initial.ask_x18, signature=signature,
+            worst_close_price_x18=initial.bid_x18, signature=signature,
             validation_product_id=order.product_id, validation_valid=valid,
             now_ms=issued_at,
         )
@@ -630,23 +634,38 @@ class OperationalVenueIO:
                 raise ValueError
         except BaseException:
             raise OperationalSafetyError("write request binding rejected") from None
-        response = self._post(_GATEWAY_HOST, "/v1/execute", payload)
         expected = (
             "execute_cancel_product_orders" if intent.kind == CANCEL_ALL
             else "execute_place_order"
         )
+        try:
+            response = self._post(_GATEWAY_HOST, "/v1/execute", payload)
+        except BaseException:
+            raise ExecuteFailure(EXECUTE_TRANSPORT_AMBIGUITY) from None
+        if (
+            type(response) is dict
+            and response.get("status") == "failure"
+            and response.get("request_type") == expected
+            and type(response.get("error_code")) is int
+            and response["error_code"] >= 0
+            and type(response.get("error")) is str
+            and bool(response["error"])
+        ):
+            raise ExecuteFailure(
+                EXECUTE_VENUE_REJECTION, response["error_code"]
+            )
         if (
             type(response) is not dict or response.get("status") != "success"
             or response.get("request_type") != expected or type(response.get("data")) is not dict
         ):
-            raise OperationalSafetyError("write outcome requires reconciliation")
+            raise ExecuteFailure(EXECUTE_RESPONSE_AMBIGUITY)
         if intent.kind == CANCEL_ALL:
             cancelled = response["data"].get("cancelled_orders")
             if (
                 type(cancelled) is not list or len(cancelled) != 1
                 or len(self._resting_orders) != 1 or type(cancelled[0]) is not dict
             ):
-                raise OperationalSafetyError("exact cancellation response mismatch")
+                raise ExecuteFailure(EXECUTE_RESPONSE_AMBIGUITY)
             expected_entry = next(iter(self._resting_orders.values()))
             cancelled_order = cancelled[0]
             cancelled_digest = cancelled_order.get("digest")
@@ -659,7 +678,7 @@ class OperationalVenueIO:
                     "cancelled order remaining amount",
                 )
             except OperationalSafetyError:
-                raise OperationalSafetyError("exact cancellation response mismatch") from None
+                raise ExecuteFailure(EXECUTE_RESPONSE_AMBIGUITY) from None
             if (
                 type(cancelled_digest) is not str
                 or cancelled_digest.lower() != expected_entry.digest.lower()
@@ -669,14 +688,14 @@ class OperationalVenueIO:
                 or cancelled_nonce != expected_entry.nonce
                 or cancelled_remaining != expected_entry.amount_x18
             ):
-                raise OperationalSafetyError("exact cancellation response mismatch")
+                raise ExecuteFailure(EXECUTE_RESPONSE_AMBIGUITY)
             self._cancelled_entry = cancelled_digest.lower()
             self._terminal[intent.digest.lower()] = "CANCELLED"
             self._terminal[cancelled_digest.lower()] = "CANCELLED"
         else:
             returned = response["data"].get("digest")
             if type(returned) is not str or returned.lower() != intent.digest.lower():
-                raise OperationalSafetyError("write response identity mismatch")
+                raise ExecuteFailure(EXECUTE_RESPONSE_AMBIGUITY)
             if intent.kind == CLOSE:
                 self._terminal[intent.digest.lower()] = "CANCELLED"
         return intent.digest

@@ -40,11 +40,40 @@ RUNNING = "RUNNING"
 # Pinned SDK appendix packing: version=1, order type in bits 9..10,
 # reduce-only in bit 11.
 POST_ONLY_APPENDIX = 1 | (3 << 9)
+IOC_APPENDIX = 1 | (1 << 9)
 IOC_REDUCE_ONLY_APPENDIX = 1 | (1 << 9) | (1 << 11)
+
+EXECUTE_VENUE_REJECTION = "VENUE_REJECTION"
+EXECUTE_TRANSPORT_AMBIGUITY = "TRANSPORT_AMBIGUITY"
+EXECUTE_RESPONSE_AMBIGUITY = "RESPONSE_AMBIGUITY"
+EXECUTE_FAILURE_CLASSES = {
+    EXECUTE_VENUE_REJECTION,
+    EXECUTE_TRANSPORT_AMBIGUITY,
+    EXECUTE_RESPONSE_AMBIGUITY,
+}
 
 
 class NadoContractError(ValueError):
     """A fail-closed contract or evidence violation."""
+
+
+class ExecuteFailure(RuntimeError):
+    """Sanitized execute outcome safe to retain beside a durable intent."""
+
+    def __init__(self, failure_class: str, venue_code: int | None = None) -> None:
+        if failure_class not in EXECUTE_FAILURE_CLASSES:
+            raise NadoContractError("execute failure class rejected")
+        if venue_code is not None and (
+            type(venue_code) is not int or venue_code < 0
+        ):
+            raise NadoContractError("execute venue code rejected")
+        if failure_class == EXECUTE_VENUE_REJECTION and venue_code is None:
+            raise NadoContractError("terminal venue rejection requires a code")
+        if failure_class != EXECUTE_VENUE_REJECTION and venue_code is not None:
+            raise NadoContractError("ambiguous execute failure cannot retain a venue code")
+        self.failure_class = failure_class
+        self.venue_code = venue_code
+        super().__init__(f"execute failure: {failure_class}")
 
 
 class FixedEnvironment:
@@ -733,6 +762,15 @@ class IntentStore:
             )
             """
         )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS nado_execute_failures (
+                digest TEXT PRIMARY KEY,
+                failure_class TEXT NOT NULL,
+                venue_code INTEGER
+            )
+            """
+        )
         self._connection.commit()
 
     def prepare(self, intent: OrderIntent) -> None:
@@ -939,6 +977,51 @@ class IntentStore:
         if self.get(digest).kind == ENTRY:
             self.halt()
 
+    def _record_execute_failure(
+        self, digest: str, failure: ExecuteFailure
+    ) -> None:
+        state = (
+            "REJECTED"
+            if failure.failure_class == EXECUTE_VENUE_REJECTION
+            else "AMBIGUOUS"
+        )
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO nado_execute_failures
+                    (digest, failure_class, venue_code)
+                VALUES (?, ?, ?)
+                """,
+                (digest.lower(), failure.failure_class, failure.venue_code),
+            )
+            changed = self._connection.execute(
+                """
+                UPDATE nado_intents SET state = ?
+                WHERE digest = ? AND state = 'PREPARED'
+                """,
+                (state, digest.lower()),
+            )
+            if changed.rowcount != 1:
+                raise NadoContractError("execute failure intent state rejected")
+            self._connection.execute(
+                """
+                UPDATE nado_lifecycle_state SET status = 'HALTED'
+                WHERE singleton = 1 AND status != 'COMPLETE'
+                """
+            )
+
+    def execute_failure(self, digest: str) -> tuple[str, int | None] | None:
+        row = self._connection.execute(
+            """
+            SELECT failure_class, venue_code FROM nado_execute_failures
+            WHERE digest = ?
+            """,
+            (digest.lower(),),
+        ).fetchone()
+        if row is None:
+            return None
+        return str(row[0]), None if row[1] is None else int(row[1])
+
     def lifecycle_status(self) -> str:
         row = self._connection.execute(
             "SELECT status FROM nado_lifecycle_state WHERE singleton = 1"
@@ -993,16 +1076,21 @@ class IntentStore:
         """Dispatch one already-durable intent exactly once.
 
         The operational binding deliberately prepares through ``LifecycleCore``
-        before obtaining a signature.  Any exception after this boundary is an
-        ambiguous write and permanently closes the automatic gate.
+        before obtaining a signature.  A complete venue rejection is terminal;
+        every ambiguous outcome permanently closes the automatic gate.
         """
         intent = self.get(digest)
         if self.state(digest) != "PREPARED" or self.lifecycle_status() != RUNNING:
             raise NadoContractError("only one prepared intent may be dispatched")
         try:
             result = dispatch(intent)
+        except ExecuteFailure as error:
+            self._record_execute_failure(digest, error)
+            raise
         except BaseException:
-            self._mark_ambiguous(digest)
+            self._record_execute_failure(
+                digest, ExecuteFailure(EXECUTE_TRANSPORT_AMBIGUITY)
+            )
             raise
         self._mark(digest, "DISPATCHED")
         return result
@@ -1478,8 +1566,8 @@ class LifecycleCore:
         validation_valid: bool,
         now_ms: int,
     ) -> OrderIntent:
-        if order.appendix != POST_ONLY_APPENDIX:
-            raise NadoContractError("entry must be post-only")
+        if order.appendix not in {POST_ONLY_APPENDIX, IOC_APPENDIX}:
+            raise NadoContractError("entry must use an accepted bounded order type")
         expected_sender = encode_subaccount(account.owner, account.subaccount_name)
         if (
             order.sender.lower() != expected_sender.lower()
