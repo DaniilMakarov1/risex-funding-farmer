@@ -50,6 +50,11 @@ SDK_PROVENANCE = {
     "repository": "https://github.com/x10xchange/python_sdk",
     "commit": "2130cdb1cd6e7b1867db83bd3af036572d258739",
 }
+# Stark private scalars are accepted by the pinned SDK's crypto dependency in
+# the half-open range [1, EC_ORDER).  Keep the bound local so malformed values
+# never reach the native key-derivation routine, which can panic on them.
+STARK_EC_ORDER = 0x800000000000010FFFFFFFFFFFFFFFFB781126DCAE7B2321E66A241ADC64D2F
+_MAX_STARK_PRIVATE_KEY_HEX_DIGITS = (STARK_EC_ORDER.bit_length() + 3) // 4
 
 MAX_REST_PAGE_ITEMS = 256
 MAX_REST_PAGES = 16
@@ -262,6 +267,48 @@ class ExtendedIdentity:
         )
 
 
+def _validate_stark_private_key(value: str, identity: ExtendedIdentity) -> None:
+    """Validate the pinned SDK key form and bind it to the configured L2 key."""
+    if (
+        type(value) is not str
+        or not value.startswith("0x")
+        or not value[2:]
+        or len(value[2:]) > _MAX_STARK_PRIVATE_KEY_HEX_DIGITS
+        or any(char not in "0123456789abcdefABCDEF" for char in value[2:])
+    ):
+        _fail("PRIVATE_KEY_INVALID", "AUTH")
+    try:
+        scalar = int(value[2:], 16)
+    except ValueError:
+        _fail("PRIVATE_KEY_INVALID", "AUTH")
+    if not 0 < scalar < STARK_EC_ORDER:
+        _fail("PRIVATE_KEY_INVALID", "AUTH")
+
+    if (
+        type(identity.l2_key) is not str
+        or not identity.l2_key.startswith("0x")
+        or not identity.l2_key[2:]
+        or any(char not in "0123456789abcdefABCDEF" for char in identity.l2_key[2:])
+    ):
+        _fail("ACCOUNT_IDENTITY_MISMATCH", "IDENTITY")
+    try:
+        configured_public_key = int(identity.l2_key[2:], 16)
+    except ValueError:
+        _fail("ACCOUNT_IDENTITY_MISMATCH", "IDENTITY")
+    try:
+        # x10 2.5.0 pins fast-stark-crypto 0.5.0, whose SDK public-key
+        # derivation is the authoritative binding for StarkPerpetualAccount.
+        from fast_stark_crypto import get_public_key
+        derived_public_key = get_public_key(scalar)
+    except (ImportError, ModuleNotFoundError):
+        _fail("OFFICIAL_SDK_UNAVAILABLE", "AUTH")
+    except BaseException:
+        # Native crypto failures must not expose exception text or key data.
+        _fail("STARK_PUBLIC_KEY_DERIVATION_FAILED", "AUTH")
+    if type(derived_public_key) is not int or derived_public_key != configured_public_key:
+        _fail("ACCOUNT_IDENTITY_MISMATCH", "IDENTITY")
+
+
 class ExtendedCredentialCapability:
     """Short-lived protected credential handle used only by the sealed runner."""
 
@@ -298,12 +345,7 @@ class ExtendedCredentialCapability:
             value = bytes(self._private_key).decode("ascii")
         except UnicodeDecodeError:
             _fail("PRIVATE_KEY_INVALID", "AUTH")
-        if len(value) != 66 or not value.startswith("0x"):
-            _fail("PRIVATE_KEY_INVALID", "AUTH")
-        try:
-            int(value, 16)
-        except ValueError:
-            _fail("PRIVATE_KEY_INVALID", "AUTH")
+        _validate_stark_private_key(value, self.identity)
         return value
 
     def sign_order(
@@ -444,12 +486,7 @@ class _PasswdHomeCredentialSource:
                 private_text = bytes(private_key).decode("ascii")
             except UnicodeDecodeError:
                 _fail("PRIVATE_KEY_INVALID", "AUTH")
-            if len(private_text) != 66 or not private_text.startswith("0x"):
-                _fail("PRIVATE_KEY_INVALID", "AUTH")
-            try:
-                int(private_text, 16)
-            except ValueError:
-                _fail("PRIVATE_KEY_INVALID", "AUTH")
+            _validate_stark_private_key(private_text, identity)
             return ExtendedCredentialCapability(api_key, private_key, identity)
         except BaseException:
             _zeroize(api_key)

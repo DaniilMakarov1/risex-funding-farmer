@@ -13,6 +13,7 @@ from risex_farmer.extended_testnet_lifecycle_operational import (
     ACTIVE,
     CANCELLED,
     MAX_FRESHNESS_MS,
+    STARK_EC_ORDER,
     STARK_PRIVATE_KEY_BASENAME,
     ExtendedCredentialCapability,
     ExtendedIdentity,
@@ -423,6 +424,7 @@ def test_signer_observes_claimed_after_durable_preparation(tmp_path, no_sleep):
 
 def test_pinned_official_sdk_signing_is_offline_and_exact():
     pytest.importorskip("x10")
+    fast_stark_crypto = pytest.importorskip("fast_stark_crypto")
     intent = type("Intent", (), {
         "external_id": "123456789012345678901234567891", "nonce": 7,
         "market": TARGET_MARKET, "side": "BUY", "qty": Decimal("0.001"),
@@ -430,14 +432,93 @@ def test_pinned_official_sdk_signing_is_offline_and_exact():
         "expiry_ms": 1770000015000, "reduce_only": False,
     })()
     fixture = _base_fixture()
+    private_text = "0x7" + "A" * 62
+    identity = ExtendedIdentity(
+        7001, 3, hex(fast_stark_crypto.get_public_key(int(private_text[2:], 16))), 7001003,
+    )
     capability = ExtendedCredentialCapability(
-        bytearray(b"fixture-api-key"), bytearray(b"0x" + b"1" * 64), IDENTITY,
+        bytearray(b"fixture-api-key"), bytearray(private_text, "ascii"), identity,
     )
     try:
         signed = capability.sign_order(intent, fixture["market"])
-        _validate_signed_payload(intent, signed.payload, IDENTITY)
+        _validate_signed_payload(intent, signed.payload, identity)
         assert signed.external_id == intent.external_id
         assert signed.settlement_hash
+    finally:
+        capability.close()
+
+
+def test_valid_63_digit_stark_scalar_is_sdk_derived_and_zeroized_after_close():
+    fast_stark_crypto = pytest.importorskip("fast_stark_crypto")
+    private_text = "0x7" + "a" * 62
+    private_key = bytearray(private_text, "ascii")
+    api_key = bytearray(b"fixture-api-key")
+    identity = ExtendedIdentity(
+        7001, 3, hex(fast_stark_crypto.get_public_key(int(private_text[2:], 16))), 7001003,
+    )
+    capability = ExtendedCredentialCapability(api_key, private_key, identity)
+    try:
+        assert len(private_text) == 65
+        assert capability._private_key_text() == private_text
+    finally:
+        capability.close()
+    assert api_key == bytearray()
+    assert private_key == bytearray()
+
+
+@pytest.mark.parametrize(
+    "private_text",
+    [
+        "0x0",
+        hex(STARK_EC_ORDER),
+        "0x" + "0" * 63,
+    ],
+)
+def test_stark_scalar_rejects_zero_and_order_boundaries(private_text):
+    capability = ExtendedCredentialCapability(
+        bytearray(b"fixture-api-key"), bytearray(private_text, "ascii"), IDENTITY,
+    )
+    try:
+        with pytest.raises(OperationalSafetyError, match="PRIVATE_KEY_INVALID") as caught:
+            capability._private_key_text()
+        assert "0x" not in str(caught.value)
+    finally:
+        capability.close()
+
+
+@pytest.mark.parametrize(
+    "private_text",
+    [
+        "0X" + "7" * 63,
+        "0x" + "7" * 62 + "g",
+        "0x" + "7" * 62 + " ",
+        "0x0" + "7" * 63,
+    ],
+)
+def test_stark_scalar_rejects_unsafe_sdk_representations(private_text):
+    capability = ExtendedCredentialCapability(
+        bytearray(b"fixture-api-key"), bytearray(private_text, "ascii"), IDENTITY,
+    )
+    try:
+        with pytest.raises(OperationalSafetyError, match="PRIVATE_KEY_INVALID"):
+            capability._private_key_text()
+    finally:
+        capability.close()
+
+
+def test_stark_scalar_rejects_identity_mismatch_before_signing():
+    fast_stark_crypto = pytest.importorskip("fast_stark_crypto")
+    private_text = "0x7" + "a" * 62
+    derived = fast_stark_crypto.get_public_key(int(private_text[2:], 16))
+    identity = ExtendedIdentity(7001, 3, hex(derived ^ 1), 7001003)
+    capability = ExtendedCredentialCapability(
+        bytearray(b"fixture-api-key"), bytearray(private_text, "ascii"), identity,
+    )
+    try:
+        with pytest.raises(OperationalSafetyError, match="ACCOUNT_IDENTITY_MISMATCH") as caught:
+            capability._private_key_text()
+        assert caught.value.failure_class == "IDENTITY"
+        assert private_text not in str(caught.value)
     finally:
         capability.close()
 
