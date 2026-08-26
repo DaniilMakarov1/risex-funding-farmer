@@ -12,6 +12,7 @@ import pytest
 from risex_farmer.extended_testnet_lifecycle_operational import (
     ACTIVE,
     CANCELLED,
+    MAX_FRESHNESS_MS,
     STARK_PRIVATE_KEY_BASENAME,
     ExtendedCredentialCapability,
     ExtendedIdentity,
@@ -261,6 +262,96 @@ def test_fixture_open_ioc_uses_one_known_id_cancel_and_finishes_flat(tmp_path, n
     store = OperationalIntentStore(tmp_path / "cancel.sqlite3")
     assert [item.kind for item in store.all()] == ["ENTRY", "CANCEL"]
     assert store.lifecycle_state() == "COMPLETE"
+
+
+def test_rest_observation_rejects_book_stale_by_completion_without_server_clock():
+    wire = _base_fixture()
+
+    def wrapped(data, *, paginated=False):
+        value = {"status": "OK", "data": data}
+        if paginated:
+            value["pagination"] = {"cursor": None, "count": len(data)}
+        return value
+
+    class Transport:
+        def request(self, method, path, *, query=(), body=None, allow_404=False):
+            if path == "/user/account/info":
+                return wrapped(_account(wire))
+            if path == "/user/balance":
+                return wrapped(copy.deepcopy(wire["account"]["balance"]))
+            if path == "/info/markets":
+                return wrapped([copy.deepcopy(wire["market"])], paginated=True)
+            if path.endswith("/orderbook"):
+                return wrapped(copy.deepcopy(wire["book"]))
+            if path == "/user/fees":
+                return wrapped(copy.deepcopy(wire["account"]["fees"]), paginated=True)
+            if path == "/user/leverage":
+                return wrapped(copy.deepcopy(wire["account"]["leverage"]), paginated=True)
+            if path in {"/user/orders", "/user/positions", "/user/orders/history", "/user/trades"}:
+                return wrapped([])
+            raise AssertionError(path)
+
+    clock_values = iter((1_770_000_000_000, 1_770_000_000_000 + MAX_FRESHNESS_MS + 1))
+    capability = type("Capability", (), {"identity": IDENTITY})()
+    io = OperationalVenueIO(
+        capability, transport=Transport(), clock=lambda: next(clock_values),
+    )
+    with pytest.raises(OperationalSafetyError, match="FRESH_REST_OBSERVATION_REQUIRED"):
+        io.observe(())
+
+
+def test_entry_rejects_deeper_depth_when_top_ask_cannot_fill_exact_qty(tmp_path, no_sleep):
+    io = FixtureIO()
+    store = OperationalIntentStore(tmp_path / "entry-depth.sqlite3")
+    runner = SealedLifecycleRunner(
+        store=store, journal=RuntimeRunJournal(tmp_path / "entry-depth.sqlite3"),
+        io=io, capability=FakeSigner(), identity=IDENTITY,
+    )
+    observation = io.observe(())
+    market = copy.deepcopy(observation.market)
+    market["tradingConfig"]["minOrderSize"] = "0.002"
+    book = copy.deepcopy(observation.book)
+    book["asks"] = [
+        {"price": "40010", "qty": "0.001"},
+        {"price": "40011", "qty": "0.010"},
+    ]
+    bad = copy.copy(observation)
+    object.__setattr__(bad, "market", market)
+    object.__setattr__(bad, "book", book)
+    with pytest.raises(OperationalSafetyError, match="TOP_LEVEL_DEPTH_INSUFFICIENT"):
+        runner._prepare_entry(bad)
+    assert store.all() == ()
+
+
+def test_close_rejects_deeper_depth_when_top_bid_cannot_fill_exact_position(tmp_path, no_sleep):
+    io = FixtureIO()
+    io.wire["market"]["tradingConfig"]["minOrderSize"] = "0.002"
+    path = tmp_path / "close-depth.sqlite3"
+    store = OperationalIntentStore(path)
+    runner = SealedLifecycleRunner(
+        store=store, journal=RuntimeRunJournal(path),
+        io=io, capability=FakeSigner(), identity=IDENTITY,
+    )
+    initial = io.observe(())
+    runner._last_observation = initial
+    entry = runner._prepare_entry(initial)
+    store.claim(entry.id, expected_lifecycle="ENTRY_PREPARED", next_lifecycle="ENTRY_AMBIGUOUS")
+    signed = runner.capability.sign_order(store.get(entry.id), initial.market)
+    store.bind_signed(entry.id, payload=signed.payload, payload_digest=canonical_digest(signed.payload))
+    store.mark_accepted(entry.id, "90001", entry.external_id)
+    store.mark_reconciled(entry.id)
+    io.phase = "ENTRY_FILLED"
+    filled = io.observe((store.get(entry.id),))
+    book = copy.deepcopy(filled.book)
+    book["bids"] = [
+        {"price": "40000", "qty": "0.001"},
+        {"price": "39999", "qty": "0.010"},
+    ]
+    bad = copy.copy(filled)
+    object.__setattr__(bad, "book", book)
+    with pytest.raises(OperationalSafetyError, match="TOP_LEVEL_DEPTH_INSUFFICIENT"):
+        runner._prepare_close(entry, bad)
+    assert [item.kind for item in store.all()] == ["ENTRY"]
 
 
 def test_ambiguous_place_is_durable_and_never_replayed(tmp_path, no_sleep):

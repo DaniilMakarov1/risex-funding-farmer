@@ -969,7 +969,7 @@ class RuntimeRunJournal:
 @dataclass(frozen=True)
 class RestObservation:
     observed_at_ms: int
-    server_time_ms: int
+    server_time_ms: int | None
     account: Mapping[str, Any]
     market: Mapping[str, Any]
     book: Mapping[str, Any]
@@ -984,6 +984,7 @@ class RestObservation:
     exact_by_external: Mapping[str, tuple[Mapping[str, Any], ...]] = field(default_factory=dict)
     stream_frames: int = 0
     fingerprint: str | None = None
+    book_observed_at_ms: int | None = None
 
     @property
     def semantic_fingerprint(self) -> str:
@@ -1189,13 +1190,28 @@ def _list_data(value: Mapping[str, Any], code: str) -> tuple[list[Mapping[str, A
 
 
 def _validate_fresh(observation: RestObservation, now_ms: int) -> None:
+    server_fresh = (
+        observation.server_time_ms is None
+        or (
+            type(observation.server_time_ms) is int
+            and observation.server_time_ms > 0
+            and 0 <= now_ms - observation.server_time_ms <= MAX_FRESHNESS_MS
+        )
+    )
+    book_fresh = (
+        observation.book_observed_at_ms is None
+        or (
+            type(observation.book_observed_at_ms) is int
+            and observation.book_observed_at_ms > 0
+            and 0 <= now_ms - observation.book_observed_at_ms <= MAX_FRESHNESS_MS
+        )
+    )
     if (
         type(observation.observed_at_ms) is not int
-        or type(observation.server_time_ms) is not int
         or observation.observed_at_ms <= 0
-        or observation.server_time_ms <= 0
         or not 0 <= now_ms - observation.observed_at_ms <= MAX_FRESHNESS_MS
-        or not 0 <= now_ms - observation.server_time_ms <= MAX_FRESHNESS_MS
+        or not server_fresh
+        or not book_fresh
         or observation.stream_frames != 0
     ):
         _fail("FRESH_REST_OBSERVATION_REQUIRED")
@@ -1369,6 +1385,7 @@ class OperationalVenueIO:
         )
         if raw_book is None:
             _fail("BOOK_SCHEMA", "SCHEMA")
+        book_observed_at = self.now_ms()
         book = self._book(raw_book, market)
         fees = self._list(
             "/user/fees", query=(("market", TARGET_MARKET),), code="FEE_LIST_SCHEMA"
@@ -1400,7 +1417,9 @@ class OperationalVenueIO:
         observed_at = self.now_ms()
         observation = RestObservation(
             observed_at_ms=observed_at,
-            server_time_ms=observed_at,
+            # This direct REST binding has no authoritative server-clock field;
+            # keep the server timestamp absent instead of relabeling local time.
+            server_time_ms=None,
             account=dict(account), market=dict(market), book=book,
             balance=dict(balance), fees=tuple(dict(row) for row in fees),
             leverage=tuple(dict(row) for row in leverage),
@@ -1410,6 +1429,7 @@ class OperationalVenueIO:
             trades=tuple(dict(row) for row in trades),
             exact_by_id=exact_by_id, exact_by_external=exact_by_external,
             stream_frames=0,
+            book_observed_at_ms=book_observed_at,
         )
         _validate_fresh(observation, observed_at)
         return observation
@@ -1757,7 +1777,17 @@ class SealedLifecycleRunner:
             _fail("BOOK_CROSSED")
         return bid, ask
 
+    @staticmethod
+    def _top_level_qty(levels: Any) -> Decimal:
+        try:
+            level = levels[0]
+            value = level["qty"]
+        except (KeyError, IndexError, TypeError):
+            _fail("BOOK_SCHEMA", "SCHEMA")
+        return _decimal(value, "BOOK_QTY_SCHEMA")
+
     def _prepare_entry(self, observation: RestObservation) -> OrderIntent:
+        _validate_fresh(observation, self.io.now_ms())
         config = observation.market["tradingConfig"]
         qty = _decimal(config["minOrderSize"], "MINIMUM_SIZE_SCHEMA")
         fee_rows = tuple(row for row in observation.fees if row.get("market") == TARGET_MARKET)
@@ -1766,10 +1796,11 @@ class SealedLifecycleRunner:
         fee = _decimal(fee_rows[0].get("takerFeeRate"), "TAKER_FEE_SCHEMA")
         bid, ask = self._book_prices(observation)
         price = ask
-        ask_depth = sum((_decimal(level["qty"], "BOOK_QTY_SCHEMA") for level in observation.book["asks"]), Decimal(0))
-        bid_depth = sum((_decimal(level["qty"], "BOOK_QTY_SCHEMA") for level in observation.book["bids"]), Decimal(0))
-        if ask_depth < qty or bid_depth < qty:
-            _fail("BOOK_DEPTH_INSUFFICIENT")
+        if (
+            self._top_level_qty(observation.book["asks"]) < qty
+            or self._top_level_qty(observation.book["bids"]) < qty
+        ):
+            _fail("TOP_LEVEL_DEPTH_INSUFFICIENT")
         cap = _decimal(config.get("limitPriceCap"), "PRICE_CAP_SCHEMA")
         floor = _decimal(config.get("limitPriceFloor"), "PRICE_FLOOR_SCHEMA")
         if price < floor or price > cap:
@@ -2001,14 +2032,9 @@ class SealedLifecycleRunner:
         bid, ask = self._book_prices(observation)
         price = bid if position["side"] == "LONG" else ask
         config = observation.market["tradingConfig"]
-        close_depth = sum(
-            (_decimal(level["qty"], "BOOK_QTY_SCHEMA") for level in (
-                observation.book["bids"] if position["side"] == "LONG" else observation.book["asks"]
-            )),
-            Decimal(0),
-        )
-        if close_depth < size:
-            _fail("BOOK_DEPTH_INSUFFICIENT")
+        close_levels = observation.book["bids"] if position["side"] == "LONG" else observation.book["asks"]
+        if self._top_level_qty(close_levels) < size:
+            _fail("TOP_LEVEL_DEPTH_INSUFFICIENT")
         cap = _decimal(config.get("limitPriceCap"), "PRICE_CAP_SCHEMA")
         floor = _decimal(config.get("limitPriceFloor"), "PRICE_FLOOR_SCHEMA")
         if price < floor or price > cap:
