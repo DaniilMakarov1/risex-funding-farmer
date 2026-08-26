@@ -225,6 +225,7 @@ def test_place_is_signed_only_after_durable_intent_and_dispatch_claim(tmp_path):
     assert persisted.state == "DISPATCHED" and persisted.order_id == OPEN_ORDER
     path, body = transport.calls[0]
     assert path == PLACE_PATH
+    assert body["price_ticks"] == intent.price_ticks == 782170
     assert set(body) == {
         "market_id", "size_steps", "price_ticks", "side", "post_only",
         "reduce_only", "stp_mode", "order_type", "time_in_force",
