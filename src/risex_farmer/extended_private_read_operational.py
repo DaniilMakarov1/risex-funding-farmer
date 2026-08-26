@@ -751,11 +751,16 @@ class _DirectTransport:
             }
 
     async def open_stream(self, request: Any) -> _DirectStream:
-        socket = await self._session.ws_connect(
-            request.url, headers=dict(request.headers), proxy=None,
-            timeout=_TIMEOUT_SECONDS, autoclose=False, autoping=False,
-            max_msg_size=_MAX_JSON_BYTES,
-        )
+        try:
+            socket = await self._session.ws_connect(
+                request.url, headers=dict(request.headers), proxy=None,
+                timeout=_TIMEOUT_SECONDS, autoclose=False, autoping=False,
+                max_msg_size=_MAX_JSON_BYTES,
+            )
+        except aiohttp.ClientResponseError as exc:
+            raise PreflightViolation("HTTP") from exc
+        except (aiohttp.ClientConnectionError, TimeoutError, OSError) as exc:
+            raise PreflightViolation("TRANSPORT") from exc
         if str(socket._response.url) != request.url:
             await socket.close()
             raise PreflightViolation("STREAM_REDIRECT_FORBIDDEN")
