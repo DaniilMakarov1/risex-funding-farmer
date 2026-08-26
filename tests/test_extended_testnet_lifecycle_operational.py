@@ -836,11 +836,54 @@ def test_exact_market_exception_rejects_multiple_or_contradictory_pagination(bod
         _list_data(body, "MARKET_LIST_SCHEMA", allow_single_unpaginated=True)
 
 
-def test_empty_lists_allow_absent_or_null_pagination_only():
+def test_empty_lists_allow_absent_null_or_zero_count_pagination():
     assert _list_data({"status": "OK", "data": []}, "LIST_SCHEMA") == ([], None)
     assert _list_data({"status": "OK", "data": [], "pagination": None}, "LIST_SCHEMA") == ([], None)
+    assert _list_data(
+        {"status": "OK", "data": [], "pagination": {"cursor": None, "count": 0}},
+        "LIST_SCHEMA",
+    ) == ([], None)
+    assert _list_data(
+        {"status": "OK", "data": [], "pagination": {"count": 0}},
+        "LIST_SCHEMA",
+    ) == ([], None)
     with pytest.raises(OperationalSafetyError, match="PAGINATION_EMPTY_CONTRADICTION"):
         _list_data({"status": "OK", "data": [], "pagination": {"cursor": 1, "count": 0}}, "LIST_SCHEMA")
+
+
+@pytest.mark.parametrize("path", ["/user/orders/history", "/user/trades"])
+def test_empty_reconciliation_lists_accept_observed_count_only_pagination(path):
+    class CountOnlyEmpty:
+        def request(self, method, requested_path, *, query=(), body=None, allow_404=False):
+            assert method == "GET" and requested_path == path
+            assert tuple(query) == (("limit", 256),)
+            return {"status": "OK", "data": [], "pagination": {"count": 0}}
+
+    capability = type("Capability", (), {"api_key": lambda self: "key", "identity": IDENTITY})()
+    io = OperationalVenueIO(
+        capability, transport=CountOnlyEmpty(), clock=lambda: 1770000000000
+    )
+    assert io._list(path, code="LIST_SCHEMA") == ()
+
+
+@pytest.mark.parametrize(
+    "pagination",
+    [
+        {"cursor": 1, "count": 0},
+        {"cursor": "next", "count": 0},
+        {"count": 1},
+        {"count": False},
+        {"cursor": None},
+        {},
+        [],
+    ],
+)
+def test_empty_pagination_rejects_contradictory_or_invalid_forms(pagination):
+    with pytest.raises(OperationalSafetyError):
+        _list_data(
+            {"status": "OK", "data": [], "pagination": pagination},
+            "LIST_SCHEMA",
+        )
 
 
 def test_pagination_count_and_cursor_bounds_are_strict():

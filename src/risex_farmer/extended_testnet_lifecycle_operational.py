@@ -1218,9 +1218,11 @@ def _validate_page_meta(value: Mapping[str, Any], length: int, *, nonempty: bool
         if "pagination" not in value or value["pagination"] is None:
             return None
         pagination = value["pagination"]
-        if not isinstance(pagination, Mapping) or not {"cursor", "count"} <= set(pagination):
+        if not isinstance(pagination, Mapping) or "count" not in pagination:
             _fail("PAGINATION_SCHEMA", "SCHEMA")
-        if pagination.get("cursor") is not None or pagination.get("count") != 0:
+        if type(pagination["count"]) is not int:
+            _fail("PAGINATION_COUNT_INVALID", "SCHEMA")
+        if pagination.get("cursor") is not None or pagination["count"] != 0:
             _fail("PAGINATION_EMPTY_CONTRADICTION", "SAFETY")
         return None
     pagination = value.get("pagination")
