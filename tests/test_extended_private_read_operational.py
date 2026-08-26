@@ -708,7 +708,10 @@ def test_runtime_production_binding_and_normal_startup_isolation():
     assert list(inspect.signature(module._production_run).parameters) == []
     source = Path(module.__file__).read_text()
     assert REST_BASE_URL == "https://api.starknet.sepolia.extended.exchange/api/v1"
-    assert STREAM_URL.endswith("/stream.extended.exchange/v1/account")
+    assert STREAM_URL == (
+        "wss://api.starknet.sepolia.extended.exchange/"
+        "stream.extended.exchange/v1/account"
+    )
     assert "REST_BASE_URL" in source and "STREAM_URL" in source
     assert "def post" not in source.lower()
     assert "allow_redirects=False" in source
