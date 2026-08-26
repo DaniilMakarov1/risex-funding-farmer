@@ -170,6 +170,21 @@ def _same_hex(left: Any, right: Any) -> bool:
     return type(left) is str and type(right) is str and left.lower() == right.lower()
 
 
+def _normalize_observed_l2_vault(value: Any) -> int | None:
+    """Normalize Extended's canonical non-negative decimal-string field."""
+    if type(value) is not str or not value:
+        return None
+    if any(char not in "0123456789" for char in value):
+        return None
+    if len(value) > 1 and value[0] == "0":
+        return None
+    try:
+        normalized = int(value, 10)
+    except ValueError:
+        return None
+    return normalized if str(normalized) == value else None
+
+
 def _json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
 
@@ -258,12 +273,16 @@ class ExtendedIdentity:
         )
 
     def matches_account(self, value: Mapping[str, Any]) -> bool:
+        if not isinstance(value, Mapping):
+            return False
         account_id = value.get("id", value.get("accountId"))
+        l2_vault = _normalize_observed_l2_vault(value.get("l2Vault"))
         return (
             account_id == self.account_id
             and value.get("accountIndex") == self.account_index
             and _same_hex(value.get("l2Key"), self.l2_key)
-            and value.get("l2Vault") == self.l2_vault
+            and l2_vault is not None
+            and l2_vault == self.l2_vault
         )
 
 

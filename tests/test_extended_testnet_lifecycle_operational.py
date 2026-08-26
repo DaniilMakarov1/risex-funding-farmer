@@ -267,6 +267,8 @@ def test_fixture_open_ioc_uses_one_known_id_cancel_and_finishes_flat(tmp_path, n
 
 def test_rest_observation_rejects_book_stale_by_completion_without_server_clock():
     wire = _base_fixture()
+    wire["account"]["info"]["accountId"] = wire["account"]["info"].pop("id")
+    wire["account"]["info"]["l2Vault"] = str(IDENTITY.l2_vault)
 
     def wrapped(data, *, paginated=False):
         value = {"status": "OK", "data": data}
@@ -299,6 +301,38 @@ def test_rest_observation_rejects_book_stale_by_completion_without_server_clock(
     )
     with pytest.raises(OperationalSafetyError, match="FRESH_REST_OBSERVATION_REQUIRED"):
         io.observe(())
+
+
+def test_identity_accepts_observed_account_id_and_canonical_l2_vault_string():
+    account = _account(_base_fixture())
+    account["accountId"] = account.pop("id")
+    account["l2Vault"] = str(IDENTITY.l2_vault)
+    assert IDENTITY.matches_account(account)
+
+
+@pytest.mark.parametrize(
+    "l2_vault",
+    [
+        IDENTITY.l2_vault,
+        IDENTITY.l2_vault + 1,
+        str(IDENTITY.l2_vault + 1),
+        "-7001003",
+        "+7001003",
+        "07001003",
+        "7001003.0",
+        " 7001003",
+        "7001003 ",
+        "",
+        None,
+        True,
+        Decimal("7001003"),
+        "７００１００３",
+    ],
+)
+def test_identity_rejects_malformed_noncanonical_or_unbound_l2_vault(l2_vault):
+    account = _account(_base_fixture())
+    account["l2Vault"] = l2_vault
+    assert not IDENTITY.matches_account(account)
 
 
 def test_entry_rejects_deeper_depth_when_top_ask_cannot_fill_exact_qty(tmp_path, no_sleep):
