@@ -2,7 +2,7 @@
 
 ## Two-route testnet funding-boundary lifecycles
 
-Status: `ACTIVE — READ GATES READY; STAGED VENUE RUNNERS IN REVIEW; NO WRITE IN FLIGHT`.
+Status: `ACTIVE — FIRST STAGED CANDIDATES REJECTED AT CROSS-ROUTE SAFETY REVIEW; BOUNDED CORRECTIONS IN FLIGHT; NO WRITE IN FLIGHT`.
 
 Objective: prove how the accepted system behaves before, during, and after an actual testnet funding settlement on exactly two hedged routes: one RISEx–Nado route and one RISEx–Extended route. Open the smallest venue-executable matched testnet positions, observe and reconcile actual venue funding semantics at the boundary, then close every leg to authoritative zero relevant orders and exact flatness.
 
@@ -11,7 +11,7 @@ Exact starting point:
 - Published `main` is the only authorized source base; the latest accepted checkpoint includes the Nado all-products boundary, outbound-only lifecycle notifications, and the corrected RISEx completed-history/nonce-scope read gate.
 - All earlier RISEx, Nado, and Extended Level C lifecycles are complete historical evidence; this is a fresh funding-accrual objective, not permission to replay their intents.
 - The corrected public all-route implementation and its paper measurements remain accepted, but the `chief11` statistical window was intentionally ended for this rotation. Its database has integrity `ok` and zero orders/fills/positions; its obsolete automation was deleted.
-- Fresh authenticated read-only gates are accepted for RISEx, Nado, and Extended. Nado and Extended staged funding-boundary Builders are active in isolated worktrees; their reports are not acceptance. No venue write is in flight.
+- Fresh authenticated read-only gates are accepted for RISEx, Nado, and Extended. The first staged RISEx, Nado, and Extended candidates are not accepted: exact opposite-direction matching, authoritative cross-run journal binding, and Nado event-to-account funding agreement must be corrected and independently reverified before any dispatch. Extended ETH-USD currently has no ask-side liquidity. No venue write is in flight.
 
 Authorized routes:
 
@@ -50,6 +50,8 @@ Both authorized routes must independently finish with authoritative funding-boun
 
 ## Parallel bounded public observation and Telegram delivery correction
 
-The user additionally authorizes one fresh public-only all-route paper run from `2026-08-27T15:35:24Z` through `2026-08-27T17:35:24Z` on `mainnet-shadow-all-routes-20260827-chief12-2h.db`. It must retain the dynamic 58-direction universe observed at preflight, public readiness, Top-10 Telegram presentation, SQLite integrity, and zero real write capability. An exact stop/report heartbeat owns the terminal gate. A fail-closed public blocker may end the run early; the old `chief11` database must not be resumed.
+The authorized public-only all-route paper run on `mainnet-shadow-all-routes-20260827-chief12-2h.db` is complete. It ran from `2026-08-27T15:35:24Z` to the exact authorized `17:35:24Z` stop, reached durable `STOPPED_SAFE` at `17:36:14Z`, and ended with SQLite integrity `ok` and orders/fills/positions `0/0/0`. It is a bounded completed observation, not an active process and not permission to resume either this database or the old `chief11` database.
 
 The outbound-only Telegram boundary may add sanitized, semantically deduplicated PAPER versus TESTNET lifecycle actions for maker activation, authoritative two-leg open, actual funding status, exit start, close, final flatness, and paired fail-closed error/recovery. It must remain non-blocking and must not affect cadence, economics, decisions, signing, reconciliation, or venue writes; inbound polling and commands remain forbidden. No secret may enter Git, process arguments, logs, reports, or task text. The previously exposed bot token must be rotated and supplied through protected runtime configuration before Telegram delivery is re-enabled.
+
+Accepted published main `c8bcef0118eb4c613b0c5b8ffb63c87b22dceb1e` contains the bounded correction for the Extended heartbeat persistence storm observed during the two-hour run. Telegram remains operationally blocked only by the absent rotated protected token/chat configuration; do not reuse the exposed historical token or start an inbound bot.
