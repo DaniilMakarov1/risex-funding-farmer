@@ -2,7 +2,7 @@
 
 ## Mainnet public shadow — all-route liquidity measurement
 
-Status: `BLOCKED — TOP-10 TELEGRAM AND BOUNDED SHUTDOWN`.
+Status: `RUNNING — 24-HOUR ALL-ROUTE SHADOW WITH TOP-10 TELEGRAM`.
 
 Objective: use the accepted normal paper product against real unauthenticated RISEx, Nado, and Extended mainnet public data, evaluating every currently eligible venue-asset direction in `RISEx ∩ (Extended ∪ Nado)` without Top-5 or fixed route-count truncation. Measure whether opportunity frequency, duration, and conservative economics vary with authoritative route liquidity.
 
@@ -15,12 +15,12 @@ Exact starting point:
 - Accepted `f856a9931c5fa17e385102038d21ab97b0b582c2` removed that first startup/fan-out blocker. A fresh preflight again covered 58 directions and a new paper-run persisted all 58 startup rows before READY. The first scheduled FULL was then starved by a synchronized Extended disconnect/staleness wave across its 45 per-market book/trade/funding tasks: sequential recovery remained inside the main tick, so no FULL deadline or fail-closed blocker was persisted. Intentional SIGINT still reached durable `STOPPED_SAFE` in 21.25 seconds; integrity is `ok` and orders/fills/positions are zero.
 - Accepted `1796ffe272cac2fa91db0042d8a108ddb1577ecf` removed that cadence starvation without changing route or economics semantics. The fresh `chief03` preflight covered 58 directions, and its paper-run persisted 58/58 startup rows before READY. Its first FULL deadline was recorded about 1 ms late and the complete scan finished in about 9 seconds.
 - The `chief03` run completed seven scheduled FULL cadences, then was stopped at the user's request to reduce Telegram output. SIGINT did not complete within 30 seconds and the exact process required a force stop after zero orders/fills/positions and SQLite integrity `ok` were confirmed. The user now requires Telegram to show only the deterministic Top-10 rows while the runtime continues to scan and persist every direction.
+- Accepted `2f5467f07caa6807f252655e9e83d91b9596742e` limits only Telegram FULL digests to the first 10 ranked rows and corrects dynamic owned-task shutdown. The `chief04` operational checkpoint preserved 58/58 route rows and reached durable `STOPPED_SAFE` about 11 ms after SIGINT. The fresh isolated `chief05` run is now active for 24 hours; do not start a parallel duplicate.
 - Rejected branch `codex/strategy-measurement-foundation` at `300362d840141d9ed599d8189ed1d10801fc5256` is not a candidate and must not be merged or copied. Open a fresh Builder only if observed evidence proves a bounded defect or a measurement field genuinely missing from the accepted paper path.
 
 Allowed scope:
 
 - Public unauthenticated mainnet REST/WebSocket reads from the existing fixed venue adapters.
-- A fresh central Builder may implement only two bounded corrections from the exact published main: cap each authoritative Telegram FULL digest at the first 10 rows of the already-persisted deterministic ranking, and correct the newly observed intentional-shutdown hang. The Telegram cap must not affect scanning, persistence, reports, ranking, winner selection, economics, or cadence. Shutdown must cancel/await the current owned Extended health/recovery work and durably finish within 30 seconds without fabricated evidence.
 - After Chief acceptance, use a fresh isolated paper SQLite database, one preflight `scan-once`, then a bounded 24-hour `paper-run` unless a fail-closed performance/data blocker ends it earlier. Outbound Telegram remains authoritative delivery-only/non-blocking and shows at most Top-10 ranked rows per FULL digest.
 - Existing conservative paper semantics: exact Decimal arithmetic, canonical units, exact-size depth/VWAP, fee and execution PnL, funding timestamps, trade-through maker evidence, data-gap degradation, restart behavior, and `NO_TRADE` as a valid result.
 - Report opportunity count/duration, COMPLETE versus DEGRADED paper lifecycles, planned and executable-unwind net PnL, fee/spread/slippage/funding components, funding source quality, latency/freshness failures, leg-risk proxies, and every assumption or blocker, both overall and in the fixed liquidity buckets.
