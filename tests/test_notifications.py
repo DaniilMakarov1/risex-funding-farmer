@@ -163,6 +163,28 @@ async def test_outbox_deduplicates_events_and_opportunity_semantic_state():
     ]
 
 
+def test_outage_recovery_requires_a_queued_critical_notification():
+    class RejectingCapture:
+        def __init__(self):
+            self.rows = []
+        async def start(self): pass
+        def enqueue(self, row):
+            self.rows.append(row)
+            return False
+        async def close(self): pass
+
+    capture = RejectingCapture()
+    outbox = NotificationOutbox(capture)
+    assert not outbox.outage(
+        "semantic-episode", degraded=True, payload=payload("critical"),
+    )
+    assert not outbox.outage(
+        "semantic-episode", degraded=False, payload=payload("recovery"),
+    )
+    assert len(capture.rows) == 1
+    assert outbox._active_outages == set()
+
+
 def test_full_scan_digest_part_event_ids_deduplicate_and_text_is_bounded():
     rows = tuple({
         "canonical_asset": f"ASSET-{index}-" + "X" * 100,

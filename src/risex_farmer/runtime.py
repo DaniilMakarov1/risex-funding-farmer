@@ -605,8 +605,9 @@ class PublicPaperRuntime:
             detail=detail,
         )
         now = at or self.clock.now()
+        # Physical churn and logical resync are persisted operational evidence,
+        # but only an unresolved semantic failure opens a Telegram outage.
         if event_type in {
-            "PUBLIC_SOCKET_DISCONNECTED", "PUBLIC_BOOK_RESYNC_REQUIRED",
             "PUBLIC_SNAPSHOT_RECOVERY_FAILED", "PUBLIC_STREAM_CONFIRMATION_STALE",
         }:
             self._notify_outage(

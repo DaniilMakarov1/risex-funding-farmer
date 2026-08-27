@@ -3095,9 +3095,7 @@ async def test_sequence_gap_fetches_snapshot_and_reconnect_restores_readiness(tm
     assert socket_disconnects == 0 and socket_reconnects == 0
     assert [row.kind for row in delivery.rows if row.kind in {
         "CRITICAL_DATA_LOSS", "DATA_RECOVERY"
-    }] == [
-        "CRITICAL_DATA_LOSS", "DATA_RECOVERY",
-    ]
+    }] == []
 
 
 def test_repeated_outage_evidence_deduplicates_notifications_by_semantic_episode(tmp_path):
@@ -3142,13 +3140,16 @@ def test_repeated_outage_evidence_deduplicates_notifications_by_semantic_episode
         "PUBLIC_BOOK_RESYNC_REQUIRED",
     ]
     assert [row.kind for row in delivery.rows] == [
-        "CRITICAL_DATA_LOSS", "DATA_RECOVERY", "CRITICAL_DATA_LOSS",
+        "CRITICAL_DATA_LOSS", "DATA_RECOVERY",
     ]
 
 
-def test_socket_outage_notification_identity_uses_physical_episode_id(tmp_path):
+def test_socket_outage_evidence_keeps_physical_episode_identity_without_alerts(
+    tmp_path,
+):
     clock = FakeClock()
     delivery = CaptureNotifications()
+    outbox = NotificationOutbox(delivery)
     detail = {
         "episode_id": "EXTENDED:trade:episode-1",
         "market": "ABC-EXTENDED",
@@ -3157,7 +3158,7 @@ def test_socket_outage_notification_identity_uses_physical_episode_id(tmp_path):
     with PaperRepository(tmp_path / "socket-notification-dedupe.db") as repository:
         runtime = PublicPaperRuntime(
             repository, adapters={}, clock=clock,
-            notifications=NotificationOutbox(delivery),
+            notifications=outbox,
         )
         runtime._record(
             "PUBLIC_SOCKET_DISCONNECTED", at=clock.now(),
@@ -3177,9 +3178,103 @@ def test_socket_outage_notification_identity_uses_physical_episode_id(tmp_path):
             "SELECT COUNT(*) FROM runtime_evidence WHERE event_type LIKE 'PUBLIC_SOCKET_%'"
         ).fetchone()[0]
     assert count == 3
+    assert [row.kind for row in delivery.rows] == []
+    assert outbox._active_outages == set()
+
+
+def test_transient_socket_wave_persists_raw_lifecycle_without_alerts(tmp_path):
+    clock = FakeClock()
+    delivery = CaptureNotifications()
+    outbox = NotificationOutbox(delivery)
+    socket_count = 45
+    episodes = tuple(
+        (f"MARKET-{index}", ("book", "trade", "funding")[index % 3])
+        for index in range(socket_count)
+    )
+    with PaperRepository(tmp_path / "transient-socket-wave.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={}, clock=clock, notifications=outbox,
+        )
+        for index, (symbol, stream_kind) in enumerate(episodes):
+            detail = {
+                "episode_id": f"EXTENDED:{stream_kind}:episode-{index}",
+                "market": symbol,
+                "symbol": symbol,
+                "stream_kind": stream_kind,
+                "stream": stream_kind,
+            }
+            runtime._record(
+                "PUBLIC_SOCKET_DISCONNECTED", at=clock.now(),
+                venue=Venue.EXTENDED, detail=detail,
+            )
+            if stream_kind == "book":
+                runtime._record(
+                    "PUBLIC_BOOK_RESYNC_REQUIRED", at=clock.now(),
+                    venue=Venue.EXTENDED, detail=detail,
+                )
+            clock.advance(1)
+            runtime._record(
+                "PUBLIC_SOCKET_RECONNECTED", at=clock.now(),
+                venue=Venue.EXTENDED, detail=detail,
+            )
+        rows = repository.connection.execute(
+            "SELECT event_type FROM runtime_evidence ORDER BY evidence_id"
+        ).fetchall()
+    event_types = [row["event_type"] for row in rows]
+    assert event_types.count("PUBLIC_SOCKET_DISCONNECTED") == len(episodes)
+    assert event_types.count("PUBLIC_SOCKET_RECONNECTED") == len(episodes)
+    assert event_types.count("PUBLIC_BOOK_RESYNC_REQUIRED") == sum(
+        stream_kind == "book" for _, stream_kind in episodes
+    )
+    assert [row.kind for row in delivery.rows if row.kind in {
+        "CRITICAL_DATA_LOSS", "DATA_RECOVERY"
+    }] == []
+    assert outbox._active_outages == set()
+
+
+@pytest.mark.parametrize(("failure", "recovery", "venue", "detail"), (
+    (
+        "PUBLIC_STREAM_CONFIRMATION_STALE", "PUBLIC_STREAM_RESTARTED",
+        Venue.EXTENDED,
+        {
+            "episode_id": "watchdog:EXTENDED:book:ABC-EXTENDED:1",
+            "market": "ABC-EXTENDED", "stream_kind": "book",
+        },
+    ),
+    (
+        "PUBLIC_SNAPSHOT_RECOVERY_FAILED", "PUBLIC_SNAPSHOT_RECOVERY_COMPLETED",
+        Venue.NADO,
+        {
+            "episode_id": "nado-recovery-1",
+            "symbol": "ABC-NADO", "stream_kind": "book",
+        },
+    ),
+))
+def test_persistent_semantic_outage_notifies_once_and_pairs_recovery(
+    tmp_path, failure, recovery, venue, detail,
+):
+    clock = FakeClock()
+    delivery = CaptureNotifications()
+    outbox = NotificationOutbox(delivery)
+    with PaperRepository(tmp_path / f"{failure.lower()}.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={}, clock=clock, notifications=outbox,
+        )
+        runtime._record(failure, at=clock.now(), venue=venue, detail=detail)
+        clock.advance(1)
+        runtime._record(failure, at=clock.now(), venue=venue, detail=detail)
+        clock.advance(1)
+        runtime._record(recovery, at=clock.now(), venue=venue, detail=detail)
+        clock.advance(1)
+        runtime._record(recovery, at=clock.now(), venue=venue, detail=detail)
+        persisted = repository.connection.execute(
+            "SELECT event_type FROM runtime_evidence ORDER BY evidence_id"
+        ).fetchall()
+    assert [row["event_type"] for row in persisted] == [failure] * 2 + [recovery] * 2
     assert [row.kind for row in delivery.rows] == [
         "CRITICAL_DATA_LOSS", "DATA_RECOVERY",
     ]
+    assert outbox._active_outages == set()
 
 
 @pytest.mark.asyncio
@@ -3704,9 +3799,7 @@ async def test_extended_book_eof_unifies_socket_and_resync_notification_episode(
         disconnected, reconnected = assert_socket_episode(socket_rows)
         assert disconnected["episode_id"] == reconnected["episode_id"]
         assert disconnected["stream_kind"] == "book"
-        assert [row.kind for row in delivery.rows] == [
-            "CRITICAL_DATA_LOSS", "DATA_RECOVERY",
-        ]
+        assert [row.kind for row in delivery.rows] == []
         assert outbox._active_outages == set()
 
         clock.advance(1)
@@ -3717,10 +3810,8 @@ async def test_extended_book_eof_unifies_socket_and_resync_notification_episode(
                 (Venue.EXTENDED, "ABC-EXTENDED", "book")
             ],
         )
-        assert [row.kind for row in delivery.rows] == [
-            "CRITICAL_DATA_LOSS", "DATA_RECOVERY", "CRITICAL_DATA_LOSS",
-        ]
-        assert outbox._active_outages == {"EXTENDED:ABC-EXTENDED:book"}
+        assert [row.kind for row in delivery.rows] == []
+        assert outbox._active_outages == set()
         assert repository.connection.execute(
             "SELECT COUNT(*) FROM runtime_evidence "
             "WHERE event_type='PUBLIC_BOOK_RESYNC_REQUIRED'"
@@ -3830,9 +3921,7 @@ async def test_simple_combined_eof_then_reconnect_is_one_socket_episode(tmp_path
     assert disconnected["markets"] == reconnected["markets"] == [
         "ABC-NADO", "XYZ-NADO",
     ]
-    assert [row.kind for row in delivery.rows] == [
-        "CRITICAL_DATA_LOSS", "DATA_RECOVERY",
-    ]
+    assert [row.kind for row in delivery.rows] == []
     assert outbox._active_outages == set()
 
 

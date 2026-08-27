@@ -192,7 +192,10 @@ class NotificationOutbox:
         if degraded:
             if identity in self._active_outages:
                 return False
-            self._active_outages.add(identity)
+            notified = self.event(payload)
+            if notified:
+                self._active_outages.add(identity)
+            return notified
         else:
             if identity not in self._active_outages:
                 return False
