@@ -10,6 +10,7 @@ import pytest
 
 import risex_farmer.cli as cli_module
 from risex_farmer.cli import _money, _paper_run, _reason, _scan_table, main
+from risex_farmer.config import PAPER_CONFIG
 from risex_farmer.lifecycle import LifecycleSnapshot, PositionSample
 from risex_farmer.models import DataQuality, LifecycleState, SettlementStatus, Side, TradeEvidence, Venue
 from risex_farmer.orchestrator import (
@@ -312,11 +313,21 @@ async def test_report_exposes_fixed_liquidity_buckets_and_unknown_blockers(tmp_p
     assert buckets["< $250k"]["executable_unwind_net_pnl_usd"]["known_count"] == 4
     assert buckets["< $250k"]["funding_usd"]["known_count"] == 4
     assert buckets["< $250k"]["planned_fees_usd"]["known_count"] == 4
-    assert buckets["< $250k"]["spread_slippage_usd"]["total_usd"][
+    assert buckets["< $250k"]["spread_slippage_usd"][
+        "quoted_spread_plus_exact_slippage_proxy_usd"
+    ][
         "known_count"
     ] == 4
     assert buckets["< $250k"]["freshness"]["known_count"] == 6
     assert buckets["UNKNOWN"]["freshness"]["unknown_count"] == 0
+    assert "total_usd" not in buckets["< $250k"]["spread_slippage_usd"]
+    basis = report["liquidity_conditioned"]["spread_slippage_basis"]
+    assert basis["descriptive_only"] is True
+    assert basis["not_actual_cost"] is True
+    assert basis["quoted_spread_plus_exact_slippage_proxy_usd"] == (
+        "bbo_spread_usd + taker_slippage_usd; descriptive proxy only, "
+        "never realized or actual cost"
+    )
 
 
 @pytest.mark.asyncio
@@ -383,6 +394,61 @@ async def test_liquidity_duration_breaks_when_bucket_is_absent_from_a_scan(tmp_p
     ]
     assert duration["maximum_seconds"] == "0.0"
     assert duration["observed_runs"] == 2
+
+
+@pytest.mark.asyncio
+async def test_liquidity_duration_respects_normal_continuity_bound(tmp_path) -> None:
+    continuity = (
+        PAPER_CONFIG.normal_scan_seconds
+        + PAPER_CONFIG.max_market_stream_silence_seconds
+    )
+    with PaperRepository(tmp_path / "liquidity-duration-bound.db") as repository:
+        await save_measurement_scan(
+            repository, logical_at=DEFAULT_LOGICAL_AT, liquidity="249999.99"
+        )
+        await save_measurement_scan(
+            repository,
+            logical_at=DEFAULT_LOGICAL_AT + timedelta(seconds=continuity + 1),
+            liquidity="249999.99",
+        )
+        report = repository.liquidity_conditioned_report(
+            as_of=DEFAULT_LOGICAL_AT + timedelta(minutes=10)
+        )
+
+    duration = report["buckets"]["< $250k"][
+        "consecutive_opportunity_duration"
+    ]
+    assert report["duration_max_continuity_seconds"] == continuity == 145
+    assert report["duration_max_continuity_basis"] == (
+        "normal_scan_seconds + max_market_stream_silence_seconds"
+    )
+    assert "adjacent_global_persisted_scan_timestamps" in report["duration_basis"]
+    assert duration["maximum_seconds"] == "0.0"
+    assert duration["total_seconds"] == "0.0"
+    assert duration["current_seconds"] == "0.0"
+    assert duration["observed_runs"] == 2
+
+    with PaperRepository(tmp_path / "liquidity-duration-normal.db") as repository:
+        await save_measurement_scan(
+            repository, logical_at=DEFAULT_LOGICAL_AT, liquidity="249999.99"
+        )
+        await save_measurement_scan(
+            repository,
+            logical_at=DEFAULT_LOGICAL_AT + timedelta(
+                seconds=PAPER_CONFIG.normal_scan_seconds
+            ),
+            liquidity="249999.99",
+        )
+        report = repository.liquidity_conditioned_report(
+            as_of=DEFAULT_LOGICAL_AT + timedelta(minutes=10)
+        )
+
+    duration = report["buckets"]["< $250k"][
+        "consecutive_opportunity_duration"
+    ]
+    assert duration["maximum_seconds"] == "120.0"
+    assert duration["total_seconds"] == "120.0"
+    assert duration["observed_runs"] == 1
 
 
 @pytest.mark.asyncio

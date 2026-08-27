@@ -916,7 +916,7 @@ class LifecycleEngine:
         threshold = (
             self.config.btc_eth_hard_basis_expansion_rate
             if position.route_key.canonical_asset.upper() in {"BTC", "ETH"}
-            else self.config.other_top5_hard_basis_expansion_rate
+            else self.config.other_asset_hard_basis_expansion_rate
         )
         if adverse >= threshold:
             risex_side = _opposite(position.risex_taker_fill.side)

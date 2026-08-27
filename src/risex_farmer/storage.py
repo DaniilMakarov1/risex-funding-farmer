@@ -8,11 +8,12 @@ import sqlite3
 from collections import Counter
 from contextlib import contextmanager
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Iterator
 
+from .config import PAPER_CONFIG
 from .economics import replace_funding_settlement
 from .lifecycle import (
     ClosedTrade,
@@ -134,8 +135,9 @@ def _opportunity_duration(
     bucket: str,
     *,
     scan_times: tuple[datetime, ...] = (),
+    max_continuity_seconds: int,
 ) -> dict[str, object]:
-    """Measure bucket opportunity runs across persisted scan timestamps."""
+    """Measure bucket runs without fabricating continuity across long gaps."""
     plans_by_time: dict[datetime, list[object]] = {}
     for logical_at, plan in sorted(records.get(bucket, ()), key=lambda row: row[0]):
         plans_by_time.setdefault(logical_at, []).append(plan)
@@ -146,7 +148,20 @@ def _opportunity_duration(
     active_started_at: datetime | None = None
     active_last_at: datetime | None = None
     durations: list[Decimal] = []
+    previous_scan_at: datetime | None = None
     for logical_at, plans in scans:
+        if (
+            previous_scan_at is not None
+            and logical_at - previous_scan_at
+            > timedelta(seconds=max_continuity_seconds)
+        ):
+            if active_started_at is not None and active_last_at is not None:
+                durations.append(Decimal(str(
+                    (active_last_at - active_started_at).total_seconds()
+                )))
+            active_started_at = None
+            active_last_at = None
+        previous_scan_at = logical_at
         has_opportunity = any(
             bool(getattr(plan, "entry_allowed", False))
             for plan in plans
@@ -1285,13 +1300,19 @@ class PaperRepository:
         eligible observation has ``entry_allowed`` set.  An opportunity is a
         scan containing at least one eligible observation in the bucket; it is
         deliberately independent of the single winner selected by ranking.
-        Consecutive duration is the elapsed time across adjacent persisted
-        scans that contain at least one eligible route in the bucket.
+        Consecutive duration is the elapsed time across adjacent global
+        persisted scans that contain at least one eligible route in the bucket;
+        a missing bucket observation or a gap beyond the normal continuity
+        window breaks the run.
         """
         cutoff = as_of or datetime.now(UTC)
         if cutoff.tzinfo is None:
             cutoff = cutoff.replace(tzinfo=UTC)
         cutoff = cutoff.astimezone(UTC)
+        max_continuity_seconds = (
+            PAPER_CONFIG.normal_scan_seconds
+            + PAPER_CONFIG.max_market_stream_silence_seconds
+        )
         history: list[tuple[datetime, tuple[object, ...]]] = []
         for row in self.connection.execute(
             "SELECT logical_at,payload FROM scanner_snapshots ORDER BY logical_at"
@@ -1332,7 +1353,7 @@ class PaperRepository:
                 "execution": [],
                 "bbo_spread": [],
                 "taker_slippage": [],
-                "spread_slippage": [],
+                "quoted_spread_plus_exact_slippage_proxy": [],
                 "freshness": [],
             }
             for bucket in LIQUIDITY_BUCKETS
@@ -1380,7 +1401,9 @@ class PaperRepository:
                     bbo = _plan_decimal(plan, "bbo_spread_usd")
                     slippage = _plan_decimal(plan, "taker_slippage_usd")
                     if bbo is not None and slippage is not None:
-                        metrics[bucket]["spread_slippage"].append(bbo + slippage)
+                        metrics[bucket][
+                            "quoted_spread_plus_exact_slippage_proxy"
+                        ].append(bbo + slippage)
                     if _plan_decimal(plan, "freshness_age_seconds") is None:
                         freshness_unknown_counts[bucket] += 1
                 if eligible_in_scan:
@@ -1416,6 +1439,7 @@ class PaperRepository:
                     },
                     bucket,
                     scan_times=tuple(logical_at for logical_at, _ in history),
+                    max_continuity_seconds=max_continuity_seconds,
                 ),
                 "planned_maker_net_pnl_usd": planned,
                 "planned_net_pnl_usd": planned,
@@ -1436,8 +1460,10 @@ class PaperRepository:
                     "taker_slippage_usd": _metric_summary(
                         metrics[bucket]["taker_slippage"]
                     ),
-                    "total_usd": _metric_summary(
-                        metrics[bucket]["spread_slippage"]
+                    "quoted_spread_plus_exact_slippage_proxy_usd": _metric_summary(
+                        metrics[bucket][
+                            "quoted_spread_plus_exact_slippage_proxy"
+                        ]
                     ),
                 },
                 "freshness": {
@@ -1455,7 +1481,29 @@ class PaperRepository:
             "scan_count": len(history),
             "first_scan_at": None if not history else history[0][0].isoformat(),
             "last_scan_at": None if not history else history[-1][0].isoformat(),
-            "duration_basis": "adjacent_persisted_scan_timestamps",
+            "duration_basis": (
+                "adjacent_global_persisted_scan_timestamps; gaps beyond the "
+                "normal continuity window break runs"
+            ),
+            "duration_max_continuity_seconds": max_continuity_seconds,
+            "duration_max_continuity_basis": (
+                "normal_scan_seconds + max_market_stream_silence_seconds"
+            ),
+            "spread_slippage_basis": {
+                "bbo_spread_usd": (
+                    "quantity × (RISEx displayed ask−bid + hedge displayed ask−bid)"
+                ),
+                "taker_slippage_usd": (
+                    "exact-depth VWAP deviation from the venue BBO for modeled "
+                    "taker legs"
+                ),
+                "quoted_spread_plus_exact_slippage_proxy_usd": (
+                    "bbo_spread_usd + taker_slippage_usd; descriptive proxy only, "
+                    "never realized or actual cost"
+                ),
+                "descriptive_only": True,
+                "not_actual_cost": True,
+            },
             "descriptive_only": True,
             "buckets": bucket_reports,
         }

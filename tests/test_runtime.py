@@ -711,6 +711,8 @@ async def test_injected_ordinary_public_scan_builds_real_observations_and_diagno
         "risex_exact_q_entry_vwap_usd", "risex_exact_q_exit_vwap_usd",
         "hedge_maker_entry_price_usd", "planned_hedge_exit_price_usd",
         "risex_funding_usd", "hedge_funding_usd", "net_funding_usd",
+        "bbo_spread_usd", "taker_slippage_usd",
+        "quoted_spread_plus_exact_slippage_proxy_usd",
     ):
         assert result["routes"][0][key] is not None
     route = result["routes"][0]

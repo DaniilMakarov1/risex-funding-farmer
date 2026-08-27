@@ -313,7 +313,7 @@ def _route_row(
         "taker_slippage_usd": (
             None if plan.taker_slippage_usd is None else str(plan.taker_slippage_usd)
         ),
-        "spread_slippage_usd": (
+        "quoted_spread_plus_exact_slippage_proxy_usd": (
             None
             if plan.bbo_spread_usd is None or plan.taker_slippage_usd is None
             else str(plan.bbo_spread_usd + plan.taker_slippage_usd)
