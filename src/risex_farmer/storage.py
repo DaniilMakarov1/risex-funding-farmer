@@ -5,6 +5,7 @@ from __future__ import annotations
 import pickle
 import json
 import sqlite3
+from collections import Counter
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -39,7 +40,7 @@ from .paper_broker import (
     PaperOrderStatus,
     PaperPosition,
 )
-from .scanner import ScanSnapshot
+from .scanner import LIQUIDITY_BUCKETS, ScanSnapshot, liquidity_bucket
 
 
 UNKNOWN = "UNKNOWN"
@@ -64,6 +65,124 @@ def _decimal(value: Decimal | None) -> str | None:
 
 def _seconds(value) -> str | None:
     return None if value is None else str(Decimal(str(value.total_seconds())))
+
+
+def _metric_summary(values: list[Decimal], *, suffix: str = "usd") -> dict[str, object]:
+    if not values:
+        unknown = {
+            "known_count": 0,
+            "sum_usd": UNKNOWN,
+            "average_usd": UNKNOWN,
+            "minimum_usd": UNKNOWN,
+            "maximum_usd": UNKNOWN,
+        }
+        if suffix != "usd":
+            return {
+                "known_count": 0,
+                f"sum_{suffix}": UNKNOWN,
+                f"average_{suffix}": UNKNOWN,
+                f"minimum_{suffix}": UNKNOWN,
+                f"maximum_{suffix}": UNKNOWN,
+            }
+        return unknown
+    total = sum(values, Decimal("0"))
+    return {
+        "known_count": len(values),
+        f"sum_{suffix}": str(total),
+        f"average_{suffix}": str(total / Decimal(len(values))),
+        f"minimum_{suffix}": str(min(values)),
+        f"maximum_{suffix}": str(max(values)),
+    }
+
+
+def _frequency(numerator: int, denominator: int) -> str:
+    if denominator == 0:
+        return UNKNOWN
+    return str(Decimal(numerator) / Decimal(denominator))
+
+
+def _plan_route_key(plan: object) -> tuple[str, str, str]:
+    hedge_venue = getattr(plan, "hedge_venue", None)
+    hedge_name = getattr(hedge_venue, "value", hedge_venue)
+    direction = getattr(getattr(plan, "direction", None), "value", None)
+    return (
+        str(getattr(plan, "canonical_asset", "UNKNOWN")),
+        str(hedge_name or "UNKNOWN"),
+        str(direction or "UNKNOWN"),
+    )
+
+
+def _plan_bucket(plan: object) -> str:
+    route = getattr(plan, "route", None)
+    return liquidity_bucket(
+        getattr(route, "route_liquidity_usd", None) if route is not None else None
+    )
+
+
+def _plan_decimal(plan: object, name: str) -> Decimal | None:
+    value = getattr(plan, name, None)
+    return value if isinstance(value, Decimal) and value.is_finite() else None
+
+
+def _plan_blockers(plan: object) -> tuple[str, ...]:
+    raw = getattr(plan, "no_trade_reasons", ())
+    return tuple(str(reason) for reason in raw)
+
+
+def _opportunity_duration(
+    records: dict[str, list[tuple[datetime, object]]],
+    bucket: str,
+    *,
+    scan_times: tuple[datetime, ...] = (),
+) -> dict[str, object]:
+    """Measure bucket opportunity runs across persisted scan timestamps."""
+    plans_by_time: dict[datetime, list[object]] = {}
+    for logical_at, plan in sorted(records.get(bucket, ()), key=lambda row: row[0]):
+        plans_by_time.setdefault(logical_at, []).append(plan)
+    scans = [
+        (logical_at, plans_by_time.get(logical_at, []))
+        for logical_at in sorted(set(scan_times) | set(plans_by_time))
+    ]
+    active_started_at: datetime | None = None
+    active_last_at: datetime | None = None
+    durations: list[Decimal] = []
+    for logical_at, plans in scans:
+        has_opportunity = any(
+            bool(getattr(plan, "entry_allowed", False))
+            for plan in plans
+        )
+        if has_opportunity:
+            if active_started_at is None:
+                active_started_at = logical_at
+            active_last_at = logical_at
+        elif active_started_at is not None and active_last_at is not None:
+            durations.append(Decimal(str(
+                (active_last_at - active_started_at).total_seconds()
+            )))
+            active_started_at = None
+            active_last_at = None
+    current_duration = (
+        UNKNOWN
+        if active_started_at is None or active_last_at is None
+        else str(Decimal(str((active_last_at - active_started_at).total_seconds())))
+    )
+    if active_started_at is not None and active_last_at is not None:
+        durations.append(Decimal(str(
+            (active_last_at - active_started_at).total_seconds()
+        )))
+    if not durations:
+        duration = UNKNOWN
+        total = UNKNOWN
+    else:
+        duration = str(max(durations))
+        total = str(sum(durations, Decimal("0")))
+    return {
+        "consecutive_opportunity_duration_seconds": duration,
+        "maximum_seconds": duration,
+        "total_seconds": total,
+        "current_seconds": current_duration,
+        "observed_runs": len(durations),
+    }
 
 
 SCHEMA = """
@@ -1157,8 +1276,193 @@ class PaperRepository:
                 ),
             )
 
+    def liquidity_conditioned_report(
+        self, *, as_of: datetime | None = None
+    ) -> dict[str, object]:
+        """Aggregate bounded route evidence from persisted scanner snapshots.
+
+        A route observation is one persisted ``RoutePlan`` in one scan.  An
+        eligible observation has ``entry_allowed`` set.  An opportunity is a
+        scan containing at least one eligible observation in the bucket; it is
+        deliberately independent of the single winner selected by ranking.
+        Consecutive duration is the elapsed time across adjacent persisted
+        scans that contain at least one eligible route in the bucket.
+        """
+        cutoff = as_of or datetime.now(UTC)
+        if cutoff.tzinfo is None:
+            cutoff = cutoff.replace(tzinfo=UTC)
+        cutoff = cutoff.astimezone(UTC)
+        history: list[tuple[datetime, tuple[object, ...]]] = []
+        for row in self.connection.execute(
+            "SELECT logical_at,payload FROM scanner_snapshots ORDER BY logical_at"
+        ).fetchall():
+            logical_at = datetime.fromisoformat(row["logical_at"])
+            comparable_at = (
+                logical_at.replace(tzinfo=UTC)
+                if logical_at.tzinfo is None else logical_at.astimezone(UTC)
+            )
+            if comparable_at > cutoff:
+                continue
+            snapshot = _load(row["payload"])
+            plans = tuple(getattr(snapshot, "evaluations", ()))
+            history.append((comparable_at, plans))
+        history.sort(key=lambda row: row[0])
+
+        observations: dict[str, list[object]] = {
+            bucket: [] for bucket in LIQUIDITY_BUCKETS
+        }
+        records: dict[str, list[tuple[datetime, object]]] = {
+            bucket: [] for bucket in LIQUIDITY_BUCKETS
+        }
+        scan_counts = dict.fromkeys(LIQUIDITY_BUCKETS, 0)
+        opportunity_counts = dict.fromkeys(LIQUIDITY_BUCKETS, 0)
+        eligible_counts = dict.fromkeys(LIQUIDITY_BUCKETS, 0)
+        directions: dict[str, set[tuple[str, str, str]]] = {
+            bucket: set() for bucket in LIQUIDITY_BUCKETS
+        }
+        blocker_counts: dict[str, Counter[str]] = {
+            bucket: Counter() for bucket in LIQUIDITY_BUCKETS
+        }
+        metrics: dict[str, dict[str, list[Decimal]]] = {
+            bucket: {
+                "planned_net": [],
+                "unwind_net": [],
+                "funding": [],
+                "fees": [],
+                "execution": [],
+                "bbo_spread": [],
+                "taker_slippage": [],
+                "spread_slippage": [],
+                "freshness": [],
+            }
+            for bucket in LIQUIDITY_BUCKETS
+        }
+        freshness_unknown_counts = dict.fromkeys(LIQUIDITY_BUCKETS, 0)
+        complete_counts = dict.fromkeys(LIQUIDITY_BUCKETS, 0)
+
+        for logical_at, plans in history:
+            by_bucket: dict[str, list[object]] = {
+                bucket: [] for bucket in LIQUIDITY_BUCKETS
+            }
+            for plan in plans:
+                bucket = _plan_bucket(plan)
+                by_bucket[bucket].append(plan)
+                observations[bucket].append(plan)
+                records[bucket].append((logical_at, plan))
+            for bucket, bucket_plans in by_bucket.items():
+                if not bucket_plans:
+                    continue
+                scan_counts[bucket] += 1
+                eligible_in_scan = False
+                for plan in bucket_plans:
+                    directions[bucket].add(_plan_route_key(plan))
+                    blockers = _plan_blockers(plan)
+                    blocker_counts[bucket].update(blockers)
+                    eligible = bool(getattr(plan, "entry_allowed", False))
+                    if not blockers:
+                        complete_counts[bucket] += 1
+                    if eligible:
+                        eligible_counts[bucket] += 1
+                        eligible_in_scan = True
+                    for name, metric_name in (
+                        ("planned_net", "planned_maker_net_pnl_usd"),
+                        ("unwind_net", "executable_unwind_net_pnl_usd"),
+                        ("funding", "expected_target_cycle_funding_usd"),
+                        ("fees", "planned_fees_usd"),
+                        ("execution", "planned_execution_pnl_usd"),
+                        ("bbo_spread", "bbo_spread_usd"),
+                        ("taker_slippage", "taker_slippage_usd"),
+                        ("freshness", "freshness_age_seconds"),
+                    ):
+                        value = _plan_decimal(plan, metric_name)
+                        if value is not None:
+                            metrics[bucket][name].append(value)
+                    bbo = _plan_decimal(plan, "bbo_spread_usd")
+                    slippage = _plan_decimal(plan, "taker_slippage_usd")
+                    if bbo is not None and slippage is not None:
+                        metrics[bucket]["spread_slippage"].append(bbo + slippage)
+                    if _plan_decimal(plan, "freshness_age_seconds") is None:
+                        freshness_unknown_counts[bucket] += 1
+                if eligible_in_scan:
+                    opportunity_counts[bucket] += 1
+
+        bucket_reports: dict[str, dict[str, object]] = {}
+        for bucket in LIQUIDITY_BUCKETS:
+            planned = _metric_summary(metrics[bucket]["planned_net"])
+            funding = _metric_summary(metrics[bucket]["funding"])
+            fees = _metric_summary(metrics[bucket]["fees"])
+            bucket_reports[bucket] = {
+                "route_observation_count": len(observations[bucket]),
+                "distinct_venue_asset_directions": len(directions[bucket]),
+                "scan_count": scan_counts[bucket],
+                "eligible_count": eligible_counts[bucket],
+                "eligible_frequency": _frequency(
+                    eligible_counts[bucket], len(observations[bucket])
+                ),
+                "opportunity_count": opportunity_counts[bucket],
+                "opportunity_frequency": _frequency(
+                    opportunity_counts[bucket], scan_counts[bucket]
+                ),
+                "eligible_opportunity_count": eligible_counts[bucket],
+                "eligible_opportunity_frequency": _frequency(
+                    eligible_counts[bucket], len(observations[bucket])
+                ),
+                "consecutive_opportunity_duration": _opportunity_duration(
+                    {
+                        bucket: [
+                            (logical_at, plan)
+                            for logical_at, plan in records[bucket]
+                        ]
+                    },
+                    bucket,
+                    scan_times=tuple(logical_at for logical_at, _ in history),
+                ),
+                "planned_maker_net_pnl_usd": planned,
+                "planned_net_pnl_usd": planned,
+                "executable_unwind_net_pnl_usd": _metric_summary(
+                    metrics[bucket]["unwind_net"]
+                ),
+                "funding_usd": funding,
+                "expected_funding_usd": funding,
+                "planned_fees_usd": fees,
+                "fees_usd": fees,
+                "planned_execution_pnl_usd": _metric_summary(
+                    metrics[bucket]["execution"]
+                ),
+                "spread_slippage_usd": {
+                    "bbo_spread_usd": _metric_summary(
+                        metrics[bucket]["bbo_spread"]
+                    ),
+                    "taker_slippage_usd": _metric_summary(
+                        metrics[bucket]["taker_slippage"]
+                    ),
+                    "total_usd": _metric_summary(
+                        metrics[bucket]["spread_slippage"]
+                    ),
+                },
+                "freshness": {
+                    "age_seconds": _metric_summary(
+                        metrics[bucket]["freshness"], suffix="seconds"
+                    ),
+                    "known_count": len(metrics[bucket]["freshness"]),
+                    "unknown_count": freshness_unknown_counts[bucket],
+                    "complete_count": complete_counts[bucket],
+                    "blocked_count": len(observations[bucket]) - complete_counts[bucket],
+                },
+                "blockers": dict(sorted(blocker_counts[bucket].items())),
+            }
+        return {
+            "scan_count": len(history),
+            "first_scan_at": None if not history else history[0][0].isoformat(),
+            "last_scan_at": None if not history else history[-1][0].isoformat(),
+            "duration_basis": "adjacent_persisted_scan_timestamps",
+            "descriptive_only": True,
+            "buckets": bucket_reports,
+        }
+
     def report(self, *, as_of: datetime | None = None) -> dict[str, object]:
         as_of = as_of or datetime.now(UTC)
+        liquidity_conditioned = self.liquidity_conditioned_report(as_of=as_of)
         scans = self.connection.execute(
             "SELECT COALESCE(SUM(opportunity_count),0) opportunities, "
             "COALESCE(SUM(eligible_count),0) eligible FROM scanner_snapshots"
@@ -1428,6 +1732,8 @@ class PaperRepository:
             "runtime_evidence_count": len(runtime_evidence),
             "venue_readiness": latest_readiness,
             "latest_routes": latest_routes,
+            "liquidity_conditioned": liquidity_conditioned,
+            "liquidity_buckets": liquidity_conditioned["buckets"],
             "latest_trade_evidence": (
                 None if latest_trade is None else {
                     "trade_event_key": latest_trade.trade_event_key,

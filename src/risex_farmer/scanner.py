@@ -44,6 +44,34 @@ from .models import (
 
 STABLE_QUOTES = frozenset({"USD", "USDC", "USDT", "USDT0"})
 
+LIQUIDITY_BUCKETS = (
+    "< $250k",
+    "$250k–< $1m",
+    "$1m–< $10m",
+    ">= $10m",
+    "UNKNOWN",
+)
+
+
+def liquidity_bucket(value: Decimal | None) -> str:
+    """Return the frozen descriptive route-liquidity bucket."""
+    if value is None or not value.is_finite() or value < 0:
+        return "UNKNOWN"
+    if value < Decimal("250000"):
+        return "< $250k"
+    if value < Decimal("1000000"):
+        return "$250k–< $1m"
+    if value < Decimal("10000000"):
+        return "$1m–< $10m"
+    return ">= $10m"
+
+
+def _decimal_seconds(delta: timedelta) -> Decimal:
+    return (
+        Decimal(delta.days * 86_400 + delta.seconds)
+        + Decimal(delta.microseconds) / Decimal(1_000_000)
+    )
+
 
 class NoTradeReason:
     MARKET_INELIGIBLE = "MARKET_INELIGIBLE"
@@ -98,6 +126,9 @@ class RoutePlan:
     planned_maker_net_pnl_usd: Decimal | None
     executable_unwind_net_pnl_usd: Decimal | None
     no_trade_reasons: tuple[str, ...]
+    bbo_spread_usd: Decimal | None = None
+    taker_slippage_usd: Decimal | None = None
+    freshness_age_seconds: Decimal | None = None
 
     @property
     def entry_allowed(self) -> bool:
@@ -206,6 +237,44 @@ def _best_prices(book: OrderBook) -> tuple[Decimal, Decimal]:
     )
 
 
+def _freshness_age_seconds(
+    risex: MarketObservation, hedge: MarketObservation, logical_at: datetime
+) -> Decimal | None:
+    """Persist the maximum age of available route evidence at scan time."""
+    timestamps: list[datetime] = []
+    for observation in (risex, hedge):
+        if observation.volume is not None:
+            timestamps.append(observation.volume.observed_at)
+        if observation.book is not None:
+            timestamps.append(observation.book.observed_at)
+        if observation.funding is not None:
+            timestamps.append(observation.funding.observed_at)
+        if observation.health is not None:
+            if observation.health.last_market_event_at is not None:
+                timestamps.append(observation.health.last_market_event_at)
+            if observation.health.last_connection_confirmation_at is not None:
+                timestamps.append(observation.health.last_connection_confirmation_at)
+    if not timestamps or any(timestamp > logical_at for timestamp in timestamps):
+        return None
+    return max(
+        _decimal_seconds(logical_at - timestamp) for timestamp in timestamps
+    )
+
+
+def _taker_slippage_usd(
+    side: Side,
+    quantity: Decimal,
+    vwap: Decimal,
+    best_bid: Decimal,
+    best_ask: Decimal,
+) -> Decimal:
+    if side is Side.BUY:
+        return quantity * (vwap - best_ask)
+    if side is Side.SELL:
+        return quantity * (best_bid - vwap)
+    raise ValueError(f"unsupported side: {side}")
+
+
 def _fee_rate(config: PaperConfig, venue: Venue, role: LiquidityRole) -> Decimal:
     rates = {
         (Venue.RISEX, LiquidityRole.MAKER): config.risex_maker_fee_rate,
@@ -308,6 +377,7 @@ def _empty_plan(
         planned_maker_net_pnl_usd=None,
         executable_unwind_net_pnl_usd=None,
         no_trade_reasons=tuple(dict.fromkeys(reasons)),
+        freshness_age_seconds=_freshness_age_seconds(risex, hedge, logical_at),
     )
 
 
@@ -420,6 +490,20 @@ def evaluate_route(
             risex.volume.quote_volume_usd, hedge.volume.quote_volume_usd
         )
 
+    route = (
+        None
+        if route_liquidity is None
+        or risex.market.canonical_asset != hedge.market.canonical_asset
+        else Route(
+            risex.market.canonical_asset,
+            risex.market,
+            hedge.market,
+            hedge.market.venue,
+            direction,
+            route_liquidity,
+        )
+    )
+
     if not _healthy(
         risex,
         logical_at,
@@ -443,7 +527,9 @@ def evaluate_route(
         ):
             reasons.append(NoTradeReason.FUNDING_ELIGIBILITY_UNKNOWN)
     if reasons:
-        return _empty_plan(risex, hedge, direction, logical_at, reasons)
+        return _empty_plan(
+            risex, hedge, direction, logical_at, reasons, route=route
+        )
 
     if route_liquidity is None:
         return _empty_plan(
@@ -458,14 +544,6 @@ def evaluate_route(
             risex, hedge, direction, logical_at,
             (NoTradeReason.FUNDING_ELIGIBILITY_UNKNOWN,),
         )
-    route = Route(
-        risex.market.canonical_asset,
-        risex.market,
-        hedge.market,
-        hedge.market.venue,
-        direction,
-        route_liquidity,
-    )
     try:
         risex_bid, risex_ask = _best_prices(risex.book)
         hedge_bid, hedge_ask = _best_prices(hedge.book)
@@ -670,6 +748,33 @@ def evaluate_route(
         if direction is RouteDirection.LONG_RISEX_SHORT_HEDGE
         else hedge_sell.price
     )
+    assert hedge_unwind_price is not None
+    hedge_unwind_side = (
+        Side.BUY
+        if direction is RouteDirection.LONG_RISEX_SHORT_HEDGE
+        else Side.SELL
+    )
+    # A round trip crossing the displayed bid/ask width once on each venue
+    # costs q * spread per venue.  This is a descriptive quote-width proxy,
+    # not a fill claim; executable depth remains represented by exact VWAP.
+    bbo_spread_usd = quantity * (
+        (risex_ask - risex_bid) + (hedge_ask - hedge_bid)
+    )
+    taker_slippage_usd = (
+        _taker_slippage_usd(
+            risex_entry_side, quantity, risex_entry_price,
+            risex_bid, risex_ask,
+        )
+        + _taker_slippage_usd(
+            risex_exit_side, quantity, risex_exit_price,
+            risex_bid, risex_ask,
+        )
+        + _taker_slippage_usd(
+            hedge_unwind_side, quantity, hedge_unwind_price,
+            hedge_bid, hedge_ask,
+        )
+    )
+
     if direction is RouteDirection.LONG_RISEX_SHORT_HEDGE:
         unwind_execution = pair_price_pnl_usd(
             quantity,
@@ -720,6 +825,9 @@ def evaluate_route(
         planned_maker_net_pnl_usd=planned_net,
         executable_unwind_net_pnl_usd=unwind_net,
         no_trade_reasons=tuple(reasons),
+        bbo_spread_usd=bbo_spread_usd,
+        taker_slippage_usd=taker_slippage_usd,
+        freshness_age_seconds=_freshness_age_seconds(risex, hedge, logical_at),
     )
 
 
@@ -757,23 +865,19 @@ async def scan_once(
     )
     universe = tuple(plan for plan in evaluations if plan.universe_eligible)
     asset_liquidity: dict[str, Decimal] = {}
-    for plan in universe:
-        assert plan.route is not None
-        asset_liquidity[plan.canonical_asset] = max(
-            asset_liquidity.get(plan.canonical_asset, Decimal("0")),
-            plan.route.route_liquidity_usd,
-        )
+    for plan in evaluations:
+        asset_liquidity.setdefault(plan.canonical_asset, Decimal("0"))
+        if plan.route is not None:
+            asset_liquidity[plan.canonical_asset] = max(
+                asset_liquidity[plan.canonical_asset],
+                plan.route.route_liquidity_usd,
+            )
     selected_assets = tuple(
         asset
         for asset, _ in sorted(
             asset_liquidity.items(), key=lambda item: (-item[1], item[0])
-        )[: config.top_markets]
+        )
     )
-    ranked = tuple(
-        sorted(
-            (plan for plan in universe if plan.canonical_asset in selected_assets),
-            key=_rank_key,
-        )[:20]
-    )
+    ranked = tuple(sorted(universe, key=_rank_key))
     winner = next((plan for plan in ranked if plan.entry_allowed), None)
     return ScanSnapshot(logical_at, evaluations, selected_assets, ranked, winner)

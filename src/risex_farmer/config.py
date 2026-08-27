@@ -9,7 +9,6 @@ class PaperConfig:
     paper_balance_usd: Decimal = Decimal("10000")
     target_notional_per_leg_usd: Decimal = Decimal("500")
     max_open_positions: int = 1
-    top_markets: int = 5
     normal_scan_seconds: int = 120
     focused_window_seconds: int = 300
     focused_scan_seconds: int = 10
@@ -46,7 +45,6 @@ PAPER_CONFIG = PaperConfig()
 PAPER_BALANCE_USD = PAPER_CONFIG.paper_balance_usd
 TARGET_NOTIONAL_PER_LEG_USD = PAPER_CONFIG.target_notional_per_leg_usd
 MAX_OPEN_POSITIONS = PAPER_CONFIG.max_open_positions
-TOP_MARKETS = PAPER_CONFIG.top_markets
 NORMAL_SCAN_SECONDS = PAPER_CONFIG.normal_scan_seconds
 FOCUSED_WINDOW_SECONDS = PAPER_CONFIG.focused_window_seconds
 FOCUSED_SCAN_SECONDS = PAPER_CONFIG.focused_scan_seconds

@@ -204,20 +204,20 @@ def test_full_scan_digest_part_event_ids_deduplicate_and_text_is_bounded():
     assert all(line.count(" | ") == 2 for line in route_lines)
 
 
-def test_full_scan_digest_splits_all_twenty_rows_without_loss() -> None:
+def test_full_scan_digest_splits_all_58_rows_without_loss() -> None:
     rows = tuple({
         "canonical_asset": f"ASSET-{index}-" + "X" * 80,
         "hedge_venue": "EXTENDED-" + "Y" * 100,
         "direction": "LONG_RISEX_SHORT_HEDGE",
         "planned_maker_net_pnl_usd": None,
         "blockers": [f"MARKET_METADATA_STALE:{index}"],
-    } for index in range(20))
+    } for index in range(58))
     payloads = full_scan_digest_payloads(
         scan_at=NOW, opportunity=False, route_rows=rows,
     )
     assert all(len(payload.text) <= 4096 for payload in payloads)
     lines = [line for payload in payloads for line in payload.text.splitlines()[1:]]
-    assert len(lines) == len(set(lines)) == 20
+    assert len(lines) == len(set(lines)) == 58
     assert all("Expected PnL: UNKNOWN — market metadata stale" in line for line in lines)
 
 

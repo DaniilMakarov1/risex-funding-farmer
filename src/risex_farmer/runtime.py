@@ -53,6 +53,7 @@ from .scanner import (
     RoutePlan,
     ScanSnapshot,
     activation_schedule,
+    liquidity_bucket,
     planned_fee_split,
     scan_once,
 )
@@ -249,6 +250,9 @@ def _route_row(
         "route_liquidity_usd": (
             None if plan.route is None else str(plan.route.route_liquidity_usd)
         ),
+        "liquidity_bucket": liquidity_bucket(
+            None if plan.route is None else plan.route.route_liquidity_usd
+        ),
         "target_cycle_start": (
             None if plan.target_cycle is None else plan.target_cycle.start_at.isoformat()
         ),
@@ -302,6 +306,22 @@ def _route_row(
             None
             if plan.executable_unwind_net_pnl_usd is None
             else str(plan.executable_unwind_net_pnl_usd)
+        ),
+        "bbo_spread_usd": (
+            None if plan.bbo_spread_usd is None else str(plan.bbo_spread_usd)
+        ),
+        "taker_slippage_usd": (
+            None if plan.taker_slippage_usd is None else str(plan.taker_slippage_usd)
+        ),
+        "spread_slippage_usd": (
+            None
+            if plan.bbo_spread_usd is None or plan.taker_slippage_usd is None
+            else str(plan.bbo_spread_usd + plan.taker_slippage_usd)
+        ),
+        "freshness_age_seconds": (
+            None
+            if plan.freshness_age_seconds is None
+            else str(plan.freshness_age_seconds)
         ),
         "source_quality": {
             "risex_funding": {"source": risex_source, "marker": marker(risex_quote, risex_source)},
@@ -385,6 +405,7 @@ class PublicPaperRuntime:
         self._extended_universe_task: asyncio.Task[None] | None = None
         self.next_extended_catalog_at: datetime | None = None
         self.notifications = notifications
+        self._catalog_reconciliation_in_progress = False
         self._notification_run_id: str | None = None
         self._stop_cause: str | None = None
         self._requested_at: datetime | None = None
@@ -1066,35 +1087,7 @@ class PublicPaperRuntime:
             and market.contract_type is ContractType.LINEAR
             and market.is_active
         }
-        assets = risex_assets & hedge_assets
-        scores: dict[str, Decimal] = {}
-        for asset in assets:
-            risex = by_venue_asset[(Venue.RISEX, asset)]
-            risex_volume = self.volumes.get((Venue.RISEX, risex.venue_symbol))
-            values: list[Decimal] = []
-            for venue in (Venue.EXTENDED, Venue.NADO):
-                hedge = by_venue_asset.get((venue, asset))
-                if hedge is None or risex_volume is None:
-                    continue
-                hedge_volume = self.volumes.get((venue, hedge.venue_symbol))
-                if (
-                    risex_volume.quote_volume_usd is not None
-                    and hedge_volume is not None
-                    and hedge_volume.quote_volume_usd is not None
-                ):
-                    values.append(
-                        min(
-                            risex_volume.quote_volume_usd,
-                            hedge_volume.quote_volume_usd,
-                        )
-                    )
-            scores[asset] = max(values, default=Decimal("0"))
-        selected = [
-            asset
-            for asset, _ in sorted(scores.items(), key=lambda item: (-item[1], item[0]))[
-                : self.config.top_markets
-            ]
-        ]
+        selected = sorted(risex_assets & hedge_assets)
         runtime = self.repository.load_runtime()
         position = getattr(runtime, "position", None)
         if position is not None and position.route_key.canonical_asset not in selected:
@@ -1468,13 +1461,40 @@ class PublicPaperRuntime:
         try:
             self._update_extended_catalog_readiness(self.clock.now())
             assumed_at = self.clock.now()
+            candidates = self._candidate_markets()
+            candidate_keys = {
+                (market.venue, market.venue_symbol) for market in candidates
+            }
+            protected_keys: set[tuple[Venue, str]] = set()
+            if self.broker is not None and self.broker.state.order is not None:
+                order_plan = self.broker.state.order.route_plan
+                protected_keys.update({
+                    (Venue.RISEX, order_plan.risex_market.venue_symbol),
+                    (order_plan.hedge_venue, order_plan.hedge_market.venue_symbol),
+                })
+            if self.lifecycle is not None:
+                lifecycle_snapshot = self.lifecycle.snapshot
+                protected_keys.update({
+                    (Venue.RISEX, lifecycle_snapshot.risex_market.venue_symbol),
+                    (
+                        lifecycle_snapshot.hedge_market.venue,
+                        lifecycle_snapshot.hedge_market.venue_symbol,
+                    ),
+                })
+            for key in tuple(self.observations):
+                if key not in candidate_keys | protected_keys:
+                    self.observations.pop(key, None)
             await _gather_owned(*(
                 self._market_observation(
                     market, assumed_at, background=True
                 )
-                for market in self._candidate_markets()
+                for market in candidates
             ))
-            await self._reconcile_streams()
+            self._catalog_reconciliation_in_progress = True
+            try:
+                await self._reconcile_streams()
+            finally:
+                self._catalog_reconciliation_in_progress = False
             completed = self.clock.now()
             self._record(
                 "PUBLIC_REFRESH_COMPLETED", at=completed,
@@ -3998,6 +4018,24 @@ class PublicPaperRuntime:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
                 self._stream_tasks.pop(key, None)
+            changed_symbols = set(current) | set(wanted)
+            now = self.clock.now()
+            for symbol in changed_symbols:
+                if self._catalog_reconciliation_in_progress:
+                    self._trade_stream_ready.discard((venue, symbol))
+                    self._live_book_ready.discard((venue, symbol))
+                if symbol not in wanted:
+                    self.observations.pop((venue, symbol), None)
+                    continue
+                if self._catalog_reconciliation_in_progress:
+                    self.coordinator.stream(venue, symbol).gap()
+                    for component in (
+                        "book", "trade", "funding", "connection_combined"
+                    ):
+                        self._set_component_readiness(
+                            venue, f"{component}:{symbol}", False,
+                            "PUBLIC_STREAM_RECONCILIATION_PENDING", now,
+                        )
             self._combined_symbols[venue] = wanted
             self._remove_obsolete_components(venue, set(wanted), self.clock.now())
             if wanted:
@@ -4034,6 +4072,9 @@ class PublicPaperRuntime:
         )
         for key in sorted(wanted - current, key=lambda row: (row[1], row[2])):
             _, symbol, kind = key
+            self._live_book_ready.discard((Venue.EXTENDED, symbol))
+            if kind == "trade":
+                self._trade_stream_ready.discard((Venue.EXTENDED, symbol))
             data_component = "applied_funding" if kind == "funding" else kind
             self._set_component_readiness(
                 Venue.EXTENDED, f"{data_component}:{symbol}", False,
@@ -4053,6 +4094,7 @@ class PublicPaperRuntime:
         removed = current - wanted
         for key in removed:
             self._extended_confirmed_at.pop((key[1], key[2]), None)
+            self._live_book_ready.discard((Venue.EXTENDED, key[1]))
             if key[2] == "trade":
                 self._trade_stream_ready.discard((Venue.EXTENDED, key[1]))
             self._pending_socket_episodes.pop(
@@ -4070,6 +4112,11 @@ class PublicPaperRuntime:
                     "PUBLIC_STREAM_REMOVED", venue=Venue.EXTENDED,
                     detail={"symbol": key[1], "stream": key[2]},
                 )
+        wanted_symbols = {key[1] for key in wanted}
+        for symbol in {
+            key[1] for key in removed
+        } - wanted_symbols:
+            self.observations.pop((Venue.EXTENDED, symbol), None)
 
     async def _pause_or_stop(self, seconds: float) -> None:
         assert self._stop_event is not None

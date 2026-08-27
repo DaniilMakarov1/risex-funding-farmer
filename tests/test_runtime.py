@@ -198,11 +198,14 @@ class FakeAdapter(PublicAdapter):
 
 
 class ManyFakeAdapter(FakeAdapter):
-    def __init__(self, venue: Venue, clock: FakeClock, *, settlement_at: datetime) -> None:
+    def __init__(
+        self, venue: Venue, clock: FakeClock, *, settlement_at: datetime,
+        asset_count: int = 5,
+    ) -> None:
         super().__init__(venue, clock, settlement_at=settlement_at)
         self.many_markets = tuple(
             replace(self.market, canonical_asset=f"A{index}", venue_symbol=f"A{index}-{venue.value}")
-            for index in range(5)
+            for index in range(asset_count)
         )
 
     async def fetch_markets(self):
@@ -214,6 +217,43 @@ class ManyFakeAdapter(FakeAdapter):
         return tuple(
             MarketVolume(self.venue, market.venue_symbol, D("1000000"), self.clock.now(), "official-shaped")
             for market in self.many_markets
+        )
+
+
+class DynamicCatalogAdapter(FakeAdapter):
+    def __init__(
+        self,
+        venue: Venue,
+        clock: FakeClock,
+        *,
+        settlement_at: datetime,
+        assets: tuple[str, ...],
+    ) -> None:
+        super().__init__(venue, clock, settlement_at=settlement_at)
+        self.catalog = tuple(
+            replace(
+                self.market,
+                canonical_asset=asset,
+                venue_symbol=f"{asset}-{venue.value}",
+            )
+            for asset in assets
+        )
+
+    async def fetch_markets(self):
+        self._ready("markets")
+        return self.catalog
+
+    async def fetch_volumes(self):
+        self._ready("volumes")
+        return tuple(
+            MarketVolume(
+                self.venue,
+                market.venue_symbol,
+                D("1000000"),
+                self.clock.now(),
+                "official-shaped",
+            )
+            for market in self.catalog
         )
 
 
@@ -911,7 +951,7 @@ async def test_scan_still_rejects_an_untrusted_future_observation(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_route_output_keeps_all_twenty_after_system_sort(tmp_path):
+async def test_route_output_keeps_all_evaluated_routes_after_system_sort(tmp_path):
     clock = FakeClock()
     many = {
         venue: ManyFakeAdapter(venue, clock, settlement_at=NOW + timedelta(minutes=5))
@@ -922,6 +962,123 @@ async def test_route_output_keeps_all_twenty_after_system_sort(tmp_path):
         persisted = repository.report(as_of=NOW)["latest_routes"]
     assert len(result["routes"]) == 20
     assert len(persisted) == 20
+
+
+@pytest.mark.asyncio
+async def test_asymmetric_catalog_add_remove_reconciles_all_route_subscriptions(tmp_path):
+    clock = FakeClock()
+    settlement_at = NOW + timedelta(minutes=5)
+    fakes = {
+        Venue.RISEX: DynamicCatalogAdapter(
+            Venue.RISEX, clock, settlement_at=settlement_at,
+            assets=("A", "B", "C", "D", "E"),
+        ),
+        Venue.EXTENDED: DynamicCatalogAdapter(
+            Venue.EXTENDED, clock, settlement_at=settlement_at,
+            assets=("A", "C"),
+        ),
+        Venue.NADO: DynamicCatalogAdapter(
+            Venue.NADO, clock, settlement_at=settlement_at,
+            assets=("B", "C"),
+        ),
+    }
+
+    class IdleSession:
+        closed = False
+
+        async def close(self):
+            self.closed = True
+
+    with PaperRepository(tmp_path / "asymmetric-catalog.db") as repository:
+        async with PublicPaperRuntime(
+            repository, adapters=fakes, clock=clock
+        ) as runtime:
+            initial = await runtime.scan()
+            initial_keys = {
+                (row["canonical_asset"], row["hedge_venue"], row["direction"])
+                for row in initial["routes"]
+            }
+            assert initial_keys == {
+                (asset, venue.value, direction)
+                for asset, venue in (
+                    ("A", Venue.EXTENDED), ("B", Venue.NADO),
+                    ("C", Venue.EXTENDED), ("C", Venue.NADO),
+                )
+                for direction in (
+                    "LONG_RISEX_SHORT_HEDGE", "SHORT_RISEX_LONG_HEDGE",
+                )
+            }
+
+            stop = asyncio.Event()
+            runtime._session = IdleSession()
+            runtime._stop_event = stop
+
+            async def hold_combined(_venue, _adapter, _symbols, _session_id):
+                await stop.wait()
+
+            runtime._combined_stream = hold_combined
+            await runtime._refresh_public_data()
+            assert runtime._combined_symbols[Venue.RISEX] == (
+                "A-RISEX", "B-RISEX", "C-RISEX"
+            )
+            assert runtime._combined_symbols[Venue.NADO] == (
+                "B-NADO", "C-NADO"
+            )
+
+            fakes[Venue.RISEX].catalog = tuple(
+                replace(
+                    fakes[Venue.RISEX].catalog[0],
+                    canonical_asset=asset,
+                    venue_symbol=f"{asset}-RISEX",
+                )
+                for asset in ("A", "B", "C", "F")
+            )
+            fakes[Venue.EXTENDED].catalog = (
+                replace(
+                    fakes[Venue.EXTENDED].catalog[0],
+                    canonical_asset="A", venue_symbol="A-EXTENDED",
+                ),
+            )
+            fakes[Venue.NADO].catalog = tuple(
+                replace(
+                    fakes[Venue.NADO].catalog[0],
+                    canonical_asset=asset,
+                    venue_symbol=f"{asset}-NADO",
+                )
+                for asset in ("B", "C", "F")
+            )
+            await asyncio.gather(*(
+                runtime._catalog(venue, adapter)
+                for venue, adapter in fakes.items()
+            ))
+            await runtime._refresh_public_data()
+
+            assert runtime._required_symbols(Venue.EXTENDED) == {"A-EXTENDED"}
+            assert runtime._combined_symbols[Venue.RISEX] == (
+                "A-RISEX", "B-RISEX", "C-RISEX", "F-RISEX"
+            )
+            assert runtime._combined_symbols[Venue.NADO] == (
+                "B-NADO", "C-NADO", "F-NADO"
+            )
+            assert (Venue.EXTENDED, "C-EXTENDED") not in runtime.observations
+            assert (Venue.NADO, "F-NADO") in runtime.observations
+
+            clock.advance(1)
+            updated = await runtime.scan(refresh=False, scan_kind="FULL")
+            updated_keys = {
+                (row["canonical_asset"], row["hedge_venue"], row["direction"])
+                for row in updated["routes"]
+            }
+            assert updated_keys == {
+                (asset, venue.value, direction)
+                for asset, venue in (
+                    ("A", Venue.EXTENDED), ("B", Venue.NADO),
+                    ("C", Venue.NADO), ("F", Venue.NADO),
+                )
+                for direction in (
+                    "LONG_RISEX_SHORT_HEDGE", "SHORT_RISEX_LONG_HEDGE",
+                )
+            }
 
 
 @pytest.mark.asyncio
@@ -1436,25 +1593,35 @@ async def test_full_scan_digest_never_emits_for_other_scan_kinds(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_full_scan_digest_retains_all_twenty_authoritative_rows(tmp_path):
+async def test_full_scan_digest_retains_all_58_authoritative_rows(tmp_path):
     clock = FakeClock()
     fakes = {
-        venue: ManyFakeAdapter(
-            venue, clock, settlement_at=NOW + timedelta(minutes=5)
-        )
-        for venue in Venue
+        Venue.RISEX: ManyFakeAdapter(
+            Venue.RISEX, clock, settlement_at=NOW + timedelta(minutes=5),
+            asset_count=15,
+        ),
+        Venue.EXTENDED: ManyFakeAdapter(
+            Venue.EXTENDED, clock, settlement_at=NOW + timedelta(minutes=5),
+            asset_count=15,
+        ),
+        Venue.NADO: ManyFakeAdapter(
+            Venue.NADO, clock, settlement_at=NOW + timedelta(minutes=5),
+            asset_count=14,
+        ),
     }
     delivery = CaptureNotifications()
-    with PaperRepository(tmp_path / "full-scan-digest-fifteen.db") as repository:
+    with PaperRepository(tmp_path / "full-scan-digest-all-routes.db") as repository:
         async with PublicPaperRuntime(
             repository, adapters=fakes, clock=clock,
             notifications=NotificationOutbox(delivery),
         ) as runtime:
             result = await runtime.scan(scan_kind="FULL")
-    digest = next(row for row in delivery.rows if row.kind == "FULL_SCAN_DIGEST")
-    assert len(result["routes"]) == 20
-    assert len(digest.text.splitlines()[1:]) == 20
-    assert len(digest.text) <= 4096
+    digests = [row for row in delivery.rows if row.kind == "FULL_SCAN_DIGEST"]
+    assert len(result["routes"]) == 58
+    assert len(digests) == 1
+    assert sum(len(row.text.splitlines()[1:]) for row in digests) == 58
+    assert len({line for row in digests for line in row.text.splitlines()[1:]}) == 58
+    assert all(len(row.text) <= 4096 for row in digests)
 
 
 @pytest.mark.asyncio

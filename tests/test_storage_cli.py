@@ -2,7 +2,9 @@ import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+import pickle
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,13 +12,70 @@ import risex_farmer.cli as cli_module
 from risex_farmer.cli import _money, _paper_run, _reason, _scan_table, main
 from risex_farmer.lifecycle import LifecycleSnapshot, PositionSample
 from risex_farmer.models import DataQuality, LifecycleState, SettlementStatus, Side, TradeEvidence, Venue
-from risex_farmer.orchestrator import DEFAULT_LOGICAL_AT, load_fixture, run_fixture
+from risex_farmer.orchestrator import (
+    DEFAULT_LOGICAL_AT,
+    fixture_scan,
+    load_fixture,
+    run_fixture,
+)
 from risex_farmer.paper_broker import PaperEntryState
+from risex_farmer.scanner import LIQUIDITY_BUCKETS
 from risex_farmer.storage import PaperRepository
 
 
 D = Decimal
 FIXTURES = Path(__file__).parent / "fixtures" / "paper_006"
+
+
+async def save_measurement_scan(
+    repository: PaperRepository,
+    *,
+    logical_at: datetime,
+    liquidity: str | None = None,
+    blocked: bool = False,
+) -> None:
+    snapshot, observations = await fixture_scan({
+        "scenario": "no_opportunity" if blocked else "scan_only",
+        "logical_at": logical_at.isoformat(),
+    })
+    if liquidity is not None:
+        snapshot = replace(
+            snapshot,
+            evaluations=tuple(
+                replace(
+                    plan,
+                    route=(
+                        None
+                        if plan.route is None
+                        else replace(
+                            plan.route,
+                            route_liquidity_usd=D(liquidity),
+                        )
+                    ),
+                )
+                for plan in snapshot.evaluations
+            ),
+        )
+    if blocked:
+        snapshot = replace(
+            snapshot,
+            evaluations=tuple(
+                replace(
+                    plan,
+                    route=(None if liquidity is None else plan.route),
+                )
+                for plan in snapshot.evaluations
+            ),
+        )
+    repository.save_decision(
+        recorded_at=logical_at,
+        scan_snapshot=snapshot,
+        funding_quotes=tuple(
+            observation.funding
+            for observation in observations
+            if observation.funding is not None
+        ),
+    )
 
 
 @pytest.mark.asyncio
@@ -187,6 +246,143 @@ async def test_report_filters_primary_and_applied_metrics_and_computes_totals(
             "live_margin_and_liquidation_not_simulated",
         )
     )
+
+
+@pytest.mark.asyncio
+async def test_report_exposes_fixed_liquidity_buckets_and_unknown_blockers(tmp_path) -> None:
+    low = DEFAULT_LOGICAL_AT
+    with PaperRepository(tmp_path / "liquidity-report.db") as repository:
+        await save_measurement_scan(
+            repository, logical_at=low, liquidity="249999.99"
+        )
+        await save_measurement_scan(
+            repository,
+            logical_at=low + timedelta(seconds=60),
+            liquidity="249999.99",
+        )
+        await save_measurement_scan(
+            repository,
+            logical_at=low + timedelta(seconds=120),
+            liquidity="249999.99",
+            blocked=True,
+        )
+        await save_measurement_scan(
+            repository,
+            logical_at=low + timedelta(seconds=180),
+            liquidity="250000",
+        )
+        await save_measurement_scan(
+            repository,
+            logical_at=low + timedelta(seconds=240),
+            liquidity="1000000",
+        )
+        await save_measurement_scan(
+            repository,
+            logical_at=low + timedelta(seconds=300),
+            liquidity="10000000",
+        )
+        await save_measurement_scan(
+            repository,
+            logical_at=low + timedelta(seconds=360),
+            blocked=True,
+        )
+        report = repository.report(as_of=low + timedelta(minutes=10))
+
+    assert tuple(report["liquidity_buckets"]) == LIQUIDITY_BUCKETS
+    assert report["liquidity_conditioned"]["descriptive_only"] is True
+    buckets = report["liquidity_buckets"]
+    assert buckets["< $250k"]["route_observation_count"] == 6
+    assert buckets["< $250k"]["distinct_venue_asset_directions"] == 2
+    assert buckets["< $250k"]["eligible_count"] == 4
+    assert buckets["< $250k"]["opportunity_count"] == 2
+    assert buckets["< $250k"]["eligible_frequency"] == str(D("4") / D("6"))
+    assert buckets["< $250k"]["consecutive_opportunity_duration"][
+        "maximum_seconds"
+    ] == "60.0"
+    assert buckets["< $250k"]["consecutive_opportunity_duration"][
+        "observed_runs"
+    ] == 1
+    assert buckets["$250k–< $1m"]["route_observation_count"] == 2
+    assert buckets["$1m–< $10m"]["route_observation_count"] == 2
+    assert buckets[">= $10m"]["route_observation_count"] == 2
+    assert buckets["UNKNOWN"]["route_observation_count"] == 2
+    assert buckets["UNKNOWN"]["eligible_count"] == 0
+    assert buckets["UNKNOWN"]["blockers"]
+    assert buckets["< $250k"]["planned_maker_net_pnl_usd"]["known_count"] == 4
+    assert buckets["< $250k"]["executable_unwind_net_pnl_usd"]["known_count"] == 4
+    assert buckets["< $250k"]["funding_usd"]["known_count"] == 4
+    assert buckets["< $250k"]["planned_fees_usd"]["known_count"] == 4
+    assert buckets["< $250k"]["spread_slippage_usd"]["total_usd"][
+        "known_count"
+    ] == 4
+    assert buckets["< $250k"]["freshness"]["known_count"] == 6
+    assert buckets["UNKNOWN"]["freshness"]["unknown_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_report_reads_legacy_snapshot_without_new_measurement_fields(tmp_path) -> None:
+    snapshot, _ = await fixture_scan({
+        "scenario": "scan_only",
+        "logical_at": DEFAULT_LOGICAL_AT.isoformat(),
+    })
+    source = snapshot.evaluations[0]
+    legacy_plan = SimpleNamespace(
+        canonical_asset=source.canonical_asset,
+        hedge_venue=source.hedge_venue,
+        direction=source.direction,
+        route=source.route,
+        entry_allowed=True,
+        no_trade_reasons=(),
+    )
+    legacy_snapshot = SimpleNamespace(evaluations=(legacy_plan,))
+    with PaperRepository(tmp_path / "legacy-measurement.db") as repository:
+        repository.connection.execute(
+            "INSERT INTO scanner_snapshots VALUES (?, ?, ?, ?, ?)",
+            (
+                DEFAULT_LOGICAL_AT.isoformat(),
+                1,
+                1,
+                source.canonical_asset,
+                pickle.dumps(legacy_snapshot, protocol=pickle.HIGHEST_PROTOCOL),
+            ),
+        )
+        repository.connection.commit()
+        report = repository.liquidity_conditioned_report(
+            as_of=DEFAULT_LOGICAL_AT + timedelta(minutes=1)
+        )
+
+    bucket = report["buckets"]["$1m–< $10m"]
+    assert bucket["route_observation_count"] == 1
+    assert bucket["eligible_count"] == 1
+    assert bucket["planned_maker_net_pnl_usd"]["sum_usd"] == "UNKNOWN"
+    assert bucket["freshness"]["unknown_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_liquidity_duration_breaks_when_bucket_is_absent_from_a_scan(tmp_path) -> None:
+    with PaperRepository(tmp_path / "liquidity-duration-gap.db") as repository:
+        await save_measurement_scan(
+            repository, logical_at=DEFAULT_LOGICAL_AT, liquidity="249999.99"
+        )
+        await save_measurement_scan(
+            repository,
+            logical_at=DEFAULT_LOGICAL_AT + timedelta(seconds=60),
+            liquidity="250000",
+        )
+        await save_measurement_scan(
+            repository,
+            logical_at=DEFAULT_LOGICAL_AT + timedelta(seconds=120),
+            liquidity="249999.99",
+        )
+        report = repository.liquidity_conditioned_report(
+            as_of=DEFAULT_LOGICAL_AT + timedelta(minutes=5)
+        )
+
+    duration = report["buckets"]["< $250k"][
+        "consecutive_opportunity_duration"
+    ]
+    assert duration["maximum_seconds"] == "0.0"
+    assert duration["observed_runs"] == 2
 
 
 @pytest.mark.asyncio

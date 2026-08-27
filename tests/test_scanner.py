@@ -1,6 +1,7 @@
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+import time
 
 import pytest
 
@@ -311,7 +312,7 @@ def test_negative_net_is_no_trade_and_non_negative_is_allowed() -> None:
 
 
 @pytest.mark.asyncio
-async def test_top_five_assets_route_liquidity_and_twenty_route_cap() -> None:
+async def test_all_assets_are_ranked_without_liquidity_or_route_truncation() -> None:
     observations: list[MarketObservation] = []
     for index, asset in enumerate(("AAA", "BBB", "CCC", "DDD", "EEE", "FFF"), 1):
         liquidity = str(index * 1000)
@@ -321,13 +322,41 @@ async def test_top_five_assets_route_liquidity_and_twenty_route_cap() -> None:
                 observation(Venue.EXTENDED, asset, liquidity=str(index * 2000)),
                 observation(Venue.NADO, asset, liquidity=str(index * 3000)),
             )
-        )
+    )
     snapshot = await scan_once(observations, NOW)
-    assert snapshot.selected_assets == ("FFF", "EEE", "DDD", "CCC", "BBB")
-    assert len(snapshot.ranked_routes) == 20
+    assert snapshot.selected_assets == ("FFF", "EEE", "DDD", "CCC", "BBB", "AAA")
+    assert len(snapshot.ranked_routes) == 24
     assert {route.canonical_asset for route in snapshot.ranked_routes} == set(
         snapshot.selected_assets
     )
     fff = next(route for route in snapshot.ranked_routes if route.canonical_asset == "FFF")
     assert fff.route is not None
     assert fff.route.route_liquidity_usd == D("6000")
+
+
+@pytest.mark.asyncio
+async def test_observed_58_directions_are_bounded_and_unique() -> None:
+    assets = tuple(f"A{index:02d}" for index in range(1, 16))
+    observations: list[MarketObservation] = []
+    for index, asset in enumerate(assets, 1):
+        observations.extend((
+            observation(Venue.RISEX, asset, liquidity=str(index * 1000)),
+            observation(Venue.EXTENDED, asset, liquidity=str(index * 2000)),
+        ))
+        if index <= 14:
+            observations.append(
+                observation(Venue.NADO, asset, liquidity=str(index * 3000))
+            )
+
+    started = time.monotonic()
+    snapshot = await scan_once(observations, NOW)
+    elapsed = time.monotonic() - started
+
+    route_keys = {
+        (plan.canonical_asset, plan.hedge_venue, plan.direction)
+        for plan in snapshot.evaluations
+    }
+    assert len(snapshot.evaluations) == len(snapshot.ranked_routes) == 58
+    assert len(route_keys) == 58
+    assert set(snapshot.selected_assets) == set(assets)
+    assert elapsed < 1
