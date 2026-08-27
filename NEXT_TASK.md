@@ -2,7 +2,7 @@
 
 ## Mainnet public shadow — all-route liquidity measurement
 
-Status: `BLOCKED — ALL-ROUTE PUBLIC REFRESH AND SHUTDOWN`.
+Status: `BLOCKED — EXTENDED STREAM-HEALTH STARVES FULL CADENCE`.
 
 Objective: use the accepted normal paper product against real unauthenticated RISEx, Nado, and Extended mainnet public data, evaluating every currently eligible venue-asset direction in `RISEx ∩ (Extended ∪ Nado)` without Top-5 or fixed route-count truncation. Measure whether opportunity frequency, duration, and conservative economics vary with authoritative route liquidity.
 
@@ -12,17 +12,18 @@ Exact starting point:
 - Two bounded Top-5 public runs on 2026-08-27 ended safely with SQLite integrity `ok`, zero orders/fills/positions/fatal events, and consistently negative planned net PnL. They are preserved as comparison evidence but do not satisfy the all-route window.
 - Current public catalogs observed 15 unique eligible assets in the union: 15 RISEx/Extended pairs and 14 RISEx/Nado pairs, producing 58 directions. This is an observation, not a hard-coded universe; future catalog changes must be reflected dynamically.
 - Accepted all-route preflight on 2026-08-27 evaluated all 58 directions and found two positive VVV/Nado planned routes in `< $250k`; immediate executable unwind for both was negative. The first paper-run then failed before any FULL scan: its deadline was 87.5 seconds late, concurrent public observations timed out for 37–60 seconds across venues, and shutdown required an exact-process force stop after a 30-second SIGTERM bound. Database integrity remained `ok` with zero orders, fills, and positions.
+- Accepted `f856a9931c5fa17e385102038d21ab97b0b582c2` removed that first startup/fan-out blocker. A fresh preflight again covered 58 directions and a new paper-run persisted all 58 startup rows before READY. The first scheduled FULL was then starved by a synchronized Extended disconnect/staleness wave across its 45 per-market book/trade/funding tasks: sequential recovery remained inside the main tick, so no FULL deadline or fail-closed blocker was persisted. Intentional SIGINT still reached durable `STOPPED_SAFE` in 21.25 seconds; integrity is `ok` and orders/fills/positions are zero.
 - Rejected branch `codex/strategy-measurement-foundation` at `300362d840141d9ed599d8189ed1d10801fc5256` is not a candidate and must not be merged or copied. Open a fresh Builder only if observed evidence proves a bounded defect or a measurement field genuinely missing from the accepted paper path.
 
 Allowed scope:
 
 - Public unauthenticated mainnet REST/WebSocket reads from the existing fixed venue adapters.
-- A fresh central Builder from the exact published main may correct only the observed all-route public refresh/startup/shutdown defects. The runtime must reconcile the complete current catalog and subscriptions without a large concurrent REST observation storm, reuse fresh authoritative public stream evidence where valid, bound any necessary REST fallback per venue, preserve precise timeout/stale blockers, and cancel/await in-flight refresh/stream work within a bounded intentional shutdown. Existing route eligibility, exact-size depth/VWAP, economics, lifecycle, Telegram, and fail-closed semantics remain unchanged.
+- A fresh central Builder from the exact published main may correct only the observed Extended stream-health scheduling defect. Health detection/restart work must not block the cadence scheduler: the scheduled FULL must either complete over the entire current universe or persist its existing bounded `PUBLIC_SCAN_BLOCKED` result. Extended book/trade/funding failures must remain fail-closed and recover without unbounded task creation or silent route loss. Existing startup catalog, per-venue REST bound, route eligibility, exact-size depth/VWAP, economics, lifecycle, Telegram, and shutdown semantics remain unchanged.
 - After Chief acceptance, use a fresh isolated paper SQLite database, one preflight `scan-once`, then a bounded 24-hour `paper-run` unless a fail-closed performance/data blocker ends it earlier. Outbound Telegram remains authoritative delivery-only/non-blocking.
 - Existing conservative paper semantics: exact Decimal arithmetic, canonical units, exact-size depth/VWAP, fee and execution PnL, funding timestamps, trade-through maker evidence, data-gap degradation, restart behavior, and `NO_TRADE` as a valid result.
 - Report opportunity count/duration, COMPLETE versus DEGRADED paper lifecycles, planned and executable-unwind net PnL, fee/spread/slippage/funding components, funding source quality, latency/freshness failures, leg-risk proxies, and every assumption or blocker, both overall and in the fixed liquidity buckets.
 - Read-only diagnostics and a fresh Builder correction only when a concrete mainnet-public observation contradicts accepted code. Any candidate requires focused/adverse tests and one clean Python 3.11 full suite on its final SHA.
-- Required regressions cover the observed 58-direction startup, delayed/limited public transports, no REST fan-out storm, complete first FULL scan or precise bounded fail-closed result, deadline accounting, catalog add/remove reconciliation, and bounded SIGTERM-style cancellation with no fabricated scan or transport evidence.
+- Required regressions cover a synchronized 45-task Extended disconnect/staleness wave while the first FULL becomes due, non-blocking/coalesced recovery ownership, complete FULL or precise bounded `PUBLIC_SCAN_BLOCKED`, no fabricated fresh evidence, no task leak, and bounded SIGTERM-style cancellation during recovery.
 
 Forbidden scope:
 
