@@ -939,6 +939,100 @@ class PublicPaperRuntime:
         )
         return row is not None and row.available
 
+    def _extended_transport_gap_kinds(self, symbol: str) -> tuple[str, ...]:
+        """Return Extended sockets already in a physical recovery episode.
+
+        A background refresh must not queue a second REST book/funding fan-out
+        behind a known transport outage.  The existing stream and component
+        gates remain authoritative; this method only identifies an outage that
+        has already been observed and recorded.
+        """
+        gap_kinds: list[str] = []
+        components = self.component_readiness.get(Venue.EXTENDED, {})
+        for kind in ("book", "trade", "funding"):
+            identity = (Venue.EXTENDED, kind, (symbol,))
+            if (
+                identity in self._pending_socket_episodes
+                or identity in self._pending_watchdog_episodes
+            ):
+                gap_kinds.append(kind)
+                continue
+            data_component = "applied_funding" if kind == "funding" else kind
+            rows = (
+                components.get(f"{data_component}:{symbol}"),
+                components.get(f"connection_{kind}:{symbol}"),
+            )
+            if any(
+                row is not None
+                and row.detail.startswith(
+                    (
+                        "PUBLIC_STREAM_DISCONNECTED:",
+                        "PUBLIC_STREAM_CONFIRMATION_STALE:",
+                        "PUBLIC_STREAM_TRANSPORT_GAP",
+                    )
+                )
+                for row in rows
+            ):
+                gap_kinds.append(kind)
+        return tuple(gap_kinds)
+
+    def _preserve_extended_transport_gap_observation(
+        self,
+        market: Any,
+        volume: MarketVolume | None,
+        existing: MarketObservation | None,
+        gap_kinds: tuple[str, ...],
+    ) -> None:
+        """Retain only evidence that is still authoritative during a gap.
+
+        A disconnected Extended stream is already a precise fail-closed
+        condition.  Keep a healthy book only when the book socket itself is
+        healthy; never install a REST snapshot or synthesize a fresh funding
+        quote while the symbol is in transport recovery.
+        """
+        key = (Venue.EXTENDED, market.venue_symbol)
+        at = self.clock.now()
+        stream = self.coordinator.stream(*key)
+        book = stream.book()
+        funding = None if existing is None else existing.funding
+        self.observations[key] = MarketObservation(
+            market,
+            volume,
+            book,
+            funding,
+            stream.health(at),
+            trade_stream_ready=key in self._trade_stream_ready,
+            funding_stream_ready=self._extended_stream_connection_available(
+                market.venue_symbol, "funding"
+            ),
+        )
+        for kind in gap_kinds:
+            data_component = "applied_funding" if kind == "funding" else kind
+            self._set_component_readiness(
+                Venue.EXTENDED,
+                f"{data_component}:{market.venue_symbol}",
+                False,
+                "PUBLIC_STREAM_TRANSPORT_GAP",
+                at,
+            )
+            self._set_component_readiness(
+                Venue.EXTENDED,
+                f"connection_{kind}:{market.venue_symbol}",
+                False,
+                "PUBLIC_STREAM_TRANSPORT_GAP",
+                at,
+            )
+        self._record(
+            "PUBLIC_MARKET_OBSERVATION_DEFERRED",
+            at=at,
+            venue=Venue.EXTENDED,
+            detail={
+                "symbol": market.venue_symbol,
+                "reason": "EXTENDED_STREAM_TRANSPORT_GAP",
+                "components": list(gap_kinds),
+            },
+        )
+
     def _remove_obsolete_components(
         self, venue: Venue, relevant_symbols: set[str], at: datetime
     ) -> None:
@@ -1335,10 +1429,24 @@ class PublicPaperRuntime:
         existing = self.observations.get(key)
         request_started_at = self.clock.now()
         try:
+            if isinstance(adapter, ExtendedAdapter) and background:
+                transport_gap = self._extended_transport_gap_kinds(
+                    market.venue_symbol
+                )
+                if transport_gap:
+                    self._preserve_extended_transport_gap_observation(
+                        market, volume, existing, transport_gap
+                    )
+                    return
             live_health = self.coordinator.stream(*key).health(self.clock.now())
+            live_stream_ready = (
+                key in self._live_book_ready
+                if isinstance(adapter, ExtendedAdapter)
+                else key in self._trade_stream_ready
+            )
             healthy_live = (
                 background
-                and key in self._trade_stream_ready
+                and live_stream_ready
                 and live_health.data_quality is DataQuality.COMPLETE
             )
             preserve_stream_book = healthy_live
