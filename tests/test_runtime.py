@@ -4715,6 +4715,108 @@ async def test_extended_health_wave_coalesces_and_preserves_full_deadline(
 
 
 @pytest.mark.asyncio
+async def test_extended_socket_burst_yields_due_full_tick_during_45_market_wave(
+    tmp_path,
+):
+    clock = FakeClock(NOW)
+    symbols = tuple(f"WAVE-{index:02d}-EXTENDED" for index in range(45))
+    burst_per_socket = 256
+    processed = 0
+    refresh_started_at: list[int] = []
+
+    class BurstSocket:
+        def __init__(self, key):
+            self.key = key
+            self.remaining = burst_per_socket
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            nonlocal processed
+            if self.remaining:
+                self.remaining -= 1
+                processed += 1
+                return SimpleNamespace(type=aiohttp.WSMsgType.PONG, data=None)
+            # Make this bounded wave finish without entering a reconnect loop.
+            runtime._new_stream_session(self.key)
+            raise StopAsyncIteration
+
+        async def ping(self):
+            return None
+
+    class BurstSession:
+        def __init__(self):
+            self.sockets = [
+                BurstSocket((Venue.EXTENDED, symbol, "book"))
+                for symbol in symbols
+            ]
+
+        def ws_connect(self, *_args, **_kwargs):
+            return self.sockets.pop(0)
+
+    with PaperRepository(tmp_path / "extended-burst-cadence.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository,
+            adapters={Venue.EXTENDED: ExtendedAdapter(None)},
+            clock=clock,
+        )
+        runtime._session = BurstSession()
+        runtime._stop_event = asyncio.Event()
+        runtime.last_scan = SimpleNamespace(logical_at=NOW)
+        runtime.next_full_scan_at = NOW
+        runtime.next_health_check_at = NOW + timedelta(hours=1)
+        runtime._startup_gate_satisfied = True
+        runtime.accepting_entries = False
+
+        refresh_gate = asyncio.Event()
+        refresh_owner = None
+
+        def start_refresh():
+            nonlocal refresh_owner
+            refresh_started_at.append(processed)
+            refresh_owner = asyncio.create_task(refresh_gate.wait())
+            runtime._refresh_task = refresh_owner
+
+        runtime._start_public_refresh = start_refresh
+        runtime._start_background_catalog_refresh = lambda **_kwargs: None
+
+        stream_tasks = []
+        for symbol in symbols:
+            key = (Venue.EXTENDED, symbol, "book")
+            session_id = runtime._new_stream_session(key)
+            task = asyncio.create_task(
+                runtime._extended_stream(
+                    runtime.adapters[Venue.EXTENDED], symbol, "book", session_id
+                )
+            )
+            runtime._stream_tasks[key] = task
+            stream_tasks.append(task)
+        tick = asyncio.create_task(runtime.tick(NOW))
+
+        try:
+            await asyncio.gather(*stream_tasks, tick)
+            deadline_count = repository.connection.execute(
+                "SELECT COUNT(*) FROM runtime_evidence "
+                "WHERE event_type='PUBLIC_SCAN_DEADLINE' "
+                "AND json_extract(detail,'$.kind')='full'"
+            ).fetchone()[0]
+            assert deadline_count == 1
+            assert len(refresh_started_at) == 1
+            assert 0 < refresh_started_at[0] < len(symbols) * burst_per_socket
+            assert processed == len(symbols) * burst_per_socket
+        finally:
+            runtime._request_stop("STOP_EVENT")
+            await runtime.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_extended_health_recovery_stop_is_bounded_and_cleans_owner(
     tmp_path,
 ):

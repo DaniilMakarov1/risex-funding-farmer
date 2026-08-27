@@ -4119,6 +4119,10 @@ class PublicPaperRuntime:
                     ))
                     try:
                         async for message in ws:
+                            # A ready WebSocket queue may yield several messages
+                            # without suspending.  Give the cadence and shutdown
+                            # owners a turn before processing each message.
+                            await asyncio.sleep(0)
                             if not self._owns_stream_session(
                                 task_key, stream_session_id
                             ):
