@@ -7,8 +7,8 @@ callable used to prove PREPARED-before-dispatch ordering.
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import sqlite3
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
@@ -47,12 +47,19 @@ FUNDING_APPLIED = "APPLIED"
 FUNDING_SKIPPED_POSITION_NOT_OPEN = "SKIPPED_POSITION_NOT_OPEN"
 FUNDING_SKIPPED_POSITION_CLOSED = "SKIPPED_POSITION_CLOSED"
 FUNDING_UNRESOLVED = "UNRESOLVED"
-FUNDING_STATUSES = {
+# These are the repository's existing normalized settlement statuses; this
+# Nado contract does not invent a venue-specific funding status.
+FUNDING_STATUSES = frozenset({
     FUNDING_APPLIED,
     FUNDING_SKIPPED_POSITION_NOT_OPEN,
     FUNDING_SKIPPED_POSITION_CLOSED,
     FUNDING_UNRESOLVED,
-}
+})
+FUNDING_COMPLETION_STATUSES = frozenset({
+    FUNDING_APPLIED,
+    FUNDING_SKIPPED_POSITION_NOT_OPEN,
+    FUNDING_SKIPPED_POSITION_CLOSED,
+})
 
 # Pinned SDK appendix packing: version=1, order type in bits 9..10,
 # reduce-only in bit 11.
@@ -778,18 +785,18 @@ class FundingRouteBinding:
 
 @dataclass(frozen=True)
 class JournalIdentity:
-    """The exact durable identity of one venue lifecycle journal."""
+    """Immutable pre-dispatch identity of one venue lifecycle journal."""
 
     venue: str
     run_id: str
-    journal_sha256: str
+    store_identity: str
     account_id: str
 
     def assert_contract(self) -> None:
         if self.venue not in {RISEX_VENUE, NADO_VENUE}:
             raise NadoContractError("journal venue is invalid")
         _safe_identifier(self.run_id, "journal run identity")
-        _hash_text(self.journal_sha256, "journal digest")
+        _safe_identifier(self.store_identity, "journal store identity")
         _safe_identifier(self.account_id, "journal account identity")
 
 
@@ -800,6 +807,7 @@ class TerminalEvidence:
     journal: JournalIdentity
     status: str
     observed_at_ms: int
+    journal_content_sha256: str
     zero_regular_orders: bool
     zero_trigger_orders: bool
     exact_flat: bool
@@ -812,6 +820,7 @@ class TerminalEvidence:
         if self.status != COMPLETE:
             raise NadoContractError("terminal evidence is not complete")
         _strict_int(self.observed_at_ms, "terminal evidence timestamp", positive=True)
+        _hash_text(self.journal_content_sha256, "terminal journal content digest")
         if (
             self.zero_regular_orders is not True
             or self.zero_trigger_orders is not True
@@ -862,7 +871,7 @@ def _journal_payload(journal: JournalIdentity) -> dict[str, object]:
     return {
         "venue": journal.venue,
         "run_id": journal.run_id,
-        "journal_sha256": _hash_text(journal.journal_sha256, "journal digest"),
+        "store_identity": journal.store_identity,
         "account_id": journal.account_id,
     }
 
@@ -872,6 +881,10 @@ def _terminal_payload(evidence: TerminalEvidence) -> dict[str, object]:
         "journal": _journal_payload(evidence.journal),
         "status": evidence.status,
         "observed_at_ms": evidence.observed_at_ms,
+        "journal_content_sha256": _hash_text(
+            evidence.journal_content_sha256,
+            "terminal journal content digest",
+        ),
         "zero_regular_orders": evidence.zero_regular_orders,
         "zero_trigger_orders": evidence.zero_trigger_orders,
         "exact_flat": evidence.exact_flat,
@@ -1083,6 +1096,8 @@ class NadoFundingBoundaryResult:
     status: str
     rate_x18: int
     cash_x18: int
+    completion_eligible: bool
+    blocked: bool
 
 
 def validate_nado_funding_boundary(
@@ -1133,8 +1148,6 @@ def validate_nado_funding_boundary(
         != route.canonical_quantity
     ):
         raise NadoContractError("Nado funding event is not the persisted market settlement")
-    if event.status != FUNDING_APPLIED:
-        raise NadoContractError("Nado applied funding event is unresolved or skipped")
     if (
         account_funding.event_id != event.event_id
         or account_funding.product_id != event.product_id
@@ -1153,6 +1166,16 @@ def validate_nado_funding_boundary(
         raise NadoContractError(
             "Nado account funding does not agree with the authoritative event"
         )
+    if (
+        event.status in {
+            FUNDING_SKIPPED_POSITION_NOT_OPEN,
+            FUNDING_SKIPPED_POSITION_CLOSED,
+        }
+        and event.cash_x18 != 0
+    ):
+        raise NadoContractError(
+            "skipped Nado funding event has nonzero applied cash"
+        )
     return NadoFundingBoundaryResult(
         event.event_id,
         event.market,
@@ -1160,6 +1183,8 @@ def validate_nado_funding_boundary(
         event.status,
         event.rate_x18,
         event.cash_x18,
+        event.status in FUNDING_COMPLETION_STATUSES,
+        event.status == FUNDING_UNRESOLVED,
     )
 
 
@@ -1214,10 +1239,10 @@ def _route_from_payload(value: object) -> FundingRouteBinding:
 
 def _journal_from_payload(value: object) -> JournalIdentity:
     payload = _mapping_payload(
-        value, "journal", {"venue", "run_id", "journal_sha256", "account_id"}
+        value, "journal", {"venue", "run_id", "store_identity", "account_id"}
     )
     journal = JournalIdentity(
-        payload["venue"], payload["run_id"], payload["journal_sha256"],
+        payload["venue"], payload["run_id"], payload["store_identity"],
         payload["account_id"],
     )
     journal.assert_contract()
@@ -1231,7 +1256,7 @@ def _terminal_from_payload(value: object) -> TerminalEvidence:
         {
             "journal", "status", "observed_at_ms", "zero_regular_orders",
             "zero_trigger_orders", "exact_flat", "unresolved_write_identities",
-            "authoritative", "evidence_digest",
+            "authoritative", "journal_content_sha256", "evidence_digest",
         },
     )
     unresolved = payload["unresolved_write_identities"]
@@ -1239,7 +1264,8 @@ def _terminal_from_payload(value: object) -> TerminalEvidence:
         raise NadoContractError("terminal evidence persistence schema is invalid")
     evidence = TerminalEvidence(
         _journal_from_payload(payload["journal"]), payload["status"],
-        payload["observed_at_ms"], payload["zero_regular_orders"],
+        payload["observed_at_ms"], payload["journal_content_sha256"],
+        payload["zero_regular_orders"],
         payload["zero_trigger_orders"], payload["exact_flat"],
         tuple(unresolved), payload["evidence_digest"], payload["authoritative"],
     )
@@ -1804,6 +1830,10 @@ class IntentStore:
                             "persisted funding boundary identity is immutable"
                         )
                     return
+                if self.intents():
+                    raise NadoContractError(
+                        "funding boundary must be bound before intent preparation"
+                    )
                 if self.lifecycle_status() != RUNNING:
                     raise NadoContractError("funding boundary requires a running lifecycle")
                 self._connection.execute(
@@ -1839,7 +1869,10 @@ class IntentStore:
             if canonical_payload(_funding_boundary_payload(binding)) != encoded:
                 raise NadoContractError("persisted funding boundary is not canonical")
             return binding
-        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        except (
+            KeyError, UnicodeDecodeError, json.JSONDecodeError,
+            InvalidOperation, TypeError, ValueError,
+        ):
             raise NadoContractError("persisted funding boundary is invalid") from None
 
     def record_nado_funding_boundary(
@@ -1877,6 +1910,8 @@ class IntentStore:
                         raise NadoContractError(
                             "persisted funding evidence contradicts the first observation"
                         )
+                    if result.blocked:
+                        self.halt()
                     return result
                 if self.lifecycle_status() != RUNNING:
                     raise NadoContractError(
@@ -1887,6 +1922,11 @@ class IntentStore:
                     "(singleton, evidence_json, evidence_digest) VALUES (1, ?, ?)",
                     (encoded, digest),
                 )
+                if result.blocked:
+                    self._connection.execute(
+                        "UPDATE nado_lifecycle_state SET status = 'HALTED' "
+                        "WHERE singleton = 1 AND status != 'COMPLETE'"
+                    )
             return result
         except NadoContractError:
             self.halt()
@@ -1914,7 +1954,10 @@ class IntentStore:
             if canonical_payload(_funding_evidence_payload(*evidence)) != encoded:
                 raise NadoContractError("persisted funding evidence is not canonical")
             return evidence
-        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        except (
+            KeyError, UnicodeDecodeError, json.JSONDecodeError,
+            InvalidOperation, TypeError, ValueError,
+        ):
             raise NadoContractError("persisted funding evidence is invalid") from None
 
     def prepare_then_fixture_dispatch(
@@ -2428,9 +2471,12 @@ class LifecycleCore:
         validation_product_id: int,
         validation_valid: bool,
         now_ms: int,
+        direction: str = LONG,
     ) -> OrderIntent:
         if order.appendix not in {POST_ONLY_APPENDIX, IOC_APPENDIX}:
             raise NadoContractError("entry must use an accepted bounded order type")
+        if direction not in {LONG, SHORT}:
+            raise NadoContractError("entry direction is invalid")
         expected_sender = encode_subaccount(account.owner, account.subaccount_name)
         if (
             order.sender.lower() != expected_sender.lower()
@@ -2454,7 +2500,8 @@ class LifecycleCore:
             worst_close_price_x18=worst_close_price_x18,
             now_ms=now_ms,
         )
-        if order.amount_x18 != plan.amount_x18:
+        expected_amount = plan.amount_x18 if direction == LONG else -plan.amount_x18
+        if order.amount_x18 != expected_amount:
             raise NadoContractError("entry amount is not the preflight minimum")
         intent = OrderIntent(
             kind=ENTRY,
@@ -2596,6 +2643,7 @@ def completion_barrier(
     catalog: CatalogSnapshot,
     evidence: EngineEvidence,
     now_ms: int,
+    mark_complete: bool = True,
 ) -> bool:
     if store.lifecycle_status() != RUNNING:
         return False
@@ -2664,8 +2712,9 @@ def completion_barrier(
     for intent, state in intents:
         if state != "RECONCILED" or now_ms <= intent.recv_time:
             return False
-    try:
-        store._mark_complete()
-    except NadoContractError:
-        return False
+    if mark_complete:
+        try:
+            store._mark_complete()
+        except NadoContractError:
+            return False
     return True

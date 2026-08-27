@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import brotli
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 import hashlib
 import http.client
 import json
@@ -43,9 +44,12 @@ from .nado_testnet_lifecycle import (
     ACTIVE_PERP, CANCEL_ALL, CLOSE, COMPLETE, ENTRY,
     EXECUTE_RESPONSE_AMBIGUITY, EXECUTE_TRANSPORT_AMBIGUITY,
     EXECUTE_VENUE_REJECTION, IOC_APPENDIX, MAX_CLOSE_ATTEMPTS, UINT32_MAX,
-    AccountSnapshot, CatalogSnapshot, EngineEvidence, IntentStore,
-    ExecuteFailure, LifecycleCore, NadoContractError, OrderEvidence, OrderIntent,
-    Product, Reconciliation,
+    LONG, NADO_VENUE, RISEX_VENUE, SHORT,
+    AccountSnapshot, CatalogSnapshot, CrossRunAttestation, EngineEvidence,
+    FundingBoundaryBinding, FundingRouteBinding, IntentStore, ExecuteFailure,
+    JournalIdentity, LifecycleCore, NadoAccountFunding, NadoContractError,
+    NadoFundingEvent, OrderEvidence, OrderIntent,
+    Product, Reconciliation, TerminalEvidence,
     SyntheticOrderVector, TriggerSnapshot, build_order_nonce,
     completion_barrier, order_digest, smallest_executable_amount,
     validate_entry_preflight,
@@ -134,6 +138,43 @@ class OperationalReport:
         }
 
 
+@dataclass(frozen=True)
+class FundingBoundaryReport:
+    """Sanitized report for the Nado leg of one funding-boundary route."""
+
+    schema_version: int
+    status: str
+    run_tag: str
+    writes: int
+    close_attempts: int
+    funding_status: str | None
+    funding_rate_x18: int | None
+    funding_cash_x18: int | None
+    final_rounds_agree: bool
+    final_zero_regular: bool
+    final_zero_trigger: bool
+    final_exact_flat: bool
+    reason: str | None = None
+
+    def sanitized(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "status": self.status,
+            "run_tag": self.run_tag,
+            "writes": self.writes,
+            "close_attempts": self.close_attempts,
+            "funding_status": self.funding_status,
+            "funding_rate_x18": self.funding_rate_x18,
+            "funding_cash_x18": self.funding_cash_x18,
+            "final_rounds_agree": self.final_rounds_agree,
+            "final_zero_regular": self.final_zero_regular,
+            "final_zero_trigger": self.final_zero_trigger,
+            "final_exact_flat": self.final_exact_flat,
+            "reason": self.reason,
+            "path": REDACTED_STORE_PATH,
+        }
+
+
 _RUNTIME_FAILURE_CLASSES = frozenset(FAILURE_CLASSES) | frozenset({
     EXECUTE_RESPONSE_AMBIGUITY,
     EXECUTE_TRANSPORT_AMBIGUITY,
@@ -146,7 +187,7 @@ _RUNTIME_STAGES = frozenset({
     "ENTRY_PREFLIGHT", "ENTRY_SIGNATURE", "ENTRY_VALIDATION",
     "ENTRY_PREPARATION", "DISPATCH", "RECONCILIATION",
     "CANCEL_PREPARATION", "CLOSE_PREPARATION", "FINAL_BARRIER",
-    "RUNNER_STARTUP", "OUTER",
+    "FUNDING_BOUNDARY", "RUNNER_STARTUP", "OUTER",
 })
 
 
@@ -195,6 +236,23 @@ class VenueIO(Protocol):
     def observe(self, digests: tuple[str, ...]) -> LiveObservation: ...
     def validate_order(self, order: SyntheticOrderVector, signature: str) -> bool: ...
     def dispatch(self, intent: OrderIntent, signature: str) -> str: ...
+
+
+class FundingBoundaryVenueIO(VenueIO, Protocol):
+    """Nado IO extension for exact, fixture-injected funding observations."""
+
+    def await_funding_boundary(self, binding: FundingBoundaryBinding) -> None: ...
+
+    def read_funding_boundary(
+        self, binding: FundingBoundaryBinding,
+    ) -> tuple[NadoFundingEvent | None, NadoAccountFunding | None]: ...
+
+    def final_attestation(
+        self,
+        binding: FundingBoundaryBinding,
+        observation: LiveObservation,
+        round_index: int,
+    ) -> CrossRunAttestation | None: ...
 
 
 class RuntimeRunJournal:
@@ -333,6 +391,16 @@ def _fsync(path: Path) -> None:
         os.close(directory)
 
 
+def _journal_store_identity(path: Path) -> str:
+    """Return a non-secret identity for the protected path and schema."""
+    try:
+        resolved = Path(path).resolve()
+        material = f"nado-level-c-v1:{resolved}".encode("utf-8")
+    except (OSError, UnicodeError):
+        raise OperationalSafetyError("operational journal identity unavailable") from None
+    return "nado-level-c-v1-" + hashlib.sha256(material).hexdigest()
+
+
 class OwnerOrderCapability:
     """Opaque owner key handle restricted to already-prepared Nado digests."""
 
@@ -403,7 +471,29 @@ def _salt() -> int:
     return secrets.randbelow(2**20)
 
 
-def _entry_order(observation: LiveObservation, owner: str, sender: str, recv: int) -> SyntheticOrderVector:
+def _canonical_quantity_x18(value: object) -> int:
+    if isinstance(value, bool) or isinstance(value, float) or not isinstance(
+        value, (str, int, Decimal)
+    ):
+        raise OperationalSafetyError("funding quantity is not exact")
+    try:
+        scaled = Decimal(str(value)) * Decimal(10**18)
+    except (InvalidOperation, ValueError):
+        raise OperationalSafetyError("funding quantity is not exact") from None
+    if not scaled.is_finite() or scaled <= 0 or scaled != scaled.to_integral_value():
+        raise OperationalSafetyError("funding quantity is not an exact x18 amount")
+    return int(scaled)
+
+
+def _entry_order(
+    observation: LiveObservation,
+    owner: str,
+    sender: str,
+    recv: int,
+    *,
+    direction: str = LONG,
+    expected_amount_x18: int | None = None,
+) -> SyntheticOrderVector:
     product = observation.product
     if (
         product.product_id != TARGET_PRODUCT_ID
@@ -414,15 +504,27 @@ def _entry_order(observation: LiveObservation, owner: str, sender: str, recv: in
     bid, ask = observation.bid_x18, observation.ask_x18
     if bid <= 0 or ask <= bid or bid % product.tick_x18 or ask % product.tick_x18:
         raise OperationalSafetyError("fresh non-crossed tick-aligned BBO required")
+    if direction not in {LONG, SHORT}:
+        raise OperationalSafetyError("funding route direction is invalid")
     salt = _salt()
     amount = smallest_executable_amount(product, prices_x18=(bid, ask))
-    buffered_ask = (ask * 110 + 99) // 100
-    price = (
-        (buffered_ask + product.tick_x18 - 1) // product.tick_x18
-    ) * product.tick_x18
+    if expected_amount_x18 is not None and amount != expected_amount_x18:
+        raise OperationalSafetyError("funding route quantity differs from executable amount")
+    if direction == LONG:
+        buffered_ask = (ask * 110 + 99) // 100
+        price = (
+            (buffered_ask + product.tick_x18 - 1) // product.tick_x18
+        ) * product.tick_x18
+        signed_amount = amount
+    else:
+        buffered_bid = (bid * 90) // 100
+        price = (buffered_bid // product.tick_x18) * product.tick_x18
+        if price <= 0:
+            raise OperationalSafetyError("funding short entry price is invalid")
+        signed_amount = -amount
     return SyntheticOrderVector(
         owner, SUBACCOUNT_NAME, sender, TARGET_PRODUCT_ID, price,
-        amount, UINT32_MAX, recv, salt,
+        signed_amount, UINT32_MAX, recv, salt,
         build_order_nonce(recv, salt), IOC_APPENDIX,
     )
 
@@ -433,6 +535,20 @@ def _terminal_flags(observation: LiveObservation) -> tuple[bool, bool, bool]:
     trigger = not observation.evidence.triggers.active_digests
     flat = not any(account.cross_perp_amounts_x18.values()) and not account.isolated_positions
     return regular, trigger, flat
+
+
+def _terminal_fingerprint(evidence: TerminalEvidence) -> tuple[object, ...]:
+    """Compare final rounds while allowing their observation timestamps to differ."""
+    return (
+        evidence.journal,
+        evidence.status,
+        evidence.journal_content_sha256,
+        evidence.zero_regular_orders,
+        evidence.zero_trigger_orders,
+        evidence.exact_flat,
+        evidence.unresolved_write_identities,
+        evidence.authoritative,
+    )
 
 
 class SealedLifecycleRunner:
@@ -526,20 +642,50 @@ class SealedLifecycleRunner:
         return result, observed
 
     def run(self) -> OperationalReport:
+        return self._run_order_lifecycle()
+
+    def _run_order_lifecycle(
+        self,
+        *,
+        route: FundingRouteBinding | None = None,
+        before_close: Callable[[LiveObservation], None] | None = None,
+        finalizer: Callable[[tuple[LiveObservation, ...]], object] | None = None,
+    ) -> OperationalReport | object:
         if self.store.intents() or self.store.lifecycle_status() != "RUNNING":
             raise OperationalSafetyError("existing lifecycle requires manual recovery")
+        entry_direction = LONG
+        expected_amount_x18: int | None = None
+        if route is not None:
+            route.assert_contract()
+            if (
+                route.nado_product_id != TARGET_PRODUCT_ID
+                or route.nado_leg.market != TARGET_TICKER_ID
+            ):
+                raise OperationalSafetyError("funding route target product identity unavailable")
+            entry_direction = route.nado_leg.direction
+            expected_amount_x18 = _canonical_quantity_x18(route.canonical_quantity)
         self.stage = "LIVE_OBSERVATION"
         initial = self._observe()
         issued_at = self.io.now_ms()
         recv = issued_at + RECV_WINDOW_MS
         self.stage = "ORDER_DERIVATION"
-        order = _entry_order(initial, self.owner, self.sender, recv)
+        order = _entry_order(
+            initial,
+            self.owner,
+            self.sender,
+            recv,
+            direction=entry_direction,
+            expected_amount_x18=expected_amount_x18,
+        )
+        worst_close_price = (
+            initial.bid_x18 if entry_direction == LONG else initial.ask_x18
+        )
         self.stage = "ENTRY_PREFLIGHT"
         validate_entry_preflight(
             catalog=initial.catalog, account=initial.evidence.account,
             triggers=initial.evidence.triggers, product_id=TARGET_PRODUCT_ID,
             entry_price_x18=order.price_x18,
-            worst_close_price_x18=initial.bid_x18, now_ms=issued_at,
+            worst_close_price_x18=worst_close_price, now_ms=issued_at,
         )
         self.stage = "ENTRY_SIGNATURE"
         capability = self.capability_loader(self.owner)
@@ -559,9 +705,9 @@ class SealedLifecycleRunner:
         entry = self.core.prepare_entry(
             order=order, catalog=initial.catalog, account=initial.evidence.account,
             triggers=initial.evidence.triggers,
-            worst_close_price_x18=initial.bid_x18, signature=signature,
+            worst_close_price_x18=worst_close_price, signature=signature,
             validation_product_id=order.product_id, validation_valid=valid,
-            now_ms=issued_at,
+            now_ms=issued_at, direction=entry_direction,
         )
         self.stage = "DISPATCH"
         self._dispatch(entry)
@@ -585,6 +731,9 @@ class SealedLifecycleRunner:
             outcome, observed = self._reconcile(entry)
         if outcome not in {Reconciliation.FILLED, Reconciliation.CANCELLED, Reconciliation.EXPIRED}:
             raise OperationalSafetyError("entry outcome requires manual recovery")
+        if before_close is not None:
+            self.stage = "FUNDING_BOUNDARY"
+            before_close(observed)
         while any(observed.evidence.account.cross_perp_amounts_x18.values()):
             if self.store.count_kind(CLOSE) >= MAX_CLOSE_ATTEMPTS:
                 self.store.halt()
@@ -595,7 +744,9 @@ class SealedLifecycleRunner:
             close = self.core.prepare_close(
                 catalog=observed.catalog, product=observed.product,
                 account=observed.evidence.account, triggers=observed.evidence.triggers,
-                worst_price_x18=observed.bid_x18, recv_time=recv, salt=_salt(),
+                worst_price_x18=(
+                    observed.bid_x18 if entry_direction == LONG else observed.ask_x18
+                ), recv_time=recv, salt=_salt(),
                 now_ms=issued_at,
             )
             self.stage = "DISPATCH"
@@ -609,6 +760,21 @@ class SealedLifecycleRunner:
             }:
                 raise OperationalSafetyError("close outcome unresolved")
         self.stage = "FINAL_BARRIER"
+        if finalizer is not None:
+            finals: list[LiveObservation] = []
+            for _ in range(2):
+                final = self._observe()
+                complete = completion_barrier(
+                    store=self.store, catalog=final.catalog, evidence=final.evidence,
+                    now_ms=self.io.now_ms(), mark_complete=False,
+                )
+                regular, trigger, flat = _terminal_flags(final)
+                if not complete or not (regular and trigger and flat):
+                    raise OperationalSafetyError(
+                        "terminal zero-order exact-flat barrier failed"
+                    )
+                finals.append(final)
+            return finalizer(tuple(finals))
         final = self._observe()
         complete = completion_barrier(
             store=self.store, catalog=final.catalog, evidence=final.evidence,
@@ -621,6 +787,130 @@ class SealedLifecycleRunner:
             1, COMPLETE, hashlib.sha256(self.run_id.encode()).hexdigest()[:16],
             self.writes, self.store.count_kind(CLOSE), regular, trigger, flat,
         )
+
+
+class SealedFundingBoundaryRunner(SealedLifecycleRunner):
+    """Nado order runner that consumes an exact cross-run funding contract."""
+
+    def __init__(
+        self,
+        *,
+        store: IntentStore,
+        journal: RuntimeRunJournal,
+        io: FundingBoundaryVenueIO,
+        capability_loader: Callable[[str], OwnerOrderCapability],
+        owner: str,
+        sender: str,
+        route: FundingRouteBinding,
+        risex_journal: JournalIdentity,
+    ) -> None:
+        try:
+            route.assert_contract()
+            risex_journal.assert_contract()
+            if risex_journal.venue != RISEX_VENUE:
+                raise NadoContractError("funding counterpart journal is not RISEx")
+        except NadoContractError:
+            raise OperationalSafetyError("funding boundary contract rejected") from None
+        if any(
+            not callable(getattr(io, method, None))
+            for method in (
+                "await_funding_boundary",
+                "read_funding_boundary",
+                "final_attestation",
+            )
+        ):
+            raise OperationalSafetyError("funding boundary adapter unavailable")
+        super().__init__(
+            store=store, journal=journal, io=io,
+            capability_loader=capability_loader, owner=owner, sender=sender,
+        )
+        nado_journal = JournalIdentity(
+            NADO_VENUE,
+            self.run_id,
+            _journal_store_identity(self.journal.path),
+            self.sender,
+        )
+        try:
+            self.funding_binding = FundingBoundaryBinding(
+                route, risex_journal, nado_journal,
+            )
+            self.funding_binding.assert_contract()
+            self.store.bind_funding_boundary(self.funding_binding)
+        except BaseException:
+            self.store.halt()
+            try:
+                self.journal.terminalize(self.run_id, "SAFETY", "RUNNER_STARTUP")
+            except BaseException:
+                pass
+            raise
+        self.funding_io = io
+        self.funding_event: NadoFundingEvent | None = None
+        self.account_funding: NadoAccountFunding | None = None
+
+    def _await_and_read_funding(self, _observed: LiveObservation) -> None:
+        self.funding_io.await_funding_boundary(self.funding_binding)
+        self.funding_event, self.account_funding = (
+            self.funding_io.read_funding_boundary(self.funding_binding)
+        )
+
+    def _finalize_funding(
+        self, finals: tuple[LiveObservation, ...],
+    ) -> FundingBoundaryReport:
+        if len(finals) != 2:
+            raise OperationalSafetyError("two final funding rounds are required")
+        attestations: list[CrossRunAttestation] = []
+        for round_index, observation in enumerate(finals, start=1):
+            attestation = self.funding_io.final_attestation(
+                self.funding_binding, observation, round_index,
+            )
+            if attestation is None:
+                raise NadoContractError("final funding attestation is incomplete")
+            attestation.assert_contract()
+            attestations.append(attestation)
+        first, second = attestations
+        if (
+            first.route != second.route
+            or first.risex_journal != second.risex_journal
+            or first.nado_journal != second.nado_journal
+            or _terminal_fingerprint(first.risex_terminal)
+            != _terminal_fingerprint(second.risex_terminal)
+            or _terminal_fingerprint(first.nado_terminal)
+            != _terminal_fingerprint(second.nado_terminal)
+        ):
+            raise NadoContractError("final funding terminal rounds disagree")
+        result = self.store.record_nado_funding_boundary(
+            attestation=second,
+            event=self.funding_event,
+            account_funding=self.account_funding,
+        )
+        regular, trigger, flat = _terminal_flags(finals[-1])
+        if result.completion_eligible:
+            self.store._mark_complete()
+        return FundingBoundaryReport(
+            1,
+            COMPLETE if result.completion_eligible else "BLOCKED",
+            hashlib.sha256(self.run_id.encode()).hexdigest()[:16],
+            self.writes,
+            self.store.count_kind(CLOSE),
+            result.status,
+            result.rate_x18,
+            result.cash_x18,
+            True,
+            regular,
+            trigger,
+            flat,
+            None if result.completion_eligible else result.status,
+        )
+
+    def run(self) -> FundingBoundaryReport:
+        result = self._run_order_lifecycle(
+            route=self.funding_binding.route,
+            before_close=self._await_and_read_funding,
+            finalizer=self._finalize_funding,
+        )
+        if not isinstance(result, FundingBoundaryReport):
+            raise OperationalSafetyError("funding boundary report was not produced")
+        return result
 
 
 def _latest_execute_failure(
@@ -686,6 +976,127 @@ def _fixture_run(
             raise
     finally:
         store.close()
+
+
+def _blocked_funding_report(
+    runner: SealedFundingBoundaryRunner, reason: str,
+) -> FundingBoundaryReport:
+    return FundingBoundaryReport(
+        1,
+        "BLOCKED",
+        hashlib.sha256(runner.run_id.encode()).hexdigest()[:16],
+        runner.writes,
+        runner.store.count_kind(CLOSE),
+        None,
+        None,
+        None,
+        False,
+        False,
+        False,
+        False,
+        reason,
+    )
+
+
+def _run_funding_boundary_fixture_or_operational(
+    *,
+    path: Path,
+    io: FundingBoundaryVenueIO,
+    capability_loader: Callable[[str], OwnerOrderCapability],
+    owner: str,
+    sender: str,
+    route: FundingRouteBinding,
+    risex_journal: JournalIdentity,
+    private_read: bool,
+) -> FundingBoundaryReport:
+    _prepare_file(path)
+    store = IntentStore(path)
+    try:
+        try:
+            setattr(io, "store", store)
+        except BaseException:
+            pass
+        runner: SealedFundingBoundaryRunner | None = None
+        try:
+            runner = SealedFundingBoundaryRunner(
+                store=store,
+                journal=RuntimeRunJournal(path),
+                io=io,
+                capability_loader=capability_loader,
+                owner=owner,
+                sender=sender,
+                route=route,
+                risex_journal=risex_journal,
+            )
+            if private_read:
+                runner.stage = "PRIVATE_READ_BARRIER"
+                preflight = asyncio.run(_accepted_private_read())
+                if preflight.get("status") != "FINALIZED":
+                    raise DurableOperationalFailure(
+                        _report_failure_class(preflight), "PRIVATE_READ_BARRIER",
+                    )
+            report = runner.run()
+            if report.status == "BLOCKED":
+                runner.terminalize("SAFETY", "FINAL_BARRIER")
+            return report
+        except BaseException as error:
+            if runner is None:
+                try:
+                    store.halt()
+                except BaseException:
+                    pass
+                return FundingBoundaryReport(
+                    1, "BLOCKED", "UNBOUND", 0, 0, None, None, None,
+                    False, False, False, False, _failure_class(error),
+                )
+            failure_class, _persisted_execute = _persist_runner_failure(runner, error)
+            return _blocked_funding_report(runner, failure_class)
+    finally:
+        store.close()
+
+
+def _fixture_funding_boundary_run(
+    *,
+    path: Path,
+    io: FundingBoundaryVenueIO,
+    capability_loader: Callable[[str], OwnerOrderCapability],
+    owner: str,
+    sender: str,
+    route: FundingRouteBinding,
+    risex_journal: JournalIdentity,
+) -> FundingBoundaryReport:
+    """Run the full funding contract against an injected fixture IO only."""
+    return _run_funding_boundary_fixture_or_operational(
+        path=path,
+        io=io,
+        capability_loader=capability_loader,
+        owner=owner,
+        sender=sender,
+        route=route,
+        risex_journal=risex_journal,
+        private_read=False,
+    )
+
+
+def run_funding_boundary(
+    *,
+    route: FundingRouteBinding,
+    risex_journal: JournalIdentity,
+    io: FundingBoundaryVenueIO,
+) -> dict[str, object]:
+    """Run one production Nado funding-boundary route with fixed credentials."""
+    owner, sender = _strict_identity()
+    report = _run_funding_boundary_fixture_or_operational(
+        path=_production_store_path(),
+        io=io,
+        capability_loader=_load_capability,
+        owner=owner,
+        sender=sender,
+        route=route,
+        risex_journal=risex_journal,
+        private_read=True,
+    )
+    return report.sanitized()
 
 
 def run() -> dict[str, object]:

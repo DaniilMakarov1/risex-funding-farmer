@@ -9,6 +9,8 @@ import pytest
 from risex_farmer.nado_testnet_lifecycle import (
     COMPLETE,
     FUNDING_APPLIED,
+    FUNDING_SKIPPED_POSITION_CLOSED,
+    FUNDING_SKIPPED_POSITION_NOT_OPEN,
     FUNDING_UNRESOLVED,
     LONG,
     NADO_VENUE,
@@ -35,11 +37,11 @@ from risex_farmer.nado_testnet_lifecycle import (
 OWNER = "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf"
 NADO_ACCOUNT = OWNER + "64656661756c740000000000"
 RISEx_JOURNAL = JournalIdentity(
-    RISEX_VENUE, "risex-run-20260828-a", "0x" + "11" * 32,
+    RISEX_VENUE, "risex-run-20260828-a", "risex-store-v1-immutable",
     "risex-primary-account",
 )
 NADO_JOURNAL = JournalIdentity(
-    NADO_VENUE, "nado-run-20260828-a", "0x" + "22" * 32, NADO_ACCOUNT,
+    NADO_VENUE, "nado-run-20260828-a", "nado-store-v1-immutable", NADO_ACCOUNT,
 )
 SETTLEMENT = 1_700_003_600_000
 
@@ -49,6 +51,7 @@ def _terminal(journal: JournalIdentity) -> TerminalEvidence:
         journal=journal,
         status=COMPLETE,
         observed_at_ms=SETTLEMENT + 1_000,
+        journal_content_sha256="0x" + "33" * 32,
         zero_regular_orders=True,
         zero_trigger_orders=True,
         exact_flat=True,
@@ -168,6 +171,35 @@ def test_funding_boundary_accepts_exact_opposite_route_and_account_event_match()
     assert result.status == FUNDING_APPLIED
     assert result.cash_x18 == 0
     assert result.rate_x18 == event.rate_x18
+    assert result.completion_eligible is True
+    assert result.blocked is False
+
+
+def test_terminal_content_digest_is_final_evidence_and_not_prebound_identity() -> None:
+    binding, attestation, event, account = _valid_evidence()
+
+    assert binding.nado_journal.store_identity == "nado-store-v1-immutable"
+    assert attestation.nado_terminal.journal == binding.nado_journal
+    assert attestation.nado_terminal.journal_content_sha256 != "0x" + "22" * 32
+    changed_terminal = replace(
+        attestation.nado_terminal,
+        journal_content_sha256="0x" + "44" * 32,
+    )
+    changed_terminal = replace(
+        changed_terminal,
+        evidence_digest="0x" + terminal_evidence_digest(changed_terminal),
+    )
+    changed_unsigned = replace(attestation, nado_terminal=changed_terminal)
+    changed_attestation = replace(
+        changed_unsigned,
+        attestation_digest="0x" + cross_run_attestation_digest(changed_unsigned),
+    )
+    assert validate_nado_funding_boundary(
+        binding=binding,
+        attestation=changed_attestation,
+        event=event,
+        account_funding=account,
+    ).status == FUNDING_APPLIED
 
 
 @pytest.mark.parametrize(
@@ -269,7 +301,7 @@ def test_funding_event_must_match_persisted_market_and_settlement(
     assert valid_event.market == "ETH-PERP_USDT0"
 
 
-def test_missing_or_unresolved_funding_is_not_treated_as_zero() -> None:
+def test_missing_funding_is_not_treated_as_zero() -> None:
     binding, attestation, event, account = _valid_evidence()
     with pytest.raises(NadoContractError, match="incomplete"):
         validate_nado_funding_boundary(
@@ -281,12 +313,53 @@ def test_missing_or_unresolved_funding_is_not_treated_as_zero() -> None:
 
     unresolved_event = _event(binding, status=FUNDING_UNRESOLVED)
     unresolved_account = _account(binding, unresolved_event, status=FUNDING_UNRESOLVED)
-    with pytest.raises(NadoContractError, match="unresolved or skipped"):
+    result = validate_nado_funding_boundary(
+        binding=binding,
+        attestation=attestation,
+        event=unresolved_event,
+        account_funding=unresolved_account,
+    )
+    assert result.status == FUNDING_UNRESOLVED
+    assert result.cash_x18 == 0
+    assert result.completion_eligible is False
+    assert result.blocked is True
+
+
+@pytest.mark.parametrize(
+    "status",
+    [FUNDING_SKIPPED_POSITION_NOT_OPEN, FUNDING_SKIPPED_POSITION_CLOSED],
+)
+def test_exact_skipped_funding_is_retained_as_non_accrual_not_zero(
+    status: str,
+) -> None:
+    binding, attestation, _, _ = _valid_evidence()
+    event = _event(binding, status=status)
+    account = _account(binding, event, status=status)
+
+    result = validate_nado_funding_boundary(
+        binding=binding,
+        attestation=attestation,
+        event=event,
+        account_funding=account,
+    )
+
+    assert result.status == status
+    assert result.cash_x18 == 0
+    assert result.completion_eligible is True
+    assert result.blocked is False
+
+
+def test_skipped_funding_with_applied_cash_is_contradictory() -> None:
+    binding, attestation, _, _ = _valid_evidence()
+    event = _event(binding, status=FUNDING_SKIPPED_POSITION_NOT_OPEN, cash_x18=1)
+    account = _account(binding, event)
+
+    with pytest.raises(NadoContractError, match="nonzero applied cash"):
         validate_nado_funding_boundary(
             binding=binding,
             attestation=attestation,
-            event=unresolved_event,
-            account_funding=unresolved_account,
+            event=event,
+            account_funding=account,
         )
 
 
@@ -345,6 +418,48 @@ def test_funding_binding_and_evidence_are_immutable_across_restart(tmp_path: Pat
         assert reopened.lifecycle_status() == "HALTED"
     finally:
         reopened.close()
+
+
+def test_unresolved_funding_is_durable_and_blocks_the_lifecycle(tmp_path: Path) -> None:
+    binding, attestation, _, _ = _valid_evidence()
+    event = _event(binding, status=FUNDING_UNRESOLVED)
+    account = _account(binding, event, status=FUNDING_UNRESOLVED)
+    store = IntentStore(tmp_path / "unresolved.sqlite3")
+    try:
+        store.bind_funding_boundary(binding)
+        result = store.record_nado_funding_boundary(
+            attestation=attestation, event=event, account_funding=account
+        )
+        assert result.status == FUNDING_UNRESOLVED
+        assert result.blocked is True
+        assert store.lifecycle_status() == "HALTED"
+        assert store.nado_funding_boundary_evidence() == (
+            attestation, event, account
+        )
+    finally:
+        store.close()
+
+
+def test_binding_after_intent_preparation_is_rejected(tmp_path: Path) -> None:
+    binding, _, _, _ = _valid_evidence()
+    store = IntentStore(tmp_path / "late-binding.sqlite3")
+    try:
+        # A minimal prepared intent is unnecessary here: the store's durable
+        # identity table is the exact guard used by the lifecycle before any
+        # funding-boundary runner can add evidence.
+        store._connection.execute(
+            "INSERT INTO nado_intents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "late-digest", "1", 1_700_000_000_000, "ENTRY", 44, b"{}",
+                "1", "1", "1", 0, None, None, "0", NADO_ACCOUNT,
+                OWNER, "default", "PREPARED",
+            ),
+        )
+        store._connection.commit()
+        with pytest.raises(NadoContractError, match="before intent preparation"):
+            store.bind_funding_boundary(binding)
+    finally:
+        store.close()
 
 
 def test_funding_evidence_requires_a_persisted_binding(tmp_path: Path) -> None:

@@ -9,24 +9,32 @@ import json
 from pathlib import Path
 import sqlite3
 import zlib
+from decimal import Decimal
 
 import pytest
 
 import risex_farmer.nado_testnet_lifecycle_operational as nado_operational
 from risex_farmer.nado_testnet_lifecycle import (
-    ACTIVE_PERP, COMPLETE, EXECUTE_RESPONSE_AMBIGUITY,
+    ACTIVE_PERP, COMPLETE, EXECUTE_RESPONSE_AMBIGUITY, FUNDING_APPLIED,
+    FUNDING_SKIPPED_POSITION_CLOSED, FUNDING_SKIPPED_POSITION_NOT_OPEN,
+    FUNDING_UNRESOLVED,
     EXECUTE_TRANSPORT_AMBIGUITY, EXECUTE_VENUE_REJECTION, HALTED, IOC_APPENDIX,
-    AccountSnapshot, CatalogSnapshot, EngineEvidence, ExecuteFailure, FillEvidence,
-    FixedEnvironment, IntentStore, OrderEvidence, Product, OrderIntent,
-    SyntheticOrderVector, TriggerSnapshot, build_order_nonce, canonical_payload,
-    order_digest, smallest_executable_amount,
+    AccountSnapshot, CatalogSnapshot, CrossRunAttestation, EngineEvidence,
+    ExecuteFailure, FillEvidence, FixedEnvironment, FundingBoundaryBinding,
+    FundingLegBinding, FundingRouteBinding, IntentStore, JournalIdentity,
+    NadoAccountFunding, NadoFundingEvent, OrderEvidence, Product, OrderIntent,
+    SyntheticOrderVector, TerminalEvidence, TriggerSnapshot, build_order_nonce,
+    canonical_payload, cross_run_attestation_digest, nado_account_funding_digest,
+    nado_funding_event_digest, order_digest, smallest_executable_amount,
+    terminal_evidence_digest,
 )
 from risex_farmer.nado_testnet_lifecycle_operational import (
     DurableExecuteFailure, DurableOperationalFailure, OperationalSafetyError,
-    OperationalVenueIO,
+    FundingBoundaryReport, OperationalVenueIO,
     OwnerOrderCapability, REDACTED_STORE_PATH, RUN_STORE_BASENAME,
-    RECV_WINDOW_MS, SealedLifecycleRunner, TARGET_PRODUCT_ID, TARGET_TICKER_ID,
-    _fixture_run, run,
+    RECV_WINDOW_MS, SealedFundingBoundaryRunner, SealedLifecycleRunner,
+    TARGET_PRODUCT_ID, TARGET_TICKER_ID, _fixture_funding_boundary_run,
+    _fixture_run, _journal_store_identity, run, run_funding_boundary,
 )
 from risex_farmer.nado_private_read_preflight import MAX_FRESHNESS_MS
 
@@ -166,6 +174,140 @@ class ReceiveWindowFixtureIO(FixtureIO):
         return super().dispatch(intent, signature)
 
 
+def _funding_route() -> FundingRouteBinding:
+    return FundingRouteBinding(
+        canonical_asset="SKR",
+        risex_leg=FundingLegBinding(
+            "RISEX", "SKR-USDC", "SHORT",
+            Decimal("12900"), Decimal("1"), Decimal("12900"),
+        ),
+        nado_leg=FundingLegBinding(
+            "NADO", TARGET_TICKER_ID, "LONG",
+            Decimal("12900"), Decimal("1"), Decimal("12900"),
+        ),
+        nado_product_id=TARGET_PRODUCT_ID,
+        settlement_at_ms=1_700_000_000_000,
+    )
+
+
+FUNDING_RISEX_JOURNAL = JournalIdentity(
+    "RISEX", "risex-funding-fixture-run", "risex-store-v1-immutable",
+    "risex-counterparty-account",
+)
+
+
+class FundingFixtureIO(FixtureIO):
+    def __init__(
+        self,
+        funding_status: str = FUNDING_APPLIED,
+        *,
+        final_rounds_agree: bool = True,
+        entry: str = "FILLED",
+    ) -> None:
+        super().__init__(entry)
+        self.funding_status = funding_status
+        self.final_rounds_agree = final_rounds_agree
+        self.await_count = 0
+        self.bound_at_dispatch: list[bool] = []
+
+    def dispatch(self, intent, signature) -> str:
+        self.bound_at_dispatch.append(
+            self.store.funding_boundary_binding() is not None
+        )
+        return super().dispatch(intent, signature)
+
+    def await_funding_boundary(self, binding: FundingBoundaryBinding) -> None:
+        assert self.store.funding_boundary_binding() == binding
+        self.await_count += 1
+
+    def read_funding_boundary(
+        self, binding: FundingBoundaryBinding,
+    ) -> tuple[NadoFundingEvent, NadoAccountFunding]:
+        unsigned_event = NadoFundingEvent(
+            "nado-funding-fixture-event",
+            binding.nado_journal,
+            binding.route.nado_product_id,
+            binding.route.nado_leg.market,
+            binding.route.settlement_at_ms,
+            binding.route.canonical_quantity,
+            125_000_000_000_000,
+            0,
+            self.funding_status,
+            "0x" + "00" * 32,
+        )
+        event = replace(
+            unsigned_event,
+            event_digest="0x" + nado_funding_event_digest(unsigned_event),
+        )
+        unsigned_account = NadoAccountFunding(
+            binding.nado_journal,
+            OWNER,
+            "default",
+            event.event_id,
+            event.product_id,
+            event.market,
+            event.settlement_at_ms,
+            event.canonical_quantity,
+            event.rate_x18,
+            event.cash_x18,
+            event.status,
+            "0x" + "00" * 32,
+        )
+        account = replace(
+            unsigned_account,
+            evidence_digest="0x" + nado_account_funding_digest(unsigned_account),
+        )
+        return event, account
+
+    @staticmethod
+    def _terminal(
+        journal: JournalIdentity, observed_at_ms: int, content_byte: str,
+    ) -> TerminalEvidence:
+        unsigned = TerminalEvidence(
+            journal,
+            COMPLETE,
+            observed_at_ms,
+            "0x" + content_byte * 64,
+            True,
+            True,
+            True,
+            (),
+            "0x" + "00" * 32,
+        )
+        return replace(
+            unsigned,
+            evidence_digest="0x" + terminal_evidence_digest(unsigned),
+        )
+
+    def final_attestation(
+        self,
+        binding: FundingBoundaryBinding,
+        observation,
+        round_index: int,
+    ) -> CrossRunAttestation:
+        content_byte = "4" if self.final_rounds_agree or round_index == 1 else "5"
+        risex_terminal = self._terminal(
+            binding.risex_journal, binding.route.settlement_at_ms + round_index,
+            "3",
+        )
+        nado_terminal = self._terminal(
+            binding.nado_journal, binding.route.settlement_at_ms + round_index,
+            content_byte,
+        )
+        unsigned = CrossRunAttestation(
+            binding.route,
+            binding.risex_journal,
+            binding.nado_journal,
+            risex_terminal,
+            nado_terminal,
+            "0x" + "00" * 32,
+        )
+        return replace(
+            unsigned,
+            attestation_digest="0x" + cross_run_attestation_digest(unsigned),
+        )
+
+
 def assert_nonce_and_digest_binding(intent: OrderIntent) -> None:
     salt = intent.nonce & ((1 << 20) - 1)
     assert intent.nonce == build_order_nonce(intent.recv_time, salt)
@@ -194,6 +336,21 @@ def run_fixture(tmp_path: Path, io: FixtureIO):
         path=path, io=io, capability_loader=capability, owner=OWNER, sender=SENDER,
     )
     # inspect through a fresh connection after the runner closes its owner
+    io.store = IntentStore(path)
+    return result, io.store
+
+
+def run_funding_fixture(tmp_path: Path, io: FundingFixtureIO):
+    path = tmp_path / "nado-funding.sqlite"
+    result = _fixture_funding_boundary_run(
+        path=path,
+        io=io,
+        capability_loader=capability,
+        owner=OWNER,
+        sender=SENDER,
+        route=_funding_route(),
+        risex_journal=FUNDING_RISEX_JOURNAL,
+    )
     io.store = IntentStore(path)
     return result, io.store
 
@@ -915,6 +1072,150 @@ def test_full_entry_uses_fresh_position_reduce_only_ioc_close(tmp_path: Path) ->
         assert close.starting_position_x18 == entry.amount_x18
         assert close.amount_x18 == -entry.amount_x18
         assert close.snapshot_id and close.snapshot_observed_at_ms
+    finally:
+        store.close()
+
+
+def test_funding_runner_binds_before_any_nado_preparation_or_dispatch(
+    tmp_path: Path,
+) -> None:
+    io = FundingFixtureIO()
+    report, store = run_funding_fixture(tmp_path, io)
+    try:
+        assert isinstance(report, FundingBoundaryReport)
+        assert report.status == COMPLETE
+        assert report.funding_status == FUNDING_APPLIED
+        assert report.final_rounds_agree is True
+        assert io.await_count == 1
+        assert io.bound_at_dispatch == [True, True]
+        assert [intent.kind for intent, _ in store.intents()] == ["ENTRY", "CLOSE"]
+        binding = store.funding_boundary_binding()
+        assert binding is not None
+        assert binding.nado_journal.run_id == store.nado_funding_boundary_evidence()[1].journal.run_id
+        assert binding.nado_journal.store_identity == _journal_store_identity(
+            tmp_path / "nado-funding.sqlite"
+        )
+    finally:
+        store.close()
+
+
+def test_funding_runner_rejects_missing_funding_adapter_before_dispatch(
+    tmp_path: Path,
+) -> None:
+    io = FixtureIO("FILLED")
+    path = tmp_path / "nado-funding.sqlite"
+    report = _fixture_funding_boundary_run(
+        path=path,
+        io=io,
+        capability_loader=capability,
+        owner=OWNER,
+        sender=SENDER,
+        route=_funding_route(),
+        risex_journal=FUNDING_RISEX_JOURNAL,
+    )
+    assert report.status == "BLOCKED"
+    assert report.writes == 0
+    assert io.dispatch_states == []
+    store = IntentStore(path)
+    try:
+        assert store.lifecycle_status() == HALTED
+        assert store.funding_boundary_binding() is None
+    finally:
+        store.close()
+
+
+def test_production_funding_entrypoint_uses_fixed_identity_and_private_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "nado-production-funding.sqlite"
+    async def finalized_private_read() -> dict[str, str]:
+        return {"status": "FINALIZED"}
+
+    monkeypatch.setattr(nado_operational, "_production_store_path", lambda: path)
+    monkeypatch.setattr(nado_operational, "_strict_identity", lambda: (OWNER, SENDER))
+    monkeypatch.setattr(nado_operational, "_load_capability", capability)
+    monkeypatch.setattr(nado_operational, "_accepted_private_read", finalized_private_read)
+
+    report = run_funding_boundary(
+        route=_funding_route(),
+        risex_journal=FUNDING_RISEX_JOURNAL,
+        io=FundingFixtureIO(),
+    )
+
+    assert report["status"] == COMPLETE
+    assert report["path"] == REDACTED_STORE_PATH
+    store = IntentStore(path)
+    try:
+        assert store.lifecycle_status() == COMPLETE
+        assert store.funding_boundary_binding() is not None
+    finally:
+        store.close()
+
+
+def test_funding_runner_retains_explicit_skipped_non_accrual_and_completes(
+    tmp_path: Path,
+) -> None:
+    io = FundingFixtureIO(FUNDING_SKIPPED_POSITION_NOT_OPEN, entry="RESTING")
+    report, store = run_funding_fixture(tmp_path, io)
+    try:
+        assert report.status == COMPLETE
+        assert report.funding_status == FUNDING_SKIPPED_POSITION_NOT_OPEN
+        assert report.funding_cash_x18 == 0
+        evidence = store.nado_funding_boundary_evidence()
+        assert evidence is not None
+        assert evidence[1].status == FUNDING_SKIPPED_POSITION_NOT_OPEN
+        assert store.lifecycle_status() == COMPLETE
+    finally:
+        store.close()
+
+
+def test_funding_runner_retains_unresolved_outcome_and_reports_blocked(
+    tmp_path: Path,
+) -> None:
+    io = FundingFixtureIO(FUNDING_UNRESOLVED)
+    report, store = run_funding_fixture(tmp_path, io)
+    try:
+        assert report.status == "BLOCKED"
+        assert report.funding_status == FUNDING_UNRESOLVED
+        assert report.reason == FUNDING_UNRESOLVED
+        assert report.final_rounds_agree is True
+        assert report.final_zero_regular and report.final_zero_trigger
+        assert report.final_exact_flat
+        evidence = store.nado_funding_boundary_evidence()
+        assert evidence is not None and evidence[1].status == FUNDING_UNRESOLVED
+        assert store.lifecycle_status() == HALTED
+    finally:
+        store.close()
+
+
+def test_funding_runner_missing_event_is_blocked_without_zero_fallback(
+    tmp_path: Path,
+) -> None:
+    io = FundingFixtureIO()
+    io.read_funding_boundary = lambda _binding: (None, None)
+    report, store = run_funding_fixture(tmp_path, io)
+    try:
+        assert report.status == "BLOCKED"
+        assert report.funding_status is None
+        assert report.funding_cash_x18 is None
+        assert report.reason == "SAFETY"
+        assert store.nado_funding_boundary_evidence() is None
+        assert store.lifecycle_status() == HALTED
+    finally:
+        store.close()
+
+
+def test_funding_runner_rejects_disagreeing_final_terminal_rounds(
+    tmp_path: Path,
+) -> None:
+    io = FundingFixtureIO(final_rounds_agree=False)
+    report, store = run_funding_fixture(tmp_path, io)
+    try:
+        assert report.status == "BLOCKED"
+        assert report.reason == "SAFETY"
+        assert store.nado_funding_boundary_evidence() is None
+        assert store.lifecycle_status() == HALTED
+        assert io.bound_at_dispatch == [True, True]
     finally:
         store.close()
 
