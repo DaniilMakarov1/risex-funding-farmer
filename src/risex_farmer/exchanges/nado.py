@@ -150,16 +150,21 @@ class NadoAdapter(PublicAdapter):
             return tuple(parsed)
 
         raw_timestamp = data["timestamp"]
+        source_observed_at = timestamp(raw_timestamp, "nanoseconds")
+        # Keep venue clock skew from making a received book future-dated; the
+        # raw exchange timestamp remains the ordering sequence below.
         return OrderBook(
             Venue.NADO,
             self._symbols_by_id.get(product_id, str(product_id)),
             levels("bids"),
             levels("asks"),
-            timestamp(raw_timestamp, "nanoseconds"),
+            min(source_observed_at, observed_at),
             int(raw_timestamp),
         )
 
-    def normalize_book_message(self, payload: Any) -> BookDelta:
+    def normalize_book_message(
+        self, payload: Any, *, received_at: datetime
+    ) -> BookDelta:
         message = require_mapping(payload, "book_depth")
         product_id = int(message["product_id"])
 
@@ -182,7 +187,7 @@ class NadoAdapter(PublicAdapter):
             self._symbols_by_id.get(product_id, str(product_id)),
             levels("bids"),
             levels("asks"),
-            timestamp(max_timestamp, "nanoseconds"),
+            min(timestamp(max_timestamp, "nanoseconds"), received_at),
             max_timestamp,
             int(message["last_max_timestamp"]),
         )

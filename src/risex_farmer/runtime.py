@@ -3536,8 +3536,16 @@ class PublicPaperRuntime:
                                 continue
                             payload = json.loads(message.data, parse_float=Decimal)
                             if kind == "book":
+                                received_at = self.clock.now()
+                                event = (
+                                    adapter.normalize_book_message(
+                                        payload, received_at=received_at
+                                    )
+                                    if isinstance(adapter, NadoAdapter)
+                                    else adapter.normalize_book_message(payload)
+                                )
                                 healthy = await self.apply_book_event(
-                                    adapter.normalize_book_message(payload),
+                                    event,
                                     stream_session_id=stream_session_id,
                                 )
                                 if not self._owns_stream_session(
@@ -3793,7 +3801,14 @@ class PublicPaperRuntime:
                                 self.coordinator.stream(venue, symbol).connection_confirmed(self.clock.now())
                             continue
                         if "orderbook" in kind or "book_depth" in kind:
-                            event = adapter.normalize_book_message(payload)  # type: ignore[attr-defined]
+                            received_at = self.clock.now()
+                            event = (
+                                adapter.normalize_book_message(
+                                    payload, received_at=received_at
+                                )
+                                if isinstance(adapter, NadoAdapter)
+                                else adapter.normalize_book_message(payload)
+                            )  # type: ignore[attr-defined]
                             healthy = await self.apply_book_event(
                                 event, stream_session_id=stream_session_id
                             )

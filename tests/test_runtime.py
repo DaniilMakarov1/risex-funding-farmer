@@ -14,6 +14,7 @@ import pytest
 
 from risex_farmer.exchanges.base import PublicAdapter, PublicDataUnavailable
 from risex_farmer.exchanges.extended import ExtendedAdapter
+from risex_farmer.exchanges.nado import NadoAdapter
 from risex_farmer.exchanges.risex import RisexAdapter
 from risex_farmer.config import PAPER_CONFIG
 from risex_farmer.models import (
@@ -635,6 +636,65 @@ async def test_injected_ordinary_public_scan_builds_real_observations_and_diagno
     assert report["latest_routes"] == result["routes"]
     assert report["latest_routes"][0]["source_quality"]["risex_funding"]["marker"] == "PAPER_ASSUMPTION"
     assert all({"markets", "volumes", "book", "funding"} <= set(fake.calls) for fake in fakes.values())
+
+
+@pytest.mark.asyncio
+async def test_nado_future_book_timestamp_does_not_abort_initial_tick(tmp_path):
+    clock = FakeClock()
+    fakes = adapters(clock, settlement_at=NOW + timedelta(minutes=5))
+    nado = fakes[Venue.NADO]
+    payload = json.loads(
+        (Path(__file__).parent / "fixtures" / "paper_002" / "nado.json").read_text()
+    )
+    normalizer = NadoAdapter(None)
+    nado.market = normalizer.normalize_market(payload["market"])
+    payload["book"]["timestamp"] = str(
+        int((clock.now() + timedelta(seconds=1)).timestamp() * 1_000_000_000)
+    )
+
+    async def future_timestamp_book(_symbol):
+        nado._ready("book")
+        return normalizer.normalize_book(payload["book"], observed_at=clock.now())
+
+    nado.fetch_book = future_timestamp_book
+    with PaperRepository(tmp_path / "nado-future-book.db") as repository:
+        async with PublicPaperRuntime(
+            repository, adapters=fakes, clock=clock
+        ) as runtime:
+            await runtime.tick()
+            observation = runtime.observations[
+                Venue.NADO, nado.market.venue_symbol
+            ]
+            assert runtime.last_scan is not None
+            assert observation.book is not None
+            assert observation.book.observed_at == runtime.last_scan.logical_at
+
+
+@pytest.mark.asyncio
+async def test_scan_still_rejects_an_untrusted_future_observation(tmp_path):
+    clock = FakeClock()
+    fakes = adapters(clock, settlement_at=NOW + timedelta(minutes=5))
+    with PaperRepository(tmp_path / "future-observation-rejected.db") as repository:
+        async with PublicPaperRuntime(
+            repository, adapters=fakes, clock=clock
+        ) as runtime:
+            await runtime.tick()
+            key = Venue.NADO, fakes[Venue.NADO].market.venue_symbol
+            observation = runtime.observations[key]
+            assert observation.book is not None
+            runtime.observations[key] = replace(
+                observation,
+                book=replace(
+                    observation.book,
+                    observed_at=clock.now() + timedelta(seconds=1),
+                ),
+            )
+            with pytest.raises(
+                RuntimeError, match="scan observation timestamp exceeds logical_at"
+            ):
+                await runtime.scan(
+                    refresh=False, scan_kind="FOCUSED", scheduled_at=clock.now()
+                )
 
 
 @pytest.mark.asyncio

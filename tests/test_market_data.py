@@ -599,9 +599,37 @@ def test_documented_book_delta_shapes_are_normalized() -> None:
     nado = NadoAdapter(None)
     nado_data = fixture("nado")
     nado.normalize_market(nado_data["market"])
-    n_delta = nado.normalize_book_message(nado_data["book_delta"])
+    n_delta = nado.normalize_book_message(
+        nado_data["book_delta"], received_at=NOW
+    )
     assert n_delta.previous_sequence == 1800000000000000000
     assert n_delta.bids[0].canonical_quantity == D("1")
+
+
+def test_nado_book_observation_time_is_bounded_by_local_receipt() -> None:
+    nado = NadoAdapter(None)
+    nado_data = fixture("nado")
+    nado.normalize_market(nado_data["market"])
+
+    future_book = deepcopy(nado_data["book"])
+    future_book["timestamp"] = str(
+        int((NOW + timedelta(seconds=1)).timestamp() * 1_000_000_000)
+    )
+    rest = nado.normalize_book(future_book, observed_at=NOW)
+    assert rest.observed_at == NOW
+    past = nado.normalize_book(nado_data["book"], observed_at=NOW)
+    assert past.observed_at == timestamp(
+        nado_data["book"]["timestamp"], "nanoseconds"
+    )
+
+    future_delta = deepcopy(nado_data["book_delta"])
+    future_delta["max_timestamp"] = str(
+        int((NOW + timedelta(seconds=1)).timestamp() * 1_000_000_000)
+    )
+    websocket = nado.normalize_book_message(
+        future_delta, received_at=NOW
+    )
+    assert websocket.observed_at == NOW
 
 
 def test_funding_freshness_uses_observation_age() -> None:
