@@ -2,7 +2,7 @@
 
 ## Mainnet public shadow — all-route liquidity measurement
 
-Status: `BLOCKED — PRE-REFRESH FULL-CADENCE STARVATION`.
+Status: `READY — RESUME 24-HOUR ALL-ROUTE SHADOW`.
 
 Objective: use the accepted normal paper product against real unauthenticated RISEx, Nado, and Extended mainnet public data, evaluating every currently eligible venue-asset direction in `RISEx ∩ (Extended ∪ Nado)` without Top-5 or fixed route-count truncation. Measure whether opportunity frequency, duration, and conservative economics vary with authoritative route liquidity.
 
@@ -23,6 +23,7 @@ Exact starting point:
 - Fresh `chief07` reached READY but produced three blocked FULL scans, 181/181 Extended disconnect/reconnect events, a synchronized outage lasting about 3 minutes 15 seconds, a 120.825-second refresh, and 392 seconds of cadence lateness. It stopped `STOPPED_SAFE` with integrity `ok` and zero orders/fills/positions; the scheduled 24-hour follow-up was removed. One fresh Extended Builder may correct only this observed public transport/cadence defect without suppressing blockers, raising limits, reducing routes, or weakening freshness.
 - The user-requested funding-boundary check is complete through the existing isolated fixture path, with no product change: a NEAR paper position spanned `13:58:01Z`–`14:00:01Z`, recognized assumed `+$8` aggregate funding, lost `$10` on price and `$0.21` in fees, and ended FLAT at `-$2.21`. It is synthetic accounting evidence only and must not enter profitability statistics.
 - Accepted merge `2e18509f8c619ac329ddf2265acbcc99dde1f418` removes redundant Extended REST fan-out during an already-known transport gap and preserves complete route-level fail-closed evidence. Fresh `chief09` then observed 85/85 Extended disconnect/reconnect events but no FULL deadline, blocker, scan, or deferred observation for more than three configured cadence intervals after READY. This is a distinct starvation before `_start_public_refresh`; start no statistical window until a fresh Builder reproduces and corrects that exact scheduling/ownership path. The run stopped safely with integrity `ok` and zero orders/fills/positions.
+- Accepted `433afb3965fb3543dc93a66854841e1d57523d0b` corrects that starvation with a cooperative event-loop handoff at each Extended message boundary. Fresh `chief10` then completed two due FULL scans over all 58 directions while processing a 67/67 disconnect/reconnect wave and 30 explicit deferred gap observations; no blocked/fatal event occurred, shutdown was safe, integrity is `ok`, and write-state rows are zero. The next action is one fresh isolated 24-hour all-route paper window with Top-10 Telegram presentation and the existing bounded stop/report gate.
 - Rejected branch `codex/strategy-measurement-foundation` at `300362d840141d9ed599d8189ed1d10801fc5256` is not a candidate and must not be merged or copied. Open a fresh Builder only if observed evidence proves a bounded defect or a measurement field genuinely missing from the accepted paper path.
 
 Allowed scope:
