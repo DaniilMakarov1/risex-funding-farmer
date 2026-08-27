@@ -2,7 +2,7 @@
 
 ## Central baseline
 
-- Git `main` is the accepted-history authority and is published to `origin/main` after every accepted Chief checkpoint. Paper remains the default; public unauthenticated mainnet shadow reads are authorized, while authenticated/private mainnet access, writes, real funds, and strategy execution are not.
+- Git `main` is the accepted-history authority and is published to `origin/main` after every accepted Chief checkpoint. Paper remains the default; public unauthenticated mainnet shadow reads and bounded outbound-only Telegram delivery are authorized, while authenticated/private venue access, writes, real funds, inbound Telegram control, and strategy execution are not.
 - RISEx, Nado, and Extended have each completed one bounded Level C testnet lifecycle ending with authoritative zero open orders and exact flatness. No additional venue lifecycle is authorized; the next gate is mainnet-public read-only shadow measurement through the normal paper product.
 - The accepted tree keeps normal startup isolated from testnet operational runners. Protected credentials and operational journals remain runtime data outside Git.
 

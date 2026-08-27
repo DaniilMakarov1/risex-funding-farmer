@@ -2,7 +2,7 @@
 
 ## Mainnet public shadow — first real-data measurement window
 
-Status: `READY FOR CHIEF OPERATIONAL GATE`.
+Status: `ACTIVE — BOUNDED PUBLIC-MAINNET PAPER WINDOW`.
 
 Objective: use the already accepted normal paper product against real unauthenticated RISEx, Nado, and Extended mainnet public data. Establish whether any route remains economically positive under the existing conservative execution model and collect the first bounded evidence for opportunity frequency, funding, fees, executable depth, spread/slippage, timing, stale-data rejection, leg risk, reconciliation health, and kill-switch reasons.
 
@@ -15,7 +15,7 @@ Exact starting point:
 Allowed scope:
 
 - Public unauthenticated mainnet REST/WebSocket reads from the existing fixed venue adapters.
-- A fresh isolated paper SQLite database, one preflight `scan-once`, then a bounded 24-hour `paper-run` observation window unless a fail-closed blocker ends it earlier; run with outbound Telegram disabled and preserve the database and sanitized report as operational evidence.
+- A fresh isolated paper SQLite database, one preflight `scan-once`, then a bounded 24-hour `paper-run` observation window unless a fail-closed blocker ends it earlier; outbound Telegram is explicitly enabled for authoritative runtime notifications only, remains delivery-only/non-blocking, and preserves the database and sanitized report as operational evidence.
 - Existing conservative paper semantics: exact Decimal arithmetic, canonical units, exact-size depth/VWAP, fee and execution PnL, funding timestamps, trade-through maker evidence, data-gap degradation, restart behavior, and `NO_TRADE` as a valid result.
 - Report opportunity count/duration, COMPLETE versus DEGRADED paper lifecycles, planned and executable-unwind net PnL, fee/slippage components, funding source quality, latency/freshness failures, leg-risk proxies, and every assumption or blocker.
 - Read-only diagnostics and a fresh Builder correction only when a concrete mainnet-public observation contradicts accepted code. Any candidate requires focused/adverse tests and one clean Python 3.11 full suite on its final SHA.
@@ -29,6 +29,7 @@ Forbidden scope:
 Acceptance for the first checkpoint:
 
 - The bounded run uses only public mainnet data and leaves verifiable zero credential/signing/write effects.
+- Telegram delivery neither supplies market evidence nor changes scan cadence, economics, lifecycle decisions, or acceptance; delivery failure cannot block the runtime.
 - The stored/reportable evidence distinguishes official values from paper assumptions and returns either quantified conservative paper opportunities or exact fail-closed/negative-economics reasons.
 - Chief defines the next statistical observation window and predeclared profitability/risk thresholds from the first evidence; no mainnet Level D or real-funds claim follows automatically.
 
