@@ -132,10 +132,6 @@ class _PublicSocketClosed(ConnectionError):
 _PublicResult = TypeVar("_PublicResult")
 PUBLIC_REQUEST_TIMEOUT_SECONDS = 30
 PUBLIC_REST_CONCURRENCY_PER_VENUE = 2
-# This is only a cleanup bound.  It is deliberately below the product's
-# 30-second safe-stop requirement and does not alter public-data freshness or
-# request deadlines.
-CANCELLATION_DRAIN_TIMEOUT_SECONDS = 1.0
 
 
 def _volume_signature(rows: Mapping[str, MarketVolume]) -> dict[str, tuple[Decimal | None, str]]:
@@ -169,47 +165,14 @@ def _http_status(exc: BaseException) -> int | None:
 
 async def _gather_owned(*work: Awaitable[Any]) -> tuple[Any, ...]:
     tasks = [asyncio.ensure_future(row) for row in work]
-    gathered = asyncio.gather(*tasks)
-    gathered.add_done_callback(_consume_future_result)
     try:
-        # Shield the group so parent cancellation reaches this cleanup path
-        # immediately instead of waiting for a cancellation-resistant child.
-        return tuple(await asyncio.shield(gathered))
+        return tuple(await asyncio.gather(*tasks))
     except BaseException:
-        if not gathered.done():
-            gathered.cancel()
-        await _cancel_tasks_bounded(tasks)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         raise
-
-
-def _consume_future_result(future: asyncio.Future[Any]) -> None:
-    if future.cancelled():
-        return
-    try:
-        future.exception()
-    except BaseException:
-        return
-
-
-async def _cancel_tasks_bounded(
-    tasks: list[asyncio.Future[Any]] | set[asyncio.Future[Any]] | tuple[asyncio.Future[Any], ...],
-    *,
-    timeout_seconds: float = CANCELLATION_DRAIN_TIMEOUT_SECONDS,
-) -> set[asyncio.Future[Any]]:
-    current = asyncio.current_task()
-    pending = {
-        task for task in tasks
-        if not task.done() and task is not current
-    }
-    for task in pending:
-        task.cancel()
-    if pending:
-        done, pending = await asyncio.wait(
-            pending, timeout=timeout_seconds
-        )
-        for task in done:
-            _consume_future_result(task)
-    return pending
 
 
 @dataclass(slots=True)
@@ -476,7 +439,6 @@ class PublicPaperRuntime:
         self.next_extended_catalog_at: datetime | None = None
         self.notifications = notifications
         self._tick_task: asyncio.Task[None] | None = None
-        self._detached_tasks: set[asyncio.Future[Any]] = set()
         self._catalog_reconciliation_in_progress = False
         self._notification_run_id: str | None = None
         self._stop_cause: str | None = None
@@ -1994,8 +1956,8 @@ class PublicPaperRuntime:
         deadline = self._pending_full_deadline_at
         refresh = self._refresh_task
         if refresh is not None and not refresh.done():
-            pending = await _cancel_tasks_bounded((refresh,))
-            self._detach_tasks(pending)
+            refresh.cancel()
+            await asyncio.gather(refresh, return_exceptions=True)
         self._refresh_task = None
         self._pending_full_scan_at = None
         self._pending_full_deadline_at = None
@@ -2013,8 +1975,6 @@ class PublicPaperRuntime:
         )
 
     def _background_task_done(self, task: asyncio.Task[None]) -> None:
-        if self._shutdown_started:
-            return
         if task.cancelled():
             return
         exception = task.exception()
@@ -4967,48 +4927,6 @@ class PublicPaperRuntime:
         if self._stop_event is not None:
             self._stop_event.set()
 
-    def _detach_tasks(
-        self, tasks: set[asyncio.Future[Any]] | tuple[asyncio.Future[Any], ...]
-    ) -> None:
-        for task in tasks:
-            if task.done():
-                _consume_future_result(task)
-                continue
-            self._detached_tasks.add(task)
-            task.add_done_callback(self._detached_tasks.discard)
-            task.add_done_callback(_consume_future_result)
-
-    async def _close_session_bounded(self) -> None:
-        session = self._session
-        close = getattr(session, "close", None)
-        if session is None or close is None or getattr(session, "closed", False):
-            return
-        try:
-            operation = close()
-        except BaseException:
-            return
-        if operation is None:
-            return
-        task = asyncio.ensure_future(operation)
-        done, pending = await asyncio.wait(
-            (task,), timeout=CANCELLATION_DRAIN_TIMEOUT_SECONDS
-        )
-        if pending:
-            task.cancel()
-            done_after_cancel, still_pending = await asyncio.wait(
-                pending, timeout=0
-            )
-            for completed in done_after_cancel:
-                _consume_future_result(completed)
-            self._detach_tasks(still_pending)
-        else:
-            for completed in done:
-                _consume_future_result(completed)
-        # Give a cancellation-resistant tick owner one scheduling turn after
-        # close has been requested, preserving the handoff boundary before the
-        # final ownership cleanup below.
-        await asyncio.sleep(0)
-
     def _has_owned_background_work(self) -> bool:
         return bool(
             self._stream_tasks
@@ -5041,11 +4959,16 @@ class PublicPaperRuntime:
         return owned
 
     async def _cancel_owned_background_tasks(self) -> None:
-        owned = self._owned_background_tasks()
-        if not owned:
-            return
-        pending = await _cancel_tasks_bounded(owned)
-        self._detach_tasks(pending)
+        while True:
+            owned = self._owned_background_tasks()
+            if not owned:
+                return
+            pending = {task for task in owned if not task.done()}
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*owned, return_exceptions=True)
+            if not pending:
+                return
 
     async def shutdown(self) -> None:
         if not self.accepting_entries and not self._has_owned_background_work():
@@ -5060,7 +4983,12 @@ class PublicPaperRuntime:
         for task in self._owned_background_tasks():
             if not task.done():
                 task.cancel()
-        await self._close_session_bounded()
+        if (
+            self._session is not None
+            and not getattr(self._session, "closed", False)
+            and hasattr(self._session, "close")
+        ):
+            await self._session.close()
         if self.broker is not None and self.broker.state.lifecycle_state is LifecycleState.ENTRY_MAKER_OPEN:
             state = await self.broker.cancel_for_process_restart(restarted_at=at)
             self.repository.save_decision(recorded_at=at, entry_state=state)
@@ -5109,8 +5037,12 @@ class PublicPaperRuntime:
     async def close(self) -> None:
         if self.accepting_entries or self._has_owned_background_work():
             await self.shutdown()
-        if not self._shutdown_started:
-            await self._close_session_bounded()
+        if (
+            self._session is not None
+            and not getattr(self._session, "closed", False)
+            and hasattr(self._session, "close")
+        ):
+            await self._session.close()
 
 
 async def public_scan_once(
