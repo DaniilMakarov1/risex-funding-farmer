@@ -2,7 +2,7 @@
 
 ## Two-route testnet funding-boundary lifecycles
 
-Status: `ACTIVE — FIRST STAGED CANDIDATES REJECTED AT CROSS-ROUTE SAFETY REVIEW; BOUNDED CORRECTIONS IN FLIGHT; NO WRITE IN FLIGHT`.
+Status: `BLOCKED — FRESH NADO READ-ONLY ROUND TERMINATED HTTP 403; EXTENDED ETH-USD HAS ZERO ASKS; NO WRITE IN FLIGHT`.
 
 Objective: prove how the accepted system behaves before, during, and after an actual testnet funding settlement on exactly two hedged routes: one RISEx–Nado route and one RISEx–Extended route. Open the smallest venue-executable matched testnet positions, observe and reconcile actual venue funding semantics at the boundary, then close every leg to authoritative zero relevant orders and exact flatness.
 
@@ -12,6 +12,7 @@ Exact starting point:
 - All earlier RISEx, Nado, and Extended Level C lifecycles are complete historical evidence; this is a fresh funding-accrual objective, not permission to replay their intents.
 - The corrected public all-route implementation and its paper measurements remain accepted, but the `chief11` statistical window was intentionally ended for this rotation. Its database has integrity `ok` and zero orders/fills/positions; its obsolete automation was deleted.
 - Fresh authenticated read-only gates are accepted for RISEx, Nado, and Extended. The first staged RISEx, Nado, and Extended candidates are not accepted: exact opposite-direction matching, authoritative cross-run journal binding, and Nado event-to-account funding agreement must be corrected and independently reverified before any dispatch. Extended ETH-USD currently has no ask-side liquidity. No venue write is in flight.
+- On the fresh `2026-08-27` operational checkpoint, RISEx again passed its two-barrier authenticated read with authoritative zero-order/flat evidence, and Extended again reached `READY` through the accepted strict REST fallback. Nado round A and its signed trigger-order observation completed, but the fifth request of authoritative round B (`contracts`) returned terminal `HTTP 403`; one separate public-only diagnostic reproduced the same `HTTP 403` on its first request. This semantic HTTP failure is not retryable inside the gate. Together with Extended ETH-USD remaining `OK` but `4 bids / 0 asks`, these are exact fail-closed blockers for both authorized writes.
 
 Authorized routes:
 
