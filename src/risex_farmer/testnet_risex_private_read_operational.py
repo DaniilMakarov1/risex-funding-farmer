@@ -636,6 +636,15 @@ def _pair_intent_safe(
     }
 
 
+def _same_account_intents_safe(intents: Sequence[dict[str, Any]]) -> bool:
+    return all(
+        len({item[field] for item in intents}) == len(intents)
+        for field in ("intent_id", "client_order_id", "order_id")
+    ) and len({
+        (item["nonce_anchor"], item["nonce_bitmap"]) for item in intents
+    }) == len(intents)
+
+
 def _pair_journal_safe(
     path: Path, *, role: str, account: str, signer: str,
 ) -> _ValidatedPairJournal | None:
@@ -665,7 +674,7 @@ def _pair_journal_safe(
             item for index, row in enumerate(rows, 1)
             if (item := _pair_intent_safe(row, role=role, ordinal=index)) is not None
         )
-        if len(intents) != 2:
+        if len(intents) != 2 or not _same_account_intents_safe(intents):
             return None
         terminal_rows = connection.execute(
             "SELECT key,value FROM terminal ORDER BY key"
@@ -732,6 +741,17 @@ def _two_account_journals_safe(primary_path: Path, counterparty_path: Path) -> b
         or primary.meta["signer"] == counterparty.meta["signer"]
     ):
         return False
+    if (
+        not _same_account_intents_safe(primary.intents)
+        or not _same_account_intents_safe(counterparty.intents)
+    ):
+        return False
+    all_intents = (*primary.intents, *counterparty.intents)
+    if any(
+        len({item[field] for item in all_intents}) != len(all_intents)
+        for field in ("intent_id", "client_order_id", "order_id")
+    ):
+        return False
     primary_by_step = {item["step"]: item for item in primary.intents}
     counter_by_step = {item["step"]: item for item in counterparty.intents}
     intent_ids = {
@@ -750,10 +770,6 @@ def _two_account_journals_safe(primary_path: Path, counterparty_path: Path) -> b
         taker = primary_by_step[taker_step]
         if (
             maker["order_id"] == taker["order_id"]
-            or (
-                maker["nonce_anchor"] == taker["nonce_anchor"]
-                and maker["nonce_bitmap"] == taker["nonce_bitmap"]
-            )
             or (
                 stage == "ENTRY" and maker["price_value"] > taker["price_value"]
             )

@@ -11,6 +11,7 @@ import uuid
 
 import pytest
 
+import risex_farmer.testnet_risex_private_read_operational as operational
 from risex_farmer.testnet_risex_private_read_preflight import (
     ACCOUNT, AUTHORIZATION, MARKET_ID, MINIMUM, ROUTER, SIGNER, STEP, TICK,
     HttpResponse, Outcome,
@@ -185,6 +186,41 @@ def _write_completed_pair_history(directory: Path) -> tuple[Path, Path]:
     return paths[PairAccountRole.PRIMARY], paths[PairAccountRole.COUNTERPARTY]
 
 
+def _rewrite_pair_nonce(
+    path: Path, *, step: str, nonce_anchor: int, nonce_bitmap: int,
+) -> None:
+    db = sqlite3.connect(path)
+    try:
+        row = db.execute(
+            "SELECT * FROM intents WHERE step=?", (step,)
+        ).fetchone()
+        assert row is not None
+        action_data = {
+            "step": row[2], "side": row[9], "order_type": row[10],
+            "time_in_force": row[11], "reduce_only": bool(row[12]),
+            "post_only": bool(row[13]), "market_id": row[14],
+            "size": row[15], "price": row[16],
+            "source_position": row[17],
+            "client_order_id": int(row[3]),
+            "nonce_anchor": nonce_anchor, "nonce_bitmap": nonce_bitmap,
+            "expires_at": row[18],
+        }
+        payload_digest = hashlib.sha256(
+            json.dumps(
+                action_data, sort_keys=True, separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        db.execute(
+            "UPDATE intents SET nonce_anchor=?, nonce_bitmap=?, payload_digest=? "
+            "WHERE step=?",
+            (nonce_anchor, nonce_bitmap, payload_digest, step),
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
 def _set_pair_baseline_history(path: Path, account: str, seed: int) -> None:
     order_id = _test_order_id(seed, 11)
     trade_peer = _test_order_id(seed + 1, 12)
@@ -280,6 +316,60 @@ def test_lifecycle_binding_accepts_canonical_pair_baseline_and_resample_evidence
         db.close()
 
     assert LifecycleClearBinding._fixture(legacy)() is True
+
+
+def test_lifecycle_binding_accepts_equal_nonce_coordinates_for_distinct_accounts(tmp_path):
+    legacy = tmp_path / _LEGACY_LIFECYCLE
+    _write_completed_legacy_history(legacy)
+    primary, counterparty = _write_completed_pair_history(tmp_path)
+
+    _rewrite_pair_nonce(
+        counterparty, step="ENTRY_MAKER", nonce_anchor=10, nonce_bitmap=0,
+    )
+    _rewrite_pair_nonce(
+        counterparty, step="EXIT_MAKER", nonce_anchor=10, nonce_bitmap=1,
+    )
+
+    assert LifecycleClearBinding._fixture(legacy)() is True
+
+
+def test_lifecycle_binding_rejects_same_account_nonce_reuse(tmp_path, monkeypatch):
+    legacy = tmp_path / _LEGACY_LIFECYCLE
+    _write_completed_legacy_history(legacy)
+    _write_completed_pair_history(tmp_path)
+
+    original = operational._pair_journal_safe
+
+    def duplicate_primary_nonce(*args, **kwargs):
+        journal = original(*args, **kwargs)
+        assert journal is not None
+        if kwargs["role"] == "PRIMARY":
+            intents = tuple(
+                {**item, "nonce_bitmap": 0} for item in journal.intents
+            )
+            return operational._ValidatedPairJournal(
+                journal.role, journal.meta, intents, journal.terminal,
+            )
+        return journal
+
+    monkeypatch.setattr(operational, "_pair_journal_safe", duplicate_primary_nonce)
+    assert LifecycleClearBinding._fixture(legacy)() is False
+
+
+@pytest.mark.parametrize("identity", ("account", "signer"))
+def test_lifecycle_binding_rejects_cross_account_identity_collapse(tmp_path, identity):
+    legacy = tmp_path / _LEGACY_LIFECYCLE
+    _write_completed_legacy_history(legacy)
+    _primary, counterparty = _write_completed_pair_history(tmp_path)
+    db = sqlite3.connect(counterparty)
+    db.execute(
+        "UPDATE meta SET value=? WHERE key=?",
+        (ACCOUNT if identity == "account" else SIGNER, identity),
+    )
+    db.commit()
+    db.close()
+
+    assert LifecycleClearBinding._fixture(legacy)() is False
 
 
 @pytest.mark.parametrize(
