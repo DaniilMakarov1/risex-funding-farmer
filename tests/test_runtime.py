@@ -1049,10 +1049,13 @@ async def test_asymmetric_catalog_add_remove_reconciles_all_route_subscriptions(
                 )
                 for asset in ("B", "C", "F")
             )
+            previous_generation = runtime._catalog_generation
             await asyncio.gather(*(
                 runtime._catalog(venue, adapter)
                 for venue, adapter in fakes.items()
             ))
+            assert runtime._catalog_generation > previous_generation
+            assert runtime._catalog_refresh_pending
             await runtime._refresh_public_data()
 
             assert runtime._required_symbols(Venue.EXTENDED) == {"A-EXTENDED"}
@@ -1624,6 +1627,302 @@ async def test_full_scan_digest_retains_all_58_authoritative_rows(tmp_path):
     assert sum(len(row.text.splitlines()[1:]) for row in digests) == 58
     assert len({line for row in digests for line in row.text.splitlines()[1:]}) == 58
     assert all(len(row.text) <= 4096 for row in digests)
+
+
+@pytest.mark.asyncio
+async def test_paper_run_startup_catalog_gate_evaluates_all_58_routes_before_ready(
+    tmp_path,
+):
+    clock = FakeClock()
+    stop = asyncio.Event()
+    fakes = {
+        Venue.RISEX: ManyFakeAdapter(
+            Venue.RISEX, clock, settlement_at=NOW + timedelta(minutes=5),
+            asset_count=15,
+        ),
+        Venue.EXTENDED: ManyFakeAdapter(
+            Venue.EXTENDED, clock, settlement_at=NOW + timedelta(minutes=5),
+            asset_count=15,
+        ),
+        Venue.NADO: ManyFakeAdapter(
+            Venue.NADO, clock, settlement_at=NOW + timedelta(minutes=5),
+            asset_count=14,
+        ),
+    }
+
+    async def stop_after_ready(_seconds: float) -> None:
+        assert repository.connection.execute(
+            "SELECT COUNT(*) FROM runtime_evidence "
+            "WHERE event_type='PAPER_RUN_READY'"
+        ).fetchone()[0] == 1
+        stop.set()
+        await asyncio.sleep(0)
+
+    with PaperRepository(tmp_path / "startup-all-routes.db") as repository:
+        result = await public_paper_run(
+            repository, adapters=fakes, clock=clock,
+            sleep=stop_after_ready, stop_event=stop,
+        )
+        scans = repository.connection.execute(
+            "SELECT detail FROM runtime_evidence WHERE event_type='PUBLIC_SCAN' "
+            "ORDER BY evidence_id"
+        ).fetchall()
+        lifecycle = repository.connection.execute(
+            "SELECT event_type FROM runtime_evidence "
+            "WHERE event_type IN ('PUBLIC_SCAN','PAPER_RUN_READY') "
+            "ORDER BY evidence_id"
+        ).fetchall()
+
+    assert result == {"status": "STOPPED_SAFE", "forced_close": False}
+    assert json.loads(scans[0][0])["evaluation_count"] == 58
+    assert [row[0] for row in lifecycle[:2]] == [
+        "PUBLIC_SCAN", "PAPER_RUN_READY"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_paper_run_startup_waits_for_delayed_extended_universe_before_ready(
+    tmp_path,
+):
+    clock = FakeClock()
+    stop = asyncio.Event()
+    target = NOW + timedelta(minutes=5)
+    extended = GatedExtendedAdapter(clock, settlement_at=target)
+
+    async def delayed_catalog():
+        extended.catalog_calls += 1
+        extended.calls.append("catalog")
+        extended.request_started.set()
+        try:
+            await extended.gate.wait()
+        except asyncio.CancelledError:
+            extended.cancelled = True
+            raise
+        volume = MarketVolume(
+            Venue.EXTENDED, extended.market.venue_symbol, D("1000000"),
+            clock.now(), "official-shaped",
+        )
+        return (extended.market,), (volume,)
+
+    extended.fetch_catalog = delayed_catalog
+    fakes = adapters(clock, settlement_at=target)
+    fakes[Venue.EXTENDED] = extended
+
+    async def stop_after_ready(_seconds: float) -> None:
+        stop.set()
+        await asyncio.sleep(0)
+
+    with PaperRepository(tmp_path / "startup-delayed-extended.db") as repository:
+        task = asyncio.create_task(public_paper_run(
+            repository, adapters=fakes, clock=clock,
+            sleep=stop_after_ready, stop_event=stop,
+        ))
+        await extended.request_started.wait()
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert repository.connection.execute(
+            "SELECT COUNT(*) FROM runtime_evidence "
+            "WHERE event_type='PAPER_RUN_READY'"
+        ).fetchone()[0] == 0
+        assert repository.connection.execute(
+            "SELECT COUNT(*) FROM runtime_evidence "
+            "WHERE event_type='PUBLIC_SCAN'"
+        ).fetchone()[0] == 0
+        extended.gate.set()
+        result = await asyncio.wait_for(task, timeout=1)
+        events = repository.connection.execute(
+            "SELECT event_type, detail FROM runtime_evidence "
+            "WHERE event_type IN ('PUBLIC_REQUEST_COMPLETED','PUBLIC_SCAN',"
+            "'PAPER_RUN_READY') ORDER BY evidence_id"
+        ).fetchall()
+
+    assert result == {"status": "STOPPED_SAFE", "forced_close": False}
+    event_types = [row[0] for row in events]
+    initial_scan_index = next(
+        index for index, row in enumerate(events)
+        if row[0] == "PUBLIC_SCAN"
+        and json.loads(row[1])["scan_kind"] == "INITIAL"
+    )
+    ready_index = event_types.index("PAPER_RUN_READY")
+    assert initial_scan_index < ready_index
+    assert "PUBLIC_REQUEST_COMPLETED" in event_types[:initial_scan_index]
+    assert extended.catalog_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_sigterm_cancels_inflight_startup_catalog_without_ready(tmp_path):
+    clock = FakeClock()
+    stop = asyncio.Event()
+    target = NOW + timedelta(minutes=5)
+    extended = GatedExtendedAdapter(clock, settlement_at=target)
+    extended.catalog_calls = 1
+    fakes = adapters(clock, settlement_at=target)
+    fakes[Venue.EXTENDED] = extended
+
+    with PaperRepository(tmp_path / "sigterm-startup-cancel.db") as repository:
+        async with PublicPaperRuntime(
+            repository, adapters=fakes, clock=clock
+        ) as runtime:
+            task = asyncio.create_task(runtime.run(stop_event=stop))
+            await extended.request_started.wait()
+            started = time.monotonic()
+            runtime._request_stop("SIGTERM")
+            result = await asyncio.wait_for(task, timeout=1)
+            elapsed = time.monotonic() - started
+            events = repository.connection.execute(
+                "SELECT event_type FROM runtime_evidence ORDER BY evidence_id"
+            ).fetchall()
+
+    assert result == {"status": "STOPPED_SAFE", "forced_close": False}
+    assert elapsed < 1
+    assert extended.cancelled
+    assert "PUBLIC_SCAN" not in {row[0] for row in events}
+    assert "PAPER_RUN_READY" not in {row[0] for row in events}
+    assert events[-1][0] == "STOPPED_SAFE"
+
+
+@pytest.mark.asyncio
+async def test_public_observation_rest_fallback_is_bounded_per_venue(tmp_path):
+    clock = FakeClock()
+    target = NOW + timedelta(minutes=5)
+
+    class TrackedManyAdapter(ManyFakeAdapter):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.active = 0
+            self.max_active = 0
+
+        async def _tracked(self, operation):
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            try:
+                await asyncio.sleep(0)
+                return await operation()
+            finally:
+                self.active -= 1
+
+        async def fetch_book(self, venue_symbol):
+            return await self._tracked(
+                lambda: FakeAdapter.fetch_book(self, venue_symbol)
+            )
+
+        async def fetch_funding_quote(self, market, *, assumed_open_at):
+            return await self._tracked(
+                lambda: FakeAdapter.fetch_funding_quote(
+                    self, market, assumed_open_at=assumed_open_at
+                )
+            )
+
+    fakes = {
+        venue: TrackedManyAdapter(venue, clock, settlement_at=target)
+        for venue in Venue
+    }
+    with PaperRepository(tmp_path / "bounded-rest-concurrency.db") as repository:
+        async with PublicPaperRuntime(
+            repository, adapters=fakes, clock=clock
+        ) as runtime:
+            result = await runtime.scan()
+
+    assert len(result["routes"]) == 20
+    assert {adapter.max_active for adapter in fakes.values()} == {2}
+
+
+@pytest.mark.asyncio
+async def test_full_refresh_deadline_records_bounded_fail_closed_result(tmp_path):
+    clock = FakeClock()
+    target = NOW + timedelta(minutes=5)
+    blocked = GatedAdapter(Venue.RISEX, clock, settlement_at=target)
+    fakes = adapters(clock, settlement_at=target)
+    fakes[Venue.RISEX] = blocked
+    with PaperRepository(tmp_path / "full-refresh-deadline.db") as repository:
+        async with PublicPaperRuntime(
+            repository, adapters=fakes, clock=clock
+        ) as runtime:
+            await runtime.tick()
+            runtime._startup_gate_satisfied = True
+            runtime._stop_event = asyncio.Event()
+            blocked.block_funding = True
+            clock.value = NOW + timedelta(seconds=120)
+            await runtime.tick(clock.now())
+            await blocked.request_started.wait()
+            owner = runtime._refresh_task
+            deadline = runtime._pending_full_deadline_at
+            assert owner is not None and not owner.done()
+            assert deadline is not None
+
+            clock.value = deadline + timedelta(seconds=1)
+            await runtime.tick(clock.now())
+            blocked_rows = repository.connection.execute(
+                "SELECT detail FROM runtime_evidence "
+                "WHERE event_type='PUBLIC_SCAN_BLOCKED'"
+            ).fetchall()
+            full_count = repository.connection.execute(
+                "SELECT COUNT(*) FROM runtime_evidence "
+                "WHERE event_type='PUBLIC_SCAN' "
+                "AND json_extract(detail,'$.scan_kind')='FULL'"
+            ).fetchone()[0]
+            await runtime.shutdown()
+
+    assert owner.done() and owner.cancelled()
+    assert len(blocked_rows) == 1
+    blocked_detail = json.loads(blocked_rows[0][0])
+    assert blocked_detail["reason"] == "PUBLIC_REFRESH_DEADLINE_EXCEEDED"
+    assert blocked_detail["completed"] is False
+    assert full_count == 0
+    assert blocked.cancelled
+
+
+@pytest.mark.asyncio
+async def test_sigterm_cancels_inflight_public_refresh_without_fabricated_full(
+    tmp_path,
+):
+    clock = FakeClock()
+    target = NOW + timedelta(minutes=5)
+    blocked = GatedAdapter(Venue.RISEX, clock, settlement_at=target)
+    fakes = adapters(clock, settlement_at=target)
+    fakes[Venue.RISEX] = blocked
+    with PaperRepository(tmp_path / "sigterm-refresh-cancel.db") as repository:
+        async with PublicPaperRuntime(
+            repository, adapters=fakes, clock=clock
+        ) as runtime:
+            await runtime.tick()
+            runtime._startup_gate_satisfied = True
+            runtime._stop_event = asyncio.Event()
+            blocked.block_funding = True
+            runtime._start_public_refresh()
+            await blocked.request_started.wait()
+            owner = runtime._refresh_task
+            assert owner is not None and not owner.done()
+            writes_before_stop = repository.connection.total_changes
+
+            started = time.monotonic()
+            runtime.accepting_entries = False
+            runtime._request_stop("SIGTERM")
+            await asyncio.wait_for(runtime.shutdown(), timeout=1)
+            elapsed = time.monotonic() - started
+            writes_after_stop = repository.connection.total_changes
+            await asyncio.sleep(0)
+            writes_quiescent = repository.connection.total_changes
+            evidence = repository.connection.execute(
+                "SELECT event_type, detail FROM runtime_evidence ORDER BY evidence_id"
+            ).fetchall()
+            integrity = repository.connection.execute(
+                "PRAGMA integrity_check"
+            ).fetchone()[0]
+
+    assert elapsed < 1
+    assert blocked.cancelled
+    assert owner.done() and owner.cancelled()
+    assert runtime._pending_full_scan_at is None
+    assert not any(
+        row[0] == "PUBLIC_SCAN"
+        and json.loads(row[1]).get("scan_kind") == "FULL"
+        for row in evidence
+    )
+    assert evidence[-1][0] == "STOPPED_SAFE"
+    assert writes_after_stop > writes_before_stop
+    assert writes_quiescent == writes_after_stop
+    assert integrity == "ok"
 
 
 @pytest.mark.asyncio
@@ -5354,7 +5653,7 @@ async def test_restart_extended_elapsed_history_is_exact_or_unresolved(
 
 
 @pytest.mark.asyncio
-async def test_nado_only_initial_then_extended_ready_next_full_has_twenty_routes(tmp_path):
+async def test_all_route_initial_catalog_is_ready_before_next_full(tmp_path):
     clock = FakeClock()
     target = NOW + timedelta(minutes=10)
     risex = ManyFakeAdapter(Venue.RISEX, clock, settlement_at=target)
@@ -5433,18 +5732,12 @@ async def test_nado_only_initial_then_extended_ready_next_full_has_twenty_routes
             clock=clock,
         ) as runtime:
             runtime._stop_event = asyncio.Event()
-            initial = await runtime.scan(scan_kind="INITIAL")
-            await extended.catalog_started.wait()
-            universe_task = runtime._extended_universe_task
-            runtime._start_extended_universe_refresh()
-            runtime._start_extended_universe_refresh()
-            assert runtime._extended_universe_task is universe_task
-            assert len(initial["routes"]) == 10
-            assert {row["hedge_venue"] for row in initial["routes"]} == {"NADO"}
-
             extended.catalog_gate.set()
-            assert runtime._extended_universe_task is not None
-            await runtime._extended_universe_task
+            initial = await runtime.scan(scan_kind="INITIAL")
+            assert len(initial["routes"]) == 20
+            assert {row["hedge_venue"] for row in initial["routes"]} == {
+                "EXTENDED", "NADO",
+            }
             await runtime._refresh_public_data()
             for venue, symbol in tuple(runtime.observations):
                 adapter = runtime.adapters[venue]

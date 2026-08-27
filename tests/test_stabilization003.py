@@ -921,6 +921,10 @@ async def test_stabilization003_e_slow_full_refresh_never_blocks_deadline_schedu
                     )
                 confirm_public_streams(runtime, clock.now())
                 await runtime.tick()
+                if offset == 120:
+                    # This legacy scheduler test intentionally keeps the
+                    # synthetic refresh open through the funding cutoff.
+                    runtime._pending_full_deadline_at = target
                 if offset == 280:
                     activated_state = repository.load_runtime()
                     assert runtime._refresh_task is refresh_owner
@@ -1024,6 +1028,8 @@ async def test_stabilization003_f_catalog_paths_do_not_gate_full_observations(
             runtime._stop_event = asyncio.Event()
             runtime._start_extended_universe_refresh()
             await extended.universe_started.wait()
+            catalog_task = runtime._extended_universe_task
+            assert catalog_task is not None and not catalog_task.done()
             clock.value = BASE + timedelta(seconds=120)
             confirm_public_streams(runtime, clock.now())
             await runtime.tick()
@@ -1041,8 +1047,7 @@ async def test_stabilization003_f_catalog_paths_do_not_gate_full_observations(
             extended.universe_gate.set()
             extended.required_gate.set()
             await runtime._refresh_task
-            assert runtime._extended_universe_task is not None
-            await runtime._extended_universe_task
+            await catalog_task
             await runtime.tick()
             final_full_count = _full_scan_count(repository)
             if runtime._refresh_task is not None:
@@ -1707,6 +1712,9 @@ async def test_stabilization003_run_loop_deadlines_precede_refresh_completion(tm
         assert await _spin_until(lambda: len(sleeper.waits) >= 3)
         refresh_owner = runtime._refresh_task
         assert refresh_owner is not None and not refresh_owner.done()
+        # Keep this focused-deadline regression about priority ordering; the
+        # bounded-default deadline is covered by the dedicated blocker test.
+        runtime._pending_full_deadline_at = target
         for expected_waits, offset in ((4, 280), (5, 395)):
             clock.value = BASE + timedelta(seconds=offset)
             for key, observation in tuple(runtime.observations.items()):
