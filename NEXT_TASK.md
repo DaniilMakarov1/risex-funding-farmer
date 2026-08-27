@@ -2,7 +2,7 @@
 
 ## Two-route testnet funding-boundary lifecycles
 
-Status: `BLOCKED — FRESH NADO READ-ONLY ROUND TERMINATED HTTP 403; EXTENDED ETH-USD HAS ZERO ASKS; NO WRITE IN FLIGHT`.
+Status: `BLOCKED — NADO LIVE FUNDING-EVENT WIRE ADAPTER IS UNPROVEN; EXTENDED TESTNET BOOKS HAVE ZERO ASKS; NO WRITE IN FLIGHT`.
 
 Objective: prove how the accepted system behaves before, during, and after an actual testnet funding settlement on exactly two hedged routes: one RISEx–Nado route and one RISEx–Extended route. Open the smallest venue-executable matched testnet positions, observe and reconcile actual venue funding semantics at the boundary, then close every leg to authoritative zero relevant orders and exact flatness.
 
@@ -12,7 +12,7 @@ Exact starting point:
 - All earlier RISEx, Nado, and Extended Level C lifecycles are complete historical evidence; this is a fresh funding-accrual objective, not permission to replay their intents.
 - The corrected public all-route implementation and its paper measurements remain accepted, but the `chief11` statistical window was intentionally ended for this rotation. Its database has integrity `ok` and zero orders/fills/positions; its obsolete automation was deleted.
 - Fresh authenticated read-only gates are accepted for RISEx, Nado, and Extended. The first staged RISEx, Nado, and Extended candidates are not accepted: exact opposite-direction matching, authoritative cross-run journal binding, and Nado event-to-account funding agreement must be corrected and independently reverified before any dispatch. Their bounded correction worktrees are preserved and idle at the operational blocker; none is integrated or accepted. Extended ETH-USD currently has no ask-side liquidity. No venue write is in flight.
-- On the fresh `2026-08-27` operational checkpoint, RISEx again passed its two-barrier authenticated read with authoritative zero-order/flat evidence, and Extended again reached `READY` through the accepted strict REST fallback. Nado round A and its signed trigger-order observation completed, but the fifth request of authoritative round B (`contracts`) returned terminal `HTTP 403`; one separate public-only diagnostic reproduced the same `HTTP 403` on its first request. This semantic HTTP failure is not retryable inside the gate. Together with Extended ETH-USD remaining `OK` but `4 bids / 0 asks`, these are exact fail-closed blockers for both authorized writes.
+- On the fresh `2026-08-28` checkpoint, RISEx again `PASSED`, Extended again reached `READY` through the accepted strict REST fallback, and Nado `FINALIZED` on 94 products with two agreeing rounds; the earlier Nado `contracts` HTTP 403 no longer reproduced. Accepted main `62fad2fbb27d937db2faa9d95feca10b21d63b0e` adds the Nado funding-boundary safety and operational contract: exact opposite directions and canonical quantity, immutable pre-dispatch route/run/store/account binding, exact event-to-account funding agreement, durable skipped/unresolved blockers, applied-only completion, and two agreeing final zero-order/exact-flat rounds. Chief verification passed `2542` tests with `3` skipped. Nado remains blocked before dispatch because no accepted authoritative live funding-event wire adapter exists; do not inject or guess that schema. Extended public `BTC-USD` and `ETH-USD` books returned respectively `1 bid / 0 asks` and `4 bids / 0 asks`, so its write remains blocked too.
 
 Authorized routes:
 
