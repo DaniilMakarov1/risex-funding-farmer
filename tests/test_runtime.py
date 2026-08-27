@@ -4116,6 +4116,9 @@ async def test_extended_health_is_per_socket_and_stale_restart_has_one_episode(
         restarted = []
         runtime._start_extended_stream = lambda _symbol, kind: restarted.append(kind)
         await runtime._check_extended_health(clock.now())
+        recovery_owner = runtime._extended_health_recovery_task
+        assert recovery_owner is not None
+        await recovery_owner
         assert restarted == [stale_kind]
         assert tasks[stale_kind].cancelled()
         for kind in ("book", "trade", "funding"):
@@ -4141,6 +4144,9 @@ async def test_extended_health_is_per_socket_and_stale_restart_has_one_episode(
             clock.now() - timedelta(seconds=26)
         )
         await runtime._check_extended_health(clock.now())
+        recovery_owner = runtime._extended_health_recovery_task
+        assert recovery_owner is not None
+        await recovery_owner
         confirm_extended_stream(runtime, symbol, stale_kind, clock.now(), data_ready=True)
         runtime._watchdog_restarted(
             (Venue.EXTENDED, stale_kind, (symbol,)), at=clock.now()
@@ -4178,6 +4184,249 @@ async def test_extended_health_is_per_socket_and_stale_restart_has_one_episode(
         "restart_reason",
     } <= set(stale_detail)
     assert stale_detail["restart_reason"] == "CONFIRMATION_STALE"
+
+
+@pytest.mark.asyncio
+async def test_extended_health_noncurrent_request_clears_watchdog_episode(
+    tmp_path,
+):
+    clock = FakeClock()
+    symbol = "ABC-EXTENDED"
+    key = (Venue.EXTENDED, symbol, "book")
+    with PaperRepository(tmp_path / "extended-health-noncurrent.db") as repository:
+        runtime = PublicPaperRuntime(repository, adapters={}, clock=clock)
+        runtime._stop_event = asyncio.Event()
+        stream_task = asyncio.create_task(runtime._stop_event.wait())
+        runtime._stream_tasks[key] = stream_task
+        old_session = runtime._new_stream_session(key)
+        runtime._extended_confirmed_at[symbol, "book"] = (
+            clock.now() - timedelta(seconds=26)
+        )
+        original_disconnect = runtime.mark_disconnected
+
+        async def superseding_disconnect(venue, market, **kwargs):
+            runtime._new_stream_session(key)
+            await original_disconnect(venue, market, **kwargs)
+
+        runtime.mark_disconnected = superseding_disconnect
+        restarted = []
+        runtime._start_extended_stream = lambda _symbol, kind: restarted.append(kind)
+        owner = None
+        try:
+            await runtime._check_extended_health(clock.now())
+            owner = runtime._extended_health_recovery_task
+            assert owner is not None
+            await owner
+            assert runtime._stream_sessions[key] != old_session
+            assert restarted == []
+            assert runtime._pending_watchdog_episodes == {}
+            assert [row["event_type"] for row in repository.connection.execute(
+                "SELECT event_type FROM runtime_evidence ORDER BY evidence_id"
+            ).fetchall()] == ["PUBLIC_STREAM_CONFIRMATION_STALE"]
+        finally:
+            runtime._request_stop("STOP_EVENT")
+            if owner is not None and not owner.done():
+                owner.cancel()
+                await asyncio.gather(owner, return_exceptions=True)
+            stream_task.cancel()
+            await asyncio.gather(stream_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_extended_health_wave_coalesces_and_preserves_full_deadline(
+    tmp_path,
+):
+    clock = FakeClock(NOW - timedelta(seconds=60))
+    target = NOW + timedelta(minutes=5)
+    fakes = adapters(clock, settlement_at=target)
+    blocked = GatedAdapter(Venue.RISEX, clock, settlement_at=target)
+    fakes[Venue.RISEX] = blocked
+    wave_symbols = tuple(
+        f"WAVE-{index:02d}-EXTENDED" for index in range(45)
+    )
+    release_recovery = asyncio.Event()
+    all_recoveries_started = asyncio.Event()
+    recovery_arrivals = 0
+    stop_streams = asyncio.Event()
+    restarted: list[str] = []
+
+    with PaperRepository(tmp_path / "extended-health-wave.db") as repository:
+        async with PublicPaperRuntime(
+            repository, adapters=fakes, clock=clock
+        ) as runtime:
+            await runtime.scan()
+            blocked.block_funding = True
+            runtime._stop_event = asyncio.Event()
+            runtime.accepting_entries = False
+            for symbol in wave_symbols:
+                key = (Venue.EXTENDED, symbol, "book")
+                task = asyncio.create_task(stop_streams.wait())
+                runtime._stream_tasks[key] = task
+                session_id = runtime._new_stream_session(key)
+                runtime._extended_confirmed_at[symbol, "book"] = (
+                    NOW - timedelta(seconds=26)
+                )
+                assert session_id.value > 0
+
+            async def gated_disconnect(*args, **kwargs):
+                nonlocal recovery_arrivals
+                recovery_arrivals += 1
+                if recovery_arrivals == len(wave_symbols):
+                    all_recoveries_started.set()
+                await all_recoveries_started.wait()
+                await release_recovery.wait()
+                return await original_disconnect(*args, **kwargs)
+
+            original_disconnect = runtime.mark_disconnected
+            runtime.mark_disconnected = gated_disconnect
+            def start_replacement(symbol: str, kind: str) -> None:
+                restarted.append(f"{symbol}:{kind}")
+                replacement_key = (Venue.EXTENDED, symbol, kind)
+                replacement_session = runtime._new_stream_session(
+                    replacement_key
+                )
+                runtime._confirm_extended_stream(
+                    symbol, kind, clock.now(), data_ready=True,
+                    stream_session_id=replacement_session,
+                )
+                runtime._watchdog_restarted(
+                    (Venue.EXTENDED, kind, (symbol,)), at=clock.now()
+                )
+
+            runtime._start_extended_stream = start_replacement
+            runtime.next_health_check_at = NOW
+            runtime.next_full_scan_at = NOW
+
+            await asyncio.wait_for(runtime.tick(NOW), timeout=1)
+            await asyncio.wait_for(
+                all_recoveries_started.wait(), timeout=1
+            )
+            await asyncio.wait_for(blocked.request_started.wait(), timeout=1)
+            refresh_owner = runtime._refresh_task
+            assert refresh_owner is not None and not refresh_owner.done()
+            assert runtime._extended_health_recovery_task is not None
+            health_owner = runtime._extended_health_recovery_task
+            assert len(runtime._extended_health_recovery_requests) == len(
+                wave_symbols
+            )
+
+            await asyncio.gather(*(
+                runtime._check_extended_health(NOW)
+                for _ in range(3)
+            ))
+            assert runtime._extended_health_recovery_task is health_owner
+            assert len(runtime._extended_health_recovery_requests) == len(
+                wave_symbols
+            )
+
+            deadline = runtime._pending_full_deadline_at
+            assert deadline is not None
+            clock.value = deadline + timedelta(seconds=1)
+            await asyncio.wait_for(runtime.tick(clock.now()), timeout=1)
+            blocked_rows = repository.connection.execute(
+                "SELECT detail FROM runtime_evidence "
+                "WHERE event_type='PUBLIC_SCAN_BLOCKED'"
+            ).fetchall()
+            full_rows = repository.connection.execute(
+                "SELECT detail FROM runtime_evidence "
+                "WHERE event_type='PUBLIC_SCAN' "
+                "AND json_extract(detail,'$.scan_kind')='FULL'"
+            ).fetchall()
+            assert len(blocked_rows) == 1
+            blocked_detail = json.loads(blocked_rows[0]["detail"])
+            assert blocked_detail == {
+                "kind": "full",
+                "reason": "PUBLIC_REFRESH_DEADLINE_EXCEEDED",
+                "scheduled_at": NOW.isoformat(),
+                "deadline_at": deadline.isoformat(),
+                "completed": False,
+                "catalog_generation": runtime._catalog_generation,
+            }
+            assert full_rows == []
+            assert runtime.last_scan is not None
+            assert runtime.last_scan.logical_at == NOW - timedelta(seconds=60)
+            assert blocked.cancelled
+
+            release_recovery.set()
+            await asyncio.wait_for(health_owner, timeout=1)
+            await asyncio.sleep(0)
+            assert sorted(restarted) == [
+                f"{symbol}:book" for symbol in sorted(wave_symbols)
+            ]
+            restart_rows = repository.connection.execute(
+                "SELECT detail FROM runtime_evidence "
+                "WHERE event_type='PUBLIC_STREAM_RESTARTED' "
+                "ORDER BY evidence_id"
+            ).fetchall()
+            assert sorted(
+                json.loads(row["detail"])["market"] for row in restart_rows
+            ) == list(sorted(wave_symbols))
+            assert runtime._extended_health_recovery_task is None
+            assert runtime._extended_health_recovery_requests == {}
+            assert all(task.done() for task in runtime._retired_stream_tasks)
+
+            runtime._request_stop("STOP_EVENT")
+            await asyncio.wait_for(runtime.shutdown(), timeout=1)
+            assert blocked.cancelled
+            assert repository.connection.execute(
+                "PRAGMA integrity_check"
+            ).fetchone()[0] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_extended_health_recovery_stop_is_bounded_and_cleans_owner(
+    tmp_path,
+):
+    clock = FakeClock()
+    target = NOW + timedelta(minutes=5)
+    fakes = adapters(clock, settlement_at=target)
+    symbol = fakes[Venue.EXTENDED].market.venue_symbol
+    key = (Venue.EXTENDED, symbol, "book")
+    recovery_entered = asyncio.Event()
+    stop_stream = asyncio.Event()
+
+    with PaperRepository(tmp_path / "extended-health-stop.db") as repository:
+        async with PublicPaperRuntime(
+            repository, adapters=fakes, clock=clock
+        ) as runtime:
+            await runtime.scan()
+            runtime._stop_event = asyncio.Event()
+            stream_task = asyncio.create_task(stop_stream.wait())
+            runtime._stream_tasks[key] = stream_task
+            session_id = runtime._new_stream_session(key)
+            runtime._extended_confirmed_at[symbol, "book"] = (
+                clock.now() - timedelta(seconds=26)
+            )
+
+            async def blocked_disconnect(*args, **kwargs):
+                recovery_entered.set()
+                await asyncio.Event().wait()
+
+            runtime.mark_disconnected = blocked_disconnect
+            check = asyncio.create_task(runtime._check_extended_health(clock.now()))
+            await check
+            owner = runtime._extended_health_recovery_task
+            assert owner is not None and not owner.done()
+            await asyncio.wait_for(recovery_entered.wait(), timeout=1)
+
+            runtime._request_stop("SIGTERM")
+            started = time.monotonic()
+            await asyncio.wait_for(runtime.shutdown(), timeout=1)
+            elapsed = time.monotonic() - started
+
+            evidence = repository.connection.execute(
+                "SELECT event_type FROM runtime_evidence ORDER BY evidence_id"
+            ).fetchall()
+            assert elapsed < 1
+            assert owner.done() and owner.cancelled()
+            assert stream_task.done() and stream_task.cancelled()
+            assert runtime._extended_health_recovery_task is None
+            assert runtime._extended_health_recovery_requests == {}
+            assert not runtime._retired_stream_tasks
+            assert evidence[-1]["event_type"] == "STOPPED_SAFE"
+            assert repository.connection.execute(
+                "PRAGMA integrity_check"
+            ).fetchone()[0] == "ok"
 
 
 @pytest.mark.asyncio
@@ -4566,6 +4815,9 @@ async def test_simultaneous_stale_watchdog_mutation_is_generation_safe(tmp_path)
         restarted = []
         runtime._start_extended_stream = lambda _symbol, kind: restarted.append(kind)
         await runtime._check_extended_health(clock.now())
+        recovery_owner = runtime._extended_health_recovery_task
+        assert recovery_owner is not None
+        await recovery_owner
         rows = repository.connection.execute(
             "SELECT event_type FROM runtime_evidence ORDER BY evidence_id"
         ).fetchall()

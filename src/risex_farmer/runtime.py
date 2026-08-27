@@ -97,6 +97,16 @@ class RecoveryEpisode:
 
 
 @dataclass(frozen=True, slots=True)
+class ExtendedHealthRecoveryRequest:
+    symbol: str
+    kind: str
+    detected_at: datetime
+    confirmed_at: datetime
+    stream_session_id: StreamSessionId
+    stream_task: asyncio.Task[None]
+
+
+@dataclass(frozen=True, slots=True)
 class RecoveryPublicationCandidate:
     recovered: OrderBook
     health: StreamHealth
@@ -390,6 +400,10 @@ class PublicPaperRuntime:
         self._catalog_refresh_pending = False
         self._recoveries: dict[tuple[Venue, str], RecoveryEpisode] = {}
         self._retired_recovery_tasks: set[asyncio.Task[None]] = set()
+        self._extended_health_recovery_task: asyncio.Task[None] | None = None
+        self._extended_health_recovery_requests: dict[
+            tuple[str, str], ExtendedHealthRecoveryRequest
+        ] = {}
         self._recovery_episode_number = 0
         self._recovery_attempt_number = 0
         self._pending_socket_episodes: dict[
@@ -2755,24 +2769,132 @@ class PublicPaperRuntime:
                 or self._extended_confirmed_at.get((symbol, kind)) != confirmed_at
             ):
                 continue
-            identity = (Venue.EXTENDED, kind, (symbol,))
-            self._watchdog_stale(
-                identity, at=at,
-                last_confirmation=confirmed_at,
+            assert session_id is not None and task is not None
+            self._queue_extended_health_recovery(
+                ExtendedHealthRecoveryRequest(
+                    symbol, kind, at, confirmed_at,
+                    session_id, task,
+                )
             )
-            await self.mark_disconnected(
-                Venue.EXTENDED, symbol, at=at, stream_kind=kind,
-                exception=TimeoutError("public socket confirmation stale"),
-                stream_session_id=session_id,
+
+    def _queue_extended_health_recovery(
+        self, request: ExtendedHealthRecoveryRequest
+    ) -> None:
+        if self._stop_event is None or self._stop_event.is_set():
+            return
+        key = (request.symbol, request.kind)
+        if key in self._extended_health_recovery_requests:
+            return
+        self._extended_health_recovery_requests[key] = request
+        owner = self._extended_health_recovery_task
+        if owner is not None and not owner.done():
+            return
+        owner = asyncio.create_task(self._run_extended_health_recoveries())
+        self._extended_health_recovery_task = owner
+        owner.add_done_callback(self._extended_health_recovery_done)
+
+    def _extended_health_recovery_is_current(
+        self, request: ExtendedHealthRecoveryRequest
+    ) -> bool:
+        if self._stop_event is None or self._stop_event.is_set():
+            return False
+        key = (Venue.EXTENDED, request.symbol, request.kind)
+        return (
+            self._stream_sessions.get(key) == request.stream_session_id
+            and self._stream_tasks.get(key) is request.stream_task
+            and self._extended_confirmed_at.get(
+                (request.symbol, request.kind)
+            ) == request.confirmed_at
+        )
+
+    async def _recover_extended_health(
+        self, request: ExtendedHealthRecoveryRequest
+    ) -> None:
+        stream_key = (Venue.EXTENDED, request.symbol, request.kind)
+        identity = (Venue.EXTENDED, request.kind, (request.symbol,))
+        if not self._extended_health_recovery_is_current(request):
+            return
+        self._watchdog_stale(
+            identity, at=request.detected_at,
+            last_confirmation=request.confirmed_at,
+        )
+        watchdog_detail = self._pending_watchdog_episodes[identity]
+        watchdog_episode_id = str(watchdog_detail["episode_id"])
+        await self.mark_disconnected(
+            Venue.EXTENDED, request.symbol,
+            at=request.detected_at,
+            stream_kind=request.kind,
+            exception=TimeoutError("public socket confirmation stale"),
+            stream_session_id=request.stream_session_id,
+        )
+        if (
+            self._stop_event is None
+            or self._stop_event.is_set()
+            or not self._owns_stream_session(
+                stream_key, request.stream_session_id
             )
-            if (
-                self._stop_event.is_set()
-                or not self._owns_stream_session(key, session_id)
-                or self._stream_tasks.get(key) is not task
-            ):
-                self._pending_watchdog_episodes.pop(identity, None)
-                continue
-            await self._restart_extended_stream(symbol, kind)
+            or self._stream_tasks.get(stream_key) is not request.stream_task
+        ):
+            self._clear_extended_health_watchdog(identity, watchdog_episode_id)
+            return
+        await self._restart_extended_stream(request.symbol, request.kind)
+
+    def _clear_extended_health_watchdog(
+        self,
+        identity: tuple[Venue, str, tuple[str, ...]],
+        episode_id: str,
+    ) -> None:
+        detail = self._pending_watchdog_episodes.get(identity)
+        if (
+            detail is not None
+            and str(detail.get("episode_id")) == episode_id
+        ):
+            self._pending_watchdog_episodes.pop(identity, None)
+
+    async def _run_extended_health_recoveries(self) -> None:
+        while (
+            self._extended_health_recovery_requests
+            and self._stop_event is not None
+            and not self._stop_event.is_set()
+        ):
+            batch = tuple(self._extended_health_recovery_requests.items())
+            outcomes: list[object] = []
+            for kind in ("book", "trade", "funding"):
+                group = tuple(
+                    (key, request)
+                    for key, request in batch
+                    if request.kind == kind
+                )
+                if not group:
+                    continue
+                outcomes.extend(await asyncio.gather(
+                    *(
+                        self._recover_extended_health(request)
+                        for _, request in group
+                    ),
+                    return_exceptions=True,
+                ))
+            for key, request in batch:
+                if self._extended_health_recovery_requests.get(key) == request:
+                    self._extended_health_recovery_requests.pop(key, None)
+            failure = next(
+                (
+                    outcome
+                    for outcome in outcomes
+                    if isinstance(outcome, BaseException)
+                    and not isinstance(outcome, asyncio.CancelledError)
+                ),
+                None,
+            )
+            if failure is not None:
+                raise failure
+
+    def _extended_health_recovery_done(
+        self, task: asyncio.Task[None]
+    ) -> None:
+        if task is self._extended_health_recovery_task:
+            self._extended_health_recovery_task = None
+        self._background_task_done(task)
 
     def _watchdog_stale(
         self, identity: tuple[Venue, str, tuple[str, ...]], *, at: datetime,
@@ -4581,6 +4703,7 @@ class PublicPaperRuntime:
             or self._refresh_task is not None
             or self._recoveries
             or self._retired_recovery_tasks
+            or self._extended_health_recovery_task is not None
             or self._extended_universe_task is not None
         )
 
@@ -4606,6 +4729,8 @@ class PublicPaperRuntime:
             if episode.task is not None
         )
         owned.extend(self._retired_recovery_tasks)
+        if self._extended_health_recovery_task is not None:
+            owned.append(self._extended_health_recovery_task)
         if self._extended_universe_task is not None:
             owned.append(self._extended_universe_task)
         for task in owned:
@@ -4642,6 +4767,8 @@ class PublicPaperRuntime:
         self._stream_sessions.clear()
         self._recoveries.clear()
         self._retired_recovery_tasks.clear()
+        self._extended_health_recovery_requests.clear()
+        self._extended_health_recovery_task = None
         self._pending_socket_episodes.clear()
         self._pending_watchdog_episodes.clear()
         self._refresh_task = None
