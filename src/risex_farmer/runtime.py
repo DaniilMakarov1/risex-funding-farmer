@@ -438,6 +438,7 @@ class PublicPaperRuntime:
         self._extended_universe_task: asyncio.Task[None] | None = None
         self.next_extended_catalog_at: datetime | None = None
         self.notifications = notifications
+        self._tick_task: asyncio.Task[None] | None = None
         self._catalog_reconciliation_in_progress = False
         self._notification_run_id: str | None = None
         self._stop_cause: str | None = None
@@ -605,18 +606,34 @@ class PublicPaperRuntime:
             detail=detail,
         )
         now = at or self.clock.now()
-        # Physical churn and logical resync are persisted operational evidence,
-        # but only an unresolved semantic failure opens a Telegram outage.
+        if event_type in {
+            "PUBLIC_SOCKET_DISCONNECTED", "PUBLIC_SOCKET_RECONNECTED",
+        }:
+            self._notify_socket_outage_if_due(
+                venue=venue, detail=detail, at=now,
+            )
+        # Physical churn and logical resync are persisted operational evidence;
+        # only semantic failure or a socket episode beyond health opens outage.
         if event_type in {
             "PUBLIC_SNAPSHOT_RECOVERY_FAILED", "PUBLIC_STREAM_CONFIRMATION_STALE",
+            "PUBLIC_SCAN_BLOCKED",
         }:
+            if event_type == "PUBLIC_SCAN_BLOCKED":
+                reason = "UNKNOWN"
+                if detail is not None and detail.get("reason") is not None:
+                    reason = str(detail["reason"])
+                text = f"Critical public scan blocked: {reason}"
+            else:
+                text = (
+                    f"Critical public data loss: "
+                    f"{venue.value if venue else 'PUBLIC'} {event_type}"
+                )
             self._notify_outage(
                 event_type, degraded=True, venue=venue, detail=detail,
                 event_id=f"data-loss:{venue.value if venue else 'PUBLIC'}:"
                 f"{event_type}:{now.isoformat()}",
                 kind="CRITICAL_DATA_LOSS", occurred_at=now,
-                text=f"Critical public data loss: "
-                f"{venue.value if venue else 'PUBLIC'} {event_type}",
+                text=text,
             )
         elif event_type in {
             "PUBLIC_SOCKET_RECONNECTED", "PUBLIC_SNAPSHOT_RECOVERY_COMPLETED",
@@ -632,6 +649,52 @@ class PublicPaperRuntime:
                 occurred_at=now,
                 text=f"Public data recovered: "
                 f"{venue.value if venue else 'PUBLIC'} {event_type}",
+            )
+
+    def _notify_socket_outage_if_due(
+        self,
+        *,
+        venue: Venue | None,
+        detail: dict[str, object] | None,
+        at: datetime,
+    ) -> None:
+        if detail is None or not self._socket_episode_is_due(detail, at):
+            return
+        episode = detail.get("episode_id") or detail.get("disconnected_at")
+        recovery_id = (
+            str(episode) if episode is not None else at.isoformat()
+        )
+        self._notify_outage(
+            "PUBLIC_SOCKET_DISCONNECTED", degraded=True, venue=venue,
+            detail=detail,
+            event_id=f"data-loss:{venue.value if venue else 'PUBLIC'}:"
+            f"PUBLIC_SOCKET_DISCONNECTED:{recovery_id}",
+            kind="CRITICAL_DATA_LOSS", occurred_at=at,
+            text=f"Critical public data loss: "
+            f"{venue.value if venue else 'PUBLIC'} PUBLIC_SOCKET_DISCONNECTED",
+        )
+
+    def _socket_episode_is_due(
+        self, detail: dict[str, object], at: datetime
+    ) -> bool:
+        disconnected_at = detail.get("disconnected_at")
+        if not isinstance(disconnected_at, str):
+            return False
+        try:
+            started_at = datetime.fromisoformat(disconnected_at)
+            age = at - started_at
+        except (TypeError, ValueError):
+            return False
+        return age >= timedelta(
+            seconds=self.config.max_market_stream_silence_seconds
+        )
+
+    def _notify_pending_socket_outages(self, at: datetime) -> None:
+        for (venue, _stream_kind, _markets), detail in tuple(
+            self._pending_socket_episodes.items()
+        ):
+            self._notify_socket_outage_if_due(
+                venue=venue, detail=detail, at=at,
             )
 
     def _notify_outage(
@@ -654,7 +717,15 @@ class PublicPaperRuntime:
         market = detail.get(
             "symbol", detail.get("market", detail.get("markets", "PUBLIC"))
         )
-        if venue is Venue.EXTENDED and stream_kind == "book":
+        if event_type == "PUBLIC_SCAN_BLOCKED":
+            semantic_episode = (
+                detail.get("scheduled_at")
+                or detail.get("deadline_at")
+                or detail.get("reason")
+                or "UNKNOWN"
+            )
+            identity = f"PUBLIC_SCAN_BLOCKED:{semantic_episode}"
+        elif venue is Venue.EXTENDED and stream_kind == "book":
             # One Extended book socket outage also emits logical book-resync
             # evidence. Both describe the same notification state.
             identity = f"{venue.value}:{market}:book"
@@ -1934,6 +2005,7 @@ class PublicPaperRuntime:
 
     async def tick(self, at: datetime | None = None) -> None:
         now = at or self.clock.now()
+        self._notify_pending_socket_outages(now)
         if (
             self.next_extended_catalog_at is not None
             and now >= self.next_extended_catalog_at
@@ -4520,7 +4592,9 @@ class PublicPaperRuntime:
         """Run one tick while allowing an external stop to cancel its awaits."""
         assert self._stop_event is not None
         tick_task = asyncio.create_task(self.tick())
+        self._tick_task = tick_task
         stop_task = asyncio.create_task(self._stop_event.wait())
+        handoff_to_shutdown = False
         try:
             done, _ = await asyncio.wait(
                 (tick_task, stop_task), return_when=asyncio.FIRST_COMPLETED
@@ -4529,7 +4603,8 @@ class PublicPaperRuntime:
                 await tick_task
                 return False
             tick_task.cancel()
-            await asyncio.gather(tick_task, return_exceptions=True)
+            # Let shutdown close the transport before awaiting this owner.
+            handoff_to_shutdown = True
             return True
         except asyncio.CancelledError:
             tick_task.cancel()
@@ -4537,6 +4612,12 @@ class PublicPaperRuntime:
         finally:
             stop_task.cancel()
             await asyncio.gather(stop_task, return_exceptions=True)
+            if (
+                self._tick_task is tick_task
+                and tick_task.done()
+                and not handoff_to_shutdown
+            ):
+                self._tick_task = None
 
     def _next_wakeup_at(self, now: datetime) -> datetime:
         if self.broker is None:
@@ -4707,6 +4788,7 @@ class PublicPaperRuntime:
             or self._extended_health_recovery_task is not None
             or self._extended_health_recovery_requests
             or self._extended_universe_task is not None
+            or self._tick_task is not None
         )
 
     def _owned_background_tasks(self) -> set[asyncio.Task[None]]:
@@ -4723,6 +4805,8 @@ class PublicPaperRuntime:
             owned.add(self._extended_health_recovery_task)
         if self._extended_universe_task is not None:
             owned.add(self._extended_universe_task)
+        if self._tick_task is not None:
+            owned.add(self._tick_task)
         return owned
 
     async def _cancel_owned_background_tasks(self) -> None:
@@ -4799,6 +4883,7 @@ class PublicPaperRuntime:
         self._pending_full_deadline_at = None
         self._catalog_refresh_pending = False
         self._extended_universe_task = None
+        self._tick_task = None
 
     async def close(self) -> None:
         if self.accepting_entries or self._has_owned_background_work():

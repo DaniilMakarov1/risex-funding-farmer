@@ -3232,6 +3232,119 @@ def test_transient_socket_wave_persists_raw_lifecycle_without_alerts(tmp_path):
     assert outbox._active_outages == set()
 
 
+@pytest.mark.asyncio
+async def test_pending_socket_episode_alerts_at_existing_silence_threshold(tmp_path):
+    clock = FakeClock()
+    delivery = CaptureNotifications()
+    outbox = NotificationOutbox(delivery)
+    symbol = "PENDING-EXTENDED"
+    identity = (Venue.EXTENDED, "trade", (symbol,))
+    with PaperRepository(tmp_path / "pending-socket-outage.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={}, clock=clock, notifications=outbox,
+        )
+        session_id = runtime._new_stream_session(
+            (Venue.EXTENDED, symbol, "trade")
+        )
+        runtime._socket_disconnected(
+            identity, at=clock.now(), stream_session_id=session_id,
+        )
+        runtime.last_scan = SimpleNamespace(logical_at=clock.now())
+        runtime.next_full_scan_at = clock.now() + timedelta(hours=1)
+        runtime.next_health_check_at = clock.now() + timedelta(hours=1)
+        runtime._startup_gate_satisfied = True
+        runtime.accepting_entries = False
+        clock.advance(25)
+        await runtime.tick(clock.now())
+        assert [row.kind for row in delivery.rows] == ["CRITICAL_DATA_LOSS"]
+
+        clock.advance(1)
+        runtime._socket_reconnected(
+            identity, at=clock.now(), stream_session_id=session_id,
+        )
+        lifecycle = repository.connection.execute(
+            "SELECT event_type FROM runtime_evidence ORDER BY evidence_id"
+        ).fetchall()
+
+    assert [row["event_type"] for row in lifecycle] == [
+        "PUBLIC_SOCKET_DISCONNECTED", "PUBLIC_SOCKET_RECONNECTED",
+    ]
+    assert [row.kind for row in delivery.rows] == [
+        "CRITICAL_DATA_LOSS", "DATA_RECOVERY",
+    ]
+    assert outbox._active_outages == set()
+
+
+@pytest.mark.parametrize(("duration", "expected"), (
+    (24, []),
+    (34, ["CRITICAL_DATA_LOSS", "DATA_RECOVERY"]),
+    (44, ["CRITICAL_DATA_LOSS", "DATA_RECOVERY"]),
+))
+def test_socket_reconnect_classifies_24_to_44_second_episodes(
+    tmp_path, duration, expected,
+):
+    clock = FakeClock()
+    delivery = CaptureNotifications()
+    outbox = NotificationOutbox(delivery)
+    symbol = f"LATE-{duration}-EXTENDED"
+    identity = (Venue.EXTENDED, "trade", (symbol,))
+    with PaperRepository(tmp_path / f"socket-reconnect-{duration}.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={}, clock=clock, notifications=outbox,
+        )
+        session_id = runtime._new_stream_session(
+            (Venue.EXTENDED, symbol, "trade")
+        )
+        runtime._socket_disconnected(
+            identity, at=clock.now(), stream_session_id=session_id,
+        )
+        clock.advance(duration)
+        runtime._socket_reconnected(
+            identity, at=clock.now(), stream_session_id=session_id,
+        )
+        lifecycle = repository.connection.execute(
+            "SELECT event_type FROM runtime_evidence ORDER BY evidence_id"
+        ).fetchall()
+
+    assert [row["event_type"] for row in lifecycle] == [
+        "PUBLIC_SOCKET_DISCONNECTED", "PUBLIC_SOCKET_RECONNECTED",
+    ]
+    assert [row.kind for row in delivery.rows] == expected
+    assert outbox._active_outages == set()
+
+
+def test_blocked_full_semantic_episode_notifies_once_with_reason(tmp_path):
+    clock = FakeClock()
+    delivery = CaptureNotifications()
+    outbox = NotificationOutbox(delivery)
+    detail = {
+        "kind": "full",
+        "reason": "PUBLIC_REFRESH_DEADLINE_EXCEEDED",
+        "scheduled_at": NOW.isoformat(),
+        "deadline_at": (NOW + timedelta(seconds=30)).isoformat(),
+        "completed": False,
+        "catalog_generation": 4,
+    }
+    with PaperRepository(tmp_path / "blocked-notification-dedupe.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={}, clock=clock, notifications=outbox,
+        )
+        runtime._record("PUBLIC_SCAN_BLOCKED", at=clock.now(), detail=detail)
+        clock.advance(1)
+        runtime._record("PUBLIC_SCAN_BLOCKED", at=clock.now(), detail=detail)
+        lifecycle = repository.connection.execute(
+            "SELECT event_type FROM runtime_evidence ORDER BY evidence_id"
+        ).fetchall()
+
+    assert [row["event_type"] for row in lifecycle] == [
+        "PUBLIC_SCAN_BLOCKED", "PUBLIC_SCAN_BLOCKED",
+    ]
+    assert [row.kind for row in delivery.rows] == ["CRITICAL_DATA_LOSS"]
+    assert delivery.rows[0].text == (
+        "Critical public scan blocked: PUBLIC_REFRESH_DEADLINE_EXCEEDED"
+    )
+
+
 @pytest.mark.parametrize(("failure", "recovery", "venue", "detail"), (
     (
         "PUBLIC_STREAM_CONFIRMATION_STALE", "PUBLIC_STREAM_RESTARTED",
@@ -4632,6 +4745,159 @@ async def test_shutdown_drains_only_owned_extended_work_during_health_wave(
 
         unrelated.cancel()
         await asyncio.gather(unrelated, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_reproduces_cancellation_resistant_session_and_socket_close(
+    tmp_path,
+):
+    clock = FakeClock()
+    session_close_started = asyncio.Event()
+    socket_iteration_started = asyncio.Event()
+    socket_close_started = asyncio.Event()
+    release_session_close = asyncio.Event()
+    release_socket_close = asyncio.Event()
+
+    class CancellationResistantSocket:
+        closed = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            socket_close_started.set()
+            while not release_socket_close.is_set():
+                try:
+                    await release_socket_close.wait()
+                except asyncio.CancelledError:
+                    continue
+            self.closed = True
+            return False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            socket_iteration_started.set()
+            await asyncio.Event().wait()
+
+    class CancellationResistantSession:
+        closed = False
+
+        def __init__(self):
+            self.socket = CancellationResistantSocket()
+
+        def ws_connect(self, *_args, **_kwargs):
+            return self.socket
+
+        async def close(self):
+            session_close_started.set()
+            while not release_session_close.is_set():
+                try:
+                    await release_session_close.wait()
+                except asyncio.CancelledError:
+                    continue
+            self.closed = True
+
+    with PaperRepository(tmp_path / "cancellation-resistant-close.db") as repository:
+        runtime = PublicPaperRuntime(repository, adapters={}, clock=clock)
+        runtime._session = CancellationResistantSession()
+        runtime._stop_event = asyncio.Event()
+        stream_key = (Venue.EXTENDED, "CLOSE-RESISTANT", "trade")
+        session_id = runtime._new_stream_session(stream_key)
+        stream_task = asyncio.create_task(runtime._extended_stream(
+            ExtendedAdapter(None), "CLOSE-RESISTANT", "trade", session_id,
+        ))
+        runtime._stream_tasks[stream_key] = stream_task
+        await asyncio.wait_for(socket_iteration_started.wait(), timeout=1)
+
+        runtime._request_stop("SIGINT")
+        shutdown_task = asyncio.create_task(runtime.shutdown())
+        try:
+            await asyncio.wait_for(session_close_started.wait(), timeout=1)
+            await asyncio.sleep(0)
+            assert not shutdown_task.done()
+
+            release_session_close.set()
+            await asyncio.wait_for(socket_close_started.wait(), timeout=1)
+            await asyncio.sleep(0)
+            assert not shutdown_task.done()
+
+            release_socket_close.set()
+            await asyncio.wait_for(shutdown_task, timeout=1)
+        finally:
+            release_session_close.set()
+            release_socket_close.set()
+            if not shutdown_task.done():
+                shutdown_task.cancel()
+            await asyncio.gather(shutdown_task, return_exceptions=True)
+
+        assert runtime._session.closed
+        assert runtime._session.socket.closed
+        assert stream_task.done() and stream_task.cancelled()
+        assert repository.connection.execute(
+            "SELECT event_type FROM runtime_evidence ORDER BY evidence_id"
+        ).fetchall()[-1]["event_type"] == "STOPPED_SAFE"
+
+
+@pytest.mark.asyncio
+async def test_run_hands_off_cancellation_resistant_tick_to_shutdown_owner(tmp_path):
+    clock = FakeClock()
+    stop = asyncio.Event()
+    tick_started = asyncio.Event()
+    tick_cancelled = asyncio.Event()
+    release_tick = asyncio.Event()
+    session_close_started = asyncio.Event()
+
+    class Session:
+        closed = False
+
+        async def close(self):
+            session_close_started.set()
+            release_tick.set()
+            self.closed = True
+
+    with PaperRepository(tmp_path / "owned-tick-handoff.db") as repository:
+        runtime = PublicPaperRuntime(repository, adapters={}, clock=clock)
+        runtime._session = Session()
+
+        async def startup_scan():
+            runtime.last_scan = SimpleNamespace(logical_at=clock.now())
+
+        async def no_restore(_at):
+            return None
+
+        async def no_streams():
+            return None
+
+        async def cancellation_resistant_tick():
+            tick_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                tick_cancelled.set()
+                await release_tick.wait()
+                raise
+
+        runtime.scan = startup_scan
+        runtime._restore = no_restore
+        runtime.start_streams = no_streams
+        runtime._start_public_refresh = lambda: None
+        runtime._start_background_catalog_refresh = lambda **_kwargs: None
+        runtime._try_mark_startup_ready = lambda: True
+        runtime.tick = cancellation_resistant_tick
+
+        run_task = asyncio.create_task(runtime.run(stop_event=stop))
+        await asyncio.wait_for(tick_started.wait(), timeout=1)
+        stop.set()
+        await asyncio.wait_for(session_close_started.wait(), timeout=1)
+        assert tick_cancelled.is_set()
+        assert runtime._tick_task is not None
+        result = await asyncio.wait_for(run_task, timeout=1)
+
+        assert result == {"status": "STOPPED_SAFE", "forced_close": False}
+        assert runtime._tick_task is None
+        assert runtime._session.closed
 
 
 @pytest.mark.asyncio
