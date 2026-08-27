@@ -47,3 +47,9 @@ Forbidden scope:
 Completion:
 
 Both authorized routes must independently finish with authoritative funding-boundary evidence, zero relevant orders, and exact flatness. Actual zero/negative funding or a venue-proven non-accrual is valid evidence only when eligibility and exposure are authoritative. Even two successful testnet lifecycles do not authorize mainnet Level D, real funds, or production strategy execution.
+
+## Parallel bounded public observation and Telegram delivery correction
+
+The user additionally authorizes one fresh public-only all-route paper run from `2026-08-27T15:35:24Z` through `2026-08-27T17:35:24Z` on `mainnet-shadow-all-routes-20260827-chief12-2h.db`. It must retain the dynamic 58-direction universe observed at preflight, public readiness, Top-10 Telegram presentation, SQLite integrity, and zero real write capability. An exact stop/report heartbeat owns the terminal gate. A fail-closed public blocker may end the run early; the old `chief11` database must not be resumed.
+
+The outbound-only Telegram boundary may add sanitized, semantically deduplicated PAPER versus TESTNET lifecycle actions for maker activation, authoritative two-leg open, actual funding status, exit start, close, final flatness, and paired fail-closed error/recovery. It must remain non-blocking and must not affect cadence, economics, decisions, signing, reconciliation, or venue writes; inbound polling and commands remain forbidden. No secret may enter Git, process arguments, logs, reports, or task text. The previously exposed bot token must be rotated and supplied through protected runtime configuration before Telegram delivery is re-enabled.
