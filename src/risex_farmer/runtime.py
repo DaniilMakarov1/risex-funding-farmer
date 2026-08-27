@@ -1000,17 +1000,22 @@ class PublicPaperRuntime:
         current = self.readiness.get(venue)
         value = VenueReadiness(available, detail, at)
         self.readiness[venue] = value
-        self.repository.set_venue_readiness(
-            venue=venue.value,
-            updated_at=at,
-            available=available,
-            detail=detail,
-        )
         last_recorded = self._last_readiness_evidence_at.get(venue)
         changed = current is None or (current.available, current.detail) != (
             available,
             detail,
         )
+        # Stream confirmations can arrive much faster than the cadence owner.
+        # Keep the in-memory timestamp current for health decisions, but avoid
+        # rewriting the same durable summary row on every heartbeat.  Durable
+        # writes remain immediate for every semantic readiness transition.
+        if changed:
+            self.repository.set_venue_readiness(
+                venue=venue.value,
+                updated_at=at,
+                available=available,
+                detail=detail,
+            )
         if changed and (
             last_recorded is None or at - last_recorded >= timedelta(seconds=10)
         ):

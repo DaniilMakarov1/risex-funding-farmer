@@ -4766,6 +4766,15 @@ async def test_extended_socket_burst_yields_due_full_tick_during_45_market_wave(
             adapters={Venue.EXTENDED: ExtendedAdapter(None)},
             clock=clock,
         )
+        readiness_writes = 0
+        original_set_venue_readiness = repository.set_venue_readiness
+
+        def count_readiness_writes(**kwargs):
+            nonlocal readiness_writes
+            readiness_writes += 1
+            return original_set_venue_readiness(**kwargs)
+
+        repository.set_venue_readiness = count_readiness_writes
         runtime._session = BurstSession()
         runtime._stop_event = asyncio.Event()
         runtime.last_scan = SimpleNamespace(logical_at=NOW)
@@ -4810,6 +4819,7 @@ async def test_extended_socket_burst_yields_due_full_tick_during_45_market_wave(
             assert len(refresh_started_at) == 1
             assert 0 < refresh_started_at[0] < len(symbols) * burst_per_socket
             assert processed == len(symbols) * burst_per_socket
+            assert readiness_writes <= len(symbols) * 2
         finally:
             runtime._request_stop("STOP_EVENT")
             await runtime.shutdown()
