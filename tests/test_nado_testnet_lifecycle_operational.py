@@ -12,6 +12,7 @@ import zlib
 
 import pytest
 
+import risex_farmer.nado_testnet_lifecycle_operational as nado_operational
 from risex_farmer.nado_testnet_lifecycle import (
     ACTIVE_PERP, COMPLETE, EXECUTE_RESPONSE_AMBIGUITY,
     EXECUTE_TRANSPORT_AMBIGUITY, EXECUTE_VENUE_REJECTION, HALTED, IOC_APPENDIX,
@@ -793,6 +794,62 @@ def test_transport_requests_and_strictly_decodes_required_encodings(
         "status": "success"
     }
     assert connection.request_args[3]["Accept-Encoding"] == "gzip, br, deflate"
+
+
+@pytest.mark.parametrize(
+    ("request_type", "body_bytes", "accepted"),
+    [
+        ("all_products", 66_250, True),
+        (
+            "all_products",
+            nado_operational.ALL_PRODUCTS_MAX_RESPONSE_BYTES + 1,
+            False,
+        ),
+        ("status", 65_536, True),
+        ("status", 65_537, False),
+    ],
+)
+def test_level_c_gateway_response_limits_are_endpoint_local_and_bounded(
+    request_type: str, body_bytes: int, accepted: bool,
+) -> None:
+    prefix, suffix = b'{"padding":"', b'"}'
+    padding_bytes = body_bytes - len(prefix) - len(suffix)
+    raw = prefix + b"x" * padding_bytes + suffix
+    assert len(raw) == body_bytes
+    connection = _Connection(_Response(raw, None))
+    io = OperationalVenueIO(OWNER, SENDER)
+    io._connection_factory = lambda _host: connection
+
+    if accepted:
+        assert io._post(
+            "gateway.test.nado.xyz", "/v1/query", {"type": request_type},
+        ) == {"padding": "x" * padding_bytes}
+    else:
+        with pytest.raises(
+            OperationalSafetyError,
+            match="transport response (schema rejected|size exceeded)",
+        ):
+            io._post(
+                "gateway.test.nado.xyz", "/v1/query", {"type": request_type},
+            )
+
+
+def test_level_c_compressed_all_products_is_bounded_after_decode() -> None:
+    prefix, suffix = b'{"padding":"', b'"}'
+    body_bytes = nado_operational.ALL_PRODUCTS_MAX_RESPONSE_BYTES + 1
+    padding_bytes = body_bytes - len(prefix) - len(suffix)
+    raw = prefix + b"x" * padding_bytes + suffix
+    compressed = gzip.compress(raw)
+    assert len(compressed) < nado_operational.MAX_RESPONSE_BYTES
+    connection = _Connection(_Response(compressed, "gzip"))
+    io = OperationalVenueIO(OWNER, SENDER)
+    io._connection_factory = lambda _host: connection
+
+    with pytest.raises(
+        OperationalSafetyError,
+        match="transport (content encoding rejected|response size exceeded)",
+    ):
+        io._post("gateway.test.nado.xyz", "/v1/query", {"type": "all_products"})
 
 
 def test_v2_pairs_transport_is_fixed_get_without_request_body() -> None:

@@ -33,8 +33,10 @@ from .nado_private_read_operational import (
     _strict_identity, run as _accepted_private_read,
 )
 from .nado_private_read_preflight import (
-    FAILURE_CLASSES, MAX_FRESHNESS_MS, FixedPreflightIdentity, NadoPreflightError,
-    ObservedResponse, _sanitized_failure_class as _preflight_failure_class,
+    ALL_PRODUCTS_MAX_RESPONSE_BYTES, FAILURE_CLASSES, MAX_FRESHNESS_MS,
+    MAX_RESPONSE_BYTES, SUBACCOUNT_INFO_MAX_RESPONSE_BYTES,
+    FixedPreflightIdentity, NadoPreflightError, ObservedResponse,
+    _sanitized_failure_class as _preflight_failure_class,
     _server_time_observation, list_trigger_orders_typed_data,
 )
 from .nado_testnet_lifecycle import (
@@ -59,7 +61,6 @@ TARGET_TICKER_ID = "SKR-PERP_USDT0"
 # 90 seconds.
 RECV_WINDOW_MS = 90_000
 HTTP_TIMEOUT_SECONDS = 5.0
-MAX_RESPONSE_BYTES = 1_048_576
 RECONCILE_READ_ATTEMPTS = 5
 RECONCILE_READ_INTERVAL_SECONDS = 1.0
 _GATEWAY_HOST = "gateway.test.nado.xyz"
@@ -958,15 +959,31 @@ class OperationalVenueIO:
             raise OperationalSafetyError(f"{label} schema mismatch")
         return parsed
 
+    @staticmethod
+    def _post_response_limit(
+        host: str, path: str, body: dict[str, object],
+    ) -> int:
+        if host == _GATEWAY_HOST and path == "/v1/query":
+            request_type = body.get("type")
+            if request_type == "all_products":
+                return ALL_PRODUCTS_MAX_RESPONSE_BYTES
+            if request_type == "subaccount_info":
+                return SUBACCOUNT_INFO_MAX_RESPONSE_BYTES
+        return MAX_RESPONSE_BYTES
+
     def _post(self, host: str, path: str, body: dict[str, object]) -> object:
         encoded = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("ascii")
-        return self._request("POST", host, path, encoded)
+        return self._request(
+            "POST", host, path, encoded,
+            response_limit=self._post_response_limit(host, path, body),
+        )
 
     def _get(self, host: str, path: str) -> object:
         return self._request("GET", host, path, None)
 
     def _request(
-        self, method: str, host: str, path: str, body: bytes | None
+        self, method: str, host: str, path: str, body: bytes | None,
+        *, response_limit: int = MAX_RESPONSE_BYTES,
     ) -> object:
         try:
             connection = self._connection_factory(host)
@@ -978,18 +995,18 @@ class OperationalVenueIO:
                 response = connection.getresponse()
                 declared = response.getheader("Content-Length")
                 if declared is not None and (
-                    not declared.isdigit() or int(declared) > MAX_RESPONSE_BYTES
+                    not declared.isdigit() or int(declared) > response_limit
                 ):
                     raise OperationalSafetyError("transport response schema rejected")
-                raw = response.read(MAX_RESPONSE_BYTES + 1)
-                if len(raw) > MAX_RESPONSE_BYTES:
+                raw = response.read(response_limit + 1)
+                if len(raw) > response_limit:
                     raise OperationalSafetyError("transport response size exceeded")
                 if not 200 <= response.status < 300:
                     raise OperationalSafetyError("HTTP status rejected")
                 content_encoding = response.getheader("Content-Encoding")
             finally:
                 connection.close()
-            decoded = self._decode_response(raw, content_encoding)
+            decoded = self._decode_response(raw, content_encoding, response_limit)
             try:
                 return json.loads(decoded.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError):
@@ -1000,16 +1017,19 @@ class OperationalVenueIO:
             raise OperationalSafetyError("transport outcome requires manual recovery") from None
 
     @staticmethod
-    def _decode_response(raw: bytes, content_encoding: str | None) -> bytes:
+    def _decode_response(
+        raw: bytes, content_encoding: str | None,
+        response_limit: int = MAX_RESPONSE_BYTES,
+    ) -> bytes:
         encoding = "identity" if content_encoding is None else content_encoding.strip().lower()
         if encoding in {"", "identity"}:
             decoded = raw
         elif encoding in {"gzip", "deflate"}:
             window = zlib.MAX_WBITS | (16 if encoding == "gzip" else 0)
             decoder = zlib.decompressobj(window)
-            decoded = decoder.decompress(raw, MAX_RESPONSE_BYTES + 1)
+            decoded = decoder.decompress(raw, response_limit + 1)
             if (
-                len(decoded) > MAX_RESPONSE_BYTES or not decoder.eof
+                len(decoded) > response_limit or not decoder.eof
                 or decoder.unconsumed_tail or decoder.unused_data
             ):
                 raise OperationalSafetyError("transport content encoding rejected")
@@ -1021,7 +1041,7 @@ class OperationalVenueIO:
                 for offset in range(0, len(raw), 1024):
                     part = decoder.process(raw[offset:offset + 1024])
                     total += len(part)
-                    if total > MAX_RESPONSE_BYTES:
+                    if total > response_limit:
                         raise ValueError
                     parts.append(part)
                 if not decoder.is_finished():
@@ -1031,7 +1051,7 @@ class OperationalVenueIO:
                 raise OperationalSafetyError("transport content encoding rejected") from None
         else:
             raise OperationalSafetyError("transport content encoding rejected")
-        if len(decoded) > MAX_RESPONSE_BYTES:
+        if len(decoded) > response_limit:
             raise OperationalSafetyError("transport response size exceeded")
         return decoded
 

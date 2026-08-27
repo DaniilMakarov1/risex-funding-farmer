@@ -226,8 +226,13 @@ def test_exact_official_wire_success_and_one_shot_request(
     assert store.state("fixture-invocation-001") == nado.FINALIZED
     assert public is not None and len(public.calls) == 15
     expected_policy = nado.TransportPolicy(True, False, False, 5_000, 65_536)
+    all_products_policy = nado.TransportPolicy(
+        True, False, False, 5_000, nado.ALL_PRODUCTS_MAX_RESPONSE_BYTES,
+    )
     subaccount_policy = nado.TransportPolicy(True, False, False, 5_000, 1_048_576)
-    assert set(public.policies) == {expected_policy, subaccount_policy}
+    assert set(public.policies) == {
+        expected_policy, all_products_policy, subaccount_policy,
+    }
     assert signed.policies == [expected_policy]
     assert public.calls[:7] == [
         {"type": "contracts"}, {"type": "status"}, {"type": "all_products"},
@@ -1479,6 +1484,12 @@ async def test_owned_http_transport_rejects_oversize_redirect_and_http_alias(
     [
         ({"type": "status"}, 65_536, True),
         ({"type": "status"}, 65_537, False),
+        ({"type": "all_products"}, 66_250, True),
+        (
+            {"type": "all_products"},
+            nado.ALL_PRODUCTS_MAX_RESPONSE_BYTES + 1,
+            False,
+        ),
         ({"type": "subaccount_info", "subaccount": "synthetic"}, 1_048_576, True),
         ({"type": "subaccount_info", "subaccount": "synthetic"}, 1_048_577, False),
     ],

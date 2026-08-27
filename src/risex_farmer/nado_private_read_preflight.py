@@ -31,6 +31,8 @@ MIN_COLLATERAL_X18 = 5 * 10**18
 MAX_FRESHNESS_MS = 30_000
 HTTP_TIMEOUT_SECONDS = 5.0
 MAX_RESPONSE_BYTES = 65_536
+# The observed official all_products response is 66,250 canonical bytes.
+ALL_PRODUCTS_MAX_RESPONSE_BYTES = 70_000
 SUBACCOUNT_INFO_MAX_RESPONSE_BYTES = 1_048_576
 LEDGER_SCHEMA_VERSION = 2
 COUNTER_PHASES = (
@@ -344,6 +346,8 @@ class SealedPublicTransport(_SealedTransport):
     def _response_limit(self, request: Mapping[str, object]) -> int:
         if type(request.get("type")) is str and request["type"] == "subaccount_info":
             return max(self.max_response_bytes, SUBACCOUNT_INFO_MAX_RESPONSE_BYTES)
+        if type(request.get("type")) is str and request["type"] == "all_products":
+            return max(self.max_response_bytes, ALL_PRODUCTS_MAX_RESPONSE_BYTES)
         return self.max_response_bytes
 
 
@@ -462,6 +466,8 @@ class _OperationalGatewayTransport(_OperationalFixedHostTransport):
     def _response_limit(self, request: Mapping[str, object]) -> int:
         if type(request.get("type")) is str and request["type"] == "subaccount_info":
             return SUBACCOUNT_INFO_MAX_RESPONSE_BYTES
+        if type(request.get("type")) is str and request["type"] == "all_products":
+            return ALL_PRODUCTS_MAX_RESPONSE_BYTES
         return MAX_RESPONSE_BYTES
 
 
