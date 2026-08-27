@@ -1,59 +1,49 @@
 # Active bounded task
 
-## Mainnet public shadow — all-route liquidity measurement
+## Two-route testnet funding-boundary lifecycles
 
-Status: `RUNNING — CORRECTED 24-HOUR ALL-ROUTE SHADOW`.
+Status: `HANDOFF READY — RISEx–NADO AND RISEx–EXTENDED`.
 
-Objective: use the accepted normal paper product against real unauthenticated RISEx, Nado, and Extended mainnet public data, evaluating every currently eligible venue-asset direction in `RISEx ∩ (Extended ∪ Nado)` without Top-5 or fixed route-count truncation. Measure whether opportunity frequency, duration, and conservative economics vary with authoritative route liquidity.
+Objective: prove how the accepted system behaves before, during, and after an actual testnet funding settlement on exactly two hedged routes: one RISEx–Nado route and one RISEx–Extended route. Open the smallest venue-executable matched testnet positions, observe and reconcile actual venue funding semantics at the boundary, then close every leg to authoritative zero relevant orders and exact flatness.
 
 Exact starting point:
 
-- Published `main` after the current governance checkpoint; normal commands remain `scan-once`, `paper-run`, and `report`.
-- Two bounded Top-5 public runs on 2026-08-27 ended safely with SQLite integrity `ok`, zero orders/fills/positions/fatal events, and consistently negative planned net PnL. They are preserved as comparison evidence but do not satisfy the all-route window.
-- Current public catalogs observed 15 unique eligible assets in the union: 15 RISEx/Extended pairs and 14 RISEx/Nado pairs, producing 58 directions. This is an observation, not a hard-coded universe; future catalog changes must be reflected dynamically.
-- Accepted all-route preflight on 2026-08-27 evaluated all 58 directions and found two positive VVV/Nado planned routes in `< $250k`; immediate executable unwind for both was negative. The first paper-run then failed before any FULL scan: its deadline was 87.5 seconds late, concurrent public observations timed out for 37–60 seconds across venues, and shutdown required an exact-process force stop after a 30-second SIGTERM bound. Database integrity remained `ok` with zero orders, fills, and positions.
-- Accepted `f856a9931c5fa17e385102038d21ab97b0b582c2` removed that first startup/fan-out blocker. A fresh preflight again covered 58 directions and a new paper-run persisted all 58 startup rows before READY. The first scheduled FULL was then starved by a synchronized Extended disconnect/staleness wave across its 45 per-market book/trade/funding tasks: sequential recovery remained inside the main tick, so no FULL deadline or fail-closed blocker was persisted. Intentional SIGINT still reached durable `STOPPED_SAFE` in 21.25 seconds; integrity is `ok` and orders/fills/positions are zero.
-- Accepted `1796ffe272cac2fa91db0042d8a108ddb1577ecf` removed that cadence starvation without changing route or economics semantics. The fresh `chief03` preflight covered 58 directions, and its paper-run persisted 58/58 startup rows before READY. Its first FULL deadline was recorded about 1 ms late and the complete scan finished in about 9 seconds.
-- The `chief03` run completed seven scheduled FULL cadences, then was stopped at the user's request to reduce Telegram output. SIGINT did not complete within 30 seconds and the exact process required a force stop after zero orders/fills/positions and SQLite integrity `ok` were confirmed. The user now requires Telegram to show only the deterministic Top-10 rows while the runtime continues to scan and persist every direction.
-- Accepted `2f5467f07caa6807f252655e9e83d91b9596742e` limits only Telegram FULL digests to the first 10 ranked rows and corrects dynamic owned-task shutdown. The `chief04` operational checkpoint preserved 58/58 route rows and reached durable `STOPPED_SAFE` about 11 ms after SIGINT. The fresh isolated `chief05` run is now active for 24 hours; do not start a parallel duplicate.
-- In `chief05`, 126 Extended socket disconnects all had matching reconnects in at most about 5.9 seconds, with no blocked FULL, recovery failure, fatal event, or unmatched episode, yet each raw disconnect was immediately delivered as `Critical public data loss`. This is an outbound severity/pairing defect; raw persistence and fail-closed market-data handling remain required.
-- The completed 15-minute watch later observed 95 additional disconnects with average recovery about 24.2 seconds and maximum about 44.2 seconds, plus one `PUBLIC_SCAN_BLOCKED:PUBLIC_REFRESH_DEADLINE_EXCEEDED`. All episodes eventually reconnected, but no confirmation-stale event represented those pending beyond the existing 25-second threshold. SIGINT then again exceeded 30 seconds and required an exact-process force stop after integrity `ok` and zero orders/fills/positions.
-- Accepted `b959da8daa9c1737406fe7ea02e8b01707bf7d0a` implements one venue-level Critical/Recovery pair for a persistent socket wave, zero outage messages for a fully transient sub-25-second wave, a precise blocked-FULL alert, and active-tick shutdown handoff. Validate these semantics on a fresh public-only run before resuming a 24-hour window.
-- Fresh `chief06` validation completed the full 15-minute watch: nine FULL scans, one 2.05-second Nado EOF disconnect/reconnect, no transient outage Telegram pair, no blocked/stale/recovery-failed/fatal event, and bounded `STOPPED_SAFE` in 8.3 seconds. Integrity is `ok` and orders/fills/positions are zero. The next action is one fresh isolated 24-hour all-route paper run with Top-10 Telegram presentation and the existing fail-closed stop/report gate.
-- Fresh `chief07` reached READY but produced three blocked FULL scans, 181/181 Extended disconnect/reconnect events, a synchronized outage lasting about 3 minutes 15 seconds, a 120.825-second refresh, and 392 seconds of cadence lateness. It stopped `STOPPED_SAFE` with integrity `ok` and zero orders/fills/positions; the scheduled 24-hour follow-up was removed. One fresh Extended Builder may correct only this observed public transport/cadence defect without suppressing blockers, raising limits, reducing routes, or weakening freshness.
-- The user-requested funding-boundary check is complete through the existing isolated fixture path, with no product change: a NEAR paper position spanned `13:58:01Z`–`14:00:01Z`, recognized assumed `+$8` aggregate funding, lost `$10` on price and `$0.21` in fees, and ended FLAT at `-$2.21`. It is synthetic accounting evidence only and must not enter profitability statistics.
-- Accepted merge `2e18509f8c619ac329ddf2265acbcc99dde1f418` removes redundant Extended REST fan-out during an already-known transport gap and preserves complete route-level fail-closed evidence. Fresh `chief09` then observed 85/85 Extended disconnect/reconnect events but no FULL deadline, blocker, scan, or deferred observation for more than three configured cadence intervals after READY. This is a distinct starvation before `_start_public_refresh`; start no statistical window until a fresh Builder reproduces and corrects that exact scheduling/ownership path. The run stopped safely with integrity `ok` and zero orders/fills/positions.
-- Accepted `433afb3965fb3543dc93a66854841e1d57523d0b` corrects that starvation with a cooperative event-loop handoff at each Extended message boundary. Fresh `chief10` then completed two due FULL scans over all 58 directions while processing a 67/67 disconnect/reconnect wave and 30 explicit deferred gap observations; no blocked/fatal event occurred, shutdown was safe, integrity is `ok`, and write-state rows are zero. The next action is one fresh isolated 24-hour all-route paper window with Top-10 Telegram presentation and the existing bounded stop/report gate.
-- Fresh `chief11` preflight covered all 58 current directions with zero write-state rows, and the corrected 24-hour run reached READY at `2026-08-27T15:22:12Z`. Do not start a parallel duplicate. Stop/report it at the scheduled boundary or earlier only for a new exact fail-closed blocker.
-- Rejected branch `codex/strategy-measurement-foundation` at `300362d840141d9ed599d8189ed1d10801fc5256` is not a candidate and must not be merged or copied. Open a fresh Builder only if observed evidence proves a bounded defect or a measurement field genuinely missing from the accepted paper path.
+- Published `main` after the clean handoff checkpoint is the only authorized source base.
+- All earlier RISEx, Nado, and Extended Level C lifecycles are complete historical evidence; this is a fresh funding-accrual objective, not permission to replay their intents.
+- The corrected public all-route implementation and its paper measurements remain accepted, but the `chief11` statistical window was intentionally ended for this rotation. Its database has integrity `ok` and zero orders/fills/positions; its obsolete automation was deleted.
+- No Builder candidate or venue write is in flight at handoff.
+
+Authorized routes:
+
+1. One testnet `RISEx–Nado` matched route.
+2. One testnet `RISEx–Extended` matched route.
+
+The new Chief must discover currently tradable common testnet markets, authoritative funding schedules, minimum quantities, and account state before choosing assets or directions. Prefer distinct RISEx markets when both routes overlap in time so venue-level netting cannot make route attribution ambiguous. If safe isolation or a common funding window cannot be proven, run the two routes sequentially across their next actual boundaries rather than combining ambiguous exposure.
 
 Allowed scope:
 
-- Public unauthenticated mainnet REST/WebSocket reads from the existing fixed venue adapters.
-- After Chief acceptance, use a fresh isolated paper SQLite database, one preflight `scan-once`, then a bounded 24-hour `paper-run` unless a fail-closed performance/data blocker ends it earlier. Outbound Telegram remains authoritative delivery-only/non-blocking and shows at most Top-10 ranked rows per FULL digest.
-- Existing conservative paper semantics: exact Decimal arithmetic, canonical units, exact-size depth/VWAP, fee and execution PnL, funding timestamps, trade-through maker evidence, data-gap degradation, restart behavior, and `NO_TRADE` as a valid result.
-- Report opportunity count/duration, COMPLETE versus DEGRADED paper lifecycles, planned and executable-unwind net PnL, fee/spread/slippage/funding components, funding source quality, latency/freshness failures, leg-risk proxies, and every assumption or blocker, both overall and in the fixed liquidity buckets.
-- Read-only diagnostics and a fresh Builder correction only when a concrete mainnet-public observation contradicts accepted code. Any candidate requires focused/adverse tests and one clean Python 3.11 full suite on its final SHA.
-- Required regressions cover a synchronized 45-task Extended disconnect/staleness wave while the first FULL becomes due, non-blocking/coalesced recovery ownership, complete FULL or precise bounded `PUBLIC_SCAN_BLOCKED`, no fabricated fresh evidence, no task leak, and bounded SIGTERM-style cancellation during recovery.
-- Required regressions also prove that 58 persisted directions yield exactly the first 10 deterministic rows to Telegram with no effect on the stored/reportable set, and reproduce bounded shutdown while Extended recovery/socket work is active.
-- Required notification regressions cover a many-socket transient EOF wave recovering below the existing stale threshold with zero critical/recovery Telegram messages, persistence of every raw lifecycle event, one persistent stale or failed-recovery critical alert, exact paired recovery, semantic dedupe, and unchanged non-blocking delivery.
-- Required notification regressions also cover a socket episode still pending at 25 seconds, later recovery at 34–44 seconds, one blocked FULL alert with semantic dedupe, and no suppression of genuine persistent loss. Required shutdown evidence includes a cancellation-resistant session/socket owner that does not cooperate immediately with task cancellation.
+- Existing protected testnet-only credentials, accounts, wallets, and accepted venue-local operational runners for RISEx, Nado, and Extended.
+- Public and authenticated testnet reads required to prove current market metadata, funding schedule/rate/source quality, identity, balances/collateral sufficiency, orders, fills, positions, and applied funding.
+- The smallest currently venue-executable matched quantity per route; modeled negative economics, test-asset spreads, and testnet minimum notionals are not blockers for this explicitly authorized lifecycle.
+- Durable fresh runtime and write-intent identities before every dispatch, sequential venue writes, exact canonical quantity matching, and the accepted no-replay/ambiguity barriers.
+- Hold the matched legs across the authoritative funding boundary; persist evidence immediately before, at/around, and after settlement. Reconcile actual funding cash/rate/status on both legs from authoritative venue evidence. Never substitute an assumed positive rate for the actual operational verdict.
+- Close each leg through the accepted venue-specific reduce-only path and finish with two fresh agreeing authoritative rounds proving zero relevant open/trigger orders, exact flatness, no unrelated state, and no unresolved write identity.
+- Read-only error monitoring throughout. On any concrete code defect, use one fresh visible GPT-5.6 Luna-max Builder in a separate worktree from the exact published `main`; Chief independently reviews, integrates, tests, and alone pushes `main`. Keep venue-local signing and execution semantics separate.
+
+Required evidence per route:
+
+- Exact environment, sanitized account/wallet identities, market, direction, canonical/raw quantity, funding timestamp, rate/source quality, entry and close identities, dispatch counts, fills, fees, and before/during/after position snapshots.
+- Authoritative funding result for each leg: applied cash when exposed and eligible, or an exact venue-proven skipped/unresolved reason. A missing or contradictory funding record is a blocker, not zero funding.
+- Timing/freshness/latency and every disconnect, retry, ambiguity, reconciliation, or manual recovery event, with secrets and raw private payloads excluded.
+- Final SQLite integrity `ok`, terminal lifecycle status, zero relevant orders, exact flatness, and a sanitized route report. `COMPLETE` requires authoritative funding semantics and final flatness; otherwise report `BLOCKED` or `DEGRADED` precisely.
 
 Forbidden scope:
 
-- No API key, wallet/session/Stark key, authenticated/private endpoint, account creation, collateral, signing, nonce, order construction, order/cancel/close dispatch, testnet or mainnet write, real funds, or live strategy execution.
-- No generic OMS, parallel execution engine, service/dashboard, new venue, or duplicate measurement framework. Do not modify isolated accepted Level C runners merely to support shadow measurement.
-- No hard-coded current asset list, fixed Top-15 substitute, liquidity-based route exclusion, causal profitability claim, or unbounded raw market-message persistence.
-- Do not raise request/scan/staleness/shutdown limits to hide the observed failure, reduce the universe, stagger away a required direction without explicit blocker evidence, or treat cached/stale data as fresh.
-- Do not treat displayed depth as proof of fill, estimated RISEx funding as authoritative applied funding, DEGRADED/unresolved trades as profitability evidence, or a single positive snapshot as strategy validation.
+- No mainnet credential, private mainnet endpoint, production wallet/account, real asset, real-money order, or mainnet strategy execution.
+- No blind replay, parallel venue writes, ambiguous route attribution, unrelated account-state mutation, fabricated funding, assumed applied cash, or weakening of identity/freshness/reconciliation gates.
+- No generic OMS, new venue, dashboard/service, cross-venue signing abstraction, or product/economics change unrelated to an observed testnet defect.
+- No reuse of rejected branch `codex/strategy-measurement-foundation` or commit `300362d840141d9ed599d8189ed1d10801fc5256`.
 
-Acceptance for the first checkpoint:
+Completion:
 
-- Every currently eligible public venue-asset direction is evaluated; current catalog size is evidence rather than configuration, and catalog additions/removals reconcile without stale subscriptions or silent route loss.
-- Startup and each FULL cadence either evaluate the complete current all-route universe from fresh authoritative evidence within the existing bounded schedule or persist an exact fail-closed blocker without hanging; intentional shutdown completes within 30 seconds and preserves SQLite integrity.
-- The bounded run uses only public mainnet data and leaves verifiable zero credential/signing/write effects.
-- Telegram delivery neither supplies market evidence nor changes scan cadence, economics, lifecycle decisions, or acceptance; delivery failure cannot block the runtime.
-- The stored/reportable evidence distinguishes official values from paper assumptions and returns either quantified conservative paper opportunities or exact fail-closed/negative-economics reasons, including the predeclared liquidity buckets and enough history to compute frequency and consecutive duration.
-- Chief defines the next statistical observation window and predeclared profitability/risk thresholds from the first evidence; no mainnet Level D or real-funds claim follows automatically.
-
-Only after a sufficiently broad mainnet-public shadow sample shows durable conservative profitability may Chief open a separate Level D hardening task. Level D must still prove current mainnet contracts/endpoints, protected production identities, Extended private WebSocket, notional/loss/leg-risk limits, restart and ambiguous-write recovery, monitoring/manual recovery, a no-dispatch shadow run, and a separately authorized smallest real-funds canary.
+Both authorized routes must independently finish with authoritative funding-boundary evidence, zero relevant orders, and exact flatness. Actual zero/negative funding or a venue-proven non-accrual is valid evidence only when eligibility and exposure are authoritative. Even two successful testnet lifecycles do not authorize mainnet Level D, real funds, or production strategy execution.
