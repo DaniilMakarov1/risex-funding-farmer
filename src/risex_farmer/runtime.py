@@ -3801,7 +3801,7 @@ class PublicPaperRuntime:
                                 adapter.normalize_book_message(
                                     payload, received_at=received_at
                                 )
-                                if isinstance(adapter, NadoAdapter)
+                                if isinstance(adapter, (NadoAdapter, RisexAdapter))
                                 else adapter.normalize_book_message(payload)
                             )  # type: ignore[attr-defined]
                             healthy = await self.apply_book_event(

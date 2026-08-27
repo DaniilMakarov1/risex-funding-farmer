@@ -588,7 +588,9 @@ def test_documented_book_delta_shapes_are_normalized() -> None:
     risex = RisexAdapter(None)
     risex_data = fixture("risex")
     risex.normalize_market(risex_data["market"])
-    r_delta = risex.normalize_book_message(risex_data["book_update"])
+    r_delta = risex.normalize_book_message(
+        risex_data["book_update"], received_at=NOW
+    )
     assert r_delta.checksum == 123  # type: ignore[union-attr]
 
     extended = ExtendedAdapter(None)
@@ -632,6 +634,31 @@ def test_nado_book_observation_time_is_bounded_by_local_receipt() -> None:
         future_delta, received_at=NOW
     )
     assert websocket.observed_at == NOW
+
+
+def test_risex_ws_book_observation_time_is_bounded_by_local_receipt() -> None:
+    risex = RisexAdapter(None)
+    risex_data = fixture("risex")
+    risex.normalize_market(risex_data["market"])
+    future_timestamp = str(
+        int((NOW + timedelta(seconds=1)).timestamp() * 1_000_000_000)
+    )
+
+    future_delta = deepcopy(risex_data["book_update"])
+    future_delta["worker_timestamp"] = future_timestamp
+    delta = risex.normalize_book_message(future_delta, received_at=NOW)
+    assert delta.observed_at == NOW
+    assert delta.checksum == risex_data["book_update"]["checksum"]
+
+    future_snapshot = deepcopy(future_delta)
+    future_snapshot["type"] = "snapshot"
+    snapshot = risex.normalize_book_message(future_snapshot, received_at=NOW)
+    assert snapshot.observed_at == NOW
+
+    past = risex.normalize_book_message(risex_data["book_update"], received_at=NOW)
+    assert past.observed_at == timestamp(
+        risex_data["book_update"]["worker_timestamp"], "nanoseconds"
+    )
 
 
 def test_extended_ws_book_observation_time_is_bounded_by_local_receipt() -> None:

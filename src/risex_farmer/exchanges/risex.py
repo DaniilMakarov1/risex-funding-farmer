@@ -253,10 +253,17 @@ class RisexAdapter(PublicAdapter):
         (self._book_units_consistent.add if valid else self._book_units_consistent.discard)(symbol)
         return OrderBook(Venue.RISEX, symbol, bids, asks, observed_at)
 
-    def normalize_book_message(self, payload: Any) -> OrderBook | BookDelta:
+    def normalize_book_message(
+        self, payload: Any, *, received_at: datetime
+    ) -> OrderBook | BookDelta:
         message = require_mapping(payload, "orderbook message")
         data = require_mapping(message.get("data"), "orderbook message.data")
-        observed_at = timestamp(message["worker_timestamp"], "nanoseconds")
+        # Keep venue clock skew from making a received book future-dated; the
+        # raw checksum and all existing RISEx ordering/recovery semantics stay
+        # authoritative.
+        observed_at = min(
+            timestamp(message["worker_timestamp"], "nanoseconds"), received_at
+        )
         if message.get("type") == "snapshot":
             return self.normalize_book(data, observed_at=observed_at)
 

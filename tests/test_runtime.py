@@ -368,6 +368,52 @@ class GatedExtendedAdapter(ExtendedAdapter):
         )
 
 
+class GatedRisexAdapter(RisexAdapter):
+    def __init__(self, clock: FakeClock, *, settlement_at: datetime) -> None:
+        super().__init__(None)
+        fake = FakeAdapter(Venue.RISEX, clock, settlement_at=settlement_at)
+        self.clock = clock
+        self.settlement_at = settlement_at
+        self.market = fake.market
+        self.calls: list[str] = []
+        self._market_ids = {self.market.venue_symbol: "1"}
+        self._symbols_by_id = {"1": self.market.venue_symbol}
+
+    async def fetch_markets(self):
+        self.calls.append("markets")
+        return (self.market,)
+
+    async def fetch_volumes(self):
+        self.calls.append("volumes")
+        return (
+            MarketVolume(
+                Venue.RISEX, self.market.venue_symbol, D("1000000"),
+                self.clock.now(), "official-shaped",
+            ),
+        )
+
+    async def fetch_book(self, venue_symbol: str):
+        self.calls.append("book")
+        return OrderBook(
+            Venue.RISEX, venue_symbol,
+            (BookLevel(D("99"), D("20")),),
+            (BookLevel(D("101"), D("20")),), self.clock.now(),
+        )
+
+    async def prime_recent_trade_evidence(self, market, *, limit: int = 20):
+        self.calls.append("trades")
+        return market
+
+    async def fetch_funding_quote(self, market, *, assumed_open_at):
+        self.calls.append("funding")
+        return FundingCashQuote(
+            Venue.RISEX, market.venue_symbol, self.clock.now(), assumed_open_at,
+            self.settlement_at, FundingQuality.ESTIMATED,
+            FundingAccrualMethod.SNAPSHOT_AT_SETTLEMENT, True,
+            D("5"), D("5"), "PAPER_ASSUMPTION:RISEX_PUBLIC_FALLBACK",
+        )
+
+
 class ClosingWebSocket:
     def __init__(
         self,
@@ -718,6 +764,90 @@ async def test_extended_future_ws_book_timestamp_does_not_abort_followup_scan(tm
                 refresh=False, scan_kind="FOCUSED", scheduled_at=clock.now()
             )
             assert book.observed_at == clock.now()
+
+
+@pytest.mark.asyncio
+async def test_risex_future_ws_book_timestamp_does_not_abort_followup_scan(tmp_path):
+    clock = FakeClock()
+    fakes = adapters(clock, settlement_at=NOW + timedelta(minutes=5))
+    risex = GatedRisexAdapter(clock, settlement_at=NOW + timedelta(minutes=5))
+    fakes[Venue.RISEX] = risex
+    symbol = risex.market.venue_symbol
+    stop = asyncio.Event()
+    future_ts = int((clock.now() + timedelta(seconds=1)).timestamp() * 1_000_000_000)
+    payload = {
+        "channel": "orderbook", "type": "snapshot", "method": "snapshot",
+        "market_id": "1", "worker_timestamp": future_ts,
+        "data": {
+            "market_id": 1,
+            "bids": [{"price": "99", "quantity": "20"}],
+            "asks": [{"price": "101", "quantity": "20"}],
+        },
+    }
+
+    async def no_delay(_seconds: float) -> None:
+        await asyncio.sleep(0)
+
+    class RisexWebSocket(TextWebSocket):
+        async def send_json(self, _payload) -> None:
+            return None
+
+        async def pong(self, _payload) -> None:
+            return None
+
+    with PaperRepository(tmp_path / "risex-future-ws-book.db") as repository:
+        async with PublicPaperRuntime(
+            repository, adapters=fakes, clock=clock, sleep=no_delay
+        ) as runtime:
+            await runtime.tick()
+            runtime._session = SingleWebSocketSession(
+                RisexWebSocket(stop, [payload])
+            )
+            runtime._stop_event = stop
+            session_id = runtime._new_stream_session(
+                (Venue.RISEX, "*", "combined")
+            )
+            await runtime._combined_stream(
+                Venue.RISEX, risex, (symbol,), session_id
+            )
+            book = runtime.coordinator.stream(Venue.RISEX, symbol).book()
+            assert book is not None
+            runtime._session = None
+            await runtime.scan(
+                refresh=False, scan_kind="FOCUSED", scheduled_at=clock.now()
+            )
+            assert book.observed_at == clock.now()
+
+
+@pytest.mark.asyncio
+async def test_risex_untrusted_future_observation_still_fails_closed(tmp_path):
+    clock = FakeClock()
+    fakes = adapters(clock, settlement_at=NOW + timedelta(minutes=5))
+    risex = GatedRisexAdapter(clock, settlement_at=NOW + timedelta(minutes=5))
+    fakes[Venue.RISEX] = risex
+    with PaperRepository(
+        tmp_path / "risex-future-observation-rejected.db"
+    ) as repository:
+        async with PublicPaperRuntime(
+            repository, adapters=fakes, clock=clock
+        ) as runtime:
+            await runtime.tick()
+            key = Venue.RISEX, risex.market.venue_symbol
+            observation = runtime.observations[key]
+            assert observation.book is not None
+            runtime.observations[key] = replace(
+                observation,
+                book=replace(
+                    observation.book,
+                    observed_at=clock.now() + timedelta(seconds=1),
+                ),
+            )
+            with pytest.raises(
+                RuntimeError, match="scan observation timestamp exceeds logical_at"
+            ):
+                await runtime.scan(
+                    refresh=False, scan_kind="FOCUSED", scheduled_at=clock.now()
+                )
 
 
 @pytest.mark.asyncio
