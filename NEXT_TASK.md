@@ -2,7 +2,7 @@
 
 ## Mainnet public shadow — all-route liquidity measurement
 
-Status: `VALIDATING — AGGREGATED EXTENDED OUTAGE ALERTS`.
+Status: `READY — RESUME 24-HOUR ALL-ROUTE SHADOW`.
 
 Objective: use the accepted normal paper product against real unauthenticated RISEx, Nado, and Extended mainnet public data, evaluating every currently eligible venue-asset direction in `RISEx ∩ (Extended ∪ Nado)` without Top-5 or fixed route-count truncation. Measure whether opportunity frequency, duration, and conservative economics vary with authoritative route liquidity.
 
@@ -19,6 +19,7 @@ Exact starting point:
 - In `chief05`, 126 Extended socket disconnects all had matching reconnects in at most about 5.9 seconds, with no blocked FULL, recovery failure, fatal event, or unmatched episode, yet each raw disconnect was immediately delivered as `Critical public data loss`. This is an outbound severity/pairing defect; raw persistence and fail-closed market-data handling remain required.
 - The completed 15-minute watch later observed 95 additional disconnects with average recovery about 24.2 seconds and maximum about 44.2 seconds, plus one `PUBLIC_SCAN_BLOCKED:PUBLIC_REFRESH_DEADLINE_EXCEEDED`. All episodes eventually reconnected, but no confirmation-stale event represented those pending beyond the existing 25-second threshold. SIGINT then again exceeded 30 seconds and required an exact-process force stop after integrity `ok` and zero orders/fills/positions.
 - Accepted `b959da8daa9c1737406fe7ea02e8b01707bf7d0a` implements one venue-level Critical/Recovery pair for a persistent socket wave, zero outage messages for a fully transient sub-25-second wave, a precise blocked-FULL alert, and active-tick shutdown handoff. Validate these semantics on a fresh public-only run before resuming a 24-hour window.
+- Fresh `chief06` validation completed the full 15-minute watch: nine FULL scans, one 2.05-second Nado EOF disconnect/reconnect, no transient outage Telegram pair, no blocked/stale/recovery-failed/fatal event, and bounded `STOPPED_SAFE` in 8.3 seconds. Integrity is `ok` and orders/fills/positions are zero. The next action is one fresh isolated 24-hour all-route paper run with Top-10 Telegram presentation and the existing fail-closed stop/report gate.
 - Rejected branch `codex/strategy-measurement-foundation` at `300362d840141d9ed599d8189ed1d10801fc5256` is not a candidate and must not be merged or copied. Open a fresh Builder only if observed evidence proves a bounded defect or a measurement field genuinely missing from the accepted paper path.
 
 Allowed scope:
