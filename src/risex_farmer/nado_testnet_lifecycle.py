@@ -57,8 +57,6 @@ FUNDING_STATUSES = frozenset({
 })
 FUNDING_COMPLETION_STATUSES = frozenset({
     FUNDING_APPLIED,
-    FUNDING_SKIPPED_POSITION_NOT_OPEN,
-    FUNDING_SKIPPED_POSITION_CLOSED,
 })
 
 # Pinned SDK appendix packing: version=1, order type in bits 9..10,
@@ -1109,8 +1107,9 @@ def validate_nado_funding_boundary(
 ) -> NadoFundingBoundaryResult:
     """Validate the exact persisted route, journals, terminal proofs, and funding.
 
-    A missing record, a venue-proven unresolved status, or any mismatch is a
-    contract failure.  In particular, zero cash is accepted only when the
+    A missing or contradictory record is a contract failure. Explicit venue
+    statuses are retained as evidence, but only applied funding is eligible
+    for completion. In particular, zero cash is accepted only when the
     authoritative event and account-scoped record both explicitly say zero.
     """
     binding.assert_contract()
@@ -1176,6 +1175,7 @@ def validate_nado_funding_boundary(
         raise NadoContractError(
             "skipped Nado funding event has nonzero applied cash"
         )
+    completion_eligible = event.status in FUNDING_COMPLETION_STATUSES
     return NadoFundingBoundaryResult(
         event.event_id,
         event.market,
@@ -1183,8 +1183,8 @@ def validate_nado_funding_boundary(
         event.status,
         event.rate_x18,
         event.cash_x18,
-        event.status in FUNDING_COMPLETION_STATUSES,
-        event.status == FUNDING_UNRESOLVED,
+        completion_eligible,
+        not completion_eligible,
     )
 
 

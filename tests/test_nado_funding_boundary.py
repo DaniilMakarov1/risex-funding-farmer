@@ -175,6 +175,24 @@ def test_funding_boundary_accepts_exact_opposite_route_and_account_event_match()
     assert result.blocked is False
 
 
+def test_applied_negative_funding_cash_remains_completion_eligible() -> None:
+    binding, attestation, _, _ = _valid_evidence()
+    event = _event(binding, cash_x18=-1)
+    account = _account(binding, event)
+
+    result = validate_nado_funding_boundary(
+        binding=binding,
+        attestation=attestation,
+        event=event,
+        account_funding=account,
+    )
+
+    assert result.status == FUNDING_APPLIED
+    assert result.cash_x18 == -1
+    assert result.completion_eligible is True
+    assert result.blocked is False
+
+
 def test_terminal_content_digest_is_final_evidence_and_not_prebound_identity() -> None:
     binding, attestation, event, account = _valid_evidence()
 
@@ -345,8 +363,8 @@ def test_exact_skipped_funding_is_retained_as_non_accrual_not_zero(
 
     assert result.status == status
     assert result.cash_x18 == 0
-    assert result.completion_eligible is True
-    assert result.blocked is False
+    assert result.completion_eligible is False
+    assert result.blocked is True
 
 
 def test_skipped_funding_with_applied_cash_is_contradictory() -> None:

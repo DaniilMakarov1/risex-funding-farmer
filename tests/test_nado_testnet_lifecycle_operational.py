@@ -1152,19 +1152,20 @@ def test_production_funding_entrypoint_uses_fixed_identity_and_private_gate(
         store.close()
 
 
-def test_funding_runner_retains_explicit_skipped_non_accrual_and_completes(
+def test_funding_runner_retains_explicit_skipped_non_accrual_and_blocks(
     tmp_path: Path,
 ) -> None:
     io = FundingFixtureIO(FUNDING_SKIPPED_POSITION_NOT_OPEN, entry="RESTING")
     report, store = run_funding_fixture(tmp_path, io)
     try:
-        assert report.status == COMPLETE
+        assert report.status == "BLOCKED"
         assert report.funding_status == FUNDING_SKIPPED_POSITION_NOT_OPEN
         assert report.funding_cash_x18 == 0
+        assert report.reason == FUNDING_SKIPPED_POSITION_NOT_OPEN
         evidence = store.nado_funding_boundary_evidence()
         assert evidence is not None
         assert evidence[1].status == FUNDING_SKIPPED_POSITION_NOT_OPEN
-        assert store.lifecycle_status() == COMPLETE
+        assert store.lifecycle_status() == HALTED
     finally:
         store.close()
 
