@@ -81,7 +81,7 @@ RISEx is one leg of every route. Hedge venue is Extended or Nado. The public sha
 - LONG RISEx / SHORT Nado
 - SHORT RISEx / LONG Nado
 
-`route_liquidity = min(risex_24h_quote_volume_usd, hedge_24h_quote_volume_usd)`. Liquidity is a measurement dimension and deterministic ranking input, not a universe-selection filter. Persist and deliver every evaluated venue-asset direction; ranking never truncates the evidence set. Convert official base volume using that venue's official current price; if unreliable, retain the evaluation with a precise fail-closed blocker and exclude it from entry eligibility.
+`route_liquidity = min(risex_24h_quote_volume_usd, hedge_24h_quote_volume_usd)`. Liquidity is a measurement dimension and deterministic ranking input, not a universe-selection filter. Persist every evaluated venue-asset direction; ranking never truncates the evidence set. Telegram delivers only the first 10 rows of that same authoritative deterministic ranking. Convert official base volume using that venue's official current price; if unreliable, retain the evaluation with a precise fail-closed blocker and exclude it from entry eligibility.
 
 A route also needs valid BBO, canonical grids and minimums, a fresh funding quote and next funding timestamp, known eligibility, and exact-quantity taker depth in both directions on both venues.
 
@@ -263,7 +263,7 @@ No mainnet/real-money trading, route switching, clips, partial-position lifecycl
 
 Telegram is delivery-only, disabled by default, and never owns data, economics, lifecycle decisions, or cadence. It accepts only authoritative runtime events/results and exposes no inbound commands, polling, scheduler, or additional formulas.
 
-Notify bounded authoritative lifecycle/data events and every persisted `FULL` scan digest, never `INITIAL`, `FOCUSED`, or `RECOVERY`. Deduplicate by stable event/route/cycle/displayed-value identity and split messages without changing or duplicating route rows.
+Notify bounded authoritative lifecycle/data events and every persisted `FULL` scan digest, never `INITIAL`, `FOCUSED`, or `RECOVERY`. Each FULL digest contains at most the first 10 rows of the persisted deterministic ranking; this presentation limit never truncates scanning, persistence, reporting, or opportunity measurement. Deduplicate by stable event/route/cycle/displayed-value identity and split messages without changing or duplicating delivered route rows.
 
 Delivery uses a bounded non-blocking queue, finite timeout, and finite attempts; outage or saturation never delays runtime. An ambiguous `sendMessage` timeout is not retried. Credentials come only from explicit environment configuration and never enter persistence, logs, messages, arguments, or process titles.
 
