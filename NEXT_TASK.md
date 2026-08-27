@@ -2,7 +2,7 @@
 
 ## Mainnet public shadow — all-route liquidity measurement
 
-Status: `BLOCKED — EXTENDED STREAM-HEALTH STARVES FULL CADENCE`.
+Status: `RUNNING — 24-HOUR ALL-ROUTE LIQUIDITY SHADOW`.
 
 Objective: use the accepted normal paper product against real unauthenticated RISEx, Nado, and Extended mainnet public data, evaluating every currently eligible venue-asset direction in `RISEx ∩ (Extended ∪ Nado)` without Top-5 or fixed route-count truncation. Measure whether opportunity frequency, duration, and conservative economics vary with authoritative route liquidity.
 
@@ -13,6 +13,7 @@ Exact starting point:
 - Current public catalogs observed 15 unique eligible assets in the union: 15 RISEx/Extended pairs and 14 RISEx/Nado pairs, producing 58 directions. This is an observation, not a hard-coded universe; future catalog changes must be reflected dynamically.
 - Accepted all-route preflight on 2026-08-27 evaluated all 58 directions and found two positive VVV/Nado planned routes in `< $250k`; immediate executable unwind for both was negative. The first paper-run then failed before any FULL scan: its deadline was 87.5 seconds late, concurrent public observations timed out for 37–60 seconds across venues, and shutdown required an exact-process force stop after a 30-second SIGTERM bound. Database integrity remained `ok` with zero orders, fills, and positions.
 - Accepted `f856a9931c5fa17e385102038d21ab97b0b582c2` removed that first startup/fan-out blocker. A fresh preflight again covered 58 directions and a new paper-run persisted all 58 startup rows before READY. The first scheduled FULL was then starved by a synchronized Extended disconnect/staleness wave across its 45 per-market book/trade/funding tasks: sequential recovery remained inside the main tick, so no FULL deadline or fail-closed blocker was persisted. Intentional SIGINT still reached durable `STOPPED_SAFE` in 21.25 seconds; integrity is `ok` and orders/fills/positions are zero.
+- Accepted `1796ffe272cac2fa91db0042d8a108ddb1577ecf` removed that cadence starvation without changing route or economics semantics. The fresh `chief03` preflight covered 58 directions, and the active paper-run persisted 58/58 startup rows before READY. Its first FULL deadline was recorded about 1 ms late and the complete scan finished in about 9 seconds. Continue this exact isolated run for 24 hours unless it records an earlier fail-closed blocker; do not start a parallel duplicate.
 - Rejected branch `codex/strategy-measurement-foundation` at `300362d840141d9ed599d8189ed1d10801fc5256` is not a candidate and must not be merged or copied. Open a fresh Builder only if observed evidence proves a bounded defect or a measurement field genuinely missing from the accepted paper path.
 
 Allowed scope:
