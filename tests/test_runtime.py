@@ -1523,8 +1523,8 @@ async def test_full_scan_digest_uses_persisted_authoritative_route_rows_in_order
         f"Full Scan 1/1 | Scan UTC: {NOW.isoformat()} | Status: OPPORTUNITY"
     )
     route_lines = digest.text.splitlines()[1:]
-    assert len(route_lines) == len(result["routes"])
-    for line, route_row in zip(route_lines, result["routes"]):
+    assert len(route_lines) == min(10, len(result["routes"]))
+    for line, route_row in zip(route_lines, result["routes"][:10]):
         risex_side = (
             "LONG"
             if route_row["direction"] == "LONG_RISEX_SHORT_HEDGE"
@@ -1567,7 +1567,7 @@ async def test_full_scan_digest_keeps_negative_blocked_and_unknown_routes_visibl
         if row["planned_maker_net_pnl_usd"] is not None
     )
     negative_lines = digests[0].text.splitlines()[1:]
-    assert len(negative_lines) == len(negative["routes"])
+    assert len(negative_lines) == min(10, len(negative["routes"]))
     for line, row in zip(negative_lines, negative["routes"]):
         assert line.startswith(f"{row['canonical_asset']} | RISEx ")
         if row["planned_maker_net_pnl_usd"] is None:
@@ -1577,7 +1577,7 @@ async def test_full_scan_digest_keeps_negative_blocked_and_unknown_routes_visibl
                 f"Expected PnL: ${format_telegram_money(row['planned_maker_net_pnl_usd'])}"
             )
     assert any(row["planned_maker_net_pnl_usd"] is None for row in unknown["routes"])
-    assert len(digests[1].text.splitlines()[1:]) == len(unknown["routes"])
+    assert len(digests[1].text.splitlines()[1:]) == min(10, len(unknown["routes"]))
     assert "Expected PnL: UNKNOWN" in digests[1].text
 
 
@@ -1621,11 +1621,26 @@ async def test_full_scan_digest_retains_all_58_authoritative_rows(tmp_path):
             notifications=NotificationOutbox(delivery),
         ) as runtime:
             result = await runtime.scan(scan_kind="FULL")
+        report = repository.report(as_of=NOW)
     digests = [row for row in delivery.rows if row.kind == "FULL_SCAN_DIGEST"]
     assert len(result["routes"]) == 58
+    assert len(report["latest_routes"]) == 58
     assert len(digests) == 1
-    assert sum(len(row.text.splitlines()[1:]) for row in digests) == 58
-    assert len({line for row in digests for line in row.text.splitlines()[1:]}) == 58
+    delivered_lines = [
+        line for row in digests for line in row.text.splitlines()[1:]
+    ]
+    assert len(delivered_lines) == 10
+    assert len(set(delivered_lines)) == 10
+    expected_lines = [
+        f"{row['canonical_asset']} | RISEx "
+        f"{'LONG' if row['direction'] == 'LONG_RISEX_SHORT_HEDGE' else 'SHORT'} / "
+        f"{row['hedge_venue']} "
+        f"{'SHORT' if row['direction'] == 'LONG_RISEX_SHORT_HEDGE' else 'LONG'} | "
+        f"Expected PnL: ${format_telegram_money(row['planned_maker_net_pnl_usd'])}"
+        for row in result["routes"][:10]
+    ]
+    assert delivered_lines == expected_lines
+    assert result["routes"][10]["canonical_asset"] not in "\n".join(delivered_lines)
     assert all(len(row.text) <= 4096 for row in digests)
 
 
@@ -4427,6 +4442,107 @@ async def test_extended_health_recovery_stop_is_bounded_and_cleans_owner(
             assert repository.connection.execute(
                 "PRAGMA integrity_check"
             ).fetchone()[0] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_shutdown_drains_only_owned_extended_work_during_health_wave(
+    tmp_path,
+):
+    clock = FakeClock()
+    symbol = "ACTIVE-EXTENDED"
+    resync_symbol = "RESYNC-EXTENDED"
+    with PaperRepository(tmp_path / "extended-health-all-owners-stop.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository,
+            adapters={Venue.EXTENDED: ExtendedAdapter(None)},
+            clock=clock,
+        )
+        class Session:
+            closed = False
+
+            async def close(self):
+                self.closed = True
+
+        session = Session()
+        runtime._session = session
+        runtime._stop_event = asyncio.Event()
+        started: dict[str, asyncio.Event] = {}
+        health_started = asyncio.Event()
+        started["health"] = health_started
+
+        async def owned_wait(name: str) -> None:
+            entered = started.setdefault(name, asyncio.Event())
+            entered.set()
+            await asyncio.Event().wait()
+
+        stream_key = (Venue.EXTENDED, symbol, "book")
+        stream_task = asyncio.create_task(owned_wait("stream"))
+        runtime._stream_tasks[stream_key] = stream_task
+        stream_session_id = runtime._new_stream_session(stream_key)
+        runtime._extended_confirmed_at[symbol, "book"] = (
+            clock.now() - timedelta(seconds=26)
+        )
+
+        resync_key = (Venue.EXTENDED, resync_symbol)
+        resync_session_id = runtime._new_stream_session(
+            (Venue.EXTENDED, resync_symbol, "book")
+        )
+        resync = runtime._new_recovery_episode(resync_key, resync_session_id)
+        resync_task = asyncio.create_task(owned_wait("resync"))
+        resync.task = resync_task
+
+        refresh_task = asyncio.create_task(owned_wait("refresh"))
+        catalog_task = asyncio.create_task(owned_wait("catalog"))
+        runtime._refresh_task = refresh_task
+        runtime._extended_universe_task = catalog_task
+
+        async def blocked_disconnect(*args, **kwargs):
+            health_started.set()
+            await asyncio.Event().wait()
+
+        runtime.mark_disconnected = blocked_disconnect
+        await runtime._check_extended_health(clock.now())
+        health_owner = runtime._extended_health_recovery_task
+        assert health_owner is not None
+        await asyncio.gather(*(event.wait() for event in started.values()))
+        await health_started.wait()
+        unrelated = asyncio.create_task(asyncio.Event().wait())
+
+        runtime._request_stop("SIGINT")
+        started_at = time.monotonic()
+        await asyncio.wait_for(runtime.shutdown(), timeout=1)
+        elapsed = time.monotonic() - started_at
+        events = repository.connection.execute(
+            "SELECT event_type FROM runtime_evidence ORDER BY evidence_id"
+        ).fetchall()
+        stop_index = next(
+            index for index, row in enumerate(events)
+            if row["event_type"] == "STOPPED_SAFE"
+        )
+
+        assert elapsed < 1
+        assert session.closed
+        assert all(task.done() and task.cancelled() for task in (
+            stream_task, resync_task, refresh_task, catalog_task, health_owner,
+        ))
+        assert runtime._stream_tasks == {}
+        assert runtime._recoveries == {}
+        assert runtime._retired_stream_tasks == set()
+        assert runtime._retired_recovery_tasks == set()
+        assert runtime._extended_health_recovery_task is None
+        assert runtime._extended_health_recovery_requests == {}
+        assert runtime._refresh_task is None
+        assert runtime._extended_universe_task is None
+        assert events[-1]["event_type"] == "STOPPED_SAFE"
+        assert stop_index == len(events) - 1
+        assert not any(
+            row["event_type"].startswith("PUBLIC_SOCKET_")
+            or row["event_type"].startswith("PUBLIC_SCAN")
+            for row in events[stop_index:]
+        )
+
+        unrelated.cancel()
+        await asyncio.gather(unrelated, return_exceptions=True)
 
 
 @pytest.mark.asyncio

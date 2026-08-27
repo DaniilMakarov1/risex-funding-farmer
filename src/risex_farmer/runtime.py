@@ -4704,8 +4704,37 @@ class PublicPaperRuntime:
             or self._recoveries
             or self._retired_recovery_tasks
             or self._extended_health_recovery_task is not None
+            or self._extended_health_recovery_requests
             or self._extended_universe_task is not None
         )
+
+    def _owned_background_tasks(self) -> set[asyncio.Task[None]]:
+        owned = set(self._stream_tasks.values())
+        owned.update(self._retired_stream_tasks)
+        if self._refresh_task is not None:
+            owned.add(self._refresh_task)
+        owned.update(
+            episode.task for episode in self._recoveries.values()
+            if episode.task is not None
+        )
+        owned.update(self._retired_recovery_tasks)
+        if self._extended_health_recovery_task is not None:
+            owned.add(self._extended_health_recovery_task)
+        if self._extended_universe_task is not None:
+            owned.add(self._extended_universe_task)
+        return owned
+
+    async def _cancel_owned_background_tasks(self) -> None:
+        while True:
+            owned = self._owned_background_tasks()
+            if not owned:
+                return
+            pending = {task for task in owned if not task.done()}
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*owned, return_exceptions=True)
+            if not pending:
+                return
 
     async def shutdown(self) -> None:
         if not self.accepting_entries and not self._has_owned_background_work():
@@ -4714,29 +4743,22 @@ class PublicPaperRuntime:
         at = self.clock.now()
         if self._stop_cause is None:
             self._request_stop("UNKNOWN_EXTERNAL_STOP")
-        if self.broker is not None and self.broker.state.lifecycle_state is LifecycleState.ENTRY_MAKER_OPEN:
-            state = await self.broker.cancel_for_process_restart(restarted_at=at)
-            self.repository.save_decision(recorded_at=at, entry_state=state)
         self._shutdown_started = True
         if self._stop_event is not None:
             self._stop_event.set()
-        owned = list(self._stream_tasks.values())
-        owned.extend(self._retired_stream_tasks)
-        if self._refresh_task is not None:
-            owned.append(self._refresh_task)
-        owned.extend(
-            episode.task for episode in self._recoveries.values()
-            if episode.task is not None
-        )
-        owned.extend(self._retired_recovery_tasks)
-        if self._extended_health_recovery_task is not None:
-            owned.append(self._extended_health_recovery_task)
-        if self._extended_universe_task is not None:
-            owned.append(self._extended_universe_task)
-        for task in owned:
-            task.cancel()
-        if owned:
-            await asyncio.gather(*owned, return_exceptions=True)
+        for task in self._owned_background_tasks():
+            if not task.done():
+                task.cancel()
+        if (
+            self._session is not None
+            and not getattr(self._session, "closed", False)
+            and hasattr(self._session, "close")
+        ):
+            await self._session.close()
+        if self.broker is not None and self.broker.state.lifecycle_state is LifecycleState.ENTRY_MAKER_OPEN:
+            state = await self.broker.cancel_for_process_restart(restarted_at=at)
+            self.repository.save_decision(recorded_at=at, entry_state=state)
+        await self._cancel_owned_background_tasks()
         at = self.clock.now()
         stop_detail: dict[str, object] = {
             "forced_close": False,
@@ -4780,7 +4802,11 @@ class PublicPaperRuntime:
     async def close(self) -> None:
         if self.accepting_entries or self._has_owned_background_work():
             await self.shutdown()
-        if self._session is not None and not self._session.closed:
+        if (
+            self._session is not None
+            and not getattr(self._session, "closed", False)
+            and hasattr(self._session, "close")
+        ):
             await self._session.close()
 
 

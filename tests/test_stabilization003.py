@@ -1169,8 +1169,8 @@ async def test_stabilization003_g_scan_rows_use_one_captured_tuple(
         digest = next(row for row in delivery.rows if row.kind == "FULL_SCAN_DIGEST")
         assert digest.occurred_at == snapshot.logical_at
         digest_lines = digest.text.splitlines()[1:]
-        assert len(digest_lines) == len(persisted)
-        for line, row in zip(digest_lines, persisted):
+        assert len(digest_lines) == min(10, len(persisted))
+        for line, row in zip(digest_lines, persisted[:10]):
             if row["planned_maker_net_pnl_usd"] is not None:
                 assert line.endswith(
                     "Expected PnL: $" + format_telegram_money(
@@ -1422,7 +1422,11 @@ async def test_stabilization003_h_top5_component_blocker_and_numeric_matrix(
                     line for line in digest.text.splitlines()[1:]
                     if risex_leg or f"/ {venue.value} " in line
                 ]
-                assert len(nado_lines) == (20 if risex_leg else 10)
+                expected_rows = [
+                    row for row in result["routes"][:10]
+                    if risex_leg or row["hedge_venue"] == venue.value
+                ]
+                assert len(nado_lines) == len(expected_rows)
                 assert all(
                     line.endswith(
                         "Expected PnL: UNKNOWN — " + label_by_blocker[blocker]
@@ -1564,7 +1568,7 @@ async def test_stabilization003_h_top5_component_blocker_and_numeric_matrix(
             digest = [
                 row for row in delivery.rows if row.kind == "FULL_SCAN_DIGEST"
             ][-1]
-            assert len(digest.text.splitlines()[1:]) == 20
+            assert len(digest.text.splitlines()[1:]) == 10
             assert all(
                 line.endswith("Expected PnL: UNKNOWN — funding")
                 for line in digest.text.splitlines()[1:]
@@ -1605,9 +1609,9 @@ async def test_stabilization003_i_telegram_relays_only_persisted_full_rows(tmp_p
     assert len(digests) == 2
     numeric_lines = digests[0].text.splitlines()[1:]
     unknown_lines = digests[1].text.splitlines()[1:]
-    assert len(numeric_lines) == len(numeric_persisted)
-    assert len(unknown_lines) == len(unknown_persisted)
-    for line, row in zip(numeric_lines, numeric_persisted):
+    assert len(numeric_lines) == min(10, len(numeric_persisted))
+    assert len(unknown_lines) == min(10, len(unknown_persisted))
+    for line, row in zip(numeric_lines, numeric_persisted[:10]):
         assert line.endswith(
             "Expected PnL: $" + format_telegram_money(
                 row["planned_maker_net_pnl_usd"]
@@ -1617,7 +1621,7 @@ async def test_stabilization003_i_telegram_relays_only_persisted_full_rows(tmp_p
         "FUNDING_STALE": "funding",
         "FUNDING_ELIGIBILITY_UNKNOWN": "funding",
     }
-    for line, row in zip(unknown_lines, unknown_persisted):
+    for line, row in zip(unknown_lines, unknown_persisted[:10]):
         blocker = row["blockers"][0]
         assert line.endswith(
             "Expected PnL: UNKNOWN — " + unknown_labels[blocker]

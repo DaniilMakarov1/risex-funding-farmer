@@ -14,6 +14,9 @@ from typing import Protocol
 import aiohttp
 
 
+TELEGRAM_FULL_DIGEST_ROW_LIMIT = 10
+
+
 @dataclass(frozen=True, slots=True)
 class NotificationPayload:
     event_id: str
@@ -51,7 +54,7 @@ def full_scan_digest_payloads(
     scan_utc = utc_time(scan_at)
     status = "OPPORTUNITY" if opportunity else "NO TRADE"
     route_lines: list[str] = []
-    for row in route_rows:
+    for row in route_rows[:TELEGRAM_FULL_DIGEST_ROW_LIMIT]:
         ticker = _bounded_digest_field(str(row.get("canonical_asset") or "UNKNOWN"), 48)
         hedge = str(row.get("hedge_venue") or "UNKNOWN")
         direction = row.get("direction")

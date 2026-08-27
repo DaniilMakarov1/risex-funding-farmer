@@ -200,11 +200,11 @@ def test_full_scan_digest_part_event_ids_deduplicate_and_text_is_bounded():
     route_lines = [
         line for digest in digests for line in digest.text.splitlines()[1:]
     ]
-    assert len(route_lines) == 20
+    assert len(route_lines) == 10
     assert all(line.count(" | ") == 2 for line in route_lines)
 
 
-def test_full_scan_digest_splits_all_58_rows_without_loss() -> None:
+def test_full_scan_digest_delivers_only_first_ten_rows_without_loss() -> None:
     rows = tuple({
         "canonical_asset": f"ASSET-{index}-" + "X" * 80,
         "hedge_venue": "EXTENDED-" + "Y" * 100,
@@ -217,8 +217,28 @@ def test_full_scan_digest_splits_all_58_rows_without_loss() -> None:
     )
     assert all(len(payload.text) <= 4096 for payload in payloads)
     lines = [line for payload in payloads for line in payload.text.splitlines()[1:]]
-    assert len(lines) == len(set(lines)) == 58
+    assert len(payloads) == 1
+    assert len(lines) == len(set(lines)) == 10
     assert all("Expected PnL: UNKNOWN — market metadata stale" in line for line in lines)
+    assert all(f"ASSET-{index}-" in line for index, line in enumerate(lines))
+    assert not any("ASSET-10-" in line for line in lines)
+
+
+def test_full_scan_digest_keeps_fewer_than_ten_rows_whole() -> None:
+    rows = tuple({
+        "canonical_asset": f"ASSET-{index}",
+        "hedge_venue": "EXTENDED",
+        "direction": "LONG_RISEX_SHORT_HEDGE",
+        "planned_maker_net_pnl_usd": str(index),
+    } for index in range(3))
+    payloads = full_scan_digest_payloads(
+        scan_at=NOW, opportunity=False, route_rows=rows,
+    )
+    assert len(payloads) == 1
+    assert payloads[0].text.splitlines()[1:] == [
+        f"ASSET-{index} | RISEx LONG / EXTENDED SHORT | Expected PnL: ${index}.00"
+        for index in range(3)
+    ]
 
 
 @pytest.mark.parametrize(("blocker", "label"), (
