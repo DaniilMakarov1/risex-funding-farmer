@@ -2,16 +2,16 @@
 
 ## Two-route testnet funding-boundary lifecycles
 
-Status: `HANDOFF READY — RISEx–NADO AND RISEx–EXTENDED`.
+Status: `ACTIVE — READ GATES READY; STAGED VENUE RUNNERS IN REVIEW; NO WRITE IN FLIGHT`.
 
 Objective: prove how the accepted system behaves before, during, and after an actual testnet funding settlement on exactly two hedged routes: one RISEx–Nado route and one RISEx–Extended route. Open the smallest venue-executable matched testnet positions, observe and reconcile actual venue funding semantics at the boundary, then close every leg to authoritative zero relevant orders and exact flatness.
 
 Exact starting point:
 
-- Published `main` after the clean handoff checkpoint is the only authorized source base.
+- Published `main` is the only authorized source base; the latest accepted checkpoint includes the Nado all-products boundary, outbound-only lifecycle notifications, and the corrected RISEx completed-history/nonce-scope read gate.
 - All earlier RISEx, Nado, and Extended Level C lifecycles are complete historical evidence; this is a fresh funding-accrual objective, not permission to replay their intents.
 - The corrected public all-route implementation and its paper measurements remain accepted, but the `chief11` statistical window was intentionally ended for this rotation. Its database has integrity `ok` and zero orders/fills/positions; its obsolete automation was deleted.
-- No Builder candidate or venue write is in flight at handoff.
+- Fresh authenticated read-only gates are accepted for RISEx, Nado, and Extended. Nado and Extended staged funding-boundary Builders are active in isolated worktrees; their reports are not acceptance. No venue write is in flight.
 
 Authorized routes:
 
