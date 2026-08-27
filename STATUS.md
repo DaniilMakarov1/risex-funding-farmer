@@ -2,8 +2,8 @@
 
 ## Central baseline
 
-- Git `main` is the accepted-history authority and is published to `origin/main` after every accepted Chief checkpoint. Paper remains the default; mainnet, real funds, and strategy execution are not authorized.
-- RISEx, Nado, and Extended have each completed one bounded Level C testnet lifecycle ending with authoritative zero open orders and exact flatness. No additional venue lifecycle is authorized before a separate strategy-testnet measurement gate.
+- Git `main` is the accepted-history authority and is published to `origin/main` after every accepted Chief checkpoint. Paper remains the default; public unauthenticated mainnet shadow reads are authorized, while authenticated/private mainnet access, writes, real funds, and strategy execution are not.
+- RISEx, Nado, and Extended have each completed one bounded Level C testnet lifecycle ending with authoritative zero open orders and exact flatness. No additional venue lifecycle is authorized; the next gate is mainnet-public read-only shadow measurement through the normal paper product.
 - The accepted tree keeps normal startup isolated from testnet operational runners. Protected credentials and operational journals remain runtime data outside Git.
 
 ## Venue completion
@@ -29,7 +29,8 @@
 - Common proven safety semantics are: durable unique intent identity before dispatch, one-way dispatch state, no blind replay, exact authoritative order/fill/position reconciliation, unrelated-state rejection, reduce-only flattening, and two ordered agreeing terminal zero-order/exact-flat rounds.
 - Common measurement inputs are funding, fees, executable top-of-book depth, spread/slippage, response and execution timestamps, stale-data status, position/order state, and reconciliation outcome. These can share a normalized observation/report boundary without sharing venue signing or write engines.
 - Venue authentication, signing, nonce/wire identity, order/cancel/close encoding, pagination, private-event transport, and recovery rules remain materially different and must stay venue-specific. The 3/3 evidence does not justify a generic OMS or a shared execution framework.
-- Infrastructure expansion stops here. The next work is a separate strategy-testnet measurement slice that is read-only/paper by default and must establish evidence and kill-switch gates before any separately authorized strategy execution.
+- Infrastructure expansion stops here. The next work uses real unauthenticated mainnet market data in the existing read-only paper runtime to establish opportunity frequency, conservative economics, timing, stale-data, leg-risk, reconciliation, and kill-switch evidence before any separately authorized strategy execution.
+- Candidate `300362d840141d9ed599d8189ed1d10801fc5256` on `codex/strategy-measurement-foundation` is formally rejected and immutable: it adds 3,359 lines of parallel measurement infrastructure for the superseded testnet-measurement objective without a visible Builder evidence report. None of it enters `main`; the existing accepted mainnet-public paper path is the authorized starting point.
 
 ## Remaining gate
 

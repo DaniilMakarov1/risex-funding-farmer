@@ -1,29 +1,35 @@
 # Active bounded task
 
-## Cross-venue strategy testnet — read-only measurement foundation
+## Mainnet public shadow — first real-data measurement window
 
-Status: `READY FOR FRESH BUILDER`.
+Status: `READY FOR CHIEF OPERATIONAL GATE`.
 
-Objective: implement one isolated, paper/read-only measurement slice across the already accepted RISEx, Nado, and Extended venue boundaries. It must collect comparable evidence for funding, explicit fees, executable liquidity and spread, modeled slippage, observation/execution timing, stale-data rejection, and reconciliation health, then produce a deterministic paper decision with explicit leg-risk and kill-switch reasons.
+Objective: use the already accepted normal paper product against real unauthenticated RISEx, Nado, and Extended mainnet public data. Establish whether any route remains economically positive under the existing conservative execution model and collect the first bounded evidence for opportunity frequency, funding, fees, executable depth, spread/slippage, timing, stale-data rejection, leg risk, reconciliation health, and kill-switch reasons.
+
+Exact starting point:
+
+- Published `main` after the current governance checkpoint; normal commands remain `scan-once`, `paper-run`, and `report`.
+- A fresh one-shot public mainnet scan on 2026-08-27 completed with all three venues `PUBLIC_MARKET_READY`, produced real routes, and correctly returned `NO_TRADE` because every route had negative planned net PnL.
+- Rejected branch `codex/strategy-measurement-foundation` at `300362d840141d9ed599d8189ed1d10801fc5256` is not a candidate and must not be merged or copied. Open a fresh Builder only if observed evidence proves a bounded defect or a measurement field genuinely missing from the accepted paper path.
 
 Allowed scope:
 
-- Reuse accepted venue read-only contracts and fixtures; add only the smallest venue-local adapters and a normalized immutable measurement/report boundary needed for comparison.
-- Measure gross and fee-adjusted funding opportunity, executable size at bounded book depth, entry/exit slippage assumptions, timestamp age/skew, and a two-leg timing budget.
-- Fail closed on stale, missing, contradictory, unrelated, non-finite, or non-comparable evidence. Report why a candidate is rejected without exposing secrets or raw authenticated payloads.
-- Define deterministic paper-only gates for maximum leg imbalance, maximum observation age/skew, reconciliation health, and a kill switch. Tests must cover funding sign/direction, fee arithmetic, depth/slippage, stale data, partial-leg simulation, reconciliation contradiction, and kill-switch activation.
-- Keep normal startup and all operational Level C runners unchanged. Use Python 3.11 focused/adverse tests and one clean full suite on the final candidate SHA.
+- Public unauthenticated mainnet REST/WebSocket reads from the existing fixed venue adapters.
+- A fresh isolated paper SQLite database, one preflight `scan-once`, then a bounded 24-hour `paper-run` observation window unless a fail-closed blocker ends it earlier; run with outbound Telegram disabled and preserve the database and sanitized report as operational evidence.
+- Existing conservative paper semantics: exact Decimal arithmetic, canonical units, exact-size depth/VWAP, fee and execution PnL, funding timestamps, trade-through maker evidence, data-gap degradation, restart behavior, and `NO_TRADE` as a valid result.
+- Report opportunity count/duration, COMPLETE versus DEGRADED paper lifecycles, planned and executable-unwind net PnL, fee/slippage components, funding source quality, latency/freshness failures, leg-risk proxies, and every assumption or blocker.
+- Read-only diagnostics and a fresh Builder correction only when a concrete mainnet-public observation contradicts accepted code. Any candidate requires focused/adverse tests and one clean Python 3.11 full suite on its final SHA.
 
 Forbidden scope:
 
-- No venue write, order preparation/signing/dispatch, credential use unless a separately bounded read-only gate requires it, real funds, mainnet endpoint, live strategy execution, scheduler/service/dashboard, generic OMS, automatic recovery, or new venue.
-- Do not merge venue authentication, signing, nonce, wire identity, order/cancel/close, pagination, or private-event implementations. The accepted testnet REST-only Extended fallback is not a mainnet capability.
-- Do not change product economics or safety invariants without a separate Chief gate based on official or observed evidence.
+- No API key, wallet/session/Stark key, authenticated/private endpoint, account creation, collateral, signing, nonce, order construction, order/cancel/close dispatch, testnet or mainnet write, real funds, or live strategy execution.
+- No generic OMS, parallel execution engine, service/dashboard, new venue, or duplicate measurement framework. Do not modify isolated accepted Level C runners merely to support shadow measurement.
+- Do not treat displayed depth as proof of fill, estimated RISEx funding as authoritative applied funding, DEGRADED/unresolved trades as profitability evidence, or a single positive snapshot as strategy validation.
 
-Acceptance:
+Acceptance for the first checkpoint:
 
-- The report is reproducible from fixtures and sanitized captured observations, makes no write-capable object reachable, and returns either a fully quantified paper candidate or a specific fail-closed reason.
-- All three venue adapters prove unit normalization and timestamp semantics independently; cross-venue arithmetic has exact Decimal behavior and no float path.
-- Kill-switch and leg-risk simulation stop before a second paper leg whenever the first-leg or reconciliation evidence is partial, stale, ambiguous, or outside the declared bounds.
+- The bounded run uses only public mainnet data and leaves verifiable zero credential/signing/write effects.
+- The stored/reportable evidence distinguishes official values from paper assumptions and returns either quantified conservative paper opportunities or exact fail-closed/negative-economics reasons.
+- Chief defines the next statistical observation window and predeclared profitability/risk thresholds from the first evidence; no mainnet Level D or real-funds claim follows automatically.
 
-After acceptance, Chief may run a separate bounded read-only testnet measurement. Any strategy write, even on testnet, requires a new explicit authorization gate; mainnet remains Level D and unauthorized.
+Only after a sufficiently broad mainnet-public shadow sample shows durable conservative profitability may Chief open a separate Level D hardening task. Level D must still prove current mainnet contracts/endpoints, protected production identities, Extended private WebSocket, notional/loss/leg-risk limits, restart and ambiguous-write recovery, monitoring/manual recovery, a no-dispatch shadow run, and a separately authorized smallest real-funds canary.
