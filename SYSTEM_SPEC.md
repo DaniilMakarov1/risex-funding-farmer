@@ -265,6 +265,8 @@ Telegram is delivery-only, disabled by default, and never owns data, economics, 
 
 Notify bounded authoritative lifecycle/data events and every persisted `FULL` scan digest, never `INITIAL`, `FOCUSED`, or `RECOVERY`. Each FULL digest contains at most the first 10 rows of the persisted deterministic ranking; this presentation limit never truncates scanning, persistence, reporting, or opportunity measurement. Deduplicate by stable event/route/cycle/displayed-value identity and split messages without changing or duplicating delivered route rows.
 
+Persist raw public socket disconnect/reconnect and resync lifecycle evidence, but do not label or deliver a self-recovered transient socket episode as critical data loss. A critical Telegram data-loss alert requires an unresolved/persistent semantic failure such as confirmation staleness beyond the existing health threshold, failed snapshot recovery, blocked authoritative scan, or fatal runtime state. Deliver recovery only when it closes a previously delivered critical episode; routine reconnect churn remains reportable operational evidence without outbound alert spam.
+
 Delivery uses a bounded non-blocking queue, finite timeout, and finite attempts; outage or saturation never delays runtime. An ambiguous `sendMessage` timeout is not retried. Credentials come only from explicit environment configuration and never enter persistence, logs, messages, arguments, or process titles.
 
 Runtime has no elapsed-time stop. It distinguishes intentional signals from fatal failures, preserves open positions, persists bounded safe-stop evidence, and cancels/awaits background tasks without fabricating transport events.
