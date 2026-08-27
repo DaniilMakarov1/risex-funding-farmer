@@ -4174,6 +4174,45 @@ async def test_healthy_live_stream_background_refresh_does_not_install_rest_book
 
 
 @pytest.mark.asyncio
+async def test_extended_live_book_refresh_does_not_depend_on_trade_readiness(tmp_path):
+    clock = FakeClock()
+    extended = GatedExtendedAdapter(
+        clock, settlement_at=NOW + timedelta(minutes=5)
+    )
+    with PaperRepository(tmp_path / "extended-live-book-refresh.db") as repository:
+        async with PublicPaperRuntime(
+            repository,
+            adapters={
+                Venue.RISEX: FakeAdapter(
+                    Venue.RISEX, clock, settlement_at=NOW + timedelta(minutes=5)
+                ),
+                Venue.EXTENDED: extended,
+                Venue.NADO: FakeAdapter(
+                    Venue.NADO, clock, settlement_at=NOW + timedelta(minutes=5)
+                ),
+            },
+            clock=clock,
+        ) as runtime:
+            await runtime.scan()
+            symbol = extended.market.venue_symbol
+            confirm_extended_stream(
+                runtime, symbol, "book", clock.now(), data_ready=True
+            )
+            before = runtime.observations[Venue.EXTENDED, symbol]
+            extended.calls.clear()
+            runtime._start_public_refresh()
+            assert runtime._refresh_task is not None
+            await runtime._refresh_task
+            after = runtime.observations[Venue.EXTENDED, symbol]
+
+    assert extended.calls == ["funding"]
+    assert (Venue.EXTENDED, symbol) not in runtime._trade_stream_ready
+    assert after.book == before.book
+    assert after.book is not None
+    assert after.book.observed_at == before.book.observed_at
+
+
+@pytest.mark.asyncio
 async def test_extended_stream_registry_is_dynamic_deduplicated_and_lock_safe(tmp_path):
     clock = FakeClock()
     adapter = ExtendedAdapter(None)
@@ -4732,6 +4771,164 @@ async def test_extended_health_recovery_stop_is_bounded_and_cleans_owner(
 
 
 @pytest.mark.asyncio
+async def test_extended_transport_wave_defers_rest_fanout_and_keeps_all_routes(
+    tmp_path,
+):
+    clock = FakeClock()
+    target = NOW + timedelta(minutes=5)
+    asset_count = 45
+    risex = ManyFakeAdapter(
+        Venue.RISEX, clock, settlement_at=target, asset_count=asset_count
+    )
+
+    class ManyExtended(GatedExtendedAdapter):
+        def __init__(self) -> None:
+            super().__init__(clock, settlement_at=target)
+            self.rows = tuple(
+                replace(
+                    self.market,
+                    canonical_asset=f"A{index}",
+                    venue_symbol=f"A{index}-EXTENDED",
+                )
+                for index in range(asset_count)
+            )
+
+        async def fetch_catalog(self):
+            self.catalog_calls += 1
+            return self.rows, tuple(
+                MarketVolume(
+                    Venue.EXTENDED,
+                    market.venue_symbol,
+                    D("1000000"),
+                    clock.now(),
+                    "official-shaped",
+                )
+                for market in self.rows
+            )
+
+        async def fetch_required_catalog(self, venue_symbols):
+            selected = tuple(
+                market for market in self.rows
+                if market.venue_symbol in set(venue_symbols)
+            )
+            return selected, tuple(
+                MarketVolume(
+                    Venue.EXTENDED,
+                    market.venue_symbol,
+                    D("1000000"),
+                    clock.now(),
+                    "official-shaped",
+                )
+                for market in selected
+            )
+
+        async def fetch_book(self, venue_symbol):
+            self.calls.append("book")
+            return OrderBook(
+                Venue.EXTENDED,
+                venue_symbol,
+                (BookLevel(D("99"), D("20")),),
+                (BookLevel(D("101"), D("20")),),
+                clock.now(),
+                None,
+            )
+
+        async def fetch_funding_quote(self, market, *, assumed_open_at):
+            self.calls.append("funding")
+            return FundingCashQuote(
+                Venue.EXTENDED,
+                market.venue_symbol,
+                clock.now(),
+                assumed_open_at,
+                target,
+                FundingQuality.PREDICTED,
+                FundingAccrualMethod.SNAPSHOT_AT_SETTLEMENT,
+                True,
+                D("5"),
+                D("5"),
+                "official-shaped",
+            )
+
+    extended = ManyExtended()
+    stop = asyncio.Event()
+    with PaperRepository(tmp_path / "extended-transport-wave-refresh.db") as repository:
+        async with PublicPaperRuntime(
+            repository,
+            adapters={Venue.RISEX: risex, Venue.EXTENDED: extended},
+            clock=clock,
+        ) as runtime:
+            await runtime.scan()
+            funding_before = {
+                market.venue_symbol: runtime.observations[
+                    Venue.EXTENDED, market.venue_symbol
+                ].funding
+                for market in extended.rows
+            }
+            extended.calls.clear()
+            runtime._stop_event = stop
+            for market in extended.rows:
+                for kind in ("book", "trade", "funding"):
+                    key = (Venue.EXTENDED, market.venue_symbol, kind)
+                    runtime._stream_tasks[key] = asyncio.create_task(stop.wait())
+                    session_id = runtime._new_stream_session(key)
+                    runtime._socket_disconnected(
+                        (Venue.EXTENDED, kind, (market.venue_symbol,)),
+                        at=clock.now(),
+                        stream_session_id=session_id,
+                    )
+                    await runtime.mark_disconnected(
+                        Venue.EXTENDED,
+                        market.venue_symbol,
+                        at=clock.now(),
+                        stream_kind=kind,
+                        stream_session_id=session_id,
+                    )
+
+            await runtime._refresh_public_data()
+            result = await runtime.scan(
+                refresh=False, scan_kind="FULL", scheduled_at=clock.now()
+            )
+            deferred = repository.connection.execute(
+                "SELECT detail FROM runtime_evidence "
+                "WHERE event_type='PUBLIC_MARKET_OBSERVATION_DEFERRED'"
+            ).fetchall()
+            full = repository.connection.execute(
+                "SELECT detail FROM runtime_evidence "
+                "WHERE event_type='PUBLIC_SCAN' "
+                "AND json_extract(detail,'$.scan_kind')='FULL'"
+            ).fetchall()
+            blocked = repository.connection.execute(
+                "SELECT COUNT(*) FROM runtime_evidence "
+                "WHERE event_type='PUBLIC_SCAN_BLOCKED'"
+            ).fetchone()[0]
+            runtime._request_stop("STOP_EVENT")
+            await runtime.shutdown()
+
+    assert extended.calls == []
+    assert len(deferred) == asset_count
+    assert all(
+        json.loads(row[0])["components"] == ["book", "trade", "funding"]
+        for row in deferred
+    )
+    assert len(result["routes"]) == asset_count * 2
+    assert len(full) == 1
+    assert blocked == 0
+    assert all(
+        runtime.observations[Venue.EXTENDED, market.venue_symbol].book is None
+        and runtime.observations[
+            Venue.EXTENDED, market.venue_symbol
+        ].funding == funding_before[market.venue_symbol]
+        for market in extended.rows
+    )
+    assert all(
+        "BOOK_UNHEALTHY" in row["blockers"]
+        and "TRADE_STREAM_UNHEALTHY" in row["blockers"]
+        and "FUNDING_STREAM_UNHEALTHY" in row["blockers"]
+        for row in result["routes"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_shutdown_drains_only_owned_extended_work_during_health_wave(
     tmp_path,
 ):
@@ -4923,6 +5120,96 @@ async def test_shutdown_reproduces_cancellation_resistant_session_and_socket_clo
         assert repository.connection.execute(
             "SELECT event_type FROM runtime_evidence ORDER BY evidence_id"
         ).fetchall()[-1]["event_type"] == "STOPPED_SAFE"
+
+
+@pytest.mark.asyncio
+async def test_shutdown_is_bounded_when_close_ignores_cancellation(tmp_path):
+    clock = FakeClock()
+    iteration_started = asyncio.Event()
+    session_close_started = asyncio.Event()
+    socket_close_started = asyncio.Event()
+    release_session_close = asyncio.Event()
+    release_socket_close = asyncio.Event()
+
+    class ResistantSocket:
+        closed = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            socket_close_started.set()
+            while not release_socket_close.is_set():
+                try:
+                    await release_socket_close.wait()
+                except asyncio.CancelledError:
+                    continue
+            self.closed = True
+            return False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            iteration_started.set()
+            await asyncio.Event().wait()
+
+    class ResistantSession:
+        closed = False
+
+        def __init__(self):
+            self.socket = ResistantSocket()
+
+        def ws_connect(self, *_args, **_kwargs):
+            return self.socket
+
+        async def close(self):
+            session_close_started.set()
+            while not release_session_close.is_set():
+                try:
+                    await release_session_close.wait()
+                except asyncio.CancelledError:
+                    continue
+            self.closed = True
+
+    with PaperRepository(tmp_path / "bounded-resistant-close.db") as repository:
+        runtime = PublicPaperRuntime(repository, adapters={}, clock=clock)
+        runtime._session = ResistantSession()
+        runtime._stop_event = asyncio.Event()
+        key = (Venue.EXTENDED, "CLOSE-RESISTANT", "trade")
+        session_id = runtime._new_stream_session(key)
+        stream_task = asyncio.create_task(runtime._extended_stream(
+            ExtendedAdapter(None), "CLOSE-RESISTANT", "trade", session_id,
+        ))
+        runtime._stream_tasks[key] = stream_task
+        await asyncio.wait_for(iteration_started.wait(), timeout=1)
+
+        runtime._request_stop("SIGTERM")
+        started = time.monotonic()
+        await asyncio.wait_for(runtime.close(), timeout=3)
+        elapsed = time.monotonic() - started
+        detached = tuple(runtime._detached_tasks)
+        events = repository.connection.execute(
+            "SELECT event_type FROM runtime_evidence ORDER BY evidence_id"
+        ).fetchall()
+
+        assert session_close_started.is_set()
+        assert socket_close_started.is_set()
+        assert elapsed < 3
+        assert stream_task in detached
+        assert runtime._stream_tasks == {}
+        assert events[-1]["event_type"] == "STOPPED_SAFE"
+
+        release_session_close.set()
+        release_socket_close.set()
+        await asyncio.wait_for(
+            asyncio.gather(*detached, return_exceptions=True), timeout=1
+        )
+        await asyncio.sleep(0)
+
+    assert runtime._detached_tasks == set()
+    assert runtime._session.closed
+    assert runtime._session.socket.closed
 
 
 @pytest.mark.asyncio

@@ -132,6 +132,10 @@ class _PublicSocketClosed(ConnectionError):
 _PublicResult = TypeVar("_PublicResult")
 PUBLIC_REQUEST_TIMEOUT_SECONDS = 30
 PUBLIC_REST_CONCURRENCY_PER_VENUE = 2
+# This is only a cleanup bound.  It is deliberately below the product's
+# 30-second safe-stop requirement and does not alter public-data freshness or
+# request deadlines.
+CANCELLATION_DRAIN_TIMEOUT_SECONDS = 1.0
 
 
 def _volume_signature(rows: Mapping[str, MarketVolume]) -> dict[str, tuple[Decimal | None, str]]:
@@ -165,14 +169,47 @@ def _http_status(exc: BaseException) -> int | None:
 
 async def _gather_owned(*work: Awaitable[Any]) -> tuple[Any, ...]:
     tasks = [asyncio.ensure_future(row) for row in work]
+    gathered = asyncio.gather(*tasks)
+    gathered.add_done_callback(_consume_future_result)
     try:
-        return tuple(await asyncio.gather(*tasks))
+        # Shield the group so parent cancellation reaches this cleanup path
+        # immediately instead of waiting for a cancellation-resistant child.
+        return tuple(await asyncio.shield(gathered))
     except BaseException:
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        if not gathered.done():
+            gathered.cancel()
+        await _cancel_tasks_bounded(tasks)
         raise
+
+
+def _consume_future_result(future: asyncio.Future[Any]) -> None:
+    if future.cancelled():
+        return
+    try:
+        future.exception()
+    except BaseException:
+        return
+
+
+async def _cancel_tasks_bounded(
+    tasks: list[asyncio.Future[Any]] | set[asyncio.Future[Any]] | tuple[asyncio.Future[Any], ...],
+    *,
+    timeout_seconds: float = CANCELLATION_DRAIN_TIMEOUT_SECONDS,
+) -> set[asyncio.Future[Any]]:
+    current = asyncio.current_task()
+    pending = {
+        task for task in tasks
+        if not task.done() and task is not current
+    }
+    for task in pending:
+        task.cancel()
+    if pending:
+        done, pending = await asyncio.wait(
+            pending, timeout=timeout_seconds
+        )
+        for task in done:
+            _consume_future_result(task)
+    return pending
 
 
 @dataclass(slots=True)
@@ -439,6 +476,7 @@ class PublicPaperRuntime:
         self.next_extended_catalog_at: datetime | None = None
         self.notifications = notifications
         self._tick_task: asyncio.Task[None] | None = None
+        self._detached_tasks: set[asyncio.Future[Any]] = set()
         self._catalog_reconciliation_in_progress = False
         self._notification_run_id: str | None = None
         self._stop_cause: str | None = None
@@ -939,6 +977,100 @@ class PublicPaperRuntime:
         )
         return row is not None and row.available
 
+    def _extended_transport_gap_kinds(self, symbol: str) -> tuple[str, ...]:
+        """Return Extended sockets already in a physical recovery episode.
+
+        A background refresh must not queue a second REST book/funding fan-out
+        behind a known transport outage.  The existing stream and component
+        gates remain authoritative; this method only identifies an outage that
+        has already been observed and recorded.
+        """
+        gap_kinds: list[str] = []
+        components = self.component_readiness.get(Venue.EXTENDED, {})
+        for kind in ("book", "trade", "funding"):
+            identity = (Venue.EXTENDED, kind, (symbol,))
+            if (
+                identity in self._pending_socket_episodes
+                or identity in self._pending_watchdog_episodes
+            ):
+                gap_kinds.append(kind)
+                continue
+            data_component = "applied_funding" if kind == "funding" else kind
+            rows = (
+                components.get(f"{data_component}:{symbol}"),
+                components.get(f"connection_{kind}:{symbol}"),
+            )
+            if any(
+                row is not None
+                and row.detail.startswith(
+                    (
+                        "PUBLIC_STREAM_DISCONNECTED:",
+                        "PUBLIC_STREAM_CONFIRMATION_STALE:",
+                        "PUBLIC_STREAM_TRANSPORT_GAP",
+                    )
+                )
+                for row in rows
+            ):
+                gap_kinds.append(kind)
+        return tuple(gap_kinds)
+
+    def _preserve_extended_transport_gap_observation(
+        self,
+        market: Any,
+        volume: MarketVolume | None,
+        existing: MarketObservation | None,
+        gap_kinds: tuple[str, ...],
+    ) -> None:
+        """Retain only evidence that is still authoritative during a gap.
+
+        A disconnected Extended stream is already a precise fail-closed
+        condition.  Keep a healthy book only when the book socket itself is
+        healthy; never install a REST snapshot or synthesize a fresh funding
+        quote while the symbol is in transport recovery.
+        """
+        key = (Venue.EXTENDED, market.venue_symbol)
+        at = self.clock.now()
+        stream = self.coordinator.stream(*key)
+        book = stream.book()
+        funding = None if existing is None else existing.funding
+        self.observations[key] = MarketObservation(
+            market,
+            volume,
+            book,
+            funding,
+            stream.health(at),
+            trade_stream_ready=key in self._trade_stream_ready,
+            funding_stream_ready=self._extended_stream_connection_available(
+                market.venue_symbol, "funding"
+            ),
+        )
+        for kind in gap_kinds:
+            data_component = "applied_funding" if kind == "funding" else kind
+            self._set_component_readiness(
+                Venue.EXTENDED,
+                f"{data_component}:{market.venue_symbol}",
+                False,
+                "PUBLIC_STREAM_TRANSPORT_GAP",
+                at,
+            )
+            self._set_component_readiness(
+                Venue.EXTENDED,
+                f"connection_{kind}:{market.venue_symbol}",
+                False,
+                "PUBLIC_STREAM_TRANSPORT_GAP",
+                at,
+            )
+        self._record(
+            "PUBLIC_MARKET_OBSERVATION_DEFERRED",
+            at=at,
+            venue=Venue.EXTENDED,
+            detail={
+                "symbol": market.venue_symbol,
+                "reason": "EXTENDED_STREAM_TRANSPORT_GAP",
+                "components": list(gap_kinds),
+            },
+        )
+
     def _remove_obsolete_components(
         self, venue: Venue, relevant_symbols: set[str], at: datetime
     ) -> None:
@@ -1335,10 +1467,24 @@ class PublicPaperRuntime:
         existing = self.observations.get(key)
         request_started_at = self.clock.now()
         try:
+            if isinstance(adapter, ExtendedAdapter) and background:
+                transport_gap = self._extended_transport_gap_kinds(
+                    market.venue_symbol
+                )
+                if transport_gap:
+                    self._preserve_extended_transport_gap_observation(
+                        market, volume, existing, transport_gap
+                    )
+                    return
             live_health = self.coordinator.stream(*key).health(self.clock.now())
+            live_stream_ready = (
+                key in self._live_book_ready
+                if isinstance(adapter, ExtendedAdapter)
+                else key in self._trade_stream_ready
+            )
             healthy_live = (
                 background
-                and key in self._trade_stream_ready
+                and live_stream_ready
                 and live_health.data_quality is DataQuality.COMPLETE
             )
             preserve_stream_book = healthy_live
@@ -1848,8 +1994,8 @@ class PublicPaperRuntime:
         deadline = self._pending_full_deadline_at
         refresh = self._refresh_task
         if refresh is not None and not refresh.done():
-            refresh.cancel()
-            await asyncio.gather(refresh, return_exceptions=True)
+            pending = await _cancel_tasks_bounded((refresh,))
+            self._detach_tasks(pending)
         self._refresh_task = None
         self._pending_full_scan_at = None
         self._pending_full_deadline_at = None
@@ -1867,6 +2013,8 @@ class PublicPaperRuntime:
         )
 
     def _background_task_done(self, task: asyncio.Task[None]) -> None:
+        if self._shutdown_started:
+            return
         if task.cancelled():
             return
         exception = task.exception()
@@ -4819,6 +4967,48 @@ class PublicPaperRuntime:
         if self._stop_event is not None:
             self._stop_event.set()
 
+    def _detach_tasks(
+        self, tasks: set[asyncio.Future[Any]] | tuple[asyncio.Future[Any], ...]
+    ) -> None:
+        for task in tasks:
+            if task.done():
+                _consume_future_result(task)
+                continue
+            self._detached_tasks.add(task)
+            task.add_done_callback(self._detached_tasks.discard)
+            task.add_done_callback(_consume_future_result)
+
+    async def _close_session_bounded(self) -> None:
+        session = self._session
+        close = getattr(session, "close", None)
+        if session is None or close is None or getattr(session, "closed", False):
+            return
+        try:
+            operation = close()
+        except BaseException:
+            return
+        if operation is None:
+            return
+        task = asyncio.ensure_future(operation)
+        done, pending = await asyncio.wait(
+            (task,), timeout=CANCELLATION_DRAIN_TIMEOUT_SECONDS
+        )
+        if pending:
+            task.cancel()
+            done_after_cancel, still_pending = await asyncio.wait(
+                pending, timeout=0
+            )
+            for completed in done_after_cancel:
+                _consume_future_result(completed)
+            self._detach_tasks(still_pending)
+        else:
+            for completed in done:
+                _consume_future_result(completed)
+        # Give a cancellation-resistant tick owner one scheduling turn after
+        # close has been requested, preserving the handoff boundary before the
+        # final ownership cleanup below.
+        await asyncio.sleep(0)
+
     def _has_owned_background_work(self) -> bool:
         return bool(
             self._stream_tasks
@@ -4851,16 +5041,11 @@ class PublicPaperRuntime:
         return owned
 
     async def _cancel_owned_background_tasks(self) -> None:
-        while True:
-            owned = self._owned_background_tasks()
-            if not owned:
-                return
-            pending = {task for task in owned if not task.done()}
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*owned, return_exceptions=True)
-            if not pending:
-                return
+        owned = self._owned_background_tasks()
+        if not owned:
+            return
+        pending = await _cancel_tasks_bounded(owned)
+        self._detach_tasks(pending)
 
     async def shutdown(self) -> None:
         if not self.accepting_entries and not self._has_owned_background_work():
@@ -4875,12 +5060,7 @@ class PublicPaperRuntime:
         for task in self._owned_background_tasks():
             if not task.done():
                 task.cancel()
-        if (
-            self._session is not None
-            and not getattr(self._session, "closed", False)
-            and hasattr(self._session, "close")
-        ):
-            await self._session.close()
+        await self._close_session_bounded()
         if self.broker is not None and self.broker.state.lifecycle_state is LifecycleState.ENTRY_MAKER_OPEN:
             state = await self.broker.cancel_for_process_restart(restarted_at=at)
             self.repository.save_decision(recorded_at=at, entry_state=state)
@@ -4929,12 +5109,8 @@ class PublicPaperRuntime:
     async def close(self) -> None:
         if self.accepting_entries or self._has_owned_background_work():
             await self.shutdown()
-        if (
-            self._session is not None
-            and not getattr(self._session, "closed", False)
-            and hasattr(self._session, "close")
-        ):
-            await self._session.close()
+        if not self._shutdown_started:
+            await self._close_session_bounded()
 
 
 async def public_scan_once(
