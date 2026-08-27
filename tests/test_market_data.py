@@ -592,7 +592,9 @@ def test_documented_book_delta_shapes_are_normalized() -> None:
     assert r_delta.checksum == 123  # type: ignore[union-attr]
 
     extended = ExtendedAdapter(None)
-    e_delta = extended.normalize_book_message(fixture("extended")["book_delta"])
+    e_delta = extended.normalize_book_message(
+        fixture("extended")["book_delta"], received_at=NOW
+    )
     assert e_delta.sequence == 2
     assert e_delta.bids[0].canonical_quantity == D("1")
 
@@ -630,6 +632,32 @@ def test_nado_book_observation_time_is_bounded_by_local_receipt() -> None:
         future_delta, received_at=NOW
     )
     assert websocket.observed_at == NOW
+
+
+def test_extended_ws_book_observation_time_is_bounded_by_local_receipt() -> None:
+    extended = ExtendedAdapter(None)
+    extended_data = fixture("extended")
+    future_delta = deepcopy(extended_data["book_delta"])
+    future_delta["ts"] = int((NOW + timedelta(seconds=1)).timestamp() * 1000)
+
+    delta = extended.normalize_book_message(future_delta, received_at=NOW)
+    assert delta.observed_at == NOW
+    assert delta.sequence == extended_data["book_delta"]["seq"]
+
+    future_snapshot = deepcopy(future_delta)
+    future_snapshot["type"] = "SNAPSHOT"
+    snapshot = extended.normalize_book_message(
+        future_snapshot, received_at=NOW
+    )
+    assert snapshot.observed_at == NOW
+    assert snapshot.sequence == extended_data["book_delta"]["seq"]
+
+    past = extended.normalize_book_message(
+        extended_data["book_delta"], received_at=NOW
+    )
+    assert past.observed_at == timestamp(
+        extended_data["book_delta"]["ts"], "milliseconds"
+    )
 
 
 def test_funding_freshness_uses_observation_age() -> None:

@@ -3536,8 +3536,11 @@ class PublicPaperRuntime:
                                 continue
                             payload = json.loads(message.data, parse_float=Decimal)
                             if kind == "book":
+                                received_at = self.clock.now()
                                 healthy = await self.apply_book_event(
-                                    adapter.normalize_book_message(payload),
+                                    adapter.normalize_book_message(
+                                        payload, received_at=received_at
+                                    ),
                                     stream_session_id=stream_session_id,
                                 )
                                 if not self._owns_stream_session(

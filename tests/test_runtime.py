@@ -671,6 +671,89 @@ async def test_nado_future_book_timestamp_does_not_abort_initial_tick(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_extended_future_ws_book_timestamp_does_not_abort_followup_scan(tmp_path):
+    clock = FakeClock()
+    fakes = adapters(clock, settlement_at=NOW + timedelta(minutes=5))
+    extended = GatedExtendedAdapter(
+        clock, settlement_at=NOW + timedelta(minutes=5)
+    )
+    fakes[Venue.EXTENDED] = extended
+    symbol = extended.market.venue_symbol
+    stop = asyncio.Event()
+    future_ts = int((clock.now() + timedelta(seconds=1)).timestamp() * 1000)
+    payload = {
+        "type": "SNAPSHOT", "seq": 2, "ts": future_ts,
+        "data": {
+            "m": symbol,
+            "b": [{"p": "99", "q": "20"}],
+            "a": [{"p": "101", "q": "20"}],
+        },
+    }
+
+    with PaperRepository(tmp_path / "extended-future-ws-book.db") as repository:
+        async with PublicPaperRuntime(
+            repository, adapters=fakes, clock=clock
+        ) as runtime:
+            await runtime.tick()
+            runtime._session = SingleWebSocketSession(
+                TextWebSocket(stop, [payload])
+            )
+            runtime._stop_event = stop
+            session_id = runtime._new_stream_session(
+                (Venue.EXTENDED, symbol, "book")
+            )
+            await runtime._extended_stream(
+                extended, symbol, "book", session_id
+            )
+            book = runtime.coordinator.stream(
+                Venue.EXTENDED, symbol
+            ).book()
+            assert book is not None
+            observation = runtime.observations[Venue.EXTENDED, symbol]
+            runtime.observations[Venue.EXTENDED, symbol] = replace(
+                observation, book=book
+            )
+            runtime._session = None
+            await runtime.scan(
+                refresh=False, scan_kind="FOCUSED", scheduled_at=clock.now()
+            )
+            assert book.observed_at == clock.now()
+
+
+@pytest.mark.asyncio
+async def test_extended_untrusted_future_observation_still_fails_closed(tmp_path):
+    clock = FakeClock()
+    fakes = adapters(clock, settlement_at=NOW + timedelta(minutes=5))
+    extended = GatedExtendedAdapter(
+        clock, settlement_at=NOW + timedelta(minutes=5)
+    )
+    fakes[Venue.EXTENDED] = extended
+    with PaperRepository(
+        tmp_path / "extended-future-observation-rejected.db"
+    ) as repository:
+        async with PublicPaperRuntime(
+            repository, adapters=fakes, clock=clock
+        ) as runtime:
+            await runtime.tick()
+            key = Venue.EXTENDED, extended.market.venue_symbol
+            observation = runtime.observations[key]
+            assert observation.book is not None
+            runtime.observations[key] = replace(
+                observation,
+                book=replace(
+                    observation.book,
+                    observed_at=clock.now() + timedelta(seconds=1),
+                ),
+            )
+            with pytest.raises(
+                RuntimeError, match="scan observation timestamp exceeds logical_at"
+            ):
+                await runtime.scan(
+                    refresh=False, scan_kind="FOCUSED", scheduled_at=clock.now()
+                )
+
+
+@pytest.mark.asyncio
 async def test_scan_still_rejects_an_untrusted_future_observation(tmp_path):
     clock = FakeClock()
     fakes = adapters(clock, settlement_at=NOW + timedelta(minutes=5))
@@ -2350,23 +2433,32 @@ async def test_sequence_gap_fetches_snapshot_and_reconnect_restores_readiness(tm
             )
             episode = runtime._recoveries[Venue.EXTENDED, market.venue_symbol]
             assert episode.terminal is None
-            await runtime.apply_book_event(adapter.normalize_book_message({
-                "type": "UPDATE", "seq": 11,
-                "ts": str(int(clock.now().timestamp() * 1000)),
-                "data": {
-                    "m": market.venue_symbol,
-                    "b": [{"p": "100", "q": "2"}], "a": [],
+            await runtime.apply_book_event(
+                adapter.normalize_book_message(
+                    {
+                        "type": "UPDATE", "seq": 11,
+                        "ts": str(int(clock.now().timestamp() * 1000)),
+                        "data": {
+                            "m": market.venue_symbol,
+                            "b": [{"p": "100", "q": "2"}], "a": [],
+                        },
+                    },
+                    received_at=clock.now(),
+                ),
+                stream_session_id=session_id,
+            )
+            snapshot = adapter.normalize_book_message(
+                {
+                    "type": "SNAPSHOT", "seq": 10,
+                    "ts": str(int(clock.now().timestamp() * 1000)),
+                    "data": {
+                        "m": market.venue_symbol,
+                        "b": [{"p": "99", "q": "20"}],
+                        "a": [{"p": "101", "q": "20"}],
+                    },
                 },
-            }), stream_session_id=session_id)
-            snapshot = adapter.normalize_book_message({
-                "type": "SNAPSHOT", "seq": 10,
-                "ts": str(int(clock.now().timestamp() * 1000)),
-                "data": {
-                    "m": market.venue_symbol,
-                    "b": [{"p": "99", "q": "20"}],
-                    "a": [{"p": "101", "q": "20"}],
-                },
-            })
+                received_at=clock.now(),
+            )
             await runtime.apply_book_event(
                 snapshot, stream_session_id=session_id
             )
@@ -6399,7 +6491,7 @@ async def test_stabilization002_r15_two_extended_recovery_cycles_are_distinct(
                 "b": [{"p": str(price), "q": "20"}],
                 "a": [{"p": str(price + 1), "q": "20"}],
             },
-        })
+        }, received_at=clock.now())
 
     with PaperRepository(tmp_path / "stabilization002-r15-extended.db") as repository:
         runtime = PublicPaperRuntime(

@@ -194,10 +194,15 @@ class ExtendedAdapter(PublicAdapter):
             sequence,
         )
 
-    def normalize_book_message(self, payload: Any) -> OrderBook | BookDelta:
+    def normalize_book_message(
+        self, payload: Any, *, received_at: datetime
+    ) -> OrderBook | BookDelta:
         message = require_mapping(payload, "orderbook message")
         data = require_mapping(message.get("data"), "orderbook message.data")
-        observed_at = timestamp(message["ts"], "milliseconds")
+        venue_observed_at = timestamp(message["ts"], "milliseconds")
+        # Keep venue clock skew from making a received book future-dated; the
+        # raw venue sequence and past venue timestamp remain authoritative.
+        observed_at = min(venue_observed_at, received_at)
         sequence = int(message["seq"])
 
         def levels(name: str) -> tuple[BookLevel, ...]:
