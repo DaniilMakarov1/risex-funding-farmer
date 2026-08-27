@@ -1,6 +1,6 @@
 # RISEx Funding Farmer — Paper System Specification
 
-SYSTEM_SPEC_VERSION = 1.0
+SYSTEM_SPEC_VERSION = 1.1
 SPEC_STATUS = FROZEN_FOR_PAPER_IMPLEMENTATION
 
 ## 1. Purpose and boundary
@@ -17,7 +17,6 @@ Build a small Python 3.11 application in one async process. Do not build a gener
 PAPER_BALANCE_USD = 10000
 TARGET_NOTIONAL_PER_LEG_USD = 500
 MAX_OPEN_POSITIONS = 1
-TOP_MARKETS = 5
 NORMAL_SCAN_SECONDS = 120
 FOCUSED_WINDOW_SECONDS = 300
 FOCUSED_SCAN_SECONDS = 10
@@ -43,7 +42,7 @@ EXPECTED_BASIS_CONVERGENCE_PNL_USD = 0
 POINTS_VALUE_USD = 0
 PAPER_ENTRY_MIN_PLANNED_NET_PNL_USD = 0
 BTC_ETH_HARD_BASIS_EXPANSION_RATE = 0.04
-OTHER_TOP5_HARD_BASIS_EXPANSION_RATE = 0.06
+OTHER_ASSET_HARD_BASIS_EXPANSION_RATE = 0.06
 ```
 
 RISEx fees are user-configured Tier 3; Extended fees are documented public values; Nado fees are user-configured assumptions. Do not create `MAKER_IMPROVEMENT_RATE`. Maker prices derive from ticks. Values are paper experiment parameters, not live risk controls.
@@ -75,14 +74,14 @@ For paper v1 only, 1 USD = 1 USDC = 1 USDT = 1 USDT0 for linear-perpetual parity
 
 ## 5. Universe and routes
 
-RISEx is one leg of every route. Hedge venue is Extended or Nado. Directions are:
+RISEx is one leg of every route. Hedge venue is Extended or Nado. The public shadow universe is the dynamic union `RISEx ∩ (Extended ∪ Nado)` after the existing active linear-perpetual, canonical-parity, volume, metadata, and safety eligibility checks. Include every currently eligible RISEx/hedge venue-asset pair independently; an asset available on only one hedge venue still contributes that pair. Do not truncate the universe by liquidity rank or by a fixed route count. Directions are:
 
 - LONG RISEx / SHORT Extended
 - SHORT RISEx / LONG Extended
 - LONG RISEx / SHORT Nado
 - SHORT RISEx / LONG Nado
 
-`route_liquidity = min(risex_24h_quote_volume_usd, hedge_24h_quote_volume_usd)`. For each asset, `asset_liquidity` is the maximum eligible route liquidity. Select Top-5 assets by this value, exactly the available four directions per selected asset and at most 20 routes. Persist and deliver all evaluated directions; ranking does not truncate the evidence set. Convert official base volume using that venue's official current price; if unreliable, exclude the market.
+`route_liquidity = min(risex_24h_quote_volume_usd, hedge_24h_quote_volume_usd)`. Liquidity is a measurement dimension and deterministic ranking input, not a universe-selection filter. Persist and deliver every evaluated venue-asset direction; ranking never truncates the evidence set. Convert official base volume using that venue's official current price; if unreliable, retain the evaluation with a precise fail-closed blocker and exclude it from entry eligibility.
 
 A route also needs valid BBO, canonical grids and minimums, a fresh funding quote and next funding timestamp, known eligibility, and exact-quantity taker depth in both directions on both venues.
 
@@ -95,7 +94,7 @@ Sort routes deterministically by:
 5. hedge_venue ascending
 6. route_direction ascending
 
-Evaluate simultaneous activations at one logical timestamp and choose one top route. Once an entry maker order exists, lock the route. Falling out of Top-5 forbids new entry but does not exit an existing position. Route switching does not exist.
+Evaluate simultaneous activations at one logical timestamp and choose one top route. Once an entry maker order exists, lock the route. Falling out of the current eligible catalog forbids new entry but does not exit an existing position. Route switching does not exist.
 
 ## 6. Market data health
 
@@ -234,7 +233,7 @@ Exit fill uses entry maker's aggressor, one-tick trade-through, cumulative-volum
 
 `InformationalMidBasis = short_mid / long_mid - 1`. `EntryExecutableBasis = short_entry_fill / long_entry_fill - 1`. `CurrentExecutableBasis = short_close_buy_vwap / long_close_sell_vwap - 1`. Adverse expansion is current executable minus entry executable.
 
-Recheck event-driven after relevant book updates on both legs. Threshold is 4% for BTC/ETH, 6% for other Top-5 assets. On trigger, skip maker waiting and taker-close both legs at exact-q VWAP with taker fees, reason HARD_BASIS, then FLAT.
+Recheck event-driven after relevant book updates on both legs. Threshold is 4% for BTC/ETH, 6% for other eligible assets. On trigger, skip maker waiting and taker-close both legs at exact-q VWAP with taker fees, reason HARD_BASIS, then FLAT.
 
 If either unwind quote is unavailable, basis and unwind PnL are UNKNOWN; record `UNWIND_QUOTE_UNAVAILABLE`, mark DEGRADED/invalid for primary metrics, and keep position open. Recalculate after recovery.
 
@@ -251,6 +250,8 @@ Persist scanner snapshots, funding quotes/cycles/settlements, orders/versions/cu
 ## 18. Commands and reporting
 
 Commands are `scan-once`, `paper-run`, and `report`. Report opportunities/eligible count, orders/fills/fill rate/active time, normal/aggressive exits, applied partial/estimated/unresolved funding, planned execution PnL, actual pair PnL, fees, simulated and applied-rate closed net (or UNKNOWN), both win rates, hold/exit duration, cycles, drawdown, virtual RISEx volume, PnL per $1,000 RISEx volume, planned-vs-actual error, complete/degraded trades, open position, and all assumption flags.
+
+For public-shadow route observations, additionally report liquidity-conditioned evidence using fixed route-liquidity buckets `< $250k`, `$250k–< $1m`, `$1m–< $10m`, and `>= $10m`, plus `UNKNOWN` when authoritative volume is unavailable. For each bucket report route-observation count, distinct venue-asset directions, eligible/opportunity count and frequency, consecutive opportunity duration, and planned versus executable-unwind net PnL with funding, fee, spread/slippage, freshness, and blocker components. Never infer that liquidity causes profitability; this is descriptive dependence evidence only.
 
 RISEx volume is absolute entry notional + absolute exit notional. Primary metrics include only closed, COMPLETE trades with all required funding resolved. Applied metrics additionally require complete applied/skipped settlements. Never force-close an open position at run end.
 
