@@ -18,7 +18,7 @@ from .exchanges.base import PublicAdapter, PublicDataUnavailable
 from .exchanges.extended import ExtendedAdapter
 from .exchanges.nado import NadoAdapter
 from .exchanges.risex import RisexAdapter
-from .lifecycle import LifecycleEngine, LifecycleSnapshot
+from .lifecycle import LifecycleEngine, LifecycleEventType, LifecycleSnapshot
 from .market_data import BookStream, MarketDataCoordinator
 from .models import (
     BookExecutionCapture,
@@ -41,8 +41,10 @@ from .models import (
     Venue,
 )
 from .notifications import (
+    LifecycleNotificationTracker,
     NotificationOutbox,
     NotificationPayload,
+    NotificationScope,
     format_telegram_money,
     full_scan_digest_payloads,
     utc_time,
@@ -447,6 +449,7 @@ class PublicPaperRuntime:
         self._position_event_lock = asyncio.Lock()
         self._shutdown_started = False
         self._startup_gate_satisfied = False
+        self.lifecycle_notifications = LifecycleNotificationTracker(notifications)
 
     async def _public_call(
         self,
@@ -795,6 +798,23 @@ class PublicPaperRuntime:
             final_pnl_usd=fields.get("final_pnl"),  # type: ignore[arg-type]
         ))
 
+    @staticmethod
+    def _paper_notification_context(
+        route_key: object,
+    ) -> tuple[str, str, str]:
+        direction = getattr(route_key, "direction", None)
+        is_long_risex = direction is RouteDirection.LONG_RISEX_SHORT_HEDGE
+        risex_side = "LONG" if is_long_risex else "SHORT"
+        hedge_side = "SHORT" if is_long_risex else "LONG"
+        hedge_venue = getattr(getattr(route_key, "hedge_venue", None), "value", "UNKNOWN")
+        canonical_asset = str(getattr(route_key, "canonical_asset", "UNKNOWN"))
+        route = f"RISEx {risex_side} / {hedge_venue} {hedge_side}"
+        lifecycle_key = "|".join(str(getattr(route_key, name, "UNKNOWN")) for name in (
+            "canonical_asset", "risex_market", "hedge_venue", "hedge_market",
+            "direction", "cycle_id",
+        ))
+        return lifecycle_key, canonical_asset, route
+
     def _notify_opportunity(self, snapshot: ScanSnapshot) -> None:
         if self.notifications is None:
             return
@@ -834,28 +854,144 @@ class PublicPaperRuntime:
         self, before: LifecycleSnapshot | None, after: LifecycleSnapshot, at: datetime
     ) -> None:
         position = after.position or (None if before is None else before.position)
+        if position is None:
+            return
+        lifecycle_key, ticker, route = self._paper_notification_context(
+            position.route_key
+        )
+        self.lifecycle_notifications.begin_lifecycle(
+            scope=NotificationScope.PAPER,
+            lifecycle_key=lifecycle_key,
+            ticker=ticker,
+            route=route,
+            expected_legs=("RISEX", "HEDGE"),
+        )
         before_state = None if before is None else before.lifecycle_state
         if after.position is not None and (before is None or before.position is None):
-            self._notify_event(
-                f"position:{after.position.position_id}:opened", "POSITION_OPENED", at,
-                f"Paper position opened: {after.position.position_id}",
+            self.lifecycle_notifications.confirm_pair_open(
+                scope=NotificationScope.PAPER,
+                lifecycle_key=lifecycle_key,
+                authoritative_legs=("RISEX", "HEDGE"),
+                at=at,
+                authoritative=True,
+                ticker=ticker,
+                route=route,
+                expected_legs=("RISEX", "HEDGE"),
             )
         exiting = {LifecycleState.EXITING_NORMAL, LifecycleState.EXITING_AGGRESSIVE}
         if after.lifecycle_state in exiting and before_state not in exiting and position is not None:
-            self._notify_event(
-                f"position:{position.position_id}:exit-started", "EXIT_STARTED", at,
-                f"Paper exit started: {position.position_id}",
+            self.lifecycle_notifications.exit_started(
+                scope=NotificationScope.PAPER,
+                lifecycle_key=lifecycle_key,
+                at=at,
+                ticker=ticker,
+                route=route,
+                expected_legs=("RISEX", "HEDGE"),
+            )
+
+        previous_events = () if before is None else before.events
+        new_events = after.events[len(previous_events):]
+        for event in new_events:
+            if event.event_type is LifecycleEventType.GAP_STARTED:
+                gap = after.gaps[-1] if after.gaps else None
+                episode_key = (
+                    f"{lifecycle_key}:gap:"
+                    f"{None if gap is None else gap.started_at.isoformat()}"
+                )
+                self.lifecycle_notifications.lifecycle_blocked(
+                    scope=NotificationScope.PAPER,
+                    lifecycle_key=lifecycle_key,
+                    episode_key=episode_key,
+                    failure_class="MARKET_DATA_GAP",
+                    stage="HOLD_EXIT",
+                    reason=event.event_type.value,
+                    at=event.occurred_at,
+                    ticker=ticker,
+                    route=route,
+                    expected_legs=("RISEX", "HEDGE"),
+                )
+            elif event.event_type is LifecycleEventType.GAP_ENDED:
+                gap = after.gaps[-1] if after.gaps else None
+                if gap is not None:
+                    self.lifecycle_notifications.lifecycle_recovered(
+                        scope=NotificationScope.PAPER,
+                        lifecycle_key=lifecycle_key,
+                        episode_key=(
+                            f"{lifecycle_key}:gap:{gap.started_at.isoformat()}"
+                        ),
+                        failure_class="MARKET_DATA_GAP",
+                        stage="HOLD_EXIT",
+                        at=event.occurred_at,
+                        ticker=ticker,
+                        route=route,
+                        expected_legs=("RISEX", "HEDGE"),
+                    )
+            elif event.event_type is LifecycleEventType.UNWIND_QUOTE_UNAVAILABLE:
+                self.lifecycle_notifications.lifecycle_blocked(
+                    scope=NotificationScope.PAPER,
+                    lifecycle_key=lifecycle_key,
+                    episode_key=f"{lifecycle_key}:unwind",
+                    failure_class="UNWIND_QUOTE_UNAVAILABLE",
+                    stage="HARD_BASIS",
+                    reason=event.event_type.value,
+                    at=event.occurred_at,
+                    ticker=ticker,
+                    route=route,
+                    expected_legs=("RISEX", "HEDGE"),
+                )
+        if (
+            before is not None
+            and before.unwind_quote_unavailable
+            and not after.unwind_quote_unavailable
+        ):
+            self.lifecycle_notifications.lifecycle_recovered(
+                scope=NotificationScope.PAPER,
+                lifecycle_key=lifecycle_key,
+                episode_key=f"{lifecycle_key}:unwind",
+                failure_class="UNWIND_QUOTE_UNAVAILABLE",
+                stage="HARD_BASIS",
+                at=at,
+                ticker=ticker,
+                route=route,
+                expected_legs=("RISEX", "HEDGE"),
             )
         closed = after.closed_trade
         previous_closed = None if before is None else before.closed_trade
         if closed is not None and previous_closed is None:
             pnl = closed.simulated_closed_net_pnl_usd
-            self._notify_event(
-                f"position:{closed.position_id}:closed:{closed.closed_at.isoformat()}",
-                "POSITION_CLOSED", closed.closed_at,
-                f"Paper position closed: {closed.position_id}; "
-                f"final PnL USD {format_telegram_money(pnl)}",
-                final_pnl=pnl,
+            # Hard-basis paper close can atomically move HOLDING -> FLAT. Keep
+            # the outbound action order explicit without changing lifecycle
+            # state: the close itself is the authoritative exit start.
+            self.lifecycle_notifications.exit_started(
+                scope=NotificationScope.PAPER,
+                lifecycle_key=lifecycle_key,
+                at=closed.closed_at,
+                ticker=ticker,
+                route=route,
+                expected_legs=("RISEX", "HEDGE"),
+            )
+            self.lifecycle_notifications.confirm_pair_closed(
+                scope=NotificationScope.PAPER,
+                lifecycle_key=lifecycle_key,
+                authoritative_legs=("RISEX", "HEDGE"),
+                at=closed.closed_at,
+                authoritative=True,
+                ticker=ticker,
+                route=route,
+                final_pnl_usd=pnl,
+                expected_legs=("RISEX", "HEDGE"),
+            )
+            self.lifecycle_notifications.confirm_final_flat(
+                scope=NotificationScope.PAPER,
+                lifecycle_key=lifecycle_key,
+                authoritative_legs=("RISEX", "HEDGE"),
+                zero_orders=True,
+                exact_flat=True,
+                at=closed.closed_at,
+                authoritative=True,
+                ticker=ticker,
+                route=route,
+                expected_legs=("RISEX", "HEDGE"),
             )
 
     def _set_readiness(
@@ -2435,9 +2571,23 @@ class PublicPaperRuntime:
             self._record("PAPER_ENTRY_ACTIVATED", at=now)
             order = broker.state.order
             assert order is not None
-            self._notify_event(
-                f"entry:{order.attempt_id}:activated", "ENTRY_ACTIVATED", now,
-                f"Paper entry activated: {order.attempt_id}",
+            lifecycle_key, ticker, route = self._paper_notification_context(
+                order.route_key
+            )
+            self.lifecycle_notifications.begin_lifecycle(
+                scope=NotificationScope.PAPER,
+                lifecycle_key=lifecycle_key,
+                ticker=ticker,
+                route=route,
+                expected_legs=("RISEX", "HEDGE"),
+            )
+            self.lifecycle_notifications.maker_entry_activated(
+                scope=NotificationScope.PAPER,
+                lifecycle_key=lifecycle_key,
+                at=now,
+                ticker=ticker,
+                route=route,
+                expected_legs=("RISEX", "HEDGE"),
             )
 
     def _fresh_focus_candidates(
@@ -2691,20 +2841,33 @@ class PublicPaperRuntime:
     ) -> None:
         if (before.status, before.cash_usd) == (after.status, after.cash_usd):
             return
-        kind = (
-            "FUNDING_RECEIVED"
-            if before.status in {
-                SettlementStatus.PENDING, SettlementStatus.UNRESOLVED
-            }
-            else "FUNDING_RECONCILED"
+        snapshot = None if self.lifecycle is None else self.lifecycle.snapshot
+        position = None if snapshot is None else snapshot.position
+        if position is None:
+            return
+        lifecycle_key, ticker, route = self._paper_notification_context(
+            position.route_key
         )
-        self._notify_event(
-            f"funding:{after.venue.value}:{after.canonical_market}:"
-            f"{after.settlement_at.isoformat()}:{after.status.value}:{after.cash_usd}",
-            kind, at,
-            f"Funding {'received' if kind == 'FUNDING_RECEIVED' else 'reconciled'}: "
-            f"{after.venue.value} {after.canonical_market} "
-            f"{after.status.value} USD {format_telegram_money(after.cash_usd)}",
+        self.lifecycle_notifications.funding_status(
+            scope=NotificationScope.PAPER,
+            lifecycle_key=lifecycle_key,
+            settlement_key=(
+                f"{after.venue.value}|{after.canonical_market}|"
+                f"{after.settlement_at.isoformat()}"
+            ),
+            status=after.status.value,
+            cash_usd=after.cash_usd,
+            at=at,
+            ticker=ticker,
+            route=route,
+            venue=after.venue.value,
+            market=after.canonical_market,
+            source=(
+                "AUTHORITATIVE_APPLIED"
+                if after.status is SettlementStatus.APPLIED_RATE
+                else "PAPER_LIFECYCLE_STATUS"
+            ),
+            expected_legs=("RISEX", "HEDGE"),
         )
 
     def _book_mid(self, venue: Venue, symbol: str) -> Decimal | None:

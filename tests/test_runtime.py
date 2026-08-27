@@ -40,7 +40,6 @@ from risex_farmer.models import (
 from risex_farmer.market_data import BookStream
 from risex_farmer.lifecycle import LifecycleEngine
 from risex_farmer.notifications import (
-    NotificationPayload,
     NotificationOutbox,
     TelegramDelivery,
     format_telegram_money,
@@ -2704,32 +2703,32 @@ async def test_runtime_lifecycle_notifications_follow_persisted_transitions(tmp_
     kinds = [row.kind for row in delivery.rows]
     for required in (
         "ENTRY_ACTIVATED", "POSITION_OPENED", "EXIT_STARTED",
-        "FUNDING_RECEIVED", "FUNDING_RECONCILED", "POSITION_CLOSED",
+        "POSITION_CLOSED", "FINAL_FLAT",
     ):
         assert kinds.count(required) == 1
+    assert kinds.count("FUNDING_STATUS") == 2
+    paper_lifecycle_kinds = {
+        "ENTRY_ACTIVATED", "POSITION_OPENED", "EXIT_STARTED",
+        "FUNDING_STATUS", "POSITION_CLOSED", "FINAL_FLAT",
+    }
+    assert all(
+        row.text.startswith("PAPER |")
+        for row in delivery.rows
+        if row.kind in paper_lifecycle_kinds
+    )
     closed = next(row for row in delivery.rows if row.kind == "POSITION_CLOSED")
     assert closed.final_pnl_usd == authoritative.simulated_closed_net_pnl_usd
     assert closed.text.endswith(
         f"final PnL USD {format_telegram_money(authoritative.simulated_closed_net_pnl_usd)}"
     )
-    received = next(row for row in delivery.rows if row.kind == "FUNDING_RECEIVED")
-    reconciled = next(row for row in delivery.rows if row.kind == "FUNDING_RECONCILED")
-    assert received == NotificationPayload(
-        f"funding:{pending.venue.value}:{pending.canonical_market}:"
-        f"{pending.settlement_at.isoformat()}:ESTIMATED:3.125",
-        "FUNDING_RECEIVED",
-        estimated_at,
-        f"Funding received: {pending.venue.value} {pending.canonical_market} "
-        "ESTIMATED USD 3.13",
-    )
-    assert reconciled == NotificationPayload(
-        f"funding:{pending.venue.value}:{pending.canonical_market}:"
-        f"{pending.settlement_at.isoformat()}:APPLIED_RATE:3.25",
-        "FUNDING_RECONCILED",
-        applied_at,
-        f"Funding reconciled: {pending.venue.value} {pending.canonical_market} "
-        "APPLIED_RATE USD 3.25",
-    )
+    funding_rows = [row for row in delivery.rows if row.kind == "FUNDING_STATUS"]
+    assert funding_rows[0].occurred_at == estimated_at
+    assert "status ESTIMATED" in funding_rows[0].text
+    assert "cash USD 3.13" in funding_rows[0].text
+    assert funding_rows[1].occurred_at == applied_at
+    assert "status APPLIED_RATE" in funding_rows[1].text
+    assert "cash USD 3.25" in funding_rows[1].text
+    assert all("received" not in row.text.lower() for row in funding_rows)
 
 
 @pytest.mark.asyncio

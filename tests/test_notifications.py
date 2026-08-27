@@ -8,9 +8,11 @@ import aiohttp
 import pytest
 
 from risex_farmer.notifications import (
+    LifecycleNotificationTracker,
     NoopNotificationDelivery,
     NotificationOutbox,
     NotificationPayload,
+    NotificationScope,
     TelegramDelivery,
     format_telegram_money,
     full_scan_digest_payloads,
@@ -95,6 +97,42 @@ class FakeSession:
 
     async def close(self):
         self.closed = True
+
+
+class LifecycleCapture:
+    def __init__(self, *, accept: bool = True) -> None:
+        self.rows: list[NotificationPayload] = []
+        self.accept = accept
+
+    async def start(self):
+        pass
+
+    def enqueue(self, row: NotificationPayload) -> bool:
+        if self.accept:
+            self.rows.append(row)
+        return self.accept
+
+    async def close(self):
+        pass
+
+
+def lifecycle_tracker(
+    *,
+    scope: NotificationScope = NotificationScope.TESTNET,
+    lifecycle_key: str = "route-1",
+    expected_legs: tuple[str, str] = ("RISEX", "HEDGE"),
+    capture: LifecycleCapture | None = None,
+) -> tuple[LifecycleNotificationTracker, LifecycleCapture]:
+    sink = capture or LifecycleCapture()
+    tracker = LifecycleNotificationTracker(NotificationOutbox(sink))
+    assert tracker.begin_lifecycle(
+        scope=scope,
+        lifecycle_key=lifecycle_key,
+        ticker="BTC",
+        route="RISEx LONG / NADO SHORT",
+        expected_legs=expected_legs,
+    )
+    return tracker, sink
 
 
 async def drain(delivery: TelegramDelivery) -> None:
@@ -492,3 +530,303 @@ async def test_close_cancels_hung_delivery_without_task_leak():
     await asyncio.wait_for(delivery.close(), timeout=0.1)
     assert delivery._worker is None
     assert session.closed
+
+
+def test_testnet_partial_or_non_authoritative_leg_never_emits_open():
+    tracker, capture = lifecycle_tracker(
+        expected_legs=("RISEX", "NADO"),
+    )
+    assert not tracker.confirm_leg_open(
+        scope=NotificationScope.TESTNET,
+        lifecycle_key="route-1",
+        leg="RISEX",
+        authoritative=True,
+        at=NOW,
+        expected_legs=("RISEX", "NADO"),
+    )
+    assert not tracker.confirm_leg_open(
+        scope=NotificationScope.TESTNET,
+        lifecycle_key="route-1",
+        leg="NADO",
+        authoritative=False,
+        at=NOW,
+        expected_legs=("RISEX", "NADO"),
+    )
+    assert not any(row.kind == "POSITION_OPENED" for row in capture.rows)
+
+
+def test_testnet_exact_authoritative_pair_open_is_one_sanitized_event():
+    tracker, capture = lifecycle_tracker(
+        expected_legs=("RISEX", "NADO"),
+    )
+    assert tracker.confirm_pair_open(
+        scope=NotificationScope.TESTNET,
+        lifecycle_key="route-1",
+        authoritative_legs={"RISEX": True, "NADO": True},
+        at=NOW,
+        authoritative=True,
+        expected_legs=("RISEX", "NADO"),
+    )
+    assert not tracker.confirm_pair_open(
+        scope=NotificationScope.TESTNET,
+        lifecycle_key="route-1",
+        authoritative_legs=("RISEX", "NADO"),
+        at=NOW,
+        authoritative=True,
+        expected_legs=("RISEX", "NADO"),
+    )
+    opened = [row for row in capture.rows if row.kind == "POSITION_OPENED"]
+    assert len(opened) == 1
+    assert opened[0].text.startswith("TESTNET | OPEN |")
+    assert "route-1" not in opened[0].text
+    assert len(opened[0].text) <= 4096
+
+
+def test_funding_status_preserves_zero_negative_and_unresolved_without_fabrication():
+    tracker, capture = lifecycle_tracker()
+    assert tracker.confirm_pair_open(
+        scope=NotificationScope.TESTNET,
+        lifecycle_key="route-1",
+        authoritative_legs=("RISEX", "HEDGE"),
+        at=NOW,
+        authoritative=True,
+    )
+    assert tracker.funding_status(
+        scope=NotificationScope.TESTNET,
+        lifecycle_key="route-1",
+        settlement_key="settlement-1",
+        status="APPLIED_RATE",
+        cash_usd=Decimal("0"),
+        at=NOW,
+    )
+    assert tracker.funding_status(
+        scope=NotificationScope.TESTNET,
+        lifecycle_key="route-1",
+        settlement_key="settlement-1",
+        status="APPLIED_RATE",
+        cash_usd=Decimal("-1.235"),
+        at=NOW,
+    )
+    assert tracker.funding_status(
+        scope=NotificationScope.TESTNET,
+        lifecycle_key="route-1",
+        settlement_key="settlement-1",
+        status="UNRESOLVED",
+        cash_usd=None,
+        at=NOW,
+    )
+    assert not tracker.funding_status(
+        scope=NotificationScope.TESTNET,
+        lifecycle_key="route-1",
+        settlement_key="settlement-1",
+        status="UNRESOLVED",
+        cash_usd=None,
+        at=NOW,
+    )
+    rows = [row for row in capture.rows if row.kind == "FUNDING_STATUS"]
+    assert len(rows) == 3
+    assert "status APPLIED_RATE" in rows[0].text
+    assert "cash USD 0.00" in rows[0].text
+    assert "cash USD -1.24" in rows[1].text
+    assert "status UNRESOLVED" in rows[2].text
+    assert "cash USD UNKNOWN" in rows[2].text
+    assert "received" not in rows[2].text.lower()
+
+
+def test_close_and_final_flat_are_ordered_authoritative_and_deduplicated():
+    tracker, capture = lifecycle_tracker()
+    assert tracker.confirm_pair_open(
+        scope=NotificationScope.TESTNET,
+        lifecycle_key="route-1",
+        authoritative_legs=("RISEX", "HEDGE"),
+        at=NOW,
+        authoritative=True,
+    )
+    assert not tracker.confirm_pair_closed(
+        scope=NotificationScope.TESTNET,
+        lifecycle_key="route-1",
+        authoritative_legs=("RISEX", "HEDGE"),
+        at=NOW,
+        authoritative=True,
+    )
+    assert tracker.exit_started(
+        scope=NotificationScope.TESTNET,
+        lifecycle_key="route-1",
+        at=NOW,
+    )
+    assert not tracker.confirm_leg_closed(
+        scope=NotificationScope.TESTNET,
+        lifecycle_key="route-1",
+        leg="RISEX",
+        authoritative=True,
+        at=NOW,
+    )
+    assert tracker.confirm_leg_closed(
+        scope=NotificationScope.TESTNET,
+        lifecycle_key="route-1",
+        leg="HEDGE",
+        authoritative=True,
+        at=NOW,
+    )
+    assert not tracker.confirm_final_flat(
+        scope=NotificationScope.TESTNET,
+        lifecycle_key="route-1",
+        authoritative_legs=("RISEX", "HEDGE"),
+        zero_orders=False,
+        exact_flat=True,
+        at=NOW,
+        authoritative=True,
+    )
+    assert tracker.confirm_final_flat(
+        scope=NotificationScope.TESTNET,
+        lifecycle_key="route-1",
+        authoritative_legs=("RISEX", "HEDGE"),
+        zero_orders=True,
+        exact_flat=True,
+        at=NOW,
+        authoritative=True,
+    )
+    assert not tracker.confirm_final_flat(
+        scope=NotificationScope.TESTNET,
+        lifecycle_key="route-1",
+        authoritative_legs=("RISEX", "HEDGE"),
+        zero_orders=True,
+        exact_flat=True,
+        at=NOW,
+        authoritative=True,
+    )
+    assert [row.kind for row in capture.rows] == [
+        "POSITION_OPENED", "EXIT_STARTED", "POSITION_CLOSED", "FINAL_FLAT",
+    ]
+
+
+def test_blocker_recovery_is_paired_and_queue_failure_creates_no_orphan():
+    tracker, capture = lifecycle_tracker()
+    assert tracker.lifecycle_blocked(
+        scope=NotificationScope.TESTNET,
+        lifecycle_key="route-1",
+        episode_key="gap-1",
+        failure_class="TRANSPORT",
+        stage="RECONCILIATION",
+        reason="temporary transport failure",
+        at=NOW,
+    )
+    assert not tracker.lifecycle_blocked(
+        scope=NotificationScope.TESTNET,
+        lifecycle_key="route-1",
+        episode_key="gap-1",
+        failure_class="TRANSPORT",
+        stage="RECONCILIATION",
+        at=NOW,
+    )
+    assert not tracker.lifecycle_recovered(
+        scope=NotificationScope.TESTNET,
+        lifecycle_key="route-1",
+        episode_key="gap-2",
+        at=NOW,
+    )
+    assert tracker.lifecycle_recovered(
+        scope=NotificationScope.TESTNET,
+        lifecycle_key="route-1",
+        episode_key="gap-1",
+        at=NOW,
+    )
+    assert not tracker.lifecycle_recovered(
+        scope=NotificationScope.TESTNET,
+        lifecycle_key="route-1",
+        episode_key="gap-1",
+        at=NOW,
+    )
+    assert [row.kind for row in capture.rows] == [
+        "LIFECYCLE_BLOCKED", "LIFECYCLE_RECOVERED",
+    ]
+
+    rejected = LifecycleCapture(accept=False)
+    failed_tracker, failed_capture = lifecycle_tracker(capture=rejected)
+    assert not failed_tracker.lifecycle_blocked(
+        scope=NotificationScope.TESTNET,
+        lifecycle_key="route-1",
+        episode_key="gap-1",
+        failure_class="TRANSPORT",
+        stage="RECONCILIATION",
+        at=NOW,
+    )
+    assert not failed_tracker.lifecycle_recovered(
+        scope=NotificationScope.TESTNET,
+        lifecycle_key="route-1",
+        episode_key="gap-1",
+        at=NOW,
+    )
+    assert failed_capture.rows == []
+
+
+def test_notification_failure_does_not_block_lifecycle_progression():
+    capture = LifecycleCapture(accept=False)
+    tracker, _ = lifecycle_tracker(capture=capture)
+    assert not tracker.confirm_pair_open(
+        scope=NotificationScope.TESTNET,
+        lifecycle_key="route-1",
+        authoritative_legs=("RISEX", "HEDGE"),
+        at=NOW,
+        authoritative=True,
+    )
+    capture.accept = True
+    assert tracker.exit_started(
+        scope=NotificationScope.TESTNET,
+        lifecycle_key="route-1",
+        at=NOW,
+    )
+    assert tracker.confirm_pair_closed(
+        scope=NotificationScope.TESTNET,
+        lifecycle_key="route-1",
+        authoritative_legs=("RISEX", "HEDGE"),
+        at=NOW,
+        authoritative=True,
+    )
+    assert tracker.confirm_final_flat(
+        scope=NotificationScope.TESTNET,
+        lifecycle_key="route-1",
+        authoritative_legs=("RISEX", "HEDGE"),
+        zero_orders=True,
+        exact_flat=True,
+        at=NOW,
+        authoritative=True,
+    )
+    assert [row.kind for row in capture.rows] == [
+        "EXIT_STARTED", "POSITION_CLOSED", "FINAL_FLAT",
+    ]
+
+    class BrokenCapture(LifecycleCapture):
+        def enqueue(self, row: NotificationPayload) -> bool:
+            raise RuntimeError("synthetic notification sink failure")
+
+    broken = BrokenCapture()
+    broken_tracker, _ = lifecycle_tracker(capture=broken)
+    assert not broken_tracker.maker_entry_activated(
+        scope=NotificationScope.TESTNET,
+        lifecycle_key="route-1",
+        at=NOW,
+    )
+
+
+def test_lifecycle_notification_text_redacts_private_tokens_and_is_bounded():
+    tracker, capture = lifecycle_tracker()
+    secret = "0x" + "a" * 64
+    private = "api_key=synthetic-private-value"
+    assert tracker.begin_lifecycle(
+        scope=NotificationScope.PAPER,
+        lifecycle_key="paper-private",
+        ticker=secret,
+        route=f"RISEx LONG / {private} order_id=private-order-id",
+    )
+    assert tracker.maker_entry_activated(
+        scope=NotificationScope.PAPER,
+        lifecycle_key="paper-private",
+        at=NOW,
+    )
+    row = capture.rows[-1]
+    assert row.text.startswith("PAPER |")
+    assert secret not in row.text
+    assert private not in row.text
+    assert "private-order-id" not in row.text
+    assert len(row.text) <= 4096
