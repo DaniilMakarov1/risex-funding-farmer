@@ -3275,6 +3275,91 @@ async def test_pending_socket_episode_alerts_at_existing_silence_threshold(tmp_p
     assert outbox._active_outages == set()
 
 
+def test_extended_socket_wave_coalesces_late_episodes_to_one_pair(tmp_path):
+    clock = FakeClock()
+    delivery = CaptureNotifications()
+    outbox = NotificationOutbox(delivery)
+    socket_count = 45
+    episodes = []
+    with PaperRepository(tmp_path / "late-socket-wave.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={}, clock=clock, notifications=outbox,
+        )
+        for index in range(socket_count):
+            symbol = f"WAVE-{index}-EXTENDED"
+            stream_kind = ("book", "trade", "funding")[index % 3]
+            identity = (Venue.EXTENDED, stream_kind, (symbol,))
+            session_id = runtime._new_stream_session(
+                (Venue.EXTENDED, symbol, stream_kind)
+            )
+            episodes.append((identity, session_id))
+            runtime._socket_disconnected(
+                identity, at=clock.now(), stream_session_id=session_id,
+            )
+
+        clock.advance(40)
+        runtime._notify_pending_socket_outages(clock.now())
+        assert [row.kind for row in delivery.rows] == ["CRITICAL_DATA_LOSS"]
+        for index, (identity, session_id) in enumerate(episodes):
+            runtime._socket_reconnected(
+                identity, at=clock.now(), stream_session_id=session_id,
+            )
+            if index < socket_count - 1:
+                assert [row.kind for row in delivery.rows] == [
+                    "CRITICAL_DATA_LOSS"
+                ]
+        lifecycle = repository.connection.execute(
+            "SELECT event_type FROM runtime_evidence ORDER BY evidence_id"
+        ).fetchall()
+
+    event_types = [row["event_type"] for row in lifecycle]
+    assert event_types.count("PUBLIC_SOCKET_DISCONNECTED") == socket_count
+    assert event_types.count("PUBLIC_SOCKET_RECONNECTED") == socket_count
+    assert [row.kind for row in delivery.rows] == [
+        "CRITICAL_DATA_LOSS", "DATA_RECOVERY",
+    ]
+    assert outbox._active_outages == set()
+
+
+def test_extended_transient_socket_wave_keeps_raw_rows_without_alerts(tmp_path):
+    clock = FakeClock()
+    delivery = CaptureNotifications()
+    outbox = NotificationOutbox(delivery)
+    socket_count = 45
+    episodes = []
+    with PaperRepository(tmp_path / "transient-socket-wave-pending.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={}, clock=clock, notifications=outbox,
+        )
+        for index in range(socket_count):
+            symbol = f"TRANSIENT-{index}-EXTENDED"
+            stream_kind = ("book", "trade", "funding")[index % 3]
+            identity = (Venue.EXTENDED, stream_kind, (symbol,))
+            session_id = runtime._new_stream_session(
+                (Venue.EXTENDED, symbol, stream_kind)
+            )
+            episodes.append((identity, session_id))
+            runtime._socket_disconnected(
+                identity, at=clock.now(), stream_session_id=session_id,
+            )
+
+        clock.advance(24)
+        runtime._notify_pending_socket_outages(clock.now())
+        for identity, session_id in episodes:
+            runtime._socket_reconnected(
+                identity, at=clock.now(), stream_session_id=session_id,
+            )
+        lifecycle = repository.connection.execute(
+            "SELECT event_type FROM runtime_evidence ORDER BY evidence_id"
+        ).fetchall()
+
+    event_types = [row["event_type"] for row in lifecycle]
+    assert event_types.count("PUBLIC_SOCKET_DISCONNECTED") == socket_count
+    assert event_types.count("PUBLIC_SOCKET_RECONNECTED") == socket_count
+    assert [row.kind for row in delivery.rows] == []
+    assert outbox._active_outages == set()
+
+
 @pytest.mark.parametrize(("duration", "expected"), (
     (24, []),
     (34, ["CRITICAL_DATA_LOSS", "DATA_RECOVERY"]),

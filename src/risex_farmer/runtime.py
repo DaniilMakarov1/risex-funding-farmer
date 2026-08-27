@@ -635,9 +635,23 @@ class PublicPaperRuntime:
                 kind="CRITICAL_DATA_LOSS", occurred_at=now,
                 text=text,
             )
+        elif event_type == "PUBLIC_SOCKET_RECONNECTED":
+            if self._pending_socket_episodes_for_venue(venue):
+                return
+            episode = None if detail is None else detail.get("episode_id")
+            recovery_id = episode or (
+                f"{venue.value if venue else 'PUBLIC'}:{event_type}:{now.isoformat()}"
+            )
+            self._notify_outage(
+                event_type, degraded=False, venue=venue, detail=detail,
+                identity_override=self._socket_wave_identity(venue),
+                event_id=f"data-recovery:{recovery_id}", kind="DATA_RECOVERY",
+                occurred_at=now,
+                text=f"Public data recovered: "
+                f"{venue.value if venue else 'PUBLIC'} {event_type}",
+            )
         elif event_type in {
-            "PUBLIC_SOCKET_RECONNECTED", "PUBLIC_SNAPSHOT_RECOVERY_COMPLETED",
-            "PUBLIC_STREAM_RESTARTED",
+            "PUBLIC_SNAPSHOT_RECOVERY_COMPLETED", "PUBLIC_STREAM_RESTARTED",
         }:
             episode = None if detail is None else detail.get("episode_id")
             recovery_id = episode or (
@@ -667,6 +681,7 @@ class PublicPaperRuntime:
         self._notify_outage(
             "PUBLIC_SOCKET_DISCONNECTED", degraded=True, venue=venue,
             detail=detail,
+            identity_override=self._socket_wave_identity(venue),
             event_id=f"data-loss:{venue.value if venue else 'PUBLIC'}:"
             f"PUBLIC_SOCKET_DISCONNECTED:{recovery_id}",
             kind="CRITICAL_DATA_LOSS", occurred_at=at,
@@ -690,12 +705,35 @@ class PublicPaperRuntime:
         )
 
     def _notify_pending_socket_outages(self, at: datetime) -> None:
+        due_by_venue: dict[Venue | None, list[dict[str, object]]] = {}
         for (venue, _stream_kind, _markets), detail in tuple(
             self._pending_socket_episodes.items()
         ):
+            if self._socket_episode_is_due(detail, at):
+                due_by_venue.setdefault(venue, []).append(detail)
+        for venue, details in sorted(
+            due_by_venue.items(),
+            key=lambda item: item[0].value if item[0] else "PUBLIC",
+        ):
+            detail = min(
+                details,
+                key=lambda row: (
+                    str(row.get("disconnected_at") or ""),
+                    str(row.get("episode_id") or ""),
+                ),
+            )
             self._notify_socket_outage_if_due(
                 venue=venue, detail=detail, at=at,
             )
+
+    def _pending_socket_episodes_for_venue(self, venue: Venue | None) -> bool:
+        return any(
+            identity[0] is venue
+            for identity in self._pending_socket_episodes
+        )
+
+    def _socket_wave_identity(self, venue: Venue | None) -> str:
+        return f"socket-wave:{venue.value if venue else 'PUBLIC'}"
 
     def _notify_outage(
         self,
@@ -708,6 +746,7 @@ class PublicPaperRuntime:
         kind: str,
         occurred_at: datetime,
         text: str,
+        identity_override: str | None = None,
     ) -> None:
         if self.notifications is None:
             return
@@ -717,7 +756,9 @@ class PublicPaperRuntime:
         market = detail.get(
             "symbol", detail.get("market", detail.get("markets", "PUBLIC"))
         )
-        if event_type == "PUBLIC_SCAN_BLOCKED":
+        if identity_override is not None:
+            identity = identity_override
+        elif event_type == "PUBLIC_SCAN_BLOCKED":
             semantic_episode = (
                 detail.get("scheduled_at")
                 or detail.get("deadline_at")
