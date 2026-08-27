@@ -2,7 +2,7 @@
 
 ## Mainnet public shadow — all-route liquidity measurement
 
-Status: `RUNNING — 24-HOUR ALL-ROUTE SHADOW`.
+Status: `BLOCKED — EXTENDED ALL-ROUTE PUBLIC TRANSPORT`.
 
 Objective: use the accepted normal paper product against real unauthenticated RISEx, Nado, and Extended mainnet public data, evaluating every currently eligible venue-asset direction in `RISEx ∩ (Extended ∪ Nado)` without Top-5 or fixed route-count truncation. Measure whether opportunity frequency, duration, and conservative economics vary with authoritative route liquidity.
 
@@ -20,7 +20,8 @@ Exact starting point:
 - The completed 15-minute watch later observed 95 additional disconnects with average recovery about 24.2 seconds and maximum about 44.2 seconds, plus one `PUBLIC_SCAN_BLOCKED:PUBLIC_REFRESH_DEADLINE_EXCEEDED`. All episodes eventually reconnected, but no confirmation-stale event represented those pending beyond the existing 25-second threshold. SIGINT then again exceeded 30 seconds and required an exact-process force stop after integrity `ok` and zero orders/fills/positions.
 - Accepted `b959da8daa9c1737406fe7ea02e8b01707bf7d0a` implements one venue-level Critical/Recovery pair for a persistent socket wave, zero outage messages for a fully transient sub-25-second wave, a precise blocked-FULL alert, and active-tick shutdown handoff. Validate these semantics on a fresh public-only run before resuming a 24-hour window.
 - Fresh `chief06` validation completed the full 15-minute watch: nine FULL scans, one 2.05-second Nado EOF disconnect/reconnect, no transient outage Telegram pair, no blocked/stale/recovery-failed/fatal event, and bounded `STOPPED_SAFE` in 8.3 seconds. Integrity is `ok` and orders/fills/positions are zero. The next action is one fresh isolated 24-hour all-route paper run with Top-10 Telegram presentation and the existing fail-closed stop/report gate.
-- Fresh `chief07` preflight persisted all 58 current directions with all three venues ready and zero write-state rows. The isolated 24-hour paper run reached `PAPER_RUN_READY` at `2026-08-27T13:28:10Z`; do not start a parallel duplicate. Stop and report it at the scheduled 24-hour boundary, or earlier only on a fail-closed data/performance blocker.
+- Fresh `chief07` reached READY but produced three blocked FULL scans, 181/181 Extended disconnect/reconnect events, a synchronized outage lasting about 3 minutes 15 seconds, a 120.825-second refresh, and 392 seconds of cadence lateness. It stopped `STOPPED_SAFE` with integrity `ok` and zero orders/fills/positions; the scheduled 24-hour follow-up was removed. One fresh Extended Builder may correct only this observed public transport/cadence defect without suppressing blockers, raising limits, reducing routes, or weakening freshness.
+- The user-requested funding-boundary check is complete through the existing isolated fixture path, with no product change: a NEAR paper position spanned `13:58:01Z`–`14:00:01Z`, recognized assumed `+$8` aggregate funding, lost `$10` on price and `$0.21` in fees, and ended FLAT at `-$2.21`. It is synthetic accounting evidence only and must not enter profitability statistics.
 - Rejected branch `codex/strategy-measurement-foundation` at `300362d840141d9ed599d8189ed1d10801fc5256` is not a candidate and must not be merged or copied. Open a fresh Builder only if observed evidence proves a bounded defect or a measurement field genuinely missing from the accepted paper path.
 
 Allowed scope:
