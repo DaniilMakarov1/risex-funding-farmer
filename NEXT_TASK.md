@@ -2,7 +2,7 @@
 
 ## Mainnet public shadow — all-route liquidity measurement
 
-Status: `BLOCKED — TRANSIENT EXTENDED CHURN MISLABELED CRITICAL`.
+Status: `VALIDATING — AGGREGATED EXTENDED OUTAGE ALERTS`.
 
 Objective: use the accepted normal paper product against real unauthenticated RISEx, Nado, and Extended mainnet public data, evaluating every currently eligible venue-asset direction in `RISEx ∩ (Extended ∪ Nado)` without Top-5 or fixed route-count truncation. Measure whether opportunity frequency, duration, and conservative economics vary with authoritative route liquidity.
 
@@ -17,12 +17,13 @@ Exact starting point:
 - The `chief03` run completed seven scheduled FULL cadences, then was stopped at the user's request to reduce Telegram output. SIGINT did not complete within 30 seconds and the exact process required a force stop after zero orders/fills/positions and SQLite integrity `ok` were confirmed. The user now requires Telegram to show only the deterministic Top-10 rows while the runtime continues to scan and persist every direction.
 - Accepted `2f5467f07caa6807f252655e9e83d91b9596742e` limits only Telegram FULL digests to the first 10 ranked rows and corrects dynamic owned-task shutdown. The `chief04` operational checkpoint preserved 58/58 route rows and reached durable `STOPPED_SAFE` about 11 ms after SIGINT. The fresh isolated `chief05` run is now active for 24 hours; do not start a parallel duplicate.
 - In `chief05`, 126 Extended socket disconnects all had matching reconnects in at most about 5.9 seconds, with no blocked FULL, recovery failure, fatal event, or unmatched episode, yet each raw disconnect was immediately delivered as `Critical public data loss`. This is an outbound severity/pairing defect; raw persistence and fail-closed market-data handling remain required.
+- The completed 15-minute watch later observed 95 additional disconnects with average recovery about 24.2 seconds and maximum about 44.2 seconds, plus one `PUBLIC_SCAN_BLOCKED:PUBLIC_REFRESH_DEADLINE_EXCEEDED`. All episodes eventually reconnected, but no confirmation-stale event represented those pending beyond the existing 25-second threshold. SIGINT then again exceeded 30 seconds and required an exact-process force stop after integrity `ok` and zero orders/fills/positions.
+- Accepted `b959da8daa9c1737406fe7ea02e8b01707bf7d0a` implements one venue-level Critical/Recovery pair for a persistent socket wave, zero outage messages for a fully transient sub-25-second wave, a precise blocked-FULL alert, and active-tick shutdown handoff. Validate these semantics on a fresh public-only run before resuming a 24-hour window.
 - Rejected branch `codex/strategy-measurement-foundation` at `300362d840141d9ed599d8189ed1d10801fc5256` is not a candidate and must not be merged or copied. Open a fresh Builder only if observed evidence proves a bounded defect or a measurement field genuinely missing from the accepted paper path.
 
 Allowed scope:
 
 - Public unauthenticated mainnet REST/WebSocket reads from the existing fixed venue adapters.
-- A fresh central Builder may change only Telegram outage classification/pairing. Persist every raw disconnect/reconnect/resync event unchanged. Do not deliver transient self-recovered socket churn as critical; alert only an existing persistent/unresolved semantic failure, and deliver recovery only for a critical episode that was actually delivered. FULL Top-10 digests and all-route persistence/reporting remain unchanged.
 - After Chief acceptance, use a fresh isolated paper SQLite database, one preflight `scan-once`, then a bounded 24-hour `paper-run` unless a fail-closed performance/data blocker ends it earlier. Outbound Telegram remains authoritative delivery-only/non-blocking and shows at most Top-10 ranked rows per FULL digest.
 - Existing conservative paper semantics: exact Decimal arithmetic, canonical units, exact-size depth/VWAP, fee and execution PnL, funding timestamps, trade-through maker evidence, data-gap degradation, restart behavior, and `NO_TRADE` as a valid result.
 - Report opportunity count/duration, COMPLETE versus DEGRADED paper lifecycles, planned and executable-unwind net PnL, fee/spread/slippage/funding components, funding source quality, latency/freshness failures, leg-risk proxies, and every assumption or blocker, both overall and in the fixed liquidity buckets.
@@ -30,6 +31,7 @@ Allowed scope:
 - Required regressions cover a synchronized 45-task Extended disconnect/staleness wave while the first FULL becomes due, non-blocking/coalesced recovery ownership, complete FULL or precise bounded `PUBLIC_SCAN_BLOCKED`, no fabricated fresh evidence, no task leak, and bounded SIGTERM-style cancellation during recovery.
 - Required regressions also prove that 58 persisted directions yield exactly the first 10 deterministic rows to Telegram with no effect on the stored/reportable set, and reproduce bounded shutdown while Extended recovery/socket work is active.
 - Required notification regressions cover a many-socket transient EOF wave recovering below the existing stale threshold with zero critical/recovery Telegram messages, persistence of every raw lifecycle event, one persistent stale or failed-recovery critical alert, exact paired recovery, semantic dedupe, and unchanged non-blocking delivery.
+- Required notification regressions also cover a socket episode still pending at 25 seconds, later recovery at 34–44 seconds, one blocked FULL alert with semantic dedupe, and no suppression of genuine persistent loss. Required shutdown evidence includes a cancellation-resistant session/socket owner that does not cooperate immediately with task cancellation.
 
 Forbidden scope:
 
