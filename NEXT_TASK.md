@@ -2,7 +2,7 @@
 
 ## Temporary six-hour synthetic-opportunity experiment
 
-Status: `IMPLEMENTATION ACCEPTED AT 523f2a42ff493d97ed56c21f598a4cd4308ff4c8 — FRESH PAPER PREFLIGHT NEXT; NO RUNTIME OR VENUE WRITE IN FLIGHT`.
+Status: `BLOCKED — FIRST SIX-HOUR ATTEMPT STOPPED RUNTIME_FATAL ON THE SHARED-SCAN ACTIVATION TIMESTAMP GATE; ZERO FILLS/POSITIONS; CORRECTION REQUIRED; NO VENUE WRITE IN FLIGHT`.
 
 Objective: observe PAPER and, only after every existing Level-B/C gate passes, testnet behavior for `RISEx–Nado` and `RISEx–Extended` before, during, and after real funding boundaries when test selection adds exactly `$0.50` to each route's calculated expected PnL.
 
@@ -18,6 +18,11 @@ Acceptance:
 
 - Focused/adverse regressions prove default-zero isolation, exact `$0.50` arithmetic, raw/adjusted persistence and presentation, no contamination of actual accounting, restart/config identity, and unchanged safety blockers; then one clean Python 3.11 full suite passes on the final SHA.
 - A six-hour PAPER run safely stops with a fresh intact database and a sanitized report. A testnet route is evidence only if its pre-existing gate passes and it completes with authoritative funding semantics, zero relevant orders, exact flatness, and no unrelated state. An unavailable route remains a precise external or implementation blocker; the synthetic overlay cannot turn it into success.
+
+Observed correction slice:
+
+- Preserve `mainnet-shadow-synthetic-all-routes-20260828-chief20-6h.db` as an immutable failed-run artifact. It reached `PAPER_RUN_READY`, persisted 28 snapshots and two `CANCELLED` virtual entry orders, then stopped `RUNTIME_FATAL` at `2026-08-28T20:59:06Z` with the exact sanitized exception `ValueError: activation must use the shared scan timestamp`; integrity is `ok`, fills/positions/funding settlements are `0/0/0`, and the six-hour window is not credited.
+- One fresh visible Builder must reproduce and correct only the live activation/refresh coordination defect. The correction must retain the shared logical scan timestamp invariant, deterministic ranking/route lock, exact activation/cutoff semantics, overlay separation, no stale-plan activation, and default-zero behavior. Add a cancellation/rescheduling adverse regression matching the observed FULL/focused overlap, then run focused/adverse and one clean Python 3.11 full suite. Do not resume the failed database or start another six-hour window before independent Chief acceptance.
 
 ## Two-route testnet funding-boundary lifecycles
 
