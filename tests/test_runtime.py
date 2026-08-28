@@ -2409,6 +2409,99 @@ async def test_activation_fails_closed_when_current_scan_cannot_be_published(
 
 
 @pytest.mark.asyncio
+async def test_disconnect_invalidation_precedes_trade_during_gated_full_refresh(
+    tmp_path,
+):
+    clock = FakeClock()
+    target = NOW + timedelta(seconds=120)
+    blocked_adapter = GatedAdapter(Venue.RISEX, clock, settlement_at=target)
+    fakes = adapters(clock, settlement_at=target)
+    fakes[Venue.RISEX] = blocked_adapter
+
+    with PaperRepository(tmp_path / "disconnect-trade-refresh-race.db") as repository:
+        async with PublicPaperRuntime(repository, adapters=fakes, clock=clock) as runtime:
+            full_scan = None
+            delivery = None
+            disconnect = None
+            release_recompute = asyncio.Event()
+            original_recompute = runtime._recompute_funding
+            try:
+                await activate_with_live_streams(runtime, clock)
+                assert runtime.broker is not None
+                order = runtime.broker.state.order
+                assert order is not None
+                runtime.mark_trade_stream_connected(
+                    order.venue, order.canonical_market, at=clock.now()
+                )
+
+                blocked_adapter.block_catalog = True
+                full_scan = asyncio.create_task(
+                    runtime.scan(
+                        refresh=True, scan_kind="FULL", scheduled_at=clock.now()
+                    )
+                )
+                await blocked_adapter.request_started.wait()
+                assert not runtime._scan_coordination_lock.locked()
+
+                recompute_started = asyncio.Event()
+
+                async def gated_recompute(*args, **kwargs):
+                    recompute_started.set()
+                    await release_recompute.wait()
+                    return await original_recompute(*args, **kwargs)
+
+                runtime._recompute_funding = gated_recompute
+                delivery = asyncio.create_task(
+                    runtime.deliver_trade(
+                        maker_trade(runtime, clock.now(), "disconnect-race-trade")
+                    )
+                )
+                await recompute_started.wait()
+
+                session_id = stream_session(
+                    runtime, order.venue, order.canonical_market, "public"
+                )
+                disconnect = asyncio.create_task(
+                    runtime.mark_disconnected(
+                        order.venue,
+                        order.canonical_market,
+                        stream_kind="public",
+                        stream_session_id=session_id,
+                    )
+                )
+                await asyncio.wait_for(asyncio.shield(disconnect), timeout=1)
+                assert runtime.broker is None
+                assert (order.venue, order.canonical_market) not in runtime._trade_stream_ready
+
+                release_recompute.set()
+                await delivery
+                assert runtime.lifecycle is None
+                assert repository.connection.execute(
+                    "SELECT COUNT(*) FROM fills"
+                ).fetchone()[0] == 0
+                assert repository.connection.execute(
+                    "SELECT COUNT(*) FROM processed_trade_events"
+                ).fetchone()[0] == 0
+
+                blocked_adapter.block_catalog = False
+                blocked_adapter.gate.set()
+                await full_scan
+                assert repository.load_runtime().lifecycle_state is LifecycleState.FLAT
+            finally:
+                release_recompute.set()
+                blocked_adapter.block_catalog = False
+                blocked_adapter.gate.set()
+                for task in (delivery, disconnect, full_scan):
+                    if task is not None and not task.done():
+                        task.cancel()
+                await asyncio.gather(
+                    *(task for task in (delivery, disconnect, full_scan) if task is not None),
+                    return_exceptions=True,
+                )
+                runtime._recompute_funding = original_recompute
+
+
+@pytest.mark.asyncio
 async def test_focused_and_active_ticks_make_zero_rest_calls_through_cutoff(tmp_path):
     clock = FakeClock()
     target = NOW + timedelta(seconds=300)

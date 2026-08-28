@@ -468,6 +468,8 @@ class PublicPaperRuntime:
         self._background_fatal: BaseException | None = None
         self._scan_coordination_lock = asyncio.Lock()
         self._scan_revision = 0
+        self._paper_entry_lock = asyncio.Lock()
+        self._stream_invalidation_revisions: dict[tuple[Venue, str], int] = {}
         self._position_event_lock = asyncio.Lock()
         self._shutdown_started = False
         self._startup_gate_satisfied = False
@@ -1775,12 +1777,11 @@ class PublicPaperRuntime:
         scan_kind: str = "INITIAL",
         scheduled_at: datetime | None = None,
     ) -> dict[str, object]:
-        async with self._scan_coordination_lock:
-            return await self._scan_unlocked(
-                refresh=refresh,
-                scan_kind=scan_kind,
-                scheduled_at=scheduled_at,
-            )
+        return await self._scan_unlocked(
+            refresh=refresh,
+            scan_kind=scan_kind,
+            scheduled_at=scheduled_at,
+        )
 
     async def _scan_unlocked(
         self,
@@ -1883,24 +1884,11 @@ class PublicPaperRuntime:
         snapshot = await scan_once(
             normalized_tuple, logical_at, config=self.config
         )
-        persist_scan = (
-            self.last_scan is None or self.last_scan.logical_at != logical_at
+        persist_scan = await self._publish_scan_state(
+            snapshot=snapshot,
+            logical_at=logical_at,
+            normalized_tuple=normalized_tuple,
         )
-        if persist_scan:
-            self.repository.ensure_synthetic_test_configuration(
-                self.config.synthetic_test_pnl_overlay_usd
-            )
-        self.last_scan = snapshot
-        self._scan_revision += 1
-        if persist_scan:
-            self.repository.save_decision(
-                recorded_at=logical_at,
-                scan_snapshot=snapshot,
-                funding_quotes=tuple(
-                    row.funding
-                    for row in normalized_tuple if row.funding is not None
-                ),
-            )
         completed_at = self.clock.now()
         self._record(
             "PUBLIC_SCAN",
@@ -2006,6 +1994,35 @@ class PublicPaperRuntime:
                 "realized_accounting_includes_overlay": False,
             }
         return result
+
+    async def _publish_scan_state(
+        self,
+        *,
+        snapshot: ScanSnapshot,
+        logical_at: datetime,
+        normalized_tuple: tuple[MarketObservation, ...],
+    ) -> bool:
+        async with self._scan_coordination_lock:
+            current = self.last_scan
+            if current is not None and current.logical_at > logical_at:
+                return False
+            persist_scan = current is None or current.logical_at != logical_at
+            if persist_scan:
+                self.repository.ensure_synthetic_test_configuration(
+                    self.config.synthetic_test_pnl_overlay_usd
+                )
+            self.last_scan = snapshot
+            self._scan_revision += 1
+            if persist_scan:
+                self.repository.save_decision(
+                    recorded_at=logical_at,
+                    scan_snapshot=snapshot,
+                    funding_quotes=tuple(
+                        row.funding
+                        for row in normalized_tuple if row.funding is not None
+                    ),
+                )
+            return persist_scan
 
     async def _refresh_public_data(self) -> None:
         assert self.adapters is not None
@@ -2610,7 +2627,8 @@ class PublicPaperRuntime:
                 )
             return
         if self.broker is not None and self.broker.state.lifecycle_state is LifecycleState.ENTRY_MAKER_OPEN:
-            order = self.broker.state.order
+            broker = self.broker
+            order = broker.state.order
             assert order is not None
             if now >= order.cutoff_at or self.next_focused_scan_at is None or now >= self.next_focused_scan_at:
                 scheduled = self.next_focused_scan_at or now
@@ -2629,12 +2647,19 @@ class PublicPaperRuntime:
                     None,
                 )
                 risex, _ = self._route_observations(order.route_plan, now)
-                await self.broker.refresh(refreshed, risex, evaluated_at=now)
-                self.repository.save_decision(
-                    recorded_at=now, entry_state=self.broker.state
-                )
-                if self.broker.state.lifecycle_state is LifecycleState.FLAT:
-                    self.broker = None
+                async with self._paper_entry_lock:
+                    if (
+                        self.broker is not broker
+                        or broker.state.lifecycle_state is not LifecycleState.ENTRY_MAKER_OPEN
+                    ):
+                        return
+                    await broker.refresh(refreshed, risex, evaluated_at=now)
+                    self.repository.save_decision(
+                        recorded_at=now, entry_state=broker.state
+                    )
+                    if broker.state.lifecycle_state is LifecycleState.FLAT:
+                        if self.broker is broker:
+                            self.broker = None
                 self.next_focused_scan_at = _next_absolute_slot(
                     scheduled, now, self.config.focused_scan_seconds
                 )
@@ -2810,8 +2835,9 @@ class PublicPaperRuntime:
     ) -> None:
         at = processed_at or self.clock.now()
         exit_receipt_version: str | None = None
-        if self.broker is not None and self.broker.state.lifecycle_state is LifecycleState.ENTRY_MAKER_OPEN:
-            active_order = self.broker.state.order
+        broker = self.broker
+        if broker is not None and broker.state.lifecycle_state is LifecycleState.ENTRY_MAKER_OPEN:
+            active_order = broker.state.order
             assert active_order is not None
             if (trade.venue, trade.canonical_market) != (
                 active_order.venue,
@@ -2836,7 +2862,7 @@ class PublicPaperRuntime:
                 return
         else:
             return
-        if self.broker is not None and self.broker.state.lifecycle_state is LifecycleState.ENTRY_MAKER_OPEN:
+        if broker is not None and broker.state.lifecycle_state is LifecycleState.ENTRY_MAKER_OPEN:
             plan = active_order.route_plan
             risex_observation = self.observations.get(
                 (Venue.RISEX, plan.risex_market.venue_symbol)
@@ -2865,11 +2891,17 @@ class PublicPaperRuntime:
         ):
             self._record("TRADE_IGNORED_STREAM_UNHEALTHY", at=at, venue=trade.venue)
             return
-        if self.broker is not None and self.broker.state.lifecycle_state is LifecycleState.ENTRY_MAKER_OPEN:
-            broker = self.broker
+        if broker is not None and broker.state.lifecycle_state is LifecycleState.ENTRY_MAKER_OPEN:
             before = broker.state
             order = before.order
             assert order is not None
+            entry_invalidation_revisions = {
+                key: self._stream_invalidation_revisions.get(key, 0)
+                for key in {
+                    (order.venue, order.canonical_market),
+                    (Venue.RISEX, order.route_plan.risex_market.venue_symbol),
+                }
+            }
             version = observed_version_id or order.active_version.version_id
             risex, hedge = self._route_observations(order.route_plan, at)
             risex_capture = self._execution_capture(risex, at)
@@ -2883,35 +2915,43 @@ class PublicPaperRuntime:
                 recompute_funding=self._recompute_funding,
                 risex_capture=risex_capture,
             )
-            if self.broker is not broker or broker.state is not before:
-                return
-            if result.fill_provenance and not self._captures_are_current(
-                risex_capture
-            ):
-                return
-            lifecycle_candidate = (
-                LifecycleEngine(result.state, config=self.config)
-                if result.state.position is not None else None
-            )
-            self.repository.save_decision(
-                recorded_at=at,
-                trade_events=(trade,),
-                entry_state=result.state,
-                lifecycle_snapshot=(
-                    None if lifecycle_candidate is None
-                    else lifecycle_candidate.snapshot
-                ),
-                fill_provenance=result.fill_provenance,
-            )
-            if result.state.position is not None:
-                self.lifecycle = lifecycle_candidate
-                self._notify_lifecycle_transition(None, self.lifecycle.snapshot, at)
-                self.broker = None
-                self.next_position_monitor_at = at + timedelta(
-                    seconds=self.config.open_position_monitor_seconds
+            async with self._paper_entry_lock:
+                if (
+                    any(
+                        self._stream_invalidation_revisions.get(key, 0) != revision
+                        for key, revision in entry_invalidation_revisions.items()
+                    )
+                    or self.broker is not broker
+                    or broker.state is not before
+                ):
+                    return
+                if result.fill_provenance and not self._captures_are_current(
+                    risex_capture
+                ):
+                    return
+                lifecycle_candidate = (
+                    LifecycleEngine(result.state, config=self.config)
+                    if result.state.position is not None else None
                 )
-            elif self.broker is broker and broker.state is before:
-                broker.publish_candidate(candidate)
+                self.repository.save_decision(
+                    recorded_at=at,
+                    trade_events=(trade,),
+                    entry_state=result.state,
+                    lifecycle_snapshot=(
+                        None if lifecycle_candidate is None
+                        else lifecycle_candidate.snapshot
+                    ),
+                    fill_provenance=result.fill_provenance,
+                )
+                if result.state.position is not None:
+                    self.lifecycle = lifecycle_candidate
+                    self._notify_lifecycle_transition(None, self.lifecycle.snapshot, at)
+                    self.broker = None
+                    self.next_position_monitor_at = at + timedelta(
+                        seconds=self.config.open_position_monitor_seconds
+                    )
+                elif self.broker is broker and broker.state is before:
+                    broker.publish_candidate(candidate)
             return
         if self.lifecycle is not None and self.lifecycle.snapshot.exit_order is not None:
             lifecycle = self.lifecycle
@@ -3190,6 +3230,10 @@ class PublicPaperRuntime:
         if not self._owns_stream_session(session_key, stream_session_id):
             return
         now = at or self.clock.now()
+        key = (venue, symbol)
+        self._stream_invalidation_revisions[key] = (
+            self._stream_invalidation_revisions.get(key, 0) + 1
+        )
         if venue is Venue.EXTENDED and stream_kind in {"book", "trade", "funding"}:
             self._extended_confirmed_at.pop((symbol, stream_kind), None)
         invalidates_book = stream_kind in {"book", "combined", "health", "public"}
@@ -3219,26 +3263,32 @@ class PublicPaperRuntime:
                 detail={"symbol": symbol, "stream": stream_kind},
             )
         if self.broker is not None and self.broker.state.lifecycle_state is LifecycleState.ENTRY_MAKER_OPEN:
-            async with self._scan_coordination_lock:
+            async with self._paper_entry_lock:
                 broker = self.broker
-                order = broker.state.order
-                assert order is not None
-                if (venue, symbol) in {
-                    (Venue.RISEX, order.route_plan.risex_market.venue_symbol),
-                    (order.route_plan.hedge_venue, order.route_plan.hedge_market.venue_symbol),
-                }:
-                    risex, hedge = self._route_observations(order.route_plan, now)
-                    local = await scan_once((risex, hedge), now, config=self.config)
-                    refreshed = local.evaluations[0] if local.evaluations else None
-                    await broker.refresh(refreshed, risex, evaluated_at=now)
-                    self.repository.save_decision(
-                        recorded_at=now, entry_state=broker.state
-                    )
-                    self.last_scan = local
-                    self._scan_revision += 1
-                    if broker.state.lifecycle_state is LifecycleState.FLAT:
-                        if self.broker is broker:
-                            self.broker = None
+                if broker is not None and broker.state.lifecycle_state is LifecycleState.ENTRY_MAKER_OPEN:
+                    order = broker.state.order
+                    assert order is not None
+                    if (venue, symbol) in {
+                        (Venue.RISEX, order.route_plan.risex_market.venue_symbol),
+                        (order.route_plan.hedge_venue, order.route_plan.hedge_market.venue_symbol),
+                    }:
+                        risex, hedge = self._route_observations(order.route_plan, now)
+                        local = await scan_once((risex, hedge), now, config=self.config)
+                        refreshed = local.evaluations[0] if local.evaluations else None
+                        await broker.refresh(refreshed, risex, evaluated_at=now)
+                        self.repository.save_decision(
+                            recorded_at=now, entry_state=broker.state
+                        )
+                        async with self._scan_coordination_lock:
+                            if (
+                                self.last_scan is None
+                                or self.last_scan.logical_at <= local.logical_at
+                            ):
+                                self.last_scan = local
+                                self._scan_revision += 1
+                        if broker.state.lifecycle_state is LifecycleState.FLAT:
+                            if self.broker is broker:
+                                self.broker = None
         if self.lifecycle is not None and (invalidates_book or invalidates_trade):
             async with self._position_event_lock:
                 if (
