@@ -1,5 +1,24 @@
 # Active bounded task
 
+## Temporary six-hour synthetic-opportunity experiment
+
+Status: `AUTHORIZED — IMPLEMENTATION NOT YET ACCEPTED; NO RUNTIME OR VENUE WRITE IN FLIGHT`.
+
+Objective: observe PAPER and, only after every existing Level-B/C gate passes, testnet behavior for `RISEx–Nado` and `RISEx–Extended` before, during, and after real funding boundaries when test selection adds exactly `$0.50` to each route's calculated expected PnL.
+
+Implementation boundary:
+
+- Add one explicit opt-in runtime experiment input whose default is exactly zero. With the authorized input, compute `test_adjusted_expected_pnl_usd = raw_expected_pnl_usd + 0.50` using exact decimal arithmetic and use only the adjusted value for experiment eligibility and deterministic ranking.
+- Preserve and report raw expected PnL, overlay amount, and adjusted test PnL separately. Telegram and reports must visibly label the adjusted value `SYNTHETIC TEST`; actual funding, fees, pair PnL, realized/closed net, and profitability claims remain exclusively authoritative and unadjusted.
+- The overlay may not manufacture funding events, liquidity, freshness, fills, positions, account cash, or lifecycle completion; bypass a blocker; modify actual accounting; or enable any mainnet private/read/write surface. Normal behavior must be byte-for-byte/economically unchanged when the input is absent.
+- Use a fresh PAPER database and a bounded six-hour observation window. Persist scanner/lifecycle evidence for both hedge venues and produce one sanitized operational report covering pre-boundary, boundary, post-boundary, route churn, opportunities, actions, funding resolution, defects, shutdown, SQLite integrity, and final state. Never resume an interrupted database.
+- Any concrete defect gets a bounded fresh visible GPT-5.6 Luna-max Builder correction and independent Chief acceptance. Testnet writes remain sequential and are attempted only after the route's existing authenticated readiness, durable identity, unrelated-state, liquidity, schedule, no-replay, reconciliation, and exact-flat gates pass.
+
+Acceptance:
+
+- Focused/adverse regressions prove default-zero isolation, exact `$0.50` arithmetic, raw/adjusted persistence and presentation, no contamination of actual accounting, restart/config identity, and unchanged safety blockers; then one clean Python 3.11 full suite passes on the final SHA.
+- A six-hour PAPER run safely stops with a fresh intact database and a sanitized report. A testnet route is evidence only if its pre-existing gate passes and it completes with authoritative funding semantics, zero relevant orders, exact flatness, and no unrelated state. An unavailable route remains a precise external or implementation blocker; the synthetic overlay cannot turn it into success.
+
 ## Two-route testnet funding-boundary lifecycles
 
 Status: `BLOCKED — THE FRESH RISEX–NADO OWNER STOPPED BEFORE WRITE IN THE REAL PREPARATION-GATE PATH; EXTENDED TESTNET BOOKS ARE EMPTY WITH A STALE FUNDING TIMESTAMP; NO WRITE IN FLIGHT`.
