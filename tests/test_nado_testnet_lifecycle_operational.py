@@ -1974,6 +1974,24 @@ def test_funding_entrypoint_isolated_store_never_falls_back_to_historical_store(
         store.close()
 
 
+def test_funding_boundary_store_v2_cannot_alias_historical_v1_path_or_identity(
+    tmp_path: Path,
+) -> None:
+    historical_path = tmp_path / (
+        ".risex-funding-farmer-nado-funding-boundary-eth-v1.sqlite3"
+    )
+    fresh_path = tmp_path / FUNDING_BOUNDARY_RUN_STORE_BASENAME
+
+    assert FUNDING_BOUNDARY_RUN_STORE_BASENAME == (
+        ".risex-funding-farmer-nado-funding-boundary-eth-v2.sqlite3"
+    )
+    assert fresh_path != historical_path
+    assert _journal_store_identity(fresh_path) != _journal_store_identity(
+        historical_path
+    )
+    assert not FUNDING_BOUNDARY_RUN_STORE_BASENAME.endswith("-v1.sqlite3")
+
+
 def test_production_funding_entrypoint_uses_fixed_identity_and_private_gate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
