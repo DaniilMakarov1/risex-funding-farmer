@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from risex_farmer.config import PAPER_CONFIG
+from risex_farmer.config import PAPER_CONFIG, SYNTHETIC_TEST_OVERLAY_USD
 from risex_farmer.models import (
     BookLevel,
     CanonicalMarket,
@@ -309,6 +309,109 @@ def test_negative_net_is_no_trade_and_non_negative_is_allowed() -> None:
     fee_split = planned_fee_split(non_negative)
     assert fee_split is not None
     assert non_negative.planned_fees_usd == sum(fee_split, D("0"))
+
+
+def test_synthetic_test_overlay_keeps_raw_pnl_and_adds_exact_decimal_amount() -> None:
+    raw = plan(
+        risex=observation(Venue.RISEX, long_cash="1", short_cash="1"),
+        hedge=observation(Venue.EXTENDED, long_cash="1", short_cash="1"),
+    )
+    config = replace(
+        PAPER_CONFIG,
+        synthetic_test_pnl_overlay_usd=SYNTHETIC_TEST_OVERLAY_USD,
+    )
+    adjusted = evaluate_route(
+        observation(Venue.RISEX, long_cash="1", short_cash="1"),
+        observation(Venue.EXTENDED, long_cash="1", short_cash="1"),
+        RouteDirection.LONG_RISEX_SHORT_HEDGE,
+        NOW,
+        config=config,
+    )
+    assert raw.planned_maker_net_pnl_usd is not None
+    assert adjusted.raw_expected_pnl_usd == adjusted.planned_maker_net_pnl_usd
+    assert adjusted.synthetic_test_pnl_overlay_usd == D("0.50")
+    assert adjusted.test_adjusted_expected_pnl_usd == (
+        raw.planned_maker_net_pnl_usd + D("0.50")
+    )
+    assert adjusted.planned_maker_net_pnl_usd == raw.planned_maker_net_pnl_usd
+    assert adjusted.entry_allowed
+    assert adjusted.no_trade_reasons == ()
+
+
+@pytest.mark.asyncio
+async def test_synthetic_test_ranks_raw_negative_routes_without_bypassing_blockers() -> None:
+    config = replace(
+        PAPER_CONFIG,
+        synthetic_test_pnl_overlay_usd=SYNTHETIC_TEST_OVERLAY_USD,
+    )
+    snapshot = await scan_once(
+        (
+            observation(Venue.RISEX, long_cash="1", short_cash="1"),
+            observation(Venue.NADO, long_cash="1", short_cash="1"),
+            observation(Venue.EXTENDED, long_cash="1", short_cash="1"),
+        ),
+        NOW,
+        config=config,
+    )
+    assert len(snapshot.ranked_routes) == 4
+    assert snapshot.winner is not None
+    assert all(
+        plan.raw_expected_pnl_usd is not None
+        and plan.raw_expected_pnl_usd < 0
+        and plan.test_adjusted_expected_pnl_usd is not None
+        and plan.test_adjusted_expected_pnl_usd >= 0
+        for plan in snapshot.ranked_routes
+    )
+    stale = evaluate_route(
+        observation(Venue.RISEX, long_cash="1", short_cash="1"),
+        observation(
+            Venue.EXTENDED,
+            long_cash="1",
+            short_cash="1",
+            funding_observed_at=NOW - timedelta(seconds=121),
+        ),
+        RouteDirection.LONG_RISEX_SHORT_HEDGE,
+        NOW,
+        config=config,
+    )
+    shallow = evaluate_route(
+        observation(Venue.RISEX, long_cash="1", short_cash="1"),
+        observation(Venue.EXTENDED, long_cash="1", short_cash="1", depth="1"),
+        RouteDirection.LONG_RISEX_SHORT_HEDGE,
+        NOW,
+        config=config,
+    )
+    unknown_funding = evaluate_route(
+        observation(Venue.RISEX, long_cash="1", short_cash="1"),
+        observation(
+            Venue.EXTENDED,
+            long_cash=None,
+            short_cash=None,
+            funding_eligible=False,
+        ),
+        RouteDirection.LONG_RISEX_SHORT_HEDGE,
+        NOW,
+        config=config,
+    )
+    unsafe = evaluate_route(
+        observation(Venue.RISEX, long_cash="1", short_cash="1"),
+        observation(
+            Venue.EXTENDED,
+            long_cash="1",
+            short_cash="1",
+            active=False,
+        ),
+        RouteDirection.LONG_RISEX_SHORT_HEDGE,
+        NOW,
+        config=config,
+    )
+    assert NoTradeReason.FUNDING_STALE in stale.no_trade_reasons
+    assert NoTradeReason.INSUFFICIENT_EXACT_DEPTH in shallow.no_trade_reasons
+    assert NoTradeReason.FUNDING_ELIGIBILITY_UNKNOWN in unknown_funding.no_trade_reasons
+    assert NoTradeReason.MARKET_INELIGIBLE in unsafe.no_trade_reasons
+    assert not stale.entry_allowed and not shallow.entry_allowed
+    assert not unknown_funding.entry_allowed
+    assert not unsafe.entry_allowed
 
 
 @pytest.mark.asyncio

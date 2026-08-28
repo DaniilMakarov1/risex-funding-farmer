@@ -13,7 +13,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Iterator
 
-from .config import PAPER_CONFIG
+from .config import PAPER_CONFIG, SYNTHETIC_TEST_OVERLAY_USD
 from .economics import replace_funding_settlement
 from .lifecycle import (
     ClosedTrade,
@@ -125,6 +125,15 @@ def _plan_decimal(plan: object, name: str) -> Decimal | None:
     return value if isinstance(value, Decimal) and value.is_finite() else None
 
 
+def _plan_raw_expected_decimal(plan: object) -> Decimal | None:
+    raw = _plan_decimal(plan, "raw_expected_pnl_usd")
+    return (
+        raw
+        if raw is not None
+        else _plan_decimal(plan, "planned_maker_net_pnl_usd")
+    )
+
+
 def _plan_blockers(plan: object) -> tuple[str, ...]:
     raw = getattr(plan, "no_trade_reasons", ())
     return tuple(str(reason) for reason in raw)
@@ -207,6 +216,10 @@ CREATE TABLE IF NOT EXISTS scanner_snapshots (
     eligible_count INTEGER NOT NULL,
     winner_asset TEXT,
     payload BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS paper_runtime_config (
+    config_key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS public_route_rows (
     logical_at TEXT NOT NULL,
@@ -500,7 +513,48 @@ class PaperRepository:
             return
         self.connection.execute(insert_sql, insert_values)
 
+    @staticmethod
+    def _canonical_synthetic_test_overlay(overlay: Decimal) -> str:
+        if type(overlay) is not Decimal or not overlay.is_finite():
+            raise ValueError("synthetic test overlay must be a finite Decimal")
+        if overlay == Decimal("0"):
+            return "0"
+        if overlay == SYNTHETIC_TEST_OVERLAY_USD:
+            return str(SYNTHETIC_TEST_OVERLAY_USD)
+        raise ValueError("synthetic test overlay must be exactly 0 or 0.50")
+
+    def _bind_synthetic_test_configuration(self, overlay: Decimal) -> None:
+        value = self._canonical_synthetic_test_overlay(overlay)
+        row = self.connection.execute(
+            "SELECT value FROM paper_runtime_config WHERE config_key=?",
+            ("synthetic_test_pnl_overlay_usd",),
+        ).fetchone()
+        if row is not None:
+            if row["value"] != value:
+                raise ValueError(
+                    "synthetic test configuration identity conflict"
+                )
+            return
+        self.connection.execute(
+            "INSERT INTO paper_runtime_config VALUES (?, ?)",
+            ("synthetic_test_pnl_overlay_usd", value),
+        )
+
+    def ensure_synthetic_test_configuration(self, overlay: Decimal) -> None:
+        """Bind one paper database to its opt-in experiment configuration."""
+        with self.transaction():
+            self._bind_synthetic_test_configuration(overlay)
+
     def _save_scan(self, snapshot: ScanSnapshot) -> None:
+        overlays = {
+            getattr(plan, "synthetic_test_pnl_overlay_usd", Decimal("0"))
+            for plan in snapshot.evaluations
+        }
+        if len(overlays) > 1:
+            raise ValueError("scan contains mixed synthetic test configurations")
+        self._bind_synthetic_test_configuration(
+            next(iter(overlays), Decimal("0"))
+        )
         self._insert_exact(
             "scanner_snapshots",
             "logical_at = ?",
@@ -1347,6 +1401,9 @@ class PaperRepository:
         metrics: dict[str, dict[str, list[Decimal]]] = {
             bucket: {
                 "planned_net": [],
+                "raw_expected": [],
+                "synthetic_overlay": [],
+                "test_adjusted_expected": [],
                 "unwind_net": [],
                 "funding": [],
                 "fees": [],
@@ -1360,6 +1417,7 @@ class PaperRepository:
         }
         freshness_unknown_counts = dict.fromkeys(LIQUIDITY_BUCKETS, 0)
         complete_counts = dict.fromkeys(LIQUIDITY_BUCKETS, 0)
+        synthetic_test_enabled = False
 
         for logical_at, plans in history:
             by_bucket: dict[str, list[object]] = {
@@ -1385,8 +1443,17 @@ class PaperRepository:
                     if eligible:
                         eligible_counts[bucket] += 1
                         eligible_in_scan = True
+                    overlay = _plan_decimal(
+                        plan, "synthetic_test_pnl_overlay_usd"
+                    )
+                    if overlay is not None:
+                        metrics[bucket]["synthetic_overlay"].append(overlay)
+                        if overlay != Decimal("0"):
+                            synthetic_test_enabled = True
                     for name, metric_name in (
                         ("planned_net", "planned_maker_net_pnl_usd"),
+                        ("raw_expected", "raw_expected_pnl_usd"),
+                        ("test_adjusted_expected", "test_adjusted_expected_pnl_usd"),
                         ("unwind_net", "executable_unwind_net_pnl_usd"),
                         ("funding", "expected_target_cycle_funding_usd"),
                         ("fees", "planned_fees_usd"),
@@ -1395,7 +1462,11 @@ class PaperRepository:
                         ("taker_slippage", "taker_slippage_usd"),
                         ("freshness", "freshness_age_seconds"),
                     ):
-                        value = _plan_decimal(plan, metric_name)
+                        value = (
+                            _plan_raw_expected_decimal(plan)
+                            if metric_name == "raw_expected_pnl_usd"
+                            else _plan_decimal(plan, metric_name)
+                        )
                         if value is not None:
                             metrics[bucket][name].append(value)
                     bbo = _plan_decimal(plan, "bbo_spread_usd")
@@ -1414,7 +1485,7 @@ class PaperRepository:
             planned = _metric_summary(metrics[bucket]["planned_net"])
             funding = _metric_summary(metrics[bucket]["funding"])
             fees = _metric_summary(metrics[bucket]["fees"])
-            bucket_reports[bucket] = {
+            bucket_report = {
                 "route_observation_count": len(observations[bucket]),
                 "distinct_venue_asset_directions": len(directions[bucket]),
                 "scan_count": scan_counts[bucket],
@@ -1477,6 +1548,21 @@ class PaperRepository:
                 },
                 "blockers": dict(sorted(blocker_counts[bucket].items())),
             }
+            if synthetic_test_enabled:
+                bucket_report.update({
+                    "raw_expected_pnl_usd": _metric_summary(
+                        metrics[bucket]["raw_expected"]
+                    ),
+                    "synthetic_test_pnl_overlay_usd": _metric_summary(
+                        metrics[bucket]["synthetic_overlay"]
+                    ),
+                    "test_adjusted_expected_pnl_usd": _metric_summary(
+                        metrics[bucket]["test_adjusted_expected"]
+                    ),
+                    "synthetic_test_label": "SYNTHETIC TEST",
+                    "realized_accounting_includes_synthetic_test_overlay": False,
+                })
+            bucket_reports[bucket] = bucket_report
         return {
             "scan_count": len(history),
             "first_scan_at": None if not history else history[0][0].isoformat(),
@@ -1656,6 +1742,15 @@ class PaperRepository:
                 "ORDER BY rank IS NULL, rank, route_key"
             )
         ]
+        configuration_row = self.connection.execute(
+            "SELECT value FROM paper_runtime_config WHERE config_key=?",
+            ("synthetic_test_pnl_overlay_usd",),
+        ).fetchone()
+        configured_overlay = (
+            None
+            if configuration_row is None
+            else Decimal(configuration_row["value"])
+        )
         latest_trade_rows = self.connection.execute(
             "SELECT payload FROM processed_trade_events WHERE payload IS NOT NULL "
             "ORDER BY rowid DESC"
@@ -1693,7 +1788,7 @@ class PaperRepository:
                 / Decimal(len(applied))
             )
         )
-        return {
+        result = {
             "opportunities": scans["opportunities"],
             "eligible_opportunities": scans["eligible"],
             "eligible_count": scans["eligible"],
@@ -1824,6 +1919,17 @@ class PaperRepository:
                 "risex_assumed_funding_is_not_official_applied_funding": True,
             },
         }
+        if configured_overlay is not None and configured_overlay != Decimal("0"):
+            result["synthetic_test"] = {
+                "label": "SYNTHETIC TEST",
+                "enabled": True,
+                "overlay_usd": str(configured_overlay),
+                "raw_expected_pnl_field": "raw_expected_pnl_usd",
+                "adjusted_expected_pnl_field": "test_adjusted_expected_pnl_usd",
+                "realized_accounting_includes_overlay": False,
+                "actual_funding_fees_pair_pnl_and_closed_net_unadjusted": True,
+            }
+        return result
 
     def _applied_partial_cycle_count(self) -> int:
         rows = self.connection.execute(

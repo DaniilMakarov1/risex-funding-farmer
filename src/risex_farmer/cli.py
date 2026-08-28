@@ -7,13 +7,32 @@ import asyncio
 import json
 import shutil
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import UTC
 from decimal import Decimal, ROUND_HALF_UP
 
+from .config import PAPER_CONFIG, SYNTHETIC_TEST_OVERLAY_USD, PaperConfig
 from .notifications import outbox_from_environment
 from .orchestrator import fixture_scan, load_fixture, run_fixture
 from .runtime import public_paper_run, public_scan_once
 from .storage import PaperRepository
+
+
+def _synthetic_test_overlay(value: str) -> Decimal:
+    try:
+        overlay = Decimal(value)
+    except (ArithmeticError, TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(
+            "synthetic test overlay must be exactly 0 or 0.50"
+        ) from exc
+    if (
+        not overlay.is_finite()
+        or overlay not in {Decimal("0"), SYNTHETIC_TEST_OVERLAY_USD}
+    ):
+        raise argparse.ArgumentTypeError(
+            "synthetic test overlay must be exactly 0 or 0.50"
+        )
+    return overlay
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -23,11 +42,21 @@ def _parser() -> argparse.ArgumentParser:
     scan = commands.add_parser("scan-once")
     scan.add_argument("--fixture", help="deterministic JSON fixture")
     scan.add_argument(
+        "--synthetic-test-pnl-overlay-usd", type=_synthetic_test_overlay,
+        default=Decimal("0"), metavar="USD",
+        help="opt-in PAPER experiment overlay (only 0 or 0.50)",
+    )
+    scan.add_argument(
         "--format", choices=("json", "table"), default="json",
         help="output format (default: json)",
     )
     run = commands.add_parser("paper-run")
     run.add_argument("--fixture", help="deterministic JSON fixture")
+    run.add_argument(
+        "--synthetic-test-pnl-overlay-usd", type=_synthetic_test_overlay,
+        default=Decimal("0"), metavar="USD",
+        help="opt-in PAPER experiment overlay (only 0 or 0.50)",
+    )
     commands.add_parser("report")
     return parser
 
@@ -217,10 +246,17 @@ def _scan_table(output: dict[str, object], *, width: int | None = None) -> str:
     return "\n".join(lines)
 
 
-async def _scan_once(repository: PaperRepository, fixture: str | None) -> dict[str, object]:
+async def _scan_once(
+    repository: PaperRepository,
+    fixture: str | None,
+    *,
+    config: PaperConfig = PAPER_CONFIG,
+) -> dict[str, object]:
     if fixture is None:
-        return await public_scan_once(repository)
-    snapshot, observations = await fixture_scan(load_fixture(fixture))
+        if config is PAPER_CONFIG:
+            return await public_scan_once(repository)
+        return await public_scan_once(repository, config=config)
+    snapshot, observations = await fixture_scan(load_fixture(fixture), config=config)
     repository.save_decision(
         recorded_at=snapshot.logical_at,
         scan_snapshot=snapshot,
@@ -237,24 +273,52 @@ async def _scan_once(repository: PaperRepository, fixture: str | None) -> dict[s
 
 
 async def _paper_run(
-    repository: PaperRepository, fixture: str | None
+    repository: PaperRepository,
+    fixture: str | None,
+    *,
+    config: PaperConfig = PAPER_CONFIG,
 ) -> dict[str, object]:
     if fixture is None:
         notifications = outbox_from_environment()
         if notifications is None:
-            return await public_paper_run(repository)
-        return await public_paper_run(repository, notifications=notifications)
-    return await run_fixture(load_fixture(fixture), repository)
+            if config is PAPER_CONFIG:
+                return await public_paper_run(repository)
+            return await public_paper_run(repository, config=config)
+        if config is PAPER_CONFIG:
+            return await public_paper_run(
+                repository, notifications=notifications
+            )
+        return await public_paper_run(
+            repository, config=config, notifications=notifications
+        )
+    return await run_fixture(load_fixture(fixture), repository, config=config)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    overlay = getattr(args, "synthetic_test_pnl_overlay_usd", Decimal("0"))
+    config = (
+        PAPER_CONFIG
+        if overlay == Decimal("0")
+        else replace(
+            PAPER_CONFIG,
+            synthetic_test_pnl_overlay_usd=overlay,
+        )
+    )
     with PaperRepository(args.db) as repository:
         try:
             if args.command == "scan-once":
-                output = asyncio.run(_scan_once(repository, args.fixture))
+                output = asyncio.run(
+                    _scan_once(repository, args.fixture)
+                    if overlay == Decimal("0")
+                    else _scan_once(repository, args.fixture, config=config)
+                )
             elif args.command == "paper-run":
-                output = asyncio.run(_paper_run(repository, args.fixture))
+                output = asyncio.run(
+                    _paper_run(repository, args.fixture)
+                    if overlay == Decimal("0")
+                    else _paper_run(repository, args.fixture, config=config)
+                )
             else:
                 output = repository.report()
         except KeyboardInterrupt:

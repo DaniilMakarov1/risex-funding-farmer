@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
+from .config import PAPER_CONFIG, PaperConfig
 from .lifecycle import LifecycleEngine, LifecycleSnapshot, restart_paper_entry_state
 from .models import (
     BookExecutionCapture,
@@ -145,7 +146,9 @@ def _observation(
 
 
 async def fixture_scan(
-    spec: dict[str, object]
+    spec: dict[str, object],
+    *,
+    config: PaperConfig = PAPER_CONFIG,
 ) -> tuple[ScanSnapshot, tuple[MarketObservation, MarketObservation]]:
     logical_at = _logical_at(spec)
     target = logical_at + timedelta(seconds=120)
@@ -160,7 +163,7 @@ async def fixture_scan(
         funding_cash=None if scenario == "no_opportunity" else "5",
     )
     hedge = _observation(Venue.EXTENDED, asset, logical_at, target)
-    return await scan_once((risex, hedge), logical_at), (risex, hedge)
+    return await scan_once((risex, hedge), logical_at, config=config), (risex, hedge)
 
 
 def _entry_trade(order, at: datetime) -> TradeEvidence:
@@ -228,8 +231,14 @@ async def _funding_recomputer(plan, opened_at: datetime, cash: str | None):
 
 
 async def run_fixture(
-    spec: dict[str, object], repository: PaperRepository
+    spec: dict[str, object],
+    repository: PaperRepository,
+    *,
+    config: PaperConfig = PAPER_CONFIG,
 ) -> dict[str, object]:
+    repository.ensure_synthetic_test_configuration(
+        config.synthetic_test_pnl_overlay_usd
+    )
     scenario = str(spec.get("scenario", "no_opportunity"))
     if scenario == "restart_open":
         return await _restart_fixture(spec, repository)
@@ -240,7 +249,7 @@ async def run_fixture(
             "state": existing.lifecycle_state.value,
             "forced_close": False,
         }
-    snapshot, observations = await fixture_scan(spec)
+    snapshot, observations = await fixture_scan(spec, config=config)
     direction_name = str(
         spec.get("direction", RouteDirection.LONG_RISEX_SHORT_HEDGE.value)
     )
@@ -270,7 +279,7 @@ async def run_fixture(
     winner = snapshot.winner
     assert winner is not None
     attempt_id = str(spec.get("attempt_id", "fixture-attempt"))
-    broker = PaperEntryBroker()
+    broker = PaperEntryBroker(config=config)
     state = await broker.activate(
         snapshot, attempt_id=attempt_id, activated_at=snapshot.logical_at
     )
@@ -418,7 +427,8 @@ async def run_fixture(
 
 
 async def _restart_fixture(
-    spec: dict[str, object], repository: PaperRepository
+    spec: dict[str, object],
+    repository: PaperRepository,
 ) -> dict[str, object]:
     runtime = repository.load_runtime()
     if runtime is None:

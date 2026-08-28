@@ -210,9 +210,9 @@ def _quote_for_open_time(
 
 def _route_rank_key(plan: RoutePlan) -> tuple[object, ...]:
     assert plan.route is not None and plan.target_cycle is not None
-    assert plan.planned_maker_net_pnl_usd is not None
+    assert plan.test_adjusted_expected_pnl_usd is not None
     return (
-        -plan.planned_maker_net_pnl_usd,
+        -plan.test_adjusted_expected_pnl_usd,
         -plan.route.route_liquidity_usd,
         plan.target_cycle.start_at,
         plan.canonical_asset,
@@ -259,7 +259,7 @@ def _route_row(
     risex_funding = None if plan.target_cycle is None else plan.target_cycle.risex_event.expected_cash_usd
     hedge_funding = None if plan.target_cycle is None else plan.target_cycle.hedge_event.expected_cash_usd
     fee_split = planned_fee_split(plan, config=config)
-    return {
+    row = {
         "rank": rank,
         "route_key": f"{plan.canonical_asset}|{plan.hedge_venue.value}|{plan.direction.value}",
         "canonical_asset": plan.canonical_asset,
@@ -354,6 +354,26 @@ def _route_row(
         },
         "assumption_flags": _assumption_flags(),
     }
+    if plan.synthetic_test_pnl_overlay_usd != Decimal("0"):
+        row.update({
+            "synthetic_test_enabled": True,
+            "synthetic_test_label": "SYNTHETIC TEST",
+            "raw_expected_pnl_usd": (
+                None
+                if plan.raw_expected_pnl_usd is None
+                else str(plan.raw_expected_pnl_usd)
+            ),
+            "synthetic_test_pnl_overlay_usd": str(
+                plan.synthetic_test_pnl_overlay_usd
+            ),
+            "test_adjusted_expected_pnl_usd": (
+                None
+                if plan.test_adjusted_expected_pnl_usd is None
+                else str(plan.test_adjusted_expected_pnl_usd)
+            ),
+            "realized_pnl_includes_synthetic_test_overlay": False,
+        })
+    return row
 
 
 class PublicPaperRuntime:
@@ -820,7 +840,12 @@ class PublicPaperRuntime:
             return
         plan = snapshot.winner
         at = snapshot.logical_at
-        if plan is None or plan.target_cycle is None or plan.planned_maker_net_pnl_usd is None:
+        if (
+            plan is None
+            or plan.target_cycle is None
+            or plan.raw_expected_pnl_usd is None
+            or plan.test_adjusted_expected_pnl_usd is None
+        ):
             self.notifications.opportunity(
                 None,
                 NotificationPayload(
@@ -833,20 +858,39 @@ class PublicPaperRuntime:
         risex_side = "LONG" if plan.direction is RouteDirection.LONG_RISEX_SHORT_HEDGE else "SHORT"
         hedge_side = "SHORT" if risex_side == "LONG" else "LONG"
         route = f"RISEx {risex_side} / {plan.hedge_venue.value} {hedge_side}"
-        pnl = plan.planned_maker_net_pnl_usd
-        cents = str(pnl.quantize(Decimal("0.01")))
+        pnl = plan.raw_expected_pnl_usd
+        adjusted = plan.test_adjusted_expected_pnl_usd
+        overlay = plan.synthetic_test_pnl_overlay_usd
+        cents = str(
+            (adjusted if overlay != Decimal("0") else pnl).quantize(Decimal("0.01"))
+        )
         state = (f"{plan.canonical_asset}:{route}", plan.target_cycle.cycle_id, cents)
         scan_utc = utc_time(at).isoformat()
+        if overlay != Decimal("0"):
+            text = (
+                f"{plan.canonical_asset} | {route} | SYNTHETIC TEST (not realized) | "
+                f"Raw expected PnL: ${format_telegram_money(pnl)} | "
+                f"Overlay: +${format_telegram_money(overlay)} | "
+                f"Adjusted test expected PnL: ${format_telegram_money(adjusted)} | "
+                f"Scan UTC: {scan_utc}"
+            )
+        else:
+            text = (
+                f"{plan.canonical_asset} | {route} | "
+                f"Expected PnL: ${format_telegram_money(pnl)} | "
+                f"Scan UTC: {scan_utc}"
+            )
         self.notifications.opportunity(
             state,
             NotificationPayload(
                 f"opportunity:{state[0]}:{state[1]}:{state[2]}:{at.isoformat()}",
                 "ELIGIBLE_OPPORTUNITY", utc_time(at),
-                f"{plan.canonical_asset} | {route} | "
-                f"Expected PnL: ${format_telegram_money(pnl)} | "
-                f"Scan UTC: {scan_utc}",
+                text,
                 ticker=plan.canonical_asset, route=route,
                 planned_maker_net_pnl_usd=pnl,
+                raw_expected_pnl_usd=pnl,
+                synthetic_test_pnl_overlay_usd=overlay,
+                test_adjusted_expected_pnl_usd=adjusted,
             ),
         )
 
@@ -1826,6 +1870,10 @@ class PublicPaperRuntime:
         persist_scan = (
             self.last_scan is None or self.last_scan.logical_at != logical_at
         )
+        if persist_scan:
+            self.repository.ensure_synthetic_test_configuration(
+                self.config.synthetic_test_pnl_overlay_usd
+            )
         self.last_scan = snapshot
         if persist_scan:
             self.repository.save_decision(
@@ -1860,7 +1908,7 @@ class PublicPaperRuntime:
         rankable = [
             plan for plan in snapshot.evaluations
             if plan.route is not None and plan.target_cycle is not None
-            and plan.planned_maker_net_pnl_usd is not None
+            and plan.test_adjusted_expected_pnl_usd is not None
         ]
         rankable.sort(key=_route_rank_key)
         ranks = {id(plan): index for index, plan in enumerate(rankable, 1)}
@@ -1892,7 +1940,7 @@ class PublicPaperRuntime:
             if not state.available
         }
 
-        return {
+        result = {
             "scan_at": logical_at.astimezone(UTC).isoformat(),
             "status": "OPPORTUNITY" if snapshot.winner is not None else "NO_TRADE",
             "reason": (
@@ -1931,6 +1979,16 @@ class PublicPaperRuntime:
             },
             "assumption_flags": _assumption_flags(),
         }
+        if self.config.synthetic_test_pnl_overlay_usd != Decimal("0"):
+            result["synthetic_test"] = {
+                "label": "SYNTHETIC TEST",
+                "enabled": True,
+                "overlay_usd": str(self.config.synthetic_test_pnl_overlay_usd),
+                "raw_expected_pnl_field": "raw_expected_pnl_usd",
+                "adjusted_expected_pnl_field": "test_adjusted_expected_pnl_usd",
+                "realized_accounting_includes_overlay": False,
+            }
+        return result
 
     async def _refresh_public_data(self) -> None:
         assert self.adapters is not None
@@ -5224,6 +5282,7 @@ async def public_scan_once(
     session_factory: Callable[[], aiohttp.ClientSession] = _public_session,
     clock: Clock | None = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    config: PaperConfig = PAPER_CONFIG,
 ) -> dict[str, object]:
     async with PublicPaperRuntime(
         repository,
@@ -5231,6 +5290,7 @@ async def public_scan_once(
         session_factory=session_factory,
         clock=clock,
         sleep=sleep,
+        config=config,
     ) as runtime:
         result = await runtime.scan()
         runtime.accepting_entries = False
@@ -5246,6 +5306,7 @@ async def public_paper_run(
     stop_event: asyncio.Event | None = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     notifications: NotificationOutbox | None = None,
+    config: PaperConfig = PAPER_CONFIG,
 ) -> dict[str, object]:
     if notifications is not None:
         await notifications.start()
@@ -5257,6 +5318,7 @@ async def public_paper_run(
             clock=clock,
             sleep=sleep,
             notifications=notifications,
+            config=config,
         ) as runtime:
             return await runtime.run(stop_event=stop_event)
     finally:

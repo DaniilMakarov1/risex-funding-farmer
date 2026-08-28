@@ -40,6 +40,9 @@ class NotificationPayload:
     planned_maker_net_pnl_usd: Decimal | None = None
     final_pnl_usd: Decimal | None = None
     parse_mode: str | None = None
+    raw_expected_pnl_usd: Decimal | None = None
+    synthetic_test_pnl_overlay_usd: Decimal | None = None
+    test_adjusted_expected_pnl_usd: Decimal | None = None
 
     def __post_init__(self) -> None:
         if self.occurred_at.tzinfo is None:
@@ -118,29 +121,36 @@ def full_scan_digest_payloads(
         else:
             route = f"RISEx UNKNOWN / {hedge} UNKNOWN"
         route = _bounded_digest_field(route, 112)
-        pnl = row.get("planned_maker_net_pnl_usd")
-        pnl_display = format_telegram_money(
-            None if pnl is None else str(pnl)
-        )
-        if pnl_display == "UNKNOWN":
-            blockers = row.get("blockers")
-            blocker = (
-                str(blockers[0])
-                if isinstance(blockers, (list, tuple)) and blockers
-                else "AUTHORITATIVE_VALUE_UNAVAILABLE"
-            )
-            pnl_value = f"UNKNOWN — {_unknown_digest_label(blocker)}"
+        synthetic_pnl_value = _synthetic_test_digest_value(row)
+        if synthetic_pnl_value is not None:
+            pnl_value = synthetic_pnl_value
         else:
-            pnl_value = f"${pnl_display}"
-        pnl_value = _bounded_digest_field(pnl_value, 92)
+            pnl = row.get("planned_maker_net_pnl_usd")
+            pnl_display = format_telegram_money(
+                None if pnl is None else str(pnl)
+            )
+            if pnl_display == "UNKNOWN":
+                blockers = row.get("blockers")
+                blocker = (
+                    str(blockers[0])
+                    if isinstance(blockers, (list, tuple)) and blockers
+                    else "AUTHORITATIVE_VALUE_UNAVAILABLE"
+                )
+                pnl_value = f"UNKNOWN — {_unknown_digest_label(blocker)}"
+            else:
+                pnl_value = f"${pnl_display}"
+        pnl_value = _bounded_digest_field(
+            pnl_value, 240 if synthetic_pnl_value is not None else 92
+        )
         funding_field = format_telegram_funding_countdown(
             row.get("target_cycle_start"), scan_utc
         )
         funding_value = funding_field.removeprefix("Funding in: ")
+        value_label = "Test economics" if synthetic_pnl_value is not None else "PnL"
         route_cards.append(
             f"<b>{rank}. {_escape_digest_field(ticker)}</b> — "
             f"{_escape_digest_field(route)}\n"
-            f"PnL: <code>{_escape_digest_field(pnl_value)}</code> | "
+            f"{value_label}: <code>{_escape_digest_field(pnl_value)}</code> | "
             f"Funding in: <code>{_escape_digest_field(funding_value)}</code>"
         )
     scan_display = _escape_digest_field(scan_utc.isoformat())
@@ -177,6 +187,42 @@ def full_scan_digest_payloads(
             parse_mode=TELEGRAM_HTML_PARSE_MODE,
         ))
     return tuple(payloads)
+
+
+def _synthetic_test_digest_value(row: Mapping[str, object]) -> str | None:
+    """Render the opt-in values without presenting them as realized PnL."""
+    raw_overlay = row.get("synthetic_test_pnl_overlay_usd")
+    try:
+        overlay = raw_overlay if isinstance(raw_overlay, Decimal) else Decimal(str(raw_overlay))
+    except (ArithmeticError, TypeError, ValueError):
+        return None
+    if not overlay.is_finite() or overlay.is_zero():
+        return None
+    raw = row.get("raw_expected_pnl_usd", row.get("planned_maker_net_pnl_usd"))
+    adjusted = row.get("test_adjusted_expected_pnl_usd")
+    if adjusted is None and raw is not None:
+        try:
+            adjusted = Decimal(str(raw)) + overlay
+        except (ArithmeticError, TypeError, ValueError):
+            adjusted = None
+
+    def money(value: object | None) -> str:
+        rendered = format_telegram_money(
+            None if value is None else str(value)
+        )
+        return rendered if rendered == "UNKNOWN" else f"${rendered}"
+
+    overlay_display = format_telegram_money(overlay)
+    overlay_label = (
+        "UNKNOWN" if overlay_display == "UNKNOWN"
+        else f"+${overlay_display}" if overlay > 0
+        else f"${overlay_display}"
+    )
+    return (
+        "SYNTHETIC TEST (not realized) | "
+        f"Raw expected: {money(raw)} | Overlay: {overlay_label} | "
+        f"Adjusted test expected: {money(adjusted)}"
+    )
 
 
 def _unknown_digest_label(blocker: str) -> str:

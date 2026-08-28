@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from typing import Iterable
 
 from .config import PAPER_CONFIG, PaperConfig
@@ -51,6 +51,28 @@ LIQUIDITY_BUCKETS = (
     ">= $10m",
     "UNKNOWN",
 )
+
+
+def test_adjusted_expected_pnl_usd(
+    raw_expected_pnl_usd: Decimal | None,
+    synthetic_test_pnl_overlay_usd: Decimal,
+) -> Decimal | None:
+    """Apply the opt-in paper-only experiment amount without changing raw PnL."""
+    if raw_expected_pnl_usd is None:
+        return None
+    if (
+        type(synthetic_test_pnl_overlay_usd) is not Decimal
+        or not synthetic_test_pnl_overlay_usd.is_finite()
+    ):
+        raise ValueError("synthetic test overlay must be a finite Decimal")
+    # Give the addition enough precision to retain the exact cents overlay
+    # even when a caller has installed a small process-wide Decimal context.
+    raw_digits = len(raw_expected_pnl_usd.as_tuple().digits)
+    overlay_digits = len(synthetic_test_pnl_overlay_usd.as_tuple().digits)
+    magnitude = max(raw_expected_pnl_usd.adjusted(), 0)
+    with localcontext() as context:
+        context.prec = max(28, raw_digits + overlay_digits + magnitude + 2)
+        return raw_expected_pnl_usd + synthetic_test_pnl_overlay_usd
 
 
 def liquidity_bucket(value: Decimal | None) -> str:
@@ -129,14 +151,42 @@ class RoutePlan:
     bbo_spread_usd: Decimal | None = None
     taker_slippage_usd: Decimal | None = None
     freshness_age_seconds: Decimal | None = None
+    synthetic_test_pnl_overlay_usd: Decimal = Decimal("0")
+    raw_expected_pnl_usd: Decimal | None = None
+    test_adjusted_expected_pnl_usd: Decimal | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.synthetic_test_pnl_overlay_usd) is not Decimal
+            or not self.synthetic_test_pnl_overlay_usd.is_finite()
+        ):
+            raise ValueError("synthetic test overlay must be a finite Decimal")
+        raw = self.planned_maker_net_pnl_usd
+        object.__setattr__(self, "raw_expected_pnl_usd", raw)
+        object.__setattr__(
+            self,
+            "test_adjusted_expected_pnl_usd",
+            test_adjusted_expected_pnl_usd(
+                raw, self.synthetic_test_pnl_overlay_usd
+            ),
+        )
+
+    def _adjusted_expected_pnl(self) -> Decimal | None:
+        adjusted = getattr(self, "test_adjusted_expected_pnl_usd", None)
+        if adjusted is not None:
+            return adjusted
+        return test_adjusted_expected_pnl_usd(
+            getattr(self, "planned_maker_net_pnl_usd", None),
+            getattr(self, "synthetic_test_pnl_overlay_usd", Decimal("0")),
+        )
 
     @property
     def entry_allowed(self) -> bool:
-        return not self.no_trade_reasons and self.planned_maker_net_pnl_usd is not None
+        return not self.no_trade_reasons and self._adjusted_expected_pnl() is not None
 
     @property
     def universe_eligible(self) -> bool:
-        return self.planned_maker_net_pnl_usd is not None and all(
+        return self._adjusted_expected_pnl() is not None and all(
             reason == NoTradeReason.PLANNED_NET_PNL_NEGATIVE
             for reason in self.no_trade_reasons
         )
@@ -354,6 +404,7 @@ def _empty_plan(
     reasons: Iterable[str],
     *,
     route: Route | None = None,
+    config: PaperConfig = PAPER_CONFIG,
 ) -> RoutePlan:
     return RoutePlan(
         canonical_asset=risex.market.canonical_asset,
@@ -378,6 +429,7 @@ def _empty_plan(
         executable_unwind_net_pnl_usd=None,
         no_trade_reasons=tuple(dict.fromkeys(reasons)),
         freshness_age_seconds=_freshness_age_seconds(risex, hedge, logical_at),
+        synthetic_test_pnl_overlay_usd=config.synthetic_test_pnl_overlay_usd,
     )
 
 
@@ -528,21 +580,25 @@ def evaluate_route(
             reasons.append(NoTradeReason.FUNDING_ELIGIBILITY_UNKNOWN)
     if reasons:
         return _empty_plan(
-            risex, hedge, direction, logical_at, reasons, route=route
+            risex, hedge, direction, logical_at, reasons,
+            route=route, config=config,
         )
 
     if route_liquidity is None:
         return _empty_plan(
-            risex, hedge, direction, logical_at, (NoTradeReason.VOLUME_UNKNOWN,)
+            risex, hedge, direction, logical_at, (NoTradeReason.VOLUME_UNKNOWN,),
+            config=config,
         )
     if risex.book is None or hedge.book is None:
         return _empty_plan(
-            risex, hedge, direction, logical_at, (NoTradeReason.BOOK_UNHEALTHY,)
+            risex, hedge, direction, logical_at, (NoTradeReason.BOOK_UNHEALTHY,),
+            config=config,
         )
     if risex.funding is None or hedge.funding is None:
         return _empty_plan(
             risex, hedge, direction, logical_at,
             (NoTradeReason.FUNDING_ELIGIBILITY_UNKNOWN,),
+            config=config,
         )
     try:
         risex_bid, risex_ask = _best_prices(risex.book)
@@ -563,6 +619,7 @@ def evaluate_route(
             logical_at,
             (NoTradeReason.INVALID_BBO,),
             route=route,
+            config=config,
         )
 
     quotes = (risex.funding, hedge.funding)
@@ -592,7 +649,8 @@ def evaluate_route(
         reasons.append(NoTradeReason.TARGET_CYCLE_ELAPSED)
     if reasons:
         return _empty_plan(
-            risex, hedge, direction, logical_at, reasons, route=route
+            risex, hedge, direction, logical_at, reasons,
+            route=route, config=config,
         )
 
     if (
@@ -604,6 +662,7 @@ def evaluate_route(
         return _empty_plan(
             risex, hedge, direction, logical_at,
             (NoTradeReason.PARITY_OR_MULTIPLIER_UNKNOWN,), route=route,
+            config=config,
         )
     try:
         common_step = common_canonical_quantity_step(
@@ -620,6 +679,7 @@ def evaluate_route(
             logical_at,
             (NoTradeReason.NO_COMMON_EXECUTABLE_QUANTITY,),
             route=route,
+            config=config,
         )
     hedge_entry_price = (
         hedge_sell_maker
@@ -642,6 +702,7 @@ def evaluate_route(
             logical_at,
             (NoTradeReason.NO_COMMON_EXECUTABLE_QUANTITY,),
             route=route,
+            config=config,
         )
 
     risex_entry_side = (
@@ -671,6 +732,7 @@ def evaluate_route(
             logical_at,
             (NoTradeReason.INSUFFICIENT_EXACT_DEPTH,),
             route=route,
+            config=config,
         )
     if not all(
         result.is_executable
@@ -683,6 +745,7 @@ def evaluate_route(
             logical_at,
             (NoTradeReason.INSUFFICIENT_EXACT_DEPTH,),
             route=route,
+            config=config,
         )
     if (
         risex_entry.price is None or risex_exit.price is None
@@ -691,6 +754,7 @@ def evaluate_route(
         return _empty_plan(
             risex, hedge, direction, logical_at,
             (NoTradeReason.INSUFFICIENT_EXACT_DEPTH,), route=route,
+            config=config,
         )
     if not (
         minimum_order_eligible(quantity, risex_entry.price, risex.market)
@@ -705,6 +769,7 @@ def evaluate_route(
             logical_at,
             (NoTradeReason.MINIMUM_ORDER,),
             route=route,
+            config=config,
         )
 
     cycle, expected_funding = _target_cycle(
@@ -741,6 +806,9 @@ def evaluate_route(
     planned_fees = planned_entry_fees + planned_exit_fees
     planned_net = planned_maker_net_pnl_usd(
         expected_funding, execution, (planned_fees,)
+    )
+    adjusted_net = test_adjusted_expected_pnl_usd(
+        planned_net, config.synthetic_test_pnl_overlay_usd
     )
 
     hedge_unwind_price = (
@@ -801,7 +869,7 @@ def evaluate_route(
         Decimal("0"),
     )
     unwind_net = unwind_execution - unwind_fees
-    if planned_net < config.paper_entry_min_planned_net_pnl_usd:
+    if adjusted_net is None or adjusted_net < config.paper_entry_min_planned_net_pnl_usd:
         reasons.append(NoTradeReason.PLANNED_NET_PNL_NEGATIVE)
     return RoutePlan(
         canonical_asset=route.canonical_asset,
@@ -828,15 +896,17 @@ def evaluate_route(
         bbo_spread_usd=bbo_spread_usd,
         taker_slippage_usd=taker_slippage_usd,
         freshness_age_seconds=_freshness_age_seconds(risex, hedge, logical_at),
+        synthetic_test_pnl_overlay_usd=config.synthetic_test_pnl_overlay_usd,
+        test_adjusted_expected_pnl_usd=adjusted_net,
     )
 
 
 def _rank_key(plan: RoutePlan) -> tuple[object, ...]:
     assert plan.route is not None
     assert plan.target_cycle is not None
-    assert plan.planned_maker_net_pnl_usd is not None
+    assert plan.test_adjusted_expected_pnl_usd is not None
     return (
-        -plan.planned_maker_net_pnl_usd,
+        -plan.test_adjusted_expected_pnl_usd,
         -plan.route.route_liquidity_usd,
         plan.target_cycle.start_at,
         plan.canonical_asset,

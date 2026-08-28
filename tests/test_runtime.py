@@ -16,7 +16,7 @@ from risex_farmer.exchanges.base import PublicAdapter, PublicDataUnavailable
 from risex_farmer.exchanges.extended import ExtendedAdapter
 from risex_farmer.exchanges.nado import NadoAdapter
 from risex_farmer.exchanges.risex import RisexAdapter
-from risex_farmer.config import PAPER_CONFIG
+from risex_farmer.config import PAPER_CONFIG, SYNTHETIC_TEST_OVERLAY_USD
 from risex_farmer.models import (
     BookLevel,
     BookDelta,
@@ -1615,6 +1615,85 @@ async def test_full_scan_digest_never_emits_for_other_scan_kinds(tmp_path):
                 await runtime.scan(scan_kind=kind)
                 clock.advance(1)
     assert not [row for row in delivery.rows if row.kind == "FULL_SCAN_DIGEST"]
+
+
+@pytest.mark.asyncio
+async def test_synthetic_test_persists_separate_route_evidence_and_labels_digest(tmp_path):
+    clock = FakeClock()
+    config = replace(
+        PAPER_CONFIG,
+        synthetic_test_pnl_overlay_usd=SYNTHETIC_TEST_OVERLAY_USD,
+    )
+    delivery = CaptureNotifications()
+    with PaperRepository(tmp_path / "synthetic-route-evidence.db") as repository:
+        async with PublicPaperRuntime(
+            repository,
+            adapters=adapters(clock, settlement_at=NOW + timedelta(minutes=5)),
+            clock=clock,
+            config=config,
+            notifications=NotificationOutbox(delivery),
+        ) as runtime:
+            result = await runtime.scan(scan_kind="FULL")
+            winner = runtime.last_scan.winner
+            assert winner is not None
+            winner_row = next(
+                row for row in result["routes"]
+                if row["route_key"] == (
+                    f"{winner.canonical_asset}|{winner.hedge_venue.value}|"
+                    f"{winner.direction.value}"
+                )
+            )
+        report = repository.report(as_of=NOW)
+
+    assert result["synthetic_test"] == {
+        "label": "SYNTHETIC TEST",
+        "enabled": True,
+        "overlay_usd": "0.50",
+        "raw_expected_pnl_field": "raw_expected_pnl_usd",
+        "adjusted_expected_pnl_field": "test_adjusted_expected_pnl_usd",
+        "realized_accounting_includes_overlay": False,
+    }
+    assert winner_row["raw_expected_pnl_usd"] == winner_row["planned_maker_net_pnl_usd"]
+    assert winner_row["synthetic_test_pnl_overlay_usd"] == "0.50"
+    assert D(winner_row["test_adjusted_expected_pnl_usd"]) == (
+        D(winner_row["raw_expected_pnl_usd"]) + D("0.50")
+    )
+    assert winner_row["realized_pnl_includes_synthetic_test_overlay"] is False
+    assert report["synthetic_test"]["label"] == "SYNTHETIC TEST"
+    assert report["synthetic_test"]["realized_accounting_includes_overlay"] is False
+    assert report["latest_routes"] == result["routes"]
+    assert any(
+        "SYNTHETIC TEST (not realized)" in payload.text
+        and "Test economics:" in payload.text
+        and "Raw expected:" in payload.text
+        and "Overlay: +$0.50" in payload.text
+        and "Adjusted test expected:" in payload.text
+        for payload in delivery.rows
+        if payload.kind == "FULL_SCAN_DIGEST"
+    )
+
+
+@pytest.mark.asyncio
+async def test_synthetic_test_config_identity_and_actual_accounting_remain_separate(tmp_path):
+    config = replace(
+        PAPER_CONFIG,
+        synthetic_test_pnl_overlay_usd=SYNTHETIC_TEST_OVERLAY_USD,
+    )
+    with PaperRepository(tmp_path / "synthetic-config.db") as repository:
+        result = await run_fixture(
+            {"scenario": "negative_closed", "attempt_id": "synthetic-negative"},
+            repository,
+            config=config,
+        )
+        assert result["status"] == "CLOSED"
+        with pytest.raises(ValueError, match="configuration identity conflict"):
+            repository.ensure_synthetic_test_configuration(Decimal("0"))
+        report = repository.report(as_of=NOW + timedelta(minutes=10))
+
+    assert report["actual_pair_pnl_usd"] == "-10"
+    assert report["actual_fees_usd"] == "0.21000"
+    assert report["simulated_closed_net_pnl_usd"] == "-10.21000"
+    assert report["synthetic_test"]["overlay_usd"] == "0.50"
 
 
 @pytest.mark.asyncio

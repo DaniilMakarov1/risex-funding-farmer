@@ -4,6 +4,10 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 
+SYNTHETIC_TEST_OVERLAY_USD = Decimal("0.50")
+_DISABLED_SYNTHETIC_TEST_OVERLAY_USD = Decimal("0")
+
+
 @dataclass(frozen=True, slots=True)
 class PaperConfig:
     paper_balance_usd: Decimal = Decimal("10000")
@@ -36,6 +40,32 @@ class PaperConfig:
     btc_eth_hard_basis_expansion_rate: Decimal = Decimal("0.04")
     other_asset_hard_basis_expansion_rate: Decimal = Decimal("0.06")
     risex_paper_fallback_assumptions_enabled: bool = True
+    synthetic_test_pnl_overlay_usd: Decimal = _DISABLED_SYNTHETIC_TEST_OVERLAY_USD
+
+    def __post_init__(self) -> None:
+        overlay = self.synthetic_test_pnl_overlay_usd
+        if (
+            type(overlay) is not Decimal
+            or not overlay.is_finite()
+            or overlay not in {
+                _DISABLED_SYNTHETIC_TEST_OVERLAY_USD,
+                SYNTHETIC_TEST_OVERLAY_USD,
+            }
+        ):
+            raise ValueError(
+                "synthetic_test_pnl_overlay_usd must be exactly 0 or 0.50"
+            )
+        # Keep the persisted/runtime identity canonical even if the caller
+        # supplies equivalent Decimal exponent formatting such as 0.500.
+        object.__setattr__(
+            self,
+            "synthetic_test_pnl_overlay_usd",
+            (
+                SYNTHETIC_TEST_OVERLAY_USD
+                if overlay == SYNTHETIC_TEST_OVERLAY_USD
+                else _DISABLED_SYNTHETIC_TEST_OVERLAY_USD
+            ),
+        )
 
 
 PAPER_CONFIG = PaperConfig()

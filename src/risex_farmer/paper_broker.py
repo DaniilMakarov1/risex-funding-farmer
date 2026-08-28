@@ -638,8 +638,8 @@ class PaperEntryBroker:
             ):
                 return self._cancel_locked(CancellationReason.ROUTE_INVALID, evaluated_at)
             if (
-                refreshed_plan.planned_maker_net_pnl_usd is None
-                or refreshed_plan.planned_maker_net_pnl_usd
+                refreshed_plan.test_adjusted_expected_pnl_usd is None
+                or refreshed_plan.test_adjusted_expected_pnl_usd
                 < self.config.paper_entry_min_planned_net_pnl_usd
             ):
                 return self._cancel_locked(
