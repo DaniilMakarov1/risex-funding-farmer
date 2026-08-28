@@ -2,7 +2,7 @@
 
 ## Temporary six-hour synthetic-opportunity experiment
 
-Status: `BLOCKED — FIRST SIX-HOUR ATTEMPT STOPPED RUNTIME_FATAL ON THE SHARED-SCAN ACTIVATION TIMESTAMP GATE; ZERO FILLS/POSITIONS; CORRECTION REQUIRED; NO VENUE WRITE IN FLIGHT`.
+Status: `CORRECTION ACCEPTED AT 9dad61d00af422598e1f9280ddf30bb3e286b51c — FRESH SHORT LIVE ACTIVATION-BOUNDARY VALIDATION NEXT; NO VENUE WRITE IN FLIGHT`.
 
 Objective: observe PAPER and, only after every existing Level-B/C gate passes, testnet behavior for `RISEx–Nado` and `RISEx–Extended` before, during, and after real funding boundaries when test selection adds exactly `$0.50` to each route's calculated expected PnL.
 
@@ -23,6 +23,7 @@ Observed correction slice:
 
 - Preserve `mainnet-shadow-synthetic-all-routes-20260828-chief20-6h.db` as an immutable failed-run artifact. It reached `PAPER_RUN_READY`, persisted 28 snapshots and two `CANCELLED` virtual entry orders, then stopped `RUNTIME_FATAL` at `2026-08-28T20:59:06Z` with the exact sanitized exception `ValueError: activation must use the shared scan timestamp`; integrity is `ok`, fills/positions/funding settlements are `0/0/0`, and the six-hour window is not credited.
 - One fresh visible Builder must reproduce and correct only the live activation/refresh coordination defect. The correction must retain the shared logical scan timestamp invariant, deterministic ranking/route lock, exact activation/cutoff semantics, overlay separation, no stale-plan activation, and default-zero behavior. Add a cancellation/rescheduling adverse regression matching the observed FULL/focused overlap, then run focused/adverse and one clean Python 3.11 full suite. Do not resume the failed database or start another six-hour window before independent Chief acceptance.
+- Accepted main `9dad61d00af422598e1f9280ddf30bb3e286b51c` satisfies the correction slice and the additional stale-fill interleaving found in Chief review. Before the replacement six-hour window, run one fresh bounded public-only validation across an actual activation/cutoff segment with the `$0.50` overlay and protected outbound Telegram delivery. Acceptance requires no runtime fatal, no stale fill after disconnect, coherent activation timestamps, SQLite integrity `ok`, and no open paper position at the bounded stop; preserve and do not resume any failed validation database.
 
 ## Two-route testnet funding-boundary lifecycles
 
