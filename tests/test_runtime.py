@@ -2277,6 +2277,138 @@ async def test_scheduling_full_focused_activation_and_strict_cutoff(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_full_refresh_focus_cancellation_recreation_keeps_activation_timestamp_coherent(
+    tmp_path,
+):
+    clock = FakeClock()
+    target = NOW + timedelta(seconds=150)
+    blocked = GatedAdapter(Venue.RISEX, clock, settlement_at=target)
+    fakes = adapters(clock, settlement_at=target)
+    fakes[Venue.RISEX] = blocked
+
+    with PaperRepository(tmp_path / "activation-refresh-race.db") as repository:
+        async with PublicPaperRuntime(repository, adapters=fakes, clock=clock) as runtime:
+            await runtime.scan()
+            confirm_public_streams(runtime, clock.now())
+            await runtime.scan(
+                refresh=False, scan_kind="FOCUSED", scheduled_at=clock.now()
+            )
+            assert runtime.last_scan is not None
+            assert runtime.last_scan.winner is not None
+            runtime.focused_cycle = runtime.last_scan.winner.target_cycle
+            activation_at = target - timedelta(seconds=120)
+            runtime.next_focused_scan_at = activation_at
+            runtime.next_full_scan_at = target + timedelta(hours=1)
+            runtime.next_health_check_at = target + timedelta(hours=1)
+            runtime._startup_gate_satisfied = True
+
+            clock.value = activation_at
+            confirm_public_streams(runtime, clock.now())
+            await runtime.tick()
+            assert runtime.broker is not None
+
+            full_at = NOW + timedelta(seconds=60)
+            runtime.next_full_scan_at = full_at
+            runtime.next_focused_scan_at = full_at
+            blocked.block_catalog = True
+            risex_key = Venue.RISEX, blocked.market.venue_symbol
+            runtime.coordinator.stream(*risex_key).disconnected()
+            runtime._live_book_ready.discard(risex_key)
+            clock.value = full_at
+            confirm_public_streams(runtime, clock.now())
+            full_tick = asyncio.create_task(runtime.tick())
+            await blocked.request_started.wait()
+            await full_tick
+            assert runtime.broker is None
+
+            confirm_public_streams(runtime, clock.now())
+            blocked.block_catalog = False
+            blocked.gate.set()
+            refresh = runtime._refresh_task
+            assert refresh is not None
+            await refresh
+            runtime._refresh_task = None
+            runtime._pending_full_scan_at = None
+            runtime._pending_full_deadline_at = None
+            runtime.next_full_scan_at = target + timedelta(hours=1)
+            await runtime.scan(
+                refresh=False, scan_kind="FULL", scheduled_at=full_at
+            )
+            assert runtime.last_scan is not None
+            assert runtime.last_scan.logical_at == full_at
+            assert runtime.last_scan.winner is not None
+            assert runtime.next_focused_scan_at == full_at + timedelta(seconds=10)
+
+            clock.value = full_at + timedelta(seconds=1)
+            await runtime.tick()
+            assert runtime.broker is not None
+            assert runtime.broker.state.order is not None
+            assert runtime.broker.state.order.created_at == clock.now()
+            activations = repository.connection.execute(
+                "SELECT COUNT(*) FROM runtime_evidence "
+                "WHERE event_type='PAPER_ENTRY_ACTIVATED'"
+            ).fetchone()[0]
+            orders = repository.connection.execute(
+                "SELECT COUNT(*) FROM orders"
+            ).fetchone()[0]
+            fills = repository.connection.execute(
+                "SELECT COUNT(*) FROM fills"
+            ).fetchone()[0]
+
+    assert activations == 2
+    assert orders == 2
+    assert fills == 0
+
+
+@pytest.mark.asyncio
+async def test_activation_fails_closed_when_current_scan_cannot_be_published(
+    tmp_path, monkeypatch,
+):
+    clock = FakeClock()
+    target = NOW + timedelta(seconds=150)
+    with PaperRepository(tmp_path / "activation-no-current-scan.db") as repository:
+        async with PublicPaperRuntime(
+            repository,
+            adapters=adapters(clock, settlement_at=target),
+            clock=clock,
+        ) as runtime:
+            await runtime.scan()
+            confirm_public_streams(runtime, clock.now())
+            await runtime.scan(
+                refresh=False, scan_kind="FOCUSED", scheduled_at=clock.now()
+            )
+            assert runtime.last_scan is not None
+            assert runtime.last_scan.winner is not None
+            runtime.focused_cycle = runtime.last_scan.winner.target_cycle
+            activation_at = target - timedelta(seconds=120)
+            runtime.next_focused_scan_at = activation_at + timedelta(seconds=10)
+            runtime.next_full_scan_at = target + timedelta(hours=1)
+            runtime.next_health_check_at = target + timedelta(hours=1)
+            runtime._startup_gate_satisfied = True
+
+            async def missing_scan(**_kwargs):
+                return {}
+
+            monkeypatch.setattr(runtime, "scan", missing_scan)
+            clock.value = activation_at
+            confirm_public_streams(runtime, clock.now())
+            await runtime.tick()
+            blocked = repository.connection.execute(
+                "SELECT detail FROM runtime_evidence "
+                "WHERE event_type='PAPER_ENTRY_ACTIVATION_BLOCKED'"
+            ).fetchone()
+            activated = repository.connection.execute(
+                "SELECT COUNT(*) FROM runtime_evidence "
+                "WHERE event_type='PAPER_ENTRY_ACTIVATED'"
+            ).fetchone()[0]
+
+    assert runtime.broker is None
+    assert activated == 0
+    assert blocked is not None
+    assert json.loads(blocked[0])["reason"] == "CURRENT_SHARED_SCAN_NOT_PUBLISHED"
+
+
+@pytest.mark.asyncio
 async def test_focused_and_active_ticks_make_zero_rest_calls_through_cutoff(tmp_path):
     clock = FakeClock()
     target = NOW + timedelta(seconds=300)

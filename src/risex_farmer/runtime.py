@@ -466,6 +466,8 @@ class PublicPaperRuntime:
         self._stop_cause: str | None = None
         self._requested_at: datetime | None = None
         self._background_fatal: BaseException | None = None
+        self._scan_coordination_lock = asyncio.Lock()
+        self._scan_revision = 0
         self._position_event_lock = asyncio.Lock()
         self._shutdown_started = False
         self._startup_gate_satisfied = False
@@ -1773,6 +1775,20 @@ class PublicPaperRuntime:
         scan_kind: str = "INITIAL",
         scheduled_at: datetime | None = None,
     ) -> dict[str, object]:
+        async with self._scan_coordination_lock:
+            return await self._scan_unlocked(
+                refresh=refresh,
+                scan_kind=scan_kind,
+                scheduled_at=scheduled_at,
+            )
+
+    async def _scan_unlocked(
+        self,
+        *,
+        refresh: bool = True,
+        scan_kind: str = "INITIAL",
+        scheduled_at: datetime | None = None,
+    ) -> dict[str, object]:
         if self.adapters is None:
             raise RuntimeError("runtime must be entered before scanning")
         started_at = self.clock.now()
@@ -1875,6 +1891,7 @@ class PublicPaperRuntime:
                 self.config.synthetic_test_pnl_overlay_usd
             )
         self.last_scan = snapshot
+        self._scan_revision += 1
         if persist_scan:
             self.repository.save_decision(
                 recorded_at=logical_at,
@@ -2351,6 +2368,60 @@ class PublicPaperRuntime:
         )
         self._record("OPEN_POSITION_RESTORED", at=at)
 
+    async def _coherent_activation_snapshot(
+        self, *, now: datetime
+    ) -> tuple[ScanSnapshot, int] | None:
+        """Return a current scan that is safe to hand to broker activation."""
+        async with self._scan_coordination_lock:
+            previous = self.last_scan
+            previous_revision = self._scan_revision
+        needs_scan = not isinstance(previous, ScanSnapshot) or (
+            previous.logical_at != now
+        )
+        if needs_scan:
+            self._record(
+                "PUBLIC_SCAN_DEADLINE",
+                at=now,
+                detail={
+                    "kind": "focused",
+                    "scheduled_at": now.isoformat(),
+                    "lateness_seconds": "0",
+                },
+            )
+            await self.scan(
+                refresh=False, scan_kind="FOCUSED", scheduled_at=now
+            )
+        async with self._scan_coordination_lock:
+            snapshot = self.last_scan
+            if not isinstance(snapshot, ScanSnapshot):
+                reason = "CURRENT_SHARED_SCAN_UNAVAILABLE"
+            elif needs_scan and self._scan_revision <= previous_revision:
+                reason = "CURRENT_SHARED_SCAN_NOT_PUBLISHED"
+            elif snapshot.logical_at < now:
+                reason = "CURRENT_SHARED_SCAN_STALE"
+            elif (
+                snapshot.winner is not None
+                and snapshot.winner.logical_at != snapshot.logical_at
+            ):
+                reason = "CURRENT_SHARED_SCAN_PLAN_TIMESTAMP_MISMATCH"
+            else:
+                return snapshot, self._scan_revision
+            self._record(
+                "PAPER_ENTRY_ACTIVATION_BLOCKED",
+                at=now,
+                detail={
+                    "reason": reason,
+                    "activation_at": now.isoformat(),
+                    "scan_at": (
+                        None
+                        if not isinstance(snapshot, ScanSnapshot)
+                        else snapshot.logical_at.isoformat()
+                    ),
+                    "scan_revision": self._scan_revision,
+                },
+            )
+            return None
+
     async def tick(self, at: datetime | None = None) -> None:
         now = at or self.clock.now()
         self._notify_pending_socket_outages(now)
@@ -2615,23 +2686,61 @@ class PublicPaperRuntime:
             if cycle is None:
                 return
             schedule = activation_schedule(cycle)
-        winner = self.last_scan.winner
-        if (
-            winner is not None
-            and winner.target_cycle is not None
-            and winner.target_cycle.start_at == cycle.start_at
-            and schedule.should_activate(now)
-        ):
-            self._attempt_number += 1
-            broker = PaperEntryBroker(config=self.config)
-            await broker.activate(
-                self.last_scan,
-                attempt_id=f"public-{int(now.timestamp())}-{self._attempt_number}",
-                activated_at=now,
+        if schedule.should_activate(now):
+            coherent = await self._coherent_activation_snapshot(now=now)
+            if coherent is None:
+                return
+            activation_snapshot, scan_revision = coherent
+            activation_at = activation_snapshot.logical_at
+            self.next_focused_scan_at = _next_absolute_slot(
+                self.next_focused_scan_at or focused_start,
+                activation_at,
+                self.config.focused_scan_seconds,
             )
-            self.broker = broker
-            self.repository.save_decision(recorded_at=now, entry_state=broker.state)
-            self._record("PAPER_ENTRY_ACTIVATED", at=now)
+            cycle = self._refresh_focused_cycle(activation_at)
+            if cycle is None:
+                return
+            schedule = activation_schedule(cycle)
+            winner = activation_snapshot.winner
+            if (
+                winner is None
+                or winner.target_cycle is None
+                or winner.target_cycle.start_at != cycle.start_at
+                or not schedule.should_activate(activation_at)
+            ):
+                return
+            async with self._scan_coordination_lock:
+                if (
+                    self.broker is not None
+                    or self._scan_revision != scan_revision
+                    or self.last_scan is not activation_snapshot
+                ):
+                    self._record(
+                        "PAPER_ENTRY_ACTIVATION_BLOCKED",
+                        at=activation_at,
+                        detail={
+                            "reason": "CURRENT_SHARED_SCAN_SUPERSEDED",
+                            "activation_at": activation_at.isoformat(),
+                            "scan_at": activation_snapshot.logical_at.isoformat(),
+                            "scan_revision": self._scan_revision,
+                        },
+                    )
+                    return
+                self._attempt_number += 1
+                broker = PaperEntryBroker(config=self.config)
+                await broker.activate(
+                    activation_snapshot,
+                    attempt_id=(
+                        f"public-{int(activation_at.timestamp())}-"
+                        f"{self._attempt_number}"
+                    ),
+                    activated_at=activation_at,
+                )
+                self.broker = broker
+                self.repository.save_decision(
+                    recorded_at=activation_at, entry_state=broker.state
+                )
+                self._record("PAPER_ENTRY_ACTIVATED", at=activation_at)
             order = broker.state.order
             assert order is not None
             lifecycle_key, ticker, route = self._paper_notification_context(
@@ -2647,7 +2756,7 @@ class PublicPaperRuntime:
             self.lifecycle_notifications.maker_entry_activated(
                 scope=NotificationScope.PAPER,
                 lifecycle_key=lifecycle_key,
-                at=now,
+                at=activation_at,
                 ticker=ticker,
                 route=route,
                 expected_legs=("RISEX", "HEDGE"),
@@ -3110,20 +3219,26 @@ class PublicPaperRuntime:
                 detail={"symbol": symbol, "stream": stream_kind},
             )
         if self.broker is not None and self.broker.state.lifecycle_state is LifecycleState.ENTRY_MAKER_OPEN:
-            order = self.broker.state.order
-            assert order is not None
-            if (venue, symbol) in {
-                (Venue.RISEX, order.route_plan.risex_market.venue_symbol),
-                (order.route_plan.hedge_venue, order.route_plan.hedge_market.venue_symbol),
-            }:
-                risex, hedge = self._route_observations(order.route_plan, now)
-                local = await scan_once((risex, hedge), now, config=self.config)
-                refreshed = local.evaluations[0] if local.evaluations else None
-                await self.broker.refresh(refreshed, risex, evaluated_at=now)
-                self.repository.save_decision(recorded_at=now, entry_state=self.broker.state)
-                self.last_scan = local
-                if self.broker.state.lifecycle_state is LifecycleState.FLAT:
-                    self.broker = None
+            async with self._scan_coordination_lock:
+                broker = self.broker
+                order = broker.state.order
+                assert order is not None
+                if (venue, symbol) in {
+                    (Venue.RISEX, order.route_plan.risex_market.venue_symbol),
+                    (order.route_plan.hedge_venue, order.route_plan.hedge_market.venue_symbol),
+                }:
+                    risex, hedge = self._route_observations(order.route_plan, now)
+                    local = await scan_once((risex, hedge), now, config=self.config)
+                    refreshed = local.evaluations[0] if local.evaluations else None
+                    await broker.refresh(refreshed, risex, evaluated_at=now)
+                    self.repository.save_decision(
+                        recorded_at=now, entry_state=broker.state
+                    )
+                    self.last_scan = local
+                    self._scan_revision += 1
+                    if broker.state.lifecycle_state is LifecycleState.FLAT:
+                        if self.broker is broker:
+                            self.broker = None
         if self.lifecycle is not None and (invalidates_book or invalidates_trade):
             async with self._position_event_lock:
                 if (
