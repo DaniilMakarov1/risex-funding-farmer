@@ -57,6 +57,14 @@ def _latest_routes(repository: PaperRepository) -> list[dict[str, object]]:
     return repository.report(as_of=BASE + timedelta(hours=2))["latest_routes"]
 
 
+def _digest_cards(payloads):
+    return [
+        card
+        for digest in payloads
+        for card in digest.text.split("\n\n")[1:]
+    ]
+
+
 class RunLoopSleep:
     def __init__(self) -> None:
         self.waits: list[tuple[float, asyncio.Event]] = []
@@ -1168,15 +1176,15 @@ async def test_stabilization003_g_scan_rows_use_one_captured_tuple(
     if scan_kind == "FULL":
         digest = next(row for row in delivery.rows if row.kind == "FULL_SCAN_DIGEST")
         assert digest.occurred_at == snapshot.logical_at
-        digest_lines = digest.text.splitlines()[1:]
-        assert len(digest_lines) == min(10, len(persisted))
-        for line, row in zip(digest_lines, persisted[:10]):
+        digest_cards = _digest_cards((digest,))
+        assert len(digest_cards) == min(10, len(persisted))
+        for card, row in zip(digest_cards, persisted[:10]):
             if row["planned_maker_net_pnl_usd"] is not None:
                 assert (
-                    "Expected PnL: $" + format_telegram_money(
+                    "PnL: <code>$" + format_telegram_money(
                         row["planned_maker_net_pnl_usd"]
                     )
-                    in line
+                    in card
                 )
 
 
@@ -1419,19 +1427,19 @@ async def test_stabilization003_h_top5_component_blocker_and_numeric_matrix(
                 digest = [
                     row for row in delivery.rows if row.kind == "FULL_SCAN_DIGEST"
                 ][-1]
-                nado_lines = [
-                    line for line in digest.text.splitlines()[1:]
-                    if risex_leg or f"/ {venue.value} " in line
+                nado_cards = [
+                    card for card in _digest_cards((digest,))
+                    if risex_leg or f"/ {venue.value} " in card
                 ]
                 expected_rows = [
                     row for row in result["routes"][:10]
                     if risex_leg or row["hedge_venue"] == venue.value
                 ]
-                assert len(nado_lines) == len(expected_rows)
+                assert len(nado_cards) == len(expected_rows)
                 assert all(
-                    "Expected PnL: UNKNOWN — " + label_by_blocker[blocker]
-                    in line
-                    for line in nado_lines
+                    "<code>UNKNOWN — " + label_by_blocker[blocker] + "</code>"
+                    in card
+                    for card in nado_cards
                 )
 
             async def apply_case(
@@ -1568,10 +1576,10 @@ async def test_stabilization003_h_top5_component_blocker_and_numeric_matrix(
             digest = [
                 row for row in delivery.rows if row.kind == "FULL_SCAN_DIGEST"
             ][-1]
-            assert len(digest.text.splitlines()[1:]) == 10
+            assert len(_digest_cards((digest,))) == 10
             assert all(
-                "Expected PnL: UNKNOWN — funding" in line
-                for line in digest.text.splitlines()[1:]
+                "<code>UNKNOWN — funding</code>" in card
+                for card in _digest_cards((digest,))
             )
 
             assert all(
@@ -1607,26 +1615,26 @@ async def test_stabilization003_i_telegram_relays_only_persisted_full_rows(tmp_p
     assert unknown["routes"] == unknown_persisted
     digests = [row for row in delivery.rows if row.kind == "FULL_SCAN_DIGEST"]
     assert len(digests) == 2
-    numeric_lines = digests[0].text.splitlines()[1:]
-    unknown_lines = digests[1].text.splitlines()[1:]
-    assert len(numeric_lines) == min(10, len(numeric_persisted))
-    assert len(unknown_lines) == min(10, len(unknown_persisted))
-    for line, row in zip(numeric_lines, numeric_persisted[:10]):
+    numeric_cards = _digest_cards((digests[0],))
+    unknown_cards = _digest_cards((digests[1],))
+    assert len(numeric_cards) == min(10, len(numeric_persisted))
+    assert len(unknown_cards) == min(10, len(unknown_persisted))
+    for card, row in zip(numeric_cards, numeric_persisted[:10]):
         assert (
-            "Expected PnL: $" + format_telegram_money(
+            "PnL: <code>$" + format_telegram_money(
                 row["planned_maker_net_pnl_usd"]
             )
-            in line
+            in card
         )
     unknown_labels = {
         "FUNDING_STALE": "funding",
         "FUNDING_ELIGIBILITY_UNKNOWN": "funding",
     }
-    for line, row in zip(unknown_lines, unknown_persisted[:10]):
+    for card, row in zip(unknown_cards, unknown_persisted[:10]):
         blocker = row["blockers"][0]
         assert (
-            "Expected PnL: UNKNOWN — " + unknown_labels[blocker]
-            in line
+            "<code>UNKNOWN — " + unknown_labels[blocker] + "</code>"
+            in card
         )
 
 

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import aiohttp
 import pytest
+import risex_farmer.notifications as notifications_module
 
 from risex_farmer.notifications import (
     LifecycleNotificationTracker,
@@ -13,6 +14,7 @@ from risex_farmer.notifications import (
     NotificationOutbox,
     NotificationPayload,
     NotificationScope,
+    TELEGRAM_HTML_PARSE_MODE,
     TelegramDelivery,
     format_telegram_funding_countdown,
     format_telegram_money,
@@ -70,9 +72,13 @@ def test_full_scan_digest_uses_persisted_target_cycle_and_preserves_unknown_pnl(
         scan_at=NOW, opportunity=False, route_rows=(row,)
     )[0]
 
-    assert payload.text.splitlines()[1] == (
-        "ABC | RISEx LONG / EXTENDED SHORT | Expected PnL: UNKNOWN — funding | "
-        "Funding in: 42 min"
+    assert payload.parse_mode == TELEGRAM_HTML_PARSE_MODE
+    assert payload.text == (
+        "<b>Full Scan 1/1 | Status: NO TRADE</b>\n"
+        "Scan UTC: <code>2027-08-01T12:00:00+00:00</code>\n\n"
+        "<b>1. ABC</b> — RISEx LONG / EXTENDED SHORT\n"
+        "PnL: <code>UNKNOWN — funding</code> | "
+        "Funding in: <code>42 min</code>"
     )
     assert row == before
 
@@ -87,6 +93,30 @@ def payload(event_id: str = "event-1") -> NotificationPayload:
         route="RISEx LONG / NADO SHORT",
         planned_maker_net_pnl_usd=Decimal("1.234567"),
     )
+
+
+def digest_cards(payloads):
+    return [
+        card
+        for digest in payloads
+        for card in digest.text.split("\n\n")[1:]
+    ]
+
+
+def test_notification_parse_mode_is_strict_and_full_digest_only():
+    for parse_mode in ("Markdown", "markdown", "HTML5", ""):
+        with pytest.raises(ValueError, match="unsupported Telegram parse mode"):
+            NotificationPayload(
+                "unsupported", "GENERIC", NOW, "plain", parse_mode=parse_mode
+            )
+
+    with pytest.raises(ValueError, match="reserved for FULL_SCAN_DIGEST"):
+        NotificationPayload(
+            "generic-html", "GENERIC", NOW, "plain",
+            parse_mode=TELEGRAM_HTML_PARSE_MODE,
+        )
+    with pytest.raises(ValueError, match="reserved for FULL_SCAN_DIGEST"):
+        NotificationPayload("full-plain", "FULL_SCAN_DIGEST", NOW, "plain")
 
 
 class FakeResponse:
@@ -298,12 +328,11 @@ def test_full_scan_digest_part_event_ids_deduplicate_and_text_is_bounded():
         f"full-scan-digest:{NOW.isoformat()}:part:{index}:{len(digests)}"
         for index in range(1, len(digests) + 1)
     ]
-    route_lines = [
-        line for digest in digests for line in digest.text.splitlines()[1:]
-    ]
-    assert len(route_lines) == 10
-    assert all(line.count(" | ") == 3 for line in route_lines)
-    assert all("Funding in: UNKNOWN" in line for line in route_lines)
+    cards = digest_cards(digests)
+    assert len(cards) == 10
+    assert all(len(card.splitlines()) == 2 for card in cards)
+    assert all(card.count(" | ") == 1 for card in cards)
+    assert all("Funding in: <code>UNKNOWN</code>" in card for card in cards)
 
 
 def test_full_scan_digest_delivers_only_first_ten_rows_without_loss() -> None:
@@ -318,10 +347,13 @@ def test_full_scan_digest_delivers_only_first_ten_rows_without_loss() -> None:
         scan_at=NOW, opportunity=False, route_rows=rows,
     )
     assert all(len(payload.text) <= 4096 for payload in payloads)
-    lines = [line for payload in payloads for line in payload.text.splitlines()[1:]]
+    lines = digest_cards(payloads)
     assert len(payloads) == 1
     assert len(lines) == len(set(lines)) == 10
-    assert all("Expected PnL: UNKNOWN — market metadata stale" in line for line in lines)
+    assert all(
+        "<code>UNKNOWN — market metadata stale</code>" in line
+        for line in lines
+    )
     assert all(f"ASSET-{index}-" in line for index, line in enumerate(lines))
     assert not any("ASSET-10-" in line for line in lines)
 
@@ -337,9 +369,9 @@ def test_full_scan_digest_keeps_fewer_than_ten_rows_whole() -> None:
         scan_at=NOW, opportunity=False, route_rows=rows,
     )
     assert len(payloads) == 1
-    assert payloads[0].text.splitlines()[1:] == [
-        f"ASSET-{index} | RISEx LONG / EXTENDED SHORT | Expected PnL: ${index}.00 | "
-        "Funding in: UNKNOWN"
+    assert digest_cards(payloads) == [
+        f"<b>{index + 1}. ASSET-{index}</b> — RISEx LONG / EXTENDED SHORT\n"
+        f"PnL: <code>${index}.00</code> | Funding in: <code>UNKNOWN</code>"
         for index in range(3)
     ]
 
@@ -360,11 +392,11 @@ def test_full_scan_unknown_uses_human_authoritative_label(blocker, label):
             "planned_maker_net_pnl_usd": None, "blockers": [blocker],
         },),
     )[0]
-    line = payload.text.splitlines()[1]
-    assert f"Expected PnL: UNKNOWN — {label}" in line
-    assert line.endswith("Funding in: UNKNOWN")
-    assert line.count(" | ") == 3
-    assert blocker not in line
+    card = digest_cards((payload,))[0]
+    assert f"<code>UNKNOWN — {label}</code>" in card
+    assert card.endswith("Funding in: <code>UNKNOWN</code>")
+    assert card.count(" | ") == 1
+    assert blocker not in card
 
 
 @pytest.mark.asyncio
@@ -382,6 +414,88 @@ async def test_telegram_only_calls_send_message_and_keeps_secrets_out_of_payload
     assert body == {"chat_id": chat, "text": "synthetic notification"}
     assert token not in payload().text and chat not in payload().text
     assert session.closed
+
+
+@pytest.mark.asyncio
+async def test_telegram_full_digest_adds_html_parse_mode_but_plain_stays_plain():
+    session = FakeSession([FakeResponse(200), FakeResponse(200)])
+    delivery = TelegramDelivery(
+        "synthetic-token", "synthetic-chat", session_factory=lambda: session
+    )
+    full = full_scan_digest_payloads(
+        scan_at=NOW,
+        opportunity=False,
+        route_rows=({
+            "canonical_asset": "ABC",
+            "hedge_venue": "EXTENDED",
+            "direction": "LONG_RISEX_SHORT_HEDGE",
+            "planned_maker_net_pnl_usd": "1",
+        },),
+    )[0]
+    plain = payload("plain")
+    await delivery.start()
+    assert delivery.enqueue(plain)
+    assert delivery.enqueue(full)
+    await drain(delivery)
+    await delivery.close()
+
+    assert session.calls[0][1] == {
+        "chat_id": "synthetic-chat", "text": plain.text,
+    }
+    assert session.calls[1][1] == {
+        "chat_id": "synthetic-chat", "text": full.text,
+        "parse_mode": TELEGRAM_HTML_PARSE_MODE,
+    }
+
+
+def test_full_scan_digest_escapes_dynamic_fields_before_html_markup():
+    payloads = full_scan_digest_payloads(
+        scan_at=NOW,
+        opportunity=False,
+        route_rows=({
+            "canonical_asset": "A&B <b>ticker</b>",
+            "hedge_venue": "HEDGE<&>",
+            "direction": "LONG_RISEX_SHORT_HEDGE",
+            "planned_maker_net_pnl_usd": "1.235",
+            "target_cycle_start": (
+                NOW + timedelta(minutes=42, seconds=59)
+            ).isoformat(),
+        },),
+    )
+
+    assert digest_cards(payloads) == [
+        "<b>1. A&amp;B &lt;b&gt;ticker&lt;/b&gt;</b> — "
+        "RISEx LONG / HEDGE&lt;&amp;&gt; SHORT\n"
+        "PnL: <code>$1.24</code> | Funding in: <code>42 min</code>"
+    ]
+    assert "<b>ticker</b>" not in payloads[0].text
+    assert "HEDGE<&>" not in payloads[0].text
+
+
+def test_full_scan_digest_splits_only_between_complete_two_line_cards(monkeypatch):
+    monkeypatch.setattr(notifications_module, "MAX_NOTIFICATION_TEXT_LENGTH", 300)
+    rows = tuple({
+        "canonical_asset": f"ASSET-{index}",
+        "hedge_venue": "EXTENDED",
+        "direction": "LONG_RISEX_SHORT_HEDGE",
+        "planned_maker_net_pnl_usd": str(index),
+        "target_cycle_start": (NOW + timedelta(minutes=5)).isoformat(),
+    } for index in range(10))
+
+    payloads = full_scan_digest_payloads(
+        scan_at=NOW, opportunity=True, route_rows=rows
+    )
+
+    assert len(payloads) > 1
+    assert all(len(item.text) <= 300 for item in payloads)
+    cards = digest_cards(payloads)
+    assert len(cards) == 10
+    assert all(len(card.splitlines()) == 2 for card in cards)
+    assert all(
+        card.startswith(f"<b>{index}. ASSET-{index - 1}</b>")
+        for index, card in enumerate(cards, 1)
+    )
+    assert all(item.parse_mode == TELEGRAM_HTML_PARSE_MODE for item in payloads)
 
 
 @pytest.mark.asyncio

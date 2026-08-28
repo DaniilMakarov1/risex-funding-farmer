@@ -41,6 +41,7 @@ from risex_farmer.market_data import BookStream
 from risex_farmer.lifecycle import LifecycleEngine
 from risex_farmer.notifications import (
     NotificationOutbox,
+    TELEGRAM_HTML_PARSE_MODE,
     TelegramDelivery,
     format_telegram_funding_countdown,
     format_telegram_money,
@@ -70,6 +71,14 @@ class CaptureNotifications:
 
     async def close(self) -> None:
         self.closed = True
+
+
+def digest_cards(payloads):
+    return [
+        card
+        for digest in payloads
+        for card in digest.text.split("\n\n")[1:]
+    ]
 
 
 class FakeClock:
@@ -1521,13 +1530,17 @@ async def test_full_scan_digest_uses_persisted_authoritative_route_rows_in_order
     assert len(digests) == 1
     digest = digests[0]
     assert digest.occurred_at == NOW
-    assert digest.text.splitlines()[0] == (
-        f"Full Scan 1/1 | Scan UTC: {NOW.isoformat()} | Status: OPPORTUNITY"
+    assert digest.parse_mode == TELEGRAM_HTML_PARSE_MODE
+    assert digest.text.split("\n\n", 1)[0] == (
+        "<b>Full Scan 1/1 | Status: OPPORTUNITY</b>\n"
+        f"Scan UTC: <code>{NOW.isoformat()}</code>"
     )
-    route_lines = digest.text.splitlines()[1:]
-    assert len(route_lines) == min(10, len(result["routes"]))
-    assert all(line.endswith("Funding in: 5 min") for line in route_lines)
-    for line, route_row in zip(route_lines, persisted_rows[:10]):
+    route_cards = digest_cards((digest,))
+    assert len(route_cards) == min(10, len(result["routes"]))
+    assert all(card.endswith("Funding in: <code>5 min</code>") for card in route_cards)
+    for rank, (card, route_row) in enumerate(
+        zip(route_cards, persisted_rows[:10]), 1
+    ):
         risex_side = (
             "LONG"
             if route_row["direction"] == "LONG_RISEX_SHORT_HEDGE"
@@ -1535,12 +1548,12 @@ async def test_full_scan_digest_uses_persisted_authoritative_route_rows_in_order
         )
         hedge_side = "SHORT" if risex_side == "LONG" else "LONG"
         expected = (
-            f"{route_row['canonical_asset']} | RISEx {risex_side} / "
-            f"{route_row['hedge_venue']} {hedge_side} | Expected PnL: "
-            f"${format_telegram_money(route_row['planned_maker_net_pnl_usd'])} | "
-            f"{format_telegram_funding_countdown(route_row['target_cycle_start'], NOW)}"
+            f"<b>{rank}. {route_row['canonical_asset']}</b> — "
+            f"RISEx {risex_side} / {route_row['hedge_venue']} {hedge_side}\n"
+            f"PnL: <code>${format_telegram_money(route_row['planned_maker_net_pnl_usd'])}"
+            "</code> | Funding in: <code>5 min</code>"
         )
-        assert line == expected
+        assert card == expected
 
 
 @pytest.mark.asyncio
@@ -1563,27 +1576,29 @@ async def test_full_scan_digest_keeps_negative_blocked_and_unknown_routes_visibl
 
     digests = [row for row in delivery.rows if row.kind == "FULL_SCAN_DIGEST"]
     assert len(digests) == 2
-    assert digests[0].text.splitlines()[0].endswith("Status: NO TRADE")
+    assert "<b>Full Scan 1/1 | Status: NO TRADE</b>" in digests[0].text
     assert any(row["blockers"] for row in negative["routes"])
     assert any(
         D(row["planned_maker_net_pnl_usd"]) < 0
         for row in negative["routes"]
         if row["planned_maker_net_pnl_usd"] is not None
     )
-    negative_lines = digests[0].text.splitlines()[1:]
-    assert len(negative_lines) == min(10, len(negative["routes"]))
-    for line, row in zip(negative_lines, negative["routes"]):
-        assert line.startswith(f"{row['canonical_asset']} | RISEx ")
+    negative_cards = digest_cards((digests[0],))
+    assert len(negative_cards) == min(10, len(negative["routes"]))
+    for rank, (card, row) in enumerate(
+        zip(negative_cards, negative["routes"]), 1
+    ):
+        assert card.startswith(f"<b>{rank}. {row['canonical_asset']}</b> — RISEx ")
         if row["planned_maker_net_pnl_usd"] is None:
-            assert "Expected PnL: UNKNOWN — " in line
+            assert "PnL: <code>UNKNOWN — " in card
         else:
             assert (
-                f"Expected PnL: ${format_telegram_money(row['planned_maker_net_pnl_usd'])}"
-                in line
+                f"PnL: <code>${format_telegram_money(row['planned_maker_net_pnl_usd'])}"
+                in card
             )
     assert any(row["planned_maker_net_pnl_usd"] is None for row in unknown["routes"])
-    assert len(digests[1].text.splitlines()[1:]) == min(10, len(unknown["routes"]))
-    assert "Expected PnL: UNKNOWN" in digests[1].text
+    assert len(digest_cards((digests[1],))) == min(10, len(unknown["routes"]))
+    assert "PnL: <code>UNKNOWN" in digests[1].text
 
 
 @pytest.mark.asyncio
@@ -1631,22 +1646,20 @@ async def test_full_scan_digest_retains_all_58_authoritative_rows(tmp_path):
     assert len(result["routes"]) == 58
     assert len(report["latest_routes"]) == 58
     assert len(digests) == 1
-    delivered_lines = [
-        line for row in digests for line in row.text.splitlines()[1:]
-    ]
-    assert len(delivered_lines) == 10
-    assert len(set(delivered_lines)) == 10
-    expected_lines = [
-        f"{row['canonical_asset']} | RISEx "
+    delivered_cards = digest_cards(digests)
+    assert len(delivered_cards) == 10
+    assert len(set(delivered_cards)) == 10
+    expected_cards = [
+        f"<b>{rank}. {row['canonical_asset']}</b> — RISEx "
         f"{'LONG' if row['direction'] == 'LONG_RISEX_SHORT_HEDGE' else 'SHORT'} / "
         f"{row['hedge_venue']} "
-        f"{'SHORT' if row['direction'] == 'LONG_RISEX_SHORT_HEDGE' else 'LONG'} | "
-        f"Expected PnL: ${format_telegram_money(row['planned_maker_net_pnl_usd'])} | "
-        f"{format_telegram_funding_countdown(row['target_cycle_start'], NOW)}"
-        for row in result["routes"][:10]
+        f"{'SHORT' if row['direction'] == 'LONG_RISEX_SHORT_HEDGE' else 'LONG'}\n"
+        f"PnL: <code>${format_telegram_money(row['planned_maker_net_pnl_usd'])}"
+        "</code> | Funding in: <code>5 min</code>"
+        for rank, row in enumerate(result["routes"][:10], 1)
     ]
-    assert delivered_lines == expected_lines
-    assert result["routes"][10]["canonical_asset"] not in "\n".join(delivered_lines)
+    assert delivered_cards == expected_cards
+    assert result["routes"][10]["canonical_asset"] not in "\n".join(delivered_cards)
     assert all(len(row.text) <= 4096 for row in digests)
 
 
@@ -2026,8 +2039,8 @@ async def test_startup_seed_refresh_keeps_first_full_digest_funding_fresh(
         ]
         for row in full_routes
     )
-    assert "Expected PnL: UNKNOWN" not in digest.text
-    assert "Expected PnL: $" in digest.text
+    assert "PnL: <code>UNKNOWN" not in digest.text
+    assert "PnL: <code>$" in digest.text
 
 
 @pytest.mark.asyncio

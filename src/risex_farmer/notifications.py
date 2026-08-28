@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import html
 import math
 import os
 import re
@@ -19,6 +20,7 @@ import aiohttp
 
 TELEGRAM_FULL_DIGEST_ROW_LIMIT = 10
 MAX_NOTIFICATION_TEXT_LENGTH = 4096
+TELEGRAM_HTML_PARSE_MODE = "HTML"
 DEFAULT_LIFECYCLE_LEGS = ("RISEX", "HEDGE")
 
 
@@ -37,12 +39,22 @@ class NotificationPayload:
     route: str | None = None
     planned_maker_net_pnl_usd: Decimal | None = None
     final_pnl_usd: Decimal | None = None
+    parse_mode: str | None = None
 
     def __post_init__(self) -> None:
         if self.occurred_at.tzinfo is None:
             raise ValueError("notification time must be timezone-aware")
         if not self.text or len(self.text) > MAX_NOTIFICATION_TEXT_LENGTH:
             raise ValueError("notification text must be bounded and non-empty")
+        if self.parse_mode not in (None, TELEGRAM_HTML_PARSE_MODE):
+            raise ValueError("unsupported Telegram parse mode")
+        if (
+            (self.kind == "FULL_SCAN_DIGEST")
+            != (self.parse_mode == TELEGRAM_HTML_PARSE_MODE)
+        ):
+            raise ValueError(
+                "HTML parse mode is reserved for FULL_SCAN_DIGEST payloads"
+            )
 
 
 def format_telegram_money(value: Decimal | str | None) -> str:
@@ -90,9 +102,13 @@ def full_scan_digest_payloads(
 ) -> tuple[NotificationPayload, ...]:
     scan_utc = utc_time(scan_at)
     status = "OPPORTUNITY" if opportunity else "NO TRADE"
-    route_lines: list[str] = []
-    for row in route_rows[:TELEGRAM_FULL_DIGEST_ROW_LIMIT]:
-        ticker = _bounded_digest_field(str(row.get("canonical_asset") or "UNKNOWN"), 48)
+    route_cards: list[str] = []
+    for rank, row in enumerate(
+        route_rows[:TELEGRAM_FULL_DIGEST_ROW_LIMIT], 1
+    ):
+        ticker = _bounded_digest_field(
+            str(row.get("canonical_asset") or "UNKNOWN"), 48
+        )
         hedge = str(row.get("hedge_venue") or "UNKNOWN")
         direction = row.get("direction")
         if direction == "LONG_RISEX_SHORT_HEDGE":
@@ -113,40 +129,52 @@ def full_scan_digest_payloads(
                 if isinstance(blockers, (list, tuple)) and blockers
                 else "AUTHORITATIVE_VALUE_UNAVAILABLE"
             )
-            pnl_field = f"Expected PnL: UNKNOWN — {_unknown_digest_label(blocker)}"
+            pnl_value = f"UNKNOWN — {_unknown_digest_label(blocker)}"
         else:
-            pnl_field = f"Expected PnL: ${pnl_display}"
+            pnl_value = f"${pnl_display}"
+        pnl_value = _bounded_digest_field(pnl_value, 92)
         funding_field = format_telegram_funding_countdown(
             row.get("target_cycle_start"), scan_utc
         )
-        route_lines.append(
-            f"{ticker} | {route} | {_bounded_digest_field(pnl_field, 92)} | "
-            f"{funding_field}"
+        funding_value = funding_field.removeprefix("Funding in: ")
+        route_cards.append(
+            f"<b>{rank}. {_escape_digest_field(ticker)}</b> — "
+            f"{_escape_digest_field(route)}\n"
+            f"PnL: <code>{_escape_digest_field(pnl_value)}</code> | "
+            f"Funding in: <code>{_escape_digest_field(funding_value)}</code>"
         )
-    header_budget = len(
-        f"Full Scan 99/99 | Scan UTC: {scan_utc.isoformat()} | Status: {status}\n"
-    )
+    scan_display = _escape_digest_field(scan_utc.isoformat())
+    status_display = _escape_digest_field(status)
+
+    def header(index: int, total: int) -> str:
+        return (
+            f"<b>Full Scan {index}/{total} | Status: {status_display}</b>\n"
+            f"Scan UTC: <code>{scan_display}</code>"
+        )
+
+    # Pack complete two-line cards using a conservative header size. The
+    # placeholder is deliberately wider than the actual part count.
+    header_budget = len(header(99, 99))
     groups: list[list[str]] = [[]]
     current_length = header_budget
-    for line in route_lines:
-        added = len(line) + 1
-        if groups[-1] and current_length + added > 4096:
+    for card in route_cards:
+        added = len(card) + 2
+        if groups[-1] and current_length + added > MAX_NOTIFICATION_TEXT_LENGTH:
             groups.append([])
             current_length = header_budget
-        groups[-1].append(line)
+        groups[-1].append(card)
         current_length += added
     total = len(groups)
     payloads: list[NotificationPayload] = []
     for index, group in enumerate(groups, 1):
-        header = (
-            f"Full Scan {index}/{total} | Scan UTC: {scan_utc.isoformat()} | "
-            f"Status: {status}"
-        )
-        text = "\n".join((header, *group))
-        assert len(text) <= 4096
+        text = header(index, total)
+        if group:
+            text = "\n\n".join((text, "\n\n".join(group)))
+        assert len(text) <= MAX_NOTIFICATION_TEXT_LENGTH
         payloads.append(NotificationPayload(
             f"full-scan-digest:{scan_utc.isoformat()}:part:{index}:{total}",
             "FULL_SCAN_DIGEST", scan_utc, text,
+            parse_mode=TELEGRAM_HTML_PARSE_MODE,
         ))
     return tuple(payloads)
 
@@ -170,6 +198,10 @@ def _unknown_digest_label(blocker: str) -> str:
 
 def _bounded_digest_field(value: str, width: int) -> str:
     return value if len(value) <= width else value[: width - 1] + "…"
+
+
+def _escape_digest_field(value: str) -> str:
+    return html.escape(value, quote=False)
 
 
 _SENSITIVE_DISPLAY_TOKEN = re.compile(
@@ -855,6 +887,8 @@ class TelegramDelivery:
         assert self._session is not None
         url = f"https://api.telegram.org/bot{self.__token}/sendMessage"
         body = {"chat_id": self.__chat_id, "text": payload.text}
+        if payload.parse_mode == TELEGRAM_HTML_PARSE_MODE:
+            body["parse_mode"] = TELEGRAM_HTML_PARSE_MODE
         for attempt in range(self._max_attempts):
             flood_control_delay: float | None = None
             try:
