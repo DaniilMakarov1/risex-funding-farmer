@@ -9,8 +9,9 @@ or sockets.
 from __future__ import annotations
 
 import asyncio
+import aiohttp
 import brotli
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 import hashlib
 import http.client
@@ -43,15 +44,22 @@ from .nado_private_read_preflight import (
 from .nado_testnet_lifecycle import (
     ACTIVE_PERP, CANCEL_ALL, CLOSE, COMPLETE, ENTRY,
     EXECUTE_RESPONSE_AMBIGUITY, EXECUTE_TRANSPORT_AMBIGUITY,
-    EXECUTE_VENUE_REJECTION, IOC_APPENDIX, MAX_CLOSE_ATTEMPTS, UINT32_MAX,
+    EXECUTE_VENUE_REJECTION, FUNDING_BLOCKED_CONTRADICTORY,
+    FUNDING_BLOCKED_MISSING, FUNDING_BOUNDARY_INTERVAL_MS, FUNDING_UNRESOLVED,
+    IOC_APPENDIX, MAX_CLOSE_ATTEMPTS, UINT32_MAX,
     LONG, NADO_VENUE, RISEX_VENUE, SHORT,
     AccountSnapshot, CatalogSnapshot, CrossRunAttestation, EngineEvidence,
     FundingBoundaryBinding, FundingRouteBinding, IntentStore, ExecuteFailure,
     JournalIdentity, LifecycleCore, NadoAccountFunding, NadoContractError,
-    NadoFundingEvent, OrderEvidence, OrderIntent,
+    NadoFundingBaseline, NadoFundingEvent, NadoFundingExposure,
+    OrderEvidence, OrderIntent,
     Product, Reconciliation, TerminalEvidence,
     SyntheticOrderVector, TriggerSnapshot, build_order_nonce,
+    decode_subaccount,
     completion_barrier, order_digest, smallest_executable_amount,
+    nado_account_funding_digest, nado_funding_event_digest,
+    nado_funding_exposure_digest,
+    _assert_authoritative_account,
     validate_entry_preflight,
 )
 
@@ -70,6 +78,10 @@ RECONCILE_READ_INTERVAL_SECONDS = 1.0
 _GATEWAY_HOST = "gateway.test.nado.xyz"
 _ARCHIVE_HOST = "archive.test.nado.xyz"
 _TRIGGER_HOST = "trigger.test.nado.xyz"
+_FUNDING_SUBSCRIBE_URL = "wss://gateway.test.nado.xyz/v1/subscribe"
+NADO_FUNDING_PAGE_LIMIT = 100
+NADO_FUNDING_MAX_PAGES = 8
+NADO_FUNDING_WAIT_GRACE_SECONDS = 30.0
 UNEXPECTED_FAILURE = "UNEXPECTED_FAILURE"
 
 
@@ -155,6 +167,8 @@ class FundingBoundaryReport:
     final_zero_trigger: bool
     final_exact_flat: bool
     reason: str | None = None
+    funding_aggregate_payment_x18: int | None = None
+    funding_account_idx: int | None = None
 
     def sanitized(self) -> dict[str, object]:
         return {
@@ -171,6 +185,8 @@ class FundingBoundaryReport:
             "final_zero_trigger": self.final_zero_trigger,
             "final_exact_flat": self.final_exact_flat,
             "reason": self.reason,
+            "funding_aggregate_payment_x18": self.funding_aggregate_payment_x18,
+            "funding_account_idx": self.funding_account_idx,
             "path": REDACTED_STORE_PATH,
         }
 
@@ -240,6 +256,14 @@ class VenueIO(Protocol):
 
 class FundingBoundaryVenueIO(VenueIO, Protocol):
     """Nado IO extension for exact, fixture-injected funding observations."""
+
+    def capture_funding_baseline(
+        self, binding: FundingBoundaryBinding, observation: LiveObservation,
+    ) -> NadoFundingBaseline: ...
+
+    def capture_funding_exposure(
+        self, binding: FundingBoundaryBinding, observation: LiveObservation,
+    ) -> NadoFundingExposure: ...
 
     def await_funding_boundary(self, binding: FundingBoundaryBinding) -> None: ...
 
@@ -648,6 +672,7 @@ class SealedLifecycleRunner:
         self,
         *,
         route: FundingRouteBinding | None = None,
+        before_entry: Callable[[LiveObservation], None] | None = None,
         before_close: Callable[[LiveObservation], None] | None = None,
         finalizer: Callable[[tuple[LiveObservation, ...]], object] | None = None,
     ) -> OperationalReport | object:
@@ -666,6 +691,9 @@ class SealedLifecycleRunner:
             expected_amount_x18 = _canonical_quantity_x18(route.canonical_quantity)
         self.stage = "LIVE_OBSERVATION"
         initial = self._observe()
+        if before_entry is not None:
+            self.stage = "FUNDING_BOUNDARY"
+            before_entry(initial)
         issued_at = self.io.now_ms()
         recv = issued_at + RECV_WINDOW_MS
         self.stage = "ORDER_DERIVATION"
@@ -814,6 +842,8 @@ class SealedFundingBoundaryRunner(SealedLifecycleRunner):
         if any(
             not callable(getattr(io, method, None))
             for method in (
+                "capture_funding_baseline",
+                "capture_funding_exposure",
                 "await_funding_boundary",
                 "read_funding_boundary",
                 "final_attestation",
@@ -844,14 +874,83 @@ class SealedFundingBoundaryRunner(SealedLifecycleRunner):
                 pass
             raise
         self.funding_io = io
+        self.funding_baseline: NadoFundingBaseline | None = None
+        self.funding_exposure: NadoFundingExposure | None = None
         self.funding_event: NadoFundingEvent | None = None
         self.account_funding: NadoAccountFunding | None = None
+        self.funding_blocker_reason: str | None = None
 
-    def _await_and_read_funding(self, _observed: LiveObservation) -> None:
-        self.funding_io.await_funding_boundary(self.funding_binding)
-        self.funding_event, self.account_funding = (
-            self.funding_io.read_funding_boundary(self.funding_binding)
+    def _capture_funding_baseline(self, observed: LiveObservation) -> None:
+        baseline = self.funding_io.capture_funding_baseline(
+            self.funding_binding, observed,
         )
+        if not isinstance(baseline, NadoFundingBaseline):
+            raise OperationalSafetyError("funding baseline adapter returned invalid evidence")
+        try:
+            baseline.assert_contract()
+            self.store.bind_funding_baseline(baseline)
+            self.funding_baseline = baseline
+        except NadoContractError:
+            raise OperationalSafetyError("funding baseline binding rejected") from None
+
+    def _await_and_read_funding(self, observed: LiveObservation) -> None:
+        try:
+            exposure = self.funding_io.capture_funding_exposure(
+                self.funding_binding, observed,
+            )
+            if not isinstance(exposure, NadoFundingExposure):
+                raise NadoContractError(
+                    "funding exposure adapter returned invalid evidence"
+                )
+            exposure.assert_contract()
+            self.store.bind_funding_exposure(exposure)
+            self.funding_exposure = exposure
+            self.funding_io.await_funding_boundary(self.funding_binding)
+            event, account_funding = self.funding_io.read_funding_boundary(
+                self.funding_binding
+            )
+            if event is not None and not isinstance(event, NadoFundingEvent):
+                raise NadoContractError("funding event adapter returned invalid evidence")
+            if account_funding is not None and not isinstance(
+                account_funding, NadoAccountFunding
+            ):
+                raise NadoContractError(
+                    "account funding adapter returned invalid evidence"
+                )
+            self.funding_event, self.account_funding = event, account_funding
+            self.funding_blocker_reason = (
+                None
+                if event is not None and account_funding is not None
+                else FUNDING_BLOCKED_MISSING
+            )
+        except BaseException as error:
+            # Funding evidence failure must not skip the already-authorized
+            # reduce-only close.  The finalizer durably records the blocker.
+            self.funding_event = None
+            self.account_funding = None
+            self.funding_exposure = None
+            if isinstance(error, NadoContractError):
+                self.funding_blocker_reason = FUNDING_BLOCKED_CONTRADICTORY
+                return
+            if isinstance(error, OperationalSafetyError):
+                message = str(error)
+                transport_failure = any(
+                    marker in message
+                    for marker in (
+                        "transport",
+                        "HTTP status",
+                        "stream ended",
+                        "deadline exhausted",
+                        "baseline or event is unavailable",
+                    )
+                )
+                self.funding_blocker_reason = (
+                    FUNDING_BLOCKED_MISSING
+                    if transport_failure
+                    else FUNDING_BLOCKED_CONTRADICTORY
+                )
+                return
+            self.funding_blocker_reason = FUNDING_BLOCKED_MISSING
 
     def _finalize_funding(
         self, finals: tuple[LiveObservation, ...],
@@ -878,11 +977,23 @@ class SealedFundingBoundaryRunner(SealedLifecycleRunner):
             != _terminal_fingerprint(second.nado_terminal)
         ):
             raise NadoContractError("final funding terminal rounds disagree")
-        result = self.store.record_nado_funding_boundary(
-            attestation=second,
-            event=self.funding_event,
-            account_funding=self.account_funding,
-        )
+        if self.funding_blocker_reason is not None:
+            result = self.store.record_nado_funding_blocker(
+                attestation=second,
+                reason=self.funding_blocker_reason,
+            )
+        else:
+            try:
+                result = self.store.record_nado_funding_boundary(
+                    attestation=second,
+                    event=self.funding_event,
+                    account_funding=self.account_funding,
+                )
+            except NadoContractError:
+                result = self.store.record_nado_funding_blocker(
+                    attestation=second,
+                    reason=FUNDING_BLOCKED_CONTRADICTORY,
+                )
         regular, trigger, flat = _terminal_flags(finals[-1])
         if result.completion_eligible:
             self.store._mark_complete()
@@ -900,11 +1011,14 @@ class SealedFundingBoundaryRunner(SealedLifecycleRunner):
             trigger,
             flat,
             None if result.completion_eligible else result.status,
+            result.aggregate_payment_x18,
+            result.account_idx,
         )
 
     def run(self) -> FundingBoundaryReport:
         result = self._run_order_lifecycle(
             route=self.funding_binding.route,
+            before_entry=self._capture_funding_baseline,
             before_close=self._await_and_read_funding,
             finalizer=self._finalize_funding,
         )
@@ -1145,6 +1259,133 @@ def run() -> dict[str, object]:
         store.close()
 
 
+_PUBLIC_FUNDING_FIELDS = frozenset({
+    "type", "timestamp", "product_id", "payment_amount", "open_interest",
+    "cumulative_funding_long_x18", "cumulative_funding_short_x18", "dt",
+})
+_ACCOUNT_PAYMENT_FIELDS = frozenset({
+    "product_id", "idx", "timestamp", "amount", "balance_amount", "rate_x18",
+    "oracle_price_x18",
+})
+
+
+def _official_integer_text(
+    value: object, label: str, *, positive: bool = False, nonnegative: bool = False,
+) -> int:
+    if type(value) is not str or not value:
+        raise OperationalSafetyError(f"{label} schema mismatch")
+    if value.startswith("-"):
+        digits = value[1:]
+    else:
+        digits = value
+    if not digits.isdigit():
+        raise OperationalSafetyError(f"{label} schema mismatch")
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise OperationalSafetyError(f"{label} schema mismatch") from None
+    if str(parsed) != value:
+        raise OperationalSafetyError(f"{label} schema mismatch")
+    if positive and parsed <= 0:
+        raise OperationalSafetyError(f"{label} schema mismatch")
+    if nonnegative and parsed < 0:
+        raise OperationalSafetyError(f"{label} schema mismatch")
+    return parsed
+
+
+def parse_nado_public_funding_event(raw: object) -> NadoFundingEvent:
+    """Parse only the documented public product-level funding event."""
+    if type(raw) is not dict or not _PUBLIC_FUNDING_FIELDS <= set(raw):
+        raise OperationalSafetyError("public funding event schema mismatch")
+    if raw["type"] != "funding_payment" or type(raw["product_id"]) is not int:
+        raise OperationalSafetyError("public funding event schema mismatch")
+    unsigned = NadoFundingEvent(
+        raw["product_id"],
+        _official_integer_text(raw["timestamp"], "funding event timestamp", positive=True),
+        _official_integer_text(raw["payment_amount"], "funding aggregate payment"),
+        _official_integer_text(raw["open_interest"], "funding open interest", nonnegative=True),
+        _official_integer_text(
+            raw["cumulative_funding_long_x18"], "funding cumulative long value"
+        ),
+        _official_integer_text(
+            raw["cumulative_funding_short_x18"], "funding cumulative short value"
+        ),
+        _official_integer_text(raw["dt"], "funding event dt", positive=True),
+        "0x" + "00" * 32,
+    )
+    try:
+        event = replace(
+            unsigned,
+            event_digest="0x" + nado_funding_event_digest(unsigned),
+        )
+        event.assert_contract()
+        return event
+    except NadoContractError:
+        raise OperationalSafetyError("public funding event contract mismatch") from None
+
+
+def parse_nado_account_payment_row(
+    raw: object,
+    binding: FundingBoundaryBinding,
+    *,
+    payment_kind: str = "funding",
+) -> NadoAccountFunding:
+    """Parse one official SDK ``IndexerPayment`` row.
+
+    The archive response may add irrelevant fields.  Required fields remain a
+    closed semantic contract, and the caller selects ``funding_payments`` so an
+    interest row can never be mistaken for account funding.
+    """
+    if type(raw) is not dict or not _ACCOUNT_PAYMENT_FIELDS <= set(raw):
+        raise OperationalSafetyError("account payment row schema mismatch")
+    if type(raw["product_id"]) is not int:
+        raise OperationalSafetyError("account payment row schema mismatch")
+    parsed = _parse_account_payment_fields(raw)
+    owner, subaccount_name = decode_subaccount(binding.nado_journal.account_id)
+    unsigned = NadoAccountFunding(
+        binding.nado_journal,
+        owner,
+        subaccount_name,
+        raw["product_id"],
+        parsed["idx"], parsed["timestamp"], parsed["amount"],
+        parsed["balance_amount"], parsed["rate_x18"], parsed["oracle_price_x18"],
+        "0x" + "00" * 32,
+        payment_kind,
+    )
+    try:
+        account = replace(
+            unsigned,
+            evidence_digest="0x" + nado_account_funding_digest(unsigned),
+        )
+        account.assert_contract()
+        return account
+    except NadoContractError:
+        raise OperationalSafetyError("account payment row contract mismatch") from None
+
+
+def parse_nado_account_funding_row(
+    raw: object, binding: FundingBoundaryBinding,
+) -> NadoAccountFunding:
+    return parse_nado_account_payment_row(raw, binding, payment_kind="funding")
+
+
+def _parse_account_payment_fields(raw: dict[str, object]) -> dict[str, int]:
+    return {
+        "idx": _official_integer_text(raw["idx"], "account payment index", nonnegative=True),
+        "timestamp": _official_integer_text(
+            raw["timestamp"], "account payment timestamp", positive=True
+        ),
+        "amount": _official_integer_text(raw["amount"], "account payment amount"),
+        "balance_amount": _official_integer_text(
+            raw["balance_amount"], "account payment balance"
+        ),
+        "rate_x18": _official_integer_text(raw["rate_x18"], "account payment rate"),
+        "oracle_price_x18": _official_integer_text(
+            raw["oracle_price_x18"], "account payment oracle", positive=True
+        ),
+    }
+
+
 class OperationalVenueIO:
     """Fixed-host production surface. Response semantics fail closed.
 
@@ -1157,6 +1398,12 @@ class OperationalVenueIO:
         self._terminal: dict[str, str] = {}
         self._cancelled_entry: str | None = None
         self._resting_orders: dict[str, OrderEvidence] = {}
+        self._v_quote_balances: dict[int, int] = {}
+        self._perp_last_cumulative_funding_x18: dict[int, int] = {}
+        self._funding_states: dict[int, tuple[int, int, int]] = {}
+        self._funding_baseline: NadoFundingBaseline | None = None
+        self._funding_exposure: NadoFundingExposure | None = None
+        self._funding_event: NadoFundingEvent | None = None
         self._connection_factory = lambda host: http.client.HTTPSConnection(
             host, timeout=HTTP_TIMEOUT_SECONDS, context=ssl.create_default_context(),
         )
@@ -1234,6 +1481,7 @@ class OperationalVenueIO:
             regular_orders_by_product=regular,
             cross_perp_amounts_x18=positions, isolated_positions=(),
             snapshot_id=str(uuid.uuid4()),
+            perp_last_cumulative_funding_x18=self._perp_last_cumulative_funding_x18,
         )
         trigger_snapshot = TriggerSnapshot(
             self.owner, SUBACCOUNT_NAME, observed, True, "trigger", triggers,
@@ -1262,6 +1510,389 @@ class OperationalVenueIO:
             CatalogSnapshot(tuple(products.values()), True, observed, True, "engine"),
             evidence, target, bid, ask,
         )
+
+    @staticmethod
+    def _funding_interval(binding: FundingBoundaryBinding) -> tuple[int, int]:
+        return (
+            binding.route.settlement_at_ms,
+            binding.route.settlement_at_ms + FUNDING_BOUNDARY_INTERVAL_MS,
+        )
+
+    def _assert_funding_binding(self, binding: FundingBoundaryBinding) -> None:
+        try:
+            binding.assert_contract()
+            if (
+                binding.route.nado_product_id != TARGET_PRODUCT_ID
+                or binding.route.nado_leg.market != TARGET_TICKER_ID
+                or binding.nado_journal.account_id.lower() != self.sender
+            ):
+                raise NadoContractError("funding adapter identity mismatch")
+            owner, subaccount_name = decode_subaccount(binding.nado_journal.account_id)
+            if owner.lower() != self.owner or subaccount_name != SUBACCOUNT_NAME:
+                raise NadoContractError("funding adapter subaccount mismatch")
+        except NadoContractError:
+            raise OperationalSafetyError("funding adapter identity mismatch") from None
+
+    def capture_funding_baseline(
+        self, binding: FundingBoundaryBinding, observation: LiveObservation,
+    ) -> NadoFundingBaseline:
+        """Read and return the immutable pre-entry archive/product baseline."""
+        self._assert_funding_binding(binding)
+        try:
+            _assert_authoritative_account(
+                observation.catalog,
+                observation.evidence.account,
+                now_ms=self.now_ms(),
+                require_flat=True,
+            )
+        except NadoContractError:
+            raise OperationalSafetyError("funding baseline account evidence rejected") from None
+        if (
+            observation.product.product_id != TARGET_PRODUCT_ID
+            or observation.product.symbol != TARGET_TICKER_ID
+            or observation.evidence.account.owner.lower() != self.owner
+            or observation.evidence.account.subaccount_name != SUBACCOUNT_NAME
+        ):
+            raise OperationalSafetyError("funding baseline product or account mismatch")
+        position = observation.evidence.account.cross_perp_amounts_x18.get(
+            TARGET_PRODUCT_ID
+        )
+        if position is None or position != 0:
+            raise OperationalSafetyError("funding baseline position is not exactly flat")
+        v_quote = self._v_quote_balances.get(TARGET_PRODUCT_ID)
+        if v_quote is None or v_quote != 0:
+            raise OperationalSafetyError("funding baseline v_quote is not exactly flat")
+        state = self._funding_states.get(TARGET_PRODUCT_ID)
+        if state is None:
+            raise OperationalSafetyError("funding baseline public state is unavailable")
+        cumulative_long, cumulative_short, open_interest = state
+        if open_interest < 0:
+            raise OperationalSafetyError("funding baseline open interest is invalid")
+        try:
+            funding_rows, all_indices = self._read_funding_history(binding)
+        except OperationalSafetyError:
+            raise
+        high_water = max(all_indices) if all_indices else None
+        empty_terminal = not all_indices
+        baseline = NadoFundingBaseline(
+            binding.nado_journal,
+            self.owner,
+            SUBACCOUNT_NAME,
+            TARGET_PRODUCT_ID,
+            binding.route.settlement_at_ms,
+            high_water,
+            empty_terminal,
+            position,
+            v_quote,
+            observation.evidence.account.observed_at_ms,
+            observation.evidence.account.snapshot_id,
+            cumulative_long,
+            cumulative_short,
+            open_interest,
+            observation.catalog.observed_at_ms,
+            "0x" + "00" * 32,
+        )
+        try:
+            baseline = replace(
+                baseline,
+                baseline_digest="0x" + self._baseline_digest(baseline),
+            )
+            baseline.assert_contract()
+        except NadoContractError:
+            raise OperationalSafetyError("funding baseline contract rejected") from None
+        self._funding_baseline = baseline
+        return baseline
+
+    def capture_funding_exposure(
+        self, binding: FundingBoundaryBinding, observation: LiveObservation,
+    ) -> NadoFundingExposure:
+        """Capture the exact fresh signed post-entry exposure before waiting."""
+        self._assert_funding_binding(binding)
+        baseline = self._funding_baseline
+        if baseline is None:
+            raise OperationalSafetyError("funding exposure baseline is unavailable")
+        try:
+            _assert_authoritative_account(
+                observation.catalog,
+                observation.evidence.account,
+                now_ms=self.now_ms(),
+                require_flat=False,
+                after_ms=baseline.position_observed_at_ms,
+            )
+        except NadoContractError:
+            raise OperationalSafetyError("funding exposure account evidence rejected") from None
+        if (
+            observation.product.product_id != TARGET_PRODUCT_ID
+            or observation.product.symbol != TARGET_TICKER_ID
+            or observation.evidence.account.owner.lower() != self.owner
+            or observation.evidence.account.subaccount_name != SUBACCOUNT_NAME
+        ):
+            raise OperationalSafetyError("funding exposure product or account mismatch")
+        position = observation.evidence.account.cross_perp_amounts_x18.get(
+            TARGET_PRODUCT_ID
+        )
+        route_quantity = _canonical_quantity_x18(binding.route.nado_leg.canonical_quantity)
+        expected_position = (
+            route_quantity
+            if binding.route.nado_leg.direction == LONG
+            else -route_quantity
+        )
+        if position != expected_position:
+            raise OperationalSafetyError("funding exposure position is not the exact route fill")
+        cumulative = observation.evidence.account.perp_last_cumulative_funding_x18.get(
+            TARGET_PRODUCT_ID
+        )
+        if cumulative is None:
+            raise OperationalSafetyError("funding exposure cumulative state is unavailable")
+        side = LONG if position > 0 else SHORT
+        baseline_cumulative = (
+            baseline.cumulative_funding_long_x18
+            if side == LONG
+            else baseline.cumulative_funding_short_x18
+        )
+        if cumulative != baseline_cumulative:
+            raise OperationalSafetyError("funding exposure cumulative state mismatch")
+        exposure = NadoFundingExposure(
+            binding.nado_journal,
+            self.owner,
+            SUBACCOUNT_NAME,
+            TARGET_PRODUCT_ID,
+            binding.route.nado_leg.direction,
+            position,
+            route_quantity,
+            observation.evidence.account.observed_at_ms,
+            observation.evidence.account.snapshot_id,
+            side,
+            cumulative,
+            "0x" + "00" * 32,
+        )
+        try:
+            exposure = replace(
+                exposure,
+                exposure_digest="0x" + nado_funding_exposure_digest(exposure),
+            )
+            exposure.assert_contract()
+        except NadoContractError:
+            raise OperationalSafetyError("funding exposure contract rejected") from None
+        self._funding_exposure = exposure
+        return exposure
+
+    @staticmethod
+    def _baseline_digest(baseline: NadoFundingBaseline) -> str:
+        from .nado_testnet_lifecycle import nado_funding_baseline_digest
+        return nado_funding_baseline_digest(baseline)
+
+    def _read_funding_page(
+        self, binding: FundingBoundaryBinding, max_idx: int | None,
+    ) -> tuple[list[NadoAccountFunding], list[int], int | None]:
+        body = {
+            "interest_and_funding": {
+                "subaccount": self.sender,
+                "product_ids": [TARGET_PRODUCT_ID],
+                "max_idx": None if max_idx is None else str(max_idx),
+                "limit": NADO_FUNDING_PAGE_LIMIT,
+            }
+        }
+        raw = self._post(_ARCHIVE_HOST, "/v1", body)
+        required = {"interest_payments", "funding_payments", "next_idx"}
+        if type(raw) is not dict or not required <= set(raw):
+            raise OperationalSafetyError("archive funding response schema mismatch")
+        interest_rows, funding_rows = raw["interest_payments"], raw["funding_payments"]
+        if type(interest_rows) is not list or type(funding_rows) is not list:
+            raise OperationalSafetyError("archive funding response schema mismatch")
+        if len(interest_rows) > NADO_FUNDING_PAGE_LIMIT or len(funding_rows) > NADO_FUNDING_PAGE_LIMIT:
+            raise OperationalSafetyError("archive funding page is not bounded")
+        all_indices: list[int] = []
+        for row in interest_rows:
+            if type(row) is not dict or type(row.get("product_id")) is not int:
+                raise OperationalSafetyError("archive interest row schema mismatch")
+            if row["product_id"] != TARGET_PRODUCT_ID:
+                raise OperationalSafetyError("archive funding product mismatch")
+            parsed = _parse_account_payment_fields(row)
+            all_indices.append(parsed["idx"])
+        parsed_funding: list[NadoAccountFunding] = []
+        for row in funding_rows:
+            if type(row) is not dict or row.get("product_id") != TARGET_PRODUCT_ID:
+                raise OperationalSafetyError("archive funding product mismatch")
+            parsed_funding.append(parse_nado_account_funding_row(row, binding))
+            all_indices.append(parsed_funding[-1].idx)
+        next_raw = raw["next_idx"]
+        if next_raw is None:
+            next_idx = None
+        else:
+            next_idx = _official_integer_text(
+                next_raw, "archive funding next index", nonnegative=True
+            )
+        if max_idx is not None and any(idx > max_idx for idx in all_indices):
+            raise OperationalSafetyError("archive funding cursor was not respected")
+        return parsed_funding, all_indices, next_idx
+
+    def _read_funding_history(
+        self, binding: FundingBoundaryBinding, *, stop_idx: int | None = None,
+    ) -> tuple[list[NadoAccountFunding], list[int]]:
+        cursor: int | None = None
+        pages = 0
+        funding_rows: list[NadoAccountFunding] = []
+        all_indices: list[int] = []
+        seen_rows: dict[tuple[str, int], NadoAccountFunding] = {}
+        seen_indices: set[int] = set()
+        while pages < NADO_FUNDING_MAX_PAGES:
+            page_rows, page_indices, next_idx = self._read_funding_page(binding, cursor)
+            pages += 1
+            if not page_indices and next_idx is not None:
+                raise OperationalSafetyError("archive funding pagination is incomplete")
+            for idx in page_indices:
+                if idx not in seen_indices:
+                    seen_indices.add(idx)
+                    all_indices.append(idx)
+            for row in page_rows:
+                identity = ("funding", row.idx)
+                previous = seen_rows.get(identity)
+                if previous is not None and previous != row:
+                    raise OperationalSafetyError("archive funding row is contradictory")
+                if previous is None:
+                    seen_rows[identity] = row
+                    funding_rows.append(row)
+            if stop_idx is not None and page_indices and max(page_indices) <= stop_idx:
+                return funding_rows, all_indices
+            if next_idx is None:
+                return funding_rows, all_indices
+            if cursor is not None and next_idx >= cursor:
+                raise OperationalSafetyError("archive funding cursor did not advance")
+            cursor = next_idx
+        raise OperationalSafetyError("archive funding pagination is not bounded")
+
+    async def _await_funding_boundary_async(
+        self, binding: FundingBoundaryBinding,
+    ) -> None:
+        now_ms = self.now_ms()
+        deadline = time.monotonic() + max(
+            0.0,
+            (binding.route.settlement_at_ms - now_ms) / 1_000,
+        ) + NADO_FUNDING_WAIT_GRACE_SECONDS
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise OperationalSafetyError(
+                    "public funding stream deadline exhausted"
+                )
+            connect_timeout = min(HTTP_TIMEOUT_SECONDS, remaining)
+            timeout = aiohttp.ClientTimeout(total=None, sock_connect=connect_timeout)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.ws_connect(
+                    _FUNDING_SUBSCRIBE_URL,
+                    heartbeat=30,
+                    timeout=connect_timeout,
+                ) as websocket:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise OperationalSafetyError(
+                            "public funding stream deadline exhausted"
+                        )
+                    await asyncio.wait_for(websocket.send_json({
+                        "method": "subscribe",
+                        "stream": {
+                            "type": "funding_payment",
+                            "product_id": TARGET_PRODUCT_ID,
+                        },
+                    }), timeout=remaining)
+                    while True:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise OperationalSafetyError(
+                                "public funding stream deadline exhausted"
+                            )
+                        message = await websocket.receive(timeout=remaining)
+                        if time.monotonic() >= deadline:
+                            raise OperationalSafetyError(
+                                "public funding stream deadline exhausted"
+                            )
+                        if message.type is aiohttp.WSMsgType.TEXT:
+                            try:
+                                payload = json.loads(message.data)
+                            except (TypeError, json.JSONDecodeError):
+                                raise OperationalSafetyError(
+                                    "public funding event schema mismatch"
+                                ) from None
+                            if type(payload) is not dict or payload.get("type") != "funding_payment":
+                                continue
+                            event = parse_nado_public_funding_event(payload)
+                            if event.product_id != binding.route.nado_product_id:
+                                raise OperationalSafetyError(
+                                    "public funding event product mismatch"
+                                )
+                            start_ms, end_ms = self._funding_interval(binding)
+                            event_ms = event.timestamp // 1_000_000
+                            if not start_ms <= event_ms < end_ms:
+                                raise OperationalSafetyError(
+                                    "public funding event boundary mismatch"
+                                )
+                            self._funding_event = event
+                            return
+                        if message.type in {
+                            aiohttp.WSMsgType.CLOSED,
+                            aiohttp.WSMsgType.CLOSE,
+                            aiohttp.WSMsgType.ERROR,
+                        }:
+                            raise OperationalSafetyError(
+                                "public funding stream ended before settlement"
+                            )
+        except OperationalSafetyError:
+            raise
+        except asyncio.TimeoutError:
+            if time.monotonic() >= deadline:
+                raise OperationalSafetyError(
+                    "public funding stream deadline exhausted"
+                ) from None
+            raise OperationalSafetyError(
+                "public funding stream transport failed"
+            ) from None
+        except (aiohttp.ClientError, OSError):
+            raise OperationalSafetyError(
+                "public funding stream transport failed"
+            ) from None
+
+    def await_funding_boundary(self, binding: FundingBoundaryBinding) -> None:
+        self._assert_funding_binding(binding)
+        if self._funding_event is not None:
+            return
+        try:
+            asyncio.run(self._await_funding_boundary_async(binding))
+        except RuntimeError as error:
+            if "cannot be called from a running event loop" in str(error):
+                raise OperationalSafetyError(
+                    "public funding stream requires a synchronous boundary"
+                ) from None
+            raise
+
+    def read_funding_boundary(
+        self, binding: FundingBoundaryBinding,
+    ) -> tuple[NadoFundingEvent | None, NadoAccountFunding | None]:
+        self._assert_funding_binding(binding)
+        baseline = self._funding_baseline
+        event = self._funding_event
+        if baseline is None or event is None:
+            raise OperationalSafetyError("funding baseline or event is unavailable")
+        funding_rows, _all_indices = self._read_funding_history(
+            binding, stop_idx=baseline.history_high_water_idx,
+        )
+        new_rows = [
+            row for row in funding_rows
+            if baseline.history_high_water_idx is None
+            or row.idx > baseline.history_high_water_idx
+        ]
+        if not new_rows:
+            return event, None
+        start_ms, end_ms = self._funding_interval(binding)
+        for row in new_rows:
+            row_ms = row.timestamp * 1_000
+            if not start_ms <= row_ms < end_ms:
+                raise OperationalSafetyError(
+                    "account funding row boundary mismatch"
+                )
+        if len(new_rows) != 1:
+            raise OperationalSafetyError("multiple post-boundary funding rows")
+        return event, new_rows[0]
 
     def validate_order(self, order: SyntheticOrderVector, signature: str) -> bool:
         try:
@@ -1503,6 +2134,7 @@ class OperationalVenueIO:
         if type(raw) is not dict or set(raw) != {"spot_products", "perp_products"}:
             raise OperationalSafetyError("catalog schema mismatch")
         result: dict[int, Product] = {}
+        self._funding_states = {}
         catalog_ids: set[int] = set()
         for kind, field in (("SPOT", "spot_products"), (ACTIVE_PERP, "perp_products")):
             if type(raw[field]) is not list:
@@ -1516,6 +2148,28 @@ class OperationalVenueIO:
                 catalog_ids.add(product_id)
                 if product_id in {0, 11}:
                     continue
+                if kind == ACTIVE_PERP and "state" in item:
+                    state = item["state"]
+                    if type(state) is not dict:
+                        raise OperationalSafetyError("funding state schema mismatch")
+                    required_state = {
+                        "cumulative_funding_long_x18",
+                        "cumulative_funding_short_x18",
+                        "open_interest",
+                    }
+                    if not required_state <= set(state):
+                        raise OperationalSafetyError("funding state schema mismatch")
+                    self._funding_states[product_id] = (
+                        self._integer(
+                            state["cumulative_funding_long_x18"],
+                            "cumulative funding long",
+                        ),
+                        self._integer(
+                            state["cumulative_funding_short_x18"],
+                            "cumulative funding short",
+                        ),
+                        self._integer(state["open_interest"], "funding open interest"),
+                    )
                 symbol = pairs.get(product_id)
                 if symbol is None:
                     raise OperationalSafetyError("catalog V2 identity coverage mismatch")
@@ -1580,14 +2234,22 @@ class OperationalVenueIO:
             if item.get("product_id") != 0 and amount:
                 raise OperationalSafetyError("unrelated spot exposure")
         result = {pid: 0 for pid, product in products.items() if product.product_type == ACTIVE_PERP}
+        self._v_quote_balances = {pid: 0 for pid in result}
+        self._perp_last_cumulative_funding_x18 = {}
         for item in perps:
             if type(item) is not dict or type(item.get("balance")) is not dict:
                 raise OperationalSafetyError("perp balance schema mismatch")
             product_id = item.get("product_id")
             amount = self._integer(item["balance"].get("amount"), "perp amount")
             quote = self._integer(item["balance"].get("v_quote_balance"), "v_quote")
+            cumulative = self._integer(
+                item["balance"].get("last_cumulative_funding_x18"),
+                "last cumulative funding",
+            )
             if product_id in result:
                 result[product_id] = amount
+                self._v_quote_balances[product_id] = quote
+                self._perp_last_cumulative_funding_x18[product_id] = cumulative
             elif amount or quote:
                 raise OperationalSafetyError("unrelated perpetual exposure")
             if amount == 0 and quote != 0:

@@ -456,6 +456,7 @@ class AccountSnapshot:
     isolated_positions: tuple[str, ...]
     snapshot_id: str = "engine-snapshot"
     contradictions: tuple[str, ...] = ()
+    perp_last_cumulative_funding_x18: Mapping[int, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -684,6 +685,14 @@ def _exact_decimal(value: object, label: str, *, positive: bool = False) -> Deci
 def _decimal_text(value: object, label: str, *, positive: bool = False) -> str:
     parsed = _exact_decimal(value, label, positive=positive)
     return format(parsed.normalize(), "f")
+
+
+def _funding_quantity_x18(value: object, label: str = "funding quantity") -> int:
+    parsed = _exact_decimal(value, label, positive=True)
+    scaled = parsed * X18
+    if scaled != scaled.to_integral_value():
+        raise NadoContractError(f"{label} is not exactly representable in x18")
+    return int(scaled)
 
 
 def _safe_identifier(value: object, label: str) -> str:
@@ -960,35 +969,276 @@ def cross_run_attestation_digest(attestation: CrossRunAttestation) -> str:
     return hashlib.sha256(canonical_payload(_attestation_payload(attestation))).hexdigest()
 
 
-@dataclass(frozen=True)
-class NadoFundingEvent:
-    """One authoritative Nado event for the persisted market and settlement."""
+FUNDING_BOUNDARY_INTERVAL_MS = 3_600_000
+FUNDING_BLOCKED_MISSING = "POST_BOUNDARY_FUNDING_EVIDENCE_MISSING"
+FUNDING_BLOCKED_CONTRADICTORY = "POST_BOUNDARY_FUNDING_EVIDENCE_CONTRADICTORY"
+FUNDING_BLOCKER_REASONS = frozenset({
+    FUNDING_BLOCKED_MISSING,
+    FUNDING_BLOCKED_CONTRADICTORY,
+})
 
-    event_id: str
+
+def _funding_integer(value: object, label: str, *, nonnegative: bool = False) -> int:
+    if type(value) is not int or (nonnegative and value < 0):
+        raise NadoContractError(f"{label} must be an integer")
+    return value
+
+
+@dataclass(frozen=True)
+class NadoFundingBaseline:
+    """Durable pre-entry state for one exact Nado funding boundary.
+
+    The history cursor is an archive cursor, not an account cash value.  The
+    explicit empty terminal flag records the authoritative ``next_idx=null``
+    baseline observed for a previously unused subaccount.
+    """
+
     journal: JournalIdentity
+    owner: str
+    subaccount_name: str
     product_id: int
-    market: str
-    settlement_at_ms: int
-    canonical_quantity: object
-    rate_x18: int
-    cash_x18: int
-    status: str
-    event_digest: str
+    boundary_at_ms: int
+    history_high_water_idx: int | None
+    history_empty_terminal: bool
+    position_x18: int
+    v_quote_balance_x18: int
+    position_observed_at_ms: int
+    position_snapshot_id: str
+    cumulative_funding_long_x18: int
+    cumulative_funding_short_x18: int
+    open_interest_x18: int
+    public_observed_at_ms: int
+    baseline_digest: str
+    authoritative: bool = True
+
+    @property
+    def target_boundary_at_ms(self) -> int:
+        return self.boundary_at_ms
+
+    def assert_contract(self) -> None:
+        self.journal.assert_contract()
+        if self.journal.venue != NADO_VENUE:
+            raise NadoContractError("Nado funding baseline journal is not Nado")
+        _address_bytes(self.owner)
+        if self.journal.account_id.lower() != encode_subaccount(
+            self.owner, self.subaccount_name
+        ).lower():
+            raise NadoContractError("Nado funding baseline journal identity mismatch")
+        product_verifier(_strict_int(self.product_id, "Nado funding baseline product id"))
+        _strict_int(self.boundary_at_ms, "Nado funding baseline boundary", positive=True)
+        if self.history_high_water_idx is not None:
+            _funding_integer(
+                self.history_high_water_idx,
+                "Nado funding history high-water index",
+                nonnegative=True,
+            )
+        if type(self.history_empty_terminal) is not bool:
+            raise NadoContractError("Nado funding baseline empty marker is invalid")
+        if self.history_empty_terminal != (self.history_high_water_idx is None):
+            raise NadoContractError("Nado funding baseline cursor/empty marker disagree")
+        _funding_integer(self.position_x18, "Nado funding baseline position")
+        _funding_integer(self.v_quote_balance_x18, "Nado funding baseline v_quote")
+        _strict_int(
+            self.position_observed_at_ms,
+            "Nado funding baseline position timestamp",
+            positive=True,
+        )
+        _safe_identifier(self.position_snapshot_id, "Nado funding baseline snapshot identity")
+        _funding_integer(
+            self.cumulative_funding_long_x18,
+            "Nado funding baseline long cumulative",
+        )
+        _funding_integer(
+            self.cumulative_funding_short_x18,
+            "Nado funding baseline short cumulative",
+        )
+        _funding_integer(
+            self.open_interest_x18,
+            "Nado funding baseline open interest",
+            nonnegative=True,
+        )
+        _strict_int(
+            self.public_observed_at_ms,
+            "Nado funding baseline public timestamp",
+            positive=True,
+        )
+        if (
+            self.position_observed_at_ms >= self.boundary_at_ms
+            or self.public_observed_at_ms >= self.boundary_at_ms
+        ):
+            raise NadoContractError(
+                "Nado funding baseline observations must precede the boundary"
+            )
+        if self.authoritative is not True:
+            raise NadoContractError("Nado funding baseline is not authoritative")
+        if _hash_text(self.baseline_digest, "Nado funding baseline digest") != (
+            "0x" + nado_funding_baseline_digest(self)
+        ):
+            raise NadoContractError("Nado funding baseline digest does not bind its contents")
+
+
+def _nado_baseline_payload(baseline: NadoFundingBaseline) -> dict[str, object]:
+    return {
+        "journal": _journal_payload(baseline.journal),
+        "owner": baseline.owner.lower(),
+        "subaccount_name": baseline.subaccount_name,
+        "product_id": baseline.product_id,
+        "boundary_at_ms": baseline.boundary_at_ms,
+        "history_high_water_idx": baseline.history_high_water_idx,
+        "history_empty_terminal": baseline.history_empty_terminal,
+        "position_x18": baseline.position_x18,
+        "v_quote_balance_x18": baseline.v_quote_balance_x18,
+        "position_observed_at_ms": baseline.position_observed_at_ms,
+        "position_snapshot_id": baseline.position_snapshot_id,
+        "cumulative_funding_long_x18": baseline.cumulative_funding_long_x18,
+        "cumulative_funding_short_x18": baseline.cumulative_funding_short_x18,
+        "open_interest_x18": baseline.open_interest_x18,
+        "public_observed_at_ms": baseline.public_observed_at_ms,
+        "authoritative": baseline.authoritative,
+    }
+
+
+def nado_funding_baseline_digest(baseline: NadoFundingBaseline) -> str:
+    return hashlib.sha256(canonical_payload(_nado_baseline_payload(baseline))).hexdigest()
+
+
+@dataclass(frozen=True)
+class NadoFundingExposure:
+    """Durable authoritative signed exposure observed after entry and before settlement."""
+
+    journal: JournalIdentity
+    owner: str
+    subaccount_name: str
+    product_id: int
+    direction: str
+    signed_position_x18: int
+    route_quantity_x18: int
+    observed_at_ms: int
+    snapshot_id: str
+    cumulative_side: str
+    cumulative_funding_x18: int
+    exposure_digest: str
     authoritative: bool = True
 
     def assert_contract(self) -> None:
-        _safe_identifier(self.event_id, "Nado funding event identity")
         self.journal.assert_contract()
         if self.journal.venue != NADO_VENUE:
-            raise NadoContractError("Nado funding event journal is not Nado")
+            raise NadoContractError("Nado funding exposure journal is not Nado")
+        _address_bytes(self.owner)
+        if self.journal.account_id.lower() != encode_subaccount(
+            self.owner, self.subaccount_name
+        ).lower():
+            raise NadoContractError("Nado funding exposure journal identity mismatch")
+        product_verifier(_strict_int(self.product_id, "Nado funding exposure product id"))
+        if self.direction not in {LONG, SHORT}:
+            raise NadoContractError("Nado funding exposure direction is invalid")
+        _funding_integer(self.signed_position_x18, "Nado funding signed position")
+        if self.signed_position_x18 == 0:
+            raise NadoContractError("Nado funding exposure position is not open")
+        _funding_integer(
+            self.route_quantity_x18,
+            "Nado funding route quantity",
+        )
+        if self.route_quantity_x18 <= 0:
+            raise NadoContractError("Nado funding route quantity is not positive")
+        expected_sign = 1 if self.direction == LONG else -1
+        if (
+            abs(self.signed_position_x18) != self.route_quantity_x18
+            or (self.signed_position_x18 > 0) != (expected_sign > 0)
+        ):
+            raise NadoContractError("Nado funding exposure sign or quantity mismatch")
+        _strict_int(self.observed_at_ms, "Nado funding exposure timestamp", positive=True)
+        _safe_identifier(self.snapshot_id, "Nado funding exposure snapshot identity")
+        if self.cumulative_side not in {LONG, SHORT}:
+            raise NadoContractError("Nado funding exposure cumulative side is invalid")
+        if self.cumulative_side != self.direction:
+            raise NadoContractError("Nado funding exposure cumulative side mismatch")
+        _funding_integer(
+            self.cumulative_funding_x18,
+            "Nado funding exposure cumulative state",
+        )
+        if self.authoritative is not True:
+            raise NadoContractError("Nado funding exposure is not authoritative")
+        if _hash_text(self.exposure_digest, "Nado funding exposure digest") != (
+            "0x" + nado_funding_exposure_digest(self)
+        ):
+            raise NadoContractError("Nado funding exposure digest does not bind its contents")
+
+
+def _nado_exposure_payload(exposure: NadoFundingExposure) -> dict[str, object]:
+    return {
+        "journal": _journal_payload(exposure.journal),
+        "owner": exposure.owner.lower(),
+        "subaccount_name": exposure.subaccount_name,
+        "product_id": exposure.product_id,
+        "direction": exposure.direction,
+        "signed_position_x18": exposure.signed_position_x18,
+        "route_quantity_x18": exposure.route_quantity_x18,
+        "observed_at_ms": exposure.observed_at_ms,
+        "snapshot_id": exposure.snapshot_id,
+        "cumulative_side": exposure.cumulative_side,
+        "cumulative_funding_x18": exposure.cumulative_funding_x18,
+        "authoritative": exposure.authoritative,
+    }
+
+
+def nado_funding_exposure_digest(exposure: NadoFundingExposure) -> str:
+    return hashlib.sha256(canonical_payload(_nado_exposure_payload(exposure))).hexdigest()
+
+
+@dataclass(frozen=True)
+class NadoFundingEvent:
+    """Authoritative public product-level hourly funding payment.
+
+    This intentionally contains no account quantity, account cash, or account
+    status.  ``payment_amount`` is the aggregate product payment from Nado's
+    public event contract.
+    """
+
+    product_id: int
+    timestamp: int
+    payment_amount: int
+    open_interest: int
+    cumulative_funding_long_x18: int
+    cumulative_funding_short_x18: int
+    dt: int
+    event_digest: str
+    authoritative: bool = True
+
+    @property
+    def event_id(self) -> str:
+        return f"nado-funding-{self.product_id}-{self.timestamp}"
+
+    @property
+    def timestamp_ns(self) -> int:
+        return self.timestamp
+
+    @property
+    def payment_amount_x18(self) -> int:
+        return self.payment_amount
+
+    @property
+    def open_interest_x18(self) -> int:
+        return self.open_interest
+
+    @property
+    def dt_ns(self) -> int:
+        return self.dt
+
+    def assert_contract(self) -> None:
         product_verifier(_strict_int(self.product_id, "Nado funding product id"))
-        _safe_identifier(self.market, "Nado funding event market")
-        _strict_int(self.settlement_at_ms, "Nado funding event settlement", positive=True)
-        _exact_decimal(self.canonical_quantity, "Nado funding event quantity", positive=True)
-        if type(self.rate_x18) is not int or type(self.cash_x18) is not int:
-            raise NadoContractError("Nado funding event values must be integers")
-        if self.status not in FUNDING_STATUSES:
-            raise NadoContractError("Nado funding event status is invalid")
+        _strict_int(self.timestamp, "Nado funding event timestamp", positive=True)
+        _funding_integer(self.payment_amount, "Nado funding aggregate payment")
+        _funding_integer(self.open_interest, "Nado funding open interest", nonnegative=True)
+        _funding_integer(
+            self.cumulative_funding_long_x18,
+            "Nado funding cumulative long value",
+        )
+        _funding_integer(
+            self.cumulative_funding_short_x18,
+            "Nado funding cumulative short value",
+        )
+        _strict_int(self.dt, "Nado funding event dt", positive=True)
         if self.authoritative is not True:
             raise NadoContractError("Nado funding event is not authoritative")
         if _hash_text(self.event_digest, "Nado funding event digest") != (
@@ -997,19 +1247,18 @@ class NadoFundingEvent:
             raise NadoContractError("Nado funding event digest does not bind its contents")
 
 
+NadoPublicFundingEvent = NadoFundingEvent
+
+
 def _nado_event_payload(event: NadoFundingEvent) -> dict[str, object]:
     return {
-        "event_id": event.event_id,
-        "journal": _journal_payload(event.journal),
         "product_id": event.product_id,
-        "market": event.market,
-        "settlement_at_ms": event.settlement_at_ms,
-        "canonical_quantity": _decimal_text(
-            event.canonical_quantity, "Nado funding event quantity", positive=True
-        ),
-        "rate_x18": event.rate_x18,
-        "cash_x18": event.cash_x18,
-        "status": event.status,
+        "timestamp": event.timestamp,
+        "payment_amount": event.payment_amount,
+        "open_interest": event.open_interest,
+        "cumulative_funding_long_x18": event.cumulative_funding_long_x18,
+        "cumulative_funding_short_x18": event.cumulative_funding_short_x18,
+        "dt": event.dt,
         "authoritative": event.authoritative,
     }
 
@@ -1020,39 +1269,61 @@ def nado_funding_event_digest(event: NadoFundingEvent) -> str:
 
 @dataclass(frozen=True)
 class NadoAccountFunding:
-    """Account-scoped applied funding record read from Nado."""
+    """One official account-scoped funding-payment row.
+
+    These fields mirror the pinned Python SDK ``IndexerPayment`` contract.
+    ``amount`` is individual account cash and is deliberately independent of
+    the public product event's aggregate ``payment_amount``.
+    """
 
     journal: JournalIdentity
     owner: str
     subaccount_name: str
-    event_id: str
     product_id: int
-    market: str
-    settlement_at_ms: int
-    canonical_quantity: object
+    idx: int
+    timestamp: int
+    amount: int
+    balance_amount: int
     rate_x18: int
-    cash_x18: int
-    status: str
+    oracle_price_x18: int
     evidence_digest: str
+    payment_kind: str = "funding"
     authoritative: bool = True
+
+    @property
+    def amount_x18(self) -> int:
+        return self.amount
+
+    @property
+    def balance_amount_x18(self) -> int:
+        return self.balance_amount
+
+    @property
+    def timestamp_s(self) -> int:
+        return self.timestamp
 
     def assert_contract(self) -> None:
         self.journal.assert_contract()
         if self.journal.venue != NADO_VENUE:
             raise NadoContractError("Nado account funding journal is not Nado")
         _address_bytes(self.owner)
-        sender = encode_subaccount(self.owner, self.subaccount_name)
-        if self.journal.account_id.lower() != sender.lower():
+        if self.journal.account_id.lower() != encode_subaccount(
+            self.owner, self.subaccount_name
+        ).lower():
             raise NadoContractError("Nado account funding journal identity mismatch")
-        _safe_identifier(self.event_id, "Nado account funding event identity")
         product_verifier(_strict_int(self.product_id, "Nado account funding product id"))
-        _safe_identifier(self.market, "Nado account funding market")
-        _strict_int(self.settlement_at_ms, "Nado account funding settlement", positive=True)
-        _exact_decimal(self.canonical_quantity, "Nado account funding quantity", positive=True)
-        if type(self.rate_x18) is not int or type(self.cash_x18) is not int:
-            raise NadoContractError("Nado account funding values must be integers")
-        if self.status not in FUNDING_STATUSES:
-            raise NadoContractError("Nado account funding status is invalid")
+        _funding_integer(self.idx, "Nado account funding index", nonnegative=True)
+        _strict_int(self.timestamp, "Nado account funding timestamp", positive=True)
+        _funding_integer(self.amount, "Nado account funding amount")
+        _funding_integer(self.balance_amount, "Nado account funding balance")
+        _strict_int(self.rate_x18, "Nado account funding rate")
+        _strict_int(
+            self.oracle_price_x18,
+            "Nado account funding oracle price",
+            positive=True,
+        )
+        if self.payment_kind != "funding":
+            raise NadoContractError("Nado account row is not a funding payment")
         if self.authoritative is not True:
             raise NadoContractError("Nado account funding is not authoritative")
         if _hash_text(self.evidence_digest, "Nado account funding digest") != (
@@ -1063,21 +1334,22 @@ class NadoAccountFunding:
             )
 
 
+NadoAccountFundingRow = NadoAccountFunding
+
+
 def _nado_account_funding_payload(account: NadoAccountFunding) -> dict[str, object]:
     return {
         "journal": _journal_payload(account.journal),
         "owner": account.owner.lower(),
         "subaccount_name": account.subaccount_name,
-        "event_id": account.event_id,
         "product_id": account.product_id,
-        "market": account.market,
-        "settlement_at_ms": account.settlement_at_ms,
-        "canonical_quantity": _decimal_text(
-            account.canonical_quantity, "Nado account funding quantity", positive=True
-        ),
+        "idx": account.idx,
+        "timestamp": account.timestamp,
+        "amount": account.amount,
+        "balance_amount": account.balance_amount,
         "rate_x18": account.rate_x18,
-        "cash_x18": account.cash_x18,
-        "status": account.status,
+        "oracle_price_x18": account.oracle_price_x18,
+        "payment_kind": account.payment_kind,
         "authoritative": account.authoritative,
     }
 
@@ -1088,103 +1360,211 @@ def nado_account_funding_digest(account: NadoAccountFunding) -> str:
 
 @dataclass(frozen=True)
 class NadoFundingBoundaryResult:
-    event_id: str
+    event_id: str | None
     market: str
     settlement_at_ms: int
     status: str
-    rate_x18: int
-    cash_x18: int
+    rate_x18: int | None
+    cash_x18: int | None
     completion_eligible: bool
     blocked: bool
+    aggregate_payment_x18: int | None = None
+    account_idx: int | None = None
+    reason: str | None = None
 
 
-def validate_nado_funding_boundary(
+def _funding_event_interval_ms(
+    boundary_at_ms: int, event: NadoFundingEvent,
+) -> tuple[int, int]:
+    del event
+    return boundary_at_ms, boundary_at_ms + FUNDING_BOUNDARY_INTERVAL_MS
+
+
+def _account_timestamp_ms(account: NadoAccountFunding) -> int:
+    # The archive contract documents payment timestamps as Unix epoch seconds.
+    return account.timestamp * 1_000
+
+
+def _assert_funding_identity(
     *,
     binding: FundingBoundaryBinding,
-    attestation: CrossRunAttestation | None,
-    event: NadoFundingEvent | None,
-    account_funding: NadoAccountFunding | None,
-) -> NadoFundingBoundaryResult:
-    """Validate the exact persisted route, journals, terminal proofs, and funding.
-
-    A missing or contradictory record is a contract failure. Explicit venue
-    statuses are retained as evidence, but only applied funding is eligible
-    for completion. In particular, zero cash is accepted only when the
-    authoritative event and account-scoped record both explicitly say zero.
-    """
-    binding.assert_contract()
-    if attestation is None or event is None or account_funding is None:
-        raise NadoContractError("funding boundary evidence is incomplete")
-    try:
-        attestation.assert_contract()
-        event.assert_contract()
-        account_funding.assert_contract()
-    except NadoContractError:
-        raise
+    baseline: NadoFundingBaseline,
+    attestation: CrossRunAttestation,
+    event: NadoFundingEvent,
+    account_funding: NadoAccountFunding,
+    exposure: NadoFundingExposure,
+) -> None:
     if _funding_route_payload(attestation.route) != _funding_route_payload(binding.route):
         raise NadoContractError("cross-run attestation route is not the persisted route")
     if _journal_payload(attestation.risex_journal) != _journal_payload(binding.risex_journal):
         raise NadoContractError("RISEx journal identity is not the persisted journal")
     if _journal_payload(attestation.nado_journal) != _journal_payload(binding.nado_journal):
         raise NadoContractError("Nado journal identity is not the persisted journal")
-    if _journal_payload(event.journal) != _journal_payload(binding.nado_journal):
-        raise NadoContractError("Nado funding event is not bound to the persisted journal")
-    if _journal_payload(account_funding.journal) != _journal_payload(binding.nado_journal):
-        raise NadoContractError(
-            "Nado account funding is not bound to the persisted journal"
-        )
+    for name, journal in (
+        ("baseline", baseline.journal),
+        ("Nado account funding", account_funding.journal),
+        ("Nado funding exposure", exposure.journal),
+    ):
+        if _journal_payload(journal) != _journal_payload(binding.nado_journal):
+            raise NadoContractError(f"{name} is not bound to the persisted journal")
     route = binding.route
-    expected = {
-        "product_id": route.nado_product_id,
-        "market": route.nado_leg.market,
-        "settlement_at_ms": route.settlement_at_ms,
-    }
     if (
-        event.product_id != expected["product_id"]
-        or event.market != expected["market"]
-        or event.settlement_at_ms != expected["settlement_at_ms"]
-        or _exact_decimal(event.canonical_quantity, "Nado funding event quantity", positive=True)
-        != route.canonical_quantity
+        baseline.product_id != route.nado_product_id
+        or baseline.boundary_at_ms != route.settlement_at_ms
+        or event.product_id != route.nado_product_id
+        or account_funding.product_id != route.nado_product_id
+        or exposure.product_id != route.nado_product_id
     ):
-        raise NadoContractError("Nado funding event is not the persisted market settlement")
+        raise NadoContractError("Nado funding evidence is not bound to the persisted product")
+    if baseline.owner.lower() != account_funding.owner.lower():
+        raise NadoContractError("Nado account funding owner differs from baseline")
+    if baseline.subaccount_name != account_funding.subaccount_name:
+        raise NadoContractError("Nado account funding subaccount differs from baseline")
+    if baseline.owner.lower() != exposure.owner.lower():
+        raise NadoContractError("Nado funding exposure owner differs from baseline")
+    if baseline.subaccount_name != exposure.subaccount_name:
+        raise NadoContractError("Nado funding exposure subaccount differs from baseline")
+
+
+def _solidity_divide_toward_zero(numerator: int, denominator: int) -> int:
+    if type(numerator) is not int or type(denominator) is not int or denominator <= 0:
+        raise NadoContractError("Nado funding settlement division is invalid")
+    magnitude = abs(numerator) // denominator
+    return -magnitude if numerator < 0 else magnitude
+
+
+def nado_funding_account_amount_x18(
+    cumulative_delta_x18: int, signed_position_x18: int,
+) -> int:
+    """Apply PerpEngineState._updateBalance with vQuoteDelta equal to zero.
+
+    MathSD21x18.mul uses signed integer division by 1e18, which Solidity
+    truncates toward zero.  The account archive amount is the resulting
+    deltaQuote, not the public product aggregate payment.
+    """
+    _funding_integer(cumulative_delta_x18, "Nado funding cumulative delta")
+    _funding_integer(signed_position_x18, "Nado funding signed position")
+    return -_solidity_divide_toward_zero(
+        cumulative_delta_x18 * signed_position_x18, X18
+    )
+
+
+def validate_nado_funding_boundary(
+    *,
+    binding: FundingBoundaryBinding,
+    baseline: NadoFundingBaseline | None,
+    attestation: CrossRunAttestation | None,
+    event: NadoFundingEvent | None,
+    account_funding: NadoAccountFunding | None,
+    exposure: NadoFundingExposure | None,
+) -> NadoFundingBoundaryResult:
+    """Validate product and account evidence for one funding boundary.
+
+    The public event supplies the product-level cumulative transition.  The
+    signed exposure selects the account's long or short cumulative side, and
+    the account amount must equal the exact PerpEngineState settlement delta.
+    The archive rate and oracle fields are retained as strict metadata only.
+    """
+    binding.assert_contract()
+    if baseline is None:
+        raise NadoContractError("pre-entry funding baseline is incomplete")
     if (
-        account_funding.event_id != event.event_id
-        or account_funding.product_id != event.product_id
-        or account_funding.market != event.market
-        or account_funding.settlement_at_ms != event.settlement_at_ms
-        or _exact_decimal(
-            account_funding.canonical_quantity,
-            "Nado account funding quantity",
-            positive=True,
-        )
-        != route.canonical_quantity
-        or account_funding.rate_x18 != event.rate_x18
-        or account_funding.cash_x18 != event.cash_x18
-        or account_funding.status != event.status
+        attestation is None
+        or event is None
+        or account_funding is None
+        or exposure is None
     ):
+        raise NadoContractError("post-boundary funding evidence is incomplete")
+    attestation.assert_contract()
+    baseline.assert_contract()
+    event.assert_contract()
+    account_funding.assert_contract()
+    exposure.assert_contract()
+    _assert_funding_identity(
+        binding=binding,
+        baseline=baseline,
+        attestation=attestation,
+        event=event,
+        account_funding=account_funding,
+        exposure=exposure,
+    )
+    if baseline.position_x18 != 0 or baseline.v_quote_balance_x18 != 0:
+        raise NadoContractError("pre-entry funding baseline is not exactly flat")
+    start_ms, end_ms = _funding_event_interval_ms(binding.route.settlement_at_ms, event)
+    event_ms = event.timestamp // 1_000_000
+    account_ms = _account_timestamp_ms(account_funding)
+    if not start_ms <= event_ms < end_ms:
+        raise NadoContractError("public funding event is outside the persisted boundary")
+    if not start_ms <= account_ms < end_ms:
+        raise NadoContractError("account funding row is outside the persisted boundary")
+    if event.dt != FUNDING_BOUNDARY_INTERVAL_MS * 1_000_000:
+        raise NadoContractError("public funding event interval does not match the boundary")
+    if baseline.history_high_water_idx is not None:
+        if account_funding.idx <= baseline.history_high_water_idx:
+            raise NadoContractError("account funding row is stale or prior to the baseline")
+    elif not baseline.history_empty_terminal:
+        raise NadoContractError("account funding baseline cursor is invalid")
+    expected_route_quantity = _funding_quantity_x18(
+        binding.route.nado_leg.canonical_quantity,
+        "Nado route canonical quantity",
+    )
+    expected_position = (
+        expected_route_quantity
+        if binding.route.nado_leg.direction == LONG
+        else -expected_route_quantity
+    )
+    if (
+        exposure.direction != binding.route.nado_leg.direction
+        or exposure.route_quantity_x18 != expected_route_quantity
+        or exposure.signed_position_x18 != expected_position
+        or exposure.observed_at_ms <= baseline.position_observed_at_ms
+        or exposure.observed_at_ms >= binding.route.settlement_at_ms
+    ):
+        raise NadoContractError("Nado funding exposure is not the fresh exact route position")
+    baseline_cumulative = (
+        baseline.cumulative_funding_long_x18
+        if exposure.cumulative_side == LONG
+        else baseline.cumulative_funding_short_x18
+    )
+    if exposure.cumulative_funding_x18 != baseline_cumulative:
+        raise NadoContractError("Nado funding exposure cumulative state is stale")
+    if account_funding.balance_amount != exposure.signed_position_x18:
+        raise NadoContractError("account funding balance does not equal exact exposure")
+    delta_long = (
+        event.cumulative_funding_long_x18
+        - baseline.cumulative_funding_long_x18
+    )
+    delta_short = (
+        event.cumulative_funding_short_x18
+        - baseline.cumulative_funding_short_x18
+    )
+    if delta_long != delta_short:
+        raise NadoContractError("public cumulative funding sides disagree")
+    relevant_after = (
+        event.cumulative_funding_long_x18
+        if exposure.cumulative_side == LONG
+        else event.cumulative_funding_short_x18
+    )
+    expected_amount = nado_funding_account_amount_x18(
+        relevant_after - exposure.cumulative_funding_x18,
+        exposure.signed_position_x18,
+    )
+    if account_funding.amount != expected_amount:
         raise NadoContractError(
-            "Nado account funding does not agree with the authoritative event"
+            "account funding amount does not match exact cumulative settlement"
         )
-    if (
-        event.status in {
-            FUNDING_SKIPPED_POSITION_NOT_OPEN,
-            FUNDING_SKIPPED_POSITION_CLOSED,
-        }
-        and event.cash_x18 != 0
-    ):
-        raise NadoContractError(
-            "skipped Nado funding event has nonzero applied cash"
-        )
-    completion_eligible = event.status in FUNDING_COMPLETION_STATUSES
     return NadoFundingBoundaryResult(
         event.event_id,
-        event.market,
-        event.settlement_at_ms,
-        event.status,
-        event.rate_x18,
-        event.cash_x18,
-        completion_eligible,
-        not completion_eligible,
+        binding.route.nado_leg.market,
+        binding.route.settlement_at_ms,
+        FUNDING_APPLIED,
+        account_funding.rate_x18,
+        account_funding.amount,
+        True,
+        False,
+        event.payment_amount,
+        account_funding.idx,
+        None,
     )
 
 
@@ -1299,16 +1679,16 @@ def _event_from_payload(value: object) -> NadoFundingEvent:
         value,
         "Nado funding event",
         {
-            "event_id", "journal", "product_id", "market", "settlement_at_ms",
-            "canonical_quantity", "rate_x18", "cash_x18", "status",
+            "product_id", "timestamp", "payment_amount", "open_interest",
+            "cumulative_funding_long_x18", "cumulative_funding_short_x18", "dt",
             "event_digest", "authoritative",
         },
     )
     event = NadoFundingEvent(
-        payload["event_id"], _journal_from_payload(payload["journal"]),
-        payload["product_id"], payload["market"], payload["settlement_at_ms"],
-        Decimal(payload["canonical_quantity"]), payload["rate_x18"], payload["cash_x18"],
-        payload["status"], payload["event_digest"], payload["authoritative"],
+        payload["product_id"], payload["timestamp"], payload["payment_amount"],
+        payload["open_interest"], payload["cumulative_funding_long_x18"],
+        payload["cumulative_funding_short_x18"], payload["dt"],
+        payload["event_digest"], payload["authoritative"],
     )
     event.assert_contract()
     return event
@@ -1319,48 +1699,86 @@ def _account_funding_from_payload(value: object) -> NadoAccountFunding:
         value,
         "Nado account funding",
         {
-            "journal", "owner", "subaccount_name", "event_id", "product_id",
-            "market", "settlement_at_ms", "canonical_quantity", "rate_x18",
-            "cash_x18", "status", "evidence_digest", "authoritative",
+            "journal", "owner", "subaccount_name", "product_id", "idx",
+            "timestamp", "amount", "balance_amount", "rate_x18",
+            "oracle_price_x18", "payment_kind", "evidence_digest", "authoritative",
         },
     )
     account = NadoAccountFunding(
         _journal_from_payload(payload["journal"]), payload["owner"],
-        payload["subaccount_name"], payload["event_id"], payload["product_id"],
-        payload["market"], payload["settlement_at_ms"],
-        Decimal(payload["canonical_quantity"]),
-        payload["rate_x18"], payload["cash_x18"], payload["status"],
-        payload["evidence_digest"], payload["authoritative"],
+        payload["subaccount_name"], payload["product_id"], payload["idx"],
+        payload["timestamp"], payload["amount"], payload["balance_amount"],
+        payload["rate_x18"], payload["oracle_price_x18"],
+        payload["evidence_digest"], payload["payment_kind"], payload["authoritative"],
     )
     account.assert_contract()
     return account
 
 
+def _baseline_from_payload(value: object) -> NadoFundingBaseline:
+    payload = _mapping_payload(
+        value,
+        "Nado funding baseline",
+        {
+            "journal", "owner", "subaccount_name", "product_id", "boundary_at_ms",
+            "history_high_water_idx", "history_empty_terminal", "position_x18",
+            "v_quote_balance_x18", "position_observed_at_ms", "position_snapshot_id",
+            "cumulative_funding_long_x18", "cumulative_funding_short_x18",
+            "open_interest_x18", "public_observed_at_ms", "baseline_digest",
+            "authoritative",
+        },
+    )
+    baseline = NadoFundingBaseline(
+        _journal_from_payload(payload["journal"]), payload["owner"],
+        payload["subaccount_name"], payload["product_id"], payload["boundary_at_ms"],
+        payload["history_high_water_idx"], payload["history_empty_terminal"],
+        payload["position_x18"], payload["v_quote_balance_x18"],
+        payload["position_observed_at_ms"], payload["position_snapshot_id"],
+        payload["cumulative_funding_long_x18"],
+        payload["cumulative_funding_short_x18"], payload["open_interest_x18"],
+        payload["public_observed_at_ms"], payload["baseline_digest"],
+        payload["authoritative"],
+    )
+    baseline.assert_contract()
+    return baseline
+
+
+def _exposure_from_payload(value: object) -> NadoFundingExposure:
+    payload = _mapping_payload(
+        value,
+        "Nado funding exposure",
+        {
+            "journal", "owner", "subaccount_name", "product_id", "direction",
+            "signed_position_x18", "route_quantity_x18", "observed_at_ms",
+            "snapshot_id", "cumulative_side", "cumulative_funding_x18",
+            "exposure_digest", "authoritative",
+        },
+    )
+    exposure = NadoFundingExposure(
+        _journal_from_payload(payload["journal"]), payload["owner"],
+        payload["subaccount_name"], payload["product_id"], payload["direction"],
+        payload["signed_position_x18"], payload["route_quantity_x18"],
+        payload["observed_at_ms"], payload["snapshot_id"],
+        payload["cumulative_side"], payload["cumulative_funding_x18"],
+        payload["exposure_digest"], payload["authoritative"],
+    )
+    exposure.assert_contract()
+    return exposure
+
+
 def _funding_evidence_payload(
     attestation: CrossRunAttestation,
+    baseline: NadoFundingBaseline,
     event: NadoFundingEvent,
     account_funding: NadoAccountFunding,
+    exposure: NadoFundingExposure,
 ) -> dict[str, object]:
     return {
-        "attestation": {
-            "route": _funding_route_payload(attestation.route),
-            "risex_journal": _journal_payload(attestation.risex_journal),
-            "nado_journal": _journal_payload(attestation.nado_journal),
-            "attestation_digest": _hash_text(
-                attestation.attestation_digest, "cross-run attestation digest"
+        "attestation": _stored_attestation_payload(attestation),
+        "baseline": _nado_baseline_payload(baseline) | {
+            "baseline_digest": _hash_text(
+                baseline.baseline_digest, "Nado funding baseline digest"
             ),
-            "risex_terminal": _terminal_payload(attestation.risex_terminal) | {
-                "evidence_digest": _hash_text(
-                    attestation.risex_terminal.evidence_digest,
-                    "RISEx terminal evidence digest",
-                )
-            },
-            "nado_terminal": _terminal_payload(attestation.nado_terminal) | {
-                "evidence_digest": _hash_text(
-                    attestation.nado_terminal.evidence_digest,
-                    "Nado terminal evidence digest",
-                )
-            },
         },
         "event": _nado_event_payload(event) | {
             "event_digest": _hash_text(event.event_digest, "Nado funding event digest"),
@@ -1370,19 +1788,56 @@ def _funding_evidence_payload(
                 account_funding.evidence_digest, "Nado account funding digest"
             ),
         },
+        "exposure": _nado_exposure_payload(exposure) | {
+            "exposure_digest": _hash_text(
+                exposure.exposure_digest, "Nado funding exposure digest"
+            ),
+        },
+    }
+
+
+def _stored_attestation_payload(
+    attestation: CrossRunAttestation,
+) -> dict[str, object]:
+    return {
+        "route": _funding_route_payload(attestation.route),
+        "risex_journal": _journal_payload(attestation.risex_journal),
+        "nado_journal": _journal_payload(attestation.nado_journal),
+        "attestation_digest": _hash_text(
+            attestation.attestation_digest, "cross-run attestation digest"
+        ),
+        "risex_terminal": _terminal_payload(attestation.risex_terminal) | {
+            "evidence_digest": _hash_text(
+                attestation.risex_terminal.evidence_digest,
+                "RISEx terminal evidence digest",
+            )
+        },
+        "nado_terminal": _terminal_payload(attestation.nado_terminal) | {
+            "evidence_digest": _hash_text(
+                attestation.nado_terminal.evidence_digest,
+                "Nado terminal evidence digest",
+            )
+        },
     }
 
 
 def _funding_evidence_from_payload(
     value: object,
-) -> tuple[CrossRunAttestation, NadoFundingEvent, NadoAccountFunding]:
+) -> tuple[
+    CrossRunAttestation, NadoFundingBaseline, NadoFundingEvent,
+    NadoAccountFunding, NadoFundingExposure
+]:
     payload = _mapping_payload(
-        value, "funding evidence", {"attestation", "event", "account_funding"}
+        value,
+        "funding evidence",
+        {"attestation", "baseline", "event", "account_funding", "exposure"},
     )
     return (
         _attestation_from_payload(payload["attestation"]),
+        _baseline_from_payload(payload["baseline"]),
         _event_from_payload(payload["event"]),
         _account_funding_from_payload(payload["account_funding"]),
+        _exposure_from_payload(payload["exposure"]),
     )
 
 
@@ -1530,6 +1985,34 @@ class IntentStore:
             )
             """
         )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS nado_funding_baseline (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                baseline_json BLOB NOT NULL,
+                baseline_digest TEXT NOT NULL
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS nado_funding_exposure (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                exposure_json BLOB NOT NULL,
+                exposure_digest TEXT NOT NULL
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS nado_funding_blocker (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                reason TEXT NOT NULL,
+                attestation_json BLOB NOT NULL,
+                blocker_digest TEXT NOT NULL
+            )
+            """
+        )
         self._connection.commit()
 
     def prepare(self, intent: OrderIntent) -> None:
@@ -1605,6 +2088,13 @@ class IntentStore:
                 )
                 if self.lifecycle_status() != RUNNING and not halted_resting_cancel:
                     raise NadoContractError("lifecycle is at a durable manual gate")
+                if (
+                    self.funding_boundary_binding() is not None
+                    and self.funding_boundary_baseline() is None
+                ):
+                    raise NadoContractError(
+                        "funding baseline must be persisted before intent preparation"
+                    )
                 if intent.kind == ENTRY and self.count_kind(ENTRY):
                     raise NadoContractError("one lifecycle permits exactly one entry")
                 if intent.kind == CANCEL_ALL and (
@@ -1813,7 +2303,11 @@ class IntentStore:
         del digest, payload
         raise NadoContractError("persisted payload and digest are immutable")
 
-    def bind_funding_boundary(self, binding: FundingBoundaryBinding) -> None:
+    def bind_funding_boundary(
+        self,
+        binding: FundingBoundaryBinding,
+        baseline: NadoFundingBaseline | None = None,
+    ) -> None:
         """Persist the exact route and both venue journal identities once."""
         encoded = canonical_payload(_funding_boundary_payload(binding))
         digest = hashlib.sha256(encoded).hexdigest()
@@ -1829,6 +2323,8 @@ class IntentStore:
                         raise NadoContractError(
                             "persisted funding boundary identity is immutable"
                         )
+                    if baseline is not None:
+                        self.bind_funding_baseline(baseline)
                     return
                 if self.intents():
                     raise NadoContractError(
@@ -1841,8 +2337,119 @@ class IntentStore:
                     "(singleton, binding_json, binding_digest) VALUES (1, ?, ?)",
                     (encoded, digest),
                 )
+                if baseline is not None:
+                    self.bind_funding_baseline(baseline)
         except sqlite3.DatabaseError:
             raise NadoContractError("funding boundary persistence failed") from None
+
+    def bind_funding_baseline(self, baseline: NadoFundingBaseline) -> None:
+        """Persist the exact empty/high-water and public pre-entry baseline."""
+        binding = self.funding_boundary_binding()
+        if binding is None:
+            raise NadoContractError("funding baseline requires a persisted boundary")
+        baseline.assert_contract()
+        if (
+            baseline.journal != binding.nado_journal
+            or baseline.product_id != binding.route.nado_product_id
+            or baseline.boundary_at_ms != binding.route.settlement_at_ms
+        ):
+            raise NadoContractError("funding baseline is not bound to the persisted route")
+        encoded = canonical_payload(_nado_baseline_payload(baseline) | {
+            "baseline_digest": _hash_text(
+                baseline.baseline_digest, "Nado funding baseline digest"
+            ),
+        })
+        digest = hashlib.sha256(encoded).hexdigest()
+        try:
+            with self._connection:
+                row = self._connection.execute(
+                    "SELECT baseline_json, baseline_digest "
+                    "FROM nado_funding_baseline WHERE singleton = 1"
+                ).fetchone()
+                if row is not None:
+                    if bytes(row[0]) != encoded or str(row[1]) != digest:
+                        raise NadoContractError(
+                            "persisted funding baseline is immutable"
+                        )
+                    return
+                if self.intents():
+                    raise NadoContractError(
+                        "funding baseline must be persisted before intent preparation"
+                    )
+                if self.lifecycle_status() != RUNNING:
+                    raise NadoContractError(
+                        "funding baseline requires a running lifecycle"
+                    )
+                self._connection.execute(
+                    "INSERT INTO nado_funding_baseline "
+                    "(singleton, baseline_json, baseline_digest) VALUES (1, ?, ?)",
+                    (encoded, digest),
+                )
+        except sqlite3.DatabaseError:
+            raise NadoContractError("funding baseline persistence failed") from None
+
+    def bind_funding_exposure(self, exposure: NadoFundingExposure) -> None:
+        """Persist the exact fresh signed route exposure before funding wait."""
+        binding = self.funding_boundary_binding()
+        baseline = self.funding_boundary_baseline()
+        if binding is None or baseline is None:
+            raise NadoContractError("funding exposure requires a persisted baseline")
+        exposure.assert_contract()
+        expected_route_quantity = _funding_quantity_x18(
+            binding.route.nado_leg.canonical_quantity,
+            "Nado route canonical quantity",
+        )
+        if (
+            exposure.journal != binding.nado_journal
+            or exposure.product_id != binding.route.nado_product_id
+            or exposure.direction != binding.route.nado_leg.direction
+            or exposure.route_quantity_x18 != expected_route_quantity
+            or exposure.observed_at_ms <= baseline.position_observed_at_ms
+            or exposure.observed_at_ms >= binding.route.settlement_at_ms
+        ):
+            raise NadoContractError("funding exposure is not bound to the persisted route")
+        baseline_cumulative = (
+            baseline.cumulative_funding_long_x18
+            if exposure.cumulative_side == LONG
+            else baseline.cumulative_funding_short_x18
+        )
+        if exposure.cumulative_funding_x18 != baseline_cumulative:
+            raise NadoContractError("funding exposure cumulative state is not the baseline")
+        entries = [intent for intent, _state in self.intents() if intent.kind == ENTRY]
+        if (
+            len(entries) != 1
+            or self.state(entries[0].digest) != "RECONCILED"
+            or self.count_kind(CLOSE) != 0
+            or self.lifecycle_status() != RUNNING
+        ):
+            raise NadoContractError(
+                "funding exposure must bind after reconciled entry and before close"
+            )
+        encoded = canonical_payload(_nado_exposure_payload(exposure) | {
+            "exposure_digest": _hash_text(
+                exposure.exposure_digest, "Nado funding exposure digest"
+            ),
+        })
+        digest = hashlib.sha256(encoded).hexdigest()
+        try:
+            with self._connection:
+                row = self._connection.execute(
+                    "SELECT exposure_json, exposure_digest "
+                    "FROM nado_funding_exposure WHERE singleton = 1"
+                ).fetchone()
+                if row is not None:
+                    if bytes(row[0]) != encoded or str(row[1]) != digest:
+                        raise NadoContractError(
+                            "persisted funding exposure is immutable"
+                        )
+                    return
+                self._connection.execute(
+                    "INSERT INTO nado_funding_exposure "
+                    "(singleton, exposure_json, exposure_digest) VALUES (1, ?, ?)",
+                    (encoded, digest),
+                )
+        except sqlite3.DatabaseError:
+            raise NadoContractError("funding exposure persistence failed") from None
 
     def funding_boundary_binding(self) -> FundingBoundaryBinding | None:
         row = self._connection.execute(
@@ -1875,6 +2482,148 @@ class IntentStore:
         ):
             raise NadoContractError("persisted funding boundary is invalid") from None
 
+    def funding_boundary_baseline(self) -> NadoFundingBaseline | None:
+        row = self._connection.execute(
+            "SELECT baseline_json, baseline_digest FROM nado_funding_baseline "
+            "WHERE singleton = 1"
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            encoded = bytes(row[0])
+            if hashlib.sha256(encoded).hexdigest() != str(row[1]):
+                raise NadoContractError("persisted funding baseline digest is invalid")
+            baseline = _baseline_from_payload(json.loads(encoded.decode("ascii")))
+            canonical = canonical_payload(_nado_baseline_payload(baseline) | {
+                "baseline_digest": _hash_text(
+                    baseline.baseline_digest, "Nado funding baseline digest"
+                ),
+            })
+            if canonical != encoded:
+                raise NadoContractError("persisted funding baseline is not canonical")
+            return baseline
+        except (
+            KeyError, UnicodeDecodeError, json.JSONDecodeError,
+            InvalidOperation, TypeError, ValueError,
+        ):
+            raise NadoContractError("persisted funding baseline is invalid") from None
+
+    def funding_boundary_exposure(self) -> NadoFundingExposure | None:
+        row = self._connection.execute(
+            "SELECT exposure_json, exposure_digest FROM nado_funding_exposure "
+            "WHERE singleton = 1"
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            encoded = bytes(row[0])
+            if hashlib.sha256(encoded).hexdigest() != str(row[1]):
+                raise NadoContractError("persisted funding exposure digest is invalid")
+            exposure = _exposure_from_payload(json.loads(encoded.decode("ascii")))
+            canonical = canonical_payload(_nado_exposure_payload(exposure) | {
+                "exposure_digest": _hash_text(
+                    exposure.exposure_digest, "Nado funding exposure digest"
+                ),
+            })
+            if canonical != encoded:
+                raise NadoContractError("persisted funding exposure is not canonical")
+            return exposure
+        except (
+            KeyError, UnicodeDecodeError, json.JSONDecodeError,
+            InvalidOperation, TypeError, ValueError,
+        ):
+            raise NadoContractError("persisted funding exposure is invalid") from None
+
+    def _assert_stored_attestation(
+        self,
+        binding: FundingBoundaryBinding,
+        attestation: CrossRunAttestation,
+    ) -> None:
+        attestation.assert_contract()
+        if _funding_route_payload(attestation.route) != _funding_route_payload(
+            binding.route
+        ):
+            raise NadoContractError("funding blocker route is not persisted")
+        if attestation.risex_journal != binding.risex_journal:
+            raise NadoContractError("funding blocker RISEx journal is not persisted")
+        if attestation.nado_journal != binding.nado_journal:
+            raise NadoContractError("funding blocker Nado journal is not persisted")
+
+    def record_nado_funding_blocker(
+        self,
+        *,
+        attestation: CrossRunAttestation | None,
+        reason: str,
+    ) -> NadoFundingBoundaryResult:
+        """Durably block on missing/contradictory post-boundary evidence."""
+        binding = self.funding_boundary_binding()
+        baseline = self.funding_boundary_baseline()
+        if binding is None or baseline is None:
+            self.halt()
+            raise NadoContractError("funding blocker lacks a persisted baseline")
+        if reason not in FUNDING_BLOCKER_REASONS:
+            self.halt()
+            raise NadoContractError("funding blocker reason is not bounded")
+        if attestation is None:
+            self.halt()
+            raise NadoContractError("funding blocker lacks final attestation")
+        try:
+            self._assert_stored_attestation(binding, attestation)
+            payload = {
+                "reason": reason,
+                "attestation": _stored_attestation_payload(attestation),
+            }
+            encoded = canonical_payload(payload)
+            digest = hashlib.sha256(encoded).hexdigest()
+            with self._connection:
+                existing = self._connection.execute(
+                    "SELECT reason, attestation_json, blocker_digest "
+                    "FROM nado_funding_blocker WHERE singleton = 1"
+                ).fetchone()
+                if existing is not None:
+                    if (
+                        str(existing[0]) != reason
+                        or bytes(existing[1]) != encoded
+                        or str(existing[2]) != digest
+                    ):
+                        raise NadoContractError(
+                            "persisted funding blocker contradicts the first observation"
+                        )
+                else:
+                    if self.lifecycle_status() != RUNNING:
+                        raise NadoContractError(
+                            "funding blocker requires a running lifecycle"
+                        )
+                    self._connection.execute(
+                        "INSERT INTO nado_funding_blocker "
+                        "(singleton, reason, attestation_json, blocker_digest) "
+                        "VALUES (1, ?, ?, ?)",
+                        (reason, encoded, digest),
+                    )
+                self._connection.execute(
+                    "UPDATE nado_lifecycle_state SET status = 'HALTED' "
+                    "WHERE singleton = 1 AND status != 'COMPLETE'"
+                )
+            return NadoFundingBoundaryResult(
+                None,
+                binding.route.nado_leg.market,
+                binding.route.settlement_at_ms,
+                FUNDING_UNRESOLVED,
+                None,
+                None,
+                False,
+                True,
+                None,
+                None,
+                reason,
+            )
+        except NadoContractError:
+            self.halt()
+            raise
+        except sqlite3.DatabaseError:
+            self.halt()
+            raise NadoContractError("funding blocker persistence failed") from None
+
     def record_nado_funding_boundary(
         self,
         *,
@@ -1884,20 +2633,30 @@ class IntentStore:
     ) -> NadoFundingBoundaryResult:
         """Validate and durably record one exact Nado funding settlement."""
         binding = self.funding_boundary_binding()
-        if binding is None:
+        baseline = self.funding_boundary_baseline()
+        exposure = self.funding_boundary_exposure()
+        if binding is None or baseline is None:
             self.halt()
-            raise NadoContractError("funding boundary was not persisted before evidence")
+            raise NadoContractError("funding boundary baseline was not persisted")
+        if event is None or account_funding is None or exposure is None:
+            return self.record_nado_funding_blocker(
+                attestation=attestation, reason=FUNDING_BLOCKED_MISSING
+            )
         try:
             result = validate_nado_funding_boundary(
                 binding=binding,
+                baseline=baseline,
                 attestation=attestation,
                 event=event,
                 account_funding=account_funding,
+                exposure=exposure,
             )
-            if attestation is None or event is None or account_funding is None:
+            if attestation is None:
                 raise NadoContractError("funding boundary evidence is incomplete")
             encoded = canonical_payload(
-                _funding_evidence_payload(attestation, event, account_funding)
+                _funding_evidence_payload(
+                    attestation, baseline, event, account_funding, exposure
+                )
             )
             digest = hashlib.sha256(encoded).hexdigest()
             with self._connection:
@@ -1910,8 +2669,6 @@ class IntentStore:
                         raise NadoContractError(
                             "persisted funding evidence contradicts the first observation"
                         )
-                    if result.blocked:
-                        self.halt()
                     return result
                 if self.lifecycle_status() != RUNNING:
                     raise NadoContractError(
@@ -1922,13 +2679,17 @@ class IntentStore:
                     "(singleton, evidence_json, evidence_digest) VALUES (1, ?, ?)",
                     (encoded, digest),
                 )
-                if result.blocked:
-                    self._connection.execute(
-                        "UPDATE nado_lifecycle_state SET status = 'HALTED' "
-                        "WHERE singleton = 1 AND status != 'COMPLETE'"
-                    )
             return result
         except NadoContractError:
+            try:
+                if attestation is not None:
+                    self._assert_stored_attestation(binding, attestation)
+                    return self.record_nado_funding_blocker(
+                        attestation=attestation,
+                        reason=FUNDING_BLOCKED_CONTRADICTORY,
+                    )
+            except NadoContractError:
+                pass
             self.halt()
             raise
         except sqlite3.DatabaseError:
@@ -1937,7 +2698,10 @@ class IntentStore:
 
     def nado_funding_boundary_evidence(
         self,
-    ) -> tuple[CrossRunAttestation, NadoFundingEvent, NadoAccountFunding] | None:
+    ) -> tuple[
+        CrossRunAttestation, NadoFundingBaseline, NadoFundingEvent,
+        NadoAccountFunding, NadoFundingExposure
+    ] | None:
         row = self._connection.execute(
             "SELECT evidence_json, evidence_digest FROM nado_funding_evidence "
             "WHERE singleton = 1"
@@ -1959,6 +2723,38 @@ class IntentStore:
             InvalidOperation, TypeError, ValueError,
         ):
             raise NadoContractError("persisted funding evidence is invalid") from None
+
+    def funding_boundary_blocker(self) -> str | None:
+        row = self._connection.execute(
+            "SELECT reason, attestation_json, blocker_digest "
+            "FROM nado_funding_blocker WHERE singleton = 1"
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            encoded = bytes(row[1])
+            if hashlib.sha256(encoded).hexdigest() != str(row[2]):
+                raise NadoContractError("persisted funding blocker digest is invalid")
+            payload = _mapping_payload(
+                json.loads(encoded.decode("ascii")),
+                "funding blocker",
+                {"reason", "attestation"},
+            )
+            if payload["reason"] != row[0] or payload["reason"] not in FUNDING_BLOCKER_REASONS:
+                raise NadoContractError("persisted funding blocker reason is invalid")
+            binding = self.funding_boundary_binding()
+            if binding is None:
+                raise NadoContractError("persisted funding blocker is unbound")
+            attestation = _attestation_from_payload(payload["attestation"])
+            self._assert_stored_attestation(binding, attestation)
+            if canonical_payload(payload) != encoded:
+                raise NadoContractError("persisted funding blocker is not canonical")
+            return str(row[0])
+        except (
+            KeyError, UnicodeDecodeError, json.JSONDecodeError,
+            InvalidOperation, TypeError, ValueError,
+        ):
+            raise NadoContractError("persisted funding blocker is invalid") from None
 
     def prepare_then_fixture_dispatch(
         self,
