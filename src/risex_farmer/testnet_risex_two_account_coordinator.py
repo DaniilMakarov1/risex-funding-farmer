@@ -2111,9 +2111,36 @@ def _fsync_file_and_parent(path: Path) -> None:
         os.close(directory)
 
 
-def _ensure_sqlite_file(path: Path) -> None:
+def _ensure_sqlite_file(path: Path, *, fresh: bool = False) -> None:
     if not path.is_absolute() or not path.parent.is_dir():
         raise CoordinatorSafetyError("RISEx journal path rejected")
+    if fresh:
+        fd: int | None = None
+        try:
+            fd = os.open(
+                path,
+                os.O_CREAT | os.O_EXCL | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            os.fchmod(fd, 0o600)
+            os.fsync(fd)
+            os.close(fd)
+            fd = None
+            directory = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        except OSError:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            raise CoordinatorSafetyError("RISEx journal path rejected") from None
+        if not _safe_file(path):
+            raise CoordinatorSafetyError("RISEx journal path rejected")
+        return
     if not path.exists():
         try:
             fd = os.open(
@@ -2138,10 +2165,12 @@ def _ensure_sqlite_file(path: Path) -> None:
 class PairJournal:
     """One role's durable run and write-identity domain."""
 
-    def __init__(self, path: str | Path, identity: RoleIdentity) -> None:
+    def __init__(
+        self, path: str | Path, identity: RoleIdentity, *, fresh: bool = False,
+    ) -> None:
         identity.validate()
         self.path = Path(path)
-        _ensure_sqlite_file(self.path)
+        _ensure_sqlite_file(self.path, fresh=fresh)
         self._db = sqlite3.connect(self.path)
         self._db.execute("PRAGMA foreign_keys=ON")
         self._db.execute("PRAGMA journal_mode=DELETE")
@@ -2256,6 +2285,79 @@ class PairJournal:
     def terminal(self, key: str) -> str | None:
         row = self._db.execute("SELECT value FROM terminal WHERE key=?", (key,)).fetchone()
         return None if row is None else str(row[0])
+
+    def terminal_items(self) -> tuple[tuple[str, str], ...]:
+        """Return the durable terminal namespace without exposing SQLite state."""
+        return tuple(
+            (str(key), str(value))
+            for key, value in self._db.execute(
+                "SELECT key,value FROM terminal ORDER BY key"
+            )
+        )
+
+    def stable_content_digest(self) -> str:
+        """Digest logical durable state with one fixed provider projection."""
+
+        def intent_payload(item: DurableIntent) -> dict[str, Any]:
+            return {
+                "intent_id": item.intent_id,
+                "ordinal": item.ordinal,
+                "step": item.step,
+                "client_order_id": item.client_order_id,
+                "nonce_anchor": item.nonce_anchor,
+                "nonce_bitmap": item.nonce_bitmap,
+                "payload_digest": item.payload_digest,
+                "bbo_digest": item.bbo_digest,
+                "state": item.state,
+                "side": item.side,
+                "order_type": item.order_type,
+                "time_in_force": item.time_in_force,
+                "reduce_only": item.reduce_only,
+                "post_only": item.post_only,
+                "market_id": item.market_id,
+                "size": str(item.size),
+                "price": str(item.price),
+                "source_position": str(item.source_position),
+                "expires_at": item.expires_at,
+                "dispatch_count": item.dispatch_count,
+                "order_id": item.order_id,
+                "filled_size": None if item.filled_size is None else str(item.filled_size),
+                "reconciled": item.reconciled,
+            }
+
+        def cancel_payload(item: DurableCancel) -> dict[str, Any]:
+            return {
+                "cancel_id": item.cancel_id,
+                "intent_id": item.intent_id,
+                "order_id": item.order_id,
+                "market_id": item.market_id,
+                "resting_order_id": item.resting_order_id,
+                "nonce_anchor": item.nonce_anchor,
+                "nonce_bitmap": item.nonce_bitmap,
+                "payload_digest": item.payload_digest,
+                "expires_at": item.expires_at,
+                "state": item.state,
+                "dispatch_count": item.dispatch_count,
+            }
+
+        terminals = tuple(
+            (key, value)
+            for key, value in self.terminal_items()
+            if not key.startswith("risex_provider:")
+        )
+        return _canonical_digest({
+            "identity": {
+                "role": self.identity.role.value,
+                "account": self.identity.account,
+                "signer": self.identity.signer,
+            },
+            "run_id": self.run_id,
+            "phase": self.phase.value,
+            "outcome": self.outcome,
+            "intents": tuple(intent_payload(item) for item in self.intents()),
+            "cancels": tuple(cancel_payload(item) for item in self.cancels()),
+            "terminal": terminals,
+        })
 
     def set_terminal(self, key: str, value: str) -> None:
         if not key or not value:
@@ -3689,6 +3791,17 @@ class TwoAccountCoordinator:
                 self._validate_history_scope(role, observation.accounts[role])
         return observation
 
+    async def rest_round_for_terminal(self) -> VenueObservation:
+        """Read and validate one fresh REST-only terminal round on this loop."""
+        observation = await _maybe_await(self._venue.rest_round())
+        self._validate_observation(observation, private=False)
+        if observation.rest_round <= 0:
+            raise CoordinatorSafetyError("RISEx REST round identity rejected")
+        for role in (AccountRole.PRIMARY, AccountRole.COUNTERPARTY):
+            if self._journals[role].terminal("baseline_history") is not None:
+                self._validate_history_scope(role, observation.accounts[role])
+        return observation
+
     def _place_resample_used(self, intent: DurableIntent) -> bool:
         key = f"place_resample:{intent.intent_id}"
         values = tuple(
@@ -4268,6 +4381,12 @@ class TwoAccountCoordinator:
         self._set_phase(Phase.ENTRY_RECONCILED)
         return observation
 
+    async def _before_exit_preparation(
+        self, observation: VenueObservation,
+    ) -> VenueObservation:
+        """Optional venue-local seam immediately before exit preparation."""
+        return observation
+
     async def _exit_maker(self, observation: VenueObservation) -> VenueObservation:
         if self.phase is Phase.ENTRY_RECONCILED:
             if (
@@ -4494,6 +4613,16 @@ class TwoAccountCoordinator:
         self._set_outcome("COMPLETE")
         self._set_phase(Phase.COMPLETE)
 
+    async def _preflight(self) -> "CoordinatorReport | None":
+        """Optional pre-observation lifecycle gate; historical default is none."""
+        return None
+
+    def _format_run_report(self, report: "CoordinatorReport") -> Any:
+        return report
+
+    def _close_after_run(self) -> bool:
+        return True
+
     async def run(self) -> CoordinatorReport:
         try:
             current = self.phase
@@ -4501,9 +4630,14 @@ class TwoAccountCoordinator:
                 journal.outcome == "COMPLETE" for journal in self._journals.values()
             ):
                 self._require_complete_evidence()
-                return self._report(CoordinatorResult.COMPLETE)
+                return self._format_run_report(self._report(CoordinatorResult.COMPLETE))
             if self._journals[AccountRole.PRIMARY].outcome == "HALTED" or current is Phase.HALTED:
-                return self._report(CoordinatorResult.FAILED_HALTED_MANUAL_RECOVERY)
+                return self._format_run_report(
+                    self._report(CoordinatorResult.FAILED_HALTED_MANUAL_RECOVERY)
+                )
+            preflight = await self._preflight()
+            if preflight is not None:
+                return self._format_run_report(preflight)
             if self._journals[AccountRole.PRIMARY].pending_writes() or self._journals[AccountRole.COUNTERPARTY].pending_writes():
                 raise CoordinatorSafetyError("RISEx pending ambiguous write requires recovery")
             dispatched = {
@@ -4529,6 +4663,8 @@ class TwoAccountCoordinator:
                 observation = await self._entry_taker(observation)
                 current = self.phase
             if current in {Phase.ENTRY_RECONCILED, Phase.EXIT_MAKER_PREPARED, Phase.EXIT_MAKER_DISPATCHED}:
+                if self.phase is Phase.ENTRY_RECONCILED:
+                    observation = await self._before_exit_preparation(observation)
                 observation = await self._exit_maker(observation)
                 current = self.phase
             if current in {Phase.EXIT_MAKER_RESTING, Phase.EXIT_PREPARED, Phase.EXIT_DISPATCHED, Phase.EXIT_RESIDUE_CANCEL_PREPARED}:
@@ -4536,7 +4672,7 @@ class TwoAccountCoordinator:
             if self.phase is Phase.EXIT_RECONCILED or self.phase is Phase.FINAL_ROUND_ONE:
                 await self._final_barrier()
             self._require_complete_evidence()
-            return self._report(CoordinatorResult.COMPLETE)
+            return self._format_run_report(self._report(CoordinatorResult.COMPLETE))
         except CoordinatorSafetyError as error:
             self._last_failure = str(error)
             try:
@@ -4549,11 +4685,12 @@ class TwoAccountCoordinator:
                 if any(j.dispatch_count() or j.cancels() for j in self._journals.values())
                 else CoordinatorResult.BLOCKED_BEFORE_WRITE
             )
-            return self._report(result)
+            return self._format_run_report(self._report(result))
         finally:
-            closer = getattr(self._venue, "close", None)
-            if callable(closer):
-                await _maybe_await(closer())
+            if self._close_after_run():
+                closer = getattr(self._venue, "close", None)
+                if callable(closer):
+                    await _maybe_await(closer())
 
     def _report(self, result: CoordinatorResult) -> CoordinatorReport:
         primary = self._journals[AccountRole.PRIMARY]
@@ -4588,17 +4725,29 @@ class TwoAccountCoordinator:
                 raise CoordinatorSafetyError("RISEx final evidence incomplete")
 
 
-async def build_risex_two_account_coordinator() -> TwoAccountCoordinator:
-    """Bind only the fixed testnet identities, journals, and REST/auth adapter."""
+async def _build_risex_two_account_coordinator_at_paths(
+    *,
+    primary_path: str | Path,
+    counterparty_path: str | Path,
+    require_fresh: bool = False,
+) -> TwoAccountCoordinator:
+    """Build the fixed coordinator at explicitly owned journal paths."""
     primary_identity, primary_loader = _load_primary_identity()
     counterparty_identity, counterparty_loader = _load_counterparty_identity()
     try:
-        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
-        primary_path = home / PRIMARY_JOURNAL
-        counterparty_path = home / COUNTERPARTY_JOURNAL
-        primary_journal = PairJournal(primary_path, primary_identity)
+        primary_path = Path(primary_path)
+        counterparty_path = Path(counterparty_path)
+        primary_journal = PairJournal(
+            primary_path,
+            primary_identity,
+            fresh=require_fresh,
+        )
         try:
-            counterparty_journal = PairJournal(counterparty_path, counterparty_identity)
+            counterparty_journal = PairJournal(
+                counterparty_path,
+                counterparty_identity,
+                fresh=require_fresh,
+            )
         except Exception:
             primary_journal.close()
             raise
@@ -4648,6 +4797,20 @@ async def build_risex_two_account_coordinator() -> TwoAccountCoordinator:
             counterparty_journal.close()
             primary_journal.close()
             raise
+    except CoordinatorSafetyError:
+        raise
+    except Exception:
+        raise CoordinatorSafetyError("RISEx production binding rejected") from None
+
+
+async def build_risex_two_account_coordinator() -> TwoAccountCoordinator:
+    """Bind only the fixed testnet identities, journals, and REST/auth adapter."""
+    try:
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        return await _build_risex_two_account_coordinator_at_paths(
+            primary_path=home / PRIMARY_JOURNAL,
+            counterparty_path=home / COUNTERPARTY_JOURNAL,
+        )
     except CoordinatorSafetyError:
         raise
     except Exception:
