@@ -5132,6 +5132,28 @@ class PublicPaperRuntime:
                     task.cancel()
             await asyncio.gather(*waiters, return_exceptions=True)
 
+    def _scheduled_scan_shutdown_requested(self) -> bool:
+        return self._shutdown_started or (
+            self._stop_event is not None and self._stop_event.is_set()
+        )
+
+    def _record_scheduled_scan_failure(self, failure: BaseException) -> None:
+        if (
+            self._scheduled_scan_shutdown_requested()
+            or self._stop_cause == "RUNTIME_FATAL"
+        ):
+            return
+        self._background_fatal = failure
+        self._request_stop("RUNTIME_FATAL")
+        self._record(
+            "RUNTIME_FATAL",
+            at=self._requested_at,
+            detail={
+                "task": "scheduled_scan",
+                "exception_class": type(failure).__name__,
+            },
+        )
+
     async def _tick_or_stop(self) -> bool:
         """Run one tick while allowing an external stop to cancel its awaits."""
         assert self._stop_event is not None
@@ -5144,7 +5166,16 @@ class PublicPaperRuntime:
                 (tick_task, stop_task), return_when=asyncio.FIRST_COMPLETED
             )
             if tick_task in done:
-                await tick_task
+                try:
+                    await tick_task
+                except asyncio.CancelledError as exc:
+                    if not self._scheduled_scan_shutdown_requested():
+                        self._record_scheduled_scan_failure(exc)
+                    raise
+                except BaseException as exc:
+                    if not self._scheduled_scan_shutdown_requested():
+                        self._record_scheduled_scan_failure(exc)
+                    raise
                 return False
             tick_task.cancel()
             # Let shutdown close the transport before awaiting this owner.

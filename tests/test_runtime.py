@@ -1319,6 +1319,94 @@ async def test_runtime_fatal_is_distinct_from_intentional_safe_stop(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_scheduled_scan_task_exception_is_supervised_as_runtime_fatal(tmp_path):
+    clock = FakeClock()
+    with PaperRepository(tmp_path / "scheduled-scan-exception.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters=adapters(clock, settlement_at=NOW), clock=clock,
+        )
+
+        async def startup_scan():
+            runtime.last_scan = SimpleNamespace(logical_at=clock.now())
+
+        async def no_restore(_at):
+            return None
+
+        async def no_streams():
+            return None
+
+        async def scheduled_scan_failure():
+            raise RuntimeError("synthetic scheduled scan defect")
+
+        runtime.scan = startup_scan
+        runtime._restore = no_restore
+        runtime.start_streams = no_streams
+        runtime._start_public_refresh = lambda: None
+        runtime._start_background_catalog_refresh = lambda **_kwargs: None
+        runtime._try_mark_startup_ready = lambda: True
+        runtime.tick = scheduled_scan_failure
+
+        with pytest.raises(RuntimeError, match="synthetic scheduled scan defect"):
+            await runtime.run(stop_event=asyncio.Event())
+        rows = repository.connection.execute(
+            "SELECT event_type,detail FROM runtime_evidence ORDER BY evidence_id"
+        ).fetchall()
+
+    assert [row["event_type"] for row in rows][-2:] == [
+        "RUNTIME_FATAL", "RUNTIME_STOPPED_FATAL",
+    ]
+    assert json.loads(rows[-2]["detail"]) == {
+        "exception_class": "RuntimeError",
+        "task": "scheduled_scan",
+    }
+    assert json.loads(rows[-1]["detail"])["stop_cause"] == "RUNTIME_FATAL"
+
+
+@pytest.mark.asyncio
+async def test_unexpected_scheduled_scan_task_cancellation_is_runtime_fatal(tmp_path):
+    clock = FakeClock()
+    with PaperRepository(tmp_path / "scheduled-scan-cancellation.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters=adapters(clock, settlement_at=NOW), clock=clock,
+        )
+
+        async def startup_scan():
+            runtime.last_scan = SimpleNamespace(logical_at=clock.now())
+
+        async def no_restore(_at):
+            return None
+
+        async def no_streams():
+            return None
+
+        async def scheduled_scan_cancellation():
+            raise asyncio.CancelledError()
+
+        runtime.scan = startup_scan
+        runtime._restore = no_restore
+        runtime.start_streams = no_streams
+        runtime._start_public_refresh = lambda: None
+        runtime._start_background_catalog_refresh = lambda **_kwargs: None
+        runtime._try_mark_startup_ready = lambda: True
+        runtime.tick = scheduled_scan_cancellation
+
+        with pytest.raises(asyncio.CancelledError):
+            await runtime.run(stop_event=asyncio.Event())
+        rows = repository.connection.execute(
+            "SELECT event_type,detail FROM runtime_evidence ORDER BY evidence_id"
+        ).fetchall()
+
+    assert [row["event_type"] for row in rows][-2:] == [
+        "RUNTIME_FATAL", "RUNTIME_STOPPED_FATAL",
+    ]
+    assert json.loads(rows[-2]["detail"]) == {
+        "exception_class": "CancelledError",
+        "task": "scheduled_scan",
+    }
+    assert json.loads(rows[-1]["detail"])["stop_cause"] == "RUNTIME_FATAL"
+
+
+@pytest.mark.asyncio
 async def test_internal_background_failure_requests_fatal_stop(tmp_path):
     clock = FakeClock()
     with PaperRepository(tmp_path / "background-fatal.db") as repository:
@@ -5611,10 +5699,18 @@ async def test_run_hands_off_cancellation_resistant_tick_to_shutdown_owner(tmp_p
         assert tick_cancelled.is_set()
         assert runtime._tick_task is not None
         result = await asyncio.wait_for(run_task, timeout=1)
+        events = repository.connection.execute(
+            "SELECT event_type FROM runtime_evidence ORDER BY evidence_id"
+        ).fetchall()
 
         assert result == {"status": "STOPPED_SAFE", "forced_close": False}
         assert runtime._tick_task is None
         assert runtime._session.closed
+        assert events[-1]["event_type"] == "STOPPED_SAFE"
+        assert not any(
+            row["event_type"] in {"RUNTIME_FATAL", "RUNTIME_STOPPED_FATAL"}
+            for row in events
+        )
 
 
 @pytest.mark.asyncio

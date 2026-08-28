@@ -1699,6 +1699,44 @@ async def test_stabilization003_run_loop_refresh_completion_wakes_due_full(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_stabilization003_scheduled_tick_cancellation_is_fatal_at_due_slot(
+    tmp_path,
+):
+    clock = FakeClock(BASE)
+    target = BASE + timedelta(hours=1)
+    controlled = ControlledFundingAdapter(Venue.RISEX, clock, settlement_at=target)
+    scheduled = BASE + timedelta(seconds=120)
+    with PaperRepository(tmp_path / "run-loop-scheduled-cancel.db") as repository:
+        runtime, _, sleeper, _, run_task = await _run_loop_ready(
+            repository, clock, controlled, target=target
+        )
+        original_tick = runtime.tick
+
+        async def cancel_due_tick(at=None):
+            if clock.now() >= scheduled:
+                raise asyncio.CancelledError()
+            await original_tick(at)
+
+        runtime.tick = cancel_due_tick
+        clock.value = scheduled
+        sleeper.release_latest()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(run_task, timeout=1)
+        events = repository.connection.execute(
+            "SELECT event_type,detail FROM runtime_evidence ORDER BY evidence_id"
+        ).fetchall()
+
+    assert [row["event_type"] for row in events][-2:] == [
+        "RUNTIME_FATAL", "RUNTIME_STOPPED_FATAL",
+    ]
+    assert json.loads(events[-2]["detail"]) == {
+        "exception_class": "CancelledError",
+        "task": "scheduled_scan",
+    }
+    assert json.loads(events[-1]["detail"])["stop_cause"] == "RUNTIME_FATAL"
+
+
+@pytest.mark.asyncio
 async def test_stabilization003_run_loop_deadlines_precede_refresh_completion(tmp_path):
     clock = FakeClock(BASE)
     target = BASE + timedelta(seconds=400)
