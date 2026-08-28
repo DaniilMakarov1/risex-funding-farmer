@@ -259,9 +259,16 @@ class _BoundaryProgressionRelay:
 
 @dataclass
 class _OwnedNado:
-    runner: _nado.SealedFundingBoundaryRunner
-    store: _nado.IntentStore
+    runner: _nado.SealedFundingBoundaryRunner | None
+    store: _nado.IntentStore | None
     private_read: Callable[[], object]
+    # The production factory defers all SQLite-backed construction to the
+    # Nado worker.  Fixture factories may continue to return an already-built
+    # runner through the original three-field shape.
+    worker_factory: Callable[
+        [], tuple[_nado.SealedFundingBoundaryRunner, _nado.IntentStore]
+    ] | None = None
+    now_ms: Callable[[], int] | None = None
 
 
 class _BridgeFactory(Protocol):
@@ -360,34 +367,55 @@ def _default_nado_factory(
         raise FundingBoundaryOrchestrationError("STARTUP_FAILED")
     owner, sender = _nado._strict_identity()
     path = _nado._funding_boundary_store_path()
-    _nado._prepare_file(path)
-    store = _nado.IntentStore(path)
-    try:
-        if (
-            store.funding_boundary_binding() is not None
-            or store.intents()
-            or store.lifecycle_status() != "RUNNING"
-        ):
-            raise FundingBoundaryOrchestrationError("STARTUP_FAILED")
-        io = _nado.OperationalVenueIO(owner, sender)
-        io._enable_funding_boundary_target()
-        runner = _nado.SealedFundingBoundaryRunner(
-            store=store,
-            journal=_nado.RuntimeRunJournal(path),
-            io=io,
-            capability_loader=_nado._load_capability,
-            owner=owner,
-            sender=sender,
-            route=route,
-            risex_journal=risex_journal,
-            risex_attestation_provider=risex_attestation_provider,
-            preparation_gate=preparation_gate,
-            boundary_progression_sink=boundary_progression_sink,
-        )
-        return _OwnedNado(runner, store, private_read)
-    except BaseException:
-        store.close()
-        raise
+
+    def build() -> tuple[
+        _nado.SealedFundingBoundaryRunner, _nado.IntentStore
+    ]:
+        # This factory is called only by the Nado worker.  In particular, the
+        # IntentStore connection, RuntimeRunJournal writes, and the runner's
+        # persisted funding binding all acquire their SQLite ownership on that
+        # same thread before any observation or preparation is possible.
+        _nado._prepare_file(path)
+        store: _nado.IntentStore | None = None
+        try:
+            store = _nado.IntentStore(path)
+            if (
+                store.funding_boundary_binding() is not None
+                or store.intents()
+                or store.lifecycle_status() != "RUNNING"
+            ):
+                raise FundingBoundaryOrchestrationError("STARTUP_FAILED")
+            io = _nado.OperationalVenueIO(owner, sender)
+            io._enable_funding_boundary_target()
+            runner = _nado.SealedFundingBoundaryRunner(
+                store=store,
+                journal=_nado.RuntimeRunJournal(path),
+                io=io,
+                capability_loader=_nado._load_capability,
+                owner=owner,
+                sender=sender,
+                route=route,
+                risex_journal=risex_journal,
+                risex_attestation_provider=risex_attestation_provider,
+                preparation_gate=preparation_gate,
+                boundary_progression_sink=boundary_progression_sink,
+            )
+            return runner, store
+        except BaseException:
+            if store is not None:
+                store.close()
+            raise
+
+    return _OwnedNado(
+        None,
+        None,
+        private_read,
+        worker_factory=build,
+        # OperationalVenueIO.now_ms is a wall-clock observation.  Keeping the
+        # owner-side barrier clock independent of the worker object avoids a
+        # caller-thread method call on the worker-owned runner.
+        now_ms=lambda: time.time_ns() // 1_000_000,
+    )
 
 
 class FundingBoundaryOrchestrator:
@@ -428,6 +456,8 @@ class FundingBoundaryOrchestrator:
         self._bridge: object | None = None
         self._provider: object | None = None
         self._nado: _OwnedNado | None = None
+        self._nado_primary_journal: JournalIdentity | None = None
+        self._nado_binding: FundingBoundaryBinding | None = None
         self._nado_report: _nado.FundingBoundaryReport | None = None
         self._risex_report: _risex.FundingBoundaryReport | None = None
         self._risex_counterparty: dict[str, object] | None = None
@@ -438,6 +468,18 @@ class FundingBoundaryOrchestrator:
         self._risex_potential_write = False
         self._nado_thread: threading.Thread | None = None
         self._risex_thread: threading.Thread | None = None
+        self._nado_worker_owned = False
+        self._nado_ready = False
+        self._nado_startup_ready = False
+        self._nado_startup_abort: str | None = None
+        self._nado_run_abort: str | None = None
+        self._nado_startup_gate: threading.Event | None = None
+        self._nado_run_gate: threading.Event | None = None
+        self._nado_close_gate: threading.Event | None = None
+        self._nado_resources_closed = False
+        self._nado_close_ready = False
+        self._nado_persistence_unknown = False
+        self._nado_manual_recovery = False
         self._nado_done = False
         self._risex_done = False
 
@@ -493,7 +535,9 @@ class FundingBoundaryOrchestrator:
         binding = getattr(runner, "funding_binding", None)
         store = owned.store
         if (
-            type(binding) is not FundingBoundaryBinding
+            runner is None
+            or store is None
+            or type(binding) is not FundingBoundaryBinding
             or store is not getattr(runner, "store", None)
             or not callable(getattr(runner, "run", None))
             or not callable(getattr(runner, "terminalize", None))
@@ -521,6 +565,25 @@ class FundingBoundaryOrchestrator:
             raise FundingBoundaryOrchestrationError("BINDING_MISMATCH") from None
         return binding
 
+    def _wait_nado_ready(self) -> FundingBoundaryBinding:
+        with self._condition:
+            while not self._nado_ready and not self._nado_done:
+                self._condition.wait()
+            binding = self._nado_binding
+            failure = self._startup_failure
+        if binding is not None and self._nado_ready:
+            return binding
+        raise FundingBoundaryOrchestrationError(failure or "STARTUP_FAILED")
+
+    def _wait_nado_startup(self) -> None:
+        with self._condition:
+            while not self._nado_startup_ready and not self._nado_done:
+                self._condition.wait()
+            if self._nado_startup_ready:
+                return
+            failure = self._startup_failure
+        raise FundingBoundaryOrchestrationError(failure or "STARTUP_FAILED")
+
     @staticmethod
     def _run_private_read(private_read: Callable[[], object]) -> object:
         result = private_read()
@@ -547,7 +610,11 @@ class FundingBoundaryOrchestrator:
             raise FundingBoundaryOrchestrationError("STARTUP_FAILED")
 
     @staticmethod
-    def _potential_nado(runner: _nado.SealedFundingBoundaryRunner) -> bool:
+    def _potential_nado(
+        runner: _nado.SealedFundingBoundaryRunner | None,
+    ) -> bool:
+        if runner is None:
+            return False
         try:
             return bool(runner.potential_write)
         except BaseException:
@@ -576,12 +643,123 @@ class FundingBoundaryOrchestrator:
             # the aggregate status will stay manual-recovery rather than close.
             pass
 
+    @staticmethod
+    def _worker_startup_code(error: BaseException) -> str:
+        code = getattr(error, "code", None)
+        return code if code in _STARTUP_FAILURES else "STARTUP_FAILED"
+
+    def _persist_nado_worker_failure(
+        self,
+        runner: _nado.SealedFundingBoundaryRunner,
+        error: BaseException,
+    ) -> bool:
+        """Persist a sanitized failure while still on the Nado owner thread."""
+        try:
+            # Keep the accepted venue-local classification and the exact
+            # runner stage even for a zero-write startup/observation failure.
+            # The caller-facing orchestration code never receives exception
+            # text or performs this persistence itself.
+            potential = self._potential_nado(runner)
+            _nado._persist_runner_failure(runner, error)
+            return not potential
+        except BaseException:
+            # If terminalization itself cannot be persisted, the owner must
+            # retain the live resource for manual recovery.  It may not
+            # claim a safe pre-write terminal result from an unknown state.
+            with self._condition:
+                self._nado_error = "NADO_FAILED"
+                self._nado_persistence_unknown = True
+                self._nado_manual_recovery = True
+                self._nado_potential_write = True
+                self._condition.notify_all()
+            return False
+
+    def _signal_nado_startup_abort(self, code: str) -> None:
+        with self._condition:
+            self._nado_startup_abort = code
+            self._nado_run_abort = code
+            startup_gate = self._nado_startup_gate
+            run_gate = self._nado_run_gate
+            close_gate = self._nado_close_gate
+            self._condition.notify_all()
+        if startup_gate is not None:
+            startup_gate.set()
+        if run_gate is not None:
+            run_gate.set()
+        # Startup failures happen before either lifecycle is released, so a
+        # successfully terminalized worker may close only after this explicit
+        # owner request.  No caller-thread SQLite close is permitted.
+        if close_gate is not None:
+            close_gate.set()
+
     def _nado_worker(self) -> None:
         owned = self._nado
         if owned is None:
             return
         runner = owned.runner
+        worker_owned = callable(owned.worker_factory)
+        startup_phase = worker_owned
+        close_after_owner_request = False
         try:
+            if worker_owned:
+                assert owned.worker_factory is not None
+                built = owned.worker_factory()
+                if (
+                    type(built) is not tuple
+                    or len(built) != 2
+                    or not isinstance(built[0], _nado.SealedFundingBoundaryRunner)
+                    or not isinstance(built[1], _nado.IntentStore)
+                ):
+                    raise FundingBoundaryOrchestrationError("STARTUP_FAILED")
+                runner, store = built
+                owned.runner = runner
+                owned.store = store
+                with self._condition:
+                    primary_journal = self._nado_primary_journal
+                if primary_journal is None:
+                    raise FundingBoundaryOrchestrationError("BINDING_MISMATCH")
+                binding = self._validate_nado_binding(owned, primary_journal)
+                with self._condition:
+                    self._nado_binding = binding
+                    self._nado_ready = True
+                    self._condition.notify_all()
+                startup_gate = self._nado_startup_gate
+                run_gate = self._nado_run_gate
+                if startup_gate is None or run_gate is None:
+                    raise FundingBoundaryOrchestrationError("STARTUP_FAILED")
+                startup_gate.wait()
+                with self._condition:
+                    startup_abort = self._nado_startup_abort
+                if startup_abort is not None:
+                    close_after_owner_request = not self._potential_nado(runner)
+                    if close_after_owner_request:
+                        runner.terminalize("SAFETY", "RUNNER_STARTUP")
+                    return
+                # This whole preflight gate stays on the Nado owner thread;
+                # the caller receives only its immutable success signal.
+                runner.stage = "PRIVATE_READ_BARRIER"
+                self._run_private_read(owned.private_read)
+                note_barrier = getattr(runner.io, "note_private_read_barrier", None)
+                if not callable(note_barrier):
+                    raise FundingBoundaryOrchestrationError("STARTUP_FAILED")
+                note_barrier()
+                self._require_nado_prewrite_time(
+                    runner, self._route.settlement_at_ms,
+                )
+                with self._condition:
+                    self._nado_startup_ready = True
+                    self._condition.notify_all()
+                run_gate.wait()
+                with self._condition:
+                    run_abort = self._nado_run_abort
+                if run_abort is not None:
+                    close_after_owner_request = not self._potential_nado(runner)
+                    if close_after_owner_request:
+                        runner.terminalize("SAFETY", "RUNNER_STARTUP")
+                    return
+                startup_phase = False
+            if runner is None:
+                raise FundingBoundaryOrchestrationError("NADO_FAILED")
             result = runner.run()
             if type(result) is not _nado.FundingBoundaryReport:
                 raise FundingBoundaryOrchestrationError("NADO_FAILED")
@@ -599,21 +777,83 @@ class FundingBoundaryOrchestrator:
                     self._nado_blocker = result.reason
             with self._condition:
                 self._nado_report = result
-        except BaseException:
-            self._nado_error = "NADO_FAILED"
-            try:
-                _nado._persist_runner_failure(runner, RuntimeError("owned nado failure"))
-            except BaseException:
-                pass
+            close_after_owner_request = worker_owned
+        except BaseException as error:
+            if worker_owned:
+                failure_code = self._worker_startup_code(error)
+                if runner is None:
+                    with self._condition:
+                        self._startup_failure = failure_code
+                        self._nado_error = "NADO_FAILED"
+                        self._condition.notify_all()
+                else:
+                    terminalized = self._persist_nado_worker_failure(
+                        runner, error,
+                    )
+                    close_after_owner_request = terminalized
+                    with self._condition:
+                        if startup_phase:
+                            self._startup_failure = failure_code
+                        self._nado_error = "NADO_FAILED"
+                        self._condition.notify_all()
+            else:
+                self._nado_error = "NADO_FAILED"
+                try:
+                    _nado._persist_runner_failure(
+                        runner, RuntimeError("owned nado failure")
+                    )
+                except BaseException:
+                    pass
         finally:
-            if self._barrier.passed:
+            if runner is not None and self._barrier.passed:
                 self._cancel_after_nado_termination(runner)
-            elif not self._potential_nado(runner):
+            elif runner is not None and not self._potential_nado(runner):
                 self._barrier.abort("BARRIER_ABORTED")
             with self._condition:
-                self._nado_potential_write = self._potential_nado(runner)
+                # A failed durable terminalization is deliberately sticky:
+                # the runner's in-memory potential flag cannot turn an
+                # unknown persisted state into a safe pre-write verdict.
+                if self._nado_persistence_unknown or self._nado_manual_recovery:
+                    self._nado_potential_write = True
+                else:
+                    self._nado_potential_write = self._potential_nado(runner)
+                if (
+                    worker_owned
+                    and close_after_owner_request
+                    and not self._nado_persistence_unknown
+                    and not self._nado_manual_recovery
+                ):
+                    # Report readiness and resource closure are separate
+                    # states.  The owner may now request close even when the
+                    # terminalized pre-write failure produced no report.
+                    self._nado_close_ready = True
+                if worker_owned and runner is None:
+                    # No SQLite resource was acquired when construction
+                    # failed before the worker could build its owner object.
+                    self._nado_resources_closed = True
                 self._nado_done = True
                 self._condition.notify_all()
+            if worker_owned and close_after_owner_request:
+                close_gate = self._nado_close_gate
+                if close_gate is not None:
+                    close_gate.wait()
+                try:
+                    store = owned.store
+                    if store is None:
+                        raise FundingBoundaryOrchestrationError("CLOSE_FAILED")
+                    # This is deliberately the only close of the worker-owned
+                    # SQLite connection.
+                    store.close()
+                except BaseException:
+                    with self._condition:
+                        self._nado_error = "NADO_FAILED"
+                        self._nado_manual_recovery = True
+                        self._nado_potential_write = True
+                        self._condition.notify_all()
+                else:
+                    with self._condition:
+                        self._nado_resources_closed = True
+                        self._condition.notify_all()
 
     def _risex_worker(self) -> None:
         bridge = self._bridge
@@ -641,13 +881,28 @@ class FundingBoundaryOrchestrator:
         with self._condition:
             nado_thread = self._nado_thread
             risex_thread = self._risex_thread
+            worker_owned = self._nado_worker_owned
+        if worker_owned:
+            # The default Nado worker may be waiting at either startup or
+            # lifecycle release, or at the post-report close handshake.  Wake
+            # it and let that same thread terminalize and close its SQLite
+            # connection; the caller never touches worker-owned resources.
+            self._signal_nado_startup_abort(code)
+            if nado_thread is not None and nado_thread.is_alive():
+                nado_thread.join(5.0)
         threads_alive = any(
             thread is not None and thread.is_alive()
             for thread in (nado_thread, risex_thread)
         )
         owned = self._nado
         runner = None if owned is None else owned.runner
-        nado_potential = False if runner is None else self._potential_nado(runner)
+        with self._condition:
+            nado_resources_closed = self._nado_resources_closed
+            nado_potential = (
+                self._nado_potential_write
+                if worker_owned
+                else False if runner is None else self._potential_nado(runner)
+            )
         risex_potential = (
             True if threads_alive and risex_thread is not None
             else self._potential_risex()
@@ -655,11 +910,27 @@ class FundingBoundaryOrchestrator:
         if threads_alive:
             with self._condition:
                 self._startup_failure = code
-                self._nado_potential_write = nado_potential
+                if worker_owned and nado_thread is not None and nado_thread.is_alive():
+                    self._nado_manual_recovery = True
+                self._nado_potential_write = (
+                    True if worker_owned and nado_thread is not None
+                    and nado_thread.is_alive() else nado_potential
+                )
                 self._risex_potential_write = risex_potential
                 self._condition.notify_all()
             return
-        if runner is not None and not nado_potential:
+        if worker_owned and not nado_resources_closed:
+            # A worker-owned store is never closed by startup cleanup.  If
+            # the worker did not positively confirm its own close, retain the
+            # resource and expose manual recovery instead of claiming that
+            # startup safely unwound.
+            with self._condition:
+                self._startup_failure = code
+                self._nado_manual_recovery = True
+                self._nado_potential_write = True
+                self._condition.notify_all()
+            return
+        if runner is not None and not nado_potential and not worker_owned:
             try:
                 runner.terminalize("SAFETY", "RUNNER_STARTUP")
             except BaseException:
@@ -677,9 +948,10 @@ class FundingBoundaryOrchestrator:
                 bridge.close()
             except BaseException:
                 pass
-        if owned is not None:
+        if owned is not None and not worker_owned:
             try:
-                owned.store.close()
+                if owned.store is not None:
+                    owned.store.close()
             except BaseException:
                 pass
         with self._condition:
@@ -733,7 +1005,23 @@ class FundingBoundaryOrchestrator:
                 raise FundingBoundaryOrchestrationError("STARTUP_FAILED")
             with self._condition:
                 self._nado = owned
-            nado_binding = self._validate_nado_binding(owned, journals[0])
+                self._nado_primary_journal = journals[0]
+                self._nado_worker_owned = callable(owned.worker_factory)
+            if self._nado_worker_owned:
+                self._nado_startup_gate = threading.Event()
+                self._nado_run_gate = threading.Event()
+                self._nado_close_gate = threading.Event()
+                with self._condition:
+                    self._nado_thread = threading.Thread(
+                        target=self._nado_worker,
+                        name="nado-funding-boundary-owned",
+                        daemon=True,
+                    )
+                assert self._nado_thread is not None
+                self._nado_thread.start()
+                nado_binding = self._wait_nado_ready()
+            else:
+                nado_binding = self._validate_nado_binding(owned, journals[0])
             risex_binding = bridge.bind_funding_boundary(nado_binding)
             if type(risex_binding) is not _risex.RisexFundingBoundaryBinding:
                 raise FundingBoundaryOrchestrationError("BINDING_MISMATCH")
@@ -744,28 +1032,53 @@ class FundingBoundaryOrchestrator:
             ):
                 raise FundingBoundaryOrchestrationError("BINDING_MISMATCH")
             self._relay.bind(nado_binding, risex_binding)
-            runner = owned.runner
-            self._barrier.bind(nado_binding, now_ms=runner.io.now_ms)
-            # Complete the accepted authenticated Nado read barrier before
-            # either lifecycle can take its first observation.  This keeps a
-            # RISEx price observation from aging while Nado is still pacing
-            # its private-read gateway window.
-            runner.stage = "PRIVATE_READ_BARRIER"
-            self._run_private_read(owned.private_read)
-            note_barrier = getattr(runner.io, "note_private_read_barrier", None)
-            if not callable(note_barrier):
-                raise FundingBoundaryOrchestrationError("STARTUP_FAILED")
-            note_barrier()
-            # Do not start either lifecycle once the exact target has arrived.
-            # This is a strict boundary check only; it adds no lead-time rule.
-            self._require_nado_prewrite_time(runner, self._route.settlement_at_ms)
+            if self._nado_worker_owned:
+                if not callable(owned.now_ms):
+                    raise FundingBoundaryOrchestrationError("STARTUP_FAILED")
+                barrier_now_ms = owned.now_ms
+            else:
+                runner = owned.runner
+                if runner is None:
+                    raise FundingBoundaryOrchestrationError("BINDING_MISMATCH")
+                barrier_now_ms = runner.io.now_ms
+            self._barrier.bind(nado_binding, now_ms=barrier_now_ms)
+            if self._nado_worker_owned:
+                startup_gate = self._nado_startup_gate
+                if startup_gate is None:
+                    raise FundingBoundaryOrchestrationError("STARTUP_FAILED")
+                # Release only the worker's accepted private-read/prewrite
+                # gate.  It will publish readiness before either lifecycle is
+                # released to run.
+                startup_gate.set()
+                self._wait_nado_startup()
+            else:
+                # Complete the accepted authenticated Nado read barrier before
+                # either lifecycle can take its first observation.  This keeps
+                # a RISEx price observation from aging while Nado is still
+                # pacing its private-read gateway window.
+                runner = owned.runner
+                if runner is None:
+                    raise FundingBoundaryOrchestrationError("BINDING_MISMATCH")
+                runner.stage = "PRIVATE_READ_BARRIER"
+                self._run_private_read(owned.private_read)
+                note_barrier = getattr(runner.io, "note_private_read_barrier", None)
+                if not callable(note_barrier):
+                    raise FundingBoundaryOrchestrationError("STARTUP_FAILED")
+                note_barrier()
+                # Do not start either lifecycle once the exact target has
+                # arrived.  This is a strict boundary check only; it adds no
+                # lead-time rule.
+                self._require_nado_prewrite_time(
+                    runner, self._route.settlement_at_ms,
+                )
             with self._condition:
                 self._binding = risex_binding
-                self._nado_thread = threading.Thread(
-                    target=self._nado_worker,
-                    name="nado-funding-boundary-owned",
-                    daemon=True,
-                )
+                if not self._nado_worker_owned:
+                    self._nado_thread = threading.Thread(
+                        target=self._nado_worker,
+                        name="nado-funding-boundary-owned",
+                        daemon=True,
+                    )
                 self._risex_thread = threading.Thread(
                     target=self._risex_worker,
                     name="risex-funding-boundary-owned",
@@ -776,7 +1089,13 @@ class FundingBoundaryOrchestrator:
             assert self._risex_thread is not None
             assert self._nado_thread is not None
             self._risex_thread.start()
-            self._nado_thread.start()
+            if self._nado_worker_owned:
+                run_gate = self._nado_run_gate
+                if run_gate is None:
+                    raise FundingBoundaryOrchestrationError("STARTUP_FAILED")
+                run_gate.set()
+            else:
+                self._nado_thread.start()
         except KeyboardInterrupt:
             self._startup_cleanup("STARTUP_INTERRUPTED")
             raise FundingBoundaryOrchestrationError("STARTUP_INTERRUPTED") from None
@@ -796,6 +1115,12 @@ class FundingBoundaryOrchestrator:
         )
         if not (self._nado_done and self._risex_done):
             status = "RUNNING" if self._started else "NOT_STARTED"
+            terminal = False
+        elif self._nado_persistence_unknown or self._nado_manual_recovery:
+            # Manual-recovery state dominates all in-memory runner flags and
+            # any partial report.  In particular, finally cannot turn a
+            # failed durable terminalization into BLOCKED_BEFORE_WRITE.
+            status = "FAILED_HALTED_MANUAL_RECOVERY"
             terminal = False
         elif self._safe_terminal_locked():
             status = "COMPLETE"
@@ -936,11 +1261,27 @@ class FundingBoundaryOrchestrator:
             if not self._started:
                 self._closed = True
                 return
-            threads = (self._nado_thread, self._risex_thread)
-            if any(thread is not None and thread.is_alive() for thread in threads):
-                raise FundingBoundaryOrchestrationError("MANUAL_RECOVERY_REQUIRED")
             report = self._snapshot_locked()
             if not report.terminal:
+                raise FundingBoundaryOrchestrationError("MANUAL_RECOVERY_REQUIRED")
+            worker_owned = self._nado_worker_owned
+            if worker_owned and not self._nado_close_ready:
+                raise FundingBoundaryOrchestrationError("MANUAL_RECOVERY_REQUIRED")
+            nado_alive = (
+                self._nado_thread is not None
+                and self._nado_thread.is_alive()
+            )
+            risex_alive = (
+                self._risex_thread is not None
+                and self._risex_thread.is_alive()
+            )
+            if risex_alive or (
+                nado_alive
+                and not (
+                    worker_owned
+                    and self._nado_done
+                )
+            ):
                 raise FundingBoundaryOrchestrationError("MANUAL_RECOVERY_REQUIRED")
             bridge = self._bridge
             owned = self._nado
@@ -948,11 +1289,38 @@ class FundingBoundaryOrchestrator:
             try:
                 bridge.close()
             except BaseException:
+                with self._condition:
+                    self._nado_manual_recovery = True
+                    self._risex_potential_write = True
+                    self._condition.notify_all()
                 raise FundingBoundaryOrchestrationError("CLOSE_FAILED") from None
-        if owned is not None:
+        if worker_owned:
+            close_gate = self._nado_close_gate
+            if close_gate is None:
+                with self._condition:
+                    self._nado_manual_recovery = True
+                    self._nado_potential_write = True
+                    self._condition.notify_all()
+                raise FundingBoundaryOrchestrationError("CLOSE_FAILED")
+            close_gate.set()
+            nado_thread = self._nado_thread
+            if nado_thread is not None and nado_thread.is_alive():
+                nado_thread.join(5.0)
+            with self._condition:
+                if not self._nado_resources_closed:
+                    self._nado_manual_recovery = True
+                    self._nado_potential_write = True
+                    self._condition.notify_all()
+                    raise FundingBoundaryOrchestrationError("CLOSE_FAILED")
+        if owned is not None and not worker_owned:
             try:
-                owned.store.close()
+                if owned.store is not None:
+                    owned.store.close()
             except BaseException:
+                with self._condition:
+                    self._nado_manual_recovery = True
+                    self._nado_potential_write = True
+                    self._condition.notify_all()
                 raise FundingBoundaryOrchestrationError("CLOSE_FAILED") from None
         with self._condition:
             self._closed = True

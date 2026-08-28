@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
+import sqlite3
 import threading
+import time
 
 import pytest
 
@@ -339,6 +341,343 @@ def _fixture(
 
 def _read_ok() -> dict[str, str]:
     return {"status": "FINALIZED"}
+
+
+REAL_NADO_OWNER = "0x" + ("11" * 20)
+REAL_NADO_SENDER = _nado.encode_subaccount(REAL_NADO_OWNER, _nado.SUBACCOUNT_NAME)
+
+
+class _RealNadoIO:
+    """Small no-network adapter used by the worker-owned SQLite regressions."""
+
+    def __init__(self, *, timestamp: int, observe_error: str | None = None) -> None:
+        self.timestamp = timestamp
+        self.observe_error = observe_error
+        self.observe_thread_id: int | None = None
+        self.private_barrier_noted = False
+
+    def _enable_funding_boundary_target(self) -> None:
+        return None
+
+    def now_ms(self) -> int:
+        return self.timestamp
+
+    def note_private_read_barrier(self) -> None:
+        self.private_barrier_noted = True
+
+    def observe(self, digests: tuple[str, ...]):
+        del digests
+        self.observe_thread_id = threading.get_ident()
+        if self.observe_error is None:
+            raise AssertionError("the normal ownership regression must not observe")
+        raise _nado.OperationalSafetyError(self.observe_error)
+
+    def capture_funding_baseline(self, *args, **kwargs):
+        raise AssertionError("unexpected funding baseline access")
+
+    def capture_funding_exposure(self, *args, **kwargs):
+        raise AssertionError("unexpected funding exposure access")
+
+    def await_funding_boundary(self, *args, **kwargs):
+        raise AssertionError("unexpected funding wait")
+
+    def read_funding_boundary(self, *args, **kwargs):
+        raise AssertionError("unexpected funding read")
+
+
+def _real_worker_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    observe_error: str | None = None,
+    private_read=None,
+    fake_run: bool = False,
+    hold_risex_after_report: bool = False,
+    fail_terminalize: bool = False,
+):
+    settlement = time.time_ns() // 1_000_000 + 60_000
+    path = tmp_path / "worker-owned-nado.sqlite3"
+    io = _RealNadoIO(timestamp=settlement - 1, observe_error=observe_error)
+    monkeypatch.setattr(
+        _nado, "_strict_identity", lambda: (REAL_NADO_OWNER, REAL_NADO_SENDER),
+    )
+    monkeypatch.setattr(_nado, "_funding_boundary_store_path", lambda: path)
+    monkeypatch.setattr(_nado, "OperationalVenueIO", lambda owner, sender: io)
+
+    config = _Config()
+    log: list[str] = []
+    holder: dict[str, object] = {}
+    release_risex = threading.Event()
+    risex_report_ready = threading.Event()
+    holder["release_risex"] = release_risex
+    holder["risex_report_ready"] = risex_report_ready
+
+    def bridge_factory(*, hold_release_gate, preparation_gate):
+        bridge = _FakeBridge(
+            preparation_gate=preparation_gate,
+            hold_release_gate=hold_release_gate,
+            config=config,
+            log=log,
+        )
+        holder["bridge"] = bridge
+        if hold_risex_after_report:
+            original_run = bridge.run_lifecycle
+
+            def delayed_run():
+                result = original_run()
+                risex_report_ready.set()
+                release_risex.wait(2)
+                return result
+
+            bridge.run_lifecycle = delayed_run
+        return bridge, lambda *args, **kwargs: None
+
+    def nado_factory(**kwargs):
+        owned = _owner._default_nado_factory(**kwargs)
+        holder["factory_runner_before_worker"] = owned.runner
+        build = owned.worker_factory
+        assert build is not None
+        if fake_run or fail_terminalize:
+            def worker_build():
+                runner, store = build()
+                if fake_run:
+                    def bounded_fake_run():
+                        runner._preparation_gate(runner.funding_binding)
+                        io.timestamp = settlement + 10
+                        runner._emit_boundary_progression(_nado.BOUNDARY_RELEASED)
+                        return _nado.FundingBoundaryReport(
+                            1, "BLOCKED", "worker-owned-test", 0, 0,
+                            _nado.FUNDING_UNRESOLVED, None, None,
+                            True, True, True, True, "TEST_BLOCKER",
+                        )
+
+                    runner.run = bounded_fake_run
+                if fail_terminalize:
+                    def failed_terminalize(*args, **kwargs):
+                        del args, kwargs
+                        raise RuntimeError("terminal persistence outage")
+
+                    runner.terminalize = failed_terminalize
+                return runner, store
+
+            owned.worker_factory = worker_build
+        return owned
+
+    orchestrator = _owner.FundingBoundaryOrchestrator(
+        route=_risex.fixed_funding_route(settlement),
+        bridge_factory=bridge_factory,
+        nado_factory=nado_factory,
+        private_read=_read_ok if private_read is None else private_read,
+    )
+    return orchestrator, holder, path, io, settlement
+
+
+def _track_worker_calls(monkeypatch: pytest.MonkeyPatch):
+    calls: dict[str, list[int]] = {}
+
+    def track(cls, name: str) -> None:
+        original = getattr(cls, name)
+        calls[name] = []
+
+        def wrapped(instance, *args, **kwargs):
+            calls[name].append(threading.get_ident())
+            return original(instance, *args, **kwargs)
+
+        monkeypatch.setattr(cls, name, wrapped)
+
+    for name in (
+        "funding_boundary_binding", "intents", "lifecycle_status", "halt", "close",
+    ):
+        track(_nado.IntentStore, name)
+    for name in ("begin", "terminalize"):
+        track(_nado.RuntimeRunJournal, name)
+    return calls
+
+
+def _read_worker_database(path: Path) -> dict[str, object]:
+    connection = sqlite3.connect(path)
+    try:
+        runtime = connection.execute(
+            "SELECT state, failure_class, stage FROM nado_runtime_runs"
+        ).fetchone()
+        lifecycle = connection.execute(
+            "SELECT status FROM nado_lifecycle_state WHERE singleton = 1"
+        ).fetchone()
+        intents = connection.execute("SELECT COUNT(*) FROM nado_intents").fetchone()
+        integrity = connection.execute("PRAGMA integrity_check").fetchone()
+    finally:
+        connection.close()
+    return {
+        "runtime": runtime,
+        "lifecycle": None if lifecycle is None else lifecycle[0],
+        "intents": None if intents is None else intents[0],
+        "integrity": None if integrity is None else integrity[0],
+        "bytes": path.read_bytes(),
+    }
+
+
+def _wait_for(predicate, timeout: float = 1.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() >= deadline:
+            raise AssertionError("worker regression did not reach its expected state")
+        time.sleep(0.001)
+
+
+def test_real_sqlite_worker_owned_normal_access_and_close_handshake(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _track_worker_calls(monkeypatch)
+    orchestrator, holder, path, _io, _settlement = _real_worker_fixture(
+        tmp_path, monkeypatch, fake_run=True, hold_risex_after_report=True,
+    )
+
+    orchestrator.start()
+    assert holder["factory_runner_before_worker"] is None
+    assert holder["risex_report_ready"].wait(1)
+    _wait_for(lambda: orchestrator._nado_done)
+    running = orchestrator.status()
+    assert running.status == "RUNNING"
+    assert running.nado_task == "DONE"
+    assert running.risex_task == "RUNNING"
+    assert orchestrator._nado_close_ready is True
+    assert orchestrator._nado_resources_closed is False
+    assert holder["bridge"].closed is False
+    with pytest.raises(_owner.FundingBoundaryOrchestrationError) as error:
+        orchestrator.close()
+    assert error.value.code == "MANUAL_RECOVERY_REQUIRED"
+    assert orchestrator._nado_resources_closed is False
+
+    holder["release_risex"].set()
+    report = orchestrator.retrieve(timeout_seconds=1)
+
+    assert report.status == "BLOCKED"
+    assert report.terminal is True
+    assert report.closed is True
+    assert orchestrator._nado_resources_closed is True
+    assert holder["bridge"].closed is True
+    worker_ids = set(calls["begin"])
+    assert len(worker_ids) == 1
+    worker_id = next(iter(worker_ids))
+    assert worker_id != threading.get_ident()
+    for name in (
+        "funding_boundary_binding", "intents", "lifecycle_status", "halt", "close",
+        "terminalize",
+    ):
+        assert calls[name]
+        assert set(calls[name]) == {worker_id}
+    database = _read_worker_database(path)
+    assert database["runtime"] == ("BLOCKED", "SAFETY", "FINAL_BARRIER")
+    assert database["lifecycle"] == "HALTED"
+    assert database["intents"] == 0
+    assert database["integrity"] == "ok"
+
+
+def test_real_sqlite_worker_owned_prewrite_failure_persists_exact_class_and_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _track_worker_calls(monkeypatch)
+    orchestrator, holder, path, io, _settlement = _real_worker_fixture(
+        tmp_path, monkeypatch, observe_error="schema failure",
+    )
+
+    report = orchestrator.run(timeout_seconds=1)
+
+    assert report.status == "BLOCKED_BEFORE_WRITE"
+    assert report.terminal is True
+    assert report.closed is True
+    assert report.nado_report is None
+    assert report.nado_potential_write is False
+    assert report.risex_potential_write is False
+    assert io.observe_thread_id is not None
+    assert holder["bridge"].closed is True
+    worker_id = io.observe_thread_id
+    assert worker_id != threading.get_ident()
+    assert set(calls["begin"]) == {worker_id}
+    assert set(calls["terminalize"]) == {worker_id}
+    for name in (
+        "funding_boundary_binding", "intents", "lifecycle_status", "halt", "close",
+    ):
+        assert calls[name]
+        assert set(calls[name]) == {worker_id}
+    database = _read_worker_database(path)
+    assert database["runtime"] == ("BLOCKED", "SCHEMA", "LIVE_OBSERVATION")
+    assert database["lifecycle"] == "HALTED"
+    assert database["intents"] == 0
+    assert database["integrity"] == "ok"
+    assert b"schema failure" not in database["bytes"]
+
+
+def test_real_sqlite_worker_owned_startup_failure_persists_exact_private_read_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _track_worker_calls(monkeypatch)
+
+    def failed_private_read():
+        raise _nado.OperationalSafetyError("transport private-read failure")
+
+    orchestrator, holder, path, _io, _settlement = _real_worker_fixture(
+        tmp_path, monkeypatch, private_read=failed_private_read,
+    )
+
+    with pytest.raises(_owner.FundingBoundaryOrchestrationError) as error:
+        orchestrator.start()
+    report = orchestrator.status()
+
+    assert error.value.code == "STARTUP_FAILED"
+    assert report.status == "BLOCKED_BEFORE_WRITE"
+    assert report.terminal is True
+    assert report.closed is True
+    assert report.nado_report is None
+    assert holder["bridge"].closed is True
+    worker_id = next(iter(calls["begin"]))
+    assert worker_id != threading.get_ident()
+    assert set(calls["terminalize"]) == {worker_id}
+    for name in (
+        "funding_boundary_binding", "intents", "lifecycle_status", "halt", "close",
+    ):
+        assert calls[name]
+        assert set(calls[name]) == {worker_id}
+    database = _read_worker_database(path)
+    assert database["runtime"] == (
+        "BLOCKED", "TRANSPORT", "PRIVATE_READ_BARRIER",
+    )
+    assert database["lifecycle"] == "HALTED"
+    assert database["intents"] == 0
+    assert database["integrity"] == "ok"
+    assert b"transport private-read failure" not in database["bytes"]
+
+
+def test_real_sqlite_worker_owned_persistence_failure_stays_manual_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _track_worker_calls(monkeypatch)
+    orchestrator, holder, path, io, _settlement = _real_worker_fixture(
+        tmp_path, monkeypatch, observe_error="schema failure", fail_terminalize=True,
+    )
+
+    report = orchestrator.run(timeout_seconds=1)
+
+    assert report.status == "FAILED_HALTED_MANUAL_RECOVERY"
+    assert report.terminal is False
+    assert report.closed is False
+    assert report.nado_potential_write is True
+    assert report.nado_report is None
+    assert io.observe_thread_id is not None
+    assert holder["bridge"].closed is False
+    assert orchestrator._nado_persistence_unknown is True
+    assert orchestrator._nado_manual_recovery is True
+    assert orchestrator._nado_resources_closed is False
+    assert calls["close"] == []
+    with pytest.raises(_owner.FundingBoundaryOrchestrationError) as error:
+        orchestrator.close()
+    assert error.value.code == "MANUAL_RECOVERY_REQUIRED"
+    database = _read_worker_database(path)
+    assert database["runtime"] == ("STARTED", None, None)
+    assert database["lifecycle"] == "RUNNING"
+    assert database["intents"] == 0
+    assert database["integrity"] == "ok"
+    assert b"terminal persistence outage" not in database["bytes"]
 
 
 @pytest.mark.parametrize("nado_now_ms", [SETTLEMENT, SETTLEMENT + 1])
