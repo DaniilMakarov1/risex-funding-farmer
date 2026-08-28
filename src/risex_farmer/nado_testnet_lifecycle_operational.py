@@ -55,10 +55,12 @@ from .nado_testnet_lifecycle import (
     OrderEvidence, OrderIntent,
     Product, Reconciliation, TerminalEvidence,
     SyntheticOrderVector, TriggerSnapshot, build_order_nonce,
-    decode_subaccount,
+    decode_subaccount, encode_subaccount,
+    canonical_payload, verify_signed_validation, _notional_x18,
     completion_barrier, order_digest, smallest_executable_amount,
     nado_account_funding_digest, nado_funding_event_digest,
     nado_funding_exposure_digest,
+    cross_run_attestation_digest, terminal_evidence_digest,
     _assert_authoritative_account,
     validate_entry_preflight,
 )
@@ -66,8 +68,24 @@ from .nado_testnet_lifecycle import (
 
 RUN_STORE_BASENAME = ".risex-funding-farmer-nado-level-c-v1.sqlite3"
 REDACTED_STORE_PATH = "<passwd-home>/" + RUN_STORE_BASENAME
+# The completed historical Level-C runner above is deliberately not the
+# funding-boundary writer's store.  A new fixed basename gives this fresh
+# route its own protected SQLite identity and keeps the historical SKR store
+# untouched.
+FUNDING_BOUNDARY_RUN_STORE_BASENAME = (
+    ".risex-funding-farmer-nado-funding-boundary-eth-v1.sqlite3"
+)
+FUNDING_BOUNDARY_REDACTED_STORE_PATH = (
+    "<passwd-home>/" + FUNDING_BOUNDARY_RUN_STORE_BASENAME
+)
+# These are the historical Level-C constants.  ``run()`` continues to open
+# RUN_STORE_BASENAME and therefore must continue to interpret that database as
+# the completed SKR route.
 TARGET_PRODUCT_ID = 44
 TARGET_TICKER_ID = "SKR-PERP_USDT0"
+FUNDING_BOUNDARY_TARGET_CANONICAL_ASSET = "ETH"
+FUNDING_BOUNDARY_TARGET_PRODUCT_ID = 4
+FUNDING_BOUNDARY_TARGET_TICKER_ID = "ETH-PERP_USDT0"
 # Official Nado Python SDK 2.0.0's nado_protocol.utils.gen_order_nonce(
 # recv_time_ms=None) fences an order at the current UTC receive timestamp plus
 # 90 seconds.
@@ -83,6 +101,35 @@ NADO_FUNDING_PAGE_LIMIT = 100
 NADO_FUNDING_MAX_PAGES = 8
 NADO_FUNDING_WAIT_GRACE_SECONDS = 30.0
 UNEXPECTED_FAILURE = "UNEXPECTED_FAILURE"
+
+# Official Nado gateway weights observed for the accepted 94-product catalog:
+# contracts(1) + status(1) + linked signer(5) + all products(5) + orders
+# (2 * 92) + subaccount(2) + isolated positions(10) + market price(1) = 209.
+# The accepted private-read round B is 29 + (2 * 92) = 213.  These are fixed
+# venue-local admission facts, not a reusable rate limiter.  Admission tracks
+# only this process's own gateway windows; unrelated same-IP traffic remains
+# outside its control and can still consume the official IP-scoped quota.
+NADO_QUERY_WEIGHT_LIMIT_10S = 400
+NADO_QUERY_WINDOW_SECONDS = 10.0
+NADO_OBSERVED_CATALOG_PRODUCT_COUNT = 94
+NADO_NON_ORDERABLE_PRODUCT_COUNT = 2
+NADO_OBSERVED_ORDERABLE_PRODUCT_COUNT = (
+    NADO_OBSERVED_CATALOG_PRODUCT_COUNT - NADO_NON_ORDERABLE_PRODUCT_COUNT
+)
+NADO_FULL_OBSERVE_FIXED_WEIGHT = 1 + 1 + 5 + 5 + 2 + 10 + 1
+NADO_FULL_OBSERVE_GATEWAY_WEIGHT = (
+    NADO_FULL_OBSERVE_FIXED_WEIGHT + 2 * NADO_OBSERVED_ORDERABLE_PRODUCT_COUNT
+)
+NADO_PRIVATE_READ_ROUND_B_GATEWAY_WEIGHT = 29 + (
+    2 * NADO_OBSERVED_ORDERABLE_PRODUCT_COUNT
+)
+NADO_BARRIER_TO_OBSERVE_WEIGHT = (
+    NADO_PRIVATE_READ_ROUND_B_GATEWAY_WEIGHT + NADO_FULL_OBSERVE_GATEWAY_WEIGHT
+)
+NADO_QUERY_ADMISSION_LIMITATION = (
+    "Admission pacing controls only this runner's own gateway query window; "
+    "unrelated same-IP traffic is not controlled."
+)
 
 
 class OperationalSafetyError(RuntimeError):
@@ -121,6 +168,43 @@ class LiveObservation:
     product: Product
     bid_x18: int
     ask_x18: int
+
+
+@dataclass(frozen=True)
+class RisexTerminalEvidence:
+    """The only external final-evidence seam accepted by the Nado runner."""
+
+    route: FundingRouteBinding
+    journal: JournalIdentity
+    terminal: TerminalEvidence
+    round_index: int
+
+    def assert_contract(self) -> None:
+        if (
+            type(self.route) is not FundingRouteBinding
+            or type(self.journal) is not JournalIdentity
+            or type(self.terminal) is not TerminalEvidence
+            or type(self.round_index) is not int
+            or self.round_index not in {1, 2}
+        ):
+            raise NadoContractError("RISEx terminal provenance is invalid")
+        try:
+            self.route.assert_contract()
+            self.journal.assert_contract()
+            self.terminal.assert_contract()
+        except NadoContractError:
+            raise
+        if self.terminal.journal != self.journal:
+            raise NadoContractError("RISEx terminal journal provenance is invalid")
+
+
+# A Chief-owned RISEx implementation supplies one immutable terminal artifact
+# and its route/journal/round provenance.  The Nado runner builds the Nado
+# terminal and CrossRunAttestation itself; a caller can never supply either as
+# authority through this seam.
+RisexTerminalEvidenceProvider = Callable[
+    [FundingBoundaryBinding, LiveObservation, int], RisexTerminalEvidence
+]
 
 
 @dataclass(frozen=True)
@@ -187,7 +271,7 @@ class FundingBoundaryReport:
             "reason": self.reason,
             "funding_aggregate_payment_x18": self.funding_aggregate_payment_x18,
             "funding_account_idx": self.funding_account_idx,
-            "path": REDACTED_STORE_PATH,
+            "path": FUNDING_BOUNDARY_REDACTED_STORE_PATH,
         }
 
 
@@ -270,13 +354,6 @@ class FundingBoundaryVenueIO(VenueIO, Protocol):
     def read_funding_boundary(
         self, binding: FundingBoundaryBinding,
     ) -> tuple[NadoFundingEvent | None, NadoAccountFunding | None]: ...
-
-    def final_attestation(
-        self,
-        binding: FundingBoundaryBinding,
-        observation: LiveObservation,
-        round_index: int,
-    ) -> CrossRunAttestation | None: ...
 
 
 class RuntimeRunJournal:
@@ -379,6 +456,11 @@ def _production_store_path() -> Path:
     return _home() / RUN_STORE_BASENAME
 
 
+def _funding_boundary_store_path() -> Path:
+    """Return the separate fixed store for the fresh ETH funding route."""
+    return _home() / FUNDING_BOUNDARY_RUN_STORE_BASENAME
+
+
 def _prepare_file(path: Path) -> None:
     try:
         descriptor = os.open(
@@ -423,6 +505,71 @@ def _journal_store_identity(path: Path) -> str:
     except (OSError, UnicodeError):
         raise OperationalSafetyError("operational journal identity unavailable") from None
     return "nado-level-c-v1-" + hashlib.sha256(material).hexdigest()
+
+
+def _full_observe_gateway_weight(
+    catalog_product_count: int = NADO_OBSERVED_CATALOG_PRODUCT_COUNT,
+    orderable_product_count: int = NADO_OBSERVED_ORDERABLE_PRODUCT_COUNT,
+) -> int:
+    """Return the fixed current-catalog weight reserved before ``observe``."""
+    if (
+        type(catalog_product_count) is not int
+        or type(orderable_product_count) is not int
+        or catalog_product_count != NADO_OBSERVED_CATALOG_PRODUCT_COUNT
+        or orderable_product_count != (
+            catalog_product_count - NADO_NON_ORDERABLE_PRODUCT_COUNT
+        )
+    ):
+        raise OperationalSafetyError("Nado observed catalog weight is unavailable")
+    return NADO_FULL_OBSERVE_FIXED_WEIGHT + 2 * orderable_product_count
+
+
+class _NadoSnapshotAdmission:
+    """Deterministic admission whose sleeper interruption fails closed."""
+
+    def __init__(
+        self,
+        *,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self._monotonic = monotonic
+        self._sleeper = sleeper
+        self._last_gateway_window_at: float | None = None
+        self._snapshot_admitted = False
+
+    def note_gateway_window(self) -> None:
+        """Record completion of an external or own Nado gateway window."""
+        self._last_gateway_window_at = self._monotonic()
+
+    def before_snapshot(self) -> None:
+        """Wait for a safe start; interruption leaves the operation fail-closed."""
+        if self._snapshot_admitted:
+            raise OperationalSafetyError("Nado snapshot admission is already in flight")
+        anchor = self._last_gateway_window_at
+        if anchor is not None:
+            deadline = anchor + NADO_QUERY_WINDOW_SECONDS
+            remaining = deadline - self._monotonic()
+            if remaining > 0:
+                self._sleeper(remaining)
+                now = self._monotonic()
+                if now < deadline:
+                    raise OperationalSafetyError(
+                        "Nado query admission did not reach a safe window"
+                    )
+            else:
+                now = self._monotonic()
+        else:
+            now = self._monotonic()
+        del now
+        self._snapshot_admitted = True
+
+    def complete_snapshot(self) -> None:
+        """Anchor the next window at conservative snapshot completion."""
+        if not self._snapshot_admitted:
+            raise OperationalSafetyError("Nado snapshot admission was not started")
+        self._last_gateway_window_at = self._monotonic()
+        self._snapshot_admitted = False
 
 
 class OwnerOrderCapability:
@@ -517,11 +664,13 @@ def _entry_order(
     *,
     direction: str = LONG,
     expected_amount_x18: int | None = None,
+    target_product_id: int = TARGET_PRODUCT_ID,
+    target_ticker_id: str = TARGET_TICKER_ID,
 ) -> SyntheticOrderVector:
     product = observation.product
     if (
-        product.product_id != TARGET_PRODUCT_ID
-        or product.symbol != TARGET_TICKER_ID
+        product.product_id != target_product_id
+        or product.symbol != target_ticker_id
         or product.product_type != ACTIVE_PERP
     ):
         raise OperationalSafetyError("fixed target product identity unavailable")
@@ -531,9 +680,19 @@ def _entry_order(
     if direction not in {LONG, SHORT}:
         raise OperationalSafetyError("funding route direction is invalid")
     salt = _salt()
-    amount = smallest_executable_amount(product, prices_x18=(bid, ask))
-    if expected_amount_x18 is not None and amount != expected_amount_x18:
-        raise OperationalSafetyError("funding route quantity differs from executable amount")
+    minimum_amount = smallest_executable_amount(product, prices_x18=(bid, ask))
+    if expected_amount_x18 is None:
+        amount = minimum_amount
+    else:
+        if (
+            type(expected_amount_x18) is not int
+            or expected_amount_x18 < minimum_amount
+            or expected_amount_x18 % product.step_x18
+        ):
+            raise OperationalSafetyError(
+                "funding route quantity differs from executable amount"
+            )
+        amount = expected_amount_x18
     if direction == LONG:
         buffered_ask = (ask * 110 + 99) // 100
         price = (
@@ -547,7 +706,7 @@ def _entry_order(
             raise OperationalSafetyError("funding short entry price is invalid")
         signed_amount = -amount
     return SyntheticOrderVector(
-        owner, SUBACCOUNT_NAME, sender, TARGET_PRODUCT_ID, price,
+        owner, SUBACCOUNT_NAME, sender, target_product_id, price,
         signed_amount, UINT32_MAX, recv, salt,
         build_order_nonce(recv, salt), IOC_APPENDIX,
     )
@@ -573,6 +732,127 @@ def _terminal_fingerprint(evidence: TerminalEvidence) -> tuple[object, ...]:
         evidence.unresolved_write_identities,
         evidence.authoritative,
     )
+
+
+def _nado_terminal_journal_content_projection(
+    store: IntentStore,
+) -> dict[str, object]:
+    """Project only immutable terminal-relevant Nado journal content.
+
+    Lifecycle/runtime state and the later funding evidence/blocker rows are
+    deliberately excluded.  The latter would make this digest circular with
+    the attestation that stores it.  The included binding, baseline, exposure,
+    durable intent payloads, and fill identities are immutable once written.
+    """
+    binding = store.funding_boundary_binding()
+    baseline = store.funding_boundary_baseline()
+    exposure = store.funding_boundary_exposure()
+    if binding is None or baseline is None or exposure is None:
+        raise OperationalSafetyError(
+            "Nado terminal journal content is unavailable"
+        )
+    try:
+        binding.assert_contract()
+        nado_journal = binding.nado_journal
+        route = binding.route
+        intents = tuple(
+            {
+                "digest": intent.digest,
+                "kind": intent.kind,
+                "product_id": intent.product_id,
+                "nonce": intent.nonce,
+                "recv_time": intent.recv_time,
+                "payload": intent.payload.decode("ascii"),
+                "amount_x18": intent.amount_x18,
+                "appendix": intent.appendix,
+                "notional_x18": intent.notional_x18,
+                "clamp_expected": intent.clamp_expected,
+                "snapshot_id": intent.snapshot_id,
+                "snapshot_observed_at_ms": intent.snapshot_observed_at_ms,
+                "starting_position_x18": intent.starting_position_x18,
+                "sender": intent.sender,
+                "owner": intent.owner,
+                "subaccount_name": intent.subaccount_name,
+            }
+            for intent, _state in store.intents()
+        )
+        fills = tuple(
+            {
+                "digest": digest,
+                "submission_idx": submission_idx,
+                "product_id": product_id,
+                "amount_x18": amount_x18,
+            }
+            for (digest, submission_idx), (product_id, amount_x18)
+            in sorted(store.persisted_fill_map().items())
+        )
+        return {
+            "binding": {
+                "route": {
+                    "canonical_asset": route.canonical_asset,
+                    "risex_leg": {
+                        "venue": route.risex_leg.venue,
+                        "market": route.risex_leg.market,
+                        "direction": route.risex_leg.direction,
+                        "raw_quantity": format(route.risex_leg.raw_quantity, "f"),
+                        "base_multiplier": format(
+                            route.risex_leg.base_multiplier, "f"
+                        ),
+                        "canonical_quantity": format(
+                            route.risex_leg.canonical_quantity, "f"
+                        ),
+                    },
+                    "nado_leg": {
+                        "venue": route.nado_leg.venue,
+                        "market": route.nado_leg.market,
+                        "direction": route.nado_leg.direction,
+                        "raw_quantity": format(route.nado_leg.raw_quantity, "f"),
+                        "base_multiplier": format(
+                            route.nado_leg.base_multiplier, "f"
+                        ),
+                        "canonical_quantity": format(
+                            route.nado_leg.canonical_quantity, "f"
+                        ),
+                    },
+                    "nado_product_id": route.nado_product_id,
+                    "settlement_at_ms": route.settlement_at_ms,
+                },
+                "risex_journal": {
+                    "venue": binding.risex_journal.venue,
+                    "run_id": binding.risex_journal.run_id,
+                    "store_identity": binding.risex_journal.store_identity,
+                    "account_id": binding.risex_journal.account_id,
+                },
+                "nado_journal": {
+                    "venue": nado_journal.venue,
+                    "run_id": nado_journal.run_id,
+                    "store_identity": nado_journal.store_identity,
+                    "account_id": nado_journal.account_id,
+                },
+            },
+            "baseline_digest": baseline.baseline_digest,
+            "exposure_digest": exposure.exposure_digest,
+            "intents": intents,
+            "fills": fills,
+        }
+    except (UnicodeDecodeError, TypeError, ValueError):
+        raise OperationalSafetyError(
+            "Nado terminal journal content is unavailable"
+        ) from None
+
+
+def _nado_terminal_journal_content_sha256(store: IntentStore) -> str:
+    try:
+        material = canonical_payload(
+            _nado_terminal_journal_content_projection(store)
+        )
+    except OperationalSafetyError:
+        raise
+    except (NadoContractError, TypeError, ValueError):
+        raise OperationalSafetyError(
+            "Nado terminal journal content is unavailable"
+        ) from None
+    return "0x" + hashlib.sha256(material).hexdigest()
 
 
 class SealedLifecycleRunner:
@@ -680,15 +960,21 @@ class SealedLifecycleRunner:
             raise OperationalSafetyError("existing lifecycle requires manual recovery")
         entry_direction = LONG
         expected_amount_x18: int | None = None
+        target_product_id = TARGET_PRODUCT_ID
+        target_ticker_id = TARGET_TICKER_ID
         if route is not None:
             route.assert_contract()
             if (
-                route.nado_product_id != TARGET_PRODUCT_ID
-                or route.nado_leg.market != TARGET_TICKER_ID
+                route.canonical_asset != FUNDING_BOUNDARY_TARGET_CANONICAL_ASSET
+                or route.nado_leg.venue != NADO_VENUE
+                or route.nado_product_id != FUNDING_BOUNDARY_TARGET_PRODUCT_ID
+                or route.nado_leg.market != FUNDING_BOUNDARY_TARGET_TICKER_ID
             ):
                 raise OperationalSafetyError("funding route target product identity unavailable")
             entry_direction = route.nado_leg.direction
             expected_amount_x18 = _canonical_quantity_x18(route.canonical_quantity)
+            target_product_id = FUNDING_BOUNDARY_TARGET_PRODUCT_ID
+            target_ticker_id = FUNDING_BOUNDARY_TARGET_TICKER_ID
         self.stage = "LIVE_OBSERVATION"
         initial = self._observe()
         if before_entry is not None:
@@ -704,6 +990,8 @@ class SealedLifecycleRunner:
             recv,
             direction=entry_direction,
             expected_amount_x18=expected_amount_x18,
+            target_product_id=target_product_id,
+            target_ticker_id=target_ticker_id,
         )
         worst_close_price = (
             initial.bid_x18 if entry_direction == LONG else initial.ask_x18
@@ -711,7 +999,7 @@ class SealedLifecycleRunner:
         self.stage = "ENTRY_PREFLIGHT"
         validate_entry_preflight(
             catalog=initial.catalog, account=initial.evidence.account,
-            triggers=initial.evidence.triggers, product_id=TARGET_PRODUCT_ID,
+            triggers=initial.evidence.triggers, product_id=target_product_id,
             entry_price_x18=order.price_x18,
             worst_close_price_x18=worst_close_price, now_ms=issued_at,
         )
@@ -730,13 +1018,24 @@ class SealedLifecycleRunner:
         finally:
             capability.close()
         self.stage = "ENTRY_PREPARATION"
-        entry = self.core.prepare_entry(
-            order=order, catalog=initial.catalog, account=initial.evidence.account,
-            triggers=initial.evidence.triggers,
-            worst_close_price_x18=worst_close_price, signature=signature,
-            validation_product_id=order.product_id, validation_valid=valid,
-            now_ms=issued_at, direction=entry_direction,
-        )
+        if route is None:
+            entry = self.core.prepare_entry(
+                order=order, catalog=initial.catalog, account=initial.evidence.account,
+                triggers=initial.evidence.triggers,
+                worst_close_price_x18=worst_close_price, signature=signature,
+                validation_product_id=order.product_id, validation_valid=valid,
+                now_ms=issued_at, direction=entry_direction,
+            )
+        else:
+            entry = self._prepare_funding_entry(
+                order=order, catalog=initial.catalog,
+                account=initial.evidence.account,
+                triggers=initial.evidence.triggers,
+                worst_close_price_x18=worst_close_price,
+                signature=signature, validation_product_id=order.product_id,
+                validation_valid=valid, now_ms=issued_at,
+                direction=entry_direction,
+            )
         self.stage = "DISPATCH"
         self._dispatch(entry)
         self.stage = "RECONCILIATION"
@@ -831,6 +1130,7 @@ class SealedFundingBoundaryRunner(SealedLifecycleRunner):
         sender: str,
         route: FundingRouteBinding,
         risex_journal: JournalIdentity,
+        risex_attestation_provider: RisexTerminalEvidenceProvider,
     ) -> None:
         try:
             route.assert_contract()
@@ -839,6 +1139,8 @@ class SealedFundingBoundaryRunner(SealedLifecycleRunner):
                 raise NadoContractError("funding counterpart journal is not RISEx")
         except NadoContractError:
             raise OperationalSafetyError("funding boundary contract rejected") from None
+        if not callable(risex_attestation_provider):
+            raise OperationalSafetyError("RISEx attestation provider unavailable")
         if any(
             not callable(getattr(io, method, None))
             for method in (
@@ -846,7 +1148,6 @@ class SealedFundingBoundaryRunner(SealedLifecycleRunner):
                 "capture_funding_exposure",
                 "await_funding_boundary",
                 "read_funding_boundary",
-                "final_attestation",
             )
         ):
             raise OperationalSafetyError("funding boundary adapter unavailable")
@@ -874,11 +1175,207 @@ class SealedFundingBoundaryRunner(SealedLifecycleRunner):
                 pass
             raise
         self.funding_io = io
+        self.risex_attestation_provider = risex_attestation_provider
         self.funding_baseline: NadoFundingBaseline | None = None
         self.funding_exposure: NadoFundingExposure | None = None
         self.funding_event: NadoFundingEvent | None = None
         self.account_funding: NadoAccountFunding | None = None
         self.funding_blocker_reason: str | None = None
+
+    def _prepare_funding_entry(
+        self,
+        *,
+        order: SyntheticOrderVector,
+        catalog: CatalogSnapshot,
+        account: AccountSnapshot,
+        triggers: TriggerSnapshot,
+        worst_close_price_x18: int,
+        signature: str,
+        validation_product_id: int,
+        validation_valid: bool,
+        now_ms: int,
+        direction: str,
+    ) -> OrderIntent:
+        """Prepare the exact route quantity after minimum-size validation."""
+        if order.appendix != IOC_APPENDIX or direction not in {LONG, SHORT}:
+            raise NadoContractError("funding entry order contract is invalid")
+        if (
+            order.sender.lower() != self.sender
+            or order.owner.lower() != account.owner.lower()
+            or order.subaccount_name != account.subaccount_name
+            or order.sender.lower() != encode_subaccount(
+                account.owner, account.subaccount_name
+            ).lower()
+        ):
+            raise NadoContractError("signed order and preflight subaccount identity mismatch")
+        self.core._assert_next_state_write(recv_time=order.recv_time, now_ms=now_ms)
+        verify_signed_validation(
+            order,
+            signature=signature,
+            validation_product_id=validation_product_id,
+            validation_valid=validation_valid,
+        )
+        plan = validate_entry_preflight(
+            catalog=catalog,
+            account=account,
+            triggers=triggers,
+            product_id=FUNDING_BOUNDARY_TARGET_PRODUCT_ID,
+            entry_price_x18=order.price_x18,
+            worst_close_price_x18=worst_close_price_x18,
+            now_ms=now_ms,
+        )
+        product = catalog.by_id()[FUNDING_BOUNDARY_TARGET_PRODUCT_ID]
+        amount = abs(order.amount_x18)
+        expected_amount_x18 = _canonical_quantity_x18(
+            self.funding_binding.route.canonical_quantity
+        )
+        expected_direction = self.funding_binding.route.nado_leg.direction
+        if (
+            order.product_id != FUNDING_BOUNDARY_TARGET_PRODUCT_ID
+            or amount != expected_amount_x18
+            or expected_direction not in {LONG, SHORT}
+            or direction != expected_direction
+            or amount < plan.amount_x18
+            or amount % product.step_x18
+            or (order.amount_x18 > 0) != (direction == LONG)
+        ):
+            raise NadoContractError("funding entry quantity or direction is invalid")
+        entry_notional = _notional_x18(order.price_x18, amount)
+        close_notional = _notional_x18(worst_close_price_x18, amount)
+        if min(entry_notional, close_notional) < product.minimum_notional_x18:
+            raise NadoContractError("funding entry is below product minimum notional")
+        intent = OrderIntent(
+            kind=ENTRY,
+            product_id=order.product_id,
+            nonce=order.nonce,
+            recv_time=order.recv_time,
+            digest=order_digest(order),
+            payload=canonical_payload(order.as_payload()),
+            amount_x18=order.amount_x18,
+            appendix=order.appendix,
+            notional_x18=entry_notional,
+            sender=order.sender.lower(),
+            owner=order.owner.lower(),
+            subaccount_name=order.subaccount_name,
+        )
+        self.store.prepare(intent)
+        return intent
+
+    def _nado_journal_content_sha256(self) -> str:
+        return _nado_terminal_journal_content_sha256(self.store)
+
+    def _local_nado_terminal(self, observation: LiveObservation) -> TerminalEvidence:
+        persisted = self.store.funding_boundary_binding()
+        if persisted != self.funding_binding:
+            raise NadoContractError("persisted Nado funding binding changed")
+        regular, trigger, flat = _terminal_flags(observation)
+        unresolved = tuple(
+            intent.digest
+            for intent, state in self.store.intents()
+            if state != "RECONCILED"
+        )
+        unsigned = TerminalEvidence(
+            self.funding_binding.nado_journal,
+            COMPLETE,
+            observation.evidence.observed_at_ms,
+            self._nado_journal_content_sha256(),
+            regular,
+            trigger,
+            flat,
+            unresolved,
+            "0x" + "00" * 32,
+        )
+        terminal = replace(
+            unsigned,
+            evidence_digest="0x" + terminal_evidence_digest(unsigned),
+        )
+        terminal.assert_contract()
+        return terminal
+
+    def _external_risex_terminal(
+        self,
+        observation: LiveObservation,
+        round_index: int,
+        previous: CrossRunAttestation | None,
+    ) -> TerminalEvidence:
+        try:
+            result = self.risex_attestation_provider(
+                self.funding_binding, observation, round_index,
+            )
+        except Exception:
+            raise OperationalSafetyError("RISEx terminal provider failed") from None
+        if type(result) is not RisexTerminalEvidence:
+            raise OperationalSafetyError(
+                "RISEx terminal provider returned invalid evidence"
+            )
+        try:
+            result.assert_contract()
+        except NadoContractError:
+            raise OperationalSafetyError(
+                "RISEx terminal provider returned invalid evidence"
+            ) from None
+        if (
+            result.route != self.funding_binding.route
+            or result.journal != self.funding_binding.risex_journal
+            or result.terminal.journal != self.funding_binding.risex_journal
+            or result.round_index != round_index
+        ):
+            raise OperationalSafetyError(
+                "RISEx terminal is not bound to the persisted route and journal"
+            )
+        reference_ms = observation.evidence.observed_at_ms
+        if abs(result.terminal.observed_at_ms - reference_ms) > MAX_FRESHNESS_MS:
+            raise OperationalSafetyError("RISEx terminal evidence is stale")
+        if previous is not None and (
+            result.terminal.observed_at_ms
+            <= previous.risex_terminal.observed_at_ms
+        ):
+            raise OperationalSafetyError(
+                "RISEx terminal rounds were reused or are not fresh"
+            )
+        return result.terminal
+
+    def _final_attestation(
+        self,
+        observation: LiveObservation,
+        round_index: int,
+        previous: CrossRunAttestation | None,
+    ) -> CrossRunAttestation:
+        # Build Nado's terminal proof before invoking the external provider so
+        # that provider code cannot influence the local terminal observation.
+        nado_terminal = self._local_nado_terminal(observation)
+        risex_terminal = self._external_risex_terminal(
+            observation, round_index, previous,
+        )
+        unsigned = CrossRunAttestation(
+            self.funding_binding.route,
+            self.funding_binding.risex_journal,
+            self.funding_binding.nado_journal,
+            risex_terminal,
+            nado_terminal,
+            "0x" + "00" * 32,
+        )
+        attestation = replace(
+            unsigned,
+            attestation_digest="0x" + cross_run_attestation_digest(unsigned),
+        )
+        attestation.assert_contract()
+        if previous is not None:
+            if (
+                attestation.nado_terminal.observed_at_ms
+                <= previous.nado_terminal.observed_at_ms
+            ):
+                raise NadoContractError(
+                    "Nado terminal rounds were reused or are not fresh"
+                )
+            if (
+                _terminal_fingerprint(attestation.risex_terminal)
+                != _terminal_fingerprint(previous.risex_terminal)
+                or _terminal_fingerprint(attestation.nado_terminal)
+                != _terminal_fingerprint(previous.nado_terminal)
+            ):
+                raise NadoContractError("final funding terminal rounds disagree")
+        return attestation
 
     def _capture_funding_baseline(self, observed: LiveObservation) -> None:
         baseline = self.funding_io.capture_funding_baseline(
@@ -958,14 +1455,14 @@ class SealedFundingBoundaryRunner(SealedLifecycleRunner):
         if len(finals) != 2:
             raise OperationalSafetyError("two final funding rounds are required")
         attestations: list[CrossRunAttestation] = []
+        previous: CrossRunAttestation | None = None
         for round_index, observation in enumerate(finals, start=1):
-            attestation = self.funding_io.final_attestation(
-                self.funding_binding, observation, round_index,
+            attestation = self._final_attestation(
+                observation, round_index, previous,
             )
-            if attestation is None:
-                raise NadoContractError("final funding attestation is incomplete")
             attestation.assert_contract()
             attestations.append(attestation)
+            previous = attestation
         first, second = attestations
         if (
             first.route != second.route
@@ -1121,11 +1618,14 @@ def _run_funding_boundary_fixture_or_operational(
     sender: str,
     route: FundingRouteBinding,
     risex_journal: JournalIdentity,
+    risex_attestation_provider: RisexTerminalEvidenceProvider,
     private_read: bool,
 ) -> FundingBoundaryReport:
     _prepare_file(path)
     store = IntentStore(path)
     try:
+        if isinstance(io, OperationalVenueIO):
+            io._enable_funding_boundary_target()
         try:
             setattr(io, "store", store)
         except BaseException:
@@ -1141,6 +1641,7 @@ def _run_funding_boundary_fixture_or_operational(
                 sender=sender,
                 route=route,
                 risex_journal=risex_journal,
+                risex_attestation_provider=risex_attestation_provider,
             )
             if private_read:
                 runner.stage = "PRIVATE_READ_BARRIER"
@@ -1149,6 +1650,9 @@ def _run_funding_boundary_fixture_or_operational(
                     raise DurableOperationalFailure(
                         _report_failure_class(preflight), "PRIVATE_READ_BARRIER",
                     )
+                note_barrier = getattr(io, "note_private_read_barrier", None)
+                if callable(note_barrier):
+                    note_barrier()
             report = runner.run()
             if report.status == "BLOCKED":
                 runner.terminalize("SAFETY", "FINAL_BARRIER")
@@ -1178,6 +1682,7 @@ def _fixture_funding_boundary_run(
     sender: str,
     route: FundingRouteBinding,
     risex_journal: JournalIdentity,
+    risex_attestation_provider: RisexTerminalEvidenceProvider,
 ) -> FundingBoundaryReport:
     """Run the full funding contract against an injected fixture IO only."""
     return _run_funding_boundary_fixture_or_operational(
@@ -1188,6 +1693,7 @@ def _fixture_funding_boundary_run(
         sender=sender,
         route=route,
         risex_journal=risex_journal,
+        risex_attestation_provider=risex_attestation_provider,
         private_read=False,
     )
 
@@ -1197,17 +1703,19 @@ def run_funding_boundary(
     route: FundingRouteBinding,
     risex_journal: JournalIdentity,
     io: FundingBoundaryVenueIO,
+    risex_attestation_provider: RisexTerminalEvidenceProvider,
 ) -> dict[str, object]:
     """Run one production Nado funding-boundary route with fixed credentials."""
     owner, sender = _strict_identity()
     report = _run_funding_boundary_fixture_or_operational(
-        path=_production_store_path(),
+        path=_funding_boundary_store_path(),
         io=io,
         capability_loader=_load_capability,
         owner=owner,
         sender=sender,
         route=route,
         risex_journal=risex_journal,
+        risex_attestation_provider=risex_attestation_provider,
         private_read=True,
     )
     return report.sanitized()
@@ -1234,6 +1742,9 @@ def run() -> dict[str, object]:
             raise DurableOperationalFailure(
                 _report_failure_class(preflight), "PRIVATE_READ_BARRIER",
             )
+        note_barrier = getattr(io, "note_private_read_barrier", None)
+        if callable(note_barrier):
+            note_barrier()
         report = runner.run()
         return report.sanitized()
     except DurableOperationalFailure as error:
@@ -1395,6 +1906,9 @@ class OperationalVenueIO:
 
     def __init__(self, owner: str, sender: str) -> None:
         self.owner, self.sender = owner.lower(), sender.lower()
+        self._target_product_id = TARGET_PRODUCT_ID
+        self._target_ticker_id = TARGET_TICKER_ID
+        self._query_admission = _NadoSnapshotAdmission()
         self._terminal: dict[str, str] = {}
         self._cancelled_entry: str | None = None
         self._resting_orders: dict[str, OrderEvidence] = {}
@@ -1414,7 +1928,23 @@ class OperationalVenueIO:
     def terminal_status(self, digest: str) -> str | None:
         return self._terminal.get(digest.lower())
 
+    def _enable_funding_boundary_target(self) -> None:
+        """Switch this fixed IO to ETH only under the funding entrypoint."""
+        self._target_product_id = FUNDING_BOUNDARY_TARGET_PRODUCT_ID
+        self._target_ticker_id = FUNDING_BOUNDARY_TARGET_TICKER_ID
+
+    def note_private_read_barrier(self) -> None:
+        """Anchor admission after the accepted private-read gateway window."""
+        self._query_admission.note_gateway_window()
+
     def observe(self, digests: tuple[str, ...]) -> LiveObservation:
+        self._query_admission.before_snapshot()
+        try:
+            return self._observe_unpaced(digests)
+        finally:
+            self._query_admission.complete_snapshot()
+
+    def _observe_unpaced(self, digests: tuple[str, ...]) -> LiveObservation:
         contracts = self._gateway({"type": "contracts"}, "query_contracts")
         if (
             set(contracts) != {"chain_id", "endpoint_addr"}
@@ -1435,10 +1965,10 @@ class OperationalVenueIO:
         pairs = self._pairs(raw_pairs)
         raw_products = self._gateway({"type": "all_products"}, "query_all_products")
         products = self._products(raw_products, pairs)
-        target = products.get(TARGET_PRODUCT_ID)
+        target = products.get(self._target_product_id)
         if (
             target is None or target.product_type != ACTIVE_PERP
-            or target.symbol != TARGET_TICKER_ID
+            or target.symbol != self._target_ticker_id
         ):
             raise OperationalSafetyError("fixed target product identity unavailable")
         product_ids = tuple(sorted(products))
@@ -1460,7 +1990,7 @@ class OperationalVenueIO:
         if set(isolated) != {"isolated_positions"} or isolated["isolated_positions"]:
             raise OperationalSafetyError("unrelated isolated position state")
         market = self._gateway(
-            {"type": "market_price", "product_id": TARGET_PRODUCT_ID},
+            {"type": "market_price", "product_id": self._target_product_id},
             "query_market_price",
         )
         if set(market) != {"product_id", "bid_x18", "ask_x18"}:
@@ -1522,8 +2052,8 @@ class OperationalVenueIO:
         try:
             binding.assert_contract()
             if (
-                binding.route.nado_product_id != TARGET_PRODUCT_ID
-                or binding.route.nado_leg.market != TARGET_TICKER_ID
+                binding.route.nado_product_id != FUNDING_BOUNDARY_TARGET_PRODUCT_ID
+                or binding.route.nado_leg.market != FUNDING_BOUNDARY_TARGET_TICKER_ID
                 or binding.nado_journal.account_id.lower() != self.sender
             ):
                 raise NadoContractError("funding adapter identity mismatch")
@@ -1548,21 +2078,21 @@ class OperationalVenueIO:
         except NadoContractError:
             raise OperationalSafetyError("funding baseline account evidence rejected") from None
         if (
-            observation.product.product_id != TARGET_PRODUCT_ID
-            or observation.product.symbol != TARGET_TICKER_ID
+            observation.product.product_id != FUNDING_BOUNDARY_TARGET_PRODUCT_ID
+            or observation.product.symbol != FUNDING_BOUNDARY_TARGET_TICKER_ID
             or observation.evidence.account.owner.lower() != self.owner
             or observation.evidence.account.subaccount_name != SUBACCOUNT_NAME
         ):
             raise OperationalSafetyError("funding baseline product or account mismatch")
         position = observation.evidence.account.cross_perp_amounts_x18.get(
-            TARGET_PRODUCT_ID
+            FUNDING_BOUNDARY_TARGET_PRODUCT_ID
         )
         if position is None or position != 0:
             raise OperationalSafetyError("funding baseline position is not exactly flat")
-        v_quote = self._v_quote_balances.get(TARGET_PRODUCT_ID)
+        v_quote = self._v_quote_balances.get(FUNDING_BOUNDARY_TARGET_PRODUCT_ID)
         if v_quote is None or v_quote != 0:
             raise OperationalSafetyError("funding baseline v_quote is not exactly flat")
-        state = self._funding_states.get(TARGET_PRODUCT_ID)
+        state = self._funding_states.get(FUNDING_BOUNDARY_TARGET_PRODUCT_ID)
         if state is None:
             raise OperationalSafetyError("funding baseline public state is unavailable")
         cumulative_long, cumulative_short, open_interest = state
@@ -1578,7 +2108,7 @@ class OperationalVenueIO:
             binding.nado_journal,
             self.owner,
             SUBACCOUNT_NAME,
-            TARGET_PRODUCT_ID,
+            FUNDING_BOUNDARY_TARGET_PRODUCT_ID,
             binding.route.settlement_at_ms,
             high_water,
             empty_terminal,
@@ -1622,14 +2152,14 @@ class OperationalVenueIO:
         except NadoContractError:
             raise OperationalSafetyError("funding exposure account evidence rejected") from None
         if (
-            observation.product.product_id != TARGET_PRODUCT_ID
-            or observation.product.symbol != TARGET_TICKER_ID
+            observation.product.product_id != FUNDING_BOUNDARY_TARGET_PRODUCT_ID
+            or observation.product.symbol != FUNDING_BOUNDARY_TARGET_TICKER_ID
             or observation.evidence.account.owner.lower() != self.owner
             or observation.evidence.account.subaccount_name != SUBACCOUNT_NAME
         ):
             raise OperationalSafetyError("funding exposure product or account mismatch")
         position = observation.evidence.account.cross_perp_amounts_x18.get(
-            TARGET_PRODUCT_ID
+            FUNDING_BOUNDARY_TARGET_PRODUCT_ID
         )
         route_quantity = _canonical_quantity_x18(binding.route.nado_leg.canonical_quantity)
         expected_position = (
@@ -1640,7 +2170,7 @@ class OperationalVenueIO:
         if position != expected_position:
             raise OperationalSafetyError("funding exposure position is not the exact route fill")
         cumulative = observation.evidence.account.perp_last_cumulative_funding_x18.get(
-            TARGET_PRODUCT_ID
+            FUNDING_BOUNDARY_TARGET_PRODUCT_ID
         )
         if cumulative is None:
             raise OperationalSafetyError("funding exposure cumulative state is unavailable")
@@ -1656,7 +2186,7 @@ class OperationalVenueIO:
             binding.nado_journal,
             self.owner,
             SUBACCOUNT_NAME,
-            TARGET_PRODUCT_ID,
+            FUNDING_BOUNDARY_TARGET_PRODUCT_ID,
             binding.route.nado_leg.direction,
             position,
             route_quantity,
@@ -1688,7 +2218,7 @@ class OperationalVenueIO:
         body = {
             "interest_and_funding": {
                 "subaccount": self.sender,
-                "product_ids": [TARGET_PRODUCT_ID],
+                "product_ids": [FUNDING_BOUNDARY_TARGET_PRODUCT_ID],
                 "max_idx": None if max_idx is None else str(max_idx),
                 "limit": NADO_FUNDING_PAGE_LIMIT,
             }
@@ -1706,13 +2236,16 @@ class OperationalVenueIO:
         for row in interest_rows:
             if type(row) is not dict or type(row.get("product_id")) is not int:
                 raise OperationalSafetyError("archive interest row schema mismatch")
-            if row["product_id"] != TARGET_PRODUCT_ID:
+            if row["product_id"] != FUNDING_BOUNDARY_TARGET_PRODUCT_ID:
                 raise OperationalSafetyError("archive funding product mismatch")
             parsed = _parse_account_payment_fields(row)
             all_indices.append(parsed["idx"])
         parsed_funding: list[NadoAccountFunding] = []
         for row in funding_rows:
-            if type(row) is not dict or row.get("product_id") != TARGET_PRODUCT_ID:
+            if (
+                type(row) is not dict
+                or row.get("product_id") != FUNDING_BOUNDARY_TARGET_PRODUCT_ID
+            ):
                 raise OperationalSafetyError("archive funding product mismatch")
             parsed_funding.append(parse_nado_account_funding_row(row, binding))
             all_indices.append(parsed_funding[-1].idx)
@@ -1793,7 +2326,7 @@ class OperationalVenueIO:
                         "method": "subscribe",
                         "stream": {
                             "type": "funding_payment",
-                            "product_id": TARGET_PRODUCT_ID,
+                            "product_id": FUNDING_BOUNDARY_TARGET_PRODUCT_ID,
                         },
                     }), timeout=remaining)
                     while True:
@@ -1974,7 +2507,7 @@ class OperationalVenueIO:
             if (
                 type(cancelled_digest) is not str
                 or cancelled_digest.lower() != expected_entry.digest.lower()
-                or cancelled_order.get("product_id") != TARGET_PRODUCT_ID
+                or cancelled_order.get("product_id") != self._target_product_id
                 or type(cancelled_order.get("sender")) is not str
                 or cancelled_order["sender"].lower() != self.sender
                 or cancelled_nonce != expected_entry.nonce
@@ -2254,7 +2787,10 @@ class OperationalVenueIO:
                 raise OperationalSafetyError("unrelated perpetual exposure")
             if amount == 0 and quote != 0:
                 raise OperationalSafetyError("flat position has nonzero v_quote")
-        if any(amount for pid, amount in result.items() if pid != TARGET_PRODUCT_ID):
+        if any(
+            amount for pid, amount in result.items()
+            if pid != self._target_product_id
+        ):
             raise OperationalSafetyError("unrelated perpetual exposure")
         return result
 
