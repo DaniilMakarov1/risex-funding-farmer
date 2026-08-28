@@ -2,7 +2,7 @@
 
 ## Temporary six-hour synthetic-opportunity experiment
 
-Status: `AUTHORIZED — IMPLEMENTATION NOT YET ACCEPTED; NO RUNTIME OR VENUE WRITE IN FLIGHT`.
+Status: `IMPLEMENTATION ACCEPTED AT 523f2a42ff493d97ed56c21f598a4cd4308ff4c8 — FRESH PAPER PREFLIGHT NEXT; NO RUNTIME OR VENUE WRITE IN FLIGHT`.
 
 Objective: observe PAPER and, only after every existing Level-B/C gate passes, testnet behavior for `RISEx–Nado` and `RISEx–Extended` before, during, and after real funding boundaries when test selection adds exactly `$0.50` to each route's calculated expected PnL.
 
