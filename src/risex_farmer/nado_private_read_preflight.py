@@ -35,6 +35,13 @@ MAX_RESPONSE_BYTES = 65_536
 ALL_PRODUCTS_MAX_RESPONSE_BYTES = 70_000
 SUBACCOUNT_INFO_MAX_RESPONSE_BYTES = 1_048_576
 LEDGER_SCHEMA_VERSION = 2
+# Official Nado query limits are IP-scoped and weighted: 400 weight per 10
+# seconds and 2,400 weight per minute.  This preflight uses one deterministic
+# boundary wait when its own two-round catalog sequence would overlap 10-second
+# buckets; it does not implement a reusable rate limiter or second attempt.
+NADO_QUERY_WEIGHT_LIMIT_10S = 400
+NADO_QUERY_WEIGHT_LIMIT_1M = 2_400
+NADO_QUERY_WINDOW_SECONDS = 10.0
 COUNTER_PHASES = (
     "public_a", "loader", "derive", "server_time", "sign", "recover",
     "trigger_dispatch", "trigger_observation", "public_b",
@@ -369,6 +376,14 @@ def _system_clock_ms() -> int:
 
 def _durable_now_ms() -> int:
     return time.time_ns() // 1_000_000
+
+
+def _monotonic_seconds() -> float:
+    return time.monotonic()
+
+
+async def _sleep_nado_query_cooldown(seconds: float) -> None:
+    await asyncio.sleep(seconds)
 
 
 def _strict_json(raw: bytes) -> object:
@@ -750,6 +765,36 @@ class _RoundEvidence:
     first_observed_ms: int
     last_observed_ms: int
     product_count: int
+    gateway_weight: int
+
+
+def _round_gateway_weight(order_product_count: int, *, round_b: bool) -> int:
+    """Return the official query weight for this fixed preflight round."""
+    if type(order_product_count) is not int or order_product_count < 0:
+        raise NadoPreflightError("gateway query product count is invalid")
+    fixed_weight = 29 if round_b else 24
+    return fixed_weight + 2 * order_product_count
+
+
+async def _wait_for_round_b_gateway_capacity(
+    round_a: _RoundEvidence, round_a_finished_at: float,
+) -> None:
+    """Separate an oversized two-round query burst before the next read."""
+    round_b_weight = round_a.gateway_weight + 5
+    if (
+        round_a.gateway_weight > NADO_QUERY_WEIGHT_LIMIT_10S
+        or round_b_weight > NADO_QUERY_WEIGHT_LIMIT_10S
+    ):
+        raise NadoPreflightError("public gateway query round exceeds ten-second limit")
+    total_weight = round_a.gateway_weight + round_b_weight
+    if total_weight > NADO_QUERY_WEIGHT_LIMIT_1M:
+        raise NadoPreflightError("public gateway query sequence exceeds one-minute limit")
+    if total_weight <= NADO_QUERY_WEIGHT_LIMIT_10S:
+        return
+    elapsed = _monotonic_seconds() - round_a_finished_at
+    remaining = max(0.0, NADO_QUERY_WINDOW_SECONDS - elapsed)
+    if remaining > 0:
+        await _sleep_nado_query_cooldown(remaining)
 
 
 def _exact_keys(value: Mapping[str, object], expected: set[str], label: str) -> None:
@@ -1140,7 +1185,7 @@ def _round_a_contract(
     _temporal(observed)
     return _RoundEvidence(
         _digest({"catalog": products, "account": account}), observed[0], observed[-1],
-        len(products),
+        len(products), _round_gateway_weight(len(product_ids), round_b=False),
     )
 
 
@@ -1176,7 +1221,7 @@ def _round_b_contract(
     _temporal(observed)
     return _RoundEvidence(
         _digest({"catalog": products, "account": account}), observed[0], observed[-1],
-        len(products),
+        len(products), _round_gateway_weight(len(product_ids), round_b=True),
     )
 
 
@@ -1441,8 +1486,10 @@ async def run_operational_private_read_preflight(
     identity_hash = _identity_hash(config.sender)
     identity_tag = _identity_tag(config.sender)
     evidence = store.evidence(config.invocation_id)
+    round_a_finished_at: float | None = None
     if evidence is None:
         round_a = await _operational_round_a(public_transport, config)
+        round_a_finished_at = _monotonic_seconds()
         await asyncio.sleep(0)
         store.claim(
             config.invocation_id, identity_hash, round_a.fingerprint,
@@ -1518,6 +1565,8 @@ async def run_operational_private_read_preflight(
         or now_ms - round_a_observed_ms > MAX_FRESHNESS_MS
     ):
         raise NadoPreflightError("durable temporal evidence is invalid or stale")
+    if round_a_finished_at is not None:
+        await _wait_for_round_b_gateway_capacity(round_a, round_a_finished_at)
     round_b = await _operational_round_b(public_transport, config)
     if round_b.first_observed_ms <= trigger_observed_ms:
         raise NadoPreflightError("public evidence temporal barrier mismatch")
@@ -1574,6 +1623,7 @@ async def _run_counted_operational_private_read(
             lambda: store.count(invocation_id, "public_a"),
             lambda: store.count(invocation_id, "public_a", True),
         )
+        round_a_finished_at = _monotonic_seconds()
         store.claim_started(
             invocation_id, round_a.fingerprint, round_a.last_observed_ms,
             round_a.product_count,
@@ -1656,6 +1706,7 @@ async def _run_counted_operational_private_read(
         store.observe(invocation_id, trigger_hash, trigger_observed_ms)
         await asyncio.sleep(0)
 
+        await _wait_for_round_b_gateway_capacity(round_a, round_a_finished_at)
         round_b = await _operational_round_b(
             public_transport, config,
             lambda: store.count(invocation_id, "public_b"),

@@ -306,6 +306,59 @@ def _add_nlp_vault_and_neighbor_market(
     return products, account
 
 
+def _expand_to_observed_94_product_catalog(
+    contract: dict[str, object],
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Build the accepted 94-product shape without changing the fixture file."""
+    source_products = copy.deepcopy(contract["wire"]["all_products"]["data"])
+    spot_template = copy.deepcopy(source_products["spot_products"][0])
+    nlp_product = copy.deepcopy(spot_template)
+    nlp_product["product_id"] = 11
+    nlp_product["config"]["token"] = "0x000000000000000000000000000000000000000b"
+    perp_template = copy.deepcopy(source_products["perp_products"][0])
+    perp_products = []
+    for product_id in range(1, 94):
+        if product_id == 11:
+            continue
+        product = copy.deepcopy(perp_template)
+        product["product_id"] = product_id
+        perp_products.append(product)
+    products = {"spot_products": [spot_template, nlp_product], "perp_products": perp_products}
+
+    account = copy.deepcopy(contract["wire"]["subaccount_info"]["data"])
+    account["spot_products"] = copy.deepcopy(products["spot_products"])
+    account["perp_products"] = copy.deepcopy(products["perp_products"])
+    nlp_balance = copy.deepcopy(account["spot_balances"][0])
+    nlp_balance["product_id"] = 11
+    nlp_balance["balance"]["amount"] = "0"
+    account["spot_balances"] = [account["spot_balances"][0], nlp_balance]
+    perp_balance_template = copy.deepcopy(account["perp_balances"][0])
+    account["perp_balances"] = []
+    for product in perp_products:
+        balance = copy.deepcopy(perp_balance_template)
+        balance["product_id"] = product["product_id"]
+        account["perp_balances"].append(balance)
+    account["spot_count"] = 2
+    account["perp_count"] = len(perp_products)
+    account["health_contributions"] = [["0", "0", "0"] for _ in range(94)]
+    account["health_contributions"][0] = [
+        "5000000000000000000", "5000000000000000000", "5000000000000000000",
+    ]
+
+    contract["wire"]["all_products"]["data"] = products
+    contract["wire"]["subaccount_info"]["data"] = account
+    contract["wire"]["orders"]["data"] = {
+        "sender": contract["sender"],
+        "product_orders": [
+            {"product_id": product["product_id"], "orders": []}
+            for product in perp_products
+        ],
+    }
+    for entry in list(contract["round_a"]) + list(contract["round_b"]):
+        entry["response"] = copy.deepcopy(contract["wire"][entry["op"]])
+    return products, account
+
+
 def test_fixed_non_orderbook_products_are_excluded_and_every_market_is_queried_once(
     contract: dict[str, object],
 ) -> None:
@@ -1591,6 +1644,217 @@ async def test_operational_runner_exact_owned_sequence_with_synthetic_boundaries
     assert json.loads(sessions[7].calls[0][1]["data"]) == {"type": "time"}
     assert sessions[8].calls[0][0] == nado.FixedPreflightIdentity.trigger_query
     assert json.loads(sessions[8].calls[0][1]["data"])["tx"]["recvTime"] == "1700000030009"
+
+
+@pytest.mark.asyncio
+async def test_counted_operational_preflight_paces_observed_94_product_sequence(
+    tmp_path: Path, contract: dict[str, object], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import risex_farmer.nado_private_read_operational as operational
+
+    products, account = _expand_to_observed_94_product_catalog(contract)
+    round_a_calls, round_a = _drive_public_contract(
+        nado._round_a_contract(_config(contract)), contract,
+        account=account, products=products,
+    )
+    round_b_calls, round_b = _drive_public_contract(
+        nado._round_b_contract(_config(contract)), contract,
+        account=account, products=products,
+    )
+    assert len(round_a_calls) == 7 and len(round_b_calls) == 8
+    assert round_a.gateway_weight == 208
+    assert round_b.gateway_weight == 213
+    assert round_a.gateway_weight + round_b.gateway_weight == 421
+    assert round_a.gateway_weight <= nado.NADO_QUERY_WEIGHT_LIMIT_10S
+    assert round_b.gateway_weight <= nado.NADO_QUERY_WEIGHT_LIMIT_10S
+    assert round_a.gateway_weight + round_b.gateway_weight < nado.NADO_QUERY_WEIGHT_LIMIT_1M
+    assert round_a.gateway_weight + sum((5, 184, 2, 10)) == 409
+    assert round_a.gateway_weight + sum((5, 184, 2, 10, 1)) == 410
+    assert len(round_a_calls[5]["product_ids"]) == 92
+
+    plan: list[tuple[str, object]] = [
+        (nado.FixedPreflightIdentity.gateway_query, entry["response"])
+        for entry in contract["round_a"]
+    ]
+    plan += [
+        (nado.FixedPreflightIdentity.gateway_edge_query, contract["wire"]["time"]),
+        (nado.FixedPreflightIdentity.trigger_query, contract["trigger"]["response"]),
+    ]
+    plan += [
+        (nado.FixedPreflightIdentity.gateway_query, entry["response"])
+        for entry in contract["round_b"]
+    ]
+    sessions: list[_HttpSession] = []
+    dispatches: list[tuple[str, float]] = []
+
+    monotonic_now = 100.0
+    waits: list[float] = []
+
+    def monotonic() -> float:
+        return monotonic_now
+
+    async def cooldown(seconds: float) -> None:
+        nonlocal monotonic_now
+        waits.append(seconds)
+        monotonic_now += seconds
+
+    def session_factory(**kwargs: object) -> object:
+        url, payload = plan[len(sessions)]
+        dispatches.append((url, monotonic_now))
+        raw = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), allow_nan=False,
+        ).encode()
+        session = _HttpSession(_HttpResponse(raw, url=url))
+        sessions.append(session)
+        return session
+
+    clock_values: list[int] = []
+    now = 1_700_000_000_025
+    for entry in contract["round_a"]:
+        clock_values.extend([int(entry["observed_at_ms"]), now])
+    clock_values.extend([1_700_000_000_008, now, now])
+    clock_values.extend([int(contract["trigger"]["observed_at_ms"]), now])
+    for entry in contract["round_b"]:
+        clock_values.extend([int(entry["observed_at_ms"]), now])
+
+    monkeypatch.setattr(nado.aiohttp, "ClientSession", session_factory)
+    monkeypatch.setattr(nado, "_system_clock_ms", lambda: clock_values.pop(0))
+    monkeypatch.setattr(nado, "_monotonic_seconds", monotonic)
+    monkeypatch.setattr(nado, "_sleep_nado_query_cooldown", cooldown)
+
+    class Handle:
+        closed = 0
+
+        def derive_owner(self) -> str:
+            return str(contract["owner"])
+
+        def sign_list_trigger_orders(self, typed: dict[str, object]) -> str:
+            return str(contract["signature"])
+
+        def close(self) -> None:
+            self.closed += 1
+
+    handle = Handle()
+    store = nado.OneShotStore(tmp_path / "paced-94.sqlite3")
+    report = await operational._fixture_run(
+        config=_config(contract), store=store,
+        capability_loader=lambda: handle,
+        recover_owner=lambda typed, signature: str(contract["owner"]),
+        path_hash="paced-path-hash",
+        transports=(nado._OperationalGatewayTransport(),
+                    nado._OperationalTimeTransport(),
+                    nado._OperationalTriggerTransport()),
+    )
+
+    assert report["status"] == nado.FINALIZED
+    assert waits == [nado.NADO_QUERY_WINDOW_SECONDS]
+    gateway_times = [
+        observed_at for url, observed_at in dispatches
+        if url == nado.FixedPreflightIdentity.gateway_query
+    ]
+    assert gateway_times == [100.0] * 7 + [110.0] * 8
+    assert len(sessions) == 17 and all(len(session.calls) == 1 for session in sessions)
+    counters = report["counters"]
+    assert counters["public_a_attempts"] == counters["public_a_completions"] == 7
+    assert counters["public_b_attempts"] == counters["public_b_completions"] == 8
+    assert handle.closed == 1 and not clock_values
+
+
+@pytest.mark.asyncio
+async def test_counted_operational_preflight_cancellation_during_cooldown_is_terminal(
+    tmp_path: Path, contract: dict[str, object], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import risex_farmer.nado_private_read_operational as operational
+
+    _expand_to_observed_94_product_catalog(contract)
+    plan: list[tuple[str, object]] = [
+        (nado.FixedPreflightIdentity.gateway_query, entry["response"])
+        for entry in contract["round_a"]
+    ]
+    plan += [
+        (nado.FixedPreflightIdentity.gateway_edge_query, contract["wire"]["time"]),
+        (nado.FixedPreflightIdentity.trigger_query, contract["trigger"]["response"]),
+    ]
+    sessions: list[_HttpSession] = []
+
+    def session_factory(**kwargs: object) -> object:
+        url, payload = plan[len(sessions)]
+        raw = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), allow_nan=False,
+        ).encode()
+        session = _HttpSession(_HttpResponse(raw, url=url))
+        sessions.append(session)
+        return session
+
+    clock_values: list[int] = []
+    now = 1_700_000_000_025
+    for entry in contract["round_a"]:
+        clock_values.extend([int(entry["observed_at_ms"]), now])
+    clock_values.extend([1_700_000_000_008, now, now])
+    clock_values.extend([int(contract["trigger"]["observed_at_ms"]), now])
+    cooldown_started = asyncio.Event()
+
+    async def cooldown(seconds: float) -> None:
+        assert seconds == nado.NADO_QUERY_WINDOW_SECONDS
+        cooldown_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(nado.aiohttp, "ClientSession", session_factory)
+    monkeypatch.setattr(nado, "_system_clock_ms", lambda: clock_values.pop(0))
+    monkeypatch.setattr(nado, "_monotonic_seconds", lambda: 100.0)
+    monkeypatch.setattr(nado, "_sleep_nado_query_cooldown", cooldown)
+
+    class Handle:
+        closed = 0
+
+        def derive_owner(self) -> str:
+            return str(contract["owner"])
+
+        def sign_list_trigger_orders(self, typed: dict[str, object]) -> str:
+            return str(contract["signature"])
+
+        def close(self) -> None:
+            self.closed += 1
+
+    handle = Handle()
+    config = _config(contract)
+    store = nado.OneShotStore(tmp_path / "paced-cancel.sqlite3")
+    task = asyncio.create_task(operational._fixture_run(
+        config=config, store=store, capability_loader=lambda: handle,
+        recover_owner=lambda typed, signature: str(contract["owner"]),
+        path_hash="paced-cancel-path-hash",
+        transports=(nado._OperationalGatewayTransport(),
+                    nado._OperationalTimeTransport(),
+                    nado._OperationalTriggerTransport()),
+    ))
+    await asyncio.wait_for(cooldown_started.wait(), timeout=1.0)
+    assert len(sessions) == 9
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    report = store.terminal_report(config.invocation_id)
+    assert report is not None
+    assert report["status"] == nado.UNKNOWN and report["reason"] == "CANCELLED"
+    counters = report["counters"]
+    assert counters["public_a_attempts"] == counters["public_a_completions"] == 7
+    assert counters["public_b_attempts"] == counters["public_b_completions"] == 0
+    assert counters["trigger_dispatch_attempts"] == counters["trigger_dispatch_completions"] == 1
+    assert counters["trigger_observation_attempts"] == counters["trigger_observation_completions"] == 1
+    assert handle.closed == 1 and len(sessions) == 9
+
+    class Never:
+        async def send_async(self, request: object) -> object:
+            raise AssertionError("terminal invocation must not perform another read")
+
+    before_restart = len(sessions)
+    restarted = await operational._fixture_run(
+        config=config, store=store, capability_loader=lambda: handle,
+        recover_owner=lambda typed, signature: str(contract["owner"]),
+        path_hash="paced-cancel-path-hash",
+        transports=(Never(), Never(), Never()),
+    )
+    assert restarted == report and len(sessions) == before_restart
 
 
 @pytest.mark.parametrize("stage", ["derive", "recover"])
