@@ -847,6 +847,34 @@ class TerminalEvidence:
             raise NadoContractError("terminal evidence digest does not bind its contents")
 
 
+@dataclass(frozen=True)
+class RisexTerminalEvidence:
+    """The only external final-evidence seam accepted by the Nado runner."""
+
+    route: FundingRouteBinding
+    journal: JournalIdentity
+    terminal: TerminalEvidence
+    round_index: int
+
+    def assert_contract(self) -> None:
+        if (
+            type(self.route) is not FundingRouteBinding
+            or type(self.journal) is not JournalIdentity
+            or type(self.terminal) is not TerminalEvidence
+            or type(self.round_index) is not int
+            or self.round_index not in {1, 2}
+        ):
+            raise NadoContractError("RISEx terminal provenance is invalid")
+        try:
+            self.route.assert_contract()
+            self.journal.assert_contract()
+            self.terminal.assert_contract()
+        except NadoContractError:
+            raise
+        if self.terminal.journal != self.journal:
+            raise NadoContractError("RISEx terminal journal provenance is invalid")
+
+
 def _funding_leg_payload(leg: FundingLegBinding) -> dict[str, object]:
     return {
         "venue": leg.venue,

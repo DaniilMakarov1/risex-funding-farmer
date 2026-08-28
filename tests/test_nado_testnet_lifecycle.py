@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib
 import json
+import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -13,6 +15,7 @@ from risex_farmer.nado_testnet_lifecycle import (
     AccountSnapshot, CatalogSnapshot, EngineEvidence, FillEvidence,
     FixedEnvironment, IntentStore, LifecycleCore, NadoContractError,
     OrderEvidence, OrderIntent, Product, Reconciliation,
+    RisexTerminalEvidence,
     SyntheticOrderVector, TriggerSnapshot, build_order_nonce,
     completion_barrier, order_digest, product_verifier,
     sign_synthetic_order, smallest_executable_amount, unpack_order_nonce,
@@ -151,6 +154,27 @@ def _other_identity(
 def test_module_is_not_imported_by_normal_package_startup() -> None:
     package = importlib.import_module("risex_farmer")
     assert "nado_testnet_lifecycle" not in Path(package.__file__).read_text()
+
+
+def test_write_free_contract_import_does_not_load_operational_or_brotli() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.path.insert(0, 'src'); "
+            "sys.modules['brotli'] = None; "
+            "import risex_farmer.nado_testnet_lifecycle as contract; "
+            "assert 'risex_farmer.nado_testnet_lifecycle_operational' "
+            "not in sys.modules; "
+            "assert contract.RisexTerminalEvidence.__module__ == "
+            "'risex_farmer.nado_testnet_lifecycle'",
+        ],
+        cwd=Path(__file__).parents[1],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_fixed_environment_product_verifier_and_nonce_vector(vector: dict[str, object]) -> None:

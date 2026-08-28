@@ -23,9 +23,11 @@ from risex_farmer.nado_testnet_lifecycle import (
     AccountSnapshot, CatalogSnapshot, CrossRunAttestation, EngineEvidence,
     ExecuteFailure, FillEvidence, FixedEnvironment, FundingBoundaryBinding,
     FundingLegBinding, FundingRouteBinding, IntentStore, JournalIdentity,
-    NadoAccountFunding, NadoFundingBaseline, NadoFundingEvent, OrderEvidence,
+    NadoAccountFunding, NadoContractError, NadoFundingBaseline, NadoFundingEvent,
+    OrderEvidence,
     NadoFundingExposure,
     Product, OrderIntent,
+    RisexTerminalEvidence as ContractRisexTerminalEvidence,
     SyntheticOrderVector, TerminalEvidence, TriggerSnapshot, build_order_nonce,
     canonical_payload, cross_run_attestation_digest, encode_subaccount,
     nado_account_funding_digest,
@@ -520,6 +522,13 @@ def test_zero_argument_surface_and_normal_startup_isolation() -> None:
     assert "nado_testnet_lifecycle_operational" not in Path(package.__file__).read_text()
 
 
+def test_risex_terminal_evidence_is_the_exact_write_free_contract_reexport() -> None:
+    assert RisexTerminalEvidence is ContractRisexTerminalEvidence
+    assert RisexTerminalEvidence.__module__ == (
+        "risex_farmer.nado_testnet_lifecycle"
+    )
+
+
 def test_nado_gateway_weight_math_is_fixed_to_the_observed_94_product_catalog() -> None:
     assert NADO_OBSERVED_CATALOG_PRODUCT_COUNT == 94
     assert NADO_OBSERVED_ORDERABLE_PRODUCT_COUNT == 92
@@ -649,6 +658,37 @@ def _adapter_binding() -> FundingBoundaryBinding:
     return FundingBoundaryBinding(
         _funding_route(), FUNDING_RISEX_JOURNAL, FUNDING_NADO_JOURNAL,
     )
+
+
+def test_risex_terminal_evidence_preserves_exact_provenance_contract() -> None:
+    binding = _adapter_binding()
+    observation = FundingFixtureIO().observe(())
+    evidence = risex_terminal_provider(binding, observation, 1)
+    evidence.assert_contract()
+    assert type(evidence) is RisexTerminalEvidence
+    assert type(evidence) is ContractRisexTerminalEvidence
+
+    other_journal = replace(binding.risex_journal, run_id="other-risex-run")
+    mismatched_terminal = FundingFixtureIO._terminal(
+        other_journal, evidence.terminal.observed_at_ms, "3",
+    )
+    invalid_results = (
+        replace(evidence, route=SimpleNamespace()),
+        replace(evidence, journal=SimpleNamespace()),
+        replace(evidence, terminal=SimpleNamespace()),
+        replace(evidence, round_index=3),
+        replace(evidence, terminal=mismatched_terminal),
+        replace(
+            evidence,
+            route=replace(
+                binding.route,
+                risex_leg=replace(binding.route.risex_leg, direction="LONG"),
+            ),
+        ),
+    )
+    for invalid in invalid_results:
+        with pytest.raises(NadoContractError):
+            invalid.assert_contract()
 
 
 def _public_funding_wire(binding: FundingBoundaryBinding) -> dict[str, object]:
@@ -2150,9 +2190,19 @@ def test_risex_terminal_provider_rejects_stale_reused_and_mutable_results(
     def mutable(_binding, _observation, _round_index):
         return {"terminal": "mutable"}
 
+    def lookalike(binding, observation, round_index):
+        result = risex_terminal_provider(binding, observation, round_index)
+        return SimpleNamespace(
+            route=result.route,
+            journal=result.journal,
+            terminal=result.terminal,
+            round_index=result.round_index,
+        )
+
     for name, provider in (
         ("stale", stale),
         ("reused", reused),
+        ("lookalike", lookalike),
         ("mutable", mutable),
     ):
         report = _fixture_funding_boundary_run(
