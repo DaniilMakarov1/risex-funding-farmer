@@ -15,6 +15,7 @@ from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 import hashlib
 import http.client
+import inspect
 import json
 import os
 from pathlib import Path
@@ -177,6 +178,15 @@ class LiveObservation:
 RisexTerminalEvidenceProvider = Callable[
     [FundingBoundaryBinding, LiveObservation, int], RisexTerminalEvidence
 ]
+
+# These callbacks are deliberately expressed in terms of the contract module's
+# immutable binding and bounded coordination values.  The Nado writer surface
+# never imports the RISEx orchestration module or receives funding cash, rate,
+# status, or any other venue result through this hook.
+BoundaryProgressionSink = Callable[[FundingBoundaryBinding, str, int], None]
+PreparationGate = Callable[[FundingBoundaryBinding], object]
+BOUNDARY_RELEASED = "RELEASED"
+BOUNDARY_CANCELLED = "CANCELLED"
 
 
 @dataclass(frozen=True)
@@ -843,6 +853,10 @@ class SealedLifecycleRunner:
         self.run_id = journal.begin(io.now_ms())
         self.stage = "RUNNER_STARTUP"
         self.writes = 0
+        # Set immediately before the durable one-way dispatch call.  An owner
+        # may use this conservative flag to distinguish a prewrite failure
+        # from a task that may already have reached the venue.
+        self.potential_write = False
 
     def terminalize(self, failure_class: str, stage: str | None = None) -> None:
         selected_stage = self.stage if stage is None else stage
@@ -855,6 +869,7 @@ class SealedLifecycleRunner:
         capability = self.capability_loader(self.owner)
         try:
             signature = capability.sign(intent)
+            self.potential_write = True
             try:
                 returned = self.store.dispatch_prepared(
                     intent.digest, lambda durable: self.io.dispatch(durable, signature)
@@ -1103,6 +1118,8 @@ class SealedFundingBoundaryRunner(SealedLifecycleRunner):
         route: FundingRouteBinding,
         risex_journal: JournalIdentity,
         risex_attestation_provider: RisexTerminalEvidenceProvider,
+        preparation_gate: PreparationGate | None = None,
+        boundary_progression_sink: BoundaryProgressionSink | None = None,
     ) -> None:
         try:
             route.assert_contract()
@@ -1113,6 +1130,13 @@ class SealedFundingBoundaryRunner(SealedLifecycleRunner):
             raise OperationalSafetyError("funding boundary contract rejected") from None
         if not callable(risex_attestation_provider):
             raise OperationalSafetyError("RISEx attestation provider unavailable")
+        if preparation_gate is not None and not callable(preparation_gate):
+            raise OperationalSafetyError("Nado preparation gate unavailable")
+        if (
+            boundary_progression_sink is not None
+            and not callable(boundary_progression_sink)
+        ):
+            raise OperationalSafetyError("Nado boundary progression sink unavailable")
         if any(
             not callable(getattr(io, method, None))
             for method in (
@@ -1148,11 +1172,61 @@ class SealedFundingBoundaryRunner(SealedLifecycleRunner):
             raise
         self.funding_io = io
         self.risex_attestation_provider = risex_attestation_provider
+        self._preparation_gate = preparation_gate
+        self._preparation_gate_used = False
+        self._boundary_progression_sink = boundary_progression_sink
+        self._boundary_progression_emitted = False
         self.funding_baseline: NadoFundingBaseline | None = None
         self.funding_exposure: NadoFundingExposure | None = None
         self.funding_event: NadoFundingEvent | None = None
         self.account_funding: NadoAccountFunding | None = None
         self.funding_blocker_reason: str | None = None
+
+    def _await_preparation_gate(self) -> None:
+        """Wait for the owner before the first durable Nado intent prepare."""
+        if self._preparation_gate is None or self._preparation_gate_used:
+            return
+        try:
+            result = self._preparation_gate(self.funding_binding)
+            if inspect.isawaitable(result):
+                raise OperationalSafetyError(
+                    "Nado preparation gate must be synchronous"
+                )
+        except OperationalSafetyError:
+            raise
+        except BaseException:
+            raise OperationalSafetyError("Nado preparation gate rejected") from None
+        self._preparation_gate_used = True
+
+    def _emit_boundary_progression(self, kind: str) -> None:
+        """Publish only the accepted Nado boundary progression to the owner."""
+        if self._boundary_progression_sink is None:
+            return
+        if kind not in {BOUNDARY_RELEASED, BOUNDARY_CANCELLED}:
+            raise OperationalSafetyError("Nado boundary progression kind rejected")
+        if self._boundary_progression_emitted:
+            raise OperationalSafetyError("Nado boundary progression replay rejected")
+        observed_at_ms = self.io.now_ms()
+        if type(observed_at_ms) is not int or observed_at_ms <= 0:
+            raise OperationalSafetyError(
+                "Nado boundary progression timestamp rejected"
+            )
+        try:
+            self._boundary_progression_sink(
+                self.funding_binding, kind, observed_at_ms,
+            )
+        except OperationalSafetyError:
+            raise
+        except BaseException:
+            raise OperationalSafetyError(
+                "Nado boundary progression sink rejected"
+            ) from None
+        self._boundary_progression_emitted = True
+
+    def cancel_boundary_progression(self) -> None:
+        """Publish Nado-owned cancellation after an interrupted lifecycle."""
+        if not self._boundary_progression_emitted:
+            self._emit_boundary_progression(BOUNDARY_CANCELLED)
 
     def _prepare_funding_entry(
         self,
@@ -1230,6 +1304,7 @@ class SealedFundingBoundaryRunner(SealedLifecycleRunner):
             owner=order.owner.lower(),
             subaccount_name=order.subaccount_name,
         )
+        self._await_preparation_gate()
         self.store.prepare(intent)
         return intent
 
@@ -1375,6 +1450,10 @@ class SealedFundingBoundaryRunner(SealedLifecycleRunner):
             self.store.bind_funding_exposure(exposure)
             self.funding_exposure = exposure
             self.funding_io.await_funding_boundary(self.funding_binding)
+            # This is the only RELEASED signal source.  It is emitted from
+            # the accepted Nado boundary progression, before the venue-local
+            # account-funding read, and carries no funding claim.
+            self._emit_boundary_progression(BOUNDARY_RELEASED)
             event, account_funding = self.funding_io.read_funding_boundary(
                 self.funding_binding
             )
@@ -1395,6 +1474,14 @@ class SealedFundingBoundaryRunner(SealedLifecycleRunner):
         except BaseException as error:
             # Funding evidence failure must not skip the already-authorized
             # reduce-only close.  The finalizer durably records the blocker.
+            if not self._boundary_progression_emitted:
+                try:
+                    # A failed/interrupted Nado progression must unblock a
+                    # waiting RISEx gate with a coordination-only CANCELLED
+                    # signal; it never claims a funding outcome.
+                    self._emit_boundary_progression(BOUNDARY_CANCELLED)
+                except BaseException:
+                    pass
             self.funding_event = None
             self.account_funding = None
             self.funding_exposure = None

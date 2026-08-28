@@ -490,8 +490,11 @@ class HoldReleaseGate(Protocol):
     def __call__(self, binding: RisexFundingBoundaryBinding) -> object: ...
 
 
+PreparationGate = Callable[[FundingBoundaryBinding], object]
+
+
 class RisexFundingBoundaryCoordinator(TwoAccountCoordinator):
-    """Fixed-route wrapper that inserts the boundary gate before exit prep."""
+    """Fixed-route wrapper that gates the first observation and all prep."""
 
     def __init__(
         self,
@@ -505,6 +508,7 @@ class RisexFundingBoundaryCoordinator(TwoAccountCoordinator):
         identity_factory: _coordinator.IdentityFactory = _coordinator._default_identity_factory,
         boundary: FundingBoundaryBinding | None = None,
         hold_release_gate: HoldReleaseGate | None = None,
+        preparation_gate: PreparationGate | None = None,
     ) -> None:
         super().__init__(
             venue=venue,
@@ -518,6 +522,10 @@ class RisexFundingBoundaryCoordinator(TwoAccountCoordinator):
         self._funding_boundary: FundingBoundaryBinding | None = None
         self._local_binding: RisexFundingBoundaryBinding | None = None
         self._hold_release_gate = hold_release_gate
+        if preparation_gate is not None and not callable(preparation_gate):
+            raise RisexFundingBoundaryError("RISEx preparation gate unavailable")
+        self._preparation_gate = preparation_gate
+        self._preparation_gate_used = False
         self._gate_invocations = 0
         self._venue_closed = False
         if boundary is not None:
@@ -538,6 +546,7 @@ class RisexFundingBoundaryCoordinator(TwoAccountCoordinator):
         counterparty_signer: str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         boundary: FundingBoundaryBinding | None = None,
         hold_release_gate: HoldReleaseGate | None = None,
+        preparation_gate: PreparationGate | None = None,
     ) -> "RisexFundingBoundaryCoordinator":
         base = TwoAccountCoordinator._fixture(
             venue=venue,
@@ -560,6 +569,7 @@ class RisexFundingBoundaryCoordinator(TwoAccountCoordinator):
             identity_factory=base._identity_factory,
             boundary=boundary,
             hold_release_gate=hold_release_gate,
+            preparation_gate=preparation_gate,
         )
 
     def _journal_identity(self, role: AccountRole) -> JournalIdentity:
@@ -574,6 +584,15 @@ class RisexFundingBoundaryCoordinator(TwoAccountCoordinator):
             self._journals[role].run_id,
             store_identity,
             identity.account,
+        )
+
+    @property
+    def potential_write(self) -> bool:
+        """Conservatively expose whether a RISEx write may have started."""
+        return any(
+            item.dispatch_count > 0
+            for journal in self._journals.values()
+            for item in (*journal.intents(), *journal.cancels())
         )
 
     def _fixed_route_check(self, boundary: FundingBoundaryBinding) -> None:
@@ -734,6 +753,23 @@ class RisexFundingBoundaryCoordinator(TwoAccountCoordinator):
                 raise ValueError
         except (KeyError, ValueError, CoordinatorSafetyError):
             raise RisexFundingBoundaryError("RISEx fixed preparation contract rejected") from None
+
+    def _run_preparation_gate(self, binding: FundingBoundaryBinding) -> None:
+        if self._preparation_gate is None or self._preparation_gate_used:
+            return
+        try:
+            result = self._preparation_gate(binding)
+            if inspect.isawaitable(result):
+                raise RisexFundingBoundaryError(
+                    "RISEx preparation gate must be synchronous"
+                )
+        except RisexFundingBoundaryError:
+            raise
+        except BaseException:
+            raise RisexFundingBoundaryError(
+                "RISEx preparation gate rejected"
+            ) from None
+        self._preparation_gate_used = True
 
     def _prepare(
         self,
@@ -987,10 +1023,14 @@ class RisexFundingBoundaryCoordinator(TwoAccountCoordinator):
 
     async def _preflight(self) -> CoordinatorReport | None:
         if self.phase is Phase.START:
-            self._require_bound()
+            binding = self._require_bound()
             if self._hold_release_gate is None:
                 self._block_before_write(FUNDING_BLOCKER_BOUNDARY_GATE_MISSING)
                 return self._report(CoordinatorResult.BLOCKED_BEFORE_WRITE)
+            # The owner barrier must complete before the first observation.
+            # This prevents a slow Nado baseline from aging a RISEx snapshot
+            # whose price would otherwise be reused after the barrier.
+            self._run_preparation_gate(binding)
         return None
 
     def _format_run_report(self, report: CoordinatorReport) -> FundingBoundaryReport:
@@ -1478,6 +1518,37 @@ class RisexCoordinationLoopBridge:
         self._settlement_at_ms = result.route.settlement_at_ms
         return result
 
+    def journal_identities(self) -> tuple[JournalIdentity, JournalIdentity]:
+        result = self._call(
+            lambda coordinator: (
+                coordinator._journal_identity(AccountRole.PRIMARY),
+                coordinator._journal_identity(AccountRole.COUNTERPARTY),
+            ),
+            timeout_seconds=self._callback_timeout_seconds,
+        )
+        if (
+            type(result) is not tuple
+            or len(result) != 2
+            or any(type(item) is not JournalIdentity for item in result)
+        ):
+            raise RisexFundingBoundaryError("RISEx journal identity result rejected")
+        return result
+
+    @property
+    def potential_write(self) -> bool:
+        try:
+            result = self._call(
+                lambda coordinator: coordinator.potential_write,
+                timeout_seconds=self._callback_timeout_seconds,
+            )
+        except BaseException:
+            # Inability to inspect a running writer is itself unsafe to treat
+            # as prewrite; callers must retain manual-recovery state.
+            return True
+        if type(result) is not bool:
+            raise RisexFundingBoundaryError("RISEx write status result rejected")
+        return result
+
     def run_lifecycle(self, *, timeout_seconds: float | None = None) -> FundingBoundaryReport:
         if timeout_seconds is None:
             if self._settlement_at_ms is None:
@@ -1567,6 +1638,7 @@ class RisexTerminalEvidenceProvider:
 
 async def _build_fresh_production_coordinator(
     hold_release_gate: HoldReleaseGate | None,
+    preparation_gate: PreparationGate | None = None,
 ) -> RisexFundingBoundaryCoordinator:
     home = Path(pwd.getpwuid(os.getuid()).pw_dir)
     base = await _coordinator._build_risex_two_account_coordinator_at_paths(
@@ -1584,6 +1656,7 @@ async def _build_fresh_production_coordinator(
             now=base._now,
             identity_factory=base._identity_factory,
             hold_release_gate=hold_release_gate,
+            preparation_gate=preparation_gate,
         )
     except Exception:
         await base._venue.close()
@@ -1595,10 +1668,13 @@ async def _build_fresh_production_coordinator(
 def build_risex_nado_funding_boundary_bridge(
     *,
     hold_release_gate: HoldReleaseGate | None,
+    preparation_gate: PreparationGate | None = None,
 ) -> tuple[RisexCoordinationLoopBridge, RisexTerminalEvidenceProvider]:
     """Create the fixed production RISEx loop and its exact sync provider."""
     bridge = RisexCoordinationLoopBridge(
-        lambda: _build_fresh_production_coordinator(hold_release_gate)
+        lambda: _build_fresh_production_coordinator(
+            hold_release_gate, preparation_gate,
+        )
     )
     bridge.start()
     return bridge, RisexTerminalEvidenceProvider(bridge)
@@ -1623,6 +1699,7 @@ __all__ = [
     "FUNDING_UNRESOLVED",
     "HoldReleaseGate",
     "HoldReleaseSignal",
+    "PreparationGate",
     "RisexCoordinationLoopBridge",
     "RisexFundingBoundaryBinding",
     "RisexFundingBoundaryCoordinator",
