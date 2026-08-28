@@ -1172,10 +1172,11 @@ async def test_stabilization003_g_scan_rows_use_one_captured_tuple(
         assert len(digest_lines) == min(10, len(persisted))
         for line, row in zip(digest_lines, persisted[:10]):
             if row["planned_maker_net_pnl_usd"] is not None:
-                assert line.endswith(
+                assert (
                     "Expected PnL: $" + format_telegram_money(
                         row["planned_maker_net_pnl_usd"]
                     )
+                    in line
                 )
 
 
@@ -1428,9 +1429,8 @@ async def test_stabilization003_h_top5_component_blocker_and_numeric_matrix(
                 ]
                 assert len(nado_lines) == len(expected_rows)
                 assert all(
-                    line.endswith(
-                        "Expected PnL: UNKNOWN — " + label_by_blocker[blocker]
-                    )
+                    "Expected PnL: UNKNOWN — " + label_by_blocker[blocker]
+                    in line
                     for line in nado_lines
                 )
 
@@ -1570,7 +1570,7 @@ async def test_stabilization003_h_top5_component_blocker_and_numeric_matrix(
             ][-1]
             assert len(digest.text.splitlines()[1:]) == 10
             assert all(
-                line.endswith("Expected PnL: UNKNOWN — funding")
+                "Expected PnL: UNKNOWN — funding" in line
                 for line in digest.text.splitlines()[1:]
             )
 
@@ -1612,10 +1612,11 @@ async def test_stabilization003_i_telegram_relays_only_persisted_full_rows(tmp_p
     assert len(numeric_lines) == min(10, len(numeric_persisted))
     assert len(unknown_lines) == min(10, len(unknown_persisted))
     for line, row in zip(numeric_lines, numeric_persisted[:10]):
-        assert line.endswith(
+        assert (
             "Expected PnL: $" + format_telegram_money(
                 row["planned_maker_net_pnl_usd"]
             )
+            in line
         )
     unknown_labels = {
         "FUNDING_STALE": "funding",
@@ -1623,8 +1624,9 @@ async def test_stabilization003_i_telegram_relays_only_persisted_full_rows(tmp_p
     }
     for line, row in zip(unknown_lines, unknown_persisted[:10]):
         blocker = row["blockers"][0]
-        assert line.endswith(
+        assert (
             "Expected PnL: UNKNOWN — " + unknown_labels[blocker]
+            in line
         )
 
 

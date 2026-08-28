@@ -1,6 +1,6 @@
 import asyncio
 from dataclasses import FrozenInstanceError
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -14,6 +14,7 @@ from risex_farmer.notifications import (
     NotificationPayload,
     NotificationScope,
     TelegramDelivery,
+    format_telegram_funding_countdown,
     format_telegram_money,
     full_scan_digest_payloads,
     outbox_from_environment,
@@ -34,6 +35,46 @@ NOW = datetime(2027, 8, 1, 12, tzinfo=UTC)
 ))
 def test_telegram_money_has_exactly_two_fractional_digits(value, expected):
     assert format_telegram_money(value) == expected
+
+
+@pytest.mark.parametrize(("target_cycle_start", "expected"), (
+    ((NOW + timedelta(minutes=42)).isoformat(), "Funding in: 42 min"),
+    ((NOW + timedelta(minutes=42, seconds=59)).isoformat(), "Funding in: 42 min"),
+    ((NOW + timedelta(seconds=59)).isoformat(), "Funding in: 0 min"),
+    (NOW.isoformat(), "Funding in: 0 min"),
+    ((NOW - timedelta(microseconds=1)).isoformat(), "Funding in: UNKNOWN"),
+    (None, "Funding in: UNKNOWN"),
+    ("not-a-timestamp", "Funding in: UNKNOWN"),
+    (NOW.replace(tzinfo=None).isoformat(), "Funding in: UNKNOWN"),
+    (NOW, "Funding in: UNKNOWN"),
+))
+def test_telegram_funding_countdown_is_conservative_and_fail_closed(
+    target_cycle_start, expected
+):
+    assert format_telegram_funding_countdown(target_cycle_start, NOW) == expected
+
+
+def test_full_scan_digest_uses_persisted_target_cycle_and_preserves_unknown_pnl():
+    row = {
+        "canonical_asset": "ABC",
+        "hedge_venue": "EXTENDED",
+        "direction": "LONG_RISEX_SHORT_HEDGE",
+        "planned_maker_net_pnl_usd": None,
+        "blockers": ["FUNDING_ELIGIBILITY_UNKNOWN"],
+        "target_cycle_start": (NOW + timedelta(minutes=42, seconds=59)).isoformat(),
+        "seconds_to_earliest_funding": "999999",
+    }
+    before = row.copy()
+
+    payload = full_scan_digest_payloads(
+        scan_at=NOW, opportunity=False, route_rows=(row,)
+    )[0]
+
+    assert payload.text.splitlines()[1] == (
+        "ABC | RISEx LONG / EXTENDED SHORT | Expected PnL: UNKNOWN — funding | "
+        "Funding in: 42 min"
+    )
+    assert row == before
 
 
 def payload(event_id: str = "event-1") -> NotificationPayload:
@@ -261,7 +302,8 @@ def test_full_scan_digest_part_event_ids_deduplicate_and_text_is_bounded():
         line for digest in digests for line in digest.text.splitlines()[1:]
     ]
     assert len(route_lines) == 10
-    assert all(line.count(" | ") == 2 for line in route_lines)
+    assert all(line.count(" | ") == 3 for line in route_lines)
+    assert all("Funding in: UNKNOWN" in line for line in route_lines)
 
 
 def test_full_scan_digest_delivers_only_first_ten_rows_without_loss() -> None:
@@ -296,7 +338,8 @@ def test_full_scan_digest_keeps_fewer_than_ten_rows_whole() -> None:
     )
     assert len(payloads) == 1
     assert payloads[0].text.splitlines()[1:] == [
-        f"ASSET-{index} | RISEx LONG / EXTENDED SHORT | Expected PnL: ${index}.00"
+        f"ASSET-{index} | RISEx LONG / EXTENDED SHORT | Expected PnL: ${index}.00 | "
+        "Funding in: UNKNOWN"
         for index in range(3)
     ]
 
@@ -318,8 +361,9 @@ def test_full_scan_unknown_uses_human_authoritative_label(blocker, label):
         },),
     )[0]
     line = payload.text.splitlines()[1]
-    assert line.endswith(f"Expected PnL: UNKNOWN — {label}")
-    assert line.count(" | ") == 2
+    assert f"Expected PnL: UNKNOWN — {label}" in line
+    assert line.endswith("Funding in: UNKNOWN")
+    assert line.count(" | ") == 3
     assert blocker not in line
 
 

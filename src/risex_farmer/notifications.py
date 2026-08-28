@@ -9,7 +9,7 @@ import os
 import re
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP, localcontext
 from enum import StrEnum
 from typing import Protocol
@@ -62,6 +62,26 @@ def format_telegram_money(value: Decimal | str | None) -> str:
         return "UNKNOWN"
 
 
+def format_telegram_funding_countdown(
+    target_cycle_start: object | None, scan_at: datetime
+) -> str:
+    """Render the fail-closed whole-minute countdown for one persisted route."""
+    if not isinstance(target_cycle_start, str):
+        return "Funding in: UNKNOWN"
+    try:
+        target_at = datetime.fromisoformat(target_cycle_start)
+        if target_at.tzinfo is None or target_at.utcoffset() is None:
+            return "Funding in: UNKNOWN"
+        if scan_at.tzinfo is None or scan_at.utcoffset() is None:
+            return "Funding in: UNKNOWN"
+        remaining = target_at.astimezone(UTC) - scan_at.astimezone(UTC)
+        if remaining < timedelta(0):
+            return "Funding in: UNKNOWN"
+        return f"Funding in: {remaining // timedelta(minutes=1)} min"
+    except (ArithmeticError, OverflowError, TypeError, ValueError):
+        return "Funding in: UNKNOWN"
+
+
 def full_scan_digest_payloads(
     *,
     scan_at: datetime,
@@ -96,8 +116,12 @@ def full_scan_digest_payloads(
             pnl_field = f"Expected PnL: UNKNOWN — {_unknown_digest_label(blocker)}"
         else:
             pnl_field = f"Expected PnL: ${pnl_display}"
+        funding_field = format_telegram_funding_countdown(
+            row.get("target_cycle_start"), scan_utc
+        )
         route_lines.append(
-            f"{ticker} | {route} | {_bounded_digest_field(pnl_field, 92)}"
+            f"{ticker} | {route} | {_bounded_digest_field(pnl_field, 92)} | "
+            f"{funding_field}"
         )
     header_budget = len(
         f"Full Scan 99/99 | Scan UTC: {scan_utc.isoformat()} | Status: {status}\n"

@@ -42,6 +42,7 @@ from risex_farmer.lifecycle import LifecycleEngine
 from risex_farmer.notifications import (
     NotificationOutbox,
     TelegramDelivery,
+    format_telegram_funding_countdown,
     format_telegram_money,
 )
 from risex_farmer.runtime import PublicPaperRuntime, public_paper_run, public_scan_once
@@ -1513,8 +1514,10 @@ async def test_full_scan_digest_uses_persisted_authoritative_route_rows_in_order
                 "SELECT COUNT(*) FROM scanner_snapshots WHERE logical_at=?",
                 (NOW.isoformat(),),
             ).fetchone()[0]
+            persisted_rows = repository.report(as_of=NOW)["latest_routes"]
 
     assert persisted == 1
+    assert result["routes"] == persisted_rows
     assert len(digests) == 1
     digest = digests[0]
     assert digest.occurred_at == NOW
@@ -1523,7 +1526,8 @@ async def test_full_scan_digest_uses_persisted_authoritative_route_rows_in_order
     )
     route_lines = digest.text.splitlines()[1:]
     assert len(route_lines) == min(10, len(result["routes"]))
-    for line, route_row in zip(route_lines, result["routes"][:10]):
+    assert all(line.endswith("Funding in: 5 min") for line in route_lines)
+    for line, route_row in zip(route_lines, persisted_rows[:10]):
         risex_side = (
             "LONG"
             if route_row["direction"] == "LONG_RISEX_SHORT_HEDGE"
@@ -1533,7 +1537,8 @@ async def test_full_scan_digest_uses_persisted_authoritative_route_rows_in_order
         expected = (
             f"{route_row['canonical_asset']} | RISEx {risex_side} / "
             f"{route_row['hedge_venue']} {hedge_side} | Expected PnL: "
-            f"${format_telegram_money(route_row['planned_maker_net_pnl_usd'])}"
+            f"${format_telegram_money(route_row['planned_maker_net_pnl_usd'])} | "
+            f"{format_telegram_funding_countdown(route_row['target_cycle_start'], NOW)}"
         )
         assert line == expected
 
@@ -1572,8 +1577,9 @@ async def test_full_scan_digest_keeps_negative_blocked_and_unknown_routes_visibl
         if row["planned_maker_net_pnl_usd"] is None:
             assert "Expected PnL: UNKNOWN — " in line
         else:
-            assert line.endswith(
+            assert (
                 f"Expected PnL: ${format_telegram_money(row['planned_maker_net_pnl_usd'])}"
+                in line
             )
     assert any(row["planned_maker_net_pnl_usd"] is None for row in unknown["routes"])
     assert len(digests[1].text.splitlines()[1:]) == min(10, len(unknown["routes"]))
@@ -1635,7 +1641,8 @@ async def test_full_scan_digest_retains_all_58_authoritative_rows(tmp_path):
         f"{'LONG' if row['direction'] == 'LONG_RISEX_SHORT_HEDGE' else 'SHORT'} / "
         f"{row['hedge_venue']} "
         f"{'SHORT' if row['direction'] == 'LONG_RISEX_SHORT_HEDGE' else 'LONG'} | "
-        f"Expected PnL: ${format_telegram_money(row['planned_maker_net_pnl_usd'])}"
+        f"Expected PnL: ${format_telegram_money(row['planned_maker_net_pnl_usd'])} | "
+        f"{format_telegram_funding_countdown(row['target_cycle_start'], NOW)}"
         for row in result["routes"][:10]
     ]
     assert delivered_lines == expected_lines
