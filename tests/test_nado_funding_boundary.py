@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
+import sqlite3
 
 import pytest
 
@@ -646,8 +647,22 @@ def test_valid_evidence_and_baseline_are_immutable_across_restart(tmp_path: Path
     finally:
         store.close()
 
+    connection = sqlite3.connect(path)
+    try:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        assert "nado_funding_progression" not in tables
+        assert "nado_funding_progression_activation" not in tables
+    finally:
+        connection.close()
+
     reopened = IntentStore(path)
     try:
+        assert reopened.funding_boundary_progression() == ()
         assert reopened.funding_boundary_binding() == binding
         assert reopened.funding_boundary_baseline() == baseline
         assert reopened.funding_boundary_exposure() == exposure

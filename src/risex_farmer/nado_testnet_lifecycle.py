@@ -1014,6 +1014,7 @@ FUNDING_PROGRESSION_RELAY_PUBLICATION_STARTED = "RELAY_PUBLICATION_STARTED"
 FUNDING_PROGRESSION_RELAY_PUBLICATION_ACCEPTED = "RELAY_PUBLICATION_ACCEPTED"
 FUNDING_PROGRESSION_ACCOUNT_HISTORY_READ_STARTED = "ACCOUNT_HISTORY_READ_STARTED"
 FUNDING_PROGRESSION_ACCOUNT_HISTORY_READ_COMPLETED = "ACCOUNT_HISTORY_READ_COMPLETED"
+FUNDING_PROGRESSION_REQUIRED = "REQUIRED"
 FUNDING_PROGRESSION_TOKENS = frozenset({
     FUNDING_PROGRESSION_PUBLIC_EVENT_WAIT_STARTED,
     FUNDING_PROGRESSION_PUBLIC_EVENT_ACCEPTED,
@@ -2443,6 +2444,72 @@ class IntentStore:
             ("nado_funding_progression",),
         ).fetchone() is not None
 
+    def _funding_progression_activation_table_exists(self) -> bool:
+        return self._connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            ("nado_funding_progression_activation",),
+        ).fetchone() is not None
+
+    def _ensure_funding_progression_activation_schema(self) -> None:
+        expected_columns = {"singleton", "requirement", "binding_digest"}
+        try:
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS nado_funding_progression_activation (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    requirement TEXT NOT NULL,
+                    binding_digest TEXT NOT NULL
+                )
+                """
+            )
+            columns = {
+                str(row[1])
+                for row in self._connection.execute(
+                    "PRAGMA table_info(nado_funding_progression_activation)"
+                )
+            }
+        except sqlite3.DatabaseError:
+            raise NadoContractError(
+                "funding progression activation schema is unavailable"
+            ) from None
+        if columns != expected_columns:
+            raise NadoContractError(
+                "funding progression activation schema is invalid"
+            )
+
+    def _funding_progression_activation_required(self) -> bool:
+        if not self._funding_progression_activation_table_exists():
+            return False
+        self._ensure_funding_progression_activation_schema()
+        try:
+            rows = self._connection.execute(
+                """
+                SELECT singleton, requirement, binding_digest
+                FROM nado_funding_progression_activation
+                ORDER BY singleton
+                """
+            ).fetchall()
+        except sqlite3.DatabaseError:
+            raise NadoContractError(
+                "funding progression activation could not be read"
+            ) from None
+        if (
+            len(rows) != 1
+            or len(rows[0]) != 3
+            or type(rows[0][0]) is not int
+            or rows[0][0] != 1
+            or type(rows[0][1]) is not str
+            or rows[0][1] != FUNDING_PROGRESSION_REQUIRED
+            or type(rows[0][2]) is not str
+        ):
+            raise NadoContractError("funding progression activation is invalid")
+        binding = self.funding_boundary_binding()
+        if binding is None or rows[0][2] != _funding_boundary_digest(binding):
+            raise NadoContractError(
+                "funding progression activation binding is invalid"
+            )
+        return True
+
     def _ensure_funding_progression_schema(self) -> None:
         expected_columns = {
             "step", "token", "observed_at_ms", "binding_digest", "relay_kind",
@@ -2506,10 +2573,17 @@ class IntentStore:
     def _validate_funding_progression(
         self, *, require_nonempty: bool | None = None,
     ) -> None:
+        activation_required = self._funding_progression_activation_required()
         records = self._funding_progression_rows()
+        if not activation_required and records is not None:
+            raise NadoContractError(
+                "funding progression activation is missing"
+            )
         if records is None:
-            # Historical stores predate this table and remain read-only
-            # compatible without an in-place schema migration.
+            if activation_required:
+                raise NadoContractError("funding progression table is missing")
+            # Historical/direct stores predate this table and remain
+            # read-only compatible without an in-place schema migration.
             return
         binding = self.funding_boundary_binding()
         if binding is None:
@@ -2563,13 +2637,13 @@ class IntentStore:
         binding = self.funding_boundary_binding()
         if binding is None or self.funding_boundary_exposure() is None:
             raise NadoContractError("funding progression requires durable exposure")
+        if not self._funding_progression_activation_required():
+            raise NadoContractError("funding progression activation is missing")
+        if not self._funding_progression_table_exists():
+            raise NadoContractError("funding progression schema is unavailable")
         binding_digest = _funding_boundary_digest(binding)
         try:
             with self._connection:
-                # Keep historical/direct evidence stores migration-free.  A
-                # progression table is created only when the lifecycle emits
-                # its first post-exposure marker.
-                self._ensure_funding_progression_schema()
                 # The empty table is the valid pre-marker state immediately
                 # after the durable exposure insert.  The candidate below
                 # must still be a non-empty valid prefix.
@@ -2758,12 +2832,34 @@ class IntentStore:
                         raise NadoContractError(
                             "persisted funding exposure is immutable"
                         )
+                    if track_progression:
+                        if not self._funding_progression_activation_required():
+                            raise NadoContractError(
+                                "funding progression activation is missing"
+                            )
+                        if not self._funding_progression_table_exists():
+                            raise NadoContractError(
+                                "funding progression schema is unavailable"
+                            )
+                        self._validate_funding_progression()
                     return
                 if track_progression:
                     # Activation is durable with the exposure row, so an
                     # interrupted first marker cannot reopen as an untracked
                     # post-exposure lifecycle.
+                    self._ensure_funding_progression_activation_schema()
                     self._ensure_funding_progression_schema()
+                    self._connection.execute(
+                        """
+                        INSERT INTO nado_funding_progression_activation
+                            (singleton, requirement, binding_digest)
+                        VALUES (1, ?, ?)
+                        """,
+                        (
+                            FUNDING_PROGRESSION_REQUIRED,
+                            _funding_boundary_digest(binding),
+                        ),
+                    )
                 self._connection.execute(
                     "INSERT INTO nado_funding_exposure "
                     "(singleton, exposure_json, exposure_digest) VALUES (1, ?, ?)",
@@ -2964,15 +3060,7 @@ class IntentStore:
                 attestation=attestation, reason=FUNDING_BLOCKED_MISSING
             )
         try:
-            progression = self._funding_progression_rows()
-            if progression is not None and (
-                not progression
-                or progression[-1].token
-                != FUNDING_PROGRESSION_ACCOUNT_HISTORY_READ_COMPLETED
-            ):
-                raise NadoContractError(
-                    "funding progression is incomplete for funding evidence"
-                )
+            self._validate_funding_progression()
             result = validate_nado_funding_boundary(
                 binding=binding,
                 baseline=baseline,
