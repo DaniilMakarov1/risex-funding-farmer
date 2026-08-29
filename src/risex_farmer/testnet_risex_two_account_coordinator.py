@@ -123,7 +123,7 @@ class CoordinatorSafetyError(RuntimeError):
 
 
 class OrderHistoryPropagationMismatch(CoordinatorSafetyError):
-    """One bounded exact-order/history status-visibility propagation mismatch."""
+    """One bounded exact-order/list status-visibility propagation mismatch."""
 
     def __init__(self, order_id: str):
         self.order_id = order_id
@@ -3391,7 +3391,7 @@ class FixedRisexTwoAccountVenue:
         for order_id, exact in zip(lookup_order_ids, lookup_values):
             listed = listed_by_id.get(order_id)
             if listed is None:
-                raise CoordinatorSafetyError("RISEx exact order/list disagreement")
+                raise OrderHistoryPropagationMismatch(order_id)
             if _order_history_evidence(listed) != _order_history_evidence(exact):
                 history_order = history_by_id.get(order_id)
                 if (

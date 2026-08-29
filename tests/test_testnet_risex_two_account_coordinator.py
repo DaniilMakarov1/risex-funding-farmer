@@ -825,6 +825,44 @@ def test_fixed_account_adapter_classifies_only_history_status_visibility_lag():
     assert not isinstance(captured.value, OrderHistoryPropagationMismatch)
 
 
+def test_fixed_account_adapter_classifies_missing_known_order_until_list_catches_up():
+    history = order(
+        wide=432, client=4032, account=ACCOUNT, side="BUY",
+        order_type="LIMIT", tif="GTC", status="OPEN", price="2999.01",
+    )
+    exact = replace(history, status="FILLED", filled_size=Decimal("0.1"))
+    trade_row = {
+        "id": f"{exact.order_id}-{exact.order_id}",
+        "order_id": exact.order_id,
+        "client_order_id": exact.client_order_id,
+        "market_id": 2,
+        "side": "BUY",
+        "size": "0.1",
+        "price": "2999.01",
+    }
+    transport = _FlatAccountReads(
+        history_orders=(), exact_order=exact, trade_rows=(trade_row,),
+    )
+    venue = _flat_read_venue(
+        transport, known_order_ids=(history.order_id,),
+    )
+    lookup_path = ORDER_LOOKUP_PATH_TEMPLATE.format(order_id=history.order_id)
+    with pytest.raises(OrderHistoryPropagationMismatch) as captured:
+        asyncio.run(
+            venue._account(AccountRole.PRIMARY, include_private=False),
+        )
+    assert captured.value.order_id == history.order_id
+    assert transport.calls.count((lookup_path, ())) == 1
+
+    transport.history_orders = (exact,)
+    snapshot, _, _ = asyncio.run(
+        venue._account(AccountRole.PRIMARY, include_private=False),
+    )
+    assert snapshot.history_orders == (exact,)
+    assert snapshot.trades[0].order_id == exact.order_id
+    assert transport.calls.count((lookup_path, ())) == 2
+
+
 def test_entry_recovery_accepts_exact_fill_and_resumed_run_only_writes_exits(tmp_path: Path):
     coordinator, initial_venue, valid_observations, rounds = _halted_entry_coordinator(tmp_path)
     coordinator.recover_entry_fill(valid_observations[2])
@@ -928,6 +966,35 @@ def test_partial_mutual_fill_halts_before_second_maker(tmp_path: Path):
     report = asyncio.run(make_lifecycle(tmp_path, venue).run())
     assert report.result is CoordinatorResult.FAILED_HALTED_MANUAL_RECOVERY
     assert [role for role, _ in venue.place_calls] == [AccountRole.COUNTERPARTY, AccountRole.PRIMARY]
+
+
+def test_external_entry_maker_fill_halts_before_primary_dispatch(tmp_path: Path):
+    observations, rounds = lifecycle_observations()
+    maker = observations[1].accounts[AccountRole.COUNTERPARTY].open_orders[0]
+    filled = replace(maker, status="FILLED", filled_size=Decimal("0.1"))
+    external_trade = trade(
+        trade_id=f"{maker.order_id}-{maker.order_id}",
+        item=filled, side="SELL", price="2999.01",
+    )
+    external_counterparty = account_snapshot(
+        AccountRole.COUNTERPARTY, position="-0.1", trades=(external_trade,),
+    )
+    external_counterparty = replace(
+        external_counterparty, history_orders=(filled,),
+    )
+    venue = PropagatingLifecycleVenue(
+        observations, rounds, propagation_failures=1,
+        propagation_order_id=maker.order_id,
+    )
+    venue.observations[1] = pair_observation(
+        account_snapshot(AccountRole.PRIMARY), external_counterparty,
+        book=observations[1].market.book,
+    )
+    report = asyncio.run(make_lifecycle(tmp_path, venue).run())
+    assert report.result is CoordinatorResult.FAILED_HALTED_MANUAL_RECOVERY
+    assert report.failure_code == "RISEx resting order proof rejected"
+    assert report.primary_dispatches == 0
+    assert [role for role, _ in venue.place_calls] == [AccountRole.COUNTERPARTY]
 
 
 def test_process_death_after_durable_dispatch_never_replays(tmp_path: Path):
