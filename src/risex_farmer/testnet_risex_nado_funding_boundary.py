@@ -70,13 +70,13 @@ _validate_market = _coordinator._validate_market
 # journals.  The new production builder rejects an existing path before any
 # PairJournal can open it, so a completed historical database is never reused.
 FUNDING_BOUNDARY_PRIMARY_JOURNAL = (
-    ".risex-funding-farmer-risex-nado-boundary-primary-v10.sqlite3"
+    ".risex-funding-farmer-risex-nado-boundary-primary-v11.sqlite3"
 )
 FUNDING_BOUNDARY_COUNTERPARTY_JOURNAL = (
-    ".risex-funding-farmer-risex-nado-boundary-counterparty-v10.sqlite3"
+    ".risex-funding-farmer-risex-nado-boundary-counterparty-v11.sqlite3"
 )
-FUNDING_BOUNDARY_PRIMARY_STORE_IDENTITY = "risex-nado-boundary-primary-v10"
-FUNDING_BOUNDARY_COUNTERPARTY_STORE_IDENTITY = "risex-nado-boundary-counterparty-v10"
+FUNDING_BOUNDARY_PRIMARY_STORE_IDENTITY = "risex-nado-boundary-primary-v11"
+FUNDING_BOUNDARY_COUNTERPARTY_STORE_IDENTITY = "risex-nado-boundary-counterparty-v11"
 
 TARGET_CANONICAL_ASSET = "ETH"
 TARGET_RISEX_MARKET = MARKET_SYMBOL

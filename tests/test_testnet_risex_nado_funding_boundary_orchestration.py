@@ -1418,7 +1418,7 @@ def test_exact_binding_prewrite_order_and_nado_sourced_release(tmp_path: Path) -
     assert bridge.closed is True and nado.store.closed is True
 
 
-def test_cross_binding_accepts_only_fresh_v10_risex_store_identities() -> None:
+def test_cross_binding_accepts_only_fresh_v11_risex_store_identities() -> None:
     route = _risex.fixed_funding_route(SETTLEMENT)
     fresh = (
         JournalIdentity(
@@ -1438,7 +1438,9 @@ def test_cross_binding_accepts_only_fresh_v10_risex_store_identities() -> None:
         fresh, route,
     ) == fresh
 
-    for version in ("v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9"):
+    for version in (
+        "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+    ):
         historical = (
             JournalIdentity(
                 RISEX_VENUE,

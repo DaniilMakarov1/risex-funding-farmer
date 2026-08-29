@@ -81,7 +81,7 @@ REDACTED_STORE_PATH = "<passwd-home>/" + RUN_STORE_BASENAME
 # route its own protected SQLite identity and keeps the historical SKR store
 # untouched.
 FUNDING_BOUNDARY_RUN_STORE_BASENAME = (
-    ".risex-funding-farmer-nado-funding-boundary-eth-v10.sqlite3"
+    ".risex-funding-farmer-nado-funding-boundary-eth-v11.sqlite3"
 )
 FUNDING_BOUNDARY_REDACTED_STORE_PATH = (
     "<passwd-home>/" + FUNDING_BOUNDARY_RUN_STORE_BASENAME
