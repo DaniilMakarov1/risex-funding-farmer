@@ -799,11 +799,11 @@ class RisexFundingBoundaryCoordinator(TwoAccountCoordinator):
         except (KeyError, ValueError, CoordinatorSafetyError):
             raise RisexFundingBoundaryError("RISEx fixed preparation contract rejected") from None
 
-    def _run_preparation_gate(self, binding: FundingBoundaryBinding) -> None:
+    def _run_preparation_gate(self, binding: RisexFundingBoundaryBinding) -> None:
         if self._preparation_gate is None or self._preparation_gate_used:
             return
         try:
-            result = self._preparation_gate(binding)
+            result = self._preparation_gate(binding.boundary)
             if inspect.isawaitable(result):
                 raise RisexFundingBoundaryError(
                     "RISEx preparation gate must be synchronous"
