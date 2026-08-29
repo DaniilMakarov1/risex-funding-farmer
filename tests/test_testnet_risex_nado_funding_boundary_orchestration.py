@@ -423,6 +423,7 @@ def _real_worker_fixture(
     private_read=None,
     fake_run: bool = False,
     hold_risex_after_report: bool = False,
+    hold_nado_after_report: bool = False,
     fail_terminalize: bool = False,
 ):
     settlement = time.time_ns() // 1_000_000 + 60_000
@@ -439,8 +440,12 @@ def _real_worker_fixture(
     holder: dict[str, object] = {}
     release_risex = threading.Event()
     risex_report_ready = threading.Event()
+    release_nado = threading.Event()
+    nado_report_ready = threading.Event()
     holder["release_risex"] = release_risex
     holder["risex_report_ready"] = risex_report_ready
+    holder["release_nado"] = release_nado
+    holder["nado_report_ready"] = nado_report_ready
 
     def bridge_factory(*, hold_release_gate, preparation_gate):
         bridge = _FakeBridge(
@@ -475,11 +480,16 @@ def _real_worker_fixture(
                         runner._preparation_gate(runner.funding_binding)
                         io.timestamp = settlement + 10
                         runner._emit_boundary_progression(_nado.BOUNDARY_RELEASED)
-                        return _nado.FundingBoundaryReport(
+                        report = _nado.FundingBoundaryReport(
                             1, "BLOCKED", "worker-owned-test", 0, 0,
                             _nado.FUNDING_UNRESOLVED, None, None,
                             True, True, True, True, "TEST_BLOCKER",
                         )
+                        if hold_nado_after_report:
+                            nado_report_ready.set()
+                            if not release_nado.wait(2):
+                                raise AssertionError("Nado worker was not released")
+                        return report
 
                     runner.run = bounded_fake_run
                 if fail_terminalize:
@@ -1594,6 +1604,35 @@ def test_timeout_does_not_cancel_and_retrieval_preserves_blocked_verdict(tmp_pat
     assert report.reason == "RISEX_APPLIED_FUNDING_CONTRACT_MISSING"
     assert report.closed is True
     assert bridge.closed is True
+
+
+def test_worker_owned_timeout_preserves_worker_for_continued_retrieval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    orchestrator, holder, _path, _io, _settlement = _real_worker_fixture(
+        tmp_path, monkeypatch, fake_run=True, hold_nado_after_report=True,
+    )
+
+    orchestrator.start()
+    assert holder["nado_report_ready"].wait(1)
+    with pytest.raises(_owner.FundingBoundaryOrchestrationTimeout):
+        orchestrator.retrieve(timeout_seconds=0.02)
+
+    running = orchestrator.status()
+    assert running.status == "RUNNING"
+    assert running.nado_task == "RUNNING"
+    assert running.risex_task == "DONE"
+    assert orchestrator._nado_thread is not None
+    assert orchestrator._nado_thread.is_alive()
+    assert orchestrator._nado_resources_closed is False
+
+    holder["release_nado"].set()
+    report = orchestrator.retrieve(timeout_seconds=1)
+
+    assert report.status == "BLOCKED"
+    assert report.terminal is True
+    assert report.closed is True
+    assert orchestrator._nado_resources_closed is True
 
 
 def test_risex_observes_only_after_delayed_nado_baseline_releases_barrier(

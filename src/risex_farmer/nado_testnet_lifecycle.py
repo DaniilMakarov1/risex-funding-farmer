@@ -1005,6 +1005,25 @@ FUNDING_BLOCKER_REASONS = frozenset({
     FUNDING_BLOCKED_CONTRADICTORY,
 })
 
+# These are durable coordination facts, not funding outcomes.  The sequence is
+# intentionally a closed-world prefix so a reopened journal can tell which
+# read-only boundary transition was last proven without retaining a payload.
+FUNDING_PROGRESSION_PUBLIC_EVENT_WAIT_STARTED = "PUBLIC_EVENT_WAIT_STARTED"
+FUNDING_PROGRESSION_PUBLIC_EVENT_ACCEPTED = "PUBLIC_EVENT_ACCEPTED"
+FUNDING_PROGRESSION_RELAY_PUBLICATION_STARTED = "RELAY_PUBLICATION_STARTED"
+FUNDING_PROGRESSION_RELAY_PUBLICATION_ACCEPTED = "RELAY_PUBLICATION_ACCEPTED"
+FUNDING_PROGRESSION_ACCOUNT_HISTORY_READ_STARTED = "ACCOUNT_HISTORY_READ_STARTED"
+FUNDING_PROGRESSION_ACCOUNT_HISTORY_READ_COMPLETED = "ACCOUNT_HISTORY_READ_COMPLETED"
+FUNDING_PROGRESSION_TOKENS = frozenset({
+    FUNDING_PROGRESSION_PUBLIC_EVENT_WAIT_STARTED,
+    FUNDING_PROGRESSION_PUBLIC_EVENT_ACCEPTED,
+    FUNDING_PROGRESSION_RELAY_PUBLICATION_STARTED,
+    FUNDING_PROGRESSION_RELAY_PUBLICATION_ACCEPTED,
+    FUNDING_PROGRESSION_ACCOUNT_HISTORY_READ_STARTED,
+    FUNDING_PROGRESSION_ACCOUNT_HISTORY_READ_COMPLETED,
+})
+FUNDING_PROGRESSION_RELAY_KINDS = frozenset({"RELEASED", "CANCELLED"})
+
 
 def _funding_integer(value: object, label: str, *, nonnegative: bool = False) -> int:
     if type(value) is not int or (nonnegative and value < 0):
@@ -1607,6 +1626,96 @@ def _funding_boundary_payload(
     }
 
 
+def _funding_boundary_digest(binding: FundingBoundaryBinding) -> str:
+    return hashlib.sha256(
+        canonical_payload(_funding_boundary_payload(binding))
+    ).hexdigest()
+
+
+@dataclass(frozen=True)
+class _FundingProgressionRecord:
+    step: int
+    token: str
+    observed_at_ms: int
+    binding_digest: str
+    relay_kind: str | None
+
+
+def _validate_funding_progression_records(
+    records: tuple[_FundingProgressionRecord, ...],
+    *,
+    binding_digest: str,
+    require_nonempty: bool,
+) -> None:
+    """Validate one exact, append-only post-exposure progression prefix."""
+    if type(binding_digest) is not str or len(binding_digest) != 64:
+        raise NadoContractError("funding progression binding digest is invalid")
+    try:
+        int(binding_digest, 16)
+    except ValueError:
+        raise NadoContractError("funding progression binding digest is invalid") from None
+    if require_nonempty and not records:
+        raise NadoContractError("funding progression is missing after exposure")
+    previous: _FundingProgressionRecord | None = None
+    for expected_step, record in enumerate(records, start=1):
+        if (
+            type(record.step) is not int
+            or record.step != expected_step
+            or type(record.token) is not str
+            or record.token not in FUNDING_PROGRESSION_TOKENS
+            or type(record.observed_at_ms) is not int
+            or record.observed_at_ms <= 0
+            or record.binding_digest != binding_digest
+            or (
+                previous is not None
+                and record.observed_at_ms < previous.observed_at_ms
+            )
+        ):
+            raise NadoContractError("funding progression record is invalid")
+        if record.token in {
+            FUNDING_PROGRESSION_RELAY_PUBLICATION_STARTED,
+            FUNDING_PROGRESSION_RELAY_PUBLICATION_ACCEPTED,
+        }:
+            if (
+                type(record.relay_kind) is not str
+                or record.relay_kind not in FUNDING_PROGRESSION_RELAY_KINDS
+            ):
+                raise NadoContractError("funding progression relay kind is invalid")
+        elif record.relay_kind is not None:
+            raise NadoContractError("funding progression relay kind is unexpected")
+
+        if previous is None:
+            allowed = record.token == FUNDING_PROGRESSION_PUBLIC_EVENT_WAIT_STARTED
+        elif previous.token == FUNDING_PROGRESSION_PUBLIC_EVENT_WAIT_STARTED:
+            allowed = record.token in {
+                FUNDING_PROGRESSION_PUBLIC_EVENT_ACCEPTED,
+                FUNDING_PROGRESSION_RELAY_PUBLICATION_STARTED,
+            }
+            if record.token == FUNDING_PROGRESSION_RELAY_PUBLICATION_STARTED:
+                allowed = record.relay_kind == "CANCELLED"
+        elif previous.token == FUNDING_PROGRESSION_PUBLIC_EVENT_ACCEPTED:
+            allowed = record.token == FUNDING_PROGRESSION_ACCOUNT_HISTORY_READ_STARTED
+            if record.token == FUNDING_PROGRESSION_RELAY_PUBLICATION_STARTED:
+                allowed = record.relay_kind in FUNDING_PROGRESSION_RELAY_KINDS
+        elif previous.token == FUNDING_PROGRESSION_RELAY_PUBLICATION_STARTED:
+            allowed = (
+                record.token == FUNDING_PROGRESSION_RELAY_PUBLICATION_ACCEPTED
+                and record.relay_kind == previous.relay_kind
+            )
+        elif previous.token == FUNDING_PROGRESSION_RELAY_PUBLICATION_ACCEPTED:
+            allowed = (
+                previous.relay_kind == "RELEASED"
+                and record.token == FUNDING_PROGRESSION_ACCOUNT_HISTORY_READ_STARTED
+            )
+        elif previous.token == FUNDING_PROGRESSION_ACCOUNT_HISTORY_READ_STARTED:
+            allowed = record.token == FUNDING_PROGRESSION_ACCOUNT_HISTORY_READ_COMPLETED
+        else:
+            allowed = False
+        if not allowed:
+            raise NadoContractError("funding progression ordering is invalid")
+        previous = record
+
+
 def _mapping_payload(value: object, label: str, keys: set[str]) -> dict[str, object]:
     if type(value) is not dict or set(value) != keys:
         raise NadoContractError(f"{label} persistence schema is invalid")
@@ -2042,6 +2151,7 @@ class IntentStore:
             """
         )
         self._connection.commit()
+        self._validate_funding_progression()
 
     def prepare(self, intent: OrderIntent) -> None:
         if unpack_order_nonce(intent.nonce)[0] != intent.recv_time:
@@ -2327,6 +2437,180 @@ class IntentStore:
         if cursor.rowcount != 1:
             raise NadoContractError("halted lifecycle cannot become complete")
 
+    def _funding_progression_table_exists(self) -> bool:
+        return self._connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            ("nado_funding_progression",),
+        ).fetchone() is not None
+
+    def _ensure_funding_progression_schema(self) -> None:
+        expected_columns = {
+            "step", "token", "observed_at_ms", "binding_digest", "relay_kind",
+        }
+        try:
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS nado_funding_progression (
+                    step INTEGER PRIMARY KEY,
+                    token TEXT NOT NULL,
+                    observed_at_ms INTEGER NOT NULL,
+                    binding_digest TEXT NOT NULL,
+                    relay_kind TEXT
+                )
+                """
+            )
+            columns = {
+                str(row[1])
+                for row in self._connection.execute(
+                    "PRAGMA table_info(nado_funding_progression)"
+                )
+            }
+        except sqlite3.DatabaseError:
+            raise NadoContractError("funding progression schema is unavailable") from None
+        if columns != expected_columns:
+            raise NadoContractError("funding progression schema is invalid")
+
+    def _funding_progression_rows(
+        self,
+    ) -> tuple[_FundingProgressionRecord, ...] | None:
+        if not self._funding_progression_table_exists():
+            return None
+        self._ensure_funding_progression_schema()
+        try:
+            raw_rows = self._connection.execute(
+                """
+                SELECT step, token, observed_at_ms, binding_digest, relay_kind
+                FROM nado_funding_progression ORDER BY step
+                """
+            ).fetchall()
+        except sqlite3.DatabaseError:
+            raise NadoContractError("funding progression could not be read") from None
+        records: list[_FundingProgressionRecord] = []
+        for row in raw_rows:
+            if (
+                len(row) != 5
+                or type(row[0]) is not int
+                or type(row[1]) is not str
+                or type(row[2]) is not int
+                or type(row[3]) is not str
+                or (row[4] is not None and type(row[4]) is not str)
+            ):
+                raise NadoContractError("funding progression record is invalid")
+            records.append(
+                _FundingProgressionRecord(
+                    row[0], row[1], row[2], row[3], row[4],
+                )
+            )
+        return tuple(records)
+
+    def _validate_funding_progression(
+        self, *, require_nonempty: bool | None = None,
+    ) -> None:
+        records = self._funding_progression_rows()
+        if records is None:
+            # Historical stores predate this table and remain read-only
+            # compatible without an in-place schema migration.
+            return
+        binding = self.funding_boundary_binding()
+        if binding is None:
+            raise NadoContractError("funding progression is unbound")
+        if require_nonempty is None:
+            require_nonempty = self.funding_boundary_exposure() is not None
+        _validate_funding_progression_records(
+            records,
+            binding_digest=_funding_boundary_digest(binding),
+            require_nonempty=require_nonempty,
+        )
+        try:
+            evidence_exists = self._connection.execute(
+                "SELECT 1 FROM nado_funding_evidence WHERE singleton = 1"
+            ).fetchone() is not None
+        except sqlite3.DatabaseError:
+            raise NadoContractError(
+                "funding progression evidence state is unavailable"
+            ) from None
+        if evidence_exists and (
+            not records
+            or records[-1].token != FUNDING_PROGRESSION_ACCOUNT_HISTORY_READ_COMPLETED
+        ):
+            raise NadoContractError(
+                "funding progression is incomplete for funding evidence"
+            )
+
+    def record_funding_progression(
+        self,
+        token: str,
+        *,
+        observed_at_ms: int,
+        relay_kind: str | None = None,
+    ) -> None:
+        """Append exactly one allowlisted post-exposure progression marker."""
+        if type(token) is not str or token not in FUNDING_PROGRESSION_TOKENS:
+            raise NadoContractError("funding progression token is not bounded")
+        if type(observed_at_ms) is not int or observed_at_ms <= 0:
+            raise NadoContractError("funding progression timestamp is invalid")
+        if token in {
+            FUNDING_PROGRESSION_RELAY_PUBLICATION_STARTED,
+            FUNDING_PROGRESSION_RELAY_PUBLICATION_ACCEPTED,
+        }:
+            if (
+                type(relay_kind) is not str
+                or relay_kind not in FUNDING_PROGRESSION_RELAY_KINDS
+            ):
+                raise NadoContractError("funding progression relay kind is invalid")
+        elif relay_kind is not None:
+            raise NadoContractError("funding progression relay kind is unexpected")
+        binding = self.funding_boundary_binding()
+        if binding is None or self.funding_boundary_exposure() is None:
+            raise NadoContractError("funding progression requires durable exposure")
+        binding_digest = _funding_boundary_digest(binding)
+        try:
+            with self._connection:
+                # Keep historical/direct evidence stores migration-free.  A
+                # progression table is created only when the lifecycle emits
+                # its first post-exposure marker.
+                self._ensure_funding_progression_schema()
+                # The empty table is the valid pre-marker state immediately
+                # after the durable exposure insert.  The candidate below
+                # must still be a non-empty valid prefix.
+                self._validate_funding_progression(require_nonempty=False)
+                records = self._funding_progression_rows()
+                assert records is not None
+                candidate = records + (
+                    _FundingProgressionRecord(
+                        len(records) + 1,
+                        token,
+                        observed_at_ms,
+                        binding_digest,
+                        relay_kind,
+                    ),
+                )
+                _validate_funding_progression_records(
+                    candidate,
+                    binding_digest=binding_digest,
+                    require_nonempty=True,
+                )
+                self._connection.execute(
+                    """
+                    INSERT INTO nado_funding_progression
+                        (step, token, observed_at_ms, binding_digest, relay_kind)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        candidate[-1].step, candidate[-1].token,
+                        candidate[-1].observed_at_ms, candidate[-1].binding_digest,
+                        candidate[-1].relay_kind,
+                    ),
+                )
+        except sqlite3.DatabaseError:
+            raise NadoContractError("funding progression persistence failed") from None
+
+    def funding_boundary_progression(self) -> tuple[str, ...]:
+        """Return only fixed sanitized tokens from the durable progression."""
+        self._validate_funding_progression()
+        records = self._funding_progression_rows()
+        return () if records is None else tuple(record.token for record in records)
+
     def replace_payload(self, digest: str, payload: bytes) -> None:
         del digest, payload
         raise NadoContractError("persisted payload and digest are immutable")
@@ -2416,12 +2700,16 @@ class IntentStore:
         except sqlite3.DatabaseError:
             raise NadoContractError("funding baseline persistence failed") from None
 
-    def bind_funding_exposure(self, exposure: NadoFundingExposure) -> None:
+    def bind_funding_exposure(
+        self, exposure: NadoFundingExposure, *, track_progression: bool = False,
+    ) -> None:
         """Persist the exact fresh signed route exposure before funding wait."""
         binding = self.funding_boundary_binding()
         baseline = self.funding_boundary_baseline()
         if binding is None or baseline is None:
             raise NadoContractError("funding exposure requires a persisted baseline")
+        if type(track_progression) is not bool:
+            raise NadoContractError("funding progression tracking flag is invalid")
         exposure.assert_contract()
         expected_route_quantity = _funding_quantity_x18(
             binding.route.nado_leg.canonical_quantity,
@@ -2471,6 +2759,11 @@ class IntentStore:
                             "persisted funding exposure is immutable"
                         )
                     return
+                if track_progression:
+                    # Activation is durable with the exposure row, so an
+                    # interrupted first marker cannot reopen as an untracked
+                    # post-exposure lifecycle.
+                    self._ensure_funding_progression_schema()
                 self._connection.execute(
                     "INSERT INTO nado_funding_exposure "
                     "(singleton, exposure_json, exposure_digest) VALUES (1, ?, ?)",
@@ -2671,6 +2964,15 @@ class IntentStore:
                 attestation=attestation, reason=FUNDING_BLOCKED_MISSING
             )
         try:
+            progression = self._funding_progression_rows()
+            if progression is not None and (
+                not progression
+                or progression[-1].token
+                != FUNDING_PROGRESSION_ACCOUNT_HISTORY_READ_COMPLETED
+            ):
+                raise NadoContractError(
+                    "funding progression is incomplete for funding evidence"
+                )
             result = validate_nado_funding_boundary(
                 binding=binding,
                 baseline=baseline,

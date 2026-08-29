@@ -21,6 +21,12 @@ from risex_farmer.nado_testnet_lifecycle import (
     FUNDING_BLOCKED_CONTRADICTORY, FUNDING_BLOCKED_MISSING, FUNDING_UNRESOLVED,
     EXECUTE_TRANSPORT_AMBIGUITY, EXECUTE_VENUE_REJECTION, HALTED, IOC_APPENDIX,
     IOC_REDUCE_ONLY_APPENDIX,
+    FUNDING_PROGRESSION_ACCOUNT_HISTORY_READ_COMPLETED,
+    FUNDING_PROGRESSION_ACCOUNT_HISTORY_READ_STARTED,
+    FUNDING_PROGRESSION_PUBLIC_EVENT_ACCEPTED,
+    FUNDING_PROGRESSION_PUBLIC_EVENT_WAIT_STARTED,
+    FUNDING_PROGRESSION_RELAY_PUBLICATION_ACCEPTED,
+    FUNDING_PROGRESSION_RELAY_PUBLICATION_STARTED,
     AccountSnapshot, CatalogSnapshot, CrossRunAttestation, EngineEvidence,
     ExecuteFailure, FillEvidence, FixedEnvironment, FundingBoundaryBinding,
     FundingLegBinding, FundingRouteBinding, IntentStore, JournalIdentity,
@@ -2179,6 +2185,147 @@ def test_funding_runner_binds_before_any_nado_preparation_or_dispatch(
         )
     finally:
         store.close()
+
+
+def test_funding_runner_persists_and_reopens_closed_world_progression(
+    tmp_path: Path,
+) -> None:
+    report, store = run_funding_fixture(tmp_path, FundingFixtureIO())
+    expected = (
+        FUNDING_PROGRESSION_PUBLIC_EVENT_WAIT_STARTED,
+        FUNDING_PROGRESSION_PUBLIC_EVENT_ACCEPTED,
+        FUNDING_PROGRESSION_ACCOUNT_HISTORY_READ_STARTED,
+        FUNDING_PROGRESSION_ACCOUNT_HISTORY_READ_COMPLETED,
+    )
+    try:
+        assert report.status == COMPLETE
+        assert report.funding_progression == expected
+        assert report.sanitized()["funding_progression"] == list(expected)
+        assert store.funding_boundary_progression() == expected
+        connection = sqlite3.connect(tmp_path / "nado-funding.sqlite")
+        try:
+            assert connection.execute(
+                "SELECT step, token, relay_kind "
+                "FROM nado_funding_progression ORDER BY step"
+            ).fetchall() == [
+                (1, FUNDING_PROGRESSION_PUBLIC_EVENT_WAIT_STARTED, None),
+                (2, FUNDING_PROGRESSION_PUBLIC_EVENT_ACCEPTED, None),
+                (3, FUNDING_PROGRESSION_ACCOUNT_HISTORY_READ_STARTED, None),
+                (4, FUNDING_PROGRESSION_ACCOUNT_HISTORY_READ_COMPLETED, None),
+            ]
+        finally:
+            connection.close()
+    finally:
+        store.close()
+
+    reopened = IntentStore(tmp_path / "nado-funding.sqlite")
+    try:
+        assert reopened.funding_boundary_progression() == expected
+        assert reopened.nado_funding_boundary_evidence() is not None
+    finally:
+        reopened.close()
+
+
+def test_funding_runner_records_relay_publication_before_account_history_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    published: list[tuple[str, int]] = []
+
+    class RelayRunner(SealedFundingBoundaryRunner):
+        def __init__(self, **kwargs):
+            super().__init__(
+                **kwargs,
+                boundary_progression_sink=(
+                    lambda _binding, kind, observed_at_ms:
+                    published.append((kind, observed_at_ms))
+                ),
+            )
+
+    monkeypatch.setattr(nado_operational, "SealedFundingBoundaryRunner", RelayRunner)
+    path = tmp_path / "nado-relay.sqlite"
+    report = _fixture_funding_boundary_run(
+        path=path,
+        io=FundingFixtureIO(),
+        capability_loader=capability,
+        owner=OWNER,
+        sender=SENDER,
+        route=_funding_route(),
+        risex_journal=FUNDING_RISEX_JOURNAL,
+        risex_attestation_provider=risex_terminal_provider,
+    )
+    expected = (
+        FUNDING_PROGRESSION_PUBLIC_EVENT_WAIT_STARTED,
+        FUNDING_PROGRESSION_PUBLIC_EVENT_ACCEPTED,
+        FUNDING_PROGRESSION_RELAY_PUBLICATION_STARTED,
+        FUNDING_PROGRESSION_RELAY_PUBLICATION_ACCEPTED,
+        FUNDING_PROGRESSION_ACCOUNT_HISTORY_READ_STARTED,
+        FUNDING_PROGRESSION_ACCOUNT_HISTORY_READ_COMPLETED,
+    )
+    assert report.status == COMPLETE
+    assert report.funding_progression == expected
+    assert published and published[0][0] == nado_operational.BOUNDARY_RELEASED
+    store = IntentStore(path)
+    try:
+        assert store.funding_boundary_progression() == expected
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("mutation", ["missing", "reordered", "contradictory"])
+def test_funding_progression_reopen_rejects_adverse_journal_state(
+    tmp_path: Path, mutation: str,
+) -> None:
+    _report, store = run_funding_fixture(tmp_path, FundingFixtureIO())
+    path = tmp_path / "nado-funding.sqlite"
+    store.close()
+    connection = sqlite3.connect(path)
+    try:
+        if mutation == "missing":
+            connection.execute(
+                "DELETE FROM nado_funding_progression WHERE step = 2"
+            )
+        elif mutation == "reordered":
+            connection.execute(
+                "UPDATE nado_funding_progression SET token = ? WHERE step = 2",
+                (FUNDING_PROGRESSION_ACCOUNT_HISTORY_READ_STARTED,),
+            )
+        else:
+            connection.execute(
+                "UPDATE nado_funding_progression SET binding_digest = ? WHERE step = 2",
+                ("0" * 64,),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+    with pytest.raises(NadoContractError):
+        IntentStore(path)
+
+
+def test_funding_progression_rejects_replay_and_preserves_historical_store_readability(
+    tmp_path: Path,
+) -> None:
+    _report, store = run_funding_fixture(tmp_path, FundingFixtureIO())
+    path = tmp_path / "nado-funding.sqlite"
+    with pytest.raises(NadoContractError):
+        store.record_funding_progression(
+            FUNDING_PROGRESSION_PUBLIC_EVENT_WAIT_STARTED,
+            observed_at_ms=1_700_000_000_123,
+        )
+    store.close()
+
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("DROP TABLE nado_funding_progression")
+        connection.commit()
+    finally:
+        connection.close()
+    historical = IntentStore(path)
+    try:
+        assert historical.funding_boundary_progression() == ()
+        assert historical.nado_funding_boundary_evidence() is not None
+        assert historical.lifecycle_status() == COMPLETE
+    finally:
+        historical.close()
 
 
 def test_funding_runner_uses_official_aggressive_short_close_price(

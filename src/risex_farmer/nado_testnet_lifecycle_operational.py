@@ -53,6 +53,13 @@ from .nado_testnet_lifecycle import (
     FundingBoundaryBinding, FundingRouteBinding, IntentStore, ExecuteFailure,
     JournalIdentity, LifecycleCore, NadoAccountFunding, NadoContractError,
     NadoFundingBaseline, NadoFundingEvent, NadoFundingExposure,
+    FUNDING_PROGRESSION_ACCOUNT_HISTORY_READ_COMPLETED,
+    FUNDING_PROGRESSION_ACCOUNT_HISTORY_READ_STARTED,
+    FUNDING_PROGRESSION_PUBLIC_EVENT_ACCEPTED,
+    FUNDING_PROGRESSION_PUBLIC_EVENT_WAIT_STARTED,
+    FUNDING_PROGRESSION_RELAY_PUBLICATION_ACCEPTED,
+    FUNDING_PROGRESSION_RELAY_PUBLICATION_STARTED,
+    FUNDING_PROGRESSION_TOKENS,
     OrderEvidence, OrderIntent,
     Product, Reconciliation, RisexTerminalEvidence, TerminalEvidence,
     SyntheticOrderVector, TriggerSnapshot, build_order_nonce,
@@ -236,6 +243,7 @@ class FundingBoundaryReport:
     reason: str | None = None
     funding_aggregate_payment_x18: int | None = None
     funding_account_idx: int | None = None
+    funding_progression: tuple[str, ...] = ()
 
     def sanitized(self) -> dict[str, object]:
         return {
@@ -254,6 +262,10 @@ class FundingBoundaryReport:
             "reason": self.reason,
             "funding_aggregate_payment_x18": self.funding_aggregate_payment_x18,
             "funding_account_idx": self.funding_account_idx,
+            "funding_progression": [
+                token for token in self.funding_progression
+                if type(token) is str and token in FUNDING_PROGRESSION_TOKENS
+            ],
             "path": FUNDING_BOUNDARY_REDACTED_STORE_PATH,
         }
 
@@ -1303,8 +1315,16 @@ class SealedFundingBoundaryRunner(SealedLifecycleRunner):
                 "Nado boundary progression timestamp rejected"
             )
         try:
+            self._record_boundary_progression(
+                FUNDING_PROGRESSION_RELAY_PUBLICATION_STARTED,
+                relay_kind=kind,
+            )
             self._boundary_progression_sink(
                 self.funding_binding, kind, observed_at_ms,
+            )
+            self._record_boundary_progression(
+                FUNDING_PROGRESSION_RELAY_PUBLICATION_ACCEPTED,
+                relay_kind=kind,
             )
         except OperationalSafetyError:
             raise
@@ -1313,6 +1333,30 @@ class SealedFundingBoundaryRunner(SealedLifecycleRunner):
                 "Nado boundary progression sink rejected"
             ) from None
         self._boundary_progression_emitted = True
+
+    def _record_boundary_progression(
+        self, token: str, *, relay_kind: str | None = None,
+    ) -> None:
+        """Persist a fixed post-exposure marker without retaining read data."""
+        if self.store.funding_boundary_exposure() is None:
+            # Preparation failures can cancel the owner relay before exposure
+            # exists; those coordination-only signals are not funding facts.
+            return
+        observed_at_ms = self.io.now_ms()
+        if type(observed_at_ms) is not int or observed_at_ms <= 0:
+            raise OperationalSafetyError(
+                "Nado funding progression timestamp rejected"
+            )
+        try:
+            self.store.record_funding_progression(
+                token,
+                observed_at_ms=observed_at_ms,
+                relay_kind=relay_kind,
+            )
+        except NadoContractError:
+            raise OperationalSafetyError(
+                "Nado funding progression persistence rejected"
+            ) from None
 
     def cancel_boundary_progression(self) -> None:
         """Publish Nado-owned cancellation after an interrupted lifecycle."""
@@ -1538,15 +1582,27 @@ class SealedFundingBoundaryRunner(SealedLifecycleRunner):
                     "funding exposure adapter returned invalid evidence"
                 )
             exposure.assert_contract()
-            self.store.bind_funding_exposure(exposure)
+            self.store.bind_funding_exposure(exposure, track_progression=True)
             self.funding_exposure = exposure
+            self._record_boundary_progression(
+                FUNDING_PROGRESSION_PUBLIC_EVENT_WAIT_STARTED,
+            )
             self.funding_io.await_funding_boundary(self.funding_binding)
+            self._record_boundary_progression(
+                FUNDING_PROGRESSION_PUBLIC_EVENT_ACCEPTED,
+            )
             # This is the only RELEASED signal source.  It is emitted from
             # the accepted Nado boundary progression, before the venue-local
             # account-funding read, and carries no funding claim.
             self._emit_boundary_progression(BOUNDARY_RELEASED)
+            self._record_boundary_progression(
+                FUNDING_PROGRESSION_ACCOUNT_HISTORY_READ_STARTED,
+            )
             event, account_funding = self.funding_io.read_funding_boundary(
                 self.funding_binding
+            )
+            self._record_boundary_progression(
+                FUNDING_PROGRESSION_ACCOUNT_HISTORY_READ_COMPLETED,
             )
             if event is not None and not isinstance(event, NadoFundingEvent):
                 raise NadoContractError("funding event adapter returned invalid evidence")
@@ -1660,6 +1716,7 @@ class SealedFundingBoundaryRunner(SealedLifecycleRunner):
             None if result.completion_eligible else result.status,
             result.aggregate_payment_x18,
             result.account_idx,
+            self.store.funding_boundary_progression(),
         )
 
     def run(self) -> FundingBoundaryReport:
@@ -1748,6 +1805,11 @@ def _fixture_run(
 def _blocked_funding_report(
     runner: SealedFundingBoundaryRunner, reason: str,
 ) -> FundingBoundaryReport:
+    try:
+        progression = runner.store.funding_boundary_progression()
+    except NadoContractError:
+        # Do not expose an unvalidated journal value in a sanitized report.
+        progression = ()
     return FundingBoundaryReport(
         1,
         "BLOCKED",
@@ -1762,6 +1824,7 @@ def _blocked_funding_report(
         False,
         False,
         reason,
+        funding_progression=progression,
     )
 
 
