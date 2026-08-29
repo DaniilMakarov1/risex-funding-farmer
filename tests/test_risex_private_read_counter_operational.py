@@ -2038,6 +2038,161 @@ def test_public_b_classifier_keeps_http_and_transport_classes_fixed(
 
 
 @pytest.mark.asyncio
+async def test_public_b_freshness_failure_is_fixed_redacted_and_durable(
+    tmp_path, monkeypatch,
+):
+    calls: list[str] = []
+    secret = "public-b-freshness-secret"
+    phase = {"b_complete": False, "post_b_now_calls": 0}
+
+    class FreshnessFailureTransport(SyntheticTransport):
+        async def public_get(self, index: int) -> HttpResponse:
+            response = await super().public_get(index)
+            if self._public_index == 2 * len(PrivateReadPreflight._REQUESTS):
+                phase["b_complete"] = True
+            return response
+
+    original_now = PrivateReadPreflight._now
+
+    def fail_only_at_b_freshness(instance):
+        if phase["b_complete"]:
+            phase["post_b_now_calls"] += 1
+            if phase["post_b_now_calls"] == 3:
+                raise RuntimeError(secret)
+        return original_now(instance)
+
+    monkeypatch.setattr(PrivateReadPreflight, "_now", fail_only_at_b_freshness)
+    report = await _run_fixture(
+        dependencies(
+            tmp_path,
+            calls,
+            transport_factory=lambda: FreshnessFailureTransport(calls),
+        )
+    )
+
+    assert report.result is Result.BLOCKED
+    assert report.reason == "validation_failed"
+    assert report.failure_class == "SAFETY"
+    assert report.failure_stage == "PUBLIC_B_FRESHNESS"
+    assert all(
+        report.counters[f"public_b_{index:02d}"]
+        == {"attempts": 1, "completions": 1}
+        for index in range(1, 10)
+    )
+    assert report.barrier_b_fingerprint is None
+    assert report.counters["final_agreement"] == {
+        "attempts": 0, "completions": 0,
+    }
+    serialized = json.dumps(report.as_dict(), sort_keys=True)
+    persisted = (tmp_path / "fixture.sqlite3").read_bytes().decode("latin1")
+    assert secret not in serialized and secret not in persisted
+    assert phase["post_b_now_calls"] == 3
+
+    restarted = await _run_fixture(dependencies(
+        tmp_path,
+        [],
+        source_factory=lambda: (_ for _ in ()).throw(AssertionError("source")),
+        transport_factory=lambda: (_ for _ in ()).throw(AssertionError("transport")),
+    ))
+    assert restarted == report
+
+
+@pytest.mark.asyncio
+async def test_public_b_fingerprint_failure_is_fixed_redacted_and_durable(
+    tmp_path, monkeypatch,
+):
+    calls: list[str] = []
+    secret = "public-b-fingerprint-secret"
+    fingerprints = 0
+    original = operational._public_fingerprint
+
+    def fail_only_b(value):
+        nonlocal fingerprints
+        fingerprints += 1
+        if fingerprints == 2:
+            raise RuntimeError(secret)
+        return original(value)
+
+    monkeypatch.setattr(operational, "_public_fingerprint", fail_only_b)
+    report = await _run_fixture(dependencies(tmp_path, calls))
+
+    assert report.result is Result.BLOCKED
+    assert report.reason == "validation_failed"
+    assert report.failure_class == "SAFETY"
+    assert report.failure_stage == "PUBLIC_B_FINGERPRINT"
+    assert all(
+        report.counters[f"public_b_{index:02d}"]
+        == {"attempts": 1, "completions": 1}
+        for index in range(1, 10)
+    )
+    assert report.barrier_b_fingerprint is None
+    assert report.counters["final_agreement"] == {
+        "attempts": 0, "completions": 0,
+    }
+    serialized = json.dumps(report.as_dict(), sort_keys=True)
+    persisted = (tmp_path / "fixture.sqlite3").read_bytes().decode("latin1")
+    assert secret not in serialized and secret not in persisted
+    assert fingerprints == 2
+
+    restarted = await _run_fixture(dependencies(
+        tmp_path,
+        [],
+        source_factory=lambda: (_ for _ in ()).throw(AssertionError("source")),
+        transport_factory=lambda: (_ for _ in ()).throw(AssertionError("transport")),
+    ))
+    assert restarted == report
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tampered_reason",
+    (
+        "validation_failed|UNKNOWN|PUBLIC_B_VALIDATION",
+        "validation_failed|SAFETY|PUBLIC_B_UNKNOWN",
+    ),
+)
+async def test_unknown_composed_public_b_reason_is_rejected_on_reopen(
+    tmp_path, tampered_reason,
+):
+    calls: list[str] = []
+
+    def mutate(round_name, path, body):
+        if round_name == "b" and path == "/v1/orders/open":
+            body["data"]["orders"] = [{"redacted": True}]
+
+    report = await _run_fixture(dependencies(
+        tmp_path,
+        calls,
+        transport_factory=lambda: SyntheticTransport(calls, public_mutator=mutate),
+    ))
+    assert report.failure_class == "SAFETY"
+    assert report.failure_stage == "PUBLIC_B_VALIDATION"
+
+    database = sqlite3.connect(tmp_path / "fixture.sqlite3")
+    assert database.execute("SELECT reason FROM run").fetchone() == (
+        "validation_failed|SAFETY|PUBLIC_B_VALIDATION",
+    )
+    database.execute("UPDATE run SET reason=?", (tampered_reason,))
+    database.commit()
+    database.close()
+
+    calls.clear()
+    reopened = await _run_fixture(dependencies(
+        tmp_path,
+        calls,
+        source_factory=lambda: (_ for _ in ()).throw(AssertionError("source")),
+        transport_factory=lambda: (_ for _ in ()).throw(AssertionError("transport")),
+    ))
+    assert reopened.result is Result.UNKNOWN
+    assert reopened.state == Result.UNKNOWN.value
+    assert reopened.reason == "store_rejected"
+    assert reopened.failure_class is None
+    assert reopened.failure_stage is None
+    assert reopened.counters == {}
+    assert calls == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("response_mutation", ("status", "transport"))
 async def test_public_b_request_failure_is_before_completion_and_has_no_post_b_provenance(
     tmp_path, response_mutation,
