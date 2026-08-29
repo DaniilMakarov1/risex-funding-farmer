@@ -61,8 +61,42 @@ class FundingBoundaryOrchestrationTimeout(FundingBoundaryOrchestrationError):
         super().__init__("TIMEOUT")
 
 
-class _PreparationBarrierAborted(Exception):
-    """Private wake-up for a peer whose prewrite barrier was aborted."""
+_PREPARATION_FAILURE_CODES = frozenset(_STARTUP_FAILURES | _RECOVERY_FAILURES)
+_PREPARATION_FAILURE_CLASS = "SAFETY"
+_PREPARATION_FAILURE_STAGE = "ENTRY_PREPARATION"
+
+
+class _PreparationBarrierFailure(FundingBoundaryOrchestrationError):
+    """Sanitized provenance for one bounded prewrite-barrier failure."""
+
+    def __init__(self, code: str) -> None:
+        if type(code) is not str or code not in _PREPARATION_FAILURE_CODES:
+            raise ValueError("unsupported preparation failure")
+        super().__init__(code)
+        self.failure_class = _PREPARATION_FAILURE_CLASS
+        self.stage = _PREPARATION_FAILURE_STAGE
+
+
+class _PreparationBarrierAborted(_PreparationBarrierFailure):
+    """Private wake-up carrying the first bounded barrier abort code."""
+
+
+def _preparation_failure(error: object) -> tuple[str, str, str] | None:
+    """Extract only the fixed, allowlisted barrier provenance."""
+    try:
+        code = getattr(error, "code", None)
+        failure_class = getattr(error, "failure_class", None)
+        stage = getattr(error, "stage", None)
+    except BaseException:
+        return None
+    if (
+        type(code) is not str
+        or code not in _PREPARATION_FAILURE_CODES
+        or failure_class != _PREPARATION_FAILURE_CLASS
+        or stage != _PREPARATION_FAILURE_STAGE
+    ):
+        return None
+    return code, _PREPARATION_FAILURE_CLASS, _PREPARATION_FAILURE_STAGE
 
 
 class _PreparationBarrier:
@@ -77,6 +111,7 @@ class _PreparationBarrier:
         self._arrived: set[str] = set()
         self._passed = False
         self._aborted = False
+        self._abort_code: str | None = None
 
     def bind(
         self,
@@ -98,40 +133,43 @@ class _PreparationBarrier:
 
     def _assert_before_target(self, binding: FundingBoundaryBinding) -> None:
         if self._now_ms is None:
-            raise FundingBoundaryOrchestrationError("BARRIER_ABORTED")
+            raise _PreparationBarrierFailure("BARRIER_ABORTED")
         try:
             now_ms = self._now_ms()
         except BaseException:
-            raise FundingBoundaryOrchestrationError("BARRIER_ABORTED") from None
+            raise _PreparationBarrierFailure("BARRIER_ABORTED") from None
         if (
             type(now_ms) is not int
             or now_ms <= 0
             or now_ms >= binding.route.settlement_at_ms
         ):
-            raise FundingBoundaryOrchestrationError("BARRIER_ABORTED")
+            raise _PreparationBarrierFailure("BARRIER_ABORTED")
 
     def _assert_before_target_or_abort(self, binding: FundingBoundaryBinding) -> None:
         try:
             self._assert_before_target(binding)
-        except FundingBoundaryOrchestrationError:
+        except FundingBoundaryOrchestrationError as error:
             # A peer may already be blocked in the condition.  Publish the
             # abort while holding the same lock, then wake it before the
             # deterministic rejection reaches the caller.
             self._aborted = True
             self._passed = False
+            self._abort_code = error.code
             self._condition.notify_all()
             raise
 
     def wait(self, side: str, binding: FundingBoundaryBinding) -> None:
         if side not in {"NADO", "RISEX"}:
-            raise FundingBoundaryOrchestrationError("BARRIER_ABORTED")
+            raise _PreparationBarrierFailure("BARRIER_ABORTED")
         with self._condition:
             if self._binding is None or self._binding != binding:
-                raise FundingBoundaryOrchestrationError("BINDING_MISMATCH")
+                raise _PreparationBarrierFailure("BINDING_MISMATCH")
             if self._passed or side in self._arrived:
-                raise FundingBoundaryOrchestrationError("BARRIER_ABORTED")
+                raise _PreparationBarrierFailure("BARRIER_ABORTED")
             if self._aborted:
-                raise _PreparationBarrierAborted
+                raise _PreparationBarrierAborted(
+                    self._abort_code or "BARRIER_ABORTED"
+                )
             self._assert_before_target_or_abort(binding)
             self._arrived.add(side)
             if len(self._arrived) == 2:
@@ -142,14 +180,18 @@ class _PreparationBarrier:
             while not self._passed and not self._aborted:
                 self._condition.wait()
             if self._aborted:
-                raise _PreparationBarrierAborted
+                raise _PreparationBarrierAborted(
+                    self._abort_code or "BARRIER_ABORTED"
+                )
 
     def abort(self, code: str = "BARRIER_ABORTED") -> None:
-        if code not in _STARTUP_FAILURES | _RECOVERY_FAILURES:
+        if code not in _PREPARATION_FAILURE_CODES:
             code = "BARRIER_ABORTED"
         with self._condition:
             if self._passed:
                 return
+            if self._abort_code is None:
+                self._abort_code = code
             self._aborted = True
             self._condition.notify_all()
 
@@ -307,6 +349,9 @@ class FundingBoundaryOrchestrationReport:
     reason: str | None = None
     closed: bool = False
     risex_counterparty: dict[str, object] | None = None
+    failure_code: str | None = None
+    failure_class: str | None = None
+    failure_stage: str | None = None
 
     def sanitized(self) -> dict[str, object]:
         counterparty: dict[str, object] | None = None
@@ -335,6 +380,9 @@ class FundingBoundaryOrchestrationReport:
             "risex": None if self.risex_report is None else self.risex_report.sanitized(),
             "risex_counterparty": counterparty,
             "reason": self.reason,
+            "failure_code": self.failure_code,
+            "failure_class": self.failure_class,
+            "failure_stage": self.failure_stage,
             "closed": self.closed,
         }
 
@@ -462,6 +510,8 @@ class FundingBoundaryOrchestrator:
         self._risex_report: _risex.FundingBoundaryReport | None = None
         self._risex_counterparty: dict[str, object] | None = None
         self._nado_blocker: str | None = None
+        self._nado_failure: tuple[str, str, str] | None = None
+        self._risex_failure: tuple[str, str, str] | None = None
         self._nado_error: str | None = None
         self._risex_error: str | None = None
         self._nado_potential_write = False
@@ -700,6 +750,7 @@ class FundingBoundaryOrchestrator:
         worker_owned = callable(owned.worker_factory)
         startup_phase = worker_owned
         close_after_owner_request = False
+        barrier_abort_code = "BARRIER_ABORTED"
         try:
             if worker_owned:
                 assert owned.worker_factory is not None
@@ -779,6 +830,12 @@ class FundingBoundaryOrchestrator:
                 self._nado_report = result
             close_after_owner_request = worker_owned
         except BaseException as error:
+            provenance = _preparation_failure(error)
+            if provenance is not None:
+                barrier_abort_code = provenance[0]
+                with self._condition:
+                    self._nado_failure = provenance
+                    self._condition.notify_all()
             if worker_owned:
                 failure_code = self._worker_startup_code(error)
                 if runner is None:
@@ -808,7 +865,7 @@ class FundingBoundaryOrchestrator:
             if runner is not None and self._barrier.passed:
                 self._cancel_after_nado_termination(runner)
             elif runner is not None and not self._potential_nado(runner):
-                self._barrier.abort("BARRIER_ABORTED")
+                self._barrier.abort(barrier_abort_code)
             with self._condition:
                 # A failed durable terminalization is deliberately sticky:
                 # the runner's in-memory potential flag cannot turn an
@@ -859,18 +916,32 @@ class FundingBoundaryOrchestrator:
         bridge = self._bridge
         if bridge is None:
             return
+        barrier_abort_code = "BARRIER_ABORTED"
         try:
             result = bridge.run_lifecycle()
             if type(result) is not _risex.FundingBoundaryReport:
                 raise FundingBoundaryOrchestrationError("RISEX_FAILED")
+            code = result.coordinator_report.failure_code
+            if type(code) is str and code in _PREPARATION_FAILURE_CODES:
+                provenance = (
+                    code, _PREPARATION_FAILURE_CLASS, _PREPARATION_FAILURE_STAGE,
+                )
+                barrier_abort_code = code
+                with self._condition:
+                    self._risex_failure = provenance
             with self._condition:
                 self._risex_report = result
-        except BaseException:
+        except BaseException as error:
+            provenance = _preparation_failure(error)
+            if provenance is not None:
+                barrier_abort_code = provenance[0]
+                with self._condition:
+                    self._risex_failure = provenance
             self._risex_error = "RISEX_FAILED"
         finally:
             potential = self._potential_risex()
             if not self._barrier.passed and not potential:
-                self._barrier.abort("BARRIER_ABORTED")
+                self._barrier.abort(barrier_abort_code)
             with self._condition:
                 self._risex_potential_write = potential
                 self._risex_done = True
@@ -1138,6 +1209,7 @@ class FundingBoundaryOrchestrator:
             status = "BLOCKED_BEFORE_WRITE"
             terminal = True
         reason = self._reason_locked(status)
+        provenance = self._nado_failure or self._risex_failure
         return FundingBoundaryOrchestrationReport(
             status=status,
             terminal=terminal,
@@ -1151,6 +1223,9 @@ class FundingBoundaryOrchestrator:
             reason=reason,
             closed=self._closed,
             risex_counterparty=self._risex_counterparty,
+            failure_code=None if provenance is None else provenance[0],
+            failure_class=None if provenance is None else provenance[1],
+            failure_stage=None if provenance is None else provenance[2],
         )
 
     def _safe_terminal_locked(self) -> bool:
@@ -1211,6 +1286,9 @@ class FundingBoundaryOrchestrator:
             ):
                 return "ASYMMETRIC_PARTIAL_EXPOSURE"
             return "MANUAL_RECOVERY_REQUIRED"
+        provenance = self._nado_failure or self._risex_failure
+        if provenance is not None:
+            return provenance[0]
         return self._nado_error or self._risex_error or "BARRIER_ABORTED"
 
     def status(self) -> FundingBoundaryOrchestrationReport:

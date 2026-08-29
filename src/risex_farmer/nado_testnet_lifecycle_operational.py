@@ -272,6 +272,50 @@ _RUNTIME_STAGES = frozenset({
     "FUNDING_BOUNDARY", "RUNNER_STARTUP", "OUTER",
 })
 
+_PREPARATION_FAILURE_CODES = frozenset({
+    "STARTUP_FAILED",
+    "STARTUP_INTERRUPTED",
+    "BINDING_MISMATCH",
+    "BARRIER_ABORTED",
+    "NADO_FAILED",
+    "RISEX_FAILED",
+    "ASYMMETRIC_PARTIAL_EXPOSURE",
+    "MANUAL_RECOVERY_REQUIRED",
+    "CLOSE_FAILED",
+})
+_PREPARATION_FAILURE_CLASS = "SAFETY"
+_PREPARATION_FAILURE_STAGE = "ENTRY_PREPARATION"
+
+
+class _PreparationGateFailure(OperationalSafetyError):
+    """Sanitized allowlisted failure from the owner preparation barrier."""
+
+    def __init__(self, code: str) -> None:
+        if type(code) is not str or code not in _PREPARATION_FAILURE_CODES:
+            raise ValueError("unsupported preparation failure")
+        self.code = code
+        self.failure_class = _PREPARATION_FAILURE_CLASS
+        self.stage = _PREPARATION_FAILURE_STAGE
+        super().__init__(code)
+
+
+def _preparation_gate_failure(error: object) -> _PreparationGateFailure | None:
+    """Accept only the fixed code/class/stage tuple from the owner barrier."""
+    try:
+        code = getattr(error, "code", None)
+        failure_class = getattr(error, "failure_class", None)
+        stage = getattr(error, "stage", None)
+    except BaseException:
+        return None
+    if (
+        type(code) is not str
+        or code not in _PREPARATION_FAILURE_CODES
+        or failure_class != _PREPARATION_FAILURE_CLASS
+        or stage != _PREPARATION_FAILURE_STAGE
+    ):
+        return None
+    return _PreparationGateFailure(code)
+
 
 def _failure_class(error: BaseException | object) -> str:
     """Return only a bounded class; never persist or report exception text."""
@@ -1194,7 +1238,10 @@ class SealedFundingBoundaryRunner(SealedLifecycleRunner):
                 )
         except OperationalSafetyError:
             raise
-        except BaseException:
+        except BaseException as error:
+            preserved = _preparation_gate_failure(error)
+            if preserved is not None:
+                raise preserved from None
             raise OperationalSafetyError("Nado preparation gate rejected") from None
         self._preparation_gate_used = True
 
@@ -1608,7 +1655,13 @@ def _persist_runner_failure(
         failure_class = error.failure_class
     else:
         failure_class = _failure_class(error)
-    stage = error.stage if isinstance(error, DurableOperationalFailure) else runner.stage
+    stage = (
+        error.stage
+        if isinstance(error, DurableOperationalFailure)
+        else error.stage
+        if isinstance(error, _PreparationGateFailure)
+        else runner.stage
+    )
     runner.terminalize(failure_class, stage)
     return failure_class, persisted_execute
 

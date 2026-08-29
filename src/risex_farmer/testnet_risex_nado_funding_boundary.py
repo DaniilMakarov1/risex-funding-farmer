@@ -126,6 +126,51 @@ class RisexFundingBoundaryError(CoordinatorSafetyError):
     """Sanitized fail-closed funding-boundary rejection."""
 
 
+_PREPARATION_FAILURE_CODES = frozenset({
+    "STARTUP_FAILED",
+    "STARTUP_INTERRUPTED",
+    "BINDING_MISMATCH",
+    "BARRIER_ABORTED",
+    "NADO_FAILED",
+    "RISEX_FAILED",
+    "ASYMMETRIC_PARTIAL_EXPOSURE",
+    "MANUAL_RECOVERY_REQUIRED",
+    "CLOSE_FAILED",
+})
+_PREPARATION_FAILURE_CLASS = "SAFETY"
+_PREPARATION_FAILURE_STAGE = "ENTRY_PREPARATION"
+
+
+class _PreparationGateFailure(RisexFundingBoundaryError):
+    """Sanitized allowlisted failure from the owner preparation barrier."""
+
+    def __init__(self, code: str) -> None:
+        if type(code) is not str or code not in _PREPARATION_FAILURE_CODES:
+            raise ValueError("unsupported preparation failure")
+        self.code = code
+        self.failure_class = _PREPARATION_FAILURE_CLASS
+        self.stage = _PREPARATION_FAILURE_STAGE
+        super().__init__(code)
+
+
+def _preparation_gate_failure(error: object) -> tuple[str, str, str] | None:
+    """Accept only the fixed code/class/stage tuple from the owner barrier."""
+    try:
+        code = getattr(error, "code", None)
+        failure_class = getattr(error, "failure_class", None)
+        stage = getattr(error, "stage", None)
+    except BaseException:
+        return None
+    if (
+        type(code) is not str
+        or code not in _PREPARATION_FAILURE_CODES
+        or failure_class != _PREPARATION_FAILURE_CLASS
+        or stage != _PREPARATION_FAILURE_STAGE
+    ):
+        return None
+    return code, _PREPARATION_FAILURE_CLASS, _PREPARATION_FAILURE_STAGE
+
+
 class FundingBoundaryResult(str, Enum):
     COMPLETE = "COMPLETE"
     BLOCKED = "BLOCKED"
@@ -765,7 +810,10 @@ class RisexFundingBoundaryCoordinator(TwoAccountCoordinator):
                 )
         except RisexFundingBoundaryError:
             raise
-        except BaseException:
+        except BaseException as error:
+            preserved = _preparation_gate_failure(error)
+            if preserved is not None:
+                raise _PreparationGateFailure(preserved[0]) from None
             raise RisexFundingBoundaryError(
                 "RISEx preparation gate rejected"
             ) from None
