@@ -1923,10 +1923,155 @@ async def test_nonflat_public_barrier_b_blocks_after_private_observation(tmp_pat
         transport_factory=lambda: SyntheticTransport(calls, public_mutator=mutate),
     ))
     assert report.result is Result.BLOCKED
+    assert report.reason == "validation_failed"
+    assert report.failure_class == "SAFETY"
+    assert report.failure_stage == "PUBLIC_B_VALIDATION"
     assert calls.count("sign") == 1
     assert report.barrier_b_fingerprint is None
     assert report.counters["public_b_09"] == {"attempts": 1, "completions": 1}
     assert report.counters["final_agreement"] == {"attempts": 0, "completions": 0}
+    persisted = (tmp_path / "fixture.sqlite3").read_bytes().decode("latin1")
+    assert "validation_failed|SAFETY|PUBLIC_B_VALIDATION" in persisted
+
+    restarted = await _run_fixture(dependencies(
+        tmp_path,
+        [],
+        source_factory=lambda: (_ for _ in ()).throw(AssertionError("source")),
+        transport_factory=lambda: (_ for _ in ()).throw(AssertionError("transport")),
+    ))
+    assert restarted == report
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mutation", "expected_class"),
+    (
+        ("schema", "SCHEMA"),
+        ("identity", "IDENTITY"),
+        ("auth", "AUTH"),
+    ),
+)
+async def test_public_b_validation_failure_classes_are_fixed_and_redacted(
+    tmp_path, mutation, expected_class,
+):
+    calls: list[str] = []
+
+    def mutate(round_name, path, body):
+        if round_name != "b":
+            return
+        if mutation == "schema" and path == "/v1/markets":
+            body["data"]["markets"][0].pop("display_name")
+        elif mutation == "identity" and path == "/v1/orderbook":
+            body["data"]["market_id"] = "999"
+        elif mutation == "auth" and path == "/v1/auth/session-key-status":
+            body["data"]["status"] = 0
+
+    report = await _run_fixture(dependencies(
+        tmp_path,
+        calls,
+        transport_factory=lambda: SyntheticTransport(
+            calls, public_mutator=mutate,
+        ),
+    ))
+
+    assert report.result is Result.BLOCKED
+    assert report.reason == "validation_failed"
+    assert report.failure_class == expected_class
+    assert report.failure_stage == "PUBLIC_B_VALIDATION"
+    assert report.barrier_b_fingerprint is None
+    assert report.counters["public_b_09"] == {
+        "attempts": 1, "completions": 1,
+    }
+    assert report.counters["final_agreement"] == {
+        "attempts": 0, "completions": 0,
+    }
+    assert report.as_dict()["failure_class"] == expected_class
+    assert report.as_dict()["failure_stage"] == "PUBLIC_B_VALIDATION"
+
+
+@pytest.mark.asyncio
+async def test_public_b_unknown_validation_failure_defaults_to_safety_without_leak(
+    tmp_path, monkeypatch,
+):
+    calls: list[str] = []
+    secret = "public-b-validation-secret"
+    original = PrivateReadPreflight._validate_sweep
+    count = 0
+
+    def fail_only_b(instance, values):
+        nonlocal count
+        count += 1
+        if count == 2:
+            raise RuntimeError(secret)
+        return original(instance, values)
+
+    monkeypatch.setattr(PrivateReadPreflight, "_validate_sweep", fail_only_b)
+    report = await _run_fixture(dependencies(tmp_path, calls))
+
+    assert report.result is Result.BLOCKED
+    assert report.reason == "validation_failed"
+    assert report.failure_class == "SAFETY"
+    assert report.failure_stage == "PUBLIC_B_VALIDATION"
+    serialized = json.dumps(report.as_dict(), sort_keys=True)
+    persisted = (tmp_path / "fixture.sqlite3").read_bytes().decode("latin1")
+    assert secret not in serialized and secret not in persisted
+
+
+@pytest.mark.parametrize(
+    ("error_factory", "expected_class"),
+    (
+        (
+            lambda: operational.aiohttp.ClientResponseError(None, ()),
+            "HTTP",
+        ),
+        (
+            lambda: operational.aiohttp.ClientPayloadError("transport secret"),
+            "TRANSPORT",
+        ),
+        (lambda: asyncio.TimeoutError("timeout secret"), "TRANSPORT"),
+    ),
+)
+def test_public_b_classifier_keeps_http_and_transport_classes_fixed(
+    error_factory, expected_class,
+):
+    assert operational._public_b_failure_class(error_factory()) == expected_class
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response_mutation", ("status", "transport"))
+async def test_public_b_request_failure_is_before_completion_and_has_no_post_b_provenance(
+    tmp_path, response_mutation,
+):
+    calls: list[str] = []
+
+    class FailingTransport(SyntheticTransport):
+        async def public_get(self, index: int) -> HttpResponse:
+            if self._public_index == len(PrivateReadPreflight._REQUESTS):
+                if response_mutation == "transport":
+                    raise RuntimeError("transport secret")
+                response = await super().public_get(index)
+                return HttpResponse(
+                    503, response.final_url, response.body,
+                    response.observed_at, response.redirected,
+                )
+            return await super().public_get(index)
+
+    report = await _run_fixture(dependencies(
+        tmp_path,
+        calls,
+        transport_factory=lambda: FailingTransport(calls),
+    ))
+
+    assert report.result is Result.UNKNOWN
+    assert report.reason == "validation_failed"
+    assert report.failure_class is None
+    assert report.failure_stage is None
+    assert report.counters["public_b_01"] == {
+        "attempts": 1, "completions": 0,
+    }
+    assert report.counters["final_agreement"] == {
+        "attempts": 0, "completions": 0,
+    }
 
 
 @pytest.mark.asyncio

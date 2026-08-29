@@ -121,6 +121,12 @@ _COUNTER_NAMES = (
     "terminal_persist",
 )
 _TERMINAL_STATES = frozenset({"PASSED", "BLOCKED", "UNKNOWN"})
+_FAILURE_CLASSES = frozenset({
+    "TRANSPORT", "HTTP", "SCHEMA", "AUTH", "IDENTITY", "SAFETY",
+})
+_PUBLIC_B_FAILURE_STAGES = frozenset({
+    "PUBLIC_B_VALIDATION", "PUBLIC_B_FRESHNESS", "PUBLIC_B_FINGERPRINT",
+})
 _REASON_VALUES = frozenset({
     "complete",
     "validation_failed",
@@ -147,6 +153,47 @@ _REASON_VALUES = frozenset({
     "positions_snapshot_schema_invalid",
     "positions_not_flat",
     "positions_stale",
+})
+_PUBLIC_B_SCHEMA_ERRORS = frozenset({
+    "invalid schema",
+    "invalid decimal",
+    "invalid nonnegative decimal",
+    "invalid unsigned integer",
+    "invalid address",
+    "invalid time scalar",
+    "invalid timestamp",
+    "invalid market cache time",
+    "market field type mismatch",
+    "invalid market time",
+    "invalid order count",
+    "invalid book grid",
+    "empty book",
+    "book total mismatch",
+})
+_PUBLIC_B_AUTH_ERRORS = frozenset({
+    "signer inactive",
+    "signer outside active interval",
+})
+_PUBLIC_B_IDENTITY_ERRORS = frozenset({
+    "config mismatch",
+    "domain mismatch",
+    "signer mismatch",
+    "market mismatch",
+    "book identity mismatch",
+})
+_PUBLIC_B_SAFETY_ERRORS = frozenset({
+    "unordered book",
+    "crossed book",
+    "notional cap",
+    "insufficient bounded depth",
+    "open orders",
+    "nonflat point position",
+    "nonflat positions",
+    "negative market field",
+    "nonpositive market field",
+    "nonpositive market config",
+    "fingerprint rejected",
+    "public barrier stale",
 })
 _LEDGER_SCHEMA = (
     "CREATE TABLE run ("
@@ -209,6 +256,8 @@ class OperationalReport:
     positions_channel_class: str | None
     positions_type_class: str | None
     positions_status_class: str | None
+    failure_class: str | None = None
+    failure_stage: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -221,6 +270,8 @@ class OperationalReport:
             "barrier_a_fingerprint": self.barrier_a_fingerprint,
             "barrier_b_fingerprint": self.barrier_b_fingerprint,
             "reason": self.reason,
+            "failure_class": self.failure_class,
+            "failure_stage": self.failure_stage,
             "auth_v2_shape": self.auth_v2_shape,
             "auth_v2_shape_sha256": self.auth_v2_shape_sha256,
             "positions_schema_classifier": self.positions_schema_classifier,
@@ -235,6 +286,56 @@ class OperationalReport:
 
 class _StoreRejected(Exception):
     pass
+
+
+class _PublicBFailure(Exception):
+    """Fixed post-response public-B provenance; never carries raw details."""
+
+    def __init__(self, failure_class: str, stage: str) -> None:
+        if failure_class not in _FAILURE_CLASSES:
+            raise ValueError("public-B failure class")
+        if stage not in _PUBLIC_B_FAILURE_STAGES:
+            raise ValueError("public-B failure stage")
+        self.failure_class = failure_class
+        self.stage = stage
+        super().__init__(failure_class)
+
+
+def _reason_parts(value: Any) -> tuple[str, str | None, str | None]:
+    """Decode only the bounded reason vocabulary stored in the ledger."""
+    if type(value) is not str:
+        raise ValueError("reason")
+    if value in _REASON_VALUES:
+        return value, None, None
+    parts = value.split("|")
+    if (
+        len(parts) == 3
+        and parts[0] == "validation_failed"
+        and parts[1] in _FAILURE_CLASSES
+        and parts[2] in _PUBLIC_B_FAILURE_STAGES
+    ):
+        return parts[0], parts[1], parts[2]
+    raise ValueError("reason")
+
+
+def _stored_reason(
+    reason: str,
+    failure_class: str | None,
+    failure_stage: str | None,
+) -> str:
+    if reason not in _REASON_VALUES:
+        raise ValueError("reason")
+    if (failure_class is None) != (failure_stage is None):
+        raise ValueError("failure provenance")
+    if failure_class is None:
+        return reason
+    if (
+        reason != "validation_failed"
+        or failure_class not in _FAILURE_CLASSES
+        or failure_stage not in _PUBLIC_B_FAILURE_STAGES
+    ):
+        raise ValueError("failure provenance")
+    return f"{reason}|{failure_class}|{failure_stage}"
 
 
 class _AuthV2Failure(Exception):
@@ -521,6 +622,13 @@ class DurableCounterLedger:
 
     def _validate_run(self, invocation_id: str) -> None:
         row = self._row(invocation_id)
+        try:
+            reason, failure_class, failure_stage = (
+                (None, None, None)
+                if row[8] is None else _reason_parts(row[8])
+            )
+        except ValueError:
+            raise ValueError("reason") from None
         if (
             row[0] != SCHEMA_VERSION
             or row[1] != invocation_id
@@ -532,7 +640,6 @@ class DurableCounterLedger:
             or (row[7] is not None and (
                 type(row[7]) is not int or not row[6] <= row[7] < 2 ** 63
             ))
-            or (row[8] is not None and row[8] not in _REASON_VALUES)
             or (row[3] in _TERMINAL_STATES) != (row[7] is not None and row[8] is not None)
             or ((row[9] is None) != (row[10] is None))
             or (
@@ -567,18 +674,33 @@ class DurableCounterLedger:
                 or completions > attempts
             ):
                 raise ValueError("counter")
+        private_complete = all(
+            counters[name] == (1, 1) for name in _PRIVATE_COUNTERS
+        )
+        public_b_complete = all(
+            counters[name] == (1, 1) for name in _PUBLIC_B_COUNTERS
+        )
         stage = _reachable_stage(row, counters)
         if stage is None:
             raise ValueError("counter state")
+        if failure_class is not None and not (
+            row[3] in {"BLOCKED", "UNKNOWN"}
+            and row[4] is not None
+            and row[5] is None
+            and private_complete
+            and public_b_complete
+            and counters["final_agreement"] == (0, 0)
+        ):
+            raise ValueError("failure provenance stage")
         terminal = row[3] in _TERMINAL_STATES
         terminal_counter = counters["terminal_persist"]
         auth_shape_present = row[9] is not None
         positions_shape_present = row[11] is not None
         if terminal:
-            if auth_shape_present != (row[8] == "auth_v2_schema_invalid"):
+            if auth_shape_present != (reason == "auth_v2_schema_invalid"):
                 raise ValueError("auth_v2 shape terminal")
             if positions_shape_present != (
-                row[8] == "positions_snapshot_schema_invalid"
+                reason == "positions_snapshot_schema_invalid"
             ):
                 raise ValueError("positions shape terminal")
         elif auth_shape_present and not (
@@ -611,7 +733,7 @@ class DurableCounterLedger:
         ):
             raise ValueError("passed invariant")
         if row[3] == "BLOCKED" and (
-            row[8] not in {"validation_failed", "lifecycle_not_clear_safety"}
+            reason not in {"validation_failed", "lifecycle_not_clear_safety"}
             or all(
                 counters[name] == (1, 1)
                 for name in _COUNTER_NAMES
@@ -619,7 +741,7 @@ class DurableCounterLedger:
             )
         ):
             raise ValueError("blocked invariant")
-        if row[3] == "UNKNOWN" and row[8] not in {
+        if row[3] == "UNKNOWN" and reason not in {
             "validation_failed", "cancelled", "interrupted_nonterminal",
             "auth_v2_timeout", "auth_v2_close", "auth_v2_binary",
             "auth_v2_malformed", "auth_v2_schema_invalid", "auth_v2_error",
@@ -799,6 +921,9 @@ class DurableCounterLedger:
         result: Result,
         reason: str,
         crash_hook: Callable[[str, str], None] | None = None,
+        *,
+        failure_class: str | None = None,
+        failure_stage: str | None = None,
     ) -> OperationalReport:
         if result.value not in _TERMINAL_STATES or reason not in _REASON_VALUES:
             raise ValueError("terminal")
@@ -835,6 +960,7 @@ class DurableCounterLedger:
         ):
             result = Result.UNKNOWN
             reason = "validation_failed"
+        stored_reason = _stored_reason(reason, failure_class, failure_stage)
         attempts, completions = self._counter_rows()["terminal_persist"]
         if attempts == 0:
             self.attempt("terminal_persist")
@@ -874,7 +1000,7 @@ class DurableCounterLedger:
                 "?='positions_snapshot_schema_invalid' "
                 "THEN positions_status_class ELSE NULL END WHERE invocation_id=?",
                 (
-                    result.value, time.time_ns(), reason, reason, reason,
+                    result.value, time.time_ns(), stored_reason, reason, reason,
                     reason, reason, reason, reason, reason, reason, reason,
                     self.invocation_id,
                 ),
@@ -894,6 +1020,7 @@ class DurableCounterLedger:
         state = str(row[3])
         if state not in _TERMINAL_STATES:
             raise ValueError("nonterminal")
+        reason, failure_class, failure_stage = _reason_parts(row[8])
         return OperationalReport(
             schema_version=SCHEMA_VERSION,
             result=Result(state),
@@ -906,7 +1033,7 @@ class DurableCounterLedger:
             },
             barrier_a_fingerprint=row[4],
             barrier_b_fingerprint=row[5],
-            reason=str(row[8]),
+            reason=reason,
             auth_v2_shape=None if row[9] is None else str(row[9]),
             auth_v2_shape_sha256=None if row[10] is None else str(row[10]),
             positions_schema_classifier=None if row[11] is None else str(row[11]),
@@ -916,6 +1043,8 @@ class DurableCounterLedger:
             positions_channel_class=None if row[15] is None else str(row[15]),
             positions_type_class=None if row[16] is None else str(row[16]),
             positions_status_class=None if row[17] is None else str(row[17]),
+            failure_class=failure_class,
+            failure_stage=failure_stage,
         )
 
     def close(self) -> None:
@@ -1715,6 +1844,32 @@ def _none(value: Any) -> None:
     return None
 
 
+def _public_b_failure_class(error: BaseException) -> str:
+    """Map only fixed local outcomes to the bounded public-B vocabulary."""
+    if isinstance(error, aiohttp.ClientResponseError):
+        return "HTTP"
+    if isinstance(
+        error,
+        (aiohttp.ClientConnectionError, asyncio.TimeoutError, ConnectionError),
+    ):
+        return "TRANSPORT"
+    if isinstance(error, aiohttp.ClientError):
+        return "TRANSPORT"
+    if type(error) in {KeyError, TypeError, IndexError}:
+        return "SCHEMA"
+    if type(error) is ValueError:
+        message = str(error)
+        if message in _PUBLIC_B_SCHEMA_ERRORS:
+            return "SCHEMA"
+        if message in _PUBLIC_B_AUTH_ERRORS:
+            return "AUTH"
+        if message in _PUBLIC_B_IDENTITY_ERRORS:
+            return "IDENTITY"
+        if message in _PUBLIC_B_SAFETY_ERRORS:
+            return "SAFETY"
+    return "SAFETY"
+
+
 async def _public_barrier(
     ledger: DurableCounterLedger,
     validator: PrivateReadPreflight,
@@ -1743,17 +1898,38 @@ async def _public_barrier(
         assert raw_response is not None
         observations.append(raw_response.observed_at)
         responses[path] = response
-    validated_sweep = validator._validate_sweep(responses)
-    finished_at = validator._now()
-    if any(
-        finished_at - observed_at < 0
-        or finished_at - observed_at > MAX_AGE_SECONDS
-        for observed_at in observations
-    ):
-        raise ValueError("public barrier stale")
-    fingerprint = _public_fingerprint(validated_sweep)
-    if not _fingerprint(fingerprint):
-        raise ValueError("fingerprint rejected")
+    try:
+        validated_sweep = validator._validate_sweep(responses)
+    except Exception as error:
+        if prefix == "b":
+            raise _PublicBFailure(
+                _public_b_failure_class(error), "PUBLIC_B_VALIDATION",
+            ) from None
+        raise
+    try:
+        finished_at = validator._now()
+        if any(
+            finished_at - observed_at < 0
+            or finished_at - observed_at > MAX_AGE_SECONDS
+            for observed_at in observations
+        ):
+            raise ValueError("public barrier stale")
+    except Exception as error:
+        if prefix == "b":
+            raise _PublicBFailure(
+                _public_b_failure_class(error), "PUBLIC_B_FRESHNESS",
+            ) from None
+        raise
+    try:
+        fingerprint = _public_fingerprint(validated_sweep)
+        if not _fingerprint(fingerprint):
+            raise ValueError("fingerprint rejected")
+    except Exception as error:
+        if prefix == "b":
+            raise _PublicBFailure(
+                _public_b_failure_class(error), "PUBLIC_B_FINGERPRINT",
+            ) from None
+        raise
     return fingerprint
 
 
@@ -2112,6 +2288,8 @@ async def _run(dependencies: _Dependencies) -> OperationalReport:
             return ledger.finalize(Result.UNKNOWN, "interrupted_nonterminal")
         result = Result.UNKNOWN
         reason = "validation_failed"
+        failure_class: str | None = None
+        failure_stage: str | None = None
         abrupt = False
         try:
             if dependencies.lifecycle_clear() is not True:
@@ -2135,6 +2313,11 @@ async def _run(dependencies: _Dependencies) -> OperationalReport:
         except _PositionsFailure as failure:
             result = Result.UNKNOWN
             reason = failure.reason
+        except _PublicBFailure as failure:
+            result = Result.UNKNOWN if ledger.has_mismatch() else Result.BLOCKED
+            reason = "validation_failed"
+            failure_class = failure.failure_class
+            failure_stage = failure.stage
         except Exception:
             result = Result.UNKNOWN if ledger.has_mismatch() else Result.BLOCKED
             reason = "validation_failed"
@@ -2145,13 +2328,23 @@ async def _run(dependencies: _Dependencies) -> OperationalReport:
                 except Exception:
                     result = Result.UNKNOWN
                     reason = "validation_failed"
+                    failure_class = None
+                    failure_stage = None
             if transport is not None and not abrupt:
                 try:
                     await _maybe_await(transport.close())
                 except Exception:
                     result = Result.UNKNOWN
                     reason = "validation_failed"
-        return ledger.finalize(result, reason, dependencies.crash_hook)
+                    failure_class = None
+                    failure_stage = None
+        return ledger.finalize(
+            result,
+            reason,
+            dependencies.crash_hook,
+            failure_class=failure_class,
+            failure_stage=failure_stage,
+        )
     finally:
         ledger.close()
 
