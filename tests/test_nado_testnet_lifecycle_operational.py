@@ -1974,17 +1974,17 @@ def test_funding_entrypoint_isolated_store_never_falls_back_to_historical_store(
         store.close()
 
 
-def test_funding_boundary_store_v5_cannot_alias_historical_v1_v2_v3_or_v4_path_or_identity(
+def test_funding_boundary_store_v6_cannot_alias_historical_v1_v2_v3_v4_or_v5_path_or_identity(
     tmp_path: Path,
 ) -> None:
     historical_paths = tuple(
         tmp_path / f".risex-funding-farmer-nado-funding-boundary-eth-{version}.sqlite3"
-        for version in ("v1", "v2", "v3", "v4")
+        for version in ("v1", "v2", "v3", "v4", "v5")
     )
     fresh_path = tmp_path / FUNDING_BOUNDARY_RUN_STORE_BASENAME
 
     assert FUNDING_BOUNDARY_RUN_STORE_BASENAME == (
-        ".risex-funding-farmer-nado-funding-boundary-eth-v5.sqlite3"
+        ".risex-funding-farmer-nado-funding-boundary-eth-v6.sqlite3"
     )
     assert all(fresh_path != path for path in historical_paths)
     assert all(
@@ -1993,7 +1993,7 @@ def test_funding_boundary_store_v5_cannot_alias_historical_v1_v2_v3_or_v4_path_o
     )
     assert all(
         f"-{version}.sqlite3" not in FUNDING_BOUNDARY_RUN_STORE_BASENAME
-        for version in ("v1", "v2", "v3", "v4")
+        for version in ("v1", "v2", "v3", "v4", "v5")
     )
 
 
