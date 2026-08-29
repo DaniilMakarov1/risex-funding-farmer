@@ -25,11 +25,11 @@ Observed correction slice:
 - One fresh visible Builder must reproduce and correct only the live activation/refresh coordination defect. The correction must retain the shared logical scan timestamp invariant, deterministic ranking/route lock, exact activation/cutoff semantics, overlay separation, no stale-plan activation, and default-zero behavior. Add a cancellation/rescheduling adverse regression matching the observed FULL/focused overlap, then run focused/adverse and one clean Python 3.11 full suite. Do not resume the failed database or start another six-hour window before independent Chief acceptance.
 - Accepted main `9dad61d00af422598e1f9280ddf30bb3e286b51c` satisfies the activation-race correction and the additional stale-fill interleaving found in Chief review. Fresh validation `mainnet-shadow-synthetic-all-routes-20260829-chief21-activation-validation.db` crossed the `22:00Z` activation/cutoff segment with two coherent activations and safe cancellations, no stale fill, disconnect, blocker, or fatal, then reached `STOPPED_SAFE` with integrity `ok`, zero active orders, fills, positions, and funding settlements. Preserve and never resume it. Replacement `mainnet-shadow-synthetic-all-routes-20260829-chief22-6h.db` then failed early after 21 scans: after the completed `22:42:20Z` cycle its cadence task emitted none of the next three scheduled deadline, blocked, or fatal records although the process remained live. Chief stopped it safely at `22:48:53Z`; integrity is `ok` and orders/fills/positions/funding are all zero. Preserve and never resume it. Accepted main `d88cd4562c28a0fa0e069ee78cae55e2e0034f36` now durably fails closed on an unexpected scheduled-tick exception or cancellation and preserves safe intentional-stop cancellation; independent Chief verification passed `187` focused/adjacent and `2699` full-suite tests with `3` skipped. Fresh six-hour public-only PAPER runtime `mainnet-shadow-synthetic-all-routes-20260829-chief23-6h.db` reached durable `PAPER_RUN_READY` at `2026-08-28T23:16:16.325570Z`, crossed six hourly public funding boundaries, and reached `STOPPED_SAFE` at `2026-08-29T05:24:56.242008Z`. It completed `377` scans; both route groups were evaluated, `21` raw-positive evaluations occurred across `12` scans, and the exact `$0.50` overlay produced `15,276` adjusted-positive evaluations across `376` scans. All `20` Extended PAPER entries cancelled safely; Nado produced no entry; fills, positions, funding settlements, and completed trades remained zero. SQLite integrity is `ok`, blocked/fatal events are zero, disconnect/reconnect counts agree at `10/10`, and actual PnL/funding/fees remained exactly zero without overlay contamination. Preserve and never resume the database. The sanitized report `mainnet-shadow-synthetic-all-routes-20260829-chief23-6h-report.json` remains untracked. The synthetic experiment is complete; do not start another PAPER runtime under this authorization. Resume only the separately authorized testnet funding-boundary objective when its recorded venue-specific blockers are independently cleared.
 
-## Two-route testnet funding-boundary lifecycles
+## Final RISEx–Nado testnet funding-boundary lifecycle
 
-Status: `BLOCKED — RISEX–NADO V6 FAILED BEFORE FUNDING AND WAS RECOVERED AUTHORITATIVELY FLAT; EXTENDED HAS NO EXECUTABLE ASK AND A STALE FUNDING TIMESTAMP; NO WRITE IN FLIGHT`.
+Status: `AUTHORIZED READ GATE — ONE FINAL V11 RISEX–NADO LIFECYCLE ONLY AFTER EXACT FUNDING-SPECIFIC AGREEMENT; RISEX–EXTENDED TESTNET WAIT ENDED; NO WRITE IN FLIGHT`.
 
-Objective: prove how the accepted system behaves before, during, and after an actual testnet funding settlement on exactly two hedged routes: one RISEx–Nado route and one RISEx–Extended route. Open the smallest venue-executable matched testnet positions, observe and reconcile actual venue funding semantics at the boundary, then close every leg to authoritative zero relevant orders and exact flatness.
+Objective: run at most one final bounded v11 RISEx–Nado lifecycle solely to verify the accepted progression/orchestration correction. Open the smallest venue-executable matched testnet positions only after exact read-gate agreement, observe and reconcile actual venue funding semantics at the boundary, then close every leg to authoritative zero relevant orders and exact flatness. RISEx–Extended testnet execution is no longer an active objective.
 
 Exact starting point:
 
@@ -67,6 +67,8 @@ Exact starting point:
 - Accepted published main `5303c2927d712e2465f13e0c2ce033c00cf622ca` adds immutable digested activation plus closed-world durable Nado progression evidence and preserves the documented non-cancelling continued-retrieval timeout contract. Independent Chief verification passed `198` focused/adverse tests and the clean Python 3.11 full suite with `2819` passed and `3` skipped; frozen v10 legacy readability was verified on a byte-copy with no hash change. v10 remains failed and permanently frozen.
 - Accepted published main `81e6f48a1e45b5239fa4387866d05425d98db528` rotates only the frozen v10 Nado and two RISEx funding-boundary identities to unused v11 names, rejects v1 through v10 as active, and preserves distinct RISEx domains. Independent Chief verification passed `3` exact identity tests, `215` affected-module tests, and the clean Python 3.11 full suite with `2819` passed and `3` skipped. All v11 stores remain absent.
 - Fresh generic v11 prerequisite gates passed: RISEx `risex-read-16ecb9e07418d0acb7b3709b385eca6a` is `PASSED`; Nado `nado-read-e1a4471032ebebec45afba07b7101c09` is `FINALIZED` on 94 products. Current bounded slice: collect two independent funding-specific read-only rounds. Require exact fixed identities, zero relevant/unrelated/trigger/isolated orders, exact flatness, positive collateral, product/market/quantity agreement, executable two-sided liquidity, stable Nado funding high-water/cumulative state, and a fresh authoritative future RISEx schedule. Also validate the owner-wrapper contract without starting a lifecycle: a non-terminal orchestration timeout must be caught and followed by continued retrieval in-process rather than process exit. Do not create a v11 lifecycle store, prepare/sign/dispatch an order, or perform any venue write. Only exact agreement may open one separately bounded future v11 Level-C owner run; any transport/semantic/identity/safety failure follows the existing Level-B retry/terminal rules. Extended remains read-only and blocked on absent executable ask-side liquidity and a fresh authoritative funding schedule.
+- The user authorizes exactly one final v11 Level-C owner run if and only if those read-only and wrapper gates pass exactly. It exists solely to verify the accepted progression/orchestration correction. Missing or contradictory funding remains `BLOCKED`, never zero; actual zero or negative funding is valid only when authoritative. If the run fails or testnet quality cannot prove the boundary, preserve the exact blocker, flatten through the accepted sequential reduce-only paths when exposure exists, prove two agreeing terminal rounds, freeze v11, and stop this slice without another lifecycle or identity rotation.
+- Stop waiting for RISEx–Extended testnet ask-side liquidity. No further Extended testnet write is authorized by this task; current work moves to the separately bounded public-mainnet evidence and offline Level-D readiness slice below.
 
 Corrected Nado funding evidence gate:
 
@@ -75,12 +77,11 @@ Corrected Nado funding evidence gate:
 - After authoritative exposure through the target boundary, query bounded complete account-history pages strictly after the persisted high-water mark and require a newly attributable funding row for the exact subaccount/product/boundary. Bind it to the public event through product, boundary interval, before/after cumulative state, and official rate/payment semantics; use account `amount` as individual cash. Missing or contradictory post-boundary account evidence is `BLOCKED`, never zero, but must not prevent the accepted reduce-only close and terminal flat reconciliation.
 - The live adapter must remain venue-local, use the official Nado SDK/contract first, perform no write during implementation or acceptance, and preserve the existing durable identity, no-replay, opposite-direction, exact-quantity, applied-only completion, and two-round terminal barriers.
 
-Authorized routes:
+Authorized testnet route:
 
 1. One testnet `RISEx–Nado` matched route.
-2. One testnet `RISEx–Extended` matched route.
 
-The new Chief must discover currently tradable common testnet markets, authoritative funding schedules, minimum quantities, and account state before choosing assets or directions. Prefer distinct RISEx markets when both routes overlap in time so venue-level netting cannot make route attribution ambiguous. If safe isolation or a common funding window cannot be proven, run the two routes sequentially across their next actual boundaries rather than combining ambiguous exposure.
+The new Chief must rediscover the current common testnet market, authoritative funding schedule, minimum quantity, and account state before the single final attempt. If safe isolation cannot be proven, do not dispatch.
 
 Allowed scope:
 
@@ -108,7 +109,31 @@ Forbidden scope:
 
 Completion:
 
-Both authorized routes must independently finish with authoritative funding-boundary evidence, zero relevant orders, and exact flatness. Actual zero/negative funding or a venue-proven non-accrual is valid evidence only when eligibility and exposure are authoritative. Even two successful testnet lifecycles do not authorize mainnet Level D, real funds, or production strategy execution.
+This slice ends after the one final v11 attempt, whether it completes or produces one precise blocker. Acceptance requires authoritative funding-boundary evidence, zero relevant orders, exact flatness, and no unrelated state. Actual zero/negative funding or a venue-proven non-accrual is valid evidence only when eligibility and exposure are authoritative. A successful testnet lifecycle does not authorize mainnet credentials, real funds, or production strategy execution.
+
+## RISEx–Extended Level-D readiness preparation
+
+Status: `AUTHORIZED OFFLINE/READ-ONLY — PUBLIC MAINNET EVIDENCE PASSED FOR BTC LIQUIDITY/MINIMUMS/SCHEDULE; EXACT RISEX ACCOUNT FEE AND ALL PRIVATE/WRITE GATES REMAIN CLOSED`.
+
+Objective: prepare one isolated manual bounded RISEx–Extended mainnet-readiness path so that a later separately authorized operation requires only protected locally provisioned identities/credentials, user-approved absolute deposit and maximum-loss caps, exact account-scoped fee/read evidence, and one explicit dispatch approval.
+
+Accepted public evidence at `2026-08-29T18:50:56Z`:
+
+- RISEx BTC/USDC: minimum `0.00015`, step `0.000001`, tick `0.1`, BBO `78226.1/78226.2`, about `$27.1m` 24h quote volume, hourly funding interval, and next boundary `2026-08-29T19:00:00Z`.
+- Extended BTC-USD: active non-RFQ crypto perpetual, minimum `0.0001`, step `0.00001`, tick `1`, BBO `78210/78211`, about `$40.5m` daily volume, hourly funding cadence, and the same next boundary. The smallest common step-aligned quantity is `0.00015 BTC`, with ample displayed depth at observation.
+- Public applied histories on both venues contain fresh consecutive hourly records. Extended documents maker `0` and taker `0.00025`; RISEx current fees are account-scoped behind JWT and remain an explicit future private-read blocker. Do not substitute paper fee assumptions.
+- Public reconciliation contracts are identified, but Level D requires future authenticated exact-order/open-order/history/trade/position/funding/fee reads and Extended private WebSocket account ingress. The testnet REST-only Extended fallback is forbidden for a mainnet readiness claim.
+
+Builder slice:
+
+- One fresh visible Extended-lane GPT-5.6 Luna-max Builder from exact published `main` may add only a route-specific offline/read-only readiness module, focused/adverse fixtures/tests, and a fixed local interactive secret-provisioning interface for separately created RISEx and Extended mainnet identities. It must not import the testnet runners as a mainnet engine, create signing payloads, sign, prepare orders, dispatch, call private endpoints, move funds, or add a generic OMS/execution framework.
+- The readiness gate must fail closed unless: exact separate account identities; protected fixed-path secret files with mode `0600`, no symlink/hardlink and no task/argument/log/DB/report persistence; explicit positive user-approved absolute deposit and maximum-loss caps; `maximum_loss <= deposit_cap`; smallest current common executable quantity within both caps; opposite directions; no own counterparty/self-trade; fresh durable runtime and per-dispatch identities; sequential writes; authoritative fee/minimum/schedule/private-stream readiness; exact entry/order/fill/position and before/at/after funding reconciliation; accepted reduce-only close; two agreeing terminal rounds; zero relevant/trigger orders; exact flatness; and no unrelated state. Missing or contradictory funding is `BLOCKED`; actual zero/negative remains representable.
+- The provisioning interface may be exercised only with synthetic test values during implementation/acceptance. Real mainnet credentials/private access, deposits/bridge/transfers, live payload construction/signing/order preparation/dispatch, positions, funding exposure, withdrawal, and strategy execution remain forbidden. Never request a private key or seed phrase in task/chat.
+
+Acceptance:
+
+- Chief independently reviews exact scope, official contract mapping, secret/redaction/non-persistence adverse tests, cap arithmetic, state transitions, restart/ambiguity barriers, dependency/import/write surfaces, and one clean isolated Python 3.11 full suite on the final SHA before fast-forward integration and push.
+- This slice can produce only `READY_FOR_PROTECTED_PROVISIONING` or a precise blocker. It cannot authorize mainnet credentials or a dispatch. Before any future mainnet operation, the user must explicitly approve concrete venues/accounts, absolute deposit cap, maximum-loss cap, and exactly one dispatch.
 
 ## Parallel bounded public observation and Telegram delivery correction
 
