@@ -1234,6 +1234,69 @@ def nado_funding_exposure_digest(exposure: NadoFundingExposure) -> str:
     return hashlib.sha256(canonical_payload(_nado_exposure_payload(exposure))).hexdigest()
 
 
+_FUNDING_PROGRESSION_REQUIREMENT_FIELD = "progression_requirement"
+_FUNDING_EXPOSURE_STORAGE_KEYS = frozenset({
+    "journal", "owner", "subaccount_name", "product_id", "direction",
+    "signed_position_x18", "route_quantity_x18", "observed_at_ms",
+    "snapshot_id", "cumulative_side", "cumulative_funding_x18",
+    "exposure_digest", "authoritative",
+})
+
+
+def _stored_funding_exposure_payload(
+    exposure: NadoFundingExposure, *, progression_required: bool,
+) -> dict[str, object]:
+    payload = _nado_exposure_payload(exposure) | {
+        "exposure_digest": _hash_text(
+            exposure.exposure_digest, "Nado funding exposure digest"
+        ),
+    }
+    if progression_required:
+        payload[_FUNDING_PROGRESSION_REQUIREMENT_FIELD] = (
+            FUNDING_PROGRESSION_REQUIRED
+        )
+    return payload
+
+
+def _funding_exposure_storage_payload(
+    value: object,
+) -> tuple[dict[str, object], bool]:
+    if type(value) is not dict:
+        raise NadoContractError("Nado funding exposure persistence schema is invalid")
+    keys = set(value)
+    if keys == _FUNDING_EXPOSURE_STORAGE_KEYS:
+        progression_required = False
+    elif keys == _FUNDING_EXPOSURE_STORAGE_KEYS | {
+        _FUNDING_PROGRESSION_REQUIREMENT_FIELD
+    }:
+        requirement = value[_FUNDING_PROGRESSION_REQUIREMENT_FIELD]
+        if type(requirement) is not str or requirement != FUNDING_PROGRESSION_REQUIRED:
+            raise NadoContractError("Nado funding exposure progression marker is invalid")
+        progression_required = True
+    else:
+        raise NadoContractError("Nado funding exposure persistence schema is invalid")
+    return (
+        {key: value[key] for key in _FUNDING_EXPOSURE_STORAGE_KEYS},
+        progression_required,
+    )
+
+
+def _funding_exposure_from_storage_payload(
+    value: object,
+) -> tuple[NadoFundingExposure, bool]:
+    payload, progression_required = _funding_exposure_storage_payload(value)
+    exposure = NadoFundingExposure(
+        _journal_from_payload(payload["journal"]), payload["owner"],
+        payload["subaccount_name"], payload["product_id"], payload["direction"],
+        payload["signed_position_x18"], payload["route_quantity_x18"],
+        payload["observed_at_ms"], payload["snapshot_id"],
+        payload["cumulative_side"], payload["cumulative_funding_x18"],
+        payload["exposure_digest"], payload["authoritative"],
+    )
+    exposure.assert_contract()
+    return exposure, progression_required
+
+
 @dataclass(frozen=True)
 class NadoFundingEvent:
     """Authoritative public product-level hourly funding payment.
@@ -1882,26 +1945,7 @@ def _baseline_from_payload(value: object) -> NadoFundingBaseline:
 
 
 def _exposure_from_payload(value: object) -> NadoFundingExposure:
-    payload = _mapping_payload(
-        value,
-        "Nado funding exposure",
-        {
-            "journal", "owner", "subaccount_name", "product_id", "direction",
-            "signed_position_x18", "route_quantity_x18", "observed_at_ms",
-            "snapshot_id", "cumulative_side", "cumulative_funding_x18",
-            "exposure_digest", "authoritative",
-        },
-    )
-    exposure = NadoFundingExposure(
-        _journal_from_payload(payload["journal"]), payload["owner"],
-        payload["subaccount_name"], payload["product_id"], payload["direction"],
-        payload["signed_position_x18"], payload["route_quantity_x18"],
-        payload["observed_at_ms"], payload["snapshot_id"],
-        payload["cumulative_side"], payload["cumulative_funding_x18"],
-        payload["exposure_digest"], payload["authoritative"],
-    )
-    exposure.assert_contract()
-    return exposure
+    return _funding_exposure_from_storage_payload(value)[0]
 
 
 def _funding_evidence_payload(
@@ -2444,71 +2488,38 @@ class IntentStore:
             ("nado_funding_progression",),
         ).fetchone() is not None
 
-    def _funding_progression_activation_table_exists(self) -> bool:
-        return self._connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
-            ("nado_funding_progression_activation",),
-        ).fetchone() is not None
-
-    def _ensure_funding_progression_activation_schema(self) -> None:
-        expected_columns = {"singleton", "requirement", "binding_digest"}
+    def _funding_exposure_record(
+        self,
+    ) -> tuple[NadoFundingExposure, bool] | None:
         try:
-            self._connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS nado_funding_progression_activation (
-                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                    requirement TEXT NOT NULL,
-                    binding_digest TEXT NOT NULL
-                )
-                """
+            row = self._connection.execute(
+                "SELECT exposure_json, exposure_digest "
+                "FROM nado_funding_exposure WHERE singleton = 1"
+            ).fetchone()
+            if row is None:
+                return None
+            encoded = bytes(row[0])
+            if hashlib.sha256(encoded).hexdigest() != str(row[1]):
+                raise NadoContractError("persisted funding exposure digest is invalid")
+            exposure, progression_required = _funding_exposure_from_storage_payload(
+                json.loads(encoded.decode("ascii"))
             )
-            columns = {
-                str(row[1])
-                for row in self._connection.execute(
-                    "PRAGMA table_info(nado_funding_progression_activation)"
+            if canonical_payload(
+                _stored_funding_exposure_payload(
+                    exposure, progression_required=progression_required,
                 )
-            }
-        except sqlite3.DatabaseError:
-            raise NadoContractError(
-                "funding progression activation schema is unavailable"
-            ) from None
-        if columns != expected_columns:
-            raise NadoContractError(
-                "funding progression activation schema is invalid"
-            )
-
-    def _funding_progression_activation_required(self) -> bool:
-        if not self._funding_progression_activation_table_exists():
-            return False
-        self._ensure_funding_progression_activation_schema()
-        try:
-            rows = self._connection.execute(
-                """
-                SELECT singleton, requirement, binding_digest
-                FROM nado_funding_progression_activation
-                ORDER BY singleton
-                """
-            ).fetchall()
-        except sqlite3.DatabaseError:
-            raise NadoContractError(
-                "funding progression activation could not be read"
-            ) from None
-        if (
-            len(rows) != 1
-            or len(rows[0]) != 3
-            or type(rows[0][0]) is not int
-            or rows[0][0] != 1
-            or type(rows[0][1]) is not str
-            or rows[0][1] != FUNDING_PROGRESSION_REQUIRED
-            or type(rows[0][2]) is not str
+            ) != encoded:
+                raise NadoContractError("persisted funding exposure is not canonical")
+            return exposure, progression_required
+        except (
+            KeyError, UnicodeDecodeError, json.JSONDecodeError,
+            InvalidOperation, TypeError, ValueError,
         ):
-            raise NadoContractError("funding progression activation is invalid")
-        binding = self.funding_boundary_binding()
-        if binding is None or rows[0][2] != _funding_boundary_digest(binding):
-            raise NadoContractError(
-                "funding progression activation binding is invalid"
-            )
-        return True
+            raise NadoContractError("persisted funding exposure is invalid") from None
+
+    def _funding_progression_required(self) -> bool:
+        record = self._funding_exposure_record()
+        return record is not None and record[1]
 
     def _ensure_funding_progression_schema(self) -> None:
         expected_columns = {
@@ -2573,14 +2584,10 @@ class IntentStore:
     def _validate_funding_progression(
         self, *, require_nonempty: bool | None = None,
     ) -> None:
-        activation_required = self._funding_progression_activation_required()
+        progression_required = self._funding_progression_required()
         records = self._funding_progression_rows()
-        if not activation_required and records is not None:
-            raise NadoContractError(
-                "funding progression activation is missing"
-            )
         if records is None:
-            if activation_required:
+            if progression_required:
                 raise NadoContractError("funding progression table is missing")
             # Historical/direct stores predate this table and remain
             # read-only compatible without an in-place schema migration.
@@ -2637,8 +2644,8 @@ class IntentStore:
         binding = self.funding_boundary_binding()
         if binding is None or self.funding_boundary_exposure() is None:
             raise NadoContractError("funding progression requires durable exposure")
-        if not self._funding_progression_activation_required():
-            raise NadoContractError("funding progression activation is missing")
+        if not self._funding_progression_required():
+            raise NadoContractError("funding progression requires tracked exposure")
         if not self._funding_progression_table_exists():
             raise NadoContractError("funding progression schema is unavailable")
         binding_digest = _funding_boundary_digest(binding)
@@ -2815,11 +2822,11 @@ class IntentStore:
             raise NadoContractError(
                 "funding exposure must bind after reconciled entry and before close"
             )
-        encoded = canonical_payload(_nado_exposure_payload(exposure) | {
-            "exposure_digest": _hash_text(
-                exposure.exposure_digest, "Nado funding exposure digest"
-            ),
-        })
+        encoded = canonical_payload(
+            _stored_funding_exposure_payload(
+                exposure, progression_required=track_progression,
+            )
+        )
         digest = hashlib.sha256(encoded).hexdigest()
         try:
             with self._connection:
@@ -2833,10 +2840,6 @@ class IntentStore:
                             "persisted funding exposure is immutable"
                         )
                     if track_progression:
-                        if not self._funding_progression_activation_required():
-                            raise NadoContractError(
-                                "funding progression activation is missing"
-                            )
                         if not self._funding_progression_table_exists():
                             raise NadoContractError(
                                 "funding progression schema is unavailable"
@@ -2844,22 +2847,10 @@ class IntentStore:
                         self._validate_funding_progression()
                     return
                 if track_progression:
-                    # Activation is durable with the exposure row, so an
-                    # interrupted first marker cannot reopen as an untracked
-                    # post-exposure lifecycle.
-                    self._ensure_funding_progression_activation_schema()
+                    # The REQUIRED marker is covered by the immutable
+                    # exposure digest, so an interrupted first marker cannot
+                    # reopen as an untracked post-exposure lifecycle.
                     self._ensure_funding_progression_schema()
-                    self._connection.execute(
-                        """
-                        INSERT INTO nado_funding_progression_activation
-                            (singleton, requirement, binding_digest)
-                        VALUES (1, ?, ?)
-                        """,
-                        (
-                            FUNDING_PROGRESSION_REQUIRED,
-                            _funding_boundary_digest(binding),
-                        ),
-                    )
                 self._connection.execute(
                     "INSERT INTO nado_funding_exposure "
                     "(singleton, exposure_json, exposure_digest) VALUES (1, ?, ?)",
@@ -2926,30 +2917,8 @@ class IntentStore:
             raise NadoContractError("persisted funding baseline is invalid") from None
 
     def funding_boundary_exposure(self) -> NadoFundingExposure | None:
-        row = self._connection.execute(
-            "SELECT exposure_json, exposure_digest FROM nado_funding_exposure "
-            "WHERE singleton = 1"
-        ).fetchone()
-        if row is None:
-            return None
-        try:
-            encoded = bytes(row[0])
-            if hashlib.sha256(encoded).hexdigest() != str(row[1]):
-                raise NadoContractError("persisted funding exposure digest is invalid")
-            exposure = _exposure_from_payload(json.loads(encoded.decode("ascii")))
-            canonical = canonical_payload(_nado_exposure_payload(exposure) | {
-                "exposure_digest": _hash_text(
-                    exposure.exposure_digest, "Nado funding exposure digest"
-                ),
-            })
-            if canonical != encoded:
-                raise NadoContractError("persisted funding exposure is not canonical")
-            return exposure
-        except (
-            KeyError, UnicodeDecodeError, json.JSONDecodeError,
-            InvalidOperation, TypeError, ValueError,
-        ):
-            raise NadoContractError("persisted funding exposure is invalid") from None
+        record = self._funding_exposure_record()
+        return None if record is None else record[0]
 
     def _assert_stored_attestation(
         self,

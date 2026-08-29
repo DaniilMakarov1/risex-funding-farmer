@@ -4,6 +4,7 @@ from dataclasses import replace
 import asyncio
 import brotli
 import gzip
+import hashlib
 import importlib
 import inspect
 import json
@@ -2214,13 +2215,22 @@ def test_funding_runner_persists_and_reopens_closed_world_progression(
                 (3, FUNDING_PROGRESSION_ACCOUNT_HISTORY_READ_STARTED, None),
                 (4, FUNDING_PROGRESSION_ACCOUNT_HISTORY_READ_COMPLETED, None),
             ]
-            activation = connection.execute(
-                "SELECT requirement, binding_digest "
-                "FROM nado_funding_progression_activation"
+            exposure_row = connection.execute(
+                "SELECT exposure_json, exposure_digest "
+                "FROM nado_funding_exposure WHERE singleton = 1"
             ).fetchone()
-            assert activation is not None
-            assert activation[0] == FUNDING_PROGRESSION_REQUIRED
-            assert type(activation[1]) is str and len(activation[1]) == 64
+            assert exposure_row is not None
+            exposure_encoded = bytes(exposure_row[0])
+            exposure_payload = json.loads(exposure_encoded.decode("ascii"))
+            assert exposure_payload["progression_requirement"] == (
+                FUNDING_PROGRESSION_REQUIRED
+            )
+            assert hashlib.sha256(exposure_encoded).hexdigest() == exposure_row[1]
+            assert connection.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = "
+                "'nado_funding_progression_activation'"
+            ).fetchone() is None
         finally:
             connection.close()
     finally:
@@ -2309,7 +2319,7 @@ def test_funding_progression_reopen_rejects_adverse_journal_state(
         IntentStore(path)
 
 
-def test_funding_progression_rejects_replay_and_tracked_table_deletion(
+def test_funding_progression_rejects_replay_and_all_optional_table_deletion(
     tmp_path: Path,
 ) -> None:
     _report, store = run_funding_fixture(tmp_path, FundingFixtureIO())
@@ -2323,7 +2333,11 @@ def test_funding_progression_rejects_replay_and_tracked_table_deletion(
 
     connection = sqlite3.connect(path)
     try:
-        connection.execute("DROP TABLE nado_funding_progression")
+        for table in (
+            "nado_funding_progression",
+            "nado_funding_progression_activation",
+        ):
+            connection.execute(f"DROP TABLE IF EXISTS {table}")
         connection.commit()
     finally:
         connection.close()
