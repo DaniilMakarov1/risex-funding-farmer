@@ -2472,6 +2472,7 @@ class OperationalVenueIO:
                     _FUNDING_SUBSCRIBE_URL,
                     heartbeat=30,
                     timeout=connect_timeout,
+                    compress=15,
                 ) as websocket:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:

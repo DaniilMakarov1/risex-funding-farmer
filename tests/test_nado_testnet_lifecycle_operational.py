@@ -835,6 +835,11 @@ def test_public_funding_event_waits_for_wall_clock_settlement_on_same_connection
     assert receive_count == 2
     assert len(connected) == 1
     assert connected[0][0] == nado_operational._FUNDING_SUBSCRIBE_URL
+    assert connected[0][1] == {
+        "heartbeat": 30,
+        "timeout": pytest.approx(nado_operational.HTTP_TIMEOUT_SECONDS),
+        "compress": 15,
+    }
     assert sent == [{
         "method": "subscribe",
         "stream": {
@@ -843,6 +848,44 @@ def test_public_funding_event_waits_for_wall_clock_settlement_on_same_connection
         },
     }]
     assert io._funding_event == parse_nado_public_funding_event(wire)
+
+
+def test_public_funding_handshake_failure_is_fail_closed_without_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binding = _adapter_binding()
+    connected: list[tuple[str, dict[str, object]]] = []
+
+    class FakeSession:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def ws_connect(self, url, **kwargs):
+            connected.append((url, kwargs))
+            raise nado_operational.aiohttp.WSServerHandshakeError(
+                None, (), status=403, message="Forbidden"
+            )
+
+    monkeypatch.setattr(nado_operational.aiohttp, "ClientSession", FakeSession)
+    io = OperationalVenueIO(OWNER, SENDER)
+    io.now_ms = lambda: binding.route.settlement_at_ms
+
+    with pytest.raises(OperationalSafetyError, match="transport failed"):
+        asyncio.run(io._await_funding_boundary_async(binding))
+
+    assert len(connected) == 1
+    assert connected[0][0] == nado_operational._FUNDING_SUBSCRIBE_URL
+    assert connected[0][1] == {
+        "heartbeat": 30,
+        "timeout": pytest.approx(nado_operational.HTTP_TIMEOUT_SECONDS),
+        "compress": 15,
+    }
 
 
 def test_early_timestamped_event_cannot_release_read_or_close_before_settlement(
