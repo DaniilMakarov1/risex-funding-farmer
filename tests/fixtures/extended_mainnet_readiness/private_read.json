@@ -1,0 +1,54 @@
+{
+  "identities": [
+    {
+      "venue": "RISEx",
+      "account_id": "synthetic-risex-account-001",
+      "environment": "MAINNET",
+      "exact": true,
+      "authoritative": true
+    },
+    {
+      "venue": "Extended",
+      "account_id": "synthetic-extended-account-001",
+      "environment": "MAINNET",
+      "exact": true,
+      "authoritative": true
+    }
+  ],
+  "venues": [
+    {
+      "venue": "RISEx",
+      "account_id": "synthetic-risex-account-001",
+      "fee_status": "ACCOUNT_SCOPED_AUTHORITATIVE",
+      "fee_source": "ACCOUNT_SCOPED_READ",
+      "maker_fee_rate": "0.00005",
+      "taker_fee_rate": "0.00021",
+      "private_stream_status": "READY_ACCOUNT_SCOPED",
+      "private_stream_source": "ACCOUNT_PRIVATE_STREAM",
+      "unrelated_state_clear": true
+    },
+    {
+      "venue": "Extended",
+      "account_id": "synthetic-extended-account-001",
+      "fee_status": "ACCOUNT_SCOPED_AUTHORITATIVE",
+      "fee_source": "ACCOUNT_SCOPED_READ",
+      "maker_fee_rate": "0",
+      "taker_fee_rate": "0.00025",
+      "private_stream_status": "READY_ACCOUNT_SCOPED",
+      "private_stream_source": "ACCOUNT_PRIVATE_STREAM",
+      "unrelated_state_clear": true
+    }
+  ],
+  "planned_deposits": [
+    {
+      "venue": "RISEx",
+      "account_id": "synthetic-risex-account-001",
+      "amount_usd": "40.00"
+    },
+    {
+      "venue": "Extended",
+      "account_id": "synthetic-extended-account-001",
+      "amount_usd": "50.00"
+    }
+  ]
+}

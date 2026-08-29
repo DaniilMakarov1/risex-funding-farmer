@@ -1,0 +1,66 @@
+{
+  "approval": {
+    "approval_id": "synthetic-future-approval-001",
+    "route_id": "RISEX-EXTENDED-BTC-001",
+    "direction": "LONG_RISEX_SHORT_EXTENDED",
+    "risex_venue": "RISEx",
+    "risex_account_id": "synthetic-risex-account-001",
+    "extended_venue": "Extended",
+    "extended_account_id": "synthetic-extended-account-001",
+    "risex_planned_deposit_usd": "40.00",
+    "extended_planned_deposit_usd": "50.00",
+    "deposit_cap_usd": "100.00",
+    "maximum_loss_usd": "2.00",
+    "approval_mode": "EXPLICIT_ABSOLUTE_USD",
+    "scope": "ONE_MANUAL_LIFECYCLE_DISPATCH",
+    "manual_lifecycle_dispatch_authorized": true,
+    "authorization_count": 1
+  },
+  "operational": {
+    "runtime_id": "synthetic-runtime-001",
+    "runtime_fresh": true,
+    "runtime_durable_before_dispatch": true,
+    "captured_immediately_before_dispatch": true,
+    "dispatches": [
+      {
+        "sequence": 1,
+        "venue": "RISEx",
+        "purpose": "ENTRY",
+        "account_id": "synthetic-risex-account-001",
+        "runtime_id": "synthetic-runtime-001",
+        "write_identity": "synthetic-write-risex-entry-001",
+        "durable_before_dispatch": true
+      },
+      {
+        "sequence": 2,
+        "venue": "Extended",
+        "purpose": "ENTRY",
+        "account_id": "synthetic-extended-account-001",
+        "runtime_id": "synthetic-runtime-001",
+        "write_identity": "synthetic-write-extended-entry-001",
+        "durable_before_dispatch": true
+      },
+      {
+        "sequence": 3,
+        "venue": "RISEx",
+        "purpose": "CLOSE",
+        "account_id": "synthetic-risex-account-001",
+        "runtime_id": "synthetic-runtime-001",
+        "write_identity": "synthetic-write-risex-close-001",
+        "durable_before_dispatch": true
+      },
+      {
+        "sequence": 4,
+        "venue": "Extended",
+        "purpose": "CLOSE",
+        "account_id": "synthetic-extended-account-001",
+        "runtime_id": "synthetic-runtime-001",
+        "write_identity": "synthetic-write-extended-close-001",
+        "durable_before_dispatch": true
+      }
+    ],
+    "sequential_writes": true,
+    "no_blind_replay": true,
+    "restart_requires_reconciliation": true
+  }
+}

@@ -1,0 +1,58 @@
+{
+  "route": {
+    "route_id": "RISEX-EXTENDED-BTC-001",
+    "canonical_asset": "BTC",
+    "direction": "LONG_RISEX_SHORT_EXTENDED",
+    "loss_bound_usd": "0.50",
+    "self_trade_free": true,
+    "counterparty_account_id": null
+  },
+  "venues": [
+    {
+      "venue": "RISEx",
+      "canonical_asset": "BTC",
+      "active": true,
+      "linear_perpetual": true,
+      "non_rfq": true,
+      "metadata_current": true,
+      "minimum_quantity": "0.00015",
+      "quantity_step": "0.000001",
+      "reference_price_usd": "78226.1",
+      "available_buy_quantity": "0.25",
+      "available_sell_quantity": "0.25",
+      "fee_status": "PENDING_ACCOUNT_SCOPED",
+      "fee_source": "PRIVATE_READ_PENDING",
+      "maker_fee_rate": null,
+      "taker_fee_rate": null,
+      "schedule_status": "CURRENT_PUBLIC",
+      "schedule_source": "OFFICIAL_CURRENT_SCHEDULE",
+      "funding_interval_seconds": 3600,
+      "next_funding_at": 1780000000,
+      "private_stream_status": "PENDING_PRIVATE_READ",
+      "private_stream_source": "PRIVATE_READ_PENDING"
+    },
+    {
+      "venue": "Extended",
+      "canonical_asset": "BTC",
+      "active": true,
+      "linear_perpetual": true,
+      "non_rfq": true,
+      "metadata_current": true,
+      "minimum_quantity": "0.0001",
+      "quantity_step": "0.00001",
+      "reference_price_usd": "78210",
+      "available_buy_quantity": "0.25",
+      "available_sell_quantity": "0.25",
+      "fee_status": "PUBLIC_CURRENT",
+      "fee_source": "PUBLIC_READ",
+      "maker_fee_rate": "0",
+      "taker_fee_rate": "0.00025",
+      "schedule_status": "CURRENT_PUBLIC",
+      "schedule_source": "OFFICIAL_CURRENT_SCHEDULE",
+      "funding_interval_seconds": 3600,
+      "next_funding_at": 1780000000,
+      "private_stream_status": "PENDING_PRIVATE_READ",
+      "private_stream_source": "PRIVATE_READ_PENDING"
+    }
+  ]
+}
