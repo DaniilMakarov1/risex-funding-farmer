@@ -1408,7 +1408,7 @@ def test_exact_binding_prewrite_order_and_nado_sourced_release(tmp_path: Path) -
     assert bridge.closed is True and nado.store.closed is True
 
 
-def test_cross_binding_accepts_only_fresh_v2_risex_store_identities() -> None:
+def test_cross_binding_accepts_only_fresh_v3_risex_store_identities() -> None:
     route = _risex.fixed_funding_route(SETTLEMENT)
     fresh = (
         JournalIdentity(
@@ -1428,25 +1428,26 @@ def test_cross_binding_accepts_only_fresh_v2_risex_store_identities() -> None:
         fresh, route,
     ) == fresh
 
-    historical = (
-        JournalIdentity(
-            RISEX_VENUE,
-            "risex-primary-run",
-            "risex-nado-boundary-primary-v1",
-            PRIMARY_ACCOUNT,
-        ),
-        JournalIdentity(
-            RISEX_VENUE,
-            "risex-counterparty-run",
-            "risex-nado-boundary-counterparty-v1",
-            COUNTERPARTY_ACCOUNT,
-        ),
-    )
-    with pytest.raises(_owner.FundingBoundaryOrchestrationError) as error:
-        _owner.FundingBoundaryOrchestrator._validate_journals(
-            historical, route,
+    for version in ("v1", "v2"):
+        historical = (
+            JournalIdentity(
+                RISEX_VENUE,
+                "risex-primary-run",
+                f"risex-nado-boundary-primary-{version}",
+                PRIMARY_ACCOUNT,
+            ),
+            JournalIdentity(
+                RISEX_VENUE,
+                "risex-counterparty-run",
+                f"risex-nado-boundary-counterparty-{version}",
+                COUNTERPARTY_ACCOUNT,
+            ),
         )
-    assert error.value.code == "BINDING_MISMATCH"
+        with pytest.raises(_owner.FundingBoundaryOrchestrationError) as error:
+            _owner.FundingBoundaryOrchestrator._validate_journals(
+                historical, route,
+            )
+        assert error.value.code == "BINDING_MISMATCH"
 
 
 def test_complete_requires_both_funding_contracts_to_be_completion_eligible(
