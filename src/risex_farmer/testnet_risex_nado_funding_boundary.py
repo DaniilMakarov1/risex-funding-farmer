@@ -1412,8 +1412,13 @@ class RisexFundingBoundaryCoordinator(TwoAccountCoordinator):
         if type(value.observed_at_ms) is not int or value.observed_at_ms <= 0:
             raise RisexFundingBoundaryError(FUNDING_BLOCKER_EVIDENCE_STALE)
         if require_current_fresh:
-            now_ms = _coordinator._now_int(self._now()) * 1_000
-            if value.observed_at_ms > now_ms or now_ms - value.observed_at_ms > _FRESHNESS_MS:
+            now_seconds = _coordinator._now_int(self._now())
+            now_ms = now_seconds * 1_000
+            next_second_ms = (now_seconds + 1) * 1_000
+            if (
+                value.observed_at_ms >= next_second_ms
+                or now_ms - value.observed_at_ms > _FRESHNESS_MS
+            ):
                 raise RisexFundingBoundaryError(FUNDING_BLOCKER_EVIDENCE_STALE)
         if (
             value.kind == BoundarySignalKind.RELEASED.value
@@ -1796,8 +1801,13 @@ class RisexFundingBoundaryCoordinator(TwoAccountCoordinator):
 
     def _validate_callback_reference(self, value: object) -> tuple[int, str]:
         observed_at_ms, token = _callback_reference(value)
-        now_ms = _coordinator._now_int(self._now()) * 1_000
-        if observed_at_ms > now_ms or now_ms - observed_at_ms > _FRESHNESS_MS:
+        now_seconds = _coordinator._now_int(self._now())
+        now_ms = now_seconds * 1_000
+        next_second_ms = (now_seconds + 1) * 1_000
+        if (
+            observed_at_ms >= next_second_ms
+            or now_ms - observed_at_ms > _FRESHNESS_MS
+        ):
             raise RisexFundingBoundaryError("RISEx Nado callback reference is stale")
         return observed_at_ms, token
 
@@ -1808,9 +1818,11 @@ class RisexFundingBoundaryCoordinator(TwoAccountCoordinator):
         callback_observed_at_ms: int,
     ) -> int:
         oldest = _oldest_required_observation_ms(observation)
-        now_ms = _coordinator._now_int(self._now()) * 1_000
+        now_seconds = _coordinator._now_int(self._now())
+        now_ms = now_seconds * 1_000
+        next_second_ms = (now_seconds + 1) * 1_000
         if (
-            oldest > now_ms
+            oldest >= next_second_ms
             or now_ms - oldest > _FRESHNESS_MS
             or oldest < callback_observed_at_ms - _FRESHNESS_MS
         ):

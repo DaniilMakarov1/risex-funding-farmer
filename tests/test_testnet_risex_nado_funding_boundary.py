@@ -629,6 +629,95 @@ def test_missing_stale_cancelled_gate_evidence_flattens_and_durably_blocks(
 
 
 @pytest.mark.parametrize(
+    ("kind", "expected"),
+    [
+        (
+            BoundarySignalKind.RELEASED.value,
+            FUNDING_BLOCKER_MISSING_CONTRACT,
+        ),
+        (
+            BoundarySignalKind.CANCELLED.value,
+            boundary_module.FUNDING_BLOCKER_CANCELLED,
+        ),
+    ],
+)
+def test_current_second_max_signal_timestamp_preserves_release_and_cancel_semantics(
+    tmp_path: Path, kind: str, expected: str,
+):
+    observed_at_ms = NOW_FOR_TERMINAL * 1_000 + 999
+
+    def gate(binding):
+        signal = (
+            HoldReleaseSignal.released
+            if kind == BoundarySignalKind.RELEASED.value
+            else HoldReleaseSignal.cancelled
+        )
+        return signal(
+            binding,
+            observed_at_ms=observed_at_ms,
+            signal_id=f"current-second-{kind.lower()}",
+        )
+
+    lifecycle, _, venue, _, _ = _lifecycle_fixture(tmp_path, gate=gate)
+    try:
+        report = asyncio.run(lifecycle.run())
+        assert report.result is FundingBoundaryResult.BLOCKED
+        assert report.funding_blocker == expected
+        assert len(venue.place_calls) == 4
+        assert lifecycle.phase is coordinator_module.Phase.COMPLETE
+    finally:
+        _close_fixture(lifecycle)
+
+
+def test_callback_and_terminal_freshness_keep_current_second_and_strict_bounds(
+    tmp_path: Path,
+):
+    lifecycle, _, _, _, rounds = _lifecycle_fixture(tmp_path, gate=_released_gate())
+    current_ms = NOW_FOR_TERMINAL * 1_000
+    try:
+        current_max = LiveObservation(
+            CallbackEvidence(current_ms + 999, "current-max", 1),
+        )
+        assert lifecycle._validate_callback_reference(current_max)[0] == (
+            current_ms + 999
+        )
+        at_stale_cutoff = LiveObservation(
+            CallbackEvidence(current_ms - boundary_module._FRESHNESS_MS, "cutoff", 2),
+        )
+        assert lifecycle._validate_callback_reference(at_stale_cutoff)[0] == (
+            current_ms - boundary_module._FRESHNESS_MS
+        )
+        for observed_at_ms in (
+            current_ms + 1_000,
+            current_ms - boundary_module._FRESHNESS_MS - 1,
+        ):
+            with pytest.raises(RisexFundingBoundaryError):
+                lifecycle._validate_callback_reference(
+                    LiveObservation(CallbackEvidence(observed_at_ms, "rejected", 3)),
+                )
+
+        current_observation = _retime_observation(
+            rounds[0], NOW_FOR_TERMINAL, rest_round=3,
+        )
+        assert lifecycle._validate_terminal_freshness(
+            current_observation,
+            callback_observed_at_ms=current_ms + 999,
+        ) == current_ms
+
+        for observed_at in (
+            NOW_FOR_TERMINAL + 1,
+            NOW_FOR_TERMINAL - boundary_module.MAX_AGE_SECONDS,
+        ):
+            with pytest.raises(RisexFundingBoundaryError):
+                lifecycle._validate_terminal_freshness(
+                    _retime_observation(rounds[0], observed_at, rest_round=4),
+                    callback_observed_at_ms=current_ms + 999,
+                )
+    finally:
+        _close_fixture(lifecycle)
+
+
+@pytest.mark.parametrize(
     "claim",
     [
         SimpleNamespace(status="AUTHORITATIVE"),
@@ -959,10 +1048,10 @@ def test_provider_binds_fresh_rounds_to_real_callback_references_and_rejects_rep
         provider = RisexTerminalEvidenceProvider(bridge)
         try:
             reference_one = LiveObservation(
-                CallbackEvidence((NOW + 2) * 1_000, "nado-1", 1),
+                CallbackEvidence(NOW_FOR_TERMINAL * 1_000 + 998, "nado-1", 1),
             )
             reference_two = LiveObservation(
-                CallbackEvidence((NOW + 3) * 1_000, "nado-2", 2),
+                CallbackEvidence(NOW_FOR_TERMINAL * 1_000 + 999, "nado-2", 2),
             )
             first = provider(boundary, reference_one, 1)
             assert type(first) is RisexTerminalEvidence
