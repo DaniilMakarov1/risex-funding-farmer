@@ -791,6 +791,181 @@ def test_actual_barrier_binding_reaches_both_sides_once_before_observation(
     assert report.sanitized()["binding_digest"] == risex_binding.identity_digest
 
 
+def test_actual_barrier_abort_provenance_survives_both_wrappers_and_worker_terminalization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A target-time owner abort remains bounded through both real wrappers."""
+    settlement = time.time_ns() // 1_000_000 + 60_000
+    nado_path = tmp_path / "actual-abort-nado.sqlite3"
+    nado_io = _RealNadoIO(timestamp=settlement - 1)
+    risex_venues: list[_NoNetworkRisexVenue] = []
+    nado_barrier_errors: list[BaseException] = []
+    risex_barrier_errors: list[BaseException] = []
+    nado_errors: list[BaseException] = []
+    risex_errors: list[BaseException] = []
+    monkeypatch.setattr(
+        _nado, "_strict_identity", lambda: (REAL_NADO_OWNER, REAL_NADO_SENDER),
+    )
+    monkeypatch.setattr(_nado, "_funding_boundary_store_path", lambda: nado_path)
+    monkeypatch.setattr(_nado, "OperationalVenueIO", lambda owner, sender: nado_io)
+
+    def bridge_factory(*, hold_release_gate, preparation_gate):
+        def coordinator_factory():
+            venue = _NoNetworkRisexVenue()
+            risex_venues.append(venue)
+            coordinator = _risex.RisexFundingBoundaryCoordinator._fixture(
+                venue=venue,
+                primary_journal=tmp_path / "actual-abort-risex-primary.sqlite3",
+                counterparty_journal=tmp_path / "actual-abort-risex-counterparty.sqlite3",
+                hold_release_gate=hold_release_gate,
+                preparation_gate=preparation_gate,
+            )
+            original_barrier_gate = coordinator._preparation_gate
+            assert original_barrier_gate is not None
+
+            def tracked_barrier_gate(binding):
+                try:
+                    return original_barrier_gate(binding)
+                except BaseException as error:
+                    risex_barrier_errors.append(error)
+                    raise
+
+            coordinator._preparation_gate = tracked_barrier_gate
+            original_gate = coordinator._run_preparation_gate
+
+            def tracked_gate(binding):
+                try:
+                    return original_gate(binding)
+                except BaseException as error:
+                    risex_errors.append(error)
+                    raise
+
+            coordinator._run_preparation_gate = tracked_gate
+            return coordinator
+
+        bridge = _risex.RisexCoordinationLoopBridge(
+            coordinator_factory,
+            startup_timeout_seconds=2,
+            callback_timeout_seconds=2,
+            lifecycle_timeout_seconds=2,
+            shutdown_timeout_seconds=2,
+        )
+        return bridge, _risex.RisexTerminalEvidenceProvider(bridge)
+
+    def nado_factory(**kwargs):
+        owned = _owner._default_nado_factory(**kwargs)
+        # Keep Nado's startup read strictly pre-target while making the
+        # owner-side barrier clock the accepted non-hypothetical target time.
+        owned.now_ms = lambda: settlement
+        build = owned.worker_factory
+        assert build is not None
+
+        def worker_build():
+            runner, store = build()
+            original_barrier_gate = runner._preparation_gate
+            assert original_barrier_gate is not None
+
+            def tracked_barrier_gate(binding):
+                try:
+                    return original_barrier_gate(binding)
+                except BaseException as error:
+                    nado_barrier_errors.append(error)
+                    raise
+
+            runner._preparation_gate = tracked_barrier_gate
+            original_gate = runner._await_preparation_gate
+
+            def tracked_gate():
+                try:
+                    return original_gate()
+                except BaseException as error:
+                    nado_errors.append(error)
+                    raise
+
+            runner._await_preparation_gate = tracked_gate
+
+            def barrier_only_run():
+                runner.stage = "ENTRY_PREPARATION"
+                runner._await_preparation_gate()
+                raise AssertionError("the actual barrier unexpectedly passed")
+
+            runner.run = barrier_only_run
+            return runner, store
+
+        owned.worker_factory = worker_build
+        return owned
+
+    orchestrator = _owner.FundingBoundaryOrchestrator(
+        route=_risex.fixed_funding_route(settlement),
+        bridge_factory=bridge_factory,
+        nado_factory=nado_factory,
+        private_read=_read_ok,
+    )
+    report = orchestrator.run(timeout_seconds=2)
+
+    assert orchestrator._barrier._now_ms() == settlement
+    assert report.status == "BLOCKED_BEFORE_WRITE"
+    assert report.terminal is True
+    assert report.reason == "BARRIER_ABORTED"
+    assert report.failure_code == "BARRIER_ABORTED"
+    assert report.failure_class == "SAFETY"
+    assert report.failure_stage == "ENTRY_PREPARATION"
+    assert report.nado_report is None
+    assert report.risex_report is not None
+    assert report.risex_report.coordinator_report.failure_code == (
+        "BARRIER_ABORTED"
+    )
+
+    assert len(risex_barrier_errors) == 1
+    assert len(nado_barrier_errors) == 1
+    for error in (risex_barrier_errors[0], nado_barrier_errors[0]):
+        assert error.code == "BARRIER_ABORTED"
+        assert error.failure_class == "SAFETY"
+        assert error.stage == "ENTRY_PREPARATION"
+    assert {
+        type(risex_barrier_errors[0]), type(nado_barrier_errors[0]),
+    } == {_owner._PreparationBarrierFailure, _owner._PreparationBarrierAborted}
+
+    assert len(nado_errors) == 1
+    assert nado_errors[0].code == "BARRIER_ABORTED"
+    assert nado_errors[0].failure_class == "SAFETY"
+    assert nado_errors[0].stage == "ENTRY_PREPARATION"
+    assert len(risex_errors) == 1
+    assert risex_errors[0].code == "BARRIER_ABORTED"
+    assert risex_errors[0].failure_class == "SAFETY"
+    assert risex_errors[0].stage == "ENTRY_PREPARATION"
+
+    assert report.risex_report.coordinator_report.primary_intents == 0
+    assert report.risex_report.coordinator_report.counterparty_intents == 0
+    assert report.risex_report.coordinator_report.primary_dispatches == 0
+    assert report.risex_report.coordinator_report.counterparty_dispatches == 0
+    assert report.risex_report.coordinator_report.counterparty_cancels == 0
+    assert report.nado_potential_write is False
+    assert report.risex_potential_write is False
+    nado_runner = orchestrator.nado_runner
+    assert nado_runner is not None
+    assert nado_runner.writes == 0
+    assert nado_io.observe_thread_id is None
+    assert risex_venues and risex_venues[0].observe_calls == 0
+    assert risex_venues[0].rest_round_calls == 0
+    assert risex_venues[0].place_calls == []
+    assert risex_venues[0].cancel_calls == []
+
+    database = _read_worker_database(nado_path)
+    assert database["runtime"] == ("BLOCKED", "SAFETY", "ENTRY_PREPARATION")
+    assert database["lifecycle"] == "HALTED"
+    assert database["intents"] == 0
+    assert database["integrity"] == "ok"
+    assert b"preparation gate rejected" not in database["bytes"]
+
+    sanitized = report.sanitized()
+    assert sanitized["reason"] == "BARRIER_ABORTED"
+    assert sanitized["failure_code"] == "BARRIER_ABORTED"
+    assert sanitized["failure_class"] == "SAFETY"
+    assert sanitized["failure_stage"] == "ENTRY_PREPARATION"
+    assert report.closed is True
+
+
 def test_preparation_barrier_rejects_risex_local_binding_mismatch() -> None:
     primary = JournalIdentity(
         RISEX_VENUE, "risex-run", _risex.FUNDING_BOUNDARY_PRIMARY_STORE_IDENTITY,
