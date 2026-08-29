@@ -94,6 +94,7 @@ RECV_WINDOW_MS = 90_000
 HTTP_TIMEOUT_SECONDS = 5.0
 RECONCILE_READ_ATTEMPTS = 5
 RECONCILE_READ_INTERVAL_SECONDS = 1.0
+NADO_CLOSE_AGGRESSIVE_PERCENT = 2
 _GATEWAY_HOST = "gateway.test.nado.xyz"
 _ARCHIVE_HOST = "archive.test.nado.xyz"
 _TRIGGER_HOST = "trigger.test.nado.xyz"
@@ -738,6 +739,43 @@ def _entry_order(
     )
 
 
+def _funding_boundary_close_price(
+    observation: LiveObservation, position_direction: str,
+) -> int:
+    """Build the official Nado aggressive limit for a funding-boundary close."""
+    product = observation.product
+    product.assert_contract()
+    bid, ask = observation.bid_x18, observation.ask_x18
+    if (
+        bid <= 0
+        or ask <= bid
+        or bid % product.tick_x18
+        or ask % product.tick_x18
+    ):
+        raise OperationalSafetyError("fresh non-crossed tick-aligned BBO required")
+    if position_direction == SHORT:
+        # A short position closes with a BUY.  The official CLI derives its
+        # aggressive limit from the safe bid and rounds upward to a tick.
+        buffered_bid = (
+            bid * (100 + NADO_CLOSE_AGGRESSIVE_PERCENT) + 99
+        ) // 100
+        price = (
+            (buffered_bid + product.tick_x18 - 1) // product.tick_x18
+        ) * product.tick_x18
+    elif position_direction == LONG:
+        # A long position closes with a SELL.  Mirror the official CLI by
+        # deriving from the safe ask and rounding downward to a tick.
+        buffered_ask = (
+            ask * (100 - NADO_CLOSE_AGGRESSIVE_PERCENT)
+        ) // 100
+        price = (buffered_ask // product.tick_x18) * product.tick_x18
+    else:
+        raise OperationalSafetyError("funding route direction is invalid")
+    if price <= 0:
+        raise OperationalSafetyError("funding close price is invalid")
+    return price
+
+
 def _terminal_flags(observation: LiveObservation) -> tuple[bool, bool, bool]:
     account = observation.evidence.account
     regular = not any(account.regular_orders_by_product.values())
@@ -1103,7 +1141,13 @@ class SealedLifecycleRunner:
                 catalog=observed.catalog, product=observed.product,
                 account=observed.evidence.account, triggers=observed.evidence.triggers,
                 worst_price_x18=(
-                    observed.bid_x18 if entry_direction == LONG else observed.ask_x18
+                    _funding_boundary_close_price(observed, entry_direction)
+                    if route is not None
+                    else (
+                        observed.bid_x18
+                        if entry_direction == LONG
+                        else observed.ask_x18
+                    )
                 ), recv_time=recv, salt=_salt(),
                 now_ms=issued_at,
             )

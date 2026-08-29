@@ -20,6 +20,7 @@ from risex_farmer.nado_testnet_lifecycle import (
     ACTIVE_PERP, COMPLETE, EXECUTE_RESPONSE_AMBIGUITY, FUNDING_APPLIED,
     FUNDING_BLOCKED_CONTRADICTORY, FUNDING_BLOCKED_MISSING, FUNDING_UNRESOLVED,
     EXECUTE_TRANSPORT_AMBIGUITY, EXECUTE_VENUE_REJECTION, HALTED, IOC_APPENDIX,
+    IOC_REDUCE_ONLY_APPENDIX,
     AccountSnapshot, CatalogSnapshot, CrossRunAttestation, EngineEvidence,
     ExecuteFailure, FillEvidence, FixedEnvironment, FundingBoundaryBinding,
     FundingLegBinding, FundingRouteBinding, IntentStore, JournalIdentity,
@@ -27,6 +28,7 @@ from risex_farmer.nado_testnet_lifecycle import (
     OrderEvidence,
     NadoFundingExposure,
     Product, OrderIntent,
+    LONG, SHORT,
     RisexTerminalEvidence as ContractRisexTerminalEvidence,
     SyntheticOrderVector, TerminalEvidence, TriggerSnapshot, build_order_nonce,
     canonical_payload, cross_run_attestation_digest, encode_subaccount,
@@ -48,14 +50,16 @@ from risex_farmer.nado_testnet_lifecycle_operational import (
     NADO_QUERY_WEIGHT_LIMIT_10S,
     NADO_QUERY_WINDOW_SECONDS, NADO_OBSERVED_CATALOG_PRODUCT_COUNT,
     NADO_OBSERVED_ORDERABLE_PRODUCT_COUNT,
-    RECV_WINDOW_MS, SealedFundingBoundaryRunner, SealedLifecycleRunner,
+    NADO_CLOSE_AGGRESSIVE_PERCENT, RECV_WINDOW_MS,
+    SealedFundingBoundaryRunner, SealedLifecycleRunner,
     RisexTerminalEvidence, RuntimeRunJournal, TARGET_PRODUCT_ID, TARGET_TICKER_ID,
     _NadoSnapshotAdmission, _fixture_funding_boundary_run,
     _full_observe_gateway_weight,
     _fixture_run, _journal_store_identity,
     _nado_terminal_journal_content_sha256, _prepare_file,
     parse_nado_account_funding_row,
-    parse_nado_public_funding_event, run, run_funding_boundary,
+    _funding_boundary_close_price, parse_nado_public_funding_event, run,
+    run_funding_boundary,
 )
 from risex_farmer.nado_private_read_preflight import MAX_FRESHNESS_MS
 
@@ -217,15 +221,15 @@ class ReceiveWindowFixtureIO(FixtureIO):
         return super().dispatch(intent, signature)
 
 
-def _funding_route() -> FundingRouteBinding:
+def _funding_route(nado_direction: str = LONG) -> FundingRouteBinding:
     return FundingRouteBinding(
         canonical_asset=FUNDING_BOUNDARY_TARGET_CANONICAL_ASSET,
         risex_leg=FundingLegBinding(
-            "RISEX", "ETH-USDC", "SHORT",
+            "RISEX", "ETH-USDC", SHORT if nado_direction == LONG else LONG,
             Decimal("0.1"), Decimal("1"), Decimal("0.1"),
         ),
         nado_leg=FundingLegBinding(
-            "NADO", FUNDING_BOUNDARY_TARGET_TICKER_ID, "LONG",
+            "NADO", FUNDING_BOUNDARY_TARGET_TICKER_ID, nado_direction,
             Decimal("0.1"), Decimal("1"), Decimal("0.1"),
         ),
         nado_product_id=FUNDING_BOUNDARY_TARGET_PRODUCT_ID,
@@ -249,6 +253,7 @@ class FundingFixtureIO(FixtureIO):
         *,
         final_rounds_agree: bool = True,
         entry: str = "FILLED",
+        direction: str = LONG,
     ) -> None:
         super().__init__(
             entry,
@@ -264,6 +269,7 @@ class FundingFixtureIO(FixtureIO):
         self.clock -= 300_000
         self.funding_status = funding_status
         self.final_rounds_agree = final_rounds_agree
+        self.direction = direction
         self.await_count = 0
         self.baseline_captured = False
         self.exposure_captured = False
@@ -312,7 +318,9 @@ class FundingFixtureIO(FixtureIO):
     ) -> NadoFundingExposure:
         assert self.store.funding_boundary_binding() == binding
         assert observation.evidence.account.cross_perp_amounts_x18 == {
-            FUNDING_BOUNDARY_TARGET_PRODUCT_ID: ETH_ROUTE_AMOUNT_X18
+            FUNDING_BOUNDARY_TARGET_PRODUCT_ID: (
+                ETH_ROUTE_AMOUNT_X18 if self.direction == LONG else -ETH_ROUTE_AMOUNT_X18
+            )
         }
         self.exposure_captured = True
         unsigned = NadoFundingExposure(
@@ -320,12 +328,12 @@ class FundingFixtureIO(FixtureIO):
             OWNER,
             "default",
             FUNDING_BOUNDARY_TARGET_PRODUCT_ID,
-            "LONG",
-            ETH_ROUTE_AMOUNT_X18,
+            self.direction,
+            ETH_ROUTE_AMOUNT_X18 if self.direction == LONG else -ETH_ROUTE_AMOUNT_X18,
             ETH_ROUTE_AMOUNT_X18,
             observation.evidence.account.observed_at_ms,
             observation.evidence.account.snapshot_id,
-            "LONG",
+            self.direction,
             0,
             "0x" + "00" * 32,
         )
@@ -357,6 +365,11 @@ class FundingFixtureIO(FixtureIO):
             unsigned_event,
             event_digest="0x" + nado_funding_event_digest(unsigned_event),
         )
+        signed_position = (
+            ETH_ROUTE_AMOUNT_X18
+            if self.direction == LONG
+            else -ETH_ROUTE_AMOUNT_X18
+        )
         unsigned_account = NadoAccountFunding(
             binding.nado_journal,
             OWNER,
@@ -364,8 +377,8 @@ class FundingFixtureIO(FixtureIO):
             event.product_id,
             1,
             binding.route.settlement_at_ms // 1_000,
-            -ETH_ROUTE_AMOUNT_X18,
-            ETH_ROUTE_AMOUNT_X18,
+            -signed_position,
+            signed_position,
             125_000_000_000_000,
             2_000 * X18,
             "0x" + "00" * 32,
@@ -474,7 +487,9 @@ def run_fixture(tmp_path: Path, io: FixtureIO):
     return result, io.store
 
 
-def run_funding_fixture(tmp_path: Path, io: FundingFixtureIO):
+def run_funding_fixture(
+    tmp_path: Path, io: FundingFixtureIO, *, route: FundingRouteBinding | None = None,
+):
     path = tmp_path / "nado-funding.sqlite"
     def provider(binding, observation, round_index):
         return risex_terminal_provider(
@@ -490,7 +505,7 @@ def run_funding_fixture(tmp_path: Path, io: FundingFixtureIO):
         capability_loader=capability,
         owner=OWNER,
         sender=SENDER,
-        route=_funding_route(),
+        route=_funding_route() if route is None else route,
         risex_journal=FUNDING_RISEX_JOURNAL,
         risex_attestation_provider=provider,
     )
@@ -1194,6 +1209,47 @@ def test_entry_buffer_rounds_exact_ten_percent_bound_without_extra_tick() -> Non
     assert order.amount_x18 == 12_900 * X18
 
 
+@pytest.mark.parametrize(
+    ("direction", "expected"),
+    [
+        (SHORT, 1_015 * X18),
+        (LONG, 987 * X18),
+    ],
+)
+def test_funding_boundary_close_price_uses_official_direction_and_tick_rounding(
+    direction: str, expected: int,
+) -> None:
+    io = FixtureIO(
+        bid_x18=994 * X18,
+        ask_x18=1_008 * X18,
+        tick_x18=7 * X18,
+    )
+    observed = io.observe(())
+    price = _funding_boundary_close_price(observed, direction)
+
+    assert price == expected
+    assert price % observed.product.tick_x18 == 0
+    if direction == SHORT:
+        target = observed.bid_x18 * (100 + NADO_CLOSE_AGGRESSIVE_PERCENT)
+        assert price * 100 >= target
+        assert (price - observed.product.tick_x18) * 100 < target
+    else:
+        target = observed.ask_x18 * (100 - NADO_CLOSE_AGGRESSIVE_PERCENT)
+        assert price * 100 <= target
+        assert (price + observed.product.tick_x18) * 100 > target
+
+
+def test_funding_boundary_close_price_rejects_invalid_direction_or_bbo() -> None:
+    io = FixtureIO()
+    observed = io.observe(())
+    with pytest.raises(OperationalSafetyError, match="direction"):
+        _funding_boundary_close_price(observed, "SIDEWAYS")
+    with pytest.raises(OperationalSafetyError, match="BBO"):
+        _funding_boundary_close_price(
+            replace(observed, ask_x18=observed.bid_x18), LONG,
+        )
+
+
 def test_sealed_order_receive_window_matches_sdk_and_forbids_legacy_100_ms() -> None:
     assert RECV_WINDOW_MS == 90_000
     assert RECV_WINDOW_MS != 100
@@ -1791,6 +1847,7 @@ def test_full_entry_uses_fresh_position_reduce_only_ioc_close(tmp_path: Path) ->
         assert close.starting_position_x18 == entry.amount_x18
         assert close.amount_x18 == -entry.amount_x18
         assert close.snapshot_id and close.snapshot_observed_at_ms
+        assert int(json.loads(close.payload)["place_order"]["order"]["priceX18"]) == io.bid_x18
     finally:
         store.close()
 
@@ -1815,6 +1872,17 @@ def test_funding_runner_binds_before_any_nado_preparation_or_dispatch(
         assert entry.amount_x18 == ETH_ROUTE_AMOUNT_X18
         assert close.product_id == FUNDING_BOUNDARY_TARGET_PRODUCT_ID
         assert close.amount_x18 == -ETH_ROUTE_AMOUNT_X18
+        assert close.appendix == IOC_REDUCE_ONLY_APPENDIX
+        expected_close_price = (
+            (ETH_ASK_X18 * (100 - NADO_CLOSE_AGGRESSIVE_PERCENT) // 100)
+            // ETH_TICK_X18
+        ) * ETH_TICK_X18
+        close_price = int(json.loads(close.payload)["place_order"]["order"]["priceX18"])
+        assert close_price == expected_close_price
+        assert close_price != ETH_BID_X18
+        assert io.dispatch_states == ["PREPARED", "PREPARED"]
+        assert_nonce_and_digest_binding(entry)
+        assert_nonce_and_digest_binding(close)
         binding = store.funding_boundary_binding()
         assert binding is not None
         assert binding.route.canonical_asset == FUNDING_BOUNDARY_TARGET_CANONICAL_ASSET
@@ -1833,6 +1901,35 @@ def test_funding_runner_binds_before_any_nado_preparation_or_dispatch(
         assert binding.nado_journal.store_identity == _journal_store_identity(
             tmp_path / "nado-funding.sqlite"
         )
+    finally:
+        store.close()
+
+
+def test_funding_runner_uses_official_aggressive_short_close_price(
+    tmp_path: Path,
+) -> None:
+    io = FundingFixtureIO(direction=SHORT)
+    report, store = run_funding_fixture(
+        tmp_path, io, route=_funding_route(SHORT),
+    )
+    try:
+        assert report.status == COMPLETE
+        entry, close = [intent for intent, _ in store.intents()]
+        assert entry.amount_x18 == -ETH_ROUTE_AMOUNT_X18
+        assert close.amount_x18 == ETH_ROUTE_AMOUNT_X18
+        assert close.appendix == IOC_REDUCE_ONLY_APPENDIX
+        buffered_bid = (
+            ETH_BID_X18 * (100 + NADO_CLOSE_AGGRESSIVE_PERCENT) + 99
+        ) // 100
+        expected_close_price = (
+            (buffered_bid + ETH_TICK_X18 - 1) // ETH_TICK_X18
+        ) * ETH_TICK_X18
+        close_price = int(json.loads(close.payload)["place_order"]["order"]["priceX18"])
+        assert close_price == expected_close_price
+        assert close_price != ETH_ASK_X18
+        assert io.dispatch_states == ["PREPARED", "PREPARED"]
+        assert_nonce_and_digest_binding(entry)
+        assert_nonce_and_digest_binding(close)
     finally:
         store.close()
 
