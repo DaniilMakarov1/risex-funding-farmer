@@ -273,7 +273,7 @@ def test_fixed_route_is_exact_eth_two_venue_opposite_direction_contract():
     assert route.canonical_quantity == TARGET_QUANTITY == Decimal("0.1")
 
 
-def test_historical_zero_argument_builder_and_fresh_v7_names_are_unchanged():
+def test_historical_zero_argument_builder_and_fresh_v8_names_are_unchanged():
     assert not inspect.signature(
         coordinator_module.build_risex_two_account_coordinator
     ).parameters
@@ -287,16 +287,16 @@ def test_historical_zero_argument_builder_and_fresh_v7_names_are_unchanged():
         FUNDING_BOUNDARY_COUNTERPARTY_JOURNAL,
     }
     assert FUNDING_BOUNDARY_PRIMARY_JOURNAL == (
-        ".risex-funding-farmer-risex-nado-boundary-primary-v7.sqlite3"
+        ".risex-funding-farmer-risex-nado-boundary-primary-v8.sqlite3"
     )
     assert FUNDING_BOUNDARY_COUNTERPARTY_JOURNAL == (
-        ".risex-funding-farmer-risex-nado-boundary-counterparty-v7.sqlite3"
+        ".risex-funding-farmer-risex-nado-boundary-counterparty-v8.sqlite3"
     )
     assert boundary_module.FUNDING_BOUNDARY_PRIMARY_STORE_IDENTITY == (
-        "risex-nado-boundary-primary-v7"
+        "risex-nado-boundary-primary-v8"
     )
     assert boundary_module.FUNDING_BOUNDARY_COUNTERPARTY_STORE_IDENTITY == (
-        "risex-nado-boundary-counterparty-v7"
+        "risex-nado-boundary-counterparty-v8"
     )
     assert FUNDING_BOUNDARY_PRIMARY_JOURNAL != FUNDING_BOUNDARY_COUNTERPARTY_JOURNAL
     assert (
@@ -304,7 +304,7 @@ def test_historical_zero_argument_builder_and_fresh_v7_names_are_unchanged():
         != boundary_module.FUNDING_BOUNDARY_COUNTERPARTY_STORE_IDENTITY
     )
     assert all(
-        all(version not in value for version in ("-v1", "-v2", "-v3", "-v4", "-v5", "-v6"))
+        all(version not in value for version in ("-v1", "-v2", "-v3", "-v4", "-v5", "-v6", "-v7"))
         for value in (
             FUNDING_BOUNDARY_PRIMARY_JOURNAL,
             FUNDING_BOUNDARY_COUNTERPARTY_JOURNAL,
