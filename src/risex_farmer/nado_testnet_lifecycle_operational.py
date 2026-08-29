@@ -2516,6 +2516,18 @@ class OperationalVenueIO:
                                 raise OperationalSafetyError(
                                     "public funding event boundary mismatch"
                                 )
+                            wall_clock_ms = self.now_ms()
+                            if type(wall_clock_ms) is not int or wall_clock_ms <= 0:
+                                raise OperationalSafetyError(
+                                    "funding boundary wall-clock timestamp rejected"
+                                )
+                            if wall_clock_ms < binding.route.settlement_at_ms:
+                                # The public event may be published before the
+                                # venue's settlement boundary.  Do not cache
+                                # it: keep this same socket open for a
+                                # post-settlement observation under the
+                                # existing absolute deadline.
+                                continue
                             self._funding_event = event
                             return
                         if message.type in {
