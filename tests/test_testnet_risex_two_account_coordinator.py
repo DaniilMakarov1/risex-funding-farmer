@@ -40,6 +40,7 @@ from risex_farmer.testnet_risex_two_account_coordinator import (
     PAGE_LIMIT,
     PORTFOLIO_PATH,
     PLACE_PATH,
+    PROPAGATION_SETTLE_SECONDS,
     PrivateEventEvidence,
     RestOrder,
     RestTrade,
@@ -638,6 +639,17 @@ def make_lifecycle(tmp_path: Path, venue: LifecycleVenue):
     )
 
 
+@pytest.fixture
+def propagation_sleep(monkeypatch):
+    calls = []
+
+    async def instant_sleep(delay):
+        calls.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", instant_sleep)
+    return calls
+
+
 def _halted_entry_coordinator(tmp_path: Path):
     valid_observations, rounds = lifecycle_observations()
     bad_observations = list(valid_observations)
@@ -659,7 +671,9 @@ def _halted_entry_coordinator(tmp_path: Path):
     return coordinator, venue, valid_observations, rounds
 
 
-def test_complete_two_account_lifecycle_is_sequential_and_reduce_only(tmp_path: Path):
+def test_complete_two_account_lifecycle_is_sequential_and_reduce_only(
+    tmp_path: Path, propagation_sleep,
+):
     observations, rounds = lifecycle_observations()
     venue = LifecycleVenue(observations, rounds)
     coordinator = make_lifecycle(tmp_path, venue)
@@ -682,9 +696,12 @@ def test_complete_two_account_lifecycle_is_sequential_and_reduce_only(tmp_path: 
     assert exit_maker_request["reduce_only"] is True
     assert exit_request["side"] == 1 and exit_request["reduce_only"] is True
     assert report.final_rounds == 2
+    assert propagation_sleep == []
 
 
-def test_exact_order_history_propagation_mismatch_allows_one_fresh_resample(tmp_path: Path):
+def test_exact_order_history_propagation_mismatch_settles_before_one_fresh_resample(
+    tmp_path: Path, propagation_sleep,
+):
     observations, rounds = lifecycle_observations()
     venue = PropagatingLifecycleVenue(
         observations, rounds, propagation_failures=1,
@@ -702,9 +719,52 @@ def test_exact_order_history_propagation_mismatch_allows_one_fresh_resample(tmp_
     assert coordinator._journals[AccountRole.COUNTERPARTY].terminal(
         f"place_resample:{entry_maker.intent_id}"
     ) == "USED"
+    assert propagation_sleep == [PROPAGATION_SETTLE_SECONDS]
 
 
-def test_taker_propagation_mismatch_allows_current_taker_or_paired_maker(tmp_path: Path):
+def test_propagation_settlement_cancellation_consumes_allowance_without_resample(
+    tmp_path: Path, monkeypatch,
+):
+    observations, rounds = lifecycle_observations()
+    venue = PropagatingLifecycleVenue(
+        observations, rounds, propagation_failures=1,
+    )
+    coordinator = make_lifecycle(tmp_path, venue)
+    sleep_calls = []
+    sleep_started = asyncio.Event()
+    durable_markers = []
+
+    async def cancellable_sleep(delay):
+        intent = coordinator._journals[AccountRole.COUNTERPARTY].by_step("ENTRY_MAKER")
+        assert intent is not None
+        key = f"place_resample:{intent.intent_id}"
+        sleep_calls.append(delay)
+        durable_markers.append(tuple(
+            coordinator._journals[role].terminal(key)
+            for role in (AccountRole.PRIMARY, AccountRole.COUNTERPARTY)
+        ))
+        sleep_started.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(asyncio, "sleep", cancellable_sleep)
+
+    async def cancel_during_settlement():
+        task = asyncio.create_task(coordinator.run())
+        await sleep_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(cancel_during_settlement())
+    assert sleep_calls == [PROPAGATION_SETTLE_SECONDS]
+    assert durable_markers == [("USED", "USED")]
+    assert venue.observe_calls == 2
+    assert [role for role, _ in venue.place_calls] == [AccountRole.COUNTERPARTY]
+
+
+def test_taker_propagation_mismatch_allows_current_taker_or_paired_maker(
+    tmp_path: Path, propagation_sleep,
+):
     observations, rounds = lifecycle_observations()
     paired_maker_id = observations[2].accounts[
         AccountRole.COUNTERPARTY
@@ -722,9 +782,12 @@ def test_taker_propagation_mismatch_allows_current_taker_or_paired_maker(tmp_pat
     assert coordinator._journals[AccountRole.PRIMARY].terminal(
         f"place_resample:{entry_taker.intent_id}"
     ) == "USED"
+    assert propagation_sleep == [PROPAGATION_SETTLE_SECONDS]
 
 
-def test_exact_order_history_propagation_mismatch_halts_after_one_resample(tmp_path: Path):
+def test_exact_order_history_propagation_mismatch_halts_after_one_resample(
+    tmp_path: Path, propagation_sleep,
+):
     observations, rounds = lifecycle_observations()
     venue = PropagatingLifecycleVenue(
         observations, rounds, propagation_failures=2,
@@ -736,9 +799,12 @@ def test_exact_order_history_propagation_mismatch_halts_after_one_resample(tmp_p
     assert venue.observe_calls == 3
     assert [role for role, _ in venue.place_calls] == [AccountRole.COUNTERPARTY]
     assert coordinator.phase is Phase.HALTED
+    assert propagation_sleep == [PROPAGATION_SETTLE_SECONDS]
 
 
-def test_older_stage_propagation_mismatch_is_terminal_without_resample(tmp_path: Path):
+def test_older_stage_propagation_mismatch_is_terminal_without_resample(
+    tmp_path: Path, propagation_sleep,
+):
     observations, rounds = lifecycle_observations()
     older_entry_order_id = observations[2].accounts[
         AccountRole.COUNTERPARTY
@@ -763,6 +829,7 @@ def test_older_stage_propagation_mismatch_is_terminal_without_resample(tmp_path:
     assert coordinator._journals[AccountRole.COUNTERPARTY].terminal(
         f"place_resample:{exit_maker.intent_id}"
     ) is None
+    assert propagation_sleep == []
 
 
 def test_order_history_propagation_classifier_is_monotonic_and_immutable():
@@ -968,7 +1035,9 @@ def test_partial_mutual_fill_halts_before_second_maker(tmp_path: Path):
     assert [role for role, _ in venue.place_calls] == [AccountRole.COUNTERPARTY, AccountRole.PRIMARY]
 
 
-def test_external_entry_maker_fill_halts_before_primary_dispatch(tmp_path: Path):
+def test_external_entry_maker_fill_halts_before_primary_dispatch(
+    tmp_path: Path, propagation_sleep,
+):
     observations, rounds = lifecycle_observations()
     maker = observations[1].accounts[AccountRole.COUNTERPARTY].open_orders[0]
     filled = replace(maker, status="FILLED", filled_size=Decimal("0.1"))
@@ -995,6 +1064,7 @@ def test_external_entry_maker_fill_halts_before_primary_dispatch(tmp_path: Path)
     assert report.failure_code == "RISEx resting order proof rejected"
     assert report.primary_dispatches == 0
     assert [role for role, _ in venue.place_calls] == [AccountRole.COUNTERPARTY]
+    assert propagation_sleep == [PROPAGATION_SETTLE_SECONDS]
 
 
 def test_process_death_after_durable_dispatch_never_replays(tmp_path: Path):

@@ -77,6 +77,10 @@ from .risex_private_read_operational import (
 
 MAX_AGE_SECONDS = 5
 MAX_PERMIT_SECONDS = 60
+# One existing venue-local freshness window is the bounded propagation
+# settlement period.  It is deliberately within the permit window and is not
+# a retry or backoff policy.
+PROPAGATION_SETTLE_SECONDS = MAX_AGE_SECONDS
 BOUND_FRACTION = Decimal("0.003")
 MARKET_ID = OFFICIAL_MARKET_ID
 MARKET_SYMBOL = OFFICIAL_MARKET_SYMBOL
@@ -3840,7 +3844,7 @@ class TwoAccountCoordinator:
         return frozenset(allowed)
 
     async def _observe_after_place(self, intent: DurableIntent) -> VenueObservation:
-        """Allow one fresh full read only for the classified propagation defect."""
+        """Allow one fresh full read after classified propagation settlement."""
         try:
             return await self._observe()
         except OrderHistoryPropagationMismatch as error:
@@ -3856,6 +3860,9 @@ class TwoAccountCoordinator:
                     "RISEx exact order/history propagation resample exhausted"
                 ) from None
             self._mark_place_resample_used(intent)
+            # Consume the durable one-use allowance before this cancellable
+            # settlement wait.  Cancellation must propagate and cannot replay.
+            await asyncio.sleep(PROPAGATION_SETTLE_SECONDS)
             return await self._observe()
 
     def _bind_baseline_history(self, role: AccountRole, account: AccountSnapshot) -> None:
