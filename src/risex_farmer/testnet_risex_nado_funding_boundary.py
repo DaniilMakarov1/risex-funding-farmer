@@ -22,6 +22,7 @@ import math
 import os
 from pathlib import Path
 import pwd
+import re
 import threading
 import time
 from typing import Any, Callable, Mapping, Protocol
@@ -83,8 +84,11 @@ TARGET_NADO_MARKET = "ETH-PERP_USDT0"
 TARGET_NADO_PRODUCT_ID = 4
 TARGET_QUANTITY = Decimal("0.1")
 TARGET_MULTIPLIER = Decimal("1")
+FUNDING_INTERVAL_NS = 3_600_000_000_000
+FUNDING_RATE_HISTORY_PATH = _coordinator.FUNDING_RATE_HISTORY_PATH
 
 FUNDING_UNRESOLVED = "UNRESOLVED"
+FUNDING_APPLIED_RATE = "APPLIED_RATE"
 FUNDING_BLOCKER_MISSING_CONTRACT = "RISEX_APPLIED_FUNDING_CONTRACT_MISSING"
 FUNDING_BLOCKER_BOUNDARY_GATE_MISSING = "RISEX_BOUNDARY_GATE_MISSING"
 FUNDING_BLOCKER_BOUNDARY_INTERRUPTED = "RISEX_BOUNDARY_GATE_INTERRUPTED"
@@ -103,8 +107,15 @@ _BOUNDARY_DIGEST_KEY = "funding_boundary:digest"
 _ENTRY_RECONCILIATION_AT_KEY = "funding_entry:reconciled_at_ms"
 _GATE_INVOCATION_KEY = "funding_gate:invocation"
 _GATE_RESULT_KEY = "funding_gate:result"
+_HISTORY_INVOCATION_KEY = "funding_history:invocation"
+_HISTORY_RESULT_KEY = "funding_history:result"
 _FUNDING_STATUS_KEY = "funding:status"
 _FUNDING_BLOCKER_KEY = "funding:blocker"
+_APPLIED_ROW_IDENTITY_KEY = "funding:applied_row:identity"
+_APPLIED_ROW_DIGEST_KEY = "funding:applied_row:digest"
+_APPLIED_ROW_PAYLOAD_KEY = "funding:applied_row:payload"
+_APPLIED_DIRECTION_KEY = "funding:applied:direction"
+_APPLIED_RATE_CASH_KEY = "funding:applied:rate_cash"
 _PROVIDER_PREFIX = "risex_provider:"
 _PROVIDER_ROUND_PREFIX = f"{_PROVIDER_PREFIX}round:"
 _FRESHNESS_MS = MAX_AGE_SECONDS * 1_000
@@ -316,6 +327,65 @@ def _exact_decimal(value: object, label: str) -> Decimal:
     return parsed
 
 
+_CANONICAL_DECIMAL = re.compile(r"^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
+
+
+def _canonical_decimal(
+    value: object, label: str, *, positive: bool = False,
+) -> tuple[Decimal, str]:
+    """Parse one required official decimal without float or lexical ambiguity."""
+    if isinstance(value, bool) or not isinstance(value, (str, int, Decimal)):
+        raise RisexFundingBoundaryError(f"{label} rejected")
+    if isinstance(value, str):
+        if (
+            len(value) > 128
+            or value != value.strip()
+            or not _CANONICAL_DECIMAL.fullmatch(value)
+        ):
+            raise RisexFundingBoundaryError(f"{label} rejected")
+    parsed = _exact_decimal(value, label)
+    if positive and parsed <= 0:
+        raise RisexFundingBoundaryError(f"{label} rejected")
+    if parsed == 0 and parsed.is_signed():
+        raise RisexFundingBoundaryError(f"{label} rejected")
+    text = format(parsed, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    if text in {"", "-0"}:
+        text = "0"
+    if len(text) > 128:
+        raise RisexFundingBoundaryError(f"{label} rejected")
+    return parsed, text
+
+
+def _canonical_timestamp_ns(value: object, label: str) -> int:
+    if type(value) is int:
+        text = str(value)
+    elif (
+        type(value) is str
+        and value.isascii()
+        and value.isdecimal()
+        and (value == "0" or not value.startswith("0"))
+    ):
+        text = value
+    else:
+        raise RisexFundingBoundaryError(f"{label} rejected")
+    try:
+        parsed = int(text)
+    except (TypeError, ValueError):
+        raise RisexFundingBoundaryError(f"{label} rejected") from None
+    if parsed <= 0:
+        raise RisexFundingBoundaryError(f"{label} rejected")
+    return parsed
+
+
+def _canonical_market_id(value: object) -> int:
+    parsed = _canonical_timestamp_ns(value, "RISEx funding history market")
+    if parsed != MARKET_ID:
+        raise RisexFundingBoundaryError("RISEx funding history market rejected")
+    return parsed
+
+
 def _safe_signal_id(value: object) -> str:
     if type(value) is not str or not value or value != value.strip():
         raise RisexFundingBoundaryError("RISEx boundary signal identity rejected")
@@ -360,6 +430,12 @@ def _journal_payload(journal: JournalIdentity) -> dict[str, object]:
 def _boundary_payload(binding: RisexFundingBoundaryBinding) -> dict[str, object]:
     return {
         "route": _route_payload(binding.route),
+        "risex_market_id": MARKET_ID,
+        "risex_funding_interval_ns": FUNDING_INTERVAL_NS,
+        "risex_exposures": {
+            "primary": str(TARGET_QUANTITY),
+            "counterparty": str(TARGET_QUANTITY),
+        },
         "primary_journal": _journal_payload(binding.primary_journal),
         "counterparty_journal": _journal_payload(binding.counterparty_journal),
         "nado_journal": _journal_payload(binding.nado_journal),
@@ -399,6 +475,92 @@ def fixed_funding_route(settlement_at_ms: int) -> FundingRouteBinding:
     except Exception:
         raise RisexFundingBoundaryError("RISEx fixed funding route rejected") from None
     return route
+
+
+def _target_history_interval_ns(
+    binding: RisexFundingBoundaryBinding,
+) -> tuple[int, int]:
+    try:
+        target_end_ns = binding.route.settlement_at_ms * 1_000_000
+    except (TypeError, ValueError, OverflowError):
+        raise RisexFundingBoundaryError("RISEx funding boundary timestamp rejected") from None
+    target_start_ns = target_end_ns - FUNDING_INTERVAL_NS
+    if target_start_ns <= 0:
+        raise RisexFundingBoundaryError("RISEx funding interval rejected")
+    return target_start_ns, target_end_ns
+
+
+@dataclass(frozen=True)
+class RisexAppliedFundingRow:
+    """One official settled rate row bound to the persisted RISEx boundary."""
+
+    market_id: int
+    start_time_ns: int
+    end_time_ns: int
+    funding_rate: Decimal
+    index_price: Decimal
+
+    def assert_contract(self, binding: RisexFundingBoundaryBinding) -> None:
+        try:
+            if (
+                type(self.market_id) is not int
+                or self.market_id != MARKET_ID
+                or type(self.start_time_ns) is not int
+                or type(self.end_time_ns) is not int
+                or self.start_time_ns <= 0
+                or self.end_time_ns <= self.start_time_ns
+                or self.end_time_ns - self.start_time_ns != FUNDING_INTERVAL_NS
+                or type(self.funding_rate) is not Decimal
+                or not self.funding_rate.is_finite()
+                or type(self.index_price) is not Decimal
+                or not self.index_price.is_finite()
+                or self.index_price <= 0
+            ):
+                raise ValueError
+            expected_start_ns, expected_end_ns = _target_history_interval_ns(binding)
+            if (
+                self.start_time_ns != expected_start_ns
+                or self.end_time_ns != expected_end_ns
+            ):
+                raise ValueError
+        except (AttributeError, TypeError, ValueError):
+            raise RisexFundingBoundaryError(
+                "RISEx applied funding row contract rejected"
+            ) from None
+
+    @property
+    def identity(self) -> str:
+        return (
+            f"RISEx:{self.market_id}:{self.start_time_ns}:{self.end_time_ns}"
+        )
+
+    @property
+    def digest(self) -> str:
+        return hashlib.sha256(canonical_payload(self.payload())).hexdigest()
+
+    @property
+    def rate_cash(self) -> Decimal:
+        return self.funding_rate * self.index_price * TARGET_QUANTITY
+
+    def signed_rate_cash(self, direction: str) -> Decimal:
+        if direction == LONG:
+            return -self.rate_cash
+        if direction == SHORT:
+            return self.rate_cash
+        raise RisexFundingBoundaryError("RISEx applied funding direction rejected")
+
+    def payload(self) -> dict[str, object]:
+        _, rate = _canonical_decimal(self.funding_rate, "RISEx funding rate")
+        _, index = _canonical_decimal(
+            self.index_price, "RISEx funding index price", positive=True,
+        )
+        return {
+            "market_id": self.market_id,
+            "start_time_ns": str(self.start_time_ns),
+            "end_time_ns": str(self.end_time_ns),
+            "funding_rate": rate,
+            "index_price": index,
+        }
 
 
 def _signal_payload(signal: HoldReleaseSignal) -> dict[str, object]:
@@ -441,6 +603,179 @@ def _forbidden_funding_claim(value: object) -> bool:
         if normalized in {"funding", "funding_event", "funding_claim"}:
             return True
     return False
+
+
+class _FundingHistoryEvidenceError(RisexFundingBoundaryError):
+    """Internal sanitized reason for one rejected official history read."""
+
+    def __init__(self, reason: str) -> None:
+        if reason not in {
+            FUNDING_BLOCKER_EVIDENCE_MISSING,
+            FUNDING_BLOCKER_EVIDENCE_CONTRADICTORY,
+            FUNDING_BLOCKER_EVIDENCE_STALE,
+        }:
+            raise ValueError("unsupported funding history reason")
+        self.reason = reason
+        super().__init__(reason)
+
+
+_HISTORY_ROW_FIELDS = frozenset({
+    "start_time", "end_time", "funding_rate", "index_price",
+})
+
+
+def _history_failure(reason: str) -> _FundingHistoryEvidenceError:
+    return _FundingHistoryEvidenceError(reason)
+
+
+def _parse_history_row(value: object, *, now_ns: int) -> RisexAppliedFundingRow:
+    if not isinstance(value, Mapping) or not _HISTORY_ROW_FIELDS <= set(value):
+        raise _history_failure(FUNDING_BLOCKER_EVIDENCE_CONTRADICTORY)
+    try:
+        if "market_id" in value:
+            _canonical_market_id(value["market_id"])
+        for key in ("market", "symbol"):
+            if key in value and value[key] != TARGET_RISEX_MARKET:
+                raise ValueError
+        start_time_ns = _canonical_timestamp_ns(
+            value["start_time"], "RISEx funding history start timestamp",
+        )
+        end_time_ns = _canonical_timestamp_ns(
+            value["end_time"], "RISEx funding history end timestamp",
+        )
+        funding_rate, _ = _canonical_decimal(
+            value["funding_rate"], "RISEx funding history rate",
+        )
+        index_price, _ = _canonical_decimal(
+            value["index_price"], "RISEx funding history index price",
+            positive=True,
+        )
+        row = RisexAppliedFundingRow(
+            MARKET_ID,
+            start_time_ns,
+            end_time_ns,
+            funding_rate,
+            index_price,
+        )
+        if (
+            end_time_ns <= start_time_ns
+            or end_time_ns - start_time_ns != FUNDING_INTERVAL_NS
+        ):
+            raise ValueError
+        if end_time_ns > now_ns:
+            raise _history_failure(FUNDING_BLOCKER_EVIDENCE_STALE)
+        return row
+    except _FundingHistoryEvidenceError:
+        raise
+    except (RisexFundingBoundaryError, TypeError, ValueError):
+        raise _history_failure(FUNDING_BLOCKER_EVIDENCE_CONTRADICTORY) from None
+
+
+def _parse_applied_history_response(
+    response: object,
+    binding: RisexFundingBoundaryBinding,
+    *,
+    now: int,
+) -> RisexAppliedFundingRow:
+    """Validate the exact settled history row and its older cadence anchors."""
+    if type(response) is not _coordinator._HTTPObservation:
+        raise _history_failure(FUNDING_BLOCKER_EVIDENCE_MISSING)
+    if response.final_url not in {
+        "", _coordinator.REST_ORIGIN + FUNDING_RATE_HISTORY_PATH,
+    }:
+        raise _history_failure(FUNDING_BLOCKER_EVIDENCE_CONTRADICTORY)
+    try:
+        _coordinator._require_recent(response, now, "funding history")
+    except CoordinatorSafetyError:
+        raise _history_failure(FUNDING_BLOCKER_EVIDENCE_STALE) from None
+    body = response.body
+    if (
+        response.status != 200
+        or not isinstance(body, Mapping)
+        or "data" not in body
+        or not isinstance(body.get("request_id"), str)
+        or not body["request_id"]
+    ):
+        raise _history_failure(FUNDING_BLOCKER_EVIDENCE_MISSING) from None
+    data = body["data"]
+    if (
+        not isinstance(data, Mapping)
+        or not isinstance(data.get("records"), list)
+        or not data["records"]
+        or len(data["records"]) > 256
+    ):
+        raise _history_failure(FUNDING_BLOCKER_EVIDENCE_MISSING)
+    try:
+        now_ns = _coordinator._now_int(now) * 1_000_000_000
+        expected_start_ns, expected_end_ns = _target_history_interval_ns(binding)
+    except (CoordinatorSafetyError, RisexFundingBoundaryError):
+        raise RisexFundingBoundaryError("RISEx funding history boundary rejected") from None
+    try:
+        if "market_id" in data:
+            _canonical_market_id(data["market_id"])
+        for key in ("market", "symbol"):
+            if key in data and data[key] != TARGET_RISEX_MARKET:
+                raise ValueError
+    except (RisexFundingBoundaryError, TypeError, ValueError):
+        raise _history_failure(FUNDING_BLOCKER_EVIDENCE_CONTRADICTORY) from None
+    rows = tuple(
+        _parse_history_row(item, now_ns=now_ns) for item in data["records"]
+    )
+    intervals = tuple((row.start_time_ns, row.end_time_ns) for row in rows)
+    if len(set(intervals)) != len(intervals):
+        raise _history_failure(FUNDING_BLOCKER_EVIDENCE_CONTRADICTORY)
+    target_rows = tuple(
+        row for row in rows
+        if row.start_time_ns == expected_start_ns
+        and row.end_time_ns == expected_end_ns
+    )
+    if not target_rows:
+        if rows and max(row.end_time_ns for row in rows) < expected_end_ns:
+            raise _history_failure(FUNDING_BLOCKER_EVIDENCE_STALE)
+        raise _history_failure(FUNDING_BLOCKER_EVIDENCE_MISSING)
+    if len(target_rows) != 1:
+        raise _history_failure(FUNDING_BLOCKER_EVIDENCE_CONTRADICTORY)
+    by_interval = {
+        (row.start_time_ns, row.end_time_ns): row for row in rows
+    }
+    target = target_rows[0]
+    for offset in (1, 2):
+        adjacent_end_ns = expected_start_ns - (offset - 1) * FUNDING_INTERVAL_NS
+        adjacent_start_ns = adjacent_end_ns - FUNDING_INTERVAL_NS
+        if (adjacent_start_ns, adjacent_end_ns) not in by_interval:
+            raise _history_failure(FUNDING_BLOCKER_EVIDENCE_CONTRADICTORY)
+    return target
+
+
+def _row_from_payload(
+    payload: object, binding: RisexFundingBoundaryBinding,
+) -> RisexAppliedFundingRow:
+    if type(payload) is not dict or set(payload) != {
+        "market_id", "start_time_ns", "end_time_ns", "funding_rate", "index_price",
+    }:
+        raise RisexFundingBoundaryError("RISEx persisted applied row rejected")
+    try:
+        row = RisexAppliedFundingRow(
+            _canonical_market_id(payload["market_id"]),
+            _canonical_timestamp_ns(
+                payload["start_time_ns"], "RISEx persisted start timestamp",
+            ),
+            _canonical_timestamp_ns(
+                payload["end_time_ns"], "RISEx persisted end timestamp",
+            ),
+            _canonical_decimal(
+                payload["funding_rate"], "RISEx persisted funding rate",
+            )[0],
+            _canonical_decimal(
+                payload["index_price"], "RISEx persisted index price", positive=True,
+            )[0],
+        )
+        row.assert_contract(binding)
+        return row
+    except RisexFundingBoundaryError:
+        raise
+    except (TypeError, ValueError):
+        raise RisexFundingBoundaryError("RISEx persisted applied row rejected") from None
 
 
 def _required_observation_timestamps(observation: VenueObservation) -> tuple[int, ...]:
@@ -536,6 +871,7 @@ class HoldReleaseGate(Protocol):
 
 
 PreparationGate = Callable[[FundingBoundaryBinding], object]
+FundingHistoryReader = Callable[[], object]
 
 
 class RisexFundingBoundaryCoordinator(TwoAccountCoordinator):
@@ -554,6 +890,7 @@ class RisexFundingBoundaryCoordinator(TwoAccountCoordinator):
         boundary: FundingBoundaryBinding | None = None,
         hold_release_gate: HoldReleaseGate | None = None,
         preparation_gate: PreparationGate | None = None,
+        funding_history_reader: FundingHistoryReader | None = None,
     ) -> None:
         super().__init__(
             venue=venue,
@@ -570,8 +907,17 @@ class RisexFundingBoundaryCoordinator(TwoAccountCoordinator):
         if preparation_gate is not None and not callable(preparation_gate):
             raise RisexFundingBoundaryError("RISEx preparation gate unavailable")
         self._preparation_gate = preparation_gate
+        if funding_history_reader is not None and not callable(funding_history_reader):
+            raise RisexFundingBoundaryError("RISEx funding history reader unavailable")
+        venue_history_reader = getattr(venue, "funding_rate_history", None)
+        self._funding_history_reader = (
+            funding_history_reader
+            if funding_history_reader is not None
+            else venue_history_reader if callable(venue_history_reader) else None
+        )
         self._preparation_gate_used = False
         self._gate_invocations = 0
+        self._history_reads = 0
         self._venue_closed = False
         if boundary is not None:
             self.bind_funding_boundary(boundary)
@@ -592,6 +938,7 @@ class RisexFundingBoundaryCoordinator(TwoAccountCoordinator):
         boundary: FundingBoundaryBinding | None = None,
         hold_release_gate: HoldReleaseGate | None = None,
         preparation_gate: PreparationGate | None = None,
+        funding_history_reader: FundingHistoryReader | None = None,
     ) -> "RisexFundingBoundaryCoordinator":
         base = TwoAccountCoordinator._fixture(
             venue=venue,
@@ -615,6 +962,7 @@ class RisexFundingBoundaryCoordinator(TwoAccountCoordinator):
             boundary=boundary,
             hold_release_gate=hold_release_gate,
             preparation_gate=preparation_gate,
+            funding_history_reader=funding_history_reader,
         )
 
     def _journal_identity(self, role: AccountRole) -> JournalIdentity:
@@ -738,6 +1086,85 @@ class RisexFundingBoundaryCoordinator(TwoAccountCoordinator):
             raise RisexFundingBoundaryError("RISEx funding blocker rejected")
         self._set_paired_terminal(_FUNDING_STATUS_KEY, FUNDING_UNRESOLVED)
         self._set_paired_terminal(_FUNDING_BLOCKER_KEY, reason)
+
+    def _role_terminal(self, role: AccountRole, key: str) -> str | None:
+        value = self._journals[role].terminal(key)
+        return value
+
+    def _set_role_terminal(self, role: AccountRole, key: str, value: str) -> None:
+        if not isinstance(value, str) or not value:
+            raise RisexFundingBoundaryError("RISEx role journal value rejected")
+        current = self._role_terminal(role, key)
+        if current is not None and current != value:
+            raise RisexFundingBoundaryError("RISEx role journal value is immutable")
+        if current != value:
+            self._journals[role].set_terminal(key, value)
+
+    def _persist_applied_funding(self, row: RisexAppliedFundingRow) -> None:
+        binding = self._require_bound()
+        row.assert_contract(binding)
+        status = self._paired_terminal(_FUNDING_STATUS_KEY)
+        blocker = self._paired_terminal(_FUNDING_BLOCKER_KEY)
+        if status is not None and status != FUNDING_APPLIED_RATE:
+            raise RisexFundingBoundaryError("RISEx applied funding status contradicted")
+        if blocker is not None:
+            raise RisexFundingBoundaryError("RISEx applied funding blocker contradicted")
+        encoded = canonical_payload(row.payload()).decode("ascii")
+        self._set_paired_terminal(_APPLIED_ROW_IDENTITY_KEY, row.identity)
+        self._set_paired_terminal(_APPLIED_ROW_DIGEST_KEY, row.digest)
+        self._set_paired_terminal(_APPLIED_ROW_PAYLOAD_KEY, encoded)
+        self._set_role_terminal(AccountRole.PRIMARY, _APPLIED_DIRECTION_KEY, LONG)
+        self._set_role_terminal(AccountRole.COUNTERPARTY, _APPLIED_DIRECTION_KEY, SHORT)
+        self._set_role_terminal(
+            AccountRole.PRIMARY,
+            _APPLIED_RATE_CASH_KEY,
+            _canonical_decimal(
+                row.signed_rate_cash(LONG), "RISEx primary applied cash",
+            )[1],
+        )
+        self._set_role_terminal(
+            AccountRole.COUNTERPARTY,
+            _APPLIED_RATE_CASH_KEY,
+            _canonical_decimal(
+                row.signed_rate_cash(SHORT), "RISEx counterparty applied cash",
+            )[1],
+        )
+        self._set_paired_terminal(_FUNDING_STATUS_KEY, FUNDING_APPLIED_RATE)
+
+    def _assert_applied_funding(self) -> RisexAppliedFundingRow:
+        binding = self._require_bound()
+        if self._paired_terminal(_FUNDING_STATUS_KEY) != FUNDING_APPLIED_RATE:
+            raise RisexFundingBoundaryError("RISEx applied funding status is missing")
+        if self._paired_terminal(_FUNDING_BLOCKER_KEY) is not None:
+            raise RisexFundingBoundaryError("RISEx applied funding blocker is present")
+        identities = self._paired_terminal(_APPLIED_ROW_IDENTITY_KEY)
+        digests = self._paired_terminal(_APPLIED_ROW_DIGEST_KEY)
+        encoded = self._paired_terminal(_APPLIED_ROW_PAYLOAD_KEY)
+        if identities is None or digests is None or encoded is None:
+            raise RisexFundingBoundaryError("RISEx applied funding row is incomplete")
+        try:
+            payload = json.loads(encoded)
+            if canonical_payload(payload).decode("ascii") != encoded:
+                raise ValueError
+        except (CoordinatorSafetyError, TypeError, ValueError, UnicodeDecodeError):
+            raise RisexFundingBoundaryError("RISEx applied funding row is malformed") from None
+        row = _row_from_payload(payload, binding)
+        if row.identity != identities or row.digest != digests:
+            raise RisexFundingBoundaryError("RISEx applied funding row digest mismatch")
+        expected_directions = {
+            AccountRole.PRIMARY: LONG,
+            AccountRole.COUNTERPARTY: SHORT,
+        }
+        for role, direction in expected_directions.items():
+            if self._role_terminal(role, _APPLIED_DIRECTION_KEY) != direction:
+                raise RisexFundingBoundaryError("RISEx applied funding direction mismatch")
+            expected_cash = _canonical_decimal(
+                row.signed_rate_cash(direction),
+                "RISEx applied funding cash",
+            )[1]
+            if self._role_terminal(role, _APPLIED_RATE_CASH_KEY) != expected_cash:
+                raise RisexFundingBoundaryError("RISEx applied funding cash mismatch")
+        return row
 
     def _assert_fixed_preparation(
         self,
@@ -995,7 +1422,98 @@ class RisexFundingBoundaryCoordinator(TwoAccountCoordinator):
             raise RisexFundingBoundaryError(FUNDING_BLOCKER_EVIDENCE_STALE)
         return value
 
-    def _resolve_hold_release(self) -> bool:
+    def _history_invocation_id(self) -> str:
+        binding = self._require_bound()
+        return _canonical_digest({
+            "binding_digest": binding.identity_digest,
+            "purpose": "RISEx_APPLIED_FUNDING_HISTORY",
+        })
+
+    def _persist_history_result(self, result: str) -> None:
+        if not isinstance(result, str) or not result:
+            raise RisexFundingBoundaryError("RISEx funding history result rejected")
+        self._set_paired_terminal(_HISTORY_RESULT_KEY, result)
+
+    def _record_history_blocker(self, reason: str) -> bool:
+        self._persist_history_result(f"BLOCKED|{reason}")
+        self._persist_funding_blocker(reason)
+        return False
+
+    async def _resolve_applied_funding(self) -> bool:
+        """Read and durably bind one official settled rate after release."""
+        binding = self._require_bound()
+        status = self._paired_terminal(_FUNDING_STATUS_KEY)
+        if status == FUNDING_APPLIED_RATE:
+            self._assert_applied_funding()
+            return True
+        if status == FUNDING_UNRESOLVED:
+            blocker = self._paired_terminal(_FUNDING_BLOCKER_KEY)
+            if blocker not in _KNOWN_FUNDING_BLOCKERS:
+                raise RisexFundingBoundaryError("RISEx funding blocker is missing")
+            return False
+        if status is not None:
+            raise RisexFundingBoundaryError("RISEx funding status contract rejected")
+
+        history_result = self._paired_terminal(_HISTORY_RESULT_KEY)
+        if history_result is not None:
+            if history_result.startswith("APPLIED|"):
+                row = self._assert_applied_funding()
+                if history_result != f"APPLIED|{row.identity}|{row.digest}":
+                    raise RisexFundingBoundaryError(
+                        "RISEx persisted funding history result rejected"
+                    )
+                return True
+            if history_result.startswith("BLOCKED|"):
+                reason = history_result[len("BLOCKED|"):]
+                if reason not in _KNOWN_FUNDING_BLOCKERS:
+                    raise RisexFundingBoundaryError(
+                        "RISEx persisted funding history blocker rejected"
+                    )
+                self._persist_funding_blocker(reason)
+                return False
+            raise RisexFundingBoundaryError("RISEx persisted funding history result rejected")
+
+        invocation_id = self._history_invocation_id()
+        prior_invocation = self._paired_terminal(_HISTORY_INVOCATION_KEY)
+        if prior_invocation is not None:
+            if prior_invocation != f"STARTED|{invocation_id}":
+                raise RisexFundingBoundaryError(
+                    "RISEx funding history invocation identity rejected"
+                )
+            return self._record_history_blocker(FUNDING_BLOCKER_BOUNDARY_INTERRUPTED)
+
+        self._set_paired_terminal(
+            _HISTORY_INVOCATION_KEY, f"STARTED|{invocation_id}"
+        )
+        reader = self._funding_history_reader
+        if reader is None:
+            return self._record_history_blocker(FUNDING_BLOCKER_MISSING_CONTRACT)
+        self._history_reads += 1
+        try:
+            response = reader()
+            if inspect.isawaitable(response):
+                response = await response
+        except asyncio.CancelledError:
+            return self._record_history_blocker(FUNDING_BLOCKER_BOUNDARY_INTERRUPTED)
+        except Exception:
+            return self._record_history_blocker(FUNDING_BLOCKER_EVIDENCE_MISSING)
+        try:
+            row = _parse_applied_history_response(
+                response,
+                binding,
+                now=_coordinator._now_int(self._now()),
+            )
+        except _FundingHistoryEvidenceError as error:
+            return self._record_history_blocker(error.reason)
+        except CoordinatorSafetyError:
+            raise
+        except Exception:
+            return self._record_history_blocker(FUNDING_BLOCKER_EVIDENCE_CONTRADICTORY)
+        self._persist_applied_funding(row)
+        self._persist_history_result(f"APPLIED|{row.identity}|{row.digest}")
+        return True
+
+    async def _resolve_hold_release(self) -> bool:
         """Resolve the one gate once, durably, after exact entry reconciliation."""
         binding = self._require_bound()
         invocation_id = self._gate_invocation_id()
@@ -1003,8 +1521,7 @@ class RisexFundingBoundaryCoordinator(TwoAccountCoordinator):
         if prior_result is not None:
             if prior_result.startswith("RELEASED|"):
                 self._decode_persisted_release(prior_result[len("RELEASED|"):])
-                self._persist_funding_blocker(FUNDING_BLOCKER_MISSING_CONTRACT)
-                return True
+                return await self._resolve_applied_funding()
             if prior_result.startswith("BLOCKED|"):
                 reason = prior_result[len("BLOCKED|"):]
                 if reason not in _KNOWN_FUNDING_BLOCKERS:
@@ -1048,10 +1565,7 @@ class RisexFundingBoundaryCoordinator(TwoAccountCoordinator):
         if signal.kind == BoundarySignalKind.CANCELLED.value:
             return self._record_gate_blocker(FUNDING_BLOCKER_CANCELLED)
         self._persist_gate_result(f"RELEASED|{_signal_json(signal)}")
-        # RISEx has no accepted applied-funding cash/status wire contract.
-        # Even a valid coordination release therefore remains UNRESOLVED.
-        self._persist_funding_blocker(FUNDING_BLOCKER_MISSING_CONTRACT)
-        return True
+        return await self._resolve_applied_funding()
 
     def _assert_gate_before_exit(self) -> None:
         result = self._paired_terminal(_GATE_RESULT_KEY)
@@ -1064,10 +1578,14 @@ class RisexFundingBoundaryCoordinator(TwoAccountCoordinator):
                 raise RisexFundingBoundaryError("RISEx exit gate blocker rejected")
         else:
             raise RisexFundingBoundaryError("RISEx exit gate decision is missing")
-        if self._paired_terminal(_FUNDING_STATUS_KEY) != FUNDING_UNRESOLVED:
-            raise RisexFundingBoundaryError("RISEx funding status contract is not unresolved")
-        if self._paired_terminal(_FUNDING_BLOCKER_KEY) not in _KNOWN_FUNDING_BLOCKERS:
-            raise RisexFundingBoundaryError("RISEx funding blocker is missing")
+        status = self._paired_terminal(_FUNDING_STATUS_KEY)
+        if status == FUNDING_APPLIED_RATE:
+            self._assert_applied_funding()
+        elif status == FUNDING_UNRESOLVED:
+            if self._paired_terminal(_FUNDING_BLOCKER_KEY) not in _KNOWN_FUNDING_BLOCKERS:
+                raise RisexFundingBoundaryError("RISEx funding blocker is missing")
+        else:
+            raise RisexFundingBoundaryError("RISEx funding status contract is missing")
 
     async def _preflight(self) -> CoordinatorReport | None:
         if self.phase is Phase.START:
@@ -1095,7 +1613,7 @@ class RisexFundingBoundaryCoordinator(TwoAccountCoordinator):
         if entry_at_ms >= binding.route.settlement_at_ms:
             self._record_gate_blocker(FUNDING_BLOCKER_ENTRY_AFTER_BOUNDARY)
         else:
-            self._resolve_hold_release()
+            await self._resolve_hold_release()
         # The gate may have waited for the boundary.  Never use the pre-gate
         # snapshot for flattening; obtain a new authoritative full observation.
         fresh = await self._observe()
@@ -1705,6 +2223,7 @@ async def _build_fresh_production_coordinator(
             identity_factory=base._identity_factory,
             hold_release_gate=hold_release_gate,
             preparation_gate=preparation_gate,
+            funding_history_reader=base._venue.funding_rate_history,
         )
     except Exception:
         await base._venue.close()
@@ -1730,6 +2249,7 @@ def build_risex_nado_funding_boundary_bridge(
 
 __all__ = [
     "BoundarySignalKind",
+    "FUNDING_APPLIED_RATE",
     "FUNDING_BLOCKER_AUTHORITATIVE_INJECTION",
     "FUNDING_BLOCKER_BOUNDARY_GATE_MISSING",
     "FUNDING_BLOCKER_BOUNDARY_INTERRUPTED",
@@ -1741,6 +2261,8 @@ __all__ = [
     "FUNDING_BLOCKER_GATE_CALLBACK_CANCELLED",
     "FUNDING_BOUNDARY_COUNTERPARTY_JOURNAL",
     "FUNDING_BOUNDARY_PRIMARY_JOURNAL",
+    "FUNDING_INTERVAL_NS",
+    "FUNDING_RATE_HISTORY_PATH",
     "FundingBoundaryReport",
     "FundingBoundaryResult",
     "FUNDING_BLOCKER_MISSING_CONTRACT",
@@ -1748,10 +2270,12 @@ __all__ = [
     "HoldReleaseGate",
     "HoldReleaseSignal",
     "PreparationGate",
+    "FundingHistoryReader",
     "RisexCoordinationLoopBridge",
     "RisexFundingBoundaryBinding",
     "RisexFundingBoundaryCoordinator",
     "RisexFundingBoundaryError",
+    "RisexAppliedFundingRow",
     "RisexTerminalEvidenceProvider",
     "TARGET_CANONICAL_ASSET",
     "TARGET_NADO_MARKET",

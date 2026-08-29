@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from decimal import Decimal
 import inspect
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import threading
@@ -28,7 +29,10 @@ from risex_farmer.testnet_risex_nado_funding_boundary import (
     FUNDING_BLOCKER_EVIDENCE_STALE,
     FUNDING_BLOCKER_ENTRY_AFTER_BOUNDARY,
     FUNDING_BLOCKER_GATE_CALLBACK_CANCELLED,
+    FUNDING_APPLIED_RATE,
     FUNDING_BLOCKER_MISSING_CONTRACT,
+    FUNDING_INTERVAL_NS,
+    FUNDING_RATE_HISTORY_PATH,
     FUNDING_BOUNDARY_COUNTERPARTY_JOURNAL,
     FUNDING_BOUNDARY_PRIMARY_JOURNAL,
     FundingBoundaryResult,
@@ -127,7 +131,13 @@ def _retime_observation(observation, observed_at: int, *, rest_round: int):
     return replace(observation, market=market, accounts=accounts, rest_round=rest_round)
 
 
-def _lifecycle_fixture(tmp_path: Path, *, gate=None, settlement_at_ms=SETTLEMENT_AT_MS):
+def _lifecycle_fixture(
+    tmp_path: Path,
+    *,
+    gate=None,
+    settlement_at_ms=SETTLEMENT_AT_MS,
+    history_reader=None,
+):
     observations, rounds = lifecycle_observations()
     original = LifecycleVenue(observations, rounds)
     observations = list(observations[:3]) + [observations[2]] + list(observations[3:])
@@ -142,6 +152,7 @@ def _lifecycle_fixture(tmp_path: Path, *, gate=None, settlement_at_ms=SETTLEMENT
         counterparty_journal=tmp_path / "counterparty.sqlite3",
         now=lambda: NOW_FOR_TERMINAL,
         identity_factory=identity_factory,
+        funding_history_reader=history_reader,
     )
     route = fixed_funding_route(settlement_at_ms)
     boundary = FundingBoundaryBinding(
@@ -199,6 +210,56 @@ def _released_gate(observed_at_ms=SETTLEMENT_AT_MS):
             signal_id="release-1",
         )
     return gate
+
+
+def _history_rows(binding, *, rate="0.001", index_price="3000.00"):
+    end = binding.route.settlement_at_ms * 1_000_000
+    interval = FUNDING_INTERVAL_NS
+    return [
+        {
+            "start_time": str(end - interval),
+            "end_time": str(end),
+            "funding_rate": rate,
+            "index_price": index_price,
+        },
+        {
+            "start_time": str(end - 2 * interval),
+            "end_time": str(end - interval),
+            "funding_rate": "0.0009",
+            "index_price": index_price,
+        },
+        {
+            "start_time": str(end - 3 * interval),
+            "end_time": str(end - 2 * interval),
+            "funding_rate": "0.0008",
+            "index_price": index_price,
+        },
+    ]
+
+
+def _history_response(
+    binding,
+    *,
+    rows=None,
+    rate="0.001",
+    observed_at=NOW_FOR_TERMINAL,
+    include_additive=True,
+):
+    data = {"records": list(rows if rows is not None else _history_rows(binding, rate=rate))}
+    if include_additive:
+        data["irrelevant_metadata"] = {"source": "fixture-only"}
+    body = {
+        "data": data,
+        "request_id": "funding-history-1",
+    }
+    if include_additive:
+        body["irrelevant_response_metadata"] = {"transport": "fixture-only"}
+    return coordinator_module._HTTPObservation(
+        200,
+        coordinator_module.REST_ORIGIN + FUNDING_RATE_HISTORY_PATH,
+        body,
+        observed_at,
+    )
 
 
 def test_fixed_route_is_exact_eth_two_venue_opposite_direction_contract():
@@ -385,6 +446,154 @@ def test_valid_gate_reconciles_after_release_then_flattens_and_blocks_missing_co
         assert lifecycle.phase is coordinator_module.Phase.COMPLETE
     finally:
         _close_fixture(lifecycle)
+
+
+@pytest.mark.parametrize(
+    ("rate", "primary_cash", "counterparty_cash"),
+    [
+        ("-0.0002", "0.06", "-0.06"),
+        ("0", "0", "0"),
+    ],
+)
+def test_valid_official_history_persists_applied_rate_and_flattens(
+    tmp_path: Path, rate: str, primary_cash: str, counterparty_cash: str,
+):
+    holder = {}
+    history_calls = []
+
+    def history_reader():
+        history_calls.append(True)
+        return _history_response(holder["binding"], rate=rate)
+
+    lifecycle, boundary, venue, _, _ = _lifecycle_fixture(
+        tmp_path,
+        gate=_released_gate(),
+        history_reader=history_reader,
+    )
+    holder["binding"] = boundary
+    try:
+        report = asyncio.run(lifecycle.run())
+        assert report.result is FundingBoundaryResult.COMPLETE
+        assert report.funding_status == FUNDING_APPLIED_RATE
+        assert report.funding_blocker is None
+        assert history_calls == [True]
+        assert [role for role, _ in venue.place_calls] == [
+            coordinator_module.AccountRole.COUNTERPARTY,
+            coordinator_module.AccountRole.PRIMARY,
+            coordinator_module.AccountRole.COUNTERPARTY,
+            coordinator_module.AccountRole.PRIMARY,
+        ]
+        primary = lifecycle._journals[coordinator_module.AccountRole.PRIMARY]
+        counterparty = lifecycle._journals[coordinator_module.AccountRole.COUNTERPARTY]
+        boundary_payload = json.loads(
+            primary.terminal(boundary_module._BOUNDARY_PAYLOAD_KEY)
+        )
+        assert boundary_payload["risex_market_id"] == coordinator_module.MARKET_ID
+        assert boundary_payload["risex_funding_interval_ns"] == FUNDING_INTERVAL_NS
+        assert boundary_payload["risex_exposures"] == {
+            "primary": "0.1", "counterparty": "0.1",
+        }
+        assert primary.terminal(boundary_module._APPLIED_ROW_IDENTITY_KEY) == (
+            counterparty.terminal(boundary_module._APPLIED_ROW_IDENTITY_KEY)
+        )
+        assert primary.terminal(boundary_module._APPLIED_ROW_DIGEST_KEY) == (
+            counterparty.terminal(boundary_module._APPLIED_ROW_DIGEST_KEY)
+        )
+        assert primary.terminal(boundary_module._APPLIED_ROW_PAYLOAD_KEY) == (
+            counterparty.terminal(boundary_module._APPLIED_ROW_PAYLOAD_KEY)
+        )
+        assert primary.terminal(boundary_module._APPLIED_DIRECTION_KEY) == "LONG"
+        assert counterparty.terminal(boundary_module._APPLIED_DIRECTION_KEY) == "SHORT"
+        assert primary.terminal(boundary_module._APPLIED_RATE_CASH_KEY) == primary_cash
+        assert counterparty.terminal(boundary_module._APPLIED_RATE_CASH_KEY) == counterparty_cash
+        assert asyncio.run(lifecycle._resolve_applied_funding()) is True
+        assert history_calls == [True]
+        assert lifecycle.phase is coordinator_module.Phase.COMPLETE
+    finally:
+        _close_fixture(lifecycle)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    [
+        ("missing_records", FUNDING_BLOCKER_EVIDENCE_MISSING),
+        ("not_published", FUNDING_BLOCKER_EVIDENCE_STALE),
+        ("stale_response", FUNDING_BLOCKER_EVIDENCE_STALE),
+        ("duplicate", boundary_module.FUNDING_BLOCKER_EVIDENCE_CONTRADICTORY),
+        ("cadence", boundary_module.FUNDING_BLOCKER_EVIDENCE_CONTRADICTORY),
+        ("wrong_market", boundary_module.FUNDING_BLOCKER_EVIDENCE_CONTRADICTORY),
+        ("wrong_interval", boundary_module.FUNDING_BLOCKER_EVIDENCE_CONTRADICTORY),
+        ("malformed_decimal", boundary_module.FUNDING_BLOCKER_EVIDENCE_CONTRADICTORY),
+    ],
+)
+def test_invalid_official_history_remains_blocked_but_reduce_only_close_completes(
+    tmp_path: Path, mutation: str, expected: str,
+):
+    holder = {}
+    history_calls = []
+
+    def history_reader():
+        history_calls.append(True)
+        binding = holder["binding"]
+        rows = _history_rows(binding)
+        if mutation == "missing_records":
+            return coordinator_module._HTTPObservation(
+                200, "", {"data": {"other": []}, "request_id": "history"},
+                NOW_FOR_TERMINAL,
+            )
+        if mutation == "not_published":
+            rows = rows[1:]
+        elif mutation == "stale_response":
+            return _history_response(
+                binding, rows=rows,
+                observed_at=NOW_FOR_TERMINAL - boundary_module.MAX_AGE_SECONDS - 1,
+            )
+        elif mutation == "duplicate":
+            rows = [*rows, rows[0]]
+        elif mutation == "cadence":
+            rows[1] = dict(
+                rows[1],
+                start_time=str(int(rows[1]["start_time"]) + 1),
+                end_time=str(int(rows[1]["end_time"]) + 1),
+            )
+        elif mutation == "wrong_market":
+            rows[0] = dict(rows[0], market_id="3")
+        elif mutation == "wrong_interval":
+            rows[0] = dict(
+                rows[0], end_time=str(int(rows[0]["end_time"]) + 1),
+            )
+        elif mutation == "malformed_decimal":
+            rows[0] = dict(rows[0], funding_rate=0.001)
+        return _history_response(binding, rows=rows)
+
+    lifecycle, boundary, venue, _, _ = _lifecycle_fixture(
+        tmp_path,
+        gate=_released_gate(),
+        history_reader=history_reader,
+    )
+    holder["binding"] = boundary
+    try:
+        report = asyncio.run(lifecycle.run())
+        assert report.result is FundingBoundaryResult.BLOCKED
+        assert report.funding_status == boundary_module.FUNDING_UNRESOLVED
+        assert report.funding_blocker == expected
+        assert history_calls == [True]
+        assert len(venue.place_calls) == 4
+        assert lifecycle.phase is coordinator_module.Phase.COMPLETE
+    finally:
+        _close_fixture(lifecycle)
+
+
+def test_history_reader_is_exact_market_two_no_query_surface():
+    transport = object.__new__(coordinator_module.FixedRisexTwoAccountTransport)
+    transport._accounts = frozenset({"0x" + "11" * 20, "0x" + "22" * 20})
+    assert transport._target(FUNDING_RATE_HISTORY_PATH, ()) == (
+        coordinator_module.REST_ORIGIN + FUNDING_RATE_HISTORY_PATH
+    )
+    with pytest.raises(coordinator_module.CoordinatorSafetyError):
+        transport._target(FUNDING_RATE_HISTORY_PATH, (("market_id", "2"),))
+    with pytest.raises(coordinator_module.CoordinatorSafetyError):
+        transport._target("/v1/markets/id/3/funding-rate-history", ())
 
 
 @pytest.mark.parametrize(

@@ -1458,7 +1458,7 @@ def test_complete_requires_both_funding_contracts_to_be_completion_eligible(
         config=_Config(
             nado_status="COMPLETE",
             risex_result=_risex.FundingBoundaryResult.COMPLETE,
-            risex_funding_status="APPLIED",
+            risex_funding_status=_risex.FUNDING_APPLIED_RATE,
             risex_blocker=None,
         ),
     )

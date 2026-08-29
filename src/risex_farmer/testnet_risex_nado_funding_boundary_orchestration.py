@@ -1239,7 +1239,7 @@ class FundingBoundaryOrchestrator:
             and nado.funding_status == FUNDING_APPLIED
             and risex.coordinator_report.result is _risex.CoordinatorResult.COMPLETE
             and risex.result is _risex.FundingBoundaryResult.COMPLETE
-            and risex.funding_status != _risex.FUNDING_UNRESOLVED
+            and risex.funding_status == _risex.FUNDING_APPLIED_RATE
             and risex.funding_blocker is None
         )
 
@@ -1257,7 +1257,11 @@ class FundingBoundaryOrchestrator:
             and risex.coordinator_report.result is _risex.CoordinatorResult.COMPLETE
             and risex.coordinator_report.phase is _risex.Phase.COMPLETE
             and (
-                risex.result is _risex.FundingBoundaryResult.COMPLETE
+                (
+                    risex.result is _risex.FundingBoundaryResult.COMPLETE
+                    and risex.funding_status == _risex.FUNDING_APPLIED_RATE
+                    and risex.funding_blocker is None
+                )
                 or (
                     risex.result is _risex.FundingBoundaryResult.BLOCKED
                     and risex.funding_status == _risex.FUNDING_UNRESOLVED

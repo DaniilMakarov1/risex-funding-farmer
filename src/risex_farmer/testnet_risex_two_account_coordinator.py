@@ -108,6 +108,7 @@ PLACE_PATH = "/v1/orders/place"
 CANCEL_PATH = "/v1/orders/cancel"
 HISTORY_PATH = "/v1/orders"
 TRADES_PATH = "/v1/trade-history"
+FUNDING_RATE_HISTORY_PATH = f"/v1/markets/id/{MARKET_ID}/funding-rate-history"
 ORDER_LOOKUP_PATH_TEMPLATE = "/v1/orders/by-id/{order_id}"
 POSITION_PATH = "/v1/account/position"
 POSITIONS_PATH = "/v1/positions"
@@ -805,7 +806,8 @@ class FixedRisexTwoAccountTransport:
         }
         allowed = path in {
             "/v1/auth/session-key-status", "/v1/auth/signers", "/v1/orders/open",
-            "/v1/auth/nonce", HISTORY_PATH, TRADES_PATH, POSITION_PATH,
+            "/v1/auth/nonce", HISTORY_PATH, TRADES_PATH,
+            FUNDING_RATE_HISTORY_PATH, POSITION_PATH,
             POSITIONS_PATH, PORTFOLIO_PATH,
         } or path.startswith("/v1/nonce-state/") or path.startswith("/v1/orders/by-id/")
         if not (path, query) in fixed and not allowed:
@@ -853,6 +855,9 @@ class FixedRisexTwoAccountTransport:
                 raise CoordinatorSafetyError("RISEx paged read surface rejected") from None
             if page <= 0 or page > MAX_PAGINATION_PAGES:
                 raise CoordinatorSafetyError("RISEx paged read surface rejected")
+        elif path == FUNDING_RATE_HISTORY_PATH:
+            if query:
+                raise CoordinatorSafetyError("RISEx funding history read surface rejected")
         elif path == POSITION_PATH:
             if len(query) != 2 or query[0][0] != "account" or query[1] != ("market_id", str(MARKET_ID)):
                 raise CoordinatorSafetyError("RISEx position read surface rejected")
@@ -3289,6 +3294,10 @@ class FixedRisexTwoAccountVenue:
         )
         _validate_market(value, self._now())
         return value
+
+    async def funding_rate_history(self) -> _HTTPObservation:
+        """Read only the fixed market-2 official applied-rate history path."""
+        return await self._transport.get(FUNDING_RATE_HISTORY_PATH)
 
     async def _nonce(self, identity: RoleIdentity) -> tuple[NonceState, int]:
         response = await self._transport.get(NONCE_PATH_TEMPLATE.format(account=identity.account))
