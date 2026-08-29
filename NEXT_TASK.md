@@ -27,9 +27,11 @@ Observed correction slice:
 
 ## Final RISEx–Nado testnet funding-boundary lifecycle
 
-Status: `AUTHORIZED READ GATE — ONE FINAL V11 RISEX–NADO LIFECYCLE ONLY AFTER EXACT FUNDING-SPECIFIC AGREEMENT; RISEX–EXTENDED TESTNET WAIT ENDED; NO WRITE IN FLIGHT`.
+Status: `COMPLETED BLOCKED — THE SINGLE V11 LIFECYCLE WAS USED, BOTH VENUES ARE AUTHORITATIVELY FLAT, FUNDING IS UNRESOLVED, AND NO REPLAY OR FURTHER TESTNET WRITE IS AUTHORIZED`.
 
-Objective: run at most one final bounded v11 RISEx–Nado lifecycle solely to verify the accepted progression/orchestration correction. Open the smallest venue-executable matched testnet positions only after exact read-gate agreement, observe and reconcile actual venue funding semantics at the boundary, then close every leg to authoritative zero relevant orders and exact flatness. RISEx–Extended testnet execution is no longer an active objective.
+Objective: preserve and report the terminal v11 evidence. The corrected owner retrieval behavior was exercised, but Nado progression stopped after entry at `PUBLIC_EVENT_WAIT_STARTED` and never durably accepted the public event, completed account history, or recorded funding/blocker evidence. Funding is `UNRESOLVED`. Accepted sequential reduce-only recovery completed and two agreeing terminal rounds prove zero orders, exact flatness, and no unrelated state. Do not run another lifecycle, resume these journals, or rotate identities.
+
+All detailed v11 gate/scope/evidence text below through this section's Completion paragraph is retained only as the historical contract against which the consumed run was judged. It grants no current read or write action.
 
 Exact starting point:
 
@@ -109,13 +111,13 @@ Forbidden scope:
 
 Completion:
 
-This slice ends after the one final v11 attempt, whether it completes or produces one precise blocker. Acceptance requires authoritative funding-boundary evidence, zero relevant orders, exact flatness, and no unrelated state. Actual zero/negative funding or a venue-proven non-accrual is valid evidence only when eligibility and exposure are authoritative. A successful testnet lifecycle does not authorize mainnet credentials, real funds, or production strategy execution.
+This slice is closed `BLOCKED`: the one final attempt was consumed, recovery and terminal flatness are complete, and the exact funding/progression blocker is recorded above. No further v11 lifecycle or testnet write is authorized.
 
 ## RISEx–Extended Level-D readiness preparation
 
-Status: `AUTHORIZED OFFLINE/READ-ONLY — PUBLIC MAINNET EVIDENCE PASSED FOR BTC LIQUIDITY/MINIMUMS/SCHEDULE; EXACT RISEX ACCOUNT FEE AND ALL PRIVATE/WRITE GATES REMAIN CLOSED`.
+Status: `READY FOR PROTECTED PROVISIONING — PUBLIC/OFFLINE GATE AND ISOLATED LEVEL-D EVIDENCE PATH ACCEPTED ON e640aa1; REAL IDENTITIES, PRIVATE READS, CAPS, DEPOSITS, AND DISPATCH REMAIN UNAUTHORIZED/ABSENT`.
 
-Objective: prepare one isolated manual bounded RISEx–Extended mainnet-readiness path so that a later separately authorized operation requires only protected locally provisioned identities/credentials, user-approved absolute deposit and maximum-loss caps, exact account-scoped fee/read evidence, and one explicit dispatch approval.
+Objective: wait for the user to create separate mainnet wallets/accounts, then use only the accepted hidden-input fixed local provisioning interface. After a separate authorization, run bounded authenticated private-read gates for exact identities, account fees, private streams, unrelated state, and planned deposits. Mainnet deposits and one dispatch remain separate later decisions requiring explicit concrete absolute caps and exact account/venue approval.
 
 Accepted public evidence at `2026-08-29T18:50:56Z`:
 
@@ -124,16 +126,16 @@ Accepted public evidence at `2026-08-29T18:50:56Z`:
 - Public applied histories on both venues contain fresh consecutive hourly records. Extended documents maker `0` and taker `0.00025`; RISEx current fees are account-scoped behind JWT and remain an explicit future private-read blocker. Do not substitute paper fee assumptions.
 - Public reconciliation contracts are identified, but Level D requires future authenticated exact-order/open-order/history/trade/position/funding/fee reads and Extended private WebSocket account ingress. The testnet REST-only Extended fallback is forbidden for a mainnet readiness claim.
 
-Builder slice:
+Accepted implementation:
 
-- One fresh visible Extended-lane GPT-5.6 Luna-max Builder from exact published `main` may add only a route-specific offline/read-only readiness module, focused/adverse fixtures/tests, and a fixed local interactive secret-provisioning interface for separately created RISEx and Extended mainnet identities. It must not import the testnet runners as a mainnet engine, create signing payloads, sign, prepare orders, dispatch, call private endpoints, move funds, or add a generic OMS/execution framework.
+- Published main `e640aa1d76387c45bfebfdae8fee7ac90153051a` contains only the route-specific offline/read-only readiness module, focused/adverse synthetic fixtures/tests, and fixed local interactive protected-identity provisioning interface. It does not import testnet runners as a mainnet engine, construct signing payloads, sign, prepare orders, dispatch, call private endpoints, move funds, or add a generic OMS/execution framework.
 - The readiness gate must fail closed unless: exact separate account identities; protected fixed-path secret files with mode `0600`, no symlink/hardlink and no task/argument/log/DB/report persistence; explicit positive user-approved absolute deposit and maximum-loss caps; `maximum_loss <= deposit_cap`; smallest current common executable quantity within both caps; opposite directions; no own counterparty/self-trade; fresh durable runtime and per-dispatch identities; sequential writes; authoritative fee/minimum/schedule/private-stream readiness; exact entry/order/fill/position and before/at/after funding reconciliation; accepted reduce-only close; two agreeing terminal rounds; zero relevant/trigger orders; exact flatness; and no unrelated state. Missing or contradictory funding is `BLOCKED`; actual zero/negative remains representable.
 - The provisioning interface may be exercised only with synthetic test values during implementation/acceptance. Real mainnet credentials/private access, deposits/bridge/transfers, live payload construction/signing/order preparation/dispatch, positions, funding exposure, withdrawal, and strategy execution remain forbidden. Never request a private key or seed phrase in task/chat.
 
-Acceptance:
+Accepted verification and next gate:
 
-- Chief independently reviews exact scope, official contract mapping, secret/redaction/non-persistence adverse tests, cap arithmetic, state transitions, restart/ambiguity barriers, dependency/import/write surfaces, and one clean isolated Python 3.11 full suite on the final SHA before fast-forward integration and push.
-- This slice can produce only `READY_FOR_PROTECTED_PROVISIONING` or a precise blocker. It cannot authorize mainnet credentials or a dispatch. Before any future mainnet operation, the user must explicitly approve concrete venues/accounts, absolute deposit cap, maximum-loss cap, and exactly one dispatch.
+- Chief independently accepted exact scope, official contract mapping, secret/redaction/non-persistence adverse tests, cap arithmetic, state transitions, restart/ambiguity barriers, dependency/import/write surfaces, `109` focused/adverse tests, and one clean isolated Python 3.11 full suite with `2928` passed and `3` skipped on the final SHA before fast-forward integration and push.
+- Current state is only `READY_FOR_PROTECTED_PROVISIONING`. The interface itself never confers write authority. Do not request secrets in task/chat. Before authenticated private reads, deposits, or any dispatch, obtain the corresponding separate user authorization; one future dispatch additionally requires exact venues/accounts, planned deposits, positive absolute deposit cap, positive maximum-loss cap, and one explicit manual lifecycle approval.
 
 ## Parallel bounded public observation and Telegram delivery correction
 
