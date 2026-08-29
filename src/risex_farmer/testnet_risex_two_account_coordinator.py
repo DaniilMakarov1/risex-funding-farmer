@@ -77,10 +77,9 @@ from .risex_private_read_operational import (
 
 MAX_AGE_SECONDS = 5
 MAX_PERMIT_SECONDS = 60
-# One existing venue-local freshness window is the bounded propagation
-# settlement period.  It is deliberately within the permit window and is not
-# a retry or backoff policy.
-PROPAGATION_SETTLE_SECONDS = MAX_AGE_SECONDS
+# The propagation settlement period is a fixed bounded wait before the single
+# allowlisted resample; it is not a retry or backoff policy.
+PROPAGATION_SETTLE_SECONDS = 60
 BOUND_FRACTION = Decimal("0.003")
 MARKET_ID = OFFICIAL_MARKET_ID
 MARKET_SYMBOL = OFFICIAL_MARKET_SYMBOL

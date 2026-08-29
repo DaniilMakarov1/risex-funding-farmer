@@ -671,6 +671,10 @@ def _halted_entry_coordinator(tmp_path: Path):
     return coordinator, venue, valid_observations, rounds
 
 
+def test_propagation_settlement_bound_is_fixed_sixty_seconds():
+    assert PROPAGATION_SETTLE_SECONDS == 60
+
+
 def test_complete_two_account_lifecycle_is_sequential_and_reduce_only(
     tmp_path: Path, propagation_sleep,
 ):
