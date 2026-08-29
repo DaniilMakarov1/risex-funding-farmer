@@ -2569,21 +2569,62 @@ def test_fixed_rest_paths_and_counterparty_marker_are_sealed(tmp_path: Path, mon
 class _RetryContent:
     def __init__(self, outcome):
         self.outcome = outcome
+        self.read_calls = []
+        self._read = False
 
     async def read(self, limit):
+        self.read_calls.append(limit)
+        if self._read:
+            return b""
+        self._read = True
         if isinstance(self.outcome, BaseException):
             raise self.outcome
         return self.outcome[:limit]
 
 
+class _StreamProtocol:
+    def __init__(self):
+        self.connected = True
+        self._reading_paused = False
+
+    def pause_reading(self):
+        self._reading_paused = True
+
+    def resume_reading(self):
+        self._reading_paused = False
+
+
+def _live_stream_response(transport, chunks, *, terminal=None):
+    reader = aiohttp.StreamReader(_StreamProtocol(), limit=transport.MAX_BYTES)
+    reader.feed_data(chunks[0])
+
+    async def produce():
+        for chunk in chunks[1:]:
+            await asyncio.sleep(0)
+            reader.feed_data(chunk)
+        if terminal is None:
+            reader.feed_eof()
+        else:
+            await asyncio.sleep(0)
+            reader.set_exception(terminal)
+
+    producer = asyncio.create_task(produce())
+    response = _RetryResponse(
+        transport.REST_ORIGIN + "/v1/system/config",
+        body=b"",
+        content=reader,
+    )
+    return response, reader, producer
+
+
 class _RetryResponse:
-    def __init__(self, url, *, body, status=200, content_length=None):
+    def __init__(self, url, *, body, status=200, content_length=None, content=None):
         self.url = url
         self.status = status
         self.history = ()
-        self.content = _RetryContent(body)
+        self.content = content if content is not None else _RetryContent(body)
         self.content_length = (
-            len(body) if content_length is None and isinstance(body, bytes)
+            len(body) if content_length is None and content is None and isinstance(body, bytes)
             else content_length
         )
 
@@ -2623,9 +2664,11 @@ def _retry_transport(session):
     return transport
 
 
-def _retry_response(transport, body, *, status=200, path="/v1/system/config"):
+def _retry_response(
+    transport, body, *, status=200, path="/v1/system/config", content=None,
+):
     return _RetryResponse(
-        transport.REST_ORIGIN + path, body=body, status=status,
+        transport.REST_ORIGIN + path, body=body, status=status, content=content,
     )
 
 
@@ -2635,15 +2678,79 @@ VALID_RETRY_BODY = b'{"data":{},"request_id":"ok"}'
 def test_fixed_transport_get_success_uses_one_attempt():
     session = _RetrySession()
     transport = _retry_transport(session)
-    session.get_outcomes = [_retry_response(transport, VALID_RETRY_BODY)]
+    response_fixture = _retry_response(transport, VALID_RETRY_BODY)
+    session.get_outcomes = [response_fixture]
 
     response = asyncio.run(transport.get("/v1/system/config"))
 
     assert response.body == {"data": {}, "request_id": "ok"}
     assert len(session.get_calls) == 1
+    assert response_fixture.content.read_calls == [
+        transport.MAX_BYTES + 1,
+        transport.MAX_BYTES - len(VALID_RETRY_BODY) + 1,
+    ]
     assert session.get_calls[0][1] == {
         "allow_redirects": False, "proxy": None,
     }
+
+
+def test_fixed_transport_get_drains_live_shaped_multichunk_stream_to_eof():
+    async def exercise():
+        session = _RetrySession()
+        transport = _retry_transport(session)
+        response, reader, producer = _live_stream_response(
+            transport,
+            (b'{"data":', b'{},"request_id":', b'"ok"}'),
+        )
+        session.get_outcomes = [response]
+        try:
+            observed = await transport.get("/v1/system/config")
+            return observed, reader.at_eof(), len(session.get_calls)
+        finally:
+            if not producer.done():
+                producer.cancel()
+            await asyncio.gather(producer, return_exceptions=True)
+
+    response, at_eof, get_call_count = asyncio.run(exercise())
+
+    assert response.body == {"data": {}, "request_id": "ok"}
+    assert at_eof is True
+    assert get_call_count == 1
+
+
+def test_fixed_transport_get_rejects_oversized_decoded_stream_without_retry():
+    async def exercise():
+        session = _RetrySession()
+        transport = _retry_transport(session)
+        transport.MAX_BYTES = 4
+        response, _reader, producer = _live_stream_response(
+            transport, (b"{}", b"xxx"),
+        )
+        session.get_outcomes = [response]
+        try:
+            with pytest.raises(CoordinatorSafetyError, match="response bound rejected"):
+                await transport.get("/v1/system/config")
+            return len(session.get_calls)
+        finally:
+            if not producer.done():
+                producer.cancel()
+            await asyncio.gather(producer, return_exceptions=True)
+
+    assert asyncio.run(exercise()) == 1
+
+
+def test_fixed_transport_get_accepts_exact_decoded_limit_and_checks_eof():
+    session = _RetrySession()
+    transport = _retry_transport(session)
+    transport.MAX_BYTES = 4
+    response_fixture = _retry_response(transport, b"{}  ")
+    session.get_outcomes = [response_fixture]
+
+    response = asyncio.run(transport.get("/v1/system/config"))
+
+    assert response.body == {}
+    assert len(session.get_calls) == 1
+    assert response_fixture.content.read_calls == [5, 1]
 
 
 @pytest.mark.parametrize(
@@ -2681,6 +2788,66 @@ def test_fixed_transport_get_retries_aiohttp_partial_body_then_succeeds():
 
     assert response.body == {"data": {}, "request_id": "ok"}
     assert len(session.get_calls) == 2
+
+
+@pytest.mark.parametrize(
+    "failure",
+    (
+        aiohttp.ClientPayloadError("premature EOF"),
+        ConnectionResetError("reset"),
+        TimeoutError("timeout"),
+    ),
+)
+def test_fixed_transport_get_retries_stream_failure_after_partial_body(failure):
+    async def exercise():
+        session = _RetrySession()
+        transport = _retry_transport(session)
+        first, _reader, producer = _live_stream_response(
+            transport, (b'{"data":',), terminal=failure,
+        )
+        session.get_outcomes = [
+            first, _retry_response(transport, VALID_RETRY_BODY),
+        ]
+        try:
+            observed = await transport.get("/v1/system/config")
+            return observed, len(session.get_calls)
+        finally:
+            if not producer.done():
+                producer.cancel()
+            await asyncio.gather(producer, return_exceptions=True)
+
+    response, get_call_count = asyncio.run(exercise())
+
+    assert response.body == {"data": {}, "request_id": "ok"}
+    assert get_call_count == 2
+
+
+def test_fixed_transport_get_stops_after_two_stream_failures():
+    async def exercise():
+        session = _RetrySession()
+        transport = _retry_transport(session)
+        first, _reader_one, producer_one = _live_stream_response(
+            transport,
+            (b'{"data":',),
+            terminal=aiohttp.ClientPayloadError("first premature EOF"),
+        )
+        second, _reader_two, producer_two = _live_stream_response(
+            transport,
+            (b'{"data":',),
+            terminal=ConnectionResetError("second reset"),
+        )
+        session.get_outcomes = [first, second]
+        try:
+            with pytest.raises(CoordinatorSafetyError, match="transport failed"):
+                await transport.get("/v1/system/config")
+            return len(session.get_calls)
+        finally:
+            for producer in (producer_one, producer_two):
+                if not producer.done():
+                    producer.cancel()
+            await asyncio.gather(producer_one, producer_two, return_exceptions=True)
+
+    assert asyncio.run(exercise()) == 2
 
 
 @pytest.mark.parametrize("raw", (b"", b" \r\n", b'{"data":'))
@@ -2773,6 +2940,19 @@ def test_fixed_transport_get_http_and_schema_semantics_do_not_retry(status, raw)
     response = asyncio.run(transport.get("/v1/system/config"))
     with pytest.raises(CoordinatorSafetyError, match="rejected"):
         _response_data(response)
+
+    assert len(session.get_calls) == 1
+
+
+def test_fixed_transport_get_redirect_does_not_retry():
+    session = _RetrySession()
+    transport = _retry_transport(session)
+    response = _retry_response(transport, VALID_RETRY_BODY)
+    response.url = transport.REST_ORIGIN + "/v1/system/config?redirected=true"
+    session.get_outcomes = [response]
+
+    with pytest.raises(CoordinatorSafetyError, match="redirect rejected"):
+        asyncio.run(transport.get("/v1/system/config"))
 
     assert len(session.get_calls) == 1
 

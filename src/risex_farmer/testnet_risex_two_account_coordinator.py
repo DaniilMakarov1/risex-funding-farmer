@@ -886,9 +886,19 @@ class FixedRisexTwoAccountTransport:
                     raise CoordinatorSafetyError("RISEx REST redirect rejected")
                 if response.content_length is not None and response.content_length > self.MAX_BYTES:
                     raise CoordinatorSafetyError("RISEx REST response bound rejected")
-                raw = await response.content.read(self.MAX_BYTES + 1)
-                if len(raw) > self.MAX_BYTES:
-                    raise CoordinatorSafetyError("RISEx REST response bound rejected")
+                chunks: list[bytes] = []
+                total_bytes = 0
+                while True:
+                    # StreamReader.read(n) may return an available partial chunk;
+                    # keep the request bounded and read until its authoritative EOF.
+                    chunk = await response.content.read(self.MAX_BYTES - total_bytes + 1)
+                    if chunk == b"":
+                        break
+                    if len(chunk) > self.MAX_BYTES - total_bytes:
+                        raise CoordinatorSafetyError("RISEx REST response bound rejected")
+                    chunks.append(chunk)
+                    total_bytes += len(chunk)
+                raw = b"".join(chunks)
                 body = (
                     _strict_get_json_bytes(raw)
                     if response.status == 200
