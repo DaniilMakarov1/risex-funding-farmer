@@ -525,8 +525,11 @@ class PropagatingLifecycleVenue(LifecycleVenue):
     def __init__(
         self, observations, rounds, *, propagation_failures=0,
         propagation_order_id=None, propagation_after_place=None,
+        accepted_order_ids=None,
     ):
-        super().__init__(observations, rounds)
+        super().__init__(
+            observations, rounds, accepted_order_ids=accepted_order_ids,
+        )
         self.propagation_failures = propagation_failures
         self.propagation_order_id = propagation_order_id
         self.propagation_after_place = propagation_after_place
@@ -658,6 +661,58 @@ def make_lifecycle(tmp_path: Path, venue: LifecycleVenue):
         now=lambda: NOW,
         identity_factory=identity_factory,
     )
+
+
+def install_external_entry_maker_fill(observations, rounds):
+    maker = observations[1].accounts[AccountRole.COUNTERPARTY].open_orders[0]
+    filled = replace(maker, status="FILLED", filled_size=Decimal("0.1"))
+    external_trade = trade(
+        trade_id=f"{maker.order_id}-{maker.order_id}",
+        item=filled, side="SELL", price="2999.01",
+    )
+    external_counterparty = account_snapshot(
+        AccountRole.COUNTERPARTY, position="-0.1", trades=(external_trade,),
+    )
+    external_counterparty = replace(
+        external_counterparty, history_orders=(filled,),
+    )
+    observations[1] = pair_observation(
+        account_snapshot(AccountRole.PRIMARY), external_counterparty,
+        book=observations[1].market.book,
+    )
+    for collection, start in ((observations, 2), (rounds, 0)):
+        for index in range(start, len(collection)):
+            current = collection[index]
+            counterparty = current.accounts[AccountRole.COUNTERPARTY]
+            counterparty = replace(
+                counterparty,
+                history_orders=tuple(
+                    filled if item.order_id == maker.order_id else item
+                    for item in counterparty.history_orders
+                ),
+                trades=tuple(
+                    external_trade if item.order_id == maker.order_id else item
+                    for item in counterparty.trades
+                ),
+            )
+            accounts = dict(current.accounts)
+            accounts[AccountRole.COUNTERPARTY] = counterparty
+            collection[index] = replace(current, accounts=accounts)
+    accepted_order_ids = (
+        maker.order_id,
+        next(
+            item.order_id
+            for item in observations[2].accounts[AccountRole.PRIMARY].history_orders
+            if item.client_order_id == 2001
+        ),
+        observations[3].accounts[AccountRole.COUNTERPARTY].open_orders[0].order_id,
+        next(
+            item.order_id
+            for item in observations[4].accounts[AccountRole.PRIMARY].history_orders
+            if item.client_order_id == 2002
+        ),
+    )
+    return maker, external_trade, accepted_order_ids
 
 
 @pytest.fixture
@@ -1213,35 +1268,358 @@ def test_partial_mutual_fill_halts_before_second_maker(tmp_path: Path):
     assert [role for role, _ in venue.place_calls] == [AccountRole.COUNTERPARTY, AccountRole.PRIMARY]
 
 
-def test_external_entry_maker_fill_halts_before_primary_dispatch(
-    tmp_path: Path, propagation_sleep,
+def test_external_entry_maker_fill_is_reconciled_before_primary_dispatch(
+    tmp_path: Path, propagation_sleep, monkeypatch,
 ):
     observations, rounds = lifecycle_observations()
-    maker = observations[1].accounts[AccountRole.COUNTERPARTY].open_orders[0]
-    filled = replace(maker, status="FILLED", filled_size=Decimal("0.1"))
-    external_trade = trade(
-        trade_id=f"{maker.order_id}-{maker.order_id}",
-        item=filled, side="SELL", price="2999.01",
-    )
-    external_counterparty = account_snapshot(
-        AccountRole.COUNTERPARTY, position="-0.1", trades=(external_trade,),
-    )
-    external_counterparty = replace(
-        external_counterparty, history_orders=(filled,),
+    maker, external_trade, accepted_order_ids = install_external_entry_maker_fill(
+        observations, rounds,
     )
     venue = PropagatingLifecycleVenue(
         observations, rounds, propagation_failures=1,
         propagation_order_id=maker.order_id,
+        accepted_order_ids=accepted_order_ids,
+    )
+    coordinator = make_lifecycle(tmp_path, venue)
+    preparation_states = []
+    original_prepare = coordinator._prepare
+
+    def capture_primary_preparation(role, observation, **kwargs):
+        if role is AccountRole.PRIMARY and kwargs["step"] == "ENTRY_TAKER":
+            maker_intent = coordinator._journals[AccountRole.COUNTERPARTY].by_step(
+                "ENTRY_MAKER"
+            )
+            assert maker_intent is not None
+            journal = coordinator._journals[AccountRole.COUNTERPARTY]
+            preparation_states.append(
+                (
+                    maker_intent.state, maker_intent.filled_size,
+                    maker_intent.reconciled, journal.terminal("trade:ENTRY"),
+                    journal.terminal("price:ENTRY"),
+                )
+            )
+        return original_prepare(role, observation, **kwargs)
+
+    monkeypatch.setattr(coordinator, "_prepare", capture_primary_preparation)
+    report = asyncio.run(coordinator.run())
+    assert report.result is CoordinatorResult.COMPLETE
+    assert report.primary_dispatches == 2
+    assert report.counterparty_dispatches == 2
+    assert [role for role, _ in venue.place_calls] == [
+        AccountRole.COUNTERPARTY, AccountRole.PRIMARY,
+        AccountRole.COUNTERPARTY, AccountRole.PRIMARY,
+    ]
+    assert preparation_states == [
+        (
+            "TERMINAL", Decimal("0.1"), True,
+            external_trade.trade_id, str(external_trade.price),
+        )
+    ]
+    maker_intent = coordinator._journals[AccountRole.COUNTERPARTY].by_step("ENTRY_MAKER")
+    assert maker_intent is not None
+    assert maker_intent.state == "TERMINAL"
+    assert maker_intent.filled_size == Decimal("0.1")
+    assert maker_intent.reconciled is True
+    assert coordinator._journals[AccountRole.COUNTERPARTY].terminal(
+        "trade:ENTRY"
+    ) == external_trade.trade_id
+    assert coordinator._journals[AccountRole.COUNTERPARTY].terminal(
+        "price:ENTRY"
+    ) == str(external_trade.price)
+    assert venue.observe_calls == 6
+    assert propagation_sleep == [PROPAGATION_SETTLE_SECONDS]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "cancelled",
+        "partial",
+        "missing_trade",
+        "duplicate_trade",
+        "wrong_position",
+        "open_order",
+        "open_contradiction",
+        "wrong_order_price",
+        "wrong_order_client",
+        "wrong_order_direction",
+        "wrong_trade_order",
+        "wrong_trade_client",
+        "wrong_trade_market",
+        "wrong_trade_side",
+        "wrong_trade_price",
+        "extra_trade",
+        "stale",
+    ],
+)
+def test_external_entry_maker_fill_rejects_non_exact_evidence(
+    tmp_path: Path, propagation_sleep, mutation: str,
+):
+    observations, rounds = lifecycle_observations()
+    maker, matching_trade, accepted_order_ids = install_external_entry_maker_fill(
+        observations, rounds,
+    )
+    filled = observations[1].accounts[AccountRole.COUNTERPARTY].history_orders[0]
+    external_counterparty = observations[1].accounts[AccountRole.COUNTERPARTY]
+
+    if mutation == "cancelled":
+        cancelled = replace(filled, status="CANCELLED", filled_size=Decimal("0"))
+        external_counterparty = replace(external_counterparty, history_orders=(cancelled,))
+    elif mutation == "partial":
+        partial = replace(filled, filled_size=Decimal("0.05"))
+        partial_trade = replace(matching_trade, size=Decimal("0.05"))
+        external_counterparty = replace(
+            external_counterparty, history_orders=(partial,), trades=(partial_trade,),
+        )
+    elif mutation == "missing_trade":
+        external_counterparty = replace(external_counterparty, trades=())
+    elif mutation == "duplicate_trade":
+        external_counterparty = replace(
+            external_counterparty, trades=(matching_trade, matching_trade),
+        )
+    elif mutation == "wrong_position":
+        external_counterparty = with_private(
+            replace(external_counterparty, position=Decimal("-0.05")),
+        )
+    elif mutation == "open_order":
+        external_counterparty = with_private(
+            replace(external_counterparty, open_orders=(filled,)),
+        )
+    elif mutation == "open_contradiction":
+        external_counterparty = with_private(
+            replace(
+                external_counterparty, open_orders=(maker,), history_orders=(),
+            ),
+        )
+    elif mutation == "wrong_order_price":
+        external_counterparty = replace(
+            external_counterparty,
+            history_orders=(replace(filled, price=Decimal("2999.02")),),
+        )
+    elif mutation == "wrong_order_client":
+        external_counterparty = replace(
+            external_counterparty,
+            history_orders=(replace(filled, client_order_id=1009),),
+        )
+    elif mutation == "wrong_order_direction":
+        external_counterparty = replace(
+            external_counterparty,
+            history_orders=(replace(filled, side="BUY"),),
+        )
+    elif mutation == "wrong_trade_order":
+        wrong_order = order(
+            wide=499, client=4499, account=COUNTERPARTY, side="SELL",
+            order_type="LIMIT", tif="GTC", status="FILLED", price="2999.01",
+            filled="0.1", post_only=True,
+        )
+        external_counterparty = replace(
+            external_counterparty,
+            trades=(replace(matching_trade, order_id=wrong_order.order_id),),
+        )
+    elif mutation == "wrong_trade_client":
+        external_counterparty = replace(
+            external_counterparty,
+            trades=(replace(matching_trade, client_order_id=1009),),
+        )
+    elif mutation == "wrong_trade_market":
+        external_counterparty = replace(
+            external_counterparty,
+            trades=(replace(matching_trade, market_id=3),),
+        )
+    elif mutation == "wrong_trade_side":
+        external_counterparty = replace(
+            external_counterparty,
+            trades=(replace(matching_trade, side="BUY"),),
+        )
+    elif mutation == "wrong_trade_price":
+        external_counterparty = replace(
+            external_counterparty,
+            trades=(replace(matching_trade, price=Decimal("2999.02")),),
+        )
+    elif mutation == "extra_trade":
+        extra_order = order(
+            wide=499, client=4499, account=COUNTERPARTY, side="SELL",
+            order_type="LIMIT", tif="GTC", status="FILLED", price="2999.01",
+            filled="0.1", post_only=True,
+        )
+        extra_trade = replace(
+            matching_trade,
+            trade_id=f"{maker.order_id}-{extra_order.order_id}",
+        )
+        external_counterparty = replace(
+            external_counterparty, trades=(matching_trade, extra_trade),
+        )
+    else:
+        external_counterparty = replace(
+            external_counterparty, observed_at=NOW - MAX_AGE_SECONDS - 1,
+        )
+
+    venue = PropagatingLifecycleVenue(
+        observations, rounds, propagation_failures=1,
+        propagation_order_id=maker.order_id,
+        accepted_order_ids=accepted_order_ids,
     )
     venue.observations[1] = pair_observation(
         account_snapshot(AccountRole.PRIMARY), external_counterparty,
         book=observations[1].market.book,
     )
     report = asyncio.run(make_lifecycle(tmp_path, venue).run())
+
     assert report.result is CoordinatorResult.FAILED_HALTED_MANUAL_RECOVERY
-    assert report.failure_code == "RISEx resting order proof rejected"
     assert report.primary_dispatches == 0
+    assert report.counterparty_dispatches == 1
     assert [role for role, _ in venue.place_calls] == [AccountRole.COUNTERPARTY]
+    assert propagation_sleep == [PROPAGATION_SETTLE_SECONDS]
+
+
+def test_external_entry_maker_fill_survives_restart_before_primary_preparation(
+    tmp_path: Path, propagation_sleep, monkeypatch,
+):
+    observations, rounds = lifecycle_observations()
+    maker, external_trade, accepted_order_ids = install_external_entry_maker_fill(
+        observations, rounds,
+    )
+    venue = PropagatingLifecycleVenue(
+        observations, rounds, propagation_failures=1,
+        propagation_order_id=maker.order_id,
+        accepted_order_ids=accepted_order_ids,
+    )
+    coordinator = make_lifecycle(tmp_path, venue)
+    primary_preparations = []
+    original_prepare = coordinator._prepare
+
+    def capture_primary_preparation(role, observation, **kwargs):
+        if role is AccountRole.PRIMARY and kwargs["step"] == "ENTRY_TAKER":
+            primary_preparations.append(True)
+        return original_prepare(role, observation, **kwargs)
+
+    monkeypatch.setattr(coordinator, "_prepare", capture_primary_preparation)
+    original_set_phase = coordinator._set_phase
+
+    def crash_after_external_reconciliation(phase):
+        original_set_phase(phase)
+        if phase is Phase.ENTRY_MAKER_RESTING:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(coordinator, "_set_phase", crash_after_external_reconciliation)
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(coordinator.run())
+
+    counterparty = coordinator._journals[AccountRole.COUNTERPARTY]
+    maker_intent = counterparty.by_step("ENTRY_MAKER")
+    assert maker_intent is not None
+    assert maker_intent.state == "TERMINAL"
+    assert maker_intent.filled_size == Decimal("0.1")
+    assert maker_intent.reconciled is True
+    assert counterparty.terminal("trade:ENTRY") == external_trade.trade_id
+    assert counterparty.terminal("price:ENTRY") == str(external_trade.price)
+    assert primary_preparations == []
+    assert coordinator.phase is Phase.ENTRY_MAKER_RESTING
+    for journal in coordinator._journals.values():
+        journal.close()
+
+    entry_taker_id = next(
+        item.order_id for item in observations[2].accounts[AccountRole.PRIMARY].history_orders
+        if item.client_order_id == 2001
+    )
+    exit_maker_id = observations[3].accounts[AccountRole.COUNTERPARTY].open_orders[0].order_id
+    exit_taker_id = next(
+        item.order_id for item in observations[4].accounts[AccountRole.PRIMARY].history_orders
+        if item.client_order_id == 2002
+    )
+    recovery_venue = LifecycleVenue(
+        observations[1:5], rounds,
+        accepted_order_ids=(entry_taker_id, exit_maker_id, exit_taker_id),
+    )
+    recovered = make_lifecycle(tmp_path, recovery_venue)
+    recovery_preparations = []
+    recovered_original_prepare = recovered._prepare
+
+    def capture_recovery_preparation(role, observation, **kwargs):
+        if role is AccountRole.PRIMARY and kwargs["step"] == "ENTRY_TAKER":
+            journal = recovered._journals[AccountRole.COUNTERPARTY]
+            recovery_preparations.append(
+                (journal.terminal("trade:ENTRY"), journal.terminal("price:ENTRY"))
+            )
+        return recovered_original_prepare(role, observation, **kwargs)
+
+    monkeypatch.setattr(recovered, "_prepare", capture_recovery_preparation)
+    report = asyncio.run(recovered.run())
+    assert report.result is CoordinatorResult.COMPLETE
+    assert recovery_preparations == [(external_trade.trade_id, str(external_trade.price))]
+    assert recovery_venue.place_calls[0][0] is AccountRole.PRIMARY
+    assert [role for role, _ in recovery_venue.place_calls] == [
+        AccountRole.PRIMARY, AccountRole.COUNTERPARTY, AccountRole.PRIMARY,
+    ]
+    assert recovered._journals[AccountRole.COUNTERPARTY].terminal(
+        "trade:ENTRY"
+    ) == external_trade.trade_id
+    assert recovered._journals[AccountRole.COUNTERPARTY].terminal(
+        "price:ENTRY"
+    ) == str(external_trade.price)
+    assert propagation_sleep == [PROPAGATION_SETTLE_SECONDS]
+
+
+@pytest.mark.parametrize("mutation", ["trade_id", "trade_price"])
+def test_external_entry_maker_fill_restart_rejects_changed_identity(
+    tmp_path: Path, propagation_sleep, monkeypatch, mutation: str,
+):
+    observations, rounds = lifecycle_observations()
+    maker, external_trade, accepted_order_ids = install_external_entry_maker_fill(
+        observations, rounds,
+    )
+    venue = PropagatingLifecycleVenue(
+        observations, rounds, propagation_failures=1,
+        propagation_order_id=maker.order_id,
+        accepted_order_ids=accepted_order_ids,
+    )
+    coordinator = make_lifecycle(tmp_path, venue)
+    original_set_phase = coordinator._set_phase
+
+    def crash_after_external_reconciliation(phase):
+        original_set_phase(phase)
+        if phase is Phase.ENTRY_MAKER_RESTING:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(coordinator, "_set_phase", crash_after_external_reconciliation)
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(coordinator.run())
+    counterparty = coordinator._journals[AccountRole.COUNTERPARTY]
+    assert counterparty.terminal("trade:ENTRY") == external_trade.trade_id
+    assert counterparty.terminal("price:ENTRY") == str(external_trade.price)
+    for journal in coordinator._journals.values():
+        journal.close()
+
+    current = observations[1]
+    current_counterparty = current.accounts[AccountRole.COUNTERPARTY]
+    if mutation == "trade_id":
+        changed_trade = replace(
+            external_trade,
+            trade_id=f"0x{302:016x}{1:016x}{1:016x}-{maker.order_id}",
+        )
+    else:
+        changed_trade = replace(external_trade, price=Decimal("2999.02"))
+    changed_counterparty = replace(
+        current_counterparty, trades=(changed_trade,),
+    )
+    bad = replace(current, accounts={
+        AccountRole.PRIMARY: current.accounts[AccountRole.PRIMARY],
+        AccountRole.COUNTERPARTY: changed_counterparty,
+    })
+    recovery_venue = LifecycleVenue([bad], [], accepted_order_ids=())
+    recovered = make_lifecycle(tmp_path, recovery_venue)
+    report = asyncio.run(recovered.run())
+    assert report.result is CoordinatorResult.FAILED_HALTED_MANUAL_RECOVERY
+    assert report.failure_code == "RISEx external maker fill identity contradiction"
+    assert report.primary_dispatches == 0
+    assert report.counterparty_dispatches == 1
+    assert recovery_venue.place_calls == []
+    assert recovered._journals[AccountRole.COUNTERPARTY].terminal(
+        "trade:ENTRY"
+    ) == external_trade.trade_id
+    assert recovered._journals[AccountRole.COUNTERPARTY].terminal(
+        "price:ENTRY"
+    ) == str(external_trade.price)
     assert propagation_sleep == [PROPAGATION_SETTLE_SECONDS]
 
 

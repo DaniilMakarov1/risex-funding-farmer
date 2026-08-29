@@ -2530,6 +2530,112 @@ class PairJournal:
         _fsync_file_and_parent(self.path)
         return self.intent(intent_id)
 
+    def reconcile_external_entry_maker_fill(
+        self, intent_id: str, *, filled_size: Decimal,
+        trade_id: str, price: Decimal,
+    ) -> DurableIntent:
+        """Atomically seal an external entry maker fill and its identities."""
+        current = self.intent(intent_id)
+        try:
+            filled_size = _decimal(filled_size, nonnegative=True)
+            price = _decimal(price, positive=True)
+        except CoordinatorSafetyError:
+            raise CoordinatorSafetyError(
+                "RISEx external maker fill journal rejected"
+            ) from None
+        if not isinstance(trade_id, str):
+            raise CoordinatorSafetyError("RISEx external maker fill journal rejected")
+        try:
+            trade_parts = trade_id.split("-")
+        except Exception:
+            raise CoordinatorSafetyError("RISEx external maker fill journal rejected") from None
+        if (
+            current.step != "ENTRY_MAKER"
+            or current.side != "SELL"
+            or current.order_type != "LIMIT"
+            or current.time_in_force != "GTC"
+            or current.reduce_only
+            or not current.post_only
+            or current.market_id != MARKET_ID
+            or current.size != MARKET_MINIMUM
+            or current.source_position != 0
+            or current.dispatch_count != 1
+            or current.order_id is None
+            or not _valid_order_id(current.order_id)
+            or current.state not in {"DISPATCHED", "TERMINAL"}
+            or current.reconciled != (current.state == "TERMINAL")
+            or current.size != filled_size
+            or price % MARKET_TICK
+            or len(trade_parts) != 2
+            or not all(_valid_order_id(part) for part in trade_parts)
+            or current.order_id not in trade_parts
+            or self.terminal(f"place:{current.intent_id}")
+            != WriteResultClass.ACCEPTED.value
+        ):
+            raise CoordinatorSafetyError("RISEx external maker fill journal rejected")
+        NonceState(current.nonce_anchor, current.nonce_bitmap).validate()
+        trade_key = "trade:ENTRY"
+        price_key = "price:ENTRY"
+        price_value = str(price)
+        existing_trade = self.terminal(trade_key)
+        existing_price = self.terminal(price_key)
+        if current.state == "TERMINAL":
+            if (
+                current.filled_size != filled_size
+                or existing_trade != trade_id
+                or existing_price != price_value
+            ):
+                raise CoordinatorSafetyError(
+                    "RISEx external maker fill identity contradiction"
+                )
+            if current.price != price:
+                raise CoordinatorSafetyError("RISEx external maker fill journal rejected")
+            return current
+        if current.state != "DISPATCHED" or current.filled_size is not None:
+            raise CoordinatorSafetyError("RISEx external maker fill journal rejected")
+        if current.price != price:
+            raise CoordinatorSafetyError("RISEx external maker fill journal rejected")
+        if existing_trade is not None or existing_price is not None:
+            raise CoordinatorSafetyError(
+                "RISEx external maker fill identity contradiction"
+            )
+        try:
+            with self._db:
+                row = self._db.execute(
+                    "SELECT state,filled_size,reconciled FROM intents WHERE intent_id=?",
+                    (intent_id,),
+                ).fetchone()
+                if row is None or row[0] != "DISPATCHED" or row[1] is not None or bool(row[2]):
+                    raise CoordinatorSafetyError(
+                        "RISEx external maker fill journal rejected"
+                    )
+                changed = self._db.execute(
+                    "UPDATE intents SET state='TERMINAL',filled_size=?,reconciled=1 "
+                    "WHERE intent_id=? AND state='DISPATCHED' AND dispatch_count=1 "
+                    "AND reconciled=0",
+                    (str(filled_size), intent_id),
+                ).rowcount
+                if changed != 1:
+                    raise CoordinatorSafetyError(
+                        "RISEx external maker fill journal rejected"
+                    )
+                self._db.execute(
+                    "INSERT INTO terminal(key,value) VALUES (?,?)",
+                    (trade_key, trade_id),
+                )
+                self._db.execute(
+                    "INSERT INTO terminal(key,value) VALUES (?,?)",
+                    (price_key, price_value),
+                )
+        except CoordinatorSafetyError:
+            raise
+        except Exception:
+            raise CoordinatorSafetyError(
+                "RISEx external maker fill journal rejected"
+            ) from None
+        _fsync_file_and_parent(self.path)
+        return self.intent(intent_id)
+
     def recover_entry_fill(
         self, intent_id: str, *, filled_size: Decimal, trade_id: str, price: Decimal,
     ) -> DurableIntent:
@@ -4221,6 +4327,70 @@ class TwoAccountCoordinator:
     def _prove_bid_resting(self, intent: DurableIntent, observation: VenueObservation) -> RestOrder:
         return self._prove_resting(AccountRole.COUNTERPARTY, intent, observation)
 
+    def _reconcile_external_entry_maker_fill(
+        self, intent: DurableIntent, observation: VenueObservation,
+    ) -> None:
+        """Accept only an exact external fill before the primary entry write."""
+        journal = self._journals[AccountRole.COUNTERPARTY]
+        if (
+            intent.step != "ENTRY_MAKER"
+            or intent.side != "SELL"
+            or intent.order_type != "LIMIT"
+            or intent.time_in_force != "GTC"
+            or intent.reduce_only
+            or not intent.post_only
+            or intent.market_id != MARKET_ID
+            or intent.size != MARKET_MINIMUM
+            or intent.source_position != 0
+            or intent.dispatch_count != 1
+            or intent.order_id is None
+            or not _valid_order_id(intent.order_id)
+            or intent.state not in {"DISPATCHED", "TERMINAL"}
+            or intent.reconciled != (intent.state == "TERMINAL")
+            or journal.terminal(f"place:{intent.intent_id}")
+            != WriteResultClass.ACCEPTED.value
+        ):
+            raise CoordinatorSafetyError("RISEx external maker fill dispatch rejected")
+        counterparty = observation.accounts[AccountRole.COUNTERPARTY]
+        primary = observation.accounts[AccountRole.PRIMARY]
+        if counterparty.open_orders or primary.open_orders:
+            raise CoordinatorSafetyError("RISEx external maker fill open state rejected")
+        order = _order_for(counterparty, intent.client_order_id)
+        if order is None:
+            raise CoordinatorSafetyError("RISEx external maker fill order missing")
+        self._ensure_order_matches(intent, order, AccountRole.COUNTERPARTY)
+        if (
+            intent.size != MARKET_MINIMUM
+            or order.status != "FILLED"
+            or order.filled_size != intent.size
+            or order.filled_size != MARKET_MINIMUM
+            or counterparty.position != Decimal("-0.1")
+        ):
+            raise CoordinatorSafetyError("RISEx external maker fill rejected")
+        trades = _trades_for(counterparty, order)
+        if len(trades) != 1:
+            raise CoordinatorSafetyError("RISEx external maker fill trade rejected")
+        trade = trades[0]
+        self._validate_pair_fill_leg(
+            AccountRole.COUNTERPARTY, intent, order, trade,
+        )
+        trade_parts = trade.trade_id.split("-")
+        if (
+            len(trade_parts) != 2
+            or intent.order_id not in trade_parts
+            or trade.order_id != order.order_id
+            or trade.client_order_id != intent.client_order_id
+            or trade.market_id != intent.market_id
+            or trade.account.lower() != self._identities[AccountRole.COUNTERPARTY].account
+            or trade.side != intent.side
+            or trade.size != intent.size
+        ):
+            raise CoordinatorSafetyError("RISEx external maker fill trade binding rejected")
+        journal.reconcile_external_entry_maker_fill(
+            intent.intent_id, filled_size=MARKET_MINIMUM,
+            trade_id=trade.trade_id, price=trade.price,
+        )
+
     def _pair_fill(
         self, maker_role: AccountRole, maker_intent: DurableIntent,
         taker_role: AccountRole, taker_intent: DurableIntent,
@@ -4388,7 +4558,24 @@ class TwoAccountCoordinator:
             else self._observe()
         )
         intent = self._journal_intent(AccountRole.COUNTERPARTY, "ENTRY_MAKER")
-        self._prove_resting(AccountRole.COUNTERPARTY, intent, observation)
+        maker_order = _order_for(
+            observation.accounts[AccountRole.COUNTERPARTY], intent.client_order_id,
+        )
+        if maker_order is not None and maker_order.status == "FILLED":
+            self._reconcile_external_entry_maker_fill(intent, observation)
+        else:
+            if (
+                maker_order is not None
+                and maker_order.status == "OPEN"
+                and (
+                    observation.accounts[AccountRole.COUNTERPARTY].position != 0
+                    or _trades_for(
+                        observation.accounts[AccountRole.COUNTERPARTY], maker_order,
+                    )
+                )
+            ):
+                raise CoordinatorSafetyError("RISEx resting order proof rejected")
+            self._prove_resting(AccountRole.COUNTERPARTY, intent, observation)
         self._set_phase(Phase.ENTRY_MAKER_RESTING)
         return observation
 
@@ -4397,6 +4584,10 @@ class TwoAccountCoordinator:
         if self.phase is Phase.ENTRY_MAKER_RESTING:
             if intent.order_id is None:
                 raise CoordinatorSafetyError("RISEx maker order identity missing")
+            if intent.state == "TERMINAL":
+                self._reconcile_external_entry_maker_fill(intent, observation)
+            elif intent.state != "RESTING":
+                raise CoordinatorSafetyError("RISEx maker reconciliation state rejected")
             if observation.accounts[AccountRole.PRIMARY].position != 0:
                 raise CoordinatorSafetyError("RISEx primary pre-entry state rejected")
             price = _bound(observation.market.book.ask, observation.market.tick, "BUY")
