@@ -12,6 +12,7 @@ from risex_farmer.nado_testnet_lifecycle import (
     FUNDING_APPLIED,
     FUNDING_BLOCKED_CONTRADICTORY,
     FUNDING_BLOCKED_MISSING,
+    FUNDING_PROGRESSION_PUBLIC_EVENT_WAIT_STARTED,
     FUNDING_UNRESOLVED,
     LONG,
     NADO_VENUE,
@@ -37,6 +38,7 @@ from risex_farmer.nado_testnet_lifecycle import (
     nado_funding_exposure_digest,
     terminal_evidence_digest,
     validate_nado_funding_boundary,
+    _funding_boundary_digest,
 )
 
 
@@ -679,6 +681,92 @@ def test_valid_evidence_and_baseline_are_immutable_across_restart(tmp_path: Path
         assert blocked.status == FUNDING_UNRESOLVED
         assert reopened.funding_boundary_blocker() == FUNDING_BLOCKED_CONTRADICTORY
         assert reopened.lifecycle_status() == "HALTED"
+    finally:
+        reopened.close()
+
+
+def test_legacy_exposure_rejects_injected_progression_prefix_on_restart(
+    tmp_path: Path,
+) -> None:
+    binding, baseline, _attestation, _event, _account = _valid_evidence()
+    path = tmp_path / "legacy-injected-progression.sqlite3"
+    store = IntentStore(path)
+    try:
+        store.bind_funding_boundary(binding, baseline)
+        _seed_reconciled_entry(store)
+        store.bind_funding_exposure(_exposure(binding, baseline))
+    finally:
+        store.close()
+
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            """
+            CREATE TABLE nado_funding_progression (
+                step INTEGER PRIMARY KEY,
+                token TEXT NOT NULL,
+                observed_at_ms INTEGER NOT NULL,
+                binding_digest TEXT NOT NULL,
+                relay_kind TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO nado_funding_progression
+                (step, token, observed_at_ms, binding_digest, relay_kind)
+            VALUES (1, ?, ?, ?, NULL)
+            """,
+            (
+                FUNDING_PROGRESSION_PUBLIC_EVENT_WAIT_STARTED,
+                SETTLEMENT - 25,
+                _funding_boundary_digest(binding),
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(NadoContractError):
+        IntentStore(path)
+
+
+def test_legacy_empty_progression_table_remains_readable(tmp_path: Path) -> None:
+    binding, baseline, attestation, event, account = _valid_evidence()
+    path = tmp_path / "legacy-empty-progression.sqlite3"
+    store = IntentStore(path)
+    try:
+        store.bind_funding_boundary(binding, baseline)
+        _seed_reconciled_entry(store)
+        exposure = _exposure(binding, baseline)
+        store.bind_funding_exposure(exposure)
+        store.record_nado_funding_boundary(
+            attestation=attestation, event=event, account_funding=account,
+        )
+    finally:
+        store.close()
+
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            """
+            CREATE TABLE nado_funding_progression (
+                step INTEGER PRIMARY KEY,
+                token TEXT NOT NULL,
+                observed_at_ms INTEGER NOT NULL,
+                binding_digest TEXT NOT NULL,
+                relay_kind TEXT
+            )
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    reopened = IntentStore(path)
+    try:
+        assert reopened.funding_boundary_progression() == ()
+        assert reopened.nado_funding_boundary_evidence() is not None
     finally:
         reopened.close()
 

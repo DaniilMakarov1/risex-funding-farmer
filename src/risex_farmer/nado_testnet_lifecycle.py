@@ -2592,11 +2592,17 @@ class IntentStore:
             # Historical/direct stores predate this table and remain
             # read-only compatible without an in-place schema migration.
             return
+        if not progression_required and records:
+            raise NadoContractError(
+                "funding progression requires tracked exposure"
+            )
         binding = self.funding_boundary_binding()
         if binding is None:
             raise NadoContractError("funding progression is unbound")
         if require_nonempty is None:
-            require_nonempty = self.funding_boundary_exposure() is not None
+            require_nonempty = (
+                progression_required and self.funding_boundary_exposure() is not None
+            )
         _validate_funding_progression_records(
             records,
             binding_digest=_funding_boundary_digest(binding),
@@ -2610,7 +2616,7 @@ class IntentStore:
             raise NadoContractError(
                 "funding progression evidence state is unavailable"
             ) from None
-        if evidence_exists and (
+        if progression_required and evidence_exists and (
             not records
             or records[-1].token != FUNDING_PROGRESSION_ACCOUNT_HISTORY_READ_COMPLETED
         ):
