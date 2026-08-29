@@ -779,13 +779,19 @@ def test_account_funding_parser_rejects_missing_required_fields(missing: str) ->
         parse_nado_account_funding_row(raw, binding)
 
 
-def test_public_funding_subscription_uses_official_product_stream(
+def test_public_funding_event_waits_for_wall_clock_settlement_on_same_connection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     binding = _adapter_binding()
     wire = _public_funding_wire(binding)
     sent: list[dict[str, object]] = []
     connected: list[tuple[str, dict[str, object]]] = []
+    receive_count = 0
+    wall_clock = iter((
+        binding.route.settlement_at_ms - 100,
+        binding.route.settlement_at_ms - 100,
+        binding.route.settlement_at_ms,
+    ))
 
     class FakeWebSocket:
         async def __aenter__(self):
@@ -798,7 +804,9 @@ def test_public_funding_subscription_uses_official_product_stream(
             sent.append(payload)
 
         async def receive(self, *, timeout):
+            nonlocal receive_count
             assert timeout > 0
+            receive_count += 1
             return SimpleNamespace(
                 type=nado_operational.aiohttp.WSMsgType.TEXT,
                 data=json.dumps(wire),
@@ -819,11 +827,13 @@ def test_public_funding_subscription_uses_official_product_stream(
             return FakeWebSocket()
 
     io = OperationalVenueIO(OWNER, SENDER)
-    io.now_ms = lambda: binding.route.settlement_at_ms - 100
+    io.now_ms = lambda: next(wall_clock)
     monkeypatch.setattr(nado_operational.aiohttp, "ClientSession", FakeSession)
 
     io.await_funding_boundary(binding)
 
+    assert receive_count == 2
+    assert len(connected) == 1
     assert connected[0][0] == nado_operational._FUNDING_SUBSCRIBE_URL
     assert sent == [{
         "method": "subscribe",
@@ -833,6 +843,229 @@ def test_public_funding_subscription_uses_official_product_stream(
         },
     }]
     assert io._funding_event == parse_nado_public_funding_event(wire)
+
+
+def test_early_timestamped_event_cannot_release_read_or_close_before_settlement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binding = _adapter_binding()
+    wire = _public_funding_wire(binding)
+    connected: list[str] = []
+    receive_count = 0
+    wall_clock = [binding.route.settlement_at_ms - 100]
+    second_receive = asyncio.Event()
+    allow_post_settlement_event = asyncio.Event()
+    release_calls: list[str] = []
+    read_calls: list[str] = []
+    close_calls: list[str] = []
+
+    class FakeWebSocket:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def send_json(self, _payload):
+            return None
+
+        async def receive(self, *, timeout):
+            nonlocal receive_count
+            assert timeout > 0
+            receive_count += 1
+            if receive_count == 1:
+                return SimpleNamespace(
+                    type=nado_operational.aiohttp.WSMsgType.TEXT,
+                    data=json.dumps(wire),
+                )
+            second_receive.set()
+            await allow_post_settlement_event.wait()
+            return SimpleNamespace(
+                type=nado_operational.aiohttp.WSMsgType.TEXT,
+                data=json.dumps(wire),
+            )
+
+    class FakeSession:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def ws_connect(self, url, **_kwargs):
+            connected.append(url)
+            return FakeWebSocket()
+
+    monkeypatch.setattr(nado_operational.aiohttp, "ClientSession", FakeSession)
+    io = OperationalVenueIO(OWNER, SENDER)
+    io.now_ms = lambda: wall_clock[0]
+
+    async def downstream_progression() -> None:
+        await io._await_funding_boundary_async(binding)
+        release_calls.append("RELEASED")
+        read_calls.append("FUNDING_READ")
+        close_calls.append("CLOSE")
+
+    async def scenario() -> None:
+        task = asyncio.create_task(downstream_progression())
+        await asyncio.wait_for(second_receive.wait(), timeout=1)
+        assert not task.done()
+        assert io._funding_event is None
+        assert release_calls == []
+        assert read_calls == []
+        assert close_calls == []
+        wall_clock[0] = binding.route.settlement_at_ms
+        allow_post_settlement_event.set()
+        await asyncio.wait_for(task, timeout=1)
+
+    asyncio.run(scenario())
+
+    assert connected == [nado_operational._FUNDING_SUBSCRIBE_URL]
+    assert receive_count == 2
+    assert io._funding_event == parse_nado_public_funding_event(wire)
+    assert release_calls == ["RELEASED"]
+    assert read_calls == ["FUNDING_READ"]
+    assert close_calls == ["CLOSE"]
+
+
+def test_early_timestamped_event_fails_closed_at_existing_deadline_without_progression(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binding = _adapter_binding()
+    wire = _public_funding_wire(binding)
+    receive_count = 0
+    monotonic_clock = [100.0]
+    wall_clock = [binding.route.settlement_at_ms - 100]
+    release_calls: list[str] = []
+    read_calls: list[str] = []
+    close_calls: list[str] = []
+
+    class FakeWebSocket:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def send_json(self, _payload):
+            return None
+
+        async def receive(self, *, timeout):
+            nonlocal receive_count
+            assert timeout > 0
+            receive_count += 1
+            if receive_count == 1:
+                return SimpleNamespace(
+                    type=nado_operational.aiohttp.WSMsgType.TEXT,
+                    data=json.dumps(wire),
+                )
+            monotonic_clock[0] = 130.1
+            raise asyncio.TimeoutError
+
+    class FakeSession:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def ws_connect(self, _url, **_kwargs):
+            return FakeWebSocket()
+
+    monkeypatch.setattr(
+        nado_operational.time, "monotonic", lambda: monotonic_clock[0],
+    )
+    monkeypatch.setattr(nado_operational.aiohttp, "ClientSession", FakeSession)
+    io = OperationalVenueIO(OWNER, SENDER)
+    io.now_ms = lambda: wall_clock[0]
+
+    async def downstream_progression() -> None:
+        await io._await_funding_boundary_async(binding)
+        release_calls.append("RELEASED")
+        read_calls.append("FUNDING_READ")
+        close_calls.append("CLOSE")
+
+    with pytest.raises(OperationalSafetyError, match="deadline exhausted"):
+        asyncio.run(downstream_progression())
+
+    assert receive_count == 2
+    assert io._funding_event is None
+    assert release_calls == []
+    assert read_calls == []
+    assert close_calls == []
+
+
+def test_early_timestamped_event_wait_is_cancellable_without_progression(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binding = _adapter_binding()
+    wire = _public_funding_wire(binding)
+    receive_count = 0
+    second_receive = asyncio.Event()
+    allow_post_settlement_event = asyncio.Event()
+
+    class FakeWebSocket:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def send_json(self, _payload):
+            return None
+
+        async def receive(self, *, timeout):
+            nonlocal receive_count
+            assert timeout > 0
+            receive_count += 1
+            if receive_count == 1:
+                return SimpleNamespace(
+                    type=nado_operational.aiohttp.WSMsgType.TEXT,
+                    data=json.dumps(wire),
+                )
+            second_receive.set()
+            await allow_post_settlement_event.wait()
+            return SimpleNamespace(
+                type=nado_operational.aiohttp.WSMsgType.TEXT,
+                data=json.dumps(wire),
+            )
+
+    class FakeSession:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def ws_connect(self, _url, **_kwargs):
+            return FakeWebSocket()
+
+    monkeypatch.setattr(nado_operational.aiohttp, "ClientSession", FakeSession)
+    io = OperationalVenueIO(OWNER, SENDER)
+    io.now_ms = lambda: binding.route.settlement_at_ms - 100
+
+    async def scenario() -> None:
+        task = asyncio.create_task(io._await_funding_boundary_async(binding))
+        await asyncio.wait_for(second_receive.wait(), timeout=1)
+        assert not task.done()
+        assert io._funding_event is None
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+
+    assert receive_count == 2
+    assert io._funding_event is None
 
 
 def test_public_funding_stream_uses_absolute_deadline_for_irrelevant_frames(
