@@ -3991,17 +3991,14 @@ class TwoAccountCoordinator:
                 raise CoordinatorSafetyError("RISEx entry recovery intent rejected")
             NonceState(intent.nonce_anchor, intent.nonce_bitmap).validate()
 
-        expected_terminal_trade: str | None = None
-        expected_terminal_price: str | None = None
-        for key in ("trade:ENTRY", "price:ENTRY"):
-            primary_value = primary_journal.terminal(key)
-            counterparty_value = counterparty_journal.terminal(key)
-            if primary_value != counterparty_value:
-                raise CoordinatorSafetyError("RISEx entry recovery terminal mismatch")
-            if key == "trade:ENTRY":
-                expected_terminal_trade = primary_value
-            else:
-                expected_terminal_price = primary_value
+        expected_terminal_trade = {
+            role: journal.terminal("trade:ENTRY")
+            for role, journal in self._journals.items()
+        }
+        expected_terminal_price = {
+            role: journal.terminal("price:ENTRY")
+            for role, journal in self._journals.items()
+        }
 
         primary_order = _order_for(
             observation.accounts[AccountRole.PRIMARY], primary_intent.client_order_id,
@@ -4036,11 +4033,8 @@ class TwoAccountCoordinator:
         if len(primary_trades) != 1 or len(counterparty_trades) != 1:
             raise CoordinatorSafetyError("RISEx entry recovery trade evidence rejected")
         primary_trade, counterparty_trade = primary_trades[0], counterparty_trades[0]
-        expected_trade_id = f"{counterparty_order.order_id}-{primary_order.order_id}"
         if (
-            primary_trade.trade_id != expected_trade_id
-            or counterparty_trade.trade_id != expected_trade_id
-            or primary_trade.order_id != primary_order.order_id
+            primary_trade.order_id != primary_order.order_id
             or counterparty_trade.order_id != counterparty_order.order_id
             or primary_trade.client_order_id != primary_intent.client_order_id
             or counterparty_trade.client_order_id != counterparty_intent.client_order_id
@@ -4052,29 +4046,30 @@ class TwoAccountCoordinator:
             or primary_trade.size != MARKET_MINIMUM
             or counterparty_trade.size != MARKET_MINIMUM
             or primary_trade.size != counterparty_trade.size
-            or primary_trade.price != counterparty_trade.price
-            or primary_trade.price != counterparty_intent.price
+            or counterparty_trade.price != counterparty_intent.price
             or primary_trade.price > primary_intent.price
         ):
             raise CoordinatorSafetyError("RISEx entry recovery trade identity rejected")
-        trade_id = expected_trade_id
-        trade_price = str(primary_trade.price)
-        if (
-            expected_terminal_trade is not None
-            and expected_terminal_trade != trade_id
-        ) or (
-            expected_terminal_price is not None
-            and expected_terminal_price != trade_price
+        for role, trade in (
+            (AccountRole.PRIMARY, primary_trade),
+            (AccountRole.COUNTERPARTY, counterparty_trade),
         ):
-            raise CoordinatorSafetyError("RISEx entry recovery terminal evidence rejected")
+            if (
+                expected_terminal_trade[role] is not None
+                and expected_terminal_trade[role] != trade.trade_id
+            ) or (
+                expected_terminal_price[role] is not None
+                and expected_terminal_price[role] != str(trade.price)
+            ):
+                raise CoordinatorSafetyError("RISEx entry recovery terminal evidence rejected")
 
         primary_journal.recover_entry_fill(
             primary_intent.intent_id, filled_size=MARKET_MINIMUM,
-            trade_id=trade_id, price=primary_trade.price,
+            trade_id=primary_trade.trade_id, price=primary_trade.price,
         )
         counterparty_journal.recover_entry_fill(
             counterparty_intent.intent_id, filled_size=MARKET_MINIMUM,
-            trade_id=trade_id, price=primary_trade.price,
+            trade_id=counterparty_trade.trade_id, price=counterparty_trade.price,
         )
         if (
             self.phase is not Phase.ENTRY_RECONCILED
@@ -4110,6 +4105,35 @@ class TwoAccountCoordinator:
             )
         ):
             raise CoordinatorSafetyError("RISEx exact order binding rejected")
+
+    def _validate_pair_fill_leg(
+        self, role: AccountRole, intent: DurableIntent,
+        order: RestOrder, trade: RestTrade,
+    ) -> None:
+        """Validate one fill against its own sealed account/write domain."""
+        journal = self._journals.get(role)
+        identity = self._identities.get(role)
+        if journal is None or identity is None:
+            raise CoordinatorSafetyError("RISEx fill account identity rejected")
+        try:
+            sealed = journal.intent(intent.intent_id)
+        except CoordinatorSafetyError:
+            raise
+        if sealed != intent:
+            raise CoordinatorSafetyError("RISEx sealed fill intent rejected")
+        if (
+            intent.dispatch_count != 1
+            or intent.state not in {"DISPATCHED", "RESTING", "TERMINAL"}
+            or intent.reconciled != (intent.state == "TERMINAL")
+            or intent.filled_size not in {None, Decimal("0"), intent.size}
+            or (intent.state == "TERMINAL" and intent.filled_size != intent.size)
+            or journal.terminal(f"place:{intent.intent_id}")
+            != WriteResultClass.ACCEPTED.value
+        ):
+            raise CoordinatorSafetyError("RISEx sealed fill dispatch rejected")
+        NonceState(intent.nonce_anchor, intent.nonce_bitmap).validate()
+        self._ensure_order_matches(intent, order, role)
+        _validate_trade(trade, identity, _now_int(self._now()))
 
     async def _dispatch_place(self, role: AccountRole, intent: DurableIntent, market: MarketObservation) -> DurableIntent:
         journal = self._journals[role]
@@ -4183,16 +4207,35 @@ class TwoAccountCoordinator:
         taker_role: AccountRole, taker_intent: DurableIntent,
         observation: VenueObservation, *, maker_position: Decimal, taker_position: Decimal,
     ) -> RestOrder | None:
+        """Reconcile two exact account-local fills without cross-leg IDs/prices."""
+        if (
+            maker_role is taker_role
+            or maker_intent.intent_id == taker_intent.intent_id
+            or maker_intent.market_id != taker_intent.market_id
+            or maker_intent.size != taker_intent.size
+            or maker_intent.side == taker_intent.side
+        ):
+            raise CoordinatorSafetyError("RISEx mutual fill pair binding rejected")
         maker_account = observation.accounts[maker_role]
         taker_account = observation.accounts[taker_role]
         maker_order = _order_for(maker_account, maker_intent.client_order_id)
         taker_order = _order_for(taker_account, taker_intent.client_order_id)
         if maker_order is None or taker_order is None:
             raise CoordinatorSafetyError("RISEx mutual order identity missing")
-        self._ensure_order_matches(maker_intent, maker_order, maker_role)
-        self._ensure_order_matches(taker_intent, taker_order, taker_role)
+        maker_trades = _trades_for(maker_account, maker_order)
+        taker_trades = _trades_for(taker_account, taker_order)
+        if len(maker_trades) != 1 or len(taker_trades) != 1:
+            raise CoordinatorSafetyError("RISEx exact trade evidence missing")
+        maker_trade, taker_trade = maker_trades[0], taker_trades[0]
+        self._validate_pair_fill_leg(
+            maker_role, maker_intent, maker_order, maker_trade,
+        )
+        self._validate_pair_fill_leg(
+            taker_role, taker_intent, taker_order, taker_trade,
+        )
         if (
             taker_order.status != "FILLED"
+            or maker_order.status not in {"FILLED", "CANCELLED"}
             or taker_order.filled_size != taker_intent.size
             or maker_order.filled_size != maker_intent.size
             or maker_order.filled_size != taker_order.filled_size
@@ -4200,27 +4243,18 @@ class TwoAccountCoordinator:
             or observation.accounts[taker_role].position != taker_position
         ):
             raise CoordinatorSafetyError("RISEx partial or contradictory fill rejected")
-        maker_trades = _trades_for(maker_account, maker_order)
-        taker_trades = _trades_for(taker_account, taker_order)
-        if len(maker_trades) != 1 or len(taker_trades) != 1:
-            raise CoordinatorSafetyError("RISEx exact trade evidence missing")
-        maker_trade, taker_trade = maker_trades[0], taker_trades[0]
-        expected_trade_id = f"{maker_order.order_id}-{taker_order.order_id}"
         if (
-            maker_trade.trade_id != taker_trade.trade_id
-            or maker_trade.trade_id != expected_trade_id
-            or maker_trade.size != maker_intent.size
+            maker_trade.size != maker_intent.size
             or taker_trade.size != taker_intent.size
             or maker_trade.size != taker_trade.size
-            or maker_trade.price != taker_trade.price
             or maker_trade.price != maker_intent.price
             or (
                 taker_intent.side == "BUY"
-                and maker_trade.price > taker_intent.price
+                and taker_trade.price > taker_intent.price
             )
             or (
                 taker_intent.side == "SELL"
-                and maker_trade.price < taker_intent.price
+                and taker_trade.price < taker_intent.price
             )
             or maker_trade.order_id != maker_order.order_id
             or taker_trade.order_id != taker_order.order_id

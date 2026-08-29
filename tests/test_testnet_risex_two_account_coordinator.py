@@ -550,7 +550,10 @@ class PropagatingLifecycleVenue(LifecycleVenue):
         return await super().observe()
 
 
-def lifecycle_observations(*, second_final_book: BookObservation | None = None):
+def lifecycle_observations(
+    *, second_final_book: BookObservation | None = None,
+    independent_external_fills: bool = False,
+):
     maker_entry = order(
         wide=201, client=1001, account=COUNTERPARTY, side="SELL",
         order_type="LIMIT", tif="GTC", status="OPEN", price="2999.01",
@@ -588,22 +591,40 @@ def lifecycle_observations(*, second_final_book: BookObservation | None = None):
         bids=(BookLevel(Decimal("2999.00"), Decimal("0.1"), 1),),
         asks=(BookLevel(Decimal("2999.01"), Decimal("1"), 1),), observed_at=NOW,
     )
+    entry_primary_trade_id = f"{maker_entry_filled.order_id}-{entry.order_id}"
+    entry_counterparty_trade_id = entry_primary_trade_id
+    entry_primary_price = Decimal("2999.01")
+    entry_counterparty_price = entry_primary_price
+    exit_primary_trade_id = f"{maker_exit_filled.order_id}-{exit_order.order_id}"
+    exit_counterparty_trade_id = exit_primary_trade_id
+    exit_primary_price = Decimal("2999.00")
+    exit_counterparty_price = exit_primary_price
+    if independent_external_fills:
+        def external_order_id(wide: int) -> str:
+            return f"0x{wide:016x}{1:016x}{1:016x}"
+
+        entry_primary_trade_id = f"{external_order_id(301)}-{entry.order_id}"
+        entry_counterparty_trade_id = f"{external_order_id(302)}-{maker_entry_filled.order_id}"
+        entry_primary_price = Decimal("2999.02")
+        exit_primary_trade_id = f"{external_order_id(303)}-{exit_order.order_id}"
+        exit_counterparty_trade_id = f"{external_order_id(304)}-{maker_exit_filled.order_id}"
+        exit_primary_price = Decimal("2998.99")
     entry_primary = account_snapshot(AccountRole.PRIMARY, position="0.1", orders=(), trades=(
-        trade(trade_id=f"{maker_entry_filled.order_id}-{entry.order_id}", item=entry, side="BUY", price="2999.01"),
+        trade(trade_id=entry_primary_trade_id, item=entry, side="BUY", price=str(entry_primary_price)),
     ))
     entry_primary = replace(entry_primary, history_orders=(entry,))
     entry_counter = account_snapshot(AccountRole.COUNTERPARTY, position="-0.1", orders=(), trades=(
-        trade(trade_id=f"{maker_entry_filled.order_id}-{entry.order_id}", item=maker_entry_filled, side="SELL", price="2999.01"),
+        trade(trade_id=entry_counterparty_trade_id, item=maker_entry_filled, side="SELL", price=str(entry_counterparty_price)),
     ))
     entry_counter = replace(entry_counter, history_orders=(maker_entry_filled,))
     exit_primary = account_snapshot(AccountRole.PRIMARY, position="0", orders=(), trades=(
-        trade(trade_id=f"{maker_entry_filled.order_id}-{entry.order_id}", item=entry, side="BUY", price="2999.01"),
-        trade(trade_id=f"{maker_exit_filled.order_id}-{exit_order.order_id}", item=exit_order, side="SELL", price="2999.00"),
+        trade(trade_id=entry_primary_trade_id, item=entry, side="BUY", price=str(entry_primary_price)),
+        trade(trade_id=exit_primary_trade_id, item=exit_order, side="SELL", price=str(exit_primary_price)),
     ))
     exit_primary = replace(exit_primary, history_orders=(entry, exit_order))
     exit_counter = account_snapshot(AccountRole.COUNTERPARTY, position="0", orders=(), trades=(
-        trade(trade_id=f"{maker_entry_filled.order_id}-{entry.order_id}", item=maker_entry_filled, side="SELL", price="2999.01"),
-        trade(trade_id=f"{maker_exit_filled.order_id}-{exit_order.order_id}", item=maker_exit_filled, side="BUY", price="2999.00"),
+        trade(trade_id=entry_counterparty_trade_id, item=maker_entry_filled, side="SELL", price=str(entry_counterparty_price)),
+        trade(trade_id=exit_counterparty_trade_id, item=maker_exit_filled, side="BUY", price=str(exit_counterparty_price)),
     ))
     exit_counter = replace(exit_counter, history_orders=(maker_entry_filled, maker_exit_filled))
     rounds_book = second_final_book or exit_rest_book
@@ -650,8 +671,12 @@ def propagation_sleep(monkeypatch):
     return calls
 
 
-def _halted_entry_coordinator(tmp_path: Path):
-    valid_observations, rounds = lifecycle_observations()
+def _halted_entry_coordinator(
+    tmp_path: Path, *, independent_external_fills: bool = False,
+):
+    valid_observations, rounds = lifecycle_observations(
+        independent_external_fills=independent_external_fills,
+    )
     bad_observations = list(valid_observations)
     bad = bad_observations[2]
     primary = bad.accounts[AccountRole.PRIMARY]
@@ -701,6 +726,141 @@ def test_complete_two_account_lifecycle_is_sequential_and_reduce_only(
     assert exit_request["side"] == 1 and exit_request["reduce_only"] is True
     assert report.final_rounds == 2
     assert propagation_sleep == []
+
+
+def test_independent_external_fills_complete_with_each_journal_binding_its_own_evidence(
+    tmp_path: Path,
+):
+    observations, rounds = lifecycle_observations(independent_external_fills=True)
+    coordinator = make_lifecycle(tmp_path, LifecycleVenue(observations, rounds))
+
+    report = asyncio.run(coordinator.run())
+
+    assert report.result is CoordinatorResult.COMPLETE
+    primary = coordinator._journals[AccountRole.PRIMARY]
+    counterparty = coordinator._journals[AccountRole.COUNTERPARTY]
+    assert primary.terminal("trade:ENTRY") != counterparty.terminal("trade:ENTRY")
+    assert primary.terminal("trade:EXIT") != counterparty.terminal("trade:EXIT")
+    assert primary.terminal("price:ENTRY") == "2999.02"
+    assert counterparty.terminal("price:ENTRY") == "2999.01"
+    assert primary.terminal("price:EXIT") == "2998.99"
+    assert counterparty.terminal("price:EXIT") == "2999.00"
+    assert primary.by_step("ENTRY_TAKER").dispatch_count == 1
+    assert counterparty.by_step("ENTRY_MAKER").dispatch_count == 1
+    assert primary.by_step("EXIT_TAKER").dispatch_count == 1
+    assert counterparty.by_step("EXIT_MAKER").dispatch_count == 1
+    assert report.final_rounds == 2
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "same_direction",
+        "unequal_quantity",
+        "duplicate",
+        "wrong_account",
+        "wrong_order",
+        "wrong_client",
+        "wrong_market",
+        "partial",
+        "ambiguous",
+        "unrelated_order",
+        "unrelated_fill",
+        "nonterminal_order",
+    ],
+)
+def test_independent_fill_contract_rejects_adverse_entry_evidence(
+    tmp_path: Path, mutation: str,
+):
+    observations, rounds = lifecycle_observations(independent_external_fills=True)
+    current = observations[2]
+    primary = current.accounts[AccountRole.PRIMARY]
+    counterparty = current.accounts[AccountRole.COUNTERPARTY]
+    primary_trade = primary.trades[0]
+    counterparty_trade = counterparty.trades[0]
+
+    if mutation == "same_direction":
+        counterparty = with_private(replace(
+            counterparty, trades=(replace(counterparty_trade, side="BUY"),),
+        ))
+    elif mutation == "unequal_quantity":
+        primary = with_private(replace(
+            primary, trades=(replace(primary_trade, size=Decimal("0.099")),),
+        ))
+    elif mutation == "duplicate":
+        primary = with_private(replace(
+            primary, trades=(primary_trade, primary_trade),
+        ))
+    elif mutation == "wrong_account":
+        primary = with_private(replace(
+            primary, trades=(replace(primary_trade, account=COUNTERPARTY),),
+        ))
+    elif mutation == "wrong_order":
+        wrong_order_id = counterparty.history_orders[0].order_id
+        primary = with_private(replace(
+            primary, trades=(replace(primary_trade, order_id=wrong_order_id),),
+        ))
+    elif mutation == "wrong_client":
+        primary = with_private(replace(
+            primary,
+            trades=(replace(primary_trade, client_order_id=counterparty_trade.client_order_id),),
+        ))
+    elif mutation == "wrong_market":
+        primary = with_private(replace(
+            primary, trades=(replace(primary_trade, market_id=3),),
+        ))
+    elif mutation == "partial":
+        primary = with_private(replace(
+            primary,
+            history_orders=(replace(primary.history_orders[0], filled_size=Decimal("0.05")),),
+            trades=(replace(primary_trade, size=Decimal("0.05")),),
+        ))
+    elif mutation == "ambiguous":
+        ambiguous = replace(
+            primary_trade,
+            trade_id=f"0x{499:016x}{1:016x}{1:016x}-{primary_trade.order_id}",
+        )
+        primary = with_private(replace(
+            primary, trades=(primary_trade, ambiguous),
+        ))
+    elif mutation == "unrelated_order":
+        unrelated = order(
+            wide=499, client=4499, account=ACCOUNT, side="BUY",
+            order_type="MARKET", tif="IOC", status="FILLED", price="0",
+        )
+        primary = with_private(replace(
+            primary, history_orders=(*primary.history_orders, unrelated),
+        ))
+    elif mutation == "unrelated_fill":
+        unrelated = order(
+            wide=499, client=4499, account=ACCOUNT, side="BUY",
+            order_type="MARKET", tif="IOC", status="FILLED", price="0",
+            filled="0.1",
+        )
+        unrelated_trade = trade(
+            trade_id=f"{unrelated.order_id}-{unrelated.order_id}",
+            item=unrelated, side="BUY", price="2999.02",
+        )
+        primary = with_private(replace(
+            primary, trades=(*primary.trades, unrelated_trade),
+        ))
+    else:
+        counterparty = with_private(replace(
+            counterparty,
+            history_orders=(replace(counterparty.history_orders[0], status="OPEN"),),
+        ))
+
+    observations[2] = replace(current, accounts={
+        AccountRole.PRIMARY: primary,
+        AccountRole.COUNTERPARTY: counterparty,
+    })
+    report = asyncio.run(make_lifecycle(
+        tmp_path, LifecycleVenue(observations, rounds),
+    ).run())
+
+    assert report.result is CoordinatorResult.FAILED_HALTED_MANUAL_RECOVERY
+    assert report.primary_dispatches == 1
+    assert report.counterparty_dispatches == 1
 
 
 def test_exact_order_history_propagation_mismatch_settles_before_one_fresh_resample(
@@ -972,6 +1132,20 @@ def test_entry_recovery_accepts_exact_fill_and_resumed_run_only_writes_exits(tmp
     assert coordinator._journals[AccountRole.COUNTERPARTY].by_step("ENTRY_MAKER").dispatch_count == 1
     assert coordinator._journals[AccountRole.PRIMARY].by_step("EXIT_TAKER").reduce_only is True
     assert coordinator._journals[AccountRole.COUNTERPARTY].by_step("EXIT_MAKER").reduce_only is True
+
+
+def test_entry_recovery_preserves_independent_trade_ids_and_prices(tmp_path: Path):
+    coordinator, _, valid_observations, _ = _halted_entry_coordinator(
+        tmp_path, independent_external_fills=True,
+    )
+
+    coordinator.recover_entry_fill(valid_observations[2])
+
+    primary = coordinator._journals[AccountRole.PRIMARY]
+    counterparty = coordinator._journals[AccountRole.COUNTERPARTY]
+    assert primary.terminal("trade:ENTRY") != counterparty.terminal("trade:ENTRY")
+    assert primary.terminal("price:ENTRY") == "2999.02"
+    assert counterparty.terminal("price:ENTRY") == "2999.01"
 
 
 def test_entry_recovery_rejects_mismatch_without_writes_and_cannot_replay(tmp_path: Path):
