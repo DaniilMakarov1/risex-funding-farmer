@@ -79,15 +79,16 @@ def _balance(**overrides):
     return value
 
 
-def _spot(asset="USDC", **overrides):
+def _spot(asset="USD", **overrides):
+    collateral = asset in {"USD", "USDC"}
     value = {
         "accountId": gate.EXPECTED_ACCOUNT_ID,
         "asset": asset,
-        "balance": "100" if asset == "USDC" else "0",
-        "indexPrice": "1" if asset == "USDC" else "100",
-        "notionalValue": "100" if asset == "USDC" else "0",
-        "contributionFactor": "1" if asset == "USDC" else "0",
-        "equityContribution": "100" if asset == "USDC" else "0",
+        "balance": "100" if collateral else "0",
+        "indexPrice": "1" if collateral else "100",
+        "notionalValue": "100" if collateral else "0",
+        "contributionFactor": "1" if collateral else "0",
+        "equityContribution": "100" if collateral else "0",
         "updatedAt": 1700000000000,
     }
     value.update(overrides)
@@ -366,6 +367,84 @@ def test_balance_uses_observed_usd_denomination_and_rejects_usdc():
         gate._decode_balance(_envelope(_balance(collateralName="USDC")))
     assert error.value.reason == "COLLATERAL_ASSET_UNEXPECTED"
     assert error.value.failure_class == "SAFETY"
+
+
+def test_spot_collateral_allowlist_is_closed_and_keeps_other_assets_unrelated():
+    for asset in ("USD", "USDC"):
+        rows = gate._decode_spot_rows(_envelope([_spot(asset)]))
+        assert gate._noncollateral_nonzero_spot_assets(rows) == []
+
+    rows = gate._decode_spot_rows(
+        _envelope(
+            [
+                _spot(
+                    "ETHSPOT",
+                    balance="1",
+                    indexPrice="2000",
+                    notionalValue="2000",
+                    contributionFactor="0.9",
+                    equityContribution="1800",
+                )
+            ]
+        )
+    )
+    assert gate._noncollateral_nonzero_spot_assets(rows) == ["ETHSPOT"]
+
+
+def test_observed_mainnet_balance_arithmetic_includes_spot_equity():
+    balance = _balance(
+        balance="-0.005052",
+        equity="20.711382",
+        availableForTrade="20.7113811",
+        initialMargin="0",
+        unrealisedPnl="0",
+        spotEquity="20.716434",
+        spotEquityForAvailableForTrade="20.7164331",
+        collateralReservedForSpotOrders="0",
+        exposure="0",
+        leverage="0",
+        marginRatio="0",
+    )
+    rows = gate._decode_spot_rows(
+        _envelope(
+            [
+                _spot(
+                    "USD",
+                    balance="20.716434",
+                    notionalValue="20.716434",
+                    equityContribution="20.716434",
+                )
+            ]
+        )
+    )
+    summary = gate._empty_summary()
+    gate._set_summary_state(
+        summary,
+        balance=gate._decode_balance_data(balance),
+        spot=rows,
+        asset_operations=(),
+        fees=(),
+        open_orders=(),
+        order_history=(),
+        trades=(),
+        positions=(),
+        position_history=(),
+        funding=(),
+        page_counts={},
+    )
+    assert summary["flatness"]["exact"] is True
+    assert summary["flatness"]["formula_agreement"] is True
+    assert summary["flatness"]["zero_fields"] == {
+        "initialMargin": "0",
+        "marginRatio": "0",
+        "exposure": "0",
+        "leverage": "0",
+        "unrealisedPnl": "0",
+        "withdrawableUnrealisedPnl": "0",
+        "collateralReservedForSpotOrders": "0",
+    }
+    assert summary["spot_balances"]["assets"] == ["USD"]
+    assert summary["spot_balances"]["noncollateral_nonzero_assets"] == []
 
 
 def test_production_run_directory_accepts_macos_directory_link_count(tmp_path):
@@ -653,6 +732,84 @@ async def test_private_stream_requires_auth_surface_empty_components_and_rest_ag
     result, _, _ = await _run(tmp_path / "disagree", transport=transport, invocation_id="stream-disagree")
     assert result.reason == "REST_STREAM_BALANCE_DISAGREE"
     assert result.failure_class == "SAFETY"
+
+
+@pytest.mark.asyncio
+async def test_observed_rest_stream_spot_classification_and_ethspot_block(tmp_path):
+    observed_balance = _balance(
+        balance="-0.005052",
+        equity="20.711382",
+        availableForTrade="20.7113811",
+        spotEquity="20.716434",
+        spotEquityForAvailableForTrade="20.7164331",
+    )
+    observed_usd = _spot(
+        "USD",
+        balance="20.716434",
+        notionalValue="20.716434",
+        equityContribution="20.716434",
+    )
+    responses = _base_responses()
+    responses[gate.BALANCE_PATH] = _envelope(observed_balance)
+    responses[gate.SPOT_BALANCES_PATH] = _envelope([observed_usd])
+    frames = _stream_frames()
+    frames[0] = {
+        "type": "BALANCE",
+        "data": {"balance": observed_balance},
+        "ts": 1700000000000,
+        "seq": 1,
+    }
+    frames[4] = {
+        "type": "SPOT_BALANCE",
+        "data": {"spotBalances": [observed_usd]},
+        "ts": 1700000000004,
+        "seq": 5,
+    }
+    result, _, _ = await _run(
+        tmp_path / "usd-only",
+        transport=Transport(responses=responses, streams=[frames]),
+        invocation_id="observed-usd-only",
+    )
+    assert result.ready
+    assert result.summary["flatness"]["exact"] is True
+    assert result.summary["flatness"]["formula_agreement"] is True
+    assert result.summary["spot_balances"]["assets"] == ["USD"]
+    assert result.summary["spot_balances"]["noncollateral_nonzero_assets"] == []
+
+    observed_ethspot = _spot(
+        "ETHSPOT",
+        balance="1",
+        indexPrice="2000",
+        notionalValue="2000",
+        contributionFactor="0.9",
+        equityContribution="1800",
+    )
+    responses = _base_responses()
+    responses[gate.BALANCE_PATH] = _envelope(observed_balance)
+    responses[gate.SPOT_BALANCES_PATH] = _envelope([observed_usd, observed_ethspot])
+    frames = _stream_frames()
+    frames[0] = {
+        "type": "BALANCE",
+        "data": {"balance": observed_balance},
+        "ts": 1700000000000,
+        "seq": 1,
+    }
+    frames[4] = {
+        "type": "SPOT_BALANCE",
+        "data": {"spotBalances": [observed_usd, observed_ethspot]},
+        "ts": 1700000000004,
+        "seq": 5,
+    }
+    result, _, _ = await _run(
+        tmp_path / "ethspot",
+        transport=Transport(responses=responses, streams=[frames]),
+        invocation_id="observed-ethspot",
+    )
+    assert result.reason == "STREAM_UNRELATED_SPOT_STATE"
+    assert result.failure_class == "SAFETY"
+    assert result.summary["spot_balances"]["assets"] == ["ETHSPOT", "USD"]
+    assert result.summary["spot_balances"]["noncollateral_nonzero_assets"] == ["ETHSPOT"]
+    assert "ETHSPOT" in result.evidence()
 
 
 @pytest.mark.asyncio

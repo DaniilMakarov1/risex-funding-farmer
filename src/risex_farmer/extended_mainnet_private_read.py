@@ -71,9 +71,11 @@ POSITION_HISTORY_PATH = "/user/positions/history"
 FUNDING_HISTORY_PATH = "/user/funding/history"
 FEE_MARKET = "BTC-USD"
 # Extended's live mainnet balance contract uses the denomination ``USD``.
-# The spot-balance endpoint separately identifies its collateral asset as
-# ``USDC``; keep those two venue fields distinct.
+# The spot-balance contract also documents ``USDC`` as a collateral entry.
+# Keep this explicit set closed-world; an arbitrary asset is never collateral
+# merely because it has a balance.
 BALANCE_COLLATERAL_NAME = "USD"
+_COLLATERAL_SPOT_ASSETS = frozenset({BALANCE_COLLATERAL_NAME, "USDC"})
 
 EXPECTED_ACCOUNT_ID = 303919
 EXPECTED_ACCOUNT_INDEX = 0
@@ -1266,6 +1268,17 @@ def _zero_spot_balances(_observed_at_ms: int) -> tuple[dict[str, Any], ...]:
     return ()
 
 
+def _noncollateral_nonzero_spot_assets(
+    rows: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    return sorted(
+        row["asset"]
+        for row in rows
+        if row["asset"] not in _COLLATERAL_SPOT_ASSETS
+        and Decimal(row["balance"]) != 0
+    )
+
+
 def _decode_spot_rows(body: Any) -> tuple[dict[str, Any], ...]:
     data = _decode_envelope(body, "SPOT_BALANCES")
     if not isinstance(data, list):
@@ -1311,7 +1324,7 @@ def _decode_spot_rows(body: Any) -> tuple[dict[str, Any], ...]:
         ):
             if source in item and item[source] is not None:
                 values[target] = _number_text(_decimal(item[source], f"SPOT_{source.upper()}"))
-        if asset == "USDC":
+        if asset in _COLLATERAL_SPOT_ASSETS:
             if Decimal(values["index_price"]) != Decimal("1") or Decimal(values["contribution_factor"]) != Decimal("1"):
                 raise GateFailure("COLLATERAL_SPOT_ROW_INVALID", "SAFETY")
         rows.append(values)
@@ -1732,7 +1745,7 @@ async def _read_stream_once(
                 positions = rows
             elif frame_type == "SPOT_BALANCE":
                 rows = tuple(_decode_spot_rows({"status": "OK", "data": value}))
-                noncollateral = [row for row in rows if row["asset"] != "USDC" and Decimal(row["balance"]) != 0]
+                noncollateral = _noncollateral_nonzero_spot_assets(rows)
                 if noncollateral:
                     raise GateFailure("STREAM_UNRELATED_SPOT_STATE", "SAFETY")
                 spot_balances = rows
@@ -1830,11 +1843,7 @@ def _set_summary_state(
     summary["spot_balances"] = {
         "count": len(spot),
         "assets": sorted(row["asset"] for row in spot),
-        "noncollateral_nonzero_assets": sorted(
-            row["asset"]
-            for row in spot
-            if row["asset"] != "USDC" and Decimal(row["balance"]) != 0
-        ),
+        "noncollateral_nonzero_assets": _noncollateral_nonzero_spot_assets(spot),
         "rows_digest": _stream_digest_rows(spot),
     }
     pending = [
@@ -1886,15 +1895,20 @@ def _set_summary_state(
             "leverage",
             "unrealisedPnl",
             "withdrawableUnrealisedPnl",
-            "spotEquity",
-            "spotEquityForAvailableForTrade",
             "collateralReservedForSpotOrders",
         )
     }
     exact_zero = all(Decimal(value) == 0 for value in zero_fields.values())
     exact_formula = (
-        Decimal(balance["equity"]) == Decimal(balance["balance"]) + Decimal(balance["unrealisedPnl"])
-        and Decimal(balance["availableForTrade"]) == Decimal(balance["equity"]) - Decimal(balance["initialMargin"])
+        Decimal(balance["equity"])
+        == Decimal(balance["balance"])
+        + Decimal(balance["unrealisedPnl"])
+        + Decimal(balance["spotEquity"])
+        and Decimal(balance["availableForTrade"])
+        == Decimal(balance["balance"])
+        + Decimal(balance["unrealisedPnl"])
+        + Decimal(balance["spotEquityForAvailableForTrade"])
+        - Decimal(balance["initialMargin"])
     )
     summary["flatness"] = {
         "exact": bool(
