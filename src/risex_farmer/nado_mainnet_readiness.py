@@ -1,18 +1,18 @@
 """Offline/read-only RISEx--Nado mainnet readiness evidence.
 
 This is a route-local evidence contract, not a Nado client.  It validates
-public observations, future injected private-read evidence, and future
+public observations, future injected account-read evidence, and future
 operator approval evidence without opening transport, persistence, signing,
 order construction, or venue-action surfaces.
 
 The RISEx identity is intentionally borrowed by path from the accepted
 RISEx--Extended readiness boundary.  This module never writes that path.
-Only the Nado read-only credential bundle has a new protected file.
+Nado read evidence uses public wallet/subaccount identity and unsigned
+queries; authenticated streams remain a future gate.
 """
 
 from __future__ import annotations
 
-import getpass
 import json
 import math
 import os
@@ -20,7 +20,7 @@ import stat
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 
 READY_FOR_PROTECTED_PROVISIONING = "READY_FOR_PROTECTED_PROVISIONING"
@@ -29,7 +29,6 @@ PRIVATE_READ_GATES_COMPLETE = "PRIVATE_READ_GATES_COMPLETE"
 FUTURE_DISPATCH_APPROVAL_COMPLETE = "FUTURE_DISPATCH_APPROVAL_COMPLETE"
 POST_LIFECYCLE_EVIDENCE_COMPLETE = "POST_LIFECYCLE_EVIDENCE_COMPLETE"
 BLOCKED = "BLOCKED"
-PROVISIONED = "PROTECTED_FILES_CREATED"
 
 NO_MAINNET_WRITE_AUTHORITY = "NO_MAINNET_WRITE_AUTHORITY"
 
@@ -56,7 +55,15 @@ NADO_MAINNET_PERP_ENGINE_CONTRACT = "0xF8599D58d1137fC56EcDd9C16ee139C8BDf96da1"
 NADO_BTC_PERP_PRODUCT_ID = 2
 NADO_PUBLIC_MINIMUM_NOTIONAL_USD = Decimal("100")
 NADO_PUBLIC_MINIMUM_FEE_NOTIONAL_USD = Decimal("100")
-NADO_READ_CREDENTIAL_KIND = "API_KEY_SECRET_READ_ONLY"
+NADO_PUBLIC_IDENTITY_SOURCE = "PUBLIC_WALLET_SUBACCOUNT"
+NADO_UNSIGNED_QUERY_AUTHENTICATION = "UNSIGNED_QUERY"
+NADO_UNSIGNED_QUERY_STATUS = "AUTHORITATIVE_UNSIGNED_QUERY"
+NADO_UNSIGNED_QUERY_SOURCE = "NADO_UNSIGNED_QUERY"
+NADO_PRIVATE_STREAM_PENDING_STATUS = "PENDING_SIGNED_AUTHENTICATE"
+NADO_PRIVATE_STREAM_PENDING_SOURCE = "FUTURE_SIGNED_AUTHENTICATE"
+NADO_REQUIRED_QUERY_KINDS = frozenset(
+    {"SUBACCOUNT_INFO", "SUBACCOUNT_ORDERS", "FEE_RATES"}
+)
 NADO_SDK_PACKAGE = "nado-protocol"
 NADO_SDK_VERSION = "2.0.0"
 
@@ -70,10 +77,6 @@ CANONICAL_RISEX_IDENTITY_PATH = (
     / "extended-mainnet-readiness"
     / "risex.identity"
 )
-PROTECTED_SECRET_DIRECTORY = (
-    Path.home() / ".config" / "risex-farmer" / "nado-mainnet-readiness"
-)
-_NADO_SECRET_FILENAME = "nado.identity"
 _SECRET_MAX_BYTES = 4096
 _PROTECTED_DIRECTORY_MODE = 0o700
 _PROTECTED_FILE_MODE = 0o600
@@ -136,6 +139,17 @@ def _token(value: Any, field: str) -> str:
     return value
 
 
+def _hex_identifier(value: Any, field: str, byte_length: int) -> str:
+    if (
+        type(value) is not str
+        or len(value) != 2 + (byte_length * 2)
+        or not value.startswith("0x")
+        or any(char not in "0123456789abcdefABCDEF" for char in value[2:])
+    ):
+        raise ReadinessViolation(f"HEX_IDENTITY_INVALID:{field}")
+    return value
+
+
 def _positive_decimal(value: Any, field: str) -> Decimal:
     result = _decimal(value, field)
     if result <= 0:
@@ -150,6 +164,9 @@ class AccountIdentity:
     environment: str = "MAINNET"
     exact: bool = True
     authoritative: bool = True
+    wallet_address: str | None = None
+    subaccount: str | None = None
+    identity_source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -315,15 +332,16 @@ class ReadinessEvidence:
 class PrivateVenueRead:
     venue: str
     account_id: str
-    credential_mode: str
+    query_authentication: str
+    query_status: str
+    query_source: str
+    query_kinds: tuple[str, ...]
     fee_status: str
     fee_source: str
     maker_fee_rate: Decimal
     taker_fee_rate: Decimal
     private_stream_status: str
     private_stream_source: str
-    account_state_status: str
-    account_state_source: str
     collateral_status: str
     collateral_usd: Decimal
     zero_relevant_orders: bool
@@ -363,6 +381,9 @@ class PrivateReadEvidence:
                 environment=_required(item, "environment", "identity"),
                 exact=_required(item, "exact", "identity"),
                 authoritative=_required(item, "authoritative", "identity"),
+                wallet_address=item.get("wallet_address"),
+                subaccount=item.get("subaccount"),
+                identity_source=item.get("identity_source"),
             )
             for item in _sequence(
                 _required(raw, "identities", "private_read"),
@@ -373,8 +394,17 @@ class PrivateReadEvidence:
             PrivateVenueRead(
                 venue=_required(item, "venue", "private_venue"),
                 account_id=_required(item, "account_id", "private_venue"),
-                credential_mode=_required(
-                    item, "credential_mode", "private_venue"
+                query_authentication=_required(
+                    item, "query_authentication", "private_venue"
+                ),
+                query_status=_required(item, "query_status", "private_venue"),
+                query_source=_required(item, "query_source", "private_venue"),
+                query_kinds=tuple(
+                    _token(value, "private_venue.query_kind")
+                    for value in _sequence(
+                        _required(item, "query_kinds", "private_venue"),
+                        "private_venue.query_kinds",
+                    )
                 ),
                 fee_status=_required(item, "fee_status", "private_venue"),
                 fee_source=_required(item, "fee_source", "private_venue"),
@@ -391,12 +421,6 @@ class PrivateReadEvidence:
                 ),
                 private_stream_source=_required(
                     item, "private_stream_source", "private_venue"
-                ),
-                account_state_status=_required(
-                    item, "account_state_status", "private_venue"
-                ),
-                account_state_source=_required(
-                    item, "account_state_source", "private_venue"
                 ),
                 collateral_status=_required(
                     item, "collateral_status", "private_venue"
@@ -839,45 +863,6 @@ class ProtectedFileState:
 
 
 @dataclass(frozen=True)
-class ProtectedSecretFiles:
-    risex: ProtectedFileState
-    nado: ProtectedFileState
-
-    @property
-    def states(self) -> tuple[ProtectedFileState, ProtectedFileState]:
-        return self.risex, self.nado
-
-    @property
-    def all_protected(self) -> bool:
-        return all(item.protected for item in self.states)
-
-
-@dataclass(frozen=True)
-class ProvisioningResult:
-    status: str
-    reason: str
-    files: ProtectedSecretFiles
-    mainnet_write_authority: str = NO_MAINNET_WRITE_AUTHORITY
-
-    @property
-    def write_ready(self) -> bool:
-        return False
-
-    def evidence(self) -> str:
-        return json.dumps(
-            {
-                "mainnet_write_authority": self.mainnet_write_authority,
-                "reason": self.reason,
-                "status": self.status,
-                "venues": list(VENUES),
-                "write_ready": self.write_ready,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-
-
-@dataclass(frozen=True)
 class ReadinessResult:
     status: str
     reason: str
@@ -1032,13 +1017,10 @@ class LifecycleResult:
         )
 
 
-def protected_secret_paths() -> Mapping[str, Path]:
-    """Return the canonical RISEx path and the only new Nado path."""
+def inspect_canonical_risex_identity() -> ProtectedFileState:
+    """Inspect the accepted RISEx protected identity by metadata only."""
 
-    return {
-        "RISEx": CANONICAL_RISEX_IDENTITY_PATH,
-        "Nado": PROTECTED_SECRET_DIRECTORY / _NADO_SECRET_FILENAME,
-    }
+    return _file_state("RISEx", CANONICAL_RISEX_IDENTITY_PATH)
 
 
 def _directory_state(directory: Path) -> tuple[bool, str]:
@@ -1109,209 +1091,6 @@ def _file_state(venue: str, path: Path) -> ProtectedFileState:
         mode=mode,
         link_count=links,
     )
-
-
-def inspect_protected_secret_files() -> ProtectedSecretFiles:
-    """Inspect metadata only; neither protected file is opened or read."""
-
-    paths = protected_secret_paths()
-    return ProtectedSecretFiles(
-        risex=_file_state("RISEx", paths["RISEx"]),
-        nado=_file_state("Nado", paths["Nado"]),
-    )
-
-
-def _ensure_fixed_directory() -> None:
-    directory = PROTECTED_SECRET_DIRECTORY
-    if not directory.is_absolute():
-        raise ReadinessViolation("PROTECTED_DIRECTORY_NOT_ABSOLUTE")
-
-    missing: list[Path] = []
-    current = directory
-    while True:
-        try:
-            info = os.lstat(current)
-        except FileNotFoundError:
-            missing.append(current)
-            if current.parent == current:
-                raise ReadinessViolation("PROTECTED_DIRECTORY_PARENT_MISSING")
-            current = current.parent
-            continue
-        except OSError as exc:
-            raise ReadinessViolation("PROTECTED_DIRECTORY_UNREADABLE") from exc
-        if stat.S_ISLNK(info.st_mode):
-            raise ReadinessViolation("PROTECTED_DIRECTORY_SYMLINK")
-        if not stat.S_ISDIR(info.st_mode):
-            raise ReadinessViolation("PROTECTED_DIRECTORY_NOT_DIRECTORY")
-        if info.st_uid != os.getuid():
-            raise ReadinessViolation("PROTECTED_DIRECTORY_OWNER_NOT_CURRENT_USER")
-        break
-
-    for item in reversed(missing):
-        try:
-            os.mkdir(item, _PROTECTED_DIRECTORY_MODE)
-        except FileExistsError:
-            pass
-        ok, reason = _directory_state(item)
-        if not ok:
-            raise ReadinessViolation(reason)
-    ok, reason = _directory_state(directory)
-    if not ok:
-        raise ReadinessViolation(reason)
-
-
-def _secret_bytes(value: Any) -> bytearray:
-    if type(value) is not str or not value or value != value.strip():
-        raise ReadinessViolation("PROTECTED_INPUT_INVALID")
-    if any(char in value for char in ("\x00", "\n", "\r")):
-        raise ReadinessViolation("PROTECTED_INPUT_INVALID")
-    try:
-        payload = bytearray(value.encode("utf-8"))
-    except UnicodeEncodeError as exc:
-        raise ReadinessViolation("PROTECTED_INPUT_INVALID") from exc
-    if not 0 < len(payload) <= _SECRET_MAX_BYTES:
-        payload[:] = b"\x00" * len(payload)
-        raise ReadinessViolation("PROTECTED_INPUT_INVALID")
-    return payload
-
-
-def _write_payload(directory_fd: int, filename: str, payload: bytearray) -> None:
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    descriptor = -1
-    created = False
-    completed = False
-    try:
-        descriptor = os.open(
-            filename,
-            flags,
-            _PROTECTED_FILE_MODE,
-            dir_fd=directory_fd,
-        )
-        created = True
-        info = os.fstat(descriptor)
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-            raise ReadinessViolation("PROTECTED_FILE_NOT_REGULAR")
-        if info.st_uid != os.getuid():
-            raise ReadinessViolation("PROTECTED_FILE_OWNER_NOT_CURRENT_USER")
-        if info.st_nlink != 1:
-            raise ReadinessViolation("PROTECTED_FILE_HARDLINK")
-        os.fchmod(descriptor, _PROTECTED_FILE_MODE)
-        view = memoryview(payload)
-        try:
-            while len(view):
-                written = os.write(descriptor, view)
-                if written <= 0:
-                    raise ReadinessViolation("PROTECTED_FILE_WRITE_INCOMPLETE")
-                view = view[written:]
-        finally:
-            view.release()
-        os.fsync(descriptor)
-        final_info = os.fstat(descriptor)
-        if (
-            stat.S_IMODE(final_info.st_mode) != _PROTECTED_FILE_MODE
-            or final_info.st_uid != os.getuid()
-            or final_info.st_nlink != 1
-            or final_info.st_size != len(payload)
-        ):
-            raise ReadinessViolation("PROTECTED_FILE_METADATA_CHANGED")
-        completed = True
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        if created and not completed:
-            try:
-                os.unlink(filename, dir_fd=directory_fd)
-            except OSError:
-                pass
-
-
-def _blocked_provisioning(reason: str) -> ProvisioningResult:
-    return ProvisioningResult(
-        status=BLOCKED,
-        reason=reason,
-        files=inspect_protected_secret_files(),
-    )
-
-
-def provision_nado_identity(
-    input_fn: Callable[[str], str] | None = None,
-) -> ProvisioningResult:
-    """Create only the Nado API-key/secret read-only bundle locally.
-
-    The canonical RISEx file is checked by metadata and never opened.  The
-    callback is intentionally one hidden-input prompt, allowing tests to use
-    opaque synthetic input without introducing a credential fixture.
-    """
-
-    before = inspect_protected_secret_files()
-    if not before.risex.protected:
-        return _blocked_provisioning(
-            "CANONICAL_RISEX_IDENTITY_NOT_PROTECTED"
-            f":{before.risex.reason}"
-        )
-    if before.nado.present:
-        return _blocked_provisioning("NADO_PROTECTED_PATH_ALREADY_EXISTS")
-    nado_directory_ok, nado_directory_reason = _directory_state(
-        PROTECTED_SECRET_DIRECTORY
-    )
-    if not nado_directory_ok and nado_directory_reason != "PROTECTED_DIRECTORY_MISSING":
-        return _blocked_provisioning(nado_directory_reason)
-
-    input_fn = getpass.getpass if input_fn is None else input_fn
-    payload: bytearray | None = None
-    supplied: str | None = None
-    try:
-        prompt = (
-            "Nado API key/secret read-only bundle "
-            "(hidden local input; no private key or seed phrase): "
-        )
-        try:
-            supplied = input_fn(prompt)
-        except Exception as exc:
-            raise ReadinessViolation("PROTECTED_INPUT_UNAVAILABLE") from exc
-        payload = _secret_bytes(supplied)
-        _ensure_fixed_directory()
-        directory_fd = os.open(
-            os.fspath(PROTECTED_SECRET_DIRECTORY),
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
-        )
-        try:
-            _write_payload(directory_fd, _NADO_SECRET_FILENAME, payload)
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    except ReadinessViolation as exc:
-        return _blocked_provisioning(str(exc))
-    except OSError:
-        return _blocked_provisioning("PROTECTED_FILESYSTEM_OPERATION_FAILED")
-    finally:
-        if payload is not None:
-            payload[:] = b"\x00" * len(payload)
-        supplied = None
-
-    result = ProvisioningResult(
-        status=PROVISIONED,
-        reason="NADO_PROTECTED_IDENTITY_CREATED",
-        files=inspect_protected_secret_files(),
-    )
-    if not result.files.nado.protected:
-        return ProvisioningResult(
-            status=BLOCKED,
-            reason=f"NADO_PROTECTED_FILE_NOT_SAFE:{result.files.nado.reason}",
-            files=result.files,
-        )
-    return result
-
-
-def provision_protected_identities(
-    input_fn: Callable[[str], str] | None = None,
-) -> ProvisioningResult:
-    """Compatibility name for the Nado-only protected provisioning gate."""
-
-    return provision_nado_identity(input_fn)
 
 
 def _rational_lcm(values: Sequence[Decimal]) -> tuple[int, int]:
@@ -1617,64 +1396,33 @@ def _with_readiness_phase(
 
 
 def assess_readiness(evidence: ReadinessEvidence) -> ReadinessResult:
-    """Evaluate public evidence and the local protected-file phase."""
+    """Evaluate public evidence and the canonical RISEx protected-path phase."""
 
     base = _public_evaluation(evidence)
     if base.blockers:
         return base
-    protected = inspect_protected_secret_files()
-    if not protected.risex.present and not protected.nado.present:
-        if protected.risex.reason not in {
-            "PROTECTED_FILE_MISSING",
-            "PROTECTED_DIRECTORY_MISSING",
-        }:
-            blocker = f"PROTECTED_SECRET_FILE_NOT_SAFE:RISEx:{protected.risex.reason}"
-            return _with_readiness_phase(
-                base, status=BLOCKED, reason=blocker, blockers=(blocker,)
-            )
-        if protected.nado.reason not in {
-            "PROTECTED_FILE_MISSING",
-            "PROTECTED_DIRECTORY_MISSING",
-        }:
-            blocker = f"PROTECTED_SECRET_FILE_NOT_SAFE:Nado:{protected.nado.reason}"
-            return _with_readiness_phase(
-                base, status=BLOCKED, reason=blocker, blockers=(blocker,)
-            )
+    protected = inspect_canonical_risex_identity()
+    if not protected.present and protected.reason in {
+        "PROTECTED_FILE_MISSING",
+        "PROTECTED_DIRECTORY_MISSING",
+    }:
         return _with_readiness_phase(
             base,
             status=READY_FOR_PROTECTED_PROVISIONING,
-            reason="PUBLIC_OFFLINE_REQUIREMENTS_PROVEN_PROTECTED_PROVISIONING_PENDING",
+            reason="PUBLIC_OFFLINE_REQUIREMENTS_PROVEN_CANONICAL_RISEX_PROTECTED_PATH_PENDING",
         )
-    if protected.risex.protected and not protected.nado.present:
-        if protected.nado.reason not in {
-            "PROTECTED_FILE_MISSING",
-            "PROTECTED_DIRECTORY_MISSING",
-        }:
-            blocker = f"PROTECTED_SECRET_FILE_NOT_SAFE:Nado:{protected.nado.reason}"
-            return _with_readiness_phase(
-                base, status=BLOCKED, reason=blocker, blockers=(blocker,)
-            )
-        return _with_readiness_phase(
-            base,
-            status=READY_FOR_PROTECTED_PROVISIONING,
-            reason="CANONICAL_RISEX_PROTECTED_NADO_PROVISIONING_PENDING",
-        )
-    if protected.all_protected:
+    if protected.protected:
         return _with_readiness_phase(
             base,
             status=READY_FOR_PRIVATE_READ_GATES,
-            reason="PROTECTED_IDENTITIES_PRESENT_PRIVATE_READ_GATES_PENDING",
+            reason="CANONICAL_RISEX_PROTECTED_NADO_UNSIGNED_READ_GATES_PENDING",
         )
-    blockers = tuple(
-        f"PROTECTED_SECRET_FILE_NOT_SAFE:{item.venue}:{item.reason}"
-        for item in protected.states
-        if not item.protected
-    )
+    blocker = f"PROTECTED_SECRET_FILE_NOT_SAFE:RISEx:{protected.reason}"
     return _with_readiness_phase(
         base,
         status=BLOCKED,
-        reason=blockers[0] if blockers else "PROTECTED_SECRET_FILES_INVALID",
-        blockers=blockers or ("PROTECTED_SECRET_FILES_INVALID",),
+        reason=blocker,
+        blockers=(blocker,),
     )
 
 
@@ -1714,6 +1462,36 @@ def _private_identity_map(
             _add_blocker(blockers, f"PRIVATE_ACCOUNT_ENVIRONMENT_NOT_MAINNET:{identity.venue}")
         if identity.exact is not True or identity.authoritative is not True:
             _add_blocker(blockers, f"PRIVATE_ACCOUNT_IDENTITY_NOT_AUTHORITATIVE:{identity.venue}")
+        if identity.venue == "Nado":
+            try:
+                wallet = _hex_identifier(
+                    identity.wallet_address,
+                    "Nado.wallet_address",
+                    20,
+                )
+                subaccount = _hex_identifier(
+                    identity.subaccount,
+                    "Nado.subaccount",
+                    32,
+                )
+            except ReadinessViolation:
+                _add_blocker(blockers, "NADO_PUBLIC_WALLET_SUBACCOUNT_NOT_EXACT")
+            else:
+                if identity.identity_source != NADO_PUBLIC_IDENTITY_SOURCE:
+                    _add_blocker(blockers, "NADO_PUBLIC_IDENTITY_SOURCE_NOT_EXACT")
+                if identity.account_id.lower() != subaccount.lower():
+                    _add_blocker(blockers, "NADO_ACCOUNT_ID_NOT_SUBACCOUNT")
+                if subaccount[2:42].lower() != wallet[2:].lower():
+                    _add_blocker(blockers, "NADO_SUBACCOUNT_WALLET_MISMATCH")
+        elif any(
+            value is not None
+            for value in (
+                identity.wallet_address,
+                identity.subaccount,
+                identity.identity_source,
+            )
+        ):
+            _add_blocker(blockers, "RISEX_IDENTITY_MUST_REUSE_CANONICAL_PATH")
         result[identity.venue] = identity.account_id
     if set(result) != set(VENUES):
         _add_blocker(blockers, "PRIVATE_IDENTITIES_MUST_INCLUDE_ONE_EXACT_ACCOUNT_PER_VENUE")
@@ -1784,14 +1562,6 @@ def assess_private_read(
     blockers: list[str] = []
     account_ids = _private_identity_map(private_read, blockers)
     private_venues: dict[str, PrivateVenueRead] = {}
-    expected_modes = {
-        "RISEx": "CANONICAL_PROTECTED_IDENTITY",
-        "Nado": NADO_READ_CREDENTIAL_KIND,
-    }
-    expected_stream_sources = {
-        "RISEx": "ACCOUNT_PRIVATE_STREAM",
-        "Nado": "NADO_ACCOUNT_PRIVATE_STREAM",
-    }
     for venue in private_read.venues:
         if venue.venue not in VENUES:
             _add_blocker(blockers, "PRIVATE_VENUE_READ_OUT_OF_SCOPE")
@@ -1801,21 +1571,34 @@ def assess_private_read(
         private_venues[venue.venue] = venue
         if venue.account_id != account_ids.get(venue.venue):
             _add_blocker(blockers, f"PRIVATE_VENUE_ACCOUNT_BINDING_MISMATCH:{venue.venue}")
-        if venue.credential_mode != expected_modes[venue.venue]:
-            _add_blocker(blockers, f"PRIVATE_CREDENTIAL_MODE_NOT_ALLOWED:{venue.venue}")
+        if venue.venue == "Nado":
+            if venue.query_authentication != NADO_UNSIGNED_QUERY_AUTHENTICATION:
+                _add_blocker(blockers, "NADO_QUERY_MUST_BE_UNSIGNED")
+            if venue.query_status != NADO_UNSIGNED_QUERY_STATUS or venue.query_source != NADO_UNSIGNED_QUERY_SOURCE:
+                _add_blocker(blockers, "NADO_UNSIGNED_QUERY_NOT_AUTHORITATIVE")
+            if not NADO_REQUIRED_QUERY_KINDS.issubset(set(venue.query_kinds)):
+                _add_blocker(blockers, "NADO_UNSIGNED_QUERY_SET_INCOMPLETE")
+            if (
+                venue.private_stream_status != NADO_PRIVATE_STREAM_PENDING_STATUS
+                or venue.private_stream_source != NADO_PRIVATE_STREAM_PENDING_SOURCE
+            ):
+                _add_blocker(blockers, "NADO_PRIVATE_STREAM_MUST_REMAIN_PENDING")
+        else:
+            if venue.query_authentication != "CANONICAL_PROTECTED_READ":
+                _add_blocker(blockers, "RISEX_QUERY_MUST_USE_CANONICAL_PROTECTED_PATH")
+            if venue.query_status != "AUTHORITATIVE_CURRENT" or venue.query_source != "ACCOUNT_SCOPED_PRIVATE_READ":
+                _add_blocker(blockers, "ACCOUNT_STATE_NOT_AUTHORITATIVE:RISEx")
+            if (
+                venue.private_stream_status != "READY_ACCOUNT_SCOPED"
+                or venue.private_stream_source != "ACCOUNT_PRIVATE_STREAM"
+            ):
+                _add_blocker(blockers, "PRIVATE_STREAM_NOT_READY:RISEx")
         if venue.fee_status != "ACCOUNT_SCOPED_AUTHORITATIVE" or venue.fee_source != "ACCOUNT_SCOPED_READ":
             _add_blocker(blockers, f"ACCOUNT_FEE_NOT_AUTHORITATIVE:{venue.venue}")
         if not _valid_decimal(venue.maker_fee_rate, f"{venue.venue}.maker_fee_rate"):
             _add_blocker(blockers, f"ACCOUNT_FEE_VALUE_INVALID:{venue.venue}:maker")
         if not _valid_decimal(venue.taker_fee_rate, f"{venue.venue}.taker_fee_rate"):
             _add_blocker(blockers, f"ACCOUNT_FEE_VALUE_INVALID:{venue.venue}:taker")
-        if (
-            venue.private_stream_status != "READY_ACCOUNT_SCOPED"
-            or venue.private_stream_source != expected_stream_sources[venue.venue]
-        ):
-            _add_blocker(blockers, f"PRIVATE_STREAM_NOT_READY:{venue.venue}")
-        if venue.account_state_status != "AUTHORITATIVE_CURRENT" or venue.account_state_source != "ACCOUNT_SCOPED_PRIVATE_READ":
-            _add_blocker(blockers, f"ACCOUNT_STATE_NOT_AUTHORITATIVE:{venue.venue}")
         if venue.collateral_status != "AUTHORITATIVE_POSITIVE" or not _valid_decimal(
             venue.collateral_usd, f"{venue.venue}.collateral_usd", positive=True
         ):
@@ -1835,7 +1618,7 @@ def assess_private_read(
         return _invalid_private_result(public, blockers, planned_total=planned_total)
     return PrivateReadResult(
         status=PRIVATE_READ_GATES_COMPLETE,
-        reason="AUTHENTICATED_PRIVATE_READ_REQUIREMENTS_PROVEN",
+        reason="ACCOUNT_SCOPED_READ_REQUIREMENTS_PROVEN_UNSIGNED_NADO_QUERY_PENDING_STREAM_AUTH",
         blockers=(),
         route_id=public.route_id,
         direction=public.direction,
@@ -2225,9 +2008,15 @@ __all__ = [
     "NADO_MAINNET_PERP_ENGINE_CONTRACT",
     "NADO_PUBLIC_MINIMUM_FEE_NOTIONAL_USD",
     "NADO_PUBLIC_MINIMUM_NOTIONAL_USD",
-    "NADO_READ_CREDENTIAL_KIND",
+    "NADO_PUBLIC_IDENTITY_SOURCE",
     "NADO_SDK_PACKAGE",
     "NADO_SDK_VERSION",
+    "NADO_PRIVATE_STREAM_PENDING_SOURCE",
+    "NADO_PRIVATE_STREAM_PENDING_STATUS",
+    "NADO_REQUIRED_QUERY_KINDS",
+    "NADO_UNSIGNED_QUERY_AUTHENTICATION",
+    "NADO_UNSIGNED_QUERY_SOURCE",
+    "NADO_UNSIGNED_QUERY_STATUS",
     "NO_MAINNET_WRITE_AUTHORITY",
     "OPPOSITE_DIRECTIONS",
     "POST_LIFECYCLE_EVIDENCE_COMPLETE",
@@ -2236,11 +2025,7 @@ __all__ = [
     "PrivateReadEvidence",
     "PrivateReadResult",
     "PrivateVenueRead",
-    "PROTECTED_SECRET_DIRECTORY",
-    "PROVISIONED",
-    "ProvisioningResult",
     "ProtectedFileState",
-    "ProtectedSecretFiles",
     "READY_FOR_PRIVATE_READ_GATES",
     "READY_FOR_PROTECTED_PROVISIONING",
     "ReadinessEvidence",
@@ -2253,8 +2038,5 @@ __all__ = [
     "assess_post_lifecycle",
     "assess_private_read",
     "assess_readiness",
-    "inspect_protected_secret_files",
-    "provision_nado_identity",
-    "provision_protected_identities",
-    "protected_secret_paths",
+    "inspect_canonical_risex_identity",
 ]

@@ -27,7 +27,7 @@
     },
     "nado": {
       "venue": "Nado",
-      "account_id": "synthetic-nado-account-001",
+      "account_id": "0x111111111111111111111111111111111111111164656661756c740000000000",
       "route_id": "RISEX-NADO-BTC-001",
       "canonical_asset": "BTC",
       "entry_side": "SELL",

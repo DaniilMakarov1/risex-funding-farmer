@@ -6,7 +6,7 @@
     "risex_venue": "RISEx",
     "risex_account_id": "synthetic-risex-account-001",
     "nado_venue": "Nado",
-    "nado_account_id": "synthetic-nado-account-001",
+    "nado_account_id": "0x111111111111111111111111111111111111111164656661756c740000000000",
     "risex_planned_deposit_usd": "40",
     "nado_planned_deposit_usd": "50",
     "deposit_cap_usd": "250",
@@ -35,7 +35,7 @@
         "sequence": 2,
         "venue": "Nado",
         "purpose": "ENTRY",
-        "account_id": "synthetic-nado-account-001",
+        "account_id": "0x111111111111111111111111111111111111111164656661756c740000000000",
         "runtime_id": "synthetic-runtime-001",
         "write_identity": "synthetic-write-nado-entry-001",
         "durable_before_dispatch": true
@@ -53,7 +53,7 @@
         "sequence": 4,
         "venue": "Nado",
         "purpose": "CLOSE",
-        "account_id": "synthetic-nado-account-001",
+        "account_id": "0x111111111111111111111111111111111111111164656661756c740000000000",
         "runtime_id": "synthetic-runtime-001",
         "write_identity": "synthetic-write-nado-close-001",
         "durable_before_dispatch": true

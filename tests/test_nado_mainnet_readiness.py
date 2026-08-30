@@ -21,7 +21,8 @@ PRIVATE_FIXTURE = FIXTURE_ROOT / "private_read.json"
 APPROVAL_FIXTURE = FIXTURE_ROOT / "dispatch_approval.json"
 LIFECYCLE_FIXTURE = FIXTURE_ROOT / "lifecycle.json"
 SYNTHETIC_RISEX_IDENTITY = "synthetic-risex-identity-only"
-SYNTHETIC_NADO_BUNDLE = "synthetic-nado-api-key-secret-bundle"
+NADO_WALLET = "0x1111111111111111111111111111111111111111"
+NADO_SUBACCOUNT = "0x111111111111111111111111111111111111111164656661756c740000000000"
 
 
 def _raw(path: Path):
@@ -46,10 +47,8 @@ def _lifecycle():
 
 def _configure_paths(tmp_path, monkeypatch):
     canonical = tmp_path / "canonical-risex" / "risex.identity"
-    nado_directory = tmp_path / "nado-protected"
     monkeypatch.setattr(readiness, "CANONICAL_RISEX_IDENTITY_PATH", canonical)
-    monkeypatch.setattr(readiness, "PROTECTED_SECRET_DIRECTORY", nado_directory)
-    return canonical, nado_directory
+    return canonical
 
 
 def _install_canonical(canonical: Path):
@@ -59,20 +58,10 @@ def _install_canonical(canonical: Path):
     os.chmod(canonical, 0o600)
 
 
-def _provision(tmp_path, monkeypatch):
-    canonical, nado_directory = _configure_paths(tmp_path, monkeypatch)
+def _install_canonical_for_gate(tmp_path, monkeypatch):
+    canonical = _configure_paths(tmp_path, monkeypatch)
     _install_canonical(canonical)
-    prompts = []
-
-    def hidden_input(prompt):
-        prompts.append(prompt)
-        return SYNTHETIC_NADO_BUNDLE
-
-    result = readiness.provision_nado_identity(hidden_input)
-    assert result.status == readiness.PROVISIONED
-    assert result.files.all_protected
-    assert len(prompts) == 1
-    return canonical, nado_directory, result
+    return canonical
 
 
 def _with_venue(evidence, venue_name, **changes):
@@ -160,7 +149,7 @@ def _with_terminal(lifecycle, index, **changes):
 
 
 def _post(tmp_path, monkeypatch, *, evidence=None, private=None, approval=None, lifecycle=None):
-    _provision(tmp_path, monkeypatch)
+    _install_canonical_for_gate(tmp_path, monkeypatch)
     return readiness.assess_post_lifecycle(
         _public() if evidence is None else evidence,
         _private() if private is None else private,
@@ -203,10 +192,20 @@ def test_official_nado_metadata_is_offline_only():
     assert readiness.NADO_BTC_PERP_PRODUCT_ID == 2
     assert readiness.NADO_PUBLIC_MINIMUM_NOTIONAL_USD == Decimal("100")
     assert readiness.NADO_PUBLIC_MINIMUM_FEE_NOTIONAL_USD == Decimal("100")
-    assert readiness.NADO_READ_CREDENTIAL_KIND == "API_KEY_SECRET_READ_ONLY"
+    assert readiness.NADO_PUBLIC_IDENTITY_SOURCE == "PUBLIC_WALLET_SUBACCOUNT"
+    assert readiness.NADO_UNSIGNED_QUERY_AUTHENTICATION == "UNSIGNED_QUERY"
+    assert readiness.NADO_UNSIGNED_QUERY_STATUS == "AUTHORITATIVE_UNSIGNED_QUERY"
+    assert readiness.NADO_UNSIGNED_QUERY_SOURCE == "NADO_UNSIGNED_QUERY"
+    assert readiness.NADO_PRIVATE_STREAM_PENDING_STATUS == "PENDING_SIGNED_AUTHENTICATE"
+    assert readiness.NADO_PRIVATE_STREAM_PENDING_SOURCE == "FUTURE_SIGNED_AUTHENTICATE"
+    assert readiness.NADO_REQUIRED_QUERY_KINDS == frozenset(
+        {"SUBACCOUNT_INFO", "SUBACCOUNT_ORDERS", "FEE_RATES"}
+    )
     assert readiness.NADO_SDK_PACKAGE == "nado-protocol"
     assert readiness.NADO_SDK_VERSION == "2.0.0"
-    assert readiness.protected_secret_paths()["Nado"].name == "nado.identity"
+    assert not hasattr(readiness, "NADO_READ_CREDENTIAL_KIND")
+    assert not hasattr(readiness, "provision_nado_identity")
+    assert not hasattr(readiness, "PROTECTED_SECRET_DIRECTORY")
 
 
 @pytest.mark.parametrize("direction", sorted(readiness.OPPOSITE_DIRECTIONS))
@@ -293,116 +292,98 @@ def test_public_parser_tolerates_irrelevant_additive_fields_but_rejects_later_ph
             readiness.ReadinessEvidence.from_mapping(later)
 
 
-def test_protected_phase_requires_canonical_risex_and_only_adds_nado_file(
+def test_protected_phase_reuses_only_canonical_risex_path_without_nado_secret_surface(
     tmp_path, monkeypatch
 ):
-    canonical, nado_directory = _configure_paths(tmp_path, monkeypatch)
-    blocked = readiness.provision_nado_identity(lambda _prompt: SYNTHETIC_NADO_BUNDLE)
-    assert blocked.status == readiness.BLOCKED
-    assert blocked.reason.startswith("CANONICAL_RISEX_IDENTITY_NOT_PROTECTED")
-    assert not nado_directory.exists()
+    canonical = _configure_paths(tmp_path, monkeypatch)
+    missing = readiness.assess_readiness(_public())
+    assert missing.status == readiness.READY_FOR_PROTECTED_PROVISIONING
+    assert not (tmp_path / "nado-protected").exists()
 
     _install_canonical(canonical)
     before_content = canonical.read_bytes()
     before_inode = canonical.stat().st_ino
-    prompts = []
-    result = readiness.provision_nado_identity(
-        lambda prompt: prompts.append(prompt) or SYNTHETIC_NADO_BUNDLE
-    )
-    assert result.status == readiness.PROVISIONED
-    assert len(prompts) == 1
-    assert "API key/secret" in prompts[0]
-    assert "private key" in prompts[0]
+    result = readiness.assess_readiness(_public())
+    assert result.status == readiness.READY_FOR_PRIVATE_READ_GATES
+    inspected = readiness.inspect_canonical_risex_identity()
+    assert inspected.path == str(canonical)
+    assert inspected.protected
     assert canonical.read_bytes() == before_content
     assert canonical.stat().st_ino == before_inode
-    assert sorted(path.name for path in nado_directory.iterdir()) == ["nado.identity"]
-    assert not (nado_directory / "risex.identity").exists()
-    assert result.files.risex.path == str(canonical)
-    assert result.files.nado.mode == 0o600
-    assert result.files.nado.link_count == 1
-    assert SYNTHETIC_NADO_BUNDLE not in repr(result)
-    assert SYNTHETIC_NADO_BUNDLE not in result.evidence()
+    assert "synthetic-" not in result.evidence()
 
-
-def test_provisioning_rejects_duplicate_invalid_or_existing_nado_without_persistence(
-    tmp_path, monkeypatch
-):
-    canonical, nado_directory = _configure_paths(tmp_path, monkeypatch)
-    _install_canonical(canonical)
-    duplicate = readiness.provision_nado_identity(lambda _prompt: "")
-    assert duplicate.status == readiness.BLOCKED
-    assert duplicate.reason == "PROTECTED_INPUT_INVALID"
-    assert not nado_directory.exists()
-
-    invalid = readiness.provision_nado_identity(lambda _prompt: "bad\nvalue")
-    assert invalid.status == readiness.BLOCKED
-    assert invalid.reason == "PROTECTED_INPUT_INVALID"
-    assert not nado_directory.exists()
-
-    nado_directory.mkdir(mode=0o700)
-    os.chmod(nado_directory, 0o700)
-    nado_path = nado_directory / "nado.identity"
-    nado_path.write_text("synthetic-existing-nado")
-    os.chmod(nado_path, 0o600)
-    prompts = []
-    existing = readiness.provision_nado_identity(
-        lambda prompt: prompts.append(prompt) or "synthetic-new-nado"
-    )
-    assert existing.status == readiness.BLOCKED
-    assert existing.reason == "NADO_PROTECTED_PATH_ALREADY_EXISTS"
-    assert prompts == []
-    assert nado_path.read_text() == "synthetic-existing-nado"
+    source = (ROOT / "src/risex_farmer/nado_mainnet_readiness.py").read_text()
+    for forbidden in (
+        "API_KEY_SECRET_READ_ONLY",
+        "PROTECTED_SECRET_DIRECTORY",
+        "nado.identity",
+        "provision_nado_identity",
+        "provision_protected_identities",
+    ):
+        assert forbidden not in source
 
 
 def test_protected_inspection_rejects_0700_0600_ownership_symlink_and_hardlink(
     tmp_path, monkeypatch
 ):
-    canonical, nado_directory, _ = _provision(tmp_path, monkeypatch)
-    paths = readiness.protected_secret_paths()
-    assert all(item.protected for item in readiness.inspect_protected_secret_files().states)
+    canonical = _install_canonical_for_gate(tmp_path, monkeypatch)
+    assert readiness.inspect_canonical_risex_identity().protected
 
-    os.chmod(nado_directory, 0o755)
-    inspected = readiness.inspect_protected_secret_files()
-    assert inspected.nado.reason == "PROTECTED_DIRECTORY_MODE_NOT_0700"
-    os.chmod(nado_directory, 0o700)
-    os.chmod(paths["Nado"], 0o644)
-    assert readiness.inspect_protected_secret_files().nado.reason == "PROTECTED_FILE_MODE_NOT_0600"
-    os.chmod(paths["Nado"], 0o600)
+    os.chmod(canonical.parent, 0o755)
+    assert (
+        readiness.inspect_canonical_risex_identity().reason
+        == "PROTECTED_DIRECTORY_MODE_NOT_0700"
+    )
+    os.chmod(canonical.parent, 0o700)
+    os.chmod(canonical, 0o644)
+    assert (
+        readiness.inspect_canonical_risex_identity().reason
+        == "PROTECTED_FILE_MODE_NOT_0600"
+    )
+    os.chmod(canonical, 0o600)
 
     replacement = tmp_path / "replacement"
     replacement.write_text("synthetic-replacement")
     os.chmod(replacement, 0o600)
-    paths["Nado"].unlink()
-    paths["Nado"].symlink_to(replacement)
-    assert readiness.inspect_protected_secret_files().nado.reason == "PROTECTED_FILE_SYMLINK"
-    paths["Nado"].unlink()
-    os.link(canonical, paths["Nado"])
-    assert readiness.inspect_protected_secret_files().nado.reason == "PROTECTED_FILE_HARDLINK"
+    canonical.unlink()
+    canonical.symlink_to(replacement)
+    assert (
+        readiness.inspect_canonical_risex_identity().reason
+        == "PROTECTED_FILE_SYMLINK"
+    )
+    canonical.unlink()
+
+    hardlink_source = tmp_path / "hardlink-source"
+    hardlink_source.write_text("synthetic-hardlink")
+    os.chmod(hardlink_source, 0o600)
+    os.link(hardlink_source, canonical)
+    assert (
+        readiness.inspect_canonical_risex_identity().reason
+        == "PROTECTED_FILE_HARDLINK"
+    )
 
     current_uid = os.getuid()
     monkeypatch.setattr(readiness.os, "getuid", lambda: current_uid + 100000)
-    foreign = readiness.inspect_protected_secret_files()
-    assert all(item.reason == "PROTECTED_DIRECTORY_OWNER_NOT_CURRENT_USER" for item in foreign.states)
+    foreign = readiness.inspect_canonical_risex_identity()
+    assert foreign.reason == "PROTECTED_DIRECTORY_OWNER_NOT_CURRENT_USER"
 
 
-def test_canonical_risex_file_unsafe_state_blocks_readiness_and_nado_provisioning(
+def test_canonical_risex_file_unsafe_state_blocks_readiness_without_nado_secret_surface(
     tmp_path, monkeypatch
 ):
-    canonical, nado_directory = _configure_paths(tmp_path, monkeypatch)
+    canonical = _configure_paths(tmp_path, monkeypatch)
     _install_canonical(canonical)
     canonical.chmod(0o644)
-    public = _public()
-    result = readiness.assess_readiness(public)
+    result = readiness.assess_readiness(_public())
     assert result.status == readiness.BLOCKED
     assert "PROTECTED_SECRET_FILE_NOT_SAFE:RISEx:PROTECTED_FILE_MODE_NOT_0600" in result.blockers
-    assert readiness.provision_nado_identity(lambda _prompt: SYNTHETIC_NADO_BUNDLE).status == readiness.BLOCKED
-    assert not nado_directory.exists()
+    assert not (tmp_path / "nado-protected").exists()
 
 
-def test_safe_files_open_private_read_gate_and_reuse_nado_read_only_mode(
+def test_safe_files_open_private_read_gate_with_unsigned_nado_queries(
     tmp_path, monkeypatch
 ):
-    _provision(tmp_path, monkeypatch)
+    _install_canonical_for_gate(tmp_path, monkeypatch)
     public = _public()
     readiness_result = readiness.assess_readiness(public)
     assert readiness_result.status == readiness.READY_FOR_PRIVATE_READ_GATES
@@ -412,15 +393,32 @@ def test_safe_files_open_private_read_gate_and_reuse_nado_read_only_mode(
     assert private_result.mainnet_write_authority == readiness.NO_MAINNET_WRITE_AUTHORITY
     assert not private_result.write_ready
     assert "synthetic-risex-account-001" not in private_result.evidence()
-    assert "synthetic-nado-account-001" not in private_result.evidence()
+    assert NADO_SUBACCOUNT not in private_result.evidence()
+    nado_identity = next(item for item in _private().identities if item.venue == "Nado")
+    nado_read = next(item for item in _private().venues if item.venue == "Nado")
+    assert nado_identity.wallet_address == NADO_WALLET
+    assert nado_identity.subaccount == NADO_SUBACCOUNT
+    assert nado_identity.identity_source == readiness.NADO_PUBLIC_IDENTITY_SOURCE
+    assert nado_read.query_authentication == readiness.NADO_UNSIGNED_QUERY_AUTHENTICATION
+    assert nado_read.query_status == readiness.NADO_UNSIGNED_QUERY_STATUS
+    assert nado_read.query_source == readiness.NADO_UNSIGNED_QUERY_SOURCE
+    assert set(nado_read.query_kinds) == readiness.NADO_REQUIRED_QUERY_KINDS
+    assert nado_read.private_stream_status == readiness.NADO_PRIVATE_STREAM_PENDING_STATUS
+    assert nado_read.private_stream_source == readiness.NADO_PRIVATE_STREAM_PENDING_SOURCE
 
 
 @pytest.mark.parametrize(
     ("change_kind", "reason"),
     [
-        ("nado_mode", "PRIVATE_CREDENTIAL_MODE_NOT_ALLOWED:Nado"),
-        ("nado_stream", "PRIVATE_STREAM_NOT_READY:Nado"),
-        ("nado_account_state", "ACCOUNT_STATE_NOT_AUTHORITATIVE:Nado"),
+        ("nado_query_authentication", "NADO_QUERY_MUST_BE_UNSIGNED"),
+        ("nado_query_status", "NADO_UNSIGNED_QUERY_NOT_AUTHORITATIVE"),
+        ("nado_query_source", "NADO_UNSIGNED_QUERY_NOT_AUTHORITATIVE"),
+        ("nado_query_kinds", "NADO_UNSIGNED_QUERY_SET_INCOMPLETE"),
+        ("nado_stream", "NADO_PRIVATE_STREAM_MUST_REMAIN_PENDING"),
+        ("nado_stream_pending", "NADO_PRIVATE_STREAM_MUST_REMAIN_PENDING"),
+        ("nado_identity_missing", "NADO_PUBLIC_WALLET_SUBACCOUNT_NOT_EXACT"),
+        ("nado_identity", "NADO_SUBACCOUNT_WALLET_MISMATCH"),
+        ("nado_account_binding", "NADO_ACCOUNT_ID_NOT_SUBACCOUNT"),
         ("nado_collateral", "POSITIVE_COLLATERAL_NOT_PROVEN:Nado"),
         ("nado_zero_orders", "PRIVATE_STATE_NOT_CLEAR:Nado:zero_relevant_orders"),
         ("nado_trigger_orders", "PRIVATE_STATE_NOT_CLEAR:Nado:zero_trigger_orders"),
@@ -433,17 +431,39 @@ def test_safe_files_open_private_read_gate_and_reuse_nado_read_only_mode(
         ("deposit_account", "PLANNED_DEPOSIT_ACCOUNT_MISMATCH:Nado"),
     ],
 )
-def test_private_read_gates_fail_closed_on_nado_account_fee_stream_state_and_deposit_risks(
+def test_private_read_gates_fail_closed_on_unsigned_query_identity_fee_stream_state_and_deposit_risks(
     tmp_path, monkeypatch, change_kind, reason
 ):
-    _provision(tmp_path, monkeypatch)
+    _install_canonical_for_gate(tmp_path, monkeypatch)
     private = _private()
-    if change_kind == "nado_mode":
-        private = _with_private_venue(private, "Nado", credential_mode="CANONICAL_PROTECTED_IDENTITY")
+    if change_kind == "nado_query_authentication":
+        private = _with_private_venue(private, "Nado", query_authentication="SIGNED_QUERY")
+    elif change_kind == "nado_query_status":
+        private = _with_private_venue(private, "Nado", query_status="CURRENT")
+    elif change_kind == "nado_query_source":
+        private = _with_private_venue(private, "Nado", query_source="PUBLIC_READ")
+    elif change_kind == "nado_query_kinds":
+        private = _with_private_venue(
+            private,
+            "Nado",
+            query_kinds=("SUBACCOUNT_INFO", "SUBACCOUNT_ORDERS"),
+        )
     elif change_kind == "nado_stream":
         private = _with_private_venue(private, "Nado", private_stream_source="ACCOUNT_PRIVATE_STREAM")
-    elif change_kind == "nado_account_state":
-        private = _with_private_venue(private, "Nado", account_state_source="PUBLIC_READ")
+    elif change_kind == "nado_stream_pending":
+        private = _with_private_venue(private, "Nado", private_stream_status="READY_ACCOUNT_SCOPED")
+    elif change_kind == "nado_identity_missing":
+        private = _with_identity(
+            private,
+            "Nado",
+            wallet_address=None,
+            subaccount=None,
+            identity_source=None,
+        )
+    elif change_kind == "nado_identity":
+        private = _with_identity(private, "Nado", wallet_address="0x" + ("2" * 40))
+    elif change_kind == "nado_account_binding":
+        private = _with_identity(private, "Nado", account_id="0x" + ("1" * 64))
     elif change_kind == "nado_collateral":
         private = _with_private_venue(private, "Nado", collateral_usd=Decimal("0"))
     elif change_kind == "nado_zero_orders":
@@ -470,7 +490,7 @@ def test_private_read_gates_fail_closed_on_nado_account_fee_stream_state_and_dep
 
 
 def test_private_read_requires_both_exact_accounts_and_positive_deposits(tmp_path, monkeypatch):
-    _provision(tmp_path, monkeypatch)
+    _install_canonical_for_gate(tmp_path, monkeypatch)
     private = dataclasses.replace(_private(), identities=_private().identities[:1])
     result = readiness.assess_private_read(_public(), private)
     assert result.status == readiness.BLOCKED
@@ -486,7 +506,7 @@ def test_future_approval_requires_private_read_and_never_becomes_write_ready(
     assert "PRIVATE_READ_REQUIRES_READY_PRIVATE_READ_GATES" in blocked.blockers
     assert not blocked.write_ready
 
-    _provision(tmp_path, monkeypatch)
+    _install_canonical_for_gate(tmp_path, monkeypatch)
     complete = readiness.assess_dispatch_approval(_public(), _private(), _approval())
     assert complete.status == readiness.FUTURE_DISPATCH_APPROVAL_COMPLETE
     assert complete.complete
@@ -513,7 +533,7 @@ def test_future_approval_requires_private_read_and_never_becomes_write_ready(
 def test_explicit_positive_deposit_and_max_loss_caps_bind_accounts_and_scope(
     tmp_path, monkeypatch, attribute, value, reason
 ):
-    _provision(tmp_path, monkeypatch)
+    _install_canonical_for_gate(tmp_path, monkeypatch)
     base = _approval()
     approval = dataclasses.replace(base.approval, **{attribute: value})
     result = readiness.assess_dispatch_approval(
@@ -538,7 +558,7 @@ def test_explicit_positive_deposit_and_max_loss_caps_bind_accounts_and_scope(
 def test_fresh_runtime_durable_identity_and_restart_barriers_fail_closed(
     tmp_path, monkeypatch, attribute, value, reason
 ):
-    _provision(tmp_path, monkeypatch)
+    _install_canonical_for_gate(tmp_path, monkeypatch)
     base = _approval()
     operational = dataclasses.replace(base.operational, **{attribute: value})
     result = readiness.assess_dispatch_approval(
@@ -549,7 +569,7 @@ def test_fresh_runtime_durable_identity_and_restart_barriers_fail_closed(
 
 
 def test_dispatch_identity_ordering_and_distinctness_are_required(tmp_path, monkeypatch):
-    _provision(tmp_path, monkeypatch)
+    _install_canonical_for_gate(tmp_path, monkeypatch)
     base = _approval()
     swapped = list(base.operational.dispatches)
     swapped[0], swapped[1] = swapped[1], swapped[0]
@@ -582,7 +602,7 @@ def test_lifecycle_requires_prior_gates_and_accepts_both_directions_with_zero_or
     assert missing.status == readiness.BLOCKED
     assert "FUTURE_DISPATCH_APPROVAL_REQUIRED" in missing.blockers
 
-    _provision(tmp_path, monkeypatch)
+    _install_canonical_for_gate(tmp_path, monkeypatch)
     complete = readiness.assess_post_lifecycle(_public(), _private(), _approval(), _lifecycle())
     assert complete.status == readiness.POST_LIFECYCLE_EVIDENCE_COMPLETE
     assert complete.complete
@@ -701,7 +721,7 @@ def test_terminal_round_count_sequence_and_time_order_are_required(tmp_path, mon
 
 
 def test_all_result_surfaces_are_redacted_and_never_write_ready(tmp_path, monkeypatch):
-    _provision(tmp_path, monkeypatch)
+    _install_canonical_for_gate(tmp_path, monkeypatch)
     public = _public()
     results = [
         readiness.assess_readiness(public),
@@ -713,9 +733,9 @@ def test_all_result_surfaces_are_redacted_and_never_write_ready(tmp_path, monkey
         assert result.mainnet_write_authority == readiness.NO_MAINNET_WRITE_AUTHORITY
         assert not result.write_ready
         assert SYNTHETIC_RISEX_IDENTITY not in repr(result)
-        assert SYNTHETIC_NADO_BUNDLE not in repr(result)
+        assert NADO_SUBACCOUNT not in repr(result)
         assert "synthetic-risex-account-001" not in result.evidence()
-        assert "synthetic-nado-account-001" not in result.evidence()
+        assert NADO_SUBACCOUNT not in result.evidence()
 
 
 def test_readiness_module_has_no_transport_database_sdk_or_write_surface():
@@ -734,6 +754,12 @@ def test_readiness_module_has_no_transport_database_sdk_or_write_surface():
         "eth_account",
         "starknet",
         "nado_private_read",
+        "API_KEY_SECRET_READ_ONLY",
+        "PROTECTED_SECRET_DIRECTORY",
+        "nado.identity",
+        "provision_nado_identity",
+        "provision_protected_identities",
+        "NADO_ACCOUNT_PRIVATE_STREAM",
     ):
         assert forbidden not in source
     assert not re.search(r"\b(?:POST|PUT|DELETE|PATCH)\b", source)
@@ -747,7 +773,6 @@ def test_readiness_module_has_no_transport_database_sdk_or_write_surface():
     assert set(imported_roots) <= {
         "dataclasses",
         "decimal",
-        "getpass",
         "json",
         "math",
         "os",

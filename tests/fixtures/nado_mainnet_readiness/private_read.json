@@ -9,25 +9,29 @@
     },
     {
       "venue": "Nado",
-      "account_id": "synthetic-nado-account-001",
+      "account_id": "0x111111111111111111111111111111111111111164656661756c740000000000",
       "environment": "MAINNET",
       "exact": true,
-      "authoritative": true
+      "authoritative": true,
+      "wallet_address": "0x1111111111111111111111111111111111111111",
+      "subaccount": "0x111111111111111111111111111111111111111164656661756c740000000000",
+      "identity_source": "PUBLIC_WALLET_SUBACCOUNT"
     }
   ],
   "venues": [
     {
       "venue": "RISEx",
       "account_id": "synthetic-risex-account-001",
-      "credential_mode": "CANONICAL_PROTECTED_IDENTITY",
+      "query_authentication": "CANONICAL_PROTECTED_READ",
+      "query_status": "AUTHORITATIVE_CURRENT",
+      "query_source": "ACCOUNT_SCOPED_PRIVATE_READ",
+      "query_kinds": ["ACCOUNT_STATE", "ORDERS", "FEES"],
       "fee_status": "ACCOUNT_SCOPED_AUTHORITATIVE",
       "fee_source": "ACCOUNT_SCOPED_READ",
       "maker_fee_rate": "0.00005",
       "taker_fee_rate": "0.00021",
       "private_stream_status": "READY_ACCOUNT_SCOPED",
       "private_stream_source": "ACCOUNT_PRIVATE_STREAM",
-      "account_state_status": "AUTHORITATIVE_CURRENT",
-      "account_state_source": "ACCOUNT_SCOPED_PRIVATE_READ",
       "collateral_status": "AUTHORITATIVE_POSITIVE",
       "collateral_usd": "50",
       "zero_relevant_orders": true,
@@ -37,16 +41,17 @@
     },
     {
       "venue": "Nado",
-      "account_id": "synthetic-nado-account-001",
-      "credential_mode": "API_KEY_SECRET_READ_ONLY",
+      "account_id": "0x111111111111111111111111111111111111111164656661756c740000000000",
+      "query_authentication": "UNSIGNED_QUERY",
+      "query_status": "AUTHORITATIVE_UNSIGNED_QUERY",
+      "query_source": "NADO_UNSIGNED_QUERY",
+      "query_kinds": ["SUBACCOUNT_INFO", "SUBACCOUNT_ORDERS", "FEE_RATES"],
       "fee_status": "ACCOUNT_SCOPED_AUTHORITATIVE",
       "fee_source": "ACCOUNT_SCOPED_READ",
       "maker_fee_rate": "-0.00002",
       "taker_fee_rate": "0.00018",
-      "private_stream_status": "READY_ACCOUNT_SCOPED",
-      "private_stream_source": "NADO_ACCOUNT_PRIVATE_STREAM",
-      "account_state_status": "AUTHORITATIVE_CURRENT",
-      "account_state_source": "ACCOUNT_SCOPED_PRIVATE_READ",
+      "private_stream_status": "PENDING_SIGNED_AUTHENTICATE",
+      "private_stream_source": "FUTURE_SIGNED_AUTHENTICATE",
       "collateral_status": "AUTHORITATIVE_POSITIVE",
       "collateral_usd": "60",
       "zero_relevant_orders": true,
@@ -63,7 +68,7 @@
     },
     {
       "venue": "Nado",
-      "account_id": "synthetic-nado-account-001",
+      "account_id": "0x111111111111111111111111111111111111111164656661756c740000000000",
       "amount_usd": "50"
     }
   ]
