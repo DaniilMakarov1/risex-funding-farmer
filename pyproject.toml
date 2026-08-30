@@ -12,6 +12,7 @@ dependencies = ["aiohttp>=3.9,<4"]
 [project.scripts]
 risex-farmer = "risex_farmer.cli:main"
 nado-mainnet-unsigned-read = "risex_farmer.nado_mainnet_unsigned_read:main"
+nado-mainnet-archive-read = "risex_farmer.nado_mainnet_archive_read:main"
 
 [project.optional-dependencies]
 test = [

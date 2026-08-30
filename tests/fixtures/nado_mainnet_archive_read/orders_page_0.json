@@ -1,0 +1,29 @@
+{
+  "orders": [
+    {
+      "digest": "0x1111111111111111111111111111111111111111111111111111111111111111",
+      "subaccount": "0xf3c1b239f2978856839c3b676f22682c04500ac464656661756c740000000000",
+      "product_id": 4,
+      "submission_idx": "100",
+      "last_fill_submission_idx": "100",
+      "isolated": false,
+      "amount": "100000000000000000",
+      "price_x18": "100000000000000000000",
+      "base_filled": "100000000000000000",
+      "quote_filled": "10000000000000000000",
+      "fee": "0",
+      "builder_fee": "0",
+      "realized_pnl": "0",
+      "closed_amount": "0",
+      "closed_net_entry": "0",
+      "closed_margin": "0",
+      "expiration": "4294967295",
+      "nonce": "1",
+      "appendix": 0,
+      "first_fill_timestamp": "1700000000000",
+      "last_fill_timestamp": "1700000000000",
+      "irrelevant_additive_field": "ignored"
+    }
+  ],
+  "irrelevant_top_level_field": {"accepted": true}
+}

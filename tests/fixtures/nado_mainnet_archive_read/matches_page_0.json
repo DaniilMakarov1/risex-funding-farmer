@@ -1,0 +1,38 @@
+{
+  "matches": [
+    {
+      "digest": "0x1111111111111111111111111111111111111111111111111111111111111111",
+      "submission_idx": "100",
+      "order": {
+        "sender": "0xf3c1b239f2978856839c3b676f22682c04500ac464656661756c740000000000",
+        "nonce": "1",
+        "price_x18": "100000000000000000000",
+        "amount": "100000000000000000",
+        "expiration": "4294967295",
+        "appendix": 0
+      },
+      "pre_balance": {
+        "base": {"perp": {"product_id": 4}}
+      },
+      "post_balance": {
+        "base": {"perp": {"product_id": 4}}
+      },
+      "base_filled": "100000000000000000",
+      "quote_filled": "10000000000000000000",
+      "base_fee": "0",
+      "quote_fee": "0",
+      "is_taker": true,
+      "irrelevant_additive_field": "ignored"
+    }
+  ],
+  "txs": [
+    {
+      "submission_idx": "100",
+      "timestamp": "1700000000000",
+      "tx": {
+        "subaccount": "0xf3c1b239f2978856839c3b676f22682c04500ac464656661756c740000000000"
+      }
+    }
+  ],
+  "irrelevant_top_level_field": "accepted"
+}
