@@ -137,6 +137,25 @@ Accepted verification and next gate:
 - Chief independently accepted exact scope, official contract mapping, secret/redaction/non-persistence adverse tests, cap arithmetic, state transitions, restart/ambiguity barriers, dependency/import/write surfaces, `109` focused/adverse tests, and one clean isolated Python 3.11 full suite with `2928` passed and `3` skipped on the final SHA before fast-forward integration and push.
 - Current state is only `READY_FOR_PROTECTED_PROVISIONING`. The interface itself never confers write authority. Do not request secrets in task/chat. Before authenticated private reads, deposits, or any dispatch, obtain the corresponding separate user authorization; one future dispatch additionally requires exact venues/accounts, planned deposits, positive absolute deposit cap, positive maximum-loss cap, and one explicit manual lifecycle approval.
 
+## RISEx–Nado Level-D readiness preparation
+
+Status: `AUTHORIZED FOR ONE NARROW BUILDER — PUBLIC/OFFLINE AND PROTECTED PRIVATE-READ READINESS ONLY; NO MAINNET WRITE AUTHORITY`.
+
+Objective: add the smallest isolated RISEx–Nado counterpart to the accepted RISEx–Extended readiness evidence path so that the next operational step is protected local credential provisioning followed by a separately authorized exact-account private-read gate. Use current official Nado mainnet contracts and evaluate the official SDK first. Do not reuse a testnet runner as a mainnet engine and do not add a generic OMS, shared execution platform, signing payload, order preparation, signing, dispatch, transfer, withdrawal, or strategy surface.
+
+Accepted public starting evidence at `2026-08-30T10:02Z`:
+
+- RISEx BTC/USDC: minimum `0.00015`, step `0.000001`, BBO `78008/78008.1`; Nado BTC-PERP: quantity step/minimum `0.00005`, BBO `77969/77970`, and public minimum notional `$100`. Both reported the same next boundary `2026-08-30T11:00:00Z` with two-sided displayed depth sufficient for the public-contract common quantity `0.00130 BTC` (about `$101.36` per leg).
+- The user's manual experience with smaller Nado trades is not yet an authoritative order-type/account contract. Preserve `$100` as the fail-closed minimum unless an official contract plus later protected account-scoped read/simulation proves a specific smaller non-writing path. Do not prepare an order to discover this.
+- The user reports that all three venue accounts were funded and earlier manual small positions were closed. Treat this only as user-provided context. Future private reads must prove the exact identities, actual collateral, account-scoped fees, zero relevant/trigger orders, exact flatness, and no unrelated state; they must not infer those facts from the report.
+
+Acceptance for this slice:
+
+- Fixed local hidden-input provisioning with mode `0700` directory and `0600` no-link files, redacted/non-persistent results, and no private key or seed phrase in task/chat. Reuse the already accepted canonical protected RISEx identity path rather than creating a second RISEx secret copy; add only the Nado-specific protected identity surface needed by this route.
+- A route-local public/offline readiness contract for current minimum/step/depth, fees, schedule, opposite directions, no own counterparty, and smallest executable common quantity; later phases separately require exact protected identities, authoritative account-scoped private reads, caps and one approval, fresh durable runtime/per-dispatch identities, sequential writes, funding before/at/after, accepted reduce-only close, and two agreeing terminal zero-order/exact-flat rounds.
+- Missing or contradictory funding is `BLOCKED`, never zero. Actual zero or negative remains valid only when authoritative. Every result reports `NO_MAINNET_WRITE_AUTHORITY`; no network-private or write-capable code is accepted in this slice.
+- One fresh visible Nado Builder on GPT-5.6 Luna `max`, separate worktree/branch from exact published main. Builder does not self-accept, merge, push, or create agents. Chief independently reviews official evidence, scope/diff, focused/adverse tests, dependency/import/write surfaces, and one clean Python 3.11 full suite before one fast-forward integration and push.
+
 ## Parallel bounded public observation and Telegram delivery correction
 
 The user explicitly started a fresh continuous public-mainnet PAPER observation on `2026-08-30`. Active database `mainnet-paper-live-20260830-chief25.db` reached `PAPER_RUN_READY`, persists all current route directions, uses zero synthetic overlay, and retains exact zero write state. Outbound-only Telegram delivery is enabled from the protected mode-`0600` configuration outside Git. Keep inbound polling/commands and all venue writes disabled. This is a local process only; a reboot-persistent server/service deployment is a separate future bounded decision.
