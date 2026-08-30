@@ -1,0 +1,35 @@
+{
+  "interest_payments": [
+    {
+      "product_id": 4,
+      "idx": "9",
+      "timestamp": "1700000000000",
+      "amount": "0",
+      "balance_amount": "0",
+      "rate_x18": "0",
+      "oracle_price_x18": "100000000000000000000",
+      "irrelevant_additive_field": true
+    }
+  ],
+  "funding_payments": [
+    {
+      "product_id": 4,
+      "idx": "8",
+      "timestamp": "1700000000000",
+      "amount": "100",
+      "balance_amount": "100",
+      "rate_x18": "1",
+      "oracle_price_x18": "100000000000000000000"
+    },
+    {
+      "product_id": 4,
+      "idx": "7",
+      "timestamp": "1700000000000",
+      "amount": "-50",
+      "balance_amount": "50",
+      "rate_x18": "-1",
+      "oracle_price_x18": "100000000000000000000"
+    }
+  ],
+  "next_idx": null
+}

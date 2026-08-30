@@ -1,0 +1,22 @@
+{
+  "events": [
+    {
+      "subaccount": "0xf3c1b239f2978856839c3b676f22682c04500ac464656661756c740000000000",
+      "isolated": false,
+      "product_id": 4,
+      "submission_idx": "100",
+      "event_type": "match_orders",
+      "irrelevant_additive_field": 123
+    }
+  ],
+  "txs": [
+    {
+      "submission_idx": "100",
+      "timestamp": "1700000000000",
+      "tx": {
+        "sender": "0xf3c1b239f2978856839c3b676f22682c04500ac464656661756c740000000000"
+      }
+    }
+  ],
+  "irrelevant_top_level_field": ["accepted"]
+}
