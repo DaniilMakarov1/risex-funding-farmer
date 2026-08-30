@@ -245,6 +245,12 @@ def _int_text(value: Any, field: str) -> str:
     return value
 
 
+def _nullable_int_text(value: Any, field: str) -> str | None:
+    if value is None:
+        return None
+    return _int_text(value, field)
+
+
 def _uint_text(value: Any, field: str) -> str:
     result = _int_text(value, field)
     if result.startswith("-"):
@@ -1144,10 +1150,11 @@ def _parse_order(row: Any, index: int) -> dict[str, Any]:
         "realized_pnl",
         "closed_amount",
         "closed_net_entry",
-        "closed_margin",
     ):
         if key in row:
             _int_text(row[key], f"{field}_{key.upper()}")
+    if "closed_margin" in row:
+        _nullable_int_text(row["closed_margin"], f"{field}_CLOSED_MARGIN")
     for key in ("expiration", "nonce", "first_fill_timestamp", "last_fill_timestamp"):
         if key in row:
             _uint_text(row[key], f"{field}_{key.upper()}")

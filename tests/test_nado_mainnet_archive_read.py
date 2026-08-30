@@ -156,6 +156,51 @@ async def test_complete_archive_history_and_zero_funding_are_observed_without_au
 
 
 @pytest.mark.asyncio
+async def test_archive_cross_margin_order_accepts_official_null_closed_margin(
+    tmp_path: Path,
+) -> None:
+    responses = _default_responses()
+    orders = deepcopy(responses[("orders", None)])
+    assert isinstance(orders, dict)
+    assert isinstance(orders["orders"], list)
+    assert isinstance(orders["orders"][0], dict)
+    orders["orders"][0]["isolated"] = False
+    orders["orders"][0]["closed_margin"] = None
+    responses[("orders", None)] = orders
+
+    result = await _run(tmp_path, FixtureTransport(responses))
+
+    assert result.read_complete is True
+    assert result.status == gate.STATUS_BLOCKED
+    assert result.reason == "ARCHIVE_READ_COMPLETE_NO_MAINNET_WRITE_AUTHORITY"
+    assert result.history["orders"]["count"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "closed_margin",
+    ["", " 0", "0 ", "01", "+0", "-00", "0.0", 0, False, [], {}],
+)
+async def test_archive_order_rejects_malformed_non_null_closed_margin(
+    tmp_path: Path,
+    closed_margin: object,
+) -> None:
+    responses = _default_responses()
+    orders = deepcopy(responses[("orders", None)])
+    assert isinstance(orders, dict)
+    assert isinstance(orders["orders"], list)
+    assert isinstance(orders["orders"][0], dict)
+    orders["orders"][0]["closed_margin"] = closed_margin
+    responses[("orders", None)] = orders
+
+    result = await _run(tmp_path, FixtureTransport(responses))
+
+    assert result.read_complete is False
+    assert result.failure_class == "SCHEMA"
+    assert result.reason == "INTEGER_TEXT_INVALID_ORDER_0_CLOSED_MARGIN"
+
+
+@pytest.mark.asyncio
 async def test_positive_negative_funding_is_distinguished_from_actual_zero(
     tmp_path: Path,
 ) -> None:
