@@ -2,7 +2,7 @@
 
 ## Lighter public PAPER integration
 
-Status: `AUTHORIZED — LEVEL-A PUBLIC PAPER ONLY; NO PRIVATE OR WRITE PATH`.
+Status: `ACCEPTED — LEVEL-A PUBLIC PAPER COMPLETE; TESTNET SEPARATE AND NOT STARTED`.
 
 Objective: add Lighter to the normal public PAPER product with the smallest venue-local adapter and minimum central wiring that reuse the accepted architecture. Use only official public Lighter contracts. Add the dynamic `RISEx ∩ Lighter` universe, canonical perpetual metadata/parity, volume, exact book depth, public trades, future funding and applied funding evidence required by the existing interfaces. Configure the official Standard tier as maker `0` / taker `0`; do not query account tier per scan. Preserve the existing immediate exact-quantity virtual-taker assumption and do not model the documented Standard-account delay.
 
@@ -14,6 +14,8 @@ Acceptance:
 - Both RISEx/Lighter directions enter the full dynamic PAPER universe and deterministic ranking. Fee, quantity, planned/actual PnL, maker fill evidence, taker depth loss, normal close, Hard Basis, restart, persistence, and reporting remain correct under the Lighter execution profile without changing Extended/Nado behavior.
 - Focused/adverse regressions cover the distinct new contracts, followed by one clean isolated Python 3.11 full suite plus dependency/import/write-surface checks on the final candidate SHA.
 - No private/authenticated endpoint, credential, account state, order payload, signing, dispatch, testnet/mainnet write, transfer, withdrawal, or real-funds behavior. Testnet is a separate later bounded slice after public PAPER acceptance.
+
+Accepted evidence: published candidate `ee40fee9ad6a4db83eaa380d14489cc74a87f99e`; independent Chief checks passed `243` focused/adjacent tests, `3246` candidate tests plus `3` skipped, and `3281` integrated tests plus `3` skipped. Current public catalog semantics were observed on the fixed official host; the adapter has no HTTP-write, credential, signing, account, or dispatch surface. Do not expand this accepted PAPER slice. The next Lighter action, when opened, must be a fresh venue-local Builder and a separately bounded isolated testnet-readiness objective; no Lighter credential or write is currently provisioned or authorized.
 
 ## Mainnet protected credential onboarding and exact-account reads
 
