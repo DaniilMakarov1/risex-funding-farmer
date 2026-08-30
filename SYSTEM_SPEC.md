@@ -1,13 +1,13 @@
 # RISEx Funding Farmer — Paper System Specification
 
-SYSTEM_SPEC_VERSION = 1.1
+SYSTEM_SPEC_VERSION = 1.2
 SPEC_STATUS = FROZEN_FOR_PAPER_IMPLEMENTATION
 
 ## 1. Purpose and boundary
 
 Research whether a delta-neutral funding strategy used to farm RISEx points can have non-negative trading PnL after configured fees and this paper execution model.
 
-The normal product is PAPER ONLY and uses official public RISEx, Extended, and Nado data without private endpoints, trading keys, real orders, or collateral management. Section 21 defines a separate isolated testnet program; it is not a runtime switch and never authorizes mainnet or real funds.
+The normal product is PAPER ONLY and uses official public RISEx, Extended, Nado, and Lighter data without private endpoints, trading keys, real orders, or collateral management. Section 21 defines separate isolated testnet programs; they are not runtime switches and never authorize mainnet or real funds.
 
 Build a small Python 3.11 application in one async process. Do not build a generic platform, event bus, plugin/DI framework, microservices, separate venue processes, Redis, Celery, dashboard, general alerting framework, or LLM calls from `paper-run`. The only notification exception is the bounded outbound Telegram delivery in section 20.
 
@@ -38,6 +38,8 @@ EXTENDED_MAKER_FEE_RATE = 0
 EXTENDED_TAKER_FEE_RATE = 0.00025
 NADO_MAKER_FEE_RATE = 0.0001
 NADO_TAKER_FEE_RATE = 0.00035
+LIGHTER_MAKER_FEE_RATE = 0
+LIGHTER_TAKER_FEE_RATE = 0
 EXPECTED_BASIS_CONVERGENCE_PNL_USD = 0
 POINTS_VALUE_USD = 0
 PAPER_ENTRY_MIN_PLANNED_NET_PNL_USD = 0
@@ -45,11 +47,11 @@ BTC_ETH_HARD_BASIS_EXPANSION_RATE = 0.04
 OTHER_ASSET_HARD_BASIS_EXPANSION_RATE = 0.06
 ```
 
-RISEx fees are user-configured Tier 3; Extended fees are documented public values; Nado fees are user-configured assumptions. Do not create `MAKER_IMPROVEMENT_RATE`. Maker prices derive from ticks. Values are paper experiment parameters, not live risk controls.
+RISEx fees are user-configured Tier 3; Extended fees are documented public values; Nado fees are user-configured assumptions. Lighter PAPER and testnet are explicitly configured for the official Standard account tier with zero maker and taker fees; do not query or re-prove the account tier per scan or lifecycle. A future Lighter mainnet gate must prove the configured tier once at provisioning/startup before relying on it. Do not create `MAKER_IMPROVEMENT_RATE`. Maker prices derive from ticks. Values are paper experiment parameters, not live risk controls.
 
 ## 3. Official evidence and unknowns
 
-Use only official public RISEx, Extended, and Nado APIs and documentation. Do not use aggregators, scraped UI, manually copied market values, or other projects.
+Use only official public RISEx, Extended, Nado, and Lighter APIs and documentation. Do not use aggregators, scraped UI, manually copied market values, or other projects.
 
 If official evidence cannot establish units, multiplier, funding semantics/eligibility, applied funding, or instrument parity, set the value `UNKNOWN` and `EntryAllowed = false`. Never guess. PAPER-002 may stop with `BLOCKED — RISEX OFFICIAL FUNDING SEMANTICS INSUFFICIENT`.
 
@@ -74,12 +76,14 @@ For paper v1 only, 1 USD = 1 USDC = 1 USDT = 1 USDT0 for linear-perpetual parity
 
 ## 5. Universe and routes
 
-RISEx is one leg of every route. Hedge venue is Extended or Nado. The public shadow universe is the dynamic union `RISEx ∩ (Extended ∪ Nado)` after the existing active linear-perpetual, canonical-parity, volume, metadata, and safety eligibility checks. Include every currently eligible RISEx/hedge venue-asset pair independently; an asset available on only one hedge venue still contributes that pair. Do not truncate the universe by liquidity rank or by a fixed route count. Directions are:
+RISEx is one leg of every route. Hedge venue is Extended, Nado, or Lighter. The public shadow universe is the dynamic union `RISEx ∩ (Extended ∪ Nado ∪ Lighter)` after the existing active linear-perpetual, canonical-parity, volume, metadata, and safety eligibility checks. Include every currently eligible RISEx/hedge venue-asset pair independently; an asset available on only one hedge venue still contributes that pair. Do not truncate the universe by liquidity rank or by a fixed route count. Directions are:
 
 - LONG RISEx / SHORT Extended
 - SHORT RISEx / LONG Extended
 - LONG RISEx / SHORT Nado
 - SHORT RISEx / LONG Nado
+- LONG RISEx / SHORT Lighter
+- SHORT RISEx / LONG Lighter
 
 `route_liquidity = min(risex_24h_quote_volume_usd, hedge_24h_quote_volume_usd)`. Liquidity is a measurement dimension and deterministic ranking input, not a universe-selection filter. Persist every evaluated venue-asset direction; ranking never truncates the evidence set. Telegram delivers only the first 10 rows of that same authoritative deterministic ranking. Convert official base volume using that venue's official current price; if unreliable, retain the evaluation with a precise fail-closed blocker and exclude it from entry eligibility.
 
@@ -139,7 +143,7 @@ Adapter converts venue semantics to cash per canonical base. Core calculates `le
 
 For Extended, the future Scanner quote comes only from the official REST market stats (`fundingRate`, `markPrice`, and future `nextFundingRate`). A funding WebSocket record is applied/history evidence: it never replaces the future `MarketObservation.funding`, never turns its event timestamp into a future settlement, and reconciles an open lifecycle only against the exact persisted venue/market/settlement identity. Keep REST quote readiness as `funding`, applied-record data readiness as `applied_funding`, and physical connection readiness as `connection_funding`; these components must not overwrite one another. The public funding stream contains only hourly applied records, so a heartbeat-confirmed funding connection is sufficient stream readiness for a future Scanner quote; absence of the first applied record after startup is not a blocker and does not make the venue unavailable. When public evidence cannot establish applied cash, retain `UNRESOLVED`; do not infer cash from a book midpoint or carry an applied rate into the next cycle.
 
-Before maker fill, `assumed_position_opened_at = current_evaluation_timestamp`: estimate full-position funding if opened now. Never use order creation as an open position, forecast a T−5 fill, or freeze the T−120 estimate. After full two-leg entry, `position_opened_at = risex_taker_fill_at` and funding is recomputed from actual open time.
+Before maker fill, `assumed_position_opened_at = current_evaluation_timestamp`: estimate full-position funding if opened now. Never use order creation as an open position, forecast a T−5 fill, or freeze the T−120 estimate. After full two-leg entry, `position_opened_at = route_taker_fill_at` and funding is recomputed from actual open time.
 
 ## 8. Target cycle and settlement reconciliation
 
@@ -177,7 +181,7 @@ Maker entry/normal exit price:
 - one tick: BUY at best bid, SELL at best ask;
 - two or more: BUY at bid + tick, SELL at ask − tick.
 
-Target raw canonical quantity is `500 / planned_hedge_maker_canonical_price`. Compute each canonical step as raw step × multiplier, derive a common canonical step with integer-scaled LCM, and floor the target to it. Adapters convert canonical quantity back to raw quantity. Enforce both venues' minimum quantity and notional.
+Target raw canonical quantity is `500 / planned_route_maker_canonical_price`. Compute each canonical step as raw step × multiplier, derive a common canonical step with integer-scaled LCM, and floor the target to it. Adapters convert canonical quantity back to raw quantity. Enforce both venues' minimum quantity and notional.
 
 Exact taker VWAP walks asks for BUY and bids for SELL for exactly canonical quantity. Insufficient depth is not executable. Never use last/mark as execution, fixed slippage, spread reserve, hidden buffer, percentage improvement, progressive entry chasing, or fill probability.
 
@@ -185,7 +189,7 @@ Exact taker VWAP walks asks for BUY and bids for SELL for exactly canonical quan
 
 `fill_notional_usd = abs(q × canonical_fill_price)` and `fee_usd = fee_base_notional_usd × fee_rate`. Normally fee base equals fill notional. Nado taker fee base is max(fill notional, venue minimum fee notional). Persist rate, source, and observed/configured time.
 
-Planned entry assumes hedge maker entry, RISEx taker entry VWAP, reverse hedge maker exit, and reverse RISEx taker exit VWAP.
+There are exactly two paper execution profiles. Extended and Nado routes retain hedge-maker entry/exit plus RISEx-taker entry/exit. Lighter routes use RISEx-maker entry/exit plus Lighter-taker entry/exit. This is a bounded route choice, not a generic order-management or execution framework.
 
 For LONG, price PnL is `q × (exit - entry)`; for SHORT, `q × (entry - exit)`. `PlannedExecutionPnLUSD` is both legs' planned price PnL. `PlannedMakerNetPnLUSD = ExpectedTargetCycleFundingUSD + PlannedExecutionPnLUSD - all planned entry/exit fees`.
 
@@ -193,7 +197,7 @@ Expected basis convergence and points value are zero. Entry requires PlannedMake
 
 ## 12. Paper maker entry
 
-At activation create hedge-venue LIMIT POST_ONLY only for the first ranked route, non-negative plan, no position/order, fresh data, and executable RISEx exact-q entry VWAP. Lock the route.
+At activation create a route-maker LIMIT POST_ONLY only for the first ranked route, non-negative plan, no position/order, fresh data, and executable route-taker exact-q entry VWAP. The route maker is the hedge venue for Extended/Nado and RISEx for Lighter. Lock the route.
 
 Cancel only when its own planned PnL turns negative, data is stale, route becomes invalid/non-executable, or cutoff arrives. Every 10 seconds recalculate quote/PnL; price change cancels/replaces with a new version and resets old cumulative volume.
 
@@ -203,15 +207,15 @@ BUY maker requires SELL aggressor and `trade_price <= buy_limit - tick`; SELL ma
 
 ## 13. Global paper taker assumption
 
-Every virtual taker signal fills immediately and fully at fresh exact-q VWAP: RISEx entry hedge, RISEx normal exit, both Hard Basis legs, and executable-unwind calculations. Do not model latency, rejection, retry, failure, or partial taker. Book must be fresh, sequence-valid, and deep enough.
+Every virtual taker signal fills immediately and fully at fresh exact-q VWAP: the selected route taker on entry and normal exit, both Hard Basis legs, and executable-unwind calculations. Do not model latency, including Lighter's documented Standard-account transaction delay, rejection, retry, failure, or partial taker. Book must be fresh, sequence-valid, and deep enough.
 
-While entry maker is active, lost RISEx entry depth cancels it as non-executable. While exit maker is active, lost RISEx reverse depth cancels the version as `PAPER_EXIT_ORDER_CANCELLED_UNWIND_UNAVAILABLE`, preserves position/state, and recreates in the same mode after recovery.
+While entry maker is active, lost route-taker entry depth cancels it as non-executable. While exit maker is active, lost route-taker reverse depth cancels the version as `PAPER_EXIT_ORDER_CANCELLED_UNWIND_UNAVAILABLE`, preserves position/state, and recreates in the same mode after recovery.
 
 Reports set true: taker failure/latency not simulated, partial fills not simulated, queue position not simulated, cancel/replace latency not simulated, stablecoin depeg not simulated, live margin/liquidation not simulated.
 
 ## 14. Entry completion and PnL
 
-Persist maker fill exchange timestamp, maker fill receipt time, and local RISEx taker processing time. Position open time is RISEx taker fill time.
+Persist maker fill exchange timestamp, maker fill receipt time, and local route-taker processing time. Position open time is route-taker fill time.
 
 Immediately after full entry: persist actual prices/fees; recompute funding from actual open; quote current maker exit; compute PlannedMakerExitNetPnLUSD, PlannedHoldToTargetNetPnLUSD, and ExecutableUnwindNetPnLUSD; decide HOLD/EXIT without waiting. HOLD only when planned hold is strictly greater than planned maker exit; otherwise EXITING_NORMAL.
 
@@ -227,7 +231,7 @@ Before target-cycle resolution, planned hold-to-target equals maker exit net + r
 
 Normal exit maker placement follows normal maker rules. Exactly 10 seconds after normal exit begins without fill, transition to EXITING_AGGRESSIVE. Aggressive one-tick pricing is unchanged; at two+ ticks BUY at ask − tick and SELL at bid + tick. Aggressive is sticky. Reprice every 10 seconds.
 
-Exit fill uses entry maker's aggressor, one-tick trade-through, cumulative-volume, and dedup rules. There is no timed/pre-funding/waiting taker fallback. Track exit wait, funding received while exiting, and pair PnL change while exiting. After hedge maker closes, reverse RISEx taker then FLAT.
+Exit fill uses entry maker's aggressor, one-tick trade-through, cumulative-volume, and dedup rules. There is no timed/pre-funding/waiting taker fallback. Track exit wait, funding received while exiting, and pair PnL change while exiting. After the route maker closes, execute the reverse route taker then FLAT.
 
 ## 16. Basis and hard exit
 
@@ -271,9 +275,9 @@ Delivery uses a bounded non-blocking queue, finite timeout, and finite attempts;
 
 Runtime has no elapsed-time stop. It distinguishes intentional signals from fatal failures, preserves open positions, persists bounded safe-stop evidence, and cancels/awaits background tasks without fabricating transport events.
 
-## 21. Isolated three-venue testnet program
+## 21. Isolated venue testnet programs
 
-RISEx, Extended, and Nado testnet modules are opt-in and isolated from normal Farmer startup, Scanner, paper runtime/economics, Telegram, and paper persistence. They use only official environments and accounts, never mainnet or real funds, and keep every potential notional `<= USD 500`.
+RISEx, Extended, Nado, and future Lighter testnet modules are opt-in and isolated from normal Farmer startup, Scanner, paper runtime/economics, Telegram, and paper persistence. They use only official environments and separate test-only accounts, never mainnet or real funds. The historical three-venue program keeps every potential notional `<= USD 500`; the future Lighter slice uses the smallest venue-executable test quantity and receives its own bounded gate after public PAPER acceptance.
 
 Authenticated read-only readiness requires correct environment/account identity, secret isolation, bounded transport, critical response semantics, and authoritative account state. Proven read-only failures may be retried as fresh bounded observations; operational run IDs are durable runtime data rather than source-code milestones.
 

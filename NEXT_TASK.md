@@ -1,5 +1,20 @@
 # Active bounded task
 
+## Lighter public PAPER integration
+
+Status: `AUTHORIZED — LEVEL-A PUBLIC PAPER ONLY; NO PRIVATE OR WRITE PATH`.
+
+Objective: add Lighter to the normal public PAPER product with the smallest venue-local adapter and minimum central wiring that reuse the accepted architecture. Use only official public Lighter contracts. Add the dynamic `RISEx ∩ Lighter` universe, canonical perpetual metadata/parity, volume, exact book depth, public trades, future funding and applied funding evidence required by the existing interfaces. Configure the official Standard tier as maker `0` / taker `0`; do not query account tier per scan. Preserve the existing immediate exact-quantity virtual-taker assumption and do not model the documented Standard-account delay.
+
+Execution profile: only Lighter routes differ from the existing routes. Entry is RISEx maker then exact-quantity Lighter taker; normal close is RISEx maker close then exact-quantity Lighter taker close. Extended/Nado remain hedge-maker then RISEx-taker. Reuse existing route state, accounting, scheduling, persistence, ranking, health, reporting, and outbound-only Telegram surfaces; make only the bounded profile-aware changes required for correctness. Do not create a generic OMS, plugin framework, signing abstraction, or parallel live execution engine.
+
+Acceptance:
+
+- Strict additive-field-tolerant parsing and fail-closed semantic validation for official Lighter public responses, including canonical quantity/price grids, active linear-perpetual eligibility, sequence/book health, exact-quantity VWAP, funding schedule/rate/cash semantics, and applied-history identity.
+- Both RISEx/Lighter directions enter the full dynamic PAPER universe and deterministic ranking. Fee, quantity, planned/actual PnL, maker fill evidence, taker depth loss, normal close, Hard Basis, restart, persistence, and reporting remain correct under the Lighter execution profile without changing Extended/Nado behavior.
+- Focused/adverse regressions cover the distinct new contracts, followed by one clean isolated Python 3.11 full suite plus dependency/import/write-surface checks on the final candidate SHA.
+- No private/authenticated endpoint, credential, account state, order payload, signing, dispatch, testnet/mainnet write, transfer, withdrawal, or real-funds behavior. Testnet is a separate later bounded slice after public PAPER acceptance.
+
 ## Mainnet protected credential onboarding and exact-account reads
 
 Status: `AUTHORIZED — BOUNDED PRIVATE READS; FIXED RISEX REGISTRATION CONSUMED; NO MAINNET ORDER/TRANSFER/WITHDRAWAL AUTHORITY`.
