@@ -1,0 +1,8 @@
+{
+  "status": "success",
+  "data": {
+    "chain_id": "57073",
+    "endpoint_addr": "0x1111111111111111111111111111111111111111"
+  },
+  "request_type": "query_contracts"
+}

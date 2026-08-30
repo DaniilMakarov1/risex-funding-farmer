@@ -1,0 +1,13 @@
+{
+  "status": "success",
+  "data": {
+    "spot_products": [
+      {"product_id": 0},
+      {"product_id": 1}
+    ],
+    "perp_products": [
+      {"product_id": 2}
+    ]
+  },
+  "request_type": "query_all_products"
+}

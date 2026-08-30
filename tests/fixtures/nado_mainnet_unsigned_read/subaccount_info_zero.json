@@ -1,0 +1,41 @@
+{
+  "status": "success",
+  "data": {
+    "subaccount": "0xf3c1b239f2978856839c3b676f22682c04500ac464656661756c740000000000",
+    "exists": true,
+    "healths": [
+      {"assets": "0", "liabilities": "0", "health": "0"},
+      {"assets": "0", "liabilities": "0", "health": "0"},
+      {"assets": "0", "liabilities": "0", "health": "0"}
+    ],
+    "health_contributions": [
+      ["0", "0", "0"],
+      ["0", "0", "0"],
+      ["0", "0", "0"]
+    ],
+    "spot_count": 2,
+    "perp_count": 1,
+    "spot_balances": [
+      {"product_id": 0, "balance": {"amount": "0"}},
+      {"product_id": 1, "balance": {"amount": "0"}}
+    ],
+    "perp_balances": [
+      {
+        "product_id": 2,
+        "balance": {
+          "amount": "0",
+          "v_quote_balance": "0",
+          "last_cumulative_funding_x18": "0"
+        }
+      }
+    ],
+    "spot_products": [
+      {"product_id": 0},
+      {"product_id": 1}
+    ],
+    "perp_products": [
+      {"product_id": 2}
+    ]
+  },
+  "request_type": "query_subaccount_info"
+}

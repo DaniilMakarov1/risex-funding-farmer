@@ -1,0 +1,7 @@
+{
+  "status": "success",
+  "data": {
+    "linked_signer": "0x0000000000000000000000000000000000000000"
+  },
+  "request_type": "query_linked_signer"
+}

@@ -1,0 +1,12 @@
+{
+  "status": "success",
+  "data": {
+    "taker_fee_rates_x18": ["0", "0", "0"],
+    "maker_fee_rates_x18": ["0", "0", "0"],
+    "liquidation_sequencer_fee": "0",
+    "health_check_sequencer_fee": "0",
+    "taker_sequencer_fee": "0",
+    "withdraw_sequencer_fees": ["0", "0", "0"]
+  },
+  "request_type": "query_fee_rates"
+}

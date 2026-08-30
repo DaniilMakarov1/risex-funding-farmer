@@ -1,0 +1,7 @@
+{
+  "status": "success",
+  "data": {
+    "isolated_positions": []
+  },
+  "request_type": "query_isolated_positions"
+}
