@@ -8,11 +8,12 @@ messages.
 
 Extended's official API contract separates the two credentials: ``X-Api-Key``
 is sufficient for read-only account access, while writes also require a Stark
-signature made with the account's Stark private key.  This module currently
-owns only the read-only identity/API-key phase.  A separate future Stark
-provisioning command is an explicit, fail-closed boundary and has no write
-authority in this slice.  The module does not create a client, prepare a
-payload, sign, connect to the venue, or dispatch a request.
+signature made with the account's Stark private key.  This module owns the
+protected read-only identity/API-key files and the legacy explicit public
+metadata provisioner.  The ``discover`` command lazily delegates the bounded
+mainnet account discovery transport to a separate venue-local module.  This
+module never accepts a Stark private key in the read-only flow, prepares a
+payload, signs, or dispatches a write.
 """
 
 from __future__ import annotations
@@ -1031,6 +1032,108 @@ def _input(input_fn: Callable[[str], str], prompt: str) -> str:
     return value
 
 
+def _persist_protected_credentials_buffer(
+    identity: ExtendedPublicIdentity,
+    api_key: bytearray,
+) -> ProvisioningResult:
+    """Persist one already-validated read-only credential atomically.
+
+    The caller owns ``api_key`` and must zeroize it after this call.  This
+    helper accepts only the public identity plus the read-only API key; it has
+    no path for Stark material or write authority.
+    """
+
+    before = inspect_protected_credentials()
+    if before.reason not in {
+        "PROTECTED_DIRECTORY_MISSING",
+        "PROTECTED_DIRECTORY_PARENT_MISSING",
+        "PROTECTED_DIRECTORY_OK",
+        "PROTECTED_FILES_READY",
+    }:
+        return ProvisioningResult(BLOCKED, before.reason, before)
+    if before.directory_present and not before.directory_protected:
+        return ProvisioningResult(BLOCKED, before.reason, before)
+    if before.directory_present and any(item.present for item in before.files):
+        return ProvisioningResult(BLOCKED, "PROTECTED_PATH_ALREADY_EXISTS", before)
+
+    metadata_payload = bytearray()
+    directory_fd = -1
+    created: list[str] = []
+    try:
+        if not isinstance(identity, ExtendedPublicIdentity):
+            raise CredentialOnboardingError("IDENTITY_INVALID")
+        api_fingerprint = _fingerprint(api_key)
+        metadata_payload = _metadata_payload(identity, api_fingerprint)
+        directory_fd = _open_directory(create=True)
+        if _directory_entries_from_fd(directory_fd):
+            raise CredentialOnboardingError("PROTECTED_PATH_ALREADY_EXISTS")
+        _write_secure_file(
+            directory_fd, API_KEY_FILENAME, api_key, MAX_API_KEY_BYTES
+        )
+        created.append(API_KEY_FILENAME)
+        _write_secure_file(
+            directory_fd,
+            IDENTITY_FILENAME,
+            metadata_payload,
+            MAX_IDENTITY_FILE_BYTES,
+        )
+        created.append(IDENTITY_FILENAME)
+        _sync_directory(directory_fd)
+    except CredentialOnboardingError as exc:
+        if directory_fd >= 0:
+            _cleanup_created(directory_fd, created)
+        return ProvisioningResult(
+            BLOCKED, exc.code, inspect_protected_credentials()
+        )
+    except BaseException:
+        if directory_fd >= 0:
+            _cleanup_created(directory_fd, created)
+        return ProvisioningResult(
+            BLOCKED, "PROTECTED_PROVISIONING_FAILED", inspect_protected_credentials()
+        )
+    finally:
+        if directory_fd >= 0:
+            try:
+                os.close(directory_fd)
+            except OSError:
+                pass
+        _zeroize(metadata_payload)
+    after = inspect_protected_credentials()
+    return ProvisioningResult(PROVISIONED, "PROTECTED_FILES_CREATED", after)
+
+
+def persist_discovered_credentials(
+    identity: ExtendedPublicIdentity,
+    api_key: str,
+) -> ProvisioningResult:
+    """Persist a discovered public identity and read-only API key only.
+
+    ``api_key`` is accepted for the in-process discovery handoff, never from
+    CLI arguments or environment variables.  It is copied to a mutable
+    buffer, used only for the protected file write, and zeroized before
+    returning.  Existing protected state is never overwritten.
+    """
+
+    secret = bytearray()
+    try:
+        secret = _secret_bytes(
+            api_key,
+            maximum=MAX_API_KEY_BYTES,
+            code="API_KEY_INVALID",
+        )
+        return _persist_protected_credentials_buffer(identity, secret)
+    except CredentialOnboardingError as exc:
+        return ProvisioningResult(
+            BLOCKED, exc.code, inspect_protected_credentials()
+        )
+    except BaseException:
+        return ProvisioningResult(
+            BLOCKED, "PROTECTED_PROVISIONING_FAILED", inspect_protected_credentials()
+        )
+    finally:
+        _zeroize(secret)
+
+
 def provision_protected_credentials(
     input_fn: Callable[[str], str] | None = None,
 ) -> ProvisioningResult:
@@ -1056,9 +1159,6 @@ def provision_protected_credentials(
         return ProvisioningResult(BLOCKED, "PROTECTED_PATH_ALREADY_EXISTS", before)
 
     api_key = bytearray()
-    metadata_payload = bytearray()
-    directory_fd = -1
-    created: list[str] = []
     try:
         identity = ExtendedPublicIdentity.from_inputs(
             _input(input_fn, "Extended account ID (hidden public metadata): "),
@@ -1071,46 +1171,18 @@ def provision_protected_credentials(
             maximum=MAX_API_KEY_BYTES,
             code="API_KEY_INVALID",
         )
-        api_fingerprint = _fingerprint(api_key)
-        metadata_payload = _metadata_payload(identity, api_fingerprint)
-        directory_fd = _open_directory(create=True)
-        if _directory_entries_from_fd(directory_fd):
-            raise CredentialOnboardingError("PROTECTED_PATH_ALREADY_EXISTS")
-        _write_secure_file(
-            directory_fd, API_KEY_FILENAME, api_key, MAX_API_KEY_BYTES
-        )
-        created.append(API_KEY_FILENAME)
-        _write_secure_file(
-            directory_fd,
-            IDENTITY_FILENAME,
-            metadata_payload,
-            MAX_IDENTITY_FILE_BYTES,
-        )
-        created.append(IDENTITY_FILENAME)
-        _sync_directory(directory_fd)
+        return _persist_protected_credentials_buffer(identity, api_key)
     except CredentialOnboardingError as exc:
-        if directory_fd >= 0:
-            _cleanup_created(directory_fd, created)
         result = ProvisioningResult(
             BLOCKED, exc.code, inspect_protected_credentials()
         )
         return result
     except BaseException:
-        if directory_fd >= 0:
-            _cleanup_created(directory_fd, created)
         return ProvisioningResult(
             BLOCKED, "PROTECTED_PROVISIONING_FAILED", inspect_protected_credentials()
         )
     finally:
-        if directory_fd >= 0:
-            try:
-                os.close(directory_fd)
-            except OSError:
-                pass
         _zeroize(api_key)
-        _zeroize(metadata_payload)
-    after = inspect_protected_credentials()
-    return ProvisioningResult(PROVISIONED, "PROTECTED_FILES_CREATED", after)
 
 
 def _read_secret_file(directory_fd: int, filename: str, maximum: int) -> bytearray:
@@ -1233,6 +1305,10 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("provision", help="create protected files using hidden input")
     commands.add_parser(
+        "discover",
+        help="discover the mainnet account with a hidden read-only API key",
+    )
+    commands.add_parser(
         "provision-stark",
         help="reserved future Stark phase; no mainnet write authority",
     )
@@ -1252,6 +1328,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "inspect":
         print(inspect_protected_credentials().evidence())
         return 0
+    if args.command == "discover":
+        # Keep normal imports and the legacy local provisioner free of live
+        # transport dependencies.  Discovery is an explicit operator command.
+        from .extended_mainnet_account_discovery import run_cli
+
+        return run_cli()
     if args.command == "provision-stark":
         result = provision_stark_private_key()
         print(result.evidence())
@@ -1291,6 +1373,7 @@ __all__ = [
     "future_stark_protected_paths",
     "inspect_protected_credentials",
     "main",
+    "persist_discovered_credentials",
     "provision_protected_credentials",
     "provision_stark_private_key",
     "protected_paths",
