@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from dataclasses import replace
 import json
 import os
 import inspect
@@ -265,11 +266,11 @@ def test_file_mode_symlink_hardlink_and_foreign_owner_are_rejected(context, monk
 
     current_uid = os.getuid()
     foreign_uid = current_uid + 100000
-    real_lstat = onboarding.os.lstat
+    real_stat = onboarding.os.stat
 
-    def foreign_identity_lstat(path):
-        info = real_lstat(path)
-        if Path(path) == paths["identity"]:
+    def foreign_identity_stat(path, *args, **kwargs):
+        info = real_stat(path, *args, **kwargs)
+        if path == onboarding.IDENTITY_FILENAME:
             return SimpleNamespace(
                 st_mode=info.st_mode,
                 st_nlink=info.st_nlink,
@@ -278,7 +279,7 @@ def test_file_mode_symlink_hardlink_and_foreign_owner_are_rejected(context, monk
             )
         return info
 
-    monkeypatch.setattr(onboarding.os, "lstat", foreign_identity_lstat)
+    monkeypatch.setattr(onboarding.os, "stat", foreign_identity_stat)
     inspected = onboarding.inspect_protected_files()
     assert inspected.identity.reason == "PROTECTED_FILE_OWNER_NOT_CURRENT_USER"
 
@@ -290,6 +291,47 @@ def test_foreign_directory_owner_is_rejected(context, monkeypatch):
     inspected = onboarding.inspect_protected_files()
     assert inspected.session_key.reason == "PROTECTED_DIRECTORY_OWNER_NOT_CURRENT_USER"
     assert inspected.identity.reason == "PROTECTED_DIRECTORY_OWNER_NOT_CURRENT_USER"
+
+
+def test_parent_component_symlink_is_rejected_before_hidden_input(context):
+    config = context.directory.parent
+    config.mkdir(parents=True, mode=0o700)
+    target = config.parent / "config-target"
+    target.mkdir(mode=0o700)
+    config.rmdir()
+    config.symlink_to(target, target_is_directory=True)
+    calls = 0
+
+    def prompt(_prompt: str):
+        nonlocal calls
+        calls += 1
+        return "not-used"
+
+    inspected = onboarding.inspect_protected_files()
+    assert inspected.identity.reason == "PROTECTED_DIRECTORY_SYMLINK"
+    result = onboarding.provision_mainnet_session_signer(prompt)
+    assert result.reason == "PROTECTED_DIRECTORY_SYMLINK"
+    assert calls == 0
+
+
+def test_directory_descriptor_remains_bound_across_parent_swap(context, monkeypatch):
+    assert _provision(context).ready
+    parent = context.directory.parent
+    moved_parent = parent.parent / "config-moved"
+    real_open = onboarding._open_directory
+
+    def open_then_swap():
+        descriptor = real_open()
+        parent.rename(moved_parent)
+        parent.mkdir(mode=0o700)
+        return descriptor
+
+    monkeypatch.setattr(onboarding, "_open_directory", open_then_swap)
+    inspected = onboarding.inspect_protected_files()
+
+    assert inspected.session_key.protected
+    assert inspected.identity.protected
+    assert inspected.session_key.size == 32
 
 
 def test_unexpected_prompt_exception_never_leaks_key_text(context):
@@ -371,11 +413,11 @@ def test_registration_intent_binds_nonce_identity_is_durable_and_non_replayable(
     assert intent.observed_nonce_anchor == 7
     assert intent.observed_bitmap_index == 3
     assert intent.observed_bitmap == 4
-    assert intent.nonce_anchor == 8
-    assert intent.nonce_bitmap_index == 0
+    assert intent.nonce_anchor == 7
+    assert intent.nonce_bitmap_index == 3
     assert intent.state == onboarding.REGISTRATION_PREPARED
-    assert intent.typed_register_data["message"]["nonceAnchor"] == 8
-    assert intent.typed_register_data["message"]["nonceBitmap"] == 0
+    assert intent.typed_register_data["message"]["nonceAnchor"] == 7
+    assert intent.typed_register_data["message"]["nonceBitmap"] == 3
 
     intent_bytes = onboarding.protected_paths()["registration_intent"].read_bytes()
     assert context.main_key.hex().encode() not in intent_bytes
@@ -408,12 +450,62 @@ def test_registration_intent_binds_nonce_identity_is_durable_and_non_replayable(
     assert reuse.value.reason == "REGISTRATION_INTENT_NOT_REUSABLE"
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("nonce_anchor", 8), ("nonce_bitmap_index", 4)],
+)
+def test_persisted_nonce_identity_mismatch_is_rejected(field, value, context):
+    assert _provision(context).ready
+    intent = onboarding.prepare_registration_intent(
+        nonce_anchor=7,
+        current_bitmap_index=3,
+        bitmap="0x4",
+    )
+    path = onboarding.protected_paths()["registration_intent"]
+    persisted = json.loads(path.read_text())
+    persisted[field] = value
+    path.write_text(json.dumps(persisted, sort_keys=True, separators=(",", ":")) + "\n")
+
+    with pytest.raises(onboarding.OnboardingViolation) as loaded:
+        onboarding.load_registration_intent()
+    assert loaded.value.reason == "REGISTRATION_INTENT_INVALID"
+    with pytest.raises(onboarding.OnboardingViolation) as requested:
+        onboarding.build_register_signer_request(
+            intent,
+            "0x" + "a" * 130,
+            "0x" + "b" * 130,
+        )
+    assert requested.value.reason == "REGISTRATION_INTENT_INVALID"
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["nonce_anchor", "nonce_bitmap_index"],
+)
+def test_request_nonce_identity_mismatch_is_rejected(field, context):
+    assert _provision(context).ready
+    intent = onboarding.prepare_registration_intent(
+        nonce_anchor=7,
+        current_bitmap_index=3,
+        bitmap="0x4",
+    )
+    replacement = replace(intent, **{field: getattr(intent, field) + 1})
+
+    with pytest.raises(onboarding.OnboardingViolation) as requested:
+        onboarding.build_register_signer_request(
+            replacement,
+            "0x" + "a" * 130,
+            "0x" + "b" * 130,
+        )
+    assert requested.value.reason == "REGISTRATION_INTENT_NONCE_MISMATCH"
+
+
 def test_register_request_is_exact_and_has_no_unofficial_fields(context):
     assert _provision(context).ready
     intent = onboarding.prepare_registration_intent(
         nonce_anchor=10,
-        current_bitmap_index=0,
-        bitmap=0,
+        current_bitmap_index=5,
+        bitmap="0x4",
     )
     request = onboarding.build_register_signer_request(
         intent,
@@ -434,8 +526,8 @@ def test_register_request_is_exact_and_has_no_unofficial_fields(context):
     assert request["account"] == context.main_address
     assert request["signer"] == context.session_address
     assert request["message"] == onboarding.REGISTER_SIGNER_MESSAGE
-    assert request["nonce_anchor"] == "11"
-    assert request["nonce_bitmap_index"] == 0
+    assert request["nonce_anchor"] == "10"
+    assert request["nonce_bitmap_index"] == 5
     assert request["expiration"] == str(context.expiration)
     assert "label" not in request
 
@@ -444,7 +536,7 @@ def test_register_request_is_exact_and_has_no_unofficial_fields(context):
     ("field", "value", "reason"),
     [
         ("nonce_anchor", -1, "NONCE_ANCHOR_INVALID"),
-        ("nonce_anchor", 2**48 - 1, "NONCE_ANCHOR_INVALID"),
+        ("nonce_anchor", 2**48, "NONCE_ANCHOR_INVALID"),
         ("current_bitmap_index", 208, "NONCE_BITMAP_INDEX_INVALID"),
         ("current_bitmap_index", -1, "NONCE_BITMAP_INDEX_INVALID"),
         ("bitmap", "0x" + "0" * 65, "NONCE_BITMAP_INVALID"),
@@ -480,6 +572,7 @@ def test_module_is_offline_and_absent_from_normal_cli_imports():
         "positions",
         "withdraw",
         "transfer",
+        "lstat",
     ):
         assert forbidden not in source
     tree = ast.parse(source)
@@ -501,6 +594,7 @@ def test_module_is_offline_and_absent_from_normal_cli_imports():
         "typing",
         "__future__",
         "eth_account",
+        "errno",
     }
 
     environment = os.environ.copy()

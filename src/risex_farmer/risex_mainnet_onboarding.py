@@ -16,6 +16,7 @@ operational caller cannot silently replay it after a restart or ambiguity.
 
 from __future__ import annotations
 
+import errno
 import getpass
 import json
 import os
@@ -268,100 +269,113 @@ def _now_unix() -> int:
     return int(time.time())
 
 
-def _directory_components(directory: Path) -> tuple[list[Path], str | None]:
+def _directory_open_flags() -> int:
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+    nofollow_flag = getattr(os, "O_NOFOLLOW", 0)
+    if not directory_flag or not nofollow_flag:
+        raise OnboardingViolation("PROTECTED_FILESYSTEM_FEATURE_UNAVAILABLE")
+    return (
+        os.O_RDONLY
+        | directory_flag
+        | nofollow_flag
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+
+
+def _fixed_directory_components(directory: Path) -> tuple[str, ...]:
     if not isinstance(directory, Path) or not directory.is_absolute():
-        return [], "PROTECTED_DIRECTORY_NOT_ABSOLUTE"
-    missing: list[Path] = []
-    current = directory
-    while True:
-        try:
-            info = os.lstat(current)
-        except FileNotFoundError:
-            missing.append(current)
-            if current.parent == current:
-                return [], "PROTECTED_DIRECTORY_PARENT_MISSING"
-            current = current.parent
-            continue
-        except OSError:
-            return [], "PROTECTED_DIRECTORY_UNREADABLE"
-        if stat.S_ISLNK(info.st_mode):
-            return [], "PROTECTED_DIRECTORY_SYMLINK"
-        if not stat.S_ISDIR(info.st_mode):
-            return [], "PROTECTED_DIRECTORY_NOT_DIRECTORY"
-        if info.st_uid != os.getuid():
-            return [], "PROTECTED_DIRECTORY_OWNER_NOT_CURRENT_USER"
-        return missing, None
+        raise OnboardingViolation("PROTECTED_DIRECTORY_NOT_ABSOLUTE")
+    parts = directory.parts
+    if not parts or parts[0] != os.sep:
+        raise OnboardingViolation("PROTECTED_DIRECTORY_NOT_ABSOLUTE")
+    components = parts[1:]
+    if not components or any(part in {"", ".", ".."} for part in components):
+        raise OnboardingViolation("PROTECTED_DIRECTORY_INVALID")
+    return components
 
 
-def _directory_state(directory: Path) -> tuple[bool, str]:
-    missing, error = _directory_components(directory)
-    if error is not None:
-        return False, error
-    if missing:
-        return False, "PROTECTED_DIRECTORY_MISSING"
+def _validate_directory_fd(fd: int, *, final: bool = False) -> None:
     try:
-        info = os.lstat(directory)
+        info = os.fstat(fd)
     except OSError:
-        return False, "PROTECTED_DIRECTORY_UNREADABLE"
-    if stat.S_IMODE(info.st_mode) != _DIRECTORY_MODE:
-        return False, "PROTECTED_DIRECTORY_MODE_NOT_0700"
-    return True, "PROTECTED_DIRECTORY_OK"
+        raise OnboardingViolation("PROTECTED_DIRECTORY_UNREADABLE") from None
+    if not stat.S_ISDIR(info.st_mode):
+        raise OnboardingViolation("PROTECTED_DIRECTORY_NOT_DIRECTORY")
+    current_uid = os.getuid()
+    if final:
+        if info.st_uid != current_uid:
+            raise OnboardingViolation("PROTECTED_DIRECTORY_OWNER_NOT_CURRENT_USER")
+        if stat.S_IMODE(info.st_mode) != _DIRECTORY_MODE:
+            raise OnboardingViolation("PROTECTED_DIRECTORY_MODE_NOT_0700")
+    elif info.st_uid not in {0, current_uid}:
+        raise OnboardingViolation("PROTECTED_DIRECTORY_OWNER_NOT_CURRENT_USER")
 
 
-def _ensure_fixed_directory() -> None:
-    directory = PROTECTED_SECRET_DIRECTORY
-    missing, error = _directory_components(directory)
-    if error is not None:
-        raise OnboardingViolation(error)
-    for item in reversed(missing):
+def _directory_open_reason(
+    error: OSError, *, parent_fd: int | None = None, component: str | None = None
+) -> str:
+    if error.errno == errno.ENOENT:
+        return "PROTECTED_DIRECTORY_MISSING"
+    if error.errno == errno.ELOOP:
+        return "PROTECTED_DIRECTORY_SYMLINK"
+    if error.errno == errno.ENOTDIR:
+        if parent_fd is not None and component is not None:
+            try:
+                info = os.stat(component, dir_fd=parent_fd, follow_symlinks=False)
+            except OSError:
+                pass
+            else:
+                if stat.S_ISLNK(info.st_mode):
+                    return "PROTECTED_DIRECTORY_SYMLINK"
+        return "PROTECTED_DIRECTORY_NOT_DIRECTORY"
+    return "PROTECTED_DIRECTORY_UNREADABLE"
+
+
+def _open_directory_component(
+    parent_fd: int,
+    component: str,
+    *,
+    create_missing: bool,
+    final: bool,
+    flags: int,
+) -> int:
+    created = False
+    try:
+        descriptor = os.open(component, flags, dir_fd=parent_fd)
+    except OSError as error:
+        if error.errno != errno.ENOENT or not create_missing:
+            raise OnboardingViolation(
+                _directory_open_reason(
+                    error,
+                    parent_fd=parent_fd,
+                    component=component,
+                )
+            ) from None
         try:
-            os.mkdir(item, _DIRECTORY_MODE)
+            os.mkdir(component, _DIRECTORY_MODE, dir_fd=parent_fd)
+            created = True
         except FileExistsError:
             pass
         except OSError:
             raise OnboardingViolation("PROTECTED_DIRECTORY_CREATE_FAILED") from None
         try:
-            info = os.lstat(item)
-        except OSError:
-            raise OnboardingViolation("PROTECTED_DIRECTORY_UNREADABLE") from None
-        if stat.S_ISLNK(info.st_mode):
-            raise OnboardingViolation("PROTECTED_DIRECTORY_SYMLINK")
-        if not stat.S_ISDIR(info.st_mode):
-            raise OnboardingViolation("PROTECTED_DIRECTORY_NOT_DIRECTORY")
-        if info.st_uid != os.getuid():
-            raise OnboardingViolation("PROTECTED_DIRECTORY_OWNER_NOT_CURRENT_USER")
-        try:
-            os.chmod(item, _DIRECTORY_MODE)
-        except OSError:
-            raise OnboardingViolation("PROTECTED_DIRECTORY_MODE_FAILED") from None
-    ok, reason = _directory_state(directory)
-    if not ok:
-        raise OnboardingViolation(reason)
+            descriptor = os.open(component, flags, dir_fd=parent_fd)
+        except OSError as open_error:
+            raise OnboardingViolation(
+                _directory_open_reason(
+                    open_error,
+                    parent_fd=parent_fd,
+                    component=component,
+                )
+            ) from None
 
-
-def _open_directory() -> int:
-    directory_flag = getattr(os, "O_DIRECTORY", 0)
-    nofollow_flag = getattr(os, "O_NOFOLLOW", 0)
-    if not directory_flag or not nofollow_flag:
-        raise OnboardingViolation("PROTECTED_FILESYSTEM_FEATURE_UNAVAILABLE")
     try:
-        descriptor = os.open(
-            PROTECTED_SECRET_DIRECTORY,
-            os.O_RDONLY
-            | directory_flag
-            | nofollow_flag
-            | getattr(os, "O_CLOEXEC", 0),
-        )
-    except OSError:
-        raise OnboardingViolation("PROTECTED_DIRECTORY_OPEN_FAILED") from None
-    try:
-        info = os.fstat(descriptor)
-        if (
-            not stat.S_ISDIR(info.st_mode)
-            or info.st_uid != os.getuid()
-            or stat.S_IMODE(info.st_mode) != _DIRECTORY_MODE
-        ):
-            raise OnboardingViolation("PROTECTED_DIRECTORY_NOT_SAFE")
+        if created:
+            try:
+                os.fchmod(descriptor, _DIRECTORY_MODE)
+            except OSError:
+                raise OnboardingViolation("PROTECTED_DIRECTORY_MODE_FAILED") from None
+        _validate_directory_fd(descriptor, final=final)
         return descriptor
     except OnboardingViolation:
         os.close(descriptor)
@@ -369,6 +383,54 @@ def _open_directory() -> int:
     except OSError:
         os.close(descriptor)
         raise OnboardingViolation("PROTECTED_DIRECTORY_UNREADABLE") from None
+
+
+def _walk_fixed_directory(*, create_missing: bool) -> int:
+    components = _fixed_directory_components(PROTECTED_SECRET_DIRECTORY)
+    flags = _directory_open_flags()
+    try:
+        current_fd = os.open(os.sep, flags)
+    except OSError:
+        raise OnboardingViolation("PROTECTED_DIRECTORY_OPEN_FAILED") from None
+    try:
+        _validate_directory_fd(current_fd)
+        for index, component in enumerate(components):
+            child_fd = _open_directory_component(
+                current_fd,
+                component,
+                create_missing=create_missing,
+                final=index == len(components) - 1,
+                flags=flags,
+            )
+            os.close(current_fd)
+            current_fd = child_fd
+        result = current_fd
+        current_fd = -1
+        return result
+    finally:
+        if current_fd != -1:
+            os.close(current_fd)
+
+
+def _directory_state(directory: Path) -> tuple[bool, str]:
+    if directory != PROTECTED_SECRET_DIRECTORY:
+        return False, "PROTECTED_DIRECTORY_NOT_FIXED"
+    try:
+        descriptor = _walk_fixed_directory(create_missing=False)
+    except OnboardingViolation as error:
+        return False, error.reason
+    try:
+        return True, "PROTECTED_DIRECTORY_OK"
+    finally:
+        os.close(descriptor)
+
+
+def _ensure_fixed_directory() -> int:
+    return _walk_fixed_directory(create_missing=True)
+
+
+def _open_directory() -> int:
+    return _walk_fixed_directory(create_missing=False)
 
 
 def protected_paths() -> Mapping[str, Path]:
@@ -392,8 +454,14 @@ def _file_size_limit(name: str) -> int:
     }[name]
 
 
-def _file_state(name: str, path: Path, directory_ok: bool, directory_reason: str) -> ProtectedPathState:
-    if not directory_ok:
+def _file_state(
+    name: str,
+    path: Path,
+    directory_fd: int | None,
+    directory_ok: bool,
+    directory_reason: str,
+) -> ProtectedPathState:
+    if not directory_ok or directory_fd is None:
         return ProtectedPathState(
             name=name,
             path=str(path),
@@ -402,7 +470,7 @@ def _file_state(name: str, path: Path, directory_ok: bool, directory_reason: str
             reason=directory_reason,
         )
     try:
-        info = os.lstat(path)
+        info = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
     except FileNotFoundError:
         return ProtectedPathState(
             name=name,
@@ -454,16 +522,32 @@ def inspect_protected_files() -> ProtectedFiles:
     """Inspect fixed metadata only; never read secret or identity bytes."""
 
     paths = protected_paths()
-    directory_ok, directory_reason = _directory_state(PROTECTED_SECRET_DIRECTORY)
-    states = {
-        name: _file_state(name, path, directory_ok, directory_reason)
-        for name, path in (
-            (SESSION_KEY_FILENAME, paths["session_key"]),
-            (IDENTITY_FILENAME, paths["identity"]),
-            (REGISTRATION_INTENT_FILENAME, paths["registration_intent"]),
-            (REGISTRATION_SPENT_FILENAME, paths["registration_spent"]),
-        )
-    }
+    directory_fd: int | None = None
+    try:
+        directory_fd = _open_directory()
+    except OnboardingViolation as error:
+        directory_ok, directory_reason = False, error.reason
+    else:
+        directory_ok, directory_reason = True, "PROTECTED_DIRECTORY_OK"
+    try:
+        states = {
+            name: _file_state(
+                name,
+                path,
+                directory_fd,
+                directory_ok,
+                directory_reason,
+            )
+            for name, path in (
+                (SESSION_KEY_FILENAME, paths["session_key"]),
+                (IDENTITY_FILENAME, paths["identity"]),
+                (REGISTRATION_INTENT_FILENAME, paths["registration_intent"]),
+                (REGISTRATION_SPENT_FILENAME, paths["registration_spent"]),
+            )
+        }
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
     return ProtectedFiles(
         session_key=states[SESSION_KEY_FILENAME],
         identity=states[IDENTITY_FILENAME],
@@ -869,6 +953,17 @@ def build_register_signer_request(
         raise OnboardingViolation("REGISTRATION_INTENT_NOT_REUSABLE")
     if not _valid_signature(account_signature) or not _valid_signature(signer_signature):
         raise OnboardingViolation("SIGNATURE_INVALID")
+    if (
+        intent.nonce_anchor != intent.observed_nonce_anchor
+        or intent.nonce_bitmap_index != intent.observed_bitmap_index
+    ):
+        raise OnboardingViolation("REGISTRATION_INTENT_NONCE_MISMATCH")
+    try:
+        persisted = load_registration_intent()
+    except OnboardingViolation:
+        raise
+    if persisted != intent:
+        raise OnboardingViolation("REGISTRATION_INTENT_MISMATCH")
     # Revalidate the whole contract identity before returning a wire-shaped
     # object.  No optional label or extra field is accepted here.
     build_register_signer_typed_data(
@@ -986,7 +1081,7 @@ def _parse_intent(value: bytes, identity: ProvisionedIdentity) -> RegistrationIn
             raise ValueError
         observed_anchor = _uint(
             data["observed_nonce_anchor"],
-            maximum=_UINT48_MAX - 1,
+            maximum=_UINT48_MAX,
             reason="NONCE_ANCHOR_INVALID",
         )
         observed_index = _uint(
@@ -1003,7 +1098,7 @@ def _parse_intent(value: bytes, identity: ProvisionedIdentity) -> RegistrationIn
             maximum=_MAX_NONCE_BITMAP_INDEX,
             reason="NONCE_BITMAP_INDEX_INVALID",
         )
-        if anchor != observed_anchor + 1 or bitmap_index != 0:
+        if anchor != observed_anchor or bitmap_index != observed_index:
             raise ValueError
         return RegistrationIntent(
             intent_id=data["intent_id"],
@@ -1088,13 +1183,13 @@ def prepare_registration_intent(
 
     ``nonce_anchor``/``current_bitmap_index``/``bitmap`` are the exact bounded
     identity fields from the official nonce-state observation.  The signed
-    registration identity is ``nonce_anchor + 1`` at bitmap index zero.  This
+    registration identity uses the exact observed anchor and bitmap index.  This
     function performs no key loading, signing, network access, or dispatch.
     """
 
     observed_anchor = _uint(
         nonce_anchor,
-        maximum=_UINT48_MAX - 1,
+        maximum=_UINT48_MAX,
         reason="NONCE_ANCHOR_INVALID",
     )
     observed_index = _uint(
@@ -1129,8 +1224,8 @@ def prepare_registration_intent(
             observed_nonce_anchor=observed_anchor,
             observed_bitmap_index=observed_index,
             observed_bitmap=observed_bitmap,
-            nonce_anchor=observed_anchor + 1,
-            nonce_bitmap_index=0,
+            nonce_anchor=observed_anchor,
+            nonce_bitmap_index=observed_index,
         )
         _create_secure_file(
             directory_fd,
@@ -1229,8 +1324,7 @@ def provision_mainnet_session_signer(
             expiration=expiration,
         )
 
-        _ensure_fixed_directory()
-        directory_fd = _open_directory()
+        directory_fd = _ensure_fixed_directory()
         created: list[_CreatedFile] = []
         try:
             # O_EXCL is the authoritative race-safe no-overwrite barrier.  The
