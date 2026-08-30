@@ -12,20 +12,20 @@ import pytest
 from risex_farmer import extended_mainnet_credential_onboarding as onboarding
 
 
-PUBLIC_KEY = int("abc123", 16)
 ACCOUNT_ID = "1001"
 ACCOUNT_INDEX = "0"
 L2_KEY = "0xabc123"
 L2_VAULT = "321"
 API_KEY = "synthetic-api-key-only"
-STARK_PRIVATE_KEY = "0x1234"
 
 
 def _configure(tmp_path, monkeypatch):
     directory = tmp_path / "config" / "risex-farmer" / "extended-mainnet-credentials"
     monkeypatch.setattr(onboarding, "PROTECTED_DIRECTORY", directory)
     monkeypatch.setattr(
-        onboarding, "_derive_stark_public_key", lambda scalar: PUBLIC_KEY
+        onboarding,
+        "STARK_PROTECTED_DIRECTORY",
+        tmp_path / "config" / "risex-farmer" / "extended-mainnet-signing",
     )
     return directory
 
@@ -37,7 +37,6 @@ def _values(**changes):
         "l2_key": L2_KEY,
         "l2_vault": L2_VAULT,
         "api_key": API_KEY,
-        "stark_private_key": STARK_PRIVATE_KEY,
     }
     values.update(changes)
     return [values[key] for key in values]
@@ -66,7 +65,7 @@ def _file(path, value=b"synthetic"):
     return path
 
 
-def test_provision_persists_exact_identity_separate_credentials_and_sanitized_metadata(
+def test_read_only_provision_persists_exact_identity_and_only_api_key(
     tmp_path, monkeypatch
 ):
     directory = _configure(tmp_path, monkeypatch)
@@ -80,7 +79,6 @@ def test_provision_persists_exact_identity_separate_credentials_and_sanitized_me
     assert set(path.name for path in directory.iterdir()) == {
         onboarding.IDENTITY_FILENAME,
         onboarding.API_KEY_FILENAME,
-        onboarding.STARK_PRIVATE_KEY_FILENAME,
     }
     for path in directory.iterdir():
         details = os.lstat(path)
@@ -100,20 +98,18 @@ def test_provision_persists_exact_identity_separate_credentials_and_sanitized_me
         "l2_key": L2_KEY,
         "l2_vault": 321,
     }
-    assert metadata["credential_contract"] == {
-        "api_key": "READ_ONLY_X_API_KEY",
-        "stark_private_key": "WRITE_STARK_SIGNATURE_ONLY",
-    }
+    assert metadata["credential_contract"] == {"api_key": "READ_ONLY_X_API_KEY"}
+    assert metadata["mainnet_write_authority"] == onboarding.NO_MAINNET_WRITE_AUTHORITY
+    assert metadata["write_ready"] is False
     assert metadata["api_key_fingerprint"] == hashlib.sha256(
         API_KEY.encode("ascii")
     ).hexdigest()
-    assert metadata["stark_private_key_fingerprint"] == hashlib.sha256(
-        STARK_PRIVATE_KEY.encode("ascii")
-    ).hexdigest()
     assert API_KEY not in (directory / onboarding.IDENTITY_FILENAME).read_text()
-    assert STARK_PRIVATE_KEY not in (directory / onboarding.IDENTITY_FILENAME).read_text()
     assert API_KEY not in result.evidence()
-    assert STARK_PRIVATE_KEY not in result.evidence()
+    assert "stark_private_key" not in result.evidence()
+    assert "WRITE_STARK_SIGNATURE_ONLY" not in result.evidence()
+    assert result.mainnet_write_authority == onboarding.NO_MAINNET_WRITE_AUTHORITY
+    assert result.inspection.mainnet_write_authority == onboarding.NO_MAINNET_WRITE_AUTHORITY
 
 
 def test_discovery_survives_restart_and_closes_zeroized_handle(tmp_path, monkeypatch):
@@ -129,17 +125,14 @@ def test_discovery_survives_restart_and_closes_zeroized_handle(tmp_path, monkeyp
     with onboarding.discover_protected_credentials() as credentials:
         assert credentials.identity == inspection.identity
         assert credentials.api_key() == API_KEY
-        assert credentials.stark_private_key() == STARK_PRIVATE_KEY
         assert API_KEY not in repr(credentials)
-        assert STARK_PRIVATE_KEY not in repr(credentials)
+        assert not hasattr(credentials, "stark_private_key")
     assert credentials.closed
     assert credentials._api_key == bytearray()
-    assert credentials._stark_private_key == bytearray()
     with pytest.raises(onboarding.CredentialOnboardingError) as error:
         credentials.api_key()
     assert str(error.value) == "CREDENTIAL_HANDLE_CLOSED"
     assert API_KEY not in str(error.value)
-    assert STARK_PRIVATE_KEY not in str(error.value)
 
 
 def test_metadata_inspection_never_reads_secret_file_bytes(tmp_path, monkeypatch):
@@ -153,7 +146,8 @@ def test_metadata_inspection_never_reads_secret_file_bytes(tmp_path, monkeypatch
     inspection = onboarding.inspect_protected_credentials()
     assert inspection.ready
     assert inspection.api_key_fingerprint
-    assert inspection.stark_private_key_fingerprint
+    assert not hasattr(inspection, "stark_private_key_fingerprint")
+    assert "stark_private_key" not in inspection.evidence()
 
 
 def test_prompt_cancellation_is_sanitized_and_writes_nothing(tmp_path, monkeypatch):
@@ -182,7 +176,6 @@ def test_prompt_cancellation_is_sanitized_and_writes_nothing(tmp_path, monkeypat
         ("l2_key", "not-hex", "L2_KEY_INVALID"),
         ("l2_vault", "-1", "L2_VAULT_INVALID"),
         ("api_key", " ", "API_KEY_INVALID"),
-        ("stark_private_key", "not-a-stark-key", "STARK_PRIVATE_KEY_INVALID"),
         ("account_id", None, "INPUT_INVALID"),
     ],
 )
@@ -197,43 +190,123 @@ def test_malformed_or_missing_inputs_fail_closed(tmp_path, monkeypatch, field, v
     assert value not in result.evidence() if value else True
 
 
-def test_identical_credentials_are_rejected_before_key_derivation(tmp_path, monkeypatch):
+def test_read_only_provision_does_not_enter_future_stark_phase(tmp_path, monkeypatch):
     directory = _configure(tmp_path, monkeypatch)
-    derived = []
+    prompts = []
+
+    def future_phase_must_not_run(*args, **kwargs):
+        raise AssertionError("future Stark phase entered")
+
     monkeypatch.setattr(
-        onboarding, "_derive_stark_public_key", lambda scalar: derived.append(scalar)
+        onboarding, "provision_stark_private_key", future_phase_must_not_run
     )
+    result = onboarding.provision_protected_credentials(_input(_values(), prompts))
+
+    assert result.provisioned
+    assert len(prompts) == 5
+    assert all("Stark" not in prompt for prompt in prompts)
+    assert set(path.name for path in directory.iterdir()) == {
+        onboarding.IDENTITY_FILENAME,
+        onboarding.API_KEY_FILENAME,
+    }
+
+
+def test_future_stark_phase_is_explicit_and_fail_closed_without_prompt_or_load(
+    tmp_path, monkeypatch
+):
+    _configure(tmp_path, monkeypatch)
+    called = []
+
+    def forbidden(*args, **kwargs):
+        called.append((args, kwargs))
+        raise AssertionError("future Stark input must not be read")
+
+    result = onboarding.provision_stark_private_key(forbidden)
+
+    assert not result.provisioned
+    assert result.status == onboarding.BLOCKED
+    assert result.reason == onboarding.NO_MAINNET_WRITE_AUTHORITY
+    assert result.mainnet_write_authority == onboarding.NO_MAINNET_WRITE_AUTHORITY
+    assert result.write_ready is False
+    assert called == []
+    assert onboarding.future_stark_protected_paths()["directory"] != onboarding.protected_paths()[
+        "directory"
+    ]
+    assert not onboarding.future_stark_protected_paths()["directory"].exists()
+
+
+def test_future_stark_cli_path_is_explicitly_blocked_and_sanitized(
+    tmp_path, monkeypatch, capsys
+):
+    _configure(tmp_path, monkeypatch)
+    assert onboarding.main(["provision-stark"]) == 1
+    output = capsys.readouterr().out
+    assert onboarding.NO_MAINNET_WRITE_AUTHORITY in output
+    assert "private" not in output.lower()
+    assert not onboarding.future_stark_protected_paths()["directory"].exists()
+
+
+def test_legacy_combined_state_fails_closed_without_reading_or_overwriting(
+    tmp_path, monkeypatch
+):
+    directory = _configure(tmp_path, monkeypatch)
+    assert onboarding.provision_protected_credentials(_input(_values())).provisioned
+    original = {
+        path.name: path.read_bytes()
+        for path in directory.iterdir()
+        if path.name in {onboarding.IDENTITY_FILENAME, onboarding.API_KEY_FILENAME}
+    }
+    _file(directory / onboarding.STARK_PRIVATE_KEY_FILENAME, b"legacy-stark-key")
+
+    def forbidden_secret_read(*args, **kwargs):
+        raise AssertionError("combined-state inspection read a secret")
+
+    monkeypatch.setattr(onboarding, "_read_secret_file", forbidden_secret_read)
+    inspection = onboarding.inspect_protected_credentials()
+    assert not inspection.ready
+    assert inspection.reason == "PROTECTED_DIRECTORY_UNEXPECTED_ENTRY"
+    assert "legacy-stark-key" not in inspection.evidence()
+
+    prompts = []
     result = onboarding.provision_protected_credentials(
-        _input(_values(api_key=STARK_PRIVATE_KEY))
+        _input(_values(), prompts)
     )
     assert result.status == onboarding.BLOCKED
-    assert result.reason == "CREDENTIALS_NOT_DISTINCT"
-    assert derived == []
-    assert not directory.exists()
+    assert result.reason == "PROTECTED_DIRECTORY_UNEXPECTED_ENTRY"
+    assert prompts == []
+    assert {
+        path.name: path.read_bytes()
+        for path in directory.iterdir()
+        if path.name in original
+    } == original
 
 
-def test_private_key_must_bind_to_public_identity(tmp_path, monkeypatch):
+def test_legacy_combined_metadata_is_not_accepted_as_read_only_state(
+    tmp_path, monkeypatch
+):
     directory = _configure(tmp_path, monkeypatch)
-    monkeypatch.setattr(onboarding, "_derive_stark_public_key", lambda scalar: 999)
-    result = onboarding.provision_protected_credentials(_input(_values()))
-    assert result.status == onboarding.BLOCKED
-    assert result.reason == "STARK_PUBLIC_IDENTITY_MISMATCH"
-    assert not directory.exists()
-
-
-def test_missing_official_sdk_blocks_before_persistence(tmp_path, monkeypatch):
-    directory = _configure(tmp_path, monkeypatch)
-    monkeypatch.setattr(
-        onboarding,
-        "_derive_stark_public_key",
-        lambda scalar: (_ for _ in ()).throw(
-            onboarding.CredentialOnboardingError("OFFICIAL_SDK_UNAVAILABLE")
-        ),
+    assert onboarding.provision_protected_credentials(_input(_values())).provisioned
+    metadata_path = directory / onboarding.IDENTITY_FILENAME
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["stark_private_key_fingerprint"] = "0" * 64
+    metadata["credential_contract"]["stark_private_key"] = (
+        "WRITE_STARK_SIGNATURE_ONLY"
     )
-    result = onboarding.provision_protected_credentials(_input(_values()))
-    assert result.status == onboarding.BLOCKED
-    assert result.reason == "OFFICIAL_SDK_UNAVAILABLE"
-    assert not directory.exists()
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    metadata_path.chmod(0o600)
+
+    before = {
+        path.name: path.read_bytes() for path in directory.iterdir()
+    }
+    inspection = onboarding.inspect_protected_credentials()
+    assert not inspection.ready
+    assert inspection.reason == "IDENTITY_METADATA_INVALID"
+    with pytest.raises(onboarding.CredentialOnboardingError) as error:
+        onboarding.discover_protected_credentials()
+    assert str(error.value) == "IDENTITY_METADATA_INVALID"
+    assert {
+        path.name: path.read_bytes() for path in directory.iterdir()
+    } == before
 
 
 @pytest.mark.parametrize("defect", ["symlink", "regular_file", "mode", "owner"])
@@ -287,7 +360,7 @@ def test_metadata_inspection_reports_file_safety_without_secret_reads(
     api_key = _file(directory / onboarding.API_KEY_FILENAME, API_KEY.encode())
     stark = _file(
         directory / onboarding.STARK_PRIVATE_KEY_FILENAME,
-        STARK_PRIVATE_KEY.encode(),
+        b"legacy-combined-state",
     )
     if defect == "symlink":
         api_key.unlink()
@@ -328,7 +401,7 @@ def test_metadata_inspection_reports_file_safety_without_secret_reads(
         "PROTECTED_FILE_OWNER_NOT_CURRENT_USER",
     }
     assert API_KEY not in inspection.evidence()
-    assert STARK_PRIVATE_KEY not in inspection.evidence()
+    assert "stark_private_key" not in inspection.evidence()
 
 
 def test_parent_symlink_is_rejected_before_hidden_input(tmp_path, monkeypatch):
@@ -363,7 +436,6 @@ def test_retained_final_descriptor_survives_parent_swap(tmp_path, monkeypatch):
         assert set(onboarding._directory_entries_from_fd(descriptor)) == {
             onboarding.IDENTITY_FILENAME,
             onboarding.API_KEY_FILENAME,
-            onboarding.STARK_PRIVATE_KEY_FILENAME,
         }
         blocked = onboarding.inspect_protected_credentials()
         assert blocked.status == onboarding.INSPECTION_BLOCKED
@@ -411,7 +483,7 @@ def test_partial_write_rolls_back_all_created_files_and_redacts_exception(
     result = onboarding.provision_protected_credentials(_input(_values()))
     assert result.status == onboarding.BLOCKED
     assert result.reason == "PROTECTED_PROVISIONING_FAILED"
-    assert calls == [onboarding.API_KEY_FILENAME, onboarding.STARK_PRIVATE_KEY_FILENAME]
+    assert calls == [onboarding.API_KEY_FILENAME, onboarding.IDENTITY_FILENAME]
     assert directory.exists()
     assert list(directory.iterdir()) == []
     assert secret_in_error not in result.evidence()
@@ -458,7 +530,7 @@ def test_cli_inspect_is_visible_safe_and_does_not_add_normal_cli_mode(
     output = capsys.readouterr().out
     assert "PROTECTED_FILES_MISSING" in output
     assert API_KEY not in output
-    assert STARK_PRIVATE_KEY not in output
+    assert "stark_private_key" not in output
 
     result = onboarding.main(["provision", "--api-key", API_KEY])
     captured = capsys.readouterr()
@@ -479,11 +551,11 @@ def test_terminal_provision_uses_hidden_getpass_and_prints_only_sanitized_result
     )
     assert onboarding.main(["provision"]) == 0
     output = capsys.readouterr().out
-    assert len(prompts) == 6
+    assert len(prompts) == 5
     assert all("hidden" in prompt for prompt in prompts)
     assert "PROTECTED_FILES_CREATED" in output
     assert API_KEY not in output
-    assert STARK_PRIVATE_KEY not in output
+    assert "stark_private_key" not in output
 
 
 def test_missing_persisted_secret_fails_closed_on_inspection_and_discovery(

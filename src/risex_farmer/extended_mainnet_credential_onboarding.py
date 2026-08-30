@@ -6,11 +6,13 @@ The default input function is :func:`getpass.getpass`; no credential value is
 accepted through command-line arguments, environment variables, or task/chat
 messages.
 
-Extended's official API contract separates the two retained credentials:
-``X-Api-Key`` is sufficient for read-only account access, while writes also
-require a Stark signature made with the account's Stark private key.  This
-slice only persists and discovers those credentials.  It does not create a
-client, prepare a payload, sign, connect to the venue, or dispatch a request.
+Extended's official API contract separates the two credentials: ``X-Api-Key``
+is sufficient for read-only account access, while writes also require a Stark
+signature made with the account's Stark private key.  This module currently
+owns only the read-only identity/API-key phase.  A separate future Stark
+provisioning command is an explicit, fail-closed boundary and has no write
+authority in this slice.  The module does not create a client, prepare a
+payload, sign, connect to the venue, or dispatch a request.
 """
 
 from __future__ import annotations
@@ -32,6 +34,7 @@ VENUE = "Extended"
 ENVIRONMENT = "MAINNET"
 PROVISIONED = "PROVISIONED"
 BLOCKED = "BLOCKED"
+NO_MAINNET_WRITE_AUTHORITY = "NO_MAINNET_WRITE_AUTHORITY"
 INSPECTION_READY = "PROTECTED_FILES_READY"
 INSPECTION_MISSING = "PROTECTED_FILES_MISSING"
 INSPECTION_BLOCKED = "PROTECTED_FILES_BLOCKED"
@@ -41,31 +44,27 @@ INSPECTION_BLOCKED = "PROTECTED_FILES_BLOCKED"
 PROTECTED_DIRECTORY = (
     Path.home() / ".config" / "risex-farmer" / "extended-mainnet-credentials"
 )
+# Reserved for a later separately authorized Stark-key phase.  The current
+# read-only flow never opens, inspects, prompts for, or loads this path.
+STARK_PROTECTED_DIRECTORY = (
+    Path.home() / ".config" / "risex-farmer" / "extended-mainnet-signing"
+)
 IDENTITY_FILENAME = "identity.json"
 API_KEY_FILENAME = "api-key"
 STARK_PRIVATE_KEY_FILENAME = "stark-private-key"
 PROTECTED_FILENAMES = (
     IDENTITY_FILENAME,
     API_KEY_FILENAME,
-    STARK_PRIVATE_KEY_FILENAME,
 )
 
-PROVISIONING_SCHEMA_VERSION = 1
+PROVISIONING_SCHEMA_VERSION = 2
 PROTECTED_DIRECTORY_MODE = 0o700
 PROTECTED_FILE_MODE = 0o600
 MAX_API_KEY_BYTES = 512
-MAX_STARK_PRIVATE_KEY_BYTES = 128
 MAX_IDENTITY_FILE_BYTES = 4096
 MAX_PUBLIC_INPUT_CHARS = 256
 MAX_DECIMAL_IDENTIFIER = 2**63 - 1
 MAX_ACCOUNT_INDEX = 2**31 - 1
-
-# The current official x10 SDK delegates Stark public-key derivation to this
-# native dependency.  Keep this bound local and lazy: the normal paper import
-# surface never loads the SDK or any crypto library.
-STARK_EC_ORDER = 0x800000000000010FFFFFFFFFFFFFFFFB781126DCAE7B2321E66A241ADC64D2F
-MAX_STARK_PRIVATE_KEY_HEX_DIGITS = (STARK_EC_ORDER.bit_length() + 3) // 4
-
 
 class CredentialOnboardingError(ValueError):
     """Sanitized local failure; its text is always a fixed code."""
@@ -184,45 +183,6 @@ class ExtendedPublicIdentity:
         }
 
 
-def _derive_stark_public_key(private_scalar: int) -> int:
-    """Use the official SDK's crypto dependency at the protected boundary."""
-
-    try:
-        from fast_stark_crypto import get_public_key
-    except (ImportError, ModuleNotFoundError):
-        raise CredentialOnboardingError("OFFICIAL_SDK_UNAVAILABLE") from None
-    try:
-        derived = get_public_key(private_scalar)
-    except BaseException:
-        raise CredentialOnboardingError("STARK_PUBLIC_KEY_DERIVATION_FAILED") from None
-    if type(derived) is not int or derived <= 0:
-        raise CredentialOnboardingError("STARK_PUBLIC_KEY_DERIVATION_FAILED")
-    return derived
-
-
-def _validate_stark_private_key(value: bytearray, identity: ExtendedPublicIdentity) -> None:
-    try:
-        text = bytes(value).decode("ascii")
-    except UnicodeDecodeError:
-        raise CredentialOnboardingError("STARK_PRIVATE_KEY_INVALID") from None
-    if (
-        not text.startswith("0x")
-        or not text[2:]
-        or len(text[2:]) > MAX_STARK_PRIVATE_KEY_HEX_DIGITS
-        or any(char not in "0123456789abcdefABCDEF" for char in text[2:])
-    ):
-        raise CredentialOnboardingError("STARK_PRIVATE_KEY_INVALID")
-    try:
-        scalar = int(text[2:], 16)
-    except ValueError:
-        raise CredentialOnboardingError("STARK_PRIVATE_KEY_INVALID") from None
-    if not 0 < scalar < STARK_EC_ORDER:
-        raise CredentialOnboardingError("STARK_PRIVATE_KEY_INVALID")
-    derived = _derive_stark_public_key(scalar)
-    if derived != int(identity.l2_key[2:], 16):
-        raise CredentialOnboardingError("STARK_PUBLIC_IDENTITY_MISMATCH")
-
-
 def _secret_bytes(value: Any, *, maximum: int, code: str) -> bytearray:
     if type(value) is not str or not value or value != value.strip():
         raise CredentialOnboardingError(code)
@@ -272,8 +232,8 @@ class CredentialInspection:
     directory_mode: int | None
     identity: ExtendedPublicIdentity | None
     api_key_fingerprint: str | None
-    stark_private_key_fingerprint: str | None
     files: tuple[ProtectedFileMetadata, ...]
+    mainnet_write_authority: str = NO_MAINNET_WRITE_AUTHORITY
 
     @property
     def ready(self) -> bool:
@@ -295,12 +255,10 @@ class CredentialInspection:
                     "access": "READ_ONLY_X_API_KEY",
                     "fingerprint": self.api_key_fingerprint,
                 },
-                "stark_private_key": {
-                    "access": "WRITE_STARK_SIGNATURE_ONLY",
-                    "fingerprint": self.stark_private_key_fingerprint,
-                },
             },
             "files": [item.to_metadata() for item in self.files],
+            "mainnet_write_authority": self.mainnet_write_authority,
+            "write_ready": False,
         }
 
     def evidence(self) -> str:
@@ -312,6 +270,7 @@ class ProvisioningResult:
     status: str
     reason: str
     inspection: CredentialInspection
+    mainnet_write_authority: str = NO_MAINNET_WRITE_AUTHORITY
 
     @property
     def provisioned(self) -> bool:
@@ -322,6 +281,36 @@ class ProvisioningResult:
             "status": self.status,
             "reason": self.reason,
             "inspection": self.inspection.to_metadata(),
+            "mainnet_write_authority": self.mainnet_write_authority,
+            "write_ready": False,
+        }
+
+    def evidence(self) -> str:
+        return json.dumps(self.to_metadata(), sort_keys=True, separators=(",", ":"))
+
+
+@dataclass(frozen=True)
+class StarkProvisioningResult:
+    """Future-only Stark phase result; no write authority exists here."""
+
+    status: str
+    reason: str
+    mainnet_write_authority: str = NO_MAINNET_WRITE_AUTHORITY
+
+    @property
+    def provisioned(self) -> bool:
+        return False
+
+    @property
+    def write_ready(self) -> bool:
+        return False
+
+    def to_metadata(self) -> dict[str, Any]:
+        return {
+            "mainnet_write_authority": self.mainnet_write_authority,
+            "reason": self.reason,
+            "status": self.status,
+            "write_ready": self.write_ready,
         }
 
     def evidence(self) -> str:
@@ -329,26 +318,22 @@ class ProvisioningResult:
 
 
 class ProtectedExtendedCredentials:
-    """In-memory handle for a discovered credential pair.
+    """In-memory handle for a discovered read-only API credential.
 
-    The handle deliberately has no signing or transport methods.  A later
-    bounded private-read or write slice may consume its fields and must close
-    it in a ``finally`` block.
+    The handle deliberately contains no Stark/write credential and has no
+    signing or transport methods.  A later bounded private-read slice may
+    consume the API key and must close it in a ``finally`` block.
     """
 
     def __init__(
         self,
         identity: ExtendedPublicIdentity,
         api_key: bytearray,
-        stark_private_key: bytearray,
         api_key_fingerprint: str,
-        stark_private_key_fingerprint: str,
     ) -> None:
         self.identity = identity
         self._api_key = api_key
-        self._stark_private_key = stark_private_key
         self.api_key_fingerprint = api_key_fingerprint
-        self.stark_private_key_fingerprint = stark_private_key_fingerprint
         self._closed = False
 
     @property
@@ -363,14 +348,6 @@ class ProtectedExtendedCredentials:
         except UnicodeDecodeError:
             raise CredentialOnboardingError("API_KEY_INVALID") from None
 
-    def stark_private_key(self) -> str:
-        if self._closed:
-            raise CredentialOnboardingError("CREDENTIAL_HANDLE_CLOSED")
-        try:
-            return bytes(self._stark_private_key).decode("ascii")
-        except UnicodeDecodeError:
-            raise CredentialOnboardingError("STARK_PRIVATE_KEY_INVALID") from None
-
     def __repr__(self) -> str:
         state = "closed" if self._closed else "open"
         return f"<ProtectedExtendedCredentials {state} identity={self.identity!r}>"
@@ -379,7 +356,6 @@ class ProtectedExtendedCredentials:
 
     def close(self) -> None:
         _zeroize(self._api_key)
-        _zeroize(self._stark_private_key)
         self._closed = True
 
     def __enter__(self) -> "ProtectedExtendedCredentials":
@@ -396,7 +372,19 @@ def protected_paths() -> Mapping[str, Path]:
         "directory": PROTECTED_DIRECTORY,
         "identity": PROTECTED_DIRECTORY / IDENTITY_FILENAME,
         "api_key": PROTECTED_DIRECTORY / API_KEY_FILENAME,
-        "stark_private_key": PROTECTED_DIRECTORY / STARK_PRIVATE_KEY_FILENAME,
+    }
+
+
+def future_stark_protected_paths() -> Mapping[str, Path]:
+    """Return the reserved future Stark path without opening it.
+
+    This path is intentionally outside the read-only directory.  The current
+    implementation never creates, inspects, prompts for, or loads it.
+    """
+
+    return {
+        "directory": STARK_PROTECTED_DIRECTORY,
+        "stark_private_key": STARK_PROTECTED_DIRECTORY / STARK_PRIVATE_KEY_FILENAME,
     }
 
 
@@ -630,7 +618,6 @@ def _file_observation(
     elif info.st_size > {
         IDENTITY_FILENAME: MAX_IDENTITY_FILE_BYTES,
         API_KEY_FILENAME: MAX_API_KEY_BYTES,
-        STARK_PRIVATE_KEY_FILENAME: MAX_STARK_PRIVATE_KEY_BYTES,
     }[name]:
         reason = "PROTECTED_FILE_TOO_LARGE"
     else:
@@ -720,9 +707,14 @@ def _metadata_values(raw: bytearray) -> tuple[ExtendedPublicIdentity, str, str]:
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise CredentialOnboardingError("IDENTITY_METADATA_INVALID") from None
     if not isinstance(value, Mapping) or set(value) != {
-        "schema_version", "venue", "environment", "identity",
-        "api_key_fingerprint", "stark_private_key_fingerprint",
+        "schema_version",
+        "venue",
+        "environment",
+        "identity",
+        "api_key_fingerprint",
         "credential_contract",
+        "mainnet_write_authority",
+        "write_ready",
     }:
         raise CredentialOnboardingError("IDENTITY_METADATA_INVALID")
     if (
@@ -730,28 +722,24 @@ def _metadata_values(raw: bytearray) -> tuple[ExtendedPublicIdentity, str, str]:
         or value["schema_version"] != PROVISIONING_SCHEMA_VERSION
         or value["venue"] != VENUE
         or value["environment"] != ENVIRONMENT
+        or value["mainnet_write_authority"] != NO_MAINNET_WRITE_AUTHORITY
+        or value["write_ready"] is not False
     ):
         raise CredentialOnboardingError("IDENTITY_METADATA_INVALID")
     identity = ExtendedPublicIdentity.from_metadata(value["identity"])
     contract = value["credential_contract"]
-    if not isinstance(contract, Mapping) or set(contract) != {"api_key", "stark_private_key"}:
+    if not isinstance(contract, Mapping) or set(contract) != {"api_key"}:
         raise CredentialOnboardingError("IDENTITY_METADATA_INVALID")
+    if contract["api_key"] != "READ_ONLY_X_API_KEY":
+        raise CredentialOnboardingError("IDENTITY_METADATA_INVALID")
+    fingerprint = value["api_key_fingerprint"]
     if (
-        contract["api_key"] != "READ_ONLY_X_API_KEY"
-        or contract["stark_private_key"] != "WRITE_STARK_SIGNATURE_ONLY"
+        type(fingerprint) is not str
+        or len(fingerprint) != 64
+        or any(char not in "0123456789abcdef" for char in fingerprint)
     ):
         raise CredentialOnboardingError("IDENTITY_METADATA_INVALID")
-    fingerprints = []
-    for key in ("api_key_fingerprint", "stark_private_key_fingerprint"):
-        fingerprint = value[key]
-        if (
-            type(fingerprint) is not str
-            or len(fingerprint) != 64
-            or any(char not in "0123456789abcdef" for char in fingerprint)
-        ):
-            raise CredentialOnboardingError("IDENTITY_METADATA_INVALID")
-        fingerprints.append(fingerprint)
-    return identity, fingerprints[0], fingerprints[1]
+    return identity, fingerprint, value["mainnet_write_authority"]
 
 
 def _inspection_failure(reason: str) -> CredentialInspection:
@@ -767,7 +755,6 @@ def _inspection_failure(reason: str) -> CredentialInspection:
         for key, name in (
             ("identity", IDENTITY_FILENAME),
             ("api_key", API_KEY_FILENAME),
-            ("stark_private_key", STARK_PRIVATE_KEY_FILENAME),
         )
     )
     return CredentialInspection(
@@ -779,7 +766,6 @@ def _inspection_failure(reason: str) -> CredentialInspection:
         directory_mode=None,
         identity=None,
         api_key_fingerprint=None,
-        stark_private_key_fingerprint=None,
         files=files,
     )
 
@@ -798,12 +784,10 @@ def _inspect_protected_credentials() -> CredentialInspection:
         for key, name in (
             ("identity", IDENTITY_FILENAME),
             ("api_key", API_KEY_FILENAME),
-            ("stark_private_key", STARK_PRIVATE_KEY_FILENAME),
         )
     )
     identity: ExtendedPublicIdentity | None = None
     api_fingerprint: str | None = None
-    stark_fingerprint: str | None = None
     inspection_reason = reason
     status = INSPECTION_MISSING
     try:
@@ -836,7 +820,6 @@ def _inspect_protected_credentials() -> CredentialInspection:
                     for key, name in (
                         ("identity", IDENTITY_FILENAME),
                         ("api_key", API_KEY_FILENAME),
-                        ("stark_private_key", STARK_PRIVATE_KEY_FILENAME),
                     )
                 )
                 try:
@@ -858,7 +841,11 @@ def _inspect_protected_credentials() -> CredentialInspection:
                         raw = bytearray()
                         try:
                             raw = _read_metadata_file(directory_fd)
-                            identity, api_fingerprint, stark_fingerprint = _metadata_values(raw)
+                            identity, api_fingerprint, authority = _metadata_values(raw)
+                            if authority != NO_MAINNET_WRITE_AUTHORITY:
+                                raise CredentialOnboardingError(
+                                    "IDENTITY_METADATA_INVALID"
+                                )
                         except CredentialOnboardingError as exc:
                             status = INSPECTION_BLOCKED
                             inspection_reason = exc.code
@@ -882,7 +869,6 @@ def _inspect_protected_credentials() -> CredentialInspection:
         directory_mode=mode,
         identity=identity,
         api_key_fingerprint=api_fingerprint,
-        stark_private_key_fingerprint=stark_fingerprint,
         files=files,
     )
 
@@ -1016,7 +1002,6 @@ def _cleanup_created(directory_fd: int, created: list[str]) -> None:
 def _metadata_payload(
     identity: ExtendedPublicIdentity,
     api_fingerprint: str,
-    stark_fingerprint: str,
 ) -> bytearray:
     value = {
         "schema_version": PROVISIONING_SCHEMA_VERSION,
@@ -1024,11 +1009,11 @@ def _metadata_payload(
         "environment": ENVIRONMENT,
         "identity": identity.to_metadata(),
         "api_key_fingerprint": api_fingerprint,
-        "stark_private_key_fingerprint": stark_fingerprint,
         "credential_contract": {
             "api_key": "READ_ONLY_X_API_KEY",
-            "stark_private_key": "WRITE_STARK_SIGNATURE_ONLY",
         },
+        "mainnet_write_authority": NO_MAINNET_WRITE_AUTHORITY,
+        "write_ready": False,
     }
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
     if len(encoded) > MAX_IDENTITY_FILE_BYTES:
@@ -1049,10 +1034,11 @@ def _input(input_fn: Callable[[str], str], prompt: str) -> str:
 def provision_protected_credentials(
     input_fn: Callable[[str], str] | None = None,
 ) -> ProvisioningResult:
-    """Atomically provision Extended identity/API/Stark files.
+    """Atomically provision the Extended identity and read-only API key.
 
     ``input_fn`` exists only as a synthetic test seam.  Production callers
-    omit it and receive hidden terminal input for every field.
+    omit it and receive hidden terminal input for the four public identity
+    fields and the API key.  The Stark phase is never entered here.
     """
 
     input_fn = getpass.getpass if input_fn is None else input_fn
@@ -1070,7 +1056,6 @@ def provision_protected_credentials(
         return ProvisioningResult(BLOCKED, "PROTECTED_PATH_ALREADY_EXISTS", before)
 
     api_key = bytearray()
-    stark_private_key = bytearray()
     metadata_payload = bytearray()
     directory_fd = -1
     created: list[str] = []
@@ -1086,19 +1071,8 @@ def provision_protected_credentials(
             maximum=MAX_API_KEY_BYTES,
             code="API_KEY_INVALID",
         )
-        stark_private_key = _secret_bytes(
-            _input(input_fn, "Extended Stark signing key (hidden): "),
-            maximum=MAX_STARK_PRIVATE_KEY_BYTES,
-            code="STARK_PRIVATE_KEY_INVALID",
-        )
-        if api_key == stark_private_key:
-            raise CredentialOnboardingError("CREDENTIALS_NOT_DISTINCT")
-        _validate_stark_private_key(stark_private_key, identity)
         api_fingerprint = _fingerprint(api_key)
-        stark_fingerprint = _fingerprint(stark_private_key)
-        metadata_payload = _metadata_payload(
-            identity, api_fingerprint, stark_fingerprint
-        )
+        metadata_payload = _metadata_payload(identity, api_fingerprint)
         directory_fd = _open_directory(create=True)
         if _directory_entries_from_fd(directory_fd):
             raise CredentialOnboardingError("PROTECTED_PATH_ALREADY_EXISTS")
@@ -1106,13 +1080,6 @@ def provision_protected_credentials(
             directory_fd, API_KEY_FILENAME, api_key, MAX_API_KEY_BYTES
         )
         created.append(API_KEY_FILENAME)
-        _write_secure_file(
-            directory_fd,
-            STARK_PRIVATE_KEY_FILENAME,
-            stark_private_key,
-            MAX_STARK_PRIVATE_KEY_BYTES,
-        )
-        created.append(STARK_PRIVATE_KEY_FILENAME)
         _write_secure_file(
             directory_fd,
             IDENTITY_FILENAME,
@@ -1141,7 +1108,6 @@ def provision_protected_credentials(
             except OSError:
                 pass
         _zeroize(api_key)
-        _zeroize(stark_private_key)
         _zeroize(metadata_payload)
     after = inspect_protected_credentials()
     return ProvisioningResult(PROVISIONED, "PROTECTED_FILES_CREATED", after)
@@ -1203,14 +1169,13 @@ def _read_secret_file(directory_fd: int, filename: str, maximum: int) -> bytearr
 
 
 def discover_protected_credentials() -> ProtectedExtendedCredentials:
-    """Discover the persisted pair after a restart without emitting secrets."""
+    """Discover the persisted read-only API credential after a restart."""
 
     inspection = inspect_protected_credentials()
     if not inspection.ready:
         raise CredentialOnboardingError(inspection.reason)
     directory_fd = -1
     api_key = bytearray()
-    stark_private_key = bytearray()
     try:
         directory_fd = _open_directory()
         if set(_directory_entries_from_fd(directory_fd)) != set(PROTECTED_FILENAMES):
@@ -1218,34 +1183,20 @@ def discover_protected_credentials() -> ProtectedExtendedCredentials:
         api_key = _read_secret_file(
             directory_fd, API_KEY_FILENAME, MAX_API_KEY_BYTES
         )
-        stark_private_key = _read_secret_file(
-            directory_fd,
-            STARK_PRIVATE_KEY_FILENAME,
-            MAX_STARK_PRIVATE_KEY_BYTES,
-        )
-        if api_key == stark_private_key:
-            raise CredentialOnboardingError("CREDENTIALS_NOT_DISTINCT")
         if _fingerprint(api_key) != inspection.api_key_fingerprint:
             raise CredentialOnboardingError("API_KEY_FINGERPRINT_MISMATCH")
-        if _fingerprint(stark_private_key) != inspection.stark_private_key_fingerprint:
-            raise CredentialOnboardingError("STARK_PRIVATE_KEY_FINGERPRINT_MISMATCH")
         if inspection.identity is None:
             raise CredentialOnboardingError("IDENTITY_METADATA_INVALID")
-        _validate_stark_private_key(stark_private_key, inspection.identity)
         return ProtectedExtendedCredentials(
             inspection.identity,
             api_key,
-            stark_private_key,
             inspection.api_key_fingerprint or "",
-            inspection.stark_private_key_fingerprint or "",
         )
     except CredentialOnboardingError:
         _zeroize(api_key)
-        _zeroize(stark_private_key)
         raise
     except BaseException:
         _zeroize(api_key)
-        _zeroize(stark_private_key)
         raise CredentialOnboardingError("PROTECTED_DISCOVERY_FAILED") from None
     finally:
         if directory_fd >= 0:
@@ -1253,6 +1204,20 @@ def discover_protected_credentials() -> ProtectedExtendedCredentials:
                 os.close(directory_fd)
             except OSError:
                 pass
+
+
+def provision_stark_private_key(
+    input_fn: Callable[[str], str] | None = None,
+) -> StarkProvisioningResult:
+    """Reserve the explicit future Stark phase without entering it.
+
+    The argument is retained only to make accidental coupling visible in
+    tests; it is deliberately never called.  Stark-key persistence, loading,
+    signing, and every write path remain outside this implementation slice.
+    """
+
+    del input_fn
+    return StarkProvisioningResult(BLOCKED, NO_MAINNET_WRITE_AUTHORITY)
 
 
 class _SafeArgumentParser(argparse.ArgumentParser):
@@ -1267,6 +1232,10 @@ def _parser() -> argparse.ArgumentParser:
     )
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("provision", help="create protected files using hidden input")
+    commands.add_parser(
+        "provision-stark",
+        help="reserved future Stark phase; no mainnet write authority",
+    )
     commands.add_parser("inspect", help="show sanitized metadata and file safety only")
     return parser
 
@@ -1283,6 +1252,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "inspect":
         print(inspect_protected_credentials().evidence())
         return 0
+    if args.command == "provision-stark":
+        result = provision_stark_private_key()
+        print(result.evidence())
+        return 1
     result = provision_protected_credentials()
     print(result.evidence())
     return 0 if result.provisioned else 1
@@ -1304,17 +1277,21 @@ __all__ = [
     "INSPECTION_MISSING",
     "INSPECTION_READY",
     "MAX_API_KEY_BYTES",
-    "MAX_STARK_PRIVATE_KEY_BYTES",
+    "NO_MAINNET_WRITE_AUTHORITY",
     "PROTECTED_DIRECTORY",
     "PROTECTED_DIRECTORY_MODE",
     "PROTECTED_FILE_MODE",
     "PROVISIONED",
     "ProtectedExtendedCredentials",
     "ProvisioningResult",
+    "STARK_PROTECTED_DIRECTORY",
     "STARK_PRIVATE_KEY_FILENAME",
+    "StarkProvisioningResult",
     "discover_protected_credentials",
+    "future_stark_protected_paths",
     "inspect_protected_credentials",
     "main",
     "provision_protected_credentials",
+    "provision_stark_private_key",
     "protected_paths",
 ]
