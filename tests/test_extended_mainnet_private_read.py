@@ -358,6 +358,15 @@ def test_official_fixture_records_current_read_contract():
     assert value["write_methods_forbidden"] == ["POST", "PUT", "PATCH", "DELETE"]
 
 
+def test_production_run_directory_accepts_macos_directory_link_count(tmp_path):
+    path = tmp_path / "extended-mainnet-private-read"
+    path.mkdir(mode=gate.RUN_DIRECTORY_MODE)
+    path.chmod(gate.RUN_DIRECTORY_MODE)
+
+    assert path.lstat().st_nlink == 2
+    gate._ensure_run_directory(path)
+
+
 @pytest.mark.asyncio
 async def test_ready_reads_exact_account_and_proves_flatness_without_write_surface(tmp_path):
     result, transport, source = await _run(tmp_path)

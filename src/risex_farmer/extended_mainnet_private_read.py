@@ -600,7 +600,6 @@ def _ensure_run_directory(path: Path) -> None:
         not stat.S_ISDIR(info.st_mode)
         or path.is_symlink()
         or info.st_uid != os.getuid()
-        or info.st_nlink != 1
         or stat.S_IMODE(info.st_mode) != RUN_DIRECTORY_MODE
     ):
         raise StoreFailure("RUN_DIRECTORY_INVALID", "SAFETY")
