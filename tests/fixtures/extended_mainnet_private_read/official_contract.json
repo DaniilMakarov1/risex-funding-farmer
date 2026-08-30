@@ -1,0 +1,24 @@
+{
+  "provenance": {
+    "documentation": "https://api.docs.extended.exchange/",
+    "environment": "MAINNET",
+    "auth": "X-Api-Key",
+    "transport": "GET-only REST plus API-key account WebSocket"
+  },
+  "read_paths": [
+    "/api/v1/user/account/info",
+    "/api/v1/user/accounts",
+    "/api/v1/user/balance",
+    "/api/v1/user/spot/balances",
+    "/api/v1/user/assetOperations",
+    "/api/v1/user/fees?market=BTC-USD",
+    "/api/v1/user/orders",
+    "/api/v1/user/orders/history",
+    "/api/v1/user/trades",
+    "/api/v1/user/positions",
+    "/api/v1/user/positions/history",
+    "/api/v1/user/funding/history?startTime=0"
+  ],
+  "private_stream_path": "/stream.extended.exchange/v1/account",
+  "write_methods_forbidden": ["POST", "PUT", "PATCH", "DELETE"]
+}
