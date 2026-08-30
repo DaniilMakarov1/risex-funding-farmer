@@ -139,22 +139,22 @@ Accepted verification and next gate:
 
 ## RISEx–Nado Level-D readiness preparation
 
-Status: `AUTHORIZED FOR ONE NARROW BUILDER — PUBLIC/OFFLINE AND PROTECTED PRIVATE-READ READINESS ONLY; NO MAINNET WRITE AUTHORITY`.
+Status: `ACCEPTED ON a6651db — PUBLIC/OFFLINE GATE BLOCKED ON EXACT NADO ORDER-TYPE EXECUTABLE MINIMUM; NO MAINNET WRITE AUTHORITY`.
 
 Objective: add the smallest isolated RISEx–Nado counterpart to the accepted RISEx–Extended readiness evidence path so that the next operational step is protected local credential provisioning followed by a separately authorized exact-account private-read gate. Use current official Nado mainnet contracts and evaluate the official SDK first. Do not reuse a testnet runner as a mainnet engine and do not add a generic OMS, shared execution platform, signing payload, order preparation, signing, dispatch, transfer, withdrawal, or strategy surface.
 
 Accepted public starting evidence at `2026-08-30T10:02Z`:
 
-- RISEx BTC/USDC: minimum `0.00015`, step `0.000001`, BBO `78008/78008.1`; Nado BTC-PERP: quantity step/minimum `0.00005`, BBO `77969/77970`, and public minimum notional `$100`. Both reported the same next boundary `2026-08-30T11:00:00Z` with two-sided displayed depth sufficient for the public-contract common quantity `0.00130 BTC` (about `$101.36` per leg).
-- The user's manual experience with smaller Nado trades is not yet an authoritative order-type/account contract. Preserve `$100` as the fail-closed minimum unless an official contract plus later protected account-scoped read/simulation proves a specific smaller non-writing path. Do not prepare an order to discover this.
+- RISEx BTC/USDC: minimum `0.00015`, step `0.000001`, BBO `78008/78008.1`; Nado BTC-PERP: quantity step/minimum `0.00005`, BBO `77969/77970`, product `min_size` `$100`, and minimum taker-fee notional `$100`. Both reported the same next boundary `2026-08-30T11:00:00Z` with sufficient two-sided depth for the theoretical common grid candidate `0.00015 BTC` (about `$11.70` per leg).
+- Official Nado FAQ/fee contracts confirm there is no universal trade minimum and that some order types permit trades below product `min_size`, while taker minimum-fee calculation still uses `min_size`. Do not treat `$100` as an unconditional execution floor or claim `0.00015 BTC` executable until an exact selected order type and its current authoritative minimum semantics are proven without preparing an order.
 - The user reports that all three venue accounts were funded and earlier manual small positions were closed. Treat this only as user-provided context. Future private reads must prove the exact identities, actual collateral, account-scoped fees, zero relevant/trigger orders, exact flatness, and no unrelated state; they must not infer those facts from the report.
 
 Acceptance for this slice:
 
-- Fixed local hidden-input provisioning with mode `0700` directory and `0600` no-link files, redacted/non-persistent results, and no private key or seed phrase in task/chat. Reuse the already accepted canonical protected RISEx identity path rather than creating a second RISEx secret copy; add only the Nado-specific protected identity surface needed by this route.
-- A route-local public/offline readiness contract for current minimum/step/depth, fees, schedule, opposite directions, no own counterparty, and smallest executable common quantity; later phases separately require exact protected identities, authoritative account-scoped private reads, caps and one approval, fresh durable runtime/per-dispatch identities, sequential writes, funding before/at/after, accepted reduce-only close, and two agreeing terminal zero-order/exact-flat rounds.
+- Reuse the already accepted canonical protected RISEx identity path by metadata only. Nado's first account-scoped reads require exact public wallet/bytes32 subaccount identity and unsigned authoritative queries, not an API key/secret; private signed streams and all signing remain a future gate. No private key or seed phrase may enter task/chat.
+- The accepted route-local contract separates product `min_size`, minimum-fee notional, theoretical grid quantity, and exact order-type executable minimum. Current baseline is `BLOCKED:NADO_EXECUTABLE_MINIMUM_PENDING`; `common_quantity` and gross notional remain unset. Later phases separately require exact identities, authoritative account-scoped reads, caps and one approval, fresh durable runtime/per-dispatch identities, sequential writes, funding before/at/after, accepted reduce-only close, and two agreeing terminal zero-order/exact-flat rounds.
 - Missing or contradictory funding is `BLOCKED`, never zero. Actual zero or negative remains valid only when authoritative. Every result reports `NO_MAINNET_WRITE_AUTHORITY`; no network-private or write-capable code is accepted in this slice.
-- One fresh visible Nado Builder on GPT-5.6 Luna `max`, separate worktree/branch from exact published main. Builder does not self-accept, merge, push, or create agents. Chief independently reviews official evidence, scope/diff, focused/adverse tests, dependency/import/write surfaces, and one clean Python 3.11 full suite before one fast-forward integration and push.
+- Accepted candidate `a6651db728f61a9693b54ceb9cc00c694bb5ed37` passed independent Chief review: `93` focused/adverse tests, clean Python 3.11 full suite `3021` passed / `3` skipped, and dependency/import/write-surface/diff/Git checks. Next action is a bounded authoritative non-writing determination of the selected Nado order type's executable minimum; if public evidence remains unresolved, stop at this exact blocker rather than prepare or dispatch an order.
 
 ## Parallel bounded public observation and Telegram delivery correction
 
