@@ -105,6 +105,8 @@ _MAX_ADDRESS_CHARS = 42
 _UINT32_MAX = 2**32 - 1
 _UINT48_MAX = 2**48 - 1
 _MAX_NONCE_BITMAP_INDEX = 207
+_FULL_NONCE_BITMAP_INDEX = 208
+_FULL_NONCE_BITMAP_MASK = (1 << (_MAX_NONCE_BITMAP_INDEX + 1)) - 1
 _PROMPT = "RISEx main-wallet private key (hidden; not persisted): "
 
 
@@ -226,6 +228,7 @@ class OnboardingResult:
 @dataclass(frozen=True)
 class RegistrationIntent:
     intent_id: str
+    runtime_id: str
     wallet_address: str
     session_signer_address: str
     expiration: int
@@ -953,10 +956,16 @@ def build_register_signer_request(
         raise OnboardingViolation("REGISTRATION_INTENT_NOT_REUSABLE")
     if not _valid_signature(account_signature) or not _valid_signature(signer_signature):
         raise OnboardingViolation("SIGNATURE_INVALID")
-    if (
-        intent.nonce_anchor != intent.observed_nonce_anchor
-        or intent.nonce_bitmap_index != intent.observed_bitmap_index
-    ):
+    try:
+        expected_anchor, expected_index = _selected_nonce_fields(
+            intent.observed_nonce_anchor,
+            intent.observed_bitmap_index,
+            intent.observed_bitmap,
+            allow_full_bitmap=True,
+        )
+    except OnboardingViolation:
+        raise OnboardingViolation("REGISTRATION_INTENT_NONCE_MISMATCH") from None
+    if intent.nonce_anchor != expected_anchor or intent.nonce_bitmap_index != expected_index:
         raise OnboardingViolation("REGISTRATION_INTENT_NONCE_MISMATCH")
     try:
         persisted = load_registration_intent()
@@ -1007,6 +1016,30 @@ def _parse_bitmap(value: object) -> int:
     return _uint(parsed, maximum=2**256 - 1, reason="NONCE_BITMAP_INVALID")
 
 
+def _selected_nonce_fields(
+    observed_anchor: int,
+    observed_index: int,
+    observed_bitmap: int,
+    *,
+    allow_full_bitmap: bool,
+) -> tuple[int, int]:
+    """Resolve the official current cursor into the signed bitmap nonce."""
+
+    if observed_index == _FULL_NONCE_BITMAP_INDEX:
+        if not allow_full_bitmap:
+            raise OnboardingViolation("NONCE_BITMAP_INDEX_INVALID")
+        if observed_anchor >= _UINT48_MAX or (
+            observed_bitmap & _FULL_NONCE_BITMAP_MASK
+        ) != _FULL_NONCE_BITMAP_MASK:
+            raise OnboardingViolation("NONCE_BITMAP_FULL_INVALID")
+        return observed_anchor + 1, 0
+    if observed_index > _MAX_NONCE_BITMAP_INDEX:
+        raise OnboardingViolation("NONCE_BITMAP_INDEX_INVALID")
+    if observed_bitmap & (1 << observed_index):
+        raise OnboardingViolation("NONCE_BITMAP_INDEX_ALREADY_USED")
+    return observed_anchor, observed_index
+
+
 def _intent_mapping(intent: RegistrationIntent) -> dict[str, Any]:
     return {
         "environment": "MAINNET",
@@ -1017,6 +1050,7 @@ def _intent_mapping(intent: RegistrationIntent) -> dict[str, Any]:
         "observed_bitmap": str(intent.observed_bitmap),
         "observed_bitmap_index": intent.observed_bitmap_index,
         "observed_nonce_anchor": intent.observed_nonce_anchor,
+        "runtime_id": intent.runtime_id,
         "schema_version": _SCHEMA_VERSION,
         "session_signer_address": intent.session_signer_address,
         "state": REGISTRATION_PREPARED,
@@ -1047,6 +1081,7 @@ def _parse_intent(value: bytes, identity: ProvisionedIdentity) -> RegistrationIn
             "observed_bitmap",
             "observed_bitmap_index",
             "observed_nonce_anchor",
+            "runtime_id",
             "schema_version",
             "session_signer_address",
             "state",
@@ -1063,6 +1098,10 @@ def _parse_intent(value: bytes, identity: ProvisionedIdentity) -> RegistrationIn
             or type(data["intent_id"]) is not str
             or len(data["intent_id"]) != 32
             or any(character not in "0123456789abcdef" for character in data["intent_id"])
+            or type(data["runtime_id"]) is not str
+            or len(data["runtime_id"]) != 32
+            or any(character not in "0123456789abcdef" for character in data["runtime_id"])
+            or data["runtime_id"] == data["intent_id"]
         ):
             raise ValueError
         wallet = _normalize_address(data["wallet_address"])
@@ -1086,30 +1125,37 @@ def _parse_intent(value: bytes, identity: ProvisionedIdentity) -> RegistrationIn
         )
         observed_index = _uint(
             data["observed_bitmap_index"],
-            maximum=_MAX_NONCE_BITMAP_INDEX,
+            maximum=_FULL_NONCE_BITMAP_INDEX,
             reason="NONCE_BITMAP_INDEX_INVALID",
         )
         observed_bitmap = _parse_bitmap(data["observed_bitmap"])
-        anchor = _uint(
+        anchor, bitmap_index = _selected_nonce_fields(
+            observed_anchor,
+            observed_index,
+            observed_bitmap,
+            allow_full_bitmap=True,
+        )
+        stored_anchor = _uint(
             data["nonce_anchor"], maximum=_UINT48_MAX, reason="NONCE_ANCHOR_INVALID"
         )
-        bitmap_index = _uint(
+        stored_bitmap_index = _uint(
             data["nonce_bitmap_index"],
             maximum=_MAX_NONCE_BITMAP_INDEX,
             reason="NONCE_BITMAP_INDEX_INVALID",
         )
-        if anchor != observed_anchor or bitmap_index != observed_index:
+        if stored_anchor != anchor or stored_bitmap_index != bitmap_index:
             raise ValueError
         return RegistrationIntent(
             intent_id=data["intent_id"],
+            runtime_id=data["runtime_id"],
             wallet_address=wallet,
             session_signer_address=signer,
             expiration=expiration,
             observed_nonce_anchor=observed_anchor,
             observed_bitmap_index=observed_index,
             observed_bitmap=observed_bitmap,
-            nonce_anchor=anchor,
-            nonce_bitmap_index=bitmap_index,
+            nonce_anchor=stored_anchor,
+            nonce_bitmap_index=stored_bitmap_index,
         )
     except OnboardingViolation:
         raise OnboardingViolation("REGISTRATION_INTENT_INVALID") from None
@@ -1176,15 +1222,36 @@ def _new_intent_id() -> str:
     return value
 
 
+def _new_runtime_id() -> str:
+    """Create the durable run identity distinct from the write intent."""
+
+    try:
+        value = secrets.token_hex(16)
+    except Exception:
+        raise OnboardingViolation("REGISTRATION_RUNTIME_ID_FAILED") from None
+    if (
+        type(value) is not str
+        or len(value) != 32
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise OnboardingViolation("REGISTRATION_RUNTIME_ID_FAILED")
+    return value
+
+
 def prepare_registration_intent(
-    *, nonce_anchor: object, current_bitmap_index: object, bitmap: object
+    *,
+    nonce_anchor: object,
+    current_bitmap_index: object,
+    bitmap: object,
+    allow_full_bitmap: bool = False,
 ) -> RegistrationIntent:
     """Persist one offline register-signer intent from an observed nonce.
 
     ``nonce_anchor``/``current_bitmap_index``/``bitmap`` are the exact bounded
-    identity fields from the official nonce-state observation.  The signed
-    registration identity uses the exact observed anchor and bitmap index.  This
-    function performs no key loading, signing, network access, or dispatch.
+    identity fields from the official nonce-state observation.  A full cursor
+    resolves to the next anchor and bitmap bit zero only when the caller opts
+    into the validated rollover.  This function performs no key loading,
+    signing, network access, or dispatch.
     """
 
     observed_anchor = _uint(
@@ -1194,10 +1261,16 @@ def prepare_registration_intent(
     )
     observed_index = _uint(
         current_bitmap_index,
-        maximum=_MAX_NONCE_BITMAP_INDEX,
+        maximum=_FULL_NONCE_BITMAP_INDEX,
         reason="NONCE_BITMAP_INDEX_INVALID",
     )
     observed_bitmap = _parse_bitmap(bitmap)
+    selected_anchor, selected_index = _selected_nonce_fields(
+        observed_anchor,
+        observed_index,
+        observed_bitmap,
+        allow_full_bitmap=allow_full_bitmap,
+    )
     now = _now_unix()
     directory_fd, identity = _read_identity_and_open()
     try:
@@ -1216,16 +1289,21 @@ def prepare_registration_intent(
                 raise
         if not 0 < now < identity.expiration <= _UINT32_MAX:
             raise OnboardingViolation("EXPIRATION_INVALID")
+        intent_id = _new_intent_id()
+        runtime_id = _new_runtime_id()
+        if intent_id == runtime_id:
+            raise OnboardingViolation("REGISTRATION_IDENTITY_COLLISION")
         intent = RegistrationIntent(
-            intent_id=_new_intent_id(),
+            intent_id=intent_id,
+            runtime_id=runtime_id,
             wallet_address=identity.wallet_address,
             session_signer_address=identity.session_signer_address,
             expiration=identity.expiration,
             observed_nonce_anchor=observed_anchor,
             observed_bitmap_index=observed_index,
             observed_bitmap=observed_bitmap,
-            nonce_anchor=observed_anchor,
-            nonce_bitmap_index=observed_index,
+            nonce_anchor=selected_anchor,
+            nonce_bitmap_index=selected_index,
         )
         _create_secure_file(
             directory_fd,
