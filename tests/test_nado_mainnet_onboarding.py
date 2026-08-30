@@ -389,6 +389,77 @@ def test_existing_parent_symlink_is_rejected_before_hidden_input(
     assert called is False
 
 
+def test_provision_binds_to_opened_fd_after_parent_substitution(
+    tmp_path: Path, monkeypatch
+) -> None:
+    parent = tmp_path / "nado-parent"
+    directory = parent / "nado-mainnet-onboarding"
+    directory.mkdir(mode=0o700, parents=True)
+    os.chmod(directory, 0o700)
+    monkeypatch.setattr(onboarding, "PROTECTED_DIRECTORY", directory)
+
+    original_inspect = onboarding._inspect_protected_files_fd
+    substituted = False
+
+    def inspect_and_substitute(directory_fd: int) -> onboarding.ProtectedFiles:
+        nonlocal substituted
+        files = original_inspect(directory_fd)
+        if not substituted:
+            moved_parent = tmp_path / "nado-parent-original"
+            parent.rename(moved_parent)
+            parent.mkdir(mode=0o700)
+            replacement = parent / "nado-mainnet-onboarding"
+            replacement.mkdir(mode=0o700)
+            os.chmod(replacement, 0o700)
+            substituted = True
+        return files
+
+    monkeypatch.setattr(
+        onboarding,
+        "_inspect_protected_files_fd",
+        inspect_and_substitute,
+    )
+    result = onboarding.provision_nado_mainnet_credential(
+        lambda prompt: MAIN_KEY if "main wallet" in prompt else LINKED_KEY
+    )
+
+    original_directory = tmp_path / "nado-parent-original" / "nado-mainnet-onboarding"
+    replacement_directory = parent / "nado-mainnet-onboarding"
+    assert result.status == onboarding.PROVISIONED
+    assert substituted is True
+    assert (original_directory / onboarding.CREDENTIAL_FILENAME).is_file()
+    assert (original_directory / onboarding.IDENTITY_FILENAME).is_file()
+    assert not (replacement_directory / onboarding.CREDENTIAL_FILENAME).exists()
+    assert not (replacement_directory / onboarding.IDENTITY_FILENAME).exists()
+
+
+def test_missing_components_are_created_relative_to_trusted_directory_fds(
+    tmp_path: Path, monkeypatch
+) -> None:
+    directory = _set_directory(tmp_path / "missing-parent", monkeypatch)
+    real_mkdir = onboarding.os.mkdir
+    calls: list[tuple[object, int | None]] = []
+
+    def relative_mkdir(path: object, mode: int, *, dir_fd: int | None = None) -> None:
+        calls.append((path, dir_fd))
+        assert dir_fd is not None
+        assert isinstance(path, str)
+        assert not os.path.isabs(path)
+        real_mkdir(path, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(onboarding.os, "mkdir", relative_mkdir)
+    values = iter((MAIN_KEY, LINKED_KEY))
+    result = onboarding.provision_nado_mainnet_credential(
+        lambda _prompt: next(values)
+    )
+
+    assert result.status == onboarding.PROVISIONED
+    assert calls
+    assert all(dir_fd is not None for _path, dir_fd in calls)
+    assert all(isinstance(path, str) and not os.path.isabs(path) for path, _dir_fd in calls)
+    assert directory.is_dir()
+
+
 def test_relative_and_foreign_directory_paths_fail_closed(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(onboarding, "PROTECTED_DIRECTORY", Path("relative-onboarding"))
     inspected = onboarding.inspect_protected_files()
@@ -456,9 +527,9 @@ def test_file_owner_is_checked_independently_of_directory_owner(
     foreign_uid = current_uid + 100000
     real_lstat = onboarding.os.lstat
 
-    def foreign_file_lstat(path: Path):
-        info = real_lstat(path)
-        if Path(path) == paths["credential"]:
+    def foreign_file_lstat(path: object, *args: object, **kwargs: object):
+        info = real_lstat(path, *args, **kwargs)
+        if path == onboarding.CREDENTIAL_FILENAME:
             return SimpleNamespace(
                 st_mode=info.st_mode,
                 st_nlink=info.st_nlink,

@@ -239,61 +239,199 @@ def _files_evidence(files: ProtectedFiles) -> list[dict[str, object]]:
     ]
 
 
-def _directory_state(directory: Path) -> tuple[bool, str]:
-    if not directory.is_absolute():
-        return False, "PROTECTED_DIRECTORY_NOT_ABSOLUTE"
+def _raise_violation(reason: str) -> None:
+    raise OnboardingViolation(reason)
+
+
+def _protected_directory_parts() -> tuple[str, ...]:
+    directory = PROTECTED_DIRECTORY
+    if not isinstance(directory, Path) or not directory.is_absolute():
+        _raise_violation("PROTECTED_DIRECTORY_NOT_ABSOLUTE")
     parts = directory.parts
-    if any(part in {"", ".", ".."} for part in parts[1:]):
-        return False, "PROTECTED_DIRECTORY_NOT_CANONICAL"
-    current = Path(parts[0])
-    info = None
-    if len(parts) == 1:
+    if len(parts) < 2 or any(part in {"", ".", ".."} for part in parts[1:]):
+        _raise_violation("PROTECTED_DIRECTORY_NOT_CANONICAL")
+    return parts[1:]
+
+
+def _directory_files_for_reason(reason: str) -> ProtectedFiles:
+    if not reason.startswith("PROTECTED_DIRECTORY_"):
+        reason = "PROTECTED_DIRECTORY_UNAVAILABLE"
+    paths = protected_paths()
+    return ProtectedFiles(
+        identity=ProtectedFileState(
+            kind="identity",
+            path=str(paths["identity"]),
+            present=False,
+            protected=False,
+            reason=reason,
+        ),
+        credential=ProtectedFileState(
+            kind="credential",
+            path=str(paths["credential"]),
+            present=False,
+            protected=False,
+            reason=reason,
+        ),
+    )
+
+
+def _directory_child_failure(
+    parent_fd: int,
+    component: str,
+    *,
+    missing_reason: str,
+) -> None:
+    try:
+        info = os.lstat(component, dir_fd=parent_fd)
+    except FileNotFoundError:
+        _raise_violation(missing_reason)
+    except OSError:
+        _raise_violation("PROTECTED_DIRECTORY_UNAVAILABLE")
+    if stat.S_ISLNK(info.st_mode):
+        _raise_violation("PROTECTED_DIRECTORY_SYMLINK")
+    if not stat.S_ISDIR(info.st_mode):
+        _raise_violation("PROTECTED_DIRECTORY_NOT_DIRECTORY")
+    _raise_violation("PROTECTED_DIRECTORY_UNAVAILABLE")
+
+
+def _open_directory_child(
+    parent_fd: int,
+    component: str,
+    flags: int,
+    *,
+    create: bool,
+) -> tuple[int, os.stat_result]:
+    created = False
+    try:
+        child_fd = os.open(component, flags, dir_fd=parent_fd)
+    except FileNotFoundError:
+        if not create:
+            _raise_violation("PROTECTED_DIRECTORY_MISSING")
         try:
-            info = os.lstat(current)
-        except FileNotFoundError:
-            return False, "PROTECTED_DIRECTORY_MISSING"
+            os.mkdir(
+                component,
+                PROTECTED_DIRECTORY_MODE,
+                dir_fd=parent_fd,
+            )
+        except FileExistsError:
+            pass
         except OSError:
-            return False, "PROTECTED_DIRECTORY_UNREADABLE"
-        if stat.S_ISLNK(info.st_mode):
-            return False, "PROTECTED_DIRECTORY_SYMLINK"
-        if not stat.S_ISDIR(info.st_mode):
-            return False, "PROTECTED_DIRECTORY_NOT_DIRECTORY"
-    for part in parts[1:]:
-        current /= part
+            _raise_violation("PROTECTED_DIRECTORY_UNAVAILABLE")
+        else:
+            created = True
         try:
-            info = os.lstat(current)
+            child_fd = os.open(component, flags, dir_fd=parent_fd)
         except FileNotFoundError:
-            return False, "PROTECTED_DIRECTORY_MISSING"
+            _raise_violation("PROTECTED_DIRECTORY_UNAVAILABLE")
         except OSError:
-            return False, "PROTECTED_DIRECTORY_UNREADABLE"
-        if stat.S_ISLNK(info.st_mode):
-            return False, "PROTECTED_DIRECTORY_SYMLINK"
+            _directory_child_failure(
+                parent_fd,
+                component,
+                missing_reason="PROTECTED_DIRECTORY_UNAVAILABLE",
+            )
+    except OSError:
+        _directory_child_failure(
+            parent_fd,
+            component,
+            missing_reason="PROTECTED_DIRECTORY_MISSING",
+        )
+
+    try:
+        info = os.fstat(child_fd)
         if not stat.S_ISDIR(info.st_mode):
-            return False, "PROTECTED_DIRECTORY_NOT_DIRECTORY"
-    assert info is not None
-    if info.st_uid != os.getuid():
-        return False, "PROTECTED_DIRECTORY_OWNER_NOT_CURRENT_USER"
-    if stat.S_IMODE(info.st_mode) != PROTECTED_DIRECTORY_MODE:
-        return False, "PROTECTED_DIRECTORY_MODE_NOT_0700"
-    return True, "PROTECTED_DIRECTORY_OK"
+            _raise_violation("PROTECTED_DIRECTORY_NOT_DIRECTORY")
+        if created:
+            try:
+                os.fchmod(child_fd, PROTECTED_DIRECTORY_MODE)
+                info = os.fstat(child_fd)
+            except OSError:
+                _raise_violation("PROTECTED_DIRECTORY_UNAVAILABLE")
+        return child_fd, info
+    except BaseException:
+        try:
+            os.close(child_fd)
+        except OSError:
+            pass
+        raise
+
+
+def _open_fixed_directory(*, create: bool = True) -> int | None:
+    """Open the fixed directory through trusted descriptors only."""
+
+    parts = _protected_directory_parts()
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
+    try:
+        descriptor = os.open(os.sep, flags)
+        for index, component in enumerate(parts):
+            next_descriptor = -1
+            try:
+                next_descriptor, info = _open_directory_child(
+                    descriptor,
+                    component,
+                    flags,
+                    create=create,
+                )
+                if index == len(parts) - 1:
+                    if info.st_uid != os.getuid():
+                        _raise_violation(
+                            "PROTECTED_DIRECTORY_OWNER_NOT_CURRENT_USER"
+                        )
+                    if stat.S_IMODE(info.st_mode) != PROTECTED_DIRECTORY_MODE:
+                        _raise_violation("PROTECTED_DIRECTORY_MODE_NOT_0700")
+                previous_descriptor = descriptor
+                descriptor = next_descriptor
+                next_descriptor = -1
+                try:
+                    os.close(previous_descriptor)
+                except OSError:
+                    pass
+            finally:
+                if next_descriptor >= 0:
+                    try:
+                        os.close(next_descriptor)
+                    except OSError:
+                        pass
+        return descriptor
+    except OnboardingViolation as exc:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        if not create and str(exc) == "PROTECTED_DIRECTORY_MISSING":
+            return None
+        raise
+    except OSError:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        _raise_violation("PROTECTED_DIRECTORY_UNAVAILABLE")
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise
 
 
 def _file_state(
     kind: str,
     path: Path,
-    directory_ok: bool,
-    directory_reason: str,
+    directory_fd: int | None,
+    directory_reason: str | None = None,
 ) -> ProtectedFileState:
-    if not directory_ok:
+    if directory_fd is None:
         return ProtectedFileState(
             kind=kind,
             path=str(path),
             present=False,
             protected=False,
-            reason=directory_reason,
+            reason=directory_reason or "PROTECTED_DIRECTORY_MISSING",
         )
     try:
-        info = os.lstat(path)
+        info = os.lstat(path.name, dir_fd=directory_fd)
     except FileNotFoundError:
         return ProtectedFileState(
             kind=kind,
@@ -344,136 +482,32 @@ def _file_state(
     )
 
 
-def inspect_protected_files() -> ProtectedFiles:
-    """Inspect only metadata; never read credential or identity contents."""
-
+def _inspect_protected_files_fd(directory_fd: int) -> ProtectedFiles:
     paths = protected_paths()
-    directory_ok, directory_reason = _directory_state(PROTECTED_DIRECTORY)
     return ProtectedFiles(
-        identity=_file_state(
-            "identity", paths["identity"], directory_ok, directory_reason
-        ),
-        credential=_file_state(
-            "credential", paths["credential"], directory_ok, directory_reason
-        ),
+        identity=_file_state("identity", paths["identity"], directory_fd),
+        credential=_file_state("credential", paths["credential"], directory_fd),
     )
 
 
-def _raise_violation(reason: str) -> None:
-    raise OnboardingViolation(reason)
+def inspect_protected_files() -> ProtectedFiles:
+    """Inspect only metadata through one exact directory descriptor."""
 
-
-def _ensure_fixed_directory() -> None:
-    directory = PROTECTED_DIRECTORY
-    if not directory.is_absolute():
-        _raise_violation("PROTECTED_DIRECTORY_NOT_ABSOLUTE")
-    if any(part in {"", ".", ".."} for part in directory.parts[1:]):
-        _raise_violation("PROTECTED_DIRECTORY_NOT_CANONICAL")
-
-    missing: list[Path] = []
-    current = directory
-    while True:
-        try:
-            info = os.lstat(current)
-        except FileNotFoundError:
-            missing.append(current)
-            if current.parent == current:
-                _raise_violation("PROTECTED_DIRECTORY_PARENT_MISSING")
-            current = current.parent
-            continue
-        except OSError:
-            _raise_violation("PROTECTED_DIRECTORY_UNREADABLE")
-        if stat.S_ISLNK(info.st_mode):
-            _raise_violation("PROTECTED_DIRECTORY_SYMLINK")
-        if not stat.S_ISDIR(info.st_mode):
-            _raise_violation("PROTECTED_DIRECTORY_NOT_DIRECTORY")
-        if info.st_uid != os.getuid():
-            _raise_violation("PROTECTED_DIRECTORY_OWNER_NOT_CURRENT_USER")
-        break
-
-    for item in reversed(missing):
-        try:
-            os.mkdir(item, PROTECTED_DIRECTORY_MODE)
-        except FileExistsError:
-            pass
-        except OSError:
-            _raise_violation("PROTECTED_DIRECTORY_UNAVAILABLE")
-        try:
-            info = os.lstat(item)
-        except OSError:
-            _raise_violation("PROTECTED_DIRECTORY_UNREADABLE")
-        if stat.S_ISLNK(info.st_mode):
-            _raise_violation("PROTECTED_DIRECTORY_SYMLINK")
-        if not stat.S_ISDIR(info.st_mode):
-            _raise_violation("PROTECTED_DIRECTORY_NOT_DIRECTORY")
-        if info.st_uid != os.getuid():
-            _raise_violation("PROTECTED_DIRECTORY_OWNER_NOT_CURRENT_USER")
-        if stat.S_IMODE(info.st_mode) != PROTECTED_DIRECTORY_MODE:
-            _raise_violation("PROTECTED_DIRECTORY_MODE_NOT_0700")
-
-    directory_ok, reason = _directory_state(directory)
-    if not directory_ok:
-        _raise_violation(reason)
-
-
-def _open_fixed_directory() -> int:
-    _ensure_fixed_directory()
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    descriptor = -1
     try:
-        descriptor = os.open(os.sep, flags)
+        directory_fd = _open_fixed_directory(create=False)
+    except OnboardingViolation as exc:
+        return _directory_files_for_reason(str(exc))
     except OSError:
-        _raise_violation("PROTECTED_DIRECTORY_UNAVAILABLE")
+        return _directory_files_for_reason("PROTECTED_DIRECTORY_UNAVAILABLE")
+    if directory_fd is None:
+        return _directory_files_for_reason("PROTECTED_DIRECTORY_MISSING")
     try:
-        parts = PROTECTED_DIRECTORY.parts
-        for index, part in enumerate(parts[1:], start=1):
-            next_descriptor = -1
-            try:
-                try:
-                    next_descriptor = os.open(
-                        part,
-                        flags,
-                        dir_fd=descriptor,
-                    )
-                except OSError:
-                    try:
-                        info = os.lstat(part, dir_fd=descriptor)
-                    except OSError:
-                        _raise_violation("PROTECTED_DIRECTORY_UNAVAILABLE")
-                    if stat.S_ISLNK(info.st_mode):
-                        _raise_violation("PROTECTED_DIRECTORY_SYMLINK")
-                    _raise_violation("PROTECTED_DIRECTORY_UNAVAILABLE")
-                info = os.fstat(next_descriptor)
-                if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-                    _raise_violation("PROTECTED_DIRECTORY_NOT_DIRECTORY")
-                if index == len(parts) - 1:
-                    if info.st_uid != os.getuid():
-                        _raise_violation(
-                            "PROTECTED_DIRECTORY_OWNER_NOT_CURRENT_USER"
-                        )
-                    if stat.S_IMODE(info.st_mode) != PROTECTED_DIRECTORY_MODE:
-                        _raise_violation("PROTECTED_DIRECTORY_MODE_NOT_0700")
-                previous_descriptor = descriptor
-                descriptor = next_descriptor
-                next_descriptor = -1
-                try:
-                    os.close(previous_descriptor)
-                except OSError:
-                    pass
-            finally:
-                if next_descriptor >= 0:
-                    try:
-                        os.close(next_descriptor)
-                    except OSError:
-                        pass
-        return descriptor
-    except BaseException:
+        return _inspect_protected_files_fd(directory_fd)
+    finally:
         try:
-            os.close(descriptor)
+            os.close(directory_fd)
         except OSError:
             pass
-        raise
 
 
 def _wipe(payload: bytearray | None) -> None:
@@ -819,119 +853,132 @@ def provision_nado_mainnet_credential(
     """
 
     input_fn = getpass.getpass if input_fn is None else input_fn
+    directory_fd: int | None = None
+    main_key: bytearray | None = None
+    linked_key: bytearray | None = None
+    metadata_payload: bytearray | None = None
     try:
         _subaccount_name(subaccount_name)
-        before = inspect_protected_files()
-        directory_ok, directory_reason = _directory_state(PROTECTED_DIRECTORY)
-        if not directory_ok and directory_reason != "PROTECTED_DIRECTORY_MISSING":
-            return _blocked(directory_reason)
-        if before.any_present:
-            return _blocked("PROTECTED_PATH_ALREADY_EXISTS")
+        try:
+            directory_fd = _open_fixed_directory(create=False)
+        except OnboardingViolation as exc:
+            if str(exc) != "PROTECTED_DIRECTORY_MISSING":
+                return _blocked(str(exc))
+        if directory_fd is not None:
+            before = _inspect_protected_files_fd(directory_fd)
+            if before.any_present:
+                return OnboardingResult(
+                    status=BLOCKED,
+                    reason="PROTECTED_PATH_ALREADY_EXISTS",
+                    files=before,
+                )
 
         main_key = _private_key_bytes(
             _prompt(input_fn, "Nado main wallet private key (hidden): "),
             "main_wallet_key",
         )
-        linked_key: bytearray | None = None
-        metadata_payload: bytearray | None = None
-        try:
-            assert main_key is not None
-            wallet_address = _derive_wallet_address(main_key)
-            identity = _identity_from_parts(
-                wallet_address,
-                subaccount_name,
-                expected_wallet_address=expected_wallet_address,
-                expected_subaccount=expected_subaccount,
-            )
-            linked_key = _private_key_bytes(
-                _prompt(
-                    input_fn,
-                    "Nado linked signer private key (hidden; blank only with official fallback proof): ",
-                ),
-                "linked_signer_key",
-                optional=True,
-            )
-            if linked_key is not None:
-                credential_kind = LINKED_SIGNER_CREDENTIAL
-                credential_address = _derive_wallet_address(linked_key)
-                if credential_address == identity.wallet_address:
-                    _raise_violation("MAIN_AND_LINKED_IDENTITY_CONFLICT")
-                if expected_linked_signer_address is not None:
-                    expected_linked = _address(
-                        expected_linked_signer_address,
-                        "expected_linked_signer_address",
-                    )
-                    if credential_address != expected_linked:
-                        _raise_violation("LINKED_SIGNER_IDENTITY_CONFLICT")
-            else:
-                _validate_fallback_proof(fallback_proof)
-                credential_kind = MAIN_WALLET_FALLBACK_CREDENTIAL
-                credential_address = identity.wallet_address
-                if expected_linked_signer_address is not None:
-                    _raise_violation("LINKED_SIGNER_IDENTITY_CONFLICT")
-
-            credential_payload = (
-                linked_key if linked_key is not None else main_key
-            )
-            credential_fingerprint = hashlib.sha256(credential_payload).hexdigest()
-            metadata_payload = _metadata_payload(
-                identity,
-                credential_kind,
-                credential_address,
-                credential_fingerprint,
-            )
-
-            after_input = inspect_protected_files()
-            if after_input.any_present:
-                return OnboardingResult(
-                    status=BLOCKED,
-                    reason="PROTECTED_PATH_ALREADY_EXISTS",
-                    files=after_input,
+        assert main_key is not None
+        wallet_address = _derive_wallet_address(main_key)
+        identity = _identity_from_parts(
+            wallet_address,
+            subaccount_name,
+            expected_wallet_address=expected_wallet_address,
+            expected_subaccount=expected_subaccount,
+        )
+        linked_key = _private_key_bytes(
+            _prompt(
+                input_fn,
+                "Nado linked signer private key (hidden; blank only with official fallback proof): ",
+            ),
+            "linked_signer_key",
+            optional=True,
+        )
+        if linked_key is not None:
+            credential_kind = LINKED_SIGNER_CREDENTIAL
+            credential_address = _derive_wallet_address(linked_key)
+            if credential_address == identity.wallet_address:
+                _raise_violation("MAIN_AND_LINKED_IDENTITY_CONFLICT")
+            if expected_linked_signer_address is not None:
+                expected_linked = _address(
+                    expected_linked_signer_address,
+                    "expected_linked_signer_address",
                 )
-            directory_fd = _open_fixed_directory()
-            created: list[str] = []
-            try:
-                _write_new_file(directory_fd, CREDENTIAL_FILENAME, credential_payload)
-                created.append(CREDENTIAL_FILENAME)
-                _write_new_file(directory_fd, IDENTITY_FILENAME, metadata_payload)
-                created.append(IDENTITY_FILENAME)
-                os.fsync(directory_fd)
-            except OnboardingViolation as exc:
-                if not _rollback_created(directory_fd, created):
-                    raise OnboardingViolation("PROTECTED_ROLLBACK_INCOMPLETE") from None
-                raise exc
-            except OSError:
-                if not _rollback_created(directory_fd, created):
-                    raise OnboardingViolation("PROTECTED_ROLLBACK_INCOMPLETE") from None
-                _raise_violation("PROTECTED_FILESYSTEM_OPERATION_FAILED")
-            except BaseException:
-                if not _rollback_created(directory_fd, created):
-                    raise OnboardingViolation("PROTECTED_ROLLBACK_INCOMPLETE") from None
-                raise OnboardingViolation("PROTECTED_ONBOARDING_FAILED") from None
-            finally:
-                try:
-                    os.close(directory_fd)
-                except OSError:
-                    pass
+                if credential_address != expected_linked:
+                    _raise_violation("LINKED_SIGNER_IDENTITY_CONFLICT")
+        else:
+            _validate_fallback_proof(fallback_proof)
+            credential_kind = MAIN_WALLET_FALLBACK_CREDENTIAL
+            credential_address = identity.wallet_address
+            if expected_linked_signer_address is not None:
+                _raise_violation("LINKED_SIGNER_IDENTITY_CONFLICT")
+
+        credential_payload = linked_key if linked_key is not None else main_key
+        credential_fingerprint = hashlib.sha256(credential_payload).hexdigest()
+        metadata_payload = _metadata_payload(
+            identity,
+            credential_kind,
+            credential_address,
+            credential_fingerprint,
+        )
+
+        if directory_fd is None:
+            directory_fd = _open_fixed_directory(create=True)
+            if directory_fd is None:
+                _raise_violation("PROTECTED_DIRECTORY_UNAVAILABLE")
+        after_input = _inspect_protected_files_fd(directory_fd)
+        if after_input.any_present:
             return OnboardingResult(
-                status=PROVISIONED,
-                reason="PROTECTED_NADO_CREDENTIAL_CREATED",
-                files=inspect_protected_files(),
-                identity=identity,
-                credential_kind=credential_kind,
-                credential_address=credential_address,
-                credential_fingerprint=credential_fingerprint,
+                status=BLOCKED,
+                reason="PROTECTED_PATH_ALREADY_EXISTS",
+                files=after_input,
             )
-        finally:
-            _wipe(main_key)
-            _wipe(linked_key)
-            _wipe(metadata_payload)
+
+        created: list[str] = []
+        try:
+            _write_new_file(directory_fd, CREDENTIAL_FILENAME, credential_payload)
+            created.append(CREDENTIAL_FILENAME)
+            _write_new_file(directory_fd, IDENTITY_FILENAME, metadata_payload)
+            created.append(IDENTITY_FILENAME)
+            os.fsync(directory_fd)
+            final_files = _inspect_protected_files_fd(directory_fd)
+            if not final_files.all_protected:
+                _raise_violation("PROTECTED_FILE_METADATA_CHANGED")
+        except OnboardingViolation as exc:
+            if not _rollback_created(directory_fd, created):
+                raise OnboardingViolation("PROTECTED_ROLLBACK_INCOMPLETE") from None
+            raise exc
+        except OSError:
+            if not _rollback_created(directory_fd, created):
+                raise OnboardingViolation("PROTECTED_ROLLBACK_INCOMPLETE") from None
+            _raise_violation("PROTECTED_FILESYSTEM_OPERATION_FAILED")
+        except BaseException:
+            if not _rollback_created(directory_fd, created):
+                raise OnboardingViolation("PROTECTED_ROLLBACK_INCOMPLETE") from None
+            raise OnboardingViolation("PROTECTED_ONBOARDING_FAILED") from None
+        return OnboardingResult(
+            status=PROVISIONED,
+            reason="PROTECTED_NADO_CREDENTIAL_CREATED",
+            files=final_files,
+            identity=identity,
+            credential_kind=credential_kind,
+            credential_address=credential_address,
+            credential_fingerprint=credential_fingerprint,
+        )
     except OnboardingViolation as exc:
         return _blocked(str(exc))
     except OSError:
         return _blocked("PROTECTED_FILESYSTEM_OPERATION_FAILED")
     except BaseException:
         return _blocked("PROTECTED_ONBOARDING_FAILED")
+    finally:
+        _wipe(main_key)
+        _wipe(linked_key)
+        _wipe(metadata_payload)
+        if directory_fd is not None:
+            try:
+                os.close(directory_fd)
+            except OSError:
+                pass
 
 
 def _read_owned_file(
@@ -1079,8 +1126,9 @@ def _metadata_from_bytes(
     return identity, credential_kind, credential_address, fingerprint
 
 
-def _load_metadata() -> tuple[NadoPublicIdentity, str, str, str]:
-    directory_fd = _open_fixed_directory()
+def _load_metadata(
+    directory_fd: int,
+) -> tuple[NadoPublicIdentity, str, str, str]:
     raw: bytearray | None = None
     try:
         raw = _read_owned_file(
@@ -1091,26 +1139,37 @@ def _load_metadata() -> tuple[NadoPublicIdentity, str, str, str]:
         return _metadata_from_bytes(raw)
     finally:
         _wipe(raw)
+
+
+def discover_public_identity() -> NadoPublicIdentity:
+    """Load only the sanitized identity file for unsigned account reads."""
+
+    directory_fd = _open_fixed_directory(create=False)
+    if directory_fd is None:
+        _raise_violation("PROTECTED_DIRECTORY_MISSING")
+    try:
+        identity, _kind, _address_value, _fingerprint = _load_metadata(
+            directory_fd
+        )
+        return identity
+    finally:
         try:
             os.close(directory_fd)
         except OSError:
             pass
 
 
-def discover_public_identity() -> NadoPublicIdentity:
-    """Load only the sanitized identity file for unsigned account reads."""
-
-    identity, _kind, _address_value, _fingerprint = _load_metadata()
-    return identity
-
-
 def discover_protected_credential() -> CredentialDiscovery:
     """Validate restart persistence without returning secret bytes."""
 
-    identity, credential_kind, credential_address, fingerprint = _load_metadata()
-    directory_fd = _open_fixed_directory()
+    directory_fd = _open_fixed_directory(create=False)
+    if directory_fd is None:
+        _raise_violation("PROTECTED_DIRECTORY_MISSING")
     raw: bytearray | None = None
     try:
+        identity, credential_kind, credential_address, fingerprint = _load_metadata(
+            directory_fd
+        )
         raw = _read_owned_file(
             directory_fd,
             CREDENTIAL_FILENAME,
