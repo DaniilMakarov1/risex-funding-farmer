@@ -59,7 +59,7 @@ def _account_row(**overrides):
 def _balance(**overrides):
     value = {
         "accountId": gate.EXPECTED_ACCOUNT_ID,
-        "collateralName": "USDC",
+        "collateralName": "USD",
         "balance": "100",
         "equity": "100",
         "availableForTrade": "100",
@@ -358,6 +358,16 @@ def test_official_fixture_records_current_read_contract():
     assert value["write_methods_forbidden"] == ["POST", "PUT", "PATCH", "DELETE"]
 
 
+def test_balance_uses_observed_usd_denomination_and_rejects_usdc():
+    decoded = gate._decode_balance(_envelope(_balance(collateralName="USD")))
+    assert decoded["collateral_name"] == "USD"
+
+    with pytest.raises(gate.GateFailure) as error:
+        gate._decode_balance(_envelope(_balance(collateralName="USDC")))
+    assert error.value.reason == "COLLATERAL_ASSET_UNEXPECTED"
+    assert error.value.failure_class == "SAFETY"
+
+
 def test_production_run_directory_accepts_macos_directory_link_count(tmp_path):
     path = tmp_path / "extended-mainnet-private-read"
     path.mkdir(mode=gate.RUN_DIRECTORY_MODE)
@@ -379,6 +389,7 @@ async def test_ready_reads_exact_account_and_proves_flatness_without_write_surfa
     assert result.summary["balance"]["balance"] == "100"
     assert result.summary["balance"]["equity"] == "100"
     assert result.summary["balance"]["availableForTrade"] == "100"
+    assert result.summary["balance"]["collateral_name"] == "USD"
     assert result.summary["fees"]["rates"]["BTC-USD"]["taker"] == "0.00025"
     assert result.summary["funding"]["status"] == "AUTHORITATIVE_EMPTY_HISTORY"
     assert result.summary["funding"]["cash_total"] is None
@@ -593,6 +604,7 @@ async def test_documented_zero_balance_404_is_explicit_zero_not_missing_data(tmp
     result, _, _ = await _run(tmp_path, transport=transport, invocation_id="zero-404-run")
     assert result.ready
     assert result.summary["balance"]["balance_source"] == "OFFICIAL_404_ZERO_BALANCE"
+    assert result.summary["balance"]["collateral_name"] == "USD"
     assert result.summary["balance"]["equity"] == "0"
     assert result.summary["spot_balances"]["count"] == 0
 

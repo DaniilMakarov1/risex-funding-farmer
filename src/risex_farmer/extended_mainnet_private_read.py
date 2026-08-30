@@ -70,6 +70,10 @@ POSITIONS_PATH = "/user/positions"
 POSITION_HISTORY_PATH = "/user/positions/history"
 FUNDING_HISTORY_PATH = "/user/funding/history"
 FEE_MARKET = "BTC-USD"
+# Extended's live mainnet balance contract uses the denomination ``USD``.
+# The spot-balance endpoint separately identifies its collateral asset as
+# ``USDC``; keep those two venue fields distinct.
+BALANCE_COLLATERAL_NAME = "USD"
 
 EXPECTED_ACCOUNT_ID = 303919
 EXPECTED_ACCOUNT_INDEX = 0
@@ -1217,9 +1221,9 @@ def _decode_balance_data(data: Any, *, stream: bool = False) -> dict[str, Any]:
     required = {"collateralName", *_BALANCE_DECIMAL_FIELDS, "updatedTime"}
     if not required.issubset(data):
         raise GateFailure("BALANCE_FIELDS_MISSING", "SCHEMA")
-    if data["collateralName"] != "USDC":
+    if data["collateralName"] != BALANCE_COLLATERAL_NAME:
         raise GateFailure("COLLATERAL_ASSET_UNEXPECTED", "SAFETY")
-    result: dict[str, Any] = {"collateral_name": "USDC"}
+    result: dict[str, Any] = {"collateral_name": BALANCE_COLLATERAL_NAME}
     for field in _BALANCE_DECIMAL_FIELDS:
         value = _decimal(data[field], field)
         if field in {
@@ -1249,7 +1253,7 @@ def _zero_balance(observed_at_ms: int) -> dict[str, Any]:
         raise GateFailure("CLOCK_INVALID", "SAFETY")
     data = {
         "accountId": EXPECTED_ACCOUNT_ID,
-        "collateralName": "USDC",
+        "collateralName": BALANCE_COLLATERAL_NAME,
         **{field: "0" for field in _BALANCE_DECIMAL_FIELDS},
         "updatedTime": observed_at_ms,
     }
