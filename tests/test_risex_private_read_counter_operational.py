@@ -475,6 +475,8 @@ async def test_fixed_transport_disconnect_does_not_repeat_physical_get(monkeypat
         def __init__(self, method, url, **kwargs):
             self.method = method
             self.url = url
+            # aiohttp 3.14 cleans up this request attribute on send errors.
+            self._body = None
             self._traces = kwargs["traces"]
 
         async def send(self, _connection):
