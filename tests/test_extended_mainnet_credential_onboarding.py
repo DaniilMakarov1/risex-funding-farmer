@@ -187,7 +187,10 @@ def test_malformed_or_missing_inputs_fail_closed(tmp_path, monkeypatch, field, v
     assert result.status == onboarding.BLOCKED
     assert result.reason == reason
     assert not directory.exists()
-    assert value not in result.evidence() if value else True
+    sanitized = json.loads(result.evidence())
+    assert sanitized["status"] == onboarding.BLOCKED
+    assert sanitized["reason"] == reason
+    assert sanitized["write_ready"] is False
 
 
 def test_read_only_provision_does_not_enter_future_stark_phase(tmp_path, monkeypatch):
