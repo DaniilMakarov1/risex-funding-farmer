@@ -27,6 +27,7 @@ from .models import (
     FundingCashQuote,
     FundingSettlement,
     LifecycleState,
+    LiquidityRole,
     MakerFillProvenance,
     SettlementStatus,
     Side,
@@ -778,6 +779,12 @@ class PaperRepository:
         order: PaperEntryOrder,
         state: LifecycleState,
     ) -> None:
+        lighter = position.route_key.hedge_venue is Venue.LIGHTER
+        risex_entry_fill = (
+            position.maker_fill
+            if position.maker_fill.venue is Venue.RISEX
+            else position.taker_fill
+        )
         self.connection.execute(
             """INSERT INTO positions VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
                ON CONFLICT(position_id) DO UPDATE SET lifecycle_state=excluded.lifecycle_state,
@@ -790,20 +797,20 @@ class PaperRepository:
                 _iso(position.position_opened_at),
                 _decimal(order.route_plan.planned_execution_pnl_usd),
                 _decimal(order.route_plan.planned_maker_net_pnl_usd),
-                str(position.risex_taker_fill.fee.fill_notional_usd),
+                str(risex_entry_fill.fee.fill_notional_usd),
                 _dump(position),
             ),
         )
         self._save_fill(
             f"{position.position_id}:hedge-entry",
             position.position_id,
-            "HEDGE_ENTRY",
+            "MAKER_ENTRY" if lighter else "HEDGE_ENTRY",
             position.hedge_maker_fill,
         )
         self._save_fill(
             f"{position.position_id}:risex-entry",
             position.position_id,
-            "RISEX_ENTRY",
+            "TAKER_ENTRY" if lighter else "RISEX_ENTRY",
             position.risex_taker_fill,
         )
         for quote in position.recomputed_funding_quotes:
@@ -1128,16 +1135,30 @@ class PaperRepository:
             )
 
     def _save_closed(self, closed: ClosedTrade) -> None:
+        lighter = closed.hedge_exit_fill.venue is Venue.LIGHTER
+        lighter_hedge_leg = (
+            "TAKER_EXIT"
+            if lighter
+            else "HEDGE_EXIT"
+        )
+        lighter_risex_leg = (
+            "MAKER_EXIT"
+            if lighter
+            and closed.risex_exit_fill.fee.liquidity_role is LiquidityRole.MAKER
+            else "TAKER_EXIT"
+            if lighter
+            else "RISEX_EXIT"
+        )
         self._save_fill(
             f"{closed.position_id}:hedge-exit",
             closed.position_id,
-            "HEDGE_EXIT",
+            lighter_hedge_leg,
             closed.hedge_exit_fill,
         )
         self._save_fill(
             f"{closed.position_id}:risex-exit",
             closed.position_id,
-            "RISEX_EXIT",
+            lighter_risex_leg,
             closed.risex_exit_fill,
         )
         self.connection.execute(

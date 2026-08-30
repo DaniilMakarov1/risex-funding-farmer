@@ -94,6 +94,18 @@ class BookStream:
                 max_timestamp=delta.sequence,
                 observed_at=delta.observed_at,
             )
+        if (
+            self.venue is Venue.LIGHTER
+            and delta.sequence is not None
+            and delta.previous_sequence is not None
+        ):
+            return self.lighter_delta(
+                delta.bids,
+                delta.asks,
+                previous_sequence=delta.previous_sequence,
+                sequence=delta.sequence,
+                observed_at=delta.observed_at,
+            )
         if self.venue is Venue.RISEX and delta.checksum is not None:
             return self.risex_update(
                 delta.bids,
@@ -103,6 +115,28 @@ class BookStream:
             )
         self.gap()
         return False
+
+    def lighter_delta(
+        self,
+        bids: Iterable[BookLevel],
+        asks: Iterable[BookLevel],
+        *,
+        previous_sequence: int,
+        sequence: int,
+        observed_at: datetime,
+    ) -> bool:
+        """Apply Lighter absolute levels only across the documented nonce chain."""
+        if (
+            not self.book_initialized
+            or self._sequence is None
+            or previous_sequence != self._sequence
+            or sequence <= previous_sequence
+        ):
+            self.gap()
+            return False
+        self._apply_absolute(bids, asks)
+        self._sequence = sequence
+        return self._finish_update(observed_at)
 
     def nado_delta(
         self,

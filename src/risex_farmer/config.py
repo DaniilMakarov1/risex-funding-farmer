@@ -34,6 +34,9 @@ class PaperConfig:
     extended_taker_fee_rate: Decimal = Decimal("0.00025")
     nado_maker_fee_rate: Decimal = Decimal("0.0001")
     nado_taker_fee_rate: Decimal = Decimal("0.00035")
+    # Lighter Standard account: official public fee schedule is fixed at zero.
+    lighter_maker_fee_rate: Decimal = Decimal("0")
+    lighter_taker_fee_rate: Decimal = Decimal("0")
     expected_basis_convergence_pnl_usd: Decimal = Decimal("0")
     points_value_usd: Decimal = Decimal("0")
     paper_entry_min_planned_net_pnl_usd: Decimal = Decimal("0")
@@ -96,6 +99,8 @@ EXTENDED_MAKER_FEE_RATE = PAPER_CONFIG.extended_maker_fee_rate
 EXTENDED_TAKER_FEE_RATE = PAPER_CONFIG.extended_taker_fee_rate
 NADO_MAKER_FEE_RATE = PAPER_CONFIG.nado_maker_fee_rate
 NADO_TAKER_FEE_RATE = PAPER_CONFIG.nado_taker_fee_rate
+LIGHTER_MAKER_FEE_RATE = PAPER_CONFIG.lighter_maker_fee_rate
+LIGHTER_TAKER_FEE_RATE = PAPER_CONFIG.lighter_taker_fee_rate
 EXPECTED_BASIS_CONVERGENCE_PNL_USD = PAPER_CONFIG.expected_basis_convergence_pnl_usd
 POINTS_VALUE_USD = PAPER_CONFIG.points_value_usd
 PAPER_ENTRY_MIN_PLANNED_NET_PNL_USD = PAPER_CONFIG.paper_entry_min_planned_net_pnl_usd

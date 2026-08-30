@@ -14,10 +14,11 @@ from typing import Any, Protocol, TypeVar
 import aiohttp
 
 from .config import PAPER_CONFIG, PaperConfig
-from .exchanges.base import PublicAdapter, PublicDataUnavailable
+from .exchanges.base import PublicAdapter, PublicDataUnavailable, require_mapping
 from .exchanges.extended import ExtendedAdapter
 from .exchanges.nado import NadoAdapter
 from .exchanges.risex import RisexAdapter
+from .exchanges.lighter import LighterAdapter
 from .lifecycle import LifecycleEngine, LifecycleEventType, LifecycleSnapshot
 from .market_data import BookStream, MarketDataCoordinator
 from .models import (
@@ -296,12 +297,97 @@ def _route_row(
         "risex_funding_usd": None if risex_funding is None else str(risex_funding),
         "hedge_funding_usd": None if hedge_funding is None else str(hedge_funding),
         "net_funding_usd": None if plan.expected_target_cycle_funding_usd is None else str(plan.expected_target_cycle_funding_usd),
-        "risex_entry_liquidity_role": "TAKER",
-        "risex_exact_q_entry_vwap_usd": None if plan.risex_entry_price is None else str(plan.risex_entry_price),
-        "risex_exact_q_exit_vwap_usd": None if plan.risex_exit_price is None else str(plan.risex_exit_price),
-        "hedge_entry_liquidity_role": "MAKER",
-        "hedge_maker_entry_price_usd": None if plan.hedge_entry_price is None else str(plan.hedge_entry_price),
-        "planned_hedge_exit_price_usd": None if plan.hedge_exit_price is None else str(plan.hedge_exit_price),
+        "risex_entry_liquidity_role": (
+            "MAKER" if plan.hedge_venue is Venue.LIGHTER else "TAKER"
+        ),
+        "risex_exact_q_entry_vwap_usd": (
+            None
+            if plan.risex_entry_price is None or plan.hedge_venue is Venue.LIGHTER
+            else str(plan.risex_entry_price)
+        ),
+        "risex_exact_q_exit_vwap_usd": (
+            None
+            if plan.risex_exit_price is None or plan.hedge_venue is Venue.LIGHTER
+            else str(plan.risex_exit_price)
+        ),
+        "risex_maker_entry_price_usd": (
+            None
+            if plan.risex_entry_price is None or plan.hedge_venue is not Venue.LIGHTER
+            else str(plan.risex_entry_price)
+        ),
+        "risex_maker_exit_price_usd": (
+            None
+            if plan.risex_exit_price is None or plan.hedge_venue is not Venue.LIGHTER
+            else str(plan.risex_exit_price)
+        ),
+        "hedge_entry_liquidity_role": (
+            "TAKER" if plan.hedge_venue is Venue.LIGHTER else "MAKER"
+        ),
+        "hedge_maker_entry_price_usd": (
+            None
+            if plan.hedge_entry_price is None or plan.hedge_venue is Venue.LIGHTER
+            else str(plan.hedge_entry_price)
+        ),
+        "hedge_taker_entry_vwap_usd": (
+            None
+            if plan.hedge_entry_price is None or plan.hedge_venue is not Venue.LIGHTER
+            else str(plan.hedge_entry_price)
+        ),
+        "planned_hedge_exit_price_usd": (
+            None if plan.hedge_exit_price is None else str(plan.hedge_exit_price)
+        ),
+        "hedge_maker_exit_price_usd": (
+            None
+            if plan.hedge_exit_price is None or plan.hedge_venue is Venue.LIGHTER
+            else str(plan.hedge_exit_price)
+        ),
+        "hedge_taker_exit_vwap_usd": (
+            None
+            if plan.hedge_exit_price is None or plan.hedge_venue is not Venue.LIGHTER
+            else str(plan.hedge_exit_price)
+        ),
+        "normal_exit_maker_price_usd": (
+            None
+            if (
+                plan.risex_exit_price
+                if plan.hedge_venue is Venue.LIGHTER
+                else plan.hedge_exit_price
+            ) is None
+            else str(
+                plan.risex_exit_price
+                if plan.hedge_venue is Venue.LIGHTER
+                else plan.hedge_exit_price
+            )
+        ),
+        "normal_exit_taker_price_usd": (
+            None
+            if (
+                plan.hedge_exit_price
+                if plan.hedge_venue is Venue.LIGHTER
+                else plan.risex_exit_price
+            ) is None
+            else str(
+                plan.hedge_exit_price
+                if plan.hedge_venue is Venue.LIGHTER
+                else plan.risex_exit_price
+            )
+        ),
+        "entry_maker_venue": (
+            Venue.RISEX.value if plan.hedge_venue is Venue.LIGHTER
+            else plan.hedge_venue.value
+        ),
+        "entry_taker_venue": (
+            plan.hedge_venue.value if plan.hedge_venue is Venue.LIGHTER
+            else Venue.RISEX.value
+        ),
+        "normal_exit_maker_venue": (
+            Venue.RISEX.value if plan.hedge_venue is Venue.LIGHTER
+            else plan.hedge_venue.value
+        ),
+        "normal_exit_taker_venue": (
+            plan.hedge_venue.value if plan.hedge_venue is Venue.LIGHTER
+            else Venue.RISEX.value
+        ),
         "entry_execution_pnl_usd": (
             None
             if plan.planned_entry_execution_pnl_usd is None
@@ -608,6 +694,7 @@ class PublicPaperRuntime:
                 Venue.RISEX: RisexAdapter(self._session),
                 Venue.EXTENDED: ExtendedAdapter(self._session),
                 Venue.NADO: NadoAdapter(self._session),
+                Venue.LIGHTER: LighterAdapter(self._session),
             }
         return self
 
@@ -1572,7 +1659,7 @@ class PublicPaperRuntime:
         hedge_assets = {
             asset
             for (venue, asset), market in by_venue_asset.items()
-            if venue in {Venue.EXTENDED, Venue.NADO}
+            if venue in {Venue.EXTENDED, Venue.NADO, Venue.LIGHTER}
             and market.market_type is MarketType.PERPETUAL
             and market.contract_type is ContractType.LINEAR
             and market.is_active
@@ -1595,7 +1682,7 @@ class PublicPaperRuntime:
                 else by_venue_asset[(venue, asset)]
             )
             for asset in selected
-            for venue in (Venue.RISEX, Venue.EXTENDED, Venue.NADO)
+            for venue in (Venue.RISEX, Venue.EXTENDED, Venue.NADO, Venue.LIGHTER)
             if (venue, asset) in by_venue_asset
         )
         if isinstance(runtime, LifecycleSnapshot):
@@ -2124,18 +2211,19 @@ class PublicPaperRuntime:
         }
 
     def _startup_catalog_gate_ready(self) -> bool:
-        if self.adapters is None or any(venue not in self.adapters for venue in Venue):
+        if self.adapters is None:
             return False
+        configured = tuple(self.adapters)
         return all(
             self.component_readiness.get(venue, {}).get("catalog") is not None
             and self.component_readiness[venue]["catalog"].available
-            for venue in Venue
+            for venue in configured
         )
 
     def _startup_stream_gate_ready(self) -> bool:
         if self._session is None or self.adapters is None or self._stop_event is None:
             return True
-        for venue in (Venue.RISEX, Venue.NADO):
+        for venue in (Venue.RISEX, Venue.NADO, Venue.LIGHTER):
             wanted = tuple(sorted(self._required_symbols(venue)))
             if wanted and (
                 self._combined_symbols.get(venue, ()) != wanted
@@ -2646,14 +2734,16 @@ class PublicPaperRuntime:
                     ),
                     None,
                 )
-                risex, _ = self._route_observations(order.route_plan, now)
+                risex, hedge = self._route_observations(order.route_plan, now)
                 async with self._paper_entry_lock:
                     if (
                         self.broker is not broker
                         or broker.state.lifecycle_state is not LifecycleState.ENTRY_MAKER_OPEN
                     ):
                         return
-                    await broker.refresh(refreshed, risex, evaluated_at=now)
+                    await broker.refresh(
+                        refreshed, risex, evaluated_at=now, hedge_observation=hedge
+                    )
                     self.repository.save_decision(
                         recorded_at=now, entry_state=broker.state
                     )
@@ -2905,6 +2995,7 @@ class PublicPaperRuntime:
             version = observed_version_id or order.active_version.version_id
             risex, hedge = self._route_observations(order.route_plan, at)
             risex_capture = self._execution_capture(risex, at)
+            hedge_capture = self._execution_capture(hedge, at)
             candidate = broker.detached()
             result = await candidate.process_trade(
                 trade,
@@ -2914,6 +3005,7 @@ class PublicPaperRuntime:
                 hedge_observation=hedge,
                 recompute_funding=self._recompute_funding,
                 risex_capture=risex_capture,
+                hedge_capture=hedge_capture,
             )
             async with self._paper_entry_lock:
                 if (
@@ -2926,7 +3018,7 @@ class PublicPaperRuntime:
                 ):
                     return
                 if result.fill_provenance and not self._captures_are_current(
-                    risex_capture
+                    risex_capture, hedge_capture
                 ):
                     return
                 lifecycle_candidate = (
@@ -2968,6 +3060,7 @@ class PublicPaperRuntime:
                 at,
             )
             risex_capture = self._execution_capture(risex, at)
+            hedge_capture = self._execution_capture(hedge, at)
             candidate = lifecycle.detached()
             result = await candidate.process_exit_trade(
                 trade,
@@ -2976,11 +3069,12 @@ class PublicPaperRuntime:
                 risex_observation=risex,
                 hedge_observation=hedge,
                 risex_capture=risex_capture,
+                hedge_capture=hedge_capture,
             )
             if result.detail == "STALE_EXIT_VERSION":
                 return
             if result.fill_provenance and not self._captures_are_current(
-                risex_capture
+                risex_capture, hedge_capture
             ):
                 return
             if self.lifecycle is not lifecycle or lifecycle.snapshot is not before:
@@ -3275,7 +3369,10 @@ class PublicPaperRuntime:
                         risex, hedge = self._route_observations(order.route_plan, now)
                         local = await scan_once((risex, hedge), now, config=self.config)
                         refreshed = local.evaluations[0] if local.evaluations else None
-                        await broker.refresh(refreshed, risex, evaluated_at=now)
+                        await broker.refresh(
+                            refreshed, risex, evaluated_at=now,
+                            hedge_observation=hedge,
+                        )
                         self.repository.save_decision(
                             recorded_at=now, entry_state=broker.state
                         )
@@ -4704,11 +4801,24 @@ class PublicPaperRuntime:
                         if not self._owns_stream_session(task_key, stream_session_id):
                             return
                         await ws.send_json(adapter.trades_subscription(ids))  # type: ignore[attr-defined]
-                    else:
+                    elif venue is Venue.NADO:
                         for symbol in symbols:
                             product = adapter.product_id(symbol)  # type: ignore[attr-defined]
                             for kind in ("book_depth", "trade", "funding_rate", "funding_payment"):
                                 await ws.send_json(adapter.subscription(kind, product))  # type: ignore[attr-defined]
+                                if not self._owns_stream_session(
+                                    task_key, stream_session_id
+                                ):
+                                    return
+                    else:
+                        if not isinstance(adapter, LighterAdapter):
+                            raise TypeError("Lighter stream requires LighterAdapter")
+                        for symbol in symbols:
+                            market_id = adapter.market_id(symbol)
+                            for kind in ("order_book", "trade", "market_stats"):
+                                await ws.send_json(
+                                    adapter.subscription(kind, market_id)
+                                )
                                 if not self._owns_stream_session(
                                     task_key, stream_session_id
                                 ):
@@ -4776,6 +4886,8 @@ class PublicPaperRuntime:
                                 )
                     delay = 1
                     ordinal = 0
+                    lighter_initial_books: set[str] = set()
+                    lighter_trade_sequences: dict[str, int] = {}
                     async for message in ws:
                         if not self._owns_stream_session(
                             task_key, stream_session_id
@@ -4808,15 +4920,34 @@ class PublicPaperRuntime:
                             for symbol in symbols:
                                 self.coordinator.stream(venue, symbol).connection_confirmed(self.clock.now())
                             continue
-                        if "orderbook" in kind or "book_depth" in kind:
+                        if "orderbook" in kind or "order_book" in kind or "book_depth" in kind:
                             received_at = self.clock.now()
-                            event = (
-                                adapter.normalize_book_message(
-                                    payload, received_at=received_at
+                            if isinstance(adapter, LighterAdapter):
+                                raw_market_id = payload.get("market_id")
+                                channel_market_key = str(
+                                    raw_market_id
+                                    if raw_market_id is not None
+                                    else adapter.market_id_from_channel(
+                                        payload.get("channel")
+                                    )
                                 )
-                                if isinstance(adapter, (NadoAdapter, RisexAdapter))
-                                else adapter.normalize_book_message(payload)
-                            )  # type: ignore[attr-defined]
+                                event = adapter.normalize_book_message(
+                                    payload,
+                                    received_at=received_at,
+                                    initial=channel_market_key not in lighter_initial_books,
+                                )
+                            else:
+                                event = (
+                                    adapter.normalize_book_message(
+                                        payload, received_at=received_at
+                                    )
+                                    if isinstance(adapter, (NadoAdapter, RisexAdapter))
+                                    else adapter.normalize_book_message(payload)
+                                )  # type: ignore[attr-defined]
+                            if isinstance(adapter, LighterAdapter) and isinstance(
+                                event, OrderBook
+                            ):
+                                lighter_initial_books.add(channel_market_key)
                             healthy = await self.apply_book_event(
                                 event, stream_session_id=stream_session_id
                             )
@@ -4855,14 +4986,41 @@ class PublicPaperRuntime:
                                 task_key, stream_session_id
                             ):
                                 return
-                            await self.deliver_trade(
-                                adapter.normalize_trade(
+                            if isinstance(adapter, LighterAdapter):
+                                sequence, trades = adapter.normalize_trade_message(
                                     payload,
                                     received_at=self.clock.now(),
                                     session_id=str(id(ws)),
-                                    ordinal=ordinal,
+                                    starting_ordinal=ordinal,
                                 )
-                            )
+                                ordinal += len(trades)
+                                raw_market_id = payload.get("market_id")
+                                trade_market_key = str(
+                                    raw_market_id
+                                    if raw_market_id is not None
+                                    else adapter.market_id_from_channel(
+                                        payload.get("channel")
+                                    )
+                                )
+                                previous_sequence = lighter_trade_sequences.get(
+                                    trade_market_key
+                                )
+                                if (
+                                    previous_sequence is None
+                                    or sequence > previous_sequence
+                                ):
+                                    lighter_trade_sequences[trade_market_key] = sequence
+                                    for trade in trades:
+                                        await self.deliver_trade(trade)
+                            else:
+                                await self.deliver_trade(
+                                    adapter.normalize_trade(
+                                        payload,
+                                        received_at=self.clock.now(),
+                                        session_id=str(id(ws)),
+                                        ordinal=ordinal,
+                                    )
+                                )
                             if not self._owns_stream_session(
                                 task_key, stream_session_id
                             ):
@@ -4927,6 +5085,41 @@ class PublicPaperRuntime:
                                             ),
                                         ),
                                     ),
+                                )
+                        elif venue is Venue.LIGHTER and "market_stats" in kind:
+                            if not isinstance(adapter, LighterAdapter):
+                                raise TypeError("Lighter market stats require LighterAdapter")
+                            stats = require_mapping(
+                                payload.get("market_stats"), "market_stats"
+                            )
+                            market_id = adapter._integer(
+                                stats.get("market_id"), "market_stats.market_id"
+                            )
+                            symbol = adapter.symbol_for_market(market_id)
+                            row = self.observations.get((venue, symbol))
+                            if row is not None:
+                                received_at = self.clock.now()
+                                quote = adapter.normalize_market_stats_message(
+                                    payload,
+                                    row.market,
+                                    received_at=received_at,
+                                    assumed_open_at=received_at,
+                                )
+                                if not self._owns_stream_session(
+                                    task_key, stream_session_id
+                                ):
+                                    return
+                                self.observations[(venue, symbol)] = replace(
+                                    row, funding=quote
+                                )
+                                known = quote.quality is not FundingQuality.UNKNOWN
+                                self._set_component_readiness(
+                                    venue,
+                                    f"funding:{symbol}",
+                                    known,
+                                    "PUBLIC_FUNDING_STATS_READY"
+                                    if known else "PUBLIC_FUNDING_STATS_UNUSABLE",
+                                    received_at,
                                 )
                     if self._stop_event is None or not self._stop_event.is_set():
                         raise _PublicSocketClosed("EOF")
@@ -4994,7 +5187,7 @@ class PublicPaperRuntime:
     async def _reconcile_combined_streams(self) -> None:
         if self._session is None or self.adapters is None or self._stop_event is None:
             return
-        for venue in (Venue.RISEX, Venue.NADO):
+        for venue in (Venue.RISEX, Venue.NADO, Venue.LIGHTER):
             adapter = self.adapters.get(venue)
             if adapter is None:
                 continue

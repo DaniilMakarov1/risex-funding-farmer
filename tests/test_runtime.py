@@ -647,7 +647,7 @@ def adapters(clock: FakeClock, *, settlement_at: datetime, risex=True, funding="
             available=risex if venue is Venue.RISEX else True,
             funding_cash=funding,
         )
-        for venue in Venue
+        for venue in (Venue.RISEX, Venue.EXTENDED, Venue.NADO)
     }
 
 
@@ -966,7 +966,7 @@ async def test_route_output_keeps_all_evaluated_routes_after_system_sort(tmp_pat
     clock = FakeClock()
     many = {
         venue: ManyFakeAdapter(venue, clock, settlement_at=NOW + timedelta(minutes=5))
-        for venue in Venue
+        for venue in (Venue.RISEX, Venue.EXTENDED, Venue.NADO)
     }
     with PaperRepository(tmp_path / "route-limit.db") as repository:
         result = await public_scan_once(repository, adapters=many, clock=clock)
@@ -2016,7 +2016,7 @@ async def test_public_observation_rest_fallback_is_bounded_per_venue(tmp_path):
 
     fakes = {
         venue: TrackedManyAdapter(venue, clock, settlement_at=target)
-        for venue in Venue
+        for venue in (Venue.RISEX, Venue.EXTENDED, Venue.NADO)
     }
     with PaperRepository(tmp_path / "bounded-rest-concurrency.db") as repository:
         async with PublicPaperRuntime(

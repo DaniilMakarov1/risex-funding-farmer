@@ -46,6 +46,13 @@ from .scanner import (
     RoutePlan,
     ScanSnapshot,
     activation_schedule,
+    entry_maker_market,
+    entry_maker_price,
+    entry_maker_side,
+    entry_taker_market,
+    entry_taker_price,
+    entry_taker_side,
+    is_lighter_route,
     trade_precedes_cutoff,
 )
 
@@ -68,6 +75,9 @@ class CancellationReason(StrEnum):
     DATA_STALE = "PAPER_ORDER_CANCELLED_DATA_STALE"
     RISEX_ENTRY_DEPTH_UNAVAILABLE = (
         "PAPER_ORDER_CANCELLED_RISEX_ENTRY_DEPTH_UNAVAILABLE"
+    )
+    LIGHTER_ENTRY_DEPTH_UNAVAILABLE = (
+        "PAPER_ORDER_CANCELLED_LIGHTER_ENTRY_DEPTH_UNAVAILABLE"
     )
     ROUTE_INVALID = "PAPER_ORDER_CANCELLED_ROUTE_INVALID"
     PLANNED_NET_NEGATIVE = "PAPER_ORDER_CANCELLED_PLANNED_NET_NEGATIVE"
@@ -152,6 +162,16 @@ class PaperPosition:
     executable_unwind_net_pnl_usd: Decimal | None
     entry_executable_basis: Decimal
 
+    @property
+    def maker_fill(self) -> Fill:
+        """The physical maker leg; legacy storage fields keep their names."""
+        return self.hedge_maker_fill
+
+    @property
+    def taker_fill(self) -> Fill:
+        """The physical taker leg; legacy storage fields keep their names."""
+        return self.risex_taker_fill
+
 
 @dataclass(frozen=True, slots=True)
 class PaperEntryState:
@@ -203,6 +223,8 @@ def _fee_rate(config: PaperConfig, venue: Venue, role: LiquidityRole) -> Decimal
         (Venue.EXTENDED, LiquidityRole.TAKER): config.extended_taker_fee_rate,
         (Venue.NADO, LiquidityRole.MAKER): config.nado_maker_fee_rate,
         (Venue.NADO, LiquidityRole.TAKER): config.nado_taker_fee_rate,
+        (Venue.LIGHTER, LiquidityRole.MAKER): config.lighter_maker_fee_rate,
+        (Venue.LIGHTER, LiquidityRole.TAKER): config.lighter_taker_fee_rate,
     }[(venue, role)]
 
 
@@ -211,6 +233,7 @@ def _fee_source(venue: Venue) -> str:
         Venue.RISEX: "SYSTEM_SPEC:RISEX_TIER3_CONFIG",
         Venue.EXTENDED: "SYSTEM_SPEC:EXTENDED_PUBLIC_FEE",
         Venue.NADO: "SYSTEM_SPEC:NADO_CONFIGURED_ASSUMPTION",
+        Venue.LIGHTER: "SYSTEM_SPEC:LIGHTER_STANDARD_ACCOUNT_ZERO_FEES",
     }[venue]
 
 
@@ -504,19 +527,22 @@ class PaperEntryBroker:
                 plan.route is None
                 or plan.target_cycle is None
                 or plan.canonical_quantity is None
-                or plan.hedge_entry_price is None
-                or plan.risex_entry_price is None
+                or entry_maker_price(plan) is None
+                or entry_taker_price(plan) is None
             ):
                 raise ValueError("winner is incomplete")
             schedule = activation_schedule(plan.target_cycle)
             if not schedule.should_activate(activated_at):
                 raise ValueError("winner is outside its activation window")
-            _, hedge_side = _entry_sides(plan.direction)
+            maker_market = entry_maker_market(plan)
+            maker_side = entry_maker_side(plan)
+            maker_limit_price = entry_maker_price(plan)
+            assert maker_limit_price is not None
             order_id = f"{attempt_id}:entry"
             version = PaperOrderVersion(
                 f"{order_id}:v1",
                 1,
-                plan.hedge_entry_price,
+                maker_limit_price,
                 activated_at,
                 activated_at,
                 Decimal("0"),
@@ -527,11 +553,11 @@ class PaperEntryBroker:
                 order_id,
                 route_key,
                 plan,
-                plan.hedge_venue,
-                plan.hedge_market.venue_symbol,
+                maker_market.venue,
+                maker_market.venue_symbol,
                 "LIMIT",
                 True,
-                hedge_side,
+                maker_side,
                 plan.canonical_quantity,
                 schedule.cutoff_at,
                 activated_at,
@@ -598,6 +624,7 @@ class PaperEntryBroker:
         risex_observation: MarketObservation,
         *,
         evaluated_at: datetime,
+        hedge_observation: MarketObservation | None = None,
     ) -> PaperEntryState:
         async with self._lock:
             order = self._require_open_order()
@@ -614,15 +641,31 @@ class PaperEntryBroker:
                 risex_observation, evaluated_at, self.config
             ):
                 return self._cancel_locked(CancellationReason.DATA_STALE, evaluated_at)
-            risex_side, _ = _entry_sides(order.route_plan.direction)
-            if (
-                _exact_vwap(
-                    risex_observation, risex_side, order.canonical_quantity
+            if is_lighter_route(order.route_plan.hedge_venue):
+                taker_observation = hedge_observation
+                if taker_observation is None or not _observation_is_fresh(
+                    taker_observation, evaluated_at, self.config
+                ):
+                    return self._cancel_locked(
+                        CancellationReason.DATA_STALE, evaluated_at
+                    )
+                taker_side = entry_taker_side(order.route_plan)
+                depth_unavailable = (
+                    taker_observation is None
+                    or _exact_vwap(
+                        taker_observation, taker_side, order.canonical_quantity
+                    ) is None
                 )
-                is None
-            ):
+                depth_reason = CancellationReason.LIGHTER_ENTRY_DEPTH_UNAVAILABLE
+            else:
+                risex_side, _ = _entry_sides(order.route_plan.direction)
+                depth_unavailable = _exact_vwap(
+                    risex_observation, risex_side, order.canonical_quantity
+                ) is None
+                depth_reason = CancellationReason.RISEX_ENTRY_DEPTH_UNAVAILABLE
+            if depth_unavailable:
                 return self._cancel_locked(
-                    CancellationReason.RISEX_ENTRY_DEPTH_UNAVAILABLE,
+                    depth_reason,
                     evaluated_at,
                 )
             if (
@@ -630,7 +673,7 @@ class PaperEntryBroker:
                 or refreshed_plan.target_cycle is None
                 or _route_key(refreshed_plan) != order.route_key
                 or refreshed_plan.canonical_quantity != order.canonical_quantity
-                or refreshed_plan.hedge_entry_price is None
+                or entry_maker_price(refreshed_plan) is None
                 or any(
                     reason != NoTradeReason.PLANNED_NET_PNL_NEGATIVE
                     for reason in refreshed_plan.no_trade_reasons
@@ -652,7 +695,9 @@ class PaperEntryBroker:
                 < timedelta(seconds=self.config.entry_order_reprice_seconds)
             ):
                 return self._state
-            if refreshed_plan.hedge_entry_price == current.limit_price:
+            refreshed_maker_price = entry_maker_price(refreshed_plan)
+            assert refreshed_maker_price is not None
+            if refreshed_maker_price == current.limit_price:
                 checked = replace(current, last_checked_at=evaluated_at)
                 order = replace(
                     order,
@@ -671,7 +716,7 @@ class PaperEntryBroker:
                 replacement = PaperOrderVersion(
                     f"{order.order_id}:v{number}",
                     number,
-                    refreshed_plan.hedge_entry_price,
+                    refreshed_maker_price,
                     evaluated_at,
                     evaluated_at,
                     Decimal("0"),
@@ -699,11 +744,12 @@ class PaperEntryBroker:
             trade, order.cutoff_at
         ):
             return False
+        maker_market = entry_maker_market(order.route_plan)
         if trade.canonical_quantity <= 0 or not is_tick_aligned(
-            trade.canonical_price, order.route_plan.hedge_market.tick_size_raw
+            trade.canonical_price, maker_market.tick_size_raw
         ):
             return False
-        tick = order.route_plan.hedge_market.tick_size_raw
+        tick = maker_market.tick_size_raw
         if order.side is Side.BUY:
             return (
                 trade.aggressor_side is Side.SELL
@@ -724,6 +770,7 @@ class PaperEntryBroker:
         hedge_observation: MarketObservation,
         recompute_funding: FundingRecomputer,
         risex_capture: BookExecutionCapture | None = None,
+        hedge_capture: BookExecutionCapture | None = None,
     ) -> TradeProcessResult:
         async with self._lock:
             order = self._require_open_order()
@@ -771,36 +818,48 @@ class PaperEntryBroker:
             ):
                 state = self._cancel_locked(CancellationReason.DATA_STALE, processed_at)
                 return TradeProcessResult(TradeProcessOutcome.CANCELLED, state)
-            risex_side, _ = _entry_sides(order.route_plan.direction)
+            maker_market = entry_maker_market(order.route_plan)
+            taker_market = entry_taker_market(order.route_plan)
+            taker_capture = (
+                risex_capture
+                if taker_market.venue is Venue.RISEX
+                else hedge_capture
+            )
+            taker_side = entry_taker_side(order.route_plan)
             taker_proof = _taker_provenance(
-                risex_capture, risex_side, order.canonical_quantity,
-                venue=Venue.RISEX,
-                canonical_market=order.route_plan.risex_market.venue_symbol,
+                taker_capture, taker_side, order.canonical_quantity,
+                venue=taker_market.venue,
+                canonical_market=taker_market.venue_symbol,
                 config=self.config,
             )
             if taker_proof is None:
                 state = self._cancel_locked(
-                    CancellationReason.RISEX_ENTRY_DEPTH_UNAVAILABLE, processed_at
+                    (
+                        CancellationReason.RISEX_ENTRY_DEPTH_UNAVAILABLE
+                        if taker_market.venue is Venue.RISEX
+                        else CancellationReason.LIGHTER_ENTRY_DEPTH_UNAVAILABLE
+                    ),
+                    processed_at,
                 )
                 return TradeProcessResult(TradeProcessOutcome.CANCELLED, state)
-            risex_entry_price = taker_proof.vwap_price
+            taker_entry_price = taker_proof.vwap_price
 
             quotes = await recompute_funding(order.route_plan, processed_at)
             assert trade.exchange_timestamp is not None
             maker_fee = _fee(
                 self.config,
-                order.route_plan.hedge_market,
+                maker_market,
                 LiquidityRole.MAKER,
                 order.canonical_quantity,
                 current.limit_price,
                 trade.exchange_timestamp,
             )
-            risex_fee = _fee(
+            taker_fee = _fee(
                 self.config,
-                order.route_plan.risex_market,
+                taker_market,
                 LiquidityRole.TAKER,
                 order.canonical_quantity,
-                risex_entry_price,
+                taker_entry_price,
                 processed_at,
             )
             maker_fill = Fill(
@@ -813,20 +872,20 @@ class PaperEntryBroker:
                 trade.received_at,
                 maker_fee,
             )
-            risex_fill = Fill(
-                Venue.RISEX,
-                order.route_plan.risex_market.venue_symbol,
-                risex_side,
+            taker_fill = Fill(
+                taker_market.venue,
+                taker_market.venue_symbol,
+                taker_side,
                 order.canonical_quantity,
-                risex_entry_price,
+                taker_entry_price,
                 processed_at,
                 processed_at,
-                risex_fee,
+                taker_fee,
             )
             position, lifecycle = self._open_position(
                 order,
                 maker_fill,
-                risex_fill,
+                taker_fill,
                 quotes,
                 risex_observation,
                 hedge_observation,
@@ -853,7 +912,7 @@ class PaperEntryBroker:
             maker_proof = MakerFillProvenance(
                 order.venue, order.canonical_market, order.side, order.order_id,
                 current.version_id, current.limit_price,
-                order.route_plan.hedge_market.tick_size_raw, qualifying_trades,
+                maker_market.tick_size_raw, qualifying_trades,
                 processed_at,
             )
             return TradeProcessResult(
@@ -873,82 +932,99 @@ class PaperEntryBroker:
         self,
         order: PaperEntryOrder,
         maker_fill: Fill,
-        risex_fill: Fill,
+        taker_fill: Fill,
         quotes: tuple[FundingCashQuote, FundingCashQuote],
         risex_observation: MarketObservation,
         hedge_observation: MarketObservation,
         opened_at: datetime,
     ) -> tuple[PaperPosition, LifecycleState]:
         quantity = order.canonical_quantity
-        risex_exit = _exact_vwap(
-            risex_observation, _opposite(risex_fill.side), quantity
+        plan = order.route_plan
+        risex_entry_fill = (
+            maker_fill if maker_fill.venue is Venue.RISEX else taker_fill
         )
-        hedge_exit_side = _opposite(order.side)
-        hedge_maker_exit = _maker_price(hedge_observation, hedge_exit_side)
-        hedge_taker_exit = _exact_vwap(
-            hedge_observation, hedge_exit_side, quantity
+        hedge_entry_fill = (
+            maker_fill if maker_fill.venue is plan.hedge_venue else taker_fill
         )
+        risex_exit_taker = _exact_vwap(
+            risex_observation, _opposite(risex_entry_fill.side), quantity
+        )
+        hedge_exit_taker = _exact_vwap(
+            hedge_observation, _opposite(hedge_entry_fill.side), quantity
+        )
+        lighter = is_lighter_route(plan.hedge_venue)
+        normal_maker_observation = (
+            risex_observation if lighter else hedge_observation
+        )
+        normal_maker_side = _opposite(
+            risex_entry_fill.side if lighter else hedge_entry_fill.side
+        )
+        normal_maker_exit = _maker_price(
+            normal_maker_observation, normal_maker_side
+        )
+        normal_risex_exit = normal_maker_exit if lighter else risex_exit_taker
+        normal_hedge_exit = hedge_exit_taker if lighter else normal_maker_exit
         cycle, remaining_funding = _recomputed_cycle_and_cash(
-            order.route_plan, quantity, opened_at, quotes
+            plan, quantity, opened_at, quotes
         )
         maker_exit_net: Decimal | None = None
         hold_to_target: Decimal | None = None
         unwind_net: Decimal | None = None
-        entry_fees = maker_fill.fee.amount_usd + risex_fill.fee.amount_usd
-        if risex_exit is not None and hedge_maker_exit is not None:
+        entry_fees = maker_fill.fee.amount_usd + taker_fill.fee.amount_usd
+        if normal_risex_exit is not None and normal_hedge_exit is not None:
             exit_pnl = _pair_pnl(
-                order.route_plan.direction,
+                plan.direction,
                 quantity,
-                risex_fill.canonical_price,
-                risex_exit,
-                maker_fill.canonical_price,
-                hedge_maker_exit,
+                risex_entry_fill.canonical_price,
+                normal_risex_exit,
+                hedge_entry_fill.canonical_price,
+                normal_hedge_exit,
             )
             planned_exit_fees = (
                 _fee(
                     self.config,
-                    order.route_plan.risex_market,
-                    LiquidityRole.TAKER,
+                    plan.risex_market,
+                    LiquidityRole.MAKER if lighter else LiquidityRole.TAKER,
                     quantity,
-                    risex_exit,
+                    normal_risex_exit,
                     opened_at,
                 ).amount_usd
                 + _fee(
                     self.config,
-                    order.route_plan.hedge_market,
-                    LiquidityRole.MAKER,
+                    plan.hedge_market,
+                    LiquidityRole.TAKER if lighter else LiquidityRole.MAKER,
                     quantity,
-                    hedge_maker_exit,
+                    normal_hedge_exit,
                     opened_at,
                 ).amount_usd
             )
             maker_exit_net = exit_pnl - entry_fees - planned_exit_fees
             if remaining_funding is not None:
                 hold_to_target = maker_exit_net + remaining_funding
-        if risex_exit is not None and hedge_taker_exit is not None:
+        if risex_exit_taker is not None and hedge_exit_taker is not None:
             unwind_pnl = _pair_pnl(
-                order.route_plan.direction,
+                plan.direction,
                 quantity,
-                risex_fill.canonical_price,
-                risex_exit,
-                maker_fill.canonical_price,
-                hedge_taker_exit,
+                risex_entry_fill.canonical_price,
+                risex_exit_taker,
+                hedge_entry_fill.canonical_price,
+                hedge_exit_taker,
             )
             unwind_fees = (
                 _fee(
                     self.config,
-                    order.route_plan.risex_market,
+                    plan.risex_market,
                     LiquidityRole.TAKER,
                     quantity,
-                    risex_exit,
+                    risex_exit_taker,
                     opened_at,
                 ).amount_usd
                 + _fee(
                     self.config,
-                    order.route_plan.hedge_market,
+                    plan.hedge_market,
                     LiquidityRole.TAKER,
                     quantity,
-                    hedge_taker_exit,
+                    hedge_exit_taker,
                     opened_at,
                 ).amount_usd
             )
@@ -963,10 +1039,10 @@ class PaperEntryBroker:
         position = PaperPosition(
             f"{order.attempt_id}:position",
             order.route_key,
-            order.route_plan.direction,
+            plan.direction,
             quantity,
             maker_fill,
-            risex_fill,
+            taker_fill,
             maker_fill.exchange_at,
             maker_fill.receipt_at,
             opened_at,
@@ -978,9 +1054,9 @@ class PaperEntryBroker:
             hold_to_target,
             unwind_net,
             _entry_basis(
-                order.route_plan.direction,
-                risex_fill.canonical_price,
-                maker_fill.canonical_price,
+                plan.direction,
+                risex_entry_fill.canonical_price,
+                hedge_entry_fill.canonical_price,
             ),
         )
         return position, lifecycle

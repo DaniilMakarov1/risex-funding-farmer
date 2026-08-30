@@ -50,7 +50,10 @@ from .paper_broker import (
     _pair_pnl,
     _taker_provenance,
 )
-from .scanner import MarketObservation
+from .scanner import (
+    MarketObservation,
+    is_lighter_route,
+)
 
 
 class ExitVersionStatus(StrEnum):
@@ -297,12 +300,22 @@ def _current_basis(
 def _actual_pair_pnl(
     position: PaperPosition, risex_exit: Decimal, hedge_exit: Decimal
 ) -> Decimal:
+    risex_entry = (
+        position.hedge_maker_fill
+        if position.hedge_maker_fill.venue is Venue.RISEX
+        else position.risex_taker_fill
+    )
+    hedge_entry = (
+        position.hedge_maker_fill
+        if position.hedge_maker_fill.venue is position.route_key.hedge_venue
+        else position.risex_taker_fill
+    )
     return _pair_pnl(
         position.direction,
         position.canonical_quantity,
-        position.risex_taker_fill.canonical_price,
+        risex_entry.canonical_price,
         risex_exit,
-        position.hedge_maker_fill.canonical_price,
+        hedge_entry.canonical_price,
         hedge_exit,
     )
 
@@ -559,21 +572,45 @@ class LifecycleEngine:
         risex: MarketObservation,
         hedge: MarketObservation,
         mode: LifecycleState,
-    ) -> tuple[Decimal | None, Decimal | None, Decimal | None]:
+    ) -> tuple[
+        Decimal | None,
+        Decimal | None,
+        Decimal | None,
+        Decimal | None,
+    ]:
         position = self._position()
         quantity = position.canonical_quantity
-        risex_price = _exact_vwap(
-            risex, _opposite(position.risex_taker_fill.side), quantity
+        risex_entry = (
+            position.hedge_maker_fill
+            if position.hedge_maker_fill.venue is Venue.RISEX
+            else position.risex_taker_fill
         )
-        hedge_side = _opposite(position.hedge_maker_fill.side)
-        hedge_maker = _exit_maker_price(hedge, hedge_side, mode)
-        hedge_taker = _exact_vwap(hedge, hedge_side, quantity)
-        return risex_price, hedge_maker, hedge_taker
+        hedge_entry = (
+            position.hedge_maker_fill
+            if position.hedge_maker_fill.venue is position.route_key.hedge_venue
+            else position.risex_taker_fill
+        )
+        risex_taker = _exact_vwap(
+            risex, _opposite(risex_entry.side), quantity
+        )
+        hedge_taker = _exact_vwap(hedge, _opposite(hedge_entry.side), quantity)
+        if is_lighter_route(position.route_key.hedge_venue):
+            risex_maker = _exit_maker_price(
+                risex, _opposite(risex_entry.side), mode
+            )
+            hedge_maker = hedge_taker
+        else:
+            risex_maker = risex_taker
+            hedge_maker = _exit_maker_price(
+                hedge, _opposite(hedge_entry.side), mode
+            )
+        return risex_maker, risex_taker, hedge_maker, hedge_taker
 
     def _planned_metrics(
         self,
         at: datetime,
-        risex_price: Decimal,
+        risex_maker_price: Decimal,
+        risex_taker_price: Decimal,
         hedge_maker_price: Decimal | None,
         hedge_taker_price: Decimal,
     ) -> tuple[Decimal | None, Decimal | None, Decimal, Decimal | None]:
@@ -584,35 +621,46 @@ class LifecycleEngine:
             + position.risex_taker_fill.fee.amount_usd
         )
         maker_net: Decimal | None = None
-        if hedge_maker_price is not None and recognized is not None:
-            maker_pair = _actual_pair_pnl(position, risex_price, hedge_maker_price)
+        lighter = is_lighter_route(position.route_key.hedge_venue)
+        normal_risex_price = risex_maker_price if lighter else risex_taker_price
+        normal_hedge_price = hedge_taker_price if lighter else hedge_maker_price
+        if (
+            normal_risex_price is not None
+            and normal_hedge_price is not None
+            and recognized is not None
+        ):
+            maker_pair = _actual_pair_pnl(
+                position, normal_risex_price, normal_hedge_price
+            )
             maker_exit_fees = (
                 _fee(
                     self.config,
                     self._snapshot.risex_market,
-                    LiquidityRole.TAKER,
+                    LiquidityRole.MAKER if lighter else LiquidityRole.TAKER,
                     position.canonical_quantity,
-                    risex_price,
+                    normal_risex_price,
                     at,
                 ).amount_usd
                 + _fee(
                     self.config,
                     self._snapshot.hedge_market,
-                    LiquidityRole.MAKER,
+                    LiquidityRole.TAKER if lighter else LiquidityRole.MAKER,
                     position.canonical_quantity,
-                    hedge_maker_price,
+                    normal_hedge_price,
                     at,
                 ).amount_usd
             )
             maker_net = recognized + maker_pair - entry_fees - maker_exit_fees
-        unwind_pair = _actual_pair_pnl(position, risex_price, hedge_taker_price)
+        unwind_pair = _actual_pair_pnl(
+            position, risex_taker_price, hedge_taker_price
+        )
         unwind_exit_fees = (
             _fee(
                 self.config,
                 self._snapshot.risex_market,
                 LiquidityRole.TAKER,
                 position.canonical_quantity,
-                risex_price,
+                risex_taker_price,
                 at,
             ).amount_usd
             + _fee(
@@ -684,13 +732,13 @@ class LifecycleEngine:
     def _ensure_exit_version(
         self,
         at: datetime,
-        hedge: MarketObservation,
+        maker: MarketObservation,
         *,
         aggressive_transition: bool = False,
     ) -> None:
         mode = self._snapshot.lifecycle_state
         price = _exit_maker_price(
-            hedge, _opposite(self._position().hedge_maker_fill.side), mode
+            maker, _opposite(self._position().maker_fill.side), mode
         )
         if price is None:
             return
@@ -747,7 +795,7 @@ class LifecycleEngine:
     def _start_normal_exit(
         self,
         at: datetime,
-        hedge: MarketObservation,
+        maker: MarketObservation,
         maker_pair_pnl: Decimal | None,
     ) -> None:
         if self._snapshot.lifecycle_state is LifecycleState.HOLDING:
@@ -758,7 +806,7 @@ class LifecycleEngine:
                 exit_start_pair_pnl_usd=maker_pair_pnl,
             )
             self._append_event(LifecycleEventType.EXITING_NORMAL_STARTED, at)
-        self._ensure_exit_version(at, hedge)
+        self._ensure_exit_version(at, maker)
 
     def _start_gap(self, at: datetime) -> None:
         if self._snapshot.gap_open:
@@ -893,14 +941,14 @@ class LifecycleEngine:
         ) or not _observation_is_fresh(hedge, at, self.config):
             self._start_gap(at)
             return self._snapshot
-        risex_exit, hedge_maker, hedge_taker = self._exit_prices(
+        risex_maker, risex_taker, hedge_maker, hedge_taker = self._exit_prices(
             risex, hedge, self._snapshot.lifecycle_state
         )
-        if risex_exit is None or hedge_taker is None:
+        if risex_taker is None or hedge_taker is None:
             if hard_basis_only:
                 return self._snapshot
             self._record_unavailable(at)
-            if risex_exit is None:
+            if risex_taker is None:
                 self._cancel_exit_version(
                     ExitVersionReason.UNWIND_UNAVAILABLE, at
                 )
@@ -911,7 +959,7 @@ class LifecycleEngine:
                 )
             return self._snapshot
         self._snapshot = replace(self._snapshot, unwind_quote_unavailable=False)
-        basis = _current_basis(position, risex_exit, hedge_taker)
+        basis = _current_basis(position, risex_taker, hedge_taker)
         adverse = basis - position.entry_executable_basis
         threshold = (
             self.config.btc_eth_hard_basis_expansion_rate
@@ -919,8 +967,18 @@ class LifecycleEngine:
             else self.config.other_asset_hard_basis_expansion_rate
         )
         if adverse >= threshold:
-            risex_side = _opposite(position.risex_taker_fill.side)
-            hedge_side = _opposite(position.hedge_maker_fill.side)
+            risex_entry = (
+                position.hedge_maker_fill
+                if position.hedge_maker_fill.venue is Venue.RISEX
+                else position.risex_taker_fill
+            )
+            hedge_entry = (
+                position.hedge_maker_fill
+                if position.hedge_maker_fill.venue is position.route_key.hedge_venue
+                else position.risex_taker_fill
+            )
+            risex_side = _opposite(risex_entry.side)
+            hedge_side = _opposite(hedge_entry.side)
             risex_proof = _taker_provenance(
                 risex_capture,
                 risex_side,
@@ -968,7 +1026,7 @@ class LifecycleEngine:
 
         self._maybe_register_next_cycle(at, next_cycle)
         maker_net, hold, unwind, recognized = self._planned_metrics(
-            at, risex_exit, hedge_maker, hedge_taker
+            at, risex_maker, risex_taker, hedge_maker, hedge_taker
         )
         remaining = self._remaining_funding(at)
         if record_sample:
@@ -979,23 +1037,39 @@ class LifecycleEngine:
             self._snapshot.lifecycle_state
             in {LifecycleState.EXITING_NORMAL, LifecycleState.EXITING_AGGRESSIVE}
             and self._snapshot.exit_start_pair_pnl_usd is None
-            and hedge_maker is not None
+            and (
+                risex_maker is not None
+                if is_lighter_route(position.route_key.hedge_venue)
+                else hedge_maker is not None
+            )
         ):
             self._snapshot = replace(
                 self._snapshot,
                 exit_start_pair_pnl_usd=_actual_pair_pnl(
-                    position, risex_exit, hedge_maker
+                    position,
+                    risex_maker if risex_maker is not None else risex_taker,
+                    hedge_maker if hedge_maker is not None else hedge_taker,
                 ),
             )
         if self._snapshot.lifecycle_state is LifecycleState.HOLDING:
             if maker_net is not None and hold is not None and hold > maker_net:
                 return self._snapshot
+            normal_maker_price = risex_maker if is_lighter_route(
+                position.route_key.hedge_venue
+            ) else hedge_maker
             baseline = (
                 None
-                if hedge_maker is None
-                else _actual_pair_pnl(position, risex_exit, hedge_maker)
+                if normal_maker_price is None
+                else _actual_pair_pnl(
+                    position,
+                    risex_maker if risex_maker is not None else risex_taker,
+                    hedge_maker if hedge_maker is not None else hedge_taker,
+                )
             )
-            self._start_normal_exit(at, hedge, baseline)
+            normal_maker_observation = risex if is_lighter_route(
+                position.route_key.hedge_venue
+            ) else hedge
+            self._start_normal_exit(at, normal_maker_observation, baseline)
             return self._snapshot
 
         if self._snapshot.lifecycle_state is LifecycleState.EXITING_NORMAL:
@@ -1013,10 +1087,15 @@ class LifecycleEngine:
                 )
                 self._append_event(LifecycleEventType.EXITING_AGGRESSIVE_STARTED, at)
                 self._ensure_exit_version(
-                    at, hedge, aggressive_transition=True
+                    at,
+                    risex if is_lighter_route(position.route_key.hedge_venue) else hedge,
+                    aggressive_transition=True,
                 )
                 return self._snapshot
-        self._ensure_exit_version(at, hedge)
+        self._ensure_exit_version(
+            at,
+            risex if is_lighter_route(position.route_key.hedge_venue) else hedge,
+        )
         return self._snapshot
 
     async def recover(
@@ -1121,7 +1200,12 @@ class LifecycleEngine:
             return False
         if trade.is_orderbook_match is not True or trade.exchange_timestamp is None:
             return False
-        tick = self._snapshot.hedge_market.tick_size_raw
+        maker_market = (
+            self._snapshot.risex_market
+            if order.venue is Venue.RISEX
+            else self._snapshot.hedge_market
+        )
+        tick = maker_market.tick_size_raw
         if trade.canonical_quantity <= 0 or not is_tick_aligned(
             trade.canonical_price, tick
         ):
@@ -1145,6 +1229,7 @@ class LifecycleEngine:
         risex_observation: MarketObservation,
         hedge_observation: MarketObservation,
         risex_capture: BookExecutionCapture | None = None,
+        hedge_capture: BookExecutionCapture | None = None,
     ) -> ExitTradeResult:
         async with self._lock:
             self._fill_provenance = ()
@@ -1207,13 +1292,35 @@ class LifecycleEngine:
                     ExitTradeOutcome.SUSPENDED, self._snapshot, "DATA_GAP"
                 )
             position = self._position()
-            risex_side = _opposite(position.risex_taker_fill.side)
+            lighter = is_lighter_route(position.route_key.hedge_venue)
+            maker_market = (
+                self._snapshot.risex_market
+                if lighter else self._snapshot.hedge_market
+            )
+            taker_market = (
+                self._snapshot.hedge_market
+                if lighter else self._snapshot.risex_market
+            )
+            risex_entry = (
+                position.hedge_maker_fill
+                if position.hedge_maker_fill.venue is Venue.RISEX
+                else position.risex_taker_fill
+            )
+            hedge_entry = (
+                position.hedge_maker_fill
+                if position.hedge_maker_fill.venue is position.route_key.hedge_venue
+                else position.risex_taker_fill
+            )
+            risex_side = _opposite(risex_entry.side)
+            hedge_side = _opposite(hedge_entry.side)
+            taker_side = hedge_side if lighter else risex_side
+            taker_capture = hedge_capture if lighter else risex_capture
             taker_proof = _taker_provenance(
-                risex_capture,
-                risex_side,
+                taker_capture,
+                taker_side,
                 position.canonical_quantity,
-                venue=self._snapshot.risex_market.venue,
-                canonical_market=self._snapshot.risex_market.venue_symbol,
+                venue=taker_market.venue,
+                canonical_market=taker_market.venue_symbol,
                 config=self.config,
             )
             if taker_proof is None:
@@ -1226,17 +1333,17 @@ class LifecycleEngine:
                     self._snapshot,
                     ExitVersionReason.UNWIND_UNAVAILABLE.value,
                 )
-            risex_price = taker_proof.vwap_price
+            taker_price = taker_proof.vwap_price
             assert trade.exchange_timestamp is not None
-            hedge_fee = _fee(
+            maker_fee = _fee(
                 self.config,
-                self._snapshot.hedge_market,
+                maker_market,
                 LiquidityRole.MAKER,
                 position.canonical_quantity,
                 active.limit_price,
                 trade.exchange_timestamp,
             )
-            hedge_fill = Fill(
+            maker_fill = Fill(
                 order.venue,
                 order.canonical_market,
                 order.side,
@@ -1244,12 +1351,12 @@ class LifecycleEngine:
                 active.limit_price,
                 trade.exchange_timestamp,
                 trade.received_at,
-                hedge_fee,
+                maker_fee,
             )
-            risex_fill = self._taker_fill(
-                self._snapshot.risex_market,
-                _opposite(position.risex_taker_fill.side),
-                risex_price,
+            taker_fill = self._taker_fill(
+                taker_market,
+                taker_side,
+                taker_price,
                 processed_at,
             )
             reason = (
@@ -1269,16 +1376,22 @@ class LifecycleEngine:
                     order, versions=order.versions[:-1] + (filled,)
                 ),
             )
-            self._close_locked(hedge_fill, risex_fill, reason, processed_at)
+            self._close_locked(maker_fill, taker_fill, reason, processed_at)
             maker_proof = MakerFillProvenance(
                 order.venue, order.canonical_market, order.side, order.order_id,
                 active.version_id, active.limit_price,
-                self._snapshot.hedge_market.tick_size_raw, qualifying_trades,
+                maker_market.tick_size_raw, qualifying_trades,
                 processed_at,
             )
             proofs = (
-                (f"{position.position_id}:hedge-exit", maker_proof),
-                (f"{position.position_id}:risex-exit", taker_proof),
+                (
+                    f"{position.position_id}:hedge-exit",
+                    taker_proof if lighter else maker_proof,
+                ),
+                (
+                    f"{position.position_id}:risex-exit",
+                    maker_proof if lighter else taker_proof,
+                ),
             )
             self._fill_provenance = proofs
             return ExitTradeResult(
@@ -1300,13 +1413,21 @@ class LifecycleEngine:
 
     def _close_locked(
         self,
-        hedge_fill: Fill,
-        risex_fill: Fill,
+        maker_fill: Fill,
+        taker_fill: Fill,
         reason: CloseReason,
         closed_at: datetime,
     ) -> None:
         position = self._position()
         self._mark_future_closed_skips(closed_at)
+        risex_fill = (
+            maker_fill if maker_fill.venue is Venue.RISEX else taker_fill
+        )
+        hedge_fill = (
+            maker_fill
+            if maker_fill.venue is position.route_key.hedge_venue
+            else taker_fill
+        )
         pair_pnl = _actual_pair_pnl(
             position, risex_fill.canonical_price, hedge_fill.canonical_price
         )

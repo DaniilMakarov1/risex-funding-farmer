@@ -1197,7 +1197,7 @@ async def test_stabilization003_h_top5_component_blocker_and_numeric_matrix(
         venue: ManyFakeAdapter(
             venue, clock, settlement_at=BASE + timedelta(hours=1)
         )
-        for venue in Venue
+        for venue in (Venue.RISEX, Venue.EXTENDED, Venue.NADO)
     }
     for adapter in fakes.values():
         adapter.funding_cash = D("0")

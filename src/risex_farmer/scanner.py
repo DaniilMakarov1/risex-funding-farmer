@@ -192,6 +192,59 @@ class RoutePlan:
         )
 
 
+def is_lighter_route(hedge_venue: Venue) -> bool:
+    """Return the one fixed PAPER profile that differs from the legacy routes."""
+    return hedge_venue is Venue.LIGHTER
+
+
+def _entry_sides(direction: RouteDirection) -> tuple[Side, Side]:
+    if direction is RouteDirection.LONG_RISEX_SHORT_HEDGE:
+        return Side.BUY, Side.SELL
+    return Side.SELL, Side.BUY
+
+
+def entry_maker_market(plan: RoutePlan) -> CanonicalMarket:
+    return plan.risex_market if is_lighter_route(plan.hedge_venue) else plan.hedge_market
+
+
+def entry_taker_market(plan: RoutePlan) -> CanonicalMarket:
+    return plan.hedge_market if is_lighter_route(plan.hedge_venue) else plan.risex_market
+
+
+def entry_maker_side(plan: RoutePlan) -> Side:
+    risex_side, hedge_side = _entry_sides(plan.direction)
+    return risex_side if is_lighter_route(plan.hedge_venue) else hedge_side
+
+
+def entry_taker_side(plan: RoutePlan) -> Side:
+    risex_side, hedge_side = _entry_sides(plan.direction)
+    return hedge_side if is_lighter_route(plan.hedge_venue) else risex_side
+
+
+def normal_exit_maker_market(plan: RoutePlan) -> CanonicalMarket:
+    return entry_maker_market(plan)
+
+
+def normal_exit_taker_market(plan: RoutePlan) -> CanonicalMarket:
+    return entry_taker_market(plan)
+
+
+def entry_maker_price(plan: RoutePlan) -> Decimal | None:
+    return plan.risex_entry_price if is_lighter_route(plan.hedge_venue) else plan.hedge_entry_price
+
+
+def entry_taker_price(plan: RoutePlan) -> Decimal | None:
+    return plan.hedge_entry_price if is_lighter_route(plan.hedge_venue) else plan.risex_entry_price
+
+
+def normal_exit_maker_price(plan: RoutePlan) -> Decimal | None:
+    return plan.risex_exit_price if is_lighter_route(plan.hedge_venue) else plan.hedge_exit_price
+
+
+def normal_exit_taker_price(plan: RoutePlan) -> Decimal | None:
+    return plan.hedge_exit_price if is_lighter_route(plan.hedge_venue) else plan.risex_exit_price
+
+
 @dataclass(frozen=True, slots=True)
 class ScanSnapshot:
     logical_at: datetime
@@ -333,6 +386,8 @@ def _fee_rate(config: PaperConfig, venue: Venue, role: LiquidityRole) -> Decimal
         (Venue.EXTENDED, LiquidityRole.TAKER): config.extended_taker_fee_rate,
         (Venue.NADO, LiquidityRole.MAKER): config.nado_maker_fee_rate,
         (Venue.NADO, LiquidityRole.TAKER): config.nado_taker_fee_rate,
+        (Venue.LIGHTER, LiquidityRole.MAKER): config.lighter_maker_fee_rate,
+        (Venue.LIGHTER, LiquidityRole.TAKER): config.lighter_taker_fee_rate,
     }
     return rates[(venue, role)]
 
@@ -363,12 +418,18 @@ def _maker_fee_split(
     risex_exit_price: Decimal,
     hedge_exit_price: Decimal,
 ) -> tuple[Decimal, Decimal]:
+    if hedge_market.venue is Venue.LIGHTER:
+        risex_role = LiquidityRole.MAKER
+        hedge_role = LiquidityRole.TAKER
+    else:
+        risex_role = LiquidityRole.TAKER
+        hedge_role = LiquidityRole.MAKER
     entry = _fee(
-        config, risex_market, LiquidityRole.TAKER, quantity, risex_entry_price
-    ) + _fee(config, hedge_market, LiquidityRole.MAKER, quantity, hedge_entry_price)
+        config, risex_market, risex_role, quantity, risex_entry_price
+    ) + _fee(config, hedge_market, hedge_role, quantity, hedge_entry_price)
     exit_ = _fee(
-        config, risex_market, LiquidityRole.TAKER, quantity, risex_exit_price
-    ) + _fee(config, hedge_market, LiquidityRole.MAKER, quantity, hedge_exit_price)
+        config, risex_market, risex_role, quantity, risex_exit_price
+    ) + _fee(config, hedge_market, hedge_role, quantity, hedge_exit_price)
     return entry, exit_
 
 
@@ -504,8 +565,9 @@ def evaluate_route(
     if risex.market.venue is not Venue.RISEX or hedge.market.venue not in {
         Venue.EXTENDED,
         Venue.NADO,
+        Venue.LIGHTER,
     }:
-        raise ValueError("route must be RISEx to Extended or Nado")
+        raise ValueError("route must be RISEx to Extended, Nado, or Lighter")
     reasons: list[str] = []
     markets = (risex.market, hedge.market)
     reasons.extend(
@@ -603,8 +665,12 @@ def evaluate_route(
     try:
         risex_bid, risex_ask = _best_prices(risex.book)
         hedge_bid, hedge_ask = _best_prices(hedge.book)
-        maker_price(Side.BUY, risex_bid, risex_ask, risex.market.tick_size_raw)
-        maker_price(Side.SELL, risex_bid, risex_ask, risex.market.tick_size_raw)
+        risex_buy_maker = maker_price(
+            Side.BUY, risex_bid, risex_ask, risex.market.tick_size_raw
+        )
+        risex_sell_maker = maker_price(
+            Side.SELL, risex_bid, risex_ask, risex.market.tick_size_raw
+        )
         hedge_buy_maker = maker_price(
             Side.BUY, hedge_bid, hedge_ask, hedge.market.tick_size_raw
         )
@@ -681,18 +747,31 @@ def evaluate_route(
             route=route,
             config=config,
         )
-    hedge_entry_price = (
+    lighter = hedge.market.venue is Venue.LIGHTER
+    risex_entry_maker_price = (
+        risex_buy_maker
+        if direction is RouteDirection.LONG_RISEX_SHORT_HEDGE
+        else risex_sell_maker
+    )
+    risex_exit_maker_price = (
+        risex_sell_maker
+        if direction is RouteDirection.LONG_RISEX_SHORT_HEDGE
+        else risex_buy_maker
+    )
+    hedge_entry_maker_price = (
         hedge_sell_maker
         if direction is RouteDirection.LONG_RISEX_SHORT_HEDGE
         else hedge_buy_maker
     )
-    hedge_exit_price = (
+    hedge_exit_maker_price = (
         hedge_buy_maker
         if direction is RouteDirection.LONG_RISEX_SHORT_HEDGE
         else hedge_sell_maker
     )
     quantity = sized_canonical_quantity(
-        config.target_notional_per_leg_usd, hedge_entry_price, common_step
+        config.target_notional_per_leg_usd,
+        risex_entry_maker_price if lighter else hedge_entry_maker_price,
+        common_step,
     )
     if quantity <= 0:
         return _empty_plan(
@@ -756,12 +835,30 @@ def evaluate_route(
             (NoTradeReason.INSUFFICIENT_EXACT_DEPTH,), route=route,
             config=config,
         )
-    if not (
-        minimum_order_eligible(quantity, risex_entry.price, risex.market)
-        and minimum_order_eligible(quantity, risex_exit.price, risex.market)
+    hedge_entry_price = (
+        hedge_sell.price
+        if direction is RouteDirection.LONG_RISEX_SHORT_HEDGE
+        else hedge_buy.price
+    ) if lighter else hedge_entry_maker_price
+    hedge_exit_price = (
+        hedge_buy.price
+        if direction is RouteDirection.LONG_RISEX_SHORT_HEDGE
+        else hedge_sell.price
+    ) if lighter else hedge_exit_maker_price
+    minimums_eligible = (
+        minimum_order_eligible(quantity, risex_entry_maker_price, risex.market)
+        and minimum_order_eligible(quantity, risex_exit_maker_price, risex.market)
         and minimum_order_eligible(quantity, hedge_entry_price, hedge.market)
         and minimum_order_eligible(quantity, hedge_exit_price, hedge.market)
-    ):
+        if lighter
+        else (
+            minimum_order_eligible(quantity, risex_entry.price, risex.market)
+            and minimum_order_eligible(quantity, risex_exit.price, risex.market)
+            and minimum_order_eligible(quantity, hedge_entry_price, hedge.market)
+            and minimum_order_eligible(quantity, hedge_exit_price, hedge.market)
+        )
+    )
+    if not minimums_eligible:
         return _empty_plan(
             risex,
             hedge,
@@ -775,8 +872,10 @@ def evaluate_route(
     cycle, expected_funding = _target_cycle(
         route, direction, quantity, risex.funding, hedge.funding
     )
-    risex_entry_price = risex_entry.price
-    risex_exit_price = risex_exit.price
+    risex_entry_taker_price = risex_entry.price
+    risex_exit_taker_price = risex_exit.price
+    risex_entry_price = risex_entry_maker_price if lighter else risex_entry_taker_price
+    risex_exit_price = risex_exit_maker_price if lighter else risex_exit_taker_price
     if direction is RouteDirection.LONG_RISEX_SHORT_HEDGE:
         entry_execution = quantity * (hedge_entry_price - risex_entry_price)
         execution = pair_price_pnl_usd(
@@ -828,26 +927,52 @@ def evaluate_route(
     bbo_spread_usd = quantity * (
         (risex_ask - risex_bid) + (hedge_ask - hedge_bid)
     )
-    taker_slippage_usd = (
-        _taker_slippage_usd(
-            risex_entry_side, quantity, risex_entry_price,
-            risex_bid, risex_ask,
+    if lighter:
+        taker_slippage_usd = sum(
+            (
+                _taker_slippage_usd(
+                    risex_entry_side, quantity, risex_entry_taker_price,
+                    risex_bid, risex_ask,
+                ),
+                _taker_slippage_usd(
+                    risex_exit_side, quantity, risex_exit_taker_price,
+                    risex_bid, risex_ask,
+                ),
+                _taker_slippage_usd(
+                    _entry_sides(direction)[1], quantity, hedge_entry_price,
+                    hedge_bid, hedge_ask,
+                ),
+                _taker_slippage_usd(
+                    hedge_unwind_side, quantity, hedge_unwind_price,
+                    hedge_bid, hedge_ask,
+                ),
+            ),
+            Decimal("0"),
         )
-        + _taker_slippage_usd(
-            risex_exit_side, quantity, risex_exit_price,
-            risex_bid, risex_ask,
+    else:
+        taker_slippage_usd = (
+            _taker_slippage_usd(
+                risex_entry_side, quantity, risex_entry_price,
+                risex_bid, risex_ask,
+            )
+            + _taker_slippage_usd(
+                risex_exit_side, quantity, risex_exit_price,
+                risex_bid, risex_ask,
+            )
+            + _taker_slippage_usd(
+                hedge_unwind_side, quantity, hedge_unwind_price,
+                hedge_bid, hedge_ask,
+            )
         )
-        + _taker_slippage_usd(
-            hedge_unwind_side, quantity, hedge_unwind_price,
-            hedge_bid, hedge_ask,
-        )
-    )
 
+    unwind_risex_exit_price = (
+        risex_exit_taker_price if lighter else risex_exit_price
+    )
     if direction is RouteDirection.LONG_RISEX_SHORT_HEDGE:
         unwind_execution = pair_price_pnl_usd(
             quantity,
             risex_entry_price,
-            risex_exit_price,
+            unwind_risex_exit_price,
             hedge_entry_price,
             hedge_unwind_price,
         )
@@ -857,13 +982,24 @@ def evaluate_route(
             hedge_entry_price,
             hedge_unwind_price,
             risex_entry_price,
-            risex_exit_price,
+            unwind_risex_exit_price,
         )
     unwind_fees = sum(
         (
-            _fee(config, risex.market, LiquidityRole.TAKER, quantity, risex_entry_price),
-            _fee(config, hedge.market, LiquidityRole.MAKER, quantity, hedge_entry_price),
-            _fee(config, risex.market, LiquidityRole.TAKER, quantity, risex_exit_price),
+            _fee(
+                config, risex.market,
+                LiquidityRole.MAKER if lighter else LiquidityRole.TAKER,
+                quantity, risex_entry_price,
+            ),
+            _fee(
+                config, hedge.market,
+                LiquidityRole.TAKER if lighter else LiquidityRole.MAKER,
+                quantity, hedge_entry_price,
+            ),
+            _fee(
+                config, risex.market, LiquidityRole.TAKER, quantity,
+                risex_exit_taker_price,
+            ),
             _fee(config, hedge.market, LiquidityRole.TAKER, quantity, hedge_unwind_price),
         ),
         Decimal("0"),
@@ -924,7 +1060,8 @@ async def scan_once(
     observed = tuple(observations)
     risex_rows = tuple(row for row in observed if row.market.venue is Venue.RISEX)
     hedge_rows = tuple(
-        row for row in observed if row.market.venue in {Venue.EXTENDED, Venue.NADO}
+        row for row in observed
+        if row.market.venue in {Venue.EXTENDED, Venue.NADO, Venue.LIGHTER}
     )
     evaluations = tuple(
         evaluate_route(risex, hedge, direction, logical_at, config=config)

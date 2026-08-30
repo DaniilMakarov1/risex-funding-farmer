@@ -12,6 +12,7 @@ class Venue(StrEnum):
     RISEX = "RISEX"
     EXTENDED = "EXTENDED"
     NADO = "NADO"
+    LIGHTER = "LIGHTER"
 
 
 class Side(StrEnum):
