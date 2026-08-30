@@ -6,6 +6,8 @@ Status: `AUTHORIZED — LOCAL HIDDEN-INPUT ONBOARDING AND BOUNDED PRIVATE READS 
 
 Objective: provision the narrowest official credential for each funded mainnet account, derive and bind only sanitized public identities, then run bounded authoritative exact-account read-only gates for balances/collateral, fees, regular/trigger orders, fills/history, positions, funding evidence, private-stream readiness where required, and unrelated state. RISEx may use the main wallet key once through hidden local input only to register a narrower session signer when no already-registered signer/JWT is available. Extended reads use its UI-created read-only API key; its Stark key is reserved for a later write gate. Nado reads use the public wallet and bytes32 subaccount without a private key; evaluate an official linked signer before any future execute path.
 
+The retained venue credential must survive Chief/task/process restart and be sufficient for later authoritative reconciliation and an accepted reduce-only close. Discovery uses one fixed venue-local protected path plus sanitized public identity/fingerprint metadata; no handoff, source file, task, report, argument, log, fixture, or operational database contains secret bytes. A main wallet key is retained only when official evidence proves the narrower session/linked signer cannot satisfy that lifecycle.
+
 User-bound caps for exactly one future manual lifecycle are `deposit_cap_usd = 20` and `maximum_loss_usd = 12`. These caps authorize no write by themselves; current exact-account and executable-quantity evidence must prove the entire matched lifecycle fits both values before a later exact approval.
 
 Allowed now:
