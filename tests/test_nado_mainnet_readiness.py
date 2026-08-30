@@ -58,9 +58,37 @@ def _install_canonical(canonical: Path):
     os.chmod(canonical, 0o600)
 
 
+def _enable_later_gate_harness(monkeypatch):
+    """Exercise later validators without asserting unresolved Nado order semantics."""
+
+    synthetic_public = readiness.ReadinessResult(
+        status=readiness.READY_FOR_PRIVATE_READ_GATES,
+        reason="TEST_ONLY_LATER_GATE_HARNESS",
+        blockers=(),
+        route_id="RISEX-NADO-BTC-001",
+        direction="LONG_RISEX_SHORT_NADO",
+        theoretical_common_quantity=Decimal("0.00015"),
+        common_quantity=Decimal("0.00015"),
+        gross_trade_notional_usd=Decimal("23.3966325"),
+        loss_bound_usd=Decimal("0.50"),
+    )
+    # The public fixture intentionally stays BLOCKED because Nado's exact
+    # executable minimum for a selected order type is still unresolved.
+    def synthetic_public_for(evidence):
+        return dataclasses.replace(
+            synthetic_public,
+            route_id=evidence.route.route_id,
+            direction=evidence.route.direction,
+            loss_bound_usd=evidence.route.loss_bound_usd,
+        )
+
+    monkeypatch.setattr(readiness, "_public_evaluation", synthetic_public_for)
+
+
 def _install_canonical_for_gate(tmp_path, monkeypatch):
     canonical = _configure_paths(tmp_path, monkeypatch)
     _install_canonical(canonical)
+    _enable_later_gate_harness(monkeypatch)
     return canonical
 
 
@@ -179,19 +207,25 @@ def test_offline_contract_matches_current_public_nado_baseline_and_has_no_write_
         Decimal("0.000001"),
     )
     result = readiness.assess_readiness(evidence)
-    assert result.status == readiness.READY_FOR_PROTECTED_PROVISIONING
-    assert result.common_quantity == Decimal("0.00130")
-    assert result.gross_trade_notional_usd == Decimal("202.770815")
+    assert result.status == readiness.BLOCKED
+    assert result.reason == "NADO_EXECUTABLE_MINIMUM_PENDING"
+    assert result.theoretical_common_quantity == Decimal("0.00015")
+    assert result.theoretical_common_quantity * nado.best_bid_usd == Decimal("11.69535")
+    assert result.common_quantity is None
+    assert result.gross_trade_notional_usd is None
     assert result.mainnet_write_authority == readiness.NO_MAINNET_WRITE_AUTHORITY
     assert not result.write_ready
     assert "synthetic-" not in result.evidence()
+    assert "0.00130" not in result.evidence()
 
 
 def test_official_nado_metadata_is_offline_only():
     assert readiness.NADO_MAINNET_CHAIN_ID == 57073
     assert readiness.NADO_BTC_PERP_PRODUCT_ID == 2
-    assert readiness.NADO_PUBLIC_MINIMUM_NOTIONAL_USD == Decimal("100")
+    assert readiness.NADO_PUBLIC_PRODUCT_MIN_SIZE_USD == Decimal("100")
     assert readiness.NADO_PUBLIC_MINIMUM_FEE_NOTIONAL_USD == Decimal("100")
+    assert readiness.NADO_EXECUTABLE_MINIMUM_PENDING_STATUS == "PENDING_ORDER_TYPE_SEMANTICS"
+    assert readiness.NADO_EXECUTABLE_MINIMUM_PENDING_SOURCE == "OFFICIAL_PUBLIC_EVIDENCE_UNRESOLVED"
     assert readiness.NADO_PUBLIC_IDENTITY_SOURCE == "PUBLIC_WALLET_SUBACCOUNT"
     assert readiness.NADO_UNSIGNED_QUERY_AUTHENTICATION == "UNSIGNED_QUERY"
     assert readiness.NADO_UNSIGNED_QUERY_STATUS == "AUTHORITATIVE_UNSIGNED_QUERY"
@@ -203,6 +237,7 @@ def test_official_nado_metadata_is_offline_only():
     )
     assert readiness.NADO_SDK_PACKAGE == "nado-protocol"
     assert readiness.NADO_SDK_VERSION == "2.0.0"
+    assert not hasattr(readiness, "NADO_PUBLIC_MINIMUM_NOTIONAL_USD")
     assert not hasattr(readiness, "NADO_READ_CREDENTIAL_KIND")
     assert not hasattr(readiness, "provision_nado_identity")
     assert not hasattr(readiness, "PROTECTED_SECRET_DIRECTORY")
@@ -217,7 +252,8 @@ def test_both_opposite_directions_are_valid_public_route_selections(
         _public(), route=dataclasses.replace(_public().route, direction=direction)
     )
     result = readiness.assess_readiness(evidence)
-    assert result.status == readiness.READY_FOR_PROTECTED_PROVISIONING
+    assert result.status == readiness.BLOCKED
+    assert "NADO_EXECUTABLE_MINIMUM_PENDING" in result.blockers
     assert result.direction == direction
 
 
@@ -253,9 +289,9 @@ def test_route_and_self_trade_barriers_fail_closed(tmp_path, monkeypatch, change
         ("RISEx", {"quantity_step": Decimal("0.00001")}, "QUANTITY_STEP_NOT_EXACT:RISEx"),
         ("Nado", {"minimum_quantity": Decimal("0.0001")}, "MINIMUM_QUANTITY_NOT_EXACT:Nado"),
         ("Nado", {"quantity_step": Decimal("0.00001")}, "QUANTITY_STEP_NOT_EXACT:Nado"),
-        ("Nado", {"minimum_notional_usd": Decimal("99")}, "MINIMUM_NOTIONAL_NOT_EXACT:Nado"),
+        ("Nado", {"product_min_size_usd": Decimal("99")}, "PRODUCT_MIN_SIZE_NOT_EXACT:Nado"),
         ("Nado", {"minimum_fee_notional_usd": Decimal("99")}, "MINIMUM_FEE_NOTIONAL_NOT_EXACT:Nado"),
-        ("Nado", {"available_sell_quantity": Decimal("0.00129")}, "COMMON_QUANTITY_NOT_EXECUTABLE:Nado"),
+        ("Nado", {"available_sell_quantity": Decimal("0.00014")}, "THEORETICAL_COMMON_QUANTITY_NOT_EXECUTABLE:Nado"),
         ("Nado", {"best_bid_usd": Decimal("77970")}, "BBO_OR_REFERENCE_NOT_SAFE:Nado"),
         ("Nado", {"best_ask_usd": Decimal("77970.05")}, "BBO_OR_REFERENCE_NOT_SAFE:Nado"),
         ("Nado", {"fee_status": "PUBLIC_ASSUMPTION"}, "ACCOUNT_FEE_MUST_REMAIN_PENDING:Nado"),
@@ -271,6 +307,37 @@ def test_exact_minima_step_depth_bbo_fees_schedule_and_contract_are_required(
     result = readiness.assess_readiness(_with_venue(_public(), venue, **change))
     assert result.status == readiness.BLOCKED
     assert reason in result.blockers
+
+
+@pytest.mark.parametrize(
+    ("change", "reason"),
+    [
+        (
+            {
+                "executable_order_type": "UNVERIFIED_ORDER_TYPE",
+                "executable_minimum_quantity": Decimal("0.00015"),
+            },
+            "NADO_EXECUTABLE_MINIMUM_PENDING_MUST_NOT_CLAIM",
+        ),
+        (
+            {"executable_minimum_source": "UNVERIFIED_SOURCE"},
+            "NADO_EXECUTABLE_MINIMUM_EVIDENCE_NOT_EXACT",
+        ),
+        (
+            {"executable_minimum_status": "UNSUPPORTED_STATUS"},
+            "NADO_EXECUTABLE_MINIMUM_STATUS_UNSUPPORTED",
+        ),
+    ],
+)
+def test_nado_executable_minimum_remains_fail_closed_until_order_type_evidence_is_authoritative(
+    tmp_path, monkeypatch, change, reason
+):
+    _configure_paths(tmp_path, monkeypatch)
+    result = readiness.assess_readiness(_with_venue(_public(), "Nado", **change))
+    assert result.status == readiness.BLOCKED
+    assert reason in result.blockers
+    assert result.common_quantity is None
+    assert result.gross_trade_notional_usd is None
 
 
 def test_public_parser_tolerates_irrelevant_additive_fields_but_rejects_later_phase_claims():
@@ -297,14 +364,18 @@ def test_protected_phase_reuses_only_canonical_risex_path_without_nado_secret_su
 ):
     canonical = _configure_paths(tmp_path, monkeypatch)
     missing = readiness.assess_readiness(_public())
-    assert missing.status == readiness.READY_FOR_PROTECTED_PROVISIONING
+    assert missing.status == readiness.BLOCKED
+    assert missing.reason == "NADO_EXECUTABLE_MINIMUM_PENDING"
+    assert missing.theoretical_common_quantity == Decimal("0.00015")
+    assert missing.common_quantity is None
     assert not (tmp_path / "nado-protected").exists()
 
     _install_canonical(canonical)
     before_content = canonical.read_bytes()
     before_inode = canonical.stat().st_ino
     result = readiness.assess_readiness(_public())
-    assert result.status == readiness.READY_FOR_PRIVATE_READ_GATES
+    assert result.status == readiness.BLOCKED
+    assert result.reason == "NADO_EXECUTABLE_MINIMUM_PENDING"
     inspected = readiness.inspect_canonical_risex_identity()
     assert inspected.path == str(canonical)
     assert inspected.protected
@@ -374,6 +445,7 @@ def test_canonical_risex_file_unsafe_state_blocks_readiness_without_nado_secret_
     canonical = _configure_paths(tmp_path, monkeypatch)
     _install_canonical(canonical)
     canonical.chmod(0o644)
+    _enable_later_gate_harness(monkeypatch)
     result = readiness.assess_readiness(_public())
     assert result.status == readiness.BLOCKED
     assert "PROTECTED_SECRET_FILE_NOT_SAFE:RISEx:PROTECTED_FILE_MODE_NOT_0600" in result.blockers
@@ -504,6 +576,7 @@ def test_future_approval_requires_private_read_and_never_becomes_write_ready(
     blocked = readiness.assess_dispatch_approval(_public(), _private(), _approval())
     assert blocked.status == readiness.BLOCKED
     assert "PRIVATE_READ_REQUIRES_READY_PRIVATE_READ_GATES" in blocked.blockers
+    assert "NADO_EXECUTABLE_MINIMUM_PENDING" in blocked.blockers
     assert not blocked.write_ready
 
     _install_canonical_for_gate(tmp_path, monkeypatch)

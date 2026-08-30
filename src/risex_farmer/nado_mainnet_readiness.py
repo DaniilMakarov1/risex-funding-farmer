@@ -53,8 +53,12 @@ NADO_MAINNET_CHAIN_ID = 57073
 NADO_MAINNET_ENDPOINT_CONTRACT = "0x05ec92D78ED421f3D3Ada77FFdE167106565974E"
 NADO_MAINNET_PERP_ENGINE_CONTRACT = "0xF8599D58d1137fC56EcDd9C16ee139C8BDf96da1"
 NADO_BTC_PERP_PRODUCT_ID = 2
-NADO_PUBLIC_MINIMUM_NOTIONAL_USD = Decimal("100")
+NADO_PUBLIC_PRODUCT_MIN_SIZE_USD = Decimal("100")
 NADO_PUBLIC_MINIMUM_FEE_NOTIONAL_USD = Decimal("100")
+NADO_EXECUTABLE_MINIMUM_PENDING_STATUS = "PENDING_ORDER_TYPE_SEMANTICS"
+NADO_EXECUTABLE_MINIMUM_PENDING_SOURCE = "OFFICIAL_PUBLIC_EVIDENCE_UNRESOLVED"
+NADO_EXECUTABLE_MINIMUM_AUTHORITATIVE_STATUS = "AUTHORITATIVE_ORDER_TYPE_MINIMUM"
+NADO_EXECUTABLE_MINIMUM_AUTHORITATIVE_SOURCE = "OFFICIAL_ORDER_TYPE_CONTRACT"
 NADO_PUBLIC_IDENTITY_SOURCE = "PUBLIC_WALLET_SUBACCOUNT"
 NADO_UNSIGNED_QUERY_AUTHENTICATION = "UNSIGNED_QUERY"
 NADO_UNSIGNED_QUERY_STATUS = "AUTHORITATIVE_UNSIGNED_QUERY"
@@ -67,9 +71,8 @@ NADO_REQUIRED_QUERY_KINDS = frozenset(
 NADO_SDK_PACKAGE = "nado-protocol"
 NADO_SDK_VERSION = "2.0.0"
 
-# This is the already accepted canonical RISEx identity path.  It is
-# deliberately a separate path from the Nado directory and is never written
-# by this module.
+# This is the already accepted canonical RISEx identity path.  It is the
+# accepted protected path and is never written by this module.
 CANONICAL_RISEX_IDENTITY_PATH = (
     Path.home()
     / ".config"
@@ -181,8 +184,13 @@ class VenueReadiness:
     metadata_current: bool
     minimum_quantity: Decimal
     quantity_step: Decimal
-    minimum_notional_usd: Decimal | None
+    product_min_size_usd: Decimal | None
     minimum_fee_notional_usd: Decimal | None
+    executable_order_type: str | None
+    executable_minimum_quantity: Decimal | None
+    executable_minimum_notional_usd: Decimal | None
+    executable_minimum_status: str
+    executable_minimum_source: str
     tick_size_usd: Decimal
     best_bid_usd: Decimal
     best_ask_usd: Decimal
@@ -270,13 +278,30 @@ class ReadinessEvidence:
                     _required(item, "quantity_step", "venue"),
                     "quantity_step",
                 ),
-                minimum_notional_usd=_optional_decimal(
-                    item, "minimum_notional_usd", "minimum_notional_usd"
+                product_min_size_usd=_optional_decimal(
+                    item, "product_min_size_usd", "product_min_size_usd"
                 ),
                 minimum_fee_notional_usd=_optional_decimal(
                     item,
                     "minimum_fee_notional_usd",
                     "minimum_fee_notional_usd",
+                ),
+                executable_order_type=item.get("executable_order_type"),
+                executable_minimum_quantity=_optional_decimal(
+                    item,
+                    "executable_minimum_quantity",
+                    "executable_minimum_quantity",
+                ),
+                executable_minimum_notional_usd=_optional_decimal(
+                    item,
+                    "executable_minimum_notional_usd",
+                    "executable_minimum_notional_usd",
+                ),
+                executable_minimum_status=_required(
+                    item, "executable_minimum_status", "venue"
+                ),
+                executable_minimum_source=_required(
+                    item, "executable_minimum_source", "venue"
                 ),
                 tick_size_usd=_decimal(
                     _required(item, "tick_size_usd", "venue"),
@@ -869,6 +894,7 @@ class ReadinessResult:
     blockers: tuple[str, ...]
     route_id: str
     direction: str
+    theoretical_common_quantity: Decimal | None
     common_quantity: Decimal | None
     gross_trade_notional_usd: Decimal | None
     loss_bound_usd: Decimal | None
@@ -893,6 +919,11 @@ class ReadinessResult:
                     None if self.common_quantity is None else str(self.common_quantity)
                 ),
                 "direction": self.direction,
+                "theoretical_common_quantity": (
+                    None
+                    if self.theoretical_common_quantity is None
+                    else str(self.theoretical_common_quantity)
+                ),
                 "gross_trade_notional_usd": (
                     None
                     if self.gross_trade_notional_usd is None
@@ -1152,7 +1183,7 @@ def _exact_multiple(value: Decimal, step: Decimal) -> bool:
         return False
 
 
-def _venue_common_quantity(
+def _theoretical_common_quantity(
     risex: VenueReadiness, nado: VenueReadiness
 ) -> Decimal:
     step_numerator, step_denominator = _rational_lcm(
@@ -1160,18 +1191,41 @@ def _venue_common_quantity(
     )
     minimum = max(risex.minimum_quantity, nado.minimum_quantity)
     minimum_numerator, minimum_denominator = minimum.as_integer_ratio()
-    notional_floor = NADO_PUBLIC_MINIMUM_NOTIONAL_USD / min(
-        nado.best_bid_usd, nado.best_ask_usd
-    )
-    notional_numerator, notional_denominator = notional_floor.as_integer_ratio()
-    required_numerator = max(
-        minimum_numerator * notional_denominator,
-        notional_numerator * minimum_denominator,
-    )
-    required_denominator = minimum_denominator * notional_denominator
+    required_numerator = minimum_numerator
+    required_denominator = minimum_denominator
     multiplier = _ceil_fraction(
         required_numerator * step_denominator,
         required_denominator * step_numerator,
+    )
+    return _fraction_to_decimal(
+        step_numerator * multiplier,
+        step_denominator,
+    )
+
+
+def _order_type_common_quantity(
+    risex: VenueReadiness,
+    nado: VenueReadiness,
+    theoretical_quantity: Decimal,
+) -> Decimal | None:
+    if nado.executable_minimum_status != NADO_EXECUTABLE_MINIMUM_AUTHORITATIVE_STATUS:
+        return None
+    minimums = [theoretical_quantity]
+    if nado.executable_minimum_quantity is not None:
+        minimums.append(nado.executable_minimum_quantity)
+    if nado.executable_minimum_notional_usd is not None:
+        minimums.append(
+            nado.executable_minimum_notional_usd
+            / min(nado.best_bid_usd, nado.best_ask_usd)
+        )
+    minimum = max(minimums)
+    step_numerator, step_denominator = _rational_lcm(
+        [risex.quantity_step, nado.quantity_step]
+    )
+    minimum_numerator, minimum_denominator = minimum.as_integer_ratio()
+    multiplier = _ceil_fraction(
+        minimum_numerator * step_denominator,
+        minimum_denominator * step_numerator,
     )
     return _fraction_to_decimal(
         step_numerator * multiplier,
@@ -1186,6 +1240,7 @@ def _invalid_public_result(reason: str) -> ReadinessResult:
         blockers=(reason,),
         route_id="UNKNOWN_ROUTE",
         direction="UNKNOWN_DIRECTION",
+        theoretical_common_quantity=None,
         common_quantity=None,
         gross_trade_notional_usd=None,
         loss_bound_usd=None,
@@ -1233,7 +1288,7 @@ def _public_evaluation(evidence: ReadinessEvidence) -> ReadinessResult:
             "product_id": None,
             "minimum_quantity": Decimal("0.00015"),
             "quantity_step": Decimal("0.000001"),
-            "minimum_notional_usd": None,
+            "product_min_size_usd": None,
             "minimum_fee_notional_usd": None,
         },
         "Nado": {
@@ -1241,7 +1296,7 @@ def _public_evaluation(evidence: ReadinessEvidence) -> ReadinessResult:
             "product_id": NADO_BTC_PERP_PRODUCT_ID,
             "minimum_quantity": Decimal("0.00005"),
             "quantity_step": Decimal("0.00005"),
-            "minimum_notional_usd": NADO_PUBLIC_MINIMUM_NOTIONAL_USD,
+            "product_min_size_usd": NADO_PUBLIC_PRODUCT_MIN_SIZE_USD,
             "minimum_fee_notional_usd": NADO_PUBLIC_MINIMUM_FEE_NOTIONAL_USD,
         },
     }
@@ -1268,6 +1323,8 @@ def _public_evaluation(evidence: ReadinessEvidence) -> ReadinessResult:
         for field_name, field_value in (
             ("minimum_quantity", venue.minimum_quantity),
             ("quantity_step", venue.quantity_step),
+            ("product_min_size_usd", venue.product_min_size_usd),
+            ("minimum_fee_notional_usd", venue.minimum_fee_notional_usd),
             ("tick_size_usd", venue.tick_size_usd),
             ("best_bid_usd", venue.best_bid_usd),
             ("best_ask_usd", venue.best_ask_usd),
@@ -1275,7 +1332,9 @@ def _public_evaluation(evidence: ReadinessEvidence) -> ReadinessResult:
             ("available_buy_quantity", venue.available_buy_quantity),
             ("available_sell_quantity", venue.available_sell_quantity),
         ):
-            if not _valid_decimal(field_value, f"{venue.venue}.{field_name}", positive=True):
+            if field_value is not None and not _valid_decimal(
+                field_value, f"{venue.venue}.{field_name}", positive=True
+            ):
                 _add_blocker(
                     blockers,
                     f"CURRENT_MARKET_VALUE_INVALID:{venue.venue}:{field_name}",
@@ -1284,8 +1343,8 @@ def _public_evaluation(evidence: ReadinessEvidence) -> ReadinessResult:
             _add_blocker(blockers, f"MINIMUM_QUANTITY_NOT_EXACT:{venue.venue}")
         if venue.quantity_step != contract["quantity_step"]:
             _add_blocker(blockers, f"QUANTITY_STEP_NOT_EXACT:{venue.venue}")
-        if venue.minimum_notional_usd != contract["minimum_notional_usd"]:
-            _add_blocker(blockers, f"MINIMUM_NOTIONAL_NOT_EXACT:{venue.venue}")
+        if venue.product_min_size_usd != contract["product_min_size_usd"]:
+            _add_blocker(blockers, f"PRODUCT_MIN_SIZE_NOT_EXACT:{venue.venue}")
         if venue.minimum_fee_notional_usd != contract["minimum_fee_notional_usd"]:
             _add_blocker(blockers, f"MINIMUM_FEE_NOTIONAL_NOT_EXACT:{venue.venue}")
         if not _exact_multiple(venue.minimum_quantity, venue.quantity_step):
@@ -1334,7 +1393,57 @@ def _public_evaluation(evidence: ReadinessEvidence) -> ReadinessResult:
             or venue.private_stream_source != "PRIVATE_READ_PENDING"
         ):
             _add_blocker(blockers, f"PRIVATE_STREAM_MUST_REMAIN_PENDING:{venue.venue}")
+        if venue.venue == "Nado":
+            if venue.executable_minimum_status == NADO_EXECUTABLE_MINIMUM_PENDING_STATUS:
+                if (
+                    venue.executable_order_type is not None
+                    or venue.executable_minimum_quantity is not None
+                    or venue.executable_minimum_notional_usd is not None
+                ):
+                    _add_blocker(
+                        blockers,
+                        "NADO_EXECUTABLE_MINIMUM_PENDING_MUST_NOT_CLAIM",
+                    )
+                if venue.executable_minimum_source != NADO_EXECUTABLE_MINIMUM_PENDING_SOURCE:
+                    _add_blocker(
+                        blockers,
+                        "NADO_EXECUTABLE_MINIMUM_EVIDENCE_NOT_EXACT",
+                    )
+                _add_blocker(blockers, "NADO_EXECUTABLE_MINIMUM_PENDING")
+            elif venue.executable_minimum_status == NADO_EXECUTABLE_MINIMUM_AUTHORITATIVE_STATUS:
+                if venue.executable_minimum_source != NADO_EXECUTABLE_MINIMUM_AUTHORITATIVE_SOURCE:
+                    _add_blocker(
+                        blockers,
+                        "NADO_EXECUTABLE_MINIMUM_EVIDENCE_NOT_EXACT",
+                    )
+                if not _valid_token(venue.executable_order_type, "Nado.executable_order_type"):
+                    _add_blocker(blockers, "NADO_EXECUTABLE_ORDER_TYPE_NOT_EXACT")
+                if (
+                    venue.executable_minimum_quantity is None
+                    and venue.executable_minimum_notional_usd is None
+                ):
+                    _add_blocker(blockers, "NADO_EXECUTABLE_MINIMUM_NOT_PROVEN")
+                for field_name, value in (
+                    (
+                        "executable_minimum_quantity",
+                        venue.executable_minimum_quantity,
+                    ),
+                    (
+                        "executable_minimum_notional_usd",
+                        venue.executable_minimum_notional_usd,
+                    ),
+                ):
+                    if value is not None and not _valid_decimal(
+                        value, f"Nado.{field_name}", positive=True
+                    ):
+                        _add_blocker(
+                            blockers,
+                            f"NADO_EXECUTABLE_MINIMUM_INVALID:{field_name}",
+                        )
+            else:
+                _add_blocker(blockers, "NADO_EXECUTABLE_MINIMUM_STATUS_UNSUPPORTED")
 
+    theoretical_common_quantity: Decimal | None = None
     common_quantity: Decimal | None = None
     gross_trade_notional: Decimal | None = None
     if set(venue_map) != set(VENUES) or len(evidence.venues) != len(VENUES):
@@ -1348,18 +1457,23 @@ def _public_evaluation(evidence: ReadinessEvidence) -> ReadinessResult:
         ):
             _add_blocker(blockers, "PUBLIC_FUNDING_SCHEDULE_NOT_COMMON")
         try:
-            common_quantity = _venue_common_quantity(risex, nado)
-            if common_quantity * min(nado.best_bid_usd, nado.best_ask_usd) < NADO_PUBLIC_MINIMUM_NOTIONAL_USD:
-                _add_blocker(blockers, "NADO_COMMON_QUANTITY_BELOW_MINIMUM_NOTIONAL")
+            theoretical_common_quantity = _theoretical_common_quantity(risex, nado)
             for venue in (risex, nado):
                 if (
-                    common_quantity > venue.available_buy_quantity
-                    or common_quantity > venue.available_sell_quantity
+                    theoretical_common_quantity > venue.available_buy_quantity
+                    or theoretical_common_quantity > venue.available_sell_quantity
                 ):
-                    _add_blocker(blockers, f"COMMON_QUANTITY_NOT_EXECUTABLE:{venue.venue}")
-            gross_trade_notional = common_quantity * (
-                risex.reference_price_usd + nado.reference_price_usd
+                    _add_blocker(
+                        blockers,
+                        f"THEORETICAL_COMMON_QUANTITY_NOT_EXECUTABLE:{venue.venue}",
+                    )
+            common_quantity = _order_type_common_quantity(
+                risex, nado, theoretical_common_quantity
             )
+            if common_quantity is not None:
+                gross_trade_notional = common_quantity * (
+                    risex.reference_price_usd + nado.reference_price_usd
+                )
         except (ArithmeticError, ReadinessViolation):
             _add_blocker(blockers, "COMMON_QUANTITY_NOT_COMPUTABLE")
 
@@ -1370,6 +1484,7 @@ def _public_evaluation(evidence: ReadinessEvidence) -> ReadinessResult:
         blockers=tuple(blockers),
         route_id=route_id,
         direction=direction,
+        theoretical_common_quantity=theoretical_common_quantity,
         common_quantity=common_quantity,
         gross_trade_notional_usd=gross_trade_notional,
         loss_bound_usd=loss_bound,
@@ -1389,6 +1504,7 @@ def _with_readiness_phase(
         blockers=blockers,
         route_id=base.route_id,
         direction=base.direction,
+        theoretical_common_quantity=base.theoretical_common_quantity,
         common_quantity=base.common_quantity,
         gross_trade_notional_usd=base.gross_trade_notional_usd,
         loss_bound_usd=base.loss_bound_usd,
@@ -2006,8 +2122,12 @@ __all__ = [
     "NADO_MAINNET_CHAIN_ID",
     "NADO_MAINNET_ENDPOINT_CONTRACT",
     "NADO_MAINNET_PERP_ENGINE_CONTRACT",
+    "NADO_EXECUTABLE_MINIMUM_AUTHORITATIVE_SOURCE",
+    "NADO_EXECUTABLE_MINIMUM_AUTHORITATIVE_STATUS",
+    "NADO_EXECUTABLE_MINIMUM_PENDING_SOURCE",
+    "NADO_EXECUTABLE_MINIMUM_PENDING_STATUS",
     "NADO_PUBLIC_MINIMUM_FEE_NOTIONAL_USD",
-    "NADO_PUBLIC_MINIMUM_NOTIONAL_USD",
+    "NADO_PUBLIC_PRODUCT_MIN_SIZE_USD",
     "NADO_PUBLIC_IDENTITY_SOURCE",
     "NADO_SDK_PACKAGE",
     "NADO_SDK_VERSION",
