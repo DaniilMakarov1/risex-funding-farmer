@@ -1,12 +1,11 @@
-"""Protected, offline Nado mainnet credential onboarding.
+"""Protected, offline Nado mainnet identity and signer onboarding.
 
 This module is an explicitly invoked operator boundary, not part of the
-paper runtime or the normal command-line application.  It derives the public
-Nado wallet/subaccount identity locally and stores one opaque credential in a
-fixed owner-only directory.  It deliberately has no transport, database,
-execute, order, or signature surface.  A later venue-local private-read or
-execution gate can consume the protected credential after independently
-proving the current Nado linked-signer binding.
+paper runtime or the normal command-line application.  Its read-only path
+stores only the public Nado wallet/subaccount identity in a fixed owner-only
+directory.  A separately named future signer path may create or store one
+linked-signer key, but neither path has transport, database, execute, order,
+or signature surface.  Public account queries do not require that signer.
 
 The representation follows the current official Nado SDK/contracts:
 mainnet chain ``57073``; a sender is the wallet address followed by a
@@ -26,7 +25,12 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 
-PROVISIONED = "PROTECTED_NADO_CREDENTIAL_CREATED"
+IDENTITY_PROVISIONED = "PROTECTED_NADO_IDENTITY_CREATED"
+LINKED_SIGNER_PROVISIONED = "PROTECTED_NADO_LINKED_SIGNER_CREATED"
+# Kept as the stable generic success marker for callers that do not need to
+# distinguish the two explicit phases.  Read-only provisioning is the only
+# current operator command, so its value is intentionally identity-specific.
+PROVISIONED = IDENTITY_PROVISIONED
 BLOCKED = "BLOCKED"
 NO_MAINNET_WRITE_AUTHORITY = "NO_MAINNET_WRITE_AUTHORITY"
 
@@ -39,23 +43,23 @@ NADO_UNSIGNED_READ_STATUS = "AUTHORITATIVE_UNSIGNED_QUERY"
 NADO_DEFAULT_SUBACCOUNT_NAME = "default"
 
 LINKED_SIGNER_CREDENTIAL = "LINKED_SIGNER"
-MAIN_WALLET_FALLBACK_CREDENTIAL = "MAIN_WALLET_FALLBACK"
 LINKED_SIGNER_BINDING_PENDING = "REQUIRES_AUTHORITATIVE_NADO_QUERY"
-MAIN_WALLET_DIRECT_BINDING = "MAIN_WALLET_DIRECT"
-REQUIRED_LIFECYCLE = "AUTHORITATIVE_RECONCILIATION_AND_REDUCE_ONLY_CLOSE"
-OFFICIAL_FALLBACK_SOURCE = "OFFICIAL_NADO_CONTRACT_EVIDENCE"
-OFFICIAL_FALLBACK_REASON = "LINKED_SIGNER_CANNOT_SATISFY_REQUIRED_LIFECYCLE"
-# Current official Nado docs and the official Python SDK explicitly support a
-# linked signer for execute signing.  Until a later source-backed contract
-# correction changes this constant in a separately reviewed slice, retaining
-# the main wallet is forbidden even if a caller supplies synthetic evidence.
-CURRENT_OFFICIAL_LINKED_SIGNER_SUPPORT = True
+IDENTITY_METADATA_SCHEMA_VERSION = 2
+MAIN_WALLET_PERSISTENCE_FORBIDDEN = "MAIN_WALLET_PERSISTENCE_FORBIDDEN"
+LINKED_SIGNER_PROVISIONING_SEPARATE = "LINKED_SIGNER_PROVISIONING_SEPARATE"
 
 PROTECTED_DIRECTORY = (
     Path.home() / ".config" / "risex-farmer" / "nado-mainnet-onboarding"
 )
+# Reserved for the separately invoked future linked-signer phase.  The
+# read-only identity path never opens, inspects, prompts for, or loads this
+# directory.
+LINKED_SIGNER_PROTECTED_DIRECTORY = (
+    Path.home() / ".config" / "risex-farmer" / "nado-mainnet-signing"
+)
 IDENTITY_FILENAME = "nado.identity.json"
 CREDENTIAL_FILENAME = "nado.credential.bin"
+LINKED_SIGNER_METADATA_FILENAME = "nado.linked-signer.json"
 PROTECTED_DIRECTORY_MODE = 0o700
 PROTECTED_FILE_MODE = 0o600
 MAX_PRIVATE_KEY_BYTES = 32
@@ -99,24 +103,6 @@ class NadoPublicIdentity:
 
 
 @dataclass(frozen=True)
-class MainWalletFallbackProof:
-    """Structured future-only proof that a linked signer is insufficient.
-
-    The current official Nado contract/docs support linked signers, so this
-    proof is not presently constructible from the current evidence.  The
-    strict shape exists only to prevent a caller from silently selecting the
-    main wallet as a fallback without a later authoritative contradiction.
-    """
-
-    source: str
-    lifecycle: str
-    linked_signer_supported: bool
-    linked_signer_satisfies_lifecycle: bool
-    authoritative: bool
-    reason_code: str
-
-
-@dataclass(frozen=True)
 class ProtectedFileState:
     kind: str
     path: str
@@ -143,8 +129,22 @@ class ProtectedFiles:
         return all(state.protected for state in self.states)
 
     @property
+    def identity_protected(self) -> bool:
+        return self.identity.protected
+
+    @property
+    def read_identity_ready(self) -> bool:
+        return (
+            self.identity.protected
+            and not self.credential.present
+            and self.credential.reason == "FUTURE_PHASE_NOT_INSPECTED"
+        )
+
+    @property
     def any_present(self) -> bool:
-        return any(state.present for state in self.states)
+        return any(state.present for state in self.states) or (
+            self.credential.reason == "PROTECTED_DIRECTORY_UNEXPECTED_ENTRY"
+        )
 
 
 @dataclass(frozen=True)
@@ -160,7 +160,7 @@ class OnboardingResult:
 
     @property
     def provisioned(self) -> bool:
-        return self.status == PROVISIONED
+        return self.status in {IDENTITY_PROVISIONED, LINKED_SIGNER_PROVISIONED}
 
     @property
     def write_ready(self) -> bool:
@@ -214,11 +214,23 @@ class CredentialDiscovery:
 
 
 def protected_paths() -> Mapping[str, Path]:
-    """Return the fixed path pair without opening either file."""
+    """Return the read-only path and reserved future credential path."""
 
     return {
+        "directory": PROTECTED_DIRECTORY,
         "identity": PROTECTED_DIRECTORY / IDENTITY_FILENAME,
-        "credential": PROTECTED_DIRECTORY / CREDENTIAL_FILENAME,
+        "credential": LINKED_SIGNER_PROTECTED_DIRECTORY / CREDENTIAL_FILENAME,
+    }
+
+
+def future_linked_signer_paths() -> Mapping[str, Path]:
+    """Return future signer paths without opening or inspecting them."""
+
+    return {
+        "directory": LINKED_SIGNER_PROTECTED_DIRECTORY,
+        "credential": LINKED_SIGNER_PROTECTED_DIRECTORY / CREDENTIAL_FILENAME,
+        "metadata": LINKED_SIGNER_PROTECTED_DIRECTORY
+        / LINKED_SIGNER_METADATA_FILENAME,
     }
 
 
@@ -243,8 +255,8 @@ def _raise_violation(reason: str) -> None:
     raise OnboardingViolation(reason)
 
 
-def _protected_directory_parts() -> tuple[str, ...]:
-    directory = PROTECTED_DIRECTORY
+def _protected_directory_parts(directory: Path | None = None) -> tuple[str, ...]:
+    directory = PROTECTED_DIRECTORY if directory is None else directory
     if not isinstance(directory, Path) or not directory.is_absolute():
         _raise_violation("PROTECTED_DIRECTORY_NOT_ABSOLUTE")
     parts = directory.parts
@@ -375,10 +387,14 @@ def _open_directory_child(
         raise
 
 
-def _open_fixed_directory(*, create: bool = True) -> int | None:
+def _open_fixed_directory(
+    *,
+    create: bool = True,
+    directory: Path | None = None,
+) -> int | None:
     """Open the fixed directory through trusted descriptors only."""
 
-    parts = _protected_directory_parts()
+    parts = _protected_directory_parts(directory)
     flags = _required_directory_flags()
     descriptor = -1
     try:
@@ -501,11 +517,53 @@ def _file_state(
     )
 
 
+def _directory_entries(directory_fd: int) -> tuple[str, ...]:
+    try:
+        return tuple(sorted(os.listdir(directory_fd)))
+    except OSError:
+        _raise_violation("PROTECTED_DIRECTORY_UNAVAILABLE")
+
+
+def _future_credential_state(reason: str) -> ProtectedFileState:
+    return ProtectedFileState(
+        kind="credential",
+        path=str(future_linked_signer_paths()["credential"]),
+        present=False,
+        protected=False,
+        reason=reason,
+    )
+
+
 def _inspect_protected_files_fd(directory_fd: int) -> ProtectedFiles:
     paths = protected_paths()
-    return ProtectedFiles(
-        identity=_file_state("identity", paths["identity"], directory_fd),
-        credential=_file_state("credential", paths["credential"], directory_fd),
+    identity = _file_state("identity", paths["identity"], directory_fd)
+    entries = _directory_entries(directory_fd)
+    if not entries or set(entries) == {IDENTITY_FILENAME}:
+        credential = _future_credential_state("FUTURE_PHASE_NOT_INSPECTED")
+    elif CREDENTIAL_FILENAME in entries:
+        credential = _file_state(
+            "credential",
+            PROTECTED_DIRECTORY / CREDENTIAL_FILENAME,
+            directory_fd,
+        )
+    else:
+        credential = _future_credential_state(
+            "PROTECTED_DIRECTORY_UNEXPECTED_ENTRY"
+        )
+    return ProtectedFiles(identity=identity, credential=credential)
+
+
+def _inspect_future_linked_signer_files_fd(
+    directory_fd: int,
+) -> tuple[ProtectedFileState, ProtectedFileState]:
+    paths = future_linked_signer_paths()
+    entries = _directory_entries(directory_fd)
+    allowed = {CREDENTIAL_FILENAME, LINKED_SIGNER_METADATA_FILENAME}
+    if any(entry not in allowed for entry in entries):
+        _raise_violation("PROTECTED_DIRECTORY_UNEXPECTED_ENTRY")
+    return (
+        _file_state("credential", paths["credential"], directory_fd),
+        _file_state("metadata", paths["metadata"], directory_fd),
     )
 
 
@@ -651,6 +709,52 @@ def _bytes32(value: Any, field: str) -> str:
     return value.lower()
 
 
+def _subaccount_name_from_sender(
+    wallet_address: str,
+    sender: str,
+) -> str:
+    wallet = bytes.fromhex(_address(wallet_address, "wallet_address")[2:])
+    raw = bytes.fromhex(_bytes32(sender, "subaccount")[2:])
+    if raw[: len(wallet)] != wallet:
+        _raise_violation("SUBACCOUNT_IDENTITY_CONFLICT")
+    encoded_name = raw[len(wallet) :]
+    try:
+        first_padding = encoded_name.index(0)
+    except ValueError:
+        first_padding = len(encoded_name)
+    if any(byte != 0 for byte in encoded_name[first_padding:]):
+        _raise_violation("SUBACCOUNT_IDENTITY_CONFLICT")
+    try:
+        name = encoded_name[:first_padding].decode("ascii")
+    except UnicodeDecodeError:
+        _raise_violation("PUBLIC_IDENTITY_INVALID:subaccount")
+    return _subaccount_name(name)
+
+
+def _identity_from_public_parts(
+    wallet_address: Any,
+    subaccount: Any,
+    *,
+    subaccount_name: str | None = None,
+    expected_wallet_address: str | None = None,
+    expected_subaccount: str | None = None,
+) -> NadoPublicIdentity:
+    wallet = _address(wallet_address, "wallet_address")
+    sender = _bytes32(subaccount, "subaccount")
+    derived_name = _subaccount_name_from_sender(wallet, sender)
+    if subaccount_name is not None:
+        if _subaccount_name(subaccount_name) != derived_name:
+            _raise_violation("SUBACCOUNT_IDENTITY_CONFLICT")
+    return _identity_from_parts(
+        wallet,
+        derived_name,
+        expected_wallet_address=expected_wallet_address,
+        expected_subaccount=(
+            sender if expected_subaccount is None else expected_subaccount
+        ),
+    )
+
+
 def derive_public_identity(
     main_wallet_key: str,
     subaccount_name: str = NADO_DEFAULT_SUBACCOUNT_NAME,
@@ -685,6 +789,24 @@ def export_unsigned_read_identity(identity: NadoPublicIdentity) -> dict[str, obj
     return canonical.as_dict()
 
 
+def _metadata_payload(identity: NadoPublicIdentity) -> bytearray:
+    payload: dict[str, object] = identity.as_dict()
+    payload["schema_version"] = IDENTITY_METADATA_SCHEMA_VERSION
+    try:
+        encoded = json.dumps(
+            payload,
+            allow_nan=False,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+    except (TypeError, UnicodeError, ValueError):
+        _raise_violation("METADATA_ENCODING_FAILED")
+    if len(encoded) > MAX_IDENTITY_BYTES:
+        _raise_violation("METADATA_TOO_LARGE")
+    return bytearray(encoded)
+
+
 def _hex_fingerprint(value: Any, field: str) -> str:
     if (
         type(value) is not str
@@ -695,52 +817,24 @@ def _hex_fingerprint(value: Any, field: str) -> str:
     return value
 
 
-def _validate_fallback_proof(proof: Any) -> None:
-    if not isinstance(proof, MainWalletFallbackProof):
-        _raise_violation("MAIN_WALLET_FALLBACK_OFFICIAL_PROOF_REQUIRED")
-    if (
-        proof.source != OFFICIAL_FALLBACK_SOURCE
-        or proof.lifecycle != REQUIRED_LIFECYCLE
-        or proof.linked_signer_supported is not False
-        or proof.linked_signer_satisfies_lifecycle is not False
-        or proof.authoritative is not True
-        or proof.reason_code != OFFICIAL_FALLBACK_REASON
-    ):
-        _raise_violation("MAIN_WALLET_FALLBACK_OFFICIAL_PROOF_REQUIRED")
-    if CURRENT_OFFICIAL_LINKED_SIGNER_SUPPORT:
-        _raise_violation("MAIN_WALLET_FALLBACK_FORBIDDEN_BY_CURRENT_OFFICIAL_CONTRACT")
-
-
-def _metadata_payload(
+def _linked_signer_metadata_payload(
     identity: NadoPublicIdentity,
-    credential_kind: str,
     credential_address: str,
     credential_fingerprint: str,
 ) -> bytearray:
-    if credential_kind == LINKED_SIGNER_CREDENTIAL:
-        binding = LINKED_SIGNER_BINDING_PENDING
-        fallback_authorization = "NOT_APPLICABLE"
-    elif credential_kind == MAIN_WALLET_FALLBACK_CREDENTIAL:
-        binding = MAIN_WALLET_DIRECT_BINDING
-        fallback_authorization = "OFFICIAL_LINKED_SIGNER_INSUFFICIENCY_PROVEN"
-    else:
-        _raise_violation("CREDENTIAL_KIND_INVALID")
     payload: dict[str, object] = {
-        "binding_status": binding,
         "chain_id": NADO_MAINNET_CHAIN_ID,
         "credential_address": credential_address,
         "credential_fingerprint": credential_fingerprint,
-        "credential_kind": credential_kind,
+        "credential_kind": LINKED_SIGNER_CREDENTIAL,
         "environment": NADO_MAINNET_ENVIRONMENT,
-        "fallback_authorization": fallback_authorization,
         "identity_source": NADO_PUBLIC_IDENTITY_SOURCE,
+        "identity_subaccount": identity.subaccount,
+        "identity_wallet_address": identity.wallet_address,
         "mainnet_write_authority": NO_MAINNET_WRITE_AUTHORITY,
         "query_authentication": NADO_UNSIGNED_QUERY_AUTHENTICATION,
         "schema_version": 1,
-        "subaccount": identity.subaccount,
-        "subaccount_name": identity.subaccount_name,
         "venue": NADO_VENUE,
-        "wallet_address": identity.wallet_address,
     }
     try:
         encoded = json.dumps(
@@ -849,35 +943,73 @@ def _blocked(reason: str) -> OnboardingResult:
     )
 
 
-def provision_nado_mainnet_credential(
+def _merge_public_identity_value(
+    primary: Any,
+    alias: Any,
+    *,
+    field: str,
+    normalizer: Callable[[Any, str], str],
+) -> Any:
+    if primary is None:
+        return alias
+    if alias is None:
+        return primary
+    first = normalizer(primary, field)
+    second = normalizer(alias, field)
+    if first != second:
+        _raise_violation("PUBLIC_IDENTITY_CONFLICT")
+    return first
+
+
+def _public_identity_arguments(
+    wallet_address: Any,
+    subaccount: Any,
+    public_wallet_address: Any,
+    public_subaccount: Any,
+) -> tuple[Any, Any]:
+    wallet = _merge_public_identity_value(
+        wallet_address,
+        public_wallet_address,
+        field="wallet_address",
+        normalizer=_address,
+    )
+    sender = _merge_public_identity_value(
+        subaccount,
+        public_subaccount,
+        field="subaccount",
+        normalizer=_bytes32,
+    )
+    if (wallet is None) != (sender is None):
+        _raise_violation("PUBLIC_IDENTITY_INPUT_INCOMPLETE")
+    return wallet, sender
+
+
+def provision_nado_mainnet_identity(
     input_fn: Callable[[str], str] | None = None,
     subaccount_name: str = NADO_DEFAULT_SUBACCOUNT_NAME,
     *,
+    wallet_address: str | None = None,
+    subaccount: str | None = None,
+    public_wallet_address: str | None = None,
+    public_subaccount: str | None = None,
     expected_wallet_address: str | None = None,
     expected_subaccount: str | None = None,
-    expected_linked_signer_address: str | None = None,
-    fallback_proof: MainWalletFallbackProof | None = None,
 ) -> OnboardingResult:
-    """Provision one fixed Nado credential through hidden local input.
+    """Provision only the public identity needed for unsigned Nado reads.
 
-    The first prompt is the main wallet key and is used only to derive the
-    public wallet/subaccount.  The second prompt is the optional linked signer
-    key.  A non-empty second value is the default and only current path.  An
-    empty second value is accepted only with the strict future fallback proof;
-    the main wallet is never silently retained as a convenience fallback.
-
-    No transport or Nado execute is performed.  In particular, this function
-    does not register a linked signer; the later exact-account read gate must
-    verify that the persisted linked signer address is currently bound.
+    With no explicit public pair, exactly one hidden main-wallet prompt is
+    used for local derivation.  The derived key is held only in a wipeable
+    bytearray and is never written, fingerprinted, or used as a credential.
+    Supplying ``wallet_address`` and ``subaccount`` skips hidden input
+    entirely.  Linked-signer provisioning is deliberately a separate future
+    function and is not called or loaded here.
     """
 
     input_fn = getpass.getpass if input_fn is None else input_fn
     directory_fd: int | None = None
     main_key: bytearray | None = None
-    linked_key: bytearray | None = None
     metadata_payload: bytearray | None = None
     try:
-        _subaccount_name(subaccount_name)
         try:
             directory_fd = _open_fixed_directory(create=False)
         except OnboardingViolation as exc:
@@ -892,53 +1024,40 @@ def provision_nado_mainnet_credential(
                     files=before,
                 )
 
-        main_key = _private_key_bytes(
-            _prompt(input_fn, "Nado main wallet private key (hidden): "),
-            "main_wallet_key",
-        )
-        assert main_key is not None
-        wallet_address = _derive_wallet_address(main_key)
-        identity = _identity_from_parts(
+        wallet, sender = _public_identity_arguments(
             wallet_address,
-            subaccount_name,
-            expected_wallet_address=expected_wallet_address,
-            expected_subaccount=expected_subaccount,
+            subaccount,
+            public_wallet_address,
+            public_subaccount,
         )
-        linked_key = _private_key_bytes(
-            _prompt(
-                input_fn,
-                "Nado linked signer private key (hidden; blank only with official fallback proof): ",
-            ),
-            "linked_signer_key",
-            optional=True,
-        )
-        if linked_key is not None:
-            credential_kind = LINKED_SIGNER_CREDENTIAL
-            credential_address = _derive_wallet_address(linked_key)
-            if credential_address == identity.wallet_address:
-                _raise_violation("MAIN_AND_LINKED_IDENTITY_CONFLICT")
-            if expected_linked_signer_address is not None:
-                expected_linked = _address(
-                    expected_linked_signer_address,
-                    "expected_linked_signer_address",
-                )
-                if credential_address != expected_linked:
-                    _raise_violation("LINKED_SIGNER_IDENTITY_CONFLICT")
+        if wallet is None and sender is None:
+            _subaccount_name(subaccount_name)
+            main_key = _private_key_bytes(
+                _prompt(input_fn, "Nado main wallet private key (hidden): "),
+                "main_wallet_key",
+            )
+            assert main_key is not None
+            derived_wallet = _derive_wallet_address(main_key)
+            identity = _identity_from_parts(
+                derived_wallet,
+                subaccount_name,
+                expected_wallet_address=expected_wallet_address,
+                expected_subaccount=expected_subaccount,
+            )
         else:
-            _validate_fallback_proof(fallback_proof)
-            credential_kind = MAIN_WALLET_FALLBACK_CREDENTIAL
-            credential_address = identity.wallet_address
-            if expected_linked_signer_address is not None:
-                _raise_violation("LINKED_SIGNER_IDENTITY_CONFLICT")
+            identity = _identity_from_public_parts(
+                wallet,
+                sender,
+                subaccount_name=(
+                    None
+                    if subaccount_name == NADO_DEFAULT_SUBACCOUNT_NAME
+                    else subaccount_name
+                ),
+                expected_wallet_address=expected_wallet_address,
+                expected_subaccount=expected_subaccount,
+            )
 
-        credential_payload = linked_key if linked_key is not None else main_key
-        credential_fingerprint = hashlib.sha256(credential_payload).hexdigest()
-        metadata_payload = _metadata_payload(
-            identity,
-            credential_kind,
-            credential_address,
-            credential_fingerprint,
-        )
+        metadata_payload = _metadata_payload(identity)
 
         if directory_fd is None:
             directory_fd = _open_fixed_directory(create=True)
@@ -954,13 +1073,11 @@ def provision_nado_mainnet_credential(
 
         created: list[str] = []
         try:
-            _write_new_file(directory_fd, CREDENTIAL_FILENAME, credential_payload)
-            created.append(CREDENTIAL_FILENAME)
             _write_new_file(directory_fd, IDENTITY_FILENAME, metadata_payload)
             created.append(IDENTITY_FILENAME)
             os.fsync(directory_fd)
             final_files = _inspect_protected_files_fd(directory_fd)
-            if not final_files.all_protected:
+            if not final_files.read_identity_ready:
                 _raise_violation("PROTECTED_FILE_METADATA_CHANGED")
         except OnboardingViolation as exc:
             if not _rollback_created(directory_fd, created):
@@ -976,10 +1093,252 @@ def provision_nado_mainnet_credential(
             raise OnboardingViolation("PROTECTED_ONBOARDING_FAILED") from None
         return OnboardingResult(
             status=PROVISIONED,
-            reason="PROTECTED_NADO_CREDENTIAL_CREATED",
+            reason="PROTECTED_NADO_IDENTITY_CREATED",
             files=final_files,
             identity=identity,
-            credential_kind=credential_kind,
+        )
+    except OnboardingViolation as exc:
+        return _blocked(str(exc))
+    except OSError:
+        return _blocked("PROTECTED_FILESYSTEM_OPERATION_FAILED")
+    except BaseException:
+        return _blocked("PROTECTED_ONBOARDING_FAILED")
+    finally:
+        _wipe(main_key)
+        _wipe(metadata_payload)
+        if directory_fd is not None:
+            try:
+                os.close(directory_fd)
+            except OSError:
+                pass
+
+
+def provision_nado_mainnet_credential(
+    input_fn: Callable[[str], str] | None = None,
+    subaccount_name: str = NADO_DEFAULT_SUBACCOUNT_NAME,
+    *,
+    wallet_address: str | None = None,
+    subaccount: str | None = None,
+    public_wallet_address: str | None = None,
+    public_subaccount: str | None = None,
+    expected_wallet_address: str | None = None,
+    expected_subaccount: str | None = None,
+    expected_linked_signer_address: str | None = None,
+    fallback_proof: object | None = None,
+) -> OnboardingResult:
+    """Compatibility entry point with read-only identity semantics.
+
+    The historical credential-shaped name now has exactly the same
+    read-only behavior as :func:`provision_nado_mainnet_identity`.  Legacy
+    signer or fallback arguments are rejected before any prompt or write so
+    the main wallet can never become a persistent fallback.
+    """
+
+    if expected_linked_signer_address is not None:
+        return _blocked(LINKED_SIGNER_PROVISIONING_SEPARATE)
+    if fallback_proof is not None:
+        return _blocked(MAIN_WALLET_PERSISTENCE_FORBIDDEN)
+    return provision_nado_mainnet_identity(
+        input_fn,
+        subaccount_name,
+        wallet_address=wallet_address,
+        subaccount=subaccount,
+        public_wallet_address=public_wallet_address,
+        public_subaccount=public_subaccount,
+        expected_wallet_address=expected_wallet_address,
+        expected_subaccount=expected_subaccount,
+    )
+
+
+# Read-only spelling for new callers; both names have identical semantics.
+provision_nado_read_identity = provision_nado_mainnet_identity
+
+
+def _generate_linked_signer_key() -> bytearray:
+    try:
+        payload = bytearray(os.urandom(MAX_PRIVATE_KEY_BYTES))
+    except BaseException:
+        _raise_violation("LINKED_SIGNER_GENERATION_FAILED")
+    if len(payload) != MAX_PRIVATE_KEY_BYTES or not any(payload):
+        _wipe(payload)
+        _raise_violation("LINKED_SIGNER_GENERATION_FAILED")
+    return payload
+
+
+def provision_nado_linked_signer(
+    input_fn: Callable[[str], str] | None = None,
+    *,
+    generate: bool = False,
+    expected_linked_signer_address: str | None = None,
+) -> OnboardingResult:
+    """Explicit future-only local linked-signer provisioning.
+
+    This path requires an already provisioned public identity.  It either
+    generates a fresh local key or accepts one existing linked-signer key
+    through one hidden prompt.  It never accepts the main wallet as a
+    fallback, never updates the identity file, and never contacts or signs
+    for Nado.  Its fixed directory is separate from the read-only identity
+    directory.  The normal read-only identity path never calls this function.
+    """
+
+    input_fn = getpass.getpass if input_fn is None else input_fn
+    identity_directory_fd: int | None = None
+    signer_directory_fd: int | None = None
+    linked_key: bytearray | None = None
+    metadata_payload: bytearray | None = None
+    try:
+        if type(generate) is not bool:
+            _raise_violation("LINKED_SIGNER_GENERATION_FLAG_INVALID")
+        try:
+            identity_directory_fd = _open_fixed_directory(create=False)
+        except OnboardingViolation as exc:
+            if str(exc) != "PROTECTED_DIRECTORY_MISSING":
+                return _blocked(str(exc))
+        if identity_directory_fd is None:
+            return _blocked("PROTECTED_IDENTITY_REQUIRED")
+        files = _inspect_protected_files_fd(identity_directory_fd)
+        if files.credential.present or (
+            files.credential.reason == "PROTECTED_DIRECTORY_UNEXPECTED_ENTRY"
+        ):
+            return OnboardingResult(
+                status=BLOCKED,
+                reason="PROTECTED_PATH_ALREADY_EXISTS",
+                files=files,
+            )
+        if not files.identity.present:
+            return OnboardingResult(
+                status=BLOCKED,
+                reason="PROTECTED_IDENTITY_REQUIRED",
+                files=files,
+            )
+        if not files.identity.protected:
+            return OnboardingResult(
+                status=BLOCKED,
+                reason=files.identity.reason,
+                files=files,
+            )
+        identity = _load_metadata(identity_directory_fd)
+        try:
+            signer_directory_fd = _open_fixed_directory(
+                create=False,
+                directory=LINKED_SIGNER_PROTECTED_DIRECTORY,
+            )
+        except OnboardingViolation as exc:
+            if str(exc) != "PROTECTED_DIRECTORY_MISSING":
+                return _blocked(str(exc))
+        if signer_directory_fd is not None:
+            if _directory_entries(signer_directory_fd):
+                return OnboardingResult(
+                    status=BLOCKED,
+                    reason="PROTECTED_PATH_ALREADY_EXISTS",
+                    files=files,
+                )
+            return OnboardingResult(
+                status=BLOCKED,
+                reason="PROTECTED_PATH_ALREADY_EXISTS",
+                files=files,
+            )
+        if generate:
+            linked_key = _generate_linked_signer_key()
+        else:
+            linked_key = _private_key_bytes(
+                _prompt(
+                    input_fn,
+                "Nado linked signer private key (hidden; future explicit path): ",
+                ),
+                "linked_signer_key",
+            )
+        assert linked_key is not None
+        credential_address = _derive_wallet_address(linked_key)
+        if credential_address == identity.wallet_address:
+            _raise_violation(MAIN_WALLET_PERSISTENCE_FORBIDDEN)
+        if expected_linked_signer_address is not None:
+            expected_linked = _address(
+                expected_linked_signer_address,
+                "expected_linked_signer_address",
+            )
+            if credential_address != expected_linked:
+                _raise_violation("LINKED_SIGNER_IDENTITY_CONFLICT")
+        credential_fingerprint = hashlib.sha256(linked_key).hexdigest()
+        metadata_payload = _linked_signer_metadata_payload(
+            identity,
+            credential_address,
+            credential_fingerprint,
+        )
+        current_identity = _load_metadata(identity_directory_fd)
+        if current_identity != identity:
+            _raise_violation("PROTECTED_IDENTITY_CHANGED")
+        current_files = _inspect_protected_files_fd(identity_directory_fd)
+        if current_files.credential.present or (
+            current_files.credential.reason == "PROTECTED_DIRECTORY_UNEXPECTED_ENTRY"
+        ):
+            return OnboardingResult(
+                status=BLOCKED,
+                reason="PROTECTED_PATH_ALREADY_EXISTS",
+                files=current_files,
+            )
+        if signer_directory_fd is None:
+            signer_directory_fd = _open_fixed_directory(
+                create=True,
+                directory=LINKED_SIGNER_PROTECTED_DIRECTORY,
+            )
+            if signer_directory_fd is None:
+                _raise_violation("PROTECTED_DIRECTORY_UNAVAILABLE")
+        if _directory_entries(signer_directory_fd):
+            return OnboardingResult(
+                status=BLOCKED,
+                reason="PROTECTED_PATH_ALREADY_EXISTS",
+                files=current_files,
+            )
+        created: list[str] = []
+        final_identity: NadoPublicIdentity | None = None
+        final_identity_state: ProtectedFileState | None = None
+        try:
+            _write_new_file(signer_directory_fd, CREDENTIAL_FILENAME, linked_key)
+            created.append(CREDENTIAL_FILENAME)
+            _write_new_file(
+                signer_directory_fd,
+                LINKED_SIGNER_METADATA_FILENAME,
+                metadata_payload,
+            )
+            created.append(LINKED_SIGNER_METADATA_FILENAME)
+            os.fsync(signer_directory_fd)
+            final_credential, final_metadata = _inspect_future_linked_signer_files_fd(
+                signer_directory_fd
+            )
+            if not final_credential.protected or not final_metadata.protected:
+                _raise_violation("PROTECTED_FILE_METADATA_CHANGED")
+            final_identity = _load_metadata(identity_directory_fd)
+            if final_identity != identity:
+                _raise_violation("PROTECTED_IDENTITY_CHANGED")
+            final_identity_state = _inspect_protected_files_fd(
+                identity_directory_fd
+            ).identity
+            if not final_identity_state.protected:
+                _raise_violation("PROTECTED_FILE_METADATA_CHANGED")
+        except OnboardingViolation as exc:
+            if not _rollback_created(signer_directory_fd, created):
+                raise OnboardingViolation("PROTECTED_ROLLBACK_INCOMPLETE") from None
+            raise exc
+        except OSError:
+            if not _rollback_created(signer_directory_fd, created):
+                raise OnboardingViolation("PROTECTED_ROLLBACK_INCOMPLETE") from None
+            _raise_violation("PROTECTED_FILESYSTEM_OPERATION_FAILED")
+        except BaseException:
+            if not _rollback_created(signer_directory_fd, created):
+                raise OnboardingViolation("PROTECTED_ROLLBACK_INCOMPLETE") from None
+            raise OnboardingViolation("PROTECTED_ONBOARDING_FAILED") from None
+        assert final_identity is not None
+        assert final_identity_state is not None
+        return OnboardingResult(
+            status=LINKED_SIGNER_PROVISIONED,
+            reason="PROTECTED_NADO_LINKED_SIGNER_CREATED",
+            files=ProtectedFiles(
+                identity=final_identity_state,
+                credential=final_credential,
+            ),
+            identity=identity,
+            credential_kind=LINKED_SIGNER_CREDENTIAL,
             credential_address=credential_address,
             credential_fingerprint=credential_fingerprint,
         )
@@ -990,14 +1349,24 @@ def provision_nado_mainnet_credential(
     except BaseException:
         return _blocked("PROTECTED_ONBOARDING_FAILED")
     finally:
-        _wipe(main_key)
         _wipe(linked_key)
         _wipe(metadata_payload)
-        if directory_fd is not None:
+        if signer_directory_fd is not None:
             try:
-                os.close(directory_fd)
+                os.close(signer_directory_fd)
             except OSError:
                 pass
+        if identity_directory_fd is not None:
+            try:
+                os.close(identity_directory_fd)
+            except OSError:
+                pass
+
+
+# Explicit name for callers that want to make the future phase visible in
+# their own operator code.  The alias does not make it part of the normal
+# command or the read-only identity path.
+provision_nado_mainnet_linked_signer = provision_nado_linked_signer
 
 
 def _read_owned_file(
@@ -1061,7 +1430,7 @@ def _read_owned_file(
 
 def _metadata_from_bytes(
     raw: bytearray,
-) -> tuple[NadoPublicIdentity, str, str, str]:
+) -> NadoPublicIdentity:
     try:
         decoded = bytes(raw).decode("ascii")
         value = json.loads(decoded)
@@ -1070,21 +1439,76 @@ def _metadata_from_bytes(
     if type(value) is not dict:
         _raise_violation("METADATA_INVALID")
     expected_keys = {
-        "binding_status",
         "chain_id",
-        "credential_address",
-        "credential_fingerprint",
-        "credential_kind",
         "environment",
-        "fallback_authorization",
         "identity_source",
         "mainnet_write_authority",
         "query_authentication",
+        "read_status",
         "schema_version",
         "subaccount",
         "subaccount_name",
         "venue",
         "wallet_address",
+        "write_ready",
+    }
+    try:
+        canonical = json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError, UnicodeError):
+        _raise_violation("METADATA_NOT_CANONICAL")
+    if set(value) != expected_keys or decoded != canonical:
+        _raise_violation("METADATA_NOT_CANONICAL")
+    if (
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != IDENTITY_METADATA_SCHEMA_VERSION
+        or value["venue"] != NADO_VENUE
+        or value["environment"] != NADO_MAINNET_ENVIRONMENT
+        or type(value["chain_id"]) is not int
+        or value["chain_id"] != NADO_MAINNET_CHAIN_ID
+        or value["identity_source"] != NADO_PUBLIC_IDENTITY_SOURCE
+        or value["mainnet_write_authority"] != NO_MAINNET_WRITE_AUTHORITY
+        or value["query_authentication"] != NADO_UNSIGNED_QUERY_AUTHENTICATION
+        or value["read_status"] != NADO_UNSIGNED_READ_STATUS
+        or value["write_ready"] is not False
+    ):
+        _raise_violation("METADATA_INVALID")
+    return _identity_from_public_parts(
+        value["wallet_address"],
+        value["subaccount"],
+        subaccount_name=value["subaccount_name"],
+    )
+
+
+def _linked_signer_metadata_from_bytes(
+    raw: bytearray,
+    identity: NadoPublicIdentity,
+) -> tuple[str, str]:
+    try:
+        decoded = bytes(raw).decode("ascii")
+        value = json.loads(decoded)
+    except (UnicodeError, json.JSONDecodeError):
+        _raise_violation("METADATA_INVALID")
+    if type(value) is not dict:
+        _raise_violation("METADATA_INVALID")
+    expected_keys = {
+        "chain_id",
+        "credential_address",
+        "credential_fingerprint",
+        "credential_kind",
+        "environment",
+        "identity_source",
+        "identity_subaccount",
+        "identity_wallet_address",
+        "mainnet_write_authority",
+        "query_authentication",
+        "schema_version",
+        "venue",
     }
     try:
         canonical = json.dumps(
@@ -1101,53 +1525,31 @@ def _metadata_from_bytes(
     if (
         type(value["schema_version"]) is not int
         or value["schema_version"] != 1
+        or value["chain_id"] != NADO_MAINNET_CHAIN_ID
         or value["venue"] != NADO_VENUE
         or value["environment"] != NADO_MAINNET_ENVIRONMENT
-        or type(value["chain_id"]) is not int
-        or value["chain_id"] != NADO_MAINNET_CHAIN_ID
         or value["identity_source"] != NADO_PUBLIC_IDENTITY_SOURCE
         or value["mainnet_write_authority"] != NO_MAINNET_WRITE_AUTHORITY
         or value["query_authentication"] != NADO_UNSIGNED_QUERY_AUTHENTICATION
+        or value["credential_kind"] != LINKED_SIGNER_CREDENTIAL
     ):
         _raise_violation("METADATA_INVALID")
-    identity = _identity_from_parts(
-        _address(value["wallet_address"], "wallet_address"),
-        _subaccount_name(value["subaccount_name"]),
-        expected_subaccount=_bytes32(value["subaccount"], "subaccount"),
+    if (
+        _address(value["identity_wallet_address"], "identity_wallet_address")
+        != identity.wallet_address
+        or _bytes32(value["identity_subaccount"], "identity_subaccount")
+        != identity.subaccount
+    ):
+        _raise_violation("METADATA_IDENTITY_CONFLICT")
+    return (
+        _address(value["credential_address"], "credential_address"),
+        _hex_fingerprint(value["credential_fingerprint"], "credential_fingerprint"),
     )
-    credential_kind = value["credential_kind"]
-    if type(credential_kind) is not str or credential_kind not in {
-        LINKED_SIGNER_CREDENTIAL,
-        MAIN_WALLET_FALLBACK_CREDENTIAL,
-    }:
-        _raise_violation("METADATA_INVALID")
-    credential_address = _address(
-        value["credential_address"], "credential_address"
-    )
-    if credential_kind == LINKED_SIGNER_CREDENTIAL:
-        if (
-            credential_address == identity.wallet_address
-            or value["binding_status"] != LINKED_SIGNER_BINDING_PENDING
-            or value["fallback_authorization"] != "NOT_APPLICABLE"
-        ):
-            _raise_violation("METADATA_IDENTITY_CONFLICT")
-    else:
-        if (
-            credential_address != identity.wallet_address
-            or value["binding_status"] != MAIN_WALLET_DIRECT_BINDING
-            or value["fallback_authorization"]
-            != "OFFICIAL_LINKED_SIGNER_INSUFFICIENCY_PROVEN"
-        ):
-            _raise_violation("METADATA_IDENTITY_CONFLICT")
-    fingerprint = _hex_fingerprint(
-        value["credential_fingerprint"], "credential_fingerprint"
-    )
-    return identity, credential_kind, credential_address, fingerprint
 
 
 def _load_metadata(
     directory_fd: int,
-) -> tuple[NadoPublicIdentity, str, str, str]:
+) -> NadoPublicIdentity:
     raw: bytearray | None = None
     try:
         raw = _read_owned_file(
@@ -1167,10 +1569,12 @@ def discover_public_identity() -> NadoPublicIdentity:
     if directory_fd is None:
         _raise_violation("PROTECTED_DIRECTORY_MISSING")
     try:
-        identity, _kind, _address_value, _fingerprint = _load_metadata(
-            directory_fd
-        )
-        return identity
+        files = _inspect_protected_files_fd(directory_fd)
+        if files.credential.present or (
+            files.credential.reason == "PROTECTED_DIRECTORY_UNEXPECTED_ENTRY"
+        ):
+            _raise_violation("PROTECTED_DIRECTORY_UNEXPECTED_ENTRY")
+        return _load_metadata(directory_fd)
     finally:
         try:
             os.close(directory_fd)
@@ -1181,41 +1585,70 @@ def discover_public_identity() -> NadoPublicIdentity:
 def discover_protected_credential() -> CredentialDiscovery:
     """Validate restart persistence without returning secret bytes."""
 
-    directory_fd = _open_fixed_directory(create=False)
-    if directory_fd is None:
+    identity_directory_fd = _open_fixed_directory(create=False)
+    if identity_directory_fd is None:
         _raise_violation("PROTECTED_DIRECTORY_MISSING")
+    signer_directory_fd: int | None = None
+    metadata_raw: bytearray | None = None
     raw: bytearray | None = None
     try:
-        identity, credential_kind, credential_address, fingerprint = _load_metadata(
-            directory_fd
+        current_files = _inspect_protected_files_fd(identity_directory_fd)
+        if current_files.credential.present or (
+            current_files.credential.reason == "PROTECTED_DIRECTORY_UNEXPECTED_ENTRY"
+        ):
+            _raise_violation("PROTECTED_DIRECTORY_UNEXPECTED_ENTRY")
+        identity = _load_metadata(identity_directory_fd)
+        signer_directory_fd = _open_fixed_directory(
+            create=False,
+            directory=LINKED_SIGNER_PROTECTED_DIRECTORY,
+        )
+        if signer_directory_fd is None:
+            _raise_violation("PROTECTED_FILE_UNAVAILABLE")
+        entries = _directory_entries(signer_directory_fd)
+        if set(entries) != {
+            CREDENTIAL_FILENAME,
+            LINKED_SIGNER_METADATA_FILENAME,
+        }:
+            _raise_violation("PROTECTED_DIRECTORY_CONTENT_CHANGED")
+        metadata_raw = _read_owned_file(
+            signer_directory_fd,
+            LINKED_SIGNER_METADATA_FILENAME,
+            maximum=MAX_IDENTITY_BYTES,
+        )
+        credential_address, fingerprint = _linked_signer_metadata_from_bytes(
+            metadata_raw,
+            identity,
         )
         raw = _read_owned_file(
-            directory_fd,
+            signer_directory_fd,
             CREDENTIAL_FILENAME,
             maximum=MAX_PRIVATE_KEY_BYTES,
             exact_size=MAX_PRIVATE_KEY_BYTES,
         )
         derived_address = _derive_wallet_address(raw)
+        if derived_address == identity.wallet_address:
+            _raise_violation(MAIN_WALLET_PERSISTENCE_FORBIDDEN)
         if derived_address != credential_address:
             _raise_violation("PERSISTED_CREDENTIAL_IDENTITY_CONFLICT")
         if hashlib.sha256(raw).hexdigest() != fingerprint:
             _raise_violation("PERSISTED_CREDENTIAL_FINGERPRINT_CONFLICT")
-        if credential_kind == LINKED_SIGNER_CREDENTIAL:
-            if derived_address == identity.wallet_address:
-                _raise_violation("MAIN_AND_LINKED_IDENTITY_CONFLICT")
-        elif derived_address != identity.wallet_address:
-            _raise_violation("PERSISTED_CREDENTIAL_IDENTITY_CONFLICT")
         return CredentialDiscovery(
             identity=identity,
-            credential_kind=credential_kind,
+            credential_kind=LINKED_SIGNER_CREDENTIAL,
             credential_address=credential_address,
             credential_fingerprint=fingerprint,
-            credential_path=str(protected_paths()["credential"]),
+            credential_path=str(future_linked_signer_paths()["credential"]),
         )
     finally:
+        _wipe(metadata_raw)
         _wipe(raw)
+        if signer_directory_fd is not None:
+            try:
+                os.close(signer_directory_fd)
+            except OSError:
+                pass
         try:
-            os.close(directory_fd)
+            os.close(identity_directory_fd)
         except OSError:
             pass
 
@@ -1223,7 +1656,7 @@ def discover_protected_credential() -> CredentialDiscovery:
 def main() -> int:
     """Run the fixed hidden-input operator flow with no CLI arguments."""
 
-    result = provision_nado_mainnet_credential()
+    result = provision_nado_mainnet_identity()
     print(result.evidence())
     return 0 if result.provisioned else 1
 
@@ -1236,13 +1669,15 @@ __all__ = [
     "BLOCKED",
     "CREDENTIAL_FILENAME",
     "CredentialDiscovery",
-    "CURRENT_OFFICIAL_LINKED_SIGNER_SUPPORT",
+    "IDENTITY_METADATA_SCHEMA_VERSION",
     "IDENTITY_FILENAME",
-    "LINKED_SIGNER_BINDING_PENDING",
     "LINKED_SIGNER_CREDENTIAL",
-    "MAIN_WALLET_FALLBACK_CREDENTIAL",
-    "MainWalletFallbackProof",
+    "LINKED_SIGNER_METADATA_FILENAME",
+    "LINKED_SIGNER_PROVISIONED",
+    "LINKED_SIGNER_PROTECTED_DIRECTORY",
+    "LINKED_SIGNER_PROVISIONING_SEPARATE",
     "MAX_IDENTITY_BYTES",
+    "MAIN_WALLET_PERSISTENCE_FORBIDDEN",
     "NADO_DEFAULT_SUBACCOUNT_NAME",
     "NADO_MAINNET_CHAIN_ID",
     "NADO_MAINNET_ENVIRONMENT",
@@ -1254,21 +1689,24 @@ __all__ = [
     "NadoPublicIdentity",
     "OnboardingResult",
     "OnboardingViolation",
-    "OFFICIAL_FALLBACK_REASON",
-    "OFFICIAL_FALLBACK_SOURCE",
     "PROTECTED_DIRECTORY",
     "PROTECTED_DIRECTORY_MODE",
     "PROTECTED_FILE_MODE",
     "PROVISIONED",
+    "IDENTITY_PROVISIONED",
     "ProtectedFileState",
     "ProtectedFiles",
-    "REQUIRED_LIFECYCLE",
     "discover_protected_credential",
     "discover_public_identity",
     "derive_public_identity",
     "export_unsigned_read_identity",
+    "future_linked_signer_paths",
     "inspect_protected_files",
     "main",
+    "provision_nado_linked_signer",
     "provision_nado_mainnet_credential",
+    "provision_nado_mainnet_identity",
+    "provision_nado_mainnet_linked_signer",
+    "provision_nado_read_identity",
     "protected_paths",
 ]
