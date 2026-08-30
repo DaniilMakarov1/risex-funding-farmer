@@ -294,6 +294,26 @@ def _directory_child_failure(
     _raise_violation("PROTECTED_DIRECTORY_UNAVAILABLE")
 
 
+def _required_directory_flags() -> int:
+    directory_flag = getattr(os, "O_DIRECTORY", None)
+    nofollow_flag = getattr(os, "O_NOFOLLOW", None)
+    if (
+        type(directory_flag) is not int
+        or directory_flag <= 0
+        or type(nofollow_flag) is not int
+        or nofollow_flag <= 0
+    ):
+        _raise_violation("PROTECTED_DIRECTORY_FEATURE_UNAVAILABLE")
+    return os.O_RDONLY | directory_flag | nofollow_flag
+
+
+def _validate_directory_component(info: os.stat_result) -> None:
+    if not stat.S_ISDIR(info.st_mode):
+        _raise_violation("PROTECTED_DIRECTORY_NOT_DIRECTORY")
+    if info.st_uid not in (0, os.getuid()):
+        _raise_violation("PROTECTED_DIRECTORY_OWNER_NOT_CURRENT_USER")
+
+
 def _open_directory_child(
     parent_fd: int,
     component: str,
@@ -338,12 +358,12 @@ def _open_directory_child(
 
     try:
         info = os.fstat(child_fd)
-        if not stat.S_ISDIR(info.st_mode):
-            _raise_violation("PROTECTED_DIRECTORY_NOT_DIRECTORY")
+        _validate_directory_component(info)
         if created:
             try:
                 os.fchmod(child_fd, PROTECTED_DIRECTORY_MODE)
                 info = os.fstat(child_fd)
+                _validate_directory_component(info)
             except OSError:
                 _raise_violation("PROTECTED_DIRECTORY_UNAVAILABLE")
         return child_fd, info
@@ -359,8 +379,7 @@ def _open_fixed_directory(*, create: bool = True) -> int | None:
     """Open the fixed directory through trusted descriptors only."""
 
     parts = _protected_directory_parts()
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags = _required_directory_flags()
     descriptor = -1
     try:
         descriptor = os.open(os.sep, flags)
@@ -740,7 +759,7 @@ def _metadata_payload(
 
 def _write_new_file(directory_fd: int, filename: str, payload: bytearray) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= os.O_NOFOLLOW
     descriptor = -1
     created = False
     completed = False
@@ -988,7 +1007,7 @@ def _read_owned_file(
     maximum: int,
     exact_size: int | None = None,
 ) -> bytearray:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | os.O_NOFOLLOW
     try:
         descriptor = os.open(filename, flags, dir_fd=directory_fd)
     except OSError:

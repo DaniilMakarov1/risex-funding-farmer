@@ -389,6 +389,54 @@ def test_existing_parent_symlink_is_rejected_before_hidden_input(
     assert called is False
 
 
+@pytest.mark.parametrize("missing_flag", ("O_DIRECTORY", "O_NOFOLLOW"))
+def test_required_directory_flags_fail_closed_before_hidden_input(
+    tmp_path: Path, monkeypatch, missing_flag: str
+) -> None:
+    _set_directory(tmp_path, monkeypatch)
+    monkeypatch.delattr(onboarding.os, missing_flag, raising=False)
+
+    inspected = onboarding.inspect_protected_files()
+    assert inspected.identity.reason == "PROTECTED_DIRECTORY_FEATURE_UNAVAILABLE"
+    called = False
+
+    def no_prompt(_prompt: str) -> str:
+        nonlocal called
+        called = True
+        return MAIN_KEY
+
+    result = onboarding.provision_nado_mainnet_credential(no_prompt)
+    assert result.status == onboarding.BLOCKED
+    assert result.reason == "PROTECTED_DIRECTORY_FEATURE_UNAVAILABLE"
+    assert called is False
+
+
+def test_foreign_owned_intermediate_directory_is_rejected(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _set_directory(tmp_path, monkeypatch)
+    real_fstat = onboarding.os.fstat
+    current_uid = os.getuid()
+    foreign_uid = current_uid + 100000
+    fstat_calls = 0
+
+    def foreign_intermediate_fstat(fd: int):
+        nonlocal fstat_calls
+        info = real_fstat(fd)
+        fstat_calls += 1
+        if fstat_calls == 1:
+            return SimpleNamespace(
+                st_mode=info.st_mode,
+                st_uid=foreign_uid,
+            )
+        return info
+
+    monkeypatch.setattr(onboarding.os, "fstat", foreign_intermediate_fstat)
+    inspected = onboarding.inspect_protected_files()
+    assert inspected.identity.reason == "PROTECTED_DIRECTORY_OWNER_NOT_CURRENT_USER"
+    assert fstat_calls == 1
+
+
 def test_provision_binds_to_opened_fd_after_parent_substitution(
     tmp_path: Path, monkeypatch
 ) -> None:
