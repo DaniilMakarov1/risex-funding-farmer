@@ -21,6 +21,7 @@ test = [
 ]
 testnet-risex = ["eth-account>=0.13,<0.14"]
 testnet-nado = ["eth-account>=0.13,<0.14", "brotli>=1.1,<2"]
+mainnet-nado = ["eth-account>=0.13,<0.14"]
 testnet-extended = ["x10-python-trading-starknet==2.5.0"]
 
 [tool.setuptools.packages.find]
