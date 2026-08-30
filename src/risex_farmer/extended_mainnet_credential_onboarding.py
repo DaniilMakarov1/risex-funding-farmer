@@ -16,6 +16,7 @@ client, prepare a payload, sign, connect to the venue, or dispatch a request.
 from __future__ import annotations
 
 import argparse
+import errno
 import getpass
 import hashlib
 import json
@@ -399,58 +400,208 @@ def protected_paths() -> Mapping[str, Path]:
     }
 
 
-def _path_chain(path: Path) -> tuple[Path, ...]:
+def _path_components(path: Path) -> tuple[str, ...]:
     if not path.is_absolute():
         raise CredentialOnboardingError("PROTECTED_PATH_NOT_ABSOLUTE")
-    result: list[Path] = []
-    current = path
-    while True:
-        result.append(current)
-        if current.parent == current:
-            break
-        current = current.parent
-    return tuple(reversed(result))
+    if path.anchor != os.sep:
+        raise CredentialOnboardingError("PROTECTED_PATH_NOT_ABSOLUTE")
+    components = path.parts[1:]
+    if not components or any(component in {"", ".", ".."} for component in components):
+        raise CredentialOnboardingError("PROTECTED_PATH_INVALID")
+    return components
+
+
+def _directory_open_flags() -> int:
+    if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
+        raise CredentialOnboardingError("PROTECTED_DIRECTORY_FLAGS_UNAVAILABLE")
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def _directory_open_error(
+    error: OSError,
+    *,
+    root: bool = False,
+    parent_fd: int | None = None,
+    component: str | None = None,
+) -> CredentialOnboardingError:
+    if parent_fd is not None and component is not None:
+        try:
+            info = os.stat(component, dir_fd=parent_fd, follow_symlinks=False)
+        except OSError:
+            info = None
+        if info is not None:
+            if stat.S_ISLNK(info.st_mode):
+                return CredentialOnboardingError("PROTECTED_DIRECTORY_SYMLINK")
+            if not stat.S_ISDIR(info.st_mode):
+                return CredentialOnboardingError("PROTECTED_DIRECTORY_NOT_DIRECTORY")
+    if error.errno == errno.ELOOP:
+        return CredentialOnboardingError("PROTECTED_DIRECTORY_SYMLINK")
+    if error.errno == errno.ENOTDIR:
+        return CredentialOnboardingError("PROTECTED_DIRECTORY_NOT_DIRECTORY")
+    if isinstance(error, FileNotFoundError):
+        return CredentialOnboardingError("PROTECTED_DIRECTORY_MISSING")
+    return CredentialOnboardingError(
+        "PROTECTED_DIRECTORY_ROOT_UNREADABLE" if root else "PROTECTED_DIRECTORY_UNREADABLE"
+    )
+
+
+def _validate_directory_component(descriptor: int) -> os.stat_result:
+    try:
+        info = os.fstat(descriptor)
+    except OSError:
+        raise CredentialOnboardingError("PROTECTED_DIRECTORY_UNREADABLE") from None
+    if not stat.S_ISDIR(info.st_mode):
+        raise CredentialOnboardingError("PROTECTED_DIRECTORY_NOT_DIRECTORY")
+    return info
+
+
+def _validate_final_directory(descriptor: int) -> os.stat_result:
+    info = _validate_directory_component(descriptor)
+    if info.st_uid != os.getuid():
+        raise CredentialOnboardingError("PROTECTED_DIRECTORY_OWNER_NOT_CURRENT_USER")
+    if stat.S_IMODE(info.st_mode) != PROTECTED_DIRECTORY_MODE:
+        raise CredentialOnboardingError("PROTECTED_DIRECTORY_MODE_NOT_0700")
+    return info
+
+
+def _walk_protected_directory(*, create: bool) -> int:
+    """Open the fixed directory through retained descriptor-relative parents."""
+
+    components = _path_components(PROTECTED_DIRECTORY)
+    flags = _directory_open_flags()
+    current = -1
+    try:
+        try:
+            current = os.open(os.sep, flags)
+        except OSError as exc:
+            raise _directory_open_error(exc, root=True) from None
+        try:
+            _validate_directory_component(current)
+        except CredentialOnboardingError:
+            raise CredentialOnboardingError("PROTECTED_DIRECTORY_ROOT_INVALID") from None
+
+        for index, component in enumerate(components):
+            final = index == len(components) - 1
+            child = -1
+            created = False
+            keep_child = False
+            try:
+                try:
+                    child = os.open(component, flags, dir_fd=current)
+                except FileNotFoundError as exc:
+                    if not create:
+                        raise _directory_open_error(
+                            exc, parent_fd=current, component=component
+                        ) from None
+                    try:
+                        os.mkdir(component, PROTECTED_DIRECTORY_MODE, dir_fd=current)
+                        created = True
+                    except FileExistsError:
+                        pass
+                    except OSError:
+                        raise CredentialOnboardingError(
+                            "PROTECTED_DIRECTORY_CREATE_FAILED"
+                        ) from None
+                    try:
+                        child = os.open(component, flags, dir_fd=current)
+                    except OSError as exc:
+                        raise _directory_open_error(
+                            exc, parent_fd=current, component=component
+                        ) from None
+                except OSError as exc:
+                    raise _directory_open_error(
+                        exc, parent_fd=current, component=component
+                    ) from None
+
+                try:
+                    info = _validate_directory_component(child)
+                except CredentialOnboardingError:
+                    raise
+                if not final and info.st_uid not in {0, os.getuid()}:
+                    raise CredentialOnboardingError(
+                        "PROTECTED_DIRECTORY_PARENT_OWNER_NOT_TRUSTED"
+                    )
+                if created:
+                    try:
+                        os.fchmod(child, PROTECTED_DIRECTORY_MODE)
+                    except OSError:
+                        raise CredentialOnboardingError(
+                            "PROTECTED_DIRECTORY_MODE_SET_FAILED"
+                        ) from None
+                    info = _validate_directory_component(child)
+                    if stat.S_IMODE(info.st_mode) != PROTECTED_DIRECTORY_MODE:
+                        raise CredentialOnboardingError(
+                            "PROTECTED_DIRECTORY_MODE_NOT_0700"
+                        )
+                keep_child = True
+            finally:
+                if not keep_child and child >= 0:
+                    try:
+                        os.close(child)
+                    except OSError:
+                        pass
+                if current >= 0:
+                    try:
+                        os.close(current)
+                    except OSError:
+                        pass
+                    current = -1
+            current = child
+            child = -1
+        if current < 0:
+            raise CredentialOnboardingError("PROTECTED_DIRECTORY_INVALID")
+        return current
+    except BaseException:
+        if current >= 0:
+            try:
+                os.close(current)
+            except OSError:
+                pass
+        raise
 
 
 def _directory_observation() -> tuple[bool, bool, str, int | None]:
-    path = PROTECTED_DIRECTORY
+    descriptor = -1
     try:
-        _path_chain(path)
+        descriptor = _walk_protected_directory(create=False)
+        info = os.fstat(descriptor)
+        mode = stat.S_IMODE(info.st_mode)
+        if info.st_uid != os.getuid():
+            return True, False, "PROTECTED_DIRECTORY_OWNER_NOT_CURRENT_USER", mode
+        if mode != PROTECTED_DIRECTORY_MODE:
+            return True, False, "PROTECTED_DIRECTORY_MODE_NOT_0700", mode
+        return True, True, "PROTECTED_DIRECTORY_OK", mode
     except CredentialOnboardingError as exc:
-        return False, False, exc.code, None
-    try:
-        info = os.lstat(path)
-    except OSError:
-        if not path.exists():
-            return False, False, "PROTECTED_DIRECTORY_MISSING", None
-        return False, False, "PROTECTED_DIRECTORY_UNREADABLE", None
-    # Only the fixed final directory is a protected object.  System paths on
-    # macOS may legitimately contain a stable symlink such as /var ->
-    # /private/var; the final O_NOFOLLOW open below still rejects a swapped
-    # credential directory.
-    if stat.S_ISLNK(info.st_mode):
-        return False, False, "PROTECTED_DIRECTORY_SYMLINK", None
-    if not stat.S_ISDIR(info.st_mode):
-        return False, False, "PROTECTED_DIRECTORY_NOT_DIRECTORY", None
-    mode = stat.S_IMODE(info.st_mode)
-    if info.st_uid != os.getuid():
-        return True, False, "PROTECTED_DIRECTORY_OWNER_NOT_CURRENT_USER", mode
-    if mode != PROTECTED_DIRECTORY_MODE:
-        return True, False, "PROTECTED_DIRECTORY_MODE_NOT_0700", mode
-    return True, True, "PROTECTED_DIRECTORY_OK", mode
+        return (
+            False,
+            False,
+            exc.code,
+            None,
+        )
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
-def _file_observation(name: str, path: Path, directory_ready: bool) -> ProtectedFileMetadata:
-    if not directory_ready:
+def _file_observation(
+    name: str,
+    path: Path,
+    directory_ready: bool,
+    directory_fd: int | None = None,
+) -> ProtectedFileMetadata:
+    if not directory_ready or directory_fd is None:
         return ProtectedFileMetadata(
             name=name,
             path=str(path),
             present=False,
             protected=False,
             reason="PROTECTED_DIRECTORY_NOT_READY",
-        )
+    )
     try:
-        info = os.lstat(path)
+        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
     except FileNotFoundError:
         return ProtectedFileMetadata(name, str(path), False, False, "PROTECTED_FILE_MISSING")
     except OSError:
@@ -490,10 +641,16 @@ def _file_observation(name: str, path: Path, directory_ready: bool) -> Protected
 
 
 def _directory_entries() -> tuple[str, ...]:
+    descriptor = -1
     try:
-        return tuple(sorted(os.listdir(PROTECTED_DIRECTORY)))
-    except OSError:
-        raise CredentialOnboardingError("PROTECTED_DIRECTORY_UNREADABLE") from None
+        descriptor = _walk_protected_directory(create=False)
+        return _directory_entries_from_fd(descriptor)
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 def _directory_entries_from_fd(directory_fd: int) -> tuple[str, ...]:
@@ -503,21 +660,14 @@ def _directory_entries_from_fd(directory_fd: int) -> tuple[str, ...]:
         raise CredentialOnboardingError("PROTECTED_DIRECTORY_UNREADABLE") from None
 
 
-def _read_metadata_file(path: Path) -> bytearray:
+def _read_metadata_file(directory_fd: int) -> bytearray:
     """Read only the non-secret metadata manifest."""
 
-    directory_fd = -1
     descriptor = -1
     result = bytearray()
     try:
-        directory_fd = os.open(
-            path.parent,
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
-        )
         descriptor = os.open(
-            path.name,
+            IDENTITY_FILENAME,
             os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
             dir_fd=directory_fd,
         )
@@ -560,11 +710,6 @@ def _read_metadata_file(path: Path) -> bytearray:
         if descriptor >= 0:
             try:
                 os.close(descriptor)
-            except OSError:
-                pass
-        if directory_fd >= 0:
-            try:
-                os.close(directory_fd)
             except OSError:
                 pass
 
@@ -643,9 +788,13 @@ def _inspect_protected_credentials() -> CredentialInspection:
     """Inspect protected metadata only; secret file bytes are never read."""
 
     path_map = protected_paths()
-    present, protected, reason, mode = _directory_observation()
+    directory_fd = -1
+    present = False
+    protected = False
+    mode: int | None = None
+    reason = "PROTECTED_DIRECTORY_MISSING"
     files = tuple(
-        _file_observation(name, path_map[key], protected)
+        _file_observation(name, path_map[key], False)
         for key, name in (
             ("identity", IDENTITY_FILENAME),
             ("api_key", API_KEY_FILENAME),
@@ -656,44 +805,74 @@ def _inspect_protected_credentials() -> CredentialInspection:
     api_fingerprint: str | None = None
     stark_fingerprint: str | None = None
     inspection_reason = reason
-    if not present:
-        status = (
-            INSPECTION_MISSING
-            if reason in {"PROTECTED_DIRECTORY_MISSING", "PROTECTED_DIRECTORY_PARENT_MISSING"}
-            else INSPECTION_BLOCKED
-        )
-    elif not protected:
-        status = INSPECTION_BLOCKED
-    else:
+    status = INSPECTION_MISSING
+    try:
         try:
-            entries = _directory_entries()
+            directory_fd = _walk_protected_directory(create=False)
         except CredentialOnboardingError as exc:
-            entries = ()
-            status = INSPECTION_BLOCKED
-            inspection_reason = exc.code
+            reason = exc.code
+            inspection_reason = reason
+            status = (
+                INSPECTION_MISSING
+                if reason in {"PROTECTED_DIRECTORY_MISSING", "PROTECTED_DIRECTORY_PARENT_MISSING"}
+                else INSPECTION_BLOCKED
+            )
         else:
-            unexpected = set(entries) - set(PROTECTED_FILENAMES)
-            if unexpected:
+            present = True
+            info = _validate_directory_component(directory_fd)
+            mode = stat.S_IMODE(info.st_mode)
+            if info.st_uid != os.getuid():
+                inspection_reason = "PROTECTED_DIRECTORY_OWNER_NOT_CURRENT_USER"
                 status = INSPECTION_BLOCKED
-                inspection_reason = "PROTECTED_DIRECTORY_UNEXPECTED_ENTRY"
-            elif not all(item.protected for item in files):
+            elif mode != PROTECTED_DIRECTORY_MODE:
+                inspection_reason = "PROTECTED_DIRECTORY_MODE_NOT_0700"
                 status = INSPECTION_BLOCKED
-                inspection_reason = next(
-                    item.reason for item in files if not item.protected
-                )
             else:
-                raw = bytearray()
+                protected = True
+                reason = "PROTECTED_DIRECTORY_OK"
+                inspection_reason = reason
+                files = tuple(
+                    _file_observation(name, path_map[key], True, directory_fd)
+                    for key, name in (
+                        ("identity", IDENTITY_FILENAME),
+                        ("api_key", API_KEY_FILENAME),
+                        ("stark_private_key", STARK_PRIVATE_KEY_FILENAME),
+                    )
+                )
                 try:
-                    raw = _read_metadata_file(path_map["identity"])
-                    identity, api_fingerprint, stark_fingerprint = _metadata_values(raw)
+                    entries = _directory_entries_from_fd(directory_fd)
                 except CredentialOnboardingError as exc:
                     status = INSPECTION_BLOCKED
                     inspection_reason = exc.code
-                finally:
-                    _zeroize(raw)
-                if identity is not None:
-                    status = INSPECTION_READY
-                    inspection_reason = "PROTECTED_FILES_READY"
+                else:
+                    unexpected = set(entries) - set(PROTECTED_FILENAMES)
+                    if unexpected:
+                        status = INSPECTION_BLOCKED
+                        inspection_reason = "PROTECTED_DIRECTORY_UNEXPECTED_ENTRY"
+                    elif not all(item.protected for item in files):
+                        status = INSPECTION_BLOCKED
+                        inspection_reason = next(
+                            item.reason for item in files if not item.protected
+                        )
+                    else:
+                        raw = bytearray()
+                        try:
+                            raw = _read_metadata_file(directory_fd)
+                            identity, api_fingerprint, stark_fingerprint = _metadata_values(raw)
+                        except CredentialOnboardingError as exc:
+                            status = INSPECTION_BLOCKED
+                            inspection_reason = exc.code
+                        finally:
+                            _zeroize(raw)
+                        if identity is not None:
+                            status = INSPECTION_READY
+                            inspection_reason = "PROTECTED_FILES_READY"
+    finally:
+        if directory_fd >= 0:
+            try:
+                os.close(directory_fd)
+            except OSError:
+                pass
     return CredentialInspection(
         status=status,
         reason=inspection_reason,
@@ -718,80 +897,30 @@ def inspect_protected_credentials() -> CredentialInspection:
 
 
 def _ensure_protected_directory() -> None:
-    chain = _path_chain(PROTECTED_DIRECTORY)
-    missing: list[Path] = []
-    for item in chain:
-        try:
-            info = os.lstat(item)
-        except FileNotFoundError:
-            missing.append(item)
-            continue
-        except OSError:
-            raise CredentialOnboardingError("PROTECTED_DIRECTORY_UNREADABLE") from None
-        if item == PROTECTED_DIRECTORY and stat.S_ISLNK(info.st_mode):
-            raise CredentialOnboardingError("PROTECTED_DIRECTORY_SYMLINK")
-        if not stat.S_ISDIR(info.st_mode) and not (
-            item != PROTECTED_DIRECTORY and stat.S_ISLNK(info.st_mode)
-        ):
-            raise CredentialOnboardingError("PROTECTED_DIRECTORY_NOT_DIRECTORY")
-    for item in missing:
-        created = False
-        try:
-            os.mkdir(item, PROTECTED_DIRECTORY_MODE)
-            created = True
-        except FileExistsError:
-            pass
-        except OSError:
-            raise CredentialOnboardingError("PROTECTED_DIRECTORY_CREATE_FAILED") from None
-        if created:
+    descriptor = -1
+    try:
+        descriptor = _walk_protected_directory(create=True)
+        _validate_final_directory(descriptor)
+    finally:
+        if descriptor >= 0:
             try:
-                os.chmod(item, PROTECTED_DIRECTORY_MODE)
+                os.close(descriptor)
             except OSError:
-                raise CredentialOnboardingError("PROTECTED_DIRECTORY_MODE_SET_FAILED") from None
-        try:
-            info = os.lstat(item)
-        except OSError:
-            raise CredentialOnboardingError("PROTECTED_DIRECTORY_UNREADABLE") from None
-        if item == PROTECTED_DIRECTORY and stat.S_ISLNK(info.st_mode):
-            raise CredentialOnboardingError("PROTECTED_DIRECTORY_SYMLINK")
-        if not stat.S_ISDIR(info.st_mode) and not (
-            item != PROTECTED_DIRECTORY and stat.S_ISLNK(info.st_mode)
-        ):
-            raise CredentialOnboardingError("PROTECTED_DIRECTORY_NOT_DIRECTORY")
-    try:
-        info = os.lstat(PROTECTED_DIRECTORY)
-    except OSError:
-        raise CredentialOnboardingError("PROTECTED_DIRECTORY_UNREADABLE") from None
-    if info.st_uid != os.getuid():
-        raise CredentialOnboardingError("PROTECTED_DIRECTORY_OWNER_NOT_CURRENT_USER")
-    if stat.S_IMODE(info.st_mode) != PROTECTED_DIRECTORY_MODE:
-        raise CredentialOnboardingError("PROTECTED_DIRECTORY_MODE_NOT_0700")
+                pass
 
 
-def _open_directory() -> int:
+def _open_directory(*, create: bool = False) -> int:
+    descriptor = -1
     try:
-        descriptor = os.open(
-            PROTECTED_DIRECTORY,
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
-        )
-    except OSError:
-        raise CredentialOnboardingError("PROTECTED_DIRECTORY_OPEN_FAILED") from None
-    try:
-        info = os.fstat(descriptor)
-        if (
-            not stat.S_ISDIR(info.st_mode)
-            or info.st_uid != os.getuid()
-            or stat.S_IMODE(info.st_mode) != PROTECTED_DIRECTORY_MODE
-        ):
-            raise CredentialOnboardingError("PROTECTED_DIRECTORY_NOT_PROTECTED")
+        descriptor = _walk_protected_directory(create=create)
+        _validate_final_directory(descriptor)
         return descriptor
     except BaseException:
-        try:
-            os.close(descriptor)
-        except OSError:
-            pass
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
         raise
 
 
@@ -939,14 +1068,6 @@ def provision_protected_credentials(
         return ProvisioningResult(BLOCKED, before.reason, before)
     if before.directory_present and any(item.present for item in before.files):
         return ProvisioningResult(BLOCKED, "PROTECTED_PATH_ALREADY_EXISTS", before)
-    if before.directory_present:
-        try:
-            if _directory_entries():
-                return ProvisioningResult(
-                    BLOCKED, "PROTECTED_DIRECTORY_NOT_EMPTY", before
-                )
-        except CredentialOnboardingError as exc:
-            return ProvisioningResult(BLOCKED, exc.code, before)
 
     api_key = bytearray()
     stark_private_key = bytearray()
@@ -978,8 +1099,7 @@ def provision_protected_credentials(
         metadata_payload = _metadata_payload(
             identity, api_fingerprint, stark_fingerprint
         )
-        _ensure_protected_directory()
-        directory_fd = _open_directory()
+        directory_fd = _open_directory(create=True)
         if _directory_entries_from_fd(directory_fd):
             raise CredentialOnboardingError("PROTECTED_PATH_ALREADY_EXISTS")
         _write_secure_file(

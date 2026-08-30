@@ -255,7 +255,15 @@ def test_bad_fixed_directory_is_rejected_without_prompt(
             directory.chmod(0o755)
         else:
             real_uid = os.getuid()
-            monkeypatch.setattr(onboarding.os, "getuid", lambda: real_uid + 1)
+            parent_checks = len(onboarding._path_components(directory)) - 1
+            calls = 0
+
+            def wrong_final_owner():
+                nonlocal calls
+                calls += 1
+                return real_uid if calls <= parent_checks else real_uid + 1
+
+            monkeypatch.setattr(onboarding.os, "getuid", wrong_final_owner)
 
     prompts = []
     result = onboarding.provision_protected_credentials(_input(_values(), prompts))
@@ -290,13 +298,23 @@ def test_metadata_inspection_reports_file_safety_without_secret_reads(
     elif defect == "mode":
         api_key.chmod(0o644)
     else:
-        real_uid = os.getuid()
-        monkeypatch.setattr(
-            onboarding,
-            "_directory_observation",
-            lambda: (True, True, "PROTECTED_DIRECTORY_OK", 0o700),
-        )
-        monkeypatch.setattr(onboarding.os, "getuid", lambda: real_uid + 1)
+        real_stat = onboarding.os.stat
+        bad_uid = os.getuid() + 1
+
+        class FakeStat:
+            def __init__(self, info):
+                self.st_mode = info.st_mode
+                self.st_uid = bad_uid
+                self.st_nlink = info.st_nlink
+                self.st_size = info.st_size
+
+        def stat_with_wrong_api_owner(path, *args, **kwargs):
+            info = real_stat(path, *args, **kwargs)
+            if path == onboarding.API_KEY_FILENAME:
+                return FakeStat(info)
+            return info
+
+        monkeypatch.setattr(onboarding.os, "stat", stat_with_wrong_api_owner)
 
     inspection = onboarding.inspect_protected_credentials()
     api_observation = next(
@@ -311,6 +329,53 @@ def test_metadata_inspection_reports_file_safety_without_secret_reads(
     }
     assert API_KEY not in inspection.evidence()
     assert STARK_PRIVATE_KEY not in inspection.evidence()
+
+
+def test_parent_symlink_is_rejected_before_hidden_input(tmp_path, monkeypatch):
+    directory = _configure(tmp_path, monkeypatch)
+    parent_component = directory.parents[1]
+    redirected = tmp_path / "redirected-parent"
+    redirected.mkdir()
+    parent_component.symlink_to(redirected, target_is_directory=True)
+
+    prompts = []
+    result = onboarding.provision_protected_credentials(_input(_values(), prompts))
+
+    assert result.status == onboarding.BLOCKED
+    assert result.reason == "PROTECTED_DIRECTORY_SYMLINK"
+    assert prompts == []
+    assert not (redirected / "risex-farmer").exists()
+
+
+def test_retained_final_descriptor_survives_parent_swap(tmp_path, monkeypatch):
+    directory = _configure(tmp_path, monkeypatch)
+    assert onboarding.provision_protected_credentials(_input(_values())).provisioned
+    descriptor = onboarding._open_directory()
+    parent_component = directory.parents[1]
+    moved_parent = tmp_path / "original-parent"
+    redirected = tmp_path / "redirected-parent"
+    redirected.mkdir()
+
+    try:
+        parent_component.rename(moved_parent)
+        parent_component.symlink_to(redirected, target_is_directory=True)
+
+        assert set(onboarding._directory_entries_from_fd(descriptor)) == {
+            onboarding.IDENTITY_FILENAME,
+            onboarding.API_KEY_FILENAME,
+            onboarding.STARK_PRIVATE_KEY_FILENAME,
+        }
+        blocked = onboarding.inspect_protected_credentials()
+        assert blocked.status == onboarding.INSPECTION_BLOCKED
+        assert blocked.reason == "PROTECTED_DIRECTORY_SYMLINK"
+    finally:
+        if parent_component.is_symlink():
+            parent_component.unlink()
+        if moved_parent.exists():
+            moved_parent.rename(parent_component)
+        if redirected.exists():
+            redirected.rmdir()
+        os.close(descriptor)
 
 
 def test_overwrite_is_rejected_before_any_new_prompt_or_write(tmp_path, monkeypatch):
