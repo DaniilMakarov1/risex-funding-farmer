@@ -1,0 +1,70 @@
+{
+  "identities": [
+    {
+      "venue": "RISEx",
+      "account_id": "synthetic-risex-account-001",
+      "environment": "MAINNET",
+      "exact": true,
+      "authoritative": true
+    },
+    {
+      "venue": "Nado",
+      "account_id": "synthetic-nado-account-001",
+      "environment": "MAINNET",
+      "exact": true,
+      "authoritative": true
+    }
+  ],
+  "venues": [
+    {
+      "venue": "RISEx",
+      "account_id": "synthetic-risex-account-001",
+      "credential_mode": "CANONICAL_PROTECTED_IDENTITY",
+      "fee_status": "ACCOUNT_SCOPED_AUTHORITATIVE",
+      "fee_source": "ACCOUNT_SCOPED_READ",
+      "maker_fee_rate": "0.00005",
+      "taker_fee_rate": "0.00021",
+      "private_stream_status": "READY_ACCOUNT_SCOPED",
+      "private_stream_source": "ACCOUNT_PRIVATE_STREAM",
+      "account_state_status": "AUTHORITATIVE_CURRENT",
+      "account_state_source": "ACCOUNT_SCOPED_PRIVATE_READ",
+      "collateral_status": "AUTHORITATIVE_POSITIVE",
+      "collateral_usd": "50",
+      "zero_relevant_orders": true,
+      "zero_trigger_orders": true,
+      "exact_flat": true,
+      "unrelated_state_clear": true
+    },
+    {
+      "venue": "Nado",
+      "account_id": "synthetic-nado-account-001",
+      "credential_mode": "API_KEY_SECRET_READ_ONLY",
+      "fee_status": "ACCOUNT_SCOPED_AUTHORITATIVE",
+      "fee_source": "ACCOUNT_SCOPED_READ",
+      "maker_fee_rate": "-0.00002",
+      "taker_fee_rate": "0.00018",
+      "private_stream_status": "READY_ACCOUNT_SCOPED",
+      "private_stream_source": "NADO_ACCOUNT_PRIVATE_STREAM",
+      "account_state_status": "AUTHORITATIVE_CURRENT",
+      "account_state_source": "ACCOUNT_SCOPED_PRIVATE_READ",
+      "collateral_status": "AUTHORITATIVE_POSITIVE",
+      "collateral_usd": "60",
+      "zero_relevant_orders": true,
+      "zero_trigger_orders": true,
+      "exact_flat": true,
+      "unrelated_state_clear": true
+    }
+  ],
+  "planned_deposits": [
+    {
+      "venue": "RISEx",
+      "account_id": "synthetic-risex-account-001",
+      "amount_usd": "40"
+    },
+    {
+      "venue": "Nado",
+      "account_id": "synthetic-nado-account-001",
+      "amount_usd": "50"
+    }
+  ]
+}
