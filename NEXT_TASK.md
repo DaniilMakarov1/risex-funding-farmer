@@ -1,5 +1,23 @@
 # Active bounded task
 
+## Mainnet protected credential onboarding and exact-account reads
+
+Status: `AUTHORIZED — LOCAL HIDDEN-INPUT ONBOARDING AND BOUNDED PRIVATE READS ONLY; NO MAINNET WRITE AUTHORITY YET`.
+
+Objective: provision the narrowest official credential for each funded mainnet account, derive and bind only sanitized public identities, then run bounded authoritative exact-account read-only gates for balances/collateral, fees, regular/trigger orders, fills/history, positions, funding evidence, private-stream readiness where required, and unrelated state. RISEx may use the main wallet key once through hidden local input only to register a narrower session signer when no already-registered signer/JWT is available. Extended reads use its UI-created read-only API key; its Stark key is reserved for a later write gate. Nado reads use the public wallet and bytes32 subaccount without a private key; evaluate an official linked signer before any future execute path.
+
+Allowed now:
+
+- A local visible hidden-input mechanism with fixed protected paths, owner-only directory/file modes, no links, bounded size, redacted results, and no secret persistence in task/chat, arguments, logs, reports, operational databases, fixtures, Git, or process titles.
+- Official UI/docs/SDK discovery needed to create or validate venue-specific narrow credentials and sanitized public identities.
+- Bounded authenticated or exact-identity read-only observations under Level B, with the existing transport-attempt and terminal semantic-failure rules.
+
+Still blocked:
+
+- Deposits/transfers, signing-payload preparation, signing, dispatch, orders, positions, funding exposure, withdrawals, and strategy execution.
+- Any mainnet write before exact accounts and authoritative zero unrelated/regular/trigger orders plus exact flatness are proven; current fees, executable minimum and funding semantics are authoritative; the user supplies positive absolute deposit and maximum-loss caps with `maximum_loss <= deposit_cap`; and the user explicitly approves one exact manual lifecycle bound to venues, accounts, direction, quantity, and caps.
+- Parallel route lifecycles, self-trading, blind replay, ambiguous reconciliation, missing/contradictory funding treated as zero, or weakening the two-round terminal zero-order/exact-flat barrier.
+
 ## Temporary six-hour synthetic-opportunity experiment
 
 Status: `COMPLETED SAFE — SIX-HOUR SYNTHETIC PAPER WINDOW FINISHED; TESTNET FUNDING-BOUNDARY ROUTES REMAIN BLOCKED; NO WRITE IN FLIGHT`.
