@@ -373,6 +373,110 @@ def test_lighter_book_message_type_matches_snapshot_phase(initial, message_type)
         )
 
 
+def lighter_trade_message(
+    *,
+    message_type: str = "update/trade",
+    channel: str = "trade:0",
+    market_id: int | str | None = 0,
+    nonce: int | str = 7,
+    trades: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "type": message_type,
+        "channel": channel,
+        "nonce": nonce,
+        "trades": trades if trades is not None else [{
+            "type": "trade",
+            "market_id": 0,
+            "trade_id": 123,
+            "timestamp": int(NOW.timestamp() * 1000),
+            "size": "1",
+            "price": "101",
+            "is_maker_ask": False,
+        }],
+    }
+    if market_id is not None:
+        payload["market_id"] = market_id
+    return payload
+
+
+@pytest.mark.parametrize(
+    ("initial", "message_type"),
+    ((True, "update/trade"), (False, "subscribed/trade")),
+)
+def test_lighter_trade_message_type_matches_subscription_phase(initial, message_type):
+    adapter = LighterAdapter(object())
+    adapter.normalize_market(market_row())
+    with pytest.raises(ValueError, match="message type is invalid"):
+        adapter.normalize_trade_message(
+            lighter_trade_message(message_type=message_type),
+            received_at=NOW,
+            session_id="session",
+            starting_ordinal=1,
+            initial=initial,
+        )
+
+
+def test_lighter_trade_snapshot_only_establishes_identity_and_nonce():
+    adapter = LighterAdapter(object())
+    adapter.normalize_market(market_row())
+    nonce, trades = adapter.normalize_trade_message(
+        lighter_trade_message(
+            message_type="subscribed/trade",
+            nonce=50,
+            trades=[
+                {
+                    "type": "trade",
+                    "market_id": 0,
+                    "trade_id": 999,
+                    "timestamp": int(NOW.timestamp() * 1000),
+                    "size": "500",
+                    "price": "101",
+                    "is_maker_ask": False,
+                },
+            ],
+        ),
+        received_at=NOW,
+        session_id="session",
+        starting_ordinal=1,
+        initial=True,
+    )
+
+    assert nonce == 50
+    assert trades == ()
+
+
+@pytest.mark.parametrize(
+    ("change", "error"),
+    (
+        ({"channel": "order_book:0"}, "trade channel is invalid"),
+        ({"market_id": 1}, "trade channel identity mismatch"),
+        (
+            {
+                "trades": [
+                    {
+                        "type": "trade",
+                        "market_id": 1,
+                    },
+                ],
+            },
+            "trade channel identity mismatch",
+        ),
+        ({"nonce": True}, "trade.nonce must be an integer"),
+    ),
+)
+def test_lighter_trade_message_identity_and_nonce_are_strict(change, error):
+    adapter = LighterAdapter(object())
+    adapter.normalize_market(market_row())
+    with pytest.raises((TypeError, ValueError), match=error):
+        adapter.normalize_trade_message(
+            lighter_trade_message(**change),
+            received_at=NOW,
+            session_id="session",
+            starting_ordinal=1,
+        )
+
+
 @pytest.mark.asyncio
 async def test_lighter_refresh_cancels_when_exact_taker_depth_is_lost():
     risex = observation(Venue.RISEX)

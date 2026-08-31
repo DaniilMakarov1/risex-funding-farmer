@@ -387,11 +387,30 @@ class LighterAdapter(PublicAdapter):
         received_at: datetime,
         session_id: str,
         starting_ordinal: int,
+        initial: bool = False,
     ) -> tuple[int, tuple[TradeEvidence, ...]]:
         message = require_mapping(payload, "Lighter trade message")
-        if str(message.get("type", "")) != "update/trade":
+        expected_type = "subscribed/trade" if initial else "update/trade"
+        if str(message.get("type", "")) != expected_type:
             raise ValueError("Lighter trade message type is invalid")
-        channel_market_id = self.market_id_from_channel(message.get("channel"))
+        channel = str(message.get("channel") or "")
+        if channel.startswith("trade/"):
+            channel_market_id = self._integer(
+                channel.removeprefix("trade/"), "trade.channel.market_id"
+            )
+        elif channel.startswith("trade:"):
+            channel_market_id = self._integer(
+                channel.removeprefix("trade:"), "trade.channel.market_id"
+            )
+        else:
+            raise ValueError("Lighter trade channel is invalid")
+        raw_market_id = message.get("market_id")
+        if (
+            raw_market_id is not None
+            and self._integer(raw_market_id, "market_id") != channel_market_id
+        ):
+            raise ValueError("Lighter trade channel identity mismatch")
+        self.symbol_for_market(channel_market_id)
         nonce = self._integer(message.get("nonce"), "trade.nonce")
         rows = tuple(
             require_mapping(raw, "trade")
@@ -403,6 +422,8 @@ class LighterAdapter(PublicAdapter):
             for row in rows
         ):
             raise ValueError("Lighter trade channel identity mismatch")
+        if initial:
+            return nonce, ()
         trades = tuple(
             self.normalize_trade(
                 row,

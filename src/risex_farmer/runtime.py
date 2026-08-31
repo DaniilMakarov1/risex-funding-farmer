@@ -4987,27 +4987,27 @@ class PublicPaperRuntime:
                             ):
                                 return
                             if isinstance(adapter, LighterAdapter):
+                                channel_market_id = adapter.market_id_from_channel(
+                                    payload.get("channel")
+                                )
+                                trade_market_key = str(channel_market_id)
+                                initial = trade_market_key not in lighter_trade_sequences
                                 sequence, trades = adapter.normalize_trade_message(
                                     payload,
                                     received_at=self.clock.now(),
                                     session_id=str(id(ws)),
                                     starting_ordinal=ordinal,
+                                    initial=initial,
                                 )
                                 ordinal += len(trades)
-                                raw_market_id = payload.get("market_id")
-                                trade_market_key = str(
-                                    raw_market_id
-                                    if raw_market_id is not None
-                                    else adapter.market_id_from_channel(
-                                        payload.get("channel")
-                                    )
-                                )
                                 previous_sequence = lighter_trade_sequences.get(
                                     trade_market_key
                                 )
-                                if (
-                                    previous_sequence is None
-                                    or sequence > previous_sequence
+                                if initial:
+                                    lighter_trade_sequences[trade_market_key] = sequence
+                                elif (
+                                    previous_sequence is not None
+                                    and sequence > previous_sequence
                                 ):
                                     lighter_trade_sequences[trade_market_key] = sequence
                                     for trade in trades:

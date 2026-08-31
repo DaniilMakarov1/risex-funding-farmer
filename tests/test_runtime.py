@@ -14,6 +14,7 @@ import pytest
 
 from risex_farmer.exchanges.base import PublicAdapter, PublicDataUnavailable
 from risex_farmer.exchanges.extended import ExtendedAdapter
+from risex_farmer.exchanges.lighter import LighterAdapter
 from risex_farmer.exchanges.nado import NadoAdapter
 from risex_farmer.exchanges.risex import RisexAdapter
 from risex_farmer.config import PAPER_CONFIG, SYNTHETIC_TEST_OVERLAY_USD
@@ -203,6 +204,24 @@ class FakeAdapter(PublicAdapter):
             None,
             None,
             "official-public-synthetic-shape",
+        )
+
+
+class LighterStreamAdapter(LighterAdapter):
+    def __init__(self, clock: FakeClock) -> None:
+        super().__init__(None)
+        self.clock = clock
+        self._market_ids = {"ETH": 1}
+        self._symbols_by_id = {1: "ETH"}
+
+    async def fetch_book(self, venue_symbol: str) -> OrderBook:
+        return OrderBook(
+            Venue.LIGHTER,
+            venue_symbol,
+            (BookLevel(D("99"), D("20")),),
+            (BookLevel(D("101"), D("20")),),
+            self.clock.now(),
+            1,
         )
 
 
@@ -560,6 +579,30 @@ class SingleWebSocketSession:
     def ws_connect(self, *_args, **_kwargs):
         self.connections += 1
         return self.websocket
+
+
+class LighterTextWebSocket(TextWebSocket):
+    async def send_json(self, _payload) -> None:
+        return None
+
+
+def lighter_trade_message(
+    *, message_type: str, nonce: int, trade_id: int, channel: str = "trade:1"
+) -> dict[str, object]:
+    return {
+        "type": message_type,
+        "channel": channel,
+        "nonce": nonce,
+        "trades": [{
+            "type": "trade",
+            "market_id": 1,
+            "trade_id": trade_id,
+            "timestamp": str(int(NOW.timestamp() * 1000)),
+            "size": "1",
+            "price": "100",
+            "is_maker_ask": False,
+        }],
+    }
 
 
 def assert_socket_episode(rows):
@@ -4337,6 +4380,143 @@ async def test_extended_trade_sequence_resets_for_each_physical_session(tmp_path
         "EXTENDED|ABC-EXTENDED|new-session",
     ]
     assert discontinuities == 0
+
+
+@pytest.mark.asyncio
+async def test_lighter_trade_snapshot_is_not_delivered_and_updates_require_new_nonce(
+    tmp_path,
+):
+    clock = FakeClock()
+    stop = asyncio.Event()
+    websocket = LighterTextWebSocket(stop, (
+        lighter_trade_message(
+            message_type="subscribed/trade", nonce=50, trade_id=1000
+        ),
+        lighter_trade_message(
+            message_type="update/trade", nonce=50, trade_id=1001
+        ),
+        lighter_trade_message(
+            message_type="update/trade", nonce=49, trade_id=1002
+        ),
+        lighter_trade_message(
+            message_type="update/trade", nonce=51, trade_id=1003
+        ),
+    ))
+    session = SingleWebSocketSession(websocket)
+    delivered = []
+
+    async def capture_trade(row) -> None:
+        delivered.append(row)
+
+    async def no_delay(_seconds: float) -> None:
+        await asyncio.sleep(0)
+
+    adapter = LighterStreamAdapter(clock)
+    with PaperRepository(tmp_path / "lighter-trade-sequence.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository,
+            adapters={Venue.LIGHTER: adapter},
+            clock=clock,
+            sleep=no_delay,
+        )
+        runtime._session = session
+        runtime._stop_event = stop
+        runtime.deliver_trade = capture_trade
+        session_id = runtime._new_stream_session(
+            (Venue.LIGHTER, "*", "combined")
+        )
+        await runtime._combined_stream(
+            Venue.LIGHTER, adapter, ("ETH",), session_id
+        )
+
+    assert session.connections == 1
+    assert [row.trade_event_key for row in delivered] == [
+        "LIGHTER|ETH|1003",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_lighter_trade_sequence_resets_for_each_physical_session(tmp_path):
+    clock = FakeClock()
+    stop = asyncio.Event()
+
+    class SessionWebSocket(LighterTextWebSocket):
+        def __init__(self, payloads, *, stop_on_eof):
+            super().__init__(stop, payloads)
+            self.stop_on_eof = stop_on_eof
+
+        async def __anext__(self):
+            if not self.messages:
+                if self.stop_on_eof:
+                    stop.set()
+                raise StopAsyncIteration
+            return SimpleNamespace(
+                type=aiohttp.WSMsgType.TEXT,
+                data=json.dumps(self.messages.pop(0)),
+            )
+
+    first = SessionWebSocket(
+        (
+            lighter_trade_message(
+                message_type="subscribed/trade", nonce=50, trade_id=2000
+            ),
+            lighter_trade_message(
+                message_type="update/trade", nonce=51, trade_id=2001
+            ),
+        ),
+        stop_on_eof=False,
+    )
+    second = SessionWebSocket(
+        (
+            lighter_trade_message(
+                message_type="subscribed/trade", nonce=1, trade_id=3000
+            ),
+            lighter_trade_message(
+                message_type="update/trade", nonce=2, trade_id=3001
+            ),
+        ),
+        stop_on_eof=True,
+    )
+
+    class TwoSession:
+        connections = 0
+
+        def ws_connect(self, *_args, **_kwargs):
+            self.connections += 1
+            return (first, second)[self.connections - 1]
+
+    session = TwoSession()
+    delivered = []
+
+    async def capture_trade(row) -> None:
+        delivered.append(row)
+
+    async def no_delay(_seconds: float) -> None:
+        await asyncio.sleep(0)
+
+    adapter = LighterStreamAdapter(clock)
+    with PaperRepository(tmp_path / "lighter-trade-session-reset.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository,
+            adapters={Venue.LIGHTER: adapter},
+            clock=clock,
+            sleep=no_delay,
+        )
+        runtime._session = session
+        runtime._stop_event = stop
+        runtime.deliver_trade = capture_trade
+        session_id = runtime._new_stream_session(
+            (Venue.LIGHTER, "*", "combined")
+        )
+        await runtime._combined_stream(
+            Venue.LIGHTER, adapter, ("ETH",), session_id
+        )
+
+    assert session.connections == 2
+    assert [row.trade_event_key for row in delivered] == [
+        "LIGHTER|ETH|2001",
+        "LIGHTER|ETH|3001",
+    ]
 
 
 @pytest.mark.asyncio
