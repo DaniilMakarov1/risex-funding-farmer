@@ -104,6 +104,8 @@ Evaluate simultaneous activations at one logical timestamp and choose one top ro
 
 WebSocket supplies available BBO, book deltas, maker-leg public trades, funding, connection state, sequence, and heartbeat/ping. REST supplies markets/metadata, volume, missing stream data, and official applied-funding history when available. Initial and recovery book snapshots may use REST only where the venue snapshot preserves the sequence contract. Lighter is the fixed exception: its REST book has no nonce, so only a fresh per-market WebSocket subscription snapshot may establish or recover a sequence-valid book. Lighter is always the virtual taker leg, so its public trade channel is neither subscribed nor required for route readiness; RISEx maker-trade evidence remains mandatory.
 
+Lighter public `market_stats` funding values are percentage-number units: divide `current_funding_rate` and `funding_rate` by `100` exactly once at the venue boundary. Funding cash per canonical base uses the validated `mark_price`, not `index_price`. `current_funding_rate` is only the next hourly prediction; when `funding_timestamp` advances contiguously to the exact registered lifecycle settlement, apply that frame's `funding_rate` once and retain `current_funding_rate` for the next boundary. Stale, duplicate, gapped, mismatched-session, or unregistered boundaries do not create an applied settlement and fail closed without replay.
+
 Track per stream:
 
 ```text
