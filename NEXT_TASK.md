@@ -9,6 +9,7 @@ Objective: correct only the observed gap after an activated PAPER maker entry te
 Acceptance:
 
 - Cover every current entry-cancellation path, including refresh, stream invalidation, trade-time cancellation, cutoff, and process restart, without changing the scanner, ranking, position limit, maker-fill evidence, hedge timing, funding, exit, or PnL economics.
+- A trade-time cancellation that persists `FLAT` must also release the in-memory broker atomically; prove that a later eligible attempt can activate without a process restart. The observed defect retains a `FLAT` broker after taker-side staleness/depth rejection and otherwise blocks every future activation.
 - The persisted runtime evidence and Telegram payload contain only sanitized bounded fields and never imply a fill, hedge, position, or realized PnL when none exists.
 - Regression tests prove exactly-once terminal notification per attempt, distinct notifications for repeated same-cycle attempts, and no cancellation notification after an atomic two-leg open.
 - Run focused/adverse tests and one clean isolated Python 3.11 full suite on the final candidate SHA. The active `chief36` PAPER process and its database remain untouched until independent Chief acceptance; any later replacement uses a fresh database.
