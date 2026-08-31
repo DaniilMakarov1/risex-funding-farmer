@@ -236,13 +236,13 @@ def canonical_testnet_address(value: Any) -> str:
 
 
 def canonical_api_public_key(value: Any) -> str:
-    """Normalize one operator-supplied non-secret API public key."""
+    """Normalize one operator-supplied 40-byte API public key."""
 
     if not isinstance(value, str) or not value:
         raise ValueError("API public key is unavailable")
     raw = value[2:] if value[:2].lower() == "0x" else value
-    if len(raw) != 64 or any(character not in "0123456789abcdefABCDEF" for character in raw):
-        raise ValueError("API public key is not a 32-byte hexadecimal key")
+    if len(raw) != 80 or any(character not in "0123456789abcdefABCDEF" for character in raw):
+        raise ValueError("API public key is not a 40-byte hexadecimal key")
     return "0x" + raw.lower()
 
 

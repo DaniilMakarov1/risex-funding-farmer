@@ -12,7 +12,7 @@ from risex_farmer import lighter_testnet_readiness as lighter
 ADDRESS = lighter.EXPECTED_L1_ADDRESS
 ACCOUNT_INDEX = 17
 API_KEY_INDEX = lighter.FIRST_USER_API_KEY_INDEX
-EXPECTED_API_PUBLIC_KEY = "0x" + "11" * 32
+EXPECTED_API_PUBLIC_KEY = "0x" + "11" * 40
 
 
 def protected_wallet(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> lighter.WalletMetadata:
@@ -431,7 +431,7 @@ def test_official_faucet_account_202_shape_accepts_zero_spot_quote_and_omitted_p
 
 
 def test_api_public_key_matching_is_exact_but_prefix_and_case_normalized():
-    expected = "0x" + "ab" * 32
+    expected = "0x" + "ab" * 40
     responses = all_ready_responses()
     responses["/api/v1/apikeys"]["api_keys"][0]["public_key"] = expected[2:].upper()
     result, _ = run_ready(responses, expected_api_public_key=expected)
@@ -441,7 +441,7 @@ def test_api_public_key_matching_is_exact_but_prefix_and_case_normalized():
 
 
 def test_api_public_key_mismatch_blocks_auth_before_private_reads():
-    result, transport = run_ready(expected_api_public_key="0x" + "22" * 32)
+    result, transport = run_ready(expected_api_public_key="0x" + "22" * 40)
     assert result.status == "BLOCKED"
     assert result.failure_class == "AUTH"
     assert result.reason == "API_KEY_PUBLIC_KEY_MISMATCH"
@@ -456,6 +456,29 @@ def test_expected_api_public_key_is_required_and_validated_locally():
     assert result.reason == "READINESS_CONFIGURATION_INVALID"
     assert result.requests == 0
     assert transport.requests == []
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "0x" + "11" * 32,
+        "11" * 32,
+        "0x" + "11" * 39,
+        "11" * 41,
+    ],
+)
+def test_api_public_key_rejects_non_40_byte_lengths(value):
+    with pytest.raises(ValueError, match="40-byte"):
+        lighter.canonical_api_public_key(value)
+
+
+def test_api_public_key_response_rejects_32_byte_key():
+    responses = all_ready_responses()
+    responses["/api/v1/apikeys"]["api_keys"][0]["public_key"] = "0x" + "11" * 32
+    result, _ = run_ready(responses)
+    assert result.status == "BLOCKED"
+    assert result.failure_class == "AUTH"
+    assert result.reason == "API_KEY_PUBLIC_KEY_INVALID"
 
 
 @pytest.mark.parametrize("mutation", ["unknown", "locked", "margin_enabled", "wrong_id", "missing"])
