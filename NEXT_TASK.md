@@ -1,5 +1,19 @@
 # Active bounded task
 
+## PAPER Lighter heartbeat and exact entry-cutoff timing
+
+Status: `AUTHORIZED — LIVE ROOT CAUSES PROVEN; FRESH BUILDER CANDIDATE REQUIRED`.
+
+Objective: remove two observed public PAPER transport/scheduling defects without weakening maker-fill evidence, route locking, freshness, or the fixed entry window. First, bind the already defined Lighter application heartbeat to the owned combined public stream: send the exact bounded `{"type":"ping"}` cadence, accept only the exact application `pong` confirmation for that owned socket, preserve WebSocket control-frame handling, and cancel the heartbeat on disconnect/replacement/shutdown. Second, make an active entry order's `T−5 seconds` cutoff cancellation a prompt owned deadline independent of long catalog refresh, scan, reconnect, or recovery work, while preserving atomic persistence, exactly-once cancellation outcome/notification, sequential state mutation, and the rule that exchange timestamps at or after cutoff never count.
+
+Observed evidence and acceptance:
+
+- The official Lighter SDK handles application-level ping/pong, and the repository adapter already exposes a client ping action that the combined runtime never invokes. Current `chief37` repeatedly records Lighter `EOF` disconnects about every 121–122 seconds. A bounded public diagnostic with no client application ping closed at `121.2s`; the otherwise identical diagnostic sending `{"type":"ping"}` every 10 seconds received `14` application `pong` frames and remained connected for the full `150s` observation.
+- Former `chief36` cancellation evidence is internally consistent and must stay safe: SNDK/AAVE `DATA_STALE` coincided exactly with RISEx order-book resync; LIT `DATA_STALE` coincided exactly with Lighter EOF; SNDK `ROUTE_INVALID` followed an exact common-quantity change from `0.3402` to `0.3392`; neither maker evidence nor taker hedge existed. Do not relabel these outcomes or keep an entry alive across an ambiguous maker stream or unavailable exact-q taker hedge.
+- The sixth AAVE attempt had cutoff `19:59:55Z` but persisted cancellation at `20:00:04.952Z` because focused work was delayed by refresh/reconnect churn. Trade-time eligibility already rejects exchange timestamps at or after cutoff; add adverse scheduling tests proving the cancellation deadline itself cannot be postponed by unrelated refresh/recovery work and cannot double-cancel or race a legitimate pre-cutoff atomic open.
+- Preserve `entry_activation_at=T−120s`, `entry_fill_cutoff_at=T−5s`, 10-second repricing/economic checks, 25-second confirmed-stream freshness, exact quantity, price-version evidence reset, one-position limit, and all funding/exit/PnL behavior. Do not extend stale tolerances, infer missed fills, count post-cutoff trades, or add venue-write/private surfaces.
+- Run focused/adverse tests, dependency/compile/diff/no-write checks, and one clean isolated Python 3.11 full suite on the final candidate. Keep active `chief37` and its database untouched until independent Chief acceptance; any accepted live replacement uses a fresh database and must demonstrate a Lighter public connection beyond the former 121-second failure boundary with all routes restored and zero fatal/exposure.
+
 ## PAPER entry outcome observability correction
 
 Status: `ACCEPTED — PUBLISHED CORRECTION ACTIVE IN FRESH CHIEF37 PAPER RUNTIME`.
