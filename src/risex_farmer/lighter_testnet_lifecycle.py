@@ -843,7 +843,11 @@ class LighterGateway(Protocol):
     async def market(self, market_id: int) -> MarketObservation: ...
 
     async def snapshot(
-        self, market_id: int, *, client_order_index: int | None = None
+        self,
+        market_id: int,
+        *,
+        client_order_index: int | None = None,
+        post_cancel_target: tuple[int, int] | None = None,
     ) -> AccountSnapshot: ...
 
     async def reconcile_nonce(self, *, account_index: int, api_key_index: int) -> int: ...
@@ -1781,15 +1785,133 @@ class OfficialSdkReadAdapter:
         return tuple(self._order(row) for row in _sdk_sequence(_sdk_field(data, "ACCOUNT_ORDERS", "orders"), "ACCOUNT_ORDERS"))
 
     @staticmethod
-    def _merge_orders(*groups: Sequence[OrderSnapshot]) -> tuple[OrderSnapshot, ...]:
-        by_index: dict[int, OrderSnapshot] = {}
-        for group in groups:
+    def _post_cancel_transition_allowed(
+        active: OrderSnapshot,
+        terminal: OrderSnapshot,
+        *,
+        target_order_index: int,
+        target_client_order_index: int,
+    ) -> bool:
+        """Return whether two endpoint rows are one safe cancel transition."""
+
+        immutable_fields = (
+            "order_index",
+            "client_order_index",
+            "account_index",
+            "market_id",
+            "quantity",
+            "price",
+            "is_ask",
+            "order_type",
+            "time_in_force",
+            "reduce_only",
+            "nonce",
+            "trigger",
+        )
+        if any(getattr(active, field) != getattr(terminal, field) for field in immutable_fields):
+            return False
+        if (
+            active.order_index != target_order_index
+            or terminal.order_index != target_order_index
+            or active.client_order_index != target_client_order_index
+            or terminal.client_order_index != target_client_order_index
+        ):
+            return False
+        if (
+            not isinstance(active.status, str)
+            or not isinstance(terminal.status, str)
+            or active.status.upper()
+            not in {"OPEN", "ACTIVE", "PENDING", "IN-PROGRESS", "IN_PROGRESS"}
+            or not active.active
+            or active.order_type != "limit"
+            or active.time_in_force != "post_only"
+            or active.reduce_only
+            or active.trigger
+            or active.remaining_quantity != active.quantity
+            or active.filled_quantity != 0
+            or active.filled_quote != 0
+        ):
+            return False
+        return (
+            terminal.status.upper() in {"CANCELED", "CANCELLED", "EXPIRED"}
+            and terminal.remaining_quantity == 0
+            and terminal.filled_quantity == 0
+            and terminal.filled_quote == 0
+        )
+
+    @staticmethod
+    def _validate_post_cancel_target(
+        target: tuple[int, int] | None,
+        *,
+        client_order_index: int | None = None,
+    ) -> tuple[int, int] | None:
+        if target is None:
+            return None
+        if not isinstance(target, tuple) or len(target) != 2:
+            raise LifecycleHalt("POST_CANCEL_TARGET_BINDING_INVALID", failure_class="SCHEMA")
+        target_order_index, target_client_order_index = target
+        if (
+            isinstance(target_order_index, bool)
+            or not isinstance(target_order_index, int)
+            or target_order_index < 0
+            or isinstance(target_client_order_index, bool)
+            or not isinstance(target_client_order_index, int)
+            or not 0 < target_client_order_index <= LIGHTER_MAX_CLIENT_ORDER_INDEX
+            or client_order_index is not None
+            and (
+                isinstance(client_order_index, bool)
+                or not isinstance(client_order_index, int)
+                or client_order_index != target_client_order_index
+            )
+        ):
+            raise LifecycleHalt("POST_CANCEL_TARGET_BINDING_INVALID", failure_class="SCHEMA")
+        return target
+
+    @staticmethod
+    def _merge_orders(
+        *groups: Sequence[OrderSnapshot],
+        post_cancel_target: tuple[int, int] | None = None,
+    ) -> tuple[OrderSnapshot, ...]:
+        post_cancel_target = OfficialSdkReadAdapter._validate_post_cancel_target(
+            post_cancel_target
+        )
+        if post_cancel_target is not None and len(groups) != 2:
+            raise LifecycleHalt("POST_CANCEL_TARGET_BINDING_INVALID", failure_class="SCHEMA")
+        target_order_index = (
+            None if post_cancel_target is None else post_cancel_target[0]
+        )
+        target_client_order_index = (
+            None if post_cancel_target is None else post_cancel_target[1]
+        )
+
+        by_index: dict[int, tuple[int, OrderSnapshot]] = {}
+        for group_index, group in enumerate(groups):
             for row in group:
-                previous = by_index.get(row.order_index)
-                if previous is not None and previous != row:
+                previous_entry = by_index.get(row.order_index)
+                if previous_entry is None:
+                    by_index[row.order_index] = (group_index, row)
+                    continue
+                previous_group, previous = previous_entry
+                if previous == row:
+                    continue
+                if not (
+                    post_cancel_target is not None
+                    and target_order_index is not None
+                    and target_client_order_index is not None
+                    and previous_group == 0
+                    and group_index == 1
+                    and OfficialSdkReadAdapter._post_cancel_transition_allowed(
+                        previous,
+                        row,
+                        target_order_index=target_order_index,
+                        target_client_order_index=target_client_order_index,
+                    )
+                ):
                     raise LifecycleHalt("DUPLICATE_ORDER_CONTRADICTION", failure_class="SAFETY")
-                by_index[row.order_index] = row
-        return tuple(by_index.values())
+                # The exact endpoint's terminal row is authoritative for the
+                # one explicitly bound post-cancel transition.
+                by_index[row.order_index] = (group_index, row)
+        return tuple(row for _, row in by_index.values())
 
     async def _fills(self) -> tuple[FillSnapshot, ...]:
         cursor: str | None = None
@@ -1951,7 +2073,14 @@ class OfficialSdkReadAdapter:
         market_id: int,
         *,
         client_order_index: int | None = None,
+        post_cancel_target: tuple[int, int] | None = None,
     ) -> AccountSnapshot:
+        if post_cancel_target is not None and client_order_index is None:
+            raise LifecycleHalt("POST_CANCEL_TARGET_BINDING_INVALID", failure_class="SCHEMA")
+        post_cancel_target = self._validate_post_cancel_target(
+            post_cancel_target,
+            client_order_index=client_order_index,
+        )
         account = await self._account()
         limits = await self._call(
             self._account_api.account_limits,
@@ -1961,7 +2090,11 @@ class OfficialSdkReadAdapter:
         )
         active_orders = await self._active_orders()
         target_orders = await self._target_orders(client_order_index)
-        orders = self._merge_orders(active_orders, target_orders)
+        orders = self._merge_orders(
+            active_orders,
+            target_orders,
+            post_cancel_target=post_cancel_target,
+        )
         fills = await self._fills()
         funding = await self._funding_once(baseline_high_water=0)
         assets = _bootstrap_assets(account)
@@ -2270,10 +2403,17 @@ class SdkLighterGateway:
         return await self._market_reader(market_id)
 
     async def snapshot(
-        self, market_id: int, *, client_order_index: int | None = None
+        self,
+        market_id: int,
+        *,
+        client_order_index: int | None = None,
+        post_cancel_target: tuple[int, int] | None = None,
     ) -> AccountSnapshot:
         assert self._snapshot_reader is not None
-        return await self._snapshot_reader(market_id, client_order_index=client_order_index)
+        kwargs: dict[str, Any] = {"client_order_index": client_order_index}
+        if post_cancel_target is not None:
+            kwargs["post_cancel_target"] = post_cancel_target
+        return await self._snapshot_reader(market_id, **kwargs)
 
     async def reconcile_nonce(self, *, account_index: int, api_key_index: int) -> int:
         if account_index != LIGHTER_ACCOUNT_INDEX or api_key_index != LIGHTER_API_KEY_INDEX:
@@ -2704,7 +2844,12 @@ class LighterLevelCRunner:
             # This is deliberately the exact account/target read.  It must
             # not become a broad account refresh or another cancel attempt.
             after_cancel = await self.gateway.snapshot(
-                market.market_id, client_order_index=request.client_order_index
+                market.market_id,
+                client_order_index=request.client_order_index,
+                post_cancel_target=(
+                    cancel.target_order_index,
+                    request.client_order_index,
+                ),
             )
             after_cancel.validate_identity_and_safety(
                 self.identity,
@@ -2713,6 +2858,8 @@ class LighterLevelCRunner:
                 observed_at_ms=self.clock_ms(),
                 allow_active_order_index=cancel.target_order_index,
             )
+            if after_cancel.fills:
+                raise LifecycleHalt("MAKER_CANCEL_FILL_PRESENT", failure_class="SAFETY")
             cancelled = _find_order(after_cancel, cancel)
             original = _find_order(after_cancel, place)
             if original.order_index != cancelled.order_index:

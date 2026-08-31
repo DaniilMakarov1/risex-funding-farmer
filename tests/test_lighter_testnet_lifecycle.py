@@ -111,6 +111,7 @@ class SyntheticGateway:
         maker_cancel_status_sequence: tuple[str, ...] | None = None,
         maker_cancel_unrelated_order: bool = False,
         maker_cancel_mismatch: bool = False,
+        maker_cancel_fill: bool = False,
     ) -> None:
         self.clock = clock
         self.funding_mode = funding_mode
@@ -129,6 +130,7 @@ class SyntheticGateway:
         self.maker_cancel_order_index: int | None = None
         self.maker_cancel_unrelated_order = maker_cancel_unrelated_order
         self.maker_cancel_mismatch = maker_cancel_mismatch
+        self.maker_cancel_fill = maker_cancel_fill
         self.store: lifecycle.LifecycleStore | None = None
         self.discover_calls = 0
         self.market_calls: list[int] = []
@@ -179,9 +181,18 @@ class SyntheticGateway:
         )
 
     async def snapshot(
-        self, market_id: int, *, client_order_index: int | None = None
+        self,
+        market_id: int,
+        *,
+        client_order_index: int | None = None,
+        post_cancel_target: tuple[int, int] | None = None,
     ) -> lifecycle.AccountSnapshot:
         assert market_id == MARKET_ID
+        if post_cancel_target is not None:
+            assert post_cancel_target == (
+                self.maker_cancel_order_index,
+                client_order_index,
+            )
         self.snapshot_calls += 1
         if self.maker_cancel_status_index is not None:
             assert self.maker_cancel_order_index is not None
@@ -374,6 +385,20 @@ class SyntheticGateway:
         if self.maker_cancel_mismatch:
             updated = replace(updated, price=updated.price + Decimal("0.01"))
         self.orders[order_index] = updated
+        if self.maker_cancel_fill:
+            self.fills.append(
+                lifecycle.FillSnapshot(
+                    trade_id="maker-cancel-fill",
+                    order_index=order_index,
+                    client_order_index=order.client_order_index,
+                    account_index=ACCOUNT_INDEX,
+                    market_id=MARKET_ID,
+                    quantity=order.quantity,
+                    price=order.price,
+                    is_ask=order.is_ask,
+                    timestamp_ms=self.clock[0],
+                )
+            )
         if self.maker_cancel_unrelated_order:
             self.orders[order_index + 1] = replace(
                 order,
@@ -603,6 +628,7 @@ async def run_synthetic(
     maker_cancel_status_sequence: tuple[str, ...] | None = None,
     maker_cancel_unrelated_order: bool = False,
     maker_cancel_mismatch: bool = False,
+    maker_cancel_fill: bool = False,
 ) -> tuple[lifecycle.RunnerReport, SyntheticGateway, lifecycle.LifecycleStore]:
     clock = [0]
     gateway = SyntheticGateway(
@@ -617,6 +643,7 @@ async def run_synthetic(
         maker_cancel_status_sequence=maker_cancel_status_sequence,
         maker_cancel_unrelated_order=maker_cancel_unrelated_order,
         maker_cancel_mismatch=maker_cancel_mismatch,
+        maker_cancel_fill=maker_cancel_fill,
     )
     runner, store = make_runner(tmp_path, gateway, mode=mode)
     report = await runner.run()
@@ -841,6 +868,18 @@ async def test_maker_cancel_perpetual_active_exhausts_without_replay(tmp_path):
         "MAKER_PLACE",
         "MAKER_CANCEL",
     ]
+    store.close()
+
+
+async def test_maker_cancel_rejects_fill_evidence_even_with_zero_terminal_order(tmp_path):
+    report, gateway, store = await run_synthetic(tmp_path, maker_cancel_fill=True)
+
+    assert report.result is lifecycle.RunnerResult.HALTED_MANUAL_RECOVERY
+    assert report.failure_class == "TRANSPORT"
+    assert report.reason == "POST_SEND_RECONCILIATION_UNRESOLVED"
+    assert gateway.cancel_calls == 1
+    assert [row[0] for row in gateway.dispatches] == ["MAKER_PLACE", "MAKER_CANCEL"]
+    assert gateway.sleep_calls == []
     store.close()
 
 
@@ -1368,7 +1407,9 @@ async def test_sdk_stale_parsed_fields_then_authoritative_create_and_cancel_reco
         assert market_id == MARKET_ID
         return market_at(clock[0])
 
-    async def read_snapshot(market_id, *, client_order_index=None):
+    async def read_snapshot(
+        market_id, *, client_order_index=None, post_cancel_target=None
+    ):
         assert market_id == MARKET_ID
         return account()
 
@@ -1514,7 +1555,9 @@ async def test_sdk_rejection_or_unsafe_hash_blocks_without_replay(
         assert market_id == MARKET_ID
         return market_at(clock[0])
 
-    async def read_snapshot(market_id, *, client_order_index=None):
+    async def read_snapshot(
+        market_id, *, client_order_index=None, post_cancel_target=None
+    ):
         assert market_id == MARKET_ID
         assert client_order_index is None
         return empty_account()
@@ -1841,6 +1884,40 @@ def _sdk_ok(data):
     return data, SimpleNamespace(status=200), None
 
 
+def official_order_row(
+    *,
+    order_index: int = 700,
+    client_order_index: int = 701,
+    status: str = "open",
+    remaining_base_amount: str = "1",
+    filled_base_amount: str = "0",
+    filled_quote_amount: str = "0",
+    price: str = "3.8000",
+    nonce: int = 7,
+    trigger_price: str = "0",
+    trigger_status: str = "na",
+):
+    return SimpleNamespace(
+        order_index=order_index,
+        client_order_index=client_order_index,
+        owner_account_index=ACCOUNT_INDEX,
+        market_index=MARKET_ID,
+        initial_base_amount="1",
+        remaining_base_amount=remaining_base_amount,
+        filled_base_amount=filled_base_amount,
+        filled_quote_amount=filled_quote_amount,
+        price=price,
+        is_ask=True,
+        type="limit",
+        time_in_force="post-only",
+        reduce_only=False,
+        nonce=nonce,
+        status=status,
+        trigger_price=trigger_price,
+        trigger_status=trigger_status,
+    )
+
+
 class FakeOfficialApis:
     def __init__(self):
         self.detail = SimpleNamespace(
@@ -1903,6 +1980,7 @@ class FakeOfficialApis:
         )
         self.limits = SimpleNamespace(current_maker_fee_tick=0, current_taker_fee_tick=0)
         self.active_orders = []
+        self.target_orders = []
         self.account_pages = {}
         self.trade_pages = {}
         self.funding_pages = {}
@@ -1939,7 +2017,7 @@ class FakeOfficialApis:
         return _sdk_ok(SimpleNamespace(orders=self.active_orders))
 
     async def account_orders(self, **kwargs):
-        return _sdk_ok(SimpleNamespace(orders=[]))
+        return _sdk_ok(SimpleNamespace(orders=self.target_orders))
 
     async def trades(self, **kwargs):
         if self.loop_trades:
@@ -2009,6 +2087,108 @@ async def test_official_sdk_reader_builds_complete_public_snapshots_and_terminal
     assert terminal.active_trigger_orders == 0
     assert terminal.signed_position == 0
     assert "synthetic-auth-token" not in json.dumps(result.evidence())
+
+
+async def test_official_reader_allows_only_bound_post_cancel_open_to_terminal_transition():
+    apis = FakeOfficialApis()
+    apis.active_orders = [official_order_row(status="open")]
+    apis.target_orders = [
+        official_order_row(
+            status="canceled",
+            remaining_base_amount="0",
+            filled_base_amount="0",
+            filled_quote_amount="0",
+        )
+    ]
+    adapter = make_read_adapter(apis)
+
+    snapshot = await adapter.snapshot(
+        MARKET_ID,
+        client_order_index=701,
+        post_cancel_target=(700, 701),
+    )
+
+    assert len(snapshot.orders) == 1
+    assert snapshot.orders[0].status == "canceled"
+    assert snapshot.orders[0].remaining_quantity == 0
+    assert snapshot.orders[0].filled_quantity == 0
+    assert snapshot.orders[0].filled_quote == 0
+    assert snapshot.active_regular_orders == ()
+
+
+async def test_official_reader_rejects_contradictory_duplicate_outside_bound_transition():
+    apis = FakeOfficialApis()
+    apis.active_orders = [official_order_row(price="3.8000")]
+    apis.target_orders = [official_order_row(price="3.8100")]
+    adapter = make_read_adapter(apis)
+
+    with pytest.raises(
+        lifecycle.LifecycleHalt,
+        match="DUPLICATE_ORDER_CONTRADICTION",
+    ) as exc_info:
+        await adapter.snapshot(
+            MARKET_ID,
+            client_order_index=701,
+            post_cancel_target=(999, 701),
+        )
+
+    assert exc_info.value.failure_class == "SAFETY"
+
+
+async def test_official_reader_rejects_bound_post_cancel_target_field_mismatch():
+    apis = FakeOfficialApis()
+    apis.active_orders = [official_order_row(price="3.8000")]
+    apis.target_orders = [
+        official_order_row(
+            status="canceled",
+            remaining_base_amount="0",
+            filled_base_amount="0",
+            filled_quote_amount="0",
+            price="3.8100",
+        )
+    ]
+    adapter = make_read_adapter(apis)
+
+    with pytest.raises(
+        lifecycle.LifecycleHalt,
+        match="DUPLICATE_ORDER_CONTRADICTION",
+    ):
+        await adapter.snapshot(
+            MARKET_ID,
+            client_order_index=701,
+            post_cancel_target=(700, 701),
+        )
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        (700, 702),
+        (701, 701),
+    ],
+)
+async def test_official_reader_rejects_post_cancel_target_binding_mismatch(target):
+    apis = FakeOfficialApis()
+    apis.active_orders = [official_order_row(status="open")]
+    apis.target_orders = [
+        official_order_row(
+            status="canceled",
+            remaining_base_amount="0",
+            filled_base_amount="0",
+            filled_quote_amount="0",
+        )
+    ]
+    adapter = make_read_adapter(apis)
+
+    with pytest.raises(
+        lifecycle.LifecycleHalt,
+        match="POST_CANCEL_TARGET_BINDING_INVALID|DUPLICATE_ORDER_CONTRADICTION",
+    ):
+        await adapter.snapshot(
+            MARKET_ID,
+            client_order_index=701,
+            post_cancel_target=target,
+        )
 
 
 async def test_official_reader_parses_pinned_plural_position_fundings_field():
