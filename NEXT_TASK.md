@@ -2,7 +2,7 @@
 
 ## PAPER Lighter heartbeat and exact entry-cutoff timing
 
-Status: `AUTHORIZED — LIVE ROOT CAUSES PROVEN; FRESH BUILDER CANDIDATE REQUIRED`.
+Status: `ACCEPTED — PUBLISHED AND LIVE-VALIDATED IN FRESH CHIEF38`.
 
 Objective: remove two observed public PAPER transport/scheduling defects without weakening maker-fill evidence, route locking, freshness, or the fixed entry window. First, bind the already defined Lighter application heartbeat to the owned combined public stream: send the exact bounded `{"type":"ping"}` cadence, accept only the exact application `pong` confirmation for that owned socket, preserve WebSocket control-frame handling, and cancel the heartbeat on disconnect/replacement/shutdown. Second, make an active entry order's `T−5 seconds` cutoff cancellation a prompt owned deadline independent of long catalog refresh, scan, reconnect, or recovery work, while preserving atomic persistence, exactly-once cancellation outcome/notification, sequential state mutation, and the rule that exchange timestamps at or after cutoff never count.
 
@@ -13,6 +13,8 @@ Observed evidence and acceptance:
 - The sixth AAVE attempt had cutoff `19:59:55Z` but persisted cancellation at `20:00:04.952Z` because focused work was delayed by refresh/reconnect churn. Trade-time eligibility already rejects exchange timestamps at or after cutoff; add adverse scheduling tests proving the cancellation deadline itself cannot be postponed by unrelated refresh/recovery work and cannot double-cancel or race a legitimate pre-cutoff atomic open.
 - Preserve `entry_activation_at=T−120s`, `entry_fill_cutoff_at=T−5s`, 10-second repricing/economic checks, 25-second confirmed-stream freshness, exact quantity, price-version evidence reset, one-position limit, and all funding/exit/PnL behavior. Do not extend stale tolerances, infer missed fills, count post-cutoff trades, or add venue-write/private surfaces.
 - Run focused/adverse tests, dependency/compile/diff/no-write checks, and one clean isolated Python 3.11 full suite on the final candidate. Keep active `chief37` and its database untouched until independent Chief acceptance; any accepted live replacement uses a fresh database and must demonstrate a Lighter public connection beyond the former 121-second failure boundary with all routes restored and zero fatal/exposure.
+
+Accepted evidence: Builder candidate `1dcf44463a503adda5e5f36b269830f5972d3fed` was independently reviewed and integrated/published as main `505c45b7fe92a593ce018e74c72fc79afbba38f3`. The clean integrated Python 3.11 suite passed `3598` tests with `3` skipped. Former `chief37` stopped `STOPPED_SAFE` with integrity `ok` and zero exposure. Fresh `chief38` reached `PAPER_RUN_READY` with all `128` routes, including `48` Lighter directions, then held the initial Lighter combined stream beyond three minutes with repeated `PUBLIC_FUNDING_STATS_READY`, zero Lighter disconnects, zero unusable-funding events, zero fatal events, and zero orders/positions/fills/funding/completed trades. Continue normal public PAPER observation; no venue write or freshness/window relaxation was introduced.
 
 ## PAPER entry outcome observability correction
 
