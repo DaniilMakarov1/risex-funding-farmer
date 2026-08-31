@@ -136,6 +136,8 @@ class SyntheticGateway:
         maker_cancel_unrelated_order: bool = False,
         maker_cancel_mismatch: bool = False,
         maker_cancel_fill: bool = False,
+        maker_cancel_fill_variant: str | None = None,
+        historical_fills: tuple[lifecycle.FillSnapshot, ...] = (),
     ) -> None:
         self.clock = clock
         self.funding_mode = funding_mode
@@ -155,6 +157,7 @@ class SyntheticGateway:
         self.maker_cancel_unrelated_order = maker_cancel_unrelated_order
         self.maker_cancel_mismatch = maker_cancel_mismatch
         self.maker_cancel_fill = maker_cancel_fill
+        self.maker_cancel_fill_variant = maker_cancel_fill_variant
         self.store: lifecycle.LifecycleStore | None = None
         self.discover_calls = 0
         self.market_calls: list[int] = []
@@ -162,7 +165,7 @@ class SyntheticGateway:
         self.nonce_calls: list[tuple[int, int]] = []
         self.dispatches: list[tuple[str, int, int, bool, bool]] = []
         self.orders: dict[int, lifecycle.OrderSnapshot] = {}
-        self.fills: list[lifecycle.FillSnapshot] = []
+        self.fills: list[lifecycle.FillSnapshot] = list(historical_fills)
         self.position = Decimal("0")
         self.next_order_index = 500
         self.terminal_calls = 0
@@ -409,20 +412,45 @@ class SyntheticGateway:
         if self.maker_cancel_mismatch:
             updated = replace(updated, price=updated.price + Decimal("0.01"))
         self.orders[order_index] = updated
-        if self.maker_cancel_fill:
-            self.fills.append(
-                lifecycle.FillSnapshot(
-                    trade_id="maker-cancel-fill",
-                    order_index=order_index,
-                    client_order_index=order.client_order_index,
-                    account_index=ACCOUNT_INDEX,
-                    market_id=MARKET_ID,
-                    quantity=order.quantity,
-                    price=order.price,
-                    is_ask=order.is_ask,
-                    timestamp_ms=self.clock[0],
-                )
+        if self.maker_cancel_fill or self.maker_cancel_fill_variant is not None:
+            variant = self.maker_cancel_fill_variant
+            if variant not in {
+                None,
+                "duplicate",
+                "wrong_client",
+                "wrong_order",
+                "wrong_account",
+                "wrong_market",
+                "wrong_side",
+                "wrong_quantity",
+            }:
+                raise AssertionError(f"unknown maker cancel fill variant: {variant}")
+            fill = lifecycle.FillSnapshot(
+                trade_id="maker-cancel-fill",
+                order_index=order_index if variant != "wrong_order" else order_index + 1,
+                client_order_index=(
+                    order.client_order_index
+                    if variant != "wrong_client"
+                    else order.client_order_index + 1
+                ),
+                account_index=(
+                    ACCOUNT_INDEX
+                    if variant != "wrong_account"
+                    else ACCOUNT_INDEX + 1
+                ),
+                market_id=MARKET_ID if variant != "wrong_market" else MARKET_ID + 1,
+                quantity=(
+                    order.quantity
+                    if variant != "wrong_quantity"
+                    else order.quantity + Decimal("1")
+                ),
+                price=order.price,
+                is_ask=order.is_ask if variant != "wrong_side" else not order.is_ask,
+                timestamp_ms=self.clock[0],
             )
+            self.fills.append(fill)
+            if variant == "duplicate":
+                self.fills.append(replace(fill, trade_id="maker-cancel-fill-duplicate"))
         if self.maker_cancel_unrelated_order:
             self.orders[order_index + 1] = replace(
                 order,
@@ -818,6 +846,8 @@ async def run_synthetic(
     maker_cancel_unrelated_order: bool = False,
     maker_cancel_mismatch: bool = False,
     maker_cancel_fill: bool = False,
+    maker_cancel_fill_variant: str | None = None,
+    historical_fills: tuple[lifecycle.FillSnapshot, ...] = (),
 ) -> tuple[lifecycle.RunnerReport, SyntheticGateway, lifecycle.LifecycleStore]:
     clock = [0]
     gateway = SyntheticGateway(
@@ -833,6 +863,8 @@ async def run_synthetic(
         maker_cancel_unrelated_order=maker_cancel_unrelated_order,
         maker_cancel_mismatch=maker_cancel_mismatch,
         maker_cancel_fill=maker_cancel_fill,
+        maker_cancel_fill_variant=maker_cancel_fill_variant,
+        historical_fills=historical_fills,
     )
     runner, store = make_runner(tmp_path, gateway, mode=mode)
     report = await runner.run()
@@ -963,6 +995,40 @@ async def test_complete_ordered_lifecycle_rediscovery_intents_and_terminal_round
     store.close()
 
 
+async def test_maker_cancel_tolerates_unrelated_historical_fills(tmp_path):
+    historical = lifecycle.FillSnapshot(
+        trade_id="historical-fill",
+        order_index=41,
+        client_order_index=42,
+        account_index=ACCOUNT_INDEX,
+        market_id=MARKET_ID,
+        quantity=Decimal("7"),
+        price=Decimal("9.50"),
+        is_ask=True,
+        timestamp_ms=0,
+    )
+
+    report, gateway, store = await run_synthetic(
+        tmp_path,
+        historical_fills=(historical,),
+    )
+
+    assert report.result is lifecycle.RunnerResult.COMPLETE
+    assert report.intent_count == 4
+    assert report.dispatch_count == 4
+    assert report.terminal_rounds == 2
+    assert gateway.cancel_calls == 1
+    assert [row[0] for row in gateway.dispatches] == [
+        "MAKER_PLACE",
+        "MAKER_CANCEL",
+        "OPEN",
+        "CLOSE",
+    ]
+    assert gateway.fills[0] == historical
+    assert store.all_intents_reconciled()
+    store.close()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("maker_cancel_status", ["canceled", "CANCELLED", "EXPIRED"])
 async def test_maker_cancel_accepts_official_and_legacy_terminal_statuses(
@@ -1068,6 +1134,36 @@ async def test_maker_cancel_rejects_fill_evidence_even_with_zero_terminal_order(
     assert report.reason == "POST_SEND_RECONCILIATION_UNRESOLVED"
     assert gateway.cancel_calls == 1
     assert [row[0] for row in gateway.dispatches] == ["MAKER_PLACE", "MAKER_CANCEL"]
+    assert gateway.sleep_calls == []
+    store.close()
+
+
+@pytest.mark.parametrize(
+    "maker_cancel_fill_variant",
+    [
+        "wrong_client",
+        "wrong_order",
+        "wrong_account",
+        "wrong_market",
+        "wrong_side",
+        "wrong_quantity",
+        "duplicate",
+    ],
+)
+async def test_maker_cancel_rejects_partial_or_malformed_fill_identity(
+    tmp_path, maker_cancel_fill_variant
+):
+    report, gateway, store = await run_synthetic(
+        tmp_path,
+        maker_cancel_fill_variant=maker_cancel_fill_variant,
+    )
+
+    assert report.result is lifecycle.RunnerResult.HALTED_MANUAL_RECOVERY
+    assert report.failure_class == "TRANSPORT"
+    assert report.reason == "POST_SEND_RECONCILIATION_UNRESOLVED"
+    assert report.intent_count == 2
+    assert report.dispatch_count == 2
+    assert gateway.cancel_calls == 1
     assert gateway.sleep_calls == []
     store.close()
 
