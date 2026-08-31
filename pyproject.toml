@@ -11,6 +11,7 @@ dependencies = ["aiohttp>=3.9,<4"]
 
 [project.scripts]
 risex-farmer = "risex_farmer.cli:main"
+risex-telegram-provision = "risex_farmer.telegram_config:main"
 nado-mainnet-unsigned-read = "risex_farmer.nado_mainnet_unsigned_read:main"
 nado-mainnet-archive-read = "risex_farmer.nado_mainnet_archive_read:main"
 lighter-testnet-readiness = "risex_farmer.lighter_testnet_readiness:main"

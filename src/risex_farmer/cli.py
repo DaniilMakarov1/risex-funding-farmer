@@ -7,6 +7,7 @@ import asyncio
 import json
 import shutil
 from collections.abc import Sequence
+from contextlib import nullcontext
 from dataclasses import replace
 from datetime import UTC
 from decimal import Decimal, ROUND_HALF_UP
@@ -16,6 +17,7 @@ from .notifications import outbox_from_environment
 from .orchestrator import fixture_scan, load_fixture, run_fixture
 from .runtime import public_paper_run, public_scan_once
 from .storage import PaperRepository
+from .telegram_config import TelegramConfigurationError, paper_telegram_environment
 
 
 def _synthetic_test_overlay(value: str) -> Decimal:
@@ -305,24 +307,34 @@ def main(argv: Sequence[str] | None = None) -> int:
             synthetic_test_pnl_overlay_usd=overlay,
         )
     )
-    with PaperRepository(args.db) as repository:
-        try:
-            if args.command == "scan-once":
-                output = asyncio.run(
-                    _scan_once(repository, args.fixture)
-                    if overlay == Decimal("0")
-                    else _scan_once(repository, args.fixture, config=config)
-                )
-            elif args.command == "paper-run":
-                output = asyncio.run(
-                    _paper_run(repository, args.fixture)
-                    if overlay == Decimal("0")
-                    else _paper_run(repository, args.fixture, config=config)
-                )
-            else:
-                output = repository.report()
-        except KeyboardInterrupt:
-            output = {"status": "STOPPED_SAFE", "forced_close": False}
+    telegram_environment = (
+        paper_telegram_environment()
+        if args.command == "paper-run" and args.fixture is None
+        else nullcontext()
+    )
+    try:
+        with telegram_environment:
+            with PaperRepository(args.db) as repository:
+                try:
+                    if args.command == "scan-once":
+                        output = asyncio.run(
+                            _scan_once(repository, args.fixture)
+                            if overlay == Decimal("0")
+                            else _scan_once(repository, args.fixture, config=config)
+                        )
+                    elif args.command == "paper-run":
+                        output = asyncio.run(
+                            _paper_run(repository, args.fixture)
+                            if overlay == Decimal("0")
+                            else _paper_run(repository, args.fixture, config=config)
+                        )
+                    else:
+                        output = repository.report()
+                except KeyboardInterrupt:
+                    output = {"status": "STOPPED_SAFE", "forced_close": False}
+    except TelegramConfigurationError as error:
+        print(json.dumps({"reason": error.reason, "status": "BLOCKED"}, sort_keys=True))
+        return 1
     if args.command == "scan-once" and args.format == "table":
         print(_scan_table(output))
     else:
