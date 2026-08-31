@@ -2722,6 +2722,63 @@ def _find_order(snapshot: AccountSnapshot, intent: IntentSpec) -> OrderSnapshot:
     return order
 
 
+def _validate_maker_cancel_fill_history(
+    fills: Sequence[FillSnapshot],
+    *,
+    target_order_index: int,
+    target_client_order_index: int,
+    account_index: int,
+    market_id: int,
+    is_ask: bool,
+    quantity: Decimal,
+) -> None:
+    """Reject only fill history attributable to the current maker target.
+
+    The Lighter trades endpoint is account-wide, so older fills may be
+    present after a fresh maker cancel.  A shared order or client identity is
+    still a contradiction: a partial identity can never be treated as
+    unrelated history.
+    """
+
+    try:
+        rows = tuple(fills)
+    except TypeError:
+        raise LifecycleHalt("MAKER_CANCEL_FILL_SCHEMA_INVALID", failure_class="SCHEMA") from None
+
+    matching: list[FillSnapshot] = []
+    for fill in rows:
+        try:
+            if fill.account_index != account_index:
+                raise LifecycleHalt("MAKER_CANCEL_FILL_ACCOUNT_MISMATCH", failure_class="SAFETY")
+            if (
+                fill.order_index == target_order_index
+                or fill.client_order_index == target_client_order_index
+            ):
+                matching.append(fill)
+        except AttributeError:
+            raise LifecycleHalt("MAKER_CANCEL_FILL_SCHEMA_INVALID", failure_class="SCHEMA") from None
+
+    if not matching:
+        return
+    if len(matching) != 1:
+        raise LifecycleHalt("MAKER_CANCEL_FILL_IDENTITY_CONTRADICTION", failure_class="SAFETY")
+
+    fill = matching[0]
+    if (
+        fill.order_index != target_order_index
+        or fill.client_order_index != target_client_order_index
+    ):
+        raise LifecycleHalt("MAKER_CANCEL_FILL_IDENTITY_MISMATCH", failure_class="SAFETY")
+    if (
+        fill.account_index != account_index
+        or fill.market_id != market_id
+        or fill.is_ask != is_ask
+        or fill.quantity != quantity
+    ):
+        raise LifecycleHalt("MAKER_CANCEL_FILL_FIELDS_MISMATCH", failure_class="SAFETY")
+    raise LifecycleHalt("MAKER_CANCEL_FILL_PRESENT", failure_class="SAFETY")
+
+
 def _reconcile_filled(
     snapshot: AccountSnapshot,
     intent: IntentSpec,
@@ -3004,8 +3061,15 @@ class LighterLevelCRunner:
                 observed_at_ms=self.clock_ms(),
                 allow_active_order_index=cancel.target_order_index,
             )
-            if after_cancel.fills:
-                raise LifecycleHalt("MAKER_CANCEL_FILL_PRESENT", failure_class="SAFETY")
+            _validate_maker_cancel_fill_history(
+                after_cancel.fills,
+                target_order_index=cancel.target_order_index,
+                target_client_order_index=request.client_order_index,
+                account_index=self.identity.account_index,
+                market_id=market.market_id,
+                is_ask=request.is_ask,
+                quantity=request.quantity,
+            )
             cancelled = _find_order(after_cancel, cancel)
             original = _find_order(after_cancel, place)
             if original.order_index != cancelled.order_index:
