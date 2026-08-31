@@ -2551,9 +2551,9 @@ class LighterLevelCRunner:
     async def _fresh_prewrite(self) -> tuple[MarketObservation, AccountSnapshot]:
         if self._market is None:
             raise LifecycleHalt("MARKET_NOT_BOUND")
-        now = self.clock_ms()
         market = await self.gateway.market(self._market.market_id)
-        market.validate(now_ms=now)
+        market_now = self.clock_ms()
+        market.validate(now_ms=market_now)
         if (
             market.contract != self._market.contract
             or market.funding.next_boundary_ms != self._market.funding.next_boundary_ms
@@ -2561,11 +2561,12 @@ class LighterLevelCRunner:
             raise LifecycleHalt("MARKET_CHANGED_BEFORE_WRITE", failure_class="SAFETY")
         self._market = market
         account = await self.gateway.snapshot(market.market_id)
+        account_now = self.clock_ms()
         account.validate_identity_and_safety(
             self.identity,
             market_id=market.market_id,
             require_flat=True,
-            observed_at_ms=now,
+            observed_at_ms=account_now,
         )
         return market, account
 
@@ -2850,17 +2851,18 @@ class LighterLevelCRunner:
         )
 
     async def _close_phase(self, market: MarketObservation) -> None:
-        now = self.clock_ms()
         fresh_market = await self.gateway.market(market.market_id)
-        fresh_market.validate(now_ms=now, require_future_funding=False)
+        market_now = self.clock_ms()
+        fresh_market.validate(now_ms=market_now, require_future_funding=False)
         if fresh_market.contract != market.contract:
             raise LifecycleHalt("MARKET_CHANGED_BEFORE_CLOSE", failure_class="SAFETY")
         account = await self.gateway.snapshot(market.market_id)
+        account_now = self.clock_ms()
         account.validate_identity_and_safety(
             self.identity,
             market_id=market.market_id,
             require_flat=False,
-            observed_at_ms=now,
+            observed_at_ms=account_now,
         )
         if any(
             row.market_id != market.market_id and row.signed_quantity != 0

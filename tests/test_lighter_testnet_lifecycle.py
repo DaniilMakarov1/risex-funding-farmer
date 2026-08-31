@@ -403,6 +403,98 @@ async def test_preflight_validates_each_read_against_post_read_clock(tmp_path):
     store.close()
 
 
+@pytest.mark.asyncio
+async def test_fresh_prewrite_rejects_market_stale_after_market_read(tmp_path):
+    clock = [0]
+    gateway = SyntheticGateway(clock)
+    runner, store = make_runner(tmp_path, gateway)
+
+    async def market_after_clock_advance(market_id):
+        observed = market_at(clock[0])
+        clock[0] += 10_001
+        return observed
+
+    gateway.market = market_after_clock_advance
+
+    report = await runner.run()
+
+    assert report.result is lifecycle.RunnerResult.BLOCKED
+    assert report.reason == "MARKET_OBSERVATION_STALE"
+    assert report.intent_count == 0
+    assert report.dispatch_count == 0
+    assert not gateway.dispatches
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_fresh_prewrite_uses_post_read_clock_for_account(tmp_path):
+    clock = [0]
+    gateway = SyntheticGateway(clock)
+    runner, store = make_runner(tmp_path, gateway)
+    runner._market = market_at(clock[0])
+
+    async def market_read_advances_clock(market_id):
+        observed = market_at(clock[0])
+        clock[0] += 1
+        return observed
+
+    gateway.market = market_read_advances_clock
+
+    market, account = await runner._fresh_prewrite()
+
+    assert market.observed_at_ms == 0
+    assert account.observed_at_ms == 1
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_close_pre_read_rejects_market_stale_after_market_read(tmp_path):
+    clock = [0]
+    gateway = SyntheticGateway(clock)
+    runner, store = make_runner(tmp_path, gateway)
+    runner._quantity = Decimal("1")
+    runner._open_is_ask = True
+    gateway.position = Decimal("-1")
+    runner_market = market_at(clock[0])
+
+    async def market_after_clock_advance(market_id):
+        observed = market_at(clock[0])
+        clock[0] += 10_001
+        return observed
+
+    gateway.market = market_after_clock_advance
+
+    with pytest.raises(lifecycle.LifecycleHalt, match="MARKET_OBSERVATION_STALE"):
+        await runner._close_phase(runner_market)
+
+    assert not gateway.dispatches
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_close_pre_read_uses_post_read_clock_for_account(tmp_path):
+    clock = [0]
+    gateway = SyntheticGateway(clock)
+    runner, store = make_runner(tmp_path, gateway)
+    runner._quantity = Decimal("1")
+    runner._open_is_ask = True
+    gateway.position = Decimal("-1")
+    runner_market = market_at(clock[0])
+    store.begin()
+
+    async def market_read_advances_clock(market_id):
+        observed = market_at(clock[0])
+        clock[0] += 1
+        return observed
+
+    gateway.market = market_read_advances_clock
+
+    await runner._close_phase(runner_market)
+
+    assert [row[0] for row in gateway.dispatches] == ["CLOSE"]
+    store.close()
+
+
 async def run_synthetic(
     tmp_path: Path,
     *,
