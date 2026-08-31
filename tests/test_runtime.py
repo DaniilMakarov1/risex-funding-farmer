@@ -213,8 +213,10 @@ class LighterStreamAdapter(LighterAdapter):
         self.clock = clock
         self._market_ids = {"ETH": 1}
         self._symbols_by_id = {1: "ETH"}
+        self.fetch_book_calls = 0
 
     async def fetch_book(self, venue_symbol: str) -> OrderBook:
+        self.fetch_book_calls += 1
         return OrderBook(
             Venue.LIGHTER,
             venue_symbol,
@@ -584,6 +586,106 @@ class SingleWebSocketSession:
 class LighterTextWebSocket(TextWebSocket):
     async def send_json(self, _payload) -> None:
         return None
+
+
+def lighter_order_book_snapshot(*, timestamp: int, nonce: int = 1) -> dict[str, object]:
+    return {
+        "type": "subscribed/order_book",
+        "channel": "order_book:1",
+        "market_id": 1,
+        "timestamp": timestamp,
+        "order_book": {
+            "code": 0,
+            "bids": [{"price": "99", "size": "20"}],
+            "asks": [{"price": "101", "size": "20"}],
+            "nonce": nonce,
+            "begin_nonce": nonce,
+        },
+    }
+
+
+def lighter_market_stats_all_snapshot(*, timestamp: int) -> dict[str, object]:
+    return {
+        "type": "subscribed/market_stats",
+        "channel": "market_stats:all",
+        "timestamp": timestamp,
+        "market_stats": {
+            "1": {
+                "symbol": "ETH",
+                "market_id": 1,
+                "index_price": "100",
+                "last_trade_price": "100",
+                "current_funding_rate": "0.001",
+                "funding_rate": "0.0005",
+                "funding_timestamp": timestamp + 1,
+            },
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_lighter_combined_stream_bootstraps_from_authoritative_subscriptions(
+    tmp_path,
+):
+    clock = FakeClock()
+    stop = asyncio.Event()
+    adapter = LighterStreamAdapter(clock)
+    market = CanonicalMarket(
+        "ETH", Venue.LIGHTER, "ETH", MarketType.PERPETUAL,
+        ContractType.LINEAR, D("1"), "USDC", "USDC", D("0.1"), D("0.001"),
+        D("0.001"), D("10"), None, True, False, False,
+    )
+    funding = adapter.unknown_funding_quote(
+        market, observed_at=clock.now(), assumed_open_at=clock.now()
+    )
+    websocket = LighterTextWebSocket(
+        stop,
+        (
+            lighter_order_book_snapshot(
+                timestamp=int(clock.now().timestamp() * 1000)
+            ),
+            lighter_market_stats_all_snapshot(
+                timestamp=int(clock.now().timestamp() * 1000)
+            ),
+        ),
+    )
+    sent = []
+
+    async def capture_send(payload) -> None:
+        sent.append(payload)
+
+    websocket.send_json = capture_send
+    session = SingleWebSocketSession(websocket)
+    with PaperRepository(tmp_path / "lighter-subscription-bootstrap.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository,
+            adapters={Venue.LIGHTER: adapter},
+            clock=clock,
+        )
+        runtime._session = session
+        runtime._stop_event = stop
+        runtime.observations[(Venue.LIGHTER, "ETH")] = MarketObservation(
+            market, None, None, funding, None
+        )
+        session_id = runtime._new_stream_session(
+            (Venue.LIGHTER, "*", "combined")
+        )
+        await runtime._combined_stream(
+            Venue.LIGHTER, adapter, ("ETH",), session_id
+        )
+        stream = runtime.coordinator.stream(Venue.LIGHTER, "ETH")
+        observation = runtime.observations[(Venue.LIGHTER, "ETH")]
+
+    assert adapter.fetch_book_calls == 0
+    assert [payload["channel"] for payload in sent] == [
+        "order_book/1", "trade/1", "market_stats/all",
+    ]
+    assert stream.book() is not None
+    assert stream.book().sequence == 1
+    assert stream.health(clock.now()).data_quality is DataQuality.COMPLETE
+    assert (Venue.LIGHTER, "ETH") in runtime._trade_stream_ready
+    assert observation.funding is not None
+    assert observation.funding.quality is FundingQuality.PREDICTED
 
 
 def lighter_trade_message(

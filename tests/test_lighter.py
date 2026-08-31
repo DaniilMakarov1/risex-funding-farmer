@@ -603,6 +603,101 @@ async def test_lighter_trade_and_market_stats_supply_identity_and_future_cash():
     assert invalid.quality is FundingQuality.UNKNOWN
 
 
+def test_lighter_market_stats_subscription_snapshot_is_authoritative():
+    adapter = LighterAdapter(object())
+    market = adapter.normalize_market(market_row())
+    stats_at_ms = int(NOW.timestamp() * 1000)
+    quote = adapter.normalize_market_stats_message(
+        {
+            "type": "subscribed/market_stats",
+            "channel": "market_stats:0",
+            "timestamp": stats_at_ms,
+            "market_stats": {
+                "symbol": "ETH",
+                "market_id": 0,
+                "index_price": "100",
+                "last_trade_price": "100",
+                "current_funding_rate": "0.001",
+                "funding_rate": "0.0005",
+                "funding_timestamp": stats_at_ms,
+            },
+        },
+        market,
+        received_at=NOW,
+        assumed_open_at=NOW,
+    )
+    assert quote.quality is FundingQuality.PREDICTED
+    assert adapter._funding_quotes["ETH"] == quote
+
+
+def test_lighter_funding_timestamp_one_millisecond_wire_skew_is_normalized():
+    adapter = LighterAdapter(object())
+    market = adapter.normalize_market(market_row())
+    stats_at_ms = int(NOW.timestamp() * 1000)
+    quote = adapter.normalize_market_stats_message(
+        {
+            "type": "update/market_stats",
+            "channel": "market_stats:0",
+            "timestamp": stats_at_ms,
+            "market_stats": {
+                "symbol": "ETH",
+                "market_id": 0,
+                "index_price": "100",
+                "current_funding_rate": "0.001",
+                "funding_timestamp": stats_at_ms + 1,
+            },
+        },
+        market,
+        received_at=NOW,
+        assumed_open_at=NOW,
+    )
+    assert quote.quality is FundingQuality.PREDICTED
+    assert quote.settlement_at == NOW + timedelta(hours=1)
+
+
+def test_lighter_all_market_stats_snapshot_selects_target_market():
+    adapter = LighterAdapter(object())
+    market = adapter.normalize_market(market_row())
+    stats_at_ms = int(NOW.timestamp() * 1000)
+    rows = adapter.market_stats_rows(
+        {
+            "type": "subscribed/market_stats",
+            "channel": "market_stats:all",
+            "timestamp": stats_at_ms,
+            "market_stats": {
+                "0": {
+                    "symbol": "ETH",
+                    "market_id": 0,
+                    "index_price": "100",
+                    "current_funding_rate": "0.001",
+                    "funding_timestamp": stats_at_ms,
+                },
+            },
+        }
+    )
+    quote = adapter.normalize_market_stats_message(
+        {
+            "type": "subscribed/market_stats",
+            "channel": "market_stats:all",
+            "timestamp": stats_at_ms,
+            "market_stats": {
+                "0": {
+                    "symbol": "ETH",
+                    "market_id": 0,
+                    "index_price": "100",
+                    "current_funding_rate": "0.001",
+                    "funding_timestamp": stats_at_ms,
+                },
+            },
+        },
+        market,
+        received_at=NOW,
+        assumed_open_at=NOW,
+    )
+    assert rows[0][0] == 0
+    assert quote.quality is FundingQuality.PREDICTED
+
+
 def test_lighter_non_hourly_funding_timestamp_fails_closed():
     adapter = LighterAdapter(object())
     market = adapter.normalize_market(market_row())
@@ -637,6 +732,9 @@ def test_lighter_heartbeats_and_no_applied_public_history_surface():
     }
     assert adapter.subscription("market_stats", 0) == {
         "type": "subscribe", "channel": "market_stats/0"
+    }
+    assert adapter.subscription("market_stats", "all") == {
+        "type": "subscribe", "channel": "market_stats/all"
     }
     assert adapter.client_ping_action().payload == b'{"type":"ping"}'
     assert adapter.handle_server_pong().connection_confirmed

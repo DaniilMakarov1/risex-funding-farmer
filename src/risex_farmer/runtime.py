@@ -4815,7 +4815,7 @@ class PublicPaperRuntime:
                             raise TypeError("Lighter stream requires LighterAdapter")
                         for symbol in symbols:
                             market_id = adapter.market_id(symbol)
-                            for kind in ("order_book", "trade", "market_stats"):
+                            for kind in ("order_book", "trade"):
                                 await ws.send_json(
                                     adapter.subscription(kind, market_id)
                                 )
@@ -4823,6 +4823,15 @@ class PublicPaperRuntime:
                                     task_key, stream_session_id
                                 ):
                                     return
+                        # One all-market stats snapshot is authoritative for
+                        # each subscribed perp and keeps the 24-market burst at
+                        # 49 subscriptions instead of exceeding Lighter's
+                        # documented 50 in-flight-message limit.
+                        await ws.send_json(adapter.subscription("market_stats", "all"))
+                        if not self._owns_stream_session(
+                            task_key, stream_session_id
+                        ):
+                            return
                     self._socket_reconnected(
                         socket_identity, at=self.clock.now(),
                         stream_session_id=stream_session_id,
@@ -4862,6 +4871,13 @@ class PublicPaperRuntime:
                             ):
                                 return
                             book_ready = episode.terminal == "COMPLETE"
+                        elif venue is Venue.LIGHTER:
+                            # Lighter sends a complete order-book snapshot on
+                            # subscription.  Read that authoritative snapshot
+                            # before falling back to REST, so the combined
+                            # socket can drain its subscription responses.
+                            self.coordinator.stream(venue, symbol).gap()
+                            book_ready = False
                         else:
                             snapshot = await self._public_call(
                                 venue,
@@ -5089,15 +5105,14 @@ class PublicPaperRuntime:
                         elif venue is Venue.LIGHTER and "market_stats" in kind:
                             if not isinstance(adapter, LighterAdapter):
                                 raise TypeError("Lighter market stats require LighterAdapter")
-                            stats = require_mapping(
-                                payload.get("market_stats"), "market_stats"
-                            )
-                            market_id = adapter._integer(
-                                stats.get("market_id"), "market_stats.market_id"
-                            )
-                            symbol = adapter.symbol_for_market(market_id)
-                            row = self.observations.get((venue, symbol))
-                            if row is not None:
+                            for market_id, _stats in adapter.market_stats_rows(payload):
+                                try:
+                                    symbol = adapter.symbol_for_market(market_id)
+                                except ValueError:
+                                    continue
+                                row = self.observations.get((venue, symbol))
+                                if row is None:
+                                    continue
                                 received_at = self.clock.now()
                                 quote = adapter.normalize_market_stats_message(
                                     payload,

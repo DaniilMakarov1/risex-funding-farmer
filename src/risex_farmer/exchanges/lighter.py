@@ -52,6 +52,10 @@ class LighterAdapter(PublicAdapter):
     # this public contract; it is not inferred from a generic asset registry.
     PERP_QUOTE_ASSET_ID = 0
     FUNDING_PERIOD = timedelta(hours=1)
+    # Current public frames report the hourly boundary one millisecond after
+    # the boundary.  Keep this tolerance narrower than a market-data freshness
+    # window and canonicalize only that observed wire-level skew.
+    FUNDING_BOUNDARY_TOLERANCE = timedelta(milliseconds=1)
 
     def __init__(self, session: Any) -> None:
         super().__init__(
@@ -457,6 +461,58 @@ class LighterAdapter(PublicAdapter):
             f"{self.WS_SOURCE}#market-stats:future-funding-required",
         )
 
+    @classmethod
+    def market_stats_rows(cls, payload: Any) -> tuple[tuple[int, Any], ...]:
+        """Return the strict direct or all-market stats rows in a WS frame."""
+        message = require_mapping(payload, "Lighter market stats message")
+        if str(message.get("type", "")) not in {
+            "subscribed/market_stats", "update/market_stats",
+        }:
+            raise ValueError("Lighter market stats message type is invalid")
+        stats_payload = require_mapping(message.get("market_stats"), "market_stats")
+        channel = str(message.get("channel", ""))
+        if not (
+            channel.startswith("market_stats/")
+            or channel.startswith("market_stats:")
+        ):
+            raise ValueError("Lighter market stats channel is invalid")
+        channel_suffix = (
+            channel.rsplit("/", 1)[-1]
+            if "/" in channel
+            else channel.rsplit(":", 1)[-1]
+        )
+        if channel_suffix == "all":
+            rows: list[tuple[int, Any]] = []
+            seen_ids: set[int] = set()
+            for raw_market_id, raw_stats in stats_payload.items():
+                market_id = cls._integer(raw_market_id, "market_stats.market_id")
+                stats = require_mapping(raw_stats, "market_stats row")
+                row_market_id = cls._integer(
+                    stats.get("market_id"), "market_stats.market_id"
+                )
+                if row_market_id != market_id or market_id in seen_ids:
+                    raise ValueError("Lighter market stats row identity mismatch")
+                seen_ids.add(market_id)
+                rows.append((market_id, stats))
+            if not rows:
+                raise ValueError("Lighter all-market stats snapshot is empty")
+            return tuple(rows)
+        market_id = cls.market_id_from_channel(channel)
+        row_market_id = cls._integer(
+            stats_payload.get("market_id"), "market_stats.market_id"
+        )
+        if row_market_id != market_id:
+            raise ValueError("Lighter market stats channel identity mismatch")
+        return ((market_id, stats_payload),)
+
+    @classmethod
+    def _hourly_funding_boundary(cls, raw_value: Any) -> datetime:
+        funding_at = timestamp(raw_value, "milliseconds")
+        boundary = funding_at.replace(minute=0, second=0, microsecond=0)
+        if funding_at - boundary > cls.FUNDING_BOUNDARY_TOLERANCE:
+            raise ValueError("Lighter funding timestamp is not an hourly boundary")
+        return boundary
+
     def normalize_market_stats_message(
         self,
         payload: Any,
@@ -467,12 +523,15 @@ class LighterAdapter(PublicAdapter):
     ) -> FundingCashQuote:
         message = require_mapping(payload, "Lighter market stats message")
         try:
-            if str(message.get("type", "")) != "update/market_stats":
-                raise ValueError("Lighter market stats message type is invalid")
-            stats = require_mapping(message.get("market_stats"), "market_stats")
+            target_market_id = self.market_id(market.venue_symbol)
+            rows = self.market_stats_rows(message)
+            matching_rows = tuple(
+                row for market_id, row in rows if market_id == target_market_id
+            )
+            if len(matching_rows) != 1:
+                raise ValueError("Lighter market stats target is missing or duplicated")
+            stats = matching_rows[0]
             market_id = self._integer(stats.get("market_id"), "market_stats.market_id")
-            if self.market_id_from_channel(message.get("channel")) != market_id:
-                raise ValueError("Lighter market stats channel identity mismatch")
             if self.symbol_for_market(market_id) != market.venue_symbol:
                 raise ValueError("Lighter market stats identity mismatch")
             symbol = str(stats.get("symbol", "")).strip()
@@ -482,7 +541,9 @@ class LighterAdapter(PublicAdapter):
                 raise ValueError("Lighter market stats market is not linear")
             raw_time = message.get("timestamp")
             observed_at = min(timestamp(raw_time, "milliseconds"), received_at)
-            last_funding_at = timestamp(stats.get("funding_timestamp"), "milliseconds")
+            last_funding_at = self._hourly_funding_boundary(
+                stats.get("funding_timestamp")
+            )
             settlement_at = last_funding_at + self.FUNDING_PERIOD
             rate = decimal_value(stats.get("current_funding_rate"), "current_funding_rate")
             index = decimal_value(stats.get("index_price"), "index_price")
@@ -539,7 +600,7 @@ class LighterAdapter(PublicAdapter):
         )
 
     @staticmethod
-    def subscription(kind: str, market_id: int) -> dict[str, object]:
+    def subscription(kind: str, market_id: int | str) -> dict[str, object]:
         channels = {
             "book": "order_book",
             "order_book": "order_book",
