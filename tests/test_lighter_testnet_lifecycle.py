@@ -107,6 +107,7 @@ class SyntheticGateway:
         response_mismatch_kind: lifecycle.IntentKind | None = None,
         drop_after_accept_kind: lifecycle.IntentKind | None = None,
         public_order_nonces: dict[lifecycle.IntentKind, int] | None = None,
+        maker_cancel_status: str = "CANCELLED",
     ) -> None:
         self.clock = clock
         self.funding_mode = funding_mode
@@ -115,6 +116,7 @@ class SyntheticGateway:
         self.response_mismatch_kind = response_mismatch_kind
         self.drop_after_accept_kind = drop_after_accept_kind
         self.public_order_nonces = dict(public_order_nonces or {})
+        self.maker_cancel_status = maker_cancel_status
         self.store: lifecycle.LifecycleStore | None = None
         self.discover_calls = 0
         self.market_calls: list[int] = []
@@ -301,7 +303,7 @@ class SyntheticGateway:
         self.orders[order_index] = replace(
             order,
             remaining_quantity=Decimal("0"),
-            status="CANCELLED",
+            status=self.maker_cancel_status,
         )
         self.dispatches.append(("MAKER_CANCEL", nonce, api_key_index, False, order.is_ask))
         return lifecycle.DispatchOutcome(
@@ -517,6 +519,7 @@ async def run_synthetic(
     response_mismatch_kind: lifecycle.IntentKind | None = None,
     drop_after_accept_kind: lifecycle.IntentKind | None = None,
     public_order_nonces: dict[lifecycle.IntentKind, int] | None = None,
+    maker_cancel_status: str = "CANCELLED",
 ) -> tuple[lifecycle.RunnerReport, SyntheticGateway, lifecycle.LifecycleStore]:
     clock = [0]
     gateway = SyntheticGateway(
@@ -527,6 +530,7 @@ async def run_synthetic(
         response_mismatch_kind=response_mismatch_kind,
         drop_after_accept_kind=drop_after_accept_kind,
         public_order_nonces=public_order_nonces,
+        maker_cancel_status=maker_cancel_status,
     )
     runner, store = make_runner(tmp_path, gateway, mode=mode)
     report = await runner.run()
@@ -654,6 +658,51 @@ async def test_complete_ordered_lifecycle_rediscovery_intents_and_terminal_round
     assert all(row[3] is False for row in gateway.dispatches[:3])
     assert gateway.dispatches[-1][3] is True
     assert store.all_intents_reconciled()
+    store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("maker_cancel_status", ["canceled", "CANCELLED", "EXPIRED"])
+async def test_maker_cancel_accepts_official_and_legacy_terminal_statuses(
+    tmp_path, maker_cancel_status
+):
+    report, gateway, store = await run_synthetic(
+        tmp_path,
+        maker_cancel_status=maker_cancel_status,
+    )
+
+    assert report.result is lifecycle.RunnerResult.COMPLETE
+    assert report.intent_count == 4
+    assert report.dispatch_count == 4
+    assert [row[0] for row in gateway.dispatches] == [
+        "MAKER_PLACE",
+        "MAKER_CANCEL",
+        "OPEN",
+        "CLOSE",
+    ]
+    maker_order = next(row for row in gateway.orders.values() if row.order_type == "limit")
+    assert maker_order.status == maker_cancel_status
+    assert maker_order.remaining_quantity == 0
+    assert maker_order.filled_quantity == 0
+    store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("maker_cancel_status", ["OPEN", "FILLED", "UNKNOWN"])
+async def test_maker_cancel_rejects_active_filled_and_unknown_statuses(
+    tmp_path, maker_cancel_status
+):
+    report, gateway, store = await run_synthetic(
+        tmp_path,
+        maker_cancel_status=maker_cancel_status,
+    )
+
+    assert report.result is lifecycle.RunnerResult.HALTED_MANUAL_RECOVERY
+    assert report.failure_class == "TRANSPORT"
+    assert report.reason == "POST_SEND_RECONCILIATION_UNRESOLVED"
+    assert [row[0] for row in gateway.dispatches] == ["MAKER_PLACE", "MAKER_CANCEL"]
+    assert report.intent_count == 2
+    assert report.dispatch_count == 2
     store.close()
 
 
