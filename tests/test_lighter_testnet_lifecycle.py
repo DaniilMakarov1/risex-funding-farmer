@@ -2907,9 +2907,10 @@ async def test_official_reader_rejects_post_cancel_target_binding_mismatch(targe
 
 async def test_official_reader_parses_pinned_plural_position_fundings_field():
     apis = FakeOfficialApis()
+    timestamp_ms = 1_788_184_800_000
     apis.position_funding_rows = [
         SimpleNamespace(
-            timestamp=HOUR,
+            timestamp=timestamp_ms,
             market_id=MARKET_ID,
             funding_id=77,
             change="-0.25",
@@ -2919,7 +2920,7 @@ async def test_official_reader_parses_pinned_plural_position_fundings_field():
             position_side="short",
         )
     ]
-    adapter = make_read_adapter(apis)
+    adapter = make_read_adapter(apis, clock=[timestamp_ms])
 
     history = await adapter.funding_history(
         MARKET_ID,
@@ -2933,13 +2934,101 @@ async def test_official_reader_parses_pinned_plural_position_fundings_field():
         lifecycle.FundingRecord(
             77,
             MARKET_ID,
-            HOUR,
+            timestamp_ms,
             Decimal("-0.25"),
             Decimal("0.001"),
             Decimal("1"),
             "short",
         ),
     )
+
+
+@pytest.mark.parametrize(
+    ("timestamp", "timestamp_ms"),
+    [
+        (1_788_184_800, 1_788_184_800_000),
+        (1_788_184_800_000, 1_788_184_800_000),
+    ],
+)
+async def test_official_reader_normalizes_position_funding_timestamp_for_boundary(
+    timestamp, timestamp_ms
+):
+    apis = FakeOfficialApis()
+    apis.position_funding_rows = [
+        SimpleNamespace(
+            timestamp=timestamp,
+            market_id=120,
+            funding_id=492,
+            change="0.000121",
+            discount="0",
+            rate="0.000012",
+            position_size="2.79",
+            position_side="short",
+        )
+    ]
+    adapter = make_read_adapter(apis, clock=[timestamp_ms])
+
+    history = await adapter.funding_history(
+        120,
+        account_index=ACCOUNT_INDEX,
+        baseline_high_water=491,
+        boundary_ms=timestamp_ms,
+    )
+
+    assert history.attributable(
+        market_id=120,
+        quantity=Decimal("2.79"),
+        is_ask=True,
+        boundary_ms=timestamp_ms,
+    ) == lifecycle.FundingRecord(
+        492,
+        120,
+        timestamp_ms,
+        Decimal("0.000121"),
+        Decimal("0.000012"),
+        Decimal("2.79"),
+        "short",
+    )
+
+
+@pytest.mark.parametrize(
+    ("timestamp", "reason"),
+    [
+        (True, "FUNDING_TIMESTAMP_INVALID"),
+        (0, "FUNDING_TIMESTAMP_INVALID"),
+        (-1, "FUNDING_TIMESTAMP_INVALID"),
+        (10_000_000_000, "FUNDING_TIMESTAMP_INVALID"),
+        (999_999_999_999, "FUNDING_TIMESTAMP_INVALID"),
+        (1_788_184_800_001, "FUNDING_TIMESTAMP_IN_FUTURE"),
+        (lifecycle.MAX_WIRE_INTEGER + 1, "FUNDING_TIMESTAMP_OVERFLOW"),
+    ],
+)
+async def test_official_reader_rejects_unsafe_position_funding_timestamps(
+    timestamp, reason
+):
+    apis = FakeOfficialApis()
+    apis.position_funding_rows = [
+        SimpleNamespace(
+            timestamp=timestamp,
+            market_id=120,
+            funding_id=492,
+            change="0.000121",
+            discount="0",
+            rate="0.000012",
+            position_size="2.79",
+            position_side="short",
+        )
+    ]
+    adapter = make_read_adapter(apis, clock=[1_788_184_800_000])
+
+    with pytest.raises(lifecycle.LifecycleHalt, match=reason) as exc_info:
+        await adapter.funding_history(
+            120,
+            account_index=ACCOUNT_INDEX,
+            baseline_high_water=491,
+        )
+
+    assert exc_info.value.failure_class == "SCHEMA"
 
 
 async def test_official_reader_trigger_orders_fail_the_zero_order_gate():

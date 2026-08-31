@@ -65,6 +65,9 @@ MAX_PAGES = 256
 MAX_PRIVATE_FILE_BYTES = 8192
 MAX_PUBLIC_IDENTITY_BYTES = 32_768
 MAX_WIRE_INTEGER = (1 << 63) - 1
+_LIGHTER_FUNDING_SECONDS_MIN = 1_000_000_000
+_LIGHTER_FUNDING_SECONDS_MAX = 10_000_000_000
+_LIGHTER_FUNDING_MILLISECONDS_MIN = 1_000_000_000_000
 LIGHTER_MAX_CLIENT_ORDER_INDEX = (1 << 48) - 1
 MAX_MARKET_DECIMALS = 18
 TERMINAL_ROUND_MAX_AGE_MS = 10_000
@@ -159,6 +162,31 @@ def _int(value: Any, label: str, *, nonnegative: bool = False) -> int:
     if nonnegative and value < 0:
         raise LifecycleHalt(f"{label}_INVALID", failure_class="SCHEMA")
     return value
+
+
+def _funding_timestamp_ms(value: Any, *, now_ms: int | None = None) -> int:
+    """Normalize the Lighter PositionFunding epoch timestamp to milliseconds.
+
+    PositionFunding is observed in Unix seconds, while this lifecycle's
+    boundary contract is milliseconds.  Keep an explicit magnitude gap so an
+    intermediate value is never guessed as either unit.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise LifecycleHalt("FUNDING_TIMESTAMP_INVALID", failure_class="SCHEMA")
+    if _LIGHTER_FUNDING_SECONDS_MIN <= value < _LIGHTER_FUNDING_SECONDS_MAX:
+        normalized = value * 1000
+    elif value >= _LIGHTER_FUNDING_MILLISECONDS_MIN:
+        normalized = value
+    else:
+        raise LifecycleHalt("FUNDING_TIMESTAMP_INVALID", failure_class="SCHEMA")
+    if normalized > MAX_WIRE_INTEGER:
+        raise LifecycleHalt("FUNDING_TIMESTAMP_OVERFLOW", failure_class="SCHEMA")
+    if now_ms is not None:
+        now = _int(now_ms, "FUNDING_CLOCK", nonnegative=True)
+        if normalized > now:
+            raise LifecycleHalt("FUNDING_TIMESTAMP_IN_FUTURE", failure_class="SCHEMA")
+    return normalized
 
 
 def _text(value: Any, label: str) -> str:
@@ -2134,7 +2162,10 @@ class OfficialSdkReadAdapter:
                 parsed = FundingRecord(
                     funding_id=funding_id,
                     market_id=_int(_sdk_field(row, "FUNDING_MARKET_ID", "market_id"), "FUNDING_MARKET_ID", nonnegative=True),
-                    timestamp_ms=_int(_sdk_field(row, "FUNDING_TIMESTAMP", "timestamp"), "FUNDING_TIMESTAMP", nonnegative=True),
+                    timestamp_ms=_funding_timestamp_ms(
+                        _sdk_field(row, "FUNDING_TIMESTAMP", "timestamp"),
+                        now_ms=self._clock_ms(),
+                    ),
                     change=_decimal(_sdk_field(row, "FUNDING_CHANGE", "change"), "FUNDING_CHANGE"),
                     rate=_decimal(_sdk_field(row, "FUNDING_RATE", "rate"), "FUNDING_RATE"),
                     position_size=_decimal(_sdk_field(row, "FUNDING_POSITION_SIZE", "position_size"), "FUNDING_POSITION_SIZE", positive=True),
