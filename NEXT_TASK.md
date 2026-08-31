@@ -4,7 +4,7 @@
 
 Status: `AUTHORIZED — LIVE DEFECT REPRODUCED; BUILDER CANDIDATE REQUIRED`.
 
-Objective: correct only the observed gap after an activated PAPER maker entry terminates without a fill. Persist one explicit cancellation outcome with the exact existing `CancellationReason`, route, attempt identity, active duration, and zero cumulative maker quantity, then emit one bounded Telegram lifecycle notification stating that the maker entry was not filled, no taker hedge was taken, no position opened, and the runtime returned to `FLAT`. The notification identity must distinguish repeated attempts for the same route and funding cycle without weakening route locking or existing lifecycle notification deduplication.
+Objective: correct only the observed gap after an activated PAPER maker entry terminates without a full fill. Persist one explicit cancellation outcome with the exact existing `CancellationReason`, route, attempt identity, active duration, and actual cumulative qualifying maker evidence, then emit one bounded Telegram lifecycle notification stating that the maker entry was not fully filled, no taker hedge was taken, no position opened, and the runtime returned to `FLAT`. The five observed attempts had zero cumulative evidence, but a sub-target nonzero accumulation must be reported accurately rather than omitted or called a partial position. The notification identity must distinguish repeated attempts for the same route and funding cycle without weakening route locking or existing lifecycle notification deduplication.
 
 Acceptance:
 
