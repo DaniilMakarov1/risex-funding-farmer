@@ -628,7 +628,13 @@ def evaluate_route(
         max_silence_seconds=config.max_market_stream_silence_seconds,
     ):
         reasons.append(NoTradeReason.BOOK_UNHEALTHY)
-    if not risex.trade_stream_ready or not hedge.trade_stream_ready:
+    if (
+        not risex.trade_stream_ready
+        or (
+            hedge.market.venue is not Venue.LIGHTER
+            and not hedge.trade_stream_ready
+        )
+    ):
         reasons.append(NoTradeReason.TRADE_STREAM_UNHEALTHY)
     if not risex.funding_stream_ready or not hedge.funding_stream_ready:
         reasons.append(NoTradeReason.FUNDING_STREAM_UNHEALTHY)

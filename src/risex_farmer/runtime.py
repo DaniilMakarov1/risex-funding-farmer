@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import signal
+from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Protocol, TypeVar
@@ -20,7 +21,7 @@ from .exchanges.nado import NadoAdapter
 from .exchanges.risex import RisexAdapter
 from .exchanges.lighter import LighterAdapter
 from .lifecycle import LifecycleEngine, LifecycleEventType, LifecycleSnapshot
-from .market_data import BookStream, MarketDataCoordinator
+from .market_data import BookStream, MarketDataCoordinator, funding_is_fresh
 from .models import (
     BookExecutionCapture,
     BookDelta,
@@ -97,6 +98,8 @@ class RecoveryEpisode:
     attempts: int = 0
     overflows: int = 0
     terminal: str | None = None
+    lighter_snapshot_requested: bool = False
+    lighter_snapshot_event: asyncio.Event | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,6 +138,55 @@ class _PublicSocketClosed(ConnectionError):
 _PublicResult = TypeVar("_PublicResult")
 PUBLIC_REQUEST_TIMEOUT_SECONDS = 30
 PUBLIC_REST_CONCURRENCY_PER_VENUE = 2
+LIGHTER_MAX_INFLIGHT_SUBSCRIPTIONS = 50
+LIGHTER_WS_RECOVERY_TIMEOUT_SECONDS = 30
+
+
+@dataclass(slots=True)
+class _LighterSubscriptionDispatcher:
+    """Keep Lighter subscription requests below its in-flight limit.
+
+    Lighter acknowledges public subscriptions with the first frame for the
+    response channel.  The dispatcher sends at most 50 unacknowledged
+    requests, then lets the combined stream consume those frames before
+    sending the remaining requests.  It is deliberately local to one
+    physical public session and has no account or write surface.
+    """
+
+    ws: Any
+    is_current: Callable[[], bool]
+    pending: deque[tuple[str, dict[str, object]]] = field(default_factory=deque)
+    inflight: deque[str] = field(default_factory=deque)
+
+    @staticmethod
+    def _response_channel(channel: object) -> str:
+        value = str(channel or "")
+        return value.replace("/", ":", 1)
+
+    def queue(self, payload: dict[str, object]) -> None:
+        self.pending.append((
+            self._response_channel(payload.get("channel")), payload
+        ))
+
+    def acknowledge(self, payload: Mapping[str, object]) -> None:
+        channel = self._response_channel(payload.get("channel"))
+        try:
+            self.inflight.remove(channel)
+        except ValueError:
+            return
+
+    async def drain(self) -> None:
+        while (
+            self.pending
+            and len(self.inflight) < LIGHTER_MAX_INFLIGHT_SUBSCRIPTIONS
+        ):
+            if not self.is_current():
+                return
+            channel, payload = self.pending.popleft()
+            await self.ws.send_json(payload)
+            if not self.is_current():
+                return
+            self.inflight.append(channel)
 
 
 def _volume_signature(rows: Mapping[str, MarketVolume]) -> dict[str, tuple[Decimal | None, str]]:
@@ -1695,6 +1747,48 @@ class PublicPaperRuntime:
                     result.append(market)
         return tuple(result)
 
+    def _healthy_lighter_stream_book(
+        self, key: tuple[Venue, str], at: datetime
+    ) -> OrderBook | None:
+        """Return only a live sequence-bearing Lighter book.
+
+        Lighter's REST book has no nonce.  A sequence-bearing book already
+        owned by the public WebSocket must therefore win any concurrent REST
+        observation, including a refresh that started before the WS snapshot
+        arrived.
+        """
+        stream = self.coordinator.stream(*key)
+        book = stream.book()
+        if (
+            book is None
+            or book.sequence is None
+            or stream.health(at).data_quality is not DataQuality.COMPLETE
+        ):
+            return None
+        return book
+
+    def _healthy_lighter_ws_funding(
+        self, key: tuple[Venue, str], at: datetime
+    ) -> FundingCashQuote | None:
+        observation = self.observations.get(key)
+        quote = None if observation is None else observation.funding
+        if quote is None or quote.quality is FundingQuality.UNKNOWN:
+            return None
+        adapter = None if self.adapters is None else self.adapters.get(Venue.LIGHTER)
+        if not isinstance(adapter, LighterAdapter) or quote.source != adapter.WS_SOURCE:
+            return None
+        if not funding_is_fresh(
+            quote.observed_at,
+            at,
+            max_age_seconds=self.config.default_max_funding_data_age_seconds,
+        ):
+            return None
+        return quote
+
+    def _route_trade_stream_ready(self, venue: Venue, symbol: str) -> bool:
+        """Return trade evidence required by the fixed PAPER route profile."""
+        return venue is Venue.LIGHTER or (venue, symbol) in self._trade_stream_ready
+
     async def _market_observation(
         self, market: Any, assumed_at: datetime, *, background: bool = False
     ) -> None:
@@ -1717,7 +1811,7 @@ class PublicPaperRuntime:
             live_health = self.coordinator.stream(*key).health(self.clock.now())
             live_stream_ready = (
                 key in self._live_book_ready
-                if isinstance(adapter, ExtendedAdapter)
+                if isinstance(adapter, (ExtendedAdapter, LighterAdapter))
                 else key in self._trade_stream_ready
             )
             healthy_live = (
@@ -1725,7 +1819,21 @@ class PublicPaperRuntime:
                 and live_stream_ready
                 and live_health.data_quality is DataQuality.COMPLETE
             )
-            preserve_stream_book = healthy_live
+            lighter_stream_book = (
+                self._healthy_lighter_stream_book(key, self.clock.now())
+                if isinstance(adapter, LighterAdapter)
+                else None
+            )
+            lighter_ws_funding = (
+                self._healthy_lighter_ws_funding(key, self.clock.now())
+                if isinstance(adapter, LighterAdapter)
+                else None
+            )
+            preserve_stream_book = (
+                lighter_stream_book is not None
+                if isinstance(adapter, LighterAdapter)
+                else healthy_live
+            )
             if isinstance(adapter, RisexAdapter):
                 # The immutable contract becomes eligible only after both public
                 # book and recent-trade unit evidence are proven in this scan.
@@ -1747,15 +1855,41 @@ class PublicPaperRuntime:
                         market, assumed_open_at=assumed_at
                     ),
                 )
-            else:
-                if preserve_stream_book:
-                    book = self.coordinator.stream(*key).book()
+            elif isinstance(adapter, LighterAdapter) and (
+                episode := self._recoveries.get(key)
+            ) is not None and episode.terminal is None:
+                # A Lighter gap is recovered only by a fresh sequence-bearing
+                # WS snapshot.  Never install another sequence-less REST book
+                # while that recovery owns the stream.
+                preserve_stream_book = True
+                book = self.coordinator.stream(*key).book()
+                if lighter_ws_funding is not None:
+                    funding = lighter_ws_funding
+                else:
                     funding = await self._public_call(
                         market.venue,
                         lambda: adapter.fetch_funding_quote(
                             market, assumed_open_at=assumed_at
                         ),
                     )
+            else:
+                if preserve_stream_book:
+                    book = self.coordinator.stream(*key).book()
+                    if lighter_ws_funding is not None:
+                        funding = lighter_ws_funding
+                    else:
+                        funding = await self._public_call(
+                            market.venue,
+                            lambda: adapter.fetch_funding_quote(
+                                market, assumed_open_at=assumed_at
+                            ),
+                        )
+                elif isinstance(adapter, LighterAdapter) and lighter_ws_funding is not None:
+                    book = await self._public_call(
+                        market.venue,
+                        lambda: adapter.fetch_book(market.venue_symbol),
+                    )
+                    funding = lighter_ws_funding
                 else:
                     book, funding = await _gather_owned(
                         self._public_call(
@@ -1772,6 +1906,18 @@ class PublicPaperRuntime:
             logical_at = self.clock.now()
             funding = _quote_for_open_time(funding, logical_at)
             stream = self.coordinator.stream(market.venue, market.venue_symbol)
+            if isinstance(adapter, LighterAdapter):
+                lighter_stream_book = self._healthy_lighter_stream_book(key, logical_at)
+                if lighter_stream_book is not None:
+                    # Re-check after every awaited REST operation.  A WS
+                    # snapshot may have won the race while fetch_book ran.
+                    preserve_stream_book = True
+                    book = lighter_stream_book
+                lighter_ws_funding = self._healthy_lighter_ws_funding(key, logical_at)
+                if lighter_ws_funding is not None:
+                    # A market_stats frame can win while REST funding was in
+                    # flight; keep the authoritative WS quote.
+                    funding = lighter_ws_funding
             if not preserve_stream_book:
                 stream.connected(logical_at)
                 stream.snapshot(book)
@@ -1784,10 +1930,18 @@ class PublicPaperRuntime:
                     ),
                 )
             self.observations[key] = MarketObservation(
-                market, volume, stream.book(), funding, stream.health(logical_at)
+                market, volume, stream.book(), funding, stream.health(logical_at),
+                trade_stream_ready=market.venue is not Venue.LIGHTER,
             )
             ready_components = ["funding"]
-            if not preserve_stream_book or live_health.data_quality is DataQuality.COMPLETE:
+            current_health = stream.health(logical_at)
+            if (
+                current_health.data_quality is DataQuality.COMPLETE
+                or (
+                    not isinstance(adapter, LighterAdapter)
+                    and not preserve_stream_book
+                )
+            ):
                 ready_components.append("book")
             for component in ready_components:
                 self._set_component_readiness(
@@ -1928,9 +2082,13 @@ class PublicPaperRuntime:
                 health = replace(
                     health, stream_connected=False, data_quality=DataQuality.DEGRADED
                 )
-            trade_stream_ready = refresh or (
-                observation.market.venue, observation.market.venue_symbol
-            ) in self._trade_stream_ready
+            trade_stream_ready = (
+                False
+                if observation.market.venue is Venue.LIGHTER
+                else refresh or (
+                    observation.market.venue, observation.market.venue_symbol
+                ) in self._trade_stream_ready
+            )
             funding_stream_ready = True
             if observation.market.venue is Venue.EXTENDED:
                 funding_stream_ready = refresh or self._extended_stream_connection_available(
@@ -1958,12 +2116,15 @@ class PublicPaperRuntime:
             for row in normalized_tuple
         }
         captured_keys = set(normalized_by_market)
+        trade_required_keys = {
+            key for key in captured_keys if key[0] is not Venue.LIGHTER
+        }
         observations_source = (
             "REST_BOOTSTRAP"
             if refresh else (
                 "LIVE_STREAM"
                 if captured_keys
-                and captured_keys <= self._trade_stream_ready
+                and trade_required_keys <= self._trade_stream_ready
                 and captured_keys <= self._live_book_ready
                 else "MIXED"
             )
@@ -2331,7 +2492,10 @@ class PublicPaperRuntime:
             )
         return replace(
             row, book=stream.book(), health=health,
-            trade_stream_ready=(venue, symbol) in self._trade_stream_ready,
+            trade_stream_ready=(
+                venue is not Venue.LIGHTER
+                and (venue, symbol) in self._trade_stream_ready
+            ),
             funding_stream_ready=(
                 venue is not Venue.EXTENDED
                 or self._extended_stream_connection_available(symbol, "funding")
@@ -2558,7 +2722,10 @@ class PublicPaperRuntime:
                     and isinstance(self.adapters.get(Venue.EXTENDED), ExtendedAdapter)
                 ):
                     continue
-                if (venue, symbol) not in self._trade_stream_ready:
+                if (
+                    venue is not Venue.LIGHTER
+                    and (venue, symbol) not in self._trade_stream_ready
+                ):
                     continue
                 health = self.coordinator.stream(venue, symbol).health(now)
                 confirmation = health.last_connection_confirmation_at
@@ -3093,6 +3260,8 @@ class PublicPaperRuntime:
     def mark_trade_stream_connected(
         self, venue: Venue, symbol: str, *, at: datetime | None = None
     ) -> None:
+        if venue is Venue.LIGHTER:
+            return
         now = at or self.clock.now()
         if (
             venue is Venue.EXTENDED
@@ -3331,7 +3500,14 @@ class PublicPaperRuntime:
         if venue is Venue.EXTENDED and stream_kind in {"book", "trade", "funding"}:
             self._extended_confirmed_at.pop((symbol, stream_kind), None)
         invalidates_book = stream_kind in {"book", "combined", "health", "public"}
-        invalidates_trade = stream_kind in {"trade", "combined", "health", "public"}
+        lighter_combined_without_trade = (
+            venue is Venue.LIGHTER
+            and stream_kind in {"combined", "health", "public"}
+        )
+        invalidates_trade = (
+            stream_kind in {"trade", "combined", "health", "public"}
+            and not lighter_combined_without_trade
+        )
         if invalidates_trade:
             self._trade_stream_ready.discard((venue, symbol))
         if invalidates_book:
@@ -3340,7 +3516,11 @@ class PublicPaperRuntime:
         exception_name = "StreamGap" if exception is None else type(exception).__name__
         exception_detail = "" if exception is None else f":{str(exception)[:120]}"
         if stream_kind in {"combined", "public", "health"}:
-            affected = ("book", "trade", "funding", "connection_combined")
+            affected = (
+                ("book", "funding", "connection_combined")
+                if lighter_combined_without_trade
+                else ("book", "trade", "funding", "connection_combined")
+            )
         elif venue is Venue.EXTENDED and stream_kind == "funding":
             affected = ("applied_funding", "connection_funding")
         else:
@@ -3780,10 +3960,10 @@ class PublicPaperRuntime:
             and hedge.health.data_quality is DataQuality.COMPLETE
             and (Venue.RISEX, snapshot.risex_market.venue_symbol)
             in self._trade_stream_ready
-            and (
+            and self._route_trade_stream_ready(
                 snapshot.hedge_market.venue,
                 snapshot.hedge_market.venue_symbol,
-            ) in self._trade_stream_ready
+            )
         )
         if execution_healthy:
             before = lifecycle.snapshot
@@ -3816,6 +3996,13 @@ class PublicPaperRuntime:
         self, book: OrderBook, *, at: datetime | None = None
     ) -> bool:
         now = at or self.clock.now()
+        if book.venue is Venue.LIGHTER and book.sequence is None:
+            self._record(
+                "PUBLIC_REST_SNAPSHOT_IGNORED_FOR_WS_RESYNC",
+                at=now, venue=book.venue,
+                detail={"symbol": book.canonical_market},
+            )
+            return False
         async with self._position_event_lock:
             await self._recover_snapshot_locked(book, at=now)
         return True
@@ -3894,9 +4081,10 @@ class PublicPaperRuntime:
                 and hedge.health.data_quality is DataQuality.COMPLETE
                 and (Venue.RISEX, lifecycle_before.risex_market.venue_symbol)
                 in self._trade_stream_ready
-                and (lifecycle_before.hedge_market.venue,
-                     lifecycle_before.hedge_market.venue_symbol)
-                in self._trade_stream_ready
+                and self._route_trade_stream_ready(
+                    lifecycle_before.hedge_market.venue,
+                    lifecycle_before.hedge_market.venue_symbol,
+                )
             )
             if execution_healthy:
                 def recovery_capture(
@@ -4022,6 +4210,8 @@ class PublicPaperRuntime:
                     self.lifecycle = None
             episode.terminal = "COMPLETE"
             episode.buffer.clear()
+            if episode.lighter_snapshot_event is not None:
+                episode.lighter_snapshot_event.set()
         self._notify_outage(
             "PUBLIC_SNAPSHOT_RECOVERY_COMPLETED", degraded=False, venue=venue,
             detail=completion_detail,
@@ -4048,6 +4238,13 @@ class PublicPaperRuntime:
         )
         episode = self._recoveries.get(key)
         active = episode is not None and episode.terminal is None
+        if (
+            event.venue is Venue.LIGHTER
+            and episode is not None
+            and episode.terminal == "FAILED"
+            and episode.owned_stream_session_id == stream_session_id
+        ):
+            return False
         if episode is not None and episode.terminal == "FAILED":
             return False
         required_session = (
@@ -4055,6 +4252,17 @@ class PublicPaperRuntime:
             if active else self._stream_sessions.get(stream_key)
         )
         if required_session != stream_session_id:
+            return False
+        if (
+            isinstance(event, OrderBook)
+            and event.venue is Venue.LIGHTER
+            and event.sequence is None
+        ):
+            self._record(
+                "PUBLIC_REST_SNAPSHOT_IGNORED_FOR_WS_RESYNC",
+                at=now, venue=event.venue,
+                detail={"symbol": event.canonical_market},
+            )
             return False
         if not active:
             self.coordinator.stream(*key).connection_confirmed(now)
@@ -4087,7 +4295,11 @@ class PublicPaperRuntime:
                     stream_kind="book", exception=exc,
                     stream_session_id=stream_session_id,
                 )
-                if event.venue is not Venue.RISEX:
+                if event.venue is Venue.LIGHTER:
+                    self._fail_lighter_snapshot_recovery(
+                        key, episode, cause="WS_SNAPSHOT_SEQUENCE_GAP", at=now
+                    )
+                elif event.venue is not Venue.RISEX:
                     self._restart_recovery_attempt(key, episode)
                 return False
             return await self._publish_recovery_snapshot(
@@ -4147,6 +4359,12 @@ class PublicPaperRuntime:
                 stream_kind="book", stream_session_id=stream_session_id,
             )
             if event.venue is Venue.RISEX:
+                return False
+            if event.venue is Venue.LIGHTER:
+                self._start_snapshot_recovery(
+                    event.venue, event.canonical_market,
+                    displaced_stream_session_id=stream_session_id,
+                )
                 return False
             self._start_snapshot_recovery(
                 event.venue, event.canonical_market,
@@ -4318,18 +4536,30 @@ class PublicPaperRuntime:
         current = self._recoveries.get(key)
         if current is not None and current.terminal is None:
             return current
+        if (
+            venue is Venue.LIGHTER
+            and current is not None
+            and current.terminal == "FAILED"
+            and current.owned_stream_session_id == displaced_stream_session_id
+        ):
+            # Do not turn every post-failure delta on the same physical
+            # session into another recovery episode.  A fresh WS session is
+            # the only allowed successor for a failed Lighter recovery.
+            return current
         session_id = (
             self._new_stream_session((venue, symbol, "book"))
             if venue is Venue.EXTENDED else displaced_stream_session_id
         )
         episode = self._new_recovery_episode(key, session_id)
         self._record_recovery_started(key, episode)
-        operation = (
-            self._restart_extended_book_stream(symbol, episode)
-            if venue is Venue.EXTENDED
-            else self._recover_snapshot_in_background(venue, symbol, episode)
-        )
-        self._spawn_recovery_task(key, episode, operation)
+        if venue is Venue.EXTENDED:
+            self._spawn_recovery_task(
+                key, episode, self._restart_extended_book_stream(symbol, episode)
+            )
+        elif venue is not Venue.LIGHTER:
+            self._spawn_recovery_task(
+                key, episode, self._recover_snapshot_in_background(venue, symbol, episode)
+            )
         return episode
 
     def _spawn_recovery_task(
@@ -4348,6 +4578,100 @@ class PublicPaperRuntime:
 
         task.add_done_callback(release)
 
+    def _arm_lighter_snapshot_recovery(
+        self, key: tuple[Venue, str], episode: RecoveryEpisode
+    ) -> None:
+        if (
+            key[0] is not Venue.LIGHTER
+            or self._recoveries.get(key) is not episode
+            or episode.terminal is not None
+            or episode.task is not None
+        ):
+            return
+        episode.lighter_snapshot_requested = True
+        episode.lighter_snapshot_event = asyncio.Event()
+        self._spawn_recovery_task(
+            key,
+            episode,
+            self._wait_for_lighter_snapshot(key, episode),
+        )
+
+    async def _wait_for_lighter_snapshot(
+        self, key: tuple[Venue, str], episode: RecoveryEpisode
+    ) -> None:
+        event = episode.lighter_snapshot_event
+        if event is None:
+            return
+        try:
+            async with asyncio.timeout(LIGHTER_WS_RECOVERY_TIMEOUT_SECONDS):
+                await event.wait()
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            if self._owns_recovery(key, episode, episode.attempt_generation):
+                self._fail_lighter_snapshot_recovery(
+                    key, episode, cause="WS_SNAPSHOT_TIMEOUT", at=self.clock.now()
+                )
+
+    def _fail_lighter_snapshot_recovery(
+        self,
+        key: tuple[Venue, str],
+        episode: RecoveryEpisode,
+        *,
+        cause: str,
+        at: datetime,
+    ) -> None:
+        if not self._owns_recovery(key, episode, episode.attempt_generation):
+            return
+        episode.terminal = "FAILED"
+        episode.buffer.clear()
+        if episode.lighter_snapshot_event is not None:
+            episode.lighter_snapshot_event.set()
+        self.coordinator.stream(*key).gap()
+        for component in ("book", "connection_combined"):
+            self._set_component_readiness(
+                key[0], f"{component}:{key[1]}", False,
+                f"PUBLIC_SNAPSHOT_RECOVERY_FAILED:{cause}", at,
+            )
+        self._record(
+            "PUBLIC_SNAPSHOT_RECOVERY_FAILED",
+            at=at,
+            venue=key[0],
+            detail={
+                "symbol": key[1],
+                "episode_id": episode.episode_id.value,
+                "generation": episode.attempt_generation.value,
+                "attempts": episode.attempts,
+                "cause": cause,
+                "source": "WS_SNAPSHOT",
+            },
+        )
+
+    async def _request_lighter_snapshot(
+        self,
+        ws: object,
+        adapter: LighterAdapter,
+        symbol: str,
+        stream_session_id: StreamSessionId,
+        dispatcher: _LighterSubscriptionDispatcher,
+    ) -> None:
+        key = (Venue.LIGHTER, symbol)
+        episode = self._recoveries.get(key)
+        if (
+            episode is None
+            or episode.terminal is not None
+            or episode.owned_stream_session_id != stream_session_id
+            or not self._owns_stream_session((Venue.LIGHTER, "*", "combined"), stream_session_id)
+            or episode.lighter_snapshot_requested
+        ):
+            return
+        episode.attempts = 1
+        self._arm_lighter_snapshot_recovery(key, episode)
+        dispatcher.queue(
+            adapter.subscription("order_book", adapter.market_id(symbol))
+        )
+        await dispatcher.drain()
+
     def _build_recovery_book(
         self, snapshot: OrderBook, episode: RecoveryEpisode
     ) -> tuple[OrderBook, int, int]:
@@ -4357,6 +4681,10 @@ class PublicPaperRuntime:
         buffered = len(episode.buffer)
         replayed = 0
         if snapshot.sequence is None:
+            if snapshot.venue is Venue.LIGHTER:
+                raise ValueError(
+                    "Lighter WS recovery snapshot must carry a nonce"
+                )
             recovered = stream.book()
             if recovered is None:
                 raise ValueError("snapshot recovery produced no book")
@@ -4795,6 +5123,7 @@ class PublicPaperRuntime:
                             venue, symbols, stream_session_id
                         )
                     )
+                    lighter_dispatcher: _LighterSubscriptionDispatcher | None = None
                     if venue is Venue.RISEX:
                         ids = [adapter.market_id(symbol) for symbol in symbols]  # type: ignore[attr-defined]
                         await ws.send_json(adapter.orderbook_subscription(ids))  # type: ignore[attr-defined]
@@ -4813,25 +5142,27 @@ class PublicPaperRuntime:
                     else:
                         if not isinstance(adapter, LighterAdapter):
                             raise TypeError("Lighter stream requires LighterAdapter")
+                        lighter_dispatcher = _LighterSubscriptionDispatcher(
+                            ws=ws,
+                            is_current=lambda: self._owns_stream_session(
+                                task_key, stream_session_id
+                            ),
+                        )
+                        for symbol in replaced_recoveries:
+                            episode = self._recoveries.get((venue, symbol))
+                            if episode is not None:
+                                self._arm_lighter_snapshot_recovery(
+                                    (venue, symbol), episode
+                                )
                         for symbol in symbols:
                             market_id = adapter.market_id(symbol)
-                            for kind in ("order_book", "trade"):
-                                await ws.send_json(
-                                    adapter.subscription(kind, market_id)
-                                )
-                                if not self._owns_stream_session(
-                                    task_key, stream_session_id
-                                ):
-                                    return
-                        # One all-market stats snapshot is authoritative for
-                        # each subscribed perp and keeps the 24-market burst at
-                        # 49 subscriptions instead of exceeding Lighter's
-                        # documented 50 in-flight-message limit.
-                        await ws.send_json(adapter.subscription("market_stats", "all"))
-                        if not self._owns_stream_session(
-                            task_key, stream_session_id
-                        ):
-                            return
+                            lighter_dispatcher.queue(
+                                adapter.subscription("order_book", market_id)
+                            )
+                        lighter_dispatcher.queue(
+                            adapter.subscription("market_stats", "all")
+                        )
+                        await lighter_dispatcher.drain()
                     self._socket_reconnected(
                         socket_identity, at=self.clock.now(),
                         stream_session_id=stream_session_id,
@@ -4874,8 +5205,7 @@ class PublicPaperRuntime:
                         elif venue is Venue.LIGHTER:
                             # Lighter sends a complete order-book snapshot on
                             # subscription.  Read that authoritative snapshot
-                            # before falling back to REST, so the combined
-                            # socket can drain its subscription responses.
+                            # before processing any live deltas.
                             self.coordinator.stream(venue, symbol).gap()
                             book_ready = False
                         else:
@@ -4891,11 +5221,18 @@ class PublicPaperRuntime:
                                 snapshot, stream_session_id=stream_session_id
                             )
                         if book_ready:
-                            self.mark_trade_stream_connected(venue, symbol)
-                            for component in (
-                                "book", "trade", "funding",
-                                "connection_combined",
-                            ):
+                            if venue is Venue.LIGHTER:
+                                components = (
+                                    "book", "connection_book",
+                                    "connection_combined",
+                                )
+                            else:
+                                self.mark_trade_stream_connected(venue, symbol)
+                                components = (
+                                    "book", "trade", "funding",
+                                    "connection_combined",
+                                )
+                            for component in components:
                                 self._set_component_readiness(
                                     venue, f"{component}:{symbol}", True,
                                     "PUBLIC_STREAM_CONNECTED", self.clock.now(),
@@ -4930,6 +5267,9 @@ class PublicPaperRuntime:
                         if message.type is not aiohttp.WSMsgType.TEXT:
                             continue
                         payload = json.loads(message.data, parse_float=Decimal)
+                        if lighter_dispatcher is not None:
+                            lighter_dispatcher.acknowledge(payload)
+                            await lighter_dispatcher.drain()
                         ordinal += 1
                         kind = str(payload.get("channel", payload.get("type", ""))).lower()
                         if venue is Venue.RISEX and str(payload.get("type", "")).lower() not in {"snapshot", "update"}:
@@ -4947,10 +5287,17 @@ class PublicPaperRuntime:
                                         payload.get("channel")
                                     )
                                 )
+                                payload_type = str(
+                                    payload.get("type", "")
+                                ).lower()
+                                is_subscription_snapshot = (
+                                    channel_market_key not in lighter_initial_books
+                                    or payload_type == "subscribed/order_book"
+                                )
                                 event = adapter.normalize_book_message(
                                     payload,
                                     received_at=received_at,
-                                    initial=channel_market_key not in lighter_initial_books,
+                                    initial=is_subscription_snapshot,
                                 )
                             else:
                                 event = (
@@ -4971,6 +5318,19 @@ class PublicPaperRuntime:
                                 task_key, stream_session_id
                             ):
                                 return
+                            if (
+                                venue is Venue.LIGHTER
+                                and isinstance(event, BookDelta)
+                                and not healthy
+                                and lighter_dispatcher is not None
+                            ):
+                                await self._request_lighter_snapshot(
+                                    ws,
+                                    adapter,
+                                    event.canonical_market,
+                                    stream_session_id,
+                                    lighter_dispatcher,
+                                )
                             episode = self._recoveries.get(
                                 (venue, event.canonical_market)
                             )
@@ -4984,13 +5344,20 @@ class PublicPaperRuntime:
                                     stream_session_id=stream_session_id,
                                 )
                             elif healthy:
-                                self.mark_trade_stream_connected(
-                                    venue, event.canonical_market
-                                )
-                                for component in (
-                                    "book", "trade", "funding",
-                                    "connection_combined",
-                                ):
+                                if venue is Venue.LIGHTER:
+                                    components = (
+                                        "book", "connection_book",
+                                        "connection_combined",
+                                    )
+                                else:
+                                    self.mark_trade_stream_connected(
+                                        venue, event.canonical_market
+                                    )
+                                    components = (
+                                        "book", "trade", "funding",
+                                        "connection_combined",
+                                    )
+                                for component in components:
                                     self._set_component_readiness(
                                         venue,
                                         f"{component}:{event.canonical_market}",

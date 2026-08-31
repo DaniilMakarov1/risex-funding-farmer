@@ -665,7 +665,7 @@ async def test_lighter_combined_stream_bootstraps_from_authoritative_subscriptio
         runtime._session = session
         runtime._stop_event = stop
         runtime.observations[(Venue.LIGHTER, "ETH")] = MarketObservation(
-            market, None, None, funding, None
+            market, None, None, funding, None, trade_stream_ready=False
         )
         session_id = runtime._new_stream_session(
             (Venue.LIGHTER, "*", "combined")
@@ -678,14 +678,430 @@ async def test_lighter_combined_stream_bootstraps_from_authoritative_subscriptio
 
     assert adapter.fetch_book_calls == 0
     assert [payload["channel"] for payload in sent] == [
-        "order_book/1", "trade/1", "market_stats/all",
+        "order_book/1", "market_stats/all",
     ]
     assert stream.book() is not None
     assert stream.book().sequence == 1
     assert stream.health(clock.now()).data_quality is DataQuality.COMPLETE
-    assert (Venue.LIGHTER, "ETH") in runtime._trade_stream_ready
+    assert (Venue.LIGHTER, "ETH") not in runtime._trade_stream_ready
+    assert not observation.trade_stream_ready
     assert observation.funding is not None
     assert observation.funding.quality is FundingQuality.PREDICTED
+
+
+@pytest.mark.asyncio
+async def test_lighter_healthy_ws_funding_is_retained_on_background_refresh(tmp_path):
+    clock = FakeClock()
+
+    class NoFundingRestLighterAdapter(LighterStreamAdapter):
+        def __init__(self, clock: FakeClock) -> None:
+            super().__init__(clock)
+            self.fetch_funding_calls = 0
+
+        async def fetch_funding_quote(self, market, *, assumed_open_at):
+            self.fetch_funding_calls += 1
+            raise AssertionError("healthy Lighter WS funding must be retained")
+
+    adapter = NoFundingRestLighterAdapter(clock)
+    market = CanonicalMarket(
+        "ETH", Venue.LIGHTER, "ETH", MarketType.PERPETUAL,
+        ContractType.LINEAR, D("1"), "USDC", "USDC", D("0.1"), D("0.001"),
+        D("0.001"), D("10"), None, True, False, False,
+    )
+    quote = FundingCashQuote(
+        Venue.LIGHTER, "ETH", clock.now(), clock.now(),
+        clock.now() + timedelta(hours=1), FundingQuality.PREDICTED,
+        FundingAccrualMethod.SNAPSHOT_AT_SETTLEMENT, True,
+        D("-0.1"), D("0.1"), adapter.WS_SOURCE,
+    )
+    with PaperRepository(tmp_path / "lighter-ws-funding-refresh.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={Venue.LIGHTER: adapter}, clock=clock,
+        )
+        stream = runtime.coordinator.stream(Venue.LIGHTER, "ETH")
+        stream.connected(clock.now())
+        stream.snapshot(OrderBook(
+            Venue.LIGHTER, "ETH",
+            (BookLevel(D("99"), D("20")),),
+            (BookLevel(D("101"), D("20")),),
+            clock.now(), 10,
+        ))
+        stream.connection_confirmed(clock.now())
+        runtime.observations[(Venue.LIGHTER, "ETH")] = MarketObservation(
+            market, None, stream.book(), quote, stream.health(clock.now()),
+            trade_stream_ready=False,
+        )
+        await runtime._market_observation(
+            market, clock.now(), background=True
+        )
+        observation = runtime.observations[(Venue.LIGHTER, "ETH")]
+
+    assert adapter.fetch_funding_calls == 0
+    assert observation.funding is not None
+    assert observation.funding.source == adapter.WS_SOURCE
+    assert observation.funding == quote
+
+
+@pytest.mark.asyncio
+async def test_lighter_ws_snapshot_wins_startup_rest_race(tmp_path):
+    clock = FakeClock()
+    rest_started = asyncio.Event()
+    release_rest = asyncio.Event()
+
+    class DelayedRestLighterAdapter(LighterStreamAdapter):
+        async def fetch_book(self, venue_symbol: str) -> OrderBook:
+            rest_started.set()
+            await release_rest.wait()
+            self.fetch_book_calls += 1
+            return OrderBook(
+                Venue.LIGHTER,
+                venue_symbol,
+                (BookLevel(D("99"), D("20")),),
+                (BookLevel(D("101"), D("20")),),
+                self.clock.now(),
+                None,
+            )
+
+    adapter = DelayedRestLighterAdapter(clock)
+    market = CanonicalMarket(
+        "ETH", Venue.LIGHTER, "ETH", MarketType.PERPETUAL,
+        ContractType.LINEAR, D("1"), "USDC", "USDC", D("0.1"), D("0.001"),
+        D("0.001"), D("10"), None, True, False, False,
+    )
+    with PaperRepository(tmp_path / "lighter-startup-race.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={Venue.LIGHTER: adapter}, clock=clock,
+        )
+        session_id = runtime._new_stream_session(
+            (Venue.LIGHTER, "*", "combined")
+        )
+        observation_task = asyncio.create_task(
+            runtime._market_observation(market, clock.now())
+        )
+        await rest_started.wait()
+        assert await runtime.apply_book_event(
+            OrderBook(
+                Venue.LIGHTER, "ETH",
+                (BookLevel(D("99"), D("20")),),
+                (BookLevel(D("101"), D("20")),),
+                clock.now(), 10,
+            ),
+            stream_session_id=session_id,
+        )
+        release_rest.set()
+        await observation_task
+        assert await runtime.apply_book_event(
+            BookDelta(
+                Venue.LIGHTER, "ETH",
+                (BookLevel(D("100"), D("21")),), (),
+                clock.now(), 12, 10,
+            ),
+            stream_session_id=session_id,
+        )
+        book = runtime.coordinator.stream(Venue.LIGHTER, "ETH").book()
+
+    assert adapter.fetch_book_calls == 1
+    assert book is not None and book.sequence == 12
+
+
+@pytest.mark.asyncio
+async def test_lighter_sequence_less_rest_snapshot_is_rejected_during_recovery(
+    tmp_path,
+):
+    clock = FakeClock()
+    adapter = LighterStreamAdapter(clock)
+    with PaperRepository(tmp_path / "lighter-sequence-less-recovery.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={Venue.LIGHTER: adapter}, clock=clock,
+        )
+        session_id = runtime._new_stream_session(
+            (Venue.LIGHTER, "*", "combined")
+        )
+        stream = runtime.coordinator.stream(Venue.LIGHTER, "ETH")
+        stream.connected(clock.now())
+        stream.snapshot(OrderBook(
+            Venue.LIGHTER, "ETH",
+            (BookLevel(D("99"), D("20")),),
+            (BookLevel(D("101"), D("20")),),
+            clock.now(), 7,
+        ))
+        assert not await runtime.apply_book_event(
+            BookDelta(
+                Venue.LIGHTER, "ETH", (), (), clock.now(), 8, 999,
+            ),
+            stream_session_id=session_id,
+        )
+        episode = runtime._recoveries[Venue.LIGHTER, "ETH"]
+        assert not await runtime.apply_book_event(
+            OrderBook(
+                Venue.LIGHTER, "ETH",
+                (BookLevel(D("98"), D("20")),),
+                (BookLevel(D("102"), D("20")),),
+                clock.now(), None,
+            ),
+            stream_session_id=session_id,
+        )
+        ignored = repository.connection.execute(
+            "SELECT COUNT(*) FROM runtime_evidence "
+            "WHERE event_type='PUBLIC_REST_SNAPSHOT_IGNORED_FOR_WS_RESYNC'"
+        ).fetchone()[0]
+
+    assert episode.terminal is None
+    assert runtime.coordinator.stream(Venue.LIGHTER, "ETH").book() is None
+    assert ignored == 1
+
+
+@pytest.mark.asyncio
+async def test_lighter_ws_resubscribe_snapshot_recovers_and_accepts_next_delta(
+    tmp_path,
+):
+    clock = FakeClock()
+    stop = asyncio.Event()
+    adapter = LighterStreamAdapter(clock)
+    sent = []
+    timestamp = int(clock.now().timestamp() * 1000)
+    bad_update = {
+        "type": "update/order_book",
+        "channel": "order_book:1",
+        "market_id": 1,
+        "timestamp": timestamp,
+        "order_book": {
+            "code": 0,
+            "bids": [{"price": "100", "size": "21"}],
+            "asks": [],
+            "nonce": 2,
+            "begin_nonce": 999,
+        },
+    }
+    valid_update = {
+        **bad_update,
+        "order_book": {
+            **bad_update["order_book"],
+            "nonce": 4,
+            "begin_nonce": 3,
+        },
+    }
+    websocket = LighterTextWebSocket(stop, (
+        lighter_order_book_snapshot(timestamp=timestamp, nonce=1),
+        bad_update,
+        lighter_order_book_snapshot(timestamp=timestamp, nonce=3),
+        valid_update,
+    ))
+
+    async def capture_send(payload) -> None:
+        sent.append(payload)
+
+    websocket.send_json = capture_send
+    session = SingleWebSocketSession(websocket)
+    with PaperRepository(tmp_path / "lighter-ws-recovery.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={Venue.LIGHTER: adapter}, clock=clock,
+        )
+        runtime._session = session
+        runtime._stop_event = stop
+        session_id = runtime._new_stream_session(
+            (Venue.LIGHTER, "*", "combined")
+        )
+        await runtime._combined_stream(
+            Venue.LIGHTER, adapter, ("ETH",), session_id
+        )
+        episode = runtime._recoveries[Venue.LIGHTER, "ETH"]
+        book = runtime.coordinator.stream(Venue.LIGHTER, "ETH").book()
+
+    assert adapter.fetch_book_calls == 0
+    assert [payload["channel"] for payload in sent] == [
+        "order_book/1", "market_stats/all", "order_book/1",
+    ]
+    assert episode.terminal == "COMPLETE"
+    assert book is not None and book.sequence == 4
+
+
+@pytest.mark.asyncio
+async def test_lighter_stale_recovery_session_cannot_install_snapshot(tmp_path):
+    clock = FakeClock()
+    adapter = LighterStreamAdapter(clock)
+    with PaperRepository(tmp_path / "lighter-stale-recovery.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={Venue.LIGHTER: adapter}, clock=clock,
+        )
+        old_session = runtime._new_stream_session(
+            (Venue.LIGHTER, "*", "combined")
+        )
+        stream = runtime.coordinator.stream(Venue.LIGHTER, "ETH")
+        stream.connected(clock.now())
+        stream.snapshot(OrderBook(
+            Venue.LIGHTER, "ETH",
+            (BookLevel(D("99"), D("20")),),
+            (BookLevel(D("101"), D("20")),),
+            clock.now(), 1,
+        ))
+        assert not await runtime.apply_book_event(
+            BookDelta(
+                Venue.LIGHTER, "ETH", (), (), clock.now(), 2, 999,
+            ),
+            stream_session_id=old_session,
+        )
+        new_session = runtime._new_stream_session(
+            (Venue.LIGHTER, "*", "combined")
+        )
+        assert runtime._replace_displaced_combined_recoveries(
+            Venue.LIGHTER, ("ETH",), new_session
+        ) == ("ETH",)
+        successor = runtime._recoveries[Venue.LIGHTER, "ETH"]
+        assert not await runtime.apply_book_event(
+            OrderBook(
+                Venue.LIGHTER, "ETH",
+                (BookLevel(D("98"), D("20")),),
+                (BookLevel(D("102"), D("20")),),
+                clock.now(), 3,
+            ),
+            stream_session_id=old_session,
+        )
+        assert runtime._recoveries[Venue.LIGHTER, "ETH"] is successor
+        assert await runtime.apply_book_event(
+            OrderBook(
+                Venue.LIGHTER, "ETH",
+                (BookLevel(D("98"), D("20")),),
+                (BookLevel(D("102"), D("20")),),
+                clock.now(), 3,
+            ),
+            stream_session_id=new_session,
+        )
+        book = stream.book()
+
+    assert book is not None and book.sequence == 3
+
+
+@pytest.mark.asyncio
+async def test_lighter_failed_recovery_does_not_storm_on_same_session(tmp_path):
+    clock = FakeClock()
+    adapter = LighterStreamAdapter(clock)
+    with PaperRepository(tmp_path / "lighter-recovery-storm.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={Venue.LIGHTER: adapter}, clock=clock,
+        )
+        session_id = runtime._new_stream_session(
+            (Venue.LIGHTER, "*", "combined")
+        )
+        stream = runtime.coordinator.stream(Venue.LIGHTER, "ETH")
+        stream.connected(clock.now())
+        stream.snapshot(OrderBook(
+            Venue.LIGHTER, "ETH",
+            (BookLevel(D("99"), D("20")),),
+            (BookLevel(D("101"), D("20")),),
+            clock.now(), 1,
+        ))
+        assert not await runtime.apply_book_event(
+            BookDelta(
+                Venue.LIGHTER, "ETH", (), (), clock.now(), 2, 999,
+            ),
+            stream_session_id=session_id,
+        )
+        key = (Venue.LIGHTER, "ETH")
+        episode = runtime._recoveries[key]
+        runtime._fail_lighter_snapshot_recovery(
+            key, episode, cause="WS_SNAPSHOT_TIMEOUT", at=clock.now()
+        )
+        for _ in range(3):
+            assert runtime._start_snapshot_recovery(
+                Venue.LIGHTER, "ETH",
+                displaced_stream_session_id=session_id,
+            ) is episode
+            assert not await runtime.apply_book_event(
+                BookDelta(
+                    Venue.LIGHTER, "ETH", (), (), clock.now(), 3, 999,
+                ),
+                stream_session_id=session_id,
+            )
+        started = repository.connection.execute(
+            "SELECT COUNT(*) FROM runtime_evidence "
+            "WHERE event_type='PUBLIC_SNAPSHOT_RECOVERY_STARTED'"
+        ).fetchone()[0]
+        failed = repository.connection.execute(
+            "SELECT COUNT(*) FROM runtime_evidence "
+            "WHERE event_type='PUBLIC_SNAPSHOT_RECOVERY_FAILED'"
+        ).fetchone()[0]
+
+    assert episode.terminal == "FAILED"
+    assert started == 1
+    assert failed == 1
+
+
+@pytest.mark.asyncio
+async def test_lighter_combined_subscriptions_cap_inflight_without_route_cutoff(
+    tmp_path,
+):
+    clock = FakeClock()
+    stop = asyncio.Event()
+    symbols = tuple(f"S{index}" for index in range(25))
+
+    class ManyLighterStreamAdapter(LighterStreamAdapter):
+        def __init__(self, clock: FakeClock) -> None:
+            super().__init__(clock)
+            self._market_ids = {
+                symbol: index + 1 for index, symbol in enumerate(symbols)
+            }
+            self._symbols_by_id = {
+                index + 1: symbol for index, symbol in enumerate(symbols)
+            }
+
+    adapter = ManyLighterStreamAdapter(clock)
+    sent = []
+    timestamp = int(clock.now().timestamp() * 1000)
+    messages = []
+    for index, symbol in enumerate(symbols, start=1):
+        messages.append({
+            "type": "subscribed/order_book",
+            "channel": f"order_book:{index}",
+            "market_id": index,
+            "timestamp": timestamp,
+            "order_book": {
+                "code": 0,
+                "bids": [{"price": "99", "size": "20"}],
+                "asks": [{"price": "101", "size": "20"}],
+                "nonce": 1,
+                "begin_nonce": 1,
+            },
+        })
+    first_read_sent_count = None
+
+    class ObservingLighterWebSocket(LighterTextWebSocket):
+        async def __anext__(self):
+            nonlocal first_read_sent_count
+            if first_read_sent_count is None:
+                first_read_sent_count = len(sent)
+            return await super().__anext__()
+
+    websocket = ObservingLighterWebSocket(stop, tuple(messages))
+
+    async def capture_send(payload) -> None:
+        sent.append(payload)
+
+    websocket.send_json = capture_send
+    session = SingleWebSocketSession(websocket)
+    with PaperRepository(tmp_path / "lighter-subscription-cap.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={Venue.LIGHTER: adapter}, clock=clock,
+        )
+        runtime._session = session
+        runtime._stop_event = stop
+        session_id = runtime._new_stream_session(
+            (Venue.LIGHTER, "*", "combined")
+        )
+        await runtime._combined_stream(
+            Venue.LIGHTER, adapter, symbols, session_id
+        )
+
+    assert first_read_sent_count == 26
+    assert len(sent) == 26
+    assert sent[25]["channel"] == "market_stats/all"
+    assert len({
+        payload["channel"] for payload in sent
+        if payload["channel"].startswith("order_book/")
+    }) == 25
+    assert not any(
+        payload["channel"].startswith("trade/") for payload in sent
+    )
 
 
 def lighter_trade_message(

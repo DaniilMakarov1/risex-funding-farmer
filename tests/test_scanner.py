@@ -258,6 +258,23 @@ def test_insufficient_depth_minimums_and_zero_common_quantity_are_no_trade() -> 
     )
     assert NoTradeReason.MINIMUM_ORDER in below_exit_notional.no_trade_reasons
 
+
+def test_lighter_route_uses_risex_trade_gate_and_exact_lighter_depth() -> None:
+    lighter_without_trade = replace(
+        observation(Venue.LIGHTER), trade_stream_ready=False
+    )
+    route = plan(hedge=lighter_without_trade)
+    assert NoTradeReason.TRADE_STREAM_UNHEALTHY not in route.no_trade_reasons
+
+    risex_without_trade = replace(
+        observation(Venue.RISEX), trade_stream_ready=False
+    )
+    blocked = plan(risex=risex_without_trade, hedge=lighter_without_trade)
+    assert NoTradeReason.TRADE_STREAM_UNHEALTHY in blocked.no_trade_reasons
+
+    shallow = plan(hedge=observation(Venue.LIGHTER, depth="1"))
+    assert NoTradeReason.INSUFFICIENT_EXACT_DEPTH in shallow.no_trade_reasons
+
     no_quantity = plan(
         hedge=observation(Venue.EXTENDED, quantity_step="10")
     )

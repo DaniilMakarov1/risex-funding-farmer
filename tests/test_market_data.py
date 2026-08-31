@@ -704,6 +704,32 @@ def book(venue: Venue, sequence: int) -> OrderBook:
     )
 
 
+def test_lighter_rest_book_without_nonce_is_not_sequence_healthy() -> None:
+    stream = BookStream(Venue.LIGHTER, "ETH")
+    stream.connected(NOW)
+    stream.snapshot(OrderBook(
+        Venue.LIGHTER,
+        "ETH",
+        (BookLevel(D("99"), D("20")),),
+        (BookLevel(D("101"), D("20")),),
+        NOW,
+        None,
+    ))
+    stream.connection_confirmed(NOW)
+    assert stream.book() is not None and stream.book().sequence is None
+    assert stream.health(NOW).data_quality is DataQuality.DEGRADED
+
+    stream.snapshot(OrderBook(
+        Venue.LIGHTER,
+        "ETH",
+        (BookLevel(D("99"), D("20")),),
+        (BookLevel(D("101"), D("20")),),
+        NOW,
+        7,
+    ))
+    assert stream.health(NOW).data_quality is DataQuality.COMPLETE
+
+
 def test_reconnect_sequence_gap_heartbeat_and_recovery() -> None:
     stream = BookStream(Venue.EXTENDED, "ABC")
     stream.connected(NOW)

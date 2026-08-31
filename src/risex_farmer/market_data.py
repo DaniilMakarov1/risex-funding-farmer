@@ -228,6 +228,7 @@ class BookStream:
             and confirmation_fresh
             and self.book_initialized
             and self.book_sequence_valid
+            and (self.venue is not Venue.LIGHTER or self._sequence is not None)
             and self._valid_bbo()
         )
         return StreamHealth(
