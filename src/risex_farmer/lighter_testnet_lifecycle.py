@@ -70,6 +70,9 @@ TERMINAL_ROUND_MAX_AGE_MS = 10_000
 SDK_READ_TIMEOUT_SECONDS = 30.0
 FUNDING_SETTLEMENT_WINDOW_SECONDS = 30.0
 FUNDING_POLL_INTERVAL_SECONDS = 2.0
+MAKER_CANCEL_RECONCILIATION_TIMEOUT_SECONDS = 10.0
+MAKER_CANCEL_RECONCILIATION_POLL_INTERVAL_SECONDS = 1.0
+MAKER_CANCEL_RECONCILIATION_MAX_POLLS = 10
 
 _HEX_HASH = re.compile(r"^0x[0-9a-fA-F]{64}$")
 _LIGHTER_TRANSACTION_HASH = re.compile(r"^[0-9a-fA-F]{80}$")
@@ -581,6 +584,7 @@ class AccountSnapshot:
         market_id: int,
         require_flat: bool,
         observed_at_ms: int,
+        allow_active_order_index: int | None = None,
     ) -> None:
         if self.account_index != identity.account_index:
             raise LifecycleHalt("ACCOUNT_IDENTITY_MISMATCH", failure_class="IDENTITY")
@@ -590,7 +594,14 @@ class AccountSnapshot:
             raise LifecycleHalt("COLLATERAL_NOT_POSITIVE", failure_class="SAFETY")
         if self.maker_fee_tick != 0 or self.taker_fee_tick != 0:
             raise LifecycleHalt("STANDARD_FEE_TICKS_NOT_ZERO", failure_class="SAFETY")
-        if self.active_regular_orders or self.active_trigger_orders:
+        active_orders = (*self.active_regular_orders, *self.active_trigger_orders)
+        if allow_active_order_index is None:
+            active_other = active_orders
+        else:
+            active_other = tuple(
+                row for row in active_orders if row.order_index != allow_active_order_index
+            )
+        if active_other:
             raise LifecycleHalt("ACTIVE_ORDERS_PRESENT", failure_class="SAFETY")
         if not self.unrelated_state_clear:
             raise LifecycleHalt("UNRELATED_ACCOUNT_STATE", failure_class="SAFETY")
@@ -2659,6 +2670,117 @@ class LighterLevelCRunner:
         self.store.reconcile(intent.intent_id, _digest(summary), now_ms=self.clock_ms())
         self.store.record_evidence("ORDER", summary, now_ms=self.clock_ms())
 
+    async def _reconcile_maker_cancel(
+        self,
+        market: MarketObservation,
+        place: IntentSpec,
+        cancel: IntentSpec,
+        placed_order: OrderSnapshot,
+    ) -> OrderSnapshot:
+        """Reconcile one accepted maker cancel without ever replaying it.
+
+        Lighter can expose the exact maker order as active for a short period
+        after the cancel transaction is accepted.  Only that exact original
+        unfilled post-only order may be observed during the bounded wait.  A
+        second active order, any fill/field/state contradiction, or any
+        missing/ambiguous target is terminal immediately.
+        """
+
+        request = place.request
+        if (
+            request is None
+            or cancel.target_order_index is None
+            or placed_order.order_index != cancel.target_order_index
+            or placed_order.client_order_index != request.client_order_index
+        ):
+            raise LifecycleHalt("MAKER_CANCEL_RECONCILIATION_VECTOR_INVALID", failure_class="SCHEMA")
+        deadline_ms = self.clock_ms() + int(
+            MAKER_CANCEL_RECONCILIATION_TIMEOUT_SECONDS * 1000
+        )
+        polls = 0
+        terminal_statuses = {"CANCELED", "CANCELLED", "EXPIRED"}
+
+        while True:
+            # This is deliberately the exact account/target read.  It must
+            # not become a broad account refresh or another cancel attempt.
+            after_cancel = await self.gateway.snapshot(
+                market.market_id, client_order_index=request.client_order_index
+            )
+            after_cancel.validate_identity_and_safety(
+                self.identity,
+                market_id=market.market_id,
+                require_flat=True,
+                observed_at_ms=self.clock_ms(),
+                allow_active_order_index=cancel.target_order_index,
+            )
+            cancelled = _find_order(after_cancel, cancel)
+            original = _find_order(after_cancel, place)
+            if original.order_index != cancelled.order_index:
+                raise LifecycleHalt("MAKER_CANCEL_TARGET_MISMATCH", failure_class="SAFETY")
+            if original.nonce != placed_order.nonce or original.trigger:
+                raise LifecycleHalt("MAKER_CANCEL_TARGET_FIELDS_MISMATCH", failure_class="SAFETY")
+            if not isinstance(original.status, str) or not original.status:
+                raise LifecycleHalt("MAKER_CANCEL_STATUS_INVALID", failure_class="SCHEMA")
+
+            status = original.status.upper()
+            if status in terminal_statuses:
+                if (
+                    original.remaining_quantity != 0
+                    or original.filled_quantity != 0
+                    or original.filled_quote != 0
+                ):
+                    raise LifecycleHalt(
+                        "MAKER_CANCEL_RECONCILIATION_FAILED", failure_class="SAFETY"
+                    )
+                self._record_reconciled(
+                    cancel,
+                    {
+                        "filled_quantity": str(original.filled_quantity),
+                        "kind": cancel.kind.value,
+                        "market_id": market.market_id,
+                        "order_index": original.order_index,
+                        "remaining_quantity": str(original.remaining_quantity),
+                        "status": original.status,
+                    },
+                )
+                return original
+
+            if status not in {
+                "OPEN",
+                "ACTIVE",
+                "PENDING",
+                "IN-PROGRESS",
+                "IN_PROGRESS",
+            }:
+                raise LifecycleHalt(
+                    "MAKER_CANCEL_RECONCILIATION_FAILED", failure_class="SAFETY"
+                )
+            if (
+                not original.active
+                or original.remaining_quantity != request.quantity
+                or original.filled_quantity != 0
+                or original.filled_quote != 0
+            ):
+                raise LifecycleHalt(
+                    "MAKER_CANCEL_TARGET_NOT_ORIGINAL_UNFILLED", failure_class="SAFETY"
+                )
+
+            now_ms = self.clock_ms()
+            if polls >= MAKER_CANCEL_RECONCILIATION_MAX_POLLS or now_ms >= deadline_ms:
+                raise LifecycleHalt(
+                    "MAKER_CANCEL_RECONCILIATION_EXHAUSTED", failure_class="TRANSPORT"
+                )
+            remaining_seconds = min(
+                MAKER_CANCEL_RECONCILIATION_POLL_INTERVAL_SECONDS,
+                max(0, deadline_ms - now_ms) / 1000,
+            )
+            if remaining_seconds <= 0:
+                raise LifecycleHalt(
+                    "MAKER_CANCEL_RECONCILIATION_EXHAUSTED", failure_class="TRANSPORT"
+                )
+            await self.sleep(remaining_seconds)
+            polls += 1
+
     async def _maker_phase(self, market: MarketObservation, account: AccountSnapshot) -> None:
         market, account = await self._fresh_prewrite()
         maker_is_ask = not bool(self._open_is_ask)
@@ -2715,33 +2837,10 @@ class LighterLevelCRunner:
             market_id=market.market_id,
         )
         await self._dispatch(cancel)
-        async def reconcile_cancel() -> OrderSnapshot:
-            after_cancel = await self.gateway.snapshot(
-                market.market_id, client_order_index=request.client_order_index
-            )
-            after_cancel.validate_identity_and_safety(
-                self.identity,
-                market_id=market.market_id,
-                require_flat=True,
-                observed_at_ms=self.clock_ms(),
-            )
-            if after_cancel.active_regular_orders or after_cancel.active_trigger_orders:
-                raise LifecycleHalt("MAKER_CANCEL_DID_NOT_PROVE_ZERO_ORDERS", failure_class="SAFETY")
-            cancelled = _find_order(after_cancel, cancel)
-            if cancelled.status.upper() not in {"CANCELED", "CANCELLED", "EXPIRED"} or cancelled.filled_quantity != 0:
-                raise LifecycleHalt("MAKER_CANCEL_RECONCILIATION_FAILED", failure_class="SAFETY")
-            self._record_reconciled(
-                cancel,
-                {
-                    "kind": cancel.kind.value,
-                    "market_id": market.market_id,
-                    "order_index": order.order_index,
-                    "status": cancelled.status,
-                },
-            )
-            return cancelled
-
-        await self._post_send_reconcile(cancel, reconcile_cancel)
+        await self._post_send_reconcile(
+            cancel,
+            lambda: self._reconcile_maker_cancel(market, place, cancel, order),
+        )
 
     async def _open_phase(self, market: MarketObservation, account: AccountSnapshot) -> None:
         market, account = await self._fresh_prewrite()
@@ -3142,6 +3241,9 @@ __all__ = [
     "LIGHTER_IDENTITY_PATH",
     "LIGHTER_SDK_COMMIT",
     "LIGHTER_SYMBOL",
+    "MAKER_CANCEL_RECONCILIATION_MAX_POLLS",
+    "MAKER_CANCEL_RECONCILIATION_POLL_INTERVAL_SECONDS",
+    "MAKER_CANCEL_RECONCILIATION_TIMEOUT_SECONDS",
     "LighterGateway",
     "LighterLevelCRunner",
     "OfficialSdkReadAdapter",
