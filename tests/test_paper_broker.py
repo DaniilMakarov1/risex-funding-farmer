@@ -321,6 +321,20 @@ async def test_process_restart_contract_cancels_without_fill_reconstruction() ->
 
 
 @pytest.mark.asyncio
+async def test_cutoff_cancellation_requires_deadline_and_is_terminal() -> None:
+    broker, _, _ = await active_broker()
+    cutoff = broker.state.order.cutoff_at
+    with pytest.raises(ValueError, match="premature"):
+        await broker.cancel_for_cutoff(cancelled_at=cutoff - timedelta(microseconds=1))
+    state = await broker.cancel_for_cutoff(cancelled_at=cutoff)
+    assert state.lifecycle_state is LifecycleState.FLAT
+    assert state.position is None
+    assert state.order.cancellation_reason is CancellationReason.CUTOFF
+    with pytest.raises(ValueError, match="no open paper entry order"):
+        await broker.cancel_for_cutoff(cancelled_at=cutoff)
+
+
+@pytest.mark.asyncio
 async def test_fill_opens_both_legs_atomically_with_actual_times_and_fees() -> None:
     broker, risex, hedge = await active_broker()
     risex = replace(

@@ -870,7 +870,13 @@ def test_lighter_heartbeats_and_no_applied_public_history_surface():
         "type": "subscribe", "channel": "market_stats/all"
     }
     assert adapter.client_ping_action().payload == b'{"type":"ping"}'
-    assert adapter.handle_server_pong().connection_confirmed
+    assert adapter.handle_server_pong(b'{"type":"pong"}').connection_confirmed
+    assert (
+        adapter.handle_server_pong(b'{"type":"pong","extra":1}')
+        .connection_confirmed
+        is False
+    )
+    assert adapter.handle_server_pong(b"not-json").connection_confirmed is False
 
 
 @pytest.mark.asyncio

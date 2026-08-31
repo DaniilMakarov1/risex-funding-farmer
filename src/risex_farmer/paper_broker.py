@@ -618,6 +618,16 @@ class PaperEntryBroker:
                 CancellationReason.PROCESS_RESTART, restarted_at
             )
 
+    async def cancel_for_cutoff(
+        self, *, cancelled_at: datetime
+    ) -> PaperEntryState:
+        """Cancel the active entry at its owned, exact cutoff deadline."""
+        async with self._lock:
+            order = self._require_open_order()
+            if cancelled_at < order.cutoff_at:
+                raise ValueError("paper entry cutoff cancellation is premature")
+            return self._cancel_locked(CancellationReason.CUTOFF, cancelled_at)
+
     async def refresh(
         self,
         refreshed_plan: RoutePlan | None,

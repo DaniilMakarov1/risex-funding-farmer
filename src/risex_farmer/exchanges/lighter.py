@@ -6,6 +6,7 @@ credential, order, signing, or dispatch surface.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -717,9 +718,19 @@ class LighterAdapter(PublicAdapter):
         return {"type": "subscribe", "channel": f"{channel}/{market_id}"}
 
     @staticmethod
-    def client_ping_action(payload: bytes = b'{"type":"ping"}') -> PublicHeartbeatAction:
-        return PublicHeartbeatAction(WebSocketFrameAction.NONE, payload, False)
+    def client_ping_action() -> PublicHeartbeatAction:
+        return PublicHeartbeatAction(
+            WebSocketFrameAction.NONE, b'{"type":"ping"}', False
+        )
 
     @staticmethod
-    def handle_server_pong(payload: bytes = b"") -> PublicHeartbeatAction:
-        return PublicHeartbeatAction(WebSocketFrameAction.NONE, payload, True)
+    def handle_server_pong(payload: bytes = b'{"type":"pong"}') -> PublicHeartbeatAction:
+        try:
+            decoded = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, TypeError, ValueError):
+            confirmed = False
+        else:
+            confirmed = decoded == {"type": "pong"}
+        return PublicHeartbeatAction(
+            WebSocketFrameAction.NONE, payload, confirmed
+        )

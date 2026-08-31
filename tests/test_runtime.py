@@ -617,6 +617,9 @@ class LighterTextWebSocket(TextWebSocket):
     async def send_json(self, _payload) -> None:
         return None
 
+    async def send_str(self, _payload) -> None:
+        return None
+
 
 def lighter_order_book_snapshot(*, timestamp: int, nonce: int = 1) -> dict[str, object]:
     return {
@@ -692,7 +695,19 @@ async def test_lighter_combined_stream_bootstraps_from_authoritative_subscriptio
     funding = adapter.unknown_funding_quote(
         market, observed_at=clock.now(), assumed_open_at=clock.now()
     )
-    websocket = LighterTextWebSocket(
+    class TimedLighterTextWebSocket(LighterTextWebSocket):
+        def __init__(self, stop_event, payloads) -> None:
+            super().__init__(stop_event, payloads)
+            self.index = 0
+
+        async def __anext__(self):
+            message = await super().__anext__()
+            self.index += 1
+            if self.index in {3, 4}:
+                clock.advance(1)
+            return message
+
+    websocket = TimedLighterTextWebSocket(
         stop,
         (
             lighter_order_book_snapshot(
@@ -701,6 +716,8 @@ async def test_lighter_combined_stream_bootstraps_from_authoritative_subscriptio
             lighter_market_stats_all_snapshot(
                 timestamp=int(clock.now().timestamp() * 1000)
             ),
+            {"type": "pong"},
+            {"type": "pong", "extra": 1},
         ),
     )
     sent = []
@@ -727,8 +744,8 @@ async def test_lighter_combined_stream_bootstraps_from_authoritative_subscriptio
         await runtime._combined_stream(
             Venue.LIGHTER, adapter, ("ETH",), session_id
         )
-        stream = runtime.coordinator.stream(Venue.LIGHTER, "ETH")
-        observation = runtime.observations[(Venue.LIGHTER, "ETH")]
+    stream = runtime.coordinator.stream(Venue.LIGHTER, "ETH")
+    observation = runtime.observations[(Venue.LIGHTER, "ETH")]
 
     assert adapter.fetch_book_calls == 0
     assert [payload["channel"] for payload in sent] == [
@@ -736,11 +753,87 @@ async def test_lighter_combined_stream_bootstraps_from_authoritative_subscriptio
     ]
     assert stream.book() is not None
     assert stream.book().sequence == 1
+    assert stream.health(clock.now()).last_connection_confirmation_at == NOW + timedelta(seconds=1)
     assert stream.health(clock.now()).data_quality is DataQuality.COMPLETE
     assert (Venue.LIGHTER, "ETH") not in runtime._trade_stream_ready
     assert not observation.trade_stream_ready
     assert observation.funding is not None
     assert observation.funding.quality is FundingQuality.PREDICTED
+
+
+@pytest.mark.asyncio
+async def test_lighter_application_heartbeat_is_exact_and_session_owned(
+    tmp_path,
+):
+    clock = FakeClock()
+    stop = asyncio.Event()
+    adapter = LighterStreamAdapter(clock)
+    websocket = LighterTextWebSocket(stop, ())
+    sent: list[str] = []
+
+    async def send_str(payload: str) -> None:
+        sent.append(payload)
+
+    websocket.send_str = send_str
+    sleeps: list[float] = []
+
+    async def fast_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        if len(sleeps) == 2:
+            stop.set()
+        await asyncio.sleep(0)
+
+    with PaperRepository(tmp_path / "lighter-application-heartbeat.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={Venue.LIGHTER: adapter}, clock=clock,
+            sleep=fast_sleep,
+        )
+        runtime._stop_event = stop
+        key = (Venue.LIGHTER, "*", "combined")
+        session_id = runtime._new_stream_session(key)
+        task = asyncio.create_task(
+            runtime._lighter_heartbeat(websocket, key, session_id)
+        )
+        await task
+
+    assert sleeps == [10, 10]
+    assert sent == ['{"type":"ping"}']
+
+
+@pytest.mark.asyncio
+async def test_lighter_application_heartbeat_stops_after_session_replacement(
+    tmp_path,
+):
+    clock = FakeClock()
+    stop = asyncio.Event()
+    adapter = LighterStreamAdapter(clock)
+    websocket = LighterTextWebSocket(stop, ())
+    sent: list[str] = []
+
+    async def send_str(payload: str) -> None:
+        sent.append(payload)
+
+    websocket.send_str = send_str
+    sleep_calls: list[float] = []
+    key = (Venue.LIGHTER, "*", "combined")
+
+    with PaperRepository(tmp_path / "lighter-heartbeat-replacement.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={Venue.LIGHTER: adapter}, clock=clock,
+        )
+        runtime._stop_event = stop
+        session_id = runtime._new_stream_session(key)
+
+        async def replace_after_sleep(seconds: float) -> None:
+            sleep_calls.append(seconds)
+            runtime._new_stream_session(key)
+            await asyncio.sleep(0)
+
+        runtime._sleep = replace_after_sleep
+        await runtime._lighter_heartbeat(websocket, key, session_id)
+
+    assert sleep_calls == [10]
+    assert sent == []
 
 
 @pytest.mark.asyncio
@@ -3821,6 +3914,101 @@ async def test_partial_maker_evidence_then_cancellation_is_not_reported_as_full_
             assert f"cumulative eligible maker quantity {partial_quantity}" in row.text
             assert "full maker fill no" in row.text
             assert "opened position quantity 0" in row.text
+
+
+@pytest.mark.asyncio
+async def test_cutoff_deadline_cancels_while_focused_scan_is_blocked(tmp_path):
+    clock = FakeClock()
+    target = NOW + timedelta(seconds=120)
+    delivery = CaptureNotifications()
+    scan_started = asyncio.Event()
+    release_scan = asyncio.Event()
+    with PaperRepository(tmp_path / "independent-cutoff-deadline.db") as repository:
+        async with PublicPaperRuntime(
+            repository,
+            adapters=adapters(clock, settlement_at=target),
+            clock=clock,
+            notifications=NotificationOutbox(delivery),
+        ) as runtime:
+            await activate_with_live_streams(runtime, clock)
+            broker = runtime.broker
+            assert broker is not None
+            order = broker.state.order
+            assert order is not None
+            original_scan = runtime.scan
+
+            async def blocked_scan(*args, **kwargs):
+                scan_started.set()
+                await release_scan.wait()
+                return await original_scan(*args, **kwargs)
+
+            runtime.scan = blocked_scan
+            clock.value = order.cutoff_at - timedelta(seconds=1)
+            runtime.next_focused_scan_at = clock.now()
+            tick_task = asyncio.create_task(runtime.tick())
+            await scan_started.wait()
+
+            # Replace the real timer with an already-due owned deadline so the
+            # test observes the cutoff while the unrelated scan is still held.
+            await runtime._cancel_entry_cutoff_deadline()
+            clock.value = order.cutoff_at
+            await runtime._start_entry_cutoff_deadline(broker, order.cutoff_at)
+            deadline_task = runtime._entry_cutoff_task
+            assert deadline_task is not None
+            await asyncio.wait_for(asyncio.shield(deadline_task), timeout=1)
+
+            assert not tick_task.done()
+            assert runtime.broker is None
+            assert repository.load_runtime().order.cancellation_reason.value == (
+                "PAPER_ORDER_CANCELLED_CUTOFF"
+            )
+            assert len(paper_entry_cancellations(repository)) == 1
+            assert len([
+                row for row in delivery.rows
+                if row.kind == "ENTRY_CANCELLED_NO_FILL"
+            ]) == 1
+
+            release_scan.set()
+            await tick_task
+            assert len(paper_entry_cancellations(repository)) == 1
+            assert len([
+                row for row in delivery.rows
+                if row.kind == "ENTRY_CANCELLED_NO_FILL"
+            ]) == 1
+
+
+@pytest.mark.asyncio
+async def test_cutoff_deadline_does_not_cancel_atomically_opened_pre_cutoff_position(
+    tmp_path,
+):
+    clock = FakeClock()
+    target = NOW + timedelta(seconds=120)
+    with PaperRepository(tmp_path / "cutoff-open-race.db") as repository:
+        async with PublicPaperRuntime(
+            repository, adapters=adapters(clock, settlement_at=target), clock=clock,
+        ) as runtime:
+            await activate_with_live_streams(runtime, clock)
+            broker = runtime.broker
+            assert broker is not None
+            order = broker.state.order
+            assert order is not None
+            clock.advance(1)
+            runtime.mark_trade_stream_connected(
+                order.venue, order.canonical_market, at=clock.now()
+            )
+            await runtime.deliver_trade(
+                maker_trade(runtime, clock.now(), "pre-cutoff-atomic-open")
+            )
+            assert runtime.lifecycle is not None
+            assert runtime.lifecycle.snapshot.position is not None
+
+            clock.value = order.cutoff_at
+            assert not await runtime._cancel_entry_at_cutoff(
+                broker, at=clock.now()
+            )
+            assert runtime.broker is None
+            assert repository.load_runtime().lifecycle_state is not LifecycleState.FLAT
+            assert paper_entry_cancellations(repository) == []
 
 
 @pytest.mark.asyncio
@@ -7837,6 +8025,7 @@ async def test_restore_persists_and_notifies_process_restart_entry_cancellation(
             notifications=NotificationOutbox(delivery),
         )
         await replacement._restore(restart_at)
+        await original._cancel_entry_cutoff_deadline()
         state = repository.load_runtime()
         cancellations = paper_entry_cancellations(repository)
     assert state.lifecycle_state is LifecycleState.FLAT

@@ -643,6 +643,7 @@ class PublicPaperRuntime:
         self.next_extended_catalog_at: datetime | None = None
         self.notifications = notifications
         self._tick_task: asyncio.Task[None] | None = None
+        self._entry_cutoff_task: asyncio.Task[None] | None = None
         self._catalog_reconciliation_in_progress = False
         self._notification_run_id: str | None = None
         self._stop_cause: str | None = None
@@ -2653,6 +2654,72 @@ class PublicPaperRuntime:
         self._retired_stream_tasks.discard(task)
         self._background_task_done(task)
 
+    def _entry_cutoff_task_done(self, task: asyncio.Task[None]) -> None:
+        if task is self._entry_cutoff_task:
+            self._entry_cutoff_task = None
+        self._background_task_done(task)
+
+    async def _cancel_entry_cutoff_deadline(self) -> None:
+        task = self._entry_cutoff_task
+        if task is None or task is asyncio.current_task():
+            return
+        self._entry_cutoff_task = None
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    async def _start_entry_cutoff_deadline(
+        self, broker: PaperEntryBroker, cutoff_at: datetime
+    ) -> None:
+        await self._cancel_entry_cutoff_deadline()
+        task = asyncio.create_task(
+            self._entry_cutoff_deadline(broker, cutoff_at)
+        )
+        self._entry_cutoff_task = task
+        task.add_done_callback(self._entry_cutoff_task_done)
+
+    async def _entry_cutoff_deadline(
+        self, broker: PaperEntryBroker, cutoff_at: datetime
+    ) -> None:
+        try:
+            while True:
+                remaining = (cutoff_at - self.clock.now()).total_seconds()
+                if remaining <= 0:
+                    break
+                # This owned deadline uses the event loop's wall-clock timer,
+                # independently of the scheduler's injected cadence sleep.
+                await asyncio.sleep(remaining)
+                if self._stop_event is not None and self._stop_event.is_set():
+                    return
+            await self._cancel_entry_at_cutoff(
+                broker, at=self.clock.now()
+            )
+        except asyncio.CancelledError:
+            raise
+
+    async def _cancel_entry_at_cutoff(
+        self, broker: PaperEntryBroker, *, at: datetime | None = None
+    ) -> bool:
+        async with self._paper_entry_lock:
+            if (
+                self.broker is not broker
+                or broker.state.lifecycle_state is not LifecycleState.ENTRY_MAKER_OPEN
+            ):
+                return False
+            order = broker.state.order
+            assert order is not None
+            cancelled_at = at or self.clock.now()
+            if cancelled_at < order.cutoff_at:
+                return False
+            state = await broker.cancel_for_cutoff(cancelled_at=cancelled_at)
+            self._save_entry_decision(
+                recorded_at=cancelled_at, entry_state=state
+            )
+            if self.broker is broker:
+                self.broker = None
+            await self._cancel_entry_cutoff_deadline()
+            return True
+
     def _observation(self, venue: Venue, symbol: str, at: datetime) -> MarketObservation:
         row = self.observations[(venue, symbol)]
         stream = self.coordinator.stream(venue, symbol)
@@ -3063,7 +3130,16 @@ class PublicPaperRuntime:
             broker = self.broker
             order = broker.state.order
             assert order is not None
-            if now >= order.cutoff_at or self.next_focused_scan_at is None or now >= self.next_focused_scan_at:
+            if now >= order.cutoff_at:
+                cancelled = await self._cancel_entry_at_cutoff(broker, at=now)
+                if cancelled:
+                    await self.scan(
+                        refresh=False,
+                        scan_kind="FOCUSED",
+                        scheduled_at=order.cutoff_at,
+                    )
+                return
+            if self.next_focused_scan_at is None or now >= self.next_focused_scan_at:
                 scheduled = self.next_focused_scan_at or now
                 await self.scan(
                     refresh=False, scan_kind="FOCUSED", scheduled_at=scheduled
@@ -3095,6 +3171,7 @@ class PublicPaperRuntime:
                     if broker.state.lifecycle_state is LifecycleState.FLAT:
                         if self.broker is broker:
                             self.broker = None
+                        await self._cancel_entry_cutoff_deadline()
                 self.next_focused_scan_at = _next_absolute_slot(
                     scheduled, now, self.config.focused_scan_seconds
                 )
@@ -3197,6 +3274,11 @@ class PublicPaperRuntime:
                     activated_at=activation_at,
                 )
                 self.broker = broker
+                activated_order = broker.state.order
+                assert activated_order is not None
+                await self._start_entry_cutoff_deadline(
+                    broker, activated_order.cutoff_at
+                )
                 self._save_entry_decision(
                     recorded_at=activation_at, entry_state=broker.state
                 )
@@ -3385,6 +3467,7 @@ class PublicPaperRuntime:
                     self.lifecycle = lifecycle_candidate
                     self._notify_lifecycle_transition(None, self.lifecycle.snapshot, at)
                     self.broker = None
+                    await self._cancel_entry_cutoff_deadline()
                     self.next_position_monitor_at = at + timedelta(
                         seconds=self.config.open_position_monitor_seconds
                     )
@@ -3392,6 +3475,7 @@ class PublicPaperRuntime:
                     broker.publish_candidate(candidate)
                     if broker.state.lifecycle_state is LifecycleState.FLAT:
                         self.broker = None
+                        await self._cancel_entry_cutoff_deadline()
             return
         if self.lifecycle is not None and self.lifecycle.snapshot.exit_order is not None:
             lifecycle = self.lifecycle
@@ -3822,36 +3906,49 @@ class PublicPaperRuntime:
                 at=now, venue=venue,
                 detail={"symbol": symbol, "stream": stream_kind},
             )
-        if self.broker is not None and self.broker.state.lifecycle_state is LifecycleState.ENTRY_MAKER_OPEN:
+        broker = self.broker
+        order = (
+            None
+            if broker is None
+            or broker.state.lifecycle_state is not LifecycleState.ENTRY_MAKER_OPEN
+            else broker.state.order
+        )
+        if order is not None and (venue, symbol) in {
+            (Venue.RISEX, order.route_plan.risex_market.venue_symbol),
+            (order.route_plan.hedge_venue, order.route_plan.hedge_market.venue_symbol),
+        }:
+            # Do not hold the state lock while this local scan awaits.  The
+            # owned cutoff deadline must be able to cancel the entry promptly.
+            risex, hedge = self._route_observations(order.route_plan, now)
+            local = await scan_once((risex, hedge), now, config=self.config)
+            refreshed = local.evaluations[0] if local.evaluations else None
             async with self._paper_entry_lock:
-                broker = self.broker
-                if broker is not None and broker.state.lifecycle_state is LifecycleState.ENTRY_MAKER_OPEN:
-                    order = broker.state.order
-                    assert order is not None
-                    if (venue, symbol) in {
-                        (Venue.RISEX, order.route_plan.risex_market.venue_symbol),
-                        (order.route_plan.hedge_venue, order.route_plan.hedge_market.venue_symbol),
-                    }:
-                        risex, hedge = self._route_observations(order.route_plan, now)
-                        local = await scan_once((risex, hedge), now, config=self.config)
-                        refreshed = local.evaluations[0] if local.evaluations else None
-                        await broker.refresh(
-                            refreshed, risex, evaluated_at=now,
-                            hedge_observation=hedge,
-                        )
-                        self._save_entry_decision(
-                            recorded_at=now, entry_state=broker.state
-                        )
-                        async with self._scan_coordination_lock:
-                            if (
-                                self.last_scan is None
-                                or self.last_scan.logical_at <= local.logical_at
-                            ):
-                                self.last_scan = local
-                                self._scan_revision += 1
-                        if broker.state.lifecycle_state is LifecycleState.FLAT:
-                            if self.broker is broker:
-                                self.broker = None
+                if (
+                    self.broker is not broker
+                    or broker is None
+                    or broker.state.lifecycle_state is not LifecycleState.ENTRY_MAKER_OPEN
+                    or not self._owns_stream_session(session_key, stream_session_id)
+                ):
+                    pass
+                else:
+                    await broker.refresh(
+                        refreshed, risex, evaluated_at=now,
+                        hedge_observation=hedge,
+                    )
+                    self._save_entry_decision(
+                        recorded_at=now, entry_state=broker.state
+                    )
+                    async with self._scan_coordination_lock:
+                        if (
+                            self.last_scan is None
+                            or self.last_scan.logical_at <= local.logical_at
+                        ):
+                            self.last_scan = local
+                            self._scan_revision += 1
+                    if broker.state.lifecycle_state is LifecycleState.FLAT:
+                        if self.broker is broker:
+                            self.broker = None
+                        await self._cancel_entry_cutoff_deadline()
         if self.lifecycle is not None and (invalidates_book or invalidates_trade):
             async with self._position_event_lock:
                 if (
@@ -5081,6 +5178,34 @@ class PublicPaperRuntime:
                 await close()
             raise
 
+    async def _lighter_heartbeat(
+        self,
+        ws: object,
+        stream_key: tuple[Venue, str, str],
+        stream_session_id: StreamSessionId,
+    ) -> None:
+        try:
+            while self._stop_event is not None and not self._stop_event.is_set():
+                await self._sleep(10)
+                if (
+                    self._stop_event.is_set()
+                    or not self._owns_stream_session(
+                        stream_key, stream_session_id
+                    )
+                ):
+                    return
+                action = LighterAdapter.client_ping_action()
+                await ws.send_str(action.payload.decode("utf-8"))  # type: ignore[attr-defined]
+                if not self._owns_stream_session(stream_key, stream_session_id):
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            close = getattr(ws, "close", None)
+            if close is not None:
+                await close()
+            raise
+
     async def _recover_snapshot_in_background(
         self, venue: Venue, symbol: str, episode: RecoveryEpisode
     ) -> None:
@@ -5397,6 +5522,7 @@ class PublicPaperRuntime:
             if not self._owns_stream_session(task_key, stream_session_id):
                 return
             session_established = False
+            heartbeat: asyncio.Task[None] | None = None
             try:
                 async with self._session.ws_connect(
                     adapter.ws_base, heartbeat=10, autoping=False, compress=15
@@ -5404,6 +5530,12 @@ class PublicPaperRuntime:
                     if not self._owns_stream_session(task_key, stream_session_id):
                         return
                     session_established = True
+                    if isinstance(adapter, LighterAdapter):
+                        heartbeat = asyncio.create_task(
+                            self._lighter_heartbeat(
+                                ws, task_key, stream_session_id
+                            )
+                        )
                     replaced_recoveries = (
                         self._replace_displaced_combined_recoveries(
                             venue, symbols, stream_session_id
@@ -5540,12 +5672,14 @@ class PublicPaperRuntime:
                                 task_key, stream_session_id
                             ):
                                 return
-                            for symbol in symbols:
-                                self.coordinator.stream(venue, symbol).connection_confirmed(self.clock.now())
+                            if not isinstance(adapter, LighterAdapter):
+                                for symbol in symbols:
+                                    self.coordinator.stream(venue, symbol).connection_confirmed(self.clock.now())
                             continue
                         if message.type is aiohttp.WSMsgType.PONG:
-                            for symbol in symbols:
-                                self.coordinator.stream(venue, symbol).connection_confirmed(self.clock.now())
+                            if not isinstance(adapter, LighterAdapter):
+                                for symbol in symbols:
+                                    self.coordinator.stream(venue, symbol).connection_confirmed(self.clock.now())
                             continue
                         if message.type in {
                             aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING,
@@ -5555,6 +5689,15 @@ class PublicPaperRuntime:
                         if message.type is not aiohttp.WSMsgType.TEXT:
                             continue
                         payload = json.loads(message.data, parse_float=Decimal)
+                        if isinstance(adapter, LighterAdapter):
+                            application_pong = adapter.handle_server_pong(
+                                message.data.encode("utf-8")
+                            )
+                            if application_pong.connection_confirmed:
+                                delay = 1
+                                for symbol in symbols:
+                                    self.coordinator.stream(venue, symbol).connection_confirmed(self.clock.now())
+                                continue
                         if lighter_dispatcher is not None:
                             lighter_dispatcher.acknowledge(payload)
                             await lighter_dispatcher.drain()
@@ -5865,6 +6008,10 @@ class PublicPaperRuntime:
                     return
                 delay = min(delay * 2, 30)
                 stream_session_id = self._new_stream_session(task_key)
+            finally:
+                if heartbeat is not None:
+                    heartbeat.cancel()
+                    await asyncio.gather(heartbeat, return_exceptions=True)
 
     async def start_streams(self) -> None:
         if self._session is None or self.adapters is None:
@@ -6267,6 +6414,7 @@ class PublicPaperRuntime:
             or self._extended_health_recovery_task is not None
             or self._extended_health_recovery_requests
             or self._extended_universe_task is not None
+            or self._entry_cutoff_task is not None
             or self._tick_task is not None
         )
 
@@ -6284,6 +6432,8 @@ class PublicPaperRuntime:
             owned.add(self._extended_health_recovery_task)
         if self._extended_universe_task is not None:
             owned.add(self._extended_universe_task)
+        if self._entry_cutoff_task is not None:
+            owned.add(self._entry_cutoff_task)
         if self._tick_task is not None:
             owned.add(self._tick_task)
         return owned
@@ -6313,6 +6463,7 @@ class PublicPaperRuntime:
         for task in self._owned_background_tasks():
             if not task.done():
                 task.cancel()
+        await self._cancel_entry_cutoff_deadline()
         if (
             self._session is not None
             and not getattr(self._session, "closed", False)
@@ -6362,6 +6513,7 @@ class PublicPaperRuntime:
         self._pending_full_deadline_at = None
         self._catalog_refresh_pending = False
         self._extended_universe_task = None
+        self._entry_cutoff_task = None
         self._tick_task = None
 
     async def close(self) -> None:
