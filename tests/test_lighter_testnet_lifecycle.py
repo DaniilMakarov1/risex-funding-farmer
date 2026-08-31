@@ -643,6 +643,21 @@ async def test_complete_ordered_lifecycle_rediscovery_intents_and_terminal_round
     store.close()
 
 
+async def test_generated_maker_open_close_client_indexes_fit_lighter_uint48(tmp_path):
+    report, _, store = await run_synthetic(tmp_path, funding_mode="good")
+
+    assert report.result is lifecycle.RunnerResult.COMPLETE
+    rows = store._connection.execute(
+        "SELECT kind, client_order_index FROM intents "
+        "WHERE kind IN ('MAKER_PLACE', 'OPEN', 'CLOSE') ORDER BY rowid"
+    ).fetchall()
+    assert [row[0] for row in rows] == ["MAKER_PLACE", "OPEN", "CLOSE"]
+    assert all(
+        0 < row[1] <= lifecycle.LIGHTER_MAX_CLIENT_ORDER_INDEX for row in rows
+    )
+    store.close()
+
+
 @pytest.mark.parametrize(
     ("funding_mode", "change"),
     [("negative", Decimal("-0.25")), ("zero", Decimal("0"))],
@@ -929,6 +944,51 @@ def test_post_only_and_reduce_only_vectors_are_closed_world():
         lifecycle.OrderRequest(
             MARKET_ID, 1, Decimal("1"), Decimal("10"), False, "limit", "post_only", True, -1, 0, 0
         )
+
+
+@pytest.mark.parametrize(
+    "client_order_index",
+    [1, lifecycle.LIGHTER_MAX_CLIENT_ORDER_INDEX],
+)
+def test_client_order_index_accepts_positive_uint48_boundary(client_order_index):
+    request = lifecycle.OrderRequest(
+        MARKET_ID,
+        client_order_index,
+        Decimal("1"),
+        Decimal("10"),
+        True,
+        "market",
+        "ioc",
+        False,
+        0,
+        0,
+        0,
+    )
+    assert request.client_order_index == client_order_index
+
+
+@pytest.mark.asyncio
+async def test_oversized_client_order_index_is_rejected_before_intent_dispatch(
+    tmp_path, monkeypatch
+):
+    gateway = SyntheticGateway([0])
+    runner, store = make_runner(tmp_path, gateway)
+    runner._market = market_at(0)
+    runner._quantity = Decimal("1")
+    runner._open_is_ask = True
+    monkeypatch.setattr(
+        lifecycle,
+        "_new_client_order_index",
+        lambda: lifecycle.LIGHTER_MAX_CLIENT_ORDER_INDEX + 1,
+    )
+
+    with pytest.raises(lifecycle.LifecycleHalt, match="ORDER_ID_INVALID"):
+        await runner._maker_phase(runner._market, gateway._account())
+
+    assert store.intent_count() == 0
+    assert store.dispatch_count() == 0
+    assert gateway.dispatches == []
+    store.close()
 
 
 @pytest.mark.parametrize(
