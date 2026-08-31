@@ -41,6 +41,7 @@ from .lighter_testnet_readiness import (
     MarketContract,
     ReadinessResult,
     TESTNET_BOOTSTRAP_ASSET_BASELINE,
+    USDC_SYMBOL,
     canonical_api_public_key,
     canonical_testnet_address,
 )
@@ -1386,7 +1387,20 @@ def _sdk_tif(value: Any) -> str:
     return aliases[raw]
 
 
-def _bootstrap_assets(account: Any) -> tuple[BootstrapAsset, ...]:
+def _bootstrap_assets(
+    account: Any,
+    *,
+    allow_active_order_locks: bool = False,
+) -> tuple[BootstrapAsset, ...]:
+    """Validate the fixed account-asset shape without freezing balances.
+
+    The faucet values are only a pre-trade observation.  Lighter account
+    assets retain the fixed symbol/id/margin-mode contract while balances and
+    the enabled quote asset's margin balance can change after fills, funding,
+    or realized PnL.  A non-zero lock is meaningful only while an active order
+    is present; terminal and flat snapshots therefore require zero locks.
+    """
+
     rows = _sdk_sequence(_sdk_field(account, "ASSETS", "assets"), "ASSETS")
     expected = {asset.symbol: asset for asset in TESTNET_BOOTSTRAP_ASSET_BASELINE}
     observed: dict[str, BootstrapAsset] = {}
@@ -1399,23 +1413,66 @@ def _bootstrap_assets(account: Any) -> tuple[BootstrapAsset, ...]:
         expected_asset = expected.get(symbol)
         if expected_asset is None:
             raise LifecycleHalt("UNKNOWN_BOOTSTRAP_ASSET", failure_class="SAFETY")
+        if asset_id != expected_asset.asset_id:
+            raise LifecycleHalt("ACCOUNT_ASSET_ID_MISMATCH", failure_class="IDENTITY")
+        margin_mode = _text(
+            _sdk_field(row, "ASSET_MARGIN_MODE", "margin_mode"),
+            "ASSET_MARGIN_MODE",
+        )
+        if margin_mode != expected_asset.margin_mode:
+            raise LifecycleHalt(
+                "ACCOUNT_ASSET_MARGIN_MODE_MISMATCH", failure_class="SAFETY"
+            )
+        balance = _decimal(
+            _sdk_field(row, "ASSET_BALANCE", "balance"), "ASSET_BALANCE"
+        )
+        locked_balance = _decimal(
+            _sdk_field(row, "ASSET_LOCKED_BALANCE", "locked_balance"),
+            "ASSET_LOCKED_BALANCE",
+        )
+        margin_balance = _decimal(
+            _sdk_field(row, "ASSET_MARGIN_BALANCE", "margin_balance"),
+            "ASSET_MARGIN_BALANCE",
+        )
+        if balance < 0:
+            raise LifecycleHalt("ASSET_BALANCE_NEGATIVE", failure_class="SAFETY")
+        if locked_balance < 0:
+            raise LifecycleHalt(
+                "ASSET_LOCKED_BALANCE_NEGATIVE", failure_class="SAFETY"
+            )
+        if margin_balance < 0:
+            raise LifecycleHalt(
+                "ASSET_MARGIN_BALANCE_NEGATIVE", failure_class="SAFETY"
+            )
+        if locked_balance > balance:
+            raise LifecycleHalt(
+                "ASSET_LOCKED_BALANCE_EXCEEDS_BALANCE", failure_class="SAFETY"
+            )
+        if locked_balance != 0 and not allow_active_order_locks:
+            raise LifecycleHalt(
+                "ASSET_LOCKED_BALANCE_UNEXPECTED", failure_class="SAFETY"
+            )
+        if expected_asset.symbol != USDC_SYMBOL and margin_balance != 0:
+            raise LifecycleHalt(
+                "ASSET_MARGIN_LIABILITY_PRESENT", failure_class="SAFETY"
+            )
+        if expected_asset.symbol == USDC_SYMBOL and margin_balance <= 0:
+            raise LifecycleHalt(
+                "USDC_MARGIN_BALANCE_NOT_POSITIVE", failure_class="SAFETY"
+            )
         observed_asset = BootstrapAsset(
             symbol=symbol,
             asset_id=asset_id,
-            balance=_decimal(_sdk_field(row, "ASSET_BALANCE", "balance"), "ASSET_BALANCE"),
-            locked_balance=_decimal(
-                _sdk_field(row, "ASSET_LOCKED_BALANCE", "locked_balance"),
-                "ASSET_LOCKED_BALANCE",
-            ),
-            margin_balance=_decimal(
-                _sdk_field(row, "ASSET_MARGIN_BALANCE", "margin_balance"),
-                "ASSET_MARGIN_BALANCE",
-            ),
-            margin_mode=_text(_sdk_field(row, "ASSET_MARGIN_MODE", "margin_mode"), "ASSET_MARGIN_MODE"),
+            balance=balance,
+            locked_balance=locked_balance,
+            margin_balance=margin_balance,
+            margin_mode=margin_mode,
         )
-        _decimal(_sdk_field(row, "ASSET_MULTIPLIER", "multiplier"), "ASSET_MULTIPLIER")
-        if observed_asset != expected_asset:
-            raise LifecycleHalt("BOOTSTRAP_ASSET_BASELINE_MISMATCH", failure_class="SAFETY")
+        _decimal(
+            _sdk_field(row, "ASSET_MULTIPLIER", "multiplier"),
+            "ASSET_MULTIPLIER",
+            positive=True,
+        )
         observed[symbol] = observed_asset
         asset_ids.add(asset_id)
     if set(observed) != set(expected):
@@ -2097,7 +2154,10 @@ class OfficialSdkReadAdapter:
         )
         fills = await self._fills()
         funding = await self._funding_once(baseline_high_water=0)
-        assets = _bootstrap_assets(account)
+        assets = _bootstrap_assets(
+            account,
+            allow_active_order_locks=any(order.active for order in active_orders),
+        )
         pool_info = _sdk_field(account, "POOL_INFO", "pool_info", default=None)
         shares = _sdk_sequence(_sdk_field(account, "SHARES", "shares"), "SHARES")
         pending_unlocks = _sdk_field(account, "PENDING_UNLOCKS", "pending_unlocks", default=None)
