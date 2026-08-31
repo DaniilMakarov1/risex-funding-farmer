@@ -108,6 +108,9 @@ class SyntheticGateway:
         drop_after_accept_kind: lifecycle.IntentKind | None = None,
         public_order_nonces: dict[lifecycle.IntentKind, int] | None = None,
         maker_cancel_status: str = "CANCELLED",
+        maker_cancel_status_sequence: tuple[str, ...] | None = None,
+        maker_cancel_unrelated_order: bool = False,
+        maker_cancel_mismatch: bool = False,
     ) -> None:
         self.clock = clock
         self.funding_mode = funding_mode
@@ -117,6 +120,15 @@ class SyntheticGateway:
         self.drop_after_accept_kind = drop_after_accept_kind
         self.public_order_nonces = dict(public_order_nonces or {})
         self.maker_cancel_status = maker_cancel_status
+        self.maker_cancel_status_sequence = (
+            None
+            if maker_cancel_status_sequence is None
+            else tuple(maker_cancel_status_sequence)
+        )
+        self.maker_cancel_status_index: int | None = None
+        self.maker_cancel_order_index: int | None = None
+        self.maker_cancel_unrelated_order = maker_cancel_unrelated_order
+        self.maker_cancel_mismatch = maker_cancel_mismatch
         self.store: lifecycle.LifecycleStore | None = None
         self.discover_calls = 0
         self.market_calls: list[int] = []
@@ -130,6 +142,9 @@ class SyntheticGateway:
         self.terminal_calls = 0
         self.close_calls = 0
         self.close_error: BaseException | None = None
+        self.cancel_calls = 0
+        self.cancel_snapshot_statuses: list[str] = []
+        self.sleep_calls: list[float] = []
 
     async def close(self) -> None:
         self.close_calls += 1
@@ -168,6 +183,18 @@ class SyntheticGateway:
     ) -> lifecycle.AccountSnapshot:
         assert market_id == MARKET_ID
         self.snapshot_calls += 1
+        if self.maker_cancel_status_index is not None:
+            assert self.maker_cancel_order_index is not None
+            order = self.orders[self.maker_cancel_order_index]
+            if self.maker_cancel_status_sequence is not None:
+                if self.maker_cancel_status_index < len(self.maker_cancel_status_sequence):
+                    order = self._with_cancel_status(
+                        order,
+                        self.maker_cancel_status_sequence[self.maker_cancel_status_index],
+                    )
+                    self.orders[self.maker_cancel_order_index] = order
+                    self.maker_cancel_status_index += 1
+                self.cancel_snapshot_statuses.append(order.status)
         return self._account()
 
     async def reconcile_nonce(self, *, account_index: int, api_key_index: int) -> int:
@@ -178,6 +205,41 @@ class SyntheticGateway:
         assert self.store is not None
         assert self.store.intent_count() == len(self.dispatches) + 1
         assert self.store.dispatch_count() == len(self.dispatches) + 1
+
+    @staticmethod
+    def _with_cancel_status(
+        order: lifecycle.OrderSnapshot, status: str
+    ) -> lifecycle.OrderSnapshot:
+        active_statuses = {
+            "OPEN",
+            "ACTIVE",
+            "PENDING",
+            "IN-PROGRESS",
+            "IN_PROGRESS",
+        }
+        if status.upper() in active_statuses:
+            return replace(
+                order,
+                remaining_quantity=order.quantity,
+                filled_quantity=Decimal("0"),
+                filled_quote=Decimal("0"),
+                status=status,
+            )
+        if status.upper() == "FILLED":
+            return replace(
+                order,
+                remaining_quantity=Decimal("0"),
+                filled_quantity=order.quantity,
+                filled_quote=order.quantity * order.price,
+                status=status,
+            )
+        return replace(
+            order,
+            remaining_quantity=Decimal("0"),
+            filled_quantity=Decimal("0"),
+            filled_quote=Decimal("0"),
+            status=status,
+        )
 
     def _new_order(
         self,
@@ -299,12 +361,29 @@ class SyntheticGateway:
         self._assert_intent_durable()
         assert market_id == MARKET_ID
         assert api_key_index == API_KEY_INDEX
+        self.cancel_calls += 1
         order = self.orders[order_index]
-        self.orders[order_index] = replace(
-            order,
-            remaining_quantity=Decimal("0"),
-            status=self.maker_cancel_status,
-        )
+        self.maker_cancel_order_index = order_index
+        if self.maker_cancel_status_sequence is None:
+            updated = self._with_cancel_status(order, self.maker_cancel_status)
+        else:
+            if not self.maker_cancel_status_sequence:
+                raise AssertionError("the synthetic status sequence must not be empty")
+            updated = order
+            self.maker_cancel_status_index = 0
+        if self.maker_cancel_mismatch:
+            updated = replace(updated, price=updated.price + Decimal("0.01"))
+        self.orders[order_index] = updated
+        if self.maker_cancel_unrelated_order:
+            self.orders[order_index + 1] = replace(
+                order,
+                order_index=order_index + 1,
+                client_order_index=order.client_order_index + 1,
+                remaining_quantity=order.quantity,
+                filled_quantity=Decimal("0"),
+                filled_quote=Decimal("0"),
+                status="OPEN",
+            )
         self.dispatches.append(("MAKER_CANCEL", nonce, api_key_index, False, order.is_ask))
         return lifecycle.DispatchOutcome(
             accepted=True,
@@ -365,7 +444,8 @@ class SyntheticGateway:
 
     async def sleep_until_boundary(self, delay: float) -> None:
         assert delay >= 0
-        self.clock[0] = HOUR
+        self.sleep_calls.append(delay)
+        self.clock[0] += int(delay * 1000)
 
 
 def make_runner(
@@ -520,6 +600,9 @@ async def run_synthetic(
     drop_after_accept_kind: lifecycle.IntentKind | None = None,
     public_order_nonces: dict[lifecycle.IntentKind, int] | None = None,
     maker_cancel_status: str = "CANCELLED",
+    maker_cancel_status_sequence: tuple[str, ...] | None = None,
+    maker_cancel_unrelated_order: bool = False,
+    maker_cancel_mismatch: bool = False,
 ) -> tuple[lifecycle.RunnerReport, SyntheticGateway, lifecycle.LifecycleStore]:
     clock = [0]
     gateway = SyntheticGateway(
@@ -531,6 +614,9 @@ async def run_synthetic(
         drop_after_accept_kind=drop_after_accept_kind,
         public_order_nonces=public_order_nonces,
         maker_cancel_status=maker_cancel_status,
+        maker_cancel_status_sequence=maker_cancel_status_sequence,
+        maker_cancel_unrelated_order=maker_cancel_unrelated_order,
+        maker_cancel_mismatch=maker_cancel_mismatch,
     )
     runner, store = make_runner(tmp_path, gateway, mode=mode)
     report = await runner.run()
@@ -703,6 +789,82 @@ async def test_maker_cancel_rejects_active_filled_and_unknown_statuses(
     assert [row[0] for row in gateway.dispatches] == ["MAKER_PLACE", "MAKER_CANCEL"]
     assert report.intent_count == 2
     assert report.dispatch_count == 2
+    store.close()
+
+
+async def test_maker_cancel_polls_observed_active_then_canceled_once(tmp_path):
+    report, gateway, store = await run_synthetic(
+        tmp_path,
+        maker_cancel_status_sequence=("OPEN", "OPEN", "CANCELLED"),
+    )
+
+    assert report.result is lifecycle.RunnerResult.COMPLETE
+    assert report.intent_count == 4
+    assert report.dispatch_count == 4
+    assert gateway.cancel_calls == 1
+    assert [status.upper() for status in gateway.cancel_snapshot_statuses[:3]] == [
+        "OPEN",
+        "OPEN",
+        "CANCELLED",
+    ]
+    assert gateway.sleep_calls[:2] == [1.0, 1.0]
+    assert store.all_intents_reconciled()
+    store.close()
+
+
+async def test_maker_cancel_perpetual_active_exhausts_without_replay(tmp_path):
+    report, gateway, store = await run_synthetic(tmp_path, maker_cancel_status="OPEN")
+
+    assert report.result is lifecycle.RunnerResult.HALTED_MANUAL_RECOVERY
+    assert report.failure_class == "TRANSPORT"
+    assert report.reason == "POST_SEND_RECONCILIATION_UNRESOLVED"
+    assert report.intent_count == 2
+    assert report.dispatch_count == 2
+    assert gateway.cancel_calls == 1
+    assert gateway.sleep_calls == [1.0] * lifecycle.MAKER_CANCEL_RECONCILIATION_MAX_POLLS
+
+    restarted = lifecycle.LighterLevelCRunner(
+        gateway,
+        store,
+        readiness=ready_readiness(),
+        identity=identity(),
+        mode=lifecycle.RunMode.TESTNET_WRITE,
+        clock_ms=lambda: gateway.clock[0],
+        sleep=gateway.sleep_until_boundary,
+    )
+    second = await restarted.run()
+
+    assert second.result is lifecycle.RunnerResult.BLOCKED
+    assert second.reason == "RESTART_REQUIRES_FRESH_DATABASE"
+    assert gateway.cancel_calls == 1
+    assert [row[0] for row in gateway.dispatches] == [
+        "MAKER_PLACE",
+        "MAKER_CANCEL",
+    ]
+    store.close()
+
+
+@pytest.mark.parametrize(
+    ("failure", "gateway_kwargs"),
+    [
+        ("filled", {"maker_cancel_status": "FILLED"}),
+        ("unrelated", {"maker_cancel_unrelated_order": True}),
+        ("mismatch", {"maker_cancel_mismatch": True}),
+        ("unknown", {"maker_cancel_status": "UNKNOWN"}),
+    ],
+)
+async def test_maker_cancel_contradictions_fail_without_poll(
+    tmp_path, failure, gateway_kwargs
+):
+    report, gateway, store = await run_synthetic(tmp_path, **gateway_kwargs)
+
+    assert report.result is lifecycle.RunnerResult.HALTED_MANUAL_RECOVERY, failure
+    assert report.failure_class == "TRANSPORT"
+    assert report.reason == "POST_SEND_RECONCILIATION_UNRESOLVED"
+    assert report.intent_count == 2
+    assert report.dispatch_count == 2
+    assert gateway.cancel_calls == 1
+    assert gateway.sleep_calls == []
     store.close()
 
 
