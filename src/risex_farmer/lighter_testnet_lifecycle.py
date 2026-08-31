@@ -2338,23 +2338,17 @@ class SdkLighterGateway:
             return DispatchOutcome(accepted=False, rejected=True, error_class="SDK_REJECTED")
         if created is None or response is None or getattr(response, "code", None) != 200:
             return DispatchOutcome(accepted=False, rejected=True, error_class="SDK_REJECTED")
-        # Inspect only public transaction fields; never touch created.sig or raw
-        # transaction JSON.  The authoritative order read remains mandatory.
-        if (
-            getattr(created, "order_book_index", None) != request.market_id
-            or getattr(created, "account_index", None) != LIGHTER_ACCOUNT_INDEX
-            or getattr(created, "base_amount", None)
-            != _wire_units(request.quantity, request.size_decimals, "BASE_AMOUNT")
-            or getattr(created, "price", None)
-            != _wire_units(request.price, request.price_decimals, "PRICE")
-            or getattr(created, "is_ask", None) != int(request.is_ask)
-            or getattr(created, "order_type", None) != order_type
-            or getattr(created, "nonce", None) != nonce
-        ):
-            raise LifecycleHalt("SDK_ORDER_RESPONSE_MISMATCH", failure_class="SAFETY")
+        # The pinned SDK's parsed transaction object is not an authoritative
+        # receipt: its parser still reads stale field names and can populate
+        # those fields with None even after a successful HTTP response.  Do
+        # not inspect or serialize it; the runner must reconcile the exact
+        # client order from authoritative account state after this boundary.
+        tx_hash = _safe_hash(getattr(response, "tx_hash", None))
+        if tx_hash is None:
+            return DispatchOutcome(accepted=False, rejected=True, error_class="SDK_REJECTED")
         return DispatchOutcome(
             accepted=True,
-            tx_hash=_safe_hash(getattr(response, "tx_hash", None)),
+            tx_hash=tx_hash,
         )
 
     async def cancel_order(
@@ -2382,18 +2376,15 @@ class SdkLighterGateway:
             raise AmbiguousDispatch(_classify_sdk_error(exc)) from None
         if error or cancelled is None or response is None or getattr(response, "code", None) != 200:
             return DispatchOutcome(accepted=False, rejected=True, error_class="SDK_REJECTED")
-        if (
-            getattr(cancelled, "order_book_index", None) != market_id
-            or getattr(cancelled, "account_index", None) != LIGHTER_ACCOUNT_INDEX
-            or getattr(cancelled, "nonce", None) != nonce
-        ):
-            # order_nonce identifies the target order, while nonce identifies
-            # this cancel transaction.  Only the latter can be compared with
-            # the explicit nonce supplied to the signer.
-            raise LifecycleHalt("SDK_CANCEL_RESPONSE_MISMATCH", failure_class="SAFETY")
+        # As with create_order, the parsed cancel object can contain None for
+        # fields whose JSON names are stale in the pinned SDK.  Exact target
+        # disappearance and zero-order reconciliation is authoritative.
+        tx_hash = _safe_hash(getattr(response, "tx_hash", None))
+        if tx_hash is None:
+            return DispatchOutcome(accepted=False, rejected=True, error_class="SDK_REJECTED")
         return DispatchOutcome(
             accepted=True,
-            tx_hash=_safe_hash(getattr(response, "tx_hash", None)),
+            tx_hash=tx_hash,
         )
 
 

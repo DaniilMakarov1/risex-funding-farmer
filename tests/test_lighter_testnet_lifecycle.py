@@ -767,7 +767,7 @@ async def test_terminal_round_disagreement_blocks_after_close(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_sdk_dispatch_has_explicit_key_nonce_and_public_response_checks():
+async def test_sdk_dispatch_accepts_observed_stale_parsed_transaction_fields():
     class FakeSigner:
         def __init__(self):
             self.create_kwargs = None
@@ -777,13 +777,13 @@ async def test_sdk_dispatch_has_explicit_key_nonce_and_public_response_checks():
             self.create_kwargs = kwargs
             return (
                 SimpleNamespace(
-                    account_index=ACCOUNT_INDEX,
-                    order_book_index=MARKET_ID,
-                    base_amount=1,
-                    price=1010,
-                    is_ask=1,
-                    order_type=0,
-                    nonce=33,
+                    account_index=None,
+                    order_book_index=None,
+                    base_amount=None,
+                    price=None,
+                    is_ask=None,
+                    order_type=None,
+                    nonce=None,
                 ),
                 SimpleNamespace(code=200, tx_hash="0x" + "21" * 32),
                 None,
@@ -793,10 +793,10 @@ async def test_sdk_dispatch_has_explicit_key_nonce_and_public_response_checks():
             self.cancel_kwargs = kwargs
             return (
                 SimpleNamespace(
-                    account_index=ACCOUNT_INDEX,
-                    order_book_index=MARKET_ID,
-                    order_nonce=777,
-                    nonce=34,
+                    account_index=None,
+                    order_book_index=None,
+                    order_nonce=None,
+                    nonce=None,
                 ),
                 SimpleNamespace(code=200, tx_hash="0x" + "22" * 32),
                 None,
@@ -851,6 +851,312 @@ async def test_sdk_dispatch_has_explicit_key_nonce_and_public_response_checks():
     assert signer.cancel_kwargs["skip_nonce"] == 0
     with pytest.raises(lifecycle.LifecycleHalt, match="EXPLICIT_KEY_AND_NONCE_REQUIRED"):
         await gateway.cancel_order(MARKET_ID, 777, nonce=35, api_key_index=255)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["create", "cancel"])
+async def test_sdk_none_parsed_transaction_is_rejected(operation):
+    class FakeSigner:
+        def __init__(self):
+            self.calls = 0
+
+        async def create_order(self, **_kwargs):
+            self.calls += 1
+            return None, SimpleNamespace(code=200, tx_hash="0x" + "23" * 32), None
+
+        async def cancel_order(self, **_kwargs):
+            self.calls += 1
+            return None, SimpleNamespace(code=200, tx_hash="0x" + "24" * 32), None
+
+    async def unused(*_args, **_kwargs):
+        raise AssertionError("not a dispatch read")
+
+    signer = FakeSigner()
+    gateway = lifecycle.SdkLighterGateway(
+        signer,
+        market_discoverer=unused,
+        market_reader=unused,
+        snapshot_reader=unused,
+        funding_reader=unused,
+    )
+    if operation == "create":
+        outcome = await gateway.create_order(
+            lifecycle.OrderRequest(
+                market_id=MARKET_ID,
+                client_order_index=123,
+                quantity=Decimal("1"),
+                price=Decimal("10.10"),
+                is_ask=True,
+                order_type="limit",
+                time_in_force="post_only",
+                reduce_only=False,
+                order_expiry=-1,
+                size_decimals=0,
+                price_decimals=2,
+            ),
+            nonce=35,
+            api_key_index=API_KEY_INDEX,
+        )
+    else:
+        outcome = await gateway.cancel_order(
+            MARKET_ID,
+            777,
+            nonce=36,
+            api_key_index=API_KEY_INDEX,
+        )
+
+    assert not outcome.accepted
+    assert outcome.rejected
+    assert outcome.error_class == "SDK_REJECTED"
+    assert signer.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_sdk_stale_parsed_fields_then_authoritative_create_and_cancel_reconcile(tmp_path):
+    clock = [0]
+    store = lifecycle.LifecycleStore(tmp_path / "lighter-sdk-authoritative.sqlite")
+    state: dict[str, lifecycle.OrderSnapshot | None] = {"order": None}
+
+    def account() -> lifecycle.AccountSnapshot:
+        order = state["order"]
+        return lifecycle.AccountSnapshot(
+            account_index=ACCOUNT_INDEX,
+            l1_address=ADDRESS,
+            collateral=Decimal("1000"),
+            maker_fee_tick=0,
+            taker_fee_tick=0,
+            orders=() if order is None else (order,),
+            positions=(lifecycle.PositionSnapshot(ACCOUNT_INDEX, MARKET_ID, Decimal("0")),),
+            fills=(),
+            funding_high_water=0,
+            unrelated_state_clear=True,
+            observed_at_ms=clock[0],
+        )
+
+    class FakeSigner:
+        def __init__(self):
+            self.create_calls = 0
+            self.cancel_calls = 0
+
+        async def create_order(self, **kwargs):
+            self.create_calls += 1
+            assert store.intent_count() == 1
+            assert store.dispatch_count() == 1
+            quantity = Decimal(kwargs["base_amount"])
+            price = Decimal(kwargs["price"]).scaleb(-2)
+            state["order"] = lifecycle.OrderSnapshot(
+                order_index=700,
+                client_order_index=kwargs["client_order_index"],
+                account_index=ACCOUNT_INDEX,
+                market_id=kwargs["market_index"],
+                quantity=quantity,
+                remaining_quantity=quantity,
+                filled_quantity=Decimal("0"),
+                filled_quote=Decimal("0"),
+                price=price,
+                is_ask=kwargs["is_ask"],
+                order_type="limit",
+                time_in_force="post_only",
+                reduce_only=False,
+                nonce=kwargs["nonce"],
+                status="OPEN",
+            )
+            return (
+                SimpleNamespace(
+                    account_index=None,
+                    order_book_index=None,
+                    base_amount=None,
+                    price=None,
+                    is_ask=None,
+                    order_type=None,
+                    nonce=None,
+                ),
+                SimpleNamespace(code=200, tx_hash="0x" + "31" * 32),
+                None,
+            )
+
+        async def cancel_order(self, **kwargs):
+            self.cancel_calls += 1
+            assert store.intent_count() == 2
+            assert store.dispatch_count() == 2
+            order = state["order"]
+            assert order is not None
+            state["order"] = replace(
+                order,
+                remaining_quantity=Decimal("0"),
+                status="CANCELLED",
+            )
+            return (
+                SimpleNamespace(
+                    account_index=None,
+                    order_book_index=None,
+                    order_nonce=None,
+                    nonce=None,
+                ),
+                SimpleNamespace(code=200, tx_hash="0x" + "32" * 32),
+                None,
+            )
+
+    async def discover_market():
+        raise AssertionError("maker reconciliation does not rediscover a market")
+
+    async def read_market(market_id):
+        assert market_id == MARKET_ID
+        return market_at(clock[0])
+
+    async def read_snapshot(market_id, *, client_order_index=None):
+        assert market_id == MARKET_ID
+        return account()
+
+    async def read_funding(*_args, **_kwargs):
+        raise AssertionError("funding is outside this regression")
+
+    next_nonce = [100]
+
+    async def read_nonce(*_args):
+        value = next_nonce[0]
+        next_nonce[0] += 1
+        return value
+
+    signer = FakeSigner()
+    gateway = lifecycle.SdkLighterGateway(
+        signer,
+        market_discoverer=discover_market,
+        market_reader=read_market,
+        snapshot_reader=read_snapshot,
+        funding_reader=read_funding,
+        nonce_reader=read_nonce,
+    )
+    runner = lifecycle.LighterLevelCRunner(
+        gateway,
+        store,
+        readiness=ready_readiness(),
+        identity=identity(),
+        mode=lifecycle.RunMode.TESTNET_WRITE,
+        clock_ms=lambda: clock[0],
+    )
+    runner._market = market_at(clock[0])
+    runner._quantity = Decimal("1")
+    runner._open_is_ask = True
+    store.begin()
+
+    await runner._maker_phase(runner._market, account())
+
+    assert signer.create_calls == 1
+    assert signer.cancel_calls == 1
+    assert store.dispatch_count() == 2
+    assert store.all_intents_reconciled()
+    assert state["order"] is not None
+    assert state["order"].status == "CANCELLED"
+    store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("response_code", "error", "tx_hash"),
+    [
+        (400, None, "0x" + "41" * 32),
+        (200, "sdk-error", "0x" + "42" * 32),
+        (200, None, ""),
+    ],
+)
+async def test_sdk_rejection_or_unsafe_hash_blocks_without_replay(
+    tmp_path, response_code, error, tx_hash
+):
+    clock = [0]
+    store = lifecycle.LifecycleStore(tmp_path / "lighter-sdk-rejection.sqlite")
+
+    class FakeSigner:
+        def __init__(self):
+            self.create_calls = 0
+
+        async def create_order(self, **_kwargs):
+            self.create_calls += 1
+            return (
+                SimpleNamespace(
+                    account_index=None,
+                    order_book_index=None,
+                    base_amount=None,
+                    price=None,
+                    is_ask=None,
+                    order_type=None,
+                    nonce=None,
+                ),
+                SimpleNamespace(code=response_code, tx_hash=tx_hash),
+                error,
+            )
+
+    def empty_account() -> lifecycle.AccountSnapshot:
+        return lifecycle.AccountSnapshot(
+            account_index=ACCOUNT_INDEX,
+            l1_address=ADDRESS,
+            collateral=Decimal("1000"),
+            maker_fee_tick=0,
+            taker_fee_tick=0,
+            orders=(),
+            positions=(lifecycle.PositionSnapshot(ACCOUNT_INDEX, MARKET_ID, Decimal("0")),),
+            fills=(),
+            funding_high_water=0,
+            unrelated_state_clear=True,
+            observed_at_ms=clock[0],
+        )
+
+    async def discover_market():
+        return market_at(clock[0])
+
+    async def read_market(market_id):
+        assert market_id == MARKET_ID
+        return market_at(clock[0])
+
+    async def read_snapshot(market_id, *, client_order_index=None):
+        assert market_id == MARKET_ID
+        assert client_order_index is None
+        return empty_account()
+
+    async def read_funding(*_args, **_kwargs):
+        raise AssertionError("rejected dispatch must not enter funding")
+
+    async def read_nonce(*_args):
+        return 200
+
+    signer = FakeSigner()
+    gateway = lifecycle.SdkLighterGateway(
+        signer,
+        market_discoverer=discover_market,
+        market_reader=read_market,
+        snapshot_reader=read_snapshot,
+        funding_reader=read_funding,
+        nonce_reader=read_nonce,
+    )
+
+    def new_runner() -> lifecycle.LighterLevelCRunner:
+        return lifecycle.LighterLevelCRunner(
+            gateway,
+            store,
+            readiness=ready_readiness(),
+            identity=identity(),
+            mode=lifecycle.RunMode.TESTNET_WRITE,
+            clock_ms=lambda: clock[0],
+        )
+
+    first = await new_runner().run()
+
+    assert first.result is lifecycle.RunnerResult.BLOCKED
+    assert first.failure_class == "HTTP"
+    assert first.reason == "SDK_REJECTED"
+    assert first.intent_count == 1
+    assert first.dispatch_count == 1
+    assert signer.create_calls == 1
+
+    second = await new_runner().run()
+
+    assert second.result is lifecycle.RunnerResult.BLOCKED
+    assert second.reason == "RESTART_REQUIRES_FRESH_DATABASE"
+    assert signer.create_calls == 1
+    assert store.intent_state(
+        store._connection.execute("SELECT intent_id FROM intents").fetchone()[0]
+    ) is lifecycle.IntentState.REJECTED
+    store.close()
 
 
 @pytest.mark.asyncio
