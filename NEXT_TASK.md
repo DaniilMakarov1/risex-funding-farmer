@@ -1,5 +1,18 @@
 # Active bounded task
 
+## PAPER entry outcome observability correction
+
+Status: `AUTHORIZED — LIVE DEFECT REPRODUCED; BUILDER CANDIDATE REQUIRED`.
+
+Objective: correct only the observed gap after an activated PAPER maker entry terminates without a fill. Persist one explicit cancellation outcome with the exact existing `CancellationReason`, route, attempt identity, active duration, and zero cumulative maker quantity, then emit one bounded Telegram lifecycle notification stating that the maker entry was not filled, no taker hedge was taken, no position opened, and the runtime returned to `FLAT`. The notification identity must distinguish repeated attempts for the same route and funding cycle without weakening route locking or existing lifecycle notification deduplication.
+
+Acceptance:
+
+- Cover every current entry-cancellation path, including refresh, stream invalidation, trade-time cancellation, cutoff, and process restart, without changing the scanner, ranking, position limit, maker-fill evidence, hedge timing, funding, exit, or PnL economics.
+- The persisted runtime evidence and Telegram payload contain only sanitized bounded fields and never imply a fill, hedge, position, or realized PnL when none exists.
+- Regression tests prove exactly-once terminal notification per attempt, distinct notifications for repeated same-cycle attempts, and no cancellation notification after an atomic two-leg open.
+- Run focused/adverse tests and one clean isolated Python 3.11 full suite on the final candidate SHA. The active `chief36` PAPER process and its database remain untouched until independent Chief acceptance; any later replacement uses a fresh database.
+
 ## Lighter public PAPER integration
 
 Status: `ACCEPTED — LEVEL-A PUBLIC PAPER COMPLETE; FRESH CHIEF36 PAPER RUNTIME ACTIVE; TESTNET TERMINAL AND ISOLATED`.

@@ -1,5 +1,9 @@
 # Current status
 
+## PAPER entry-outcome diagnosis
+
+The active `chief36` public PAPER runtime remains running and unmodified. Its first five maker-entry attempts all terminated safely with zero maker fills, zero taker hedges, zero positions, zero funding settlements, and zero realized PnL: SNDK cancelled on stale data, SNDK on route invalidation, AAVE on stale data, LIT on stale data, and AAVE at cutoff. The stale-data cancellations coincide with observed RISEx resynchronization or Lighter disconnect evidence, so no execution may be inferred. The runtime correctly returned each attempt to `FLAT`, but it persisted no explicit runtime cancellation event and Telegram emitted only `MAKER ENTRY ACTIVATED`; the lifecycle tracker has no terminal unfilled-entry notification and its route-cycle identity can suppress a repeated same-cycle activation. A bounded PAPER observability correction is active in `NEXT_TASK.md`; execution economics remain unchanged.
+
 ## Central baseline
 
 - On `2026-08-31` the current sole Chief independently re-audited takeover on published `main == origin/main == 02a8c4e10b81e7b4dab775396f3ce040c7ff88a6`. The only tracked user change remains `README.md`; the six named untracked operational artifacts, historical branches, and worktrees remain preserved. The single active process is the public-only PAPER PID `43755` under launchd `com.risex.paper.chief36`; its owner-only database has SQLite integrity `ok`, all four venues ready, the latest full scan has `128` routes including `48` Lighter directions, and orders/positions/fills/completed/fatal remain `0/0/0/0/0`. Both recorded Codex automations are paused, and no mainnet venue-write process exists.
