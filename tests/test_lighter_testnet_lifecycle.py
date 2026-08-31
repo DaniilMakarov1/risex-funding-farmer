@@ -2323,10 +2323,45 @@ async def test_official_reader_uses_pinned_account_limits_fee_tick_fields():
         await adapter.snapshot(MARKET_ID)
 
 
-@pytest.mark.parametrize("mutation", ["extra", "duplicate", "changed"])
-async def test_official_reader_requires_exact_faucet_asset_baseline(mutation):
+async def test_official_reader_accepts_legal_post_trade_asset_balance_change():
     apis = FakeOfficialApis()
-    if mutation == "extra":
+    apis.account_value.assets[2].margin_balance = "10000.016409"
+    adapter = make_read_adapter(apis)
+
+    snapshot = await adapter.snapshot(MARKET_ID)
+
+    assert snapshot.asset_count == 3
+
+
+async def test_official_reader_accepts_exact_original_asset_baseline():
+    adapter = make_read_adapter(FakeOfficialApis())
+
+    snapshot = await adapter.snapshot(MARKET_ID)
+
+    assert snapshot.asset_count == 3
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason", "failure_class"),
+    [
+        ("missing", "BOOTSTRAP_ASSET_BASELINE_MISMATCH", "SAFETY"),
+        ("unknown", "UNKNOWN_BOOTSTRAP_ASSET", "SAFETY"),
+        ("duplicate", "DUPLICATE_ACCOUNT_ASSET", "SAFETY"),
+        ("wrong_id", "ACCOUNT_ASSET_ID_MISMATCH", "IDENTITY"),
+        ("wrong_mode", "ACCOUNT_ASSET_MARGIN_MODE_MISMATCH", "SAFETY"),
+        ("locked", "ASSET_LOCKED_BALANCE_UNEXPECTED", "SAFETY"),
+        ("margin_liability", "ASSET_MARGIN_LIABILITY_PRESENT", "SAFETY"),
+        ("negative_balance", "ASSET_BALANCE_NEGATIVE", "SAFETY"),
+        ("nonfinite_balance", "ASSET_BALANCE_INVALID", "SCHEMA"),
+    ],
+)
+async def test_official_reader_rejects_structurally_unsafe_asset_state(
+    mutation, reason, failure_class
+):
+    apis = FakeOfficialApis()
+    if mutation == "missing":
+        apis.account_value.assets.pop(1)
+    elif mutation == "unknown":
         apis.account_value.assets.append(
             SimpleNamespace(
                 symbol="OTHER",
@@ -2340,11 +2375,46 @@ async def test_official_reader_requires_exact_faucet_asset_baseline(mutation):
         )
     elif mutation == "duplicate":
         apis.account_value.assets.append(apis.account_value.assets[0])
+    elif mutation == "wrong_id":
+        apis.account_value.assets[0].asset_id = 99
+    elif mutation == "wrong_mode":
+        apis.account_value.assets[1].margin_mode = "enabled"
+    elif mutation == "locked":
+        apis.account_value.assets[0].locked_balance = "1"
+    elif mutation == "margin_liability":
+        apis.account_value.assets[0].margin_balance = "1"
+    elif mutation == "negative_balance":
+        apis.account_value.assets[1].balance = "-1"
     else:
-        apis.account_value.assets[2].margin_balance = "9999"
+        apis.account_value.assets[1].balance = "NaN"
     adapter = make_read_adapter(apis)
-    with pytest.raises(lifecycle.LifecycleHalt, match="BOOTSTRAP|DUPLICATE"):
+    with pytest.raises(lifecycle.LifecycleHalt, match=reason) as exc_info:
         await adapter.snapshot(MARKET_ID)
+    assert exc_info.value.failure_class == failure_class
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value", "reason", "failure_class"),
+    [
+        ("balance", "-1", "ASSET_BALANCE_NEGATIVE", "SAFETY"),
+        ("locked_balance", "-1", "ASSET_LOCKED_BALANCE_NEGATIVE", "SAFETY"),
+        ("margin_balance", "-1", "ASSET_MARGIN_BALANCE_NEGATIVE", "SAFETY"),
+        ("locked_balance", "NaN", "ASSET_LOCKED_BALANCE_INVALID", "SCHEMA"),
+        ("margin_balance", "Infinity", "ASSET_MARGIN_BALANCE_INVALID", "SCHEMA"),
+        ("multiplier", "0", "ASSET_MULTIPLIER_INVALID", "SCHEMA"),
+    ],
+)
+async def test_official_reader_rejects_nonfinite_negative_or_unsafe_asset_fields(
+    field_name, value, reason, failure_class
+):
+    apis = FakeOfficialApis()
+    setattr(apis.account_value.assets[1], field_name, value)
+    adapter = make_read_adapter(apis)
+
+    with pytest.raises(lifecycle.LifecycleHalt, match=reason) as exc_info:
+        await adapter.snapshot(MARKET_ID)
+
+    assert exc_info.value.failure_class == failure_class
 
 
 async def test_official_reader_type_checks_account_l1_before_lower():
