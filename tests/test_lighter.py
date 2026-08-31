@@ -280,7 +280,7 @@ def test_lighter_book_nonce_chain_and_zero_delete_are_strict():
     adapter.normalize_market(market_row())
     snapshot = adapter.normalize_book_message(
         {
-            "type": "update/order_book",
+            "type": "subscribed/order_book",
             "channel": "order_book/0",
             "timestamp": 1_000_000,
             "order_book": {
@@ -344,6 +344,32 @@ def test_lighter_book_nonce_chain_and_zero_delete_are_strict():
                 },
             },
             received_at=datetime(1970, 1, 1, 0, 16, 41, tzinfo=UTC),
+        )
+
+
+@pytest.mark.parametrize(
+    ("initial", "message_type"),
+    ((True, "update/order_book"), (False, "subscribed/order_book")),
+)
+def test_lighter_book_message_type_matches_snapshot_phase(initial, message_type):
+    adapter = LighterAdapter(object())
+    adapter.normalize_market(market_row())
+    with pytest.raises(ValueError, match="message type is invalid"):
+        adapter.normalize_book_message(
+            {
+                "type": message_type,
+                "channel": "order_book:0",
+                "timestamp": 1_000_000,
+                "order_book": {
+                    "code": 0,
+                    "bids": [{"price": "99", "size": "2"}],
+                    "asks": [{"price": "101", "size": "2"}],
+                    "nonce": 10,
+                    "begin_nonce": 8,
+                },
+            },
+            received_at=datetime(1970, 1, 1, 0, 16, 41, tzinfo=UTC),
+            initial=initial,
         )
 
 

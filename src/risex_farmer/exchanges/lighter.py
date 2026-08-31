@@ -306,7 +306,8 @@ class LighterAdapter(PublicAdapter):
         initial: bool = False,
     ) -> OrderBook | BookDelta:
         message = require_mapping(payload, "Lighter order book message")
-        if str(message.get("type", "")) != "update/order_book":
+        expected_type = "subscribed/order_book" if initial else "update/order_book"
+        if str(message.get("type", "")) != expected_type:
             raise ValueError("Lighter order book message type is invalid")
         data = require_mapping(message.get("order_book"), "order_book")
         channel = str(message.get("channel", ""))
