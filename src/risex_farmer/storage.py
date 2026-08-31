@@ -1315,6 +1315,31 @@ class PaperRepository:
         venue: str | None,
         detail: dict[str, object],
     ) -> None:
+        # Entry cancellation evidence is the durable terminal outcome for one
+        # attempt.  Keep retries of the same state transition idempotent while
+        # rejecting a conflicting payload for the same identity.
+        if event_type == "PAPER_ENTRY_CANCELLED_NO_FILL":
+            event_id = detail.get("event_id")
+            if isinstance(event_id, str) and event_id:
+                for row in self.connection.execute(
+                    "SELECT detail FROM runtime_evidence "
+                    "WHERE event_type=? ORDER BY evidence_id",
+                    (event_type,),
+                ):
+                    try:
+                        existing = json.loads(row["detail"])
+                    except (TypeError, ValueError):
+                        continue
+                    if (
+                        not isinstance(existing, dict)
+                        or existing.get("event_id") != event_id
+                    ):
+                        continue
+                    if existing != detail:
+                        raise ValueError(
+                            "conflicting duplicate paper entry cancellation evidence"
+                        )
+                    return
         self.connection.execute(
             "INSERT INTO runtime_evidence(recorded_at,event_type,venue,detail) "
             "VALUES (?, ?, ?, ?)",

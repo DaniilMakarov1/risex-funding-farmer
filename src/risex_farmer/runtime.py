@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import signal
 from collections import deque
@@ -51,7 +52,12 @@ from .notifications import (
     full_scan_digest_payloads,
     utc_time,
 )
-from .paper_broker import PaperEntryBroker, PaperEntryState
+from .paper_broker import (
+    CancellationReason,
+    PaperEntryBroker,
+    PaperEntryState,
+    PaperOrderStatus,
+)
 from .scanner import (
     MarketObservation,
     RoutePlan,
@@ -140,6 +146,7 @@ PUBLIC_REQUEST_TIMEOUT_SECONDS = 30
 PUBLIC_REST_CONCURRENCY_PER_VENUE = 2
 LIGHTER_MAX_INFLIGHT_SUBSCRIPTIONS = 50
 LIGHTER_WS_RECOVERY_TIMEOUT_SECONDS = 30
+PAPER_ENTRY_CANCELLATION_EVENT = "PAPER_ENTRY_CANCELLED_NO_FILL"
 
 
 @dataclass(slots=True)
@@ -271,6 +278,43 @@ def _route_rank_key(plan: RoutePlan) -> tuple[object, ...]:
         plan.canonical_asset,
         plan.hedge_venue.value,
         plan.direction.value,
+    )
+
+
+def _bounded_paper_identity(
+    value: object | None, fallback: str, width: int
+) -> str:
+    rendered = " ".join(str(value).split()) if value is not None else ""
+    rendered = "".join(
+        character
+        if character.isascii()
+        and (character.isalnum() or character in "._:-|")
+        else "_"
+        for character in rendered
+    )
+    return (rendered[:width] or fallback)
+
+
+def _paper_entry_route_identity(route_key: object) -> str:
+    fields = (
+        ("canonical_asset", 48),
+        ("risex_market", 80),
+        ("hedge_venue", 24),
+        ("hedge_market", 80),
+        ("direction", 64),
+        ("cycle_id", 96),
+    )
+    return "|".join(
+        _bounded_paper_identity(
+            getattr(
+                getattr(route_key, name, None),
+                "value",
+                getattr(route_key, name, None),
+            ),
+            "UNKNOWN",
+            width,
+        )
+        for name, width in fields
     )
 
 
@@ -830,6 +874,138 @@ class PublicPaperRuntime:
                 text=f"Public data recovered: "
                 f"{venue.value if venue else 'PUBLIC'} {event_type}",
             )
+
+    def _paper_entry_cancellation_evidence(
+        self, state: PaperEntryState, at: datetime
+    ) -> tuple[datetime, str, str | None, dict[str, object]] | None:
+        """Build the single sanitized terminal outcome for an unfilled entry."""
+        order = state.order
+        if (
+            order is None
+            or state.lifecycle_state is not LifecycleState.FLAT
+            or state.position is not None
+            or order.status is not PaperOrderStatus.CANCELLED
+            or not isinstance(order.cancellation_reason, CancellationReason)
+            or type(order.attempt_id) is not str
+            or not order.attempt_id
+        ):
+            return None
+        cancelled_at = order.cancelled_at or at
+        active_duration = max(
+            Decimal("0"),
+            Decimal(str((cancelled_at - order.created_at).total_seconds())),
+        )
+        route_identity = _paper_entry_route_identity(order.route_key)
+        attempt_id = _bounded_paper_identity(order.attempt_id, "UNKNOWN", 96)
+        attempt_identity = hashlib.sha256(
+            order.attempt_id.encode("utf-8", "replace")
+        ).hexdigest()
+        cumulative_eligible_maker_quantity = (
+            order.active_version.cumulative_eligible_quantity
+        )
+        event_id = (
+            f"{PAPER_ENTRY_CANCELLATION_EVENT}:{route_identity}:"
+            f"attempt:{attempt_identity}"
+        )
+        detail: dict[str, object] = {
+            "event_id": event_id,
+            "outcome": "MAKER_ENTRY_NOT_FILLED",
+            "attempt_id": attempt_id,
+            "attempt_identity": attempt_identity,
+            "route_identity": route_identity,
+            "route": _bounded_paper_identity(
+                self._paper_notification_context(order.route_key)[2],
+                "UNKNOWN ROUTE",
+                112,
+            ),
+            "canonical_asset": _bounded_paper_identity(
+                order.route_key.canonical_asset, "UNKNOWN", 48
+            ),
+            "risex_market": _bounded_paper_identity(
+                order.route_key.risex_market, "UNKNOWN", 80
+            ),
+            "hedge_venue": _bounded_paper_identity(
+                order.route_key.hedge_venue.value, "UNKNOWN", 24
+            ),
+            "hedge_market": _bounded_paper_identity(
+                order.route_key.hedge_market, "UNKNOWN", 80
+            ),
+            "direction": _bounded_paper_identity(
+                order.route_key.direction.value, "UNKNOWN", 64
+            ),
+            "cycle_id": _bounded_paper_identity(
+                order.route_key.cycle_id, "UNKNOWN", 96
+            ),
+            "cancellation_reason": order.cancellation_reason.value,
+            "cancelled_at": cancelled_at.isoformat(),
+            "active_duration_seconds": str(active_duration),
+            "cumulative_eligible_maker_quantity": str(
+                cumulative_eligible_maker_quantity
+            ),
+            "full_maker_fill": False,
+            "taker_hedge_taken": False,
+            "opened_position_quantity": "0",
+            "position_opened": False,
+            "returned_state": LifecycleState.FLAT.value,
+        }
+        return cancelled_at, PAPER_ENTRY_CANCELLATION_EVENT, None, detail
+
+    def _notify_paper_entry_cancellation(
+        self,
+        state: PaperEntryState,
+        evidence: tuple[datetime, str, str | None, dict[str, object]],
+    ) -> None:
+        if self.notifications is None or state.order is None:
+            return
+        order = state.order
+        lifecycle_key, ticker, route = self._paper_notification_context(
+            order.route_key
+        )
+        detail = evidence[3]
+        self.lifecycle_notifications.begin_lifecycle(
+            scope=NotificationScope.PAPER,
+            lifecycle_key=lifecycle_key,
+            ticker=ticker,
+            route=route,
+            expected_legs=("RISEX", "HEDGE"),
+        )
+        self.lifecycle_notifications.maker_entry_cancelled(
+            scope=NotificationScope.PAPER,
+            lifecycle_key=lifecycle_key,
+            attempt_id=order.attempt_id,
+            cancellation_reason=detail["cancellation_reason"],
+            active_duration_seconds=detail["active_duration_seconds"],
+            cumulative_eligible_maker_quantity=(
+                detail["cumulative_eligible_maker_quantity"]
+            ),
+            at=evidence[0],
+            ticker=ticker,
+            route=route,
+            expected_legs=("RISEX", "HEDGE"),
+        )
+
+    def _save_entry_decision(
+        self,
+        *,
+        recorded_at: datetime,
+        entry_state: PaperEntryState,
+        trade_events: tuple[TradeEvidence, ...] = (),
+        lifecycle_snapshot: LifecycleSnapshot | None = None,
+        fill_provenance: tuple[tuple[str, FillProvenance], ...] = (),
+    ) -> None:
+        cancellation = self._paper_entry_cancellation_evidence(
+            entry_state, recorded_at
+        )
+        self.repository.save_decision(
+            recorded_at=recorded_at,
+            trade_events=trade_events,
+            entry_state=entry_state,
+            lifecycle_snapshot=lifecycle_snapshot,
+            fill_provenance=fill_provenance,
+            runtime_evidence=() if cancellation is None else (cancellation,),
+        )
+        if cancellation is not None:
+            self._notify_paper_entry_cancellation(entry_state, cancellation)
 
     def _notify_socket_outage_if_due(
         self,
@@ -2544,7 +2720,9 @@ class PublicPaperRuntime:
         if isinstance(runtime, PaperEntryState) and runtime.lifecycle_state is LifecycleState.ENTRY_MAKER_OPEN:
             broker = PaperEntryBroker.from_state(runtime, config=self.config)
             restarted = await broker.cancel_for_process_restart(restarted_at=at)
-            self.repository.save_decision(recorded_at=at, entry_state=restarted)
+            self._save_entry_decision(
+                recorded_at=at, entry_state=restarted
+            )
             self._record("ENTRY_CANCELLED_ON_RESTART", at=at)
             return
         if not isinstance(runtime, LifecycleSnapshot) or runtime.lifecycle_state is LifecycleState.FLAT:
@@ -2911,7 +3089,7 @@ class PublicPaperRuntime:
                     await broker.refresh(
                         refreshed, risex, evaluated_at=now, hedge_observation=hedge
                     )
-                    self.repository.save_decision(
+                    self._save_entry_decision(
                         recorded_at=now, entry_state=broker.state
                     )
                     if broker.state.lifecycle_state is LifecycleState.FLAT:
@@ -3019,7 +3197,7 @@ class PublicPaperRuntime:
                     activated_at=activation_at,
                 )
                 self.broker = broker
-                self.repository.save_decision(
+                self._save_entry_decision(
                     recorded_at=activation_at, entry_state=broker.state
                 )
                 self._record("PAPER_ENTRY_ACTIVATED", at=activation_at)
@@ -3039,6 +3217,7 @@ class PublicPaperRuntime:
                 scope=NotificationScope.PAPER,
                 lifecycle_key=lifecycle_key,
                 at=activation_at,
+                attempt_id=order.attempt_id,
                 ticker=ticker,
                 route=route,
                 expected_legs=("RISEX", "HEDGE"),
@@ -3192,7 +3371,7 @@ class PublicPaperRuntime:
                     LifecycleEngine(result.state, config=self.config)
                     if result.state.position is not None else None
                 )
-                self.repository.save_decision(
+                self._save_entry_decision(
                     recorded_at=at,
                     trade_events=(trade,),
                     entry_state=result.state,
@@ -3211,6 +3390,8 @@ class PublicPaperRuntime:
                     )
                 elif self.broker is broker and broker.state is before:
                     broker.publish_candidate(candidate)
+                    if broker.state.lifecycle_state is LifecycleState.FLAT:
+                        self.broker = None
             return
         if self.lifecycle is not None and self.lifecycle.snapshot.exit_order is not None:
             lifecycle = self.lifecycle
@@ -3658,7 +3839,7 @@ class PublicPaperRuntime:
                             refreshed, risex, evaluated_at=now,
                             hedge_observation=hedge,
                         )
-                        self.repository.save_decision(
+                        self._save_entry_decision(
                             recorded_at=now, entry_state=broker.state
                         )
                         async with self._scan_coordination_lock:
@@ -6140,7 +6321,7 @@ class PublicPaperRuntime:
             await self._session.close()
         if self.broker is not None and self.broker.state.lifecycle_state is LifecycleState.ENTRY_MAKER_OPEN:
             state = await self.broker.cancel_for_process_restart(restarted_at=at)
-            self.repository.save_decision(recorded_at=at, entry_state=state)
+            self._save_entry_decision(recorded_at=at, entry_state=state)
         await self._cancel_owned_background_tasks()
         at = self.clock.now()
         stop_detail: dict[str, object] = {

@@ -370,6 +370,8 @@ class _LifecycleNotificationState:
     closed_legs: set[str] = field(default_factory=set)
     funding: dict[str, tuple[str, str]] = field(default_factory=dict)
     active_blockers: set[str] = field(default_factory=set)
+    entry_activation_attempts: set[str] = field(default_factory=set)
+    entry_cancellation_attempts: set[str] = field(default_factory=set)
     activation_notified: bool = False
     pair_opened: bool = False
     exit_started: bool = False
@@ -431,6 +433,7 @@ class LifecycleNotificationTracker:
         scope: NotificationScope | str,
         lifecycle_key: str,
         at: datetime,
+        attempt_id: object | None = None,
         ticker: object | None = None,
         route: object | None = None,
         expected_legs: Sequence[str] = DEFAULT_LIFECYCLE_LEGS,
@@ -439,13 +442,78 @@ class LifecycleNotificationTracker:
             scope, lifecycle_key, ticker=ticker, route=route,
             expected_legs=expected_legs,
         )
-        if state is None or state.activation_notified:
+        if state is None:
             return False
-        state.activation_notified = True
+        if attempt_id is None:
+            if state.activation_notified:
+                return False
+            state.activation_notified = True
+            suffix = "entry-activated"
+        else:
+            if type(attempt_id) is not str or not attempt_id:
+                return False
+            attempt_identity = _opaque_identity("paper-entry-attempt", attempt_id)
+            if attempt_identity in state.entry_activation_attempts:
+                return False
+            state.entry_activation_attempts.add(attempt_identity)
+            suffix = f"entry-activated:{attempt_identity}"
         return self._emit(
-            state, "ENTRY_ACTIVATED", at, "entry-activated",
+            state, "ENTRY_ACTIVATED", at, suffix,
             f"{state.scope.value} | MAKER ENTRY ACTIVATED | "
             f"{state.ticker} | {state.route}",
+        )
+
+    def maker_entry_cancelled(
+        self,
+        *,
+        scope: NotificationScope | str,
+        lifecycle_key: str,
+        attempt_id: object,
+        cancellation_reason: object,
+        active_duration_seconds: object,
+        cumulative_eligible_maker_quantity: object,
+        at: datetime,
+        ticker: object | None = None,
+        route: object | None = None,
+        expected_legs: Sequence[str] = DEFAULT_LIFECYCLE_LEGS,
+    ) -> bool:
+        state = self._state(
+            scope, lifecycle_key, ticker=ticker, route=route,
+            expected_legs=expected_legs,
+        )
+        if state is None or state.pair_opened:
+            return False
+        if type(attempt_id) is not str or not attempt_id:
+            return False
+        attempt_identity = _opaque_identity("paper-entry-attempt", attempt_id)
+        if attempt_identity in state.entry_cancellation_attempts:
+            return False
+        reason = _safe_code(cancellation_reason, "")
+        duration = _decimal_or_none(active_duration_seconds)
+        quantity = _decimal_or_none(cumulative_eligible_maker_quantity)
+        if (
+            not reason
+            or duration is None
+            or duration < 0
+            or quantity is None
+            or quantity < 0
+        ):
+            return False
+        state.entry_cancellation_attempts.add(attempt_identity)
+        duration_display = format(duration, "f")
+        attempt_display = _safe_display(attempt_id, "UNKNOWN ATTEMPT", 64)
+        return self._emit(
+            state,
+            "ENTRY_CANCELLED_NO_FILL",
+            at,
+            f"entry-cancelled-no-fill:{attempt_identity}",
+            f"{state.scope.value} | MAKER ENTRY NOT FILLED | "
+            f"{state.ticker} | {state.route} | reason {reason} | "
+            f"attempt {attempt_display} [{attempt_identity[:12]}] | "
+            f"active seconds {duration_display} | "
+            f"cumulative eligible maker quantity {format(quantity, 'f')} | "
+            "full maker fill no | no taker hedge | opened position quantity 0 | "
+            "returned FLAT",
         )
 
     def confirm_leg_open(

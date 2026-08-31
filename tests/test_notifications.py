@@ -967,6 +967,60 @@ def test_notification_failure_does_not_block_lifecycle_progression():
     )
 
 
+def test_paper_entry_cancellation_is_once_per_attempt_and_stops_after_open():
+    tracker, capture = lifecycle_tracker(
+        scope=NotificationScope.PAPER,
+        lifecycle_key="ABC|RISEx-PERP|NADO-PERP|cycle-1",
+    )
+    common = {
+        "scope": NotificationScope.PAPER,
+        "lifecycle_key": "ABC|RISEx-PERP|NADO-PERP|cycle-1",
+        "cancellation_reason": "PAPER_ORDER_CANCELLED_CUTOFF",
+        "active_duration_seconds": "12.5",
+        "cumulative_eligible_maker_quantity": "0",
+        "at": NOW,
+    }
+    assert tracker.maker_entry_cancelled(
+        **common, attempt_id="attempt-1"
+    )
+    assert not tracker.maker_entry_cancelled(
+        **common, attempt_id="attempt-1"
+    )
+    assert tracker.maker_entry_cancelled(
+        **common, attempt_id="attempt-2"
+    )
+
+    cancellations = [
+        row for row in capture.rows if row.kind == "ENTRY_CANCELLED_NO_FILL"
+    ]
+    assert len(cancellations) == 2
+    assert cancellations[0].event_id != cancellations[1].event_id
+    for row in cancellations:
+        assert (
+            "MAKER ENTRY NOT FILLED" in row.text
+            and "PAPER_ORDER_CANCELLED_CUTOFF" in row.text
+            and "active seconds 12.5" in row.text
+            and "cumulative eligible maker quantity 0" in row.text
+            and "full maker fill no" in row.text
+            and "no taker hedge" in row.text
+            and "opened position quantity 0" in row.text
+            and "returned FLAT" in row.text
+            and "PnL" not in row.text
+            and "realized" not in row.text.lower()
+        )
+
+    assert tracker.confirm_pair_open(
+        scope=NotificationScope.PAPER,
+        lifecycle_key="ABC|RISEx-PERP|NADO-PERP|cycle-1",
+        authoritative_legs=("RISEX", "HEDGE"),
+        at=NOW,
+        authoritative=True,
+    )
+    assert not tracker.maker_entry_cancelled(
+        **common, attempt_id="attempt-3"
+    )
+
+
 def test_lifecycle_notification_text_redacts_private_tokens_and_is_bounded():
     tracker, capture = lifecycle_tracker()
     secret = "0x" + "a" * 64

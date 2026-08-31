@@ -1445,6 +1445,19 @@ async def activate_with_live_streams(
     assert runtime.broker is not None
 
 
+def paper_entry_cancellations(
+    repository: PaperRepository,
+) -> list[dict[str, object]]:
+    return [
+        json.loads(row["detail"])
+        for row in repository.connection.execute(
+            "SELECT detail FROM runtime_evidence "
+            "WHERE event_type='PAPER_ENTRY_CANCELLED_NO_FILL' "
+            "ORDER BY evidence_id"
+        )
+    ]
+
+
 @pytest.mark.asyncio
 async def test_injected_ordinary_public_scan_builds_real_observations_and_diagnostics(tmp_path):
     clock = FakeClock()
@@ -3089,6 +3102,7 @@ async def test_scheduling_full_focused_activation_and_strict_cutoff(tmp_path):
                     "SELECT detail FROM runtime_evidence WHERE event_type='PUBLIC_SCAN'"
                 )
             ]
+            cancellations = paper_entry_cancellations(repository)
     assert scans >= first_scans + 4
     assert {NOW, NOW + timedelta(seconds=100), NOW + timedelta(seconds=110)} <= recorded
     assert NOW + timedelta(seconds=120) in recorded
@@ -3104,6 +3118,17 @@ async def test_scheduling_full_focused_activation_and_strict_cutoff(tmp_path):
     assert {row["observations_source"] for row in telemetry} <= {
         "REST_BOOTSTRAP", "LIVE_STREAM", "MIXED",
     }
+    assert len(cancellations) == 1
+    assert cancellations[0]["cancellation_reason"] == "PAPER_ORDER_CANCELLED_CUTOFF"
+    assert cancellations[0]["attempt_id"]
+    assert cancellations[0]["route_identity"]
+    assert D(cancellations[0]["active_duration_seconds"]) == D("115")
+    assert cancellations[0]["cumulative_eligible_maker_quantity"] == "0"
+    assert cancellations[0]["full_maker_fill"] is False
+    assert cancellations[0]["taker_hedge_taken"] is False
+    assert cancellations[0]["opened_position_quantity"] == "0"
+    assert cancellations[0]["position_opened"] is False
+    assert cancellations[0]["returned_state"] == "FLAT"
 
 
 @pytest.mark.asyncio
@@ -3317,6 +3342,12 @@ async def test_disconnect_invalidation_precedes_trade_during_gated_full_refresh(
                 blocked_adapter.gate.set()
                 await full_scan
                 assert repository.load_runtime().lifecycle_state is LifecycleState.FLAT
+                cancellations = paper_entry_cancellations(repository)
+                assert len(cancellations) == 1
+                assert cancellations[0]["cancellation_reason"] == (
+                    "PAPER_ORDER_CANCELLED_DATA_STALE"
+                )
+                assert cancellations[0]["cumulative_eligible_maker_quantity"] == "0"
             finally:
                 release_recompute.set()
                 blocked_adapter.block_catalog = False
@@ -3674,6 +3705,125 @@ def maker_trade(runtime: PublicPaperRuntime, at: datetime, key: str = "public-tr
 
 
 @pytest.mark.asyncio
+async def test_trade_time_cancellation_releases_broker_for_next_same_cycle_attempt(
+    tmp_path,
+):
+    clock = FakeClock()
+    target = NOW + timedelta(seconds=120)
+    delivery = CaptureNotifications()
+    with PaperRepository(tmp_path / "trade-cancel-outcome.db") as repository:
+        async with PublicPaperRuntime(
+            repository,
+            adapters=adapters(clock, settlement_at=target),
+            clock=clock,
+            notifications=NotificationOutbox(delivery),
+        ) as runtime:
+            await activate_with_live_streams(runtime, clock)
+            first_order = runtime.broker.state.order
+            assert first_order is not None
+            first_attempt = first_order.attempt_id
+            clock.advance(31)
+            runtime.mark_trade_stream_connected(
+                first_order.venue, first_order.canonical_market, at=clock.now()
+            )
+            await runtime.deliver_trade(
+                maker_trade(runtime, clock.now(), "trade-time-cancel")
+            )
+            assert runtime.broker is None
+            assert runtime.lifecycle is None
+            cancellations = paper_entry_cancellations(repository)
+            assert len(cancellations) == 1
+            assert cancellations[0]["cancellation_reason"] == (
+                "PAPER_ORDER_CANCELLED_DATA_STALE"
+            )
+            assert cancellations[0]["cumulative_eligible_maker_quantity"] == "0"
+            cancellation_rows = [
+                row
+                for row in delivery.rows
+                if row.kind == "ENTRY_CANCELLED_NO_FILL"
+            ]
+            assert len(cancellation_rows) == 1
+            assert "no taker hedge" in cancellation_rows[0].text
+            assert "opened position quantity 0" in cancellation_rows[0].text
+            assert "returned FLAT" in cancellation_rows[0].text
+            runtime._save_entry_decision(
+                recorded_at=clock.now(), entry_state=repository.load_runtime()
+            )
+            assert len(paper_entry_cancellations(repository)) == 1
+            assert len([
+                row for row in delivery.rows
+                if row.kind == "ENTRY_CANCELLED_NO_FILL"
+            ]) == 1
+
+            confirm_public_streams(runtime, clock.now())
+            runtime.next_focused_scan_at = clock.now()
+            await runtime.tick()
+            assert runtime.broker is not None
+            second_order = runtime.broker.state.order
+            assert second_order is not None
+            assert second_order.attempt_id != first_attempt
+            activation_rows = [
+                row for row in delivery.rows if row.kind == "ENTRY_ACTIVATED"
+            ]
+            assert len(activation_rows) == 2
+            assert activation_rows[0].event_id != activation_rows[1].event_id
+
+
+@pytest.mark.asyncio
+async def test_partial_maker_evidence_then_cancellation_is_not_reported_as_full_fill(
+    tmp_path,
+):
+    clock = FakeClock()
+    target = NOW + timedelta(seconds=120)
+    delivery = CaptureNotifications()
+    with PaperRepository(tmp_path / "partial-entry-cancel.db") as repository:
+        async with PublicPaperRuntime(
+            repository,
+            adapters=adapters(clock, settlement_at=target),
+            clock=clock,
+            notifications=NotificationOutbox(delivery),
+        ) as runtime:
+            await activate_with_live_streams(runtime, clock)
+            order = runtime.broker.state.order
+            assert order is not None
+            runtime.mark_trade_stream_connected(
+                order.venue, order.canonical_market, at=clock.now()
+            )
+            partial_quantity = order.canonical_quantity / D("2")
+            await runtime.deliver_trade(
+                replace(
+                    maker_trade(runtime, clock.now(), "partial-entry-evidence"),
+                    canonical_quantity=partial_quantity,
+                )
+            )
+            assert runtime.broker is not None
+            assert runtime.broker.state.order.active_version.cumulative_eligible_quantity == (
+                partial_quantity
+            )
+
+            clock.value = order.cutoff_at
+            confirm_public_streams(runtime, clock.now())
+            await runtime.tick()
+            assert runtime.broker is None
+            cancellations = paper_entry_cancellations(repository)
+            assert len(cancellations) == 1
+            detail = cancellations[0]
+            assert detail["cumulative_eligible_maker_quantity"] == str(
+                partial_quantity
+            )
+            assert detail["full_maker_fill"] is False
+            assert detail["opened_position_quantity"] == "0"
+            assert detail["taker_hedge_taken"] is False
+            row = next(
+                row for row in delivery.rows
+                if row.kind == "ENTRY_CANCELLED_NO_FILL"
+            )
+            assert f"cumulative eligible maker quantity {partial_quantity}" in row.text
+            assert "full maker fill no" in row.text
+            assert "opened position quantity 0" in row.text
+
+
+@pytest.mark.asyncio
 async def test_rest_bootstrap_cannot_activate_until_required_live_streams_are_ready(tmp_path):
     clock = FakeClock()
     target = NOW + timedelta(seconds=120)
@@ -3853,8 +4003,11 @@ async def test_runtime_lifecycle_notifications_follow_persisted_transitions(tmp_
             )
             await runtime.deliver_trade(exit_trade)
             authoritative = repository.load_runtime().closed_trade
+            cancellations = paper_entry_cancellations(repository)
 
     kinds = [row.kind for row in delivery.rows]
+    assert kinds.count("ENTRY_CANCELLED_NO_FILL") == 0
+    assert cancellations == []
     for required in (
         "ENTRY_ACTIVATED", "POSITION_OPENED", "EXIT_STARTED",
         "POSITION_CLOSED", "FINAL_FLAT",
@@ -7654,10 +7807,45 @@ async def test_safe_shutdown_cancels_only_virtual_entry_and_preserves_open_posit
             await runtime.shutdown()
             state = repository.load_runtime()
             report = repository.report(as_of=clock.now())
+            cancellations = paper_entry_cancellations(repository)
     assert state.lifecycle_state is LifecycleState.FLAT
     assert state.order.status.value == "CANCELLED"
+    assert len(cancellations) == 1
+    assert cancellations[0]["cancellation_reason"] == (
+        "PAPER_ORDER_CANCELLED_PROCESS_RESTART"
+    )
     assert report["last_runtime_event"]["event_type"] == "STOPPED_SAFE"
     assert report["last_runtime_event"]["detail"]["forced_close"] is False
+
+
+@pytest.mark.asyncio
+async def test_restore_persists_and_notifies_process_restart_entry_cancellation(tmp_path):
+    clock = FakeClock()
+    target = NOW + timedelta(seconds=120)
+    delivery = CaptureNotifications()
+    with PaperRepository(tmp_path / "restore-entry-cancel.db") as repository:
+        original = PublicPaperRuntime(
+            repository, adapters=adapters(clock, settlement_at=target), clock=clock
+        )
+        await original.__aenter__()
+        await activate_with_live_streams(original, clock)
+        restart_at = clock.now() + timedelta(seconds=4)
+        replacement = PublicPaperRuntime(
+            repository,
+            adapters=adapters(clock, settlement_at=target),
+            clock=clock,
+            notifications=NotificationOutbox(delivery),
+        )
+        await replacement._restore(restart_at)
+        state = repository.load_runtime()
+        cancellations = paper_entry_cancellations(repository)
+    assert state.lifecycle_state is LifecycleState.FLAT
+    assert state.order.cancellation_reason.value == (
+        "PAPER_ORDER_CANCELLED_PROCESS_RESTART"
+    )
+    assert len(cancellations) == 1
+    assert D(cancellations[0]["active_duration_seconds"]) == D("4")
+    assert [row.kind for row in delivery.rows] == ["ENTRY_CANCELLED_NO_FILL"]
 
 
 @pytest.mark.asyncio
