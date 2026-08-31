@@ -96,6 +96,30 @@ def market_at(now_ms: int) -> lifecycle.MarketObservation:
     )
 
 
+def close_market_at(
+    now_ms: int,
+    *,
+    best_bid: str = "3.7285",
+    best_ask: str = "3.8000",
+    bid_quantity: str = "3.00",
+    ask_quantity: str = "3.00",
+    min_base_amount: str = "3.00",
+    price_decimals: int = 4,
+) -> lifecycle.MarketObservation:
+    base = market_at(now_ms)
+    return replace(
+        base,
+        contract=replace(
+            base.contract,
+            min_base_amount=Decimal(min_base_amount),
+            size_decimals=2,
+            price_decimals=price_decimals,
+        ),
+        bids=(lifecycle.BookLevel(Decimal(best_bid), Decimal(bid_quantity)),),
+        asks=(lifecycle.BookLevel(Decimal(best_ask), Decimal(ask_quantity)),),
+    )
+
+
 class SyntheticGateway:
     def __init__(
         self,
@@ -612,6 +636,171 @@ async def test_close_pre_read_uses_post_read_clock_for_account(tmp_path):
 
     assert [row[0] for row in gateway.dispatches] == ["CLOSE"]
     store.close()
+
+
+@pytest.mark.asyncio
+async def test_long_close_uses_exact_position_and_20_percent_sell_guard(tmp_path):
+    clock = [0]
+    gateway = SyntheticGateway(clock)
+    observed = close_market_at(0, min_base_amount="3.00")
+    gateway.market = lambda market_id: _async_market(observed, market_id)
+    gateway.position = Decimal("2.69")
+    runner, store = make_runner(tmp_path, gateway)
+    runner._market = observed
+    runner._quantity = Decimal("2.69")
+    runner._open_is_ask = False
+    store.begin()
+
+    await runner._close_phase(observed)
+
+    close_order = next(order for order in gateway.orders.values() if order.reduce_only)
+    expected_bound = observed.best_bid * (Decimal(1) - lifecycle.LIGHTER_CLOSE_MAX_SLIPPAGE)
+    assert close_order.quantity == Decimal("2.69")
+    assert close_order.is_ask is True
+    assert close_order.order_type == "market"
+    assert close_order.time_in_force == "ioc"
+    assert close_order.reduce_only is True
+    assert close_order.price == expected_bound == Decimal("2.9828")
+    assert close_order.price < observed.best_bid
+    assert lifecycle._grid(close_order.price, observed.price_tick)
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_short_close_uses_exact_position_and_20_percent_buy_guard(tmp_path):
+    clock = [0]
+    gateway = SyntheticGateway(clock)
+    observed = close_market_at(0, min_base_amount="3.00")
+    gateway.market = lambda market_id: _async_market(observed, market_id)
+    gateway.position = Decimal("-2.69")
+    runner, store = make_runner(tmp_path, gateway)
+    runner._market = observed
+    runner._quantity = Decimal("2.69")
+    runner._open_is_ask = True
+    store.begin()
+
+    await runner._close_phase(observed)
+
+    close_order = next(order for order in gateway.orders.values() if order.reduce_only)
+    expected_bound = observed.best_ask * (Decimal(1) + lifecycle.LIGHTER_CLOSE_MAX_SLIPPAGE)
+    assert close_order.quantity == Decimal("2.69")
+    assert close_order.is_ask is False
+    assert close_order.order_type == "market"
+    assert close_order.time_in_force == "ioc"
+    assert close_order.reduce_only is True
+    assert close_order.price == expected_bound == Decimal("4.5600")
+    assert close_order.price > observed.best_ask
+    assert lifecycle._grid(close_order.price, observed.price_tick)
+    store.close()
+
+
+@pytest.mark.parametrize(
+    ("is_ask", "best_bid", "best_ask", "expected"),
+    [
+        (True, "3.7284", "3.8000", Decimal("2.9827")),
+        (False, "3.7285", "3.8001", Decimal("4.5602")),
+    ],
+)
+def test_close_price_bound_rounds_directionally_to_price_tick(
+    is_ask, best_bid, best_ask, expected
+):
+    market = close_market_at(0, best_bid=best_bid, best_ask=best_ask)
+    reference = market.best_bid if is_ask else market.best_ask
+    raw_bound = reference * (
+        Decimal(1) - lifecycle.LIGHTER_CLOSE_MAX_SLIPPAGE
+        if is_ask
+        else Decimal(1) + lifecycle.LIGHTER_CLOSE_MAX_SLIPPAGE
+    )
+
+    bound = lifecycle.close_price_bound(
+        market,
+        quantity=Decimal("2.69"),
+        is_ask=is_ask,
+    )
+
+    assert bound == expected
+    assert lifecycle._grid(bound, market.price_tick)
+    assert bound <= raw_bound if is_ask else bound >= raw_bound
+
+
+async def _async_market(observed, market_id):
+    assert market_id == observed.market_id
+    return observed
+
+
+@pytest.mark.parametrize(
+    ("mutation", "is_ask", "reason"),
+    [
+        ("empty", True, "EXTERNAL_LIQUIDITY_INSUFFICIENT"),
+        ("insufficient", True, "EXTERNAL_LIQUIDITY_INSUFFICIENT"),
+        ("off_grid", True, "CLOSE_BOOK_LEVEL_OFF_GRID"),
+        ("overflow", False, "CLOSE_PRICE_BOUND_INVALID"),
+    ],
+)
+def test_close_price_bound_fails_closed_on_book_or_arithmetic_defects(
+    mutation, is_ask, reason
+):
+    if mutation == "empty":
+        market = replace(close_market_at(0), bids=())
+    elif mutation == "insufficient":
+        market = close_market_at(0, bid_quantity="2.68")
+    elif mutation == "off_grid":
+        market = close_market_at(0, best_bid="3.72845")
+    else:
+        market = close_market_at(0, best_ask="9e999999", price_decimals=0)
+
+    with pytest.raises(lifecycle.LifecycleHalt, match=reason):
+        lifecycle.close_price_bound(
+            market,
+            quantity=Decimal("2.69"),
+            is_ask=is_ask,
+        )
+
+
+def test_close_price_bound_rejects_nonfinite_policy():
+    market = close_market_at(0)
+    original = lifecycle.LIGHTER_CLOSE_MAX_SLIPPAGE
+    lifecycle.LIGHTER_CLOSE_MAX_SLIPPAGE = Decimal("NaN")
+    try:
+        with pytest.raises(lifecycle.LifecycleHalt, match="CLOSE_SLIPPAGE_POLICY_INVALID"):
+            lifecycle.close_price_bound(
+                market,
+                quantity=Decimal("2.69"),
+                is_ask=True,
+            )
+    finally:
+        lifecycle.LIGHTER_CLOSE_MAX_SLIPPAGE = original
+
+
+def test_smallest_executable_quantity_remains_the_open_path_contract():
+    market = market_at(0)
+
+    assert lifecycle.smallest_executable_quantity(market, is_ask=False) == (
+        Decimal("1"),
+        Decimal("10.10"),
+    )
+    assert lifecycle.smallest_executable_quantity(market, is_ask=True) == (
+        Decimal("1"),
+        Decimal("10.00"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("quantity", "is_ask", "reason"),
+    [
+        (Decimal("0"), True, "CLOSE_QUANTITY_INVALID"),
+        (Decimal("NaN"), True, "CLOSE_QUANTITY_INVALID"),
+        (Decimal("2.691"), True, "CLOSE_QUANTITY_OFF_GRID"),
+        (Decimal("2.69"), 1, "CLOSE_SIDE_INVALID"),
+    ],
+)
+def test_close_price_bound_rejects_invalid_quantity_or_side(quantity, is_ask, reason):
+    with pytest.raises(lifecycle.LifecycleHalt, match=reason):
+        lifecycle.close_price_bound(
+            close_market_at(0),
+            quantity=quantity,
+            is_ask=is_ask,
+        )
 
 
 async def run_synthetic(
@@ -1156,6 +1345,46 @@ async def test_ambiguous_send_is_one_shot_and_restart_does_not_replay(tmp_path):
     store.close()
     with pytest.raises(lifecycle.LifecycleHalt, match="FRESH_DATABASE_PATH_MUST_NOT_EXIST"):
         lifecycle.LifecycleStore(tmp_path / "lighter-level-c.sqlite")
+
+
+async def test_ambiguous_close_is_one_shot_and_restart_does_not_replay(tmp_path):
+    clock = [0]
+    gateway = SyntheticGateway(clock, ambiguous_kind=lifecycle.IntentKind.CLOSE)
+    runner, store = make_runner(tmp_path, gateway)
+    report = await runner.run()
+
+    assert report.result is lifecycle.RunnerResult.HALTED_MANUAL_RECOVERY
+    assert report.reason == "SYNTHETIC_AMBIGUOUS_SEND"
+    assert report.intent_count == 4
+    assert report.dispatch_count == 4
+    assert [row[0] for row in gateway.dispatches] == [
+        "MAKER_PLACE",
+        "MAKER_CANCEL",
+        "OPEN",
+    ]
+    row = store._connection.execute(
+        "SELECT state FROM intents WHERE kind = 'CLOSE'"
+    ).fetchone()
+    assert row[0] == lifecycle.IntentState.AMBIGUOUS.value
+
+    restarted = lifecycle.LighterLevelCRunner(
+        gateway,
+        store,
+        readiness=ready_readiness(),
+        identity=identity(),
+        mode=lifecycle.RunMode.TESTNET_WRITE,
+        clock_ms=lambda: clock[0],
+        sleep=gateway.sleep_until_boundary,
+    )
+    second = await restarted.run()
+    assert second.result is lifecycle.RunnerResult.BLOCKED
+    assert second.reason == "RESTART_REQUIRES_FRESH_DATABASE"
+    assert [row[0] for row in gateway.dispatches] == [
+        "MAKER_PLACE",
+        "MAKER_CANCEL",
+        "OPEN",
+    ]
+    store.close()
 
 
 async def test_terminal_round_disagreement_blocks_after_close(tmp_path):

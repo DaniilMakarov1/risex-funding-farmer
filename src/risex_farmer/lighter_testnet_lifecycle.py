@@ -18,7 +18,7 @@ import argparse
 import asyncio
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_DOWN
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR
 from enum import Enum
 import hashlib
 import importlib
@@ -71,6 +71,7 @@ TERMINAL_ROUND_MAX_AGE_MS = 10_000
 SDK_READ_TIMEOUT_SECONDS = 30.0
 FUNDING_SETTLEMENT_WINDOW_SECONDS = 30.0
 FUNDING_POLL_INTERVAL_SECONDS = 2.0
+LIGHTER_CLOSE_MAX_SLIPPAGE = Decimal("0.20")
 MAKER_CANCEL_RECONCILIATION_TIMEOUT_SECONDS = 10.0
 MAKER_CANCEL_RECONCILIATION_POLL_INTERVAL_SECONDS = 1.0
 MAKER_CANCEL_RECONCILIATION_MAX_POLLS = 10
@@ -167,9 +168,15 @@ def _text(value: Any, label: str) -> str:
 
 
 def _grid(value: Decimal, step: Decimal) -> bool:
-    if step <= 0:
+    try:
+        value = value if isinstance(value, Decimal) else Decimal(str(value))
+        step = step if isinstance(step, Decimal) else Decimal(str(step))
+        if not value.is_finite() or not step.is_finite() or step <= 0:
+            return False
+        units = value / step
+        return units.to_integral_value(rounding=ROUND_DOWN) == units
+    except (ArithmeticError, InvalidOperation):
         return False
-    return (value / step).to_integral_value(rounding=ROUND_DOWN) == value / step
 
 
 def _ceil_grid(value: Decimal, step: Decimal) -> Decimal:
@@ -1270,6 +1277,85 @@ def smallest_executable_quantity(market: MarketObservation, *, is_ask: bool) -> 
             return quantity, worst
         quantity += step
     raise LifecycleHalt("MINIMUM_QUANTITY_SEARCH_EXHAUSTED", failure_class="SAFETY")
+
+
+def close_price_bound(
+    market: MarketObservation,
+    *,
+    quantity: Decimal,
+    is_ask: bool,
+) -> Decimal:
+    """Return the exact-state reduce-only close protection price.
+
+    Lighter's market IOC price is a slippage guard, not an execution price.
+    The observed close rejection at the exact book worst price requires a
+    bounded testnet-only allowance: 20% below the observed best bid for a
+    sell, or 20% above the observed best ask for a buy.  The result is
+    directionally rounded to the observed price grid: down for a sell and
+    up for a buy, so tick alignment never narrows the allowed slippage.
+
+    The quantity is deliberately supplied by the authoritative position
+    rather than by the market minimum.  Walking the corresponding book side
+    still proves that the exact quantity has sufficient current depth before
+    dispatch.
+    """
+
+    if not isinstance(is_ask, bool):
+        raise LifecycleHalt("CLOSE_SIDE_INVALID", failure_class="SCHEMA")
+    exact_quantity = _decimal(quantity, "CLOSE_QUANTITY", positive=True)
+    try:
+        tick = market.price_tick
+        step = market.size_step
+    except (ArithmeticError, InvalidOperation, TypeError, ValueError):
+        raise LifecycleHalt("CLOSE_GRID_INVALID", failure_class="SCHEMA") from None
+    if not tick.is_finite() or tick <= 0:
+        raise LifecycleHalt("CLOSE_PRICE_TICK_INVALID", failure_class="SCHEMA")
+    if not step.is_finite() or step <= 0 or not _grid(exact_quantity, step):
+        raise LifecycleHalt("CLOSE_QUANTITY_OFF_GRID", failure_class="SAFETY")
+
+    raw_levels = market.bids if is_ask else market.asks
+    if not isinstance(raw_levels, (tuple, list)) or not raw_levels:
+        raise LifecycleHalt("EXTERNAL_LIQUIDITY_INSUFFICIENT", failure_class="SAFETY")
+    normalized_levels: list[BookLevel] = []
+    for level in raw_levels:
+        price = _decimal(level.price, "CLOSE_BOOK_PRICE", positive=True)
+        level_quantity = _decimal(level.quantity, "CLOSE_BOOK_QUANTITY", positive=True)
+        if not _grid(price, tick) or not _grid(level_quantity, step):
+            raise LifecycleHalt("CLOSE_BOOK_LEVEL_OFF_GRID", failure_class="SAFETY")
+        normalized_levels.append(BookLevel(price, level_quantity))
+    levels = tuple(sorted(normalized_levels, key=lambda row: row.price, reverse=is_ask))
+    remaining = exact_quantity
+    for level in levels:
+        remaining -= level.quantity
+        if remaining <= 0:
+            break
+    else:
+        raise LifecycleHalt("EXTERNAL_LIQUIDITY_INSUFFICIENT", failure_class="SAFETY")
+
+    reference = _decimal(
+        levels[0].price,
+        "CLOSE_REFERENCE_PRICE",
+        positive=True,
+    )
+    max_slippage = _decimal(
+        LIGHTER_CLOSE_MAX_SLIPPAGE,
+        "CLOSE_SLIPPAGE_POLICY",
+    )
+    if max_slippage < 0 or max_slippage >= 1:
+        raise LifecycleHalt("CLOSE_SLIPPAGE_POLICY_INVALID", failure_class="SAFETY")
+    try:
+        factor = Decimal(1) - max_slippage if is_ask else Decimal(1) + max_slippage
+        bound = reference * factor
+        rounding = ROUND_FLOOR if is_ask else ROUND_CEILING
+        bound = (bound / tick).to_integral_value(rounding=rounding) * tick
+    except (ArithmeticError, InvalidOperation):
+        raise LifecycleHalt("CLOSE_PRICE_BOUND_INVALID", failure_class="SAFETY") from None
+    if not bound.is_finite() or bound <= 0:
+        raise LifecycleHalt("CLOSE_PRICE_BOUND_INVALID", failure_class="SAFETY")
+    if not _grid(bound, tick):
+        raise LifecycleHalt("CLOSE_PRICE_BOUND_OFF_GRID", failure_class="SAFETY")
+    _wire_units(bound, market.contract.price_decimals, "CLOSE_PRICE_BOUND")
+    return bound
 
 
 def _new_id(prefix: str) -> str:
@@ -3182,20 +3268,17 @@ class LighterLevelCRunner:
         if position is None or position.signed_quantity != expected_open:
             raise LifecycleHalt("CLOSE_POSITION_IDENTITY_INVALID", failure_class="SAFETY")
         close_is_ask = position.signed_quantity > 0
-        quantity, worst = smallest_executable_quantity(fresh_market, is_ask=close_is_ask)
-        if quantity != abs(position.signed_quantity):
-            # Close quantity is state-derived and may not be replaced by the
-            # current minimum; exact position size is mandatory.
-            _, worst = _walk(
-                tuple(sorted(fresh_market.bids if close_is_ask else fresh_market.asks, key=lambda row: row.price, reverse=close_is_ask)),
-                abs(position.signed_quantity),
-            )
-            quantity = abs(position.signed_quantity)
+        quantity = abs(position.signed_quantity)
+        price_bound = close_price_bound(
+            fresh_market,
+            quantity=quantity,
+            is_ask=close_is_ask,
+        )
         request = OrderRequest(
             market_id=market.market_id,
             client_order_index=_new_client_order_index(),
             quantity=quantity,
-            price=worst,
+            price=price_bound,
             is_ask=close_is_ask,
             order_type="market",
             time_in_force="ioc",
@@ -3428,6 +3511,7 @@ __all__ = [
     "AccountSnapshot",
     "AmbiguousDispatch",
     "BookLevel",
+    "close_price_bound",
     "DispatchOutcome",
     "FillSnapshot",
     "FundingHistory",
@@ -3445,6 +3529,7 @@ __all__ = [
     "LIGHTER_ACCOUNT_INDEX",
     "LIGHTER_API_KEY_INDEX",
     "LIGHTER_API_KEY_PRIVATE_PATH",
+    "LIGHTER_CLOSE_MAX_SLIPPAGE",
     "LIGHTER_IDENTITY_PATH",
     "LIGHTER_SDK_COMMIT",
     "LIGHTER_SYMBOL",
