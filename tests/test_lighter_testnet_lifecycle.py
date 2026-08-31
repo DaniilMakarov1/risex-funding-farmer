@@ -525,6 +525,79 @@ class SyntheticGateway:
         self.clock[0] += int(delay * 1000)
 
 
+class MakerCancelAdverseGateway(SyntheticGateway):
+    """Synthetic post-cancel account views for the bounded gap regressions."""
+
+    def __init__(
+        self,
+        clock: list[int],
+        *,
+        missing_polls: int | None = 0,
+        post_cancel_position: Decimal | None = None,
+        partial_identity: str | None = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(clock, **kwargs)
+        if missing_polls is not None and missing_polls < 0:
+            raise AssertionError("missing_polls must be nonnegative or None")
+        if partial_identity not in {None, "wrong_order", "wrong_client"}:
+            raise AssertionError(f"unknown partial identity: {partial_identity}")
+        self.missing_polls = missing_polls
+        self.post_cancel_position = post_cancel_position
+        self.partial_identity = partial_identity
+
+    async def snapshot(
+        self,
+        market_id: int,
+        *,
+        client_order_index: int | None = None,
+        post_cancel_target: tuple[int, int] | None = None,
+    ) -> lifecycle.AccountSnapshot:
+        account = await super().snapshot(
+            market_id,
+            client_order_index=client_order_index,
+            post_cancel_target=post_cancel_target,
+        )
+        if post_cancel_target is None or self.maker_cancel_order_index is None:
+            return account
+
+        if self.missing_polls is None or self.missing_polls > 0:
+            if self.missing_polls is not None:
+                self.missing_polls -= 1
+            target_order_index, target_client_order_index = post_cancel_target
+            orders = tuple(
+                row
+                for row in account.orders
+                if row.order_index != target_order_index
+                and row.client_order_index != target_client_order_index
+            )
+            positions = account.positions
+            if self.post_cancel_position is not None:
+                positions = (
+                    lifecycle.PositionSnapshot(
+                        ACCOUNT_INDEX,
+                        MARKET_ID,
+                        self.post_cancel_position,
+                    ),
+                )
+            return replace(account, orders=orders, positions=positions)
+
+        if self.partial_identity is not None:
+            rows = list(account.orders)
+            if len(rows) != 1:
+                raise AssertionError("the partial identity fixture requires one target row")
+            row = rows[0]
+            if self.partial_identity == "wrong_order":
+                rows[0] = replace(row, order_index=row.order_index + 1)
+            else:
+                rows[0] = replace(
+                    row,
+                    client_order_index=row.client_order_index + 1,
+                )
+            return replace(account, orders=tuple(rows))
+        return account
+
+
 def make_runner(
     tmp_path: Path,
     gateway: SyntheticGateway,
@@ -871,6 +944,17 @@ async def run_synthetic(
     return report, gateway, store
 
 
+async def run_maker_cancel_adverse(
+    tmp_path: Path,
+    **kwargs,
+) -> tuple[lifecycle.RunnerReport, MakerCancelAdverseGateway, lifecycle.LifecycleStore]:
+    clock = [0]
+    gateway = MakerCancelAdverseGateway(clock, **kwargs)
+    runner, store = make_runner(tmp_path, gateway)
+    report = await runner.run()
+    return report, gateway, store
+
+
 def write_protected(path: Path, content: str) -> None:
     path.parent.mkdir(mode=0o700)
     path.parent.chmod(0o700)
@@ -1123,6 +1207,139 @@ async def test_maker_cancel_perpetual_active_exhausts_without_replay(tmp_path):
         "MAKER_PLACE",
         "MAKER_CANCEL",
     ]
+    store.close()
+
+
+async def test_maker_cancel_tolerates_transient_zero_order_archive_gap_then_exact_terminal(
+    tmp_path,
+):
+    historical = lifecycle.FillSnapshot(
+        trade_id="historical-gap-fill",
+        order_index=41,
+        client_order_index=42,
+        account_index=ACCOUNT_INDEX,
+        market_id=MARKET_ID,
+        quantity=Decimal("7"),
+        price=Decimal("9.50"),
+        is_ask=True,
+        timestamp_ms=0,
+    )
+    report, gateway, store = await run_maker_cancel_adverse(
+        tmp_path,
+        missing_polls=2,
+        historical_fills=(historical,),
+    )
+
+    assert report.result is lifecycle.RunnerResult.COMPLETE
+    assert report.intent_count == 4
+    assert report.dispatch_count == 4
+    assert gateway.cancel_calls == 1
+    assert gateway.sleep_calls[:2] == [1.0, 1.0]
+    assert gateway.fills[0] == historical
+    maker_order = next(row for row in gateway.orders.values() if row.order_type == "limit")
+    assert maker_order.status == "CANCELLED"
+    assert maker_order.remaining_quantity == 0
+    assert maker_order.filled_quantity == 0
+    assert maker_order.filled_quote == 0
+    assert store.all_intents_reconciled()
+    store.close()
+
+
+async def test_maker_cancel_perpetual_zero_order_archive_gap_exhausts_without_replay(
+    tmp_path,
+):
+    report, gateway, store = await run_maker_cancel_adverse(
+        tmp_path,
+        missing_polls=None,
+    )
+
+    assert report.result is lifecycle.RunnerResult.HALTED_MANUAL_RECOVERY
+    assert report.failure_class == "TRANSPORT"
+    assert report.reason == "POST_SEND_RECONCILIATION_UNRESOLVED"
+    assert report.intent_count == 2
+    assert report.dispatch_count == 2
+    assert gateway.cancel_calls == 1
+    assert [row[0] for row in gateway.dispatches] == ["MAKER_PLACE", "MAKER_CANCEL"]
+    assert gateway.sleep_calls == [1.0] * lifecycle.MAKER_CANCEL_RECONCILIATION_MAX_POLLS
+
+    restarted = lifecycle.LighterLevelCRunner(
+        gateway,
+        store,
+        readiness=ready_readiness(),
+        identity=identity(),
+        mode=lifecycle.RunMode.TESTNET_WRITE,
+        clock_ms=lambda: gateway.clock[0],
+        sleep=gateway.sleep_until_boundary,
+    )
+    second = await restarted.run()
+
+    assert second.result is lifecycle.RunnerResult.BLOCKED
+    assert second.reason == "RESTART_REQUIRES_FRESH_DATABASE"
+    assert gateway.cancel_calls == 1
+    store.close()
+
+
+@pytest.mark.parametrize(
+    "gateway_kwargs",
+    [
+        {"missing_polls": 1, "maker_cancel_unrelated_order": True},
+        {"missing_polls": 1, "maker_cancel_fill": True},
+        {"missing_polls": 1, "post_cancel_position": Decimal("1")},
+    ],
+)
+async def test_maker_cancel_zero_order_archive_gap_rejects_unsafe_account_state(
+    tmp_path, gateway_kwargs
+):
+    report, gateway, store = await run_maker_cancel_adverse(
+        tmp_path,
+        **gateway_kwargs,
+    )
+
+    assert report.result is lifecycle.RunnerResult.HALTED_MANUAL_RECOVERY
+    assert report.failure_class == "TRANSPORT"
+    assert report.reason == "POST_SEND_RECONCILIATION_UNRESOLVED"
+    assert report.intent_count == 2
+    assert report.dispatch_count == 2
+    assert gateway.cancel_calls == 1
+    assert gateway.sleep_calls == []
+    store.close()
+
+
+@pytest.mark.parametrize("partial_identity", ["wrong_order", "wrong_client"])
+async def test_maker_cancel_partial_order_or_client_identity_fails_immediately(
+    tmp_path, partial_identity
+):
+    report, gateway, store = await run_maker_cancel_adverse(
+        tmp_path,
+        partial_identity=partial_identity,
+    )
+
+    assert report.result is lifecycle.RunnerResult.HALTED_MANUAL_RECOVERY
+    assert report.failure_class == "TRANSPORT"
+    assert report.reason == "POST_SEND_RECONCILIATION_UNRESOLVED"
+    assert report.intent_count == 2
+    assert report.dispatch_count == 2
+    assert gateway.cancel_calls == 1
+    assert gateway.sleep_calls == []
+    store.close()
+
+
+async def test_maker_cancel_zero_order_archive_gap_still_requires_exact_terminal_row(
+    tmp_path,
+):
+    report, gateway, store = await run_maker_cancel_adverse(
+        tmp_path,
+        missing_polls=2,
+        maker_cancel_status_sequence=("OPEN",),
+    )
+
+    assert report.result is lifecycle.RunnerResult.HALTED_MANUAL_RECOVERY
+    assert report.failure_class == "TRANSPORT"
+    assert report.reason == "POST_SEND_RECONCILIATION_UNRESOLVED"
+    assert report.intent_count == 2
+    assert report.dispatch_count == 2
+    assert gateway.cancel_calls == 1
+    assert gateway.sleep_calls == [1.0] * lifecycle.MAKER_CANCEL_RECONCILIATION_MAX_POLLS
     store.close()
 
 
@@ -2439,6 +2656,21 @@ async def test_official_reader_allows_only_bound_post_cancel_open_to_terminal_tr
     assert snapshot.orders[0].filled_quantity == 0
     assert snapshot.orders[0].filled_quote == 0
     assert snapshot.active_regular_orders == ()
+
+
+async def test_official_reader_exposes_empty_combined_post_cancel_gap_snapshot():
+    apis = FakeOfficialApis()
+    adapter = make_read_adapter(apis)
+
+    snapshot = await adapter.snapshot(
+        MARKET_ID,
+        client_order_index=701,
+        post_cancel_target=(700, 701),
+    )
+
+    assert snapshot.orders == ()
+    assert snapshot.active_regular_orders == ()
+    assert snapshot.active_trigger_orders == ()
 
 
 async def test_official_reader_rejects_contradictory_duplicate_outside_bound_transition():
