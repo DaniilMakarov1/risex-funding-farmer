@@ -3025,8 +3025,9 @@ class LighterLevelCRunner:
         Lighter can expose the exact maker order as active for a short period
         after the cancel transaction is accepted.  Only that exact original
         unfilled post-only order may be observed during the bounded wait.  A
-        second active order, any fill/field/state contradiction, or any
-        missing/ambiguous target is terminal immediately.
+        second active order, any fill/field/state contradiction, or an
+        unvalidated missing target is terminal immediately; an empty validated
+        zero-order snapshot shares the same bounded wait.
         """
 
         request = place.request
@@ -3070,57 +3071,74 @@ class LighterLevelCRunner:
                 is_ask=request.is_ask,
                 quantity=request.quantity,
             )
-            cancelled = _find_order(after_cancel, cancel)
-            original = _find_order(after_cancel, place)
-            if original.order_index != cancelled.order_index:
-                raise LifecycleHalt("MAKER_CANCEL_TARGET_MISMATCH", failure_class="SAFETY")
-            if original.nonce != placed_order.nonce or original.trigger:
-                raise LifecycleHalt("MAKER_CANCEL_TARGET_FIELDS_MISMATCH", failure_class="SAFETY")
-            if not isinstance(original.status, str) or not original.status:
-                raise LifecycleHalt("MAKER_CANCEL_STATUS_INVALID", failure_class="SCHEMA")
+            target_rows = tuple(
+                row
+                for row in after_cancel.orders
+                if row.order_index == cancel.target_order_index
+                or row.client_order_index == request.client_order_index
+            )
+            if not target_rows:
+                # The active endpoint can remove the order before the exact
+                # account-history endpoint publishes its terminal row.  This
+                # is a valid transient only for a genuinely empty, flat,
+                # current-target-fill-free snapshot.  Do not let unrelated
+                # rows turn the gap into a permissive reconciliation path.
+                if after_cancel.orders:
+                    raise LifecycleHalt(
+                        "MAKER_CANCEL_RECONCILIATION_FAILED", failure_class="SAFETY"
+                    )
+            else:
+                cancelled = _find_order(after_cancel, cancel)
+                original = _find_order(after_cancel, place)
+                if original.order_index != cancelled.order_index:
+                    raise LifecycleHalt("MAKER_CANCEL_TARGET_MISMATCH", failure_class="SAFETY")
+                if original.nonce != placed_order.nonce or original.trigger:
+                    raise LifecycleHalt("MAKER_CANCEL_TARGET_FIELDS_MISMATCH", failure_class="SAFETY")
+                if not isinstance(original.status, str) or not original.status:
+                    raise LifecycleHalt("MAKER_CANCEL_STATUS_INVALID", failure_class="SCHEMA")
 
-            status = original.status.upper()
-            if status in terminal_statuses:
+                status = original.status.upper()
+                if status in terminal_statuses:
+                    if (
+                        original.remaining_quantity != 0
+                        or original.filled_quantity != 0
+                        or original.filled_quote != 0
+                    ):
+                        raise LifecycleHalt(
+                            "MAKER_CANCEL_RECONCILIATION_FAILED", failure_class="SAFETY"
+                        )
+                    self._record_reconciled(
+                        cancel,
+                        {
+                            "filled_quantity": str(original.filled_quantity),
+                            "kind": cancel.kind.value,
+                            "market_id": market.market_id,
+                            "order_index": original.order_index,
+                            "remaining_quantity": str(original.remaining_quantity),
+                            "status": original.status,
+                        },
+                    )
+                    return original
+
+                if status not in {
+                    "OPEN",
+                    "ACTIVE",
+                    "PENDING",
+                    "IN-PROGRESS",
+                    "IN_PROGRESS",
+                }:
+                    raise LifecycleHalt(
+                        "MAKER_CANCEL_RECONCILIATION_FAILED", failure_class="SAFETY"
+                    )
                 if (
-                    original.remaining_quantity != 0
+                    not original.active
+                    or original.remaining_quantity != request.quantity
                     or original.filled_quantity != 0
                     or original.filled_quote != 0
                 ):
                     raise LifecycleHalt(
-                        "MAKER_CANCEL_RECONCILIATION_FAILED", failure_class="SAFETY"
+                        "MAKER_CANCEL_TARGET_NOT_ORIGINAL_UNFILLED", failure_class="SAFETY"
                     )
-                self._record_reconciled(
-                    cancel,
-                    {
-                        "filled_quantity": str(original.filled_quantity),
-                        "kind": cancel.kind.value,
-                        "market_id": market.market_id,
-                        "order_index": original.order_index,
-                        "remaining_quantity": str(original.remaining_quantity),
-                        "status": original.status,
-                    },
-                )
-                return original
-
-            if status not in {
-                "OPEN",
-                "ACTIVE",
-                "PENDING",
-                "IN-PROGRESS",
-                "IN_PROGRESS",
-            }:
-                raise LifecycleHalt(
-                    "MAKER_CANCEL_RECONCILIATION_FAILED", failure_class="SAFETY"
-                )
-            if (
-                not original.active
-                or original.remaining_quantity != request.quantity
-                or original.filled_quantity != 0
-                or original.filled_quote != 0
-            ):
-                raise LifecycleHalt(
-                    "MAKER_CANCEL_TARGET_NOT_ORIGINAL_UNFILLED", failure_class="SAFETY"
-                )
 
             now_ms = self.clock_ms()
             if polls >= MAKER_CANCEL_RECONCILIATION_MAX_POLLS or now_ms >= deadline_ms:
