@@ -694,6 +694,35 @@ async def test_short_close_uses_exact_position_and_20_percent_buy_guard(tmp_path
     store.close()
 
 
+@pytest.mark.parametrize(
+    ("is_ask", "best_bid", "best_ask", "expected"),
+    [
+        (True, "3.7284", "3.8000", Decimal("2.9827")),
+        (False, "3.7285", "3.8001", Decimal("4.5602")),
+    ],
+)
+def test_close_price_bound_rounds_directionally_to_price_tick(
+    is_ask, best_bid, best_ask, expected
+):
+    market = close_market_at(0, best_bid=best_bid, best_ask=best_ask)
+    reference = market.best_bid if is_ask else market.best_ask
+    raw_bound = reference * (
+        Decimal(1) - lifecycle.LIGHTER_CLOSE_MAX_SLIPPAGE
+        if is_ask
+        else Decimal(1) + lifecycle.LIGHTER_CLOSE_MAX_SLIPPAGE
+    )
+
+    bound = lifecycle.close_price_bound(
+        market,
+        quantity=Decimal("2.69"),
+        is_ask=is_ask,
+    )
+
+    assert bound == expected
+    assert lifecycle._grid(bound, market.price_tick)
+    assert bound <= raw_bound if is_ask else bound >= raw_bound
+
+
 async def _async_market(observed, market_id):
     assert market_id == observed.market_id
     return observed
@@ -704,7 +733,7 @@ async def _async_market(observed, market_id):
     [
         ("empty", True, "EXTERNAL_LIQUIDITY_INSUFFICIENT"),
         ("insufficient", True, "EXTERNAL_LIQUIDITY_INSUFFICIENT"),
-        ("off_grid", True, "CLOSE_PRICE_BOUND_OFF_GRID"),
+        ("off_grid", True, "CLOSE_BOOK_LEVEL_OFF_GRID"),
         ("overflow", False, "CLOSE_PRICE_BOUND_INVALID"),
     ],
 )
@@ -716,7 +745,7 @@ def test_close_price_bound_fails_closed_on_book_or_arithmetic_defects(
     elif mutation == "insufficient":
         market = close_market_at(0, bid_quantity="2.68")
     elif mutation == "off_grid":
-        market = close_market_at(0, best_bid="3.7284")
+        market = close_market_at(0, best_bid="3.72845")
     else:
         market = close_market_at(0, best_ask="9e999999", price_decimals=0)
 

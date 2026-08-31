@@ -18,7 +18,7 @@ import argparse
 import asyncio
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_DOWN
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR
 from enum import Enum
 import hashlib
 import importlib
@@ -1290,9 +1290,9 @@ def close_price_bound(
     Lighter's market IOC price is a slippage guard, not an execution price.
     The observed close rejection at the exact book worst price requires a
     bounded testnet-only allowance: 20% below the observed best bid for a
-    sell, or 20% above the observed best ask for a buy.  The result must
-    already be exactly representable on the observed price grid; silently
-    rounding the guard would change the accepted slippage policy.
+    sell, or 20% above the observed best ask for a buy.  The result is
+    directionally rounded to the observed price grid: down for a sell and
+    up for a buy, so tick alignment never narrows the allowed slippage.
 
     The quantity is deliberately supplied by the authoritative position
     rather than by the market minimum.  Walking the corresponding book side
@@ -1346,6 +1346,8 @@ def close_price_bound(
     try:
         factor = Decimal(1) - max_slippage if is_ask else Decimal(1) + max_slippage
         bound = reference * factor
+        rounding = ROUND_FLOOR if is_ask else ROUND_CEILING
+        bound = (bound / tick).to_integral_value(rounding=rounding) * tick
     except (ArithmeticError, InvalidOperation):
         raise LifecycleHalt("CLOSE_PRICE_BOUND_INVALID", failure_class="SAFETY") from None
     if not bound.is_finite() or bound <= 0:
