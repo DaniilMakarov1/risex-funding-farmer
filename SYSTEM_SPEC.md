@@ -102,7 +102,7 @@ Evaluate simultaneous activations at one logical timestamp and choose one top ro
 
 ## 6. Market data health
 
-WebSocket supplies available BBO, book deltas, public trades, funding, connection state, sequence, and heartbeat/ping. REST supplies markets/metadata, volume, initial and recovery snapshots, missing stream data, and official applied-funding history when available.
+WebSocket supplies available BBO, book deltas, maker-leg public trades, funding, connection state, sequence, and heartbeat/ping. REST supplies markets/metadata, volume, missing stream data, and official applied-funding history when available. Initial and recovery book snapshots may use REST only where the venue snapshot preserves the sequence contract. Lighter is the fixed exception: its REST book has no nonce, so only a fresh per-market WebSocket subscription snapshot may establish or recover a sequence-valid book. Lighter is always the virtual taker leg, so its public trade channel is neither subscribed nor required for route readiness; RISEx maker-trade evidence remains mandatory.
 
 Track per stream:
 
