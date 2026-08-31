@@ -2,7 +2,7 @@
 
 ## PAPER entry outcome observability correction
 
-Status: `AUTHORIZED — LIVE DEFECT REPRODUCED; BUILDER CANDIDATE REQUIRED`.
+Status: `ACCEPTED — PUBLISHED CORRECTION ACTIVE IN FRESH CHIEF37 PAPER RUNTIME`.
 
 Objective: correct only the observed gap after an activated PAPER maker entry terminates without a full fill. Persist one explicit cancellation outcome with the exact existing `CancellationReason`, route, attempt identity, active duration, and actual cumulative qualifying maker evidence, then emit one bounded Telegram lifecycle notification stating that the maker entry was not fully filled, no taker hedge was taken, no position opened, and the runtime returned to `FLAT`. The five observed attempts had zero cumulative evidence, but a sub-target nonzero accumulation must be reported accurately rather than omitted or called a partial position. The notification identity must distinguish repeated attempts for the same route and funding cycle without weakening route locking or existing lifecycle notification deduplication.
 
@@ -13,6 +13,8 @@ Acceptance:
 - The persisted runtime evidence and Telegram payload contain only sanitized bounded fields and never imply a fill, hedge, position, or realized PnL when none exists.
 - Regression tests prove exactly-once terminal notification per attempt, distinct notifications for repeated same-cycle attempts, and no cancellation notification after an atomic two-leg open.
 - Run focused/adverse tests and one clean isolated Python 3.11 full suite on the final candidate SHA. The active `chief36` PAPER process and its database remain untouched until independent Chief acceptance; any later replacement uses a fresh database.
+
+Accepted evidence: Builder candidate `87b1d0e88edbdd08a9d2ff587e04ae5352133ff7` was independently reviewed and integrated as main `560f6755a01fe2df80952f8b5e5efbdbabf66d49`. The clean integrated Python 3.11 suite passed `3593` tests with `3` skipped. Former `chief36` stopped `STOPPED_SAFE` at zero exposure and will not be resumed. Fresh `chief37` reached `PAPER_RUN_READY`, all four public venues ready, `128` routes, and zero orders, positions, fills, completed trades, or fatal events. Continue observation; the next genuine activation cancellation should produce both durable evidence and the new explicit Telegram outcome.
 
 ## Lighter public PAPER integration
 
@@ -243,7 +245,7 @@ Acceptance for this slice:
 
 ## Public PAPER restart and Telegram credential preservation
 
-The former `chief35` public-mainnet PAPER observation is stopped and its launchd label removed. Its owner-only database `mainnet-paper-live-20260831-chief35.db` has SQLite integrity `ok`, two durable `STOPPED_SAFE` rounds, and zero orders, positions, fills, or completed trades; preserve it and never resume or reuse it. Accepted main `5a3975ea44152d3863a83c59ab3255932a3aba2f` corrects Lighter public funding percentage normalization, mark-price cash, and exact once-only applied-boundary reconciliation. The single active replacement is PID `43755`, launchd label `com.risex.paper.chief36`, on fresh owner-only mode `0600` database `mainnet-paper-live-20260831-chief36.db`. It reached `PAPER_RUN_READY`; the first `LIVE_STREAM` scan has all `128` routes, all `48` Lighter directions, corrected cent-scale Lighter funding, zero exposure, zero completed trades, and no fatal event. Continue observation without starting a second instance or reusing any operational database.
+The former `chief36` public-mainnet PAPER observation is stopped and its launchd label removed. Its owner-only database `mainnet-paper-live-20260831-chief36.db` has SQLite integrity `ok`, durable `STOPPED_SAFE`, six cancelled attempts, and zero open orders, positions, fills, completed trades, funding settlements, or realized PnL; preserve it and never resume or reuse it. Accepted main `560f6755a01fe2df80952f8b5e5efbdbabf66d49` adds explicit no-fill cancellation outcomes and releases the broker after trade-time cancellation. The single active replacement is PID `98546`, launchd label `com.risex.paper.chief37`, on fresh owner-only mode `0600` database `mainnet-paper-live-20260831-chief37.db`. It reached `PAPER_RUN_READY`; all four public venues are ready, the current scan has all `128` routes, and exposure plus fatal events remain zero. Continue observation without starting a second instance or reusing any operational database.
 
 The authorized public-only all-route paper run on `mainnet-shadow-all-routes-20260827-chief12-2h.db` is complete. It ran from `2026-08-27T15:35:24Z` to the exact authorized `17:35:24Z` stop, reached durable `STOPPED_SAFE` at `17:36:14Z`, and ended with SQLite integrity `ok` and orders/fills/positions `0/0/0`. It is a bounded completed observation, not an active process and not permission to resume either this database or the old `chief11` database.
 
