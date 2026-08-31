@@ -106,6 +106,7 @@ class SyntheticGateway:
         ambiguous_kind: lifecycle.IntentKind | None = None,
         response_mismatch_kind: lifecycle.IntentKind | None = None,
         drop_after_accept_kind: lifecycle.IntentKind | None = None,
+        public_order_nonces: dict[lifecycle.IntentKind, int] | None = None,
     ) -> None:
         self.clock = clock
         self.funding_mode = funding_mode
@@ -113,6 +114,7 @@ class SyntheticGateway:
         self.ambiguous_kind = ambiguous_kind
         self.response_mismatch_kind = response_mismatch_kind
         self.drop_after_accept_kind = drop_after_accept_kind
+        self.public_order_nonces = dict(public_order_nonces or {})
         self.store: lifecycle.LifecycleStore | None = None
         self.discover_calls = 0
         self.market_calls: list[int] = []
@@ -186,6 +188,15 @@ class SyntheticGateway:
     ) -> lifecycle.OrderSnapshot:
         filled = request.quantity if status == "FILLED" else Decimal("0")
         price = request.price if fill_price is None else fill_price
+        kind = (
+            lifecycle.IntentKind.CLOSE
+            if request.reduce_only
+            else (
+                lifecycle.IntentKind.OPEN
+                if request.order_type == "market"
+                else lifecycle.IntentKind.MAKER_PLACE
+            )
+        )
         return lifecycle.OrderSnapshot(
             order_index=order_index,
             client_order_index=request.client_order_index,
@@ -200,7 +211,7 @@ class SyntheticGateway:
             order_type=request.order_type,
             time_in_force=request.time_in_force,
             reduce_only=request.reduce_only,
-            nonce=nonce,
+            nonce=self.public_order_nonces.get(kind, nonce),
             status=status,
         )
 
@@ -505,6 +516,7 @@ async def run_synthetic(
     ambiguous_kind: lifecycle.IntentKind | None = None,
     response_mismatch_kind: lifecycle.IntentKind | None = None,
     drop_after_accept_kind: lifecycle.IntentKind | None = None,
+    public_order_nonces: dict[lifecycle.IntentKind, int] | None = None,
 ) -> tuple[lifecycle.RunnerReport, SyntheticGateway, lifecycle.LifecycleStore]:
     clock = [0]
     gateway = SyntheticGateway(
@@ -514,6 +526,7 @@ async def run_synthetic(
         ambiguous_kind=ambiguous_kind,
         response_mismatch_kind=response_mismatch_kind,
         drop_after_accept_kind=drop_after_accept_kind,
+        public_order_nonces=public_order_nonces,
     )
     runner, store = make_runner(tmp_path, gateway, mode=mode)
     report = await runner.run()
@@ -657,6 +670,143 @@ async def test_generated_maker_open_close_client_indexes_fit_lighter_uint48(tmp_
         0 < row[1] <= lifecycle.LIGHTER_MAX_CLIENT_ORDER_INDEX for row in rows
     )
     store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kind",
+    [
+        lifecycle.IntentKind.MAKER_PLACE,
+        lifecycle.IntentKind.OPEN,
+        lifecycle.IntentKind.CLOSE,
+    ],
+)
+async def test_public_order_nonce_is_distinct_from_transaction_nonce_for_reconciliation(
+    tmp_path, kind
+):
+    public_order_nonce = 3_629_417
+    report, gateway, store = await run_synthetic(
+        tmp_path,
+        public_order_nonces={kind: public_order_nonce},
+    )
+
+    assert report.result is lifecycle.RunnerResult.COMPLETE
+    assert report.intent_count == 4
+    assert report.dispatch_count == 4
+    persisted = store._connection.execute(
+        "SELECT kind, nonce FROM intents ORDER BY rowid"
+    ).fetchall()
+    assert [(row[0], row[1]) for row in persisted] == [
+        ("MAKER_PLACE", 100),
+        ("MAKER_CANCEL", 101),
+        ("OPEN", 102),
+        ("CLOSE", 103),
+    ]
+    assert [row[1] for row in gateway.dispatches] == [100, 101, 102, 103]
+    if kind is lifecycle.IntentKind.MAKER_PLACE:
+        order = next(row for row in gateway.orders.values() if row.order_type == "limit")
+    elif kind is lifecycle.IntentKind.OPEN:
+        order = next(
+            row
+            for row in gateway.orders.values()
+            if row.order_type == "market" and not row.reduce_only
+        )
+    else:
+        order = next(row for row in gateway.orders.values() if row.reduce_only)
+    assert order.nonce == public_order_nonce
+    assert order.nonce not in {100, 101, 102, 103}
+    store.close()
+
+
+def _order_reconciliation_fixture():
+    request = lifecycle.OrderRequest(
+        market_id=MARKET_ID,
+        client_order_index=123,
+        quantity=Decimal("1"),
+        price=Decimal("10"),
+        is_ask=True,
+        order_type="market",
+        time_in_force="ioc",
+        reduce_only=False,
+        order_expiry=0,
+        size_decimals=0,
+        price_decimals=2,
+    )
+    intent = lifecycle.IntentSpec(
+        "open-reconciliation",
+        lifecycle.IntentKind.OPEN,
+        request,
+        None,
+        5,
+    )
+    order = lifecycle.OrderSnapshot(
+        order_index=700,
+        client_order_index=request.client_order_index,
+        account_index=ACCOUNT_INDEX,
+        market_id=MARKET_ID,
+        quantity=request.quantity,
+        remaining_quantity=Decimal("0"),
+        filled_quantity=request.quantity,
+        filled_quote=Decimal("10"),
+        price=request.price,
+        is_ask=request.is_ask,
+        order_type=request.order_type,
+        time_in_force=request.time_in_force,
+        reduce_only=request.reduce_only,
+        nonce=3_629_417,
+        status="FILLED",
+    )
+    snapshot = lifecycle.AccountSnapshot(
+        account_index=ACCOUNT_INDEX,
+        l1_address=ADDRESS,
+        collateral=Decimal("1000"),
+        maker_fee_tick=0,
+        taker_fee_tick=0,
+        orders=(order,),
+        positions=(),
+        fills=(),
+        funding_high_water=0,
+        unrelated_state_clear=True,
+        observed_at_ms=0,
+    )
+    return request, intent, order, snapshot
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("client_order_index", 124),
+        ("account_index", ACCOUNT_INDEX + 1),
+        ("market_id", MARKET_ID + 1),
+        ("quantity", Decimal("2")),
+        ("price", Decimal("10.1")),
+        ("is_ask", False),
+        ("order_type", "limit"),
+        ("time_in_force", "post_only"),
+        ("reduce_only", True),
+    ],
+)
+def test_find_order_rejects_every_non_nonce_order_field_mismatch(field, value):
+    _, intent, order, snapshot = _order_reconciliation_fixture()
+    mismatched = replace(order, **{field: value})
+
+    with pytest.raises(lifecycle.LifecycleHalt) as exc_info:
+        lifecycle._find_order(replace(snapshot, orders=(mismatched,)), intent)
+
+    assert exc_info.value.reason in {
+        "EXACT_ORDER_RECONCILIATION_FAILED",
+        "EXACT_ORDER_FIELDS_MISMATCH",
+    }
+
+
+def test_find_order_requires_a_unique_client_order_index_match():
+    _, intent, order, snapshot = _order_reconciliation_fixture()
+    duplicate = replace(order, order_index=701)
+
+    with pytest.raises(
+        lifecycle.LifecycleHalt, match="EXACT_ORDER_RECONCILIATION_FAILED"
+    ):
+        lifecycle._find_order(replace(snapshot, orders=(order, duplicate)), intent)
 
 
 @pytest.mark.parametrize(
@@ -1716,6 +1866,36 @@ async def test_official_reader_trigger_orders_fail_the_zero_order_gate():
     result = await adapter.readiness()
     assert result.status == "BLOCKED"
     assert result.reason == "ACTIVE_ORDERS_PRESENT"
+
+
+@pytest.mark.parametrize("nonce", [True, -1, "3"])
+async def test_official_reader_keeps_public_order_nonce_schema_validation(nonce):
+    apis = FakeOfficialApis()
+    apis.active_orders = [
+        SimpleNamespace(
+            order_index=700,
+            client_order_index=701,
+            owner_account_index=ACCOUNT_INDEX,
+            market_index=MARKET_ID,
+            initial_base_amount="1",
+            remaining_base_amount="1",
+            filled_base_amount="0",
+            filled_quote_amount="0",
+            price="3.8000",
+            is_ask=True,
+            type="limit",
+            time_in_force="post-only",
+            reduce_only=False,
+            nonce=nonce,
+            status="open",
+            trigger_price="0",
+            trigger_status="na",
+        )
+    ]
+    adapter = make_read_adapter(apis)
+
+    with pytest.raises(lifecycle.LifecycleHalt, match="ORDER_NONCE_INVALID"):
+        await adapter.snapshot(MARKET_ID)
 
 
 @pytest.mark.parametrize("kind", ["accounts", "trades", "funding"])

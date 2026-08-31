@@ -2407,6 +2407,8 @@ def _find_order(snapshot: AccountSnapshot, intent: IntentSpec) -> OrderSnapshot:
         raise LifecycleHalt("EXACT_ORDER_RECONCILIATION_FAILED", failure_class="SAFETY")
     order = matches[0]
     expected_market_id = request.market_id if request is not None else intent.market_id
+    # Lighter exposes Order.nonce as a venue order nonce, distinct from the
+    # API-key transaction nonce already sealed in the intent and dispatch.
     if (
         order.account_index != LIGHTER_ACCOUNT_INDEX
         or order.market_id != expected_market_id
@@ -2417,7 +2419,6 @@ def _find_order(snapshot: AccountSnapshot, intent: IntentSpec) -> OrderSnapshot:
             or order.order_type != request.order_type
             or order.time_in_force != request.time_in_force
             or order.reduce_only != request.reduce_only
-            or order.nonce != intent.nonce
         ))
     ):
         raise LifecycleHalt("EXACT_ORDER_FIELDS_MISMATCH", failure_class="SAFETY")
