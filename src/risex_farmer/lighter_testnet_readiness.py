@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import stat
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
@@ -158,6 +159,37 @@ class ApiKeyProvisioningPlan:
 
 
 @dataclass(frozen=True)
+class BootstrapAsset:
+    """A non-secret asset state accepted by the fixed testnet bootstrap gate."""
+
+    symbol: str
+    asset_id: int
+    balance: Decimal
+    locked_balance: Decimal
+    margin_balance: Decimal
+    margin_mode: str
+
+    def evidence(self) -> dict[str, Any]:
+        return {
+            "asset_id": self.asset_id,
+            "balance": str(self.balance),
+            "locked_balance": str(self.locked_balance),
+            "margin_balance": str(self.margin_balance),
+            "margin_mode": self.margin_mode,
+            "symbol": self.symbol,
+        }
+
+
+TESTNET_BOOTSTRAP_ASSET_BASELINE: tuple[BootstrapAsset, ...] = (
+    BootstrapAsset("ETH", 1, Decimal("3"), Decimal("0"), Decimal("0"), "disabled"),
+    BootstrapAsset(
+        "LIT", 2, Decimal("1000000"), Decimal("0"), Decimal("0"), "disabled"
+    ),
+    BootstrapAsset("USDC", 3, Decimal("0"), Decimal("0"), Decimal("10000"), "enabled"),
+)
+
+
+@dataclass(frozen=True)
 class AuthorizationCapability:
     """A protected header value paired with its non-secret account binding."""
 
@@ -201,6 +233,17 @@ def canonical_testnet_address(value: Any) -> str:
     if not _same_address(value, EXPECTED_L1_ADDRESS):
         raise ValueError("Lighter testnet public address does not match the fixed identity")
     return EXPECTED_L1_ADDRESS
+
+
+def canonical_api_public_key(value: Any) -> str:
+    """Normalize one operator-supplied non-secret API public key."""
+
+    if not isinstance(value, str) or not value:
+        raise ValueError("API public key is unavailable")
+    raw = value[2:] if value[:2].lower() == "0x" else value
+    if len(raw) != 64 or any(character not in "0123456789abcdefABCDEF" for character in raw):
+        raise ValueError("API public key is not a 32-byte hexadecimal key")
+    return "0x" + raw.lower()
 
 
 def _metadata_failure(path: Path, reason: str, *, present: bool = False) -> WalletMetadata:
@@ -464,6 +507,7 @@ class _GateState:
     identity_verified: bool = False
     authorization_identity_verified: bool = False
     api_key_verified: bool = False
+    api_key_public_key_verified: bool = False
     collateral_positive: bool = False
     fees_verified: bool = False
     active_orders_zero: bool = False
@@ -478,6 +522,8 @@ class _GateState:
     funding_count: int = 0
     asset_count: int = 0
     position_count: int = 0
+    bootstrap_asset_baseline_verified: bool = False
+    bootstrap_assets: tuple[BootstrapAsset, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -507,6 +553,9 @@ class ReadinessResult:
     funding_count: int
     asset_count: int
     position_count: int
+    api_key_public_key_verified: bool = False
+    bootstrap_asset_baseline_verified: bool = False
+    bootstrap_assets: tuple[BootstrapAsset, ...] = ()
     write_authority: str = NO_TESTNET_WRITE_AUTHORITY
 
     @property
@@ -520,6 +569,7 @@ class ReadinessResult:
                 "account_index": self.account_index,
                 "active_order_count": self.active_order_count,
                 "api_key_index": self.api_key_index,
+                "api_key_public_key_verified": self.api_key_public_key_verified,
                 "api_key_verified": self.api_key_verified,
                 "asset_count": self.asset_count,
                 "authorization_identity_verified": self.authorization_identity_verified,
@@ -528,6 +578,10 @@ class ReadinessResult:
                 "fees_verified": self.fees_verified,
                 "funding_count": self.funding_count,
                 "funding_history_read": self.funding_history_read,
+                "bootstrap_asset_baseline_verified": self.bootstrap_asset_baseline_verified,
+                "accepted_bootstrap_assets": [
+                    asset.evidence() for asset in self.bootstrap_assets
+                ],
                 "identity_verified": self.identity_verified,
                 "position_count": self.position_count,
                 "positions_flat": self.positions_flat,
@@ -569,6 +623,7 @@ def _result(
         identity_verified=state.identity_verified,
         authorization_identity_verified=state.authorization_identity_verified,
         api_key_verified=state.api_key_verified,
+        api_key_public_key_verified=state.api_key_public_key_verified,
         collateral_positive=state.collateral_positive,
         fees_verified=state.fees_verified,
         active_orders_zero=state.active_orders_zero,
@@ -583,6 +638,8 @@ def _result(
         funding_count=state.funding_count,
         asset_count=state.asset_count,
         position_count=state.position_count,
+        bootstrap_asset_baseline_verified=state.bootstrap_asset_baseline_verified,
+        bootstrap_assets=state.bootstrap_assets,
     )
 
 
@@ -691,6 +748,8 @@ def _get_json(
             raise _GateFailure("HTTP", "HTTP_STATUS_INVALID")
         if response.final_url is not None and response.final_url != request.url:
             raise _GateFailure("SAFETY", "FIXED_HOST_OR_REDIRECT_VIOLATION")
+        if response.status_code != 200:
+            raise _GateFailure("HTTP", "HTTP_STATUS_NON_200")
         try:
             payload = _require_mapping(_decode_json(response.body))
         except _GateFailure:
@@ -765,16 +824,27 @@ def _discover_account_index(
     else:
         raise _GateFailure("SAFETY", "DISCOVERY_PAGINATION_LIMIT")
 
-    if not indices or len(set(indices)) != len(indices):
+    if len(set(indices)) != len(indices):
         raise _GateFailure("IDENTITY", "DISCOVERY_ACCOUNT_INDEX_AMBIGUOUS")
     if expected_account_index is not None:
-        if expected_account_index not in indices:
+        matching = [index for index in indices if index == expected_account_index]
+        if not matching:
             raise _GateFailure("IDENTITY", "EXPECTED_ACCOUNT_INDEX_NOT_FOUND")
+        if len(matching) != 1:
+            raise _GateFailure("IDENTITY", "DISCOVERY_ACCOUNT_INDEX_AMBIGUOUS")
         return expected_account_index
-    return min(indices)
+    distinct_indices = set(indices)
+    if len(distinct_indices) != 1:
+        raise _GateFailure("IDENTITY", "DISCOVERY_ACCOUNT_INDEX_AMBIGUOUS")
+    return next(iter(distinct_indices))
 
 
-def _parse_api_key(payload: Mapping[str, Any], account_index: int, api_key_index: int) -> None:
+def _parse_api_key(
+    payload: Mapping[str, Any],
+    account_index: int,
+    api_key_index: int,
+    expected_api_public_key: str,
+) -> None:
     keys = _list(_require(payload, "api_keys"))
     matches = 0
     for item in keys:
@@ -786,8 +856,14 @@ def _parse_api_key(payload: Mapping[str, Any], account_index: int, api_key_index
         _integer(_require(row, "transaction_time"), nonnegative=True)
         if row_account == account_index and row_index == api_key_index:
             matches += 1
-            if nonce < 0 or not public_key:
+            if nonce < 0:
                 raise _GateFailure("AUTH", "API_KEY_METADATA_INVALID")
+            try:
+                normalized_public_key = canonical_api_public_key(public_key)
+            except ValueError:
+                raise _GateFailure("AUTH", "API_KEY_PUBLIC_KEY_INVALID")
+            if normalized_public_key != expected_api_public_key:
+                raise _GateFailure("AUTH", "API_KEY_PUBLIC_KEY_MISMATCH")
     if matches != 1:
         raise _GateFailure("AUTH", "API_KEY_NOT_PROVISIONED")
 
@@ -821,12 +897,11 @@ def _parse_positions_and_assets(
     cross_asset_value = _decimal(_require(account, "cross_asset_value"), nonnegative=True)
     if collateral <= 0 or total_asset_value <= 0 or cross_asset_value <= 0:
         raise _GateFailure("SAFETY", "COLLATERAL_NOT_POSITIVE")
-    state.collateral_positive = True
 
     shares = _list(_require(account, "shares"))
     if shares:
         raise _GateFailure("SAFETY", "UNRELATED_POOL_SHARES_PRESENT")
-    pool_info = _require(account, "pool_info")
+    pool_info = _optional(account, "pool_info")
     if pool_info is not None:
         raise _GateFailure("SAFETY", "UNRELATED_POOL_STATE_PRESENT")
     pending_unlocks = _list(_require(account, "pending_unlocks"))
@@ -872,7 +947,11 @@ def _parse_positions_and_assets(
     state.asset_count = len(assets)
     symbols: set[str] = set()
     asset_ids: set[int] = set()
-    quote_asset_count = 0
+    expected_assets = {asset.symbol: asset for asset in TESTNET_BOOTSTRAP_ASSET_BASELINE}
+    observed_assets: dict[str, BootstrapAsset] = {}
+    account_margin_balance = None
+    if "margin_balance" in account:
+        account_margin_balance = _decimal(account["margin_balance"], nonnegative=True)
     for item in assets:
         asset = _require_mapping(item)
         symbol = _string(_require(asset, "symbol"), nonempty=True)
@@ -888,14 +967,42 @@ def _parse_positions_and_assets(
             raise _GateFailure("SAFETY", "DUPLICATE_ACCOUNT_ASSET")
         symbols.add(symbol)
         asset_ids.add(asset_id)
-        if symbol == quote_symbol:
-            quote_asset_count += 1
-            if balance <= 0 or margin_balance <= 0 or not _zero(locked_balance):
-                raise _GateFailure("SAFETY", "QUOTE_COLLATERAL_STATE_INVALID")
-        elif not (_zero(balance) and _zero(locked_balance) and _zero(margin_balance)):
-            raise _GateFailure("SAFETY", "UNRELATED_ASSET_BALANCE_PRESENT")
-    if quote_asset_count != 1:
-        raise _GateFailure("SAFETY", "QUOTE_ASSET_NOT_UNIQUE")
+        expected = expected_assets.get(symbol)
+        if expected is None:
+            raise _GateFailure("SAFETY", "UNKNOWN_BOOTSTRAP_ASSET")
+        observed = BootstrapAsset(
+            symbol=symbol,
+            asset_id=asset_id,
+            balance=balance,
+            locked_balance=locked_balance,
+            margin_balance=margin_balance,
+            margin_mode=margin_mode,
+        )
+        if observed != expected:
+            raise _GateFailure("SAFETY", "BOOTSTRAP_ASSET_BASELINE_MISMATCH")
+        observed_assets[symbol] = observed
+
+    if set(observed_assets) != set(expected_assets):
+        raise _GateFailure("SAFETY", "BOOTSTRAP_ASSET_BASELINE_MISMATCH")
+    if quote_symbol != USDC_SYMBOL:
+        raise _GateFailure("SAFETY", "QUOTE_SYMBOL_NOT_FIXED")
+    quote_asset = observed_assets[USDC_SYMBOL]
+    if (
+        quote_asset.margin_balance <= 0
+        or collateral != quote_asset.margin_balance
+        or total_asset_value != quote_asset.margin_balance
+        or cross_asset_value != quote_asset.margin_balance
+        or (
+            account_margin_balance is not None
+            and account_margin_balance != quote_asset.margin_balance
+        )
+    ):
+        raise _GateFailure("SAFETY", "COLLATERAL_VALUES_MISMATCH")
+    state.collateral_positive = True
+    state.bootstrap_assets = tuple(
+        observed_assets[baseline.symbol] for baseline in TESTNET_BOOTSTRAP_ASSET_BASELINE
+    )
+    state.bootstrap_asset_baseline_verified = True
     state.unrelated_state_clear = True
 
 
@@ -1228,6 +1335,7 @@ def run_level_b(
     wallet: WalletMetadata | None = None,
     expected_account_index: int | None = None,
     api_key_index: int = FIRST_USER_API_KEY_INDEX,
+    expected_api_public_key: str | None = None,
     authorization_loader: Callable[[], AuthorizationCapability | None] | None = None,
     quote_symbol: str = USDC_SYMBOL,
 ) -> ReadinessResult:
@@ -1262,6 +1370,9 @@ def run_level_b(
         )
         if plan.api_key_index != api_key_index:
             raise ValueError("API-key plan mismatch")
+        normalized_expected_api_public_key = canonical_api_public_key(expected_api_public_key)
+        if quote_symbol != USDC_SYMBOL:
+            raise ValueError("quote symbol is not the fixed testnet quote")
     except ValueError:
         return blocked_local_result(
             "READINESS_CONFIGURATION_INVALID",
@@ -1302,8 +1413,14 @@ def run_level_b(
             "/api/v1/apikeys",
             [("account_index", str(state.account_index)), ("api_key_index", str(api_key_index))],
         )
-        _parse_api_key(payload, state.account_index, api_key_index)
+        _parse_api_key(
+            payload,
+            state.account_index,
+            api_key_index,
+            normalized_expected_api_public_key,
+        )
         state.api_key_verified = True
+        state.api_key_public_key_verified = True
 
         payload = _request(
             transport,
@@ -1439,22 +1556,63 @@ def _load_fixture(
 
 _SENSITIVE_FIXTURE_FIELDS = frozenset(
     {
+        "auth",
+        "auth_header",
+        "auth_value",
         "authorization",
+        "authorization_header",
+        "authorization_token",
+        "authorization_value",
         "auth_token",
         "access_token",
         "api_key",
+        "bearer",
+        "bearer_token",
+        "header_value",
+        "jwt",
+        "jwt_token",
+        "mnemonic",
+        "passphrase",
         "password",
         "private_key",
         "secret",
+        "secret_key",
+        "seed",
+        "seed_phrase",
+        "session_token",
+        "token",
         "wallet_private_key",
     }
 )
+_SENSITIVE_FIXTURE_FIELDS_COMPACT = frozenset(
+    field.replace("_", "") for field in _SENSITIVE_FIXTURE_FIELDS
+)
+
+
+def _normalize_fixture_field_name(key: str) -> str:
+    key = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", key)
+    return re.sub(r"[^A-Za-z0-9]+", "_", key).strip("_").lower()
+
+
+def _is_sensitive_fixture_field(key: str) -> bool:
+    normalized = _normalize_fixture_field_name(key)
+    compact = normalized.replace("_", "")
+    if normalized in _SENSITIVE_FIXTURE_FIELDS or compact in _SENSITIVE_FIXTURE_FIELDS_COMPACT:
+        return True
+    if normalized.startswith(("auth_", "authorization_")) or compact.startswith(
+        ("auth", "authorization")
+    ):
+        return any(
+            marker in normalized
+            for marker in ("header", "token", "secret", "value")
+        )
+    return False
 
 
 def _reject_sensitive_fixture_fields(value: Any) -> None:
     if isinstance(value, Mapping):
         for key, child in value.items():
-            if isinstance(key, str) and key.lower() in _SENSITIVE_FIXTURE_FIELDS:
+            if isinstance(key, str) and _is_sensitive_fixture_field(key):
                 raise ValueError("FIXTURE_CONTAINS_SENSITIVE_FIELD")
             _reject_sensitive_fixture_fields(child)
     elif isinstance(value, list):
@@ -1471,6 +1629,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=Path,
         help="local JSON response fixture; no live transport is available",
     )
+    parser.add_argument(
+        "--expected-api-public-key",
+        help="operator-supplied non-secret API public key for exact verification",
+    )
+    parser.add_argument(
+        "--expected-account-index",
+        type=int,
+        help="operator-supplied exact account index when the wallet names multiple accounts",
+    )
     args = parser.parse_args(argv)
 
     wallet = inspect_protected_wallet()
@@ -1484,6 +1651,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = run_level_b(
                 transport,
                 wallet=wallet,
+                expected_account_index=args.expected_account_index,
+                expected_api_public_key=args.expected_api_public_key,
                 authorization_loader=authorization_loader,
             )
         except (_GateFailure, ValueError):
@@ -1497,6 +1666,7 @@ __all__ = [
     "AccountCreationPlan",
     "AuthorizationCapability",
     "ApiKeyProvisioningPlan",
+    "BootstrapAsset",
     "EXPECTED_L1_ADDRESS",
     "FIRST_USER_API_KEY_INDEX",
     "FixtureReadTransport",
@@ -1509,6 +1679,7 @@ __all__ = [
     "ReadResponse",
     "ReadinessResult",
     "TESTNET_API_URL",
+    "TESTNET_BOOTSTRAP_ASSET_BASELINE",
     "TESTNET_CHAIN_ID",
     "TESTNET_WS_URL",
     "TESTNET_WALLET_PATH",
@@ -1518,6 +1689,7 @@ __all__ = [
     "build_account_creation_plan",
     "build_api_key_provisioning_plan",
     "canonical_testnet_address",
+    "canonical_api_public_key",
     "inspect_protected_wallet",
     "main",
     "parse_market_contract",
