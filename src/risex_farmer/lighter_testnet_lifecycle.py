@@ -72,6 +72,7 @@ FUNDING_SETTLEMENT_WINDOW_SECONDS = 30.0
 FUNDING_POLL_INTERVAL_SECONDS = 2.0
 
 _HEX_HASH = re.compile(r"^0x[0-9a-fA-F]{64}$")
+_LIGHTER_TRANSACTION_HASH = re.compile(r"^[0-9a-fA-F]{80}$")
 _SAFE_ID = re.compile(r"^[A-Za-z0-9._:-]{1,160}$")
 _SENSITIVE_KEYS = frozenset(
     {
@@ -206,8 +207,10 @@ def _digest(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
-def _safe_hash(value: Any) -> str | None:
-    if isinstance(value, str) and _HEX_HASH.fullmatch(value):
+def _safe_lighter_transaction_hash(value: Any) -> str | None:
+    """Validate the canonical 80-hex-character Lighter transaction hash."""
+
+    if isinstance(value, str) and _LIGHTER_TRANSACTION_HASH.fullmatch(value):
         return value.lower()
     return None
 
@@ -2343,7 +2346,7 @@ class SdkLighterGateway:
         # those fields with None even after a successful HTTP response.  Do
         # not inspect or serialize it; the runner must reconcile the exact
         # client order from authoritative account state after this boundary.
-        tx_hash = _safe_hash(getattr(response, "tx_hash", None))
+        tx_hash = _safe_lighter_transaction_hash(getattr(response, "tx_hash", None))
         if tx_hash is None:
             return DispatchOutcome(accepted=False, rejected=True, error_class="SDK_REJECTED")
         return DispatchOutcome(
@@ -2379,7 +2382,7 @@ class SdkLighterGateway:
         # As with create_order, the parsed cancel object can contain None for
         # fields whose JSON names are stale in the pinned SDK.  Exact target
         # disappearance and zero-order reconciliation is authoritative.
-        tx_hash = _safe_hash(getattr(response, "tx_hash", None))
+        tx_hash = _safe_lighter_transaction_hash(getattr(response, "tx_hash", None))
         if tx_hash is None:
             return DispatchOutcome(accepted=False, rejected=True, error_class="SDK_REJECTED")
         return DispatchOutcome(

@@ -21,6 +21,7 @@ API_KEY_INDEX = 4
 PUBLIC_KEY = "0x" + "11" * 40
 MARKET_ID = 987
 HOUR = lifecycle.HOURLY_FUNDING_INTERVAL_MS
+LIGHTER_TRANSACTION_HASH = "ab" * 40
 
 
 def identity() -> lifecycle.IdentityMetadata:
@@ -271,7 +272,7 @@ class SyntheticGateway:
         return lifecycle.DispatchOutcome(
             accepted=True,
             order_index=order_index,
-            tx_hash="0x" + "12" * 32,
+            tx_hash="12" * 40,
         )
 
     async def cancel_order(
@@ -294,7 +295,7 @@ class SyntheticGateway:
         self.dispatches.append(("MAKER_CANCEL", nonce, api_key_index, False, order.is_ask))
         return lifecycle.DispatchOutcome(
             accepted=True,
-            tx_hash="0x" + "13" * 32,
+            tx_hash="13" * 40,
         )
 
     async def funding_history(
@@ -785,7 +786,7 @@ async def test_sdk_dispatch_accepts_observed_stale_parsed_transaction_fields():
                     order_type=None,
                     nonce=None,
                 ),
-                SimpleNamespace(code=200, tx_hash="0x" + "21" * 32),
+                SimpleNamespace(code=200, tx_hash="21" * 40),
                 None,
             )
 
@@ -798,7 +799,7 @@ async def test_sdk_dispatch_accepts_observed_stale_parsed_transaction_fields():
                     order_nonce=None,
                     nonce=None,
                 ),
-                SimpleNamespace(code=200, tx_hash="0x" + "22" * 32),
+                SimpleNamespace(code=200, tx_hash="22" * 40),
                 None,
             )
 
@@ -843,6 +844,8 @@ async def test_sdk_dispatch_accepts_observed_stale_parsed_transaction_fields():
         api_key_index=API_KEY_INDEX,
     )
     assert created.accepted and cancelled.accepted
+    assert created.tx_hash == "21" * 40
+    assert cancelled.tx_hash == "22" * 40
     assert signer.create_kwargs["api_key_index"] == API_KEY_INDEX
     assert signer.create_kwargs["nonce"] == 33
     assert signer.create_kwargs["skip_nonce"] == 0
@@ -862,11 +865,11 @@ async def test_sdk_none_parsed_transaction_is_rejected(operation):
 
         async def create_order(self, **_kwargs):
             self.calls += 1
-            return None, SimpleNamespace(code=200, tx_hash="0x" + "23" * 32), None
+            return None, SimpleNamespace(code=200, tx_hash="23" * 40), None
 
         async def cancel_order(self, **_kwargs):
             self.calls += 1
-            return None, SimpleNamespace(code=200, tx_hash="0x" + "24" * 32), None
+            return None, SimpleNamespace(code=200, tx_hash="24" * 40), None
 
     async def unused(*_args, **_kwargs):
         raise AssertionError("not a dispatch read")
@@ -971,7 +974,7 @@ async def test_sdk_stale_parsed_fields_then_authoritative_create_and_cancel_reco
                     order_type=None,
                     nonce=None,
                 ),
-                SimpleNamespace(code=200, tx_hash="0x" + "31" * 32),
+                SimpleNamespace(code=200, tx_hash="31" * 40),
                 None,
             )
 
@@ -993,7 +996,7 @@ async def test_sdk_stale_parsed_fields_then_authoritative_create_and_cancel_reco
                     order_nonce=None,
                     nonce=None,
                 ),
-                SimpleNamespace(code=200, tx_hash="0x" + "32" * 32),
+                SimpleNamespace(code=200, tx_hash="32" * 40),
                 None,
             )
 
@@ -1051,13 +1054,55 @@ async def test_sdk_stale_parsed_fields_then_authoritative_create_and_cancel_reco
     store.close()
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("0" * 80, "0" * 80),
+        ("A" * 80, "a" * 80),
+        ("0123456789abcdef" * 5, "0123456789abcdef" * 5),
+    ],
+)
+def test_lighter_transaction_hash_validator_accepts_exact_80_hex(value, expected):
+    assert lifecycle._safe_lighter_transaction_hash(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        123,
+        b"a" * 80,
+        "",
+        "a" * 79,
+        "a" * 81,
+        "0x" + "a" * 64,
+        "0x" + "a" * 80,
+        "0X" + "a" * 78,
+        "a" * 64,
+        "a" * 40 + "g" + "a" * 39,
+        "a" * 40 + "0x" + "a" * 38,
+        "a" * 79 + "\n",
+    ],
+)
+def test_lighter_transaction_hash_validator_rejects_previous_and_invalid_shapes(value):
+    assert lifecycle._safe_lighter_transaction_hash(value) is None
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("response_code", "error", "tx_hash"),
     [
-        (400, None, "0x" + "41" * 32),
-        (200, "sdk-error", "0x" + "42" * 32),
+        (400, None, LIGHTER_TRANSACTION_HASH),
+        (200, "sdk-error", LIGHTER_TRANSACTION_HASH),
         (200, None, ""),
+        (200, None, "0x" + "41" * 32),
+        (200, None, "41" * 32),
+        (200, None, "0x" + "41" * 40),
+        (200, None, "41" * 39),
+        (200, None, "41" * 41),
+        (200, None, "41" * 40 + "g"),
+        (200, None, "41" * 40 + "0x"),
+        (200, None, None),
     ],
 )
 async def test_sdk_rejection_or_unsafe_hash_blocks_without_replay(
