@@ -86,10 +86,9 @@ class LighterAdapter(PublicAdapter):
 
     async def fetch_markets(self) -> tuple[CanonicalMarket, ...]:
         payload = await self._get_json("/api/v1/orderBookDetails", params={"filter": "perp"})
-        # The official response has both arrays.  Requiring the spot array too
-        # prevents a partial response from being mistaken for a complete catalog.
+        # The perp filter makes order_book_details the required catalog.  The
+        # unrelated spot field may be omitted or non-array in this response.
         rows = self._response_rows(payload, "order_book_details")
-        require_list(require_mapping(payload, "response").get("spot_order_book_details"), "spot_order_book_details")
         row_ids = tuple(
             self._integer(require_mapping(row, "order_book_details row").get("market_id"), "market_id")
             for row in rows

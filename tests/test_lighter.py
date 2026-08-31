@@ -149,7 +149,7 @@ async def test_lighter_rest_contracts_normalize_metadata_volume_and_book_async(m
     details = {
         "code": 200,
         "order_book_details": [market_row()],
-        "spot_order_book_details": [],
+        "future_catalog_field": {"ignored": True},
     }
     calls = []
 
@@ -188,6 +188,67 @@ async def test_lighter_rest_contracts_normalize_metadata_volume_and_book_async(m
         ("/api/v1/orderBookDetails", {"filter": "perp"}),
         ("/api/v1/orderBookOrders", {"market_id": "0", "limit": "250"}),
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "error"),
+    (
+        ({"code": 200}, "order_book_details must be an array"),
+        ({"code": 200, "order_book_details": {}}, "order_book_details must be an array"),
+        ({"code": 500, "order_book_details": [market_row()]}, "not successful"),
+        ({"code": 200, "order_book_details": [None]}, "order_book_details row must be an object"),
+        (
+            {"code": 200, "order_book_details": [market_row(market_id=None)]},
+            "market_id must be an integer",
+        ),
+        (
+            {"code": 200, "order_book_details": [market_row(market_config=None)]},
+            "market_config must be an object",
+        ),
+    ),
+)
+async def test_lighter_perp_catalog_rejects_missing_or_malformed_required_data(
+    monkeypatch, payload, error
+):
+    adapter = LighterAdapter(object())
+
+    async def get_json(path, *, params=None):
+        assert path == "/api/v1/orderBookDetails"
+        assert params == {"filter": "perp"}
+        return payload
+
+    monkeypatch.setattr(adapter, "_get_json", get_json)
+    with pytest.raises((TypeError, ValueError), match=error):
+        await adapter.fetch_markets()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("change", "blocker"),
+    (
+        ({"market_type": "spot"}, "LIGHTER_MARKET_NOT_PERPETUAL"),
+        ({"quote_asset_id": 3}, "LIGHTER_QUOTE_ASSET_NOT_USDC"),
+    ),
+)
+async def test_lighter_perp_catalog_keeps_unsafe_metadata_fail_closed(
+    monkeypatch, change, blocker
+):
+    adapter = LighterAdapter(object())
+    payload = {"code": 200, "order_book_details": [market_row(**change)]}
+
+    async def get_json(path, *, params=None):
+        return payload
+
+    monkeypatch.setattr(adapter, "_get_json", get_json)
+    markets = await adapter.fetch_markets()
+
+    assert len(markets) == 1
+    market = markets[0]
+    assert blocker in market.evidence_blockers
+    assert market.contract_type is ContractType.OTHER
+    assert market.base_multiplier is None
+    assert not market.is_active
 
 
 @pytest.mark.parametrize(
