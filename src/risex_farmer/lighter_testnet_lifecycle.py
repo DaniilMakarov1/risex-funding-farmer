@@ -64,6 +64,7 @@ MAX_PAGES = 256
 MAX_PRIVATE_FILE_BYTES = 8192
 MAX_PUBLIC_IDENTITY_BYTES = 32_768
 MAX_WIRE_INTEGER = (1 << 63) - 1
+LIGHTER_MAX_CLIENT_ORDER_INDEX = (1 << 48) - 1
 MAX_MARKET_DECIMALS = 18
 TERMINAL_ROUND_MAX_AGE_MS = 10_000
 SDK_READ_TIMEOUT_SECONDS = 30.0
@@ -714,7 +715,7 @@ class OrderRequest:
             or self.market_id < 0
             or isinstance(self.client_order_index, bool)
             or not isinstance(self.client_order_index, int)
-            or self.client_order_index <= 0
+            or not 0 < self.client_order_index <= LIGHTER_MAX_CLIENT_ORDER_INDEX
         ):
             raise LifecycleHalt("ORDER_ID_INVALID", failure_class="SCHEMA")
         quantity = _decimal(self.quantity, "ORDER_QUANTITY", positive=True)
@@ -1254,6 +1255,12 @@ def smallest_executable_quantity(market: MarketObservation, *, is_ask: bool) -> 
 
 def _new_id(prefix: str) -> str:
     return f"{prefix}-{uuid4().hex}"
+
+
+def _new_client_order_index() -> int:
+    """Generate an unpredictable positive client order index accepted by Lighter."""
+
+    return int(uuid4().int & LIGHTER_MAX_CLIENT_ORDER_INDEX) or 1
 
 
 class SdkSecretLogFilter(logging.Filter):
@@ -2663,7 +2670,7 @@ class LighterLevelCRunner:
         maker_price = market.best_ask if maker_is_ask else market.best_bid
         request = OrderRequest(
             market_id=market.market_id,
-            client_order_index=int(uuid4().int & ((1 << 62) - 1)) or 1,
+            client_order_index=_new_client_order_index(),
             quantity=self._quantity or Decimal(0),
             price=maker_price,
             is_ask=maker_is_ask,
@@ -2749,7 +2756,7 @@ class LighterLevelCRunner:
             raise LifecycleHalt("OPEN_QUANTITY_CHANGED_BEFORE_WRITE", failure_class="SAFETY")
         request = OrderRequest(
             market_id=market.market_id,
-            client_order_index=int(uuid4().int & ((1 << 62) - 1)) or 1,
+            client_order_index=_new_client_order_index(),
             quantity=quantity,
             price=worst,
             is_ask=is_ask,
@@ -2885,7 +2892,7 @@ class LighterLevelCRunner:
             quantity = abs(position.signed_quantity)
         request = OrderRequest(
             market_id=market.market_id,
-            client_order_index=int(uuid4().int & ((1 << 62) - 1)) or 1,
+            client_order_index=_new_client_order_index(),
             quantity=quantity,
             price=worst,
             is_ask=close_is_ask,
