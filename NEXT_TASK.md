@@ -2,7 +2,7 @@
 
 ## Lighter public PAPER integration
 
-Status: `ACCEPTED — LEVEL-A PUBLIC PAPER COMPLETE; FRESH CHIEF35 PAPER RUNTIME ACTIVE; TESTNET TERMINAL AND ISOLATED`.
+Status: `ACCEPTED — LEVEL-A PUBLIC PAPER COMPLETE; FRESH CHIEF36 PAPER RUNTIME ACTIVE; TESTNET TERMINAL AND ISOLATED`.
 
 Objective: maintain Lighter in the normal public PAPER product with the smallest venue-local adapter and minimum central wiring that reuse the accepted architecture. Use only official public Lighter contracts. Keep the dynamic `RISEx ∩ Lighter` universe, canonical perpetual metadata/parity, volume, exact sequence-bearing book depth, aggregate future-funding statistics, and maker-leg trade evidence required by the fixed execution profile. Configure the official Standard tier as maker `0` / taker `0`; do not query account tier per scan. Preserve the existing immediate exact-quantity virtual-taker assumption and do not model the documented Standard-account delay.
 
@@ -23,7 +23,29 @@ Status: `COMPLETE — AUTHORITATIVE FUNDING RECORDED; ZERO ORDERS; EXACT FLAT; N
 
 Terminal evidence: exact testnet account `202`, API-key index `4`, and market `120` completed the accepted maker-place/cancel path, then opened short `2.79 LIT` under order `34058472185700930` / trade `260361`. The position was authoritatively held through boundary `1788184800000`; exact account funding is `+0.000121` test USDC at rate `0.000012`. One fresh reduce-only close dispatched exactly once; its immediate read was ambiguous and was never replayed. Later authoritative order/fill evidence resolved close order `34339947154989401` / trade `266054` as exact `2.79 @ 3.6023`, and two new agreeing terminal rounds prove zero regular/trigger orders, exact flatness, no unrelated state, and no unresolved write identity. Final journal `/Users/daniilmakarov/.config/risex-farmer/lighter-testnet/level-c-terminal-evidence-chief80.db` is mode `0600`, integrity `ok`, SHA-256 `454a1c087e45e0e3a96343598f95643296d6fa5000f0971db8290870760be0c5`.
 
-Accepted published main `271bdb24a6ea4ec0f9d1a63188ed954cc8a8d638` normalizes the observed official `PositionFunding.timestamp` seconds value into the lifecycle's millisecond boundary contract with strict ambiguous/future/overflow rejection. Independent Chief verification passed `10` focused tests and the clean Python 3.11 full suite with `3545` passed / `3` skipped. This slice is closed. Preserve every source, continuation, blocked pre-write, and terminal journal; do not resume, repair, delete, or reuse them. No additional Lighter testnet write, Lighter mainnet credential, private mainnet access, signing, order, transfer, withdrawal, or strategy execution is authorized.
+Accepted published main `271bdb24a6ea4ec0f9d1a63188ed954cc8a8d638` normalizes the observed official `PositionFunding.timestamp` seconds value into the lifecycle's millisecond boundary contract with strict ambiguous/future/overflow rejection. Independent Chief verification passed `10` focused tests and the clean Python 3.11 full suite with `3545` passed / `3` skipped. This slice is closed. Preserve every source, continuation, blocked pre-write, and terminal journal; do not resume, repair, delete, or reuse them. No additional Lighter testnet write is authorized. Lighter mainnet is governed only by the separate bounded slice below; testnet credentials, identities, quantities, and journals confer no mainnet readiness or write authority.
+
+## Lighter mainnet onboarding and one bounded manual lifecycle
+
+Status: `AUTHORIZED FOR OFFICIAL-CONTRACT REVIEW, PROTECTED ONBOARDING, AND EXACT-ACCOUNT READINESS; WRITE PHASE BLOCKED ON LIGHTER-SPECIFIC POSITIVE ABSOLUTE CAPS AND ALL SAFETY GATES`.
+
+Objective: establish the smallest isolated Lighter mainnet Level-D path for the user's exact funded account, then, only after every gate below passes, perform exactly one manual smallest-executable lifecycle: one opening order, authoritative exact-identity reconciliation, one accepted reduce-only close of the fresh exact position, and two fresh agreeing terminal rounds proving zero relevant regular/trigger orders and exact flatness. The user's prior UI order and reported closure are context only, never clean-account evidence.
+
+Current bounded actions:
+
+- Independently verify current official Lighter mainnet chain/host, SDK/API authentication and key-registration contracts, account/API-key identity and fee tier, private read and authoritative reconciliation surfaces, order/trigger/trade/funding/position schemas, executable minimum/step/tick, reduce-only close contract, and the accepted testnet runner's reusable venue-local safety semantics. Do not assume testnet hosts, account indices, market IDs, keys, fees, or quantities apply to mainnet.
+- Prefer a narrower persistent API/session key. Retain a main wallet key only if current official evidence proves it is required to register or recover that signer and no narrower persistent credential can authoritatively reconcile and close the lifecycle.
+- Provision secrets only through a local visible no-echo launcher that atomically writes to a fixed Lighter-mainnet path outside the repository with owner-only directory/file modes, no symlink/hardlink, bounded size, and no secret output. Governance may record only the protected path contract, mode, sanitized public identity, and safe fingerprint.
+- Run bounded Level-B exact-account reads proving chain/host, wallet/account/API-key identity, tier and fees, collateral/assets, regular and trigger orders, positions, trades and funding history, current market metadata and liquidity, unrelated-state policy, and authoritative close readiness. Any existing position/order, unrelated state, semantic contradiction, or ambiguous history stops before a write.
+
+Write phase gates:
+
+- Before any signing-payload preparation, signing, or dispatch, the user must supply positive absolute Lighter-specific `maximum_deposit_or_collateral` and `maximum_total_loss` caps. No cap from RISEx, Extended, Nado, PAPER, or testnet is inherited. The exact smallest executable lifecycle must fit both caps.
+- Persist a fresh durable runtime identity and a distinct fresh write-intent identity before every dispatch. Writes are sequential. An ambiguous response is reconciled authoritatively and is never blindly replayed.
+- Bind the exact mainnet account, market, side, quantity, price/slippage bound, fee tier, collateral, order identity, fill identity, position delta, and close semantics before opening. Never touch unrelated state or increase an existing position.
+- Close only the fresh authoritative exact position quantity through the accepted reduce-only path. Completion requires authoritative entry/close reconciliation, two fresh agreeing terminal rounds, zero relevant regular/trigger orders, exact flatness, no unrelated mutation, and no unresolved write identity.
+
+Forbidden scope: strategy or automatic trading, a second lifecycle, another wallet/account, transfer/deposit/withdrawal action by the agent, position increase, account-wide cancellation, blind replay, mainnet PAPER coupling, generic OMS/framework work, or any reuse/resume of Lighter testnet operational databases. The active public PAPER remains a separate read-only process and must not be restarted merely for this slice.
 
 ## Mainnet protected credential onboarding and exact-account reads
 
