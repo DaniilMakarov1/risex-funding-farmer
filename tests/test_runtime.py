@@ -49,6 +49,7 @@ from risex_farmer.notifications import (
 )
 from risex_farmer.runtime import PublicPaperRuntime, public_paper_run, public_scan_once
 from risex_farmer.orchestrator import run_fixture
+from risex_farmer.paper_broker import PaperEntryBroker
 from risex_farmer.scanner import MarketObservation, ScanSnapshot
 from risex_farmer.storage import PaperRepository
 
@@ -224,6 +225,35 @@ class LighterStreamAdapter(LighterAdapter):
             (BookLevel(D("101"), D("20")),),
             self.clock.now(),
             1,
+        )
+
+
+class BoundaryLighterAdapter(LighterStreamAdapter):
+    def __init__(self, clock: FakeClock, market, initial_stats) -> None:
+        super().__init__(clock)
+        self.market = market
+        self.initial_stats = initial_stats
+
+    async def fetch_markets(self):
+        return (self.market,)
+
+    async def fetch_volumes(self):
+        return (
+            MarketVolume(
+                Venue.LIGHTER,
+                self.market.venue_symbol,
+                D("1000000"),
+                self.clock.now(),
+                "official-public-test-shape",
+            ),
+        )
+
+    async def fetch_funding_quote(self, market, *, assumed_open_at):
+        return self.normalize_market_stats_message(
+            self.initial_stats,
+            market,
+            received_at=self.clock.now(),
+            assumed_open_at=assumed_open_at,
         )
 
 
@@ -604,7 +634,10 @@ def lighter_order_book_snapshot(*, timestamp: int, nonce: int = 1) -> dict[str, 
     }
 
 
-def lighter_market_stats_all_snapshot(*, timestamp: int) -> dict[str, object]:
+def lighter_market_stats_all_snapshot(
+    *, timestamp: int, funding_timestamp: int | None = None
+) -> dict[str, object]:
+    funding_timestamp = timestamp + 1 if funding_timestamp is None else funding_timestamp
     return {
         "type": "subscribed/market_stats",
         "channel": "market_stats:all",
@@ -613,11 +646,32 @@ def lighter_market_stats_all_snapshot(*, timestamp: int) -> dict[str, object]:
             "1": {
                 "symbol": "ETH",
                 "market_id": 1,
-                "index_price": "100",
+                "mark_price": "100",
                 "last_trade_price": "100",
                 "current_funding_rate": "0.001",
                 "funding_rate": "0.0005",
-                "funding_timestamp": timestamp + 1,
+                "funding_timestamp": funding_timestamp,
+            },
+        },
+    }
+
+
+def lighter_market_stats_all_update(
+    *, timestamp: int, funding_timestamp: int, current_rate: str,
+    applied_rate: str, mark_price: str = "0.004350",
+) -> dict[str, object]:
+    return {
+        "type": "update/market_stats",
+        "channel": "market_stats:all",
+        "timestamp": timestamp,
+        "market_stats": {
+            "1": {
+                "symbol": "ETH",
+                "market_id": 1,
+                "mark_price": mark_price,
+                "current_funding_rate": current_rate,
+                "funding_rate": applied_rate,
+                "funding_timestamp": funding_timestamp,
             },
         },
     }
@@ -687,6 +741,133 @@ async def test_lighter_combined_stream_bootstraps_from_authoritative_subscriptio
     assert not observation.trade_stream_ready
     assert observation.funding is not None
     assert observation.funding.quality is FundingQuality.PREDICTED
+
+
+@pytest.mark.asyncio
+async def test_lighter_market_stats_boundary_applies_once_and_keeps_next_prediction(
+    tmp_path,
+):
+    clock = FakeClock(NOW + timedelta(minutes=59))
+    boundary = NOW + timedelta(hours=1)
+    initial_timestamp = int(clock.now().timestamp() * 1000)
+    initial_stats = lighter_market_stats_all_snapshot(
+        timestamp=initial_timestamp,
+        funding_timestamp=int(NOW.timestamp() * 1000),
+    )
+    lighter_market = CanonicalMarket(
+        "ETH", Venue.LIGHTER, "ETH", MarketType.PERPETUAL,
+        ContractType.LINEAR, D("1"), "USDC", "USDC", D("1"), D("1"),
+        D("1"), D("10"), None, True, False, False,
+    )
+    lighter = BoundaryLighterAdapter(clock, lighter_market, initial_stats)
+    risex = FakeAdapter(
+        Venue.RISEX, clock, settlement_at=boundary, funding_cash="5"
+    )
+    risex.market = replace(
+        risex.market, canonical_asset="ETH", venue_symbol="ETH-RISEX"
+    )
+    update = lighter_market_stats_all_update(
+        timestamp=int((boundary + timedelta(seconds=1)).timestamp() * 1000),
+        funding_timestamp=int(boundary.timestamp() * 1000),
+        current_rate="0.0074",
+        applied_rate="0.0053",
+    )
+    stale = lighter_market_stats_all_update(
+        timestamp=int((boundary + timedelta(seconds=2)).timestamp() * 1000),
+        funding_timestamp=int(NOW.timestamp() * 1000),
+        current_rate="0.0001",
+        applied_rate="0.0001",
+    )
+
+    class AdvancingLighterSocket(LighterTextWebSocket):
+        def __init__(self, stop_event, payloads) -> None:
+            super().__init__(stop_event, payloads)
+            self.index = 0
+
+        async def __anext__(self):
+            if self.index == 2:
+                clock.value = boundary + timedelta(seconds=1)
+            message = await super().__anext__()
+            self.index += 1
+            return message
+
+    stop = asyncio.Event()
+    websocket = AdvancingLighterSocket(
+        stop,
+        (
+            lighter_order_book_snapshot(timestamp=initial_timestamp),
+            initial_stats,
+            update,
+            stale,
+            update,
+        ),
+    )
+    async def send_json(_payload) -> None:
+        return None
+
+    websocket.send_json = send_json
+    with PaperRepository(tmp_path / "lighter-market-stats-boundary.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository,
+            adapters={Venue.RISEX: risex, Venue.LIGHTER: lighter},
+            clock=clock,
+        )
+        await runtime.scan()
+        assert runtime.last_scan is not None and runtime.last_scan.winner is not None
+        broker = PaperEntryBroker()
+        await broker.activate(
+            runtime.last_scan,
+            attempt_id="lighter-boundary",
+            activated_at=clock.now(),
+        )
+        runtime.broker = broker
+        confirm_public_streams(runtime, clock.now())
+        clock.advance(1)
+        await runtime.deliver_trade(maker_trade(runtime, clock.now(), "lighter-boundary-entry"))
+        assert runtime.lifecycle is not None
+        position = runtime.lifecycle.snapshot.position
+        assert position is not None
+        pending = next(
+            row for row in runtime.lifecycle.snapshot.settlements
+            if row.venue is Venue.LIGHTER
+        )
+        assert pending.status is SettlementStatus.PENDING
+
+        runtime._session = SingleWebSocketSession(websocket)
+        runtime._stop_event = stop
+        session_id = runtime._new_stream_session(
+            (Venue.LIGHTER, "*", "combined")
+        )
+        await runtime._combined_stream(
+            Venue.LIGHTER, lighter, ("ETH",), session_id
+        )
+        snapshot = runtime.lifecycle.snapshot
+        applied = next(
+            row for row in snapshot.settlements if row.venue is Venue.LIGHTER
+        )
+        predicted = runtime.observations[Venue.LIGHTER, "ETH"].funding
+        lighter_rows = tuple(
+            (row["status"], row["cash_usd"])
+            for row in repository.connection.execute(
+            "SELECT status,cash_usd FROM funding_settlements "
+            "WHERE venue='LIGHTER'"
+            ).fetchall()
+        )
+
+    assert applied.status is SettlementStatus.APPLIED_RATE
+    expected_cash_per_base = D("0.004350") * D("0.0053") / D("100")
+    expected_cash = position.canonical_quantity * (
+        expected_cash_per_base
+        if position.direction.value == "LONG_RISEX_SHORT_HEDGE"
+        else -expected_cash_per_base
+    )
+    assert applied.cash_usd == expected_cash
+    assert len(lighter_rows) == 1
+    assert lighter_rows[0][0] == "APPLIED_RATE"
+    assert D(lighter_rows[0][1]) == expected_cash
+    assert predicted is not None and predicted.quality is FundingQuality.PREDICTED
+    assert predicted.short_cash_per_canonical_base_usd == D("0.0000003219")
+    assert predicted.long_cash_per_canonical_base_usd == D("-0.0000003219")
 
 
 @pytest.mark.asyncio

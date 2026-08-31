@@ -6,7 +6,7 @@ credential, order, signing, or dispatch surface.
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -52,6 +52,11 @@ class LighterAdapter(PublicAdapter):
     # this public contract; it is not inferred from a generic asset registry.
     PERP_QUOTE_ASSET_ID = 0
     FUNDING_PERIOD = timedelta(hours=1)
+    # Lighter's public market-stats funding fields are percentage-number
+    # values (for example, 0.0047 means 0.0047%), while the paper domain
+    # stores signed rates as fractions.  Keep this conversion at the wire
+    # boundary so no downstream path can apply it twice.
+    FUNDING_RATE_PERCENT_DIVISOR = Decimal("100")
     # Current public frames report the hourly boundary one millisecond after
     # the boundary.  Keep this tolerance narrower than a market-data freshness
     # window and canonicalize only that observed wire-level skew.
@@ -66,6 +71,15 @@ class LighterAdapter(PublicAdapter):
         self._market_ids: dict[str, int] = {}
         self._symbols_by_id: dict[int, str] = {}
         self._funding_quotes: dict[str, FundingCashQuote] = {}
+
+    @dataclass(frozen=True, slots=True)
+    class _MarketStats:
+        observed_at: datetime
+        funding_at: datetime
+        settlement_at: datetime
+        current_rate: Decimal
+        applied_rate: Decimal
+        mark_price: Decimal
 
     @staticmethod
     def _integer(value: Any, field: str) -> int:
@@ -513,6 +527,76 @@ class LighterAdapter(PublicAdapter):
             raise ValueError("Lighter funding timestamp is not an hourly boundary")
         return boundary
 
+    @classmethod
+    def _funding_rate(cls, value: Any, field: str) -> Decimal:
+        rate = decimal_value(
+            value, field, scale=cls.FUNDING_RATE_PERCENT_DIVISOR
+        )
+        if not rate.is_finite():
+            raise ValueError(f"{field} must be finite")
+        return rate
+
+    def _parse_market_stats_message(
+        self,
+        payload: Any,
+        market: CanonicalMarket,
+        *,
+        received_at: datetime,
+    ) -> _MarketStats:
+        message = require_mapping(payload, "Lighter market stats message")
+        target_market_id = self.market_id(market.venue_symbol)
+        rows = self.market_stats_rows(message)
+        matching_rows = tuple(
+            row for market_id, row in rows if market_id == target_market_id
+        )
+        if len(matching_rows) != 1:
+            raise ValueError("Lighter market stats target is missing or duplicated")
+        stats = matching_rows[0]
+        market_id = self._integer(stats.get("market_id"), "market_stats.market_id")
+        if self.symbol_for_market(market_id) != market.venue_symbol:
+            raise ValueError("Lighter market stats identity mismatch")
+        symbol = str(stats.get("symbol", "")).strip()
+        if symbol != market.venue_symbol:
+            raise ValueError("Lighter market stats symbol mismatch")
+        if (
+            market.venue is not Venue.LIGHTER
+            or market.contract_type is not ContractType.LINEAR
+        ):
+            raise ValueError("Lighter market stats market is not linear")
+        raw_time = message.get("timestamp")
+        observed_at = min(timestamp(raw_time, "milliseconds"), received_at)
+        funding_at = self._hourly_funding_boundary(
+            stats.get("funding_timestamp")
+        )
+        settlement_at = funding_at + self.FUNDING_PERIOD
+        current_rate = self._funding_rate(
+            stats.get("current_funding_rate"), "current_funding_rate"
+        )
+        applied_rate = self._funding_rate(
+            stats.get("funding_rate"), "funding_rate"
+        )
+        # Lighter's official funding payment is (-1) * position * mark * rate.
+        # The index price is not a substitute for the mark used by that
+        # contract, so missing or invalid mark_price fails the public quote
+        # closed-world validation.
+        mark_price = decimal_value(stats.get("mark_price"), "mark_price")
+        if (
+            mark_price <= 0
+            or not current_rate.is_finite()
+            or not applied_rate.is_finite()
+            or funding_at > observed_at
+            or settlement_at <= observed_at
+        ):
+            raise ValueError("Lighter future funding inputs are not usable")
+        return self._MarketStats(
+            observed_at,
+            funding_at,
+            settlement_at,
+            current_rate,
+            applied_rate,
+            mark_price,
+        )
+
     def normalize_market_stats_message(
         self,
         payload: Any,
@@ -521,50 +605,18 @@ class LighterAdapter(PublicAdapter):
         received_at: datetime,
         assumed_open_at: datetime,
     ) -> FundingCashQuote:
-        message = require_mapping(payload, "Lighter market stats message")
         try:
-            target_market_id = self.market_id(market.venue_symbol)
-            rows = self.market_stats_rows(message)
-            matching_rows = tuple(
-                row for market_id, row in rows if market_id == target_market_id
+            stats = self._parse_market_stats_message(
+                payload, market, received_at=received_at
             )
-            if len(matching_rows) != 1:
-                raise ValueError("Lighter market stats target is missing or duplicated")
-            stats = matching_rows[0]
-            market_id = self._integer(stats.get("market_id"), "market_stats.market_id")
-            if self.symbol_for_market(market_id) != market.venue_symbol:
-                raise ValueError("Lighter market stats identity mismatch")
-            symbol = str(stats.get("symbol", "")).strip()
-            if symbol != market.venue_symbol:
-                raise ValueError("Lighter market stats symbol mismatch")
-            if market.venue is not Venue.LIGHTER or market.contract_type is not ContractType.LINEAR:
-                raise ValueError("Lighter market stats market is not linear")
-            raw_time = message.get("timestamp")
-            observed_at = min(timestamp(raw_time, "milliseconds"), received_at)
-            last_funding_at = self._hourly_funding_boundary(
-                stats.get("funding_timestamp")
-            )
-            settlement_at = last_funding_at + self.FUNDING_PERIOD
-            rate = decimal_value(stats.get("current_funding_rate"), "current_funding_rate")
-            index = decimal_value(stats.get("index_price"), "index_price")
-            if (
-                index <= 0
-                or not rate.is_finite()
-                or last_funding_at.minute != 0
-                or last_funding_at.second != 0
-                or last_funding_at.microsecond != 0
-                or last_funding_at > observed_at
-                or settlement_at <= observed_at
-            ):
-                raise ValueError("Lighter future funding inputs are not usable")
-            cash = index * rate
-            eligible = assumed_open_at < settlement_at
+            cash = stats.mark_price * stats.current_rate
+            eligible = assumed_open_at < stats.settlement_at
             quote = FundingCashQuote(
                 Venue.LIGHTER,
                 market.venue_symbol,
-                observed_at,
+                stats.observed_at,
                 assumed_open_at,
-                settlement_at,
+                stats.settlement_at,
                 FundingQuality.PREDICTED,
                 FundingAccrualMethod.SNAPSHOT_AT_SETTLEMENT,
                 True,
@@ -572,12 +624,63 @@ class LighterAdapter(PublicAdapter):
                 cash if eligible else Decimal("0"),
                 self.WS_SOURCE,
             )
-        except (KeyError, TypeError, ValueError):
+        except (ArithmeticError, KeyError, TypeError, ValueError):
             return self.unknown_funding_quote(
                 market, observed_at=received_at, assumed_open_at=assumed_open_at
             )
-        self._funding_quotes[market.venue_symbol] = quote
+        cached = self._funding_quotes.get(market.venue_symbol)
+        if cached is None or quote.settlement_at >= cached.settlement_at:
+            # Runtime transport sequencing rejects stale frames before they
+            # become observations; keep the REST fallback monotonic too.
+            self._funding_quotes[market.venue_symbol] = quote
         return quote
+
+    def normalize_applied_market_stats_message(
+        self,
+        payload: Any,
+        market: CanonicalMarket,
+        *,
+        previous_funding_at: datetime | None,
+        registered_settlement_at: datetime | None,
+        received_at: datetime,
+        assumed_open_at: datetime,
+    ) -> FundingCashQuote | None:
+        """Normalize one contiguous public boundary as applied funding.
+
+        A market-stats update proves a cash amount only when its canonical
+        funding boundary follows the previous boundary by exactly one period
+        and matches the lifecycle's registered settlement key.  The current
+        frame's ``funding_rate`` is the applied rate; ``current_funding_rate``
+        remains reserved for the next predicted quote.
+        """
+        try:
+            stats = self._parse_market_stats_message(
+                payload, market, received_at=received_at
+            )
+            if (
+                previous_funding_at is None
+                or registered_settlement_at is None
+                or stats.funding_at != previous_funding_at + self.FUNDING_PERIOD
+                or stats.funding_at != registered_settlement_at
+                or assumed_open_at >= stats.funding_at
+            ):
+                return None
+            cash = stats.mark_price * stats.applied_rate
+            return FundingCashQuote(
+                Venue.LIGHTER,
+                market.venue_symbol,
+                stats.observed_at,
+                assumed_open_at,
+                stats.funding_at,
+                FundingQuality.APPLIED_RATE,
+                FundingAccrualMethod.SNAPSHOT_AT_SETTLEMENT,
+                True,
+                -cash,
+                cash,
+                f"{self.WS_SOURCE}#applied-market-stats",
+            )
+        except (ArithmeticError, KeyError, TypeError, ValueError):
+            return None
 
     async def fetch_funding_quote(
         self, market: CanonicalMarket, *, assumed_open_at: datetime

@@ -3461,6 +3461,111 @@ class PublicPaperRuntime:
         if notification is not None:
             self._notify_settlement_transition(*notification)
 
+    def _lighter_registered_settlement(
+        self, symbol: str
+    ) -> tuple[datetime, datetime] | None:
+        lifecycle = self.lifecycle
+        if lifecycle is None:
+            return None
+        snapshot = lifecycle.snapshot
+        position = snapshot.position
+        if (
+            position is None
+            or snapshot.hedge_market.venue is not Venue.LIGHTER
+            or snapshot.hedge_market.venue_symbol != symbol
+        ):
+            return None
+        for row in snapshot.settlements:
+            if (
+                row.venue is Venue.LIGHTER
+                and row.canonical_market == symbol
+                and row.status in {
+                    SettlementStatus.PENDING,
+                    SettlementStatus.ESTIMATED,
+                    SettlementStatus.UNRESOLVED,
+                }
+            ):
+                return row.settlement_at, position.position_opened_at
+        return None
+
+    async def _apply_lighter_market_stats(
+        self,
+        quote: FundingCashQuote,
+        applied_quote: FundingCashQuote | None,
+        stream_session_id: StreamSessionId,
+    ) -> None:
+        """Install the predicted quote and atomically reconcile one applied rate."""
+        session_key = (Venue.LIGHTER, "*", "combined")
+        notification: tuple[
+            FundingSettlement, FundingSettlement, datetime
+        ] | None = None
+        async with self._position_event_lock:
+            if not self._owns_stream_session(session_key, stream_session_id):
+                return
+            commit_at = self.clock.now()
+            if applied_quote is not None and self.lifecycle is not None:
+                lifecycle = self.lifecycle
+                before_snapshot = lifecycle.snapshot
+                settlement = self._funding_settlement_from_quote(
+                    applied_quote, before_snapshot
+                )
+                if (
+                    settlement is not None
+                    and before_snapshot.hedge_market.venue is Venue.LIGHTER
+                    and before_snapshot.hedge_market.venue_symbol
+                    == applied_quote.canonical_market
+                    and settlement.key in {
+                        row.key for row in before_snapshot.settlements
+                    }
+                ):
+                    before_settlement = next(
+                        row for row in before_snapshot.settlements
+                        if row.key == settlement.key
+                    )
+                    if before_settlement.status in {
+                        SettlementStatus.PENDING,
+                        SettlementStatus.ESTIMATED,
+                        SettlementStatus.UNRESOLVED,
+                    }:
+                        candidate = lifecycle.detached()
+                        await candidate.reconcile_settlement(settlement)
+                        if (
+                            not self._owns_stream_session(
+                                session_key, stream_session_id
+                            )
+                            or self.lifecycle is not lifecycle
+                            or lifecycle.snapshot is not before_snapshot
+                        ):
+                            return
+                        if candidate.snapshot != before_snapshot:
+                            self.repository.save_decision(
+                                recorded_at=commit_at,
+                                lifecycle_snapshot=candidate.snapshot,
+                            )
+                            lifecycle.publish_candidate(candidate)
+                            after_settlement = next(
+                                row for row in candidate.snapshot.settlements
+                                if row.key == settlement.key
+                            )
+                            notification = (
+                                before_settlement, after_settlement, commit_at
+                            )
+            key = (quote.venue, quote.canonical_market)
+            observation = self.observations.get(key)
+            if observation is not None:
+                self.observations[key] = replace(observation, funding=quote)
+            known = quote.quality is not FundingQuality.UNKNOWN
+            self._set_component_readiness(
+                quote.venue,
+                f"funding:{quote.canonical_market}",
+                known,
+                "PUBLIC_FUNDING_STATS_READY"
+                if known else "PUBLIC_FUNDING_STATS_UNUSABLE",
+                commit_at,
+            )
+        if notification is not None:
+            self._notify_settlement_transition(*notification)
+
     async def _apply_funding_quote(self, quote: FundingCashQuote) -> None:
         key = (quote.venue, quote.canonical_market)
         self._set_component_readiness(
@@ -5241,6 +5346,8 @@ class PublicPaperRuntime:
                     ordinal = 0
                     lighter_initial_books: set[str] = set()
                     lighter_trade_sequences: dict[str, int] = {}
+                    lighter_funding_boundaries: dict[str, datetime] = {}
+                    lighter_funding_gaps: set[str] = set()
                     async for message in ws:
                         if not self._owns_stream_session(
                             task_key, stream_session_id
@@ -5491,17 +5598,58 @@ class PublicPaperRuntime:
                                     task_key, stream_session_id
                                 ):
                                     return
-                                self.observations[(venue, symbol)] = replace(
-                                    row, funding=quote
+                                applied_quote: FundingCashQuote | None = None
+                                current_boundary = (
+                                    None
+                                    if quote.quality is FundingQuality.UNKNOWN
+                                    else quote.settlement_at - adapter.FUNDING_PERIOD
                                 )
-                                known = quote.quality is not FundingQuality.UNKNOWN
-                                self._set_component_readiness(
-                                    venue,
-                                    f"funding:{symbol}",
-                                    known,
-                                    "PUBLIC_FUNDING_STATS_READY"
-                                    if known else "PUBLIC_FUNDING_STATS_UNUSABLE",
-                                    received_at,
+                                if current_boundary is not None:
+                                    previous_boundary = lighter_funding_boundaries.get(
+                                        symbol
+                                    )
+                                    if (
+                                        previous_boundary is not None
+                                        and current_boundary < previous_boundary
+                                    ):
+                                        # A stale all-market frame must not
+                                        # regress the predicted quote or prove
+                                        # a second settlement.
+                                        continue
+                                    if previous_boundary is None:
+                                        lighter_funding_boundaries[symbol] = (
+                                            current_boundary
+                                        )
+                                    elif current_boundary > previous_boundary:
+                                        contiguous = (
+                                            current_boundary
+                                            == previous_boundary + adapter.FUNDING_PERIOD
+                                        )
+                                        if not contiguous or symbol in lighter_funding_gaps:
+                                            lighter_funding_gaps.add(symbol)
+                                        else:
+                                            registered = (
+                                                self._lighter_registered_settlement(
+                                                    symbol
+                                                )
+                                            )
+                                            if registered is not None:
+                                                registered_at, opened_at = registered
+                                                applied_quote = (
+                                                    adapter.normalize_applied_market_stats_message(
+                                                        payload,
+                                                        row.market,
+                                                        previous_funding_at=previous_boundary,
+                                                        registered_settlement_at=registered_at,
+                                                        received_at=received_at,
+                                                        assumed_open_at=opened_at,
+                                                    )
+                                                )
+                                        lighter_funding_boundaries[symbol] = (
+                                            current_boundary
+                                        )
+                                await self._apply_lighter_market_stats(
+                                    quote, applied_quote, stream_session_id
                                 )
                     if self._stop_event is None or not self._stop_event.is_set():
                         raise _PublicSocketClosed("EOF")

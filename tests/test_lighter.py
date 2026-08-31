@@ -567,7 +567,7 @@ async def test_lighter_trade_and_market_stats_supply_identity_and_future_cash():
             "market_stats": {
                 "symbol": "ETH",
                 "market_id": 0,
-                "index_price": "100",
+                "mark_price": "100",
                 "current_funding_rate": "0.001",
                 "funding_rate": "0.0005",
                 "funding_timestamp": last_funding_at_ms,
@@ -579,10 +579,10 @@ async def test_lighter_trade_and_market_stats_supply_identity_and_future_cash():
     )
     assert quote.quality is FundingQuality.PREDICTED
     assert quote.settlement_at == NOW + timedelta(hours=1)
-    assert quote.long_cash_per_canonical_base_usd == D("-0.1")
-    assert quote.short_cash_per_canonical_base_usd == D("0.1")
+    assert quote.long_cash_per_canonical_base_usd == D("-0.001")
+    assert quote.short_cash_per_canonical_base_usd == D("0.001")
     refreshed = await adapter.fetch_funding_quote(market, assumed_open_at=NOW)
-    assert refreshed.long_cash_per_canonical_base_usd == D("-0.1")
+    assert refreshed.long_cash_per_canonical_base_usd == D("-0.001")
     invalid = adapter.normalize_market_stats_message(
         {
             "type": "update/market_stats",
@@ -590,8 +590,9 @@ async def test_lighter_trade_and_market_stats_supply_identity_and_future_cash():
             "market_stats": {
                 "symbol": "ETH",
                 "market_id": 0,
-                "index_price": "100",
+                "mark_price": "100",
                 "current_funding_rate": "0.001",
+                "funding_rate": "0.0005",
                 "funding_timestamp": stats_at_ms + 3_600_000,
             },
             "timestamp": 1_800_000_000_000,
@@ -601,6 +602,134 @@ async def test_lighter_trade_and_market_stats_supply_identity_and_future_cash():
         assumed_open_at=NOW,
     )
     assert invalid.quality is FundingQuality.UNKNOWN
+
+
+def test_lighter_pump_percentage_rates_use_mark_and_apply_once_at_boundary():
+    adapter = LighterAdapter(object())
+    market = adapter.normalize_market(market_row(symbol="PUMP", market_id=45))
+    stats_at_ms = int(NOW.timestamp() * 1000)
+    predicted = adapter.normalize_market_stats_message(
+        {
+            "type": "update/market_stats",
+            "channel": "market_stats:45",
+            "timestamp": stats_at_ms,
+            "market_stats": {
+                "symbol": "PUMP",
+                "market_id": 45,
+                "index_price": "999",
+                "mark_price": "0.004350",
+                "current_funding_rate": "0.0047",
+                "funding_rate": "0.0053",
+                "funding_timestamp": stats_at_ms,
+            },
+        },
+        market,
+        received_at=NOW,
+        assumed_open_at=NOW,
+    )
+    assert predicted.quality is FundingQuality.PREDICTED
+    assert predicted.long_cash_per_canonical_base_usd == D("-0.00000020445")
+    assert predicted.short_cash_per_canonical_base_usd == D("0.00000020445")
+    pump_quantity = D("500") / D("0.004350")
+    assert pump_quantity * predicted.short_cash_per_canonical_base_usd == D("0.0235")
+
+    applied_at = NOW + timedelta(hours=1)
+    applied = adapter.normalize_applied_market_stats_message(
+        {
+            "type": "update/market_stats",
+            "channel": "market_stats:45",
+            "timestamp": int((applied_at + timedelta(seconds=1)).timestamp() * 1000),
+            "market_stats": {
+                "symbol": "PUMP",
+                "market_id": 45,
+                "mark_price": "0.004350",
+                "current_funding_rate": "0.0074",
+                "funding_rate": "0.0053",
+                "funding_timestamp": int(applied_at.timestamp() * 1000),
+            },
+        },
+        market,
+        previous_funding_at=NOW,
+        registered_settlement_at=applied_at,
+        received_at=applied_at + timedelta(seconds=1),
+        assumed_open_at=NOW + timedelta(seconds=1),
+    )
+    assert applied is not None
+    assert applied.quality is FundingQuality.APPLIED_RATE
+    assert applied.settlement_at == applied_at
+    assert applied.long_cash_per_canonical_base_usd == D("-0.00000023055")
+    assert applied.short_cash_per_canonical_base_usd == D("0.00000023055")
+    assert pump_quantity * applied.short_cash_per_canonical_base_usd == D("0.0265")
+    assert adapter.normalize_applied_market_stats_message(
+        {
+            "type": "update/market_stats",
+            "channel": "market_stats:45",
+            "timestamp": int((applied_at + timedelta(seconds=1)).timestamp() * 1000),
+            "market_stats": {
+                "symbol": "PUMP",
+                "market_id": 45,
+                "mark_price": "0.004350",
+                "current_funding_rate": "0.0074",
+                "funding_rate": "0.0053",
+                "funding_timestamp": int(applied_at.timestamp() * 1000),
+            },
+        },
+        market,
+        previous_funding_at=applied_at,
+        registered_settlement_at=applied_at,
+        received_at=applied_at + timedelta(seconds=1),
+        assumed_open_at=NOW + timedelta(seconds=1),
+    ) is None
+    assert adapter.normalize_applied_market_stats_message(
+        {
+            "type": "update/market_stats",
+            "channel": "market_stats:45",
+            "timestamp": int((applied_at + timedelta(seconds=1)).timestamp() * 1000),
+            "market_stats": {
+                "symbol": "PUMP",
+                "market_id": 45,
+                "mark_price": "0.004350",
+                "current_funding_rate": "0.0074",
+                "funding_rate": "0.0053",
+                "funding_timestamp": int(applied_at.timestamp() * 1000),
+            },
+        },
+        market,
+        previous_funding_at=NOW,
+        registered_settlement_at=NOW + timedelta(hours=2),
+        received_at=applied_at + timedelta(seconds=1),
+        assumed_open_at=NOW + timedelta(seconds=1),
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "missing_field", ("mark_price", "current_funding_rate", "funding_rate")
+)
+def test_lighter_market_stats_missing_required_field_fails_closed(missing_field):
+    adapter = LighterAdapter(object())
+    market = adapter.normalize_market(market_row())
+    stats_at_ms = int(NOW.timestamp() * 1000)
+    stats = {
+        "symbol": "ETH",
+        "market_id": 0,
+        "mark_price": "100",
+        "current_funding_rate": "0.001",
+        "funding_rate": "0.0005",
+        "funding_timestamp": stats_at_ms,
+    }
+    stats.pop(missing_field)
+    quote = adapter.normalize_market_stats_message(
+        {
+            "type": "update/market_stats",
+            "channel": "market_stats:0",
+            "timestamp": stats_at_ms,
+            "market_stats": stats,
+        },
+        market,
+        received_at=NOW,
+        assumed_open_at=NOW,
+    )
+    assert quote.quality is FundingQuality.UNKNOWN
 
 
 def test_lighter_market_stats_subscription_snapshot_is_authoritative():
@@ -615,7 +744,7 @@ def test_lighter_market_stats_subscription_snapshot_is_authoritative():
             "market_stats": {
                 "symbol": "ETH",
                 "market_id": 0,
-                "index_price": "100",
+                "mark_price": "100",
                 "last_trade_price": "100",
                 "current_funding_rate": "0.001",
                 "funding_rate": "0.0005",
@@ -642,8 +771,9 @@ def test_lighter_funding_timestamp_one_millisecond_wire_skew_is_normalized():
             "market_stats": {
                 "symbol": "ETH",
                 "market_id": 0,
-                "index_price": "100",
+                "mark_price": "100",
                 "current_funding_rate": "0.001",
+                "funding_rate": "0.0005",
                 "funding_timestamp": stats_at_ms + 1,
             },
         },
@@ -668,8 +798,9 @@ def test_lighter_all_market_stats_snapshot_selects_target_market():
                 "0": {
                     "symbol": "ETH",
                     "market_id": 0,
-                    "index_price": "100",
+                    "mark_price": "100",
                     "current_funding_rate": "0.001",
+                    "funding_rate": "0.0005",
                     "funding_timestamp": stats_at_ms,
                 },
             },
@@ -684,8 +815,9 @@ def test_lighter_all_market_stats_snapshot_selects_target_market():
                 "0": {
                     "symbol": "ETH",
                     "market_id": 0,
-                    "index_price": "100",
+                    "mark_price": "100",
                     "current_funding_rate": "0.001",
+                    "funding_rate": "0.0005",
                     "funding_timestamp": stats_at_ms,
                 },
             },
@@ -710,8 +842,9 @@ def test_lighter_non_hourly_funding_timestamp_fails_closed():
             "market_stats": {
                 "symbol": "ETH",
                 "market_id": 0,
-                "index_price": "100",
+                "mark_price": "100",
                 "current_funding_rate": "0.001",
+                "funding_rate": "0.0005",
                 "funding_timestamp": stats_at_ms - 1_800_000,
             },
         },
