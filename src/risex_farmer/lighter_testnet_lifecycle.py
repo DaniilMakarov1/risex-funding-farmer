@@ -2728,7 +2728,7 @@ class LighterLevelCRunner:
             if after_cancel.active_regular_orders or after_cancel.active_trigger_orders:
                 raise LifecycleHalt("MAKER_CANCEL_DID_NOT_PROVE_ZERO_ORDERS", failure_class="SAFETY")
             cancelled = _find_order(after_cancel, cancel)
-            if cancelled.status.upper() not in {"CANCELLED", "EXPIRED"} or cancelled.filled_quantity != 0:
+            if cancelled.status.upper() not in {"CANCELED", "CANCELLED", "EXPIRED"} or cancelled.filled_quantity != 0:
                 raise LifecycleHalt("MAKER_CANCEL_RECONCILIATION_FAILED", failure_class="SAFETY")
             self._record_reconciled(
                 cancel,
