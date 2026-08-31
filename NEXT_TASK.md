@@ -27,7 +27,7 @@ Accepted published main `271bdb24a6ea4ec0f9d1a63188ed954cc8a8d638` normalizes th
 
 ## Lighter mainnet onboarding and one bounded manual lifecycle
 
-Status: `AUTHORIZED FOR OFFICIAL-CONTRACT REVIEW, PROTECTED ONBOARDING, AND EXACT-ACCOUNT READINESS; WRITE PHASE BLOCKED ON LIGHTER-SPECIFIC POSITIVE ABSOLUTE CAPS AND ALL SAFETY GATES`.
+Status: `AUTHORIZED FOR OFFICIAL-CONTRACT REVIEW, PROTECTED ONBOARDING, AND EXACT-ACCOUNT READINESS; LIGHTER-SPECIFIC CAPS RECORDED; WRITE PHASE REMAINS BLOCKED ON ALL OTHER SAFETY GATES`.
 
 Objective: establish the smallest isolated Lighter mainnet Level-D path for the user's exact funded account, then, only after every gate below passes, perform exactly one manual smallest-executable lifecycle: one opening order, authoritative exact-identity reconciliation, one accepted reduce-only close of the fresh exact position, and two fresh agreeing terminal rounds proving zero relevant regular/trigger orders and exact flatness. The user's prior UI order and reported closure are context only, never clean-account evidence.
 
@@ -40,7 +40,7 @@ Current bounded actions:
 
 Write phase gates:
 
-- Before any signing-payload preparation, signing, or dispatch, the user must supply positive absolute Lighter-specific `maximum_deposit_or_collateral` and `maximum_total_loss` caps. No cap from RISEx, Extended, Nado, PAPER, or testnet is inherited. The exact smallest executable lifecycle must fit both caps.
+- The user-bound Lighter-specific caps are `maximum_deposit_or_collateral_usd = 20` and `maximum_total_loss_usd = 10`; the loss cap does not exceed the collateral cap. No cap from RISEx, Extended, Nado, PAPER, or testnet is inherited. The exact smallest executable lifecycle must be independently proven to fit both caps before any signing-payload preparation, signing, or dispatch. The caps alone authorize no write.
 - Persist a fresh durable runtime identity and a distinct fresh write-intent identity before every dispatch. Writes are sequential. An ambiguous response is reconciled authoritatively and is never blindly replayed.
 - Bind the exact mainnet account, market, side, quantity, price/slippage bound, fee tier, collateral, order identity, fill identity, position delta, and close semantics before opening. Never touch unrelated state or increase an existing position.
 - Close only the fresh authoritative exact position quantity through the accepted reduce-only path. Completion requires authoritative entry/close reconciliation, two fresh agreeing terminal rounds, zero relevant regular/trigger orders, exact flatness, no unrelated mutation, and no unresolved write identity.
