@@ -1263,7 +1263,7 @@ def _walk(levels: Sequence[BookLevel], quantity: Decimal) -> tuple[Decimal, Deci
 
 
 def smallest_executable_quantity(market: MarketObservation, *, is_ask: bool) -> tuple[Decimal, Decimal]:
-    """Return the smallest current grid quantity and its IOC protection price."""
+    """Return the smallest current grid quantity and walked-book worst price."""
 
     step = market.size_step
     levels = tuple(sorted(market.bids, key=lambda row: row.price, reverse=True)) if is_ask else tuple(
@@ -1272,8 +1272,12 @@ def smallest_executable_quantity(market: MarketObservation, *, is_ask: bool) -> 
     quantity = _ceil_grid(market.contract.min_base_amount, step)
     # Minimum quote is evaluated at actual executable depth, not at last/mark.
     for _ in range(100_000):
-        vwap, worst = _walk(levels, quantity)
-        if quantity * vwap >= market.contract.min_quote_amount:
+        try:
+            vwap, worst = _walk(levels, quantity)
+            meets_minimum_quote = quantity * vwap >= market.contract.min_quote_amount
+        except (ArithmeticError, InvalidOperation):
+            raise LifecycleHalt("EXECUTABLE_QUOTE_INVALID", failure_class="SAFETY") from None
+        if meets_minimum_quote:
             return quantity, worst
         quantity += step
     raise LifecycleHalt("MINIMUM_QUANTITY_SEARCH_EXHAUSTED", failure_class="SAFETY")
@@ -1285,19 +1289,19 @@ def close_price_bound(
     quantity: Decimal,
     is_ask: bool,
 ) -> Decimal:
-    """Return the exact-state reduce-only close protection price.
+    """Return the exact-quantity market IOC protection price.
 
     Lighter's market IOC price is a slippage guard, not an execution price.
-    The observed close rejection at the exact book worst price requires a
-    bounded testnet-only allowance: 20% below the observed best bid for a
-    sell, or 20% above the observed best ask for a buy.  The result is
-    directionally rounded to the observed price grid: down for a sell and
-    up for a buy, so tick alignment never narrows the allowed slippage.
+    The observed rejection at the exact book worst price requires a bounded
+    testnet-only allowance: 20% below the observed best bid for a sell, or
+    20% above the observed best ask for a buy.  The result is directionally
+    rounded to the observed price grid: down for a sell and up for a buy, so
+    tick alignment never narrows the allowed slippage.
 
-    The quantity is deliberately supplied by the authoritative position
-    rather than by the market minimum.  Walking the corresponding book side
-    still proves that the exact quantity has sufficient current depth before
-    dispatch.
+    Walking the corresponding book side proves that the supplied exact
+    quantity has sufficient current depth before dispatch.  The helper is
+    shared by opening and reduce-only closing market IOC orders; callers own
+    the quantity/position identity checks around it.
     """
 
     if not isinstance(is_ask, bool):
@@ -3219,15 +3223,20 @@ class LighterLevelCRunner:
 
     async def _open_phase(self, market: MarketObservation, account: AccountSnapshot) -> None:
         market, account = await self._fresh_prewrite()
-        quantity, worst = smallest_executable_quantity(market, is_ask=bool(self._open_is_ask))
+        quantity, _ = smallest_executable_quantity(market, is_ask=bool(self._open_is_ask))
         is_ask = bool(self._open_is_ask)
         if quantity != self._quantity:
             raise LifecycleHalt("OPEN_QUANTITY_CHANGED_BEFORE_WRITE", failure_class="SAFETY")
+        price_bound = close_price_bound(
+            market,
+            quantity=quantity,
+            is_ask=is_ask,
+        )
         request = OrderRequest(
             market_id=market.market_id,
             client_order_index=_new_client_order_index(),
             quantity=quantity,
-            price=worst,
+            price=price_bound,
             is_ask=is_ask,
             order_type="market",
             time_in_force="ioc",

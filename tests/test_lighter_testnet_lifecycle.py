@@ -904,6 +904,127 @@ def test_close_price_bound_rejects_invalid_quantity_or_side(quantity, is_ask, re
         )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("is_ask", "best_bid", "best_ask", "expected"),
+    [
+        (True, "3.7284", "3.8000", Decimal("2.9827")),
+        (False, "3.7285", "3.8001", Decimal("4.5602")),
+    ],
+)
+async def test_open_market_ioc_uses_directional_20_percent_guard(
+    tmp_path, is_ask, best_bid, best_ask, expected
+):
+    observed = close_market_at(
+        0,
+        best_bid=best_bid,
+        best_ask=best_ask,
+        min_base_amount="2.69",
+    )
+    gateway = SyntheticGateway([0])
+    gateway.market = lambda market_id: _async_market(observed, market_id)
+    runner, store = make_runner(tmp_path, gateway)
+    runner._market = observed
+    runner._quantity = Decimal("2.69")
+    runner._open_is_ask = is_ask
+    store.begin()
+
+    await runner._open_phase(observed, gateway._account())
+
+    open_order = next(
+        order
+        for order in gateway.orders.values()
+        if order.order_type == "market" and not order.reduce_only
+    )
+    assert open_order.quantity == Decimal("2.69")
+    assert open_order.price == expected
+    assert open_order.is_ask is is_ask
+    assert open_order.order_type == "market"
+    assert open_order.time_in_force == "ioc"
+    assert open_order.reduce_only is False
+    assert lifecycle._grid(open_order.price, observed.price_tick)
+    assert [row[0] for row in gateway.dispatches] == ["OPEN"]
+    store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mutation", "is_ask", "reason"),
+    [
+        ("insufficient", True, "EXTERNAL_LIQUIDITY_INSUFFICIENT"),
+        ("off_grid", True, "BOOK_LEVEL_OFF_GRID"),
+        ("overflow", False, "CLOSE_PRICE_BOUND_INVALID"),
+        ("quote_overflow", False, "EXECUTABLE_QUOTE_INVALID"),
+    ],
+)
+async def test_open_market_ioc_guard_fails_closed_before_dispatch(
+    tmp_path, mutation, is_ask, reason
+):
+    if mutation == "insufficient":
+        observed = close_market_at(
+            0,
+            min_base_amount="2.69",
+            bid_quantity="2.68",
+        )
+    elif mutation == "off_grid":
+        observed = close_market_at(
+            0,
+            min_base_amount="2.69",
+            best_bid="3.72845",
+        )
+    elif mutation == "overflow":
+        observed = close_market_at(
+            0,
+            min_base_amount="0.01",
+            best_bid="3",
+            best_ask="9e999999",
+            price_decimals=0,
+        )
+    else:
+        observed = close_market_at(
+            0,
+            min_base_amount="2.69",
+            best_bid="3",
+            best_ask="9e999999",
+            price_decimals=0,
+        )
+    gateway = SyntheticGateway([0])
+    gateway.market = lambda market_id: _async_market(observed, market_id)
+    runner, store = make_runner(tmp_path, gateway)
+    runner._market = observed
+    runner._quantity = Decimal("0.01") if mutation == "overflow" else Decimal("2.69")
+    runner._open_is_ask = is_ask
+    store.begin()
+
+    with pytest.raises(lifecycle.LifecycleHalt, match=reason):
+        await runner._open_phase(observed, gateway._account())
+
+    assert store.intent_count() == 0
+    assert store.dispatch_count() == 0
+    assert gateway.dispatches == []
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_open_market_ioc_rejects_changed_current_minimum_before_dispatch(tmp_path):
+    observed = close_market_at(0, min_base_amount="2.70")
+    gateway = SyntheticGateway([0])
+    gateway.market = lambda market_id: _async_market(observed, market_id)
+    runner, store = make_runner(tmp_path, gateway)
+    runner._market = observed
+    runner._quantity = Decimal("2.69")
+    runner._open_is_ask = True
+    store.begin()
+
+    with pytest.raises(lifecycle.LifecycleHalt, match="OPEN_QUANTITY_CHANGED_BEFORE_WRITE"):
+        await runner._open_phase(observed, gateway._account())
+
+    assert store.intent_count() == 0
+    assert store.dispatch_count() == 0
+    assert gateway.dispatches == []
+    store.close()
+
+
 async def run_synthetic(
     tmp_path: Path,
     *,
@@ -1072,6 +1193,9 @@ async def test_complete_ordered_lifecycle_rediscovery_intents_and_terminal_round
     assert gateway.market_calls and set(gateway.market_calls) == {MARKET_ID}
     assert all(account == ACCOUNT_INDEX and key == API_KEY_INDEX for account, key in gateway.nonce_calls)
     assert [row[0] for row in gateway.dispatches] == ["MAKER_PLACE", "MAKER_CANCEL", "OPEN", "CLOSE"]
+    maker_order = next(order for order in gateway.orders.values() if order.order_type == "limit")
+    assert maker_order.price == Decimal("10.00")
+    assert maker_order.is_ask is False
     assert all(row[2] == API_KEY_INDEX for row in gateway.dispatches)
     assert all(row[3] is False for row in gateway.dispatches[:3])
     assert gateway.dispatches[-1][3] is True
@@ -1697,6 +1821,39 @@ async def test_ambiguous_close_is_one_shot_and_restart_does_not_replay(tmp_path)
         "MAKER_CANCEL",
         "OPEN",
     ]
+    store.close()
+
+
+async def test_ambiguous_open_is_one_shot_and_restart_does_not_replay(tmp_path):
+    clock = [0]
+    gateway = SyntheticGateway(clock, ambiguous_kind=lifecycle.IntentKind.OPEN)
+    runner, store = make_runner(tmp_path, gateway)
+    first = await runner.run()
+
+    assert first.result is lifecycle.RunnerResult.HALTED_MANUAL_RECOVERY
+    assert first.reason == "SYNTHETIC_AMBIGUOUS_SEND"
+    assert first.intent_count == 3
+    assert first.dispatch_count == 3
+    assert [row[0] for row in gateway.dispatches] == ["MAKER_PLACE", "MAKER_CANCEL"]
+    row = store._connection.execute(
+        "SELECT state FROM intents WHERE kind = 'OPEN'"
+    ).fetchone()
+    assert row[0] == lifecycle.IntentState.AMBIGUOUS.value
+
+    restarted = lifecycle.LighterLevelCRunner(
+        gateway,
+        store,
+        readiness=ready_readiness(),
+        identity=identity(),
+        mode=lifecycle.RunMode.TESTNET_WRITE,
+        clock_ms=lambda: clock[0],
+        sleep=gateway.sleep_until_boundary,
+    )
+    second = await restarted.run()
+
+    assert second.result is lifecycle.RunnerResult.BLOCKED
+    assert second.reason == "RESTART_REQUIRES_FRESH_DATABASE"
+    assert [row[0] for row in gateway.dispatches] == ["MAKER_PLACE", "MAKER_CANCEL"]
     store.close()
 
 
