@@ -57,6 +57,7 @@ from .paper_broker import (
     PaperEntryBroker,
     PaperEntryState,
     PaperOrderStatus,
+    _observation_is_fresh,
 )
 from .scanner import (
     MarketObservation,
@@ -5299,15 +5300,35 @@ class PublicPaperRuntime:
             candidate = lifecycle.detached()
             risex_capture = self._execution_capture(risex, at)
             hedge_capture = self._execution_capture(hedge, at)
-            await candidate.evaluate(
-                evaluated_at=at,
-                risex_observation=risex,
-                hedge_observation=hedge,
-                record_sample=False,
-                hard_basis_only=True,
-                risex_capture=risex_capture,
-                hedge_capture=hedge_capture,
-            )
+            if snapshot.gap_open:
+                if (
+                    not _observation_is_fresh(risex, at, self.config)
+                    or not _observation_is_fresh(hedge, at, self.config)
+                    or (Venue.RISEX, snapshot.risex_market.venue_symbol)
+                    not in self._trade_stream_ready
+                    or not self._route_trade_stream_ready(
+                        snapshot.hedge_market.venue,
+                        snapshot.hedge_market.venue_symbol,
+                    )
+                ):
+                    return
+                await candidate.recover(
+                    recovered_at=at,
+                    risex_observation=risex,
+                    hedge_observation=hedge,
+                    risex_capture=risex_capture,
+                    hedge_capture=hedge_capture,
+                )
+            else:
+                await candidate.evaluate(
+                    evaluated_at=at,
+                    risex_observation=risex,
+                    hedge_observation=hedge,
+                    record_sample=False,
+                    hard_basis_only=True,
+                    risex_capture=risex_capture,
+                    hedge_capture=hedge_capture,
+                )
             if self.lifecycle is not lifecycle or lifecycle.snapshot is not before:
                 return
             if candidate.fill_provenance and not self._captures_are_current(

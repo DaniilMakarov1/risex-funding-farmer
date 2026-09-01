@@ -39,7 +39,7 @@ from risex_farmer.models import (
     Venue,
 )
 from risex_farmer.market_data import BookStream
-from risex_farmer.lifecycle import LifecycleEngine
+from risex_farmer.lifecycle import LifecycleEngine, LifecycleEventType
 from risex_farmer.notifications import (
     NotificationOutbox,
     TELEGRAM_HTML_PARSE_MODE,
@@ -9217,6 +9217,147 @@ async def _stabilization002_position_runtime(
     runtime.lifecycle = LifecycleEngine.from_snapshot(repository.load_runtime())
     await _stabilization002_seed_position_books(runtime, NOW)
     return runtime
+
+
+async def _stabilization002_persist_gap(
+    runtime: PublicPaperRuntime, repository: PaperRepository, at: datetime
+) -> None:
+    lifecycle = runtime.lifecycle
+    assert lifecycle is not None
+    candidate = lifecycle.detached()
+    await candidate.start_gap(started_at=at)
+    repository.save_decision(
+        recorded_at=at, lifecycle_snapshot=candidate.snapshot
+    )
+    lifecycle.publish_candidate(candidate)
+
+
+def _stabilization002_hedge_delta(
+    runtime: PublicPaperRuntime, at: datetime, *, sequence: int = 2
+) -> BookDelta:
+    lifecycle = runtime.lifecycle
+    assert lifecycle is not None
+    market = lifecycle.snapshot.hedge_market
+    assert market.venue is Venue.EXTENDED
+    return BookDelta(
+        Venue.EXTENDED,
+        market.venue_symbol,
+        (BookLevel(D("100"), D("10")),),
+        (),
+        at,
+        sequence,
+        None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_relevant_book_event_recovers_open_gap_when_both_legs_are_fresh(
+    tmp_path,
+):
+    clock = FakeClock()
+    with PaperRepository(tmp_path / "relevant-book-gap-recovery.db") as repository:
+        runtime = await _stabilization002_position_runtime(repository, clock)
+        await _stabilization002_persist_gap(runtime, repository, clock.now())
+        clock.advance(1)
+        at = clock.now()
+        lifecycle = runtime.lifecycle
+        assert lifecycle is not None
+        symbol = lifecycle.snapshot.hedge_market.venue_symbol
+        session_id = stream_session(runtime, Venue.EXTENDED, symbol, "book")
+
+        assert await runtime.apply_book_event(
+            _stabilization002_hedge_delta(runtime, at),
+            stream_session_id=session_id,
+        )
+
+        assert runtime.lifecycle is not None
+        after = runtime.lifecycle.snapshot
+        assert not after.gap_open
+        assert after.gaps[-1].ended_at == at
+        assert repository.load_runtime() == after
+
+
+@pytest.mark.asyncio
+async def test_relevant_book_event_keeps_gap_open_when_other_leg_is_stale(
+    tmp_path,
+):
+    clock = FakeClock()
+    with PaperRepository(tmp_path / "relevant-book-gap-stale-leg.db") as repository:
+        runtime = await _stabilization002_position_runtime(repository, clock)
+        await _stabilization002_persist_gap(runtime, repository, clock.now())
+        clock.advance(26)
+        at = clock.now()
+        lifecycle = runtime.lifecycle
+        assert lifecycle is not None
+        hedge_symbol = lifecycle.snapshot.hedge_market.venue_symbol
+        runtime.coordinator.stream(
+            Venue.EXTENDED, hedge_symbol
+        ).connection_confirmed(at)
+        session_id = stream_session(
+            runtime, Venue.EXTENDED, hedge_symbol, "book"
+        )
+
+        assert await runtime.apply_book_event(
+            _stabilization002_hedge_delta(runtime, at),
+            stream_session_id=session_id,
+        )
+
+        assert runtime.lifecycle is not None
+        after = runtime.lifecycle.snapshot
+        assert after.gap_open
+        assert after == repository.load_runtime()
+        assert not any(
+            event.event_type is LifecycleEventType.GAP_ENDED
+            for event in after.events
+        )
+
+
+@pytest.mark.asyncio
+async def test_relevant_book_event_keeps_gap_open_after_other_leg_invalidation(
+    tmp_path,
+):
+    clock = FakeClock()
+    with PaperRepository(tmp_path / "relevant-book-gap-invalidation.db") as repository:
+        runtime = await _stabilization002_position_runtime(repository, clock)
+        lifecycle = runtime.lifecycle
+        assert lifecycle is not None
+        risex_symbol = lifecycle.snapshot.risex_market.venue_symbol
+        risex_session_id = stream_session(
+            runtime, Venue.RISEX, risex_symbol, "combined"
+        )
+        await runtime.mark_disconnected(
+            Venue.RISEX,
+            risex_symbol,
+            at=clock.now(),
+            stream_kind="trade",
+            stream_session_id=risex_session_id,
+        )
+        assert runtime.lifecycle is not None
+        assert runtime.lifecycle.snapshot.gap_open
+        assert runtime.coordinator.stream(
+            Venue.RISEX, risex_symbol
+        ).health(clock.now()).data_quality is DataQuality.COMPLETE
+        assert (Venue.RISEX, risex_symbol) not in runtime._trade_stream_ready
+
+        clock.advance(1)
+        at = clock.now()
+        hedge_symbol = runtime.lifecycle.snapshot.hedge_market.venue_symbol
+        hedge_session_id = stream_session(
+            runtime, Venue.EXTENDED, hedge_symbol, "book"
+        )
+        assert await runtime.apply_book_event(
+            _stabilization002_hedge_delta(runtime, at),
+            stream_session_id=hedge_session_id,
+        )
+
+        assert runtime.lifecycle is not None
+        after = runtime.lifecycle.snapshot
+        assert after.gap_open
+        assert after == repository.load_runtime()
+        assert not any(
+            event.event_type is LifecycleEventType.GAP_ENDED
+            for event in after.events
+        )
 
 
 def _stabilization002_fail_save(repository: PaperRepository) -> None:
