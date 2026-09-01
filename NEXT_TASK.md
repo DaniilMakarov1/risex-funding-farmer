@@ -2,7 +2,7 @@
 
 ## PAPER continuous correctness proof
 
-Status: `ACTIVE — CHIEF40 SAFELY STOPPED ON PROVEN EXTENDED CONNECTION-STORM DEFECT; CORRECTION IN PROGRESS`.
+Status: `ACTIVE — EXTENDED CORRECTION ACCEPTED ON e4d8dcc; FRESH PAPER VALIDATION NEXT`.
 
 Objective: starting from accepted published main, run exactly one fresh public-only PAPER process on a new owner-only database and obtain reproducible end-to-end evidence that eligible profitable routes can activate, retain an immutable attempt quantity across harmless optimizer drift, accumulate only qualifying maker trade-through, open both virtual legs atomically, reconcile funding, and close back to exact `FLAT`. Observe every missed opportunity and terminal attempt outcome. A cancellation or no-trade result is valid only when its exact fail-closed reason is supported by authoritative persisted market/runtime evidence; any proven implementation defect gets one fresh bounded visible PAPER Builder candidate followed by independent Chief review, integration, and another fresh validation process/database.
 
@@ -18,9 +18,11 @@ User decision: on `2026-09-01` the user explicitly directed the Chief to pursue 
 
 Terminal `chief40` evidence: published governance/main `51fe7ef098adcf5d4ab462476b90bd111cd796c6` started exactly one fresh runtime, PID `28438`, launchd label `com.risex.paper.chief40`, on new database `mainnet-paper-live-20260901-chief40.db`. It reached `PAPER_RUN_READY`, then opened `57` separate Extended sockets for `19` required markets across book/trade/funding. Within about four minutes it recorded `115` Extended disconnects, `73` Extended book-resync requirements, repeated full-scan lateness/deferred observations, and no second completed full scan. Chief unloaded the exact label at zero exposure; durable `STOPPED_SAFE`, SQLite integrity `ok`, and zero orders/fills/positions/funding settlements/completed trades are proven. The launchd file is removed so this immutable database cannot restart on login. Preserve and never resume it.
 
+Accepted correction: main `e4d8dccc9ce327335ef18a1a6390b4be479499cc` owns exactly three market-omitted Extended sockets, routes strictly by validated market, enforces the observed physical global book sequence on every frame, replaces the aggregate book stream and fails all books closed on physical ambiguity, keeps valid contiguous market-local content failures isolated, forbids REST recovery while the aggregate book stream is owned, rejects displaced sessions, and atomically stages Extended funding reconciliation. Independent Chief verification passed `12` focused tests, all `188` runtime tests, and a fresh isolated Python 3.11 full suite with `3620` passed / `3` skipped plus compile, import, scope, diff, and ancestry checks. Start exactly one fresh process/database from this accepted tip and first prove three Extended sockets, repeated completed full scans, stable readiness for all four venues, no connection storm, and zero fatal/exposure before evaluating opportunity and lifecycle behavior.
+
 ## PAPER Extended aggregate public streams
 
-Status: `AUTHORIZED — ONE FRESH VISIBLE PAPER BUILDER REQUIRED`.
+Status: `ACCEPTED — INTEGRATED ON e4d8dcc; FRESH PAPER VALIDATION REQUIRED`.
 
 Objective: replace Extended's current per-market public WebSocket fan-out with exactly three owned venue-wide streams using the official market-omitted endpoints: one all-market order-book stream, one all-market public-trades stream, and one all-market applied-funding stream. Route each validated message to its exact required canonical market while preserving all existing book sequence/snapshot recovery, trade sequence and maker-evidence identity, applied-funding identity, component readiness, heartbeat/watchdog, catalog reconciliation, stale-data, and fail-closed behavior. This is an Extended transport correction, not a product/economics change.
 
@@ -33,13 +35,15 @@ Observed contract and defect:
 Acceptance:
 
 - Use exactly three Extended public WebSocket connections independent of required-market count. Message market identity must be strictly parsed and only currently required canonical markets may mutate observations, readiness, books, trade evidence, or applied funding.
-- Preserve per-symbol book state and strict monotonic sequence/recovery semantics. One market's invalid book sequence must fail that market closed and recover it without falsely invalidating or replacing healthy unrelated markets; no REST book may establish WebSocket sequence health.
+- Preserve per-symbol book state under the observed venue-wide physical sequence contract. Any physical duplicate, out-of-order frame, or forward gap must fail every required Extended book closed and replace the single aggregate book socket; on valid contiguous physical frames, a market-local content/application failure isolates only that market. No REST book may establish or recover aggregate WebSocket sequence health.
 - Preserve per-symbol trade sequence/evidence isolation and prevent historical, duplicate, wrong-market, stale-session, or removed-market messages from contributing to maker fill. Preserve per-symbol applied-funding reconciliation and never turn the applied stream into the future funding quote.
 - Preserve server ping/pong handling, owned stream replacement, watchdog freshness, startup/readiness gates, dynamic catalog add/remove reconciliation, one-position limit, locked quantity, entry cutoff, economics, Telegram, persistence, and all non-Extended venue behavior.
 - Add focused/adverse regressions for connection count, interleaved multi-market routing, one-market gap isolation, dynamic add/remove, stale-session replacement, heartbeat/watchdog, and no evidence cross-contamination. Run one clean isolated Python 3.11 full suite plus dependency, compile, diff, and no-write checks on the final candidate.
 - Do not change scanner ranking, target quantity, fees/funding/execution economics, timing/freshness thresholds, maker-fill rules, private access, credentials, signing, dispatch, or any venue-write surface.
 
 Use one fresh visible PAPER Builder on GPT-5.6 Luna `max` from the exact published governance base. Chief independently reviews and alone integrates/pushes. After acceptance, start exactly one fresh process/database and prove three Extended sockets, repeated completed full scans, stable four-venue readiness, and no connection storm before evaluating entry behavior.
+
+Accepted evidence: visible Builder commits `04985fc01eee7b8ff5ef81380a8ba9ef6cb3ab69`, `e8dc6eeeed4933a276b991d86e2e92a83e4d2972`, and `e4d8dccc9ce327335ef18a1a6390b4be479499cc` remain additive and reviewable. A bounded live public diagnostic observed aggregate order-book sequence `1..80` across interleaved markets, proving one physical global cursor. The Builder's final suite passed `3620` with `3` skipped. The Chief independently reviewed the full final diff and races, repeated `12` focused and `188` runtime tests, and ran a new isolated Python 3.11 full suite with `3620` passed and `3` skipped; compile, import, diff, ancestry, clean-candidate, no-private, and no-write checks passed. The exact candidate was fast-forward integrated to `main`; no runtime is active yet.
 
 ## PAPER maker-entry locked quantity
 
