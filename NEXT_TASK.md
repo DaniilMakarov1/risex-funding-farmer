@@ -1,5 +1,11 @@
 # Active bounded task
 
+## PAPER chief39 live behavior observation
+
+Status: `ACTIVE — USER-REQUESTED 2.5-HOUR READ-ONLY OBSERVATION THROUGH 2026-09-01 13:22 EUROPE/MOSCOW`.
+
+Objective: observe the single fresh public-only PAPER runtime `chief39` on owner-only database `mainnet-paper-live-20260901-chief39.db` without restarting, repairing, or creating another process. Track every maker-entry activation through its exact terminal outcome: cancellation reason and duration/evidence, or full maker fill followed immediately by exact-quantity taker hedge, persisted position, funding, close, and final PnL. Confirm all `128` routes including `48` Lighter directions, four-venue health, Lighter heartbeat/funding usability, zero fatal/blocked evidence, and Telegram lifecycle evidence. A single bounded control notification was already accepted by Telegram HTTP `200` / `ok=true`; do not send further synthetic messages. Heartbeat `paper-chief39-2-5` checks every ten minutes and produces one final aggregate after the window, then deletes itself while leaving PAPER running unless a safety failure requires a halt. No credential read, private venue access, venue write, strategy execution, or change to economics/freshness/window behavior is authorized.
+
 ## PAPER Lighter heartbeat and exact entry-cutoff timing
 
 Status: `ACCEPTED — PUBLISHED AND LIVE-VALIDATED IN FRESH CHIEF38`.
