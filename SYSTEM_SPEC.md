@@ -20,7 +20,7 @@ MAX_OPEN_POSITIONS = 1
 NORMAL_SCAN_SECONDS = 120
 FOCUSED_WINDOW_SECONDS = 300
 FOCUSED_SCAN_SECONDS = 10
-ENTRY_MAKER_START_BEFORE_FUNDING_SECONDS = 120
+ENTRY_MAKER_START_BEFORE_FUNDING_SECONDS = 180
 ENTRY_MAKER_CANCEL_BEFORE_FUNDING_SECONDS = 5
 ENTRY_ORDER_REPRICE_SECONDS = 10
 OPEN_POSITION_MONITOR_SECONDS = 10
@@ -145,7 +145,7 @@ Adapter converts venue semantics to cash per canonical base. Core calculates `le
 
 For Extended, the future Scanner quote comes only from the official REST market stats (`fundingRate`, `markPrice`, and future `nextFundingRate`). A funding WebSocket record is applied/history evidence: it never replaces the future `MarketObservation.funding`, never turns its event timestamp into a future settlement, and reconciles an open lifecycle only against the exact persisted venue/market/settlement identity. Keep REST quote readiness as `funding`, applied-record data readiness as `applied_funding`, and physical connection readiness as `connection_funding`; these components must not overwrite one another. The public funding stream contains only hourly applied records, so a heartbeat-confirmed funding connection is sufficient stream readiness for a future Scanner quote; absence of the first applied record after startup is not a blocker and does not make the venue unavailable. When public evidence cannot establish applied cash, retain `UNRESOLVED`; do not infer cash from a book midpoint or carry an applied rate into the next cycle.
 
-Before maker fill, `assumed_position_opened_at = current_evaluation_timestamp`: estimate full-position funding if opened now. Never use order creation as an open position, forecast a T−5 fill, or freeze the T−120 estimate. After full two-leg entry, `position_opened_at = route_taker_fill_at` and funding is recomputed from actual open time.
+Before maker fill, `assumed_position_opened_at = current_evaluation_timestamp`: estimate full-position funding if opened now. Never use order creation as an open position, forecast a T−5 fill, or freeze the T−180 estimate. After full two-leg entry, `position_opened_at = route_taker_fill_at` and funding is recomputed from actual open time.
 
 ## 8. Target cycle and settlement reconciliation
 
@@ -170,7 +170,7 @@ APPLIED_RATE replaces ESTIMATED; it is not another cash flow. Authoritative cash
 
 ## 9. Exact scheduling
 
-`entry_activation_at = T - 120 seconds`; `entry_fill_cutoff_at = T - 5 seconds`. Create one exact activation event once the cycle is known and perform focused evaluation exactly then, independent of a periodic tick. Starting with `5 < seconds_to_T < 120` permits immediate focused evaluation. Recalculate every 10 seconds thereafter.
+`entry_activation_at = T - 180 seconds`; `entry_fill_cutoff_at = T - 5 seconds`. Create one exact activation event once the cycle is known and perform focused evaluation exactly then, independent of a periodic tick. Starting with `5 < seconds_to_T < 180` permits immediate focused evaluation. Recalculate every 10 seconds thereafter.
 
 A trade participates only if `exchange_timestamp < cutoff`. A trade exactly at or after cutoff never counts, regardless of receipt time or coroutine ordering. Persist exchange, receipt, and raw timestamps. At T−5 cancel an unfilled order and skip the opportunity.
 
