@@ -5671,6 +5671,192 @@ def test_risex_recovery_cursor_boundary_is_strict_and_checksum_validated(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_risex_bad_buffered_replay_restarts_before_next_snapshot(tmp_path):
+    clock = FakeClock()
+    stop = asyncio.Event()
+    symbol = "AAA/USDC"
+    market_id = "1"
+    timestamp_ns = str(int(clock.now().timestamp() * 1_000_000_000))
+
+    def levels(quantity: str = "20") -> dict[str, object]:
+        return {
+            "bids": [{"price": "99", "quantity": quantity}],
+            "asks": [{"price": "101", "quantity": "20"}],
+        }
+
+    def checksum(quantity: str) -> int:
+        stream = BookStream(Venue.RISEX, symbol)
+        stream.snapshot(OrderBook(
+            Venue.RISEX, symbol,
+            (BookLevel(D("99"), D(quantity)),),
+            (BookLevel(D("101"), D("20")),), clock.now(),
+        ))
+        return stream.risex_checksum()
+
+    payloads = [
+        {
+            "channel": "orderbook", "type": "update", "market_id": market_id,
+            "block_number": 100, "log_index": 0,
+            "worker_timestamp": timestamp_ns, "checksum": 0,
+            "data": {"market_id": 1, **levels("18")},
+        },
+        {
+            "channel": "orderbook", "type": "update", "market_id": market_id,
+            "block_number": 100, "log_index": 2,
+            "worker_timestamp": timestamp_ns,
+            "checksum": checksum("19") + 1,
+            "data": {"market_id": 1, **levels("19")},
+        },
+        {
+            "method": "snapshot", "channel": "orderbook", "type": "snapshot",
+            "market_id": market_id, "block_number": 100, "log_index": 1,
+            "worker_timestamp": timestamp_ns,
+            "data": {"market_id": 1, **levels("20")},
+        },
+        {
+            "method": "snapshot", "channel": "orderbook", "type": "snapshot",
+            "market_id": market_id, "block_number": 100, "log_index": 3,
+            "worker_timestamp": timestamp_ns,
+            "data": {"market_id": 1, **levels("20")},
+        },
+    ]
+
+    class SyntheticRisexAdapter(RisexAdapter):
+        def __init__(self) -> None:
+            super().__init__(None)
+            self._market_ids = {symbol: market_id}
+            self._symbols_by_id = {market_id: symbol}
+            self._raw_markets = {
+                symbol: {
+                    "market_id": market_id,
+                    "config": {
+                        "name": symbol, "step_size": "1",
+                        "step_price": "1", "min_order_size": "1",
+                    },
+                }
+            }
+
+        async def fetch_book(self, venue_symbol: str) -> OrderBook:
+            assert venue_symbol == symbol
+            return OrderBook(
+                Venue.RISEX, venue_symbol,
+                (BookLevel(D("99"), D("20")),),
+                (BookLevel(D("101"), D("20")),), clock.now(),
+            )
+
+    class TextMessage:
+        type = aiohttp.WSMsgType.TEXT
+
+        def __init__(self, payload: dict[str, object]) -> None:
+            self.data = json.dumps(payload)
+
+    class ScriptedWebSocket:
+        def __init__(self) -> None:
+            self.messages = deque(TextMessage(payload) for payload in payloads)
+            self.sent: list[dict[str, object]] = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self.messages:
+                return self.messages.popleft()
+            stop.set()
+            raise StopAsyncIteration
+
+        async def send_json(self, payload: dict[str, object]) -> None:
+            self.sent.append(payload)
+
+        async def pong(self, _payload) -> None:
+            return None
+
+    class ScriptedSession:
+        def __init__(self, websocket: ScriptedWebSocket) -> None:
+            self.websocket = websocket
+            self.connections = 0
+
+        def ws_connect(self, *_args, **_kwargs):
+            self.connections += 1
+            return self.websocket
+
+    adapter = SyntheticRisexAdapter()
+    websocket = ScriptedWebSocket()
+    session = ScriptedSession(websocket)
+    with PaperRepository(tmp_path / "risex-bad-buffered-replay.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={Venue.RISEX: adapter}, clock=clock,
+        )
+        runtime._session = session
+        runtime._stop_event = stop
+        published: list[OrderBook] = []
+        publish = runtime._publish_recovery_snapshot
+
+        async def record_publish(*args, **kwargs):
+            published.append(args[3])
+            return await publish(*args, **kwargs)
+
+        runtime._publish_recovery_snapshot = record_publish
+        session_id = runtime._new_stream_session(
+            (Venue.RISEX, "*", "combined")
+        )
+        await runtime._combined_stream(
+            Venue.RISEX, adapter, (symbol,), session_id
+        )
+        evidence = repository.connection.execute(
+            "SELECT event_type,detail FROM runtime_evidence ORDER BY evidence_id"
+        ).fetchall()
+
+    failed = [
+        json.loads(row["detail"])
+        for row in evidence
+        if row["event_type"] == "PUBLIC_SNAPSHOT_RECOVERY_FAILED"
+    ]
+    started = [
+        json.loads(row["detail"])
+        for row in evidence
+        if row["event_type"] == "PUBLIC_SNAPSHOT_RECOVERY_STARTED"
+    ]
+    resubscribes = [
+        row for row in evidence
+        if row["event_type"] == "PUBLIC_BOOK_RESYNC_STARTED"
+    ]
+    completed = [
+        json.loads(row["detail"])
+        for row in evidence
+        if row["event_type"] == "PUBLIC_SNAPSHOT_RECOVERY_COMPLETED"
+    ]
+    assert session.connections == 1
+    assert len(failed) == 1
+    assert failed[0]["cause"] == "WS_SNAPSHOT_REPLAY_FAILED"
+    assert len(started) == 2
+    assert len(resubscribes) == 2
+    assert len(completed) == 1
+    assert completed[0]["episode_id"] == started[1]["episode_id"]
+    assert completed[0]["episode_id"] != failed[0]["episode_id"]
+    assert len(published) == 1
+    assert published[0].bids[0].canonical_quantity == D("20")
+    assert published[0].sequence == (100 << 64) | 3
+    episode = runtime._recoveries[Venue.RISEX, symbol]
+    assert episode.terminal == "COMPLETE"
+    assert not episode.buffer
+    assert runtime.coordinator.stream(Venue.RISEX, symbol).book() == published[0]
+    assert websocket.sent == [
+        adapter.orderbook_subscription([1]),
+        adapter.trades_subscription([1]),
+        adapter.orderbook_unsubscription(),
+        adapter.orderbook_subscription([1]),
+        adapter.orderbook_unsubscription(),
+        adapter.orderbook_subscription([1]),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_risex_delta_cannot_extend_rest_book_before_ws_snapshot(tmp_path):
     """A checksum-valid delta still needs the session's WS snapshot boundary."""
     clock = FakeClock()
