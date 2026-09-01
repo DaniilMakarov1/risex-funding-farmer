@@ -5409,6 +5409,139 @@ async def test_risex_checksum_gap_resubscribes_and_recovers_from_ws_snapshots(tm
 
 
 @pytest.mark.asyncio
+async def test_risex_background_refresh_does_not_overwrite_live_combined_book(
+    tmp_path,
+):
+    """A REST refresh racing WS ownership must retain the live checksum state."""
+    clock = FakeClock()
+    symbol = "ABC/USDC"
+    key = (Venue.RISEX, symbol)
+    stream_key = (Venue.RISEX, "*", "combined")
+    book_started = asyncio.Event()
+    release_book = asyncio.Event()
+    stale_rest_book = OrderBook(
+        Venue.RISEX, symbol,
+        (BookLevel(D("99"), D("20")),),
+        (BookLevel(D("101"), D("20")),),
+        clock.now(),
+    )
+
+    class RacingRisexAdapter(RisexAdapter):
+        def __init__(self) -> None:
+            super().__init__(None)
+            self.market = replace(
+                FakeAdapter(
+                    Venue.RISEX, clock, settlement_at=NOW + timedelta(minutes=5)
+                ).market,
+                venue_symbol=symbol,
+            )
+            self._market_ids = {symbol: "1"}
+            self._symbols_by_id = {"1": symbol}
+
+        async def fetch_book(self, venue_symbol: str) -> OrderBook:
+            assert venue_symbol == symbol
+            book_started.set()
+            await release_book.wait()
+            return stale_rest_book
+
+        async def prime_recent_trade_evidence(
+            self, market: CanonicalMarket, *, limit: int = 20
+        ) -> CanonicalMarket:
+            return market
+
+        async def fetch_funding_quote(self, market, *, assumed_open_at):
+            return FundingCashQuote(
+                Venue.RISEX, symbol, clock.now(), assumed_open_at,
+                NOW + timedelta(minutes=5), FundingQuality.ESTIMATED,
+                FundingAccrualMethod.SNAPSHOT_AT_SETTLEMENT, True,
+                D("1"), D("1"), "PAPER_ASSUMPTION:RISEX_PUBLIC_FALLBACK",
+            )
+
+    adapter = RacingRisexAdapter()
+    volume = MarketVolume(
+        Venue.RISEX, symbol, D("1000000"), clock.now(), "official-shaped"
+    )
+    old_quote = await adapter.fetch_funding_quote(
+        adapter.market, assumed_open_at=clock.now()
+    )
+    live_snapshot = OrderBook(
+        Venue.RISEX, symbol,
+        (BookLevel(D("100"), D("2")),),
+        (BookLevel(D("102"), D("2")),),
+        clock.now(),
+    )
+    live_after_first_update = OrderBook(
+        Venue.RISEX, symbol,
+        (BookLevel(D("100"), D("3")),),
+        (BookLevel(D("102"), D("2")),),
+        clock.now(),
+    )
+    live_after_second_update = OrderBook(
+        Venue.RISEX, symbol,
+        (BookLevel(D("100"), D("4")),),
+        (BookLevel(D("102"), D("2")),),
+        clock.now(),
+    )
+
+    def checksum(book: OrderBook) -> int:
+        projected = BookStream(Venue.RISEX, symbol)
+        projected.snapshot(book)
+        return projected.risex_checksum()
+
+    with PaperRepository(tmp_path / "risex-refresh-book-ownership.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={Venue.RISEX: adapter}, clock=clock
+        )
+        stream = runtime.coordinator.stream(*key)
+        stream.connected(clock.now())
+        stream.snapshot(stale_rest_book)
+        stream.connection_confirmed(clock.now())
+        runtime.observations[key] = MarketObservation(
+            adapter.market, volume, stale_rest_book, old_quote, stream.health(clock.now()),
+            trade_stream_ready=False,
+        )
+        session_id = runtime._new_stream_session(stream_key)
+
+        refresh = asyncio.create_task(runtime._market_observation(
+            adapter.market, clock.now(), background=True,
+            catalog_volumes={key: volume},
+        ))
+        await book_started.wait()
+
+        assert await runtime.apply_book_event(
+            live_snapshot, stream_session_id=session_id
+        )
+        assert await runtime.apply_book_event(
+            BookDelta(
+                Venue.RISEX, symbol,
+                live_after_first_update.bids, (), clock.now(),
+                checksum=checksum(live_after_first_update),
+            ),
+            stream_session_id=session_id,
+        )
+
+        release_book.set()
+        await refresh
+
+        # The refresh returned an older REST snapshot while the combined WS
+        # stream had already established and advanced its own checksum state.
+        assert runtime.coordinator.stream(*key).book() == live_after_first_update
+        assert await runtime.apply_book_event(
+            BookDelta(
+                Venue.RISEX, symbol,
+                live_after_second_update.bids, (), clock.now(),
+                checksum=checksum(live_after_second_update),
+            ),
+            stream_session_id=session_id,
+        )
+        assert runtime.coordinator.stream(*key).book() == live_after_second_update
+        assert repository.connection.execute(
+            "SELECT COUNT(*) FROM runtime_evidence "
+            "WHERE event_type='PUBLIC_BOOK_RESYNC_REQUIRED'"
+        ).fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
 async def test_extended_eof_persists_one_ordered_physical_socket_episode(tmp_path):
     clock = FakeClock()
     stop = asyncio.Event()

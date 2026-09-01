@@ -2084,6 +2084,17 @@ class PublicPaperRuntime:
         )
         existing = self.observations.get(key)
         request_started_at = self.clock.now()
+        risex_stream_key: tuple[Venue, str, str] | None = None
+        risex_session_at_start: StreamSessionId | None = None
+        risex_book_revision_at_start: int | None = None
+        risex_invalidation_revision_at_start: int | None = None
+        if isinstance(adapter, RisexAdapter) and background:
+            risex_stream_key = self._book_stream_key(*key)
+            risex_session_at_start = self._stream_sessions.get(risex_stream_key)
+            risex_book_revision_at_start = self._book_revisions.get(key, 0)
+            risex_invalidation_revision_at_start = (
+                self._stream_invalidation_revisions.get(key, 0)
+            )
         try:
             if isinstance(adapter, ExtendedAdapter) and background:
                 transport_gap = self._extended_transport_gap_kinds(
@@ -2205,6 +2216,34 @@ class PublicPaperRuntime:
                     )
             logical_at = self.clock.now()
             funding = _quote_for_open_time(funding, logical_at)
+            if (
+                isinstance(adapter, RisexAdapter)
+                and background
+                and risex_stream_key is not None
+                and risex_book_revision_at_start is not None
+                and risex_invalidation_revision_at_start is not None
+            ):
+                current_stream = self.coordinator.stream(*key)
+                current_recovery = self._recoveries.get(key)
+                stream_state_changed = (
+                    self._stream_sessions.get(risex_stream_key)
+                    != risex_session_at_start
+                    or self._book_revisions.get(key, 0)
+                    != risex_book_revision_at_start
+                    or self._stream_invalidation_revisions.get(key, 0)
+                    != risex_invalidation_revision_at_start
+                    or (
+                        current_recovery is not None
+                        and current_recovery.terminal is None
+                    )
+                )
+                if stream_state_changed:
+                    # A combined WS event or recovery may have advanced or
+                    # invalidated the book while REST was in flight.  The
+                    # stream owns that state; never replace it with an
+                    # unordered REST snapshot or publish a stale book.
+                    preserve_stream_book = True
+                    book = current_stream.book()
             stream = self.coordinator.stream(market.venue, market.venue_symbol)
             if isinstance(adapter, LighterAdapter):
                 lighter_stream_book = self._healthy_lighter_stream_book(key, logical_at)
