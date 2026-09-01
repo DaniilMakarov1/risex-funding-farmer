@@ -4214,12 +4214,18 @@ class PublicPaperRuntime:
             self._extended_aggregate_key(kind), stream_session_id
         ):
             return
+        # The aggregate trade socket carries every required market and has no
+        # per-market subscription acknowledgement.  A current physical
+        # connection confirmation is therefore the trade-stream evidence for
+        # each market, even when that market has been quiet.  Book and funding
+        # retain their independent data-readiness requirements.
+        aggregate_data_ready = data_ready or kind == "trade"
         for symbol in self._extended_stream_symbols_now():
             self._confirm_extended_stream(
                 symbol,
                 kind,
                 at,
-                data_ready=data_ready,
+                data_ready=aggregate_data_ready,
                 stream_session_id=stream_session_id,
             )
 

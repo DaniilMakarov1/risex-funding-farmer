@@ -7745,7 +7745,7 @@ async def test_extended_client_heartbeat_is_ten_seconds_and_owned(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_extended_server_ping_and_client_pong_confirm_only_own_socket(tmp_path):
+async def test_extended_aggregate_trade_heartbeat_makes_all_symbols_ready(tmp_path):
     clock = FakeClock()
     stop = asyncio.Event()
 
@@ -7775,18 +7775,76 @@ async def test_extended_server_ping_and_client_pong_confirm_only_own_socket(tmp_
         runtime = PublicPaperRuntime(repository, adapters={}, clock=clock)
         runtime._session = session
         runtime._stop_event = stop
-        runtime._extended_stream_symbols = ("ABC-EXTENDED",)
+        runtime._extended_stream_symbols = (
+            "ABC-EXTENDED", "QUIET-EXTENDED",
+        )
         session_id = runtime._new_stream_session(
             (Venue.EXTENDED, "*", "trade")
         )
         await runtime._extended_stream(
-            ExtendedAdapter(None), ("ABC-EXTENDED",), "trade", session_id
+            ExtendedAdapter(None), runtime._extended_stream_symbols, "trade", session_id
         )
     assert socket.pongs == [b"server"]
-    assert runtime._extended_confirmed_at["ABC-EXTENDED", "trade"] == NOW + timedelta(seconds=2)
-    assert (Venue.EXTENDED, "ABC-EXTENDED") not in runtime._trade_stream_ready
+    assert all(
+        runtime._extended_confirmed_at[symbol, "trade"] == NOW + timedelta(seconds=2)
+        for symbol in runtime._extended_stream_symbols
+    )
+    assert {
+        (Venue.EXTENDED, symbol) for symbol in runtime._extended_stream_symbols
+    } <= runtime._trade_stream_ready
+    assert all(
+        runtime.component_readiness[Venue.EXTENDED][f"trade:{symbol}"].available
+        for symbol in runtime._extended_stream_symbols
+    )
+    assert all(
+        runtime.component_readiness[Venue.EXTENDED][
+            f"connection_trade:{symbol}"
+        ].available
+        for symbol in runtime._extended_stream_symbols
+    )
     assert ("ABC-EXTENDED", "book") not in runtime._extended_confirmed_at
     assert ("ABC-EXTENDED", "funding") not in runtime._extended_confirmed_at
+
+
+@pytest.mark.asyncio
+async def test_extended_aggregate_trade_stale_session_cannot_ready_new_symbol(tmp_path):
+    clock = FakeClock()
+    stop = asyncio.Event()
+    with PaperRepository(tmp_path / "extended-aggregate-trade-session-ownership.db") as repository:
+        runtime = PublicPaperRuntime(repository, adapters={}, clock=clock)
+        runtime._stop_event = stop
+        runtime._extended_stream_symbols = ("ABC-EXTENDED",)
+        key = (Venue.EXTENDED, "*", "trade")
+        stale_session = runtime._new_stream_session(key)
+        runtime._confirm_extended_aggregate(
+            "trade", clock.now(), data_ready=False,
+            stream_session_id=stale_session,
+        )
+        await runtime.mark_disconnected(
+            Venue.EXTENDED, "ABC-EXTENDED", stream_kind="trade",
+            stream_session_id=stale_session,
+        )
+
+        runtime._extended_stream_symbols = (
+            "ABC-EXTENDED", "NEW-EXTENDED",
+        )
+        current_session = runtime._new_stream_session(key)
+        runtime._confirm_extended_aggregate(
+            "trade", clock.now(), data_ready=False,
+            stream_session_id=stale_session,
+        )
+        assert (Venue.EXTENDED, "NEW-EXTENDED") not in runtime._trade_stream_ready
+        assert "trade:NEW-EXTENDED" not in runtime.component_readiness.get(
+            Venue.EXTENDED, {}
+        )
+
+        runtime._confirm_extended_aggregate(
+            "trade", clock.now(), data_ready=False,
+            stream_session_id=current_session,
+        )
+        assert {
+            (Venue.EXTENDED, symbol) for symbol in runtime._extended_stream_symbols
+        } <= runtime._trade_stream_ready
 
 
 @pytest.mark.asyncio
