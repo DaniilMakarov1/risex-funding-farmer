@@ -2,7 +2,7 @@
 
 ## PAPER maker-entry locked quantity
 
-Status: `AUTHORIZED — GOVERNANCE BOUNDARY PENDING FRESH BUILDER IMPLEMENTATION AND INDEPENDENT ACCEPTANCE`.
+Status: `ACCEPTED — IMPLEMENTATION INTEGRATED ON f6fd1dd; FRESH LIVE VALIDATION PENDING AFTER CHIEF39 OBSERVATION`.
 
 Objective: on maker-entry activation, persist the exact canonical plan quantity as immutable `locked_quantity` for that attempt. A later 10-second Scanner plan may optimize to a different target quantity, but quantity drift alone must not emit `PAPER_ORDER_CANCELLED_ROUTE_INVALID`, cancel/re-enter, resize, or transfer maker evidence. Re-evaluate the locked attempt only at `locked_quantity`: current exact-q taker entry depth/VWAP, both venue grids and minimum quantity/notional, fresh data on both legs, the same route/direction/target funding cycle, maker post-only validity, fees/funding/execution components, and planned maker net PnL. Retain exact fail-closed cancellation when any of those locked-quantity gates actually fails or becomes unknown, or at the existing exact `T−5` cutoff.
 
@@ -17,6 +17,8 @@ Acceptance:
 - Do not touch, stop, restart, repair, copy, or resume active `chief39` or `mainnet-paper-live-20260901-chief39.db` before acceptance. After publication, validate only on a fresh PAPER database and prove live quantity drift no longer causes cancellation/re-entry while every safety gate remains fail closed.
 
 User decision: on `2026-09-01` the user explicitly authorized this locked-quantity PAPER behavior and explicitly kept clips prohibited. No other economics, timing, freshness, execution, strategy, testnet, or mainnet authority changed.
+
+Accepted evidence: the single fresh visible PAPER Builder produced candidate `f6fd1dde218c8d309be28b4ed7939f9a8a8ec848` from exact published base `00c01a58177d82cca8a9b6a1eccb1951c624c978`, changing only `paper_broker.py`, `scanner.py`, and focused broker tests. Chief independently reviewed the full diff, quantity/route/cycle/depth/minimum/economics/price-version/fill/cutoff/no-write contracts, repeated `207` focused/adjacent tests, and ran one clean isolated Python 3.11 full suite with `3607` passed and `3` skipped plus compile, dependency, local-import, ancestry, diff, and Git checks. The candidate was fast-forward integrated without touching active `chief39`, its database, `README.md`, or preserved operational artifacts. Publish the accepted main, continue `chief39` read-only through its observation window, then use only a fresh database/process identity for live validation; never run a second PAPER concurrently.
 
 ## PAPER chief39 live behavior observation
 
