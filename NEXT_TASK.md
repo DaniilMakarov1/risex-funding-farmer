@@ -2,7 +2,7 @@
 
 ## PAPER continuous correctness proof
 
-Status: `AUTHORIZED — FRESH LOCKED-QUANTITY VALIDATION AND ITERATIVE DEFECT CORRECTION`.
+Status: `ACTIVE — CHIEF40 FRESH LOCKED-QUANTITY VALIDATION AND ITERATIVE DEFECT CORRECTION`.
 
 Objective: starting from accepted published main, run exactly one fresh public-only PAPER process on a new owner-only database and obtain reproducible end-to-end evidence that eligible profitable routes can activate, retain an immutable attempt quantity across harmless optimizer drift, accumulate only qualifying maker trade-through, open both virtual legs atomically, reconcile funding, and close back to exact `FLAT`. Observe every missed opportunity and terminal attempt outcome. A cancellation or no-trade result is valid only when its exact fail-closed reason is supported by authoritative persisted market/runtime evidence; any proven implementation defect gets one fresh bounded visible PAPER Builder candidate followed by independent Chief review, integration, and another fresh validation process/database.
 
@@ -15,6 +15,8 @@ Acceptance:
 - Clips, partial-position lifecycle, inferred fills, blind continuation across ambiguous maker data, changed timing/freshness/economics, private endpoints, credentials, signing, dispatch, real funds, withdrawals, and strategy-driven venue writes remain outside this slice unless the user separately authorizes a product change.
 
 User decision: on `2026-09-01` the user explicitly directed the Chief to pursue this correctness goal for as long as necessary, continuously test the PAPER system, diagnose missed profitable routes, and correct proven defects. This reopens fresh PAPER validation after the earlier stop but does not authorize real trading or weakening existing safety gates.
+
+Active evidence: published governance/main `51fe7ef098adcf5d4ab462476b90bd111cd796c6` started exactly one fresh runtime, PID `28438`, launchd label `com.risex.paper.chief40`, on new database `mainnet-paper-live-20260901-chief40.db`. The database and logs are owner-only, SQLite integrity is `ok`, `PAPER_RUN_READY` is durable, all four public venues are available, and the first complete snapshot contains all `128` routes with zero orders, fills, positions, funding settlements, completed trades, or fatal/blocked evidence. Automatic launchd restart is disabled so an unexpected terminal failure cannot blindly resume. Heartbeat `paper-chief40-correctness` owns continuing observation and bounded escalation.
 
 ## PAPER maker-entry locked quantity
 
