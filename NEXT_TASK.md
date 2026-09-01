@@ -2,7 +2,7 @@
 
 ## PAPER continuous correctness proof
 
-Status: `ACTIVE — CHIEF40 FRESH LOCKED-QUANTITY VALIDATION AND ITERATIVE DEFECT CORRECTION`.
+Status: `ACTIVE — CHIEF40 SAFELY STOPPED ON PROVEN EXTENDED CONNECTION-STORM DEFECT; CORRECTION IN PROGRESS`.
 
 Objective: starting from accepted published main, run exactly one fresh public-only PAPER process on a new owner-only database and obtain reproducible end-to-end evidence that eligible profitable routes can activate, retain an immutable attempt quantity across harmless optimizer drift, accumulate only qualifying maker trade-through, open both virtual legs atomically, reconcile funding, and close back to exact `FLAT`. Observe every missed opportunity and terminal attempt outcome. A cancellation or no-trade result is valid only when its exact fail-closed reason is supported by authoritative persisted market/runtime evidence; any proven implementation defect gets one fresh bounded visible PAPER Builder candidate followed by independent Chief review, integration, and another fresh validation process/database.
 
@@ -16,7 +16,30 @@ Acceptance:
 
 User decision: on `2026-09-01` the user explicitly directed the Chief to pursue this correctness goal for as long as necessary, continuously test the PAPER system, diagnose missed profitable routes, and correct proven defects. This reopens fresh PAPER validation after the earlier stop but does not authorize real trading or weakening existing safety gates.
 
-Active evidence: published governance/main `51fe7ef098adcf5d4ab462476b90bd111cd796c6` started exactly one fresh runtime, PID `28438`, launchd label `com.risex.paper.chief40`, on new database `mainnet-paper-live-20260901-chief40.db`. The database and logs are owner-only, SQLite integrity is `ok`, `PAPER_RUN_READY` is durable, all four public venues are available, and the first complete snapshot contains all `128` routes with zero orders, fills, positions, funding settlements, completed trades, or fatal/blocked evidence. Automatic launchd restart is disabled so an unexpected terminal failure cannot blindly resume. Heartbeat `paper-chief40-correctness` owns continuing observation and bounded escalation.
+Terminal `chief40` evidence: published governance/main `51fe7ef098adcf5d4ab462476b90bd111cd796c6` started exactly one fresh runtime, PID `28438`, launchd label `com.risex.paper.chief40`, on new database `mainnet-paper-live-20260901-chief40.db`. It reached `PAPER_RUN_READY`, then opened `57` separate Extended sockets for `19` required markets across book/trade/funding. Within about four minutes it recorded `115` Extended disconnects, `73` Extended book-resync requirements, repeated full-scan lateness/deferred observations, and no second completed full scan. Chief unloaded the exact label at zero exposure; durable `STOPPED_SAFE`, SQLite integrity `ok`, and zero orders/fills/positions/funding settlements/completed trades are proven. The launchd file is removed so this immutable database cannot restart on login. Preserve and never resume it.
+
+## PAPER Extended aggregate public streams
+
+Status: `AUTHORIZED — ONE FRESH VISIBLE PAPER BUILDER REQUIRED`.
+
+Objective: replace Extended's current per-market public WebSocket fan-out with exactly three owned venue-wide streams using the official market-omitted endpoints: one all-market order-book stream, one all-market public-trades stream, and one all-market applied-funding stream. Route each validated message to its exact required canonical market while preserving all existing book sequence/snapshot recovery, trade sequence and maker-evidence identity, applied-funding identity, component readiness, heartbeat/watchdog, catalog reconciliation, stale-data, and fail-closed behavior. This is an Extended transport correction, not a product/economics change.
+
+Observed contract and defect:
+
+- Official Extended public WebSocket documentation explicitly states that omitting `{market}` subscribes each order-book, public-trades, or funding stream to all available markets; the server pings every 15 seconds and requires pong within 10 seconds. The accepted adapter already uses the official base but opens one socket per symbol and type.
+- Fresh `chief40` created `57` Extended sockets for `19` required symbols. It then recorded venue-wide waves of EOF and `ClientConnectionResetError`, `115` Extended disconnects and `73` book-resync requirements in about four minutes, delayed the second full scan, and deferred Extended observations for transport gaps. Other venues had only one isolated disconnect each and recovered.
+- No order, fill, position, settlement, completed trade, private access, or venue write existed; `chief40` stopped safely and its database is immutable.
+
+Acceptance:
+
+- Use exactly three Extended public WebSocket connections independent of required-market count. Message market identity must be strictly parsed and only currently required canonical markets may mutate observations, readiness, books, trade evidence, or applied funding.
+- Preserve per-symbol book state and strict monotonic sequence/recovery semantics. One market's invalid book sequence must fail that market closed and recover it without falsely invalidating or replacing healthy unrelated markets; no REST book may establish WebSocket sequence health.
+- Preserve per-symbol trade sequence/evidence isolation and prevent historical, duplicate, wrong-market, stale-session, or removed-market messages from contributing to maker fill. Preserve per-symbol applied-funding reconciliation and never turn the applied stream into the future funding quote.
+- Preserve server ping/pong handling, owned stream replacement, watchdog freshness, startup/readiness gates, dynamic catalog add/remove reconciliation, one-position limit, locked quantity, entry cutoff, economics, Telegram, persistence, and all non-Extended venue behavior.
+- Add focused/adverse regressions for connection count, interleaved multi-market routing, one-market gap isolation, dynamic add/remove, stale-session replacement, heartbeat/watchdog, and no evidence cross-contamination. Run one clean isolated Python 3.11 full suite plus dependency, compile, diff, and no-write checks on the final candidate.
+- Do not change scanner ranking, target quantity, fees/funding/execution economics, timing/freshness thresholds, maker-fill rules, private access, credentials, signing, dispatch, or any venue-write surface.
+
+Use one fresh visible PAPER Builder on GPT-5.6 Luna `max` from the exact published governance base. Chief independently reviews and alone integrates/pushes. After acceptance, start exactly one fresh process/database and prove three Extended sockets, repeated completed full scans, stable four-venue readiness, and no connection storm before evaluating entry behavior.
 
 ## PAPER maker-entry locked quantity
 
