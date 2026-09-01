@@ -9278,6 +9278,93 @@ async def test_relevant_book_event_recovers_open_gap_when_both_legs_are_fresh(
 
 
 @pytest.mark.asyncio
+async def test_lighter_relevant_book_event_recovers_without_trade_stream_membership(
+    tmp_path,
+):
+    clock = FakeClock(NOW + timedelta(minutes=59))
+    target = NOW + timedelta(hours=1)
+    initial_timestamp = int(clock.now().timestamp() * 1000)
+    initial_stats = lighter_market_stats_all_snapshot(
+        timestamp=initial_timestamp,
+        funding_timestamp=int(NOW.timestamp() * 1000),
+    )
+    lighter_market = CanonicalMarket(
+        "ETH", Venue.LIGHTER, "ETH", MarketType.PERPETUAL,
+        ContractType.LINEAR, D("1"), "USDC", "USDC", D("1"), D("1"),
+        D("1"), D("10"), None, True, False, False,
+    )
+    lighter = BoundaryLighterAdapter(clock, lighter_market, initial_stats)
+    risex = FakeAdapter(
+        Venue.RISEX, clock, settlement_at=target, funding_cash="5"
+    )
+    risex.market = replace(
+        risex.market, canonical_asset="ETH", venue_symbol="ETH-RISEX"
+    )
+    with PaperRepository(tmp_path / "lighter-relevant-book-gap.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository,
+            adapters={Venue.RISEX: risex, Venue.LIGHTER: lighter},
+            clock=clock,
+        )
+        await runtime.scan()
+        assert runtime.last_scan is not None
+        assert runtime.last_scan.winner is not None
+        lighter_session_id = runtime._new_stream_session(
+            (Venue.LIGHTER, "*", "combined")
+        )
+        assert await runtime.apply_book_event(
+            OrderBook(
+                Venue.LIGHTER,
+                "ETH",
+                (BookLevel(D("99"), D("20")),),
+                (BookLevel(D("101"), D("20")),),
+                clock.now(),
+                1,
+            ),
+            stream_session_id=lighter_session_id,
+        )
+        broker = PaperEntryBroker()
+        await broker.activate(
+            runtime.last_scan,
+            attempt_id="lighter-relevant-book-gap",
+            activated_at=clock.now(),
+        )
+        runtime.broker = broker
+        confirm_public_streams(runtime, clock.now())
+        assert (Venue.LIGHTER, "ETH") not in runtime._trade_stream_ready
+        clock.advance(1)
+        await runtime.deliver_trade(
+            maker_trade(runtime, clock.now(), "lighter-relevant-book-entry")
+        )
+        assert runtime.lifecycle is not None
+        assert runtime.lifecycle.snapshot.hedge_market.venue is Venue.LIGHTER
+        assert (Venue.LIGHTER, "ETH") not in runtime._trade_stream_ready
+        await _stabilization002_persist_gap(runtime, repository, clock.now())
+
+        clock.advance(1)
+        at = clock.now()
+        assert await runtime.apply_book_event(
+            BookDelta(
+                Venue.LIGHTER,
+                "ETH",
+                (BookLevel(D("100"), D("20")),),
+                (),
+                at,
+                2,
+                1,
+            ),
+            stream_session_id=lighter_session_id,
+        )
+
+        assert runtime.lifecycle is not None
+        after = runtime.lifecycle.snapshot
+        assert not after.gap_open
+        assert after.gaps[-1].ended_at == at
+        assert (Venue.LIGHTER, "ETH") not in runtime._trade_stream_ready
+        assert repository.load_runtime() == after
+
+
+@pytest.mark.asyncio
 async def test_relevant_book_event_keeps_gap_open_when_other_leg_is_stale(
     tmp_path,
 ):
