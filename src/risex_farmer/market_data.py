@@ -116,6 +116,31 @@ class BookStream:
         self.gap()
         return False
 
+    def extended_aggregate_delta(self, delta: BookDelta) -> bool:
+        """Apply one Extended delta from an all-market stream.
+
+        Extended's aggregate socket interleaves markets.  Its wire sequence
+        therefore remains strictly increasing for the physical stream, while
+        the sequence observed by one market may skip values belonging to other
+        markets.  The runtime validates the physical/market sequence contract
+        before calling this method; this method only applies the already
+        validated absolute levels to this market's independent book.
+        """
+        if delta.venue is not self.venue or delta.canonical_market != self.canonical_market:
+            raise ValueError("delta does not belong to this stream")
+        if (
+            self.venue is not Venue.EXTENDED
+            or not self.book_initialized
+            or self._sequence is None
+            or delta.sequence is None
+            or delta.sequence <= self._sequence
+        ):
+            self.gap()
+            return False
+        self._apply_absolute(delta.bids, delta.asks)
+        self._sequence = delta.sequence
+        return self._finish_update(delta.observed_at)
+
     def lighter_delta(
         self,
         bids: Iterable[BookLevel],

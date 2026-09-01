@@ -584,6 +584,20 @@ def test_public_websocket_heartbeat_actions() -> None:
     }
 
 
+def test_extended_market_omitted_stream_urls_are_venue_wide() -> None:
+    adapter = ExtendedAdapter(None)
+    assert adapter.orderbook_stream_url() == (
+        "wss://api.starknet.extended.exchange/stream.extended.exchange/v1/orderbooks"
+    )
+    assert adapter.trades_stream_url() == (
+        "wss://api.starknet.extended.exchange/stream.extended.exchange/v1/publicTrades"
+    )
+    assert adapter.funding_stream_url() == (
+        "wss://api.starknet.extended.exchange/stream.extended.exchange/v1/funding"
+    )
+    assert adapter.orderbook_stream_url("ABC-USD").endswith("/orderbooks/ABC-USD")
+
+
 def test_documented_book_delta_shapes_are_normalized() -> None:
     risex = RisexAdapter(None)
     risex_data = fixture("risex")

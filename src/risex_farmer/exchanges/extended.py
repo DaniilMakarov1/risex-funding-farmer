@@ -218,7 +218,10 @@ class ExtendedAdapter(PublicAdapter):
                 )
             return tuple(parsed)
 
-        market = str(data["m"])
+        raw_market = data["m"]
+        if not isinstance(raw_market, str) or not raw_market:
+            raise TypeError("orderbook market must be a non-empty string")
+        market = raw_market
         bids = levels("b")
         asks = levels("a")
         if message.get("type") == "SNAPSHOT":
@@ -229,7 +232,10 @@ class ExtendedAdapter(PublicAdapter):
         self, payload: Any, *, received_at: datetime, session_id: str, ordinal: int
     ) -> TradeEvidence:
         trade = require_mapping(payload, "trade")
-        market = str(trade["m"])
+        raw_market = trade["m"]
+        if not isinstance(raw_market, str) or not raw_market:
+            raise TypeError("trade market must be a non-empty string")
+        market = raw_market
         price = decimal_value(trade["p"], "trade.p")
         quantity = decimal_value(trade["q"], "trade.q")
         raw_time = trade["T"]
@@ -325,7 +331,8 @@ class ExtendedAdapter(PublicAdapter):
         data = require_mapping(message.get("data"), "funding message.data")
         timestamp(message["ts"], "milliseconds")
         decimal_value(data["f"], "funding rate")
-        if str(data.get("m")) != market.venue_symbol:
+        raw_market = data.get("m")
+        if not isinstance(raw_market, str) or raw_market != market.venue_symbol:
             return None
         return FundingSettlement(
             Venue.EXTENDED,
@@ -375,14 +382,17 @@ class ExtendedAdapter(PublicAdapter):
             self.SOURCE,
         )
 
-    def orderbook_stream_url(self, venue_symbol: str) -> str:
-        return f"{self.ws_base}/orderbooks/{quote(venue_symbol, safe='')}"
+    def orderbook_stream_url(self, venue_symbol: str | None = None) -> str:
+        suffix = "" if venue_symbol is None else f"/{quote(venue_symbol, safe='')}"
+        return f"{self.ws_base}/orderbooks{suffix}"
 
-    def trades_stream_url(self, venue_symbol: str) -> str:
-        return f"{self.ws_base}/publicTrades/{quote(venue_symbol, safe='')}"
+    def trades_stream_url(self, venue_symbol: str | None = None) -> str:
+        suffix = "" if venue_symbol is None else f"/{quote(venue_symbol, safe='')}"
+        return f"{self.ws_base}/publicTrades{suffix}"
 
-    def funding_stream_url(self, venue_symbol: str) -> str:
-        return f"{self.ws_base}/funding/{quote(venue_symbol, safe='')}"
+    def funding_stream_url(self, venue_symbol: str | None = None) -> str:
+        suffix = "" if venue_symbol is None else f"/{quote(venue_symbol, safe='')}"
+        return f"{self.ws_base}/funding{suffix}"
 
     @staticmethod
     def handle_server_ping(payload: bytes) -> PublicHeartbeatAction:

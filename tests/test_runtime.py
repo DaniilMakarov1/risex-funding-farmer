@@ -3079,9 +3079,7 @@ async def test_late_extended_universe_schedules_post_seed_refresh(tmp_path):
         runtime._session = object()
         runtime._stop_event = asyncio.Event()
         runtime._reconcile_combined_streams = no_combined_streams
-        runtime._start_extended_stream = lambda symbol, kind: started.append(
-            (symbol, kind)
-        )
+        runtime._start_extended_stream = lambda kind: started.append(kind)
         runtime._refresh_task = asyncio.create_task(pending_seed_refresh())
         seed_task = runtime._refresh_task
         universe_task = asyncio.create_task(runtime._refresh_extended_universe())
@@ -3100,10 +3098,7 @@ async def test_late_extended_universe_schedules_post_seed_refresh(tmp_path):
 
     key = (Venue.EXTENDED, extended.market.venue_symbol)
     assert key in runtime.observations
-    assert set(started) == {
-        (extended.market.venue_symbol, kind)
-        for kind in ("book", "trade", "funding")
-    }
+    assert set(started) == {"book", "trade", "funding"}
 
 
 @pytest.mark.asyncio
@@ -5885,6 +5880,7 @@ async def test_extended_stream_registry_is_dynamic_deduplicated_and_lock_safe(tm
             symbol for venue, symbol, _ in runtime._stream_tasks
             if venue is Venue.EXTENDED
         }
+        extended_symbols = set(runtime._extended_stream_symbols)
         runtime.broker = None
         await runtime.shutdown()
         socket_lifecycle_count = repository.connection.execute(
@@ -5892,7 +5888,10 @@ async def test_extended_stream_registry_is_dynamic_deduplicated_and_lock_safe(tm
             "WHERE event_type IN "
             "('PUBLIC_SOCKET_DISCONNECTED','PUBLIC_SOCKET_RECONNECTED')"
         ).fetchone()[0]
-    assert symbols == {original.venue_symbol, added.venue_symbol}
+    assert symbols == {"*"}
+    assert extended_symbols == {
+        original.venue_symbol, added.venue_symbol,
+    }
     assert socket_lifecycle_count == 0
 
 
@@ -7507,9 +7506,7 @@ async def test_extended_funding_connection_allows_quiet_applied_stream(tmp_path)
         runtime._session = object()
         runtime._stop_event = asyncio.Event()
         started = []
-        runtime._start_extended_stream = lambda market_symbol, kind: started.append(
-            (market_symbol, kind)
-        )
+        runtime._start_extended_stream = lambda kind: started.append(kind)
         await runtime._reconcile_extended_streams()
         for kind in ("book", "trade", "funding"):
             confirm_extended_stream(runtime,
@@ -7592,7 +7589,7 @@ async def test_extended_funding_connection_allows_quiet_applied_stream(tmp_path)
             )
         )
         await runtime.shutdown()
-    assert sorted(kind for market_symbol, kind in started) == [
+    assert sorted(started) == [
         "book", "funding", "trade",
     ]
 
@@ -7778,11 +7775,12 @@ async def test_extended_server_ping_and_client_pong_confirm_only_own_socket(tmp_
         runtime = PublicPaperRuntime(repository, adapters={}, clock=clock)
         runtime._session = session
         runtime._stop_event = stop
+        runtime._extended_stream_symbols = ("ABC-EXTENDED",)
         session_id = runtime._new_stream_session(
-            (Venue.EXTENDED, "ABC-EXTENDED", "trade")
+            (Venue.EXTENDED, "*", "trade")
         )
         await runtime._extended_stream(
-            ExtendedAdapter(None), "ABC-EXTENDED", "trade", session_id
+            ExtendedAdapter(None), ("ABC-EXTENDED",), "trade", session_id
         )
     assert socket.pongs == [b"server"]
     assert runtime._extended_confirmed_at["ABC-EXTENDED", "trade"] == NOW + timedelta(seconds=2)
@@ -10476,3 +10474,450 @@ async def test_stabilization002_queued_risex_trade_dispatch_is_cancelled_on_repl
             "SELECT COUNT(*) FROM processed_trade_events "
             "WHERE trade_event_key='obsolete-risex-trade'"
         ).fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_extended_aggregate_stream_routes_interleaved_market_evidence(
+    tmp_path,
+):
+    clock = FakeClock()
+    stop = asyncio.Event()
+    base = FakeAdapter(
+        Venue.EXTENDED, clock, settlement_at=NOW + timedelta(minutes=5)
+    ).market
+    markets = tuple(
+        replace(base, canonical_asset=asset, venue_symbol=f"{asset}-EXTENDED")
+        for asset in ("A", "B")
+    )
+    timestamp = int(clock.now().timestamp() * 1000)
+
+    def book_message(market: str, sequence: int, *, snapshot: bool) -> dict:
+        return {
+            "type": "SNAPSHOT" if snapshot else "UPDATE",
+            "ts": timestamp,
+            "seq": sequence,
+            "data": {
+                "m": market,
+                "b": [{"p": "99", "c": "2" if snapshot else "3"}],
+                "a": [{"p": "101", "c": "2"}],
+            },
+        }
+
+    def trade_message(sequence: int, market: str, trade_id: str) -> dict:
+        return {
+            "seq": sequence,
+            "ts": timestamp,
+            "data": [{
+                "m": market, "p": "100", "q": "1", "T": timestamp,
+                "S": "SELL", "i": trade_id, "tT": "TRADE",
+            }],
+        }
+
+    def funding_message(sequence: int, market: str) -> dict:
+        return {
+            "seq": sequence,
+            "ts": timestamp,
+            "data": {"m": market, "T": timestamp, "f": "0.001"},
+        }
+
+    messages = (
+        book_message(markets[0].venue_symbol, 1, snapshot=True),
+        book_message(markets[1].venue_symbol, 2, snapshot=True),
+        book_message(markets[0].venue_symbol, 3, snapshot=False),
+        book_message(markets[1].venue_symbol, 4, snapshot=False),
+        trade_message(1, markets[0].venue_symbol, "a-trade"),
+        trade_message(2, markets[1].venue_symbol, "b-trade"),
+        trade_message(3, "NOT-REQUIRED", "wrong-market"),
+        funding_message(1, markets[0].venue_symbol),
+        funding_message(2, markets[1].venue_symbol),
+        funding_message(3, "NOT-REQUIRED"),
+    )
+
+    delivered: list[TradeEvidence] = []
+
+    async def capture_trade(row, **_kwargs) -> None:
+        delivered.append(row)
+
+    with PaperRepository(tmp_path / "extended-aggregate-routing.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={Venue.EXTENDED: ExtendedAdapter(None)},
+            clock=clock,
+        )
+        runtime._session = SingleWebSocketSession(TextWebSocket(stop, messages))
+        runtime._stop_event = stop
+        runtime._extended_stream_symbols = tuple(
+            market.venue_symbol for market in markets
+        )
+        for market in markets:
+            runtime.observations[Venue.EXTENDED, market.venue_symbol] = (
+                MarketObservation(market, None, None, None, None)
+            )
+            await runtime.recover_snapshot(OrderBook(
+                Venue.EXTENDED, market.venue_symbol,
+                (BookLevel(D("98"), D("1")),),
+                (BookLevel(D("102"), D("1")),),
+                clock.now(),
+            ))
+        runtime.deliver_trade = capture_trade
+        session_id = runtime._new_stream_session(
+            (Venue.EXTENDED, "*", "book")
+        )
+        assert not await runtime.recover_snapshot(OrderBook(
+            Venue.EXTENDED, markets[0].venue_symbol,
+            (BookLevel(D("97"), D("1")),),
+            (BookLevel(D("103"), D("1")),),
+            clock.now(),
+        ))
+        # Use one aggregate session per stream kind, as the production
+        # reconciler does. The book reader below is the only one that carries
+        # data in this fixture.
+        runtime._new_stream_session((Venue.EXTENDED, "*", "trade"))
+        runtime._new_stream_session((Venue.EXTENDED, "*", "funding"))
+        book_session = SingleWebSocketSession(
+            TextWebSocket(stop, messages[:4])
+        )
+        runtime._session = book_session
+        await runtime._extended_stream(
+            runtime.adapters[Venue.EXTENDED],  # type: ignore[index]
+            runtime._extended_stream_symbols,
+            "book",
+            session_id,
+        )
+
+        # Route trade and funding frames independently through their owned
+        # aggregate sessions. Each uses a fresh socket fixture and therefore
+        # has a clean per-session monotonic cursor.
+        trade_stop = asyncio.Event()
+        runtime._stop_event = trade_stop
+        runtime._session = SingleWebSocketSession(
+            TextWebSocket(trade_stop, messages[4:7])
+        )
+        trade_session = runtime._stream_sessions[Venue.EXTENDED, "*", "trade"]
+        await runtime._extended_stream(
+            runtime.adapters[Venue.EXTENDED],  # type: ignore[index]
+            runtime._extended_stream_symbols,
+            "trade",
+            trade_session,
+        )
+        funding_stop = asyncio.Event()
+        runtime._stop_event = funding_stop
+        runtime._session = SingleWebSocketSession(
+            TextWebSocket(funding_stop, messages[7:])
+        )
+        funding_session = runtime._stream_sessions[
+            Venue.EXTENDED, "*", "funding"
+        ]
+        await runtime._extended_stream(
+            runtime.adapters[Venue.EXTENDED],  # type: ignore[index]
+            runtime._extended_stream_symbols,
+            "funding",
+            funding_session,
+        )
+        books = {
+            market.venue_symbol: runtime.coordinator.stream(
+                Venue.EXTENDED, market.venue_symbol
+            ).book()
+            for market in markets
+        }
+        readiness = runtime.component_readiness[Venue.EXTENDED]
+
+    assert book_session.connections == 1
+    assert [row.trade_event_key for row in delivered] == [
+        f"EXTENDED|{markets[0].venue_symbol}|a-trade",
+        f"EXTENDED|{markets[1].venue_symbol}|b-trade",
+    ]
+    assert books[markets[0].venue_symbol] is not None
+    assert books[markets[1].venue_symbol] is not None
+    assert books[markets[0].venue_symbol].sequence == 3
+    assert books[markets[1].venue_symbol].sequence == 4
+    assert all(
+        readiness[f"{component}:{market.venue_symbol}"].available
+        for market in markets
+        for component in (
+            "book", "connection_book", "trade", "connection_trade",
+            "applied_funding", "connection_funding",
+        )
+    )
+    assert "NOT-REQUIRED" not in runtime.observations
+
+
+@pytest.mark.asyncio
+async def test_extended_aggregate_book_gap_isolated_and_recovers_per_market(
+    tmp_path,
+):
+    clock = FakeClock()
+    base = FakeAdapter(
+        Venue.EXTENDED, clock, settlement_at=NOW + timedelta(minutes=5)
+    ).market
+    markets = tuple(
+        replace(base, canonical_asset=asset, venue_symbol=f"{asset}-EXTENDED")
+        for asset in ("A", "B")
+    )
+
+    def snapshot(market: str, sequence: int) -> OrderBook:
+        return OrderBook(
+            Venue.EXTENDED, market,
+            (BookLevel(D("99"), D("2")),),
+            (BookLevel(D("101"), D("2")),), clock.now(), sequence,
+        )
+
+    with PaperRepository(tmp_path / "extended-aggregate-gap.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={Venue.EXTENDED: ExtendedAdapter(None)},
+            clock=clock,
+        )
+        runtime._extended_stream_symbols = tuple(
+            market.venue_symbol for market in markets
+        )
+        session_id = runtime._new_stream_session(
+            (Venue.EXTENDED, "*", "book")
+        )
+        assert await runtime.apply_book_event(
+            snapshot(markets[0].venue_symbol, 1),
+            stream_session_id=session_id,
+        )
+        assert await runtime.apply_book_event(
+            snapshot(markets[1].venue_symbol, 2),
+            stream_session_id=session_id,
+        )
+        assert not await runtime.apply_book_event(
+            BookDelta(
+                Venue.EXTENDED, markets[0].venue_symbol,
+                (BookLevel(D("99"), D("4")),), (), clock.now(), 4,
+            ),
+            stream_session_id=session_id,
+        )
+        assert await runtime.apply_book_event(
+            BookDelta(
+                Venue.EXTENDED, markets[1].venue_symbol,
+                (BookLevel(D("99"), D("3")),), (), clock.now(), 5,
+            ),
+            stream_session_id=session_id,
+        )
+        assert await runtime.apply_book_event(
+            snapshot(markets[0].venue_symbol, 6),
+            stream_session_id=session_id,
+        )
+        a_book = runtime.coordinator.stream(
+            Venue.EXTENDED, markets[0].venue_symbol
+        ).book()
+        b_book = runtime.coordinator.stream(
+            Venue.EXTENDED, markets[1].venue_symbol
+        ).book()
+        a_episode = runtime._recoveries[Venue.EXTENDED, markets[0].venue_symbol]
+
+    assert a_episode.terminal == "COMPLETE"
+    assert a_book is not None and a_book.sequence == 6
+    assert b_book is not None and b_book.sequence == 5
+    assert (Venue.EXTENDED, markets[0].venue_symbol) in runtime._live_book_ready
+    assert (Venue.EXTENDED, markets[1].venue_symbol) in runtime._live_book_ready
+    assert not any(
+        key[1] == markets[1].venue_symbol for key in runtime._recoveries
+    )
+
+
+@pytest.mark.asyncio
+async def test_extended_aggregate_reconciliation_keeps_three_owned_streams(
+    tmp_path,
+):
+    clock = FakeClock()
+    base = FakeAdapter(
+        Venue.EXTENDED, clock, settlement_at=NOW + timedelta(minutes=5)
+    ).market
+    a_extended = replace(base, canonical_asset="A", venue_symbol="A-EXTENDED")
+    b_extended = replace(base, canonical_asset="B", venue_symbol="B-EXTENDED")
+    a_risex = replace(a_extended, venue=Venue.RISEX, venue_symbol="A-RISEX")
+    b_risex = replace(b_extended, venue=Venue.RISEX, venue_symbol="B-RISEX")
+    stop = asyncio.Event()
+    urls: list[str] = []
+
+    class WaitingSocket:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await stop.wait()
+            raise StopAsyncIteration
+
+        async def ping(self):
+            return None
+
+    class Session:
+        closed = False
+
+        def ws_connect(self, url, **_kwargs):
+            urls.append(url)
+            return WaitingSocket()
+
+    def add_volume(market):
+        return MarketVolume(
+            market.venue, market.venue_symbol, D("1000000"), clock.now(),
+            "official-shaped",
+        )
+
+    def snapshot(market: str, sequence: int) -> OrderBook:
+        return OrderBook(
+            Venue.EXTENDED, market,
+            (BookLevel(D("99"), D("2")),),
+            (BookLevel(D("101"), D("2")),), clock.now(), sequence,
+        )
+
+    with PaperRepository(tmp_path / "extended-aggregate-reconcile.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={Venue.EXTENDED: ExtendedAdapter(None)},
+            clock=clock,
+        )
+        runtime._session = Session()
+        runtime._stop_event = stop
+        runtime.markets[Venue.EXTENDED] = (a_extended,)
+        runtime.markets[Venue.RISEX] = (a_risex,)
+        for market in (a_extended, a_risex):
+            runtime.volumes[market.venue, market.venue_symbol] = add_volume(market)
+        await runtime._reconcile_extended_streams()
+        tasks = dict(runtime._stream_tasks)
+        await asyncio.sleep(0)
+        assert set(tasks) == {
+            (Venue.EXTENDED, "*", "book"),
+            (Venue.EXTENDED, "*", "trade"),
+            (Venue.EXTENDED, "*", "funding"),
+        }
+        runtime.markets[Venue.EXTENDED] = (a_extended, b_extended)
+        runtime.markets[Venue.RISEX] = (a_risex, b_risex)
+        for market in (b_extended, b_risex):
+            runtime.volumes[market.venue, market.venue_symbol] = add_volume(market)
+        await runtime._reconcile_extended_streams()
+        assert runtime._stream_tasks == tasks
+        assert len(urls) == 3
+        old_session = runtime._stream_sessions[Venue.EXTENDED, "*", "book"]
+        runtime.markets[Venue.EXTENDED] = (b_extended,)
+        runtime.markets[Venue.RISEX] = (b_risex,)
+        await runtime._reconcile_extended_streams()
+        assert runtime._stream_tasks == tasks
+        assert runtime._extended_stream_symbols == ("B-EXTENDED",)
+        assert not await runtime.apply_book_event(
+            snapshot("A-EXTENDED", 1), stream_session_id=old_session
+        )
+        assert runtime.coordinator.stream(
+            Venue.EXTENDED, "A-EXTENDED"
+        ).book() is None
+        await runtime.shutdown()
+
+    assert urls == [
+        "wss://api.starknet.extended.exchange/stream.extended.exchange/v1/orderbooks",
+        "wss://api.starknet.extended.exchange/stream.extended.exchange/v1/publicTrades",
+        "wss://api.starknet.extended.exchange/stream.extended.exchange/v1/funding",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_extended_aggregate_watchdog_replaces_one_owned_stream(
+    tmp_path,
+):
+    clock = FakeClock()
+    with PaperRepository(tmp_path / "extended-aggregate-watchdog.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={Venue.EXTENDED: ExtendedAdapter(None)},
+            clock=clock,
+        )
+        runtime._stop_event = asyncio.Event()
+        runtime._extended_stream_symbols = ("A-EXTENDED", "B-EXTENDED")
+        key = (Venue.EXTENDED, "*", "book")
+        session_id = runtime._new_stream_session(key)
+        task = asyncio.create_task(runtime._stop_event.wait())
+        runtime._stream_tasks[key] = task
+        runtime._extended_connection_confirmed_at["book"] = (
+            clock.now() - timedelta(seconds=26)
+        )
+        restarted: list[str] = []
+        runtime._start_extended_stream = lambda kind: restarted.append(kind)
+        await runtime._check_extended_health(clock.now())
+        owner = runtime._extended_health_recovery_task
+        assert owner is not None
+        await owner
+        assert restarted == ["book"]
+        assert task.cancelled()
+        assert runtime._pending_watchdog_episodes
+        replacement = runtime._new_stream_session(key)
+        runtime._confirm_extended_aggregate(
+            "book", clock.now(), data_ready=False,
+            stream_session_id=replacement,
+        )
+        runtime._watchdog_restarted(
+            runtime._extended_aggregate_identity("book"), at=clock.now()
+        )
+        rows = repository.connection.execute(
+            "SELECT event_type FROM runtime_evidence "
+            "WHERE event_type IN ('PUBLIC_STREAM_CONFIRMATION_STALE',"
+            "'PUBLIC_STREAM_RESTARTED') ORDER BY evidence_id"
+        ).fetchall()
+
+    assert [row["event_type"] for row in rows] == [
+        "PUBLIC_STREAM_CONFIRMATION_STALE", "PUBLIC_STREAM_RESTARTED",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_extended_aggregate_stale_sessions_cannot_mutate_book_or_trade_health(
+    tmp_path,
+):
+    clock = FakeClock()
+    symbol = "A-EXTENDED"
+    with PaperRepository(tmp_path / "extended-aggregate-stale-session.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={Venue.EXTENDED: ExtendedAdapter(None)},
+            clock=clock,
+        )
+        runtime._extended_stream_symbols = (symbol,)
+        book_key = (Venue.EXTENDED, "*", "book")
+        stale_book = runtime._new_stream_session(book_key)
+        runtime._new_stream_session(book_key)
+        assert not await runtime.apply_book_event(
+            OrderBook(
+                Venue.EXTENDED, symbol,
+                (BookLevel(D("99"), D("1")),),
+                (BookLevel(D("101"), D("1")),),
+                clock.now(), 1,
+            ),
+            stream_session_id=stale_book,
+        )
+        assert runtime.coordinator.stream(Venue.EXTENDED, symbol).book() is None
+
+        trade_key = (Venue.EXTENDED, "*", "trade")
+        stale_trade = runtime._new_stream_session(trade_key)
+        runtime._new_stream_session(trade_key)
+        stream = runtime.coordinator.stream(Venue.EXTENDED, symbol)
+        stream.connected(clock.now())
+        runtime._trade_stream_ready.add((Venue.EXTENDED, symbol))
+        await PublicPaperRuntime.deliver_trade(
+            runtime,
+            TradeEvidence(
+                "stale-trade", Venue.EXTENDED, symbol, clock.now(), clock.now(),
+                "stale-trade", D("1"), D("100"), Side.SELL, True,
+            ),
+            processed_at=clock.now() + timedelta(seconds=1),
+            stream_session_id=stale_trade,
+        )
+        confirmation = stream.health(clock.now()).last_connection_confirmation_at
+
+        funding_key = (Venue.EXTENDED, "*", "funding")
+        stale_funding = runtime._new_stream_session(funding_key)
+        runtime._new_stream_session(funding_key)
+        await runtime._apply_extended_funding_record(
+            FundingSettlement(
+                Venue.EXTENDED, symbol, clock.now(),
+                SettlementStatus.UNRESOLVED, None,
+            ),
+            stream_session_id=stale_funding,
+        )
+        persisted_settlements = repository.connection.execute(
+            "SELECT COUNT(*) FROM funding_settlements"
+        ).fetchone()[0]
+
+    assert confirmation == NOW
+    assert persisted_settlements == 0

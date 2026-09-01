@@ -641,6 +641,11 @@ class PublicPaperRuntime:
         self._extended_metadata_at: dict[str, datetime] = {}
         self._extended_universe_task: asyncio.Task[None] | None = None
         self.next_extended_catalog_at: datetime | None = None
+        self._extended_stream_symbols: tuple[str, ...] = ()
+        self._extended_connection_confirmed_at: dict[str, datetime] = {}
+        self._extended_book_sequence_state: dict[
+            StreamSessionId, int
+        ] = {}
         self.notifications = notifications
         self._tick_task: asyncio.Task[None] | None = None
         self._entry_cutoff_task: asyncio.Task[None] | None = None
@@ -671,6 +676,14 @@ class PublicPaperRuntime:
     def _new_stream_session(
         self, key: tuple[Venue, str, str]
     ) -> StreamSessionId:
+        previous = self._stream_sessions.get(key)
+        if (
+            previous is not None
+            and key[0] is Venue.EXTENDED
+            and key[1] == "*"
+            and key[2] == "book"
+        ):
+            self._extended_book_sequence_state.pop(previous, None)
         self._stream_session_number += 1
         session_id = StreamSessionId(self._stream_session_number)
         self._stream_sessions[key] = session_id
@@ -681,12 +694,56 @@ class PublicPaperRuntime:
     ) -> bool:
         return self._stream_sessions.get(key) == session_id
 
+    def _book_stream_key(
+        self, venue: Venue, symbol: str
+    ) -> tuple[Venue, str, str]:
+        if venue is Venue.EXTENDED:
+            aggregate = (venue, "*", "book")
+            if aggregate in self._stream_sessions or aggregate in self._stream_tasks:
+                return aggregate
+            return venue, symbol, "book"
+        return venue, "*", "combined"
+
     @staticmethod
-    def _book_stream_key(venue: Venue, symbol: str) -> tuple[Venue, str, str]:
-        return (
-            (venue, symbol, "book")
-            if venue is Venue.EXTENDED else (venue, "*", "combined")
-        )
+    def _extended_aggregate_key(kind: str) -> tuple[Venue, str, str]:
+        return Venue.EXTENDED, "*", kind
+
+    @staticmethod
+    def _extended_aggregate_identity(
+        kind: str,
+    ) -> tuple[Venue, str, tuple[str, ...]]:
+        # The physical identity deliberately does not contain the catalog. A
+        # catalog add/remove changes routing, not the owned socket.
+        return Venue.EXTENDED, kind, ("*",)
+
+    def _extended_aggregate_active(self, kind: str) -> bool:
+        key = self._extended_aggregate_key(kind)
+        return key in self._stream_sessions or key in self._stream_tasks
+
+    def _extended_stream_key(
+        self, symbol: str, kind: str, session_id: StreamSessionId | None = None
+    ) -> tuple[Venue, str, str]:
+        aggregate = self._extended_aggregate_key(kind)
+        if session_id is not None and self._owns_stream_session(aggregate, session_id):
+            return aggregate
+        if session_id is None and self._extended_aggregate_active(kind):
+            return aggregate
+        return Venue.EXTENDED, symbol, kind
+
+    def _extended_stream_symbols_now(self) -> tuple[str, ...]:
+        """Return the current routing set for an aggregate socket."""
+        if self._extended_stream_symbols:
+            return self._extended_stream_symbols
+        symbols = set(self._required_extended_symbols())
+        if not symbols:
+            symbols.update(symbol for symbol, _kind in self._extended_confirmed_at)
+        return tuple(sorted(symbols))
+
+    def _extended_stream_owns(
+        self, symbol: str, kind: str, session_id: StreamSessionId
+    ) -> bool:
+        key = self._extended_stream_key(symbol, kind, session_id)
+        return self._owns_stream_session(key, session_id)
 
     def _book_session_value(self, venue: Venue, symbol: str) -> int:
         session = self._stream_sessions.get(self._book_stream_key(venue, symbol))
@@ -765,10 +822,7 @@ class PublicPaperRuntime:
         generation: RecoveryAttemptGeneration,
     ) -> bool:
         venue, symbol = key
-        stream_key = (
-            (venue, symbol, "book")
-            if venue is Venue.EXTENDED else (venue, "*", "combined")
-        )
+        stream_key = self._book_stream_key(venue, symbol)
         return (
             self._recoveries.get(key) is episode
             and episode.terminal is None
@@ -1455,10 +1509,13 @@ class PublicPaperRuntime:
         gap_kinds: list[str] = []
         components = self.component_readiness.get(Venue.EXTENDED, {})
         for kind in ("book", "trade", "funding"):
-            identity = (Venue.EXTENDED, kind, (symbol,))
+            aggregate_identity = self._extended_aggregate_identity(kind)
+            legacy_identity = (Venue.EXTENDED, kind, (symbol,))
             if (
-                identity in self._pending_socket_episodes
-                or identity in self._pending_watchdog_episodes
+                aggregate_identity in self._pending_socket_episodes
+                or aggregate_identity in self._pending_watchdog_episodes
+                or legacy_identity in self._pending_socket_episodes
+                or legacy_identity in self._pending_watchdog_episodes
             ):
                 gap_kinds.append(kind)
                 continue
@@ -2011,6 +2068,20 @@ class PublicPaperRuntime:
                 if isinstance(adapter, LighterAdapter)
                 else healthy_live
             )
+            if (
+                isinstance(adapter, ExtendedAdapter)
+                and self._extended_aggregate_active("book")
+            ):
+                aggregate_stream = self.coordinator.stream(*key)
+                if (
+                    key not in self._live_book_ready
+                    or aggregate_stream.book() is None
+                ):
+                    aggregate_stream.gap()
+                    self._live_book_ready.discard(key)
+                # While an aggregate WS is owned, REST must not replace or
+                # establish its sequence-bearing book state.
+                preserve_stream_book = True
             if isinstance(adapter, RisexAdapter):
                 # The immutable contract becomes eligible only after both public
                 # book and recent-trade unit evidence are proven in this scan.
@@ -2572,14 +2643,15 @@ class PublicPaperRuntime:
             ):
                 return False
         wanted_extended = {
-            (Venue.EXTENDED, symbol, kind)
-            for symbol in self._required_extended_symbols()
+            (Venue.EXTENDED, "*", kind)
             for kind in ("book", "trade", "funding")
         }
+        if not self._required_extended_symbols():
+            wanted_extended = set()
         active_extended = {
             key
             for key, task in self._stream_tasks.items()
-            if key[0] is Venue.EXTENDED and not task.done()
+            if key[0] is Venue.EXTENDED and key[1] == "*" and not task.done()
         }
         return active_extended == wanted_extended
 
@@ -3350,7 +3422,16 @@ class PublicPaperRuntime:
         *,
         observed_version_id: str | None = None,
         processed_at: datetime | None = None,
+        stream_session_id: StreamSessionId | None = None,
     ) -> None:
+        if (
+            stream_session_id is not None
+            and trade.venue is Venue.EXTENDED
+            and not self._extended_stream_owns(
+                trade.canonical_market, "trade", stream_session_id
+            )
+        ):
+            return
         at = processed_at or self.clock.now()
         exit_receipt_version: str | None = None
         broker = self.broker
@@ -3437,6 +3518,15 @@ class PublicPaperRuntime:
             )
             async with self._paper_entry_lock:
                 if (
+                    (
+                        stream_session_id is not None
+                        and not self._extended_stream_owns(
+                            trade.canonical_market,
+                            "trade",
+                            stream_session_id,
+                        )
+                    )
+                    or
                     any(
                         self._stream_invalidation_revisions.get(key, 0) != revision
                         for key, revision in entry_invalidation_revisions.items()
@@ -3503,6 +3593,13 @@ class PublicPaperRuntime:
                 risex_capture=risex_capture,
                 hedge_capture=hedge_capture,
             )
+            if (
+                stream_session_id is not None
+                and not self._extended_stream_owns(
+                    trade.canonical_market, "trade", stream_session_id
+                )
+            ):
+                return
             if result.detail == "STALE_EXIT_VERSION":
                 return
             if result.fill_provenance and not self._captures_are_current(
@@ -3533,9 +3630,8 @@ class PublicPaperRuntime:
             and self.adapters is not None
             and isinstance(self.adapters.get(Venue.EXTENDED), ExtendedAdapter)
         ):
-            session_id = self._stream_sessions.get(
-                (Venue.EXTENDED, symbol, "trade")
-            )
+            session_key = self._extended_stream_key(symbol, "trade")
+            session_id = self._stream_sessions.get(session_key)
             if session_id is not None:
                 self._confirm_extended_stream(
                     symbol, "trade", now, data_ready=True,
@@ -3554,7 +3650,22 @@ class PublicPaperRuntime:
             "PUBLIC_STREAM_CONNECTED", now
         )
 
-    async def deliver_settlement(self, settlement: FundingSettlement) -> None:
+    async def deliver_settlement(
+        self,
+        settlement: FundingSettlement,
+        *,
+        stream_session_id: StreamSessionId | None = None,
+    ) -> None:
+        if (
+            stream_session_id is not None
+            and (
+                settlement.venue is not Venue.EXTENDED
+                or not self._extended_stream_owns(
+                    settlement.canonical_market, "funding", stream_session_id
+                )
+            )
+        ):
+            return
         self.repository.upsert_settlement(settlement)
         if self.lifecycle is not None and settlement.key in {
             row.key for row in self.lifecycle.snapshot.settlements
@@ -3564,6 +3675,13 @@ class PublicPaperRuntime:
                 if row.key == settlement.key
             )
             await self.lifecycle.reconcile_settlement(settlement)
+            if (
+                stream_session_id is not None
+                and not self._extended_stream_owns(
+                    settlement.canonical_market, "funding", stream_session_id
+                )
+            ):
+                return
             self.repository.save_decision(
                 recorded_at=self.clock.now(), lifecycle_snapshot=self.lifecycle.snapshot
             )
@@ -3619,9 +3737,19 @@ class PublicPaperRuntime:
         return (bid + ask) / Decimal("2")
 
     async def _apply_extended_funding_record(
-        self, settlement: FundingSettlement
+        self,
+        settlement: FundingSettlement,
+        *,
+        stream_session_id: StreamSessionId | None = None,
     ) -> None:
         if settlement.venue is not Venue.EXTENDED or self.lifecycle is None:
+            return
+        if (
+            stream_session_id is not None
+            and not self._extended_stream_owns(
+                settlement.canonical_market, "funding", stream_session_id
+            )
+        ):
             return
         required = {
             row.key: row for row in self.lifecycle.snapshot.settlements
@@ -3634,7 +3762,9 @@ class PublicPaperRuntime:
             SettlementStatus.SKIPPED_POSITION_CLOSED,
         }:
             return
-        await self.deliver_settlement(settlement)
+        await self.deliver_settlement(
+            settlement, stream_session_id=stream_session_id
+        )
 
     @staticmethod
     def _funding_settlement_from_quote(
@@ -3858,7 +3988,7 @@ class PublicPaperRuntime:
         session_key = (
             (venue, "*", "combined")
             if venue is not Venue.EXTENDED or stream_kind == "combined"
-            else (venue, symbol, stream_kind)
+            else self._extended_stream_key(symbol, stream_kind)
         )
         if not self._owns_stream_session(session_key, stream_session_id):
             return
@@ -3998,11 +4128,13 @@ class PublicPaperRuntime:
         self, symbol: str, kind: str, at: datetime, *, data_ready: bool,
         stream_session_id: StreamSessionId,
     ) -> None:
-        if not self._owns_stream_session(
-            (Venue.EXTENDED, symbol, kind), stream_session_id
-        ):
+        stream_key = self._extended_stream_key(symbol, kind, stream_session_id)
+        if not self._owns_stream_session(stream_key, stream_session_id):
             return
         self._extended_confirmed_at[symbol, kind] = at
+        aggregate = stream_key[1] == "*"
+        if aggregate:
+            self._extended_connection_confirmed_at[kind] = at
         if kind == "book":
             self.coordinator.stream(Venue.EXTENDED, symbol).connected(at)
         self._set_component_readiness(
@@ -4021,25 +4153,68 @@ class PublicPaperRuntime:
             f"PUBLIC_{kind.upper()}_STREAM_READY", at,
         )
 
+    def _confirm_extended_aggregate(
+        self,
+        kind: str,
+        at: datetime,
+        *,
+        data_ready: bool,
+        stream_session_id: StreamSessionId,
+    ) -> None:
+        if not self._owns_stream_session(
+            self._extended_aggregate_key(kind), stream_session_id
+        ):
+            return
+        for symbol in self._extended_stream_symbols_now():
+            self._confirm_extended_stream(
+                symbol,
+                kind,
+                at,
+                data_ready=data_ready,
+                stream_session_id=stream_session_id,
+            )
+
     async def _check_extended_health(self, at: datetime) -> None:
-        stale = [
-            (symbol, kind, confirmed_at,
-             self._stream_sessions.get((Venue.EXTENDED, symbol, kind)),
-             self._stream_tasks.get((Venue.EXTENDED, symbol, kind)))
-            for (symbol, kind), confirmed_at in self._extended_confirmed_at.items()
-            if (Venue.EXTENDED, symbol, kind) in self._stream_tasks
-            if at - confirmed_at > timedelta(seconds=25)
-        ]
+        stale: list[tuple[str, str, datetime, StreamSessionId | None, asyncio.Task[None] | None]] = []
+        for kind in ("book", "trade", "funding"):
+            aggregate_key = self._extended_aggregate_key(kind)
+            aggregate_task = self._stream_tasks.get(aggregate_key)
+            if aggregate_task is not None and not aggregate_task.done():
+                confirmed_at = self._extended_connection_confirmed_at.get(kind)
+                if (
+                    confirmed_at is not None
+                    and at - confirmed_at > timedelta(seconds=25)
+                ):
+                    stale.append((
+                        "*", kind, confirmed_at,
+                        self._stream_sessions.get(aggregate_key), aggregate_task,
+                    ))
+                continue
+            stale.extend(
+                (symbol, kind, confirmed_at,
+                 self._stream_sessions.get((Venue.EXTENDED, symbol, kind)),
+                 self._stream_tasks.get((Venue.EXTENDED, symbol, kind)))
+                for (symbol, confirmed_kind), confirmed_at
+                in self._extended_confirmed_at.items()
+                if confirmed_kind == kind
+                and (Venue.EXTENDED, symbol, kind) in self._stream_tasks
+                and at - confirmed_at > timedelta(seconds=25)
+            )
         for symbol, kind, confirmed_at, session_id, task in sorted(
             stale, key=lambda row: (row[0], row[1])
         ):
-            key = (Venue.EXTENDED, symbol, kind)
+            key = self._extended_stream_key(symbol, kind, session_id)
+            confirmation_current = (
+                self._extended_connection_confirmed_at.get(kind)
+                if key[1] == "*"
+                else self._extended_confirmed_at.get((symbol, kind))
+            )
             if (
                 self._stop_event is None or self._stop_event.is_set()
                 or session_id is None
                 or not self._owns_stream_session(key, session_id)
                 or self._stream_tasks.get(key) is not task
-                or self._extended_confirmed_at.get((symbol, kind)) != confirmed_at
+                or confirmation_current != confirmed_at
             ):
                 continue
             assert session_id is not None and task is not None
@@ -4071,7 +4246,16 @@ class PublicPaperRuntime:
     ) -> bool:
         if self._stop_event is None or self._stop_event.is_set():
             return False
-        key = (Venue.EXTENDED, request.symbol, request.kind)
+        key = self._extended_stream_key(
+            request.symbol, request.kind, request.stream_session_id
+        )
+        if key[1] == "*":
+            confirmed = self._extended_connection_confirmed_at.get(request.kind)
+            return (
+                self._stream_sessions.get(key) == request.stream_session_id
+                and self._stream_tasks.get(key) is request.stream_task
+                and confirmed == request.confirmed_at
+            )
         return (
             self._stream_sessions.get(key) == request.stream_session_id
             and self._stream_tasks.get(key) is request.stream_task
@@ -4083,8 +4267,15 @@ class PublicPaperRuntime:
     async def _recover_extended_health(
         self, request: ExtendedHealthRecoveryRequest
     ) -> None:
-        stream_key = (Venue.EXTENDED, request.symbol, request.kind)
-        identity = (Venue.EXTENDED, request.kind, (request.symbol,))
+        stream_key = self._extended_stream_key(
+            request.symbol, request.kind, request.stream_session_id
+        )
+        aggregate = stream_key[1] == "*"
+        identity = (
+            self._extended_aggregate_identity(request.kind)
+            if aggregate
+            else (Venue.EXTENDED, request.kind, (request.symbol,))
+        )
         if not self._extended_health_recovery_is_current(request):
             return
         self._watchdog_stale(
@@ -4093,13 +4284,24 @@ class PublicPaperRuntime:
         )
         watchdog_detail = self._pending_watchdog_episodes[identity]
         watchdog_episode_id = str(watchdog_detail["episode_id"])
-        await self.mark_disconnected(
-            Venue.EXTENDED, request.symbol,
-            at=request.detected_at,
-            stream_kind=request.kind,
-            exception=TimeoutError("public socket confirmation stale"),
-            stream_session_id=request.stream_session_id,
-        )
+        if aggregate:
+            for symbol in self._extended_stream_symbols_now():
+                await self.mark_disconnected(
+                    Venue.EXTENDED, symbol,
+                    at=request.detected_at,
+                    stream_kind=request.kind,
+                    exception=TimeoutError("public socket confirmation stale"),
+                    stream_session_id=request.stream_session_id,
+                )
+            self._extended_connection_confirmed_at.pop(request.kind, None)
+        else:
+            await self.mark_disconnected(
+                Venue.EXTENDED, request.symbol,
+                at=request.detected_at,
+                stream_kind=request.kind,
+                exception=TimeoutError("public socket confirmation stale"),
+                stream_session_id=request.stream_session_id,
+            )
         if (
             self._stop_event is None
             or self._stop_event.is_set()
@@ -4110,7 +4312,10 @@ class PublicPaperRuntime:
         ):
             self._clear_extended_health_watchdog(identity, watchdog_episode_id)
             return
-        await self._restart_extended_stream(request.symbol, request.kind)
+        if aggregate:
+            await self._restart_extended_stream(request.kind)
+        else:
+            await self._restart_extended_stream(request.symbol, request.kind)
 
     def _clear_extended_health_watchdog(
         self,
@@ -4177,18 +4382,26 @@ class PublicPaperRuntime:
             return
         venue, stream_kind, markets = identity
         self._watchdog_episode_number += 1
+        scope = (
+            tuple(self._extended_stream_symbols_now())
+            if venue is Venue.EXTENDED and markets == ("*",)
+            else markets
+        )
         detail: dict[str, object] = {
             "episode_id": (
                 f"watchdog:{venue.value}:{stream_kind}:{markets[0]}:"
                 f"{at.isoformat()}:{self._watchdog_episode_number}"
             ),
             "stream_identity": f"{venue.value}:{stream_kind}:{markets[0]}",
-            "stream_kind": stream_kind, "market": markets[0],
+            "stream_kind": stream_kind,
+            "market": markets[0],
             "last_confirmation": last_confirmation.isoformat(),
             "detected_at": at.isoformat(),
             "stale_age": str(Decimal(str((at - last_confirmation).total_seconds()))),
             "restart_reason": "CONFIRMATION_STALE",
         }
+        if markets == ("*",):
+            detail["markets"] = list(scope)
         self._pending_watchdog_episodes[identity] = detail
         self._record(
             "PUBLIC_STREAM_CONFIRMATION_STALE", at=at, venue=venue, detail=detail
@@ -4218,7 +4431,11 @@ class PublicPaperRuntime:
         session_key = (
             (identity[0], "*", "combined")
             if identity[1] == "combined"
-            else (identity[0], identity[2][0], identity[1])
+            else (
+                self._extended_aggregate_key(identity[1])
+                if identity[0] is Venue.EXTENDED and identity[2] == ("*",)
+                else (identity[0], identity[2][0], identity[1])
+            )
         )
         if not self._owns_stream_session(session_key, stream_session_id):
             return
@@ -4242,6 +4459,8 @@ class PublicPaperRuntime:
             detail["close_classification"] = close_classification
         if stream_kind == "combined":
             detail["markets"] = list(markets)
+        elif markets == ("*",):
+            detail["markets"] = list(self._extended_stream_symbols_now())
         else:
             detail["market"] = markets[0]
         self._pending_socket_episodes[identity] = detail
@@ -4262,7 +4481,11 @@ class PublicPaperRuntime:
         session_key = (
             (identity[0], "*", "combined")
             if identity[1] == "combined"
-            else (identity[0], identity[2][0], identity[1])
+            else (
+                self._extended_aggregate_key(identity[1])
+                if identity[0] is Venue.EXTENDED and identity[2] == ("*",)
+                else (identity[0], identity[2][0], identity[1])
+            )
         )
         if not self._owns_stream_session(session_key, stream_session_id):
             return
@@ -4304,8 +4527,19 @@ class PublicPaperRuntime:
             )
 
     async def _recover_snapshot_locked(
-        self, book: OrderBook, *, at: datetime
-    ) -> None:
+        self, book: OrderBook, *, at: datetime, websocket: bool = False
+    ) -> bool:
+        if (
+            book.venue is Venue.EXTENDED
+            and self._extended_aggregate_active("book")
+            and not websocket
+        ):
+            self._record(
+                "PUBLIC_REST_SNAPSHOT_IGNORED_FOR_WS_RESYNC",
+                at=at, venue=book.venue,
+                detail={"symbol": book.canonical_market},
+            )
+            return False
         now = at
         stream = self.coordinator.stream(book.venue, book.canonical_market)
         stream.connected(now)
@@ -4331,7 +4565,7 @@ class PublicPaperRuntime:
             )
         lifecycle = self.lifecycle
         if lifecycle is None or not lifecycle.snapshot.gap_open:
-            return
+            return True
         snapshot = lifecycle.snapshot
         risex, hedge = self._market_pair_observations(
             snapshot.risex_market, snapshot.hedge_market, now
@@ -4361,11 +4595,11 @@ class PublicPaperRuntime:
                 hedge_capture=hedge_capture,
             )
             if self.lifecycle is not lifecycle or lifecycle.snapshot is not before:
-                return
+                return True
             if candidate.fill_provenance and not self._captures_are_current(
                 risex_capture, hedge_capture
             ):
-                return
+                return True
             self.repository.save_decision(
                 recorded_at=now,
                 lifecycle_snapshot=candidate.snapshot,
@@ -4374,6 +4608,7 @@ class PublicPaperRuntime:
             lifecycle.publish_candidate(candidate)
             if candidate.snapshot.lifecycle_state is LifecycleState.FLAT:
                 self.lifecycle = None
+        return True
 
     async def recover_snapshot(
         self, book: OrderBook, *, at: datetime | None = None
@@ -4387,8 +4622,7 @@ class PublicPaperRuntime:
             )
             return False
         async with self._position_event_lock:
-            await self._recover_snapshot_locked(book, at=now)
-        return True
+            return await self._recover_snapshot_locked(book, at=now)
 
     async def _publish_recovery_snapshot(
         self,
@@ -4614,11 +4848,29 @@ class PublicPaperRuntime:
             return False
         now = self.clock.now()
         key = (event.venue, event.canonical_market)
-        stream_key = (
-            (event.venue, event.canonical_market, "book")
-            if event.venue is Venue.EXTENDED
-            else (event.venue, "*", "combined")
+        stream_key = self._book_stream_key(*key)
+        aggregate = (
+            event.venue is Venue.EXTENDED
+            and self._owns_stream_session(
+                self._extended_aggregate_key("book"), stream_session_id
+            )
         )
+        aggregate_physical_previous = (
+            self._extended_book_sequence_state.get(stream_session_id)
+            if aggregate else None
+        )
+        if aggregate and event.canonical_market not in set(
+            self._extended_stream_symbols_now()
+        ):
+            if event.sequence is not None:
+                previous = self._extended_book_sequence_state.get(stream_session_id)
+                if previous is None or event.sequence > previous:
+                    self._extended_book_sequence_state[stream_session_id] = event.sequence
+            return False
+        if aggregate and event.sequence is not None:
+            previous = self._extended_book_sequence_state.get(stream_session_id)
+            if previous is None or event.sequence > previous:
+                self._extended_book_sequence_state[stream_session_id] = event.sequence
         episode = self._recoveries.get(key)
         active = episode is not None and episode.terminal is None
         if (
@@ -4637,6 +4889,34 @@ class PublicPaperRuntime:
         if required_session != stream_session_id:
             return False
         if (
+            aggregate
+            and isinstance(event, OrderBook)
+            and event.sequence is None
+        ):
+            self._record(
+                "PUBLIC_REST_SNAPSHOT_IGNORED_FOR_WS_RESYNC",
+                at=now, venue=event.venue,
+                detail={"symbol": event.canonical_market},
+            )
+            return False
+        if (
+            aggregate
+            and isinstance(event, BookDelta)
+            and event.sequence is not None
+        ):
+            previous = aggregate_physical_previous
+            if previous is not None and event.sequence != previous + 1:
+                if not active:
+                    await self.mark_disconnected(
+                        event.venue, event.canonical_market, at=now,
+                        stream_kind="book", stream_session_id=stream_session_id,
+                    )
+                    self._start_snapshot_recovery(
+                        event.venue, event.canonical_market,
+                        displaced_stream_session_id=stream_session_id,
+                    )
+                return False
+        if (
             isinstance(event, OrderBook)
             and event.venue is Venue.LIGHTER
             and event.sequence is None
@@ -4651,12 +4931,23 @@ class PublicPaperRuntime:
             self.coordinator.stream(*key).connection_confirmed(now)
         if isinstance(event, OrderBook):
             if not active:
+                if aggregate:
+                    current = self.coordinator.stream(*key).book()
+                    if (
+                        current is not None
+                        and current.sequence is not None
+                        and event.sequence is not None
+                        and event.sequence <= current.sequence
+                    ):
+                        return False
                 async with self._position_event_lock:
                     if not self._owns_stream_session(
                         stream_key, stream_session_id
                     ):
                         return False
-                    await self._recover_snapshot_locked(event, at=now)
+                    await self._recover_snapshot_locked(
+                        event, at=now, websocket=True
+                    )
                     return self._owns_stream_session(
                         stream_key, stream_session_id
                     )
@@ -4670,7 +4961,15 @@ class PublicPaperRuntime:
                 return False
             try:
                 recovered, buffered, replayed = self._build_recovery_book(
-                    event, episode
+                    event,
+                    episode,
+                    aggregate=(
+                        event.venue is Venue.EXTENDED
+                        and self._owns_stream_session(
+                            self._extended_aggregate_key("book"),
+                            stream_session_id,
+                        )
+                    ),
                 )
             except ValueError as exc:
                 await self.mark_disconnected(
@@ -4736,7 +5035,30 @@ class PublicPaperRuntime:
                 episode.buffer.append(event)
             return False
         stream = self.coordinator.stream(event.venue, event.canonical_market)
-        if not stream.apply_delta(event):
+        if aggregate:
+            current = stream.book()
+            current_sequence = None if current is None else current.sequence
+            exact = (
+                current_sequence is not None
+                and event.sequence is not None
+                and event.sequence == current_sequence + 1
+            )
+            interleaved = (
+                current_sequence is not None
+                and event.sequence is not None
+                and event.sequence > current_sequence
+                and aggregate_physical_previous is not None
+                and event.sequence == aggregate_physical_previous + 1
+            )
+            if exact:
+                healthy = stream.apply_delta(event)
+            elif interleaved:
+                healthy = stream.extended_aggregate_delta(event)
+            else:
+                healthy = False
+        else:
+            healthy = stream.apply_delta(event)
+        if not healthy:
             await self.mark_disconnected(
                 event.venue, event.canonical_market, at=now,
                 stream_kind="book", stream_session_id=stream_session_id,
@@ -4929,13 +5251,24 @@ class PublicPaperRuntime:
             # session into another recovery episode.  A fresh WS session is
             # the only allowed successor for a failed Lighter recovery.
             return current
+        aggregate = (
+            venue is Venue.EXTENDED
+            and self._owns_stream_session(
+                self._extended_aggregate_key("book"),
+                displaced_stream_session_id,
+            )
+        )
         session_id = (
-            self._new_stream_session((venue, symbol, "book"))
-            if venue is Venue.EXTENDED else displaced_stream_session_id
+            displaced_stream_session_id
+            if aggregate
+            else (
+                self._new_stream_session((venue, symbol, "book"))
+                if venue is Venue.EXTENDED else displaced_stream_session_id
+            )
         )
         episode = self._new_recovery_episode(key, session_id)
         self._record_recovery_started(key, episode)
-        if venue is Venue.EXTENDED:
+        if venue is Venue.EXTENDED and not aggregate:
             self._spawn_recovery_task(
                 key, episode, self._restart_extended_book_stream(symbol, episode)
             )
@@ -5056,7 +5389,7 @@ class PublicPaperRuntime:
         await dispatcher.drain()
 
     def _build_recovery_book(
-        self, snapshot: OrderBook, episode: RecoveryEpisode
+        self, snapshot: OrderBook, episode: RecoveryEpisode, *, aggregate: bool = False
     ) -> tuple[OrderBook, int, int]:
         stream = BookStream(snapshot.venue, snapshot.canonical_market)
         stream.connected(self.clock.now())
@@ -5079,7 +5412,11 @@ class PublicPaperRuntime:
                 and delta.sequence <= snapshot.sequence
             ):
                 continue
-            if not stream.apply_delta(delta):
+            applied = (
+                stream.extended_aggregate_delta(delta)
+                if aggregate else stream.apply_delta(delta)
+            )
+            if not applied:
                 raise ValueError("buffered book delta sequence gap")
             replayed += 1
         recovered = stream.book()
@@ -5117,7 +5454,9 @@ class PublicPaperRuntime:
                 )
             )
 
-    def _start_extended_stream(self, symbol: str, kind: str) -> None:
+    def _start_extended_stream(
+        self, symbol_or_kind: str, kind: str | None = None
+    ) -> None:
         if (
             self._session is None
             or self.adapters is None
@@ -5128,28 +5467,61 @@ class PublicPaperRuntime:
         adapter = self.adapters.get(Venue.EXTENDED)
         if not isinstance(adapter, ExtendedAdapter):
             return
-        key = (Venue.EXTENDED, symbol, kind)
+        aggregate = kind is None
+        stream_kind = symbol_or_kind if aggregate else kind
+        assert stream_kind is not None
+        symbol = symbol_or_kind
+        key = (
+            self._extended_aggregate_key(stream_kind)
+            if aggregate else (Venue.EXTENDED, symbol, stream_kind)
+        )
         current = self._stream_tasks.get(key)
         if current is not None and not current.done():
             return
+        if aggregate:
+            self._extended_connection_confirmed_at.pop(stream_kind, None)
         session_id = self._new_stream_session(key)
         self._stream_tasks[key] = asyncio.create_task(
-            self._extended_stream(adapter, symbol, kind, session_id)
+            self._extended_stream(
+                adapter,
+                self._extended_stream_symbols_now() if aggregate else symbol,
+                stream_kind,
+                session_id,
+            )
         )
 
-    async def _restart_extended_stream(self, symbol: str, kind: str) -> None:
-        key = (Venue.EXTENDED, symbol, kind)
+    async def _restart_extended_stream(
+        self, symbol_or_kind: str, kind: str | None = None
+    ) -> None:
+        aggregate = kind is None
+        stream_kind = symbol_or_kind if aggregate else kind
+        assert stream_kind is not None
+        symbol = symbol_or_kind
+        key = (
+            self._extended_aggregate_key(stream_kind)
+            if aggregate else (Venue.EXTENDED, symbol, stream_kind)
+        )
+        if aggregate:
+            self._extended_connection_confirmed_at.pop(stream_kind, None)
         current = self._stream_tasks.get(key)
         if current is not None and current is not asyncio.current_task():
             self._stream_tasks.pop(key, None)
-            self._stream_sessions.pop(key, None)
-            self._start_extended_stream(symbol, kind)
+            old_session = self._stream_sessions.pop(key, None)
+            if old_session is not None:
+                self._extended_book_sequence_state.pop(old_session, None)
+            if aggregate:
+                self._start_extended_stream(stream_kind)
+            else:
+                self._start_extended_stream(symbol, stream_kind)
             current.cancel()
             self._retired_stream_tasks.add(current)
             current.add_done_callback(self._retired_stream_task_done)
             await asyncio.sleep(0)
             return
-        self._start_extended_stream(symbol, kind)
+        if aggregate:
+            self._start_extended_stream(stream_kind)
+        else:
+            self._start_extended_stream(symbol, stream_kind)
 
     async def _extended_heartbeat(
         self,
@@ -5283,13 +5655,340 @@ class PublicPaperRuntime:
             self._recover_snapshot_in_background(key[0], key[1], episode),
         )
 
-    async def _extended_stream(
+    async def _extended_aggregate_stream(
         self,
         adapter: ExtendedAdapter,
-        symbol: str,
+        symbols: tuple[str, ...],
         kind: str,
         stream_session_id: StreamSessionId,
     ) -> None:
+        """Own one market-omitted Extended socket and route it by market.
+
+        The socket is physical and venue-wide; every book, trade, and funding
+        state mutation remains keyed by the market carried in the validated
+        message.  Catalog changes update ``_extended_stream_symbols`` without
+        replacing this socket, so a newly required market waits for its own
+        evidence and a removed market becomes inert immediately.
+        """
+        assert self._session is not None
+        if symbols and not self._extended_stream_symbols:
+            self._extended_stream_symbols = tuple(sorted(dict.fromkeys(symbols)))
+        task_key = self._extended_aggregate_key(kind)
+        socket_identity = self._extended_aggregate_identity(kind)
+        url = {
+            "book": adapter.orderbook_stream_url(),
+            "trade": adapter.trades_stream_url(),
+            "funding": adapter.funding_stream_url(),
+        }[kind]
+        delay = 1
+        while self._stop_event is not None and not self._stop_event.is_set():
+            if not self._owns_stream_session(task_key, stream_session_id):
+                return
+            session_established = False
+            heartbeat: asyncio.Task[None] | None = None
+            try:
+                async with self._session.ws_connect(
+                    url, heartbeat=None, autoping=False
+                ) as ws:
+                    if not self._owns_stream_session(task_key, stream_session_id):
+                        return
+                    session_established = True
+                    connected_at = self.clock.now()
+                    if kind == "book":
+                        for symbol in self._extended_stream_symbols_now():
+                            key = (Venue.EXTENDED, symbol)
+                            stream = self.coordinator.stream(*key)
+                            stream.connected(connected_at)
+                            # Extended REST books have no sequence marker. A
+                            # physical aggregate session must establish each
+                            # market's sequence from its own WS snapshot,
+                            # even when a REST book was already present.
+                            stream.gap()
+                            self._live_book_ready.discard(key)
+                            self._set_component_readiness(
+                                Venue.EXTENDED, f"book:{symbol}", False,
+                                "PUBLIC_BOOK_DATA_PENDING", connected_at,
+                            )
+                    self._confirm_extended_aggregate(
+                        kind, connected_at, data_ready=False,
+                        stream_session_id=stream_session_id,
+                    )
+                    self._socket_reconnected(
+                        socket_identity, at=connected_at,
+                        stream_session_id=stream_session_id,
+                    )
+                    if not self._owns_stream_session(task_key, stream_session_id):
+                        return
+                    self._watchdog_restarted(
+                        socket_identity, at=self.clock.now()
+                    )
+                    heartbeat = asyncio.create_task(self._extended_heartbeat(
+                        ws, task_key, stream_session_id
+                    ))
+                    last_trade_sequence: int | None = None
+                    trade_discontinuity_recorded = False
+                    last_funding_sequence: int | None = None
+                    ordinal = 0
+                    try:
+                        async for message in ws:
+                            await asyncio.sleep(0)
+                            if not self._owns_stream_session(
+                                task_key, stream_session_id
+                            ):
+                                return
+                            if message.type is aiohttp.WSMsgType.PING:
+                                await ws.pong(message.data)
+                                if not self._owns_stream_session(
+                                    task_key, stream_session_id
+                                ):
+                                    return
+                                delay = 1
+                                self._confirm_extended_aggregate(
+                                    kind, self.clock.now(), data_ready=False,
+                                    stream_session_id=stream_session_id,
+                                )
+                                continue
+                            if message.type is aiohttp.WSMsgType.PONG:
+                                delay = 1
+                                self._confirm_extended_aggregate(
+                                    kind, self.clock.now(), data_ready=False,
+                                    stream_session_id=stream_session_id,
+                                )
+                                continue
+                            if message.type in {
+                                aiohttp.WSMsgType.CLOSE,
+                                aiohttp.WSMsgType.CLOSING,
+                                aiohttp.WSMsgType.CLOSED,
+                                aiohttp.WSMsgType.ERROR,
+                            }:
+                                raise _PublicSocketClosed(message.type.name)
+                            if message.type is not aiohttp.WSMsgType.TEXT:
+                                continue
+                            payload = json.loads(message.data, parse_float=Decimal)
+                            if kind == "book":
+                                received_at = self.clock.now()
+                                event = adapter.normalize_book_message(
+                                    payload, received_at=received_at
+                                )
+                                if event.canonical_market not in set(
+                                    self._extended_stream_symbols_now()
+                                ):
+                                    # apply_book_event advances only the
+                                    # aggregate sequence cursor for an
+                                    # irrelevant market and performs no market
+                                    # readiness/book mutation.
+                                    await self.apply_book_event(
+                                        event,
+                                        stream_session_id=stream_session_id,
+                                    )
+                                    continue
+                                healthy = await self.apply_book_event(
+                                    event,
+                                    stream_session_id=stream_session_id,
+                                )
+                                if not self._owns_stream_session(
+                                    task_key, stream_session_id
+                                ):
+                                    return
+                                delay = 1
+                                if healthy:
+                                    self._confirm_extended_stream(
+                                        event.canonical_market, kind,
+                                        self.clock.now(), data_ready=True,
+                                        stream_session_id=stream_session_id,
+                                    )
+                            elif kind == "trade":
+                                received_at = self.clock.now()
+                                sequence, trades = adapter.normalize_trade_message(
+                                    payload,
+                                    received_at=received_at,
+                                    session_id=str(id(ws)),
+                                    starting_ordinal=ordinal,
+                                )
+                                ordinal += len(trades)
+                                previous = last_trade_sequence
+                                if previous is not None and sequence != previous + 1:
+                                    if not trade_discontinuity_recorded:
+                                        forward = sequence > previous + 1
+                                        self._record(
+                                            "PUBLIC_TRADE_SEQUENCE_DISCONTINUITY",
+                                            at=received_at,
+                                            venue=Venue.EXTENDED,
+                                            detail={
+                                                "action": (
+                                                    "ACCEPT_MONOTONIC"
+                                                    if forward
+                                                    else "IGNORE_NON_MONOTONIC"
+                                                ),
+                                                "classification": (
+                                                    "FORWARD_GAP"
+                                                    if forward
+                                                    else (
+                                                        "DUPLICATE"
+                                                        if sequence == previous
+                                                        else "OUT_OF_ORDER"
+                                                    )
+                                                ),
+                                                "current_sequence": sequence,
+                                                "previous_sequence": previous,
+                                                "stream": "trade",
+                                                "scope": "ALL_MARKETS",
+                                            },
+                                        )
+                                        trade_discontinuity_recorded = True
+                                    if sequence <= previous:
+                                        for trade in trades:
+                                            if trade.canonical_market in set(
+                                                self._extended_stream_symbols_now()
+                                            ):
+                                                self._confirm_extended_stream(
+                                                    trade.canonical_market,
+                                                    kind,
+                                                    received_at,
+                                                    data_ready=True,
+                                                    stream_session_id=stream_session_id,
+                                                )
+                                        continue
+                                last_trade_sequence = sequence
+                                routed = tuple(
+                                    trade for trade in trades
+                                    if trade.canonical_market in set(
+                                        self._extended_stream_symbols_now()
+                                    )
+                                )
+                                for trade in routed:
+                                    self._confirm_extended_stream(
+                                        trade.canonical_market, kind,
+                                        received_at, data_ready=True,
+                                        stream_session_id=stream_session_id,
+                                    )
+                                delay = 1
+                                for trade in routed:
+                                    if not self._owns_stream_session(
+                                        task_key, stream_session_id
+                                    ):
+                                        return
+                                    await self.deliver_trade(
+                                        trade,
+                                        stream_session_id=stream_session_id,
+                                    )
+                            else:
+                                message = require_mapping(
+                                    payload, "funding message"
+                                )
+                                data = require_mapping(
+                                    message.get("data"),
+                                    "funding message.data",
+                                )
+                                sequence = int(message["seq"])
+                                raw_market = data.get("m")
+                                current_symbols = set(
+                                    self._extended_stream_symbols_now()
+                                )
+                                if (
+                                    not isinstance(raw_market, str)
+                                    or raw_market not in current_symbols
+                                ):
+                                    if (
+                                        last_funding_sequence is None
+                                        or sequence > last_funding_sequence
+                                    ):
+                                        last_funding_sequence = sequence
+                                    continue
+                                previous = last_funding_sequence
+                                if (
+                                    previous is not None
+                                    and sequence <= previous
+                                ):
+                                    if (Venue.EXTENDED, raw_market) in self.observations:
+                                        self._confirm_extended_stream(
+                                            raw_market, kind, self.clock.now(),
+                                            data_ready=True,
+                                            stream_session_id=stream_session_id,
+                                        )
+                                    continue
+                                last_funding_sequence = sequence
+                                row = self.observations.get(
+                                    (Venue.EXTENDED, raw_market)
+                                )
+                                if row is None:
+                                    continue
+                                settlement = (
+                                    adapter.normalize_applied_funding_message(
+                                        payload, row.market
+                                    )
+                                )
+                                delay = 1
+                                self._confirm_extended_stream(
+                                    raw_market, kind, self.clock.now(),
+                                    data_ready=True,
+                                    stream_session_id=stream_session_id,
+                                )
+                                if settlement is not None:
+                                    if not self._owns_stream_session(
+                                        task_key, stream_session_id
+                                    ):
+                                        return
+                                    await self._apply_extended_funding_record(
+                                        settlement,
+                                        stream_session_id=stream_session_id,
+                                    )
+                    finally:
+                        if heartbeat is not None:
+                            heartbeat.cancel()
+                            await asyncio.gather(
+                                heartbeat, return_exceptions=True
+                            )
+                    if self._stop_event is None or not self._stop_event.is_set():
+                        raise _PublicSocketClosed("EOF")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if self._stop_event is not None and self._stop_event.is_set():
+                    break
+                if (
+                    not self._owns_stream_session(task_key, stream_session_id)
+                    or (
+                        self._stream_tasks.get(task_key) is not None
+                        and self._stream_tasks.get(task_key)
+                        is not asyncio.current_task()
+                    )
+                ):
+                    return
+                if session_established:
+                    self._record_transport_disconnect(
+                        socket_identity, at=self.clock.now(), exception=exc,
+                        stream_session_id=stream_session_id,
+                    )
+                for symbol in self._extended_stream_symbols_now():
+                    await self.mark_disconnected(
+                        Venue.EXTENDED, symbol, stream_kind=kind,
+                        exception=exc, stream_session_id=stream_session_id,
+                    )
+                self._extended_connection_confirmed_at.pop(kind, None)
+                if not self._owns_stream_session(task_key, stream_session_id):
+                    return
+                await self._sleep(delay)
+                if not self._owns_stream_session(task_key, stream_session_id):
+                    return
+                delay = min(delay * 2, 30)
+                stream_session_id = self._new_stream_session(task_key)
+
+    async def _extended_stream(
+        self,
+        adapter: ExtendedAdapter,
+        symbol: str | tuple[str, ...],
+        kind: str,
+        stream_session_id: StreamSessionId,
+    ) -> None:
+        # The symbol overload remains for direct historical recovery/health
+        # fixtures; production reconciliation always passes the aggregate
+        # routing tuple and owns one market-omitted socket per kind.
+        if not isinstance(symbol, str):
+            await self._extended_aggregate_stream(
+                adapter, tuple(symbol), kind, stream_session_id
+            )
+            return
         assert self._session is not None
         task_key = (Venue.EXTENDED, symbol, kind)
         socket_identity = (Venue.EXTENDED, kind, (symbol,))
@@ -6103,69 +6802,107 @@ class PublicPaperRuntime:
         adapter = self.adapters.get(Venue.EXTENDED)
         if not isinstance(adapter, ExtendedAdapter):
             return
-        wanted = {
-            (Venue.EXTENDED, symbol, kind)
-            for symbol in self._required_extended_symbols()
+        wanted_symbols = tuple(sorted(self._required_extended_symbols()))
+        previous_symbols = self._extended_stream_symbols
+        previous_set = set(previous_symbols)
+        wanted_set = set(wanted_symbols)
+        self._extended_stream_symbols = wanted_symbols
+        now = self.clock.now()
+
+        # A catalog change is a routing change, not a reason to create a new
+        # physical connection.  Clear only the symbols whose own evidence is
+        # no longer current; healthy symbols retain their books and readiness.
+        added_symbols = wanted_set - previous_set
+        removed_symbols = previous_set - wanted_set
+        for symbol in sorted(added_symbols):
+            self._extended_confirmed_at = {
+                key: value
+                for key, value in self._extended_confirmed_at.items()
+                if key[0] != symbol
+            }
+            for kind in ("book", "trade", "funding"):
+                self._set_component_readiness(
+                    Venue.EXTENDED,
+                    f"{('applied_funding' if kind == 'funding' else kind)}:{symbol}",
+                    False,
+                    f"PUBLIC_{kind.upper()}_DATA_PENDING",
+                    now,
+                )
+                self._set_component_readiness(
+                    Venue.EXTENDED, f"connection_{kind}:{symbol}", False,
+                    f"PUBLIC_{kind.upper()}_CONNECTION_PENDING", now,
+                )
+                if kind == "book":
+                    self._live_book_ready.discard((Venue.EXTENDED, symbol))
+                    self.coordinator.stream(
+                        Venue.EXTENDED, symbol
+                    ).gap()
+                elif kind == "trade":
+                    self._trade_stream_ready.discard((Venue.EXTENDED, symbol))
+                self._record(
+                    "PUBLIC_STREAM_ADDED", venue=Venue.EXTENDED,
+                    detail={"symbol": symbol, "stream": kind},
+                )
+        for symbol in sorted(removed_symbols):
+            for kind in ("book", "trade", "funding"):
+                self._extended_confirmed_at.pop((symbol, kind), None)
+            self._live_book_ready.discard((Venue.EXTENDED, symbol))
+            self._trade_stream_ready.discard((Venue.EXTENDED, symbol))
+            self.observations.pop((Venue.EXTENDED, symbol), None)
+            self._record(
+                "PUBLIC_STREAM_REMOVED", venue=Venue.EXTENDED,
+                detail={"symbol": symbol, "stream": "all"},
+            )
+
+        self._remove_obsolete_components(Venue.EXTENDED, wanted_set, now)
+        wanted_keys = {
+            self._extended_aggregate_key(kind)
             for kind in ("book", "trade", "funding")
-        }
-        current: set[tuple[Venue, str, str]] = set()
+        } if wanted_symbols else set()
         for key, task in tuple(self._stream_tasks.items()):
-            if key[0] is not Venue.EXTENDED:
+            if key[0] is not Venue.EXTENDED or key[1] != "*":
                 continue
             if task.done():
                 self._stream_tasks.pop(key, None)
-            else:
-                current.add(key)
-        self._remove_obsolete_components(
-            Venue.EXTENDED, {key[1] for key in wanted}, self.clock.now()
-        )
-        for key in sorted(wanted - current, key=lambda row: (row[1], row[2])):
-            _, symbol, kind = key
-            self._live_book_ready.discard((Venue.EXTENDED, symbol))
-            if kind == "trade":
-                self._trade_stream_ready.discard((Venue.EXTENDED, symbol))
-            data_component = "applied_funding" if kind == "funding" else kind
-            self._set_component_readiness(
-                Venue.EXTENDED, f"{data_component}:{symbol}", False,
-                f"PUBLIC_{kind.upper()}_DATA_PENDING", self.clock.now(),
-            )
-            self._set_component_readiness(
-                Venue.EXTENDED, f"connection_{kind}:{symbol}", False,
-                f"PUBLIC_{kind.upper()}_CONNECTION_PENDING", self.clock.now(),
-            )
-            if kind == "book":
-                self.coordinator.stream(Venue.EXTENDED, symbol).gap()
-            self._start_extended_stream(symbol, kind)
+
+        active_keys = {
+            key for key, task in self._stream_tasks.items()
+            if key[0] is Venue.EXTENDED and key[1] == "*" and not task.done()
+        }
+        removed_keys = active_keys - wanted_keys
+        for key in removed_keys:
+            task = self._stream_tasks.pop(key)
+            removed_session = self._stream_sessions.pop(key, None)
+            self._extended_connection_confirmed_at.pop(key[2], None)
+            self._extended_book_sequence_state = {
+                saved_session: sequence
+                for saved_session, sequence
+                in self._extended_book_sequence_state.items()
+                if saved_session != removed_session
+            }
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            identity = self._extended_aggregate_identity(key[2])
+            self._pending_socket_episodes.pop(identity, None)
+            self._pending_watchdog_episodes.pop(identity, None)
             self._record(
-                "PUBLIC_STREAM_ADDED", venue=Venue.EXTENDED,
-                detail={"symbol": symbol, "stream": kind},
+                "PUBLIC_STREAM_REMOVED", venue=Venue.EXTENDED,
+                detail={"stream": key[2], "scope": "ALL_MARKETS"},
             )
-        removed = current - wanted
-        for key in removed:
-            self._extended_confirmed_at.pop((key[1], key[2]), None)
-            self._live_book_ready.discard((Venue.EXTENDED, key[1]))
-            if key[2] == "trade":
-                self._trade_stream_ready.discard((Venue.EXTENDED, key[1]))
-            self._pending_socket_episodes.pop(
-                (Venue.EXTENDED, key[2], (key[1],)), None
-            )
-            self._stream_tasks[key].cancel()
-        if removed:
-            await asyncio.gather(
-                *(self._stream_tasks[key] for key in removed),
-                return_exceptions=True,
-            )
-            for key in removed:
-                self._stream_tasks.pop(key, None)
+        if not wanted_symbols:
+            for kind in ("book", "trade", "funding"):
+                identity = self._extended_aggregate_identity(kind)
+                self._pending_socket_episodes.pop(identity, None)
+                self._pending_watchdog_episodes.pop(identity, None)
+        for kind in ("book", "trade", "funding"):
+            key = self._extended_aggregate_key(kind)
+            task = self._stream_tasks.get(key)
+            if wanted_symbols and (task is None or task.done()):
+                self._start_extended_stream(kind)
                 self._record(
-                    "PUBLIC_STREAM_REMOVED", venue=Venue.EXTENDED,
-                    detail={"symbol": key[1], "stream": key[2]},
+                    "PUBLIC_STREAM_RECONCILED", venue=Venue.EXTENDED,
+                    detail={"stream": kind, "scope": "ALL_MARKETS"},
                 )
-        wanted_symbols = {key[1] for key in wanted}
-        for symbol in {
-            key[1] for key in removed
-        } - wanted_symbols:
-            self.observations.pop((Venue.EXTENDED, symbol), None)
 
     async def _pause_or_stop(self, seconds: float) -> None:
         assert self._stop_event is not None
@@ -6502,6 +7239,9 @@ class PublicPaperRuntime:
         self._stream_tasks.clear()
         self._retired_stream_tasks.clear()
         self._stream_sessions.clear()
+        self._extended_stream_symbols = ()
+        self._extended_connection_confirmed_at.clear()
+        self._extended_book_sequence_state.clear()
         self._recoveries.clear()
         self._retired_recovery_tasks.clear()
         self._extended_health_recovery_requests.clear()
