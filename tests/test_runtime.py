@@ -4786,24 +4786,75 @@ async def test_production_shaped_zec_first_fill_chain_is_exact_and_single(tmp_pa
             assert order.side is Side.BUY
             assert order.canonical_quantity == D("0.6")
             assert order.active_version.limit_price == D("801.056")
+            activation_taker_vwap = order.route_plan.risex_entry_price
+            assert activation_taker_vwap == D("800.53")
             clock.advance(1)
+            fill_at = clock.now()
+            risex_key = Venue.RISEX, "ZEC-RISEX"
+            fresh_risex_book = OrderBook(
+                Venue.RISEX,
+                "ZEC-RISEX",
+                (BookLevel(D("800.53"), D("0.3")),
+                 BookLevel(D("800.13"), D("0.3"))),
+                (BookLevel(D("800.531"), D("5")),),
+                fill_at,
+                2,
+            )
+            runtime.coordinator.stream(*risex_key).snapshot(fresh_risex_book)
+            runtime._bump_book_revision(risex_key)
             runtime.mark_trade_stream_connected(order.venue, order.canonical_market)
             trade = TradeEvidence(
                 "zec-public-sell", Venue.EXTENDED, "ZEC-EXTENDED",
-                clock.now(), clock.now(), int(clock.now().timestamp() * 1_000_000_000),
+                fill_at, fill_at, int(fill_at.timestamp() * 1_000_000_000),
                 D("1.5"), D("800.938"), Side.SELL, True,
             )
             await runtime.deliver_trade(trade)
             position = runtime.lifecycle.snapshot.position
             assert position.canonical_quantity == D("0.6")
             assert position.hedge_maker_fill.canonical_price == D("801.056")
-            assert position.risex_taker_fill.canonical_price == D("800.53")
+            assert position.risex_taker_fill.canonical_price == D("800.33")
+            assert position.risex_taker_fill.canonical_price != activation_taker_vwap
+            assert position.risex_taker_fill.fee.fill_notional_usd == D("480.198")
+            assert position.risex_taker_fill.fee.amount_usd == (
+                D("480.198") * D("0.00021")
+            )
+            assert position.entry_executable_basis == (
+                D("800.33") / D("801.056") - D("1")
+            )
             assert repository.connection.execute(
                 "SELECT COUNT(*) FROM positions"
             ).fetchone()[0] == 1
             assert repository.connection.execute(
                 "SELECT COUNT(*) FROM fills"
             ).fetchone()[0] == 2
+            persisted = repository.load_runtime()
+            assert persisted.position is not None
+            assert persisted.position.risex_taker_fill.canonical_price == D("800.33")
+            assert persisted.position.risex_taker_fill.fee.amount_usd == (
+                D("480.198") * D("0.00021")
+            )
+            assert persisted.position.entry_executable_basis == position.entry_executable_basis
+            assert persisted.position.planned_maker_exit_net_pnl_usd == (
+                position.planned_maker_exit_net_pnl_usd
+            )
+            assert persisted.position.planned_hold_to_target_net_pnl_usd == (
+                position.planned_hold_to_target_net_pnl_usd
+            )
+            assert persisted.position.executable_unwind_net_pnl_usd == (
+                position.executable_unwind_net_pnl_usd
+            )
+            persisted_taker_row = repository.connection.execute(
+                "SELECT notional_usd,fee_usd,payload FROM fills "
+                "WHERE fill_id=?",
+                (f"{position.position_id}:risex-entry",),
+            ).fetchone()
+            assert persisted_taker_row is not None
+            assert D(persisted_taker_row["notional_usd"]) == D("480.198")
+            assert D(persisted_taker_row["fee_usd"]) == (
+                D("480.198") * D("0.00021")
+            )
+            persisted_taker_fill = pickle.loads(persisted_taker_row["payload"])
+            assert persisted_taker_fill == persisted.position.risex_taker_fill
             entry_fill_values = repository.connection.execute(
                 "SELECT notional_usd,fee_usd FROM fills ORDER BY fill_id"
             ).fetchall()
