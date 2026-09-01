@@ -30,6 +30,8 @@ Accepted and published main `931b0abef5eafbd7aec55caaeca82685ec1f5289` preserves
 
 Fresh `chief46` proved this is not operationally sufficient: after `PAPER_RUN_READY` and a completed compatible full refresh, one all-24 RISEx resubscribe occurred at `15:21:58.273795Z`; recovery completed in about `0.4` seconds. Chief stopped before entry with durable `STOPPED_SAFE`, integrity `ok`, and exact zero orders/fills/positions/funding/completed trades. Preserve and never resume it; no PAPER runtime remains. The current bounded RISEx Builder must reproduce the actual startup transition and distinguish a true WS-established checksum baseline from a REST book merely installed under the current session. Keep stale books entry-ineligible and preserve bootstrap, explicit recovery, session/invalidation/revision, checksum, no-replay, observation, and no-write barriers. Only after independent acceptance start a new database and again require quiet post-refresh deltas without resync followed by a complete non-degraded lifecycle ending with zero orders and exact `FLAT`.
 
+In parallel, the separate Extended Builder on exact `ac5325c` owns only the three observed aggregate book-socket `EOF` episodes at roughly 25-second intervals. It must prove or reject a client heartbeat/control defect, retaining exactly three aggregate sockets, global book sequence, WS-only recovery, current-session ownership, and genuine disconnect visibility. A new PAPER runtime is forbidden until Chief independently accepts every correction required by these two independent blockers.
+
 ## PAPER Extended aggregate public streams
 
 Status: `ACCEPTED — AGGREGATE STREAMS ON e4d8dcc AND QUIET-TRADE READINESS ON bd3a58b; FRESH chief42 VALIDATION ACTIVE`.
