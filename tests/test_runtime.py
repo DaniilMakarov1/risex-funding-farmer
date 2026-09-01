@@ -1677,7 +1677,8 @@ async def test_risex_future_ws_book_timestamp_does_not_abort_followup_scan(tmp_p
     future_ts = int((clock.now() + timedelta(seconds=1)).timestamp() * 1_000_000_000)
     payload = {
         "channel": "orderbook", "type": "snapshot", "method": "snapshot",
-        "market_id": "1", "worker_timestamp": future_ts,
+        "market_id": "1", "block_number": 100, "log_index": 1,
+        "worker_timestamp": future_ts,
         "data": {
             "market_id": 1,
             "bids": [{"price": "99", "quantity": "20"}],
@@ -5444,29 +5445,41 @@ async def test_risex_checksum_gap_resubscribes_and_recovers_from_ws_snapshots(tm
         (BookLevel(D("101"), D("20")),), clock.now(),
     ))
     valid_checksum = checksum_book.risex_checksum()
+    buffered_checksum_book = BookStream(Venue.RISEX, symbols[0])
+    buffered_checksum_book.snapshot(OrderBook(
+        Venue.RISEX, symbols[0],
+        (BookLevel(D("99"), D("19")),),
+        (BookLevel(D("101"), D("20")),), clock.now(),
+    ))
+    buffered_checksum = buffered_checksum_book.risex_checksum()
     payloads = [
         {
             "channel": "orderbook", "type": "update", "market_id": "1",
+            "block_number": 100, "log_index": 0,
             "worker_timestamp": timestamp_ns, "checksum": 0,
             "data": {"market_id": 1, **levels("18")},
         },
         {
             "channel": "orderbook", "type": "update", "market_id": "1",
-            "worker_timestamp": timestamp_ns, "checksum": 0,
+            "block_number": 100, "log_index": 2,
+            "worker_timestamp": timestamp_ns, "checksum": buffered_checksum,
             "data": {"market_id": 1, **levels("19")},
         },
         {
             "method": "snapshot", "channel": "orderbook", "type": "snapshot",
-            "market_id": "1", "worker_timestamp": timestamp_ns,
+            "market_id": "1", "block_number": 100, "log_index": 1,
+            "worker_timestamp": timestamp_ns,
             "data": {"market_id": 1, **levels()},
         },
         {
             "method": "snapshot", "channel": "orderbook", "type": "snapshot",
-            "market_id": "2", "worker_timestamp": timestamp_ns,
+            "market_id": "2", "block_number": 100, "log_index": 1,
+            "worker_timestamp": timestamp_ns,
             "data": {"market_id": 2, **levels()},
         },
         {
             "channel": "orderbook", "type": "update", "market_id": "1",
+            "block_number": 100, "log_index": 3,
             "worker_timestamp": timestamp_ns, "checksum": valid_checksum,
             "data": {
                 "market_id": 1,
@@ -5586,7 +5599,9 @@ async def test_risex_checksum_gap_resubscribes_and_recovers_from_ws_snapshots(tm
     assert {row["symbol"] for row in completed} == set(symbols)
     assert {row["source"] for row in completed} == {"WS_RESUBSCRIBE_SNAPSHOT"}
     assert sum(row["buffered"] for row in completed) == 1
-    assert all(row["replayed"] == 0 for row in completed)
+    assert sum(row["replayed"] for row in completed) == 1
+    assert next(row for row in completed if row["symbol"] == symbols[0])["replayed"] == 1
+    assert next(row for row in completed if row["symbol"] == symbols[1])["replayed"] == 0
     assert all(not episode.buffer for episode in runtime._recoveries.values())
     assert all(episode.task is None for episode in runtime._recoveries.values())
     assert all(
@@ -5594,6 +5609,251 @@ async def test_risex_checksum_gap_resubscribes_and_recovers_from_ws_snapshots(tm
         is DataQuality.COMPLETE
         for symbol in symbols
     )
+
+
+def test_risex_recovery_cursor_boundary_is_strict_and_checksum_validated(tmp_path):
+    clock = FakeClock()
+    symbol = "ABC/USDC"
+    key = (Venue.RISEX, symbol)
+    cursor = lambda block, log: (block << 64) | log
+
+    def make_book(quantity: str, sequence: int | None) -> OrderBook:
+        return OrderBook(
+            Venue.RISEX, symbol,
+            (BookLevel(D("99"), D(quantity)),),
+            (BookLevel(D("101"), D("20")),),
+            clock.now(), sequence,
+        )
+
+    snapshot = make_book("20", cursor(100, 5))
+    after_newer_delta = make_book("19", cursor(100, 6))
+    checksum_stream = BookStream(Venue.RISEX, symbol)
+    checksum_stream.snapshot(after_newer_delta)
+    newer = BookDelta(
+        Venue.RISEX, symbol, after_newer_delta.bids, (), clock.now(),
+        sequence=cursor(100, 6), checksum=checksum_stream.risex_checksum(),
+    )
+    older = BookDelta(
+        Venue.RISEX, symbol,
+        (BookLevel(D("99"), D("18")),), (), clock.now(),
+        sequence=cursor(100, 4), checksum=0,
+    )
+
+    with PaperRepository(tmp_path / "risex-cursor-recovery.db") as repository:
+        runtime = PublicPaperRuntime(repository)
+        session_id = runtime._new_stream_session(
+            (Venue.RISEX, "*", "combined")
+        )
+        episode = runtime._new_recovery_episode(key, session_id)
+        episode.buffer.extend((older, newer))
+        recovered, buffered, replayed = runtime._build_recovery_book(
+            snapshot, episode
+        )
+        assert buffered == 2
+        assert replayed == 1
+        assert recovered == after_newer_delta
+
+        episode.buffer[:] = [newer, older]
+        with pytest.raises(ValueError, match="ambiguous"):
+            runtime._build_recovery_book(snapshot, episode)
+
+        episode.buffer[:] = [replace(newer, checksum=newer.checksum + 1)]
+        with pytest.raises(ValueError, match="sequence gap"):
+            runtime._build_recovery_book(snapshot, episode)
+
+        episode.buffer[:] = [replace(newer, sequence=None)]
+        with pytest.raises(ValueError, match="block/log cursor"):
+            runtime._build_recovery_book(snapshot, episode)
+
+        episode.buffer.clear()
+        with pytest.raises(ValueError, match="block/log cursor"):
+            runtime._build_recovery_book(replace(snapshot, sequence=None), episode)
+
+
+@pytest.mark.asyncio
+async def test_risex_bad_buffered_replay_restarts_before_next_snapshot(tmp_path):
+    clock = FakeClock()
+    stop = asyncio.Event()
+    symbol = "AAA/USDC"
+    market_id = "1"
+    timestamp_ns = str(int(clock.now().timestamp() * 1_000_000_000))
+
+    def levels(quantity: str = "20") -> dict[str, object]:
+        return {
+            "bids": [{"price": "99", "quantity": quantity}],
+            "asks": [{"price": "101", "quantity": "20"}],
+        }
+
+    def checksum(quantity: str) -> int:
+        stream = BookStream(Venue.RISEX, symbol)
+        stream.snapshot(OrderBook(
+            Venue.RISEX, symbol,
+            (BookLevel(D("99"), D(quantity)),),
+            (BookLevel(D("101"), D("20")),), clock.now(),
+        ))
+        return stream.risex_checksum()
+
+    payloads = [
+        {
+            "channel": "orderbook", "type": "update", "market_id": market_id,
+            "block_number": 100, "log_index": 0,
+            "worker_timestamp": timestamp_ns, "checksum": 0,
+            "data": {"market_id": 1, **levels("18")},
+        },
+        {
+            "channel": "orderbook", "type": "update", "market_id": market_id,
+            "block_number": 100, "log_index": 2,
+            "worker_timestamp": timestamp_ns,
+            "checksum": checksum("19") + 1,
+            "data": {"market_id": 1, **levels("19")},
+        },
+        {
+            "method": "snapshot", "channel": "orderbook", "type": "snapshot",
+            "market_id": market_id, "block_number": 100, "log_index": 1,
+            "worker_timestamp": timestamp_ns,
+            "data": {"market_id": 1, **levels("20")},
+        },
+        {
+            "method": "snapshot", "channel": "orderbook", "type": "snapshot",
+            "market_id": market_id, "block_number": 100, "log_index": 3,
+            "worker_timestamp": timestamp_ns,
+            "data": {"market_id": 1, **levels("20")},
+        },
+    ]
+
+    class SyntheticRisexAdapter(RisexAdapter):
+        def __init__(self) -> None:
+            super().__init__(None)
+            self._market_ids = {symbol: market_id}
+            self._symbols_by_id = {market_id: symbol}
+            self._raw_markets = {
+                symbol: {
+                    "market_id": market_id,
+                    "config": {
+                        "name": symbol, "step_size": "1",
+                        "step_price": "1", "min_order_size": "1",
+                    },
+                }
+            }
+
+        async def fetch_book(self, venue_symbol: str) -> OrderBook:
+            assert venue_symbol == symbol
+            return OrderBook(
+                Venue.RISEX, venue_symbol,
+                (BookLevel(D("99"), D("20")),),
+                (BookLevel(D("101"), D("20")),), clock.now(),
+            )
+
+    class TextMessage:
+        type = aiohttp.WSMsgType.TEXT
+
+        def __init__(self, payload: dict[str, object]) -> None:
+            self.data = json.dumps(payload)
+
+    class ScriptedWebSocket:
+        def __init__(self) -> None:
+            self.messages = deque(TextMessage(payload) for payload in payloads)
+            self.sent: list[dict[str, object]] = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self.messages:
+                return self.messages.popleft()
+            stop.set()
+            raise StopAsyncIteration
+
+        async def send_json(self, payload: dict[str, object]) -> None:
+            self.sent.append(payload)
+
+        async def pong(self, _payload) -> None:
+            return None
+
+    class ScriptedSession:
+        def __init__(self, websocket: ScriptedWebSocket) -> None:
+            self.websocket = websocket
+            self.connections = 0
+
+        def ws_connect(self, *_args, **_kwargs):
+            self.connections += 1
+            return self.websocket
+
+    adapter = SyntheticRisexAdapter()
+    websocket = ScriptedWebSocket()
+    session = ScriptedSession(websocket)
+    with PaperRepository(tmp_path / "risex-bad-buffered-replay.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={Venue.RISEX: adapter}, clock=clock,
+        )
+        runtime._session = session
+        runtime._stop_event = stop
+        published: list[OrderBook] = []
+        publish = runtime._publish_recovery_snapshot
+
+        async def record_publish(*args, **kwargs):
+            published.append(args[3])
+            return await publish(*args, **kwargs)
+
+        runtime._publish_recovery_snapshot = record_publish
+        session_id = runtime._new_stream_session(
+            (Venue.RISEX, "*", "combined")
+        )
+        await runtime._combined_stream(
+            Venue.RISEX, adapter, (symbol,), session_id
+        )
+        evidence = repository.connection.execute(
+            "SELECT event_type,detail FROM runtime_evidence ORDER BY evidence_id"
+        ).fetchall()
+
+    failed = [
+        json.loads(row["detail"])
+        for row in evidence
+        if row["event_type"] == "PUBLIC_SNAPSHOT_RECOVERY_FAILED"
+    ]
+    started = [
+        json.loads(row["detail"])
+        for row in evidence
+        if row["event_type"] == "PUBLIC_SNAPSHOT_RECOVERY_STARTED"
+    ]
+    resubscribes = [
+        row for row in evidence
+        if row["event_type"] == "PUBLIC_BOOK_RESYNC_STARTED"
+    ]
+    completed = [
+        json.loads(row["detail"])
+        for row in evidence
+        if row["event_type"] == "PUBLIC_SNAPSHOT_RECOVERY_COMPLETED"
+    ]
+    assert session.connections == 1
+    assert len(failed) == 1
+    assert failed[0]["cause"] == "WS_SNAPSHOT_REPLAY_FAILED"
+    assert len(started) == 2
+    assert len(resubscribes) == 2
+    assert len(completed) == 1
+    assert completed[0]["episode_id"] == started[1]["episode_id"]
+    assert completed[0]["episode_id"] != failed[0]["episode_id"]
+    assert len(published) == 1
+    assert published[0].bids[0].canonical_quantity == D("20")
+    assert published[0].sequence == (100 << 64) | 3
+    episode = runtime._recoveries[Venue.RISEX, symbol]
+    assert episode.terminal == "COMPLETE"
+    assert not episode.buffer
+    assert runtime.coordinator.stream(Venue.RISEX, symbol).book() == published[0]
+    assert websocket.sent == [
+        adapter.orderbook_subscription([1]),
+        adapter.trades_subscription([1]),
+        adapter.orderbook_unsubscription(),
+        adapter.orderbook_subscription([1]),
+        adapter.orderbook_unsubscription(),
+        adapter.orderbook_subscription([1]),
+    ]
 
 
 @pytest.mark.asyncio
@@ -5675,6 +5935,7 @@ async def test_risex_rest_bootstrap_does_not_claim_ws_checksum_ownership(
         (BookLevel(D("100"), D("3")),),
         (BookLevel(D("102"), D("2")),),
         clock.now(),
+        (100 << 64) | 2,
     )
 
     def checksum(book: OrderBook) -> int:
@@ -5686,7 +5947,8 @@ async def test_risex_rest_bootstrap_does_not_claim_ws_checksum_ownership(
     payloads = [
         {
             "method": "snapshot", "channel": "orderbook", "type": "snapshot",
-            "market_id": "1", "worker_timestamp": timestamp_ns,
+            "market_id": "1", "block_number": 100, "log_index": 1,
+            "worker_timestamp": timestamp_ns,
             "data": {
                 "market_id": 1,
                 "bids": [{"price": "100", "quantity": "2"}],
@@ -5695,6 +5957,7 @@ async def test_risex_rest_bootstrap_does_not_claim_ws_checksum_ownership(
         },
         {
             "channel": "orderbook", "type": "update", "market_id": "1",
+            "block_number": 100, "log_index": 2,
             "worker_timestamp": timestamp_ns,
             "checksum": checksum(ws_after_update),
             "data": {
@@ -10405,7 +10668,8 @@ async def test_stabilization002_risex_overflow_failed_recovery_restarts_on_ws_sn
         timestamp_ns = str(int(clock.now().timestamp() * 1_000_000_000))
         snapshot_payload = {
             "method": "snapshot", "channel": "orderbook", "type": "snapshot",
-            "market_id": "1", "worker_timestamp": timestamp_ns,
+            "market_id": "1", "block_number": 100, "log_index": 1,
+            "worker_timestamp": timestamp_ns,
             "data": {
                 "market_id": 1,
                 "bids": [{"price": "99", "quantity": "20"}],

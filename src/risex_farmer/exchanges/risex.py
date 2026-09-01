@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from decimal import Decimal
 import re
-from typing import Any
+from typing import Any, Mapping
 
 from risex_farmer.models import (
     BookLevel,
@@ -33,6 +33,28 @@ from .base import (
     require_mapping,
     timestamp,
 )
+
+
+_RISEX_LOG_INDEX_BITS = 64
+_RISEX_LOG_INDEX_LIMIT = 1 << _RISEX_LOG_INDEX_BITS
+
+
+def _risex_book_cursor(message: Mapping[str, Any]) -> int:
+    """Pack the official block/log position into the model cursor slot."""
+    # The shared book model has one integer cursor.  Keeping 64 bits for the
+    # log index preserves lexicographic (block_number, log_index) ordering;
+    # overflow is rejected rather than allowing two wire positions to alias.
+    values: list[int] = []
+    for field in ("block_number", "log_index"):
+        value = message.get(field)
+        if type(value) is not int or value < 0:
+            raise ValueError(
+                f"RISEx orderbook {field} must be a nonnegative JSON integer"
+            )
+        values.append(value)
+    if values[1] >= _RISEX_LOG_INDEX_LIMIT:
+        raise ValueError("RISEx orderbook log_index exceeds cursor range")
+    return (values[0] << _RISEX_LOG_INDEX_BITS) | values[1]
 
 
 class RisexAdapter(PublicAdapter):
@@ -258,6 +280,7 @@ class RisexAdapter(PublicAdapter):
     ) -> OrderBook | BookDelta:
         message = require_mapping(payload, "orderbook message")
         data = require_mapping(message.get("data"), "orderbook message.data")
+        cursor = _risex_book_cursor(message)
         # Keep venue clock skew from making a received book future-dated; the
         # raw checksum and all existing RISEx ordering/recovery semantics stay
         # authoritative.
@@ -265,7 +288,11 @@ class RisexAdapter(PublicAdapter):
             timestamp(message["worker_timestamp"], "nanoseconds"), received_at
         )
         if message.get("type") == "snapshot":
-            return self.normalize_book(data, observed_at=observed_at)
+            book = self.normalize_book(data, observed_at=observed_at)
+            return OrderBook(
+                book.venue, book.canonical_market, book.bids, book.asks,
+                book.observed_at, cursor,
+            )
 
         def levels(name: str) -> tuple[BookLevel, ...]:
             return tuple(
@@ -285,6 +312,7 @@ class RisexAdapter(PublicAdapter):
             levels("bids"),
             levels("asks"),
             observed_at,
+            sequence=cursor,
             checksum=int(message["checksum"]),
         )
 

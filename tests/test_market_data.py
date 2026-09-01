@@ -606,6 +606,7 @@ def test_documented_book_delta_shapes_are_normalized() -> None:
         risex_data["book_update"], received_at=NOW
     )
     assert r_delta.checksum == 123  # type: ignore[union-attr]
+    assert r_delta.sequence == (180 << 64) | 1  # type: ignore[union-attr]
 
     extended = ExtendedAdapter(None)
     e_delta = extended.normalize_book_message(
@@ -622,6 +623,34 @@ def test_documented_book_delta_shapes_are_normalized() -> None:
     )
     assert n_delta.previous_sequence == 1800000000000000000
     assert n_delta.bids[0].canonical_quantity == D("1")
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("block_number", None),
+        ("block_number", -1),
+        ("block_number", "180"),
+        ("block_number", 180.0),
+        ("block_number", True),
+        ("log_index", None),
+        ("log_index", -1),
+        ("log_index", "1"),
+        ("log_index", 1.0),
+        ("log_index", True),
+        ("log_index", 1 << 64),
+    ],
+)
+def test_risex_ws_book_cursor_rejects_noncanonical_metadata(
+    field: str, value: object
+) -> None:
+    adapter = RisexAdapter(None)
+    data = fixture("risex")
+    adapter.normalize_market(data["market"])
+    payload = deepcopy(data["book_update"])
+    payload[field] = value
+    with pytest.raises(ValueError):
+        adapter.normalize_book_message(payload, received_at=NOW)
 
 
 def test_nado_book_observation_time_is_bounded_by_local_receipt() -> None:
@@ -781,3 +810,15 @@ def test_nado_gap_and_risex_checksum_detection() -> None:
     checksum = risex.risex_checksum()
     assert risex.risex_update((), (), checksum=checksum, observed_at=NOW)
     assert not risex.risex_update((), (), checksum=checksum + 1, observed_at=NOW)
+
+
+@pytest.mark.parametrize("sequence", [1, 0])
+def test_risex_cursor_must_advance_strictly(sequence: int) -> None:
+    risex = BookStream(Venue.RISEX, "ABC")
+    risex.connected(NOW)
+    risex.snapshot(book(Venue.RISEX, 1))
+    checksum = risex.risex_checksum()
+    assert not risex.risex_update(
+        (), (), checksum=checksum, observed_at=NOW, sequence=sequence
+    )
+    assert risex.book() is None

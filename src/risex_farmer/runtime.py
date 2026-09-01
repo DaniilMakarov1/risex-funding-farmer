@@ -5345,6 +5345,29 @@ class PublicPaperRuntime:
                     self._fail_lighter_snapshot_recovery(
                         key, episode, cause="WS_SNAPSHOT_SEQUENCE_GAP", at=now
                     )
+                elif event.venue is Venue.RISEX:
+                    if self._owns_recovery(
+                        key, episode, episode.attempt_generation
+                    ):
+                        self._retire_recovery_task(episode.task)
+                        episode.task = None
+                        episode.terminal = "FAILED"
+                        buffered_before_failure = len(episode.buffer)
+                        episode.buffer.clear()
+                        self._record(
+                            "PUBLIC_SNAPSHOT_RECOVERY_FAILED",
+                            at=now,
+                            venue=event.venue,
+                            detail={
+                                "symbol": event.canonical_market,
+                                "episode_id": episode.episode_id.value,
+                                "generation": episode.attempt_generation.value,
+                                "attempts": episode.attempts,
+                                "buffered": buffered_before_failure,
+                                "cause": "WS_SNAPSHOT_REPLAY_FAILED",
+                                "source": "WS_SNAPSHOT",
+                            },
+                        )
                 elif event.venue is not Venue.RISEX:
                     self._restart_recovery_attempt(key, episode)
                 return False
@@ -5836,6 +5859,25 @@ class PublicPaperRuntime:
         stream.snapshot(snapshot)
         buffered = len(episode.buffer)
         replayed = 0
+        if snapshot.venue is Venue.RISEX:
+            if snapshot.sequence is None:
+                raise ValueError(
+                    "RISEx WS recovery snapshot must carry a block/log cursor"
+                )
+            previous_sequence: int | None = None
+            for delta in episode.buffer:
+                if delta.sequence is None:
+                    raise ValueError(
+                        "RISEx buffered book delta must carry a block/log cursor"
+                    )
+                if (
+                    previous_sequence is not None
+                    and delta.sequence <= previous_sequence
+                ):
+                    raise ValueError(
+                        "RISEx buffered book delta order is ambiguous"
+                    )
+                previous_sequence = delta.sequence
         if snapshot.sequence is None:
             if snapshot.venue is Venue.LIGHTER:
                 raise ValueError(
