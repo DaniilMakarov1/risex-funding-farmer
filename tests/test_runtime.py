@@ -3706,6 +3706,193 @@ async def test_full_refresh_adopts_concurrent_catalog_volume_snapshot_once(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_full_refresh_adopts_permuted_catalog_volume_snapshot_once(tmp_path):
+    clock = FakeClock()
+    target = NOW + timedelta(minutes=5)
+    venues = (Venue.RISEX, Venue.NADO, Venue.LIGHTER)
+    catalog_started = {venue: asyncio.Event() for venue in venues}
+    observation_started = {venue: asyncio.Event() for venue in venues}
+    release_catalog = asyncio.Event()
+    release_observations = asyncio.Event()
+    permutations = {
+        Venue.RISEX: (2, 0, 1),
+        Venue.NADO: (1, 2, 0),
+        Venue.LIGHTER: (0, 2, 1),
+    }
+
+    class PermutingCatalogAdapter(ManyFakeAdapter):
+        def __init__(self, venue: Venue) -> None:
+            super().__init__(venue, clock, settlement_at=target, asset_count=3)
+            self.catalog_calls = 0
+            self.book_calls = 0
+            self.permuted_markets = tuple(
+                self.many_markets[index] for index in permutations[venue]
+            )
+
+        async def fetch_markets(self):
+            self.catalog_calls += 1
+            self._ready("markets")
+            if self.catalog_calls > 2:
+                catalog_started[self.venue].set()
+                await release_catalog.wait()
+                return self.permuted_markets
+            return self.many_markets
+
+        async def fetch_volumes(self):
+            self.catalog_calls += 1
+            self._ready("volumes")
+            if self.catalog_calls > 2:
+                catalog_started[self.venue].set()
+                await release_catalog.wait()
+                volume = D("2000000")
+                markets = self.permuted_markets
+            else:
+                volume = D("1000000")
+                markets = self.many_markets
+            return tuple(
+                MarketVolume(
+                    self.venue, market.venue_symbol, volume,
+                    self.clock.now(), "permuted-catalog",
+                )
+                for market in markets
+            )
+
+        async def fetch_book(self, venue_symbol: str):
+            self.book_calls += 1
+            if self.book_calls > len(self.many_markets):
+                observation_started[self.venue].set()
+                await release_observations.wait()
+            return await super().fetch_book(venue_symbol)
+
+    fakes = {venue: PermutingCatalogAdapter(venue) for venue in venues}
+    with PaperRepository(tmp_path / "full-refresh-permuted-catalog-snapshot.db") as repository:
+        async with PublicPaperRuntime(
+            repository, adapters=fakes, clock=clock
+        ) as runtime:
+            await runtime.scan()
+            runtime.next_health_check_at = NOW + timedelta(hours=1)
+            runtime.next_full_scan_at = NOW
+
+            await runtime.tick(NOW)
+            first = runtime._refresh_task
+            assert first is not None and not first.done()
+            await asyncio.gather(*(
+                event.wait() for event in observation_started.values()
+            ))
+            await asyncio.gather(*(
+                event.wait() for event in catalog_started.values()
+            ))
+            catalog_task = runtime._extended_universe_task
+            assert catalog_task is not None
+            release_catalog.set()
+            await catalog_task
+            release_observations.set()
+            await first
+
+            current_markets = {
+                (market.venue, market.venue_symbol): market
+                for rows in runtime.markets.values() for market in rows
+            }
+            assert all(
+                observation.market == current_markets[key]
+                for key, observation in runtime.observations.items()
+            )
+
+            superseded = repository.connection.execute(
+                "SELECT COUNT(*) FROM runtime_evidence "
+                "WHERE event_type='PUBLIC_REFRESH_SUPERSEDED'"
+            ).fetchone()[0]
+            assert superseded == 0
+            assert all(
+                observation.volume is not None
+                and observation.volume.quote_volume_usd == D("2000000")
+                for observation in runtime.observations.values()
+            )
+            assert all(adapter.book_calls == 6 for adapter in fakes.values())
+
+            for _ in range(3):
+                task = runtime._refresh_task
+                if task is None:
+                    break
+                await task
+                await runtime.tick(NOW)
+
+            refreshes = repository.connection.execute(
+                "SELECT COUNT(*) FROM runtime_evidence "
+                "WHERE event_type='PUBLIC_REFRESH_STARTED'"
+            ).fetchone()[0]
+            full_scans = repository.connection.execute(
+                "SELECT COUNT(*) FROM runtime_evidence "
+                "WHERE event_type='PUBLIC_SCAN' "
+                "AND json_extract(detail,'$.scan_kind')='FULL'"
+            ).fetchone()[0]
+            assert refreshes == 1
+            assert full_scans == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation",
+    ("duplicate", "same_key_field", "add", "remove", "candidate", "missing_volume"),
+)
+async def test_catalog_adoption_rejects_non_compatible_snapshot(
+    tmp_path, mutation
+):
+    clock = FakeClock()
+    venues = (Venue.RISEX, Venue.NADO, Venue.LIGHTER)
+    fakes = {
+        venue: ManyFakeAdapter(
+            venue, clock, settlement_at=NOW + timedelta(minutes=5), asset_count=2
+        )
+        for venue in venues
+    }
+    with PaperRepository(
+        tmp_path / f"catalog-adoption-{mutation}.db"
+    ) as repository:
+        async with PublicPaperRuntime(
+            repository, adapters=fakes, clock=clock
+        ) as runtime:
+            await runtime.scan()
+            initial_markets = runtime._catalog_market_snapshot()
+            initial_candidate_keys = {
+                (market.venue, market.venue_symbol)
+                for market in runtime._candidate_markets()
+            }
+            original_risex = runtime.markets[Venue.RISEX]
+            if mutation == "duplicate":
+                runtime.markets[Venue.RISEX] = original_risex + (original_risex[0],)
+            elif mutation == "same_key_field":
+                runtime.markets[Venue.RISEX] = tuple(
+                    replace(market, is_off_hours=True)
+                    if market.venue_symbol == "A0-RISEX" else market
+                    for market in original_risex
+                )
+            elif mutation == "add":
+                runtime.markets[Venue.RISEX] = original_risex + (
+                    replace(
+                        original_risex[0],
+                        canonical_asset="NEW",
+                        venue_symbol="NEW-RISEX",
+                    ),
+                )
+            elif mutation == "remove":
+                runtime.markets[Venue.RISEX] = original_risex[:-1]
+            elif mutation == "candidate":
+                runtime.markets[Venue.RISEX] = tuple(
+                    replace(market, is_active=False)
+                    if market.venue_symbol == "A0-RISEX" else market
+                    for market in original_risex
+                )
+            else:
+                runtime.volumes.pop((Venue.RISEX, "A0-RISEX"))
+
+            assert not runtime._adopt_compatible_catalog_update(
+                initial_markets=initial_markets,
+                initial_candidate_keys=initial_candidate_keys,
+            )
+
+
+@pytest.mark.asyncio
 async def test_full_refresh_supersedes_concurrent_catalog_market_change(tmp_path):
     clock = FakeClock()
     target = NOW + timedelta(minutes=5)

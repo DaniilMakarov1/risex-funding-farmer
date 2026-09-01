@@ -1638,9 +1638,17 @@ class PublicPaperRuntime:
         )
 
     def _catalog_market_snapshot(self) -> dict[Venue, tuple[Any, ...]]:
-        """Copy catalog identity without exposing mutable runtime containers."""
+        """Copy catalog identity in a deterministic, order-independent form."""
         return {
-            venue: tuple(markets)
+            venue: tuple(sorted(
+                (
+                    ((market.venue, market.venue_symbol), market)
+                    for market in markets
+                ),
+                key=lambda row: (
+                    row[0][0].value, row[0][1], repr(row[1])
+                ),
+            ))
             for venue, markets in self.markets.items()
         }
 
