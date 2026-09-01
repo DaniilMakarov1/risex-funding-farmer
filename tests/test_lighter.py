@@ -4,6 +4,13 @@ from decimal import Decimal
 
 import pytest
 
+from risex_farmer.config import PAPER_CONFIG
+from risex_farmer.economics import (
+    exact_quantity_vwap,
+    maker_price,
+    pair_price_pnl_usd,
+    venue_fee_amount_usd,
+)
 from risex_farmer.exchanges.lighter import LighterAdapter
 from risex_farmer.lifecycle import CloseReason, LifecycleEngine
 from risex_farmer.market_data import BookStream
@@ -18,12 +25,14 @@ from risex_farmer.models import (
     FundingCashQuote,
     FundingQuality,
     LifecycleState,
+    LiquidityRole,
     MarketType,
     MarketVolume,
     OrderBook,
     RouteDirection,
     Side,
     StreamHealth,
+    TakerFillProvenance,
     TradeEvidence,
     Venue,
 )
@@ -908,6 +917,10 @@ async def test_lighter_full_dynamic_route_and_normal_lifecycle_persists_physical
     assert plan.risex_entry_price != plan.risex_exit_price
     assert plan.hedge_entry_price in {D("98"), D("100")}
     assert all(route.entry_allowed for route in routes)
+    activation_hedge_price = plan.hedge_entry_price
+    quantity = plan.canonical_quantity
+    first_level_quantity = quantity / D("2")
+    second_level_quantity = quantity - first_level_quantity
 
     broker = PaperEntryBroker()
     await broker.activate(
@@ -919,6 +932,55 @@ async def test_lighter_full_dynamic_route_and_normal_lifecycle_persists_physical
     assert order.side is (Side.BUY if direction is RouteDirection.LONG_RISEX_SHORT_HEDGE else Side.SELL)
     opened_at = NOW + timedelta(seconds=1)
     entry_side = order.side
+    hedge_entry_side = Side.SELL if entry_side is Side.BUY else Side.BUY
+    hedge_exit_side = entry_side
+    if direction is RouteDirection.LONG_RISEX_SHORT_HEDGE:
+        fresh_lighter_bids = (
+            ("98.3", str(first_level_quantity)),
+            ("97.9", str(second_level_quantity)),
+        )
+        fresh_lighter_asks = (("100", "10"),)
+        expected_consumed_levels = (
+            BookLevel(D("98.3"), first_level_quantity),
+            BookLevel(D("97.9"), second_level_quantity),
+        )
+    else:
+        fresh_lighter_bids = (("98", "10"),)
+        fresh_lighter_asks = (
+            ("100.5", str(first_level_quantity)),
+            ("101.1", str(second_level_quantity)),
+        )
+        expected_consumed_levels = (
+            BookLevel(D("100.5"), first_level_quantity),
+            BookLevel(D("101.1"), second_level_quantity),
+        )
+    fresh_risex = observation(Venue.RISEX, at=opened_at)
+    fresh_lighter = observation(
+        Venue.LIGHTER,
+        symbol="ETH",
+        at=opened_at,
+        bids=fresh_lighter_bids,
+        asks=fresh_lighter_asks,
+    )
+    expected_fresh_entry_vwap = (
+        sum(
+            (
+                level.canonical_price * level.canonical_quantity
+                for level in expected_consumed_levels
+            ),
+            D("0"),
+        )
+        / quantity
+    )
+    assert expected_fresh_entry_vwap != activation_hedge_price
+    fresh_entry_vwap = exact_quantity_vwap(
+        hedge_entry_side,
+        quantity,
+        fresh_lighter.book.bids,
+        fresh_lighter.book.asks,
+    )
+    assert fresh_entry_vwap.is_executable
+    assert fresh_entry_vwap.price == expected_fresh_entry_vwap
     entry_trade = TradeEvidence(
         "lighter-entry",
         Venue.RISEX,
@@ -952,19 +1014,174 @@ async def test_lighter_full_dynamic_route_and_normal_lifecycle_persists_physical
         entry_trade,
         observed_version_id=order.active_version.version_id,
         processed_at=opened_at,
-        risex_observation=risex,
-        hedge_observation=lighter,
+        risex_observation=fresh_risex,
+        hedge_observation=fresh_lighter,
         recompute_funding=recompute,
-        risex_capture=capture(risex, opened_at),
-        hedge_capture=capture(lighter, opened_at),
+        risex_capture=capture(fresh_risex, opened_at),
+        hedge_capture=capture(fresh_lighter, opened_at),
     )
     assert result.outcome is TradeProcessOutcome.OPENED
     position = result.state.position
     assert position is not None
     assert position.maker_fill.venue is Venue.RISEX
     assert position.taker_fill.venue is Venue.LIGHTER
-    assert position.taker_fill.fee.amount_usd == D("0")
+    taker_proof = dict(result.fill_provenance)[f"{position.position_id}:risex-entry"]
+    assert isinstance(taker_proof, TakerFillProvenance)
+    assert taker_proof.venue is Venue.LIGHTER
+    assert taker_proof.canonical_market == "ETH"
+    assert taker_proof.side is hedge_entry_side
+    assert taker_proof.observed_at == opened_at
+    assert taker_proof.received_at == opened_at
+    assert taker_proof.decision_at == opened_at
+    assert taker_proof.consumed_levels == expected_consumed_levels
+    assert taker_proof.requested_quantity == quantity
+    assert taker_proof.executed_quantity == quantity
+    assert taker_proof.notional_usd == quantity * expected_fresh_entry_vwap
+    assert taker_proof.vwap_price == expected_fresh_entry_vwap
+    assert taker_proof.vwap_price != activation_hedge_price
+    assert position.taker_fill.canonical_price == expected_fresh_entry_vwap
+    assert position.taker_fill.fee.fill_notional_usd == (
+        quantity * expected_fresh_entry_vwap
+    )
+    assert position.taker_fill.fee.rate == PAPER_CONFIG.lighter_taker_fee_rate
+    assert position.taker_fill.fee.amount_usd == venue_fee_amount_usd(
+        Venue.LIGHTER,
+        LiquidityRole.TAKER,
+        quantity * expected_fresh_entry_vwap,
+        PAPER_CONFIG.lighter_taker_fee_rate,
+    ) == D("0")
     assert position.maker_fill.fee.liquidity_role.name == "MAKER"
+    risex_entry = position.maker_fill.canonical_price
+    hedge_entry = position.taker_fill.canonical_price
+    risex_exit_taker = exact_quantity_vwap(
+        Side.SELL if entry_side is Side.BUY else Side.BUY,
+        quantity,
+        fresh_risex.book.bids,
+        fresh_risex.book.asks,
+    )
+    hedge_exit_taker = exact_quantity_vwap(
+        hedge_exit_side,
+        quantity,
+        fresh_lighter.book.bids,
+        fresh_lighter.book.asks,
+    )
+    normal_risex_exit = maker_price(
+        Side.SELL if entry_side is Side.BUY else Side.BUY,
+        max(level.canonical_price for level in fresh_risex.book.bids),
+        min(level.canonical_price for level in fresh_risex.book.asks),
+        fresh_risex.market.tick_size_raw,
+    )
+    assert risex_exit_taker.is_executable
+    assert hedge_exit_taker.is_executable
+    assert risex_exit_taker.price is not None
+    assert hedge_exit_taker.price is not None
+    if direction is RouteDirection.LONG_RISEX_SHORT_HEDGE:
+        expected_planned_price_pnl = pair_price_pnl_usd(
+            quantity,
+            risex_entry,
+            normal_risex_exit,
+            hedge_entry,
+            hedge_exit_taker.price,
+        )
+        expected_unwind_price_pnl = pair_price_pnl_usd(
+            quantity,
+            risex_entry,
+            risex_exit_taker.price,
+            hedge_entry,
+            hedge_exit_taker.price,
+        )
+        activation_planned_price_pnl = pair_price_pnl_usd(
+            quantity,
+            risex_entry,
+            normal_risex_exit,
+            activation_hedge_price,
+            hedge_exit_taker.price,
+        )
+        activation_unwind_price_pnl = pair_price_pnl_usd(
+            quantity,
+            risex_entry,
+            risex_exit_taker.price,
+            activation_hedge_price,
+            hedge_exit_taker.price,
+        )
+    else:
+        expected_planned_price_pnl = pair_price_pnl_usd(
+            quantity,
+            hedge_entry,
+            hedge_exit_taker.price,
+            risex_entry,
+            normal_risex_exit,
+        )
+        expected_unwind_price_pnl = pair_price_pnl_usd(
+            quantity,
+            hedge_entry,
+            hedge_exit_taker.price,
+            risex_entry,
+            risex_exit_taker.price,
+        )
+        activation_planned_price_pnl = pair_price_pnl_usd(
+            quantity,
+            activation_hedge_price,
+            hedge_exit_taker.price,
+            risex_entry,
+            normal_risex_exit,
+        )
+        activation_unwind_price_pnl = pair_price_pnl_usd(
+            quantity,
+            activation_hedge_price,
+            hedge_exit_taker.price,
+            risex_entry,
+            risex_exit_taker.price,
+        )
+    entry_fees = position.maker_fill.fee.amount_usd + position.taker_fill.fee.amount_usd
+    planned_exit_fees = (
+        venue_fee_amount_usd(
+            Venue.RISEX,
+            LiquidityRole.MAKER,
+            quantity * normal_risex_exit,
+            PAPER_CONFIG.risex_maker_fee_rate,
+        )
+        + venue_fee_amount_usd(
+            Venue.LIGHTER,
+            LiquidityRole.TAKER,
+            quantity * hedge_exit_taker.price,
+            PAPER_CONFIG.lighter_taker_fee_rate,
+        )
+    )
+    unwind_exit_fees = (
+        venue_fee_amount_usd(
+            Venue.RISEX,
+            LiquidityRole.TAKER,
+            quantity * risex_exit_taker.price,
+            PAPER_CONFIG.risex_taker_fee_rate,
+        )
+        + venue_fee_amount_usd(
+            Venue.LIGHTER,
+            LiquidityRole.TAKER,
+            quantity * hedge_exit_taker.price,
+            PAPER_CONFIG.lighter_taker_fee_rate,
+        )
+    )
+    expected_planned_net = (
+        expected_planned_price_pnl - entry_fees - planned_exit_fees
+    )
+    expected_unwind_net = (
+        expected_unwind_price_pnl - entry_fees - unwind_exit_fees
+    )
+    assert position.entry_executable_basis == (
+        expected_fresh_entry_vwap / risex_entry - D("1")
+        if direction is RouteDirection.LONG_RISEX_SHORT_HEDGE
+        else risex_entry / expected_fresh_entry_vwap - D("1")
+    )
+    assert position.planned_maker_exit_net_pnl_usd == expected_planned_net
+    assert position.planned_hold_to_target_net_pnl_usd == expected_planned_net
+    assert position.executable_unwind_net_pnl_usd == expected_unwind_net
+    assert position.planned_maker_exit_net_pnl_usd != (
+        activation_planned_price_pnl - entry_fees - planned_exit_fees
+    )
+    assert position.executable_unwind_net_pnl_usd != (
+        activation_unwind_price_pnl - entry_fees - unwind_exit_fees
+    )
     engine = LifecycleEngine(result.state)
     close_at = opened_at + timedelta(seconds=1)
     fresh_risex = observation(Venue.RISEX, at=close_at)
@@ -1029,6 +1246,20 @@ async def test_lighter_full_dynamic_route_and_normal_lifecycle_persists_physical
             row["leg"]: _load(row["payload"])
             for row in repository.connection.execute("SELECT leg,payload FROM fills")
         }
+        persisted_provenance_row = repository.connection.execute(
+            "SELECT provenance_kind,payload FROM fill_provenance WHERE fill_id=?",
+            (f"{position.position_id}:risex-entry",),
+        ).fetchone()
+        assert persisted_provenance_row is not None
+        assert persisted_provenance_row["provenance_kind"] == "TAKER"
+        assert _load(persisted_provenance_row["payload"]) == taker_proof
+        persisted_taker_fill = fills["TAKER_ENTRY"]
+        assert persisted_taker_fill.venue is Venue.LIGHTER
+        assert persisted_taker_fill.canonical_price == expected_fresh_entry_vwap
+        assert persisted_taker_fill.fee.fill_notional_usd == (
+            quantity * expected_fresh_entry_vwap
+        )
+        assert persisted_taker_fill.fee.amount_usd == D("0")
         assert repository.load_runtime().closed_trade == closed
     assert report["fills"] == 4
     assert set(fills) == {"MAKER_ENTRY", "TAKER_ENTRY", "MAKER_EXIT", "TAKER_EXIT"}
