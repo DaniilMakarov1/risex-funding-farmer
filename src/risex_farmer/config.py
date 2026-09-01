@@ -16,7 +16,7 @@ class PaperConfig:
     normal_scan_seconds: int = 120
     focused_window_seconds: int = 300
     focused_scan_seconds: int = 10
-    entry_maker_start_before_funding_seconds: int = 120
+    entry_maker_start_before_funding_seconds: int = 180
     entry_maker_cancel_before_funding_seconds: int = 5
     entry_order_reprice_seconds: int = 10
     open_position_monitor_seconds: int = 10

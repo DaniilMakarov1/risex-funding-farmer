@@ -31,7 +31,13 @@ from risex_farmer.paper_broker import (
     TradeProcessOutcome,
     VersionCloseReason,
 )
-from risex_farmer.scanner import MarketObservation, NoTradeReason, RoutePlan, scan_once
+from risex_farmer.scanner import (
+    MarketObservation,
+    NoTradeReason,
+    RoutePlan,
+    entry_taker_price,
+    scan_once,
+)
 
 
 D = Decimal
@@ -642,32 +648,42 @@ async def test_cutoff_cancellation_requires_deadline_and_is_terminal() -> None:
 @pytest.mark.asyncio
 async def test_fill_opens_both_legs_atomically_with_actual_times_and_fees() -> None:
     broker, risex, hedge = await active_broker()
-    risex = replace(
-        risex,
+    order = broker.state.order
+    assert order is not None
+    assert entry_taker_price(order.route_plan) == D("101")
+    opened_at = NOW + timedelta(seconds=20)
+    fresh_risex = observation(Venue.RISEX, at=opened_at)
+    fresh_risex = replace(
+        fresh_risex,
         book=replace(
-            risex.book,
+            fresh_risex.book,
             asks=(BookLevel(D("101"), D("2")), BookLevel(D("103"), D("3"))),
         ),
     )
+    fresh_hedge = observation(Venue.EXTENDED, at=opened_at)
     version_id = broker.state.order.active_version.version_id
     exchange_at = NOW + timedelta(seconds=1)
-    received_at = NOW + timedelta(seconds=20)
-    opened_at = received_at
+    received_at = opened_at
     seen: list[datetime] = []
     result = await broker.process_trade(
         trade("fill", exchange_at=exchange_at, received_at=received_at),
         observed_version_id=version_id,
         processed_at=opened_at,
-        risex_observation=risex,
-        hedge_observation=hedge,
+        risex_observation=fresh_risex,
+        hedge_observation=fresh_hedge,
         recompute_funding=funding_recomputer(seen=seen),
-        risex_capture=capture(risex, opened_at),
+        risex_capture=capture(fresh_risex, opened_at),
     )
 
     position = result.state.position
     assert result.outcome is TradeProcessOutcome.OPENED
     assert result.state.order.status is PaperOrderStatus.FILLED
     assert position is not None
+    taker_proof = dict(result.fill_provenance)[f"{position.position_id}:risex-entry"]
+    assert taker_proof.vwap_price == D("102.2")
+    assert taker_proof.vwap_price != entry_taker_price(order.route_plan)
+    assert taker_proof.observed_at == opened_at
+    assert taker_proof.notional_usd == D("511")
     assert position.hedge_maker_fill_exchange_at == exchange_at
     assert position.hedge_maker_fill_received_at == received_at
     assert position.risex_taker_fill_at == opened_at == position.position_opened_at
@@ -678,7 +694,12 @@ async def test_fill_opens_both_legs_atomically_with_actual_times_and_fees() -> N
     )
     assert position.hedge_maker_fill.fee.amount_usd == 0
     assert position.risex_taker_fill.canonical_price == D("102.2")
+    assert position.risex_taker_fill.fee.fill_notional_usd == D("511")
     assert position.risex_taker_fill.fee.amount_usd == D("511") * D("0.00021")
+    assert position.entry_executable_basis == D("100") / D("102.2") - D("1")
+    assert position.planned_maker_exit_net_pnl_usd == D("-16.21126")
+    assert position.planned_hold_to_target_net_pnl_usd == D("33.78874")
+    assert position.executable_unwind_net_pnl_usd == D("-21.33751")
     assert position.canonical_quantity == D("5")
     assert result.state.lifecycle_state is LifecycleState.HOLDING
 

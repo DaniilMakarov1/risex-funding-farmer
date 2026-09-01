@@ -3166,7 +3166,7 @@ async def test_scheduling_full_focused_activation_and_strict_cutoff(tmp_path):
             clock.advance(10)  # Full scan at +120.
             await runtime.tick()
             await runtime._refresh_task
-            for _ in range(16):  # Focused cadence through exact T-120 activation.
+            for _ in range(16):  # Focused cadence through exact T-180 activation.
                 clock.advance(10)
                 confirm_public_streams(runtime, clock.now())
                 await runtime.tick()
@@ -3196,6 +3196,7 @@ async def test_scheduling_full_focused_activation_and_strict_cutoff(tmp_path):
     assert scans >= first_scans + 4
     assert {NOW, NOW + timedelta(seconds=100), NOW + timedelta(seconds=110)} <= recorded
     assert NOW + timedelta(seconds=120) in recorded
+    assert NOW + timedelta(seconds=220) in recorded
     assert NOW + timedelta(seconds=280) in recorded
     assert NOW + timedelta(seconds=395) in recorded
     assert {"INITIAL", "FULL", "FOCUSED"} <= {
@@ -3212,7 +3213,7 @@ async def test_scheduling_full_focused_activation_and_strict_cutoff(tmp_path):
     assert cancellations[0]["cancellation_reason"] == "PAPER_ORDER_CANCELLED_CUTOFF"
     assert cancellations[0]["attempt_id"]
     assert cancellations[0]["route_identity"]
-    assert D(cancellations[0]["active_duration_seconds"]) == D("115")
+    assert D(cancellations[0]["active_duration_seconds"]) == D("175")
     assert cancellations[0]["cumulative_eligible_maker_quantity"] == "0"
     assert cancellations[0]["full_maker_fill"] is False
     assert cancellations[0]["taker_hedge_taken"] is False
@@ -3226,7 +3227,7 @@ async def test_full_refresh_focus_cancellation_recreation_keeps_activation_times
     tmp_path,
 ):
     clock = FakeClock()
-    target = NOW + timedelta(seconds=150)
+    target = NOW + timedelta(seconds=210)
     blocked = GatedAdapter(Venue.RISEX, clock, settlement_at=target)
     fakes = adapters(clock, settlement_at=target)
     fakes[Venue.RISEX] = blocked
@@ -3241,7 +3242,7 @@ async def test_full_refresh_focus_cancellation_recreation_keeps_activation_times
             assert runtime.last_scan is not None
             assert runtime.last_scan.winner is not None
             runtime.focused_cycle = runtime.last_scan.winner.target_cycle
-            activation_at = target - timedelta(seconds=120)
+            activation_at = target - timedelta(seconds=180)
             runtime.next_focused_scan_at = activation_at
             runtime.next_full_scan_at = target + timedelta(hours=1)
             runtime.next_health_check_at = target + timedelta(hours=1)
@@ -3310,7 +3311,7 @@ async def test_activation_fails_closed_when_current_scan_cannot_be_published(
     tmp_path, monkeypatch,
 ):
     clock = FakeClock()
-    target = NOW + timedelta(seconds=150)
+    target = NOW + timedelta(seconds=210)
     with PaperRepository(tmp_path / "activation-no-current-scan.db") as repository:
         async with PublicPaperRuntime(
             repository,
@@ -3325,7 +3326,7 @@ async def test_activation_fails_closed_when_current_scan_cannot_be_published(
             assert runtime.last_scan is not None
             assert runtime.last_scan.winner is not None
             runtime.focused_cycle = runtime.last_scan.winner.target_cycle
-            activation_at = target - timedelta(seconds=120)
+            activation_at = target - timedelta(seconds=180)
             runtime.next_focused_scan_at = activation_at + timedelta(seconds=10)
             runtime.next_full_scan_at = target + timedelta(hours=1)
             runtime.next_health_check_at = target + timedelta(hours=1)
@@ -3519,9 +3520,9 @@ async def test_run_loop_wakes_on_activation_and_cutoff_deadlines(tmp_path):
             )
         }
     assert result["status"] == "STOPPED_SAFE"
-    assert target - timedelta(seconds=120) in wakeups
+    assert target - timedelta(seconds=180) in wakeups
     assert target - timedelta(seconds=5) in wakeups
-    assert target - timedelta(seconds=120) in recorded
+    assert target - timedelta(seconds=180) in recorded
     assert target - timedelta(seconds=5) in recorded
 
 
@@ -3555,10 +3556,10 @@ async def test_hung_refresh_never_moves_absolute_entry_deadlines(tmp_path):
                 "SELECT opportunity_count FROM scanner_snapshots WHERE logical_at=?",
                 (at.isoformat(),),
             ).fetchone()[0]
-            for at in (target - timedelta(seconds=120), target - timedelta(seconds=5))
+            for at in (target - timedelta(seconds=180), target - timedelta(seconds=5))
         ]
     assert result["status"] == "STOPPED_SAFE"
-    assert target - timedelta(seconds=120) in recorded
+    assert target - timedelta(seconds=180) in recorded
     assert target - timedelta(seconds=5) in recorded
     assert deadline_evaluations == [4, 4]
     assert gated.catalog_calls == 1

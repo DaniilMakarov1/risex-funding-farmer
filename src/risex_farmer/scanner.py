@@ -267,7 +267,9 @@ class ActivationSchedule:
     def is_startup_window(self, now: datetime) -> bool:
         target_at = self.cutoff_at + timedelta(seconds=5)
         time_to_target = target_at - now
-        return timedelta(seconds=5) < time_to_target < timedelta(seconds=120)
+        return timedelta(seconds=5) < time_to_target < timedelta(
+            seconds=PAPER_CONFIG.entry_maker_start_before_funding_seconds
+        )
 
     def next_focused_evaluation_at(self, last_evaluated_at: datetime) -> datetime | None:
         next_at = last_evaluated_at + timedelta(seconds=10)
@@ -276,7 +278,9 @@ class ActivationSchedule:
 
 def activation_schedule(cycle: TargetFundingCycle) -> ActivationSchedule:
     return ActivationSchedule(
-        cycle.start_at - timedelta(seconds=120),
+        cycle.start_at - timedelta(
+            seconds=PAPER_CONFIG.entry_maker_start_before_funding_seconds
+        ),
         cycle.start_at - timedelta(seconds=5),
     )
 

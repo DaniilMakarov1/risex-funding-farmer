@@ -981,9 +981,9 @@ async def test_stabilization003_e_slow_full_refresh_never_blocks_deadline_schedu
     assert activated_state.lifecycle_state is LifecycleState.ENTRY_MAKER_OPEN
     assert activated_state.order is not None
     assert activated_state.order.status is PaperOrderStatus.OPEN
-    assert activated_state.order.created_at == target - timedelta(seconds=120)
+    assert activated_state.order.created_at == target - timedelta(seconds=180)
     assert activated_state.order.cutoff_at == target - timedelta(seconds=5)
-    assert activation_rows == [target - timedelta(seconds=120)]
+    assert activation_rows == [target - timedelta(seconds=180)]
     assert isinstance(cutoff_state, PaperEntryState)
     assert cutoff_state.lifecycle_state is LifecycleState.FLAT
     assert cutoff_state.order is not None
@@ -1005,7 +1005,7 @@ async def test_stabilization003_e_slow_full_refresh_never_blocks_deadline_schedu
         for row in focused
     )
     assert any(
-        row["scheduled_at"] == (target - timedelta(seconds=120)).isoformat()
+        row["scheduled_at"] == (target - timedelta(seconds=180)).isoformat()
         for row in focused
     )
     assert any(
@@ -1767,7 +1767,7 @@ async def test_stabilization003_run_loop_deadlines_precede_refresh_completion(tm
         # Keep this focused-deadline regression about priority ordering; the
         # bounded-default deadline is covered by the dedicated blocker test.
         runtime._pending_full_deadline_at = target
-        for expected_waits, offset in ((4, 280), (5, 395)):
+        for expected_waits, offset in ((4, 220), (5, 395)):
             clock.value = BASE + timedelta(seconds=offset)
             for key, observation in tuple(runtime.observations.items()):
                 runtime.observations[key] = replace(
@@ -1794,7 +1794,7 @@ async def test_stabilization003_run_loop_deadlines_precede_refresh_completion(tm
     assert health and health[-1] <= BASE + timedelta(seconds=395)
     assert any(row["scheduled_at"] == (BASE + timedelta(seconds=100)).isoformat() for row in focused)
     assert [row[0] for row in activation_rows] == [
-        (target - timedelta(seconds=120)).isoformat()
+        (target - timedelta(seconds=180)).isoformat()
     ]
     assert isinstance(state_at_cutoff, PaperEntryState)
     assert state_at_cutoff.lifecycle_state is LifecycleState.FLAT
