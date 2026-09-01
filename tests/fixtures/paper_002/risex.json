@@ -33,6 +33,8 @@
     "channel": "orderbook",
     "type": "update",
     "market_id": "7",
+    "block_number": 180,
+    "log_index": 1,
     "worker_timestamp": "1800000000000000200",
     "checksum": 123,
     "data": {

@@ -112,6 +112,7 @@ class BookStream:
                 delta.asks,
                 checksum=delta.checksum,
                 observed_at=delta.observed_at,
+                sequence=delta.sequence,
             )
         self.gap()
         return False
@@ -194,14 +195,26 @@ class BookStream:
         *,
         checksum: int,
         observed_at: datetime,
+        sequence: int | None = None,
     ) -> bool:
         if not self.book_initialized:
+            return False
+        if (
+            sequence is not None
+            and self._sequence is not None
+            and sequence <= self._sequence
+        ):
+            self.gap()
             return False
         self._apply_absolute(bids, asks)
         if self.risex_checksum() != checksum:
             self.gap()
             return False
-        return self._finish_update(observed_at)
+        if not self._finish_update(observed_at):
+            return False
+        if sequence is not None:
+            self._sequence = sequence
+        return True
 
     def _apply_absolute(
         self, bids: Iterable[BookLevel], asks: Iterable[BookLevel]

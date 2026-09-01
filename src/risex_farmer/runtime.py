@@ -5836,6 +5836,25 @@ class PublicPaperRuntime:
         stream.snapshot(snapshot)
         buffered = len(episode.buffer)
         replayed = 0
+        if snapshot.venue is Venue.RISEX:
+            if snapshot.sequence is None:
+                raise ValueError(
+                    "RISEx WS recovery snapshot must carry a block/log cursor"
+                )
+            previous_sequence: int | None = None
+            for delta in episode.buffer:
+                if delta.sequence is None:
+                    raise ValueError(
+                        "RISEx buffered book delta must carry a block/log cursor"
+                    )
+                if (
+                    previous_sequence is not None
+                    and delta.sequence <= previous_sequence
+                ):
+                    raise ValueError(
+                        "RISEx buffered book delta order is ambiguous"
+                    )
+                previous_sequence = delta.sequence
         if snapshot.sequence is None:
             if snapshot.venue is Venue.LIGHTER:
                 raise ValueError(
