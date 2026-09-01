@@ -1,5 +1,21 @@
 # Active bounded task
 
+## PAPER continuous correctness proof
+
+Status: `AUTHORIZED — FRESH LOCKED-QUANTITY VALIDATION AND ITERATIVE DEFECT CORRECTION`.
+
+Objective: starting from accepted published main, run exactly one fresh public-only PAPER process on a new owner-only database and obtain reproducible end-to-end evidence that eligible profitable routes can activate, retain an immutable attempt quantity across harmless optimizer drift, accumulate only qualifying maker trade-through, open both virtual legs atomically, reconcile funding, and close back to exact `FLAT`. Observe every missed opportunity and terminal attempt outcome. A cancellation or no-trade result is valid only when its exact fail-closed reason is supported by authoritative persisted market/runtime evidence; any proven implementation defect gets one fresh bounded visible PAPER Builder candidate followed by independent Chief review, integration, and another fresh validation process/database.
+
+Acceptance:
+
+- Validate accepted locked-quantity behavior in a process started from main at or after `1c9ba1cf7386cca5c74409a411e16f063d59ff6a`; optimized target drift alone must not cancel or replace the attempt, while genuine locked-q freshness, depth, grid/minimum, route/cycle, post-only, economics, and cutoff failures remain exact and fail closed.
+- Maintain exactly one public PAPER runtime, one fresh immutable operational identity/database per replacement, protected outbound-only Telegram loading, durable terminal ownership, SQLite integrity, and zero venue-write/private-access surface.
+- Track route eligibility, activation, each order/version, qualifying maker evidence, taker depth, cancellations, fills, positions, settlement status, funding cash, exits, completed PnL, public-stream gaps/resyncs, and fatal evidence. Diagnose from persisted evidence and official public contracts; do not weaken safety barriers merely to force a fill.
+- A complete proof requires at least one authoritative PAPER lifecycle from maker activation through full qualifying maker fill, immediate exact-q virtual taker hedge, persisted two-leg position, funding reconciliation at the intended boundary, completed close, zero active order, and exact `FLAT`, plus focused/adverse regressions and a clean Python 3.11 full suite for every accepted code change.
+- Clips, partial-position lifecycle, inferred fills, blind continuation across ambiguous maker data, changed timing/freshness/economics, private endpoints, credentials, signing, dispatch, real funds, withdrawals, and strategy-driven venue writes remain outside this slice unless the user separately authorizes a product change.
+
+User decision: on `2026-09-01` the user explicitly directed the Chief to pursue this correctness goal for as long as necessary, continuously test the PAPER system, diagnose missed profitable routes, and correct proven defects. This reopens fresh PAPER validation after the earlier stop but does not authorize real trading or weakening existing safety gates.
+
 ## PAPER maker-entry locked quantity
 
 Status: `ACCEPTED — IMPLEMENTATION INTEGRATED ON f6fd1dd; USER STOPPED LIVE TESTING BEFORE FRESH VALIDATION`.
