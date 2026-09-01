@@ -4855,22 +4855,29 @@ class PublicPaperRuntime:
                 self._extended_aggregate_key("book"), stream_session_id
             )
         )
-        aggregate_physical_previous = (
-            self._extended_book_sequence_state.get(stream_session_id)
-            if aggregate else None
-        )
+        aggregate_physical_previous = None
+        if aggregate:
+            aggregate_physical_previous = self._extended_book_sequence_state.get(
+                stream_session_id
+            )
+            if (
+                event.sequence is None
+                or (
+                    aggregate_physical_previous is not None
+                    and event.sequence != aggregate_physical_previous + 1
+                )
+            ):
+                await self._fail_extended_aggregate_book_sequence(
+                    stream_session_id=stream_session_id,
+                    previous_sequence=aggregate_physical_previous,
+                    current_sequence=event.sequence,
+                )
+                return False
+            self._extended_book_sequence_state[stream_session_id] = event.sequence
         if aggregate and event.canonical_market not in set(
             self._extended_stream_symbols_now()
         ):
-            if event.sequence is not None:
-                previous = self._extended_book_sequence_state.get(stream_session_id)
-                if previous is None or event.sequence > previous:
-                    self._extended_book_sequence_state[stream_session_id] = event.sequence
             return False
-        if aggregate and event.sequence is not None:
-            previous = self._extended_book_sequence_state.get(stream_session_id)
-            if previous is None or event.sequence > previous:
-                self._extended_book_sequence_state[stream_session_id] = event.sequence
         episode = self._recoveries.get(key)
         active = episode is not None and episode.terminal is None
         if (
@@ -4888,34 +4895,6 @@ class PublicPaperRuntime:
         )
         if required_session != stream_session_id:
             return False
-        if (
-            aggregate
-            and isinstance(event, OrderBook)
-            and event.sequence is None
-        ):
-            self._record(
-                "PUBLIC_REST_SNAPSHOT_IGNORED_FOR_WS_RESYNC",
-                at=now, venue=event.venue,
-                detail={"symbol": event.canonical_market},
-            )
-            return False
-        if (
-            aggregate
-            and isinstance(event, BookDelta)
-            and event.sequence is not None
-        ):
-            previous = aggregate_physical_previous
-            if previous is not None and event.sequence != previous + 1:
-                if not active:
-                    await self.mark_disconnected(
-                        event.venue, event.canonical_market, at=now,
-                        stream_kind="book", stream_session_id=stream_session_id,
-                    )
-                    self._start_snapshot_recovery(
-                        event.venue, event.canonical_market,
-                        displaced_stream_session_id=stream_session_id,
-                    )
-                return False
         if (
             isinstance(event, OrderBook)
             and event.venue is Venue.LIGHTER
@@ -5050,12 +5029,25 @@ class PublicPaperRuntime:
                 and aggregate_physical_previous is not None
                 and event.sequence == aggregate_physical_previous + 1
             )
-            if exact:
-                healthy = stream.apply_delta(event)
-            elif interleaved:
-                healthy = stream.extended_aggregate_delta(event)
-            else:
-                healthy = False
+            try:
+                if exact:
+                    healthy = stream.apply_delta(event)
+                elif interleaved:
+                    healthy = stream.extended_aggregate_delta(event)
+                else:
+                    healthy = False
+            except (TypeError, ValueError) as exc:
+                stream.gap()
+                await self.mark_disconnected(
+                    event.venue, event.canonical_market, at=now,
+                    stream_kind="book", exception=exc,
+                    stream_session_id=stream_session_id,
+                )
+                self._start_snapshot_recovery(
+                    event.venue, event.canonical_market,
+                    displaced_stream_session_id=stream_session_id,
+                )
+                return False
         else:
             healthy = stream.apply_delta(event)
         if not healthy:
@@ -5454,6 +5446,74 @@ class PublicPaperRuntime:
                 )
             )
 
+    async def _fail_extended_aggregate_book_sequence(
+        self,
+        *,
+        stream_session_id: StreamSessionId,
+        previous_sequence: int | None,
+        current_sequence: int | None,
+    ) -> None:
+        """Fail the whole physical aggregate book socket on sequence ambiguity."""
+        task_key = self._extended_aggregate_key("book")
+        if not self._owns_stream_session(task_key, stream_session_id):
+            return
+        expected_sequence = (
+            None if previous_sequence is None else previous_sequence + 1
+        )
+        classification = (
+            "MISSING_SEQUENCE"
+            if current_sequence is None
+            else (
+                "FORWARD_GAP"
+                if expected_sequence is not None
+                and current_sequence > expected_sequence
+                else "DUPLICATE_OR_OUT_OF_ORDER"
+            )
+        )
+        now = self.clock.now()
+        self._record(
+            "PUBLIC_BOOK_SEQUENCE_DISCONTINUITY",
+            at=now,
+            venue=Venue.EXTENDED,
+            detail={
+                "stream": "book",
+                "scope": "ALL_MARKETS",
+                "classification": classification,
+                "previous_sequence": previous_sequence,
+                "current_sequence": current_sequence,
+                "expected_sequence": expected_sequence,
+            },
+        )
+        identity = self._extended_aggregate_identity("book")
+        self._socket_disconnected(
+            identity,
+            at=now,
+            stream_session_id=stream_session_id,
+            cause="SEQUENCE_DISCONTINUITY",
+            exception_class="ValueError",
+            close_classification=None,
+        )
+        symbols = self._extended_stream_symbols_now()
+        for symbol in symbols:
+            await self.mark_disconnected(
+                Venue.EXTENDED,
+                symbol,
+                at=now,
+                stream_kind="book",
+                exception=ValueError("aggregate book sequence discontinuity"),
+                stream_session_id=stream_session_id,
+            )
+            recovery = self._recoveries.get((Venue.EXTENDED, symbol))
+            if (
+                recovery is not None
+                and recovery.terminal is None
+            ):
+                self._retire_recovery_task(recovery.task)
+                self._recoveries.pop((Venue.EXTENDED, symbol), None)
+        self._extended_connection_confirmed_at.pop("book", None)
+        if self._owns_stream_session(task_key, stream_session_id):
+            await self._restart_extended_stream("book")
+
     def _start_extended_stream(
         self, symbol_or_kind: str, kind: str | None = None
     ) -> None:
@@ -5504,7 +5564,7 @@ class PublicPaperRuntime:
         if aggregate:
             self._extended_connection_confirmed_at.pop(stream_kind, None)
         current = self._stream_tasks.get(key)
-        if current is not None and current is not asyncio.current_task():
+        if current is not None:
             self._stream_tasks.pop(key, None)
             old_session = self._stream_sessions.pop(key, None)
             if old_session is not None:
@@ -5513,6 +5573,8 @@ class PublicPaperRuntime:
                 self._start_extended_stream(stream_kind)
             else:
                 self._start_extended_stream(symbol, stream_kind)
+            if current is asyncio.current_task():
+                return
             current.cancel()
             self._retired_stream_tasks.add(current)
             current.add_done_callback(self._retired_stream_task_done)
@@ -5773,14 +5835,17 @@ class PublicPaperRuntime:
                                 if event.canonical_market not in set(
                                     self._extended_stream_symbols_now()
                                 ):
-                                    # apply_book_event advances only the
-                                    # aggregate sequence cursor for an
-                                    # irrelevant market and performs no market
-                                    # readiness/book mutation.
+                                    # apply_book_event validates the physical
+                                    # cursor before discarding an irrelevant
+                                    # market without local state mutation.
                                     await self.apply_book_event(
                                         event,
                                         stream_session_id=stream_session_id,
                                     )
+                                    if not self._owns_stream_session(
+                                        task_key, stream_session_id
+                                    ):
+                                        return
                                     continue
                                 healthy = await self.apply_book_event(
                                     event,

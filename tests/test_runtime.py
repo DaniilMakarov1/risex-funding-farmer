@@ -10641,9 +10641,8 @@ async def test_extended_aggregate_stream_routes_interleaved_market_evidence(
     assert "NOT-REQUIRED" not in runtime.observations
 
 
-@pytest.mark.asyncio
-async def test_extended_aggregate_book_gap_isolated_and_recovers_per_market(
-    tmp_path,
+async def _assert_extended_aggregate_book_sequence_gap_fails_all(
+    tmp_path, monkeypatch, gap_market: str, gap_sequence: int = 4
 ):
     clock = FakeClock()
     base = FakeAdapter(
@@ -10669,9 +10668,331 @@ async def test_extended_aggregate_book_gap_isolated_and_recovers_per_market(
         runtime._extended_stream_symbols = tuple(
             market.venue_symbol for market in markets
         )
-        session_id = runtime._new_stream_session(
-            (Venue.EXTENDED, "*", "book")
+        book_key = (Venue.EXTENDED, "*", "book")
+        stale_session_id = runtime._new_stream_session(
+            book_key
         )
+        assert await runtime.apply_book_event(
+            snapshot(markets[0].venue_symbol, 1),
+            stream_session_id=stale_session_id,
+        )
+        assert await runtime.apply_book_event(
+            snapshot(markets[1].venue_symbol, 2),
+            stream_session_id=stale_session_id,
+        )
+        restart_calls: list[str] = []
+        replacement_sessions = []
+
+        def start_replacement(kind: str) -> None:
+            restart_calls.append(kind)
+            replacement_sessions.append(runtime._new_stream_session(book_key))
+
+        monkeypatch.setattr(runtime, "_start_extended_stream", start_replacement)
+        gap_event = snapshot(gap_market, gap_sequence)
+        assert not await runtime.apply_book_event(
+            gap_event,
+            stream_session_id=stale_session_id,
+        )
+        assert restart_calls == ["book"]
+        assert len(replacement_sessions) == 1
+        replacement_session_id = replacement_sessions[0]
+        assert replacement_session_id != stale_session_id
+        for market in markets:
+            stream = runtime.coordinator.stream(
+                Venue.EXTENDED, market.venue_symbol
+            )
+            assert stream.book() is None
+            assert stream.health(clock.now()).data_quality is DataQuality.DEGRADED
+            assert (Venue.EXTENDED, market.venue_symbol) not in (
+                runtime._live_book_ready
+            )
+            assert not runtime.component_readiness[Venue.EXTENDED][
+                f"book:{market.venue_symbol}"
+            ].available
+
+        # The displaced aggregate session cannot restore either book after the
+        # physical sequence failure.
+        assert not await runtime.apply_book_event(
+            snapshot(markets[0].venue_symbol, 5),
+            stream_session_id=stale_session_id,
+        )
+        assert not await runtime.apply_book_event(
+            snapshot(markets[1].venue_symbol, 6),
+            stream_session_id=stale_session_id,
+        )
+        assert all(
+            runtime.coordinator.stream(
+                Venue.EXTENDED, market.venue_symbol
+            ).book() is None
+            for market in markets
+        )
+        assert not await runtime.recover_snapshot(OrderBook(
+            Venue.EXTENDED, markets[0].venue_symbol,
+            (BookLevel(D("97"), D("1")),),
+            (BookLevel(D("103"), D("1")),),
+            clock.now(),
+        ))
+        assert all(
+            runtime.coordinator.stream(
+                Venue.EXTENDED, market.venue_symbol
+            ).book() is None
+            for market in markets
+        )
+
+        # A fresh aggregate session establishes each market independently. A
+        # valid A snapshot must not make B healthy, and vice versa.
+        assert await runtime.apply_book_event(
+            snapshot(markets[0].venue_symbol, 100),
+            stream_session_id=replacement_session_id,
+        )
+        assert runtime.coordinator.stream(
+            Venue.EXTENDED, markets[0].venue_symbol
+        ).book() is not None
+        assert runtime.coordinator.stream(
+            Venue.EXTENDED, markets[1].venue_symbol
+        ).book() is None
+        assert (Venue.EXTENDED, markets[0].venue_symbol) in (
+            runtime._live_book_ready
+        )
+        assert (Venue.EXTENDED, markets[1].venue_symbol) not in (
+            runtime._live_book_ready
+        )
+        assert await runtime.apply_book_event(
+            snapshot(markets[1].venue_symbol, 101),
+            stream_session_id=replacement_session_id,
+        )
+        assert all(
+            runtime.coordinator.stream(
+                Venue.EXTENDED, market.venue_symbol
+            ).book() is not None
+            for market in markets
+        )
+        sequence_rows = repository.connection.execute(
+            "SELECT event_type FROM runtime_evidence "
+            "WHERE event_type IN ('PUBLIC_BOOK_SEQUENCE_DISCONTINUITY',"
+            "'PUBLIC_SOCKET_DISCONNECTED') ORDER BY evidence_id"
+        ).fetchall()
+
+    assert [row["event_type"] for row in sequence_rows] == [
+        "PUBLIC_BOOK_SEQUENCE_DISCONTINUITY",
+        "PUBLIC_SOCKET_DISCONNECTED",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_extended_aggregate_irrelevant_book_gap_fails_all_and_recovers(
+    tmp_path, monkeypatch
+):
+    await _assert_extended_aggregate_book_sequence_gap_fails_all(
+        tmp_path, monkeypatch, "NOT-REQUIRED"
+    )
+
+
+@pytest.mark.asyncio
+async def test_extended_aggregate_required_snapshot_gap_fails_all_and_recovers(
+    tmp_path, monkeypatch
+):
+    await _assert_extended_aggregate_book_sequence_gap_fails_all(
+        tmp_path, monkeypatch, "A-EXTENDED"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gap_sequence", [2, 1])
+async def test_extended_aggregate_duplicate_or_out_of_order_gap_fails_all(
+    tmp_path, monkeypatch, gap_sequence
+):
+    await _assert_extended_aggregate_book_sequence_gap_fails_all(
+        tmp_path, monkeypatch, "NOT-REQUIRED", gap_sequence
+    )
+
+
+@pytest.mark.asyncio
+async def test_extended_aggregate_book_gap_replaces_current_reader_and_reconnects(
+    tmp_path,
+):
+    clock = FakeClock()
+    base = FakeAdapter(
+        Venue.EXTENDED, clock, settlement_at=NOW + timedelta(minutes=5)
+    ).market
+    markets = tuple(
+        replace(base, canonical_asset=asset, venue_symbol=f"{asset}-EXTENDED")
+        for asset in ("A", "B")
+    )
+    timestamp = str(int(clock.now().timestamp() * 1000))
+
+    def message(market: str, sequence: int) -> dict:
+        return {
+            "type": "SNAPSHOT",
+            "ts": timestamp,
+            "seq": sequence,
+            "data": {
+                "m": market,
+                "b": [{"p": "99", "c": "2"}],
+                "a": [{"p": "101", "c": "2"}],
+            },
+        }
+
+    class ControlledSocket:
+        def __init__(self, payloads, connected: asyncio.Event) -> None:
+            self.payloads = list(payloads)
+            self.connected = connected
+            self.release = asyncio.Event()
+
+        async def __aenter__(self):
+            self.connected.set()
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self.payloads:
+                return SimpleNamespace(
+                    type=aiohttp.WSMsgType.TEXT,
+                    data=json.dumps(self.payloads.pop(0)),
+                )
+            await self.release.wait()
+            raise StopAsyncIteration
+
+        async def ping(self):
+            return None
+
+        async def pong(self, _data):
+            return None
+
+    with PaperRepository(
+        tmp_path / "extended-aggregate-current-reader-gap.db"
+    ) as repository:
+        first_connected = asyncio.Event()
+        replacement_connected = asyncio.Event()
+        first_socket = ControlledSocket(
+            (
+                message(markets[0].venue_symbol, 1),
+                message(markets[1].venue_symbol, 2),
+                message("NOT-REQUIRED", 4),
+            ),
+            first_connected,
+        )
+        replacement_socket = ControlledSocket((), replacement_connected)
+
+        class Session:
+            def __init__(self) -> None:
+                self.connections = 0
+
+            def ws_connect(self, url, **_kwargs):
+                assert url.endswith("/orderbooks")
+                self.connections += 1
+                return (
+                    first_socket
+                    if self.connections == 1
+                    else replacement_socket
+                )
+
+        runtime = PublicPaperRuntime(
+            repository, adapters={Venue.EXTENDED: ExtendedAdapter(None)},
+            clock=clock,
+        )
+        runtime._session = Session()
+        runtime._stop_event = asyncio.Event()
+        runtime._extended_stream_symbols = tuple(
+            market.venue_symbol for market in markets
+        )
+        book_key = (Venue.EXTENDED, "*", "book")
+        first_session = runtime._new_stream_session(book_key)
+        first_reader = asyncio.create_task(runtime._extended_stream(
+            runtime.adapters[Venue.EXTENDED],  # type: ignore[index]
+            runtime._extended_stream_symbols,
+            "book",
+            first_session,
+        ))
+        runtime._stream_tasks[book_key] = first_reader
+        replacement_reader = None
+        try:
+            await first_connected.wait()
+            await replacement_connected.wait()
+            await first_reader
+            replacement_session = runtime._stream_sessions[book_key]
+            replacement_reader = runtime._stream_tasks[book_key]
+            assert replacement_session != first_session
+            assert replacement_reader is not first_reader
+            assert all(
+                runtime.coordinator.stream(
+                    Venue.EXTENDED, market.venue_symbol
+                ).book() is None
+                for market in markets
+            )
+            assert await runtime.apply_book_event(
+                OrderBook(
+                    Venue.EXTENDED, markets[0].venue_symbol,
+                    (BookLevel(D("99"), D("2")),),
+                    (BookLevel(D("101"), D("2")),),
+                    clock.now(), 100,
+                ),
+                stream_session_id=replacement_session,
+            )
+            assert runtime.coordinator.stream(
+                Venue.EXTENDED, markets[0].venue_symbol
+            ).book() is not None
+            assert runtime.coordinator.stream(
+                Venue.EXTENDED, markets[1].venue_symbol
+            ).book() is None
+            assert await runtime.apply_book_event(
+                OrderBook(
+                    Venue.EXTENDED, markets[1].venue_symbol,
+                    (BookLevel(D("99"), D("2")),),
+                    (BookLevel(D("101"), D("2")),),
+                    clock.now(), 101,
+                ),
+                stream_session_id=replacement_session,
+            )
+        finally:
+            runtime._stop_event.set()
+            replacement_socket.release.set()
+            if replacement_reader is not None:
+                await replacement_reader
+
+    assert runtime.coordinator.stream(
+        Venue.EXTENDED, markets[0].venue_symbol
+    ).book() is not None
+    assert runtime.coordinator.stream(
+        Venue.EXTENDED, markets[1].venue_symbol
+    ).book() is not None
+
+
+@pytest.mark.asyncio
+async def test_extended_aggregate_valid_content_failure_is_market_local(
+    tmp_path,
+):
+    clock = FakeClock()
+    base = FakeAdapter(
+        Venue.EXTENDED, clock, settlement_at=NOW + timedelta(minutes=5)
+    ).market
+    markets = tuple(
+        replace(base, canonical_asset=asset, venue_symbol=f"{asset}-EXTENDED")
+        for asset in ("A", "B")
+    )
+
+    def snapshot(market: str, sequence: int) -> OrderBook:
+        return OrderBook(
+            Venue.EXTENDED, market,
+            (BookLevel(D("99"), D("2")),),
+            (BookLevel(D("101"), D("2")),), clock.now(), sequence,
+        )
+
+    with PaperRepository(tmp_path / "extended-aggregate-content-failure.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={Venue.EXTENDED: ExtendedAdapter(None)},
+            clock=clock,
+        )
+        runtime._extended_stream_symbols = tuple(
+            market.venue_symbol for market in markets
+        )
+        book_key = (Venue.EXTENDED, "*", "book")
+        session_id = runtime._new_stream_session(book_key)
         assert await runtime.apply_book_event(
             snapshot(markets[0].venue_symbol, 1),
             stream_session_id=session_id,
@@ -10683,37 +11004,36 @@ async def test_extended_aggregate_book_gap_isolated_and_recovers_per_market(
         assert not await runtime.apply_book_event(
             BookDelta(
                 Venue.EXTENDED, markets[0].venue_symbol,
-                (BookLevel(D("99"), D("4")),), (), clock.now(), 4,
+                (BookLevel(D("99"), D("-1")),), (),
+                clock.now(), 3,
             ),
             stream_session_id=session_id,
         )
-        assert await runtime.apply_book_event(
-            BookDelta(
-                Venue.EXTENDED, markets[1].venue_symbol,
-                (BookLevel(D("99"), D("3")),), (), clock.now(), 5,
-            ),
-            stream_session_id=session_id,
-        )
-        assert await runtime.apply_book_event(
-            snapshot(markets[0].venue_symbol, 6),
-            stream_session_id=session_id,
-        )
-        a_book = runtime.coordinator.stream(
+        assert runtime.coordinator.stream(
             Venue.EXTENDED, markets[0].venue_symbol
-        ).book()
+        ).book() is None
         b_book = runtime.coordinator.stream(
             Venue.EXTENDED, markets[1].venue_symbol
         ).book()
-        a_episode = runtime._recoveries[Venue.EXTENDED, markets[0].venue_symbol]
-
-    assert a_episode.terminal == "COMPLETE"
-    assert a_book is not None and a_book.sequence == 6
-    assert b_book is not None and b_book.sequence == 5
-    assert (Venue.EXTENDED, markets[0].venue_symbol) in runtime._live_book_ready
-    assert (Venue.EXTENDED, markets[1].venue_symbol) in runtime._live_book_ready
-    assert not any(
-        key[1] == markets[1].venue_symbol for key in runtime._recoveries
-    )
+        assert b_book is not None and b_book.sequence == 2
+        assert runtime._recoveries[
+            Venue.EXTENDED, markets[0].venue_symbol
+        ].terminal is None
+        assert await runtime.apply_book_event(
+            BookDelta(
+                Venue.EXTENDED, markets[1].venue_symbol,
+                (BookLevel(D("99"), D("3")),), (),
+                clock.now(), 4,
+            ),
+            stream_session_id=session_id,
+        )
+        assert runtime.coordinator.stream(
+            Venue.EXTENDED, markets[1].venue_symbol
+        ).book().sequence == 4
+        assert await runtime.apply_book_event(
+            snapshot(markets[0].venue_symbol, 5),
+            stream_session_id=session_id,
+        )
 
 
 @pytest.mark.asyncio
