@@ -1,5 +1,23 @@
 # Active bounded task
 
+## PAPER maker-entry locked quantity
+
+Status: `AUTHORIZED — GOVERNANCE BOUNDARY PENDING FRESH BUILDER IMPLEMENTATION AND INDEPENDENT ACCEPTANCE`.
+
+Objective: on maker-entry activation, persist the exact canonical plan quantity as immutable `locked_quantity` for that attempt. A later 10-second Scanner plan may optimize to a different target quantity, but quantity drift alone must not emit `PAPER_ORDER_CANCELLED_ROUTE_INVALID`, cancel/re-enter, resize, or transfer maker evidence. Re-evaluate the locked attempt only at `locked_quantity`: current exact-q taker entry depth/VWAP, both venue grids and minimum quantity/notional, fresh data on both legs, the same route/direction/target funding cycle, maker post-only validity, fees/funding/execution components, and planned maker net PnL. Retain exact fail-closed cancellation when any of those locked-quantity gates actually fails or becomes unknown, or at the existing exact `T−5` cutoff.
+
+Acceptance:
+
+- Reproduce the observed AAVE `3.939→3.941` and `3.993→3.999` drifts in focused regressions: each remains one attempt and keeps its original exact quantity while locked-q depth and planned net economics remain valid and non-negative.
+- Prove independently that locked-q depth loss, grid/minimum failure, negative or unknown economics, stale data, changed route/direction/cycle, invalid post-only maker quote, and cutoff still cancel with the exact existing fail-closed reason. Quantity never changes within an attempt.
+- Preserve price-version behavior: a maker-price change may replace the current version, resets that version's cumulative maker evidence, retains the same locked quantity, and never transfers evidence between versions or quantities.
+- Preserve the pre-cutoff atomic fill versus owned-cutoff race, exactly-once cancellation persistence and Telegram delivery, immediate exact-q taker hedge, one-position limit, 25-second stream freshness, 120-second funding age, `T−120`/`T−5`, fees, funding, exit, and PnL semantics.
+- Do not add clips, partial-position lifecycle, partial taker hedge, dynamic resizing, route switching, queue/fill-probability simulation, private access, credential handling, order preparation/signing/dispatch, or any venue/mainnet write surface.
+- Use one fresh visible PAPER Builder on GPT-5.6 Luna `max` from the exact published governance base. The Builder must report root/branch/HEAD/status before edits, remain within the bounded slice, run focused/adverse tests and one clean isolated Python 3.11 full suite on the final SHA, and provide dependency/compile/diff/no-write evidence. Chief independently reviews and alone accepts/integrates/pushes.
+- Do not touch, stop, restart, repair, copy, or resume active `chief39` or `mainnet-paper-live-20260901-chief39.db` before acceptance. After publication, validate only on a fresh PAPER database and prove live quantity drift no longer causes cancellation/re-entry while every safety gate remains fail closed.
+
+User decision: on `2026-09-01` the user explicitly authorized this locked-quantity PAPER behavior and explicitly kept clips prohibited. No other economics, timing, freshness, execution, strategy, testnet, or mainnet authority changed.
+
 ## PAPER chief39 live behavior observation
 
 Status: `ACTIVE — USER-REQUESTED 2.5-HOUR READ-ONLY OBSERVATION THROUGH 2026-09-01 13:22 EUROPE/MOSCOW`.

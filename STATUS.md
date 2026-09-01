@@ -1,5 +1,11 @@
 # Current status
 
+## PAPER locked-quantity decision
+
+On `2026-09-01` the user explicitly authorized one bounded PAPER correction for the observed AAVE quantity-drift cancellations. A maker-entry attempt will lock its exact canonical activation quantity for its entire lifetime; later optimized target-quantity drift alone will no longer cancel or re-enter it. All continuing safety and economics checks must be recomputed at that immutable locked quantity, including exact-q taker depth/VWAP, venue grids/minimums, both-leg freshness, route/direction/cycle identity, maker post-only validity, fees/funding/execution, and planned net PnL. Genuine locked-q failure remains fail-closed. Clips, resizing, partial-position entry/hedge, evidence transfer, route switching, and every private/live write remain prohibited.
+
+No implementation is accepted yet. The active `chief39` process and database remain read-only observation evidence and must not be touched. Chief will publish only this governance boundary, create exactly one fresh visible PAPER Builder on GPT-5.6 Luna `max`, independently review its candidate and clean Python 3.11 full suite, and use only a fresh PAPER database for later live validation.
+
 ## PAPER transport and cutoff follow-up
 
 Accepted and published main `505c45b7fe92a593ce018e74c72fc79afbba38f3` corrects both proven defects without changing the two-minute entry window or freshness/economic rules. The owned Lighter combined public stream now sends the exact application `{"type":"ping"}` every 10 seconds, accepts only the exact application-pong object as connection confirmation, and retires the heartbeat on stream replacement, disconnect, or shutdown. An active PAPER entry now owns an independent exact `T−5 seconds` cancellation task, so catalog refresh, focused scans, reconnects, and recovery work cannot postpone terminal persistence; broker/fill/cutoff mutation remains serialized and exactly once. Independent Chief review passed the adverse heartbeat/session, blocked-scan cutoff, duplicate-cancel, and pre-cutoff atomic-open races, followed by the clean integrated Python 3.11 suite with `3598` passed / `3` skipped.

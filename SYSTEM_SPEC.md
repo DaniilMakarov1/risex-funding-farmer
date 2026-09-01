@@ -1,6 +1,6 @@
 # RISEx Funding Farmer — Paper System Specification
 
-SYSTEM_SPEC_VERSION = 1.2
+SYSTEM_SPEC_VERSION = 1.3
 SPEC_STATUS = FROZEN_FOR_PAPER_IMPLEMENTATION
 
 ## 1. Purpose and boundary
@@ -185,6 +185,8 @@ Maker entry/normal exit price:
 
 Target raw canonical quantity is `500 / planned_route_maker_canonical_price`. Compute each canonical step as raw step × multiplier, derive a common canonical step with integer-scaled LCM, and floor the target to it. Adapters convert canonical quantity back to raw quantity. Enforce both venues' minimum quantity and notional.
 
+At maker-entry activation, persist that exact canonical quantity as the attempt's `locked_quantity`. The quantity is immutable for the entire attempt. Later 10-second Scanner plans may calculate a different target quantity, but target-quantity drift alone does not invalidate or replace the active attempt. Every subsequent executability and economics check uses `locked_quantity`, including both venues' grids and minimum quantity/notional, exact-quantity route-taker depth/VWAP, fees, funding, planned entry/exit execution, and planned maker net PnL. Clips, resizing, partial-position entry, and transfer of maker evidence between quantities remain prohibited.
+
 Exact taker VWAP walks asks for BUY and bids for SELL for exactly canonical quantity. Insufficient depth is not executable. Never use last/mark as execution, fixed slippage, spread reserve, hidden buffer, percentage improvement, progressive entry chasing, or fill probability.
 
 ## 11. Fees and planned entry economics
@@ -201,7 +203,7 @@ Expected basis convergence and points value are zero. Entry requires PlannedMake
 
 At activation create a route-maker LIMIT POST_ONLY only for the first ranked route, non-negative plan, no position/order, fresh data, and executable route-taker exact-q entry VWAP. The route maker is the hedge venue for Extended/Nado and RISEx for Lighter. Lock the route.
 
-Cancel only when its own planned PnL turns negative, data is stale, route becomes invalid/non-executable, or cutoff arrives. Every 10 seconds recalculate quote/PnL; price change cancels/replaces with a new version and resets old cumulative volume.
+Cancel only when its locked-quantity planned PnL turns negative or unknown, data is stale, the locked route/direction/target funding cycle changes, `locked_quantity` becomes invalid or non-executable under current venue grids/minimums or exact-q taker depth, the maker quote is no longer valid post-only, or cutoff arrives. A newly optimized target quantity differing from `locked_quantity` is not itself a cancellation reason. Every 10 seconds recalculate the maker quote and all economics at `locked_quantity`; price change cancels/replaces with a new version and resets old cumulative volume without changing quantity or transferring maker evidence.
 
 Trade evidence contains key, exchange/receipt time, canonical quantity/price, aggressor side, and `is_orderbook_match` true/false/unknown. Only true matches count. With an official realtime trade ID, key is venue + market + ID. Otherwise key adds connection session, exchange time, product, price, quantity, aggressor, and event ordinal.
 
