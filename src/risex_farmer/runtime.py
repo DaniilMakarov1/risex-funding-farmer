@@ -142,11 +142,123 @@ class _PublicSocketClosed(ConnectionError):
         self.classification = classification
 
 
+class _ExtendedBookIngressOverflow(ConnectionError):
+    def __init__(self, *, capacity: int, queued: int) -> None:
+        super().__init__(
+            "Extended aggregate book ingress queue reached its safety bound"
+        )
+        self.capacity = capacity
+        self.queued = queued
+
+
+class _ExtendedBookPriorityReader:
+    """Drain one aggregate book socket while prioritizing control frames.
+
+    The aggregate book can produce enough text frames to leave the normal
+    application iterator behind the venue heartbeat.  This reader is the
+    sole consumer of the physical WebSocket.  It keeps text frames ordered
+    for the existing serial book processor, but makes PING/PONG/CLOSE frames
+    available ahead of queued data so control handling is not delayed by book
+    application work.
+    """
+
+    def __init__(
+        self,
+        websocket: Any,
+        *,
+        is_current: Callable[[], bool],
+        stop_event: asyncio.Event,
+        data_capacity: int,
+    ) -> None:
+        self._websocket = websocket
+        self._is_current = is_current
+        self._stop_event = stop_event
+        self._data: asyncio.Queue[Any] = asyncio.Queue(maxsize=data_capacity)
+        self._control: asyncio.Queue[Any] = asyncio.Queue()
+        self._available = asyncio.Event()
+        self._failure: BaseException | None = None
+        self._source_exhausted = False
+        self._ingress_task: asyncio.Task[None] | None = None
+        self._data_capacity = data_capacity
+
+    async def start(self) -> None:
+        self._ingress_task = asyncio.create_task(self._ingress())
+
+    async def _ingress(self) -> None:
+        try:
+            async for message in self._websocket:
+                await asyncio.sleep(0)
+                if not self._is_current() or self._stop_event.is_set():
+                    return
+                if message.type in {
+                    aiohttp.WSMsgType.PING,
+                    aiohttp.WSMsgType.PONG,
+                    aiohttp.WSMsgType.CLOSE,
+                    aiohttp.WSMsgType.CLOSING,
+                    aiohttp.WSMsgType.CLOSED,
+                    aiohttp.WSMsgType.ERROR,
+                }:
+                    self._control.put_nowait(message)
+                else:
+                    try:
+                        self._data.put_nowait(message)
+                    except asyncio.QueueFull as exc:
+                        raise _ExtendedBookIngressOverflow(
+                            capacity=self._data_capacity,
+                            queued=self._data.qsize(),
+                        ) from exc
+                self._available.set()
+            self._source_exhausted = True
+            if self._is_current():
+                self._failure = _PublicSocketClosed("EOF")
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:
+            self._failure = exc
+        finally:
+            self._available.set()
+
+    async def close(self) -> None:
+        task = self._ingress_task
+        if task is None or task.done() or task is asyncio.current_task():
+            return
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    def __aiter__(self) -> _ExtendedBookPriorityReader:
+        return self
+
+    async def __anext__(self) -> Any:
+        while True:
+            self._available.clear()
+            if not self._is_current():
+                raise StopAsyncIteration
+            if self._stop_event.is_set() and not self._source_exhausted:
+                raise StopAsyncIteration
+            try:
+                return self._control.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            if self._failure is not None and not (
+                isinstance(self._failure, _PublicSocketClosed)
+                and self._failure.classification == "EOF"
+            ):
+                raise self._failure
+            try:
+                return self._data.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            if self._failure is not None:
+                raise self._failure
+            await self._available.wait()
+
+
 _PublicResult = TypeVar("_PublicResult")
 PUBLIC_REQUEST_TIMEOUT_SECONDS = 30
 PUBLIC_REST_CONCURRENCY_PER_VENUE = 2
 LIGHTER_MAX_INFLIGHT_SUBSCRIPTIONS = 50
 LIGHTER_WS_RECOVERY_TIMEOUT_SECONDS = 30
+EXTENDED_BOOK_INGRESS_QUEUE_SIZE = 2048
 PAPER_ENTRY_CANCELLATION_EVENT = "PAPER_ENTRY_CANCELLED_NO_FILL"
 
 
@@ -4747,6 +4859,8 @@ class PublicPaperRuntime:
         exception: BaseException,
         stream_session_id: StreamSessionId,
     ) -> None:
+        if isinstance(exception, _ExtendedBookIngressOverflow):
+            return
         if isinstance(exception, _PublicSocketClosed):
             self._socket_disconnected(
                 identity, at=at, cause="SOCKET_CLOSED",
@@ -6156,8 +6270,22 @@ class PublicPaperRuntime:
                     trade_discontinuity_recorded = False
                     last_funding_sequence: int | None = None
                     ordinal = 0
+                    book_reader: _ExtendedBookPriorityReader | None = None
+                    message_source: Any = ws
+                    if kind == "book":
+                        assert self._stop_event is not None
+                        book_reader = _ExtendedBookPriorityReader(
+                            ws,
+                            is_current=lambda: self._owns_stream_session(
+                                task_key, stream_session_id
+                            ),
+                            stop_event=self._stop_event,
+                            data_capacity=EXTENDED_BOOK_INGRESS_QUEUE_SIZE,
+                        )
+                        await book_reader.start()
+                        message_source = book_reader
                     try:
-                        async for message in ws:
+                        async for message in message_source:
                             await asyncio.sleep(0)
                             if not self._owns_stream_session(
                                 task_key, stream_session_id
@@ -6364,6 +6492,8 @@ class PublicPaperRuntime:
                                         stream_session_id=stream_session_id,
                                     )
                     finally:
+                        if book_reader is not None:
+                            await book_reader.close()
                         if heartbeat is not None:
                             heartbeat.cancel()
                             await asyncio.gather(
@@ -6386,10 +6516,24 @@ class PublicPaperRuntime:
                 ):
                     return
                 if session_established:
-                    self._record_transport_disconnect(
-                        socket_identity, at=self.clock.now(), exception=exc,
-                        stream_session_id=stream_session_id,
-                    )
+                    if isinstance(exc, _ExtendedBookIngressOverflow):
+                        self._record(
+                            "PUBLIC_BOOK_INGRESS_OVERFLOW",
+                            at=self.clock.now(),
+                            venue=Venue.EXTENDED,
+                            detail={
+                                "stream": "book",
+                                "scope": "ALL_MARKETS",
+                                "queue_capacity": exc.capacity,
+                                "queued": exc.queued,
+                                "stream_session_id": stream_session_id.value,
+                            },
+                        )
+                    else:
+                        self._record_transport_disconnect(
+                            socket_identity, at=self.clock.now(), exception=exc,
+                            stream_session_id=stream_session_id,
+                        )
                 for symbol in self._extended_stream_symbols_now():
                     await self.mark_disconnected(
                         Venue.EXTENDED, symbol, stream_kind=kind,

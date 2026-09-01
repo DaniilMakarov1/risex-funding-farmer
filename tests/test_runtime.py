@@ -1,4 +1,5 @@
 import asyncio
+from collections import deque
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -11938,6 +11939,353 @@ async def test_extended_aggregate_stream_routes_interleaved_market_evidence(
         )
     )
     assert "NOT-REQUIRED" not in runtime.observations
+
+
+@pytest.mark.asyncio
+async def test_extended_aggregate_book_ping_preempts_fifo_backlog_without_dropping_frames(
+    tmp_path,
+):
+    clock = FakeClock()
+    stop = asyncio.Event()
+    symbol = "BTC-EXTENDED"
+    frame_count = 120
+    processed: list[int] = []
+
+    def book_frame(sequence: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            type=aiohttp.WSMsgType.TEXT,
+            data=json.dumps({
+                "type": "UPDATE",
+                "ts": int(clock.now().timestamp() * 1000),
+                "seq": sequence,
+                "data": {"m": symbol, "b": [], "a": []},
+            }),
+        )
+
+    class Socket:
+        def __init__(self) -> None:
+            self.frames = deque(book_frame(i) for i in range(1, frame_count + 1))
+            self.frames.append(
+                SimpleNamespace(type=aiohttp.WSMsgType.PING, data=b"server")
+            )
+            self.eof_release = asyncio.Event()
+            self.pongs: list[tuple[bytes, int]] = []
+            self.processed_count = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self.frames:
+                return self.frames.popleft()
+            await self.eof_release.wait()
+            stop.set()
+            raise StopAsyncIteration
+
+        async def ping(self):
+            return None
+
+        async def pong(self, data):
+            self.pongs.append((data, self.processed_count))
+
+    socket = Socket()
+
+    class Session:
+        def ws_connect(self, *_args, **_kwargs):
+            return socket
+
+    with PaperRepository(
+        tmp_path / "extended-aggregate-book-heartbeat-priority.db"
+    ) as repository:
+        runtime = PublicPaperRuntime(
+            repository,
+            adapters={Venue.EXTENDED: ExtendedAdapter(None)},
+            clock=clock,
+        )
+        runtime._session = Session()
+        runtime._stop_event = stop
+        runtime._extended_stream_symbols = (symbol,)
+
+        async def inert_heartbeat(_ws, _key, _session_id):
+            await stop.wait()
+
+        runtime._extended_heartbeat = inert_heartbeat
+
+        async def process_book(event, *, stream_session_id):
+            processed.append(event.sequence)
+            socket.processed_count = len(processed)
+            if len(processed) == frame_count:
+                socket.eof_release.set()
+            await asyncio.sleep(0.01)
+            return True
+
+        runtime.apply_book_event = process_book
+        session_id = runtime._new_stream_session(
+            (Venue.EXTENDED, "*", "book")
+        )
+        await runtime._extended_stream(
+            runtime.adapters[Venue.EXTENDED],  # type: ignore[index]
+            (symbol,),
+            "book",
+            session_id,
+        )
+
+    assert socket.pongs == [(b"server", 1)]
+    assert processed == list(range(1, frame_count + 1))
+
+
+@pytest.mark.asyncio
+async def test_extended_aggregate_book_ingress_overflow_fails_closed_without_socket_episode(
+    tmp_path,
+):
+    clock = FakeClock()
+    stop = asyncio.Event()
+    symbol = "BTC-EXTENDED"
+    overflow_probe = asyncio.Event()
+    first_frame_started = asyncio.Event()
+    release_first_frame = asyncio.Event()
+    frame_count = 2050
+
+    def book_frame(sequence: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            type=aiohttp.WSMsgType.TEXT,
+            data=json.dumps({
+                "type": "UPDATE",
+                "ts": int(clock.now().timestamp() * 1000),
+                "seq": sequence,
+                "data": {"m": symbol, "b": [], "a": []},
+            }),
+        )
+
+    class Socket:
+        def __init__(self) -> None:
+            self.frames = deque(book_frame(i) for i in range(1, frame_count + 1))
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self.frames:
+                frame = self.frames.popleft()
+                if frame.data.find('"seq": 2050') >= 0:
+                    overflow_probe.set()
+                return frame
+            await asyncio.Future()
+            raise AssertionError
+
+        async def ping(self):
+            return None
+
+        async def pong(self, _data):
+            return None
+
+    socket = Socket()
+
+    class Session:
+        def ws_connect(self, *_args, **_kwargs):
+            return socket
+
+    async def stop_after_reconnect_delay(_seconds):
+        stop.set()
+        await asyncio.sleep(0)
+
+    with PaperRepository(
+        tmp_path / "extended-aggregate-book-ingress-overflow.db"
+    ) as repository:
+        runtime = PublicPaperRuntime(
+            repository,
+            adapters={Venue.EXTENDED: ExtendedAdapter(None)},
+            clock=clock,
+            sleep=stop_after_reconnect_delay,
+        )
+        runtime._session = Session()
+        runtime._stop_event = stop
+        runtime._extended_stream_symbols = (symbol,)
+
+        async def inert_heartbeat(_ws, _key, _session_id):
+            await stop.wait()
+
+        runtime._extended_heartbeat = inert_heartbeat
+
+        async def block_first_frame(_event, *, stream_session_id):
+            first_frame_started.set()
+            await release_first_frame.wait()
+            return True
+
+        runtime.apply_book_event = block_first_frame
+        session_id = runtime._new_stream_session(
+            (Venue.EXTENDED, "*", "book")
+        )
+        task = asyncio.create_task(runtime._extended_stream(
+            runtime.adapters[Venue.EXTENDED],  # type: ignore[index]
+            (symbol,),
+            "book",
+            session_id,
+        ))
+        await first_frame_started.wait()
+        await overflow_probe.wait()
+        release_first_frame.set()
+        await task
+        rows = repository.connection.execute(
+            "SELECT event_type,detail FROM runtime_evidence ORDER BY evidence_id"
+        ).fetchall()
+
+    overflow = [
+        json.loads(row["detail"])
+        for row in rows
+        if row["event_type"] == "PUBLIC_BOOK_INGRESS_OVERFLOW"
+    ]
+    assert len(overflow) == 1
+    assert overflow[0]["queue_capacity"] == 2048
+    assert overflow[0]["queued"] == 2048
+    assert [
+        row["event_type"] for row in rows
+        if row["event_type"].startswith("PUBLIC_SOCKET_")
+    ] == []
+
+
+@pytest.mark.asyncio
+async def test_extended_aggregate_book_repeated_eof_replaces_sessions_and_resyncs_all_books(
+    tmp_path,
+):
+    clock = FakeClock()
+    stop = asyncio.Event()
+    base = FakeAdapter(
+        Venue.EXTENDED, clock, settlement_at=NOW + timedelta(minutes=5)
+    ).market
+    markets = tuple(
+        replace(base, canonical_asset=asset, venue_symbol=f"{asset}-EXTENDED")
+        for asset in ("A", "B")
+    )
+    timestamp = int(clock.now().timestamp() * 1000)
+
+    def snapshot(market: str, sequence: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            type=aiohttp.WSMsgType.TEXT,
+            data=json.dumps({
+                "type": "SNAPSHOT",
+                "ts": timestamp,
+                "seq": sequence,
+                "data": {
+                    "m": market,
+                    "b": [{"p": "99", "c": "2"}],
+                    "a": [{"p": "101", "c": "2"}],
+                },
+            }),
+        )
+
+    class Socket:
+        def __init__(self, frames=(), *, stop_on_enter=False) -> None:
+            self.frames = deque(frames)
+            self.stop_on_enter = stop_on_enter
+
+        async def __aenter__(self):
+            if self.stop_on_enter:
+                stop.set()
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self.frames:
+                return self.frames.popleft()
+            raise StopAsyncIteration
+
+        async def ping(self):
+            return None
+
+        async def pong(self, _data):
+            return None
+
+    sockets = [
+        Socket((snapshot(markets[0].venue_symbol, 1), snapshot(markets[1].venue_symbol, 2))),
+        Socket((snapshot(markets[0].venue_symbol, 1), snapshot(markets[1].venue_symbol, 2))),
+        Socket((snapshot(markets[0].venue_symbol, 1), snapshot(markets[1].venue_symbol, 2))),
+        Socket(stop_on_enter=True),
+    ]
+
+    class Session:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def ws_connect(self, *_args, **_kwargs):
+            socket = sockets[self.calls]
+            self.calls += 1
+            return socket
+
+    delays: list[float] = []
+
+    async def fast_sleep(seconds: float) -> None:
+        delays.append(seconds)
+        await asyncio.sleep(0)
+
+    with PaperRepository(
+        tmp_path / "extended-aggregate-book-repeated-eof.db"
+    ) as repository:
+        runtime = PublicPaperRuntime(
+            repository,
+            adapters={Venue.EXTENDED: ExtendedAdapter(None)},
+            clock=clock,
+            sleep=fast_sleep,
+        )
+        session = Session()
+        runtime._session = session
+        runtime._stop_event = stop
+        runtime._extended_stream_symbols = tuple(
+            market.venue_symbol for market in markets
+        )
+
+        async def inert_heartbeat(_ws, _key, _session_id):
+            await stop.wait()
+
+        runtime._extended_heartbeat = inert_heartbeat
+        session_id = runtime._new_stream_session(
+            (Venue.EXTENDED, "*", "book")
+        )
+        await runtime._extended_stream(
+            runtime.adapters[Venue.EXTENDED],  # type: ignore[index]
+            runtime._extended_stream_symbols,
+            "book",
+            session_id,
+        )
+        rows = repository.connection.execute(
+            "SELECT event_type,detail FROM runtime_evidence ORDER BY evidence_id"
+        ).fetchall()
+
+    disconnected = [
+        json.loads(row["detail"])
+        for row in rows
+        if row["event_type"] == "PUBLIC_SOCKET_DISCONNECTED"
+    ]
+    reconnected = [
+        json.loads(row["detail"])
+        for row in rows
+        if row["event_type"] == "PUBLIC_SOCKET_RECONNECTED"
+    ]
+    resyncs = [
+        row for row in rows if row["event_type"] == "PUBLIC_BOOK_RESYNC_REQUIRED"
+    ]
+    assert session.calls == 4
+    assert [row["disconnected_stream_session_id"] for row in disconnected] == [1, 2, 3]
+    assert [row["reconnected_stream_session_id"] for row in reconnected] == [2, 3, 4]
+    assert len(resyncs) == 6
+    assert delays == [1, 1, 1]
 
 
 async def _assert_extended_aggregate_book_sequence_gap_fails_all(
