@@ -17,6 +17,7 @@ from risex_farmer.models import (
     MarketType,
     MarketVolume,
     OrderBook,
+    RouteDirection,
     Side,
     StreamHealth,
     TradeEvidence,
@@ -105,6 +106,33 @@ def observation(
         book,
         funding,
         health,
+    )
+
+
+def fractional_observation(
+    venue: Venue,
+    *,
+    at: datetime,
+    maker_price: str,
+    depth: str = "10",
+    cash: str = "5",
+) -> MarketObservation:
+    row = observation(
+        venue,
+        at=at,
+        bid=str(D(maker_price) - D("0.03")),
+        ask=str(D(maker_price) + D("0.01")),
+        depth=depth,
+        cash=cash,
+    )
+    return replace(
+        row,
+        market=replace(
+            row.market,
+            tick_size_raw=D("0.01"),
+            quantity_step_raw=D("0.001"),
+            minimum_quantity_raw=D("0.001"),
+        ),
     )
 
 
@@ -258,7 +286,18 @@ async def test_replacement_resets_quantity_and_old_version_token_cannot_fill() -
         hedge_entry_price=D("101"),
     )
     fresh_risex = observation(Venue.RISEX, at=NOW + timedelta(seconds=10))
-    await broker.refresh(refreshed, fresh_risex, evaluated_at=NOW + timedelta(seconds=10))
+    fresh_hedge = observation(
+        Venue.EXTENDED,
+        at=NOW + timedelta(seconds=10),
+        bid="100",
+        ask="102",
+    )
+    await broker.refresh(
+        refreshed,
+        fresh_risex,
+        evaluated_at=NOW + timedelta(seconds=10),
+        hedge_observation=fresh_hedge,
+    )
 
     order = broker.state.order
     assert len(order.versions) == 2
@@ -270,7 +309,7 @@ async def test_replacement_resets_quantity_and_old_version_token_cannot_fill() -
         observed_version_id=old_id,
         processed_at=NOW + timedelta(seconds=11),
         risex_observation=fresh_risex,
-        hedge_observation=observation(Venue.EXTENDED, at=NOW + timedelta(seconds=10)),
+        hedge_observation=fresh_hedge,
         recompute_funding=funding_recomputer(),
     )
     assert result.outcome is TradeProcessOutcome.IGNORED
@@ -288,25 +327,291 @@ async def test_refresh_cancellation_precedence_and_exact_reasons() -> None:
     state = await broker.refresh(None, stale, evaluated_at=NOW + timedelta(seconds=10))
     assert state.order.cancellation_reason is CancellationReason.DATA_STALE
 
-    broker, _, _ = await active_broker()
+    broker, _, hedge = await active_broker()
     shallow = observation(Venue.RISEX, at=NOW + timedelta(seconds=10), depth="1")
-    state = await broker.refresh(None, shallow, evaluated_at=NOW + timedelta(seconds=10))
+    state = await broker.refresh(
+        None,
+        shallow,
+        evaluated_at=NOW + timedelta(seconds=10),
+        hedge_observation=hedge,
+    )
     assert state.order.cancellation_reason is CancellationReason.RISEX_ENTRY_DEPTH_UNAVAILABLE
 
-    broker, _, _ = await active_broker()
+    broker, _, hedge = await active_broker()
     fresh = observation(Venue.RISEX, at=NOW + timedelta(seconds=10))
-    state = await broker.refresh(None, fresh, evaluated_at=NOW + timedelta(seconds=10))
+    state = await broker.refresh(
+        None,
+        fresh,
+        evaluated_at=NOW + timedelta(seconds=10),
+        hedge_observation=hedge,
+    )
     assert state.order.cancellation_reason is CancellationReason.ROUTE_INVALID
 
-    broker, _, _ = await active_broker()
+    broker, _, hedge = await active_broker()
     negative = replace(
         broker.state.order.route_plan,
         logical_at=NOW + timedelta(seconds=10),
         planned_maker_net_pnl_usd=D("-1"),
         no_trade_reasons=(NoTradeReason.PLANNED_NET_PNL_NEGATIVE,),
     )
-    state = await broker.refresh(negative, fresh, evaluated_at=NOW + timedelta(seconds=10))
+    zero_risex = observation(Venue.RISEX, at=NOW + timedelta(seconds=10), cash="0")
+    zero_hedge = observation(Venue.EXTENDED, at=NOW + timedelta(seconds=10), cash="0")
+    state = await broker.refresh(
+        negative,
+        zero_risex,
+        evaluated_at=NOW + timedelta(seconds=10),
+        hedge_observation=zero_hedge,
+    )
     assert state.order.cancellation_reason is CancellationReason.PLANNED_NET_NEGATIVE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "initial_maker_price",
+        "refreshed_maker_price",
+        "refreshed_depth",
+        "initial_quantity",
+        "refreshed_quantity",
+    ),
+    (
+        ("126.91", "126.85", "10", D("3.939"), D("3.941")),
+        ("125.20", "125.03", "10", D("3.993"), D("3.999")),
+    ),
+)
+async def test_refresh_uses_locked_quantity_when_scanner_target_drifts(
+    initial_maker_price: str,
+    refreshed_maker_price: str,
+    refreshed_depth: str,
+    initial_quantity: Decimal,
+    refreshed_quantity: Decimal,
+) -> None:
+    initial_risex = fractional_observation(
+        Venue.RISEX, at=NOW, maker_price=initial_maker_price
+    )
+    initial_hedge = fractional_observation(
+        Venue.EXTENDED, at=NOW, maker_price=initial_maker_price
+    )
+    initial_snapshot = await scan_once((initial_risex, initial_hedge), NOW)
+    initial_plan = next(
+        plan
+        for plan in initial_snapshot.evaluations
+        if plan.direction.value == "LONG_RISEX_SHORT_HEDGE"
+    )
+    assert initial_plan.canonical_quantity == initial_quantity
+    assert initial_plan.entry_allowed
+    broker = PaperEntryBroker()
+    await broker.activate(
+        replace(initial_snapshot, winner=initial_plan),
+        attempt_id="locked-drift",
+        activated_at=NOW,
+    )
+    order_before = broker.state.order
+    assert order_before is not None
+    assert order_before.locked_quantity == initial_quantity
+
+    refreshed_at = NOW + timedelta(seconds=10)
+    refreshed_risex = fractional_observation(
+        Venue.RISEX,
+        at=refreshed_at,
+        maker_price=refreshed_maker_price,
+        depth=refreshed_depth,
+    )
+    refreshed_hedge = fractional_observation(
+        Venue.EXTENDED,
+        at=refreshed_at,
+        maker_price=refreshed_maker_price,
+        depth=refreshed_depth,
+    )
+    refreshed_snapshot = await scan_once(
+        (refreshed_risex, refreshed_hedge), refreshed_at
+    )
+    refreshed_plan = next(
+        plan
+        for plan in refreshed_snapshot.evaluations
+        if plan.direction is initial_plan.direction
+    )
+    assert refreshed_plan.canonical_quantity == refreshed_quantity
+    assert refreshed_plan.entry_allowed
+
+    state = await broker.refresh(
+        refreshed_plan,
+        refreshed_risex,
+        evaluated_at=refreshed_at,
+        hedge_observation=refreshed_hedge,
+    )
+
+    order_after = state.order
+    assert state.lifecycle_state is LifecycleState.ENTRY_MAKER_OPEN
+    assert order_after is not None
+    assert order_after.attempt_id == order_before.attempt_id
+    assert order_after.locked_quantity == initial_quantity
+    assert order_after.canonical_quantity == initial_quantity
+    assert order_after.route_plan.canonical_quantity == initial_quantity
+    assert len(order_after.versions) == 2
+    assert order_after.versions[0].status is PaperVersionStatus.REPLACED
+    assert order_after.active_version.cumulative_eligible_quantity == D("0")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("market_field", "value", "scanner_reason"),
+    (
+        ("quantity_step_raw", "2", None),
+        ("minimum_quantity_raw", "6", NoTradeReason.MINIMUM_ORDER),
+        ("minimum_notional_usd", "1000", NoTradeReason.MINIMUM_ORDER),
+    ),
+)
+async def test_refresh_cancels_when_locked_quantity_fails_grid_or_minimum(
+    market_field: str,
+    value: str,
+    scanner_reason: str | None,
+) -> None:
+    broker, _, _ = await active_broker()
+    evaluated_at = NOW + timedelta(seconds=10)
+    fresh_risex = observation(Venue.RISEX, at=evaluated_at)
+    fresh_hedge = observation(Venue.EXTENDED, at=evaluated_at)
+    fresh_hedge = replace(
+        fresh_hedge,
+        market=replace(fresh_hedge.market, **{market_field: D(value)}),
+    )
+    refreshed_snapshot = await scan_once(
+        (fresh_risex, fresh_hedge), evaluated_at
+    )
+    refreshed_plan = next(
+        plan
+        for plan in refreshed_snapshot.evaluations
+        if plan.direction is broker.state.order.route_key.direction
+    )
+    if scanner_reason is None:
+        assert refreshed_plan.entry_allowed
+    else:
+        assert scanner_reason in refreshed_plan.no_trade_reasons
+
+    state = await broker.refresh(
+        refreshed_plan,
+        fresh_risex,
+        evaluated_at=evaluated_at,
+        hedge_observation=fresh_hedge,
+    )
+    assert state.lifecycle_state is LifecycleState.FLAT
+    assert state.order.cancellation_reason is CancellationReason.ROUTE_INVALID
+
+
+@pytest.mark.asyncio
+async def test_refresh_cancels_unknown_locked_funding_economics() -> None:
+    broker, _, _ = await active_broker()
+    evaluated_at = NOW + timedelta(seconds=10)
+    fresh_risex = observation(Venue.RISEX, at=evaluated_at)
+    fresh_hedge = observation(Venue.EXTENDED, at=evaluated_at)
+    assert fresh_hedge.funding is not None
+    fresh_hedge = replace(
+        fresh_hedge,
+        funding=replace(
+            fresh_hedge.funding,
+            eligibility_known=False,
+            long_cash_per_canonical_base_usd=None,
+            short_cash_per_canonical_base_usd=None,
+        ),
+    )
+    refreshed_snapshot = await scan_once(
+        (fresh_risex, fresh_hedge), evaluated_at
+    )
+    refreshed_plan = next(
+        plan
+        for plan in refreshed_snapshot.evaluations
+        if plan.direction is broker.state.order.route_key.direction
+    )
+    assert NoTradeReason.FUNDING_ELIGIBILITY_UNKNOWN in refreshed_plan.no_trade_reasons
+
+    state = await broker.refresh(
+        refreshed_plan,
+        fresh_risex,
+        evaluated_at=evaluated_at,
+        hedge_observation=fresh_hedge,
+    )
+    assert state.lifecycle_state is LifecycleState.FLAT
+    assert state.order.cancellation_reason is CancellationReason.ROUTE_INVALID
+
+
+@pytest.mark.asyncio
+async def test_refresh_cancels_invalid_locked_post_only_quote() -> None:
+    broker, _, _ = await active_broker()
+    evaluated_at = NOW + timedelta(seconds=10)
+    fresh_risex = observation(Venue.RISEX, at=evaluated_at)
+    fresh_hedge = observation(Venue.EXTENDED, at=evaluated_at)
+    assert fresh_hedge.book is not None
+    fresh_hedge = replace(
+        fresh_hedge,
+        book=replace(
+            fresh_hedge.book,
+            bids=(BookLevel(D("101"), D("10")),),
+            asks=(BookLevel(D("100"), D("10")),),
+        ),
+    )
+    refreshed_snapshot = await scan_once(
+        (fresh_risex, fresh_hedge), evaluated_at
+    )
+    refreshed_plan = next(
+        plan
+        for plan in refreshed_snapshot.evaluations
+        if plan.direction is broker.state.order.route_key.direction
+    )
+    assert NoTradeReason.INVALID_BBO in refreshed_plan.no_trade_reasons
+
+    state = await broker.refresh(
+        refreshed_plan,
+        fresh_risex,
+        evaluated_at=evaluated_at,
+        hedge_observation=fresh_hedge,
+    )
+    assert state.lifecycle_state is LifecycleState.FLAT
+    assert state.order.cancellation_reason is CancellationReason.ROUTE_INVALID
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ("direction", "cycle"))
+async def test_refresh_cancels_locked_route_direction_or_cycle_change(
+    mutation: str,
+) -> None:
+    broker, _, _ = await active_broker()
+    evaluated_at = NOW + timedelta(seconds=10)
+    fresh_risex = observation(Venue.RISEX, at=evaluated_at)
+    fresh_hedge = observation(Venue.EXTENDED, at=evaluated_at)
+    refreshed_snapshot = await scan_once(
+        (fresh_risex, fresh_hedge), evaluated_at
+    )
+    direction = broker.state.order.route_key.direction
+    refreshed_plan = next(
+        plan for plan in refreshed_snapshot.evaluations if plan.direction is direction
+    )
+    if mutation == "direction":
+        changed_direction = next(
+            candidate for candidate in RouteDirection if candidate is not direction
+        )
+        refreshed_plan = next(
+            plan
+            for plan in refreshed_snapshot.evaluations
+            if plan.direction is changed_direction
+        )
+    else:
+        assert refreshed_plan.target_cycle is not None
+        refreshed_plan = replace(
+            refreshed_plan,
+            target_cycle=replace(
+                refreshed_plan.target_cycle,
+                cycle_id=f"{refreshed_plan.target_cycle.cycle_id}:changed",
+            ),
+        )
+
+    state = await broker.refresh(
+        refreshed_plan,
+        fresh_risex,
+        evaluated_at=evaluated_at,
+        hedge_observation=fresh_hedge,
+    )
+    assert state.lifecycle_state is LifecycleState.FLAT
+    assert state.order.cancellation_reason is CancellationReason.ROUTE_INVALID
 
 
 @pytest.mark.asyncio

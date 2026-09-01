@@ -561,6 +561,7 @@ def evaluate_route(
     logical_at: datetime,
     *,
     config: PaperConfig = PAPER_CONFIG,
+    canonical_quantity_override: Decimal | None = None,
 ) -> RoutePlan:
     if risex.market.venue is not Venue.RISEX or hedge.market.venue not in {
         Venue.EXTENDED,
@@ -774,11 +775,38 @@ def evaluate_route(
         if direction is RouteDirection.LONG_RISEX_SHORT_HEDGE
         else hedge_sell_maker
     )
-    quantity = sized_canonical_quantity(
-        config.target_notional_per_leg_usd,
-        risex_entry_maker_price if lighter else hedge_entry_maker_price,
-        common_step,
-    )
+    if canonical_quantity_override is None:
+        quantity = sized_canonical_quantity(
+            config.target_notional_per_leg_usd,
+            risex_entry_maker_price if lighter else hedge_entry_maker_price,
+            common_step,
+        )
+    else:
+        if (
+            type(canonical_quantity_override) is not Decimal
+            or not canonical_quantity_override.is_finite()
+            or canonical_quantity_override <= 0
+        ):
+            return _empty_plan(
+                risex,
+                hedge,
+                direction,
+                logical_at,
+                (NoTradeReason.NO_COMMON_EXECUTABLE_QUANTITY,),
+                route=route,
+                config=config,
+            )
+        quantity = canonical_quantity_override
+        if quantity % common_step != 0:
+            return _empty_plan(
+                risex,
+                hedge,
+                direction,
+                logical_at,
+                (NoTradeReason.NO_COMMON_EXECUTABLE_QUANTITY,),
+                route=route,
+                config=config,
+            )
     if quantity <= 0:
         return _empty_plan(
             risex,
@@ -1040,6 +1068,31 @@ def evaluate_route(
         freshness_age_seconds=_freshness_age_seconds(risex, hedge, logical_at),
         synthetic_test_pnl_overlay_usd=config.synthetic_test_pnl_overlay_usd,
         test_adjusted_expected_pnl_usd=adjusted_net,
+    )
+
+
+def evaluate_route_at_quantity(
+    risex: MarketObservation,
+    hedge: MarketObservation,
+    direction: RouteDirection,
+    logical_at: datetime,
+    canonical_quantity: Decimal,
+    *,
+    config: PaperConfig = PAPER_CONFIG,
+) -> RoutePlan:
+    """Evaluate all route gates at an already-selected canonical quantity.
+
+    Paper entry attempts use this narrow variant after activation so a later
+    target-notional optimization cannot silently change the quantity whose
+    depth, grids, minimums, and economics are being checked.
+    """
+    return evaluate_route(
+        risex,
+        hedge,
+        direction,
+        logical_at,
+        config=config,
+        canonical_quantity_override=canonical_quantity,
     )
 
 

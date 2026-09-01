@@ -52,6 +52,7 @@ from .scanner import (
     entry_taker_market,
     entry_taker_price,
     entry_taker_side,
+    evaluate_route_at_quantity,
     is_lighter_route,
     trade_precedes_cutoff,
 )
@@ -140,6 +141,11 @@ class PaperEntryOrder:
     @property
     def active_version(self) -> PaperOrderVersion:
         return self.versions[-1]
+
+    @property
+    def locked_quantity(self) -> Decimal:
+        """The immutable canonical quantity selected when this attempt began."""
+        return self.canonical_quantity
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,6 +289,34 @@ def _observation_is_fresh(
         and now >= health.last_connection_confirmation_at
         and now - health.last_connection_confirmation_at
         <= timedelta(seconds=config.max_market_stream_silence_seconds)
+    )
+
+
+def _quote_for_evaluation_time(
+    quote: FundingCashQuote, evaluated_at: datetime
+) -> FundingCashQuote:
+    """Match scanner open-time normalization without changing source evidence."""
+    if quote.assumed_or_actual_position_opened_at == evaluated_at:
+        return quote
+    if quote.eligibility_known and evaluated_at >= quote.settlement_at:
+        return replace(
+            quote,
+            assumed_or_actual_position_opened_at=evaluated_at,
+            long_cash_per_canonical_base_usd=Decimal("0"),
+            short_cash_per_canonical_base_usd=Decimal("0"),
+        )
+    return replace(quote, assumed_or_actual_position_opened_at=evaluated_at)
+
+
+def _observation_for_evaluation_time(
+    observation: MarketObservation, evaluated_at: datetime
+) -> MarketObservation:
+    funding = observation.funding
+    if funding is None:
+        return observation
+    return replace(
+        observation,
+        funding=_quote_for_evaluation_time(funding, evaluated_at),
     )
 
 
@@ -475,6 +509,117 @@ def _recomputed_cycle_and_cash(
     return cycle, risex_expected + hedge_expected
 
 
+def _route_identity_matches(
+    plan: RoutePlan, route_key: LockedRouteKey
+) -> bool:
+    route = plan.route
+    return (
+        plan.canonical_asset == route_key.canonical_asset
+        and plan.risex_market.venue_symbol == route_key.risex_market
+        and plan.hedge_venue is route_key.hedge_venue
+        and plan.hedge_market.venue_symbol == route_key.hedge_market
+        and plan.direction is route_key.direction
+        and (
+            route is None
+            or (
+                route.canonical_asset == route_key.canonical_asset
+                and route.risex_market.venue_symbol == route_key.risex_market
+                and route.hedge_venue is route_key.hedge_venue
+                and route.hedge_market.venue_symbol == route_key.hedge_market
+                and route.direction is route_key.direction
+            )
+        )
+    )
+
+
+def _entry_depth_cancellation_reason(
+    order: PaperEntryOrder,
+    risex_observation: MarketObservation,
+    hedge_observation: MarketObservation,
+) -> CancellationReason:
+    taker_observation = (
+        hedge_observation
+        if is_lighter_route(order.route_key.hedge_venue)
+        else risex_observation
+    )
+    unavailable = (
+        _exact_vwap(
+            taker_observation,
+            entry_taker_side(order.route_plan),
+            order.locked_quantity,
+        )
+        is None
+    )
+    if not unavailable:
+        return CancellationReason.ROUTE_INVALID
+    return (
+        CancellationReason.LIGHTER_ENTRY_DEPTH_UNAVAILABLE
+        if is_lighter_route(order.route_key.hedge_venue)
+        else CancellationReason.RISEX_ENTRY_DEPTH_UNAVAILABLE
+    )
+
+
+def _evaluate_locked_route(
+    order: PaperEntryOrder,
+    risex_observation: MarketObservation,
+    hedge_observation: MarketObservation | None,
+    evaluated_at: datetime,
+    config: PaperConfig,
+) -> RoutePlan | None:
+    if hedge_observation is None:
+        return None
+    risex = _observation_for_evaluation_time(risex_observation, evaluated_at)
+    hedge = _observation_for_evaluation_time(hedge_observation, evaluated_at)
+    try:
+        return evaluate_route_at_quantity(
+            risex,
+            hedge,
+            order.route_key.direction,
+            evaluated_at,
+            order.locked_quantity,
+            config=config,
+        )
+    except (ArithmeticError, TypeError, ValueError):
+        return None
+
+
+def _locked_plan_cancellation_reason(
+    order: PaperEntryOrder,
+    plan: RoutePlan,
+    risex_observation: MarketObservation,
+    hedge_observation: MarketObservation,
+) -> CancellationReason | None:
+    reasons = set(plan.no_trade_reasons)
+    if reasons.intersection(
+        {
+            NoTradeReason.BOOK_UNHEALTHY,
+            NoTradeReason.FUNDING_STALE,
+            NoTradeReason.TRADE_STREAM_UNHEALTHY,
+            NoTradeReason.FUNDING_STREAM_UNHEALTHY,
+        }
+    ):
+        return CancellationReason.DATA_STALE
+    if NoTradeReason.INSUFFICIENT_EXACT_DEPTH in reasons:
+        return _entry_depth_cancellation_reason(
+            order, risex_observation, hedge_observation
+        )
+    if any(reason != NoTradeReason.PLANNED_NET_PNL_NEGATIVE for reason in reasons):
+        return CancellationReason.ROUTE_INVALID
+    if (
+        NoTradeReason.PLANNED_NET_PNL_NEGATIVE in reasons
+        or plan.test_adjusted_expected_pnl_usd is None
+    ):
+        return CancellationReason.PLANNED_NET_NEGATIVE
+    if (
+        plan.canonical_quantity != order.locked_quantity
+        or plan.target_cycle is None
+        or entry_maker_price(plan) is None
+        or not plan.entry_allowed
+    ):
+        return CancellationReason.ROUTE_INVALID
+    return None
+
+
 class PaperEntryBroker:
     """Serializes paper entry evidence and exposes only complete state transitions."""
 
@@ -640,63 +785,62 @@ class PaperEntryBroker:
             order = self._require_open_order()
             if evaluated_at >= order.cutoff_at:
                 return self._cancel_locked(CancellationReason.CUTOFF, evaluated_at)
-            stale_reasons = {
-                NoTradeReason.BOOK_UNHEALTHY,
-                NoTradeReason.FUNDING_STALE,
-            }
-            if (
-                refreshed_plan is not None
-                and stale_reasons.intersection(refreshed_plan.no_trade_reasons)
-            ) or not _observation_is_fresh(
+            if not _observation_is_fresh(
                 risex_observation, evaluated_at, self.config
+            ) or hedge_observation is None or not _observation_is_fresh(
+                hedge_observation, evaluated_at, self.config
             ):
                 return self._cancel_locked(CancellationReason.DATA_STALE, evaluated_at)
-            if is_lighter_route(order.route_plan.hedge_venue):
-                taker_observation = hedge_observation
-                if taker_observation is None or not _observation_is_fresh(
-                    taker_observation, evaluated_at, self.config
-                ):
-                    return self._cancel_locked(
-                        CancellationReason.DATA_STALE, evaluated_at
-                    )
-                taker_side = entry_taker_side(order.route_plan)
-                depth_unavailable = (
-                    taker_observation is None
-                    or _exact_vwap(
-                        taker_observation, taker_side, order.canonical_quantity
-                    ) is None
+            taker_observation = (
+                hedge_observation
+                if is_lighter_route(order.route_key.hedge_venue)
+                else risex_observation
+            )
+            if (
+                _exact_vwap(
+                    taker_observation,
+                    entry_taker_side(order.route_plan),
+                    order.locked_quantity,
                 )
-                depth_reason = CancellationReason.LIGHTER_ENTRY_DEPTH_UNAVAILABLE
-            else:
-                risex_side, _ = _entry_sides(order.route_plan.direction)
-                depth_unavailable = _exact_vwap(
-                    risex_observation, risex_side, order.canonical_quantity
-                ) is None
-                depth_reason = CancellationReason.RISEX_ENTRY_DEPTH_UNAVAILABLE
-            if depth_unavailable:
+                is None
+            ):
                 return self._cancel_locked(
-                    depth_reason,
+                    _entry_depth_cancellation_reason(
+                        order, risex_observation, hedge_observation
+                    ),
                     evaluated_at,
                 )
-            if (
-                refreshed_plan is None
-                or refreshed_plan.target_cycle is None
-                or _route_key(refreshed_plan) != order.route_key
-                or refreshed_plan.canonical_quantity != order.canonical_quantity
-                or entry_maker_price(refreshed_plan) is None
-                or any(
-                    reason != NoTradeReason.PLANNED_NET_PNL_NEGATIVE
-                    for reason in refreshed_plan.no_trade_reasons
-                )
+            if refreshed_plan is None or not _route_identity_matches(
+                refreshed_plan, order.route_key
             ):
                 return self._cancel_locked(CancellationReason.ROUTE_INVALID, evaluated_at)
             if (
-                refreshed_plan.test_adjusted_expected_pnl_usd is None
-                or refreshed_plan.test_adjusted_expected_pnl_usd
-                < self.config.paper_entry_min_planned_net_pnl_usd
+                refreshed_plan.target_cycle is not None
+                and _route_key(refreshed_plan) != order.route_key
             ):
+                return self._cancel_locked(CancellationReason.ROUTE_INVALID, evaluated_at)
+            locked_plan = _evaluate_locked_route(
+                order,
+                risex_observation,
+                hedge_observation,
+                evaluated_at,
+                self.config,
+            )
+            if (
+                locked_plan is None
+                or not _route_identity_matches(locked_plan, order.route_key)
+                or (
+                    locked_plan.target_cycle is not None
+                    and _route_key(locked_plan) != order.route_key
+                )
+            ):
+                return self._cancel_locked(CancellationReason.ROUTE_INVALID, evaluated_at)
+            cancellation_reason = _locked_plan_cancellation_reason(
+                order, locked_plan, risex_observation, hedge_observation
+            )
+            if cancellation_reason is not None:
                 return self._cancel_locked(
-                    CancellationReason.PLANNED_NET_NEGATIVE, evaluated_at
+                    cancellation_reason, evaluated_at
                 )
 
             current = order.active_version
@@ -705,13 +849,13 @@ class PaperEntryBroker:
                 < timedelta(seconds=self.config.entry_order_reprice_seconds)
             ):
                 return self._state
-            refreshed_maker_price = entry_maker_price(refreshed_plan)
+            refreshed_maker_price = entry_maker_price(locked_plan)
             assert refreshed_maker_price is not None
             if refreshed_maker_price == current.limit_price:
                 checked = replace(current, last_checked_at=evaluated_at)
                 order = replace(
                     order,
-                    route_plan=refreshed_plan,
+                    route_plan=locked_plan,
                     versions=order.versions[:-1] + (checked,),
                 )
             else:
@@ -733,7 +877,7 @@ class PaperEntryBroker:
                 )
                 order = replace(
                     order,
-                    route_plan=refreshed_plan,
+                    route_plan=locked_plan,
                     versions=order.versions[:-1] + (closed, replacement),
                 )
             self._state = replace(self._state, order=order)
@@ -811,7 +955,7 @@ class PaperEntryBroker:
             ) + (trade,)
             self._qualifying_trades[current.version_id] = qualifying_trades
             cumulative = current.cumulative_eligible_quantity + trade.canonical_quantity
-            if cumulative < order.canonical_quantity:
+            if cumulative < order.locked_quantity:
                 current = replace(
                     current, cumulative_eligible_quantity=cumulative,
                 )
@@ -837,7 +981,7 @@ class PaperEntryBroker:
             )
             taker_side = entry_taker_side(order.route_plan)
             taker_proof = _taker_provenance(
-                taker_capture, taker_side, order.canonical_quantity,
+                taker_capture, taker_side, order.locked_quantity,
                 venue=taker_market.venue,
                 canonical_market=taker_market.venue_symbol,
                 config=self.config,
@@ -860,7 +1004,7 @@ class PaperEntryBroker:
                 self.config,
                 maker_market,
                 LiquidityRole.MAKER,
-                order.canonical_quantity,
+                order.locked_quantity,
                 current.limit_price,
                 trade.exchange_timestamp,
             )
@@ -868,7 +1012,7 @@ class PaperEntryBroker:
                 self.config,
                 taker_market,
                 LiquidityRole.TAKER,
-                order.canonical_quantity,
+                order.locked_quantity,
                 taker_entry_price,
                 processed_at,
             )
@@ -876,7 +1020,7 @@ class PaperEntryBroker:
                 order.venue,
                 order.canonical_market,
                 order.side,
-                order.canonical_quantity,
+                order.locked_quantity,
                 current.limit_price,
                 trade.exchange_timestamp,
                 trade.received_at,
@@ -886,7 +1030,7 @@ class PaperEntryBroker:
                 taker_market.venue,
                 taker_market.venue_symbol,
                 taker_side,
-                order.canonical_quantity,
+                order.locked_quantity,
                 taker_entry_price,
                 processed_at,
                 processed_at,
@@ -903,7 +1047,7 @@ class PaperEntryBroker:
             )
             filled_version = replace(
                 current,
-                cumulative_eligible_quantity=order.canonical_quantity,
+                cumulative_eligible_quantity=order.locked_quantity,
                 status=PaperVersionStatus.FILLED,
                 closed_at=processed_at,
             )
@@ -948,7 +1092,7 @@ class PaperEntryBroker:
         hedge_observation: MarketObservation,
         opened_at: datetime,
     ) -> tuple[PaperPosition, LifecycleState]:
-        quantity = order.canonical_quantity
+        quantity = order.locked_quantity
         plan = order.route_plan
         risex_entry_fill = (
             maker_fill if maker_fill.venue is Venue.RISEX else taker_fill
