@@ -633,6 +633,9 @@ class PublicPaperRuntime:
         self._book_revisions: dict[tuple[Venue, str], int] = {}
         self._book_recovery_generations: dict[tuple[Venue, str], int] = {}
         self._book_checksums: dict[tuple[Venue, str], int | None] = {}
+        self._risex_ws_book_sessions: dict[
+            tuple[Venue, str], StreamSessionId
+        ] = {}
         self._combined_symbols: dict[Venue, tuple[str, ...]] = {}
         self.next_health_check_at: datetime | None = None
         self.focused_cycle: TargetFundingCycle | None = None
@@ -685,6 +688,16 @@ class PublicPaperRuntime:
             and key[2] == "book"
         ):
             self._extended_book_sequence_state.pop(previous, None)
+        if (
+            previous is not None
+            and key[0] is Venue.RISEX
+            and key[1] == "*"
+            and key[2] == "combined"
+        ):
+            for book_key, owner in tuple(self._risex_ws_book_sessions.items()):
+                if owner == previous:
+                    self._risex_ws_book_sessions.pop(book_key, None)
+                    self._live_book_ready.discard(book_key)
         self._stream_session_number += 1
         session_id = StreamSessionId(self._stream_session_number)
         self._stream_sessions[key] = session_id
@@ -763,8 +776,10 @@ class PublicPaperRuntime:
         if key[0] is not Venue.RISEX:
             return None
         stream_key = self._book_stream_key(*key)
+        current_session = self._stream_sessions.get(stream_key)
         if (
-            self._stream_sessions.get(stream_key) is None
+            current_session is None
+            or self._risex_ws_book_sessions.get(key) != current_session
             or key not in self._live_book_ready
         ):
             return None
@@ -2163,7 +2178,11 @@ class PublicPaperRuntime:
             preserve_stream_book = (
                 lighter_stream_book is not None
                 if isinstance(adapter, LighterAdapter)
-                else healthy_live or risex_owned_ws_book is not None
+                else (
+                    risex_owned_ws_book is not None
+                    if isinstance(adapter, RisexAdapter)
+                    else healthy_live
+                )
             )
             if (
                 isinstance(adapter, ExtendedAdapter)
@@ -2182,15 +2201,8 @@ class PublicPaperRuntime:
             if isinstance(adapter, RisexAdapter):
                 # The immutable contract becomes eligible only after both public
                 # book and recent-trade unit evidence are proven in this scan.
-                if (
-                    risex_owned_ws_book is not None
-                    or (healthy_live and existing is not None)
-                ):
-                    book = (
-                        risex_owned_ws_book
-                        if risex_owned_ws_book is not None
-                        else self.coordinator.stream(*key).book()
-                    )
+                if risex_owned_ws_book is not None:
+                    book = risex_owned_ws_book
                     if existing is not None:
                         market = existing.market
                 else:
@@ -4228,6 +4240,8 @@ class PublicPaperRuntime:
             self._trade_stream_ready.discard((venue, symbol))
         if invalidates_book:
             self._live_book_ready.discard((venue, symbol))
+            if venue is Venue.RISEX:
+                self._risex_ws_book_sessions.pop((venue, symbol), None)
             self.coordinator.stream(venue, symbol).disconnected()
         exception_name = "StreamGap" if exception is None else type(exception).__name__
         exception_detail = "" if exception is None else f":{str(exception)[:120]}"
@@ -4749,7 +4763,12 @@ class PublicPaperRuntime:
             )
 
     async def _recover_snapshot_locked(
-        self, book: OrderBook, *, at: datetime, websocket: bool = False
+        self,
+        book: OrderBook,
+        *,
+        at: datetime,
+        websocket: bool = False,
+        stream_session_id: StreamSessionId | None = None,
     ) -> bool:
         if (
             book.venue is Venue.EXTENDED
@@ -4771,7 +4790,15 @@ class PublicPaperRuntime:
             (book.venue, book.canonical_market),
             checksum=(stream.risex_checksum() if book.venue is Venue.RISEX else None),
         )
-        self._live_book_ready.add((book.venue, book.canonical_market))
+        key = (book.venue, book.canonical_market)
+        ws_book_owned = (
+            book.venue is not Venue.RISEX
+            or (websocket and stream_session_id is not None)
+        )
+        if ws_book_owned:
+            self._live_book_ready.add(key)
+            if book.venue is Venue.RISEX and stream_session_id is not None:
+                self._risex_ws_book_sessions[key] = stream_session_id
         self._set_component_readiness(
             book.venue, f"book:{book.canonical_market}", True,
             "PUBLIC_STREAM_RECOVERED", now,
@@ -5043,6 +5070,10 @@ class PublicPaperRuntime:
                 checksum=(stream.risex_checksum() if venue is Venue.RISEX else None),
             )
             self._live_book_ready.add(key)
+            if venue is Venue.RISEX:
+                self._risex_ws_book_sessions[key] = (
+                    episode.owned_stream_session_id
+                )
             self.component_readiness[venue] = dict(candidate.components)
             self.readiness[venue] = candidate.venue_readiness
             if candidate.observation is not None:
@@ -5077,6 +5108,7 @@ class PublicPaperRuntime:
         event: OrderBook | BookDelta,
         *,
         stream_session_id: StreamSessionId,
+        websocket: bool = True,
     ) -> bool:
         if self._shutdown_started:
             return False
@@ -5161,7 +5193,10 @@ class PublicPaperRuntime:
                     ):
                         return False
                     await self._recover_snapshot_locked(
-                        event, at=now, websocket=True
+                        event,
+                        at=now,
+                        websocket=websocket,
+                        stream_session_id=stream_session_id,
                     )
                     return self._owns_stream_session(
                         stream_key, stream_session_id
@@ -5285,6 +5320,17 @@ class PublicPaperRuntime:
                 )
                 return False
         else:
+            if (
+                event.venue is Venue.RISEX
+                and self._risex_ws_book_sessions.get(key) != stream_session_id
+            ):
+                await self.mark_disconnected(
+                    event.venue, event.canonical_market, at=now,
+                    stream_kind="book",
+                    exception=ValueError("RISEx WS snapshot not established"),
+                    stream_session_id=stream_session_id,
+                )
+                return False
             healthy = stream.apply_delta(event)
         if not healthy:
             await self.mark_disconnected(
@@ -5307,6 +5353,8 @@ class PublicPaperRuntime:
         else:
             self._bump_book_revision(key, checksum=event.checksum)
             self._live_book_ready.add(key)
+            if event.venue is Venue.RISEX:
+                self._risex_ws_book_sessions[key] = stream_session_id
             if self.lifecycle is not None:
                 await self._evaluate_relevant_book_event(key, now)
         return True
@@ -6716,9 +6764,21 @@ class PublicPaperRuntime:
                                 task_key, stream_session_id
                             ):
                                 return
-                            book_ready = await self.apply_book_event(
-                                snapshot, stream_session_id=stream_session_id
-                            )
+                            if venue is Venue.RISEX:
+                                # REST supplies a paper fallback only.  Its
+                                # unordered snapshot cannot own the RISEx
+                                # checksum sequence before the WS snapshot.
+                                await self.apply_book_event(
+                                    snapshot,
+                                    stream_session_id=stream_session_id,
+                                    websocket=False,
+                                )
+                                book_ready = False
+                            else:
+                                book_ready = await self.apply_book_event(
+                                    snapshot,
+                                    stream_session_id=stream_session_id
+                                )
                         if book_ready:
                             if venue is Venue.LIGHTER:
                                 components = (
