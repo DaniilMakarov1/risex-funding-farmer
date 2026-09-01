@@ -10432,6 +10432,134 @@ async def test_stabilization002_queued_nado_funding_is_cancelled_on_real_replace
 
 
 @pytest.mark.asyncio
+async def test_no_session_settlement_delivery_keeps_live_lifecycle_path(
+    tmp_path, monkeypatch
+):
+    clock = FakeClock()
+    with PaperRepository(tmp_path / "no-session-settlement.db") as repository:
+        runtime = await _stabilization002_position_runtime(repository, clock)
+        lifecycle = runtime.lifecycle
+        assert lifecycle is not None
+        before_snapshot = lifecycle.snapshot
+        pending = next(
+            row for row in before_snapshot.settlements
+            if row.venue is Venue.EXTENDED
+        )
+        applied = replace(
+            pending, status=SettlementStatus.APPLIED_RATE, cash_usd=D("1.25")
+        )
+        live_calls = []
+        original_reconcile = lifecycle.reconcile_settlement
+
+        async def live_reconcile(update):
+            live_calls.append(lifecycle)
+            return await original_reconcile(update)
+
+        monkeypatch.setattr(lifecycle, "reconcile_settlement", live_reconcile)
+        monkeypatch.setattr(
+            lifecycle,
+            "detached",
+            lambda: pytest.fail("no-session delivery must not detach"),
+        )
+        notifications = []
+        monkeypatch.setattr(
+            runtime,
+            "_notify_settlement_transition",
+            lambda *args: notifications.append(args),
+        )
+        await runtime.deliver_settlement(applied)
+        persisted = repository.load_runtime()
+
+    assert live_calls == [lifecycle]
+    assert lifecycle.snapshot is not before_snapshot
+    assert next(
+        row for row in lifecycle.snapshot.settlements
+        if row.key == pending.key
+    ) == applied
+    assert persisted is not None
+    assert next(
+        row for row in persisted.settlements
+        if row.key == pending.key
+    ) == applied
+    assert len(notifications) == 1
+
+
+@pytest.mark.asyncio
+async def test_extended_aggregate_funding_reconciliation_is_inert_after_replacement(
+    tmp_path, monkeypatch
+):
+    clock = FakeClock()
+    with PaperRepository(
+        tmp_path / "extended-aggregate-funding-replacement.db"
+    ) as repository:
+        runtime = await _stabilization002_position_runtime(repository, clock)
+        lifecycle = runtime.lifecycle
+        assert lifecycle is not None
+        before_snapshot = lifecycle.snapshot
+        persisted_before = repository.load_runtime()
+        pending = next(
+            row for row in before_snapshot.settlements
+            if row.venue is Venue.EXTENDED
+        )
+        applied = replace(
+            pending, status=SettlementStatus.APPLIED_RATE, cash_usd=D("1.25")
+        )
+        session_key = (Venue.EXTENDED, "*", "funding")
+        session_id = runtime._new_stream_session(session_key)
+        staged = lifecycle.detached()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        original_reconcile = staged.reconcile_settlement
+
+        async def gated_reconcile(update):
+            entered.set()
+            await release.wait()
+            return await original_reconcile(update)
+
+        staged.reconcile_settlement = gated_reconcile
+        monkeypatch.setattr(lifecycle, "detached", lambda: staged)
+        notifications = []
+        monkeypatch.setattr(
+            runtime,
+            "_notify_settlement_transition",
+            lambda *args: notifications.append(args),
+        )
+        delivery = asyncio.create_task(
+            runtime.deliver_settlement(
+                applied, stream_session_id=session_id
+            )
+        )
+        await entered.wait()
+        assert lifecycle.snapshot is before_snapshot
+        assert repository.load_runtime() == persisted_before
+        persisted_rows_before = tuple(
+            tuple(row) for row in repository.connection.execute(
+                "SELECT venue,canonical_market,settlement_at,status,cash_usd "
+                "FROM funding_settlements ORDER BY venue,canonical_market,settlement_at"
+            )
+        )
+
+        replacement_session = runtime._new_stream_session(session_key)
+        assert replacement_session != session_id
+        release.set()
+        await delivery
+        persisted_after = repository.load_runtime()
+        persisted_rows_after = tuple(
+            tuple(row) for row in repository.connection.execute(
+                "SELECT venue,canonical_market,settlement_at,status,cash_usd "
+                "FROM funding_settlements ORDER BY venue,canonical_market,settlement_at"
+            )
+        )
+
+    assert staged.snapshot != before_snapshot
+    assert runtime.lifecycle is lifecycle
+    assert lifecycle.snapshot is before_snapshot
+    assert persisted_after == persisted_before
+    assert persisted_rows_after == persisted_rows_before
+    assert notifications == []
+
+
+@pytest.mark.asyncio
 async def test_stabilization002_queued_risex_trade_dispatch_is_cancelled_on_replacement(
     tmp_path,
 ):
@@ -10983,9 +11111,21 @@ async def test_extended_aggregate_valid_content_failure_is_market_local(
             (BookLevel(D("101"), D("2")),), clock.now(), sequence,
         )
 
+    class NoRestExtendedAdapter(ExtendedAdapter):
+        def __init__(self) -> None:
+            super().__init__(None)
+            self.fetch_book_calls = 0
+
+        async def fetch_book(self, venue_symbol: str) -> OrderBook:
+            self.fetch_book_calls += 1
+            raise AssertionError(
+                f"aggregate recovery attempted REST for {venue_symbol}"
+            )
+
+    adapter = NoRestExtendedAdapter()
     with PaperRepository(tmp_path / "extended-aggregate-content-failure.db") as repository:
         runtime = PublicPaperRuntime(
-            repository, adapters={Venue.EXTENDED: ExtendedAdapter(None)},
+            repository, adapters={Venue.EXTENDED: adapter},
             clock=clock,
         )
         runtime._extended_stream_symbols = tuple(
@@ -11019,6 +11159,10 @@ async def test_extended_aggregate_valid_content_failure_is_market_local(
         assert runtime._recoveries[
             Venue.EXTENDED, markets[0].venue_symbol
         ].terminal is None
+        failed = runtime._recoveries[
+            Venue.EXTENDED, markets[0].venue_symbol
+        ]
+        assert failed.task is None
         assert await runtime.apply_book_event(
             BookDelta(
                 Venue.EXTENDED, markets[1].venue_symbol,
@@ -11030,10 +11174,63 @@ async def test_extended_aggregate_valid_content_failure_is_market_local(
         assert runtime.coordinator.stream(
             Venue.EXTENDED, markets[1].venue_symbol
         ).book().sequence == 4
+
+        # Aggregate-local recovery is WS-only.  Neither the direct REST
+        # entrypoint nor a background REST attempt may restore A while this
+        # physical aggregate session remains owned.
+        assert not await runtime.recover_snapshot(
+            snapshot(markets[0].venue_symbol, 5)
+        )
+        await runtime._recover_snapshot_in_background(
+            Venue.EXTENDED, markets[0].venue_symbol, failed
+        )
+        assert not await runtime._publish_recovery_snapshot(
+            (Venue.EXTENDED, markets[0].venue_symbol),
+            failed,
+            failed.attempt_generation,
+            snapshot(markets[0].venue_symbol, 5),
+            at=clock.now(),
+            buffered=0,
+            replayed=0,
+            source="REST_SNAPSHOT",
+        )
+        assert adapter.fetch_book_calls == 0
+        assert runtime.coordinator.stream(
+            Venue.EXTENDED, markets[0].venue_symbol
+        ).book() is None
+        assert runtime.coordinator.stream(
+            Venue.EXTENDED, markets[1].venue_symbol
+        ).book().sequence == 4
+
+        # The next contiguous owned WS snapshot restores only the failed
+        # market.  A displaced old session cannot mutate either market.
         assert await runtime.apply_book_event(
             snapshot(markets[0].venue_symbol, 5),
             stream_session_id=session_id,
         )
+        assert runtime.coordinator.stream(
+            Venue.EXTENDED, markets[0].venue_symbol
+        ).book().sequence == 5
+        assert runtime.coordinator.stream(
+            Venue.EXTENDED, markets[1].venue_symbol
+        ).book().sequence == 4
+        replacement_session = runtime._new_stream_session(book_key)
+        assert not await runtime.apply_book_event(
+            BookDelta(
+                Venue.EXTENDED, markets[0].venue_symbol,
+                (BookLevel(D("99"), D("4")),), (),
+                clock.now(), 6,
+            ),
+            stream_session_id=session_id,
+        )
+        assert not await runtime.apply_book_event(
+            snapshot(markets[0].venue_symbol, 100),
+            stream_session_id=session_id,
+        )
+        assert replacement_session != session_id
+        assert runtime.coordinator.stream(
+            Venue.EXTENDED, markets[0].venue_symbol
+        ).book().sequence == 5
 
 
 @pytest.mark.asyncio

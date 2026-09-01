@@ -3656,40 +3656,89 @@ class PublicPaperRuntime:
         *,
         stream_session_id: StreamSessionId | None = None,
     ) -> None:
-        if (
-            stream_session_id is not None
-            and (
-                settlement.venue is not Venue.EXTENDED
-                or not self._extended_stream_owns(
-                    settlement.canonical_market, "funding", stream_session_id
+        if stream_session_id is None:
+            self.repository.upsert_settlement(settlement)
+            if self.lifecycle is not None and settlement.key in {
+                row.key for row in self.lifecycle.snapshot.settlements
+            }:
+                before = next(
+                    row for row in self.lifecycle.snapshot.settlements
+                    if row.key == settlement.key
                 )
-            )
+                await self.lifecycle.reconcile_settlement(settlement)
+                self.repository.save_decision(
+                    recorded_at=self.clock.now(), lifecycle_snapshot=self.lifecycle.snapshot
+                )
+                after = next(
+                    row for row in self.lifecycle.snapshot.settlements
+                    if row.key == settlement.key
+                )
+                self._notify_settlement_transition(before, after, self.clock.now())
+            return
+
+        session_key = self._extended_aggregate_key("funding")
+        if (
+            settlement.venue is not Venue.EXTENDED
+            or not self._owns_stream_session(session_key, stream_session_id)
         ):
             return
-        self.repository.upsert_settlement(settlement)
-        if self.lifecycle is not None and settlement.key in {
-            row.key for row in self.lifecycle.snapshot.settlements
-        }:
-            before = next(
-                row for row in self.lifecycle.snapshot.settlements
-                if row.key == settlement.key
-            )
-            await self.lifecycle.reconcile_settlement(settlement)
+        lifecycle = self.lifecycle
+        before_snapshot = None if lifecycle is None else lifecycle.snapshot
+        required = (
+            set() if before_snapshot is None
+            else {row.key for row in before_snapshot.settlements}
+        )
+        if lifecycle is None or settlement.key not in required:
+            async with self._position_event_lock:
+                if (
+                    not self._owns_stream_session(session_key, stream_session_id)
+                ):
+                    return
+                if (
+                    self.lifecycle is not lifecycle
+                    or (
+                        lifecycle is not None
+                        and lifecycle.snapshot is not before_snapshot
+                    )
+                ):
+                    return
+                self.repository.upsert_settlement(settlement)
+            return
+
+        before = next(
+            row for row in before_snapshot.settlements
+            if row.key == settlement.key
+        )
+        # Reconcile a detached candidate.  The live lifecycle must not be
+        # changed until the stream/session and snapshot ownership checks pass.
+        candidate = lifecycle.detached()
+        await candidate.reconcile_settlement(settlement)
+        notification: tuple[
+            FundingSettlement, FundingSettlement, datetime
+        ] | None = None
+        async with self._position_event_lock:
+            if not self._owns_stream_session(session_key, stream_session_id):
+                return
             if (
-                stream_session_id is not None
-                and not self._extended_stream_owns(
-                    settlement.canonical_market, "funding", stream_session_id
-                )
+                self.lifecycle is not lifecycle
+                or lifecycle.snapshot is not before_snapshot
             ):
                 return
+            if candidate.snapshot == before_snapshot:
+                self.repository.upsert_settlement(settlement)
+                return
+            commit_at = self.clock.now()
             self.repository.save_decision(
-                recorded_at=self.clock.now(), lifecycle_snapshot=self.lifecycle.snapshot
+                recorded_at=commit_at, lifecycle_snapshot=candidate.snapshot
             )
+            lifecycle.publish_candidate(candidate)
             after = next(
-                row for row in self.lifecycle.snapshot.settlements
+                row for row in candidate.snapshot.settlements
                 if row.key == settlement.key
             )
-            self._notify_settlement_transition(before, after, self.clock.now())
+            notification = (before, after, commit_at)
+        if notification is not None:
+            self._notify_settlement_transition(*notification)
 
     def _notify_settlement_transition(
         self,
@@ -4637,6 +4686,18 @@ class PublicPaperRuntime:
         source: str,
     ) -> bool:
         venue, symbol = key
+        if (
+            venue is Venue.EXTENDED
+            and source == "REST_SNAPSHOT"
+            and self._extended_aggregate_active("book")
+        ):
+            self._record(
+                "PUBLIC_REST_SNAPSHOT_IGNORED_FOR_WS_RESYNC",
+                at=at,
+                venue=venue,
+                detail={"symbol": symbol, "source": source},
+            )
+            return False
         expected_buffer = tuple(episode.buffer)
         projected_stream = BookStream(venue, symbol)
         projected_stream.connected(at)
@@ -4890,7 +4951,9 @@ class PublicPaperRuntime:
         if episode is not None and episode.terminal == "FAILED":
             return False
         required_session = (
-            episode.owned_stream_session_id
+            self._stream_sessions.get(stream_key)
+            if event.venue is Venue.EXTENDED and stream_key[1] == "*"
+            else episode.owned_stream_session_id
             if active else self._stream_sessions.get(stream_key)
         )
         if required_session != stream_session_id:
@@ -5209,6 +5272,36 @@ class PublicPaperRuntime:
             replaced.append(symbol)
         return tuple(replaced)
 
+    def _replace_displaced_extended_aggregate_recoveries(
+        self,
+        symbols: tuple[str, ...],
+        stream_session_id: StreamSessionId,
+    ) -> None:
+        """Give a fresh aggregate book session ownership of stale recovery."""
+        for symbol in symbols:
+            key = (Venue.EXTENDED, symbol)
+            stream = self.coordinator.stream(*key)
+            current = self._recoveries.get(key)
+            book_present = stream.book() is not None
+            if current is None and not book_present:
+                continue
+            if (
+                current is not None
+                and current.terminal is None
+                and current.owned_stream_session_id == stream_session_id
+            ):
+                continue
+            if (
+                current is not None
+                and current.terminal == "COMPLETE"
+                and not book_present
+            ):
+                continue
+            if current is not None:
+                self._retire_recovery_task(current.task)
+            episode = self._new_recovery_episode(key, stream_session_id)
+            self._record_recovery_started(key, episode)
+
     def _record_recovery_started(
         self, key: tuple[Venue, str], episode: RecoveryEpisode
     ) -> None:
@@ -5264,7 +5357,7 @@ class PublicPaperRuntime:
             self._spawn_recovery_task(
                 key, episode, self._restart_extended_book_stream(symbol, episode)
             )
-        elif venue is not Venue.LIGHTER:
+        elif venue is not Venue.LIGHTER and not aggregate:
             self._spawn_recovery_task(
                 key, episode, self._recover_snapshot_in_background(venue, symbol, episode)
             )
@@ -5649,14 +5742,36 @@ class PublicPaperRuntime:
         generation = episode.attempt_generation
         for attempt in range(1, 4):
             try:
+                if (
+                    venue is Venue.EXTENDED
+                    and self._extended_aggregate_active("book")
+                ):
+                    return
                 if not self._owns_recovery(key, episode, generation):
                     return
                 episode.attempts = attempt
+
+                async def fetch_snapshot() -> OrderBook | None:
+                    # Recheck after waiting for the per-venue REST slot so a
+                    # queued fallback cannot begin once aggregate ownership
+                    # has taken over the book.
+                    if (
+                        venue is Venue.EXTENDED
+                        and self._extended_aggregate_active("book")
+                    ):
+                        return None
+                    return await self.adapters[venue].fetch_book(symbol)
+
                 snapshot = await self._public_call(
                     venue,
-                    lambda: self.adapters[venue].fetch_book(symbol),
+                    fetch_snapshot,
                 )
-                if not self._owns_recovery(key, episode, generation):
+                if snapshot is None:
+                    return
+                if (
+                    venue is Venue.EXTENDED
+                    and self._extended_aggregate_active("book")
+                ) or not self._owns_recovery(key, episode, generation):
                     return
                 recovered, buffered, replayed = self._build_recovery_book(
                     snapshot, episode
@@ -5673,6 +5788,11 @@ class PublicPaperRuntime:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                if (
+                    venue is Venue.EXTENDED
+                    and self._extended_aggregate_active("book")
+                ):
+                    return
                 if not self._owns_recovery(key, episode, generation):
                     return
                 self._set_component_readiness(
@@ -5757,7 +5877,11 @@ class PublicPaperRuntime:
                     session_established = True
                     connected_at = self.clock.now()
                     if kind == "book":
-                        for symbol in self._extended_stream_symbols_now():
+                        symbols_now = self._extended_stream_symbols_now()
+                        self._replace_displaced_extended_aggregate_recoveries(
+                            symbols_now, stream_session_id
+                        )
+                        for symbol in symbols_now:
                             key = (Venue.EXTENDED, symbol)
                             stream = self.coordinator.stream(*key)
                             stream.connected(connected_at)
