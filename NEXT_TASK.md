@@ -2,7 +2,7 @@
 
 ## PAPER continuous correctness proof
 
-Status: `ACTIVE — CHIEF47 TERMINAL ZERO EXPOSURE; EXTENDED RAPID EOF RECURRENCE REOPENED`.
+Status: `ACTIVE — EXTENDED NO-CHANGE ACCEPTED; CHIEF48 FIRST ATTEMPT VALID NO-FILL; NEXT CYCLE ACTIVE`.
 
 Objective: starting from accepted published main, run exactly one fresh public-only PAPER process on a new owner-only database and obtain reproducible end-to-end evidence that eligible profitable routes can activate, retain an immutable attempt quantity across harmless optimizer drift, accumulate only qualifying maker trade-through, open both virtual legs atomically, reconcile funding, and close back to exact `FLAT`. Observe every missed opportunity and terminal attempt outcome. A cancellation or no-trade result is valid only when its exact fail-closed reason is supported by authoritative persisted market/runtime evidence; any proven implementation defect gets one fresh bounded visible PAPER Builder candidate followed by independent Chief review, integration, and another fresh validation process/database.
 
@@ -34,7 +34,9 @@ Accepted and published main `0bfe07a0d0dc6cf63f00fbbf011b671e13fde44e` binds RIS
 
 Fresh `chief47` completed five scheduled all-`128` scans with `14–23` eligible routes and no RISEx resync, but disproved Extended live acceptance. Its initial aggregate book session closed `EOF` after about ten minutes, and replacement session `7` closed again only `23.120802` seconds later. Both episodes correctly invalidated all `19` books and reconnected, but the rapid second recurrence matches the pre-fix blocker. Chief stopped before entry with durable `STOPPED_SAFE`, integrity `ok`, and exact zero attempts/orders/fills/positions/funding/completed trades. Preserve and never resume this database; its plist is in Trash and no PAPER runtime remains.
 
-The next bounded slice is Extended-only diagnosis from current published main. Prove why the accepted control-priority reader still permits the live rapid EOF: distinguish server/session policy, client PING interaction, ingress scheduling/starvation, control-frame handling, queue behavior, or another observed cause with an exact diagnostic and regression. Do not guess, suppress disconnects, drop/reorder sequence frames, weaken WS-only recovery, change other venues/economics/strategy, or add private/write access. Only after independent Chief acceptance may a fresh numbered PAPER database start; it must again prove RISEx stability, Extended transport stability, and the complete non-degraded lifecycle.
+The Extended diagnostic slice concluded `NO CHANGE`: independent clients observed intermittent all-market server `CLOSE 1011`/abnormal termination even without client PINGs, while the accepted priority reader preserved ordered frames, prompt server PONGs, low queue depth, and strict recovery. Client PING removal is not proven safe or causal. Treat only fully recovered pre-position episodes as venue transients; any unresolved readiness loss or position-overlapping gap remains fail closed and invalidates the lifecycle proof.
+
+Fresh `chief48` is the one active public-only PAPER runtime on owner-only `mainnet-paper-live-20260901-chief48.db`. It activated AAVE/Lighter at `16:58:00.002421Z`, preserved one exact locked attempt for `114.998699` seconds across four reprices, observed zero qualifying maker trade events, cancelled exactly at `16:59:55.001120Z`, and returned `FLAT` with zero fill/hedge/position. This is a supported no-fill caused by no public maker trade-through, not an implementation defect. Continue the same runtime through the next cycle; preserve deterministic ranking and do not switch to a lower-ranked route merely to force a fill. Diagnose every later cancellation or position transition from persisted evidence and require one complete non-degraded lifecycle.
 
 ## PAPER Extended aggregate public streams
 
