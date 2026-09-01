@@ -3592,6 +3592,207 @@ async def test_full_tick_coalesces_background_refresh_and_skips_missed_slots(tmp
 
 
 @pytest.mark.asyncio
+async def test_full_refresh_adopts_concurrent_catalog_volume_snapshot_once(tmp_path):
+    clock = FakeClock()
+    target = NOW + timedelta(minutes=5)
+    catalog_started = {
+        venue: asyncio.Event() for venue in (Venue.RISEX, Venue.NADO)
+    }
+    observation_started = {
+        venue: asyncio.Event()
+        for venue in (Venue.RISEX, Venue.EXTENDED, Venue.NADO)
+    }
+    release_catalog = asyncio.Event()
+    release_observations = asyncio.Event()
+
+    class RotatingCatalogAdapter(FakeAdapter):
+        def __init__(self, venue: Venue) -> None:
+            super().__init__(venue, clock, settlement_at=target)
+            self.catalog_calls = 0
+            self.book_calls = 0
+
+        async def fetch_markets(self):
+            self.catalog_calls += 1
+            self._ready("markets")
+            return (self.market,)
+
+        async def fetch_volumes(self):
+            self.catalog_calls += 1
+            self._ready("volumes")
+            if self.venue in catalog_started and self.catalog_calls > 2:
+                catalog_started[self.venue].set()
+                await release_catalog.wait()
+            volume = D("2000000") if self.catalog_calls > 2 else D("1000000")
+            return (
+                MarketVolume(
+                    self.venue, self.market.venue_symbol, volume,
+                    self.clock.now(), "rotating-catalog",
+                ),
+            )
+
+        async def fetch_book(self, venue_symbol: str):
+            self.book_calls += 1
+            if self.book_calls == 2:
+                observation_started[self.venue].set()
+                await release_observations.wait()
+            return await super().fetch_book(venue_symbol)
+
+    fakes = {
+        venue: RotatingCatalogAdapter(venue)
+        for venue in (Venue.RISEX, Venue.EXTENDED, Venue.NADO)
+    }
+    with PaperRepository(tmp_path / "full-refresh-catalog-snapshot.db") as repository:
+        async with PublicPaperRuntime(
+            repository, adapters=fakes, clock=clock
+        ) as runtime:
+            await runtime.scan()
+            runtime.next_health_check_at = NOW + timedelta(hours=1)
+            runtime.next_full_scan_at = NOW
+
+            await runtime.tick(NOW)
+            first = runtime._refresh_task
+            assert first is not None and not first.done()
+            await asyncio.gather(*(
+                event.wait() for event in observation_started.values()
+            ))
+            await asyncio.gather(*(
+                event.wait() for event in catalog_started.values()
+            ))
+            catalog_task = runtime._extended_universe_task
+            assert catalog_task is not None
+            release_catalog.set()
+            await catalog_task
+            release_observations.set()
+            await first
+
+            for venue in (Venue.RISEX, Venue.NADO):
+                observation = runtime.observations[
+                    venue, f"ABC-{venue.value}"
+                ]
+                assert observation.volume is not None
+                assert observation.volume.quote_volume_usd == D("2000000")
+
+            superseded = repository.connection.execute(
+                "SELECT COUNT(*) FROM runtime_evidence "
+                "WHERE event_type='PUBLIC_REFRESH_SUPERSEDED'"
+            ).fetchone()[0]
+            assert superseded == 0
+
+            for _ in range(3):
+                task = runtime._refresh_task
+                if task is None:
+                    break
+                await task
+                await runtime.tick(NOW)
+
+            refreshes = repository.connection.execute(
+                "SELECT COUNT(*) FROM runtime_evidence "
+                "WHERE event_type='PUBLIC_REFRESH_STARTED'"
+            ).fetchone()[0]
+            full_scans = repository.connection.execute(
+                "SELECT COUNT(*) FROM runtime_evidence "
+                "WHERE event_type='PUBLIC_SCAN' "
+                "AND json_extract(detail,'$.scan_kind')='FULL'"
+            ).fetchone()[0]
+            assert refreshes == 1
+            assert full_scans == 1
+            assert all(adapter.book_calls == 2 for adapter in fakes.values())
+            nado_liquidity = {
+                plan.route.route_liquidity_usd
+                for plan in runtime.last_scan.evaluations
+                if plan.hedge_venue is Venue.NADO and plan.route is not None
+            }
+            assert nado_liquidity == {D("2000000")}
+
+
+@pytest.mark.asyncio
+async def test_full_refresh_supersedes_concurrent_catalog_market_change(tmp_path):
+    clock = FakeClock()
+    target = NOW + timedelta(minutes=5)
+    catalog_started = asyncio.Event()
+    observation_started = asyncio.Event()
+    release_catalog = asyncio.Event()
+    release_observation = asyncio.Event()
+
+    class StructuralCatalogAdapter(FakeAdapter):
+        def __init__(self) -> None:
+            super().__init__(Venue.RISEX, clock, settlement_at=target)
+            self.catalog_calls = 0
+            self.book_calls = 0
+
+        async def fetch_markets(self):
+            self.catalog_calls += 1
+            self._ready("markets")
+            if self.catalog_calls > 2:
+                market = replace(
+                    self.market,
+                    canonical_asset="DEF",
+                    venue_symbol="DEF-RISEX",
+                )
+                return (market,)
+            return (self.market,)
+
+        async def fetch_volumes(self):
+            self.catalog_calls += 1
+            self._ready("volumes")
+            if self.catalog_calls > 2:
+                catalog_started.set()
+                await release_catalog.wait()
+                symbol = "DEF-RISEX"
+            else:
+                symbol = self.market.venue_symbol
+            return (
+                MarketVolume(
+                    Venue.RISEX, symbol, D("1000000"),
+                    self.clock.now(), "structural-catalog",
+                ),
+            )
+
+        async def fetch_book(self, venue_symbol: str):
+            self.book_calls += 1
+            if self.book_calls == 2:
+                observation_started.set()
+                await release_observation.wait()
+            return await super().fetch_book(venue_symbol)
+
+    structural = StructuralCatalogAdapter()
+    fakes = adapters(clock, settlement_at=target)
+    fakes[Venue.RISEX] = structural
+    with PaperRepository(tmp_path / "full-refresh-structural-change.db") as repository:
+        async with PublicPaperRuntime(
+            repository, adapters=fakes, clock=clock
+        ) as runtime:
+            await runtime.scan()
+            runtime.next_health_check_at = NOW + timedelta(hours=1)
+            runtime.next_full_scan_at = NOW
+
+            await runtime.tick(NOW)
+            first = runtime._refresh_task
+            assert first is not None and not first.done()
+            await observation_started.wait()
+            await catalog_started.wait()
+            catalog_task = runtime._extended_universe_task
+            assert catalog_task is not None
+            release_catalog.set()
+            await catalog_task
+            release_observation.set()
+            await first
+
+            superseded = repository.connection.execute(
+                "SELECT COUNT(*) FROM runtime_evidence "
+                "WHERE event_type='PUBLIC_REFRESH_SUPERSEDED'"
+            ).fetchone()[0]
+            full_scans = repository.connection.execute(
+                "SELECT COUNT(*) FROM runtime_evidence "
+                "WHERE event_type='PUBLIC_SCAN' "
+                "AND json_extract(detail,'$.scan_kind')='FULL'"
+            ).fetchone()[0]
+            assert superseded == 1
+            assert full_scans == 0
+            assert runtime._catalog_refresh_pending
+
+
+@pytest.mark.asyncio
 async def test_negative_candidate_focus_trace_and_late_winner_activation(tmp_path):
     clock = FakeClock()
     target = NOW + timedelta(seconds=400)

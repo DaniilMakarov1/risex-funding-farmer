@@ -1637,6 +1637,49 @@ class PublicPaperRuntime:
             at,
         )
 
+    def _catalog_market_snapshot(self) -> dict[Venue, tuple[Any, ...]]:
+        """Copy catalog identity without exposing mutable runtime containers."""
+        return {
+            venue: tuple(markets)
+            for venue, markets in self.markets.items()
+        }
+
+    def _adopt_compatible_catalog_update(
+        self,
+        *,
+        initial_markets: Mapping[Venue, tuple[Any, ...]],
+        initial_candidate_keys: set[tuple[Venue, str]],
+    ) -> bool:
+        """Adopt a concurrent volume-only catalog update for one refresh.
+
+        A public refresh owns one immutable market/volume input snapshot while
+        its observations are in flight.  A background catalog response may
+        then publish newer volumes, but it may not change the market identity
+        or candidate set underneath that refresh.  Rebinding the completed
+        observations to the newer volumes keeps the scan coherent without
+        repeating book/funding observations.  Any structural change remains a
+        normal supersede and is retried by the existing fail-closed path.
+        """
+        if self._catalog_market_snapshot() != dict(initial_markets):
+            return False
+        current_candidate_keys = {
+            (market.venue, market.venue_symbol)
+            for market in self._candidate_markets()
+        }
+        if current_candidate_keys != initial_candidate_keys:
+            return False
+
+        current_volumes = dict(self.volumes)
+        for key in initial_candidate_keys:
+            if key not in current_volumes:
+                return False
+        for key, observation in tuple(self.observations.items()):
+            volume = current_volumes.get(key)
+            if volume is not None:
+                self.observations[key] = replace(observation, volume=volume)
+        self._catalog_refresh_pending = False
+        return True
+
     async def _catalog(
         self,
         venue: Venue,
@@ -2024,12 +2067,21 @@ class PublicPaperRuntime:
         return venue is Venue.LIGHTER or (venue, symbol) in self._trade_stream_ready
 
     async def _market_observation(
-        self, market: Any, assumed_at: datetime, *, background: bool = False
+        self,
+        market: Any,
+        assumed_at: datetime,
+        *,
+        background: bool = False,
+        catalog_volumes: Mapping[tuple[Venue, str], MarketVolume] | None = None,
     ) -> None:
         assert self.adapters is not None
         adapter = self.adapters[market.venue]
         key = (market.venue, market.venue_symbol)
-        volume = self.volumes.get(key)
+        volume = (
+            self.volumes.get(key)
+            if catalog_volumes is None
+            else catalog_volumes.get(key)
+        )
         existing = self.observations.get(key)
         request_started_at = self.clock.now()
         try:
@@ -2524,7 +2576,10 @@ class PublicPaperRuntime:
         assert self.adapters is not None
         started = self.clock.now()
         catalog_generation = self._catalog_generation
+        initial_markets = self._catalog_market_snapshot()
+        initial_volumes = dict(self.volumes)
         self._record("PUBLIC_REFRESH_STARTED", at=started)
+        catalog_snapshot_adopted = False
         try:
             self._update_extended_catalog_readiness(self.clock.now())
             assumed_at = self.clock.now()
@@ -2553,7 +2608,8 @@ class PublicPaperRuntime:
                     self.observations.pop(key, None)
             await _gather_owned(*(
                 self._market_observation(
-                    market, assumed_at, background=True
+                    market, assumed_at, background=True,
+                    catalog_volumes=initial_volumes,
                 )
                 for market in candidates
             ))
@@ -2563,7 +2619,18 @@ class PublicPaperRuntime:
             finally:
                 self._catalog_reconciliation_in_progress = False
             completed = self.clock.now()
-            if catalog_generation != self._catalog_generation:
+            if (
+                catalog_generation != self._catalog_generation
+                or self._catalog_market_snapshot() != initial_markets
+            ):
+                catalog_snapshot_adopted = self._adopt_compatible_catalog_update(
+                    initial_markets=initial_markets,
+                    initial_candidate_keys=candidate_keys,
+                )
+            if (
+                catalog_generation != self._catalog_generation
+                and not catalog_snapshot_adopted
+            ):
                 self._catalog_refresh_pending = True
                 self._record(
                     "PUBLIC_REFRESH_SUPERSEDED", at=completed,
@@ -2575,12 +2642,31 @@ class PublicPaperRuntime:
                     },
                 )
                 return
+            if (
+                self._catalog_market_snapshot() != initial_markets
+                and not catalog_snapshot_adopted
+            ):
+                self._catalog_refresh_pending = True
+                self._record(
+                    "PUBLIC_REFRESH_SUPERSEDED", at=completed,
+                    detail={
+                        "started_at": started.isoformat(),
+                        "completed_at": completed.isoformat(),
+                        "catalog_generation_at_start": catalog_generation,
+                        "catalog_generation_at_completion": self._catalog_generation,
+                        "reason": "CATALOG_SNAPSHOT_CHANGED",
+                    },
+                )
+                return
             self._record(
                 "PUBLIC_REFRESH_COMPLETED", at=completed,
                 detail={
                     "elapsed_seconds": str(
                         Decimal(str((completed - started).total_seconds()))
-                    )
+                    ),
+                    "catalog_generation_at_start": catalog_generation,
+                    "catalog_generation_at_completion": self._catalog_generation,
+                    "catalog_snapshot_adopted": catalog_snapshot_adopted,
                 },
             )
         except asyncio.CancelledError:
