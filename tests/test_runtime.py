@@ -5695,8 +5695,13 @@ async def test_risex_background_refresh_does_not_overwrite_live_combined_book(
         ))
         await book_started.wait()
 
-        assert await runtime.apply_book_event(
+        replacement_session = runtime._new_stream_session(stream_key)
+        assert replacement_session != session_id
+        assert not await runtime.apply_book_event(
             live_snapshot, stream_session_id=session_id
+        )
+        assert await runtime.apply_book_event(
+            live_snapshot, stream_session_id=replacement_session
         )
         assert await runtime.apply_book_event(
             BookDelta(
@@ -5704,7 +5709,7 @@ async def test_risex_background_refresh_does_not_overwrite_live_combined_book(
                 live_after_first_update.bids, (), clock.now(),
                 checksum=checksum(live_after_first_update),
             ),
-            stream_session_id=session_id,
+            stream_session_id=replacement_session,
         )
 
         release_book.set()
@@ -5719,9 +5724,139 @@ async def test_risex_background_refresh_does_not_overwrite_live_combined_book(
                 live_after_second_update.bids, (), clock.now(),
                 checksum=checksum(live_after_second_update),
             ),
-            stream_session_id=session_id,
+            stream_session_id=replacement_session,
         )
         assert runtime.coordinator.stream(*key).book() == live_after_second_update
+        assert repository.connection.execute(
+            "SELECT COUNT(*) FROM runtime_evidence "
+            "WHERE event_type='PUBLIC_BOOK_RESYNC_REQUIRED'"
+        ).fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_risex_background_refresh_preserves_quiet_owned_checksum_book(
+    tmp_path,
+):
+    """A quiet owned book remains the WS checksum baseline while unusable."""
+    clock = FakeClock()
+    symbol = "ABC/USDC"
+    key = (Venue.RISEX, symbol)
+    stream_key = (Venue.RISEX, "*", "combined")
+    quiet_at = clock.now() - timedelta(seconds=26)
+    ws_book = OrderBook(
+        Venue.RISEX, symbol,
+        (BookLevel(D("100"), D("2")),),
+        (BookLevel(D("102"), D("2")),),
+        quiet_at,
+    )
+    rest_book = OrderBook(
+        Venue.RISEX, symbol,
+        (BookLevel(D("99"), D("20")),),
+        (BookLevel(D("101"), D("20")),),
+        clock.now(),
+    )
+    ws_after_delta = OrderBook(
+        Venue.RISEX, symbol,
+        (BookLevel(D("100"), D("3")),),
+        (BookLevel(D("102"), D("2")),),
+        clock.now(),
+    )
+
+    class QuietRisexAdapter(RisexAdapter):
+        def __init__(self) -> None:
+            super().__init__(None)
+            self.market = replace(
+                FakeAdapter(
+                    Venue.RISEX, clock, settlement_at=NOW + timedelta(minutes=5)
+                ).market,
+                venue_symbol=symbol,
+            )
+            self.book_calls = 0
+            self.funding_calls = 0
+            self._market_ids = {symbol: "1"}
+            self._symbols_by_id = {"1": symbol}
+
+        async def fetch_book(self, venue_symbol: str) -> OrderBook:
+            assert venue_symbol == symbol
+            self.book_calls += 1
+            return rest_book
+
+        async def prime_recent_trade_evidence(
+            self, market: CanonicalMarket, *, limit: int = 20
+        ) -> CanonicalMarket:
+            return market
+
+        async def fetch_funding_quote(self, market, *, assumed_open_at):
+            self.funding_calls += 1
+            return FundingCashQuote(
+                Venue.RISEX, symbol, clock.now(), assumed_open_at,
+                NOW + timedelta(minutes=5), FundingQuality.ESTIMATED,
+                FundingAccrualMethod.SNAPSHOT_AT_SETTLEMENT, True,
+                D("1"), D("1"), "PAPER_ASSUMPTION:RISEX_PUBLIC_FALLBACK",
+            )
+
+    adapter = QuietRisexAdapter()
+    volume = MarketVolume(
+        Venue.RISEX, symbol, D("1000000"), clock.now(), "official-shaped"
+    )
+    old_quote = FundingCashQuote(
+        Venue.RISEX, symbol, quiet_at, quiet_at,
+        NOW + timedelta(minutes=5), FundingQuality.ESTIMATED,
+        FundingAccrualMethod.SNAPSHOT_AT_SETTLEMENT, True,
+        D("1"), D("1"), "PAPER_ASSUMPTION:RISEX_PUBLIC_FALLBACK",
+    )
+
+    def checksum(book: OrderBook) -> int:
+        projected = BookStream(Venue.RISEX, symbol)
+        projected.snapshot(book)
+        return projected.risex_checksum()
+
+    with PaperRepository(tmp_path / "risex-quiet-book-ownership.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={Venue.RISEX: adapter}, clock=clock
+        )
+        stream = runtime.coordinator.stream(*key)
+        stream.connected(quiet_at)
+        stream.snapshot(ws_book)
+        stream.connection_confirmed(quiet_at)
+        runtime._bump_book_revision(key, checksum=checksum(ws_book))
+        runtime._live_book_ready.add(key)
+        runtime._trade_stream_ready.add(key)
+        runtime.observations[key] = MarketObservation(
+            adapter.market, volume, ws_book, old_quote,
+            stream.health(clock.now()), trade_stream_ready=True,
+        )
+        session_id = runtime._new_stream_session(stream_key)
+        revision = runtime._book_revisions[key]
+
+        assert stream.health(clock.now()).data_quality is DataQuality.DEGRADED
+        await runtime._market_observation(
+            adapter.market, clock.now(), background=True,
+            catalog_volumes={key: volume},
+        )
+
+        assert adapter.book_calls == 0
+        assert adapter.funding_calls == 1
+        assert runtime.coordinator.stream(*key).book() == ws_book
+        assert runtime.observations[key].book == ws_book
+        assert runtime.observations[key].health.data_quality is DataQuality.DEGRADED
+        assert runtime.observations[key].volume == volume
+        assert runtime.observations[key].funding is not old_quote
+        assert runtime.observations[key].funding.observed_at == clock.now()
+        assert runtime._stream_sessions[stream_key] == session_id
+        assert runtime._stream_invalidation_revisions.get(key, 0) == 0
+        assert runtime._book_revisions[key] == revision
+        assert runtime._book_checksums[key] == checksum(ws_book)
+
+        assert await runtime.apply_book_event(
+            BookDelta(
+                Venue.RISEX, symbol,
+                ws_after_delta.bids, (), clock.now(),
+                checksum=checksum(ws_after_delta),
+            ),
+            stream_session_id=session_id,
+        )
+        assert runtime.coordinator.stream(*key).book() == ws_after_delta
         assert repository.connection.execute(
             "SELECT COUNT(*) FROM runtime_evidence "
             "WHERE event_type='PUBLIC_BOOK_RESYNC_REQUIRED'"

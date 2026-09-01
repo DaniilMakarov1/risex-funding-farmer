@@ -756,6 +756,29 @@ class PublicPaperRuntime:
             return recovery.attempt_generation.value
         return self._book_recovery_generations.get(key, 0)
 
+    def _owned_risex_ws_book(
+        self, key: tuple[Venue, str]
+    ) -> OrderBook | None:
+        """Return a current combined-WS checksum baseline without freshness."""
+        if key[0] is not Venue.RISEX:
+            return None
+        stream_key = self._book_stream_key(*key)
+        if (
+            self._stream_sessions.get(stream_key) is None
+            or key not in self._live_book_ready
+        ):
+            return None
+        stream = self.coordinator.stream(*key)
+        if not stream.stream_connected:
+            return None
+        recovery = self._recoveries.get(key)
+        if recovery is not None and recovery.terminal is None:
+            return None
+        book = stream.book()
+        if book is None or self._book_checksums.get(key) is None:
+            return None
+        return book
+
     def _bump_book_revision(
         self,
         key: tuple[Venue, str],
@@ -2097,6 +2120,7 @@ class PublicPaperRuntime:
         risex_session_at_start: StreamSessionId | None = None
         risex_book_revision_at_start: int | None = None
         risex_invalidation_revision_at_start: int | None = None
+        risex_owned_ws_book: OrderBook | None = None
         if isinstance(adapter, RisexAdapter) and background:
             risex_stream_key = self._book_stream_key(*key)
             risex_session_at_start = self._stream_sessions.get(risex_stream_key)
@@ -2104,6 +2128,7 @@ class PublicPaperRuntime:
             risex_invalidation_revision_at_start = (
                 self._stream_invalidation_revisions.get(key, 0)
             )
+            risex_owned_ws_book = self._owned_risex_ws_book(key)
         try:
             if isinstance(adapter, ExtendedAdapter) and background:
                 transport_gap = self._extended_transport_gap_kinds(
@@ -2138,7 +2163,7 @@ class PublicPaperRuntime:
             preserve_stream_book = (
                 lighter_stream_book is not None
                 if isinstance(adapter, LighterAdapter)
-                else healthy_live
+                else healthy_live or risex_owned_ws_book is not None
             )
             if (
                 isinstance(adapter, ExtendedAdapter)
@@ -2157,9 +2182,17 @@ class PublicPaperRuntime:
             if isinstance(adapter, RisexAdapter):
                 # The immutable contract becomes eligible only after both public
                 # book and recent-trade unit evidence are proven in this scan.
-                if healthy_live and existing is not None:
-                    book = self.coordinator.stream(*key).book()
-                    market = existing.market
+                if (
+                    risex_owned_ws_book is not None
+                    or (healthy_live and existing is not None)
+                ):
+                    book = (
+                        risex_owned_ws_book
+                        if risex_owned_ws_book is not None
+                        else self.coordinator.stream(*key).book()
+                    )
+                    if existing is not None:
+                        market = existing.market
                 else:
                     book = await self._public_call(
                         market.venue,
