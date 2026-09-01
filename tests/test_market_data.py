@@ -554,6 +554,7 @@ def test_nanosecond_timestamp_boundaries_floor_sub_microseconds() -> None:
 def test_public_websocket_heartbeat_actions() -> None:
     assert HEALTH_CHECK_CADENCE_SECONDS == 10
 
+    assert RisexAdapter.client_ping_action() == {"method": "ping"}
     risex_payload = fixture("risex")["heartbeat"]["server_ping_payload"].encode()
     risex_action = RisexAdapter.handle_server_ping(risex_payload)
     assert risex_action.frame_action is WebSocketFrameAction.PONG

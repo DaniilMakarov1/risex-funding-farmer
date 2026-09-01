@@ -523,5 +523,10 @@ class RisexAdapter(PublicAdapter):
         return {"method": "subscribe", "params": {"channel": "trades", "market_ids": market_ids}}
 
     @staticmethod
+    def client_ping_action() -> dict[str, object]:
+        """Return the documented JSON keep-alive request."""
+        return {"method": "ping"}
+
+    @staticmethod
     def handle_server_ping(payload: bytes) -> PublicHeartbeatAction:
         return PublicHeartbeatAction(WebSocketFrameAction.PONG, payload, True)

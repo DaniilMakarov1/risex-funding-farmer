@@ -6672,6 +6672,71 @@ async def test_lighter_trade_snapshot_is_not_delivered_and_updates_require_new_n
 
 
 @pytest.mark.asyncio
+async def test_risex_json_keepalive_is_session_owned(tmp_path):
+    clock = FakeClock()
+    stop = asyncio.Event()
+    sent = []
+    sleeps = []
+
+    async def controlled_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        if len(sleeps) == 2:
+            stop.set()
+        await asyncio.sleep(0)
+
+    class WebSocket:
+        async def send_json(self, payload) -> None:
+            sent.append(payload)
+
+    with PaperRepository(tmp_path / "risex-json-keepalive.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={}, clock=clock, sleep=controlled_sleep,
+        )
+        runtime._stop_event = stop
+        session_id = runtime._new_stream_session(
+            (Venue.RISEX, "*", "combined")
+        )
+        await runtime._risex_heartbeat(
+            WebSocket(), (Venue.RISEX, "*", "combined"), session_id
+        )
+
+    assert sleeps == [10, 10]
+    assert sent == [{"method": "ping"}]
+
+
+@pytest.mark.asyncio
+async def test_risex_json_keepalive_stops_after_session_replacement(tmp_path):
+    clock = FakeClock()
+    stop = asyncio.Event()
+    sent = []
+    key = (Venue.RISEX, "*", "combined")
+
+    class WebSocket:
+        async def send_json(self, payload) -> None:
+            sent.append(payload)
+
+    sleep_calls = []
+
+    with PaperRepository(tmp_path / "risex-keepalive-replacement.db") as repository:
+        runtime = PublicPaperRuntime(
+            repository, adapters={}, clock=clock,
+        )
+        runtime._stop_event = stop
+        session_id = runtime._new_stream_session(key)
+
+        async def replace_after_sleep(seconds: float) -> None:
+            sleep_calls.append(seconds)
+            runtime._new_stream_session(key)
+            await asyncio.sleep(0)
+
+        runtime._sleep = replace_after_sleep
+        await runtime._risex_heartbeat(WebSocket(), key, session_id)
+
+    assert sleep_calls == [10]
+    assert sent == []
+
+
+@pytest.mark.asyncio
 async def test_lighter_trade_sequence_resets_for_each_physical_session(tmp_path):
     clock = FakeClock()
     stop = asyncio.Event()

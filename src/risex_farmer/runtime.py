@@ -6130,6 +6130,34 @@ class PublicPaperRuntime:
                 await close()
             raise
 
+    async def _risex_heartbeat(
+        self,
+        ws: object,
+        stream_key: tuple[Venue, str, str],
+        stream_session_id: StreamSessionId,
+    ) -> None:
+        """Keep RISEx per-market confirmation inside its 25-second gate."""
+        try:
+            while self._stop_event is not None and not self._stop_event.is_set():
+                await self._sleep(10)
+                if (
+                    self._stop_event.is_set()
+                    or not self._owns_stream_session(
+                        stream_key, stream_session_id
+                    )
+                ):
+                    return
+                await ws.send_json(RisexAdapter.client_ping_action())  # type: ignore[attr-defined]
+                if not self._owns_stream_session(stream_key, stream_session_id):
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            close = getattr(ws, "close", None)
+            if close is not None:
+                await close()
+            raise
+
     async def _recover_snapshot_in_background(
         self, venue: Venue, symbol: str, episode: RecoveryEpisode
     ) -> None:
@@ -6848,6 +6876,12 @@ class PublicPaperRuntime:
                     if isinstance(adapter, LighterAdapter):
                         heartbeat = asyncio.create_task(
                             self._lighter_heartbeat(
+                                ws, task_key, stream_session_id
+                            )
+                        )
+                    elif isinstance(adapter, RisexAdapter):
+                        heartbeat = asyncio.create_task(
+                            self._risex_heartbeat(
                                 ws, task_key, stream_session_id
                             )
                         )
