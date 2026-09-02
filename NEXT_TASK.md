@@ -8,7 +8,7 @@ The former Funding Farmer central profitability, funding-boundary, PAPER lifecyc
 
 ## SS-001A — pure entry observer domain
 
-Status: `AUTHORIZED FOR ONE VISIBLE SPREAD BUILDER`.
+Status: `AUTHORIZED FOR ONE FRESH VISIBLE SPREAD BUILDER AFTER REJECTED CANDIDATE a3ac545`.
 
 Base: exact accepted governance `main` selected by the Chief when the Builder is created.
 
@@ -76,7 +76,10 @@ Required outcome values include:
 - Strict would-fill: quote version predates evidence; exact RISEx venue/market/direction; correct aggressor; trade-through by at least one tick; version-local eligible quantity reaches exact `q`; duplicate rejection; replacement resets evidence; expiry or data gap forbids fill.
 - One optional fill model may exist only as an explicitly named optimistic upper bound, not a queue simulator.
 - Persistable provenance contracts include UTC and monotonic quote/trade/detection timestamps, absolute monotonic horizon deadline, book receipt monotonic time, stream session, recovery generation, book revision, and sequence/checksum when applicable.
+- Local monotonic timestamps belong only to the local process. Do not invent or compare an exchange monotonic timestamp. Authoritative exchange/event UTC is optional and carries explicit authority/provenance; quote-before-trade ordering and would-fill detection use local receipt monotonic time. `WouldFillEvidence` explicitly persists `would_fill_detected_monotonic_ns`.
 - Horizon selection accepts only an exact-market, sequence-valid, current-session, gap-free, fresh book received at or before the deadline. No interpolation or later-book look-ahead is permitted.
+- Horizon selection requires both the expected stream session ID and expected recovery generation. A same-session book from another recovery generation is displaced evidence and cannot become a hedge.
+- A quote cannot be `QUOTE_ACTIVE` unless its recomputed actual edge, target edge, hedge notional, fee evidence, and sizing evidence are present and internally consistent. Missing economics fails closed as `QUOTE_NOT_ECONOMIC`.
 - Pure deterministic replay of the same immutable inputs produces equivalent canonical evidence using ordinary deterministic value contracts; do not build a custom serializer subsystem.
 - Strict would-fill is a conservative lower bound. The optional optimistic model is an upper bound. Absence of strict fills alone is not a no-go: near-zero strict and near-zero optimistic evidence supports `PROFITABLE_QUOTES_UNFILLABLE`, while near-zero strict and materially positive optimistic evidence supports `FILLABILITY_INSUFFICIENT_EVIDENCE`; repeated strict fills support delayed-edge evaluation. SS-001A does not invent the numeric thresholds for “near-zero” or “materially positive”; SS-001B must freeze them before discovery.
 
@@ -113,3 +116,5 @@ Builder must report preflight root/branch/HEAD/status, exact scope/diff, focused
 - No position/exit/funding lifecycle, two-sided active quotes, multi-lot inventory, batching, OMS, generic event bus, dashboard, new venue adapter, ML, or automatic optimization.
 
 Completion: Chief independently reviews scope, diff, contracts, tests, dependency surface, Git, and final suite. Only Chief may accept and integrate. SS-001B remains closed after SS-001A unless separately opened by accepted governance.
+
+Rejected evidence: candidate `a3ac545a78a687788595470c1e1e1e91a501ec74` is not accepted and must not be merged or amended. It invented a cross-clock `trade_exchange_monotonic_ns`, admitted quotes with absent economics, omitted explicit would-fill detection monotonic evidence, and did not bind horizon books to the expected recovery generation. A fresh correction candidate starts from the current accepted `main`; it may use the rejected diff only as non-authoritative reference.

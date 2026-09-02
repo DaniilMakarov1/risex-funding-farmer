@@ -23,4 +23,5 @@
 - External governance review accepted the transition. Before any SS-001A candidate acceptance, target-margin formulas, deterministic quantity sizing, conservative/optimistic fillability interpretation, exact hedge-failure outcomes, and the bounded SS-001A/SS-001B complexity limits were frozen in System Specification 2.1.
 - “Approximately zero” and “materially positive” fillability thresholds are deliberately not hidden in SS-001A; SS-001B must freeze numeric thresholds before its first discovery sample.
 - The only authorized implementation slice is `SS-001A`, defined in `NEXT_TASK.md`.
+- SS-001A candidate `a3ac545a78a687788595470c1e1e1e91a501ec74` was independently rejected and was not merged. Its green tests did not cover fail-open missing economics, invalid cross-clock exchange-monotonic ordering, missing explicit would-fill detection time, or recovery-generation displacement. The original Builder is released; correction requires a fresh visible Spread Builder from current accepted `main`.
 - `SS-001B`, discovery runs, `SS-002`, and `SS-003` are closed until their preceding acceptance and explicit authorization gates.
