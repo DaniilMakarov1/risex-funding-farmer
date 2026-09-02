@@ -1,6 +1,6 @@
 # RISEx Spread Shadow — System Specification
 
-SYSTEM_SPEC_VERSION = 2.0
+SYSTEM_SPEC_VERSION = 2.1
 SPEC_STATUS = ACTIVE_SPREAD_SHADOW__FROZEN_LEGACY_FUNDING_FARMER
 
 ## 0. Active product domain: RISEx Spread Shadow
@@ -24,21 +24,57 @@ ConditionalMarkout(h) = EntryEdge(h) - EntryEdge(0)
 
 Exact-q VWAP already includes visible spread and depth impact. No second spread or slippage deduction is permitted. The configured RISEx fee is applied exactly once with its provenance; public-only evidence must not be described as an observed account-specific fee. Lighter Standard fee and published latency are frozen research inputs with source metadata, not private-account observations or end-to-end execution guarantees.
 
+### 0.1 Quote economics and deterministic quantity
+
+`target_margin_bps` is the minimum net entry-execution edge after the exact configured entry fees, measured against actual Lighter hedge notional, before any empirical latency or markout haircut. It is not distance from RISEx BBO, gross pre-fee spread, future funding, future exit income, or a latency reserve.
+
+For `m = target_margin_bps / 10000`, configured RISEx maker fee `fR`, configured Lighter taker fee `fL`, exact-q Lighter sell VWAP `Hsell(q)`, and exact-q Lighter buy VWAP `Hbuy(q)`:
+
+```text
+max_risex_buy = Hsell(q) * (1 - fL - m) / (1 + fR)
+risex_buy_quote = min(
+    round_down_to_risex_tick(max_risex_buy),
+    risex_best_ask - risex_tick,
+)
+
+min_risex_sell = Hbuy(q) * (1 + fL + m) / (1 - fR)
+risex_sell_quote = max(
+    round_up_to_risex_tick(min_risex_sell),
+    risex_best_bid + risex_tick,
+)
+```
+
+After tick rounding, the domain recomputes and records the actual exact entry edge. A rounded quote is not assumed to retain the target edge; a quote whose recomputed edge is below the requested target is not economic.
+
+For each configured target notional, the current required-side Lighter top price is the deterministic sizing reference. Compute `q_raw = target_notional / reference_price`, floor it to the exact common RISEx/Lighter canonical quantity step, validate both venues' minimum quantity and minimum notional, then calculate exact-q Lighter VWAP and derive the RISEx quote. Quantity is not optimized or resized retrospectively from later books.
+
+### 0.2 Fill and hedge evidence semantics
+
+Strict would-fill is a conservative lower bound, not ground truth. An optional optimistic model is only an explicitly labelled upper bound. The SS-001 product interpretations are:
+
+- strict approximately zero and optimistic approximately zero: `PROFITABLE_QUOTES_UNFILLABLE` / no-go;
+- strict approximately zero but optimistic materially positive: `FILLABILITY_INSUFFICIENT_EVIDENCE`;
+- repeated strict fills: delayed-edge evaluation is supported.
+
+Absence of strict fills alone does not kill the strategy. The numeric meanings of `approximately zero` and `materially positive` must be explicit frozen SS-001B configuration selected before the discovery sample; SS-001A must not hide or infer those thresholds.
+
+`HEDGE_OUTCOME_UNKNOWN` is reserved for a genuinely unclassified or incomplete terminal state and is not a catch-all. Missing book, stale book, displaced session, overlapping data gap, partial depth, and zero executable depth retain distinct outcomes. `HEDGE_PARTIAL` means positive executable quantity below exact `q`; `HEDGE_DEPTH_UNAVAILABLE` means zero executable quantity in an otherwise valid required-side book. Known data failures use exact missing, stale, displaced-session, or gap-overlap classifications and never become `NO TRADE` or `HEDGE_OUTCOME_UNKNOWN`.
+
 Sensitivity horizons are `0`, `300`, `500`, and `1000` milliseconds after local monotonic would-fill detection. `2000` milliseconds is permitted only as a cheap stress horizon. The complete latency curve is primary. In particular, `500 ms` is diagnostic and is not a prediction, actual execution latency, SLA, admission guarantee, or fill claim.
 
 Every horizon uses only the latest current-session, sequence-valid Lighter book actually received at or before its absolute monotonic deadline. Later books are never applied retroactively and interpolation is forbidden. Missing, stale, displaced-session, gap-overlapping, or insufficient-depth evidence remains an explicit hedge outcome and never becomes `NO TRADE`.
 
 The fill-to-hedge observation path is event driven from the hypothetical maker-would-fill detection event. Periodic quote refresh or legacy scan cadence may not delay it.
 
-### 0.1 Stages and authority
+### 0.3 Stages and authority
 
-- `SS-001`: entry observer research. `SS-001A` contains only deterministic pure domain/evidence contracts. After independent acceptance, `SS-001B` may integrate public RISEx/Lighter feeds, prospective horizon captures, append-only evidence, and one bounded report.
+- `SS-001`: entry observer research. `SS-001A` contains only deterministic pure domain/evidence contracts. It contains no serializer framework, persistence abstraction, generic engine, event bus, sockets, CLI, database, or reporting. Canonical evidence is deterministic without introducing a custom serialization subsystem. After independent acceptance, `SS-001B` may integrate public RISEx/Lighter feeds, prospective horizon captures, append-only evidence, and one bounded report.
 - `SS-002`: one-lot complete-cycle shadow trader. Closed until SS-001 produces repeated `ENTRY_EDGE_CANDIDATE` evidence and the user authorizes the next slice.
 - `SS-003`: frozen-policy holdout. Closed until SS-002 is accepted and its policy is frozen before an untouched interval.
 
 No private endpoint, credential, signing, order preparation, dispatch, testnet/mainnet write, real fund, transfer, withdrawal, or strategy execution is authorized. The active entrypoint must have no reachable dependency on private/auth/write surfaces.
 
-### 0.2 Package and dependency boundary
+### 0.4 Package and dependency boundary
 
 New code lives under `src/risex_spread_shadow/`; tests live under `tests/spread_shadow/`. It has separate CLI, configuration, run identity, persistence, and report surfaces.
 
@@ -46,7 +82,7 @@ It may reuse only venue-neutral/public contracts and exact pure math: normalized
 
 The following legacy strategy dependencies are forbidden from every new entrypoint-reachable path: `risex_farmer.scanner`, `risex_farmer.paper_broker`, `risex_farmer.lifecycle`, legacy `RoutePlan` admission/ranking, funding activation/cutoff policy, position state machine, persistence, Telegram/reporting, operational testnet/mainnet modules, authenticated adapters, credentials, signing, and write code. The legacy public `risex_farmer.runtime` is also not a Spread strategy dependency because it directly imports those forbidden modules.
 
-The limited Spread feed runner may reuse the accepted public adapters and venue-neutral `BookStream`, but must cover only RISEx and Lighter, expose immutable accepted events through one bounded non-blocking queue, emit explicit `DATA_GAP` on overflow, preserve session/recovery/book-revision/sequence/checksum provenance, reject stale or displaced events, and avoid a generic event bus.
+The limited Spread feed runner may reuse the accepted public adapters and venue-neutral `BookStream`, but must cover only RISEx and Lighter, expose immutable accepted events through one bounded non-blocking queue, emit explicit `DATA_GAP` on overflow, preserve session/recovery/book-revision/sequence/checksum provenance, reject stale or displaced events, and fail closed on ambiguity. It must not copy normalizers, import strategy modules, or grow a generic recovery/event framework or general public runtime. SS-001B must first pass a short 1–3 market end-to-end public pipeline smoke; only the unchanged accepted runner may then expand to the full discovery universe.
 
 ## Legacy benchmark domain: RISEx Funding Farmer
 
