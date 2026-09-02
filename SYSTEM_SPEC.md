@@ -1,6 +1,6 @@
 # RISEx Spread Shadow — System Specification
 
-SYSTEM_SPEC_VERSION = 2.1
+SYSTEM_SPEC_VERSION = 2.2
 SPEC_STATUS = ACTIVE_SPREAD_SHADOW__FROZEN_LEGACY_FUNDING_FARMER
 
 ## 0. Active product domain: RISEx Spread Shadow
@@ -59,6 +59,12 @@ Strict would-fill is a conservative lower bound, not ground truth. An optional o
 Absence of strict fills alone does not kill the strategy. The numeric meanings of `approximately zero` and `materially positive` must be explicit frozen SS-001B configuration selected before the discovery sample; SS-001A must not hide or infer those thresholds.
 
 `HEDGE_OUTCOME_UNKNOWN` is reserved for a genuinely unclassified or incomplete terminal state and is not a catch-all. Missing book, stale book, displaced session, overlapping data gap, partial depth, and zero executable depth retain distinct outcomes. `HEDGE_PARTIAL` means positive executable quantity below exact `q`; `HEDGE_DEPTH_UNAVAILABLE` means zero executable quantity in an otherwise valid required-side book. Known data failures use exact missing, stale, displaced-session, or gap-overlap classifications and never become `NO TRADE` or `HEDGE_OUTCOME_UNKNOWN`.
+
+Exact accumulated Lighter notional is authoritative. VWAP is derived evidence and may be a repeating decimal; neither entry-edge nor partial/full hedge validation may reconstruct exact notional by requiring `notional == quantity * rounded_vwap`.
+
+Sizing evidence is internally valid only when it binds the quote direction and policy target notional and deterministically recomputes `q_raw`, the common canonical step, the floored quantity, both raw venue quantities, and every minimum flag from its retained inputs. A quote with mismatched or unverifiable sizing evidence is not economic.
+
+Every data-gap contract identifies its source venue in addition to market, session, and recovery generation. RISEx trade-evidence gaps may invalidate would-fill evidence; Lighter book-evidence gaps may invalidate hedge horizons. A gap from one venue must never invalidate the other venue's evidence.
 
 Sensitivity horizons are `0`, `300`, `500`, and `1000` milliseconds after local monotonic would-fill detection. `2000` milliseconds is permitted only as a cheap stress horizon. The complete latency curve is primary. In particular, `500 ms` is diagnostic and is not a prediction, actual execution latency, SLA, admission guarantee, or fill claim.
 
