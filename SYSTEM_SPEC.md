@@ -1,11 +1,60 @@
-# RISEx Funding Farmer — Paper System Specification
+# RISEx Spread Shadow — System Specification
 
-SYSTEM_SPEC_VERSION = 1.3
-SPEC_STATUS = FROZEN_FOR_PAPER_IMPLEMENTATION
+SYSTEM_SPEC_VERSION = 2.0
+SPEC_STATUS = ACTIVE_SPREAD_SHADOW__FROZEN_LEGACY_FUNDING_FARMER
 
-## 1. Purpose and boundary
+## 0. Active product domain: RISEx Spread Shadow
 
-Research whether a delta-neutral funding strategy used to farm RISEx points can have non-negative trading PnL after configured fees and this paper execution model.
+RISEx Spread Shadow is the active public-only research contour. Its question is whether a reproducible positive entry-execution edge exists when a hypothetical RISEx maker fill is followed by a delayed executable exact-quantity Lighter Standard taker hedge. Points are worth zero. Funding is diagnostic and separate. A future maker fill, future maker exit, or basis convergence is never recognized as earned entry income.
+
+The fixed directions are:
+
+- Direction A: RISEx maker BUY, then Lighter taker SELL.
+- Direction B: RISEx maker SELL, then Lighter taker BUY.
+
+For exact canonical quantity `q`:
+
+```text
+EntryEdgeA(h) = q * (LighterSellVWAP(T_detect + h) - RISExMakerBuyPrice)
+                - exact configured entry fees
+EntryEdgeB(h) = q * (RISExMakerSellPrice - LighterBuyVWAP(T_detect + h))
+                - exact configured entry fees
+ConditionalMarkout(h) = EntryEdge(h) - EntryEdge(0)
+```
+
+Exact-q VWAP already includes visible spread and depth impact. No second spread or slippage deduction is permitted. The configured RISEx fee is applied exactly once with its provenance; public-only evidence must not be described as an observed account-specific fee. Lighter Standard fee and published latency are frozen research inputs with source metadata, not private-account observations or end-to-end execution guarantees.
+
+Sensitivity horizons are `0`, `300`, `500`, and `1000` milliseconds after local monotonic would-fill detection. `2000` milliseconds is permitted only as a cheap stress horizon. The complete latency curve is primary. In particular, `500 ms` is diagnostic and is not a prediction, actual execution latency, SLA, admission guarantee, or fill claim.
+
+Every horizon uses only the latest current-session, sequence-valid Lighter book actually received at or before its absolute monotonic deadline. Later books are never applied retroactively and interpolation is forbidden. Missing, stale, displaced-session, gap-overlapping, or insufficient-depth evidence remains an explicit hedge outcome and never becomes `NO TRADE`.
+
+The fill-to-hedge observation path is event driven from the hypothetical maker-would-fill detection event. Periodic quote refresh or legacy scan cadence may not delay it.
+
+### 0.1 Stages and authority
+
+- `SS-001`: entry observer research. `SS-001A` contains only deterministic pure domain/evidence contracts. After independent acceptance, `SS-001B` may integrate public RISEx/Lighter feeds, prospective horizon captures, append-only evidence, and one bounded report.
+- `SS-002`: one-lot complete-cycle shadow trader. Closed until SS-001 produces repeated `ENTRY_EDGE_CANDIDATE` evidence and the user authorizes the next slice.
+- `SS-003`: frozen-policy holdout. Closed until SS-002 is accepted and its policy is frozen before an untouched interval.
+
+No private endpoint, credential, signing, order preparation, dispatch, testnet/mainnet write, real fund, transfer, withdrawal, or strategy execution is authorized. The active entrypoint must have no reachable dependency on private/auth/write surfaces.
+
+### 0.2 Package and dependency boundary
+
+New code lives under `src/risex_spread_shadow/`; tests live under `tests/spread_shadow/`. It has separate CLI, configuration, run identity, persistence, and report surfaces.
+
+It may reuse only venue-neutral/public contracts and exact pure math: normalized public market models, RISEx and Lighter public adapters, accepted checksum/sequence handling, exact-q VWAP, tick math, common quantity-grid math, fee math, and timestamp/provenance primitives. It must not copy public adapters or create a second venue-contract implementation.
+
+The following legacy strategy dependencies are forbidden from every new entrypoint-reachable path: `risex_farmer.scanner`, `risex_farmer.paper_broker`, `risex_farmer.lifecycle`, legacy `RoutePlan` admission/ranking, funding activation/cutoff policy, position state machine, persistence, Telegram/reporting, operational testnet/mainnet modules, authenticated adapters, credentials, signing, and write code. The legacy public `risex_farmer.runtime` is also not a Spread strategy dependency because it directly imports those forbidden modules.
+
+The limited Spread feed runner may reuse the accepted public adapters and venue-neutral `BookStream`, but must cover only RISEx and Lighter, expose immutable accepted events through one bounded non-blocking queue, emit explicit `DATA_GAP` on overflow, preserve session/recovery/book-revision/sequence/checksum provenance, reject stale or displaced events, and avoid a generic event bus.
+
+## Legacy benchmark domain: RISEx Funding Farmer
+
+Sections 1–21 below are preserved as the historical Funding Farmer specification. That strategy and its profitability path are frozen legacy benchmark material. They remain in the repository but are not active product behavior and must not supply strategy logic to RISEx Spread Shadow.
+
+## 1. Legacy purpose and boundary
+
+Historically, this domain researched whether a delta-neutral funding strategy used to farm RISEx points could have non-negative trading PnL after configured fees and its paper execution model. It is now frozen as a legacy benchmark.
 
 The normal product is PAPER ONLY and uses official public RISEx, Extended, Nado, and Lighter data without private endpoints, trading keys, real orders, or collateral management. Section 21 defines separate isolated testnet programs; they are not runtime switches and never authorize mainnet or real funds.
 

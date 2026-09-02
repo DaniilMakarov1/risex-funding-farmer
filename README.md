@@ -1,8 +1,11 @@
-# RISEx Funding Farmer
+# RISEx Spread Shadow and legacy Funding Farmer
 
-A small, standalone paper trader for testing whether a delta-neutral RISEx-points funding strategy can produce non-negative trading PnL after configured fees and the documented paper execution model.
+This repository contains two deliberately separated research contours.
 
-The default product is **paper only**. It uses official public RISEx, Extended, and Nado market data. Optional venue-specific testnet modules are isolated from normal startup and advance only through separately governed fixture, private-read, and live-write gates. Mainnet and real funds are prohibited. Current acceptance state and the exact active boundaries live in `STATUS.md` and `NEXT_TASK.md`.
+- **RISEx Spread Shadow** is active. It asks whether hypothetical RISEx maker fills retain positive fee-adjusted entry edge against delayed executable exact-quantity Lighter Standard taker hedges. It is public-only shadow research with points valued at `$0`.
+- **RISEx Funding Farmer** is a frozen legacy benchmark. Its code and historical evidence remain available, but its funding-boundary profitability path and operational runs are not active.
+
+No contour currently authorizes private endpoints, credentials, signing, order preparation, order dispatch, testnet/mainnet writes, real funds, transfers, withdrawals, or strategy execution. Current acceptance state and the exact active boundary live in `STATUS.md` and `NEXT_TASK.md`.
 
 ## Requirements
 
@@ -24,7 +27,13 @@ python -m pip install -e '.[test]'
 pytest
 ```
 
-## Commands
+## Entrypoints
+
+The legacy benchmark retains the `risex-farmer` entrypoint documented below. It is not the active Spread Shadow strategy and must not be resumed as an operational process.
+
+The active contour will use a separate `risex-spread-shadow` entrypoint after SS-001B is independently accepted. SS-001A contains pure domain/evidence contracts only, so that entrypoint does not exist yet and no shadow run is currently authorized.
+
+## Legacy commands
 
 The shared public HTTP runtime session uses a 30-second total request timeout so
 large, slow official responses can complete without changing scan cadence or
@@ -107,7 +116,7 @@ risex-farmer --db paper.db paper-run --fixture tests/fixtures/paper_006/positive
 risex-farmer --db paper.db report
 ```
 
-See `SYSTEM_SPEC.md` for frozen product behavior, `STATUS.md` for the accepted baseline, and `NEXT_TASK.md` for the current authorization boundary.
+See `SYSTEM_SPEC.md` for the active Spread Shadow contract and preserved legacy specification, `STATUS.md` for the accepted baseline, and `NEXT_TASK.md` for the current authorization boundary.
 
 The RISEx, Extended, and Nado lifecycle modules are not CLI modes and must not be imported by normal Farmer startup. Their verification levels and safety gates are defined once in `AGENTS.md`; current venue state and work live only in `STATUS.md` and `NEXT_TASK.md`.
 
