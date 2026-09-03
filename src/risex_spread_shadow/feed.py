@@ -18,8 +18,11 @@ from risex_farmer.exchanges.risex import RisexAdapter
 from risex_farmer.market_data import BookStream
 from risex_farmer.models import BookDelta, CanonicalMarket, OrderBook, Venue
 
-from .config import ShadowConfig
+from .config import MAX_PUBLIC_DURATION_SECONDS, ShadowConfig
 from .models import BookEvidence, DataGapEvidence, TradeEvidence
+
+
+_DRAIN_SCHEDULING_ALLOWANCE_SECONDS = 1.2
 
 
 @dataclass(frozen=True, slots=True)
@@ -287,6 +290,7 @@ class PublicFeedRunner:
             )
         self.fatal_reason: str | None = None
         self._connection_serial = {Venue.RISEX: 0, Venue.LIGHTER: 0}
+        self._external_stop_event: asyncio.Event | None = None
 
     def state(self, venue: Venue, canonical_market: str) -> _StreamState:
         return self._states[(venue, canonical_market)]
@@ -368,6 +372,8 @@ class PublicFeedRunner:
 
     def _protocol_failure(self, venue: Venue, reason: str) -> None:
         self.fatal_reason = reason
+        if self._external_stop_event is not None:
+            self._external_stop_event.set()
         for pair in self.market_pairs:
             state = self.state(venue, pair.canonical_market)
             self._gap(state, reason=reason)
@@ -795,19 +801,95 @@ class PublicFeedRunner:
                 if not stop.is_set():
                     self.disconnect(venue, reason="PUBLIC_SOCKET_DISCONNECTED")
 
-    async def run(self, *, duration_seconds: int | None = None) -> None:
+    async def run(
+        self,
+        *,
+        duration_seconds: int | None = None,
+        stop_event: asyncio.Event | None = None,
+        drain_event: asyncio.Event | None = None,
+    ) -> None:
         duration = self.config.duration_seconds if duration_seconds is None else duration_seconds
-        if isinstance(duration, bool) or not isinstance(duration, int) or duration <= 0 or duration > 900:
-            raise ValueError("public smoke duration must be 1..900 seconds")
+        if (
+            isinstance(duration, bool)
+            or not isinstance(duration, int)
+            or duration <= 0
+            or duration > MAX_PUBLIC_DURATION_SECONDS
+        ):
+            raise ValueError(
+                f"public smoke duration must be 1..{MAX_PUBLIC_DURATION_SECONDS} seconds"
+            )
+        # The prospective wall-clock gate is independent from the operator's
+        # requested duration.  A shorter configured sample wall-clock limit
+        # therefore always wins without allowing a longer feed timer to
+        # bypass it.
+        effective_duration = min(duration, self.config.sample_wall_clock_seconds)
         stop = asyncio.Event()
+        risex_stop = asyncio.Event()
         tasks = [
-            asyncio.create_task(self._transport_loop(Venue.RISEX, stop)),
+            asyncio.create_task(self._transport_loop(Venue.RISEX, risex_stop)),
             asyncio.create_task(self._transport_loop(Venue.LIGHTER, stop)),
         ]
+        self._external_stop_event = stop_event
+        timer: asyncio.Task[None] | None = None
+        requested_stop: asyncio.Task[bool] | None = None
+        drain_timer: asyncio.Task[None] | None = None
+        drain_waiter: asyncio.Task[bool] | None = None
         try:
-            await asyncio.sleep(duration)
+            if stop_event is None:
+                await asyncio.sleep(effective_duration)
+            else:
+                requested_stop = asyncio.create_task(stop_event.wait())
+                if duration >= self.config.sample_wall_clock_seconds:
+                    # At the configured wall boundary, the observer's
+                    # explicit timer is authoritative.  Waiting for its
+                    # latched event avoids a duration-timer race that could
+                    # close the feed before the SAMPLE_STOP marker and drain
+                    # tail are established.
+                    await requested_stop
+                    done = {requested_stop}
+                else:
+                    timer = asyncio.create_task(asyncio.sleep(effective_duration))
+                    done, _ = await asyncio.wait(
+                        (timer, requested_stop),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                sample_stop_requested = requested_stop in done and self.fatal_reason is None
+                if sample_stop_requested:
+                    # No further RISEx books or trades may extend the sample.
+                    # Keep only Lighter ingress alive for the already-created
+                    # horizon captures, bounded by the largest configured
+                    # horizon plus normal scheduling allowance.
+                    risex_stop.set()
+                    tasks[0].cancel()
+                    await asyncio.gather(tasks[0], return_exceptions=True)
+                    drain_seconds = (
+                        max(self.config.horizons_ms) / 1000
+                        + _DRAIN_SCHEDULING_ALLOWANCE_SECONDS
+                    )
+                    if drain_event is None:
+                        drain_timer = asyncio.create_task(asyncio.sleep(drain_seconds))
+                        await drain_timer
+                    elif not drain_event.is_set():
+                        drain_timer = asyncio.create_task(asyncio.sleep(drain_seconds))
+                        drain_waiter = asyncio.create_task(drain_event.wait())
+                        await asyncio.wait(
+                            (drain_timer, drain_waiter),
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
         finally:
+            self._external_stop_event = None
+            for waiter in (timer, requested_stop, drain_timer, drain_waiter):
+                if waiter is not None and not waiter.done():
+                    waiter.cancel()
+            waiters = tuple(
+                waiter
+                for waiter in (timer, requested_stop, drain_timer, drain_waiter)
+                if waiter is not None
+            )
+            if waiters:
+                await asyncio.gather(*waiters, return_exceptions=True)
             stop.set()
+            risex_stop.set()
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)

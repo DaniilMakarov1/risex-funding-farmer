@@ -34,6 +34,20 @@ _FORBIDDEN_FIELD_PARTS = (
 )
 
 
+MAX_EVIDENCE_RECORDS = 2_500_000
+MAX_EVIDENCE_FILE_BYTES = 12 * 1024 * 1024 * 1024
+TERMINAL_FAILURE_RECORD_RESERVE = 1
+TERMINAL_FAILURE_BYTES_RESERVE = 16 * 1024
+
+
+class EvidenceStorageLimitExceeded(RuntimeError):
+    """Raised before an append would cross a bounded evidence-store limit."""
+
+    def __init__(self, limit: str) -> None:
+        self.limit = limit
+        super().__init__(f"evidence storage {limit} limit exceeded")
+
+
 def new_run_id() -> str:
     """Return an unpredictable, path-safe identity for one fresh run."""
 
@@ -104,6 +118,7 @@ class AppendOnlyEvidenceStore:
         self.run_id = run_id
         self._closed = False
         self._record_index = 0
+        self._bytes_written = 0
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.path.parent, stat.S_IRWXU)
         descriptor = os.open(
@@ -141,6 +156,14 @@ class AppendOnlyEvidenceStore:
     def is_closed(self) -> bool:
         return self._closed
 
+    @property
+    def record_count(self) -> int:
+        return self._record_index
+
+    @property
+    def byte_count(self) -> int:
+        return self._bytes_written
+
     def append_batch(
         self,
         records: Sequence[Mapping[str, Any]],
@@ -165,16 +188,42 @@ class AppendOnlyEvidenceStore:
                 enumerate(normalized), key=lambda item: _record_order(item[1], item[0])
             )
         )
+        terminal_failure = (
+            len(ordered) == 1 and ordered[0].get("kind") == "RUN_FAILED"
+        )
+        if MAX_EVIDENCE_RECORDS <= TERMINAL_FAILURE_RECORD_RESERVE:
+            raise ValueError("MAX_EVIDENCE_RECORDS must leave a terminal-marker reserve")
+        record_limit = (
+            MAX_EVIDENCE_RECORDS
+            if terminal_failure
+            else MAX_EVIDENCE_RECORDS - TERMINAL_FAILURE_RECORD_RESERVE
+        )
+        serialized: list[str] = []
         assigned: list[int] = []
-        for record in ordered:
-            index = self._record_index
-            self._record_index += 1
+        for offset, record in enumerate(ordered):
+            index = self._record_index + offset
             payload = dict(record)
             payload["run_id"] = self.run_id
             payload["record_index"] = index
-            self._file.write(json.dumps(_json_value(payload), sort_keys=True, separators=(",", ":")))
-            self._file.write("\n")
+            serialized.append(
+                json.dumps(_json_value(payload), sort_keys=True, separators=(",", ":"))
+                + "\n"
+            )
             assigned.append(index)
+        batch_bytes = sum(len(line.encode("utf-8")) for line in serialized)
+        byte_limit = (
+            MAX_EVIDENCE_FILE_BYTES
+            if terminal_failure
+            else MAX_EVIDENCE_FILE_BYTES - TERMINAL_FAILURE_BYTES_RESERVE
+        )
+        if self._record_index + len(ordered) > record_limit:
+            raise EvidenceStorageLimitExceeded("RECORD_COUNT")
+        if self._bytes_written + batch_bytes > byte_limit:
+            raise EvidenceStorageLimitExceeded("FILE_BYTES")
+        for line in serialized:
+            self._file.write(line)
+            self._record_index += 1
+            self._bytes_written += len(line.encode("utf-8"))
         self._file.flush()
         if sync:
             os.fsync(self._file.fileno())
@@ -215,6 +264,11 @@ def store_permissions(path: str | os.PathLike[str]) -> int:
 
 __all__ = [
     "AppendOnlyEvidenceStore",
+    "EvidenceStorageLimitExceeded",
+    "MAX_EVIDENCE_FILE_BYTES",
+    "MAX_EVIDENCE_RECORDS",
+    "TERMINAL_FAILURE_BYTES_RESERVE",
+    "TERMINAL_FAILURE_RECORD_RESERVE",
     "iter_records",
     "new_run_id",
     "store_permissions",

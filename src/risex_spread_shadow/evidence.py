@@ -14,6 +14,7 @@ from .models import (
     DataGapEvidence,
     EntryViabilityEpisode,
     EntryViabilityOutcome,
+    FillabilityModel,
     HedgeHorizonCapture,
     QuoteVersion,
     SpreadDirection,
@@ -56,6 +57,126 @@ def _trade_qualifies(quote_version: QuoteVersion, trade: TradeEvidence, tick: De
     return (
         trade.aggressor_side is Side.BUY
         and trade.canonical_price >= quote.maker_price + tick  # type: ignore[operator]
+    )
+
+
+def is_eligible_trade(quote_version: QuoteVersion, trade: TradeEvidence) -> bool:
+    """Return whether a trade is relevant to at least one active quote version.
+
+    Eligibility deliberately stops before price qualification.  A trade can be
+    eligible while merely missing, touching, or passing a quote; those are
+    separate fillability observations.  Local receipt ordering and the quote's
+    stream identity remain the only ordering/identity authorities.
+    """
+
+    quote = quote_version.quote
+    if not quote_version.is_active or quote.maker_price is None:
+        return False
+    return (
+        trade.venue is Venue.RISEX
+        and trade.canonical_market == quote_version.canonical_market
+        and trade.stream_session_id == quote_version.stream_session_id
+        and trade.recovery_generation == quote_version.recovery_generation
+        and trade.received_monotonic_ns > quote_version.quote_created_monotonic_ns
+        and (
+            quote_version.quote_expires_monotonic_ns is None
+            or trade.received_monotonic_ns < quote_version.quote_expires_monotonic_ns
+        )
+        and trade.aggressor_side is quote_version.direction.hedge_side
+    )
+
+
+def _optimistic_trade_qualifies(
+    quote_version: QuoteVersion, trade: TradeEvidence
+) -> bool:
+    """Apply the at-or-through optimistic upper-bound price rule."""
+
+    if not is_eligible_trade(quote_version, trade):
+        return False
+    quote = quote_version.quote
+    if quote.maker_side is Side.BUY:
+        return trade.canonical_price <= quote.maker_price  # type: ignore[operator]
+    return trade.canonical_price >= quote.maker_price  # type: ignore[operator]
+
+
+def detect_optimistic_would_fill(
+    quote_version: QuoteVersion,
+    trades: Iterable[TradeEvidence],
+    *,
+    data_gaps: Iterable[DataGapEvidence] = (),
+    would_fill_detected_monotonic_ns: int | None = None,
+    detected_utc=None,
+    hedge_stream_session_id: str | int | None = None,
+    hedge_recovery_generation: int | None = None,
+) -> WouldFillEvidence | None:
+    """Detect the explicitly labelled at-or-through public upper bound.
+
+    This model assumes that every eligible public quantity is allocated to the
+    quote (zero queue ahead and no hidden liquidity).  It is intentionally
+    separate from :func:`detect_strict_would_fill`: equality and sub-tick
+    prices qualify here, while the strict lower-bound detector remains a
+    one-full-tick-through, tick-aligned contract.
+    """
+
+    quote = quote_version.quote
+    if not quote_version.is_active or not validate_quote_economics(quote):
+        return None
+    if quote.maker_price is None or quote.canonical_quantity is None:
+        return None
+    grouped: dict[str, list[TradeEvidence]] = {}
+    for trade in tuple(trades):
+        grouped.setdefault(trade.trade_event_key, []).append(trade)
+    resolved_list: list[TradeEvidence] = []
+    for _key, group in sorted(grouped.items()):
+        if any(trade != group[0] for trade in group[1:]):
+            return None
+        resolved_list.append(group[0])
+    ordered = sorted(
+        resolved_list,
+        key=lambda trade: (trade.received_monotonic_ns, trade.trade_event_key),
+    )
+    qualifying: list[TradeEvidence] = []
+    cumulative = Decimal("0")
+    threshold_received: int | None = None
+    for trade in ordered:
+        if _optimistic_trade_qualifies(quote_version, trade):
+            qualifying.append(trade)
+            cumulative += trade.canonical_quantity
+            if cumulative >= quote.canonical_quantity:
+                threshold_received = trade.received_monotonic_ns
+                break
+    if not qualifying or threshold_received is None:
+        return None
+    detection = (
+        threshold_received
+        if would_fill_detected_monotonic_ns is None
+        else would_fill_detected_monotonic_ns
+    )
+    _int(detection, "would_fill_detected_monotonic_ns")
+    if detection < threshold_received or detection <= quote_version.quote_created_monotonic_ns:
+        return None
+    if quote_version.quote_expires_monotonic_ns is not None and detection >= quote_version.quote_expires_monotonic_ns:
+        return None
+    if _matching_risex_gap(data_gaps, quote_version, detection) is not None:
+        return None
+    if hedge_stream_session_id is None:
+        hedge_stream_session_id = quote_version.hedge_stream_session_id
+    if hedge_recovery_generation is None:
+        hedge_recovery_generation = quote_version.hedge_recovery_generation
+    return WouldFillEvidence(
+        quote_version_id=quote_version.version_id,
+        venue=Venue.RISEX,
+        canonical_market=quote_version.canonical_market,
+        direction=quote_version.direction,
+        canonical_quantity=quote.canonical_quantity,
+        cumulative_eligible_quantity=cumulative,
+        qualifying_trade_event_keys=tuple(trade.trade_event_key for trade in qualifying),
+        would_fill_detected_monotonic_ns=detection,
+        qualifying_trades=tuple(qualifying),
+        detected_utc=detected_utc,
+        hedge_stream_session_id=hedge_stream_session_id,
+        hedge_recovery_generation=hedge_recovery_generation,
+        fillability_model=FillabilityModel.OPTIMISTIC_UPPER_BOUND,
     )
 
 
@@ -253,6 +374,7 @@ def _capture(
     gap: DataGapEvidence | None = None,
     freshness_max_age_ns: int | None = None,
     ambiguous_books: tuple[BookEvidence, ...] = (),
+    fillability_model: FillabilityModel = FillabilityModel.STRICT_LOWER_BOUND,
 ) -> HedgeHorizonCapture:
     return HedgeHorizonCapture(
         horizon_ms=horizon_ms,
@@ -276,6 +398,7 @@ def _capture(
         gap_evidence=gap,
         freshness_max_age_ns=freshness_max_age_ns,
         ambiguous_books=ambiguous_books,
+        fillability_model=fillability_model,
     )
 
 
@@ -288,6 +411,7 @@ def capture_horizon(
     expected_recovery_generation: int | None = None,
     data_gaps: Iterable[DataGapEvidence] = (),
     freshness_max_age_ns: int | None = None,
+    fillability_model: FillabilityModel | str | None = None,
 ) -> HedgeHorizonCapture:
     """Select the latest eligible Lighter book without look-ahead."""
 
@@ -311,6 +435,13 @@ def capture_horizon(
         raise ValueError("expected Lighter session and recovery generation are required")
     if freshness_max_age_ns is not None:
         _int(freshness_max_age_ns, "freshness_max_age_ns")
+    model = (
+        would_fill.fillability_model
+        if fillability_model is None
+        else fillability_model
+    )
+    if not isinstance(model, FillabilityModel):
+        model = FillabilityModel(model)
     books_tuple = tuple(books)
     gaps_tuple = tuple(data_gaps)
 
@@ -325,6 +456,7 @@ def capture_horizon(
             requested=would_fill.canonical_quantity,
             outcome=outcome,
             freshness_max_age_ns=freshness_max_age_ns,
+            fillability_model=model,
             **kwargs,
         )
 
@@ -432,16 +564,35 @@ def build_entry_viability_episode(
     detected_utc=None,
     horizons: Sequence[int] = (0, 300, 500, 1000),
     freshness_max_age_ns: int | None = None,
+    fillability_model: FillabilityModel | str = FillabilityModel.STRICT_LOWER_BOUND,
 ) -> EntryViabilityEpisode:
     """Replay one immutable quote/evidence set into an episode."""
 
     quote = quote_version.quote
+    model = (
+        fillability_model
+        if isinstance(fillability_model, FillabilityModel)
+        else FillabilityModel(fillability_model)
+    )
     if quote.outcome is EntryViabilityOutcome.QUOTE_NOT_POST_ONLY:
-        return EntryViabilityEpisode(quote_version, EntryViabilityOutcome.QUOTE_NOT_POST_ONLY)
+        return EntryViabilityEpisode(
+            quote_version,
+            EntryViabilityOutcome.QUOTE_NOT_POST_ONLY,
+            fillability_model=model,
+        )
     if not quote_version.is_active or not validate_quote_economics(quote):
-        return EntryViabilityEpisode(quote_version, EntryViabilityOutcome.QUOTE_NOT_ECONOMIC)
+        return EntryViabilityEpisode(
+            quote_version,
+            EntryViabilityOutcome.QUOTE_NOT_ECONOMIC,
+            fillability_model=model,
+        )
     data_gaps = tuple(data_gaps)
-    would_fill = detect_strict_would_fill(
+    detector = (
+        detect_strict_would_fill
+        if model is FillabilityModel.STRICT_LOWER_BOUND
+        else detect_optimistic_would_fill
+    )
+    would_fill = detector(
         quote_version,
         trades,
         data_gaps=data_gaps,
@@ -455,7 +606,11 @@ def build_entry_viability_episode(
         else quote_version.hedge_recovery_generation,
     )
     if would_fill is None:
-        return EntryViabilityEpisode(quote_version, EntryViabilityOutcome.NO_WOULD_FILL)
+        return EntryViabilityEpisode(
+            quote_version,
+            EntryViabilityOutcome.NO_WOULD_FILL,
+            fillability_model=model,
+        )
     if books_by_horizon is None:
         books_by_horizon = {}
     captures = tuple(
@@ -471,6 +626,7 @@ def build_entry_viability_episode(
             else quote_version.hedge_recovery_generation,
             data_gaps=data_gaps,
             freshness_max_age_ns=freshness_max_age_ns,
+            fillability_model=model,
         )
         for horizon in horizons
     )
@@ -479,6 +635,7 @@ def build_entry_viability_episode(
         EntryViabilityOutcome.WOULD_FILL,
         would_fill,
         captures,
+        model,
     )
 
 
@@ -491,8 +648,10 @@ select_horizon_capture = capture_horizon
 __all__ = [
     "build_entry_viability_episode",
     "capture_horizon",
+    "detect_optimistic_would_fill",
     "detect_strict_would_fill",
     "horizon_deadline_monotonic_ns",
+    "is_eligible_trade",
     "select_horizon_capture",
     "would_fill_evidence",
 ]

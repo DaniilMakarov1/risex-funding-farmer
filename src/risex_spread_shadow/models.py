@@ -103,6 +103,62 @@ class SpreadDirection(StrEnum):
         return Side.SELL if self is self.RISEX_BUY_LIGHTER_SELL else Side.BUY
 
 
+class FillabilityModel(StrEnum):
+    """The two explicitly bounded public fillability interpretations."""
+
+    STRICT_LOWER_BOUND = "STRICT_LOWER_BOUND"
+    OPTIMISTIC_UPPER_BOUND = "OPTIMISTIC_UPPER_BOUND"
+
+    # Short aliases keep call sites readable without adding another model.
+    STRICT = STRICT_LOWER_BOUND
+    OPTIMISTIC = OPTIMISTIC_UPPER_BOUND
+
+
+class SampleStopReason(StrEnum):
+    """The bounded prospective sample-stop conditions."""
+
+    STRICT_EPISODE_LIMIT = "STRICT_EPISODE_LIMIT"
+    ELIGIBLE_TRADE_LIMIT = "ELIGIBLE_TRADE_LIMIT"
+    WALL_CLOCK_LIMIT = "WALL_CLOCK_LIMIT"
+    INTEGRITY_FAILURE = "INTEGRITY_FAILURE"
+
+    STRICT_EPISODES = STRICT_EPISODE_LIMIT
+    ELIGIBLE_TRADES = ELIGIBLE_TRADE_LIMIT
+    WALL_CLOCK = WALL_CLOCK_LIMIT
+    INTEGRITY = INTEGRITY_FAILURE
+
+
+@dataclass(frozen=True, slots=True)
+class SampleStopSignal:
+    """One latched, deterministic first-stop-wins observation."""
+
+    reason: SampleStopReason
+    observed_monotonic_ns: int
+    strict_episode_count: int
+    eligible_trade_count: int
+    optimistic_episode_count: int = 0
+    integrity_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        reason = self.reason if isinstance(self.reason, SampleStopReason) else SampleStopReason(self.reason)
+        object.__setattr__(self, "reason", reason)
+        _non_negative_int(self.observed_monotonic_ns, "observed_monotonic_ns")
+        for value, name in (
+            (self.strict_episode_count, "strict_episode_count"),
+            (self.eligible_trade_count, "eligible_trade_count"),
+            (self.optimistic_episode_count, "optimistic_episode_count"),
+        ):
+            _non_negative_int(value, name)
+        if self.integrity_reason is not None and not self.integrity_reason:
+            raise ValueError("integrity_reason must be non-empty when supplied")
+        if reason is SampleStopReason.INTEGRITY_FAILURE and self.integrity_reason is None:
+            raise ValueError("integrity stop requires an integrity reason")
+
+    @property
+    def stop_reason(self) -> SampleStopReason:
+        return self.reason
+
+
 class EntryViabilityOutcome(StrEnum):
     """Fail-closed quote, fill, and hedge outcomes."""
 
@@ -683,7 +739,7 @@ def queue_overflow_gap(
 
 @dataclass(frozen=True, slots=True)
 class WouldFillEvidence:
-    """Conservative, version-local hypothetical maker fill evidence."""
+    """Version-local hypothetical maker fill evidence for one bound."""
 
     quote_version_id: str
     venue: Venue
@@ -697,12 +753,19 @@ class WouldFillEvidence:
     detected_utc: datetime | None = None
     hedge_stream_session_id: str | int | None = None
     hedge_recovery_generation: int | None = None
+    fillability_model: FillabilityModel = FillabilityModel.STRICT_LOWER_BOUND
 
     def __post_init__(self) -> None:
         if not self.quote_version_id:
             raise ValueError("quote_version_id must be non-empty")
         venue = self.venue if isinstance(self.venue, Venue) else Venue(self.venue)
         object.__setattr__(self, "venue", venue)
+        model = (
+            self.fillability_model
+            if isinstance(self.fillability_model, FillabilityModel)
+            else FillabilityModel(self.fillability_model)
+        )
+        object.__setattr__(self, "fillability_model", model)
         if venue is not Venue.RISEX:
             raise ValueError("would-fill evidence must come from RISEx")
         if not self.canonical_market:
@@ -749,6 +812,10 @@ class WouldFillEvidence:
     def filled_quantity(self) -> Decimal:
         return self.canonical_quantity
 
+    @property
+    def model(self) -> FillabilityModel:
+        return self.fillability_model
+
 
 @dataclass(frozen=True, slots=True)
 class HedgeHorizonCapture:
@@ -775,6 +842,7 @@ class HedgeHorizonCapture:
     gap_evidence: DataGapEvidence | None = None
     freshness_max_age_ns: int | None = None
     ambiguous_books: tuple[BookEvidence, ...] = ()
+    fillability_model: FillabilityModel = FillabilityModel.STRICT_LOWER_BOUND
 
     def __post_init__(self) -> None:
         if isinstance(self.horizon_ms, bool) or not isinstance(self.horizon_ms, int):
@@ -804,6 +872,12 @@ class HedgeHorizonCapture:
             else EntryViabilityOutcome(self.outcome)
         )
         object.__setattr__(self, "outcome", outcome)
+        model = (
+            self.fillability_model
+            if isinstance(self.fillability_model, FillabilityModel)
+            else FillabilityModel(self.fillability_model)
+        )
+        object.__setattr__(self, "fillability_model", model)
         if self.vwap_price is not None and _decimal(self.vwap_price, "vwap_price") <= 0:
             raise ValueError("vwap_price must be positive when present")
         if self.freshness_max_age_ns is not None:
@@ -974,6 +1048,10 @@ class HedgeHorizonCapture:
     def exact_notional_usd(self) -> Decimal:
         return self.notional_usd
 
+    @property
+    def model(self) -> FillabilityModel:
+        return self.fillability_model
+
 
 @dataclass(frozen=True, slots=True)
 class EntryViabilityEpisode:
@@ -983,6 +1061,7 @@ class EntryViabilityEpisode:
     outcome: EntryViabilityOutcome
     would_fill_evidence: WouldFillEvidence | None = None
     horizon_captures: tuple[HedgeHorizonCapture, ...] = ()
+    fillability_model: FillabilityModel | None = None
 
     def __post_init__(self) -> None:
         outcome = (
@@ -991,6 +1070,16 @@ class EntryViabilityEpisode:
             else EntryViabilityOutcome(self.outcome)
         )
         object.__setattr__(self, "outcome", outcome)
+        model = self.fillability_model
+        if model is None:
+            model = (
+                self.would_fill_evidence.fillability_model
+                if self.would_fill_evidence is not None
+                else FillabilityModel.STRICT_LOWER_BOUND
+            )
+        elif not isinstance(model, FillabilityModel):
+            model = FillabilityModel(model)
+        object.__setattr__(self, "fillability_model", model)
         if not isinstance(self.horizon_captures, tuple):
             raise TypeError("horizon_captures must be a tuple")
         if outcome is not EntryViabilityOutcome.WOULD_FILL and self.horizon_captures:
@@ -1003,6 +1092,8 @@ class EntryViabilityEpisode:
                 raise ValueError("would-fill market does not match quote version")
             if evidence.direction is not self.quote_version.direction:
                 raise ValueError("would-fill direction does not match quote version")
+            if evidence.fillability_model is not model:
+                raise ValueError("would-fill model does not match episode")
             if outcome is not EntryViabilityOutcome.WOULD_FILL:
                 raise ValueError("would-fill evidence requires WOULD_FILL episode outcome")
         if outcome is EntryViabilityOutcome.WOULD_FILL and self.would_fill_evidence is None:
@@ -1016,10 +1107,16 @@ class EntryViabilityEpisode:
                     != self.would_fill_evidence.would_fill_detected_monotonic_ns
                 ):
                     raise ValueError("horizon detection time does not match would-fill evidence")
+            if capture.fillability_model is not model:
+                raise ValueError("horizon model does not match episode")
 
     @property
     def captures_by_horizon(self) -> tuple[HedgeHorizonCapture, ...]:
         return self.horizon_captures
+
+    @property
+    def model(self) -> FillabilityModel:
+        return self.fillability_model
 
 
 __all__ = [
@@ -1031,11 +1128,14 @@ __all__ = [
     "EntryViabilityOutcome",
     "ExactVwap",
     "FeeEvidence",
+    "FillabilityModel",
     "HedgeHorizonCapture",
     "HypotheticalMakerQuote",
     "LighterBookEvidence",
     "QuotePolicy",
     "QuoteVersion",
+    "SampleStopReason",
+    "SampleStopSignal",
     "SizingEvidence",
     "SpreadDirection",
     "TradeEvidence",

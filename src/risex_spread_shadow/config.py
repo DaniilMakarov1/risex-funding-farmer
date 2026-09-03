@@ -1,4 +1,4 @@
-"""Small, immutable configuration for the SS-001B public measurement."""
+"""Small, immutable configuration for the SS-001D public measurement."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ _DEFAULT_MARGINS = (
     Decimal("5"),
 )
 _DEFAULT_HORIZONS = (0, 300, 500, 1000)
+MAX_PUBLIC_DURATION_SECONDS = 1_200
 
 
 def _positive_decimal_tuple(value: tuple[Decimal, ...], name: str) -> tuple[Decimal, ...]:
@@ -31,7 +32,7 @@ def _positive_decimal_tuple(value: tuple[Decimal, ...], name: str) -> tuple[Deci
 
 @dataclass(frozen=True, slots=True)
 class ShadowConfig:
-    """Only the fixed SS-001B measurement grid and bounded runtime limits."""
+    """Only the fixed SS-001D measurement grid and bounded runtime limits."""
 
     target_notionals_usd: tuple[Decimal, ...] = _DEFAULT_NOTIONALS
     target_margins_bps: tuple[Decimal, ...] = _DEFAULT_MARGINS
@@ -46,6 +47,9 @@ class ShadowConfig:
     store_batch_interval_seconds: float = 0.25
     max_markets: int = 3
     duration_seconds: int = 60
+    strict_episode_limit: int = 50
+    eligible_trade_limit: int = 500
+    sample_wall_clock_seconds: int = 1_200
     risex_maker_fee_rate: Decimal = Decimal("0.00005")
     lighter_taker_fee_rate: Decimal = Decimal("0")
     risex_fee_source: str = "CONFIGURED_RISEX_RESEARCH_INPUT"
@@ -71,6 +75,9 @@ class ShadowConfig:
             (self.store_batch_size, "store_batch_size"),
             (self.max_markets, "max_markets"),
             (self.duration_seconds, "duration_seconds"),
+            (self.strict_episode_limit, "strict_episode_limit"),
+            (self.eligible_trade_limit, "eligible_trade_limit"),
+            (self.sample_wall_clock_seconds, "sample_wall_clock_seconds"),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
@@ -89,8 +96,12 @@ class ShadowConfig:
             raise ValueError("store_batch_interval_seconds must be positive")
         if self.max_markets > 3:
             raise ValueError("max_markets must not exceed three")
-        if self.duration_seconds > 900:
-            raise ValueError("duration_seconds must not exceed 900")
+        if self.duration_seconds > MAX_PUBLIC_DURATION_SECONDS:
+            raise ValueError(
+                f"duration_seconds must not exceed {MAX_PUBLIC_DURATION_SECONDS}"
+            )
+        if self.sample_wall_clock_seconds < 1:
+            raise ValueError("sample_wall_clock_seconds must be positive")
         for value, name in (
             (self.risex_maker_fee_rate, "risex_maker_fee_rate"),
             (self.lighter_taker_fee_rate, "lighter_taker_fee_rate"),
@@ -103,3 +114,7 @@ class ShadowConfig:
     @property
     def policy_count(self) -> int:
         return 2 * len(self.target_notionals_usd) * len(self.target_margins_bps)
+
+    @property
+    def sample_wall_clock_limit_ns(self) -> int:
+        return self.sample_wall_clock_seconds * 1_000_000_000

@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from decimal import Decimal as D
 import json
 from pathlib import Path
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -28,7 +29,9 @@ from risex_spread_shadow import (
     FeedTradeEvent,
     HistoryCapacityExceeded,
     IngressQueue,
+    EvidenceStorageLimitExceeded,
     MarketPair,
+    MAX_PUBLIC_DURATION_SECONDS,
     ReplayHarness,
     ShadowConfig,
     SpreadObserver,
@@ -40,6 +43,8 @@ from risex_spread_shadow import (
 )
 from risex_spread_shadow.feed import PublicFeedRunner
 import risex_spread_shadow.runner as runner_module
+import risex_spread_shadow.store as store_module
+import risex_spread_shadow.cli as cli_module
 
 
 UTC = timezone.utc
@@ -127,6 +132,280 @@ def config(**changes) -> ShadowConfig:
     return ShadowConfig(**values)
 
 
+def test_public_duration_cap_is_shared_by_config_and_cli(tmp_path: Path, monkeypatch) -> None:
+    assert ShadowConfig(duration_seconds=MAX_PUBLIC_DURATION_SECONDS).duration_seconds == 1_200
+    with pytest.raises(ValueError, match="must not exceed"):
+        ShadowConfig(duration_seconds=MAX_PUBLIC_DURATION_SECONDS + 1)
+
+    captured: dict[str, object] = {}
+
+    async def fake_smoke(*args, **kwargs):
+        captured.update(kwargs)
+        return {"record_count": 1, "byte_count": 1}
+
+    monkeypatch.setattr(cli_module, "run_public_smoke", fake_smoke)
+    monkeypatch.setattr(cli_module, "_source_commit", lambda: "fixture")
+    assert (
+        cli_module.main(
+            [
+                "smoke",
+                "--store-root",
+                str(tmp_path),
+                "--duration-seconds",
+                str(MAX_PUBLIC_DURATION_SECONDS),
+                "--max-markets",
+                "1",
+            ]
+        )
+        == 0
+    )
+    assert captured["duration_seconds"] == MAX_PUBLIC_DURATION_SECONDS
+    with pytest.raises(SystemExit, match="between 1 and 1200"):
+        cli_module.main(
+            [
+                "smoke",
+                "--store-root",
+                str(tmp_path),
+                "--duration-seconds",
+                str(MAX_PUBLIC_DURATION_SECONDS + 1),
+            ]
+        )
+
+
+@pytest.mark.asyncio
+async def test_public_feed_honors_external_stop_and_duration_cap(monkeypatch) -> None:
+    class FakeRisex:
+        ws_base = "wss://risex.test"
+
+        @staticmethod
+        def market_id(_symbol):
+            return 1
+
+    class FakeLighter:
+        ws_base = "wss://lighter.test"
+
+        @staticmethod
+        def market_id(_symbol):
+            return 2
+
+    runner = PublicFeedRunner(
+        None,
+        (PAIR,),
+        IngressQueue(8),
+        config=config(),
+        risex_adapter=FakeRisex(),
+        lighter_adapter=FakeLighter(),
+    )
+    started = asyncio.Event()
+    started_count = 0
+
+    async def fake_transport(venue, stop):
+        nonlocal started_count
+        started_count += 1
+        if started_count == 2:
+            started.set()
+        await stop.wait()
+
+    monkeypatch.setattr(runner, "_transport_loop", fake_transport)
+    with pytest.raises(ValueError, match="1..1200"):
+        await runner.run(duration_seconds=MAX_PUBLIC_DURATION_SECONDS + 1)
+
+    requested_stop = asyncio.Event()
+    drain = asyncio.Event()
+    drain.set()
+    task = asyncio.create_task(
+        runner.run(
+            duration_seconds=MAX_PUBLIC_DURATION_SECONDS,
+            stop_event=requested_stop,
+            drain_event=drain,
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+    requested_stop.set()
+    await asyncio.wait_for(task, timeout=1)
+    assert runner.fatal_reason is None
+
+
+@pytest.mark.asyncio
+async def test_sample_stop_persists_on_silent_feed_wall_clock(tmp_path: Path) -> None:
+    store = AppendOnlyEvidenceStore.create(
+        tmp_path,
+        metadata={"source_commit": "fixture", "evidence_mode": "OBSERVATIONAL"},
+    )
+    observer = SpreadObserver(
+        config(sample_wall_clock_seconds=1),
+        (PAIR,),
+        store,
+        sample_started_monotonic_ns=time.monotonic_ns(),
+    )
+    observer._sample_stop.wall_clock_limit_ns = 10_000_000
+    seen: dict[str, object] = {}
+
+    class Feed:
+        ingress = observer.ingress
+
+        async def run(self, **kwargs):
+            seen.update(kwargs)
+            await asyncio.wait_for(kwargs["stop_event"].wait(), timeout=1)
+            await kwargs["drain_event"].wait()
+
+    await runner_module.SpreadShadowRunner(Feed(), observer).run(duration_seconds=1)
+    store.close()
+    records = [json.loads(line) for line in store.path.read_text().splitlines()]
+    stops = [record for record in records if record.get("kind") == "SAMPLE_STOP"]
+    assert len(stops) == 1
+    assert stops[0]["reason"] == "WALL_CLOCK_LIMIT"
+    assert observer.sample_stop_signal is not None
+    assert observer.sample_stop_signal.reason.value == "WALL_CLOCK_LIMIT"
+    assert isinstance(seen["stop_event"], asyncio.Event)
+
+
+@pytest.mark.asyncio
+async def test_sample_stop_freezes_economics_and_drains_lighter_horizons(tmp_path: Path) -> None:
+    store = AppendOnlyEvidenceStore.create(
+        tmp_path,
+        metadata={"source_commit": "fixture", "evidence_mode": "OBSERVATIONAL"},
+    )
+    base = time.monotonic_ns()
+    observer = SpreadObserver(
+        config(strict_episode_limit=1),
+        (PAIR,),
+        store,
+        sample_started_monotonic_ns=base,
+    )
+    initial = (
+        FeedBookEvent(evidence_book(Venue.RISEX, received=base, session="risex"), PAIR, "SNAPSHOT", "fixture"),
+        FeedBookEvent(
+            evidence_book(
+                Venue.LIGHTER,
+                received=base,
+                session="lighter",
+                bids=(("100", "10"),),
+                asks=(("102", "10"),),
+            ),
+            PAIR,
+            "SNAPSHOT",
+            "fixture",
+        ),
+        FeedTradeEvent(trade(received=base + 1), PAIR, "fixture"),
+    )
+    delayed_book = FeedBookEvent(
+        evidence_book(
+            Venue.LIGHTER,
+            received=base + 100_000_000,
+            session="lighter",
+            revision=2,
+            bids=(("90", "10"),),
+            asks=(("110", "10"),),
+        ),
+        PAIR,
+        "DELTA",
+        "fixture",
+    )
+    later_trade = FeedTradeEvent(
+        TradeEvidence(
+            trade_event_key="after-stop",
+            venue=Venue.RISEX,
+            canonical_market="BTC",
+            canonical_price=D("98"),
+            canonical_quantity=D("10"),
+            aggressor_side=Side.SELL,
+            received_utc=NOW,
+            received_monotonic_ns=base + 200_000_000,
+            stream_session_id="risex",
+            recovery_generation=0,
+            exchange_event_utc=NOW,
+            exchange_event_time_provenance="fixture-event-time",
+        ),
+        PAIR,
+        "fixture",
+    )
+
+    counts_after_stop: tuple[int, int, int] | None = None
+
+    class Feed:
+        ingress = observer.ingress
+
+        async def run(self, **kwargs):
+            nonlocal counts_after_stop
+            for item in initial:
+                assert self.ingress.offer(item)
+            await asyncio.wait_for(kwargs["stop_event"].wait(), timeout=1)
+            counts_after_stop = (
+                observer.strict_episode_count,
+                observer.optimistic_episode_count,
+                observer.eligible_trade_count,
+            )
+            assert self.ingress.offer(delayed_book)
+            assert self.ingress.offer(later_trade)
+            await asyncio.wait_for(kwargs["drain_event"].wait(), timeout=3)
+
+    await runner_module.SpreadShadowRunner(Feed(), observer).run(duration_seconds=60)
+    store.close()
+    records = [json.loads(line) for line in store.path.read_text().splitlines()]
+    horizons = [record for record in records if record.get("kind") == "HEDGE_HORIZON"]
+    assert counts_after_stop == (1, 1, 1)
+    assert (observer.strict_episode_count, observer.optimistic_episode_count, observer.eligible_trade_count) == (1, 1, 1)
+    assert len(horizons) == 8
+    assert all(record["outcome"] == "HEDGE_FULL" for record in horizons)
+    delayed = [record for record in horizons if record["horizon_ms"] == 1000]
+    assert delayed and delayed[0]["book_received_monotonic_ns"] == base + 100_000_000
+    assert len([record for record in records if record.get("kind") == "SAMPLE_STOP"]) == 1
+
+
+def test_evidence_store_record_cap_reserves_terminal_failure_slot(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(store_module, "MAX_EVIDENCE_RECORDS", 4)
+    monkeypatch.setattr(store_module, "TERMINAL_FAILURE_BYTES_RESERVE", 0)
+    store = AppendOnlyEvidenceStore.create(tmp_path, metadata={"evidence_mode": "FIXTURE"})
+    assert store.record_count == 1
+    store.append_batch(({"kind": "EVIDENCE", "value": 1}, {"kind": "EVIDENCE", "value": 2}))
+    with pytest.raises(EvidenceStorageLimitExceeded, match="RECORD_COUNT"):
+        store.append_batch(({"kind": "EVIDENCE", "value": 3},))
+    assert store.record_count == 3
+    assert store.append_batch(({"kind": "RUN_FAILED", "fatal_reason": "EVIDENCE_STORAGE_LIMIT"},)) == (3,)
+    assert store.record_count == 4
+    store.close()
+
+
+def test_evidence_store_file_cap_reserves_terminal_failure_bytes(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(store_module, "MAX_EVIDENCE_RECORDS", 100)
+    store = AppendOnlyEvidenceStore.create(tmp_path, metadata={"evidence_mode": "FIXTURE"})
+    reserve = 1_024
+    monkeypatch.setattr(store_module, "TERMINAL_FAILURE_BYTES_RESERVE", reserve)
+    monkeypatch.setattr(store_module, "MAX_EVIDENCE_FILE_BYTES", store.byte_count + reserve)
+    with pytest.raises(EvidenceStorageLimitExceeded, match="FILE_BYTES"):
+        store.append_batch(({"kind": "EVIDENCE", "value": "regular"},))
+    store.append_batch(({"kind": "RUN_FAILED", "fatal_reason": "EVIDENCE_STORAGE_LIMIT"},))
+    store.close()
+    assert store.byte_count == store.path.stat().st_size
+    assert store.byte_count <= store_module.MAX_EVIDENCE_FILE_BYTES
+
+
+@pytest.mark.asyncio
+async def test_evidence_store_limit_becomes_named_integrity_stop(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(store_module, "MAX_EVIDENCE_RECORDS", 2)
+    store = AppendOnlyEvidenceStore.create(tmp_path, metadata={"evidence_mode": "FIXTURE"})
+    observer = SpreadObserver(config(), (PAIR,), store)
+    gap = FeedGapEvent(
+        DataGapEvidence(
+            source_venue=Venue.LIGHTER,
+            canonical_market="BTC",
+            stream_session_id="lighter",
+            recovery_generation=0,
+            gap_start_monotonic_ns=100,
+            reason="CAP_TEST",
+        )
+    )
+    with pytest.raises(EvidenceStorageLimitExceeded, match="RECORD_COUNT"):
+        await observer.handle_gap(gap)
+    assert observer.fatal_reason == "EVIDENCE_STORAGE_LIMIT"
+    assert observer.sample_stop_signal is not None
+    assert observer.sample_stop_signal.reason.value == "INTEGRITY_FAILURE"
+    assert observer.sample_stop_event.is_set()
+    store.append_batch(({"kind": "RUN_FAILED", "fatal_reason": observer.fatal_reason},))
+    store.close()
+
+
 @pytest.mark.asyncio
 async def test_fixture_replay_is_labelled_and_captures_all_deadlines_without_lookahead(tmp_path: Path) -> None:
     store = AppendOnlyEvidenceStore.create(
@@ -177,7 +456,11 @@ async def test_fixture_replay_is_labelled_and_captures_all_deadlines_without_loo
 
     records = [json.loads(line) for line in store.path.read_text().splitlines()]
     horizons = [record for record in records if record.get("kind") == "HEDGE_HORIZON"]
-    assert len(horizons) == 4
+    assert len(horizons) == 8
+    assert {record["fillability_model"] for record in horizons} == {
+        "STRICT_LOWER_BOUND",
+        "OPTIMISTIC_UPPER_BOUND",
+    }
     assert {record["outcome"] for record in horizons} == {"HEDGE_FULL"}
     by_horizon = {record["horizon_ms"]: record["book_received_monotonic_ns"] for record in horizons}
     assert by_horizon[0] == 100
@@ -185,7 +468,7 @@ async def test_fixture_replay_is_labelled_and_captures_all_deadlines_without_loo
     assert any(record.get("kind") == "REPLAY_MODE" for record in records)
     report = build_report(store.path)
     assert report["evidence_mode"] == "FIXTURE"
-    assert report["horizon_record_count"] == 4
+    assert report["horizon_record_count"] == 8
     assert {group["horizon_ms"] for group in report["groups"]} == {0, 300, 500, 1000}
 
 
@@ -1236,6 +1519,8 @@ async def test_run_public_smoke_emits_one_clean_stop_or_one_failure_marker(
         if record.get("kind") in {"RUN_STOP", "RUN_FAILED"}
     ]
     assert clean_terminal == ["RUN_STOP"]
+    assert clean_result["record_count"] == len(clean_records)
+    assert clean_result["byte_count"] == Path(clean_result["store_path"]).stat().st_size
 
     async def failed(self, **_kwargs):
         raise LookupError("planned failure")

@@ -1,4 +1,4 @@
-"""SS-001A contracts plus the limited SS-001B public measurement path."""
+"""SS-001A contracts plus the bounded SS-001D public measurement path."""
 
 from .economics import (
     build_hypothetical_maker_quote,
@@ -13,8 +13,10 @@ from .economics import (
 from .evidence import (
     build_entry_viability_episode,
     capture_horizon,
+    detect_optimistic_would_fill,
     detect_strict_would_fill,
     horizon_deadline_monotonic_ns,
+    is_eligible_trade,
     select_horizon_capture,
     would_fill_evidence,
 )
@@ -27,11 +29,14 @@ from .models import (
     EntryViabilityOutcome,
     ExactVwap,
     FeeEvidence,
+    FillabilityModel,
     HedgeHorizonCapture,
     HypotheticalMakerQuote,
     LighterBookEvidence,
     QuotePolicy,
     QuoteVersion,
+    SampleStopReason,
+    SampleStopSignal,
     Side,
     SizingEvidence,
     SpreadDirection,
@@ -39,7 +44,7 @@ from .models import (
     Venue,
     queue_overflow_gap,
 )
-from .config import ShadowConfig
+from .config import MAX_PUBLIC_DURATION_SECONDS, ShadowConfig
 from .feed import (
     FeedBookEvent,
     FeedGapEvent,
@@ -54,11 +59,20 @@ from .runner import (
     BookHistory,
     HistoryCapacityExceeded,
     ReplayHarness,
+    SampleStopController,
     SpreadObserver,
     SpreadShadowRunner,
     run_public_smoke,
 )
-from .store import AppendOnlyEvidenceStore, iter_records, new_run_id, store_permissions
+from .store import (
+    AppendOnlyEvidenceStore,
+    EvidenceStorageLimitExceeded,
+    MAX_EVIDENCE_FILE_BYTES,
+    MAX_EVIDENCE_RECORDS,
+    iter_records,
+    new_run_id,
+    store_permissions,
+)
 
 __all__ = [
     "BookEvidence",
@@ -69,6 +83,7 @@ __all__ = [
     "EntryViabilityOutcome",
     "ExactVwap",
     "FeeEvidence",
+    "FillabilityModel",
     "HedgeHorizonCapture",
     "HypotheticalMakerQuote",
     "LighterBookEvidence",
@@ -83,10 +98,12 @@ __all__ = [
     "build_hypothetical_maker_quote",
     "capture_horizon",
     "compute_sizing_evidence",
+    "detect_optimistic_would_fill",
     "detect_strict_would_fill",
     "exact_entry_edge_usd",
     "exact_vwap",
     "horizon_deadline_monotonic_ns",
+    "is_eligible_trade",
     "queue_overflow_gap",
     "select_horizon_capture",
     "size_quote",
@@ -95,6 +112,9 @@ __all__ = [
     "validate_sizing_evidence",
     "would_fill_evidence",
     "AppendOnlyEvidenceStore",
+    "EvidenceStorageLimitExceeded",
+    "MAX_EVIDENCE_FILE_BYTES",
+    "MAX_EVIDENCE_RECORDS",
     "BookHistory",
     "FeedBookEvent",
     "FeedGapEvent",
@@ -104,7 +124,11 @@ __all__ = [
     "MarketPair",
     "PublicFeedRunner",
     "ReplayHarness",
+    "SampleStopController",
+    "SampleStopReason",
+    "SampleStopSignal",
     "ShadowConfig",
+    "MAX_PUBLIC_DURATION_SECONDS",
     "SpreadObserver",
     "SpreadShadowRunner",
     "build_report",

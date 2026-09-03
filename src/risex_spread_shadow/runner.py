@@ -1,4 +1,4 @@
-"""The single SS-001B observer, evidence path, and public-smoke orchestration."""
+"""The single SS-001D observer, evidence path, and public-smoke orchestration."""
 
 from __future__ import annotations
 
@@ -19,7 +19,12 @@ from risex_farmer.models import BookLevel, Venue
 
 from .config import ShadowConfig
 from .economics import build_hypothetical_maker_quote, exact_entry_edge_usd
-from .evidence import capture_horizon, detect_strict_would_fill
+from .evidence import (
+    capture_horizon,
+    detect_optimistic_would_fill,
+    detect_strict_would_fill,
+    is_eligible_trade,
+)
 from .feed import (
     FeedBookEvent,
     FeedGapEvent,
@@ -34,15 +39,18 @@ from .models import (
     BookEvidence,
     DataGapEvidence,
     EntryViabilityOutcome,
+    FillabilityModel,
     HedgeHorizonCapture,
     HypotheticalMakerQuote,
     QuotePolicy,
     QuoteVersion,
+    SampleStopReason,
+    SampleStopSignal,
     SpreadDirection,
     TradeEvidence,
     WouldFillEvidence,
 )
-from .store import AppendOnlyEvidenceStore
+from .store import AppendOnlyEvidenceStore, EvidenceStorageLimitExceeded
 
 
 _SHUTDOWN_TIMEOUT_SECONDS = 2.0
@@ -61,6 +69,124 @@ class HistoryCapacityExceeded(RuntimeError):
     def __init__(self, gap: DataGapEvidence) -> None:
         super().__init__("book history capacity reached; evidence gap is required")
         self.gap = gap
+
+
+@dataclass(slots=True)
+class SampleStopController:
+    """Latch the first prospective SS-001D sample-stop condition."""
+
+    started_monotonic_ns: int
+    strict_episode_limit: int = 50
+    eligible_trade_limit: int = 500
+    wall_clock_limit_ns: int = 20 * 60 * 1_000_000_000
+    strict_episode_count: int = 0
+    eligible_trade_count: int = 0
+    optimistic_episode_count: int = 0
+    signal: SampleStopSignal | None = None
+
+    def __post_init__(self) -> None:
+        for value, name in (
+            (self.started_monotonic_ns, "started_monotonic_ns"),
+            (self.strict_episode_limit, "strict_episode_limit"),
+            (self.eligible_trade_limit, "eligible_trade_limit"),
+            (self.wall_clock_limit_ns, "wall_clock_limit_ns"),
+            (self.strict_episode_count, "strict_episode_count"),
+            (self.eligible_trade_count, "eligible_trade_count"),
+            (self.optimistic_episode_count, "optimistic_episode_count"),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if self.strict_episode_limit <= 0:
+            raise ValueError("strict_episode_limit must be positive")
+        if self.eligible_trade_limit <= 0:
+            raise ValueError("eligible_trade_limit must be positive")
+        if self.wall_clock_limit_ns <= 0:
+            raise ValueError("wall_clock_limit_ns must be positive")
+
+    def observe(
+        self,
+        *,
+        observed_monotonic_ns: int,
+        strict_episode_increment: int = 0,
+        eligible_trade_increment: int = 0,
+        optimistic_episode_increment: int = 0,
+        integrity_reason: str | None = None,
+    ) -> SampleStopSignal | None:
+        """Advance counters once and latch a deterministic first-stop signal."""
+
+        if isinstance(observed_monotonic_ns, bool) or not isinstance(observed_monotonic_ns, int):
+            raise TypeError("observed_monotonic_ns must be int")
+        if observed_monotonic_ns < self.started_monotonic_ns:
+            raise ValueError("observed_monotonic_ns must not precede sample start")
+        for value, name in (
+            (strict_episode_increment, "strict_episode_increment"),
+            (eligible_trade_increment, "eligible_trade_increment"),
+            (optimistic_episode_increment, "optimistic_episode_increment"),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if integrity_reason is not None and not integrity_reason:
+            raise ValueError("integrity_reason must be non-empty when supplied")
+        if self.signal is not None:
+            return self.signal
+        self.strict_episode_count += strict_episode_increment
+        self.eligible_trade_count += eligible_trade_increment
+        self.optimistic_episode_count += optimistic_episode_increment
+
+        # Integrity wins a same-observation tie because it is a safety stop.
+        if integrity_reason is not None:
+            reason = SampleStopReason.INTEGRITY_FAILURE
+        elif self.strict_episode_count >= self.strict_episode_limit:
+            reason = SampleStopReason.STRICT_EPISODE_LIMIT
+        elif self.eligible_trade_count >= self.eligible_trade_limit:
+            reason = SampleStopReason.ELIGIBLE_TRADE_LIMIT
+        elif observed_monotonic_ns - self.started_monotonic_ns >= self.wall_clock_limit_ns:
+            reason = SampleStopReason.WALL_CLOCK_LIMIT
+        else:
+            return None
+        self.signal = SampleStopSignal(
+            reason=reason,
+            observed_monotonic_ns=observed_monotonic_ns,
+            strict_episode_count=self.strict_episode_count,
+            eligible_trade_count=self.eligible_trade_count,
+            optimistic_episode_count=self.optimistic_episode_count,
+            integrity_reason=integrity_reason,
+        )
+        return self.signal
+
+    def observe_counts(
+        self,
+        *,
+        observed_monotonic_ns: int,
+        strict_episode_count: int,
+        eligible_trade_count: int,
+        optimistic_episode_count: int = 0,
+        integrity_reason: str | None = None,
+    ) -> SampleStopSignal | None:
+        """Advance from absolute counts without allowing counter rollback."""
+
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in (
+                strict_episode_count,
+                eligible_trade_count,
+                optimistic_episode_count,
+            )
+        ):
+            raise ValueError("sample counts must be non-negative integers")
+        if strict_episode_count < self.strict_episode_count:
+            raise ValueError("strict episode count cannot move backwards")
+        if eligible_trade_count < self.eligible_trade_count:
+            raise ValueError("eligible trade count cannot move backwards")
+        if optimistic_episode_count < self.optimistic_episode_count:
+            raise ValueError("optimistic episode count cannot move backwards")
+        return self.observe(
+            observed_monotonic_ns=observed_monotonic_ns,
+            strict_episode_increment=strict_episode_count - self.strict_episode_count,
+            eligible_trade_increment=eligible_trade_count - self.eligible_trade_count,
+            optimistic_episode_increment=optimistic_episode_count - self.optimistic_episode_count,
+            integrity_reason=integrity_reason,
+        )
 
 
 class BookHistory:
@@ -204,6 +330,7 @@ class SpreadObserver:
         *,
         now_utc: Callable[[], datetime] | None = None,
         monotonic_ns: Callable[[], int] | None = None,
+        sample_started_monotonic_ns: int | None = None,
     ) -> None:
         self.config = config
         self.market_pairs = tuple(market_pairs)
@@ -227,9 +354,30 @@ class SpreadObserver:
         self._active_versions: dict[str, QuoteVersion] = {}
         self._trades: dict[str, dict[str, TradeEvidence]] = {}
         self._pending: dict[str, _PendingEpisode] = {}
+        self._optimistic_pending: dict[str, _PendingEpisode] = {}
+        # One completed model/version must not be rediscovered while its
+        # quote remains active.  The map is keyed by the fixed policy grid,
+        # so it stays bounded while allowing a replacement quote version to
+        # start a fresh episode.
+        self._last_episode_versions: dict[tuple[FillabilityModel, str], str] = {}
         self._tasks: set[asyncio.Task[None]] = set()
         self._append_lock = asyncio.Lock()
         self._version_serial = 0
+        sample_started = (
+            0
+            if sample_started_monotonic_ns is None
+            else sample_started_monotonic_ns
+        )
+        self._sample_stop = SampleStopController(
+            started_monotonic_ns=sample_started,
+            strict_episode_limit=config.strict_episode_limit,
+            eligible_trade_limit=config.eligible_trade_limit,
+            wall_clock_limit_ns=config.sample_wall_clock_limit_ns,
+        )
+        self._sample_stop_event = asyncio.Event()
+        self._horizon_drain_event = asyncio.Event()
+        self._sample_frozen = False
+        self._sample_stop_recorded = False
         self.fatal_reason: str | None = None
         self._closing = False
         self._replay_mode = False
@@ -240,7 +388,49 @@ class SpreadObserver:
 
     @property
     def pending_episode_count(self) -> int:
+        # Preserve the SS-001B public meaning: this is the strict lower-bound
+        # pending count.  The two models have independent counters below.
         return len(self._pending)
+
+    @property
+    def optimistic_pending_episode_count(self) -> int:
+        return len(self._optimistic_pending)
+
+    @property
+    def total_pending_episode_count(self) -> int:
+        return len(self._pending) + len(self._optimistic_pending)
+
+    @property
+    def strict_episode_count(self) -> int:
+        return self._sample_stop.strict_episode_count
+
+    @property
+    def optimistic_episode_count(self) -> int:
+        return self._sample_stop.optimistic_episode_count
+
+    @property
+    def eligible_trade_count(self) -> int:
+        return self._sample_stop.eligible_trade_count
+
+    @property
+    def sample_stop_signal(self) -> SampleStopSignal | None:
+        return self._sample_stop.signal
+
+    @property
+    def sample_started_monotonic_ns(self) -> int:
+        return self._sample_stop.started_monotonic_ns
+
+    @property
+    def sample_stop_event(self) -> asyncio.Event:
+        return self._sample_stop_event
+
+    @property
+    def horizon_drain_event(self) -> asyncio.Event:
+        return self._horizon_drain_event
+
+    def _refresh_horizon_drain_event(self) -> None:
+        if self._sample_frozen and not self._pending and not self._optimistic_pending:
+            self._horizon_drain_event.set()
 
     @staticmethod
     def policy_id(policy: QuotePolicy) -> str:
@@ -262,8 +452,19 @@ class SpreadObserver:
             # together at an absolute deadline.
             async with self._append_lock:
                 await asyncio.to_thread(self.store.append_batch, records)
-        except Exception:
-            self.fatal_reason = "EVIDENCE_STORE_WRITE_FAILED"
+        except Exception as exc:
+            self.fatal_reason = (
+                "EVIDENCE_STORAGE_LIMIT"
+                if isinstance(exc, EvidenceStorageLimitExceeded)
+                else "EVIDENCE_STORE_WRITE_FAILED"
+            )
+            self._observe_sample_stop(
+                observed_monotonic_ns=max(
+                    self._sample_stop.started_monotonic_ns,
+                    self._monotonic_ns(),
+                ),
+                integrity_reason=self.fatal_reason,
+            )
             raise
 
     def _book_record(self, event: FeedBookEvent) -> dict[str, Any]:
@@ -377,6 +578,10 @@ class SpreadObserver:
             "quote_created_utc": None if version is None else version.quote_created_utc,
             "quote_created_monotonic_ns": created_ns,
             "quote_expires_monotonic_ns": None if version is None else version.quote_expires_monotonic_ns,
+            "quote_stream_session_id": None if version is None else version.stream_session_id,
+            "quote_recovery_generation": None if version is None else version.recovery_generation,
+            "hedge_stream_session_id": None if version is None else version.hedge_stream_session_id,
+            "hedge_recovery_generation": None if version is None else version.hedge_recovery_generation,
             "quote_lifetime_ns": self.config.quote_lifetime_ns,
             "maker_side": quote.maker_side.value,
             "hedge_side": quote.lighter_side.value,
@@ -407,6 +612,88 @@ class SpreadObserver:
             "sizing": self._sizing_record(quote),
             "observed_monotonic_ns": created_ns,
         }
+
+    @staticmethod
+    def _pending_key(model: FillabilityModel, version_id: str) -> str:
+        if model is FillabilityModel.STRICT_LOWER_BOUND:
+            return version_id
+        return f"{model.value}:{version_id}"
+
+    def _pending_for_model(self, model: FillabilityModel) -> dict[str, _PendingEpisode]:
+        return (
+            self._pending
+            if model is FillabilityModel.STRICT_LOWER_BOUND
+            else self._optimistic_pending
+        )
+
+    def _sample_stop_record(
+        self,
+        signal: SampleStopSignal | None,
+    ) -> dict[str, Any] | None:
+        if signal is None or self._sample_stop_recorded:
+            return None
+        self._sample_stop_recorded = True
+        return {
+            "kind": "SAMPLE_STOP",
+            "reason": signal.reason.value,
+            "strict_episode_count": signal.strict_episode_count,
+            "optimistic_episode_count": signal.optimistic_episode_count,
+            "eligible_trade_count": signal.eligible_trade_count,
+            "integrity_reason": signal.integrity_reason,
+            "observed_monotonic_ns": signal.observed_monotonic_ns,
+        }
+
+    def _observe_sample_stop(
+        self,
+        *,
+        observed_monotonic_ns: int,
+        strict_episode_increment: int = 0,
+        eligible_trade_increment: int = 0,
+        optimistic_episode_increment: int = 0,
+        integrity_reason: str | None = None,
+    ) -> dict[str, Any] | None:
+        signal = self._sample_stop.observe(
+            observed_monotonic_ns=observed_monotonic_ns,
+            strict_episode_increment=strict_episode_increment,
+            eligible_trade_increment=eligible_trade_increment,
+            optimistic_episode_increment=optimistic_episode_increment,
+            integrity_reason=integrity_reason,
+        )
+        if signal is not None:
+            self._sample_frozen = True
+            self._sample_stop_event.set()
+            self._refresh_horizon_drain_event()
+        return self._sample_stop_record(signal)
+
+    async def trigger_wall_clock_stop(self) -> None:
+        """Persist the wall-clock stop even when the public feed is silent."""
+
+        observed = max(self._sample_stop.started_monotonic_ns, self._monotonic_ns())
+        stop_record = self._observe_sample_stop(observed_monotonic_ns=observed)
+        if stop_record is not None:
+            await self._append((stop_record,))
+        self._refresh_horizon_drain_event()
+
+    async def wait_for_wall_clock_stop(self) -> None:
+        deadline = (
+            self._sample_stop.started_monotonic_ns
+            + self._sample_stop.wall_clock_limit_ns
+        )
+        delay_ns = deadline - self._monotonic_ns()
+        if delay_ns > 0:
+            timer = asyncio.create_task(asyncio.sleep(delay_ns / 1_000_000_000))
+            already_stopped = asyncio.create_task(self._sample_stop_event.wait())
+            done, _ = await asyncio.wait(
+                (timer, already_stopped),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if already_stopped in done:
+                timer.cancel()
+                await asyncio.gather(timer, return_exceptions=True)
+                return
+            already_stopped.cancel()
+            await asyncio.gather(already_stopped, return_exceptions=True)
+        await self.trigger_wall_clock_stop()
 
     @staticmethod
     def _policy(
@@ -510,6 +797,8 @@ class SpreadObserver:
 
     async def handle_book(self, event: FeedBookEvent) -> None:
         book = event.book
+        if self._sample_frozen and book.venue is not Venue.LIGHTER:
+            return
         if not self._book_admissible(event):
             return
         stream_key = (book.venue, book.canonical_market)
@@ -544,16 +833,29 @@ class SpreadObserver:
             await self.handle_gap(FeedGapEvent(exc.gap))
             return
         self._current_books[(book.venue, book.canonical_market)] = book
+        if self._sample_frozen:
+            await self._append((self._book_record(event),))
+            self._refresh_horizon_drain_event()
+            return
         records, versions = self._versions_for_book(event)
         for policy_key in set(self._active_versions) - set(versions):
             if policy_key.startswith(f"{book.canonical_market}|"):
                 self._active_versions.pop(policy_key, None)
         self._active_versions.update(versions)
-        await self._append((self._book_record(event), *records))
+        output_records: list[Mapping[str, Any]] = [self._book_record(event), *records]
+        stop_record = self._observe_sample_stop(
+            observed_monotonic_ns=book.received_monotonic_ns,
+            integrity_reason=self.fatal_reason,
+        )
+        if stop_record is not None:
+            output_records.append(stop_record)
+        await self._append(output_records)
         self._prune_state(book.received_monotonic_ns)
 
     async def handle_gap(self, event: FeedGapEvent) -> None:
         gap = event.gap
+        if self._sample_frozen and gap.source_venue is not Venue.LIGHTER:
+            return
         stream_key = (gap.source_venue, gap.canonical_market)
         self._gapped_identities[stream_key] = (
             gap.stream_session_id,
@@ -565,9 +867,25 @@ class SpreadObserver:
         for policy_key in tuple(self._active_versions):
             if policy_key.startswith(f"{gap.canonical_market}|"):
                 self._active_versions.pop(policy_key, None)
-        await self._append((self._gap_record(gap),))
+        output_records: list[Mapping[str, Any]] = [self._gap_record(gap)]
+        stop_record = self._observe_sample_stop(
+            observed_monotonic_ns=max(
+                self._sample_stop.started_monotonic_ns,
+                gap.gap_start_monotonic_ns,
+            ),
+            integrity_reason=self.fatal_reason,
+        )
+        if stop_record is not None:
+            output_records.append(stop_record)
+        await self._append(output_records)
 
-    def _trade_record(self, event: FeedTradeEvent) -> dict[str, Any]:
+    def _trade_record(
+        self,
+        event: FeedTradeEvent,
+        *,
+        eligible: bool = False,
+        eligible_policy_ids: Sequence[str] = (),
+    ) -> dict[str, Any]:
         trade = event.trade
         return {
             "kind": "RISEX_TRADE",
@@ -584,11 +902,17 @@ class SpreadObserver:
             "stream_session_id": trade.stream_session_id,
             "recovery_generation": trade.recovery_generation,
             "raw_timestamp": event.raw_timestamp,
+            "eligible_trade": eligible,
+            "eligible_policy_ids": tuple(eligible_policy_ids),
             "observed_monotonic_ns": trade.received_monotonic_ns,
         }
 
-    def _would_fill_record(self, evidence: WouldFillEvidence) -> dict[str, Any]:
-        return {
+    def _would_fill_record(
+        self,
+        evidence: WouldFillEvidence,
+        version: QuoteVersion | None = None,
+    ) -> dict[str, Any]:
+        record = {
             "kind": "WOULD_FILL",
             "canonical_market": evidence.canonical_market,
             "venue": evidence.venue.value,
@@ -597,12 +921,27 @@ class SpreadObserver:
             "canonical_quantity": evidence.canonical_quantity,
             "cumulative_eligible_quantity": evidence.cumulative_eligible_quantity,
             "qualifying_trade_event_keys": evidence.qualifying_trade_event_keys,
+            "fillability_model": evidence.fillability_model.value,
             "would_fill_detected_monotonic_ns": evidence.would_fill_detected_monotonic_ns,
             "detected_utc": evidence.detected_utc,
             "hedge_stream_session_id": evidence.hedge_stream_session_id,
             "hedge_recovery_generation": evidence.hedge_recovery_generation,
             "observed_monotonic_ns": evidence.would_fill_detected_monotonic_ns,
         }
+        if version is not None:
+            record.update(
+                {
+                    "policy_id": self.policy_id(version.quote.policy),
+                    "quote_created_monotonic_ns": version.quote_created_monotonic_ns,
+                    "quote_stream_session_id": version.stream_session_id,
+                    "quote_recovery_generation": version.recovery_generation,
+                    "maker_price": version.quote.maker_price,
+                    "quote_canonical_quantity": version.quote.canonical_quantity,
+                    "post_only_bound_price": version.quote.post_only_bound_price,
+                    "risex_tick_size": version.quote.risex_tick_size,
+                }
+            )
+        return record
 
     def _hedge_edge(self, version: QuoteVersion, capture: HedgeHorizonCapture) -> Decimal | None:
         if capture.outcome is not EntryViabilityOutcome.HEDGE_FULL:
@@ -636,6 +975,7 @@ class SpreadObserver:
             "canonical_market": capture.canonical_market,
             "venue": Venue.LIGHTER.value,
             "policy_id": self.policy_id(version.quote.policy),
+            "fillability_model": capture.fillability_model.value,
             "quote_version_id": version.version_id,
             "direction": version.direction.value,
             "target_notional_usd": version.quote.policy.target_notional_usd,
@@ -669,6 +1009,8 @@ class SpreadObserver:
 
     async def handle_trade(self, event: FeedTradeEvent) -> None:
         trade = event.trade
+        if self._sample_frozen:
+            return
         if not self._trade_admissible(event):
             return
         market_trades = self._trades.setdefault(trade.canonical_market, {})
@@ -687,51 +1029,90 @@ class SpreadObserver:
             await self.handle_gap(FeedGapEvent(gap))
             return
         market_trades[trade.trade_event_key] = trade
-        records: list[Mapping[str, Any]] = [self._trade_record(event)]
-        for policy_key, version in tuple(self._active_versions.items()):
-            if version.canonical_market != trade.canonical_market:
-                continue
-            if version.version_id in self._pending:
-                continue
-            evidence = detect_strict_would_fill(
-                version,
-                tuple(market_trades.values()),
-                data_gaps=self.history.gaps(),
-                would_fill_detected_monotonic_ns=trade.received_monotonic_ns,
-                detected_utc=trade.received_utc,
+        relevant_versions = tuple(
+            (policy_key, version)
+            for policy_key, version in self._active_versions.items()
+            if version.canonical_market == trade.canonical_market
+            and is_eligible_trade(version, trade)
+        )
+        records: list[Mapping[str, Any]] = [
+            self._trade_record(
+                event,
+                eligible=bool(relevant_versions),
+                eligible_policy_ids=tuple(sorted(policy_key for policy_key, _ in relevant_versions)),
             )
-            if evidence is None:
-                continue
-            pending = _PendingEpisode(version, evidence)
-            self._pending[version.version_id] = pending
-            latest_deadline = max(
-                evidence.would_fill_detected_monotonic_ns
-                + horizon * 1_000_000
-                for horizon in self.config.horizons_ms
-            )
-            self.history.register_pending(
-                version.version_id,
-                evidence.would_fill_detected_monotonic_ns,
-                latest_deadline,
-                identity=(
-                    Venue.LIGHTER,
-                    evidence.canonical_market,
-                    evidence.hedge_stream_session_id
-                    or version.hedge_stream_session_id
-                    or "unknown",
-                    evidence.hedge_recovery_generation
-                    if evidence.hedge_recovery_generation is not None
-                    else version.hedge_recovery_generation or 0,
-                ),
-            )
-            records.append(self._would_fill_record(evidence))
-            if not self._replay_mode:
-                for horizon in self.config.horizons_ms:
-                    task = asyncio.create_task(
-                        self._capture_later(version.version_id, horizon)
-                    )
-                    self._tasks.add(task)
-                    task.add_done_callback(self._capture_task_done)
+        ]
+        strict_increment = 0
+        optimistic_increment = 0
+        for model, detector in (
+            (FillabilityModel.STRICT_LOWER_BOUND, detect_strict_would_fill),
+            (FillabilityModel.OPTIMISTIC_UPPER_BOUND, detect_optimistic_would_fill),
+        ):
+            pending_by_version = self._pending_for_model(model)
+            for _policy_key, version in tuple(self._active_versions.items()):
+                if version.canonical_market != trade.canonical_market:
+                    continue
+                if version.version_id in pending_by_version:
+                    continue
+                if self._last_episode_versions.get((model, _policy_key)) == version.version_id:
+                    continue
+                evidence = detector(
+                    version,
+                    tuple(market_trades.values()),
+                    data_gaps=self.history.gaps(),
+                    would_fill_detected_monotonic_ns=trade.received_monotonic_ns,
+                    detected_utc=trade.received_utc,
+                )
+                if evidence is None:
+                    continue
+                pending = _PendingEpisode(version, evidence)
+                pending_by_version[version.version_id] = pending
+                self._last_episode_versions[(model, _policy_key)] = version.version_id
+                latest_deadline = max(
+                    evidence.would_fill_detected_monotonic_ns
+                    + horizon * 1_000_000
+                    for horizon in self.config.horizons_ms
+                )
+                self.history.register_pending(
+                    self._pending_key(model, version.version_id),
+                    evidence.would_fill_detected_monotonic_ns,
+                    latest_deadline,
+                    identity=(
+                        Venue.LIGHTER,
+                        evidence.canonical_market,
+                        evidence.hedge_stream_session_id
+                        or version.hedge_stream_session_id
+                        or "unknown",
+                        evidence.hedge_recovery_generation
+                        if evidence.hedge_recovery_generation is not None
+                        else version.hedge_recovery_generation or 0,
+                    ),
+                )
+                records.append(self._would_fill_record(evidence, version))
+                if model is FillabilityModel.STRICT_LOWER_BOUND:
+                    strict_increment += 1
+                else:
+                    optimistic_increment += 1
+                if not self._replay_mode:
+                    for horizon in self.config.horizons_ms:
+                        task = asyncio.create_task(
+                            self._capture_later(
+                                version.version_id,
+                                horizon,
+                                model=model,
+                            )
+                        )
+                        self._tasks.add(task)
+                        task.add_done_callback(self._capture_task_done)
+        stop_record = self._observe_sample_stop(
+            observed_monotonic_ns=trade.received_monotonic_ns,
+            strict_episode_increment=strict_increment,
+            eligible_trade_increment=1 if relevant_versions else 0,
+            optimistic_episode_increment=optimistic_increment,
+            integrity_reason=self.fatal_reason,
+        )
+        if stop_record is not None:
+            records.append(stop_record)
         await self._append(records)
         self._prune_state(trade.received_monotonic_ns)
 
@@ -750,8 +1131,16 @@ class SpreadObserver:
                 return
             await self.handle_item(item)
 
-    async def _capture_one(self, version_id: str, horizon: int, *, force: bool) -> None:
-        pending = self._pending.get(version_id)
+    async def _capture_one(
+        self,
+        version_id: str,
+        horizon: int,
+        *,
+        force: bool,
+        model: FillabilityModel = FillabilityModel.STRICT_LOWER_BOUND,
+    ) -> None:
+        pending_by_version = self._pending_for_model(model)
+        pending = pending_by_version.get(version_id)
         if pending is None or horizon in pending.captures:
             return
         evidence = pending.would_fill
@@ -788,6 +1177,7 @@ class SpreadObserver:
                 else pending.version.hedge_recovery_generation,
                 data_gaps=gaps,
                 freshness_max_age_ns=self.config.freshness_max_age_ns,
+                fillability_model=model,
             )
         except (TypeError, ValueError, ArithmeticError):
             capture = HedgeHorizonCapture(
@@ -813,16 +1203,24 @@ class SpreadObserver:
                 filled_quantity=Decimal("0"),
                 notional_usd=Decimal("0"),
                 vwap_price=None,
+                fillability_model=model,
             )
         pending.captures[horizon] = capture
         await self._append((self._horizon_record(pending.version, capture),))
         if len(pending.captures) == len(self.config.horizons_ms):
-            self._pending.pop(version_id, None)
-            self.history.complete(version_id, self._monotonic_ns())
+            pending_by_version.pop(version_id, None)
+            self.history.complete(self._pending_key(model, version_id), self._monotonic_ns())
             self._prune_state(self._monotonic_ns())
+            self._refresh_horizon_drain_event()
 
-    async def _capture_later(self, version_id: str, horizon: int) -> None:
-        pending = self._pending.get(version_id)
+    async def _capture_later(
+        self,
+        version_id: str,
+        horizon: int,
+        *,
+        model: FillabilityModel = FillabilityModel.STRICT_LOWER_BOUND,
+    ) -> None:
+        pending = self._pending_for_model(model).get(version_id)
         if pending is None:
             return
         deadline = pending.would_fill.would_fill_detected_monotonic_ns + horizon * 1_000_000
@@ -830,7 +1228,7 @@ class SpreadObserver:
         if delay_ns > 0:
             await asyncio.sleep(delay_ns / 1_000_000_000)
         await asyncio.sleep(0)
-        await self._capture_one(version_id, horizon, force=False)
+        await self._capture_one(version_id, horizon, force=False, model=model)
 
     async def flush_pending(self, *, force: bool = False) -> None:
         if force:
@@ -840,15 +1238,26 @@ class SpreadObserver:
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
             self._tasks.clear()
-        if not self._pending:
+        if not self._pending and not self._optimistic_pending:
+            self._refresh_horizon_drain_event()
             return
         if not force:
             deadline = self._monotonic_ns() + 1_200_000_000
-            while self._pending and self._tasks and self._monotonic_ns() < deadline:
+            while (self._pending or self._optimistic_pending) and self._tasks and self._monotonic_ns() < deadline:
                 await asyncio.sleep(0.02)
-        for version_id, pending in tuple(self._pending.items()):
-            for horizon in self.config.horizons_ms:
-                await self._capture_one(version_id, horizon, force=force)
+        for model in (
+            FillabilityModel.STRICT_LOWER_BOUND,
+            FillabilityModel.OPTIMISTIC_UPPER_BOUND,
+        ):
+            for version_id, pending in tuple(self._pending_for_model(model).items()):
+                for horizon in self.config.horizons_ms:
+                    await self._capture_one(
+                        version_id,
+                        horizon,
+                        force=force,
+                        model=model,
+                    )
+        self._refresh_horizon_drain_event()
 
     async def close(self) -> None:
         self._closing = True
@@ -861,6 +1270,7 @@ class SpreadObserver:
             self._tasks.clear()
         self.ingress.close()
         self._active_versions.clear()
+        self._refresh_horizon_drain_event()
 
     def _prune_state(self, now_ns: int) -> None:
         floor = max(0, now_ns - self.config.trade_retention_ns)
@@ -870,11 +1280,19 @@ class SpreadObserver:
         )
         if active_starts:
             floor = max(floor, min(active_starts))
+
+        def relevant_to_active_quote(trade: TradeEvidence) -> bool:
+            return any(
+                is_eligible_trade(version, trade)
+                for version in self._active_versions.values()
+            )
+
         for market, trades in tuple(self._trades.items()):
             retained = {
                 key: trade
                 for key, trade in trades.items()
                 if trade.received_monotonic_ns >= floor
+                or relevant_to_active_quote(trade)
             }
             if retained:
                 self._trades[market] = retained
@@ -891,6 +1309,14 @@ class SpreadObserver:
             return
         if failure is not None and self.fatal_reason is None:
             self.fatal_reason = "HEDGE_CAPTURE_FAILED"
+            self._observe_sample_stop(
+                observed_monotonic_ns=max(
+                    self._sample_stop.started_monotonic_ns,
+                    self._monotonic_ns(),
+                ),
+                integrity_reason=self.fatal_reason,
+            )
+        self._refresh_horizon_drain_event()
 
 
 class SpreadShadowRunner:
@@ -928,12 +1354,64 @@ class SpreadShadowRunner:
 
     async def run(self, *, duration_seconds: int | None = None) -> None:
         consumer = asyncio.create_task(self.observer.consume())
+        sample_stop_event = getattr(self.observer, "sample_stop_event", None)
+        horizon_drain_event = getattr(self.observer, "horizon_drain_event", None)
+        wall_clock_task: asyncio.Task[Any] | None = None
+        wait_for_wall_clock_stop = getattr(self.observer, "wait_for_wall_clock_stop", None)
+        trigger_wall_clock_stop = getattr(self.observer, "trigger_wall_clock_stop", None)
+        sample_started = getattr(self.observer, "sample_started_monotonic_ns", None)
+        wall_clock_enabled = (
+            sample_stop_event is not None
+            and wait_for_wall_clock_stop is not None
+            and isinstance(sample_started, int)
+            and sample_started > 0
+        )
+        if wall_clock_enabled:
+            wall_clock_task = asyncio.create_task(wait_for_wall_clock_stop())
         failure: BaseException | None = None
         try:
-            await self.feed.run(duration_seconds=duration_seconds)
+            feed_kwargs: dict[str, Any] = {"duration_seconds": duration_seconds}
+            if sample_stop_event is not None:
+                feed_kwargs["stop_event"] = sample_stop_event
+            if horizon_drain_event is not None:
+                feed_kwargs["drain_event"] = horizon_drain_event
+            await self.feed.run(**feed_kwargs)
+            if (
+                sample_stop_event is not None
+                and not sample_stop_event.is_set()
+                and wall_clock_enabled
+                and time.monotonic_ns()
+                >= self.observer.sample_started_monotonic_ns
+                + self.observer.config.sample_wall_clock_limit_ns
+                and trigger_wall_clock_stop is not None
+            ):
+                await trigger_wall_clock_stop()
         except BaseException as exc:
             failure = exc
         finally:
+            if wall_clock_task is not None:
+                wall_signal = getattr(self.observer, "sample_stop_signal", None)
+                if (
+                    not wall_clock_task.done()
+                    and wall_signal is not None
+                    and wall_signal.reason is SampleStopReason.WALL_CLOCK_LIMIT
+                ):
+                    # The timer has latched the wall stop and may still be
+                    # persisting its marker.  Let that append finish before
+                    # closing the ingress/store.
+                    await asyncio.gather(wall_clock_task, return_exceptions=True)
+                elif not wall_clock_task.done():
+                    wall_clock_task.cancel()
+                    await asyncio.gather(wall_clock_task, return_exceptions=True)
+                else:
+                    await asyncio.gather(wall_clock_task, return_exceptions=True)
+                if failure is None and not wall_clock_task.cancelled():
+                    try:
+                        wall_failure = wall_clock_task.exception()
+                    except BaseException:
+                        wall_failure = None
+                    if wall_failure is not None:
+                        failure = wall_failure
             try:
                 self.feed.ingress.close()
             except BaseException as exc:
@@ -1020,6 +1498,10 @@ async def run_public_smoke(
         "target_notionals_usd": config.target_notionals_usd,
         "target_margins_bps": config.target_margins_bps,
         "horizons_ms": config.horizons_ms,
+        "fillability_models": tuple(model.value for model in FillabilityModel),
+        "strict_episode_limit": config.strict_episode_limit,
+        "eligible_trade_limit": config.eligible_trade_limit,
+        "sample_wall_clock_seconds": config.sample_wall_clock_seconds,
         "freshness_max_age_ns": config.freshness_max_age_ns,
         "quote_lifetime_ns": config.quote_lifetime_ns,
         "risex_maker_fee_rate": config.risex_maker_fee_rate,
@@ -1052,7 +1534,12 @@ async def run_public_smoke(
                     "observed_monotonic_ns": 0,
                 },)
             )
-            observer = SpreadObserver(config, pairs, store)
+            observer = SpreadObserver(
+                config,
+                pairs,
+                store,
+                sample_started_monotonic_ns=time.monotonic_ns(),
+            )
             feed = PublicFeedRunner(
                 session,
                 pairs,
@@ -1064,14 +1551,18 @@ async def run_public_smoke(
             await SpreadShadowRunner(feed, observer).run(duration_seconds=duration_seconds)
             fatal_reason = feed.fatal_reason or observer.fatal_reason
             if fatal_reason is None:
-                store.append_batch(
-                    ({
-                        "kind": "RUN_STOP",
-                        "fatal_reason": None,
-                        "stopped_utc": datetime.now(UTC),
-                        "observed_monotonic_ns": time.monotonic_ns(),
-                    },)
-                )
+                try:
+                    store.append_batch(
+                        ({
+                            "kind": "RUN_STOP",
+                            "fatal_reason": None,
+                            "stopped_utc": datetime.now(UTC),
+                            "observed_monotonic_ns": time.monotonic_ns(),
+                        },)
+                    )
+                except EvidenceStorageLimitExceeded:
+                    observer.fatal_reason = "EVIDENCE_STORAGE_LIMIT"
+                    raise
             else:
                 store.append_batch(
                     ({
@@ -1089,6 +1580,8 @@ async def run_public_smoke(
                 "markets": tuple(pair.canonical_market for pair in pairs),
                 "duration_seconds": config.duration_seconds if duration_seconds is None else duration_seconds,
                 "fatal_reason": fatal_reason,
+                "record_count": store.record_count,
+                "byte_count": store.byte_count,
             }
             return result
     except Exception as exc:
@@ -1121,6 +1614,7 @@ __all__ = [
     "BookHistory",
     "HistoryCapacityExceeded",
     "ReplayHarness",
+    "SampleStopController",
     "SpreadObserver",
     "SpreadShadowRunner",
     "run_public_smoke",

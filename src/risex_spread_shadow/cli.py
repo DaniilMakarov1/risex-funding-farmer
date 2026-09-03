@@ -1,4 +1,4 @@
-"""One public-only SS-001B command and one offline report mode."""
+"""One public-only SS-001D command and one offline report mode."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 import subprocess
 
-from .config import ShadowConfig
+from .config import MAX_PUBLIC_DURATION_SECONDS, ShadowConfig
 from .report import render_report
 from .runner import run_public_smoke
 
@@ -47,8 +47,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "report":
         print(render_report(Path(args.path), format=args.format))
         return 0
-    if args.duration_seconds <= 0 or args.duration_seconds > 900:
-        raise SystemExit("--duration-seconds must be between 1 and 900")
+    if args.duration_seconds <= 0 or args.duration_seconds > MAX_PUBLIC_DURATION_SECONDS:
+        raise SystemExit(
+            f"--duration-seconds must be between 1 and {MAX_PUBLIC_DURATION_SECONDS}"
+        )
     if args.max_markets <= 0 or args.max_markets > 3:
         raise SystemExit("--max-markets must be between 1 and 3")
     result = asyncio.run(
