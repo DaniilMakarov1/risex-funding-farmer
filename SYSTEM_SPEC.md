@@ -1,6 +1,6 @@
 # RISEx Spread Shadow — System Specification
 
-SYSTEM_SPEC_VERSION = 3.0
+SYSTEM_SPEC_VERSION = 3.1
 SPEC_STATUS = ACTIVE_SPREAD_SHADOW__FROZEN_LEGACY_FUNDING_FARMER
 
 ## 0. Active product domain: RISEx Spread Shadow
@@ -199,6 +199,20 @@ The one frozen DG-004 run is immutable `DATA_INSUFFICIENT / TERMINAL_SERIALIZATI
 - A fatal public-protocol observation must retain bounded sanitized evidence sufficient to distinguish venue, WebSocket frame kind/category, and a non-secret bounded length/hash or equivalent classification without retaining raw payloads. Its `DATA_GAP`/fatal evidence must survive a full or closing ingress path and remain ordered before the terminal marker. This slice does not authorize accepting binary or otherwise unsupported frames, changing the official public protocol contract, retrying the economic run, or weakening fatal handling.
 - Acceptance requires focused cancellation/race, full-ingress protocol-failure, terminal-order, store-cap-reserve, and corrupt-replay tests; deterministic replay of immutable DG-002B, DG-003, and DG-004 evidence; one clean Python 3.11 full suite; and clean dependency, compile, import, private/write-surface, diff, scope, and Git checks. Store representation, economics, fill bounds, eligibility, stop rules, horizons, fees, markets, queue capacity, and shutdown timeout remain unchanged.
 - No replacement economic gate may be frozen until this correction is independently accepted and the unsupported Lighter frame class is resolved by official or sanitized observed public evidence. `SS-002` and `SS-003` remain closed. No private, authenticated, signing, or write activity is authorized.
+
+### 0.13 Accepted terminal correction and frozen `DG-005`
+
+`SS-001F` is independently accepted on exact source `cdbc95c67adaf9df120c3ff07bb990dc37542ae3`. Every observer-owned append and terminal marker now crosses one serialized boundary that waits for any thread-backed file operation to become quiescent; a sole terminal marker is physically last on a successful terminal path. Offline reporting rejects invalid, duplicate, decreasing, missing, or non-contiguous indices, missing/multiple/non-last terminals, and records after a terminal. Public protocol failures retain bounded sanitized venue, frame kind/category, length, and SHA-256 evidence without raw payloads, including when ingress is full or closing.
+
+Current official Lighter WebSocket documentation defines JSON subscription and response messages, and the current official Python SDK parses received asynchronous messages as JSON and uses JSON application-level ping/pong. A separate bounded `600 s` public transport diagnostic observed `34,309` text frames, four ordinary WebSocket CLOSE frames over five connections, and no binary, continuation, or otherwise unsupported frame. The exact historical DG-004 frame kind is unrecoverable because the old evidence omitted it; that omission is not permission to accept an unknown frame. Ordinary CLOSE remains supported, all data messages remain JSON text, and any future unsupported frame remains fatal with the new sanitized classification. No protocol-acceptance change is authorized.
+
+`DG-005 — Fillability Bounds Integrity Recovery Discovery` is frozen before its sample on exact accepted measurement source `cdbc95c67adaf9df120c3ff07bb990dc37542ae3`. It is one fresh public-only observational run in a fresh owner-only store.
+
+- Universe, economics, directions, sizes, margins, horizons, fees/provenance, `25 s` freshness, quote construction, strict lower bound, optimistic at-or-through upper bound, eligibility, exact-q accumulation, no-lookahead capture, and concentration dimensions are exactly sections 0.8–0.11.
+- Stop on the first of `50` aggregate strict episodes, `500` unique eligible RISEx trades with relevant active quotes, `1,200 s`, or any integrity/fatal condition. After sample stop retain only the bounded Lighter horizon tail already authorized. There is no manual early stop, extension, retry, or parameter change.
+- Enforce `2,500,000` records, `12 GiB`, at least `24 GiB` free before launch, exact source/universe admission, one physically-last terminal, contiguous unique indices, owner-only permissions, no private/write surface, and two byte-identical canonical reports. Any unsupported public frame remains terminal and its sanitized evidence must precede `RUN_FAILED`.
+- Completeness, materiality thresholds, required per-policy reporting, and seven-verdict precedence are exactly section 0.9. `PROFITABLE_QUOTES_UNFILLABLE` and the public-bracket form of `FILLABILITY_INSUFFICIENT_EVIDENCE` still require `500` eligible trades. A strict-stop sample may reach `LATENCY_DESTROYS_EDGE` or `ENTRY_EDGE_CANDIDATE` only through the frozen per-policy thresholds.
+- This gate may resolve the active mission only as case A, B, or C in section 0.8. A measurement failure is not mission completion. `SS-002` and `SS-003` remain closed; no private, authenticated, signing, or write activity follows any result.
 
 ## Legacy benchmark domain: RISEx Funding Farmer
 
