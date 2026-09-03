@@ -1,19 +1,19 @@
 # Active bounded task
 
-## SS-001C — Measurement Reliability Correction
+## DG-002A — Corrected Measurement Stability
 
-Status: `AUTHORIZED / BUILDER NOT YET OPENED`.
+Status: `FROZEN / READY TO RUN`.
 
-Objective: correct only the three measurement defects proven by the immutable `DG-001` evidence and accepted source: RISEx `PING` fall-through to fatal invalid-frame, ingress close failing to wake an already blocked consumer, and report completeness that globally degrades unrelated same-market evidence and treats zero strict fills as data corruption.
+Objective: prove the accepted SS-001C public measurement path can admit exact `BTC/ETH/SOL`, run for the bounded duration, terminate without intervention, retain intact evidence, and render deterministically.
 
-Exact base: current accepted and published `main`. Use one fresh visible Spread Builder and a fresh `codex/spread-ss-001c-measurement-reliability` branch/worktree. Verification is Level A plus, after independent acceptance and integration, a separately frozen public-only `DG-002A` stability run.
+Exact source: accepted and published `b4f2822327fc0f7b50a02d7aabfc2d6e61b453a4`. No Builder or code change is authorized. Verification is the prospective public-only gate frozen in System Specification 2.4.
 
-Allowed implementation scope: the minimum feed/ingress/runner/report surfaces required for correct RISEx ping handling, wake-up-safe draining shutdown, bounded consumer termination, exactly one clean terminal `RUN_STOP`, overlap-aware completeness, and separation of data quality from zero-fill evidence. Preserve explicit partial/stale/missing/gap outcomes and terminal-marker semantics.
+Run exactly once for `60 seconds` in a fresh owner-only store with a `250,000`-record cap and requested universe `BTC/ETH/SOL`. Require unassisted return within `10 seconds` after duration, exact source metadata, all three markets, one clean sole `RUN_STOP`, no failure/fatal/integrity class named by the frozen gate, owner-only permissions, and two byte-identical canonical offline JSON reports.
 
-Required adverse regressions: blocked empty consumer plus close; queued drain; double close; already-stopped transport; consumer exception; evidence-store failure; pending horizon at shutdown; no required queued-record loss; no synthetic planned-shutdown transport gap; exactly one clean `RUN_STOP`; overlapping gap invalidates only contaminated evidence; unrelated same-market evidence remains clean; zero strict fills is not automatically degraded; missing horizon rows remain incomplete; named partial/stale/missing/gap outcomes are never imputed as zero.
+The run is stability evidence only. Preserve and report economic observations, but do not interpret them as the discovery verdict and do not tune the later gate from them.
 
-Forbidden: strategy, fee, quote-economics, quantity, fill-model, universe, storage architecture, generic lifecycle/recovery, private/auth/credential/signing/write/testnet/mainnet, venue, `SS-002`, or `SS-003` changes. Heavy persistence is observed but not proven causal, so no storage optimization is authorized in this slice.
+Forbidden: any code, strategy, fee, quote-economics, quantity, fill-model, storage, private/auth/credential/signing/write/testnet/mainnet, venue, `SS-002`, or `SS-003` change.
 
-Acceptance: Builder never self-accepts. Chief verifies exact base, root-cause-aligned narrow diff, focused adverse tests, one clean isolated Python 3.11 full suite on final SHA, dependency/import/private/write surfaces, Git cleanliness, and no strategy expansion before fast-forward integration and push.
+Acceptance: every frozen success condition passes. Any failure blocks `DG-002B` and is recorded before a separately frozen diagnostic or rerun.
 
-After acceptance, freeze `DG-002A` prospectively before running it. `DG-002B` must not run or be frozen from observed stability/economic results before `DG-002A` passes. The immutable `DG-001` verdict remains `DATA_INSUFFICIENT` and is never renamed or reused as economic evidence. `SS-002` and `SS-003` remain closed.
+After a pass, record the result, then freeze `DG-002B` prospectively before its economic sample. The immutable `DG-001` verdict remains `DATA_INSUFFICIENT` and is never renamed or reused as economic evidence.
