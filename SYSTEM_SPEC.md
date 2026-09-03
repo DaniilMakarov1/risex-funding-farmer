@@ -1,6 +1,6 @@
 # RISEx Spread Shadow — System Specification
 
-SYSTEM_SPEC_VERSION = 3.1
+SYSTEM_SPEC_VERSION = 3.2
 SPEC_STATUS = ACTIVE_SPREAD_SHADOW__FROZEN_LEGACY_FUNDING_FARMER
 
 ## 0. Active product domain: RISEx Spread Shadow
@@ -213,6 +213,17 @@ Current official Lighter WebSocket documentation defines JSON subscription and r
 - Enforce `2,500,000` records, `12 GiB`, at least `24 GiB` free before launch, exact source/universe admission, one physically-last terminal, contiguous unique indices, owner-only permissions, no private/write surface, and two byte-identical canonical reports. Any unsupported public frame remains terminal and its sanitized evidence must precede `RUN_FAILED`.
 - Completeness, materiality thresholds, required per-policy reporting, and seven-verdict precedence are exactly section 0.9. `PROFITABLE_QUOTES_UNFILLABLE` and the public-bracket form of `FILLABILITY_INSUFFICIENT_EVIDENCE` still require `500` eligible trades. A strict-stop sample may reach `LATENCY_DESTROYS_EDGE` or `ENTRY_EDGE_CANDIDATE` only through the frozen per-policy thresholds.
 - This gate may resolve the active mission only as case A, B, or C in section 0.8. A measurement failure is not mission completion. `SS-002` and `SS-003` remain closed; no private, authenticated, signing, or write activity follows any result.
+
+### 0.14 Post-DG-005 lossless book-evidence correction
+
+The one frozen DG-005 run is immutable `DATA_INSUFFICIENT / MEASUREMENT_THROUGHPUT_FAILURE`. Its terminal stream is physically valid and clean, but its `1,117` gaps include `921` Lighter and `166` RISEx `QUEUE_OVERFLOW` gaps plus `27` unexpected Lighter disconnect gaps. It stopped prospectively on `WALL_CLOCK_LIMIT` at `40` unique eligible trades with diagnostic `17` strict and `22` optimistic episodes. All `288` policy/horizon groups per model are degraded; no fillability or delayed-edge verdict may be inferred.
+
+- The owner-only evidence file has `130,877` records and `4,986,247,063` bytes, SHA-256 `5de295aaf7b8b7f63c71a518e3da3e718c89b154faa1efc4143735c61a8c3611`; its repeated canonical report is byte-identical at SHA-256 `a9721dc76ad96286bed1e97af7bd7db40168983844e96cab2c1e1e15ba54555f`. Indices are exactly contiguous `0..130876` and the sole final marker is clean `RUN_STOP`.
+- Full `BOOK` rows account for `4,831,137,744` bytes, or `96.89%` of the evidence. Lighter contributed `64,494` BOOK rows with median `74,410` bytes; the median normalized state repeated `1,081` bid and `751` ask levels per revision. This prospectively proves that the accepted batching path alone does not safely sustain the deep-book public stream and that a bounded lossless representation correction is necessary.
+- `SS-001G — Lossless Book-Delta Evidence` is the only authorized correction. For each venue/market/session/recovery chain, persist one full normalized starting snapshot and then exact normalized level changes with an explicit predecessor/revision identity sufficient to reconstruct every accepted immutable full book byte-for-byte in canonical numeric form. A new or displaced chain must start with a full snapshot. Missing, ambiguous, duplicate, or out-of-order predecessor evidence fails closed; it never guesses or silently skips a revision.
+- Quote evidence must bind the exact RISEx and Lighter book revision identities used for BBO, sizing, hedge VWAP, and maker-price construction. Horizon evidence retains its exact referenced Lighter revision. An offline bounded-memory reconstruction/audit path must prove revision chains and referenced calculation witnesses without changing quote, fill, eligibility, or horizon semantics. Existing full-BOOK historical evidence remains readable and deterministic.
+- Acceptance requires realistic deep-book evidence: at least the observed `1,900`-level contour, repeated small deltas, all three markets, an offered event rate above DG-005 without queue-capacity feedback, actual JSON serialization and owner-only durable storage, zero overflow/loss/reordering, bounded memory, clean terminal drain, deterministic reconstruction equal to the source full books, and a material byte reduction sufficient to remain below the existing caps with headroom. Focused failure/recovery/cap/legacy-replay tests and one clean Python 3.11 full suite are mandatory.
+- No generic database, compression framework, message bus, storage service, queue/cap/timeout increase, raw-payload archive, venue/protocol/economic/fill/stop/horizon change, private/authenticated access, or write path is authorized. No replacement discovery gate may be frozen until SS-001G is independently accepted. `SS-002` and `SS-003` remain closed.
 
 ## Legacy benchmark domain: RISEx Funding Farmer
 
