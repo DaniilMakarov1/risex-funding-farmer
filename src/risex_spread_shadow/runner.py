@@ -45,6 +45,9 @@ from .models import (
 from .store import AppendOnlyEvidenceStore
 
 
+_SHUTDOWN_TIMEOUT_SECONDS = 2.0
+
+
 def _level_record(level: BookLevel) -> dict[str, str]:
     return {
         "price": str(level.canonical_price),
@@ -899,14 +902,66 @@ class SpreadShadowRunner:
         self.feed = feed
         self.observer = observer
 
+    @staticmethod
+    def _consume_task_result(task: asyncio.Task[Any]) -> None:
+        try:
+            task.exception()
+        except BaseException:
+            pass
+
+    async def _await_shutdown_task(
+        self,
+        task: asyncio.Task[Any],
+        *,
+        failure_reason: str,
+    ) -> None:
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(task), timeout=_SHUTDOWN_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            task.cancel()
+            task.add_done_callback(self._consume_task_result)
+            if self.observer.fatal_reason is None:
+                self.observer.fatal_reason = failure_reason
+            raise
+
     async def run(self, *, duration_seconds: int | None = None) -> None:
         consumer = asyncio.create_task(self.observer.consume())
+        failure: BaseException | None = None
         try:
             await self.feed.run(duration_seconds=duration_seconds)
+        except BaseException as exc:
+            failure = exc
         finally:
-            self.feed.ingress.close()
-            await consumer
-            await self.observer.close()
+            try:
+                self.feed.ingress.close()
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
+            try:
+                await self._await_shutdown_task(
+                    consumer,
+                    failure_reason="INGRESS_DRAIN_TIMEOUT",
+                )
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
+            if self.feed.ingress.has_pending and self.observer.fatal_reason is None:
+                self.observer.fatal_reason = "INGRESS_DRAIN_INCOMPLETE"
+                if failure is None:
+                    failure = RuntimeError("public feed ingress did not drain")
+            try:
+                observer_close = asyncio.create_task(self.observer.close())
+                await self._await_shutdown_task(
+                    observer_close,
+                    failure_reason="OBSERVER_SHUTDOWN_TIMEOUT",
+                )
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
+        if failure is not None:
+            raise failure
 
 
 class ReplayHarness:
@@ -974,6 +1029,9 @@ async def run_public_smoke(
         "created_utc": started_utc,
     }
     store = AppendOnlyEvidenceStore.create(store_root, metadata=metadata)
+    observer: SpreadObserver | None = None
+    feed: PublicFeedRunner | None = None
+    terminal_written = False
     try:
         timeout = aiohttp.ClientTimeout(total=30)
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -1004,30 +1062,56 @@ async def run_public_smoke(
                 lighter_adapter=lighter,
             )
             await SpreadShadowRunner(feed, observer).run(duration_seconds=duration_seconds)
-            store.append_batch(
-                ({
-                    "kind": "RUN_STOP",
-                    "fatal_reason": feed.fatal_reason or observer.fatal_reason,
-                    "stopped_utc": datetime.now(UTC),
-                    "observed_monotonic_ns": time.monotonic_ns(),
-                },)
-            )
-            return {
+            fatal_reason = feed.fatal_reason or observer.fatal_reason
+            if fatal_reason is None:
+                store.append_batch(
+                    ({
+                        "kind": "RUN_STOP",
+                        "fatal_reason": None,
+                        "stopped_utc": datetime.now(UTC),
+                        "observed_monotonic_ns": time.monotonic_ns(),
+                    },)
+                )
+            else:
+                store.append_batch(
+                    ({
+                        "kind": "RUN_FAILED",
+                        "failure_class": "FATAL_RUNTIME",
+                        "fatal_reason": fatal_reason,
+                        "failed_utc": datetime.now(UTC),
+                        "observed_monotonic_ns": time.monotonic_ns(),
+                    },)
+                )
+            terminal_written = True
+            result = {
                 "run_id": store.run_id,
                 "store_path": str(store.path),
                 "markets": tuple(pair.canonical_market for pair in pairs),
                 "duration_seconds": config.duration_seconds if duration_seconds is None else duration_seconds,
-                "fatal_reason": feed.fatal_reason or observer.fatal_reason,
+                "fatal_reason": fatal_reason,
             }
+            return result
     except Exception as exc:
-        store.append_batch(
-            ({
-                "kind": "RUN_FAILED",
-                "failure_class": type(exc).__name__,
-                "failed_utc": datetime.now(UTC),
-                "observed_monotonic_ns": time.monotonic_ns(),
-            },)
-        )
+        if not terminal_written:
+            fatal_reason = (
+                None
+                if feed is None or observer is None
+                else feed.fatal_reason or observer.fatal_reason
+            )
+            try:
+                store.append_batch(
+                    ({
+                        "kind": "RUN_FAILED",
+                        "failure_class": type(exc).__name__,
+                        "fatal_reason": fatal_reason,
+                        "failed_utc": datetime.now(UTC),
+                        "observed_monotonic_ns": time.monotonic_ns(),
+                    },)
+                )
+            except Exception as marker_exc:
+                exc.add_note(
+                    f"unable to persist RUN_FAILED marker: {type(marker_exc).__name__}"
+                )
         raise
     finally:
         store.close()

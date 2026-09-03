@@ -97,6 +97,7 @@ class IngressQueue:
         if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity <= 0:
             raise ValueError("ingress queue capacity must be positive")
         self._queue: asyncio.Queue[IngressItem] = asyncio.Queue(maxsize=capacity)
+        self._wake = asyncio.Event()
         self._latched: dict[tuple[Venue, str, str | int, int], DataGapEvidence] = {}
         self._closed = False
 
@@ -173,32 +174,48 @@ class IngressQueue:
 
         if self._closed:
             self._latch(self._item_gap(item))
+            self._wake.set()
             return False
         try:
             self._queue.put_nowait(item)
         except asyncio.QueueFull:
             self._latch(self._item_gap(item))
+            self._wake.set()
             return False
+        self._wake.set()
         return True
 
     async def next_item(self) -> IngressItem | None:
-        if self._latched:
-            key = sorted(
-                self._latched,
-                key=lambda value: (
-                    value[1],
-                    value[0].value,
-                    str(value[2]),
-                    value[3],
-                ),
-            )[0]
-            return FeedGapEvent(self._latched.pop(key))
-        if self._closed and self._queue.empty():
-            return None
-        return await self._queue.get()
+        while True:
+            if self._latched:
+                key = sorted(
+                    self._latched,
+                    key=lambda value: (
+                        value[1],
+                        value[0].value,
+                        str(value[2]),
+                        value[3],
+                    ),
+                )[0]
+                return FeedGapEvent(self._latched.pop(key))
+            try:
+                return self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            if self._closed:
+                return None
+
+            # Clear only after observing an empty, open queue.  The second
+            # check closes the small same-loop race with an offer/close that
+            # happened before the consumer started waiting.
+            self._wake.clear()
+            if self._latched or not self._queue.empty() or self._closed:
+                continue
+            await self._wake.wait()
 
     def close(self) -> None:
         self._closed = True
+        self._wake.set()
 
 
 @dataclass(slots=True)
@@ -681,6 +698,7 @@ class PublicFeedRunner:
                 await ws.pong(action.payload)
                 if action.connection_confirmed:
                     self._confirm_venue(Venue.RISEX)
+                continue
             elif kind == "CLOSE":
                 return
             elif kind == "PONG":

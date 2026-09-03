@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from decimal import Decimal as D
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -38,6 +39,7 @@ from risex_spread_shadow import (
     store_permissions,
 )
 from risex_spread_shadow.feed import PublicFeedRunner
+import risex_spread_shadow.runner as runner_module
 
 
 UTC = timezone.utc
@@ -408,6 +410,58 @@ def test_queue_overflow_latches_explicit_identity_gap_without_blocking() -> None
 
 
 @pytest.mark.asyncio
+async def test_empty_ingress_close_wakes_already_blocked_consumer() -> None:
+    queue = IngressQueue(2)
+    waiting = asyncio.create_task(queue.next_item())
+    await asyncio.sleep(0)
+    assert not waiting.done()
+
+    queue.close()
+
+    assert await asyncio.wait_for(waiting, timeout=1) is None
+    queue.close()
+    assert not queue.has_pending
+
+
+@pytest.mark.asyncio
+async def test_ingress_close_drains_latch_and_queue_and_rejects_late_offers() -> None:
+    queue = IngressQueue(1)
+    queued = FeedBookEvent(
+        evidence_book(Venue.LIGHTER, received=10, session="lighter"),
+        PAIR,
+        "SNAPSHOT",
+        "fixture",
+    )
+    overflow = FeedBookEvent(
+        evidence_book(Venue.LIGHTER, received=11, session="lighter", revision=2),
+        PAIR,
+        "DELTA",
+        "fixture",
+    )
+    late = FeedBookEvent(
+        evidence_book(Venue.LIGHTER, received=12, session="lighter", revision=3),
+        PAIR,
+        "DELTA",
+        "fixture",
+    )
+    assert queue.offer(queued)
+    assert not queue.offer(overflow)
+    queue.close()
+    assert not queue.offer(late)
+
+    first = await queue.next_item()
+    second = await queue.next_item()
+    third = await queue.next_item()
+
+    assert isinstance(first, FeedGapEvent)
+    assert first.gap.reason == "QUEUE_OVERFLOW"
+    assert isinstance(second, FeedBookEvent)
+    assert second == queued
+    assert third is None
+    assert not queue.has_pending
+
+
+@pytest.mark.asyncio
 async def test_observer_rejects_queued_old_identity_after_overflow_until_fresh_snapshot(tmp_path: Path) -> None:
     store = AppendOnlyEvidenceStore.create(
         tmp_path,
@@ -563,6 +617,58 @@ async def test_delayed_would_fill_retains_books_through_detection_based_deadline
     assert {row["horizon_ms"] for row in horizons} == {0, 300, 500, 1000}
     assert next(row for row in horizons if row["horizon_ms"] == 1000)["book_received_monotonic_ns"] == 1_000_000_200
     await observer.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_observer_shutdown_keeps_pending_horizon_outcomes_explicit(tmp_path: Path) -> None:
+    store = AppendOnlyEvidenceStore.create(
+        tmp_path,
+        metadata={"source_commit": "fixture", "evidence_mode": "FIXTURE"},
+    )
+    clock = [200]
+    observer = SpreadObserver(
+        config(freshness_max_age_ns=2_000_000_000),
+        (PAIR,),
+        store,
+        monotonic_ns=lambda: clock[0],
+    )
+    await observer.handle_book(
+        FeedBookEvent(
+            evidence_book(Venue.RISEX, received=100, session="risex"),
+            PAIR,
+            "SNAPSHOT",
+            "fixture",
+        )
+    )
+    await observer.handle_book(
+        FeedBookEvent(
+            evidence_book(
+                Venue.LIGHTER,
+                received=100,
+                session="lighter",
+                bids=(("100", "10"),),
+                asks=(("102", "10"),),
+            ),
+            PAIR,
+            "SNAPSHOT",
+            "fixture",
+        )
+    )
+    observer._replay_mode = True
+    await observer.handle_trade(FeedTradeEvent(trade(received=200), PAIR, "fixture-time"))
+    observer._replay_mode = False
+    assert observer.pending_episode_count == 1
+
+    await observer.close()
+    records = [json.loads(line) for line in store.path.read_text().splitlines()]
+    horizons = [record for record in records if record.get("kind") == "HEDGE_HORIZON"]
+    by_horizon = {record["horizon_ms"]: record for record in horizons}
+    assert by_horizon[0]["outcome"] == "HEDGE_FULL"
+    for horizon_ms in (300, 500, 1000):
+        assert by_horizon[horizon_ms]["outcome"] == "HEDGE_DATA_GAP"
+        assert by_horizon[horizon_ms]["gap_reason"] == "RUN_STOPPED_BEFORE_HORIZON"
+        assert by_horizon[horizon_ms]["entry_edge_usd"] is None
     store.close()
 
 
@@ -737,6 +843,93 @@ def test_public_text_payload_parser_preserves_decimal_wire_values() -> None:
 
 
 @pytest.mark.asyncio
+async def test_risex_server_ping_is_consumed_and_read_loop_continues() -> None:
+    class FakeRisex:
+        @staticmethod
+        def market_id(_symbol):
+            return 1
+
+        @staticmethod
+        def handle_server_ping(payload):
+            assert payload == b"server"
+            return SimpleNamespace(payload=b"pong", connection_confirmed=True)
+
+    class FakeLighter:
+        @staticmethod
+        def market_id(_symbol):
+            return 2
+
+    class FakeWebsocket:
+        def __init__(self):
+            self.messages = iter(
+                (
+                    SimpleNamespace(type="PING", data=b"server"),
+                    SimpleNamespace(type="CLOSE", data=b""),
+                )
+            )
+            self.pongs = []
+
+        async def receive(self):
+            return next(self.messages)
+
+        async def pong(self, payload):
+            self.pongs.append(payload)
+
+    runner = PublicFeedRunner(
+        None,
+        (PAIR,),
+        IngressQueue(16),
+        risex_adapter=FakeRisex(),
+        lighter_adapter=FakeLighter(),
+    )
+    runner.begin_connection(Venue.RISEX, "risex")
+    websocket = FakeWebsocket()
+
+    await runner._read_risex(websocket, asyncio.Event())
+
+    assert websocket.pongs == [b"pong"]
+    assert runner.fatal_reason is None
+    assert not runner.ingress.has_pending
+
+
+@pytest.mark.asyncio
+async def test_risex_invalid_control_frame_still_fails_closed() -> None:
+    class FakeRisex:
+        @staticmethod
+        def market_id(_symbol):
+            return 1
+
+        @staticmethod
+        def handle_server_ping(_payload):
+            raise AssertionError("invalid frame must not be treated as PING")
+
+    class FakeLighter:
+        @staticmethod
+        def market_id(_symbol):
+            return 2
+
+    class FakeWebsocket:
+        async def receive(self):
+            return SimpleNamespace(type="BINARY", data=b"invalid")
+
+    runner = PublicFeedRunner(
+        None,
+        (PAIR,),
+        IngressQueue(16),
+        risex_adapter=FakeRisex(),
+        lighter_adapter=FakeLighter(),
+    )
+    runner.begin_connection(Venue.RISEX, "risex")
+
+    await runner._read_risex(FakeWebsocket(), asyncio.Event())
+
+    assert runner.fatal_reason == "RISEX_PUBLIC_FRAME_INVALID"
+    item = await runner.ingress.next_item()
+    assert isinstance(item, FeedGapEvent)
+    assert item.gap.reason == "RISEX_PUBLIC_FRAME_INVALID"
+
+
+@pytest.mark.asyncio
 async def test_transport_planned_stop_uses_only_explicit_planned_stop_gap() -> None:
     from types import SimpleNamespace
 
@@ -875,6 +1068,211 @@ async def test_transport_early_close_remains_socket_disconnect_gap() -> None:
     await asyncio.wait_for(task, timeout=1)
 
 
+@pytest.mark.asyncio
+async def test_spread_runner_bounded_shutdown_drains_all_queued_evidence(
+    tmp_path: Path,
+) -> None:
+    store = AppendOnlyEvidenceStore.create(
+        tmp_path,
+        metadata={"source_commit": "fixture", "evidence_mode": "FIXTURE"},
+    )
+    observer = runner_module.SpreadObserver(config(), (PAIR,), store)
+    gaps = tuple(
+        FeedGapEvent(
+            DataGapEvidence(
+                source_venue=Venue.LIGHTER,
+                canonical_market="BTC",
+                stream_session_id="lighter",
+                recovery_generation=0,
+                gap_start_monotonic_ns=start,
+                reason="QUEUED_TEST_GAP",
+            )
+        )
+        for start in (100, 200, 300)
+    )
+
+    class Feed:
+        ingress = observer.ingress
+
+        async def run(self, **_kwargs):
+            for item in gaps:
+                assert self.ingress.offer(item)
+
+    await runner_module.SpreadShadowRunner(Feed(), observer).run()
+
+    store.close()
+    records = [json.loads(line) for line in store.path.read_text().splitlines()]
+    assert [record["reason"] for record in records if record.get("kind") == "DATA_GAP"] == [
+        "QUEUED_TEST_GAP",
+        "QUEUED_TEST_GAP",
+        "QUEUED_TEST_GAP",
+    ]
+    assert observer.fatal_reason is None
+    assert not observer.ingress.has_pending
+
+
+@pytest.mark.asyncio
+async def test_spread_runner_preserves_consumer_exception_and_closes_observer() -> None:
+    ingress = IngressQueue(2)
+
+    class FailingObserver:
+        def __init__(self):
+            self.ingress = ingress
+            self.fatal_reason = None
+            self.closed = False
+
+        async def consume(self):
+            raise LookupError("consumer failure")
+
+        async def close(self):
+            self.closed = True
+
+    class Feed:
+        def __init__(self):
+            self.ingress = ingress
+
+        async def run(self, **_kwargs):
+            return None
+
+    observer = FailingObserver()
+    with pytest.raises(LookupError, match="consumer failure"):
+        await runner_module.SpreadShadowRunner(Feed(), observer).run()
+    assert observer.closed
+
+
+@pytest.mark.asyncio
+async def test_spread_runner_bounds_a_consumer_that_will_not_terminate(monkeypatch) -> None:
+    monkeypatch.setattr(runner_module, "_SHUTDOWN_TIMEOUT_SECONDS", 0.01)
+    ingress = IngressQueue(2)
+
+    class StuckObserver:
+        def __init__(self):
+            self.ingress = ingress
+            self.fatal_reason = None
+            self.closed = False
+            self.never = asyncio.Event()
+
+        async def consume(self):
+            await self.never.wait()
+
+        async def close(self):
+            self.closed = True
+
+    class Feed:
+        def __init__(self):
+            self.ingress = ingress
+
+        async def run(self, **_kwargs):
+            return None
+
+    observer = StuckObserver()
+    with pytest.raises(asyncio.TimeoutError):
+        await runner_module.SpreadShadowRunner(Feed(), observer).run()
+    assert observer.fatal_reason == "INGRESS_DRAIN_TIMEOUT"
+    assert observer.closed
+
+
+@pytest.mark.asyncio
+async def test_spread_runner_preserves_evidence_store_failure() -> None:
+    class FailingStore:
+        run_id = "fixture-run"
+
+        def append_batch(self, _records):
+            raise OSError("store failure")
+
+    observer = runner_module.SpreadObserver(config(), (PAIR,), FailingStore())
+    gap = FeedGapEvent(
+        DataGapEvidence(
+            source_venue=Venue.LIGHTER,
+            canonical_market="BTC",
+            stream_session_id="lighter",
+            recovery_generation=0,
+            gap_start_monotonic_ns=100,
+            reason="STORE_FAILURE_TEST",
+        )
+    )
+
+    class Feed:
+        ingress = observer.ingress
+
+        async def run(self, **_kwargs):
+            assert self.ingress.offer(gap)
+
+    with pytest.raises(OSError, match="store failure"):
+        await runner_module.SpreadShadowRunner(Feed(), observer).run()
+    assert observer.fatal_reason == "EVIDENCE_STORE_WRITE_FAILED"
+
+
+@pytest.mark.asyncio
+async def test_run_public_smoke_emits_one_clean_stop_or_one_failure_marker(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    async def select(_risex, _lighter, **_kwargs):
+        return (PAIR,)
+
+    monkeypatch.setattr(runner_module, "select_public_market_pairs", select)
+
+    class NoOpFeed:
+        def __init__(self, _session, _pairs, ingress, **_kwargs):
+            self.ingress = ingress
+            self.fatal_reason = None
+
+    monkeypatch.setattr(runner_module, "PublicFeedRunner", NoOpFeed)
+
+    async def clean(self, **_kwargs):
+        return None
+
+    monkeypatch.setattr(runner_module.SpreadShadowRunner, "run", clean)
+    clean_result = await runner_module.run_public_smoke(
+        str(tmp_path / "clean"), config=config(), source_commit="fixture", duration_seconds=1
+    )
+    clean_records = [
+        json.loads(line) for line in Path(clean_result["store_path"]).read_text().splitlines()
+    ]
+    clean_terminal = [
+        record["kind"]
+        for record in clean_records
+        if record.get("kind") in {"RUN_STOP", "RUN_FAILED"}
+    ]
+    assert clean_terminal == ["RUN_STOP"]
+
+    async def failed(self, **_kwargs):
+        raise LookupError("planned failure")
+
+    monkeypatch.setattr(runner_module.SpreadShadowRunner, "run", failed)
+    with pytest.raises(LookupError, match="planned failure"):
+        await runner_module.run_public_smoke(
+            str(tmp_path / "failed"), config=config(), source_commit="fixture", duration_seconds=1
+        )
+    failed_root = next((tmp_path / "failed").iterdir())
+    failed_records = [json.loads(line) for line in (failed_root / "evidence.jsonl").read_text().splitlines()]
+    failed_terminal = [
+        record["kind"]
+        for record in failed_records
+        if record.get("kind") in {"RUN_STOP", "RUN_FAILED"}
+    ]
+    assert failed_terminal == ["RUN_FAILED"]
+    assert failed_records[-1]["failure_class"] == "LookupError"
+
+    async def fatal(self, **_kwargs):
+        self.feed.fatal_reason = "TEST_FATAL"
+
+    monkeypatch.setattr(runner_module.SpreadShadowRunner, "run", fatal)
+    fatal_result = await runner_module.run_public_smoke(
+        str(tmp_path / "fatal"), config=config(), source_commit="fixture", duration_seconds=1
+    )
+    fatal_records = [
+        json.loads(line) for line in Path(fatal_result["store_path"]).read_text().splitlines()
+    ]
+    assert [
+        record["kind"]
+        for record in fatal_records
+        if record.get("kind") in {"RUN_STOP", "RUN_FAILED"}
+    ] == ["RUN_FAILED"]
+    assert fatal_result["fatal_reason"] == "TEST_FATAL"
+
+
 def test_report_uses_horizon_entry_edges_and_excludes_only_clean_terminal_stop_gap(
     tmp_path: Path,
 ) -> None:
@@ -959,3 +1357,151 @@ def test_report_uses_horizon_entry_edges_and_excludes_only_clean_terminal_stop_g
     forced = build_report(write_records(tmp_path / "forced", clean_stop=False))
     forced_group = next(group for group in forced["groups"] if group["horizon_ms"] == 300)
     assert forced_group["data_completeness"] == "DEGRADED"
+
+
+def test_report_completeness_is_episode_scoped_and_zero_fill_is_clean(
+    tmp_path: Path,
+) -> None:
+    def quote(policy_id: str, version_id: str, *, created: int) -> dict:
+        return {
+            "kind": "QUOTE",
+            "canonical_market": "BTC",
+            "direction": "RISEX_BUY_LIGHTER_SELL",
+            "target_notional_usd": "100",
+            "target_margin_bps": "1",
+            "policy_id": policy_id,
+            "quote_version_id": version_id,
+            "outcome": "QUOTE_ACTIVE",
+            "quote_created_monotonic_ns": created,
+            "quote_expires_monotonic_ns": created + 100,
+            "quote_lifetime_ns": 100,
+            "risex_tick_size": "1",
+            "post_only_bound_price": "100",
+            "maker_price": "99",
+            "canonical_quantity": "1",
+            "observed_monotonic_ns": created,
+        }
+
+    def fill(version_id: str, *, detected: int, session: str) -> dict:
+        return {
+            "kind": "WOULD_FILL",
+            "canonical_market": "BTC",
+            "venue": "RISEX",
+            "quote_version_id": version_id,
+            "would_fill_detected_monotonic_ns": detected,
+            "hedge_stream_session_id": session,
+            "hedge_recovery_generation": 0,
+            "observed_monotonic_ns": detected,
+        }
+
+    def horizon(
+        policy_id: str,
+        version_id: str,
+        *,
+        detected: int,
+        session: str,
+        outcome: str = "HEDGE_FULL",
+        edge: str | None = "1",
+    ) -> dict:
+        return {
+            "kind": "HEDGE_HORIZON",
+            "canonical_market": "BTC",
+            "venue": "LIGHTER",
+            "direction": "RISEX_BUY_LIGHTER_SELL",
+            "target_notional_usd": "100",
+            "target_margin_bps": "1",
+            "policy_id": policy_id,
+            "quote_version_id": version_id,
+            "horizon_ms": 0,
+            "would_fill_detected_monotonic_ns": detected,
+            "horizon_deadline_monotonic_ns": detected,
+            "expected_stream_session_id": session,
+            "expected_recovery_generation": 0,
+            "outcome": outcome,
+            "entry_edge_usd": edge,
+            "conditional_markout_usd": edge,
+            "observed_monotonic_ns": detected,
+        }
+
+    store = AppendOnlyEvidenceStore.create(
+        tmp_path,
+        metadata={"source_commit": "fixture", "evidence_mode": "OBSERVATIONAL"},
+    )
+    store.append_batch(
+        (
+            quote("bad", "bad-v", created=100),
+            quote("clean", "clean-v", created=100),
+            quote("zero", "zero-v", created=1_000),
+            quote("missing", "missing-v", created=2_000),
+            quote("partial", "partial-v", created=3_000),
+            fill("bad-v", detected=150, session="lighter-1"),
+            fill("clean-v", detected=150, session="lighter-2"),
+            fill("missing-v", detected=2_050, session="lighter-3"),
+            fill("partial-v", detected=3_050, session="lighter-4"),
+            horizon("bad", "bad-v", detected=150, session="lighter-1"),
+            horizon("clean", "clean-v", detected=150, session="lighter-2"),
+            horizon(
+                "partial",
+                "partial-v",
+                detected=3_050,
+                session="lighter-4",
+                outcome="HEDGE_PARTIAL",
+                edge="99",
+            ),
+            {
+                "kind": "DATA_GAP",
+                "canonical_market": "BTC",
+                "venue": "LIGHTER",
+                "stream_session_id": "lighter-1",
+                "recovery_generation": 0,
+                "gap_start_monotonic_ns": 149,
+                "gap_end_monotonic_ns": 151,
+                "reason": "QUEUE_OVERFLOW",
+                "observed_monotonic_ns": 149,
+            },
+            {"kind": "RUN_STOP", "fatal_reason": None},
+        )
+    )
+    path = store.path
+    store.close()
+
+    report = build_report(path)
+    horizon_zero = [group for group in report["groups"] if group["horizon_ms"] == 0]
+    bad = next(
+        group
+        for group in horizon_zero
+        if group["data_completeness"] == "DEGRADED"
+        and group["mean_entry_edge_usd"] == "1"
+    )
+    clean = next(
+        group
+        for group in horizon_zero
+        if group["data_completeness"] == "COMPLETE"
+        and group["mean_entry_edge_usd"] == "1"
+    )
+    zero = next(
+        group
+        for group in horizon_zero
+        if group["strict_would_fill_count"] == 0
+    )
+    missing = next(
+        group
+        for group in horizon_zero
+        if group["data_completeness"] == "DEGRADED"
+        and group["strict_would_fill_count"] == 1
+        and group["mean_entry_edge_usd"] is None
+    )
+    partial = next(
+        group
+        for group in horizon_zero
+        if group["data_completeness"] == "COMPLETE"
+        and group["partial_or_missing_rate"] == "1"
+    )
+    assert bad["data_gap_count"] == 1
+    assert clean["data_completeness"] == "COMPLETE"
+    assert zero["data_completeness"] == "COMPLETE"
+    assert zero["strict_would_fill_count"] == 0
+    assert zero["mean_entry_edge_usd"] is None
+    assert missing["data_completeness"] == "DEGRADED"
+    assert partial["mean_entry_edge_usd"] is None
+    assert partial["positive_edge_share"] is None
