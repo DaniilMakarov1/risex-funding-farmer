@@ -767,14 +767,15 @@ class PublicFeedRunner:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                self.disconnect(venue, reason="PUBLIC_SOCKET_DISCONNECTED")
                 if not stop.is_set():
+                    self.disconnect(venue, reason="PUBLIC_SOCKET_DISCONNECTED")
                     try:
                         await asyncio.wait_for(stop.wait(), timeout=1)
                     except asyncio.TimeoutError:
                         pass
             else:
-                self.disconnect(venue, reason="PUBLIC_SOCKET_DISCONNECTED")
+                if not stop.is_set():
+                    self.disconnect(venue, reason="PUBLIC_SOCKET_DISCONNECTED")
 
     async def run(self, *, duration_seconds: int | None = None) -> None:
         duration = self.config.duration_seconds if duration_seconds is None else duration_seconds

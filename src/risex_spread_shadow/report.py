@@ -84,6 +84,14 @@ def build_report(path: str | Path) -> dict[str, Any]:
     fills = [record for record in records if record.get("kind") == "WOULD_FILL"]
     horizons = [record for record in records if record.get("kind") == "HEDGE_HORIZON"]
     gaps = [record for record in records if record.get("kind") == "DATA_GAP"]
+    ordinary_duration_completion = (
+        any(
+            record.get("kind") == "RUN_STOP"
+            and record.get("fatal_reason") in (None, "")
+            for record in records
+        )
+        and not any(record.get("kind") == "RUN_FAILED" for record in records)
+    )
     quote_by_version = {
         _key_text(record.get("quote_version_id")): record
         for record in quotes
@@ -128,11 +136,6 @@ def build_report(path: str | Path) -> dict[str, Any]:
             target = _key_text(first_horizon.get("target_notional_usd"))
             margin = _key_text(first_horizon.get("target_margin_bps"))
         quoteable = [quote for quote in policy_quotes if quote.get("outcome") == "QUOTE_ACTIVE"]
-        edges = [
-            parsed
-            for quote in quoteable
-            if (parsed := _decimal(quote.get("actual_edge_usd"))) is not None
-        ]
         quote_count = len(policy_quotes)
         quoteable_count = len(quoteable)
         bbo_distances: list[Decimal] = []
@@ -177,13 +180,30 @@ def build_report(path: str | Path) -> dict[str, Any]:
             else Decimal("0")
         )
         policy_gaps = [gap for gap in gaps if _key_text(gap.get("canonical_market")) == market]
+        completeness_gaps = [
+            gap
+            for gap in policy_gaps
+            if not (
+                ordinary_duration_completion
+                and gap.get("reason") == "PUBLIC_SMOKE_STOPPED"
+            )
+        ]
         for horizon_ms in (0, 300, 500, 1000):
             observations = horizon_groups.get((policy_id, horizon_ms), [])
             outcomes = [_key_text(item.get("outcome")) for item in observations]
+            # These are conditional realized values.  Quote estimates are not
+            # horizon-specific, and partial/missing captures are not zeroes.
+            entry_edges = [
+                parsed
+                for item in observations
+                if item.get("outcome") == "HEDGE_FULL"
+                and (parsed := _decimal(item.get("entry_edge_usd"))) is not None
+            ]
             markouts = [
                 parsed
                 for item in observations
-                if (parsed := _decimal(item.get("conditional_markout_usd"))) is not None
+                if item.get("outcome") == "HEDGE_FULL"
+                and (parsed := _decimal(item.get("conditional_markout_usd"))) is not None
             ]
             full = outcomes.count("HEDGE_FULL")
             partial = outcomes.count("HEDGE_PARTIAL")
@@ -197,11 +217,11 @@ def build_report(path: str | Path) -> dict[str, Any]:
                     "HEDGE_OUTCOME_UNKNOWN",
                 )
             )
-            positive = sum(1 for edge in markouts if edge > 0)
+            positive = sum(1 for edge in entry_edges if edge > 0)
             expected = fills_by_policy.get(policy_id, 0)
             completeness = (
                 "COMPLETE"
-                if expected == len(observations) and expected > 0 and not policy_gaps
+                if expected == len(observations) and expected > 0 and not completeness_gaps
                 else "DEGRADED"
             )
             output_groups.append(
@@ -233,10 +253,14 @@ def build_report(path: str | Path) -> dict[str, Any]:
                         else None
                     ),
                     "mean_entry_edge_usd": _json_number(
-                        sum(edges, Decimal("0")) / Decimal(len(edges)) if edges else None
+                        sum(entry_edges, Decimal("0")) / Decimal(len(entry_edges))
+                        if entry_edges
+                        else None
                     ),
-                    "median_entry_edge_usd": _json_number(_median(edges)),
-                    "p05_entry_edge_usd": _json_number(_percentile(edges, Decimal("0.05"))),
+                    "median_entry_edge_usd": _json_number(_median(entry_edges)),
+                    "p05_entry_edge_usd": _json_number(
+                        _percentile(entry_edges, Decimal("0.05"))
+                    ),
                     "mean_conditional_markout_usd": _json_number(
                         sum(markouts, Decimal("0")) / Decimal(len(markouts)) if markouts else None
                     ),
@@ -245,7 +269,7 @@ def build_report(path: str | Path) -> dict[str, Any]:
                         _percentile(markouts, Decimal("0.05"))
                     ),
                     "positive_edge_share": _json_number(
-                        Decimal(positive) / Decimal(len(markouts)) if markouts else None
+                        Decimal(positive) / Decimal(len(entry_edges)) if entry_edges else None
                     ),
                     "maximum_adverse_markout_usd": _json_number(min(markouts) if markouts else None),
                     "hypothetical_risex_filled_notional_usd": _json_number(

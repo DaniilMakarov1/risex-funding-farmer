@@ -734,3 +734,228 @@ def test_public_text_payload_parser_preserves_decimal_wire_values() -> None:
     assert parsed is not None
     assert parsed["price"] == D("1.25")
     assert PublicFeedRunner._payload(SimpleNamespace(data="not-json")) is None
+
+
+@pytest.mark.asyncio
+async def test_transport_planned_stop_uses_only_explicit_planned_stop_gap() -> None:
+    from types import SimpleNamespace
+
+    class FakeWebsocket:
+        def __init__(self) -> None:
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def __aenter__(self):
+            self.entered.set()
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def send_json(self, _payload):
+            return None
+
+        async def receive(self):
+            await self.release.wait()
+            return SimpleNamespace(type="CLOSE")
+
+    class FakeSession:
+        def __init__(self, websocket) -> None:
+            self.websocket = websocket
+
+        def ws_connect(self, *_args, **_kwargs):
+            return self.websocket
+
+    class FakeRisex:
+        ws_base = "wss://risex.test"
+
+        def market_id(self, _symbol):
+            return 1
+
+        @staticmethod
+        def orderbook_subscription(_ids):
+            return {"subscribe": "books"}
+
+        @staticmethod
+        def trades_subscription(_ids):
+            return {"subscribe": "trades"}
+
+    class FakeLighter:
+        def market_id(self, _symbol):
+            return 2
+
+    websocket = FakeWebsocket()
+    runner = PublicFeedRunner(
+        FakeSession(websocket),
+        (PAIR,),
+        IngressQueue(16),
+        risex_adapter=FakeRisex(),
+        lighter_adapter=FakeLighter(),
+    )
+    stop = asyncio.Event()
+    task = asyncio.create_task(runner._transport_loop(Venue.RISEX, stop))
+    await websocket.entered.wait()
+    stop.set()
+    websocket.release.set()
+    await asyncio.wait_for(task, timeout=1)
+
+    assert runner.state(Venue.RISEX, "BTC").connected
+    assert not runner.ingress.has_pending
+    runner.disconnect(Venue.RISEX, reason="PUBLIC_SMOKE_STOPPED")
+    item = await runner.ingress.next_item()
+    assert isinstance(item, FeedGapEvent)
+    assert item.gap.reason == "PUBLIC_SMOKE_STOPPED"
+
+
+@pytest.mark.asyncio
+async def test_transport_early_close_remains_socket_disconnect_gap() -> None:
+    from types import SimpleNamespace
+
+    class FakeWebsocket:
+        def __init__(self) -> None:
+            self.entered = asyncio.Event()
+
+        async def __aenter__(self):
+            self.entered.set()
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def send_json(self, _payload):
+            return None
+
+        async def receive(self):
+            return SimpleNamespace(type="CLOSE")
+
+    class FakeSession:
+        def __init__(self, websocket) -> None:
+            self.websocket = websocket
+            self.calls = 0
+
+        def ws_connect(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls > 1:
+                raise RuntimeError("reconnect is outside this adverse fixture")
+            return self.websocket
+
+    class FakeRisex:
+        ws_base = "wss://risex.test"
+
+        def market_id(self, _symbol):
+            return 1
+
+        @staticmethod
+        def orderbook_subscription(_ids):
+            return {"subscribe": "books"}
+
+        @staticmethod
+        def trades_subscription(_ids):
+            return {"subscribe": "trades"}
+
+    class FakeLighter:
+        def market_id(self, _symbol):
+            return 2
+
+    websocket = FakeWebsocket()
+    runner = PublicFeedRunner(
+        FakeSession(websocket),
+        (PAIR,),
+        IngressQueue(16),
+        risex_adapter=FakeRisex(),
+        lighter_adapter=FakeLighter(),
+    )
+    stop = asyncio.Event()
+    task = asyncio.create_task(runner._transport_loop(Venue.RISEX, stop))
+    await websocket.entered.wait()
+    item = await asyncio.wait_for(runner.ingress.next_item(), timeout=1)
+    assert isinstance(item, FeedGapEvent)
+    assert item.gap.reason == "PUBLIC_SOCKET_DISCONNECTED"
+    stop.set()
+    await asyncio.wait_for(task, timeout=1)
+
+
+def test_report_uses_horizon_entry_edges_and_excludes_only_clean_terminal_stop_gap(
+    tmp_path: Path,
+) -> None:
+    def write_records(root: Path, *, clean_stop: bool) -> Path:
+        store = AppendOnlyEvidenceStore.create(
+            root,
+            metadata={"source_commit": "fixture", "evidence_mode": "OBSERVATIONAL"},
+        )
+        records = [
+            {
+                "kind": "QUOTE",
+                "canonical_market": "BTC",
+                "direction": "RISEX_BUY_LIGHTER_SELL",
+                "target_notional_usd": "100",
+                "target_margin_bps": "1",
+                "policy_id": "policy-1",
+                "quote_version_id": "version-1",
+                "outcome": "QUOTE_ACTIVE",
+                "actual_edge_usd": "999",
+                "quote_created_monotonic_ns": 1_000_000_000,
+                "quote_expires_monotonic_ns": 2_000_000_000,
+                "quote_lifetime_ns": 1_000_000_000,
+                "risex_tick_size": "1",
+                "post_only_bound_price": "100",
+                "maker_price": "99",
+                "canonical_quantity": "1",
+            },
+            {"kind": "WOULD_FILL", "quote_version_id": "version-1"},
+            {
+                "kind": "HEDGE_HORIZON",
+                "canonical_market": "BTC",
+                "direction": "RISEX_BUY_LIGHTER_SELL",
+                "target_notional_usd": "100",
+                "target_margin_bps": "1",
+                "policy_id": "policy-1",
+                "quote_version_id": "version-1",
+                "horizon_ms": 300,
+                "outcome": "HEDGE_FULL",
+                "entry_edge_usd": "2.00",
+                "conditional_markout_usd": "-1.00",
+            },
+            {
+                "kind": "DATA_GAP",
+                "canonical_market": "BTC",
+                "reason": "PUBLIC_SMOKE_STOPPED",
+            },
+            {
+                "kind": "HEDGE_HORIZON",
+                "canonical_market": "BTC",
+                "direction": "RISEX_BUY_LIGHTER_SELL",
+                "target_notional_usd": "100",
+                "target_margin_bps": "1",
+                "policy_id": "policy-1",
+                "quote_version_id": "version-1",
+                "horizon_ms": 500,
+                "outcome": "HEDGE_PARTIAL",
+                "entry_edge_usd": "123.00",
+                "conditional_markout_usd": "0",
+            },
+        ]
+        if clean_stop:
+            records.append({"kind": "RUN_STOP", "fatal_reason": None})
+        store.append_batch(records)
+        path = store.path
+        store.close()
+        return path
+
+    clean = build_report(write_records(tmp_path / "clean", clean_stop=True))
+    clean_group = next(group for group in clean["groups"] if group["horizon_ms"] == 300)
+    assert clean_group["data_completeness"] == "COMPLETE"
+    assert clean_group["data_gap_count"] == 1
+    assert clean_group["mean_entry_edge_usd"] == "2.00"
+    assert clean_group["median_entry_edge_usd"] == "2.00"
+    assert clean_group["p05_entry_edge_usd"] == "2.00"
+    assert clean_group["positive_edge_share"] == "1"
+    assert clean_group["mean_conditional_markout_usd"] == "-1.00"
+    partial_group = next(group for group in clean["groups"] if group["horizon_ms"] == 500)
+    assert partial_group["mean_entry_edge_usd"] is None
+    assert partial_group["positive_edge_share"] is None
+    assert partial_group["mean_conditional_markout_usd"] is None
+
+    forced = build_report(write_records(tmp_path / "forced", clean_stop=False))
+    forced_group = next(group for group in forced["groups"] if group["horizon_ms"] == 300)
+    assert forced_group["data_completeness"] == "DEGRADED"
