@@ -678,6 +678,55 @@ def test_public_feed_recovery_gates_deltas_until_fresh_snapshot() -> None:
     asyncio.run(exercise())
 
 
+@pytest.mark.asyncio
+async def test_risex_trade_channel_with_block_number_is_not_book_recovery() -> None:
+    from risex_farmer.exchanges.risex import RisexAdapter
+
+    risex = RisexAdapter(None)
+    risex._market_ids = {"BTC/USDC": "1"}
+    risex._symbols_by_id = {"1": "BTC/USDC"}
+    risex._raw_markets = {
+        "BTC/USDC": {"config": {"step_size": "1", "step_price": "1"}}
+    }
+
+    class FakeLighter:
+        def market_id(self, _symbol):
+            return 2
+
+    runner = PublicFeedRunner(
+        None,
+        (PAIR,),
+        IngressQueue(16),
+        risex_adapter=risex,
+        lighter_adapter=FakeLighter(),
+    )
+
+    async def exercise():
+        runner.begin_connection(Venue.RISEX, "r")
+        await runner.ingest_risex_payload(
+            {
+                "channel": "trades",
+                "type": "update",
+                "market_id": "1",
+                "block_number": 123,
+                "worker_timestamp": "1800000000000000000",
+                "data": {
+                    "id": "trade-realistic",
+                    "maker_side": 0,
+                    "price": "98",
+                    "size": "1",
+                },
+            }
+        )
+        item = await runner.ingress.next_item()
+        assert isinstance(item, FeedTradeEvent)
+        assert item.trade.trade_event_key == "RISEX|BTC/USDC|trade-realistic"
+        assert runner.state(Venue.RISEX, "BTC").recovery_generation == 0
+        assert not runner.ingress.has_pending
+
+    await exercise()
+
+
 def test_public_text_payload_parser_preserves_decimal_wire_values() -> None:
     from types import SimpleNamespace
 

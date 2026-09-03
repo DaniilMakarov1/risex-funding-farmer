@@ -464,7 +464,10 @@ class PublicFeedRunner:
         message_type = str(payload.get("type", "")).lower()
         if message_type in {"subscribed", "unsubscribed", "ack", "connected"}:
             return
-        if channel == "orderbook" or "block_number" in payload:
+        trade_channel = channel in {"trades", "trade"}
+        if not trade_channel and (
+            channel == "orderbook" or "block_number" in payload
+        ):
             try:
                 normalized = self.risex.normalize_book_message(
                     payload, received_at=received_at
