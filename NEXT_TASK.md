@@ -2,7 +2,7 @@
 
 ## SS-001E — Evidence Throughput Recovery
 
-Status: `AUTHORIZED / BUILDER NOT YET OPENED`.
+Status: `AUTHORIZED / FRESH POST-REJECTION BUILDER REQUIRED`.
 
 Objective: correct the proven DG-003 public evidence backpressure and terminal-drain failure with the smallest lossless change, without changing quote economics, fillability semantics, the evidence caps, or any strategy behavior.
 
