@@ -1,19 +1,15 @@
-# Active bounded task
+# Current task state
 
-## DG-002B — Corrected Entry Viability Discovery
+## Entry Viability Stage — Closed
 
-Status: `FROZEN / READY TO RUN`.
+Status: `COMPLETE / NO AUTHORIZED NEXT SLICE`.
 
-Objective: obtain one valid evidence-backed product verdict for RISEx-maker → Lighter-taker entry viability on the accepted measurement path.
+Terminal verdict: `FILLABILITY_INSUFFICIENT_EVIDENCE`.
 
-Exact source: accepted and published `b4f2822327fc0f7b50a02d7aabfc2d6e61b453a4`. No Builder or code change is authorized. Verification is the prospective public-only gate frozen in System Specification 2.5.
+The accepted measurement defects were corrected at `b4f2822327fc0f7b50a02d7aabfc2d6e61b453a4`; `DG-002A` passed; and fresh public-only `DG-002B` run `mjWY59nkjlLzRzghrGOVkyuX` completed with intact deterministic evidence.
 
-Run exactly once for `60 seconds` in a fresh owner-only store with a `250,000`-record cap and exact `BTC/ETH/SOL`. Use both directions, `$100/$250/$500`, `1/2/3/5 bps`, `0/300/500/1000 ms`, `25 s` freshness, the frozen fees, and at most the first `50` strict episodes by record index.
+All `288` report groups were complete and quoteable snapshot opportunity was materially present, but there were `0` strict would-fills and the optimistic model was not implemented. The evidence therefore supports neither a repeatable entry-edge candidate nor the stronger unfillability verdict.
 
-Require the accepted source/surface, admission, terminal, fatal/integrity, permissions, deterministic-report, completeness, fillability, depth, edge, and exact seven-verdict precedence rules. Produce one verdict with exact evidence identity and the complete report.
+`SS-002` and `SS-003` remain closed. No Builder, implementation change, public run, private/auth/write action, or automatic retry is authorized.
 
-Forbidden: any code, strategy, fee, quote-economics, quantity, fill-model, storage, private/auth/credential/signing/write/testnet/mainnet, venue, `SS-002`, or `SS-003` change.
-
-Acceptance: the result is not caused by an implementation or integrity failure. A proven objective public-data limitation may still support `DATA_INSUFFICIENT`; another measurement-path failure is not mission success.
-
-After the verdict, record it and stop the current Entry Viability Stage. Only `ENTRY_EDGE_CANDIDATE` permits a later proposal for `SS-002`; every other verdict leaves `SS-002` and `SS-003` closed.
+Any future slice requires a new explicit user objective and prospective scope; it must not reinterpret either immutable `DG-001` or terminal `DG-002B` evidence.
