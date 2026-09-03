@@ -677,6 +677,326 @@ def test_store_is_fresh_owner_only_append_only_and_rejects_secret_fields(tmp_pat
     assert store_permissions(store.path) == 0o600
 
 
+@pytest.mark.asyncio
+async def test_observer_store_batch_flushes_by_count_interval_and_final_tail(tmp_path: Path) -> None:
+    store = AppendOnlyEvidenceStore.create(
+        tmp_path,
+        metadata={"source_commit": "fixture", "evidence_mode": "FIXTURE"},
+    )
+    original_append_batch = store.append_batch
+    batches: list[tuple[dict[str, object], ...]] = []
+
+    def observed_append(records):
+        batches.append(tuple(dict(record) for record in records))
+        return original_append_batch(records)
+
+    store.append_batch = observed_append
+    observer = SpreadObserver(
+        config(store_batch_size=3, store_batch_interval_seconds=0.03),
+        (PAIR,),
+        store,
+    )
+
+    await observer._append(
+        ({"kind": "EVIDENCE", "record_id": "one", "observed_monotonic_ns": 1},)
+    )
+    assert observer.pending_record_count == 1
+    assert len(batches) == 0
+
+    await observer._append(
+        (
+            {"kind": "EVIDENCE", "record_id": "two", "observed_monotonic_ns": 2},
+            {"kind": "EVIDENCE", "record_id": "three", "observed_monotonic_ns": 3},
+        )
+    )
+    assert observer.pending_record_count == 0
+    assert [len(batch) for batch in batches] == [3]
+
+    await observer._append(
+        ({"kind": "EVIDENCE", "record_id": "interval", "observed_monotonic_ns": 4},)
+    )
+    await asyncio.sleep(0.08)
+    assert observer.pending_record_count == 0
+    assert [len(batch) for batch in batches] == [3, 1]
+
+    await observer._append(
+        ({"kind": "EVIDENCE", "record_id": "tail", "observed_monotonic_ns": 5},)
+    )
+    assert observer.pending_record_count == 1
+    await observer.close()
+    assert observer.pending_record_count == 0
+    assert [len(batch) for batch in batches] == [3, 1, 1]
+    assert store.record_count == 6
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_observer_writer_serializes_concurrent_append_order_and_unique_indices(
+    tmp_path: Path,
+) -> None:
+    store = AppendOnlyEvidenceStore.create(
+        tmp_path,
+        metadata={"source_commit": "fixture", "evidence_mode": "FIXTURE"},
+    )
+    observer = SpreadObserver(
+        config(store_batch_size=2, store_batch_interval_seconds=1),
+        (PAIR,),
+        store,
+    )
+    gate = asyncio.Event()
+
+    async def append_after_gate(record_id: str, observed: int) -> None:
+        await gate.wait()
+        await observer._append(
+            ({"kind": "EVIDENCE", "record_id": record_id, "observed_monotonic_ns": observed},)
+        )
+
+    writers = tuple(
+        asyncio.create_task(append_after_gate(str(index), index))
+        for index in range(8)
+    )
+    gate.set()
+    await asyncio.gather(*writers)
+    await observer.close()
+    records = [json.loads(line) for line in store.path.read_text().splitlines()]
+    evidence = [record for record in records if record.get("kind") == "EVIDENCE"]
+    assert [record["record_index"] for record in records] == list(range(len(records)))
+    assert [record["record_id"] for record in evidence] == [str(index) for index in range(8)]
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_observer_writer_latches_failure_without_retrying_ambiguous_batch(
+    tmp_path: Path,
+) -> None:
+    store = AppendOnlyEvidenceStore.create(
+        tmp_path,
+        metadata={"source_commit": "fixture", "evidence_mode": "FIXTURE"},
+    )
+    calls = 0
+
+    def failing_append(_records):
+        nonlocal calls
+        calls += 1
+        raise OSError("fixture sync failure")
+
+    store.append_batch = failing_append
+    observer = SpreadObserver(
+        config(store_batch_size=8, store_batch_interval_seconds=0.01),
+        (PAIR,),
+        store,
+    )
+    await observer._append(
+        ({"kind": "EVIDENCE", "record_id": "one", "observed_monotonic_ns": 1},)
+    )
+    await asyncio.sleep(0.04)
+    assert observer.fatal_reason == "EVIDENCE_STORE_WRITE_FAILED"
+    assert observer.sample_stop_event.is_set()
+    assert calls == 1
+    with pytest.raises(OSError, match="fixture sync failure"):
+        await observer.close()
+    assert calls == 1
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_observed_three_market_load_has_bounded_lossless_batched_drain() -> None:
+    observed_book_events = 39_877
+    observed_quote_rows = 643_392
+    observed_gate_seconds = 1_200
+    quote_rows_per_event = 17
+    rows_per_event = 1 + quote_rows_per_event
+    expected_rows = observed_book_events * rows_per_event
+    assert expected_rows >= observed_book_events + observed_quote_rows
+
+    class CountingStore:
+        run_id = "fixture-throughput"
+
+        def __init__(self) -> None:
+            self.append_calls = 0
+            self.record_count = 0
+            self.batch_sizes: list[int] = []
+            self.expected_event = 0
+            self.expected_slot = 0
+            self.market_mask = 0
+
+        def append_batch(self, records) -> None:
+            # A bounded deterministic delay represents the synchronous
+            # serialization/fsync cost without creating a multi-gigabyte file.
+            time.sleep(0.0002)
+            batch = tuple(records)
+            self.append_calls += 1
+            self.batch_sizes.append(len(batch))
+            for record in batch:
+                market_name = record["canonical_market"]
+                expected_market = ("BTC", "ETH", "SOL")[self.expected_event % 3]
+                if market_name != expected_market:
+                    raise AssertionError("three-market append order changed")
+                if record["event_index"] != self.expected_event:
+                    raise AssertionError("event append order changed")
+                if self.expected_slot == 0:
+                    if record["kind"] != "BOOK":
+                        raise AssertionError("book row missing at event boundary")
+                elif record["kind"] != "QUOTE":
+                    raise AssertionError("quote row missing inside event batch")
+                self.expected_slot += 1
+                if self.expected_slot == rows_per_event:
+                    self.expected_slot = 0
+                    self.expected_event += 1
+                self.record_count += 1
+                self.market_mask |= 1 << (self.expected_event % 3)
+
+    store = CountingStore()
+    pair_two = MarketPair(
+        "ETH",
+        market(Venue.RISEX, "ETH/USDC", "ETH"),
+        market(Venue.LIGHTER, "ETH", "ETH"),
+    )
+    pair_three = MarketPair(
+        "SOL",
+        market(Venue.RISEX, "SOL/USDC", "SOL"),
+        market(Venue.LIGHTER, "SOL", "SOL"),
+    )
+    observer = SpreadObserver(
+        config(
+            ingress_queue_capacity=4096,
+            store_batch_size=128,
+            store_batch_interval_seconds=0.25,
+        ),
+        (PAIR, pair_two, pair_three),
+        store,
+    )
+    fixture_items = tuple(
+        FeedBookEvent(
+            BookEvidence(
+                venue=Venue.LIGHTER,
+                canonical_market=pair.canonical_market,
+                bids=(BookLevel(D("99"), D("10")),),
+                asks=(BookLevel(D("101"), D("10")),),
+                received_monotonic_ns=1,
+                stream_session_id=f"lighter-{pair.canonical_market}",
+                recovery_generation=0,
+                book_revision=1,
+                sequence=1,
+                checksum=1,
+                sequence_valid=True,
+                checksum_valid=True,
+                received_utc=NOW,
+                fresh=True,
+            ),
+            pair,
+            "SNAPSHOT",
+            "fixture",
+        )
+        for pair in (PAIR, pair_two, pair_three)
+    )
+    processed = 0
+    offer_failures = 0
+    maximum_queue = 0
+    maximum_pending = 0
+    burst_size = 64
+    burst_interval_seconds = 0.01
+    planned_offered_rate = burst_size / burst_interval_seconds
+    observed_offered_rate = observed_book_events / observed_gate_seconds
+    assert planned_offered_rate > observed_offered_rate
+
+    async def synthetic_handle(_item) -> None:
+        nonlocal processed, maximum_pending
+        event_index = processed
+        processed += 1
+        market_name = ("BTC", "ETH", "SOL")[event_index % 3]
+        rows = [
+            {
+                "kind": "BOOK",
+                "canonical_market": market_name,
+                "event_index": event_index,
+                "row_index": 0,
+                "observed_monotonic_ns": event_index,
+            }
+        ]
+        rows.extend(
+            {
+                "kind": "QUOTE",
+                "canonical_market": market_name,
+                "event_index": event_index,
+                "row_index": row_index,
+                "observed_monotonic_ns": event_index,
+            }
+            for row_index in range(1, rows_per_event)
+        )
+        await observer._append(rows)
+        maximum_pending = max(
+            maximum_pending, getattr(observer, "pending_record_count", 0)
+        )
+
+    observer.handle_item = synthetic_handle
+    consumer = asyncio.create_task(observer.consume())
+    offer_started = time.monotonic()
+    for burst_start in range(0, observed_book_events, burst_size):
+        burst_end = min(observed_book_events, burst_start + burst_size)
+        for event_index in range(burst_start, burst_end):
+            if not observer.ingress.offer(fixture_items[event_index % 3]):
+                offer_failures += 1
+            maximum_queue = max(maximum_queue, observer.ingress.qsize)
+        if burst_end < observed_book_events:
+            await asyncio.sleep(burst_interval_seconds)
+    offer_elapsed = time.monotonic() - offer_started
+    achieved_offered_rate = observed_book_events / offer_elapsed
+    assert achieved_offered_rate >= planned_offered_rate * 0.5
+    assert achieved_offered_rate >= observed_offered_rate
+    assert offer_elapsed <= observed_book_events / observed_offered_rate
+    observer.ingress.close()
+    await asyncio.wait_for(consumer, timeout=30)
+    close_started = time.monotonic()
+    await asyncio.wait_for(observer.close(), timeout=5)
+    close_elapsed = time.monotonic() - close_started
+
+    assert processed == observed_book_events
+    assert offer_failures == 0
+    assert maximum_queue < observer.ingress.capacity
+    assert maximum_queue > 0
+    assert maximum_pending <= observer.config.store_batch_size
+    assert maximum_pending > 0
+    assert store.record_count == expected_rows
+    assert store.expected_event == observed_book_events
+    assert store.expected_slot == 0
+    assert store.market_mask == 0b111
+    assert len(store.batch_sizes) == store.append_calls
+    assert max(store.batch_sizes) <= observer.config.store_batch_size
+    # The pre-correction writer performs one store call per event; the
+    # configured 128-record batching contract must remain materially below it.
+    assert store.append_calls < observed_book_events // 4
+    assert close_elapsed < 5
+
+
+@pytest.mark.asyncio
+async def test_batched_cap_failure_leaves_reserved_terminal_marker_slot(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(store_module, "MAX_EVIDENCE_RECORDS", 2)
+    monkeypatch.setattr(store_module, "TERMINAL_FAILURE_BYTES_RESERVE", 0)
+    store = AppendOnlyEvidenceStore.create(
+        tmp_path,
+        metadata={"source_commit": "fixture", "evidence_mode": "FIXTURE"},
+    )
+    observer = SpreadObserver(
+        config(store_batch_size=8, store_batch_interval_seconds=1),
+        (PAIR,),
+        store,
+    )
+    await observer._append(
+        ({"kind": "EVIDENCE", "record_id": "over-cap", "observed_monotonic_ns": 1},)
+    )
+    with pytest.raises(EvidenceStorageLimitExceeded, match="RECORD_COUNT"):
+        await observer.close()
+    assert observer.fatal_reason == "EVIDENCE_STORAGE_LIMIT"
+    store.append_batch(({"kind": "RUN_FAILED", "fatal_reason": observer.fatal_reason},))
+    store.close()
+    records = [json.loads(line) for line in (store.path).read_text().splitlines()]
+    assert [record["kind"] for record in records] == ["RUN_METADATA", "RUN_FAILED"]
+
+
 def test_queue_overflow_latches_explicit_identity_gap_without_blocking() -> None:
     queue = IngressQueue(1)
     first = FeedBookEvent(evidence_book(Venue.LIGHTER, received=10, session="l"), PAIR, "SNAPSHOT", "fixture")

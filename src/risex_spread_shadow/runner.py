@@ -1,4 +1,4 @@
-"""The single SS-001D observer, evidence path, and public-smoke orchestration."""
+"""The single SS-001E observer, evidence path, and public-smoke orchestration."""
 
 from __future__ import annotations
 
@@ -362,6 +362,18 @@ class SpreadObserver:
         self._last_episode_versions: dict[tuple[FillabilityModel, str], str] = {}
         self._tasks: set[asyncio.Task[None]] = set()
         self._append_lock = asyncio.Lock()
+        # Evidence writes are deliberately buffered only at this observer
+        # boundary.  The ingress queue remains bounded and the store remains
+        # append-only JSONL; a batch is always written and fsynced as one
+        # operation.  Keeping the pending records here removes one fsync per
+        # event from the hot feed path without introducing another queue or
+        # persistence service.
+        self._pending_records: list[Mapping[str, Any]] = []
+        self._pending_started_at: float | None = None
+        self._batch_loop_task: asyncio.Task[None] | None = None
+        self._batch_stop_event = asyncio.Event()
+        self._batch_wakeup = asyncio.Event()
+        self._append_failure: BaseException | None = None
         self._version_serial = 0
         sample_started = (
             0
@@ -432,6 +444,12 @@ class SpreadObserver:
         if self._sample_frozen and not self._pending and not self._optimistic_pending:
             self._horizon_drain_event.set()
 
+    @property
+    def pending_record_count(self) -> int:
+        """Return the number of evidence records awaiting a durable sync."""
+
+        return len(self._pending_records)
+
     @staticmethod
     def policy_id(policy: QuotePolicy) -> str:
         return "|".join(
@@ -443,29 +461,152 @@ class SpreadObserver:
             )
         )
 
+    def _register_append_failure(self, exc: BaseException) -> None:
+        """Latch one writer failure and turn it into an integrity stop."""
+
+        if self._append_failure is not None:
+            return
+        self._append_failure = exc
+        self.fatal_reason = (
+            "EVIDENCE_STORAGE_LIMIT"
+            if isinstance(exc, EvidenceStorageLimitExceeded)
+            else "EVIDENCE_STORE_WRITE_FAILED"
+        )
+        self._pending_records.clear()
+        self._pending_started_at = None
+        self._observe_sample_stop(
+            observed_monotonic_ns=max(
+                self._sample_stop.started_monotonic_ns,
+                self._monotonic_ns(),
+            ),
+            integrity_reason=self.fatal_reason,
+        )
+
+    async def _flush_pending_batch_locked(self) -> None:
+        """Durably append the current batch while ``_append_lock`` is held."""
+
+        if self._append_failure is not None:
+            raise self._append_failure
+        if not self._pending_records:
+            return
+        # Detach before the blocking file operation.  A failed write is a
+        # terminal condition and must never be blindly replayed: a store may
+        # have partially written before reporting an OS error.
+        records = tuple(self._pending_records)
+        self._pending_records.clear()
+        self._pending_started_at = None
+        try:
+            # Keep JSON serialization, flush, and fsync off the event loop.
+            # append_batch performs one sync for the whole batch.
+            await asyncio.to_thread(self.store.append_batch, records)
+        except Exception as exc:
+            self._register_append_failure(exc)
+            raise
+
+    async def _flush_pending_batch(self) -> None:
+        """Durably append the current batch, preserving one append order."""
+
+        async with self._append_lock:
+            await self._flush_pending_batch_locked()
+
+    async def _batch_loop(self) -> None:
+        """Flush below-threshold evidence at the configured interval."""
+
+        interval = float(self.config.store_batch_interval_seconds)
+        loop = asyncio.get_running_loop()
+        try:
+            while not self._batch_stop_event.is_set():
+                async with self._append_lock:
+                    pending_started_at = self._pending_started_at
+                if pending_started_at is None:
+                    self._batch_wakeup.clear()
+                    if self._batch_stop_event.is_set():
+                        break
+                    # Close the race between the empty check and wait: an
+                    # append either is visible here or sets the wake event
+                    # before waiting begins.
+                    async with self._append_lock:
+                        if self._pending_records:
+                            continue
+                    if self._batch_stop_event.is_set():
+                        break
+                    await self._batch_wakeup.wait()
+                    continue
+                remaining = max(0.0, interval - (loop.time() - pending_started_at))
+                self._batch_wakeup.clear()
+                try:
+                    await asyncio.wait_for(self._batch_wakeup.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    pass
+                if self._batch_stop_event.is_set():
+                    break
+                if self._batch_wakeup.is_set():
+                    continue
+                try:
+                    await self._flush_pending_batch()
+                except asyncio.CancelledError:
+                    raise
+                except BaseException:
+                    # The first failure is retained for the consumer/close
+                    # path.  Do not keep retrying an ambiguous append.
+                    return
+        except asyncio.CancelledError:
+            raise
+
+    def _ensure_batch_loop(self) -> None:
+        if self._batch_stop_event.is_set():
+            return
+        task = self._batch_loop_task
+        if task is None or task.done():
+            task = asyncio.create_task(self._batch_loop())
+            self._batch_loop_task = task
+            task.add_done_callback(self._batch_task_done)
+
+    def _batch_task_done(self, task: asyncio.Task[None]) -> None:
+        if task is self._batch_loop_task:
+            self._batch_loop_task = None
+        if task.cancelled():
+            return
+        try:
+            failure = task.exception()
+        except (asyncio.CancelledError, RuntimeError):
+            return
+        if failure is not None:
+            self._register_append_failure(failure)
+
     async def _append(self, records: Sequence[Mapping[str, Any]]) -> None:
         if not records:
             return
-        try:
-            # Keep synchronous file synchronization off the websocket/event
-            # loop.  The lock preserves append order when horizon tasks wake
-            # together at an absolute deadline.
-            async with self._append_lock:
-                await asyncio.to_thread(self.store.append_batch, records)
-        except Exception as exc:
-            self.fatal_reason = (
-                "EVIDENCE_STORAGE_LIMIT"
-                if isinstance(exc, EvidenceStorageLimitExceeded)
-                else "EVIDENCE_STORE_WRITE_FAILED"
-            )
-            self._observe_sample_stop(
-                observed_monotonic_ns=max(
-                    self._sample_stop.started_monotonic_ns,
-                    self._monotonic_ns(),
-                ),
-                integrity_reason=self.fatal_reason,
-            )
-            raise
+        async with self._append_lock:
+            if self._append_failure is not None:
+                raise self._append_failure
+
+            # Keep each domain event contiguous.  If adding it would cross
+            # the configured count, flush the prior records first, then
+            # enqueue the event as a fresh batch.  A single event may itself
+            # contain several quote rows; it is never split or dropped.
+            incoming = tuple(dict(record) for record in records)
+            if self._pending_records and (
+                len(self._pending_records) + len(incoming)
+                > self.config.store_batch_size
+            ):
+                await self._flush_pending_batch_locked()
+            if self._pending_started_at is None:
+                self._pending_started_at = asyncio.get_running_loop().time()
+            self._pending_records.extend(incoming)
+            self._ensure_batch_loop()
+            self._batch_wakeup.set()
+            if len(self._pending_records) >= self.config.store_batch_size:
+                await self._flush_pending_batch_locked()
+
+            # Integrity markers and explicit gaps are safety evidence.  Persist
+            # them immediately so a later cap/failure cannot hide the reserved
+            # terminal evidence; normal books/quotes/trades stay batched.
+            if any(
+                record.get("kind") in {"DATA_GAP", "SAMPLE_STOP"}
+                for record in incoming
+            ):
+                await self._flush_pending_batch_locked()
 
     def _book_record(self, event: FeedBookEvent) -> dict[str, Any]:
         book = event.book
@@ -1257,20 +1398,48 @@ class SpreadObserver:
                         force=force,
                         model=model,
                     )
+        # Horizon captures append through the same bounded writer as feed
+        # events.  Force/replay flushes are durable before returning, while a
+        # normal drain still uses the configured count/interval path and then
+        # performs one final sync for any short tail.
+        await self._flush_pending_batch()
         self._refresh_horizon_drain_event()
 
     async def close(self) -> None:
         self._closing = True
-        await self.flush_pending(force=False)
-        if self._tasks:
-            tasks = tuple(self._tasks)
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            self._tasks.clear()
-        self.ingress.close()
-        self._active_versions.clear()
-        self._refresh_horizon_drain_event()
+        failure: BaseException | None = None
+        try:
+            await self.flush_pending(force=False)
+            if self._tasks:
+                tasks = tuple(self._tasks)
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                self._tasks.clear()
+        except BaseException as exc:
+            failure = exc
+        finally:
+            # Stop the interval flusher only after horizon tasks have drained
+            # so no producer can race the final durable append.  A sleeping
+            # loop exits promptly after the event is set; a write already in
+            # progress is awaited rather than cancelled (cancelling a
+            # thread-backed fsync could overlap a subsequent append).
+            self._batch_stop_event.set()
+            self._batch_wakeup.set()
+            batch_task = self._batch_loop_task
+            if batch_task is not None:
+                await asyncio.gather(batch_task, return_exceptions=True)
+                self._batch_loop_task = None
+            if failure is None:
+                try:
+                    await self._flush_pending_batch()
+                except BaseException as exc:
+                    failure = exc
+            self.ingress.close()
+            self._active_versions.clear()
+            self._refresh_horizon_drain_event()
+        if failure is not None:
+            raise failure
 
     def _prune_state(self, now_ns: int) -> None:
         floor = max(0, now_ns - self.config.trade_retention_ns)
