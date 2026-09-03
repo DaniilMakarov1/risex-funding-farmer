@@ -1,6 +1,6 @@
 # RISEx Spread Shadow — System Specification
 
-SYSTEM_SPEC_VERSION = 2.5
+SYSTEM_SPEC_VERSION = 2.6
 SPEC_STATUS = ACTIVE_SPREAD_SHADOW__FROZEN_LEGACY_FUNDING_FARMER
 
 ## 0. Active product domain: RISEx Spread Shadow
@@ -133,6 +133,18 @@ This gate was frozen on `2026-09-03` only after `DG-002A` passed and before open
 - The full source/surface, admission, terminal, fatal/integrity, planned-stop, permissions, deterministic-report, completeness, fillability, depth, edge-materiality, concentration, and seven-verdict precedence rules in sections 0.5 and 0.6 apply. A clean run with zero strict fills is complete data, not corruption; it is interpreted only through the unchanged frozen fillability and verdict rules.
 - Emit exactly one of the seven section-0.5 verdicts with the complete diagnostic report and exact evidence identity. A measurement-path failure is not mission success; objective public-data limitations may support `DATA_INSUFFICIENT` only when the accepted path remains proven correct.
 - No automatic retry, threshold change, strategy expansion, `SS-002`, or `SS-003` follows from the observation. `SS-002` can only be proposed after a recorded `ENTRY_EDGE_CANDIDATE`; every other verdict ends the current Entry Viability Stage without implementation expansion.
+
+### 0.8 Fillability-bound research contract
+
+The post-DG-002B mission is to resolve whether profitable hedge-anchored RISEx maker quotes are genuinely unreachable or whether zero strict fills result from the conservative public-trade lower bound. `DG-002B` and its `FILLABILITY_INSUFFICIENT_EVIDENCE` verdict remain immutable historical evidence.
+
+- The accepted strict would-fill definition is unchanged and remains the conservative lower bound: correct immutable quote identity and local ordering, correct market/direction/aggressor, at least one full tick through the maker price, cumulative non-duplicated public quantity at or beyond that strict price reaching exact `q`, unexpired/unreplaced quote, and no overlapping invalid gap.
+- One optimistic upper bound may classify a quote only when the quote version existed before the evidence; market, direction, aggressor, session, recovery, and local ordering agree; the trade is exactly at or through the maker price; cumulative non-duplicated public quantity at-or-through reaches exact `q`; the quote remains active and unexpired; and no invalid gap overlaps. It assumes zero queue ahead, no hidden liquidity ahead, and allocation of all eligible public volume. It must be labelled `OPTIMISTIC_UPPER_BOUND`, never realistic or expected fillability.
+- The intended public research bracket is `StrictWouldFill <= RealMakerFillability <= OptimisticWouldFill`, with the explicit caveat that public data cannot guarantee every venue-microstructure detail. Strict and optimistic episode identity, quantity, time-to-fill, filled notional, and all `0/300/500/1000 ms` no-lookahead hedge captures remain separately attributable; the same trade quantity is never duplicated within one model/version.
+- An eligible RISEx trade is one accepted, deduplicated public trade for which at least one correct-side relevant quote version is active immediately before the trade by local receipt ordering. Stop counters count each eligible trade event once, not once per policy.
+- Per-policy reporting must include snapshot quoteable time, actual snapshot edge, quote distance from the RISEx post-only BBO bound in ticks/bps; eligible/touch/at-or-through/strict counts; cumulative qualifying volume, fill counts/notional/time-to-fill for both bounds; model-separated full/partial/missing hedge rates and edge/markout curves; and market/direction/size/margin concentration. Named missing/stale/session/gap/depth outcomes are not zero edge.
+- The existing append-only evidence representation remains unchanged unless implementation proves it cannot preserve the contract. Long-run reports must use bounded streaming or multi-pass processing rather than retaining the full evidence file in memory. No generic storage, compression, queue, execution, or lifecycle framework is authorized.
+- The mission ends only with strong optimistic-unreachability evidence, a materially separated strict/optimistic public bracket requiring a different calibration decision, or conservative fill episodes with a prospective delayed-edge verdict. `SS-002` and `SS-003` remain closed throughout.
 
 ## Legacy benchmark domain: RISEx Funding Farmer
 

@@ -43,3 +43,10 @@
 
 - The measurement defects are independently corrected and accepted, `DG-002A` passed, and the separately frozen `DG-002B` produced a valid non-integrity-failure product verdict.
 - The Entry Viability Stage is complete with `FILLABILITY_INSUFFICIENT_EVIDENCE`. No implementation or operational gate is active. `SS-002` and `SS-003` remain closed.
+
+## Current Chief mission
+
+- Resolve RISEx–Lighter fillability uncertainty: determine with prospectively valid public evidence whether profitable hedge-anchored RISEx maker quotes are genuinely unfillable or whether the current zero-fill result is caused by the conservative strict would-fill model; do not open `SS-002` until fillability is resolved and delayed hedge evidence exists.
+- Read-only reconstruction of all `29` immutable DG-002B trades found `348` correct-side active quote interactions. Five trade events reached at least one quote; four traded exactly at a quote; one ETH event traded one tick through three quote policies. That is `22` at-or-through interactions (`19` exact-at, `3` through/strict-price), but no strict or optimistic cumulative quantity reached exact `q`. Twenty-four trades reached no quote. Quote-to-post-only-bound distance across interactions had median `262 ticks / 3.920 bps` and p95 `538 ticks / 7.365 bps`; touches were concentrated in RISEx-sell/Lighter-buy ETH policies.
+- The short evidence distinguishes neither practical unreachability nor strict-model conservatism. An explicit at-or-through optimistic upper bound is required alongside the unchanged strict lower bound. `SS-001D — Fillability Bounds` is the only authorized implementation slice.
+- DG-002B volume was `223 MiB` BOOK plus `202 MiB` QUOTE at about `7.42 MB/s`. With `527 GiB` free, the projected bounded capture is supportable without changing storage representation; long-run reporting must be memory-bounded. `DG-003` remains unrun and unfrozen until SS-001D acceptance.
