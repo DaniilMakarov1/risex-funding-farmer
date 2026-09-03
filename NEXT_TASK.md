@@ -1,17 +1,17 @@
 # Active bounded task
 
-## SS-001H — Episode-Local Completeness and Material Stop
+## DG-007 — Fillability Bounds Resolution Discovery
 
-Status: `AUTHORIZED / BUILDER NOT YET OPENED`.
+Status: `FROZEN PROSPECTIVELY / NOT YET OPENED`.
 
-Objective: correct the proven DG-006 mismatch so a gap invalidates only its overlapping episode/horizon and a future sample stops on the already-frozen material per-policy strict threshold rather than an insufficient aggregate count.
+Objective: run exactly one public unauthenticated RISEx–Lighter fillability-bounds sample that can resolve the active mission through the frozen valid strict/optimistic bracket and delayed-edge rules.
 
-Exact base: accepted published `main` after this governance record. Create one fresh visible Spread Builder and worktree from that exact base.
+Exact source: `6e03195fe1c45e076cbe4cd20a2a02b178cc40e1`.
 
-Allowed: raw/valid/contaminated episode and horizon attribution with named reasons; valid-only fill/edge verdict distributions; graceful CLOSE versus unexpected transport-failure evidence; exact session/recovery/full-snapshot barriers; online future stop at `10` valid strict episodes for one exact policy spanning `5` detection timestamps after all four horizons complete; deterministic DG-006 and legacy replay tests.
+Frozen sample: `BTC/ETH/SOL`; both directions; `$100/$250/$500`; `1/2/3/5 bps`; `0/300/500/1000 ms`; configured fees; `25 s` freshness; unchanged strict lower bound and optimistic upper bound. Stop on the first exact policy with `10` valid all-horizon strict episodes across `5` detection timestamps, or `500` eligible trades, or `1,200 s`, or integrity/fatal failure.
 
-Acceptance: only overlapping episodes/horizons are invalid; contaminated evidence remains visible and cannot enter valid statistics; graceful CLOSE remains a bounded gap while transport exception fails closed; material stop is exact and first; focused/adverse, realistic-load, deterministic replay, and fresh isolated Python 3.11 full suites pass.
+Admission and evidence: exact source/universe match; owner-only append-only full-plus-delta store; at least `24 GiB` free; unchanged `2,500,000`-record and `12 GiB` caps; contiguous indices and valid chains/references; all required model-scoped horizons; raw/valid/contaminated named attribution; one physically-last terminal; deterministic repeated reports. Run exactly once and do not tune, extend, or stop from observed economics.
 
-Forbidden: changing economics, fees, quote-margin grid, maker pricing, strict or optimistic fill semantics, eligible-trade semantics, horizons, venue contracts, queue/cap/timeout values, storage representation, strategy, private/auth/credential/signing/order preparation/dispatch/testnet/mainnet/write activity, `SS-002`, or `SS-003`.
+Verdict: apply System Specification 0.9 and 0.17 precedence using valid episode/edge evidence only. Complete the active mission only with case A, B, or C as defined there; in case C finish the prospective entry-edge verdict and stop before `SS-002`.
 
-After candidate delivery, Chief independently reviews and alone accepts/integrates. Freeze no replacement discovery gate until acceptance.
+Forbidden: any implementation change, sample-dependent tuning, private/auth/credential/signing/order preparation/dispatch/testnet/mainnet/write activity, venue or strategy change, `SS-002`, or `SS-003`.
