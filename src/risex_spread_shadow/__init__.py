@@ -1,4 +1,4 @@
-"""SS-001A contracts plus the bounded SS-001G public measurement path."""
+"""SS-001A contracts plus the bounded SS-001H public measurement path."""
 
 from .economics import (
     build_hypothetical_maker_quote,

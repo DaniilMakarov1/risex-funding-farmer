@@ -1,4 +1,4 @@
-"""Deterministic offline aggregation of SS-001G JSONL evidence."""
+"""Deterministic offline aggregation of SS-001H JSONL evidence."""
 
 from __future__ import annotations
 
@@ -126,37 +126,99 @@ class _NumberStats:
 
 @dataclass(slots=True)
 class _HorizonStats:
+    """Raw horizon evidence plus episode-local valid classifications."""
+
     observation_count: int = 0
     outcomes: dict[str, int] = field(default_factory=lambda: defaultdict(int))
     filled_quantity: _NumberStats = field(default_factory=_NumberStats)
     notional: _NumberStats = field(default_factory=_NumberStats)
+    raw_entry_edge: _NumberStats = field(default_factory=_NumberStats)
+    raw_markout: _NumberStats = field(default_factory=_NumberStats)
     entry_edge: _NumberStats = field(default_factory=_NumberStats)
     markout: _NumberStats = field(default_factory=_NumberStats)
     version_ids: set[str] = field(default_factory=set)
     version_id_capacity_exceeded: bool = False
     contaminated: bool = False
     gap_reasons: set[str] = field(default_factory=set)
+    valid_observation_count: int = 0
+    valid_outcomes: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    valid_filled_quantity: _NumberStats = field(default_factory=_NumberStats)
+    valid_notional: _NumberStats = field(default_factory=_NumberStats)
+    contaminated_observation_count: int = 0
+    contaminated_outcomes: dict[str, int] = field(
+        default_factory=lambda: defaultdict(int)
+    )
+    contaminated_filled_quantity: _NumberStats = field(default_factory=_NumberStats)
+    contaminated_notional: _NumberStats = field(default_factory=_NumberStats)
+    contaminated_entry_edge: _NumberStats = field(default_factory=_NumberStats)
+    contaminated_markout: _NumberStats = field(default_factory=_NumberStats)
+    contamination_reason_counts: dict[str, int] = field(
+        default_factory=lambda: defaultdict(int)
+    )
+    missing_expected_count: int = 0
+    edge_excluded_by_fill_count: int = 0
 
-    def add(self, record: dict[str, Any], *, track_version: bool = True) -> None:
+    def add_raw(self, record: dict[str, Any], *, track_version: bool = True) -> None:
         self.observation_count += 1
         outcome = _key_text(record.get("outcome"))
         self.outcomes[outcome] += 1
         self.filled_quantity.add(_decimal(record.get("filled_quantity")))
         self.notional.add(_decimal(record.get("notional_usd")))
         if outcome == "HEDGE_FULL":
-            self.entry_edge.add(_decimal(record.get("entry_edge_usd")))
-            self.markout.add(_decimal(record.get("conditional_markout_usd")))
+            self.raw_entry_edge.add(_decimal(record.get("entry_edge_usd")))
+            self.raw_markout.add(_decimal(record.get("conditional_markout_usd")))
         version_id = record.get("quote_version_id")
         if track_version and version_id is not None:
             if len(self.version_ids) < _HORIZON_VERSION_CAP:
                 self.version_ids.add(_key_text(version_id))
             else:
                 self.version_id_capacity_exceeded = True
-        if outcome == "HEDGE_DATA_GAP":
+
+    def classify(
+        self,
+        record: dict[str, Any],
+        *,
+        contaminated_reasons: set[str] | frozenset[str] = frozenset(),
+        edge_allowed: bool = True,
+    ) -> None:
+        """Classify one already-counted raw horizon without mutating raw data."""
+
+        outcome = _key_text(record.get("outcome"))
+        reasons = tuple(sorted({_key_text(reason) for reason in contaminated_reasons if reason}))
+        if reasons:
+            self.contaminated_observation_count += 1
+            self.contaminated_outcomes[outcome] += 1
+            self.contaminated_filled_quantity.add(
+                _decimal(record.get("filled_quantity"))
+            )
+            self.contaminated_notional.add(_decimal(record.get("notional_usd")))
+            if outcome == "HEDGE_FULL":
+                self.contaminated_entry_edge.add(
+                    _decimal(record.get("entry_edge_usd"))
+                )
+                self.contaminated_markout.add(
+                    _decimal(record.get("conditional_markout_usd"))
+                )
+            for reason in reasons:
+                self.contamination_reason_counts[reason] += 1
             self.contaminated = True
-            self.gap_reasons.add(_key_text(record.get("gap_reason")) or outcome)
-        elif outcome == "HEDGE_OUTCOME_UNKNOWN":
-            self.contaminated = True
+            self.gap_reasons.update(reasons)
+            return
+        self.valid_observation_count += 1
+        self.valid_outcomes[outcome] += 1
+        self.valid_filled_quantity.add(_decimal(record.get("filled_quantity")))
+        self.valid_notional.add(_decimal(record.get("notional_usd")))
+        if outcome == "HEDGE_FULL":
+            if edge_allowed:
+                self.entry_edge.add(_decimal(record.get("entry_edge_usd")))
+                self.markout.add(_decimal(record.get("conditional_markout_usd")))
+            else:
+                self.edge_excluded_by_fill_count += 1
+
+    def add(self, record: dict[str, Any], *, track_version: bool = True) -> None:
+        """Backward-compatible raw-only alias used by older callers."""
+
+        self.add_raw(record, track_version=track_version)
 
 
 @dataclass(slots=True)
@@ -173,6 +235,75 @@ class _ModelStats:
     )
     fill_version_ids: set[str] = field(default_factory=set)
     fill_version_id_capacity_exceeded: bool = False
+    valid_fill_count: int = 0
+    valid_filled_notional: Decimal = Decimal("0")
+    valid_threshold_volume: Decimal = Decimal("0")
+    valid_threshold_notional: Decimal = Decimal("0")
+    valid_time_to_fill_ms: _NumberStats = field(default_factory=_NumberStats)
+    raw_detection_timestamps: set[int] = field(default_factory=set)
+    valid_detection_timestamps: set[int] = field(default_factory=set)
+    contaminated_fill_count: int = 0
+    contaminated_detection_timestamps: set[int] = field(default_factory=set)
+    contaminated_filled_notional: Decimal = Decimal("0")
+    contaminated_threshold_volume: Decimal = Decimal("0")
+    contaminated_threshold_notional: Decimal = Decimal("0")
+    contaminated_time_to_fill_ms: _NumberStats = field(default_factory=_NumberStats)
+    fill_contamination_reason_counts: dict[str, int] = field(
+        default_factory=lambda: defaultdict(int)
+    )
+
+    def classify_fill(
+        self,
+        record: dict[str, Any],
+        info: _QuoteInfo | None,
+        reasons: set[str] | frozenset[str],
+    ) -> None:
+        """Add one raw fill to the valid or contaminated episode ledger."""
+
+        quantity = (
+            None if info is None else info.quantity
+        ) or _decimal(record.get("canonical_quantity"))
+        maker_price = None if info is None else info.maker_price
+        if maker_price is None:
+            maker_price = _decimal(record.get("maker_price"))
+        filled_notional = (
+            quantity * maker_price
+            if quantity is not None and maker_price is not None
+            else Decimal("0")
+        )
+        cumulative = _decimal(record.get("cumulative_eligible_quantity")) or Decimal("0")
+        threshold_notional = (
+            cumulative * maker_price
+            if maker_price is not None
+            else Decimal("0")
+        )
+        detected = _record_int(record, "would_fill_detected_monotonic_ns")
+        created = None if info is None else info.created
+        if created is None:
+            created = _record_int(record, "quote_created_monotonic_ns")
+        time_to_fill = (
+            Decimal(max(0, detected - created)) / Decimal("1000000")
+            if detected is not None and created is not None
+            else None
+        )
+        if reasons:
+            self.contaminated_fill_count += 1
+            self.contaminated_filled_notional += filled_notional
+            self.contaminated_threshold_volume += cumulative
+            self.contaminated_threshold_notional += threshold_notional
+            self.contaminated_time_to_fill_ms.add(time_to_fill)
+            if detected is not None:
+                self.contaminated_detection_timestamps.add(detected)
+            for reason in sorted(reasons):
+                self.fill_contamination_reason_counts[reason] += 1
+            return
+        self.valid_fill_count += 1
+        self.valid_filled_notional += filled_notional
+        self.valid_threshold_volume += cumulative
+        self.valid_threshold_notional += threshold_notional
+        self.valid_time_to_fill_ms.add(time_to_fill)
+        if detected is not None:
+            self.valid_detection_timestamps.add(detected)
 
 
 @dataclass(slots=True)
@@ -255,41 +386,18 @@ class _EpisodeContext:
     market: str
     quote_created: int | None
     detected: int | None
+    quote_info: _QuoteInfo | None = None
+    fill_record: dict[str, Any] = field(default_factory=dict)
     risex_stream_session: str | int | None = None
     risex_recovery: int | None = None
     hedge_stream_session: str | int | None = None
     hedge_recovery: int | None = None
     horizons_seen: set[int] = field(default_factory=set)
-    contaminated_horizons: set[int] = field(default_factory=set)
-
-    def horizon_interval(self, horizon: int) -> dict[str, Any]:
-        return {
-            "kind": "HEDGE_HORIZON",
-            "canonical_market": self.market,
-            "venue": "LIGHTER",
-            "expected_stream_session_id": self.hedge_stream_session,
-            "expected_recovery_generation": self.hedge_recovery,
-            "would_fill_detected_monotonic_ns": self.detected,
-            "horizon_deadline_monotonic_ns": None
-            if self.detected is None
-            else self.detected + horizon * 1_000_000,
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class _CompletedEpisodeIndex:
-    """Minimal identity retained for gaps that arrive after horizon completion."""
-
-    model: str
-    version_id: str
-    policy_id: str
-    market: str
-    quote_created: int | None
-    detected: int | None
-    risex_stream_session: str | int | None
-    risex_recovery: int | None
-    hedge_stream_session: str | int | None
-    hedge_recovery: int | None
+    horizon_records: dict[int, dict[str, Any]] = field(default_factory=dict)
+    fill_contamination_reasons: set[str] = field(default_factory=set)
+    horizon_contamination_reasons: dict[int, set[str]] = field(
+        default_factory=lambda: defaultdict(set)
+    )
 
     def horizon_interval(self, horizon: int) -> dict[str, Any]:
         return {
@@ -415,6 +523,7 @@ def _gap_contaminates(
     gap_session = gap.get("stream_session_id")
     if (
         gap_session is not None
+        and gap_session != "unknown"
         and record_session is not None
         and gap_session != record_session
     ):
@@ -947,44 +1056,145 @@ def _model_payload(
     completeness: str,
     implemented: bool,
 ) -> dict[str, Any]:
-    outcome_counts = {
-        key: horizon.outcomes[key] for key in sorted(horizon.outcomes)
+    outcome_counts = {key: horizon.outcomes[key] for key in sorted(horizon.outcomes)}
+    valid_outcome_counts = {
+        key: horizon.valid_outcomes[key] for key in sorted(horizon.valid_outcomes)
     }
-    full = horizon.outcomes.get("HEDGE_FULL", 0)
-    partial = horizon.outcomes.get("HEDGE_PARTIAL", 0)
-    missing = sum(
-        horizon.outcomes.get(name, 0)
-        for name in (
-            "HEDGE_DEPTH_UNAVAILABLE",
-            "HEDGE_DATA_MISSING",
-            "HEDGE_DATA_STALE",
-            "HEDGE_SESSION_DISPLACED",
-            "HEDGE_DATA_GAP",
-            "HEDGE_OUTCOME_UNKNOWN",
+    contaminated_outcome_counts = {
+        key: horizon.contaminated_outcomes[key]
+        for key in sorted(horizon.contaminated_outcomes)
+    }
+
+    def missing_count(outcomes: dict[str, int]) -> int:
+        return sum(
+            outcomes.get(name, 0)
+            for name in (
+                "HEDGE_DEPTH_UNAVAILABLE",
+                "HEDGE_DATA_MISSING",
+                "HEDGE_DATA_STALE",
+                "HEDGE_SESSION_DISPLACED",
+                "HEDGE_DATA_GAP",
+                "HEDGE_OUTCOME_UNKNOWN",
+            )
         )
-    )
+
+    raw_full = horizon.outcomes.get("HEDGE_FULL", 0)
+    valid_full = horizon.valid_outcomes.get("HEDGE_FULL", 0)
+    contaminated_full = horizon.contaminated_outcomes.get("HEDGE_FULL", 0)
+    raw_partial = horizon.outcomes.get("HEDGE_PARTIAL", 0)
+    valid_partial = horizon.valid_outcomes.get("HEDGE_PARTIAL", 0)
+    contaminated_partial = horizon.contaminated_outcomes.get("HEDGE_PARTIAL", 0)
+    raw_missing = missing_count(horizon.outcomes)
+    valid_missing = missing_count(horizon.valid_outcomes)
+    contaminated_missing = missing_count(horizon.contaminated_outcomes)
     return {
         "model": model_name,
         "implemented": implemented,
         "would_fill_count": stats.fill_count,
         "fill_count": stats.fill_count,
+        "raw_would_fill_count": stats.fill_count,
+        "valid_would_fill_count": stats.valid_fill_count,
+        "contaminated_would_fill_count": stats.contaminated_fill_count,
         "filled_notional_usd": _json_number(stats.filled_notional),
+        "raw_filled_notional_usd": _json_number(stats.filled_notional),
+        "valid_filled_notional_usd": _json_number(stats.valid_filled_notional),
+        "contaminated_filled_notional_usd": _json_number(
+            stats.contaminated_filled_notional
+        ),
         "cumulative_qualifying_volume": _json_number(stats.qualifying_volume),
         "cumulative_qualifying_notional_usd": _json_number(stats.qualifying_notional),
         "threshold_qualifying_volume": _json_number(stats.threshold_volume),
         "threshold_qualifying_notional_usd": _json_number(stats.threshold_notional),
+        "valid_threshold_qualifying_volume": _json_number(
+            stats.valid_threshold_volume
+        ),
+        "valid_threshold_qualifying_notional_usd": _json_number(
+            stats.valid_threshold_notional
+        ),
+        "contaminated_threshold_qualifying_volume": _json_number(
+            stats.contaminated_threshold_volume
+        ),
+        "contaminated_threshold_qualifying_notional_usd": _json_number(
+            stats.contaminated_threshold_notional
+        ),
         "time_to_fill_ms": _stats_payload(stats.time_to_fill_ms),
+        "raw_time_to_fill_ms": _stats_payload(stats.time_to_fill_ms),
+        "valid_time_to_fill_ms": _stats_payload(stats.valid_time_to_fill_ms),
+        "contaminated_time_to_fill_ms": _stats_payload(
+            stats.contaminated_time_to_fill_ms
+        ),
+        "raw_detection_timestamp_count": len(stats.raw_detection_timestamps),
+        "valid_detection_timestamp_count": len(stats.valid_detection_timestamps),
+        "contaminated_detection_timestamp_count": len(
+            stats.contaminated_detection_timestamps
+        ),
+        "fill_contamination_reason_counts": {
+            key: stats.fill_contamination_reason_counts[key]
+            for key in sorted(stats.fill_contamination_reason_counts)
+        },
         "horizon": {
             "observation_count": horizon.observation_count,
+            "raw_observation_count": horizon.observation_count,
+            "valid_observation_count": horizon.valid_observation_count,
+            "contaminated_observation_count": horizon.contaminated_observation_count,
             "outcome_counts": outcome_counts,
-            "full_hedge_rate": _rate(full, horizon.observation_count),
-            "partial_hedge_rate": _rate(partial, horizon.observation_count),
-            "missing_hedge_rate": _rate(missing, horizon.observation_count),
-            "partial_or_missing_rate": _rate(partial + missing, horizon.observation_count),
-            "filled_quantity": _stats_payload(horizon.filled_quantity),
-            "notional_usd": _stats_payload(horizon.notional),
+            "raw_outcome_counts": outcome_counts,
+            "valid_outcome_counts": valid_outcome_counts,
+            "contaminated_outcome_counts": contaminated_outcome_counts,
+            "full_hedge_rate": _rate(valid_full, horizon.valid_observation_count),
+            "raw_full_hedge_rate": _rate(raw_full, horizon.observation_count),
+            "valid_full_hedge_rate": _rate(valid_full, horizon.valid_observation_count),
+            "contaminated_full_hedge_rate": _rate(
+                contaminated_full, horizon.contaminated_observation_count
+            ),
+            "partial_hedge_rate": _rate(valid_partial, horizon.valid_observation_count),
+            "raw_partial_hedge_rate": _rate(raw_partial, horizon.observation_count),
+            "contaminated_partial_hedge_rate": _rate(
+                contaminated_partial, horizon.contaminated_observation_count
+            ),
+            "missing_hedge_rate": _rate(valid_missing, horizon.valid_observation_count),
+            "raw_missing_hedge_rate": _rate(raw_missing, horizon.observation_count),
+            "contaminated_missing_hedge_rate": _rate(
+                contaminated_missing, horizon.contaminated_observation_count
+            ),
+            "partial_or_missing_rate": _rate(
+                valid_partial + valid_missing, horizon.valid_observation_count
+            ),
+            "raw_partial_or_missing_rate": _rate(
+                raw_partial + raw_missing, horizon.observation_count
+            ),
+            "contaminated_partial_or_missing_rate": _rate(
+                contaminated_partial + contaminated_missing,
+                horizon.contaminated_observation_count,
+            ),
+            "filled_quantity": _stats_payload(horizon.valid_filled_quantity),
+            "raw_filled_quantity": _stats_payload(horizon.filled_quantity),
+            "contaminated_filled_quantity": _stats_payload(
+                horizon.contaminated_filled_quantity
+            ),
+            "notional_usd": _stats_payload(horizon.valid_notional),
+            "raw_notional_usd": _stats_payload(horizon.notional),
+            "contaminated_notional_usd": _stats_payload(horizon.contaminated_notional),
             "entry_edge_usd": _stats_payload(horizon.entry_edge),
+            "raw_entry_edge_usd": _stats_payload(horizon.raw_entry_edge),
+            "contaminated_entry_edge_usd": _stats_payload(
+                horizon.contaminated_entry_edge
+            ),
             "conditional_markout_usd": _stats_payload(horizon.markout),
+            "raw_conditional_markout_usd": _stats_payload(horizon.raw_markout),
+            "contaminated_conditional_markout_usd": _stats_payload(
+                horizon.contaminated_markout
+            ),
+            "valid_edge_count": horizon.entry_edge.count,
+            "raw_edge_count": horizon.raw_entry_edge.count,
+            "contaminated_edge_count": horizon.contaminated_entry_edge.count,
+            "edge_excluded_by_fill_count": horizon.edge_excluded_by_fill_count,
+            "gap_reasons": sorted(horizon.gap_reasons),
+            "contamination_reason_counts": {
+                key: horizon.contamination_reason_counts[key]
+                for key in sorted(horizon.contamination_reason_counts)
+            },
+            "missing_expected_count": horizon.missing_expected_count,
             "data_completeness": completeness,
         },
     }
@@ -1005,7 +1215,8 @@ def build_report(path: str | Path) -> dict[str, Any]:
     active_by_policy: dict[str, _QuoteInfo] = {}
     active_by_version: dict[str, _QuoteInfo] = {}
     episodes: dict[tuple[str, str], _EpisodeContext] = {}
-    completed_episodes: dict[tuple[str, str], _CompletedEpisodeIndex] = {}
+    completed_episodes: dict[tuple[str, str], _EpisodeContext] = {}
+    deferred_horizons: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     episode_context_truncated = False
     recent_gaps: deque[dict[str, Any]] = deque(maxlen=_RECENT_GAP_CAP)
     recent_gap_truncated = False
@@ -1015,6 +1226,10 @@ def build_report(path: str | Path) -> dict[str, Any]:
     trade_key_order: deque[str] = deque(maxlen=_RECENT_TRADE_KEY_CAP)
     first_sample_stop: dict[str, Any] | None = None
     replay_seen = False
+    transport_event_counts: dict[str, int] = defaultdict(int)
+    transport_failure_class_counts: dict[str, int] = defaultdict(int)
+    transport_exception_type_counts: dict[str, int] = defaultdict(int)
+    unexpected_transport_failure = False
 
     def policy_for(policy_id: str | None, record: dict[str, Any]) -> _PolicyStats | None:
         if policy_id is None or not policy_id:
@@ -1187,12 +1402,18 @@ def build_report(path: str | Path) -> dict[str, Any]:
             if info is not None and info.maker_price is not None:
                 stats.threshold_notional += cumulative * info.maker_price
         detected = _record_int(record, "would_fill_detected_monotonic_ns")
+        if detected is not None:
+            stats.raw_detection_timestamps.add(detected)
         if info is not None and detected is not None:
             stats.time_to_fill_ms.add(Decimal(max(0, detected - info.created)) / Decimal("1000000"))
         if not version_text:
+            stats.contaminated_fill_count += 1
+            stats.fill_contamination_reason_counts["EPISODE_CONTEXT_MISSING"] += 1
             return True
         if len(episodes) + len(completed_episodes) >= _EPISODE_CONTEXT_CAP:
             episode_context_truncated = True
+            stats.contaminated_fill_count += 1
+            stats.fill_contamination_reason_counts["EPISODE_CONTEXT_CAPACITY"] += 1
             return True
         if info is None:
             created = _record_int(record, "quote_created_monotonic_ns")
@@ -1201,24 +1422,33 @@ def build_report(path: str | Path) -> dict[str, Any]:
             created = info.created
             market = info.market
         episode = _EpisodeContext(
-            model,
-            version_text,
-            policy_id,
-            market,
-            created,
-            detected,
-            None if info is None else info.stream_session,
-            None if info is None else info.recovery,
-            record.get("hedge_stream_session_id")
-            if record.get("hedge_stream_session_id") is not None
-            else (None if info is None else info.hedge_stream_session),
-            _record_int(record, "hedge_recovery_generation")
-            if record.get("hedge_recovery_generation") is not None
-            else (None if info is None else info.hedge_recovery),
+            model=model,
+            version_id=version_text,
+            policy_id=policy_id,
+            market=market,
+            quote_created=created,
+            detected=detected,
+            quote_info=info,
+            fill_record=dict(record),
+            risex_stream_session=None if info is None else info.stream_session,
+            risex_recovery=None if info is None else info.recovery,
+            hedge_stream_session=(
+                record.get("hedge_stream_session_id")
+                if record.get("hedge_stream_session_id") is not None
+                else (None if info is None else info.hedge_stream_session)
+            ),
+            hedge_recovery=(
+                _record_int(record, "hedge_recovery_generation")
+                if record.get("hedge_recovery_generation") is not None
+                else (None if info is None else info.hedge_recovery)
+            ),
         )
         episodes[(model, version_text)] = episode
         for gap in recent_gaps:
             mark_gap_for_episode(gap, episode)
+        deferred = deferred_horizons.pop((model, version_text), ())
+        for horizon_record in deferred:
+            attach_horizon_record(horizon_record, episode)
         return True
 
     def mark_gap_for_episode(gap: dict[str, Any], episode: _EpisodeContext) -> None:
@@ -1231,55 +1461,50 @@ def build_report(path: str | Path) -> dict[str, Any]:
             "stream_session_id": episode.risex_stream_session,
             "recovery_generation": episode.risex_recovery,
         }
-        if _gap_contaminates(gap, fill_record):
-            episode.contaminated_horizons.update(_HORIZONS)
+        gap_venue = _record_venue(gap)
+        if gap_venue == "RISEX" and _gap_contaminates(gap, fill_record):
+            episode.fill_contamination_reasons.add(
+                _key_text(gap.get("reason")) or "RISEX_GAP_OVERLAP"
+            )
+            return
+        if gap_venue != "LIGHTER":
             return
         for horizon in _HORIZONS:
             if _gap_contaminates(gap, episode.horizon_interval(horizon)):
-                episode.contaminated_horizons.add(horizon)
+                episode.horizon_contamination_reasons[horizon].add(
+                    _key_text(gap.get("reason")) or "LIGHTER_GAP_OVERLAP"
+                )
 
     def mark_gap_for_completed_episode(
-        gap: dict[str, Any], episode: _CompletedEpisodeIndex
+        gap: dict[str, Any], episode: _EpisodeContext
     ) -> None:
-        fill_record = {
-            "kind": "WOULD_FILL",
-            "canonical_market": episode.market,
-            "venue": "RISEX",
-            "quote_created_monotonic_ns": episode.quote_created,
-            "would_fill_detected_monotonic_ns": episode.detected,
-            "stream_session_id": episode.risex_stream_session,
-            "recovery_generation": episode.risex_recovery,
-        }
-        stats = policies.get(episode.policy_id)
-        if stats is None:
-            return
-        if _gap_contaminates(gap, fill_record):
-            for horizon in _HORIZONS:
-                stats.model(episode.model).horizons[horizon].contaminated = True
-            return
-        for horizon in _HORIZONS:
-            if _gap_contaminates(gap, episode.horizon_interval(horizon)):
-                stats.model(episode.model).horizons[horizon].contaminated = True
+        mark_gap_for_episode(gap, episode)
 
     def retire_episode(key: tuple[str, str], episode: _EpisodeContext) -> None:
-        stats = policies.get(episode.policy_id)
-        if stats is not None:
-            model_stats = stats.model(episode.model)
-            for horizon in episode.contaminated_horizons:
-                model_stats.horizons[horizon].contaminated = True
-        completed_episodes[key] = _CompletedEpisodeIndex(
-            model=episode.model,
-            version_id=episode.version_id,
-            policy_id=episode.policy_id,
-            market=episode.market,
-            quote_created=episode.quote_created,
-            detected=episode.detected,
-            risex_stream_session=episode.risex_stream_session,
-            risex_recovery=episode.risex_recovery,
-            hedge_stream_session=episode.hedge_stream_session,
-            hedge_recovery=episode.hedge_recovery,
-        )
+        completed_episodes[key] = episode
         episodes.pop(key, None)
+
+    def attach_horizon_record(
+        record: dict[str, Any], episode: _EpisodeContext
+    ) -> None:
+        """Attach a raw horizon that may have preceded its fill in the store."""
+
+        horizon = int(record["horizon_ms"])
+        episode.horizons_seen.add(horizon)
+        episode.horizon_records[horizon] = dict(record)
+        embedded = _embedded_horizon_gap(record)
+        if embedded is not None:
+            embedded_reason = _key_text(embedded.get("reason")) or "HEDGE_DATA_GAP"
+            if embedded_reason != "PUBLIC_SMOKE_STOPPED":
+                episode.horizon_contamination_reasons[horizon].add(embedded_reason)
+        elif record.get("outcome") == "HEDGE_DATA_GAP":
+            episode.horizon_contamination_reasons[horizon].add("HEDGE_DATA_GAP")
+        if record.get("outcome") == "HEDGE_OUTCOME_UNKNOWN":
+            episode.horizon_contamination_reasons[horizon].add(
+                "HEDGE_OUTCOME_UNKNOWN"
+            )
+        if len(episode.horizons_seen) == len(_HORIZONS):
+            retire_episode((episode.model, episode.version_id), episode)
 
     def process_horizon(record: dict[str, Any]) -> None:
         nonlocal horizon_record_count, optimistic_supported
@@ -1295,7 +1520,12 @@ def build_report(path: str | Path) -> dict[str, Any]:
             return
         version_id = record.get("quote_version_id")
         version_text = _key_text(version_id) if version_id is not None else ""
-        episode = episodes.get((model, version_text)) if version_text else None
+        episode = (
+            episodes.get((model, version_text))
+            or completed_episodes.get((model, version_text))
+            if version_text
+            else None
+        )
         info = quote_for_version(version_id)
         policy_id = _key_text(record.get("policy_id")) or (
             episode.policy_id if episode is not None else None
@@ -1307,23 +1537,45 @@ def build_report(path: str | Path) -> dict[str, Any]:
         horizon_stats = stats.horizons[horizon]
         if version_text and version_text in horizon_stats.version_ids:
             return
-        horizon_stats.add(record)
+        horizon_stats.add_raw(record)
         if episode is not None:
-            episode.horizons_seen.add(horizon)
-            if horizon in episode.contaminated_horizons:
-                horizon_stats.contaminated = True
-            embedded = _embedded_horizon_gap(record)
-            if embedded is not None and embedded.get("reason") != "PUBLIC_SMOKE_STOPPED":
-                episode.contaminated_horizons.add(horizon)
-                horizon_stats.contaminated = True
-            if len(episode.horizons_seen) == len(_HORIZONS):
-                retire_episode((model, version_text), episode)
+            attach_horizon_record(record, episode)
+        elif version_text:
+            # AppendOnlyEvidenceStore orders each batch by observed time, so a
+            # fixture or replay may legitimately place a horizon before its
+            # WOULD_FILL row. Keep the raw row deferred until exact fill
+            # identity arrives; only an unresolved row is contaminated.
+            deferred_horizons[(model, version_text)].append(dict(record))
+        else:
+            # A horizon without its exact fill context cannot be attributed to
+            # a clean episode, even though the raw row remains retained.
+            horizon_stats.contaminated = True
+            horizon_stats.contamination_reason_counts["EPISODE_CONTEXT_MISSING"] += 1
+            horizon_stats.contaminated_observation_count += 1
+            horizon_stats.contaminated_outcomes[_key_text(record.get("outcome"))] += 1
 
     def process_gap(record: dict[str, Any]) -> None:
-        nonlocal gap_count, recent_gap_truncated
+        nonlocal gap_count, recent_gap_truncated, unexpected_transport_failure
         gap_count += 1
         market = _key_text(record.get("canonical_market"))
         gap_count_by_market[market] += 1
+        transport_event = _key_text(record.get("transport_event"))
+        if not transport_event:
+            transport_event = {
+                "PUBLIC_SOCKET_GRACEFUL_CLOSE": "GRACEFUL_CLOSE",
+                "PUBLIC_SOCKET_RECONNECTED": "RECONNECT",
+                "PUBLIC_SOCKET_TRANSPORT_FAILURE": "UNEXPECTED_FAILURE",
+            }.get(_key_text(record.get("reason")), "")
+        if transport_event:
+            transport_event_counts[transport_event] += 1
+            if transport_event == "UNEXPECTED_FAILURE":
+                unexpected_transport_failure = True
+        failure_class = _key_text(record.get("transport_failure_class"))
+        if failure_class:
+            transport_failure_class_counts[failure_class] += 1
+        exception_type = _key_text(record.get("transport_exception_type"))
+        if exception_type:
+            transport_exception_type_counts[exception_type] += 1
         if record.get("reason") == "PUBLIC_SMOKE_STOPPED":
             pending_stop_gaps.append(record)
         else:
@@ -1388,12 +1640,86 @@ def build_report(path: str | Path) -> dict[str, Any]:
     }:
         optimistic_supported = True
 
-    for episode in episodes.values():
+    # Classification is deliberately finalized only after the complete
+    # physical stream has been read.  A gap can arrive after the fourth
+    # horizon row, so adding an edge to the valid distribution at row time
+    # would allow a late gap to poison an already-published statistic.
+    all_episodes = tuple(episodes.values()) + tuple(completed_episodes.values())
+    for episode in all_episodes:
         policy = policies.get(episode.policy_id)
         if policy is None:
             continue
-        for horizon in episode.contaminated_horizons:
-            policy.model(episode.model).horizons[horizon].contaminated = True
+        model_stats = policy.model(episode.model)
+        # A valid episode is stronger than a valid individual horizon: the
+        # fill interval and every required horizon must be present and clean.
+        # Keep the horizon ledger local below, but fold all horizon reasons
+        # into the episode-level fill/edge verdict before classifying it.
+        episode_reasons = set(episode.fill_contamination_reasons)
+        horizon_reasons: dict[int, set[str]] = {}
+        for horizon in _HORIZONS:
+            horizon_stats = model_stats.horizons[horizon]
+            record = episode.horizon_records.get(horizon)
+            if record is None:
+                reasons = {"HORIZON_RECORD_MISSING"}
+                horizon_stats.missing_expected_count += 1
+                horizon_stats.contaminated = True
+                horizon_stats.contamination_reason_counts[
+                    "HORIZON_RECORD_MISSING"
+                ] += 1
+            else:
+                reasons = set(
+                    episode.horizon_contamination_reasons.get(horizon, set())
+                )
+            horizon_reasons[horizon] = reasons
+            episode_reasons.update(reasons)
+        model_stats.classify_fill(
+            episode.fill_record,
+            episode.quote_info,
+            episode_reasons,
+        )
+        for horizon in _HORIZONS:
+            record = episode.horizon_records.get(horizon)
+            if record is None:
+                continue
+            horizon_stats = model_stats.horizons[horizon]
+            horizon_stats.classify(
+                record,
+                contaminated_reasons=horizon_reasons[horizon],
+                edge_allowed=not episode_reasons,
+            )
+
+    # A raw horizon whose exact fill never appeared is retained, but cannot
+    # enter a valid attribution distribution.
+    for (model, _version_text), records in deferred_horizons.items():
+        for record in records:
+            policy_id = _key_text(record.get("policy_id"))
+            policy = policies.get(policy_id)
+            if policy is None:
+                continue
+            try:
+                horizon = int(record.get("horizon_ms"))
+            except (TypeError, ValueError):
+                continue
+            if horizon not in _HORIZONS:
+                continue
+            horizon_stats = policy.model(model).horizons[horizon]
+            horizon_stats.contaminated = True
+            horizon_stats.contamination_reason_counts["EPISODE_CONTEXT_MISSING"] += 1
+            horizon_stats.contaminated_observation_count += 1
+            horizon_stats.contaminated_outcomes[_key_text(record.get("outcome"))] += 1
+
+    root_counts["strict_valid_episode_count"] = sum(
+        policy.strict.valid_fill_count for policy in policies.values()
+    )
+    root_counts["strict_contaminated_episode_count"] = sum(
+        policy.strict.contaminated_fill_count for policy in policies.values()
+    )
+    root_counts["optimistic_valid_episode_count"] = sum(
+        policy.optimistic.valid_fill_count for policy in policies.values()
+    )
+    root_counts["optimistic_contaminated_episode_count"] = sum(
+        policy.optimistic.contaminated_fill_count for policy in policies.values()
+    )
 
     def completeness_for(
         policy: _PolicyStats,
@@ -1412,15 +1738,26 @@ def build_report(path: str | Path) -> dict[str, Any]:
             coverage = False
         if expected <= _HORIZON_VERSION_CAP and len(observations.version_ids) < expected:
             coverage = False
+        # Episode-level fill contamination is intentionally separate from the
+        # horizon ledger.  A gap in the 300 ms horizon of one episode must not
+        # degrade an otherwise covered 0 ms horizon for that same policy; the
+        # fill/edge episode is contaminated, while only the overlapping
+        # horizon observation is contaminated here.
         contaminated = observations.contaminated
         if episode_context_truncated or recent_gap_truncated:
             contaminated = True
         if not ordinary_duration_completion:
             contaminated = contaminated or bool(pending_stop_gaps)
+        if unexpected_transport_failure:
+            contaminated = True
         return "COMPLETE" if ordinary_duration_completion and coverage and not contaminated else "DEGRADED"
 
     model_fill_totals = {
         model: sum(policy.model(model).fill_count for policy in policies.values())
+        for model in _MODELS
+    }
+    valid_model_fill_totals = {
+        model: sum(policy.model(model).valid_fill_count for policy in policies.values())
         for model in _MODELS
     }
     eligible_totals = sum(policy.eligible_trade_count for policy in policies.values())
@@ -1458,6 +1795,13 @@ def build_report(path: str | Path) -> dict[str, Any]:
                 if value > 0
             )
             strict_edge_count = strict_edges.count
+            strict_raw_edges = strict_horizon.raw_entry_edge
+            strict_raw_markouts = strict_horizon.raw_markout
+            strict_raw_positive = sum(
+                1
+                for value in strict_raw_edges.values.ordered()
+                if value > 0
+            )
             strict_model_payload = _model_payload(
                 _STRICT_MODEL,
                 policy.strict,
@@ -1526,7 +1870,17 @@ def build_report(path: str | Path) -> dict[str, Any]:
                 "at_or_through_count": policy.at_or_through_count,
                 "strict_price_through_count": policy.strict_price_through_count,
                 "strict_would_fill_count": policy.strict.fill_count,
+                "strict_raw_would_fill_count": policy.strict.fill_count,
+                "strict_valid_would_fill_count": policy.strict.valid_fill_count,
+                "strict_contaminated_would_fill_count": policy.strict.contaminated_fill_count,
+                "strict_valid_episode_count": policy.strict.valid_fill_count,
+                "strict_contaminated_episode_count": policy.strict.contaminated_fill_count,
                 "optimistic_upper_bound_count": policy.optimistic.fill_count,
+                "optimistic_raw_would_fill_count": policy.optimistic.fill_count,
+                "optimistic_valid_would_fill_count": policy.optimistic.valid_fill_count,
+                "optimistic_contaminated_would_fill_count": policy.optimistic.contaminated_fill_count,
+                "optimistic_valid_episode_count": policy.optimistic.valid_fill_count,
+                "optimistic_contaminated_episode_count": policy.optimistic.contaminated_fill_count,
                 "optimistic_model": "IMPLEMENTED" if optimistic_supported else "NOT_IMPLEMENTED",
                 "strict_cumulative_qualifying_volume": _json_number(policy.strict.qualifying_volume),
                 "optimistic_cumulative_qualifying_volume": _json_number(policy.optimistic.qualifying_volume),
@@ -1535,18 +1889,87 @@ def build_report(path: str | Path) -> dict[str, Any]:
                 "strict_threshold_qualifying_volume": _json_number(policy.strict.threshold_volume),
                 "optimistic_threshold_qualifying_volume": _json_number(policy.optimistic.threshold_volume),
                 "strict_filled_notional_usd": _json_number(policy.strict.filled_notional),
+                "strict_raw_filled_notional_usd": _json_number(policy.strict.filled_notional),
+                "strict_valid_filled_notional_usd": _json_number(
+                    policy.strict.valid_filled_notional
+                ),
+                "strict_contaminated_filled_notional_usd": _json_number(
+                    policy.strict.contaminated_filled_notional
+                ),
                 "optimistic_filled_notional_usd": _json_number(policy.optimistic.filled_notional),
+                "optimistic_raw_filled_notional_usd": _json_number(
+                    policy.optimistic.filled_notional
+                ),
+                "optimistic_valid_filled_notional_usd": _json_number(
+                    policy.optimistic.valid_filled_notional
+                ),
+                "optimistic_contaminated_filled_notional_usd": _json_number(
+                    policy.optimistic.contaminated_filled_notional
+                ),
                 "strict_time_to_fill_ms": _stats_payload(policy.strict.time_to_fill_ms),
+                "strict_raw_time_to_fill_ms": _stats_payload(
+                    policy.strict.time_to_fill_ms
+                ),
+                "strict_valid_time_to_fill_ms": _stats_payload(
+                    policy.strict.valid_time_to_fill_ms
+                ),
+                "strict_contaminated_time_to_fill_ms": _stats_payload(
+                    policy.strict.contaminated_time_to_fill_ms
+                ),
                 "optimistic_time_to_fill_ms": _stats_payload(policy.optimistic.time_to_fill_ms),
+                "optimistic_raw_time_to_fill_ms": _stats_payload(
+                    policy.optimistic.time_to_fill_ms
+                ),
+                "optimistic_valid_time_to_fill_ms": _stats_payload(
+                    policy.optimistic.valid_time_to_fill_ms
+                ),
+                "optimistic_contaminated_time_to_fill_ms": _stats_payload(
+                    policy.optimistic.contaminated_time_to_fill_ms
+                ),
+                "strict_fill_contamination_reason_counts": {
+                    key: policy.strict.fill_contamination_reason_counts[key]
+                    for key in sorted(policy.strict.fill_contamination_reason_counts)
+                },
+                "optimistic_fill_contamination_reason_counts": {
+                    key: policy.optimistic.fill_contamination_reason_counts[key]
+                    for key in sorted(policy.optimistic.fill_contamination_reason_counts)
+                },
                 "fillability_models": {
                     _STRICT_MODEL: strict_model_payload,
                     _OPTIMISTIC_MODEL: optimistic_model_payload,
                 },
                 "full_hedge_rate": _rate(
+                    strict_horizon.valid_outcomes.get("HEDGE_FULL", 0),
+                    strict_horizon.valid_observation_count,
+                ),
+                "raw_full_hedge_rate": _rate(
                     strict_horizon.outcomes.get("HEDGE_FULL", 0),
                     strict_horizon.observation_count,
                 ),
+                "valid_full_hedge_rate": _rate(
+                    strict_horizon.valid_outcomes.get("HEDGE_FULL", 0),
+                    strict_horizon.valid_observation_count,
+                ),
+                "contaminated_full_hedge_rate": _rate(
+                    strict_horizon.contaminated_outcomes.get("HEDGE_FULL", 0),
+                    strict_horizon.contaminated_observation_count,
+                ),
                 "partial_or_missing_rate": _rate(
+                    strict_horizon.valid_outcomes.get("HEDGE_PARTIAL", 0)
+                    + sum(
+                        strict_horizon.valid_outcomes.get(name, 0)
+                        for name in (
+                            "HEDGE_DEPTH_UNAVAILABLE",
+                            "HEDGE_DATA_MISSING",
+                            "HEDGE_DATA_STALE",
+                            "HEDGE_SESSION_DISPLACED",
+                            "HEDGE_DATA_GAP",
+                            "HEDGE_OUTCOME_UNKNOWN",
+                        )
+                    ),
+                    strict_horizon.valid_observation_count,
+                ),
+                "raw_partial_or_missing_rate": _rate(
                     strict_horizon.outcomes.get("HEDGE_PARTIAL", 0)
                     + sum(
                         strict_horizon.outcomes.get(name, 0)
@@ -1561,18 +1984,71 @@ def build_report(path: str | Path) -> dict[str, Any]:
                     ),
                     strict_horizon.observation_count,
                 ),
+                "contaminated_partial_or_missing_rate": _rate(
+                    strict_horizon.contaminated_outcomes.get("HEDGE_PARTIAL", 0)
+                    + sum(
+                        strict_horizon.contaminated_outcomes.get(name, 0)
+                        for name in (
+                            "HEDGE_DEPTH_UNAVAILABLE",
+                            "HEDGE_DATA_MISSING",
+                            "HEDGE_DATA_STALE",
+                            "HEDGE_SESSION_DISPLACED",
+                            "HEDGE_DATA_GAP",
+                            "HEDGE_OUTCOME_UNKNOWN",
+                        )
+                    ),
+                    strict_horizon.contaminated_observation_count,
+                ),
                 "mean_entry_edge_usd": _json_number(strict_edges.mean()),
                 "median_entry_edge_usd": _json_number(strict_edges.median()),
                 "p05_entry_edge_usd": _json_number(strict_edges.percentile(Decimal("0.05"))),
+                "raw_mean_entry_edge_usd": _json_number(strict_raw_edges.mean()),
+                "raw_median_entry_edge_usd": _json_number(strict_raw_edges.median()),
+                "raw_p05_entry_edge_usd": _json_number(
+                    strict_raw_edges.percentile(Decimal("0.05"))
+                ),
                 "mean_conditional_markout_usd": _json_number(strict_markouts.mean()),
                 "median_conditional_markout_usd": _json_number(strict_markouts.median()),
                 "p05_conditional_markout_usd": _json_number(strict_markouts.percentile(Decimal("0.05"))),
+                "raw_mean_conditional_markout_usd": _json_number(
+                    strict_raw_markouts.mean()
+                ),
+                "raw_median_conditional_markout_usd": _json_number(
+                    strict_raw_markouts.median()
+                ),
+                "raw_p05_conditional_markout_usd": _json_number(
+                    strict_raw_markouts.percentile(Decimal("0.05"))
+                ),
+                "contaminated_mean_conditional_markout_usd": _json_number(
+                    strict_horizon.contaminated_markout.mean()
+                ),
+                "contaminated_median_conditional_markout_usd": _json_number(
+                    strict_horizon.contaminated_markout.median()
+                ),
+                "contaminated_p05_conditional_markout_usd": _json_number(
+                    strict_horizon.contaminated_markout.percentile(Decimal("0.05"))
+                ),
                 "positive_edge_share": _rate(positive, strict_edge_count),
+                "raw_positive_edge_share": _rate(
+                    strict_raw_positive, strict_raw_edges.count
+                ),
+                "valid_edge_count": strict_horizon.entry_edge.count,
+                "raw_edge_count": strict_raw_edges.count,
+                "contaminated_edge_count": strict_horizon.contaminated_entry_edge.count,
+                "edge_excluded_by_fill_count": strict_horizon.edge_excluded_by_fill_count,
                 "maximum_adverse_markout_usd": _json_number(strict_markouts.minimum()),
                 "hypothetical_risex_filled_notional_usd": _json_number(policy.strict.filled_notional),
                 "concentration": {
                     "strict_episode_share": _rate(policy.strict.fill_count, model_fill_totals[_STRICT_MODEL]),
+                    "strict_valid_episode_share": _rate(
+                        policy.strict.valid_fill_count,
+                        valid_model_fill_totals[_STRICT_MODEL],
+                    ),
                     "optimistic_episode_share": _rate(policy.optimistic.fill_count, model_fill_totals[_OPTIMISTIC_MODEL]),
+                    "optimistic_valid_episode_share": _rate(
+                        policy.optimistic.valid_fill_count,
+                        valid_model_fill_totals[_OPTIMISTIC_MODEL],
+                    ),
                     "eligible_trade_share": _rate(policy.eligible_trade_count, eligible_totals),
                     "strict_qualifying_volume_share": _json_number(
                         policy.strict.qualifying_volume / model_volume_totals[_STRICT_MODEL]
@@ -1593,6 +2069,24 @@ def build_report(path: str | Path) -> dict[str, Any]:
                     },
                 },
                 "data_gap_count": gap_count_by_market.get(policy.market, 0),
+                "strict_raw_detection_timestamp_count": len(
+                    policy.strict.raw_detection_timestamps
+                ),
+                "strict_valid_detection_timestamp_count": len(
+                    policy.strict.valid_detection_timestamps
+                ),
+                "strict_contaminated_detection_timestamp_count": len(
+                    policy.strict.contaminated_detection_timestamps
+                ),
+                "optimistic_raw_detection_timestamp_count": len(
+                    policy.optimistic.raw_detection_timestamps
+                ),
+                "optimistic_valid_detection_timestamp_count": len(
+                    policy.optimistic.valid_detection_timestamps
+                ),
+                "optimistic_contaminated_detection_timestamp_count": len(
+                    policy.optimistic.contaminated_detection_timestamps
+                ),
                 "data_completeness": strict_complete,
                 "strict_data_completeness": strict_complete,
                 "optimistic_data_completeness": optimistic_complete,
@@ -1619,6 +2113,9 @@ def build_report(path: str | Path) -> dict[str, Any]:
                 "eligible_trade_count",
                 "integrity_reason",
                 "observed_monotonic_ns",
+                "material_policy_id",
+                "material_valid_strict_episode_count",
+                "material_detection_timestamp_count",
             )
         }
     return {
@@ -1629,8 +2126,22 @@ def build_report(path: str | Path) -> dict[str, Any]:
         "record_count": record_count,
         "byte_count": Path(path).stat().st_size,
         "gap_count": gap_count,
+        "failed_run": failed_run,
+        "clean_stop_count": clean_stop_count,
         "strict_would_fill_count": root_counts["strict_episode_count"],
+        "strict_raw_episode_count": root_counts["strict_episode_count"],
+        "strict_valid_episode_count": root_counts["strict_valid_episode_count"],
+        "strict_contaminated_episode_count": root_counts[
+            "strict_contaminated_episode_count"
+        ],
         "optimistic_upper_bound_count": root_counts["optimistic_episode_count"],
+        "optimistic_raw_episode_count": root_counts["optimistic_episode_count"],
+        "optimistic_valid_episode_count": root_counts[
+            "optimistic_valid_episode_count"
+        ],
+        "optimistic_contaminated_episode_count": root_counts[
+            "optimistic_contaminated_episode_count"
+        ],
         "eligible_trade_count": root_counts["eligible_trade_count"],
         "strict_episode_count": root_counts["strict_episode_count"],
         "optimistic_episode_count": root_counts["optimistic_episode_count"],
@@ -1643,6 +2154,24 @@ def build_report(path: str | Path) -> dict[str, Any]:
         "current_reconstructed_book_levels": book_audit.current_level_count,
         "sample_stop_reason": None if sample_stop_payload is None else sample_stop_payload["reason"],
         "sample_stop_signal": sample_stop_payload,
+        "transport_event_counts": {
+            key: transport_event_counts[key] for key in sorted(transport_event_counts)
+        },
+        "graceful_close_count": transport_event_counts.get("GRACEFUL_CLOSE", 0),
+        "reconnect_count": transport_event_counts.get("RECONNECT", 0),
+        "unexpected_transport_failure_count": transport_event_counts.get(
+            "UNEXPECTED_FAILURE", 0
+        ),
+        "transport_failure_class_counts": {
+            key: transport_failure_class_counts[key]
+            for key in sorted(transport_failure_class_counts)
+        },
+        "transport_exception_type_counts": {
+            key: transport_exception_type_counts[key]
+            for key in sorted(transport_exception_type_counts)
+        },
+        "fail_closed": failed_run
+        or transport_event_counts.get("UNEXPECTED_FAILURE", 0) > 0,
         "optimistic_model": "IMPLEMENTED" if optimistic_supported else "NOT_IMPLEMENTED",
         "markets": sorted(markets),
         "groups": output_groups,

@@ -290,9 +290,26 @@ def test_sample_stop_controller_latches_first_reason_wins(kwargs, expected) -> N
         strict_episode_limit=2,
         eligible_trade_limit=2,
         wall_clock_limit_ns=10,
+        material_valid_strict_episode_limit=2,
+        material_detection_timestamp_limit=2,
     )
     kwargs.setdefault("observed_monotonic_ns", 101)
     signal = controller.observe(**kwargs)
+    if expected is SampleStopReason.STRICT_EPISODE_LIMIT:
+        assert signal is None
+        assert controller.material_counts("policy-1") == (0, 0)
+        assert controller.observe_material(
+            policy_id="policy-1",
+            episode_id="episode-1",
+            detection_monotonic_ns=101,
+            observed_monotonic_ns=101,
+        ) is None
+        signal = controller.observe_material(
+            policy_id="policy-1",
+            episode_id="episode-2",
+            detection_monotonic_ns=102,
+            observed_monotonic_ns=102,
+        )
     assert signal is not None
     assert signal.reason is expected
     assert controller.observe(
@@ -300,6 +317,69 @@ def test_sample_stop_controller_latches_first_reason_wins(kwargs, expected) -> N
         strict_episode_increment=2,
         eligible_trade_increment=2,
     ) is signal
+
+
+def test_material_stop_requires_one_policy_distinct_timestamps_and_survives_invalidation() -> None:
+    controller = SampleStopController(
+        started_monotonic_ns=100,
+        material_valid_strict_episode_limit=4,
+        material_detection_timestamp_limit=2,
+        eligible_trade_limit=500,
+        wall_clock_limit_ns=1_000,
+    )
+    for episode_id in ("a", "b"):
+        assert controller.observe_material(
+            policy_id="policy-a",
+            episode_id=episode_id,
+            detection_monotonic_ns=101,
+            observed_monotonic_ns=101,
+        ) is None
+    assert controller.material_counts("policy-a") == (2, 1)
+    assert controller.observe_material(
+        policy_id="policy-a",
+        episode_id="c",
+        detection_monotonic_ns=102,
+        observed_monotonic_ns=102,
+    ) is None
+    assert controller.material_counts("policy-a") == (3, 2)
+    controller.invalidate_material(policy_id="policy-a", episode_id="b")
+    assert controller.material_counts("policy-a") == (2, 2)
+    assert controller.observe_material(
+        policy_id="policy-b",
+        episode_id="other",
+        detection_monotonic_ns=103,
+        observed_monotonic_ns=103,
+    ) is None
+    signal = controller.observe_material(
+        policy_id="policy-a",
+        episode_id="d",
+        detection_monotonic_ns=104,
+        observed_monotonic_ns=104,
+    )
+    assert signal is None
+    signal = controller.observe_material(
+        policy_id="policy-a",
+        episode_id="e",
+        detection_monotonic_ns=105,
+        observed_monotonic_ns=106,
+    )
+    assert signal is not None
+    assert signal.reason is SampleStopReason.STRICT_EPISODE_LIMIT
+    assert signal.material_policy_id == "policy-a"
+    assert signal.material_valid_strict_episode_count == 4
+    assert signal.material_detection_timestamp_count == 4
+    assert signal.observed_monotonic_ns == 106
+
+
+def test_material_stop_rejects_a_backdated_observation() -> None:
+    controller = SampleStopController(started_monotonic_ns=100)
+    with pytest.raises(ValueError, match="must not precede detection"):
+        controller.observe_material(
+            policy_id="policy-a",
+            episode_id="episode-1",
+            detection_monotonic_ns=101,
+            observed_monotonic_ns=100,
+        )
 
 
 def _pair() -> MarketPair:
@@ -651,3 +731,302 @@ def test_report_preserves_a_late_gap_after_episode_retirement(tmp_path: Path) ->
     delayed = next(group for group in report["groups"] if group["horizon_ms"] == 300)
     assert zero["data_completeness"] == "COMPLETE"
     assert delayed["data_completeness"] == "DEGRADED"
+
+
+def test_report_attributes_each_horizon_to_only_overlapping_episode(
+    tmp_path: Path,
+) -> None:
+    store = AppendOnlyEvidenceStore.create(
+        tmp_path,
+        metadata={"source_commit": "fixture", "evidence_mode": "FIXTURE"},
+    )
+    records: list[dict[str, object]] = []
+    gap_offsets = (None, 100_000_000, 400_000_000, 700_000_000)
+    for index, gap_offset in enumerate(gap_offsets):
+        detected = index * 2_000_000_000 + 10
+        version = f"episode-{index}"
+        records.append(
+            {
+                "kind": "QUOTE",
+                "canonical_market": "BTC",
+                "direction": "RISEX_BUY_LIGHTER_SELL",
+                "target_notional_usd": "100",
+                "target_margin_bps": "1",
+                "policy_id": "policy-1",
+                "quote_version_id": version,
+                "outcome": "QUOTE_ACTIVE",
+                "quote_created_monotonic_ns": detected - 10,
+                "quote_expires_monotonic_ns": detected + 1_000_000_000,
+                "quote_stream_session_id": "risex",
+                "quote_recovery_generation": 0,
+                "hedge_stream_session_id": "lighter",
+                "hedge_recovery_generation": 0,
+                "maker_price": "99",
+                "canonical_quantity": "1",
+                "risex_tick_size": "1",
+                "post_only_bound_price": "100",
+                "observed_monotonic_ns": detected - 10,
+            }
+        )
+        records.append(
+            {
+                "kind": "WOULD_FILL",
+                "canonical_market": "BTC",
+                "venue": "RISEX",
+                "policy_id": "policy-1",
+                "fillability_model": "STRICT_LOWER_BOUND",
+                "quote_version_id": version,
+                "direction": "RISEX_BUY_LIGHTER_SELL",
+                "quote_created_monotonic_ns": detected - 10,
+                "quote_stream_session_id": "risex",
+                "quote_recovery_generation": 0,
+                "hedge_stream_session_id": "lighter",
+                "hedge_recovery_generation": 0,
+                "canonical_quantity": "1",
+                "cumulative_eligible_quantity": "1",
+                "would_fill_detected_monotonic_ns": detected,
+                "observed_monotonic_ns": detected,
+            }
+        )
+        for horizon in (0, 300, 500, 1000):
+            records.append(
+                {
+                    "kind": "HEDGE_HORIZON",
+                    "canonical_market": "BTC",
+                    "venue": "LIGHTER",
+                    "policy_id": "policy-1",
+                    "fillability_model": "STRICT_LOWER_BOUND",
+                    "quote_version_id": version,
+                    "direction": "RISEX_BUY_LIGHTER_SELL",
+                    "target_notional_usd": "100",
+                    "target_margin_bps": "1",
+                    "horizon_ms": horizon,
+                    "would_fill_detected_monotonic_ns": detected,
+                    "horizon_deadline_monotonic_ns": detected + horizon * 1_000_000,
+                    "expected_stream_session_id": "lighter",
+                    "expected_recovery_generation": 0,
+                    "outcome": "HEDGE_FULL",
+                    "filled_quantity": "1",
+                    "notional_usd": "99",
+                    "entry_edge_usd": str(index + 1),
+                    "conditional_markout_usd": "0",
+                    "observed_monotonic_ns": detected + horizon * 1_000_000,
+                }
+            )
+        if gap_offset is not None:
+            gap_start = detected + gap_offset
+            records.append(
+                {
+                    "kind": "DATA_GAP",
+                    "canonical_market": "BTC",
+                    "venue": "LIGHTER",
+                    "stream_session_id": "lighter",
+                    "recovery_generation": 0,
+                    "gap_start_monotonic_ns": gap_start,
+                    "gap_end_monotonic_ns": gap_start + 1,
+                    "reason": f"ROUND_{index}",
+                    "observed_monotonic_ns": gap_start,
+                }
+            )
+    records.append({"kind": "RUN_STOP", "fatal_reason": None, "observed_monotonic_ns": 10**15})
+    store.append_batch(records)
+    path = store.path
+    store.close()
+
+    report = build_report(path)
+    assert report["strict_valid_episode_count"] == 1
+    assert report["strict_contaminated_episode_count"] == 3
+    for horizon, contaminated_count in ((0, 0), (300, 1), (500, 2), (1000, 3)):
+        row = next(group for group in report["groups"] if group["horizon_ms"] == horizon)
+        nested = row["fillability_models"]["STRICT_LOWER_BOUND"]["horizon"]
+        assert nested["raw_observation_count"] == 4
+        assert nested["valid_observation_count"] == 4 - contaminated_count
+        assert nested["contaminated_observation_count"] == contaminated_count
+        assert nested["raw_edge_count"] == 4
+        assert nested["valid_edge_count"] == 1
+        assert nested["contaminated_edge_count"] == contaminated_count
+        assert nested["edge_excluded_by_fill_count"] == 3 - contaminated_count
+        assert row["strict_valid_would_fill_count"] == 1
+        assert row["strict_contaminated_would_fill_count"] == 3
+        assert row["raw_full_hedge_rate"] == "1"
+        assert row["valid_full_hedge_rate"] == "1"
+        if contaminated_count:
+            assert nested["contamination_reason_counts"] == {
+                f"ROUND_{index}": 1 for index in range(1, contaminated_count + 1)
+            }
+        else:
+            assert nested["contamination_reason_counts"] == {}
+
+
+def test_dg006_replay_classifies_only_all_four_clean_horizon_episodes(
+    tmp_path: Path,
+) -> None:
+    horizons = (0, 300, 500, 1000)
+    gap_windows = (
+        (1_000_000_000, 17_000_000_000),
+        (30_000_000_000, 44_000_000_000),
+        (60_000_000_000, 74_000_000_000),
+    )
+    strict_times = (
+        tuple(1_000_000_000 + index * 2_000_000_000 for index in range(9))
+        + tuple(30_000_000_000 + index * 2_000_000_000 for index in range(8))
+        + tuple(60_000_000_000 + index * 2_000_000_000 for index in range(8))
+        + tuple(100_000_000_000 + index * 2_000_000_000 for index in range(31))
+    )
+    optimistic_times = strict_times + (
+        2_000_000_000,
+        4_000_000_000,
+        6_000_000_000,
+        8_000_000_000,
+    ) + tuple(200_000_000_000 + index * 2_000_000_000 for index in range(27))
+
+    def overlaps_gap(detected: int) -> bool:
+        interval = (detected, detected + 1_000_000_000)
+        return any(
+            not (gap_end < interval[0] or gap_start > interval[1])
+            for gap_start, gap_end in gap_windows
+        )
+
+    expected = {
+        "STRICT_LOWER_BOUND": (
+            len(strict_times),
+            sum(not overlaps_gap(detected) for detected in strict_times),
+            sum(overlaps_gap(detected) for detected in strict_times),
+        ),
+        "OPTIMISTIC_UPPER_BOUND": (
+            len(optimistic_times),
+            sum(not overlaps_gap(detected) for detected in optimistic_times),
+            sum(overlaps_gap(detected) for detected in optimistic_times),
+        ),
+    }
+    assert expected == {
+        "STRICT_LOWER_BOUND": (56, 31, 25),
+        "OPTIMISTIC_UPPER_BOUND": (87, 58, 29),
+    }
+
+    store = AppendOnlyEvidenceStore.create(
+        tmp_path,
+        metadata={
+            "source_commit": "4f83f8dea9f7a5deea4902f0c5cc6443e28004c1",
+            "evidence_mode": "OBSERVATIONAL",
+            "fillability_models": [
+                "STRICT_LOWER_BOUND",
+                "OPTIMISTIC_UPPER_BOUND",
+            ],
+        },
+        run_id="dg006-shaped",
+    )
+    records: list[dict[str, object]] = []
+    all_episodes = (
+        ("STRICT_LOWER_BOUND", strict_times),
+        ("OPTIMISTIC_UPPER_BOUND", optimistic_times),
+    )
+    for model, detected_times in all_episodes:
+        model_prefix = "strict" if model == "STRICT_LOWER_BOUND" else "optimistic"
+        for index, detected in enumerate(detected_times):
+            version = f"{model_prefix}-{index:03d}"
+            created = detected - 100_000_000
+            common = {
+                "canonical_market": "BTC",
+                "direction": "RISEX_BUY_LIGHTER_SELL",
+                "policy_id": "policy-dg006",
+                "quote_version_id": version,
+                "quote_created_monotonic_ns": created,
+                "quote_expires_monotonic_ns": detected + 1_000_000_000,
+                "quote_stream_session_id": "risex-dg006",
+                "quote_recovery_generation": 0,
+                "hedge_stream_session_id": "lighter-dg006",
+                "hedge_recovery_generation": 0,
+                "maker_price": "99",
+                "canonical_quantity": "1",
+                "risex_tick_size": "1",
+                "post_only_bound_price": "100",
+                "actual_edge_usd": "1",
+            }
+            records.append(
+                {
+                    "kind": "QUOTE",
+                    **common,
+                    "target_notional_usd": "100",
+                    "target_margin_bps": "1",
+                    "outcome": "QUOTE_ACTIVE",
+                    "observed_monotonic_ns": created,
+                }
+            )
+            records.append(
+                {
+                    "kind": "WOULD_FILL",
+                    "venue": "RISEX",
+                    "fillability_model": model,
+                    **common,
+                    "cumulative_eligible_quantity": "1",
+                    "would_fill_detected_monotonic_ns": detected,
+                    "observed_monotonic_ns": detected,
+                }
+            )
+            for horizon in horizons:
+                records.append(
+                    {
+                        "kind": "HEDGE_HORIZON",
+                        "venue": "LIGHTER",
+                        "fillability_model": model,
+                        **common,
+                        "target_notional_usd": "100",
+                        "target_margin_bps": "1",
+                        "horizon_ms": horizon,
+                        "would_fill_detected_monotonic_ns": detected,
+                        "horizon_deadline_monotonic_ns": (
+                            detected + horizon * 1_000_000
+                        ),
+                        "expected_stream_session_id": "lighter-dg006",
+                        "expected_recovery_generation": 0,
+                        "outcome": "HEDGE_FULL",
+                        "filled_quantity": "1",
+                        "notional_usd": "99",
+                        "entry_edge_usd": "1",
+                        "conditional_markout_usd": "0",
+                        "observed_monotonic_ns": (
+                            detected + horizon * 1_000_000
+                        ),
+                    }
+                )
+    for index, (gap_start, gap_end) in enumerate(gap_windows, start=1):
+        records.append(
+            {
+                "kind": "DATA_GAP",
+                "canonical_market": "BTC",
+                "venue": "LIGHTER",
+                "stream_session_id": "lighter-dg006",
+                "recovery_generation": 0,
+                "gap_start_monotonic_ns": gap_start,
+                "gap_end_monotonic_ns": gap_end,
+                "reason": f"DG006_ROUND_{index}",
+                "observed_monotonic_ns": gap_start,
+            }
+        )
+    records.append(
+        {
+            "kind": "RUN_STOP",
+            "fatal_reason": None,
+            "observed_monotonic_ns": 200_000_000_000,
+        }
+    )
+    store.append_batch(records)
+    path = store.path
+    store.close()
+
+    report = build_report(path)
+    assert report["horizon_record_count"] == 572
+    assert report["strict_raw_episode_count"] == expected["STRICT_LOWER_BOUND"][0]
+    assert report["strict_valid_episode_count"] == expected["STRICT_LOWER_BOUND"][1]
+    assert report["strict_contaminated_episode_count"] == expected["STRICT_LOWER_BOUND"][2]
+    assert report["optimistic_raw_episode_count"] == expected["OPTIMISTIC_UPPER_BOUND"][0]
+    assert report["optimistic_valid_episode_count"] == expected["OPTIMISTIC_UPPER_BOUND"][1]
+    assert report["optimistic_contaminated_episode_count"] == expected["OPTIMISTIC_UPPER_BOUND"][2]
+    for group in report["groups"]:
+        for model, (raw, valid, contaminated) in expected.items():
+            horizon = group["fillability_models"][model]["horizon"]
+            assert horizon["raw_observation_count"] == raw
+            assert horizon["valid_observation_count"] == valid
+            assert horizon["contaminated_observation_count"] == contaminated
+    assert build_report(path) == report

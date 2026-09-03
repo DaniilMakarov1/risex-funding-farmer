@@ -164,6 +164,9 @@ class SampleStopSignal:
     eligible_trade_count: int
     optimistic_episode_count: int = 0
     integrity_reason: str | None = None
+    material_policy_id: str | None = None
+    material_valid_strict_episode_count: int = 0
+    material_detection_timestamp_count: int = 0
 
     def __post_init__(self) -> None:
         reason = self.reason if isinstance(self.reason, SampleStopReason) else SampleStopReason(self.reason)
@@ -179,6 +182,31 @@ class SampleStopSignal:
             raise ValueError("integrity_reason must be non-empty when supplied")
         if reason is SampleStopReason.INTEGRITY_FAILURE and self.integrity_reason is None:
             raise ValueError("integrity stop requires an integrity reason")
+        if self.material_policy_id is not None and (
+            not isinstance(self.material_policy_id, str) or not self.material_policy_id
+        ):
+            raise ValueError("material_policy_id must be a non-empty string when supplied")
+        for value, name in (
+            (
+                self.material_valid_strict_episode_count,
+                "material_valid_strict_episode_count",
+            ),
+            (
+                self.material_detection_timestamp_count,
+                "material_detection_timestamp_count",
+            ),
+        ):
+            _non_negative_int(value, name)
+        if self.material_policy_id is None and any(
+            value
+            for value in (
+                self.material_valid_strict_episode_count,
+                self.material_detection_timestamp_count,
+            )
+        ):
+            raise ValueError(
+                "material counts require material_policy_id"
+            )
 
     @property
     def stop_reason(self) -> SampleStopReason:
@@ -739,6 +767,9 @@ class DataGapEvidence:
     protocol_frame_category: str | None = None
     protocol_frame_length: int | None = None
     protocol_frame_sha256: str | None = None
+    transport_event: str | None = None
+    transport_failure_class: str | None = None
+    transport_exception_type: str | None = None
 
     def __post_init__(self) -> None:
         venue = self.source_venue if isinstance(self.source_venue, Venue) else Venue(self.source_venue)
@@ -783,6 +814,40 @@ class DataGapEvidence:
                 or any(character not in "0123456789abcdef" for character in digest)
             ):
                 raise ValueError("protocol_frame_sha256 must be a lowercase SHA-256 digest")
+        if self.transport_event is not None:
+            if self.transport_event not in {
+                "GRACEFUL_CLOSE",
+                "RECONNECT",
+                "UNEXPECTED_FAILURE",
+            }:
+                raise ValueError("unsupported transport event")
+        if self.transport_failure_class is not None:
+            if self.transport_failure_class not in {
+                "TIMEOUT",
+                "RESET",
+                "ERROR",
+                "EXCEPTION",
+            }:
+                raise ValueError("unsupported transport failure class")
+            if self.transport_event != "UNEXPECTED_FAILURE":
+                raise ValueError(
+                    "transport failure class requires unexpected transport failure"
+                )
+        if self.transport_exception_type is not None:
+            if (
+                not isinstance(self.transport_exception_type, str)
+                or not self.transport_exception_type
+                or len(self.transport_exception_type) > 64
+                or any(
+                    ord(character) < 0x20 or ord(character) > 0x7E
+                    for character in self.transport_exception_type
+                )
+            ):
+                raise ValueError("transport exception type must be bounded printable ASCII")
+            if self.transport_event != "UNEXPECTED_FAILURE":
+                raise ValueError(
+                    "transport exception type requires unexpected transport failure"
+                )
 
     @property
     def venue(self) -> Venue:

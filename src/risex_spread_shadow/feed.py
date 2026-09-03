@@ -1,4 +1,4 @@
-"""Limited RISEx/Lighter public feed ingress for SS-001F."""
+"""Limited RISEx/Lighter public feed ingress for SS-001H."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import time
 from typing import Any, Callable
 
 import aiohttp
+from aiohttp import WSCloseCode
 
 from risex_farmer.exchanges.lighter import LighterAdapter
 from risex_farmer.exchanges.risex import RisexAdapter
@@ -25,6 +26,41 @@ from .models import BookEvidence, DataGapEvidence, TradeEvidence
 
 _DRAIN_SCHEDULING_ALLOWANCE_SECONDS = 1.2
 _PROTOCOL_FRAME_LENGTH_CAP = 65_536
+_NORMAL_CLOSE_CODE = int(WSCloseCode.OK)
+
+
+class _UnexpectedPublicClose(ConnectionError):
+    """Sanitized marker for a close without the normal WebSocket code."""
+
+
+def _transport_failure_class(exc: BaseException) -> str:
+    """Classify transport failures without retaining exception details."""
+
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return "TIMEOUT"
+    if isinstance(
+        exc,
+        (
+            ConnectionResetError,
+            ConnectionAbortedError,
+            BrokenPipeError,
+        ),
+    ):
+        return "RESET"
+    if isinstance(exc, ConnectionError):
+        return "ERROR"
+    return "EXCEPTION"
+
+
+def _sanitized_exception_type(exc: BaseException) -> str:
+    """Return only a bounded printable exception type, never its message."""
+
+    value = type(exc).__name__
+    sanitized = "".join(
+        character if 0x20 <= ord(character) <= 0x7E else "?"
+        for character in value
+    )
+    return sanitized[:64] or "UNKNOWN"
 
 
 def _protocol_frame_evidence(data: Any) -> tuple[int, str]:
@@ -125,6 +161,7 @@ class IngressQueue:
         self._wake = asyncio.Event()
         self._latched: dict[tuple[Venue, str, str | int, int], DataGapEvidence] = {}
         self._closed = False
+        self._offer_serial = 0
 
     @property
     def capacity(self) -> int:
@@ -141,6 +178,12 @@ class IngressQueue:
     @property
     def has_pending(self) -> bool:
         return bool(self._latched) or not self._queue.empty()
+
+    @property
+    def offer_serial(self) -> int:
+        """Monotonic count used by the observer's idle-queue watermark."""
+
+        return self._offer_serial
 
     @staticmethod
     def _item_gap(item: IngressItem) -> DataGapEvidence:
@@ -190,6 +233,21 @@ class IngressQueue:
             ),
             None,
         )
+        transport_gap = next(
+            (
+                candidate
+                for candidate in (gap, previous)
+                if candidate.transport_event == "UNEXPECTED_FAILURE"
+            ),
+            next(
+                (
+                    candidate
+                    for candidate in (previous, gap)
+                    if candidate.transport_event is not None
+                ),
+                None,
+            ),
+        )
         self._latched[identity] = DataGapEvidence(
             source_venue=previous.source_venue,
             canonical_market=previous.canonical_market,
@@ -212,11 +270,25 @@ class IngressQueue:
             protocol_frame_sha256=(
                 None if protocol_gap is None else protocol_gap.protocol_frame_sha256
             ),
+            transport_event=(
+                None if transport_gap is None else transport_gap.transport_event
+            ),
+            transport_failure_class=(
+                None
+                if transport_gap is None
+                else transport_gap.transport_failure_class
+            ),
+            transport_exception_type=(
+                None
+                if transport_gap is None
+                else transport_gap.transport_exception_type
+            ),
         )
 
     def offer(self, item: IngressItem) -> bool:
         """Enqueue without waiting; an overflow always latches explicit gap evidence."""
 
+        self._offer_serial += 1
         if self._closed:
             self._latch(self._item_gap(item))
             self._wake.set()
@@ -350,16 +422,18 @@ class PublicFeedRunner:
         session_id: str | int | None = None,
         recovery_generation: int | None = None,
         protocol_evidence: Mapping[str, Any] | None = None,
+        transport_evidence: Mapping[str, Any] | None = None,
     ) -> None:
         if session_id is None:
             session_id = state.session_id
         if session_id is None:
-            if protocol_evidence is None:
+            if protocol_evidence is None and transport_evidence is None:
                 return
             session_id = "unknown"
         if recovery_generation is None:
             recovery_generation = state.recovery_generation
         protocol_fields = {} if protocol_evidence is None else dict(protocol_evidence)
+        transport_fields = {} if transport_evidence is None else dict(transport_evidence)
         self.ingress.offer(
             FeedGapEvent(
                 DataGapEvidence(
@@ -375,6 +449,13 @@ class PublicFeedRunner:
                     protocol_frame_category=protocol_fields.get("protocol_frame_category"),
                     protocol_frame_length=protocol_fields.get("protocol_frame_length"),
                     protocol_frame_sha256=protocol_fields.get("protocol_frame_sha256"),
+                    transport_event=transport_fields.get("transport_event"),
+                    transport_failure_class=transport_fields.get(
+                        "transport_failure_class"
+                    ),
+                    transport_exception_type=transport_fields.get(
+                        "transport_exception_type"
+                    ),
                 )
             )
         )
@@ -392,9 +473,14 @@ class PublicFeedRunner:
                     reason="PUBLIC_SOCKET_RECONNECTED",
                     session_id=old_session,
                     recovery_generation=old_generation,
+                    transport_evidence={"transport_event": "RECONNECT"},
                 )
                 state.recovery_generation += 1
             elif state.session_id is not None:
+                # disconnect() already persisted the old identity's transport
+                # gap.  Reusing that identity here only advances the recovery
+                # generation; emitting another gap would double-count one
+                # graceful rollover.
                 state.recovery_generation += 1
             state.stream.disconnected()
             state.session_id = session_id
@@ -402,13 +488,45 @@ class PublicFeedRunner:
             state.awaiting_snapshot = True
             state.stream.connected(now)
 
-    def disconnect(self, venue: Venue, *, reason: str = "PUBLIC_SOCKET_DISCONNECTED") -> None:
+    def disconnect(
+        self,
+        venue: Venue,
+        *,
+        reason: str = "PUBLIC_SOCKET_DISCONNECTED",
+        transport_evidence: Mapping[str, Any] | None = None,
+    ) -> None:
         for pair in self.market_pairs:
             state = self.state(venue, pair.canonical_market)
             if not state.connected:
                 continue
-            self._gap(state, reason=reason)
+            self._gap(
+                state,
+                reason=reason,
+                transport_evidence=transport_evidence,
+            )
             state.stream.disconnected()
+            state.connected = False
+            state.awaiting_snapshot = True
+
+    def _record_transport_failure(self, venue: Venue, exc: BaseException) -> None:
+        """Persist one sanitized unexpected transport failure and halt closed."""
+
+        self.fatal_reason = "PUBLIC_SOCKET_TRANSPORT_FAILURE"
+        if self._external_stop_event is not None:
+            self._external_stop_event.set()
+        evidence = {
+            "transport_event": "UNEXPECTED_FAILURE",
+            "transport_failure_class": _transport_failure_class(exc),
+            "transport_exception_type": _sanitized_exception_type(exc),
+        }
+        for pair in self.market_pairs:
+            state = self.state(venue, pair.canonical_market)
+            self._gap(
+                state,
+                reason="PUBLIC_SOCKET_DISCONNECTED",
+                transport_evidence=evidence,
+            )
+            state.stream.gap()
             state.connected = False
             state.awaiting_snapshot = True
 
@@ -751,7 +869,17 @@ class PublicFeedRunner:
         if value is None:
             return "TEXT"
         enum_name = getattr(value, "name", None)
-        if enum_name in {"BINARY", "CONTINUATION"}:
+        if enum_name in {
+            "BINARY",
+            "CONTINUATION",
+            "CLOSE",
+            "CLOSED",
+            "CLOSING",
+            "ERROR",
+            "PING",
+            "PONG",
+            "TEXT",
+        }:
             return enum_name
         text = str(value)
         if text.endswith("TEXT") or text in {"1", "TEXT"}:
@@ -760,15 +888,43 @@ class PublicFeedRunner:
             return "PING"
         if text.endswith("PONG") or text in {"10", "PONG"}:
             return "PONG"
-        if text.endswith(("CLOSE", "CLOSED", "CLOSING")) or text in {
-            "8", "CLOSE", "CLOSED", "CLOSING"
-        }:
+        if text.endswith("CLOSED") or text in {"257", "CLOSED"}:
+            return "CLOSED"
+        if text.endswith("CLOSING") or text in {"256", "CLOSING"}:
+            return "CLOSING"
+        if text.endswith("CLOSE") or text in {"8", "CLOSE"}:
             return "CLOSE"
         if text.endswith("ERROR") or text in {"ERROR"}:
             return "ERROR"
         return text.upper()
 
-    async def _read_risex(self, ws: Any, stop: asyncio.Event) -> None:
+    @staticmethod
+    def _normal_close_code(ws: Any, message: Any, kind: str) -> bool:
+        """Accept only aiohttp's explicit protocol-normal close code."""
+
+        if kind == "CLOSE":
+            code = getattr(message, "data", None)
+        elif kind == "CLOSED":
+            # aiohttp emits CLOSED with no frame data after EOF, but records
+            # the observed close code on the response itself.  No such
+            # response-level code exists on an unknown/malformed fixture.
+            code = getattr(ws, "close_code", None)
+        else:
+            # CLOSING means the close handshake is incomplete; it carries no
+            # demonstrably normal peer close code.
+            return False
+        return (
+            isinstance(code, int)
+            and not isinstance(code, bool)
+            and code == _NORMAL_CLOSE_CODE
+        )
+
+    def _unexpected_close(self, venue: Venue) -> None:
+        """Persist sanitized unexpected-close evidence and fail closed."""
+
+        self._record_transport_failure(venue, _UnexpectedPublicClose())
+
+    async def _read_risex(self, ws: Any, stop: asyncio.Event) -> str | None:
         while not stop.is_set():
             try:
                 message = await asyncio.wait_for(
@@ -785,8 +941,11 @@ class PublicFeedRunner:
                 if action.connection_confirmed:
                     self._confirm_venue(Venue.RISEX)
                 continue
-            elif kind == "CLOSE":
-                return
+            elif kind in {"CLOSE", "CLOSED", "CLOSING"}:
+                if self._normal_close_code(ws, message, kind):
+                    return "GRACEFUL_CLOSE"
+                self._unexpected_close(Venue.RISEX)
+                return "UNEXPECTED_CLOSE"
             elif kind == "PONG":
                 self._confirm_venue(Venue.RISEX)
             elif kind == "ERROR":
@@ -818,7 +977,7 @@ class PublicFeedRunner:
                 )
                 return
 
-    async def _read_lighter(self, ws: Any, stop: asyncio.Event) -> None:
+    async def _read_lighter(self, ws: Any, stop: asyncio.Event) -> str | None:
         while not stop.is_set():
             try:
                 message = await asyncio.wait_for(ws.receive(), timeout=10)
@@ -831,8 +990,11 @@ class PublicFeedRunner:
                 await ws.pong(getattr(message, "data", b""))
                 self._confirm_venue(Venue.LIGHTER)
                 continue
-            if kind == "CLOSE":
-                return
+            if kind in {"CLOSE", "CLOSED", "CLOSING"}:
+                if self._normal_close_code(ws, message, kind):
+                    return "GRACEFUL_CLOSE"
+                self._unexpected_close(Venue.LIGHTER)
+                return "UNEXPECTED_CLOSE"
             if kind == "PONG":
                 self._confirm_venue(Venue.LIGHTER)
                 continue
@@ -868,6 +1030,7 @@ class PublicFeedRunner:
     async def _transport_loop(self, venue: Venue, stop: asyncio.Event) -> None:
         while not stop.is_set():
             try:
+                termination: str | None = None
                 if venue is Venue.RISEX:
                     async with self.session.ws_connect(
                         self.risex.ws_base, heartbeat=None, autoping=False
@@ -879,7 +1042,7 @@ class PublicFeedRunner:
                         ]
                         await ws.send_json(self.risex.orderbook_subscription(ids))
                         await ws.send_json(self.risex.trades_subscription(ids))
-                        await self._read_risex(ws, stop)
+                        termination = await self._read_risex(ws, stop)
                 else:
                     async with self.session.ws_connect(
                         self.lighter.ws_base, heartbeat=None, autoping=False
@@ -891,19 +1054,33 @@ class PublicFeedRunner:
                                     "book", self.lighter.market_id(pair.lighter_market.venue_symbol)
                                 )
                             )
-                        await self._read_lighter(ws, stop)
+                        termination = await self._read_lighter(ws, stop)
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 if not stop.is_set():
-                    self.disconnect(venue, reason="PUBLIC_SOCKET_DISCONNECTED")
-                    try:
-                        await asyncio.wait_for(stop.wait(), timeout=1)
-                    except asyncio.TimeoutError:
-                        pass
+                    self._record_transport_failure(venue, exc)
+                    stop.set()
             else:
                 if not stop.is_set():
-                    self.disconnect(venue, reason="PUBLIC_SOCKET_DISCONNECTED")
+                    if self.fatal_reason is not None:
+                        stop.set()
+                    elif termination == "GRACEFUL_CLOSE":
+                        self.disconnect(
+                            venue,
+                            reason="PUBLIC_SOCKET_DISCONNECTED",
+                            transport_evidence={"transport_event": "GRACEFUL_CLOSE"},
+                        )
+                        # Reconnect is intentionally a new session/recovery
+                        # chain.  Preserve the bounded retry pause so a
+                        # close/reconnect loop cannot monopolize the event
+                        # loop or silently join books.
+                        try:
+                            await asyncio.wait_for(stop.wait(), timeout=1)
+                        except asyncio.TimeoutError:
+                            pass
+                    else:
+                        self.disconnect(venue, reason="PUBLIC_SOCKET_DISCONNECTED")
 
     async def run(
         self,

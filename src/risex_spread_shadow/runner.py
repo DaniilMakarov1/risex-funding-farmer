@@ -1,4 +1,4 @@
-"""The single SS-001G observer, evidence path, and public-smoke orchestration."""
+"""The single SS-001H observer, evidence path, and public-smoke orchestration."""
 
 from __future__ import annotations
 
@@ -60,6 +60,8 @@ from .store import AppendOnlyEvidenceStore, EvidenceStorageLimitExceeded
 
 _SHUTDOWN_TIMEOUT_SECONDS = 2.0
 _TERMINAL_KINDS = frozenset({"RUN_STOP", "RUN_FAILED"})
+_MATERIAL_VALID_STRICT_EPISODE_LIMIT = 10
+_MATERIAL_DETECTION_TIMESTAMP_LIMIT = 5
 
 
 class HistoryCapacityExceeded(RuntimeError):
@@ -177,7 +179,13 @@ def _apply_history_record(
 
 @dataclass(slots=True)
 class SampleStopController:
-    """Latch the first prospective SS-001D sample-stop condition."""
+    """Latch the first prospective SS-001H sample-stop condition.
+
+    Strict episodes are retained as a raw diagnostic counter, but they are no
+    longer an aggregate stop condition.  The strict stop is earned only by a
+    single exact policy after its completed, currently valid episodes reach
+    the frozen count and detection-timestamp thresholds.
+    """
 
     started_monotonic_ns: int
     strict_episode_limit: int = 50
@@ -187,6 +195,9 @@ class SampleStopController:
     eligible_trade_count: int = 0
     optimistic_episode_count: int = 0
     signal: SampleStopSignal | None = None
+    material_valid_strict_episode_limit: int = _MATERIAL_VALID_STRICT_EPISODE_LIMIT
+    material_detection_timestamp_limit: int = _MATERIAL_DETECTION_TIMESTAMP_LIMIT
+    _material_episodes: dict[str, dict[str, int]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         for value, name in (
@@ -206,6 +217,67 @@ class SampleStopController:
             raise ValueError("eligible_trade_limit must be positive")
         if self.wall_clock_limit_ns <= 0:
             raise ValueError("wall_clock_limit_ns must be positive")
+        if (
+            isinstance(self.material_valid_strict_episode_limit, bool)
+            or not isinstance(self.material_valid_strict_episode_limit, int)
+            or self.material_valid_strict_episode_limit <= 0
+        ):
+            raise ValueError("material valid strict episode limit must be positive")
+        if (
+            isinstance(self.material_detection_timestamp_limit, bool)
+            or not isinstance(self.material_detection_timestamp_limit, int)
+            or self.material_detection_timestamp_limit <= 0
+        ):
+            raise ValueError("material detection timestamp limit must be positive")
+
+    def _signal(
+        self,
+        *,
+        reason: SampleStopReason,
+        observed_monotonic_ns: int,
+        integrity_reason: str | None = None,
+        material_policy_id: str | None = None,
+    ) -> SampleStopSignal:
+        material_count = 0
+        timestamp_count = 0
+        if material_policy_id is not None:
+            episodes = self._material_episodes[material_policy_id]
+            material_count = len(episodes)
+            timestamp_count = len(set(episodes.values()))
+        return SampleStopSignal(
+            reason=reason,
+            observed_monotonic_ns=observed_monotonic_ns,
+            strict_episode_count=self.strict_episode_count,
+            eligible_trade_count=self.eligible_trade_count,
+            optimistic_episode_count=self.optimistic_episode_count,
+            integrity_reason=integrity_reason,
+            material_policy_id=material_policy_id,
+            material_valid_strict_episode_count=material_count,
+            material_detection_timestamp_count=timestamp_count,
+        )
+
+    def _observe_non_material_stop(
+        self,
+        *,
+        observed_monotonic_ns: int,
+        integrity_reason: str | None,
+    ) -> SampleStopSignal | None:
+        """Evaluate only the unchanged eligible/wall/integrity stops."""
+
+        if integrity_reason is not None:
+            reason = SampleStopReason.INTEGRITY_FAILURE
+        elif self.eligible_trade_count >= self.eligible_trade_limit:
+            reason = SampleStopReason.ELIGIBLE_TRADE_LIMIT
+        elif observed_monotonic_ns - self.started_monotonic_ns >= self.wall_clock_limit_ns:
+            reason = SampleStopReason.WALL_CLOCK_LIMIT
+        else:
+            return None
+        self.signal = self._signal(
+            reason=reason,
+            observed_monotonic_ns=observed_monotonic_ns,
+            integrity_reason=integrity_reason,
+        )
+        return self.signal
 
     def observe(
         self,
@@ -236,27 +308,78 @@ class SampleStopController:
         self.strict_episode_count += strict_episode_increment
         self.eligible_trade_count += eligible_trade_increment
         self.optimistic_episode_count += optimistic_episode_increment
-
-        # Integrity wins a same-observation tie because it is a safety stop.
-        if integrity_reason is not None:
-            reason = SampleStopReason.INTEGRITY_FAILURE
-        elif self.strict_episode_count >= self.strict_episode_limit:
-            reason = SampleStopReason.STRICT_EPISODE_LIMIT
-        elif self.eligible_trade_count >= self.eligible_trade_limit:
-            reason = SampleStopReason.ELIGIBLE_TRADE_LIMIT
-        elif observed_monotonic_ns - self.started_monotonic_ns >= self.wall_clock_limit_ns:
-            reason = SampleStopReason.WALL_CLOCK_LIMIT
-        else:
-            return None
-        self.signal = SampleStopSignal(
-            reason=reason,
+        return self._observe_non_material_stop(
             observed_monotonic_ns=observed_monotonic_ns,
-            strict_episode_count=self.strict_episode_count,
-            eligible_trade_count=self.eligible_trade_count,
-            optimistic_episode_count=self.optimistic_episode_count,
             integrity_reason=integrity_reason,
         )
-        return self.signal
+
+    def observe_material(
+        self,
+        *,
+        policy_id: str,
+        episode_id: str,
+        detection_monotonic_ns: int,
+        observed_monotonic_ns: int,
+    ) -> SampleStopSignal | None:
+        """Record one completed valid strict episode for its exact policy."""
+
+        if not isinstance(policy_id, str) or not policy_id:
+            raise ValueError("material policy_id must be a non-empty string")
+        if not isinstance(episode_id, str) or not episode_id:
+            raise ValueError("material episode_id must be a non-empty string")
+        if (
+            isinstance(detection_monotonic_ns, bool)
+            or not isinstance(detection_monotonic_ns, int)
+            or detection_monotonic_ns < self.started_monotonic_ns
+        ):
+            raise ValueError("material detection timestamp must be an in-range integer")
+        if (
+            isinstance(observed_monotonic_ns, bool)
+            or not isinstance(observed_monotonic_ns, int)
+            or observed_monotonic_ns < detection_monotonic_ns
+        ):
+            raise ValueError(
+                "material observed timestamp must not precede detection timestamp"
+            )
+        if self.signal is not None:
+            return self.signal
+        episodes = self._material_episodes.setdefault(policy_id, {})
+        episodes.setdefault(episode_id, detection_monotonic_ns)
+        candidates = tuple(
+            candidate
+            for candidate in sorted(self._material_episodes)
+            if len(self._material_episodes[candidate])
+            >= self.material_valid_strict_episode_limit
+            and len(set(self._material_episodes[candidate].values()))
+            >= self.material_detection_timestamp_limit
+        )
+        if candidates:
+            self.signal = self._signal(
+                reason=SampleStopReason.STRICT_EPISODE_LIMIT,
+                observed_monotonic_ns=observed_monotonic_ns,
+                material_policy_id=candidates[0],
+            )
+            return self.signal
+        return self._observe_non_material_stop(
+            observed_monotonic_ns=observed_monotonic_ns,
+            integrity_reason=None,
+        )
+
+    def invalidate_material(self, *, policy_id: str, episode_id: str) -> None:
+        """Remove a late-contaminated candidate before a stop is latched."""
+
+        if self.signal is not None:
+            return
+        episodes = self._material_episodes.get(policy_id)
+        if episodes is None:
+            return
+        episodes.pop(episode_id, None)
+        if not episodes:
+            self._material_episodes.pop(policy_id, None)
+
+    def material_counts(self, policy_id: str) -> tuple[int, int]:
+        episodes = self._material_episodes.get(policy_id, {})
+        return len(episodes), len(set(episodes.values()))
 
     def observe_counts(
         self,
@@ -562,6 +685,20 @@ class _PendingEpisode:
     captures: dict[int, HedgeHorizonCapture] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class _MaterialCandidate:
+    """Compact identity retained for late gap invalidation."""
+
+    version_id: str
+    market: str
+    quote_created: int
+    detected: int
+    risex_stream_session: str | int | None
+    risex_recovery: int | None
+    hedge_stream_session: str | int | None
+    hedge_recovery: int | None
+
+
 class SpreadObserver:
     """Consumes accepted feed events and persists one deterministic evidence path."""
 
@@ -599,6 +736,15 @@ class SpreadObserver:
         self._trades: dict[str, dict[str, TradeEvidence]] = {}
         self._pending: dict[str, _PendingEpisode] = {}
         self._optimistic_pending: dict[str, _PendingEpisode] = {}
+        # Strict episodes remain available until the run ends so a late
+        # matching gap can remove a not-yet-counted material candidate.  The
+        # bounded prospective episode cap keeps this memory finite.  Retain
+        # only exact gap-matching identity after the four captures complete;
+        # do not keep potentially large hedge books alive for the whole run.
+        self._material_candidates: dict[str, tuple[str, _MaterialCandidate]] = {}
+        self._material_boundary_task: asyncio.Task[None] | None = None
+        self._material_finalize_lock = asyncio.Lock()
+        self._handling_item = 0
         # One completed model/version must not be rediscovered while its
         # quote remains active.  The map is keyed by the fixed policy grid,
         # so it stays bounded while allowing a replacement quote version to
@@ -695,6 +841,94 @@ class SpreadObserver:
     def _refresh_horizon_drain_event(self) -> None:
         if self._sample_frozen and not self._pending and not self._optimistic_pending:
             self._horizon_drain_event.set()
+
+    def _schedule_material_stop_boundary(self) -> None:
+        """Schedule one stable idle-queue watermark for material candidates."""
+
+        if (
+            self._sample_frozen
+            or self.fatal_reason is not None
+            or not self._material_candidates
+            or self._material_boundary_task is not None
+        ):
+            return
+        self._material_boundary_task = asyncio.create_task(
+            self._material_stop_boundary()
+        )
+
+    async def _material_stop_boundary(self) -> None:
+        """Wait across an idle turn before publishing a material stop.
+
+        A fourth horizon can complete before a matching gap already offered by
+        the feed reaches the observer.  The stable offer serial plus an empty
+        ingress and no active consumer item form the bounded queue watermark:
+        all evidence offered through that serial has been handled, while an
+        offer arriving during the settling turn cancels this attempt.
+        """
+
+        try:
+            await asyncio.sleep(0)
+            watermark = self.ingress.offer_serial
+            await asyncio.sleep(0)
+            if (
+                self._handling_item
+                or self.ingress.has_pending
+                or self.ingress.offer_serial != watermark
+            ):
+                return
+            await self._finalize_material_stop(
+                observed_monotonic_ns=max(
+                    self._sample_stop.started_monotonic_ns,
+                    self._monotonic_ns(),
+                )
+            )
+        finally:
+            self._material_boundary_task = None
+
+    async def _finalize_material_stop(
+        self,
+        *,
+        observed_monotonic_ns: int,
+    ) -> dict[str, Any] | None:
+        """Count only candidates clean at the queue/watermark boundary."""
+
+        async with self._material_finalize_lock:
+            if self._sample_frozen or self.fatal_reason is not None:
+                return None
+            if (
+                isinstance(observed_monotonic_ns, bool)
+                or not isinstance(observed_monotonic_ns, int)
+            ):
+                raise TypeError("material observed timestamp must be int")
+            for version_id, (policy_id, candidate) in tuple(
+                self._material_candidates.items()
+            ):
+                if not self._gap_overlaps_material_candidate_is_clean(candidate):
+                    self._sample_stop.invalidate_material(
+                        policy_id=policy_id,
+                        episode_id=version_id,
+                    )
+                    self._material_candidates.pop(version_id, None)
+                    continue
+                signal = self._sample_stop.observe_material(
+                    policy_id=policy_id,
+                    episode_id=version_id,
+                    detection_monotonic_ns=candidate.detected,
+                    observed_monotonic_ns=max(
+                        observed_monotonic_ns,
+                        candidate.detected,
+                    ),
+                )
+                if signal is None:
+                    continue
+                self._sample_frozen = True
+                self._sample_stop_event.set()
+                self._refresh_horizon_drain_event()
+                record = self._sample_stop_record(signal)
+                if record is not None:
+                    await self._append((record,))
+                return record
+        return None
 
     @property
     def pending_record_count(self) -> int:
@@ -985,6 +1219,12 @@ class SpreadObserver:
                     "protocol_frame_sha256": gap.protocol_frame_sha256,
                 }
             )
+        if gap.transport_event is not None:
+            record["transport_event"] = gap.transport_event
+        if gap.transport_failure_class is not None:
+            record["transport_failure_class"] = gap.transport_failure_class
+        if gap.transport_exception_type is not None:
+            record["transport_exception_type"] = gap.transport_exception_type
         return record
 
     def _book_admissible(self, event: FeedBookEvent) -> bool:
@@ -1198,6 +1438,13 @@ class SpreadObserver:
             "optimistic_episode_count": signal.optimistic_episode_count,
             "eligible_trade_count": signal.eligible_trade_count,
             "integrity_reason": signal.integrity_reason,
+            "material_policy_id": signal.material_policy_id,
+            "material_valid_strict_episode_count": (
+                signal.material_valid_strict_episode_count
+            ),
+            "material_detection_timestamp_count": (
+                signal.material_detection_timestamp_count
+            ),
             "observed_monotonic_ns": signal.observed_monotonic_ns,
         }
 
@@ -1222,6 +1469,154 @@ class SpreadObserver:
             self._sample_stop_event.set()
             self._refresh_horizon_drain_event()
         return self._sample_stop_record(signal)
+
+    def _gap_overlaps_pending_episode(
+        self,
+        gap: DataGapEvidence,
+        pending: _PendingEpisode,
+    ) -> bool:
+        """Check only the venue-local interval a candidate actually uses."""
+
+        version = pending.version
+        evidence = pending.would_fill
+        if gap.source_venue is Venue.RISEX:
+            return gap.matches(
+                Venue.RISEX,
+                version.canonical_market,
+                version.stream_session_id,
+                version.recovery_generation,
+            ) and gap.overlaps(
+                version.quote_created_monotonic_ns,
+                evidence.would_fill_detected_monotonic_ns,
+            )
+        if gap.source_venue is Venue.LIGHTER:
+            session = (
+                evidence.hedge_stream_session_id
+                or version.hedge_stream_session_id
+            )
+            recovery = (
+                evidence.hedge_recovery_generation
+                if evidence.hedge_recovery_generation is not None
+                else version.hedge_recovery_generation
+            )
+            if session is None or recovery is None or not gap.matches(
+                Venue.LIGHTER,
+                evidence.canonical_market,
+                session,
+                recovery,
+            ):
+                return False
+            return any(
+                gap.overlaps(
+                    evidence.would_fill_detected_monotonic_ns,
+                    evidence.would_fill_detected_monotonic_ns + horizon * 1_000_000,
+                )
+                for horizon in self.config.horizons_ms
+            )
+        return False
+
+    def _gap_overlaps_material_candidate(
+        self,
+        gap: DataGapEvidence,
+        candidate: _MaterialCandidate,
+    ) -> bool:
+        """Apply the same venue-local interval rule to compact identity."""
+
+        if gap.source_venue is Venue.RISEX:
+            if candidate.risex_stream_session is None or candidate.risex_recovery is None:
+                return False
+            return gap.matches(
+                Venue.RISEX,
+                candidate.market,
+                candidate.risex_stream_session,
+                candidate.risex_recovery,
+            ) and gap.overlaps(candidate.quote_created, candidate.detected)
+        if gap.source_venue is Venue.LIGHTER:
+            if (
+                candidate.hedge_stream_session is None
+                or candidate.hedge_recovery is None
+            ):
+                return False
+            if not gap.matches(
+                Venue.LIGHTER,
+                candidate.market,
+                candidate.hedge_stream_session,
+                candidate.hedge_recovery,
+            ):
+                return False
+            return any(
+                gap.overlaps(
+                    candidate.detected,
+                    candidate.detected + horizon * 1_000_000,
+                )
+                for horizon in self.config.horizons_ms
+            )
+        return False
+
+    def _gap_overlaps_material_candidate_is_clean(
+        self,
+        candidate: _MaterialCandidate,
+    ) -> bool:
+        return not any(
+            self._gap_overlaps_material_candidate(gap, candidate)
+            for gap in self.history.gaps()
+        )
+
+    def _pending_is_material_valid(self, pending: _PendingEpisode) -> bool:
+        """Return whether all four completed captures are clean evidence."""
+
+        if set(pending.captures) != set(self.config.horizons_ms):
+            return False
+        if any(
+            capture.outcome
+            in {
+                EntryViabilityOutcome.HEDGE_DATA_GAP,
+                EntryViabilityOutcome.HEDGE_OUTCOME_UNKNOWN,
+            }
+            or capture.gap_evidence is not None
+            for capture in pending.captures.values()
+        ):
+            return False
+        return not any(
+            self._gap_overlaps_pending_episode(gap, pending)
+            for gap in self.history.gaps()
+        )
+
+    def _observe_material_stop(
+        self,
+        *,
+        policy_id: str,
+        pending: _PendingEpisode,
+    ) -> None:
+        if pending.version.direction not in (
+            SpreadDirection.RISEX_BUY_LIGHTER_SELL,
+            SpreadDirection.RISEX_SELL_LIGHTER_BUY,
+        ):
+            return
+        if not self._pending_is_material_valid(pending):
+            return
+        version_id = pending.version.version_id
+        self._material_candidates[version_id] = (
+            policy_id,
+            _MaterialCandidate(
+                version_id=version_id,
+                market=pending.version.canonical_market,
+                quote_created=pending.version.quote_created_monotonic_ns,
+                detected=pending.would_fill.would_fill_detected_monotonic_ns,
+                risex_stream_session=pending.version.stream_session_id,
+                risex_recovery=pending.version.recovery_generation,
+                hedge_stream_session=(
+                    pending.would_fill.hedge_stream_session_id
+                    or pending.version.hedge_stream_session_id
+                ),
+                hedge_recovery=(
+                    pending.would_fill.hedge_recovery_generation
+                    if pending.would_fill.hedge_recovery_generation is not None
+                    else pending.version.hedge_recovery_generation
+                ),
+            ),
+        )
+        self._schedule_material_stop_boundary()
 
     async def trigger_wall_clock_stop(self) -> None:
         """Persist the wall-clock stop even when the public feed is silent."""
@@ -1471,6 +1866,11 @@ class SpreadObserver:
 
     async def handle_gap(self, event: FeedGapEvent) -> None:
         gap = event.gap
+        if gap.transport_event == "UNEXPECTED_FAILURE" or gap.reason == "PUBLIC_SOCKET_TRANSPORT_FAILURE":
+            # A graceful CLOSE is a bounded data gap.  An unexpected socket
+            # failure is a terminal measurement-integrity condition even when
+            # it arrived as an otherwise well-formed gap event.
+            self.fatal_reason = "PUBLIC_SOCKET_TRANSPORT_FAILURE"
         if self._sample_frozen and gap.source_venue is not Venue.LIGHTER:
             return
         stream_key = (gap.source_venue, gap.canonical_market)
@@ -1481,6 +1881,13 @@ class SpreadObserver:
         self._awaiting_fresh_snapshot.add(stream_key)
         self.history.add_gap(gap)
         self._current_books.pop((gap.source_venue, gap.canonical_market), None)
+        for version_id, (policy_id, candidate) in tuple(self._material_candidates.items()):
+            if self._gap_overlaps_material_candidate(gap, candidate):
+                self._sample_stop.invalidate_material(
+                    policy_id=policy_id,
+                    episode_id=version_id,
+                )
+                self._material_candidates.pop(version_id, None)
         for policy_key in tuple(self._active_versions):
             if policy_key.startswith(f"{gap.canonical_market}|"):
                 self._active_versions.pop(policy_key, None)
@@ -1749,8 +2156,19 @@ class SpreadObserver:
         while True:
             item = await self.ingress.next_item()
             if item is None:
+                await self._finalize_material_stop(
+                    observed_monotonic_ns=max(
+                        self._sample_stop.started_monotonic_ns,
+                        self._monotonic_ns(),
+                    )
+                )
                 return
-            await self.handle_item(item)
+            self._handling_item += 1
+            try:
+                await self.handle_item(item)
+            finally:
+                self._handling_item -= 1
+            self._schedule_material_stop_boundary()
 
     async def _capture_one(
         self,
@@ -1831,6 +2249,11 @@ class SpreadObserver:
         pending.captures[horizon] = capture
         await self._append((self._horizon_record(pending.version, capture),))
         if len(pending.captures) == len(self.config.horizons_ms):
+            if model is FillabilityModel.STRICT_LOWER_BOUND:
+                self._observe_material_stop(
+                    policy_id=self.policy_id(pending.version.quote.policy),
+                    pending=pending,
+                )
             pending_by_version.pop(version_id, None)
             self.history.complete(self._pending_key(model, version_id), self._monotonic_ns())
             self._prune_state(self._monotonic_ns())
@@ -1972,6 +2395,17 @@ class SpreadObserver:
         if was_cancelled:
             raise asyncio.CancelledError
 
+    async def _cancel_material_boundary_and_wait(self) -> None:
+        """Do not leave a deferred material-stop task behind on shutdown."""
+
+        task = self._material_boundary_task
+        if task is None or task is asyncio.current_task():
+            return
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        if self._material_boundary_task is task:
+            self._material_boundary_task = None
+
     async def append_terminal(self, record: Mapping[str, Any]) -> None:
         """Append the sole terminal marker after every prior append is done."""
 
@@ -2000,6 +2434,7 @@ class SpreadObserver:
 
         try:
             await self._cancel_capture_tasks_and_wait()
+            await self._cancel_material_boundary_and_wait()
             await self._stop_batch_loop()
         except BaseException as exc:
             self._terminal_error = exc
@@ -2057,11 +2492,17 @@ class SpreadObserver:
         try:
             await self.flush_pending(force=False)
             await self._cancel_capture_tasks_and_wait()
+            await self._cancel_material_boundary_and_wait()
         except BaseException as exc:
             failure = exc
         finally:
             try:
                 await self._cancel_capture_tasks_and_wait()
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
+            try:
+                await self._cancel_material_boundary_and_wait()
             except BaseException as exc:
                 if failure is None:
                     failure = exc
@@ -2293,6 +2734,12 @@ class ReplayHarness:
         finally:
             self.observer._replay_mode = False
         await self.observer.flush_pending(force=True)
+        await self.observer._finalize_material_stop(
+            observed_monotonic_ns=max(
+                self.observer.sample_started_monotonic_ns,
+                self.observer._monotonic_ns(),
+            )
+        )
         await self.observer.append_terminal(
             {
                 "kind": "RUN_STOP",
@@ -2327,6 +2774,8 @@ async def run_public_smoke(
         "horizons_ms": config.horizons_ms,
         "fillability_models": tuple(model.value for model in FillabilityModel),
         "strict_episode_limit": config.strict_episode_limit,
+        "material_valid_strict_episode_limit": _MATERIAL_VALID_STRICT_EPISODE_LIMIT,
+        "material_detection_timestamp_limit": _MATERIAL_DETECTION_TIMESTAMP_LIMIT,
         "eligible_trade_limit": config.eligible_trade_limit,
         "sample_wall_clock_seconds": config.sample_wall_clock_seconds,
         "freshness_max_age_ns": config.freshness_max_age_ns,

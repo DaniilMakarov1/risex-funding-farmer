@@ -276,6 +276,8 @@ async def test_sample_stop_freezes_economics_and_drains_lighter_horizons(tmp_pat
         store,
         sample_started_monotonic_ns=base,
     )
+    observer._sample_stop.material_valid_strict_episode_limit = 1
+    observer._sample_stop.material_detection_timestamp_limit = 1
     initial = (
         FeedBookEvent(evidence_book(Venue.RISEX, received=base, session="risex"), PAIR, "SNAPSHOT", "fixture"),
         FeedBookEvent(
@@ -333,7 +335,7 @@ async def test_sample_stop_freezes_economics_and_drains_lighter_horizons(tmp_pat
             nonlocal counts_after_stop
             for item in initial:
                 assert self.ingress.offer(item)
-            await asyncio.wait_for(kwargs["stop_event"].wait(), timeout=1)
+            await asyncio.wait_for(kwargs["stop_event"].wait(), timeout=3)
             counts_after_stop = (
                 observer.strict_episode_count,
                 observer.optimistic_episode_count,
@@ -352,8 +354,98 @@ async def test_sample_stop_freezes_economics_and_drains_lighter_horizons(tmp_pat
     assert len(horizons) == 8
     assert all(record["outcome"] == "HEDGE_FULL" for record in horizons)
     delayed = [record for record in horizons if record["horizon_ms"] == 1000]
-    assert delayed and delayed[0]["book_received_monotonic_ns"] == base + 100_000_000
-    assert len([record for record in records if record.get("kind") == "SAMPLE_STOP"]) == 1
+    assert delayed and delayed[0]["book_received_monotonic_ns"] == base
+    stops = [record for record in records if record.get("kind") == "SAMPLE_STOP"]
+    assert len(stops) == 1
+    assert stops[0]["reason"] == "STRICT_EPISODE_LIMIT"
+    assert stops[0]["material_policy_id"] == "BTC|RISEX_BUY_LIGHTER_SELL|100|1"
+    assert stops[0]["material_valid_strict_episode_count"] == 1
+    assert stops[0]["material_detection_timestamp_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_late_matching_gap_invalidates_material_candidate_before_terminal(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store = AppendOnlyEvidenceStore.create(
+        tmp_path,
+        metadata={"source_commit": "fixture", "evidence_mode": "OBSERVATIONAL"},
+    )
+    base = time.monotonic_ns()
+    observer = SpreadObserver(
+        config(strict_episode_limit=1),
+        (PAIR,),
+        store,
+        sample_started_monotonic_ns=base,
+    )
+    observer._sample_stop.material_valid_strict_episode_limit = 1
+    observer._sample_stop.material_detection_timestamp_limit = 1
+    # Hold the explicit boundary so this fixture can deliver a matching gap
+    # after the fourth horizon capture but before any material stop is latched.
+    monkeypatch.setattr(observer, "_schedule_material_stop_boundary", lambda: None)
+
+    await observer.handle_item(
+        FeedBookEvent(
+            evidence_book(Venue.RISEX, received=base, session="risex"),
+            PAIR,
+            "SNAPSHOT",
+            "fixture",
+        )
+    )
+    await observer.handle_item(
+        FeedBookEvent(
+            evidence_book(
+                Venue.LIGHTER,
+                received=base,
+                session="lighter",
+                bids=(("100", "10"),),
+                asks=(("102", "10"),),
+            ),
+            PAIR,
+            "SNAPSHOT",
+            "fixture",
+        )
+    )
+    await observer.handle_item(
+        FeedTradeEvent(trade(received=base + 1), PAIR, "fixture")
+    )
+    await observer.flush_pending(force=False)
+
+    assert observer.pending_episode_count == 0
+    assert len(observer._material_candidates) == 1
+    assert observer.sample_stop_signal is None
+
+    await observer.handle_gap(
+        FeedGapEvent(
+            DataGapEvidence(
+                source_venue=Venue.LIGHTER,
+                canonical_market="BTC",
+                stream_session_id="lighter",
+                recovery_generation=0,
+                gap_start_monotonic_ns=base + 100_000_000,
+                gap_end_monotonic_ns=base + 100_000_001,
+                reason="LATE_MATCHING_GAP",
+            )
+        )
+    )
+    await observer._finalize_material_stop(
+        observed_monotonic_ns=max(base, time.monotonic_ns())
+    )
+
+    assert observer.sample_stop_signal is None
+    assert not observer._sample_frozen
+    assert not observer._material_candidates
+    await observer.append_terminal(
+        {
+            "kind": "RUN_STOP",
+            "fatal_reason": None,
+            "observed_monotonic_ns": max(base, time.monotonic_ns()),
+        }
+    )
+    store.close()
+    records = [json.loads(line) for line in store.path.read_text().splitlines()]
+    assert not any(record.get("kind") == "SAMPLE_STOP" for record in records)
+    assert records[-1]["kind"] == "RUN_STOP"
 
 
 def test_evidence_store_record_cap_reserves_terminal_failure_slot(tmp_path: Path, monkeypatch) -> None:
@@ -951,6 +1043,199 @@ async def test_protocol_failure_evidence_survives_full_or_closing_ingress(
     assert "invalid" not in json.dumps(gap)
     assert records[-1]["kind"] == "RUN_FAILED"
     assert records.index(gap) < len(records) - 1
+
+
+def test_latched_transport_gap_preserves_sanitized_fields() -> None:
+    ingress = IngressQueue(1)
+    queued = FeedBookEvent(
+        evidence_book(Venue.LIGHTER, received=10, session="lighter"),
+        PAIR,
+        "SNAPSHOT",
+        "fixture",
+    )
+    gap = DataGapEvidence(
+        source_venue=Venue.LIGHTER,
+        canonical_market="BTC",
+        stream_session_id="lighter",
+        recovery_generation=0,
+        gap_start_monotonic_ns=20,
+        reason="PUBLIC_SOCKET_DISCONNECTED",
+        transport_event="UNEXPECTED_FAILURE",
+        transport_failure_class="ERROR",
+        transport_exception_type="ConnectionError",
+    )
+    assert ingress.offer(queued)
+    assert not ingress.offer(FeedGapEvent(gap))
+
+    async def drain():
+        return await ingress.next_item(), await ingress.next_item()
+
+    first, second = asyncio.run(drain())
+    assert isinstance(first, FeedGapEvent)
+    assert isinstance(second, FeedBookEvent)
+    assert first.gap.transport_event == "UNEXPECTED_FAILURE"
+    assert first.gap.transport_failure_class == "ERROR"
+    assert first.gap.transport_exception_type == "ConnectionError"
+
+
+def test_reconnect_starts_new_identity_and_requires_a_fresh_snapshot() -> None:
+    class FakeRisex:
+        @staticmethod
+        def market_id(_symbol):
+            return 1
+
+    class FakeLighter:
+        @staticmethod
+        def market_id(_symbol):
+            return 2
+
+    runner = PublicFeedRunner(
+        None,
+        (PAIR,),
+        IngressQueue(16),
+        risex_adapter=FakeRisex(),
+        lighter_adapter=FakeLighter(),
+    )
+    runner.begin_connection(Venue.LIGHTER, "lighter-old")
+    runner.begin_connection(Venue.LIGHTER, "lighter-new")
+    gap = asyncio.run(runner.ingress.next_item())
+    assert isinstance(gap, FeedGapEvent)
+    assert gap.gap.reason == "PUBLIC_SOCKET_RECONNECTED"
+    assert gap.gap.transport_event == "RECONNECT"
+    assert gap.gap.stream_session_id == "lighter-old"
+    assert gap.gap.recovery_generation == 0
+    state = runner.state(Venue.LIGHTER, "BTC")
+    assert state.session_id == "lighter-new"
+    assert state.recovery_generation == 1
+    assert state.awaiting_snapshot
+
+
+def test_graceful_rollover_persists_one_gap_before_new_identity() -> None:
+    class FakeRisex:
+        @staticmethod
+        def market_id(_symbol):
+            return 1
+
+    class FakeLighter:
+        @staticmethod
+        def market_id(_symbol):
+            return 2
+
+    runner = PublicFeedRunner(
+        None,
+        (PAIR,),
+        IngressQueue(16),
+        risex_adapter=FakeRisex(),
+        lighter_adapter=FakeLighter(),
+    )
+    runner.begin_connection(Venue.LIGHTER, "lighter-old")
+    runner.disconnect(
+        Venue.LIGHTER,
+        transport_evidence={"transport_event": "GRACEFUL_CLOSE"},
+    )
+    runner.begin_connection(Venue.LIGHTER, "lighter-new")
+
+    assert runner.ingress.qsize == 1
+    gap = asyncio.run(runner.ingress.next_item())
+    assert isinstance(gap, FeedGapEvent)
+    assert gap.gap.reason == "PUBLIC_SOCKET_DISCONNECTED"
+    assert gap.gap.transport_event == "GRACEFUL_CLOSE"
+    assert gap.gap.stream_session_id == "lighter-old"
+    assert gap.gap.recovery_generation == 0
+    assert not runner.ingress.has_pending
+    state = runner.state(Venue.LIGHTER, "BTC")
+    assert state.session_id == "lighter-new"
+    assert state.recovery_generation == 1
+    assert state.connected
+    assert state.awaiting_snapshot
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("venue", "reader_name", "message", "close_code"),
+    (
+        (Venue.RISEX, "_read_risex", SimpleNamespace(type="CLOSE", data=1001), None),
+        (Venue.RISEX, "_read_risex", SimpleNamespace(type="CLOSE", data=None), None),
+        (Venue.RISEX, "_read_risex", SimpleNamespace(type="CLOSED", data=None), None),
+        (Venue.LIGHTER, "_read_lighter", SimpleNamespace(type="CLOSING", data=None), None),
+    ),
+)
+async def test_transport_close_without_normal_code_fails_closed(
+    venue: Venue,
+    reader_name: str,
+    message: SimpleNamespace,
+    close_code: int | None,
+) -> None:
+    class FakeRisex:
+        @staticmethod
+        def market_id(_symbol):
+            return 1
+
+    class FakeLighter:
+        @staticmethod
+        def market_id(_symbol):
+            return 2
+
+    class FakeWebsocket:
+        def __init__(self) -> None:
+            self.close_code = close_code
+
+        async def receive(self):
+            return message
+
+    runner = PublicFeedRunner(
+        None,
+        (PAIR,),
+        IngressQueue(16),
+        risex_adapter=FakeRisex(),
+        lighter_adapter=FakeLighter(),
+    )
+    runner.begin_connection(venue, "close-test")
+
+    result = await getattr(runner, reader_name)(FakeWebsocket(), asyncio.Event())
+
+    assert result == "UNEXPECTED_CLOSE"
+    assert runner.fatal_reason == "PUBLIC_SOCKET_TRANSPORT_FAILURE"
+    item = await runner.ingress.next_item()
+    assert isinstance(item, FeedGapEvent)
+    assert item.gap.transport_event == "UNEXPECTED_FAILURE"
+    assert item.gap.transport_failure_class == "ERROR"
+    assert item.gap.transport_exception_type == "_UnexpectedPublicClose"
+    assert "1001" not in repr(item.gap)
+
+
+@pytest.mark.asyncio
+async def test_transport_aiohttp_normal_eof_close_is_graceful() -> None:
+    class FakeRisex:
+        @staticmethod
+        def market_id(_symbol):
+            return 1
+
+    class FakeLighter:
+        @staticmethod
+        def market_id(_symbol):
+            return 2
+
+    class FakeWebsocket:
+        close_code = 1000
+
+        async def receive(self):
+            return SimpleNamespace(type="CLOSED", data=None)
+
+    runner = PublicFeedRunner(
+        None,
+        (PAIR,),
+        IngressQueue(16),
+        risex_adapter=FakeRisex(),
+        lighter_adapter=FakeLighter(),
+    )
+    runner.begin_connection(Venue.LIGHTER, "normal-eof")
+
+    result = await runner._read_lighter(FakeWebsocket(), asyncio.Event())
+
+    assert result == "GRACEFUL_CLOSE"
+    assert runner.fatal_reason is None
+    assert not runner.ingress.has_pending
 
 
 @pytest.mark.asyncio
@@ -1623,7 +1908,7 @@ async def test_risex_server_ping_is_consumed_and_read_loop_continues() -> None:
             self.messages = iter(
                 (
                     SimpleNamespace(type="PING", data=b"server"),
-                    SimpleNamespace(type="CLOSE", data=b""),
+                    SimpleNamespace(type="CLOSE", data=1000),
                 )
             )
             self.pongs = []
@@ -1709,7 +1994,7 @@ async def test_transport_planned_stop_uses_only_explicit_planned_stop_gap() -> N
 
         async def receive(self):
             await self.release.wait()
-            return SimpleNamespace(type="CLOSE")
+            return SimpleNamespace(type="CLOSE", data=1000)
 
     class FakeSession:
         def __init__(self, websocket) -> None:
@@ -1778,7 +2063,7 @@ async def test_transport_early_close_remains_socket_disconnect_gap() -> None:
             return None
 
         async def receive(self):
-            return SimpleNamespace(type="CLOSE")
+            return SimpleNamespace(type="CLOSE", data=1000)
 
     class FakeSession:
         def __init__(self, websocket) -> None:
@@ -1823,8 +2108,63 @@ async def test_transport_early_close_remains_socket_disconnect_gap() -> None:
     item = await asyncio.wait_for(runner.ingress.next_item(), timeout=1)
     assert isinstance(item, FeedGapEvent)
     assert item.gap.reason == "PUBLIC_SOCKET_DISCONNECTED"
+    assert item.gap.transport_event == "GRACEFUL_CLOSE"
+    assert item.gap.transport_failure_class is None
     stop.set()
     await asyncio.wait_for(task, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_transport_exception_is_sanitized_and_fails_closed() -> None:
+    class FakeWebsocket:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def send_json(self, _payload):
+            raise ConnectionResetError("secret transport detail")
+
+    class FakeSession:
+        def ws_connect(self, *_args, **_kwargs):
+            return FakeWebsocket()
+
+    class FakeRisex:
+        ws_base = "wss://risex.test"
+
+        def market_id(self, _symbol):
+            return 1
+
+        @staticmethod
+        def orderbook_subscription(_ids):
+            return {"subscribe": "books"}
+
+        @staticmethod
+        def trades_subscription(_ids):
+            return {"subscribe": "trades"}
+
+    class FakeLighter:
+        def market_id(self, _symbol):
+            return 2
+
+    runner = PublicFeedRunner(
+        FakeSession(),
+        (PAIR,),
+        IngressQueue(16),
+        risex_adapter=FakeRisex(),
+        lighter_adapter=FakeLighter(),
+    )
+    stop = asyncio.Event()
+    await asyncio.wait_for(runner._transport_loop(Venue.RISEX, stop), timeout=1)
+
+    assert runner.fatal_reason == "PUBLIC_SOCKET_TRANSPORT_FAILURE"
+    item = await runner.ingress.next_item()
+    assert isinstance(item, FeedGapEvent)
+    assert item.gap.transport_event == "UNEXPECTED_FAILURE"
+    assert item.gap.transport_failure_class == "RESET"
+    assert item.gap.transport_exception_type == "ConnectionResetError"
+    assert "secret" not in repr(item.gap)
 
 
 @pytest.mark.asyncio
@@ -2256,11 +2596,12 @@ def test_report_uses_horizon_entry_edges_and_excludes_only_clean_terminal_stop_g
     clean_group = next(group for group in clean["groups"] if group["horizon_ms"] == 300)
     assert clean_group["data_completeness"] == "COMPLETE"
     assert clean_group["data_gap_count"] == 1
-    assert clean_group["mean_entry_edge_usd"] == "2.00"
-    assert clean_group["median_entry_edge_usd"] == "2.00"
-    assert clean_group["p05_entry_edge_usd"] == "2.00"
-    assert clean_group["positive_edge_share"] == "1"
-    assert clean_group["mean_conditional_markout_usd"] == "-1.00"
+    assert clean_group["mean_entry_edge_usd"] is None
+    assert clean_group["raw_mean_entry_edge_usd"] == "2.00"
+    assert clean_group["raw_median_entry_edge_usd"] == "2.00"
+    assert clean_group["raw_p05_entry_edge_usd"] == "2.00"
+    assert clean_group["positive_edge_share"] is None
+    assert clean_group["raw_mean_conditional_markout_usd"] == "-1.00"
     partial_group = next(group for group in clean["groups"] if group["horizon_ms"] == 500)
     assert partial_group["mean_entry_edge_usd"] is None
     assert partial_group["positive_edge_share"] is None
@@ -2311,6 +2652,7 @@ def test_report_completeness_is_episode_scoped_and_zero_fill_is_clean(
         *,
         detected: int,
         session: str,
+        horizon_ms: int = 0,
         outcome: str = "HEDGE_FULL",
         edge: str | None = "1",
     ) -> dict:
@@ -2323,9 +2665,9 @@ def test_report_completeness_is_episode_scoped_and_zero_fill_is_clean(
             "target_margin_bps": "1",
             "policy_id": policy_id,
             "quote_version_id": version_id,
-            "horizon_ms": 0,
+            "horizon_ms": horizon_ms,
             "would_fill_detected_monotonic_ns": detected,
-            "horizon_deadline_monotonic_ns": detected,
+            "horizon_deadline_monotonic_ns": detected + horizon_ms * 1_000_000,
             "expected_stream_session_id": session,
             "expected_recovery_generation": 0,
             "outcome": outcome,
@@ -2350,7 +2692,16 @@ def test_report_completeness_is_episode_scoped_and_zero_fill_is_clean(
             fill("missing-v", detected=2_050, session="lighter-3"),
             fill("partial-v", detected=3_050, session="lighter-4"),
             horizon("bad", "bad-v", detected=150, session="lighter-1"),
-            horizon("clean", "clean-v", detected=150, session="lighter-2"),
+            *tuple(
+                horizon(
+                    "clean",
+                    "clean-v",
+                    detected=150,
+                    session="lighter-2",
+                    horizon_ms=horizon_ms,
+                )
+                for horizon_ms in (0, 300, 500, 1000)
+            ),
             horizon(
                 "partial",
                 "partial-v",
@@ -2382,7 +2733,8 @@ def test_report_completeness_is_episode_scoped_and_zero_fill_is_clean(
         group
         for group in horizon_zero
         if group["data_completeness"] == "DEGRADED"
-        and group["mean_entry_edge_usd"] == "1"
+        and group["mean_entry_edge_usd"] is None
+        and group["raw_mean_entry_edge_usd"] == "1"
     )
     clean = next(
         group
@@ -2409,6 +2761,8 @@ def test_report_completeness_is_episode_scoped_and_zero_fill_is_clean(
         and group["partial_or_missing_rate"] == "1"
     )
     assert bad["data_gap_count"] == 1
+    assert bad["raw_mean_entry_edge_usd"] == "1"
+    assert bad["mean_entry_edge_usd"] is None
     assert clean["data_completeness"] == "COMPLETE"
     assert zero["data_completeness"] == "COMPLETE"
     assert zero["strict_would_fill_count"] == 0
