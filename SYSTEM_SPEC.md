@@ -1,6 +1,6 @@
 # RISEx Spread Shadow — System Specification
 
-SYSTEM_SPEC_VERSION = 2.9
+SYSTEM_SPEC_VERSION = 3.0
 SPEC_STATUS = ACTIVE_SPREAD_SHADOW__FROZEN_LEGACY_FUNDING_FARMER
 
 ## 0. Active product domain: RISEx Spread Shadow
@@ -188,6 +188,17 @@ The one frozen DG-003 run is immutable `DATA_INSUFFICIENT / MEASUREMENT_THROUGHP
 - Storage remains append-only JSONL with the accepted lossless batching path, maximum `2,500,000` records and `12 GiB`, at least `24 GiB` free before start, deterministic offline replay, owner-only permissions, exact terminal uniqueness, and all evidence needed by section 0.8. Crossing a cap is `DATA_INSUFFICIENT`, never a partial economic verdict.
 - Completeness, thresholds, reporting dimensions, and seven-verdict precedence are exactly section 0.9. In particular, `PROFITABLE_QUOTES_UNFILLABLE` and the public-bracket form of `FILLABILITY_INSUFFICIENT_EVIDENCE` require `500` eligible trades; a valid strict-stop sample instead reports the complete per-policy delayed-edge evidence and may reach `LATENCY_DESTROYS_EDGE` or `ENTRY_EDGE_CANDIDATE` only through the frozen material-policy thresholds. Sparse/concentrated strict evidence cannot be promoted to an entry candidate.
 - Any terminal result is evidence, not trading permission. `SS-002` and `SS-003` remain closed. Only a separately recorded `ENTRY_EDGE_CANDIDATE` may support a later proposal for SS-002; it does not open it automatically.
+
+### 0.12 Post-DG-004 terminal-integrity correction
+
+The one frozen DG-004 run is immutable `DATA_INSUFFICIENT / TERMINAL_SERIALIZATION_FAILURE`. It stopped on the first fatal condition, `LIGHTER_PUBLIC_FRAME_INVALID`, but timed out draining ingress and did not produce a serially valid terminal evidence stream. Its `49` eligible trades, `24` strict episodes, `57` optimistic episodes, and `324` horizons are diagnostic only and may not support any fillability or delayed-edge verdict.
+
+- The retained owner-only evidence file has `166,291` physical records and `727,561,746` bytes, SHA-256 `77f795be487224634e806e3b7c546de8c4378b2c98334f21f59c623ba3ecebfa`. A cancelled asynchronous drain left an in-flight thread-backed append able to overlap the direct `RUN_FAILED` append: record indices `166287` through `166289` were duplicated or physically out of order, records followed the terminal marker, and no `DATA_GAP` row preserved the protocol failure. This is an evidence-integrity defect, not venue economics.
+- `SS-001F — Terminal Serialization and Protocol-Failure Evidence` is the only authorized correction. It must serialize every store append, including terminal markers, against any in-flight background append; guarantee one terminal marker is physically last with unique strictly increasing contiguous record indices; and close only after the append worker is known quiescent. Cancellation, timeout, or ambiguous file-worker completion must fail closed without concurrent direct use of the store.
+- Offline reporting must independently detect and explicitly reject duplicate, missing, decreasing, or otherwise non-contiguous record indices, more than one terminal marker, any record after a terminal marker, a missing terminal marker, or a terminal marker that is not physically last. A deterministic regression must reproduce the observed cancellation-during-threaded-append race and fail on the pre-correction implementation.
+- A fatal public-protocol observation must retain bounded sanitized evidence sufficient to distinguish venue, WebSocket frame kind/category, and a non-secret bounded length/hash or equivalent classification without retaining raw payloads. Its `DATA_GAP`/fatal evidence must survive a full or closing ingress path and remain ordered before the terminal marker. This slice does not authorize accepting binary or otherwise unsupported frames, changing the official public protocol contract, retrying the economic run, or weakening fatal handling.
+- Acceptance requires focused cancellation/race, full-ingress protocol-failure, terminal-order, store-cap-reserve, and corrupt-replay tests; deterministic replay of immutable DG-002B, DG-003, and DG-004 evidence; one clean Python 3.11 full suite; and clean dependency, compile, import, private/write-surface, diff, scope, and Git checks. Store representation, economics, fill bounds, eligibility, stop rules, horizons, fees, markets, queue capacity, and shutdown timeout remain unchanged.
+- No replacement economic gate may be frozen until this correction is independently accepted and the unsupported Lighter frame class is resolved by official or sanitized observed public evidence. `SS-002` and `SS-003` remain closed. No private, authenticated, signing, or write activity is authorized.
 
 ## Legacy benchmark domain: RISEx Funding Farmer
 

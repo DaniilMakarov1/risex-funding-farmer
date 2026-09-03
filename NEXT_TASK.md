@@ -1,17 +1,17 @@
 # Active bounded task
 
-## DG-004 — Fillability Bounds Recovery Discovery
+## SS-001F — Terminal Serialization and Protocol-Failure Evidence
 
-Status: `FROZEN / READY TO RUN ONCE`.
+Status: `AUTHORIZED / BUILDER NOT YET OPENED`.
 
-Objective: obtain one valid prospective public fillability/delayed-entry-edge verdict on the independently accepted lossless evidence path.
+Objective: correct the proven DG-004 evidence-terminal race and preserve bounded sanitized public-protocol failure classification before any replacement economic sample.
 
-Exact measurement source: `cd741e2a46e874f1e77feebac2aba5c80a96455d`. No Builder or code change is authorized. Use one fresh owner-only store and exact `BTC/ETH/SOL`, both directions, `$100/$250/$500`, `1/2/3/5 bps`, `0/300/500/1000 ms`, frozen fee inputs, `25 s` freshness, and unchanged strict/optimistic semantics.
+Exact base: the accepted published `main` after this governance record. Create exactly one fresh visible Spread Builder and worktree from that exact base.
 
-Stop on the first of `50` aggregate strict episodes, `500` unique eligible RISEx trades with relevant active quotes, `1200 s`, or integrity/fatal. Complete only the frozen Lighter horizon tail after sample stop. Enforce `2,500,000` records, `12 GiB`, and at least `24 GiB` free before start. Do not inspect economic output before terminal stop.
+Allowed: serialize all store writes and terminal emission against in-flight thread-backed appends; guarantee one physically-last terminal with unique contiguous increasing indices; make offline reporting reject index/terminal corruption; preserve bounded sanitized venue/frame-kind/category/length-or-hash protocol-failure evidence before terminal even when ingress is full or closing; add focused/adverse regressions.
 
-Acceptance: exact source/universe/config, clean unique terminal, no fatal/integrity/non-terminal transport gap, all model-scoped horizons, deterministic repeated report, owner-only permissions, complete per-policy snapshot/fillability/hedge/concentration report, and exact System Specification 2.9 verdict precedence.
+Acceptance: a deterministic test reproduces cancellation while a thread-backed append is still running; full/closing-ingress protocol failures remain durably ordered before the terminal; corrupt DG-004-style replay is explicitly rejected; clean fixtures retain one last terminal and ordered indices; immutable DG-002B/DG-003/DG-004 reports remain deterministic; focused/adverse tests and one clean Python 3.11 full suite pass; dependency, compile, import, private/write-surface, diff, scope, and Git checks are clean.
 
-Forbidden: any code, fee, quote grid, maker pricing, fill definition, eligibility, stop rule, horizon, venue, strategy, storage representation/cap, private/auth/credential/signing/write/testnet/mainnet, `SS-002`, or `SS-003` change; manual stop/extension or automatic retry.
+Forbidden: changing store representation/caps, queue size, shutdown timeout, fill semantics, eligibility, economics, fees, quote grid, horizons, stop rules, public protocol acceptance, retry behavior, venue, strategy, private/auth/credential/signing/write/testnet/mainnet surface, `SS-002`, or `SS-003`.
 
-After the terminal verdict, record it and stop. `SS-002` and `SS-003` remain closed; even `ENTRY_EDGE_CANDIDATE` permits only a later separate proposal.
+After candidate delivery, Chief independently reviews and alone accepts/integrates. Freeze no replacement economic gate until the correction is accepted and the unsupported Lighter frame class is resolved from official or sanitized observed public evidence. `SS-002` and `SS-003` remain closed.
