@@ -1,6 +1,6 @@
 # RISEx Spread Shadow — System Specification
 
-SYSTEM_SPEC_VERSION = 2.4
+SYSTEM_SPEC_VERSION = 2.5
 SPEC_STATUS = ACTIVE_SPREAD_SHADOW__FROZEN_LEGACY_FUNDING_FARMER
 
 ## 0. Active product domain: RISEx Spread Shadow
@@ -124,6 +124,15 @@ This gate was frozen on `2026-09-03` after independent acceptance of SS-001C and
 - Required success evidence: all three requested markets are admitted; source metadata matches; exactly one clean `RUN_STOP` is the sole terminal marker; there is no `RUN_FAILED`, non-null fatal reason, `RISEX_PUBLIC_FRAME_INVALID`, unexpected `PUBLIC_SOCKET_DISCONNECTED`, queue overflow, history-capacity failure, store failure, or unclassified schema failure. Planned terminal `PUBLIC_SMOKE_STOPPED` gaps are allowed only after the bounded stop and must not contaminate earlier completed evidence.
 - The retained store must remain below the record cap, have owner-only directory/file permissions, and produce byte-identical canonical offline JSON reports in two consecutive reads. Record counts, strict fills, horizons, and edges are reported as diagnostics only and have no pass threshold here.
 - Any failed condition blocks `DG-002B`. There is no automatic retry or threshold change from observed output; a new run requires a separately recorded diagnostic result and prospective gate.
+
+### 0.7 Prospective corrected discovery gate `DG-002B`
+
+This gate was frozen on `2026-09-03` only after `DG-002A` passed and before opening a new economic sample. It reuses the original `DG-001` economics and verdict rules unchanged; no threshold or bound is selected from the stability run's economic observations.
+
+- Run unchanged accepted source `b4f2822327fc0f7b50a02d7aabfc2d6e61b453a4` once into a fresh owner-only observational store, with exact public `BTC/ETH/SOL`, both directions, `$100/$250/$500`, `1/2/3/5 bps`, `0/300/500/1000 ms`, `25 s` freshness, the exact fees/provenance in section 0.5, a `60 second` duration, `250,000`-record cap, and first `50` strict episodes by `record_index`.
+- The full source/surface, admission, terminal, fatal/integrity, planned-stop, permissions, deterministic-report, completeness, fillability, depth, edge-materiality, concentration, and seven-verdict precedence rules in sections 0.5 and 0.6 apply. A clean run with zero strict fills is complete data, not corruption; it is interpreted only through the unchanged frozen fillability and verdict rules.
+- Emit exactly one of the seven section-0.5 verdicts with the complete diagnostic report and exact evidence identity. A measurement-path failure is not mission success; objective public-data limitations may support `DATA_INSUFFICIENT` only when the accepted path remains proven correct.
+- No automatic retry, threshold change, strategy expansion, `SS-002`, or `SS-003` follows from the observation. `SS-002` can only be proposed after a recorded `ENTRY_EDGE_CANDIDATE`; every other verdict ends the current Entry Viability Stage without implementation expansion.
 
 ## Legacy benchmark domain: RISEx Funding Farmer
 
