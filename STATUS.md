@@ -2,7 +2,7 @@
 
 ## Accepted baseline and ownership
 
-- Current accepted and published implementation `main` is `9ac7b73941b9f0217cfa6a2ef68b21d6040fd015` before the `DG-001` governance checkpoint.
+- Current accepted and published `main` is `c9440ee7dd4b87d5d91d3a028ce26a1501d6556f` before this terminal-verdict checkpoint; accepted measurement implementation remains `9ac7b73941b9f0217cfa6a2ef68b21d6040fd015`.
 - Transition preflight on `2026-09-02` independently verified local `main`, local `origin/main`, and GitHub `refs/heads/main` at `554b6c9c5e2b60eb13c9f33c6c2184e6932c84f0` (`Refine conservative PAPER economics gate`). That SHA remains the historical transition baseline; later accepted work is recorded below.
 - The active project root is `/Users/daniilmakarov/Desktop/RISEx Spread Shadow`, created as a clean checkout of the existing `DaniilMakarov1/risex-funding-farmer` repository. This is not a new GitHub repository.
 - The historical checkout `/Users/daniilmakarov/Desktop/risex-funding-farmer` contains a pre-existing modified `README.md`, six untracked operational artifacts, and old dirty worktree residues. They were not changed, accepted, or used as a base. Old unaccepted candidates are abandoned/rejected residue.
@@ -26,7 +26,9 @@
 - The Chief's exact-SHA public-only BTC smoke used fresh run `5AuNTOVaN842jMZZ0Oss87ov`: `95` RISEx books, `254` Lighter books, `3` RISEx trades, `8352` active quote records, no fatal or real transport/schema gap, deterministic offline report, clean shutdown, and owner-only `0700/0600` storage. No natural strict fill occurred in that 15-second acceptance smoke; deterministic tests prove the event-driven four-horizon path without lookahead.
 - External governance review accepted the transition. Before any SS-001A candidate acceptance, target-margin formulas, deterministic quantity sizing, conservative/optimistic fillability interpretation, exact hedge-failure outcomes, and the bounded SS-001A/SS-001B complexity limits were frozen in System Specification 2.1.
 - The prospective real-public discovery gate `DG-001` is frozen in System Specification 2.3 before any discovery sample. It fixes the `BTC/ETH/SOL` universe, `25 s` freshness, fee inputs/provenance, numeric fillability and edge thresholds, completeness/fatal rules, a `60 s`/`250,000`-record/first-`50`-strict-evidence bound, and exact seven-verdict precedence.
-- The only active task is the single bounded `DG-001` observational discovery run and terminal Entry Viability verdict. No implementation slice is open.
+- `DG-001` ran once on exact measurement source `9ac7b73941b9f0217cfa6a2ef68b21d6040fd015` with fresh run `RNLvQGjXjcT8xkAD48OoVq6h` and exact `BTC/ETH/SOL` admission. Its owner-only store retained `54,493` records (`253,441,888` bytes, SHA-256 `507f15f52926dabf77befa8bb8116d77944edb0bbe6468a795fffb8685438d6c`) below the `250,000`-record cap.
+- The run recorded `52,176` active quotes, `2,195` accepted books, `6` RISEx trades, `114` explicit gaps, `0` strict would-fills, and `0` horizons. It exceeded the frozen duration without a clean `RUN_STOP`; the exact hung process was terminated after its store stopped advancing. The offline report was deterministic (SHA-256 `786b9630b66f53d80fabc362eb60ce599695fcccf0c8f2a09c8059b3342ffd4a`), with all `288` groups degraded.
+- Under the predeclared first-precedence rule, the terminal Entry Viability verdict is exactly `DATA_INSUFFICIENT`. Quoteable snapshot evidence existed, but missing clean termination and repeated public-frame/socket gaps prevent any fillability or delayed-edge conclusion. No implementation slice is open.
 - SS-001A candidate `a3ac545a78a687788595470c1e1e1e91a501ec74` was independently rejected and was not merged. Its green tests did not cover fail-open missing economics, invalid cross-clock exchange-monotonic ordering, missing explicit would-fill detection time, or recovery-generation displacement. The original Builder is released; correction requires a fresh visible Spread Builder from current accepted `main`.
 - Correction candidate `7b3e370865de28bc4a4566445c676772dc0727cc` was also independently rejected and not merged. It failed a required repeating-decimal multi-level exact-q case, accepted sizing evidence with the wrong direction/target notional, and lacked venue identity on gap evidence. System Specification 2.2 freezes these adverse contracts before the next fresh candidate.
 - The rejected candidates remain historical non-authoritative evidence and were not merged. `SS-002` and `SS-003` remain closed.
@@ -34,7 +36,5 @@
 
 ## Current Chief mission
 
-- The Entry Viability Stage is not complete when SS-001B and its smoke are complete. Those are intermediate technical milestones.
-- The mission ends only after: accepted/integrated minimal SS-001B; successful bounded public-only pipeline smoke; a separately frozen pre-discovery gate covering universe, freshness, public fee inputs, fillability thresholds, completeness, stop rules, and verdict rules; bounded real-public discovery; and one evidence-backed Entry Viability product verdict.
-- The terminal verdict is one of `ENTRY_EDGE_CANDIDATE`, `NO_SNAPSHOT_EDGE`, `LATENCY_DESTROYS_EDGE`, `PROFITABLE_QUOTES_UNFILLABLE`, `FILLABILITY_INSUFFICIENT_EVIDENCE`, `LIGHTER_DEPTH_UNSUITABLE`, or `DATA_INSUFFICIENT`.
-- `DG-001` discovery is now authorized exactly as frozen. `SS-002` remains closed until the product verdict and may be proposed only after `ENTRY_EDGE_CANDIDATE` satisfies that frozen gate.
+- The Entry Viability mission is complete with terminal verdict `DATA_INSUFFICIENT` from the single frozen `DG-001` run.
+- `SS-002` and `SS-003` remain closed. A future correction and new discovery run would require a fresh explicit user decision and a new prospective gate; this failed evidence must never be reclassified after the fact.
