@@ -1,6 +1,6 @@
 # RISEx Spread Shadow — System Specification
 
-SYSTEM_SPEC_VERSION = 2.7
+SYSTEM_SPEC_VERSION = 2.8
 SPEC_STATUS = ACTIVE_SPREAD_SHADOW__FROZEN_LEGACY_FUNDING_FARMER
 
 ## 0. Active product domain: RISEx Spread Shadow
@@ -169,6 +169,15 @@ Verdicts are evaluated in this fixed precedence and exactly one is recorded:
 7. `ENTRY_EDGE_CANDIDATE` when at least one exact policy satisfies every material strict-fillability, completeness, hedge-depth, `300 ms`, and `500 ms` condition.
 
 Any terminal result is evidence, not permission to change strategy or trade. `SS-002` and `SS-003` remain closed. Only `ENTRY_EDGE_CANDIDATE` may support a later separate proposal for SS-002; it does not open SS-002 automatically.
+
+### 0.10 Post-DG-003 measurement-throughput correction
+
+The one frozen DG-003 run is immutable `DATA_INSUFFICIENT / MEASUREMENT_THROUGHPUT_FAILURE`. Its source, stop counters, fills, and horizons remain diagnostic only: the run recorded queue-overflow gaps and ended with `INGRESS_DRAIN_TIMEOUT`, so it cannot issue any fillability or entry-edge verdict and must not be reinterpreted after a correction.
+
+- The observed failure requires the smallest lossless correction to public evidence throughput and terminal draining. Prefer activating the already-configured bounded store batching/synchronization contract when that is sufficient. A compact quote representation referencing already-persisted immutable book revisions is permitted only if deterministic stress evidence proves batching alone cannot keep up with the observed bounded surface. Either path must preserve exact quote economics, active-version timing, trade interaction, both fill bounds, exact-`q` horizons, gap/session/recovery identity, append ordering, caps, terminal durability, and deterministic legacy/new replay.
+- Increasing queue capacity or shutdown timeout alone is not acceptance because it does not remove sustained backpressure. No compression platform, database, message bus, generic persistence framework, strategy/economic change, private access, or write path is authorized.
+- Acceptance requires an adverse high-rate fixture at or above the observed three-market event/quote workload with zero queue overflow, bounded memory, deterministic evidence/report output, and a clean stop plus horizon drain inside the accepted shutdown bound. Failure injection must prove ordered record indices, bounded unsynced exposure, final sync, cap reserve, and exactly one terminal marker.
+- A replacement prospective economic gate may be frozen only after this correction is independently accepted. It must use a fresh store and exact accepted source and must not reuse DG-003 economic output to tune quote economics or fill definitions. `SS-002` and `SS-003` remain closed.
 
 ## Legacy benchmark domain: RISEx Funding Farmer
 

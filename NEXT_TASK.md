@@ -1,19 +1,19 @@
 # Active bounded task
 
-## DG-003 — Fillability Bounds Discovery
+## SS-001E — Evidence Throughput Recovery
 
-Status: `FROZEN / READY FOR CHIEF PUBLIC-ONLY RUN`.
+Status: `AUTHORIZED / BUILDER NOT YET OPENED`.
 
-Objective: run exactly one prospectively frozen public-only sample that resolves whether the accepted profitable hedge-anchored RISEx quotes are unreachable even under the optimistic upper bound, remain bracketed by public-data fill uncertainty, or produce material strict fills with delayed Lighter hedge evidence.
+Objective: correct the proven DG-003 public evidence backpressure and terminal-drain failure with the smallest lossless change, without changing quote economics, fillability semantics, the evidence caps, or any strategy behavior.
 
-Exact source: `10cc7be7b58c536fc8edf65309b13e9a9d8d819b`. Chief executes the accepted public unauthenticated runner directly; no Builder, code edit, or sample tuning is authorized.
+Exact base: current accepted and published `main`. Use one fresh visible Spread Builder and fresh `codex/spread-ss-001e-throughput-recovery` branch/worktree. Verification is Level A. Builder performs no public/live run.
 
-Frozen surface: exact `BTC/ETH/SOL`, both directions, `$100/$250/$500`, `1/2/3/5 bps`, `0/300/500/1000 ms`, `25 s` freshness, RISEx maker `0.00005`, Lighter taker `0`, strict lower bound unchanged, optimistic at-or-through upper bound, and the full per-policy/concentration report in System Specification 2.7.
+Allowed scope: the minimum `risex_spread_shadow` store/observer/runner/report and focused tests needed to make the existing `store_batch_size=128` and `store_batch_interval_seconds=0.25` contract real, preserve deterministic ordering, and drain a frozen sample cleanly under the observed bounded three-market load. Diagnose with immutable DG-003 evidence and deterministic fixtures only. Compact quote-to-book references are allowed only if measured fixture evidence proves batching/sync correction alone insufficient.
 
-Frozen stop and storage rule: first of `50` strict episodes, `500` unique eligible trades, `1,200 s`, or integrity/fatal. Freeze RISEx economics at stop and retain only the bounded Lighter tail for pending horizons. Maximum `2,500,000` records and `12 GiB`; require at least `24 GiB` free before launch. One fresh owner-only store, exact source metadata, exactly one terminal marker, and two byte-identical canonical reports are required.
+Required adverse evidence: at-or-above-observed burst/sustained fixture load has zero `QUEUE_OVERFLOW`; records retain deterministic append order and unique indices; periodic/batch sync has a strict maximum unsynced interval/count; stop flushes all pre-stop evidence, freezes later RISEx economics, retains only required Lighter horizon evidence, and completes within the accepted shutdown bound; write/sync/cap failures remain fail-closed with the reserved terminal marker; legacy DG-002B and failed DG-003 stores replay deterministically and remain historically unchanged.
 
-Verdict: apply the exact System Specification 2.7 precedence. `PROFITABLE_QUOTES_UNFILLABLE` requires `500` eligible trades and both bounds at most `1`; `FILLABILITY_INSUFFICIENT_EVIDENCE` requires `500` eligible trades, non-material strict evidence, and optimistic evidence above `1`; delayed entry verdicts require at least `10` strict episodes for one exact policy across at least `5` detection timestamps plus the frozen hedge/edge thresholds. Any failed operational/completeness gate is `DATA_INSUFFICIENT`, not an economic verdict.
+Acceptance: Chief independently verifies the immutable failure diagnosis, scope, adverse load/flush/failure tests, deterministic replay of both historical stores, focused tests, one clean isolated Python 3.11 full suite on final SHA, dependency/import/private/write surfaces, Git cleanliness, and no economics/storage-platform expansion. Builder never self-accepts or merges/pushes `main`.
 
-Required output: exact run/store identity and hashes; stop reason; record/byte counts; integrity/completeness; per-policy snapshot, distance, fillability, both model curves, and concentration; exactly one frozen verdict; durable status update. Do not extend or rerun because results look favorable or unfavorable.
+Forbidden: changing fees, quote grid, maker pricing, strict/optimistic definitions, eligibility, thresholds, stop logic, horizons, venue, strategy, funding, inventory, exits, or evidence caps; queue-size/timeout-only masking; compression/database/message-bus/generic persistence architecture; private/auth/credential/signing/write/testnet/mainnet; SS-002 or SS-003.
 
-Forbidden: any code/config/threshold tuning after sample open; another venue; private/authenticated data; credentials/signing/write/testnet/mainnet; queue/FIFO/L3/probability/ML; fees, quote grid, maker pricing, strategy, funding, inventory, exits, SS-002, or SS-003. A second public run requires a newly recorded diagnostic reason and separately frozen gate; it is not automatic.
+After acceptance only, Chief may freeze one fresh replacement public discovery gate prospectively. No repeat run is authorized before that freeze.
