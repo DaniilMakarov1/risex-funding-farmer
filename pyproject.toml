@@ -16,6 +16,7 @@ nado-mainnet-unsigned-read = "risex_farmer.nado_mainnet_unsigned_read:main"
 nado-mainnet-archive-read = "risex_farmer.nado_mainnet_archive_read:main"
 lighter-testnet-readiness = "risex_farmer.lighter_testnet_readiness:main"
 lighter-testnet-level-c = "risex_farmer.lighter_testnet_lifecycle:main"
+risex-spread-shadow = "risex_spread_shadow.cli:main"
 
 [project.optional-dependencies]
 test = [

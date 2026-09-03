@@ -1,4 +1,4 @@
-"""Pure SS-001A RISEx Spread Shadow contracts."""
+"""SS-001A contracts plus the limited SS-001B public measurement path."""
 
 from .economics import (
     build_hypothetical_maker_quote,
@@ -39,6 +39,26 @@ from .models import (
     Venue,
     queue_overflow_gap,
 )
+from .config import ShadowConfig
+from .feed import (
+    FeedBookEvent,
+    FeedGapEvent,
+    FeedTradeEvent,
+    IngressQueue,
+    MarketPair,
+    PublicFeedRunner,
+    select_public_market_pairs,
+)
+from .report import build_report, render_report
+from .runner import (
+    BookHistory,
+    HistoryCapacityExceeded,
+    ReplayHarness,
+    SpreadObserver,
+    SpreadShadowRunner,
+    run_public_smoke,
+)
+from .store import AppendOnlyEvidenceStore, iter_records, new_run_id, store_permissions
 
 __all__ = [
     "BookEvidence",
@@ -74,4 +94,24 @@ __all__ = [
     "validate_quote_economics",
     "validate_sizing_evidence",
     "would_fill_evidence",
+    "AppendOnlyEvidenceStore",
+    "BookHistory",
+    "FeedBookEvent",
+    "FeedGapEvent",
+    "FeedTradeEvent",
+    "HistoryCapacityExceeded",
+    "IngressQueue",
+    "MarketPair",
+    "PublicFeedRunner",
+    "ReplayHarness",
+    "ShadowConfig",
+    "SpreadObserver",
+    "SpreadShadowRunner",
+    "build_report",
+    "iter_records",
+    "new_run_id",
+    "render_report",
+    "run_public_smoke",
+    "select_public_market_pairs",
+    "store_permissions",
 ]
