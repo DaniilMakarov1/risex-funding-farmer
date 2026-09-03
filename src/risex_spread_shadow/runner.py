@@ -1,4 +1,4 @@
-"""The single SS-001F observer, evidence path, and public-smoke orchestration."""
+"""The single SS-001G observer, evidence path, and public-smoke orchestration."""
 
 from __future__ import annotations
 
@@ -50,18 +50,16 @@ from .models import (
     TradeEvidence,
     WouldFillEvidence,
 )
+from .book_chain import (
+    BookRevisionChainError,
+    BookRevisionEncoder,
+    book_state_sha256,
+)
 from .store import AppendOnlyEvidenceStore, EvidenceStorageLimitExceeded
 
 
 _SHUTDOWN_TIMEOUT_SECONDS = 2.0
 _TERMINAL_KINDS = frozenset({"RUN_STOP", "RUN_FAILED"})
-
-
-def _level_record(level: BookLevel) -> dict[str, str]:
-    return {
-        "price": str(level.canonical_price),
-        "quantity": str(level.canonical_quantity),
-    }
 
 
 class HistoryCapacityExceeded(RuntimeError):
@@ -70,6 +68,111 @@ class HistoryCapacityExceeded(RuntimeError):
     def __init__(self, gap: DataGapEvidence) -> None:
         super().__init__("book history capacity reached; evidence gap is required")
         self.gap = gap
+
+
+@dataclass(slots=True)
+class _HistoryBookRecord:
+    """Book metadata plus either a full anchor or compact level changes."""
+
+    metadata: BookEvidence
+    full: bool
+    bids: tuple[BookLevel, ...]
+    asks: tuple[BookLevel, ...]
+
+    def materialize(
+        self,
+        bids: Mapping[Decimal, Decimal],
+        asks: Mapping[Decimal, Decimal],
+    ) -> BookEvidence:
+        return BookEvidence(
+            venue=self.metadata.venue,
+            canonical_market=self.metadata.canonical_market,
+            bids=tuple(
+                BookLevel(price, quantity)
+                for price, quantity in sorted(
+                    bids.items(), key=lambda item: item[0], reverse=True
+                )
+                if quantity > 0
+            ),
+            asks=tuple(
+                BookLevel(price, quantity)
+                for price, quantity in sorted(asks.items(), key=lambda item: item[0])
+                if quantity > 0
+            ),
+            received_monotonic_ns=self.metadata.received_monotonic_ns,
+            stream_session_id=self.metadata.stream_session_id,
+            recovery_generation=self.metadata.recovery_generation,
+            book_revision=self.metadata.book_revision,
+            sequence=self.metadata.sequence,
+            checksum=self.metadata.checksum,
+            sequence_valid=self.metadata.sequence_valid,
+            checksum_valid=self.metadata.checksum_valid,
+            received_utc=self.metadata.received_utc,
+            fresh=self.metadata.fresh,
+        )
+
+
+@dataclass(slots=True)
+class _HistoryChain:
+    """One bounded identity chain with a compact retained revision tail."""
+
+    entries: list[_HistoryBookRecord] = field(default_factory=list)
+    base_bids: dict[Decimal, Decimal] = field(default_factory=dict)
+    base_asks: dict[Decimal, Decimal] = field(default_factory=dict)
+    current_bids: dict[Decimal, Decimal] = field(default_factory=dict)
+    current_asks: dict[Decimal, Decimal] = field(default_factory=dict)
+    last_revision: int | None = None
+
+
+def _history_levels(levels: Iterable[BookLevel]) -> dict[Decimal, Decimal]:
+    result: dict[Decimal, Decimal] = {}
+    for level in levels:
+        if not isinstance(level, BookLevel):
+            raise TypeError("book levels must be BookLevel values")
+        if level.canonical_price <= 0 or level.canonical_quantity <= 0:
+            raise ValueError("book levels must have positive price and quantity")
+        if level.canonical_price in result:
+            raise ValueError("book levels must not repeat a price")
+        result[level.canonical_price] = level.canonical_quantity
+    return result
+
+
+def _history_changes(
+    previous: Mapping[Decimal, Decimal],
+    current: Mapping[Decimal, Decimal],
+    *,
+    reverse: bool,
+) -> tuple[BookLevel, ...]:
+    changed: list[BookLevel] = []
+    for price in sorted(previous.keys() | current.keys(), reverse=reverse):
+        old = previous.get(price)
+        new = current.get(price)
+        if old != new:
+            changed.append(BookLevel(price, Decimal("0") if new is None else new))
+    return tuple(changed)
+
+
+def _apply_history_record(
+    record: _HistoryBookRecord,
+    bids: dict[Decimal, Decimal],
+    asks: dict[Decimal, Decimal],
+) -> None:
+    if record.full:
+        bids.clear()
+        asks.clear()
+        bids.update(_history_levels(record.bids))
+        asks.update(_history_levels(record.asks))
+        return
+    for level in record.bids:
+        if level.canonical_quantity == 0:
+            bids.pop(level.canonical_price, None)
+        else:
+            bids[level.canonical_price] = level.canonical_quantity
+    for level in record.asks:
+        if level.canonical_quantity == 0:
+            asks.pop(level.canonical_price, None)
+        else:
+            asks[level.canonical_price] = level.canonical_quantity
 
 
 @dataclass(slots=True)
@@ -191,12 +294,17 @@ class SampleStopController:
 
 
 class BookHistory:
-    """Time-retained book evidence with no silent fixed-count eviction."""
+    """Time-retained books with bounded compact revision-chain storage."""
 
     def __init__(self, *, retention_ns: int, capacity: int | None = None) -> None:
         self.retention_ns = retention_ns
         self.capacity = capacity
-        self._books: dict[tuple[Venue, str], list[BookEvidence]] = {}
+        self._chains: dict[
+            tuple[Venue, str, str | int, int], _HistoryChain
+        ] = {}
+        self._active_identities: dict[
+            tuple[Venue, str], tuple[Venue, str, str | int, int]
+        ] = {}
         self._gaps: list[DataGapEvidence] = []
         self._pending: dict[str, tuple[int, int]] = {}
         self._pending_identity: dict[
@@ -205,7 +313,7 @@ class BookHistory:
 
     @property
     def book_count(self) -> int:
-        return sum(len(items) for items in self._books.values())
+        return sum(len(chain.entries) for chain in self._chains.values())
 
     @property
     def pending_count(self) -> int:
@@ -249,12 +357,29 @@ class BookHistory:
                 and gap.gap_end_monotonic_ns >= cutoff
             )
         ]
-        for identity, books in tuple(self._books.items()):
-            retained = [book for book in books if book.received_monotonic_ns >= cutoff]
-            if retained:
-                self._books[identity] = retained
-            else:
-                del self._books[identity]
+        for identity, chain in tuple(self._chains.items()):
+            split_at = 0
+            for entry in chain.entries:
+                if entry.metadata.received_monotonic_ns >= cutoff:
+                    break
+                _apply_history_record(entry, chain.base_bids, chain.base_asks)
+                split_at += 1
+            if split_at:
+                del chain.entries[:split_at]
+            # Keep the current compact state even when the retained time
+            # window has no entries.  A later DELTA in the same stream still
+            # has a valid predecessor in memory; only the historical query
+            # tail has been pruned.
+            market_identity = (identity[0], identity[1])
+            if (
+                not chain.entries
+                and self._active_identities.get(market_identity) != identity
+                and not any(
+                    pending_identity == identity
+                    for pending_identity in self._pending_identity.values()
+                )
+            ):
+                del self._chains[identity]
 
     def register_pending(
         self,
@@ -272,7 +397,9 @@ class BookHistory:
         self._pending_identity.pop(version_id, None)
         self._prune(now_ns)
 
-    def add_book(self, book: BookEvidence) -> None:
+    def add_book(self, book: BookEvidence, *, source_kind: str | None = None) -> None:
+        if source_kind not in {None, "SNAPSHOT", "DELTA"}:
+            raise ValueError("unsupported book source kind")
         self._prune(book.received_monotonic_ns)
         if self.capacity is not None and self.book_count >= self.capacity:
             raise HistoryCapacityExceeded(
@@ -285,8 +412,72 @@ class BookHistory:
                     reason="BOOK_HISTORY_CAPACITY",
                 )
             )
-        identity = (book.venue, book.canonical_market)
-        self._books.setdefault(identity, []).append(book)
+        identity = (
+            book.venue,
+            book.canonical_market,
+            book.stream_session_id,
+            book.recovery_generation,
+        )
+        chain = self._chains.get(identity)
+        current_bids = _history_levels(book.bids)
+        current_asks = _history_levels(book.asks)
+        if chain is None:
+            if source_kind == "DELTA":
+                raise ValueError("delta book requires a retained predecessor snapshot")
+            full = True
+            stored_bids = tuple(book.bids)
+            stored_asks = tuple(book.asks)
+            chain = _HistoryChain()
+            self._chains[identity] = chain
+            self._active_identities[(book.venue, book.canonical_market)] = identity
+            for old_identity in tuple(self._chains):
+                if old_identity == identity or old_identity[:2] != identity[:2]:
+                    continue
+                if any(
+                    pending_identity == old_identity
+                    for pending_identity in self._pending_identity.values()
+                ):
+                    continue
+                del self._chains[old_identity]
+        else:
+            if chain.last_revision is not None and book.book_revision <= chain.last_revision:
+                raise ValueError("book revision is duplicate or out of order")
+            if source_kind in {None, "SNAPSHOT"}:
+                full = True
+                stored_bids = tuple(book.bids)
+                stored_asks = tuple(book.asks)
+            else:
+                if chain.last_revision is not None and book.book_revision != chain.last_revision + 1:
+                    raise ValueError("book revision predecessor is missing")
+                full = False
+                stored_bids = _history_changes(
+                    chain.current_bids, current_bids, reverse=True
+                )
+                stored_asks = _history_changes(
+                    chain.current_asks, current_asks, reverse=False
+                )
+        metadata = BookEvidence(
+            venue=book.venue,
+            canonical_market=book.canonical_market,
+            bids=(),
+            asks=(),
+            received_monotonic_ns=book.received_monotonic_ns,
+            stream_session_id=book.stream_session_id,
+            recovery_generation=book.recovery_generation,
+            book_revision=book.book_revision,
+            sequence=book.sequence,
+            checksum=book.checksum,
+            sequence_valid=book.sequence_valid,
+            checksum_valid=book.checksum_valid,
+            received_utc=book.received_utc,
+            fresh=book.fresh,
+        )
+        chain.entries.append(
+            _HistoryBookRecord(metadata, full, stored_bids, stored_asks)
+        )
+        chain.current_bids = current_bids
+        chain.current_asks = current_asks
+        chain.last_revision = book.book_revision
 
     def add_gap(self, gap: DataGapEvidence) -> None:
         if gap not in self._gaps:
@@ -294,9 +485,17 @@ class BookHistory:
         self._prune(gap.gap_start_monotonic_ns)
 
     def books(self, venue: Venue, market: str, deadline_ns: int | None = None) -> tuple[BookEvidence, ...]:
-        values = tuple(self._books.get((venue, market), ()))
-        if deadline_ns is not None:
-            values = tuple(book for book in values if book.received_monotonic_ns <= deadline_ns)
+        values: list[BookEvidence] = []
+        for (entry_venue, entry_market, _session, _recovery), chain in self._chains.items():
+            if entry_venue is not venue or entry_market != market:
+                continue
+            bids = dict(chain.base_bids)
+            asks = dict(chain.base_asks)
+            for entry in chain.entries:
+                if deadline_ns is not None and entry.metadata.received_monotonic_ns > deadline_ns:
+                    continue
+                _apply_history_record(entry, bids, asks)
+                values.append(entry.materialize(bids, asks))
         return tuple(
             sorted(
                 values,
@@ -307,6 +506,49 @@ class BookHistory:
                     repr(book),
                 ),
             )
+        )
+
+    def latest_books(
+        self,
+        venue: Venue,
+        market: str,
+        deadline_ns: int | None = None,
+    ) -> tuple[BookEvidence, ...]:
+        """Return only the latest revision per identity, retaining tied ambiguity."""
+
+        candidates: list[BookEvidence] = []
+        for (entry_venue, entry_market, _session, _recovery), chain in self._chains.items():
+            if entry_venue is not venue or entry_market != market:
+                continue
+            bids = dict(chain.base_bids)
+            asks = dict(chain.base_asks)
+            latest: _HistoryBookRecord | None = None
+            for entry in chain.entries:
+                if deadline_ns is not None and entry.metadata.received_monotonic_ns > deadline_ns:
+                    continue
+                _apply_history_record(entry, bids, asks)
+                latest = entry
+            if latest is not None:
+                candidates.append(latest.materialize(bids, asks))
+        if not candidates:
+            return ()
+        latest_rank = max(
+            (
+                book.received_monotonic_ns,
+                book.book_revision,
+                -1 if book.sequence is None else book.sequence,
+            )
+            for book in candidates
+        )
+        return tuple(
+            book
+            for book in candidates
+            if (
+                book.received_monotonic_ns,
+                book.book_revision,
+                -1 if book.sequence is None else book.sequence,
+            )
+            == latest_rank
         )
 
     def gaps(self) -> tuple[DataGapEvidence, ...]:
@@ -350,6 +592,7 @@ class SpreadObserver:
         self._current_stream_identities: dict[
             tuple[Venue, str], tuple[str | int, int]
         ] = {}
+        self._book_encoder = BookRevisionEncoder()
         self._last_book_ranks: dict[tuple[Venue, str], tuple[int, int, int]] = {}
         self._awaiting_fresh_snapshot: set[tuple[Venue, str]] = set()
         self._active_versions: dict[str, QuoteVersion] = {}
@@ -717,26 +960,9 @@ class SpreadObserver:
 
     def _book_record(self, event: FeedBookEvent) -> dict[str, Any]:
         book = event.book
-        return {
-            "kind": "BOOK",
-            "canonical_market": book.canonical_market,
-            "venue": book.venue.value,
-            "source_kind": event.source_kind,
-            "checksum_validation": event.checksum_validation,
-            "received_utc": book.received_utc,
-            "received_monotonic_ns": book.received_monotonic_ns,
-            "stream_session_id": book.stream_session_id,
-            "recovery_generation": book.recovery_generation,
-            "book_revision": book.book_revision,
-            "sequence": book.sequence,
-            "checksum": book.checksum,
-            "sequence_valid": book.sequence_valid,
-            "checksum_valid": book.checksum_valid,
-            "fresh": book.fresh,
-            "bids": tuple(_level_record(level) for level in book.bids),
-            "asks": tuple(_level_record(level) for level in book.asks),
-            "observed_monotonic_ns": book.received_monotonic_ns,
-        }
+        record = self._book_encoder.encode(book, source_kind=event.source_kind)
+        record["checksum_validation"] = event.checksum_validation
+        return record
 
     def _gap_record(self, gap: DataGapEvidence) -> dict[str, Any]:
         record: dict[str, Any] = {
@@ -819,7 +1045,39 @@ class SpreadObserver:
         *,
         version: QuoteVersion | None,
         created_ns: int,
+        risex_book: BookEvidence | None = None,
+        lighter_book: BookEvidence | None = None,
+        risex_state_sha256: str | None = None,
+        lighter_state_sha256: str | None = None,
     ) -> dict[str, Any]:
+        risex_revision = (
+            version.risex_book_revision
+            if version is not None
+            else None
+            if risex_book is None
+            else risex_book.book_revision
+        )
+        lighter_revision = (
+            version.lighter_book_revision
+            if version is not None
+            else None
+            if lighter_book is None
+            else lighter_book.book_revision
+        )
+        risex_revision_id = (
+            version.risex_book_revision_id
+            if version is not None
+            else None
+            if risex_book is None
+            else risex_book.book_revision_id
+        )
+        lighter_revision_id = (
+            version.lighter_book_revision_id
+            if version is not None
+            else None
+            if lighter_book is None
+            else lighter_book.book_revision_id
+        )
         return {
             "kind": "QUOTE",
             "policy_id": self.policy_id(policy),
@@ -840,6 +1098,48 @@ class SpreadObserver:
             "quote_recovery_generation": None if version is None else version.recovery_generation,
             "hedge_stream_session_id": None if version is None else version.hedge_stream_session_id,
             "hedge_recovery_generation": None if version is None else version.hedge_recovery_generation,
+            "risex_book_revision": risex_revision,
+            "risex_book_revision_id": risex_revision_id,
+            "risex_book_state_sha256": (
+                risex_state_sha256
+                if risex_state_sha256 is not None
+                else None if risex_book is None else book_state_sha256(risex_book)
+            ),
+            "risex_book_stream_session_id": (
+                None
+                if version is None and risex_book is None
+                else version.stream_session_id
+                if version is not None
+                else risex_book.stream_session_id
+            ),
+            "risex_book_recovery_generation": (
+                None
+                if version is None and risex_book is None
+                else version.recovery_generation
+                if version is not None
+                else risex_book.recovery_generation
+            ),
+            "lighter_book_revision": lighter_revision,
+            "lighter_book_revision_id": lighter_revision_id,
+            "lighter_book_state_sha256": (
+                lighter_state_sha256
+                if lighter_state_sha256 is not None
+                else None if lighter_book is None else book_state_sha256(lighter_book)
+            ),
+            "lighter_book_stream_session_id": (
+                None
+                if version is None and lighter_book is None
+                else version.hedge_stream_session_id
+                if version is not None
+                else lighter_book.stream_session_id
+            ),
+            "lighter_book_recovery_generation": (
+                None
+                if version is None and lighter_book is None
+                else version.hedge_recovery_generation
+                if version is not None
+                else lighter_book.recovery_generation
+            ),
             "quote_lifetime_ns": self.config.quote_lifetime_ns,
             "maker_side": quote.maker_side.value,
             "hedge_side": quote.lighter_side.value,
@@ -1004,6 +1304,8 @@ class SpreadObserver:
         )
         records: list[dict[str, Any]] = []
         versions: dict[str, QuoteVersion] = {}
+        risex_state_sha256 = self._book_encoder.state_sha256_for(risex)
+        lighter_state_sha256 = self._book_encoder.state_sha256_for(lighter)
         for direction in (
             SpreadDirection.RISEX_BUY_LIGHTER_SELL,
             SpreadDirection.RISEX_SELL_LIGHTER_BUY,
@@ -1041,6 +1343,10 @@ class SpreadObserver:
                             quote_expires_monotonic_ns=created_ns + self.config.quote_lifetime_ns,
                             hedge_stream_session_id=lighter.stream_session_id,
                             hedge_recovery_generation=lighter.recovery_generation,
+                            risex_book_revision=risex.book_revision,
+                            lighter_book_revision=lighter.book_revision,
+                            risex_book_revision_id=risex.book_revision_id,
+                            lighter_book_revision_id=lighter.book_revision_id,
                         )
                         versions[policy_key] = version
                     records.append(
@@ -1049,6 +1355,10 @@ class SpreadObserver:
                             quote,
                             version=version,
                             created_ns=created_ns,
+                            risex_book=risex,
+                            lighter_book=lighter,
+                            risex_state_sha256=risex_state_sha256,
+                            lighter_state_sha256=lighter_state_sha256,
                         )
                     )
         return records, versions
@@ -1069,6 +1379,19 @@ class SpreadObserver:
             )
             previous_rank = self._last_book_ranks.get(stream_key)
             if previous_rank is not None and rank <= previous_rank:
+                self.fatal_reason = "BOOK_REVISION_CHAIN_INVALID"
+                await self.handle_gap(
+                    FeedGapEvent(
+                        DataGapEvidence(
+                            source_venue=book.venue,
+                            canonical_market=book.canonical_market,
+                            stream_session_id=book.stream_session_id,
+                            recovery_generation=book.recovery_generation,
+                            gap_start_monotonic_ns=book.received_monotonic_ns,
+                            reason="BOOK_REVISION_CHAIN_INVALID",
+                        )
+                    )
+                )
                 return
             self._last_book_ranks[stream_key] = rank
         else:
@@ -1085,14 +1408,50 @@ class SpreadObserver:
             book.recovery_generation,
         )
         try:
-            self.history.add_book(book)
+            book_record = self._book_record(event)
+        except BookRevisionChainError:
+            # A feed event that cannot bind to the immediately preceding
+            # persisted revision is not safely representable.  Preserve the
+            # named gap and stop the sample rather than writing a guessed
+            # delta or silently falling back to a repeated full book.
+            self.fatal_reason = "BOOK_REVISION_CHAIN_INVALID"
+            await self.handle_gap(
+                FeedGapEvent(
+                    DataGapEvidence(
+                        source_venue=book.venue,
+                        canonical_market=book.canonical_market,
+                        stream_session_id=book.stream_session_id,
+                        recovery_generation=book.recovery_generation,
+                        gap_start_monotonic_ns=book.received_monotonic_ns,
+                        reason="BOOK_REVISION_CHAIN_INVALID",
+                    )
+                )
+            )
+            return
+        try:
+            self.history.add_book(book, source_kind=event.source_kind)
         except HistoryCapacityExceeded as exc:
             self.fatal_reason = "BOOK_HISTORY_CAPACITY"
             await self.handle_gap(FeedGapEvent(exc.gap))
             return
+        except (TypeError, ValueError):
+            self.fatal_reason = "BOOK_REVISION_CHAIN_INVALID"
+            await self.handle_gap(
+                FeedGapEvent(
+                    DataGapEvidence(
+                        source_venue=book.venue,
+                        canonical_market=book.canonical_market,
+                        stream_session_id=book.stream_session_id,
+                        recovery_generation=book.recovery_generation,
+                        gap_start_monotonic_ns=book.received_monotonic_ns,
+                        reason="BOOK_REVISION_CHAIN_INVALID",
+                    )
+                )
+            )
+            return
         self._current_books[(book.venue, book.canonical_market)] = book
         if self._sample_frozen:
-            await self._append((self._book_record(event),))
+            await self._append((book_record,))
             self._refresh_horizon_drain_event()
             return
         records, versions = self._versions_for_book(event)
@@ -1100,7 +1459,7 @@ class SpreadObserver:
             if policy_key.startswith(f"{book.canonical_market}|"):
                 self._active_versions.pop(policy_key, None)
         self._active_versions.update(versions)
-        output_records: list[Mapping[str, Any]] = [self._book_record(event), *records]
+        output_records: list[Mapping[str, Any]] = [book_record, *records]
         stop_record = self._observe_sample_stop(
             observed_monotonic_ns=book.received_monotonic_ns,
             integrity_reason=self.fatal_reason,
@@ -1255,6 +1614,10 @@ class SpreadObserver:
             "book_stream_session_id": capture.book_stream_session_id,
             "book_recovery_generation": capture.book_recovery_generation,
             "book_revision": capture.book_revision,
+            "book_revision_id": capture.book_revision_id,
+            "book_state_sha256": (
+                None if book is None else book_state_sha256(book)
+            ),
             "sequence": capture.sequence,
             "checksum": capture.checksum,
             "gap_source_venue": None if gap is None else gap.source_venue.value,
@@ -1426,7 +1789,9 @@ class SpreadObserver:
         try:
             capture = capture_horizon(
                 evidence,
-                self.history.books(Venue.LIGHTER, evidence.canonical_market, deadline),
+                self.history.latest_books(
+                    Venue.LIGHTER, evidence.canonical_market, deadline
+                ),
                 horizon_ms=horizon,
                 expected_stream_session_id=evidence.hedge_stream_session_id
                 or pending.version.hedge_stream_session_id,

@@ -1,4 +1,4 @@
-"""SS-001A contracts plus the bounded SS-001D public measurement path."""
+"""SS-001A contracts plus the bounded SS-001G public measurement path."""
 
 from .economics import (
     build_hypothetical_maker_quote,
@@ -43,6 +43,22 @@ from .models import (
     TradeEvidence,
     Venue,
     queue_overflow_gap,
+    make_book_revision_id,
+)
+from .book_chain import (
+    BookAuditResult,
+    BookChainEncoder,
+    BookRevisionChainError,
+    BookRevisionEncoder,
+    BookRevisionReconstructor,
+    BookReconstructor,
+    DELTA_BOOK_ENCODING,
+    FULL_BOOK_ENCODING,
+    LosslessBookEncoder,
+    audit_book_revisions,
+    book_chain_id,
+    book_state_sha256,
+    reconstruct_book_records,
 )
 from .config import MAX_PUBLIC_DURATION_SECONDS, ShadowConfig
 from .feed import (
@@ -105,6 +121,20 @@ __all__ = [
     "horizon_deadline_monotonic_ns",
     "is_eligible_trade",
     "queue_overflow_gap",
+    "make_book_revision_id",
+    "BookAuditResult",
+    "BookChainEncoder",
+    "BookRevisionChainError",
+    "BookRevisionEncoder",
+    "BookRevisionReconstructor",
+    "BookReconstructor",
+    "DELTA_BOOK_ENCODING",
+    "FULL_BOOK_ENCODING",
+    "LosslessBookEncoder",
+    "audit_book_revisions",
+    "book_chain_id",
+    "book_state_sha256",
+    "reconstruct_book_records",
     "select_horizon_capture",
     "size_quote",
     "validate_quote",

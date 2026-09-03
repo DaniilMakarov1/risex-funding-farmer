@@ -83,6 +83,32 @@ def _market_identities(market: CanonicalMarket) -> tuple[str, ...]:
     return tuple(dict.fromkeys(identities))
 
 
+def make_book_revision_id(
+    venue: Venue | str,
+    canonical_market: str,
+    stream_session_id: str | int,
+    recovery_generation: int,
+    book_revision: int,
+) -> str:
+    """Return the stable identity of one normalized public-book revision.
+
+    The identity deliberately includes the stream session and recovery
+    generation.  A venue revision number can restart after a reconnect, so a
+    bare integer is not sufficient to bind a quote or horizon witness.
+    """
+
+    resolved_venue = venue if isinstance(venue, Venue) else Venue(venue)
+    if not isinstance(canonical_market, str) or not canonical_market:
+        raise ValueError("canonical_market must be non-empty")
+    _session(stream_session_id)
+    _non_negative_int(recovery_generation, "recovery_generation")
+    _non_negative_int(book_revision, "book_revision")
+    return (
+        f"{resolved_venue.value}|{canonical_market}|{stream_session_id}|"
+        f"{recovery_generation}|{book_revision}"
+    )
+
+
 class SpreadDirection(StrEnum):
     """The only two maker/hedge directions in SS-001A."""
 
@@ -515,6 +541,10 @@ class QuoteVersion:
     quote_expires_monotonic_ns: int | None = None
     hedge_stream_session_id: str | int | None = None
     hedge_recovery_generation: int | None = None
+    risex_book_revision: int | None = None
+    lighter_book_revision: int | None = None
+    risex_book_revision_id: str | None = None
+    lighter_book_revision_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.version_id:
@@ -531,6 +561,18 @@ class QuoteVersion:
             _session(self.hedge_stream_session_id, "hedge_stream_session_id")
         if self.hedge_recovery_generation is not None:
             _non_negative_int(self.hedge_recovery_generation, "hedge_recovery_generation")
+        for value, name in (
+            (self.risex_book_revision, "risex_book_revision"),
+            (self.lighter_book_revision, "lighter_book_revision"),
+        ):
+            if value is not None:
+                _non_negative_int(value, name)
+        for value, name in (
+            (self.risex_book_revision_id, "risex_book_revision_id"),
+            (self.lighter_book_revision_id, "lighter_book_revision_id"),
+        ):
+            if value is not None and (not isinstance(value, str) or not value):
+                raise ValueError(f"{name} must be a non-empty string when supplied")
 
     @property
     def canonical_market(self) -> str:
@@ -655,6 +697,24 @@ class BookEvidence:
     @property
     def book_received_monotonic_ns(self) -> int:
         return self.received_monotonic_ns
+
+    @property
+    def book_revision_id(self) -> str:
+        """Exact revision identity used by persisted calculation witnesses."""
+
+        return make_book_revision_id(
+            self.venue,
+            self.canonical_market,
+            self.stream_session_id,
+            self.recovery_generation,
+            self.book_revision,
+        )
+
+    @property
+    def revision_id(self) -> str:
+        """Short alias for callers that refer to a book revision directly."""
+
+        return self.book_revision_id
 
     @property
     def is_sequence_healthy(self) -> bool:
@@ -874,6 +934,7 @@ class HedgeHorizonCapture:
     freshness_max_age_ns: int | None = None
     ambiguous_books: tuple[BookEvidence, ...] = ()
     fillability_model: FillabilityModel = FillabilityModel.STRICT_LOWER_BOUND
+    book_revision_id: str | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.horizon_ms, bool) or not isinstance(self.horizon_ms, int):
@@ -941,6 +1002,11 @@ class HedgeHorizonCapture:
                 raise ValueError("book recovery provenance does not match selected book")
             if self.book_revision != self.book.book_revision:
                 raise ValueError("book revision provenance does not match selected book")
+            expected_revision_id = self.book.book_revision_id
+            if self.book_revision_id is None:
+                object.__setattr__(self, "book_revision_id", expected_revision_id)
+            elif self.book_revision_id != expected_revision_id:
+                raise ValueError("book revision identity does not match selected book")
             if self.sequence != self.book.sequence or self.checksum != self.book.checksum:
                 raise ValueError("book sequence/checksum provenance does not match selected book")
             if self.book.received_monotonic_ns > self.horizon_deadline_monotonic_ns:
@@ -957,6 +1023,8 @@ class HedgeHorizonCapture:
             )
         ):
             raise ValueError("book provenance requires a retained book")
+        elif self.book_revision_id is not None:
+            raise ValueError("book revision identity requires a retained book")
         book_is_current = self.book is not None and (
             self.book.stream_session_id == self.expected_stream_session_id
             and self.book.recovery_generation == self.expected_recovery_generation

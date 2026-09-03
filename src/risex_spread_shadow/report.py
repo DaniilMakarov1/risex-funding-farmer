@@ -1,4 +1,4 @@
-"""Deterministic offline aggregation of SS-001F JSONL evidence."""
+"""Deterministic offline aggregation of SS-001G JSONL evidence."""
 
 from __future__ import annotations
 
@@ -9,6 +9,15 @@ import json
 from pathlib import Path
 from typing import Any, Iterator
 
+from risex_farmer.models import Venue
+
+from .book_chain import (
+    BookAuditResult,
+    BookRevisionChainError,
+    BookRevisionReconstructor,
+    book_state_sha256,
+)
+from .models import make_book_revision_id
 from .store import iter_records
 
 
@@ -33,6 +42,7 @@ _EPISODE_CONTEXT_CAP = _MAX_TOTAL_EPISODES
 _RECENT_TRADE_KEY_CAP = 4096
 _RECENT_GAP_CAP = 64
 _TERMINAL_KINDS = frozenset({"RUN_STOP", "RUN_FAILED"})
+_MAX_BOOK_REFERENCE_REQUESTS = _MAX_TOTAL_EPISODES * len(_HORIZONS)
 
 
 class EvidenceIntegrityError(ValueError):
@@ -491,6 +501,310 @@ def _validated_records(path: str | Path) -> Iterator[dict[str, Any]]:
         raise EvidenceIntegrityError("MISSING_TERMINAL_MARKER")
 
 
+def _reference_fields_present(record: dict[str, Any], prefix: str) -> bool:
+    return any(
+        record.get(name) is not None
+        for name in (
+            f"{prefix}_revision",
+            f"{prefix}_revision_id",
+            f"{prefix}_stream_session_id",
+            f"{prefix}_recovery_generation",
+        )
+    )
+
+
+def _validate_book_reference(
+    reconstructor: BookRevisionReconstructor,
+    record: dict[str, Any],
+    *,
+    prefix: str,
+    venue: Venue,
+    require_current: bool,
+    allow_legacy_id: bool = False,
+) -> tuple[tuple[Venue, str, str | int, int, int, str], str] | None:
+    """Validate one optional exact book witness and return its replay key."""
+
+    if not _reference_fields_present(record, prefix):
+        return None
+    revision_value = record.get(f"{prefix}_revision")
+    revision = (
+        revision_value
+        if isinstance(revision_value, int) and not isinstance(revision_value, bool)
+        else None
+    )
+    revision_id = record.get(f"{prefix}_revision_id")
+    session = record.get(f"{prefix}_stream_session_id")
+    recovery_value = record.get(f"{prefix}_recovery_generation")
+    recovery = (
+        recovery_value
+        if isinstance(recovery_value, int) and not isinstance(recovery_value, bool)
+        else None
+    )
+    market = record.get("canonical_market")
+    if (
+        revision is None
+        or revision < 0
+        or isinstance(session, bool)
+        or not isinstance(session, (str, int))
+        or session == ""
+        or recovery is None
+        or recovery < 0
+        or not isinstance(market, str)
+        or not market
+    ):
+        raise EvidenceIntegrityError("BOOK_REFERENCE_FIELDS_INVALID")
+    if revision_id is None:
+        if not allow_legacy_id:
+            raise EvidenceIntegrityError("BOOK_REFERENCE_FIELDS_INVALID")
+        revision_id = make_book_revision_id(
+            venue,
+            market,
+            session,
+            recovery,
+            revision,
+        )
+    elif not isinstance(revision_id, str) or not revision_id:
+        raise EvidenceIntegrityError("BOOK_REFERENCE_FIELDS_INVALID")
+    try:
+        digest = reconstructor.validate_reference(
+            venue=venue,
+            market=market,
+            session=session,
+            recovery=recovery,
+            revision=revision,
+            revision_id=revision_id,
+            require_current=require_current,
+        )
+    except BookRevisionChainError as exc:
+        raise EvidenceIntegrityError(exc.reason) from exc
+    supplied_digest = record.get(f"{prefix}_state_sha256")
+    if supplied_digest is not None:
+        if (
+            not isinstance(supplied_digest, str)
+            or len(supplied_digest) != 64
+            or any(character not in "0123456789abcdef" for character in supplied_digest)
+        ):
+            raise EvidenceIntegrityError("BOOK_REFERENCE_DIGEST_INVALID")
+        if require_current and supplied_digest != digest:
+            raise EvidenceIntegrityError("BOOK_REFERENCE_DIGEST_MISMATCH")
+    return (
+        venue,
+        market,
+        session,
+        recovery,
+        revision,
+        revision_id,
+    ), (supplied_digest or "")
+
+
+def _audit_book_evidence(path: str | Path) -> BookAuditResult:
+    """Replay BOOK chains and verify all new exact calculation witnesses.
+
+    The first pass retains only one reconstructed state per identity chain.
+    Horizon references are bounded by the prospective episode cap and are
+    checked in a second streaming pass so an older referenced book never
+    requires retaining every historical full book in memory.
+    """
+
+    reconstructor = BookRevisionReconstructor()
+    horizon_requests: dict[
+        tuple[Venue, str, str | int, int, int, str], str
+    ] = {}
+    for record in _validated_records(path):
+        kind = record.get("kind")
+        if kind == "BOOK":
+            try:
+                reconstructor.append(record)
+            except BookRevisionChainError as exc:
+                raise EvidenceIntegrityError(exc.reason) from exc
+        elif kind == "DATA_GAP":
+            try:
+                venue = Venue(record.get("venue"))
+            except (TypeError, ValueError):
+                venue = None
+            session = record.get("stream_session_id")
+            recovery = _record_int(record, "recovery_generation")
+            market = _key_text(record.get("canonical_market"))
+            if (
+                venue in (Venue.RISEX, Venue.LIGHTER)
+                and isinstance(session, (str, int))
+                and not isinstance(session, bool)
+                and session != ""
+                and recovery is not None
+                and market
+            ):
+                reconstructor.mark_gap(
+                    venue=venue,
+                    market=market,
+                    session=session,
+                    recovery=recovery,
+                )
+        elif kind == "QUOTE":
+            # Quote construction is bound to the current pair of books.  A
+            # new quote may not point behind the current chain tip.
+            risex_reference = _validate_book_reference(
+                reconstructor,
+                record,
+                prefix="risex_book",
+                venue=Venue.RISEX,
+                require_current=True,
+            )
+            lighter_reference = _validate_book_reference(
+                reconstructor,
+                record,
+                prefix="lighter_book",
+                venue=Venue.LIGHTER,
+                require_current=True,
+            )
+            if (risex_reference is None) != (lighter_reference is None):
+                raise EvidenceIntegrityError("QUOTE_BOOK_REFERENCE_PAIR_INCOMPLETE")
+            if risex_reference is not None and lighter_reference is not None:
+                risex_key = risex_reference[0]
+                lighter_key = lighter_reference[0]
+                expected_risex_session = record.get(
+                    "risex_book_stream_session_id",
+                    record.get("quote_stream_session_id", record.get("stream_session_id")),
+                )
+                expected_risex_recovery = _record_int(
+                    record,
+                    "risex_book_recovery_generation",
+                )
+                if expected_risex_recovery is None:
+                    expected_risex_recovery = _record_int(
+                        record,
+                        "quote_recovery_generation",
+                    )
+                expected_lighter_session = record.get(
+                    "lighter_book_stream_session_id",
+                    record.get("hedge_stream_session_id"),
+                )
+                expected_lighter_recovery = _record_int(
+                    record,
+                    "lighter_book_recovery_generation",
+                )
+                if expected_lighter_recovery is None:
+                    expected_lighter_recovery = _record_int(
+                        record,
+                        "hedge_recovery_generation",
+                    )
+                if (
+                    expected_risex_session is not None
+                    and risex_key[2] != expected_risex_session
+                ) or (
+                    expected_risex_recovery is not None
+                    and risex_key[3] != expected_risex_recovery
+                ) or (
+                    expected_lighter_session is not None
+                    and lighter_key[2] != expected_lighter_session
+                ) or (
+                    expected_lighter_recovery is not None
+                    and lighter_key[3] != expected_lighter_recovery
+                ):
+                    raise EvidenceIntegrityError("QUOTE_BOOK_REFERENCE_IDENTITY_MISMATCH")
+        elif kind == "HEDGE_HORIZON":
+            prefix = "book"
+            book_reference_present = _reference_fields_present(record, prefix)
+            lighter_reference_present = _reference_fields_present(record, "lighter_book")
+            if book_reference_present and lighter_reference_present:
+                raise EvidenceIntegrityError("HORIZON_BOOK_REFERENCE_AMBIGUOUS")
+            if not book_reference_present and lighter_reference_present:
+                prefix = "lighter_book"
+            result = _validate_book_reference(
+                reconstructor,
+                record,
+                prefix=prefix,
+                venue=Venue.LIGHTER,
+                require_current=False,
+                allow_legacy_id=True,
+            )
+            if result is not None:
+                key, digest = result
+                # A SESSION_DISPLACED outcome intentionally retains the
+                # latest book from the wrong stream as diagnostic evidence;
+                # its selected-book identity must not equal the expected
+                # stream.  Other selected-book outcomes must remain bound to
+                # the expected Lighter identity.
+                if record.get("outcome") != "HEDGE_SESSION_DISPLACED":
+                    expected_session = record.get("expected_stream_session_id")
+                    if expected_session is None:
+                        expected_session = record.get("book_stream_session_id")
+                    expected_recovery = _record_int(
+                        record,
+                        "expected_recovery_generation",
+                    )
+                    if expected_recovery is None:
+                        expected_recovery = _record_int(
+                            record,
+                            "book_recovery_generation",
+                        )
+                    if (
+                        expected_session is not None
+                        and key[2] != expected_session
+                    ) or (
+                        expected_recovery is not None
+                        and key[3] != expected_recovery
+                    ):
+                        raise EvidenceIntegrityError("HORIZON_BOOK_REFERENCE_IDENTITY_MISMATCH")
+                if len(horizon_requests) >= _MAX_BOOK_REFERENCE_REQUESTS and key not in horizon_requests:
+                    raise EvidenceIntegrityError("BOOK_REFERENCE_CAPACITY")
+                previous = horizon_requests.get(key)
+                if previous is not None and previous != digest:
+                    raise EvidenceIntegrityError("BOOK_REFERENCE_DIGEST_CONFLICT")
+                horizon_requests[key] = digest
+
+    if horizon_requests:
+        replay = BookRevisionReconstructor()
+        remaining = set(horizon_requests)
+        for record in _validated_records(path):
+            if record.get("kind") == "DATA_GAP":
+                try:
+                    venue = Venue(record.get("venue"))
+                except (TypeError, ValueError):
+                    venue = None
+                session = record.get("stream_session_id")
+                recovery = _record_int(record, "recovery_generation")
+                market = _key_text(record.get("canonical_market"))
+                if (
+                    venue in (Venue.RISEX, Venue.LIGHTER)
+                    and isinstance(session, (str, int))
+                    and not isinstance(session, bool)
+                    and session != ""
+                    and recovery is not None
+                    and market
+                ):
+                    replay.mark_gap(
+                        venue=venue,
+                        market=market,
+                        session=session,
+                        recovery=recovery,
+                    )
+                continue
+            if record.get("kind") != "BOOK":
+                continue
+            try:
+                book = replay.append(record)
+            except BookRevisionChainError as exc:
+                raise EvidenceIntegrityError(exc.reason) from exc
+            key = (
+                book.venue,
+                book.canonical_market,
+                book.stream_session_id,
+                book.recovery_generation,
+                book.book_revision,
+                book.book_revision_id,
+            )
+            if key not in remaining:
+                continue
+            expected_digest = horizon_requests[key]
+            if expected_digest:
+                if expected_digest != book_state_sha256(book):
+                    raise EvidenceIntegrityError("BOOK_REFERENCE_DIGEST_MISMATCH")
+            remaining.remove(key)
+        if remaining:
+            raise EvidenceIntegrityError("BOOK_REFERENCE_NOT_REPLAYED")
+    return reconstructor.audit()
+
+
 def _record_decimal(record: dict[str, Any], *names: str) -> Decimal | None:
     for name in names:
         value = _decimal(record.get(name))
@@ -677,6 +991,7 @@ def _model_payload(
 
 
 def build_report(path: str | Path) -> dict[str, Any]:
+    book_audit = _audit_book_evidence(path)
     metadata: dict[str, Any] = {}
     mode = "OBSERVATIONAL"
     record_count = 0
@@ -1320,6 +1635,12 @@ def build_report(path: str | Path) -> dict[str, Any]:
         "strict_episode_count": root_counts["strict_episode_count"],
         "optimistic_episode_count": root_counts["optimistic_episode_count"],
         "horizon_record_count": horizon_record_count,
+        "book_record_count": book_audit.book_count,
+        "full_book_snapshot_count": book_audit.full_snapshot_count,
+        "book_delta_count": book_audit.delta_count,
+        "book_chain_count": book_audit.chain_count,
+        "maximum_reconstructed_book_levels": book_audit.maximum_level_count,
+        "current_reconstructed_book_levels": book_audit.current_level_count,
         "sample_stop_reason": None if sample_stop_payload is None else sample_stop_payload["reason"],
         "sample_stop_signal": sample_stop_payload,
         "optimistic_model": "IMPLEMENTED" if optimistic_supported else "NOT_IMPLEMENTED",
