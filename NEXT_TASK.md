@@ -1,19 +1,17 @@
 # Active bounded task
 
-## SS-001E — Evidence Throughput Recovery
+## DG-004 — Fillability Bounds Recovery Discovery
 
-Status: `AUTHORIZED / FRESH POST-REJECTION BUILDER REQUIRED`.
+Status: `FROZEN / READY TO RUN ONCE`.
 
-Objective: correct the proven DG-003 public evidence backpressure and terminal-drain failure with the smallest lossless change, without changing quote economics, fillability semantics, the evidence caps, or any strategy behavior.
+Objective: obtain one valid prospective public fillability/delayed-entry-edge verdict on the independently accepted lossless evidence path.
 
-Exact base: current accepted and published `main`. Use one fresh visible Spread Builder and fresh `codex/spread-ss-001e-throughput-recovery` branch/worktree. Verification is Level A. Builder performs no public/live run.
+Exact measurement source: `cd741e2a46e874f1e77feebac2aba5c80a96455d`. No Builder or code change is authorized. Use one fresh owner-only store and exact `BTC/ETH/SOL`, both directions, `$100/$250/$500`, `1/2/3/5 bps`, `0/300/500/1000 ms`, frozen fee inputs, `25 s` freshness, and unchanged strict/optimistic semantics.
 
-Allowed scope: the minimum `risex_spread_shadow` store/observer/runner/report and focused tests needed to make the existing `store_batch_size=128` and `store_batch_interval_seconds=0.25` contract real, preserve deterministic ordering, and drain a frozen sample cleanly under the observed bounded three-market load. Diagnose with immutable DG-003 evidence and deterministic fixtures only. Compact quote-to-book references are allowed only if measured fixture evidence proves batching/sync correction alone insufficient.
+Stop on the first of `50` aggregate strict episodes, `500` unique eligible RISEx trades with relevant active quotes, `1200 s`, or integrity/fatal. Complete only the frozen Lighter horizon tail after sample stop. Enforce `2,500,000` records, `12 GiB`, and at least `24 GiB` free before start. Do not inspect economic output before terminal stop.
 
-Required adverse evidence: at-or-above-observed burst/sustained fixture load has zero `QUEUE_OVERFLOW`; records retain deterministic append order and unique indices; periodic/batch sync has a strict maximum unsynced interval/count; stop flushes all pre-stop evidence, freezes later RISEx economics, retains only required Lighter horizon evidence, and completes within the accepted shutdown bound; write/sync/cap failures remain fail-closed with the reserved terminal marker; legacy DG-002B and failed DG-003 stores replay deterministically and remain historically unchanged.
+Acceptance: exact source/universe/config, clean unique terminal, no fatal/integrity/non-terminal transport gap, all model-scoped horizons, deterministic repeated report, owner-only permissions, complete per-policy snapshot/fillability/hedge/concentration report, and exact System Specification 2.9 verdict precedence.
 
-Acceptance: Chief independently verifies the immutable failure diagnosis, scope, adverse load/flush/failure tests, deterministic replay of both historical stores, focused tests, one clean isolated Python 3.11 full suite on final SHA, dependency/import/private/write surfaces, Git cleanliness, and no economics/storage-platform expansion. Builder never self-accepts or merges/pushes `main`.
+Forbidden: any code, fee, quote grid, maker pricing, fill definition, eligibility, stop rule, horizon, venue, strategy, storage representation/cap, private/auth/credential/signing/write/testnet/mainnet, `SS-002`, or `SS-003` change; manual stop/extension or automatic retry.
 
-Forbidden: changing fees, quote grid, maker pricing, strict/optimistic definitions, eligibility, thresholds, stop logic, horizons, venue, strategy, funding, inventory, exits, or evidence caps; queue-size/timeout-only masking; compression/database/message-bus/generic persistence architecture; private/auth/credential/signing/write/testnet/mainnet; SS-002 or SS-003.
-
-After acceptance only, Chief may freeze one fresh replacement public discovery gate prospectively. No repeat run is authorized before that freeze.
+After the terminal verdict, record it and stop. `SS-002` and `SS-003` remain closed; even `ENTRY_EDGE_CANDIDATE` permits only a later separate proposal.

@@ -1,6 +1,6 @@
 # RISEx Spread Shadow — System Specification
 
-SYSTEM_SPEC_VERSION = 2.8
+SYSTEM_SPEC_VERSION = 2.9
 SPEC_STATUS = ACTIVE_SPREAD_SHADOW__FROZEN_LEGACY_FUNDING_FARMER
 
 ## 0. Active product domain: RISEx Spread Shadow
@@ -178,6 +178,16 @@ The one frozen DG-003 run is immutable `DATA_INSUFFICIENT / MEASUREMENT_THROUGHP
 - Increasing queue capacity or shutdown timeout alone is not acceptance because it does not remove sustained backpressure. No compression platform, database, message bus, generic persistence framework, strategy/economic change, private access, or write path is authorized.
 - Acceptance requires an adverse high-rate fixture at or above the observed three-market event/quote workload with zero queue overflow, bounded memory, deterministic evidence/report output, and a clean stop plus horizon drain inside the accepted shutdown bound. Failure injection must prove ordered record indices, bounded unsynced exposure, final sync, cap reserve, and exactly one terminal marker.
 - A replacement prospective economic gate may be frozen only after this correction is independently accepted. It must use a fresh store and exact accepted source and must not reuse DG-003 economic output to tune quote economics or fill definitions. `SS-002` and `SS-003` remain closed.
+
+### 0.11 Frozen replacement fillability-bounds gate `DG-004`
+
+`DG-004 — Fillability Bounds Recovery Discovery` is frozen before its sample on exact accepted measurement source `cd741e2a46e874f1e77feebac2aba5c80a96455d`. It is one fresh public-only observational run in a fresh owner-only store. No DG-003 economic count or edge value may tune its parameters.
+
+- Universe and economics remain exact: `BTC/ETH/SOL`; both directions; target notionals `$100/$250/$500`; target margins `1/2/3/5 bps`; horizons `0/300/500/1000 ms`; configured RISEx Tier-3 maker fee and Lighter Standard taker fee with the already accepted provenance; `25 s` freshness; unchanged quote construction, strict lower bound, optimistic at-or-through upper bound, eligibility, exact-q accumulation, no-lookahead capture, and concentration dimensions.
+- The economic sample stops on the first of: `50` aggregate strict would-fill episodes; `500` unique eligible RISEx public trades while relevant quotes are active; `1200 s` wall clock; or any integrity/fatal condition. The already accepted frozen-sample/Lighter-horizon tail must complete without later RISEx economics. No manual early stop, extension, retry, or parameter change is allowed.
+- Storage remains append-only JSONL with the accepted lossless batching path, maximum `2,500,000` records and `12 GiB`, at least `24 GiB` free before start, deterministic offline replay, owner-only permissions, exact terminal uniqueness, and all evidence needed by section 0.8. Crossing a cap is `DATA_INSUFFICIENT`, never a partial economic verdict.
+- Completeness, thresholds, reporting dimensions, and seven-verdict precedence are exactly section 0.9. In particular, `PROFITABLE_QUOTES_UNFILLABLE` and the public-bracket form of `FILLABILITY_INSUFFICIENT_EVIDENCE` require `500` eligible trades; a valid strict-stop sample instead reports the complete per-policy delayed-edge evidence and may reach `LATENCY_DESTROYS_EDGE` or `ENTRY_EDGE_CANDIDATE` only through the frozen material-policy thresholds. Sparse/concentrated strict evidence cannot be promoted to an entry candidate.
+- Any terminal result is evidence, not trading permission. `SS-002` and `SS-003` remain closed. Only a separately recorded `ENTRY_EDGE_CANDIDATE` may support a later proposal for SS-002; it does not open it automatically.
 
 ## Legacy benchmark domain: RISEx Funding Farmer
 
