@@ -1,5 +1,11 @@
 # Active bounded task
 
+## Chief mission and completion condition
+
+The current Chief mission is to finish the Entry Viability Stage with an evidence-backed product verdict about whether a practically available, repeatable positive RISEx-maker to Lighter-taker entry edge exists. Accepted SS-001B plus smoke is an intermediate technical milestone, not mission completion.
+
+Required sequence: accept and integrate the minimal SS-001B measurement pipeline; complete its bounded public-only smoke; before examining the full discovery sample, freeze the exact discovery universe, freshness policy, public fee inputs and sources, numeric strict/optimistic fillability thresholds, minimum completeness, fatal/incomplete stop rules, maximum duration/evidence count, and verdict rules; run bounded real-public discovery; then issue exactly one predeclared Entry Viability verdict. Do not open SS-002 before that verdict.
+
 ## Legacy central economics/funding task
 
 Status: `FROZEN / REPLACED`.
@@ -14,7 +20,7 @@ The accepted pure contracts are the only Spread-domain base for SS-001B. Rejecte
 
 ## SS-001B — limited public integration, evidence store, and report
 
-Status: `AUTHORIZED FOR ONE FRESH VISIBLE SPREAD BUILDER`.
+Status: `AUTHORIZED FOR ONE FRESH VISIBLE SPREAD BUILDER`. The first Builder attempt was rejected without a commit or acceptance evidence; a replacement must start from the current accepted `main`.
 
 Base: the exact accepted governance `main` selected by the Chief when the Builder is created.
 

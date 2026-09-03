@@ -2,7 +2,8 @@
 
 ## Accepted baseline and ownership
 
-- Transition preflight on `2026-09-02` independently verified local `main`, local `origin/main`, and GitHub `refs/heads/main` at `554b6c9c5e2b60eb13c9f33c6c2184e6932c84f0` (`Refine conservative PAPER economics gate`). The published commit containing this status is the current accepted governance tip.
+- Current accepted `main` and `origin/main` are `2d67811757994deef8523ae384c5e09cd1b2502f` before this governance checkpoint.
+- Transition preflight on `2026-09-02` independently verified local `main`, local `origin/main`, and GitHub `refs/heads/main` at `554b6c9c5e2b60eb13c9f33c6c2184e6932c84f0` (`Refine conservative PAPER economics gate`). That SHA remains the historical transition baseline; later accepted work is recorded below.
 - The active project root is `/Users/daniilmakarov/Desktop/RISEx Spread Shadow`, created as a clean checkout of the existing `DaniilMakarov1/risex-funding-farmer` repository. This is not a new GitHub repository.
 - The historical checkout `/Users/daniilmakarov/Desktop/risex-funding-farmer` contains a pre-existing modified `README.md`, six untracked operational artifacts, and old dirty worktree residues. They were not changed, accepted, or used as a base. Old unaccepted candidates are abandoned/rejected residue.
 - One Chief owns `main`, governance, acceptance, push, and operational decisions. No old Chief or Builder task is active.
@@ -27,3 +28,11 @@
 - SS-001A candidate `a3ac545a78a687788595470c1e1e1e91a501ec74` was independently rejected and was not merged. Its green tests did not cover fail-open missing economics, invalid cross-clock exchange-monotonic ordering, missing explicit would-fill detection time, or recovery-generation displacement. The original Builder is released; correction requires a fresh visible Spread Builder from current accepted `main`.
 - Correction candidate `7b3e370865de28bc4a4566445c676772dc0727cc` was also independently rejected and not merged. It failed a required repeating-decimal multi-level exact-q case, accepted sizing evidence with the wrong direction/target notional, and lacked venue identity on gap evidence. System Specification 2.2 freezes these adverse contracts before the next fresh candidate.
 - The rejected candidates remain historical non-authoritative evidence and were not merged. `SS-002`, `SS-003`, and the full discovery run remain closed.
+- The first SS-001B Builder attempt from `2d67811757994deef8523ae384c5e09cd1b2502f` was formally rejected and released without a commit. Its unaccepted worktree duplicated implementation paths, reached about 4,600 new production lines, and produced no final tests or smoke evidence. `main` was untouched; SS-001B remains the only open implementation slice and requires a fresh Builder.
+
+## Current Chief mission
+
+- The Entry Viability Stage is not complete when SS-001B and its smoke are complete. Those are intermediate technical milestones.
+- The mission ends only after: accepted/integrated minimal SS-001B; successful bounded public-only pipeline smoke; a separately frozen pre-discovery gate covering universe, freshness, public fee inputs, fillability thresholds, completeness, stop rules, and verdict rules; bounded real-public discovery; and one evidence-backed Entry Viability product verdict.
+- The terminal verdict is one of `ENTRY_EDGE_CANDIDATE`, `NO_SNAPSHOT_EDGE`, `LATENCY_DESTROYS_EDGE`, `PROFITABLE_QUOTES_UNFILLABLE`, `FILLABILITY_INSUFFICIENT_EVIDENCE`, `LIGHTER_DEPTH_UNSUITABLE`, or `DATA_INSUFFICIENT`.
+- Discovery remains closed until SS-001B acceptance and the separate frozen gate. `SS-002` remains closed until the product verdict and may be proposed only after repeated `ENTRY_EDGE_CANDIDATE` evidence satisfies that frozen gate.
