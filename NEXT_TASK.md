@@ -1,17 +1,17 @@
 # Active bounded task
 
-## DG-007 — Fillability Bounds Resolution Discovery
+## SS-001I — Open-Ended Gap Replay Parity
 
-Status: `FROZEN PROSPECTIVELY / NOT YET OPENED`.
+Status: `AUTHORIZED / BUILDER NOT YET OPENED`.
 
-Objective: run exactly one public unauthenticated RISEx–Lighter fillability-bounds sample that can resolve the active mission through the frozen valid strict/optimistic bracket and delayed-edge rules.
+Objective: correct the proven offline null-ended-gap overlap defect so deterministic replay agrees with the accepted online interval/identity semantics and the immutable DG-007 evidence can receive its frozen verdict.
 
-Exact source: `6e03195fe1c45e076cbe4cd20a2a02b178cc40e1`.
+Exact base: accepted published `main` after this governance record. Create one fresh visible Spread Builder and worktree from that exact base.
 
-Frozen sample: `BTC/ETH/SOL`; both directions; `$100/$250/$500`; `1/2/3/5 bps`; `0/300/500/1000 ms`; configured fees; `25 s` freshness; unchanged strict lower bound and optimistic upper bound. Stop on the first exact policy with `10` valid all-horizon strict episodes across `5` detection timestamps, or `500` eligible trades, or `1,200 s`, or integrity/fatal failure.
+Allowed: change only offline report gap-overlap handling and focused tests. A null-ended gap is open from its recorded start and never overlaps evidence completed before that start; matching venue/market/session/recovery and later interval overlap remain mandatory and fail closed where evidence is genuinely malformed or incomplete.
 
-Admission and evidence: exact source/universe match; owner-only append-only full-plus-delta store; at least `24 GiB` free; unchanged `2,500,000`-record and `12 GiB` caps; contiguous indices and valid chains/references; all required model-scoped horizons; raw/valid/contaminated named attribution; one physically-last terminal; deterministic repeated reports. Run exactly once and do not tune, extend, or stop from observed economics.
+Acceptance: adverse null-ended and finite gap boundaries; exact identity mismatches; mixed same-policy recovery generations; unchanged raw counts/horizons; two byte-identical reports for each immutable DG-006 and DG-007 store; focused tests and one fresh isolated Python 3.11 full suite. Corrected DG-007 stop-policy validity must agree with its online `10`-episode/`10`-timestamp signal or the gate remains insufficient.
 
-Verdict: apply System Specification 0.9 and 0.17 precedence using valid episode/edge evidence only. Complete the active mission only with case A, B, or C as defined there; in case C finish the prospective entry-edge verdict and stop before `SS-002`.
+Forbidden: collection/runtime changes, economics, fees, quote construction, fill models, eligibility, online stop logic, horizons, queues, storage/caps/timeouts, protocol or venue behavior, any new sample, private/auth/credential/signing/order preparation/dispatch/testnet/mainnet/write activity, strategy, `SS-002`, or `SS-003`.
 
-Forbidden: any implementation change, sample-dependent tuning, private/auth/credential/signing/order preparation/dispatch/testnet/mainnet/write activity, venue or strategy change, `SS-002`, or `SS-003`.
+After candidate delivery, Chief independently reviews and alone accepts/integrates, then applies the already-frozen DG-007 verdict to the unchanged immutable evidence. Do not collect another sample.
