@@ -360,6 +360,9 @@ def test_observer_counts_one_eligible_trade_across_policies_and_keeps_models_ind
         observer._replay_mode = False
         await observer.flush_pending(force=True)
         await observer.handle_trade(FeedTradeEvent(trade, _pair(), "duplicate"))
+        await observer.append_terminal(
+            {"kind": "RUN_STOP", "fatal_reason": None, "observed_monotonic_ns": 0}
+        )
         await observer.close()
 
     import asyncio

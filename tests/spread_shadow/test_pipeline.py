@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 from decimal import Decimal as D
+import hashlib
 import json
 from pathlib import Path
+import threading
 import time
 from types import SimpleNamespace
 
@@ -30,6 +32,7 @@ from risex_spread_shadow import (
     HistoryCapacityExceeded,
     IngressQueue,
     EvidenceStorageLimitExceeded,
+    EvidenceIntegrityError,
     MarketPair,
     MAX_PUBLIC_DURATION_SECONDS,
     ReplayHarness,
@@ -800,6 +803,157 @@ async def test_observer_writer_latches_failure_without_retrying_ambiguous_batch(
 
 
 @pytest.mark.asyncio
+async def test_cancelled_thread_append_quiesces_before_terminal_append(tmp_path: Path) -> None:
+    store = AppendOnlyEvidenceStore.create(
+        tmp_path,
+        metadata={"source_commit": "fixture", "evidence_mode": "FIXTURE"},
+    )
+    original_append_batch = store.append_batch
+    started = threading.Event()
+    release = threading.Event()
+    active_calls = 0
+    maximum_active_calls = 0
+
+    def blocked_append(records):
+        nonlocal active_calls, maximum_active_calls
+        active_calls += 1
+        maximum_active_calls = max(maximum_active_calls, active_calls)
+        started.set()
+        if any(record.get("record_id") == "blocked" for record in records):
+            assert release.wait(timeout=2)
+        try:
+            return original_append_batch(records)
+        finally:
+            active_calls -= 1
+
+    store.append_batch = blocked_append
+    observer = SpreadObserver(
+        config(store_batch_size=1, store_batch_interval_seconds=1),
+        (PAIR,),
+        store,
+    )
+    append_task = asyncio.create_task(
+        observer._append(
+            ({"kind": "EVIDENCE", "record_id": "blocked", "observed_monotonic_ns": 1},)
+        )
+    )
+    assert await asyncio.to_thread(started.wait, 1)
+
+    terminal_task = asyncio.create_task(
+        observer.append_terminal(
+            {
+                "kind": "RUN_FAILED",
+                "failure_class": "CancelledError",
+                "fatal_reason": "EVIDENCE_APPEND_CANCELLED",
+                "observed_monotonic_ns": 2,
+            }
+        )
+    )
+    append_task.cancel()
+    await asyncio.sleep(0.01)
+    assert not append_task.done()
+    assert not terminal_task.done()
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await append_task
+    await asyncio.wait_for(terminal_task, timeout=1)
+    assert observer.append_quiescent
+    assert maximum_active_calls == 1
+
+    await observer.close()
+    store.close()
+    records = [json.loads(line) for line in store.path.read_text().splitlines()]
+    assert [record["record_index"] for record in records] == list(range(len(records)))
+    assert [record["kind"] for record in records] == [
+        "RUN_METADATA",
+        "EVIDENCE",
+        "RUN_FAILED",
+    ]
+    assert records[-1]["fatal_reason"] == "EVIDENCE_APPEND_CANCELLED"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("close_before_failure", (False, True))
+async def test_protocol_failure_evidence_survives_full_or_closing_ingress(
+    tmp_path: Path,
+    close_before_failure: bool,
+) -> None:
+    store = AppendOnlyEvidenceStore.create(
+        tmp_path,
+        metadata={"source_commit": "fixture", "evidence_mode": "FIXTURE"},
+    )
+    observer = SpreadObserver(
+        config(ingress_queue_capacity=1),
+        (PAIR,),
+        store,
+    )
+
+    class FakeRisex:
+        @staticmethod
+        def market_id(_symbol):
+            return 1
+
+    class FakeLighter:
+        @staticmethod
+        def market_id(_symbol):
+            return 2
+
+    feed = PublicFeedRunner(
+        None,
+        (PAIR,),
+        observer.ingress,
+        risex_adapter=FakeRisex(),
+        lighter_adapter=FakeLighter(),
+    )
+    feed.begin_connection(Venue.LIGHTER, "lighter")
+    queued = FeedBookEvent(
+        evidence_book(Venue.LIGHTER, received=10, session="lighter"),
+        PAIR,
+        "SNAPSHOT",
+        "fixture",
+    )
+    assert observer.ingress.offer(queued)
+    if close_before_failure:
+        observer.ingress.close()
+    feed._protocol_failure(
+        Venue.LIGHTER,
+        "LIGHTER_PUBLIC_FRAME_INVALID",
+        frame_kind="BINARY",
+        frame_category="UNSUPPORTED_FRAME_KIND",
+        frame_data=b"invalid",
+    )
+    if not close_before_failure:
+        observer.ingress.close()
+
+    await observer.consume()
+    await observer.close()
+    await observer.append_terminal(
+        {
+            "kind": "RUN_FAILED",
+            "failure_class": "FATAL_RUNTIME",
+            "fatal_reason": feed.fatal_reason,
+            "observed_monotonic_ns": 20,
+        }
+    )
+    store.close()
+
+    records = [json.loads(line) for line in store.path.read_text().splitlines()]
+    gaps = [record for record in records if record.get("kind") == "DATA_GAP"]
+    assert len(gaps) == 1
+    gap = gaps[0]
+    assert gap["reason"] == "LIGHTER_PUBLIC_FRAME_INVALID"
+    assert gap["venue"] == "LIGHTER"
+    assert gap["protocol_frame_kind"] == "BINARY"
+    assert gap["protocol_frame_category"] == "UNSUPPORTED_FRAME_KIND"
+    assert gap["protocol_frame_length"] == len(b"invalid")
+    assert gap["protocol_frame_sha256"] == hashlib.sha256(b"invalid").hexdigest()
+    assert "invalid" not in json.dumps(gap)
+    assert records[-1]["kind"] == "RUN_FAILED"
+    assert records.index(gap) < len(records) - 1
+
+
+@pytest.mark.asyncio
 async def test_observed_three_market_load_has_bounded_lossless_batched_drain() -> None:
     observed_book_events = 39_877
     observed_quote_rows = 643_392
@@ -991,7 +1145,9 @@ async def test_batched_cap_failure_leaves_reserved_terminal_marker_slot(
     with pytest.raises(EvidenceStorageLimitExceeded, match="RECORD_COUNT"):
         await observer.close()
     assert observer.fatal_reason == "EVIDENCE_STORAGE_LIMIT"
-    store.append_batch(({"kind": "RUN_FAILED", "fatal_reason": observer.fatal_reason},))
+    await observer.append_terminal(
+        {"kind": "RUN_FAILED", "fatal_reason": observer.fatal_reason}
+    )
     store.close()
     records = [json.loads(line) for line in (store.path).read_text().splitlines()]
     assert [record["kind"] for record in records] == ["RUN_METADATA", "RUN_FAILED"]
@@ -1878,6 +2034,157 @@ async def test_run_public_smoke_emits_one_clean_stop_or_one_failure_marker(
     assert fatal_result["fatal_reason"] == "TEST_FATAL"
 
 
+@pytest.mark.asyncio
+async def test_run_public_smoke_selection_failure_keeps_terminal_audit_trail(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    class SelectionFailure(RuntimeError):
+        pass
+
+    async def select_failure(_risex, _lighter, **_kwargs):
+        raise SelectionFailure("public market selection failed")
+
+    monkeypatch.setattr(runner_module, "select_public_market_pairs", select_failure)
+    root = tmp_path / "selection-failure"
+    with pytest.raises(SelectionFailure, match="public market selection failed"):
+        await runner_module.run_public_smoke(
+            str(root), config=config(), source_commit="fixture", duration_seconds=1
+        )
+
+    evidence_path = root / next(path.name for path in root.iterdir()) / "evidence.jsonl"
+    records = [json.loads(line) for line in evidence_path.read_text().splitlines()]
+    assert [record["kind"] for record in records] == ["RUN_METADATA", "RUN_FAILED"]
+    assert [record["record_index"] for record in records] == [0, 1]
+    assert [
+        record["kind"]
+        for record in records
+        if record.get("kind") in {"RUN_STOP", "RUN_FAILED"}
+    ] == ["RUN_FAILED"]
+    assert records[-1]["failure_class"] == "SelectionFailure"
+    assert store_permissions(evidence_path) == 0o600
+    assert evidence_path.parent.stat().st_mode & 0o777 == 0o700
+
+
+@pytest.mark.asyncio
+async def test_close_waits_for_claimed_terminal_append(tmp_path: Path) -> None:
+    store = AppendOnlyEvidenceStore.create(
+        tmp_path,
+        metadata={"source_commit": "fixture", "evidence_mode": "FIXTURE"},
+    )
+    original_append_batch = store.append_batch
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocked_terminal_append(records):
+        if any(record.get("kind") == "RUN_FAILED" for record in records):
+            started.set()
+            assert release.wait(timeout=2)
+        return original_append_batch(records)
+
+    store.append_batch = blocked_terminal_append
+    observer = SpreadObserver(
+        config(store_batch_size=8, store_batch_interval_seconds=1),
+        (PAIR,),
+        store,
+    )
+    terminal_task = asyncio.create_task(
+        observer.append_terminal(
+            {
+                "kind": "RUN_FAILED",
+                "failure_class": "fixture",
+                "fatal_reason": "fixture",
+                "observed_monotonic_ns": 1,
+            }
+        )
+    )
+    assert await asyncio.to_thread(started.wait, 1)
+    close_task = asyncio.create_task(observer.close())
+    await asyncio.sleep(0.01)
+    assert not close_task.done()
+    assert not store.is_closed
+
+    release.set()
+    await asyncio.wait_for(terminal_task, timeout=1)
+    await asyncio.wait_for(close_task, timeout=1)
+    assert observer.terminal_written
+    assert not store.is_closed
+    store.close()
+    records = [json.loads(line) for line in store.path.read_text().splitlines()]
+    assert [record["record_index"] for record in records] == list(range(len(records)))
+    assert records[-1]["kind"] == "RUN_FAILED"
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    (
+        ("duplicate", "DUPLICATE_RECORD_INDEX"),
+        ("missing", "MISSING_RECORD_INDEX"),
+        ("decreasing", "DECREASING_RECORD_INDEX"),
+        ("multiple_terminal", "MULTIPLE_TERMINAL_MARKERS"),
+        ("missing_terminal", "MISSING_TERMINAL_MARKER"),
+        ("record_after_terminal", "RECORD_AFTER_TERMINAL"),
+    ),
+)
+def test_report_rejects_dg004_style_physical_corruption(
+    tmp_path: Path,
+    mutation: str,
+    reason: str,
+) -> None:
+    store = AppendOnlyEvidenceStore.create(
+        tmp_path,
+        metadata={"source_commit": "fixture", "evidence_mode": "FIXTURE"},
+    )
+    store.append_batch(
+        (
+            {"kind": "EVIDENCE", "record_id": "one", "observed_monotonic_ns": 1},
+            {"kind": "RUN_FAILED", "fatal_reason": "fixture", "observed_monotonic_ns": 2},
+        )
+    )
+    path = store.path
+    store.close()
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+
+    if mutation == "duplicate":
+        records[-1]["record_index"] = records[-2]["record_index"]
+    elif mutation == "missing":
+        records[-1]["record_index"] += 1
+    elif mutation == "decreasing":
+        records[-1]["record_index"] = records[-2]["record_index"] - 1
+    elif mutation == "multiple_terminal":
+        records.append(
+            {
+                "kind": "RUN_STOP",
+                "fatal_reason": None,
+                "record_index": records[-1]["record_index"] + 1,
+            }
+        )
+    elif mutation == "missing_terminal":
+        records.pop()
+    elif mutation == "record_after_terminal":
+        terminal = dict(records[-1])
+        terminal["record_index"] = 1
+        records = [
+            records[0],
+            terminal,
+            {
+                "kind": "EVIDENCE",
+                "record_id": "after-terminal",
+                "record_index": 2,
+            },
+        ]
+    path.write_text(
+        "\n".join(
+            json.dumps(record, sort_keys=True, separators=(",", ":"))
+            for record in records
+        )
+        + "\n"
+    )
+
+    with pytest.raises(EvidenceIntegrityError, match=reason):
+        build_report(path)
+
+
 def test_report_uses_horizon_entry_edges_and_excludes_only_clean_terminal_stop_gap(
     tmp_path: Path,
 ) -> None:
@@ -1959,9 +2266,8 @@ def test_report_uses_horizon_entry_edges_and_excludes_only_clean_terminal_stop_g
     assert partial_group["positive_edge_share"] is None
     assert partial_group["mean_conditional_markout_usd"] is None
 
-    forced = build_report(write_records(tmp_path / "forced", clean_stop=False))
-    forced_group = next(group for group in forced["groups"] if group["horizon_ms"] == 300)
-    assert forced_group["data_completeness"] == "DEGRADED"
+    with pytest.raises(EvidenceIntegrityError, match="MISSING_TERMINAL_MARKER"):
+        build_report(write_records(tmp_path / "forced", clean_stop=False))
 
 
 def test_report_completeness_is_episode_scoped_and_zero_fill_is_clean(

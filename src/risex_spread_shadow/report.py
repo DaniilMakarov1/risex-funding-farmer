@@ -1,4 +1,4 @@
-"""Deterministic offline aggregation of SS-001D JSONL evidence."""
+"""Deterministic offline aggregation of SS-001F JSONL evidence."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .store import iter_records
 
@@ -32,6 +32,19 @@ _HORIZON_VERSION_CAP = _MAX_MODEL_EPISODES
 _EPISODE_CONTEXT_CAP = _MAX_TOTAL_EPISODES
 _RECENT_TRADE_KEY_CAP = 4096
 _RECENT_GAP_CAP = 64
+_TERMINAL_KINDS = frozenset({"RUN_STOP", "RUN_FAILED"})
+
+
+class EvidenceIntegrityError(ValueError):
+    """Raised when the physical evidence stream cannot support a report."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(f"evidence integrity failure: {reason}")
+
+
+def _is_terminal_kind(value: Any) -> bool:
+    return isinstance(value, str) and value in _TERMINAL_KINDS
 
 
 class _BoundedValues:
@@ -442,6 +455,42 @@ def _record_model(record: dict[str, Any]) -> str:
     return _OPTIMISTIC_MODEL if _key_text(value).upper() == _OPTIMISTIC_MODEL else _STRICT_MODEL
 
 
+def _validated_records(path: str | Path) -> Iterator[dict[str, Any]]:
+    """Validate physical append identity and terminal placement while streaming."""
+
+    previous_index: int | None = None
+    terminal_kind: str | None = None
+    for record in iter_records(path):
+        value = record.get("record_index")
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise EvidenceIntegrityError("INVALID_RECORD_INDEX")
+        if previous_index is None:
+            if value != 0:
+                raise EvidenceIntegrityError("MISSING_RECORD_INDEX")
+        elif value == previous_index:
+            raise EvidenceIntegrityError("DUPLICATE_RECORD_INDEX")
+        elif value < previous_index:
+            raise EvidenceIntegrityError("DECREASING_RECORD_INDEX")
+        elif value != previous_index + 1:
+            raise EvidenceIntegrityError(
+                "MISSING_RECORD_INDEX / NON_CONTIGUOUS_RECORD_INDEX"
+            )
+
+        kind = record.get("kind")
+        if terminal_kind is not None:
+            if _is_terminal_kind(kind):
+                raise EvidenceIntegrityError("MULTIPLE_TERMINAL_MARKERS")
+            raise EvidenceIntegrityError(
+                "RECORD_AFTER_TERMINAL / TERMINAL_MARKER_NOT_LAST"
+            )
+        if _is_terminal_kind(kind):
+            terminal_kind = kind
+        previous_index = value
+        yield record
+    if terminal_kind is None:
+        raise EvidenceIntegrityError("MISSING_TERMINAL_MARKER")
+
+
 def _record_decimal(record: dict[str, Any], *names: str) -> Decimal | None:
     for name in names:
         value = _decimal(record.get(name))
@@ -650,6 +699,7 @@ def build_report(path: str | Path) -> dict[str, Any]:
     seen_trade_keys: set[str] = set()
     trade_key_order: deque[str] = deque(maxlen=_RECENT_TRADE_KEY_CAP)
     first_sample_stop: dict[str, Any] | None = None
+    replay_seen = False
 
     def policy_for(policy_id: str | None, record: dict[str, Any]) -> _PolicyStats | None:
         if policy_id is None or not policy_id:
@@ -972,7 +1022,7 @@ def build_report(path: str | Path) -> dict[str, Any]:
         "strict_episode_count": 0,
         "optimistic_episode_count": 0,
     }
-    for record in iter_records(path):
+    for record in _validated_records(path):
         record_count += 1
         kind = record.get("kind")
         market = record.get("canonical_market")
@@ -984,6 +1034,7 @@ def build_report(path: str | Path) -> dict[str, Any]:
                 metadata = candidate
         elif kind == "REPLAY_MODE":
             mode = "FIXTURE"
+            replay_seen = True
         elif kind == "RUN_FAILED":
             failed_run = True
         elif kind == "RUN_STOP" and record.get("fatal_reason") in (None, ""):
@@ -1013,9 +1064,9 @@ def build_report(path: str | Path) -> dict[str, Any]:
         for gap in pending_stop_gaps:
             mark_gap(gap)
 
-    mode = "FIXTURE" if mode == "FIXTURE" or any(
-        record.get("kind") == "REPLAY_MODE" for record in iter_records(path)
-    ) else _key_text(metadata.get("evidence_mode", mode))
+    mode = "FIXTURE" if mode == "FIXTURE" or replay_seen else _key_text(
+        metadata.get("evidence_mode", mode)
+    )
     if _OPTIMISTIC_MODEL in {
         _key_text(value).upper()
         for value in metadata.get("fillability_models", ())
@@ -1307,4 +1358,4 @@ def render_report(path: str | Path, *, format: str = "json") -> str:
     return "\n".join(lines)
 
 
-__all__ = ["build_report", "render_report"]
+__all__ = ["EvidenceIntegrityError", "build_report", "render_report"]

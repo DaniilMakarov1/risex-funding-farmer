@@ -54,7 +54,7 @@ from .feed import (
     PublicFeedRunner,
     select_public_market_pairs,
 )
-from .report import build_report, render_report
+from .report import EvidenceIntegrityError, build_report, render_report
 from .runner import (
     BookHistory,
     HistoryCapacityExceeded,
@@ -112,6 +112,7 @@ __all__ = [
     "validate_sizing_evidence",
     "would_fill_evidence",
     "AppendOnlyEvidenceStore",
+    "EvidenceIntegrityError",
     "EvidenceStorageLimitExceeded",
     "MAX_EVIDENCE_FILE_BYTES",
     "MAX_EVIDENCE_RECORDS",

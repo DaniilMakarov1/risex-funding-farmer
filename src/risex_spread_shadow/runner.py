@@ -1,4 +1,4 @@
-"""The single SS-001E observer, evidence path, and public-smoke orchestration."""
+"""The single SS-001F observer, evidence path, and public-smoke orchestration."""
 
 from __future__ import annotations
 
@@ -54,6 +54,7 @@ from .store import AppendOnlyEvidenceStore, EvidenceStorageLimitExceeded
 
 
 _SHUTDOWN_TIMEOUT_SECONDS = 2.0
+_TERMINAL_KINDS = frozenset({"RUN_STOP", "RUN_FAILED"})
 
 
 def _level_record(level: BookLevel) -> dict[str, str]:
@@ -374,6 +375,9 @@ class SpreadObserver:
         self._batch_stop_event = asyncio.Event()
         self._batch_wakeup = asyncio.Event()
         self._append_failure: BaseException | None = None
+        self._append_operation: asyncio.Task[Any] | None = None
+        self._last_append_succeeded = False
+        self._append_cancelled = False
         self._version_serial = 0
         sample_started = (
             0
@@ -392,6 +396,11 @@ class SpreadObserver:
         self._sample_stop_recorded = False
         self.fatal_reason: str | None = None
         self._closing = False
+        self._closed_for_append = False
+        self._terminal_started = False
+        self._terminal_written = False
+        self._terminal_error: BaseException | None = None
+        self._terminal_complete_event = asyncio.Event()
         self._replay_mode = False
 
     @property
@@ -450,6 +459,17 @@ class SpreadObserver:
 
         return len(self._pending_records)
 
+    @property
+    def append_quiescent(self) -> bool:
+        """Whether no thread-backed store append remains in flight."""
+
+        operation = self._append_operation
+        return operation is None or operation.done()
+
+    @property
+    def terminal_written(self) -> bool:
+        return self._terminal_written
+
     @staticmethod
     def policy_id(policy: QuotePolicy) -> str:
         return "|".join(
@@ -482,10 +502,81 @@ class SpreadObserver:
             integrity_reason=self.fatal_reason,
         )
 
-    async def _flush_pending_batch_locked(self) -> None:
+    def _register_append_cancelled(self, *, terminal: bool) -> None:
+        """Latch cancellation without permitting an unsafe append retry."""
+
+        self._append_cancelled = True
+        if self.fatal_reason is None:
+            self.fatal_reason = "EVIDENCE_APPEND_CANCELLED"
+        if not terminal:
+            self._observe_sample_stop(
+                observed_monotonic_ns=max(
+                    self._sample_stop.started_monotonic_ns,
+                    self._monotonic_ns(),
+                ),
+                integrity_reason=self.fatal_reason,
+            )
+
+    async def _wait_store_operation(
+        self,
+        operation: asyncio.Task[Any],
+    ) -> Any:
+        """Wait for a thread-backed append even when its caller is cancelled."""
+
+        while True:
+            if operation.cancelled():
+                raise RuntimeError("evidence append worker was cancelled")
+            try:
+                return await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                # Cancellation of this coroutine must not cancel the actual
+                # worker.  Keep waiting until the file operation is known to
+                # have finished, so no later append can overlap it.
+                continue
+
+    async def _store_append(
+        self,
+        records: Sequence[Mapping[str, Any]],
+        *,
+        terminal: bool = False,
+    ) -> Any:
+        """Run one physical append and retain its completion across cancel."""
+
+        if self._append_operation is not None:
+            raise RuntimeError("concurrent evidence append is not permitted")
+        operation = asyncio.create_task(
+            asyncio.to_thread(self.store.append_batch, records)
+        )
+        self._append_operation = operation
+        self._last_append_succeeded = False
+        try:
+            result = await asyncio.shield(operation)
+            self._last_append_succeeded = True
+            return result
+        except asyncio.CancelledError:
+            try:
+                result = await self._wait_store_operation(operation)
+            except Exception as exc:
+                self._register_append_failure(exc)
+                raise
+            self._last_append_succeeded = True
+            self._register_append_cancelled(terminal=terminal)
+            # The physical append is complete, but the caller's cancellation
+            # remains a fail-closed run condition.
+            raise
+        except Exception as exc:
+            self._register_append_failure(exc)
+            raise
+        finally:
+            if operation.done() and self._append_operation is operation:
+                self._append_operation = None
+
+    async def _flush_pending_batch_locked(self, *, allow_failure: bool = False) -> None:
         """Durably append the current batch while ``_append_lock`` is held."""
 
-        if self._append_failure is not None:
+        if self._append_failure is not None and not (
+            allow_failure and isinstance(self._append_failure, EvidenceStorageLimitExceeded)
+        ):
             raise self._append_failure
         if not self._pending_records:
             return
@@ -498,9 +589,13 @@ class SpreadObserver:
         try:
             # Keep JSON serialization, flush, and fsync off the event loop.
             # append_batch performs one sync for the whole batch.
-            await asyncio.to_thread(self.store.append_batch, records)
+            await self._store_append(records)
         except Exception as exc:
-            self._register_append_failure(exc)
+            # _store_append latches the first physical failure.  Preserve the
+            # original exception here without attempting a second append.
+            if not isinstance(exc, asyncio.CancelledError):
+                if self._append_failure is None:
+                    self._register_append_failure(exc)
             raise
 
     async def _flush_pending_batch(self) -> None:
@@ -580,12 +675,24 @@ class SpreadObserver:
         async with self._append_lock:
             if self._append_failure is not None:
                 raise self._append_failure
+            if self._append_cancelled:
+                raise RuntimeError("evidence append was cancelled; run is fail-closed")
+            if self._terminal_started:
+                raise RuntimeError("terminal evidence append has already started")
+            if self._closed_for_append:
+                raise RuntimeError("evidence writer is closed")
 
             # Keep each domain event contiguous.  If adding it would cross
             # the configured count, flush the prior records first, then
             # enqueue the event as a fresh batch.  A single event may itself
             # contain several quote rows; it is never split or dropped.
             incoming = tuple(dict(record) for record in records)
+            if any(
+                isinstance(record.get("kind"), str)
+                and record["kind"] in _TERMINAL_KINDS
+                for record in incoming
+            ):
+                raise ValueError("terminal evidence must use append_terminal")
             if self._pending_records and (
                 len(self._pending_records) + len(incoming)
                 > self.config.store_batch_size
@@ -632,7 +739,7 @@ class SpreadObserver:
         }
 
     def _gap_record(self, gap: DataGapEvidence) -> dict[str, Any]:
-        return {
+        record: dict[str, Any] = {
             "kind": "DATA_GAP",
             "canonical_market": gap.canonical_market,
             "venue": gap.source_venue.value,
@@ -643,6 +750,16 @@ class SpreadObserver:
             "reason": gap.reason,
             "observed_monotonic_ns": gap.gap_start_monotonic_ns,
         }
+        if gap.protocol_frame_kind is not None:
+            record.update(
+                {
+                    "protocol_frame_kind": gap.protocol_frame_kind,
+                    "protocol_frame_category": gap.protocol_frame_category,
+                    "protocol_frame_length": gap.protocol_frame_length,
+                    "protocol_frame_sha256": gap.protocol_frame_sha256,
+                }
+            )
+        return record
 
     def _book_admissible(self, event: FeedBookEvent) -> bool:
         book = event.book
@@ -1405,31 +1522,199 @@ class SpreadObserver:
         await self._flush_pending_batch()
         self._refresh_horizon_drain_event()
 
+    async def _stop_batch_loop(self) -> None:
+        """Stop the interval flusher only after its worker is quiescent."""
+
+        self._batch_stop_event.set()
+        self._batch_wakeup.set()
+        task = self._batch_loop_task
+        if task is None or task is asyncio.current_task():
+            return
+        was_cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                # Keep waiting for the loop's current append.  Re-raise only
+                # after the physical worker has stopped so a caller cannot
+                # start a direct terminal append concurrently.
+                was_cancelled = True
+            except BaseException:
+                break
+        await asyncio.gather(task, return_exceptions=True)
+        if self._batch_loop_task is task:
+            self._batch_loop_task = None
+        if was_cancelled:
+            raise asyncio.CancelledError
+
+    async def _wait_append_quiescent(self) -> None:
+        """Wait for any physical append even when its owner task is gone."""
+
+        operation = self._append_operation
+        if operation is None:
+            return
+        try:
+            await self._wait_store_operation(operation)
+        except Exception as exc:
+            if self._append_failure is None:
+                self._register_append_failure(exc)
+            raise
+
+    async def _wait_terminal_completion(self) -> None:
+        """Keep store shutdown behind a terminal call running in another task."""
+
+        if not self._terminal_started or self._terminal_written:
+            return
+        was_cancelled = False
+        while not self._terminal_complete_event.is_set():
+            try:
+                await asyncio.shield(self._terminal_complete_event.wait())
+            except asyncio.CancelledError:
+                was_cancelled = True
+        if was_cancelled:
+            raise asyncio.CancelledError
+        if self._terminal_error is not None:
+            raise self._terminal_error
+
+    async def _acquire_append_lock_uncancelled(self) -> bool:
+        """Acquire the append lock without abandoning a waiter on cancel."""
+
+        waiter = asyncio.create_task(self._append_lock.acquire())
+        was_cancelled = False
+        while True:
+            try:
+                await asyncio.shield(waiter)
+                return was_cancelled
+            except asyncio.CancelledError:
+                was_cancelled = True
+
+    async def _cancel_capture_tasks_and_wait(self) -> None:
+        """Cancel capture tasks and wait for their append work to quiesce."""
+
+        tasks = {task for task in self._tasks if task is not asyncio.current_task()}
+        for task in tasks:
+            task.cancel()
+        was_cancelled = False
+        pending = tasks
+        while pending:
+            try:
+                _done, pending = await asyncio.wait(pending)
+            except asyncio.CancelledError:
+                # The child tasks may be unwinding a shielded thread append;
+                # do not let caller cancellation make store.close race them.
+                was_cancelled = True
+        self._tasks.difference_update(tasks)
+        if was_cancelled:
+            raise asyncio.CancelledError
+
+    async def append_terminal(self, record: Mapping[str, Any]) -> None:
+        """Append the sole terminal marker after every prior append is done."""
+
+        if not isinstance(record, Mapping):
+            raise TypeError("terminal evidence must be a mapping")
+        kind = record.get("kind")
+        if kind not in _TERMINAL_KINDS:
+            raise ValueError("terminal evidence must be RUN_STOP or RUN_FAILED")
+
+        cancelled_while_claiming = await self._acquire_append_lock_uncancelled()
+        try:
+            if self._terminal_written:
+                if cancelled_while_claiming:
+                    raise asyncio.CancelledError
+                return
+            if self._terminal_started:
+                if self._terminal_error is not None:
+                    raise self._terminal_error
+                raise RuntimeError("terminal evidence append has already started")
+            self._terminal_started = True
+            self._closing = True
+            self._batch_stop_event.set()
+            self._batch_wakeup.set()
+        finally:
+            self._append_lock.release()
+
+        try:
+            await self._cancel_capture_tasks_and_wait()
+            await self._stop_batch_loop()
+        except BaseException as exc:
+            self._terminal_error = exc
+            self._closed_for_append = True
+            self._active_versions.clear()
+            self._terminal_complete_event.set()
+            raise
+
+        terminal_operation_started = False
+        cancelled_while_writing = await self._acquire_append_lock_uncancelled()
+        try:
+            try:
+                # A known pre-append cap failure still permits the reserved
+                # RUN_FAILED marker.  Ambiguous physical write failures do
+                # not permit any retry.
+                await self._flush_pending_batch_locked(allow_failure=True)
+                terminal_operation_started = True
+                await self._store_append((dict(record),), terminal=True)
+            except asyncio.CancelledError:
+                if terminal_operation_started and self._last_append_succeeded:
+                    self._terminal_written = True
+                else:
+                    self._terminal_error = asyncio.CancelledError()
+                self._closed_for_append = True
+                self._active_versions.clear()
+                self._terminal_complete_event.set()
+                raise
+            except BaseException as exc:
+                self._terminal_error = exc
+                self._closed_for_append = True
+                self._active_versions.clear()
+                self._terminal_complete_event.set()
+                raise
+            else:
+                self._terminal_written = True
+                self._closed_for_append = True
+                self._active_versions.clear()
+                self._terminal_complete_event.set()
+        finally:
+            self._append_lock.release()
+        if cancelled_while_claiming or cancelled_while_writing:
+            raise asyncio.CancelledError
+
     async def close(self) -> None:
+        await self._wait_terminal_completion()
+        if self._closed_for_append:
+            if self._append_failure is not None:
+                raise self._append_failure
+            if self._terminal_error is not None:
+                raise self._terminal_error
+            self.ingress.close()
+            return
         self._closing = True
         failure: BaseException | None = None
         try:
             await self.flush_pending(force=False)
-            if self._tasks:
-                tasks = tuple(self._tasks)
-                for task in tasks:
-                    task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-                self._tasks.clear()
+            await self._cancel_capture_tasks_and_wait()
         except BaseException as exc:
             failure = exc
         finally:
+            try:
+                await self._cancel_capture_tasks_and_wait()
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
             # Stop the interval flusher only after horizon tasks have drained
             # so no producer can race the final durable append.  A sleeping
             # loop exits promptly after the event is set; a write already in
             # progress is awaited rather than cancelled (cancelling a
             # thread-backed fsync could overlap a subsequent append).
-            self._batch_stop_event.set()
-            self._batch_wakeup.set()
-            batch_task = self._batch_loop_task
-            if batch_task is not None:
-                await asyncio.gather(batch_task, return_exceptions=True)
-                self._batch_loop_task = None
+            try:
+                await self._stop_batch_loop()
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
+            try:
+                await self._wait_append_quiescent()
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
             if failure is None:
                 try:
                     await self._flush_pending_batch()
@@ -1437,6 +1722,7 @@ class SpreadObserver:
                     failure = exc
             self.ingress.close()
             self._active_versions.clear()
+            self._closed_for_append = True
             self._refresh_horizon_drain_event()
         if failure is not None:
             raise failure
@@ -1642,6 +1928,13 @@ class ReplayHarness:
         finally:
             self.observer._replay_mode = False
         await self.observer.flush_pending(force=True)
+        await self.observer.append_terminal(
+            {
+                "kind": "RUN_STOP",
+                "fatal_reason": None,
+                "observed_monotonic_ns": 0,
+            }
+        )
 
 
 async def run_public_smoke(
@@ -1694,7 +1987,13 @@ async def run_public_smoke(
                 requested_markets=requested_markets,
                 max_markets=config.max_markets,
             )
-            store.append_batch(
+            observer = SpreadObserver(
+                config,
+                pairs,
+                store,
+                sample_started_monotonic_ns=time.monotonic_ns(),
+            )
+            await observer._append(
                 ({
                     "kind": "RUN_START",
                     "markets": tuple(pair.canonical_market for pair in pairs),
@@ -1703,12 +2002,7 @@ async def run_public_smoke(
                     "observed_monotonic_ns": 0,
                 },)
             )
-            observer = SpreadObserver(
-                config,
-                pairs,
-                store,
-                sample_started_monotonic_ns=time.monotonic_ns(),
-            )
+            await observer.flush_pending()
             feed = PublicFeedRunner(
                 session,
                 pairs,
@@ -1720,27 +2014,23 @@ async def run_public_smoke(
             await SpreadShadowRunner(feed, observer).run(duration_seconds=duration_seconds)
             fatal_reason = feed.fatal_reason or observer.fatal_reason
             if fatal_reason is None:
-                try:
-                    store.append_batch(
-                        ({
-                            "kind": "RUN_STOP",
-                            "fatal_reason": None,
-                            "stopped_utc": datetime.now(UTC),
-                            "observed_monotonic_ns": time.monotonic_ns(),
-                        },)
-                    )
-                except EvidenceStorageLimitExceeded:
-                    observer.fatal_reason = "EVIDENCE_STORAGE_LIMIT"
-                    raise
+                await observer.append_terminal(
+                    {
+                        "kind": "RUN_STOP",
+                        "fatal_reason": None,
+                        "stopped_utc": datetime.now(UTC),
+                        "observed_monotonic_ns": time.monotonic_ns(),
+                    }
+                )
             else:
-                store.append_batch(
-                    ({
+                await observer.append_terminal(
+                    {
                         "kind": "RUN_FAILED",
                         "failure_class": "FATAL_RUNTIME",
                         "fatal_reason": fatal_reason,
                         "failed_utc": datetime.now(UTC),
                         "observed_monotonic_ns": time.monotonic_ns(),
-                    },)
+                    }
                 )
             terminal_written = True
             result = {
@@ -1753,24 +2043,28 @@ async def run_public_smoke(
                 "byte_count": store.byte_count,
             }
             return result
-    except Exception as exc:
+    except BaseException as exc:
         if not terminal_written:
             fatal_reason = (
-                None
-                if feed is None or observer is None
-                else feed.fatal_reason or observer.fatal_reason
-            )
+                None if feed is None else feed.fatal_reason
+            ) or (None if observer is None else observer.fatal_reason)
+            failure_record = {
+                "kind": "RUN_FAILED",
+                "failure_class": type(exc).__name__,
+                "fatal_reason": fatal_reason,
+                "failed_utc": datetime.now(UTC),
+                "observed_monotonic_ns": time.monotonic_ns(),
+            }
             try:
-                store.append_batch(
-                    ({
-                        "kind": "RUN_FAILED",
-                        "failure_class": type(exc).__name__,
-                        "fatal_reason": fatal_reason,
-                        "failed_utc": datetime.now(UTC),
-                        "observed_monotonic_ns": time.monotonic_ns(),
-                    },)
-                )
-            except Exception as marker_exc:
+                if observer is None:
+                    # Before an observer exists there is no background writer
+                    # or buffered append that could race this one safe direct
+                    # terminal append (for example, market selection failed).
+                    store.append_batch((failure_record,))
+                else:
+                    await observer.append_terminal(failure_record)
+                terminal_written = True
+            except BaseException as marker_exc:
                 exc.add_note(
                     f"unable to persist RUN_FAILED marker: {type(marker_exc).__name__}"
                 )

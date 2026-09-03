@@ -1,4 +1,4 @@
-"""Owner-only append-only evidence storage for SS-001B."""
+"""Owner-only append-only evidence storage for SS-001F."""
 
 from __future__ import annotations
 
@@ -99,6 +99,7 @@ def _record_order(record: Mapping[str, Any], ordinal: int) -> tuple[Any, ...]:
     except (TypeError, ValueError):
         monotonic = 0
     return (
+        1 if text("kind") in {"RUN_STOP", "RUN_FAILED"} else 0,
         monotonic,
         text("kind"),
         text("canonical_market"),

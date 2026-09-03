@@ -1,4 +1,4 @@
-"""Limited RISEx/Lighter public feed ingress for SS-001B."""
+"""Limited RISEx/Lighter public feed ingress for SS-001F."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
+import hashlib
 import json
 import time
 from typing import Any, Callable
@@ -23,6 +24,27 @@ from .models import BookEvidence, DataGapEvidence, TradeEvidence
 
 
 _DRAIN_SCHEDULING_ALLOWANCE_SECONDS = 1.2
+_PROTOCOL_FRAME_LENGTH_CAP = 65_536
+
+
+def _protocol_frame_evidence(data: Any) -> tuple[int, str]:
+    """Return bounded, non-raw evidence for one invalid public frame."""
+
+    if isinstance(data, str):
+        raw = data.encode("utf-8", "replace")
+    elif isinstance(data, bytes):
+        raw = data
+    elif isinstance(data, (bytearray, memoryview)):
+        raw = bytes(data)
+    elif data is None:
+        raw = b""
+    else:
+        # Do not retain or stringify an arbitrary payload.  Its type is enough
+        # to distinguish an unexpected object from a text/binary frame.
+        raw = type(data).__name__.encode("ascii", "replace")
+    bounded_length = min(len(raw), _PROTOCOL_FRAME_LENGTH_CAP)
+    digest = hashlib.sha256(raw).hexdigest()
+    return bounded_length, digest
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +182,14 @@ class IngressQueue:
             end = None
         else:
             end = max(previous.gap_end_monotonic_ns, end)
+        protocol_gap = next(
+            (
+                candidate
+                for candidate in (previous, gap)
+                if candidate.protocol_frame_kind is not None
+            ),
+            None,
+        )
         self._latched[identity] = DataGapEvidence(
             source_venue=previous.source_venue,
             canonical_market=previous.canonical_market,
@@ -169,7 +199,19 @@ class IngressQueue:
                 previous.gap_start_monotonic_ns, gap.gap_start_monotonic_ns
             ),
             gap_end_monotonic_ns=end,
-            reason="QUEUE_OVERFLOW",
+            reason=("QUEUE_OVERFLOW" if protocol_gap is None else protocol_gap.reason),
+            protocol_frame_kind=(
+                None if protocol_gap is None else protocol_gap.protocol_frame_kind
+            ),
+            protocol_frame_category=(
+                None if protocol_gap is None else protocol_gap.protocol_frame_category
+            ),
+            protocol_frame_length=(
+                None if protocol_gap is None else protocol_gap.protocol_frame_length
+            ),
+            protocol_frame_sha256=(
+                None if protocol_gap is None else protocol_gap.protocol_frame_sha256
+            ),
         )
 
     def offer(self, item: IngressItem) -> bool:
@@ -307,13 +349,17 @@ class PublicFeedRunner:
         start: int | None = None,
         session_id: str | int | None = None,
         recovery_generation: int | None = None,
+        protocol_evidence: Mapping[str, Any] | None = None,
     ) -> None:
         if session_id is None:
             session_id = state.session_id
         if session_id is None:
-            return
+            if protocol_evidence is None:
+                return
+            session_id = "unknown"
         if recovery_generation is None:
             recovery_generation = state.recovery_generation
+        protocol_fields = {} if protocol_evidence is None else dict(protocol_evidence)
         self.ingress.offer(
             FeedGapEvent(
                 DataGapEvidence(
@@ -325,6 +371,10 @@ class PublicFeedRunner:
                         self._monotonic_ns() if start is None else start
                     ),
                     reason=reason,
+                    protocol_frame_kind=protocol_fields.get("protocol_frame_kind"),
+                    protocol_frame_category=protocol_fields.get("protocol_frame_category"),
+                    protocol_frame_length=protocol_fields.get("protocol_frame_length"),
+                    protocol_frame_sha256=protocol_fields.get("protocol_frame_sha256"),
                 )
             )
         )
@@ -370,13 +420,40 @@ class PublicFeedRunner:
         )
         return None if pair is None else self.state(venue, pair.canonical_market)
 
-    def _protocol_failure(self, venue: Venue, reason: str) -> None:
+    def _protocol_failure(
+        self,
+        venue: Venue,
+        reason: str,
+        *,
+        frame_kind: str = "UNKNOWN",
+        frame_category: str = "UNCLASSIFIED",
+        frame_data: Any = None,
+    ) -> None:
         self.fatal_reason = reason
         if self._external_stop_event is not None:
             self._external_stop_event.set()
+        sanitized_kind = "".join(
+            character if 0x20 <= ord(character) <= 0x7E else "?"
+            for character in str(frame_kind)
+        )[:64] or "UNKNOWN"
+        sanitized_category = "".join(
+            character if 0x20 <= ord(character) <= 0x7E else "?"
+            for character in str(frame_category)
+        )[:96] or "UNCLASSIFIED"
+        frame_length, frame_sha256 = _protocol_frame_evidence(frame_data)
+        protocol_evidence = {
+            "protocol_frame_kind": sanitized_kind,
+            "protocol_frame_category": sanitized_category,
+            "protocol_frame_length": frame_length,
+            "protocol_frame_sha256": frame_sha256,
+        }
         for pair in self.market_pairs:
             state = self.state(venue, pair.canonical_market)
-            self._gap(state, reason=reason)
+            self._gap(
+                state,
+                reason=reason,
+                protocol_evidence=protocol_evidence,
+            )
             state.stream.gap()
             state.awaiting_snapshot = True
 
@@ -673,6 +750,9 @@ class PublicFeedRunner:
         value = getattr(message, "type", None)
         if value is None:
             return "TEXT"
+        enum_name = getattr(value, "name", None)
+        if enum_name in {"BINARY", "CONTINUATION"}:
+            return enum_name
         text = str(value)
         if text.endswith("TEXT") or text in {"1", "TEXT"}:
             return "TEXT"
@@ -718,12 +798,24 @@ class PublicFeedRunner:
                         self._confirm_venue(Venue.RISEX)
                     await self.ingest_risex_payload(payload, ws=ws)
                 else:
-                    self._protocol_failure(Venue.RISEX, "RISEX_PUBLIC_MESSAGE_INVALID")
+                    self._protocol_failure(
+                        Venue.RISEX,
+                        "RISEX_PUBLIC_MESSAGE_INVALID",
+                        frame_kind=kind,
+                        frame_category="INVALID_MESSAGE_PAYLOAD",
+                        frame_data=getattr(message, "data", None),
+                    )
                     return
             if self.fatal_reason is not None:
                 return
             elif kind not in {"PONG", "TEXT"}:
-                self._protocol_failure(Venue.RISEX, "RISEX_PUBLIC_FRAME_INVALID")
+                self._protocol_failure(
+                    Venue.RISEX,
+                    "RISEX_PUBLIC_FRAME_INVALID",
+                    frame_kind=kind,
+                    frame_category="UNSUPPORTED_FRAME_KIND",
+                    frame_data=getattr(message, "data", None),
+                )
                 return
 
     async def _read_lighter(self, ws: Any, stop: asyncio.Event) -> None:
@@ -753,12 +845,24 @@ class PublicFeedRunner:
                         self._confirm_venue(Venue.LIGHTER)
                     await self.ingest_lighter_payload(payload, ws=ws)
                 else:
-                    self._protocol_failure(Venue.LIGHTER, "LIGHTER_PUBLIC_MESSAGE_INVALID")
+                    self._protocol_failure(
+                        Venue.LIGHTER,
+                        "LIGHTER_PUBLIC_MESSAGE_INVALID",
+                        frame_kind=kind,
+                        frame_category="INVALID_MESSAGE_PAYLOAD",
+                        frame_data=getattr(message, "data", None),
+                    )
                     return
             if self.fatal_reason is not None:
                 return
             if kind != "TEXT":
-                self._protocol_failure(Venue.LIGHTER, "LIGHTER_PUBLIC_FRAME_INVALID")
+                self._protocol_failure(
+                    Venue.LIGHTER,
+                    "LIGHTER_PUBLIC_FRAME_INVALID",
+                    frame_kind=kind,
+                    frame_category="UNSUPPORTED_FRAME_KIND",
+                    frame_data=getattr(message, "data", None),
+                )
                 return
 
     async def _transport_loop(self, venue: Venue, stop: asyncio.Event) -> None:

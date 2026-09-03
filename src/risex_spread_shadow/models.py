@@ -675,6 +675,10 @@ class DataGapEvidence:
     gap_start_monotonic_ns: int
     gap_end_monotonic_ns: int | None = None
     reason: str = "DATA_GAP"
+    protocol_frame_kind: str | None = None
+    protocol_frame_category: str | None = None
+    protocol_frame_length: int | None = None
+    protocol_frame_sha256: str | None = None
 
     def __post_init__(self) -> None:
         venue = self.source_venue if isinstance(self.source_venue, Venue) else Venue(self.source_venue)
@@ -692,6 +696,33 @@ class DataGapEvidence:
                 raise ValueError("gap end must not precede gap start")
         if not self.reason:
             raise ValueError("gap reason must be non-empty")
+        protocol_values = (
+            self.protocol_frame_kind,
+            self.protocol_frame_category,
+            self.protocol_frame_length,
+            self.protocol_frame_sha256,
+        )
+        if any(value is not None for value in protocol_values):
+            if any(value is None for value in protocol_values):
+                raise ValueError("protocol failure evidence must be complete")
+            for value, name, limit in (
+                (self.protocol_frame_kind, "protocol_frame_kind", 64),
+                (self.protocol_frame_category, "protocol_frame_category", 96),
+            ):
+                if not isinstance(value, str) or not value or len(value) > limit:
+                    raise ValueError(f"{name} must be a bounded non-empty string")
+                if any(ord(character) < 0x20 or ord(character) > 0x7E for character in value):
+                    raise ValueError(f"{name} must use printable ASCII")
+            _non_negative_int(self.protocol_frame_length, "protocol_frame_length")  # type: ignore[arg-type]
+            if self.protocol_frame_length > 65_536:  # type: ignore[operator]
+                raise ValueError("protocol_frame_length must be bounded")
+            digest = self.protocol_frame_sha256
+            if (
+                not isinstance(digest, str)
+                or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+            ):
+                raise ValueError("protocol_frame_sha256 must be a lowercase SHA-256 digest")
 
     @property
     def venue(self) -> Venue:
