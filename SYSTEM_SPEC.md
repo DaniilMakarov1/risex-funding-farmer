@@ -1,6 +1,6 @@
 # RISEx Spread Shadow — System Specification
 
-SYSTEM_SPEC_VERSION = 2.2
+SYSTEM_SPEC_VERSION = 2.3
 SPEC_STATUS = ACTIVE_SPREAD_SHADOW__FROZEN_LEGACY_FUNDING_FARMER
 
 ## 0. Active product domain: RISEx Spread Shadow
@@ -89,6 +89,31 @@ It may reuse only venue-neutral/public contracts and exact pure math: normalized
 The following legacy strategy dependencies are forbidden from every new entrypoint-reachable path: `risex_farmer.scanner`, `risex_farmer.paper_broker`, `risex_farmer.lifecycle`, legacy `RoutePlan` admission/ranking, funding activation/cutoff policy, position state machine, persistence, Telegram/reporting, operational testnet/mainnet modules, authenticated adapters, credentials, signing, and write code. The legacy public `risex_farmer.runtime` is also not a Spread strategy dependency because it directly imports those forbidden modules.
 
 The limited Spread feed runner may reuse the accepted public adapters and venue-neutral `BookStream`, but must cover only RISEx and Lighter, expose immutable accepted events through one bounded non-blocking queue, emit explicit `DATA_GAP` on overflow, preserve session/recovery/book-revision/sequence/checksum provenance, reject stale or displaced events, and fail closed on ambiguity. It must not copy normalizers, import strategy modules, or grow a generic recovery/event framework or general public runtime. SS-001B must first pass a short 1–3 market end-to-end public pipeline smoke; only the unchanged accepted runner may then expand to the full discovery universe.
+
+### 0.5 Frozen Entry Viability discovery gate `DG-001`
+
+This gate was frozen on `2026-09-03` after SS-001B acceptance and its bounded smoke, and before examining any discovery run. It applies only to the next single real-public discovery run on unchanged accepted source `9ac7b73941b9f0217cfa6a2ef68b21d6040fd015`.
+
+- Universe: exact public RISEx/Lighter intersections `BTC`, `ETH`, and `SOL`; both fixed directions; exact `$100/$250/$500` notionals, `1/2/3/5 bps` target margins, and `0/300/500/1000 ms` horizons. Failure to admit all three markets makes the run `DATA_INSUFFICIENT`.
+- Freshness: the paired quote books and every selected Lighter hedge book must be current-session, sequence-valid, gap-free for the relevant identity, and at most `25,000,000,000 ns` old by local monotonic receipt time. A book received even `1 ns` after a horizon deadline is ineligible. Missing, stale, displaced, partial, zero-depth, and gap outcomes remain distinct.
+- Fees: RISEx maker `0.00005`, labelled `CONFIGURED_RISEX_RESEARCH_INPUT` and never described as a public or account-specific observation; Lighter Standard taker `0`, sourced from `https://docs.lighter.xyz/trading/trading-fees` as checked on `2026-09-03`. Points are `$0`; funding and future exit value are excluded.
+- Run bound: one fresh owner-only observational store, maximum `60 seconds`, maximum `250,000` persisted records, and at most the first `50` `WOULD_FILL` records by append-only `record_index` enter the verdict sample. Any later in-flight records remain immutable but are excluded. Crossing the record cap, source mismatch, missing clean `RUN_STOP`, any `RUN_FAILED`, non-null fatal reason, store/queue/history-capacity failure, unclassified schema failure, or secret/private/write surface makes the result `DATA_INSUFFICIENT` and ends the gate.
+- Completeness: terminal `PUBLIC_SMOKE_STOPPED` markers after a clean bounded stop do not invalidate earlier completed observations. Every other gap remains visible and invalidates overlapping evidence. A non-data verdict requires no `HEDGE_OUTCOME_UNKNOWN`, all four horizon rows for at least `95%` of sampled strict episodes globally and for every policy used by the verdict, and at least `95%` full-or-explicitly-classified hedge outcomes. Partial, missing, stale, displaced, gap, and zero-depth outcomes are never imputed as zero edge.
+- Fillability thresholds: `approximately zero` means `0` or `1` sampled strict episodes across the run; the same numeric threshold applies to an implemented optimistic model. `Materially positive` fillability means at least `10` strict episodes for one exact market/direction/size/margin policy, spanning at least `5` distinct would-fill detection timestamps. Because SS-001B has no optimistic model, low strict fillability cannot be called optimistic zero.
+- Edge materiality: for one full hedge, materially positive means exact entry edge at least `max($0.01, 1 bp of hypothetical RISEx filled notional)`. A candidate policy must have at least `90%` positive-edge share and a materially positive `p05` at `300 ms`, a strictly positive median at `500 ms`, at least `95%` full-hedge rate at every horizon, and the complete latency curve reported. The published Lighter Standard `300 ms` taker latency is a research input, not an execution guarantee; `500 ms` remains diagnostic.
+- Snapshot availability: quoteable-time share of at least `1%` for any policy is materially present. Below that for every policy is snapshot absence.
+
+Verdicts are evaluated in this fixed precedence and exactly one is emitted:
+
+1. `DATA_INSUFFICIENT` for a failed run bound, missing universe, fatal/integrity condition, or insufficient completeness.
+2. `NO_SNAPSHOT_EDGE` when every policy has quoteable-time share below `1%`, or repeated complete strict evidence exists but no policy has materially positive `0 ms` edge.
+3. `LIGHTER_DEPTH_UNSUITABLE` when a materially fillable policy exists but at least `50%` of its valid `0 ms` outcomes are `HEDGE_PARTIAL` or `HEDGE_DEPTH_UNAVAILABLE`.
+4. `PROFITABLE_QUOTES_UNFILLABLE` only when snapshot edge is materially present, both strict and implemented optimistic counts are approximately zero, and completeness passes.
+5. `FILLABILITY_INSUFFICIENT_EVIDENCE` when snapshot edge is materially present but strict evidence is below the materially-positive threshold and the optimistic model is absent or materially positive.
+6. `LATENCY_DESTROYS_EDGE` when repeated complete strict evidence has materially positive `0 ms` edge but no policy satisfies the frozen `300/500 ms` edge requirements.
+7. `ENTRY_EDGE_CANDIDATE` when at least one exact policy satisfies every frozen fillability, completeness, full-hedge, `300 ms`, and `500 ms` condition above.
+
+No discovery result proves profitability. `SS-002` remains closed through this gate and can only be proposed after the terminal verdict is recorded; it requires `ENTRY_EDGE_CANDIDATE` rather than another verdict.
 
 ## Legacy benchmark domain: RISEx Funding Farmer
 
