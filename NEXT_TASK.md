@@ -4,120 +4,60 @@
 
 Status: `FROZEN / REPLACED`.
 
-The former Funding Farmer central profitability, funding-boundary, PAPER lifecycle, testnet, and mainnet tasks are not active. Do not resume an old process, database, worktree, candidate, credential path, or operational authority.
+Do not resume an old Funding Farmer process, database, worktree, candidate, credential path, or operational authority.
 
 ## SS-001A — pure entry observer domain
 
-Status: `AUTHORIZED FOR ONE FRESH VISIBLE SPREAD BUILDER AFTER REJECTED CANDIDATES a3ac545 AND 7b3e370`.
+Status: `ACCEPTED` at `f7251387f0ffe684ed5f3d61f4ea4601b6156183`.
 
-Base: exact accepted governance `main` selected by the Chief when the Builder is created.
+The accepted pure contracts are the only Spread-domain base for SS-001B. Rejected candidates `a3ac545` and `7b3e370` remain non-authoritative history.
 
-Objective: implement only deterministic pure RISEx Spread Shadow domain and evidence contracts under `src/risex_spread_shadow/`, with tests under `tests/spread_shadow/`. No network runtime, CLI, database, report, position, exit, funding lifecycle, or operational process belongs in this slice.
+## SS-001B — limited public integration, evidence store, and report
 
-### Fixed research grid
+Status: `AUTHORIZED FOR ONE FRESH VISIBLE SPREAD BUILDER`.
 
-- Directions: RISEx maker BUY → Lighter taker SELL; RISEx maker SELL → Lighter taker BUY.
-- Discovery notionals: `$100`, `$250`, `$500`.
-- Target margins: `1`, `2`, `3`, `5` basis points.
-- Horizons: `0`, `300`, `500`, `1000` milliseconds. An optional `2000 ms` stress horizon is allowed only if it adds no architecture.
+Base: the exact accepted governance `main` selected by the Chief when the Builder is created.
 
-### Frozen quote and quantity semantics
+Objective: connect the accepted SS-001A contracts to a deliberately limited RISEx/Lighter public feed runner, prospectively capture hypothetical quote/fill/hedge evidence, persist it append-only, and expose one bounded CLI report. This slice may run only a short 1–3 market public pipeline smoke. It does not authorize the discovery run, private access, or venue writes.
 
-`target_margin_bps` is minimum net entry-execution edge after exact configured RISEx maker and Lighter taker entry fees, measured against actual Lighter hedge notional and before any latency/markout haircut. It is not BBO distance, gross spread, funding, exit income, or latency reserve.
+### Required architecture
 
-For `m = target_margin_bps / 10000`, RISEx maker fee `fR`, and Lighter taker fee `fL`:
+- RISEx and Lighter only. Reuse the accepted public adapters, normalizers, `BookStream`, checksum/sequence logic, exact math, and neutral timestamp/provenance primitives; do not copy them.
+- Do not import the legacy runtime, scanner, paper broker, lifecycle, route ranking/admission, funding activation, position state, persistence, Telegram/reporting, testnet/mainnet operations, private adapters, credentials, signing, or dispatch.
+- Use a separate limited feed runner because the legacy runtime directly imports forbidden strategy modules. Do not create a general public runtime, generic event bus, generic recovery framework, service, or daemon.
+- The observer boundary receives immutable accepted RISEx books/trades, accepted Lighter books, explicit public-stream health/gap changes, and diagnostic public funding only. It never receives old scanner output, `RoutePlan`, `PaperEntryState`, `LifecycleSnapshot`, route winners, or old PnL.
+- One bounded non-blocking ingress queue may be used. It must never block the WebSocket critical path; overflow is an explicit venue/market/session/recovery `DATA_GAP`, never a silent drop. Stale, displaced, duplicate, gapped, or recovery-ambiguous evidence fails closed.
+- Maintain the fixed research grid for both directions, notionals `$100/$250/$500`, margins `1/2/3/5 bps`, and horizons `0/300/500/1000 ms`. These are simultaneous counterfactual observations, never venue orders.
+- Quote refresh cadence is independent of fill-to-hedge reaction. A strict hypothetical would-fill immediately creates monotonic deadlines; no periodic scan tick may delay detection or capture scheduling.
+- At every deadline, use only the latest eligible Lighter book actually received no later than that deadline. No later-book replay, interpolation, retrospective quantity change, or assumed execution is permitted.
+- Funding and points cannot enter entry edge. Public funding may be persisted only as separately labelled diagnostic evidence; points remain `$0`.
 
-```text
-max_risex_buy = Hsell(q) * (1 - fL - m) / (1 + fR)
-buy_quote = min(round_down_to_tick(max_risex_buy), risex_best_ask - tick)
+### Run identity and append-only evidence
 
-min_risex_sell = Hbuy(q) * (1 + fL + m) / (1 - fR)
-sell_quote = max(round_up_to_tick(min_risex_sell), risex_best_bid + tick)
-```
+- Every smoke or later discovery run uses a fresh unpredictable run ID and a fresh owner-only store. Never open or migrate legacy PAPER state.
+- The store is append-only for observations. Corrections are new records linked to the superseded record; evidence rows are not updated or deleted during a run.
+- Persist at minimum: run/config identity; market and venue identities; quote policy/version and exact sizing/economics; quote UTC/monotonic creation; RISEx trade exchange UTC plus authority when present; trade receipt UTC/monotonic; strict/optimistic fill-model label and evidence keys; would-fill detection monotonic; every horizon/deadline; exact hedge outcome; selected or conflicting book receipt/session/recovery/revision/sequence/checksum; exact requested/filled quantity and accumulated notional; VWAP when defined; gap/health provenance; and deterministic reason codes.
+- Store metadata records the exact source commit, Python version, configured fee sources/rates, fixed grid, freshness policy, markets, and start/stop times. Secrets and raw credentials have no schema field and must never be accepted.
+- A forced stop, queue overflow, disconnect, recovery ambiguity, or write failure to the evidence store must be explicit and fail closed. Missing evidence never becomes `NO TRADE`.
 
-Recompute and retain the actual exact entry edge after rounding; the rounded quote is economic only if that edge still satisfies the requested target.
+### CLI and report
 
-For each target notional, size exactly once from the current required-side Lighter top price: `q_raw = target_notional / reference_price`; floor to the common RISEx/Lighter canonical quantity step; validate both venues' minimum quantity and notional; calculate exact-q Lighter VWAP; then derive the RISEx quote. Never optimize or resize `q` from later books.
+- Provide separate public-only entrypoints for the bounded observer smoke and offline report. Importing or invoking them must expose no private/auth/write-capable path.
+- The report groups every result by market, direction, size, target margin, and latency horizon. It reports opportunity count, quoteable-time share, median quote lifetime, RISEx-BBO distance in ticks, strict would-fill count, optimistic upper-bound count when implemented, full-hedge rate, partial/missing rate, mean/median/p05 exact entry edge, mean/median/p05 conditional markout, positive-edge share, maximum adverse markout, hypothetical RISEx filled notional, concentration, and data completeness.
+- Show the complete latency curve and component metrics. Do not emit one profitability score, select a historically best route, treat funding as entry edge, or claim the smoke/discovery proves profitability.
+- `HEDGE_OUTCOME_UNKNOWN` remains reserved for genuinely unclassified/incomplete evidence; named missing, stale, displaced, gap, partial, and zero-depth outcomes remain distinct in storage and reports.
 
-### Required immutable contracts
+### Bounded smoke and acceptance evidence
 
-- `QuotePolicy`
-- `HypotheticalMakerQuote`
-- `QuoteVersion`
-- `WouldFillEvidence`
-- `HedgeHorizonCapture`
-- `EntryViabilityEpisode`
-- `EntryViabilityOutcome`
+- Builder may perform one public-only smoke covering 1–3 markets for at most 15 minutes, with a fresh owner-only store and no legacy state. The purpose is pipeline/provenance validation, not strategy evaluation.
+- Smoke must demonstrate accepted RISEx/Lighter event ingestion, event-driven fill reaction when an eligible fixture/replay or naturally observed public event occurs, all four deadlines, append-only persistence, deterministic offline replay/report, explicit gap handling, and clean shutdown. It need not wait for a natural strict fill; injected deterministic public-event fixtures must be labelled as fixtures and kept separate from observational results.
+- Focused/adverse tests cover queue overflow/no silent drop, stale/displaced/recovery rejection, one-nanosecond no-lookahead, event-driven deadlines independent of quote refresh, deterministic replay, append-only/no-overwrite behavior, exact outcome preservation, report grouping/latency curve, fresh run/store identity, owner-only permissions, and unreachable private/auth/write imports.
+- Builder runs one final clean Python 3.11 full suite on the committed candidate and reports exact preflight, branch/base, diff/scope, tests, dependency/import surface, smoke identity/duration/markets/outcome, sanitized evidence counts, store permissions, and clean Git status. Builder never self-accepts, merges, pushes `main`, or starts the full discovery run.
+- Production implementation is an upper-bounded slice, not a line target: stop and escalate before exceeding `3200` new SS-001B production lines or introducing more than the limited runner, queue, append-only store, CLI, and report surfaces described here.
 
-Required outcome values include:
+### Closed gates
 
-- `QUOTE_NOT_POST_ONLY`
-- `QUOTE_NOT_ECONOMIC`
-- `QUOTE_ACTIVE`
-- `NO_WOULD_FILL`
-- `WOULD_FILL`
-- `HEDGE_FULL`
-- `HEDGE_PARTIAL`
-- `HEDGE_DEPTH_UNAVAILABLE`
-- `HEDGE_DATA_MISSING`
-- `HEDGE_DATA_STALE`
-- `HEDGE_SESSION_DISPLACED`
-- `HEDGE_DATA_GAP`
-- `HEDGE_OUTCOME_UNKNOWN`
+- The full discovery run (up to 72 hours or 50 strict episodes) remains closed. Before it can start, SS-001B must be independently accepted and governance must freeze numeric interpretations of “approximately zero” and “materially positive”, the exact discovery market universe, freshness policy, configured public fee inputs/sources, and fatal/incomplete-evidence stop thresholds.
+- `SS-002` and `SS-003` remain closed. No position/exit/funding lifecycle, real or prepared order, private connection, credential, signing, dispatch, testnet/mainnet write, transfer, withdrawal, strategy execution, multiple lots, inventory, batching, OMS, dashboard, Telegram, new venue adapter, ML, or optimization is authorized.
 
-`HEDGE_PARTIAL` means a valid book supplies a positive quantity smaller than exact `q`. `HEDGE_DEPTH_UNAVAILABLE` means an otherwise valid required-side book supplies zero executable quantity. Missing book, stale book, displaced session, and an overlapping data gap retain their exact named classifications. `HEDGE_OUTCOME_UNKNOWN` is only for a genuinely unclassified or incomplete terminal state; it is never a catch-all. None becomes `NO TRADE`.
-
-### Required behavior
-
-- Exact BUY/SELL entry-edge signs and fees applied once.
-- Exact target-margin formula, post-only cap/floor, and post-rounding actual-edge revalidation.
-- Deterministic required-side top-price sizing, common-step floor, venue-minimum validation, and no later resizing.
-- Sizing evidence must recompute its own raw quantity, common step, floored quantity, raw venue quantities, and minimum flags, and must match the quote direction and policy target notional. Forged or mismatched sizing evidence is `QUOTE_NOT_ECONOMIC`.
-- Exact-q multi-level VWAP; visible spread/depth impact is never subtracted a second time.
-- Preserve exact accumulated Lighter notional as authoritative. Do not require `notional == q × rounded VWAP`; repeating-decimal VWAP must not break exact-q entry edge or hedge evidence.
-- Strict would-fill: quote version predates evidence; exact RISEx venue/market/direction; correct aggressor; trade-through by at least one tick; version-local eligible quantity reaches exact `q`; duplicate rejection; replacement resets evidence; expiry or data gap forbids fill.
-- One optional fill model may exist only as an explicitly named optimistic upper bound, not a queue simulator.
-- Persistable provenance contracts include UTC and monotonic quote/trade/detection timestamps, absolute monotonic horizon deadline, book receipt monotonic time, stream session, recovery generation, book revision, and sequence/checksum when applicable.
-- Local monotonic timestamps belong only to the local process. Do not invent or compare an exchange monotonic timestamp. Authoritative exchange/event UTC is optional and carries explicit authority/provenance; quote-before-trade ordering and would-fill detection use local receipt monotonic time. `WouldFillEvidence` explicitly persists `would_fill_detected_monotonic_ns`.
-- Horizon selection accepts only an exact-market, sequence-valid, current-session, gap-free, fresh book received at or before the deadline. No interpolation or later-book look-ahead is permitted.
-- Horizon selection requires both the expected stream session ID and expected recovery generation. A same-session book from another recovery generation is displaced evidence and cannot become a hedge.
-- Data-gap evidence includes source venue. Only RISEx gaps may invalidate maker would-fill evidence and only Lighter gaps may invalidate hedge-book evidence; market/session/recovery identity remains mandatory.
-- A quote cannot be `QUOTE_ACTIVE` unless its recomputed actual edge, target edge, hedge notional, fee evidence, and sizing evidence are present and internally consistent. Missing economics fails closed as `QUOTE_NOT_ECONOMIC`.
-- Pure deterministic replay of the same immutable inputs produces equivalent canonical evidence using ordinary deterministic value contracts; do not build a custom serializer subsystem.
-- Strict would-fill is a conservative lower bound. The optional optimistic model is an upper bound. Absence of strict fills alone is not a no-go: near-zero strict and near-zero optimistic evidence supports `PROFITABLE_QUOTES_UNFILLABLE`, while near-zero strict and materially positive optimistic evidence supports `FILLABILITY_INSUFFICIENT_EVIDENCE`; repeated strict fills support delayed-edge evaluation. SS-001A does not invent the numeric thresholds for “near-zero” or “materially positive”; SS-001B must freeze them before discovery.
-
-### Focused acceptance evidence
-
-One regression per material risk, including:
-
-1. Exact BUY and SELL edge signs.
-2. Exact-q multi-level VWAP.
-3. No double counting of spread/slippage.
-4. RISEx fee applied once.
-5. Quote predates qualifying trade.
-6. Wrong aggressor does not fill.
-7. One-tick boundary.
-8. Duplicate trade rejection.
-9. Replacement resets version-local evidence.
-10. A book received one nanosecond after deadline is rejected.
-11. Monotonic-clock deadline construction.
-12. Stale/displaced Lighter session rejection.
-13. Exact partial hedge quantity.
-14. Missing hedge does not become `NO TRADE`.
-15. Queue-overflow input creates explicit gap evidence contract.
-16. Deterministic replay.
-17. No imports from old scanner/broker/lifecycle/runtime or old strategy persistence/reporting.
-18. No private/auth/write surface is reachable from the package.
-
-Builder must report preflight root/branch/HEAD/status, exact scope/diff, focused/adverse tests, dependency/import surface, compile evidence, and one clean full Python 3.11 suite on the final committed SHA. Builder never self-accepts, merges, or pushes `main`.
-
-### Forbidden scope
-
-- No SS-001B feed integration, sockets, serializer framework, persistence abstraction, generic engine, CLI, database, report, or discovery run.
-- No old scanner, broker, lifecycle, RoutePlan, funding activation/cutoff, old state machine, Telegram, or operational module.
-- No private/authenticated endpoint, credential, signing, order preparation, dispatch, testnet/mainnet write, real fund, transfer, withdrawal, or strategy execution.
-- No position/exit/funding lifecycle, two-sided active quotes, multi-lot inventory, batching, OMS, generic event bus, dashboard, new venue adapter, ML, or automatic optimization.
-
-Completion: Chief independently reviews scope, diff, contracts, tests, dependency surface, Git, and final suite. Only Chief may accept and integrate. SS-001B remains closed after SS-001A unless separately opened by accepted governance.
-
-Rejected evidence: candidates `a3ac545a78a687788595470c1e1e1e91a501ec74` and `7b3e370865de28bc4a4566445c676772dc0727cc` are not accepted and must not be merged or amended. The first invented a cross-clock exchange monotonic timestamp, admitted missing economics, omitted explicit detection time, and missed recovery binding. The second failed repeating-decimal multi-level VWAP, admitted mismatched sizing direction/notional, and omitted venue identity from data gaps. A fresh correction candidate starts from current accepted `main`; rejected diffs are non-authoritative reference only.
+Completion: Chief independently reviews scope, diff, contracts, tests, public smoke evidence, dependency surface, Git, and final suite. Only Chief may accept and integrate.
