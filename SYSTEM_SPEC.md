@@ -1,6 +1,6 @@
 # RISEx Spread Shadow — System Specification
 
-SYSTEM_SPEC_VERSION = 2.6
+SYSTEM_SPEC_VERSION = 2.7
 SPEC_STATUS = ACTIVE_SPREAD_SHADOW__FROZEN_LEGACY_FUNDING_FARMER
 
 ## 0. Active product domain: RISEx Spread Shadow
@@ -145,6 +145,30 @@ The post-DG-002B mission is to resolve whether profitable hedge-anchored RISEx m
 - Per-policy reporting must include snapshot quoteable time, actual snapshot edge, quote distance from the RISEx post-only BBO bound in ticks/bps; eligible/touch/at-or-through/strict counts; cumulative qualifying volume, fill counts/notional/time-to-fill for both bounds; model-separated full/partial/missing hedge rates and edge/markout curves; and market/direction/size/margin concentration. Named missing/stale/session/gap/depth outcomes are not zero edge.
 - The existing append-only evidence representation remains unchanged unless implementation proves it cannot preserve the contract. Long-run reports must use bounded streaming or multi-pass processing rather than retaining the full evidence file in memory. No generic storage, compression, queue, execution, or lifecycle framework is authorized.
 - The mission ends only with strong optimistic-unreachability evidence, a materially separated strict/optimistic public bracket requiring a different calibration decision, or conservative fill episodes with a prospective delayed-edge verdict. `SS-002` and `SS-003` remain closed throughout.
+
+### 0.9 Frozen fillability-bounds discovery gate `DG-003`
+
+This gate was frozen on `2026-09-03` only after independent acceptance of SS-001D and before opening any new economic sample. It applies to exactly one public unauthenticated run on source `10cc7be7b58c536fc8edf65309b13e9a9d8d819b`.
+
+- Universe and economics: exact public RISEx/Lighter `BTC`, `ETH`, and `SOL`; both fixed directions; `$100/$250/$500`; `1/2/3/5 bps`; `0/300/500/1000 ms`; `25,000,000,000 ns` freshness; RISEx maker fee `0.00005` labelled `CONFIGURED_RISEX_RESEARCH_INPUT`; Lighter Standard taker fee `0` with the section-0.5 provenance; points `$0`; no funding or future-exit value. The quote grid, maker pricing, strict definition, fees, and venues are unchanged.
+- Bounds: `STRICT_LOWER_BOUND` retains the one-full-tick-through exact-`q` definition. `OPTIMISTIC_UPPER_BOUND` uses the section-0.8 at-or-through exact-`q` definition and must always be reported as the zero-queue/no-hidden-liquidity upper bound. One accepted deduplicated RISEx trade increments the eligible counter once even when it is relevant to multiple policies.
+- Stop rule: freeze the economic sample at the first of `50` strict episodes, `500` unique eligible RISEx trades, `1,200 seconds` from sample start, or any integrity/fatal condition. After a non-fatal sample stop, accept no later RISEx economics or episodes; retain only the bounded Lighter tail required to finish already-pending horizons, for no longer than the largest configured horizon plus the accepted scheduling allowance. Emit exactly one `SAMPLE_STOP` and exactly one terminal marker.
+- Storage and environment: one fresh owner-only observational store; maximum `2,500,000` total records and `12 GiB` for the evidence file, with a reserved terminal failure marker. A cap breach is an integrity failure, never a truncated economic verdict. Before launch, require at least `24 GiB` free on the target filesystem, exact source identity, clean accepted surfaces, and no other Spread observer. The append-only JSONL representation remains unchanged; final record and byte counts are reported.
+- Completeness: exact three-market admission; source match; exactly one clean `RUN_STOP`; no `RUN_FAILED`, fatal reason, queue/history/store failure, unexpected disconnect, unclassified schema failure, or secret/private/write surface; deterministic repeated offline reports; owner-only permissions; and all four model-scoped horizons for every fill episode. Named partial/depth/missing/stale/session/gap outcomes remain explicit and are never imputed. A non-terminal gap invalidates only overlapping matching evidence. A wall-clock stop below `500` eligible trades and below material strict fillability is insufficient for an unfillability or public-bracket conclusion.
+- Fillability thresholds: `approximately zero` is `0` or `1` episodes across the run. `Materially positive` is at least `10` episodes for one exact market/direction/size/margin policy spanning at least `5` distinct detection timestamps. Counts `2..9`, or concentration in fewer than five timestamps, are sparse rather than materially positive. The full per-policy and concentration report in section 0.8 is mandatory; no aggregate-only verdict is valid.
+- Edge thresholds: for one full hedge, material positive edge is at least `max($0.01, 1 bp of hypothetical RISEx filled notional)`. A candidate policy requires material strict fillability, at least `95%` full-hedge rate at every horizon, at least `90%` positive-edge share and materially positive `p05` at `300 ms`, and a strictly positive median at `500 ms`. The complete `0/300/500/1000 ms` curve is reported; `500 ms` remains diagnostic.
+
+Verdicts are evaluated in this fixed precedence and exactly one is recorded:
+
+1. `DATA_INSUFFICIENT` for any source, universe, stop, cap, terminal, integrity, completeness, or deterministic-report failure; also for a wall-clock stop below both `500` eligible trades and material strict fillability.
+2. `NO_SNAPSHOT_EDGE` when every policy has quoteable-time share below `1%`, or material complete strict fills exist but no policy has materially positive `0 ms` edge.
+3. `LIGHTER_DEPTH_UNSUITABLE` when a materially strict-fillable policy exists but at least `50%` of its valid `0 ms` outcomes are `HEDGE_PARTIAL` or `HEDGE_DEPTH_UNAVAILABLE`.
+4. `PROFITABLE_QUOTES_UNFILLABLE` only after `500` eligible trades with materially present snapshot opportunities, complete evidence, strict count at most `1`, and optimistic count at most `1`.
+5. `FILLABILITY_INSUFFICIENT_EVIDENCE` after `500` eligible trades when strict evidence is not materially positive but optimistic evidence exceeds the approximately-zero bound. Sparse or concentrated optimistic evidence is reported separately from materially positive optimistic evidence. This ends further public simulation and presents the smallest controlled fill-calibration choices to the owner.
+6. `LATENCY_DESTROYS_EDGE` when material complete strict fills have materially positive `0 ms` edge but no policy satisfies the frozen delayed-edge thresholds.
+7. `ENTRY_EDGE_CANDIDATE` when at least one exact policy satisfies every material strict-fillability, completeness, hedge-depth, `300 ms`, and `500 ms` condition.
+
+Any terminal result is evidence, not permission to change strategy or trade. `SS-002` and `SS-003` remain closed. Only `ENTRY_EDGE_CANDIDATE` may support a later separate proposal for SS-002; it does not open SS-002 automatically.
 
 ## Legacy benchmark domain: RISEx Funding Farmer
 

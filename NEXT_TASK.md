@@ -1,19 +1,19 @@
 # Active bounded task
 
-## SS-001D — Fillability Bounds
+## DG-003 — Fillability Bounds Discovery
 
-Status: `AUTHORIZED / BUILDER NOT YET OPENED`.
+Status: `FROZEN / READY FOR CHIEF PUBLIC-ONLY RUN`.
 
-Objective: add one explicitly optimistic at-or-through public fill upper bound beside the unchanged strict lower bound, so a later prospective sample can distinguish unreachable profitable quotes from strict-model conservatism and capture delayed hedge evidence whenever either model fills.
+Objective: run exactly one prospectively frozen public-only sample that resolves whether the accepted profitable hedge-anchored RISEx quotes are unreachable even under the optimistic upper bound, remain bracketed by public-data fill uncertainty, or produce material strict fills with delayed Lighter hedge evidence.
 
-Exact base: current accepted and published `main`. Use one fresh visible Spread Builder and fresh `codex/spread-ss-001d-fillability-bounds` branch/worktree. Verification is Level A. Builder performs no public/live run.
+Exact source: `10cc7be7b58c536fc8edf65309b13e9a9d8d819b`. Chief executes the accepted public unauthenticated runner directly; no Builder, code edit, or sample tuning is authorized.
 
-Allowed scope: the minimum `risex_spread_shadow` evidence, observer/runner, report, CLI/config, and focused test changes required for the System Specification 2.6 fillability-bound contract. Preserve the strict detector behavior byte-for-byte at its public boundary. Add separately named `OPTIMISTIC_UPPER_BOUND` cumulative at-or-through detection, model-scoped episode identity/horizons, unique eligible-trade and sample-stop counters, and bounded streaming/multi-pass per-policy reporting.
+Frozen surface: exact `BTC/ETH/SOL`, both directions, `$100/$250/$500`, `1/2/3/5 bps`, `0/300/500/1000 ms`, `25 s` freshness, RISEx maker `0.00005`, Lighter taker `0`, strict lower bound unchanged, optimistic at-or-through upper bound, and the full per-policy/concentration report in System Specification 2.7.
 
-Required adverse evidence: quote must predate trade; correct market/direction/aggressor/session/recovery; equality qualifies optimistic but not strict; sub-tick through qualifies optimistic but not strict; cumulative exact-q threshold and time-to-fill; quote replacement/expiry resets eligibility; duplicates/conflicts never add volume; overlapping gap rejects; strict and optimistic episodes cannot suppress or duplicate one another; one eligible trade increments the stop counter once across policies; first-stop-wins for strict/eligible/time/integrity; model-separated no-lookahead horizons; named non-full outcomes remain non-imputed; report is deterministic and memory-bounded for a synthetic large stream.
+Frozen stop and storage rule: first of `50` strict episodes, `500` unique eligible trades, `1,200 s`, or integrity/fatal. Freeze RISEx economics at stop and retain only the bounded Lighter tail for pending horizons. Maximum `2,500,000` records and `12 GiB`; require at least `24 GiB` free before launch. One fresh owner-only store, exact source metadata, exactly one terminal marker, and two byte-identical canonical reports are required.
 
-Forbidden: queue-position/FIFO/L3/hidden-liquidity/probability/ML modeling; strict-rule relaxation; fees, venue, quote grid, maker pricing, strategy, funding, inventory, exits, storage representation/compression, generic architecture, legacy runtime, private/auth/credential/signing/write/testnet/mainnet, `SS-002`, or `SS-003` changes.
+Verdict: apply the exact System Specification 2.7 precedence. `PROFITABLE_QUOTES_UNFILLABLE` requires `500` eligible trades and both bounds at most `1`; `FILLABILITY_INSUFFICIENT_EVIDENCE` requires `500` eligible trades, non-material strict evidence, and optimistic evidence above `1`; delayed entry verdicts require at least `10` strict episodes for one exact policy across at least `5` detection timestamps plus the frozen hedge/edge thresholds. Any failed operational/completeness gate is `DATA_INSUFFICIENT`, not an economic verdict.
 
-Acceptance: Chief independently verifies root-cause-aligned scope, focused/adverse tests, deterministic large-stream report evidence, one clean isolated Python 3.11 full suite on final SHA, dependency/import/private/write surfaces, Git cleanliness, and no strategy/storage expansion. Builder never self-accepts or merges/pushes `main`.
+Required output: exact run/store identity and hashes; stop reason; record/byte counts; integrity/completeness; per-policy snapshot, distance, fillability, both model curves, and concentration; exactly one frozen verdict; durable status update. Do not extend or rerun because results look favorable or unfavorable.
 
-After acceptance only, Chief freezes `DG-003` prospectively. Proposed—not yet frozen—stop rule is the first of `50` strict episodes, `500` unique eligible trades, `20 minutes`, or integrity/fatal, with prospective record/byte caps and unchanged economic thresholds.
+Forbidden: any code/config/threshold tuning after sample open; another venue; private/authenticated data; credentials/signing/write/testnet/mainnet; queue/FIFO/L3/probability/ML; fees, quote grid, maker pricing, strategy, funding, inventory, exits, SS-002, or SS-003. A second public run requires a newly recorded diagnostic reason and separately frozen gate; it is not automatic.
