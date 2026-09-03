@@ -1,6 +1,6 @@
 # RISEx Spread Shadow — System Specification
 
-SYSTEM_SPEC_VERSION = 3.2
+SYSTEM_SPEC_VERSION = 3.3
 SPEC_STATUS = ACTIVE_SPREAD_SHADOW__FROZEN_LEGACY_FUNDING_FARMER
 
 ## 0. Active product domain: RISEx Spread Shadow
@@ -224,6 +224,20 @@ The one frozen DG-005 run is immutable `DATA_INSUFFICIENT / MEASUREMENT_THROUGHP
 - Quote evidence must bind the exact RISEx and Lighter book revision identities used for BBO, sizing, hedge VWAP, and maker-price construction. Horizon evidence retains its exact referenced Lighter revision. An offline bounded-memory reconstruction/audit path must prove revision chains and referenced calculation witnesses without changing quote, fill, eligibility, or horizon semantics. Existing full-BOOK historical evidence remains readable and deterministic.
 - Acceptance requires realistic deep-book evidence: at least the observed `1,900`-level contour, repeated small deltas, all three markets, an offered event rate above DG-005 without queue-capacity feedback, actual JSON serialization and owner-only durable storage, zero overflow/loss/reordering, bounded memory, clean terminal drain, deterministic reconstruction equal to the source full books, and a material byte reduction sufficient to remain below the existing caps with headroom. Focused failure/recovery/cap/legacy-replay tests and one clean Python 3.11 full suite are mandatory.
 - No generic database, compression framework, message bus, storage service, queue/cap/timeout increase, raw-payload archive, venue/protocol/economic/fill/stop/horizon change, private/authenticated access, or write path is authorized. No replacement discovery gate may be frozen until SS-001G is independently accepted. `SS-002` and `SS-003` remain closed.
+
+### 0.15 Accepted book-delta evidence and frozen `DG-006`
+
+`SS-001G` is independently accepted on exact implementation source `4f83f8dea9f7a5deea4902f0c5cc6443e28004c1`. Each venue/market/session/recovery chain now persists one full normalized starting snapshot and exact canonical level deltas with explicit predecessor, revision, chain, and state-digest identity. QUOTE records bind the exact RISEx and Lighter revisions used by their calculation; HEDGE_HORIZON records retain the exact Lighter revision witness. Reconstruction and report audit are bounded, deterministic, legacy-full compatible, and fail closed on broken chains or references.
+
+Chief acceptance on the exact committed tree includes `120` focused Spread tests, an isolated Python 3.11 full suite of `3780 passed, 3 skipped`, clean compile/import/dependency/scope surfaces, deterministic legacy replay of DG-002B, DG-003, and DG-005, and continued explicit rejection of corrupt DG-004 as `DECREASING_RECORD_INDEX`. The independent three-market, six-chain, `1,900`-level stress persisted `720` ordered revisions with `714` deltas and one clean terminal in `920,592` bytes; its complete end-to-end test duration was `10.13 s`, establishing at least `71` books/s including two offline reports, above DG-005's approximately `54.8` books/s accepted rate, without changing queue, timeout, or storage caps.
+
+`DG-006 — Fillability Bounds Lossless Discovery` is frozen before its sample on exact accepted measurement source `4f83f8dea9f7a5deea4902f0c5cc6443e28004c1`. It authorizes exactly one fresh public-only observational run in a fresh owner-only store.
+
+- Universe and economics are unchanged: exact public RISEx/Lighter `BTC/ETH/SOL`; both directions; `$100/$250/$500`; `1/2/3/5 bps`; `0/300/500/1000 ms`; `25 s` freshness; the configured fee inputs and provenance; points `$0`; no funding or future-exit value; unchanged maker pricing, strict lower bound, optimistic at-or-through upper bound, eligible-trade definition, exact-q accumulation, no-lookahead capture, and concentration dimensions.
+- Stop on the first of `50` aggregate strict episodes, `500` unique eligible RISEx public trades while relevant quotes are active, `1,200 s` wall clock, or any integrity/fatal condition. After a non-fatal sample stop, retain only the already-authorized bounded Lighter horizon tail. There is no manual early stop, extension, retry, or parameter change.
+- Use the accepted full-plus-delta BOOK representation and exact calculation witnesses in one fresh owner-only append-only JSONL store. Enforce the unchanged `2,500,000`-record and `12 GiB` caps, at least `24 GiB` free before launch, exact source/universe admission, contiguous unique record indices, exactly one physically-last terminal, deterministic repeated reports, and no private/authenticated/write surface. Any cap, chain, reference, queue, history, store, protocol, terminal, or completeness failure is `DATA_INSUFFICIENT`, never an economic verdict.
+- Completeness, materiality thresholds, all required per-policy dimensions, and verdict precedence are exactly section 0.9. `PROFITABLE_QUOTES_UNFILLABLE` and the public-bracket form of `FILLABILITY_INSUFFICIENT_EVIDENCE` require `500` eligible trades. A strict-stop sample may reach `LATENCY_DESTROYS_EDGE` or `ENTRY_EDGE_CANDIDATE` only through the frozen per-policy strict-fillability, exact-q hedge, and delayed-edge thresholds.
+- This gate may resolve the active mission only as case A, B, or C in section 0.8. A measurement failure is not mission completion. `SS-002` and `SS-003` remain closed, and no private, authenticated, credential, signing, order-preparation, dispatch, testnet, mainnet, or other write activity is authorized.
 
 ## Legacy benchmark domain: RISEx Funding Farmer
 
