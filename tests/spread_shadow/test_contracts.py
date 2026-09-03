@@ -152,6 +152,7 @@ def trade(
     session="risex-1",
     recovery=0,
     exchange_at=NOW,
+    exchange_provenance="OFFICIAL_EVENT_UTC",
 ) -> TradeEvidence:
     return TradeEvidence(
         trade_event_key=key,
@@ -165,7 +166,7 @@ def trade(
         stream_session_id=session,
         recovery_generation=recovery,
         exchange_event_utc=exchange_at,
-        exchange_event_time_provenance="OFFICIAL_EVENT_UTC",
+        exchange_event_time_provenance=exchange_provenance,
     )
 
 
@@ -295,6 +296,43 @@ def test_strict_fill_requires_quote_before_trade_by_local_receipt() -> None:
     ) is None
 
 
+def test_strict_fill_stops_at_first_local_threshold_and_retains_no_late_trade() -> None:
+    version = active_quote_version()
+    evidence = detect_strict_would_fill(
+        version,
+        [
+            trade("late", quantity="9", received=130),
+            trade("second", quantity="2", received=102),
+            trade("first", quantity="1", received=101),
+        ],
+    )
+
+    assert evidence is not None
+    assert evidence.qualifying_trade_event_keys == ("first", "second")
+    assert evidence.cumulative_eligible_quantity == D("3")
+    assert evidence.would_fill_detected_monotonic_ns == 102
+    assert detect_strict_would_fill(
+        version,
+        [
+            trade("first", quantity="1", received=101),
+            trade("second", quantity="2", received=102),
+        ],
+        would_fill_detected_monotonic_ns=101,
+    ) is None
+    delayed = detect_strict_would_fill(
+        version,
+        [
+            trade("late", quantity="9", received=130),
+            trade("first", quantity="1", received=101),
+            trade("second", quantity="2", received=102),
+        ],
+        would_fill_detected_monotonic_ns=150,
+    )
+    assert delayed is not None
+    assert delayed.qualifying_trade_event_keys == ("first", "second")
+    assert delayed.would_fill_detected_monotonic_ns == 150
+
+
 def test_wrong_aggressor_does_not_fill() -> None:
     version = active_quote_version()
     assert detect_strict_would_fill(
@@ -314,6 +352,36 @@ def test_duplicate_trade_key_cannot_supply_quantity_twice() -> None:
     version = active_quote_version()
     duplicate = trade("same", quantity="2")
     assert detect_strict_would_fill(version, [duplicate, duplicate]) is None
+
+
+def test_conflicting_duplicate_trade_key_fails_closed_independent_of_input_order() -> None:
+    version = active_quote_version()
+    first = trade("same", quantity="2", received=101)
+    conflicting = trade("same", quantity="3", received=101)
+    other = trade("other", quantity="1", received=102)
+
+    assert detect_strict_would_fill(version, [first, conflicting, other]) is None
+    assert detect_strict_would_fill(version, [other, conflicting, first]) is None
+
+    identical = detect_strict_would_fill(version, [other, first, first])
+    assert identical is not None
+    assert identical.qualifying_trade_event_keys == ("same", "other")
+    assert identical.cumulative_eligible_quantity == D("3")
+
+
+@pytest.mark.parametrize(
+    ("exchange_at", "exchange_provenance"),
+    [(None, "OFFICIAL_EVENT_UTC"), (NOW, None)],
+)
+def test_exchange_utc_and_provenance_must_be_supplied_as_a_pair(
+    exchange_at, exchange_provenance
+) -> None:
+    with pytest.raises(ValueError):
+        trade(
+            "unpaired",
+            exchange_at=exchange_at,
+            exchange_provenance=exchange_provenance,
+        )
 
 
 def test_replacement_resets_version_local_fill_evidence() -> None:
@@ -387,8 +455,10 @@ def test_horizon_distinguishes_partial_zero_depth_missing_stale_and_displaced() 
     partial = capture_horizon(evidence, [book(bids=(("101", "1"),), received=120)], horizon_ms=0)
     zero = capture_horizon(evidence, [book(bids=(), received=120)], horizon_ms=0)
     missing = capture_horizon(evidence, [], horizon_ms=0)
-    stale = capture_horizon(evidence, [book(received=120, fresh=False)], horizon_ms=0)
-    displaced = capture_horizon(evidence, [book(received=120, session="new-session")], horizon_ms=0)
+    stale_book = book(received=120, fresh=False)
+    displaced_book = book(received=120, session="new-session")
+    stale = capture_horizon(evidence, [stale_book], horizon_ms=0)
+    displaced = capture_horizon(evidence, [displaced_book], horizon_ms=0)
 
     assert partial.outcome is EntryViabilityOutcome.HEDGE_PARTIAL
     assert partial.filled_quantity == D("1") and partial.notional_usd == D("101")
@@ -397,25 +467,165 @@ def test_horizon_distinguishes_partial_zero_depth_missing_stale_and_displaced() 
     assert missing.outcome is EntryViabilityOutcome.HEDGE_DATA_MISSING
     assert stale.outcome is EntryViabilityOutcome.HEDGE_DATA_STALE
     assert displaced.outcome is EntryViabilityOutcome.HEDGE_SESSION_DISPLACED
+    assert stale.book == stale_book
+    assert stale.book_received_monotonic_ns == 120
+    assert stale.book_stream_session_id == "lighter-1"
+    assert stale.book_recovery_generation == 0
+    assert stale.book_revision == stale_book.book_revision
+    assert stale.sequence == stale_book.sequence and stale.checksum == stale_book.checksum
+    assert displaced.book == displaced_book
+    assert displaced.book_stream_session_id == "new-session"
+    assert displaced.book_recovery_generation == 0
+    assert displaced.book_revision == displaced_book.book_revision
 
 
 def test_horizon_binds_recovery_generation_and_freshness_policy() -> None:
     evidence = would_fill()
+    displaced_book = book(received=120, recovery=1)
     displaced = capture_horizon(
         evidence,
-        [book(received=120, recovery=1)],
+        [displaced_book],
         horizon_ms=0,
         expected_stream_session_id="lighter-1",
         expected_recovery_generation=0,
     )
+    stale_book = book(received=100, fresh=True)
     stale = capture_horizon(
         evidence,
-        [book(received=100, fresh=True)],
+        [stale_book],
         horizon_ms=0,
         freshness_max_age_ns=19,
     )
     assert displaced.outcome is EntryViabilityOutcome.HEDGE_SESSION_DISPLACED
     assert stale.outcome is EntryViabilityOutcome.HEDGE_DATA_STALE
+    assert displaced.book == displaced_book
+    assert displaced.book_recovery_generation == 1
+    assert stale.book == stale_book
+    assert stale.book_received_monotonic_ns == 100
+
+
+def test_horizon_gap_from_pre_detection_book_to_zero_deadline_is_retained() -> None:
+    evidence = would_fill()
+    selected = book(received=100)
+    gap = DataGapEvidence(Venue.LIGHTER, "BTC", "lighter-1", 0, 110, 119)
+
+    capture = capture_horizon(
+        evidence,
+        [selected],
+        horizon_ms=0,
+        data_gaps=[gap],
+    )
+
+    assert capture.outcome is EntryViabilityOutcome.HEDGE_DATA_GAP
+    assert capture.book == selected
+    assert capture.gap_evidence == gap
+    assert capture.book_received_monotonic_ns == selected.received_monotonic_ns
+    assert capture.book_stream_session_id == selected.stream_session_id
+    assert capture.book_recovery_generation == selected.recovery_generation
+    assert capture.book_revision == selected.book_revision
+    assert capture.sequence == selected.sequence and capture.checksum == selected.checksum
+
+
+def test_horizon_tied_latest_books_fail_closed_with_order_independent_provenance() -> None:
+    evidence = would_fill()
+    first_book = book(
+        received=120,
+        revision=7,
+        sequence=42,
+        bids=(("101", "1"), ("103", "2")),
+    )
+    second_book = book(
+        received=120,
+        revision=7,
+        sequence=42,
+        bids=(("101", "3"),),
+    )
+
+    first = capture_horizon(evidence, [first_book, second_book], horizon_ms=0)
+    second = capture_horizon(evidence, [second_book, first_book], horizon_ms=0)
+
+    assert first == second
+    assert first.outcome is EntryViabilityOutcome.HEDGE_OUTCOME_UNKNOWN
+    assert first.book is None
+    assert first.ambiguous_books == tuple(sorted((first_book, second_book), key=repr))
+
+
+def test_quote_validation_binds_exact_vwap_without_requiring_rounded_notional() -> None:
+    quote = build_hypothetical_maker_quote(policy(), book())
+    assert quote.exact_hedge_vwap is not None
+    assert quote.lighter_notional_usd != quote.canonical_quantity * quote.lighter_vwap_price
+    assert validate_quote_economics(quote)
+
+    for change in (
+        {"requested_quantity": D("4")},
+        {"filled_quantity": D("2")},
+        {"notional_usd": D("308")},
+        {"price": D("102")},
+    ):
+        forged_vwap = replace(quote.exact_hedge_vwap, **change)
+        forged_quote = replace(quote, exact_hedge_vwap=forged_vwap)
+        assert not validate_quote_economics(forged_quote)
+
+
+def test_horizon_outcomes_reject_known_misclassification_and_preserve_truthful_states() -> None:
+    evidence = would_fill()
+    full = capture_horizon(evidence, [book(received=120)], horizon_ms=0)
+    partial = capture_horizon(
+        evidence,
+        [book(received=120, bids=(("101", "1"),))],
+        horizon_ms=0,
+    )
+    zero = capture_horizon(evidence, [book(received=120, bids=())], horizon_ms=0)
+    missing = capture_horizon(evidence, [], horizon_ms=0)
+    stale_book = book(received=120, fresh=False)
+    stale = capture_horizon(evidence, [stale_book], horizon_ms=0)
+    displaced_book = book(received=120, recovery=1)
+    displaced = capture_horizon(evidence, [displaced_book], horizon_ms=0)
+    gap = DataGapEvidence(Venue.LIGHTER, "BTC", "lighter-1", 0, 110, 119)
+    gapped = capture_horizon(evidence, [book(received=100)], horizon_ms=0, data_gaps=[gap])
+
+    assert full.outcome is EntryViabilityOutcome.HEDGE_FULL
+    assert partial.outcome is EntryViabilityOutcome.HEDGE_PARTIAL
+    assert zero.outcome is EntryViabilityOutcome.HEDGE_DEPTH_UNAVAILABLE
+    assert missing.book is None
+    assert stale.book == stale_book
+    assert displaced.book == displaced_book
+    assert gapped.gap_evidence == gap
+
+    with pytest.raises(ValueError):
+        replace(missing, outcome=EntryViabilityOutcome.HEDGE_OUTCOME_UNKNOWN)
+    with pytest.raises(ValueError):
+        replace(stale, outcome=EntryViabilityOutcome.HEDGE_OUTCOME_UNKNOWN)
+    with pytest.raises(ValueError):
+        replace(displaced, outcome=EntryViabilityOutcome.HEDGE_OUTCOME_UNKNOWN)
+    with pytest.raises(ValueError):
+        replace(gapped, outcome=EntryViabilityOutcome.HEDGE_OUTCOME_UNKNOWN)
+    with pytest.raises(ValueError):
+        replace(partial, outcome=EntryViabilityOutcome.HEDGE_OUTCOME_UNKNOWN)
+    with pytest.raises(ValueError):
+        replace(zero, outcome=EntryViabilityOutcome.HEDGE_OUTCOME_UNKNOWN)
+    with pytest.raises(ValueError):
+        replace(full, outcome=EntryViabilityOutcome.HEDGE_DATA_MISSING, filled_quantity=D("0"), notional_usd=D("0"), vwap_price=None)
+
+
+def test_non_fill_episode_and_horizon_factory_cannot_produce_captures() -> None:
+    version = active_quote_version()
+    episode = build_entry_viability_episode(
+        version,
+        [],
+        books_by_horizon={0: (book(received=120),)},
+        horizons=(0,),
+    )
+
+    assert episode.outcome is EntryViabilityOutcome.NO_WOULD_FILL
+    assert episode.horizon_captures == ()
+    with pytest.raises(TypeError):
+        capture_horizon(episode, [], horizon_ms=0)
+    with pytest.raises(ValueError):
+        replace(
+            episode,
+            horizon_captures=(capture_horizon(would_fill(), [book(received=120)], horizon_ms=0),),
+        )
 
 
 def test_only_lighter_gap_invalidates_hedge_evidence_and_retains_identity() -> None:

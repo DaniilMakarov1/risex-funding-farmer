@@ -582,6 +582,18 @@ def validate_quote_economics(
         return False
     if quote.lighter_filled_quantity != q or quote.lighter_vwap_price is None:
         return False
+    exact_vwap = quote.exact_hedge_vwap
+    if (
+        exact_vwap.requested_quantity != q
+        or exact_vwap.filled_quantity != quote.lighter_filled_quantity
+        or exact_vwap.notional_usd != hedge_notional
+        or exact_vwap.price != quote.lighter_vwap_price
+        or not exact_vwap.is_executable
+    ):
+        return False
+    expected_vwap_price = exact_vwap.notional_usd / exact_vwap.filled_quantity
+    if exact_vwap.price != expected_vwap_price or quote.lighter_vwap_price != expected_vwap_price:
+        return False
     if maker_notional != q * maker_price:
         return False
     if len(quote.fee_components) != 2:

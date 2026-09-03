@@ -101,26 +101,40 @@ def detect_strict_would_fill(
     tick = quote.risex_tick_size or quote.policy.risex_tick_size
     if tick is None or tick <= 0:
         return None
+    grouped: dict[str, list[TradeEvidence]] = {}
+    for trade in tuple(trades):
+        grouped.setdefault(trade.trade_event_key, []).append(trade)
+    # Resolve duplicates by event key before ordering.  A conflicting key is
+    # unusable rather than being selected by the iterable's arrival order.
+    resolved_list: list[TradeEvidence] = []
+    for _key, group in sorted(grouped.items()):
+        if any(trade != group[0] for trade in group[1:]):
+            return None
+        resolved_list.append(group[0])
+    resolved = tuple(resolved_list)
     ordered = sorted(
-        tuple(trades),
+        resolved,
         key=lambda trade: (trade.received_monotonic_ns, trade.trade_event_key),
     )
-    seen: set[str] = set()
     qualifying: list[TradeEvidence] = []
     cumulative = Decimal("0")
+    threshold_received: int | None = None
     for trade in ordered:
-        if trade.trade_event_key in seen:
-            continue
-        seen.add(trade.trade_event_key)
         if _trade_qualifies(quote_version, trade, tick):
             qualifying.append(trade)
             cumulative += trade.canonical_quantity
-    if not qualifying or cumulative < quote.canonical_quantity:
+            if cumulative >= quote.canonical_quantity:
+                threshold_received = trade.received_monotonic_ns
+                break
+    if not qualifying or threshold_received is None:
         return None
-    last_received = max(trade.received_monotonic_ns for trade in qualifying)
-    detection = last_received if would_fill_detected_monotonic_ns is None else would_fill_detected_monotonic_ns
+    detection = (
+        threshold_received
+        if would_fill_detected_monotonic_ns is None
+        else would_fill_detected_monotonic_ns
+    )
     _int(detection, "would_fill_detected_monotonic_ns")
-    if detection < last_received or detection <= quote_version.quote_created_monotonic_ns:
+    if detection < threshold_received or detection <= quote_version.quote_created_monotonic_ns:
         return None
     if quote_version.quote_expires_monotonic_ns is not None and detection >= quote_version.quote_expires_monotonic_ns:
         return None
@@ -174,6 +188,39 @@ def _book_identity_candidates(
     )
 
 
+def _book_identity_rank(book: BookEvidence) -> tuple[int, int, int]:
+    return (
+        book.received_monotonic_ns,
+        book.book_revision,
+        -1 if book.sequence is None else book.sequence,
+    )
+
+
+def _book_rank(book: BookEvidence) -> tuple[int, int, int, str]:
+    return (*_book_identity_rank(book), repr(book))
+
+
+def _latest_book(books: Sequence[BookEvidence]) -> BookEvidence:
+    if not books:
+        raise ValueError("at least one book is required")
+    return max(books, key=_book_rank)
+
+
+def _ambiguous_latest_books(books: Sequence[BookEvidence]) -> tuple[BookEvidence, ...]:
+    """Return a deterministic conflicting latest-identity group, if present."""
+
+    if not books:
+        return ()
+    latest_identity = max(_book_identity_rank(book) for book in books)
+    unique: list[BookEvidence] = []
+    for book in books:
+        if _book_identity_rank(book) == latest_identity and book not in unique:
+            unique.append(book)
+    if len(unique) > 1:
+        return tuple(sorted(unique, key=repr))
+    return ()
+
+
 def _gap_for_horizon(
     gaps: Iterable[DataGapEvidence],
     *,
@@ -205,6 +252,7 @@ def _capture(
     vwap: Decimal | None = None,
     gap: DataGapEvidence | None = None,
     freshness_max_age_ns: int | None = None,
+    ambiguous_books: tuple[BookEvidence, ...] = (),
 ) -> HedgeHorizonCapture:
     return HedgeHorizonCapture(
         horizon_ms=horizon_ms,
@@ -227,6 +275,7 @@ def _capture(
         vwap_price=vwap,
         gap_evidence=gap,
         freshness_max_age_ns=freshness_max_age_ns,
+        ambiguous_books=ambiguous_books,
     )
 
 
@@ -242,6 +291,8 @@ def capture_horizon(
 ) -> HedgeHorizonCapture:
     """Select the latest eligible Lighter book without look-ahead."""
 
+    if not isinstance(would_fill, WouldFillEvidence):
+        raise TypeError("horizon capture requires WouldFillEvidence, not a non-fill episode")
     _int(horizon_ms, "horizon_ms")
     if horizon_ms not in (0, 300, 500, 1000, 2000):
         raise ValueError("unsupported horizon; use 0/300/500/1000 ms")
@@ -258,46 +309,42 @@ def capture_horizon(
         expected_recovery = getattr(would_fill, "hedge_recovery_generation", None)
     if expected_session is None or expected_recovery is None:
         raise ValueError("expected Lighter session and recovery generation are required")
+    if freshness_max_age_ns is not None:
+        _int(freshness_max_age_ns, "freshness_max_age_ns")
     books_tuple = tuple(books)
     gaps_tuple = tuple(data_gaps)
+
+    def finish(outcome: EntryViabilityOutcome, **kwargs) -> HedgeHorizonCapture:
+        return _capture(
+            horizon_ms=horizon_ms,
+            detected=detected,
+            deadline=deadline,
+            expected_session=expected_session,
+            expected_recovery=expected_recovery,
+            market=would_fill.canonical_market,
+            requested=would_fill.canonical_quantity,
+            outcome=outcome,
+            freshness_max_age_ns=freshness_max_age_ns,
+            **kwargs,
+        )
+
     candidates = _book_identity_candidates(
         books_tuple,
         market=would_fill.canonical_market,
         deadline=deadline,
     )
-    gap = _gap_for_horizon(
-        gaps_tuple,
-        market=would_fill.canonical_market,
-        session=expected_session,
-        recovery=expected_recovery,
-        start=detected,
-        deadline=deadline,
-    )
-    if gap is not None:
-        return _capture(
-            horizon_ms=horizon_ms,
-            detected=detected,
-            deadline=deadline,
-            expected_session=expected_session,
-            expected_recovery=expected_recovery,
-            market=would_fill.canonical_market,
-            requested=would_fill.canonical_quantity,
-            outcome=EntryViabilityOutcome.HEDGE_DATA_GAP,
-            gap=gap,
-            freshness_max_age_ns=freshness_max_age_ns,
-        )
     if not candidates:
-        return _capture(
-            horizon_ms=horizon_ms,
-            detected=detected,
-            deadline=deadline,
-            expected_session=expected_session,
-            expected_recovery=expected_recovery,
+        gap = _gap_for_horizon(
+            gaps_tuple,
             market=would_fill.canonical_market,
-            requested=would_fill.canonical_quantity,
-            outcome=EntryViabilityOutcome.HEDGE_DATA_MISSING,
-            freshness_max_age_ns=freshness_max_age_ns,
+            session=expected_session,
+            recovery=expected_recovery,
+            start=detected,
+            deadline=deadline,
         )
+        if gap is not None:
+            return finish(EntryViabilityOutcome.HEDGE_DATA_GAP, gap=gap)
+        return finish(EntryViabilityOutcome.HEDGE_DATA_MISSING)
     identity = tuple(
         book
         for book in candidates
@@ -305,30 +352,25 @@ def capture_horizon(
         and book.recovery_generation == expected_recovery
     )
     if not identity:
-        return _capture(
-            horizon_ms=horizon_ms,
-            detected=detected,
-            deadline=deadline,
-            expected_session=expected_session,
-            expected_recovery=expected_recovery,
-            market=would_fill.canonical_market,
-            requested=would_fill.canonical_quantity,
-            outcome=EntryViabilityOutcome.HEDGE_SESSION_DISPLACED,
-            freshness_max_age_ns=freshness_max_age_ns,
-        )
+        displaced = _latest_book(candidates)
+        return finish(EntryViabilityOutcome.HEDGE_SESSION_DISPLACED, book=displaced)
+    ambiguous = _ambiguous_latest_books(identity)
+    if ambiguous:
+        return finish(EntryViabilityOutcome.HEDGE_OUTCOME_UNKNOWN, ambiguous_books=ambiguous)
+    latest_identity = _latest_book(identity)
+    gap = _gap_for_horizon(
+        gaps_tuple,
+        market=would_fill.canonical_market,
+        session=expected_session,
+        recovery=expected_recovery,
+        start=latest_identity.received_monotonic_ns,
+        deadline=deadline,
+    )
+    if gap is not None:
+        return finish(EntryViabilityOutcome.HEDGE_DATA_GAP, book=latest_identity, gap=gap)
     healthy = tuple(book for book in identity if book.is_sequence_healthy)
     if not healthy:
-        return _capture(
-            horizon_ms=horizon_ms,
-            detected=detected,
-            deadline=deadline,
-            expected_session=expected_session,
-            expected_recovery=expected_recovery,
-            market=would_fill.canonical_market,
-            requested=would_fill.canonical_quantity,
-            outcome=EntryViabilityOutcome.HEDGE_OUTCOME_UNKNOWN,
-            freshness_max_age_ns=freshness_max_age_ns,
-        )
+        return finish(EntryViabilityOutcome.HEDGE_OUTCOME_UNKNOWN, book=latest_identity)
     fresh = tuple(book for book in healthy if book.fresh)
     if freshness_max_age_ns is not None:
         _int(freshness_max_age_ns, "freshness_max_age_ns")
@@ -338,25 +380,22 @@ def capture_horizon(
             if deadline - book.received_monotonic_ns <= freshness_max_age_ns
         )
     if not fresh:
-        return _capture(
-            horizon_ms=horizon_ms,
-            detected=detected,
-            deadline=deadline,
-            expected_session=expected_session,
-            expected_recovery=expected_recovery,
-            market=would_fill.canonical_market,
-            requested=would_fill.canonical_quantity,
-            outcome=EntryViabilityOutcome.HEDGE_DATA_STALE,
-            freshness_max_age_ns=freshness_max_age_ns,
-        )
-    selected = max(
-        fresh,
-        key=lambda book: (
-            book.received_monotonic_ns,
-            book.book_revision,
-            -1 if book.sequence is None else book.sequence,
-        ),
+        stale_book = _latest_book(healthy)
+        return finish(EntryViabilityOutcome.HEDGE_DATA_STALE, book=stale_book)
+    ambiguous = _ambiguous_latest_books(fresh)
+    if ambiguous:
+        return finish(EntryViabilityOutcome.HEDGE_OUTCOME_UNKNOWN, ambiguous_books=ambiguous)
+    selected = _latest_book(fresh)
+    gap = _gap_for_horizon(
+        gaps_tuple,
+        market=would_fill.canonical_market,
+        session=expected_session,
+        recovery=expected_recovery,
+        start=selected.received_monotonic_ns,
+        deadline=deadline,
     )
+    if gap is not None:
+        return finish(EntryViabilityOutcome.HEDGE_DATA_GAP, book=selected, gap=gap)
     try:
         vwap = exact_quantity_vwap(
             would_fill.direction.hedge_side,
@@ -365,38 +404,19 @@ def capture_horizon(
             selected.asks,
         )
     except (TypeError, ValueError, ArithmeticError):
-        return _capture(
-            horizon_ms=horizon_ms,
-            detected=detected,
-            deadline=deadline,
-            expected_session=expected_session,
-            expected_recovery=expected_recovery,
-            market=would_fill.canonical_market,
-            requested=would_fill.canonical_quantity,
-            outcome=EntryViabilityOutcome.HEDGE_OUTCOME_UNKNOWN,
-            book=selected,
-            freshness_max_age_ns=freshness_max_age_ns,
-        )
+        return finish(EntryViabilityOutcome.HEDGE_OUTCOME_UNKNOWN, book=selected)
     if vwap.filled_quantity == would_fill.canonical_quantity:
         outcome = EntryViabilityOutcome.HEDGE_FULL
     elif vwap.filled_quantity > 0:
         outcome = EntryViabilityOutcome.HEDGE_PARTIAL
     else:
         outcome = EntryViabilityOutcome.HEDGE_DEPTH_UNAVAILABLE
-    return _capture(
-        horizon_ms=horizon_ms,
-        detected=detected,
-        deadline=deadline,
-        expected_session=expected_session,
-        expected_recovery=expected_recovery,
-        market=would_fill.canonical_market,
-        requested=would_fill.canonical_quantity,
-        outcome=outcome,
+    return finish(
+        outcome,
         book=selected,
         filled=vwap.filled_quantity,
         notional=vwap.notional_usd,
         vwap=vwap.price if vwap.filled_quantity > 0 else None,
-        freshness_max_age_ns=freshness_max_age_ns,
     )
 
 

@@ -57,6 +57,18 @@ def _utc(value: datetime | None, name: str) -> datetime | None:
     return value
 
 
+def _book_levels_well_formed(book: BookEvidence) -> bool:
+    for level in (*book.bids, *book.asks):
+        if not isinstance(level, BookLevel):
+            return False
+        if any(
+            not isinstance(value, Decimal) or not value.is_finite() or value <= 0
+            for value in (level.canonical_price, level.canonical_quantity)
+        ):
+            return False
+    return True
+
+
 def _market_identities(market: CanonicalMarket) -> tuple[str, ...]:
     """Return accepted canonical and venue-symbol identities without guessing."""
 
@@ -521,7 +533,7 @@ class TradeEvidence:
             raise ValueError("trade price and quantity must be positive")
         _utc(self.received_utc, "received_utc")
         _utc(self.exchange_event_utc, "exchange_event_utc")
-        if self.exchange_event_utc is not None and not self.exchange_event_time_provenance:
+        if (self.exchange_event_utc is None) != (self.exchange_event_time_provenance is None):
             raise ValueError("exchange UTC requires explicit provenance")
         if self.exchange_event_time_provenance is not None and not self.exchange_event_time_provenance:
             raise ValueError("exchange event provenance must be non-empty")
@@ -762,6 +774,7 @@ class HedgeHorizonCapture:
     vwap_price: Decimal | None
     gap_evidence: DataGapEvidence | None = None
     freshness_max_age_ns: int | None = None
+    ambiguous_books: tuple[BookEvidence, ...] = ()
 
     def __post_init__(self) -> None:
         if isinstance(self.horizon_ms, bool) or not isinstance(self.horizon_ms, int):
@@ -795,13 +808,26 @@ class HedgeHorizonCapture:
             raise ValueError("vwap_price must be positive when present")
         if self.freshness_max_age_ns is not None:
             _non_negative_int(self.freshness_max_age_ns, "freshness_max_age_ns")
+        if not isinstance(self.ambiguous_books, tuple):
+            raise TypeError("ambiguous_books must be a tuple")
+        executable_outcomes = {
+            EntryViabilityOutcome.HEDGE_FULL,
+            EntryViabilityOutcome.HEDGE_PARTIAL,
+            EntryViabilityOutcome.HEDGE_DEPTH_UNAVAILABLE,
+        }
+        data_failure_outcomes = {
+            EntryViabilityOutcome.HEDGE_DATA_MISSING,
+            EntryViabilityOutcome.HEDGE_DATA_STALE,
+            EntryViabilityOutcome.HEDGE_SESSION_DISPLACED,
+            EntryViabilityOutcome.HEDGE_DATA_GAP,
+        }
+        if outcome not in executable_outcomes | data_failure_outcomes | {
+            EntryViabilityOutcome.HEDGE_OUTCOME_UNKNOWN,
+        }:
+            raise ValueError("horizon capture requires a hedge outcome")
         if self.book is not None:
             if self.book.venue is not Venue.LIGHTER or self.book.canonical_market != self.canonical_market:
                 raise ValueError("selected book identity does not match capture")
-            if self.book.stream_session_id != self.expected_stream_session_id:
-                raise ValueError("selected book session does not match expected session")
-            if self.book.recovery_generation != self.expected_recovery_generation:
-                raise ValueError("selected book recovery does not match expected generation")
             if self.book_received_monotonic_ns != self.book.received_monotonic_ns:
                 raise ValueError("book receipt provenance does not match selected book")
             if self.book_stream_session_id != self.book.stream_session_id:
@@ -814,11 +840,34 @@ class HedgeHorizonCapture:
                 raise ValueError("book sequence/checksum provenance does not match selected book")
             if self.book.received_monotonic_ns > self.horizon_deadline_monotonic_ns:
                 raise ValueError("book received after horizon deadline")
-            if self.freshness_max_age_ns is not None and (
-                self.horizon_deadline_monotonic_ns - self.book.received_monotonic_ns
-                > self.freshness_max_age_ns
-            ):
-                raise ValueError("selected book fails freshness policy")
+        elif any(
+            value is not None
+            for value in (
+                self.book_received_monotonic_ns,
+                self.book_stream_session_id,
+                self.book_recovery_generation,
+                self.book_revision,
+                self.sequence,
+                self.checksum,
+            )
+        ):
+            raise ValueError("book provenance requires a retained book")
+        book_is_current = self.book is not None and (
+            self.book.stream_session_id == self.expected_stream_session_id
+            and self.book.recovery_generation == self.expected_recovery_generation
+        )
+        book_is_healthy = self.book is not None and self.book.is_sequence_healthy
+        book_fails_age = self.book is not None and (
+            self.freshness_max_age_ns is not None
+            and self.horizon_deadline_monotonic_ns - self.book.received_monotonic_ns
+            > self.freshness_max_age_ns
+        )
+        book_is_stale = book_is_current and book_is_healthy and (
+            not self.book.fresh or book_fails_age
+        )
+        book_is_executable = book_is_current and book_is_healthy and (
+            self.book.fresh and not book_fails_age
+        )
         if self.gap_evidence is not None:
             if not self.gap_evidence.matches(
                 Venue.LIGHTER,
@@ -827,27 +876,95 @@ class HedgeHorizonCapture:
                 self.expected_recovery_generation,
             ):
                 raise ValueError("gap evidence identity does not match expected Lighter stream")
+        for ambiguous in self.ambiguous_books:
+            if (
+                ambiguous.venue is not Venue.LIGHTER
+                or ambiguous.canonical_market != self.canonical_market
+                or ambiguous.stream_session_id != self.expected_stream_session_id
+                or ambiguous.recovery_generation != self.expected_recovery_generation
+                or ambiguous.received_monotonic_ns > self.horizon_deadline_monotonic_ns
+            ):
+                raise ValueError("ambiguous book provenance does not match capture identity")
+        if self.ambiguous_books:
+            first_ambiguous = self.ambiguous_books[0]
+            identity = (
+                first_ambiguous.received_monotonic_ns,
+                first_ambiguous.book_revision,
+                first_ambiguous.sequence,
+            )
+            if len(self.ambiguous_books) < 2 or any(
+                book == first_ambiguous
+                or (
+                    book.received_monotonic_ns,
+                    book.book_revision,
+                    book.sequence,
+                )
+                != identity
+                for book in self.ambiguous_books[1:]
+            ):
+                raise ValueError("ambiguous book provenance must contain a conflicting tied group")
+        if self.ambiguous_books and outcome is not EntryViabilityOutcome.HEDGE_OUTCOME_UNKNOWN:
+            raise ValueError("ambiguous book provenance requires UNKNOWN outcome")
+        if self.ambiguous_books and self.book is not None:
+            raise ValueError("ambiguous book provenance cannot also select a book")
         if outcome is EntryViabilityOutcome.HEDGE_FULL and filled != requested:
             raise ValueError("HEDGE_FULL requires exact requested quantity")
         if outcome is EntryViabilityOutcome.HEDGE_PARTIAL and not (0 < filled < requested):
             raise ValueError("HEDGE_PARTIAL requires positive quantity below exact q")
         if outcome is EntryViabilityOutcome.HEDGE_DEPTH_UNAVAILABLE and filled != 0:
             raise ValueError("HEDGE_DEPTH_UNAVAILABLE requires zero executable quantity")
-        if outcome in {
-            EntryViabilityOutcome.HEDGE_FULL,
-            EntryViabilityOutcome.HEDGE_PARTIAL,
-            EntryViabilityOutcome.HEDGE_DEPTH_UNAVAILABLE,
-        } and (self.book is None or not self.book.is_sequence_healthy or not self.book.fresh):
+        if outcome in {EntryViabilityOutcome.HEDGE_FULL, EntryViabilityOutcome.HEDGE_PARTIAL}:
+            if notional <= 0:
+                raise ValueError("positive hedge outcomes require positive notional")
+        if outcome is EntryViabilityOutcome.HEDGE_FULL and self.vwap_price is None:
+            raise ValueError("HEDGE_FULL requires a derived VWAP price")
+        if outcome is EntryViabilityOutcome.HEDGE_DEPTH_UNAVAILABLE and (
+            notional != 0 or self.vwap_price is not None
+        ):
+            raise ValueError("HEDGE_DEPTH_UNAVAILABLE requires zero notional and no VWAP")
+        if outcome in executable_outcomes and not book_is_executable:
             raise ValueError("executable hedge outcomes require a healthy fresh Lighter book")
-        if outcome is EntryViabilityOutcome.HEDGE_DATA_GAP and self.gap_evidence is None:
-            raise ValueError("HEDGE_DATA_GAP requires gap evidence")
-        if outcome in {
-            EntryViabilityOutcome.HEDGE_DATA_MISSING,
-            EntryViabilityOutcome.HEDGE_DATA_STALE,
-            EntryViabilityOutcome.HEDGE_SESSION_DISPLACED,
-            EntryViabilityOutcome.HEDGE_DATA_GAP,
-        } and filled != 0:
-            raise ValueError("data-failure hedge outcomes cannot report executable quantity")
+        if outcome in executable_outcomes and (self.gap_evidence is not None or self.ambiguous_books):
+            raise ValueError("executable hedge outcomes cannot retain gap or ambiguity evidence")
+        if outcome is EntryViabilityOutcome.HEDGE_DATA_MISSING:
+            if self.book is not None or self.gap_evidence is not None or self.ambiguous_books:
+                raise ValueError("HEDGE_DATA_MISSING requires no book or gap selection")
+        elif outcome is EntryViabilityOutcome.HEDGE_SESSION_DISPLACED:
+            if self.book is None or book_is_current:
+                raise ValueError("HEDGE_SESSION_DISPLACED requires displaced book provenance")
+            if self.gap_evidence is not None or self.ambiguous_books:
+                raise ValueError("displaced outcome cannot retain gap or ambiguity evidence")
+        elif outcome is EntryViabilityOutcome.HEDGE_DATA_STALE:
+            if not book_is_stale:
+                raise ValueError("HEDGE_DATA_STALE requires a stale current healthy book")
+            if self.gap_evidence is not None or self.ambiguous_books:
+                raise ValueError("stale outcome cannot retain gap or ambiguity evidence")
+        elif outcome is EntryViabilityOutcome.HEDGE_DATA_GAP:
+            if self.gap_evidence is None:
+                raise ValueError("HEDGE_DATA_GAP requires gap evidence")
+            if self.book is not None and not book_is_current:
+                raise ValueError("gap outcome cannot retain displaced book provenance")
+            if self.ambiguous_books:
+                raise ValueError("gap outcome cannot retain ambiguity evidence")
+        elif outcome is EntryViabilityOutcome.HEDGE_OUTCOME_UNKNOWN:
+            if self.gap_evidence is not None:
+                raise ValueError("UNKNOWN cannot mask a known data gap")
+            if not self.ambiguous_books:
+                if self.book is None:
+                    raise ValueError("UNKNOWN cannot mask missing book data")
+                if not book_is_current:
+                    raise ValueError("UNKNOWN cannot mask displaced book data")
+                if book_is_stale:
+                    raise ValueError("UNKNOWN cannot mask stale book data")
+                if book_is_executable and _book_levels_well_formed(self.book) and (
+                    (filled == 0 and notional == 0 and self.vwap_price is None)
+                    or (0 < filled <= requested and notional > 0)
+                ):
+                    raise ValueError("UNKNOWN cannot mask a known hedge-depth outcome")
+        if outcome in data_failure_outcomes and (
+            filled != 0 or notional != 0 or self.vwap_price is not None
+        ):
+            raise ValueError("data-failure hedge outcomes require zero executable evidence")
 
     @property
     def deadline_monotonic_ns(self) -> int:
@@ -876,6 +993,8 @@ class EntryViabilityEpisode:
         object.__setattr__(self, "outcome", outcome)
         if not isinstance(self.horizon_captures, tuple):
             raise TypeError("horizon_captures must be a tuple")
+        if outcome is not EntryViabilityOutcome.WOULD_FILL and self.horizon_captures:
+            raise ValueError("non-fill episodes cannot contain horizon captures")
         if self.would_fill_evidence is not None:
             evidence = self.would_fill_evidence
             if evidence.quote_version_id != self.quote_version.version_id:
