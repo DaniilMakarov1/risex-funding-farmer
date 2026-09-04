@@ -60,6 +60,7 @@ from .book_chain import (
     book_state_sha256,
     reconstruct_book_records,
 )
+from .calibration import build_calibration_evidence
 from .config import MAX_PUBLIC_DURATION_SECONDS, ShadowConfig
 from .feed import (
     FeedBookEvent,
@@ -163,6 +164,7 @@ __all__ = [
     "SpreadObserver",
     "SpreadShadowRunner",
     "build_report",
+    "build_calibration_evidence",
     "iter_records",
     "new_run_id",
     "render_report",

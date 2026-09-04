@@ -17,6 +17,7 @@ from .book_chain import (
     BookRevisionReconstructor,
     book_state_sha256,
 )
+from .calibration import build_calibration_evidence
 from .models import make_book_revision_id
 from .store import iter_records
 
@@ -1238,6 +1239,7 @@ def build_report(path: str | Path) -> dict[str, Any]:
     transport_failure_class_counts: dict[str, int] = defaultdict(int)
     transport_exception_type_counts: dict[str, int] = defaultdict(int)
     unexpected_transport_failure = False
+    calibration_records: list[dict[str, Any]] = []
 
     def policy_for(policy_id: str | None, record: dict[str, Any]) -> _PolicyStats | None:
         if policy_id is None or not policy_id:
@@ -1600,6 +1602,8 @@ def build_report(path: str | Path) -> dict[str, Any]:
     for record in _validated_records(path):
         record_count += 1
         kind = record.get("kind")
+        if kind in {"QUOTE", "RISEX_TRADE", "WOULD_FILL", "HEDGE_HORIZON"}:
+            calibration_records.append(record)
         market = record.get("canonical_market")
         if market is not None and len(markets) < 64:
             markets.add(_key_text(market))
@@ -2110,6 +2114,7 @@ def build_report(path: str | Path) -> dict[str, Any]:
             row["horizon_ms"],
         )
     )
+    calibration_evidence = build_calibration_evidence(calibration_records)
     sample_stop_payload = None
     if first_sample_stop is not None:
         sample_stop_payload = {
@@ -2183,6 +2188,7 @@ def build_report(path: str | Path) -> dict[str, Any]:
         "optimistic_model": "IMPLEMENTED" if optimistic_supported else "NOT_IMPLEMENTED",
         "markets": sorted(markets),
         "groups": output_groups,
+        "calibration_evidence": calibration_evidence,
     }
 
 
