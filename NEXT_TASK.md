@@ -1,17 +1,9 @@
-# Active bounded task
+# No active implementation task
 
-## SS-001I — Open-Ended Gap Replay Parity
+Status: `OWNER DECISION REQUIRED / IMPLEMENTATION CLOSED`.
 
-Status: `AUTHORIZED / BUILDER NOT YET OPENED`.
+DG-007 has the terminal frozen-precedence verdict `NO_SNAPSHOT_EDGE`. Prospectively valid conservative fills and delayed exact-q hedge evidence exist, resolving the fillability mission by case C, but the only materially strict-fillable policy misses the frozen `$0.01` p05 threshold at `0 ms`.
 
-Objective: correct the proven offline null-ended-gap overlap defect so deterministic replay agrees with the accepted online interval/identity semantics and the immutable DG-007 evidence can receive its frozen verdict.
+Do not collect another public sample and do not tune the existing evidence retrospectively. `SS-002` and `SS-003` remain closed. No Builder may be opened until the owner explicitly authorizes a new bounded objective.
 
-Exact base: accepted published `main` after this governance record. Create one fresh visible Spread Builder and worktree from that exact base.
-
-Allowed: change only offline report gap-overlap handling and focused tests. A null-ended gap is open from its recorded start and never overlaps evidence completed before that start; matching venue/market/session/recovery and later interval overlap remain mandatory and fail closed where evidence is genuinely malformed or incomplete.
-
-Acceptance: adverse null-ended and finite gap boundaries; exact identity mismatches; mixed same-policy recovery generations; unchanged raw counts/horizons; two byte-identical reports for each immutable DG-006 and DG-007 store; focused tests and one fresh isolated Python 3.11 full suite. Corrected DG-007 stop-policy validity must agree with its online `10`-episode/`10`-timestamp signal or the gate remains insufficient.
-
-Forbidden: collection/runtime changes, economics, fees, quote construction, fill models, eligibility, online stop logic, horizons, queues, storage/caps/timeouts, protocol or venue behavior, any new sample, private/auth/credential/signing/order preparation/dispatch/testnet/mainnet/write activity, strategy, `SS-002`, or `SS-003`.
-
-After candidate delivery, Chief independently reviews and alone accepts/integrates, then applies the already-frozen DG-007 verdict to the unchanged immutable evidence. Do not collect another sample.
+Any next step would change strategy or scope and therefore requires an explicit owner decision: maker pricing/margin grid, fee assumptions, venue choice, or a separately bounded calibration path. Private/authenticated data, credentials, signing, order preparation, dispatch, testnet/mainnet execution, positions, inventory, exits, unwind, and live trading remain prohibited.
