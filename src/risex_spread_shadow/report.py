@@ -540,13 +540,21 @@ def _gap_contaminates(
         # Missing timestamps or identity cannot prove that the evidence is
         # clean; retain fail-closed behaviour for malformed/legacy records.
         return True
+    if interval[1] < interval[0]:
+        return True
     gap_start = _record_int(gap, "gap_start_monotonic_ns")
     if gap_start is None:
         return True
+    if "gap_end_monotonic_ns" not in gap:
+        return True
+    if gap.get("gap_end_monotonic_ns") is None:
+        # A null end is an open interval.  It only reaches evidence whose
+        # interval has not ended before the gap begins; later matching
+        # evidence remains contaminated until session/recovery identity
+        # changes.
+        return interval[1] >= gap_start
     gap_end = _record_int(gap, "gap_end_monotonic_ns")
-    if gap_end is None:
-        gap_end = interval[1]
-    if gap_end < gap_start:
+    if gap_end is None or gap_end < gap_start:
         return True
     return not (gap_end < interval[0] or gap_start > interval[1])
 

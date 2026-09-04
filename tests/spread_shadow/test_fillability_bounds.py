@@ -34,6 +34,7 @@ from risex_spread_shadow import (
     detect_strict_would_fill,
     build_report,
 )
+from risex_spread_shadow.report import _gap_contaminates
 
 
 UTC = timezone.utc
@@ -731,6 +732,149 @@ def test_report_preserves_a_late_gap_after_episode_retirement(tmp_path: Path) ->
     delayed = next(group for group in report["groups"] if group["horizon_ms"] == 300)
     assert zero["data_completeness"] == "COMPLETE"
     assert delayed["data_completeness"] == "DEGRADED"
+
+
+def _gap_test_record(
+    *,
+    start: object = 10,
+    end: object = 20,
+    session: object = "lighter-1",
+    recovery: object = 0,
+    market: object = "BTC",
+    venue: object = "LIGHTER",
+    policy_id: str = "policy-1",
+) -> dict[str, object]:
+    return {
+        "kind": "HEDGE_HORIZON",
+        "canonical_market": market,
+        "venue": venue,
+        "policy_id": policy_id,
+        "would_fill_detected_monotonic_ns": start,
+        "horizon_deadline_monotonic_ns": end,
+        "expected_stream_session_id": session,
+        "expected_recovery_generation": recovery,
+    }
+
+
+def _gap_test_gap(
+    *,
+    start: object = 30,
+    end: object = 40,
+    session: object = "lighter-1",
+    recovery: object = 0,
+    market: object = "BTC",
+    venue: object = "LIGHTER",
+) -> dict[str, object]:
+    return {
+        "kind": "DATA_GAP",
+        "canonical_market": market,
+        "venue": venue,
+        "stream_session_id": session,
+        "recovery_generation": recovery,
+        "gap_start_monotonic_ns": start,
+        "gap_end_monotonic_ns": end,
+        "reason": "TEST_GAP",
+    }
+
+
+@pytest.mark.parametrize(
+    ("label", "interval", "expected"),
+    (
+        ("before", (10, 20), False),
+        ("exact_boundary", (10, 30), True),
+        ("inside", (10, 40), True),
+        ("after", (40, 50), True),
+    ),
+)
+def test_null_ended_gap_is_open_from_inclusive_start(
+    label: str,
+    interval: tuple[int, int],
+    expected: bool,
+) -> None:
+    del label
+    gap = _gap_test_gap(start=30, end=None)
+    assert _gap_contaminates(
+        gap,
+        _gap_test_record(start=interval[0], end=interval[1]),
+    ) is expected
+
+
+@pytest.mark.parametrize(
+    ("label", "interval", "gap_start", "gap_end", "expected"),
+    (
+        ("before", (10, 20), 30, 40, False),
+        ("after", (50, 60), 30, 40, False),
+        ("overlap_left", (20, 35), 30, 40, True),
+        ("overlap_right", (35, 50), 30, 40, True),
+        ("malformed_order", (10, 20), 40, 39, True),
+        ("malformed_value", (10, 20), 30, "not-an-integer", True),
+    ),
+)
+def test_finite_gap_boundaries_and_malformed_endpoints(
+    label: str,
+    interval: tuple[int, int],
+    gap_start: object,
+    gap_end: object,
+    expected: bool,
+) -> None:
+    del label
+    assert _gap_contaminates(
+        _gap_test_gap(start=gap_start, end=gap_end),
+        _gap_test_record(start=interval[0], end=interval[1]),
+    ) is expected
+
+
+def test_gap_identity_mismatches_do_not_contaminate_matching_interval() -> None:
+    record = _gap_test_record(start=10, end=20)
+    for field, value in (
+        ("venue", "RISEX"),
+        ("canonical_market", "ETH"),
+        ("stream_session_id", "lighter-2"),
+        ("recovery_generation", 1),
+    ):
+        gap = _gap_test_gap(start=10, end=20)
+        gap[field] = value
+        assert _gap_contaminates(gap, record) is False, field
+
+
+def test_same_policy_recovery_generations_are_classified_independently() -> None:
+    gap = _gap_test_gap(start=100, end=None)
+    same_recovery = _gap_test_record(
+        start=90,
+        end=110,
+        recovery=0,
+        policy_id="same-policy",
+    )
+    recovered = _gap_test_record(
+        start=90,
+        end=110,
+        recovery=1,
+        policy_id="same-policy",
+    )
+    completed_before_gap = _gap_test_record(
+        start=10,
+        end=20,
+        recovery=0,
+        policy_id="same-policy",
+    )
+    assert _gap_contaminates(gap, same_recovery) is True
+    assert _gap_contaminates(gap, recovered) is False
+    assert _gap_contaminates(gap, completed_before_gap) is False
+
+
+def test_missing_or_malformed_gap_and_record_timestamps_fail_closed() -> None:
+    record = _gap_test_record()
+    assert _gap_contaminates(
+        _gap_test_gap(start=30, end=None),
+        {**record, "horizon_deadline_monotonic_ns": 5},
+    ) is True
+    missing_end = _gap_test_gap(start=30)
+    del missing_end["gap_end_monotonic_ns"]
+    assert _gap_contaminates(missing_end, record) is True
+    assert _gap_contaminates(
+        _gap_test_gap(start="not-an-integer", end=40),
+        record,
+    ) is True
 
 
 def test_report_attributes_each_horizon_to_only_overlapping_episode(
