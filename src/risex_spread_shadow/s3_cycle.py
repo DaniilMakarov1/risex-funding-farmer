@@ -1628,16 +1628,27 @@ class CycleRunDriver:
                 admissions[scenario] = admission
                 self.admissions.append(admission)
                 self._write(self._admission_payload(attempt_index, admission))
-        rejected = any(not admission.accepted for admission in admissions.values())
+        accepted_any = any(admission.accepted for admission in admissions.values())
         self._decisions[attempt_index] = _DecisionState(
             attempt_index=attempt_index,
             quote_version=quote_version,
             source_books=books,
             admissions=admissions,
             inputs=[],
-            finished=skip is not None or rejected,
+            # A rejected alternative must not close a decision whose sibling
+            # was admitted.  In streaming mode the accepted lane continues
+            # through the global input path while the rejected lane remains
+            # auditable as a per-scenario admission.  The old aggregate
+            # ``rejected`` check incorrectly made that healthy lane look
+            # finished and could also emit an attempt end into stream
+            # evidence, making a physical replay impossible.
+            finished=skip is not None or not accepted_any,
         )
-        if skip is not None or rejected:
+        # A streaming run has one physical stream end, not one attempt end
+        # per signal.  Even an entirely rejected late signal is represented
+        # by its decision/admission records; emitting ``CYCLE_END`` here
+        # would mix attempt-scoped records into the stream replay contract.
+        if not self.streaming and (skip is not None or not accepted_any):
             self._write(
                 {
                     "kind": "CYCLE_END",
@@ -2558,7 +2569,10 @@ async def run_public_cycle_collection(
         writer=writer,
         streaming=True,
     )
-    ingress = IngressQueue(capacity=4096)
+    # S3 stream replay is a physical producer-order contract.  Keep the
+    # historical queue default unchanged for the other public pipelines and
+    # opt this bounded stream into offer-order gap delivery explicitly.
+    ingress = IngressQueue(capacity=4096, preserve_offer_order=True)
     producer: PublicCycleProducer | None = None
     feed: PublicFeedRunner | None = None
     terminal_written = False

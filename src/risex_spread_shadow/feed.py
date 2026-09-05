@@ -155,16 +155,20 @@ IngressItem = FeedBookEvent | FeedTradeEvent | FeedGapEvent
 class IngressQueue:
     """A bounded non-blocking ingress with a durable-in-memory gap latch."""
 
-    def __init__(self, capacity: int) -> None:
+    def __init__(self, capacity: int, *, preserve_offer_order: bool = False) -> None:
         if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity <= 0:
             raise ValueError("ingress queue capacity must be positive")
-        self._queue: asyncio.Queue[tuple[IngressItem, int]] = asyncio.Queue(
+        if not isinstance(preserve_offer_order, bool):
+            raise TypeError("preserve_offer_order must be bool")
+        self._preserve_offer_order = preserve_offer_order
+        self._queue: asyncio.Queue[tuple[IngressItem, int, int]] = asyncio.Queue(
             maxsize=capacity
         )
-        self._queued_entries: deque[tuple[IngressItem, int]] = deque()
+        self._queued_entries: deque[tuple[IngressItem, int, int]] = deque()
         self._wake = asyncio.Event()
         self._latched: dict[tuple[Venue, str, str | int, int], DataGapEvidence] = {}
         self._latched_received: dict[tuple[Venue, str, str | int, int], int] = {}
+        self._latched_serial: dict[tuple[Venue, str, str | int, int], int] = {}
         self._in_flight: tuple[IngressItem, int] | None = None
         self._consumer_failed = False
         self._progress = asyncio.Event()
@@ -218,7 +222,7 @@ class IngressQueue:
             return True
         if any(
             received <= deadline_ns and self._is_lighter_horizon_item(item)
-            for item, received in self._queued_entries
+            for item, received, _serial in self._queued_entries
         ):
             return True
         return any(
@@ -284,7 +288,7 @@ class IngressQueue:
             reason="QUEUE_OVERFLOW",
         )
 
-    def _latch(self, gap: DataGapEvidence) -> None:
+    def _latch(self, gap: DataGapEvidence, *, offer_serial: int) -> None:
         identity = (
             gap.source_venue,
             gap.canonical_market,
@@ -295,6 +299,7 @@ class IngressQueue:
         if previous is None:
             self._latched[identity] = gap
             self._latched_received[identity] = gap.gap_start_monotonic_ns
+            self._latched_serial[identity] = offer_serial
             return
         end = gap.gap_end_monotonic_ns
         if previous.gap_end_monotonic_ns is None or end is None:
@@ -363,6 +368,9 @@ class IngressQueue:
         self._latched_received[identity] = min(
             self._latched_received[identity], gap.gap_start_monotonic_ns
         )
+        self._latched_serial[identity] = min(
+            self._latched_serial[identity], offer_serial
+        )
 
     def offer(self, item: IngressItem) -> bool:
         """Enqueue without waiting; an overflow always latches explicit gap evidence."""
@@ -370,16 +378,16 @@ class IngressQueue:
         self._offer_serial += 1
         received = self._item_received_monotonic_ns(item)
         if self._closed:
-            self._latch(self._item_gap(item))
+            self._latch(self._item_gap(item), offer_serial=self._offer_serial)
             self._wake.set()
             self._progress.set()
             return False
         try:
-            entry = (item, received)
+            entry = (item, received, self._offer_serial)
             self._queue.put_nowait(entry)
             self._queued_entries.append(entry)
         except asyncio.QueueFull:
-            self._latch(self._item_gap(item))
+            self._latch(self._item_gap(item), offer_serial=self._offer_serial)
             self._wake.set()
             self._progress.set()
             return False
@@ -390,17 +398,32 @@ class IngressQueue:
     async def next_item(self) -> IngressItem | None:
         while True:
             if self._latched:
-                key = sorted(
-                    self._latched,
-                    key=lambda value: (
-                        value[1],
-                        value[0].value,
-                        str(value[2]),
-                        value[3],
-                    ),
-                )[0]
-                gap = self._latched.pop(key)
-                received = self._latched_received.pop(key)
+                if self._preserve_offer_order:
+                    latched_key = min(
+                        self._latched,
+                        key=lambda value: self._latched_serial[value],
+                    )
+                    latched_serial = self._latched_serial[latched_key]
+                    if self._queued_entries and self._queued_entries[0][2] < latched_serial:
+                        entry = self._queue.get_nowait()
+                        queued = self._queued_entries.popleft()
+                        if queued != entry:
+                            raise RuntimeError("ingress queue coordination lost item order")
+                        self._in_flight = (entry[0], entry[1])
+                        return entry[0]
+                else:
+                    latched_key = sorted(
+                        self._latched,
+                        key=lambda value: (
+                            value[1],
+                            value[0].value,
+                            str(value[2]),
+                            value[3],
+                        ),
+                    )[0]
+                gap = self._latched.pop(latched_key)
+                received = self._latched_received.pop(latched_key)
+                self._latched_serial.pop(latched_key)
                 item = FeedGapEvent(gap)
                 self._in_flight = (item, received)
                 return item
@@ -409,7 +432,7 @@ class IngressQueue:
                 queued = self._queued_entries.popleft()
                 if queued != entry:
                     raise RuntimeError("ingress queue coordination lost item order")
-                self._in_flight = entry
+                self._in_flight = (entry[0], entry[1])
                 return entry[0]
             except asyncio.QueueEmpty:
                 pass
