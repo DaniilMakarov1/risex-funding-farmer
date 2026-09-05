@@ -61,8 +61,20 @@ from .book_chain import (
     reconstruct_book_records,
 )
 from .calibration import build_calibration_evidence
-from .offline_evaluation import build_offline_evaluation
-from .config import MAX_PUBLIC_DURATION_SECONDS, ShadowConfig
+from .offline_evaluation import (
+    FIXED_EVALUATION_SECTION,
+    build_fixed_offline_evaluation,
+    build_offline_evaluation,
+)
+from .config import (
+    FIXED_SCANNER_STAGE_NAMES,
+    MAX_PUBLIC_DURATION_SECONDS,
+    ShadowConfig,
+    fixed_scanner_config,
+    fixed_scanner_policy_fingerprint,
+    fixed_scanner_policy_fields,
+    fixed_scanner_stage_fingerprint,
+)
 from .feed import (
     FeedBookEvent,
     FeedGapEvent,
@@ -89,7 +101,16 @@ from .store import (
     MAX_EVIDENCE_RECORDS,
     iter_records,
     new_run_id,
+    reserve_scanner_stage,
+    ScannerStageClaimError,
     store_permissions,
+)
+from .scanner import (
+    ScannerPreconditionError,
+    render_fixed_evaluation,
+    render_fixed_report,
+    run_fixed_scanner,
+    validate_loaded_release,
 )
 
 __all__ = [
@@ -146,6 +167,8 @@ __all__ = [
     "AppendOnlyEvidenceStore",
     "EvidenceIntegrityError",
     "EvidenceStorageLimitExceeded",
+    "ScannerStageClaimError",
+    "ScannerPreconditionError",
     "MAX_EVIDENCE_FILE_BYTES",
     "MAX_EVIDENCE_RECORDS",
     "BookHistory",
@@ -161,15 +184,27 @@ __all__ = [
     "SampleStopReason",
     "SampleStopSignal",
     "ShadowConfig",
+    "FIXED_EVALUATION_SECTION",
+    "FIXED_SCANNER_STAGE_NAMES",
     "MAX_PUBLIC_DURATION_SECONDS",
     "SpreadObserver",
     "SpreadShadowRunner",
     "build_report",
+    "build_fixed_offline_evaluation",
     "build_calibration_evidence",
     "build_offline_evaluation",
     "iter_records",
     "new_run_id",
+    "reserve_scanner_stage",
     "render_report",
+    "render_fixed_evaluation",
+    "render_fixed_report",
+    "run_fixed_scanner",
+    "validate_loaded_release",
+    "fixed_scanner_config",
+    "fixed_scanner_policy_fields",
+    "fixed_scanner_policy_fingerprint",
+    "fixed_scanner_stage_fingerprint",
     "run_public_smoke",
     "select_public_market_pairs",
     "store_permissions",

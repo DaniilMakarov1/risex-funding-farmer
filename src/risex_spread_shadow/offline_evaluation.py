@@ -17,6 +17,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
+from datetime import UTC, datetime
 import hashlib
 import json
 from pathlib import Path
@@ -29,6 +30,29 @@ from .book_chain import (
     BookRevisionReconstructor,
     book_state_sha256,
 )
+from .config import (
+    FIXED_SCANNER_BYTE_CAP,
+    FIXED_SCANNER_DIRECTION,
+    FIXED_SCANNER_ELIGIBLE_TRADE_LIMIT,
+    FIXED_SCANNER_HORIZONS_MS,
+    FIXED_SCANNER_LIGHTER_FEE_PROVENANCE,
+    FIXED_SCANNER_LIGHTER_TAKER_FEE_RATE,
+    FIXED_SCANNER_LIGHTER_TAKER_LATENCY_MS,
+    FIXED_SCANNER_MARKET,
+    FIXED_SCANNER_MARGINS_BPS,
+    FIXED_SCANNER_NOTIONAL_USD,
+    FIXED_SCANNER_RECORD_CAP,
+    FIXED_SCANNER_RISEX_FEE_PROVENANCE,
+    FIXED_SCANNER_RISEX_FEE_TIER,
+    FIXED_SCANNER_RISEX_MAKER_FEE_RATE,
+    FIXED_SCANNER_STAGE_NAMES,
+    FIXED_SCANNER_TERMINAL_DRAIN_ALLOWANCE_NS,
+    FIXED_SCANNER_WALL_CLOCK_SECONDS,
+    fixed_scanner_policy_fields,
+    fixed_scanner_policy_fingerprint,
+    fixed_scanner_stage_fingerprint,
+    is_exact_release,
+)
 from .economics import exact_vwap
 from .models import make_book_revision_id
 from .store import iter_records
@@ -38,6 +62,7 @@ HORIZONS = (0, 300, 500, 1000)
 STRICT_MODEL = "STRICT_LOWER_BOUND"
 OPTIMISTIC_MODEL = "OPTIMISTIC_UPPER_BOUND"
 EVALUATION_SECTION = "SCAN_002_BOUNDED_OFFLINE_EVALUATION"
+FIXED_EVALUATION_SECTION = "SCAN_003_FIXED_OFFLINE_EVALUATION"
 _NS_PER_MINUTE = 60_000_000_000
 _NS_PER_FIVE_MINUTES = 300_000_000_000
 _MAX_QUOTES = 250_000
@@ -46,6 +71,34 @@ _MAX_FILLS = 2_000
 _MAX_HORIZONS = 8_000
 _MAX_GAPS = 100_000
 _MISSING = object()
+_REFERENCE_REPORT_MAX_BYTES = 8 * 1024 * 1024
+_HASH_CHUNK_BYTES = 1024 * 1024
+
+_FIXED_DATA_GATE_NAMES = frozenset(
+    {
+        "COMMON_ELIGIBLE_UNIT_FLOOR",
+        "ALL_ELIGIBLE_UNITS_CLEAN",
+        "PAIRED_CLEAN_UNIT_FLOOR",
+        "DISTINCT_EFFECTIVE_LEVEL_FLOOR",
+        "DISTINCT_EFFECTIVE_LEVEL_SHARE",
+        "EFFECTIVE_LEVEL_COLLISION_COUNT",
+        "EFFECTIVE_LEVEL_COLLISION_SHARE",
+        "EFFECTIVE_LEVEL_REVERSED",
+        "EFFECTIVE_LEVEL_UNRESOLVED",
+        "SELECTOR_INPUT_COMPLETE",
+    }
+)
+_FIXED_ARM_DATA_GATE_SUFFIXES = (
+    "_CLEAN_FILLED_UNIT_FLOOR",
+    "_VENUE_CLUSTER_FLOOR",
+    "_DETECTION_TIMESTAMP_FLOOR",
+    "_ONE_MINUTE_CONCENTRATION",
+    "_FIVE_MINUTE_CONCENTRATION",
+    "_FULL_HEDGE_0MS",
+    "_FULL_HEDGE_300MS",
+    "_FULL_HEDGE_500MS",
+    "_FULL_HEDGE_1000MS",
+)
 
 _POLICY_PAYLOAD = {
     "market": "BTC",
@@ -846,6 +899,380 @@ def _stage_contract(metadata: Mapping[str, Any], mode: str, run_id: str | None) 
     }
 
 
+def _parse_utc(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(UTC)
+
+
+def _fixed_stage_contract(
+    metadata: Mapping[str, Any],
+    mode: str,
+    run_id: str | None,
+    *,
+    terminal_records: Iterable[Mapping[str, Any]] = (),
+) -> dict[str, Any]:
+    """Validate the terminal-bound SCAN-003 producer contract.
+
+    Metadata is written before a run knows its terminal time.  The actual
+    interval and stage fingerprint therefore come only from the sole final
+    terminal record and are checked here rather than trusted from the header.
+    """
+
+    raw = metadata.get("scan_003")
+    section = raw if isinstance(raw, Mapping) else {}
+    missing: list[str] = []
+    invalid: list[str] = []
+
+    def required(name: str) -> Any:
+        value = section.get(name, _MISSING)
+        if value is _MISSING:
+            missing.append(name)
+            return None
+        return value
+
+    stage_kind_value = required("stage_kind")
+    stage_kind = _text(stage_kind_value).upper()
+    if stage_kind not in {"PUBLIC", "FIXTURE"}:
+        invalid.append("stage_kind")
+    synthetic = mode.upper() == "FIXTURE" or stage_kind == "FIXTURE"
+    stage_name = required("stage_name")
+    if stage_name not in FIXED_SCANNER_STAGE_NAMES:
+        invalid.append("stage_name")
+    stage_run_id = required("run_id")
+    if not isinstance(stage_run_id, str) or not stage_run_id:
+        invalid.append("run_id")
+    if run_id is not None and stage_run_id != run_id:
+        invalid.append("run_id_top_level_mismatch")
+    accepted_release = required("accepted_release")
+    if not isinstance(accepted_release, str) or not accepted_release:
+        invalid.append("accepted_release")
+    elif stage_kind == "PUBLIC" and not is_exact_release(accepted_release):
+        invalid.append("accepted_release")
+
+    policy = required("policy")
+    expected_policy: Mapping[str, Any] = {}
+    if isinstance(accepted_release, str) and accepted_release:
+        expected_policy = fixed_scanner_policy_fields(accepted_release)
+    if not isinstance(policy, Mapping):
+        invalid.append("policy")
+    elif dict(policy) != dict(expected_policy):
+        invalid.append("policy")
+    policy_fingerprint = required("policy_fingerprint")
+    expected_policy_fingerprint = (
+        fixed_scanner_policy_fingerprint(accepted_release)
+        if isinstance(accepted_release, str) and accepted_release
+        else None
+    )
+    if policy_fingerprint != expected_policy_fingerprint:
+        invalid.append("policy_fingerprint")
+
+    requested_window = required("requested_window_utc")
+    window_start = window_end = None
+    if not isinstance(requested_window, Mapping):
+        invalid.append("requested_window_utc")
+    else:
+        window_start = _parse_utc(requested_window.get("start_utc"))
+        window_end = _parse_utc(requested_window.get("end_utc"))
+        if window_start is None:
+            invalid.append("requested_window_utc.start_utc")
+        if window_end is None:
+            invalid.append("requested_window_utc.end_utc")
+        if window_start is not None and window_end is not None and window_end <= window_start:
+            invalid.append("requested_window_utc")
+
+    sample_start = required("sample_start")
+    sample_start_ns: int | None = None
+    sample_start_utc: datetime | None = None
+    if not isinstance(sample_start, Mapping):
+        invalid.append("sample_start")
+    else:
+        sample_start_ns = _integer(sample_start.get("monotonic_ns"))
+        sample_start_utc = _parse_utc(sample_start.get("utc"))
+        if sample_start_ns is None:
+            invalid.append("sample_start.monotonic_ns")
+        if sample_start_utc is None:
+            invalid.append("sample_start.utc")
+
+    limits = required("limits")
+    expected_limits = {
+        "eligible_trade_limit": FIXED_SCANNER_ELIGIBLE_TRADE_LIMIT,
+        "wall_clock_seconds": FIXED_SCANNER_WALL_CLOCK_SECONDS,
+        "record_cap": FIXED_SCANNER_RECORD_CAP,
+        "byte_cap": FIXED_SCANNER_BYTE_CAP,
+        "terminal_drain_allowance_ns": FIXED_SCANNER_TERMINAL_DRAIN_ALLOWANCE_NS,
+        "fill_count_stop": None,
+    }
+    if not isinstance(limits, Mapping):
+        invalid.append("limits")
+    elif dict(limits) != expected_limits:
+        invalid.append("limits")
+
+    cal_reference = section.get("cal_reference", _MISSING)
+    if stage_name == "HOLDOUT-001":
+        if cal_reference is _MISSING:
+            missing.append("cal_reference")
+        elif not isinstance(cal_reference, Mapping):
+            invalid.append("cal_reference")
+        else:
+            for name in (
+                "stage_name",
+                "run_id",
+                "accepted_release",
+                "policy_fingerprint",
+                "stage_fingerprint",
+                "reference_sha256",
+                "selected_margin_bps",
+                "terminal_end_utc",
+            ):
+                value = cal_reference.get(name, _MISSING)
+                if value is _MISSING or not isinstance(value, str) or not value:
+                    invalid.append(f"cal_reference.{name}")
+            if cal_reference.get("stage_name") != "CAL-001":
+                invalid.append("cal_reference.stage_name")
+            if cal_reference.get("accepted_release") != accepted_release:
+                invalid.append("cal_reference.accepted_release")
+            if cal_reference.get("policy_fingerprint") != expected_policy_fingerprint:
+                invalid.append("cal_reference.policy_fingerprint")
+            if cal_reference.get("selected_margin_bps") not in {"1", "2"}:
+                invalid.append("cal_reference.selected_margin_bps")
+            for name in ("stage_fingerprint", "reference_sha256"):
+                value = cal_reference.get(name)
+                if isinstance(value, str) and (
+                    len(value) != 64
+                    or any(character not in "0123456789abcdef" for character in value)
+                ):
+                    invalid.append(f"cal_reference.{name}")
+            if isinstance(cal_reference.get("terminal_end_utc"), str) and _parse_utc(
+                cal_reference["terminal_end_utc"]
+            ) is None:
+                invalid.append("cal_reference.terminal_end_utc")
+    elif cal_reference is not _MISSING:
+        invalid.append("cal_reference")
+
+    # The header may contain the start, but never a guessed terminal or stage
+    # fingerprint.  Those values are authoritative only in the final row.
+    if "stage_fingerprint" in section or "sample_interval" in section:
+        invalid.append("header_terminal_fields_present")
+
+    terminal_rows = tuple(terminal_records)
+    terminal = terminal_rows[0] if len(terminal_rows) == 1 else None
+    if not terminal_rows:
+        missing.append("terminal")
+    elif len(terminal_rows) != 1:
+        invalid.append("terminal_count")
+    terminal_payload = terminal.get("scan_003") if terminal is not None else None
+    terminal_interval = None
+    terminal_stop = None
+    supplied_stage_fingerprint = None
+    terminal_kind = None if terminal is None else _text(terminal.get("kind"))
+    terminal_end_ns: int | None = None
+    terminal_end_utc: datetime | None = None
+    terminal_observed_ns: int | None = None
+    terminal_utc: datetime | None = None
+    if not isinstance(terminal_payload, Mapping):
+        missing.append("terminal.scan_003")
+    else:
+        for name, expected in (
+            ("stage_name", stage_name),
+            ("stage_kind", stage_kind_value),
+            ("run_id", stage_run_id),
+            ("accepted_release", accepted_release),
+            ("policy_fingerprint", policy_fingerprint),
+        ):
+            if terminal_payload.get(name) != expected:
+                invalid.append(f"terminal.{name}")
+        terminal_interval = terminal_payload.get("sample_interval")
+        if not isinstance(terminal_interval, Mapping):
+            invalid.append("terminal.sample_interval")
+        else:
+            terminal_start_ns = _integer(terminal_interval.get("start_monotonic_ns"))
+            terminal_end_ns = _integer(terminal_interval.get("end_monotonic_ns"))
+            terminal_start_utc = _parse_utc(terminal_interval.get("start_utc"))
+            terminal_end_utc = _parse_utc(terminal_interval.get("end_utc"))
+            if terminal_start_ns is None:
+                invalid.append("terminal.sample_interval.start_monotonic_ns")
+            if terminal_end_ns is None:
+                invalid.append("terminal.sample_interval.end_monotonic_ns")
+            if terminal_start_utc is None:
+                invalid.append("terminal.sample_interval.start_utc")
+            if terminal_end_utc is None:
+                invalid.append("terminal.sample_interval.end_utc")
+            if terminal_start_ns is not None and terminal_end_ns is not None and terminal_end_ns < terminal_start_ns:
+                invalid.append("terminal.sample_interval")
+            if terminal_start_utc is not None and terminal_end_utc is not None and terminal_end_utc < terminal_start_utc:
+                invalid.append("terminal.sample_interval")
+            if sample_start_ns is not None and terminal_start_ns != sample_start_ns:
+                invalid.append("terminal.sample_interval.start_monotonic_ns_mismatch")
+            if sample_start_utc is not None and terminal_start_utc != sample_start_utc:
+                invalid.append("terminal.sample_interval.start_utc_mismatch")
+        terminal_stop = terminal_payload.get("stop")
+        if not isinstance(terminal_stop, Mapping):
+            invalid.append("terminal.stop")
+        supplied_stage_fingerprint = terminal_payload.get("stage_fingerprint", _MISSING)
+        if supplied_stage_fingerprint is _MISSING:
+            missing.append("terminal.stage_fingerprint")
+        if terminal is not None:
+            terminal_observed_ns = _integer(terminal.get("observed_monotonic_ns"))
+            terminal_timestamp = (
+                terminal.get("stopped_utc")
+                if terminal_kind == "RUN_STOP"
+                else terminal.get("failed_utc")
+            )
+            terminal_utc = _parse_utc(terminal_timestamp)
+            if terminal_observed_ns is None:
+                invalid.append("terminal.observed_monotonic_ns")
+            if terminal_utc is None:
+                invalid.append("terminal.timestamp")
+            if terminal_end_ns is not None and terminal_observed_ns != terminal_end_ns:
+                invalid.append("terminal.observed_monotonic_ns_mismatch")
+            if terminal_end_utc is not None and terminal_utc != terminal_end_utc:
+                invalid.append("terminal.timestamp_mismatch")
+
+    computed_stage_fingerprint = None
+    if (
+        isinstance(stage_name, str)
+        and isinstance(stage_kind_value, str)
+        and isinstance(stage_run_id, str)
+        and isinstance(accepted_release, str)
+        and isinstance(policy_fingerprint, str)
+        and isinstance(terminal_interval, Mapping)
+    ):
+        computed_stage_fingerprint = fixed_scanner_stage_fingerprint(
+            stage_name=stage_name,
+            stage_kind=stage_kind_value,
+            run_id=stage_run_id,
+            accepted_release=accepted_release,
+            sample_interval=terminal_interval,
+            policy_fingerprint=policy_fingerprint,
+        )
+        if supplied_stage_fingerprint != computed_stage_fingerprint:
+            invalid.append("terminal.stage_fingerprint")
+
+    return {
+        "contract": "SCAN_003",
+        "stage_kind": stage_kind,
+        "stage_name": stage_name if isinstance(stage_name, str) else None,
+        "run_id": stage_run_id if isinstance(stage_run_id, str) else None,
+        "accepted_release": accepted_release if isinstance(accepted_release, str) else None,
+        "policy": dict(policy) if isinstance(policy, Mapping) else None,
+        "policy_fingerprint": policy_fingerprint,
+        "computed_policy_fingerprint": expected_policy_fingerprint,
+        "requested_window_utc": dict(requested_window) if isinstance(requested_window, Mapping) else None,
+        "sample_start": dict(sample_start) if isinstance(sample_start, Mapping) else None,
+        "limits": dict(limits) if isinstance(limits, Mapping) else None,
+        "cal_reference": dict(cal_reference) if isinstance(cal_reference, Mapping) else None,
+        "terminal_kind": terminal_kind,
+        "terminal": dict(terminal_payload) if isinstance(terminal_payload, Mapping) else None,
+        "terminal_stop": dict(terminal_stop) if isinstance(terminal_stop, Mapping) else None,
+        "terminal_end_monotonic_ns": terminal_end_ns,
+        "terminal_end_utc": None if terminal_end_utc is None else terminal_end_utc.isoformat(),
+        "terminal_observed_monotonic_ns": terminal_observed_ns,
+        "terminal_utc": None if terminal_utc is None else terminal_utc.isoformat(),
+        "stage_fingerprint": None if supplied_stage_fingerprint is _MISSING else supplied_stage_fingerprint,
+        "computed_stage_fingerprint": computed_stage_fingerprint,
+        "missing_fields": sorted(set(missing)),
+        "invalid_fields": sorted(set(invalid)),
+        "valid": not missing and not invalid and stage_kind == "PUBLIC",
+        "synthetic": synthetic,
+    }
+
+
+def _fixed_quote_scope_matches(record: Mapping[str, Any]) -> bool:
+    return (
+        _text(record.get("canonical_market")) == FIXED_SCANNER_MARKET
+        and _text(record.get("direction")) == FIXED_SCANNER_DIRECTION
+        and _decimal(record.get("target_notional_usd")) == FIXED_SCANNER_NOTIONAL_USD
+        and _decimal(record.get("target_margin_bps")) in FIXED_SCANNER_MARGINS_BPS
+        and _decimal(record.get("risex_maker_fee_rate")) == FIXED_SCANNER_RISEX_MAKER_FEE_RATE
+        and _decimal(record.get("lighter_taker_fee_rate")) == FIXED_SCANNER_LIGHTER_TAKER_FEE_RATE
+        and _text(record.get("risex_fee_source")) == FIXED_SCANNER_RISEX_FEE_PROVENANCE
+        and _text(record.get("lighter_fee_source")) == FIXED_SCANNER_LIGHTER_FEE_PROVENANCE
+    )
+
+
+def _legitimate_inactive_quote(record: Mapping[str, Any]) -> bool:
+    """Accept a normal non-active quote row without inventing a version."""
+
+    return (
+        record.get("quote_version_id") is None
+        and _text(record.get("outcome"))
+        in {"QUOTE_NOT_POST_ONLY", "QUOTE_NOT_ECONOMIC"}
+        and isinstance(record.get("policy_id"), str)
+        and bool(record.get("policy_id"))
+        and _fixed_quote_scope_matches(record)
+    )
+
+
+def _load_stage_reference(reference: Any) -> tuple[Mapping[str, Any] | None, set[str]]:
+    """Load a prior fixed-stage report or evidence stream without networking."""
+
+    if isinstance(reference, Mapping):
+        report = reference.get("offline_evaluation")
+        if isinstance(report, Mapping):
+            return report, set()
+        return reference, set()
+    if not isinstance(reference, (str, Path)):
+        return None, {"HOLDOUT_REFERENCE_MISSING_OR_MALFORMED"}
+    path = Path(reference)
+    if not path.is_file():
+        return None, {"HOLDOUT_REFERENCE_NOT_FOUND"}
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return None, {"HOLDOUT_REFERENCE_UNREADABLE"}
+    if size > _REFERENCE_REPORT_MAX_BYTES:
+        try:
+            return build_offline_evaluation(path), set()
+        except (OSError, ValueError, TypeError):
+            return None, {"HOLDOUT_REFERENCE_INVALID_JSON"}
+    try:
+        with path.open("rb") as handle:
+            content = handle.read(_REFERENCE_REPORT_MAX_BYTES + 1)
+    except OSError:
+        return None, {"HOLDOUT_REFERENCE_UNREADABLE"}
+    if len(content) > _REFERENCE_REPORT_MAX_BYTES:
+        try:
+            return build_offline_evaluation(path), set()
+        except (OSError, ValueError, TypeError):
+            return None, {"HOLDOUT_REFERENCE_INVALID_JSON"}
+    try:
+        decoded = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        # Evidence JSONL is intentionally sent back through the same bounded
+        # evaluator, never through the legacy retained-history report.
+        try:
+            return build_offline_evaluation(path), set()
+        except (OSError, ValueError, TypeError):
+            return None, {"HOLDOUT_REFERENCE_INVALID_JSON"}
+    if not isinstance(decoded, Mapping):
+        return None, {"HOLDOUT_REFERENCE_NOT_OBJECT"}
+    report = decoded.get("offline_evaluation")
+    return (report if isinstance(report, Mapping) else decoded), set()
+
+
+def _reference_sha256(reference: Any) -> str | None:
+    if not isinstance(reference, (str, Path)):
+        return None
+    try:
+        digest = hashlib.sha256()
+        with Path(reference).open("rb") as handle:
+            while True:
+                chunk = handle.read(_HASH_CHUNK_BYTES)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
 def _stats_for_units(values: list[Decimal]) -> dict[str, Any]:
     return _stats(values)
 
@@ -1213,12 +1640,17 @@ def _metadata_from_compact(compact: Iterable[Mapping[str, Any]]) -> tuple[dict[s
     return metadata, mode, run_id
 
 
-def build_offline_evaluation(source: str | Path | Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+def build_offline_evaluation(
+    source: str | Path | Iterable[Mapping[str, Any]],
+    *,
+    cal_reference: str | Path | Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """Build the bounded SCAN-002 numerical contract from evidence.
 
     ``source`` may be an evidence JSONL path or a deterministic record
     iterable.  A path is preferred by the report because it permits two
-    bounded passes without retaining physical BOOK rows.
+    bounded passes without retaining physical BOOK rows.  ``cal_reference``
+    is used only by the fixed HOLDOUT-001 contract and is read offline.
     """
 
     factory, is_path = _build_source(source)
@@ -1234,7 +1666,34 @@ def build_offline_evaluation(source: str | Path | Iterable[Mapping[str, Any]]) -
         source_factory = lambda: iter(compact)
     else:
         source_factory = factory
-    stage = _stage_contract(metadata, mode, run_id)
+    control_source = compact if not is_path else _stream(
+        source_factory,
+        False,
+        integrity,
+        validate_terminal=False,
+    )
+    terminal_records: list[Mapping[str, Any]] = []
+    sample_stop_records: list[Mapping[str, Any]] = []
+    run_start_records: list[Mapping[str, Any]] = []
+    for record in control_source:
+        kind = record.get("kind")
+        if kind in {"RUN_STOP", "RUN_FAILED"}:
+            terminal_records.append(record)
+        elif kind == "SAMPLE_STOP":
+            sample_stop_records.append(record)
+        elif kind == "RUN_START":
+            run_start_records.append(record)
+    fixed_contract = isinstance(metadata.get("scan_003"), Mapping)
+    stage = (
+        _fixed_stage_contract(
+            metadata,
+            mode,
+            run_id,
+            terminal_records=terminal_records,
+        )
+        if fixed_contract
+        else _stage_contract(metadata, mode, run_id)
+    )
 
     # Only the latest active version per policy is retained.  A fill stores a
     # snapshot of that quote, so later nominal replacements cannot rewrite its
@@ -1244,6 +1703,7 @@ def build_offline_evaluation(source: str | Path | Iterable[Mapping[str, Any]]) -
     trades: dict[str, _Trade] = {}
     trade_conflicts: set[str] = set()
     eligible_keys: list[str] = []
+    eligible_trade_record_receipts: list[int | None] = []
     fills: dict[tuple[str, str], _Fill] = {}
     duplicate_fills = 0
     fill_conflicts: set[tuple[str, str]] = set()
@@ -1251,6 +1711,8 @@ def build_offline_evaluation(source: str | Path | Iterable[Mapping[str, Any]]) -
     duplicate_horizons = 0
     horizon_conflicts: set[tuple[str, str, int]] = set()
     gaps: list[Mapping[str, Any]] = []
+    inactive_quote_count = 0
+    fixed_profile_quote_issues: set[str] = set()
     reference_quantities: dict[tuple[Any, ...], Decimal | None] = {}
     horizon_requests: dict[tuple[str, str, int], tuple[str, int, str | int | None, int | None, Decimal | None]] = {}
     record_counts: defaultdict[str, int] = defaultdict(int)
@@ -1265,11 +1727,21 @@ def build_offline_evaluation(source: str | Path | Iterable[Mapping[str, Any]]) -
         if kind == "QUOTE":
             quote = _quote_from_record(record)
             if quote is None:
+                if fixed_contract and _legitimate_inactive_quote(record):
+                    policy_id = _text(record.get("policy_id"))
+                    previous = active_by_policy.pop(policy_id, None)
+                    if previous is not None:
+                        active_by_version.pop(previous.version_id, None)
+                    inactive_quote_count += 1
+                    continue
                 integrity.append("QUOTE_IDENTITY_MISSING")
                 continue
             previous = active_by_policy.pop(quote.policy_id, None)
             if previous is not None:
                 active_by_version.pop(previous.version_id, None)
+            if fixed_contract and _text(record.get("outcome")) == "QUOTE_ACTIVE" and not _fixed_quote_scope_matches(record):
+                fixed_profile_quote_issues.add("FIXED_QUOTE_PROFILE_MISMATCH")
+                integrity.append("FIXED_QUOTE_PROFILE_MISMATCH")
             if (
                 _text(record.get("outcome")) == "QUOTE_ACTIVE"
                 and quote.market == "BTC"
@@ -1287,6 +1759,13 @@ def build_offline_evaluation(source: str | Path | Iterable[Mapping[str, Any]]) -
         elif kind == "RISEX_TRADE":
             if record.get("eligible_trade") is not True:
                 continue
+            # The stop contract is about unique keys, but the public producer
+            # must not emit any eligible row at or after the fixed cutoff.
+            # Retain every row's receipt for that independent terminal check,
+            # including duplicates that the identity ledger collapses.
+            eligible_trade_record_receipts.append(
+                _integer(record.get("received_monotonic_ns", record.get("observed_monotonic_ns")))
+            )
             trade = _trade_from_record(record)
             if trade is None:
                 integrity.append("ELIGIBLE_TRADE_IDENTITY_MISSING")
@@ -1395,11 +1874,21 @@ def build_offline_evaluation(source: str | Path | Iterable[Mapping[str, Any]]) -
             else:
                 gaps.append(record)
 
-    interval = stage["required"].get("sample_interval")
+    interval = (
+        stage.get("terminal", {}).get("sample_interval")
+        if fixed_contract and isinstance(stage.get("terminal"), Mapping)
+        else stage["required"].get("sample_interval")
+    )
     if isinstance(interval, Mapping):
         interval_start = _integer(interval.get("start_monotonic_ns"))
         interval_end = _integer(interval.get("end_monotonic_ns"))
-        if interval_start is not None and interval_end is not None and interval_end - interval_start > 1_200 * 1_000_000_000:
+        allowed_duration = (
+            FIXED_SCANNER_WALL_CLOCK_SECONDS * 1_000_000_000
+            + FIXED_SCANNER_TERMINAL_DRAIN_ALLOWANCE_NS
+            if fixed_contract
+            else 1_200 * 1_000_000_000
+        )
+        if interval_start is not None and interval_end is not None and interval_end - interval_start > allowed_duration:
             integrity.append("STAGE_WALL_CLOCK_OVERRUN")
     record_total = sum(record_counts.values())
     if record_total > 1_000_000:
@@ -1674,7 +2163,11 @@ def build_offline_evaluation(source: str | Path | Iterable[Mapping[str, Any]]) -
     status_counts = {status.lower(): sum(unit.status == status for unit in units_by_root.values()) for status in ("CLEAN", "CONTAMINATED", "INACTIVE", "UNRESOLVED")}
     common_units = clean_units
     arms: dict[str, dict[str, Any]] = {}
-    sample_interval = stage["required"].get("sample_interval")
+    sample_interval = (
+        stage.get("terminal", {}).get("sample_interval")
+        if fixed_contract and isinstance(stage.get("terminal"), Mapping)
+        else stage["required"].get("sample_interval")
+    )
     stage_start = _integer(sample_interval.get("start_monotonic_ns")) if isinstance(sample_interval, Mapping) else None
 
     def arm_rows(arm: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -1835,6 +2328,276 @@ def build_offline_evaluation(source: str | Path | Iterable[Mapping[str, Any]]) -
         gate("EVIDENCE_INTEGRITY", False, sorted(set(integrity)), "no integrity failures")
     else:
         gate("EVIDENCE_INTEGRITY", True, [], "no integrity failures")
+    fixed_admission_gates = {
+        "SCANNER_RUN_START_VALID",
+        "SCANNER_TERMINAL_VALID",
+        "SCANNER_FIRST_STOP_VALID",
+        "SCANNER_CAPS_VALID",
+        "SCANNER_INTERVAL_VALID",
+        "SCANNER_STAGE_FINGERPRINT_VALID",
+        "SCANNER_PERSISTED_RECORD_INDICES",
+        "SCANNER_PROFILE_VALID",
+        "SCANNER_HOLDOUT_REFERENCE_VALID",
+    }
+    fixed_admission_observed: dict[str, Any] = {}
+    if fixed_contract:
+        start_payloads = [
+            record.get("scan_003")
+            for record in run_start_records
+            if isinstance(record.get("scan_003"), Mapping)
+        ]
+        start_valid = (
+            len(run_start_records) == 1
+            and len(start_payloads) == 1
+            and start_payloads[0].get("stage_name") == stage.get("stage_name")
+            and start_payloads[0].get("run_id") == stage.get("run_id")
+            and start_payloads[0].get("accepted_release") == stage.get("accepted_release")
+            and start_payloads[0].get("sample_start") == stage.get("sample_start")
+        )
+        fixed_admission_observed["run_start_count"] = len(run_start_records)
+        gate(
+            "SCANNER_RUN_START_VALID",
+            start_valid,
+            fixed_admission_observed["run_start_count"],
+            "one RUN_START bound to metadata sample start",
+        )
+
+        terminal = stage.get("terminal")
+        terminal_stop = stage.get("terminal_stop")
+        terminal_timing_interval = (
+            terminal.get("sample_interval")
+            if isinstance(terminal, Mapping)
+            else None
+        )
+        terminal_timing_end_ns = (
+            _integer(terminal_timing_interval.get("end_monotonic_ns"))
+            if isinstance(terminal_timing_interval, Mapping)
+            else None
+        )
+        terminal_timing_stop_ns = (
+            _integer(terminal_stop.get("observed_monotonic_ns"))
+            if isinstance(terminal_stop, Mapping)
+            else None
+        )
+        terminal_timing_end_utc = (
+            _parse_utc(terminal_timing_interval.get("end_utc"))
+            if isinstance(terminal_timing_interval, Mapping)
+            else None
+        )
+        terminal_timing_valid = (
+            terminal_timing_end_ns is not None
+            and terminal_timing_stop_ns is not None
+            and terminal_timing_end_ns >= terminal_timing_stop_ns
+            and stage.get("terminal_observed_monotonic_ns") == terminal_timing_end_ns
+            and terminal_timing_end_utc is not None
+            and stage.get("terminal_utc") == terminal_timing_end_utc.isoformat()
+        )
+        terminal_valid = (
+            stage.get("terminal_kind") == "RUN_STOP"
+            and isinstance(terminal, Mapping)
+            and terminal.get("stage_name") == stage.get("stage_name")
+            and terminal.get("run_id") == stage.get("run_id")
+            and terminal.get("accepted_release") == stage.get("accepted_release")
+            and terminal.get("policy_fingerprint") == stage.get("policy_fingerprint")
+            and terminal_timing_valid
+            and not integrity
+        )
+        fixed_admission_observed["terminal_kind"] = stage.get("terminal_kind")
+        gate(
+            "SCANNER_TERMINAL_VALID",
+            terminal_valid,
+            stage.get("terminal_kind"),
+            "one clean physically-last RUN_STOP",
+        )
+
+        stop = stage.get("terminal_stop")
+        stop_rows_valid = False
+        if isinstance(stop, Mapping) and len(sample_stop_records) == 1:
+            sample_stop = sample_stop_records[0]
+            stop_rows_valid = all(
+                sample_stop.get(name) == stop.get(name)
+                for name in (
+                    "reason",
+                    "strict_episode_count",
+                    "eligible_trade_count",
+                    "optimistic_episode_count",
+                    "observed_monotonic_ns",
+                )
+            )
+        actual_stop_reason = None if not isinstance(stop, Mapping) else _text(stop.get("reason"))
+        stop_count_valid = (
+            isinstance(stop, Mapping)
+            and _integer(stop.get("eligible_trade_count")) == len(eligible_keys)
+            and _integer(stop.get("strict_episode_count")) == sum(
+                key[0] == STRICT_MODEL for key in fills
+            )
+            and _integer(stop.get("optimistic_episode_count")) == sum(
+                key[0] == OPTIMISTIC_MODEL for key in fills
+            )
+        )
+        stop_reason_valid = actual_stop_reason in {
+            "ELIGIBLE_TRADE_LIMIT",
+            "WALL_CLOCK_LIMIT",
+        }
+        sample_start_value = _integer(
+            (stage.get("sample_start") or {}).get("monotonic_ns")
+            if isinstance(stage.get("sample_start"), Mapping)
+            else None
+        )
+        stop_observed = (
+            _integer(stop.get("observed_monotonic_ns"))
+            if isinstance(stop, Mapping)
+            else None
+        )
+        eligible_receipts = [
+            trade.received
+            for trade in trades.values()
+            if trade.received is not None
+        ]
+        sample_deadline = (
+            None
+            if sample_start_value is None
+            else sample_start_value + FIXED_SCANNER_WALL_CLOCK_SECONDS * 1_000_000_000
+        )
+        if actual_stop_reason == "ELIGIBLE_TRADE_LIMIT":
+            stop_reason_valid = (
+                stop_reason_valid
+                and len(eligible_keys) == FIXED_SCANNER_ELIGIBLE_TRADE_LIMIT
+                and sample_deadline is not None
+                and stop_observed is not None
+                and stop_observed < sample_deadline
+                and bool(eligible_receipts)
+                and len(eligible_receipts) == len(eligible_keys)
+                and all(received < sample_deadline for received in eligible_receipts)
+                and all(
+                    received is not None and received < sample_deadline
+                    for received in eligible_trade_record_receipts
+                )
+                and max(eligible_receipts) == stop_observed
+            )
+        elif actual_stop_reason == "WALL_CLOCK_LIMIT":
+            stop_reason_valid = (
+                stop_reason_valid
+                and stop_observed is not None
+                and sample_start_value is not None
+                and stop_observed - sample_start_value >= FIXED_SCANNER_WALL_CLOCK_SECONDS * 1_000_000_000
+                and len(eligible_keys) < FIXED_SCANNER_ELIGIBLE_TRADE_LIMIT
+                and sample_deadline is not None
+                and len(eligible_receipts) == len(eligible_keys)
+                and all(received < sample_deadline for received in eligible_receipts)
+                and all(
+                    received is not None and received < sample_deadline
+                    for received in eligible_trade_record_receipts
+                )
+            )
+        first_stop_valid = stop_rows_valid and stop_count_valid and stop_reason_valid
+        fixed_admission_observed["stop_reason"] = actual_stop_reason
+        fixed_admission_observed["sample_stop_count"] = len(sample_stop_records)
+        gate(
+            "SCANNER_FIRST_STOP_VALID",
+            first_stop_valid,
+            fixed_admission_observed,
+            "one SAMPLE_STOP matching actual first-stop counts and reason",
+        )
+
+        index_issues = {
+            "INVALID_RECORD_INDEX",
+            "NON_CONTIGUOUS_RECORD_INDEX",
+            "MISSING_RECORD_INDEX",
+        }
+        physical_record_indices = stage["synthetic"] or (
+            is_path and not any(issue in index_issues for issue in integrity)
+        )
+        gate(
+            "SCANNER_PERSISTED_RECORD_INDICES",
+            physical_record_indices,
+            {
+                "is_path": is_path,
+                "index_issues": sorted(index_issues & set(integrity)),
+            },
+            "persisted public evidence with contiguous record indices",
+        )
+        path_bytes = (
+            Path(source).stat().st_size
+            if is_path and Path(source).exists()
+            else None
+        )
+        terminal_stop_reason = (
+            _text(terminal.get("stop", {}).get("reason"))
+            if isinstance(terminal, Mapping) and isinstance(terminal.get("stop"), Mapping)
+            else ""
+        )
+        caps_valid = (
+            record_total <= FIXED_SCANNER_RECORD_CAP
+            and (path_bytes is None or path_bytes <= FIXED_SCANNER_BYTE_CAP)
+            and not any(
+                issue in {"RECORD_CAP_EXCEEDED", "BYTE_CAP_EXCEEDED"}
+                for issue in integrity
+            )
+            and terminal_stop_reason not in {"RECORD_CAP", "BYTE_CAP", "EVIDENCE_STORAGE_LIMIT"}
+        )
+        fixed_admission_observed["record_count"] = record_total
+        fixed_admission_observed["byte_count"] = path_bytes
+        gate(
+            "SCANNER_CAPS_VALID",
+            caps_valid,
+            {"record_count": record_total, "byte_count": path_bytes},
+            {"record_cap": FIXED_SCANNER_RECORD_CAP, "byte_cap": FIXED_SCANNER_BYTE_CAP},
+        )
+
+        requested = stage.get("requested_window_utc")
+        sample_start_payload = stage.get("sample_start")
+        terminal_interval = terminal.get("sample_interval") if isinstance(terminal, Mapping) else None
+        requested_start = _parse_utc(requested.get("start_utc")) if isinstance(requested, Mapping) else None
+        requested_end = _parse_utc(requested.get("end_utc")) if isinstance(requested, Mapping) else None
+        actual_start = _parse_utc(sample_start_payload.get("utc")) if isinstance(sample_start_payload, Mapping) else None
+        actual_end = _parse_utc(terminal_interval.get("end_utc")) if isinstance(terminal_interval, Mapping) else None
+        actual_start_ns = _integer(sample_start_payload.get("monotonic_ns")) if isinstance(sample_start_payload, Mapping) else None
+        actual_end_ns = _integer(terminal_interval.get("end_monotonic_ns")) if isinstance(terminal_interval, Mapping) else None
+        interval_valid = (
+            requested_start is not None
+            and requested_end is not None
+            and actual_start is not None
+            and actual_end is not None
+            and requested_start <= actual_start < requested_end
+            and actual_start <= actual_end
+            and actual_start_ns is not None
+            and actual_end_ns is not None
+            and actual_end_ns >= actual_start_ns
+        )
+        fixed_admission_observed["sample_interval"] = terminal_interval
+        gate(
+            "SCANNER_INTERVAL_VALID",
+            interval_valid,
+            terminal_interval,
+            "actual interval inside the supplied UTC window and bounded stop/drain",
+        )
+        gate(
+            "SCANNER_STAGE_FINGERPRINT_VALID",
+            bool(stage.get("stage_fingerprint"))
+            and stage.get("stage_fingerprint") == stage.get("computed_stage_fingerprint"),
+            stage.get("stage_fingerprint"),
+            stage.get("computed_stage_fingerprint"),
+        )
+        gate(
+            "SCANNER_PROFILE_VALID",
+            bool(stage.get("valid")) and not stage["synthetic"],
+            stage.get("invalid_fields") or stage.get("missing_fields"),
+            "exact fixed profile, release, provenance, and terminal contract",
+        )
+    holdout_reference_pass = True
+    holdout_reference_observed: dict[str, Any] = {}
+    current_trade_identities = set(eligible_keys)
+    current_order_identities: set[str] = set()
+    for trade in trades.values():
+        for role, identity in (
+            ("maker", trade.maker_order_id),
+            ("taker", trade.taker_order_id),
+        ):
+            if identity is not None:
+                current_order_identities.add(
+                    f"{trade.market}|{role}|{identity[0]}:{identity[1]}"
+                )
     gate("COMMON_ELIGIBLE_UNIT_FLOOR", len(common_units) >= 50, len(common_units), ">=50")
     bad_population = status_counts["contaminated"] + status_counts["inactive"] + status_counts["unresolved"]
     gate("ALL_ELIGIBLE_UNITS_CLEAN", bad_population == 0, status_counts, "contaminated=inactive=unresolved=0")
@@ -1908,35 +2671,207 @@ def build_offline_evaluation(source: str | Path | Iterable[Mapping[str, Any]]) -
         for arm in ("1", "2")
     }
     selected_arm = _select_arm(arm_passes, selector_scores)
-    mathematical_shared_failed = {
-        name
-        for name in failed_gates
-        if not name.startswith("ARM_")
-        and name not in {"STAGE_METADATA_VALID", "FIXTURE_MODE_NOT_PUBLIC_STAGE"}
-    }
-    selection_pass = (
+    if fixed_contract and stage.get("stage_name") == "HOLDOUT-001":
+        prior, reference_issues = _load_stage_reference(cal_reference)
+        holdout_reference_observed["issues"] = sorted(reference_issues)
+        binding = stage.get("cal_reference")
+        if not isinstance(binding, Mapping):
+            reference_issues.add("HOLDOUT_REFERENCE_BINDING_MISSING")
+            binding = {}
+        else:
+            actual_reference_sha256 = _reference_sha256(cal_reference)
+            if actual_reference_sha256 is None:
+                reference_issues.add("HOLDOUT_REFERENCE_HASH_UNAVAILABLE")
+            elif binding.get("reference_sha256") != actual_reference_sha256:
+                reference_issues.add("HOLDOUT_REFERENCE_HASH_MISMATCH")
+            if binding.get("accepted_release") != stage.get("accepted_release"):
+                reference_issues.add("HOLDOUT_BINDING_RELEASE_MISMATCH")
+            if binding.get("policy_fingerprint") != stage.get("policy_fingerprint"):
+                reference_issues.add("HOLDOUT_BINDING_POLICY_MISMATCH")
+        if prior is None:
+            holdout_reference_pass = False
+        else:
+            prior_provenance = prior.get("provenance")
+            if not isinstance(prior_provenance, Mapping):
+                reference_issues.add("HOLDOUT_REFERENCE_PROVENANCE_MISSING")
+                prior_provenance = {}
+            if prior_provenance.get("stage_name") != "CAL-001":
+                reference_issues.add("HOLDOUT_REFERENCE_NOT_CAL_001")
+            if prior.get("stage_verdict") != "CAL_PASS_PROVISIONAL" or not prior.get("stage_qualified"):
+                reference_issues.add("HOLDOUT_REFERENCE_CAL_NOT_ACCEPTED")
+            if prior_provenance.get("policy_fingerprint") != stage.get("policy_fingerprint"):
+                reference_issues.add("HOLDOUT_POLICY_FINGERPRINT_MISMATCH")
+            if prior_provenance.get("accepted_release") != stage.get("accepted_release"):
+                reference_issues.add("HOLDOUT_ACCEPTED_RELEASE_MISMATCH")
+            if binding.get("run_id") != prior_provenance.get("run_id"):
+                reference_issues.add("HOLDOUT_BINDING_RUN_ID_MISMATCH")
+            if binding.get("stage_fingerprint") != prior_provenance.get("stage_fingerprint"):
+                reference_issues.add("HOLDOUT_BINDING_STAGE_FINGERPRINT_MISMATCH")
+            prior_interval = (
+                prior_provenance.get("terminal", {}).get("sample_interval")
+                if isinstance(prior_provenance.get("terminal"), Mapping)
+                else None
+            )
+            current_interval = (
+                stage.get("terminal", {}).get("sample_interval")
+                if isinstance(stage.get("terminal"), Mapping)
+                else None
+            )
+            prior_start = _parse_utc(prior_interval.get("start_utc")) if isinstance(prior_interval, Mapping) else None
+            prior_end = _parse_utc(prior_interval.get("end_utc")) if isinstance(prior_interval, Mapping) else None
+            current_start = _parse_utc(current_interval.get("start_utc")) if isinstance(current_interval, Mapping) else None
+            current_end = _parse_utc(current_interval.get("end_utc")) if isinstance(current_interval, Mapping) else None
+            if prior_start is None or prior_end is None or current_start is None or current_end is None:
+                reference_issues.add("HOLDOUT_INTERVAL_MISSING")
+            elif prior_end > current_start:
+                reference_issues.add("HOLDOUT_INTERVAL_OVERLAP_OR_REVERSED")
+            requested_window = stage.get("requested_window_utc")
+            requested_start = (
+                _parse_utc(requested_window.get("start_utc"))
+                if isinstance(requested_window, Mapping)
+                else None
+            )
+            if prior_end is not None and (requested_start is None or requested_start < prior_end):
+                reference_issues.add("HOLDOUT_WINDOW_PRECEDES_CAL_COMPLETION")
+            binding_end = _parse_utc(binding.get("terminal_end_utc"))
+            if prior_end is None or binding_end is None or binding_end != prior_end:
+                reference_issues.add("HOLDOUT_BINDING_CAL_COMPLETION_MISMATCH")
+            prior_identities = prior.get("identities")
+            if not isinstance(prior_identities, Mapping):
+                reference_issues.add("HOLDOUT_REFERENCE_IDENTITIES_MISSING")
+                prior_identities = {}
+            raw_prior_trades = prior_identities.get("eligible_trade_keys")
+            raw_prior_orders = prior_identities.get("order_identities")
+            if not isinstance(raw_prior_trades, (list, tuple)):
+                reference_issues.add("HOLDOUT_REFERENCE_TRADE_IDENTITIES_MISSING")
+                raw_prior_trades = ()
+            if not isinstance(raw_prior_orders, (list, tuple)):
+                reference_issues.add("HOLDOUT_REFERENCE_ORDER_IDENTITIES_MISSING")
+                raw_prior_orders = ()
+            prior_trades = {_text(value) for value in raw_prior_trades if _text(value)}
+            prior_orders = {_text(value) for value in raw_prior_orders if _text(value)}
+            if current_trade_identities & prior_trades:
+                reference_issues.add("HOLDOUT_SHARED_TRADE_IDENTITY")
+            if current_order_identities & prior_orders:
+                reference_issues.add("HOLDOUT_SHARED_ORDER_IDENTITY")
+            prior_selected = (
+                prior.get("selector", {}).get("selected_margin_bps")
+                if isinstance(prior.get("selector"), Mapping)
+                else None
+            )
+            if not prior_selected or selected_arm != prior_selected:
+                reference_issues.add("HOLDOUT_SELECTOR_DISAGREEMENT")
+            if binding.get("selected_margin_bps") != prior_selected:
+                reference_issues.add("HOLDOUT_BINDING_SELECTOR_MISMATCH")
+        holdout_reference_pass = not reference_issues
+        holdout_reference_observed["issues"] = sorted(reference_issues)
+        gate(
+            "SCANNER_HOLDOUT_REFERENCE_VALID",
+            holdout_reference_pass,
+            holdout_reference_observed,
+            "accepted CAL report, same policy/release, separated interval and identities",
+        )
+    if fixed_contract:
+        mathematical_shared_failed = {
+            name
+            for name in failed_gates
+            if not name.startswith("ARM_")
+            and name
+            not in (
+                fixed_admission_gates
+                | {
+                    "STAGE_METADATA_VALID",
+                    "FIXTURE_MODE_NOT_PUBLIC_STAGE",
+                    "EVIDENCE_INTEGRITY",
+                }
+            )
+        }
+    else:
+        mathematical_shared_failed = {
+            name
+            for name in failed_gates
+            if not name.startswith("ARM_")
+            and name not in {"STAGE_METADATA_VALID", "FIXTURE_MODE_NOT_PUBLIC_STAGE"}
+        }
+    mathematical_selection_pass = (
         selected_arm is not None
         and not mathematical_shared_failed
         and arm_passes[selected_arm]
     )
-    if not selection_pass:
+    if not mathematical_selection_pass:
         failed_gates.append("NO_ARM_QUALIFIES")
-    if stage["synthetic"]:
+    fixed_stage_admission_pass = (
+        fixed_contract
+        and not stage["synthetic"]
+        and bool(stage["valid"])
+        and not integrity
+        and not any(
+            not gate_results[name]["passed"]
+            for name in fixed_admission_gates
+            if name in gate_results
+        )
+    )
+    fixed_shared_data_failure = fixed_contract and any(
+        name in _FIXED_DATA_GATE_NAMES for name in failed_gates
+    )
+    fixed_arm_data_failures = {
+        arm: fixed_contract
+        and any(
+            name.startswith(f"ARM_{arm}_")
+            and any(name.endswith(suffix) for suffix in _FIXED_ARM_DATA_GATE_SUFFIXES)
+            for name in failed_gates
+        )
+        for arm in ("1", "2")
+    }
+    # A single arm may qualify under the frozen selector.  If selection
+    # succeeds, only shared gates and the selected arm's data are required;
+    # if no arm qualifies, both arms must be measured sufficiently before an
+    # economic negative/unconfirmed label is meaningful.
+    fixed_required_data_failure = fixed_contract and (
+        fixed_shared_data_failure
+        or (
+            fixed_arm_data_failures.get(selected_arm, False)
+            if mathematical_selection_pass and selected_arm is not None
+            else any(fixed_arm_data_failures.values())
+        )
+    )
+    if fixed_contract:
+        if stage["synthetic"]:
+            stage_verdict = "FIXTURE_ONLY"
+        elif not fixed_stage_admission_pass or fixed_required_data_failure:
+            stage_verdict = "DATA_INSUFFICIENT"
+        elif not mathematical_selection_pass:
+            stage_verdict = "CALIBRATION_FAILED"
+        elif stage.get("stage_name") == "CAL-001":
+            stage_verdict = "CAL_PASS_PROVISIONAL"
+        elif holdout_reference_pass:
+            stage_verdict = "PUBLIC_PAPER_PROFITABILITY_CANDIDATE"
+        else:
+            stage_verdict = "DATA_INSUFFICIENT"
+    elif stage["synthetic"]:
         stage_verdict = "FIXTURE_ONLY"
     elif not stage["valid"] or integrity:
         stage_verdict = "DATA_INSUFFICIENT"
-    elif not selection_pass:
+    elif not mathematical_selection_pass:
         stage_verdict = "CALIBRATION_FAILED"
     else:
         # Numerical qualification is intentionally not stage admission.  The
         # producer/first-stop/start-window/holdout gate is SCAN-003 scope.
         stage_verdict = "DATA_INSUFFICIENT"
-    if selection_pass:
+    if mathematical_selection_pass:
         mathematical_verdict = "NUMERICAL_QUALIFIED"
-    elif not stage["valid"] or integrity:
+    elif (
+        (
+            fixed_contract
+            and not stage["synthetic"]
+            and (integrity or fixed_required_data_failure)
+        )
+        or (not fixed_contract and (not stage["valid"] or integrity))
+    ):
         mathematical_verdict = "DATA_INSUFFICIENT"
     else:
         mathematical_verdict = "NUMERICAL_FAILED"
+    selection_pass = mathematical_selection_pass
 
     unit_payload = [
         {
@@ -1951,30 +2886,107 @@ def build_offline_evaluation(source: str | Path | Iterable[Mapping[str, Any]]) -
         }
         for unit in sorted(units_by_root.values(), key=lambda item: item.unit_id)
     ]
+    if fixed_contract:
+        stage_qualified = (
+            fixed_stage_admission_pass
+            and mathematical_selection_pass
+            and (
+                stage.get("stage_name") == "CAL-001"
+                or holdout_reference_pass
+            )
+        )
+        candidate_eligible = stage_verdict == "PUBLIC_PAPER_PROFITABILITY_CANDIDATE"
+        stage_admission = {
+            "status": (
+                "CAL_PASS_PROVISIONAL"
+                if stage_qualified and stage.get("stage_name") == "CAL-001"
+                else "PUBLIC_PAPER_PROFITABILITY_CANDIDATE"
+                if candidate_eligible
+                else "CLOSED"
+            ),
+            "open": stage_qualified,
+            "reason": (
+                "CAL is provisional; HOLDOUT requires the same policy,"
+                " separated interval, and unchanged selector"
+                if stage.get("stage_name") == "CAL-001"
+                else "both fixed stages must pass before the candidate label"
+            ),
+        }
+        if stage_qualified:
+            evidence_outcome = "POSITIVE"
+        elif not fixed_stage_admission_pass or fixed_required_data_failure:
+            # Provenance, producer validity, and completeness failures are
+            # not economic evidence, even when the visible subset scores
+            # happen to pass.
+            evidence_outcome = "INSUFFICIENT"
+        else:
+            primary_sums = [
+                _decimal(arms[arm]["horizon_scores"]["300"]["sum"])
+                for arm in ("1", "2")
+            ]
+            if all(value is not None and value < 0 for value in primary_sums):
+                # Call a configuration negative only when both nominal arms
+                # have sufficient valid primary-horizon measurements and
+                # their aggregate conditional entry edge is actually below
+                # zero.  A single weak or unmeasured arm is not enough.
+                evidence_outcome = "NEGATIVE"
+            else:
+                # A failed threshold, selector, or positive-sum requirement
+                # with otherwise sufficient data is an unconfirmed result,
+                # not proof of negative economics.
+                evidence_outcome = "NOT_CONFIRMED"
+        evaluation_section = FIXED_EVALUATION_SECTION
+    else:
+        stage_qualified = False
+        candidate_eligible = False
+        stage_admission = {
+            "status": "CLOSED_PENDING_SCAN_003",
+            "open": False,
+            "reason": "producer, first-stop, cap, start-window, and holdout admission are later scope",
+        }
+        evidence_outcome = None
+        evaluation_section = EVALUATION_SECTION
     return {
         "schema_version": 1,
-        "section": EVALUATION_SECTION,
+        "section": evaluation_section,
         "descriptive_only": True,
         "conditional_entry_edge_only": True,
         "no_executable_pnl": True,
         "no_confidence_estimate": True,
         "stage_verdict": stage_verdict,
-        "stage_qualified": False,
-        "stage_admission": {
-            "status": "CLOSED_PENDING_SCAN_003",
-            "open": False,
-            "reason": "producer, first-stop, cap, start-window, and holdout admission are later scope",
-        },
+        "stage_qualified": stage_qualified,
+        "stage_admission": stage_admission,
         "mathematical_verdict": mathematical_verdict,
-        "mathematical_stage_qualified": selection_pass,
-        "public_candidate_verdict": None,
-        "candidate_eligible": False,
+        "mathematical_stage_qualified": mathematical_selection_pass,
+        "public_candidate_verdict": (
+            "PUBLIC_PAPER_PROFITABILITY_CANDIDATE"
+            if candidate_eligible
+            else None
+        ),
+        "candidate_eligible": candidate_eligible,
+        "evidence_outcome": evidence_outcome,
         "provenance": stage,
         "record_counts": {key: record_counts[key] for key in sorted(record_counts)},
         "book_record_count": book_count,
         "integrity_issues": sorted(set(integrity)),
         "duplicate_fill_count": duplicate_fills,
         "duplicate_horizon_count": duplicate_horizons,
+        "inactive_quote_count": inactive_quote_count,
+        "fixed_profile_quote_issues": sorted(fixed_profile_quote_issues),
+        "coverage": {
+            "raw_eligible_trade_count": len(eligible_keys),
+            "raw_unit_count": len(units_by_root),
+            "clean_unit_count": status_counts["clean"],
+            "contaminated_unit_count": status_counts["contaminated"],
+            "inactive_unit_count": status_counts["inactive"],
+            "unresolved_unit_count": status_counts["unresolved"],
+            "common_eligible_unit_count": len(common_units),
+            "clean_subset_is_not_full_stage": len(common_units) != len(units_by_root),
+        },
+        "identities": {
+            "eligible_trade_keys": sorted(current_trade_identities),
+            "order_identities": sorted(current_order_identities),
+        },
         "population": {
             "raw_unit_count": len(units_by_root),
             "clean_unit_count": status_counts["clean"],
@@ -2009,8 +3021,23 @@ def build_offline_evaluation(source: str | Path | Iterable[Mapping[str, Any]]) -
     }
 
 
+def build_fixed_offline_evaluation(
+    source: str | Path | Iterable[Mapping[str, Any]],
+    *,
+    cal_reference: str | Path | Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Evaluate the fixed SCAN-003 producer path directly."""
+
+    result = build_offline_evaluation(source, cal_reference=cal_reference)
+    if result.get("section") != FIXED_EVALUATION_SECTION:
+        raise ValueError("evidence is not in the SCAN-003 fixed scanner shape")
+    return result
+
+
 __all__ = [
     "EVALUATION_SECTION",
+    "FIXED_EVALUATION_SECTION",
     "HORIZONS",
+    "build_fixed_offline_evaluation",
     "build_offline_evaluation",
 ]

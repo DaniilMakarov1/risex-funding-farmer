@@ -11,6 +11,13 @@ import subprocess
 from .config import MAX_PUBLIC_DURATION_SECONDS, ShadowConfig
 from .report import render_report
 from .runner import run_public_smoke
+from .scanner import (
+    ScannerPreconditionError,
+    render_fixed_evaluation,
+    render_fixed_report,
+    run_fixed_scanner,
+)
+from .store import ScannerStageClaimError
 
 
 def _source_commit() -> str:
@@ -39,6 +46,24 @@ def _parser() -> argparse.ArgumentParser:
     report = subparsers.add_parser("report", help="offline deterministic evidence report")
     report.add_argument("path")
     report.add_argument("--format", choices=("json", "table"), default="json")
+    scan = subparsers.add_parser(
+        "scan",
+        help="one fixed SCAN-003 public CAL/HOLDOUT measurement",
+    )
+    scan.add_argument("--store-root", default="./spread-shadow-runs")
+    scan.add_argument("--stage", choices=("CAL-001", "HOLDOUT-001"), required=True)
+    scan.add_argument("--accepted-release", required=True)
+    scan.add_argument("--window-start-utc", required=True)
+    scan.add_argument("--window-end-utc", required=True)
+    scan.add_argument("--cal-report")
+    scan.add_argument("--format", choices=("json", "table"), default="json")
+    scan_report = subparsers.add_parser(
+        "scan-report",
+        help="offline report for one fixed SCAN-003 evidence stream",
+    )
+    scan_report.add_argument("path")
+    scan_report.add_argument("--cal-report")
+    scan_report.add_argument("--format", choices=("json", "table"), default="json")
     return parser
 
 
@@ -46,6 +71,36 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "report":
         print(render_report(Path(args.path), format=args.format))
+        return 0
+    if args.command == "scan-report":
+        try:
+            print(
+                render_fixed_report(
+                    Path(args.path),
+                    format=args.format,
+                    cal_reference=args.cal_report,
+                )
+            )
+        except (ScannerPreconditionError, ScannerStageClaimError, ValueError) as exc:
+            raise SystemExit(str(exc)) from exc
+        return 0
+    if args.command == "scan":
+        if args.stage == "CAL-001" and args.cal_report is not None:
+            raise SystemExit("--cal-report is only valid for HOLDOUT-001")
+        try:
+            result = asyncio.run(
+                run_fixed_scanner(
+                    args.store_root,
+                    stage_name=args.stage,
+                    accepted_release=args.accepted_release,
+                    window_start_utc=args.window_start_utc,
+                    window_end_utc=args.window_end_utc,
+                    cal_report=args.cal_report,
+                )
+            )
+        except (ScannerPreconditionError, ScannerStageClaimError, ValueError) as exc:
+            raise SystemExit(str(exc)) from exc
+        print(render_fixed_evaluation(result, format=args.format))
         return 0
     if args.duration_seconds <= 0 or args.duration_seconds > MAX_PUBLIC_DURATION_SECONDS:
         raise SystemExit(

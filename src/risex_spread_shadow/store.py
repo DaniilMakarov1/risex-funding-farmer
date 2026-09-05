@@ -40,6 +40,10 @@ TERMINAL_FAILURE_RECORD_RESERVE = 1
 TERMINAL_FAILURE_BYTES_RESERVE = 16 * 1024
 
 
+class ScannerStageClaimError(RuntimeError):
+    """Raised when a fixed scanner stage has already been attempted."""
+
+
 class EvidenceStorageLimitExceeded(RuntimeError):
     """Raised before an append would cross a bounded evidence-store limit."""
 
@@ -52,6 +56,89 @@ def new_run_id() -> str:
     """Return an unpredictable, path-safe identity for one fresh run."""
 
     return secrets.token_urlsafe(18)
+
+
+def reserve_scanner_stage(
+    root: str | os.PathLike[str],
+    *,
+    stage_name: str,
+    run_id: str,
+    accepted_release: str,
+    window_start_utc: str,
+    window_end_utc: str,
+    claimed_utc: str,
+) -> Path:
+    """Durably claim one SCAN-003 stage before its first public request.
+
+    The marker is intentionally a single owner-only create-once file.  It is
+    never overwritten: a failed or missed attempt therefore cannot be
+    silently retried with the same stage name.
+    """
+
+    if not isinstance(stage_name, str) or not stage_name or "/" in stage_name or "\\" in stage_name:
+        raise ValueError("stage_name must be a non-empty path-safe string")
+    for value, name in (
+        (run_id, "run_id"),
+        (accepted_release, "accepted_release"),
+        (window_start_utc, "window_start_utc"),
+        (window_end_utc, "window_end_utc"),
+        (claimed_utc, "claimed_utc"),
+    ):
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{name} must be a non-empty string")
+    root_path = Path(root)
+    root_path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(root_path, stat.S_IRWXU)
+    claim_dir = root_path / ".scan-003"
+    claim_dir.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(claim_dir, stat.S_IRWXU)
+    claim_path = claim_dir / f"{stage_name}.claim"
+    payload = {
+        "schema_version": 1,
+        "stage_name": stage_name,
+        "run_id": run_id,
+        "accepted_release": accepted_release,
+        "window_start_utc": window_start_utc,
+        "window_end_utc": window_end_utc,
+        "claimed_utc": claimed_utc,
+    }
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+    try:
+        descriptor = os.open(
+            claim_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            stat.S_IRUSR | stat.S_IWUSR,
+        )
+    except FileExistsError as exc:
+        raise ScannerStageClaimError(
+            f"scanner stage already claimed: {stage_name}"
+        ) from exc
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(claim_path, stat.S_IRUSR | stat.S_IWUSR)
+        try:
+            directory_descriptor = os.open(claim_dir, os.O_RDONLY)
+        except OSError as exc:
+            raise ScannerStageClaimError(
+                "scanner stage claim directory cannot be durably synced"
+            ) from exc
+        try:
+            os.fsync(directory_descriptor)
+        except OSError as exc:
+            raise ScannerStageClaimError(
+                "scanner stage claim directory sync failed"
+            ) from exc
+        finally:
+            os.close(directory_descriptor)
+    except BaseException:
+        # The create-once marker is intentionally retained if writing it is
+        # ambiguous.  A caller must inspect the local attempt rather than
+        # risk a second stage run.
+        raise
+    return claim_path
 
 
 def _reject_secret_field(name: str) -> None:
@@ -89,24 +176,18 @@ def _json_value(value: Any) -> Any:
 
 
 def _record_order(record: Mapping[str, Any], ordinal: int) -> tuple[Any, ...]:
-    def text(name: str) -> str:
-        value = record.get(name)
-        return "" if value is None else str(value)
-
     raw_time = record.get("observed_monotonic_ns", record.get("received_monotonic_ns", 0))
     try:
         monotonic = int(raw_time)
     except (TypeError, ValueError):
         monotonic = 0
     return (
-        1 if text("kind") in {"RUN_STOP", "RUN_FAILED"} else 0,
+        # Records at one local receipt time are causally emitted in the same
+        # observer batch (for example trade -> would-fill -> horizon-0). Keep
+        # that producer order; lexical kind ordering can put horizon-0 before
+        # the source trade and make a physical run unreplayable.
+        1 if record.get("kind") in {"RUN_STOP", "RUN_FAILED"} else 0,
         monotonic,
-        text("kind"),
-        text("canonical_market"),
-        text("policy_id"),
-        text("quote_version_id"),
-        text("horizon_ms"),
-        text("record_id"),
         ordinal,
     )
 
@@ -114,9 +195,28 @@ def _record_order(record: Mapping[str, Any], ordinal: int) -> tuple[Any, ...]:
 class AppendOnlyEvidenceStore:
     """A fresh owner-only JSONL file with batched, single-sync appends."""
 
-    def __init__(self, path: Path, run_id: str, metadata: Mapping[str, Any]) -> None:
+    def __init__(
+        self,
+        path: Path,
+        run_id: str,
+        metadata: Mapping[str, Any],
+        *,
+        max_records: int | None = None,
+        max_bytes: int | None = None,
+    ) -> None:
+        for value, name in ((max_records, "max_records"), (max_bytes, "max_bytes")):
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            ):
+                raise ValueError(f"{name} must be a positive integer")
+        if max_records is not None and max_records <= TERMINAL_FAILURE_RECORD_RESERVE:
+            raise ValueError("max_records must leave a terminal-marker reserve")
+        if max_bytes is not None and max_bytes <= TERMINAL_FAILURE_BYTES_RESERVE:
+            raise ValueError("max_bytes must leave a terminal-marker reserve")
         self.path = Path(path)
         self.run_id = run_id
+        self.max_records = max_records
+        self.max_bytes = max_bytes
         self._closed = False
         self._record_index = 0
         self._bytes_written = 0
@@ -141,6 +241,8 @@ class AppendOnlyEvidenceStore:
         *,
         metadata: Mapping[str, Any],
         run_id: str | None = None,
+        max_records: int | None = None,
+        max_bytes: int | None = None,
     ) -> "AppendOnlyEvidenceStore":
         identity = run_id or new_run_id()
         if not identity or "/" in identity or "\\" in identity:
@@ -151,7 +253,13 @@ class AppendOnlyEvidenceStore:
         payload = dict(metadata)
         payload["run_id"] = identity
         payload["evidence_mode"] = payload.get("evidence_mode", "OBSERVATIONAL")
-        return cls(run_dir / "evidence.jsonl", identity, payload)
+        return cls(
+            run_dir / "evidence.jsonl",
+            identity,
+            payload,
+            max_records=max_records,
+            max_bytes=max_bytes,
+        )
 
     @property
     def is_closed(self) -> bool:
@@ -192,12 +300,16 @@ class AppendOnlyEvidenceStore:
         terminal_failure = (
             len(ordered) == 1 and ordered[0].get("kind") == "RUN_FAILED"
         )
-        if MAX_EVIDENCE_RECORDS <= TERMINAL_FAILURE_RECORD_RESERVE:
-            raise ValueError("MAX_EVIDENCE_RECORDS must leave a terminal-marker reserve")
+        configured_max_records = (
+            MAX_EVIDENCE_RECORDS if self.max_records is None else self.max_records
+        )
+        configured_max_bytes = (
+            MAX_EVIDENCE_FILE_BYTES if self.max_bytes is None else self.max_bytes
+        )
         record_limit = (
-            MAX_EVIDENCE_RECORDS
+            configured_max_records
             if terminal_failure
-            else MAX_EVIDENCE_RECORDS - TERMINAL_FAILURE_RECORD_RESERVE
+            else configured_max_records - TERMINAL_FAILURE_RECORD_RESERVE
         )
         serialized: list[str] = []
         assigned: list[int] = []
@@ -213,9 +325,9 @@ class AppendOnlyEvidenceStore:
             assigned.append(index)
         batch_bytes = sum(len(line.encode("utf-8")) for line in serialized)
         byte_limit = (
-            MAX_EVIDENCE_FILE_BYTES
+            configured_max_bytes
             if terminal_failure
-            else MAX_EVIDENCE_FILE_BYTES - TERMINAL_FAILURE_BYTES_RESERVE
+            else configured_max_bytes - TERMINAL_FAILURE_BYTES_RESERVE
         )
         if self._record_index + len(ordered) > record_limit:
             raise EvidenceStorageLimitExceeded("RECORD_COUNT")
@@ -266,11 +378,13 @@ def store_permissions(path: str | os.PathLike[str]) -> int:
 __all__ = [
     "AppendOnlyEvidenceStore",
     "EvidenceStorageLimitExceeded",
+    "ScannerStageClaimError",
     "MAX_EVIDENCE_FILE_BYTES",
     "MAX_EVIDENCE_RECORDS",
     "TERMINAL_FAILURE_BYTES_RESERVE",
     "TERMINAL_FAILURE_RECORD_RESERVE",
     "iter_records",
     "new_run_id",
+    "reserve_scanner_stage",
     "store_permissions",
 ]

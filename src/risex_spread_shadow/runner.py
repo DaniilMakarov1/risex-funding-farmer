@@ -717,10 +717,33 @@ class SpreadObserver:
         now_utc: Callable[[], datetime] | None = None,
         monotonic_ns: Callable[[], int] | None = None,
         sample_started_monotonic_ns: int | None = None,
+        directions: Sequence[SpreadDirection] | None = None,
+        material_stop_enabled: bool = True,
+        enforce_sample_deadline: bool = False,
     ) -> None:
         self.config = config
         self.market_pairs = tuple(market_pairs)
         self.store = store
+        self.directions = tuple(
+            directions
+            if directions is not None
+            else (
+                SpreadDirection.RISEX_BUY_LIGHTER_SELL,
+                SpreadDirection.RISEX_SELL_LIGHTER_BUY,
+            )
+        )
+        if not self.directions:
+            raise ValueError("observer directions must not be empty")
+        if any(not isinstance(direction, SpreadDirection) for direction in self.directions):
+            raise TypeError("observer directions must be SpreadDirection values")
+        if len(set(self.directions)) != len(self.directions):
+            raise ValueError("observer directions must not repeat")
+        if not isinstance(material_stop_enabled, bool):
+            raise TypeError("material_stop_enabled must be bool")
+        self.material_stop_enabled = material_stop_enabled
+        if not isinstance(enforce_sample_deadline, bool):
+            raise TypeError("enforce_sample_deadline must be bool")
+        self.enforce_sample_deadline = enforce_sample_deadline
         self.ingress = IngressQueue(config.ingress_queue_capacity)
         self._now_utc = now_utc or (lambda: datetime.now(UTC))
         self._monotonic_ns = monotonic_ns or time.monotonic_ns
@@ -1599,6 +1622,8 @@ class SpreadObserver:
         policy_id: str,
         pending: _PendingEpisode,
     ) -> None:
+        if not self.material_stop_enabled:
+            return
         if pending.version.direction not in (
             SpreadDirection.RISEX_BUY_LIGHTER_SELL,
             SpreadDirection.RISEX_SELL_LIGHTER_BUY,
@@ -1712,10 +1737,7 @@ class SpreadObserver:
         versions: dict[str, QuoteVersion] = {}
         risex_state_sha256 = self._book_encoder.state_sha256_for(risex)
         lighter_state_sha256 = self._book_encoder.state_sha256_for(lighter)
-        for direction in (
-            SpreadDirection.RISEX_BUY_LIGHTER_SELL,
-            SpreadDirection.RISEX_SELL_LIGHTER_BUY,
-        ):
+        for direction in self.directions:
             for notional in self.config.target_notionals_usd:
                 for margin in self.config.target_margins_bps:
                     policy = self._policy(
@@ -2099,6 +2121,36 @@ class SpreadObserver:
     async def handle_trade(self, event: FeedTradeEvent) -> None:
         trade = event.trade
         if self._sample_frozen:
+            if (
+                self.enforce_sample_deadline
+                and self.sample_stop_signal is not None
+                and self.sample_stop_signal.reason is SampleStopReason.WALL_CLOCK_LIMIT
+                and trade.received_monotonic_ns
+                < self.sample_started_monotonic_ns + self.config.sample_wall_clock_limit_ns
+            ):
+                self.fatal_reason = self.fatal_reason or "PRE_CUTOFF_INGRESS_AFTER_STOP"
+                await self._append(
+                    (
+                        {
+                            "kind": "SCANNER_CUTOFF_VIOLATION",
+                            "canonical_market": trade.canonical_market,
+                            "trade_event_key": trade.trade_event_key,
+                            "reason": "PRE_CUTOFF_INGRESS_AFTER_STOP",
+                            "observed_monotonic_ns": trade.received_monotonic_ns,
+                        },
+                    )
+                )
+            return
+        if (
+            self.enforce_sample_deadline
+            and trade.received_monotonic_ns
+            >= self.sample_started_monotonic_ns + self.config.sample_wall_clock_limit_ns
+        ):
+            stop_record = self._observe_sample_stop(
+                observed_monotonic_ns=trade.received_monotonic_ns,
+            )
+            if stop_record is not None:
+                await self._append((stop_record,))
             return
         if not self._trade_admissible(event):
             return
