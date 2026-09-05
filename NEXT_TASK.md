@@ -3,7 +3,7 @@
 Status: AUTHORIZED after independent S2 acceptance; implementation/verification offline only. No market launch.
 Venue: central SPREAD, RISEx/Lighter public-only.
 Accepted implementation: `d9595420a24281fe9d0d2bc496d4b89c96ca8c80`. Start from exact published main containing this gate; Chief dispatch supplies full SHA.
-Verification: Level A. Owner's 2026-09-05 full-plan authorization and SYSTEM_SPEC 0.21 govern. One fresh visible GPT-5.6 Luna max implementation Builder, branch `codex/spread-s3-cycle-cli`, separate worktree; predecessor stopped. Chief alone accepts/integrates/pushes and later freezes prospective windows.
+Verification: Level A. Owner's 2026-09-05 full-plan authorization and SYSTEM_SPEC 0.21 govern. One fresh visible GPT-5.6 Luna max implementation Builder, branch `codex/spread-s3-public-driver`, separate worktree; predecessor stopped. Chief alone accepts/integrates/pushes and later freezes prospective windows.
 
 ## Objective and allowed scope
 
@@ -28,3 +28,13 @@ Make the accepted S1/S2 kernel usable through the smallest explicit CLI path for
 No market requests during implementation, private/credential/fee-reader/signing/order/dispatch/trading paths, other venues/repositories, legacy strategy imports, dashboards/services/frameworks, new dependencies, changes to policy or historical samples, governance/main edits, self-acceptance or delegation. No observation starts after a Builder report. After S3 acceptance Chief separately records exact future campaign windows and all immutable parameters before any public request, under existing owner authorization.
 
 Prefer a substantive clean intermediate checkpoint and fresh successor when this integration grows context-heavy. Preserve exact unaccepted tip, verified path and remaining evidence; do not keep extending one session with broad rewrites.
+
+## Current clean checkpoint and successor focus
+
+Predecessor stopped at immutable UNACCEPTED `e2de1809c2f661f1878a574505ad18e8c28ccfc1` from accepted base `62cee8d1185b09904ed747fa1e775392e46e9520`. A fresh Builder may cherry-pick it onto the exact published main supplied by Chief. It adds s3_cycle.py, two prefix fixtures and a small read-only CycleKernel.retained_results view. Chief passed both prefix fixtures. Reported full-suite evidence was run before checkpoint commit and is not final S3 acceptance evidence.
+
+The successor first completes the real public-adapter -> incremental decision/event/clock driver -> persisted replay path using offline fake producers. Wire actual callable public collection behind prospective manifest/release/claim gates; replace the current permanent raising stub without launching it. Keep the producer processing order, actual decision-ready and persistent dual-lane kernel. Do not wrap complete future CycleAttempt batches as the online entrypoint. CLI integration and final campaign/report acceptance requirements above remain to be finished; avoid a new parallel runner/engine.
+
+Concrete draft issues to resolve/verify in that remaining work: closing events/results must be able to consume reserved capacity (the current writer admits only terminal into reserve); caps must be aggregate across all four windows rather than reset per window; final reports must use refreshed retained audit verdicts; envelope proof must exercise actual cutoff/deadline/drain/load path, not merely sum constants. The existing conservative stress timeline is 131 seconds against the 135-second tail, but closing data is never guaranteed. Fixed policy and all UNKNOWN/insufficient outcomes remain unchanged. No further historical CAL replay is needed.
+
+Keep draft fixture/report scaffolding only where useful to the final minimal tool. Stop at a tested, clean producer/CLI checkpoint for another fresh session if full S3 completion becomes context-heavy. Neither this prefix nor any green fixture authorizes a live request.
