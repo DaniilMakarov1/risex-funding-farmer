@@ -434,6 +434,12 @@ def _quote_from_record(record: Mapping[str, Any]) -> _Quote | None:
     for name in ("maker_price", "risex_tick_size", "canonical_quantity", "target_notional_usd", "target_margin_bps"):
         if _decimal(record.get(name)) is None:
             issues.add(f"{name.upper()}_MISSING_OR_MALFORMED")
+    risex_fee_rate = _decimal(record.get("risex_maker_fee_rate"))
+    lighter_fee_rate = _decimal(record.get("lighter_taker_fee_rate"))
+    if risex_fee_rate != Decimal("0.0001"):
+        issues.add("FIXED_RISEX_FEE_RATE_MISMATCH")
+    if lighter_fee_rate != Decimal("0"):
+        issues.add("FIXED_LIGHTER_FEE_RATE_MISMATCH")
     try:
         risex_ref = _reference(record, "risex_book", Venue.RISEX)
         lighter_ref = _reference(record, "lighter_book", Venue.LIGHTER)
@@ -466,8 +472,8 @@ def _quote_from_record(record: Mapping[str, Any]) -> _Quote | None:
         tick=_decimal(record.get("risex_tick_size")),
         quantity=_decimal(record.get("canonical_quantity", record.get("quote_canonical_quantity"))),
         maker_order_id=_identity(record.get("maker_order_id")),
-        risex_fee_rate=_decimal(record.get("risex_maker_fee_rate")),
-        lighter_fee_rate=_decimal(record.get("lighter_taker_fee_rate")),
+        risex_fee_rate=risex_fee_rate,
+        lighter_fee_rate=lighter_fee_rate,
         risex_fee_source=_text(record.get("risex_fee_source")),
         lighter_fee_source=_text(record.get("lighter_fee_source")),
         risex_book_ref=risex_ref,
@@ -1633,6 +1639,8 @@ def build_offline_evaluation(source: str | Path | Iterable[Mapping[str, Any]]) -
             for trade_key in unit.trade_keys:
                 trade = trades[trade_key]
                 per_event[trade_key] = trade.arm_context(arm)
+                for quote in per_event[trade_key]:
+                    unit.identity_issues.update(quote.issues)
             unit.active_by_arm[arm] = per_event
         for trade_key in unit.trade_keys:
             trade = trades[trade_key]

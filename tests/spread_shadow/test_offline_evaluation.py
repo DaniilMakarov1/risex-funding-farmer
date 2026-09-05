@@ -598,12 +598,27 @@ def test_duplicate_partial_and_tampered_horizon_or_fee_evidence_fails_closed() -
     notional_result = build_offline_evaluation(notional)
     assert "HEDGE_NOTIONAL_MISMATCH" in notional_result["population"]["units"][0]["reasons"]
 
-    fee = _qualified_records()
-    next(row for row in fee if row.get("kind") == "QUOTE" and row.get("quote_version_id") == "vn-0")[
-        "risex_maker_fee_rate"
-    ] = "0.2"
-    fee_result = build_offline_evaluation(fee)
-    assert "ENTRY_EDGE_ARITHMETIC_MISMATCH" in fee_result["population"]["units"][0]["reasons"]
+    coherent_fee = _qualified_records()
+    next(
+        row
+        for row in coherent_fee
+        if row.get("kind") == "QUOTE" and row.get("quote_version_id") == "vn-0"
+    )["risex_maker_fee_rate"] = "0.00005"
+    for row in coherent_fee:
+        if row.get("kind") == "HEDGE_HORIZON" and row.get("quote_version_id") == "vn-0":
+            row["entry_edge_usd"] = "0.995"
+    coherent_fee_result = build_offline_evaluation(coherent_fee)
+    assert "FIXED_RISEX_FEE_RATE_MISMATCH" in coherent_fee_result["population"]["units"][0]["reasons"]
+    assert coherent_fee_result["mathematical_verdict"] != "NUMERICAL_QUALIFIED"
+
+    no_fill_fee = _qualified_records(wide_fill_indices=set(range(1, 20)) | set(range(20, 30)))
+    next(
+        row
+        for row in no_fill_fee
+        if row.get("kind") == "QUOTE" and row.get("quote_version_id") == "vw-0"
+    )["risex_maker_fee_rate"] = "0.00005"
+    no_fill_fee_result = build_offline_evaluation(no_fill_fee)
+    assert "FIXED_RISEX_FEE_RATE_MISMATCH" in no_fill_fee_result["population"]["units"][0]["reasons"]
 
 
 def test_stage_fingerprints_are_checked_but_admission_stays_closed() -> None:
