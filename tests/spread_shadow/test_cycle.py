@@ -1452,13 +1452,111 @@ def test_completion_requires_true_flatness_before_a_new_decision() -> None:
     assert not rejected_inside.accepted
     assert rejected_inside.reason == CycleReason.DECISION_WITHIN_PREVIOUS_CYCLE.value
 
-    reentry_decision = _version("s2-reentry-flat", decision_ready=3_100_000_300)[0]
-    accepted = kernel.admit(reentry_decision)
+    reentry_decision, reentry_books = _fresh_reentry_version("s2-reentry-flat", 3_100_000_300)
+    accepted = kernel.admit(reentry_decision, source_books=reentry_books)
     assert accepted.accepted
     assert kernel.state() is CycleKernelState.PENDING
     reentry_result = kernel.finish(end_monotonic_ns=9_100_000_300)
     assert reentry_result.status is CycleTerminalState.ABORTED
     assert reentry_result.is_flat
+
+
+def test_flat_reentry_without_exact_s1_witnesses_is_rejected_before_clock_advance() -> None:
+    first, first_books = _version("s2-strict-readmission-first")
+    kernel = CycleKernel()
+    first_result = kernel.run(
+        first,
+        _full_cycle_events(),
+        source_books=first_books,
+        end_monotonic_ns=2_100_000_300,
+    )
+    assert first_result.status is CycleTerminalState.NORMAL
+    assert first_result.is_flat
+
+    second, _ = _version("s2-strict-readmission-missing", decision_ready=3_100_000_300)
+    admission = kernel.admit(second)
+
+    assert not admission.accepted
+    assert admission.reason == CycleReason.ENTRY_INPUT_AMBIGUOUS.value
+    assert kernel.state() is CycleKernelState.UNRESOLVED_HALTED
+    retained = kernel.finish(end_monotonic_ns=9_100_000_300)
+    assert retained == first_result
+    assert retained.quote_version_id == first.version_id
+    assert not any(
+        item.accepted and item.quote_version_id == second.version_id
+        for item in kernel.admissions_for()
+    )
+
+
+def test_later_admission_rejects_missing_or_invalid_s1_witnesses() -> None:
+    decision = 3_100_000_300
+    _, witness_books = _fresh_reentry_version("s2-strict-negative-template", decision)
+    cases = (
+        ("missing", ()),
+        ("missing-risex", (witness_books[1],)),
+        ("missing-lighter", (witness_books[0],)),
+        (
+            "wrong-revision",
+            tuple(replace(book, book_revision=99) for book in witness_books),
+        ),
+        (
+            "future",
+            tuple(
+                replace(book, normalized_ready_monotonic_ns=decision + 1)
+                for book in witness_books
+            ),
+        ),
+        ("stale", tuple(replace(book, fresh=False) for book in witness_books)),
+    )
+
+    for label, invalid_books in cases:
+        first, first_books = _version(f"s2-strict-negative-retry-first-{label}")
+        kernel = CycleKernel()
+        first_result = kernel.run(
+            first,
+            _full_cycle_events(),
+            source_books=first_books,
+            end_monotonic_ns=2_100_000_300,
+        )
+        assert first_result.status is CycleTerminalState.NORMAL
+        second, _ = _fresh_reentry_version(f"s2-strict-negative-retry-{label}", decision)
+        admission = kernel.admit(second, source_books=invalid_books)
+        assert not admission.accepted, label
+        assert admission.reason in {
+            CycleReason.ENTRY_INPUT_AMBIGUOUS.value,
+            CycleReason.ENTRY_INPUT_STALE.value,
+        }, label
+        assert kernel.state() is CycleKernelState.UNRESOLVED_HALTED
+
+
+def test_valid_second_cycle_requires_fresh_s1_witnesses_and_completes_normally() -> None:
+    first, first_books = _version("s2-valid-second-first")
+    kernel = CycleKernel()
+    first_result = kernel.run(
+        first,
+        _full_cycle_events(),
+        source_books=first_books,
+        end_monotonic_ns=2_100_000_300,
+    )
+    assert first_result.status is CycleTerminalState.NORMAL
+    assert first_result.is_flat
+
+    decision = 3_100_000_300
+    second, second_books = _fresh_reentry_version("s2-valid-second", decision)
+    admission = kernel.admit(second, source_books=second_books)
+    assert admission.accepted
+
+    shift = decision - 100
+    for event in _shifted_full_cycle_events(shift, prefix="valid-second"):
+        kernel.advance(event)
+    result = kernel.finish(end_monotonic_ns=decision + 2_100_000_200)
+
+    assert result.quote_version_id == second.version_id
+    assert result.status is CycleTerminalState.NORMAL
+    assert result.is_flat
+    assert len(result.fills) == 4
+    assert result.entry_measurement is not None
+    assert result.entry_measurement.outcome is CausalOutcome.FULL_FILL
 
 
 def test_no_fill_aborts_without_claiming_terminal_execution_pnl() -> None:

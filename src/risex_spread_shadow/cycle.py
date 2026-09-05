@@ -851,7 +851,6 @@ class _MutableCycle:
     lighter_signed_quantity: Decimal = _ZERO
     forced_used: bool = False
     unresolved: bool = False
-    input_witness_deferred: bool = False
     terminal_ns: int | None = None
 
     def add_reason(self, reason: CycleReason | str) -> None:
@@ -1778,7 +1777,6 @@ class CycleKernel:
         decision = quote_version.decision_ready_monotonic_ns
         accepted = True
         reason = "ACCEPTED"
-        input_witness_deferred = False
         if lane.halted_unresolved:
             accepted = False
             reason = CycleReason.UNRESOLVED_HALTED.value
@@ -1806,24 +1804,13 @@ class CycleKernel:
         if accepted:
             input_reason, _ = _entry_input_failure(quote_version, self.policy, books)
             if input_reason is not None:
-                # Preserve the historical no-event re-entry probe: it may
-                # open a no-fill attempt for an already-flat lane, but any
-                # evidence presented to that attempt is halted rather than
-                # executed without its own S1 witnesses.
-                input_witness_deferred = (
-                    not books
-                    and lane.last_terminal_ns is not None
-                    and lane.last_result is not None
-                    and lane.last_result.is_flat
-                )
-                if not input_witness_deferred:
-                    accepted = False
-                    reason = input_reason.value
-                    # A rejected causal input is a terminal safety failure
-                    # for this lane.  Later books belong to the stream, not
-                    # to the invalidated decision, and must not rehabilitate
-                    # it.
-                    lane.halted_unresolved = True
+                accepted = False
+                reason = input_reason.value
+                # A rejected causal input is a terminal safety failure
+                # for this lane.  Later books belong to the stream, not
+                # to the invalidated decision, and must not rehabilitate
+                # it.
+                lane.halted_unresolved = True
         admission = CycleAdmission(
             accepted=accepted,
             scenario=scenario,
@@ -1870,7 +1857,6 @@ class CycleKernel:
                 entry_cancel_schedule_ns=activation + self.policy.entry_cancel_after_activation_ns,
                 entry_target_quantity=quote_version.quote.canonical_quantity,  # type: ignore[arg-type]
                 entry_remaining_quantity=quote_version.quote.canonical_quantity,  # type: ignore[arg-type]
-                input_witness_deferred=input_witness_deferred,
             )
             lane.active = cycle
             lane.last_decision_ns = decision
@@ -2001,35 +1987,6 @@ class CycleKernel:
                 )
             )
             lane.last_result = _result(cycle)
-            return CycleProgress(
-                scenario=cycle.scenario,
-                quote_version_id=cycle.quote_version.version_id,
-                event_index=event_index,
-                event_kind=causal_event.kind,
-                event_monotonic_ns=causal_event.causal_monotonic_ns,
-                kernel_state=self.state(scenario),
-            )
-        if cycle.input_witness_deferred:
-            cycle.event_count += 1
-            event_index = cycle.event_count - 1
-            identity_key = self._terminal_event_key(causal_event)
-            if identity_key is not None:
-                cycle.seen_events[identity_key] = _event_signature(causal_event)
-            cycle.add_reason(CycleReason.ENTRY_INPUT_AMBIGUOUS)
-            cycle.entry_uncertainty.append(CausalUncertainty.MISSING_SOURCE_IDENTITY.value)
-            cycle.entry_decisions.append(
-                CausalEventDecision(
-                    causal_event.kind,
-                    causal_event.event_id,
-                    causal_event.ingress_received_monotonic_ns,
-                    "UNCERTAIN",
-                    CycleReason.ENTRY_INPUT_AMBIGUOUS.value,
-                )
-            )
-            cycle.input_witness_deferred = False
-            self._halt(cycle, CycleReason.ENTRY_INPUT_AMBIGUOUS)
-            lane.last_result = _result(cycle, terminal=True)
-            self._latch_terminal(lane, cycle)
             return CycleProgress(
                 scenario=cycle.scenario,
                 quote_version_id=cycle.quote_version.version_id,
