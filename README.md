@@ -61,15 +61,18 @@ collection stops at the first fixed limit and then drains pending horizons.
 The loaded source checkout must be clean and exactly match the accepted release.
 Use the same release and absolute store root for both stages. The create-once
 `.scan-003/<stage>.claim` is retained on failed/missed attempts; never delete it
-or change roots to retry. CAL/HOLDOUT remain closed until the Chief publishes
-their prospective operational gates in NEXT_TASK.md.
+or change roots to retry. Every new public stage requires its prospective operational gate in
+NEXT_TASK.md. CAL-001 is now consumed and HOLDOUT is closed; the current
+configuration must not be rerun.
 
 The report distinguishes `POSITIVE`, `NEGATIVE`, `NOT_CONFIRMED` and
 `INSUFFICIENT`, while fixture evidence remains `FIXTURE_ONLY`. CAL passing is
 provisional; only two passing stages can yield the public candidate label.
 Sums, means and tails are conditional dependence-unit entry scores, not
-executable PnL, profit per hour or full-cycle profitability. At the implementation
-checkpoint no CAL/HOLDOUT market observation exists.
+executable PnL, profit per hour or full-cycle profitability. The first bounded public CAL-001 sample verified the source-to-report path
+and returned `INSUFFICIENT`: observed conditional entry scores were positive,
+but the frozen qualification thresholds failed. Exact results, evidence paths
+and the stopped configuration are recorded in `STATUS.md` and `NEXT_TASK.md`.
 
 ### Opt-in RISEx owner-fee read
 
