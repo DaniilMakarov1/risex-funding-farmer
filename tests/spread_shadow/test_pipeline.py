@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal as D
 import hashlib
@@ -2770,3 +2771,452 @@ def test_report_completeness_is_episode_scoped_and_zero_fill_is_clean(
     assert missing["data_completeness"] == "DEGRADED"
     assert partial["mean_entry_edge_usd"] is None
     assert partial["positive_edge_share"] is None
+
+
+async def _scan_001_pending_observer(tmp_path: Path):
+    store = AppendOnlyEvidenceStore.create(
+        tmp_path,
+        metadata={"source_commit": "fixture", "evidence_mode": "FIXTURE"},
+    )
+    observer = SpreadObserver(config(), (PAIR,), store, sample_started_monotonic_ns=0)
+    observer._sample_stop.wall_clock_limit_ns = 10**30
+    observer._replay_mode = True
+    await observer.handle_book(
+        FeedBookEvent(
+            evidence_book(Venue.RISEX, received=100, session="risex"),
+            PAIR,
+            "SNAPSHOT",
+            "fixture",
+        )
+    )
+    await observer.handle_book(
+        FeedBookEvent(
+            evidence_book(
+                Venue.LIGHTER,
+                received=100,
+                session="lighter",
+                bids=(("100", "1"),),
+                asks=(("102", "1"),),
+            ),
+            PAIR,
+            "SNAPSHOT",
+            "fixture",
+        )
+    )
+    await observer.handle_trade(FeedTradeEvent(trade(received=200), PAIR, "fixture"))
+    observer._replay_mode = False
+    return observer, store, next(iter(observer._pending))
+
+
+@pytest.mark.asyncio
+async def test_scan_001_capture_waits_for_received_predeadline_book_in_slow_store(
+    tmp_path: Path,
+) -> None:
+    observer, store, version_id = await _scan_001_pending_observer(tmp_path)
+    append_started = asyncio.Event()
+    release_append = asyncio.Event()
+    original_append = observer._append
+
+    async def slow_append(records):
+        if any(record.get("kind") == "BOOK" for record in records):
+            append_started.set()
+            await release_append.wait()
+        await original_append(records)
+
+    observer._append = slow_append
+    queued = FeedBookEvent(
+        evidence_book(
+            Venue.LIGHTER,
+            received=299_000_200,
+            session="lighter",
+            revision=2,
+            bids=(("95", "1"),),
+            asks=(("97", "1"),),
+        ),
+        PAIR,
+        "DELTA",
+        "fixture",
+    )
+    assert observer.ingress.offer(queued)
+    before_capture = observer.history.latest_books(
+        Venue.LIGHTER,
+        "BTC",
+        300_000_200,
+    )
+    assert before_capture and before_capture[-1].bids[0].canonical_price == D("100")
+    capture = asyncio.create_task(
+        observer._capture_one(version_id, 300, force=True)
+    )
+    await asyncio.sleep(0)
+    assert not capture.done()
+    consumer = asyncio.create_task(observer.consume())
+    await asyncio.wait_for(append_started.wait(), timeout=1)
+    assert not capture.done()
+    release_append.set()
+    await asyncio.wait_for(capture, timeout=1)
+
+    observer.ingress.close()
+    await asyncio.wait_for(consumer, timeout=1)
+    await observer.close()
+    store.close()
+
+    records = [json.loads(line) for line in store.path.read_text().splitlines()]
+    horizon = next(
+        record
+        for record in records
+        if record.get("kind") == "HEDGE_HORIZON"
+        and record.get("quote_version_id") == version_id
+        and record.get("horizon_ms") == 300
+        and record.get("fillability_model") == "STRICT_LOWER_BOUND"
+    )
+    assert horizon["horizon_deadline_monotonic_ns"] == 300_000_200
+    assert horizon["book_received_monotonic_ns"] == 299_000_200
+    assert D(horizon["notional_usd"]) == D("95")
+
+
+@pytest.mark.asyncio
+async def test_scan_001_capture_includes_exact_deadline_and_excludes_late_book(
+    tmp_path: Path,
+) -> None:
+    observer, store, version_id = await _scan_001_pending_observer(tmp_path)
+    await observer.handle_book(
+        FeedBookEvent(
+            evidence_book(
+                Venue.LIGHTER,
+                received=300_000_200,
+                session="lighter",
+                revision=2,
+                bids=(("95", "1"),),
+                asks=(("97", "1"),),
+            ),
+            PAIR,
+            "DELTA",
+            "fixture",
+        )
+    )
+    await observer.handle_book(
+        FeedBookEvent(
+            evidence_book(
+                Venue.LIGHTER,
+                received=300_000_201,
+                session="lighter",
+                revision=3,
+                bids=(("80", "1"),),
+                asks=(("82", "1"),),
+            ),
+            PAIR,
+            "DELTA",
+            "fixture",
+        )
+    )
+    await observer._capture_one(version_id, 300, force=True)
+    await observer.close()
+    store.close()
+
+    records = [json.loads(line) for line in store.path.read_text().splitlines()]
+    horizon = next(
+        record
+        for record in records
+        if record.get("kind") == "HEDGE_HORIZON"
+        and record.get("quote_version_id") == version_id
+        and record.get("horizon_ms") == 300
+        and record.get("fillability_model") == "STRICT_LOWER_BOUND"
+    )
+    assert horizon["book_received_monotonic_ns"] == 300_000_200
+    assert D(horizon["notional_usd"]) == D("95")
+
+
+@pytest.mark.asyncio
+async def test_scan_001_capture_waits_for_predeadline_gap_before_snapshotting_gaps(
+    tmp_path: Path,
+) -> None:
+    observer, store, version_id = await _scan_001_pending_observer(tmp_path)
+    gap_started = asyncio.Event()
+    release_gap = asyncio.Event()
+    original_gap = observer.handle_gap
+
+    async def slow_gap(event):
+        gap_started.set()
+        await release_gap.wait()
+        await original_gap(event)
+
+    observer.handle_gap = slow_gap
+    gap = FeedGapEvent(
+        DataGapEvidence(
+            source_venue=Venue.LIGHTER,
+            canonical_market="BTC",
+            stream_session_id="lighter",
+            recovery_generation=0,
+            gap_start_monotonic_ns=299_000_200,
+            reason="QUEUED_TEST_GAP",
+        )
+    )
+    assert observer.ingress.offer(gap)
+    consumer = asyncio.create_task(observer.consume())
+    await asyncio.wait_for(gap_started.wait(), timeout=1)
+    capture = asyncio.create_task(
+        observer._capture_one(version_id, 300, force=True)
+    )
+    await asyncio.sleep(0.01)
+    assert not capture.done()
+    release_gap.set()
+    await asyncio.wait_for(capture, timeout=1)
+
+    observer.ingress.close()
+    await asyncio.wait_for(consumer, timeout=1)
+    await observer.close()
+    store.close()
+    records = [json.loads(line) for line in store.path.read_text().splitlines()]
+    horizon = next(
+        record
+        for record in records
+        if record.get("kind") == "HEDGE_HORIZON"
+        and record.get("quote_version_id") == version_id
+        and record.get("horizon_ms") == 300
+        and record.get("fillability_model") == "STRICT_LOWER_BOUND"
+    )
+    assert horizon["outcome"] == "HEDGE_DATA_GAP"
+    assert horizon["gap_reason"] == "QUEUED_TEST_GAP"
+
+
+@pytest.mark.asyncio
+async def test_scan_001_capture_barrier_times_out_fail_closed_without_consumer_ack(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(runner_module, "_HORIZON_INGRESS_BARRIER_TIMEOUT_SECONDS", 0.01)
+    observer, store, version_id = await _scan_001_pending_observer(tmp_path)
+    assert observer.ingress.offer(
+        FeedBookEvent(
+            evidence_book(
+                Venue.LIGHTER,
+                received=299_000_200,
+                session="lighter",
+                revision=2,
+                bids=(("95", "1"),),
+                asks=(("97", "1"),),
+            ),
+            PAIR,
+            "DELTA",
+            "fixture",
+        )
+    )
+    await observer._capture_one(version_id, 300, force=True)
+    assert observer.fatal_reason == "HORIZON_INGRESS_BARRIER_TIMEOUT"
+    assert observer.sample_stop_signal is not None
+    assert observer.sample_stop_signal.reason.value == "INTEGRITY_FAILURE"
+    observer.ingress.close()
+    await observer.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_scan_001_capture_barrier_fails_closed_when_consumer_handler_dies(
+    tmp_path: Path,
+) -> None:
+    observer, store, version_id = await _scan_001_pending_observer(tmp_path)
+
+    async def broken_book_handler(_event):
+        raise RuntimeError("fixture consumer failure")
+
+    observer.handle_book = broken_book_handler
+    assert observer.ingress.offer(
+        FeedBookEvent(
+            evidence_book(
+                Venue.LIGHTER,
+                received=299_000_200,
+                session="lighter",
+                revision=2,
+                bids=(("95", "1"),),
+                asks=(("97", "1"),),
+            ),
+            PAIR,
+            "DELTA",
+            "fixture",
+        )
+    )
+    capture = asyncio.create_task(
+        observer._capture_one(version_id, 300, force=True)
+    )
+    consumer = asyncio.create_task(observer.consume())
+    with pytest.raises(RuntimeError, match="fixture consumer failure"):
+        await consumer
+    await capture
+    assert observer.fatal_reason == "HORIZON_INGRESS_CONSUMER_FAILED"
+    observer.ingress.close()
+    await observer.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_scan_001_concurrent_capture_and_drain_persist_one_horizon(
+    tmp_path: Path,
+) -> None:
+    observer, store, version_id = await _scan_001_pending_observer(tmp_path)
+    await asyncio.gather(
+        observer._capture_one(version_id, 300, force=True),
+        observer._capture_one(version_id, 300, force=True),
+    )
+    await observer.close()
+    store.close()
+    records = [json.loads(line) for line in store.path.read_text().splitlines()]
+    matches = [
+        record
+        for record in records
+        if record.get("kind") == "HEDGE_HORIZON"
+        and record.get("quote_version_id") == version_id
+        and record.get("horizon_ms") == 300
+        and record.get("fillability_model") == "STRICT_LOWER_BOUND"
+    ]
+    assert len(matches) == 1
+
+
+@pytest.mark.asyncio
+async def test_scan_001_trade_key_survives_pruning_replacement_and_reconnect(
+    tmp_path: Path,
+) -> None:
+    store = AppendOnlyEvidenceStore.create(
+        tmp_path,
+        metadata={"source_commit": "fixture", "evidence_mode": "FIXTURE"},
+    )
+    observer = SpreadObserver(config(), (PAIR,), store, sample_started_monotonic_ns=0)
+    observer._sample_stop.wall_clock_limit_ns = 10**30
+    observer._replay_mode = True
+    await observer.handle_book(
+        FeedBookEvent(evidence_book(Venue.RISEX, received=100, session="risex"), PAIR, "SNAPSHOT", "fixture")
+    )
+    await observer.handle_book(
+        FeedBookEvent(
+            evidence_book(
+                Venue.LIGHTER,
+                received=100,
+                session="lighter",
+                bids=(("100", "1"),),
+                asks=(("102", "1"),),
+            ),
+            PAIR,
+            "SNAPSHOT",
+            "fixture",
+        )
+    )
+    first = trade(received=101)
+    await observer.handle_trade(FeedTradeEvent(first, PAIR, "fixture"))
+    observer._replay_mode = False
+    await observer.flush_pending(force=True)
+
+    replacement_at = 40_000_000_000
+    await observer.handle_book(
+        FeedBookEvent(
+            evidence_book(Venue.RISEX, received=replacement_at, session="risex", revision=2),
+            PAIR,
+            "DELTA",
+            "fixture",
+        )
+    )
+    await observer.handle_book(
+        FeedBookEvent(
+            evidence_book(
+                Venue.LIGHTER,
+                received=replacement_at,
+                session="lighter",
+                revision=2,
+                bids=(("100", "1"),),
+                asks=(("102", "1"),),
+            ),
+            PAIR,
+            "DELTA",
+            "fixture",
+        )
+    )
+    observer._prune_state(100_000_000_000)
+    assert not observer._trades.get("BTC")
+    await observer.handle_trade(
+        FeedTradeEvent(
+            replace(first, received_monotonic_ns=replacement_at + 1),
+            PAIR,
+            "fixture-retransmission",
+        )
+    )
+    assert observer.eligible_trade_count == 1
+    assert observer.strict_episode_count == 1
+
+    await observer.handle_gap(
+        FeedGapEvent(
+            DataGapEvidence(
+                source_venue=Venue.RISEX,
+                canonical_market="BTC",
+                stream_session_id="risex",
+                recovery_generation=0,
+                gap_start_monotonic_ns=50_000_000_000,
+                reason="TEST_RECONNECT",
+            )
+        )
+    )
+    await observer.handle_book(
+        FeedBookEvent(
+            evidence_book(
+                Venue.RISEX,
+                received=50_000_000_000,
+                session="risex-new",
+                recovery=1,
+                revision=1,
+            ),
+            PAIR,
+            "SNAPSHOT",
+            "fixture",
+        )
+    )
+    await observer.handle_trade(
+        FeedTradeEvent(
+            replace(
+                first,
+                received_monotonic_ns=50_000_000_001,
+                stream_session_id="risex-new",
+                recovery_generation=1,
+            ),
+            PAIR,
+            "fixture-reconnect-retransmission",
+        )
+    )
+    assert observer.eligible_trade_count == 1
+    assert observer.strict_episode_count == 1
+    await observer.close()
+    store.close()
+    records = [json.loads(line) for line in store.path.read_text().splitlines()]
+    assert len([record for record in records if record.get("kind") == "RISEX_TRADE"]) == 1
+    assert len([record for record in records if record.get("kind") == "WOULD_FILL" and record.get("fillability_model") == "STRICT_LOWER_BOUND"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_scan_001_conflicting_trade_key_fails_closed(tmp_path: Path) -> None:
+    observer, store, _version_id = await _scan_001_pending_observer(tmp_path)
+    await observer.flush_pending(force=True)
+    conflicting = replace(trade(received=102), canonical_price=D("99"))
+    await observer.handle_trade(FeedTradeEvent(conflicting, PAIR, "conflict"))
+    assert observer.fatal_reason == "TRADE_DEDUP_CONFLICT"
+    await observer.close()
+    store.close()
+    records = [json.loads(line) for line in store.path.read_text().splitlines()]
+    assert [record["reason"] for record in records if record.get("kind") == "DATA_GAP"] == [
+        "TRADE_DEDUP_CONFLICT"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_scan_001_trade_identity_capacity_fails_closed(tmp_path: Path) -> None:
+    observer, store, _version_id = await _scan_001_pending_observer(tmp_path)
+    observer._trade_identity_capacity = 1
+    await observer.handle_trade(
+        FeedTradeEvent(
+            replace(trade(received=102), trade_event_key="trade-2"),
+            PAIR,
+            "capacity",
+        )
+    )
+    assert observer.fatal_reason == "TRADE_DEDUP_CAPACITY"
+    assert observer.eligible_trade_count == 1
+    await observer.close()
+    store.close()
+    records = [json.loads(line) for line in store.path.read_text().splitlines()]
+    assert [record["reason"] for record in records if record.get("kind") == "DATA_GAP"] == [
+        "TRADE_DEDUP_CAPACITY"
+    ]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -157,9 +158,16 @@ class IngressQueue:
     def __init__(self, capacity: int) -> None:
         if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity <= 0:
             raise ValueError("ingress queue capacity must be positive")
-        self._queue: asyncio.Queue[IngressItem] = asyncio.Queue(maxsize=capacity)
+        self._queue: asyncio.Queue[tuple[IngressItem, int]] = asyncio.Queue(
+            maxsize=capacity
+        )
+        self._queued_entries: deque[tuple[IngressItem, int]] = deque()
         self._wake = asyncio.Event()
         self._latched: dict[tuple[Venue, str, str | int, int], DataGapEvidence] = {}
+        self._latched_received: dict[tuple[Venue, str, str | int, int], int] = {}
+        self._in_flight: tuple[IngressItem, int] | None = None
+        self._consumer_failed = False
+        self._progress = asyncio.Event()
         self._closed = False
         self._offer_serial = 0
 
@@ -184,6 +192,73 @@ class IngressQueue:
         """Monotonic count used by the observer's idle-queue watermark."""
 
         return self._offer_serial
+
+    @staticmethod
+    def _item_received_monotonic_ns(item: IngressItem) -> int:
+        if isinstance(item, FeedBookEvent):
+            return item.book.received_monotonic_ns
+        if isinstance(item, FeedTradeEvent):
+            return item.trade.received_monotonic_ns
+        return item.gap.gap_start_monotonic_ns
+
+    @staticmethod
+    def _is_lighter_horizon_item(item: IngressItem) -> bool:
+        if isinstance(item, FeedBookEvent):
+            return item.book.venue is Venue.LIGHTER
+        if isinstance(item, FeedGapEvent):
+            return item.gap.source_venue is Venue.LIGHTER
+        return False
+
+    def _has_lighter_before(self, deadline_ns: int) -> bool:
+        if (
+            self._in_flight is not None
+            and self._in_flight[1] <= deadline_ns
+            and self._is_lighter_horizon_item(self._in_flight[0])
+        ):
+            return True
+        if any(
+            received <= deadline_ns and self._is_lighter_horizon_item(item)
+            for item, received in self._queued_entries
+        ):
+            return True
+        return any(
+            received <= deadline_ns
+            and self._is_lighter_horizon_item(
+                FeedGapEvent(self._latched[key])
+            )
+            for key, received in self._latched_received.items()
+        )
+
+    async def wait_for_lighter_before(self, deadline_ns: int) -> bool:
+        """Wait until received-at-deadline Lighter ingress has been handled.
+
+        A horizon task must wait for the observer's consumer acknowledgement,
+        not merely yield to the event loop.  The wait is limited to
+        Lighter books/gaps whose receipt timestamp is within the horizon;
+        later books remain in ingress and are still excluded by the pure
+        deadline selector.
+        """
+
+        if isinstance(deadline_ns, bool) or not isinstance(deadline_ns, int):
+            raise TypeError("deadline_ns must be int")
+        if deadline_ns < 0:
+            raise ValueError("deadline_ns must be non-negative")
+        while True:
+            if self._consumer_failed:
+                return False
+            if not self._has_lighter_before(deadline_ns):
+                watermark = self._offer_serial
+                self._progress.clear()
+                if (
+                    not self._has_lighter_before(deadline_ns)
+                    and self._offer_serial == watermark
+                ):
+                    return True
+                continue
+            self._progress.clear()
+            if not self._has_lighter_before(deadline_ns):
+                continue
+            await self._progress.wait()
 
     @staticmethod
     def _item_gap(item: IngressItem) -> DataGapEvidence:
@@ -219,6 +294,7 @@ class IngressQueue:
         previous = self._latched.get(identity)
         if previous is None:
             self._latched[identity] = gap
+            self._latched_received[identity] = gap.gap_start_monotonic_ns
             return
         end = gap.gap_end_monotonic_ns
         if previous.gap_end_monotonic_ns is None or end is None:
@@ -284,22 +360,31 @@ class IngressQueue:
                 else transport_gap.transport_exception_type
             ),
         )
+        self._latched_received[identity] = min(
+            self._latched_received[identity], gap.gap_start_monotonic_ns
+        )
 
     def offer(self, item: IngressItem) -> bool:
         """Enqueue without waiting; an overflow always latches explicit gap evidence."""
 
         self._offer_serial += 1
+        received = self._item_received_monotonic_ns(item)
         if self._closed:
             self._latch(self._item_gap(item))
             self._wake.set()
+            self._progress.set()
             return False
         try:
-            self._queue.put_nowait(item)
+            entry = (item, received)
+            self._queue.put_nowait(entry)
+            self._queued_entries.append(entry)
         except asyncio.QueueFull:
             self._latch(self._item_gap(item))
             self._wake.set()
+            self._progress.set()
             return False
         self._wake.set()
+        self._progress.set()
         return True
 
     async def next_item(self) -> IngressItem | None:
@@ -314,9 +399,18 @@ class IngressQueue:
                         value[3],
                     ),
                 )[0]
-                return FeedGapEvent(self._latched.pop(key))
+                gap = self._latched.pop(key)
+                received = self._latched_received.pop(key)
+                item = FeedGapEvent(gap)
+                self._in_flight = (item, received)
+                return item
             try:
-                return self._queue.get_nowait()
+                entry = self._queue.get_nowait()
+                queued = self._queued_entries.popleft()
+                if queued != entry:
+                    raise RuntimeError("ingress queue coordination lost item order")
+                self._in_flight = entry
+                return entry[0]
             except asyncio.QueueEmpty:
                 pass
             if self._closed:
@@ -333,6 +427,15 @@ class IngressQueue:
     def close(self) -> None:
         self._closed = True
         self._wake.set()
+        self._progress.set()
+
+    def complete_item(self, *, success: bool = True) -> None:
+        """Acknowledge the item currently being handled by the observer."""
+
+        if not success:
+            self._consumer_failed = True
+        self._in_flight = None
+        self._progress.set()
 
 
 @dataclass(slots=True)

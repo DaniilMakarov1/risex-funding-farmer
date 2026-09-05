@@ -59,9 +59,15 @@ from .store import AppendOnlyEvidenceStore, EvidenceStorageLimitExceeded
 
 
 _SHUTDOWN_TIMEOUT_SECONDS = 2.0
+_HORIZON_INGRESS_BARRIER_TIMEOUT_SECONDS = 2.0
 _TERMINAL_KINDS = frozenset({"RUN_STOP", "RUN_FAILED"})
 _MATERIAL_VALID_STRICT_EPISODE_LIMIT = 10
 _MATERIAL_DETECTION_TIMESTAMP_LIMIT = 5
+# This is an internal bounded identity ledger, not a scanner configuration
+# knob.  It is deliberately larger than the fixed eligible-trade stop so
+# irrelevant accepted trades do not consume the economic sample prematurely;
+# overflow remains a named integrity failure rather than an unsafe eviction.
+_TRADE_IDENTITY_CAPACITY = 100_000
 
 
 class HistoryCapacityExceeded(RuntimeError):
@@ -734,6 +740,11 @@ class SpreadObserver:
         self._awaiting_fresh_snapshot: set[tuple[Venue, str]] = set()
         self._active_versions: dict[str, QuoteVersion] = {}
         self._trades: dict[str, dict[str, TradeEvidence]] = {}
+        self._trade_identities: dict[str, tuple[Any, ...]] = {}
+        self._trade_identity_capacity = max(
+            _TRADE_IDENTITY_CAPACITY,
+            config.eligible_trade_limit,
+        )
         self._pending: dict[str, _PendingEpisode] = {}
         self._optimistic_pending: dict[str, _PendingEpisode] = {}
         # Strict episodes remain available until the run ends so a late
@@ -1931,6 +1942,56 @@ class SpreadObserver:
             "observed_monotonic_ns": trade.received_monotonic_ns,
         }
 
+    @staticmethod
+    def _trade_semantic_fingerprint(trade: TradeEvidence) -> tuple[Any, ...]:
+        """Return trade meaning while excluding receipt/session metadata."""
+
+        return (
+            trade.venue,
+            trade.canonical_market,
+            trade.canonical_price,
+            trade.canonical_quantity,
+            trade.aggressor_side,
+            trade.exchange_event_utc,
+            trade.exchange_event_time_provenance,
+        )
+
+    async def _trade_identity_failure(
+        self,
+        trade: TradeEvidence,
+        *,
+        reason: str,
+    ) -> None:
+        self.fatal_reason = reason
+        await self.handle_gap(
+            FeedGapEvent(
+                DataGapEvidence(
+                    source_venue=Venue.RISEX,
+                    canonical_market=trade.canonical_market,
+                    stream_session_id=trade.stream_session_id,
+                    recovery_generation=trade.recovery_generation,
+                    gap_start_monotonic_ns=trade.received_monotonic_ns,
+                    reason=reason,
+                )
+            )
+        )
+
+    def _remember_trade_identity(
+        self,
+        trade: TradeEvidence,
+    ) -> str:
+        """Classify one run-wide key without evicting prior identities."""
+
+        fingerprint = self._trade_semantic_fingerprint(trade)
+        key = trade.trade_event_key
+        existing = self._trade_identities.get(key)
+        if existing is not None:
+            return "DUPLICATE" if existing == fingerprint else "CONFLICT"
+        if len(self._trade_identities) >= self._trade_identity_capacity:
+            return "CAPACITY"
+        self._trade_identities[key] = fingerprint
+        return "NEW"
+
     def _would_fill_record(
         self,
         evidence: WouldFillEvidence,
@@ -2041,20 +2102,30 @@ class SpreadObserver:
             return
         if not self._trade_admissible(event):
             return
+        identity_status = self._remember_trade_identity(trade)
+        if identity_status == "DUPLICATE":
+            return
+        if identity_status == "CONFLICT":
+            await self._trade_identity_failure(
+                trade,
+                reason="TRADE_DEDUP_CONFLICT",
+            )
+            return
+        if identity_status == "CAPACITY":
+            await self._trade_identity_failure(
+                trade,
+                reason="TRADE_DEDUP_CAPACITY",
+            )
+            return
         market_trades = self._trades.setdefault(trade.canonical_market, {})
         existing = market_trades.get(trade.trade_event_key)
         if existing is not None:
-            if existing == trade:
+            if self._trade_semantic_fingerprint(existing) == self._trade_semantic_fingerprint(trade):
                 return
-            gap = DataGapEvidence(
-                source_venue=Venue.RISEX,
-                canonical_market=trade.canonical_market,
-                stream_session_id=trade.stream_session_id,
-                recovery_generation=trade.recovery_generation,
-                gap_start_monotonic_ns=trade.received_monotonic_ns,
+            await self._trade_identity_failure(
+                trade,
                 reason="TRADE_DEDUP_CONFLICT",
             )
-            await self.handle_gap(FeedGapEvent(gap))
             return
         market_trades[trade.trade_event_key] = trade
         relevant_versions = tuple(
@@ -2164,10 +2235,13 @@ class SpreadObserver:
                 )
                 return
             self._handling_item += 1
+            succeeded = False
             try:
                 await self.handle_item(item)
+                succeeded = True
             finally:
                 self._handling_item -= 1
+                self.ingress.complete_item(success=succeeded)
             self._schedule_material_stop_boundary()
 
     async def _capture_one(
@@ -2179,6 +2253,20 @@ class SpreadObserver:
         model: FillabilityModel = FillabilityModel.STRICT_LOWER_BOUND,
     ) -> None:
         pending_by_version = self._pending_for_model(model)
+        pending = pending_by_version.get(version_id)
+        if pending is None or horizon in pending.captures:
+            return
+        deadline = (
+            pending.would_fill.would_fill_detected_monotonic_ns
+            + horizon * 1_000_000
+        )
+        if not await self._await_horizon_ingress(deadline):
+            return
+        if self._append_failure is not None or self._append_cancelled:
+            return
+        # A timer capture and the final drain can wait on the same ingress
+        # watermark.  Revalidate after that wait before claiming the slot so
+        # exactly one path can persist a given model/version/horizon.
         pending = pending_by_version.get(version_id)
         if pending is None or horizon in pending.captures:
             return
@@ -2258,6 +2346,32 @@ class SpreadObserver:
             self.history.complete(self._pending_key(model, version_id), self._monotonic_ns())
             self._prune_state(self._monotonic_ns())
             self._refresh_horizon_drain_event()
+
+    async def _await_horizon_ingress(self, deadline: int) -> bool:
+        """Bound the receipt/processing barrier and fail closed on no ack."""
+
+        try:
+            ready = await asyncio.wait_for(
+                self.ingress.wait_for_lighter_before(deadline),
+                timeout=_HORIZON_INGRESS_BARRIER_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            self.fatal_reason = "HORIZON_INGRESS_BARRIER_TIMEOUT"
+            ready = False
+        if not ready:
+            if self.fatal_reason is None:
+                self.fatal_reason = "HORIZON_INGRESS_CONSUMER_FAILED"
+            stop_record = self._observe_sample_stop(
+                observed_monotonic_ns=max(
+                    self._sample_stop.started_monotonic_ns,
+                    self._monotonic_ns(),
+                ),
+                integrity_reason=self.fatal_reason,
+            )
+            if stop_record is not None:
+                await self._append((stop_record,))
+            return False
+        return True
 
     async def _capture_later(
         self,
