@@ -1,15 +1,15 @@
-# SS-001N — Unprefixed Login-Nonce Contract Correction
+# SS-001O — Exact RISEx Owner-Fee Read
 
-Status: `ACTIVE / ONE FRESH RISEX BUILDER`.
+Status: `ACTIVE / CHIEF-CONTROLLED LEVEL-B OPERATIONAL GATE`.
 
-Objective: correct only the accepted fee runner's login-nonce parser using the combined SS-001M live structural witness and current official `AuthService_GetLoginNonce` semantics. The live exact-account response was `data.nonce`, string, exactly `64` characters, without `0x`; official documentation classifies the nonce as hexadecimal and says it is interpreted base-16 for the EIP-712 `uint256` field.
+Objective: obtain the exact currently applicable RISEx owner-account maker/taker fee schedule through one bounded read-only invocation of the independently accepted fee reader, so profitability thresholds can later be frozen from verified costs rather than assumptions.
 
-Exact base: published `main` containing the SS-001M terminal record. Verification level A. Use one fresh visible Builder, branch, and worktree. No live venue call or protected credential read is authorized in this slice.
+Exact source: published `main` containing accepted SS-001N at `08620690418552382aeb83bf99e913753e75520d`. Verification level B. Use the accepted opt-in runner and exact protected identity paths only. Do not modify source during the gate.
 
-Allowed change: the narrow nonce parser plus direct focused fixtures/tests and only necessary documentation wording. Accept the exact observed bounded unprefixed hexadecimal string and the documented bounded `0x` hexadecimal string. Parse either form base-16 to the same `uint256` value. Preserve the exact received string as the `nonce` sent in the login request; do not silently convert an unprefixed value to decimal or rewrite its wire representation. Incoming additive envelope fields remain tolerated.
+Attempt boundary: one initial transport attempt per required read plus one retry only after timeout, premature EOF/partial body, connection reset, or transport failure before a valid observation. A complete HTTP, schema, auth, identity, or safety failure is terminal. SS-001L and SS-001M are not replayed; this is one new post-correction invocation.
 
-Required adverse coverage: empty string; bare `0x`; more than 64 hex digits; non-hex characters; whitespace; JSON integer/float/bool/null; ambiguous top-level plus nested nonce; nested nonce object/list; and proof that a 64-character digit-only unprefixed value is interpreted as hexadecimal, not decimal. Existing domain/status/identity/allow-list/retry/redaction/signature/fee tests must remain green. No test may contain a real nonce, key, account, token, or response payload.
+Allowed sequence: validate the exact live EIP-712 domain; validate the exact protected wallet/session-signer pair is active; obtain its account-bound nonce; pause for the owner to type the main wallet key only into the local no-echo prompt; derive and verify the exact wallet; sign only `Login(address account,uint256 nonce,uint32 deadline)`; obtain a short-lived JWT; perform one `GET /v1/user/fees`; emit only the runner's sanitized fee evidence. The key may exist only inside the protected local capability and must be zeroized/closed as implemented.
 
-Forbidden: live access, other parser/schema changes, endpoint order or allow-list changes, authentication flow redesign, dependency changes, protected-path changes, collection/report/economics/strategy changes, `CAL-001`, `HOLDOUT-001`, orders, write payloads, dispatch, positions, balances, collateral, deposits, transfers, withdrawals, `SS-002`, and `SS-003`.
+Forbidden: key entry in chat, task text, arguments, environment, logs, reports, databases, fixtures, Git, or process titles; raw nonce, JWT, signature, response body, request ID, wallet/session address, or secret retention; source edits; registration; token refresh/logout; any endpoint outside the accepted allow-list; orders, write payloads, dispatch, positions, balances, collateral, deposits, transfers, withdrawals, strategy execution, `CAL-001`, `HOLDOUT-001`, `SS-002`, and `SS-003`.
 
-Acceptance: focused nonce and fee-runner tests, one clean isolated Python 3.11 full suite, compile/import/dependency/private-write-surface/diff/Git checks, and exact scope review. After independent acceptance and publication, open a separately frozen single operational fee-read gate; do not reuse or retry SS-001L/SS-001M.
+Terminal action: on sanitized `FEE_READ_COMPLETE`, record only exact fee/tier/schedule facts and current official Lighter Standard inputs, then open a separate prospective calibration-freeze slice. On any terminal failure, record its sanitized class and stop without blind replay. No economic verdict follows from the fee read alone.
