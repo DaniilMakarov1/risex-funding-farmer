@@ -15,6 +15,8 @@ from risex_farmer.models import (
 
 from risex_spread_shadow.cycle import (
     CycleActionKind,
+    CycleAttempt,
+    CycleClock,
     CycleKernel,
     CycleKernelState,
     CycleReason,
@@ -617,6 +619,298 @@ def test_late_processed_entry_fill_is_explicit_uncertainty_after_exit_commit() -
     assert halted.positions.lighter_signed_quantity == D("0.50")
 
 
+def _terminal_partial_cycle_events() -> tuple[object, ...]:
+    return (
+        _trade("terminal-entry", received=500_000_200, quantity="0.50", price="102"),
+        _book(
+            Venue.RISEX,
+            received=1_200_000_000,
+            revision=2,
+            bids=(("99", "10"),),
+            asks=(("105", "10"),),
+        ),
+        _book(
+            Venue.LIGHTER,
+            received=1_200_000_000,
+            revision=2,
+            bids=(("103", "10"),),
+            asks=(("104", "10"),),
+        ),
+        _trade(
+            "terminal-exit",
+            received=2_100_000_300,
+            quantity="0.50",
+            price="101",
+            aggressor=Side.SELL,
+        ),
+        _book(
+            Venue.RISEX,
+            received=2_400_000_300,
+            revision=3,
+            bids=(("100", "10"),),
+            asks=(("105", "10"),),
+        ),
+        _book(
+            Venue.LIGHTER,
+            received=2_400_000_300,
+            revision=3,
+            bids=(("100", "10"),),
+            asks=(("105", "10"),),
+        ),
+    )
+
+
+def test_late_terminal_entry_evidence_invalidates_stream_and_replay_without_new_fill() -> None:
+    version, source_books = _version("s2-late-terminal")
+    late = _trade(
+        "terminal-late-entry",
+        received=750_000_000,
+        quantity="0.25",
+        price="102",
+        normalized=2_700_000_300,
+    )
+    events = _terminal_partial_cycle_events() + (CycleClock(2_600_000_300), late)
+
+    streamed = CycleKernel().run(version, events, source_books=source_books)
+    replayed = CycleKernel().replay(version, events, source_books=source_books)
+
+    assert streamed == replayed
+    assert streamed.status is CycleTerminalState.UNRESOLVED
+    assert not streamed.is_flat
+    assert not streamed.positions.authoritative
+    assert streamed.entry_quantity == D("0.50")
+    assert len(streamed.fills) == 4
+    assert all(fill.evidence_id != late.trade_event_key for fill in streamed.fills)
+    assert streamed.entry_measurement is not None
+    assert streamed.entry_measurement.outcome is CausalOutcome.CAUSAL_UNCERTAIN
+    assert streamed.entry_measurement.decisions[-1].classification == "UNCERTAIN"
+    assert CycleReason.ENTRY_CAUSAL_UNCERTAINTY.value in streamed.reason_codes
+    assert CycleReason.LATE_OLDER_EVENT.value in streamed.reason_codes
+
+
+def _shifted_full_cycle_events(shift: int, *, prefix: str) -> tuple[object, ...]:
+    return (
+        _trade(f"{prefix}-entry", received=500_000_200 + shift, quantity="1.00", price="102"),
+        _book(
+            Venue.RISEX,
+            received=900_000_000 + shift,
+            revision=2,
+            bids=(("99", "10"),),
+            asks=(("105", "10"),),
+        ),
+        _book(
+            Venue.LIGHTER,
+            received=900_000_000 + shift,
+            revision=2,
+            bids=(("99", "10"),),
+            asks=(("100", "10"),),
+        ),
+        _trade(
+            f"{prefix}-exit",
+            received=1_600_000_300 + shift,
+            quantity="1.00",
+            price="97",
+            aggressor=Side.SELL,
+        ),
+        _book(
+            Venue.RISEX,
+            received=1_900_000_300 + shift,
+            revision=3,
+            bids=(("99", "10"),),
+            asks=(("105", "10"),),
+        ),
+        _book(
+            Venue.LIGHTER,
+            received=1_900_000_300 + shift,
+            revision=3,
+            bids=(("99", "10"),),
+            asks=(("100", "10"),),
+        ),
+    )
+
+
+def _fresh_reentry_version(version_id: str, decision: int) -> tuple[object, tuple[object, ...]]:
+    version, source_books = _version(version_id, decision_ready=decision)
+    received = decision - 100
+    fresh_books = tuple(
+        replace(
+            book,
+            received_monotonic_ns=received,
+            ingress_received_monotonic_ns=received,
+            normalized_ready_monotonic_ns=received,
+        )
+        for book in source_books
+    )
+    return version, fresh_books
+
+
+def test_late_terminal_identity_survives_two_later_completions_with_bounded_retention() -> None:
+    first, first_books = _version("s2-retained-first")
+    kernel = CycleKernel()
+    assert kernel.admit(first, source_books=first_books).accepted
+    for event in _terminal_partial_cycle_events():
+        kernel.advance(event)
+    kernel.advance_clock(2_600_000_300)
+    first_result = kernel.last_result()
+    assert first_result is not None and first_result.is_flat
+
+    second_decision = 3_100_000_300
+    second, second_books = _fresh_reentry_version("s2-retained-second", second_decision)
+    assert kernel.admit(second, source_books=second_books).accepted
+    second_shift = second_decision - 100
+    for event in _shifted_full_cycle_events(second_shift, prefix="retained-second"):
+        kernel.advance(event)
+    kernel.advance_clock(second_decision + 2_100_000_200)
+    second_result = kernel.last_result()
+    assert second_result is not None and second_result.is_flat
+
+    third_decision = 6_300_000_300
+    third, third_books = _fresh_reentry_version("s2-retained-third", third_decision)
+    assert kernel.admit(third, source_books=third_books).accepted
+    third_shift = third_decision - 100
+    for event in _shifted_full_cycle_events(third_shift, prefix="retained-third"):
+        kernel.advance(event)
+    kernel.advance_clock(third_decision + 2_100_000_200)
+    third_result = kernel.last_result()
+    assert third_result is not None and third_result.is_flat
+    assert len(third_result.fills) == 4
+
+    late = _trade(
+        "retained-first-late-entry",
+        received=750_000_000,
+        quantity="0.25",
+        price="102",
+        normalized=2_700_000_300,
+    )
+    kernel.advance(late)
+    propagated = kernel.last_result()
+    assert propagated is not None
+    assert propagated.status is CycleTerminalState.UNRESOLVED
+    assert not propagated.is_flat
+    assert not propagated.positions.authoritative
+    assert len(propagated.fills) == 4
+    assert CycleReason.ENTRY_CAUSAL_UNCERTAINTY.value in propagated.reason_codes
+    assert CycleReason.LATE_OLDER_EVENT.value in propagated.reason_codes
+    assert kernel.state() is CycleKernelState.UNRESOLVED_HALTED
+
+
+def test_exact_replay_of_prior_terminal_event_is_benign_and_not_refilled() -> None:
+    first, first_books = _version("s2-cross-attempt-duplicate-first")
+    kernel = CycleKernel()
+    assert kernel.admit(first, source_books=first_books).accepted
+    first_events = _terminal_partial_cycle_events()
+    for event in first_events:
+        kernel.advance(event)
+    kernel.advance_clock(2_600_000_300)
+    first_result = kernel.last_result()
+    assert first_result is not None and first_result.is_flat
+
+    second_decision = 3_100_000_300
+    second, second_books = _fresh_reentry_version("s2-cross-attempt-duplicate-second", second_decision)
+    assert kernel.admit(second, source_books=second_books).accepted
+    progress = kernel.advance(first_events[0])
+    current = kernel.snapshot()
+
+    assert progress.kernel_state is CycleKernelState.PENDING
+    assert current is not None
+    assert current.status is CycleTerminalState.PENDING
+    assert current.entry_quantity == D("0")
+    assert not current.fills
+    assert current.entry_measurement is not None
+    assert current.entry_measurement.duplicate_event_count == 1
+    assert current.entry_measurement.outcome is CausalOutcome.NO_FILL
+    assert CycleReason.ENTRY_CAUSAL_UNCERTAINTY.value not in current.reason_codes
+
+
+def test_default_terminal_retention_supports_twenty_sequential_complete_cycles() -> None:
+    kernel = CycleKernel()
+    assert kernel.terminal_retention_capacity >= 20
+
+    for index in range(20):
+        decision = 100 + index * 3_000_000_000
+        version, source_books = _fresh_reentry_version(f"s2-retention-capacity-{index}", decision)
+        assert kernel.admit(version, source_books=source_books).accepted
+        shift = decision - 100
+        for event in _shifted_full_cycle_events(shift, prefix=f"retention-capacity-{index}"):
+            kernel.advance(event)
+        result = kernel.finish(end_monotonic_ns=decision + 2_100_000_300)
+        assert result.status is CycleTerminalState.NORMAL
+        assert result.is_flat
+
+    assert len(kernel.admissions_for()) == 20
+    assert kernel.state() is CycleKernelState.FLAT
+
+
+def test_terminal_retention_exhaustion_halts_only_at_explicit_capacity() -> None:
+    kernel = CycleKernel(terminal_retention_capacity=2)
+    for index in range(2):
+        decision = 100 + index * 3_000_000_000
+        version, source_books = _fresh_reentry_version(f"s2-explicit-capacity-{index}", decision)
+        assert kernel.admit(version, source_books=source_books).accepted
+        shift = decision - 100
+        for event in _shifted_full_cycle_events(shift, prefix=f"explicit-capacity-{index}"):
+            kernel.advance(event)
+        assert kernel.finish(end_monotonic_ns=decision + 2_100_000_300).is_flat
+
+    version, source_books = _fresh_reentry_version("s2-explicit-capacity-third", 6_000_000_100)
+    exhausted = kernel.admit(version, source_books=source_books)
+    assert not exhausted.accepted
+    assert exhausted.reason == CycleReason.TERMINAL_RETENTION_EXHAUSTED.value
+    assert kernel.state() is CycleKernelState.UNRESOLVED_HALTED
+
+
+def test_terminal_identity_conflict_is_checked_after_full_fill() -> None:
+    version, source_books = _version("s2-full-terminal-conflict")
+    events = _full_cycle_events()
+    kernel = CycleKernel()
+    clean = kernel.run(version, events, source_books=source_books, end_monotonic_ns=2_100_000_300)
+    assert clean.status is CycleTerminalState.NORMAL
+    assert clean.is_flat
+
+    conflicting = replace(events[0], canonical_quantity=D("0.50"))
+    kernel.advance(conflicting)
+    halted = kernel.last_result()
+    assert halted is not None
+    assert halted.status is CycleTerminalState.UNRESOLVED
+    assert not halted.is_flat
+    assert halted.positions.is_zero
+    assert len(halted.fills) == 4
+    assert CycleReason.DUPLICATE_CONFLICT.value in halted.reason_codes
+
+
+def test_run_sequence_refreshes_prior_results_after_late_terminal_conflict() -> None:
+    first, first_books = _version("s2-sequence-conflict-first")
+    first_events = _full_cycle_events()
+    second_decision = 3_100_000_300
+    second, second_books = _fresh_reentry_version("s2-sequence-conflict-second", second_decision)
+    conflicting = replace(first_events[0], canonical_quantity=D("0.50"))
+    attempts = (
+        CycleAttempt(
+            quote_version=first,
+            events=first_events,
+            source_books=first_books,
+            end_monotonic_ns=2_100_000_300,
+        ),
+        CycleAttempt(
+            quote_version=second,
+            events=(conflicting,),
+            source_books=second_books,
+            end_monotonic_ns=second_decision + 1_000_000_000,
+        ),
+    )
+
+    results = CycleKernel().run_sequence(attempts)
+
+    assert len(results) == 2
+    assert results[0].status is CycleTerminalState.UNRESOLVED
+    assert not results[0].is_flat
+    assert not results[0].positions.authoritative
+    assert CycleReason.DUPLICATE_CONFLICT.value in results[0].reason_codes
+    assert len(results[0].fills) == 4
+    assert results[1].status is CycleTerminalState.UNRESOLVED
+    assert not results[1].is_flat
+
+
 def test_late_processed_exit_fill_across_cancel_boundary_is_uncertain_and_not_over_closed() -> None:
     version, source_books = _version("s2-late-exit")
     kernel = CycleKernel()
@@ -906,6 +1200,38 @@ def test_missing_required_hedge_data_is_terminal_unresolved_and_blocks_reentry()
     assert blocked.reason == CycleReason.UNRESOLVED_HALTED.value
 
 
+def test_cycle_admission_requires_exact_s1_input_witnesses_before_stream_events() -> None:
+    version, source_books = _version("s2-admission-inputs")
+    invalid_sources = (
+        (),
+        tuple(replace(book, book_revision=99) for book in source_books),
+        tuple(replace(book, normalized_ready_monotonic_ns=200) for book in source_books),
+        tuple(replace(book, fresh=False) for book in source_books),
+    )
+
+    for books in invalid_sources:
+        result = CycleKernel().run(
+            version,
+            _full_cycle_events(),
+            source_books=books,
+            end_monotonic_ns=2_100_000_300,
+        )
+        assert result.status is CycleTerminalState.UNRESOLVED
+        assert not result.is_flat
+        assert not result.positions.authoritative
+        assert result.entry_measurement is not None
+        assert result.entry_measurement.outcome is CausalOutcome.CAUSAL_UNCERTAIN
+        assert result.entry_quantity == D("0")
+        assert not result.fills
+        assert any(
+            reason in result.reason_codes
+            for reason in (
+                CycleReason.ENTRY_INPUT_AMBIGUOUS.value,
+                CycleReason.ENTRY_INPUT_STALE.value,
+            )
+        )
+
+
 def test_stale_required_action_book_fails_closed_at_the_hedge_boundary() -> None:
     kernel, _ = _admit_full_entry("s2-stale-hedge")
     kernel.advance(
@@ -954,6 +1280,60 @@ def test_future_book_cannot_be_used_to_retroactively_execute_a_due_hedge() -> No
     assert CycleReason.FUTURE_BOOK_REJECTED.value in result.reason_codes
     assert result.positions.risex_signed_quantity == D("-1.00")
     assert result.positions.lighter_signed_quantity == D("0")
+
+
+def test_due_action_uses_latest_eligible_book_and_matches_explicit_clock_boundary() -> None:
+    version, source_books = _version("s2-eligible-book")
+    prefix = (
+        _trade("eligible-entry", received=500_000_101, quantity="0.50", price="102"),
+        _book(
+            Venue.RISEX,
+            received=1_200_000_000,
+            revision=2,
+            bids=(("103", "10"),),
+            asks=(("104", "10"),),
+        ),
+        _book(
+            Venue.LIGHTER,
+            received=1_200_000_000,
+            revision=2,
+            bids=(("103", "10"),),
+            asks=(("104", "10"),),
+        ),
+    )
+    future_risex = _book(
+        Venue.RISEX,
+        received=1_600_000_000,
+        revision=3,
+        bids=(("103", "10"),),
+        asks=(("104", "10"),),
+    )
+
+    event_driven = CycleKernel()
+    assert event_driven.admit(version, source_books=source_books).accepted
+    for event in (*prefix, future_risex):
+        event_driven.advance(event)
+    event_result = event_driven.snapshot()
+
+    clock_driven = CycleKernel()
+    assert clock_driven.admit(version, source_books=source_books).accepted
+    for event in prefix:
+        clock_driven.advance(event)
+    clock_driven.advance_clock(1_500_000_101)
+    clock_result = clock_driven.snapshot()
+
+    assert event_result is not None and clock_result is not None
+    assert event_result.status is CycleTerminalState.PENDING
+    assert clock_result.status is CycleTerminalState.PENDING
+    assert event_result.reason_codes == clock_result.reason_codes == ()
+    assert [(fill.action_id, fill.quantity, fill.price, fill.book_revision_id) for fill in event_result.fills] == [
+        ("entry-maker", D("0.50"), D("101"), None),
+        ("entry-hedge", D("0.50"), D("104"), "LIGHTER|BTC|lighter-s2|0|2"),
+    ]
+    assert [(fill.action_id, fill.quantity, fill.price, fill.book_revision_id) for fill in clock_result.fills] == [
+        ("entry-maker", D("0.50"), D("101"), None),
+        ("entry-hedge", D("0.50"), D("104"), "LIGHTER|BTC|lighter-s2|0|2"),
+    ]
 
 
 def test_required_action_gap_halts_with_exposure_retained() -> None:

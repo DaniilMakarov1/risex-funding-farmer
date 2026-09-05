@@ -32,6 +32,8 @@ from .causal import (
     CausalSourceIdentity,
     CausalTimingDiagnostics,
     CausalUncertainty,
+    build_causal_resting_quote,
+    measure_causal_quote,
 )
 from .models import (
     BookEvidence,
@@ -168,6 +170,7 @@ class CycleReason(StrEnum):
     DECISION_WITHIN_PREVIOUS_CYCLE = "DECISION_WITHIN_PREVIOUS_CYCLE"
     ACTIVE_CYCLE = "ACTIVE_CYCLE"
     UNRESOLVED_HALTED = "UNRESOLVED_HALTED"
+    TERMINAL_RETENTION_EXHAUSTED = "TERMINAL_RETENTION_EXHAUSTED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -848,6 +851,7 @@ class _MutableCycle:
     lighter_signed_quantity: Decimal = _ZERO
     forced_used: bool = False
     unresolved: bool = False
+    input_witness_deferred: bool = False
     terminal_ns: int | None = None
 
     def add_reason(self, reason: CycleReason | str) -> None:
@@ -871,11 +875,22 @@ class _MutableCycle:
 class _KernelLane:
     scenario: CycleScenario
     active: _MutableCycle | None = None
+    terminal_cycle: _MutableCycle | None = None
+    terminal_cycles: list[_MutableCycle] = field(default_factory=list)
     last_result: CycleResult | None = None
     last_decision_ns: int | None = None
     last_terminal_ns: int | None = None
     halted_unresolved: bool = False
     admission_history: list[CycleAdmission] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class _TerminalAudit:
+    """Outcome of checking one trailing event against retained attempts."""
+
+    event_index: int | None
+    invalidated: bool = False
+    duplicate: bool = False
 
 
 def _coerce_event(value: CausalEvent | TradeEvidence | BookEvidence | DataGapEvidence) -> CausalEvent:
@@ -1149,13 +1164,36 @@ def _select_book(cycle: _MutableCycle, venue: Venue, due_ns: int) -> tuple[BookE
             observation.arrival_index,
         )
     )
-    latest = candidates[-1]
+    temporal = [
+        observation
+        for observation in candidates
+        if observation.processing_ready_ns is not None
+        and observation.processing_ready_ns <= due_ns
+        and observation.book.received_monotonic_ns <= due_ns
+    ]
+    future = [observation for observation in candidates if observation not in temporal]
+    fresh_temporal = [
+        observation
+        for observation in temporal
+        if observation.book.fresh
+        and observation.book.is_sequence_healthy
+        and due_ns - observation.book.received_monotonic_ns <= cycle.policy.input_freshness_max_age_ns
+    ]
+    if not temporal:
+        if any(observation.processing_ready_ns is None for observation in candidates):
+            return None, CycleReason.REQUIRED_ACTION_TIMING_MISSING
+        return None, CycleReason.FUTURE_BOOK_REJECTED
+    if not fresh_temporal and future:
+        # A book that is already stale at the due boundary is not an eligible
+        # witness merely because a newer (future) revision was recorded.
+        return None, CycleReason.FUTURE_BOOK_REJECTED
+    # A future revision is retained as evidence but cannot shadow the latest
+    # revision that was actually ready at this scheduled boundary.
+    latest = temporal[-1]
     if not latest.identity_complete:
         return None, CycleReason.REQUIRED_ACTION_AMBIGUOUS
     if latest.processing_ready_ns is None:
         return None, CycleReason.REQUIRED_ACTION_TIMING_MISSING
-    if latest.processing_ready_ns > due_ns or latest.book.received_monotonic_ns > due_ns:
-        return None, CycleReason.FUTURE_BOOK_REJECTED
     if not latest.book.is_sequence_healthy:
         return None, CycleReason.REQUIRED_ACTION_UNHEALTHY
     if not latest.book.fresh or due_ns - latest.book.received_monotonic_ns > cycle.policy.input_freshness_max_age_ns:
@@ -1463,7 +1501,14 @@ def cycle_net_cashflow(cycle: _MutableCycle) -> Decimal:
     return sum((flow.net_cashflow_usd for flow in cycle.cashflows), _ZERO)
 
 
-def _invalid_result(quote_version: QuoteVersion, *, scenario: CycleScenario, reason: CycleReason) -> CycleResult:
+def _invalid_result(
+    quote_version: QuoteVersion,
+    *,
+    scenario: CycleScenario,
+    reason: CycleReason,
+    unresolved: bool = False,
+    uncertainty: CausalUncertainty | None = None,
+) -> CycleResult:
     policy = s2_cycle_policy()
     delays = policy.delays(scenario)
     # A minimal invalid lane retains the reason but never manufactures a fill
@@ -1486,17 +1531,164 @@ def _invalid_result(quote_version: QuoteVersion, *, scenario: CycleScenario, rea
         policy=policy,
         delays=delays,
         entry_quote=placeholder,
-        phase=_Phase.ABORTED,
+        phase=_Phase.UNRESOLVED if unresolved else _Phase.ABORTED,
         current_ns=quote_version.decision_ready_monotonic_ns or quote_version.quote_created_monotonic_ns,
         entry_activation_ns=placeholder.activation_monotonic_ns or 0,
         entry_cancel_schedule_ns=(placeholder.activation_monotonic_ns or 0) + policy.entry_cancel_after_activation_ns,
         entry_target_quantity=Decimal("1"),
         entry_remaining_quantity=Decimal("1"),
+        unresolved=unresolved,
     )
     cycle.add_reason(reason)
-    cycle.add_reason(CycleReason.INVALID_ENTRY_QUOTE)
+    if not unresolved:
+        cycle.add_reason(CycleReason.INVALID_ENTRY_QUOTE)
+    if uncertainty is not None:
+        cycle.entry_uncertainty.append(uncertainty.value)
     cycle.terminal_ns = cycle.current_ns
     return _result(cycle, terminal=True)
+
+
+def _book_matches_version_binding(
+    book: BookEvidence,
+    *,
+    venue: Venue,
+    canonical_market: str,
+    stream_session_id: str | int | None,
+    recovery_generation: int | None,
+    book_revision: int | None,
+    book_revision_id: str | None,
+) -> bool:
+    """Match one admission witness to every immutable S1 binding field."""
+
+    return (
+        stream_session_id is not None
+        and recovery_generation is not None
+        and book_revision is not None
+        and book_revision_id is not None
+        and book.venue is venue
+        and book.canonical_market == canonical_market
+        and book.stream_session_id == stream_session_id
+        and book.recovery_generation == recovery_generation
+        and book.book_revision == book_revision
+        and book.book_revision_id == book_revision_id
+    )
+
+
+def _admission_witness(
+    quote_version: QuoteVersion,
+    books: tuple[BookEvidence, ...],
+    *,
+    venue: Venue,
+) -> BookEvidence | None:
+    """Return a unique exact witness, or one candidate for S1 diagnostics."""
+
+    if venue is Venue.RISEX:
+        session = quote_version.stream_session_id
+        recovery = quote_version.recovery_generation
+        revision = quote_version.risex_book_revision
+        revision_id = quote_version.risex_book_revision_id
+    else:
+        session = quote_version.hedge_stream_session_id
+        recovery = quote_version.hedge_recovery_generation
+        revision = quote_version.lighter_book_revision
+        revision_id = quote_version.lighter_book_revision_id
+    candidates = tuple(
+        book
+        for book in books
+        if book.venue is venue and book.canonical_market == quote_version.canonical_market
+    )
+    exact = tuple(
+        book
+        for book in candidates
+        if _book_matches_version_binding(
+            book,
+            venue=venue,
+            canonical_market=quote_version.canonical_market,
+            stream_session_id=session,
+            recovery_generation=recovery,
+            book_revision=revision,
+            book_revision_id=revision_id,
+        )
+    )
+    if len(exact) == 1:
+        return exact[0]
+    # Passing one sole wrong candidate through the S1 measurement validator
+    # retains its concrete mismatch/staleness classification.  Multiple
+    # candidates are intentionally left ambiguous rather than guessed.
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _entry_input_failure(
+    quote_version: QuoteVersion,
+    policy: CyclePolicy,
+    books: tuple[BookEvidence, ...],
+) -> tuple[CycleReason | None, tuple[CausalUncertainty, ...]]:
+    """Validate the S1 causal input contract before S2 admits a cycle.
+
+    The S2 transition path must not infer its initial quote inputs from later
+    stream evidence.  Building and measuring the S1 causal quote here reuses
+    the accepted identity/readiness/freshness/health checks, while the small
+    additional skew check applies the S2 policy's configured receipt bound.
+    """
+
+    decision = quote_version.decision_ready_monotonic_ns
+    if decision is None:
+        return CycleReason.MISSING_ENTRY_TIMING, (CausalUncertainty.MISSING_CAUSAL_TIMING,)
+    if (
+        quote_version.ingress_received_monotonic_ns is None
+        or quote_version.normalized_ready_monotonic_ns is None
+    ):
+        return CycleReason.ENTRY_INPUT_AMBIGUOUS, (CausalUncertainty.MISSING_CAUSAL_TIMING,)
+    if quote_version.normalized_ready_monotonic_ns > decision:
+        return CycleReason.ENTRY_INPUT_STALE, (CausalUncertainty.SOURCE_BOOK_AFTER_DECISION,)
+
+    source_book = _admission_witness(quote_version, books, venue=Venue.RISEX)
+    hedge_book = _admission_witness(quote_version, books, venue=Venue.LIGHTER)
+    try:
+        causal_quote = build_causal_resting_quote(
+            quote_version,
+            source_book=source_book,
+            hedge_source_book=hedge_book,
+            source_book_freshness_max_age_ns=policy.input_freshness_max_age_ns,
+        )
+        measurement = measure_causal_quote(
+            causal_quote,
+            (),
+            end_monotonic_ns=decision,
+            source_books=books,
+        )
+    except (ArithmeticError, TypeError, ValueError):
+        return CycleReason.ENTRY_INPUT_AMBIGUOUS, (CausalUncertainty.MISSING_CAUSAL_TIMING,)
+
+    uncertainties = tuple(measurement.uncertainty_reasons)
+    if measurement.timing.input_receipt_skew_ns is not None and (
+        measurement.timing.input_receipt_skew_ns > policy.input_receipt_skew_max_ns
+    ):
+        uncertainties = tuple(
+            dict.fromkeys((*uncertainties, CausalUncertainty.SOURCE_BOOK_RECEIPT_SKEW))
+        )
+    if not uncertainties:
+        return None, ()
+
+    stale_reasons = {
+        CausalUncertainty.SOURCE_BOOK_STALE,
+        CausalUncertainty.SOURCE_BOOK_AFTER_DECISION,
+        CausalUncertainty.SOURCE_BOOK_RECEIPT_SKEW,
+    }
+    reason = (
+        CycleReason.ENTRY_INPUT_STALE
+        if any(item in stale_reasons for item in uncertainties)
+        else CycleReason.ENTRY_INPUT_AMBIGUOUS
+    )
+    return reason, uncertainties
+
+
+def _input_uncertainty_for_reason(reason: CycleReason) -> CausalUncertainty:
+    if reason is CycleReason.ENTRY_INPUT_STALE:
+        return CausalUncertainty.SOURCE_BOOK_STALE
+    if reason is CycleReason.ENTRY_INPUT_GAP:
+        return CausalUncertainty.DATA_GAP
+    return CausalUncertainty.MISSING_SOURCE_IDENTITY
 
 
 class CycleKernel:
@@ -1509,11 +1701,28 @@ class CycleKernel:
     """
 
     _MIN_DECISION_INTERVAL_NS = 1_000_000_000
+    # No venue or fixture contract supplies a maximum normalization delay.
+    # Retain enough completed quote intervals for the caller-bounded research
+    # window; callers with a different resource envelope can set this
+    # explicitly.  Exhaustion halts before an older identity is retired.
+    _DEFAULT_TERMINAL_RETENTION_CAPACITY = 64
 
-    def __init__(self, policy: CyclePolicy | None = None) -> None:
+    def __init__(
+        self,
+        policy: CyclePolicy | None = None,
+        *,
+        terminal_retention_capacity: int = _DEFAULT_TERMINAL_RETENTION_CAPACITY,
+    ) -> None:
         self.policy = s2_cycle_policy() if policy is None else policy
         if not isinstance(self.policy, CyclePolicy):
             raise TypeError("policy must be CyclePolicy")
+        if (
+            isinstance(terminal_retention_capacity, bool)
+            or not isinstance(terminal_retention_capacity, int)
+            or terminal_retention_capacity <= 0
+        ):
+            raise ValueError("terminal_retention_capacity must be a positive integer")
+        self.terminal_retention_capacity = terminal_retention_capacity
         self._lanes = {scenario: _KernelLane(scenario) for scenario in CycleScenario}
 
     @staticmethod
@@ -1560,15 +1769,28 @@ class CycleKernel:
             raise TypeError("quote_version must be QuoteVersion")
         scenario = self._scenario(scenario)
         lane = self._lane(scenario)
+        try:
+            books = tuple(source_books)
+        except TypeError:
+            raise TypeError("source_books must be iterable") from None
+        if any(not isinstance(book, BookEvidence) for book in books):
+            raise TypeError("source_books must contain BookEvidence")
         decision = quote_version.decision_ready_monotonic_ns
         accepted = True
         reason = "ACCEPTED"
+        input_witness_deferred = False
         if lane.halted_unresolved:
             accepted = False
             reason = CycleReason.UNRESOLVED_HALTED.value
         elif lane.active is not None:
             accepted = False
             reason = CycleReason.ACTIVE_CYCLE.value
+        elif len(lane.terminal_cycles) >= self.terminal_retention_capacity:
+            # Without an explicit processing watermark, do not retire an
+            # older quote interval merely to admit another one.
+            accepted = False
+            reason = CycleReason.TERMINAL_RETENTION_EXHAUSTED.value
+            lane.halted_unresolved = True
         elif decision is None:
             accepted = False
             reason = CycleReason.MISSING_ENTRY_TIMING.value
@@ -1581,12 +1803,27 @@ class CycleKernel:
         elif not self._valid_entry_quote(quote_version):
             accepted = False
             reason = CycleReason.INVALID_ENTRY_QUOTE.value
-        try:
-            books = tuple(source_books)
-        except TypeError:
-            raise TypeError("source_books must be iterable") from None
-        if any(not isinstance(book, BookEvidence) for book in books):
-            raise TypeError("source_books must contain BookEvidence")
+        if accepted:
+            input_reason, _ = _entry_input_failure(quote_version, self.policy, books)
+            if input_reason is not None:
+                # Preserve the historical no-event re-entry probe: it may
+                # open a no-fill attempt for an already-flat lane, but any
+                # evidence presented to that attempt is halted rather than
+                # executed without its own S1 witnesses.
+                input_witness_deferred = (
+                    not books
+                    and lane.last_terminal_ns is not None
+                    and lane.last_result is not None
+                    and lane.last_result.is_flat
+                )
+                if not input_witness_deferred:
+                    accepted = False
+                    reason = input_reason.value
+                    # A rejected causal input is a terminal safety failure
+                    # for this lane.  Later books belong to the stream, not
+                    # to the invalidated decision, and must not rehabilitate
+                    # it.
+                    lane.halted_unresolved = True
         admission = CycleAdmission(
             accepted=accepted,
             scenario=scenario,
@@ -1633,6 +1870,7 @@ class CycleKernel:
                 entry_cancel_schedule_ns=activation + self.policy.entry_cancel_after_activation_ns,
                 entry_target_quantity=quote_version.quote.canonical_quantity,  # type: ignore[arg-type]
                 entry_remaining_quantity=quote_version.quote.canonical_quantity,  # type: ignore[arg-type]
+                input_witness_deferred=input_witness_deferred,
             )
             lane.active = cycle
             lane.last_decision_ns = decision
@@ -1680,9 +1918,6 @@ class CycleKernel:
         """Consume exactly one event or one explicit clock boundary."""
 
         lane = self._lane(scenario)
-        if lane.active is None:
-            raise RuntimeError("no admitted cycle is pending")
-        cycle = lane.active
         if isinstance(event, CycleClock):
             if at_monotonic_ns is not None:
                 raise ValueError("clock event and at_monotonic_ns are mutually exclusive")
@@ -1693,6 +1928,26 @@ class CycleKernel:
                 raise ValueError("clock integer and at_monotonic_ns are mutually exclusive")
             at_monotonic_ns = event
             event = None
+        if lane.active is None:
+            if event is None or at_monotonic_ns is not None:
+                raise RuntimeError("no admitted cycle is pending")
+            if not lane.terminal_cycles:
+                raise RuntimeError("no admitted cycle is pending")
+            causal_event = _coerce_event(event)
+            audit = self._audit_terminal_cycles(lane, causal_event)
+            terminal = lane.terminal_cycles[-1]
+            event_index = audit.event_index
+            if event_index is None:
+                event_index = terminal.event_count
+            return CycleProgress(
+                scenario=terminal.scenario,
+                quote_version_id=terminal.quote_version.version_id,
+                event_index=event_index,
+                event_kind=causal_event.kind,
+                event_monotonic_ns=causal_event.causal_monotonic_ns,
+                kernel_state=self.state(scenario),
+            )
+        cycle = lane.active
         if event is None:
             if at_monotonic_ns is None:
                 raise ValueError("advance requires an event or clock boundary")
@@ -1707,6 +1962,82 @@ class CycleKernel:
                 kernel_state=self.state(scenario),
             )
         causal_event = _coerce_event(event)
+        audit = self._audit_previous_terminal(lane, causal_event)
+        if audit.invalidated:
+            cycle.add_reason(CycleReason.ENTRY_CAUSAL_UNCERTAINTY)
+            cycle.entry_uncertainty.append(CausalUncertainty.LATE_OLDER_EVENT.value)
+            self._halt(cycle, CycleReason.ENTRY_CAUSAL_UNCERTAINTY)
+            lane.last_result = _result(cycle, terminal=True)
+            self._latch_terminal(lane, cycle)
+            return CycleProgress(
+                scenario=cycle.scenario,
+                quote_version_id=cycle.quote_version.version_id,
+                event_index=cycle.event_count,
+                event_kind=causal_event.kind,
+                event_monotonic_ns=causal_event.causal_monotonic_ns,
+                kernel_state=self.state(scenario),
+            )
+        if audit.duplicate:
+            # The event identity was already committed by a prior attempt.
+            # Consume it as a benign cross-attempt duplicate, but never let
+            # it become a fresh fill in the active attempt.
+            cycle.event_count += 1
+            event_index = cycle.event_count - 1
+            cycle.duplicate_event_count += 1
+            cycle.ignored_event_count += 1
+            decisions = (
+                cycle.entry_decisions
+                if cycle.phase
+                in {_Phase.ENTRY_WAIT, _Phase.ENTRY_ACTIVE, _Phase.ENTRY_HEDGE_WAIT}
+                else cycle.exit_decisions
+            )
+            decisions.append(
+                CausalEventDecision(
+                    causal_event.kind,
+                    causal_event.event_id,
+                    causal_event.ingress_received_monotonic_ns,
+                    "IGNORED",
+                    "DUPLICATE_ALREADY_COMMITTED",
+                )
+            )
+            lane.last_result = _result(cycle)
+            return CycleProgress(
+                scenario=cycle.scenario,
+                quote_version_id=cycle.quote_version.version_id,
+                event_index=event_index,
+                event_kind=causal_event.kind,
+                event_monotonic_ns=causal_event.causal_monotonic_ns,
+                kernel_state=self.state(scenario),
+            )
+        if cycle.input_witness_deferred:
+            cycle.event_count += 1
+            event_index = cycle.event_count - 1
+            identity_key = self._terminal_event_key(causal_event)
+            if identity_key is not None:
+                cycle.seen_events[identity_key] = _event_signature(causal_event)
+            cycle.add_reason(CycleReason.ENTRY_INPUT_AMBIGUOUS)
+            cycle.entry_uncertainty.append(CausalUncertainty.MISSING_SOURCE_IDENTITY.value)
+            cycle.entry_decisions.append(
+                CausalEventDecision(
+                    causal_event.kind,
+                    causal_event.event_id,
+                    causal_event.ingress_received_monotonic_ns,
+                    "UNCERTAIN",
+                    CycleReason.ENTRY_INPUT_AMBIGUOUS.value,
+                )
+            )
+            cycle.input_witness_deferred = False
+            self._halt(cycle, CycleReason.ENTRY_INPUT_AMBIGUOUS)
+            lane.last_result = _result(cycle, terminal=True)
+            self._latch_terminal(lane, cycle)
+            return CycleProgress(
+                scenario=cycle.scenario,
+                quote_version_id=cycle.quote_version.version_id,
+                event_index=event_index,
+                event_kind=causal_event.kind,
+                event_monotonic_ns=causal_event.causal_monotonic_ns,
+                kernel_state=self.state(scenario),
+            )
         cycle.event_count += 1
         event_index = cycle.event_count - 1
         event_time = causal_event.causal_monotonic_ns
@@ -1773,16 +2104,23 @@ class CycleKernel:
         if not admission.accepted:
             if admission.reason == CycleReason.INVALID_ENTRY_QUOTE.value:
                 return _invalid_result(quote_version, scenario=self._scenario(scenario), reason=CycleReason.INVALID_ENTRY_QUOTE)
+            if admission.reason in {
+                CycleReason.ENTRY_INPUT_AMBIGUOUS.value,
+                CycleReason.ENTRY_INPUT_STALE.value,
+                CycleReason.ENTRY_INPUT_GAP.value,
+            }:
+                result = _invalid_result(
+                    quote_version,
+                    scenario=self._scenario(scenario),
+                    reason=CycleReason(admission.reason),
+                    unresolved=True,
+                    uncertainty=_input_uncertainty_for_reason(CycleReason(admission.reason)),
+                )
+                self._lane(scenario).last_result = result
+                return result
             raise CycleAdmissionError(admission)
         for event in events:
             self.advance(event, scenario=scenario)
-            # Terminal lanes deliberately stop consuming later fixture
-            # records.  A complete cycle has already crossed its flat barrier;
-            # trailing records belong to a later decision or are irrelevant to
-            # this attempt and must not be presented to a lane with no active
-            # cycle.
-            if self._lane(scenario).active is None:
-                break
         return self.finish(scenario=scenario, end_monotonic_ns=end_monotonic_ns)
 
     run_stream = run
@@ -1805,7 +2143,7 @@ class CycleKernel:
         )
 
     def run_sequence(self, attempts: Iterable[CycleAttempt]) -> tuple[CycleResult, ...]:
-        results: list[CycleResult] = []
+        cycles: list[_MutableCycle] = []
         for attempt in attempts:
             if not isinstance(attempt, CycleAttempt):
                 raise TypeError("run_sequence expects CycleAttempt values")
@@ -1818,8 +2156,25 @@ class CycleKernel:
                 continue
             for event in attempt.events:
                 self.advance(event, scenario=attempt.scenario)
-            results.append(self.finish(scenario=attempt.scenario, end_monotonic_ns=attempt.end_monotonic_ns))
-        return tuple(results)
+            self.finish(scenario=attempt.scenario, end_monotonic_ns=attempt.end_monotonic_ns)
+            lane = self._lane(attempt.scenario)
+            if lane.active is not None:
+                cycles.append(lane.active)
+            elif lane.terminal_cycles:
+                cycles.append(lane.terminal_cycles[-1])
+            else:
+                raise RuntimeError("accepted cycle was not retained")
+        # A later attempt can audit and invalidate an older retained cycle.
+        # Rebuild every returned snapshot from its mutable evidence so the
+        # sequence cannot preserve a stale authoritative NORMAL/FLAT result.
+        return tuple(
+            _result(
+                cycle,
+                terminal=cycle.phase
+                in {_Phase.COMPLETE, _Phase.ABORTED, _Phase.UNRESOLVED},
+            )
+            for cycle in cycles
+        )
 
     def alternatives(
         self,
@@ -1830,10 +2185,219 @@ class CycleKernel:
     ) -> CycleAlternatives:
         return run_cycle_alternatives(quote_version, events, policy=self.policy, source_books=source_books)
 
-    def _accept_event(self, cycle: _MutableCycle, event: CausalEvent) -> None:
-        if cycle.phase in {_Phase.COMPLETE, _Phase.ABORTED, _Phase.UNRESOLVED}:
+    @staticmethod
+    def _terminal_event_key(event: CausalEvent) -> tuple[Any, ...] | None:
+        if event.stream_key is None or event.event_id is None:
+            return None
+        return event.stream_key, event.event_id
+
+    def _mark_late_terminal_trade(
+        self,
+        cycle: _MutableCycle,
+        event: CausalEvent,
+        *,
+        entry: bool,
+    ) -> None:
+        reason = (
+            CycleReason.ENTRY_CAUSAL_UNCERTAINTY
+            if entry
+            else CycleReason.EXIT_CAUSAL_UNCERTAINTY
+        )
+        uncertainty = (
+            cycle.entry_uncertainty
+            if entry
+            else cycle.exit_uncertainty
+        )
+        cycle.add_reason(reason)
+        cycle.add_reason(CycleReason.LATE_OLDER_EVENT)
+        if CausalUncertainty.LATE_OLDER_EVENT.value not in uncertainty:
+            uncertainty.append(CausalUncertainty.LATE_OLDER_EVENT.value)
+        if not event.source_identity_complete:
+            missing = CausalUncertainty.MISSING_SOURCE_IDENTITY.value
+            if missing not in uncertainty:
+                uncertainty.append(missing)
+        elif not event.identity_metadata_consistent:
+            mismatch = CausalUncertainty.SOURCE_IDENTITY_MISMATCH.value
+            if mismatch not in uncertainty:
+                uncertainty.append(mismatch)
+        elif (
+            event.stream_session_id != cycle.quote_version.stream_session_id
+            or event.recovery_generation != cycle.quote_version.recovery_generation
+        ):
+            recovery = CausalUncertainty.RECOVERY_TRANSITION.value
+            if recovery not in uncertainty:
+                uncertainty.append(recovery)
+        cycle_decisions = cycle.entry_decisions if entry else cycle.exit_decisions
+        cycle_decisions.append(
+            CausalEventDecision(
+                event.kind,
+                event.event_id,
+                event.ingress_received_monotonic_ns,
+                "UNCERTAIN",
+                "LATE_ENTRY_AFTER_COMMIT" if entry else "LATE_EXIT_AFTER_COMMIT",
+            )
+        )
+        self._halt(cycle, reason)
+
+    def _accept_terminal_event(self, cycle: _MutableCycle, event: CausalEvent) -> bool:
+        """Audit trailing evidence without reopening a completed cycle.
+
+        A terminal cycle is immutable with respect to committed fills and
+        actions, but relevant evidence can still arrive after its processing
+        boundary.  Such evidence is retained and can invalidate the
+        authoritative result; it can never be replayed as a new fill.
+        """
+
+        # Identity is checked before the candidate predicate.  A previously
+        # committed identity must still reject a conflicting payload even
+        # after the quote has filled completely or the changed payload no
+        # longer crosses the committed price.
+        # Cross-attempt identity retention is for possible fills.  Book
+        # revisions routinely repeat across independent fixture attempts and
+        # must still be admitted to the new attempt's own book history.
+        identity_key = (
+            self._terminal_event_key(event)
+            if event.kind is CausalEventKind.TRADE
+            else None
+        )
+        signature = _event_signature(event)
+        if identity_key is not None:
+            previous = cycle.seen_events.get(identity_key)
+            if previous is not None:
+                if previous == signature:
+                    cycle.duplicate_event_count += 1
+                    cycle.ignored_event_count += 1
+                    return True
+                cycle.add_reason(CycleReason.DUPLICATE_CONFLICT)
+                cycle.entry_decisions.append(
+                    CausalEventDecision(
+                        event.kind,
+                        event.event_id,
+                        event.ingress_received_monotonic_ns,
+                        "CONFLICTING_DUPLICATE",
+                        CycleReason.DUPLICATE_CONFLICT.value,
+                    )
+                )
+                self._halt(cycle, CycleReason.DUPLICATE_CONFLICT)
+                return False
+        if event.venue not in {Venue.RISEX, Venue.LIGHTER} or event.canonical_market != cycle.quote_version.canonical_market:
             cycle.ignored_event_count += 1
-            return
+            return False
+        entry_candidate = self._entry_candidate_after_commit(cycle, event)
+        exit_candidate = self._exit_candidate_after_commit(cycle, event)
+        if not (entry_candidate or exit_candidate):
+            # Terminal books, gaps, and non-crossing trades cannot affect a
+            # committed result.  Do not retain an unbounded post-terminal
+            # event log merely because the input stream continues.
+            cycle.ignored_event_count += 1
+            return False
+        if identity_key is not None:
+            cycle.seen_events[identity_key] = signature
+
+        stream_key = (event.stream_key, event.kind)
+        previous_time = cycle.last_stream_time.get(stream_key)
+        position = _stream_position(event)
+        previous_position = cycle.last_stream_position.get(stream_key)
+        if previous_time is not None and event.causal_monotonic_ns < previous_time:
+            cycle.add_reason(CycleReason.LATE_OLDER_EVENT)
+        if previous_position is not None and position is not None and position < previous_position:
+            cycle.add_reason(CycleReason.LATE_OLDER_EVENT)
+        if previous_time is None or event.causal_monotonic_ns >= previous_time:
+            cycle.last_stream_time[stream_key] = event.causal_monotonic_ns
+        if position is not None:
+            cycle.last_stream_position[stream_key] = position
+
+        if entry_candidate:
+            self._mark_late_terminal_trade(cycle, event, entry=True)
+            return False
+        if exit_candidate:
+            self._mark_late_terminal_trade(cycle, event, entry=False)
+            return False
+        cycle.ignored_event_count += 1
+        cycle.entry_decisions.append(
+            CausalEventDecision(
+                event.kind,
+                event.event_id,
+                event.ingress_received_monotonic_ns,
+                "IGNORED",
+                "TERMINAL_AFTER_COMMIT",
+            )
+        )
+        return False
+
+    def _propagate_terminal_uncertainty(
+        self,
+        lane: _KernelLane,
+        source: _MutableCycle,
+    ) -> None:
+        """Halt the lane if an older unsealed cycle becomes uncertain."""
+
+        latest = lane.terminal_cycles[-1]
+        if latest is not source and not latest.unresolved:
+            latest.add_reason(CycleReason.ENTRY_CAUSAL_UNCERTAINTY)
+            latest.add_reason(CycleReason.LATE_OLDER_EVENT)
+            if CausalUncertainty.LATE_OLDER_EVENT.value not in latest.entry_uncertainty:
+                latest.entry_uncertainty.append(CausalUncertainty.LATE_OLDER_EVENT.value)
+            latest.unresolved = True
+            latest.phase = _Phase.UNRESOLVED
+        lane.halted_unresolved = True
+        lane.last_result = _result(latest, terminal=True)
+
+    def _audit_terminal_cycles(
+        self,
+        lane: _KernelLane,
+        event: CausalEvent,
+    ) -> _TerminalAudit:
+        """Audit all retained terminal intervals without retaining noise."""
+
+        identity_key = (
+            self._terminal_event_key(event)
+            if event.kind is CausalEventKind.TRADE
+            else None
+        )
+        matching = [
+            cycle
+            for cycle in lane.terminal_cycles
+            if not cycle.unresolved
+            and (
+                (identity_key is not None and identity_key in cycle.seen_events)
+                or self._entry_candidate_after_commit(cycle, event)
+                or self._exit_candidate_after_commit(cycle, event)
+            )
+        ]
+        if not matching:
+            return _TerminalAudit(None)
+        event_index: int | None = None
+        invalidated: _MutableCycle | None = None
+        duplicate = False
+        for cycle in matching:
+            cycle.event_count += 1
+            event_index = cycle.event_count - 1
+            was_unresolved = cycle.unresolved
+            was_duplicate = self._accept_event(cycle, event)
+            duplicate = duplicate or was_duplicate is True
+            if cycle.unresolved and not was_unresolved:
+                invalidated = cycle
+        if invalidated is not None:
+            self._propagate_terminal_uncertainty(lane, invalidated)
+        else:
+            # Keep the public terminal snapshot in sync with a benign
+            # duplicate audit, without exposing the retained older attempt.
+            lane.last_result = _result(lane.terminal_cycles[-1], terminal=True)
+        return _TerminalAudit(
+            event_index,
+            invalidated=invalidated is not None,
+            duplicate=duplicate and invalidated is None,
+        )
+
+    def _audit_previous_terminal(self, lane: _KernelLane, event: CausalEvent) -> _TerminalAudit:
+        """Audit retained prior cycles before a new one acts."""
+
+        return self._audit_terminal_cycles(lane, event)
+
+    def _accept_event(self, cycle: _MutableCycle, event: CausalEvent) -> bool | None:
+        if cycle.phase in {_Phase.COMPLETE, _Phase.ABORTED, _Phase.UNRESOLVED}:
+            return self._accept_terminal_event(cycle, event)
         if event.venue not in {Venue.RISEX, Venue.LIGHTER} or event.canonical_market != cycle.quote_version.canonical_market:
             cycle.ignored_event_count += 1
             return
@@ -2912,6 +3476,9 @@ class CycleKernel:
         lane.last_terminal_ns = cycle.terminal_ns
         if cycle.unresolved or not result.is_flat:
             lane.halted_unresolved = True
+        if not any(existing is cycle for existing in lane.terminal_cycles):
+            lane.terminal_cycles.append(cycle)
+        lane.terminal_cycle = cycle
         lane.active = None
 
 
