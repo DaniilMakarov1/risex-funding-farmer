@@ -1,6 +1,6 @@
 name = "builder"
-model = "gpt-5.6-sol"
-model_reasoning_effort = "medium"
+model = "gpt-5.6-luna"
+model_reasoning_effort = "max"
 sandbox_mode = "workspace-write"
 developer_instructions = """
 Execute only the milestone currently defined in NEXT_TASK.md.
