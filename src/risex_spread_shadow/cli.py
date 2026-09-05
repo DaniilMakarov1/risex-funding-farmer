@@ -11,6 +11,13 @@ import subprocess
 from .config import MAX_PUBLIC_DURATION_SECONDS, ShadowConfig
 from .report import render_report
 from .runner import run_public_smoke
+from .s3_cycle import (
+    CycleEvidenceError,
+    CycleWindow,
+    freeze_cycle_manifest,
+    render_cycle_report,
+    run_public_cycle_collection,
+)
 from .scanner import (
     ScannerPreconditionError,
     render_fixed_evaluation,
@@ -64,7 +71,56 @@ def _parser() -> argparse.ArgumentParser:
     scan_report.add_argument("path")
     scan_report.add_argument("--cal-report")
     scan_report.add_argument("--format", choices=("json", "table"), default="json")
+    cycle_report = subparsers.add_parser(
+        "cycle-report",
+        help="offline replay/report for S3 complete-cycle evidence",
+    )
+    cycle_report.add_argument("path")
+    cycle_report.add_argument("--format", choices=("json", "table"), default="json")
+    cycle_freeze = subparsers.add_parser(
+        "cycle-freeze",
+        help="create one prospective four-window S3 manifest",
+    )
+    cycle_freeze.add_argument("--store-root", default="./spread-shadow-runs")
+    cycle_freeze.add_argument("--campaign-id", required=True)
+    cycle_freeze.add_argument("--accepted-release", required=True)
+    cycle_freeze.add_argument(
+        "--window",
+        action="append",
+        required=True,
+        metavar="ID,START_UTC,END_UTC",
+        help="repeat exactly four times; timestamps must be ISO-8601 UTC",
+    )
+    cycle_collect = subparsers.add_parser(
+        "cycle-collect",
+        help="run one manifest-bound S3 public window",
+    )
+    cycle_collect.add_argument("--store-root", default="./spread-shadow-runs")
+    cycle_collect.add_argument("--manifest", required=True)
+    cycle_collect.add_argument("--window-id", required=True)
+    cycle_collect.add_argument("--format", choices=("json", "table"), default="json")
     return parser
+
+
+def _cycle_window_specs(campaign_id: str, values: list[str]) -> tuple[CycleWindow, ...]:
+    if len(values) != 4:
+        raise SystemExit("--window must be supplied exactly four times")
+    windows: list[CycleWindow] = []
+    for ordinal, value in enumerate(values):
+        parts = value.split(",", 2)
+        if len(parts) != 3:
+            raise SystemExit("--window must use ID,START_UTC,END_UTC")
+        window_id, start, end = parts
+        windows.append(
+            CycleWindow.from_text(
+                campaign_id=campaign_id,
+                window_id=window_id,
+                start_utc=start,
+                end_utc=end,
+                ordinal=ordinal,
+            )
+        )
+    return tuple(windows)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -82,6 +138,36 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
         except (ScannerPreconditionError, ScannerStageClaimError, ValueError) as exc:
+            raise SystemExit(str(exc)) from exc
+        return 0
+    if args.command == "cycle-report":
+        try:
+            print(render_cycle_report(Path(args.path), format=args.format))
+        except (CycleEvidenceError, ValueError) as exc:
+            raise SystemExit(str(exc)) from exc
+        return 0
+    if args.command == "cycle-freeze":
+        try:
+            path = freeze_cycle_manifest(
+                args.store_root,
+                accepted_release=args.accepted_release,
+                windows=_cycle_window_specs(args.campaign_id, args.window),
+            )
+        except (CycleEvidenceError, ValueError) as exc:
+            raise SystemExit(str(exc)) from exc
+        print(str(path))
+        return 0
+    if args.command == "cycle-collect":
+        try:
+            output = asyncio.run(
+                run_public_cycle_collection(
+                    args.store_root,
+                    manifest_path=args.manifest,
+                    window_id=args.window_id,
+                )
+            )
+            print(render_cycle_report(output.store_path, format=args.format))
+        except (CycleEvidenceError, ValueError) as exc:
             raise SystemExit(str(exc)) from exc
         return 0
     if args.command == "scan":

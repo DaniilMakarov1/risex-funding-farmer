@@ -13,19 +13,27 @@ is not a generic serializer or persistence framework.
 
 from __future__ import annotations
 
+import asyncio
 from collections import defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, fields, is_dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import Enum
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
 import stat
+import time
 from typing import Any
+
+import aiohttp
+
+from risex_farmer.exchanges.lighter import LighterAdapter
+from risex_farmer.exchanges.risex import RisexAdapter
 
 from risex_farmer.models import (
     BookLevel,
@@ -55,6 +63,18 @@ from .cycle import (
     CycleTerminalState,
     s2_cycle_policy,
 )
+from .config import ShadowConfig
+from .economics import build_hypothetical_maker_quote
+from .feed import (
+    FeedBookEvent,
+    FeedGapEvent,
+    FeedTradeEvent,
+    IngressItem,
+    IngressQueue,
+    MarketPair,
+    PublicFeedRunner,
+    select_public_market_pairs,
+)
 from .models import (
     BookEvidence,
     DataGapEvidence,
@@ -68,7 +88,14 @@ from .models import (
     SpreadDirection,
     TradeEvidence,
 )
-from .store import AppendOnlyEvidenceStore, iter_records, new_run_id
+from .scanner import ScannerPreconditionError, validate_loaded_release
+from .store import (
+    AppendOnlyEvidenceStore,
+    TERMINAL_FAILURE_BYTES_RESERVE,
+    TERMINAL_FAILURE_RECORD_RESERVE,
+    iter_records,
+    new_run_id,
+)
 
 
 S3_SCHEMA_VERSION = 1
@@ -110,6 +137,14 @@ class CycleEnvelopeLimitError(CycleEvidenceError):
     def __init__(self, resource: str) -> None:
         self.resource = resource
         super().__init__(f"S3 envelope {resource} limit reached before closing reserve")
+
+
+class CycleManifestError(CycleEvidenceError):
+    """Raised when a prospective S3 campaign manifest is not exact."""
+
+
+class CyclePublicPreconditionError(CycleEvidenceError):
+    """Raised before a public request when the S3 gate is not satisfied."""
 
 
 def _text(value: Any, name: str) -> str:
@@ -387,6 +422,180 @@ def validate_cycle_windows(
         days[window.start_utc.date()] += 1
     if len(days) < 2 or any(count != 2 for count in days.values()):
         raise CycleEvidenceIntegrityError("S3 campaign requires two windows per day over at least two days")
+
+
+@dataclass(frozen=True, slots=True)
+class CycleCampaignManifest:
+    """Prospective, immutable identity for one four-window S3 campaign."""
+
+    campaign_id: str
+    accepted_release: str
+    policy_fingerprint: str
+    windows: tuple[CycleWindow, ...]
+    envelope: CycleEnvelope
+    created_utc: datetime
+
+    def __post_init__(self) -> None:
+        _path_safe(self.campaign_id, "campaign_id")
+        if not _SHA256_RE.fullmatch(self.accepted_release):
+            raise ValueError("accepted_release must be a full lowercase 40-character Git SHA")
+        if not _HEX256_RE.fullmatch(self.policy_fingerprint):
+            raise ValueError("policy_fingerprint must be a SHA-256 digest")
+        _utc(self.created_utc, "created_utc")
+        if not isinstance(self.windows, tuple):
+            raise TypeError("manifest windows must be a tuple")
+        validate_cycle_windows(self.windows, envelope=self.envelope)
+        if any(window.campaign_id != self.campaign_id for window in self.windows):
+            raise ValueError("manifest windows must use the manifest campaign identity")
+        expected = cycle_policy_fingerprint(self.accepted_release)
+        if self.policy_fingerprint != expected:
+            raise ValueError("manifest policy fingerprint does not match accepted release")
+
+    def window(self, window_id: str) -> CycleWindow:
+        for window in self.windows:
+            if window.window_id == window_id:
+                return window
+        raise CycleManifestError(f"S3 manifest has no window {window_id!r}")
+
+    def _core_payload(self) -> dict[str, Any]:
+        return {
+            "schema_version": S3_SCHEMA_VERSION,
+            "experiment_kind": S3_EXPERIMENT_KIND,
+            "campaign_id": self.campaign_id,
+            "accepted_release": self.accepted_release,
+            "policy_fingerprint": self.policy_fingerprint,
+            "policy": _primitive(s2_cycle_policy()),
+            "envelope": _primitive(self.envelope),
+            "windows": [window.to_metadata() for window in self.windows],
+            "created_utc": self.created_utc,
+        }
+
+    def to_payload(self) -> dict[str, Any]:
+        core = _primitive(self._core_payload())
+        return {**core, "manifest_sha256": _digest(core)}
+
+
+def _cycle_manifest_path(root: str | os.PathLike[str], campaign_id: str) -> Path:
+    _path_safe(campaign_id, "campaign_id")
+    return Path(root) / ".s3-cycle" / campaign_id / "manifest.json"
+
+
+def freeze_cycle_manifest(
+    root: str | os.PathLike[str],
+    *,
+    accepted_release: str,
+    windows: Sequence[CycleWindow],
+    envelope: CycleEnvelope | None = None,
+    created_utc: datetime | None = None,
+) -> Path:
+    """Create one owner-only prospective manifest exactly once."""
+
+    selected_envelope = CycleEnvelope() if envelope is None else envelope
+    policy = cycle_policy_fingerprint(accepted_release)
+    selected = CycleCampaignManifest(
+        campaign_id=windows[0].campaign_id if windows else "",
+        accepted_release=accepted_release,
+        policy_fingerprint=policy,
+        windows=tuple(windows),
+        envelope=selected_envelope,
+        created_utc=datetime.now(UTC) if created_utc is None else created_utc,
+    )
+    path = _cycle_manifest_path(root, selected.campaign_id)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, stat.S_IRWXU)
+    encoded = json.dumps(selected.to_payload(), sort_keys=True, separators=(",", ":")) + "\n"
+    try:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            stat.S_IRUSR | stat.S_IWUSR,
+        )
+    except FileExistsError as exc:
+        raise CycleManifestError(
+            f"S3 campaign manifest already exists: {selected.campaign_id}"
+        ) from exc
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+        directory_descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    except BaseException:
+        raise
+    return path
+
+
+def read_cycle_manifest(path: str | os.PathLike[str]) -> CycleCampaignManifest:
+    """Read and validate one exact prospective campaign manifest."""
+
+    selected_path = Path(path)
+    try:
+        payload = json.loads(selected_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CycleManifestError("S3 campaign manifest cannot be read") from exc
+    if not isinstance(payload, Mapping):
+        raise CycleManifestError("S3 campaign manifest is not an object")
+    required = (
+        "schema_version",
+        "experiment_kind",
+        "campaign_id",
+        "accepted_release",
+        "policy_fingerprint",
+        "policy",
+        "envelope",
+        "windows",
+        "created_utc",
+        "manifest_sha256",
+    )
+    for key in required:
+        _require(payload, key, context="S3 campaign manifest")
+    if payload["schema_version"] != S3_SCHEMA_VERSION or payload["experiment_kind"] != S3_EXPERIMENT_KIND:
+        raise CycleManifestError("unsupported S3 campaign manifest schema")
+    core = {key: payload[key] for key in required if key != "manifest_sha256"}
+    if payload["manifest_sha256"] != _digest(core):
+        raise CycleManifestError("S3 campaign manifest digest mismatch")
+    envelope_data = payload["envelope"]
+    if not isinstance(envelope_data, Mapping):
+        raise CycleManifestError("S3 campaign manifest envelope is malformed")
+    try:
+        envelope = CycleEnvelope(
+            **{field.name: envelope_data[field.name] for field in fields(CycleEnvelope)}
+        )
+        raw_windows = payload["windows"]
+        if not isinstance(raw_windows, list):
+            raise TypeError("windows must be a list")
+        windows = tuple(
+            CycleWindow.from_text(
+                campaign_id=payload["campaign_id"],
+                window_id=_require(item, "window_id", context="manifest window"),
+                start_utc=_require(item, "window_start_utc", context="manifest window"),
+                end_utc=_require(item, "window_end_utc", context="manifest window"),
+                ordinal=item.get("window_ordinal", index),
+                monotonic_start_ns=item.get("monotonic_start_ns", 0),
+            )
+            for index, item in enumerate(raw_windows)
+            if isinstance(item, Mapping)
+        )
+        if len(windows) != len(raw_windows):
+            raise TypeError("manifest window is malformed")
+        manifest = CycleCampaignManifest(
+            campaign_id=payload["campaign_id"],
+            accepted_release=payload["accepted_release"],
+            policy_fingerprint=payload["policy_fingerprint"],
+            windows=windows,
+            envelope=envelope,
+            created_utc=_parse_utc(payload["created_utc"], "manifest.created_utc"),
+        )
+    except (TypeError, ValueError, KeyError, CycleEvidenceIntegrityError) as exc:
+        raise CycleManifestError("S3 campaign manifest fields are invalid") from exc
+    if _primitive(manifest._core_payload()) != core:
+        raise CycleManifestError("S3 campaign manifest canonical fields changed")
+    return manifest
 
 
 def cycle_policy_fingerprint(accepted_release: str) -> str:
@@ -908,25 +1117,161 @@ def cycle_result_digest(result: CycleResult) -> str:
     return _digest(cycle_result_payload(result))
 
 
+@dataclass(slots=True)
+class _CycleCampaignBudget:
+    """Aggregate S3 cap view reconstructed from the durable campaign runs."""
+
+    campaign_root: Path
+    campaign_id: str
+    max_records: int
+    max_bytes: int
+    record_reserve: int
+    bytes_reserve: int
+    record_count: int = 0
+    byte_count: int = 0
+
+    @classmethod
+    def load(
+        cls,
+        campaign_root: Path,
+        *,
+        campaign_id: str,
+        max_records: int,
+        max_bytes: int,
+        record_reserve: int,
+        bytes_reserve: int,
+    ) -> "_CycleCampaignBudget":
+        budget = cls(
+            campaign_root=campaign_root,
+            campaign_id=campaign_id,
+            max_records=max_records,
+            max_bytes=max_bytes,
+            record_reserve=record_reserve,
+            bytes_reserve=bytes_reserve,
+        )
+        if not campaign_root.exists():
+            return budget
+        for path in sorted(campaign_root.glob("run-*/evidence.jsonl")):
+            try:
+                records = list(iter_records(path))
+            except Exception as exc:
+                raise CycleEvidenceIntegrityError(
+                    "S3 campaign budget cannot read an existing run"
+                ) from exc
+            if not records:
+                raise CycleEvidenceIntegrityError("S3 campaign contains an empty run")
+            metadata = records[0].get("metadata")
+            if not isinstance(metadata, Mapping):
+                raise CycleEvidenceIntegrityError("S3 campaign run has malformed metadata")
+            if metadata.get("campaign_id") != campaign_id:
+                continue
+            budget.record_count += len(records)
+            budget.byte_count += path.stat().st_size
+        return budget
+
+    def check(self, *, encoded_bytes: int, closing: bool) -> None:
+        record_limit = self.max_records if closing else self.max_records - self.record_reserve
+        byte_limit = self.max_bytes if closing else self.max_bytes - self.bytes_reserve
+        if self.record_count + 1 > record_limit:
+            raise CycleEnvelopeLimitError("records")
+        if self.byte_count + encoded_bytes > byte_limit:
+            raise CycleEnvelopeLimitError("bytes")
+
+    def commit(self, *, encoded_bytes: int) -> None:
+        self.record_count += 1
+        self.byte_count += encoded_bytes
+
+
+def _preflight_campaign_store(
+    root: str | os.PathLike[str],
+    *,
+    campaign_id: str,
+    envelope: CycleEnvelope,
+    metadata: Mapping[str, Any],
+    run_id: str,
+) -> None:
+    """Reserve the first metadata record before creating a fresh run file."""
+
+    payload = dict(metadata)
+    payload["run_id"] = run_id
+    payload["evidence_mode"] = payload.get("evidence_mode", "OBSERVATIONAL")
+    encoded = json.dumps(
+        _primitive(
+            {
+                "kind": "RUN_METADATA",
+                "metadata": payload,
+                "run_id": run_id,
+                "record_index": 0,
+            }
+        ),
+        sort_keys=True,
+        separators=(",", ":"),
+    ) + "\n"
+    budget = _CycleCampaignBudget.load(
+        Path(root),
+        campaign_id=campaign_id,
+        max_records=envelope.max_records,
+        max_bytes=envelope.max_bytes,
+        record_reserve=envelope.record_reserve,
+        bytes_reserve=envelope.bytes_reserve,
+    )
+    budget.check(encoded_bytes=len(encoded.encode("utf-8")), closing=False)
+
+
 class CycleEvidenceWriter:
     """S3-specific cap/reserve guard around the accepted append-only store."""
 
-    def __init__(self, store: AppendOnlyEvidenceStore, envelope: CycleEnvelope) -> None:
+    def __init__(
+        self,
+        store: AppendOnlyEvidenceStore,
+        envelope: CycleEnvelope,
+        *,
+        window: CycleWindow | None = None,
+        campaign_root: str | os.PathLike[str] | None = None,
+    ) -> None:
         self.store = store
         self.envelope = envelope
+        self.window = window
         self._terminal_written = False
+        root = (
+            Path(campaign_root)
+            if campaign_root is not None
+            else store.path.parent.parent
+        )
+        campaign_id = None if window is None else window.campaign_id
+        self._campaign_budget = (
+            None
+            if campaign_id is None
+            else _CycleCampaignBudget.load(
+                root,
+                campaign_id=campaign_id,
+                max_records=envelope.max_records,
+                max_bytes=envelope.max_bytes,
+                record_reserve=envelope.record_reserve,
+                bytes_reserve=envelope.bytes_reserve,
+            )
+        )
 
     @property
     def terminal_written(self) -> bool:
         return self._terminal_written
+
+    def _is_closing_record(self, record: Mapping[str, Any], *, terminal: bool) -> bool:
+        if terminal or record.get("resource_phase") == "CLOSING" or record.get("closing") is True:
+            return True
+        if self.window is None:
+            return False
+        observed = record.get("observed_monotonic_ns")
+        return isinstance(observed, int) and observed >= self.window.cutoff_monotonic_ns
 
     def append(self, record: Mapping[str, Any]) -> int:
         if self._terminal_written:
             raise CycleEvidenceIntegrityError("evidence was offered after terminal")
         kind = record.get("kind")
         terminal = kind in {"RUN_STOP", "RUN_FAILED"}
-        record_limit = self.envelope.max_records if terminal else self.envelope.max_records - self.envelope.record_reserve
-        byte_limit = self.envelope.max_bytes if terminal else self.envelope.max_bytes - self.envelope.bytes_reserve
+        closing = self._is_closing_record(record, terminal=terminal)
+        record_limit = self.envelope.max_records if closing else self.envelope.max_records - self.envelope.record_reserve
+        byte_limit = self.envelope.max_bytes if closing else self.envelope.max_bytes - self.envelope.bytes_reserve
         if self.store.record_count + 1 > record_limit:
             raise CycleEnvelopeLimitError("records")
         payload = dict(record)
@@ -935,9 +1280,14 @@ class CycleEvidenceWriter:
         encoded = json.dumps(_primitive(payload), sort_keys=True, separators=(",", ":")) + "\n"
         if self.store.byte_count + len(encoded.encode("utf-8")) > byte_limit:
             raise CycleEnvelopeLimitError("bytes")
+        encoded_bytes = len(encoded.encode("utf-8"))
+        if self._campaign_budget is not None:
+            self._campaign_budget.check(encoded_bytes=encoded_bytes, closing=closing)
         assigned = self.store.append_batch((record,), sync=True)
         if len(assigned) != 1 or assigned[0] != payload["record_index"]:
             raise CycleEvidenceIntegrityError("append store returned a non-contiguous S3 index")
+        if self._campaign_budget is not None:
+            self._campaign_budget.commit(encoded_bytes=encoded_bytes)
         if terminal:
             self._terminal_written = True
         return assigned[0]
@@ -990,6 +1340,7 @@ class CycleRunDriver:
         policy: CyclePolicy | None = None,
         writer: CycleEvidenceWriter | None = None,
         persist: bool = True,
+        streaming: bool = False,
     ) -> None:
         self.window = window
         self.envelope = CycleEnvelope() if envelope is None else envelope
@@ -1001,15 +1352,117 @@ class CycleRunDriver:
         )
         self.writer = writer
         self.persist = persist
+        self.streaming = streaming
         self.admissions: list[CycleAdmission] = []
         self.results: list[CycleResult] = []
         self.skipped: list[dict[str, Any]] = []
         self._decisions: dict[int, _DecisionState] = {}
+        self._stream_inputs: list[CausalEvent | CycleClock] = []
+        self._stream_ended = False
         self._finalized = False
 
     def _write(self, record: Mapping[str, Any]) -> None:
         if self.persist and self.writer is not None:
-            self.writer.append(record)
+            payload = dict(record)
+            observed = payload.get("observed_monotonic_ns")
+            if (
+                payload.get("kind") not in {"RUN_STOP", "RUN_FAILED"}
+                and isinstance(observed, int)
+                and observed >= self.window.cutoff_monotonic_ns
+            ):
+                payload.setdefault("resource_phase", "CLOSING")
+            self.writer.append(payload)
+
+    @property
+    def decision_count(self) -> int:
+        return len(self._decisions)
+
+    def decision_finished(self, attempt_index: int) -> bool:
+        return self._state(attempt_index).finished
+
+    def lanes_flat(self) -> bool:
+        return all(
+            self.kernel.state(scenario) is CycleKernelState.FLAT
+            for scenario in CycleScenario
+        )
+
+    def lanes_pending(self) -> bool:
+        return any(
+            self.kernel.state(scenario) is CycleKernelState.PENDING
+            for scenario in CycleScenario
+        )
+
+    def lanes_halted(self) -> bool:
+        return any(
+            self.kernel.state(scenario) is CycleKernelState.UNRESOLVED_HALTED
+            for scenario in CycleScenario
+        )
+
+    def eligible_scenarios(self) -> tuple[CycleScenario, ...]:
+        """Return lanes that can accept a fresh decision now."""
+
+        return tuple(
+            scenario
+            for scenario in CycleScenario
+            if self.kernel.state(scenario) is CycleKernelState.FLAT
+        )
+
+    def accept_global_input(
+        self,
+        value: CausalEvent | TradeEvidence | BookEvidence | DataGapEvidence | CycleClock,
+    ) -> None:
+        """Deliver one ordered input to every applicable persistent lane."""
+
+        if not self.streaming:
+            raise CycleEvidenceIntegrityError("global S3 inputs require streaming mode")
+        if self._stream_ended:
+            raise CycleEvidenceIntegrityError("S3 stream input arrived after stream end")
+        if isinstance(value, CycleClock):
+            item: CausalEvent | CycleClock = value
+            observed = value.at_monotonic_ns
+        else:
+            item = _as_causal_event(value)
+            observed = item.causal_monotonic_ns
+        if observed > self.window.deadline_monotonic_ns:
+            raise CycleEvidenceIntegrityError("S3 input arrived after hard market deadline")
+        self._write(
+            {
+                "kind": "CYCLE_STREAM_INPUT",
+                "input_index": len(self._stream_inputs),
+                "input": _input_to_dict(item),
+                "observed_monotonic_ns": observed,
+            }
+        )
+        self._stream_inputs.append(item)
+        for scenario in CycleScenario:
+            state = self.kernel.state(scenario)
+            if isinstance(item, CycleClock):
+                if state is CycleKernelState.PENDING:
+                    self.kernel.advance(item, scenario=scenario)
+                continue
+            # An event is also the trailing audit surface for a flat lane.
+            # A lane with no prior result has nothing to audit yet.
+            if state is CycleKernelState.PENDING or self.kernel.last_result(scenario) is not None:
+                self.kernel.advance(item, scenario=scenario)
+
+    def finish_stream(self, *, end_monotonic_ns: int | None = None) -> None:
+        if not self.streaming:
+            raise CycleEvidenceIntegrityError("stream end requires streaming mode")
+        if self._stream_ended:
+            return
+        end_ns = self.window.deadline_monotonic_ns if end_monotonic_ns is None else _non_negative_int(end_monotonic_ns, "end_monotonic_ns")
+        if end_ns > self.window.deadline_monotonic_ns:
+            raise CycleEvidenceIntegrityError("S3 stream end is after hard market deadline")
+        if any(self.kernel.state(scenario) is CycleKernelState.PENDING for scenario in CycleScenario):
+            self.accept_global_input(CycleClock(end_ns))
+        self._write(
+            {
+                "kind": "CYCLE_STREAM_END",
+                "end_monotonic_ns": end_ns,
+                "observed_monotonic_ns": end_ns,
+            }
+        )
+        self._stream_ended = True
 
     def _admission_payload(self, attempt_index: int, admission: CycleAdmission) -> dict[str, Any]:
         return {
@@ -1022,6 +1475,20 @@ class CycleRunDriver:
             "reason": admission.reason,
             "observed_monotonic_ns": admission.decision_monotonic_ns or self.window.monotonic_start_ns,
         }
+
+    def record_signal_skip(self, *, reason: str, observed_monotonic_ns: int) -> None:
+        """Persist an inadmissible producer signal without entering the kernel."""
+
+        _text(reason, "reason")
+        observed = _non_negative_int(observed_monotonic_ns, "observed_monotonic_ns")
+        self.skipped.append({"reason": reason, "observed_monotonic_ns": observed})
+        self._write(
+            {
+                "kind": "CYCLE_SIGNAL_SKIPPED",
+                "reason": reason,
+                "observed_monotonic_ns": observed,
+            }
+        )
 
     def _skip_reason(self, version: QuoteVersion, source_books: tuple[BookEvidence, ...]) -> str | None:
         decision = version.decision_ready_monotonic_ns
@@ -1110,16 +1577,25 @@ class CycleRunDriver:
                 admissions[scenario] = admission
                 self.admissions.append(admission)
                 self._write(self._admission_payload(attempt_index, admission))
+        rejected = any(not admission.accepted for admission in admissions.values())
         self._decisions[attempt_index] = _DecisionState(
             attempt_index=attempt_index,
             quote_version=quote_version,
             source_books=books,
             admissions=admissions,
             inputs=[],
-            finished=skip is not None,
+            finished=skip is not None or rejected,
         )
-        if skip is not None:
-            self._write({"kind": "CYCLE_END", "attempt_index": attempt_index, "skipped": True, "observed_monotonic_ns": quote_version.decision_ready_monotonic_ns or self.window.monotonic_start_ns})
+        if skip is not None or rejected:
+            self._write(
+                {
+                    "kind": "CYCLE_END",
+                    "attempt_index": attempt_index,
+                    "skipped": True,
+                    "observed_monotonic_ns": quote_version.decision_ready_monotonic_ns
+                    or self.window.monotonic_start_ns,
+                }
+            )
         return tuple(admissions[scenario] for scenario in CycleScenario)
 
     def _state(self, attempt_index: int) -> _DecisionState:
@@ -1179,12 +1655,21 @@ class CycleRunDriver:
         state.finished = True
         self._write({"kind": "CYCLE_END", "attempt_index": attempt_index, "skipped": False, "end_monotonic_ns": end_ns, "observed_monotonic_ns": end_ns})
 
-    def finalize(self) -> CycleRunOutput | tuple[CycleResult, ...]:
+    def finalize(
+        self,
+        *,
+        failed: bool = False,
+        reason: str | None = None,
+    ) -> CycleRunOutput | tuple[CycleResult, ...]:
         if self._finalized:
             return tuple(self.results) if self.writer is None else CycleRunOutput(self.writer.store.run_id, self.writer.store.path, None, tuple(self.admissions), tuple(self.results))
-        for index, state in self._decisions.items():
-            if not state.finished:
-                self.finish_decision(index)
+        if self.streaming:
+            if not self._stream_ended:
+                self.finish_stream()
+        else:
+            for index, state in self._decisions.items():
+                if not state.finished:
+                    self.finish_decision(index)
         self.results = []
         by_version = {state.quote_version.version_id: index for index, state in self._decisions.items()}
         for scenario in CycleScenario:
@@ -1208,7 +1693,7 @@ class CycleRunDriver:
         if self.writer is None:
             return tuple(self.results)
         if not self.writer.terminal_written:
-            self.writer.append_terminal()
+            self.writer.append_terminal(failed=failed, reason=reason)
         return CycleRunOutput(
             run_id=self.writer.store.run_id,
             store_path=self.writer.store.path,
@@ -1232,6 +1717,307 @@ class CycleRunDriver:
                     self.accept_input(attempt_index, item)  # type: ignore[arg-type]
                 self.finish_decision(attempt_index, end_monotonic_ns=attempt.end_monotonic_ns)
         return self.finalize()
+
+
+class PublicCycleProducer:
+    """Turn ordered public feed items into one persistent S3 cycle stream.
+
+    The producer is deliberately synchronous at the decision boundary.  A
+    book item is handled, its quote is calculated, and only then is the
+    version's decision-ready timestamp captured.  Every subsequent item is
+    delivered to the same driver in queue order; no timestamp sort or future
+    attempt batch is constructed.
+    """
+
+    def __init__(
+        self,
+        driver: CycleRunDriver,
+        market_pair: MarketPair,
+        *,
+        ingress: IngressQueue | None = None,
+        now_utc: Callable[[], datetime] | None = None,
+        monotonic_ns: Callable[[], int] | None = None,
+    ) -> None:
+        if not isinstance(driver, CycleRunDriver):
+            raise TypeError("driver must be CycleRunDriver")
+        if not isinstance(market_pair, MarketPair):
+            raise TypeError("market_pair must be MarketPair")
+        if market_pair.canonical_market != driver.policy.canonical_market:
+            raise ValueError("public cycle pair does not match the S2 policy")
+        self.driver = driver
+        self.market_pair = market_pair
+        self.ingress = ingress
+        self._now_utc = now_utc or (lambda: datetime.now(UTC))
+        self._monotonic_ns = monotonic_ns or time.monotonic_ns
+        self._latest: dict[Venue, BookEvidence] = {}
+        self._attempt_index: int | None = None
+        self._last_decision_ns: int | None = None
+        self._last_input_ns = driver.window.monotonic_start_ns
+        self._decision_serial = 0
+        self.processed_items: list[str] = []
+        self._closed = False
+
+    @property
+    def latest_books(self) -> tuple[BookEvidence, ...]:
+        return tuple(
+            book
+            for venue in (Venue.RISEX, Venue.LIGHTER)
+            if (book := self._latest.get(venue)) is not None
+        )
+
+    @property
+    def attempt_index(self) -> int | None:
+        return self._attempt_index
+
+    def _record_skip(self, reason: str, observed_ns: int) -> None:
+        self.driver.record_signal_skip(reason=reason, observed_monotonic_ns=observed_ns)
+
+    @staticmethod
+    def _processing_ready(value: Any) -> int:
+        if isinstance(value, CycleClock):
+            return value.at_monotonic_ns
+        event = _as_causal_event(value)
+        values = [event.causal_monotonic_ns]
+        if event.normalized_ready_monotonic_ns is not None:
+            values.append(event.normalized_ready_monotonic_ns)
+        if event.decision_ready_monotonic_ns is not None:
+            values.append(event.decision_ready_monotonic_ns)
+        return max(values)
+
+    def _deliver(self, value: Any) -> int:
+        observed_ns = self._processing_ready(value)
+        if observed_ns > self.driver.window.deadline_monotonic_ns:
+            return observed_ns
+        if not self.driver.streaming:
+            attempt_index = self._attempt_index
+            if attempt_index is None or self.driver.decision_finished(attempt_index):
+                return observed_ns
+            self.driver.accept_input(attempt_index, value)
+        else:
+            self.driver.accept_global_input(value)
+        self._last_input_ns = max(self._last_input_ns, observed_ns)
+        # The event transition and the explicit clock transition are separate
+        # evidence.  The latter is what advances delayed actions when no
+        # exchange event happens exactly at their due boundary.
+        if self.driver.streaming and not isinstance(value, CycleClock):
+            self.driver.accept_global_input(CycleClock(observed_ns))
+        elif not self.driver.streaming:
+            assert self._attempt_index is not None
+            if not self.driver.decision_finished(self._attempt_index):
+                self.driver.advance_clock(self._attempt_index, observed_ns)
+        return observed_ns
+
+    def _policy(self, risex_book: BookEvidence, lighter_book: BookEvidence) -> QuotePolicy:
+        if not risex_book.bids or not risex_book.asks:
+            raise CyclePublicPreconditionError("RISEX_BOOK_BBO_MISSING")
+        tick = self.market_pair.risex_market.tick_size_raw
+        if tick is None or tick <= 0:
+            raise CyclePublicPreconditionError("RISEX_TICK_MISSING")
+        configured_at = max(risex_book.received_utc, lighter_book.received_utc)
+        return QuotePolicy(
+            canonical_market=self.driver.policy.canonical_market,
+            direction=self.driver.policy.direction,
+            target_notional_usd=self.driver.policy.target_notional_usd,
+            target_margin_bps=self.driver.policy.target_margin_bps,
+            risex_maker_fee_rate=self.driver.policy.risex_maker_fee_rate,
+            lighter_taker_fee_rate=self.driver.policy.lighter_taker_fee_rate,
+            risex_fee_source=self.driver.policy.risex_fee_source,
+            lighter_fee_source=self.driver.policy.lighter_fee_source,
+            risex_market=self.market_pair.risex_market,
+            lighter_market=self.market_pair.lighter_market,
+            risex_best_bid=risex_book.bids[0].canonical_price,
+            risex_best_ask=risex_book.asks[0].canonical_price,
+            risex_tick_size=tick,
+            fee_observed_or_configured_at=configured_at,
+        )
+
+    def _build_version(
+        self,
+        risex_book: BookEvidence,
+        lighter_book: BookEvidence,
+    ) -> QuoteVersion:
+        calculation_started = _non_negative_int(
+            self._monotonic_ns(), "quote_calculation_started_monotonic_ns"
+        )
+        policy = self._policy(risex_book, lighter_book)
+        quote = build_hypothetical_maker_quote(
+            policy,
+            lighter_book,
+            risex_market=self.market_pair.risex_market,
+            lighter_market=self.market_pair.lighter_market,
+            risex_best_bid=risex_book.bids[0].canonical_price,
+            risex_best_ask=risex_book.asks[0].canonical_price,
+            risex_tick_size=policy.risex_tick_size,
+        )
+        # This call is intentionally after quote arithmetic.  A producer
+        # timestamp on the input book is not a decision-ready timestamp.
+        calculation_finished = _non_negative_int(
+            self._monotonic_ns(), "decision_ready_monotonic_ns"
+        )
+        ingress_values = tuple(
+            book.ingress_received_monotonic_ns
+            if book.ingress_received_monotonic_ns is not None
+            else book.received_monotonic_ns
+            for book in (risex_book, lighter_book)
+        )
+        normalized_values = tuple(
+            book.normalized_ready_monotonic_ns
+            if book.normalized_ready_monotonic_ns is not None
+            else book.received_monotonic_ns
+            for book in (risex_book, lighter_book)
+        )
+        ingress = max(ingress_values)
+        normalized = max(normalized_values)
+        decision = max(calculation_started, calculation_finished, normalized)
+        self._decision_serial += 1
+        version_id = f"{self.driver.window.window_id}-public-{self._decision_serial}"
+        return QuoteVersion(
+            version_id=version_id,
+            quote=quote,
+            quote_created_utc=max(risex_book.received_utc, lighter_book.received_utc),
+            quote_created_monotonic_ns=calculation_started,
+            stream_session_id=risex_book.stream_session_id,
+            recovery_generation=risex_book.recovery_generation,
+            hedge_stream_session_id=lighter_book.stream_session_id,
+            hedge_recovery_generation=lighter_book.recovery_generation,
+            risex_book_revision=risex_book.book_revision,
+            lighter_book_revision=lighter_book.book_revision,
+            risex_book_revision_id=risex_book.book_revision_id,
+            lighter_book_revision_id=lighter_book.book_revision_id,
+            ingress_received_monotonic_ns=ingress,
+            normalized_ready_monotonic_ns=normalized,
+            decision_ready_monotonic_ns=decision,
+        )
+
+    def _maybe_decide(self, observed_ns: int) -> None:
+        if self._closed or observed_ns > self.driver.window.deadline_monotonic_ns:
+            return
+        if self.driver.streaming:
+            if not self.driver.eligible_scenarios():
+                return
+        elif self.driver.lanes_halted() or self.driver.lanes_pending():
+            return
+        books = self._latest
+        risex_book = books.get(Venue.RISEX)
+        lighter_book = books.get(Venue.LIGHTER)
+        if risex_book is None or lighter_book is None:
+            return
+        try:
+            version = self._build_version(risex_book, lighter_book)
+        except (CyclePublicPreconditionError, TypeError, ValueError, ArithmeticError) as exc:
+            self._record_skip(str(exc), observed_ns)
+            return
+        decision = version.decision_ready_monotonic_ns
+        if decision is None:
+            self._record_skip("MISSING_DECISION_READY", observed_ns)
+            return
+        if self._last_decision_ns is not None and decision < self._last_decision_ns + 1_000_000_000:
+            return
+        if (
+            not self.driver.streaming
+            and self._attempt_index is not None
+            and not self.driver.decision_finished(self._attempt_index)
+        ):
+            if not self.driver.lanes_flat():
+                return
+            self.driver.finish_decision(
+                self._attempt_index,
+                end_monotonic_ns=max(decision, self._last_input_ns),
+            )
+        if not self.driver.streaming and self.driver.lanes_halted():
+            self._record_skip("UNRESOLVED_HALTED", decision)
+            return
+        self._attempt_index = self.driver.decision_count
+        self.driver.admit_decision(
+            self._attempt_index,
+            version,
+            source_books=(risex_book, lighter_book),
+        )
+        self._last_decision_ns = decision
+
+    def handle_item(self, item: IngressItem) -> None:
+        """Process one feed item in exactly the supplied delivery order."""
+
+        if isinstance(item, FeedBookEvent):
+            if item.market_pair is not self.market_pair and item.market_pair != self.market_pair:
+                raise CycleEvidenceIntegrityError("public cycle received an unrelated market pair")
+            book = item.book
+            self.processed_items.append(f"BOOK:{book.venue.value}:{book.book_revision}")
+            ready_ns = self._deliver(book)
+            self._latest[book.venue] = book
+            self._maybe_decide(ready_ns)
+            return
+        if isinstance(item, FeedTradeEvent):
+            if item.market_pair is not self.market_pair and item.market_pair != self.market_pair:
+                raise CycleEvidenceIntegrityError("public cycle received an unrelated market pair")
+            trade = item.trade
+            self.processed_items.append(f"TRADE:{trade.trade_event_key}")
+            self._deliver(trade)
+            return
+        if isinstance(item, FeedGapEvent):
+            gap = item.gap
+            self.processed_items.append(f"GAP:{gap.reason}:{gap.gap_start_monotonic_ns}")
+            self._deliver(gap)
+            latest = self._latest.get(gap.source_venue)
+            if latest is not None and gap.matches(
+                latest.venue,
+                latest.canonical_market,
+                latest.stream_session_id,
+                latest.recovery_generation,
+            ):
+                self._latest.pop(gap.source_venue, None)
+            return
+        raise TypeError("unsupported public cycle producer item")
+
+    def accept_clock(self, at_monotonic_ns: int) -> None:
+        at_ns = _non_negative_int(at_monotonic_ns, "at_monotonic_ns")
+        self.processed_items.append(f"CLOCK:{at_ns}")
+        self._deliver(CycleClock(at_ns))
+
+    async def consume(self) -> None:
+        if self.ingress is None:
+            raise ValueError("consume requires an ingress queue")
+        while True:
+            item = await self.ingress.next_item()
+            if item is None:
+                return
+            succeeded = False
+            try:
+                self.handle_item(item)
+                succeeded = True
+            finally:
+                self.ingress.complete_item(success=succeeded)
+
+    async def run_items(self, items: Iterable[IngressItem | CycleClock]) -> None:
+        """Offline fake-producer path; it intentionally does not sort items."""
+
+        for item in items:
+            if isinstance(item, CycleClock):
+                self.accept_clock(item.at_monotonic_ns)
+            else:
+                self.handle_item(item)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self.driver.streaming:
+            self.driver.finish_stream(end_monotonic_ns=self.driver.window.deadline_monotonic_ns)
+        elif self._attempt_index is not None and not self.driver.decision_finished(self._attempt_index):
+            self.accept_clock(self.driver.window.deadline_monotonic_ns)
+            self.driver.finish_decision(
+                self._attempt_index,
+                end_monotonic_ns=self.driver.window.deadline_monotonic_ns,
+            )
+
+    def finalize(self, *, failed: bool = False, reason: str | None = None) -> CycleRunOutput | tuple[CycleResult, ...]:
+        self.close()
+        return self.driver.finalize(failed=failed, reason=reason)
+
+
+# A descriptive alias keeps the public boundary discoverable without adding a
+# second implementation or engine.
+CyclePublicProducer = PublicCycleProducer
 
 
 def _fixture_market(venue: Venue, symbol: str) -> CanonicalMarket:
@@ -1522,13 +2308,22 @@ def run_fixture_window(
         "funding_status": "UNKNOWN",
         "created_utc": datetime.now(UTC),
     }
+    run_id = new_run_id()
+    _preflight_campaign_store(
+        root,
+        campaign_id=window.campaign_id,
+        envelope=selected,
+        metadata=metadata,
+        run_id=run_id,
+    )
     store = AppendOnlyEvidenceStore.create(
         root,
         metadata=metadata,
-        max_records=selected.max_records,
-        max_bytes=selected.max_bytes,
+        run_id=run_id,
+        max_records=selected.max_records + TERMINAL_FAILURE_RECORD_RESERVE,
+        max_bytes=selected.max_bytes + TERMINAL_FAILURE_BYTES_RESERVE,
     )
-    writer = CycleEvidenceWriter(store, selected)
+    writer = CycleEvidenceWriter(store, selected, window=window, campaign_root=root)
     driver = CycleRunDriver(window, envelope=selected, writer=writer)
     try:
         driver.run(attempts)
@@ -1570,12 +2365,330 @@ def run_fixture_campaign(
     )
 
 
+def _runtime_window(window: CycleWindow, *, started_utc: datetime, started_ns: int) -> CycleWindow:
+    elapsed_ns = int((started_utc - window.start_utc).total_seconds() * 1_000_000_000)
+    runtime_start_ns = started_ns - elapsed_ns
+    if runtime_start_ns < 0:
+        raise CyclePublicPreconditionError("monotonic clock cannot bind the prospective window")
+    return replace(window, monotonic_start_ns=runtime_start_ns)
+
+
+def _public_cycle_metadata(
+    *,
+    manifest: CycleCampaignManifest,
+    prospective_window: CycleWindow,
+    runtime_window: CycleWindow,
+    run_id: str,
+    started_utc: datetime,
+) -> dict[str, Any]:
+    return {
+        "schema_version": S3_SCHEMA_VERSION,
+        "experiment_kind": S3_EXPERIMENT_KIND,
+        "evidence_mode": "OBSERVATIONAL",
+        "accepted_release": manifest.accepted_release,
+        "campaign_id": manifest.campaign_id,
+        "window_id": prospective_window.window_id,
+        "window_fingerprint": cycle_window_fingerprint(
+            accepted_release=manifest.accepted_release,
+            window=runtime_window,
+        ),
+        "manifest_window_fingerprint": cycle_window_fingerprint(
+            accepted_release=manifest.accepted_release,
+            window=prospective_window,
+        ),
+        "manifest_sha256": _digest(manifest._core_payload()),
+        "policy_fingerprint": manifest.policy_fingerprint,
+        "source_scope": (Venue.RISEX.value, Venue.LIGHTER.value),
+        "policy": _primitive(s2_cycle_policy()),
+        "envelope": _primitive(manifest.envelope),
+        "run_id": run_id,
+        "prospective": True,
+        "funding_status": "UNKNOWN",
+        "tail_required_ns": manifest.envelope.worst_configured_tail_ns(),
+        "tail_sufficient": True,
+        "created_utc": started_utc,
+        **runtime_window.to_metadata(),
+    }
+
+
+async def run_public_cycle_collection(
+    store_root: str | os.PathLike[str],
+    *,
+    manifest_path: str | os.PathLike[str] | None = None,
+    manifest: CycleCampaignManifest | None = None,
+    window_id: str,
+    accepted_release: str | None = None,
+    requested_markets: tuple[str, ...] = ("BTC",),
+    now_utc: Callable[[], datetime] | None = None,
+    monotonic_ns: Callable[[], int] | None = None,
+    source_root: str | os.PathLike[str] | None = None,
+    market_selector: Callable[..., Awaitable[tuple[MarketPair, ...]]] | None = None,
+    feed_factory: Callable[..., PublicFeedRunner] | None = None,
+) -> CycleRunOutput:
+    """Run one exact prospective S3 window through public feeds only.
+
+    The clean-release check, manifest read, create-once claim, and UTC-window
+    check all happen before adapter construction or a public request.  The
+    function is callable for the later Chief-frozen experiment but is never
+    invoked by module import or help rendering.
+    """
+
+    if manifest is not None and manifest_path is not None:
+        raise CyclePublicPreconditionError("supply manifest or manifest_path, not both")
+    selected_manifest = manifest
+    if selected_manifest is None:
+        if manifest_path is None:
+            raise CyclePublicPreconditionError("S3 public collection requires a prospective manifest")
+        selected_manifest = read_cycle_manifest(manifest_path)
+    if not isinstance(selected_manifest, CycleCampaignManifest):
+        raise CyclePublicPreconditionError("S3 manifest is invalid")
+    release = selected_manifest.accepted_release if accepted_release is None else accepted_release
+    if release != selected_manifest.accepted_release:
+        raise CyclePublicPreconditionError("accepted release does not match the S3 manifest")
+    if requested_markets and {item.strip().upper() for item in requested_markets if item.strip()} != {"BTC"}:
+        raise CyclePublicPreconditionError("S3 public collection is fixed to BTC")
+    try:
+        accepted_root = validate_loaded_release(release, source_root=source_root)
+    except (ScannerPreconditionError, ValueError) as exc:
+        raise CyclePublicPreconditionError(str(exc)) from exc
+    prospective_window = selected_manifest.window(window_id)
+    clock_utc = now_utc or (lambda: datetime.now(UTC))
+    clock_ns = monotonic_ns or time.monotonic_ns
+    claimed_utc = _utc(clock_utc(), "claimed_utc")
+    claim_path = reserve_cycle_window(
+        store_root,
+        accepted_release=release,
+        window=prospective_window,
+        policy_fingerprint=selected_manifest.policy_fingerprint,
+        claimed_utc=claimed_utc,
+    )
+    started_utc = _utc(clock_utc(), "sample_start_utc")
+    if not prospective_window.start_utc <= started_utc < prospective_window.end_utc:
+        raise CyclePublicPreconditionError(
+            "S3 public collection attempt is outside its supplied prospective UTC window"
+        )
+    started_ns = _non_negative_int(clock_ns(), "sample_start_monotonic_ns")
+    runtime_window = _runtime_window(
+        prospective_window,
+        started_utc=started_utc,
+        started_ns=started_ns,
+    )
+    run_id = new_run_id()
+    metadata = _public_cycle_metadata(
+        manifest=selected_manifest,
+        prospective_window=prospective_window,
+        runtime_window=runtime_window,
+        run_id=run_id,
+        started_utc=started_utc,
+    )
+    _preflight_campaign_store(
+        store_root,
+        campaign_id=selected_manifest.campaign_id,
+        envelope=selected_manifest.envelope,
+        metadata=metadata,
+        run_id=run_id,
+    )
+    store = AppendOnlyEvidenceStore.create(
+        store_root,
+        metadata=metadata,
+        run_id=run_id,
+        max_records=selected_manifest.envelope.max_records + TERMINAL_FAILURE_RECORD_RESERVE,
+        max_bytes=selected_manifest.envelope.max_bytes + TERMINAL_FAILURE_BYTES_RESERVE,
+    )
+    writer = CycleEvidenceWriter(
+        store,
+        selected_manifest.envelope,
+        window=runtime_window,
+        campaign_root=store_root,
+    )
+    driver = CycleRunDriver(
+        runtime_window,
+        envelope=selected_manifest.envelope,
+        writer=writer,
+        streaming=True,
+    )
+    ingress = IngressQueue(capacity=4096)
+    producer: PublicCycleProducer | None = None
+    feed: PublicFeedRunner | None = None
+    terminal_written = False
+    try:
+        writer.append(
+            {
+                "kind": "RUN_START",
+                "run_id": run_id,
+                "window_id": prospective_window.window_id,
+                "accepted_release": release,
+                "observed_monotonic_ns": started_ns,
+            }
+        )
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            risex = RisexAdapter(session)
+            lighter = LighterAdapter(session)
+            selector = select_public_market_pairs if market_selector is None else market_selector
+            setup_started_utc = _utc(clock_utc(), "catalog_setup_utc")
+            setup_remaining_seconds = (
+                prospective_window.end_utc - setup_started_utc
+            ).total_seconds()
+            if setup_remaining_seconds <= 0:
+                raise CyclePublicPreconditionError(
+                    "S3 prospective window elapsed before public catalog setup"
+                )
+            try:
+                pairs = await asyncio.wait_for(
+                    selector(
+                        risex,
+                        lighter,
+                        requested_markets=("BTC",),
+                        max_markets=1,
+                    ),
+                    timeout=setup_remaining_seconds,
+                )
+            except asyncio.TimeoutError as exc:
+                raise CyclePublicPreconditionError(
+                    "S3 public catalog setup exceeded the hard deadline"
+                ) from exc
+            if len(pairs) != 1 or pairs[0].canonical_market != "BTC":
+                raise CyclePublicPreconditionError("public catalog did not admit exactly BTC")
+            feed_started_utc = _utc(clock_utc(), "feed_start_utc")
+            remaining_seconds_float = (
+                prospective_window.end_utc - feed_started_utc
+            ).total_seconds()
+            if remaining_seconds_float <= 0:
+                raise CyclePublicPreconditionError(
+                    "S3 prospective window elapsed before public feed startup"
+                )
+            producer = PublicCycleProducer(
+                driver,
+                pairs[0],
+                ingress=ingress,
+                now_utc=clock_utc,
+                monotonic_ns=clock_ns,
+            )
+            config = ShadowConfig(
+                max_markets=1,
+                duration_seconds=1,
+                sample_wall_clock_seconds=S3_WINDOW_SECONDS,
+                ingress_queue_capacity=ingress.capacity,
+            )
+            factory = PublicFeedRunner if feed_factory is None else feed_factory
+            feed = factory(
+                session,
+                pairs,
+                ingress,
+                config=config,
+                risex_adapter=risex,
+                lighter_adapter=lighter,
+                now_utc=clock_utc,
+                monotonic_ns=clock_ns,
+            )
+            consumer_stop = asyncio.Event()
+            # The S3 hard deadline is the sample stop, not the start of an
+            # unbounded post-sample drain.  The closing tail is already inside
+            # the prospective 45-minute window.
+            drain_complete = asyncio.Event()
+            drain_complete.set()
+            deadline_timer = asyncio.create_task(
+                asyncio.sleep(remaining_seconds_float)
+            )
+
+            async def signal_deadline() -> None:
+                await deadline_timer
+                consumer_stop.set()
+
+            deadline_signal = asyncio.create_task(signal_deadline())
+
+            async def consume_with_failure_signal() -> None:
+                try:
+                    await producer.consume()
+                except asyncio.CancelledError:
+                    raise
+                except BaseException:
+                    # PublicFeedRunner observes this marker and exits its
+                    # transport loops immediately when the consumer fails.
+                    setattr(feed, "fatal_reason", "S3_CONSUMER_FAILURE")
+                    consumer_stop.set()
+                    raise
+
+            consumer = asyncio.create_task(consume_with_failure_signal())
+            feed_task = asyncio.create_task(
+                feed.run(
+                    duration_seconds=max(1, math.ceil(remaining_seconds_float)),
+                    stop_event=consumer_stop,
+                    drain_event=drain_complete,
+                    duration_limit_seconds=S3_WINDOW_SECONDS,
+                )
+            )
+            try:
+                done, _ = await asyncio.wait(
+                    (feed_task, consumer),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if consumer in done:
+                    if consumer.exception() is None:
+                        raise CycleEvidenceIntegrityError(
+                            "S3 public consumer exited before feed shutdown"
+                        )
+                    if not feed_task.done():
+                        feed_task.cancel()
+                    await asyncio.gather(feed_task, return_exceptions=True)
+                    await consumer
+                await feed_task
+                ingress.close()
+                await consumer
+            finally:
+                ingress.close()
+                for task in (feed_task, consumer, deadline_signal, deadline_timer):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(
+                    feed_task,
+                    consumer,
+                    deadline_signal,
+                    deadline_timer,
+                    return_exceptions=True,
+                )
+            producer.close()
+            failed_reason = feed.fatal_reason
+            producer.finalize(failed=failed_reason is not None, reason=failed_reason)
+            terminal_written = writer.terminal_written
+            if failed_reason is not None:
+                raise CycleEvidenceError(failed_reason)
+    except BaseException as exc:
+        if not terminal_written:
+            try:
+                if producer is not None:
+                    producer.finalize(failed=True, reason=type(exc).__name__)
+                else:
+                    writer.append_terminal(failed=True, reason=type(exc).__name__)
+                terminal_written = True
+            except BaseException as marker_exc:
+                exc.add_note(f"unable to persist S3 failure marker: {type(marker_exc).__name__}")
+        raise
+    finally:
+        store.close()
+    output = CycleRunOutput(
+        run_id=store.run_id,
+        store_path=store.path,
+        claim_path=claim_path,
+        admissions=tuple(driver.admissions),
+        results=tuple(driver.results),
+    )
+    # Retain this local evidence in the returned object only; the clean source
+    # root and exact claim/manifest identities remain in the persisted records.
+    _ = accepted_root
+    return output
+
+
 @dataclass(frozen=True, slots=True)
 class _RunBundle:
     path: Path
     metadata: dict[str, Any]
     attempts: tuple[CycleAttempt, ...]
+    streaming: bool
+    stream_inputs: tuple[CausalEvent | CycleClock, ...]
     admissions: tuple[dict[str, Any], ...]
+    signal_skips: tuple[dict[str, Any], ...]
     results: tuple[dict[str, Any], ...]
     replay_admissions: tuple[CycleAdmission, ...]
     replay_results: tuple[CycleResult, ...]
@@ -1629,7 +2742,10 @@ def _read_run(path: Path) -> _RunBundle:
     decisions_raw: dict[int, tuple[QuoteVersion, tuple[BookEvidence, ...]]] = {}
     inputs_raw: defaultdict[int, list[CausalEvent | CycleClock]] = defaultdict(list)
     ends_raw: dict[int, int | None] = {}
+    stream_inputs_raw: list[tuple[int, CausalEvent | CycleClock]] = []
+    stream_end: int | None = None
     admissions: list[dict[str, Any]] = []
+    signal_skips: list[dict[str, Any]] = []
     results: list[dict[str, Any]] = []
     for record in records[1:-1]:
         kind = record.get("kind")
@@ -1650,6 +2766,27 @@ def _read_run(path: Path) -> _RunBundle:
             if input_index != len(inputs_raw[index]):
                 raise CycleEvidenceIntegrityError("S3 input delivery indices are not contiguous")
             inputs_raw[index].append(_input_from_dict(_require(record, "input", context="CYCLE_INPUT"), context="CYCLE_INPUT.input"))
+        elif kind == "CYCLE_STREAM_INPUT":
+            input_index = _non_negative_int(
+                _require(record, "input_index", context="CYCLE_STREAM_INPUT"),
+                "input_index",
+            )
+            stream_inputs_raw.append(
+                (
+                    input_index,
+                    _input_from_dict(
+                        _require(record, "input", context="CYCLE_STREAM_INPUT"),
+                        context="CYCLE_STREAM_INPUT.input",
+                    ),
+                )
+            )
+        elif kind == "CYCLE_STREAM_END":
+            if stream_end is not None:
+                raise CycleEvidenceIntegrityError("duplicate S3 stream end")
+            stream_end = _non_negative_int(
+                _require(record, "end_monotonic_ns", context="CYCLE_STREAM_END"),
+                "end_monotonic_ns",
+            )
         elif kind == "CYCLE_END":
             index = _non_negative_int(_require(record, "attempt_index", context="CYCLE_END"), "attempt_index")
             if index in ends_raw:
@@ -1657,6 +2794,8 @@ def _read_run(path: Path) -> _RunBundle:
             ends_raw[index] = record.get("end_monotonic_ns")
         elif kind == "CYCLE_ADMISSION":
             admissions.append(record)
+        elif kind == "CYCLE_SIGNAL_SKIPPED":
+            signal_skips.append(record)
         elif kind == "CYCLE_FINAL_RESULT":
             result_payload = _require(record, "result", context="CYCLE_FINAL_RESULT")
             digest = _require(record, "result_sha256", context="CYCLE_FINAL_RESULT")
@@ -1665,24 +2804,41 @@ def _read_run(path: Path) -> _RunBundle:
             results.append(record)
         elif kind in {"RUN_METADATA", "REPLAY_MODE"}:
             raise CycleEvidenceIntegrityError(f"unexpected S3 record kind: {kind}")
-    if not decisions_raw:
-        raise CycleEvidenceIntegrityError("S3 evidence contains no decisions")
+    if stream_inputs_raw and (inputs_raw or ends_raw):
+        raise CycleEvidenceIntegrityError("S3 evidence mixes stream and attempt inputs")
     expected_indices = tuple(range(len(decisions_raw)))
     if tuple(sorted(decisions_raw)) != expected_indices:
         raise CycleEvidenceIntegrityError("S3 decision indices are not contiguous")
-    if set(ends_raw) != set(decisions_raw):
+    if not stream_inputs_raw and set(ends_raw) != set(decisions_raw):
         raise CycleEvidenceIntegrityError("S3 evidence is missing a cycle end")
+    if stream_inputs_raw and ends_raw:
+        raise CycleEvidenceIntegrityError("S3 stream evidence contains attempt cycle ends")
     ordered_attempts = tuple(
         CycleAttempt(
             quote_version=decisions_raw[index][0],
             source_books=decisions_raw[index][1],
             events=tuple(inputs_raw.get(index, ())),
-            end_monotonic_ns=ends_raw[index],
+        end_monotonic_ns=ends_raw.get(index),
         )
         for index in expected_indices
     )
-    driver = CycleRunDriver(window, envelope=envelope, persist=False)
-    driver.run(ordered_attempts)
+    streaming = bool(stream_inputs_raw or stream_end is not None)
+    if streaming:
+        if stream_end is None:
+            raise CycleEvidenceIntegrityError("S3 stream evidence is missing its end")
+        if tuple(index for index, _ in stream_inputs_raw) != tuple(range(len(stream_inputs_raw))):
+            raise CycleEvidenceIntegrityError("S3 stream input indices are not contiguous")
+        driver = CycleRunDriver(window, envelope=envelope, persist=False, streaming=True)
+        for index in expected_indices:
+            version, books = decisions_raw[index]
+            driver.admit_decision(index, version, source_books=books)
+        for _, item in stream_inputs_raw:
+            driver.accept_global_input(item)
+        driver.finish_stream(end_monotonic_ns=stream_end)
+        driver.finalize()
+    else:
+        driver = CycleRunDriver(window, envelope=envelope, persist=False)
+        driver.run(ordered_attempts)
     expected_admissions = tuple(
         {
             "attempt_index": record.get("attempt_index"),
@@ -1705,17 +2861,20 @@ def _read_run(path: Path) -> _RunBundle:
         }
         for record, admission in zip(admissions, driver.admissions)
     )
-    if expected_admissions != actual_admissions:
+    if len(admissions) != len(driver.admissions) or expected_admissions != actual_admissions:
         raise CycleEvidenceIntegrityError("persisted S3 admissions do not replay identically")
     expected_result_digests = tuple(record.get("result_sha256") for record in results)
     actual_result_digests = tuple(cycle_result_digest(result) for result in driver.results)
-    if expected_result_digests != actual_result_digests:
+    if len(results) != len(actual_result_digests) or expected_result_digests != actual_result_digests:
         raise CycleEvidenceIntegrityError("persisted S3 cycle results do not replay identically")
     return _RunBundle(
         path=path,
         metadata=metadata,
         attempts=ordered_attempts,
+        streaming=streaming,
+        stream_inputs=tuple(item for _, item in stream_inputs_raw),
         admissions=tuple(admissions),
+        signal_skips=tuple(signal_skips),
         results=tuple(results),
         replay_admissions=tuple(driver.admissions),
         replay_results=tuple(driver.results),
@@ -1729,18 +2888,84 @@ def _decimal_text(value: Decimal | None) -> str | None:
     return None if value is None else str(value)
 
 
-def _group_key(result: CycleResult) -> str | None:
+def _identity_tokens(result: CycleResult) -> frozenset[str]:
     measurement = result.entry_measurement
     if measurement is None or not measurement.is_proven_fill or not measurement.fills:
-        return None
-    identities: list[str] = []
+        return frozenset()
+    identities: set[str] = set()
     for fill in measurement.fills:
         identity = fill.source_identity
-        for value in (identity.taker_order_id, identity.maker_order_id, identity.source_event_id):
-            if value is not None:
-                identities.append(value)
-                break
-    return "|".join(sorted(set(identities))) if identities else None
+        if not isinstance(identity, CausalSourceIdentity):
+            continue
+        order_ids = (identity.maker_order_id, identity.taker_order_id)
+        available_orders = {value for value in order_ids if value is not None}
+        if available_orders:
+            identities.update(available_orders)
+        elif identity.source_event_id is not None:
+            identities.add(identity.source_event_id)
+        elif identity.source_trade_id is not None:
+            identities.add(identity.source_trade_id)
+    return frozenset(identities)
+
+
+def _dependence_groups(
+    results: Sequence[CycleResult],
+) -> tuple[dict[int, str], int]:
+    """Merge overlapping exact identities transitively within one lane."""
+
+    parent = list(range(len(results)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    owners: dict[str, int] = {}
+    tokens_by_index: dict[int, frozenset[str]] = {}
+    for index, result in enumerate(results):
+        tokens = _identity_tokens(result)
+        tokens_by_index[index] = tokens
+        for token in tokens:
+            previous = owners.get(token)
+            if previous is not None:
+                union(previous, index)
+            else:
+                owners[token] = index
+    component_tokens: defaultdict[int, set[str]] = defaultdict(set)
+    for index, tokens in tokens_by_index.items():
+        component_tokens[find(index)].update(tokens)
+    keys = {
+        root: "|".join(sorted(tokens))
+        for root, tokens in component_tokens.items()
+        if tokens
+    }
+    result_keys = {
+        index: keys[find(index)]
+        for index, tokens in tokens_by_index.items()
+        if tokens and find(index) in keys
+    }
+    unresolved = sum(
+        result.entry_measurement is not None
+        and result.entry_measurement.is_proven_fill
+        and bool(result.entry_measurement.fills)
+        and not tokens_by_index[index]
+        for index, result in enumerate(results)
+    )
+    return result_keys, unresolved
+
+
+def _group_key(result: CycleResult) -> str | None:
+    """Return the local identity key for compatibility with prefix callers."""
+
+    tokens = _identity_tokens(result)
+    return "|".join(sorted(tokens)) if tokens else None
 
 
 def _result_is_unresolved(result: CycleResult) -> bool:
@@ -1756,9 +2981,12 @@ def _scenario_report(results: Sequence[CycleResult], scenario: CycleScenario) ->
     unresolved = sum(_result_is_unresolved(result) for result in selected)
     pnls = tuple(result.pnl_usd for result in complete if result.pnl_usd is not None)
     total = sum(pnls, _ZERO)
+    group_keys, unresolved_identity_count = _dependence_groups(selected)
     groups: dict[str, Decimal] = defaultdict(lambda: _ZERO)
-    for result in complete:
-        group = _group_key(result)
+    for index, result in enumerate(selected):
+        if result not in complete:
+            continue
+        group = group_keys.get(index)
         if group is not None:
             groups[group] += result.pnl_usd or _ZERO
     best_group = max(groups, key=lambda value: (groups[value], value)) if groups else None
@@ -1788,9 +3016,12 @@ def _scenario_report(results: Sequence[CycleResult], scenario: CycleScenario) ->
         "worst_cycle": None if worst is None else {"quote_version_id": worst.quote_version_id, "pnl_usd": str(worst.pnl_usd)},
         "turnover_usd": _decimal_text(sum((result.turnover_usd for result in selected), _ZERO)),
         "holding_duration_seconds": _decimal_text(Decimal(holding) / Decimal(1_000_000_000)),
+        "occupancy_holding_duration_seconds": _decimal_text(Decimal(holding) / Decimal(1_000_000_000)),
         "unmatched_exposure_duration_seconds": _decimal_text(Decimal(unmatched) / Decimal(1_000_000_000)),
         "filled_entry_dependence_group_count": len(groups),
+        "filled_entry_identity_unresolved_count": unresolved_identity_count,
         "forced_or_unmatched_pnl_usd": _decimal_text(sum((result.pnl_usd or _ZERO for result in forced_results), _ZERO)),
+        "forced_unmatched_exit_contribution_usd": _decimal_text(sum((result.pnl_usd or _ZERO for result in forced_results), _ZERO)),
         "best_dependence_group": best_group,
         "total_without_best_dependence_group_usd": _decimal_text(without_best),
         "funding_status": "UNKNOWN_EXECUTION_ONLY",
@@ -1814,13 +3045,15 @@ def _window_summary(bundle: _RunBundle) -> dict[str, Any]:
         "byte_count": bundle.byte_count,
         "primary": primary,
         "stress": stress,
-        "skipped_signal_count": sum(not bool(record.get("accepted")) for record in bundle.admissions),
+        "skipped_signal_count": sum(not bool(record.get("accepted")) for record in bundle.admissions)
+        + len(bundle.signal_skips),
         "skipped_signal_reasons": sorted(
             {
                 str(record.get("reason"))
                 for record in bundle.admissions
                 if not bool(record.get("accepted"))
             }
+            | {str(record.get("reason")) for record in bundle.signal_skips}
         ),
     }
 
@@ -1844,9 +3077,17 @@ def build_cycle_report(path: str | os.PathLike[str]) -> dict[str, Any]:
     metadata = bundles[0].metadata
     campaign_id = metadata["campaign_id"]
     policy_fingerprint = metadata["policy_fingerprint"]
+    envelope_data = metadata["envelope"]
+    if not isinstance(envelope_data, Mapping):
+        raise CycleEvidenceIntegrityError("S3 report envelope metadata is malformed")
+    envelope = CycleEnvelope(
+        **{field.name: envelope_data[field.name] for field in fields(CycleEnvelope)}
+    )
     for bundle in bundles[1:]:
         if bundle.metadata["campaign_id"] != campaign_id or bundle.metadata["policy_fingerprint"] != policy_fingerprint:
             raise CycleEvidenceIntegrityError("S3 campaign or policy identity mismatch across windows")
+        if bundle.metadata.get("envelope") != envelope_data:
+            raise CycleEvidenceIntegrityError("S3 campaign envelope mismatch across windows")
     windows = tuple(
         CycleWindow.from_text(
             campaign_id=bundle.metadata["campaign_id"],
@@ -1859,7 +3100,7 @@ def build_cycle_report(path: str | os.PathLike[str]) -> dict[str, Any]:
         for bundle in bundles
     )
     if len(windows) == 4:
-        validate_cycle_windows(windows)
+        validate_cycle_windows(windows, envelope=envelope)
     summaries = tuple(_window_summary(bundle) for bundle in bundles)
     all_primary = tuple(result for bundle in bundles for result in bundle.replay_results if result.scenario is CycleScenario.PRIMARY)
     all_stress = tuple(result for bundle in bundles for result in bundle.replay_results if result.scenario is CycleScenario.STRESS)
@@ -1891,7 +3132,13 @@ def build_cycle_report(path: str | os.PathLike[str]) -> dict[str, Any]:
         and primary_without_best is not None
         and Decimal(primary_without_best) > 0
     )
-    structurally_valid = all(bundle.terminal == "RUN_STOP" for bundle in bundles)
+    aggregate_record_count = sum(bundle.record_count for bundle in bundles)
+    aggregate_byte_count = sum(bundle.byte_count for bundle in bundles)
+    aggregate_within_caps = (
+        aggregate_record_count <= envelope.max_records
+        and aggregate_byte_count <= envelope.max_bytes
+    )
+    structurally_valid = all(bundle.terminal == "RUN_STOP" for bundle in bundles) and aggregate_within_caps
     unresolved_count = primary["unresolved_count"] + stress["unresolved_count"]
     sufficient = (
         structurally_valid
@@ -1919,6 +3166,15 @@ def build_cycle_report(path: str | os.PathLike[str]) -> dict[str, Any]:
         "window_count": len(bundles),
         "measurement_validity": "VALID" if structurally_valid else "DATA_INSUFFICIENT",
         "evidence_sufficiency": sufficiency_label,
+        "aggregate_caps": {
+            "record_count": aggregate_record_count,
+            "max_records": envelope.max_records,
+            "record_reserve": envelope.record_reserve,
+            "byte_count": aggregate_byte_count,
+            "max_bytes": envelope.max_bytes,
+            "bytes_reserve": envelope.bytes_reserve,
+            "within_caps": aggregate_within_caps,
+        },
         "economics": {
             "primary": primary,
             "stress": stress,
@@ -1935,7 +3191,7 @@ def build_cycle_report(path: str | os.PathLike[str]) -> dict[str, Any]:
             "cycles_per_window_floor": S3_REQUIRED_CYCLES_PER_QUALIFYING_WINDOW,
             "no_trading_authority": True,
         },
-        "envelope": _primitive(CycleEnvelope()),
+        "envelope": _primitive(envelope),
         "windows": summaries,
     }
 
@@ -1962,22 +3218,19 @@ def render_cycle_report(path: str | os.PathLike[str], *, format: str = "json") -
     return "\n".join(lines)
 
 
-def run_public_cycle_collection(*_args: Any, **_kwargs: Any) -> None:
-    """Fail closed until Chief freezes exact future public windows."""
-
-    raise CycleEvidenceError(
-        "S3 public collection is not enabled; Chief must freeze exact windows after offline acceptance"
-    )
-
-
 __all__ = [
     "CycleEnvelope",
     "CycleEvidenceError",
     "CycleEvidenceIntegrityError",
+    "CycleCampaignManifest",
+    "CycleManifestError",
+    "CyclePublicPreconditionError",
     "CycleEvidenceWriter",
     "CycleEnvelopeLimitError",
     "CycleRunDriver",
     "CycleRunOutput",
+    "PublicCycleProducer",
+    "CyclePublicProducer",
     "CycleWindow",
     "CycleWindowClaimError",
     "S3_BYTES_RESERVE",
@@ -1992,6 +3245,7 @@ __all__ = [
     "build_cycle_report",
     "cycle_attempt_from_dict",
     "cycle_attempt_to_dict",
+    "freeze_cycle_manifest",
     "cycle_policy_fingerprint",
     "cycle_result_digest",
     "cycle_result_payload",
@@ -1999,6 +3253,7 @@ __all__ = [
     "fixture_campaign_windows",
     "fixture_cycle_attempts",
     "render_cycle_report",
+    "read_cycle_manifest",
     "reserve_cycle_window",
     "run_fixture_campaign",
     "run_fixture_window",

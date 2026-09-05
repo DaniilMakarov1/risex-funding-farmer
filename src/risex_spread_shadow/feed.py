@@ -1293,16 +1293,25 @@ class PublicFeedRunner:
         duration_seconds: int | None = None,
         stop_event: asyncio.Event | None = None,
         drain_event: asyncio.Event | None = None,
+        duration_limit_seconds: int | None = None,
     ) -> None:
         duration = self.config.duration_seconds if duration_seconds is None else duration_seconds
+        duration_limit = (
+            MAX_PUBLIC_DURATION_SECONDS
+            if duration_limit_seconds is None
+            else duration_limit_seconds
+        )
         if (
             isinstance(duration, bool)
             or not isinstance(duration, int)
             or duration <= 0
-            or duration > MAX_PUBLIC_DURATION_SECONDS
+            or isinstance(duration_limit, bool)
+            or not isinstance(duration_limit, int)
+            or duration_limit <= 0
+            or duration > duration_limit
         ):
             raise ValueError(
-                f"public smoke duration must be 1..{MAX_PUBLIC_DURATION_SECONDS} seconds"
+                f"public smoke duration must be 1..{duration_limit} seconds"
             )
         # The prospective wall-clock gate is independent from the operator's
         # requested duration.  A shorter configured sample wall-clock limit
