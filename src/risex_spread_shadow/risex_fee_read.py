@@ -18,6 +18,9 @@ Frozen contract provenance supplied for SS-001K on 2026-09-05:
 * mainnet REST origin: ``https://api.rise.trade``;
 * EIP-712 domain: ``RISEx`` / ``1`` / chain ``4153`` / the exact mainnet
   authorization contract below;
+* login domain prerequisite: ``GET /v1/auth/eip712-domain`` from the fixed
+  origin, with the returned name, version, chain, and verifying contract
+  validated before any readiness, nonce, signing, login, or fee step;
 * nonce: ``GET /v1/auth/nonce?account=<exact wallet>``;
 * login: the account signs ``Login(address account,uint256 nonce,uint32
   deadline)`` and sends ``POST /v1/auth/login``;
@@ -58,11 +61,13 @@ MAINNET_DOMAIN_VERSION = "1"
 MAINNET_AUTH_CONTRACT = "0x0d919daa3f12ae715744eb648c00066c5dbd66f0"
 
 NONCE_PATH = "/v1/auth/nonce"
+DOMAIN_PATH = "/v1/auth/eip712-domain"
 SESSION_KEY_STATUS_PATH = "/v1/auth/session-key-status"
 LOGIN_PATH = "/v1/auth/login"
 FEES_PATH = "/v1/user/fees"
 
 ALLOWED_ENDPOINTS = (
+    ("GET", DOMAIN_PATH),
     ("GET", NONCE_PATH),
     ("GET", SESSION_KEY_STATUS_PATH),
     ("POST", LOGIN_PATH),
@@ -122,6 +127,8 @@ _SAFE_REASONS = frozenset(
         "SESSION_STATUS_INVALID",
         "SESSION_KEY_NOT_ACTIVE",
         "NONCE_INVALID",
+        "DOMAIN_RESPONSE_INVALID",
+        "DOMAIN_BINDING_MISMATCH",
         "OWNER_INPUT_CANCELLED",
         "OWNER_INPUT_UNAVAILABLE",
         "OWNER_KEY_INVALID",
@@ -466,6 +473,30 @@ def _parse_nonce(value: Any) -> tuple[str | int, int]:
     if not 0 <= numeric <= _UINT256_MAX:
         raise _failure("NONCE_INVALID", "SAFETY")
     return raw, numeric
+
+
+def _parse_domain(value: Any) -> None:
+    data = _response_data(value, "DOMAIN_RESPONSE_INVALID")
+    required = {"name", "version", "chain_id", "verifying_contract"}
+    if not required <= set(data):
+        raise _failure("DOMAIN_RESPONSE_INVALID", "SCHEMA")
+
+    if type(data["name"]) is not str or data["name"] != MAINNET_DOMAIN_NAME:
+        raise _failure("DOMAIN_BINDING_MISMATCH", "IDENTITY")
+    if type(data["version"]) is not str or data["version"] != MAINNET_DOMAIN_VERSION:
+        raise _failure("DOMAIN_BINDING_MISMATCH", "IDENTITY")
+
+    chain_id = _strict_uint(
+        data["chain_id"], maximum=_UINT256_MAX, reason="DOMAIN_RESPONSE_INVALID"
+    )
+    if chain_id != MAINNET_CHAIN_ID:
+        raise _failure("DOMAIN_BINDING_MISMATCH", "IDENTITY")
+
+    verifying_contract = _normalize_address(
+        data["verifying_contract"], "DOMAIN_RESPONSE_INVALID"
+    )
+    if verifying_contract != MAINNET_AUTH_CONTRACT:
+        raise _failure("DOMAIN_BINDING_MISMATCH", "IDENTITY")
 
 
 def _validate_session_status(
@@ -920,7 +951,7 @@ class FixedRisexFeeReadTransport:
             if bearer_token is not None:
                 raise _failure("ENDPOINT_NOT_ALLOWED", "SAFETY")
             _validate_login_body(body)
-        elif path in {NONCE_PATH, SESSION_KEY_STATUS_PATH}:
+        elif path in {DOMAIN_PATH, NONCE_PATH, SESSION_KEY_STATUS_PATH}:
             if body is not None or bearer_token is not None:
                 raise _failure("ENDPOINT_NOT_ALLOWED", "SAFETY")
         elif path == FEES_PATH:
@@ -1102,6 +1133,14 @@ async def _run_with_dependencies(dependencies: _Dependencies) -> FeeReadReport:
                 raise _failure("SESSION_SIGNER_IDENTITY_MISMATCH", "IDENTITY")
 
         transport = dependencies.transport_factory()
+        observed_endpoints.append(DOMAIN_PATH)
+        domain_observation = await _request_with_transport_retry(
+            transport,
+            "GET",
+            DOMAIN_PATH,
+        )
+        _parse_domain(domain_observation.body)
+
         observed_endpoints.append(SESSION_KEY_STATUS_PATH)
         status_observation = await _request_with_transport_retry(
             transport,
@@ -1486,6 +1525,7 @@ if __name__ == "__main__":
 __all__ = [
     "ALLOWED_ENDPOINTS",
     "BLOCKED",
+    "DOMAIN_PATH",
     "FEES_PATH",
     "FeeReadReport",
     "FixedRisexFeeReadTransport",

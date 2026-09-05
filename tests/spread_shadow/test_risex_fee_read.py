@@ -44,6 +44,17 @@ def session_status_body(**changes: Any) -> dict[str, Any]:
     return envelope(data)
 
 
+def domain_body(**changes: Any) -> dict[str, Any]:
+    data: dict[str, Any] = {
+        "name": fee_read.MAINNET_DOMAIN_NAME,
+        "version": fee_read.MAINNET_DOMAIN_VERSION,
+        "chain_id": fee_read.MAINNET_CHAIN_ID,
+        "verifying_contract": fee_read.MAINNET_AUTH_CONTRACT,
+    }
+    data.update(changes)
+    return envelope(data)
+
+
 def nonce_body(value: str = "0x10") -> dict[str, Any]:
     return envelope({"nonce": value})
 
@@ -210,6 +221,9 @@ def complete_transport() -> FakeTransport:
     nonce_query = (("account", ACCOUNT),)
     return FakeTransport(
         {
+            ("GET", fee_read.DOMAIN_PATH): [
+                observation("GET", fee_read.DOMAIN_PATH, domain_body())
+            ],
             ("GET", fee_read.SESSION_KEY_STATUS_PATH): [
                 observation(
                     "GET",
@@ -259,23 +273,25 @@ async def test_success_binds_account_nonce_login_and_one_caller_owned_fee_read(
     assert report.trial_ends_at is None
     assert report.earned_tier == 1
     assert [call["path"] for call in transport.calls] == [
+        fee_read.DOMAIN_PATH,
         fee_read.SESSION_KEY_STATUS_PATH,
         fee_read.NONCE_PATH,
         fee_read.LOGIN_PATH,
         fee_read.FEES_PATH,
     ]
-    assert transport.calls[0]["query"] == (
+    assert transport.calls[0]["query"] == ()
+    assert transport.calls[1]["query"] == (
         ("account", ACCOUNT),
         ("signer", SESSION_SIGNER),
     )
-    assert transport.calls[1]["query"] == (("account", ACCOUNT),)
-    assert transport.calls[2]["body"] == {
+    assert transport.calls[2]["query"] == (("account", ACCOUNT),)
+    assert transport.calls[3]["body"] == {
         "account": ACCOUNT,
         "nonce": "0x10",
         "deadline": int(NOW) + 300,
         "signature": SIGNATURE,
     }
-    assert transport.calls[3]["bearer_token"] == ACCESS_TOKEN
+    assert transport.calls[4]["bearer_token"] == ACCESS_TOKEN
     assert capability.typed_data == fee_read._login_typed_data(
         ACCOUNT, 0x10, int(NOW) + 300
     )
@@ -318,6 +334,128 @@ def test_login_typed_data_is_exact_and_uses_the_frozen_mainnet_domain() -> None:
     }
 
 
+def test_domain_parser_accepts_official_string_chain_id_wire() -> None:
+    fee_read._parse_domain(domain_body(chain_id=str(fee_read.MAINNET_CHAIN_ID)))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("changes", "expected_class", "expected_reason"),
+    [
+        ({"name": "Other"}, "IDENTITY", "DOMAIN_BINDING_MISMATCH"),
+        ({"version": "2"}, "IDENTITY", "DOMAIN_BINDING_MISMATCH"),
+        ({"chain_id": 4154}, "IDENTITY", "DOMAIN_BINDING_MISMATCH"),
+        ({"chain_id": "4154"}, "IDENTITY", "DOMAIN_BINDING_MISMATCH"),
+        ({"verifying_contract": OTHER_ACCOUNT}, "IDENTITY", "DOMAIN_BINDING_MISMATCH"),
+    ],
+)
+async def test_domain_mismatch_is_terminal_before_owner_login_or_fees(
+    changes: dict[str, Any], expected_class: str, expected_reason: str
+) -> None:
+    transport = complete_transport()
+    transport.responses[("GET", fee_read.DOMAIN_PATH)] = [
+        observation("GET", fee_read.DOMAIN_PATH, domain_body(**changes))
+    ]
+    called = False
+
+    def owner_capability() -> Any:
+        nonlocal called
+        called = True
+        raise AssertionError("owner capability must not be requested")
+
+    deps = replace(
+        dependencies(transport), owner_capability_factory=owner_capability
+    )
+    report = await fee_read._run_with_dependencies(deps)
+
+    assert report.terminal_classification == expected_class
+    assert report.reason == expected_reason
+    assert not called
+    assert [call["path"] for call in transport.calls] == [fee_read.DOMAIN_PATH]
+    assert report.provenance["observed_endpoints"] == [fee_read.DOMAIN_PATH]
+
+
+@pytest.mark.asyncio
+async def test_domain_schema_failure_is_terminal_without_retry_or_owner_access() -> None:
+    transport = complete_transport()
+    invalid = domain_body()
+    del invalid["data"]["verifying_contract"]
+    transport.responses[("GET", fee_read.DOMAIN_PATH)] = [
+        observation("GET", fee_read.DOMAIN_PATH, invalid)
+    ]
+    called = False
+
+    def owner_capability() -> Any:
+        nonlocal called
+        called = True
+        raise AssertionError("owner capability must not be requested")
+
+    report = await fee_read._run_with_dependencies(
+        replace(
+            dependencies(transport), owner_capability_factory=owner_capability
+        )
+    )
+
+    assert report.terminal_classification == "SCHEMA"
+    assert report.reason == "DOMAIN_RESPONSE_INVALID"
+    assert not called
+    assert len(transport.calls) == 1
+    assert transport.calls[0]["path"] == fee_read.DOMAIN_PATH
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [401, 403, 500])
+async def test_domain_http_failure_is_terminal_without_retry_or_owner_access(
+    status: int,
+) -> None:
+    transport = complete_transport()
+    transport.responses[("GET", fee_read.DOMAIN_PATH)] = [
+        observation("GET", fee_read.DOMAIN_PATH, {}, status=status)
+    ]
+    called = False
+
+    def owner_capability() -> Any:
+        nonlocal called
+        called = True
+        raise AssertionError("owner capability must not be requested")
+
+    report = await fee_read._run_with_dependencies(
+        replace(
+            dependencies(transport), owner_capability_factory=owner_capability
+        )
+    )
+
+    assert report.terminal_classification == (
+        "AUTH" if status in {401, 403} else "HTTP"
+    )
+    assert report.reason in {"AUTH_RESPONSE_REJECTED", "HTTP_RESPONSE_REJECTED"}
+    assert not called
+    assert len(transport.calls) == 1
+    assert transport.calls[0]["path"] == fee_read.DOMAIN_PATH
+
+
+@pytest.mark.asyncio
+async def test_domain_transport_failure_gets_only_one_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = complete_transport()
+    domain_key = ("GET", fee_read.DOMAIN_PATH)
+    domain = observation("GET", fee_read.DOMAIN_PATH, domain_body())
+    transport.responses[domain_key] = [asyncio.TimeoutError(), domain]
+    monkeypatch.setattr(fee_read, "_recover_login", lambda _data, _signature: ACCOUNT)
+
+    report = await fee_read._run_with_dependencies(dependencies(transport))
+
+    assert report.status == fee_read.READY
+    assert report.terminal_classification == "COMPLETE"
+    paths = [call["path"] for call in transport.calls]
+    assert paths[:2] == [
+        fee_read.DOMAIN_PATH,
+        fee_read.DOMAIN_PATH,
+    ]
+    assert paths.count(fee_read.DOMAIN_PATH) == 2
+
+
 def test_offline_owner_capability_derives_exact_wallet_signs_and_zeroizes() -> None:
     from eth_account import Account
 
@@ -356,6 +494,7 @@ async def test_session_signer_status_mismatch_is_identity_failure_without_nonce_
     assert report.terminal_classification == "IDENTITY"
     assert report.reason == "IDENTITY_BINDING_MISMATCH"
     assert [call["path"] for call in transport.calls] == [
+        fee_read.DOMAIN_PATH,
         fee_read.SESSION_KEY_STATUS_PATH
     ]
 
@@ -384,6 +523,7 @@ async def test_owner_key_identity_mismatch_stops_before_login() -> None:
     assert report.terminal_classification == "IDENTITY"
     assert report.reason == "OWNER_KEY_IDENTITY_MISMATCH"
     assert [call["path"] for call in transport.calls] == [
+        fee_read.DOMAIN_PATH,
         fee_read.SESSION_KEY_STATUS_PATH,
         fee_read.NONCE_PATH,
     ]
@@ -424,8 +564,12 @@ async def test_second_transport_failure_is_terminal_and_does_not_advance() -> No
 
     assert report.terminal_classification == "TRANSPORT"
     assert report.reason == "TRANSPORT_RETRY_EXHAUSTED"
-    assert len(transport.calls) == 2
-    assert all(call["path"] == fee_read.SESSION_KEY_STATUS_PATH for call in transport.calls)
+    assert len(transport.calls) == 3
+    assert transport.calls[0]["path"] == fee_read.DOMAIN_PATH
+    assert all(
+        call["path"] == fee_read.SESSION_KEY_STATUS_PATH
+        for call in transport.calls[1:]
+    )
 
 
 @pytest.mark.asyncio
@@ -447,7 +591,9 @@ async def test_http_and_auth_failures_are_never_retried(status: int) -> None:
 
     assert report.terminal_classification == ("AUTH" if status in {401, 403} else "HTTP")
     assert report.reason in {"AUTH_RESPONSE_REJECTED", "HTTP_RESPONSE_REJECTED"}
-    assert len(transport.calls) == 1
+    assert len(transport.calls) == 2
+    assert transport.calls[0]["path"] == fee_read.DOMAIN_PATH
+    assert transport.calls[1]["path"] == fee_read.SESSION_KEY_STATUS_PATH
 
 
 @pytest.mark.asyncio
@@ -502,7 +648,9 @@ async def test_inactive_session_key_is_auth_failure_without_retry() -> None:
 
     assert report.terminal_classification == "AUTH"
     assert report.reason == "SESSION_KEY_NOT_ACTIVE"
-    assert len(transport.calls) == 1
+    assert len(transport.calls) == 2
+    assert transport.calls[0]["path"] == fee_read.DOMAIN_PATH
+    assert transport.calls[1]["path"] == fee_read.SESSION_KEY_STATUS_PATH
 
 
 @pytest.mark.asyncio
@@ -522,10 +670,19 @@ async def test_wrong_final_host_is_safety_failure_without_retry() -> None:
 
     assert report.terminal_classification == "SAFETY"
     assert report.reason == "HOST_MISMATCH"
-    assert len(transport.calls) == 1
+    assert len(transport.calls) == 2
+    assert transport.calls[0]["path"] == fee_read.DOMAIN_PATH
+    assert transport.calls[1]["path"] == fee_read.SESSION_KEY_STATUS_PATH
 
 
 def test_allow_list_requires_exact_paths_and_identity_queries() -> None:
+    assert str(
+        fee_read.FixedRisexFeeReadTransport._target("GET", fee_read.DOMAIN_PATH)
+    ) == expected_url("GET", fee_read.DOMAIN_PATH)
+    with pytest.raises(fee_read._FeeReadFailure) as domain_query:
+        fee_read.FixedRisexFeeReadTransport._target(
+            "GET", fee_read.DOMAIN_PATH, (("account", ACCOUNT),)
+        )
     with pytest.raises(fee_read._FeeReadFailure) as wrong_path:
         fee_read.FixedRisexFeeReadTransport._target("GET", "/v1/orders")
     with pytest.raises(fee_read._FeeReadFailure) as missing_account:
@@ -543,7 +700,7 @@ def test_allow_list_requires_exact_paths_and_identity_queries() -> None:
             (("account", ACCOUNT), ("signer", ACCOUNT)),
         )
 
-    for raised in (wrong_path, missing_account, swapped, same_identity):
+    for raised in (domain_query, wrong_path, missing_account, swapped, same_identity):
         assert raised.value.reason == "ENDPOINT_NOT_ALLOWED"
         assert raised.value.failure_class == "SAFETY"
 

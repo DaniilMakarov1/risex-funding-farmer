@@ -44,20 +44,23 @@ After the SS-001K candidate is independently accepted, the bounded Level-B
 read may be run explicitly with no arguments:
 
 ```bash
+python -m pip install -e '.[risex-fee-read]'
 risex-spread-shadow-fee-read
 # or: python -m risex_spread_shadow.risex_fee_read
 ```
 
 The runner reads only the existing owner-only RISEx identity and session-signer
-files under `~/.config/risex-farmer`, checks the exact mainnet identity and
-registered signer through the public readiness endpoint, then asks for the
-owner wallet key through hidden local input. The key is used once to sign the
-official login message and is never persisted, placed in an environment
-variable, passed as an argument, or included in output. The only authenticated
-request is the caller-owned `GET /v1/user/fees` read. Output is sanitized fee
-tier/rate/provenance evidence or one classified terminal failure. No order,
-position, balance, collateral, transfer, withdrawal, deposit, or strategy path
-is available from this entrypoint.
+files under `~/.config/risex-farmer`, validates the fixed official RISEx domain
+first, then checks the exact mainnet identity and registered signer through the
+public readiness endpoint. It then asks for the owner wallet key through hidden
+local input. The key is used once to sign the official login message and is
+never persisted, placed in an environment variable, passed as an argument, or
+included in output. The only authenticated request is the caller-owned
+`GET /v1/user/fees` read. Output is sanitized fee tier/rate/provenance evidence
+or one classified terminal failure. No order, position, balance, collateral,
+transfer, withdrawal, deposit, or strategy path is available from this
+entrypoint. The signing dependency is intentionally opt-in; without
+`.[risex-fee-read]`, the runner fails closed.
 
 ## Legacy commands
 
