@@ -1,20 +1,33 @@
-# SCAN-005 — Terminal CAL-001 checkpoint
+# S1 — Causal quote measurement, offline-only
 
-Status: COMPLETE — FIRST WORKING SCANNER VERIFIED; CURRENT CONFIGURATION STOPPED WITH INSUFFICIENT EVIDENCE.
-Venue: central SPREAD (public RISEx maker SELL / Lighter Standard exact-q taker BUY).
-Objective achieved: operate the accepted simple scanner once and obtain an honest bounded real-public assessment. No implementation, Builder, public observation or HOLDOUT slice is open.
-Exact accepted implementation: `b8e9415e648543fd3435bc683eb649934c9dd0d5`; unchanged level-A suite 3915 passed, 3 skipped is reused.
+Status: AUTHORIZED — one fresh visible Spread Builder; implementation not yet accepted.
+Venue: central SPREAD, RISEx/Lighter public data only.
+Objective: honest timing and exact partial-volume measurement for one immutable hypothetical resting quote, suitable for the subsequent minimal cycle kernel.
+Accepted implementation baseline: `b8e9415e648543fd3435bc683eb649934c9dd0d5`.
+Pre-gate accepted main: `2070c8bce43fbec22e71478591fc2fd4bc46611a`. Builder starts from the exact published main containing this gate; Chief dispatch records its full SHA.
+Verification: Level A, no new public market requests or authenticated/venue-write work.
+Authority: owner "разрешаю все" on 2026-09-05 accepts the supplied S1/S2/S3 public-only plan. Only S1 is active now; Chief independently accepts and publishes its checkpoint before opening S2. Role/model rules remain unchanged.
 
-## Accepted result and evidence
+## Allowed and forbidden scope
 
-- The immutable prospective gate is published commit `ea217604561eeadacc5a217f133a588e1aaa5db5`, with the fixed UTC launch window 2026-09-05 11:26–11:31, exact release, shared root, fees, bounds, thresholds and failure interpretation. It preceded the only market attempt.
-- Run `04NlPq5s8cSalaTngkOpSz6H`: 11:26:24.568403Z to terminal 11:46:24.977264Z, WALL_CLOCK_LIMIT, 89 eligible trades. CAL result is DATA_INSUFFICIENT / INSUFFICIENT; no arm is selected. HOLDOUT has not been run and stays closed.
-- Evidence and local reports: `/Users/daniilmakarov/Desktop/RISEx Spread Shadow/spread-shadow-runs/run-04NlPq5s8cSalaTngkOpSz6H/`. Retain evidence.jsonl, report-1.json, report-2.json, report.txt, physical-audit.json and arithmetic-audit.json. STATUS records exact hashes and quantitative results. The shared root and `.scan-003/CAL-001.claim` are immutable attempt identity; never delete the claim or change roots to retry.
-- Chief independently accepted clean physical integrity, exact release/profile/window/first-stop admission, bounds/permissions, complete strict horizons, arithmetic and two byte-identical canonical reports. The scanner's real source → store → report path works. No blocking implementation defect was observed. Offline reread takes approximately 222 seconds for this 163-MiB evidence file; this is a named performance limit, not justification for speculative infrastructure work.
-- Positive conditional entry scores are descriptive only. Qualification fails on common/filled/paired evidence floors, cluster/timestamp counts, one-minute concentration, effective-level distinctness/collision share, and arm 2's 300-ms median markout. The complete failed-gate list remains in the reports. No failed sample is extended, replaced or retuned.
+- Source identity and separate ingress_received / normalized_ready / decision_ready timestamps; ingress captured immediately after frame receive before parsing or another await.
+- Small explicit one-quote execution model: hypothetical activation, fixed price/quantity, delayed effective cancellation, no overlapping replacement, exact cumulative partial quantity and dedup, and explicit uncertain outcomes.
+- Separate source-book receipt freshness, receipt skew, normalization/decision delay and resting-quote age diagnostics; compatible evidence plumbing only. Preserve historical evaluator semantics and canonical CAL/DG output; old evidence missing new fields cannot be upgraded into new causal evidence.
+- Existing Spread package/tests plus only necessary additive changes to shared public models/adapters for preserving already-available identity. A concrete venue-contract conflict stops and returns to Chief before any broader venue-local implementation.
+- A small independent numerical checker in focused tests, without importing production sizing/VWAP/fee/reconstruction helpers; independently specified adverse FULL/DELTA terminal books.
+- No cycle positions, ledger/PnL engine, CLI campaign, market observation, private/credential/fee-reader/write paths, legacy strategy imports, dependency/framework expansion or governance edits by Builder. No undocumented server expiry or inferred cross-channel event order. Documentation study, if needed, is official-source read-only; market feeds remain closed.
 
-## Next action and boundaries
+## Acceptance and required evidence
 
-Deliver this checkpoint to the owner for review. Stop this configuration under SYSTEM_SPEC sections 0.19–0.20. No further public sample, implementation expansion, paper trader, private/fee-reader access, signing, order preparation, orders or trading follows automatically. A genuinely new research hypothesis or trading-bot stage requires a separate explicit owner decision; positive values in this sparse sample do not open either.
+- Trade before decision-ready and before activation cannot fill; input book update from the same match cannot retroactively make that match a fill. Late older events, missing/stale identity and causal ambiguity are distinguished from proven no-fill.
+- Fills during cancel delay count; first partial may request cancellation, subsequent eligible partials accumulate before its effect; exact remaining quantity cannot go negative or be reset on book updates. Duplicate volume is consumed at most once; conflicting duplicate or recovery transition cannot produce false positive or false clean no-fill.
+- Explicit deterministic ordering/equal-time boundary rules; activation/cancel delays are hypothetical assumptions. Use a later-block watermark filter only to the extent official/retained venue evidence establishes its semantics; never claim actual order activation.
+- Independent checker recomputes exact common-step quantity, level notional, fees, entry edge and per-episode markout, including adverse arithmetic cases. A few FULL/DELTA chains have independently specified end state.
+- Focused/adverse regressions for distinct risks and one final clean isolated Python 3.11 full suite on final candidate SHA, with dependency/import/compile, private/write-surface, diff/scope and clean Git evidence. Do not rerun full historical CAL replay without a specific compatibility risk.
+- Before edits Builder reports root/branch/HEAD/status. Final report supplies exact SHA, changed files, tests, identity/causal evidence and limits. Chief reviews independently; Builder never self-accepts or integrates/pushes main.
 
-No fresh Builder is needed. Any later specifically authorized blocking defect must use a fresh visible GPT-5.6 Luna `max` Builder from exact accepted main, with Chief review and integration. Chief never writes implementation code. Historical detail remains in Git, not new governance/history files.
+## Stop and next action
+
+Use one fresh visible GPT-5.6 Luna max Builder on `codex/spread-s1-causal-quote` in a separate worktree from exact gate main. Bounded fixes may stay on that candidate until formal REJECT; after REJECT a fresh session/branch is mandatory. Stop for required scope expansion, unsupported venue semantics or non-convergence. After acceptance Chief publishes checkpoint; only then may separately bounded S2 begin under the owner's authorization. No market launch follows S1.
+
+Historical CAL-001 remains DATA_INSUFFICIENT / INSUFFICIENT and HOLDOUT remains closed. Preserve `.scan-003/CAL-001.claim` and every evidence/report/audit file under `spread-shadow-runs/run-04NlPq5s8cSalaTngkOpSz6H/`; hashes and historical result remain in STATUS/Git.
