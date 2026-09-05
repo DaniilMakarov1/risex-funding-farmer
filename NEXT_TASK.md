@@ -1,6 +1,6 @@
 # SCAN-004 — Chief Handoff and Prospective Readiness Gate
 
-Status: CHECKPOINT / NEW CHIEF READINESS ONLY. No Builder slice or market observation is open.
+Status: READINESS ACCEPTED / PROSPECTIVE OPERATIONAL GATE PENDING. No Builder slice or market observation is open.
 
 Venue: central SPREAD (RISEx maker / Lighter Standard exact-q taker hedge).
 Objective: take over the accepted simple scanner, independently decide whether its first bounded public calibration can be opened, and avoid further infrastructure expansion.
@@ -19,3 +19,15 @@ Allowed now: read-only review and Chief-owned updates to the five governing file
 Forbidden: public sampling before the separately published gate; private/credential/fee-reader access; signing/orders/trading; paper trader; other repositories; dashboards/services/frameworks; changing thresholds or historical results; retrying stages via another store root or deleting claims.
 
 Acceptance/evidence: concise readiness verdict with exact SHA, named residual limits and the next concrete action. A public-data screen cannot establish real queue position, executable PnL, full-cycle profitability or cross-regime reproducibility. Stop the current configuration honestly on failed economics or insufficient measurability. No positive or negative current market result exists at this checkpoint.
+
+## SCAN-004 independent readiness decision — 2026-09-05
+
+Verdict: READY TO FREEZE A SEPARATE OPERATIONAL GATE; NOT OPEN FOR OBSERVATION. No code correction is justified by this review. The published handoff `ed5910b923707588e2b6d09e31d4508f9ce17b74` is clean and differs from accepted implementation only in STATUS/NEXT_TASK/README. All five governing files were read in full. Reuse the unchanged-source acceptance evidence above.
+
+- Exact implementation for both stages: `b8e9415e648543fd3435bc683eb649934c9dd0d5`. Its computed policy fingerprint is `4bcc87dac8498b5280eb084e0351fd4be5fb45d898be108a1f6c88bee5a85734`. Offline inspection loaded this task's own source, and release validation correctly rejected the later governance HEAD. An exact clean implementation checkout must still be prepared and independently validated before launch.
+- Single designated durable store root for the future gate: `/Users/daniilmakarov/Desktop/RISEx Spread Shadow/spread-shadow-runs`. At review it does not exist; neither `.scan-003/CAL-001.claim` nor `.scan-003/HOLDOUT-001.claim` exists there. No stage was reserved. Both stages must retain this same absolute root; it cannot be replaced to retry. Available target-filesystem space was about 514 GiB; recheck at launch with at least 24 GiB free and owner-only storage.
+- Reviewed CLI → release validation → durable create-once claim → fixed observer/feed/store → bounded offline evaluation. Fixed profile, recorded fee provenance, disabled material-fill stop, 250-trade/1200-second first stop, 1,000,000-record/4-GiB failure caps, pending-horizon-only drain, and CAL/HOLDOUT release/reference separation agree with sections 0.19–0.20. Claims are retained on failed/missed attempts. Same-root use and published-window discipline remain Chief operational responsibilities.
+- The accepted producer/store positive/adverse/gap tests are fixtures, not market evidence. The evidence floors are logically compatible with the bounds, but 250 trades need not produce 50 dependence units or 20 clean paired units. Filled units must occupy at least four one-minute buckets and at least two five-minute buckets; an eligible-trade stop before 300 seconds necessarily fails concentration. Identity availability, distinct wider levels and complete delayed hedges remain unmeasured. No threshold, stop or interval may be adjusted to overcome these limitations.
+- No active scanner/Python process was found; the completed SCAN-003 Builder's latest turn is completed and its task is not loaded. No fresh Builder is needed. `.codex/agents/builder.toml` specifies `gpt-5.6-luna` / `max`; any future authorized defect slice still requires a fresh visible task explicitly using those settings.
+
+Next concrete action, separately from handoff acceptance: prepare the exact release checkout, then commit and publish the CAL-001 prospective operational gate with a future UTC launch window, the root and fingerprint above, all unchanged parameters/stops, and terminal failure interpretation. This readiness record supplies no launch window and makes no market request. HOLDOUT remains closed until a passing CAL report and selected arm are committed and published. Public entry edge is conditional and does not establish real queue position, executable PnL, full-cycle profit or cross-regime reproducibility.
