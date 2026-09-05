@@ -2048,6 +2048,33 @@ class CycleKernel:
             raise RuntimeError("no cycle has been admitted")
         return result
 
+    def retained_results(
+        self,
+        scenario: CycleScenario = CycleScenario.PRIMARY,
+        *,
+        include_active: bool = True,
+    ) -> tuple[CycleResult, ...]:
+        """Return refreshed snapshots for every retained cycle in one lane.
+
+        S3 uses this read-only view after all trailing evidence has been
+        admitted.  Rebuilding from the mutable retained cycles is essential:
+        a later identity conflict can invalidate an earlier terminal result,
+        so a result captured at the first local finish is not authoritative.
+        """
+
+        lane = self._lane(scenario)
+        results = [
+            _result(
+                cycle,
+                terminal=cycle.phase
+                in {_Phase.COMPLETE, _Phase.ABORTED, _Phase.UNRESOLVED},
+            )
+            for cycle in lane.terminal_cycles
+        ]
+        if include_active and lane.active is not None:
+            results.append(_result(lane.active))
+        return tuple(results)
+
     def run(
         self,
         quote_version: QuoteVersion,
