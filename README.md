@@ -38,10 +38,44 @@ The legacy benchmark retains the `risex-farmer` entrypoint documented below. It 
 The active contour uses the separate `risex-spread-shadow` entrypoint. It remains
 public-only and does not import the opt-in authenticated fee boundary below.
 
+### Fixed Spread scanner
+
+`scan` is the fixed CAL-001/HOLDOUT-001 route; `scan-report` evaluates saved
+evidence offline. Its profile is BTC, RISEx sell / Lighter buy, $100, nominal
+1/2 bps, recorded RISEx maker fee 1 bps and Lighter Standard taker fee 0 bps,
+with exact-q hedges at 0/300/500/1000 ms. Legacy `smoke`/`report` commands do
+not implement this fixed admission contract.
+
+Offline usage (no network):
+
+```bash
+risex-spread-shadow scan-report /absolute/run/evidence.jsonl --format table
+risex-spread-shadow scan-report /absolute/holdout/evidence.jsonl --cal-report /absolute/cal/evidence.jsonl --format json
+risex-spread-shadow scan --help
+```
+
+The public command requires `--stage`, `--accepted-release` (full Git SHA),
+`--window-start-utc`, `--window-end-utc`, and the Chief-recorded `--store-root`.
+HOLDOUT also requires `--cal-report`. The window permits starting the sample;
+collection stops at the first fixed limit and then drains pending horizons.
+The loaded source checkout must be clean and exactly match the accepted release.
+Use the same release and absolute store root for both stages. The create-once
+`.scan-003/<stage>.claim` is retained on failed/missed attempts; never delete it
+or change roots to retry. CAL/HOLDOUT remain closed until the Chief publishes
+their prospective operational gates in NEXT_TASK.md.
+
+The report distinguishes `POSITIVE`, `NEGATIVE`, `NOT_CONFIRMED` and
+`INSUFFICIENT`, while fixture evidence remains `FIXTURE_ONLY`. CAL passing is
+provisional; only two passing stages can yield the public candidate label.
+Sums, means and tails are conditional dependence-unit entry scores, not
+executable PnL, profit per hour or full-cycle profitability. At the implementation
+checkpoint no CAL/HOLDOUT market observation exists.
+
 ### Opt-in RISEx owner-fee read
 
-After the SS-001K candidate is independently accepted, the bounded Level-B
-read may be run explicitly with no arguments:
+This is a historical interface, currently quarantined for separate audited
+no-echo/partial-body defects. It must not be invoked during scanner work.
+The scanner uses recorded SS-001Q fee provenance. Historical invocation:
 
 ```bash
 python -m pip install -e '.[risex-fee-read]'
