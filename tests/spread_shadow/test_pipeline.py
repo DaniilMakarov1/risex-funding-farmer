@@ -1878,6 +1878,330 @@ async def test_risex_trade_channel_with_block_number_is_not_book_recovery() -> N
     await exercise()
 
 
+@pytest.mark.asyncio
+async def test_risex_wire_metadata_survives_feed_chain_and_causal_block_fence(
+    tmp_path: Path,
+) -> None:
+    from risex_farmer.exchanges.risex import RisexAdapter
+    from risex_spread_shadow import (
+        BookRevisionEncoder,
+        CausalEvent,
+        CausalOutcome,
+        CausalRestingQuote,
+        CausalUncertainty,
+        HypotheticalBlockWatermark,
+        measure_causal_quote,
+    )
+
+    wire_pair = MarketPair(
+        "BTC",
+        market(Venue.RISEX, "BTC"),
+        market(Venue.LIGHTER, "BTC"),
+    )
+    risex = RisexAdapter(None)
+    risex._market_ids = {"BTC": "1"}
+    risex._symbols_by_id = {"1": "BTC"}
+    risex._raw_markets = {
+        "BTC": {"config": {"step_size": "1", "step_price": "1"}}
+    }
+
+    class FakeLighter:
+        def market_id(self, _symbol):
+            return 2
+
+    runner = PublicFeedRunner(
+        None,
+        (wire_pair,),
+        IngressQueue(16),
+        config=config(),
+        risex_adapter=risex,
+        lighter_adapter=FakeLighter(),
+    )
+    wire_trade_maker = "0x" + "11" * 24
+    wire_trade_taker = "0x" + "22" * 24
+    wire_trade_id = f"{wire_trade_maker}-{wire_trade_taker}"
+    wire_tx = "0x" + "aa" * 32
+    worker_timestamp = int(NOW.timestamp() * 1_000_000_000)
+
+    runner.begin_connection(Venue.RISEX, "r")
+    await runner.ingest_risex_payload(
+        {
+            "channel": "orderbook",
+            "type": "snapshot",
+            "market_id": "1",
+            "tx_hash": wire_tx,
+            "block_number": 700,
+            "log_index": 2,
+            "worker_timestamp": worker_timestamp,
+            "data": {
+                "market_id": 1,
+                "bids": [{"price": "99", "quantity": "5"}],
+                "asks": [{"price": "101", "quantity": "5"}],
+            },
+        },
+        received_at=NOW,
+        ingress_received_monotonic_ns=90,
+        normalized_ready_monotonic_ns=91,
+    )
+    await runner.ingest_risex_payload(
+        {
+            "channel": "trades",
+            "type": "update",
+            "market_id": "1",
+            "tx_hash": wire_tx,
+            "block_number": 700,
+            "log_index": 3,
+            "worker_timestamp": worker_timestamp,
+            "data": {
+                "id": wire_trade_id,
+                "maker_order_id": wire_trade_maker,
+                "taker_order_id": wire_trade_taker,
+                "maker": "0x" + "33" * 32,
+                "taker": "0x" + "44" * 32,
+                "maker_side": 0,
+                "price": "98",
+                "size": "1",
+            },
+        },
+        received_at=NOW,
+        ingress_received_monotonic_ns=120,
+        normalized_ready_monotonic_ns=121,
+    )
+
+    book_item = await runner.ingress.next_item()
+    trade_item = await runner.ingress.next_item()
+    assert isinstance(book_item, FeedBookEvent)
+    assert isinstance(trade_item, FeedTradeEvent)
+    assert book_item.book.tx_hash == wire_tx
+    assert book_item.book.block_number == 700
+    assert book_item.book.log_index == 2
+    assert book_item.book.worker_timestamp == worker_timestamp
+    assert trade_item.trade.trade_event_key == f"RISEX|BTC|{wire_trade_id}"
+    assert trade_item.trade.source_trade_id == wire_trade_id
+    assert trade_item.trade.maker_order_id == wire_trade_maker
+    assert trade_item.trade.taker_order_id == wire_trade_taker
+    assert trade_item.trade.tx_hash == wire_tx
+    assert trade_item.trade.block_number == 700
+    assert trade_item.trade.log_index == 3
+    assert trade_item.trade.worker_timestamp == worker_timestamp
+
+    encoded_book = BookRevisionEncoder().encode(book_item.book, source_kind="SNAPSHOT")
+    assert encoded_book["tx_hash"] == wire_tx
+    assert encoded_book["block_number"] == 700
+    assert encoded_book["log_index"] == 2
+    assert encoded_book["worker_timestamp"] == worker_timestamp
+
+    store = AppendOnlyEvidenceStore.create(
+        tmp_path,
+        metadata={"source_commit": "fixture", "evidence_mode": "FIXTURE"},
+    )
+    observer = SpreadObserver(config(), (wire_pair,), store)
+    trade_record = observer._trade_record(trade_item)
+    store.close()
+    assert trade_record["source_trade_id"] == wire_trade_id
+    assert trade_record["maker_order_id"] == wire_trade_maker
+    assert trade_record["taker_order_id"] == wire_trade_taker
+    assert trade_record["tx_hash"] == wire_tx
+    assert trade_record["block_number"] == 700
+    assert trade_record["log_index"] == 3
+    assert trade_record["worker_timestamp"] == worker_timestamp
+
+    lighter_book = replace(
+        evidence_book(Venue.LIGHTER, received=90, session="l"),
+        ingress_received_monotonic_ns=90,
+        normalized_ready_monotonic_ns=91,
+    )
+    quote = CausalRestingQuote(
+        quote_id="wire-quote",
+        canonical_market="BTC",
+        maker_side=Side.BUY,
+        price=D("100"),
+        quantity=D("1"),
+        stream_session_id="r",
+        recovery_generation=0,
+        decision_ready_monotonic_ns=100,
+        source_book=book_item.book,
+        hedge_source_book=lighter_book,
+        tick_size=D("1"),
+        block_watermark=HypotheticalBlockWatermark(
+            700, "RETAINED_RISEX_BLOCK_WITNESS"
+        ),
+    )
+    causal_result = measure_causal_quote(
+        quote,
+        (
+            CausalEvent.from_book(book_item.book),
+            CausalEvent.from_trade(trade_item.trade),
+        ),
+    )
+    assert causal_result.outcome is CausalOutcome.CAUSAL_UNCERTAIN
+    assert causal_result.observed_filled_quantity == D("0")
+    assert CausalUncertainty.WATERMARK_BOUNDARY_AMBIGUOUS in causal_result.uncertainty_reasons
+
+
+@pytest.mark.asyncio
+async def test_official_risex_wire_book_fence_blocks_older_trade_without_cross_channel_cursor() -> None:
+    from risex_farmer.exchanges.risex import RisexAdapter
+    from risex_spread_shadow import (
+        CausalEvent,
+        CausalOutcome,
+        CausalRestingQuote,
+        CausalUncertainty,
+        measure_causal_quote,
+    )
+
+    risex = RisexAdapter(None)
+    risex._market_ids = {"BTC/USDC": "1"}
+    risex._symbols_by_id = {"1": "BTC/USDC"}
+    risex._raw_markets = {
+        "BTC/USDC": {"config": {"step_size": "1", "step_price": "1"}}
+    }
+
+    class FakeLighter:
+        def market_id(self, _symbol):
+            return 2
+
+    runner = PublicFeedRunner(
+        None,
+        (PAIR,),
+        IngressQueue(16),
+        config=config(),
+        risex_adapter=risex,
+        lighter_adapter=FakeLighter(),
+    )
+    runner.begin_connection(Venue.RISEX, "risex-1")
+    await runner.ingest_risex_payload(
+        {
+            "channel": "orderbook",
+            "type": "snapshot",
+            "market_id": "1",
+            "block_number": 1001,
+            "log_index": 2,
+            "worker_timestamp": "1800000000000000000",
+            "data": {
+                "market_id": 1,
+                "bids": [{"price": "99", "quantity": "5"}],
+                "asks": [{"price": "101", "quantity": "5"}],
+            },
+        },
+        received_at=NOW,
+        ingress_received_monotonic_ns=90,
+        normalized_ready_monotonic_ns=91,
+    )
+    maker_order_id = "0x" + "11" * 24
+    taker_order_id = "0x" + "22" * 24
+    source_trade_id = f"{maker_order_id}-{taker_order_id}"
+    trade_event_payload = {
+        "channel": "trades",
+        "type": "update",
+        "market_id": "1",
+        "tx_hash": "0x" + "aa" * 32,
+        "block_number": 999,
+        "log_index": 3,
+        "worker_timestamp": "1800000000000000001",
+        "data": {
+            "id": source_trade_id,
+            "maker_order_id": maker_order_id,
+            "taker_order_id": taker_order_id,
+            "maker": "0x" + "33" * 20,
+            "taker": "0x" + "44" * 20,
+            "maker_side": 0,
+            "price": "99",
+            "size": "1",
+        },
+    }
+    await runner.ingest_risex_payload(
+        trade_event_payload,
+        received_at=NOW,
+        ingress_received_monotonic_ns=120,
+        normalized_ready_monotonic_ns=121,
+    )
+
+    book_item = await runner.ingress.next_item()
+    trade_item = await runner.ingress.next_item()
+    assert isinstance(book_item, FeedBookEvent)
+    assert isinstance(trade_item, FeedTradeEvent)
+    assert trade_item.trade.trade_event_key == f"RISEX|BTC/USDC|{source_trade_id}"
+    assert trade_item.trade.block_number == 999
+    assert trade_item.trade.log_index == 3
+    assert trade_item.trade.worker_timestamp == "1800000000000000001"
+
+    lighter_book = replace(
+        evidence_book(Venue.LIGHTER, received=90, session="lighter-1"),
+        ingress_received_monotonic_ns=80,
+        normalized_ready_monotonic_ns=81,
+    )
+    quote = CausalRestingQuote(
+        quote_id="official-wire-fence",
+        canonical_market="BTC",
+        maker_side=Side.BUY,
+        price=D("100"),
+        quantity=D("1"),
+        stream_session_id="risex-1",
+        recovery_generation=0,
+        decision_ready_monotonic_ns=100,
+        source_book=book_item.book,
+        hedge_source_book=lighter_book,
+        tick_size=D("1"),
+    )
+    trade_event = CausalEvent.from_trade(trade_item.trade)
+    assert trade_event.match_id is None
+    assert trade_event.source_identity_complete
+    assert trade_event.source_identity.venue_symbol == "BTC/USDC"
+    result = measure_causal_quote(
+        quote,
+        (CausalEvent.from_book(book_item.book), trade_event),
+    )
+    assert result.outcome is CausalOutcome.CAUSAL_UNCERTAIN
+    assert result.observed_filled_quantity == D("0")
+    assert result.filled_quantity == D("0")
+    assert CausalUncertainty.WATERMARK_BOUNDARY_AMBIGUOUS in result.uncertainty_reasons
+
+    wrong_market_trade = replace(
+        trade_item.trade,
+        trade_event_key=f"RISEX|ETH/USDC|{source_trade_id}",
+    )
+    wrong_market_event = CausalEvent.from_trade(wrong_market_trade)
+    assert not wrong_market_event.source_identity_complete
+    wrong_market_result = measure_causal_quote(
+        quote,
+        (CausalEvent.from_book(book_item.book), wrong_market_event),
+    )
+    assert wrong_market_result.outcome is CausalOutcome.CAUSAL_UNCERTAIN
+    assert wrong_market_result.filled_quantity == D("0")
+    assert CausalUncertainty.MISSING_SOURCE_IDENTITY in wrong_market_result.uncertainty_reasons
+
+
+def test_quote_decision_timestamp_is_sampled_after_production_calculation() -> None:
+    from risex_spread_shadow import SpreadDirection
+
+    observer = SpreadObserver(
+        config(),
+        (PAIR,),
+        SimpleNamespace(run_id="decision-boundary-fixture"),
+        monotonic_ns=lambda: 12345,
+        directions=(SpreadDirection.RISEX_BUY_LIGHTER_SELL,),
+    )
+    risex_book = evidence_book(Venue.RISEX, received=10, session="r")
+    lighter_book = evidence_book(Venue.LIGHTER, received=10, session="l")
+    observer._current_books[(Venue.RISEX, "BTC")] = risex_book
+    observer._current_books[(Venue.LIGHTER, "BTC")] = lighter_book
+
+    records, versions = observer._versions_for_book(
+        FeedBookEvent(risex_book, PAIR, "SNAPSHOT", "fixture")
+    )
+
+    assert len(versions) == 1
+    version = next(iter(versions.values()))
+    assert version.decision_ready_monotonic_ns == 12345
+    active_record = next(
+        record for record in records if record["quote_version_id"] == version.version_id
+    )
+    assert "ingress_received_monotonic_ns" not in active_record
+    assert "normalized_ready_monotonic_ns" not in active_record
+    assert active_record["decision_ready_monotonic_ns"] == 12345
+
+
 def test_public_text_payload_parser_preserves_decimal_wire_values() -> None:
     from types import SimpleNamespace
 

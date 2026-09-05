@@ -118,6 +118,10 @@ class OrderBook:
     asks: tuple[BookLevel, ...]
     observed_at: datetime
     sequence: int | None = None
+    tx_hash: str | None = None
+    block_number: int | None = None
+    log_index: int | None = None
+    worker_timestamp: str | int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +134,10 @@ class BookDelta:
     sequence: int | None = None
     previous_sequence: int | None = None
     checksum: int | None = None
+    tx_hash: str | None = None
+    block_number: int | None = None
+    log_index: int | None = None
+    worker_timestamp: str | int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,6 +271,15 @@ class TradeEvidence:
     risex_funding_eligibility_assumption_used: bool = False
     risex_funding_estimate_assumption_used: bool = False
     paper_assumption_used: bool = False
+    source_trade_id: str | None = None
+    maker_order_id: str | None = None
+    taker_order_id: str | None = None
+    maker: str | None = None
+    taker: str | None = None
+    tx_hash: str | None = None
+    block_number: int | None = None
+    log_index: int | None = None
+    worker_timestamp: str | int | None = None
 
 
 @dataclass(frozen=True, slots=True)

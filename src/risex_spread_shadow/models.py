@@ -37,6 +37,25 @@ def _non_negative_int(value: int, name: str) -> int:
     return value
 
 
+def _optional_non_negative_int(value: int | None, name: str) -> None:
+    if value is not None:
+        _non_negative_int(value, name)
+
+
+def _optional_text(value: str | None, name: str) -> None:
+    if value is not None and (not isinstance(value, str) or not value):
+        raise ValueError(f"{name} must be a non-empty string when supplied")
+
+
+def _optional_wire_timestamp(value: str | int | None, name: str) -> None:
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise TypeError(f"{name} must be a string or integer when supplied")
+    if isinstance(value, int) and value < 0:
+        raise ValueError(f"{name} must be non-negative when supplied")
+
+
 def _session(value: str | int, name: str = "stream_session_id") -> str | int:
     if isinstance(value, bool) or not isinstance(value, (str, int)):
         raise TypeError(f"{name} must be str or int")
@@ -573,6 +592,9 @@ class QuoteVersion:
     lighter_book_revision: int | None = None
     risex_book_revision_id: str | None = None
     lighter_book_revision_id: str | None = None
+    ingress_received_monotonic_ns: int | None = None
+    normalized_ready_monotonic_ns: int | None = None
+    decision_ready_monotonic_ns: int | None = None
 
     def __post_init__(self) -> None:
         if not self.version_id:
@@ -601,6 +623,12 @@ class QuoteVersion:
         ):
             if value is not None and (not isinstance(value, str) or not value):
                 raise ValueError(f"{name} must be a non-empty string when supplied")
+        _validate_phase_timestamps(
+            self.ingress_received_monotonic_ns,
+            self.normalized_ready_monotonic_ns,
+            self.decision_ready_monotonic_ns,
+            allow_decision_without_normalized=True,
+        )
 
     @property
     def canonical_market(self) -> str:
@@ -626,6 +654,86 @@ class QuoteVersion:
     def is_active(self) -> bool:
         return self.quote.is_active and self.quote.is_economic
 
+    @property
+    def causal_timing(self) -> CausalTiming | None:
+        if self.ingress_received_monotonic_ns is None:
+            return None
+        return CausalTiming(
+            ingress_received_monotonic_ns=self.ingress_received_monotonic_ns,
+            normalized_ready_monotonic_ns=self.normalized_ready_monotonic_ns,
+            decision_ready_monotonic_ns=self.decision_ready_monotonic_ns,
+        )
+
+
+def _validate_phase_timestamps(
+    ingress_received_monotonic_ns: int | None,
+    normalized_ready_monotonic_ns: int | None,
+    decision_ready_monotonic_ns: int | None,
+    *,
+    allow_decision_without_normalized: bool = False,
+) -> None:
+    if normalized_ready_monotonic_ns is not None and ingress_received_monotonic_ns is None:
+        raise ValueError("normalized_ready_monotonic_ns requires ingress_received_monotonic_ns")
+    if (
+        decision_ready_monotonic_ns is not None
+        and normalized_ready_monotonic_ns is None
+        and not allow_decision_without_normalized
+    ):
+        raise ValueError("decision_ready_monotonic_ns requires normalized_ready_monotonic_ns")
+    _optional_non_negative_int(ingress_received_monotonic_ns, "ingress_received_monotonic_ns")
+    _optional_non_negative_int(normalized_ready_monotonic_ns, "normalized_ready_monotonic_ns")
+    _optional_non_negative_int(decision_ready_monotonic_ns, "decision_ready_monotonic_ns")
+    if (
+        ingress_received_monotonic_ns is not None
+        and normalized_ready_monotonic_ns is not None
+        and normalized_ready_monotonic_ns < ingress_received_monotonic_ns
+    ):
+        raise ValueError("normalized_ready_monotonic_ns must not precede ingress receipt")
+    if (
+        normalized_ready_monotonic_ns is not None
+        and decision_ready_monotonic_ns is not None
+        and decision_ready_monotonic_ns < normalized_ready_monotonic_ns
+    ):
+        raise ValueError("decision_ready_monotonic_ns must not precede normalized readiness")
+
+
+@dataclass(frozen=True, slots=True)
+class CausalTiming:
+    """Local monotonic phases retained for causal, offline-only evidence.
+
+    ``received_monotonic_ns`` on historical evidence remains the accepted
+    receipt-order field.  These optional phase fields are deliberately
+    additive: a historical row with no ingress phase is not upgraded into
+    causal evidence by a fallback to its old timestamp.
+    """
+
+    ingress_received_monotonic_ns: int
+    normalized_ready_monotonic_ns: int | None = None
+    decision_ready_monotonic_ns: int | None = None
+
+    def __post_init__(self) -> None:
+        _validate_phase_timestamps(
+            self.ingress_received_monotonic_ns,
+            self.normalized_ready_monotonic_ns,
+            self.decision_ready_monotonic_ns,
+        )
+
+    @property
+    def normalization_delay_ns(self) -> int | None:
+        if self.normalized_ready_monotonic_ns is None:
+            return None
+        return self.normalized_ready_monotonic_ns - self.ingress_received_monotonic_ns
+
+    @property
+    def decision_delay_ns(self) -> int | None:
+        if self.decision_ready_monotonic_ns is None or self.normalized_ready_monotonic_ns is None:
+            return None
+        return self.decision_ready_monotonic_ns - self.normalized_ready_monotonic_ns
+
+    @property
+    def is_decision_ready(self) -> bool:
+        return self.decision_ready_monotonic_ns is not None
+
 
 @dataclass(frozen=True, slots=True)
 class TradeEvidence:
@@ -643,6 +751,19 @@ class TradeEvidence:
     recovery_generation: int
     exchange_event_utc: datetime | None = None
     exchange_event_time_provenance: str | None = None
+    ingress_received_monotonic_ns: int | None = None
+    normalized_ready_monotonic_ns: int | None = None
+    decision_ready_monotonic_ns: int | None = None
+    source_trade_id: str | None = None
+    maker_order_id: str | None = None
+    taker_order_id: str | None = None
+    maker: str | None = None
+    taker: str | None = None
+    tx_hash: str | None = None
+    block_number: int | None = None
+    log_index: int | None = None
+    worker_timestamp: str | int | None = None
+    venue_symbol: str | None = None
 
     def __post_init__(self) -> None:
         if not self.trade_event_key:
@@ -666,6 +787,24 @@ class TradeEvidence:
         _non_negative_int(self.received_monotonic_ns, "received_monotonic_ns")
         _session(self.stream_session_id)
         _non_negative_int(self.recovery_generation, "recovery_generation")
+        _validate_phase_timestamps(
+            self.ingress_received_monotonic_ns,
+            self.normalized_ready_monotonic_ns,
+            self.decision_ready_monotonic_ns,
+        )
+        for value, name in (
+            (self.source_trade_id, "source_trade_id"),
+            (self.maker_order_id, "maker_order_id"),
+            (self.taker_order_id, "taker_order_id"),
+            (self.maker, "maker"),
+            (self.taker, "taker"),
+            (self.tx_hash, "tx_hash"),
+        ):
+            _optional_text(value, name)
+        _optional_non_negative_int(self.block_number, "block_number")
+        _optional_non_negative_int(self.log_index, "log_index")
+        _optional_wire_timestamp(self.worker_timestamp, "worker_timestamp")
+        _optional_text(self.venue_symbol, "venue_symbol")
 
     @property
     def received_at(self) -> datetime:
@@ -682,6 +821,20 @@ class TradeEvidence:
     @property
     def trade_received_monotonic_ns(self) -> int:
         return self.received_monotonic_ns
+
+    @property
+    def causal_timing(self) -> CausalTiming | None:
+        if self.ingress_received_monotonic_ns is None:
+            return None
+        return CausalTiming(
+            ingress_received_monotonic_ns=self.ingress_received_monotonic_ns,
+            normalized_ready_monotonic_ns=self.normalized_ready_monotonic_ns,
+            decision_ready_monotonic_ns=self.decision_ready_monotonic_ns,
+        )
+
+    @property
+    def has_causal_timing(self) -> bool:
+        return self.causal_timing is not None
 
 
 @dataclass(frozen=True, slots=True)
@@ -702,6 +855,13 @@ class BookEvidence:
     checksum_valid: bool = True
     received_utc: datetime | None = None
     fresh: bool = True
+    ingress_received_monotonic_ns: int | None = None
+    normalized_ready_monotonic_ns: int | None = None
+    decision_ready_monotonic_ns: int | None = None
+    tx_hash: str | None = None
+    block_number: int | None = None
+    log_index: int | None = None
+    worker_timestamp: str | int | None = None
 
     def __post_init__(self) -> None:
         venue = self.venue if isinstance(self.venue, Venue) else Venue(self.venue)
@@ -721,6 +881,15 @@ class BookEvidence:
         if not isinstance(self.fresh, bool):
             raise TypeError("fresh must be bool")
         _utc(self.received_utc, "received_utc")
+        _validate_phase_timestamps(
+            self.ingress_received_monotonic_ns,
+            self.normalized_ready_monotonic_ns,
+            self.decision_ready_monotonic_ns,
+        )
+        _optional_text(self.tx_hash, "tx_hash")
+        _optional_non_negative_int(self.block_number, "block_number")
+        _optional_non_negative_int(self.log_index, "log_index")
+        _optional_wire_timestamp(self.worker_timestamp, "worker_timestamp")
 
     @property
     def book_received_monotonic_ns(self) -> int:
@@ -747,6 +916,20 @@ class BookEvidence:
     @property
     def is_sequence_healthy(self) -> bool:
         return self.sequence_valid and self.checksum_valid
+
+    @property
+    def causal_timing(self) -> CausalTiming | None:
+        if self.ingress_received_monotonic_ns is None:
+            return None
+        return CausalTiming(
+            ingress_received_monotonic_ns=self.ingress_received_monotonic_ns,
+            normalized_ready_monotonic_ns=self.normalized_ready_monotonic_ns,
+            decision_ready_monotonic_ns=self.decision_ready_monotonic_ns,
+        )
+
+    @property
+    def has_causal_timing(self) -> bool:
+        return self.causal_timing is not None
 
 
 LighterBookEvidence = BookEvidence
@@ -1287,6 +1470,7 @@ __all__ = [
     "BookEvidence",
     "BookLevel",
     "CanonicalMarket",
+    "CausalTiming",
     "DataGapEvidence",
     "EntryViabilityEpisode",
     "EntryViabilityOutcome",

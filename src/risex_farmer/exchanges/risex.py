@@ -292,6 +292,10 @@ class RisexAdapter(PublicAdapter):
             return OrderBook(
                 book.venue, book.canonical_market, book.bids, book.asks,
                 book.observed_at, cursor,
+                tx_hash=message.get("tx_hash"),
+                block_number=message["block_number"],
+                log_index=message["log_index"],
+                worker_timestamp=message["worker_timestamp"],
             )
 
         def levels(name: str) -> tuple[BookLevel, ...]:
@@ -314,6 +318,10 @@ class RisexAdapter(PublicAdapter):
             observed_at,
             sequence=cursor,
             checksum=int(message["checksum"]),
+            tx_hash=message.get("tx_hash"),
+            block_number=message["block_number"],
+            log_index=message["log_index"],
+            worker_timestamp=message["worker_timestamp"],
         )
 
     def normalize_trade(
@@ -379,6 +387,17 @@ class RisexAdapter(PublicAdapter):
                 "RISEX_CONTRACT_AND_QUANTITY_UNITS_PAPER_ASSUMPTION",
                 *(() if "block_timestamp" in outer else ("RISEX_WORKER_TIMESTAMP_USED_AS_SERVER_EVENT_TIME",)),
             ),
+            source_trade_id=(
+                trade_id if isinstance(trade_id, str) and trade_id else None
+            ),
+            maker_order_id=trade.get("maker_order_id"),
+            taker_order_id=trade.get("taker_order_id"),
+            maker=trade.get("maker"),
+            taker=trade.get("taker"),
+            tx_hash=outer.get("tx_hash"),
+            block_number=outer.get("block_number"),
+            log_index=outer.get("log_index"),
+            worker_timestamp=outer.get("worker_timestamp"),
         )
 
     def unknown_funding_quote(

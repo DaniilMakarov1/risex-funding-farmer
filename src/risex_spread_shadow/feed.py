@@ -685,13 +685,30 @@ class PublicFeedRunner:
         source_kind: str,
         checksum: int | str | None,
         checksum_validation: str,
+        normalized_source: OrderBook | BookDelta | None = None,
+        ingress_received_utc: datetime | None = None,
+        ingress_received_monotonic_ns: int | None = None,
+        normalized_ready_monotonic_ns: int | None = None,
     ) -> None:
         orderbook = state.stream.book()
         if orderbook is None or state.session_id is None:
             return
         state.book_revision += 1
-        received_at = self._now_utc()
-        received_ns = self._monotonic_ns()
+        received_at = (
+            self._now_utc()
+            if ingress_received_utc is None
+            else ingress_received_utc
+        )
+        received_ns = (
+            self._monotonic_ns()
+            if ingress_received_monotonic_ns is None
+            else ingress_received_monotonic_ns
+        )
+        normalized_ns = (
+            received_ns
+            if normalized_ready_monotonic_ns is None
+            else normalized_ready_monotonic_ns
+        )
         self.ingress.offer(
             FeedBookEvent(
                 BookEvidence(
@@ -709,6 +726,28 @@ class PublicFeedRunner:
                     checksum_valid=state.stream.book_sequence_valid,
                     received_utc=received_at,
                     fresh=True,
+                    ingress_received_monotonic_ns=received_ns,
+                    normalized_ready_monotonic_ns=normalized_ns,
+                    tx_hash=(
+                        None
+                        if normalized_source is None
+                        else normalized_source.tx_hash
+                    ),
+                    block_number=(
+                        None
+                        if normalized_source is None
+                        else normalized_source.block_number
+                    ),
+                    log_index=(
+                        None
+                        if normalized_source is None
+                        else normalized_source.log_index
+                    ),
+                    worker_timestamp=(
+                        None
+                        if normalized_source is None
+                        else normalized_source.worker_timestamp
+                    ),
                 ),
                 state.market_pair,
                 source_kind,
@@ -778,9 +817,13 @@ class PublicFeedRunner:
         payload: Mapping[str, Any],
         *,
         received_at: datetime | None = None,
+        ingress_received_monotonic_ns: int | None = None,
+        normalized_ready_monotonic_ns: int | None = None,
         ws: Any | None = None,
     ) -> None:
-        received_at = received_at or self._now_utc()
+        received_at = self._now_utc() if received_at is None else received_at
+        if ingress_received_monotonic_ns is None:
+            ingress_received_monotonic_ns = self._monotonic_ns()
         channel = str(payload.get("channel", ""))
         message_type = str(payload.get("type", "")).lower()
         if message_type in {"subscribed", "unsubscribed", "ack", "connected"}:
@@ -792,6 +835,11 @@ class PublicFeedRunner:
             try:
                 normalized = self.risex.normalize_book_message(
                     payload, received_at=received_at
+                )
+                normalized_ready_ns = (
+                    self._monotonic_ns()
+                    if normalized_ready_monotonic_ns is None
+                    else normalized_ready_monotonic_ns
                 )
                 state = self._state_for_symbol(Venue.RISEX, normalized.canonical_market)
                 if state is None:
@@ -810,6 +858,10 @@ class PublicFeedRunner:
                         source_kind="SNAPSHOT",
                         checksum=None,
                         checksum_validation="BOOKSTREAM_SNAPSHOT_ACCEPTED_NO_WIRE_CHECKSUM",
+                        normalized_source=normalized,
+                        ingress_received_utc=received_at,
+                        ingress_received_monotonic_ns=ingress_received_monotonic_ns,
+                        normalized_ready_monotonic_ns=normalized_ready_ns,
                     )
                     return
                 if not isinstance(normalized, BookDelta):
@@ -828,6 +880,10 @@ class PublicFeedRunner:
                     source_kind="DELTA",
                     checksum=normalized.checksum,
                     checksum_validation="BOOKSTREAM_OFFICIAL_WIRE_CHECKSUM",
+                    normalized_source=normalized,
+                    ingress_received_utc=received_at,
+                    ingress_received_monotonic_ns=ingress_received_monotonic_ns,
+                    normalized_ready_monotonic_ns=normalized_ready_ns,
                 )
             except (AttributeError, KeyError, TypeError, ValueError, ArithmeticError):
                 symbol = str(payload.get("market_id", ""))
@@ -857,17 +913,23 @@ class PublicFeedRunner:
                 session_id=str(state.session_id),
                 ordinal=state.book_revision,
             )
+            normalized_ready_ns = (
+                self._monotonic_ns()
+                if normalized_ready_monotonic_ns is None
+                else normalized_ready_monotonic_ns
+            )
             if normalized_trade.aggressor_side is None or state.session_id is None:
                 raise ValueError("RISEx trade aggressor is not proven")
             event = TradeEvidence(
                 trade_event_key=normalized_trade.trade_event_key,
                 venue=Venue.RISEX,
                 canonical_market=state.market_pair.canonical_market,
+                venue_symbol=state.market_pair.risex_market.venue_symbol,
                 canonical_price=normalized_trade.canonical_price,
                 canonical_quantity=normalized_trade.canonical_quantity,
                 aggressor_side=normalized_trade.aggressor_side,
                 received_utc=received_at,
-                received_monotonic_ns=self._monotonic_ns(),
+                received_monotonic_ns=ingress_received_monotonic_ns,
                 stream_session_id=state.session_id,
                 recovery_generation=state.recovery_generation,
                 exchange_event_utc=normalized_trade.exchange_timestamp,
@@ -876,6 +938,17 @@ class PublicFeedRunner:
                     if normalized_trade.exchange_timestamp is not None
                     else None
                 ),
+                ingress_received_monotonic_ns=ingress_received_monotonic_ns,
+                normalized_ready_monotonic_ns=normalized_ready_ns,
+                source_trade_id=normalized_trade.source_trade_id,
+                maker_order_id=normalized_trade.maker_order_id,
+                taker_order_id=normalized_trade.taker_order_id,
+                maker=normalized_trade.maker,
+                taker=normalized_trade.taker,
+                tx_hash=normalized_trade.tx_hash,
+                block_number=normalized_trade.block_number,
+                log_index=normalized_trade.log_index,
+                worker_timestamp=normalized_trade.worker_timestamp,
             )
             self.ingress.offer(
                 FeedTradeEvent(
@@ -900,9 +973,13 @@ class PublicFeedRunner:
         payload: Mapping[str, Any],
         *,
         received_at: datetime | None = None,
+        ingress_received_monotonic_ns: int | None = None,
+        normalized_ready_monotonic_ns: int | None = None,
         ws: Any | None = None,
     ) -> None:
-        received_at = received_at or self._now_utc()
+        received_at = self._now_utc() if received_at is None else received_at
+        if ingress_received_monotonic_ns is None:
+            ingress_received_monotonic_ns = self._monotonic_ns()
         message_type = str(payload.get("type", ""))
         if not message_type.endswith("order_book"):
             return
@@ -910,6 +987,11 @@ class PublicFeedRunner:
         try:
             normalized = self.lighter.normalize_book_message(
                 payload, received_at=received_at, initial=initial
+            )
+            normalized_ready_ns = (
+                self._monotonic_ns()
+                if normalized_ready_monotonic_ns is None
+                else normalized_ready_monotonic_ns
             )
             state = self._state_for_symbol(Venue.LIGHTER, normalized.canonical_market)
             if state is None:
@@ -926,6 +1008,10 @@ class PublicFeedRunner:
                     source_kind="SNAPSHOT",
                     checksum=None,
                     checksum_validation="BOOKSTREAM_LIGHTER_FRESH_SUBSCRIPTION_SNAPSHOT",
+                    normalized_source=normalized,
+                    ingress_received_utc=received_at,
+                    ingress_received_monotonic_ns=ingress_received_monotonic_ns,
+                    normalized_ready_monotonic_ns=normalized_ready_ns,
                 )
             elif not initial and isinstance(normalized, BookDelta):
                 if state.awaiting_snapshot or not state.stream.book_initialized:
@@ -940,6 +1026,10 @@ class PublicFeedRunner:
                     source_kind="DELTA",
                     checksum=None,
                     checksum_validation="BOOKSTREAM_LIGHTER_NONCE_CHAIN",
+                    normalized_source=normalized,
+                    ingress_received_utc=received_at,
+                    ingress_received_monotonic_ns=ingress_received_monotonic_ns,
+                    normalized_ready_monotonic_ns=normalized_ready_ns,
                 )
         except (AttributeError, KeyError, TypeError, ValueError, ArithmeticError):
             market_id = payload.get("market_id")
@@ -1036,7 +1126,8 @@ class PublicFeedRunner:
             except asyncio.TimeoutError:
                 await self._send_risex_heartbeat(ws)
                 continue
-            await asyncio.sleep(0)
+            ingress_received_utc = self._now_utc()
+            ingress_received_monotonic_ns = self._monotonic_ns()
             kind = self._message_kind(message)
             if kind == "PING":
                 action = self.risex.handle_server_ping(getattr(message, "data", b""))
@@ -1058,7 +1149,12 @@ class PublicFeedRunner:
                 if payload is not None:
                     if payload == {"type": "pong"}:
                         self._confirm_venue(Venue.RISEX)
-                    await self.ingest_risex_payload(payload, ws=ws)
+                    await self.ingest_risex_payload(
+                        payload,
+                        received_at=ingress_received_utc,
+                        ingress_received_monotonic_ns=ingress_received_monotonic_ns,
+                        ws=ws,
+                    )
                 else:
                     self._protocol_failure(
                         Venue.RISEX,
@@ -1087,7 +1183,8 @@ class PublicFeedRunner:
             except asyncio.TimeoutError:
                 await self._send_lighter_heartbeat(ws)
                 continue
-            await asyncio.sleep(0)
+            ingress_received_utc = self._now_utc()
+            ingress_received_monotonic_ns = self._monotonic_ns()
             kind = self._message_kind(message)
             if kind == "PING":
                 await ws.pong(getattr(message, "data", b""))
@@ -1108,7 +1205,12 @@ class PublicFeedRunner:
                 if payload is not None:
                     if payload == {"type": "pong"}:
                         self._confirm_venue(Venue.LIGHTER)
-                    await self.ingest_lighter_payload(payload, ws=ws)
+                    await self.ingest_lighter_payload(
+                        payload,
+                        received_at=ingress_received_utc,
+                        ingress_received_monotonic_ns=ingress_received_monotonic_ns,
+                        ws=ws,
+                    )
                 else:
                     self._protocol_failure(
                         Venue.LIGHTER,

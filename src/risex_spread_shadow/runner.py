@@ -117,6 +117,13 @@ class _HistoryBookRecord:
             checksum_valid=self.metadata.checksum_valid,
             received_utc=self.metadata.received_utc,
             fresh=self.metadata.fresh,
+            ingress_received_monotonic_ns=self.metadata.ingress_received_monotonic_ns,
+            normalized_ready_monotonic_ns=self.metadata.normalized_ready_monotonic_ns,
+            decision_ready_monotonic_ns=self.metadata.decision_ready_monotonic_ns,
+            tx_hash=self.metadata.tx_hash,
+            block_number=self.metadata.block_number,
+            log_index=self.metadata.log_index,
+            worker_timestamp=self.metadata.worker_timestamp,
         )
 
 
@@ -600,6 +607,13 @@ class BookHistory:
             checksum_valid=book.checksum_valid,
             received_utc=book.received_utc,
             fresh=book.fresh,
+            ingress_received_monotonic_ns=book.ingress_received_monotonic_ns,
+            normalized_ready_monotonic_ns=book.normalized_ready_monotonic_ns,
+            decision_ready_monotonic_ns=book.decision_ready_monotonic_ns,
+            tx_hash=book.tx_hash,
+            block_number=book.block_number,
+            log_index=book.log_index,
+            worker_timestamp=book.worker_timestamp,
         )
         chain.entries.append(
             _HistoryBookRecord(metadata, full, stored_bids, stored_asks)
@@ -1289,7 +1303,7 @@ class SpreadObserver:
         sizing = quote.sizing_evidence
         if sizing is None:
             return None
-        return {
+        record = {
             "target_notional_usd": sizing.target_notional_usd,
             "reference_price": sizing.reference_price,
             "risex_validation_price": sizing.risex_validation_price,
@@ -1311,6 +1325,7 @@ class SpreadObserver:
             "lighter_min_quantity_ok": sizing.lighter_min_quantity_ok,
             "lighter_min_notional_ok": sizing.lighter_min_notional_ok,
         }
+        return record
 
     def _quote_record(
         self,
@@ -1352,7 +1367,7 @@ class SpreadObserver:
             if lighter_book is None
             else lighter_book.book_revision_id
         )
-        return {
+        record = {
             "kind": "QUOTE",
             "policy_id": self.policy_id(policy),
             "canonical_market": policy.canonical_market,
@@ -1444,6 +1459,16 @@ class SpreadObserver:
             "sizing": self._sizing_record(quote),
             "observed_monotonic_ns": created_ns,
         }
+        if version is not None:
+            for name in (
+                "ingress_received_monotonic_ns",
+                "normalized_ready_monotonic_ns",
+                "decision_ready_monotonic_ns",
+            ):
+                value = getattr(version, name)
+                if value is not None:
+                    record[name] = value
+        return record
 
     @staticmethod
     def _pending_key(model: FillabilityModel, version_id: str) -> str:
@@ -1757,6 +1782,12 @@ class SpreadObserver:
                         risex_best_ask=policy.risex_best_ask,
                         risex_tick_size=policy.risex_tick_size,
                     )
+                    # This is the actual offline decision boundary: the
+                    # clock is sampled only after the production quote
+                    # calculation returns.  Source-book normalization stays
+                    # on the BOOK witness and is never inferred from this
+                    # boundary.
+                    decision_ready_ns = self._monotonic_ns()
                     policy_key = self.policy_id(policy)
                     version: QuoteVersion | None = None
                     if quote.outcome is EntryViabilityOutcome.QUOTE_ACTIVE:
@@ -1775,6 +1806,7 @@ class SpreadObserver:
                             lighter_book_revision=lighter.book_revision,
                             risex_book_revision_id=risex.book_revision_id,
                             lighter_book_revision_id=lighter.book_revision_id,
+                            decision_ready_monotonic_ns=decision_ready_ns,
                         )
                         versions[policy_key] = version
                     records.append(
@@ -1944,11 +1976,12 @@ class SpreadObserver:
         eligible_policy_ids: Sequence[str] = (),
     ) -> dict[str, Any]:
         trade = event.trade
-        return {
+        record = {
             "kind": "RISEX_TRADE",
             "canonical_market": trade.canonical_market,
             "venue": trade.venue.value,
             "trade_event_key": trade.trade_event_key,
+            "venue_symbol": trade.venue_symbol,
             "canonical_price": trade.canonical_price,
             "canonical_quantity": trade.canonical_quantity,
             "aggressor_side": trade.aggressor_side.value,
@@ -1963,6 +1996,24 @@ class SpreadObserver:
             "eligible_policy_ids": tuple(eligible_policy_ids),
             "observed_monotonic_ns": trade.received_monotonic_ns,
         }
+        for name in (
+            "ingress_received_monotonic_ns",
+            "normalized_ready_monotonic_ns",
+            "decision_ready_monotonic_ns",
+            "source_trade_id",
+            "maker_order_id",
+            "taker_order_id",
+            "maker",
+            "taker",
+            "tx_hash",
+            "block_number",
+            "log_index",
+            "worker_timestamp",
+        ):
+            value = getattr(trade, name)
+            if value is not None:
+                record[name] = value
+        return record
 
     @staticmethod
     def _trade_semantic_fingerprint(trade: TradeEvidence) -> tuple[Any, ...]:
@@ -1971,6 +2022,7 @@ class SpreadObserver:
         return (
             trade.venue,
             trade.canonical_market,
+            trade.venue_symbol,
             trade.canonical_price,
             trade.canonical_quantity,
             trade.aggressor_side,

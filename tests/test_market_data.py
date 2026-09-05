@@ -388,12 +388,81 @@ def test_trade_ids_aggressors_and_synthetic_keys() -> None:
     assert r_trade.exchange_timestamp is not None
     assert r_trade.received_at == NOW
     assert r_trade.raw_timestamp == fixture("risex")["trade"]["block_timestamp"]
+    assert r_trade.source_trade_id == "maker-taker"
+    assert r_trade.maker_order_id is None
+    assert r_trade.tx_hash is None
     worker_only = deepcopy(fixture("risex")["trade"])
     worker_only["worker_timestamp"] = worker_only.pop("block_timestamp")
     safe = risex.normalize_trade(worker_only, received_at=NOW, session_id="s1", ordinal=2)
     assert safe.raw_timestamp == worker_only["worker_timestamp"]
     assert safe.exchange_timestamp is not None
     assert "RISEX_WORKER_TIMESTAMP_USED_AS_SERVER_EVENT_TIME" in safe.paper_assumptions
+
+
+def test_risex_public_wire_identity_is_preserved_without_inference() -> None:
+    risex = RisexAdapter(None)
+    risex._market_ids = {"BTC/USDC": "1"}
+    risex._symbols_by_id = {"1": "BTC/USDC"}
+    risex._raw_markets = {
+        "BTC/USDC": {"config": {"step_size": "1", "step_price": "1"}}
+    }
+    maker_order_id = "0x" + "11" * 24
+    taker_order_id = "0x" + "22" * 24
+    source_trade_id = f"{maker_order_id}-{taker_order_id}"
+    tx_hash = "0x" + "aa" * 32
+    trade_payload = {
+        "channel": "trades",
+        "type": "update",
+        "market_id": "1",
+        "tx_hash": tx_hash,
+        "block_number": 180,
+        "log_index": 7,
+        "worker_timestamp": 1_800_000_000_000_000_200,
+        "data": {
+            "id": source_trade_id,
+            "maker_order_id": maker_order_id,
+            "taker_order_id": taker_order_id,
+            "maker": "0x" + "33" * 32,
+            "taker": "0x" + "44" * 32,
+            "maker_side": 0,
+            "price": "100",
+            "size": "1",
+        },
+    }
+    normalized_trade = risex.normalize_trade(
+        trade_payload, received_at=NOW, session_id="public-1", ordinal=1
+    )
+    assert normalized_trade.source_trade_id == source_trade_id
+    assert normalized_trade.maker_order_id == maker_order_id
+    assert normalized_trade.taker_order_id == taker_order_id
+    assert normalized_trade.maker == "0x" + "33" * 32
+    assert normalized_trade.taker == "0x" + "44" * 32
+    assert normalized_trade.tx_hash == tx_hash
+    assert normalized_trade.block_number == 180
+    assert normalized_trade.log_index == 7
+    assert normalized_trade.worker_timestamp == 1_800_000_000_000_000_200
+
+    book_payload = {
+        "channel": "orderbook",
+        "type": "snapshot",
+        "market_id": "1",
+        "tx_hash": "0x" + "bb" * 32,
+        "block_number": 181,
+        "log_index": 8,
+        "worker_timestamp": 1_800_000_000_000_000_300,
+        "data": {
+            "market_id": 1,
+            "bids": [{"price": "99", "quantity": "2"}],
+            "asks": [{"price": "101", "quantity": "2"}],
+        },
+    }
+    normalized_book = risex.normalize_book_message(
+        book_payload, received_at=NOW
+    )
+    assert normalized_book.block_number == 181
+    assert normalized_book.log_index == 8
+    assert normalized_book.tx_hash == "0x" + "bb" * 32
+    assert normalized_book.worker_timestamp == 1_800_000_000_000_000_300
 
     extended = ExtendedAdapter(None)
     e_trade = extended.normalize_trade(

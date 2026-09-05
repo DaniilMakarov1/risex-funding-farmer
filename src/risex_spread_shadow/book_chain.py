@@ -197,6 +197,19 @@ def _str_field(record: Mapping[str, Any], name: str, *, required: bool = True) -
     return value
 
 
+def _wire_timestamp_field(
+    record: Mapping[str, Any], name: str
+) -> str | int | None:
+    value = record.get(name)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise BookRevisionChainError(f"{name.upper()}_INVALID")
+    if isinstance(value, int) and value < 0:
+        raise BookRevisionChainError(f"{name.upper()}_INVALID")
+    return value
+
+
 def _validate_sha256(value: Any, name: str) -> str:
     if (
         not isinstance(value, str)
@@ -284,6 +297,19 @@ def _metadata_book(
         raise BookRevisionChainError("BOOK_HEALTH_FLAGS_INVALID")
     received_ns = _int_field(record, "received_monotonic_ns")
     assert received_ns is not None
+    ingress_received_ns = _int_field(
+        record, "ingress_received_monotonic_ns", required=False
+    )
+    normalized_ready_ns = _int_field(
+        record, "normalized_ready_monotonic_ns", required=False
+    )
+    decision_ready_ns = _int_field(
+        record, "decision_ready_monotonic_ns", required=False
+    )
+    tx_hash = _str_field(record, "tx_hash", required=False)
+    block_number = _int_field(record, "block_number", required=False)
+    log_index = _int_field(record, "log_index", required=False)
+    worker_timestamp = _wire_timestamp_field(record, "worker_timestamp")
     return BookEvidence(
         venue=venue,
         canonical_market=market,
@@ -299,6 +325,13 @@ def _metadata_book(
         checksum_valid=checksum_valid,
         received_utc=_datetime_field(record),
         fresh=fresh,
+        ingress_received_monotonic_ns=ingress_received_ns,
+        normalized_ready_monotonic_ns=normalized_ready_ns,
+        decision_ready_monotonic_ns=decision_ready_ns,
+        tx_hash=tx_hash,
+        block_number=block_number,
+        log_index=log_index,
+        worker_timestamp=worker_timestamp,
     )
 
 
@@ -425,7 +458,7 @@ class BookRevisionEncoder:
             asks=dict(asks),
             state_sha256=_levels_state_sha256(bids, asks),
         )
-        return {
+        record = {
             "kind": "BOOK",
             "canonical_market": book.canonical_market,
             "venue": book.venue.value,
@@ -451,6 +484,19 @@ class BookRevisionEncoder:
             "asks": tuple(_book_level_record(level) for level in output_asks),
             "observed_monotonic_ns": book.received_monotonic_ns,
         }
+        for name in (
+            "ingress_received_monotonic_ns",
+            "normalized_ready_monotonic_ns",
+            "decision_ready_monotonic_ns",
+            "tx_hash",
+            "block_number",
+            "log_index",
+            "worker_timestamp",
+        ):
+            value = getattr(book, name)
+            if value is not None:
+                record[name] = value
+        return record
 
 
 # Descriptive aliases keep the public surface discoverable without creating
