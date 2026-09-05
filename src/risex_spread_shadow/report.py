@@ -19,6 +19,7 @@ from .book_chain import (
 )
 from .calibration import build_calibration_evidence
 from .models import make_book_revision_id
+from .offline_evaluation import build_offline_evaluation
 from .store import iter_records
 
 
@@ -2115,6 +2116,10 @@ def build_report(path: str | Path) -> dict[str, Any]:
         )
     )
     calibration_evidence = build_calibration_evidence(calibration_records)
+    # SCAN-002 is a bounded, separately labelled evaluation.  It replays the
+    # evidence path itself and never consumes the legacy calibration_records
+    # allocation above; the legacy fields remain byte-for-byte compatible.
+    offline_evaluation = build_offline_evaluation(path)
     sample_stop_payload = None
     if first_sample_stop is not None:
         sample_stop_payload = {
@@ -2189,6 +2194,7 @@ def build_report(path: str | Path) -> dict[str, Any]:
         "markets": sorted(markets),
         "groups": output_groups,
         "calibration_evidence": calibration_evidence,
+        "offline_evaluation": offline_evaluation,
     }
 
 
