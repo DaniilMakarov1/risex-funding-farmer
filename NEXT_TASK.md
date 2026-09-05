@@ -3,7 +3,7 @@
 Status: AUTHORIZED after independent S2 acceptance; implementation/verification offline only. No market launch.
 Venue: central SPREAD, RISEx/Lighter public-only.
 Accepted implementation: `d9595420a24281fe9d0d2bc496d4b89c96ca8c80`. Start from exact published main containing this gate; Chief dispatch supplies full SHA.
-Verification: Level A. Owner's 2026-09-05 full-plan authorization and SYSTEM_SPEC 0.21 govern. One fresh visible GPT-5.6 Luna max implementation Builder, branch `codex/spread-s3-envelope-evidence`, separate worktree; predecessor stopped. Chief alone accepts/integrates/pushes and later freezes prospective windows.
+Verification: Level A. Owner's 2026-09-05 full-plan authorization and SYSTEM_SPEC 0.21 govern. One fresh visible GPT-5.6 Luna max implementation Builder, branch `codex/spread-s3-envelope-completion`, separate worktree; predecessor stopped. Chief alone accepts/integrates/pushes and later freezes prospective windows.
 
 ## Objective and allowed scope
 
@@ -31,14 +31,16 @@ Prefer a substantive clean intermediate checkpoint and fresh successor when this
 
 ## Current clean checkpoint and successor focus
 
-Predecessor stopped at clean immutable UNACCEPTED `65dfd8ad3982a5f187f84485c0c6e4ab170da542`. A fresh Builder may cherry-pick, in order, `da42763a2a31109deaee781ddef3262259fa3219`, `db1bacced320d9de16809e870691c30a1589a467`, and `65dfd8ad3982a5f187f84485c0c6e4ab170da542` onto the exact published accepted main supplied by Chief. Preserve history. Chief independently passed all 17 current S3 tests; no final full suite. Earlier broad tests do not establish missing gates.
+Predecessor stopped at clean immutable UNACCEPTED `53a75c3cf68ecd2eec6b46a5c0a229648fd56818`. The successor starts from exact published accepted main supplied by Chief and may cherry-pick, in order, `1e33633a932a925cd7e384b7b198105d4be62f00`, `eb761cfb4a118b5999676de049f8e2138f629994`, `015f90c6ec84131e4b1f8c2c46120b778b3a47e5`, and `53a75c3cf68ecd2eec6b46a5c0a229648fd56818`. These remain unaccepted S3 implementation evidence. Chief verified 96 current pipeline/S3 tests before the last assertion-only correction and all five envelope tests on the final checkpoint. No full suite or S3 acceptance.
 
-This successor has a narrower ENVELOPE evidence checkpoint, using offline fake producers through the actual public callable/queue/driver/store/replay path:
+Checkpoint fixes independent streaming lane admission and suppresses attempt-scoped ends in stream replay. S3 explicitly selects offer-order gap delivery; historical queue default remains unchanged. Persisted fixtures cover small burst/gap/drain, primary reentry while stress is pending, max-hold forced closure with fresh liquidity versus missing-close unresolved, and aggregate writer reserve/terminal limits.
 
-1. Burst/backpressure/drain/retention: bounded queue and producer load, consumer/resource failure stops source promptly, no silent event loss or post-terminal append, aggregate record AND byte caps include closing events/results and one terminal. Existing tiny terminal-cap fixtures are supporting evidence, not a load test.
-2. Admit near entry cutoff, drive configured maximum holding plus delayed cancel/unwind to terminal within hard deadline using explicit fresh closing liquidity. Independently derive expected latest completion and prove actual transitions; missing closing data must remain explicit unresolved. Include late catalog setup and no feed overrun. Constant arithmetic alone is insufficient.
-3. Primary may admit its next decision when flat even while stress is pending/halted; each lane has its own rate/flat barrier. Queued normalization must not move clocks back to ingress, and late old evidence remains auditable while flat/after cutoff.
+This fresh successor owns only the remaining ENVELOPE completion gates, offline:
 
-Fix only concrete defects required by these three gates; no new framework, second kernel or strategy change. Preserve report/provenance/metadata/grouping checks and historical semantics. Commit a clean UNACCEPTED tested checkpoint and STOP for Chief review/rotation. Do not run a final full suite for this partial checkpoint. Report exact SHA, actually verified paths, resource/time bounds and remaining defects.
+1. Exercise `run_public_cycle_collection` with concurrent fake feed and actual queue/driver/store/replay under realistic bounded bursts. Verify resource/consumer failure stops source promptly, bounded drain/retention, no silent event loss or post-terminal append, and aggregate record AND byte caps including closing outputs and exactly one terminal. Tiny writer-only cap fixtures and a 15-item queue burst do not close this gate. Review resource-failure finalization for explicit insufficient/unresolved evidence and replayability; correct concrete defects in this path only.
+2. Prove the latest admissible entry fill near activation plus entry timeout plus delayed cancellation, followed by maximum holding and delayed exit cancellation/unwind. Independently derive the latest completion from actual configured transitions and demonstrate it before the hard deadline with explicit fresh liquidity. Existing cutoff+1.1-second fill is supporting evidence, not worst-tail proof. Missing closing evidence stays unresolved.
+3. Preserve established primary/stress independent admission, physical replay, late identity auditing, metadata/provenance/grouping, and historical queue behavior. Demonstrate configured retention covers the bounded window; do not silently retire identities.
 
-Independent forced/unmatched report/occupancy totals and full four-window robustness evidence remain the subsequent bounded S3 completion work under the same owner authorization. No actual network validation or campaign run is a Builder prerequisite: Level A only. S3 is not accepted until all requirements above and final exact-SHA verification pass; Chief alone will later freeze prospective public windows.
+Commit a clean tested UNACCEPTED checkpoint and STOP for Chief review/rotation. No final full suite for this partial checkpoint. Report exact SHA, actual evidence and remaining gates. No market requests, policy changes, additional kernel/framework, governance edits or delegation.
+
+Independent forced/unmatched report/occupancy totals and full four-window numerical robustness remain subsequent S3 completion work under the same owner authorization. S3 remains unaccepted until all requirements above and final exact-SHA verification pass; Chief alone later freezes prospective public windows.
