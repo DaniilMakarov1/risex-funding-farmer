@@ -55,8 +55,12 @@ def domain_body(**changes: Any) -> dict[str, Any]:
     return envelope(data)
 
 
-def nonce_body(value: str = "0x10") -> dict[str, Any]:
+def nonce_body(value: Any = "0x10") -> dict[str, Any]:
     return envelope({"nonce": value})
+
+
+UNPREFIXED_HEX_NONCE = "0123456789abcdef" * 4
+DIGIT_ONLY_HEX_NONCE = "10" * 32
 
 
 def login_body(**changes: Any) -> dict[str, Any]:
@@ -304,6 +308,95 @@ async def test_success_binds_account_nonce_login_and_one_caller_owned_fee_read(
     assert "fixture-request-id" not in evidence
     assert "irrelevant_private-looking-field" not in evidence
     assert report.provenance["lighter_standard"]["cancel_latency_ms"] == 300
+
+
+@pytest.mark.asyncio
+async def test_unprefixed_hex_nonce_is_base16_and_preserved_on_login(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = complete_transport()
+    transport.responses[("GET", fee_read.NONCE_PATH)] = [
+        observation(
+            "GET",
+            fee_read.NONCE_PATH,
+            nonce_body(DIGIT_ONLY_HEX_NONCE),
+            query=(("account", ACCOUNT),),
+        )
+    ]
+    capability = FakeCapability()
+    monkeypatch.setattr(fee_read, "_recover_login", lambda _data, _signature: ACCOUNT)
+
+    report = await fee_read._run_with_dependencies(
+        dependencies(transport, capability, session_signer=SESSION_SIGNER)
+    )
+
+    assert report.status == fee_read.READY
+    assert transport.calls[3]["body"]["nonce"] == DIGIT_ONLY_HEX_NONCE
+    assert capability.typed_data is not None
+    assert capability.typed_data["message"]["nonce"] == int(DIGIT_ONLY_HEX_NONCE, 16)
+    assert int(DIGIT_ONLY_HEX_NONCE, 16) != int(DIGIT_ONLY_HEX_NONCE, 10)
+
+
+def test_nonce_parser_accepts_only_bounded_hex_wire_forms() -> None:
+    assert fee_read._parse_nonce(nonce_body(UNPREFIXED_HEX_NONCE)) == (
+        UNPREFIXED_HEX_NONCE,
+        int(UNPREFIXED_HEX_NONCE, 16),
+    )
+    assert fee_read._parse_nonce(nonce_body("0x1")) == ("0x1", 1)
+    prefixed_max = "0x" + "f" * 64
+    assert fee_read._parse_nonce(nonce_body(prefixed_max)) == (
+        prefixed_max,
+        int("f" * 64, 16),
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "0x",
+        "0X1",
+        "a" * 63,
+        "a" * 65,
+        "0x" + "a" * 65,
+        "0x1 ",
+        " " + "a" * 63,
+        "g" * 64,
+        1,
+        1.0,
+        True,
+        None,
+        {},
+        [],
+    ],
+)
+def test_nonce_parser_rejects_malformed_or_non_string_nonce(value: Any) -> None:
+    with pytest.raises(fee_read._FeeReadFailure) as raised:
+        fee_read._parse_nonce(nonce_body(value))
+
+    assert raised.value.reason == "NONCE_INVALID"
+    assert raised.value.failure_class == "SCHEMA"
+
+
+def test_nonce_parser_rejects_ambiguous_top_level_nonce_but_tolerates_additive_fields() -> None:
+    accepted = {
+        "data": {"nonce": "0x1", "unrelated": {"anything": True}},
+        "request_id": "fixture-request-id",
+        "unrelated": [1, 2, 3],
+    }
+    assert fee_read._parse_nonce(accepted) == ("0x1", 1)
+
+    with pytest.raises(fee_read._FeeReadFailure) as raised:
+        fee_read._parse_nonce(
+            {
+                "data": {"nonce": "0x1"},
+                "nonce": "0x1",
+                "request_id": "fixture-request-id",
+            }
+        )
+
+    assert raised.value.reason == "NONCE_INVALID"
+    assert raised.value.failure_class == "SCHEMA"
 
 
 def test_login_typed_data_is_exact_and_uses_the_frozen_mainnet_domain() -> None:

@@ -21,7 +21,11 @@ Frozen contract provenance supplied for SS-001K on 2026-09-05:
 * login domain prerequisite: ``GET /v1/auth/eip712-domain`` from the fixed
   origin, with the returned name, version, chain, and verifying contract
   validated before any readiness, nonce, signing, login, or fee step;
-* nonce: ``GET /v1/auth/nonce?account=<exact wallet>``;
+* nonce: ``GET /v1/auth/nonce?account=<exact wallet>``; the accepted
+  ``data.nonce`` wire value is either the observed 64-character unprefixed
+  hexadecimal form or a documented ``0x``-prefixed 1..64-character
+  hexadecimal form.  Both forms are parsed base-16 for EIP-712 while the
+  exact received string is preserved in the login request;
 * login: the account signs ``Login(address account,uint256 nonce,uint32
   deadline)`` and sends ``POST /v1/auth/login``;
 * session-key status is public readiness only;
@@ -448,31 +452,26 @@ def _strict_uint(value: Any, *, maximum: int, reason: str) -> int:
     return parsed
 
 
-def _parse_nonce(value: Any) -> tuple[str | int, int]:
-    raw = _response_data(value, "NONCE_INVALID").get("nonce")
-    if type(raw) is int and not isinstance(raw, bool):
-        return raw, _strict_uint(raw, maximum=_UINT256_MAX, reason="NONCE_INVALID")
-    if type(raw) is not str or not raw or raw != raw.strip() or len(raw) > 66:
+def _parse_nonce(value: Any) -> tuple[str, int]:
+    if isinstance(value, Mapping) and "nonce" in value:
         raise _failure("NONCE_INVALID", "SCHEMA")
-    try:
-        if raw.startswith("0x"):
-            digits = raw[2:]
-            if not digits or len(digits) > 64 or any(
-                character not in "0123456789abcdefABCDEF" for character in digits
-            ):
-                raise ValueError
-            numeric = int(digits, 16)
-        elif raw.isascii() and raw.isdecimal() and (
-            raw == "0" or not raw.startswith("0")
-        ):
-            numeric = int(raw, 10)
-        else:
-            raise ValueError
-    except (TypeError, ValueError):
+    data = _response_data(value, "NONCE_INVALID")
+    raw = data.get("nonce")
+    if type(raw) is not str:
+        raise _failure("NONCE_INVALID", "SCHEMA")
+
+    if raw.startswith("0x"):
+        digits = raw[2:]
+        if not 1 <= len(digits) <= 64:
+            raise _failure("NONCE_INVALID", "SCHEMA")
+    else:
+        if len(raw) != 64:
+            raise _failure("NONCE_INVALID", "SCHEMA")
+        digits = raw
+
+    if any(character not in "0123456789abcdefABCDEF" for character in digits):
         raise _failure("NONCE_INVALID", "SCHEMA") from None
-    if not 0 <= numeric <= _UINT256_MAX:
-        raise _failure("NONCE_INVALID", "SAFETY")
-    return raw, numeric
+    return raw, int(digits, 16)
 
 
 def _parse_domain(value: Any) -> None:
