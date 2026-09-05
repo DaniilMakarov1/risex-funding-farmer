@@ -7,7 +7,7 @@ name = "risex-funding-farmer"
 version = "0.0.0"
 description = "Paper-only delta-neutral funding strategy research"
 requires-python = ">=3.11"
-dependencies = ["aiohttp>=3.9,<4"]
+dependencies = ["aiohttp>=3.9,<4", "eth-account>=0.13,<0.14"]
 
 [project.scripts]
 risex-farmer = "risex_farmer.cli:main"
@@ -17,6 +17,7 @@ nado-mainnet-archive-read = "risex_farmer.nado_mainnet_archive_read:main"
 lighter-testnet-readiness = "risex_farmer.lighter_testnet_readiness:main"
 lighter-testnet-level-c = "risex_farmer.lighter_testnet_lifecycle:main"
 risex-spread-shadow = "risex_spread_shadow.cli:main"
+risex-spread-shadow-fee-read = "risex_spread_shadow.risex_fee_read:main"
 
 [project.optional-dependencies]
 test = [

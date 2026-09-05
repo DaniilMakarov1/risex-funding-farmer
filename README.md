@@ -5,7 +5,11 @@ This repository contains two deliberately separated research contours.
 - **RISEx Spread Shadow** is active. It asks whether hypothetical RISEx maker fills retain positive fee-adjusted entry edge against delayed executable exact-quantity Lighter Standard taker hedges. It is public-only shadow research with points valued at `$0`.
 - **RISEx Funding Farmer** is a frozen legacy benchmark. Its code and historical evidence remain available, but its funding-boundary profitability path and operational runs are not active.
 
-No contour currently authorizes private endpoints, credentials, signing, order preparation, order dispatch, testnet/mainnet writes, real funds, transfers, withdrawals, or strategy execution. Current acceptance state and the exact active boundary live in `STATUS.md` and `NEXT_TASK.md`.
+The public contour and normal startup authorize no private endpoints, credentials,
+signing, order preparation, order dispatch, testnet/mainnet writes, real funds,
+transfers, withdrawals, or strategy execution. The one opt-in Level-B fee-read
+boundary is described below; current acceptance state and the exact active
+boundary live in `STATUS.md` and `NEXT_TASK.md`.
 
 ## Requirements
 
@@ -31,7 +35,29 @@ pytest
 
 The legacy benchmark retains the `risex-farmer` entrypoint documented below. It is not the active Spread Shadow strategy and must not be resumed as an operational process.
 
-The active contour will use a separate `risex-spread-shadow` entrypoint after SS-001B is independently accepted. SS-001A contains pure domain/evidence contracts only, so that entrypoint does not exist yet and no shadow run is currently authorized.
+The active contour uses the separate `risex-spread-shadow` entrypoint. It remains
+public-only and does not import the opt-in authenticated fee boundary below.
+
+### Opt-in RISEx owner-fee read
+
+After the SS-001K candidate is independently accepted, the bounded Level-B
+read may be run explicitly with no arguments:
+
+```bash
+risex-spread-shadow-fee-read
+# or: python -m risex_spread_shadow.risex_fee_read
+```
+
+The runner reads only the existing owner-only RISEx identity and session-signer
+files under `~/.config/risex-farmer`, checks the exact mainnet identity and
+registered signer through the public readiness endpoint, then asks for the
+owner wallet key through hidden local input. The key is used once to sign the
+official login message and is never persisted, placed in an environment
+variable, passed as an argument, or included in output. The only authenticated
+request is the caller-owned `GET /v1/user/fees` read. Output is sanitized fee
+tier/rate/provenance evidence or one classified terminal failure. No order,
+position, balance, collateral, transfer, withdrawal, deposit, or strategy path
+is available from this entrypoint.
 
 ## Legacy commands
 
