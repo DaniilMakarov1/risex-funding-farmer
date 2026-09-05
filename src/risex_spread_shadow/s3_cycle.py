@@ -342,8 +342,8 @@ class CycleWindow:
     monotonic_start_ns: int = 0
 
     def __post_init__(self) -> None:
-        _text(self.campaign_id, "campaign_id")
-        _text(self.window_id, "window_id")
+        _path_safe(self.campaign_id, "campaign_id")
+        _path_safe(self.window_id, "window_id")
         _utc(self.start_utc, "start_utc")
         _utc(self.end_utc, "end_utc")
         _non_negative_int(self.ordinal, "ordinal")
@@ -411,6 +411,8 @@ def validate_cycle_windows(
         raise CycleEvidenceIntegrityError("S3 campaign requires exactly four windows")
     if len({window.window_id for window in windows}) != len(windows):
         raise CycleEvidenceIntegrityError("S3 window identities must be unique")
+    if len({window.ordinal for window in windows}) != len(windows):
+        raise CycleEvidenceIntegrityError("S3 window ordinals must be unique")
     if len({window.campaign_id for window in windows}) != 1:
         raise CycleEvidenceIntegrityError("S3 windows must share one campaign identity")
     ordered = tuple(sorted(windows, key=lambda window: window.start_utc))
@@ -556,6 +558,8 @@ def read_cycle_manifest(path: str | os.PathLike[str]) -> CycleCampaignManifest:
         _require(payload, key, context="S3 campaign manifest")
     if payload["schema_version"] != S3_SCHEMA_VERSION or payload["experiment_kind"] != S3_EXPERIMENT_KIND:
         raise CycleManifestError("unsupported S3 campaign manifest schema")
+    if payload["policy"] != _primitive(s2_cycle_policy()):
+        raise CycleManifestError("S3 campaign manifest policy is not the fixed S2 policy")
     core = {key: payload[key] for key in required if key != "manifest_sha256"}
     if payload["manifest_sha256"] != _digest(core):
         raise CycleManifestError("S3 campaign manifest digest mismatch")
@@ -648,9 +652,16 @@ def reserve_cycle_window(
 
     _path_safe(window.campaign_id, "campaign_id")
     _path_safe(window.window_id, "window_id")
-    policy = policy_fingerprint or cycle_policy_fingerprint(accepted_release)
+    expected_policy = cycle_policy_fingerprint(accepted_release)
+    policy = expected_policy if policy_fingerprint is None else policy_fingerprint
     if not _HEX256_RE.fullmatch(policy):
         raise ValueError("policy_fingerprint must be a SHA-256 digest")
+    if policy != expected_policy:
+        raise ValueError("policy_fingerprint does not match the fixed S3 policy and release")
+    selected_claimed_utc = _utc(
+        datetime.now(UTC) if claimed_utc is None else claimed_utc,
+        "claimed_utc",
+    )
     root_path = Path(root)
     root_path.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(root_path, stat.S_IRWXU)
@@ -671,7 +682,7 @@ def reserve_cycle_window(
         ),
         "window_start_utc": window.start_utc,
         "window_end_utc": window.end_utc,
-        "claimed_utc": claimed_utc or datetime.now(UTC),
+        "claimed_utc": selected_claimed_utc,
     }
     encoded = json.dumps(_primitive(payload), sort_keys=True, separators=(",", ":")) + "\n"
     try:
@@ -1169,9 +1180,34 @@ class _CycleCampaignBudget:
             budget.byte_count += path.stat().st_size
         return budget
 
-    def check(self, *, encoded_bytes: int, closing: bool) -> None:
-        record_limit = self.max_records if closing else self.max_records - self.record_reserve
-        byte_limit = self.max_bytes if closing else self.max_bytes - self.bytes_reserve
+    def check(
+        self,
+        *,
+        encoded_bytes: int,
+        closing: bool,
+        terminal: bool = False,
+    ) -> None:
+        """Check one record while retaining a durable terminal-marker slot.
+
+        The S3 caps include the physically-last ``RUN_STOP``/``RUN_FAILED``
+        record.  A normal stop is not special-cased by the shared append-only
+        store, so the S3 guard must reserve one record and a bounded terminal
+        marker's bytes until that record is written.  Closing evidence may
+        consume the configured closing reserves, but it may not consume the
+        terminal slot.
+        """
+
+        if terminal:
+            record_limit = self.max_records
+            byte_limit = self.max_bytes
+        else:
+            record_limit = self.max_records - self.record_reserve
+            byte_limit = self.max_bytes - self.bytes_reserve
+            if closing:
+                # The terminal marker itself is part of the closing reserve;
+                # keep a bounded slot for it after closing evidence.
+                record_limit = self.max_records - 1
+                byte_limit = self.max_bytes - TERMINAL_FAILURE_BYTES_RESERVE
         if self.record_count + 1 > record_limit:
             raise CycleEnvelopeLimitError("records")
         if self.byte_count + encoded_bytes > byte_limit:
@@ -1270,8 +1306,15 @@ class CycleEvidenceWriter:
         kind = record.get("kind")
         terminal = kind in {"RUN_STOP", "RUN_FAILED"}
         closing = self._is_closing_record(record, terminal=terminal)
-        record_limit = self.envelope.max_records if closing else self.envelope.max_records - self.envelope.record_reserve
-        byte_limit = self.envelope.max_bytes if closing else self.envelope.max_bytes - self.envelope.bytes_reserve
+        if terminal:
+            record_limit = self.envelope.max_records
+            byte_limit = self.envelope.max_bytes
+        else:
+            record_limit = self.envelope.max_records - self.envelope.record_reserve
+            byte_limit = self.envelope.max_bytes - self.envelope.bytes_reserve
+            if closing:
+                record_limit = self.envelope.max_records - 1
+                byte_limit = self.envelope.max_bytes - TERMINAL_FAILURE_BYTES_RESERVE
         if self.store.record_count + 1 > record_limit:
             raise CycleEnvelopeLimitError("records")
         payload = dict(record)
@@ -1282,7 +1325,11 @@ class CycleEvidenceWriter:
             raise CycleEnvelopeLimitError("bytes")
         encoded_bytes = len(encoded.encode("utf-8"))
         if self._campaign_budget is not None:
-            self._campaign_budget.check(encoded_bytes=encoded_bytes, closing=closing)
+            self._campaign_budget.check(
+                encoded_bytes=encoded_bytes,
+                closing=closing,
+                terminal=terminal,
+            )
         assigned = self.store.append_batch((record,), sync=True)
         if len(assigned) != 1 or assigned[0] != payload["record_index"]:
             raise CycleEvidenceIntegrityError("append store returned a non-contiguous S3 index")
@@ -1297,7 +1344,11 @@ class CycleEvidenceWriter:
             raise CycleEvidenceIntegrityError("S3 run has more than one terminal")
         record: dict[str, Any] = {
             "kind": "RUN_FAILED" if failed else "RUN_STOP",
-            "observed_monotonic_ns": self.envelope.market_deadline_ns,
+            "observed_monotonic_ns": (
+                self.window.deadline_monotonic_ns
+                if self.window is not None
+                else self.envelope.market_deadline_ns
+            ),
             "fatal_reason": reason,
         }
         return self.append(record)
@@ -2713,32 +2764,73 @@ def _read_run(path: Path) -> _RunBundle:
     if records[0].get("kind") != "RUN_METADATA" or not isinstance(records[0].get("metadata"), Mapping):
         raise CycleEvidenceIntegrityError("S3 evidence must begin with RUN_METADATA")
     metadata = dict(records[0]["metadata"])
+    if metadata.get("run_id") != run_id:
+        raise CycleEvidenceIntegrityError("S3 metadata run identity does not match the evidence file")
     for key in (
         "schema_version", "experiment_kind", "accepted_release", "campaign_id", "window_id",
         "window_fingerprint", "policy_fingerprint", "window_start_utc", "window_end_utc",
-        "envelope", "monotonic_start_ns",
+        "envelope", "monotonic_start_ns", "evidence_mode", "source_scope", "policy",
+        "funding_status",
     ):
         _require(metadata, key, context="S3 metadata")
     if metadata["schema_version"] != S3_SCHEMA_VERSION or metadata["experiment_kind"] != S3_EXPERIMENT_KIND:
         raise CycleEvidenceIntegrityError("unsupported S3 evidence schema or experiment")
+    if metadata["evidence_mode"] not in {"FIXTURE", "OBSERVATIONAL"}:
+        raise CycleEvidenceIntegrityError("S3 evidence provenance is invalid")
+    if metadata["evidence_mode"] == "OBSERVATIONAL":
+        for key in ("manifest_sha256", "manifest_window_fingerprint", "prospective"):
+            _require(metadata, key, context="observed-public S3 metadata")
+        if not isinstance(metadata["manifest_sha256"], str) or not _HEX256_RE.fullmatch(
+            metadata["manifest_sha256"]
+        ):
+            raise CycleEvidenceIntegrityError("observed-public S3 manifest identity is invalid")
+        if metadata["prospective"] is not True:
+            raise CycleEvidenceIntegrityError("observed-public S3 evidence is not prospective")
+    if metadata["source_scope"] not in (
+        [Venue.RISEX.value, Venue.LIGHTER.value],
+        (Venue.RISEX.value, Venue.LIGHTER.value),
+    ):
+        raise CycleEvidenceIntegrityError("S3 evidence source scope is invalid")
+    if metadata["policy"] != _primitive(s2_cycle_policy()):
+        raise CycleEvidenceIntegrityError("S3 evidence policy metadata is not the fixed S2 policy")
+    if metadata["funding_status"] != "UNKNOWN":
+        raise CycleEvidenceIntegrityError("S3 evidence funding status is not UNKNOWN")
     accepted_release = metadata["accepted_release"]
-    window = CycleWindow.from_text(
-        campaign_id=metadata["campaign_id"],
-        window_id=metadata["window_id"],
-        start_utc=metadata["window_start_utc"],
-        end_utc=metadata["window_end_utc"],
-        ordinal=metadata.get("window_ordinal", 0),
-        monotonic_start_ns=metadata["monotonic_start_ns"],
-    )
-    if metadata["policy_fingerprint"] != cycle_policy_fingerprint(accepted_release):
-        raise CycleEvidenceIntegrityError("S3 policy/release fingerprint mismatch")
-    if metadata["window_fingerprint"] != cycle_window_fingerprint(accepted_release=accepted_release, window=window):
-        raise CycleEvidenceIntegrityError("S3 window fingerprint mismatch")
-    envelope_data = metadata["envelope"]
-    if not isinstance(envelope_data, Mapping):
-        raise CycleEvidenceIntegrityError("S3 envelope metadata is malformed")
-    envelope = CycleEnvelope(**{field.name: envelope_data[field.name] for field in fields(CycleEnvelope)})
-    envelope.assert_tail_sufficient()
+    try:
+        window = CycleWindow.from_text(
+            campaign_id=metadata["campaign_id"],
+            window_id=metadata["window_id"],
+            start_utc=metadata["window_start_utc"],
+            end_utc=metadata["window_end_utc"],
+            ordinal=metadata.get("window_ordinal", 0),
+            monotonic_start_ns=metadata["monotonic_start_ns"],
+        )
+        if metadata["policy_fingerprint"] != cycle_policy_fingerprint(accepted_release):
+            raise CycleEvidenceIntegrityError("S3 policy/release fingerprint mismatch")
+        if metadata["window_fingerprint"] != cycle_window_fingerprint(accepted_release=accepted_release, window=window):
+            raise CycleEvidenceIntegrityError("S3 window fingerprint mismatch")
+        manifest_window_fingerprint = metadata.get("manifest_window_fingerprint")
+        if (
+            manifest_window_fingerprint is not None
+            and manifest_window_fingerprint
+            != cycle_window_fingerprint(accepted_release=accepted_release, window=window)
+        ):
+            raise CycleEvidenceIntegrityError("S3 manifest/window fingerprint mismatch")
+        envelope_data = metadata["envelope"]
+        if not isinstance(envelope_data, Mapping):
+            raise CycleEvidenceIntegrityError("S3 envelope metadata is malformed")
+        envelope = CycleEnvelope(
+            **{field.name: envelope_data[field.name] for field in fields(CycleEnvelope)}
+        )
+        envelope.assert_tail_sufficient()
+        if metadata.get("tail_required_ns") != envelope.worst_configured_tail_ns():
+            raise CycleEvidenceIntegrityError("S3 envelope tail metadata is inconsistent")
+        if metadata.get("tail_sufficient") is not True:
+            raise CycleEvidenceIntegrityError("S3 envelope closing tail is not sufficient")
+    except CycleEvidenceIntegrityError:
+        raise
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CycleEvidenceIntegrityError("S3 evidence metadata is malformed") from exc
     decisions_raw: dict[int, tuple[QuoteVersion, tuple[BookEvidence, ...]]] = {}
     inputs_raw: defaultdict[int, list[CausalEvent | CycleClock]] = defaultdict(list)
     ends_raw: dict[int, int | None] = {}
@@ -2829,12 +2921,33 @@ def _read_run(path: Path) -> _RunBundle:
         if tuple(index for index, _ in stream_inputs_raw) != tuple(range(len(stream_inputs_raw))):
             raise CycleEvidenceIntegrityError("S3 stream input indices are not contiguous")
         driver = CycleRunDriver(window, envelope=envelope, persist=False, streaming=True)
-        for index in expected_indices:
-            version, books = decisions_raw[index]
-            driver.admit_decision(index, version, source_books=books)
-        for _, item in stream_inputs_raw:
-            driver.accept_global_input(item)
-        driver.finish_stream(end_monotonic_ns=stream_end)
+        # Replay the physical producer order.  Admitting every decision before
+        # replaying the stream would let a later decision bypass an active
+        # lane, and would therefore turn a valid persisted stream into a
+        # different kernel history.
+        stream_input_by_index = {
+            index: item for index, item in stream_inputs_raw
+        }
+        stream_input_cursor = 0
+        for record in records[1:-1]:
+            kind = record.get("kind")
+            if kind == "CYCLE_DECISION":
+                index = _non_negative_int(
+                    _require(record, "attempt_index", context="CYCLE_DECISION"),
+                    "attempt_index",
+                )
+                version, books = decisions_raw[index]
+                driver.admit_decision(index, version, source_books=books)
+            elif kind == "CYCLE_STREAM_INPUT":
+                item = stream_input_by_index[stream_input_cursor]
+                driver.accept_global_input(item)
+                stream_input_cursor += 1
+            elif kind == "CYCLE_STREAM_END":
+                driver.finish_stream(end_monotonic_ns=stream_end)
+        if stream_input_cursor != len(stream_inputs_raw):
+            raise CycleEvidenceIntegrityError("S3 stream replay did not consume every input")
+        if not driver._stream_ended:
+            driver.finish_stream(end_monotonic_ns=stream_end)
         driver.finalize()
     else:
         driver = CycleRunDriver(window, envelope=envelope, persist=False)
@@ -3069,14 +3182,44 @@ def _paths_for_report(path: str | os.PathLike[str]) -> tuple[Path, ...]:
     raise CycleEvidenceIntegrityError(f"no S3 evidence JSONL found at {selected}")
 
 
+def _validate_report_window_set(
+    windows: Sequence[CycleWindow],
+    *,
+    exact_campaign: bool,
+    envelope: CycleEnvelope | None = None,
+) -> None:
+    """Validate identities for both partial descriptive reports and campaigns."""
+
+    if not windows:
+        raise CycleEvidenceIntegrityError("S3 report has no windows")
+    if len({window.window_id for window in windows}) != len(windows):
+        raise CycleEvidenceIntegrityError("S3 report contains duplicate window identities")
+    if len({window.campaign_id for window in windows}) != 1:
+        raise CycleEvidenceIntegrityError("S3 report windows use different campaign identities")
+    ordered = tuple(sorted(windows, key=lambda window: window.start_utc))
+    if any(current.start_utc < previous.end_utc for previous, current in zip(ordered, ordered[1:])):
+        raise CycleEvidenceIntegrityError("S3 report windows overlap")
+    if exact_campaign:
+        validate_cycle_windows(windows, envelope=envelope)
+
+
 def build_cycle_report(path: str | os.PathLike[str]) -> dict[str, Any]:
     """Replay one run or a campaign root and return deterministic metrics."""
 
     paths = _paths_for_report(path)
+    if len(paths) > 4:
+        raise CycleEvidenceIntegrityError("S3 campaign report contains more than four windows")
     bundles = tuple(_read_run(item) for item in paths)
+    run_ids = [next(iter_records(bundle.path)).get("run_id") for bundle in bundles]
+    if len(set(run_ids)) != len(run_ids):
+        raise CycleEvidenceIntegrityError("S3 report contains duplicate run identities")
     metadata = bundles[0].metadata
     campaign_id = metadata["campaign_id"]
     policy_fingerprint = metadata["policy_fingerprint"]
+    accepted_release = metadata["accepted_release"]
+    evidence_mode = metadata["evidence_mode"]
+    if any(bundle.metadata["evidence_mode"] != evidence_mode for bundle in bundles[1:]):
+        raise CycleEvidenceIntegrityError("S3 report mixes fixture and observed-public provenance")
     envelope_data = metadata["envelope"]
     if not isinstance(envelope_data, Mapping):
         raise CycleEvidenceIntegrityError("S3 report envelope metadata is malformed")
@@ -3084,10 +3227,22 @@ def build_cycle_report(path: str | os.PathLike[str]) -> dict[str, Any]:
         **{field.name: envelope_data[field.name] for field in fields(CycleEnvelope)}
     )
     for bundle in bundles[1:]:
-        if bundle.metadata["campaign_id"] != campaign_id or bundle.metadata["policy_fingerprint"] != policy_fingerprint:
+        if (
+            bundle.metadata["campaign_id"] != campaign_id
+            or bundle.metadata["policy_fingerprint"] != policy_fingerprint
+            or bundle.metadata["accepted_release"] != accepted_release
+        ):
             raise CycleEvidenceIntegrityError("S3 campaign or policy identity mismatch across windows")
         if bundle.metadata.get("envelope") != envelope_data:
             raise CycleEvidenceIntegrityError("S3 campaign envelope mismatch across windows")
+    manifest_hashes = {
+        bundle.metadata.get("manifest_sha256") for bundle in bundles
+    }
+    if evidence_mode == "OBSERVATIONAL":
+        if None in manifest_hashes or len(manifest_hashes) != 1:
+            raise CycleEvidenceIntegrityError(
+                "observed-public S3 report lacks one immutable manifest identity"
+            )
     windows = tuple(
         CycleWindow.from_text(
             campaign_id=bundle.metadata["campaign_id"],
@@ -3099,8 +3254,20 @@ def build_cycle_report(path: str | os.PathLike[str]) -> dict[str, Any]:
         )
         for bundle in bundles
     )
-    if len(windows) == 4:
-        validate_cycle_windows(windows, envelope=envelope)
+    campaign_shape_valid = len(windows) == 4
+    _validate_report_window_set(
+        windows,
+        exact_campaign=campaign_shape_valid,
+        envelope=envelope,
+    )
+    observed_public = evidence_mode == "OBSERVATIONAL"
+    prospective_public = observed_public and all(
+        bundle.metadata.get("prospective") is True for bundle in bundles
+    )
+    manifest_complete = evidence_mode == "FIXTURE" or (
+        len(manifest_hashes) == 1 and None not in manifest_hashes
+    )
+    campaign_complete = campaign_shape_valid and prospective_public and manifest_complete
     summaries = tuple(_window_summary(bundle) for bundle in bundles)
     all_primary = tuple(result for bundle in bundles for result in bundle.replay_results if result.scenario is CycleScenario.PRIMARY)
     all_stress = tuple(result for bundle in bundles for result in bundle.replay_results if result.scenario is CycleScenario.STRESS)
@@ -3118,7 +3285,8 @@ def build_cycle_report(path: str | os.PathLike[str]) -> dict[str, Any]:
             days[summary["day"]] += Decimal(value)
     primary_without_best = primary["total_without_best_dependence_group_usd"]
     floors_pass = (
-        primary["complete_cycle_count"] >= S3_REQUIRED_COMPLETE_CYCLES
+        campaign_complete
+        and primary["complete_cycle_count"] >= S3_REQUIRED_COMPLETE_CYCLES
         and primary["filled_entry_dependence_group_count"] >= S3_REQUIRED_FILLED_GROUPS
         and len(qualifying_windows) >= S3_REQUIRED_WINDOWS_WITH_CYCLES
         and len({summary["day"] for summary in qualifying_windows}) >= 2
@@ -3144,7 +3312,7 @@ def build_cycle_report(path: str | os.PathLike[str]) -> dict[str, Any]:
         structurally_valid
         and unresolved_count == 0
         and floors_pass
-        and len(bundles) >= 4
+        and campaign_complete
     )
     if not structurally_valid or unresolved_count:
         sufficiency_label = "INSUFFICIENT"
@@ -3152,8 +3320,12 @@ def build_cycle_report(path: str | os.PathLike[str]) -> dict[str, Any]:
         sufficiency_label = "INSUFFICIENT"
     else:
         sufficiency_label = "SUFFICIENT"
-    if len(bundles) == 1:
+    if evidence_mode == "FIXTURE":
+        usefulness = "FIXTURE_ONLY"
+    elif len(bundles) == 1:
         usefulness = "SINGLE_WINDOW_DESCRIPTIVE_ONLY"
+    elif not campaign_complete:
+        usefulness = "INCOMPLETE_CAMPAIGN"
     elif robustness_pass:
         usefulness = "DESCRIPTIVE_CAMPAIGN_SCREEN_PASS"
     else:
@@ -3162,8 +3334,18 @@ def build_cycle_report(path: str | os.PathLike[str]) -> dict[str, Any]:
         "schema_version": S3_SCHEMA_VERSION,
         "experiment_kind": S3_EXPERIMENT_KIND,
         "campaign_id": campaign_id,
+        "accepted_release": accepted_release,
         "policy_fingerprint": policy_fingerprint,
         "window_count": len(bundles),
+        "campaign_complete": campaign_complete,
+        "provenance": {
+            "evidence_mode": evidence_mode,
+            "fixture_only": evidence_mode == "FIXTURE",
+            "observed_public": observed_public,
+            "prospective_public": prospective_public,
+            "manifest_sha256": next(iter(manifest_hashes)) if manifest_complete and evidence_mode == "OBSERVATIONAL" else None,
+            "campaign_eligible": campaign_complete,
+        },
         "measurement_validity": "VALID" if structurally_valid else "DATA_INSUFFICIENT",
         "evidence_sufficiency": sufficiency_label,
         "aggregate_caps": {
@@ -3184,7 +3366,13 @@ def build_cycle_report(path: str | os.PathLike[str]) -> dict[str, Any]:
         },
         "usefulness": {
             "label": usefulness,
-            "campaign_qualification": "QUALIFIED_DESCRIPTIVE_ONLY" if sufficient and robustness_pass else "INSUFFICIENT",
+            "campaign_qualification": (
+                "FIXTURE_ONLY"
+                if evidence_mode == "FIXTURE"
+                else "QUALIFIED_DESCRIPTIVE_ONLY"
+                if sufficient and robustness_pass
+                else "INSUFFICIENT"
+            ),
             "complete_cycle_floor": S3_REQUIRED_COMPLETE_CYCLES,
             "filled_group_floor": S3_REQUIRED_FILLED_GROUPS,
             "qualifying_window_floor": S3_REQUIRED_WINDOWS_WITH_CYCLES,

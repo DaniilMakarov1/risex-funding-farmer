@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+import json
 from pathlib import Path
 
 import pytest
 
 from risex_farmer.models import Venue
-from risex_spread_shadow.causal import CausalEvent
+from risex_spread_shadow.causal import CausalEvent, CausalSourceIdentity
 from risex_spread_shadow.feed import (
     FeedBookEvent,
     FeedTradeEvent,
@@ -32,8 +33,11 @@ from risex_spread_shadow.s3_cycle import (
     build_cycle_report,
     cycle_policy_fingerprint,
     fixture_campaign_windows,
+    run_fixture_window,
     freeze_cycle_manifest,
     run_public_cycle_collection,
+    _dependence_groups,
+    _scenario_report,
     _fixture_market,
 )
 from risex_spread_shadow.store import (
@@ -356,3 +360,328 @@ def test_manifest_is_create_once(tmp_path: Path) -> None:
             accepted_release=ACCEPTED_RELEASE,
             windows=windows,
         )
+
+
+def test_incomplete_fixture_campaign_is_not_a_sufficient_observed_campaign(tmp_path: Path) -> None:
+    windows = fixture_campaign_windows(campaign_id="incomplete-campaign")
+    for window in windows[:3]:
+        run_fixture_window(
+            tmp_path,
+            accepted_release=ACCEPTED_RELEASE,
+            window=window,
+            fixture_profile="normal",
+            count=8,
+            claim=False,
+        )
+
+    report = build_cycle_report(tmp_path)
+    assert report["window_count"] == 3
+    assert report["measurement_validity"] == "VALID"
+    assert report["evidence_sufficiency"] == "INSUFFICIENT"
+    assert report["campaign_complete"] is False
+    assert report["provenance"] == {
+        "evidence_mode": "FIXTURE",
+        "fixture_only": True,
+        "observed_public": False,
+        "prospective_public": False,
+        "manifest_sha256": None,
+        "campaign_eligible": False,
+    }
+    assert report["usefulness"]["label"] == "FIXTURE_ONLY"
+    assert report["usefulness"]["campaign_qualification"] == "FIXTURE_ONLY"
+
+
+def test_campaign_report_rejects_extra_and_duplicate_windows(tmp_path: Path) -> None:
+    windows = fixture_campaign_windows(campaign_id="window-shape-campaign")
+    for window in (*windows, windows[0]):
+        run_fixture_window(
+            tmp_path,
+            accepted_release=ACCEPTED_RELEASE,
+            window=window,
+            count=1,
+            claim=False,
+        )
+
+    with pytest.raises(CycleEvidenceIntegrityError, match="more than four windows"):
+        build_cycle_report(tmp_path)
+
+    duplicate_root = tmp_path / "duplicate"
+    for window in (windows[0], windows[0], windows[1], windows[2]):
+        run_fixture_window(
+            duplicate_root,
+            accepted_release=ACCEPTED_RELEASE,
+            window=window,
+            count=1,
+            claim=False,
+        )
+
+    with pytest.raises(CycleEvidenceIntegrityError, match="duplicate window"):
+        build_cycle_report(duplicate_root)
+
+
+def test_report_rejects_mixed_fixture_and_observed_provenance(tmp_path: Path) -> None:
+    windows = fixture_campaign_windows(campaign_id="provenance-campaign")
+    first = run_fixture_window(
+        tmp_path,
+        accepted_release=ACCEPTED_RELEASE,
+        window=windows[0],
+        count=1,
+        claim=False,
+    )
+    run_fixture_window(
+        tmp_path,
+        accepted_release=ACCEPTED_RELEASE,
+        window=windows[1],
+        count=1,
+        claim=False,
+    )
+    records = list(iter_records(first.store_path))
+    records[0]["metadata"]["evidence_mode"] = "OBSERVATIONAL"
+    records[0]["metadata"]["manifest_sha256"] = "0" * 64
+    records[0]["metadata"]["manifest_window_fingerprint"] = records[0]["metadata"]["window_fingerprint"]
+    records[0]["metadata"]["prospective"] = True
+    first.store_path.write_text(
+        "".join(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(CycleEvidenceIntegrityError, match="mixes fixture"):
+        build_cycle_report(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_stream_persistence_replays_decisions_in_physical_order(tmp_path: Path, monkeypatch) -> None:
+    from risex_spread_shadow.s3_cycle import fixture_cycle_attempts
+
+    window = fixture_campaign_windows(campaign_id="stream-replay-campaign")[0]
+    manifest = CycleCampaignManifest(
+        campaign_id=window.campaign_id,
+        accepted_release=ACCEPTED_RELEASE,
+        policy_fingerprint=cycle_policy_fingerprint(ACCEPTED_RELEASE),
+        windows=fixture_campaign_windows(campaign_id=window.campaign_id),
+        envelope=CycleEnvelope(),
+        created_utc=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    attempt = fixture_cycle_attempts(window, count=1, profile="normal")[0]
+    source_books = tuple(
+        replace(
+            book,
+            received_monotonic_ns=10_400_000_000,
+            ingress_received_monotonic_ns=10_400_000_000,
+            normalized_ready_monotonic_ns=10_400_000_000,
+            decision_ready_monotonic_ns=10_400_000_000,
+        )
+        for book in attempt.source_books
+    )
+
+    async def selector(*_args, **_kwargs):
+        return (PAIR,)
+
+    class BookOnlyFeed:
+        fatal_reason = None
+
+        def __init__(self, ingress):
+            self.ingress = ingress
+
+        async def run(self, **_kwargs):
+            for book in source_books:
+                self.ingress.offer(FeedBookEvent(book, PAIR, "SNAPSHOT", "VALID"))
+
+    def feed_factory(*args, **_kwargs):
+        return BookOnlyFeed(args[2])
+
+    monkeypatch.setattr(
+        "risex_spread_shadow.s3_cycle.validate_loaded_release",
+        lambda *_args, **_kwargs: tmp_path,
+    )
+    monotonic_values = iter((10_000_000_000, 10_500_000_000, 10_600_000_000))
+    output = await run_public_cycle_collection(
+        tmp_path,
+        manifest=manifest,
+        window_id=window.window_id,
+        now_utc=lambda: window.start_utc,
+        monotonic_ns=lambda: next(monotonic_values),
+        market_selector=selector,
+        feed_factory=feed_factory,
+    )
+
+    records = list(iter_records(output.store_path))
+    kinds = [record["kind"] for record in records]
+    assert kinds.index("CYCLE_DECISION") > kinds.index("CYCLE_STREAM_INPUT")
+    metadata = records[0]["metadata"]
+    assert records[-1]["observed_monotonic_ns"] == metadata["monotonic_start_ns"] + 45 * 60 * 1_000_000_000
+    report = build_cycle_report(output.store_path)
+    assert report["measurement_validity"] == "VALID"
+    assert report["provenance"]["observed_public"] is True
+    assert report["economics"]["primary"]["aborted_count"] == 1
+
+
+def test_report_rejects_corrupt_policy_release_and_window_metadata(tmp_path: Path) -> None:
+    mutations = (
+        ("policy", lambda metadata: metadata["policy"].update(target_margin_bps="2"), "policy metadata"),
+        ("release", lambda metadata: metadata.update(accepted_release="0" * 40), "fingerprint"),
+        ("window", lambda metadata: metadata.update(window_id="different-window"), "fingerprint"),
+        ("provenance", lambda metadata: metadata.pop("evidence_mode"), "missing evidence_mode"),
+    )
+    for name, mutate, message in mutations:
+        root = tmp_path / name
+        window = fixture_campaign_windows(campaign_id=f"corrupt-{name}")[0]
+        output = run_fixture_window(
+            root,
+            accepted_release=ACCEPTED_RELEASE,
+            window=window,
+            count=1,
+            claim=False,
+        )
+        records = list(iter_records(output.store_path))
+        mutate(records[0]["metadata"])
+        output.store_path.write_text(
+            "".join(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n" for record in records),
+            encoding="utf-8",
+        )
+        with pytest.raises(CycleEvidenceIntegrityError, match=message):
+            build_cycle_report(output.store_path)
+
+
+def test_transitive_overlapping_entry_identities_form_one_dependence_group() -> None:
+    from risex_spread_shadow.s3_cycle import fixture_cycle_attempts
+
+    window = fixture_campaign_windows(campaign_id="transitive-groups")[0]
+    driver = CycleRunDriver(window, persist=False)
+    results = driver.run(fixture_cycle_attempts(window, count=3, profile="normal"))
+    primary = [result for result in results if result.scenario is CycleScenario.PRIMARY]
+    mutated = []
+    for result, (left, right) in zip(primary, (("A", "B"), ("B", "C"), ("C", "D"))):
+        assert result.fills
+        assert all(isinstance(fill.source_identity, CausalSourceIdentity) for fill in result.fills)
+        fills = tuple(
+            replace(
+                fill,
+                source_identity=replace(
+                    fill.source_identity,
+                    maker_order_id=left,
+                    taker_order_id=right,
+                ),
+            )
+            for fill in result.fills
+        )
+        measurement = result.entry_measurement
+        assert measurement is not None
+        causal_fills = tuple(
+            replace(
+                fill,
+                source_identity=replace(
+                    fill.source_identity,
+                    maker_order_id=left,
+                    taker_order_id=right,
+                ),
+            )
+            for fill in measurement.fills
+        )
+        mutated.append(
+            replace(
+                result,
+                entry_measurement=replace(measurement, fills=causal_fills),
+                ledger=replace(result.ledger, fills=fills),
+            )
+        )
+
+    groups, unresolved = _dependence_groups(mutated)
+    report = _scenario_report(mutated, CycleScenario.PRIMARY)
+    assert unresolved == 0
+    assert len(set(groups.values())) == 1
+    assert report["filled_entry_dependence_group_count"] == 1
+    assert report["total_without_best_dependence_group_usd"] == "0.000000"
+
+
+def test_terminal_marker_stays_inside_s3_record_cap(tmp_path: Path) -> None:
+    envelope = CycleEnvelope(
+        max_records=5,
+        record_reserve=1,
+        max_bytes=200_000,
+        bytes_reserve=1_000,
+    )
+    window = CycleWindow(
+        campaign_id="terminal-cap-campaign",
+        window_id="window-1",
+        start_utc=datetime(2026, 1, 1, tzinfo=UTC),
+        end_utc=datetime(2026, 1, 1, 0, 45, tzinfo=UTC),
+    )
+    from risex_spread_shadow.s3_cycle import _preflight_campaign_store
+
+    metadata = _metadata(window, envelope)
+    run_id = new_run_id()
+    _preflight_campaign_store(
+        tmp_path,
+        campaign_id=window.campaign_id,
+        envelope=envelope,
+        metadata=metadata,
+        run_id=run_id,
+    )
+    store = AppendOnlyEvidenceStore.create(
+        tmp_path,
+        metadata=metadata,
+        run_id=run_id,
+        max_records=envelope.max_records + TERMINAL_FAILURE_RECORD_RESERVE,
+        max_bytes=envelope.max_bytes + TERMINAL_FAILURE_BYTES_RESERVE,
+    )
+    writer = CycleEvidenceWriter(store, envelope, window=window, campaign_root=tmp_path)
+    writer.append({"kind": "CYCLE_NOTE", "observed_monotonic_ns": 1})
+    writer.append({"kind": "CYCLE_NOTE", "observed_monotonic_ns": 2})
+    writer.append({"kind": "CYCLE_CLOSING_NOTE", "observed_monotonic_ns": window.cutoff_monotonic_ns})
+    writer.append_terminal()
+    assert store.record_count == envelope.max_records
+    with pytest.raises(CycleEvidenceIntegrityError, match="more than one terminal"):
+        writer.append_terminal()
+    store.close()
+
+
+def test_cutoff_deadline_and_configured_closing_tail_are_explicit() -> None:
+    from risex_spread_shadow.s3_cycle import fixture_cycle_attempts
+
+    window = fixture_campaign_windows(campaign_id="timing-envelope")[0]
+    envelope = CycleEnvelope()
+    assert envelope.worst_configured_tail_seconds == 131
+    assert envelope.closing_tail_seconds == 135
+    envelope.assert_tail_sufficient()
+
+    late = fixture_cycle_attempts(window, count=1, profile="normal")[0]
+    late_version = replace(
+        late.quote_version,
+        decision_ready_monotonic_ns=window.cutoff_monotonic_ns + 1,
+    )
+    driver = CycleRunDriver(window, persist=False)
+    admissions = driver.admit_decision(
+        0,
+        late_version,
+        source_books=late.source_books,
+    )
+    assert all(not admission.accepted for admission in admissions)
+    assert {admission.reason for admission in admissions} == {"ENTRY_CUTOFF"}
+    assert driver.decision_finished(0)
+
+    streaming = CycleRunDriver(window, persist=False, streaming=True)
+    with pytest.raises(CycleEvidenceIntegrityError, match="hard market deadline"):
+        streaming.accept_global_input(
+            __import__("risex_spread_shadow.cycle", fromlist=["CycleClock"]).CycleClock(
+                window.deadline_monotonic_ns + 1
+            )
+        )
+
+
+def test_retention_exhaustion_is_an_explicit_lane_halt() -> None:
+    from risex_spread_shadow.s3_cycle import fixture_cycle_attempts
+
+    window = fixture_campaign_windows(campaign_id="retention-envelope")[0]
+    driver = CycleRunDriver(
+        window,
+        envelope=CycleEnvelope(kernel_retention_capacity=1),
+        persist=False,
+    )
+    output = driver.run(fixture_cycle_attempts(window, count=2, profile="normal"))
+    assert len(output) == 2
+    assert all(driver.lanes_halted() for _ in (0,))
+    assert [admission.reason for admission in driver.admissions[-2:]] == [
+        "TERMINAL_RETENTION_EXHAUSTED",
+        "TERMINAL_RETENTION_EXHAUSTED",
+    ]
