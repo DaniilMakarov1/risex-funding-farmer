@@ -1411,7 +1411,11 @@ def _result(cycle: _MutableCycle, *, terminal: bool = False) -> CycleResult:
     pending = any(action.status in {CycleActionStatus.PENDING, CycleActionStatus.UNRESOLVED} for action in cycle.actions)
     positions = cycle.positions
     flat_terminal = status in {CycleTerminalState.NORMAL, CycleTerminalState.FORCED, CycleTerminalState.ABORTED} and positions.is_zero and not pending
-    cashflow_complete = flat_terminal and len(cycle.fills) == len(cycle.fees) == len(cycle.cashflows)
+    cashflow_complete = (
+        status in {CycleTerminalState.NORMAL, CycleTerminalState.FORCED}
+        and flat_terminal
+        and len(cycle.fills) == len(cycle.fees) == len(cycle.cashflows)
+    )
     terminal_ns = cycle.terminal_ns if terminal else (cycle.current_ns if status is CycleTerminalState.UNRESOLVED else None)
     if status is CycleTerminalState.UNRESOLVED:
         cycle.add_reason(CycleReason.TERMINAL_NON_FLAT if not positions.is_zero else CycleReason.TERMINAL_PENDING_ACTION if pending else CycleReason.TERMINAL_PENDING_ACTION)
@@ -1748,7 +1752,8 @@ class CycleKernel:
         not infer a future cancel, taker fill, or max-hold event from a prefix.
         """
 
-        if end_monotonic_ns is not None:
+        lane = self._lane(scenario)
+        if end_monotonic_ns is not None and lane.active is not None:
             self.advance_clock(end_monotonic_ns, scenario=scenario)
         result = self.snapshot(scenario)
         if result is None:
@@ -1771,6 +1776,13 @@ class CycleKernel:
             raise CycleAdmissionError(admission)
         for event in events:
             self.advance(event, scenario=scenario)
+            # Terminal lanes deliberately stop consuming later fixture
+            # records.  A complete cycle has already crossed its flat barrier;
+            # trailing records belong to a later decision or are irrelevant to
+            # this attempt and must not be presented to a lane with no active
+            # cycle.
+            if self._lane(scenario).active is None:
+                break
         return self.finish(scenario=scenario, end_monotonic_ns=end_monotonic_ns)
 
     run_stream = run
@@ -1926,9 +1938,24 @@ class CycleKernel:
     def _gap_overlaps_live_cycle(self, cycle: _MutableCycle, gap: DataGapEvidence) -> bool:
         if gap.canonical_market != cycle.quote_version.canonical_market:
             return False
-        if cycle.phase in {_Phase.ENTRY_WAIT, _Phase.ENTRY_ACTIVE, _Phase.ENTRY_HEDGE_WAIT}:
+        if cycle.phase in {_Phase.ENTRY_WAIT, _Phase.ENTRY_ACTIVE, _Phase.ENTRY_HEDGE_WAIT, _Phase.UNMATCHED_WAIT}:
             start = cycle.entry_activation_ns
-            end = max(cycle.current_ns, cycle.entry_cancel_effective_ns or cycle.current_ns)
+            pending_due = max(
+                (
+                    action.due_ns
+                    for action in cycle.actions
+                    if action.action_id in cycle.scheduled_takers
+                    and action.status is CycleActionStatus.PENDING
+                    and action.due_ns is not None
+                ),
+                default=cycle.current_ns,
+            )
+            end = max(
+                cycle.current_ns,
+                cycle.entry_cancel_effective_ns or cycle.current_ns,
+                cycle.entry_hedge_due_ns or cycle.current_ns,
+                pending_due,
+            )
         elif cycle.phase in {_Phase.EXIT_WAIT, _Phase.EXIT_ACTIVE, _Phase.EXIT_CANCEL_WAIT, _Phase.CLOSE_WAIT, _Phase.FORCE_WAIT}:
             start = cycle.exit_activation_ns or cycle.current_ns
             end = max(cycle.current_ns, cycle.max_hold_deadline_ns or cycle.current_ns)
@@ -1938,6 +1965,64 @@ class CycleKernel:
 
     def _action_is_live(self, cycle: _MutableCycle) -> bool:
         return cycle.phase not in {_Phase.COMPLETE, _Phase.ABORTED, _Phase.UNRESOLVED}
+
+    @staticmethod
+    def _entry_candidate_after_commit(cycle: _MutableCycle, event: CausalEvent) -> bool:
+        """Identify a possible entry fill after the entry state was committed.
+
+        A trade's local receipt interval is immutable evidence.  It can arrive
+        after a delayed processing boundary has already moved the lane into
+        hedging or exit, but silently treating a quote-crossing trade as an
+        irrelevant exit/late event would erase possible exposure.  The kernel
+        therefore only identifies the candidate here; the committed state is
+        halted below instead of being rewritten or replayed.
+        """
+
+        trade = event.trade
+        if trade is None or event.venue is not Venue.RISEX:
+            return False
+        if trade.aggressor_side is not Side.BUY:
+            return False
+        cutoff = (
+            cycle.entry_cancel_effective_ns
+            if cycle.entry_cancel_effective_ns is not None
+            else cycle.entry_cancel_requested_ns + cycle.delays.cancel_delay_ns
+            if cycle.entry_cancel_requested_ns is not None
+            else cycle.entry_cancel_schedule_ns + cycle.delays.cancel_delay_ns
+        )
+        if not cycle.entry_activation_ns <= event.causal_monotonic_ns < cutoff:
+            return False
+        if cycle.entry_remaining_quantity <= 0:
+            return False
+        crosses, ambiguous = _trade_crosses(cycle.entry_quote, trade)
+        return crosses or ambiguous
+
+    @staticmethod
+    def _exit_candidate_after_commit(cycle: _MutableCycle, event: CausalEvent) -> bool:
+        """Identify a possible exit fill after a close/force transition."""
+
+        trade = event.trade
+        quote = cycle.exit_quote
+        if trade is None or quote is None or event.venue is not Venue.RISEX:
+            return False
+        if trade.aggressor_side is not Side.SELL:
+            return False
+        activation = quote.activation_monotonic_ns
+        if activation is None:
+            return False
+        if cycle.exit_remaining_quantity <= 0:
+            return False
+        cutoff = (
+            cycle.exit_cancel_effective_ns
+            if cycle.exit_cancel_effective_ns is not None
+            else cycle.exit_cancel_requested_ns + cycle.delays.cancel_delay_ns
+            if cycle.exit_cancel_requested_ns is not None
+            else 10**30
+        )
+        if not activation <= event.causal_monotonic_ns < cutoff:
+            return False
+        crosses, ambiguous = _trade_crosses(quote, trade)
+        return crosses or ambiguous
 
     def _handle_trade(self, cycle: _MutableCycle, event: CausalEvent) -> None:
         trade = event.trade
@@ -1972,6 +2057,42 @@ class CycleKernel:
             self._halt(cycle, reason)
             return
         ready = _processing_ready_ns(event)
+        entry_phases = {
+            _Phase.ENTRY_WAIT,
+            _Phase.ENTRY_ACTIVE,
+            _Phase.ENTRY_HEDGE_WAIT,
+        }
+        exit_phases = {_Phase.EXIT_ACTIVE, _Phase.EXIT_CANCEL_WAIT}
+        if cycle.phase not in entry_phases and self._entry_candidate_after_commit(cycle, event):
+            cycle.add_reason(CycleReason.ENTRY_CAUSAL_UNCERTAINTY)
+            cycle.add_reason(CycleReason.LATE_OLDER_EVENT)
+            cycle.entry_uncertainty.append(CausalUncertainty.LATE_OLDER_EVENT.value)
+            cycle.entry_decisions.append(
+                CausalEventDecision(
+                    event.kind,
+                    event.event_id,
+                    event.ingress_received_monotonic_ns,
+                    "UNCERTAIN",
+                    "LATE_ENTRY_AFTER_COMMIT",
+                )
+            )
+            self._halt(cycle, CycleReason.ENTRY_CAUSAL_UNCERTAINTY)
+            return
+        if cycle.phase not in exit_phases and self._exit_candidate_after_commit(cycle, event):
+            cycle.add_reason(CycleReason.EXIT_CAUSAL_UNCERTAINTY)
+            cycle.add_reason(CycleReason.LATE_OLDER_EVENT)
+            cycle.exit_uncertainty.append(CausalUncertainty.LATE_OLDER_EVENT.value)
+            cycle.exit_decisions.append(
+                CausalEventDecision(
+                    event.kind,
+                    event.event_id,
+                    event.ingress_received_monotonic_ns,
+                    "UNCERTAIN",
+                    "LATE_EXIT_AFTER_COMMIT",
+                )
+            )
+            self._halt(cycle, CycleReason.EXIT_CAUSAL_UNCERTAINTY)
+            return
         expected_aggressor = Side.BUY if cycle.phase in {
             _Phase.ENTRY_WAIT,
             _Phase.ENTRY_ACTIVE,
@@ -2048,6 +2169,17 @@ class CycleKernel:
             )
             entry_action.executed_quantity = cycle.entry_observed_quantity
             entry_action.reason = "ENTRY_MAKER_PARTIAL"
+            if cycle.entry_cancel_requested_ns is not None:
+                cancel = _action(cycle, "entry-cancel")
+                if cancel.status is CycleActionStatus.PENDING:
+                    cancel.requested_quantity = cycle.entry_remaining_quantity
+                elif cancel.status is CycleActionStatus.COMPLETED and cycle.entry_cancel_effective_ns is not None:
+                    # A fill received before the effective boundary may be
+                    # processed later.  Retain the fill and reconcile the
+                    # already-recorded cancellation to the exact remaining
+                    # maker quantity instead of silently losing the event.
+                    cancel.requested_quantity = cycle.entry_remaining_quantity
+                    cancel.executed_quantity = cycle.entry_remaining_quantity
             _append_fill(
                 cycle,
                 action_id="entry-maker",
@@ -2116,7 +2248,7 @@ class CycleKernel:
                 cycle.entry_hedge_due_ns = max(ready, cycle.current_ns) + cycle.delays.taker_delay_ns
                 cycle.phase = _Phase.ENTRY_HEDGE_WAIT
             else:
-                cycle.phase = _Phase.ENTRY_ACTIVE
+                cycle.phase = _Phase.ENTRY_HEDGE_WAIT if cycle.entry_hedge_due_ns is not None else _Phase.ENTRY_ACTIVE
             return
         if cycle.exit_quote is None or cycle.phase not in {_Phase.EXIT_ACTIVE, _Phase.EXIT_CANCEL_WAIT}:
             cycle.ignored_event_count += 1
@@ -2215,6 +2347,28 @@ class CycleKernel:
         elif cycle.exit_remaining_quantity == 0:
             exit_action = _action(cycle, "exit-maker")
             _set_action_result(cycle, exit_action, status=CycleActionStatus.COMPLETED, executed=cycle.exit_quote.quantity, reason="EXIT_MAKER_FILLED", evidence_id=identity.source_event_id)
+            if cycle.exit_cancel_requested_ns is not None:
+                cancel = _add_action(
+                    cycle,
+                    action_id="exit-cancel",
+                    kind=CycleActionKind.EXIT_CANCEL,
+                    status=CycleActionStatus.NOT_REQUIRED,
+                    requested_ns=cycle.exit_cancel_requested_ns,
+                    effective_ns=ready,
+                    due_ns=ready,
+                    quantity=_ZERO,
+                    reason="EXIT_FULLY_FILLED_DURING_CANCEL_WINDOW",
+                )
+                cancel.requested_quantity = _ZERO
+                _set_action_result(
+                    cycle,
+                    cancel,
+                    status=CycleActionStatus.NOT_REQUIRED,
+                    executed=_ZERO,
+                    reason="EXIT_FULLY_FILLED_DURING_CANCEL_WINDOW",
+                )
+                cancel.effective_ns = ready
+                cancel.due_ns = ready
             cycle.phase = _Phase.CLOSE_WAIT
 
     def _run_due_until(self, cycle: _MutableCycle, target_ns: int) -> None:
@@ -2438,6 +2592,10 @@ class CycleKernel:
             action = _action(cycle, "exit-cancel")
             action.requested_quantity = cycle.exit_remaining_quantity
             _set_action_result(cycle, action, status=CycleActionStatus.COMPLETED, executed=cycle.exit_remaining_quantity, reason="EXIT_CANCEL_EFFECTIVE")
+            maker = _action(cycle, "exit-maker")
+            maker.status = CycleActionStatus.COMPLETED
+            maker.executed_quantity = cycle.exit_quote.quantity - cycle.exit_remaining_quantity if cycle.exit_quote is not None else _ZERO
+            maker.reason = "EXIT_MAKER_CANCELLED_PARTIAL"
             self._schedule_forced_remaining(cycle, effective_target)
             return
         if cycle.phase is _Phase.CLOSE_WAIT:
@@ -2449,6 +2607,15 @@ class CycleKernel:
             if cycle.paired_risex_quantity == 0 and cycle.paired_lighter_quantity == 0 and cycle.unmatched_entry_quantity == 0 and not any(item.status is CycleActionStatus.PENDING for item in cycle.actions):
                 cycle.phase = _Phase.COMPLETE
                 cycle.terminal_ns = at_ns
+                return
+            if any(
+                action.action_id in cycle.scheduled_takers
+                and action.status is CycleActionStatus.PENDING
+                for action in cycle.actions
+            ):
+                # A later queued close may still account for part of the
+                # paired position.  Do not schedule a forced action against
+                # the pre-close quantity or manufacture an over-close.
                 return
             if cycle.exit_remaining_quantity > 0:
                 if cycle.exit_cancel_requested_ns is None and cycle.max_hold_deadline_ns is not None and at_ns >= cycle.max_hold_deadline_ns:
@@ -2478,6 +2645,33 @@ class CycleKernel:
         if descriptor is None:
             return
         venue, side, requested, reason = descriptor
+        position_cap: Decimal | None = None
+        if action.kind is CycleActionKind.UNMATCHED_RISEX_UNWIND:
+            position_cap = cycle.unmatched_entry_quantity
+        elif action.kind is CycleActionKind.EXIT_HEDGE_CLOSE:
+            position_cap = cycle.paired_lighter_quantity
+        elif action.kind is CycleActionKind.FORCED_RISEX_UNWIND:
+            position_cap = cycle.paired_risex_quantity
+        elif action.kind is CycleActionKind.FORCED_LIGHTER_UNWIND:
+            position_cap = cycle.paired_lighter_quantity
+        if position_cap is not None:
+            if position_cap <= 0:
+                cycle.add_reason(CycleReason.OVER_CLOSE_BLOCKED)
+                _set_action_result(
+                    cycle,
+                    action,
+                    status=CycleActionStatus.NOT_REQUIRED,
+                    executed=_ZERO,
+                    reason=CycleReason.OVER_CLOSE_BLOCKED.value,
+                )
+                return
+            if position_cap < requested:
+                # Another queued action has already accounted for part of
+                # this close.  Retain the original action identity but shrink
+                # its still-live quantity to the exact remaining exposure.
+                cycle.add_reason(CycleReason.OVER_CLOSE_BLOCKED)
+                requested = position_cap
+                action.requested_quantity = position_cap
         paired_required = venue is Venue.LIGHTER or (
             action.kind in {CycleActionKind.FORCED_LIGHTER_UNWIND, CycleActionKind.FORCED_RISEX_UNWIND}
             and cycle.paired_risex_quantity > 0
@@ -2635,8 +2829,11 @@ class CycleKernel:
             self._schedule_forced_remaining(cycle, decision_ns)
             return
         maker_price = min((raw / tick).to_integral_value(rounding=ROUND_FLOOR) * tick, risex_best_ask - tick)
-        risex_best_bid = risex_book.bids[0].canonical_price if risex_book.bids else None
-        if maker_price <= 0 or risex_best_bid is None or maker_price < risex_best_bid + tick:
+        # A BUY below the best bid is still valid post-only liquidity.  The
+        # closed-world exit formula already caps the price below the best ask;
+        # requiring bid+tick here would incorrectly reject a safe, non-crossing
+        # quote whenever the executable hedge markout is below the RISEx BBO.
+        if maker_price <= 0:
             _add_action(cycle, action_id="exit-maker", kind=CycleActionKind.EXIT_MAKER, status=CycleActionStatus.NOT_REQUIRED, requested_ns=decision_ns, effective_ns=decision_ns, due_ns=decision_ns, quantity=quantity, reason=CycleReason.EXIT_QUOTE_INVALID.value)
             cycle.add_reason(CycleReason.EXIT_QUOTE_INVALID)
             cycle.forced_used = True
@@ -2674,6 +2871,15 @@ class CycleKernel:
     def _schedule_forced_remaining(self, cycle: _MutableCycle, requested_ns: int) -> None:
         cycle.forced_used = True
         cycle.add_reason(CycleReason.FORCED_UNWIND)
+        if any(
+            action.action_id in cycle.scheduled_takers
+            and action.status is CycleActionStatus.PENDING
+            for action in cycle.actions
+        ):
+            # Let already queued delayed closes settle before sizing forced
+            # actions from the remaining positions.
+            cycle.phase = _Phase.CLOSE_WAIT
+            return
         cycle.phase = _Phase.FORCE_WAIT
         if cycle.unmatched_entry_quantity > 0 and not any(action.action_id == "unmatched-risex" for action in cycle.actions):
             cycle.unmatched_started_ns = cycle.unmatched_started_ns or requested_ns
