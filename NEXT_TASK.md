@@ -1,6 +1,6 @@
 # S1 — Causal quote measurement, offline-only
 
-Status: AUTHORIZED — one fresh visible Spread Builder; implementation not yet accepted.
+Status: AUTHORIZED — fresh completion Builder after owner-requested context rotation; implementation not yet accepted.
 Venue: central SPREAD, RISEx/Lighter public data only.
 Objective: honest timing and exact partial-volume measurement for one immutable hypothetical resting quote, suitable for the subsequent minimal cycle kernel.
 Accepted implementation baseline: `b8e9415e648543fd3435bc683eb649934c9dd0d5`.
@@ -28,6 +28,10 @@ Authority: owner "разрешаю все" on 2026-09-05 accepts the supplied S1
 
 ## Stop and next action
 
-Use one fresh visible GPT-5.6 Luna max Builder on `codex/spread-s1-causal-quote` in a separate worktree from exact gate main. Bounded fixes may stay on that candidate until formal REJECT; after REJECT a fresh session/branch is mandatory. Stop for required scope expansion, unsupported venue semantics or non-convergence. After acceptance Chief publishes checkpoint; only then may separately bounded S2 begin under the owner's authorization. No market launch follows S1.
+Use one fresh visible GPT-5.6 Luna max Builder on `codex/spread-s1-finish` in a separate worktree from the exact published main containing this rotation gate. The predecessor has stopped at clean immutable checkpoint `b2e3c9cbfe3bef7a5300c1dd4a363cf3ccb337f3` (candidate commits `20535f6`, `9d131019`, `b2e3c9c`, based on `92c3086`). These in-project changes may be reused on the fresh branch as unaccepted implementation; do not merge them into main or rewrite the predecessor. This is owner-requested rotation, not formal REJECT.
+
+The bounded completion is to independently inspect and finish the four Chief-reproduced defects: (1) pre-cancel received trades remain eligible despite later processing, while first-partial cancellation starts at actual processing-ready; (2) both exact QuoteVersion input witnesses retain original venue/session/recovery/revision bindings, including an actual factory-to-measurement regression and missing legacy evidence; (3) known equal/older RISEx blocks cannot become causal fills when an optional watermark is omitted, without invented cross-channel order; (4) freshness diagnostics evaluate each boolean condition, including a stale-input regression. The checkpoint reports fixes and 24 passing causal tests, but factory-path and stale-flag regressions and final full-suite validation remain incomplete. Check the complete resulting S1 diff for simple coherent behavior; do not add another execution model or broaden scope. One final isolated Python 3.11 full suite is required on the final SHA, followed by independent Chief review.
+
+Prefer another fresh Builder at a substantive clean checkpoint rather than prolonged context-heavy correction loops. Stop for required scope expansion, unsupported venue semantics or non-convergence. After acceptance Chief publishes checkpoint; only then may separately bounded S2 begin under the owner's authorization. No market launch follows S1.
 
 Historical CAL-001 remains DATA_INSUFFICIENT / INSUFFICIENT and HOLDOUT remains closed. Preserve `.scan-003/CAL-001.claim` and every evidence/report/audit file under `spread-shadow-runs/run-04NlPq5s8cSalaTngkOpSz6H/`; hashes and historical result remain in STATUS/Git.

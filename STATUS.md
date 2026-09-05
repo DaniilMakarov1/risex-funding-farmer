@@ -1,5 +1,7 @@
 # Current status
 
+- S1 remains unaccepted. At the owner's requested context-rotation checkpoint, the first Builder stopped with a clean immutable candidate `b2e3c9cbfe3bef7a5300c1dd4a363cf3ccb337f3` on `codex/spread-s1-causal-quote`. Its latest causal checks report 24 passed; no final full suite covers this checkpoint. Chief had reproduced cancellation timing, quote-input binding, older-block eligibility and freshness-diagnostic defects at `9d131019`; checkpoint changes address them but require fresh-Builder completion and independent acceptance. This is rotation, not formal rejection or integration. A fresh S1 completion Builder replaces the stopped predecessor under NEXT_TASK; no market work is open.
+
 - On 2026-09-05 the owner authorized the supplied sequential public-only S1/S2/S3 complete-cycle research plan ("разрешаю все"), including a later bounded campaign after independent offline acceptance and prospective exact-window freeze. S1 causal quote measurement is the only active slice; see NEXT_TASK and SYSTEM_SPEC 0.21. No new implementation is accepted and no observer is running. No token budget was set.
 
 - First working public scanner is operationally verified on accepted implementation `b8e9415e648543fd3435bc683eb649934c9dd0d5` (SCAN-003). Chief completed SCAN-004 readiness and the one prospective SCAN-005 CAL-001 sample. No implementation change was necessary.
