@@ -2,7 +2,7 @@
 
 ## Active objective — 2026-09-06
 
-The full owner objective remains unachieved: correct confirmed research-scanner defects and independently prove data handling, causal cycle modeling, bounded resources and reproducible reports, explicitly separating all unproven claims. Sole Chief `01a076a4-783e-7061-9de3-3e96194870b8` has its own ACTIVE unbudgeted Goal. No market, private or trading authority is opened.
+The full owner objective remains unachieved: correct confirmed research-scanner defects and independently prove data handling, causal cycle modeling, bounded resources and reproducible reports, explicitly separating all unproven claims. Sole Chief `01a076be-ad68-7f70-a9df-fa4ce1b5caeb` is activated and has its own ACTIVE unbudgeted Goal; predecessor is stopped. No market, private or trading authority is opened.
 
 ## Accepted S3-T1-R4
 
@@ -18,7 +18,7 @@ Production `s3_cycle.py` SHA-256 `28ba1255baaabe57e8cb0b11c6e7e6d7868490fd35f9ab
 
 ## Remaining bounded correction work
 
-Next is S3-V1 serialization-volume diagnosis/gate in NEXT_TASK. Full-book serialization cannot fit comparable original four-window traffic inside the frozen4GiB envelope. Then separately correct omitted halted-lane skips and contradictory NO_ENTRY/INSUFFICIENT_DEPTH reasons. Preserve immutable old outputs and explicitly version corrected semantics. No concurrent implementation.
+S3-V1 offline volume diagnosis is complete and its bounded implementation gate is recorded in NEXT_TASK. BOOK stream rows consume3.369GB; median Lighter depth2727 but median3 changed levels. Accepted FULL/DELTA helpers exactly reconstruct256 sampled books at97.78% byte reduction. Full candidate workload, corruption/replay and resource acceptance remain unproven; no candidate is yet accepted. Evidence `s3-v1-chief-diagnosis/summary.json` and `gate.json`. Then separately correct omitted halted-lane skips and contradictory NO_ENTRY/INSUFFICIENT_DEPTH reasons. Preserve immutable old outputs and explicitly version corrected semantics. No concurrent implementation.
 
 S3-B3 `f5d4b7d511bd579178333565cdf0e5e02f1eb3ec` already corrected unbounded full-book retention, with4055tests/3skips,86fixture comparisons and bounded D1 replay. Compact identity state still grows within the record/byte envelope; this is not arbitrary-input constant memory. S1/S2/S3 acceptance remains in Git. R3 `a0a3001e5beeebc7dbd19c24da99397227e2c6ec` remains immutable unaccepted historical evidence; original `15e14abcfe97f3f8e77eb3796bf134a597c8e199` remains rejected.
 
@@ -30,4 +30,4 @@ Root: `/Users/daniilmakarov/Desktop/RISEx Spread Shadow/spread-shadow-runs/cycle
 
 Frozen release `23c70f79a7914bd82dc55fa94f1e699734258f46`; immutable manifest and consumed claim remain retained. Original `run-uupT4CQaE0cRywb4PH9wvOfJ/evidence.jsonl`:54,692records,3,380,019,851bytes, SHA-256 `c0ffd6a5e5fe55160485f39c4b7b95d284e40cea79067ddfdaec1bc1523c21cb`. Original report oracle `D1-W1-offline-report.json`; `D1-W1-report.json` is empty historical failed output. Primary8aborted/1unresolved/0complete; stress7aborted/1unresolved/0complete. Primary cashflow$3.75831283113 is notPnL, modeled RISEx position−0.000047BTC remains unclosed. `D1-W1-chief-integrity-audit.json` attributes3,375,851,934bytes to54,608 CYCLE_STREAM_INPUT rows; only914,947,445aggregate bytes remained including536,870,912reserve.
 
-Historical CAL-001 remains insufficient, HOLDOUT closed, DG-007 NO_SNAPSHOT_EDGE. No replacement sample, threshold retuning, private access, signing or trading is opened. Fresh Chief successor `01a076be-ad68-7f70-a9df-fa4ce1b5caeb` is designated for read-only orientation at this clean accepted checkpoint and receives sole authority only upon explicit activation; predecessor then stops project work. Successor must immediately create its own ACTIVE unbudgeted Goal with full original owner objective. Paused heartbeat has been transferred unchanged to that successor. Rotation never completes the objective.
+Historical CAL-001 remains insufficient, HOLDOUT closed, DG-007 NO_SNAPSHOT_EDGE. No replacement sample, threshold retuning, private access, signing or trading is opened. Chief `01a076be-ad68-7f70-a9df-fa4ce1b5caeb` received explicit sole activation, created its own ACTIVE unbudgeted Goal with the full original owner objective, and continues S3-V1. Predecessor stopped project coordination. Paused heartbeat was transferred unchanged. Rotation never completes the objective.
