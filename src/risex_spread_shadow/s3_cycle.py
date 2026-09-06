@@ -101,6 +101,19 @@ from .store import (
 
 S3_SCHEMA_VERSION = 1
 S3_EXPERIMENT_KIND = "S3_COMPLETE_CYCLE"
+# ``schema_version`` is the original wire schema and remains stable so the
+# immutable S3 evidence already on disk can still be replayed.  The bounded
+# chronology correction is an additive output contract: old records without
+# this field retain the historical deadline-finalization semantics, while new
+# records explicitly identify the observation-boundary semantics below.
+S3_LEGACY_OUTPUT_CONTRACT_VERSION = 1
+S3_OUTPUT_CONTRACT_VERSION = 2
+_S3_OUTPUT_CONTRACT_VERSIONS = frozenset(
+    {S3_LEGACY_OUTPUT_CONTRACT_VERSION, S3_OUTPUT_CONTRACT_VERSION}
+)
+_S3_FINALIZATION_BOUNDARY_KINDS = frozenset(
+    {"SCHEDULED_DEADLINE", "EARLY_FAILURE"}
+)
 S3_WINDOW_SECONDS = 45 * 60
 S3_ENTRY_CUTOFF_SECONDS = 42 * 60 + 45
 S3_MARKET_DEADLINE_SECONDS = 45 * 60
@@ -161,6 +174,8 @@ _UNAVAILABLE_RESULT_METRICS = (
     "holding_duration_seconds",
     "occupancy_holding_duration_seconds",
     "unmatched_exposure_duration_seconds",
+    "observed_occupancy_holding_duration_seconds",
+    "observed_unmatched_exposure_duration_seconds",
     "forced_or_unmatched_pnl_usd",
     "forced_or_unmatched_full_cycle_pnl_usd",
     "forced_unmatched_exit_contribution_usd",
@@ -295,6 +310,198 @@ def _require(mapping: Mapping[str, Any], key: str, *, context: str) -> Any:
     if key not in mapping:
         raise CycleEvidenceIntegrityError(f"{context} is missing {key}")
     return mapping[key]
+
+
+def _output_contract_version(value: Any, *, context: str) -> int:
+    """Validate the additive S3 output/replay contract selector."""
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise CycleEvidenceIntegrityError(f"{context} output_contract_version is invalid")
+    if value not in _S3_OUTPUT_CONTRACT_VERSIONS:
+        raise CycleEvidenceIntegrityError(
+            f"{context} output_contract_version is unsupported"
+        )
+    return value
+
+
+def _boundary_kind(*, boundary_ns: int, scheduled_deadline_ns: int) -> str:
+    """Classify the modeled observation boundary, independent of cause."""
+
+    return (
+        "EARLY_FAILURE"
+        if boundary_ns < scheduled_deadline_ns
+        else "SCHEDULED_DEADLINE"
+    )
+
+
+def _validate_observation_boundary(
+    value: Any,
+    *,
+    scheduled_deadline_ns: int,
+    context: str,
+) -> int:
+    boundary = _non_negative_int(value, f"{context}.observation_boundary_monotonic_ns")
+    if boundary > scheduled_deadline_ns:
+        raise CycleEvidenceIntegrityError(
+            f"{context} observation boundary is after scheduled deadline"
+        )
+    return boundary
+
+
+def _validate_failure_observation(value: Any, *, context: str) -> int:
+    try:
+        return _non_negative_int(value, f"{context}.failure_observed_monotonic_ns")
+    except (TypeError, ValueError) as exc:
+        raise CycleEvidenceIntegrityError(
+            f"{context} failure observation is malformed"
+        ) from exc
+
+
+def _failure_reason(exc: BaseException) -> str:
+    """Return the stable public failure identity for bounded resource errors."""
+
+    if isinstance(exc, CycleEnvelopeLimitError):
+        return f"S3_ENVELOPE_LIMIT_{exc.resource.upper()}"
+    return type(exc).__name__
+
+
+def _validate_v2_boundary_record(
+    record: Mapping[str, Any],
+    *,
+    deadline_ns: int,
+    context: str,
+    expected: tuple[int, str] | None = None,
+    failed: bool | None = None,
+) -> tuple[int, str, int | None]:
+    """Validate one additive v2 chronology record against its hard deadline."""
+
+    version = _output_contract_version(
+        _require(record, "output_contract_version", context=context),
+        context=context,
+    )
+    if version != S3_OUTPUT_CONTRACT_VERSION:
+        raise CycleEvidenceIntegrityError(
+            f"{context} does not use the v2 chronology contract"
+        )
+    try:
+        observed = _non_negative_int(
+            _require(record, "observed_monotonic_ns", context=context),
+            f"{context}.observed_monotonic_ns",
+        )
+        boundary = _validate_observation_boundary(
+            _require(record, "observation_boundary_monotonic_ns", context=context),
+            scheduled_deadline_ns=deadline_ns,
+            context=context,
+        )
+        scheduled = _non_negative_int(
+            _require(record, "scheduled_deadline_monotonic_ns", context=context),
+            f"{context}.scheduled_deadline_monotonic_ns",
+        )
+    except (TypeError, ValueError) as exc:
+        raise CycleEvidenceIntegrityError(f"{context} chronology is malformed") from exc
+    if observed != boundary:
+        raise CycleEvidenceIntegrityError(
+            f"{context} observed time disagrees with observation boundary"
+        )
+    if scheduled != deadline_ns:
+        raise CycleEvidenceIntegrityError(
+            f"{context} scheduled deadline disagrees with window"
+        )
+    kind = _require(record, "finalization_boundary_kind", context=context)
+    if not isinstance(kind, str) or kind not in _S3_FINALIZATION_BOUNDARY_KINDS:
+        raise CycleEvidenceIntegrityError(f"{context} finalization boundary kind is invalid")
+    expected_kind = _boundary_kind(
+        boundary_ns=boundary,
+        scheduled_deadline_ns=deadline_ns,
+    )
+    if kind != expected_kind:
+        raise CycleEvidenceIntegrityError(
+            f"{context} finalization boundary kind disagrees with its boundary"
+        )
+    raw_failure = _require(record, "failure_observed_monotonic_ns", context=context)
+    if raw_failure is None:
+        failure = None
+    else:
+        failure = _validate_failure_observation(raw_failure, context=context)
+        if min(failure, deadline_ns) != boundary:
+            raise CycleEvidenceIntegrityError(
+                f"{context} failure observation disagrees with its model boundary"
+            )
+    if kind == "EARLY_FAILURE":
+        if failure is None:
+            raise CycleEvidenceIntegrityError(
+                f"{context} early failure lacks its failure observation"
+            )
+    if failed is True and failure is None:
+        raise CycleEvidenceIntegrityError(
+            f"{context} failed finalization lacks its failure observation"
+        )
+    if failed is False and failure is not None:
+        raise CycleEvidenceIntegrityError(
+            f"{context} clean finalization carries a failure observation"
+        )
+    if expected is not None and (boundary, kind) != expected:
+        raise CycleEvidenceIntegrityError(
+            f"{context} chronology disagrees with run finalization"
+        )
+    return boundary, kind, failure
+
+
+def _validate_result_payload_observation(
+    value: Any,
+    *,
+    boundary_ns: int,
+    context: str,
+) -> None:
+    """Reject realized result timestamps beyond its bounded observation.
+
+    A pending action's effective time is a modeled schedule, not an observed
+    transition.  Keep those future schedule fields admissible while checking
+    every other monotonic timestamp carried by the typed result payload.
+    """
+
+    if not isinstance(value, Mapping):
+        raise CycleEvidenceIntegrityError(f"{context} result payload is malformed")
+    scheduled_keys = {
+        "due_monotonic_ns",
+        "hypothetical_activation_monotonic_ns",
+        "hypothetical_cancel_effective_monotonic_ns",
+        "max_hold_deadline_monotonic_ns",
+        "quote_activation_monotonic_ns",
+        "quote_expires_monotonic_ns",
+    }
+
+    def visit(item: Any, item_context: str) -> None:
+        if isinstance(item, Mapping):
+            pending_action = (
+                item.get("status") in {"PENDING", "UNRESOLVED"}
+                and "requested_monotonic_ns" in item
+                and "effective_monotonic_ns" in item
+            )
+            for key, child in item.items():
+                if (
+                    isinstance(key, str)
+                    and key.endswith("_monotonic_ns")
+                    and child is not None
+                    and key not in scheduled_keys
+                    and not (key == "effective_monotonic_ns" and pending_action)
+                ):
+                    try:
+                        observed = _non_negative_int(child, f"{item_context}.{key}")
+                    except (TypeError, ValueError) as exc:
+                        raise CycleEvidenceIntegrityError(
+                            f"{item_context}.{key} is malformed"
+                        ) from exc
+                    if observed > boundary_ns:
+                        raise CycleEvidenceIntegrityError(
+                            f"{item_context}.{key} is beyond the observation boundary"
+                        )
+                visit(child, f"{item_context}.{key}")
+        elif isinstance(item, (list, tuple)):
+            for index, child in enumerate(item):
+                visit(child, f"{item_context}[{index}]")
+
+    visit(value, context)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1334,10 +1541,15 @@ class CycleEvidenceWriter:
         *,
         window: CycleWindow | None = None,
         campaign_root: str | os.PathLike[str] | None = None,
+        output_contract_version: int = S3_LEGACY_OUTPUT_CONTRACT_VERSION,
     ) -> None:
         self.store = store
         self.envelope = envelope
         self.window = window
+        self.output_contract_version = _output_contract_version(
+            output_contract_version,
+            context="S3 writer",
+        )
         self._terminal_written = False
         root = (
             Path(campaign_root)
@@ -1415,20 +1627,78 @@ class CycleEvidenceWriter:
         failed: bool = False,
         reason: str | None = None,
         incomplete_evidence: str | None = None,
+        observation_boundary_monotonic_ns: int | None = None,
+        failure_observed_monotonic_ns: int | None = None,
     ) -> int:
         if self._terminal_written:
             raise CycleEvidenceIntegrityError("S3 run has more than one terminal")
+        scheduled_deadline_ns = (
+            self.window.deadline_monotonic_ns
+            if self.window is not None
+            else self.envelope.market_deadline_ns
+        )
+        failure_observed: int | None = None
+        if failure_observed_monotonic_ns is not None:
+            failure_observed = _validate_failure_observation(
+                failure_observed_monotonic_ns,
+                context="S3 terminal",
+            )
+            if not failed:
+                raise CycleEvidenceIntegrityError(
+                    "S3 terminal has failure time without failed status"
+                )
+            expected_boundary = min(failure_observed, scheduled_deadline_ns)
+            if (
+                observation_boundary_monotonic_ns is not None
+                and observation_boundary_monotonic_ns != expected_boundary
+            ):
+                raise CycleEvidenceIntegrityError(
+                    "S3 terminal failure time does not match observation boundary"
+                )
+            observation_boundary_monotonic_ns = expected_boundary
+        elif failed and self.output_contract_version >= S3_OUTPUT_CONTRACT_VERSION:
+            raise CycleEvidenceIntegrityError(
+                "S3 v2 failed terminal requires a failure observation"
+            )
+        if observation_boundary_monotonic_ns is None:
+            observation_boundary_monotonic_ns = scheduled_deadline_ns
+        observation_boundary = _validate_observation_boundary(
+            observation_boundary_monotonic_ns,
+            scheduled_deadline_ns=scheduled_deadline_ns,
+            context="S3 terminal",
+        )
+        if (
+            self.output_contract_version >= S3_OUTPUT_CONTRACT_VERSION
+            and not failed
+            and observation_boundary != scheduled_deadline_ns
+        ):
+            raise CycleEvidenceIntegrityError(
+                "S3 clean terminal must use the scheduled deadline"
+            )
+        if failure_observed is not None and failure_observed < observation_boundary:
+            raise CycleEvidenceIntegrityError(
+                "S3 terminal failure time precedes observation boundary"
+            )
         record: dict[str, Any] = {
             "kind": "RUN_FAILED" if failed else "RUN_STOP",
-            "observed_monotonic_ns": (
-                self.window.deadline_monotonic_ns
-                if self.window is not None
-                else self.envelope.market_deadline_ns
-            ),
+            "observed_monotonic_ns": observation_boundary,
             "fatal_reason": reason,
         }
         if incomplete_evidence is not None:
             record["incomplete_evidence"] = _text(incomplete_evidence, "incomplete_evidence")
+        if self.output_contract_version >= S3_OUTPUT_CONTRACT_VERSION:
+            record.update(
+                {
+                    "output_contract_version": self.output_contract_version,
+                    "observation_boundary_monotonic_ns": observation_boundary,
+                    "scheduled_deadline_monotonic_ns": scheduled_deadline_ns,
+                    "finalization_boundary_kind": _boundary_kind(
+                        boundary_ns=observation_boundary,
+                        scheduled_deadline_ns=scheduled_deadline_ns,
+                    ),
+                    "failure_observed_monotonic_ns": failure_observed,
+                }
+            )
         return self.append(record)
 
 
@@ -1471,6 +1741,8 @@ class CycleRunDriver:
         writer: CycleEvidenceWriter | None = None,
         persist: bool = True,
         streaming: bool = False,
+        output_contract_version: int | None = None,
+        monotonic_ns: Callable[[], int] | None = None,
     ) -> None:
         self.window = window
         self.envelope = CycleEnvelope() if envelope is None else envelope
@@ -1483,6 +1755,24 @@ class CycleRunDriver:
         self.writer = writer
         self.persist = persist
         self.streaming = streaming
+        self._monotonic_ns = monotonic_ns or time.monotonic_ns
+        selected_output_version = (
+            writer.output_contract_version
+            if output_contract_version is None and writer is not None
+            else (
+                S3_LEGACY_OUTPUT_CONTRACT_VERSION
+                if output_contract_version is None
+                else output_contract_version
+            )
+        )
+        self.output_contract_version = _output_contract_version(
+            selected_output_version,
+            context="S3 driver",
+        )
+        if writer is not None and writer.output_contract_version != self.output_contract_version:
+            raise CycleEvidenceIntegrityError(
+                "S3 driver and writer output contracts do not match"
+            )
         self.admissions: list[CycleAdmission] = []
         self.results: list[CycleResult] = []
         self.skipped: list[dict[str, Any]] = []
@@ -1496,6 +1786,133 @@ class CycleRunDriver:
         self._stream_ended = False
         self._finalized = False
         self._finalize_error: BaseException | None = None
+        self._max_observed_ns = self.window.monotonic_start_ns
+        self._observation_boundary_ns: int | None = None
+        self._failure_observed_ns: int | None = None
+        self._finalization_failed = False
+        self._stream_end_attempted = False
+        self._cycle_end_attempted: set[int] = set()
+        self._resource_failure_observed_ns: int | None = None
+        self._stream_end_error: CycleEnvelopeLimitError | None = None
+        self._cycle_end_error: CycleEnvelopeLimitError | None = None
+
+    @property
+    def observation_boundary_monotonic_ns(self) -> int | None:
+        return self._observation_boundary_ns
+
+    @property
+    def failure_observed_monotonic_ns(self) -> int | None:
+        return self._failure_observed_ns
+
+    @property
+    def resource_failure_observed_monotonic_ns(self) -> int | None:
+        return self._resource_failure_observed_ns
+
+    @property
+    def max_observed_monotonic_ns(self) -> int:
+        return self._max_observed_ns
+
+    def _bind_failure_observation(
+        self,
+        observed_monotonic_ns: int,
+        *,
+        context: str,
+    ) -> int:
+        """Retain the first failure observation and reject time travel."""
+
+        observed = _validate_failure_observation(
+            observed_monotonic_ns,
+            context=context,
+        )
+        if observed < self._max_observed_ns:
+            raise CycleEvidenceIntegrityError(
+                f"{context} precedes already-admitted evidence"
+            )
+        first = self._failure_observed_ns
+        if first is None:
+            self._failure_observed_ns = observed
+            return observed
+        if observed < first:
+            raise CycleEvidenceIntegrityError(
+                f"{context} precedes the first observed failure"
+            )
+        return first
+
+    def _set_finalization_boundary(
+        self,
+        *,
+        failed: bool,
+        observation_boundary_monotonic_ns: int | None,
+        failure_observed_monotonic_ns: int | None,
+    ) -> int:
+        """Bind one finalization boundary before any cleanup transition."""
+
+        failure_observed: int | None = None
+        if failed:
+            failure_candidate = failure_observed_monotonic_ns
+            if failure_candidate is None:
+                failure_candidate = self._failure_observed_ns
+            if failure_candidate is None:
+                failure_candidate = self._resource_failure_observed_ns
+            if failure_candidate is not None:
+                failure_observed = self._bind_failure_observation(
+                    failure_candidate,
+                    context="S3 finalization",
+                )
+            if failure_observed is not None:
+                expected_boundary = min(
+                    failure_observed,
+                    self.window.deadline_monotonic_ns,
+                )
+                if (
+                    observation_boundary_monotonic_ns is not None
+                    and observation_boundary_monotonic_ns != expected_boundary
+                ):
+                    raise CycleEvidenceIntegrityError(
+                        "S3 failure observation does not match model boundary"
+                    )
+                observation_boundary_monotonic_ns = expected_boundary
+            elif self.output_contract_version >= S3_OUTPUT_CONTRACT_VERSION:
+                raise CycleEvidenceIntegrityError(
+                    "S3 v2 failed finalization requires a failure observation"
+                )
+        elif failure_observed_monotonic_ns is not None:
+            raise CycleEvidenceIntegrityError(
+                "S3 failure time supplied for a clean finalization"
+            )
+        if observation_boundary_monotonic_ns is None:
+            if self._observation_boundary_ns is not None:
+                observation_boundary_monotonic_ns = self._observation_boundary_ns
+            else:
+                observation_boundary_monotonic_ns = self.window.deadline_monotonic_ns
+        boundary = _validate_observation_boundary(
+            observation_boundary_monotonic_ns,
+            scheduled_deadline_ns=self.window.deadline_monotonic_ns,
+            context="S3 finalization",
+        )
+        if boundary < self._max_observed_ns:
+            raise CycleEvidenceIntegrityError(
+                "S3 finalization boundary precedes already-admitted observation"
+            )
+        self._observation_boundary_ns = boundary
+        self._finalization_failed = failed
+        return boundary
+
+    def _boundary_fields(self, boundary: int) -> dict[str, Any]:
+        """Return the v2 chronology fields for one boundary-bearing record."""
+
+        if self.output_contract_version < S3_OUTPUT_CONTRACT_VERSION:
+            return {}
+        return {
+            "output_contract_version": self.output_contract_version,
+            "observation_boundary_monotonic_ns": boundary,
+            "scheduled_deadline_monotonic_ns": self.window.deadline_monotonic_ns,
+            "finalization_boundary_kind": _boundary_kind(
+                boundary_ns=boundary,
+                scheduled_deadline_ns=self.window.deadline_monotonic_ns,
+            ),
+            "failure_observed_monotonic_ns": self._failure_observed_ns,
+        }
 
     def _write(self, record: Mapping[str, Any]) -> None:
         if self.persist and self.writer is not None:
@@ -1507,7 +1924,29 @@ class CycleRunDriver:
                 and observed >= self.window.cutoff_monotonic_ns
             ):
                 payload.setdefault("resource_phase", "CLOSING")
-            self.writer.append(payload)
+            if (
+                self.output_contract_version >= S3_OUTPUT_CONTRACT_VERSION
+                and self._finalization_failed
+                and payload.get("kind") not in {"RUN_STOP", "RUN_FAILED"}
+            ):
+                # An early failure can occur before the scheduled cutoff, but
+                # its bounded close still consumes the reserved closing
+                # budget.  This does not alter the recorded causal timestamp.
+                payload.setdefault("resource_phase", "CLOSING")
+            try:
+                self.writer.append(payload)
+            except CycleEnvelopeLimitError:
+                observed = _non_negative_int(
+                    self._monotonic_ns(),
+                    "resource_failure_observed_monotonic_ns",
+                )
+                if self._resource_failure_observed_ns is None:
+                    self._resource_failure_observed_ns = observed
+                self._bind_failure_observation(
+                    observed,
+                    context="S3 resource failure",
+                )
+                raise
 
     @property
     def decision_count(self) -> int:
@@ -1570,6 +2009,7 @@ class CycleRunDriver:
             }
         )
         self._stream_input_count += 1
+        self._max_observed_ns = max(self._max_observed_ns, observed)
         for scenario in CycleScenario:
             state = self.kernel.state(scenario)
             if isinstance(item, CycleClock):
@@ -1581,23 +2021,61 @@ class CycleRunDriver:
             if state is CycleKernelState.PENDING or self.kernel.last_result(scenario) is not None:
                 self.kernel.advance(item, scenario=scenario)
 
-    def finish_stream(self, *, end_monotonic_ns: int | None = None) -> None:
+    def finish_stream(
+        self,
+        *,
+        end_monotonic_ns: int | None = None,
+        finalization_failed: bool | None = None,
+        failure_observed_monotonic_ns: int | None = None,
+    ) -> None:
         if not self.streaming:
             raise CycleEvidenceIntegrityError("stream end requires streaming mode")
         if self._stream_ended:
             return
-        end_ns = self.window.deadline_monotonic_ns if end_monotonic_ns is None else _non_negative_int(end_monotonic_ns, "end_monotonic_ns")
-        if end_ns > self.window.deadline_monotonic_ns:
-            raise CycleEvidenceIntegrityError("S3 stream end is after hard market deadline")
-        if any(self.kernel.state(scenario) is CycleKernelState.PENDING for scenario in CycleScenario):
-            self.accept_global_input(CycleClock(end_ns))
-        self._write(
-            {
+        self._stream_end_attempted = True
+        end_ns = (
+            self._observation_boundary_ns
+            if end_monotonic_ns is None and self._observation_boundary_ns is not None
+            else self.window.deadline_monotonic_ns
+            if end_monotonic_ns is None
+            else _non_negative_int(end_monotonic_ns, "end_monotonic_ns")
+        )
+        try:
+            self._set_finalization_boundary(
+                failed=(
+                    self._finalization_failed
+                    if finalization_failed is None
+                    else finalization_failed
+                ),
+                observation_boundary_monotonic_ns=end_ns,
+                failure_observed_monotonic_ns=(
+                    self._failure_observed_ns
+                    if failure_observed_monotonic_ns is None
+                    else failure_observed_monotonic_ns
+                ),
+            )
+            if (
+                self.output_contract_version >= S3_OUTPUT_CONTRACT_VERSION
+                and not self._finalization_failed
+                and end_ns != self.window.deadline_monotonic_ns
+            ):
+                raise CycleEvidenceIntegrityError(
+                    "S3 clean stream end must use the scheduled deadline"
+                )
+            if end_ns > self.window.deadline_monotonic_ns:
+                raise CycleEvidenceIntegrityError("S3 stream end is after hard market deadline")
+            if any(self.kernel.state(scenario) is CycleKernelState.PENDING for scenario in CycleScenario):
+                self.accept_global_input(CycleClock(end_ns))
+            stream_end = {
                 "kind": "CYCLE_STREAM_END",
                 "end_monotonic_ns": end_ns,
                 "observed_monotonic_ns": end_ns,
             }
-        )
+            stream_end.update(self._boundary_fields(end_ns))
+            self._write(stream_end)
+        except CycleEnvelopeLimitError as exc:
+            self._stream_end_error = exc
+            raise
         self._stream_ended = True
 
     def _admission_payload(self, attempt_index: int, admission: CycleAdmission) -> dict[str, Any]:
@@ -1628,6 +2106,7 @@ class CycleRunDriver:
                 "observed_monotonic_ns": observed,
             }
         )
+        self._max_observed_ns = max(self._max_observed_ns, observed)
 
     def _remember_skip(self, detail: dict[str, Any], *, reason: str | None) -> None:
         self.skipped_count += 1
@@ -1671,15 +2150,17 @@ class CycleRunDriver:
         return None
 
     def _record_decision(self, attempt_index: int, version: QuoteVersion, source_books: tuple[BookEvidence, ...]) -> None:
+        observed = version.decision_ready_monotonic_ns or self.window.monotonic_start_ns
         self._write(
             {
                 "kind": "CYCLE_DECISION",
                 "attempt_index": attempt_index,
                 "quote_version": _quote_version_to_dict(version),
                 "source_books": [_book_to_dict(book) for book in source_books],
-                "observed_monotonic_ns": version.decision_ready_monotonic_ns or self.window.monotonic_start_ns,
+                "observed_monotonic_ns": observed,
             }
         )
+        self._max_observed_ns = max(self._max_observed_ns, observed)
 
     def admit_decision(
         self,
@@ -1757,15 +2238,14 @@ class CycleRunDriver:
         # by its decision/admission records; emitting ``CYCLE_END`` here
         # would mix attempt-scoped records into the stream replay contract.
         if not self.streaming and (skip is not None or not accepted_any):
-            self._write(
-                {
-                    "kind": "CYCLE_END",
-                    "attempt_index": attempt_index,
-                    "skipped": True,
-                    "observed_monotonic_ns": quote_version.decision_ready_monotonic_ns
-                    or self.window.monotonic_start_ns,
-                }
-            )
+            skipped_end = {
+                "kind": "CYCLE_END",
+                "attempt_index": attempt_index,
+                "skipped": True,
+                "observed_monotonic_ns": quote_version.decision_ready_monotonic_ns
+                or self.window.monotonic_start_ns,
+            }
+            self._write(skipped_end)
         return tuple(admissions[scenario] for scenario in CycleScenario)
 
     def _state(self, attempt_index: int) -> _DecisionState:
@@ -1801,6 +2281,7 @@ class CycleRunDriver:
             }
         )
         state.input_count += 1
+        self._max_observed_ns = max(self._max_observed_ns, observed)
         state.last_input = item
         for scenario, admission in state.admissions.items():
             if admission.accepted:
@@ -1814,49 +2295,158 @@ class CycleRunDriver:
     def advance_clock(self, attempt_index: int, at_monotonic_ns: int) -> None:
         self.accept_input(attempt_index, CycleClock(_non_negative_int(at_monotonic_ns, "at_monotonic_ns")))
 
-    def finish_decision(self, attempt_index: int, *, end_monotonic_ns: int | None = None) -> None:
+    def finish_decision(
+        self,
+        attempt_index: int,
+        *,
+        end_monotonic_ns: int | None = None,
+        finalization_failed: bool | None = None,
+        failure_observed_monotonic_ns: int | None = None,
+    ) -> None:
         state = self._state(attempt_index)
         if state.finished:
             return
-        end_ns = self.window.deadline_monotonic_ns if end_monotonic_ns is None else _non_negative_int(end_monotonic_ns, "end_monotonic_ns")
-        if end_ns > self.window.deadline_monotonic_ns:
-            raise CycleEvidenceIntegrityError("cycle end is after hard market deadline")
-        if (
-            state.input_count == 0
-            or not isinstance(state.last_input, CycleClock)
-            or state.last_input.at_monotonic_ns != end_ns
-        ):
-            self.advance_clock(attempt_index, end_ns)
-        state.finished = True
-        self._write({"kind": "CYCLE_END", "attempt_index": attempt_index, "skipped": False, "end_monotonic_ns": end_ns, "observed_monotonic_ns": end_ns})
+        self._cycle_end_attempted.add(attempt_index)
+        end_ns = (
+            self._observation_boundary_ns
+            if end_monotonic_ns is None and self._observation_boundary_ns is not None
+            else self.window.deadline_monotonic_ns
+            if end_monotonic_ns is None
+            else _non_negative_int(end_monotonic_ns, "end_monotonic_ns")
+        )
+        self._set_finalization_boundary(
+            failed=(
+                self._finalization_failed
+                if finalization_failed is None
+                else finalization_failed
+            ),
+            observation_boundary_monotonic_ns=end_ns,
+            failure_observed_monotonic_ns=failure_observed_monotonic_ns,
+        )
+        try:
+            if end_ns > self.window.deadline_monotonic_ns:
+                raise CycleEvidenceIntegrityError("cycle end is after hard market deadline")
+            if (
+                state.input_count == 0
+                or not isinstance(state.last_input, CycleClock)
+                or state.last_input.at_monotonic_ns != end_ns
+            ):
+                self.advance_clock(attempt_index, end_ns)
+            state.finished = True
+            cycle_end = {
+                "kind": "CYCLE_END",
+                "attempt_index": attempt_index,
+                "skipped": False,
+                "end_monotonic_ns": end_ns,
+                "observed_monotonic_ns": end_ns,
+            }
+            self._write(cycle_end)
+        except CycleEnvelopeLimitError as exc:
+            self._cycle_end_error = exc
+            raise
 
     def finalize(
         self,
         *,
         failed: bool = False,
         reason: str | None = None,
+        failure_observed_monotonic_ns: int | None = None,
     ) -> CycleRunOutput | tuple[CycleResult, ...]:
         if self._finalized:
             if self._finalize_error is not None:
                 raise self._finalize_error
             return tuple(self.results) if self.writer is None else CycleRunOutput(self.writer.store.run_id, self.writer.store.path, None, tuple(self.admissions), tuple(self.results))
+        if not failed and (
+            self._resource_failure_observed_ns is not None
+            or self._stream_end_error is not None
+            or self._cycle_end_error is not None
+        ):
+            # A storage failure is terminal even when the caller reached the
+            # cleanup path without separately forwarding a failure flag.
+            failed = True
+        if failed:
+            failure_observed = (
+                failure_observed_monotonic_ns
+                if failure_observed_monotonic_ns is not None
+                else self._failure_observed_ns
+                if self._failure_observed_ns is not None
+                else self._resource_failure_observed_ns
+                if self.output_contract_version >= S3_OUTPUT_CONTRACT_VERSION
+                else None
+            )
+            boundary = (
+                min(failure_observed, self.window.deadline_monotonic_ns)
+                if failure_observed is not None
+                else self.window.deadline_monotonic_ns
+            )
+        else:
+            failure_observed = None
+            boundary = self.window.deadline_monotonic_ns
+        self._set_finalization_boundary(
+            failed=failed,
+            observation_boundary_monotonic_ns=boundary,
+            failure_observed_monotonic_ns=failure_observed if failed else None,
+        )
         try:
+            if self._stream_end_error is not None:
+                raise self._stream_end_error
+            if self._cycle_end_error is not None:
+                raise self._cycle_end_error
             if self.streaming:
-                if not self._stream_ended:
-                    self.finish_stream()
+                if not self._stream_ended and not self._stream_end_attempted:
+                    self.finish_stream(
+                        end_monotonic_ns=boundary,
+                        finalization_failed=failed,
+                        failure_observed_monotonic_ns=(
+                            self._failure_observed_ns if failed else None
+                        ),
+                    )
             else:
                 for index, state in self._decisions.items():
-                    if not state.finished:
-                        self.finish_decision(index)
+                    if not state.finished and index not in self._cycle_end_attempted:
+                        self.finish_decision(
+                            index,
+                            end_monotonic_ns=boundary,
+                            finalization_failed=failed,
+                            failure_observed_monotonic_ns=(
+                                self._failure_observed_ns if failed else None
+                            ),
+                        )
         except CycleEnvelopeLimitError as exc:
             # Closing the stream is itself evidence.  If its final clock or
             # CYCLE_STREAM_END cannot fit, preserve the already-written
             # prefix and use the reserved terminal slot immediately.
             if self.writer is not None and not self.writer.terminal_written:
+                resource_failure = (
+                    self._failure_observed_ns
+                    if self._failure_observed_ns is not None
+                    else self._resource_failure_observed_ns
+                    if self._resource_failure_observed_ns is not None
+                    else boundary
+                )
+                resource_boundary = min(
+                    resource_failure,
+                    self.window.deadline_monotonic_ns,
+                )
+                self._set_finalization_boundary(
+                    failed=True,
+                    observation_boundary_monotonic_ns=resource_boundary,
+                    failure_observed_monotonic_ns=resource_failure
+                    if self.output_contract_version >= S3_OUTPUT_CONTRACT_VERSION
+                    else None,
+                )
                 self.writer.append_terminal(
                     failed=True,
                     reason=f"S3_ENVELOPE_LIMIT_{exc.resource.upper()}",
                     incomplete_evidence="STREAM_FINALIZATION_PREFIX" if self.streaming else "CYCLE_FINALIZATION_PREFIX",
+                    **(
+                        {
+                            "observation_boundary_monotonic_ns": resource_boundary,
+                            "failure_observed_monotonic_ns": resource_failure,
+                        }
+                        if self.output_contract_version >= S3_OUTPUT_CONTRACT_VERSION
+                        else {}
+                    ),
                 )
             self._finalize_error = exc
             self._finalized = True
@@ -1869,8 +2459,7 @@ class CycleRunDriver:
                     if result.quote_version_id not in by_version:
                         raise CycleEvidenceIntegrityError("kernel returned an unknown S3 cycle identity")
                     self.results.append(result)
-                    self._write(
-                        {
+                    final_result_record = {
                             "kind": "CYCLE_FINAL_RESULT",
                             "attempt_index": by_version[result.quote_version_id],
                             "scenario": result.scenario.value,
@@ -1882,10 +2471,21 @@ class CycleRunDriver:
                             # after the stream has reached its bounded close.
                             # Keep them in the closing resource accounting
                             # even when the cycle itself completed earlier.
-                            "observed_monotonic_ns": self.window.deadline_monotonic_ns,
+                            "observed_monotonic_ns": (
+                                self._observation_boundary_ns
+                                if self.output_contract_version >= S3_OUTPUT_CONTRACT_VERSION
+                                else self.window.deadline_monotonic_ns
+                            ),
                             "resource_phase": "CLOSING",
-                        }
+                    }
+                    final_result_record.update(
+                        self._boundary_fields(
+                            self._observation_boundary_ns
+                            if self._observation_boundary_ns is not None
+                            else self.window.deadline_monotonic_ns
+                        )
                     )
+                    self._write(final_result_record)
         except CycleEnvelopeLimitError as exc:
             # A failed final-result append must not consume the sole terminal
             # slot or leave an evidence file without a replayable failure
@@ -1893,10 +2493,36 @@ class CycleRunDriver:
             # the omitted suffix from the physical stream, but the failed
             # terminal keeps the run explicitly insufficient.
             if self.writer is not None and not self.writer.terminal_written:
+                resource_failure = (
+                    self._failure_observed_ns
+                    if self._failure_observed_ns is not None
+                    else self._resource_failure_observed_ns
+                    if self._resource_failure_observed_ns is not None
+                    else boundary
+                )
+                resource_boundary = min(
+                    resource_failure,
+                    self.window.deadline_monotonic_ns,
+                )
+                self._set_finalization_boundary(
+                    failed=True,
+                    observation_boundary_monotonic_ns=resource_boundary,
+                    failure_observed_monotonic_ns=resource_failure
+                    if self.output_contract_version >= S3_OUTPUT_CONTRACT_VERSION
+                    else None,
+                )
                 self.writer.append_terminal(
                     failed=True,
                     reason=f"S3_ENVELOPE_LIMIT_{exc.resource.upper()}",
                     incomplete_evidence="FINAL_RESULT_PREFIX",
+                    **(
+                        {
+                            "observation_boundary_monotonic_ns": resource_boundary,
+                            "failure_observed_monotonic_ns": resource_failure,
+                        }
+                        if self.output_contract_version >= S3_OUTPUT_CONTRACT_VERSION
+                        else {}
+                    ),
                 )
             self._finalize_error = exc
             self._finalized = True
@@ -1905,7 +2531,21 @@ class CycleRunDriver:
         if self.writer is None:
             return tuple(self.results)
         if not self.writer.terminal_written:
-            self.writer.append_terminal(failed=failed, reason=reason)
+            terminal_fields = (
+                {
+                    "observation_boundary_monotonic_ns": self._observation_boundary_ns,
+                    "failure_observed_monotonic_ns": (
+                        self._failure_observed_ns if failed else None
+                    ),
+                }
+                if self.output_contract_version >= S3_OUTPUT_CONTRACT_VERSION
+                else {}
+            )
+            self.writer.append_terminal(
+                failed=failed,
+                reason=reason,
+                **terminal_fields,
+            )
         return CycleRunOutput(
             run_id=self.writer.store.run_id,
             store_path=self.writer.store.path,
@@ -1969,6 +2609,7 @@ class PublicCycleProducer:
         # This is a bounded diagnostic prefix only.  Persisted
         # CYCLE_STREAM_INPUT records are the authoritative complete order.
         self.processed_items: list[str] = []
+        self._failure_observed_ns: int | None = None
         self._closed = False
 
     @property
@@ -1982,6 +2623,35 @@ class PublicCycleProducer:
     @property
     def attempt_index(self) -> int | None:
         return self._attempt_index
+
+    @property
+    def failure_observed_monotonic_ns(self) -> int | None:
+        return self._failure_observed_ns
+
+    def capture_failure_observation(self, observed_monotonic_ns: int) -> int:
+        """Bind the first observed failure before cleanup can advance time."""
+
+        observed = _validate_failure_observation(
+            observed_monotonic_ns,
+            context="S3 producer failure",
+        )
+        if observed < self.driver.max_observed_monotonic_ns:
+            raise CycleEvidenceIntegrityError(
+                "S3 failure observation precedes already-delivered evidence"
+            )
+        if self._failure_observed_ns is None:
+            self._failure_observed_ns = observed
+        elif self._failure_observed_ns != observed:
+            raise CycleEvidenceIntegrityError(
+                "S3 producer observed more than one failure boundary"
+            )
+        return observed
+
+    def _reject_after_failure(self) -> None:
+        if self._failure_observed_ns is not None:
+            raise CycleEvidenceIntegrityError(
+                "S3 public evidence arrived after the observed failure boundary"
+            )
 
     def _record_skip(self, reason: str, observed_ns: int) -> None:
         self.driver.record_signal_skip(reason=reason, observed_monotonic_ns=observed_ns)
@@ -2156,6 +2826,19 @@ class PublicCycleProducer:
     def handle_item(self, item: IngressItem) -> None:
         """Process one feed item in exactly the supplied delivery order."""
 
+        if self._failure_observed_ns is not None:
+            # PublicFeedRunner's finally block may enqueue bounded
+            # PUBLIC_SMOKE_STOPPED cleanup gaps after the first fatal gap.
+            # They are transport cleanup, not post-failure market evidence;
+            # consume them without allowing them to replace the first fatal
+            # reason or advance the kernel.
+            if isinstance(item, FeedGapEvent):
+                self._remember_processed(
+                    f"GAP:{item.gap.reason}:{item.gap.gap_start_monotonic_ns}"
+                )
+                return
+            self._reject_after_failure()
+
         if isinstance(item, FeedBookEvent):
             if item.market_pair is not self.market_pair and item.market_pair != self.market_pair:
                 raise CycleEvidenceIntegrityError("public cycle received an unrelated market pair")
@@ -2174,6 +2857,10 @@ class PublicCycleProducer:
             return
         if isinstance(item, FeedGapEvent):
             gap = item.gap
+            if gap.transport_event == "UNEXPECTED_FAILURE":
+                # The gap timestamp is captured by the feed on the failure
+                # path, before this producer can append its close evidence.
+                self.capture_failure_observation(gap.gap_start_monotonic_ns)
             self._remember_processed(f"GAP:{gap.reason}:{gap.gap_start_monotonic_ns}")
             self._deliver(gap)
             latest = self._latest.get(gap.source_venue)
@@ -2188,6 +2875,7 @@ class PublicCycleProducer:
         raise TypeError("unsupported public cycle producer item")
 
     def accept_clock(self, at_monotonic_ns: int) -> None:
+        self._reject_after_failure()
         at_ns = _non_negative_int(at_monotonic_ns, "at_monotonic_ns")
         self._remember_processed(f"CLOCK:{at_ns}")
         self._deliver(CycleClock(at_ns))
@@ -2215,29 +2903,87 @@ class PublicCycleProducer:
             else:
                 self.handle_item(item)
 
-    def close(self) -> None:
+    def close(
+        self,
+        *,
+        failed: bool = False,
+        failure_observed_monotonic_ns: int | None = None,
+    ) -> None:
         if self._closed:
             return
+        if failed and self.driver.output_contract_version >= S3_OUTPUT_CONTRACT_VERSION:
+            if failure_observed_monotonic_ns is None:
+                failure_observed_monotonic_ns = self._failure_observed_ns
+            if failure_observed_monotonic_ns is None:
+                failure_observed_monotonic_ns = _non_negative_int(
+                    self._monotonic_ns(),
+                    "failure_observed_monotonic_ns",
+                )
+            self.capture_failure_observation(failure_observed_monotonic_ns)
+        if failed and self.driver.output_contract_version >= S3_OUTPUT_CONTRACT_VERSION:
+            boundary_ns = self._failure_observed_ns
+            assert boundary_ns is not None
+            boundary_ns = min(
+                boundary_ns,
+                self.driver.window.deadline_monotonic_ns,
+            )
+        else:
+            boundary_ns = self.driver.window.deadline_monotonic_ns
         self._closed = True
         if self.driver.streaming:
-            self.driver.finish_stream(end_monotonic_ns=self.driver.window.deadline_monotonic_ns)
+            self.driver.finish_stream(
+                end_monotonic_ns=boundary_ns,
+                finalization_failed=failed,
+                failure_observed_monotonic_ns=(
+                    self._failure_observed_ns if failed else None
+                ),
+            )
         elif self._attempt_index is not None and not self.driver.decision_finished(self._attempt_index):
-            self.accept_clock(self.driver.window.deadline_monotonic_ns)
+            self._remember_processed(f"CLOCK:{boundary_ns}")
+            self.driver.accept_input(
+                self._attempt_index,
+                CycleClock(boundary_ns),
+            )
             self.driver.finish_decision(
                 self._attempt_index,
-                end_monotonic_ns=self.driver.window.deadline_monotonic_ns,
+                end_monotonic_ns=boundary_ns,
+                finalization_failed=failed,
+                failure_observed_monotonic_ns=(
+                    self._failure_observed_ns if failed else None
+                ),
             )
 
-    def finalize(self, *, failed: bool = False, reason: str | None = None) -> CycleRunOutput | tuple[CycleResult, ...]:
+    def finalize(
+        self,
+        *,
+        failed: bool = False,
+        reason: str | None = None,
+        failure_observed_monotonic_ns: int | None = None,
+    ) -> CycleRunOutput | tuple[CycleResult, ...]:
         try:
-            self.close()
+            self.close(
+                failed=failed,
+                failure_observed_monotonic_ns=failure_observed_monotonic_ns,
+            )
         except CycleEnvelopeLimitError:
             # ``close`` performs the stream-end write before delegating to the
             # driver.  Route a close-time resource failure through the same
             # terminalizing path immediately; callers must not need a retry to
             # obtain the explicit incomplete-prefix marker.
-            return self.driver.finalize(failed=failed, reason=reason)
-        return self.driver.finalize(failed=failed, reason=reason)
+            return self.driver.finalize(
+                failed=failed,
+                reason=reason,
+                failure_observed_monotonic_ns=(
+                    self._failure_observed_ns if failed else None
+                ),
+            )
+        return self.driver.finalize(
+            failed=failed,
+            reason=reason,
+            failure_observed_monotonic_ns=(
+                self._failure_observed_ns if failed else None
+            ),
+        )
 
 
 # A descriptive alias keeps the public boundary discoverable without adding a
@@ -2598,10 +3344,15 @@ def run_fixture_window(
     count: int = 6,
     envelope: CycleEnvelope | None = None,
     claim: bool = True,
+    output_contract_version: int = S3_LEGACY_OUTPUT_CONTRACT_VERSION,
 ) -> CycleRunOutput:
     """Produce one complete offline run through the real S3 path."""
 
     selected = CycleEnvelope() if envelope is None else envelope
+    selected_output_contract_version = _output_contract_version(
+        output_contract_version,
+        context="S3 fixture",
+    )
     policy_fingerprint = cycle_policy_fingerprint(accepted_release)
     claim_path = (
         reserve_cycle_window(
@@ -2634,6 +3385,8 @@ def run_fixture_window(
         "funding_status": "UNKNOWN",
         "created_utc": datetime.now(UTC),
     }
+    if selected_output_contract_version >= S3_OUTPUT_CONTRACT_VERSION:
+        metadata["output_contract_version"] = selected_output_contract_version
     run_id = new_run_id()
     _preflight_campaign_store(
         root,
@@ -2649,14 +3402,47 @@ def run_fixture_window(
         max_records=selected.max_records + TERMINAL_FAILURE_RECORD_RESERVE,
         max_bytes=selected.max_bytes + TERMINAL_FAILURE_BYTES_RESERVE,
     )
-    writer = CycleEvidenceWriter(store, selected, window=window, campaign_root=root)
-    driver = CycleRunDriver(window, envelope=selected, writer=writer)
+    writer = CycleEvidenceWriter(
+        store,
+        selected,
+        window=window,
+        campaign_root=root,
+        output_contract_version=selected_output_contract_version,
+    )
+    driver = CycleRunDriver(
+        window,
+        envelope=selected,
+        writer=writer,
+        output_contract_version=selected_output_contract_version,
+    )
     try:
         driver.run(attempts)
     except BaseException as exc:
         if not writer.terminal_written:
             try:
-                writer.append_terminal(failed=True, reason=type(exc).__name__)
+                if selected_output_contract_version >= S3_OUTPUT_CONTRACT_VERSION:
+                    failure_observed = _non_negative_int(
+                        time.monotonic_ns(),
+                        "failure_observed_monotonic_ns",
+                    )
+                    boundary = min(
+                        failure_observed,
+                        window.deadline_monotonic_ns,
+                    )
+                    if driver.resource_failure_observed_monotonic_ns is not None:
+                        failure_observed = driver.resource_failure_observed_monotonic_ns
+                        boundary = min(
+                            failure_observed,
+                            window.deadline_monotonic_ns,
+                        )
+                    writer.append_terminal(
+                        failed=True,
+                        reason=_failure_reason(exc),
+                        observation_boundary_monotonic_ns=boundary,
+                        failure_observed_monotonic_ns=failure_observed,
+                    )
+                else:
+                    writer.append_terminal(failed=True, reason=_failure_reason(exc))
             except BaseException as marker_exc:
                 exc.add_note(f"unable to persist S3 failure marker: {type(marker_exc).__name__}")
         raise
@@ -2709,6 +3495,7 @@ def _public_cycle_metadata(
 ) -> dict[str, Any]:
     return {
         "schema_version": S3_SCHEMA_VERSION,
+        "output_contract_version": S3_OUTPUT_CONTRACT_VERSION,
         "experiment_kind": S3_EXPERIMENT_KIND,
         "evidence_mode": "OBSERVATIONAL",
         "accepted_release": manifest.accepted_release,
@@ -2826,12 +3613,15 @@ async def run_public_cycle_collection(
         selected_manifest.envelope,
         window=runtime_window,
         campaign_root=store_root,
+        output_contract_version=S3_OUTPUT_CONTRACT_VERSION,
     )
     driver = CycleRunDriver(
         runtime_window,
         envelope=selected_manifest.envelope,
         writer=writer,
         streaming=True,
+        output_contract_version=S3_OUTPUT_CONTRACT_VERSION,
+        monotonic_ns=clock_ns,
     )
     # S3 stream replay is a physical producer-order contract.  Keep the
     # historical queue default unchanged for the other public pipelines and
@@ -2840,6 +3630,39 @@ async def run_public_cycle_collection(
     producer: PublicCycleProducer | None = None
     feed: PublicFeedRunner | None = None
     terminal_written = False
+    failure_observed_monotonic_ns: int | None = None
+
+    def capture_failure_now(*, bind_producer: bool = False) -> int:
+        """Capture the coordinator's failure observation before cleanup."""
+
+        nonlocal failure_observed_monotonic_ns
+        if failure_observed_monotonic_ns is not None:
+            if (
+                bind_producer
+                and producer is not None
+                and producer.failure_observed_monotonic_ns is None
+            ):
+                producer.capture_failure_observation(failure_observed_monotonic_ns)
+            return failure_observed_monotonic_ns
+        # A resource failure can be captured inside the driver's append path
+        # before control returns to this coordinator.  Preserve that first
+        # observation instead of replacing it with the later handling or
+        # cleanup clock.
+        observed = driver.failure_observed_monotonic_ns
+        if observed is None:
+            observed = _non_negative_int(
+                clock_ns(),
+                "failure_observed_monotonic_ns",
+            )
+        failure_observed_monotonic_ns = observed
+        if (
+            bind_producer
+            and producer is not None
+            and producer.failure_observed_monotonic_ns is None
+        ):
+            producer.capture_failure_observation(observed)
+        return observed
+
     try:
         writer.append(
             {
@@ -2932,10 +3755,19 @@ async def run_public_cycle_collection(
                     await producer.consume()
                 except asyncio.CancelledError:
                     raise
-                except BaseException:
+                except BaseException as exc:
+                    if producer.failure_observed_monotonic_ns is None:
+                        capture_failure_now(bind_producer=True)
                     # PublicFeedRunner observes this marker and exits its
                     # transport loops immediately when the consumer fails.
-                    setattr(feed, "fatal_reason", "S3_CONSUMER_FAILURE")
+                    if feed.fatal_reason is None:
+                        setattr(
+                            feed,
+                            "fatal_reason",
+                            _failure_reason(exc)
+                            if isinstance(exc, CycleEnvelopeLimitError)
+                            else "S3_CONSUMER_FAILURE",
+                        )
                     consumer_stop.set()
                     raise
 
@@ -2963,6 +3795,8 @@ async def run_public_cycle_collection(
                     await asyncio.gather(feed_task, return_exceptions=True)
                     await consumer
                 await feed_task
+                if feed.fatal_reason is not None and producer.failure_observed_monotonic_ns is None:
+                    capture_failure_now()
                 ingress.close()
                 await consumer
             finally:
@@ -2977,9 +3811,21 @@ async def run_public_cycle_collection(
                     deadline_timer,
                     return_exceptions=True,
                 )
-            producer.close()
             failed_reason = feed.fatal_reason
-            producer.finalize(failed=failed_reason is not None, reason=failed_reason)
+            if failed_reason is not None and producer.failure_observed_monotonic_ns is None:
+                if failure_observed_monotonic_ns is None:
+                    capture_failure_now()
+                producer.capture_failure_observation(failure_observed_monotonic_ns)
+            failure_observed_monotonic_ns = producer.failure_observed_monotonic_ns
+            producer.finalize(
+                failed=failed_reason is not None,
+                reason=failed_reason,
+                failure_observed_monotonic_ns=(
+                    failure_observed_monotonic_ns
+                    if failed_reason is not None
+                    else None
+                ),
+            )
             terminal_written = writer.terminal_written
             if failed_reason is not None:
                 raise CycleEvidenceError(failed_reason)
@@ -2987,9 +3833,32 @@ async def run_public_cycle_collection(
         if not terminal_written and not writer.terminal_written:
             try:
                 if producer is not None:
-                    producer.finalize(failed=True, reason=type(exc).__name__)
+                    producer.finalize(
+                        failed=True,
+                        reason=_failure_reason(exc),
+                        failure_observed_monotonic_ns=(
+                            producer.failure_observed_monotonic_ns
+                            if producer.failure_observed_monotonic_ns is not None
+                            else failure_observed_monotonic_ns
+                        ),
+                    )
                 else:
-                    writer.append_terminal(failed=True, reason=type(exc).__name__)
+                    failure_observed = failure_observed_monotonic_ns
+                    if failure_observed is None:
+                        failure_observed = _non_negative_int(
+                            clock_ns(),
+                            "failure_observed_monotonic_ns",
+                        )
+                    boundary = min(
+                        failure_observed,
+                        runtime_window.deadline_monotonic_ns,
+                    )
+                    writer.append_terminal(
+                        failed=True,
+                        reason=_failure_reason(exc),
+                        observation_boundary_monotonic_ns=boundary,
+                        failure_observed_monotonic_ns=failure_observed,
+                    )
                 terminal_written = True
             except BaseException as marker_exc:
                 exc.add_note(f"unable to persist S3 failure marker: {type(marker_exc).__name__}")
@@ -3014,6 +3883,12 @@ class _RunBundle:
     path: Path
     run_id: str
     metadata: dict[str, Any]
+    output_contract_version: int
+    observation_boundary_monotonic_ns: int | None
+    scheduled_deadline_monotonic_ns: int | None
+    finalization_boundary_kind: str | None
+    failure_observed_monotonic_ns: int | None
+    result_observation_boundaries: tuple[tuple[str, str, int], ...]
     streaming: bool
     admission_count: int
     rejected_admission_count: int
@@ -3048,6 +3923,8 @@ def _read_run(path: Path) -> _RunBundle:
     record_count = 0
     has_stream_input = False
     has_stream_end = False
+    max_record_observed_ns: int | None = None
+    malformed_record_observed = False
     first_pass_digest = hashlib.sha256()
 
     for record in iter_records(path):
@@ -3065,6 +3942,20 @@ def _read_run(path: Path) -> _RunBundle:
                 raise CycleEvidenceIntegrityError("S3 evidence has no run identity")
         if record.get("run_id") != run_id or record.get("record_index") != record_count:
             raise CycleEvidenceIntegrityError("S3 evidence record indices are not contiguous")
+        if "observed_monotonic_ns" in record:
+            observed = record["observed_monotonic_ns"]
+            if (
+                isinstance(observed, int)
+                and not isinstance(observed, bool)
+                and observed >= 0
+            ):
+                max_record_observed_ns = (
+                    observed
+                    if max_record_observed_ns is None
+                    else max(max_record_observed_ns, observed)
+                )
+            else:
+                malformed_record_observed = True
         kind = record.get("kind")
         if kind in {"RUN_STOP", "RUN_FAILED"}:
             terminal_count += 1
@@ -3153,6 +4044,41 @@ def _read_run(path: Path) -> _RunBundle:
     except (KeyError, TypeError, ValueError) as exc:
         raise CycleEvidenceIntegrityError("S3 evidence metadata is malformed") from exc
 
+    output_contract_version = _output_contract_version(
+        metadata.get("output_contract_version", S3_LEGACY_OUTPUT_CONTRACT_VERSION),
+        context="S3 metadata",
+    )
+    terminal_contract: tuple[int, str, int | None] | None = None
+    if output_contract_version >= S3_OUTPUT_CONTRACT_VERSION:
+        if malformed_record_observed:
+            raise CycleEvidenceIntegrityError(
+                "S3 v2 evidence has a malformed observed timestamp"
+            )
+        terminal_contract = _validate_v2_boundary_record(
+            terminal_record,
+            deadline_ns=window.deadline_monotonic_ns,
+            context="S3 terminal",
+            failed=terminal_kind == "RUN_FAILED",
+        )
+        if (
+            max_record_observed_ns is not None
+            and max_record_observed_ns > terminal_contract[0]
+        ):
+            raise CycleEvidenceIntegrityError(
+                "S3 v2 evidence observes beyond its finalization boundary"
+            )
+        if terminal_kind == "RUN_STOP" and terminal_contract[1] != "SCHEDULED_DEADLINE":
+            raise CycleEvidenceIntegrityError(
+                "S3 clean terminal does not use the scheduled boundary"
+            )
+        if (
+            terminal_kind == "RUN_STOP"
+            and terminal_contract[0] != window.deadline_monotonic_ns
+        ):
+            raise CycleEvidenceIntegrityError(
+                "S3 clean terminal stopped before the scheduled deadline"
+            )
+
     streaming = bool(has_stream_input or has_stream_end)
     decisions_seen: list[int] = []
     input_cursors: defaultdict[int, int] = defaultdict(int)
@@ -3166,7 +4092,14 @@ def _read_run(path: Path) -> _RunBundle:
     signal_skip_count = 0
     signal_skip_reasons: set[str] = set()
     result_digests: list[str] = []
-    driver = CycleRunDriver(window, envelope=envelope, persist=False, streaming=streaming)
+    result_observation_boundaries: dict[tuple[str, str], int] = {}
+    driver = CycleRunDriver(
+        window,
+        envelope=envelope,
+        persist=False,
+        streaming=streaming,
+        output_contract_version=output_contract_version,
+    )
     second_pass_digest = hashlib.sha256()
     second_record_count = 0
     second_terminal_count = 0
@@ -3232,15 +4165,48 @@ def _read_run(path: Path) -> _RunBundle:
                 _require(record, "end_monotonic_ns", context="CYCLE_STREAM_END"),
                 "end_monotonic_ns",
             )
+            if output_contract_version >= S3_OUTPUT_CONTRACT_VERSION:
+                assert terminal_contract is not None
+                if stream_end != terminal_contract[0]:
+                    raise CycleEvidenceIntegrityError(
+                        "CYCLE_STREAM_END disagrees with run finalization"
+                    )
+                _validate_v2_boundary_record(
+                    record,
+                    deadline_ns=window.deadline_monotonic_ns,
+                    context="CYCLE_STREAM_END",
+                    expected=(terminal_contract[0], terminal_contract[1]),
+                    failed=False if terminal_kind == "RUN_STOP" else None,
+                )
             if streaming:
-                driver.finish_stream(end_monotonic_ns=stream_end)
+                driver.finish_stream(
+                    end_monotonic_ns=stream_end,
+                    finalization_failed=(
+                        terminal_kind == "RUN_FAILED"
+                        if output_contract_version >= S3_OUTPUT_CONTRACT_VERSION
+                        and terminal_contract is not None
+                        else None
+                    ),
+                    failure_observed_monotonic_ns=(
+                        terminal_contract[2]
+                        if output_contract_version >= S3_OUTPUT_CONTRACT_VERSION
+                        and terminal_contract is not None
+                        and terminal_kind == "RUN_FAILED"
+                        else None
+                    ),
+                )
         elif kind == "CYCLE_END":
             index = _non_negative_int(_require(record, "attempt_index", context="CYCLE_END"), "attempt_index")
             if index in end_values:
                 raise CycleEvidenceIntegrityError("duplicate S3 cycle end")
-            end_values[index] = record.get("end_monotonic_ns")
+            skipped = record.get("skipped") is True
+            end_value = record.get("end_monotonic_ns")
+            end_values[index] = end_value
             if not streaming:
-                driver.finish_decision(index, end_monotonic_ns=end_values[index])
+                driver.finish_decision(
+                    index,
+                    end_monotonic_ns=end_values[index],
+                )
         elif kind == "CYCLE_ADMISSION":
             persisted_admission = {
                 "attempt_index": record.get("attempt_index"),
@@ -3275,6 +4241,32 @@ def _read_run(path: Path) -> _RunBundle:
             digest = _require(record, "result_sha256", context="CYCLE_FINAL_RESULT")
             if digest != _digest(result_payload):
                 raise CycleEvidenceIntegrityError("CYCLE_FINAL_RESULT payload digest mismatch")
+            if output_contract_version >= S3_OUTPUT_CONTRACT_VERSION:
+                assert terminal_contract is not None
+                _validate_result_payload_observation(
+                    result_payload,
+                    boundary_ns=terminal_contract[0],
+                    context="CYCLE_FINAL_RESULT.result",
+                )
+                _validate_v2_boundary_record(
+                    record,
+                    deadline_ns=window.deadline_monotonic_ns,
+                    context="CYCLE_FINAL_RESULT",
+                    expected=(terminal_contract[0], terminal_contract[1]),
+                    failed=False if terminal_kind == "RUN_STOP" else None,
+                )
+                scenario = record.get("scenario")
+                quote_version_id = record.get("quote_version_id")
+                if not isinstance(scenario, str) or not isinstance(quote_version_id, str):
+                    raise CycleEvidenceIntegrityError(
+                        "CYCLE_FINAL_RESULT identity is malformed"
+                    )
+                identity = (scenario, quote_version_id)
+                if identity in result_observation_boundaries:
+                    raise CycleEvidenceIntegrityError(
+                        "duplicate S3 final-result identity"
+                    )
+                result_observation_boundaries[identity] = terminal_contract[0]
             result_digests.append(digest)
         elif kind == "RUN_METADATA" or kind == "REPLAY_MODE":
             raise CycleEvidenceIntegrityError(f"unexpected S3 record kind: {kind}")
@@ -3337,14 +4329,66 @@ def _read_run(path: Path) -> _RunBundle:
             if not stream_finalization_incomplete:
                 raise CycleEvidenceIntegrityError("S3 stream evidence is missing its end")
         if not stream_finalization_incomplete and not driver._stream_ended:
-            driver.finish_stream(end_monotonic_ns=stream_end)
+            driver.finish_stream(
+                end_monotonic_ns=stream_end,
+                finalization_failed=(
+                    terminal_kind == "RUN_FAILED"
+                    if output_contract_version >= S3_OUTPUT_CONTRACT_VERSION
+                    else None
+                ),
+                failure_observed_monotonic_ns=(
+                    terminal_contract[2]
+                    if output_contract_version >= S3_OUTPUT_CONTRACT_VERSION
+                    and terminal_contract is not None
+                    and terminal_kind == "RUN_FAILED"
+                    else None
+                ),
+            )
         if not stream_finalization_incomplete:
-            driver.finalize()
+            driver.finalize(
+                failed=(
+                    terminal_kind == "RUN_FAILED"
+                    if output_contract_version >= S3_OUTPUT_CONTRACT_VERSION
+                    else False
+                ),
+                failure_observed_monotonic_ns=(
+                    None
+                    if terminal_contract is None
+                    else terminal_contract[2]
+                ),
+            )
     else:
         for index in expected_indices:
             if not driver.decision_finished(index):
-                driver.finish_decision(index, end_monotonic_ns=end_values.get(index))
-        driver.finalize()
+                if output_contract_version >= S3_OUTPUT_CONTRACT_VERSION:
+                    assert terminal_contract is not None
+                    replay_end = end_values.get(index)
+                    if replay_end is None:
+                        replay_end = terminal_contract[0]
+                    driver.finish_decision(
+                        index,
+                        end_monotonic_ns=replay_end,
+                        finalization_failed=terminal_kind == "RUN_FAILED",
+                        failure_observed_monotonic_ns=(
+                            terminal_contract[2]
+                            if terminal_kind == "RUN_FAILED"
+                            else None
+                        ),
+                    )
+                else:
+                    driver.finish_decision(index, end_monotonic_ns=end_values.get(index))
+        driver.finalize(
+            failed=(
+                terminal_kind == "RUN_FAILED"
+                if output_contract_version >= S3_OUTPUT_CONTRACT_VERSION
+                else False
+            ),
+            failure_observed_monotonic_ns=(
+                None
+                if terminal_contract is None
+                else terminal_contract[2]
+            ),
+        )
     expected_result_digests = tuple(result_digests)
     actual_result_digests = tuple(cycle_result_digest(result) for result in driver.results)
     prefix_incomplete = (
@@ -3366,6 +4410,20 @@ def _read_run(path: Path) -> _RunBundle:
         )
     if not results_match:
         raise CycleEvidenceIntegrityError("persisted S3 cycle results do not replay identically")
+    if output_contract_version >= S3_OUTPUT_CONTRACT_VERSION:
+        expected_result_identities = {
+            (result.scenario.value, result.quote_version_id)
+            for result in driver.results
+        }
+        persisted_result_identities = set(result_observation_boundaries)
+        if not persisted_result_identities.issubset(expected_result_identities):
+            raise CycleEvidenceIntegrityError(
+                "persisted S3 final-result identities do not replay identically"
+            )
+        if not prefix_incomplete and persisted_result_identities != expected_result_identities:
+            raise CycleEvidenceIntegrityError(
+                "S3 final-result chronology is incomplete"
+            )
     resource_incomplete = (
         prefix_incomplete
         or stream_finalization_incomplete
@@ -3380,6 +4438,32 @@ def _read_run(path: Path) -> _RunBundle:
         path=path,
         run_id=run_id,
         metadata=metadata,
+        output_contract_version=output_contract_version,
+        observation_boundary_monotonic_ns=(
+            None if terminal_contract is None else terminal_contract[0]
+        ),
+        scheduled_deadline_monotonic_ns=(
+            None
+            if terminal_contract is None
+            else window.deadline_monotonic_ns
+        ),
+        finalization_boundary_kind=(
+            None if terminal_contract is None else terminal_contract[1]
+        ),
+        failure_observed_monotonic_ns=(
+            None if terminal_contract is None else terminal_contract[2]
+        ),
+        result_observation_boundaries=tuple(
+            sorted(
+                (
+                    scenario,
+                    quote_version_id,
+                    boundary,
+                )
+                for (scenario, quote_version_id), boundary
+                in result_observation_boundaries.items()
+            )
+        ),
         streaming=streaming,
         admission_count=admission_count,
         rejected_admission_count=rejected_admission_count,
@@ -3515,6 +4599,15 @@ def _forced_unmatched_exit_cashflow(result: CycleResult) -> Decimal:
     )
 
 
+def _unmatched_action_request_monotonic_ns(result: CycleResult) -> int | None:
+    """Return the causal start of the explicit unmatched unwind action."""
+
+    for action in result.actions:
+        if action.kind is CycleActionKind.UNMATCHED_RISEX_UNWIND:
+            return action.requested_monotonic_ns
+    return None
+
+
 class _ScenarioReportAccumulator:
     """Bounded aggregate for one scenario across one or more replayed runs."""
 
@@ -3546,6 +4639,9 @@ class _ScenarioReportAccumulator:
         "turnover",
         "holding",
         "unmatched_duration",
+        "observed_holding",
+        "observed_unmatched_duration",
+        "output_contract_version",
         "forced_or_unmatched_count",
         "forced_pnl",
         "forced_pnl_unknown",
@@ -3557,8 +4653,17 @@ class _ScenarioReportAccumulator:
         "complete_group_pnl",
     )
 
-    def __init__(self, scenario: CycleScenario) -> None:
+    def __init__(
+        self,
+        scenario: CycleScenario,
+        *,
+        output_contract_version: int = S3_LEGACY_OUTPUT_CONTRACT_VERSION,
+    ) -> None:
         self.scenario = scenario
+        self.output_contract_version = _output_contract_version(
+            output_contract_version,
+            context="S3 report",
+        )
         self.cycle_count = 0
         self.complete_cycle_count = 0
         self.normal_count = 0
@@ -3585,6 +4690,8 @@ class _ScenarioReportAccumulator:
         self.turnover = _ZERO
         self.holding = 0
         self.unmatched_duration = 0
+        self.observed_holding = 0
+        self.observed_unmatched_duration = 0
         self.forced_or_unmatched_count = 0
         self.forced_pnl = _ZERO
         self.forced_pnl_unknown = False
@@ -3607,7 +4714,12 @@ class _ScenarioReportAccumulator:
         if left_root != right_root:
             self.parents[right_root] = left_root
 
-    def add(self, result: CycleResult) -> None:
+    def add(
+        self,
+        result: CycleResult,
+        *,
+        observation_boundary_monotonic_ns: int | None = None,
+    ) -> None:
         if result.scenario is not self.scenario:
             return
         index = self.cycle_count
@@ -3634,6 +4746,44 @@ class _ScenarioReportAccumulator:
         )
         self.holding += result.holding_duration_ns or 0
         self.unmatched_duration += result.unmatched_exposure_duration_ns or 0
+        if result.holding_duration_ns is not None:
+            self.observed_holding += result.holding_duration_ns
+        elif (
+            observation_boundary_monotonic_ns is not None
+            and result.first_maker_fill_monotonic_ns is not None
+        ):
+            self.observed_holding += max(
+                0,
+                observation_boundary_monotonic_ns
+                - result.first_maker_fill_monotonic_ns,
+            )
+        if self.output_contract_version >= S3_OUTPUT_CONTRACT_VERSION:
+            if result.unmatched_exposure_duration_ns is not None:
+                # The kernel's realized duration starts at the same explicit
+                # unmatched action request that it records in the ledger.
+                self.observed_unmatched_duration += result.unmatched_exposure_duration_ns
+            elif (
+                result.unmatched_entry_quantity > 0
+                and observation_boundary_monotonic_ns is not None
+            ):
+                action_request_ns = _unmatched_action_request_monotonic_ns(result)
+                if action_request_ns is not None:
+                    self.observed_unmatched_duration += max(
+                        0,
+                        observation_boundary_monotonic_ns - action_request_ns,
+                    )
+        elif result.unmatched_exposure_duration_ns is not None:
+            self.observed_unmatched_duration += result.unmatched_exposure_duration_ns
+        elif (
+            result.unmatched_entry_quantity > 0
+            and observation_boundary_monotonic_ns is not None
+            and result.first_maker_fill_monotonic_ns is not None
+        ):
+            self.observed_unmatched_duration += max(
+                0,
+                observation_boundary_monotonic_ns
+                - result.first_maker_fill_monotonic_ns,
+            )
 
         fills = result.fills
         self.fill_count += len(fills)
@@ -3698,7 +4848,7 @@ class _ScenarioReportAccumulator:
             if self.forced_pnl_unknown
             else self.forced_pnl
         )
-        return {
+        report = {
             "scenario": self.scenario.value,
             "cycle_count": self.cycle_count,
             "complete_cycle_count": self.complete_cycle_count,
@@ -3766,12 +4916,55 @@ class _ScenarioReportAccumulator:
             "funding_status": "UNKNOWN_EXECUTION_ONLY",
             "positive_is_hypothetical_only": True,
         }
+        if self.output_contract_version >= S3_OUTPUT_CONTRACT_VERSION:
+            report.update(
+                {
+                    "output_contract_version": self.output_contract_version,
+                    "observed_occupancy_holding_duration_seconds": _decimal_text(
+                        Decimal(self.observed_holding) / Decimal(1_000_000_000)
+                    ),
+                    "observed_unmatched_exposure_duration_seconds": _decimal_text(
+                        Decimal(self.observed_unmatched_duration)
+                        / Decimal(1_000_000_000)
+                    ),
+                    "observed_duration_semantics": {
+                        "observed_occupancy_holding_duration_seconds": (
+                            "first_maker_fill_to_observation_boundary_for_pending_results; "
+                            "terminal holding duration otherwise"
+                        ),
+                        "observed_unmatched_exposure_duration_seconds": (
+                            "unmatched observed exposure to observation boundary for "
+                            "pending results; terminal duration otherwise"
+                        ),
+                    },
+                }
+            )
+        return report
 
 
-def _scenario_report(results: Iterable[CycleResult], scenario: CycleScenario) -> dict[str, Any]:
-    accumulator = _ScenarioReportAccumulator(scenario)
+def _scenario_report(
+    results: Iterable[CycleResult],
+    scenario: CycleScenario,
+    *,
+    output_contract_version: int = S3_LEGACY_OUTPUT_CONTRACT_VERSION,
+    observation_boundaries: Mapping[tuple[str, str], int] | None = None,
+) -> dict[str, Any]:
+    accumulator = _ScenarioReportAccumulator(
+        scenario,
+        output_contract_version=output_contract_version,
+    )
     for result in results:
-        accumulator.add(result)
+        boundary = (
+            None
+            if observation_boundaries is None
+            else observation_boundaries.get(
+                (result.scenario.value, result.quote_version_id)
+            )
+        )
+        accumulator.add(
+            result,
+            observation_boundary_monotonic_ns=boundary,
+        )
     return accumulator.report()
 
 
@@ -3803,25 +4996,41 @@ def _annotate_result_metrics(
         }
     )
     for field in _UNAVAILABLE_RESULT_METRICS:
-        report[field] = None
+        if field in report:
+            report[field] = None
     return report
 
 
 def _window_summary(bundle: _RunBundle) -> dict[str, Any]:
+    observation_boundaries = {
+        (scenario, quote_version_id): boundary
+        for scenario, quote_version_id, boundary
+        in bundle.result_observation_boundaries
+    }
     primary = _annotate_result_metrics(
-        _scenario_report(bundle.report_results, CycleScenario.PRIMARY),
+        _scenario_report(
+            bundle.report_results,
+            CycleScenario.PRIMARY,
+            output_contract_version=bundle.output_contract_version,
+            observation_boundaries=observation_boundaries,
+        ),
         resource_incomplete=bundle.resource_incomplete,
         terminal_reason=bundle.terminal_reason,
         incomplete_evidence=bundle.incomplete_evidence,
     )
     stress = _annotate_result_metrics(
-        _scenario_report(bundle.report_results, CycleScenario.STRESS),
+        _scenario_report(
+            bundle.report_results,
+            CycleScenario.STRESS,
+            output_contract_version=bundle.output_contract_version,
+            observation_boundaries=observation_boundaries,
+        ),
         resource_incomplete=bundle.resource_incomplete,
         terminal_reason=bundle.terminal_reason,
         incomplete_evidence=bundle.incomplete_evidence,
     )
     metadata = bundle.metadata
-    return {
+    summary = {
         "run_id": bundle.run_id,
         "campaign_id": metadata["campaign_id"],
         "window_id": metadata["window_id"],
@@ -3846,6 +5055,17 @@ def _window_summary(bundle: _RunBundle) -> dict[str, Any]:
             set(bundle.admission_reasons) | set(bundle.signal_skip_reasons)
         ),
     }
+    if bundle.output_contract_version >= S3_OUTPUT_CONTRACT_VERSION:
+        summary.update(
+            {
+                "output_contract_version": bundle.output_contract_version,
+                "observation_boundary_monotonic_ns": bundle.observation_boundary_monotonic_ns,
+                "scheduled_deadline_monotonic_ns": bundle.scheduled_deadline_monotonic_ns,
+                "finalization_boundary_kind": bundle.finalization_boundary_kind,
+                "failure_observed_monotonic_ns": bundle.failure_observed_monotonic_ns,
+            }
+        )
+    return summary
 
 
 def _paths_for_report(path: str | os.PathLike[str]) -> tuple[Path, ...]:
@@ -3888,6 +5108,7 @@ def build_cycle_report(path: str | os.PathLike[str]) -> dict[str, Any]:
         raise CycleEvidenceIntegrityError("S3 campaign report contains more than four windows")
     first_bundle = _read_run(paths[0])
     metadata = first_bundle.metadata
+    output_contract_version = first_bundle.output_contract_version
     campaign_id = metadata["campaign_id"]
     policy_fingerprint = metadata["policy_fingerprint"]
     accepted_release = metadata["accepted_release"]
@@ -3902,8 +5123,14 @@ def build_cycle_report(path: str | os.PathLike[str]) -> dict[str, Any]:
     manifest_hashes: set[Any] = set()
     windows_list: list[CycleWindow] = []
     summaries_list: list[dict[str, Any]] = []
-    primary_accumulator = _ScenarioReportAccumulator(CycleScenario.PRIMARY)
-    stress_accumulator = _ScenarioReportAccumulator(CycleScenario.STRESS)
+    primary_accumulator = _ScenarioReportAccumulator(
+        CycleScenario.PRIMARY,
+        output_contract_version=output_contract_version,
+    )
+    stress_accumulator = _ScenarioReportAccumulator(
+        CycleScenario.STRESS,
+        output_contract_version=output_contract_version,
+    )
     resource_incomplete_run_count = 0
     aggregate_record_count = 0
     aggregate_byte_count = 0
@@ -3916,6 +5143,10 @@ def build_cycle_report(path: str | os.PathLike[str]) -> dict[str, Any]:
         run_ids.add(bundle.run_id)
         if bundle.metadata["evidence_mode"] != evidence_mode:
             raise CycleEvidenceIntegrityError("S3 report mixes fixture and observed-public provenance")
+        if bundle.output_contract_version != output_contract_version:
+            raise CycleEvidenceIntegrityError(
+                "S3 report mixes output contract versions"
+            )
         if bundle_index:
             if (
                 bundle.metadata["campaign_id"] != campaign_id
@@ -3944,9 +5175,23 @@ def build_cycle_report(path: str | os.PathLike[str]) -> dict[str, Any]:
         all_terminals_are_clean_stops = (
             all_terminals_are_clean_stops and bundle.terminal == "RUN_STOP"
         )
+        observation_boundaries = {
+            (scenario, quote_version_id): boundary
+            for scenario, quote_version_id, boundary
+            in bundle.result_observation_boundaries
+        }
         for result in bundle.report_results:
-            primary_accumulator.add(result)
-            stress_accumulator.add(result)
+            boundary = observation_boundaries.get(
+                (result.scenario.value, result.quote_version_id)
+            )
+            primary_accumulator.add(
+                result,
+                observation_boundary_monotonic_ns=boundary,
+            )
+            stress_accumulator.add(
+                result,
+                observation_boundary_monotonic_ns=boundary,
+            )
         if bundle_index == 0:
             first_bundle = None
     if evidence_mode == "OBSERVATIONAL" and (
@@ -4078,7 +5323,7 @@ def build_cycle_report(path: str | os.PathLike[str]) -> dict[str, Any]:
             for reason in summary["skipped_signal_reasons"]
         }
     )
-    return {
+    report = {
         "schema_version": S3_SCHEMA_VERSION,
         "experiment_kind": S3_EXPERIMENT_KIND,
         "campaign_id": campaign_id,
@@ -4154,6 +5399,9 @@ def build_cycle_report(path: str | os.PathLike[str]) -> dict[str, Any]:
         "envelope": _primitive(envelope),
         "windows": summaries,
     }
+    if output_contract_version >= S3_OUTPUT_CONTRACT_VERSION:
+        report["output_contract_version"] = output_contract_version
+    return report
 
 
 def render_cycle_report(path: str | os.PathLike[str], *, format: str = "json") -> str:
@@ -4211,6 +5459,8 @@ __all__ = [
     "S3_MAX_BYTES",
     "S3_MAX_RECORDS",
     "S3_RECORD_RESERVE",
+    "S3_LEGACY_OUTPUT_CONTRACT_VERSION",
+    "S3_OUTPUT_CONTRACT_VERSION",
     "S3_SCHEMA_VERSION",
     "S3_WINDOW_SECONDS",
     "build_cycle_report",
