@@ -2514,9 +2514,11 @@ class CycleKernel:
 
         ``advance`` processes every due boundary before returning to its
         caller.  Consequently, for each expected stream the next boundary
-        needs at most the latest book already temporal at that boundary and
-        the latest book overall (which may still be future at that boundary).
-        A displaced stream is represented by a venue flag; it never needs a
+        needs only the latest temporal book, the latest future book, and the
+        latest fresh temporal book that proves the temporal-health predicate.
+        When no book is temporal, the latest timing-missing witness is also
+        retained so the selector can preserve its timing reason.  A
+        displaced stream is represented by a venue flag; it never needs a
         depth-bearing payload for action selection.
         """
 
@@ -2551,15 +2553,43 @@ class CycleKernel:
                 )
             )
             latest = candidates[-1]
-            retained_by_object[id(latest)] = latest
-            if next_due is not None:
-                temporal = [
+            if next_due is None:
+                retained_by_object[id(latest)] = latest
+                continue
+            temporal = [
+                observation
+                for observation in candidates
+                if self._book_is_temporal(observation, next_due)
+            ]
+            future = [
+                observation
+                for observation in candidates
+                if not self._book_is_temporal(observation, next_due)
+            ]
+            if temporal:
+                retained_by_object[id(temporal[-1])] = temporal[-1]
+                fresh_temporal = [
+                    observation
+                    for observation in temporal
+                    if (
+                        observation.book.fresh
+                        and observation.book.is_sequence_healthy
+                        and next_due - observation.book.received_monotonic_ns
+                        <= cycle.policy.input_freshness_max_age_ns
+                    )
+                ]
+                if fresh_temporal:
+                    retained_by_object[id(fresh_temporal[-1])] = fresh_temporal[-1]
+            if future:
+                retained_by_object[id(future[-1])] = future[-1]
+            if not temporal:
+                timing_missing = [
                     observation
                     for observation in candidates
-                    if self._book_is_temporal(observation, next_due)
+                    if observation.processing_ready_ns is None
                 ]
-                if temporal:
-                    retained_by_object[id(temporal[-1])] = temporal[-1]
+                if timing_missing:
+                    retained_by_object[id(timing_missing[-1])] = timing_missing[-1]
         cycle.books = sorted(retained_by_object.values(), key=lambda observation: observation.arrival_index)
         # Keep the compact identity digest for every book accepted during an
         # active cycle.  The digest is the exact duplicate/conflict witness;

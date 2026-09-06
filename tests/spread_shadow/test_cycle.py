@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 from decimal import Decimal as D
 import hashlib
 
+import pytest
+
 from risex_farmer.models import (
     BookLevel,
     CanonicalMarket,
@@ -1355,6 +1357,59 @@ def test_future_book_cannot_be_used_to_retroactively_execute_a_due_hedge() -> No
     assert CycleReason.FUTURE_BOOK_REJECTED.value in result.reason_codes
     assert result.positions.risex_signed_quantity == D("-1.00")
     assert result.positions.lighter_signed_quantity == D("0")
+
+
+@pytest.mark.parametrize(
+    ("middle_book", "older_age_ns", "expected_reason"),
+    [
+        pytest.param({"sequence_valid": False}, 200, CycleReason.REQUIRED_ACTION_UNHEALTHY, id="sequence"),
+        pytest.param({"checksum_valid": False}, 200, CycleReason.REQUIRED_ACTION_UNHEALTHY, id="checksum"),
+        pytest.param({"fresh": False}, 200, CycleReason.REQUIRED_ACTION_DATA_STALE, id="freshness"),
+        pytest.param({"sequence_valid": False}, 500_000_002, CycleReason.FUTURE_BOOK_REJECTED, id="stale-healthy-neighbor"),
+    ],
+)
+def test_compacted_temporal_neighbors_preserve_due_selector_reason(
+    middle_book: dict[str, bool],
+    older_age_ns: int,
+    expected_reason: CycleReason,
+) -> None:
+    kernel, _ = _admit_full_entry("s2-temporal-neighbors")
+    due = 1_000_000_200
+    kernel.advance(
+        _book(
+            Venue.RISEX,
+            received=due - 300,
+            revision=100,
+        )
+    )
+    kernel.advance(
+        _book(
+            Venue.LIGHTER,
+            received=due - older_age_ns,
+            revision=101,
+        )
+    )
+    kernel.advance(
+        _book(
+            Venue.LIGHTER,
+            received=due - 100,
+            revision=102,
+            **middle_book,
+        )
+    )
+    kernel.advance(
+        _book(
+            Venue.LIGHTER,
+            received=due + 100,
+            revision=103,
+        )
+    )
+
+    result = kernel.last_result()
+    assert result is not None
+    assert result.status is CycleTerminalState.UNRESOLVED
+    assert expected_reason.value in result.reason_codes
+    assert CycleReason.TERMINAL_NON_FLAT.value in result.reason_codes
 
 
 def test_due_action_uses_latest_eligible_book_and_matches_explicit_clock_boundary() -> None:
