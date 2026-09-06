@@ -117,6 +117,30 @@ S3_REQUIRED_CYCLES_PER_QUALIFYING_WINDOW = 5
 _SHA256_RE = re.compile(r"^[0-9a-f]{40}$")
 _HEX256_RE = re.compile(r"^[0-9a-f]{64}$")
 _ZERO = Decimal("0")
+_RESOURCE_LIMIT_REASONS = frozenset(
+    {"S3_ENVELOPE_LIMIT_RECORDS", "S3_ENVELOPE_LIMIT_BYTES"}
+)
+_RESOURCE_INCOMPLETE_MARKERS = frozenset(
+    {
+        "CYCLE_FINALIZATION_PREFIX",
+        "FINAL_RESULT_PREFIX",
+        "STREAM_FINALIZATION_PREFIX",
+    }
+)
+_UNAVAILABLE_RESULT_METRICS = (
+    "total_pnl_usd",
+    "mean_pnl_usd",
+    "gross_profit_usd",
+    "gross_loss_usd",
+    "worst_cycle",
+    "turnover_usd",
+    "holding_duration_seconds",
+    "occupancy_holding_duration_seconds",
+    "unmatched_exposure_duration_seconds",
+    "forced_or_unmatched_pnl_usd",
+    "forced_unmatched_exit_contribution_usd",
+    "total_without_best_dependence_group_usd",
+)
 
 
 class CycleEvidenceError(ValueError):
@@ -1339,7 +1363,13 @@ class CycleEvidenceWriter:
             self._terminal_written = True
         return assigned[0]
 
-    def append_terminal(self, *, failed: bool = False, reason: str | None = None) -> int:
+    def append_terminal(
+        self,
+        *,
+        failed: bool = False,
+        reason: str | None = None,
+        incomplete_evidence: str | None = None,
+    ) -> int:
         if self._terminal_written:
             raise CycleEvidenceIntegrityError("S3 run has more than one terminal")
         record: dict[str, Any] = {
@@ -1351,6 +1381,8 @@ class CycleEvidenceWriter:
             ),
             "fatal_reason": reason,
         }
+        if incomplete_evidence is not None:
+            record["incomplete_evidence"] = _text(incomplete_evidence, "incomplete_evidence")
         return self.append(record)
 
 
@@ -1411,6 +1443,7 @@ class CycleRunDriver:
         self._stream_inputs: list[CausalEvent | CycleClock] = []
         self._stream_ended = False
         self._finalized = False
+        self._finalize_error: BaseException | None = None
 
     def _write(self, record: Mapping[str, Any]) -> None:
         if self.persist and self.writer is not None:
@@ -1724,33 +1757,70 @@ class CycleRunDriver:
         reason: str | None = None,
     ) -> CycleRunOutput | tuple[CycleResult, ...]:
         if self._finalized:
+            if self._finalize_error is not None:
+                raise self._finalize_error
             return tuple(self.results) if self.writer is None else CycleRunOutput(self.writer.store.run_id, self.writer.store.path, None, tuple(self.admissions), tuple(self.results))
-        if self.streaming:
-            if not self._stream_ended:
-                self.finish_stream()
-        else:
-            for index, state in self._decisions.items():
-                if not state.finished:
-                    self.finish_decision(index)
+        try:
+            if self.streaming:
+                if not self._stream_ended:
+                    self.finish_stream()
+            else:
+                for index, state in self._decisions.items():
+                    if not state.finished:
+                        self.finish_decision(index)
+        except CycleEnvelopeLimitError as exc:
+            # Closing the stream is itself evidence.  If its final clock or
+            # CYCLE_STREAM_END cannot fit, preserve the already-written
+            # prefix and use the reserved terminal slot immediately.
+            if self.writer is not None and not self.writer.terminal_written:
+                self.writer.append_terminal(
+                    failed=True,
+                    reason=f"S3_ENVELOPE_LIMIT_{exc.resource.upper()}",
+                    incomplete_evidence="STREAM_FINALIZATION_PREFIX" if self.streaming else "CYCLE_FINALIZATION_PREFIX",
+                )
+            self._finalize_error = exc
+            self._finalized = True
+            raise
         self.results = []
         by_version = {state.quote_version.version_id: index for index, state in self._decisions.items()}
-        for scenario in CycleScenario:
-            for result in self.kernel.retained_results(scenario, include_active=True):
-                if result.quote_version_id not in by_version:
-                    raise CycleEvidenceIntegrityError("kernel returned an unknown S3 cycle identity")
-                self.results.append(result)
-                self._write(
-                    {
-                        "kind": "CYCLE_FINAL_RESULT",
-                        "attempt_index": by_version[result.quote_version_id],
-                        "scenario": result.scenario.value,
-                        "quote_version_id": result.quote_version_id,
-                        "deadline_reached": result.status is CycleTerminalState.PENDING,
-                        "result_sha256": cycle_result_digest(result),
-                        "result": cycle_result_payload(result),
-                        "observed_monotonic_ns": result.terminal_monotonic_ns or self.window.deadline_monotonic_ns,
-                    }
+        try:
+            for scenario in CycleScenario:
+                for result in self.kernel.retained_results(scenario, include_active=True):
+                    if result.quote_version_id not in by_version:
+                        raise CycleEvidenceIntegrityError("kernel returned an unknown S3 cycle identity")
+                    self.results.append(result)
+                    self._write(
+                        {
+                            "kind": "CYCLE_FINAL_RESULT",
+                            "attempt_index": by_version[result.quote_version_id],
+                            "scenario": result.scenario.value,
+                            "quote_version_id": result.quote_version_id,
+                            "deadline_reached": result.status is CycleTerminalState.PENDING,
+                            "result_sha256": cycle_result_digest(result),
+                            "result": cycle_result_payload(result),
+                            # Final results are emitted during finalization,
+                            # after the stream has reached its bounded close.
+                            # Keep them in the closing resource accounting
+                            # even when the cycle itself completed earlier.
+                            "observed_monotonic_ns": self.window.deadline_monotonic_ns,
+                            "resource_phase": "CLOSING",
+                        }
+                    )
+        except CycleEnvelopeLimitError as exc:
+            # A failed final-result append must not consume the sole terminal
+            # slot or leave an evidence file without a replayable failure
+            # marker.  The result list is a durable prefix; replay can derive
+            # the omitted suffix from the physical stream, but the failed
+            # terminal keeps the run explicitly insufficient.
+            if self.writer is not None and not self.writer.terminal_written:
+                self.writer.append_terminal(
+                    failed=True,
+                    reason=f"S3_ENVELOPE_LIMIT_{exc.resource.upper()}",
+                    incomplete_evidence="FINAL_RESULT_PREFIX",
                 )
+            self._finalize_error = exc
+            self._finalized = True
+            raise
         self._finalized = True
         if self.writer is None:
             return tuple(self.results)
@@ -2073,7 +2143,14 @@ class PublicCycleProducer:
             )
 
     def finalize(self, *, failed: bool = False, reason: str | None = None) -> CycleRunOutput | tuple[CycleResult, ...]:
-        self.close()
+        try:
+            self.close()
+        except CycleEnvelopeLimitError:
+            # ``close`` performs the stream-end write before delegating to the
+            # driver.  Route a close-time resource failure through the same
+            # terminalizing path immediately; callers must not need a retry to
+            # obtain the explicit incomplete-prefix marker.
+            return self.driver.finalize(failed=failed, reason=reason)
         return self.driver.finalize(failed=failed, reason=reason)
 
 
@@ -2720,7 +2797,7 @@ async def run_public_cycle_collection(
             if failed_reason is not None:
                 raise CycleEvidenceError(failed_reason)
     except BaseException as exc:
-        if not terminal_written:
+        if not terminal_written and not writer.terminal_written:
             try:
                 if producer is not None:
                     producer.finalize(failed=True, reason=type(exc).__name__)
@@ -2757,7 +2834,11 @@ class _RunBundle:
     results: tuple[dict[str, Any], ...]
     replay_admissions: tuple[CycleAdmission, ...]
     replay_results: tuple[CycleResult, ...]
+    report_results: tuple[CycleResult, ...]
+    resource_incomplete: bool
     terminal: str
+    terminal_reason: str | None
+    incomplete_evidence: str | None
     record_count: int
     byte_count: int
 
@@ -2775,6 +2856,8 @@ def _read_run(path: Path) -> _RunBundle:
     terminals = [record for record in records if record.get("kind") in {"RUN_STOP", "RUN_FAILED"}]
     if len(terminals) != 1 or records[-1] is not terminals[0]:
         raise CycleEvidenceIntegrityError("S3 evidence must have one physically-last terminal")
+    terminal_kind = terminals[0].get("kind")
+    terminal_reason = terminals[0].get("fatal_reason")
     if records[0].get("kind") != "RUN_METADATA" or not isinstance(records[0].get("metadata"), Mapping):
         raise CycleEvidenceIntegrityError("S3 evidence must begin with RUN_METADATA")
     metadata = dict(records[0]["metadata"])
@@ -2916,7 +2999,14 @@ def _read_run(path: Path) -> _RunBundle:
     if tuple(sorted(decisions_raw)) != expected_indices:
         raise CycleEvidenceIntegrityError("S3 decision indices are not contiguous")
     if not stream_inputs_raw and set(ends_raw) != set(decisions_raw):
-        raise CycleEvidenceIntegrityError("S3 evidence is missing a cycle end")
+        missing_cycle_end_marker = (
+            terminal_kind == "RUN_FAILED"
+            and isinstance(terminal_reason, str)
+            and terminal_reason in _RESOURCE_LIMIT_REASONS
+            and terminals[0].get("incomplete_evidence") == "CYCLE_FINALIZATION_PREFIX"
+        )
+        if not missing_cycle_end_marker:
+            raise CycleEvidenceIntegrityError("S3 evidence is missing a cycle end")
     if stream_inputs_raw and ends_raw:
         raise CycleEvidenceIntegrityError("S3 stream evidence contains attempt cycle ends")
     ordered_attempts = tuple(
@@ -2929,9 +3019,38 @@ def _read_run(path: Path) -> _RunBundle:
         for index in expected_indices
     )
     streaming = bool(stream_inputs_raw or stream_end is not None)
+    incomplete_evidence = terminals[0].get("incomplete_evidence")
+    if incomplete_evidence is not None and (
+        not isinstance(incomplete_evidence, str)
+        or incomplete_evidence not in _RESOURCE_INCOMPLETE_MARKERS
+    ):
+        raise CycleEvidenceIntegrityError("S3 terminal incomplete evidence marker is invalid")
+    resource_limit_terminal = (
+        terminal_kind == "RUN_FAILED"
+        and isinstance(terminal_reason, str)
+        and terminal_reason in _RESOURCE_LIMIT_REASONS
+    )
+    if incomplete_evidence is not None and not resource_limit_terminal:
+        raise CycleEvidenceIntegrityError("S3 incomplete evidence marker lacks a resource-limit terminal")
+    stream_finalization_incomplete = (
+        resource_limit_terminal
+        and incomplete_evidence == "STREAM_FINALIZATION_PREFIX"
+        and stream_end is None
+    )
+    if incomplete_evidence == "STREAM_FINALIZATION_PREFIX" and not stream_finalization_incomplete:
+        raise CycleEvidenceIntegrityError("S3 stream-finalization marker is inconsistent")
+    cycle_finalization_incomplete = (
+        resource_limit_terminal
+        and incomplete_evidence == "CYCLE_FINALIZATION_PREFIX"
+        and not streaming
+        and set(ends_raw) != set(decisions_raw)
+    )
+    if incomplete_evidence == "CYCLE_FINALIZATION_PREFIX" and not cycle_finalization_incomplete:
+        raise CycleEvidenceIntegrityError("S3 cycle-finalization marker is inconsistent")
     if streaming:
         if stream_end is None:
-            raise CycleEvidenceIntegrityError("S3 stream evidence is missing its end")
+            if not stream_finalization_incomplete:
+                raise CycleEvidenceIntegrityError("S3 stream evidence is missing its end")
         if tuple(index for index, _ in stream_inputs_raw) != tuple(range(len(stream_inputs_raw))):
             raise CycleEvidenceIntegrityError("S3 stream input indices are not contiguous")
         driver = CycleRunDriver(window, envelope=envelope, persist=False, streaming=True)
@@ -2960,9 +3079,10 @@ def _read_run(path: Path) -> _RunBundle:
                 driver.finish_stream(end_monotonic_ns=stream_end)
         if stream_input_cursor != len(stream_inputs_raw):
             raise CycleEvidenceIntegrityError("S3 stream replay did not consume every input")
-        if not driver._stream_ended:
+        if not stream_finalization_incomplete and not driver._stream_ended:
             driver.finish_stream(end_monotonic_ns=stream_end)
-        driver.finalize()
+        if not stream_finalization_incomplete:
+            driver.finalize()
     else:
         driver = CycleRunDriver(window, envelope=envelope, persist=False)
         driver.run(ordered_attempts)
@@ -2992,8 +3112,35 @@ def _read_run(path: Path) -> _RunBundle:
         raise CycleEvidenceIntegrityError("persisted S3 admissions do not replay identically")
     expected_result_digests = tuple(record.get("result_sha256") for record in results)
     actual_result_digests = tuple(cycle_result_digest(result) for result in driver.results)
-    if len(results) != len(actual_result_digests) or expected_result_digests != actual_result_digests:
+    prefix_incomplete = (
+        resource_limit_terminal
+        and incomplete_evidence in {"CYCLE_FINALIZATION_PREFIX", "FINAL_RESULT_PREFIX"}
+    )
+    if prefix_incomplete:
+        result_prefix = actual_result_digests[: len(expected_result_digests)]
+        if len(expected_result_digests) >= len(actual_result_digests):
+            raise CycleEvidenceIntegrityError("S3 final-result prefix marker has no omitted suffix")
+        results_match = (
+            len(expected_result_digests) <= len(actual_result_digests)
+            and expected_result_digests == result_prefix
+        )
+    else:
+        results_match = (
+            len(results) == len(actual_result_digests)
+            and expected_result_digests == actual_result_digests
+        )
+    if not results_match:
         raise CycleEvidenceIntegrityError("persisted S3 cycle results do not replay identically")
+    resource_incomplete = (
+        prefix_incomplete
+        or stream_finalization_incomplete
+        or cycle_finalization_incomplete
+    )
+    report_results = (
+        ()
+        if resource_incomplete
+        else tuple(driver.results)
+    )
     return _RunBundle(
         path=path,
         metadata=metadata,
@@ -3005,7 +3152,11 @@ def _read_run(path: Path) -> _RunBundle:
         results=tuple(results),
         replay_admissions=tuple(driver.admissions),
         replay_results=tuple(driver.results),
+        report_results=report_results,
+        resource_incomplete=resource_incomplete,
         terminal=terminals[0]["kind"],
+        terminal_reason=terminal_reason,
+        incomplete_evidence=incomplete_evidence,
         record_count=len(records),
         byte_count=path.stat().st_size,
     )
@@ -3156,9 +3307,51 @@ def _scenario_report(results: Sequence[CycleResult], scenario: CycleScenario) ->
     }
 
 
+def _annotate_result_metrics(
+    report: dict[str, Any],
+    *,
+    resource_incomplete: bool,
+    terminal_reason: str | None,
+    incomplete_evidence: str | None,
+) -> dict[str, Any]:
+    if not resource_incomplete:
+        report.update(
+            {
+                "cycle_result_metrics_complete": True,
+                "cycle_result_metrics_status": "COMPLETE",
+                "cycle_result_metrics_note": None,
+            }
+        )
+        return report
+    report.update(
+        {
+            "cycle_result_metrics_complete": False,
+            "cycle_result_metrics_status": "UNAVAILABLE_RESOURCE_LIMIT",
+            "cycle_result_metrics_note": (
+                "Cycle-result metrics are unavailable: the persisted evidence is an "
+                f"explicit {incomplete_evidence} after {terminal_reason}. Zero-valued "
+                "counts and empty-prefix aggregates do not mean observed zero exposure."
+            ),
+        }
+    )
+    for field in _UNAVAILABLE_RESULT_METRICS:
+        report[field] = None
+    return report
+
+
 def _window_summary(bundle: _RunBundle) -> dict[str, Any]:
-    primary = _scenario_report(bundle.replay_results, CycleScenario.PRIMARY)
-    stress = _scenario_report(bundle.replay_results, CycleScenario.STRESS)
+    primary = _annotate_result_metrics(
+        _scenario_report(bundle.report_results, CycleScenario.PRIMARY),
+        resource_incomplete=bundle.resource_incomplete,
+        terminal_reason=bundle.terminal_reason,
+        incomplete_evidence=bundle.incomplete_evidence,
+    )
+    stress = _annotate_result_metrics(
+        _scenario_report(bundle.report_results, CycleScenario.STRESS),
+        resource_incomplete=bundle.resource_incomplete,
+        terminal_reason=bundle.terminal_reason,
+        incomplete_evidence=bundle.incomplete_evidence,
+    )
     metadata = bundle.metadata
     return {
         "run_id": next(iter_records(bundle.path)).get("run_id"),
@@ -3168,6 +3361,14 @@ def _window_summary(bundle: _RunBundle) -> dict[str, Any]:
         "window_end_utc": metadata["window_end_utc"],
         "day": metadata["window_start_utc"][:10],
         "terminal": bundle.terminal,
+        "terminal_reason": bundle.terminal_reason,
+        "incomplete_evidence": bundle.incomplete_evidence,
+        "cycle_result_metrics_complete": not bundle.resource_incomplete,
+        "cycle_result_metrics_status": (
+            "UNAVAILABLE_RESOURCE_LIMIT" if bundle.resource_incomplete else "COMPLETE"
+        ),
+        "persisted_final_result_count": len(bundle.results),
+        "replayed_final_result_count": len(bundle.replay_results),
         "record_count": bundle.record_count,
         "byte_count": bundle.byte_count,
         "primary": primary,
@@ -3282,11 +3483,44 @@ def build_cycle_report(path: str | os.PathLike[str]) -> dict[str, Any]:
         len(manifest_hashes) == 1 and None not in manifest_hashes
     )
     campaign_complete = campaign_shape_valid and prospective_public and manifest_complete
+    resource_incomplete_run_count = sum(bundle.resource_incomplete for bundle in bundles)
+    if resource_incomplete_run_count == 0:
+        cycle_result_metrics_status = "COMPLETE"
+    elif resource_incomplete_run_count == len(bundles):
+        cycle_result_metrics_status = "UNAVAILABLE_RESOURCE_LIMIT"
+    else:
+        cycle_result_metrics_status = "PARTIAL_RESOURCE_LIMIT"
     summaries = tuple(_window_summary(bundle) for bundle in bundles)
-    all_primary = tuple(result for bundle in bundles for result in bundle.replay_results if result.scenario is CycleScenario.PRIMARY)
-    all_stress = tuple(result for bundle in bundles for result in bundle.replay_results if result.scenario is CycleScenario.STRESS)
+    all_primary = tuple(result for bundle in bundles for result in bundle.report_results if result.scenario is CycleScenario.PRIMARY)
+    all_stress = tuple(result for bundle in bundles for result in bundle.report_results if result.scenario is CycleScenario.STRESS)
     primary = _scenario_report(all_primary, CycleScenario.PRIMARY)
     stress = _scenario_report(all_stress, CycleScenario.STRESS)
+    if resource_incomplete_run_count == len(bundles):
+        primary = _annotate_result_metrics(
+            primary,
+            resource_incomplete=True,
+            terminal_reason="S3_ENVELOPE_LIMIT",
+            incomplete_evidence="RESOURCE_LIMITED_PREFIX",
+        )
+        stress = _annotate_result_metrics(
+            stress,
+            resource_incomplete=True,
+            terminal_reason="S3_ENVELOPE_LIMIT",
+            incomplete_evidence="RESOURCE_LIMITED_PREFIX",
+        )
+    elif resource_incomplete_run_count:
+        partial_note = (
+            "Cycle-result aggregates are partial: complete runs are reported, while "
+            "explicit resource-limited prefixes are excluded."
+        )
+        for scenario_report in (primary, stress):
+            scenario_report.update(
+                {
+                    "cycle_result_metrics_complete": False,
+                    "cycle_result_metrics_status": "PARTIAL_RESOURCE_LIMIT",
+                    "cycle_result_metrics_note": partial_note,
+                }
+            )
     qualifying_windows = tuple(
         summary
         for summary in summaries
@@ -3362,6 +3596,17 @@ def build_cycle_report(path: str | os.PathLike[str]) -> dict[str, Any]:
         },
         "measurement_validity": "VALID" if structurally_valid else "DATA_INSUFFICIENT",
         "evidence_sufficiency": sufficiency_label,
+        "data_quality": {
+            "cycle_result_metrics_complete": resource_incomplete_run_count == 0,
+            "cycle_result_metrics_status": cycle_result_metrics_status,
+            "resource_incomplete_run_count": resource_incomplete_run_count,
+            "note": (
+                None
+                if resource_incomplete_run_count == 0
+                else "Cycle-result aggregates exclude explicit resource-limited prefixes; "
+                "zero-valued aggregates must not be interpreted as observed zero exposure."
+            ),
+        },
         "aggregate_caps": {
             "record_count": aggregate_record_count,
             "max_records": envelope.max_records,
@@ -3374,6 +3619,8 @@ def build_cycle_report(path: str | os.PathLike[str]) -> dict[str, Any]:
         "economics": {
             "primary": primary,
             "stress": stress,
+            "cycle_result_metrics_complete": resource_incomplete_run_count == 0,
+            "cycle_result_metrics_status": cycle_result_metrics_status,
             "days_primary_total_pnl_usd": {day: str(value) for day, value in sorted(days.items())},
             "funding_status": "UNKNOWN_EXECUTION_ONLY",
             "pnl_is_hypothetical": True,
@@ -3409,6 +3656,7 @@ def render_cycle_report(path: str | os.PathLike[str], *, format: str = "json") -
     lines = [
         f"campaign={report['campaign_id']} windows={report['window_count']}",
         f"validity={report['measurement_validity']} sufficiency={report['evidence_sufficiency']} usefulness={report['usefulness']['label']}",
+        f"cycle_result_metrics={report['data_quality']['cycle_result_metrics_status']}",
         f"primary cycles={primary['complete_cycle_count']} normal={primary['normal_count']} forced={primary['forced_count']} unresolved={primary['unresolved_count']} total_pnl={primary['total_pnl_usd']}",
         f"stress cycles={stress['complete_cycle_count']} normal={stress['normal_count']} forced={stress['forced_count']} unresolved={stress['unresolved_count']} total_pnl={stress['total_pnl_usd']}",
         "funding=UNKNOWN_EXECUTION_ONLY positive_results=hypothetical_only trading_authority=NONE",

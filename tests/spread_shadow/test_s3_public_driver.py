@@ -37,6 +37,7 @@ from risex_spread_shadow.s3_cycle import (
     freeze_cycle_manifest,
     run_public_cycle_collection,
     _dependence_groups,
+    _fixture_book,
     _scenario_report,
     _fixture_market,
 )
@@ -344,6 +345,127 @@ async def test_public_collection_stops_feed_promptly_on_consumer_failure(tmp_pat
     evidence = tuple(tmp_path.glob("run-*/evidence.jsonl"))
     assert len(evidence) == 1
     assert list(iter_records(evidence[0]))[-1]["kind"] == "RUN_FAILED"
+
+
+@pytest.mark.asyncio
+async def test_public_collection_stops_fake_feed_on_resource_failure_and_marks_prefix_metrics(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    windows = fixture_campaign_windows(campaign_id="resource-feed-campaign")
+    envelope = CycleEnvelope(
+        max_records=20,
+        record_reserve=3,
+        max_bytes=1_000_000,
+        bytes_reserve=100_000,
+    )
+    manifest = CycleCampaignManifest(
+        campaign_id="resource-feed-campaign",
+        accepted_release=ACCEPTED_RELEASE,
+        policy_fingerprint=cycle_policy_fingerprint(ACCEPTED_RELEASE),
+        windows=windows,
+        envelope=envelope,
+        created_utc=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    runtime_start_ns = 10_000_000_000
+    source_ns = runtime_start_ns + 500_000_000
+    items = [
+        FeedBookEvent(
+            _fixture_book(Venue.RISEX, source_ns, 1),
+            PAIR,
+            "SNAPSHOT",
+            "VALID",
+        ),
+        FeedBookEvent(
+            _fixture_book(
+                Venue.LIGHTER,
+                source_ns,
+                1,
+                bids=(("99", "10"),),
+                asks=(("100", "10"),),
+            ),
+            PAIR,
+            "SNAPSHOT",
+            "VALID",
+        ),
+    ]
+    items.extend(
+        FeedBookEvent(
+            _fixture_book(Venue.RISEX, source_ns + index * 1_000_000, index + 2),
+            PAIR,
+            "DELTA",
+            "VALID",
+        )
+        for index in range(40)
+    )
+
+    async def selector(*_args, **_kwargs):
+        return (PAIR,)
+
+    class BurstFeed:
+        fatal_reason = None
+
+        def __init__(self, ingress):
+            self.ingress = ingress
+            self.offered = 0
+            self.stop_seen = False
+
+        async def run(self, **kwargs):
+            stop_event = kwargs["stop_event"]
+            try:
+                for item in items:
+                    if stop_event.is_set():
+                        break
+                    if self.ingress.offer(item):
+                        self.offered += 1
+                    await asyncio.sleep(0)
+            finally:
+                self.stop_seen = stop_event.is_set()
+
+    feeds: list[BurstFeed] = []
+
+    def feed_factory(*args, **_kwargs):
+        feed = BurstFeed(args[2])
+        feeds.append(feed)
+        return feed
+
+    monkeypatch.setattr(
+        "risex_spread_shadow.s3_cycle.validate_loaded_release",
+        lambda *_args, **_kwargs: tmp_path,
+    )
+    with pytest.raises(CycleEnvelopeLimitError, match="records"):
+        await run_public_cycle_collection(
+            tmp_path,
+            manifest=manifest,
+            window_id=windows[0].window_id,
+            now_utc=lambda: windows[0].start_utc,
+            monotonic_ns=lambda: runtime_start_ns,
+            market_selector=selector,
+            feed_factory=feed_factory,
+        )
+
+    assert len(feeds) == 1
+    assert feeds[0].stop_seen is True
+    assert 0 < feeds[0].offered < len(items)
+    evidence = tuple(tmp_path.glob("run-*/evidence.jsonl"))
+    assert len(evidence) == 1
+    records = list(iter_records(evidence[0]))
+    assert [record["record_index"] for record in records] == list(range(len(records)))
+    assert records[-1]["kind"] == "RUN_FAILED"
+    assert records[-1]["fatal_reason"] == "S3_ENVELOPE_LIMIT_RECORDS"
+    # The consumer stops the feed during the stream, but the already-persisted
+    # prefix still leaves the bounded stream-end record available; the
+    # subsequent final-result suffix is the resource-limited phase.
+    assert records[-1]["incomplete_evidence"] == "FINAL_RESULT_PREFIX"
+    assert all(record["kind"] not in {"RUN_STOP", "RUN_FAILED"} for record in records[:-1])
+
+    report = build_cycle_report(evidence[0])
+    summary = report["windows"][0]
+    assert report["measurement_validity"] == "DATA_INSUFFICIENT"
+    assert report["data_quality"]["cycle_result_metrics_status"] == "UNAVAILABLE_RESOURCE_LIMIT"
+    assert summary["cycle_result_metrics_complete"] is False
+    assert summary["primary"]["turnover_usd"] is None
+    assert "do not mean observed zero exposure" in summary["stress"]["cycle_result_metrics_note"]
 
 
 def test_manifest_is_create_once(tmp_path: Path) -> None:
