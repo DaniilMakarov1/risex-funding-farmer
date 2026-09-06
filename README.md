@@ -1,14 +1,16 @@
 # RISEx Spread Shadow and legacy Funding Farmer
 
-This repository contains two deliberately separated research contours.
+## Current and planned behavior — Scanner v1
 
-- **RISEx Spread Shadow** is active. It evaluates one hypothetical RISEx–Lighter complete cycle, including delayed entry hedging, exit, partial fills, forced closure, fees and unresolved residues. Positive entry spread alone is not cycle profit. It is public-only shadow research with points valued at `$0`.
-- **RISEx Funding Farmer** is a frozen legacy benchmark. Its code and historical evidence remain available, but its funding-boundary profitability path and operational runs are not active.
+FINAL-ASTRA-01 (2026-09-06) authorizes Scanner v1; it is **not yet implemented or accepted**. Accepted production remains S3-T1-R4, with exact SHA/evidence and known limitations in STATUS. The active task is SCV1-S1a; the first useful new-policy offline D1 report follows S1b, before new collection. SYSTEM_SPEC's SCV1-1 is the new versioned policy, not a claim that the commands below already implement it.
 
-The public contour and normal startup authorize no private endpoints, credentials,
-signing, order preparation, order dispatch, testnet/mainnet writes, real funds,
-transfers, withdrawals, or strategy execution. The historical opt-in Level-B fee reader described below remains quarantined.
-Current acceptance state and the exact active boundary live in `STATUS.md` and `NEXT_TASK.md`.
+The planned public-only BTC CLI models RISEx maker SELL -> Lighter Standard taker BUY, full entry/hedge/exit episodes and exact residues. It uses four alternatives: TRADE_THROUGH_ONLY and TOUCH_ALLOWED, each with primary 500 ms delays or stress 1000 ms delays plus 1 bp on RISEx fills. Touch is an explicit conditional fill assumption, not actual execution evidence. New policy preserves partials, uses venue-local operation minimums/grids, accumulates within fixed Q_cap, respects 5-second quote cancellation and a 120-second first-fill completion deadline, and reports closed execution-only PnL separately from cashflows, marked open inventory and unknown funding. See SCV1-1 for the binding details.
+
+MODEL_POSITIVE/MODEL_NEGATIVE are conditional, MODEL_SENSITIVE identifies assumption sensitivity, POLICY_BLOCKED identifies policy feasibility, DATA_INSUFFICIENT identifies missing/corrupt inputs and NO_EXECUTION_OBSERVED means no fills. Alternatives are not additive or independent; positive open marks are not closed profit. Funding UNKNOWN forbids all-in profitability claims. Technical release need not produce profit, but must have functioning core/replay and proven capacity. Points = $0; legacy Funding Farmer stays frozen.
+
+Chief GPT-6 Astra Medium / Standard reviews by events and alone integrates main; one visible GPT-5.6 Luna Max / Standard Builder implements independently within the task. No management polling, infinite Goal or cancelled campaign restart. Actual selected model/effort/speed verification is recorded in current operational evidence; prose alone does not configure a session.
+
+Until staged independent acceptance, use offline development/checks only. Later authority is limited to one prospectively gated 60-second technical public smoke and one new four-window campaign under SCV1-1.5/NEXT_TASK. Private/account/fee-reader endpoints, credentials, signing/order preparation/dispatch, testnet/mainnet orders, real funds, transfers/withdrawals and strategy execution remain prohibited. Transport WebSocket heartbeat stays enabled; there is no LLM in market collection. No new command is promised before accepted implementation; exact user commands will be updated at release.
 
 ## Requirements
 
@@ -37,14 +39,16 @@ The legacy benchmark retains the `risex-farmer` entrypoint documented below. It 
 The active contour uses the separate `risex-spread-shadow` entrypoint. It remains
 public-only and does not import the opt-in authenticated fee boundary below.
 
-### Complete-cycle research
+### Historical accepted complete-cycle commands (pre-Scanner v1)
 
-The accepted cycle path uses public BTC data only: hypothetical RISEx maker
+These existing commands implement the historical §0.21 policy, not SCV1-1. Offline historical replay is permitted; the collection examples below are reference syntax only and do not authorize a run or reuse of CYCLE-001.
+
+The accepted historical cycle path uses public BTC data only: hypothetical RISEx maker
 SELL entry, delayed Lighter Standard BUY hedge, and explicit paired exits.
 Target notional is $100 and entry threshold is 1 bp. RISEx modeled fees are
 1 bp maker / 3 bps taker; Lighter Standard is 0. Primary delays are 500 ms;
 stress uses 1000 ms and an additional 1 bp cost on each RISEx fill. Maximum
-holding time is 120 seconds. `SYSTEM_SPEC.md` defines the exact fixed policy.
+holding time is 120 seconds. `SYSTEM_SPEC.md` historical §0.21 defines that old policy; SCV1-1 supersedes it for future new-policy runs.
 
 Offline commands make no network request:
 
@@ -66,8 +70,8 @@ exit cashflow after its costs. Holding/occupancy runs from first maker fill
 to the terminal observation boundary. An unresolved exposure's observed
 duration does not establish its eventual closing time.
 
-A public campaign requires Chief-recorded prospective parameters in
-`NEXT_TASK.md` before any market request. Freeze exactly four 45-minute UTC
+The historical campaign interface required Chief-recorded prospective parameters in
+`NEXT_TASK.md` before any market request. Reference syntax for four 45-minute UTC
 windows over two days, two per day, using one clean accepted release:
 
 ```bash
@@ -92,7 +96,7 @@ are 1,000,000 records and 4 GiB, including reserves of 100,000 records and
 512 MiB. Missing closing evidence, resource failure or unresolved exposure
 cannot be upgraded to a complete profitable result.
 
-The descriptive screen requires 20 completed cycles and 20 filled dependence
+The historical descriptive screen required 20 completed cycles and 20 filled dependence
 groups, with five cycles in at least three windows spanning both days. Primary
 PnL must be positive on both days, aggregate stress positive, and primary
 positive after removing its best dependence group. Groups are not proven
@@ -100,7 +104,7 @@ independent; even a passing screen is hypothetical evidence, not trading
 authority. Fixtures remain `FIXTURE_ONLY`. No result-based stop, tuning,
 replacement window, extension or retry-to-pass is allowed.
 
-### Fixed Spread scanner
+### Historical fixed CAL/HOLDOUT scanner (closed)
 
 `scan` is the fixed CAL-001/HOLDOUT-001 route; `scan-report` evaluates saved
 evidence offline. Its profile is BTC, RISEx sell / Lighter buy, $100, nominal
@@ -161,7 +165,7 @@ transfer, withdrawal, deposit, or strategy path is available from this
 entrypoint. The signing dependency is intentionally opt-in; without
 `.[risex-fee-read]`, the runner fails closed.
 
-## Legacy commands
+## Frozen legacy commands (reference only; no operational authorization)
 
 The shared public HTTP runtime session uses a 30-second total request timeout so
 large, slow official responses can complete without changing scan cadence or
@@ -246,6 +250,6 @@ risex-farmer --db paper.db report
 
 See `SYSTEM_SPEC.md` for the active Spread Shadow contract and preserved legacy specification, `STATUS.md` for the accepted baseline, and `NEXT_TASK.md` for the current authorization boundary.
 
-The RISEx, Extended, and Nado lifecycle modules are not CLI modes and must not be imported by normal Farmer startup. Their verification levels and safety gates are defined once in `AGENTS.md`; current venue state and work live only in `STATUS.md` and `NEXT_TASK.md`.
+The RISEx, Extended, and Nado lifecycle modules are not CLI modes and must not be imported by normal Farmer startup. Their frozen verification levels and safety gates are preserved in the historical Git version referenced by `AGENTS.md`; they grant no current execution authority. Current accepted state and work live only in `STATUS.md` and `NEXT_TASK.md`.
 
-Strategy-driven testnet execution is a later, separate measurement task. It starts only after all three venue lifecycles are independently accepted and records opportunity frequency, planned-versus-actual execution, fees, resolved funding, and complete net PnL; degraded or unresolved trades do not support profitability claims.
+The historical testnet lifecycle/strategy roadmap is frozen and grants no current authority. Scanner v1 does not require its resumption. A new private or execution program requires a separate owner decision.

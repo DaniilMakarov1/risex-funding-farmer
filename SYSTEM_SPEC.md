@@ -1,9 +1,75 @@
 # RISEx Spread Shadow — System Specification
 
-SYSTEM_SPEC_VERSION = 3.6
-SPEC_STATUS = ACTIVE_SPREAD_SHADOW__FROZEN_LEGACY_FUNDING_FARMER
+SYSTEM_SPEC_VERSION = 4.0
+SPEC_STATUS = SCANNER_V1_AUTHORIZED_NOT_YET_IMPLEMENTED
 
-## 0. Active product domain: RISEx Spread Shadow
+## Scanner v1 — active policy SCV1-1 (FINAL-ASTRA-01, 2026-09-06)
+
+This owner-authorized contract governs NEW versioned policy implementations/runs. It is not a claim of implementation acceptance. Sections 0–0.21 below preserve historical experiments and their rules verbatim except their historical heading; their imperative language is historical, not current task authorization. In particular the former first-entry/exit-partial cancellation, touch uncertainty halt, common-grid one-sided close, two-scenario policy and profitable-fill/descriptive qualification gates do not govern new SCV1-1 runs. Historical outputs/claims remain immutable and are never relabelled with new policy results. Unchanged causal/data integrity constraints remain mandatory under the explicit contract here. Sections 1–21 remain frozen Funding Farmer. Old CAL/HOLDOUT/CYCLE-001 never restart.
+
+### SCV1-1.1 Market, sizing and fixed assumptions
+
+BTC only, RISEx maker SELL -> Lighter Standard taker BUY; initial target $100, entry edge 1 bp. Determine initial Q_cap from current required-side Lighter price using accepted sizing, never future data. Recorded SS-001Q fee provenance remains RISEx maker 1 bp/taker 3 bps, Lighter Standard taker 0; this is not fresh private-account verification. Reuse existing public adapters for run metadata; an official rule conflict must be documented rather than silently changing inputs.
+
+Primary activation/cancel/taker delays are 500/500/500 ms. Stress is 1000/1000/1000 ms plus 1 bp cost on every RISEx fill. These are model assumptions. Economic freshness and receipt skew remain 500 ms. At most one active entry quote version per lane; decisions no more than once per second. New episodes require full flatness.
+
+### SCV1-1.2 Quantity, episode and exit invariants
+
+1. Each operation obeys its executing venue's step/min quantity/min notional. Common grid is only for required paired initial sizing, never one-sided close.
+2. Preserve partial fills exactly even below a new order's minimum. No reduce-only minimum exemption without proven applicable venue evidence, and no rounding orders upward in hope of venue clipping.
+3. An episode has immutable Q_cap. Filled entry, remaining active quantity and in-flight quantities cannot exceed it. Closing does not replenish entry allowance within the episode. Pending hedges reserve quantity and forbid double hedging.
+4. Remove cancel-on-first-entry-partial. Eligible quotes accumulate fills but normal cancellation remains 5 seconds after activation. Count every fill before effective cancellation; cancellation is not retroactive.
+5. Hedge the accumulated executable portion without waiting for better spread or full $100 fill. Use Lighter's own grid/minimum/depth and delay. Requested/scheduled quantity is not executed quantity.
+6. After effective cancel, if no executable paired position for exit exists and cap remains, a new economically eligible entry quote may activate in the SAME episode. Require fresh valid inputs, new activation delay, RISEx minimum and the unchanged edge. Do not increase insufficient cap residue to meet minimum.
+7. Once an executable paired position is formed, stop accumulation and enter exit through an entry cancellation barrier, including new fills and pending hedges. EXITING cannot overlap effective entry or return to accumulation to rescue dust. Chief fixes these transitions in the S1b task before implementation; Builder chooses implementation structure.
+8. Preserve the existing hedge-anchored exit price: min(floor_tick(LighterSellNotional(Q)*(1-fL)/(Q*(1+fR))), RISExBestAsk-tick), with actual inventory/partials and activation eligibility. Remove mandatory exit cancellation at first partial; a valid remainder may work until its deadline/other cancellation cause. Lighter closes are bounded by real remaining position, pending closes and executable accumulated chunks. Residues remain visible.
+9. 120 seconds from the FIRST modeled maker fill is the immutable deadline to START completion. Requotes, partials and later hedges do not reset it. Stop maker entry/exit, respect cancellation delays, perform executable forced closes; flatness exactly at 120 seconds is not guaranteed.
+10. No extra taker exposure to reach minimum, no endless dust transfer across episodes, no dust write-off.
+11. An unresolvable residue with sufficient data yields POLICY_BLOCKED_MINIMUM/RESIDUAL; block new episodes only in that lane, retain/value inventory to window end, and continue observer/other scenarios. Data failures are separate.
+12. FLAT means both signed positions exactly zero AND no pending actions/active orders. Quote versions within one episode are not independent trades.
+
+This is conditional policy with quantity/time bounded directional risk, not a liquidity or absolute-dollar-loss guarantee. It does not claim that D1 dust could close on a real account.
+
+### SCV1-1.3 Exactly four alternative execution scenarios
+
+| Fill model | Primary | Stress |
+|---|---|---|
+| TRADE_THROUGH_ONLY | 500 ms delays | 1000 ms delays + 1 bp/RISEx fill |
+| TOUCH_ALLOWED | 500 ms delays | 1000 ms delays + 1 bp/RISEx fill |
+
+TRADE_THROUGH_ONLY requires at least one tick of eligible trade-through; equal-price touch yields TOUCH_IGNORED_BY_MODEL, not lane halt. TOUCH_ALLOWED permits equal-price touch as an explicit zero-queue model. Each fill is limited by unique available trade volume and remaining order quantity; duplicate events cannot create volume.
+
+Preserve activation/cancellation races, side/identity checks, admissible sequence/session/recovery, price grids and no future-data use. Check post-only eligibility at modeled activation against admissible then-current data. Crossing post-only receives no maker fill; missing eligibility data is not proven rejection/no-fill. Touch is not a corrupt book, gap, conflicting duplicate, missing identity, future observation or actual temporal conflict; those guards remain strict.
+
+Each scenario has separate inventory/actions/ledger. One public event may be used by each alternative, never twice inside a lane. Do not sum their PnL/turnover or describe them as independent observations or mathematical profitability bounds.
+
+### SCV1-1.4 Accounting and report semantics
+
+Exact level notional is primary; VWAP is derived. Carry notional through actual production fills/fees/ledger. Validate Decimal precision against genuinely allowed inputs using a distinguishing production-path regression with independent expectations, not an arbitrary-precision platform or a constant CONFIRMED label.
+
+Report separately: closed execution-only PnL; signed trade cashflows, fees/stress costs; signed open quantities/pending actions; marked inventory, documented public price source/timestamp and scenario-wide marked PnL; an executable liquidating-close estimate only when minimum/depth allow it; funding known/UNKNOWN; RISEx-only and two-venue turnover; collector, simulation-active and blocked durations.
+
+For zero initial inventory: marked execution-only PnL = sum(signed trade cashflows) - fees - stress costs + sum(signed inventory * documented current public valuation price). Do not add closed PnL again. Invalid/missing mark yields UNKNOWN. Do not pretend to close below minimum. This analytical ledger is not a statement of perp-account collateral movements.
+
+Validity, execution feasibility, sufficiency and economics are separate. MODEL_POSITIVE/MODEL_NEGATIVE are conditional window outcomes; MODEL_SENSITIVE denotes sensitivity to execution assumptions; POLICY_BLOCKED denotes an execution-policy limitation; DATA_INSUFFICIENT denotes insufficient/corrupt inputs; NO_EXECUTION_OBSERVED denotes no executions. Positive marked open inventory does not make a lane closed/profitable. Funding UNKNOWN forbids all-in profitability but permits an execution-only report. Points = $0.
+
+### SCV1-1.5 Replay, release, finite measurement and completion
+
+Reuse the existing causal layer, cycle kernel, public adapters and FULL/DELTA helper. New numerical Decimal serialization has canonical semantic identity across write/read/replay; insignificant trailing zeroes do not change its digest. Do not rewrite historical textual state. Old-format compatibility does not force old decisions on new policy. Separate coherent fixture virtual clocks from production failure propagation; scheduled/observed/processing boundaries remain distinct, first failure preserved, terminal reserve planned before writes, time-travel barriers unchanged.
+
+After S1b, demonstrate four alternatives on saved D1 market inputs with source/policy version and understandable block reasons BEFORE new market collection. This is development evidence, not holdout or production-speed proof. Recompute policy decisions using an explicit replay clock/decision contract; do not impose old decisions/admissions/fills. Identify concrete missing inputs/timestamps/censoring rather than invent future books or replace D1 entirely with fixtures.
+
+Before release prove all-D1 streaming BOOK reconstruction including session/link/gap; two equal new canonical replays and all relevant numerical/identity differences; corruption/truncation/failure paths; bounded paced observed-input load plus four active scenarios and repeated entries/exits within the unchanged envelope. Early historical lane halts and 256-book compression estimates do not prove capacity. Campaign aggregate caps are 1,000,000 records/4 GiB including 100,000 records/512 MiB terminal reserves. No cap increase for PASS.
+
+One existing public CLI must support collection/report and offline report (actual names documented only after implementation acceptance). The final readable table contains four alternatives, opportunities/attempts/filled/closed/forced/blocked, PnL/fees/costs/marks/funding, residues/pending, active versus collector duration, RISEx turnover and dependence-group concentration/result without the best group. Retain all bad/blocked episodes; groups are not proven independent. Fix NO_ENTRY despite fills, INSUFFICIENT_DEPTH for minimum-only rejection, and omitted halted intervals; use bounded counters/intervals for repeated skips. Hypothetical per-alternative request load must respect applicable published Lighter Standard units/endpoint weights; shared public collection is not four independent trading request streams.
+
+Only after offline S3 acceptance: one prospectively recorded 60-second technical public smoke at accepted source, with bounded stop/output, proving transport/data -> kernel -> store -> report without required fills/PnL. Never rerun an unchanged failure to PASS. A real technical defect permits a concrete in-scope Builder fix, independent acceptance and a new explicit technical gate; retain failure and never tune policy from smoke.
+
+After accepted release/smoke, freeze ONE release/policy and ONE new campaign: four future 45-minute windows, two on each of two calendar days, UTC timestamps plus one day-grouping timezone. Chief may choose times without repeat owner approval if finite non-LLM scheduling is feasible. Entry-quote requests stop at 42:45 even within already-started episodes; market deadline is 45:00, closing tail 135 seconds. No expired CYCLE-001 window/claim reuse, result-based stops, tuning, replacement, extension or retry-to-PASS. Blocked lanes retain inventory; observer continues to the limit; data/cap failures remain visible. Computer availability and actual scheduling must be explicit; otherwise hand exact commands/schedule to owner without claiming execution.
+
+Final report includes every window/alternative and the full denominator, marked/closed/executable distinctions, funding status, best-group concentration, limitations and sufficiency. No profit or completed-fill threshold is required for technical acceptance; POLICY_BLOCKED/NO_EXECUTION_OBSERVED/DATA_INSUFFICIENT can be legitimate measurement outcomes. Broken core, required replay failure, unproven capacity or own storage malfunction is not a released Scanner v1. Three hours need not establish a statistically strong conclusion. STOP after working Scanner v1 and this conditional conclusion, or a concrete evidence-backed blocker; no automatic next campaign or further policy/real-execution hypothesis.
+
+## 0. Historical Spread experiments (through 2026-09-06, before FINAL-ASTRA-01)
 
 RISEx Spread Shadow is the active public-only research contour. Its question is whether a reproducible positive entry-execution edge exists when a hypothetical RISEx maker fill is followed by a delayed executable exact-quantity Lighter Standard taker hedge. Points are worth zero. Funding is diagnostic and separate. A future maker fill, future maker exit, or basis convergence is never recognized as earned entry income.
 
