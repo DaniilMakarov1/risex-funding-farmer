@@ -6,6 +6,10 @@ FINAL-ASTRA-01 authorizes a working public-only BTC RISEx/Lighter Scanner v1, a 
 
 Chief `01a0780e-c190-7b80-999b-483b929f5ec6` owns acceptance/main. Executor: exactly one NEW visible GPT-5.6 Luna max / Standard Builder. Base is the exact published main commit containing SCV1-P0, resolved and remote-verified before dispatch; the full 40-character SHA, created task and worktree are bound in `spread-shadow-runs/scanner-v1-20260906/p0-dispatch.json` and the initial Builder message. The pre-P0 `d2f199f6cc589ac63b5932db0272b8435c814fc2` is provenance, not the Builder base. Never use a moving main silently. Named branch `codex/spread-v1-s1a` in its own worktree from that exact published commit. P0 publication failure blocks dispatch on stale rules.
 
+## Current candidate / next action
+
+Assigned visible Builder: `01a07817-bf0b-74f2-866e-42ae877eb672`, exact base `7c9ae11bc689d2d2a9c9aab94abf8c3fcc1b7e99`, branch `codex/spread-v1-s1a`, worktree `/Users/daniilmakarov/.codex/worktrees/f96f/RISEx Spread Shadow`. Candidate `cfbf29d36a64111cb4ceb9effe9e0bc275ed61b4` remains NOT_ACCEPTED. Review round 1 is CHANGES_REQUESTED, not formal REJECT: fix side-correct activation post-only, preserve off-grid trade invalidity independently of touch choice, and isolate new semantics from legacy-default replay. Exact counterexamples/required cases are in `spread-shadow-runs/scanner-v1-20260906/s1a-chief-cfbf29d/review.txt` and paired source-bound probe JSON. This is a bounded correction under the unchanged S1a contract, not S1b activation. Same healthy session/branch may correct; context risk requires saved handoff instead. Await one correction/blocker/context event without supervisory polling.
+
 ## Builder task contract (Level A, offline)
 
 **Result:** In the existing public-only kernel, prove venue-local quantity rules, exact partial/notional preservation and two explicit fill models across the two fixed delay/cost regimes. This is a bounded prerequisite, not all Scanner v1.
