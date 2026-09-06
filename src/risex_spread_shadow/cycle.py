@@ -105,6 +105,18 @@ class CycleScenario(StrEnum):
     STRESS = "STRESS"
 
 
+class CycleFillModel(StrEnum):
+    """SCV1's two explicit maker-fill interpretations.
+
+    The legacy S2 kernel keeps its historical ``None`` behavior for callers
+    that do not opt into this versioned contract.  SCV1 callers must select
+    one of these models explicitly so a touch assumption is never implicit.
+    """
+
+    TRADE_THROUGH_ONLY = "TRADE_THROUGH_ONLY"
+    TOUCH_ALLOWED = "TOUCH_ALLOWED"
+
+
 class CycleTerminalState(StrEnum):
     """Terminal, or current snapshot, classification of one cycle."""
 
@@ -186,6 +198,7 @@ class CycleReason(StrEnum):
     ACTIVE_CYCLE = "ACTIVE_CYCLE"
     UNRESOLVED_HALTED = "UNRESOLVED_HALTED"
     TERMINAL_RETENTION_EXHAUSTED = "TERMINAL_RETENTION_EXHAUSTED"
+    POST_ONLY_ELIGIBILITY_UNKNOWN = "POST_ONLY_ELIGIBILITY_UNKNOWN"
 
 
 @dataclass(frozen=True, slots=True)
@@ -459,8 +472,15 @@ class CycleFill:
             _decimal(value, name)
         if self.quantity <= 0 or self.price <= 0:
             raise ValueError("cycle fill quantity and price must be positive")
-        if self.notional_usd != self.quantity * self.price:
-            raise ValueError("cycle fill notional does not match exact quantity and price")
+        # Legacy fills remain valid under their historical multiplication
+        # identity.  SCV1 taker walks may instead carry an exact level sum;
+        # their derived VWAP is the quotient and may not round-trip through
+        # ``quantity * price`` for a repeating price.
+        if (
+            self.notional_usd != self.quantity * self.price
+            and self.notional_usd / self.quantity != self.price
+        ):
+            raise ValueError("cycle fill price is not derived from exact notional and quantity")
         if self.fee_rate < 0 or self.fee_usd != self.notional_usd * self.fee_rate:
             raise ValueError("cycle fill fee does not match exact notional and rate")
         expected_gross = self.notional_usd if self.side is Side.SELL else -self.notional_usd
@@ -819,6 +839,7 @@ class _MutableCycle:
     current_ns: int
     entry_activation_ns: int
     entry_cancel_schedule_ns: int
+    fill_model: CycleFillModel | None = None
     entry_cancel_requested_ns: int | None = None
     entry_cancel_effective_ns: int | None = None
     entry_hedge_due_ns: int | None = None
@@ -1026,6 +1047,11 @@ def _trade_crosses(quote: CausalRestingQuote, trade: TradeEvidence) -> tuple[boo
     return improvement >= quote.tick_size, improvement < quote.tick_size
 
 
+def _trade_price_is_tick_aligned(quote: CausalRestingQuote, trade: TradeEvidence) -> bool:
+    tick = quote.tick_size
+    return tick is None or trade.canonical_price % tick == 0
+
+
 def _floor_quantity(value: Decimal, step: Decimal) -> Decimal:
     if value <= 0 or step <= 0:
         return _ZERO
@@ -1048,7 +1074,40 @@ def _common_step(cycle: _MutableCycle) -> Decimal | None:
 
 def _minimum_ok(cycle: _MutableCycle, venue: Venue, quantity: Decimal, price: Decimal) -> bool:
     market = _market(cycle, venue)
-    return market is not None and quantity / market.base_multiplier >= market.minimum_quantity_raw and abs(quantity * price) >= market.minimum_notional_usd
+    return _minimum_ok_with_notional(cycle, venue, quantity, price)
+
+
+def _minimum_ok_with_notional(
+    cycle: _MutableCycle,
+    venue: Venue,
+    quantity: Decimal,
+    price: Decimal,
+    *,
+    notional_usd: Decimal | None = None,
+) -> bool:
+    market = _market(cycle, venue)
+    if market is None:
+        return False
+    notional = quantity * price if notional_usd is None else notional_usd
+    return (
+        quantity / market.base_multiplier >= market.minimum_quantity_raw
+        and abs(notional) >= market.minimum_notional_usd
+    )
+
+
+def _venue_quantity_step(cycle: _MutableCycle, venue: Venue) -> Decimal | None:
+    """Return the executing venue's canonical operation step.
+
+    The common grid remains the sizing grid for the paired initial quote.  A
+    one-sided taker close is a different operation and must be floored to its
+    own venue contract instead of inheriting the paired grid.
+    """
+
+    market = _market(cycle, venue)
+    if market is None:
+        return None
+    step = market.quantity_step_raw * market.base_multiplier
+    return step if step > 0 else None
 
 
 def _book_signature(book: BookEvidence) -> tuple[Any, ...]:
@@ -1264,6 +1323,7 @@ def _append_fill(
     session: str | int,
     recovery: int,
     book_revision_id: str | None,
+    notional_usd: Decimal | None = None,
 ) -> CycleFill:
     if quantity <= 0:
         raise ValueError("cycle fills require positive quantity")
@@ -1278,7 +1338,14 @@ def _append_fill(
         source = cycle.policy.lighter_fee_source
     else:
         raise ValueError("unsupported S2 fee role")
-    notional = quantity * price
+    notional = quantity * price if notional_usd is None else _decimal(notional_usd, "notional_usd")
+    if notional <= 0:
+        raise ValueError("cycle fill notional must be positive")
+    if notional_usd is not None:
+        # SCV1 exposes the derived VWAP corresponding to the exact level sum.
+        # It must never be used to reconstruct the notional for fees or
+        # cashflow.  The legacy path retains its historical supplied price.
+        price = notional / quantity
     fee = notional * rate
     gross = notional if side is Side.SELL else -notional
     scenario_cost = notional * cycle.delays.risex_fill_cost_rate if venue is Venue.RISEX else _ZERO
@@ -1746,6 +1813,7 @@ class CycleKernel:
         policy: CyclePolicy | None = None,
         *,
         terminal_retention_capacity: int = _DEFAULT_TERMINAL_RETENTION_CAPACITY,
+        fill_model: CycleFillModel | str | None = None,
     ) -> None:
         self.policy = s2_cycle_policy() if policy is None else policy
         if not isinstance(self.policy, CyclePolicy):
@@ -1757,6 +1825,9 @@ class CycleKernel:
         ):
             raise ValueError("terminal_retention_capacity must be a positive integer")
         self.terminal_retention_capacity = terminal_retention_capacity
+        if fill_model is not None and not isinstance(fill_model, CycleFillModel):
+            fill_model = CycleFillModel(fill_model)
+        self.fill_model = fill_model
         self._lanes = {scenario: _KernelLane(scenario) for scenario in CycleScenario}
 
     @staticmethod
@@ -1890,6 +1961,7 @@ class CycleKernel:
                 current_ns=decision,
                 entry_activation_ns=activation,
                 entry_cancel_schedule_ns=activation + self.policy.entry_cancel_after_activation_ns,
+                fill_model=self.fill_model,
                 entry_target_quantity=quote_version.quote.canonical_quantity,  # type: ignore[arg-type]
                 entry_remaining_quantity=quote_version.quote.canonical_quantity,  # type: ignore[arg-type]
             )
@@ -2735,6 +2807,15 @@ class CycleKernel:
         halted below instead of being rewritten or replayed.
         """
 
+        # A versioned activation-time post-only rejection is a deliberate
+        # terminal no-fill.  Later crossing trades cannot retroactively turn
+        # that rejected quote into a causal uncertainty.
+        if (
+            cycle.fill_model is not None
+            and cycle.phase is _Phase.ABORTED
+            and CycleReason.INVALID_ENTRY_QUOTE.value in cycle.reasons
+        ):
+            return False
         trade = event.trade
         if trade is None or event.venue is not Venue.RISEX:
             return False
@@ -2758,6 +2839,8 @@ class CycleKernel:
     def _exit_candidate_after_commit(cycle: _MutableCycle, event: CausalEvent) -> bool:
         """Identify a possible exit fill after a close/force transition."""
 
+        if cycle.fill_model is not None and CycleReason.EXIT_QUOTE_INVALID.value in cycle.reasons:
+            return False
         trade = event.trade
         quote = cycle.exit_quote
         if trade is None or quote is None or event.venue is not Venue.RISEX:
@@ -2876,13 +2959,46 @@ class CycleKernel:
                 cycle.ignored_event_count += 1
                 cycle.entry_decisions.append(CausalEventDecision(event.kind, event.event_id, event.ingress_received_monotonic_ns, "IGNORED", "WRONG_AGGRESSOR_SIDE"))
                 return
+            if cycle.fill_model is not None and not _trade_price_is_tick_aligned(cycle.entry_quote, trade):
+                cycle.add_reason(CycleReason.ENTRY_CAUSAL_UNCERTAINTY)
+                cycle.entry_uncertainty.append(CausalUncertainty.INVALID_TRADE_PRICE_GRID.value)
+                cycle.entry_decisions.append(
+                    CausalEventDecision(
+                        event.kind,
+                        event.event_id,
+                        event.ingress_received_monotonic_ns,
+                        "UNCERTAIN",
+                        CausalUncertainty.INVALID_TRADE_PRICE_GRID.value,
+                    )
+                )
+                self._halt(cycle, CycleReason.ENTRY_CAUSAL_UNCERTAINTY)
+                return
             crosses, ambiguous = _trade_crosses(cycle.entry_quote, trade)
             if ambiguous:
-                cycle.add_reason(CycleReason.ENTRY_CAUSAL_UNCERTAINTY)
-                cycle.entry_uncertainty.append(CausalUncertainty.QUOTE_TOUCH_ORDER_UNPROVEN.value)
-                self._halt(cycle, CycleReason.ENTRY_CAUSAL_UNCERTAINTY)
-                cycle.entry_decisions.append(CausalEventDecision(event.kind, event.event_id, event.ingress_received_monotonic_ns, "UNCERTAIN", "QUOTE_TOUCH_ORDER_UNPROVEN"))
-                return
+                if cycle.fill_model is CycleFillModel.TOUCH_ALLOWED:
+                    crosses = True
+                    ambiguous = False
+                    touch_reason = "ELIGIBLE_TOUCH_ZERO_QUEUE"
+                elif cycle.fill_model is CycleFillModel.TRADE_THROUGH_ONLY:
+                    cycle.ignored_event_count += 1
+                    cycle.entry_decisions.append(
+                        CausalEventDecision(
+                            event.kind,
+                            event.event_id,
+                            event.ingress_received_monotonic_ns,
+                            "IGNORED",
+                            "TOUCH_IGNORED_BY_MODEL",
+                        )
+                    )
+                    return
+                else:
+                    cycle.add_reason(CycleReason.ENTRY_CAUSAL_UNCERTAINTY)
+                    cycle.entry_uncertainty.append(CausalUncertainty.QUOTE_TOUCH_ORDER_UNPROVEN.value)
+                    self._halt(cycle, CycleReason.ENTRY_CAUSAL_UNCERTAINTY)
+                    cycle.entry_decisions.append(CausalEventDecision(event.kind, event.event_id, event.ingress_received_monotonic_ns, "UNCERTAIN", "QUOTE_TOUCH_ORDER_UNPROVEN"))
+                    return
+            else:
+                touch_reason = "ELIGIBLE_TRADE"
             if not crosses or cycle.entry_remaining_quantity <= 0:
                 cycle.ignored_event_count += 1
                 cycle.entry_decisions.append(CausalEventDecision(event.kind, event.event_id, event.ingress_received_monotonic_ns, "IGNORED", "NOT_TRADE_THROUGH_QUOTE_PRICE" if not crosses else "QUOTE_QUANTITY_EXHAUSTED"))
@@ -2908,7 +3024,7 @@ class CycleKernel:
                 processed_ready_monotonic_ns=ready,
             )
             cycle.entry_fills.append(causal_fill)
-            cycle.entry_decisions.append(CausalEventDecision(event.kind, event.event_id, event.ingress_received_monotonic_ns, "FILL", "ELIGIBLE_TRADE", consumed))
+            cycle.entry_decisions.append(CausalEventDecision(event.kind, event.event_id, event.ingress_received_monotonic_ns, "FILL", touch_reason, consumed))
             entry_action = _add_action(
                 cycle,
                 action_id="entry-maker",
@@ -3021,13 +3137,46 @@ class CycleKernel:
             cycle.ignored_event_count += 1
             cycle.exit_decisions.append(CausalEventDecision(event.kind, event.event_id, event.ingress_received_monotonic_ns, "IGNORED", "WRONG_AGGRESSOR_SIDE"))
             return
-        crosses, ambiguous = _trade_crosses(quote, trade)
-        if ambiguous:
+        if cycle.fill_model is not None and not _trade_price_is_tick_aligned(quote, trade):
             cycle.add_reason(CycleReason.EXIT_CAUSAL_UNCERTAINTY)
-            cycle.exit_uncertainty.append(CausalUncertainty.QUOTE_TOUCH_ORDER_UNPROVEN.value)
-            cycle.exit_decisions.append(CausalEventDecision(event.kind, event.event_id, event.ingress_received_monotonic_ns, "UNCERTAIN", "QUOTE_TOUCH_ORDER_UNPROVEN"))
+            cycle.exit_uncertainty.append(CausalUncertainty.INVALID_TRADE_PRICE_GRID.value)
+            cycle.exit_decisions.append(
+                CausalEventDecision(
+                    event.kind,
+                    event.event_id,
+                    event.ingress_received_monotonic_ns,
+                    "UNCERTAIN",
+                    CausalUncertainty.INVALID_TRADE_PRICE_GRID.value,
+                )
+            )
             self._halt(cycle, CycleReason.EXIT_CAUSAL_UNCERTAINTY)
             return
+        crosses, ambiguous = _trade_crosses(quote, trade)
+        if ambiguous:
+            if cycle.fill_model is CycleFillModel.TOUCH_ALLOWED:
+                crosses = True
+                ambiguous = False
+                touch_reason = "ELIGIBLE_TOUCH_ZERO_QUEUE"
+            elif cycle.fill_model is CycleFillModel.TRADE_THROUGH_ONLY:
+                cycle.ignored_event_count += 1
+                cycle.exit_decisions.append(
+                    CausalEventDecision(
+                        event.kind,
+                        event.event_id,
+                        event.ingress_received_monotonic_ns,
+                        "IGNORED",
+                        "TOUCH_IGNORED_BY_MODEL",
+                    )
+                )
+                return
+            else:
+                cycle.add_reason(CycleReason.EXIT_CAUSAL_UNCERTAINTY)
+                cycle.exit_uncertainty.append(CausalUncertainty.QUOTE_TOUCH_ORDER_UNPROVEN.value)
+                cycle.exit_decisions.append(CausalEventDecision(event.kind, event.event_id, event.ingress_received_monotonic_ns, "UNCERTAIN", "QUOTE_TOUCH_ORDER_UNPROVEN"))
+                self._halt(cycle, CycleReason.EXIT_CAUSAL_UNCERTAINTY)
+                return
+        else:
+            touch_reason = "ELIGIBLE_TRADE"
         if not crosses or cycle.exit_remaining_quantity <= 0:
             cycle.ignored_event_count += 1
             cycle.exit_decisions.append(CausalEventDecision(event.kind, event.event_id, event.ingress_received_monotonic_ns, "IGNORED", "NOT_TRADE_THROUGH_QUOTE_PRICE" if not crosses else "QUOTE_QUANTITY_EXHAUSTED"))
@@ -3050,7 +3199,7 @@ class CycleKernel:
             processed_ready_monotonic_ns=ready,
         )
         cycle.exit_fills.append(causal_fill)
-        cycle.exit_decisions.append(CausalEventDecision(event.kind, event.event_id, event.ingress_received_monotonic_ns, "FILL", "ELIGIBLE_TRADE", consumed))
+        cycle.exit_decisions.append(CausalEventDecision(event.kind, event.event_id, event.ingress_received_monotonic_ns, "FILL", touch_reason, consumed))
         exit_action = _action(cycle, "exit-maker")
         exit_action.executed_quantity = cycle.exit_quote.quantity - cycle.exit_remaining_quantity
         exit_action.reason = "EXIT_MAKER_PARTIAL"
@@ -3197,8 +3346,66 @@ class CycleKernel:
             return min(pending, default=None)
         return None
 
+    def _activation_post_only_eligibility(
+        self,
+        cycle: _MutableCycle,
+        quote: CausalRestingQuote,
+        at_ns: int,
+    ) -> bool | None:
+        """Check the maker quote against the admissible activation book.
+
+        A known crossing quote is a deterministic no-fill.  If the activation
+        book cannot be selected, the kernel returns ``None`` rather than
+        upgrading missing eligibility data to a clean no-fill result.
+        """
+
+        book, reason = _select_book(cycle, Venue.RISEX, at_ns)
+        if reason is not None or book is None:
+            return None
+        if not book.bids or not book.asks:
+            return None
+        best_bid = book.bids[0].canonical_price
+        best_ask = book.asks[0].canonical_price
+        if quote.maker_side is Side.SELL:
+            # A sell crosses only when it reaches the opposite bid.  It may
+            # rest at, above, or beyond the visible ask without taking a bid.
+            return quote.price > best_bid
+        # A buy may rest at or below the bid, but never at/above the ask.
+        return quote.price < best_ask
+
     def _handle_boundary(self, cycle: _MutableCycle, at_ns: int) -> None:
         if cycle.phase is _Phase.ENTRY_WAIT:
+            if cycle.fill_model is not None:
+                post_only = self._activation_post_only_eligibility(cycle, cycle.entry_quote, at_ns)
+                if post_only is False:
+                    maker = _action(cycle, "entry-maker")
+                    _set_action_result(
+                        cycle,
+                        maker,
+                        status=CycleActionStatus.COMPLETED,
+                        executed=_ZERO,
+                        reason=CycleReason.INVALID_ENTRY_QUOTE.value,
+                    )
+                    _add_action(
+                        cycle,
+                        action_id="entry-cancel",
+                        kind=CycleActionKind.ENTRY_CANCEL,
+                        status=CycleActionStatus.NOT_REQUIRED,
+                        requested_ns=at_ns,
+                        effective_ns=at_ns,
+                        due_ns=at_ns,
+                        quantity=_ZERO,
+                        reason=CycleReason.INVALID_ENTRY_QUOTE.value,
+                    )
+                    cycle.add_reason(CycleReason.INVALID_ENTRY_QUOTE)
+                    cycle.phase = _Phase.ABORTED
+                    cycle.terminal_ns = at_ns
+                    return
+                if post_only is None:
+                    cycle.add_reason(CycleReason.POST_ONLY_ELIGIBILITY_UNKNOWN)
+                    cycle.entry_uncertainty.append(CausalUncertainty.MISSING_CAUSAL_TIMING.value)
+                    self._halt(cycle, CycleReason.POST_ONLY_ELIGIBILITY_UNKNOWN)
+                    return
             cycle.phase = _Phase.ENTRY_ACTIVE
             return
         if cycle.phase is _Phase.ENTRY_ACTIVE:
@@ -3293,6 +3500,25 @@ class CycleKernel:
             self._prepare_exit(cycle, at_ns)
             return
         if cycle.phase is _Phase.EXIT_WAIT:
+            if cycle.fill_model is not None and cycle.exit_quote is not None:
+                post_only = self._activation_post_only_eligibility(cycle, cycle.exit_quote, at_ns)
+                if post_only is False:
+                    action = _action(cycle, "exit-maker")
+                    _set_action_result(
+                        cycle,
+                        action,
+                        status=CycleActionStatus.COMPLETED,
+                        executed=_ZERO,
+                        reason=CycleReason.EXIT_QUOTE_INVALID.value,
+                    )
+                    cycle.add_reason(CycleReason.EXIT_QUOTE_INVALID)
+                    self._schedule_forced_remaining(cycle, at_ns)
+                    return
+                if post_only is None:
+                    cycle.add_reason(CycleReason.POST_ONLY_ELIGIBILITY_UNKNOWN)
+                    cycle.exit_uncertainty.append(CausalUncertainty.MISSING_CAUSAL_TIMING.value)
+                    self._halt(cycle, CycleReason.POST_ONLY_ELIGIBILITY_UNKNOWN)
+                    return
             cycle.phase = _Phase.EXIT_ACTIVE
             return
         if cycle.phase is _Phase.EXIT_ACTIVE:
@@ -3458,7 +3684,10 @@ class CycleKernel:
                 _record_entry_hedge(cycle, _ZERO)
             self._apply_taker_residue(cycle, action, _ZERO, at_ns)
             return
-        step = _common_step(cycle)
+        # The legacy S2 lane retains its paired common-grid operation.  SCV1
+        # explicitly applies the executing venue's own grid to every taker
+        # action, including one-sided closes.
+        step = _common_step(cycle) if cycle.fill_model is None else _venue_quantity_step(cycle, venue)
         if step is None:
             action.status = CycleActionStatus.UNRESOLVED
             action.reason = CycleReason.REQUIRED_ACTION_DATA_MISSING.value
@@ -3480,7 +3709,18 @@ class CycleKernel:
                 _record_entry_hedge(cycle, _ZERO)
             self._apply_taker_residue(cycle, action, _ZERO, at_ns)
             return
-        if not _minimum_ok(cycle, venue, executable, vwap.price):
+        minimum_ok = (
+            _minimum_ok(cycle, venue, executable, vwap.price)
+            if cycle.fill_model is None
+            else _minimum_ok_with_notional(
+                cycle,
+                venue,
+                executable,
+                vwap.price,
+                notional_usd=vwap.notional_usd,
+            )
+        )
+        if not minimum_ok:
             _set_action_result(cycle, action, status=CycleActionStatus.COMPLETED, executed=_ZERO, reason=CycleReason.MINIMUM_RESIDUE.value)
             cycle.add_reason(CycleReason.MINIMUM_RESIDUE)
             if action.kind is CycleActionKind.ENTRY_HEDGE:
@@ -3504,6 +3744,7 @@ class CycleKernel:
             session=book.stream_session_id,
             recovery=book.recovery_generation,
             book_revision_id=book.book_revision_id,
+            notional_usd=vwap.notional_usd if cycle.fill_model is not None else None,
         )
         action_reason = CycleReason.HEDGE_PARTIAL.value if executable < requested else reason
         _set_action_result(cycle, action, status=CycleActionStatus.COMPLETED, executed=executable, reason=action_reason, evidence_id=book.book_revision_id)
@@ -3568,7 +3809,26 @@ class CycleKernel:
         quantity = cycle.paired_risex_quantity
         lighter_vwap = exact_quantity_vwap(Side.SELL, quantity, tuple(lighter_book.bids), tuple(lighter_book.asks))
         tick = cycle.quote_version.quote.risex_tick_size
-        if tick is None or lighter_vwap.price is None or not lighter_vwap.is_executable or not _minimum_ok(cycle, Venue.LIGHTER, quantity, lighter_vwap.price):
+        lighter_minimum_ok = (
+            _minimum_ok(cycle, Venue.LIGHTER, quantity, lighter_vwap.price)
+            if lighter_vwap.price is not None and cycle.fill_model is None
+            else (
+                lighter_vwap.price is not None
+                and _minimum_ok_with_notional(
+                    cycle,
+                    Venue.LIGHTER,
+                    quantity,
+                    lighter_vwap.price,
+                    notional_usd=lighter_vwap.notional_usd,
+                )
+            )
+        )
+        if (
+            tick is None
+            or lighter_vwap.price is None
+            or not lighter_vwap.is_executable
+            or not lighter_minimum_ok
+        ):
             _add_action(cycle, action_id="exit-maker", kind=CycleActionKind.EXIT_MAKER, status=CycleActionStatus.NOT_REQUIRED, requested_ns=decision_ns, effective_ns=decision_ns, due_ns=decision_ns, quantity=quantity, reason=CycleReason.EXIT_QUOTE_INVALID.value)
             cycle.add_reason(CycleReason.EXIT_QUOTE_INVALID)
             cycle.forced_used = True
@@ -3723,6 +3983,7 @@ __all__ = [
     "CycleDelays",
     "CycleFee",
     "CycleFill",
+    "CycleFillModel",
     "CycleKernel",
     "CycleKernelState",
     "CycleLedger",
