@@ -368,6 +368,34 @@ async def test_public_collection_stops_fake_feed_on_resource_failure_and_marks_p
         created_utc=datetime(2026, 1, 1, tzinfo=UTC),
     )
     runtime_start_ns = 10_000_000_000
+
+    class StageClock:
+        """Follow source delivery and the active processing stage."""
+
+        def __init__(self, start_ns: int) -> None:
+            self._ingress = None
+            self._last_processed_ns = start_ns
+
+        def bind(self, ingress) -> None:
+            self._ingress = ingress
+            complete_item = ingress.complete_item
+
+            def complete(*, success: bool = True) -> None:
+                if ingress._in_flight is not None:
+                    self._last_processed_ns = max(
+                        self._last_processed_ns,
+                        ingress._in_flight[1],
+                    )
+                complete_item(success=success)
+
+            ingress.complete_item = complete
+
+        def __call__(self) -> int:
+            if self._ingress is not None and self._ingress._in_flight is not None:
+                return self._ingress._in_flight[1]
+            return self._last_processed_ns
+
+    clock = StageClock(runtime_start_ns)
     source_ns = runtime_start_ns + 500_000_000
     items = [
         FeedBookEvent(
@@ -424,7 +452,9 @@ async def test_public_collection_stops_fake_feed_on_resource_failure_and_marks_p
 
     feeds: list[BurstFeed] = []
 
-    def feed_factory(*args, **_kwargs):
+    def feed_factory(*args, **kwargs):
+        assert kwargs["monotonic_ns"] is clock
+        clock.bind(args[2])
         feed = BurstFeed(args[2])
         feeds.append(feed)
         return feed
@@ -439,7 +469,7 @@ async def test_public_collection_stops_fake_feed_on_resource_failure_and_marks_p
             manifest=manifest,
             window_id=windows[0].window_id,
             now_utc=lambda: windows[0].start_utc,
-            monotonic_ns=lambda: runtime_start_ns,
+            monotonic_ns=clock,
             market_selector=selector,
             feed_factory=feed_factory,
         )
@@ -466,6 +496,182 @@ async def test_public_collection_stops_fake_feed_on_resource_failure_and_marks_p
     assert summary["cycle_result_metrics_complete"] is False
     assert summary["primary"]["turnover_usd"] is None
     assert "do not mean observed zero exposure" in summary["stress"]["cycle_result_metrics_note"]
+
+
+@pytest.mark.asyncio
+async def test_public_collection_preserves_first_resource_failure_across_advancing_clock(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """The public coordinator must retain the append-time failure observation."""
+
+    windows = fixture_campaign_windows(campaign_id="advancing-resource-feed-campaign")
+    envelope = CycleEnvelope(
+        max_records=20,
+        record_reserve=3,
+        max_bytes=1_000_000,
+        bytes_reserve=100_000,
+    )
+    manifest = CycleCampaignManifest(
+        campaign_id="advancing-resource-feed-campaign",
+        accepted_release=ACCEPTED_RELEASE,
+        policy_fingerprint=cycle_policy_fingerprint(ACCEPTED_RELEASE),
+        windows=windows,
+        envelope=envelope,
+        created_utc=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    runtime_start_ns = 10_000_000_000
+    source_ns = runtime_start_ns + 500_000_000
+    items = [
+        FeedBookEvent(
+            _fixture_book(Venue.RISEX, source_ns, 1),
+            PAIR,
+            "SNAPSHOT",
+            "VALID",
+        ),
+        FeedBookEvent(
+            _fixture_book(
+                Venue.LIGHTER,
+                source_ns,
+                1,
+                bids=(("99", "10"),),
+                asks=(("100", "10"),),
+            ),
+            PAIR,
+            "SNAPSHOT",
+            "VALID",
+        ),
+    ]
+    items.extend(
+        FeedBookEvent(
+            _fixture_book(Venue.RISEX, source_ns + index * 1_000_000, index + 2),
+            PAIR,
+            "DELTA",
+            "VALID",
+        )
+        for index in range(40)
+    )
+
+    class AdvancingClock:
+        """Advance only at meaningful processing and cleanup boundaries."""
+
+        handling_advance_ns = 1_000_000
+        cleanup_advance_ns = 1_000_000
+
+        def __init__(self, start_ns: int) -> None:
+            self._ingress = None
+            self._last_processed_ns = start_ns
+            self.failed_item_ns: int | None = None
+            self.consumer_handling_ns: int | None = None
+            self.cleanup_ns: int | None = None
+
+        def bind(self, ingress) -> None:
+            self._ingress = ingress
+            complete_item = ingress.complete_item
+
+            def complete(*, success: bool = True) -> None:
+                current = ingress._in_flight
+                if current is not None:
+                    current_ns = current[1]
+                    self._last_processed_ns = max(
+                        self._last_processed_ns,
+                        current_ns,
+                    )
+                    if not success and self.failed_item_ns is None:
+                        self.failed_item_ns = current_ns
+                        self.consumer_handling_ns = (
+                            current_ns + self.handling_advance_ns
+                        )
+                        self._last_processed_ns = self.consumer_handling_ns
+                complete_item(success=success)
+
+            ingress.complete_item = complete
+
+        def mark_cleanup(self) -> None:
+            if self.consumer_handling_ns is None:
+                raise AssertionError("cleanup must follow failed consumer handling")
+            self.cleanup_ns = self.consumer_handling_ns + self.cleanup_advance_ns
+            self._last_processed_ns = self.cleanup_ns
+
+        def __call__(self) -> int:
+            if self._ingress is not None and self._ingress._in_flight is not None:
+                return self._ingress._in_flight[1]
+            return self._last_processed_ns
+
+    clock = AdvancingClock(runtime_start_ns)
+
+    async def selector(*_args, **_kwargs):
+        return (PAIR,)
+
+    class BurstFeed:
+        fatal_reason = None
+
+        def __init__(self, ingress):
+            self.ingress = ingress
+            self.offered = 0
+            self.stop_seen = False
+
+        async def run(self, **kwargs):
+            stop_event = kwargs["stop_event"]
+            try:
+                for item in items:
+                    if stop_event.is_set():
+                        break
+                    if self.ingress.offer(item):
+                        self.offered += 1
+                    await asyncio.sleep(0)
+            finally:
+                self.stop_seen = stop_event.is_set()
+                clock.mark_cleanup()
+
+    feeds: list[BurstFeed] = []
+
+    def feed_factory(*args, **kwargs):
+        assert kwargs["monotonic_ns"] is clock
+        clock.bind(args[2])
+        feed = BurstFeed(args[2])
+        feeds.append(feed)
+        return feed
+
+    monkeypatch.setattr(
+        "risex_spread_shadow.s3_cycle.validate_loaded_release",
+        lambda *_args, **_kwargs: tmp_path,
+    )
+    with pytest.raises(CycleEnvelopeLimitError, match="records"):
+        await run_public_cycle_collection(
+            tmp_path,
+            manifest=manifest,
+            window_id=windows[0].window_id,
+            now_utc=lambda: windows[0].start_utc,
+            monotonic_ns=clock,
+            market_selector=selector,
+            feed_factory=feed_factory,
+        )
+
+    assert len(feeds) == 1
+    assert feeds[0].stop_seen is True
+    assert 0 < feeds[0].offered < len(items)
+    assert clock.failed_item_ns is not None
+    assert clock.consumer_handling_ns == (
+        clock.failed_item_ns + clock.handling_advance_ns
+    )
+    assert clock.cleanup_ns == clock.consumer_handling_ns + clock.cleanup_advance_ns
+
+    evidence = tuple(tmp_path.glob("run-*/evidence.jsonl"))
+    assert len(evidence) == 1
+    records = list(iter_records(evidence[0]))
+    assert [record["record_index"] for record in records] == list(range(len(records)))
+    assert records[-1]["kind"] == "RUN_FAILED"
+    assert records[-1]["fatal_reason"] == "S3_ENVELOPE_LIMIT_RECORDS"
+    assert records[-1]["failure_observed_monotonic_ns"] == clock.failed_item_ns
+    assert records[-1]["observation_boundary_monotonic_ns"] == clock.failed_item_ns
+    assert records[-1]["finalization_boundary_kind"] == "EARLY_FAILURE"
+    assert records[-1]["incomplete_evidence"] == "FINAL_RESULT_PREFIX"
+    assert all(record["kind"] not in {"RUN_STOP", "RUN_FAILED"} for record in records[:-1])
+
+    report = build_cycle_report(evidence[0])
+    assert report["measurement_validity"] == "DATA_INSUFFICIENT"
+    assert report["data_quality"]["cycle_result_metrics_status"] == "UNAVAILABLE_RESOURCE_LIMIT"
 
 
 def test_manifest_is_create_once(tmp_path: Path) -> None:

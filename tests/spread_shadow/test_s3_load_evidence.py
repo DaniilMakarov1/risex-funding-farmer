@@ -166,7 +166,11 @@ class _ConcurrentBurstFeed:
 class _FiniteFeed:
     fatal_reason = None
 
-    def __init__(self, ingress: IngressQueue, items: tuple[FeedBookEvent, ...]) -> None:
+    def __init__(
+        self,
+        ingress: IngressQueue,
+        items: tuple[FeedBookEvent, ...],
+    ) -> None:
         self.ingress = ingress
         self.items = items
         self.offered = 0
@@ -177,12 +181,52 @@ class _FiniteFeed:
             self.ingress.offer(item)
 
 
-def _collection_kwargs(manifest: CycleCampaignManifest, window: CycleWindow) -> dict[str, object]:
+class _StageClock:
+    """Clock fixture tied to source delivery and the active processing item."""
+
+    def __init__(self, start_ns: int) -> None:
+        self.start_ns = start_ns
+        self._ingress: IngressQueue | None = None
+        self._last_processed_ns = start_ns
+
+    def bind(self, ingress: IngressQueue) -> None:
+        self._ingress = ingress
+        complete_item = ingress.complete_item
+
+        def complete(*, success: bool = True) -> None:
+            if ingress._in_flight is not None:
+                self._last_processed_ns = max(
+                    self._last_processed_ns,
+                    ingress._in_flight[1],
+                )
+            complete_item(success=success)
+
+        ingress.complete_item = complete  # type: ignore[method-assign]
+
+    def __call__(self) -> int:
+        if self._ingress is not None and self._ingress._in_flight is not None:
+            return self._ingress._in_flight[1]
+        return self._last_processed_ns
+
+
+def _bind_clock(args: tuple[object, ...], kwargs: dict[str, object]) -> _StageClock:
+    clock = kwargs["monotonic_ns"]
+    if not isinstance(clock, _StageClock):
+        raise TypeError("load fixture requires its stage clock")
+    clock.bind(args[2])  # type: ignore[arg-type]
+    return clock
+
+
+def _collection_kwargs(
+    manifest: CycleCampaignManifest,
+    window: CycleWindow,
+) -> dict[str, object]:
+    clock = _StageClock(RUNTIME_START_NS)
     return {
         "manifest": manifest,
         "window_id": window.window_id,
         "now_utc": lambda: window.start_utc,
-        "monotonic_ns": lambda: RUNTIME_START_NS,
+        "monotonic_ns": clock,
     }
 
 
@@ -198,7 +242,8 @@ async def test_concurrent_burst_load_drains_losslessly_and_replays(
     async def selector(*_args, **_kwargs):
         return (PAIR,)
 
-    def feed_factory(*args, **_kwargs):
+    def feed_factory(*args, **kwargs):
+        _bind_clock(args, kwargs)
         feed = _ConcurrentBurstFeed(args[2], items)
         feeds.append(feed)
         return feed
@@ -271,10 +316,11 @@ async def test_actual_burst_overflow_latches_gap_and_reports_insufficiency(
     async def selector(*_args, **_kwargs):
         return (PAIR,)
 
-    def feed_factory(*args, **_kwargs):
+    def feed_factory(*args, **kwargs):
         # Do not yield until every item has been offered.  This deliberately
         # fills the actual 4096-entry collection queue before the consumer
         # gets a turn; the queue must preserve one explicit aggregate gap.
+        _bind_clock(args, kwargs)
         feed = _ConcurrentBurstFeed(
             args[2],
             items,
@@ -347,14 +393,19 @@ async def test_concurrent_burst_stops_source_on_record_resource_failure(
         bytes_reserve=100_000,
     )
     manifest, windows = _manifest("concurrent-record-failure", envelope=envelope)
-    items = _load_items(count=512)
+    items = _load_items(count=512, start_ns=RUNTIME_START_NS + 100_000_000)
     feeds: list[_ConcurrentBurstFeed] = []
 
     async def selector(*_args, **_kwargs):
         return (PAIR,)
 
-    def feed_factory(*args, **_kwargs):
-        feed = _ConcurrentBurstFeed(args[2], items, yield_every=8)
+    def feed_factory(*args, **kwargs):
+        _bind_clock(args, kwargs)
+        feed = _ConcurrentBurstFeed(
+            args[2],
+            items,
+            yield_every=8,
+        )
         feeds.append(feed)
         return feed
 
@@ -367,7 +418,10 @@ async def test_concurrent_burst_stops_source_on_record_resource_failure(
             tmp_path,
             market_selector=selector,
             feed_factory=feed_factory,
-            **_collection_kwargs(manifest, windows[0]),
+            **_collection_kwargs(
+                manifest,
+                windows[0],
+            ),
         )
 
     feed = feeds[0]
@@ -406,14 +460,19 @@ async def test_collection_byte_resource_failure_preserves_terminal_and_closing_p
         bytes_reserve=8_000,
     )
     manifest, windows = _manifest("concurrent-byte-failure", envelope=envelope)
-    items = _load_items(count=512)
+    items = _load_items(count=512, start_ns=RUNTIME_START_NS + 100_000_000)
     feeds: list[_ConcurrentBurstFeed] = []
 
     async def selector(*_args, **_kwargs):
         return (PAIR,)
 
-    def feed_factory(*args, **_kwargs):
-        feed = _ConcurrentBurstFeed(args[2], items, yield_every=8)
+    def feed_factory(*args, **kwargs):
+        _bind_clock(args, kwargs)
+        feed = _ConcurrentBurstFeed(
+            args[2],
+            items,
+            yield_every=8,
+        )
         feeds.append(feed)
         return feed
 
@@ -426,7 +485,10 @@ async def test_collection_byte_resource_failure_preserves_terminal_and_closing_p
             tmp_path,
             market_selector=selector,
             feed_factory=feed_factory,
-            **_collection_kwargs(manifest, windows[0]),
+            **_collection_kwargs(
+                manifest,
+                windows[0],
+            ),
         )
 
     feed = feeds[0]
@@ -461,13 +523,14 @@ async def test_aggregate_record_budget_counts_closing_results_and_terminal(
         bytes_reserve=100_000,
     )
     manifest, windows = _manifest("aggregate-record-budget", envelope=envelope)
-    items = _load_items(count=2)
+    items = _load_items(count=2, start_ns=RUNTIME_START_NS + 100_000_000)
     feeds: list[_FiniteFeed] = []
 
     async def selector(*_args, **_kwargs):
         return (PAIR,)
 
-    def feed_factory(*args, **_kwargs):
+    def feed_factory(*args, **kwargs):
+        _bind_clock(args, kwargs)
         feed = _FiniteFeed(args[2], items)
         feeds.append(feed)
         return feed
@@ -481,7 +544,10 @@ async def test_aggregate_record_budget_counts_closing_results_and_terminal(
             tmp_path,
             market_selector=selector,
             feed_factory=feed_factory,
-            **_collection_kwargs(manifest, window),
+            **_collection_kwargs(
+                manifest,
+                window,
+            ),
         )
 
     evidence = tuple(sorted(tmp_path.glob("run-*/evidence.jsonl")))
@@ -503,7 +569,10 @@ async def test_aggregate_record_budget_counts_closing_results_and_terminal(
             tmp_path,
             market_selector=selector,
             feed_factory=feed_factory,
-            **_collection_kwargs(manifest, windows[2]),
+            **_collection_kwargs(
+                manifest,
+                windows[2],
+            ),
         )
     report = build_cycle_report(tmp_path)
     assert report["aggregate_caps"]["record_count"] == 28
@@ -522,13 +591,14 @@ async def test_aggregate_byte_budget_counts_closing_results_and_terminal(
         bytes_reserve=4_000,
     )
     manifest, windows = _manifest("aggregate-byte-budget", envelope=envelope)
-    items = _load_items(count=2)
+    items = _load_items(count=2, start_ns=RUNTIME_START_NS + 100_000_000)
     feeds: list[_FiniteFeed] = []
 
     async def selector(*_args, **_kwargs):
         return (PAIR,)
 
-    def feed_factory(*args, **_kwargs):
+    def feed_factory(*args, **kwargs):
+        _bind_clock(args, kwargs)
         feed = _FiniteFeed(args[2], items)
         feeds.append(feed)
         return feed
@@ -542,7 +612,10 @@ async def test_aggregate_byte_budget_counts_closing_results_and_terminal(
             tmp_path,
             market_selector=selector,
             feed_factory=feed_factory,
-            **_collection_kwargs(manifest, window),
+            **_collection_kwargs(
+                manifest,
+                window,
+            ),
         )
 
     with pytest.raises(CycleEnvelopeLimitError, match="bytes"):
@@ -550,7 +623,10 @@ async def test_aggregate_byte_budget_counts_closing_results_and_terminal(
             tmp_path,
             market_selector=selector,
             feed_factory=feed_factory,
-            **_collection_kwargs(manifest, windows[2]),
+            **_collection_kwargs(
+                manifest,
+                windows[2],
+            ),
         )
 
     evidence = tuple(sorted(tmp_path.glob("run-*/evidence.jsonl")))

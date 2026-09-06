@@ -10,9 +10,15 @@ import pytest
 
 from risex_farmer.models import Side, Venue
 from risex_spread_shadow.causal import CausalEvent
-from risex_spread_shadow.cycle import CycleClock, CycleKernelState, CycleScenario, CycleTerminalState, s2_cycle_policy
-from risex_spread_shadow.feed import FeedBookEvent, FeedTradeEvent, IngressQueue, MarketPair
-from risex_spread_shadow.models import BookEvidence, TradeEvidence
+from risex_spread_shadow.cycle import (
+    CycleClock,
+    CycleKernelState,
+    CycleScenario,
+    CycleTerminalState,
+    s2_cycle_policy,
+)
+from risex_spread_shadow.feed import FeedBookEvent, FeedGapEvent, FeedTradeEvent, IngressQueue, MarketPair
+from risex_spread_shadow.models import BookEvidence, DataGapEvidence, TradeEvidence
 from risex_spread_shadow.s3_cycle import (
     CycleEnvelope,
     CycleEnvelopeLimitError,
@@ -31,6 +37,7 @@ from risex_spread_shadow.s3_cycle import (
     cycle_window_fingerprint,
     fixture_cycle_attempts,
     fixture_campaign_windows,
+    run_fixture_window,
 )
 from risex_spread_shadow.store import (
     AppendOnlyEvidenceStore,
@@ -80,9 +87,12 @@ def _open_stream(
     envelope: CycleEnvelope | None = None,
     queue_capacity: int = 64,
     monotonic_ns=lambda: 500_000_000,
+    output_contract_version: int = 1,
 ) -> tuple[AppendOnlyEvidenceStore, CycleEvidenceWriter, CycleRunDriver, IngressQueue, PublicCycleProducer]:
     selected = CycleEnvelope() if envelope is None else envelope
     metadata = _metadata(window, selected)
+    if output_contract_version != 1:
+        metadata["output_contract_version"] = output_contract_version
     run_id = new_run_id()
     _preflight_campaign_store(
         root,
@@ -103,12 +113,14 @@ def _open_stream(
         selected,
         window=window,
         campaign_root=root,
+        output_contract_version=output_contract_version,
     )
     driver = CycleRunDriver(
         window,
         envelope=selected,
         writer=writer,
         streaming=True,
+        output_contract_version=output_contract_version,
     )
     ingress = IngressQueue(queue_capacity, preserve_offer_order=True)
     producer = PublicCycleProducer(
@@ -318,6 +330,36 @@ def _latest_admissible_stress_tail_items(
     return tuple(items)
 
 
+def test_resource_failure_rejects_stale_clock_instead_of_rewriting_time(
+    tmp_path: Path,
+) -> None:
+    window = fixture_campaign_windows(campaign_id="stale-resource-clock")[0]
+    envelope = CycleEnvelope(
+        max_records=5,
+        record_reserve=1,
+        max_bytes=1_000_000,
+        bytes_reserve=100_000,
+    )
+    store, _writer, driver, _ingress, _producer = _open_stream(
+        tmp_path,
+        window,
+        envelope=envelope,
+        monotonic_ns=lambda: window.monotonic_start_ns,
+    )
+    try:
+        driver._monotonic_ns = lambda: window.monotonic_start_ns
+        for offset in (1, 2):
+            driver.accept_global_input(
+                CycleClock(window.monotonic_start_ns + offset)
+            )
+        with pytest.raises(CycleEvidenceIntegrityError, match="precedes"):
+            driver.accept_global_input(
+                CycleClock(window.monotonic_start_ns + 3)
+            )
+    finally:
+        store.close()
+
+
 def test_burst_queue_drains_losslessly_into_gap_evidence_and_replays(tmp_path: Path) -> None:
     window = fixture_campaign_windows(campaign_id="burst-envelope")[0]
     store, writer, driver, ingress, producer = _open_stream(
@@ -499,6 +541,532 @@ def test_latest_admissible_stress_fill_respects_tail_deadline_or_stays_unresolve
     assert len(result_records) == 1
     assert result_records[0]["observed_monotonic_ns"] == window.deadline_monotonic_ns
     assert result_records[0]["resource_phase"] == "CLOSING"
+
+
+def test_v2_early_failure_uses_observed_boundary_and_keeps_cleanup_out_of_kernel(
+    tmp_path: Path,
+) -> None:
+    window = fixture_campaign_windows(campaign_id="v2-early-failure")[0]
+    store, _writer, driver, _ingress, producer = _open_stream(
+        tmp_path,
+        window,
+        output_contract_version=2,
+    )
+    failure_ns = 1_700_000_000
+    attempt = fixture_cycle_attempts(window, count=1, profile="normal")[0]
+    try:
+        for book in attempt.source_books:
+            producer.handle_item(_feed_value(book, source_kind="SNAPSHOT"))
+        producer.handle_item(_feed_value(attempt.events[0]))
+        producer.handle_item(
+            FeedGapEvent(
+                DataGapEvidence(
+                    source_venue=Venue.RISEX,
+                    canonical_market="BTC",
+                    stream_session_id="fixture-risex",
+                    recovery_generation=0,
+                    gap_start_monotonic_ns=failure_ns,
+                    reason="PUBLIC_SOCKET_DISCONNECTED",
+                    transport_event="UNEXPECTED_FAILURE",
+                    transport_failure_class="RESET",
+                    transport_exception_type="ConnectionResetError",
+                )
+            )
+        )
+        # The real feed runner can enqueue cleanup gaps after its first fatal
+        # transport gap.  They must not replace the original failure or move
+        # the kernel past the already-bound observation.
+        producer.handle_item(
+            FeedGapEvent(
+                DataGapEvidence(
+                    source_venue=Venue.LIGHTER,
+                    canonical_market="BTC",
+                    stream_session_id="fixture-lighter",
+                    recovery_generation=0,
+                    gap_start_monotonic_ns=failure_ns + 1,
+                    reason="PUBLIC_SMOKE_STOPPED",
+                )
+            )
+        )
+        output = producer.finalize(
+            failed=True,
+            reason="PUBLIC_SOCKET_TRANSPORT_FAILURE",
+        )
+        assert driver.failure_observed_monotonic_ns == failure_ns
+        assert driver.observation_boundary_monotonic_ns == failure_ns
+    finally:
+        store.close()
+
+    records = list(iter_records(output.store_path))
+    terminal = records[-1]
+    assert terminal["kind"] == "RUN_FAILED"
+    assert terminal["observed_monotonic_ns"] == failure_ns
+    assert terminal["observation_boundary_monotonic_ns"] == failure_ns
+    assert terminal["scheduled_deadline_monotonic_ns"] == window.deadline_monotonic_ns
+    assert terminal["finalization_boundary_kind"] == "EARLY_FAILURE"
+    assert terminal["failure_observed_monotonic_ns"] == failure_ns
+    stream_end = next(record for record in records if record["kind"] == "CYCLE_STREAM_END")
+    assert stream_end["end_monotonic_ns"] == failure_ns
+    assert stream_end["observation_boundary_monotonic_ns"] == failure_ns
+    result_records = [record for record in records if record["kind"] == "CYCLE_FINAL_RESULT"]
+    assert len(result_records) == 2
+    assert all(record["observed_monotonic_ns"] == failure_ns for record in result_records)
+    assert all(
+        record["result"]["terminal_monotonic_ns"] is None
+        or record["result"]["terminal_monotonic_ns"] <= failure_ns
+        for record in result_records
+    )
+    assert all(
+        result.status.value in {"PENDING", "UNRESOLVED"}
+        for result in output.results
+    )
+    assert all(
+        action.status.value in {"PENDING", "UNRESOLVED"}
+        or action.effective_monotonic_ns is None
+        or action.effective_monotonic_ns <= failure_ns
+        for result in output.results
+        for action in result.actions
+    )
+
+    report = build_cycle_report(output.store_path)
+    assert report["output_contract_version"] == 2
+    summary = report["windows"][0]
+    assert summary["observation_boundary_monotonic_ns"] == failure_ns
+    assert summary["scheduled_deadline_monotonic_ns"] == window.deadline_monotonic_ns
+    assert summary["finalization_boundary_kind"] == "EARLY_FAILURE"
+    assert summary["primary"]["observed_occupancy_holding_duration_seconds"] is not None
+
+
+def test_v2_explicit_failure_boundary_keeps_delayed_actions_pending(tmp_path: Path) -> None:
+    window = fixture_campaign_windows(campaign_id="v2-pending-failure")[0]
+    store, _writer, driver, _ingress, producer = _open_stream(
+        tmp_path,
+        window,
+        output_contract_version=2,
+    )
+    failure_ns = 1_700_000_000
+    attempt = fixture_cycle_attempts(window, count=1, profile="normal")[0]
+    try:
+        for book in attempt.source_books:
+            producer.handle_item(_feed_value(book, source_kind="SNAPSHOT"))
+        producer.handle_item(_feed_value(attempt.events[0]))
+        producer.capture_failure_observation(failure_ns)
+        output = producer.finalize(
+            failed=True,
+            reason="PUBLIC_SOCKET_TRANSPORT_FAILURE",
+        )
+    finally:
+        store.close()
+
+    assert driver.failure_observed_monotonic_ns == failure_ns
+    assert all(result.status.value == "PENDING" for result in output.results)
+    assert all(result.terminal_monotonic_ns is None for result in output.results)
+    assert all(
+        action.status.value in {"PENDING", "UNRESOLVED"}
+        and action.due_monotonic_ns is not None
+        and action.due_monotonic_ns > failure_ns
+        for result in output.results
+        for action in result.pending_actions
+    )
+    records = list(iter_records(output.store_path))
+    assert records[-1]["kind"] == "RUN_FAILED"
+    assert records[-1]["observation_boundary_monotonic_ns"] == failure_ns
+    report = build_cycle_report(output.store_path)
+    primary = report["windows"][0]["primary"]
+    assert primary["holding_duration_seconds"] == "0"
+    assert primary["observed_occupancy_holding_duration_seconds"] == "0.1"
+
+
+def test_v2_clean_finalization_keeps_scheduled_deadline_separate(tmp_path: Path) -> None:
+    window = fixture_campaign_windows(campaign_id="v2-clean-boundary")[0]
+    output = __import__(
+        "risex_spread_shadow.s3_cycle",
+        fromlist=["run_fixture_window"],
+    ).run_fixture_window(
+        tmp_path,
+        accepted_release=ACCEPTED_RELEASE,
+        window=window,
+        fixture_profile="normal",
+        count=1,
+        claim=False,
+        output_contract_version=2,
+    )
+    records = list(iter_records(output.store_path))
+    terminal = records[-1]
+    assert terminal["kind"] == "RUN_STOP"
+    assert terminal["observed_monotonic_ns"] == window.deadline_monotonic_ns
+    assert terminal["observation_boundary_monotonic_ns"] == window.deadline_monotonic_ns
+    assert terminal["scheduled_deadline_monotonic_ns"] == window.deadline_monotonic_ns
+    assert terminal["finalization_boundary_kind"] == "SCHEDULED_DEADLINE"
+    assert terminal["failure_observed_monotonic_ns"] is None
+    report = build_cycle_report(output.store_path)
+    assert report["output_contract_version"] == 2
+
+
+@pytest.mark.parametrize("mutation", ["terminal", "result"])
+def test_v2_replay_rejects_boundary_disagreement(tmp_path: Path, mutation: str) -> None:
+    window = fixture_campaign_windows(campaign_id=f"v2-corrupt-{mutation}")[0]
+    output = __import__(
+        "risex_spread_shadow.s3_cycle",
+        fromlist=["run_fixture_window"],
+    ).run_fixture_window(
+        tmp_path,
+        accepted_release=ACCEPTED_RELEASE,
+        window=window,
+        fixture_profile="normal",
+        count=1,
+        claim=False,
+        output_contract_version=2,
+    )
+    records = list(iter_records(output.store_path))
+    if mutation == "terminal":
+        records[-1]["observed_monotonic_ns"] -= 1
+        records[-1]["observation_boundary_monotonic_ns"] -= 1
+    else:
+        result_record = next(record for record in records if record["kind"] == "CYCLE_FINAL_RESULT")
+        result_record["observed_monotonic_ns"] -= 1
+        result_record["observation_boundary_monotonic_ns"] -= 1
+    output.store_path.write_text(
+        "".join(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    with pytest.raises(CycleEvidenceIntegrityError):
+        build_cycle_report(output.store_path)
+
+
+@pytest.mark.parametrize("mutation", ["terminal", "result"])
+def test_v2_replay_rejects_boundary_kind_disagreement(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    window = fixture_campaign_windows(campaign_id=f"v2-corrupt-kind-{mutation}")[0]
+    output = __import__(
+        "risex_spread_shadow.s3_cycle",
+        fromlist=["run_fixture_window"],
+    ).run_fixture_window(
+        tmp_path,
+        accepted_release=ACCEPTED_RELEASE,
+        window=window,
+        fixture_profile="normal",
+        count=1,
+        claim=False,
+        output_contract_version=2,
+    )
+    records = list(iter_records(output.store_path))
+    target = records[-1] if mutation == "terminal" else next(
+        record for record in records if record["kind"] == "CYCLE_FINAL_RESULT"
+    )
+    # This is deliberately the contradictory combination that used to pass:
+    # a deadline boundary, an after-deadline raw failure observation, and an
+    # EARLY_FAILURE label.
+    target["finalization_boundary_kind"] = "EARLY_FAILURE"
+    target["failure_observed_monotonic_ns"] = window.deadline_monotonic_ns + 1
+    output.store_path.write_text(
+        "".join(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    with pytest.raises(CycleEvidenceIntegrityError):
+        build_cycle_report(output.store_path)
+
+
+def test_v2_replay_rejects_failed_terminal_without_failure_observation(
+    tmp_path: Path,
+) -> None:
+    window = fixture_campaign_windows(campaign_id="v2-missing-failure")[0]
+    store, _writer, _driver, _ingress, producer = _open_stream(
+        tmp_path,
+        window,
+        output_contract_version=2,
+    )
+    try:
+        attempt = fixture_cycle_attempts(window, count=1, profile="normal")[0]
+        for book in attempt.source_books:
+            producer.handle_item(_feed_value(book, source_kind="SNAPSHOT"))
+        producer.handle_item(_feed_value(attempt.events[0]))
+        producer.capture_failure_observation(1_700_000_000)
+        producer.finalize(
+            failed=True,
+            reason="PUBLIC_SOCKET_TRANSPORT_FAILURE",
+        )
+        records = list(iter_records(store.path))
+    finally:
+        store.close()
+    records[-1]["failure_observed_monotonic_ns"] = None
+    store.path.write_text(
+        "".join(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    with pytest.raises(CycleEvidenceIntegrityError):
+        build_cycle_report(store.path)
+
+
+def test_v2_replay_rejects_prior_observation_after_failure_boundary(
+    tmp_path: Path,
+) -> None:
+    window = fixture_campaign_windows(campaign_id="v2-future-observation")[0]
+    output = run_fixture_window(
+        tmp_path,
+        accepted_release=ACCEPTED_RELEASE,
+        window=window,
+        fixture_profile="normal",
+        count=1,
+        claim=False,
+        output_contract_version=2,
+    )
+    records = list(iter_records(output.store_path))
+    terminal = records[-1]
+    terminal["observed_monotonic_ns"] = 100
+    terminal["observation_boundary_monotonic_ns"] = 100
+    terminal["finalization_boundary_kind"] = "EARLY_FAILURE"
+    terminal["failure_observed_monotonic_ns"] = 100
+    output.store_path.write_text(
+        "".join(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    with pytest.raises(CycleEvidenceIntegrityError):
+        build_cycle_report(output.store_path)
+
+
+@pytest.mark.parametrize("mutation", ["terminal", "stream", "result"])
+def test_v2_replay_rejects_failure_time_on_clean_boundary_record(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    window = fixture_campaign_windows(campaign_id=f"v2-clean-with-failure-{mutation}")[0]
+    attempt = fixture_cycle_attempts(window, count=1, profile="normal")[0]
+    store, _writer, _driver, _ingress, producer = _open_stream(
+        tmp_path,
+        window=window,
+        output_contract_version=2,
+    )
+    try:
+        for value in attempt.source_books:
+            producer.handle_item(_feed_value(value, source_kind="SNAPSHOT"))
+        producer.handle_item(_feed_value(attempt.events[0]))
+        producer.accept_clock(window.deadline_monotonic_ns)
+        producer.finalize()
+        records = list(iter_records(store.path))
+    finally:
+        store.close()
+    if mutation == "terminal":
+        target = records[-1]
+    elif mutation == "stream":
+        target = next(record for record in records if record["kind"] == "CYCLE_STREAM_END")
+    else:
+        target = next(record for record in records if record["kind"] == "CYCLE_FINAL_RESULT")
+    target["failure_observed_monotonic_ns"] = window.deadline_monotonic_ns
+    store.path.write_text(
+        "".join(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    with pytest.raises(CycleEvidenceIntegrityError):
+        build_cycle_report(store.path)
+
+
+def test_v2_real_unmatched_duration_starts_at_unwind_request_and_replays(
+    tmp_path: Path,
+) -> None:
+    window = fixture_campaign_windows(campaign_id="v2-unmatched-duration")[0]
+    attempt = fixture_cycle_attempts(window, count=1, profile="normal")[0]
+    items = [
+        _feed_value(attempt.source_books[0], source_kind="SNAPSHOT"),
+        _feed_value(attempt.source_books[1], source_kind="SNAPSHOT"),
+        _feed_value(attempt.events[0]),
+        # The full pair at 1.9s lets the primary lane hedge normally.
+        _feed_value(attempt.events[1]),
+        _feed_value(attempt.events[2]),
+        # A fresh 0.40 ask at 2.5s makes the stress lane's 2.6s hedge
+        # genuinely partial; the explicit clock then reaches that boundary.
+        _feed_value(
+            _fixture_book(
+                Venue.RISEX,
+                2_500_000_000,
+                10,
+                asks=(("105", "10"),),
+            )
+        ),
+        _feed_value(
+            _fixture_book(
+                Venue.LIGHTER,
+                2_500_000_000,
+                10,
+                bids=(("99", "10"),),
+                asks=(("100", "0.40"),),
+            )
+        ),
+    ]
+    store, _writer, driver, _ingress, producer = _open_stream(
+        tmp_path,
+        window,
+        output_contract_version=2,
+    )
+    try:
+        for item in items:
+            producer.handle_item(item)
+        producer.accept_clock(2_600_000_000)
+        stress = driver.kernel.snapshot(CycleScenario.STRESS)
+        assert stress is not None
+        assert stress.status is CycleTerminalState.PENDING
+        assert stress.first_maker_fill_monotonic_ns == 1_600_000_000
+        assert stress.hedged_quantity == Decimal("0.40")
+        assert stress.unmatched_entry_quantity == Decimal("0.60")
+        assert stress.unmatched_exposure_duration_ns is None
+        unmatched_action = next(
+            action for action in stress.pending_actions if action.action_id == "unmatched-risex"
+        )
+        assert unmatched_action.requested_monotonic_ns == 2_600_000_000
+        assert unmatched_action.status.value == "PENDING"
+        producer.capture_failure_observation(2_700_000_000)
+        output = producer.finalize(
+            failed=True,
+            reason="PUBLIC_SOCKET_TRANSPORT_FAILURE",
+        )
+        records = list(iter_records(store.path))
+    finally:
+        store.close()
+
+    stress_output = next(
+        result for result in output.results if result.scenario is CycleScenario.STRESS
+    )
+    assert stress_output.complete_execution_pnl_usd is None
+    assert stress_output.terminal_monotonic_ns is None
+    assert stress_output.unmatched_exposure_duration_ns is None
+    result_record = next(
+        record
+        for record in records
+        if record["kind"] == "CYCLE_FINAL_RESULT"
+        and record["scenario"] == CycleScenario.STRESS.value
+    )
+    assert result_record["result"]["first_maker_fill_monotonic_ns"] == 1_600_000_000
+    assert result_record["result"]["unmatched_entry_quantity"] == "0.60"
+    assert result_record["result"]["unmatched_exposure_duration_ns"] is None
+    assert next(
+        action
+        for action in result_record["result"]["actions"]
+        if action["action_id"] == "unmatched-risex"
+    )["requested_monotonic_ns"] == 2_600_000_000
+
+    report = build_cycle_report(store.path)
+    stress_report = report["economics"]["stress"]
+    assert stress_report["total_pnl_usd"] is None
+    assert stress_report["observed_occupancy_holding_duration_seconds"] == "1.1"
+    assert stress_report["observed_unmatched_exposure_duration_seconds"] == "0.1"
+
+
+def test_v2_clean_stream_end_precedes_second_final_result_resource_failure_and_replays(
+    tmp_path: Path,
+) -> None:
+    window = fixture_campaign_windows(campaign_id="v2-result-prefix-after-stream-end")[0]
+    attempt = fixture_cycle_attempts(window, count=1, profile="normal")[0]
+    store, writer, driver, _ingress, producer = _open_stream(
+        tmp_path,
+        window,
+        output_contract_version=2,
+    )
+    try:
+        for value in attempt.source_books:
+            producer.handle_item(_feed_value(value, source_kind="SNAPSHOT"))
+        producer.handle_item(_feed_value(attempt.events[0]))
+        producer.accept_clock(window.deadline_monotonic_ns)
+        original_append = writer.append
+
+        def fail_final_result(record):
+            if (
+                record.get("kind") == "CYCLE_FINAL_RESULT"
+                and record.get("scenario") == CycleScenario.STRESS.value
+            ):
+                raise CycleEnvelopeLimitError("records")
+            return original_append(record)
+
+        writer.append = fail_final_result
+        driver._monotonic_ns = lambda: window.deadline_monotonic_ns + 1
+        with pytest.raises(CycleEnvelopeLimitError, match="records"):
+            producer.finalize()
+        records = list(iter_records(store.path))
+    finally:
+        store.close()
+
+    stream_end = next(record for record in records if record["kind"] == "CYCLE_STREAM_END")
+    terminal = records[-1]
+    assert stream_end["record_index"] < terminal["record_index"]
+    assert stream_end["failure_observed_monotonic_ns"] is None
+    assert stream_end["finalization_boundary_kind"] == "SCHEDULED_DEADLINE"
+    assert terminal["kind"] == "RUN_FAILED"
+    assert terminal["incomplete_evidence"] == "FINAL_RESULT_PREFIX"
+    assert terminal["observation_boundary_monotonic_ns"] == window.deadline_monotonic_ns
+    assert terminal["failure_observed_monotonic_ns"] == window.deadline_monotonic_ns + 1
+    result_records = [record for record in records if record["kind"] == "CYCLE_FINAL_RESULT"]
+    assert len(result_records) == 1
+    assert result_records[0]["scenario"] == CycleScenario.PRIMARY.value
+    assert result_records[0]["failure_observed_monotonic_ns"] is None
+
+    report = build_cycle_report(store.path)
+    assert report["measurement_validity"] == "DATA_INSUFFICIENT"
+    assert report["data_quality"]["cycle_result_metrics_status"] == "UNAVAILABLE_RESOURCE_LIMIT"
+
+
+def test_v2_early_stream_failure_precedes_final_result_resource_failure_and_replays(
+    tmp_path: Path,
+) -> None:
+    window = fixture_campaign_windows(campaign_id="v2-early-result-prefix")[0]
+    attempt = fixture_cycle_attempts(window, count=1, profile="normal")[0]
+    failure_ns = 1_700_000_000
+    store, writer, driver, _ingress, producer = _open_stream(
+        tmp_path,
+        window,
+        output_contract_version=2,
+    )
+    try:
+        for value in attempt.source_books:
+            producer.handle_item(_feed_value(value, source_kind="SNAPSHOT"))
+        producer.handle_item(_feed_value(attempt.events[0]))
+        producer.handle_item(
+            FeedGapEvent(
+                DataGapEvidence(
+                    source_venue=Venue.RISEX,
+                    canonical_market="BTC",
+                    stream_session_id="fixture-risex",
+                    recovery_generation=0,
+                    gap_start_monotonic_ns=failure_ns,
+                    reason="PUBLIC_SOCKET_DISCONNECTED",
+                    transport_event="UNEXPECTED_FAILURE",
+                    transport_failure_class="RESET",
+                    transport_exception_type="ConnectionResetError",
+                )
+            )
+        )
+        original_append = writer.append
+
+        def fail_first_final_result(record):
+            if record.get("kind") == "CYCLE_FINAL_RESULT":
+                raise CycleEnvelopeLimitError("records")
+            return original_append(record)
+
+        writer.append = fail_first_final_result
+        driver._monotonic_ns = lambda: failure_ns + 1
+        with pytest.raises(CycleEnvelopeLimitError, match="records"):
+            producer.finalize(
+                failed=True,
+                reason="PUBLIC_SOCKET_TRANSPORT_FAILURE",
+            )
+        records = list(iter_records(store.path))
+    finally:
+        store.close()
+
+    stream_end = next(record for record in records if record["kind"] == "CYCLE_STREAM_END")
+    terminal = records[-1]
+    assert stream_end["observation_boundary_monotonic_ns"] == failure_ns
+    assert stream_end["finalization_boundary_kind"] == "EARLY_FAILURE"
+    assert stream_end["failure_observed_monotonic_ns"] == failure_ns
+    assert terminal["kind"] == "RUN_FAILED"
+    assert terminal["incomplete_evidence"] == "FINAL_RESULT_PREFIX"
+    assert terminal["observation_boundary_monotonic_ns"] == failure_ns
+    assert terminal["failure_observed_monotonic_ns"] == failure_ns
+    assert not any(record["kind"] == "CYCLE_FINAL_RESULT" for record in records)
+
+    report = build_cycle_report(store.path)
+    assert report["measurement_validity"] == "DATA_INSUFFICIENT"
+    assert report["data_quality"]["cycle_result_metrics_status"] == "UNAVAILABLE_RESOURCE_LIMIT"
 
 
 def test_stream_primary_reentry_survives_pending_stress_and_replays(tmp_path: Path) -> None:
