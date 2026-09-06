@@ -9,7 +9,7 @@ import tracemalloc
 import pytest
 
 from risex_farmer.models import Venue
-from risex_spread_shadow.cycle import CycleClock, CycleScenario, CycleTerminalState
+from risex_spread_shadow.cycle import CycleClock, CycleKernel, CycleScenario, CycleTerminalState
 from risex_spread_shadow.feed import FeedBookEvent, IngressQueue, MarketPair
 from risex_spread_shadow.models import BookEvidence
 import risex_spread_shadow.s3_cycle as s3_cycle_module
@@ -787,6 +787,77 @@ def test_initial_source_book_repeat_keeps_exact_quote_witness_validation() -> No
     assert result.status is CycleTerminalState.UNRESOLVED
     assert "REQUIRED_ACTION_AMBIGUOUS" in result.reason_codes
     assert result.entry_measurement.duplicate_event_count == 0
+
+
+def test_rescheduled_hedge_boundary_keeps_temporal_health_witness() -> None:
+    window = fixture_campaign_windows(campaign_id="rescheduled-hedge-boundary")[0]
+    attempt = fixture_cycle_attempts(window, count=1, profile="normal")[0]
+    kernel = CycleKernel()
+    assert kernel.admit(attempt.quote_version, source_books=attempt.source_books).accepted
+
+    kernel.advance_clock(1_100_000_000)
+    due = 2_100_000_000
+    risex_source, lighter_source = attempt.source_books
+    risex_time = due - 300
+    kernel.advance(
+        replace(
+            risex_source,
+            book_revision=100,
+            received_monotonic_ns=risex_time,
+            ingress_received_monotonic_ns=risex_time,
+            normalized_ready_monotonic_ns=risex_time,
+            decision_ready_monotonic_ns=risex_time,
+        )
+    )
+    for revision, received, healthy in (
+        (101, due - 100, True),
+        (102, due - 100, False),
+    ):
+        kernel.advance(
+            replace(
+                lighter_source,
+                book_revision=revision,
+                received_monotonic_ns=received,
+                ingress_received_monotonic_ns=received,
+                normalized_ready_monotonic_ns=received,
+                decision_ready_monotonic_ns=received,
+                sequence_valid=healthy,
+            )
+        )
+
+    # The entry trade reschedules the next boundary earlier than the old
+    # cancel boundary.  The healthy neighbor is exactly fresh at the new
+    # hedge boundary even though it was stale relative to the old one.
+    kernel.advance(attempt.events[0])
+    active = kernel._lane(CycleScenario.PRIMARY).active
+    assert active is not None and active.entry_hedge_due_ns == due + 499_999_900
+    hedge_due = active.entry_hedge_due_ns
+    assert hedge_due is not None
+    fresh_risex_time = hedge_due - 1
+    kernel.advance(
+        replace(
+            risex_source,
+            book_revision=110,
+            received_monotonic_ns=fresh_risex_time,
+            ingress_received_monotonic_ns=fresh_risex_time,
+            normalized_ready_monotonic_ns=fresh_risex_time,
+            decision_ready_monotonic_ns=fresh_risex_time,
+        )
+    )
+    future = replace(
+        lighter_source,
+        book_revision=103,
+        received_monotonic_ns=due + 500_000_000,
+        ingress_received_monotonic_ns=due + 500_000_000,
+        normalized_ready_monotonic_ns=due + 500_000_000,
+        decision_ready_monotonic_ns=due + 500_000_000,
+    )
+    kernel.advance(future)
+
+    result = kernel.snapshot(CycleScenario.PRIMARY)
+    assert result is not None
+    assert result.status is CycleTerminalState.UNRESOLVED
+    assert result.reason_codes == ("REQUIRED_ACTION_UNHEALTHY", "TERMINAL_NON_FLAT")
 
 
 def test_replay_binds_exact_content_across_bounded_file_passes(

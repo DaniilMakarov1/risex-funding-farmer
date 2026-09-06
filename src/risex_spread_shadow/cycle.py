@@ -2515,7 +2515,8 @@ class CycleKernel:
         ``advance`` processes every due boundary before returning to its
         caller.  Consequently, for each expected stream the next boundary
         needs only the latest temporal book, the latest future book, and the
-        latest fresh temporal book that proves the temporal-health predicate.
+        latest potentially healthy temporal book that can prove the
+        temporal-health predicate at a rescheduled boundary.
         When no book is temporal, the latest timing-missing witness is also
         retained so the selector can preserve its timing reason.  A
         displaced stream is represented by a venue flag; it never needs a
@@ -2568,18 +2569,16 @@ class CycleKernel:
             ]
             if temporal:
                 retained_by_object[id(temporal[-1])] = temporal[-1]
-                fresh_temporal = [
+                healthy_temporal = [
                     observation
                     for observation in temporal
                     if (
                         observation.book.fresh
                         and observation.book.is_sequence_healthy
-                        and next_due - observation.book.received_monotonic_ns
-                        <= cycle.policy.input_freshness_max_age_ns
                     )
                 ]
-                if fresh_temporal:
-                    retained_by_object[id(fresh_temporal[-1])] = fresh_temporal[-1]
+                if healthy_temporal:
+                    retained_by_object[id(healthy_temporal[-1])] = healthy_temporal[-1]
             if future:
                 retained_by_object[id(future[-1])] = future[-1]
             if not temporal:
