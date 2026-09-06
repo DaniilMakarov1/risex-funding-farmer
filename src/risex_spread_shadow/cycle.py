@@ -472,12 +472,14 @@ class CycleFill:
             _decimal(value, name)
         if self.quantity <= 0 or self.price <= 0:
             raise ValueError("cycle fill quantity and price must be positive")
-        # Level notional is the primary quantity for taker walks.  A VWAP is
-        # a derived Decimal division and may not round-trip through
-        # ``quantity * price`` for a repeating price.  Requiring the derived
-        # price to be the quotient preserves that exact level sum without
-        # silently replacing it with a rounded multiplication.
-        if self.notional_usd / self.quantity != self.price:
+        # Legacy fills remain valid under their historical multiplication
+        # identity.  SCV1 taker walks may instead carry an exact level sum;
+        # their derived VWAP is the quotient and may not round-trip through
+        # ``quantity * price`` for a repeating price.
+        if (
+            self.notional_usd != self.quantity * self.price
+            and self.notional_usd / self.quantity != self.price
+        ):
             raise ValueError("cycle fill price is not derived from exact notional and quantity")
         if self.fee_rate < 0 or self.fee_usd != self.notional_usd * self.fee_rate:
             raise ValueError("cycle fill fee does not match exact notional and rate")
@@ -1045,6 +1047,11 @@ def _trade_crosses(quote: CausalRestingQuote, trade: TradeEvidence) -> tuple[boo
     return improvement >= quote.tick_size, improvement < quote.tick_size
 
 
+def _trade_price_is_tick_aligned(quote: CausalRestingQuote, trade: TradeEvidence) -> bool:
+    tick = quote.tick_size
+    return tick is None or trade.canonical_price % tick == 0
+
+
 def _floor_quantity(value: Decimal, step: Decimal) -> Decimal:
     if value <= 0 or step <= 0:
         return _ZERO
@@ -1334,10 +1341,11 @@ def _append_fill(
     notional = quantity * price if notional_usd is None else _decimal(notional_usd, "notional_usd")
     if notional <= 0:
         raise ValueError("cycle fill notional must be positive")
-    # Always expose the derived VWAP corresponding to the exact level sum.
-    # This is intentionally calculated after the exact notional is selected;
-    # it must never be used to reconstruct the notional for fees or cashflow.
-    price = notional / quantity
+    if notional_usd is not None:
+        # SCV1 exposes the derived VWAP corresponding to the exact level sum.
+        # It must never be used to reconstruct the notional for fees or
+        # cashflow.  The legacy path retains its historical supplied price.
+        price = notional / quantity
     fee = notional * rate
     gross = notional if side is Side.SELL else -notional
     scenario_cost = notional * cycle.delays.risex_fill_cost_rate if venue is Venue.RISEX else _ZERO
@@ -2803,7 +2811,8 @@ class CycleKernel:
         # terminal no-fill.  Later crossing trades cannot retroactively turn
         # that rejected quote into a causal uncertainty.
         if (
-            cycle.phase is _Phase.ABORTED
+            cycle.fill_model is not None
+            and cycle.phase is _Phase.ABORTED
             and CycleReason.INVALID_ENTRY_QUOTE.value in cycle.reasons
         ):
             return False
@@ -2830,7 +2839,7 @@ class CycleKernel:
     def _exit_candidate_after_commit(cycle: _MutableCycle, event: CausalEvent) -> bool:
         """Identify a possible exit fill after a close/force transition."""
 
-        if CycleReason.EXIT_QUOTE_INVALID.value in cycle.reasons:
+        if cycle.fill_model is not None and CycleReason.EXIT_QUOTE_INVALID.value in cycle.reasons:
             return False
         trade = event.trade
         quote = cycle.exit_quote
@@ -2949,6 +2958,20 @@ class CycleKernel:
             if trade.aggressor_side is not expected_aggressor:
                 cycle.ignored_event_count += 1
                 cycle.entry_decisions.append(CausalEventDecision(event.kind, event.event_id, event.ingress_received_monotonic_ns, "IGNORED", "WRONG_AGGRESSOR_SIDE"))
+                return
+            if cycle.fill_model is not None and not _trade_price_is_tick_aligned(cycle.entry_quote, trade):
+                cycle.add_reason(CycleReason.ENTRY_CAUSAL_UNCERTAINTY)
+                cycle.entry_uncertainty.append(CausalUncertainty.INVALID_TRADE_PRICE_GRID.value)
+                cycle.entry_decisions.append(
+                    CausalEventDecision(
+                        event.kind,
+                        event.event_id,
+                        event.ingress_received_monotonic_ns,
+                        "UNCERTAIN",
+                        CausalUncertainty.INVALID_TRADE_PRICE_GRID.value,
+                    )
+                )
+                self._halt(cycle, CycleReason.ENTRY_CAUSAL_UNCERTAINTY)
                 return
             crosses, ambiguous = _trade_crosses(cycle.entry_quote, trade)
             if ambiguous:
@@ -3113,6 +3136,20 @@ class CycleKernel:
         if trade.aggressor_side is not expected_aggressor:
             cycle.ignored_event_count += 1
             cycle.exit_decisions.append(CausalEventDecision(event.kind, event.event_id, event.ingress_received_monotonic_ns, "IGNORED", "WRONG_AGGRESSOR_SIDE"))
+            return
+        if cycle.fill_model is not None and not _trade_price_is_tick_aligned(quote, trade):
+            cycle.add_reason(CycleReason.EXIT_CAUSAL_UNCERTAINTY)
+            cycle.exit_uncertainty.append(CausalUncertainty.INVALID_TRADE_PRICE_GRID.value)
+            cycle.exit_decisions.append(
+                CausalEventDecision(
+                    event.kind,
+                    event.event_id,
+                    event.ingress_received_monotonic_ns,
+                    "UNCERTAIN",
+                    CausalUncertainty.INVALID_TRADE_PRICE_GRID.value,
+                )
+            )
+            self._halt(cycle, CycleReason.EXIT_CAUSAL_UNCERTAINTY)
             return
         crosses, ambiguous = _trade_crosses(quote, trade)
         if ambiguous:
@@ -3330,10 +3367,9 @@ class CycleKernel:
         best_bid = book.bids[0].canonical_price
         best_ask = book.asks[0].canonical_price
         if quote.maker_side is Side.SELL:
-            # A sell at or below the bid crosses; a sell at the ask also
-            # crosses the visible offer.  The S1a fixture contract requires a
-            # strict non-crossing price between the two sides.
-            return best_bid < quote.price < best_ask
+            # A sell crosses only when it reaches the opposite bid.  It may
+            # rest at, above, or beyond the visible ask without taking a bid.
+            return quote.price > best_bid
         # A buy may rest at or below the bid, but never at/above the ask.
         return quote.price < best_ask
 
@@ -3648,10 +3684,10 @@ class CycleKernel:
                 _record_entry_hedge(cycle, _ZERO)
             self._apply_taker_residue(cycle, action, _ZERO, at_ns)
             return
-        # Paired initial sizing uses the common grid, but every taker action
-        # executes on one venue.  Close quantity must therefore use that
-        # venue's own canonical step and minimums.
-        step = _venue_quantity_step(cycle, venue)
+        # The legacy S2 lane retains its paired common-grid operation.  SCV1
+        # explicitly applies the executing venue's own grid to every taker
+        # action, including one-sided closes.
+        step = _common_step(cycle) if cycle.fill_model is None else _venue_quantity_step(cycle, venue)
         if step is None:
             action.status = CycleActionStatus.UNRESOLVED
             action.reason = CycleReason.REQUIRED_ACTION_DATA_MISSING.value
@@ -3673,13 +3709,18 @@ class CycleKernel:
                 _record_entry_hedge(cycle, _ZERO)
             self._apply_taker_residue(cycle, action, _ZERO, at_ns)
             return
-        if not _minimum_ok_with_notional(
-            cycle,
-            venue,
-            executable,
-            vwap.price,
-            notional_usd=vwap.notional_usd,
-        ):
+        minimum_ok = (
+            _minimum_ok(cycle, venue, executable, vwap.price)
+            if cycle.fill_model is None
+            else _minimum_ok_with_notional(
+                cycle,
+                venue,
+                executable,
+                vwap.price,
+                notional_usd=vwap.notional_usd,
+            )
+        )
+        if not minimum_ok:
             _set_action_result(cycle, action, status=CycleActionStatus.COMPLETED, executed=_ZERO, reason=CycleReason.MINIMUM_RESIDUE.value)
             cycle.add_reason(CycleReason.MINIMUM_RESIDUE)
             if action.kind is CycleActionKind.ENTRY_HEDGE:
@@ -3703,7 +3744,7 @@ class CycleKernel:
             session=book.stream_session_id,
             recovery=book.recovery_generation,
             book_revision_id=book.book_revision_id,
-            notional_usd=vwap.notional_usd,
+            notional_usd=vwap.notional_usd if cycle.fill_model is not None else None,
         )
         action_reason = CycleReason.HEDGE_PARTIAL.value if executable < requested else reason
         _set_action_result(cycle, action, status=CycleActionStatus.COMPLETED, executed=executable, reason=action_reason, evidence_id=book.book_revision_id)
@@ -3768,17 +3809,25 @@ class CycleKernel:
         quantity = cycle.paired_risex_quantity
         lighter_vwap = exact_quantity_vwap(Side.SELL, quantity, tuple(lighter_book.bids), tuple(lighter_book.asks))
         tick = cycle.quote_version.quote.risex_tick_size
+        lighter_minimum_ok = (
+            _minimum_ok(cycle, Venue.LIGHTER, quantity, lighter_vwap.price)
+            if lighter_vwap.price is not None and cycle.fill_model is None
+            else (
+                lighter_vwap.price is not None
+                and _minimum_ok_with_notional(
+                    cycle,
+                    Venue.LIGHTER,
+                    quantity,
+                    lighter_vwap.price,
+                    notional_usd=lighter_vwap.notional_usd,
+                )
+            )
+        )
         if (
             tick is None
             or lighter_vwap.price is None
             or not lighter_vwap.is_executable
-            or not _minimum_ok_with_notional(
-                cycle,
-                Venue.LIGHTER,
-                quantity,
-                lighter_vwap.price,
-                notional_usd=lighter_vwap.notional_usd,
-            )
+            or not lighter_minimum_ok
         ):
             _add_action(cycle, action_id="exit-maker", kind=CycleActionKind.EXIT_MAKER, status=CycleActionStatus.NOT_REQUIRED, requested_ns=decision_ns, effective_ns=decision_ns, due_ns=decision_ns, quantity=quantity, reason=CycleReason.EXIT_QUOTE_INVALID.value)
             cycle.add_reason(CycleReason.EXIT_QUOTE_INVALID)

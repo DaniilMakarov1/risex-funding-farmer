@@ -3,14 +3,18 @@ from __future__ import annotations
 from dataclasses import replace
 from decimal import Decimal as D
 
+import pytest
+
 from risex_farmer.models import Venue
 
 from risex_spread_shadow import (
+    CausalUncertainty,
     CycleFillModel,
     CycleScenario,
     CycleTerminalState,
     CycleReason,
     Side,
+    run_cycle,
     run_scv1_s1a,
     run_scv1_s1a_alternatives,
 )
@@ -136,7 +140,13 @@ def test_scv1_duplicate_volume_is_spent_once_inside_each_lane() -> None:
 
 def test_scv1_crossing_post_only_quote_has_no_maker_fill() -> None:
     version, source_books = _version("scv1-crossing")
-    risex_400, _ = _activation_books(asks=(("101", "10"),))
+    risex_400 = _book(
+        Venue.RISEX,
+        received=400_000_000,
+        revision=2,
+        bids=(("101", "10"),),
+        asks=(("102", "10"),),
+    )
     crossing_trade = _trade(
         "scv1-crossing-trade",
         received=600_000_000,
@@ -156,6 +166,79 @@ def test_scv1_crossing_post_only_quote_has_no_maker_fill() -> None:
     assert alternative.result.entry_quantity == D("0")
     assert not alternative.result.fills
     assert CycleReason.INVALID_ENTRY_QUOTE.value in alternative.result.reason_codes
+
+
+@pytest.mark.parametrize("asks", ((('100', '10'),), (('101', '10'),)))
+def test_scv1_non_crossing_sell_at_or_above_ask_remains_eligible(asks) -> None:
+    version, source_books = _version("scv1-non-crossing-" + asks[0][0])
+    activation_book = _book(
+        Venue.RISEX,
+        received=400_000_000,
+        revision=2,
+        bids=(("99", "10"),),
+        asks=asks,
+    )
+    alternative = run_scv1_s1a(
+        version,
+        (activation_book, _trade("scv1-non-crossing-trade-" + asks[0][0], received=600_000_000, quantity="0.5", price="102")),
+        fill_model=CycleFillModel.TOUCH_ALLOWED,
+        source_books=source_books,
+        end_monotonic_ns=700_000_000,
+    )
+
+    assert alternative.result.entry_quantity == D("0.5")
+    assert alternative.result.status is CycleTerminalState.PENDING
+    assert CycleReason.INVALID_ENTRY_QUOTE.value not in alternative.result.reason_codes
+
+
+@pytest.mark.parametrize("model", tuple(CycleFillModel))
+@pytest.mark.parametrize("price", ("101.5", "102.5"))
+def test_scv1_off_grid_entry_price_is_uncertain_for_both_fill_models(model, price) -> None:
+    version, source_books = _valid_entry_version("scv1-off-grid-" + model.value + "-" + price)
+    (risex_400, _) = _activation_books()
+    alternative = run_scv1_s1a(
+        version,
+        (risex_400, _trade("scv1-off-grid-trade-" + price, received=600_000_000, quantity="0.5", price=price)),
+        fill_model=model,
+        source_books=source_books,
+        end_monotonic_ns=700_000_000,
+    )
+
+    assert alternative.result.status is CycleTerminalState.UNRESOLVED
+    assert alternative.result.entry_quantity == D("0")
+    assert not alternative.result.fills
+    assert alternative.result.entry_measurement is not None
+    decision = alternative.result.entry_measurement.decisions[-1]
+    assert decision.classification == "UNCERTAIN"
+    assert decision.reason == CausalUncertainty.INVALID_TRADE_PRICE_GRID.value
+
+
+@pytest.mark.parametrize("model", tuple(CycleFillModel))
+def test_scv1_off_grid_exit_price_is_uncertain_for_both_maker_sides(model) -> None:
+    version, source_books = _valid_entry_version("scv1-off-grid-exit-" + model.value)
+    events = list(_full_cycle_events())
+    events[5] = _trade(
+        "scv1-off-grid-exit-trade-" + model.value,
+        received=1_600_000_300,
+        quantity="1",
+        price="97.5",
+        aggressor=Side.SELL,
+    )
+
+    alternative = run_scv1_s1a(
+        version,
+        events,
+        fill_model=model,
+        source_books=source_books,
+        end_monotonic_ns=2_300_000_000,
+    )
+
+    assert alternative.result.status is CycleTerminalState.UNRESOLVED
+    assert alternative.result.exit_measurement is not None
+    decision = alternative.result.exit_measurement.decisions[-1]
+    assert decision.classification == "UNCERTAIN"
+    assert decision.reason == CausalUncertainty.INVALID_TRADE_PRICE_GRID.value
+    assert not any(fill.action_id == "exit-maker" for fill in alternative.result.fills)
 
 
 def _custom_quantity_version(*, risex_minimum: str):
@@ -232,6 +315,48 @@ def test_scv1_one_sided_close_uses_risex_grid_and_rejects_own_minimum() -> None:
     assert rejected.result.positions.risex_signed_quantity == D("-0.50")
     assert not any(fill.action_id == "unmatched-risex" for fill in rejected.result.fills)
     assert CycleReason.MINIMUM_RESIDUE.value in rejected.result.reason_codes
+
+
+def test_legacy_run_cycle_keeps_common_grid_and_accounting_contract() -> None:
+    version, source_books = _custom_quantity_version(risex_minimum="0.1")
+    risex_400, _ = _activation_books()
+    partial = _trade(
+        "legacy-common-grid-partial",
+        received=500_000_200,
+        quantity="0.50",
+        price="102",
+    )
+    events = (
+        risex_400,
+        partial,
+        _book(
+            Venue.LIGHTER,
+            received=1_200_000_000,
+            revision=2,
+            bids=(("99", "10"),),
+            asks=(("100", "10"),),
+        ),
+        _book(
+            Venue.RISEX,
+            received=1_200_000_000,
+            revision=3,
+            bids=(("99", "10"),),
+            asks=(("105", "10"),),
+        ),
+        _book(
+            Venue.RISEX,
+            received=1_600_000_000,
+            revision=4,
+            bids=(("99", "10"),),
+            asks=(("105", "10"),),
+        ),
+    )
+
+    legacy = run_cycle(version, events, source_books=source_books, end_monotonic_ns=2_200_000_000)
+    assert legacy.status is CycleTerminalState.UNRESOLVED
+    assert legacy.positions.risex_signed_quantity == D("-0.10")
+    assert next(fill for fill in legacy.fills if fill.action_id == "unmatched-risex").quantity == D("0.4")
+    assert CycleReason.TERMINAL_NON_FLAT.value in legacy.reason_codes
 
 
 def _repeating_vwap_version():
