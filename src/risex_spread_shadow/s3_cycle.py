@@ -2292,8 +2292,13 @@ def _fixture_attempt(
     window: CycleWindow,
     index: int,
     kind: str,
+    spacing_seconds: int = 400,
 ) -> CycleAttempt:
-    base = window.monotonic_start_ns + index * 400_000_000_000 + 500_000_000
+    base = (
+        window.monotonic_start_ns
+        + index * spacing_seconds * 1_000_000_000
+        + 500_000_000
+    )
     risex_market = _fixture_market(Venue.RISEX, "BTC/USDC")
     lighter_market = _fixture_market(Venue.LIGHTER, "BTC")
     source_risex = _fixture_book(Venue.RISEX, base - 100_000_000, 1)
@@ -2380,7 +2385,13 @@ def _fixture_attempt(
         )
         end = base + 125_000_000_000
     else:
-        close_bid = "97" if kind == "negative" else "99"
+        close_bid = (
+            "97"
+            if kind == "negative"
+            else "97.03"
+            if kind == "stress_boundary"
+            else "99"
+        )
         events = (
             CausalEvent.from_trade(_fixture_trade(f"{version.version_id}-entry", base + 1_100_000_000, "1.00", "102", aggressor=Side.BUY)),
             *common,
@@ -2399,6 +2410,41 @@ def _fixture_attempt(
     )
 
 
+def _fixture_attempt_with_shared_entry_maker(
+    attempt: CycleAttempt,
+    *,
+    group_key: str,
+) -> CycleAttempt:
+    """Give one fixture entry a valid maker-order bridge for grouping tests.
+
+    The trade event, trade ID, and taker order remain unique.  Only the
+    maker-order component is shared, which exercises the report's transitive
+    dependence grouping without reusing a trade event or bypassing the
+    kernel's identity barriers.
+    """
+
+    if not attempt.events or not isinstance(attempt.events[0], CausalEvent):
+        raise RuntimeError("grouped S3 fixture requires a causal entry trade")
+    entry = attempt.events[0]
+    trade = entry.trade
+    if trade is None or trade.taker_order_id is None:
+        raise RuntimeError("grouped S3 fixture requires a complete entry identity")
+    shared_maker_order_id = "0x" + hashlib.sha256(
+        ("s3-fixture-maker-group:" + group_key).encode()
+    ).hexdigest()[:48]
+    source_trade_id = f"{shared_maker_order_id}-{trade.taker_order_id}"
+    grouped_trade = replace(
+        trade,
+        trade_event_key=f"RISEX|BTC|{source_trade_id}",
+        source_trade_id=source_trade_id,
+        maker_order_id=shared_maker_order_id,
+    )
+    return replace(
+        attempt,
+        events=(CausalEvent.from_trade(grouped_trade), *attempt.events[1:]),
+    )
+
+
 def fixture_cycle_attempts(
     window: CycleWindow,
     *,
@@ -2408,8 +2454,21 @@ def fixture_cycle_attempts(
     """Return deterministic typed attempts used by offline S3 evidence tests."""
 
     _positive_int(count, "count")
-    if profile not in {"mixed", "normal", "negative", "forced", "unresolved", "terminal_conflict"}:
-        raise ValueError("fixture profile must be mixed, normal, negative, forced, unresolved, or terminal_conflict")
+    if profile not in {
+        "mixed",
+        "normal",
+        "negative",
+        "forced",
+        "unresolved",
+        "terminal_conflict",
+        "duplicate_group",
+        "stress_boundary",
+        "without_best_boundary",
+    }:
+        raise ValueError(
+            "fixture profile must be mixed, normal, negative, forced, unresolved, "
+            "terminal_conflict, duplicate_group, stress_boundary, or without_best_boundary"
+        )
     kinds = {
         "normal": "normal",
         "negative": "negative",
@@ -2417,14 +2476,41 @@ def fixture_cycle_attempts(
         "unresolved": "unresolved",
     }
     result: list[CycleAttempt] = []
+    # The historical six/seven-cycle fixtures intentionally leave wide gaps
+    # between attempts.  Boundary fixtures with twenty cycles must still fit
+    # inside the fixed pre-cutoff interval, so use a deterministic shorter
+    # spacing only for those larger offline inputs.
+    spacing_seconds = 400 if count <= 7 else 120
     for index in range(count):
         if profile == "mixed":
             kind = ("normal", "negative", "forced", "unresolved")[index % 4]
         elif profile == "terminal_conflict":
             kind = "normal"
+        elif profile == "duplicate_group":
+            kind = "normal"
+        elif profile == "stress_boundary":
+            kind = "stress_boundary"
+        elif profile == "without_best_boundary":
+            kind = "normal" if index == 0 else "negative"
         else:
             kind = kinds[profile]
-        result.append(_fixture_attempt(window=window, index=index, kind=kind))
+        attempt = _fixture_attempt(
+            window=window,
+            index=index,
+            kind=kind,
+            spacing_seconds=spacing_seconds,
+        )
+        if profile == "duplicate_group" and index in {0, 1}:
+            attempt = _fixture_attempt_with_shared_entry_maker(
+                attempt,
+                group_key="duplicate-group",
+            )
+        elif profile == "without_best_boundary" and index == 0:
+            attempt = _fixture_attempt_with_shared_entry_maker(
+                attempt,
+                group_key="without-best-boundary",
+            )
+        result.append(attempt)
     if profile == "terminal_conflict":
         if count < 2:
             raise ValueError("terminal_conflict fixture requires at least two cycles")

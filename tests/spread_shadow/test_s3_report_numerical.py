@@ -156,16 +156,19 @@ def _synthetic_observed_campaign(
     *,
     profiles: tuple[str, str, str, str],
     count: int,
+    window_counts: tuple[int, int, int, int] | None = None,
     failed_index: int | None = None,
 ) -> dict[str, object]:
     windows = fixture_campaign_windows(campaign_id=f"synthetic-{root.name}")
-    for index, (window, profile) in enumerate(zip(windows, profiles)):
+    counts = (count, count, count, count) if window_counts is None else window_counts
+    assert len(profiles) == len(windows) == len(counts)
+    for index, (window, profile, window_count) in enumerate(zip(windows, profiles, counts)):
         output = run_fixture_window(
             root,
             accepted_release=ACCEPTED_RELEASE,
             window=window,
             fixture_profile=profile,
-            count=count,
+            count=window_count,
             claim=False,
         )
         _mark_synthetic_observed(output.store_path, failed=index == failed_index)
@@ -392,3 +395,188 @@ def test_normal_fixture_provenance_cannot_become_campaign_qualification(tmp_path
     assert report["campaign_complete"] is False
     assert report["usefulness"]["label"] == "FIXTURE_ONLY"
     assert report["usefulness"]["campaign_qualification"] == "FIXTURE_ONLY"
+
+
+def test_twenty_complete_cycles_with_nineteen_filled_groups_fail_only_group_floor(
+    tmp_path: Path,
+) -> None:
+    report = _synthetic_observed_campaign(
+        tmp_path / "group-floor-boundary",
+        profiles=("duplicate_group", "normal", "normal", "normal"),
+        count=7,
+        window_counts=(7, 7, 5, 1),
+    )
+
+    primary = report["economics"]["primary"]
+    assert report["campaign_complete"] is True
+    assert report["measurement_validity"] == "VALID"
+    assert report["evidence_sufficiency"] == "INSUFFICIENT"
+    assert primary["complete_cycle_count"] == 20
+    assert primary["filled_entry_dependence_group_count"] == 19
+    assert sum(
+        window["primary"]["complete_cycle_count"] >= 5
+        for window in report["windows"]
+    ) == 3
+    assert report["robustness"] == {
+        "campaign_shape_pass": True,
+        "floors_pass": False,
+        "primary_positive_each_day": True,
+        "aggregate_stress_positive": True,
+        "primary_without_best_dependence_group_positive": True,
+        "pass": False,
+        "screen_eligible": False,
+    }
+    assert report["usefulness"]["label"] == "INCOMPLETE_CAMPAIGN"
+
+
+def test_twenty_two_cycles_in_only_two_qualifying_windows_fail_window_floor(
+    tmp_path: Path,
+) -> None:
+    report = _synthetic_observed_campaign(
+        tmp_path / "window-floor-boundary",
+        profiles=("normal", "normal", "normal", "normal"),
+        count=7,
+        window_counts=(10, 1, 10, 1),
+    )
+
+    primary = report["economics"]["primary"]
+    assert report["campaign_complete"] is True
+    assert report["measurement_validity"] == "VALID"
+    assert report["evidence_sufficiency"] == "INSUFFICIENT"
+    assert primary["complete_cycle_count"] == 22
+    assert primary["filled_entry_dependence_group_count"] == 22
+    assert sum(
+        window["primary"]["complete_cycle_count"] >= 5
+        for window in report["windows"]
+    ) == 2
+    assert len(
+        {
+            window["day"]
+            for window in report["windows"]
+            if window["primary"]["complete_cycle_count"] >= 5
+        }
+    ) == 2
+    assert report["robustness"]["campaign_shape_pass"] is True
+    assert report["robustness"]["floors_pass"] is False
+    assert report["robustness"]["primary_positive_each_day"] is True
+    assert report["robustness"]["aggregate_stress_positive"] is True
+    assert report["robustness"]["primary_without_best_dependence_group_positive"] is True
+    assert report["robustness"]["pass"] is False
+
+
+def test_nonpositive_aggregate_stress_blocks_screen_when_other_economics_pass(
+    tmp_path: Path,
+) -> None:
+    report = _synthetic_observed_campaign(
+        tmp_path / "stress-boundary",
+        profiles=("stress_boundary",) * 4,
+        count=7,
+    )
+
+    close_bid = Decimal("97.03")
+    expected_primary_per_cycle = (
+        Decimal("100.989900") - Decimal("100") - Decimal("98.009800") + close_bid
+    )
+    expected_stress_per_cycle = (
+        Decimal("100.979800") - Decimal("100") - Decimal("98.019600") + close_bid
+    )
+    primary = report["economics"]["primary"]
+    stress = report["economics"]["stress"]
+    assert Decimal(primary["total_pnl_usd"]) == expected_primary_per_cycle * 28
+    assert Decimal(stress["total_pnl_usd"]) == expected_stress_per_cycle * 28
+    assert expected_primary_per_cycle > ZERO
+    assert expected_stress_per_cycle < ZERO
+    assert report["evidence_sufficiency"] == "SUFFICIENT"
+    assert report["robustness"] == {
+        "campaign_shape_pass": True,
+        "floors_pass": True,
+        "primary_positive_each_day": True,
+        "aggregate_stress_positive": False,
+        "primary_without_best_dependence_group_positive": True,
+        "pass": False,
+        "screen_eligible": True,
+    }
+    assert report["usefulness"]["label"] == "DESCRIPTIVE_CAMPAIGN_SCREEN_FAIL"
+
+
+def test_nonpositive_without_best_group_blocks_screen_when_other_economics_pass(
+    tmp_path: Path,
+) -> None:
+    report = _synthetic_observed_campaign(
+        tmp_path / "without-best-boundary",
+        profiles=("without_best_boundary",) * 4,
+        count=7,
+        window_counts=(6, 6, 6, 5),
+    )
+
+    normal_primary = (
+        Decimal("100.989900") - Decimal("100") - Decimal("98.009800") + Decimal("99")
+    )
+    negative_primary = (
+        Decimal("100.989900") - Decimal("100") - Decimal("98.009800") + Decimal("97")
+    )
+    normal_stress = (
+        Decimal("100.979800") - Decimal("100") - Decimal("98.019600") + Decimal("99")
+    )
+    negative_stress = (
+        Decimal("100.979800") - Decimal("100") - Decimal("98.019600") + Decimal("97")
+    )
+    expected_primary = normal_primary * 4 + negative_primary * 19
+    expected_stress = normal_stress * 4 + negative_stress * 19
+    primary = report["economics"]["primary"]
+    stress = report["economics"]["stress"]
+    assert primary["complete_cycle_count"] == 23
+    assert primary["filled_entry_dependence_group_count"] == 20
+    assert Decimal(primary["total_pnl_usd"]) == expected_primary
+    assert Decimal(stress["total_pnl_usd"]) == expected_stress
+    assert Decimal(primary["total_without_best_dependence_group_usd"]) == negative_primary * 19
+    assert expected_primary > ZERO
+    assert expected_stress > ZERO
+    assert negative_primary * 19 <= ZERO
+    assert report["evidence_sufficiency"] == "SUFFICIENT"
+    assert report["robustness"] == {
+        "campaign_shape_pass": True,
+        "floors_pass": True,
+        "primary_positive_each_day": True,
+        "aggregate_stress_positive": True,
+        "primary_without_best_dependence_group_positive": False,
+        "pass": False,
+        "screen_eligible": True,
+    }
+    assert report["usefulness"]["label"] == "DESCRIPTIVE_CAMPAIGN_SCREEN_FAIL"
+
+
+def test_unresolved_fourth_window_blocks_positive_three_window_prefix_screen(
+    tmp_path: Path,
+) -> None:
+    report = _synthetic_observed_campaign(
+        tmp_path / "unresolved-fourth-window",
+        profiles=("normal", "normal", "normal", "unresolved"),
+        count=7,
+        window_counts=(7, 7, 7, 1),
+    )
+
+    primary = report["economics"]["primary"]
+    stress = report["economics"]["stress"]
+    assert report["campaign_complete"] is True
+    assert report["measurement_validity"] == "VALID"
+    assert report["evidence_sufficiency"] == "INSUFFICIENT"
+    assert primary["complete_cycle_count"] == 21
+    assert primary["filled_entry_dependence_group_count"] == 21
+    assert primary["unresolved_count"] == 1
+    assert stress["unresolved_count"] == 1
+    assert sum(
+        window["primary"]["complete_cycle_count"] >= 5
+        for window in report["windows"]
+    ) == 3
+    assert report["robustness"] == {
+        "campaign_shape_pass": True,
+        "floors_pass": True,
+        "primary_positive_each_day": True,
+        "aggregate_stress_positive": True,
+        "primary_without_best_dependence_group_positive": True,
+        "pass": False,
+        "screen_eligible": False,
+    }
+    assert report["usefulness"]["label"] == "INCOMPLETE_CAMPAIGN"
+    assert report["usefulness"]["campaign_qualification"] == "INSUFFICIENT"
