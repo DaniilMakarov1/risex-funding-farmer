@@ -9,20 +9,24 @@ import tracemalloc
 import pytest
 
 from risex_farmer.models import Venue
-from risex_spread_shadow.cycle import CycleScenario, CycleTerminalState
+from risex_spread_shadow.cycle import CycleClock, CycleScenario, CycleTerminalState
 from risex_spread_shadow.feed import FeedBookEvent, IngressQueue, MarketPair
 from risex_spread_shadow.models import BookEvidence
+import risex_spread_shadow.s3_cycle as s3_cycle_module
 from risex_spread_shadow.s3_cycle import (
     CycleCampaignManifest,
     CycleEnvelope,
+    CycleEvidenceIntegrityError,
     CycleEnvelopeLimitError,
     CycleRunDriver,
     CycleWindow,
+    PublicCycleProducer,
     build_cycle_report,
     cycle_policy_fingerprint,
     fixture_campaign_windows,
     fixture_cycle_attempts,
     run_public_cycle_collection,
+    run_fixture_window,
     _fixture_book,
     _fixture_market,
 )
@@ -688,3 +692,127 @@ def test_s3_retention_bound_supports_dense_complete_lanes_without_halt() -> None
     assert len(results) == cycles * 2
     assert all(result.status is CycleTerminalState.ABORTED for result in results)
     assert all(result.is_flat for result in results)
+
+
+def test_live_stream_and_attempt_bookkeeping_retain_only_bounded_diagnostics() -> None:
+    window = fixture_campaign_windows(campaign_id="bounded-live-bookkeeping")[0]
+    streaming = CycleRunDriver(window, persist=False, streaming=True)
+    for index in range(10_000):
+        streaming.accept_global_input(CycleClock(index))
+
+    assert not hasattr(streaming, "_stream_inputs")
+    assert streaming._stream_input_count == 10_000
+
+    producer = PublicCycleProducer(streaming, PAIR)
+    for index in range(10_000):
+        producer.accept_clock(index)
+    assert len(producer.processed_items) == 256
+    assert producer.processed_items[:4] == [
+        "CLOCK:0",
+        "CLOCK:1",
+        "CLOCK:2",
+        "CLOCK:3",
+    ]
+
+    attempt = fixture_cycle_attempts(window, count=1, profile="normal")[0]
+    non_streaming = CycleRunDriver(window, persist=False)
+    non_streaming.admit_decision(0, attempt.quote_version, source_books=attempt.source_books)
+    decision_ns = attempt.quote_version.decision_ready_monotonic_ns or 0
+    for index in range(10_000):
+        non_streaming.accept_input(0, CycleClock(decision_ns + index))
+    state = non_streaming._decisions[0]
+    assert not hasattr(state, "inputs")
+    assert state.input_count == 10_000
+    assert isinstance(state.last_input, CycleClock)
+
+
+def test_evicted_full_book_keeps_active_duplicate_conflict_identity() -> None:
+    window = fixture_campaign_windows(campaign_id="bounded-book-identity")[0]
+    attempt = fixture_cycle_attempts(window, count=1, profile="normal")[0]
+    source = attempt.source_books[0]
+    b1 = replace(
+        source,
+        book_revision=101,
+        received_monotonic_ns=700_000_000,
+        ingress_received_monotonic_ns=700_000_000,
+        normalized_ready_monotonic_ns=700_000_000,
+        decision_ready_monotonic_ns=700_000_000,
+    )
+    b2 = replace(
+        source,
+        book_revision=102,
+        received_monotonic_ns=800_000_000,
+        ingress_received_monotonic_ns=800_000_000,
+        normalized_ready_monotonic_ns=800_000_000,
+        decision_ready_monotonic_ns=800_000_000,
+    )
+
+    duplicate_driver = CycleRunDriver(window, persist=False, streaming=True)
+    duplicate_driver.admit_decision(0, attempt.quote_version, source_books=attempt.source_books)
+    for book in (b1, b2, b1):
+        duplicate_driver.accept_global_input(book)
+    duplicate = duplicate_driver.kernel.snapshot(CycleScenario.PRIMARY)
+    assert duplicate is not None and duplicate.entry_measurement is not None
+    assert duplicate.status is CycleTerminalState.PENDING
+    assert duplicate.entry_measurement.duplicate_event_count == 1
+    assert duplicate.reason_codes == ()
+
+    conflict_driver = CycleRunDriver(window, persist=False, streaming=True)
+    conflict_driver.admit_decision(0, attempt.quote_version, source_books=attempt.source_books)
+    for book in (b1, b2, replace(b1, fresh=False)):
+        conflict_driver.accept_global_input(book)
+    conflict = conflict_driver.kernel.snapshot(CycleScenario.PRIMARY)
+    assert conflict is not None
+    assert conflict.status is CycleTerminalState.UNRESOLVED
+    assert "DUPLICATE_CONFLICT" in conflict.reason_codes
+
+
+def test_initial_source_book_repeat_keeps_exact_quote_witness_validation() -> None:
+    window = fixture_campaign_windows(campaign_id="initial-book-witness")[0]
+    attempt = fixture_cycle_attempts(window, count=1, profile="normal")[0]
+    changed_source = replace(
+        attempt.source_books[0],
+        received_monotonic_ns=700_000_000,
+        ingress_received_monotonic_ns=700_000_000,
+        normalized_ready_monotonic_ns=700_000_000,
+        decision_ready_monotonic_ns=700_000_000,
+    )
+
+    driver = CycleRunDriver(window, persist=False, streaming=True)
+    driver.admit_decision(0, attempt.quote_version, source_books=attempt.source_books)
+    driver.accept_global_input(changed_source)
+
+    result = driver.kernel.snapshot(CycleScenario.PRIMARY)
+    assert result is not None and result.entry_measurement is not None
+    assert result.status is CycleTerminalState.UNRESOLVED
+    assert "REQUIRED_ACTION_AMBIGUOUS" in result.reason_codes
+    assert result.entry_measurement.duplicate_event_count == 0
+
+
+def test_replay_binds_exact_content_across_bounded_file_passes(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    output = run_fixture_window(
+        tmp_path,
+        accepted_release=ACCEPTED_RELEASE,
+        window=fixture_campaign_windows(campaign_id="replay-pass-binding")[0],
+        fixture_profile="normal",
+        count=1,
+        claim=False,
+    )
+    original_iter_records = s3_cycle_module.iter_records
+    pass_number = 0
+
+    def altered_second_pass(path: Path):
+        nonlocal pass_number
+        pass_number += 1
+        for record in original_iter_records(path):
+            if pass_number == 2 and record.get("kind") == "CYCLE_FINAL_RESULT":
+                record = {**record, "replay_only_mutation": True}
+            yield record
+
+    monkeypatch.setattr(s3_cycle_module, "iter_records", altered_second_pass)
+    with pytest.raises(CycleEvidenceIntegrityError, match="changed during bounded replay"):
+        build_cycle_report(output.store_path)
+    assert pass_number == 2

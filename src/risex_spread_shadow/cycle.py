@@ -16,6 +16,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_FLOOR
 from enum import StrEnum
+import hashlib
 from typing import Any
 
 from risex_farmer.economics import exact_quantity_vwap
@@ -81,6 +82,20 @@ def _session(value: str | int, name: str = "stream_session_id") -> None:
         raise TypeError(f"{name} must be str or int")
     if isinstance(value, str) and not value:
         raise ValueError(f"{name} must be non-empty")
+
+
+def _canonical_decimal_text(value: Decimal) -> str:
+    """Render a Decimal without changing its exact numeric value.
+
+    The previous in-memory identity signature compared Decimal values, so
+    ``1``, ``1.0`` and ``1.00`` were equal.  A text digest must retain that
+    equality without applying arithmetic or the active Decimal context.
+    """
+
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return "0" if text in {"", "-0"} else text
 
 
 class CycleScenario(StrEnum):
@@ -831,6 +846,10 @@ class _MutableCycle:
     scheduled_takers: dict[str, tuple[Venue, Side, Decimal, str]] = field(default_factory=dict)
     reasons: list[str] = field(default_factory=list)
     books: list[_BookObservation] = field(default_factory=list)
+    book_identity_keys: set[tuple[Any, ...]] = field(default_factory=set)
+    initial_book_signatures: dict[tuple[Any, ...], tuple[Any, ...]] = field(default_factory=dict)
+    displaced_book_venues: set[Venue] = field(default_factory=set)
+    entry_block_fence: int | None = None
     gaps: list[DataGapEvidence] = field(default_factory=list)
     seen_events: dict[tuple[Any, ...], tuple[Any, ...]] = field(default_factory=dict)
     last_stream_time: dict[tuple[Any, ...], int] = field(default_factory=dict)
@@ -952,8 +971,7 @@ def _event_signature(event: CausalEvent) -> tuple[Any, ...]:
         )
     elif isinstance(payload, BookEvidence):
         payload_value = (
-            tuple((level.canonical_price, level.canonical_quantity) for level in payload.bids),
-            tuple((level.canonical_price, level.canonical_quantity) for level in payload.asks),
+            _book_signature(payload)[-1],
             payload.sequence,
             payload.checksum,
             payload.sequence_valid,
@@ -984,6 +1002,12 @@ def _stream_position(event: CausalEvent) -> tuple[int, ...] | None:
     if event.venue is Venue.LIGHTER and event.sequence is not None:
         return (event.sequence,)
     return None
+
+
+def _event_identity_key(event: CausalEvent) -> tuple[Any, ...] | None:
+    if event.stream_key is None or event.event_id is None:
+        return None
+    return event.stream_key, event.event_id
 
 
 def _trade_crosses(quote: CausalRestingQuote, trade: TradeEvidence) -> tuple[bool, bool]:
@@ -1028,6 +1052,17 @@ def _minimum_ok(cycle: _MutableCycle, venue: Venue, quantity: Decimal, price: De
 
 
 def _book_signature(book: BookEvidence) -> tuple[Any, ...]:
+    level_payload = (
+        tuple(
+            (_canonical_decimal_text(level.canonical_price), _canonical_decimal_text(level.canonical_quantity))
+            for level in book.bids
+        ),
+        tuple(
+            (_canonical_decimal_text(level.canonical_price), _canonical_decimal_text(level.canonical_quantity))
+            for level in book.asks
+        ),
+    )
+    content_digest = hashlib.sha256(repr(level_payload).encode("utf-8")).hexdigest()
     return (
         book.venue,
         book.canonical_market,
@@ -1040,8 +1075,7 @@ def _book_signature(book: BookEvidence) -> tuple[Any, ...]:
         book.checksum_valid,
         book.fresh,
         book.received_monotonic_ns,
-        tuple((level.canonical_price, level.canonical_quantity) for level in book.bids),
-        tuple((level.canonical_price, level.canonical_quantity) for level in book.asks),
+        content_digest,
     )
 
 
@@ -1149,10 +1183,11 @@ def _select_book(cycle: _MutableCycle, venue: Venue, due_ns: int) -> tuple[BookE
     venue_candidates = [
         observation
         for observation in cycle.books
-        if observation.book.venue is venue and observation.book.canonical_market == cycle.quote_version.canonical_market
+        if observation.book.venue is venue
+        and observation.book.canonical_market == cycle.quote_version.canonical_market
     ]
     if not candidates:
-        if venue_candidates:
+        if venue_candidates or venue in cycle.displaced_book_venues:
             return None, CycleReason.REQUIRED_ACTION_SESSION_DISPLACED
         return None, CycleReason.REQUIRED_ACTION_DATA_MISSING
     candidates.sort(
@@ -2388,6 +2423,17 @@ class CycleKernel:
         key = event.stream_key
         identity_key = None if key is None or event.event_id is None else (key, event.event_id)
         signature = _event_signature(event)
+        initial_signature = (
+            cycle.initial_book_signatures.get(identity_key)
+            if event.kind is CausalEventKind.BOOK and identity_key is not None
+            else None
+        )
+        if initial_signature is not None and identity_key not in cycle.seen_events:
+            assert event.book is not None
+            if _book_signature(event.book) != initial_signature:
+                cycle.add_reason(CycleReason.REQUIRED_ACTION_AMBIGUOUS)
+                self._halt(cycle, CycleReason.REQUIRED_ACTION_AMBIGUOUS)
+                return
         if identity_key is not None:
             previous = cycle.seen_events.get(identity_key)
             if previous is not None:
@@ -2446,11 +2492,139 @@ class CycleKernel:
         if ready > cycle.current_ns:
             self._run_due_until(cycle, ready)
 
+    @staticmethod
+    def _expected_book_stream(
+        cycle: _MutableCycle,
+        venue: Venue,
+    ) -> tuple[str | int | None, int | None]:
+        if venue is Venue.RISEX:
+            return cycle.quote_version.stream_session_id, cycle.quote_version.recovery_generation
+        return cycle.quote_version.hedge_stream_session_id, cycle.quote_version.hedge_recovery_generation
+
+    @staticmethod
+    def _book_is_temporal(observation: _BookObservation, due_ns: int) -> bool:
+        return (
+            observation.processing_ready_ns is not None
+            and observation.processing_ready_ns <= due_ns
+            and observation.book.received_monotonic_ns <= due_ns
+        )
+
+    def _compact_books(self, cycle: _MutableCycle) -> None:
+        """Retain only the book witnesses that a future boundary can use.
+
+        ``advance`` processes every due boundary before returning to its
+        caller.  Consequently, for each expected stream the next boundary
+        needs at most the latest book already temporal at that boundary and
+        the latest book overall (which may still be future at that boundary).
+        A displaced stream is represented by a venue flag; it never needs a
+        depth-bearing payload for action selection.
+        """
+
+        if cycle.phase in {_Phase.COMPLETE, _Phase.ABORTED, _Phase.UNRESOLVED}:
+            return
+        next_due = self._next_due(cycle)
+        retained_by_object: dict[int, _BookObservation] = {}
+        for venue in (Venue.RISEX, Venue.LIGHTER):
+            expected_session, expected_recovery = self._expected_book_stream(cycle, venue)
+            candidates: list[_BookObservation] = []
+            for observation in cycle.books:
+                book = observation.book
+                if book.venue is not venue or book.canonical_market != cycle.quote_version.canonical_market:
+                    continue
+                if (
+                    expected_session is None
+                    or expected_recovery is None
+                    or book.stream_session_id != expected_session
+                    or book.recovery_generation != expected_recovery
+                ):
+                    cycle.displaced_book_venues.add(venue)
+                    continue
+                candidates.append(observation)
+            if not candidates:
+                continue
+            candidates.sort(
+                key=lambda observation: (
+                    observation.book.received_monotonic_ns,
+                    observation.processing_ready_ns if observation.processing_ready_ns is not None else -1,
+                    observation.book.book_revision,
+                    observation.arrival_index,
+                )
+            )
+            latest = candidates[-1]
+            retained_by_object[id(latest)] = latest
+            if next_due is not None:
+                temporal = [
+                    observation
+                    for observation in candidates
+                    if self._book_is_temporal(observation, next_due)
+                ]
+                if temporal:
+                    retained_by_object[id(temporal[-1])] = temporal[-1]
+        cycle.books = sorted(retained_by_object.values(), key=lambda observation: observation.arrival_index)
+        # Keep the compact identity digest for every book accepted during an
+        # active cycle.  The digest is the exact duplicate/conflict witness;
+        # dropping it when its full payload is evicted would silently turn a
+        # later conflicting revision into a new book.  Only the depth-bearing
+        # ``BookEvidence`` object is compacted above.  Terminal latching
+        # releases these compact book identities once no active decision can
+        # encounter them.
+
+    @staticmethod
+    def _release_book_payloads(cycle: _MutableCycle) -> None:
+        """Release non-result book payloads once no action can use them."""
+
+        cycle.books.clear()
+        for key in cycle.book_identity_keys:
+            cycle.seen_events.pop(key, None)
+        cycle.book_identity_keys.clear()
+        cycle.initial_book_signatures.clear()
+        cycle.displaced_book_venues.clear()
+
     def _record_book(self, cycle: _MutableCycle, event: CausalEvent, *, initial: bool = False) -> None:
         book = event.book
         assert book is not None
+        if book.canonical_market != cycle.quote_version.canonical_market:
+            return
+        expected_session, expected_recovery = self._expected_book_stream(cycle, book.venue)
+        if (
+            book.venue not in {Venue.RISEX, Venue.LIGHTER}
+            or expected_session is None
+            or expected_recovery is None
+            or book.stream_session_id != expected_session
+            or book.recovery_generation != expected_recovery
+        ):
+            identity_key = _event_identity_key(event)
+            if identity_key is not None:
+                # The event-level digest was admitted before this stream
+                # displacement was classified. Track its key so terminal
+                # release removes the compact witness as well.
+                cycle.book_identity_keys.add(identity_key)
+            if book.venue in {Venue.RISEX, Venue.LIGHTER}:
+                cycle.displaced_book_venues.add(book.venue)
+            return
         key = book.book_revision_id
         signature = _book_signature(book)
+        identity_key = _event_identity_key(event)
+        if identity_key is not None:
+            cycle.book_identity_keys.add(identity_key)
+            if initial:
+                previous = cycle.initial_book_signatures.get(identity_key)
+                if previous is not None:
+                    if previous != signature:
+                        cycle.add_reason(CycleReason.REQUIRED_ACTION_AMBIGUOUS)
+                        self._halt(cycle, CycleReason.REQUIRED_ACTION_AMBIGUOUS)
+                    else:
+                        cycle.duplicate_event_count += 1
+                        cycle.ignored_event_count += 1
+                    return
+                cycle.initial_book_signatures[identity_key] = signature
+            elif identity_key in cycle.initial_book_signatures:
+                # The first live repeat was validated against the exact
+                # source witness above.  Keep the original duplicate path
+                # even after its depth-bearing payload has been compacted.
+                cycle.duplicate_event_count += 1
+                cycle.ignored_event_count += 1
+                return
         for existing in cycle.books:
             if existing.book.book_revision_id == key:
                 if _book_signature(existing.book) != signature:
@@ -2469,8 +2643,14 @@ class CycleKernel:
                 identity_complete=event.source_identity_complete and event.identity_metadata_consistent,
             )
         )
+        if (
+            book.venue is Venue.RISEX
+            and book.book_revision_id == cycle.quote_version.risex_book_revision_id
+        ):
+            cycle.entry_block_fence = book.block_number
         if not initial and not event.source_identity_complete and self._action_is_live(cycle):
             cycle.add_reason(CycleReason.REQUIRED_ACTION_AMBIGUOUS)
+        self._compact_books(cycle)
 
     def _trade_could_matter(self, cycle: _MutableCycle, event: CausalEvent) -> bool:
         return event.venue is Venue.RISEX and event.canonical_market == cycle.quote_version.canonical_market and cycle.phase in {
@@ -2678,11 +2858,7 @@ class CycleKernel:
                 cycle.ignored_event_count += 1
                 cycle.entry_decisions.append(CausalEventDecision(event.kind, event.event_id, event.ingress_received_monotonic_ns, "IGNORED", "NOT_TRADE_THROUGH_QUOTE_PRICE" if not crosses else "QUOTE_QUANTITY_EXHAUSTED"))
                 return
-            block_fence = None
-            for observation in cycle.books:
-                if observation.book.venue is Venue.RISEX and observation.book.book_revision_id == cycle.quote_version.risex_book_revision_id:
-                    block_fence = observation.book.block_number
-                    break
+            block_fence = cycle.entry_block_fence
             if block_fence is not None and (event.block_number is None or event.block_number <= block_fence):
                 cycle.add_reason(CycleReason.ENTRY_CAUSAL_UNCERTAINTY)
                 cycle.entry_uncertainty.append(CausalUncertainty.WATERMARK_BOUNDARY_AMBIGUOUS.value)
@@ -2933,6 +3109,7 @@ class CycleKernel:
             cycle.current_ns = due
             self._handle_boundary(cycle, due)
         cycle.current_ns = max(cycle.current_ns, target_ns)
+        self._compact_books(cycle)
 
     def _next_due(self, cycle: _MutableCycle) -> int | None:
         if cycle.phase is _Phase.ENTRY_WAIT:
@@ -3464,6 +3641,7 @@ class CycleKernel:
             lane.terminal_cycles.append(cycle)
         lane.terminal_cycle = cycle
         lane.active = None
+        self._release_book_payloads(cycle)
 
 
 def run_cycle(

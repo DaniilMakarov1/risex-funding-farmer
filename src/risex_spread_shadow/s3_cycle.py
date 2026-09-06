@@ -124,6 +124,9 @@ S3_REQUIRED_COMPLETE_CYCLES = 20
 S3_REQUIRED_FILLED_GROUPS = 20
 S3_REQUIRED_WINDOWS_WITH_CYCLES = 3
 S3_REQUIRED_CYCLES_PER_QUALIFYING_WINDOW = 5
+# These are local diagnostics only.  The append-only evidence stream remains
+# the complete source of causal input/order history.
+_S3_DIAGNOSTIC_RETENTION_CAP = 256
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{40}$")
 _HEX256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -1444,7 +1447,8 @@ class _DecisionState:
     quote_version: QuoteVersion
     source_books: tuple[BookEvidence, ...]
     admissions: dict[CycleScenario, CycleAdmission]
-    inputs: list[CausalEvent | CycleClock]
+    input_count: int = 0
+    last_input: CausalEvent | CycleClock | None = None
     finished: bool = False
 
 
@@ -1482,8 +1486,13 @@ class CycleRunDriver:
         self.admissions: list[CycleAdmission] = []
         self.results: list[CycleResult] = []
         self.skipped: list[dict[str, Any]] = []
+        self.skipped_count = 0
+        self.skipped_reasons: set[str] = set()
         self._decisions: dict[int, _DecisionState] = {}
-        self._stream_inputs: list[CausalEvent | CycleClock] = []
+        # Persisted stream inputs are replayable evidence; retaining the live
+        # objects here duplicated the entire public stream in memory.  The
+        # record index only needs a monotonically increasing scalar.
+        self._stream_input_count = 0
         self._stream_ended = False
         self._finalized = False
         self._finalize_error: BaseException | None = None
@@ -1555,12 +1564,12 @@ class CycleRunDriver:
         self._write(
             {
                 "kind": "CYCLE_STREAM_INPUT",
-                "input_index": len(self._stream_inputs),
+                "input_index": self._stream_input_count,
                 "input": _input_to_dict(item),
                 "observed_monotonic_ns": observed,
             }
         )
-        self._stream_inputs.append(item)
+        self._stream_input_count += 1
         for scenario in CycleScenario:
             state = self.kernel.state(scenario)
             if isinstance(item, CycleClock):
@@ -1608,7 +1617,10 @@ class CycleRunDriver:
 
         _text(reason, "reason")
         observed = _non_negative_int(observed_monotonic_ns, "observed_monotonic_ns")
-        self.skipped.append({"reason": reason, "observed_monotonic_ns": observed})
+        self._remember_skip(
+            {"reason": reason, "observed_monotonic_ns": observed},
+            reason=reason,
+        )
         self._write(
             {
                 "kind": "CYCLE_SIGNAL_SKIPPED",
@@ -1616,6 +1628,13 @@ class CycleRunDriver:
                 "observed_monotonic_ns": observed,
             }
         )
+
+    def _remember_skip(self, detail: dict[str, Any], *, reason: str | None) -> None:
+        self.skipped_count += 1
+        if reason is not None and len(self.skipped_reasons) < _S3_DIAGNOSTIC_RETENTION_CAP:
+            self.skipped_reasons.add(reason)
+        if len(self.skipped) < _S3_DIAGNOSTIC_RETENTION_CAP:
+            self.skipped.append(detail)
 
     def _skip_reason(self, version: QuoteVersion, source_books: tuple[BookEvidence, ...]) -> str | None:
         decision = version.decision_ready_monotonic_ns
@@ -1696,9 +1715,19 @@ class CycleRunDriver:
                 self.admissions.append(admission)
                 self._write(self._admission_payload(attempt_index, admission))
                 if not admission.accepted:
-                    self.skipped.append({"attempt_index": attempt_index, "scenario": scenario.value, "reason": admission.reason})
+                    self._remember_skip(
+                        {
+                            "attempt_index": attempt_index,
+                            "scenario": scenario.value,
+                            "reason": admission.reason,
+                        },
+                        reason=admission.reason,
+                    )
         else:
-            self.skipped.append({"attempt_index": attempt_index, "reason": skip})
+            self._remember_skip(
+                {"attempt_index": attempt_index, "reason": skip},
+                reason=skip,
+            )
             for scenario in CycleScenario:
                 admission = CycleAdmission(False, scenario, quote_version.version_id, quote_version.decision_ready_monotonic_ns, skip)
                 admissions[scenario] = admission
@@ -1708,9 +1737,12 @@ class CycleRunDriver:
         self._decisions[attempt_index] = _DecisionState(
             attempt_index=attempt_index,
             quote_version=quote_version,
-            source_books=books,
+            # The decision witnesses are durably written above and are
+            # already retained by the kernel only as long as a future action
+            # can use them.  Keeping another full-depth tuple here would
+            # duplicate every decision's payload across a long stream.
+            source_books=(),
             admissions=admissions,
-            inputs=[],
             # A rejected alternative must not close a decision whose sibling
             # was admitted.  In streaming mode the accepted lane continues
             # through the global input path while the rejected lane remains
@@ -1763,12 +1795,13 @@ class CycleRunDriver:
             {
                 "kind": "CYCLE_INPUT",
                 "attempt_index": attempt_index,
-                "input_index": len(state.inputs),
+                "input_index": state.input_count,
                 "input": _input_to_dict(item),
                 "observed_monotonic_ns": observed,
             }
         )
-        state.inputs.append(item)
+        state.input_count += 1
+        state.last_input = item
         for scenario, admission in state.admissions.items():
             if admission.accepted:
                 if isinstance(item, CycleClock) and self.kernel.state(scenario) is not CycleKernelState.PENDING:
@@ -1788,7 +1821,11 @@ class CycleRunDriver:
         end_ns = self.window.deadline_monotonic_ns if end_monotonic_ns is None else _non_negative_int(end_monotonic_ns, "end_monotonic_ns")
         if end_ns > self.window.deadline_monotonic_ns:
             raise CycleEvidenceIntegrityError("cycle end is after hard market deadline")
-        if not state.inputs or not isinstance(state.inputs[-1], CycleClock) or state.inputs[-1].at_monotonic_ns != end_ns:
+        if (
+            state.input_count == 0
+            or not isinstance(state.last_input, CycleClock)
+            or state.last_input.at_monotonic_ns != end_ns
+        ):
             self.advance_clock(attempt_index, end_ns)
         state.finished = True
         self._write({"kind": "CYCLE_END", "attempt_index": attempt_index, "skipped": False, "end_monotonic_ns": end_ns, "observed_monotonic_ns": end_ns})
@@ -1929,6 +1966,8 @@ class PublicCycleProducer:
         self._last_decision_ns: int | None = None
         self._last_input_ns = driver.window.monotonic_start_ns
         self._decision_serial = 0
+        # This is a bounded diagnostic prefix only.  Persisted
+        # CYCLE_STREAM_INPUT records are the authoritative complete order.
         self.processed_items: list[str] = []
         self._closed = False
 
@@ -1946,6 +1985,10 @@ class PublicCycleProducer:
 
     def _record_skip(self, reason: str, observed_ns: int) -> None:
         self.driver.record_signal_skip(reason=reason, observed_monotonic_ns=observed_ns)
+
+    def _remember_processed(self, value: str) -> None:
+        if len(self.processed_items) < _S3_DIAGNOSTIC_RETENTION_CAP:
+            self.processed_items.append(value)
 
     @staticmethod
     def _processing_ready(value: Any) -> int:
@@ -2117,7 +2160,7 @@ class PublicCycleProducer:
             if item.market_pair is not self.market_pair and item.market_pair != self.market_pair:
                 raise CycleEvidenceIntegrityError("public cycle received an unrelated market pair")
             book = item.book
-            self.processed_items.append(f"BOOK:{book.venue.value}:{book.book_revision}")
+            self._remember_processed(f"BOOK:{book.venue.value}:{book.book_revision}")
             ready_ns = self._deliver(book)
             self._latest[book.venue] = book
             self._maybe_decide(ready_ns)
@@ -2126,12 +2169,12 @@ class PublicCycleProducer:
             if item.market_pair is not self.market_pair and item.market_pair != self.market_pair:
                 raise CycleEvidenceIntegrityError("public cycle received an unrelated market pair")
             trade = item.trade
-            self.processed_items.append(f"TRADE:{trade.trade_event_key}")
+            self._remember_processed(f"TRADE:{trade.trade_event_key}")
             self._deliver(trade)
             return
         if isinstance(item, FeedGapEvent):
             gap = item.gap
-            self.processed_items.append(f"GAP:{gap.reason}:{gap.gap_start_monotonic_ns}")
+            self._remember_processed(f"GAP:{gap.reason}:{gap.gap_start_monotonic_ns}")
             self._deliver(gap)
             latest = self._latest.get(gap.source_venue)
             if latest is not None and gap.matches(
@@ -2146,7 +2189,7 @@ class PublicCycleProducer:
 
     def accept_clock(self, at_monotonic_ns: int) -> None:
         at_ns = _non_negative_int(at_monotonic_ns, "at_monotonic_ns")
-        self.processed_items.append(f"CLOCK:{at_ns}")
+        self._remember_processed(f"CLOCK:{at_ns}")
         self._deliver(CycleClock(at_ns))
 
     async def consume(self) -> None:
@@ -2969,14 +3012,15 @@ async def run_public_cycle_collection(
 @dataclass(frozen=True, slots=True)
 class _RunBundle:
     path: Path
+    run_id: str
     metadata: dict[str, Any]
-    attempts: tuple[CycleAttempt, ...]
     streaming: bool
-    stream_inputs: tuple[CausalEvent | CycleClock, ...]
-    admissions: tuple[dict[str, Any], ...]
-    signal_skips: tuple[dict[str, Any], ...]
-    results: tuple[dict[str, Any], ...]
-    replay_admissions: tuple[CycleAdmission, ...]
+    admission_count: int
+    rejected_admission_count: int
+    admission_reasons: tuple[str, ...]
+    signal_skip_count: int
+    signal_skip_reasons: tuple[str, ...]
+    results: tuple[str, ...]
     replay_results: tuple[CycleResult, ...]
     report_results: tuple[CycleResult, ...]
     resource_incomplete: bool
@@ -2988,23 +3032,59 @@ class _RunBundle:
 
 
 def _read_run(path: Path) -> _RunBundle:
-    records = list(iter_records(path))
-    if not records:
-        raise CycleEvidenceIntegrityError("S3 evidence is empty")
-    run_id = records[0].get("run_id")
-    if not isinstance(run_id, str) or not run_id:
-        raise CycleEvidenceIntegrityError("S3 evidence has no run identity")
-    for expected_index, record in enumerate(records):
-        if record.get("run_id") != run_id or record.get("record_index") != expected_index:
+    """Read, replay, and validate one run without materializing its JSONL file.
+
+    The evidence file is intentionally replayed in two bounded passes.  The
+    first pass validates physical identity and discovers the stream shape;
+    the second pass parses and replays one record at a time.  Only the
+    bounded kernel result retention and compact report inputs survive either
+    pass.
+    """
+
+    first_record: dict[str, Any] | None = None
+    run_id: str | None = None
+    terminal_record: dict[str, Any] | None = None
+    terminal_count = 0
+    record_count = 0
+    has_stream_input = False
+    has_stream_end = False
+    first_pass_digest = hashlib.sha256()
+
+    for record in iter_records(path):
+        encoded_record = json.dumps(
+            record,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        first_pass_digest.update(len(encoded_record).to_bytes(8, "big"))
+        first_pass_digest.update(encoded_record)
+        if first_record is None:
+            first_record = record
+            run_id = record.get("run_id")
+            if not isinstance(run_id, str) or not run_id:
+                raise CycleEvidenceIntegrityError("S3 evidence has no run identity")
+        if record.get("run_id") != run_id or record.get("record_index") != record_count:
             raise CycleEvidenceIntegrityError("S3 evidence record indices are not contiguous")
-    terminals = [record for record in records if record.get("kind") in {"RUN_STOP", "RUN_FAILED"}]
-    if len(terminals) != 1 or records[-1] is not terminals[0]:
+        kind = record.get("kind")
+        if kind in {"RUN_STOP", "RUN_FAILED"}:
+            terminal_count += 1
+            terminal_record = record
+        elif terminal_count:
+            raise CycleEvidenceIntegrityError("S3 evidence must have one physically-last terminal")
+        has_stream_input = has_stream_input or kind == "CYCLE_STREAM_INPUT"
+        has_stream_end = has_stream_end or kind == "CYCLE_STREAM_END"
+        record_count += 1
+
+    if first_record is None:
+        raise CycleEvidenceIntegrityError("S3 evidence is empty")
+    if terminal_count != 1 or terminal_record is None:
         raise CycleEvidenceIntegrityError("S3 evidence must have one physically-last terminal")
-    terminal_kind = terminals[0].get("kind")
-    terminal_reason = terminals[0].get("fatal_reason")
-    if records[0].get("kind") != "RUN_METADATA" or not isinstance(records[0].get("metadata"), Mapping):
+    assert run_id is not None
+    terminal_kind = terminal_record.get("kind")
+    terminal_reason = terminal_record.get("fatal_reason")
+    if first_record.get("kind") != "RUN_METADATA" or not isinstance(first_record.get("metadata"), Mapping):
         raise CycleEvidenceIntegrityError("S3 evidence must begin with RUN_METADATA")
-    metadata = dict(records[0]["metadata"])
+    metadata = dict(first_record["metadata"])
     if metadata.get("run_id") != run_id:
         raise CycleEvidenceIntegrityError("S3 metadata run identity does not match the evidence file")
     for key in (
@@ -3072,98 +3152,159 @@ def _read_run(path: Path) -> _RunBundle:
         raise
     except (KeyError, TypeError, ValueError) as exc:
         raise CycleEvidenceIntegrityError("S3 evidence metadata is malformed") from exc
-    decisions_raw: dict[int, tuple[QuoteVersion, tuple[BookEvidence, ...]]] = {}
-    inputs_raw: defaultdict[int, list[CausalEvent | CycleClock]] = defaultdict(list)
-    ends_raw: dict[int, int | None] = {}
-    stream_inputs_raw: list[tuple[int, CausalEvent | CycleClock]] = []
+
+    streaming = bool(has_stream_input or has_stream_end)
+    decisions_seen: list[int] = []
+    input_cursors: defaultdict[int, int] = defaultdict(int)
+    end_values: dict[int, int | None] = {}
     stream_end: int | None = None
-    admissions: list[dict[str, Any]] = []
-    signal_skips: list[dict[str, Any]] = []
-    results: list[dict[str, Any]] = []
-    for record in records[1:-1]:
+    stream_end_seen = False
+    stream_input_count = 0
+    admission_count = 0
+    rejected_admission_count = 0
+    admission_reasons: set[str] = set()
+    signal_skip_count = 0
+    signal_skip_reasons: set[str] = set()
+    result_digests: list[str] = []
+    driver = CycleRunDriver(window, envelope=envelope, persist=False, streaming=streaming)
+    second_pass_digest = hashlib.sha256()
+    second_record_count = 0
+    second_terminal_count = 0
+    for record_number, record in enumerate(iter_records(path)):
+        encoded_record = json.dumps(
+            record,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        second_pass_digest.update(len(encoded_record).to_bytes(8, "big"))
+        second_pass_digest.update(encoded_record)
+        if record.get("run_id") != run_id or record.get("record_index") != record_number:
+            raise CycleEvidenceIntegrityError("S3 evidence record indices are not contiguous")
+        second_record_count += 1
+        if record_number == 0:
+            continue
         kind = record.get("kind")
+        if kind in {"RUN_STOP", "RUN_FAILED"}:
+            second_terminal_count += 1
+        elif second_terminal_count:
+            raise CycleEvidenceIntegrityError("S3 evidence must have one physically-last terminal")
         if kind == "CYCLE_DECISION":
             index = _non_negative_int(_require(record, "attempt_index", context="CYCLE_DECISION"), "attempt_index")
-            if index in decisions_raw:
+            if index != len(decisions_seen) or index in decisions_seen:
                 raise CycleEvidenceIntegrityError("duplicate S3 decision index")
             raw_books = _require(record, "source_books", context="CYCLE_DECISION")
             if not isinstance(raw_books, list):
                 raise CycleEvidenceIntegrityError("CYCLE_DECISION source books are malformed")
-            decisions_raw[index] = (
-                _quote_version_from_dict(_require(record, "quote_version", context="CYCLE_DECISION")),
-                tuple(_book_from_dict(item, context=f"CYCLE_DECISION source book {book_index}") for book_index, item in enumerate(raw_books)),
+            version = _quote_version_from_dict(_require(record, "quote_version", context="CYCLE_DECISION"))
+            books = tuple(
+                _book_from_dict(item, context=f"CYCLE_DECISION source book {book_index}")
+                for book_index, item in enumerate(raw_books)
             )
+            driver.admit_decision(index, version, source_books=books)
+            decisions_seen.append(index)
         elif kind == "CYCLE_INPUT":
             index = _non_negative_int(_require(record, "attempt_index", context="CYCLE_INPUT"), "attempt_index")
             input_index = _non_negative_int(_require(record, "input_index", context="CYCLE_INPUT"), "input_index")
-            if input_index != len(inputs_raw[index]):
+            if input_index != input_cursors[index]:
                 raise CycleEvidenceIntegrityError("S3 input delivery indices are not contiguous")
-            inputs_raw[index].append(_input_from_dict(_require(record, "input", context="CYCLE_INPUT"), context="CYCLE_INPUT.input"))
+            input_cursors[index] += 1
+            item = _input_from_dict(_require(record, "input", context="CYCLE_INPUT"), context="CYCLE_INPUT.input")
+            if not streaming:
+                driver.accept_input(index, item)
         elif kind == "CYCLE_STREAM_INPUT":
             input_index = _non_negative_int(
                 _require(record, "input_index", context="CYCLE_STREAM_INPUT"),
                 "input_index",
             )
-            stream_inputs_raw.append(
-                (
-                    input_index,
-                    _input_from_dict(
-                        _require(record, "input", context="CYCLE_STREAM_INPUT"),
-                        context="CYCLE_STREAM_INPUT.input",
-                    ),
-                )
+            if input_index != stream_input_count:
+                raise CycleEvidenceIntegrityError("S3 stream input indices are not contiguous")
+            item = _input_from_dict(
+                _require(record, "input", context="CYCLE_STREAM_INPUT"),
+                context="CYCLE_STREAM_INPUT.input",
             )
+            stream_input_count += 1
+            driver.accept_global_input(item)
         elif kind == "CYCLE_STREAM_END":
-            if stream_end is not None:
+            if stream_end_seen:
                 raise CycleEvidenceIntegrityError("duplicate S3 stream end")
+            stream_end_seen = True
             stream_end = _non_negative_int(
                 _require(record, "end_monotonic_ns", context="CYCLE_STREAM_END"),
                 "end_monotonic_ns",
             )
+            if streaming:
+                driver.finish_stream(end_monotonic_ns=stream_end)
         elif kind == "CYCLE_END":
             index = _non_negative_int(_require(record, "attempt_index", context="CYCLE_END"), "attempt_index")
-            if index in ends_raw:
+            if index in end_values:
                 raise CycleEvidenceIntegrityError("duplicate S3 cycle end")
-            ends_raw[index] = record.get("end_monotonic_ns")
+            end_values[index] = record.get("end_monotonic_ns")
+            if not streaming:
+                driver.finish_decision(index, end_monotonic_ns=end_values[index])
         elif kind == "CYCLE_ADMISSION":
-            admissions.append(record)
+            persisted_admission = {
+                "attempt_index": record.get("attempt_index"),
+                "scenario": record.get("scenario"),
+                "accepted": record.get("accepted"),
+                "quote_version_id": record.get("quote_version_id"),
+                "decision_monotonic_ns": record.get("decision_monotonic_ns"),
+                "reason": record.get("reason"),
+            }
+            if admission_count >= len(driver.admissions):
+                raise CycleEvidenceIntegrityError("persisted S3 admissions do not replay identically")
+            actual_admission = driver.admissions[admission_count]
+            replayed_admission = {
+                "attempt_index": record.get("attempt_index"),
+                "scenario": actual_admission.scenario.value,
+                "accepted": actual_admission.accepted,
+                "quote_version_id": actual_admission.quote_version_id,
+                "decision_monotonic_ns": actual_admission.decision_monotonic_ns,
+                "reason": actual_admission.reason,
+            }
+            if persisted_admission != replayed_admission:
+                raise CycleEvidenceIntegrityError("persisted S3 admissions do not replay identically")
+            admission_count += 1
+            if not bool(record.get("accepted")):
+                rejected_admission_count += 1
+                admission_reasons.add(str(record.get("reason")))
         elif kind == "CYCLE_SIGNAL_SKIPPED":
-            signal_skips.append(record)
+            signal_skip_count += 1
+            signal_skip_reasons.add(str(record.get("reason")))
         elif kind == "CYCLE_FINAL_RESULT":
             result_payload = _require(record, "result", context="CYCLE_FINAL_RESULT")
             digest = _require(record, "result_sha256", context="CYCLE_FINAL_RESULT")
             if digest != _digest(result_payload):
                 raise CycleEvidenceIntegrityError("CYCLE_FINAL_RESULT payload digest mismatch")
-            results.append(record)
-        elif kind in {"RUN_METADATA", "REPLAY_MODE"}:
+            result_digests.append(digest)
+        elif kind == "RUN_METADATA" or kind == "REPLAY_MODE":
             raise CycleEvidenceIntegrityError(f"unexpected S3 record kind: {kind}")
-    if stream_inputs_raw and (inputs_raw or ends_raw):
+
+    if (
+        second_record_count != record_count
+        or second_terminal_count != 1
+        or first_pass_digest.digest() != second_pass_digest.digest()
+    ):
+        raise CycleEvidenceIntegrityError("S3 evidence changed during bounded replay")
+    if admission_count != len(driver.admissions):
+        raise CycleEvidenceIntegrityError("persisted S3 admissions do not replay identically")
+    if stream_input_count and (input_cursors or end_values):
         raise CycleEvidenceIntegrityError("S3 evidence mixes stream and attempt inputs")
-    expected_indices = tuple(range(len(decisions_raw)))
-    if tuple(sorted(decisions_raw)) != expected_indices:
+    expected_indices = tuple(range(len(decisions_seen)))
+    if tuple(decisions_seen) != expected_indices:
         raise CycleEvidenceIntegrityError("S3 decision indices are not contiguous")
-    if not stream_inputs_raw and set(ends_raw) != set(decisions_raw):
+    if not stream_input_count and set(end_values) != set(decisions_seen):
         missing_cycle_end_marker = (
             terminal_kind == "RUN_FAILED"
             and isinstance(terminal_reason, str)
             and terminal_reason in _RESOURCE_LIMIT_REASONS
-            and terminals[0].get("incomplete_evidence") == "CYCLE_FINALIZATION_PREFIX"
+            and terminal_record.get("incomplete_evidence") == "CYCLE_FINALIZATION_PREFIX"
         )
         if not missing_cycle_end_marker:
             raise CycleEvidenceIntegrityError("S3 evidence is missing a cycle end")
-    if stream_inputs_raw and ends_raw:
+    if stream_input_count and end_values:
         raise CycleEvidenceIntegrityError("S3 stream evidence contains attempt cycle ends")
-    ordered_attempts = tuple(
-        CycleAttempt(
-            quote_version=decisions_raw[index][0],
-            source_books=decisions_raw[index][1],
-            events=tuple(inputs_raw.get(index, ())),
-        end_monotonic_ns=ends_raw.get(index),
-        )
-        for index in expected_indices
-    )
-    streaming = bool(stream_inputs_raw or stream_end is not None)
-    incomplete_evidence = terminals[0].get("incomplete_evidence")
+
+    incomplete_evidence = terminal_record.get("incomplete_evidence")
     if incomplete_evidence is not None and (
         not isinstance(incomplete_evidence, str)
         or incomplete_evidence not in _RESOURCE_INCOMPLETE_MARKERS
@@ -3187,7 +3328,7 @@ def _read_run(path: Path) -> _RunBundle:
         resource_limit_terminal
         and incomplete_evidence == "CYCLE_FINALIZATION_PREFIX"
         and not streaming
-        and set(ends_raw) != set(decisions_raw)
+        and set(end_values) != set(decisions_seen)
     )
     if incomplete_evidence == "CYCLE_FINALIZATION_PREFIX" and not cycle_finalization_incomplete:
         raise CycleEvidenceIntegrityError("S3 cycle-finalization marker is inconsistent")
@@ -3195,66 +3336,16 @@ def _read_run(path: Path) -> _RunBundle:
         if stream_end is None:
             if not stream_finalization_incomplete:
                 raise CycleEvidenceIntegrityError("S3 stream evidence is missing its end")
-        if tuple(index for index, _ in stream_inputs_raw) != tuple(range(len(stream_inputs_raw))):
-            raise CycleEvidenceIntegrityError("S3 stream input indices are not contiguous")
-        driver = CycleRunDriver(window, envelope=envelope, persist=False, streaming=True)
-        # Replay the physical producer order.  Admitting every decision before
-        # replaying the stream would let a later decision bypass an active
-        # lane, and would therefore turn a valid persisted stream into a
-        # different kernel history.
-        stream_input_by_index = {
-            index: item for index, item in stream_inputs_raw
-        }
-        stream_input_cursor = 0
-        for record in records[1:-1]:
-            kind = record.get("kind")
-            if kind == "CYCLE_DECISION":
-                index = _non_negative_int(
-                    _require(record, "attempt_index", context="CYCLE_DECISION"),
-                    "attempt_index",
-                )
-                version, books = decisions_raw[index]
-                driver.admit_decision(index, version, source_books=books)
-            elif kind == "CYCLE_STREAM_INPUT":
-                item = stream_input_by_index[stream_input_cursor]
-                driver.accept_global_input(item)
-                stream_input_cursor += 1
-            elif kind == "CYCLE_STREAM_END":
-                driver.finish_stream(end_monotonic_ns=stream_end)
-        if stream_input_cursor != len(stream_inputs_raw):
-            raise CycleEvidenceIntegrityError("S3 stream replay did not consume every input")
         if not stream_finalization_incomplete and not driver._stream_ended:
             driver.finish_stream(end_monotonic_ns=stream_end)
         if not stream_finalization_incomplete:
             driver.finalize()
     else:
-        driver = CycleRunDriver(window, envelope=envelope, persist=False)
-        driver.run(ordered_attempts)
-    expected_admissions = tuple(
-        {
-            "attempt_index": record.get("attempt_index"),
-            "scenario": record.get("scenario"),
-            "accepted": record.get("accepted"),
-            "quote_version_id": record.get("quote_version_id"),
-            "decision_monotonic_ns": record.get("decision_monotonic_ns"),
-            "reason": record.get("reason"),
-        }
-        for record in admissions
-    )
-    actual_admissions = tuple(
-        {
-            "attempt_index": record.get("attempt_index"),
-            "scenario": admission.scenario.value,
-            "accepted": admission.accepted,
-            "quote_version_id": admission.quote_version_id,
-            "decision_monotonic_ns": admission.decision_monotonic_ns,
-            "reason": admission.reason,
-        }
-        for record, admission in zip(admissions, driver.admissions)
-    )
-    if len(admissions) != len(driver.admissions) or expected_admissions != actual_admissions:
-        raise CycleEvidenceIntegrityError("persisted S3 admissions do not replay identically")
-    expected_result_digests = tuple(record.get("result_sha256") for record in results)
+        for index in expected_indices:
+            if not driver.decision_finished(index):
+                driver.finish_decision(index, end_monotonic_ns=end_values.get(index))
+        driver.finalize()
+    expected_result_digests = tuple(result_digests)
     actual_result_digests = tuple(cycle_result_digest(result) for result in driver.results)
     prefix_incomplete = (
         resource_limit_terminal
@@ -3270,7 +3361,7 @@ def _read_run(path: Path) -> _RunBundle:
         )
     else:
         results_match = (
-            len(results) == len(actual_result_digests)
+            len(result_digests) == len(actual_result_digests)
             and expected_result_digests == actual_result_digests
         )
     if not results_match:
@@ -3287,21 +3378,22 @@ def _read_run(path: Path) -> _RunBundle:
     )
     return _RunBundle(
         path=path,
+        run_id=run_id,
         metadata=metadata,
-        attempts=ordered_attempts,
         streaming=streaming,
-        stream_inputs=tuple(item for _, item in stream_inputs_raw),
-        admissions=tuple(admissions),
-        signal_skips=tuple(signal_skips),
-        results=tuple(results),
-        replay_admissions=tuple(driver.admissions),
+        admission_count=admission_count,
+        rejected_admission_count=rejected_admission_count,
+        admission_reasons=tuple(sorted(admission_reasons)),
+        signal_skip_count=signal_skip_count,
+        signal_skip_reasons=tuple(sorted(signal_skip_reasons)),
+        results=tuple(result_digests),
         replay_results=tuple(driver.results),
         report_results=report_results,
         resource_incomplete=resource_incomplete,
-        terminal=terminals[0]["kind"],
+        terminal=terminal_kind,
         terminal_reason=terminal_reason,
         incomplete_evidence=incomplete_evidence,
-        record_count=len(records),
+        record_count=record_count,
         byte_count=path.stat().st_size,
     )
 
@@ -3423,118 +3515,264 @@ def _forced_unmatched_exit_cashflow(result: CycleResult) -> Decimal:
     )
 
 
-def _scenario_report(results: Sequence[CycleResult], scenario: CycleScenario) -> dict[str, Any]:
-    selected = tuple(result for result in results if result.scenario is scenario)
-    complete = tuple(result for result in selected if result.pnl_usd is not None and result.is_flat)
-    normal = sum(result.status is CycleTerminalState.NORMAL for result in selected)
-    forced = sum(result.status is CycleTerminalState.FORCED for result in selected)
-    aborted = sum(result.status is CycleTerminalState.ABORTED for result in selected)
-    unresolved = sum(_result_is_unresolved(result) for result in selected)
-    pnls = tuple(result.pnl_usd for result in complete if result.pnl_usd is not None)
-    total = sum(pnls, _ZERO)
-    group_keys, unresolved_identity_count = _dependence_groups(selected)
-    groups: dict[str, Decimal] = defaultdict(lambda: _ZERO)
-    for index, result in enumerate(selected):
-        if result not in complete:
-            continue
-        group = group_keys.get(index)
-        if group is not None:
-            groups[group] += result.pnl_usd or _ZERO
-    best_group = max(groups, key=lambda value: (groups[value], value)) if groups else None
-    without_best = total - groups[best_group] if best_group is not None else None
-    worst = min(complete, key=lambda result: (result.pnl_usd or _ZERO, result.quote_version_id)) if complete else None
-    forced_or_unmatched_results = tuple(
-        result
-        for result in selected
-        if result.forced or result.unmatched_entry_quantity > 0
+class _ScenarioReportAccumulator:
+    """Bounded aggregate for one scenario across one or more replayed runs."""
+
+    __slots__ = (
+        "scenario",
+        "cycle_count",
+        "complete_cycle_count",
+        "normal_count",
+        "forced_count",
+        "aborted_count",
+        "unresolved_count",
+        "pnl_count",
+        "total_pnl",
+        "gross_profit",
+        "gross_loss",
+        "negative_cycle_count",
+        "worst_key",
+        "worst_quote_version_id",
+        "worst_pnl",
+        "entry_quantity",
+        "hedged_quantity",
+        "unmatched_quantity",
+        "all_positions_authoritative",
+        "fill_count",
+        "signed_cashflow",
+        "total_fees",
+        "scenario_cost",
+        "net_cashflow",
+        "turnover",
+        "holding",
+        "unmatched_duration",
+        "forced_or_unmatched_count",
+        "forced_pnl",
+        "forced_pnl_unknown",
+        "forced_exit_cashflow",
+        "filled_entry_identity_unresolved_count",
+        "parents",
+        "owners",
+        "tokens_by_index",
+        "complete_group_pnl",
     )
-    forced_full_cycle_pnls = tuple(
-        result.pnl_usd for result in forced_or_unmatched_results
-    )
-    forced_full_cycle = (
-        _ZERO
-        if not forced_full_cycle_pnls
-        else None
-        if any(value is None for value in forced_full_cycle_pnls)
-        else sum((value for value in forced_full_cycle_pnls if value is not None), _ZERO)
-    )
-    fills = tuple(fill for result in selected for fill in result.fills)
-    entry_quantity = sum((result.entry_quantity for result in selected), _ZERO)
-    hedged_quantity = sum((result.hedged_quantity for result in selected), _ZERO)
-    unmatched_quantity = (
-        None
-        if any(not result.positions.authoritative for result in selected)
-        else sum((result.unmatched_entry_quantity for result in selected), _ZERO)
-    )
-    signed_cashflow = sum((fill.gross_cashflow_usd for fill in fills), _ZERO)
-    total_fees = sum((fill.fee_usd for fill in fills), _ZERO)
-    scenario_cost = sum((fill.scenario_cost_usd for fill in fills), _ZERO)
-    net_cashflow = sum((fill.net_cashflow_usd for fill in fills), _ZERO)
-    forced_exit_cashflow = sum(
-        (_forced_unmatched_exit_cashflow(result) for result in forced_or_unmatched_results),
-        _ZERO,
-    )
-    holding = sum((result.holding_duration_ns or 0 for result in selected), 0)
-    unmatched = sum((result.unmatched_exposure_duration_ns or 0 for result in selected), 0)
-    return {
-        "scenario": scenario.value,
-        "cycle_count": len(selected),
-        "complete_cycle_count": len(complete),
-        "normal_count": normal,
-        "forced_count": forced,
-        "aborted_count": aborted,
-        "unresolved_count": unresolved,
-        "pnl_count": len(pnls),
-        "total_pnl_usd": _decimal_text(total) if pnls else None,
-        "mean_pnl_usd": _decimal_text(total / len(pnls)) if pnls else None,
-        "gross_profit_usd": (
-            _decimal_text(sum((value for value in pnls if value > 0), _ZERO))
-            if pnls
+
+    def __init__(self, scenario: CycleScenario) -> None:
+        self.scenario = scenario
+        self.cycle_count = 0
+        self.complete_cycle_count = 0
+        self.normal_count = 0
+        self.forced_count = 0
+        self.aborted_count = 0
+        self.unresolved_count = 0
+        self.pnl_count = 0
+        self.total_pnl = _ZERO
+        self.gross_profit = _ZERO
+        self.gross_loss = _ZERO
+        self.negative_cycle_count = 0
+        self.worst_key: tuple[Decimal, str] | None = None
+        self.worst_quote_version_id: str | None = None
+        self.worst_pnl: Decimal | None = None
+        self.entry_quantity = _ZERO
+        self.hedged_quantity = _ZERO
+        self.unmatched_quantity = _ZERO
+        self.all_positions_authoritative = True
+        self.fill_count = 0
+        self.signed_cashflow = _ZERO
+        self.total_fees = _ZERO
+        self.scenario_cost = _ZERO
+        self.net_cashflow = _ZERO
+        self.turnover = _ZERO
+        self.holding = 0
+        self.unmatched_duration = 0
+        self.forced_or_unmatched_count = 0
+        self.forced_pnl = _ZERO
+        self.forced_pnl_unknown = False
+        self.forced_exit_cashflow = _ZERO
+        self.filled_entry_identity_unresolved_count = 0
+        self.parents: list[int] = []
+        self.owners: dict[str, int] = {}
+        self.tokens_by_index: dict[int, frozenset[str]] = {}
+        self.complete_group_pnl: dict[int, Decimal] = {}
+
+    def _find(self, index: int) -> int:
+        while self.parents[index] != index:
+            self.parents[index] = self.parents[self.parents[index]]
+            index = self.parents[index]
+        return index
+
+    def _union(self, left: int, right: int) -> None:
+        left_root = self._find(left)
+        right_root = self._find(right)
+        if left_root != right_root:
+            self.parents[right_root] = left_root
+
+    def add(self, result: CycleResult) -> None:
+        if result.scenario is not self.scenario:
+            return
+        index = self.cycle_count
+        self.cycle_count += 1
+        self.parents.append(index)
+        tokens = _identity_tokens(result)
+        self.tokens_by_index[index] = tokens
+        for token in tokens:
+            previous = self.owners.get(token)
+            if previous is not None:
+                self._union(previous, index)
+            else:
+                self.owners[token] = index
+
+        self.normal_count += result.status is CycleTerminalState.NORMAL
+        self.forced_count += result.status is CycleTerminalState.FORCED
+        self.aborted_count += result.status is CycleTerminalState.ABORTED
+        self.unresolved_count += _result_is_unresolved(result)
+        self.entry_quantity += result.entry_quantity
+        self.hedged_quantity += result.hedged_quantity
+        self.unmatched_quantity += result.unmatched_entry_quantity
+        self.all_positions_authoritative = (
+            self.all_positions_authoritative and result.positions.authoritative
+        )
+        self.holding += result.holding_duration_ns or 0
+        self.unmatched_duration += result.unmatched_exposure_duration_ns or 0
+
+        fills = result.fills
+        self.fill_count += len(fills)
+        self.signed_cashflow += sum((fill.gross_cashflow_usd for fill in fills), _ZERO)
+        self.total_fees += sum((fill.fee_usd for fill in fills), _ZERO)
+        self.scenario_cost += sum((fill.scenario_cost_usd for fill in fills), _ZERO)
+        self.net_cashflow += sum((fill.net_cashflow_usd for fill in fills), _ZERO)
+        self.turnover += sum((fill.notional_usd for fill in fills), _ZERO)
+
+        if (
+            result.entry_measurement is not None
+            and result.entry_measurement.is_proven_fill
+            and result.entry_measurement.fills
+            and not tokens
+        ):
+            self.filled_entry_identity_unresolved_count += 1
+
+        if result.forced or result.unmatched_entry_quantity > 0:
+            self.forced_or_unmatched_count += 1
+            if result.pnl_usd is None:
+                self.forced_pnl_unknown = True
+            else:
+                self.forced_pnl += result.pnl_usd
+            self.forced_exit_cashflow += _forced_unmatched_exit_cashflow(result)
+
+        if result.pnl_usd is not None and result.is_flat:
+            pnl = result.pnl_usd
+            self.complete_cycle_count += 1
+            self.pnl_count += 1
+            self.total_pnl += pnl
+            if pnl > 0:
+                self.gross_profit += pnl
+            elif pnl < 0:
+                self.gross_loss += pnl
+                self.negative_cycle_count += 1
+            worst_key = (pnl, result.quote_version_id)
+            if self.worst_key is None or worst_key < self.worst_key:
+                self.worst_key = worst_key
+                self.worst_quote_version_id = result.quote_version_id
+                self.worst_pnl = pnl
+            if tokens:
+                self.complete_group_pnl[index] = pnl
+
+    def report(self) -> dict[str, Any]:
+        component_tokens: defaultdict[int, set[str]] = defaultdict(set)
+        for index, tokens in self.tokens_by_index.items():
+            if tokens:
+                component_tokens[self._find(index)].update(tokens)
+        groups: dict[str, Decimal] = {}
+        for index, pnl in self.complete_group_pnl.items():
+            tokens = self.tokens_by_index[index]
+            if not tokens:
+                continue
+            group = "|".join(sorted(component_tokens[self._find(index)]))
+            groups[group] = groups.get(group, _ZERO) + pnl
+        best_group = max(groups, key=lambda value: (groups[value], value)) if groups else None
+        without_best = self.total_pnl - groups[best_group] if best_group is not None else None
+        forced_full_cycle = (
+            _ZERO
+            if self.forced_or_unmatched_count == 0
             else None
-        ),
-        "gross_loss_usd": (
-            _decimal_text(sum((value for value in pnls if value < 0), _ZERO))
-            if pnls
-            else None
-        ),
-        "negative_cycle_count": sum(value < 0 for value in pnls),
-        "worst_cycle": None if worst is None else {"quote_version_id": worst.quote_version_id, "pnl_usd": str(worst.pnl_usd)},
-        "entry_quantity_total": _decimal_text(entry_quantity),
-        "hedged_quantity_total": _decimal_text(hedged_quantity),
-        "unmatched_entry_quantity_total": _decimal_text(unmatched_quantity),
-        "fill_count": len(fills),
-        "fee_count": len(fills),
-        "cashflow_count": len(fills),
-        "signed_cashflow_usd": _decimal_text(signed_cashflow),
-        "total_fees_usd": _decimal_text(total_fees),
-        "scenario_cost_usd": _decimal_text(scenario_cost),
-        "net_cashflow_usd": _decimal_text(net_cashflow),
-        "turnover_usd": _decimal_text(sum((fill.notional_usd for fill in fills), _ZERO)),
-        "holding_duration_seconds": _decimal_text(Decimal(holding) / Decimal(1_000_000_000)),
-        "occupancy_holding_duration_seconds": _decimal_text(Decimal(holding) / Decimal(1_000_000_000)),
-        "unmatched_exposure_duration_seconds": _decimal_text(Decimal(unmatched) / Decimal(1_000_000_000)),
-        "duration_semantics": {
-            "holding_duration_seconds": "first_maker_fill_to_terminal_boundary",
-            "occupancy_holding_duration_seconds": "same_interval_as_holding_duration",
-            "unmatched_exposure_duration_seconds": (
-                "unmatched_start_to_resolution_or_unresolved_observation_boundary;"
-                " not_full_exposure_duration"
+            if self.forced_pnl_unknown
+            else self.forced_pnl
+        )
+        return {
+            "scenario": self.scenario.value,
+            "cycle_count": self.cycle_count,
+            "complete_cycle_count": self.complete_cycle_count,
+            "normal_count": self.normal_count,
+            "forced_count": self.forced_count,
+            "aborted_count": self.aborted_count,
+            "unresolved_count": self.unresolved_count,
+            "pnl_count": self.pnl_count,
+            "total_pnl_usd": _decimal_text(self.total_pnl) if self.pnl_count else None,
+            "mean_pnl_usd": (
+                _decimal_text(self.total_pnl / self.pnl_count)
+                if self.pnl_count
+                else None
             ),
-        },
-        "filled_entry_dependence_group_count": len(groups),
-        "filled_entry_identity_unresolved_count": unresolved_identity_count,
-        # This is a full-cycle PnL subtotal, and is intentionally separate
-        # from the forced/unmatched exit cash-flow subtotal below.
-        "forced_or_unmatched_pnl_usd": _decimal_text(forced_full_cycle),
-        "forced_or_unmatched_full_cycle_pnl_usd": _decimal_text(forced_full_cycle),
-        "forced_unmatched_exit_contribution_usd": _decimal_text(forced_exit_cashflow),
-        "forced_unmatched_exit_cashflow_usd": _decimal_text(forced_exit_cashflow),
-        "forced_unmatched_exit_contribution_kind": "NET_CASHFLOW_SUBTOTAL",
-        "best_dependence_group": best_group,
-        "total_without_best_dependence_group_usd": _decimal_text(without_best),
-        "funding_status": "UNKNOWN_EXECUTION_ONLY",
-        "positive_is_hypothetical_only": True,
-    }
+            "gross_profit_usd": (
+                _decimal_text(self.gross_profit) if self.pnl_count else None
+            ),
+            "gross_loss_usd": (
+                _decimal_text(self.gross_loss) if self.pnl_count else None
+            ),
+            "negative_cycle_count": self.negative_cycle_count,
+            "worst_cycle": (
+                None
+                if self.worst_key is None
+                else {
+                    "quote_version_id": self.worst_quote_version_id,
+                    "pnl_usd": str(self.worst_pnl),
+                }
+            ),
+            "entry_quantity_total": _decimal_text(self.entry_quantity),
+            "hedged_quantity_total": _decimal_text(self.hedged_quantity),
+            "unmatched_entry_quantity_total": (
+                None
+                if not self.all_positions_authoritative
+                else _decimal_text(self.unmatched_quantity)
+            ),
+            "fill_count": self.fill_count,
+            "fee_count": self.fill_count,
+            "cashflow_count": self.fill_count,
+            "signed_cashflow_usd": _decimal_text(self.signed_cashflow),
+            "total_fees_usd": _decimal_text(self.total_fees),
+            "scenario_cost_usd": _decimal_text(self.scenario_cost),
+            "net_cashflow_usd": _decimal_text(self.net_cashflow),
+            "turnover_usd": _decimal_text(self.turnover),
+            "holding_duration_seconds": _decimal_text(Decimal(self.holding) / Decimal(1_000_000_000)),
+            "occupancy_holding_duration_seconds": _decimal_text(Decimal(self.holding) / Decimal(1_000_000_000)),
+            "unmatched_exposure_duration_seconds": _decimal_text(Decimal(self.unmatched_duration) / Decimal(1_000_000_000)),
+            "duration_semantics": {
+                "holding_duration_seconds": "first_maker_fill_to_terminal_boundary",
+                "occupancy_holding_duration_seconds": "same_interval_as_holding_duration",
+                "unmatched_exposure_duration_seconds": (
+                    "unmatched_start_to_resolution_or_unresolved_observation_boundary;"
+                    " not_full_exposure_duration"
+                ),
+            },
+            "filled_entry_dependence_group_count": len(groups),
+            "filled_entry_identity_unresolved_count": self.filled_entry_identity_unresolved_count,
+            "forced_or_unmatched_pnl_usd": _decimal_text(forced_full_cycle),
+            "forced_or_unmatched_full_cycle_pnl_usd": _decimal_text(forced_full_cycle),
+            "forced_unmatched_exit_contribution_usd": _decimal_text(self.forced_exit_cashflow),
+            "forced_unmatched_exit_cashflow_usd": _decimal_text(self.forced_exit_cashflow),
+            "forced_unmatched_exit_contribution_kind": "NET_CASHFLOW_SUBTOTAL",
+            "best_dependence_group": best_group,
+            "total_without_best_dependence_group_usd": _decimal_text(without_best),
+            "funding_status": "UNKNOWN_EXECUTION_ONLY",
+            "positive_is_hypothetical_only": True,
+        }
+
+
+def _scenario_report(results: Iterable[CycleResult], scenario: CycleScenario) -> dict[str, Any]:
+    accumulator = _ScenarioReportAccumulator(scenario)
+    for result in results:
+        accumulator.add(result)
+    return accumulator.report()
 
 
 def _annotate_result_metrics(
@@ -3584,7 +3822,7 @@ def _window_summary(bundle: _RunBundle) -> dict[str, Any]:
     )
     metadata = bundle.metadata
     return {
-        "run_id": next(iter_records(bundle.path)).get("run_id"),
+        "run_id": bundle.run_id,
         "campaign_id": metadata["campaign_id"],
         "window_id": metadata["window_id"],
         "window_start_utc": metadata["window_start_utc"],
@@ -3603,15 +3841,9 @@ def _window_summary(bundle: _RunBundle) -> dict[str, Any]:
         "byte_count": bundle.byte_count,
         "primary": primary,
         "stress": stress,
-        "skipped_signal_count": sum(not bool(record.get("accepted")) for record in bundle.admissions)
-        + len(bundle.signal_skips),
+        "skipped_signal_count": bundle.rejected_admission_count + bundle.signal_skip_count,
         "skipped_signal_reasons": sorted(
-            {
-                str(record.get("reason"))
-                for record in bundle.admissions
-                if not bool(record.get("accepted"))
-            }
-            | {str(record.get("reason")) for record in bundle.signal_skips}
+            set(bundle.admission_reasons) | set(bundle.signal_skip_reasons)
         ),
     }
 
@@ -3654,51 +3886,76 @@ def build_cycle_report(path: str | os.PathLike[str]) -> dict[str, Any]:
     paths = _paths_for_report(path)
     if len(paths) > 4:
         raise CycleEvidenceIntegrityError("S3 campaign report contains more than four windows")
-    bundles = tuple(_read_run(item) for item in paths)
-    run_ids = [next(iter_records(bundle.path)).get("run_id") for bundle in bundles]
-    if len(set(run_ids)) != len(run_ids):
-        raise CycleEvidenceIntegrityError("S3 report contains duplicate run identities")
-    metadata = bundles[0].metadata
+    first_bundle = _read_run(paths[0])
+    metadata = first_bundle.metadata
     campaign_id = metadata["campaign_id"]
     policy_fingerprint = metadata["policy_fingerprint"]
     accepted_release = metadata["accepted_release"]
     evidence_mode = metadata["evidence_mode"]
-    if any(bundle.metadata["evidence_mode"] != evidence_mode for bundle in bundles[1:]):
-        raise CycleEvidenceIntegrityError("S3 report mixes fixture and observed-public provenance")
     envelope_data = metadata["envelope"]
     if not isinstance(envelope_data, Mapping):
         raise CycleEvidenceIntegrityError("S3 report envelope metadata is malformed")
     envelope = CycleEnvelope(
         **{field.name: envelope_data[field.name] for field in fields(CycleEnvelope)}
     )
-    for bundle in bundles[1:]:
-        if (
-            bundle.metadata["campaign_id"] != campaign_id
-            or bundle.metadata["policy_fingerprint"] != policy_fingerprint
-            or bundle.metadata["accepted_release"] != accepted_release
-        ):
-            raise CycleEvidenceIntegrityError("S3 campaign or policy identity mismatch across windows")
-        if bundle.metadata.get("envelope") != envelope_data:
-            raise CycleEvidenceIntegrityError("S3 campaign envelope mismatch across windows")
-    manifest_hashes = {
-        bundle.metadata.get("manifest_sha256") for bundle in bundles
-    }
-    if evidence_mode == "OBSERVATIONAL":
-        if None in manifest_hashes or len(manifest_hashes) != 1:
-            raise CycleEvidenceIntegrityError(
-                "observed-public S3 report lacks one immutable manifest identity"
+    run_ids: set[str] = set()
+    manifest_hashes: set[Any] = set()
+    windows_list: list[CycleWindow] = []
+    summaries_list: list[dict[str, Any]] = []
+    primary_accumulator = _ScenarioReportAccumulator(CycleScenario.PRIMARY)
+    stress_accumulator = _ScenarioReportAccumulator(CycleScenario.STRESS)
+    resource_incomplete_run_count = 0
+    aggregate_record_count = 0
+    aggregate_byte_count = 0
+    all_terminals_are_clean_stops = True
+    prospective_public = evidence_mode == "OBSERVATIONAL"
+    for bundle_index, selected_path in enumerate(paths):
+        bundle = first_bundle if bundle_index == 0 else _read_run(selected_path)
+        if bundle.run_id in run_ids:
+            raise CycleEvidenceIntegrityError("S3 report contains duplicate run identities")
+        run_ids.add(bundle.run_id)
+        if bundle.metadata["evidence_mode"] != evidence_mode:
+            raise CycleEvidenceIntegrityError("S3 report mixes fixture and observed-public provenance")
+        if bundle_index:
+            if (
+                bundle.metadata["campaign_id"] != campaign_id
+                or bundle.metadata["policy_fingerprint"] != policy_fingerprint
+                or bundle.metadata["accepted_release"] != accepted_release
+            ):
+                raise CycleEvidenceIntegrityError("S3 campaign or policy identity mismatch across windows")
+            if bundle.metadata.get("envelope") != envelope_data:
+                raise CycleEvidenceIntegrityError("S3 campaign envelope mismatch across windows")
+        manifest_hashes.add(bundle.metadata.get("manifest_sha256"))
+        prospective_public = prospective_public and bundle.metadata.get("prospective") is True
+        windows_list.append(
+            CycleWindow.from_text(
+                campaign_id=bundle.metadata["campaign_id"],
+                window_id=bundle.metadata["window_id"],
+                start_utc=bundle.metadata["window_start_utc"],
+                end_utc=bundle.metadata["window_end_utc"],
+                ordinal=bundle.metadata.get("window_ordinal", 0),
+                monotonic_start_ns=bundle.metadata["monotonic_start_ns"],
             )
-    windows = tuple(
-        CycleWindow.from_text(
-            campaign_id=bundle.metadata["campaign_id"],
-            window_id=bundle.metadata["window_id"],
-            start_utc=bundle.metadata["window_start_utc"],
-            end_utc=bundle.metadata["window_end_utc"],
-            ordinal=bundle.metadata.get("window_ordinal", 0),
-            monotonic_start_ns=bundle.metadata["monotonic_start_ns"],
         )
-        for bundle in bundles
-    )
+        summaries_list.append(_window_summary(bundle))
+        resource_incomplete_run_count += bundle.resource_incomplete
+        aggregate_record_count += bundle.record_count
+        aggregate_byte_count += bundle.byte_count
+        all_terminals_are_clean_stops = (
+            all_terminals_are_clean_stops and bundle.terminal == "RUN_STOP"
+        )
+        for result in bundle.report_results:
+            primary_accumulator.add(result)
+            stress_accumulator.add(result)
+        if bundle_index == 0:
+            first_bundle = None
+    if evidence_mode == "OBSERVATIONAL" and (
+        None in manifest_hashes or len(manifest_hashes) != 1
+    ):
+        raise CycleEvidenceIntegrityError(
+            "observed-public S3 report lacks one immutable manifest identity"
+        )
+    windows = tuple(windows_list)
     campaign_shape_valid = len(windows) == 4
     _validate_report_window_set(
         windows,
@@ -3706,26 +3963,20 @@ def build_cycle_report(path: str | os.PathLike[str]) -> dict[str, Any]:
         envelope=envelope,
     )
     observed_public = evidence_mode == "OBSERVATIONAL"
-    prospective_public = observed_public and all(
-        bundle.metadata.get("prospective") is True for bundle in bundles
-    )
     manifest_complete = evidence_mode == "FIXTURE" or (
         len(manifest_hashes) == 1 and None not in manifest_hashes
     )
     campaign_complete = campaign_shape_valid and prospective_public and manifest_complete
-    resource_incomplete_run_count = sum(bundle.resource_incomplete for bundle in bundles)
     if resource_incomplete_run_count == 0:
         cycle_result_metrics_status = "COMPLETE"
-    elif resource_incomplete_run_count == len(bundles):
+    elif resource_incomplete_run_count == len(paths):
         cycle_result_metrics_status = "UNAVAILABLE_RESOURCE_LIMIT"
     else:
         cycle_result_metrics_status = "PARTIAL_RESOURCE_LIMIT"
-    summaries = tuple(_window_summary(bundle) for bundle in bundles)
-    all_primary = tuple(result for bundle in bundles for result in bundle.report_results if result.scenario is CycleScenario.PRIMARY)
-    all_stress = tuple(result for bundle in bundles for result in bundle.report_results if result.scenario is CycleScenario.STRESS)
-    primary = _scenario_report(all_primary, CycleScenario.PRIMARY)
-    stress = _scenario_report(all_stress, CycleScenario.STRESS)
-    if resource_incomplete_run_count == len(bundles):
+    summaries = tuple(summaries_list)
+    primary = primary_accumulator.report()
+    stress = stress_accumulator.report()
+    if resource_incomplete_run_count == len(paths):
         primary = _annotate_result_metrics(
             primary,
             resource_incomplete=True,
@@ -3769,13 +4020,11 @@ def build_cycle_report(path: str | os.PathLike[str]) -> dict[str, Any]:
         and len(qualifying_windows) >= S3_REQUIRED_WINDOWS_WITH_CYCLES
         and len({summary["day"] for summary in qualifying_windows}) >= 2
     )
-    aggregate_record_count = sum(bundle.record_count for bundle in bundles)
-    aggregate_byte_count = sum(bundle.byte_count for bundle in bundles)
     aggregate_within_caps = (
         aggregate_record_count <= envelope.max_records
         and aggregate_byte_count <= envelope.max_bytes
     )
-    structurally_valid = all(bundle.terminal == "RUN_STOP" for bundle in bundles) and aggregate_within_caps
+    structurally_valid = all_terminals_are_clean_stops and aggregate_within_caps
     unresolved_count = primary["unresolved_count"] + stress["unresolved_count"]
     sufficient = (
         structurally_valid
@@ -3811,7 +4060,7 @@ def build_cycle_report(path: str | os.PathLike[str]) -> dict[str, Any]:
         sufficiency_label = "SUFFICIENT"
     if evidence_mode == "FIXTURE":
         usefulness = "FIXTURE_ONLY"
-    elif len(bundles) == 1:
+    elif len(paths) == 1:
         usefulness = "SINGLE_WINDOW_DESCRIPTIVE_ONLY"
     elif not campaign_complete:
         usefulness = "INCOMPLETE_CAMPAIGN"
@@ -3835,7 +4084,7 @@ def build_cycle_report(path: str | os.PathLike[str]) -> dict[str, Any]:
         "campaign_id": campaign_id,
         "accepted_release": accepted_release,
         "policy_fingerprint": policy_fingerprint,
-        "window_count": len(bundles),
+        "window_count": len(paths),
         "campaign_complete": campaign_complete,
         "provenance": {
             "evidence_mode": evidence_mode,

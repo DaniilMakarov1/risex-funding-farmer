@@ -586,6 +586,81 @@ def test_duplicate_volume_is_ignored_and_conflicting_identity_halts() -> None:
     assert not kernel.admit(version).accepted
 
 
+def test_book_retention_is_bounded_and_terminal_latch_releases_payloads() -> None:
+    version, source_books = _version("s2-book-retention")
+    kernel = CycleKernel()
+    assert kernel.admit(version, source_books=source_books).accepted
+
+    # Keep the lane before its first scheduled boundary while delivering a
+    # deep stream of unique revisions.  The latest expected book is enough
+    # for the next due boundary; older revisions cannot be selected later.
+    for revision in range(2, 2_002):
+        kernel.advance(
+            _book(
+                Venue.LIGHTER,
+                received=100 + revision,
+                revision=revision,
+                bids=(("99", "10"),),
+                asks=(("100", "10"),),
+            )
+        )
+
+    lane = kernel._lane(CycleScenario.PRIMARY)
+    assert lane.active is not None
+    assert len(lane.active.books) <= 2
+    book_signatures = [
+        signature
+        for signature in lane.active.seen_events.values()
+        if signature[0].value == "BOOK"
+    ]
+    assert len(book_signatures) == 2_000
+    assert len(lane.active.initial_book_signatures) == 2
+    assert len(lane.active.book_identity_keys) == 2_002
+    assert all(
+        isinstance(signature[1][0], str) and len(signature[1][0]) == 64
+        for signature in book_signatures
+    )
+    assert all(
+        isinstance(signature[-1], str) and len(signature[-1]) == 64
+        for signature in lane.active.initial_book_signatures.values()
+    )
+
+    # A terminal cycle has no future action that can consume a stream book.
+    kernel.advance_clock(10_000_000_000)
+    assert lane.active is None
+    assert lane.terminal_cycles
+    terminal = lane.terminal_cycles[-1]
+    assert terminal.books == []
+    assert terminal.book_identity_keys == set()
+
+
+def test_book_digest_preserves_decimal_equality_without_hiding_conflicts() -> None:
+    version, source_books = _version("s2-book-digest")
+    kernel = CycleKernel()
+    assert kernel.admit(version, source_books=source_books).accepted
+
+    equivalent = replace(
+        source_books[1],
+        bids=(BookLevel(D("99.00"), D("10.00")),),
+        asks=(BookLevel(D("100.00"), D("10.00")),),
+    )
+    kernel.advance(equivalent)
+    prefix = kernel.snapshot()
+    assert prefix is not None and prefix.entry_measurement is not None
+    assert prefix.entry_measurement.duplicate_event_count == 1
+    assert kernel.state() is CycleKernelState.PENDING
+
+    conflicting = replace(
+        equivalent,
+        bids=(BookLevel(D("99.01"), D("10.00")),),
+    )
+    kernel.advance(conflicting)
+    halted = kernel.last_result()
+    assert halted is not None
+    assert halted.status is CycleTerminalState.UNRESOLVED
+    assert CycleReason.DUPLICATE_CONFLICT.value in halted.reason_codes
+
+
 def test_late_processed_entry_fill_is_explicit_uncertainty_after_exit_commit() -> None:
     version, source_books = _version("s2-late-entry")
     kernel = CycleKernel()
