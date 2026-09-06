@@ -30,6 +30,14 @@ Four fixed 45-minute windows; entry cutoff 42:45, hard market deadline 45:00, cl
 
 ## Evidence and completion
 
+## Offline correction S3-B1 — streaming campaign budget
+
+Owner authorized concrete bug fixes on 2026-09-06. One fresh visible Spread Builder (Luna max), Level A only, starts from the exact published main containing this gate. Observed defect: `_CycleCampaignBudget.load` in `src/risex_spread_shadow/s3_cycle.py` materializes `list(iter_records(path))`; the retained D1 file is 3,380,019,851 bytes. Replace only this whole-file retention with bounded streaming accounting, preserving campaign identity validation, exact record/byte totals, error classifications and existing cap/reserve semantics. Allowed files: this module and directly relevant Spread tests. No other refactor, economic/report schema change, public request, manifest/claim mutation or operational release replacement. Chief owns governance; Builder must not edit it, self-accept, merge, push main or spawn agents.
+
+Acceptance: demonstrate the old materialization risk with a bounded adverse test; prove streaming consumption, exact multi-run accounting, malformed/empty stream and wrong-campaign behavior, and unchanged reserve boundaries. Run focused tests and one final-SHA isolated Python 3.11 full suite plus dependency/import/public-surface/Git checks. Report exact base/tip, root/branch/status before edits, evidence and limitations. This correction can be reviewed independently of CYCLE-001 but cannot replace its frozen release. Public collection remains idle until the recorded D2 windows; a launch-blocking defect must be escalated, never bypassed.
+
+## Campaign evidence and completion
+
 Preserve each exact run identity, manifest and serialized terminal; verify bounds, public-only surface and deterministic offline replay/report. Report turnover, holding/occupancy, unmatched duration, skips, normal/forced/aborted/unresolved counts, fees/cashflows, total/mean PnL, gross profit/loss, worst cycle, forced exit contribution and without-best-group result separately for primary/stress. Incomplete cashflow is not completed PnL.
 
 Descriptive floors: 20 complete cycles and 20 filled dependence groups; five cycles in at least three windows spanning both days. Screens: primary positive each day, aggregate stress positive, primary without best dependence group positive. Groups are not proven independent. Separate measurement validity, sufficiency, economics and usefulness; any positive verdict stays hypothetical and confers no trading authority.
