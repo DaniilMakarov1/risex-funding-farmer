@@ -2,9 +2,9 @@
 
 ## Active work — 2026-09-06
 
-The owner-directed objective is to correct observed defects and independently verify public research-scanner data handling, causal modeling, bounded resources and reproducible reports, with explicit limits on what the evidence proves. No administrative or Builder-coordination blocker remains. The Goal card's stale `blocked` status does not describe the work state; the available goal API cannot resume it.
+The owner-directed objective is to correct observed defects and independently verify public research-scanner data handling, causal modeling, bounded resources and reproducible reports, with explicit limits on what the evidence proves. No administrative or Builder-coordination blocker remains. The Goal card is confirmed `active`; its prior administrative block is resolved.
 
-S3-B1 predecessor is finished and released. S3-B2 is dispatched to one fresh visible GPT-5.6 Luna max Builder, branch `codex/spread-s3-b2`, worktree `/Users/daniilmakarov/.codex/worktrees/b8c2/RISEx Spread Shadow`, exact base `44ca6248863bfa7b9b620dd3209d44d1ae6c797f`. Its bounded offline memory correction and acceptance criteria are in NEXT_TASK. No second Spread Builder may overlap. Chief independently reviews and alone integrates; implementation remains with Builder.
+S3-B1 predecessor is finished and released. S3-B2 is confirmed in progress in visible task `01a0759e-98d6-7c82-86ff-ae53d713bca8` (direct task polling works despite omission from the general task list), using GPT-5.6 Luna max, branch `codex/spread-s3-b2`, worktree `/Users/daniilmakarov/.codex/worktrees/b8c2/RISEx Spread Shadow`, exact base `44ca6248863bfa7b9b620dd3209d44d1ae6c797f`. Its bounded offline memory correction and acceptance criteria are in NEXT_TASK. No second Spread Builder may overlap. Chief independently reviews and alone integrates; implementation remains with Builder.
 
 ## Accepted implementation
 
