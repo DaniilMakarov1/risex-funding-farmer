@@ -1224,20 +1224,26 @@ class _CycleCampaignBudget:
         if not campaign_root.exists():
             return budget
         for path in sorted(campaign_root.glob("run-*/evidence.jsonl")):
+            record_count = 0
+            first_record: Mapping[str, Any] | None = None
             try:
-                records = list(iter_records(path))
+                for record in iter_records(path):
+                    if record_count == 0:
+                        first_record = record
+                    record_count += 1
             except Exception as exc:
                 raise CycleEvidenceIntegrityError(
                     "S3 campaign budget cannot read an existing run"
                 ) from exc
-            if not records:
+            if record_count == 0:
                 raise CycleEvidenceIntegrityError("S3 campaign contains an empty run")
-            metadata = records[0].get("metadata")
+            assert first_record is not None
+            metadata = first_record.get("metadata")
             if not isinstance(metadata, Mapping):
                 raise CycleEvidenceIntegrityError("S3 campaign run has malformed metadata")
             if metadata.get("campaign_id") != campaign_id:
                 continue
-            budget.record_count += len(records)
+            budget.record_count += record_count
             budget.byte_count += path.stat().st_size
         return budget
 
