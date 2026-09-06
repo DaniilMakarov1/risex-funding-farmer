@@ -8,7 +8,7 @@ S3-B3 `f5d4b7d511bd579178333565cdf0e5e02f1eb3ec` is independently ACCEPTED and i
 
 ## Next bounded slice S3-T1 — truthful failure chronology
 
-Central SPREAD, Level A offline only. Not dispatched yet. Rotate Chief at the clean published checkpoint before starting another candidate if context requires it; never run two Chiefs. The successor must create one fresh visible GPT-5.6 Luna max Builder on a fresh codex/spread-s3-t1-failure-time branch/worktree from the exact accepted published main and assign that SHA explicitly. No predecessor extension or overlapping implementation.
+Central SPREAD, Level A offline only. Not dispatched yet. Fresh Chief successor `01a07608-973b-73c3-b445-5001e64058e7` is designated at the clean published checkpoint; never run two Chiefs. After explicit handoff activation the successor must create one fresh visible GPT-5.6 Luna max Builder on a fresh codex/spread-s3-t1-failure-time branch/worktree from the exact accepted published main and assign that SHA explicitly. No predecessor extension or overlapping implementation.
 
 Observed defect: PublicCycleProducer.close and driver finalization use the scheduled window deadline on early failure. D1 failure terminal is 1137.707 seconds later than the first unexpected-close gap. Advancing the model to an unobserved future deadline can misstate failure/holding duration and execute scheduled hypothetical boundaries beyond available observation. Preserve immutable D1 data and historical reports.
 

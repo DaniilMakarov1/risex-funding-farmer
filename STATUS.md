@@ -10,7 +10,7 @@ Chief verified scope/clean Git, two-pass replay integrity, bounded driver/report
 
 Final D1 replay on the accepted SHA reproduces all 17 results and the exact 8561-byte report, SHA-256 `c42abbf91b00c1e5360dda5ef73c427f7a76ff218c423e50bce0fab1e2b9cfd9`: 178.21 seconds, peak RSS 53,166,080 bytes, down from B2's 1,186,758,656 bytes. Active cycles retain at most three full-book witnesses per expected venue; compact identity digests still grow with admitted event count, and terminal latching releases book payloads/identity maps. Deep-book and 100/1000/2000-update probes pass. This proves bounded full-book retention within the record/byte envelope, not constant total memory for arbitrary inputs. Runtime evidence: `s3-b3-builder-20260906` and `B3-chief-*-d93a5f4a5130.json` / `B3-chief-final-surface-f5d4b7d.json` under the campaign root. The first transient harness hash discrepancy remains unexplained; the preserved final exact-output gate passes.
 
-Next bounded correction is failure chronology (S3-T1), defined in NEXT_TASK. Chief rotation is now eligible at this clean checkpoint; do not activate two Chiefs or overlapping Builders.
+Next bounded correction is failure chronology (S3-T1), defined in NEXT_TASK. Chief handoff: successor `01a07608-973b-73c3-b445-5001e64058e7` completed read-only orientation at clean main39c15f3 and receives sole coordination authority after this published handoff. Predecessor `01a07561-fd10-7c21-9fc2-872b051402a3` stops project work after activation; any old-thread goal continuation must only point to the successor, never resume parallel coordination. The original scanner objective remains unachieved. No candidate/write is in flight.
 
 ## Accepted implementation
 
