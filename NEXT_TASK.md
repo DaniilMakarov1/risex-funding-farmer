@@ -1,6 +1,6 @@
 # S4 — Prospective complete-cycle public campaign freeze
 
-Status: Chief-only preparation under the owner's 2026-09-05 full-plan authorization. S1/S2/S3 are accepted. Exact accepted implementation: `5e226dcd1da6627358cede3dc7b688567663d979`; use a clean published release containing this implementation and current operator docs. No Builder active and no observer running. The prospective schedule below is frozen before any market request.
+Status: Chief-only preparation under the owner's 2026-09-05 full-plan authorization. S1/S2/S3 are accepted. Exact accepted implementation: `5e226dcd1da6627358cede3dc7b688567663d979`; use a clean published release containing this implementation and current operator docs. No Builder active. D1-W1 public observer is running; its exact deadline remains 2026-09-06T03:00:00Z. The prospective schedule below is frozen before any market request.
 
 Venue: central SPREAD, RISEx/Lighter public-only. Objective: obtain one bounded, reproducible execution-only observation of the fixed complete-cycle policy in SYSTEM_SPEC 0.21. Positive entry edge is not full-cycle PnL. Chief alone owns the operational gate, launches, evidence review and final verdict.
 
