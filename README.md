@@ -2,14 +2,13 @@
 
 This repository contains two deliberately separated research contours.
 
-- **RISEx Spread Shadow** is active. It asks whether hypothetical RISEx maker fills retain positive fee-adjusted entry edge against delayed executable exact-quantity Lighter Standard taker hedges. It is public-only shadow research with points valued at `$0`.
+- **RISEx Spread Shadow** is active. It evaluates one hypothetical RISEx–Lighter complete cycle, including delayed entry hedging, exit, partial fills, forced closure, fees and unresolved residues. Positive entry spread alone is not cycle profit. It is public-only shadow research with points valued at `$0`.
 - **RISEx Funding Farmer** is a frozen legacy benchmark. Its code and historical evidence remain available, but its funding-boundary profitability path and operational runs are not active.
 
 The public contour and normal startup authorize no private endpoints, credentials,
 signing, order preparation, order dispatch, testnet/mainnet writes, real funds,
-transfers, withdrawals, or strategy execution. The one opt-in Level-B fee-read
-boundary is described below; current acceptance state and the exact active
-boundary live in `STATUS.md` and `NEXT_TASK.md`.
+transfers, withdrawals, or strategy execution. The historical opt-in Level-B fee reader described below remains quarantined.
+Current acceptance state and the exact active boundary live in `STATUS.md` and `NEXT_TASK.md`.
 
 ## Requirements
 
@@ -37,6 +36,69 @@ The legacy benchmark retains the `risex-farmer` entrypoint documented below. It 
 
 The active contour uses the separate `risex-spread-shadow` entrypoint. It remains
 public-only and does not import the opt-in authenticated fee boundary below.
+
+### Complete-cycle research
+
+The accepted cycle path uses public BTC data only: hypothetical RISEx maker
+SELL entry, delayed Lighter Standard BUY hedge, and explicit paired exits.
+Target notional is $100 and entry threshold is 1 bp. RISEx modeled fees are
+1 bp maker / 3 bps taker; Lighter Standard is 0. Primary delays are 500 ms;
+stress uses 1000 ms and an additional 1 bp cost on each RISEx fill. Maximum
+holding time is 120 seconds. `SYSTEM_SPEC.md` defines the exact fixed policy.
+
+Offline commands make no network request:
+
+```bash
+risex-spread-shadow cycle-report /absolute/run/evidence.jsonl --format table
+risex-spread-shadow cycle-report /absolute/campaign-root --format json
+risex-spread-shadow cycle-freeze --help
+risex-spread-shadow cycle-collect --help
+```
+
+`cycle-report` replays saved causal events through the accepted kernel and
+checks persisted results. It separates validity, sufficiency, economics and
+usefulness. Primary and stress are alternatives: never add their turnover or
+PnL. Completed PnL includes modeled fees and costs; an unfinished cash-flow
+subtotal is not profit. Funding remains `UNKNOWN_EXECUTION_ONLY`.
+`forced_or_unmatched_full_cycle_pnl_usd` is full-cycle PnL;
+`forced_unmatched_exit_cashflow_usd` is only the executed forced/unmatched
+exit cashflow after its costs. Holding/occupancy runs from first maker fill
+to the terminal observation boundary. An unresolved exposure's observed
+duration does not establish its eventual closing time.
+
+A public campaign requires Chief-recorded prospective parameters in
+`NEXT_TASK.md` before any market request. Freeze exactly four 45-minute UTC
+windows over two days, two per day, using one clean accepted release:
+
+```bash
+risex-spread-shadow cycle-freeze --store-root /absolute/campaign-root \
+  --campaign-id CAMPAIGN_ID --accepted-release FULL_ACCEPTED_GIT_SHA \
+  --window WINDOW_1,START_1_UTC,END_1_UTC \
+  --window WINDOW_2,START_2_UTC,END_2_UTC \
+  --window WINDOW_3,START_3_UTC,END_3_UTC \
+  --window WINDOW_4,START_4_UTC,END_4_UTC
+risex-spread-shadow cycle-collect --store-root /absolute/campaign-root \
+  --manifest /absolute/campaign-root/.s3-cycle/CAMPAIGN_ID/manifest.json \
+  --window-id WINDOW_1 --format table
+```
+
+Replace placeholders only with the recorded campaign parameters. Use the same
+absolute root and release for every window. The manifest and create-once
+window claims are retained under `.s3-cycle`; never delete claims or change
+roots to retry a consumed window. Runtime storage is owner-only and excluded
+from Git. Collection admits entries until 42:45 and stops market processing
+at 45:00; the 135-second tail is reserved for closing. Campaign-wide caps
+are 1,000,000 records and 4 GiB, including reserves of 100,000 records and
+512 MiB. Missing closing evidence, resource failure or unresolved exposure
+cannot be upgraded to a complete profitable result.
+
+The descriptive screen requires 20 completed cycles and 20 filled dependence
+groups, with five cycles in at least three windows spanning both days. Primary
+PnL must be positive on both days, aggregate stress positive, and primary
+positive after removing its best dependence group. Groups are not proven
+independent; even a passing screen is hypothetical evidence, not trading
+authority. Fixtures remain `FIXTURE_ONLY`. No result-based stop, tuning,
+replacement window, extension or retry-to-pass is allowed.
 
 ### Fixed Spread scanner
 
