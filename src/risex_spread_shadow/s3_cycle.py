@@ -104,11 +104,21 @@ S3_WINDOW_SECONDS = 45 * 60
 S3_ENTRY_CUTOFF_SECONDS = 42 * 60 + 45
 S3_MARKET_DEADLINE_SECONDS = 45 * 60
 S3_CLOSING_TAIL_SECONDS = 135
+# The accepted S2 kernel admits at most one new decision per second on a
+# lane.  Decisions at the window start and exactly at the entry cutoff are
+# both admissible, so the bounded window can contain cutoff + 1 retained
+# terminal intervals.  Keep this derivation next to the S3 envelope rather
+# than inheriting the kernel's generic default or silently retiring identity
+# history when a dense public stream is supplied.
+S3_DECISION_MIN_INTERVAL_SECONDS = 1
+S3_MAX_DECISIONS_PER_LANE = (
+    S3_ENTRY_CUTOFF_SECONDS // S3_DECISION_MIN_INTERVAL_SECONDS
+) + 1
 S3_MAX_RECORDS = 1_000_000
 S3_RECORD_RESERVE = 100_000
 S3_MAX_BYTES = 4 * 1024 * 1024 * 1024
 S3_BYTES_RESERVE = 512 * 1024 * 1024
-S3_KERNEL_RETENTION_CAPACITY = 256
+S3_KERNEL_RETENTION_CAPACITY = S3_MAX_DECISIONS_PER_LANE
 S3_REQUIRED_COMPLETE_CYCLES = 20
 S3_REQUIRED_FILLED_GROUPS = 20
 S3_REQUIRED_WINDOWS_WITH_CYCLES = 3
@@ -320,6 +330,20 @@ class CycleEnvelope:
     @property
     def closing_tail_ns(self) -> int:
         return self.closing_tail_seconds * 1_000_000_000
+
+    @property
+    def required_kernel_retention_capacity(self) -> int:
+        """Conservative per-lane terminal retention for this S3 cutoff.
+
+        S2's one-second admission interval is the only rate bound used here.
+        The inclusive start/cutoff endpoints require one additional retained
+        terminal interval.  An explicitly smaller test envelope remains
+        valid so the kernel's fail-closed exhaustion path stays testable.
+        """
+
+        return (
+            self.entry_cutoff_seconds // S3_DECISION_MIN_INTERVAL_SECONDS
+        ) + 1
 
     def worst_configured_tail_ns(self, policy: CyclePolicy | None = None) -> int:
         """Return a conservative configured stress timeline to flatness.
