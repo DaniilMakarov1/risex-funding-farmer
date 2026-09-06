@@ -358,6 +358,8 @@ Report measurement validity, evidence sufficiency, economics and product usefuln
 
 Funding is UNKNOWN unless official public accrual and settlement evidence proves its treatment for the entire possible holding interval. The public-only fallback is explicitly execution-only reporting, never full break-even/profitability. Any positive result remains hypothetical and grants no trading authority. After the frozen campaign, stop, preserve the result and propose at most one substantive policy change tied to the observed cause; a new hypothesis/campaign requires a new owner decision.
 
+On `2026-09-06` the owner explicitly ended CYCLE-001 early as insufficient and cancelled both remaining D2 windows to proceed to concrete bug fixes and an independent offline audit. This supersedes completion of its remaining windows, preserves the immutable observations and frozen policy, and authorizes no replacement sample, new campaign or trading.
+
 ## Legacy benchmark domain: RISEx Funding Farmer
 
 Sections 1–21 below are preserved as the historical Funding Farmer specification. That strategy and its profitability path are frozen legacy benchmark material. They remain in the repository but are not active product behavior and must not supply strategy logic to RISEx Spread Shadow.
