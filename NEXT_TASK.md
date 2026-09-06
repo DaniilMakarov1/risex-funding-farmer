@@ -1,6 +1,6 @@
 # S4 — Prospective complete-cycle public campaign freeze
 
-Status: Chief-only preparation under the owner's 2026-09-05 full-plan authorization. S1/S2/S3 are accepted. Exact accepted implementation: `5e226dcd1da6627358cede3dc7b688567663d979`; use a clean published release containing this implementation and current operator docs. No Builder active. D1-W1 public observer is running; its exact deadline remains 2026-09-06T03:00:00Z. The prospective schedule below is frozen before any market request.
+Status: Chief-only preparation under the owner's 2026-09-05 full-plan authorization. S1/S2/S3 are accepted. Exact accepted implementation: `5e226dcd1da6627358cede3dc7b688567663d979`; use a clean published release containing this implementation and current operator docs. No Builder active. D1-W1 terminated with PUBLIC_SOCKET_TRANSPORT_FAILURE; D1-W2 is missed. No observer is active. Remaining D2 windows and aggregate caps are unchanged. See STATUS for the offline replay checkpoint. The prospective schedule below is frozen before any market request.
 
 Venue: central SPREAD, RISEx/Lighter public-only. Objective: obtain one bounded, reproducible execution-only observation of the fixed complete-cycle policy in SYSTEM_SPEC 0.21. Positive entry edge is not full-cycle PnL. Chief alone owns the operational gate, launches, evidence review and final verdict.
 
@@ -16,7 +16,7 @@ Venue: central SPREAD, RISEx/Lighter public-only. Objective: obtain one bounded,
 - Window `D2-W1`: 2026-09-07T02:15:00Z through 2026-09-07T03:00:00Z.
 - Window `D2-W2`: 2026-09-07T03:15:00Z through 2026-09-07T04:00:00Z.
 
-Moscow time is 05:15–06:00 and 06:15–07:00 on each day. All four intervals, policy and aggregate envelope are fixed now, not selected from outcomes. Launch each at its scheduled start with the accepted CLI; a delayed start cannot move the deadline. Missed/failed windows are not replaced. Check the retained claim and actual process before every launch; never duplicate a consumed attempt. Chief uses the same thread and may schedule its own follow-up through Codex; this does not delegate acceptance or create another Chief.
+Moscow time is 05:15–06:00 and 06:15–07:00 on each day. All four intervals, policy and aggregate envelope are fixed now, not selected from outcomes. Launch each at its scheduled start with the accepted CLI; a delayed start cannot move the deadline. Missed/failed windows are not replaced. Check the retained claim and actual process before every launch; never duplicate a consumed attempt. The sole current Chief may schedule follow-ups through Codex. At an owner-authorized clean Chief rotation, transfer the existing heartbeat to the successor and stop the predecessor; never duplicate coordination.
 
 ## Required before any public request
 
