@@ -8,7 +8,7 @@ S3-B1 candidate `c0af376efc76f61a874ac01f241acf7342186964` is ACCEPTED by Chief 
 
 ## Next bounded slice S3-B2 — live/replay memory
 
-Central SPREAD, Level A offline only. One fresh visible Luna max Builder from exact published main containing this gate, fresh `codex/spread-s3-b2` branch/worktree. Predecessor completion is confirmed; this gate is active. Before edits report root, branch, exact HEAD and status.
+Central SPREAD, Level A offline only. One fresh visible Luna max Builder has been dispatched from exact accepted base `44ca6248863bfa7b9b620dd3209d44d1ae6c797f`, branch `codex/spread-s3-b2`, worktree `/Users/daniilmakarov/.codex/worktrees/b8c2/RISEx Spread Shadow`. Predecessor completion is confirmed; this gate is active with no coordination blocker. Before edits Builder reports root, branch, exact HEAD and status.
 
 Observed A1 defects: the live driver retains every full stream input in `_stream_inputs`; `_read_run` loads the entire JSONL and report construction retains multiple bundles. These remain after B1. Objective: bounded streaming live bookkeeping and offline replay/report over existing evidence, preserving exact causal event ordering, contiguous identities, duplicate/conflict and terminal checks, kernel behavior, complete/aborted/unresolved states and every canonical report field. Implementation choices belong to Builder within this scope.
 
