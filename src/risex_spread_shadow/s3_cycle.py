@@ -52,6 +52,7 @@ from .causal import (
     CausalSourceIdentity,
 )
 from .cycle import (
+    CycleActionKind,
     CycleAdmission,
     CycleAttempt,
     CycleClock,
@@ -138,6 +139,16 @@ _RESOURCE_INCOMPLETE_MARKERS = frozenset(
     }
 )
 _UNAVAILABLE_RESULT_METRICS = (
+    "entry_quantity_total",
+    "hedged_quantity_total",
+    "unmatched_entry_quantity_total",
+    "fill_count",
+    "fee_count",
+    "cashflow_count",
+    "signed_cashflow_usd",
+    "total_fees_usd",
+    "scenario_cost_usd",
+    "net_cashflow_usd",
     "total_pnl_usd",
     "mean_pnl_usd",
     "gross_profit_usd",
@@ -148,7 +159,9 @@ _UNAVAILABLE_RESULT_METRICS = (
     "occupancy_holding_duration_seconds",
     "unmatched_exposure_duration_seconds",
     "forced_or_unmatched_pnl_usd",
+    "forced_or_unmatched_full_cycle_pnl_usd",
     "forced_unmatched_exit_contribution_usd",
+    "forced_unmatched_exit_cashflow_usd",
     "total_without_best_dependence_group_usd",
 )
 
@@ -2337,12 +2350,27 @@ def _fixture_attempt(
     )
     if kind == "forced":
         events = (
-            CausalEvent.from_trade(_fixture_trade(f"{version.version_id}-partial", base + 1_100_000_000, "0.50", "102", aggressor=Side.BUY)),
+            CausalEvent.from_trade(_fixture_trade(f"{version.version_id}-entry", base + 1_100_000_000, "1.00", "102", aggressor=Side.BUY)),
             *common,
-            _fixture_book(Venue.RISEX, base + 123_000_000_000, 4, asks=(("105", "10"),)),
-            _fixture_book(Venue.LIGHTER, base + 123_000_000_000, 4, bids=(("99", "10"),), asks=(("100", "10"),)),
+            # Partially fill the normal exit, then let the remaining paired
+            # quantity reach the explicit max-hold forced path.  This is the
+            # persisted S3 counterpart of the accepted partial-exit witness:
+            # full-cycle PnL remains distinct from the forced residual's net
+            # exit cash flow.
+            CausalEvent.from_trade(_fixture_trade(f"{version.version_id}-exit-partial", base + 4_600_000_000, "0.40", "97", aggressor=Side.SELL)),
+            _fixture_book(Venue.RISEX, base + 4_800_000_000, 4, asks=(("105", "10"),)),
+            _fixture_book(Venue.LIGHTER, base + 4_800_000_000, 4, bids=(("99", "10"),), asks=(("100", "10"),)),
+            _fixture_book(Venue.RISEX, base + 5_300_000_000, 5, asks=(("105", "10"),)),
+            _fixture_book(Venue.LIGHTER, base + 5_300_000_000, 5, bids=(("99", "10"),), asks=(("100", "10"),)),
+            # The partial exit schedules a forced residual after its delayed
+            # cancellation.  This paired witness is fresh for both the
+            # primary and stress forced-taker boundaries, so the fixture
+            # exercises a completed forced partial rather than an accidental
+            # stale-data unresolved result.
+            _fixture_book(Venue.RISEX, base + 6_300_000_000, 6, asks=(("105", "10"),)),
+            _fixture_book(Venue.LIGHTER, base + 6_300_000_000, 6, bids=(("99", "10"),), asks=(("100", "10"),)),
         )
-        end = base + 125_000_000_000
+        end = base + 8_000_000_000
     elif kind == "unresolved":
         events = (
             CausalEvent.from_trade(_fixture_trade(f"{version.version_id}-residue", base + 1_100_000_000, "0.50", "102", aggressor=Side.BUY)),
@@ -3274,6 +3302,35 @@ def _result_is_unresolved(result: CycleResult) -> bool:
     return result.status is CycleTerminalState.UNRESOLVED or result.status is CycleTerminalState.PENDING or not result.is_flat
 
 
+_FORCED_UNMATCHED_EXIT_KINDS = frozenset(
+    {
+        CycleActionKind.UNMATCHED_RISEX_UNWIND,
+        CycleActionKind.FORCED_RISEX_UNWIND,
+        CycleActionKind.FORCED_LIGHTER_UNWIND,
+    }
+)
+
+
+def _forced_unmatched_exit_cashflow(result: CycleResult) -> Decimal:
+    """Return only executed forced/unmatched exit net cash flow.
+
+    A forced cycle's full PnL includes its entry and any normal exit fills.
+    The report field named ``forced_unmatched_exit_contribution_usd`` is the
+    narrower executed cash-flow subtotal for the explicit forced/unmatched
+    action kinds, after their modeled fees and scenario costs.
+    """
+
+    action_kinds = {action.action_id: action.kind for action in result.actions}
+    return sum(
+        (
+            fill.net_cashflow_usd
+            for fill in result.fills
+            if action_kinds.get(fill.action_id) in _FORCED_UNMATCHED_EXIT_KINDS
+        ),
+        _ZERO,
+    )
+
+
 def _scenario_report(results: Sequence[CycleResult], scenario: CycleScenario) -> dict[str, Any]:
     selected = tuple(result for result in results if result.scenario is scenario)
     complete = tuple(result for result in selected if result.pnl_usd is not None and result.is_flat)
@@ -3294,10 +3351,36 @@ def _scenario_report(results: Sequence[CycleResult], scenario: CycleScenario) ->
     best_group = max(groups, key=lambda value: (groups[value], value)) if groups else None
     without_best = total - groups[best_group] if best_group is not None else None
     worst = min(complete, key=lambda result: (result.pnl_usd or _ZERO, result.quote_version_id)) if complete else None
-    forced_results = tuple(
+    forced_or_unmatched_results = tuple(
         result
-        for result in complete
+        for result in selected
         if result.forced or result.unmatched_entry_quantity > 0
+    )
+    forced_full_cycle_pnls = tuple(
+        result.pnl_usd for result in forced_or_unmatched_results
+    )
+    forced_full_cycle = (
+        _ZERO
+        if not forced_full_cycle_pnls
+        else None
+        if any(value is None for value in forced_full_cycle_pnls)
+        else sum((value for value in forced_full_cycle_pnls if value is not None), _ZERO)
+    )
+    fills = tuple(fill for result in selected for fill in result.fills)
+    entry_quantity = sum((result.entry_quantity for result in selected), _ZERO)
+    hedged_quantity = sum((result.hedged_quantity for result in selected), _ZERO)
+    unmatched_quantity = (
+        None
+        if any(not result.positions.authoritative for result in selected)
+        else sum((result.unmatched_entry_quantity for result in selected), _ZERO)
+    )
+    signed_cashflow = sum((fill.gross_cashflow_usd for fill in fills), _ZERO)
+    total_fees = sum((fill.fee_usd for fill in fills), _ZERO)
+    scenario_cost = sum((fill.scenario_cost_usd for fill in fills), _ZERO)
+    net_cashflow = sum((fill.net_cashflow_usd for fill in fills), _ZERO)
+    forced_exit_cashflow = sum(
+        (_forced_unmatched_exit_cashflow(result) for result in forced_or_unmatched_results),
+        _ZERO,
     )
     holding = sum((result.holding_duration_ns or 0 for result in selected), 0)
     unmatched = sum((result.unmatched_exposure_duration_ns or 0 for result in selected), 0)
@@ -3312,18 +3395,49 @@ def _scenario_report(results: Sequence[CycleResult], scenario: CycleScenario) ->
         "pnl_count": len(pnls),
         "total_pnl_usd": _decimal_text(total) if pnls else None,
         "mean_pnl_usd": _decimal_text(total / len(pnls)) if pnls else None,
-        "gross_profit_usd": _decimal_text(sum((value for value in pnls if value > 0), _ZERO)),
-        "gross_loss_usd": _decimal_text(sum((value for value in pnls if value < 0), _ZERO)),
+        "gross_profit_usd": (
+            _decimal_text(sum((value for value in pnls if value > 0), _ZERO))
+            if pnls
+            else None
+        ),
+        "gross_loss_usd": (
+            _decimal_text(sum((value for value in pnls if value < 0), _ZERO))
+            if pnls
+            else None
+        ),
         "negative_cycle_count": sum(value < 0 for value in pnls),
         "worst_cycle": None if worst is None else {"quote_version_id": worst.quote_version_id, "pnl_usd": str(worst.pnl_usd)},
-        "turnover_usd": _decimal_text(sum((result.turnover_usd for result in selected), _ZERO)),
+        "entry_quantity_total": _decimal_text(entry_quantity),
+        "hedged_quantity_total": _decimal_text(hedged_quantity),
+        "unmatched_entry_quantity_total": _decimal_text(unmatched_quantity),
+        "fill_count": len(fills),
+        "fee_count": len(fills),
+        "cashflow_count": len(fills),
+        "signed_cashflow_usd": _decimal_text(signed_cashflow),
+        "total_fees_usd": _decimal_text(total_fees),
+        "scenario_cost_usd": _decimal_text(scenario_cost),
+        "net_cashflow_usd": _decimal_text(net_cashflow),
+        "turnover_usd": _decimal_text(sum((fill.notional_usd for fill in fills), _ZERO)),
         "holding_duration_seconds": _decimal_text(Decimal(holding) / Decimal(1_000_000_000)),
         "occupancy_holding_duration_seconds": _decimal_text(Decimal(holding) / Decimal(1_000_000_000)),
         "unmatched_exposure_duration_seconds": _decimal_text(Decimal(unmatched) / Decimal(1_000_000_000)),
+        "duration_semantics": {
+            "holding_duration_seconds": "first_maker_fill_to_terminal_boundary",
+            "occupancy_holding_duration_seconds": "same_interval_as_holding_duration",
+            "unmatched_exposure_duration_seconds": (
+                "unmatched_start_to_resolution_or_unresolved_observation_boundary;"
+                " not_full_exposure_duration"
+            ),
+        },
         "filled_entry_dependence_group_count": len(groups),
         "filled_entry_identity_unresolved_count": unresolved_identity_count,
-        "forced_or_unmatched_pnl_usd": _decimal_text(sum((result.pnl_usd or _ZERO for result in forced_results), _ZERO)),
-        "forced_unmatched_exit_contribution_usd": _decimal_text(sum((result.pnl_usd or _ZERO for result in forced_results), _ZERO)),
+        # This is a full-cycle PnL subtotal, and is intentionally separate
+        # from the forced/unmatched exit cash-flow subtotal below.
+        "forced_or_unmatched_pnl_usd": _decimal_text(forced_full_cycle),
+        "forced_or_unmatched_full_cycle_pnl_usd": _decimal_text(forced_full_cycle),
+        "forced_unmatched_exit_contribution_usd": _decimal_text(forced_exit_cashflow),
+        "forced_unmatched_exit_cashflow_usd": _decimal_text(forced_exit_cashflow),
+        "forced_unmatched_exit_contribution_kind": "NET_CASHFLOW_SUBTOTAL",
         "best_dependence_group": best_group,
         "total_without_best_dependence_group_usd": _decimal_text(without_best),
         "funding_status": "UNKNOWN_EXECUTION_ONLY",
@@ -3563,15 +3677,6 @@ def build_cycle_report(path: str | os.PathLike[str]) -> dict[str, Any]:
         and len(qualifying_windows) >= S3_REQUIRED_WINDOWS_WITH_CYCLES
         and len({summary["day"] for summary in qualifying_windows}) >= 2
     )
-    robustness_pass = (
-        floors_pass
-        and len(days) >= 2
-        and all(value > 0 for value in days.values())
-        and stress["total_pnl_usd"] is not None
-        and Decimal(stress["total_pnl_usd"]) > 0
-        and primary_without_best is not None
-        and Decimal(primary_without_best) > 0
-    )
     aggregate_record_count = sum(bundle.record_count for bundle in bundles)
     aggregate_byte_count = sum(bundle.byte_count for bundle in bundles)
     aggregate_within_caps = (
@@ -3586,6 +3691,26 @@ def build_cycle_report(path: str | os.PathLike[str]) -> dict[str, Any]:
         and floors_pass
         and campaign_complete
     )
+    primary_positive_each_day = len(days) >= 2 and all(value > 0 for value in days.values())
+    aggregate_stress_positive = (
+        stress["total_pnl_usd"] is not None
+        and Decimal(stress["total_pnl_usd"]) > 0
+    )
+    primary_without_best_positive = (
+        primary_without_best is not None
+        and Decimal(primary_without_best) > 0
+    )
+    # The descriptive screen is only meaningful for structurally valid,
+    # complete evidence.  In particular, a RUN_FAILED terminal, unresolved
+    # result, or resource-limited prefix must never display SCREEN_PASS just
+    # because its retained positive prefix happens to meet the numerical
+    # floors.
+    robustness_pass = (
+        sufficient
+        and primary_positive_each_day
+        and aggregate_stress_positive
+        and primary_without_best_positive
+    )
     if not structurally_valid or unresolved_count:
         sufficiency_label = "INSUFFICIENT"
     elif not floors_pass:
@@ -3598,10 +3723,20 @@ def build_cycle_report(path: str | os.PathLike[str]) -> dict[str, Any]:
         usefulness = "SINGLE_WINDOW_DESCRIPTIVE_ONLY"
     elif not campaign_complete:
         usefulness = "INCOMPLETE_CAMPAIGN"
+    elif not sufficient:
+        usefulness = "INCOMPLETE_CAMPAIGN"
     elif robustness_pass:
         usefulness = "DESCRIPTIVE_CAMPAIGN_SCREEN_PASS"
     else:
         usefulness = "DESCRIPTIVE_CAMPAIGN_SCREEN_FAIL"
+    skipped_signal_count = sum(summary["skipped_signal_count"] for summary in summaries)
+    skipped_signal_reasons = sorted(
+        {
+            reason
+            for summary in summaries
+            for reason in summary["skipped_signal_reasons"]
+        }
+    )
     return {
         "schema_version": S3_SCHEMA_VERSION,
         "experiment_kind": S3_EXPERIMENT_KIND,
@@ -3640,6 +3775,8 @@ def build_cycle_report(path: str | os.PathLike[str]) -> dict[str, Any]:
             "bytes_reserve": envelope.bytes_reserve,
             "within_caps": aggregate_within_caps,
         },
+        "skipped_signal_count": skipped_signal_count,
+        "skipped_signal_reasons": skipped_signal_reasons,
         "economics": {
             "primary": primary,
             "stress": stress,
@@ -3648,6 +3785,15 @@ def build_cycle_report(path: str | os.PathLike[str]) -> dict[str, Any]:
             "days_primary_total_pnl_usd": {day: str(value) for day, value in sorted(days.items())},
             "funding_status": "UNKNOWN_EXECUTION_ONLY",
             "pnl_is_hypothetical": True,
+        },
+        "robustness": {
+            "campaign_shape_pass": campaign_shape_valid,
+            "floors_pass": floors_pass,
+            "primary_positive_each_day": primary_positive_each_day,
+            "aggregate_stress_positive": aggregate_stress_positive,
+            "primary_without_best_dependence_group_positive": primary_without_best_positive,
+            "pass": robustness_pass,
+            "screen_eligible": sufficient and evidence_mode == "OBSERVATIONAL",
         },
         "usefulness": {
             "label": usefulness,
@@ -3681,8 +3827,18 @@ def render_cycle_report(path: str | os.PathLike[str], *, format: str = "json") -
         f"campaign={report['campaign_id']} windows={report['window_count']}",
         f"validity={report['measurement_validity']} sufficiency={report['evidence_sufficiency']} usefulness={report['usefulness']['label']}",
         f"cycle_result_metrics={report['data_quality']['cycle_result_metrics_status']}",
-        f"primary cycles={primary['complete_cycle_count']} normal={primary['normal_count']} forced={primary['forced_count']} unresolved={primary['unresolved_count']} total_pnl={primary['total_pnl_usd']}",
-        f"stress cycles={stress['complete_cycle_count']} normal={stress['normal_count']} forced={stress['forced_count']} unresolved={stress['unresolved_count']} total_pnl={stress['total_pnl_usd']}",
+        f"primary cycles={primary['complete_cycle_count']} normal={primary['normal_count']} forced={primary['forced_count']} aborted={primary['aborted_count']} unresolved={primary['unresolved_count']} total_pnl={primary['total_pnl_usd']} mean_pnl={primary['mean_pnl_usd']} gross_profit={primary['gross_profit_usd']} gross_loss={primary['gross_loss_usd']} worst_cycle={primary['worst_cycle']}",
+        f"primary quantity_entry={primary['entry_quantity_total']} quantity_hedged={primary['hedged_quantity_total']} quantity_unmatched={primary['unmatched_entry_quantity_total']} fills={primary['fill_count']}",
+        f"primary cashflow_signed={primary['signed_cashflow_usd']} fees={primary['total_fees_usd']} net_cashflow={primary['net_cashflow_usd']} turnover={primary['turnover_usd']}",
+        f"primary holding_seconds={primary['holding_duration_seconds']} occupancy_seconds={primary['occupancy_holding_duration_seconds']} unmatched_duration_seconds={primary['unmatched_exposure_duration_seconds']}",
+        f"primary forced_full_cycle_pnl={primary['forced_or_unmatched_full_cycle_pnl_usd']} forced_exit_cashflow={primary['forced_unmatched_exit_cashflow_usd']} without_best={primary['total_without_best_dependence_group_usd']}",
+        f"stress cycles={stress['complete_cycle_count']} normal={stress['normal_count']} forced={stress['forced_count']} aborted={stress['aborted_count']} unresolved={stress['unresolved_count']} total_pnl={stress['total_pnl_usd']} mean_pnl={stress['mean_pnl_usd']} gross_profit={stress['gross_profit_usd']} gross_loss={stress['gross_loss_usd']} worst_cycle={stress['worst_cycle']}",
+        f"stress quantity_entry={stress['entry_quantity_total']} quantity_hedged={stress['hedged_quantity_total']} quantity_unmatched={stress['unmatched_entry_quantity_total']} fills={stress['fill_count']}",
+        f"stress cashflow_signed={stress['signed_cashflow_usd']} fees={stress['total_fees_usd']} net_cashflow={stress['net_cashflow_usd']} turnover={stress['turnover_usd']}",
+        f"stress holding_seconds={stress['holding_duration_seconds']} occupancy_seconds={stress['occupancy_holding_duration_seconds']} unmatched_duration_seconds={stress['unmatched_exposure_duration_seconds']}",
+        f"stress forced_full_cycle_pnl={stress['forced_or_unmatched_full_cycle_pnl_usd']} forced_exit_cashflow={stress['forced_unmatched_exit_cashflow_usd']} without_best={stress['total_without_best_dependence_group_usd']}",
+        f"robustness floors={report['robustness']['floors_pass']} primary_each_day={report['robustness']['primary_positive_each_day']} stress_positive={report['robustness']['aggregate_stress_positive']} without_best_positive={report['robustness']['primary_without_best_dependence_group_positive']} pass={report['robustness']['pass']}",
+        f"skipped_signals={report['skipped_signal_count']} reasons={report['skipped_signal_reasons']}",
         "funding=UNKNOWN_EXECUTION_ONLY positive_results=hypothetical_only trading_authority=NONE",
     ]
     for window in report["windows"]:
