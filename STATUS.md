@@ -1,12 +1,20 @@
 # Current status
 
-## Active owner objective — first working research pilot, 2026-09-07
+## Completed bounded owner objective — first raw scanner and one pilot, 2026-09-08
 
-S1a/S1b and RP3 saved-data report accepted; first public pilot NOT_RUN. Owner supersedes the immediate full S2 route with public recording -> saved stream -> existing S1b four alternatives (sequential offline allowed) -> verified CLI/table -> one 60-second technical smoke -> one frozen 15-minute pilot, entry/requote cutoff 12:45 and 135-second completion tail -> report/STOP. Full old S2, all-D1 migration, combined online capacity proof and four long windows are DEFERRED, not accepted. Policy/safety/caps unchanged. RP3 offline gate is accepted under the owner sole-implementer exception; only the specified60s smoke is now open.
+S1a/S1b/RP2/RP3 accepted; first raw scanner,60s technical smoke and one900s public pilot COMPLETED. Owner supersedes the immediate full S2 route with public recording -> saved stream -> existing S1b four alternatives (sequential offline allowed) -> verified CLI/table -> one 60-second technical smoke -> one frozen 15-minute pilot, entry/requote cutoff 12:45 and 135-second completion tail -> report/STOP. Full old S2, all-D1 migration, combined online capacity proof and four long windows are DEFERRED, not accepted. Policy/safety/caps unchanged. The finite authorized route is complete. STOP; further measurements and stage3 require an owner decision.
 
 Sole Chief `01a07cff-0729-7e71-bc73-0fcf96468ab1`, `[CHIEF] Research pilot — D1 diagnosis`; Astra/medium VERIFIED, actual speed UNKNOWN/Standard USER_SELECTED; task cost UNKNOWN. RP1 Builder `01a07d02-9e1c-7c43-b93f-dc475db25d61`, `[BUILDER] Research pilot — D1 diagnosis`, completed/stopped, clean `codex/spread-v1-rp1-d1-diagnosis` at base/HEAD `abdbb713c477273636a57e132349ed7bef4d4ba4`, no production changes. Builder actual model/effort/speed UNKNOWN (Luna/max/Standard requested). No collector, Goal, automation or scheduled follow-up.
 
-## RP3 — OFFLINE_ACCEPTED;60s technical smoke next
+## Final public result — TECHNICAL_COMPLETE / MODEL_NOT_EVALUATED_BY_STREAM
+
+Released CLI `record` -> `record-readback` -> `research-report` works on actual public BTC data. Exactly one60s smoke and one900s pilot used frozen release `8cddb446ddd5e699c760c962f26b1f8562aba3a9`; production/tests remain verified `b65e6bfe54f1287d0ef6935bddce78b20dc7c25f`. Both files COMPLETE, no confirmed losses, rejected book messages or unknown processing outcomes. No result-based repeat or policy change.
+
+Pilot48185records/46147296bytes, SHA256 `ecf9ef41de6891bcc8fc75f03516651c28243f95e4b0692a6e2e9056b82fbc01`. Collection900.002s; eligible384.616s (42.7%), ineligible515.386s. Both PRIMARY lanes active0.500s before terminal block; both STRESS11.000s. All four: zero modeled fills/closed cycles, closedPnL/fees/stress0, fundingUNKNOWN. Offline compute349.663s, separate from model time. Exactly764 decision attempts per lane, no admission/requote at or after765s. Independent receipt-age subtraction at blocks shows RISEx627466375ns /761839792ns >500ms. New observations establish application ingress pauses, not their exchange/network cause:4123 RISEx and11793 Lighter book receipts, longest pauses12.489s/3.154s, all linked to saved changes.
+
+Technical recording/readback/simulator/report path accepted; economics conclusion: model not evaluated by this stream, not demonstrated unprofitability. Scope/source/cutoff/duration partition/four alternatives/hash identities checked. Owner-only `rp3-chief-report/{final-acceptance.json,pilot-summary.md,pilot-report.json,pilot-table.md,pilot-freeze.json,pilot-block-age-check.json,pilot-ingress-diagnostics.json}` and smoke equivalents preserve provenance. CLI collector and report processes completed; no collector/Goal/automation/follow-up remains. Stage3 and additional measurements are CLOSED pending a new owner decision.
+
+## Prior RP3 offline acceptance checkpoint
 
 Accepted production/tests `b65e6bfe54f1287d0ef6935bddce78b20dc7c25f`, branch `codex/spread-v1-rp3-report`, base115f71f. `research-report` streams saved RP2 records through existing S1b sequentially for four scenarios; table/JSON, input and code hashes, fixed policy, model-second cadence, processing readiness,765s entry/requote cutoff for900s planned collection, exact eligibility and lane-block durations, separate open inventory/marks/fundingUNKNOWN. Trade/gap processing timestamps and collection start are now explicit. No new simulator or general storage/recovery platform.
 
