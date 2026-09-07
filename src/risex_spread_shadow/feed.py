@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 import hashlib
@@ -22,6 +22,7 @@ from risex_farmer.market_data import BookStream
 from risex_farmer.models import BookDelta, CanonicalMarket, OrderBook, Venue
 
 from .config import MAX_PUBLIC_DURATION_SECONDS, ShadowConfig
+from .book_chain import book_state_sha256
 from .models import BookEvidence, DataGapEvidence, TradeEvidence
 
 
@@ -119,6 +120,8 @@ class FeedBookEvent:
     market_pair: MarketPair
     source_kind: str
     checksum_validation: str
+    receipt_id: str | None = None
+    unchanged: bool = False
 
     def __post_init__(self) -> None:
         if self.book.venue not in (Venue.RISEX, Venue.LIGHTER):
@@ -129,6 +132,103 @@ class FeedBookEvent:
             raise ValueError("unsupported feed book source kind")
         if not self.checksum_validation:
             raise ValueError("checksum validation label must be non-empty")
+        if self.receipt_id is not None and not self.receipt_id:
+            raise ValueError("receipt_id must be non-empty when supplied")
+        if not isinstance(self.unchanged, bool):
+            raise TypeError("unchanged must be bool")
+
+
+@dataclass(frozen=True, slots=True)
+class FeedReceiptEvent:
+    """Compact application-level receipt captured before market filtering."""
+
+    receipt_id: str
+    venue: Venue
+    stream_session_id: str | int
+    recovery_generation: int
+    received_utc: datetime
+    received_monotonic_ns: int
+    frame_kind: str
+    frame_category: str
+    frame_length: int
+    frame_sha256: str
+    orderbook_candidate: bool
+    canonical_market: str | None = None
+    venue_symbol: str | None = None
+    market_id: str | int | None = None
+    message_type: str | None = None
+    channel: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.receipt_id, str) or not self.receipt_id:
+            raise ValueError("receipt_id must be a non-empty string")
+        venue = self.venue if isinstance(self.venue, Venue) else Venue(self.venue)
+        if venue not in (Venue.RISEX, Venue.LIGHTER):
+            raise ValueError("receipt venue must be RISEx or Lighter")
+        object.__setattr__(self, "venue", venue)
+        if isinstance(self.stream_session_id, bool) or not isinstance(
+            self.stream_session_id, (str, int)
+        ):
+            raise TypeError("receipt stream_session_id must be str or int")
+        if isinstance(self.stream_session_id, str) and not self.stream_session_id:
+            raise ValueError("receipt stream_session_id must be non-empty")
+        if (
+            isinstance(self.recovery_generation, bool)
+            or not isinstance(self.recovery_generation, int)
+            or self.recovery_generation < 0
+        ):
+            raise ValueError("receipt recovery_generation must be non-negative")
+        if not isinstance(self.received_utc, datetime):
+            raise TypeError("receipt received_utc must be datetime")
+        if self.received_utc.tzinfo is None or self.received_utc.utcoffset() is None:
+            raise ValueError("receipt received_utc must be timezone-aware")
+        if self.received_utc.utcoffset().total_seconds() != 0:
+            raise ValueError("receipt received_utc must use UTC")
+        if (
+            isinstance(self.received_monotonic_ns, bool)
+            or not isinstance(self.received_monotonic_ns, int)
+            or self.received_monotonic_ns < 0
+        ):
+            raise ValueError("receipt received_monotonic_ns must be non-negative")
+        for value, name, limit in (
+            (self.frame_kind, "frame_kind", 64),
+            (self.frame_category, "frame_category", 96),
+        ):
+            if (
+                not isinstance(value, str)
+                or not value
+                or len(value) > limit
+                or any(ord(character) < 0x20 or ord(character) > 0x7E for character in value)
+            ):
+                raise ValueError(f"receipt {name} must be bounded printable ASCII")
+        if (
+            isinstance(self.frame_length, bool)
+            or not isinstance(self.frame_length, int)
+            or not 0 <= self.frame_length <= _PROTOCOL_FRAME_LENGTH_CAP
+        ):
+            raise ValueError("receipt frame_length must be bounded")
+        if (
+            not isinstance(self.frame_sha256, str)
+            or len(self.frame_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in self.frame_sha256)
+        ):
+            raise ValueError("receipt frame_sha256 must be lowercase SHA-256")
+        if not isinstance(self.orderbook_candidate, bool):
+            raise TypeError("receipt orderbook_candidate must be bool")
+        for value, name in (
+            (self.canonical_market, "canonical_market"),
+            (self.venue_symbol, "venue_symbol"),
+            (self.message_type, "message_type"),
+            (self.channel, "channel"),
+        ):
+            if value is not None and (not isinstance(value, str) or not value):
+                raise ValueError(f"receipt {name} must be non-empty when supplied")
+        if self.market_id is not None and (
+            isinstance(self.market_id, bool)
+            or not isinstance(self.market_id, (str, int))
+            or self.market_id == ""
+        ):
+            raise TypeError("receipt market_id must be a non-empty string or int")
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,12 +236,15 @@ class FeedTradeEvent:
     trade: TradeEvidence
     market_pair: MarketPair
     raw_timestamp: str | int | None = None
+    receipt_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.trade.venue is not Venue.RISEX:
             raise ValueError("feed trades are RISEx maker evidence only")
         if self.trade.canonical_market != self.market_pair.canonical_market:
             raise ValueError("feed trade market does not match pair")
+        if self.receipt_id is not None and not self.receipt_id:
+            raise ValueError("receipt_id must be non-empty when supplied")
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,7 +252,7 @@ class FeedGapEvent:
     gap: DataGapEvidence
 
 
-IngressItem = FeedBookEvent | FeedTradeEvent | FeedGapEvent
+IngressItem = FeedReceiptEvent | FeedBookEvent | FeedTradeEvent | FeedGapEvent
 
 
 class IngressQueue:
@@ -199,6 +302,8 @@ class IngressQueue:
 
     @staticmethod
     def _item_received_monotonic_ns(item: IngressItem) -> int:
+        if isinstance(item, FeedReceiptEvent):
+            return item.received_monotonic_ns
         if isinstance(item, FeedBookEvent):
             return item.book.received_monotonic_ns
         if isinstance(item, FeedTradeEvent):
@@ -207,6 +312,8 @@ class IngressQueue:
 
     @staticmethod
     def _is_lighter_horizon_item(item: IngressItem) -> bool:
+        if isinstance(item, FeedReceiptEvent):
+            return False
         if isinstance(item, FeedBookEvent):
             return item.book.venue is Venue.LIGHTER
         if isinstance(item, FeedGapEvent):
@@ -268,6 +375,16 @@ class IngressQueue:
     def _item_gap(item: IngressItem) -> DataGapEvidence:
         if isinstance(item, FeedGapEvent):
             return item.gap
+        if isinstance(item, FeedReceiptEvent):
+            return DataGapEvidence(
+                source_venue=item.venue,
+                canonical_market=item.canonical_market or "UNKNOWN",
+                stream_session_id=item.stream_session_id,
+                recovery_generation=item.recovery_generation,
+                gap_start_monotonic_ns=item.received_monotonic_ns,
+                reason="QUEUE_OVERFLOW",
+                receipt_id=item.receipt_id,
+            )
         if isinstance(item, FeedBookEvent):
             book = item.book
             return DataGapEvidence(
@@ -277,6 +394,7 @@ class IngressQueue:
                 recovery_generation=book.recovery_generation,
                 gap_start_monotonic_ns=book.received_monotonic_ns,
                 reason="QUEUE_OVERFLOW",
+                receipt_id=item.receipt_id,
             )
         trade = item.trade
         return DataGapEvidence(
@@ -286,6 +404,7 @@ class IngressQueue:
             recovery_generation=trade.recovery_generation,
             gap_start_monotonic_ns=trade.received_monotonic_ns,
             reason="QUEUE_OVERFLOW",
+            receipt_id=item.receipt_id,
         )
 
     def _latch(self, gap: DataGapEvidence, *, offer_serial: int) -> None:
@@ -363,6 +482,14 @@ class IngressQueue:
                 None
                 if transport_gap is None
                 else transport_gap.transport_exception_type
+            ),
+            receipt_id=next(
+                (
+                    candidate.receipt_id
+                    for candidate in (previous, gap)
+                    if candidate.receipt_id is not None
+                ),
+                None,
             ),
         )
         self._latched_received[identity] = min(
@@ -470,6 +597,7 @@ class _StreamState:
     session_id: str | int | None = None
     recovery_generation: int = 0
     book_revision: int = 0
+    last_emitted_state_sha256: str | None = None
     connected: bool = False
     awaiting_snapshot: bool = True
 
@@ -488,6 +616,7 @@ class PublicFeedRunner:
         lighter_adapter: LighterAdapter | None = None,
         now_utc: Callable[[], datetime] | None = None,
         monotonic_ns: Callable[[], int] | None = None,
+        capture_receipts: bool = False,
     ) -> None:
         pairs = tuple(market_pairs)
         if not pairs or len(pairs) > 3:
@@ -502,6 +631,9 @@ class PublicFeedRunner:
         self.lighter = lighter_adapter or LighterAdapter(session)
         self._now_utc = now_utc or (lambda: datetime.now(UTC))
         self._monotonic_ns = monotonic_ns or time.monotonic_ns
+        if not isinstance(capture_receipts, bool):
+            raise TypeError("capture_receipts must be bool")
+        self.capture_receipts = capture_receipts
         self._states: dict[tuple[Venue, str], _StreamState] = {}
         self._pair_by_risex_symbol = {
             pair.risex_market.venue_symbol: pair for pair in pairs
@@ -530,6 +662,7 @@ class PublicFeedRunner:
             )
         self.fatal_reason: str | None = None
         self._connection_serial = {Venue.RISEX: 0, Venue.LIGHTER: 0}
+        self._receipt_serial = {Venue.RISEX: 0, Venue.LIGHTER: 0}
         self._external_stop_event: asyncio.Event | None = None
 
     def state(self, venue: Venue, canonical_market: str) -> _StreamState:
@@ -549,6 +682,7 @@ class PublicFeedRunner:
         recovery_generation: int | None = None,
         protocol_evidence: Mapping[str, Any] | None = None,
         transport_evidence: Mapping[str, Any] | None = None,
+        receipt_id: str | None = None,
     ) -> None:
         if session_id is None:
             session_id = state.session_id
@@ -582,6 +716,7 @@ class PublicFeedRunner:
                     transport_exception_type=transport_fields.get(
                         "transport_exception_type"
                     ),
+                    receipt_id=receipt_id,
                 )
             )
         )
@@ -612,6 +747,7 @@ class PublicFeedRunner:
             state.session_id = session_id
             state.connected = True
             state.awaiting_snapshot = True
+            state.last_emitted_state_sha256 = None
             state.stream.connected(now)
 
     def disconnect(
@@ -633,6 +769,7 @@ class PublicFeedRunner:
             state.stream.disconnected()
             state.connected = False
             state.awaiting_snapshot = True
+            state.last_emitted_state_sha256 = None
 
     def _record_transport_failure(self, venue: Venue, exc: BaseException) -> None:
         """Persist one sanitized unexpected transport failure and halt closed."""
@@ -655,6 +792,7 @@ class PublicFeedRunner:
             state.stream.gap()
             state.connected = False
             state.awaiting_snapshot = True
+            state.last_emitted_state_sha256 = None
 
     def _state_for_symbol(self, venue: Venue, symbol: str) -> _StreamState | None:
         pair = (
@@ -663,6 +801,155 @@ class PublicFeedRunner:
             else self._pair_by_lighter_symbol.get(symbol)
         )
         return None if pair is None else self.state(venue, pair.canonical_market)
+
+    @staticmethod
+    def _mapping_frame_evidence(payload: Mapping[str, Any]) -> tuple[int, str]:
+        """Hash a synthetic fixture mapping without persisting its contents."""
+
+        try:
+            encoded = json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        except (TypeError, ValueError):
+            encoded = type(payload).__name__.encode("ascii", "replace")
+        return _protocol_frame_evidence(encoded)
+
+    @staticmethod
+    def _bounded_text(value: Any, *, limit: int) -> str | None:
+        if value is None:
+            return None
+        text = str(value)
+        sanitized = "".join(
+            character if 0x20 <= ord(character) <= 0x7E else "?"
+            for character in text
+        )[:limit]
+        return sanitized or None
+
+    @staticmethod
+    def _payload_market_id(payload: Mapping[str, Any]) -> str | int | None:
+        value = payload.get("market_id")
+        if value is None and isinstance(payload.get("data"), Mapping):
+            value = payload["data"].get("market_id")
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            return None
+        if isinstance(value, str) and not value:
+            return None
+        return value
+
+    @staticmethod
+    def _payload_is_orderbook(payload: Mapping[str, Any] | None) -> bool:
+        if payload is None:
+            return False
+        message_type = str(payload.get("type", "")).lower()
+        channel = str(payload.get("channel", "")).lower()
+        return (
+            channel in {"orderbook", "order_book"}
+            or "orderbook" in message_type
+            or "order_book" in message_type
+            or isinstance(payload.get("order_book"), Mapping)
+        ) and message_type not in {"subscribed", "ack", "connected", "unsubscribed"}
+
+    def _receipt_context(
+        self,
+        venue: Venue,
+        payload: Mapping[str, Any] | None,
+    ) -> tuple[_StreamState | None, str | None, str | None, str | int | None]:
+        state: _StreamState | None = None
+        market_id = None if payload is None else self._payload_market_id(payload)
+        if market_id is not None:
+            if venue is Venue.RISEX:
+                pair = self._risex_by_market_id.get(market_id)
+                if pair is None:
+                    try:
+                        pair = self._risex_by_market_id.get(int(str(market_id)))
+                    except (TypeError, ValueError):
+                        pair = None
+            else:
+                pair = self._lighter_by_market_id.get(market_id)
+                if pair is None:
+                    try:
+                        pair = self._lighter_by_market_id.get(int(str(market_id)))
+                    except (TypeError, ValueError):
+                        pair = None
+            if pair is not None:
+                state = self.state(venue, pair.canonical_market)
+        if state is None:
+            state = next(
+                (
+                    candidate
+                    for (candidate_venue, _market), candidate in self._states.items()
+                    if candidate_venue is venue
+                ),
+                None,
+            )
+        symbol = None if state is None else state.venue_symbol
+        canonical_market = None if state is None else state.market_pair.canonical_market
+        return state, canonical_market, symbol, market_id
+
+    def _capture_receipt(
+        self,
+        venue: Venue,
+        *,
+        frame_kind: str,
+        frame_data: Any,
+        payload: Mapping[str, Any] | None,
+        received_at: datetime,
+        received_monotonic_ns: int,
+    ) -> FeedReceiptEvent | None:
+        if not self.capture_receipts:
+            return None
+        state, canonical_market, venue_symbol, market_id = self._receipt_context(
+            venue, payload
+        )
+        if payload is not None and frame_data is None:
+            frame_length, frame_sha256 = self._mapping_frame_evidence(payload)
+        else:
+            frame_length, frame_sha256 = _protocol_frame_evidence(frame_data)
+        message_type = (
+            None
+            if payload is None
+            else self._bounded_text(payload.get("type"), limit=64)
+        )
+        channel = (
+            None
+            if payload is None
+            else self._bounded_text(payload.get("channel"), limit=96)
+        )
+        orderbook_candidate = self._payload_is_orderbook(payload)
+        if orderbook_candidate:
+            category = "ORDERBOOK"
+        elif payload is None:
+            category = "UNPARSED_FRAME"
+        elif message_type in {"subscribed", "ack", "connected", "unsubscribed"}:
+            category = "CONTROL"
+        else:
+            category = "NON_ORDERBOOK"
+        self._receipt_serial[venue] += 1
+        receipt = FeedReceiptEvent(
+            receipt_id=f"{venue.value}:receipt-{self._receipt_serial[venue]}",
+            venue=venue,
+            stream_session_id=(
+                "unknown" if state is None or state.session_id is None else state.session_id
+            ),
+            recovery_generation=0 if state is None else state.recovery_generation,
+            received_utc=received_at,
+            received_monotonic_ns=received_monotonic_ns,
+            frame_kind=self._bounded_text(frame_kind, limit=64) or "UNKNOWN",
+            frame_category=category,
+            frame_length=frame_length,
+            frame_sha256=frame_sha256,
+            orderbook_candidate=orderbook_candidate,
+            canonical_market=canonical_market,
+            venue_symbol=venue_symbol,
+            market_id=market_id,
+            message_type=message_type,
+            channel=channel,
+        )
+        self.ingress.offer(receipt)
+        return receipt
 
     def _protocol_failure(
         self,
@@ -700,6 +987,7 @@ class PublicFeedRunner:
             )
             state.stream.gap()
             state.awaiting_snapshot = True
+            state.last_emitted_state_sha256 = None
 
     def _emit_book(
         self,
@@ -712,11 +1000,11 @@ class PublicFeedRunner:
         ingress_received_utc: datetime | None = None,
         ingress_received_monotonic_ns: int | None = None,
         normalized_ready_monotonic_ns: int | None = None,
+        receipt_id: str | None = None,
     ) -> None:
         orderbook = state.stream.book()
         if orderbook is None or state.session_id is None:
             return
-        state.book_revision += 1
         received_at = (
             self._now_utc()
             if ingress_received_utc is None
@@ -732,58 +1020,81 @@ class PublicFeedRunner:
             if normalized_ready_monotonic_ns is None
             else normalized_ready_monotonic_ns
         )
-        self.ingress.offer(
+        candidate = BookEvidence(
+            venue=state.venue,
+            canonical_market=state.market_pair.canonical_market,
+            bids=orderbook.bids,
+            asks=orderbook.asks,
+            received_monotonic_ns=received_ns,
+            stream_session_id=state.session_id,
+            recovery_generation=state.recovery_generation,
+            book_revision=state.book_revision,
+            sequence=orderbook.sequence,
+            checksum=checksum,
+            sequence_valid=state.stream.book_sequence_valid,
+            checksum_valid=state.stream.book_sequence_valid,
+            received_utc=received_at,
+            fresh=True,
+            ingress_received_monotonic_ns=received_ns,
+            normalized_ready_monotonic_ns=normalized_ns,
+            tx_hash=(None if normalized_source is None else normalized_source.tx_hash),
+            block_number=(
+                None if normalized_source is None else normalized_source.block_number
+            ),
+            log_index=(
+                None if normalized_source is None else normalized_source.log_index
+            ),
+            worker_timestamp=(
+                None
+                if normalized_source is None
+                else normalized_source.worker_timestamp
+            ),
+        )
+        state_digest = book_state_sha256(candidate)
+        unchanged = (
+            self.capture_receipts
+            and state.last_emitted_state_sha256 is not None
+            and state.last_emitted_state_sha256 == state_digest
+        )
+        if not unchanged:
+            state.book_revision += 1
+            candidate = replace(candidate, book_revision=state.book_revision)
+        if self.capture_receipts:
+            state.last_emitted_state_sha256 = state_digest
+        offered = self.ingress.offer(
             FeedBookEvent(
-                BookEvidence(
-                    venue=state.venue,
-                    canonical_market=state.market_pair.canonical_market,
-                    bids=orderbook.bids,
-                    asks=orderbook.asks,
-                    received_monotonic_ns=received_ns,
-                    stream_session_id=state.session_id,
-                    recovery_generation=state.recovery_generation,
-                    book_revision=state.book_revision,
-                    sequence=orderbook.sequence,
-                    checksum=checksum,
-                    sequence_valid=state.stream.book_sequence_valid,
-                    checksum_valid=state.stream.book_sequence_valid,
-                    received_utc=received_at,
-                    fresh=True,
-                    ingress_received_monotonic_ns=received_ns,
-                    normalized_ready_monotonic_ns=normalized_ns,
-                    tx_hash=(
-                        None
-                        if normalized_source is None
-                        else normalized_source.tx_hash
-                    ),
-                    block_number=(
-                        None
-                        if normalized_source is None
-                        else normalized_source.block_number
-                    ),
-                    log_index=(
-                        None
-                        if normalized_source is None
-                        else normalized_source.log_index
-                    ),
-                    worker_timestamp=(
-                        None
-                        if normalized_source is None
-                        else normalized_source.worker_timestamp
-                    ),
-                ),
+                candidate,
                 state.market_pair,
                 source_kind,
                 checksum_validation,
+                receipt_id=receipt_id,
+                unchanged=unchanged,
             )
         )
+        if self.capture_receipts and not offered:
+            # Do not let an undelivered event make a later message look like
+            # an unchanged durable state.
+            state.last_emitted_state_sha256 = None
 
-    async def _recover_market(self, state: _StreamState, ws: Any | None, *, reason: str) -> None:
+    async def _recover_market(
+        self,
+        state: _StreamState,
+        ws: Any | None,
+        *,
+        reason: str,
+        receipt_id: str | None = None,
+    ) -> None:
         old_generation = state.recovery_generation
-        self._gap(state, reason=reason, recovery_generation=old_generation)
+        self._gap(
+            state,
+            reason=reason,
+            recovery_generation=old_generation,
+            receipt_id=receipt_id,
+        )
         state.stream.gap()
         state.recovery_generation += 1
         state.awaiting_snapshot = True
+        state.last_emitted_state_sha256 = None
         if state.venue is Venue.RISEX:
             # RISEx exposes the selected orderbooks through one aggregate
             # subscription.  Its unsubscribe/resubscribe therefore invalidates
@@ -796,6 +1107,7 @@ class PublicFeedRunner:
                 other.stream.gap()
                 other.recovery_generation += 1
                 other.awaiting_snapshot = True
+                other.last_emitted_state_sha256 = None
             if ws is None or state.session_id is None:
                 return
             await ws.send_json(self.risex.orderbook_unsubscription())
@@ -843,10 +1155,21 @@ class PublicFeedRunner:
         ingress_received_monotonic_ns: int | None = None,
         normalized_ready_monotonic_ns: int | None = None,
         ws: Any | None = None,
+        receipt: FeedReceiptEvent | None = None,
     ) -> None:
         received_at = self._now_utc() if received_at is None else received_at
         if ingress_received_monotonic_ns is None:
             ingress_received_monotonic_ns = self._monotonic_ns()
+        if self.capture_receipts and receipt is None:
+            receipt = self._capture_receipt(
+                Venue.RISEX,
+                frame_kind="MAPPING",
+                frame_data=None,
+                payload=payload,
+                received_at=received_at,
+                received_monotonic_ns=ingress_received_monotonic_ns,
+            )
+        receipt_id = None if receipt is None else receipt.receipt_id
         channel = str(payload.get("channel", ""))
         message_type = str(payload.get("type", "")).lower()
         if message_type in {"subscribed", "unsubscribed", "ack", "connected"}:
@@ -872,7 +1195,10 @@ class PublicFeedRunner:
                     state.stream.snapshot(normalized, sequence=normalized.sequence)
                     if state.stream.book() is None:
                         await self._recover_market(
-                            state, ws, reason="RISEX_SNAPSHOT_INVALID"
+                            state,
+                            ws,
+                            reason="RISEX_SNAPSHOT_INVALID",
+                            receipt_id=receipt_id,
                         )
                         return
                     state.awaiting_snapshot = False
@@ -885,6 +1211,7 @@ class PublicFeedRunner:
                         ingress_received_utc=received_at,
                         ingress_received_monotonic_ns=ingress_received_monotonic_ns,
                         normalized_ready_monotonic_ns=normalized_ready_ns,
+                        receipt_id=receipt_id,
                     )
                     return
                 if not isinstance(normalized, BookDelta):
@@ -896,6 +1223,7 @@ class PublicFeedRunner:
                         state,
                         ws,
                         reason="RISEX_CHECKSUM_OR_SEQUENCE_INVALID",
+                        receipt_id=receipt_id,
                     )
                     return
                 self._emit_book(
@@ -907,6 +1235,7 @@ class PublicFeedRunner:
                     ingress_received_utc=received_at,
                     ingress_received_monotonic_ns=ingress_received_monotonic_ns,
                     normalized_ready_monotonic_ns=normalized_ready_ns,
+                    receipt_id=receipt_id,
                 )
             except (AttributeError, KeyError, TypeError, ValueError, ArithmeticError):
                 symbol = str(payload.get("market_id", ""))
@@ -918,7 +1247,12 @@ class PublicFeedRunner:
                 except (KeyError, TypeError, ValueError):
                     self.fatal_reason = "RISEX_BOOK_SCHEMA_UNCLASSIFIED"
                     return
-                await self._recover_market(state, ws, reason="RISEX_BOOK_SCHEMA_INVALID")
+                await self._recover_market(
+                    state,
+                    ws,
+                    reason="RISEX_BOOK_SCHEMA_INVALID",
+                    receipt_id=receipt_id,
+                )
             return
 
         if channel not in {"trades", "trade"} and not any(
@@ -978,6 +1312,7 @@ class PublicFeedRunner:
                     event,
                     state.market_pair,
                     normalized_trade.raw_timestamp,
+                    receipt_id=receipt_id,
                 )
             )
         except (AttributeError, KeyError, TypeError, ValueError, ArithmeticError):
@@ -989,7 +1324,11 @@ class PublicFeedRunner:
             except (KeyError, TypeError, ValueError):
                 self.fatal_reason = "RISEX_TRADE_SCHEMA_UNCLASSIFIED"
                 return
-            self._gap(state, reason="RISEX_TRADE_SCHEMA_INVALID")
+            self._gap(
+                state,
+                reason="RISEX_TRADE_SCHEMA_INVALID",
+                receipt_id=receipt_id,
+            )
 
     async def ingest_lighter_payload(
         self,
@@ -999,10 +1338,21 @@ class PublicFeedRunner:
         ingress_received_monotonic_ns: int | None = None,
         normalized_ready_monotonic_ns: int | None = None,
         ws: Any | None = None,
+        receipt: FeedReceiptEvent | None = None,
     ) -> None:
         received_at = self._now_utc() if received_at is None else received_at
         if ingress_received_monotonic_ns is None:
             ingress_received_monotonic_ns = self._monotonic_ns()
+        if self.capture_receipts and receipt is None:
+            receipt = self._capture_receipt(
+                Venue.LIGHTER,
+                frame_kind="MAPPING",
+                frame_data=None,
+                payload=payload,
+                received_at=received_at,
+                received_monotonic_ns=ingress_received_monotonic_ns,
+            )
+        receipt_id = None if receipt is None else receipt.receipt_id
         message_type = str(payload.get("type", ""))
         if not message_type.endswith("order_book"):
             return
@@ -1023,7 +1373,12 @@ class PublicFeedRunner:
             if initial and isinstance(normalized, OrderBook):
                 state.stream.snapshot(normalized, sequence=normalized.sequence)
                 if state.stream.book() is None:
-                    await self._recover_market(state, ws, reason="LIGHTER_SNAPSHOT_INVALID")
+                    await self._recover_market(
+                        state,
+                        ws,
+                        reason="LIGHTER_SNAPSHOT_INVALID",
+                        receipt_id=receipt_id,
+                    )
                     return
                 state.awaiting_snapshot = False
                 self._emit_book(
@@ -1035,13 +1390,17 @@ class PublicFeedRunner:
                     ingress_received_utc=received_at,
                     ingress_received_monotonic_ns=ingress_received_monotonic_ns,
                     normalized_ready_monotonic_ns=normalized_ready_ns,
+                    receipt_id=receipt_id,
                 )
             elif not initial and isinstance(normalized, BookDelta):
                 if state.awaiting_snapshot or not state.stream.book_initialized:
                     return
                 if not state.stream.apply_delta(normalized):
                     await self._recover_market(
-                        state, ws, reason="LIGHTER_SEQUENCE_INVALID_FRESH_RESUBSCRIBE"
+                        state,
+                        ws,
+                        reason="LIGHTER_SEQUENCE_INVALID_FRESH_RESUBSCRIBE",
+                        receipt_id=receipt_id,
                     )
                     return
                 self._emit_book(
@@ -1053,6 +1412,7 @@ class PublicFeedRunner:
                     ingress_received_utc=received_at,
                     ingress_received_monotonic_ns=ingress_received_monotonic_ns,
                     normalized_ready_monotonic_ns=normalized_ready_ns,
+                    receipt_id=receipt_id,
                 )
         except (AttributeError, KeyError, TypeError, ValueError, ArithmeticError):
             market_id = payload.get("market_id")
@@ -1062,7 +1422,12 @@ class PublicFeedRunner:
             except (KeyError, TypeError, ValueError):
                 self.fatal_reason = "LIGHTER_BOOK_SCHEMA_UNCLASSIFIED"
                 return
-            await self._recover_market(state, ws, reason="LIGHTER_BOOK_SCHEMA_INVALID")
+            await self._recover_market(
+                state,
+                ws,
+                reason="LIGHTER_BOOK_SCHEMA_INVALID",
+                receipt_id=receipt_id,
+            )
 
     async def _send_risex_heartbeat(self, ws: Any) -> None:
         action = self.risex.client_ping_action()
@@ -1152,8 +1517,18 @@ class PublicFeedRunner:
             ingress_received_utc = self._now_utc()
             ingress_received_monotonic_ns = self._monotonic_ns()
             kind = self._message_kind(message)
+            frame_data = getattr(message, "data", None)
+            payload = self._payload(message) if kind == "TEXT" else None
+            receipt = self._capture_receipt(
+                Venue.RISEX,
+                frame_kind=kind,
+                frame_data=frame_data,
+                payload=payload,
+                received_at=ingress_received_utc,
+                received_monotonic_ns=ingress_received_monotonic_ns,
+            )
             if kind == "PING":
-                action = self.risex.handle_server_ping(getattr(message, "data", b""))
+                action = self.risex.handle_server_ping(frame_data)
                 await ws.pong(action.payload)
                 if action.connection_confirmed:
                     self._confirm_venue(Venue.RISEX)
@@ -1168,7 +1543,6 @@ class PublicFeedRunner:
             elif kind == "ERROR":
                 raise ConnectionError("RISEx public websocket error")
             elif kind == "TEXT":
-                payload = self._payload(message)
                 if payload is not None:
                     if payload == {"type": "pong"}:
                         self._confirm_venue(Venue.RISEX)
@@ -1177,6 +1551,7 @@ class PublicFeedRunner:
                         received_at=ingress_received_utc,
                         ingress_received_monotonic_ns=ingress_received_monotonic_ns,
                         ws=ws,
+                        receipt=receipt,
                     )
                 else:
                     self._protocol_failure(
@@ -1209,8 +1584,18 @@ class PublicFeedRunner:
             ingress_received_utc = self._now_utc()
             ingress_received_monotonic_ns = self._monotonic_ns()
             kind = self._message_kind(message)
+            frame_data = getattr(message, "data", None)
+            payload = self._payload(message) if kind == "TEXT" else None
+            receipt = self._capture_receipt(
+                Venue.LIGHTER,
+                frame_kind=kind,
+                frame_data=frame_data,
+                payload=payload,
+                received_at=ingress_received_utc,
+                received_monotonic_ns=ingress_received_monotonic_ns,
+            )
             if kind == "PING":
-                await ws.pong(getattr(message, "data", b""))
+                await ws.pong(frame_data)
                 self._confirm_venue(Venue.LIGHTER)
                 continue
             if kind in {"CLOSE", "CLOSED", "CLOSING"}:
@@ -1224,7 +1609,6 @@ class PublicFeedRunner:
             if kind == "ERROR":
                 raise ConnectionError("Lighter public websocket error")
             if kind == "TEXT":
-                payload = self._payload(message)
                 if payload is not None:
                     if payload == {"type": "pong"}:
                         self._confirm_venue(Venue.LIGHTER)
@@ -1233,6 +1617,7 @@ class PublicFeedRunner:
                         received_at=ingress_received_utc,
                         ingress_received_monotonic_ns=ingress_received_monotonic_ns,
                         ws=ws,
+                        receipt=receipt,
                     )
                 else:
                     self._protocol_failure(
@@ -1472,6 +1857,7 @@ async def select_public_market_pairs(
 __all__ = [
     "FeedBookEvent",
     "FeedGapEvent",
+    "FeedReceiptEvent",
     "FeedTradeEvent",
     "IngressItem",
     "IngressQueue",

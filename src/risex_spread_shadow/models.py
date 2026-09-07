@@ -953,6 +953,7 @@ class DataGapEvidence:
     transport_event: str | None = None
     transport_failure_class: str | None = None
     transport_exception_type: str | None = None
+    receipt_id: str | None = None
 
     def __post_init__(self) -> None:
         venue = self.source_venue if isinstance(self.source_venue, Venue) else Venue(self.source_venue)
@@ -1031,6 +1032,8 @@ class DataGapEvidence:
                 raise ValueError(
                     "transport exception type requires unexpected transport failure"
                 )
+        if self.receipt_id is not None:
+            _optional_text(self.receipt_id, "receipt_id")
 
     @property
     def venue(self) -> Venue:

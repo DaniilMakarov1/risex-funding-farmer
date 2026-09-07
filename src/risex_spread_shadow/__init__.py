@@ -79,6 +79,7 @@ from .config import (
 from .feed import (
     FeedBookEvent,
     FeedGapEvent,
+    FeedReceiptEvent,
     FeedTradeEvent,
     IngressQueue,
     MarketPair,
@@ -86,6 +87,17 @@ from .feed import (
     select_public_market_pairs,
 )
 from .report import EvidenceIntegrityError, build_report, render_report
+from .recording import (
+    RECORDING_BYTES_RESERVE,
+    RECORDING_MAX_BYTES,
+    RECORDING_MAX_RECORDS,
+    RECORDING_RECORD_RESERVE,
+    RECORDING_SCHEMA_VERSION,
+    RECORDING_TERMINAL_RETENTION_CAPACITY,
+    RecordingReadbackError,
+    build_recording_readback,
+    render_recording_readback,
+)
 from .runner import (
     BookHistory,
     HistoryCapacityExceeded,
@@ -93,6 +105,7 @@ from .runner import (
     SampleStopController,
     SpreadObserver,
     SpreadShadowRunner,
+    run_public_recording,
     run_public_smoke,
 )
 from .store import (
@@ -267,6 +280,7 @@ __all__ = [
     "BookHistory",
     "FeedBookEvent",
     "FeedGapEvent",
+    "FeedReceiptEvent",
     "FeedTradeEvent",
     "HistoryCapacityExceeded",
     "IngressQueue",
@@ -299,6 +313,16 @@ __all__ = [
     "fixed_scanner_policy_fingerprint",
     "fixed_scanner_stage_fingerprint",
     "run_public_smoke",
+    "run_public_recording",
+    "RECORDING_BYTES_RESERVE",
+    "RECORDING_MAX_BYTES",
+    "RECORDING_MAX_RECORDS",
+    "RECORDING_RECORD_RESERVE",
+    "RECORDING_SCHEMA_VERSION",
+    "RECORDING_TERMINAL_RETENTION_CAPACITY",
+    "RecordingReadbackError",
+    "build_recording_readback",
+    "render_recording_readback",
     "select_public_market_pairs",
     "store_permissions",
     "CausalEvent",

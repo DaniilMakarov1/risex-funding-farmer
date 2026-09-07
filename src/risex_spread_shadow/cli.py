@@ -10,7 +10,8 @@ import subprocess
 
 from .config import MAX_PUBLIC_DURATION_SECONDS, ShadowConfig
 from .report import render_report
-from .runner import run_public_smoke
+from .recording import RecordingReadbackError, render_recording_readback
+from .runner import run_public_recording, run_public_smoke
 from .s3_cycle import (
     CycleEvidenceError,
     CycleWindow,
@@ -50,6 +51,20 @@ def _parser() -> argparse.ArgumentParser:
     smoke.add_argument("--market", action="append", default=[])
     smoke.add_argument("--duration-seconds", type=int, default=60)
     smoke.add_argument("--max-markets", type=int, default=3)
+    record = subparsers.add_parser(
+        "record",
+        help="bounded public-only recording with receipt/readback validation",
+    )
+    record.add_argument("--store-root", default="./spread-shadow-runs")
+    record.add_argument("--market", action="append", default=[])
+    record.add_argument("--duration-seconds", type=int, default=60)
+    record.add_argument("--max-markets", type=int, default=3)
+    record_report = subparsers.add_parser(
+        "record-readback",
+        help="offline readback of one public recording",
+    )
+    record_report.add_argument("path")
+    record_report.add_argument("--format", choices=("json", "table"), default="json")
     report = subparsers.add_parser("report", help="offline deterministic evidence report")
     report.add_argument("path")
     report.add_argument("--format", choices=("json", "table"), default="json")
@@ -128,6 +143,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "report":
         print(render_report(Path(args.path), format=args.format))
         return 0
+    if args.command == "record-readback":
+        try:
+            print(render_recording_readback(Path(args.path), format=args.format))
+        except (RecordingReadbackError, ValueError) as exc:
+            raise SystemExit(str(exc)) from exc
+        return 0
     if args.command == "scan-report":
         try:
             print(
@@ -194,8 +215,9 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.max_markets <= 0 or args.max_markets > 3:
         raise SystemExit("--max-markets must be between 1 and 3")
+    runner = run_public_recording if args.command == "record" else run_public_smoke
     result = asyncio.run(
-        run_public_smoke(
+        runner(
             args.store_root,
             requested_markets=tuple(args.market),
             source_commit=_source_commit(),

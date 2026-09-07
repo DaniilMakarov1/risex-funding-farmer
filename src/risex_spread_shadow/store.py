@@ -38,6 +38,7 @@ MAX_EVIDENCE_RECORDS = 2_500_000
 MAX_EVIDENCE_FILE_BYTES = 12 * 1024 * 1024 * 1024
 TERMINAL_FAILURE_RECORD_RESERVE = 1
 TERMINAL_FAILURE_BYTES_RESERVE = 16 * 1024
+_TERMINAL_KINDS = frozenset({"RUN_STOP", "RUN_FAILED"})
 
 
 class ScannerStageClaimError(RuntimeError):
@@ -203,20 +204,39 @@ class AppendOnlyEvidenceStore:
         *,
         max_records: int | None = None,
         max_bytes: int | None = None,
+        terminal_record_reserve: int | None = None,
+        terminal_bytes_reserve: int | None = None,
     ) -> None:
-        for value, name in ((max_records, "max_records"), (max_bytes, "max_bytes")):
+        terminal_record_reserve = (
+            TERMINAL_FAILURE_RECORD_RESERVE
+            if terminal_record_reserve is None
+            else terminal_record_reserve
+        )
+        terminal_bytes_reserve = (
+            TERMINAL_FAILURE_BYTES_RESERVE
+            if terminal_bytes_reserve is None
+            else terminal_bytes_reserve
+        )
+        for value, name in (
+            (max_records, "max_records"),
+            (max_bytes, "max_bytes"),
+            (terminal_record_reserve, "terminal_record_reserve"),
+            (terminal_bytes_reserve, "terminal_bytes_reserve"),
+        ):
             if value is not None and (
                 isinstance(value, bool) or not isinstance(value, int) or value <= 0
             ):
                 raise ValueError(f"{name} must be a positive integer")
-        if max_records is not None and max_records <= TERMINAL_FAILURE_RECORD_RESERVE:
+        if max_records is not None and max_records <= terminal_record_reserve:
             raise ValueError("max_records must leave a terminal-marker reserve")
-        if max_bytes is not None and max_bytes <= TERMINAL_FAILURE_BYTES_RESERVE:
+        if max_bytes is not None and max_bytes <= terminal_bytes_reserve:
             raise ValueError("max_bytes must leave a terminal-marker reserve")
         self.path = Path(path)
         self.run_id = run_id
         self.max_records = max_records
         self.max_bytes = max_bytes
+        self.terminal_record_reserve = terminal_record_reserve
+        self.terminal_bytes_reserve = terminal_bytes_reserve
         self._closed = False
         self._record_index = 0
         self._bytes_written = 0
@@ -243,6 +263,8 @@ class AppendOnlyEvidenceStore:
         run_id: str | None = None,
         max_records: int | None = None,
         max_bytes: int | None = None,
+        terminal_record_reserve: int | None = None,
+        terminal_bytes_reserve: int | None = None,
     ) -> "AppendOnlyEvidenceStore":
         identity = run_id or new_run_id()
         if not identity or "/" in identity or "\\" in identity:
@@ -259,6 +281,8 @@ class AppendOnlyEvidenceStore:
             payload,
             max_records=max_records,
             max_bytes=max_bytes,
+            terminal_record_reserve=terminal_record_reserve,
+            terminal_bytes_reserve=terminal_bytes_reserve,
         )
 
     @property
@@ -297,9 +321,7 @@ class AppendOnlyEvidenceStore:
                 enumerate(normalized), key=lambda item: _record_order(item[1], item[0])
             )
         )
-        terminal_failure = (
-            len(ordered) == 1 and ordered[0].get("kind") == "RUN_FAILED"
-        )
+        terminal_failure = len(ordered) == 1 and ordered[0].get("kind") in _TERMINAL_KINDS
         configured_max_records = (
             MAX_EVIDENCE_RECORDS if self.max_records is None else self.max_records
         )
@@ -309,7 +331,7 @@ class AppendOnlyEvidenceStore:
         record_limit = (
             configured_max_records
             if terminal_failure
-            else configured_max_records - TERMINAL_FAILURE_RECORD_RESERVE
+            else configured_max_records - self.terminal_record_reserve
         )
         serialized: list[str] = []
         assigned: list[int] = []
@@ -327,7 +349,7 @@ class AppendOnlyEvidenceStore:
         byte_limit = (
             configured_max_bytes
             if terminal_failure
-            else configured_max_bytes - TERMINAL_FAILURE_BYTES_RESERVE
+            else configured_max_bytes - self.terminal_bytes_reserve
         )
         if self._record_index + len(ordered) > record_limit:
             raise EvidenceStorageLimitExceeded("RECORD_COUNT")

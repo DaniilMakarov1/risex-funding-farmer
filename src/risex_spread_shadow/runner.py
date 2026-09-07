@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 import platform
@@ -28,6 +28,7 @@ from .evidence import (
 from .feed import (
     FeedBookEvent,
     FeedGapEvent,
+    FeedReceiptEvent,
     FeedTradeEvent,
     IngressItem,
     IngressQueue,
@@ -55,6 +56,14 @@ from .book_chain import (
     BookRevisionEncoder,
     book_state_sha256,
 )
+from .recording import (
+    RECORDING_BYTES_RESERVE,
+    RECORDING_MAX_BYTES,
+    RECORDING_MAX_RECORDS,
+    RECORDING_RECORD_RESERVE,
+    RECORDING_TERMINAL_RETENTION_CAPACITY,
+    build_recording_readback,
+)
 from .store import AppendOnlyEvidenceStore, EvidenceStorageLimitExceeded
 
 
@@ -68,6 +77,7 @@ _MATERIAL_DETECTION_TIMESTAMP_LIMIT = 5
 # irrelevant accepted trades do not consume the economic sample prematurely;
 # overflow remains a named integrity failure rather than an unsafe eviction.
 _TRADE_IDENTITY_CAPACITY = 100_000
+_RECORDING_FRESHNESS_MAX_AGE_NS = 500_000_000
 
 
 class HistoryCapacityExceeded(RuntimeError):
@@ -734,6 +744,7 @@ class SpreadObserver:
         directions: Sequence[SpreadDirection] | None = None,
         material_stop_enabled: bool = True,
         enforce_sample_deadline: bool = False,
+        recording_mode: bool = False,
     ) -> None:
         self.config = config
         self.market_pairs = tuple(market_pairs)
@@ -758,7 +769,18 @@ class SpreadObserver:
         if not isinstance(enforce_sample_deadline, bool):
             raise TypeError("enforce_sample_deadline must be bool")
         self.enforce_sample_deadline = enforce_sample_deadline
-        self.ingress = IngressQueue(config.ingress_queue_capacity)
+        if not isinstance(recording_mode, bool):
+            raise TypeError("recording_mode must be bool")
+        self.recording_mode = recording_mode
+        # Candidate receipts are held only until their processing outcome is
+        # observed.  This lets the recording path make a filtered/unemitted
+        # order-book frame explicit at the end of a clean prefix without
+        # retaining raw payloads or creating a second queue.
+        self._recording_pending_receipts: dict[str, FeedReceiptEvent] = {}
+        self.ingress = IngressQueue(
+            config.ingress_queue_capacity,
+            preserve_offer_order=recording_mode,
+        )
         self._now_utc = now_utc or (lambda: datetime.now(UTC))
         self._monotonic_ns = monotonic_ns or time.monotonic_ns
         self.history = BookHistory(
@@ -1235,7 +1257,8 @@ class SpreadObserver:
             # them immediately so a later cap/failure cannot hide the reserved
             # terminal evidence; normal books/quotes/trades stay batched.
             if any(
-                record.get("kind") in {"DATA_GAP", "SAMPLE_STOP"}
+                record.get("kind")
+                in {"DATA_GAP", "SAMPLE_STOP", "PUBLIC_RECEIPT_OUTCOME"}
                 for record in incoming
             ):
                 await self._flush_pending_batch_locked()
@@ -1244,6 +1267,98 @@ class SpreadObserver:
         book = event.book
         record = self._book_encoder.encode(book, source_kind=event.source_kind)
         record["checksum_validation"] = event.checksum_validation
+        if event.receipt_id is not None:
+            record["receipt_id"] = event.receipt_id
+        return record
+
+    @staticmethod
+    def _receipt_record(event: FeedReceiptEvent) -> dict[str, Any]:
+        record: dict[str, Any] = {
+            "kind": "PUBLIC_RECEIPT",
+            "receipt_id": event.receipt_id,
+            "venue": event.venue.value,
+            "canonical_market": event.canonical_market,
+            "venue_symbol": event.venue_symbol,
+            "market_id": event.market_id,
+            "stream_session_id": event.stream_session_id,
+            "recovery_generation": event.recovery_generation,
+            "received_utc": event.received_utc,
+            "received_monotonic_ns": event.received_monotonic_ns,
+            "frame_kind": event.frame_kind,
+            "frame_category": event.frame_category,
+            "frame_length": event.frame_length,
+            "frame_sha256": event.frame_sha256,
+            "orderbook_candidate": event.orderbook_candidate,
+            "message_type": event.message_type,
+            "channel": event.channel,
+            "observed_monotonic_ns": event.received_monotonic_ns,
+        }
+        return record
+
+    def _receipt_outcome(
+        self,
+        *,
+        receipt_id: str | None,
+        venue: Venue,
+        market: str | None,
+        received_monotonic_ns: int,
+        processing_outcome: str,
+        reason: str,
+        link_status: str,
+        book: BookEvidence | None = None,
+        source_kind: str | None = None,
+        gap: DataGapEvidence | None = None,
+        data_status: str = "UNKNOWN",
+        data_status_reason: str | None = None,
+    ) -> dict[str, Any]:
+        if processing_outcome not in {"CHANGED", "UNCHANGED", "REJECTED"}:
+            raise ValueError("unsupported receipt processing outcome")
+        if self.recording_mode and receipt_id is not None:
+            self._recording_pending_receipts.pop(receipt_id, None)
+        record: dict[str, Any] = {
+            "kind": "PUBLIC_RECEIPT_OUTCOME",
+            "receipt_id": receipt_id,
+            "venue": venue.value,
+            "canonical_market": market,
+            "received_monotonic_ns": received_monotonic_ns,
+            "processing_outcome": processing_outcome,
+            "outcome": processing_outcome,
+            "reason": reason,
+            "link_status": link_status,
+            "persistence_status": link_status,
+            "data_status": data_status,
+            "data_status_reason": data_status_reason or reason,
+            "observed_monotonic_ns": received_monotonic_ns,
+        }
+        if source_kind is not None:
+            record["source_kind"] = source_kind
+        if book is not None:
+            record.update(
+                {
+                    "linked_book_revision_id": book.book_revision_id,
+                    "linked_book_revision": book.book_revision,
+                    "linked_book_state_sha256": book_state_sha256(book),
+                    "book_received_monotonic_ns": book.received_monotonic_ns,
+                    "sequence": book.sequence,
+                    "checksum": book.checksum,
+                    "sequence_valid": book.sequence_valid,
+                    "checksum_valid": book.checksum_valid,
+                    "fresh": book.fresh,
+                }
+            )
+        else:
+            record.update(
+                {
+                    "linked_book_revision_id": None,
+                    "linked_book_revision": None,
+                    "linked_book_state_sha256": None,
+                    "book_received_monotonic_ns": None,
+                }
+            )
+        if gap is not None:
+            record["gap_reason"] = gap.reason
+            record["gap_start_monotonic_ns"] = gap.gap_start_monotonic_ns
+            record["gap_end_monotonic_ns"] = gap.gap_end_monotonic_ns
         return record
 
     def _gap_record(self, gap: DataGapEvidence) -> dict[str, Any]:
@@ -1273,6 +1388,8 @@ class SpreadObserver:
             record["transport_failure_class"] = gap.transport_failure_class
         if gap.transport_exception_type is not None:
             record["transport_exception_type"] = gap.transport_exception_type
+        if gap.receipt_id is not None:
+            record["receipt_id"] = gap.receipt_id
         return record
 
     def _book_admissible(self, event: FeedBookEvent) -> bool:
@@ -1823,7 +1940,260 @@ class SpreadObserver:
                     )
         return records, versions
 
+    def _recording_book_status(
+        self,
+        book: BookEvidence,
+        *,
+        unchanged: bool,
+        baseline: BookEvidence | None,
+    ) -> tuple[str, str]:
+        if not book.is_sequence_healthy:
+            return "INVALID", "BOOK_SEQUENCE_OR_CHECKSUM_UNHEALTHY"
+        if not book.fresh:
+            return "INVALID", "BOOK_NOT_FRESH"
+        if not unchanged:
+            return "VALID", "BOOK_STATE_PERSISTED"
+        if baseline is None:
+            return "UNKNOWN", "UNCHANGED_BASELINE_MISSING"
+        if not baseline.is_sequence_healthy:
+            return "INVALID", "BASELINE_SEQUENCE_OR_CHECKSUM_UNHEALTHY"
+        age = book.received_monotonic_ns - baseline.received_monotonic_ns
+        if age > _RECORDING_FRESHNESS_MAX_AGE_NS:
+            return "STALE", "BOOK_AGE_EXCEEDS_500MS"
+        # An unchanged message preserves the existing economic timestamp.  It
+        # is useful evidence of a still-identical state, not a fresh timestamp
+        # refresh or a proof of future execution.
+        return "VALID_UNCHANGED_STATE", "UNCHANGED_STATE_PRESERVED"
+
+    async def _handle_recording_book(self, event: FeedBookEvent) -> None:
+        """Persist receipt-linked book state without running economics."""
+
+        book = event.book
+        key = (book.venue, book.canonical_market)
+        baseline = self._current_books.get(key)
+        if self._sample_frozen and book.venue is not Venue.LIGHTER:
+            await self._append(
+                (
+                    self._receipt_outcome(
+                        receipt_id=event.receipt_id,
+                        venue=book.venue,
+                        market=book.canonical_market,
+                        received_monotonic_ns=book.received_monotonic_ns,
+                        processing_outcome="REJECTED",
+                        reason="SAMPLE_FROZEN",
+                        link_status="NO_RECORD",
+                        source_kind=event.source_kind,
+                        data_status="UNKNOWN",
+                    ),
+                )
+            )
+            return
+        if not self._book_admissible(event):
+            if key in self._awaiting_fresh_snapshot:
+                reason = "AWAITING_FRESH_SNAPSHOT"
+            elif (
+                baseline is not None
+                and (
+                    baseline.stream_session_id != book.stream_session_id
+                    or baseline.recovery_generation != book.recovery_generation
+                )
+            ):
+                reason = "DISPLACED_STREAM_IDENTITY"
+            else:
+                reason = "BOOK_NOT_ADMISSIBLE"
+            await self._append(
+                (
+                    self._receipt_outcome(
+                        receipt_id=event.receipt_id,
+                        venue=book.venue,
+                        market=book.canonical_market,
+                        received_monotonic_ns=book.received_monotonic_ns,
+                        processing_outcome="REJECTED",
+                        reason=reason,
+                        link_status="NO_RECORD",
+                        source_kind=event.source_kind,
+                        data_status="UNKNOWN",
+                    ),
+                )
+            )
+            return
+
+        if event.unchanged:
+            if baseline is None:
+                await self._append(
+                    (
+                        self._receipt_outcome(
+                            receipt_id=event.receipt_id,
+                            venue=book.venue,
+                            market=book.canonical_market,
+                            received_monotonic_ns=book.received_monotonic_ns,
+                            processing_outcome="REJECTED",
+                            reason="UNCHANGED_BASELINE_MISSING",
+                            link_status="NO_RECORD",
+                            source_kind=event.source_kind,
+                            data_status="UNKNOWN",
+                        ),
+                    )
+                )
+                return
+            if book_state_sha256(book) != book_state_sha256(baseline):
+                await self._receipt_outcome_for_invalid_book(
+                    event,
+                    reason="UNCHANGED_STATE_DIGEST_MISMATCH",
+                )
+                return
+            status, status_reason = self._recording_book_status(
+                book,
+                unchanged=True,
+                baseline=baseline,
+            )
+            await self._append(
+                (
+                    self._receipt_outcome(
+                        receipt_id=event.receipt_id,
+                        venue=book.venue,
+                        market=book.canonical_market,
+                        received_monotonic_ns=book.received_monotonic_ns,
+                        processing_outcome="UNCHANGED",
+                        reason="NO_STATE_CHANGE",
+                        link_status="EXISTING_BOOK_STATE",
+                        book=baseline,
+                        source_kind=event.source_kind,
+                        data_status=status,
+                        data_status_reason=status_reason,
+                    ),
+                )
+            )
+            return
+
+        stream_identity = (book.stream_session_id, book.recovery_generation)
+        if self._current_stream_identities.get(key) == stream_identity:
+            rank = (
+                book.received_monotonic_ns,
+                book.book_revision,
+                -1 if book.sequence is None else book.sequence,
+            )
+            previous_rank = self._last_book_ranks.get(key)
+            if previous_rank is not None and rank <= previous_rank:
+                self.fatal_reason = "BOOK_REVISION_CHAIN_INVALID"
+                await self.handle_gap(
+                    FeedGapEvent(
+                        DataGapEvidence(
+                            source_venue=book.venue,
+                            canonical_market=book.canonical_market,
+                            stream_session_id=book.stream_session_id,
+                            recovery_generation=book.recovery_generation,
+                            gap_start_monotonic_ns=book.received_monotonic_ns,
+                            reason="BOOK_REVISION_CHAIN_INVALID",
+                            receipt_id=event.receipt_id,
+                        )
+                    )
+                )
+                return
+            self._last_book_ranks[key] = rank
+        else:
+            self._last_book_ranks[key] = (
+                book.received_monotonic_ns,
+                book.book_revision,
+                -1 if book.sequence is None else book.sequence,
+            )
+        if key in self._awaiting_fresh_snapshot:
+            self._awaiting_fresh_snapshot.remove(key)
+            self._gapped_identities.pop(key, None)
+        self._current_stream_identities[key] = stream_identity
+        try:
+            book_record = self._book_record(event)
+        except BookRevisionChainError:
+            self.fatal_reason = "BOOK_REVISION_CHAIN_INVALID"
+            await self.handle_gap(
+                FeedGapEvent(
+                    DataGapEvidence(
+                        source_venue=book.venue,
+                        canonical_market=book.canonical_market,
+                        stream_session_id=book.stream_session_id,
+                        recovery_generation=book.recovery_generation,
+                        gap_start_monotonic_ns=book.received_monotonic_ns,
+                        reason="BOOK_REVISION_CHAIN_INVALID",
+                        receipt_id=event.receipt_id,
+                    )
+                )
+            )
+            return
+        try:
+            self.history.add_book(book, source_kind=event.source_kind)
+        except HistoryCapacityExceeded as exc:
+            self.fatal_reason = "BOOK_HISTORY_CAPACITY"
+            gap = exc.gap
+            await self.handle_gap(
+                FeedGapEvent(
+                    replace(gap, receipt_id=event.receipt_id)
+                )
+            )
+            return
+        except (TypeError, ValueError):
+            self.fatal_reason = "BOOK_REVISION_CHAIN_INVALID"
+            await self.handle_gap(
+                FeedGapEvent(
+                    DataGapEvidence(
+                        source_venue=book.venue,
+                        canonical_market=book.canonical_market,
+                        stream_session_id=book.stream_session_id,
+                        recovery_generation=book.recovery_generation,
+                        gap_start_monotonic_ns=book.received_monotonic_ns,
+                        reason="BOOK_REVISION_CHAIN_INVALID",
+                        receipt_id=event.receipt_id,
+                    )
+                )
+            )
+            return
+        self._current_books[key] = book
+        status, status_reason = self._recording_book_status(
+            book,
+            unchanged=False,
+            baseline=baseline,
+        )
+        outcome = self._receipt_outcome(
+            receipt_id=event.receipt_id,
+            venue=book.venue,
+            market=book.canonical_market,
+            received_monotonic_ns=book.received_monotonic_ns,
+            processing_outcome="CHANGED",
+            reason="BOOK_STATE_CHANGED",
+            link_status="PERSISTED_BOOK",
+            book=book,
+            source_kind=event.source_kind,
+            data_status=status,
+            data_status_reason=status_reason,
+        )
+        await self._append((book_record, outcome))
+        self._prune_state(book.received_monotonic_ns)
+
+    async def _receipt_outcome_for_invalid_book(
+        self,
+        event: FeedBookEvent,
+        *,
+        reason: str,
+    ) -> None:
+        await self._append(
+            (
+                self._receipt_outcome(
+                    receipt_id=event.receipt_id,
+                    venue=event.book.venue,
+                    market=event.book.canonical_market,
+                    received_monotonic_ns=event.book.received_monotonic_ns,
+                    processing_outcome="REJECTED",
+                    reason=reason,
+                    link_status="NO_RECORD",
+                    source_kind=event.source_kind,
+                    data_status="INVALID",
+                ),
+            )
+        )
+
     async def handle_book(self, event: FeedBookEvent) -> None:
+        if self.recording_mode:
+            await self._handle_recording_book(event)
+            return
         book = event.book
         if self._sample_frozen and book.venue is not Venue.LIGHTER:
             return
@@ -1946,6 +2316,41 @@ class SpreadObserver:
         self._awaiting_fresh_snapshot.add(stream_key)
         self.history.add_gap(gap)
         self._current_books.pop((gap.source_venue, gap.canonical_market), None)
+        if self.recording_mode:
+            observed_reason = gap.reason
+            loss_reason = gap.reason in {
+                "QUEUE_OVERFLOW",
+                "EVIDENCE_STORE_WRITE_FAILED",
+                "EVIDENCE_STORAGE_LIMIT",
+                "EVIDENCE_APPEND_CANCELLED",
+            }
+            output_records: list[Mapping[str, Any]] = [self._gap_record(gap)]
+            if gap.receipt_id is not None:
+                output_records.append(
+                    self._receipt_outcome(
+                        receipt_id=gap.receipt_id,
+                        venue=gap.source_venue,
+                        market=(
+                            None
+                            if gap.canonical_market == "UNKNOWN"
+                            else gap.canonical_market
+                        ),
+                        received_monotonic_ns=gap.gap_start_monotonic_ns,
+                        processing_outcome="REJECTED",
+                        reason=observed_reason,
+                        link_status="OBSERVED_LOSS" if loss_reason else "NO_RECORD",
+                        source_kind=None,
+                        gap=gap,
+                        data_status="UNKNOWN" if loss_reason else "INVALID",
+                        data_status_reason=(
+                            "OBSERVED_QUEUE_OR_INPUT_LOSS"
+                            if loss_reason
+                            else observed_reason
+                        ),
+                    )
+                )
+            await self._append(output_records)
+            return
         for version_id, (policy_id, candidate) in tuple(self._material_candidates.items()):
             if self._gap_overlaps_material_candidate(gap, candidate):
                 self._sample_stop.invalidate_material(
@@ -1996,6 +2401,8 @@ class SpreadObserver:
             "eligible_policy_ids": tuple(eligible_policy_ids),
             "observed_monotonic_ns": trade.received_monotonic_ns,
         }
+        if event.receipt_id is not None:
+            record["receipt_id"] = event.receipt_id
         for name in (
             "ingress_received_monotonic_ns",
             "normalized_ready_monotonic_ns",
@@ -2172,6 +2579,11 @@ class SpreadObserver:
 
     async def handle_trade(self, event: FeedTradeEvent) -> None:
         trade = event.trade
+        if self.recording_mode:
+            record = self._trade_record(event)
+            record["admissible"] = self._trade_admissible(event)
+            await self._append((record,))
+            return
         if self._sample_frozen:
             if (
                 self.enforce_sample_deadline
@@ -2319,8 +2731,45 @@ class SpreadObserver:
         await self._append(records)
         self._prune_state(trade.received_monotonic_ns)
 
+    async def handle_receipt(self, event: FeedReceiptEvent) -> None:
+        if not self.recording_mode:
+            return
+        if event.orderbook_candidate:
+            self._recording_pending_receipts[event.receipt_id] = event
+        await self._append((self._receipt_record(event),))
+
+    async def _finalize_recording_receipts(self) -> None:
+        """Materialize candidate frames that never produced a book event."""
+
+        if not self.recording_mode or not self._recording_pending_receipts:
+            return
+        pending = tuple(self._recording_pending_receipts.values())
+        self._recording_pending_receipts.clear()
+        for receipt in pending:
+            if receipt.canonical_market is None:
+                reason = "ORDERBOOK_MARKET_NOT_SELECTED"
+            else:
+                reason = "ORDERBOOK_NOT_EMITTED_AFTER_RECEIPT"
+            await self._append(
+                (
+                    self._receipt_outcome(
+                        receipt_id=receipt.receipt_id,
+                        venue=receipt.venue,
+                        market=receipt.canonical_market,
+                        received_monotonic_ns=receipt.received_monotonic_ns,
+                        processing_outcome="REJECTED",
+                        reason=reason,
+                        link_status="NO_RECORD",
+                        data_status="UNKNOWN",
+                        data_status_reason="PROCESSING_RESULT_NOT_OBSERVED",
+                    ),
+                )
+            )
+
     async def handle_item(self, item: IngressItem) -> None:
-        if isinstance(item, FeedBookEvent):
+        if isinstance(item, FeedReceiptEvent):
+            await self.handle_receipt(item)
+        elif isinstance(item, FeedBookEvent):
             await self.handle_book(item)
         elif isinstance(item, FeedTradeEvent):
             await self.handle_trade(item)
@@ -2331,6 +2780,7 @@ class SpreadObserver:
         while True:
             item = await self.ingress.next_item()
             if item is None:
+                await self._finalize_recording_receipts()
                 await self._finalize_material_stop(
                     observed_monotonic_ns=max(
                         self._sample_stop.started_monotonic_ns,
@@ -2833,6 +3283,7 @@ class SpreadShadowRunner:
 
     async def run(self, *, duration_seconds: int | None = None) -> None:
         consumer = asyncio.create_task(self.observer.consume())
+        recording_mode = bool(getattr(self.observer, "recording_mode", False))
         sample_stop_event = getattr(self.observer, "sample_stop_event", None)
         horizon_drain_event = getattr(self.observer, "horizon_drain_event", None)
         wall_clock_task: asyncio.Task[Any] | None = None
@@ -2840,7 +3291,8 @@ class SpreadShadowRunner:
         trigger_wall_clock_stop = getattr(self.observer, "trigger_wall_clock_stop", None)
         sample_started = getattr(self.observer, "sample_started_monotonic_ns", None)
         wall_clock_enabled = (
-            sample_stop_event is not None
+            not recording_mode
+            and sample_stop_event is not None
             and wait_for_wall_clock_stop is not None
             and isinstance(sample_started, int)
             and sample_started > 0
@@ -2850,9 +3302,9 @@ class SpreadShadowRunner:
         failure: BaseException | None = None
         try:
             feed_kwargs: dict[str, Any] = {"duration_seconds": duration_seconds}
-            if sample_stop_event is not None:
+            if sample_stop_event is not None and not recording_mode:
                 feed_kwargs["stop_event"] = sample_stop_event
-            if horizon_drain_event is not None:
+            if horizon_drain_event is not None and not recording_mode:
                 feed_kwargs["drain_event"] = horizon_drain_event
             await self.feed.run(**feed_kwargs)
             if (
@@ -2974,16 +3426,20 @@ async def run_public_smoke(
     requested_markets: tuple[str, ...] = (),
     source_commit: str = "UNKNOWN",
     duration_seconds: int | None = None,
+    recording_mode: bool = False,
 ) -> dict[str, Any]:
     """Run one public-only, 1–3 market smoke and return sanitized run facts."""
 
     config = config or ShadowConfig()
+    if not isinstance(recording_mode, bool):
+        raise TypeError("recording_mode must be bool")
     started_utc = datetime.now(UTC)
     metadata = {
         "schema_version": 1,
         "source_commit": source_commit,
         "python_version": platform.python_version(),
         "evidence_mode": "OBSERVATIONAL",
+        "recording_mode": recording_mode,
         "feed_scope": (Venue.RISEX.value, Venue.LIGHTER.value),
         "requested_markets": requested_markets,
         "started_utc": started_utc,
@@ -3004,7 +3460,26 @@ async def run_public_smoke(
         "lighter_fee_source": config.lighter_fee_source,
         "created_utc": started_utc,
     }
-    store = AppendOnlyEvidenceStore.create(store_root, metadata=metadata)
+    store_kwargs: dict[str, Any] = {}
+    if recording_mode:
+        metadata["recording_envelope"] = {
+            "max_records": RECORDING_MAX_RECORDS,
+            "record_reserve": RECORDING_RECORD_RESERVE,
+            "max_bytes": RECORDING_MAX_BYTES,
+            "bytes_reserve": RECORDING_BYTES_RESERVE,
+            "terminal_retention_capacity": RECORDING_TERMINAL_RETENTION_CAPACITY,
+        }
+        store_kwargs = {
+            "max_records": RECORDING_MAX_RECORDS,
+            "max_bytes": RECORDING_MAX_BYTES,
+            "terminal_record_reserve": RECORDING_RECORD_RESERVE,
+            "terminal_bytes_reserve": RECORDING_BYTES_RESERVE,
+        }
+    store = AppendOnlyEvidenceStore.create(
+        store_root,
+        metadata=metadata,
+        **store_kwargs,
+    )
     observer: SpreadObserver | None = None
     feed: PublicFeedRunner | None = None
     terminal_written = False
@@ -3024,6 +3499,7 @@ async def run_public_smoke(
                 pairs,
                 store,
                 sample_started_monotonic_ns=time.monotonic_ns(),
+                recording_mode=recording_mode,
             )
             await observer._append(
                 ({
@@ -3042,6 +3518,7 @@ async def run_public_smoke(
                 config=config,
                 risex_adapter=risex,
                 lighter_adapter=lighter,
+                capture_receipts=recording_mode,
             )
             await SpreadShadowRunner(feed, observer).run(duration_seconds=duration_seconds)
             fatal_reason = feed.fatal_reason or observer.fatal_reason
@@ -3105,6 +3582,28 @@ async def run_public_smoke(
         store.close()
 
 
+async def run_public_recording(
+    store_root: str,
+    *,
+    config: ShadowConfig | None = None,
+    requested_markets: tuple[str, ...] = (),
+    source_commit: str = "UNKNOWN",
+    duration_seconds: int | None = None,
+) -> dict[str, Any]:
+    """Collect one bounded public stream and immediately verify its readback."""
+
+    result = await run_public_smoke(
+        store_root,
+        config=config,
+        requested_markets=requested_markets,
+        source_commit=source_commit,
+        duration_seconds=duration_seconds,
+        recording_mode=True,
+    )
+    result["readback"] = build_recording_readback(result["store_path"])
+    return result
+
+
 __all__ = [
     "BookHistory",
     "HistoryCapacityExceeded",
@@ -3112,5 +3611,6 @@ __all__ = [
     "SampleStopController",
     "SpreadObserver",
     "SpreadShadowRunner",
+    "run_public_recording",
     "run_public_smoke",
 ]
