@@ -6,6 +6,8 @@ SCANNER_V1_PARTIALLY_IMPLEMENTED_S1A_S1B_ACCEPTED. Owner reopens only the finite
 
 Sole Chief: `01a07c92-745a-7670-8bb8-8909278f3095`, `[CHIEF] Scanner v1 — S2 Final`, activated by owner decision 2026-09-07. Predecessor `01a07bf4-0788-7c33-9602-d0ce84136bba` and Method3 Builder are native idle and have stopped writes/processes. Astra/medium VERIFIED from native turn_context; actual speed UNKNOWN, Standard USER_SELECTED; task cost/context percentage UNKNOWN. No collector, scheduled follow-up or Goal.
 
+Owner standing authorization (2026-09-07): routine in-scope edits/checks/local Builder commits/WIP/handoff and already-authorized Chief actions proceed without repeat permission; roles/safety/scope unchanged.
+
 ## Current SCV1-S2 Final — authorized end-to-end candidate
 
 Owner accepts STOP of the separate CAPACITY-METHOD stage and supersedes its PHASE A/B prerequisite. Exactly one fresh Luna/max/Standard Builder may implement compact durable storage, remove proven redundant source-book state, preserve semantic replay and then measure its own actual combined workload. No separate method iteration. Starting local HEAD and fetched origin/main both `e631b6e402725167f537064eb2ce600a4764d8d6`, clean; production/tests/policy unchanged. Builder starts from the published governance commit containing this decision, on `codex/spread-v1-s2-final`; dispatch identity is recorded in owner-only `s2-final-dispatch.json` after creation.
