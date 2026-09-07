@@ -1,11 +1,11 @@
 # RISEx Spread Shadow — System Specification
 
 SYSTEM_SPEC_VERSION = 4.0
-SPEC_STATUS = SCANNER_V1_PARTIALLY_IMPLEMENTED_S1A_ACCEPTED
+SPEC_STATUS = SCANNER_V1_PARTIALLY_IMPLEMENTED_S1A_S1B_ACCEPTED
 
 ## Scanner v1 — active policy SCV1-1 (FINAL-ASTRA-01, 2026-09-06)
 
-This owner-authorized contract governs NEW versioned policy implementations/runs. S1a is independently accepted as a bounded fixture/kernel subset (see STATUS); the remaining episode/storage/CLI/measurement contract is not yet implemented or accepted. Sections 0–0.21 below preserve historical experiments and their rules verbatim except their historical heading; their imperative language is historical, not current task authorization. In particular the former first-entry/exit-partial cancellation, touch uncertainty halt, common-grid one-sided close, two-scenario policy and profitable-fill/descriptive qualification gates do not govern new SCV1-1 runs. Historical outputs/claims remain immutable and are never relabelled with new policy results. Unchanged causal/data integrity constraints remain mandatory under the explicit contract here. Sections 1–21 remain frozen Funding Farmer. Old CAL/HOLDOUT/CYCLE-001 never restart.
+This owner-authorized contract governs NEW versioned policy implementations/runs. S1a and S1b are independently accepted as bounded kernel/episode and first offline D1 report slices (see STATUS); the remaining storage/CLI/measurement contract is not yet accepted. Sections 0–0.21 below preserve historical experiments and their rules verbatim except their historical heading; their imperative language is historical, not current task authorization. In particular the former first-entry/exit-partial cancellation, touch uncertainty halt, common-grid one-sided close, two-scenario policy and profitable-fill/descriptive qualification gates do not govern new SCV1-1 runs. Historical outputs/claims remain immutable and are never relabelled with new policy results. Unchanged causal/data integrity constraints remain mandatory under the explicit contract here. Sections 1–21 remain frozen Funding Farmer. Old CAL/HOLDOUT/CYCLE-001 never restart.
 
 ### SCV1-1.1 Market, sizing and fixed assumptions
 
