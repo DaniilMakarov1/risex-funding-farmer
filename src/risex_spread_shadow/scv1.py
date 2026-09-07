@@ -244,6 +244,19 @@ def run_scv1_s1a_alternatives(
     )
 
 
+from .s1b import (
+    SCV1_S1B_CONTRACT_VERSION,
+    S1bCycleKernel,
+    S1bCycleResult,
+    Scv1S1bKernel,
+    build_scv1_s1b_d1_report,
+    render_scv1_s1b_d1_report,
+    run_scv1_s1b,
+    run_scv1_s1b_alternatives,
+    scv1_s1b_policy,
+)
+
+
 __all__ = [
     "SCV1_S1A_CONTRACT_VERSION",
     "Scv1Alternative",
@@ -252,4 +265,13 @@ __all__ = [
     "scv1_s1a_policy",
     "run_scv1_s1a",
     "run_scv1_s1a_alternatives",
+    "SCV1_S1B_CONTRACT_VERSION",
+    "S1bCycleKernel",
+    "S1bCycleResult",
+    "Scv1S1bKernel",
+    "build_scv1_s1b_d1_report",
+    "render_scv1_s1b_d1_report",
+    "run_scv1_s1b",
+    "run_scv1_s1b_alternatives",
+    "scv1_s1b_policy",
 ]

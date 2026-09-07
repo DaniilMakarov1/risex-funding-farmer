@@ -174,6 +174,17 @@ from .scv1 import (
     run_scv1_s1a_alternatives,
     scv1_s1a_policy,
 )
+from .s1b import (
+    SCV1_S1B_CONTRACT_VERSION,
+    S1bCycleKernel,
+    S1bCycleResult,
+    Scv1S1bKernel,
+    build_scv1_s1b_d1_report,
+    render_scv1_s1b_d1_report,
+    run_scv1_s1b,
+    run_scv1_s1b_alternatives,
+    scv1_s1b_policy,
+)
 from .s3_cycle import (
     CycleCampaignManifest,
     CycleEnvelope,
@@ -345,6 +356,15 @@ __all__ = [
     "run_scv1_s1a",
     "run_scv1_s1a_alternatives",
     "scv1_s1a_policy",
+    "SCV1_S1B_CONTRACT_VERSION",
+    "S1bCycleKernel",
+    "S1bCycleResult",
+    "Scv1S1bKernel",
+    "build_scv1_s1b_d1_report",
+    "render_scv1_s1b_d1_report",
+    "run_scv1_s1b",
+    "run_scv1_s1b_alternatives",
+    "scv1_s1b_policy",
     "CycleCampaignManifest",
     "CycleEnvelope",
     "CycleEvidenceError",
