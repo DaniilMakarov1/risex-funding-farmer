@@ -1382,6 +1382,8 @@ class SpreadObserver:
             "reason": gap.reason,
             "observed_monotonic_ns": gap.gap_start_monotonic_ns,
         }
+        if self.recording_mode:
+            record["processing_ready_monotonic_ns"] = max(self._monotonic_ns(), gap.gap_start_monotonic_ns)
         if gap.protocol_frame_kind is not None:
             record.update(
                 {
@@ -2592,6 +2594,9 @@ class SpreadObserver:
         if self.recording_mode:
             record = self._trade_record(event)
             record["admissible"] = self._trade_admissible(event)
+            record["processing_ready_monotonic_ns"] = max(
+                self._monotonic_ns(), trade.received_monotonic_ns,
+                trade.normalized_ready_monotonic_ns or 0, trade.decision_ready_monotonic_ns or 0)
             await self._append((record,))
             return
         if self._sample_frozen:
@@ -3526,7 +3531,7 @@ async def run_public_smoke(
                     "market_metadata": tuple({"risex": asdict(pair.risex_market), "lighter": asdict(pair.lighter_market)} for pair in pairs),
                     "duration_seconds": config.duration_seconds if duration_seconds is None else duration_seconds,
                     "started_utc": started_utc,
-                    "observed_monotonic_ns": 0,
+                    "observed_monotonic_ns": observer.sample_started_monotonic_ns if recording_mode else 0,
                 },)
             )
             await observer.flush_pending()

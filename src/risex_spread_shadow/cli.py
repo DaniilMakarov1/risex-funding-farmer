@@ -5,11 +5,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 from pathlib import Path
 import subprocess
 
 from .config import MAX_PUBLIC_DURATION_SECONDS, ShadowConfig
 from .report import render_report
+from .research import build_research_report, render_research_report
 from .recording import RecordingReadbackError, render_recording_readback
 from .runner import run_public_recording, run_public_smoke
 from .s3_cycle import (
@@ -32,6 +34,7 @@ def _source_commit() -> str:
     try:
         result = subprocess.run(
             ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parents[2],
             check=True,
             capture_output=True,
             text=True,
@@ -65,6 +68,10 @@ def _parser() -> argparse.ArgumentParser:
     )
     record_report.add_argument("path")
     record_report.add_argument("--format", choices=("json", "table"), default="json")
+    research = subparsers.add_parser("research-report", help="offline saved market to four S1b scenarios")
+    research.add_argument("path")
+    research.add_argument("--format", choices=("json", "table"), default="table")
+    research.add_argument("--output-json", type=Path)
     report = subparsers.add_parser("report", help="offline deterministic evidence report")
     report.add_argument("path")
     report.add_argument("--format", choices=("json", "table"), default="json")
@@ -140,6 +147,16 @@ def _cycle_window_specs(campaign_id: str, values: list[str]) -> tuple[CycleWindo
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.command == "research-report":
+        try:
+            report = build_research_report(Path(args.path))
+        except (RecordingReadbackError, CycleEvidenceError, ValueError) as exc:
+            raise SystemExit(str(exc)) from exc
+        if args.output_json:
+            with os.fdopen(os.open(args.output_json, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8") as output:
+                output.write(render_research_report(report, format="json") + "\n")
+        print(render_research_report(report, format=args.format))
+        return 0
     if args.command == "report":
         print(render_report(Path(args.path), format=args.format))
         return 0

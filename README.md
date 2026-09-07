@@ -14,6 +14,21 @@ Until staged independent acceptance, use offline development/checks only. Later 
 
 The accepted Python fixture interfaces are `run_scv1_s1a` and `run_scv1_s1a_alternatives` in `risex_spread_shadow.scv1`; they reuse the existing cycle kernel and require saved/fixture inputs. The additional accepted offline interfaces `run_scv1_s1b`, `run_scv1_s1b_alternatives`, and `Scv1S1bKernel` implement S1b accumulation/marked inventory; `build_scv1_s1b_d1_report` and `render_scv1_s1b_d1_report` recompute saved inputs. These are not a released public collection CLI. Focused offline examples and assertions are in `tests/spread_shadow/test_scv1_s1a.py` (`python -m pytest -q tests/spread_shadow/test_scv1_s1a.py`).
 
+## Saved recording to the first research table
+
+`research-report` reads only a saved RP2 file and runs the accepted S1b kernel sequentially for all four alternatives. It makes no exchange requests. It does not use historical `cycle-report` decisions or the wider legacy observer policy.
+
+```bash
+risex-spread-shadow research-report /absolute/run/evidence.jsonl --output-json /absolute/run/research-report.json
+risex-spread-shadow research-report /absolute/run/evidence.jsonl --format json
+```
+
+The default output is a readable Markdown table; `--output-json` additionally saves the complete report once (exclusive creation, mode0600). JSON includes compact source-book and fill references, decisions, positions, separate open marks, reasons, input SHA256 and implementation fingerprints. Repeat runs reproduce economic results; only offline timing changes. Invalid/corrupt input fails explicitly. An intact but incomplete recording is reported as INCOMPLETE, never silently promoted to an economic result.
+
+Model decisions occur once per second from collection start. At an equal timestamp, already processed records precede the decision; their physical order is preserved. A saved BOOK becomes usable after its linked CHANGED processing result; trades require an explicit application processing timestamp. Old trade recordings without this field cannot establish availability and fail with TRADE_PROCESSING_TIME_UNPROVEN. No-change frames do not refresh economic timestamps. Public metadata setup time is separate from the new RUN_START collection clock.
+
+For a recording planned for900seconds, new admissions and entry requotes stop at765seconds even if collection fails early. Existing orders retain their accepted cancellation rules; the135-second tail allows completion without fabricating fills or writing off residues. All four lanes share one input file and frozen SCV1-1 policy. The table separates data-eligible duration, scenario activity until a terminal block, blocked duration, and offline runtime. Activity here means the elapsed model interval from first admission until terminal block/end; it is not continuous fresh-data time or proof of execution. JSON also reports episode-active durations and exact eligibility reasons. Funding stays UNKNOWN, points$0. When less than half the observed interval meets requirements, the report explicitly says the model is not evaluated by this stream; this descriptive label changes no trading guard.
+
 ## RP2 recording and readback
 
 The existing CLI now implements `record` and `record-readback`. Recording is fixed to public BTC on RISEx/Lighter, one market,60or900seconds; it does not run a strategy. Live invocation remains gated until the saved-input S1b/report path is accepted and the specific smoke/pilot is prospectively frozen. No public collection has yet been performed with this version.
