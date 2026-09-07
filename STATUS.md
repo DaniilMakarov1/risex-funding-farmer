@@ -12,6 +12,8 @@ Owner accepts STOP of the separate CAPACITY-METHOD stage and supersedes its PHAS
 
 Acceptance is HARD_ENVELOPE_SAFE + SEMANTIC_REPLAY_SAFE + prospectively frozen CAMPAIGN_PROFILE_FITS on candidate persistence, positive measured headroom, finite drained backlog and no concealed retention/policy halt, with final verification green. Minimal safe retirement is allowed; raising retention64/caps/policy for PASS is forbidden. Local bugs receive consolidated CHANGES_REQUESTED; fundamental compact/replay/retention/throughput conflict is S2_BLOCKED/STOP to owner, not an automatic R-series. S3/public smoke/campaign remain closed until their acceptance gates. Zero S2 Final review rounds/accepted candidates so far. Next Chief substantive action only on READY_FOR_REVIEW, BLOCKED/semantic conflict, or CONTEXT_HANDOFF_REQUIRED; no supervisory polling.
 
+Dispatch checkpoint: governance published at `64173c416358d687023d6c335151ab450f6b3f56`. One create request for Luna/max returned only `client-new-thread:74761408-8843-4f79-852d-a6bea1ee3e35`; permanent Builder ID/worktree/start remain UNCONFIRMED. Chief title/pin confirmed; Builder pin pending. No second request authorized while this setup is unresolved. Next operational action is resolution of this existing setup, then pin/identity confirmation; no implementation supervision. Exact request identity is saved in ignored `s2-final-dispatch.json`.
+
 Historical paragraphs below preserve prior accepted/rejected evidence, not superseded dispatch authority. R1/R2/R3 remain immutable NOT_ACCEPTED; CAPACITY-METHOD remains BLOCKED/NOT_ACCEPTED evidence. S1a/S1b and accepted D1 development evidence remain accepted.
 
 ## Historical SCV1-S2-CAPACITY-METHOD — CAPACITY_METHOD_BLOCKED / STOP
