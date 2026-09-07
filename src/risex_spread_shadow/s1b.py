@@ -135,6 +135,55 @@ def _s1b_hedge_book_signature(book: BookEvidence) -> tuple[tuple[str, str], ...]
     )
 
 
+def _s1b_close_book_signature(book: BookEvidence) -> tuple[tuple[str, str], ...]:
+    """Identify the Lighter bid state relevant to an exit close."""
+
+    return tuple(
+        (
+            _canonical_decimal_text(level.canonical_price),
+            _canonical_decimal_text(level.canonical_quantity),
+        )
+        for level in book.bids
+    )
+
+
+def _s1b_levels_after_consumed(
+    levels: Iterable[Any],
+    consumed_quantity: Decimal,
+) -> tuple[Any, ...]:
+    """Return the visible levels after this cycle's own prior consumption.
+
+    A book observation is an aggregate liquidity witness.  Once this cycle
+    has consumed part of that exact state, a later reservation may use only
+    its remaining depth; a new price/quantity signature resets the witness.
+    """
+
+    materialized = tuple(levels)
+    if consumed_quantity <= _ZERO:
+        return materialized
+    remaining_to_skip = consumed_quantity
+    result: list[Any] = []
+    for level in materialized:
+        quantity = level.canonical_quantity
+        if quantity <= _ZERO:
+            result.append(level)
+            continue
+        if remaining_to_skip >= quantity:
+            remaining_to_skip -= quantity
+            continue
+        if remaining_to_skip > _ZERO:
+            result.append(
+                replace(
+                    level,
+                    canonical_quantity=quantity - remaining_to_skip,
+                )
+            )
+            remaining_to_skip = _ZERO
+        else:
+            result.append(level)
+    return tuple(result)
+
+
 def _joint_operation_step(left: Decimal, right: Decimal) -> Decimal | None:
     """Return the smallest positive quantity valid on both decimal grids."""
 
@@ -392,6 +441,10 @@ class _S1bCycle:
     entry_hedge_deferred_book_signature: dict[str, tuple[tuple[str, str], ...]] = field(
         default_factory=dict
     )
+    entry_hedge_consumed_book_signature: tuple[tuple[str, str], ...] | None = None
+    entry_hedge_consumed_quantity: Decimal = _ZERO
+    exit_close_consumed_book_signature: tuple[tuple[str, str], ...] | None = None
+    exit_close_consumed_quantity: Decimal = _ZERO
 
     def add_reason(self, reason: CycleReason | str) -> None:
         value = reason.value if isinstance(reason, CycleReason) else str(reason)
@@ -502,11 +555,6 @@ def _s1b_mark_snapshot(
             and item.processing_ready_ns is not None
             and item.processing_ready_ns <= cycle.current_ns
             and item.book.received_monotonic_ns <= cycle.current_ns
-            and item.identity_complete
-            and item.book.fresh
-            and item.book.is_sequence_healthy
-            and 0 <= cycle.current_ns - item.book.received_monotonic_ns <= cycle.policy.input_freshness_max_age_ns
-            and not _book_gap_blocks(cycle, item.book, cycle.current_ns, venue=venue)
         ]
         if not candidates:
             return None, None, None, None, None, None
@@ -521,6 +569,14 @@ def _s1b_mark_snapshot(
         observation = candidates[-1]
         observations[venue] = observation
         book = observation.book
+        if (
+            not observation.identity_complete
+            or not book.fresh
+            or not book.is_sequence_healthy
+            or not 0 <= cycle.current_ns - book.received_monotonic_ns <= cycle.policy.input_freshness_max_age_ns
+            or _book_gap_blocks(cycle, book, cycle.current_ns, venue=venue)
+        ):
+            return None, None, None, None, None, None
         if venue is Venue.RISEX:
             if signed_quantity < _ZERO:
                 if not book.asks:
@@ -991,6 +1047,27 @@ class Scv1S1bKernel(CycleKernel):
         lane.last_result = self._result(cycle)
         return admission
 
+    @staticmethod
+    def _s1b_book_is_bound(cycle: _S1bCycle, book: BookEvidence) -> bool:
+        expected_session = (
+            cycle.quote_version.stream_session_id
+            if book.venue is Venue.RISEX
+            else cycle.quote_version.hedge_stream_session_id
+        )
+        expected_recovery = (
+            cycle.quote_version.recovery_generation
+            if book.venue is Venue.RISEX
+            else cycle.quote_version.hedge_recovery_generation
+        )
+        return (
+            book.venue in {Venue.RISEX, Venue.LIGHTER}
+            and book.canonical_market == cycle.quote_version.canonical_market
+            and expected_session is not None
+            and expected_recovery is not None
+            and book.stream_session_id == expected_session
+            and book.recovery_generation == expected_recovery
+        )
+
     def _record_book(self, cycle: _S1bCycle, event: CausalEvent, *, initial: bool = False) -> None:
         book = event.book
         assert book is not None
@@ -1254,16 +1331,7 @@ class Scv1S1bKernel(CycleKernel):
         if reason is not None or book is None:
             return
         current_signature = _s1b_hedge_book_signature(book)
-        if not any(
-            action.action_id not in cycle.entry_hedge_deferred_book_signature
-            or cycle.entry_hedge_deferred_book_signature[action.action_id] != current_signature
-            for action in cycle.actions
-            if action.kind is CycleActionKind.ENTRY_HEDGE
-            and action.status is CycleActionStatus.PENDING
-            and action.action_id in cycle.scheduled_takers
-            and action.due_ns is None
-            and action.reason in _ENTRY_DEFERRED_REASONS
-        ):
+        if cycle.entry_hedge_consumed_book_signature == current_signature:
             return
         self._s1b_execute_due_entry_hedges(cycle, at_ns, wake_deferred=True)
         if cycle.unresolved or cycle.policy_blocked:
@@ -1274,6 +1342,57 @@ class Scv1S1bKernel(CycleKernel):
             # no action is executed twice because completed reservations are
             # no longer pending.
             self._handle_boundary(cycle, at_ns)
+
+    @staticmethod
+    def _s1b_has_deferred_exit_close(cycle: _S1bCycle) -> bool:
+        return any(
+            action.kind is CycleActionKind.EXIT_HEDGE_CLOSE
+            and action.status is CycleActionStatus.PENDING
+            and action.action_id in cycle.scheduled_takers
+            and action.due_ns is None
+            for action in cycle.actions
+        )
+
+    def _s1b_wake_deferred_exit_closes(self, cycle: _S1bCycle, at_ns: int) -> None:
+        """Reconsider matured exit-close reservations on fresh Lighter input."""
+
+        if cycle.phase not in {
+            _S1bPhase.EXIT_ACTIVE,
+            _S1bPhase.EXIT_CANCEL_WAIT,
+            _S1bPhase.CLOSE_WAIT,
+            _S1bPhase.FORCE_WAIT,
+        } or not self._s1b_has_deferred_exit_close(cycle):
+            return
+        book, reason = _select_book(cycle, Venue.LIGHTER, at_ns)
+        if reason is not None or book is None:
+            return
+        if cycle.exit_close_consumed_book_signature == _s1b_close_book_signature(book):
+            return
+        self._s1b_execute_due_exit_closes(cycle, at_ns)
+        if cycle.unresolved or cycle.policy_blocked:
+            return
+        self._handle_boundary(cycle, at_ns)
+
+    def _s1b_reconsider_pair_on_book(self, cycle: _S1bCycle, at_ns: int) -> None:
+        """Commit the first executable pair at a newly ready BOOK boundary."""
+
+        if (
+            cycle.paired_risex_quantity <= _ZERO
+            or cycle.exit_chosen
+            or cycle.phase
+            not in {
+                _S1bPhase.ENTRY_WAIT,
+                _S1bPhase.ENTRY_ACTIVE,
+                _S1bPhase.ENTRY_CANCEL_WAIT,
+                _S1bPhase.ENTRY_REQUOTE_WAIT,
+                _S1bPhase.ENTRY_BARRIER,
+                _S1bPhase.UNMATCHED_WAIT,
+            }
+        ):
+            return
+        exit_ready, _ = self._s1b_exit_ready(cycle, at_ns)
+        if exit_ready is True:
+            self._s1b_pair_formed(cycle, at_ns)
 
     def _s1b_execute_due_entry_hedges(
         self,
@@ -1388,7 +1507,14 @@ class Scv1S1bKernel(CycleKernel):
                 item.status = CycleActionStatus.UNRESOLVED
                 item.reason = (book_reason or CycleReason.REQUIRED_ACTION_DATA_MISSING).value
             return
-        levels = tuple(book.asks)
+        book_signature = _s1b_hedge_book_signature(book)
+        if cycle.entry_hedge_consumed_book_signature != book_signature:
+            cycle.entry_hedge_consumed_book_signature = book_signature
+            cycle.entry_hedge_consumed_quantity = _ZERO
+        levels = _s1b_levels_after_consumed(
+            book.asks,
+            cycle.entry_hedge_consumed_quantity,
+        )
         available = sum(
             (level.canonical_quantity for level in levels if level.canonical_quantity > _ZERO),
             _ZERO,
@@ -1411,7 +1537,7 @@ class Scv1S1bKernel(CycleKernel):
             Side.BUY,
             executable,
             tuple(book.bids),
-            tuple(book.asks),
+            levels,
         )
         if not vwap.is_executable or vwap.price is None:
             defer_or_finalize(CycleReason.INSUFFICIENT_DEPTH)
@@ -1504,6 +1630,7 @@ class Scv1S1bKernel(CycleKernel):
                     cycle.entry_hedge_deferred_depth.pop(item.action_id, None)
                     cycle.entry_hedge_deferred_book_signature.pop(item.action_id, None)
                     cycle.add_reason(CycleReason.HEDGE_PARTIAL)
+        cycle.entry_hedge_consumed_quantity += actual_executed
         cycle.hedged_quantity += actual_executed
         cycle.paired_risex_quantity += actual_executed
         cycle.paired_lighter_quantity += actual_executed
@@ -1951,8 +2078,17 @@ class Scv1S1bKernel(CycleKernel):
             ready = _processing_ready_ns(event)
             if ready is not None and ready > cycle.current_ns:
                 self._run_due_until(cycle, ready)
-            if ready is not None and event.book is not None and event.book.venue is Venue.LIGHTER:
-                self._s1b_wake_deferred_entry_hedges(cycle, cycle.current_ns)
+            if (
+                ready is not None
+                and event.book is not None
+                and event.source_identity_complete
+                and event.identity_metadata_consistent
+                and self._s1b_book_is_bound(cycle, event.book)
+            ):
+                if event.book.venue is Venue.LIGHTER:
+                    self._s1b_wake_deferred_entry_hedges(cycle, cycle.current_ns)
+                    self._s1b_wake_deferred_exit_closes(cycle, cycle.current_ns)
+                self._s1b_reconsider_pair_on_book(cycle, cycle.current_ns)
             return
         if event.kind is CausalEventKind.DATA_GAP:
             gap = event.gap
@@ -2740,7 +2876,14 @@ class Scv1S1bKernel(CycleKernel):
                 action.status = CycleActionStatus.UNRESOLVED
                 action.reason = (book_reason or CycleReason.REQUIRED_ACTION_DATA_MISSING).value
             return
-        levels = tuple(book.bids)
+        book_signature = _s1b_close_book_signature(book)
+        if cycle.exit_close_consumed_book_signature != book_signature:
+            cycle.exit_close_consumed_book_signature = book_signature
+            cycle.exit_close_consumed_quantity = _ZERO
+        levels = _s1b_levels_after_consumed(
+            book.bids,
+            cycle.exit_close_consumed_quantity,
+        )
         available = sum(
             (level.canonical_quantity for level in levels if level.canonical_quantity > _ZERO),
             _ZERO,
@@ -2762,7 +2905,7 @@ class Scv1S1bKernel(CycleKernel):
         vwap = exact_quantity_vwap(
             Side.SELL,
             executable,
-            tuple(book.bids),
+            levels,
             tuple(book.asks),
         )
         if not vwap.is_executable or vwap.price is None:
@@ -2855,6 +2998,7 @@ class Scv1S1bKernel(CycleKernel):
             _ZERO,
             cycle.paired_lighter_quantity - actual_executed,
         )
+        cycle.exit_close_consumed_quantity += actual_executed
 
     def _execute_taker(self, cycle: _S1bCycle, action: _MutableAction, at_ns: int) -> None:
         if action.kind is CycleActionKind.ENTRY_HEDGE:

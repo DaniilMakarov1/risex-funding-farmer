@@ -1299,6 +1299,496 @@ def test_s1b_same_depth_revision_cannot_reconsume_entry_hedge(
     ) == D("0.40")
 
 
+@pytest.mark.parametrize("scenario", (CycleScenario.PRIMARY, CycleScenario.STRESS))
+@pytest.mark.parametrize(
+    "fill_model",
+    (CycleFillModel.TOUCH_ALLOWED, CycleFillModel.TRADE_THROUGH_ONLY),
+)
+def test_s1b_later_entry_due_does_not_reconsume_consumed_book(
+    scenario: CycleScenario,
+    fill_model: CycleFillModel,
+) -> None:
+    lighter_market = replace(
+        _market(Venue.LIGHTER, "BTC", minimum_quantity="0.30"),
+        quantity_step_raw=D("0.01"),
+    )
+    version, source_books = _version(
+        f"s1b-no-reconsume-later-due-{scenario.value}-{fill_model.value}",
+        lighter_market=lighter_market,
+    )
+    kernel = Scv1S1bKernel(fill_model=fill_model)
+    assert kernel.admit(version, scenario=scenario, source_books=source_books).accepted
+    activation_ns = kernel.policy.delays(scenario).activation_delay_ns
+    kernel.advance(
+        _book(
+            Venue.RISEX,
+            received=activation_ns - 100_000_000,
+            revision=2,
+            bids=(
+                ("99", "10"),
+            ),
+            asks=(
+                ("102", "10"),
+            ),
+        ),
+        scenario=scenario,
+    )
+    kernel.advance_clock(activation_ns, scenario=scenario)
+    first_fill_ns = activation_ns + 100_000_000
+    second_fill_ns = activation_ns + 300_000_000
+    kernel.advance(
+        _entry_trade(
+            f"s1b-no-reconsume-later-due-first-{scenario.value}-{fill_model.value}",
+            first_fill_ns,
+            "0.60",
+            price="102",
+        ),
+        scenario=scenario,
+    )
+    kernel.advance(
+        _entry_trade(
+            f"s1b-no-reconsume-later-due-second-{scenario.value}-{fill_model.value}",
+            second_fill_ns,
+            "0.20",
+            price="102",
+        ),
+        scenario=scenario,
+    )
+    taker_delay_ns = kernel.policy.delays(scenario).taker_delay_ns
+    first_due_ns = first_fill_ns + taker_delay_ns
+    second_due_ns = second_fill_ns + taker_delay_ns
+    kernel.advance(
+        _book(
+            Venue.LIGHTER,
+            received=first_due_ns - 100_000_000,
+            revision=2,
+            bids=(
+                ("99", "10"),
+            ),
+            asks=(
+                ("100", "0.40"),
+            ),
+        ),
+        scenario=scenario,
+    )
+    kernel.advance_clock(first_due_ns, scenario=scenario)
+    first = kernel.snapshot(scenario=scenario)
+    assert first is not None
+    assert first.hedged_quantity == D("0.40")
+    assert first.pending_entry_hedge_quantity == D("0.40")
+
+    # The second reservation matures without a new Lighter observation.  The
+    # first 0.40 must not be counted again as fresh depth.
+    kernel.advance_clock(second_due_ns, scenario=scenario)
+    second = kernel.snapshot(scenario=scenario)
+    assert second is not None
+    assert second.hedged_quantity == D("0.40")
+    assert second.pending_entry_hedge_quantity == D("0.40")
+    assert sum(
+        (fill.quantity for fill in second.fills if fill.action_id.startswith("entry-hedge")),
+        D("0"),
+    ) == D("0.40")
+
+
+@pytest.mark.parametrize("scenario", (CycleScenario.PRIMARY, CycleScenario.STRESS))
+@pytest.mark.parametrize(
+    "fill_model",
+    (CycleFillModel.TOUCH_ALLOWED, CycleFillModel.TRADE_THROUGH_ONLY),
+)
+def test_s1b_pair_rechecks_exit_readiness_on_recovered_book(
+    scenario: CycleScenario,
+    fill_model: CycleFillModel,
+) -> None:
+    lighter_market = replace(
+        _market(Venue.LIGHTER, "BTC", minimum_quantity="0.30"),
+        quantity_step_raw=D("0.01"),
+    )
+    version, source_books = _version(
+        f"s1b-pair-book-recovery-{scenario.value}-{fill_model.value}",
+        lighter_market=lighter_market,
+    )
+    kernel = Scv1S1bKernel(fill_model=fill_model)
+    assert kernel.admit(version, scenario=scenario, source_books=source_books).accepted
+    activation_ns = kernel.policy.delays(scenario).activation_delay_ns
+    kernel.advance(
+        _book(
+            Venue.RISEX,
+            received=activation_ns - 100_000_000,
+            revision=2,
+            bids=(
+                ("99", "10"),
+            ),
+            asks=(
+                ("105", "10"),
+            ),
+        ),
+        scenario=scenario,
+    )
+    kernel.advance_clock(activation_ns, scenario=scenario)
+    first_fill_ns = activation_ns + 100_000_000
+    kernel.advance(
+        _entry_trade(
+            f"s1b-pair-book-recovery-entry-{scenario.value}-{fill_model.value}",
+            first_fill_ns,
+            "0.40",
+            price="102",
+        ),
+        scenario=scenario,
+    )
+    hedge_due_ns = first_fill_ns + kernel.policy.delays(scenario).taker_delay_ns
+    kernel.advance(
+        _book(
+            Venue.RISEX,
+            received=hedge_due_ns - 100_000_000,
+            revision=3,
+            bids=(
+                ("99", "10"),
+            ),
+            asks=(
+                ("105", "10"),
+            ),
+        ),
+        scenario=scenario,
+    )
+    kernel.advance(
+        _book(
+            Venue.LIGHTER,
+            received=hedge_due_ns - 100_000_000,
+            revision=3,
+            bids=(
+                ("99", "0.20"),
+            ),
+            asks=(
+                ("100", "10"),
+            ),
+        ),
+        scenario=scenario,
+    )
+    kernel.advance_clock(hedge_due_ns, scenario=scenario)
+    before = kernel.snapshot(scenario=scenario)
+    assert before is not None
+    assert before.positions.paired_risex_quantity == D("0.40")
+    assert not any(action.action_id == "entry-cancel" for action in before.actions)
+
+    recovery_ns = hedge_due_ns + 100_000_000
+    kernel.advance(
+        _book(
+            Venue.LIGHTER,
+            received=recovery_ns,
+            revision=4,
+            bids=(
+                ("99", "10"),
+            ),
+            asks=(
+                ("100", "10"),
+            ),
+        ),
+        scenario=scenario,
+    )
+    recovered = kernel.snapshot(scenario=scenario)
+    assert recovered is not None
+    cancel = next(action for action in recovered.actions if action.action_id == "entry-cancel")
+    assert cancel.status.value == "PENDING"
+
+
+@pytest.mark.parametrize("scenario", (CycleScenario.PRIMARY, CycleScenario.STRESS))
+@pytest.mark.parametrize(
+    "fill_model",
+    (CycleFillModel.TOUCH_ALLOWED, CycleFillModel.TRADE_THROUGH_ONLY),
+)
+def test_s1b_matured_exit_close_wakes_on_depth_recovery_without_new_fill(
+    scenario: CycleScenario,
+    fill_model: CycleFillModel,
+) -> None:
+    lighter_market = replace(
+        _market(Venue.LIGHTER, "BTC", minimum_quantity="0.30"),
+        quantity_step_raw=D("0.01"),
+    )
+    version, source_books = _version(
+        f"s1b-exit-close-recovery-{scenario.value}-{fill_model.value}",
+        lighter_market=lighter_market,
+    )
+    kernel = Scv1S1bKernel(fill_model=fill_model)
+    assert kernel.admit(version, scenario=scenario, source_books=source_books).accepted
+    activation_ns = version.decision_ready_monotonic_ns + kernel.policy.delays(scenario).activation_delay_ns
+    kernel.advance(
+        _book(
+            Venue.RISEX,
+            received=activation_ns - 100_000_000,
+            revision=2,
+            bids=(
+                ("99", "10"),
+            ),
+            asks=(
+                ("105", "10"),
+            ),
+        ),
+        scenario=scenario,
+    )
+    kernel.advance_clock(activation_ns, scenario=scenario)
+    entry_fill_ns = activation_ns + 100_000_000
+    kernel.advance(
+        _entry_trade(
+            f"s1b-exit-close-recovery-entry-{scenario.value}-{fill_model.value}",
+            entry_fill_ns,
+            "0.80",
+            price="102",
+        ),
+        scenario=scenario,
+    )
+    entry_due_ns = entry_fill_ns + kernel.policy.delays(scenario).taker_delay_ns
+    kernel.advance(
+        _book(
+            Venue.RISEX,
+            received=entry_due_ns - 100_000_000,
+            revision=3,
+            bids=(
+                ("99", "10"),
+            ),
+            asks=(
+                ("105", "10"),
+            ),
+        ),
+        scenario=scenario,
+    )
+    kernel.advance(
+        _book(
+            Venue.LIGHTER,
+            received=entry_due_ns - 100_000_000,
+            revision=3,
+            bids=(
+                ("99", "10"),
+            ),
+            asks=(
+                ("100", "10"),
+            ),
+        ),
+        scenario=scenario,
+    )
+    kernel.advance_clock(entry_due_ns, scenario=scenario)
+    entry_cancel = next(
+        action for action in kernel.snapshot(scenario=scenario).actions  # type: ignore[union-attr]
+        if action.action_id == "entry-cancel"
+    )
+    cancel_effective_ns = entry_cancel.effective_monotonic_ns
+    assert cancel_effective_ns is not None
+    kernel.advance(
+        _book(
+            Venue.RISEX,
+            received=cancel_effective_ns - 100_000_000,
+            revision=4,
+            bids=(
+                ("99", "10"),
+            ),
+            asks=(
+                ("105", "10"),
+            ),
+        ),
+        scenario=scenario,
+    )
+    kernel.advance(
+        _book(
+            Venue.LIGHTER,
+            received=cancel_effective_ns - 100_000_000,
+            revision=4,
+            bids=(
+                ("99", "10"),
+            ),
+            asks=(
+                ("100", "10"),
+            ),
+        ),
+        scenario=scenario,
+    )
+    kernel.advance_clock(cancel_effective_ns, scenario=scenario)
+    exit_action = next(
+        action for action in kernel.snapshot(scenario=scenario).actions  # type: ignore[union-attr]
+        if action.action_id == "exit-maker"
+    )
+    exit_activation_ns = exit_action.effective_monotonic_ns
+    assert exit_activation_ns is not None
+    kernel.advance(
+        _book(
+            Venue.RISEX,
+            received=exit_activation_ns - 100_000_000,
+            revision=5,
+            bids=(
+                ("99", "10"),
+            ),
+            asks=(
+                ("105", "10"),
+            ),
+        ),
+        scenario=scenario,
+    )
+    exit_fill_ns = exit_activation_ns + 100_000_000
+    kernel.advance(
+        _trade(
+            f"s1b-exit-close-recovery-fill-{scenario.value}-{fill_model.value}",
+            received=exit_fill_ns,
+            quantity="0.40",
+            price="97",
+            aggressor=Side.SELL,
+        ),
+        scenario=scenario,
+    )
+    close_due_ns = exit_fill_ns + kernel.policy.delays(scenario).taker_delay_ns
+    kernel.advance(
+        _book(
+            Venue.LIGHTER,
+            received=close_due_ns - 100_000_000,
+            revision=5,
+            bids=(
+                ("99", "0.20"),
+            ),
+            asks=(
+                ("100", "10"),
+            ),
+        ),
+        scenario=scenario,
+    )
+    kernel.advance_clock(close_due_ns, scenario=scenario)
+    before = kernel.snapshot(scenario=scenario)
+    assert before is not None
+    assert before.positions.paired_lighter_quantity == D("0.80")
+    assert before.pending_exit_close_quantity == D("0.40")
+
+    recovery_ns = close_due_ns + 100_000_000
+    kernel.advance(
+        _book(
+            Venue.LIGHTER,
+            received=recovery_ns,
+            revision=6,
+            bids=(
+                ("99", "0.40"),
+            ),
+            asks=(
+                ("100", "10"),
+            ),
+        ),
+        scenario=scenario,
+    )
+    after = kernel.snapshot(scenario=scenario)
+    assert after is not None
+    assert after.positions.risex_signed_quantity == D("-0.40")
+    assert after.positions.lighter_signed_quantity == D("0.40")
+    assert after.pending_exit_close_quantity == D("0")
+    assert sum(
+        (fill.quantity for fill in after.fills if fill.action_id == "exit-close:0"),
+        D("0"),
+    ) == D("0.40")
+
+    # A later maker partial gets its own reservation, but the unchanged
+    # 0.40-depth witness cannot be consumed a second time.
+    second_exit_fill_ns = recovery_ns + 100_000_000
+    kernel.advance(
+        _trade(
+            f"s1b-exit-close-recovery-second-{scenario.value}-{fill_model.value}",
+            received=second_exit_fill_ns,
+            quantity="0.20",
+            price="97",
+            aggressor=Side.SELL,
+        ),
+        scenario=scenario,
+    )
+    second_close_due_ns = second_exit_fill_ns + kernel.policy.delays(scenario).taker_delay_ns
+    kernel.advance(
+        _book(
+            Venue.LIGHTER,
+            received=second_close_due_ns - 100_000_000,
+            revision=7,
+            bids=(
+                ("99", "0.40"),
+            ),
+            asks=(
+                ("100", "10"),
+            ),
+        ),
+        scenario=scenario,
+    )
+    kernel.advance_clock(
+        second_close_due_ns,
+        scenario=scenario,
+    )
+    unchanged = kernel.snapshot(scenario=scenario)
+    assert unchanged is not None
+    assert unchanged.positions.paired_lighter_quantity == D("0.40")
+    assert unchanged.pending_exit_close_quantity == D("0.20")
+    assert sum(
+        (fill.quantity for fill in unchanged.fills if fill.action_id.startswith("exit-close:")),
+        D("0"),
+    ) == D("0.40")
+
+
+@pytest.mark.parametrize("scenario", (CycleScenario.PRIMARY, CycleScenario.STRESS))
+@pytest.mark.parametrize(
+    "fill_model",
+    (CycleFillModel.TOUCH_ALLOWED, CycleFillModel.TRADE_THROUGH_ONLY),
+)
+def test_s1b_latest_unhealthy_book_invalidates_current_mark(
+    scenario: CycleScenario,
+    fill_model: CycleFillModel,
+) -> None:
+    version, source_books = _version(
+        f"s1b-unhealthy-latest-mark-{scenario.value}-{fill_model.value}"
+    )
+    kernel = Scv1S1bKernel(fill_model=fill_model)
+    assert kernel.admit(version, scenario=scenario, source_books=source_books).accepted
+    activation_ns = version.decision_ready_monotonic_ns + kernel.policy.delays(scenario).activation_delay_ns
+    kernel.advance(
+        _book(
+            Venue.RISEX,
+            received=activation_ns - 100_000_000,
+            revision=2,
+            bids=(
+                ("99", "10"),
+            ),
+            asks=(
+                ("102", "10"),
+            ),
+        ),
+        scenario=scenario,
+    )
+    kernel.advance_clock(activation_ns, scenario=scenario)
+    fill_ns = activation_ns + 100_000_000
+    kernel.advance(
+        _entry_trade(
+            f"s1b-unhealthy-latest-mark-fill-{scenario.value}-{fill_model.value}",
+            fill_ns,
+            "0.20",
+            price="102",
+        ),
+        scenario=scenario,
+    )
+    healthy = kernel.snapshot(scenario=scenario)
+    assert healthy is not None
+    assert healthy.marked_risex_price == D("102")
+    assert healthy.marked_risex_book_revision_id is not None
+    assert healthy.marked_risex_book_revision_id.endswith("|2")
+
+    kernel.advance(
+        _book(
+            Venue.RISEX,
+            received=fill_ns + 100_000_000,
+            revision=3,
+            bids=(
+                ("99", "10"),
+            ),
+            asks=(
+                ("110", "10"),
+            ),
+            sequence_valid=False,
+        ),
+        scenario=scenario,
+    )
+    unhealthy = kernel.snapshot(scenario=scenario)
+    assert unhealthy is not None
+    assert unhealthy.marked_risex_price is None
+    assert unhealthy.marked_inventory_usd is None
+    assert unhealthy.marked_execution_only_pnl_usd is None
+    assert unhealthy.marked_risex_book_revision_id is None
+
+
 def _entry_deadline_gate_setup(
     scenario: CycleScenario,
     *,
