@@ -56,9 +56,9 @@ def _parser() -> argparse.ArgumentParser:
         help="bounded public-only recording with receipt/readback validation",
     )
     record.add_argument("--store-root", default="./spread-shadow-runs")
-    record.add_argument("--market", action="append", default=[])
-    record.add_argument("--duration-seconds", type=int, default=60)
-    record.add_argument("--max-markets", type=int, default=3)
+    record.add_argument("--market", action="append", choices=("BTC",), default=[])
+    record.add_argument("--duration-seconds", type=int, choices=(60, 900), default=60)
+    record.add_argument("--max-markets", type=int, choices=(1,), default=1)
     record_report = subparsers.add_parser(
         "record-readback",
         help="offline readback of one public recording",

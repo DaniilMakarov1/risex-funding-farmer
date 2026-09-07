@@ -847,6 +847,7 @@ class PublicFeedRunner:
         channel = str(payload.get("channel", "")).lower()
         return (
             channel in {"orderbook", "order_book"}
+            or ("block_number" in payload and channel not in {"trade", "trades"})
             or "orderbook" in message_type
             or "order_book" in message_type
             or isinstance(payload.get("order_book"), Mapping)
@@ -876,6 +877,7 @@ class PublicFeedRunner:
                         pair = None
             if pair is not None:
                 state = self.state(venue, pair.canonical_market)
+        selected = state is not None
         if state is None:
             state = next(
                 (
@@ -886,7 +888,7 @@ class PublicFeedRunner:
                 None,
             )
         symbol = None if state is None else state.venue_symbol
-        canonical_market = None if state is None else state.market_pair.canonical_market
+        canonical_market = None if state is None or (market_id is not None and not selected) else state.market_pair.canonical_market
         return state, canonical_market, symbol, market_id
 
     def _capture_receipt(

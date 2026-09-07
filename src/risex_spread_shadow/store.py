@@ -224,9 +224,9 @@ class AppendOnlyEvidenceStore:
             (terminal_bytes_reserve, "terminal_bytes_reserve"),
         ):
             if value is not None and (
-                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+                isinstance(value, bool) or not isinstance(value, int) or value < (0 if name.startswith("terminal_") else 1)
             ):
-                raise ValueError(f"{name} must be a positive integer")
+                raise ValueError(f"{name} has invalid capacity")
         if max_records is not None and max_records <= terminal_record_reserve:
             raise ValueError("max_records must leave a terminal-marker reserve")
         if max_bytes is not None and max_bytes <= terminal_bytes_reserve:

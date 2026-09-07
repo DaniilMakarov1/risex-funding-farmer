@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 import platform
@@ -1258,7 +1258,7 @@ class SpreadObserver:
             # terminal evidence; normal books/quotes/trades stay batched.
             if any(
                 record.get("kind")
-                in {"DATA_GAP", "SAMPLE_STOP", "PUBLIC_RECEIPT_OUTCOME"}
+                in {"DATA_GAP", "SAMPLE_STOP", "PUBLIC_RECEIPT_OUTCOME", "PUBLIC_RECEIPT"}
                 for record in incoming
             ):
                 await self._flush_pending_batch_locked()
@@ -1308,10 +1308,11 @@ class SpreadObserver:
         book: BookEvidence | None = None,
         source_kind: str | None = None,
         gap: DataGapEvidence | None = None,
+        message_book: BookEvidence | None = None,
         data_status: str = "UNKNOWN",
         data_status_reason: str | None = None,
     ) -> dict[str, Any]:
-        if processing_outcome not in {"CHANGED", "UNCHANGED", "REJECTED"}:
+        if processing_outcome not in {"CHANGED", "UNCHANGED", "REJECTED", "UNKNOWN"}:
             raise ValueError("unsupported receipt processing outcome")
         if self.recording_mode and receipt_id is not None:
             self._recording_pending_receipts.pop(receipt_id, None)
@@ -1330,6 +1331,14 @@ class SpreadObserver:
             "data_status_reason": data_status_reason or reason,
             "observed_monotonic_ns": received_monotonic_ns,
         }
+        ready = max(received_monotonic_ns, self._monotonic_ns())
+        message_book = message_book or book
+        if message_book is not None:
+            ready = max(ready, message_book.normalized_ready_monotonic_ns or ready)
+            record["message_sequence"] = message_book.sequence
+            record["message_checksum"] = message_book.checksum
+            record["message_normalized_ready_monotonic_ns"] = message_book.normalized_ready_monotonic_ns
+        record["processing_ready_monotonic_ns"] = ready
         if source_kind is not None:
             record["source_kind"] = source_kind
         if book is not None:
@@ -2058,6 +2067,7 @@ class SpreadObserver:
                         reason="NO_STATE_CHANGE",
                         link_status="EXISTING_BOOK_STATE",
                         book=baseline,
+                        message_book=book,
                         source_kind=event.source_kind,
                         data_status=status,
                         data_status_reason=status_reason,
@@ -2734,9 +2744,12 @@ class SpreadObserver:
     async def handle_receipt(self, event: FeedReceiptEvent) -> None:
         if not self.recording_mode:
             return
-        if event.orderbook_candidate:
-            self._recording_pending_receipts[event.receipt_id] = event
         await self._append((self._receipt_record(event),))
+        if event.orderbook_candidate:
+            if len(self._recording_pending_receipts) >= self.config.ingress_queue_capacity:
+                self.fatal_reason = "RECEIPT_OUTCOME_CAPACITY"
+                raise RuntimeError(self.fatal_reason)
+            self._recording_pending_receipts[event.receipt_id] = event
 
     async def _finalize_recording_receipts(self) -> None:
         """Materialize candidate frames that never produced a book event."""
@@ -2757,7 +2770,7 @@ class SpreadObserver:
                         venue=receipt.venue,
                         market=receipt.canonical_market,
                         received_monotonic_ns=receipt.received_monotonic_ns,
-                        processing_outcome="REJECTED",
+                        processing_outcome="UNKNOWN",
                         reason=reason,
                         link_status="NO_RECORD",
                         data_status="UNKNOWN",
@@ -2781,6 +2794,8 @@ class SpreadObserver:
             item = await self.ingress.next_item()
             if item is None:
                 await self._finalize_recording_receipts()
+                if self.recording_mode:
+                    return
                 await self._finalize_material_stop(
                     observed_monotonic_ns=max(
                         self._sample_stop.started_monotonic_ns,
@@ -2796,7 +2811,8 @@ class SpreadObserver:
             finally:
                 self._handling_item -= 1
                 self.ingress.complete_item(success=succeeded)
-            self._schedule_material_stop_boundary()
+            if not self.recording_mode:
+                self._schedule_material_stop_boundary()
 
     async def _capture_one(
         self,
@@ -3434,12 +3450,14 @@ async def run_public_smoke(
     if not isinstance(recording_mode, bool):
         raise TypeError("recording_mode must be bool")
     started_utc = datetime.now(UTC)
+    started_ns = time.monotonic_ns()
     metadata = {
         "schema_version": 1,
         "source_commit": source_commit,
         "python_version": platform.python_version(),
         "evidence_mode": "OBSERVATIONAL",
         "recording_mode": recording_mode,
+        "started_monotonic_ns": started_ns,
         "feed_scope": (Venue.RISEX.value, Venue.LIGHTER.value),
         "requested_markets": requested_markets,
         "started_utc": started_utc,
@@ -3505,6 +3523,7 @@ async def run_public_smoke(
                 ({
                     "kind": "RUN_START",
                     "markets": tuple(pair.canonical_market for pair in pairs),
+                    "market_metadata": tuple({"risex": asdict(pair.risex_market), "lighter": asdict(pair.lighter_market)} for pair in pairs),
                     "duration_seconds": config.duration_seconds if duration_seconds is None else duration_seconds,
                     "started_utc": started_utc,
                     "observed_monotonic_ns": 0,
@@ -3592,12 +3611,17 @@ async def run_public_recording(
 ) -> dict[str, Any]:
     """Collect one bounded public stream and immediately verify its readback."""
 
+    if requested_markets not in ((), ("BTC",)):
+        raise ValueError("recording is fixed to BTC")
+    config = replace(config or ShadowConfig(), max_markets=1)
+    if duration_seconds is not None and duration_seconds not in (60, 900):
+        raise ValueError("recording duration must be 60 or 900 seconds")
     result = await run_public_smoke(
         store_root,
         config=config,
-        requested_markets=requested_markets,
+        requested_markets=("BTC",),
         source_commit=source_commit,
-        duration_seconds=duration_seconds,
+        duration_seconds=60 if duration_seconds is None else duration_seconds,
         recording_mode=True,
     )
     result["readback"] = build_recording_readback(result["store_path"])

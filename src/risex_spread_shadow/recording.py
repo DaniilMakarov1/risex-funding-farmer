@@ -48,7 +48,7 @@ _EXPECTED_STOP_GAP_REASONS = frozenset(
 _DATA_STATUSES = frozenset(
     {"VALID", "VALID_UNCHANGED_STATE", "STALE", "INVALID", "UNKNOWN"}
 )
-_OUTCOME_KINDS = frozenset({"CHANGED", "UNCHANGED", "REJECTED"})
+_OUTCOME_KINDS = frozenset({"CHANGED", "UNCHANGED", "REJECTED", "UNKNOWN"})
 _LINK_STATUSES = frozenset(
     {"PERSISTED_BOOK", "EXISTING_BOOK_STATE", "NO_RECORD", "OBSERVED_LOSS"}
 )
@@ -127,7 +127,10 @@ def _sha256(value: Any, name: str) -> str:
 
 
 def _optional_market(value: Any, name: str = "canonical_market") -> str | None:
-    return _text(value, name, optional=True)
+    result = _text(value, name, optional=True)
+    if name == "canonical_market" and result not in (None, "BTC"):
+        _fail("RECORDING_MARKET_NOT_BTC")
+    return result
 
 
 def _record_time(record: Mapping[str, Any], *, required: bool = True) -> int | None:
@@ -198,6 +201,51 @@ def _append_interval(
     )
 
 
+class _Availability:
+    """Integrate current two-venue eligibility; silence never refreshes state."""
+
+    def __init__(self, start: int) -> None:
+        self.at = start
+        self.start = start
+        self.books: dict[Venue, Any] = {}
+        self.durations: Counter[str] = Counter()
+        self.intervals: list[dict[str, Any]] = []
+        self.truncated = False
+
+    def reason(self) -> str:
+        for venue in (Venue.RISEX, Venue.LIGHTER):
+            b = self.books.get(venue)
+            if b is None:
+                return "MISSING_" + venue.value + "_BOOK"
+            if not b.fresh or not b.is_sequence_healthy:
+                return "UNHEALTHY_" + venue.value + "_BOOK"
+            if self.at - b.received_monotonic_ns > 500_000_000:
+                return "STALE_" + venue.value + "_BOOK"
+        if abs(self.books[Venue.RISEX].received_monotonic_ns -
+               self.books[Venue.LIGHTER].received_monotonic_ns) > 500_000_000:
+            return "INPUT_RECEIPT_SKEW"
+        return "VALID"
+
+    def advance(self, until: int) -> None:
+        if until < self.at:
+            _fail("AVAILABILITY_CLOCK_REGRESSION")
+        while self.at < until:
+            end = min([until] + [b.received_monotonic_ns + 500_000_001
+                      for b in self.books.values()
+                      if self.at < b.received_monotonic_ns + 500_000_001 < until])
+            reason = self.reason()
+            self.durations[reason] += end - self.at
+            if self.intervals and self.intervals[-1]["reason"] == reason and self.intervals[-1]["end_monotonic_ns"] == self.at:
+                self.intervals[-1]["end_monotonic_ns"] = end
+            elif len(self.intervals) < _MAX_INTERVALS:
+                self.intervals.append({"start_monotonic_ns": self.at, "end_monotonic_ns": end,
+                                       "status": "VALID" if reason == "VALID" else "INELIGIBLE",
+                                       "reason": reason})
+            else:
+                self.truncated = True
+            self.at = end
+
+
 def build_recording_readback(path: str | Path) -> dict[str, Any]:
     """Stream one recording file and return deterministic compact facts."""
 
@@ -244,12 +292,17 @@ def build_recording_readback(path: str | Path) -> dict[str, Any]:
     changed_count = 0
     rejected_count = 0
     interval_truncated = False
+    availability: _Availability | None = None
+    incomplete_observations: set[str] = set()
+    last_processing_ready_ns = 0
 
     try:
         for record in records:
             if not isinstance(record, Mapping):
                 _fail("RECORD_NOT_OBJECT")
             record_count += 1
+            if record_count > RECORDING_MAX_RECORDS:
+                _fail("RECORD_COUNT_EXCEEDS_ENVELOPE")
             kind = record.get("kind")
             if not isinstance(kind, str) or not kind:
                 _fail("RECORD_KIND_INVALID")
@@ -286,6 +339,7 @@ def build_recording_readback(path: str | Path) -> dict[str, Any]:
                 if metadata.get("recording_mode") is not True:
                     _fail("RECORDING_MODE_MISSING")
                 _validate_envelope(metadata)
+                availability = _Availability(_non_negative_int(metadata.get("started_monotonic_ns"), "started_monotonic_ns"))
                 continue
             if metadata is None:
                 _fail("RUN_METADATA_MISSING")
@@ -311,6 +365,9 @@ def build_recording_readback(path: str | Path) -> dict[str, Any]:
                 if frame_length > RECORDING_FRAME_LENGTH_CAP:
                     _fail("FRAME_LENGTH_EXCEEDS_CAP")
                 _sha256(record.get("frame_sha256"), "frame_sha256")
+                assert availability is not None
+                if received_ns < availability.start:
+                    _fail("RECEIPT_BEFORE_RUN_START")
                 candidate = record.get("orderbook_candidate")
                 if not isinstance(candidate, bool):
                     _fail("ORDERBOOK_CANDIDATE_INVALID")
@@ -396,6 +453,24 @@ def build_recording_readback(path: str | Path) -> dict[str, Any]:
                     "checksum_valid": book.checksum_valid,
                     "fresh": book.fresh,
                 }
+                source = receipts.get(receipt_id)
+                if source is None:
+                    _fail("BOOK_RECEIPT_LINK_MISSING")
+                if (not source["orderbook_candidate"] or source["venue"] != book.venue.value
+                    or source["canonical_market"] != book.canonical_market
+                    or source["stream_session_id"] != book.stream_session_id
+                    or source["recovery_generation"] != book.recovery_generation
+                    or source["received_monotonic_ns"] != book.received_monotonic_ns):
+                    _fail("BOOK_RECEIPT_CONTEXT_MISMATCH")
+                ready = max(x for x in (book.received_monotonic_ns, book.normalized_ready_monotonic_ns,
+                                       book.decision_ready_monotonic_ns) if x is not None)
+                if book.normalized_ready_monotonic_ns is None or ready < book.received_monotonic_ns:
+                    _fail("BOOK_READINESS_INVALID")
+                assert availability is not None
+                availability.advance(max(availability.at, ready))
+                availability.books[book.venue] = book
+                book_by_id[book_id]["receipt_id"] = receipt_id
+                book_by_id[book_id]["ready_ns"] = ready
                 book_receipts.append((receipt_id, book_id))
                 continue
 
@@ -426,12 +501,15 @@ def build_recording_readback(path: str | Path) -> dict[str, Any]:
                         recovery=recovery,
                     )
                 reason_counts[reason] += 1
-                is_loss = (
-                    reason in _LOSS_REASONS
-                    or record.get("transport_event") == "UNEXPECTED_FAILURE"
-                )
+                is_loss = reason in _LOSS_REASONS
+                if record.get("transport_event") == "UNEXPECTED_FAILURE":
+                    incomplete_observations.add("PUBLIC_SOCKET_TRANSPORT_FAILURE")
                 if is_loss:
                     loss_count += 1
+                    incomplete_observations.add(reason)
+                assert availability is not None
+                availability.advance(max(availability.at, start_ns))
+                availability.books.pop(venue, None)
                 _bounded_append(
                     diagnostic_gaps,
                     {
@@ -461,6 +539,10 @@ def build_recording_readback(path: str | Path) -> dict[str, Any]:
                 received_ns = _non_negative_int(
                     record.get("received_monotonic_ns"), "received_monotonic_ns"
                 )
+                processing_ready = _non_negative_int(record.get("processing_ready_monotonic_ns"), "processing_ready_monotonic_ns")
+                last_processing_ready_ns = max(last_processing_ready_ns, processing_ready)
+                if processing_ready < received_ns:
+                    _fail("OUTCOME_PROCESSING_PRECEDES_RECEIPT")
                 reason = _text(record.get("reason"), "reason")
                 assert reason is not None
                 link_status = _text(record.get("link_status"), "link_status")
@@ -503,6 +585,19 @@ def build_recording_readback(path: str | Path) -> dict[str, Any]:
                         record.get("linked_book_revision"),
                         "linked_book_revision",
                     )
+                    target = book_by_id.get(linked_book_id)
+                    if target is None:
+                        _fail("BOOK_LINK_TARGET_MISSING_OR_FUTURE")
+                    source = receipts.get(receipt_id)
+                    if source is None:
+                        _fail("RECEIPT_LINK_MISSING")
+                    if (source["stream_session_id"] != target["stream_session_id"]
+                        or source["recovery_generation"] != target["recovery_generation"]):
+                        _fail("BOOK_LINK_SESSION_MISMATCH")
+                    if outcome == "CHANGED" and target["receipt_id"] != receipt_id:
+                        _fail("CHANGED_BOOK_RECEIPT_MISMATCH")
+                    if outcome == "UNCHANGED" and target["ready_ns"] > received_ns:
+                        _fail("UNCHANGED_FUTURE_BOOK")
                     pending_link_ids.append(
                         (receipt_id, linked_book_id, linked_digest, linked_revision)
                     )
@@ -527,6 +622,10 @@ def build_recording_readback(path: str | Path) -> dict[str, Any]:
                         _fail("RECEIPT_OUTCOME_MARKET_MISMATCH")
                     if received_ns < source["received_monotonic_ns"]:
                         _fail("RECEIPT_OUTCOME_PRECEDES_RECEIPT")
+                if link_status == "OBSERVED_LOSS":
+                    incomplete_observations.add(reason)
+                if data_status_reason == "PROCESSING_RESULT_NOT_OBSERVED":
+                    incomplete_observations.add("PROCESSING_OUTCOME_UNKNOWN")
                 outcome_receipts.add(receipt_id)
                 outcome_counts[outcome] += 1
                 reason_counts[reason] += 1
@@ -536,7 +635,7 @@ def build_recording_readback(path: str | Path) -> dict[str, Any]:
                     changed_count += 1
                 elif outcome == "UNCHANGED":
                     unchanged_count += 1
-                else:
+                elif outcome == "REJECTED":
                     rejected_count += 1
                 status = _interval_status(data_status)
                 if len(intervals) >= _MAX_INTERVALS:
@@ -619,30 +718,21 @@ def build_recording_readback(path: str | Path) -> dict[str, Any]:
                 missing_outcome_count += 1
         if missing_outcome_count and terminal_kind == "RUN_STOP":
             _fail("RECEIPT_OUTCOME_MISSING")
-        if first_receipt_ns is not None and last_receipt_ns is not None:
-            collector_duration_ns = max(0, last_receipt_ns - first_receipt_ns)
-        else:
-            collector_duration_ns = None
-        for interval in intervals:
-            interval["end_monotonic_ns"] = None
-        terminal_ns = _record_time(terminal_record, required=False)
-        if terminal_ns is not None and intervals:
-            for index, interval in enumerate(intervals[:-1]):
-                if interval["end_monotonic_ns"] is None:
-                    interval["end_monotonic_ns"] = intervals[index + 1][
-                        "start_monotonic_ns"
-                    ]
-            if intervals[-1]["end_monotonic_ns"] is None and terminal_ns >= intervals[-1][
-                "start_monotonic_ns"
-            ]:
-                intervals[-1]["end_monotonic_ns"] = terminal_ns
+        terminal_ns = _record_time(terminal_record)
+        assert availability is not None and terminal_ns is not None
+        if terminal_ns < max(last_receipt_ns or 0, last_processing_ready_ns):
+            _fail("TERMINAL_PRECEDES_OBSERVATIONS")
+        availability.advance(terminal_ns)
+        collector_duration_ns = terminal_ns - availability.start
+        intervals = availability.intervals
+        interval_truncated = availability.truncated
         unexpected_gap_reasons = sorted(
             reason
             for reason in reason_counts
             if reason not in _EXPECTED_STOP_GAP_REASONS
             and reason in _LOSS_REASONS
         )
-        incomplete_reasons = list(unexpected_gap_reasons)
+        incomplete_reasons = list(unexpected_gap_reasons) + list(incomplete_observations)
         if terminal_kind == "RUN_FAILED":
             incomplete_reasons.append(
                 str(terminal_record.get("fatal_reason") or "RUN_FAILED")
@@ -650,6 +740,8 @@ def build_recording_readback(path: str | Path) -> dict[str, Any]:
         if missing_outcome_count:
             incomplete_reasons.append("RECEIPT_OUTCOME_MISSING")
         incomplete_reasons = sorted(set(incomplete_reasons))
+        if terminal_kind == "RUN_STOP" and terminal_record.get("fatal_reason") is not None:
+            _fail("RUN_STOP_HAS_FATAL_REASON")
         if data_status_counts and set(data_status_counts) == {"VALID"}:
             data_status = "VALID"
         elif data_status_counts and set(data_status_counts) <= {
@@ -670,7 +762,10 @@ def build_recording_readback(path: str | Path) -> dict[str, Any]:
             "recording_status": "INCOMPLETE" if incomplete_reasons else "COMPLETE",
             "incomplete_reasons": incomplete_reasons,
             "application_silence": receipt_counts["orderbook_candidate"] == 0,
-            "data_status": data_status,
+            "data_status": "VALID" if availability.durations.get("VALID", 0) == collector_duration_ns and collector_duration_ns > 0 else "MIXED_OR_INELIGIBLE",
+            "data_eligibility_duration_ns": dict(sorted(availability.durations.items())),
+            "data_valid_duration_ns": availability.durations.get("VALID", 0),
+            "data_ineligible_duration_ns": collector_duration_ns - availability.durations.get("VALID", 0),
             "record_count": record_count,
             "byte_count": byte_count,
             "record_counts": _record_count(kind_counts),
@@ -687,6 +782,7 @@ def build_recording_readback(path: str | Path) -> dict[str, Any]:
             "changed_count": changed_count,
             "unchanged_count": unchanged_count,
             "rejected_count": rejected_count,
+            "unknown_processing_count": outcome_counts["UNKNOWN"],
             "linked_book_count": linked_book_count,
             "no_record_or_loss_count": unlinked_no_record_count,
             "observed_loss_count": loss_count,
