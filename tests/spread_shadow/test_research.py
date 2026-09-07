@@ -162,3 +162,13 @@ async def test_observed_queue_loss_is_incomplete_not_economic_loss(tmp_path):
     assert report['technical_status']=='INCOMPLETE'
     assert report['readback']['observed_loss_count']>0
     assert all(lane['summary']['fills']==0 for lane in report['alternatives'])
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('duration', ['900', True, 901])
+async def test_corrupt_duration_cannot_bypass_cutoff(tmp_path, duration):
+    path=await sample(tmp_path)
+    records=[json.loads(line) for line in path.read_text().splitlines()]
+    records[1]['duration_seconds']=duration
+    path.write_text(''.join(json.dumps(r)+'\n' for r in records))
+    with pytest.raises(RecordingReadbackError,match='INVALID_PLANNED_DURATION'):
+        build_research_report(path)

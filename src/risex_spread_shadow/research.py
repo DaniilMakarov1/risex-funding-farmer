@@ -66,7 +66,12 @@ def _metadata(path: Path) -> tuple[dict, QuotePolicy, int, int]:
              'risex_maker_fee_rate', 'lighter_taker_fee_rate', 'risex_fee_source', 'lighter_fee_source')
     policy = QuotePolicy(**{name: getattr(frozen, name) for name in names},
                          risex_market=markets[0], lighter_market=markets[1])
-    metadata = dict(metadata, planned_duration_seconds=start_record.get('duration_seconds'))
+    planned = start_record.get('duration_seconds')
+    if planned is not None and (type(planned) is not int or not 1 <= planned <= 900):
+        raise RecordingReadbackError('INVALID_PLANNED_DURATION')
+    if metadata.get('evidence_mode') == 'OBSERVATIONAL' and planned not in (60, 900):
+        raise RecordingReadbackError('PUBLIC_RECORDING_DURATION_NOT_FROZEN')
+    metadata = dict(metadata, planned_duration_seconds=planned)
     start = start_record.get('observed_monotonic_ns') or metadata['started_monotonic_ns']
     end = terminal['observed_monotonic_ns']
     if end < start or end - start > 960 * SECOND:
@@ -230,6 +235,7 @@ def _run_lane(path: Path, policy: QuotePolicy, start: int, end: int,
     observe_block()
     results = kernel.retained_results(scenario)
     summary = _d1_summary(results)
+    summary['forced_fill_count'] = sum('forced' in fill.action_id.lower() for result in results for fill in result.fills)
     summary.update(decision_attempts=attempts, opportunities=opportunities, accepted_quotes=admissions,
                    admission_block_reasons=dict(sorted(reasons.items())),
                    first_admission_monotonic_ns=first_admission, blocked_at_monotonic_ns=blocked_at,
@@ -270,6 +276,7 @@ def build_research_report(path: str | Path) -> dict:
     if any('TERMINAL_RETENTION_EXHAUSTED' in lane['summary']['lane_block_reasons'] for lane in lanes):
         technical = 'INCOMPLETE'
     return {'report_kind': 'RP3_SCV1_S1B_RESEARCH', 'source': identity,
+            'evidence_mode': metadata.get('evidence_mode', 'UNKNOWN'),
             'implementation_sha256': {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
                 for name in ('research.py', 's1b.py', 'cycle.py', 'causal.py', 'models.py',
                              'economics.py', 'recording.py', 'book_chain.py')},
@@ -296,14 +303,14 @@ def render_research_report(report: dict, *, format: str = 'table') -> str:
     if format != 'table':
         raise ValueError('unknown report format')
     seconds = lambda ns: f'{ns / SECOND:.3f}'
-    lines = [f"Recording: {report['technical_status']} | SHA256: {report['source']['sha256']}",
+    lines = [f"{report['evidence_mode']} | Recording: {report['technical_status']} | SHA256: {report['source']['sha256']}",
              f"Collector {seconds(report['collector_duration_ns'])} s; eligible {seconds(report['data_valid_duration_ns'])} s; ineligible {seconds(report['data_ineligible_duration_ns'])} s", 
-             '| Model / delay | Opportunities / attempts / admitted | Fills / closed / forced | Blocked s | Active until block s | Closed PnL $ | Fees $ | Stress $ | Open RISEx / Lighter | Offline s |',
+             '| Model / delay | Opportunities / attempts / admitted | Fills / closed / forced fills | Blocked s | Active until block s | Closed PnL $ | Fees $ | Stress $ | Open RISEx / Lighter | Offline s |',
              '|---|---:|---:|---:|---:|---:|---:|---:|---|---:|']
     for lane in report['alternatives']:
         s = lane['summary']
         residuals = [f"{e['positions']['risex_signed_quantity']} / {e['positions']['lighter_signed_quantity']}" for e in lane['episodes'] if not e['closed'] and (e['positions']['risex_signed_quantity'] != '0' or e['positions']['lighter_signed_quantity'] != '0')]
-        lines.append(f"| {lane['fill_model']} / {lane['scenario']} | {s['opportunities']} / {s['decision_attempts']} / {s['accepted_quotes']} | {s['fills']} / {s['closed_count']} / {s['forced_count']} | {seconds(s['lane_blocked_duration_ns'])} | {seconds(s['lane_active_until_block_duration_ns'])} | {s['closed_execution_pnl_usd']} | {s['fees_usd']} | {s['stress_cost_usd']} | {'; '.join(residuals) or '0 / 0'} | {seconds(lane['offline_compute_duration_ns'])} |")
+        lines.append(f"| {lane['fill_model']} / {lane['scenario']} | {s['opportunities']} / {s['decision_attempts']} / {s['accepted_quotes']} | {s['fills']} / {s['closed_count']} / {s['forced_fill_count']} | {seconds(s['lane_blocked_duration_ns'])} | {seconds(s['lane_active_until_block_duration_ns'])} | {s['closed_execution_pnl_usd']} | {s['fees_usd']} | {s['stress_cost_usd']} | {'; '.join(residuals) or '0 / 0'} | {seconds(lane['offline_compute_duration_ns'])} |")
     for lane in report['alternatives']:
         if lane['summary']['lane_block_reasons']:
             lines.append(f"{lane['fill_model']}/{lane['scenario']}: " + ', '.join(lane['summary']['lane_block_reasons']))
