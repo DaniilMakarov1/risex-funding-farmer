@@ -4,9 +4,17 @@
 
 SCANNER_V1_PARTIALLY_IMPLEMENTED_S1A_S1B_ACCEPTED. Owner reopens only the finite Scanner v1 route: SCV1-S1a -> S1b -> S2 -> S3 -> one bounded public campaign and final report/STOP. The original broad repair program/Goal, CAL/HOLDOUT and CYCLE-001 remain stopped. This is neither completed Scanner v1 nor trading readiness. Until the planned independent acceptance gates, development/checks are offline only; no private endpoints, fee reader, credentials or trading.
 
-Sole Chief: `01a07bf4-0788-7c33-9602-d0ce84136bba`, activated by owner decision 2026-09-07; predecessor `01a07b9b-c837-7ef0-bd8d-2c0ff4470819` completed/idle. Astra/medium VERIFIED from this native turn context; speed UNKNOWN, Standard USER_SELECTED; task cost/context percentage UNKNOWN. R3 Builder completed/stopped. No collector, scheduled follow-up or Goal.
+Sole Chief: `01a07c92-745a-7670-8bb8-8909278f3095`, `[CHIEF] Scanner v1 — S2 Final`, activated by owner decision 2026-09-07. Predecessor `01a07bf4-0788-7c33-9602-d0ce84136bba` and Method3 Builder are native idle and have stopped writes/processes. Astra/medium VERIFIED from native turn_context; actual speed UNKNOWN, Standard USER_SELECTED; task cost/context percentage UNKNOWN. No collector, scheduled follow-up or Goal.
 
-## Current SCV1-S2-CAPACITY-METHOD — CAPACITY_METHOD_BLOCKED / STOP
+## Current SCV1-S2 Final — authorized end-to-end candidate
+
+Owner accepts STOP of the separate CAPACITY-METHOD stage and supersedes its PHASE A/B prerequisite. Exactly one fresh Luna/max/Standard Builder may implement compact durable storage, remove proven redundant source-book state, preserve semantic replay and then measure its own actual combined workload. No separate method iteration. Starting local HEAD and fetched origin/main both `e631b6e402725167f537064eb2ce600a4764d8d6`, clean; production/tests/policy unchanged. Builder starts from the published governance commit containing this decision, on `codex/spread-v1-s2-final`; dispatch identity is recorded in owner-only `s2-final-dispatch.json` after creation.
+
+Acceptance is HARD_ENVELOPE_SAFE + SEMANTIC_REPLAY_SAFE + prospectively frozen CAMPAIGN_PROFILE_FITS on candidate persistence, positive measured headroom, finite drained backlog and no concealed retention/policy halt, with final verification green. Minimal safe retirement is allowed; raising retention64/caps/policy for PASS is forbidden. Local bugs receive consolidated CHANGES_REQUESTED; fundamental compact/replay/retention/throughput conflict is S2_BLOCKED/STOP to owner, not an automatic R-series. S3/public smoke/campaign remain closed until their acceptance gates. Zero S2 Final review rounds/accepted candidates so far. Next Chief substantive action only on READY_FOR_REVIEW, BLOCKED/semantic conflict, or CONTEXT_HANDOFF_REQUIRED; no supervisory polling.
+
+Historical paragraphs below preserve prior accepted/rejected evidence, not superseded dispatch authority. R1/R2/R3 remain immutable NOT_ACCEPTED; CAPACITY-METHOD remains BLOCKED/NOT_ACCEPTED evidence. S1a/S1b and accepted D1 development evidence remain accepted.
+
+## Historical SCV1-S2-CAPACITY-METHOD — CAPACITY_METHOD_BLOCKED / STOP
 
 Chief independently reviewed the finite context-recovery result at accepted main `8186e7f1036ba74513dab671f4a18edcf69bdab1`. Verdict CAPACITY_METHOD_BLOCKED: the measured profile does not exercise/persist the intended workload. Both retention2566 and64 profiles admit one episode per alternative, then reject64 requests per alternative as UNRESOLVED_HALTED. The capacity profile processes55128 work items but writes only6rows/2368bytes (metadata, four summary-only result rows, stop); no market-stream/full-result persistence is measured. The retention control filters only TERMINAL_RETENTION_EXHAUSTED and misses the actual halt. This fails CAMPAIGN_PROFILE_FITS, not proof of economic failure or an observed hard-cap overrun.
 
