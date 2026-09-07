@@ -1,4 +1,4 @@
-# Current bounded task — SCV1-S2-CAPACITY-METHOD
+# Current bounded task — CAPACITY_METHOD_BLOCKED / STOP
 
 ## Finite owner objective and ownership
 
@@ -6,15 +6,11 @@ Continue FINAL-ASTRA-01: working public-only BTC RISEx maker SELL -> Lighter Sta
 
 Sole Chief `01a07bf4-0788-7c33-9602-d0ce84136bba` owns independent acceptance/governance/integration/push; predecessor completed/idle. Astra/medium VERIFIED native, speed UNKNOWN/Standard USER_SELECTED; task cost/context UNKNOWN. S1b candidate `85b7f007268233e4a43ce43faca56efb73ab5ff1` remains accepted and integrated exactly at `543493cd14deda8186a7ad7a3f5439e171d442b2`. Owner-decision starting published main: `7ea5a555ad44ccf3a6aa65e4bed82800b806c390`. No S2 implementation accepted. No global settings/credits/resets, collectors, scheduled follow-ups or Goal.
 
-## PHASE A — owner authorization 2026-09-07
+## Current action — STOP after CAPACITY_METHOD_BLOCKED
 
-Only SCV1-S2-CAPACITY-METHOD is open: one fresh visible GPT-5.6 Luna/max/Standard Builder, replacement named `codex/spread-v1-s2-capacity-method-3` branch/worktree from exact published main after this authorization checkpoint. Record exact dispatch identity in the existing ignored evidence root. R3 `5fc34f2c3a73d52507c2a8bc36f31f8465aee844` and prior rejected candidates are immutable NOT_ACCEPTED, never resume their sessions/branches. Read their localized reviews as unaccepted technical evidence only. R3 review: `s2-chief-5fc34f2/review/` under the evidence root below.
+Owner-authorized PHASE A ended in CAPACITY_METHOD_BLOCKED after independent review. The saved workload safety-halts after one unresolved episode per alternative and omits source/full-result persistence from its measured6-row output. The default64 control fails to detect the actual UNRESOLVED_HALTED reason. See STATUS and owner-only `s2-capacity-method-chief-blocked-20260907/review.json` for exact identities, independently checked counters/paths, limitations and stopped-process state. Current accepted pre-verdict main is `8186e7f1036ba74513dab671f4a18edcf69bdab1`; no production/tests changed.
 
-This is finite engineering analysis of the current capacity blocker, not production storage repair, a new general S1a/S1b audit, universal benchmark/storage/recovery/observability architecture or automatic R4. Builder chooses methods/algorithms within the contract. Diagnostic harness/scripts may live in owner-only ignored evidence space, or narrowly necessary test code. No production edits, policy/fees/delays/freshness/$100/four-alternative/120s/5s/one-second rule changes, cap increase or raising retention 64 for PASS. No public/private market work or S3. If production/tests are unchanged, no full suite is required solely for this analysis.
-
-### Immediate context-recovery checkpoint — before further measurement
-
-Method-2 Builder suffered two native compactions and is stopped/archived/interrupted; no tracked patch exists. Use owner-only `s2-capacity-method-2-preserved-20260907/handoff.json`, saved evidence and native command records; original worktree was removed by the app after archive, copy/hash preservation completed first. The fresh successor starts from exact current accepted main. First bounded output ONLY: verify preserved harness/config/import identities, distinguish current harness from stale report-v3, reconcile non-book mismatches10, profile persistence6records/2368bytes, retention2566 projection and default64 halt control false. Return a concrete method blocker or one justified finite next check with exact commands/outcomes needed. No new full profile, raw3.38GB rerun, large subproblem or production change in this checkpoint. Do not silently continue from reconciliation into measurements; stop writes and send a concrete checkpoint to Chief. This is context recovery within PHASE A, not another R-series or acceptance. Full PHASE A criteria remain below.
+No active Builder. Method3 finished the mandated reconciliation checkpoint; no automatic follow-up or successor. The owner decision explicitly requires STOP on METHOD_BLOCKED. Do not create PHASE B/R4/S3 or another renamed method/correction series. Any new changed method/scope requires owner decision. Full finite objective remains unachieved; original PHASE A criteria and conditional later gates below are preserved as constraints, not current execution authority. R3/prior rejected candidates remain immutable NOT_ACCEPTED.
 
 ### Campaign Capacity Contract and deliverables
 
