@@ -2062,8 +2062,19 @@ class Scv1S1bKernel(CycleKernel):
 
     def _accept_event(self, cycle: _S1bCycle, event: CausalEvent) -> None:
         if event.venue not in {Venue.RISEX, Venue.LIGHTER} or event.canonical_market != cycle.quote_version.canonical_market:
+            cycle.event_count += 1
             cycle.ignored_event_count += 1
             return
+        if event.kind is CausalEventKind.DATA_GAP:
+            gap = event.gap
+            assert gap is not None
+            # A gap from another session/recovery chain is not evidence about
+            # this episode.  Resolve identity before any interval operation
+            # so an irrelevant future-activation gap cannot raise or alter
+            # the episode's gap history.
+            if not self._s1b_gap_matches_cycle(cycle, gap):
+                return
+        cycle.event_count += 1
         identity_key = _event_identity_key(event)
         signature = _event_signature(event)
         if identity_key is not None:
@@ -2133,18 +2144,18 @@ class Scv1S1bKernel(CycleKernel):
             self._run_due_until(cycle, ready)
 
     def _gap_overlaps_s1b(self, cycle: _S1bCycle, gap: DataGapEvidence) -> bool:
-        if gap.canonical_market != cycle.quote_version.canonical_market:
+        if not self._s1b_gap_matches_cycle(cycle, gap):
             return False
-        if cycle.phase in {
+        entry_phase = cycle.phase in {
             _S1bPhase.ENTRY_WAIT,
             _S1bPhase.ENTRY_ACTIVE,
             _S1bPhase.ENTRY_CANCEL_WAIT,
             _S1bPhase.ENTRY_REQUOTE_WAIT,
             _S1bPhase.ENTRY_BARRIER,
             _S1bPhase.UNMATCHED_WAIT,
-        }:
+        }
+        if entry_phase:
             start = min((item.activation_ns for item in cycle.entry_versions), default=cycle.current_ns)
-            end = max(cycle.current_ns, cycle.max_hold_deadline_ns or cycle.current_ns)
         elif cycle.phase in {
             _S1bPhase.EXIT_WAIT,
             _S1bPhase.EXIT_ACTIVE,
@@ -2153,10 +2164,41 @@ class Scv1S1bKernel(CycleKernel):
             _S1bPhase.FORCE_WAIT,
         }:
             start = cycle.exit_activation_ns or cycle.current_ns
-            end = max(cycle.current_ns, cycle.max_hold_deadline_ns or cycle.current_ns)
         else:
             return False
-        if gap.source_venue not in {Venue.RISEX, Venue.LIGHTER}:
+        future_activation_points = (
+            tuple(
+                item.activation_ns
+                for item in cycle.entry_versions
+                if not item.activation_checked and item.activation_ns > cycle.current_ns
+            )
+            if entry_phase
+            else ()
+        )
+        if any(gap.overlaps(at_ns, at_ns) for at_ns in future_activation_points):
+            # A re-quote may leave an earlier activation in the past while
+            # the current entry version is still waiting.  Check each future
+            # activation point independently so a gap crossing that version
+            # cannot be lost behind the historical minimum.
+            return True
+        if start > cycle.current_ns:
+            # No action/exposure interval exists before the future activation
+            # boundary.  Use the inclusive activation point so a matching
+            # gap that ended before activation is irrelevant, while a gap
+            # touching/crossing activation (including an open gap) remains
+            # uncertain.  Never pass an inverted interval to DataGapEvidence.
+            return gap.overlaps(start, start)
+        end = max(cycle.current_ns, cycle.max_hold_deadline_ns or cycle.current_ns)
+        return gap.overlaps(start, end)
+
+    @staticmethod
+    def _s1b_gap_matches_cycle(cycle: _S1bCycle, gap: DataGapEvidence) -> bool:
+        """Check gap identity before evaluating its temporal interval."""
+
+        if (
+            gap.source_venue not in {Venue.RISEX, Venue.LIGHTER}
+            or gap.canonical_market != cycle.quote_version.canonical_market
+        ):
             return False
         expected_session = (
             cycle.quote_version.stream_session_id
@@ -2171,7 +2213,6 @@ class Scv1S1bKernel(CycleKernel):
         return (
             expected_session is not None
             and expected_recovery is not None
-            and gap.overlaps(start, end)
             and gap.matches(
                 gap.source_venue,
                 cycle.quote_version.canonical_market,
@@ -3238,7 +3279,6 @@ class Scv1S1bKernel(CycleKernel):
             self.advance_clock(at_monotonic_ns, scenario=scenario)
             return None
         causal_event = _coerce_event(event)
-        cycle.event_count += 1
         self._accept_event(cycle, causal_event)
         lane.last_result = self._result(cycle)
         if cycle.phase in {_S1bPhase.COMPLETE, _S1bPhase.ABORTED, _S1bPhase.UNRESOLVED}:

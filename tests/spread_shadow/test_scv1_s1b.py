@@ -9,9 +9,11 @@ import pytest
 from risex_farmer.models import Venue
 
 from risex_spread_shadow import (
+    CausalEvent,
     CycleFillModel,
     CycleClock,
     CycleTerminalState,
+    DataGapEvidence,
     Scv1S1bKernel,
     build_scv1_s1b_d1_report,
     Side,
@@ -37,6 +39,16 @@ def _activation_book() -> object:
 
 def _entry_trade(key: str, received: int, quantity: str, *, price: str = "101"):
     return _trade(key, received=received, quantity=quantity, price=price)
+
+
+def _position_quantities(positions: object) -> tuple[D, D, D, D, D]:
+    return (
+        positions.risex_signed_quantity,
+        positions.lighter_signed_quantity,
+        positions.paired_risex_quantity,
+        positions.paired_lighter_quantity,
+        positions.unmatched_risex_quantity,
+    )
 
 
 def _fresh_version(version_id: str, decision: int, revision: int):
@@ -891,6 +903,430 @@ def test_s1b_entry_wait_deadline_starts_completion_before_late_activation() -> N
     assert cancel.status.value == "PENDING"
     assert cancel.requested_monotonic_ns == 120_600_000_000
     assert cancel.effective_monotonic_ns == 121_100_000_000
+
+
+@pytest.mark.parametrize("scenario", tuple(CycleScenario))
+@pytest.mark.parametrize("fill_model", tuple(CycleFillModel))
+def test_s1b_gap_overlap_uses_inclusive_activation_boundary(
+    scenario: CycleScenario,
+    fill_model: CycleFillModel,
+) -> None:
+    version, source_books = _version(
+        f"s1b-gap-activation-{scenario.value}-{fill_model.value}"
+    )
+    kernel = Scv1S1bKernel(fill_model=fill_model)
+    assert kernel.admit(
+        version,
+        scenario=scenario,
+        source_books=source_books,
+    ).accepted
+    activation_ns = (
+        version.decision_ready_monotonic_ns
+        + kernel.policy.delays(scenario).activation_delay_ns
+    )
+
+    # A matching gap that is fully closed before activation remains in the
+    # evidence history but does not falsely block the future quote.  The
+    # activation guard still uses a fresh post-only book afterward.
+    closed_before = DataGapEvidence(
+        source_venue=Venue.LIGHTER,
+        canonical_market="BTC",
+        stream_session_id="lighter-s2",
+        recovery_generation=0,
+        gap_start_monotonic_ns=activation_ns - 300_000_000,
+        gap_end_monotonic_ns=activation_ns - 200_000_000,
+        reason="PRE_ACTIVATION_GAP",
+    )
+    kernel.advance(closed_before, scenario=scenario)
+    before_activation = kernel.snapshot(scenario=scenario)
+    assert before_activation is not None
+    assert before_activation.status is CycleTerminalState.PENDING
+    assert before_activation.reason_codes == ()
+    active = kernel._lane(scenario).active
+    assert active is not None
+    assert active.gaps == [closed_before]
+
+    kernel.advance(
+        _book(
+            Venue.RISEX,
+            received=activation_ns - 50_000_000,
+            revision=2,
+            bids=(("99", "10"),),
+            asks=(("102", "10"),),
+        ),
+        scenario=scenario,
+    )
+    kernel.advance_clock(activation_ns, scenario=scenario)
+    activated = kernel.snapshot(scenario=scenario)
+    assert activated is not None
+    assert activated.status is CycleTerminalState.PENDING
+    assert "REQUIRED_ACTION_DATA_GAP" not in activated.reason_codes
+
+    # Touching activation is inclusive and therefore remains uncertain.
+    touching_kernel = Scv1S1bKernel(fill_model=fill_model)
+    assert touching_kernel.admit(
+        version,
+        scenario=scenario,
+        source_books=source_books,
+    ).accepted
+    touching = DataGapEvidence(
+        source_venue=Venue.LIGHTER,
+        canonical_market="BTC",
+        stream_session_id="lighter-s2",
+        recovery_generation=0,
+        gap_start_monotonic_ns=activation_ns,
+        gap_end_monotonic_ns=activation_ns,
+        reason="ACTIVATION_BOUNDARY_GAP",
+    )
+    touching_kernel.advance(touching, scenario=scenario)
+    touching_result = touching_kernel.snapshot(scenario=scenario)
+    assert touching_result is not None
+    assert touching_result.status is CycleTerminalState.UNRESOLVED
+    assert "REQUIRED_ACTION_DATA_GAP" in touching_result.reason_codes
+
+    # An open matching gap that starts before activation can continue through
+    # that boundary and must remain uncertain as well.
+    open_kernel = Scv1S1bKernel(fill_model=fill_model)
+    assert open_kernel.admit(
+        version,
+        scenario=scenario,
+        source_books=source_books,
+    ).accepted
+    open_gap = DataGapEvidence(
+        source_venue=Venue.LIGHTER,
+        canonical_market="BTC",
+        stream_session_id="lighter-s2",
+        recovery_generation=0,
+        gap_start_monotonic_ns=activation_ns - 1,
+        gap_end_monotonic_ns=None,
+        reason="OPEN_PRE_ACTIVATION_GAP",
+    )
+    open_kernel.advance(open_gap, scenario=scenario)
+    open_result = open_kernel.snapshot(scenario=scenario)
+    assert open_result is not None
+    assert open_result.status is CycleTerminalState.UNRESOLVED
+    assert "REQUIRED_ACTION_DATA_GAP" in open_result.reason_codes
+
+
+@pytest.mark.parametrize("scenario", tuple(CycleScenario))
+@pytest.mark.parametrize("fill_model", tuple(CycleFillModel))
+@pytest.mark.parametrize(
+    ("source_venue", "stream_session_id", "recovery_generation"),
+    (
+        (Venue.RISEX, "wrong-risex-session", 0),
+        (Venue.LIGHTER, "wrong-lighter-session", 0),
+        (Venue.LIGHTER, "lighter-s2", 1),
+    ),
+)
+def test_s1b_wrong_gap_identity_is_ignored_before_interval_and_state_change(
+    scenario: CycleScenario,
+    fill_model: CycleFillModel,
+    source_venue: Venue,
+    stream_session_id: str,
+    recovery_generation: int,
+) -> None:
+    version, source_books = _version(
+        f"s1b-gap-identity-{scenario.value}-{fill_model.value}-{source_venue.value}-{recovery_generation}"
+    )
+    kernel = Scv1S1bKernel(fill_model=fill_model)
+    assert kernel.admit(
+        version,
+        scenario=scenario,
+        source_books=source_books,
+    ).accepted
+    activation_ns = (
+        version.decision_ready_monotonic_ns
+        + kernel.policy.delays(scenario).activation_delay_ns
+    )
+    before = kernel.snapshot(scenario=scenario)
+    assert before is not None
+    active = kernel._lane(scenario).active
+    assert active is not None
+    assert active.gaps == []
+    event_count_before = active.event_count
+
+    wrong_identity_gap = DataGapEvidence(
+        source_venue=source_venue,
+        canonical_market="BTC",
+        stream_session_id=stream_session_id,
+        recovery_generation=recovery_generation,
+        gap_start_monotonic_ns=activation_ns - 300_000_000,
+        gap_end_monotonic_ns=activation_ns - 200_000_000,
+        reason="WRONG_IDENTITY_GAP",
+    )
+    kernel.advance(wrong_identity_gap, scenario=scenario)
+    after = kernel.snapshot(scenario=scenario)
+    assert after is not None
+    assert after.status is before.status is CycleTerminalState.PENDING
+    assert after.reason_codes == before.reason_codes == ()
+    assert after.positions == before.positions
+    assert after.ledger == before.ledger
+    assert after.actions == before.actions
+    assert after.entry_quantity == before.entry_quantity == D("0")
+    assert after.hedged_quantity == before.hedged_quantity == D("0")
+    assert active.event_count == event_count_before
+    assert active.gaps == []
+
+
+@pytest.mark.parametrize("scenario", tuple(CycleScenario))
+@pytest.mark.parametrize("fill_model", tuple(CycleFillModel))
+def test_s1b_late_processed_gap_preserves_fills_positions_and_time(
+    scenario: CycleScenario,
+    fill_model: CycleFillModel,
+) -> None:
+    version, source_books = _version(
+        f"s1b-gap-late-{scenario.value}-{fill_model.value}"
+    )
+    kernel = Scv1S1bKernel(fill_model=fill_model)
+    assert kernel.admit(
+        version,
+        scenario=scenario,
+        source_books=source_books,
+    ).accepted
+    activation_ns = (
+        version.decision_ready_monotonic_ns
+        + kernel.policy.delays(scenario).activation_delay_ns
+    )
+    kernel.advance(
+        _book(
+            Venue.RISEX,
+            received=activation_ns - 100_000_000,
+            revision=2,
+            bids=(("99", "10"),),
+            asks=(("102", "10"),),
+        ),
+        scenario=scenario,
+    )
+    kernel.advance_clock(activation_ns, scenario=scenario)
+    fill_ns = activation_ns + 100_000_000
+    kernel.advance(
+        _entry_trade(
+            f"s1b-gap-late-fill-{scenario.value}-{fill_model.value}",
+            fill_ns,
+            "0.50",
+            price="102",
+        ),
+        scenario=scenario,
+    )
+    hedge_due_ns = fill_ns + kernel.policy.delays(scenario).taker_delay_ns
+    kernel.advance(
+        _book(
+            Venue.LIGHTER,
+            received=hedge_due_ns - 100_000_000,
+            revision=2,
+            bids=(("99", "10"),),
+            asks=(("100", "10"),),
+        ),
+        scenario=scenario,
+    )
+    kernel.advance_clock(hedge_due_ns, scenario=scenario)
+    before = kernel.snapshot(scenario=scenario)
+    assert before is not None
+    assert before.entry_quantity == D("0.50")
+    assert before.hedged_quantity == D("0.50")
+    active = kernel._lane(scenario).active
+    assert active is not None
+    current_before = active.current_ns
+    fills_before = before.fills
+    actions_before = before.actions
+    ledger_before = before.ledger
+    positions_before = before.positions
+
+    late_gap = DataGapEvidence(
+        source_venue=Venue.LIGHTER,
+        canonical_market="BTC",
+        stream_session_id="lighter-s2",
+        recovery_generation=0,
+        gap_start_monotonic_ns=fill_ns + 1,
+        gap_end_monotonic_ns=fill_ns + 2,
+        reason="LATE_PROCESSED_GAP",
+    )
+    late_event = CausalEvent.from_gap(
+        late_gap,
+        ingress_received_monotonic_ns=current_before + 100,
+    )
+    kernel.advance(late_event, scenario=scenario)
+    after = kernel.snapshot(scenario=scenario)
+    assert after is not None
+    assert after.status is CycleTerminalState.UNRESOLVED
+    assert "REQUIRED_ACTION_DATA_GAP" in after.reason_codes
+    assert after.fills == fills_before
+    assert after.actions == actions_before
+    assert after.ledger == ledger_before
+    assert _position_quantities(after.positions) == _position_quantities(positions_before)
+    terminal = kernel._lane(scenario).terminal_cycles[-1]
+    assert terminal.current_ns >= current_before
+
+
+@pytest.mark.parametrize("scenario", tuple(CycleScenario))
+@pytest.mark.parametrize("fill_model", tuple(CycleFillModel))
+def test_s1b_gap_preserves_pending_entry_hedge_obligation(
+    scenario: CycleScenario,
+    fill_model: CycleFillModel,
+) -> None:
+    lighter_market = replace(
+        _market(Venue.LIGHTER, "BTC", minimum_quantity="0.30"),
+        quantity_step_raw=D("0.01"),
+    )
+    version, source_books = _version(
+        f"s1b-gap-pending-hedge-{scenario.value}-{fill_model.value}",
+        lighter_market=lighter_market,
+    )
+    kernel = Scv1S1bKernel(fill_model=fill_model)
+    assert kernel.admit(
+        version,
+        scenario=scenario,
+        source_books=source_books,
+    ).accepted
+    activation_ns = (
+        version.decision_ready_monotonic_ns
+        + kernel.policy.delays(scenario).activation_delay_ns
+    )
+    kernel.advance(
+        _book(
+            Venue.RISEX,
+            received=activation_ns - 100_000_000,
+            revision=2,
+            bids=(("99", "10"),),
+            asks=(("102", "10"),),
+        ),
+        scenario=scenario,
+    )
+    kernel.advance_clock(activation_ns, scenario=scenario)
+    fill_ns = activation_ns + 100_000_000
+    kernel.advance(
+        _entry_trade(
+            f"s1b-gap-pending-hedge-fill-{scenario.value}-{fill_model.value}",
+            fill_ns,
+            "0.20",
+            price="102",
+        ),
+        scenario=scenario,
+    )
+    hedge_due_ns = fill_ns + kernel.policy.delays(scenario).taker_delay_ns
+    kernel.advance(
+        _book(
+            Venue.LIGHTER,
+            received=hedge_due_ns - 100_000_000,
+            revision=2,
+            bids=(("99", "10"),),
+            asks=(("100", "0.20"),),
+        ),
+        scenario=scenario,
+    )
+    kernel.advance_clock(hedge_due_ns, scenario=scenario)
+    before = kernel.snapshot(scenario=scenario)
+    assert before is not None
+    assert before.pending_entry_hedge_quantity == D("0.20")
+    assert before.positions.risex_signed_quantity == D("-0.20")
+    active = kernel._lane(scenario).active
+    assert active is not None
+    current_before = active.current_ns
+    gap = DataGapEvidence(
+        source_venue=Venue.LIGHTER,
+        canonical_market="BTC",
+        stream_session_id="lighter-s2",
+        recovery_generation=0,
+        gap_start_monotonic_ns=current_before,
+        gap_end_monotonic_ns=current_before,
+        reason="PENDING_HEDGE_GAP",
+    )
+    kernel.advance(
+        CausalEvent.from_gap(
+            gap,
+            ingress_received_monotonic_ns=current_before + 100,
+        ),
+        scenario=scenario,
+    )
+    after = kernel.snapshot(scenario=scenario)
+    assert after is not None
+    assert after.status is CycleTerminalState.UNRESOLVED
+    assert after.pending_entry_hedge_quantity == before.pending_entry_hedge_quantity
+    assert _position_quantities(after.positions) == _position_quantities(before.positions)
+    assert after.ledger == before.ledger
+    assert after.actions == before.actions
+
+
+def test_s1b_gap_preserves_pending_exit_and_position_obligations() -> None:
+    scenario = CycleScenario.PRIMARY
+    kernel, exit_activation_ns, _ = _exit_deadline_gate_setup(scenario)
+    before = kernel.snapshot(scenario=scenario)
+    assert before is not None
+    assert before.positions.paired_risex_quantity > D("0")
+    assert any(action.action_id == "exit-maker" for action in before.pending_actions)
+    active = kernel._lane(scenario).active
+    assert active is not None
+    current_before = active.current_ns
+    assert current_before < exit_activation_ns
+
+    gap = DataGapEvidence(
+        source_venue=Venue.RISEX,
+        canonical_market="BTC",
+        stream_session_id="risex-s2",
+        recovery_generation=0,
+        gap_start_monotonic_ns=current_before,
+        gap_end_monotonic_ns=None,
+        reason="PENDING_EXIT_GAP",
+    )
+    kernel.advance(
+        CausalEvent.from_gap(
+            gap,
+            ingress_received_monotonic_ns=current_before + 100,
+        ),
+        scenario=scenario,
+    )
+    after = kernel.snapshot(scenario=scenario)
+    assert after is not None
+    assert after.status is CycleTerminalState.UNRESOLVED
+    assert _position_quantities(after.positions) == _position_quantities(before.positions)
+    assert after.ledger == before.ledger
+    assert after.actions == before.actions
+    assert after.exit_price == before.exit_price
+
+
+@pytest.mark.parametrize("scenario", tuple(CycleScenario))
+@pytest.mark.parametrize("fill_model", tuple(CycleFillModel))
+def test_s1b_gap_checks_future_requote_activation_points(
+    scenario: CycleScenario,
+    fill_model: CycleFillModel,
+) -> None:
+    kernel, cancel_effective_ns = _s1b_cancel_effective_boundary(scenario, fill_model)
+    next_decision_ns = cancel_effective_ns + 1_000_000_000
+    next_version, next_books = _fresh_version(
+        f"s1b-gap-future-requote-{scenario.value}-{fill_model.value}",
+        next_decision_ns,
+        4,
+    )
+    assert kernel.admit(
+        next_version,
+        scenario=scenario,
+        source_books=next_books,
+    ).accepted
+    active = kernel._lane(scenario).active
+    assert active is not None
+    activation_ns = next_decision_ns + kernel.policy.delays(scenario).activation_delay_ns
+    assert active.current_ns < activation_ns
+
+    gap = DataGapEvidence(
+        source_venue=Venue.LIGHTER,
+        canonical_market="BTC",
+        stream_session_id="lighter-s2",
+        recovery_generation=0,
+        gap_start_monotonic_ns=activation_ns - 1,
+        gap_end_monotonic_ns=None,
+        reason="FUTURE_REQUOTE_OPEN_GAP",
+    )
+    kernel.advance(
+        CausalEvent.from_gap(
+            gap,
+            ingress_received_monotonic_ns=active.current_ns + 100,
+        ),
+        scenario=scenario,
+    )
+    result = kernel.snapshot(scenario=scenario)
+    assert result is not None
+    assert result.status is CycleTerminalState.UNRESOLVED
+    assert "REQUIRED_ACTION_DATA_GAP" in result.reason_codes
 
 
 def test_s1b_exit_wait_deadline_starts_cancel_before_late_activation() -> None:
