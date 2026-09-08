@@ -2064,6 +2064,93 @@ def test_s1b_entry_activation_gate_survives_deadline_cancel_for_crossing_requote
     assert not any(fill.action_id == "entry-maker:1" for fill in after.fills)
 
 
+@pytest.mark.parametrize("fill_model", tuple(CycleFillModel))
+def test_s1b_invalid_post_only_completed_cancel_preserves_reason(
+    fill_model: CycleFillModel,
+) -> None:
+    scenario = CycleScenario.PRIMARY
+    invalid_version, source_books = _version(
+        f"s1b-invalid-post-only-{fill_model.value}"
+    )
+    kernel = Scv1S1bKernel(fill_model=fill_model)
+    assert kernel.admit(
+        invalid_version,
+        scenario=scenario,
+        source_books=source_books,
+    ).accepted
+    crossing_activation_ns = (
+        invalid_version.decision_ready_monotonic_ns
+        + kernel.policy.delays(scenario).activation_delay_ns
+    )
+    kernel.advance(
+        _book(
+            Venue.RISEX,
+            received=crossing_activation_ns - 100_000_000,
+            revision=2,
+            bids=(("102", "10"),),
+            asks=(("103", "10"),),
+        ),
+        scenario=scenario,
+    )
+    kernel.advance_clock(crossing_activation_ns, scenario=scenario)
+    crossing = kernel.snapshot(scenario=scenario)
+    assert crossing is not None
+    invalid_cancel = next(
+        action
+        for action in crossing.actions
+        if action.reason == "ENTRY_INVALIDATED_NO_ORDER"
+    )
+    assert invalid_cancel.status.value == "COMPLETED"
+    assert invalid_cancel.requested_quantity == invalid_cancel.executed_quantity
+    assert invalid_cancel.remaining_quantity == D("0")
+
+    next_decision_ns = crossing_activation_ns + 1_000_000_000
+    next_version, next_books = _fresh_version(
+        f"s1b-invalid-post-only-next-{fill_model.value}",
+        next_decision_ns,
+        3,
+    )
+    assert kernel.admit(
+        next_version,
+        scenario=scenario,
+        source_books=next_books,
+    ).accepted
+    next_activation_ns = (
+        next_decision_ns + kernel.policy.delays(scenario).activation_delay_ns
+    )
+    kernel.advance(
+        _book(
+            Venue.RISEX,
+            received=next_activation_ns - 100_000_000,
+            revision=4,
+            bids=(("99", "10"),),
+            asks=(("102", "10"),),
+        ),
+        scenario=scenario,
+    )
+    kernel.advance_clock(next_activation_ns, scenario=scenario)
+
+    # Re-enter the completed-action boundary after the crossing version was
+    # invalidated.  This must preserve the truthful no-order reason while the
+    # late-fill path still reconciles genuine cancellation actions.
+    kernel.advance_clock(
+        next_activation_ns
+        + kernel.policy.entry_cancel_after_activation_ns
+        + kernel.policy.delays(scenario).cancel_delay_ns,
+        scenario=scenario,
+    )
+    after = kernel.snapshot(scenario=scenario)
+    assert after is not None
+    preserved = next(
+        action for action in after.actions if action.action_id == invalid_cancel.action_id
+    )
+    assert preserved.status.value == "COMPLETED"
+    assert preserved.reason == "ENTRY_INVALIDATED_NO_ORDER"
+    assert preserved.requested_quantity == invalid_cancel.requested_quantity
+    assert preserved.executed_quantity == invalid_cancel.executed_quantity
+    assert preserved.remaining_quantity == invalid_cancel.remaining_quantity
+
+
 @pytest.mark.parametrize("scenario", (CycleScenario.PRIMARY, CycleScenario.STRESS))
 def test_s1b_entry_activation_gate_keeps_eligible_pre_cancel_race(
     scenario: CycleScenario,
