@@ -1,5 +1,13 @@
 # Current status
 
+## S1b cancellation correction ACCEPTED; complete saved-pilot rerun pending
+
+Chief `01a0807d-0043-7131-a681-824a13b609c5` independently accepts Builder `01a0807d-ce6e-71f1-8e81-0c7b19ef6867` candidate `ab18071362948039a96402b2a7cc7f9226eab947`, exact base `b7f25979f763a4b4e331216fe22120cc31ea3d82`. One review, no correction rounds. Only cancellation completion and directly related regressions changed. A pre-effective fill processed after completed cancellation now reconciles both cancel quantities; validation, policy and timing unchanged. Builder stopped, clean branch preserved. Chief Astra/medium and Builder Luna/max VERIFIED native; speed UNKNOWN/Standard USER_SELECTED; task cost UNKNOWN.
+
+Chief read full diff, reproduced original uncached record41247 failure on base, then traversed original end on candidate without exception; exact original fills/money unchanged, cancel .001038/.001038, positions -.000222/+.00022, UNRESOLVED retained. Twelve additional boundary/full-fill/idempotence checks pass. Builder final isolated Python3.11.5 suite4172passed/3skipped132.65s and base regression4fail/4pass verified through native commands/log hashes; dependency isolation/check passes. Evidence: owner-only `s1b-cancel-chief-20260908/{review.json,fixed719.json,fixed719-completion-trace.json,independent-boundary-checks.json,independent-arithmetic.json}` and `s1b-cancel-builder-20260908/verification-summary.json`. No repeated full suite needed on exact integration.
+
+Next: complete fresh four-alternative run under unchanged method in `conditional-episodes-cancel-fixed-20260908/`, then finite report/STOP. All original conditional-probe files remain hash-identical. No new collection, trading, policy change or full S2.
+
 ## Owner-authorized handoff — local cancellation fix and complete offline probe, 2026-09-08
 
 The owner supersedes the previous STOP only for the finite route in NEXT_TASK: one visible Builder corrects the concrete S1b cancellation accounting defect, a fresh Chief independently accepts, then all four alternatives are recalculated from scratch on the same immutable pilot. No production fix is accepted yet. Existing evidence remains immutable; no old/new kernel result stitching. Normal Chief/Builder division and context rotation apply; prior personal exceptions do not apply.

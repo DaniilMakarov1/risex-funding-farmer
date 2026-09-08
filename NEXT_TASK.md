@@ -1,4 +1,8 @@
-# OPEN — local S1b cancellation accounting fix, then complete conditional episodes
+# OPEN — accepted cancellation fix; complete fresh conditional episodes
+
+## Current checkpoint
+
+Cancellation fix `ab18071362948039a96402b2a7cc7f9226eab947` is independently ACCEPTED by sole Chief `01a0807d-0043-7131-a681-824a13b609c5`; one review. Builder stopped; no further implementation open. Verification and exact evidence are in STATUS. The reproduction/correction instructions below describe the completed first part and must not trigger a repeat. Only the complete fresh four-alternative calculation and finite report/STOP remain open.
 
 ## Owner decision and sole ownership, 2026-09-08
 
