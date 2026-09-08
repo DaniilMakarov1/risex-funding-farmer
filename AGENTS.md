@@ -20,6 +20,10 @@ Owner explicitly instructed current Chief to review and stop the RP2 Builder and
 
 Owner subsequently explicitly authorized continuing in this same session despite native compactions. For this personal-completion route, the mandatory context-rotation stop is waived; recover from current Git/documents/evidence as needed. Other invariants remain unchanged.
 
+## Current owner decision — cancellation fix and conditional probe, 2026-09-08
+
+The owner explicitly requests a new Chief and one visible Builder for the bounded S1b cancellation accounting correction and, after independent Chief acceptance, a fresh complete four-alternative rerun on the same saved pilot as specified in NEXT_TASK. Normal Chief/Builder implementation and acceptance roles apply. The earlier personal implementation and context-rotation exceptions are limited to the completed research-pilot route and do not apply here. No new public collection, policy change or full S2 work is authorized.
+
 ## Standing owner authorization
 
 Owner decision 2026-09-07: ordinary actions necessary within the current authorized slice are pre-approved. Chief and Builder must proceed without asking the owner again for code/test edits, offline checks, dependency setup required for authorized verification, local candidate/WIP commits, evidence preservation and handoff. Chief's already-authorized governance commits, accepted integration/push and sequential Builder creation/rotation also require no repeat confirmation. Builder commits its own authorized production/tests paths on its own branch independently; a commit is not acceptance. Do not invent approval gates from routine Git operations, skills or uncertainty that can be resolved within the contract.

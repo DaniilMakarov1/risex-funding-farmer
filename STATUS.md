@@ -1,5 +1,11 @@
 # Current status
 
+## Owner-authorized handoff — local cancellation fix and complete offline probe, 2026-09-08
+
+The owner supersedes the previous STOP only for the finite route in NEXT_TASK: one visible Builder corrects the concrete S1b cancellation accounting defect, a fresh Chief independently accepts, then all four alternatives are recalculated from scratch on the same immutable pilot. No production fix is accepted yet. Existing evidence remains immutable; no old/new kernel result stitching. Normal Chief/Builder division and context rotation apply; prior personal exceptions do not apply.
+
+Outgoing Chief `01a07f8b-131d-7c03-8e97-80dc4b08823a` relinquishes engineering control at publication of this handoff before successor activation. No active processes, agents, collectors or scheduled follow-ups; no candidate. Actual model/effort/speed/usage UNKNOWN. Production/tests unchanged from frozen pilot release. Docs-only handoff requires identity/diff checks, not a repeated full suite. Successor owns reproduction, single Builder dispatch, review/integration and the authorized full rerun. Historical STOP/result sections below describe preserved prior results, not the current authorization.
+
 ## Conditional-episode probe — production blocker / STOP, 2026-09-08
 
 The fixed offline probe reached its explicit production-blocker stop. EXECUTION_PATH_BLOCKS_EVALUATION describes an engineering blocker, not a completed four-alternative assessment. Production/tests and policy are unchanged; no fix is accepted. Further correction/replay requires a new owner decision.
