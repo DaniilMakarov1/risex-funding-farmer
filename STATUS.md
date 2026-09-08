@@ -1,5 +1,9 @@
 # Current status
 
+## Lifecycle candidate CHANGES_REQUESTED — 2026-09-08
+
+Candidate7fbf77873e9c80916eec38394324baab5bf1a570 not accepted. Full907-line diff and owner-only wrappers reviewed; native isolated Python3.11.5 suite4210passed3skipped verified. Three independent fixtures expose false source binding after same-HEAD edits, valid historical report invalidated by later docs commit, and empty result accepted COMPLETE. Consolidated evidence evaluation-recovery-chief-20260908/lifecycle-review-7fbf778/. Fresh correction required; predecessor01a08210-1697-7e63-ad7f-e2a3a96c3282 is idle and had native compaction, must not resume. No code merged. Stale/gap diagnostic Builder continues separately; full pilot waits for both findings/acceptance.
+
 ## Focused exit diagnosis authorized — 2026-09-08
 
 Owner prioritizes five stale unwind and fifteen gap/temporal Primary exit cases while minimal lifecycle correction continues. One additional isolated visible diagnostic Builder permitted; normal Chief review and integration remain. Exact twenty starts and diagnostic criteria are in NEXT_TASK. No new code accepted or new public/full pilot run launched. Saved28 Primary maker episodes partition into5 minimum-residue,5 stale-unwind,15 gap/temporal exit,3 activation-unknown; this is recorded classification, not proof all guards are correct. Seven original Lighter disconnects approximately122seconds apart are observed; cause UNKNOWN. Prior worktree and owner-only outputs still exist, so deletion attribution is unproven.
