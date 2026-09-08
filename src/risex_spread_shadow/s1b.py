@@ -1518,7 +1518,7 @@ class Scv1S1bKernel(CycleKernel):
 
         if (
             cycle.paired_risex_quantity <= _ZERO
-            or cycle.exit_chosen
+            or (cycle.exit_chosen and cycle.exit_quote is not None)
             or cycle.phase
             not in {
                 _S1bPhase.ENTRY_WAIT,
@@ -2430,7 +2430,21 @@ class Scv1S1bKernel(CycleKernel):
                     for item in cycle.entry_versions
                 )
                 if all_cancelled and not _s1b_pending_actions(cycle, CycleActionKind.ENTRY_HEDGE):
-                    values.append(cycle.current_ns)
+                    # A paired position can reach the barrier while the
+                    # current books are temporarily unusable for exit.  The
+                    # boundary handler records that data deferral and leaves
+                    # the pair pending until a new BOOK wakes it.  Do not
+                    # reinsert the same timestamp: doing so calls the same
+                    # deferred transition again and the no-progress guard
+                    # would incorrectly turn a retryable data condition into
+                    # REQUIRED_ACTION_AMBIGUOUS.
+                    exit_ready, exit_reason = self._s1b_exit_ready(cycle, cycle.current_ns)
+                    if not (
+                        exit_ready is None
+                        and exit_reason is not None
+                        and exit_reason.value in _RETRYABLE_ACTION_DATA_REASONS
+                    ):
+                        values.append(cycle.current_ns)
             if (
                 cycle.max_hold_deadline_ns is not None
                 and not cycle.deadline_forced
@@ -3513,6 +3527,16 @@ class Scv1S1bKernel(CycleKernel):
 
     def _s1b_has_unresolved_observation(self, cycle: _S1bCycle) -> bool:
         if any(_s1b_action_data_deferred(action) for action in cycle.actions):
+            return True
+        if (
+            cycle.exit_chosen
+            and cycle.exit_quote is None
+            and cycle.paired_risex_quantity > _ZERO
+        ):
+            # The pair has already committed the lane to exit, but the
+            # causally required exit BOOK was unavailable at the last
+            # observation.  Keep the known inventory visible while making a
+            # no-recovery finish explicitly incomplete.
             return True
         return any(self._gap_overlaps_s1b(cycle, gap) for gap in cycle.gaps)
 

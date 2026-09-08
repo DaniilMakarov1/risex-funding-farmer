@@ -2422,6 +2422,89 @@ def test_s1b_later_entry_due_does_not_reconsume_consumed_book(
     ) == D("0.40")
 
 
+def test_s1b_stale_exit_barrier_defers_until_fresh_book_without_scheduler_halt() -> None:
+    def build_kernel() -> Scv1S1bKernel:
+        version, source_books = _version("chief-stale-exit-barrier")
+        kernel = Scv1S1bKernel(fill_model=CycleFillModel.TOUCH_ALLOWED)
+        assert kernel.admit(version, source_books=source_books).accepted
+        kernel.advance(_activation_book())
+        kernel.advance(_entry_trade("f", 600_000_000, "0.60"))
+        kernel.advance(
+            _book(
+                Venue.RISEX,
+                received=900_000_000,
+                revision=3,
+                bids=(("99", "10"),),
+                asks=(("102", "10"),),
+            )
+        )
+        kernel.advance(
+            _book(
+                Venue.LIGHTER,
+                received=900_000_000,
+                revision=3,
+                bids=(("99", "10"),),
+                asks=(("100", "10"),),
+            )
+        )
+        return kernel
+
+    no_recovery = build_kernel()
+    no_recovery.advance_clock(1_100_000_000)
+    before_stale = no_recovery.snapshot()
+    assert before_stale is not None
+    assert before_stale.status is CycleTerminalState.PENDING
+    assert before_stale.positions.paired_risex_quantity == D("0.60")
+    assert before_stale.positions.paired_lighter_quantity == D("0.60")
+    deadline = before_stale.max_hold_deadline_monotonic_ns
+
+    no_recovery.advance_clock(1_600_000_000)
+    deferred = no_recovery.snapshot()
+    assert deferred is not None
+    assert deferred.status is CycleTerminalState.PENDING
+    assert deferred.positions.authoritative
+    assert deferred.positions.paired_risex_quantity == D("0.60")
+    assert deferred.positions.paired_lighter_quantity == D("0.60")
+    assert "REQUIRED_ACTION_DATA_STALE" in deferred.reason_codes
+    assert "REQUIRED_ACTION_AMBIGUOUS" not in deferred.reason_codes
+    assert deferred.max_hold_deadline_monotonic_ns == deadline
+
+    finished = no_recovery.finish(end_monotonic_ns=2_000_000_000)
+    assert finished.status is CycleTerminalState.UNRESOLVED
+    assert not finished.positions.authoritative
+    assert finished.positions.paired_risex_quantity == D("0.60")
+    assert finished.positions.paired_lighter_quantity == D("0.60")
+    assert finished.max_hold_deadline_monotonic_ns == deadline
+    assert not finished.cashflow_complete
+
+    recovered = build_kernel()
+    recovered.advance_clock(1_600_000_000)
+    for venue, asks in (
+        (Venue.RISEX, (("102", "10"),)),
+        (Venue.LIGHTER, (("100", "10"),)),
+    ):
+        recovered.advance(
+            _book(
+                venue,
+                received=1_700_000_000,
+                revision=4,
+                bids=(("99", "10"),),
+                asks=asks,
+            )
+        )
+    resumed = recovered.snapshot()
+    assert resumed is not None
+    assert resumed.status is CycleTerminalState.PENDING
+    assert resumed.positions.paired_risex_quantity == D("0.60")
+    assert resumed.positions.paired_lighter_quantity == D("0.60")
+    assert any(
+        action.action_id == "exit-maker"
+        and action.status.value == "PENDING"
+        for action in resumed.actions
+    )
+    assert resumed.max_hold_deadline_monotonic_ns == deadline
+
+
 @pytest.mark.parametrize("scenario", (CycleScenario.PRIMARY, CycleScenario.STRESS))
 @pytest.mark.parametrize(
     "fill_model",
