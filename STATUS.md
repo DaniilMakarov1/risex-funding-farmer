@@ -1,5 +1,11 @@
 # Current status
 
+## Owner-approved process update and exit continuity implementation — 2026-09-08
+
+AGENTS now contains stable current rules, with historical exceptions retained in Git. Owner approves bounded venue-specific exit continuity and paired-position reduction despite non-executable residuals; target behavior is in SYSTEM_SPEC/NEXT_TASK and is NOT_YET_IMPLEMENTED/ACCEPTED. Lifecycle R1 and exit Builder have isolated ownership. No production change is part of this governance update. Preserve R1 branch/worktree ddcb, diagnostic branch/worktree9d28, earlier candidate7fbf778/ac43, all original input/results and evidence.
+
+Independent raw timing/minimum checks confirm five temporary stale misses with subminimum residues. Both Lighter outage intervals have healthy same-session RISEx BOOK updates, no recorded RISEx trades/gaps and no due Lighter action; whole-lane halt is a design restriction, not proven permanently unknown inventory. Builder withdrew the contrary conclusion. Final all-four run waits for accepted corrections. No new public collection. Earlier stage entries below are historical records, not active authority; current scope is solely NEXT_TASK.
+
 ## Lifecycle candidate CHANGES_REQUESTED — 2026-09-08
 
 Candidate7fbf77873e9c80916eec38394324baab5bf1a570 not accepted. Full907-line diff and owner-only wrappers reviewed; native isolated Python3.11.5 suite4210passed3skipped verified. Three independent fixtures expose false source binding after same-HEAD edits, valid historical report invalidated by later docs commit, and empty result accepted COMPLETE. Consolidated evidence evaluation-recovery-chief-20260908/lifecycle-review-7fbf778/. Fresh correction required; predecessor01a08210-1697-7e63-ad7f-e2a3a96c3282 is idle and had native compaction, must not resume. No code merged. Stale/gap diagnostic Builder continues separately; full pilot waits for both findings/acceptance.
