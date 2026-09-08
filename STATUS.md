@@ -1,5 +1,9 @@
 # Current status
 
+## Focused exit diagnosis authorized — 2026-09-08
+
+Owner prioritizes five stale unwind and fifteen gap/temporal Primary exit cases while minimal lifecycle correction continues. One additional isolated visible diagnostic Builder permitted; normal Chief review and integration remain. Exact twenty starts and diagnostic criteria are in NEXT_TASK. No new code accepted or new public/full pilot run launched. Saved28 Primary maker episodes partition into5 minimum-residue,5 stale-unwind,15 gap/temporal exit,3 activation-unknown; this is recorded classification, not proof all guards are correct. Seven original Lighter disconnects approximately122seconds apart are observed; cause UNKNOWN. Prior worktree and owner-only outputs still exist, so deletion attribution is unproven.
+
 ## Evaluation recovery AUTHORIZED — sequential handoff, 2026-09-08
 
 Owner now requests cause diagnosis, correction and repeated tests. Prior STOP/no-rerun superseded only by bounded NEXT_TASK recovery contract. No new core defect established; interrupted host/process cause remains UNKNOWN. New Chief and fresh visible Builder retain normal roles; no internal agents or resumed old Builder. Outgoing Chief01a08176-c6c9-7f12-88a4-4a13a61dfa03 relinquishes engineering control before successor creation. No active process, collector, Builder or scheduled follow-up; no implementation WIP. Next: successor verifies newly published exact base, dispatches one Builder for distinguishing interruption/reliability diagnosis and minimal justified repair, independent acceptance, then one fresh same-pilot all-four retest/report. Previous accepted code and705 saved results remain intact.

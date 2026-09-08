@@ -1,3 +1,11 @@
+# Immediate owner priority — explain stale/gap exits, 2026-09-08
+
+Owner requests focused diagnosis and justified correction while the existing lifecycle Builder continues. One additional visible diagnostic Builder is authorized from exact accepted main, isolated ownership. Primary saved starts649/669/677/719/730 have stale unmatched-unwind results. Exit starts161/167/174/177/178/188/217 have DATA_GAP;378/384/385/387/464/469/470/477 additionally have late-event exit uncertainty. These are overlapping conditional episodes, not independent routes. Read immutable conditional-episodes-gap-fixed-20260908 outputs and original pilot below.
+
+First deliver causal traces for these20 starts: required venue/side/book identity and receipt/readiness/age at failed action, threshold excess, first subsequent admissible fresh book; positions/orders/pending actions before and after failure; exact gap source/index/session/recovery, affected obligation, physical versus causal event ordering. Determine whether late uncertainty is the primary blocker or a consequence of an earlier halt. Use representative small deterministic controls and exact saved evidence, no full rerun/general audit. Distinguish faithfully unavailable observations from wrongly handled available data. Test whether temporary stale taker data unnecessarily causes permanent halt instead of retaining exposure and waiting; waiting/recovery cannot infer fills during ambiguous maker intervals. Explain economic significance and minimal correction if proven, without tuning thresholds or changing frozen minimums/fees/delays/caps. Diagnostic Builder initially owns only new owner-only evidence/probes; production/test changes follow consolidated Chief findings, with normal independent acceptance and final isolated suite. Existing lifecycle Builder owns only its launch/report correction. Full all-four rerun remains gated and must wait for resolution of these findings to avoid an unnecessary repeat. No new public collection.
+
+The finite objective remains a trustworthy same-pilot four-alternative result or a specific evidence-backed data/policy blocker, not a required profit/fill count. Lifecycle contract below remains active subject to this explicit parallel exception and priority.
+
 # Interrupted saved-input evaluation — bounded diagnosis, correction and retest
 
 ## Owner authorization — 2026-09-08
