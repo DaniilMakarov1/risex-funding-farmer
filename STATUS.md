@@ -1,5 +1,11 @@
 # Current status
 
+## Bounded DATA_GAP slice AUTHORIZED — Chief handoff, 2026-09-08
+
+Owner accepts saved audit and authorizes only NEXT_TASK gap correction plus independently accepted fresh all-four rerun. Preparation base dbfe598e443b24cc38dec2dc70eff0cbfc4e7185; no gap implementation yet. Audit reproduces Stress365 invalid future-activation interval and identity-after-overlap defect; evidence s1b-audit-20260908. Prior cancellation remains accepted. Old partial results are immutable and cannot become new final results.
+
+Outgoing Chief01a0807d-0043-7131-a681-824a13b609c5 relinquishes control upon publication before creating the successor. Previous Builder stopped; no active calculation/collector or scheduled follow-up. Native compaction occurred during handoff preparation; only this safe checkpoint continued. New sole Chief starts with one visible Builder dispatch, not a general audit. Preparation model/effort Astra/medium previously native VERIFIED; speed UNKNOWN/Standard USER_SELECTED; task cost UNKNOWN. Handoff s1b-gap-fix-handoff-20260908. Historical STOP statements below are superseded only by this bounded owner decision.
+
 ## Final cancellation/probe route — ENGINE_BLOCKED / STOP, 2026-09-08
 
 Cancellation correction final candidate `9b73aff6585ff41117d1dde617d4d52b4cbe39aa` independently accepted (two review rounds, one specific correction); published calculation source `c2f7571063cb1898e0261779611b653c712a8a3e`. Final verified isolated Python3.11.5 suite4174passed/3skipped; late-fill accounting and truthful invalid/no-order reason preserved. No further implementation authorized.

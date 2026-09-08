@@ -24,6 +24,10 @@ Owner subsequently explicitly authorized continuing in this same session despite
 
 The owner explicitly requests a new Chief and one visible Builder for the bounded S1b cancellation accounting correction and, after independent Chief acceptance, a fresh complete four-alternative rerun on the same saved pilot as specified in NEXT_TASK. Normal Chief/Builder implementation and acceptance roles apply. The earlier personal implementation and context-rotation exceptions are limited to the completed research-pilot route and do not apply here. No new public collection, policy change or full S2 work is authorized.
 
+## Current owner decision — bounded DATA_GAP fix, 2026-09-08
+
+Owner accepts the saved audit and authorizes a new Chief and one visible Builder for only the two connected S1b gap defects (future activation interval and identity before overlap), distinguishing regressions, final isolated suite, independent Chief acceptance, then one fresh all-four conditional rerun on the immutable pilot. NEXT_TASK contains the binding contract. This supersedes the previous STOP only for this finite slice; normal roles and context rotation apply. No general audit, new collection, policy/economic tuning or S2/capacity. A subsequent independent core exception requires immediate compact diagnostic preservation and STOP for a new owner decision; no automatic next fix.
+
 ## Standing owner authorization
 
 Owner decision 2026-09-07: ordinary actions necessary within the current authorized slice are pre-approved. Chief and Builder must proceed without asking the owner again for code/test edits, offline checks, dependency setup required for authorized verification, local candidate/WIP commits, evidence preservation and handoff. Chief's already-authorized governance commits, accepted integration/push and sequential Builder creation/rotation also require no repeat confirmation. Builder commits its own authorized production/tests paths on its own branch independently; a commit is not acceptance. Do not invent approval gates from routine Git operations, skills or uncertainty that can be resolved within the contract.
