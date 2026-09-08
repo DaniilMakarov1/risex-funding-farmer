@@ -1,5 +1,11 @@
 # Current status
 
+## Bounded DATA_GAP fix ACCEPTED — fresh evaluation pending, 2026-09-08
+
+Chief independently accepts candidate `16d188b2e3cbc74e28d8f5de90abe319190c3869` from exact base `380b5f19c373a1502c8b97addc88bf8c765e4cb1`; one review, no correction. Only s1b.py and its tests changed. Identity precedes gap bookkeeping/overlap; future activation uses inclusive boundary evidence, with historical exposure/requote obligations preserved. Policy/economics unchanged. Final isolated Python3.11.5 suite4203passed/3skipped125.82s, native exit0/log/source identity verified. Chief28 independent cases pass; exact Stress365 now UNRESOLVED REQUIRED_ACTION_DATA_GAP without exception; Primary719 full result/ledger/versions equal prior accepted cancellation output. Evidence `s1b-gap-chief-20260908/{review.json,independent-probes.json,saved-cases.json,native-verification.json}`. Builder Stress365 packet mislabels research.py fingerprint as s1b; independent final-source execution resolves provenance.
+
+Chief01a08176-c6c9-7f12-88a4-4a13a61dfa03 remains sole integration/evaluation owner. Builder01a08177-a07a-7110-b92a-d790ad51ffd8 completed/idle, preserved clean branchcodex/spread-v1-s1b-gap-fix. Native compaction was followed by work contrary to rotation rule; no waiver claimed, no further implementation in that session. Exact final candidate independently verified. Astra/medium and Luna/max VERIFIED; actual speed UNKNOWN, Standard requested; task cost UNKNOWN. Only fresh all-four evaluation in `conditional-episodes-gap-fixed-20260908/` and report/STOP remain. No new collection.
+
 ## Bounded DATA_GAP slice AUTHORIZED — Chief handoff, 2026-09-08
 
 Owner accepts saved audit and authorizes only NEXT_TASK gap correction plus independently accepted fresh all-four rerun. Preparation base dbfe598e443b24cc38dec2dc70eff0cbfc4e7185; no gap implementation yet. Audit reproduces Stress365 invalid future-activation interval and identity-after-overlap defect; evidence s1b-audit-20260908. Prior cancellation remains accepted. Old partial results are immutable and cannot become new final results.

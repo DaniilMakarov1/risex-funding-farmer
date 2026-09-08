@@ -1,5 +1,9 @@
 # S1b bounded DATA_GAP fix and fresh conditional evaluation
 
+## Current accepted checkpoint — 2026-09-08
+
+Gap candidate16d188b2e3cbc74e28d8f5de90abe319190c3869 is independently ACCEPTED; see STATUS and s1b-gap-chief-20260908/review.json. Builder completed/idle and must not resume. Correction contract and regression requirements below describe the accepted slice, not a new dispatch. The sole remaining action is ONE fresh complete all-four rerun from zero in conditional-episodes-gap-fixed-20260908 on the exact published accepted source, followed by the report/STOP below. Chief01a08176-c6c9-7f12-88a4-4a13a61dfa03 owns the calculation. Preserve all earlier failed/prefix reports. Any independent core exception triggers the specified compact capture and STOP, no next fix.
+
 ## Owner decision and finite objective — 2026-09-08
 
 Owner accepts the saved audit and authorizes a new Chief and one fresh visible Builder. Start with Builder dispatch, not another general audit. Fix only the two connected S1b DATA_GAP defects: an interval from future activation to current time, and temporal overlap evaluated before applicable identity. Normal Chief/Builder roles apply. Builder implements necessary production changes and distinguishing tests; Chief independently reviews and alone integrates/pushes accepted code. Then run one fresh complete all-four conditional experiment on the same immutable pilot and report/STOP. No economic tuning, public collection, S2/capacity, private activity, extra agents or broader kernel redesign.

@@ -1,6 +1,6 @@
 # RISEx Spread Shadow and legacy Funding Farmer
 
-Current limitation (2026-09-08): the bounded S1b cancellation fix is accepted, but the subsequent saved-pilot conditional experiment stopped on a separate invalid-interval error in gap handling (TRADE_THROUGH_ONLY/STRESS, start365). Primary completed with no closed cycles; the other alternatives are incomplete/not run. This is an engineering blocker, not a complete economic evaluation. See STATUS/NEXT_TASK and owner-only `conditional-episodes-cancel-fixed-20260908-v2/report.md`. The owner has now authorized only the bounded DATA_GAP correction and, after independent acceptance, one fresh all-four rerun; see NEXT_TASK.
+Current limitation (2026-09-08): the bounded S1b cancellation and DATA_GAP corrections are independently accepted. Exact saved Stress365 no longer throws and retains execution uncertainty; cancellation start719 remains unchanged. One fresh complete all-four conditional evaluation on the immutable pilot is pending. Earlier incomplete results remain historical evidence, not a complete economic evaluation. See STATUS/NEXT_TASK and owner-only `s1b-gap-chief-20260908/review.json`. No new public collection is authorized.
 
 ## Current and planned behavior — Scanner v1
 
