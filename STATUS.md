@@ -1,5 +1,11 @@
 # Current status
 
+## Cancellation correction v2 ACCEPTED; final fresh rerun open
+
+Chief independently accepts `9b73aff6585ff41117d1dde617d4d52b4cbe39aa` atop `ab180713`, preserving newer main governance. Two reviews, one cause-specific correction; final accepted production/tests tree verified4174passed/3skipped123.59s in isolated Python3.11.5, native exit0 verified. Corrected invalid/no-order reason regression fails on parent and passes candidate; dependency/import/compile/diff checks clean. Chief full correction diff review and exact saved starts45/50/161/167/174 now equal original full rows; start719 completes with .001038/.001038 cancel and identical original fills, UNRESOLVED. Evidence `s1b-cancel-chief-20260908-v2/{saved-case-checks.json,native-test-evidence.json,review.json}`. Builder stopped, clean preserved candidate branch; no ongoing production work.
+
+Only fresh all-four calculation in `conditional-episodes-cancel-fixed-20260908-v2/` and finite report/STOP remain; prior stopped176-row rerun is immutable, never appended/imported. Model/effort remain native VERIFIED Astra/medium and Luna/max; speed UNKNOWN/Standard USER_SELECTED; task cost UNKNOWN.
+
 ## Same-fix correction pending — cancel reason regression
 
 Initial acceptance `ab180713` is insufficient for final release: fresh rerun source `9b0282e` reveals completed invalid/no-order cancellation reason rewritten from ENTRY_INVALIDATED_NO_ORDER to ENTRY_CANCEL_EFFECTIVE. Chief comparison of starts45/50/161/167/174 finds only that action-reason change; quantities, fills and outcomes unchanged. Preserve causal invalidation classification. This is a regression introduced by the current correction, not a newly opened independent core redesign. Same healthy Builder session receives one bounded CHANGES_REQUESTED; no formal REJECT/history rewrite. Chief owns integration.

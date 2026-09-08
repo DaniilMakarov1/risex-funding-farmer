@@ -1,10 +1,8 @@
-# OPEN — preserve invalid-cancel reason; complete fresh conditional episodes
+# OPEN — final accepted cancellation fix; complete fresh conditional episodes
 
 ## Current checkpoint
 
-A direct regression of the initial fix is now CHANGES_REQUESTED: repeated completion rewrites ENTRY_INVALIDATED_NO_ORDER on already-completed crossing/no-order versions. Preserve that truthful reason while keeping late-fill cancellation quantities reconciled. Same Builder makes this narrow production/tests correction with a failing-before regression and final required verification; Chief independently reviews. The first fresh rerun stopped at176 rows, exit130, is preserved and cannot be reused. Full four-alternative rerun and finite report remain unachieved. The initial acceptance paragraph below is historical and does not authorize final release before this correction.
-
-Cancellation fix `ab18071362948039a96402b2a7cc7f9226eab947` is independently ACCEPTED by sole Chief `01a0807d-0043-7131-a681-824a13b609c5`; one review. Builder stopped; no further implementation open. Verification and exact evidence are in STATUS. The reproduction/correction instructions below describe the completed first part and must not trigger a repeat. Only the complete fresh four-alternative calculation and finite report/STOP remain open.
+Final cancellation correction `9b73aff6585ff41117d1dde617d4d52b4cbe39aa` is independently ACCEPTED by sole Chief `01a0807d-0043-7131-a681-824a13b609c5`. Two review rounds; one bounded correction preserves invalid/no-order cancellation reason while retaining the original accounting fix. Builder stopped; verification and exact evidence in STATUS. No further production changes open. Reproduction/correction paragraphs below are completed history, not instructions to repeat. Only the fresh complete four-alternative calculation in `conditional-episodes-cancel-fixed-20260908-v2/` and finite report/STOP remain. Do not reuse the stopped176-row first rerun or any old-core results.
 
 ## Owner decision and sole ownership, 2026-09-08
 
