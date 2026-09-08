@@ -1,5 +1,11 @@
 # Current status
 
+## Same-fix correction pending — cancel reason regression
+
+Initial acceptance `ab180713` is insufficient for final release: fresh rerun source `9b0282e` reveals completed invalid/no-order cancellation reason rewritten from ENTRY_INVALIDATED_NO_ORDER to ENTRY_CANCEL_EFFECTIVE. Chief comparison of starts45/50/161/167/174 finds only that action-reason change; quantities, fills and outcomes unchanged. Preserve causal invalidation classification. This is a regression introduced by the current correction, not a newly opened independent core redesign. Same healthy Builder session receives one bounded CHANGES_REQUESTED; no formal REJECT/history rewrite. Chief owns integration.
+
+Rerun stopped SIGINT exit130;176 grid rows preserved, no four-alternative result. Original inputs/results unchanged; new prefix `conditional-episodes-cancel-fixed-20260908/` immutable and never reused under changed source. Proof: `s1b-cancel-chief-20260908/review-round2-counterexample.json`. No active collector; only Builder correction active. After independent corrected acceptance, recompute every alternative from zero in another new directory, then report/STOP.
+
 ## S1b cancellation correction ACCEPTED; complete saved-pilot rerun pending
 
 Chief `01a0807d-0043-7131-a681-824a13b609c5` independently accepts Builder `01a0807d-ce6e-71f1-8e81-0c7b19ef6867` candidate `ab18071362948039a96402b2a7cc7f9226eab947`, exact base `b7f25979f763a4b4e331216fe22120cc31ea3d82`. One review, no correction rounds. Only cancellation completion and directly related regressions changed. A pre-effective fill processed after completed cancellation now reconciles both cancel quantities; validation, policy and timing unchanged. Builder stopped, clean branch preserved. Chief Astra/medium and Builder Luna/max VERIFIED native; speed UNKNOWN/Standard USER_SELECTED; task cost UNKNOWN.

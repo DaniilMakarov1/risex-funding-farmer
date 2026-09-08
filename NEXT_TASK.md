@@ -1,6 +1,8 @@
-# OPEN — accepted cancellation fix; complete fresh conditional episodes
+# OPEN — preserve invalid-cancel reason; complete fresh conditional episodes
 
 ## Current checkpoint
+
+A direct regression of the initial fix is now CHANGES_REQUESTED: repeated completion rewrites ENTRY_INVALIDATED_NO_ORDER on already-completed crossing/no-order versions. Preserve that truthful reason while keeping late-fill cancellation quantities reconciled. Same Builder makes this narrow production/tests correction with a failing-before regression and final required verification; Chief independently reviews. The first fresh rerun stopped at176 rows, exit130, is preserved and cannot be reused. Full four-alternative rerun and finite report remain unachieved. The initial acceptance paragraph below is historical and does not authorize final release before this correction.
 
 Cancellation fix `ab18071362948039a96402b2a7cc7f9226eab947` is independently ACCEPTED by sole Chief `01a0807d-0043-7131-a681-824a13b609c5`; one review. Builder stopped; no further implementation open. Verification and exact evidence are in STATUS. The reproduction/correction instructions below describe the completed first part and must not trigger a repeat. Only the complete fresh four-alternative calculation and finite report/STOP remain open.
 
