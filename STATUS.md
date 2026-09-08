@@ -1,5 +1,9 @@
 # Current status
 
+## Evaluation recovery AUTHORIZED — sequential handoff, 2026-09-08
+
+Owner now requests cause diagnosis, correction and repeated tests. Prior STOP/no-rerun superseded only by bounded NEXT_TASK recovery contract. No new core defect established; interrupted host/process cause remains UNKNOWN. New Chief and fresh visible Builder retain normal roles; no internal agents or resumed old Builder. Outgoing Chief01a08176-c6c9-7f12-88a4-4a13a61dfa03 relinquishes engineering control before successor creation. No active process, collector, Builder or scheduled follow-up; no implementation WIP. Next: successor verifies newly published exact base, dispatches one Builder for distinguishing interruption/reliability diagnosis and minimal justified repair, independent acceptance, then one fresh same-pilot all-four retest/report. Previous accepted code and705 saved results remain intact.
+
 ## DATA_GAP evaluation INCOMPLETE / STOP — 2026-09-08
 
 Gap fix16d188b2 remains independently ACCEPTED; calculation source2e383ac36789feb7712a9237a9e916b0754d085d. Original runner57826/calculation57831 disappeared; last serialized record TOUCH_ALLOWED/PRIMARY start160 at17:07:36.328035UTC. At17:13UTC neither process nor a replacement existed, and run.exit/results.json/engine-error.json were absent. Completion wait cell57 was unavailable. Cause UNKNOWN; no new kernel exception, signal, cancellation or resource cause is proven. Owner explicitly forbids restarting; no restart/resume/new fix performed. No calculation/Builder/collector or scheduled follow-up remains.
