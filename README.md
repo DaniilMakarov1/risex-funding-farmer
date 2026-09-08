@@ -1,5 +1,7 @@
 # RISEx Spread Shadow and legacy Funding Farmer
 
+Current limitation (2026-09-08): the bounded S1b cancellation fix is accepted, but the subsequent saved-pilot conditional experiment stopped on a separate invalid-interval error in gap handling (TRADE_THROUGH_ONLY/STRESS, start365). Primary completed with no closed cycles; the other alternatives are incomplete/not run. This is an engineering blocker, not a complete economic evaluation. See STATUS/NEXT_TASK and owner-only `conditional-episodes-cancel-fixed-20260908-v2/report.md`. Further diagnosis/correction requires a new owner decision.
+
 ## Current and planned behavior — Scanner v1
 
 The first raw research scanner is implemented and verified: `record` -> `record-readback` -> `research-report`, using the accepted S1b kernel for all four alternatives. Exactly one60-second technical smoke and one15-minute public pilot are complete. The pilot has a technically complete recording but only42.7% eligible data; lanes halted early on freshness, with no modeled fills or closed cycles. This does not establish strategy profitability. Source, tests and owner-only evidence are in STATUS. Further reliability development and measurements require a new owner decision; the authorized route has stopped. Historical experiments and commands remain separate.
