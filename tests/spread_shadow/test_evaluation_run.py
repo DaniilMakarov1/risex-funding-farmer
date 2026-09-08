@@ -47,6 +47,7 @@ def _fixture_source(tmp_path: Path, source: str, *, helper: str | None = None):
     _git(repo, "config", "user.email", "fixture@example.invalid")
     _git(repo, "config", "user.name", "Fixture")
     child = _write(repo / "calc.py", source)
+    _write(repo / ".gitignore", "__pycache__/\n")
     if helper is not None:
         _write(repo / "helper.py", helper)
     _git(repo, "add", ".")
@@ -92,12 +93,17 @@ def _kill_pid(pid: int) -> None:
         except ProcessLookupError:
             return False
         try:
-            state = subprocess.check_output(
+            state_result = subprocess.run(
                 ["ps", "-o", "stat=", "-p", str(pid)],
+                capture_output=True,
                 text=True,
-            ).strip()
+                check=False,
+            )
         except (OSError, subprocess.SubprocessError):
             return True
+        if state_result.returncode != 0:
+            return False
+        state = state_result.stdout.strip()
         return bool(state) and not state.startswith("Z")
 
     try:
@@ -152,7 +158,7 @@ def test_source_edit_during_child_is_not_authoritative(tmp_path: Path) -> None:
         from pathlib import Path
 
         source = Path(__file__)
-        source.write_text(source.read_text(encoding="utf-8") + "\n# child edit\n", encoding="utf-8")
+        source.write_text(source.read_text(encoding="utf-8") + "# child edit", encoding="utf-8")
         Path("results.json").write_text('{"status":"COMPLETE"}', encoding="utf-8")
         """,
     )
