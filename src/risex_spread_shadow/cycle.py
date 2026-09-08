@@ -1200,6 +1200,26 @@ def _schedule_taker(
     cycle.scheduled_takers[action_id] = (venue, side, quantity, reason)
 
 
+def _expected_book_binding(
+    cycle: _MutableCycle,
+    venue: Venue,
+) -> tuple[str | int | None, int | None]:
+    """Return the effective causal book binding for one venue.
+
+    S1b may advance the Lighter binding only after an explicit, validated
+    recovery boundary.  The legacy cycle has no such mutable binding and
+    therefore continues to use its immutable quote-version witness.
+    """
+
+    if venue is Venue.RISEX:
+        return cycle.quote_version.stream_session_id, cycle.quote_version.recovery_generation
+    effective_session = getattr(cycle, "effective_hedge_stream_session_id", None)
+    effective_recovery = getattr(cycle, "effective_hedge_recovery_generation", None)
+    if effective_session is not None and effective_recovery is not None:
+        return effective_session, effective_recovery
+    return cycle.quote_version.hedge_stream_session_id, cycle.quote_version.hedge_recovery_generation
+
+
 def _book_gap_blocks(cycle: _MutableCycle, book: BookEvidence | None, due_ns: int, *, venue: Venue) -> bool:
     if book is not None:
         start_ns = book.received_monotonic_ns
@@ -1207,12 +1227,7 @@ def _book_gap_blocks(cycle: _MutableCycle, book: BookEvidence | None, due_ns: in
         recovery = book.recovery_generation
     else:
         start_ns = max(0, due_ns - cycle.policy.input_freshness_max_age_ns)
-        if venue is Venue.RISEX:
-            session = cycle.quote_version.stream_session_id
-            recovery = cycle.quote_version.recovery_generation
-        else:
-            session = cycle.quote_version.hedge_stream_session_id
-            recovery = cycle.quote_version.hedge_recovery_generation
+        session, recovery = _expected_book_binding(cycle, venue)
         if session is None or recovery is None:
             return False
     return any(
@@ -1223,14 +1238,13 @@ def _book_gap_blocks(cycle: _MutableCycle, book: BookEvidence | None, due_ns: in
 
 
 def _select_book(cycle: _MutableCycle, venue: Venue, due_ns: int) -> tuple[BookEvidence | None, CycleReason | None]:
-    if venue is Venue.RISEX:
-        expected_session = cycle.quote_version.stream_session_id
-        expected_recovery = cycle.quote_version.recovery_generation
-    else:
-        expected_session = cycle.quote_version.hedge_stream_session_id
-        expected_recovery = cycle.quote_version.hedge_recovery_generation
+    expected_session, expected_recovery = _expected_book_binding(cycle, venue)
     if expected_session is None or expected_recovery is None:
         return None, CycleReason.REQUIRED_ACTION_DATA_MISSING
+    if venue in cycle.displaced_book_venues:
+        if _book_gap_blocks(cycle, None, due_ns, venue=venue):
+            return None, CycleReason.REQUIRED_ACTION_DATA_GAP
+        return None, CycleReason.REQUIRED_ACTION_SESSION_DISPLACED
     candidates = [
         observation
         for observation in cycle.books

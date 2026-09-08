@@ -77,6 +77,66 @@ def _fresh_version(version_id: str, decision: int, revision: int):
     return version, (risex, lighter)
 
 
+def test_s1b_temporary_stale_taker_book_retries_only_on_fresh_book() -> None:
+    version, source_books = _version("s1b-stale-recovery")
+    kernel = Scv1S1bKernel(fill_model=CycleFillModel.TOUCH_ALLOWED)
+    assert kernel.admit(version, source_books=source_books).accepted
+    activation_ns = version.decision_ready_monotonic_ns + kernel.policy.delays(
+        CycleScenario.PRIMARY
+    ).activation_delay_ns
+    kernel.advance(
+        _book(
+            Venue.RISEX,
+            received=activation_ns - 100_000_000,
+            revision=2,
+            bids=(("99", "10"),),
+            asks=(("102", "10"),),
+        )
+    )
+    kernel.advance_clock(activation_ns)
+    fill_ns = activation_ns + 100_000_000
+    kernel.advance(_entry_trade("s1b-stale-recovery-fill", fill_ns, "0.20", price="102"))
+    due_ns = fill_ns + kernel.policy.delays(CycleScenario.PRIMARY).taker_delay_ns
+
+    kernel.advance(
+        _book(
+            Venue.LIGHTER,
+            received=due_ns - 100_000_000,
+            revision=2,
+            fresh=False,
+            bids=(("99", "10"),),
+            asks=(("100", "0.20"),),
+        )
+    )
+    kernel.advance_clock(due_ns)
+    stale = kernel.snapshot()
+    assert stale is not None
+    assert stale.status is CycleTerminalState.PENDING
+    assert stale.hedged_quantity == D("0")
+    stale_action = next(action for action in stale.actions if action.action_id == "entry-hedge")
+    assert stale_action.status.value == "PENDING"
+    assert stale_action.reason == "REQUIRED_ACTION_DATA_STALE"
+    assert stale_action.due_monotonic_ns == due_ns
+
+    kernel.advance(
+        _book(
+            Venue.LIGHTER,
+            received=due_ns + 100_000_000,
+            revision=3,
+            bids=(("99", "10"),),
+            asks=(("100", "0.20"),),
+        )
+    )
+    recovered = kernel.snapshot()
+    assert recovered is not None
+    assert recovered.hedged_quantity == D("0.20")
+    assert recovered.pending_entry_hedge_quantity == D("0")
+    recovered_action = next(action for action in recovered.actions if action.action_id == "entry-hedge")
+    assert recovered_action.status.value == "COMPLETED"
+    assert recovered_action.due_monotonic_ns == due_ns
+    assert [fill.quantity for fill in recovered.fills if fill.action_id == "entry-hedge"] == [D("0.20")]
+
+
 def test_s1b_accumulates_partial_entry_and_hedges_one_reserved_chunk() -> None:
     version, source_books = _version("s1b-accumulate")
     kernel = Scv1S1bKernel(fill_model=CycleFillModel.TOUCH_ALLOWED)
@@ -969,6 +1029,16 @@ def test_s1b_gap_overlap_uses_inclusive_activation_boundary(
         scenario=scenario,
         source_books=source_books,
     ).accepted
+    touching_kernel.advance(
+        _book(
+            Venue.RISEX,
+            received=activation_ns - 50_000_000,
+            revision=2,
+            bids=(("99", "10"),),
+            asks=(("102", "10"),),
+        ),
+        scenario=scenario,
+    )
     touching = DataGapEvidence(
         source_venue=Venue.LIGHTER,
         canonical_market="BTC",
@@ -981,8 +1051,10 @@ def test_s1b_gap_overlap_uses_inclusive_activation_boundary(
     touching_kernel.advance(touching, scenario=scenario)
     touching_result = touching_kernel.snapshot(scenario=scenario)
     assert touching_result is not None
-    assert touching_result.status is CycleTerminalState.UNRESOLVED
+    assert touching_result.status is CycleTerminalState.PENDING
     assert "REQUIRED_ACTION_DATA_GAP" in touching_result.reason_codes
+    touching_finished = touching_kernel.finish(scenario=scenario)
+    assert touching_finished.status is CycleTerminalState.UNRESOLVED
 
     # An open matching gap that starts before activation can continue through
     # that boundary and must remain uncertain as well.
@@ -992,6 +1064,16 @@ def test_s1b_gap_overlap_uses_inclusive_activation_boundary(
         scenario=scenario,
         source_books=source_books,
     ).accepted
+    open_kernel.advance(
+        _book(
+            Venue.RISEX,
+            received=activation_ns - 50_000_000,
+            revision=2,
+            bids=(("99", "10"),),
+            asks=(("102", "10"),),
+        ),
+        scenario=scenario,
+    )
     open_gap = DataGapEvidence(
         source_venue=Venue.LIGHTER,
         canonical_market="BTC",
@@ -1004,8 +1086,10 @@ def test_s1b_gap_overlap_uses_inclusive_activation_boundary(
     open_kernel.advance(open_gap, scenario=scenario)
     open_result = open_kernel.snapshot(scenario=scenario)
     assert open_result is not None
-    assert open_result.status is CycleTerminalState.UNRESOLVED
+    assert open_result.status is CycleTerminalState.PENDING
     assert "REQUIRED_ACTION_DATA_GAP" in open_result.reason_codes
+    open_finished = open_kernel.finish(scenario=scenario)
+    assert open_finished.status is CycleTerminalState.UNRESOLVED
 
 
 @pytest.mark.parametrize("scenario", tuple(CycleScenario))
@@ -1148,12 +1232,14 @@ def test_s1b_late_processed_gap_preserves_fills_positions_and_time(
     kernel.advance(late_event, scenario=scenario)
     after = kernel.snapshot(scenario=scenario)
     assert after is not None
-    assert after.status is CycleTerminalState.UNRESOLVED
+    assert after.status is CycleTerminalState.PENDING
     assert "REQUIRED_ACTION_DATA_GAP" in after.reason_codes
     assert after.fills == fills_before
     assert after.actions == actions_before
     assert after.ledger == ledger_before
     assert _position_quantities(after.positions) == _position_quantities(positions_before)
+    finished = kernel.finish(scenario=scenario)
+    assert finished.status is CycleTerminalState.UNRESOLVED
     terminal = kernel._lane(scenario).terminal_cycles[-1]
     assert terminal.current_ns >= current_before
 
@@ -1240,11 +1326,357 @@ def test_s1b_gap_preserves_pending_entry_hedge_obligation(
     )
     after = kernel.snapshot(scenario=scenario)
     assert after is not None
-    assert after.status is CycleTerminalState.UNRESOLVED
+    assert after.status is CycleTerminalState.PENDING
     assert after.pending_entry_hedge_quantity == before.pending_entry_hedge_quantity
     assert _position_quantities(after.positions) == _position_quantities(before.positions)
     assert after.ledger == before.ledger
     assert after.actions == before.actions
+    finished = kernel.finish(scenario=scenario)
+    assert finished.status is CycleTerminalState.UNRESOLVED
+
+
+def test_s1b_lighter_gap_keeps_risex_maker_fill_and_delayed_hedge_visible() -> None:
+    version, source_books = _version("s1b-lighter-gap-risex-fill")
+    kernel = Scv1S1bKernel(fill_model=CycleFillModel.TOUCH_ALLOWED)
+    assert kernel.admit(version, source_books=source_books).accepted
+    activation_ns = version.decision_ready_monotonic_ns + kernel.policy.delays(
+        CycleScenario.PRIMARY
+    ).activation_delay_ns
+    kernel.advance(
+        _book(
+            Venue.RISEX,
+            received=activation_ns - 100_000_000,
+            revision=2,
+            bids=(("99", "10"),),
+            asks=(("102", "10"),),
+        )
+    )
+    kernel.advance_clock(activation_ns)
+    gap = DataGapEvidence(
+        source_venue=Venue.LIGHTER,
+        canonical_market="BTC",
+        stream_session_id="lighter-s2",
+        recovery_generation=0,
+        gap_start_monotonic_ns=activation_ns + 100_000_000,
+        gap_end_monotonic_ns=None,
+        reason="LIGHTER_ONLY_OUTAGE",
+    )
+    kernel.advance(gap)
+    fill_ns = activation_ns + 200_000_000
+    kernel.advance(_entry_trade("s1b-lighter-gap-risex-fill", fill_ns, "0.20", price="102"))
+    observed = kernel.snapshot()
+    assert observed is not None
+    assert observed.status is CycleTerminalState.PENDING
+    assert observed.entry_quantity == D("0.20")
+    assert observed.positions.risex_signed_quantity == D("-0.20")
+    assert observed.pending_entry_hedge_quantity == D("0.20")
+    assert not any(fill.venue is Venue.LIGHTER for fill in observed.fills)
+    assert "REQUIRED_ACTION_DATA_GAP" in observed.reason_codes
+
+    finished = kernel.finish(end_monotonic_ns=fill_ns + 1_000_000_000)
+    assert finished.status is CycleTerminalState.UNRESOLVED
+    assert finished.positions.risex_signed_quantity == D("-0.20")
+    assert finished.pending_entry_hedge_quantity == D("0.20")
+    assert not finished.cashflow_complete
+
+
+def test_s1b_lighter_recovery_requires_new_valid_snapshot_binding() -> None:
+    version, source_books = _version("s1b-lighter-recovery-boundary")
+    kernel = Scv1S1bKernel(fill_model=CycleFillModel.TOUCH_ALLOWED)
+    assert kernel.admit(version, source_books=source_books).accepted
+    activation_ns = version.decision_ready_monotonic_ns + kernel.policy.delays(
+        CycleScenario.PRIMARY
+    ).activation_delay_ns
+    kernel.advance(
+        _book(
+            Venue.RISEX,
+            received=activation_ns - 100_000_000,
+            revision=2,
+            bids=(("99", "10"),),
+            asks=(("102", "10"),),
+        )
+    )
+    kernel.advance_clock(activation_ns)
+    fill_ns = activation_ns + 100_000_000
+    kernel.advance(_entry_trade("s1b-lighter-recovery-fill", fill_ns, "0.20", price="102"))
+    due_ns = fill_ns + kernel.policy.delays(CycleScenario.PRIMARY).taker_delay_ns
+
+    # A replacement stream before the gap boundary cannot heal the old
+    # binding, even though its levels are otherwise executable.
+    pre_recovery = _book(
+        Venue.LIGHTER,
+        received=due_ns - 400_000_000,
+        revision=2,
+        session="lighter-reconnect-pre",
+        recovery=1,
+        bids=(("99", "10"),),
+        asks=(("100", "0.20"),),
+    )
+    kernel.advance(pre_recovery)
+    gap = DataGapEvidence(
+        source_venue=Venue.LIGHTER,
+        canonical_market="BTC",
+        stream_session_id="lighter-s2",
+        recovery_generation=0,
+        gap_start_monotonic_ns=due_ns - 300_000_000,
+        gap_end_monotonic_ns=due_ns - 200_000_000,
+        reason="LIGHTER_RECONNECT_BOUNDARY",
+    )
+    kernel.advance(gap)
+    kernel.advance_clock(due_ns)
+    before_recovery = kernel.snapshot()
+    assert before_recovery is not None
+    assert before_recovery.status is CycleTerminalState.PENDING
+    assert before_recovery.pending_entry_hedge_quantity == D("0.20")
+    assert "REQUIRED_ACTION_DATA_GAP" in before_recovery.reason_codes
+
+    # A fresh book on the old session, then stale and sequence-unhealthy
+    # replacement books, remain non-authoritative recovery attempts.
+    kernel.advance(
+        _book(
+            Venue.LIGHTER,
+            received=due_ns + 100_000_000,
+            revision=3,
+            session="lighter-s2",
+            recovery=0,
+            bids=(("99", "10"),),
+            asks=(("100", "0.20"),),
+        )
+    )
+    kernel.advance(
+        _book(
+            Venue.LIGHTER,
+            received=due_ns + 200_000_000,
+            revision=4,
+            session="lighter-reconnect-pre",
+            recovery=1,
+            fresh=False,
+            bids=(("99", "10"),),
+            asks=(("100", "0.20"),),
+        )
+    )
+    kernel.advance(
+        _book(
+            Venue.LIGHTER,
+            received=due_ns + 300_000_000,
+            revision=5,
+            session="lighter-reconnect-sequence-bad",
+            recovery=1,
+            sequence_valid=False,
+            bids=(("99", "10"),),
+            asks=(("100", "0.20"),),
+        )
+    )
+    bad_market = replace(
+        _book(
+            Venue.LIGHTER,
+            received=due_ns + 400_000_000,
+            revision=6,
+            session="lighter-reconnect-market-bad",
+            recovery=1,
+            bids=(("99", "10"),),
+            asks=(("100", "0.20"),),
+        ),
+        canonical_market="ETH",
+    )
+    kernel.advance(bad_market)
+    still_waiting = kernel.snapshot()
+    assert still_waiting is not None
+    assert still_waiting.hedged_quantity == D("0")
+    assert still_waiting.pending_entry_hedge_quantity == D("0.20")
+    assert not any(fill.action_id == "entry-hedge" for fill in still_waiting.fills)
+
+    valid = _book(
+        Venue.LIGHTER,
+        received=due_ns + 500_000_000,
+        revision=7,
+        session="lighter-reconnect-valid",
+        recovery=1,
+        bids=(("99", "10"),),
+        asks=(("100", "0.20"),),
+    )
+    kernel.advance(valid)
+    recovered = kernel.snapshot()
+    assert recovered is not None
+    assert recovered.hedged_quantity == D("0.20")
+    assert recovered.pending_entry_hedge_quantity == D("0")
+    assert recovered.actions[1].due_monotonic_ns == due_ns
+    assert [fill.quantity for fill in recovered.fills if fill.action_id == "entry-hedge"] == [D("0.20")]
+    hedge_fill = next(fill for fill in recovered.fills if fill.action_id == "entry-hedge")
+    assert hedge_fill.book_revision_id == "LIGHTER|BTC|lighter-reconnect-valid|1|7"
+    active = kernel._lane(CycleScenario.PRIMARY).active
+    assert active is not None
+    assert active.gaps == [gap]
+    assert active.effective_hedge_stream_session_id == "lighter-reconnect-valid"
+    assert active.effective_hedge_recovery_generation == 1
+
+    # Replaying the recovery witness cannot reserve or execute a second hedge.
+    kernel.advance(valid)
+    replayed = kernel.snapshot()
+    assert replayed is not None
+    assert [fill.quantity for fill in replayed.fills if fill.action_id == "entry-hedge"] == [D("0.20")]
+
+
+def test_s1b_unmatched_subminimum_residue_does_not_block_paired_reduction() -> None:
+    risex_market = replace(
+        _market(Venue.RISEX, "BTC/USDC"),
+        minimum_quantity_raw=D("0.6"),
+        quantity_step_raw=D("0.01"),
+    )
+    lighter_market = replace(
+        _market(Venue.LIGHTER, "BTC"),
+        minimum_quantity_raw=D("0.3"),
+        quantity_step_raw=D("0.01"),
+    )
+    version, source_books = _version(
+        "s1b-unmatched-residue-paired-reduction",
+        risex_market=risex_market,
+        lighter_market=lighter_market,
+    )
+    kernel = Scv1S1bKernel(fill_model=CycleFillModel.TOUCH_ALLOWED)
+    assert kernel.admit(version, source_books=source_books).accepted
+    activation_ns = version.decision_ready_monotonic_ns + kernel.policy.delays(
+        CycleScenario.PRIMARY
+    ).activation_delay_ns
+    kernel.advance(
+        _book(
+            Venue.RISEX,
+            received=activation_ns - 100_000_000,
+            revision=2,
+            bids=(("99", "10"),),
+            asks=(("102", "10"),),
+        )
+    )
+    kernel.advance_clock(activation_ns)
+    kernel.advance(_entry_trade("s1b-residue-entry", 600_000_000, "0.95", price="102"))
+    kernel.advance(
+        _book(
+            Venue.RISEX,
+            received=900_000_000,
+            revision=3,
+            bids=(("99", "10"),),
+            asks=(("105", "10"),),
+        )
+    )
+    kernel.advance(
+        _book(
+            Venue.LIGHTER,
+            received=900_000_000,
+            revision=2,
+            bids=(("99", "10"),),
+            asks=(("100", "0.75"),),
+        )
+    )
+    kernel.advance_clock(1_100_000_000)
+    paired = kernel.snapshot()
+    assert paired is not None
+    assert paired.positions.paired_risex_quantity == D("0.75")
+    assert paired.positions.paired_lighter_quantity == D("0.75")
+    assert paired.positions.unmatched_risex_quantity == D("0.20")
+    assert paired.pending_entry_hedge_quantity == D("0.20")
+
+    # The cancellation barrier finalizes the subminimum hedge residue without
+    # rounding it up, then schedules the exact unmatched RISEx residue.
+    kernel.advance(
+        _book(
+            Venue.RISEX,
+            received=1_500_000_000,
+            revision=4,
+            bids=(("99", "10"),),
+            asks=(("105", "10"),),
+        )
+    )
+    kernel.advance(
+        _book(
+            Venue.LIGHTER,
+            received=1_500_000_000,
+            revision=3,
+            bids=(("99", "10"),),
+            asks=(("100", "10"),),
+        )
+    )
+    kernel.advance_clock(1_600_000_000)
+    barrier = kernel.snapshot()
+    assert barrier is not None
+    assert barrier.positions.unmatched_risex_quantity == D("0.20")
+    assert barrier.positions.paired_risex_quantity == D("0.75")
+    assert next(action for action in barrier.actions if action.action_id == "unmatched-risex").status.value == "PENDING"
+
+    # The unmatched operation is below the RISEx minimum, but its failed
+    # attempt must not prevent the already executable pair from getting an
+    # exit quote and closing independently.
+    kernel.advance(
+        _book(
+            Venue.RISEX,
+            received=2_000_000_000,
+            revision=5,
+            bids=(("99", "10"),),
+            asks=(("105", "10"),),
+        )
+    )
+    kernel.advance(
+        _book(
+            Venue.LIGHTER,
+            received=2_000_000_000,
+            revision=4,
+            bids=(("99", "10"),),
+            asks=(("100", "10"),),
+        )
+    )
+    kernel.advance_clock(2_100_000_000)
+    exit_ready = kernel.snapshot()
+    assert exit_ready is not None
+    assert exit_ready.positions.unmatched_risex_quantity == D("0.20")
+    assert exit_ready.positions.paired_risex_quantity == D("0.75")
+    assert exit_ready.exit_measurement is not None
+    assert exit_ready.exit_measurement.quote.quantity == D("0.75")
+    unmatched = next(action for action in exit_ready.actions if action.action_id == "unmatched-risex")
+    assert unmatched.status.value == "COMPLETED"
+    assert unmatched.executed_quantity == D("0")
+    assert unmatched.reason == "MINIMUM_RESIDUE"
+    assert "POLICY_BLOCKED_RESIDUAL" in exit_ready.reason_codes
+
+    kernel.advance(
+        _book(
+            Venue.RISEX,
+            received=2_500_000_000,
+            revision=6,
+            bids=(("99", "10"),),
+            asks=(("105", "10"),),
+        )
+    )
+    kernel.advance_clock(2_600_000_000)
+    kernel.advance(
+        _trade(
+            "s1b-residue-exit-fill",
+            received=2_700_000_000,
+            quantity="0.75",
+            price="97",
+            aggressor=Side.SELL,
+        )
+    )
+    kernel.advance(
+        _book(
+            Venue.LIGHTER,
+            received=3_100_000_000,
+            revision=5,
+            bids=(("99", "0.75"),),
+            asks=(("100", "10"),),
+        )
+    )
+    closed_pair = kernel.advance_clock(3_200_000_000) or kernel.snapshot()
+    assert closed_pair is not None
+    assert closed_pair.status is CycleTerminalState.UNRESOLVED
+    assert closed_pair.policy_blocked
+    assert closed_pair.positions.paired_risex_quantity == D("0")
+    assert closed_pair.positions.paired_lighter_quantity == D("0")
+    assert closed_pair.positions.unmatched_risex_quantity == D("0.20")
+    assert closed_pair.positions.risex_signed_quantity == D("-0.20")
+    assert closed_pair.positions.lighter_signed_quantity == D("0")
+    assert not closed_pair.is_flat
+    assert not closed_pair.cashflow_complete
+    assert "POLICY_BLOCKED_RESIDUAL" in closed_pair.reason_codes
+    assert [fill.quantity for fill in closed_pair.fills if fill.action_id == "exit-close:0"] == [D("0.75")]
 
 
 def test_s1b_gap_preserves_pending_exit_and_position_obligations() -> None:
@@ -1325,8 +1757,10 @@ def test_s1b_gap_checks_future_requote_activation_points(
     )
     result = kernel.snapshot(scenario=scenario)
     assert result is not None
-    assert result.status is CycleTerminalState.UNRESOLVED
+    assert result.status is CycleTerminalState.PENDING
     assert "REQUIRED_ACTION_DATA_GAP" in result.reason_codes
+    finished = kernel.finish(scenario=scenario)
+    assert finished.status is CycleTerminalState.UNRESOLVED
 
 
 def test_s1b_exit_wait_deadline_starts_cancel_before_late_activation() -> None:
