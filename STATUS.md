@@ -1,5 +1,9 @@
 # Current status
 
+## Exit continuity candidate CHANGES_REQUESTED — 2026-09-08
+
+Candidate06e7ed8635a192d2af1adc7006b76e439019fff4 (basee36a9e7) is NOT_ACCEPTED. Chief independently reproduces a stale-exit barrier defect: paired0.60BTC remains at1.1s; book receipt0.9s is stale at cancellation completion1.6s; deferred _prepare_exit retains ENTRY_BARRIER, repeated current-time boundary triggers REQUIRED_ACTION_AMBIGUOUS and makes known positions nonauthoritative. Builder receives exact fixture and must preserve pending state, fresh-book recovery and deadline with a distinguishing regression. Required representative saved-start evidence and FULL-rooted decoder provenance remain under review. No integration or full pilot.
+
 ## Lifecycle R1 accepted — 2026-09-08
 
 Chief accepts candidate3d51e64d18718618785cb2c07efc5589a354412a against base11e696d214cae46c368db0b47b6cbaba7900c79b. Full implementation/test diff and owner-only wrappers reviewed; independent original counterexamples now classify dirty source as SOURCE_CHANGED_BEFORE_EXECUTION, empty output as RESULT_ARTIFACT_INVALID, and unchanged historical completion after docs commit as COMPLETE. Isolated Python3.11 suite4218passed3skipped131.86s, exit0; prior system/sandbox-limited attempts are retained but not final evidence. Real saved16-record S1b fixture completed four alternatives through launch/read with verified input/import/output identity. This validates lifecycle/integration only, not economics or the final conditional grid harness. Review evidence: evaluation-recovery-chief-20260908/lifecycle-review-r1/. Exit continuity remains pending; full pilot gated on its acceptance and final frozen harness identity.
