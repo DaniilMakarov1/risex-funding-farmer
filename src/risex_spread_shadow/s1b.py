@@ -1734,6 +1734,15 @@ class Scv1S1bKernel(CycleKernel):
         maker.reason = "ENTRY_MAKER_CANCELLED_PARTIAL" if version.remaining_quantity > 0 else "ENTRY_MAKER_FILLED"
         if version.cancel_effective_ns is not None and version.cancel_action_id in {item.action_id for item in cycle.actions}:
             cancel = _s1b_action(cycle, version.cancel_action_id)
+            if (
+                cancel.status is CycleActionStatus.COMPLETED
+                and cancel.reason == "ENTRY_INVALIDATED_NO_ORDER"
+            ):
+                # A crossing post-only quote never became an order.  Its
+                # completed action is a truthful invalidation record, not a
+                # cancellation that became effective later; preserve that
+                # reason when the barrier revisits completed versions.
+                return
             # A fill can be causally before cancellation effective time while
             # becoming processing-ready after that boundary.  Re-entering the
             # boundary must reconcile the same cancel action to the version's
