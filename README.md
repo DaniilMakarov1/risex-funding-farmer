@@ -1,6 +1,6 @@
 # RISEx Spread Shadow and legacy Funding Farmer
 
-Current limitation (2026-09-08): the bounded S1b cancellation and DATA_GAP corrections are independently accepted. Exact saved Stress365 no longer throws and retains execution uncertainty; cancellation start719 remains unchanged. One fresh complete all-four conditional evaluation on the immutable pilot is pending. Earlier incomplete results remain historical evidence, not a complete economic evaluation. See STATUS/NEXT_TASK and owner-only `s1b-gap-chief-20260908/review.json`. No new public collection is authorized.
+Current limitation (2026-09-08): the S1b cancellation and DATA_GAP corrections are independently accepted. The fresh saved-pilot evaluation is incomplete: both TRADE_THROUGH_ONLY alternatives completed, TOUCH_ALLOWED/Primary stopped after160grid rows, and TOUCH_ALLOWED/Stress did not start. The process disappeared without a terminal exit/error packet; cause UNKNOWN, no new kernel exception proven. No closed cycles in saved results; closed PnL is undefined. Owner forbids restarting. See STATUS/NEXT_TASK and owner-only `conditional-episodes-gap-fixed-20260908/report.md`. No active calculation or new collection is authorized.
 
 ## Current and planned behavior — Scanner v1
 
