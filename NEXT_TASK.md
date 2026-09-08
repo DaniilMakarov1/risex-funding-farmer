@@ -8,9 +8,9 @@ One Chief (01a0820e-d972-7a33-a4dc-ab6ab9e0a3d6), at most two visible Luna/max B
 
 Finish with independently accepted corrections and ONE fresh complete four-alternative calculation on the immutable pilot, or a specific demonstrated data/policy blocker. The objective is a trustworthy economic assessment, not a required fill/profit count. Full online capacity, all-D1 migration and long campaigns remain deferred and are not prerequisites for this saved-input report.
 
-## A. Minimal lifecycle correction already in progress
+## A. Minimal lifecycle correction — ACCEPTED
 
-Candidate7fbf77873e9c80916eec38394324baab5bf1a570 is unaccepted CHANGES_REQUESTED. R1 started from11e696d214cae46c368db0b47b6cbaba7900c79b on codex/spread-v1-evaluation-recovery-r1, worktree ddcb; preserve all its work. Consolidated review: evaluation-recovery-chief-20260908/lifecycle-review-7fbf778/review.md under the evidence root below.
+Candidate3d51e64d18718618785cb2c07efc5589a354412a is independently ACCEPTED: isolated suite4218passed3skipped, original counterexamples resolved, real saved S1b fixture launch/read verified. Preserve its branch and evidence; no further lifecycle implementation is assigned. Final conditional-grid harness still needs its frozen source/input/output binding before the one pilot rerun. Earlier candidate7fbf77873e9c80916eec38394324baab5bf1a570 remains historical CHANGES_REQUESTED. R1 started from11e696d214cae46c368db0b47b6cbaba7900c79b on codex/spread-v1-evaluation-recovery-r1, worktree ddcb; preserve all its work. Consolidated review: evaluation-recovery-chief-20260908/lifecycle-review-7fbf778/review.md under the evidence root below.
 
 Correct only the proven source-at-execution binding, durable historical-result verification and valid complete-result checks; demonstrate the actual bounded launch/read harness on a small fixture. Empty/malformed/incomplete output or absent terminal cannot become authoritative success. Preserve source/input/child/import identity, exclusive one-shot launch and readable partial outputs. A later docs commit or disappearance of the original checkout must not invalidate previously proven unchanged evidence. No watcher/service/retry/detach or generic framework. Historical process disappearance cause remains UNKNOWN; a reproduced wrapper weakness is not proof of historical attribution.
 

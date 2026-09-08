@@ -1,5 +1,9 @@
 # Current status
 
+## Lifecycle R1 accepted — 2026-09-08
+
+Chief accepts candidate3d51e64d18718618785cb2c07efc5589a354412a against base11e696d214cae46c368db0b47b6cbaba7900c79b. Full implementation/test diff and owner-only wrappers reviewed; independent original counterexamples now classify dirty source as SOURCE_CHANGED_BEFORE_EXECUTION, empty output as RESULT_ARTIFACT_INVALID, and unchanged historical completion after docs commit as COMPLETE. Isolated Python3.11 suite4218passed3skipped131.86s, exit0; prior system/sandbox-limited attempts are retained but not final evidence. Real saved16-record S1b fixture completed four alternatives through launch/read with verified input/import/output identity. This validates lifecycle/integration only, not economics or the final conditional grid harness. Review evidence: evaluation-recovery-chief-20260908/lifecycle-review-r1/. Exit continuity remains pending; full pilot gated on its acceptance and final frozen harness identity.
+
 ## Owner-approved process update and exit continuity implementation — 2026-09-08
 
 AGENTS now contains stable current rules, with historical exceptions retained in Git. Owner approves bounded venue-specific exit continuity and paired-position reduction despite non-executable residuals; target behavior is in SYSTEM_SPEC/NEXT_TASK and is NOT_YET_IMPLEMENTED/ACCEPTED. Lifecycle R1 and exit Builder have isolated ownership. No production change is part of this governance update. Preserve R1 branch/worktree ddcb, diagnostic branch/worktree9d28, earlier candidate7fbf778/ac43, all original input/results and evidence.
