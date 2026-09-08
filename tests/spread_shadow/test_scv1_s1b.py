@@ -366,6 +366,168 @@ def test_s1b_counts_fill_during_cancel_and_requotes_without_cap_or_deadline_rese
     assert requoted.max_hold_deadline_monotonic_ns == first_deadline
 
 
+def _s1b_cancel_effective_boundary(
+    scenario: CycleScenario,
+    fill_model: CycleFillModel,
+) -> tuple[Scv1S1bKernel, int]:
+    version, source_books = _version(
+        f"s1b-cancel-accounting-{scenario.value}-{fill_model.value}"
+    )
+    kernel = Scv1S1bKernel(fill_model=fill_model)
+    assert kernel.admit(version, scenario=scenario, source_books=source_books).accepted
+    assert version.decision_ready_monotonic_ns is not None
+    activation_ns = (
+        version.decision_ready_monotonic_ns
+        + kernel.policy.delays(scenario).activation_delay_ns
+    )
+    kernel.advance(
+        _book(
+            Venue.RISEX,
+            received=activation_ns - 100_000_000,
+            revision=2,
+            bids=(("99", "10"),),
+            asks=(("102", "10"),),
+        ),
+        scenario=scenario,
+    )
+    kernel.advance_clock(activation_ns, scenario=scenario)
+    cancel_requested_ns = activation_ns + kernel.policy.entry_cancel_after_activation_ns
+    cancel_effective_ns = cancel_requested_ns + kernel.policy.delays(scenario).cancel_delay_ns
+    kernel.advance_clock(cancel_effective_ns, scenario=scenario)
+    return kernel, cancel_effective_ns
+
+
+@pytest.mark.parametrize("scenario", tuple(CycleScenario))
+@pytest.mark.parametrize("fill_model", tuple(CycleFillModel))
+def test_s1b_cancel_completion_reconciles_pre_effective_fill_processed_late(
+    scenario: CycleScenario,
+    fill_model: CycleFillModel,
+) -> None:
+    kernel, cancel_effective_ns = _s1b_cancel_effective_boundary(scenario, fill_model)
+    processing_ready_ns = cancel_effective_ns + 100
+    kernel.advance(
+        replace(
+            _entry_trade(
+                f"s1b-cancel-accounting-pre-effective-{scenario.value}-{fill_model.value}",
+                cancel_effective_ns - 1,
+                "0.22",
+                price="102",
+            ),
+            normalized_ready_monotonic_ns=processing_ready_ns,
+        ),
+        scenario=scenario,
+    )
+    after_fill = kernel.snapshot(scenario=scenario)
+    assert after_fill is not None
+    assert after_fill.entry_quantity == D("0.22")
+    assert after_fill.pending_entry_hedge_quantity == D("0.22")
+
+    hedge_due_ns = processing_ready_ns + kernel.policy.delays(scenario).taker_delay_ns
+    kernel.advance(
+        _book(
+            Venue.LIGHTER,
+            received=hedge_due_ns - 100_000_000,
+            revision=2,
+            bids=(("99", "10"),),
+            asks=(("100", "10"),),
+        ),
+        scenario=scenario,
+    )
+    # The hedge boundary re-enters entry-cancellation completion for every
+    # prior version.  The delayed fill must reconcile the same cancel action,
+    # rather than leave requested and executed quantities inconsistent.
+    kernel.advance_clock(hedge_due_ns, scenario=scenario)
+    result = kernel.snapshot(scenario=scenario)
+    assert result is not None
+    cancel = next(action for action in result.actions if action.action_id == "entry-cancel")
+    assert cancel.status.value == "COMPLETED"
+    assert cancel.requested_quantity == D("0.78")
+    assert cancel.executed_quantity == D("0.78")
+    assert cancel.remaining_quantity == D("0")
+    maker = next(action for action in result.actions if action.action_id == "entry-maker")
+    hedge = next(action for action in result.actions if action.action_id == "entry-hedge")
+    assert maker.executed_quantity == D("0.22")
+    assert hedge.executed_quantity == D("0.22")
+    assert result.entry_quantity == D("0.22")
+    assert result.hedged_quantity == D("0.22")
+    assert result.ledger.signed_cashflow_usd == D("0.22")
+    assert result.ledger.total_fees_usd == D("0.002222")
+    assert all(action.remaining_quantity >= D("0") for action in result.actions)
+
+
+@pytest.mark.parametrize("scenario", tuple(CycleScenario))
+@pytest.mark.parametrize("fill_model", tuple(CycleFillModel))
+def test_s1b_cancel_window_excludes_post_effective_fill_and_preserves_version_separation(
+    scenario: CycleScenario,
+    fill_model: CycleFillModel,
+) -> None:
+    kernel, cancel_effective_ns = _s1b_cancel_effective_boundary(scenario, fill_model)
+    kernel.advance(
+        replace(
+            _entry_trade(
+                f"s1b-cancel-accounting-post-effective-{scenario.value}-{fill_model.value}",
+                cancel_effective_ns + 1,
+                "0.22",
+                price="102",
+            ),
+            normalized_ready_monotonic_ns=cancel_effective_ns + 100,
+        ),
+        scenario=scenario,
+    )
+    old_version_only = kernel.snapshot(scenario=scenario)
+    assert old_version_only is not None
+    assert old_version_only.entry_quantity == D("0")
+    assert not any(fill.action_id.startswith("entry-maker") for fill in old_version_only.fills)
+    old_cancel = next(action for action in old_version_only.actions if action.action_id == "entry-cancel")
+    assert old_cancel.requested_quantity == D("1.00")
+    assert old_cancel.executed_quantity == D("1.00")
+    assert old_cancel.remaining_quantity == D("0")
+
+    next_decision_ns = cancel_effective_ns + 1_000_000_000
+    next_version, next_books = _fresh_version(
+        f"s1b-cancel-accounting-next-{scenario.value}-{fill_model.value}",
+        next_decision_ns,
+        3,
+    )
+    assert kernel.admit(next_version, scenario=scenario, source_books=next_books).accepted
+    next_activation_ns = next_decision_ns + kernel.policy.delays(scenario).activation_delay_ns
+    kernel.advance(
+        _book(
+            Venue.RISEX,
+            received=next_activation_ns - 100_000_000,
+            revision=4,
+            bids=(("99", "10"),),
+            asks=(("102", "10"),),
+        ),
+        scenario=scenario,
+    )
+    kernel.advance_clock(next_activation_ns, scenario=scenario)
+    kernel.advance(
+        _entry_trade(
+            f"s1b-cancel-accounting-next-fill-{scenario.value}-{fill_model.value}",
+            next_activation_ns + 100_000_000,
+            "0.22",
+            price="102",
+        ),
+        scenario=scenario,
+    )
+    separated = kernel.snapshot(scenario=scenario)
+    assert separated is not None
+    assert separated.entry_version_ids == (
+        f"s1b-cancel-accounting-{scenario.value}-{fill_model.value}",
+        f"s1b-cancel-accounting-next-{scenario.value}-{fill_model.value}",
+    )
+    assert separated.entry_quantity == D("0.22")
+    old_maker = next(action for action in separated.actions if action.action_id == "entry-maker")
+    new_maker = next(action for action in separated.actions if action.action_id == "entry-maker:1")
+    old_cancel = next(action for action in separated.actions if action.action_id == "entry-cancel")
+    assert old_maker.executed_quantity == D("0")
+    assert new_maker.executed_quantity == D("0.22")
+    assert old_cancel.requested_quantity == D("1.00")
+    assert old_cancel.executed_quantity == D("1.00")
+    assert old_cancel.remaining_quantity == D("0")
+
+
 def test_s1b_partial_exit_keeps_valid_maker_remainder_and_closes_only_actual_fill() -> None:
     version, source_books = _version("s1b-partial-exit")
     kernel = Scv1S1bKernel(fill_model=CycleFillModel.TOUCH_ALLOWED)

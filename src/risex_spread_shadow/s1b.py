@@ -1734,8 +1734,16 @@ class Scv1S1bKernel(CycleKernel):
         maker.reason = "ENTRY_MAKER_CANCELLED_PARTIAL" if version.remaining_quantity > 0 else "ENTRY_MAKER_FILLED"
         if version.cancel_effective_ns is not None and version.cancel_action_id in {item.action_id for item in cycle.actions}:
             cancel = _s1b_action(cycle, version.cancel_action_id)
+            # A fill can be causally before cancellation effective time while
+            # becoming processing-ready after that boundary.  Re-entering the
+            # boundary must reconcile the same cancel action to the version's
+            # remaining quantity, including when its first completion already
+            # latched the action as COMPLETED.
             cancel.requested_quantity = version.remaining_quantity
-            if cancel.status is CycleActionStatus.PENDING:
+            if cancel.status in {
+                CycleActionStatus.PENDING,
+                CycleActionStatus.COMPLETED,
+            }:
                 _s1b_set_action(
                     cycle,
                     cancel,
