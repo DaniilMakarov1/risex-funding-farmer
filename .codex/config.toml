@@ -1,8 +1,10 @@
-model = "gpt-6-astra"
-model_reasoning_effort = "medium"
+# The primary session remains selectable per session by the owner.
+# These defaults apply only to spawned agents without explicit overrides.
 
+model_verbosity = "medium"
+model_reasoning_summary = "detailed"
 [agents]
 enabled = true
 max_concurrent_threads_per_session = 1
-default_subagent_model = "gpt-5.6-sol"
-default_subagent_reasoning_effort = "medium"
+default_subagent_model = "gpt-5.6-luna"
+default_subagent_reasoning_effort = "max"

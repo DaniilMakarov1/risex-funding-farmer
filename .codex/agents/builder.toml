@@ -1,4 +1,5 @@
 name = "builder"
+description = "Implementation-focused Builder for the bounded project milestone."
 model = "gpt-5.6-luna"
 model_reasoning_effort = "max"
 sandbox_mode = "workspace-write"
