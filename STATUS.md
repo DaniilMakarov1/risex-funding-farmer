@@ -1,5 +1,11 @@
 # Current status
 
+## Linear book selection accepted — 2026-09-09
+
+Chief accepts58a4ac4b7cba0fb90e5f7a19f93c84d09d1d81f6: exact temporal complement replaces deep equality membership, no policy change. Full diff/surroundings reviewed;384 independent boundary/duplicate/freshness/health cases preserve selected object and reason. Builder isolated suite reported4222passed3skipped2failed; raw full stdout unavailable, durable summary is not a raw transcript. Both process-kill failures independently classified through preserved identical candidate/base6ad9ba2 logs. No unrelated lifecycle repairs. Evidence: evaluation-recovery-chief-20260908/linear-review-58a4ac4/.
+
+Prior final run evaluation-final-20260909/pilot-run stopped deliberately via child SIGTERM after160 PRIMARY rows; lifecycle persisted FAILED/CHILD_SIGNALLED with unchanged clean6ad9ba2 source. Exact reason/process/prefix counts preserved. This is incomplete evidence, not an economic result. Next one fresh four-alternative run uses the accepted linear correction; no prefix stitching or new collection.
+
 ## Final evaluation active; concrete runtime bottleneck — 2026-09-09
 
 Frozen6ad9ba2 run evaluation-final-20260909/pilot-run:16fixture checks PASS; grid764/eligible317 verified. Prefix123Primary rows preserved; start124 unusually slow. Native sample738/741 stacks in list_contains/deep equality, matching cycle.py:_select_book temporal membership complement. Minimal equivalent correction delegated under NEXT_TASK; no economics/policy change. Current PIDs12669/12674 belong to Chief; source402b remains clean/frozen6ad9ba2. No completed economic conclusion yet.
