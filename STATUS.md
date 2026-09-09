@@ -1,5 +1,13 @@
 # Current status
 
+## Saved-pilot economic checkpoint COMPLETE — 2026-09-09
+
+Fresh evaluation-linear-final-20260909/pilot-run completed from clean source3be87b65ddd0a1d9e59f50704edf90ef623ad496 with child exit0, durable COMPLETE and authoritative read. All four alternatives contain764starts/317eligible each, original immutable pilot hash unchanged. Chief independently verified860 fill records, exact positions/cash/fees/fixed stress costs and zero-inventory closure. No prefix stitching. Report and hash-bound acceptance: evaluation-linear-final-20260909/{economic-report.md,chief-final-acceptance.json}; detailed ledger summaries remain owner-only.
+
+In order TTO/PRIMARY,TTO/STRESS,TOUCH/PRIMARY,TOUCH/STRESS: maker episodes28/32/52/40; full closures15/6/19/13; open inventory13/26/33/27; closed-PnL medians USD−0.060543/−0.0840201404/−0.060543/−0.0910274904. Every closed episode is net negative in every alternative. Conditional starts overlap and must not be aggregated as strategy income. Funding UNKNOWN; open-inventory valuations/closed PnL remain unavailable where not evidenced. This pilot does not support positive economic edge under unchanged parameters, but is not a universal verdict over other inputs.
+
+The fifteen original PRIMARY Lighter-gap episodes now close; stale649/719/730 close paired exposure leaving exact subminimum RISEx residues,669/677 also retain post-only uncertainty and paired exposure. The finite checkpoint is achieved. No further Builder work/processes or automatic campaign authorized; all accepted/unaccepted branches, worktrees, prior160-row stopped run and evidence preserved. NEXT_TASK now records completion and owner decision boundary.
+
 ## Linear book selection accepted — 2026-09-09
 
 Chief accepts58a4ac4b7cba0fb90e5f7a19f93c84d09d1d81f6: exact temporal complement replaces deep equality membership, no policy change. Full diff/surroundings reviewed;384 independent boundary/duplicate/freshness/health cases preserve selected object and reason. Builder isolated suite reported4222passed3skipped2failed; raw full stdout unavailable, durable summary is not a raw transcript. Both process-kill failures independently classified through preserved identical candidate/base6ad9ba2 logs. No unrelated lifecycle repairs. Evidence: evaluation-recovery-chief-20260908/linear-review-58a4ac4/.

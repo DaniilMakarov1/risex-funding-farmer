@@ -1,4 +1,10 @@
-# Complete the saved-pilot evaluation with bounded exit continuity
+# Saved-pilot evaluation — COMPLETE
+
+## Completion and remaining authority — 2026-09-09
+
+The finite objective below is COMPLETE. Authoritative four-alternative run from3be87b65ddd0a1d9e59f50704edf90ef623ad496 and Chief independent860-fill verification are preserved in evaluation-linear-final-20260909/. Report: economic-report.md; hash-bound acceptance: chief-final-acceptance.json. Full closures15/6/19/13, all net negative; open episodes13/26/33/27 remain separate. No continuous-strategy profit aggregation or general profitability claim.
+
+Chief owns final report delivery; Builders are idle and preserve all branches/evidence. No additional implementation, rerun, public collection, parameter tuning or campaign is required by this completed objective. A changed hypothesis or new campaign requires a new owner decision. Prior sections below describe the completed work and confer no authority to restart it.
 
 ## Owner authorization and finite objective — 2026-09-08
 
@@ -33,7 +39,7 @@ Required distinguishing checks: temporary stale book then fresh recovery; no rec
 
 ## Observed bounded runtime correction — 2026-09-09
 
-Correction58a4ac4 is ACCEPTED after full diff review,384 independent output comparisons and identical candidate/base classification of the two process-kill failures. The prior6ad9ba2 run is deliberately terminal FAILED/CHILD_SIGNALLED;160 PRIMARY rows preserved separately. Chief owns one fresh all-four run in evaluation-linear-final-20260909, after fixture launch/read validation, with frozen integrated source/input/wrappers. Builder is idle and retains its branch/worktree/evidence. No economic settings or collection authority changed. Final independent economic report remains unachieved.
+Correction58a4ac4 is ACCEPTED after full diff review,384 independent output comparisons and identical candidate/base classification of the two process-kill failures. The prior6ad9ba2 run is deliberately terminal FAILED/CHILD_SIGNALLED;160 PRIMARY rows preserved separately. Chief completed the one fresh all-four run in evaluation-linear-final-20260909 after fixture launch/read validation, with frozen integrated source/input/wrappers. Builder is idle and retains its branch/worktree/evidence. No economic settings or collection authority changed. Final independent economic report is COMPLETE; see completion section.
 
 ## Immutable input, evidence and final run
 
