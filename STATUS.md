@@ -1,5 +1,9 @@
 # Current status
 
+## A/B/C saved-pilot comparison AUTHORIZED — 2026-09-09
+
+Native owner request in the auditor task authorizes comparison of unchanged120s baseline, only300s hold, and one120s causal exit-repricing candidate. Chief independently recovered the request. NEXT_TASK freezes C_BE_REPRICE_V1 formula/domain/cancel/activation and finite checks; SYSTEM_SPEC separates this opt-in research experiment from default policy. Reuse one visible Luna/max Builder and the independent auditor, no new tasks. Initial clean main0f9c61dea823905ee04d5ed10edbb8fa49927d07; no active full calculation at authorization. B may use a separately frozen baseline while C changes are isolated. New packet abc-comparison-20260909; original audits/inputs unchanged. No new collection/private/orders/tuning.
+
 ## Independent loss/exit-cause analysis COMPLETE — 2026-09-09
 
 Independent Astra/max auditor01a08558-e1c5-72d2-ac85-c8245928cd65 completed the finite saved-execution analysis and delivered the packet through native messaging. Chief read the full report/53-row summary and independently verified all44indexed artifacts; Chief did not duplicate the causal computation. Auditor worktree8e8e/branch codex/spread-v1-loss-cause-auditor remains clean at1dd336e5fac6472447b286d5474399803c833079, native completed/idle. Production/tests/governing untouched by auditor; no full replay/suite/collection/probes required, no active calculations or follow-up.
