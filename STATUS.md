@@ -1,5 +1,9 @@
 # Current status
 
+## Independent loss/exit-cause auditor AUTHORIZED — 2026-09-09
+
+Owner requests a new independent GPT-6 Astra/max auditor to analyze losses in already saved executions, prioritizing why49of53closed conditional episodes are labelled forced. The hypothesis that acceptable cycle completion is the weak point must be tested. NEXT_TASK defines the finite analysis: independently verify FORCED semantics,53episode timelines, hold/quote/data/partial interactions and gross/fee/stress decomposition. Prior audit remains COMPLETE WITH QUALIFICATIONS; its code/input/results stay immutable. Current Chief retains sole governance/integration ownership; the new auditor is read-only, owns new derived evidence only and does not launch a full replay, collect data or alter policy/production. Dispatch and package identity: loss-causes-auditor-handoff-20260909/ under the scanner evidence root.
+
 ## Independent system/economic audit COMPLETE WITH QUALIFICATIONS — 2026-09-09
 
 Successor Chief01a08506-2b07-7353-980a-6280c76629d6 verified predecessor completed/idle before taking sole ownership. Tested source279b3a302d4b9295d0008274376a83b8a9c8e997 is production/tests-identical to3be87b65ddd0a1d9e59f50704edf90ef623ad496. No production/tests/policy changes. One fresh same-input four-alternative replay completed with durable authoritative COMPLETE/child exit0; all3056 material rows equal the prior complete result. Independent stdlib-only reconstruction checks all15916 normalized book hashes,562 taker depth allocations and all860 fill ledger allocations;235650 assertions PASS. This is independent numerical/evidence verification of the accepted simulator, not a separately implemented simulator or whole-codebase correctness proof.
