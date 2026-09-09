@@ -115,6 +115,17 @@ _ENTRY_DEFERRED_REASONS = frozenset(
         CycleReason.MINIMUM_RESIDUE.value,
     }
 )
+_RETRYABLE_ACTION_DATA_REASONS = frozenset(
+    {
+        CycleReason.REQUIRED_ACTION_DATA_MISSING.value,
+        CycleReason.REQUIRED_ACTION_DATA_GAP.value,
+        CycleReason.REQUIRED_ACTION_DATA_STALE.value,
+        CycleReason.REQUIRED_ACTION_SESSION_DISPLACED.value,
+        CycleReason.REQUIRED_ACTION_UNHEALTHY.value,
+        CycleReason.REQUIRED_ACTION_TIMING_MISSING.value,
+        CycleReason.FUTURE_BOOK_REJECTED.value,
+    }
+)
 
 
 def _s1b_hedge_book_signature(book: BookEvidence) -> tuple[tuple[str, str], ...]:
@@ -445,6 +456,9 @@ class _S1bCycle:
     entry_hedge_consumed_quantity: Decimal = _ZERO
     exit_close_consumed_book_signature: tuple[tuple[str, str], ...] | None = None
     exit_close_consumed_quantity: Decimal = _ZERO
+    effective_hedge_stream_session_id: str | int | None = None
+    effective_hedge_recovery_generation: int | None = None
+    lighter_recovery_boundary_ns: int | None = None
 
     def add_reason(self, reason: CycleReason | str) -> None:
         value = reason.value if isinstance(reason, CycleReason) else str(reason)
@@ -479,6 +493,33 @@ def _s1b_pending_actions(
 
 def _s1b_pending_quantity(cycle: _S1bCycle, *kinds: CycleActionKind) -> Decimal:
     return sum((action.remaining_quantity for action in _s1b_pending_actions(cycle, *kinds)), _ZERO)
+
+
+def _s1b_action_data_deferred(action: _MutableAction) -> bool:
+    return (
+        action.status is CycleActionStatus.PENDING
+        and action.reason in _RETRYABLE_ACTION_DATA_REASONS
+    )
+
+
+def _s1b_expected_binding(
+    cycle: _S1bCycle,
+    venue: Venue,
+) -> tuple[str | int | None, int | None]:
+    if venue is Venue.RISEX:
+        return cycle.quote_version.stream_session_id, cycle.quote_version.recovery_generation
+    if (
+        cycle.effective_hedge_stream_session_id is not None
+        and cycle.effective_hedge_recovery_generation is not None
+    ):
+        return (
+            cycle.effective_hedge_stream_session_id,
+            cycle.effective_hedge_recovery_generation,
+        )
+    return (
+        cycle.quote_version.hedge_stream_session_id,
+        cycle.quote_version.hedge_recovery_generation,
+    )
 
 
 def _s1b_action(cycle: _S1bCycle, action_id: str) -> _MutableAction:
@@ -533,16 +574,9 @@ def _s1b_mark_snapshot(
         )
         if signed_quantity == _ZERO:
             continue
-        expected_session = (
-            cycle.quote_version.stream_session_id
-            if venue is Venue.RISEX
-            else cycle.quote_version.hedge_stream_session_id
-        )
-        expected_recovery = (
-            cycle.quote_version.recovery_generation
-            if venue is Venue.RISEX
-            else cycle.quote_version.hedge_recovery_generation
-        )
+        if venue in cycle.displaced_book_venues:
+            return None, None, None, None, None, None
+        expected_session, expected_recovery = _s1b_expected_binding(cycle, venue)
         if expected_session is None or expected_recovery is None:
             return None, None, None, None, None, None
         candidates = [
@@ -878,6 +912,8 @@ class Scv1S1bKernel(CycleKernel):
             phase=_S1bPhase.ENTRY_WAIT,
             current_ns=decision,
             q_cap=quantity,
+            effective_hedge_stream_session_id=version.hedge_stream_session_id,
+            effective_hedge_recovery_generation=version.hedge_recovery_generation,
         )
         self._new_version(
             cycle,
@@ -1049,16 +1085,7 @@ class Scv1S1bKernel(CycleKernel):
 
     @staticmethod
     def _s1b_book_is_bound(cycle: _S1bCycle, book: BookEvidence) -> bool:
-        expected_session = (
-            cycle.quote_version.stream_session_id
-            if book.venue is Venue.RISEX
-            else cycle.quote_version.hedge_stream_session_id
-        )
-        expected_recovery = (
-            cycle.quote_version.recovery_generation
-            if book.venue is Venue.RISEX
-            else cycle.quote_version.hedge_recovery_generation
-        )
+        expected_session, expected_recovery = _s1b_expected_binding(cycle, book.venue)
         return (
             book.venue in {Venue.RISEX, Venue.LIGHTER}
             and book.canonical_market == cycle.quote_version.canonical_market
@@ -1068,21 +1095,90 @@ class Scv1S1bKernel(CycleKernel):
             and book.recovery_generation == expected_recovery
         )
 
+    @staticmethod
+    def _s1b_try_bind_lighter_recovery(
+        cycle: _S1bCycle,
+        event: CausalEvent,
+        book: BookEvidence,
+    ) -> bool:
+        """Bind a future Lighter action only at a validated recovery boundary.
+
+        ``BookEvidence`` is the complete normalized book state emitted by the
+        book-chain decoder.  It is accepted here only when its causal timing,
+        identity, freshness, and sequence/checksum health are valid and it is
+        a new stream/recovery identity following a matching Lighter gap.  The
+        old quote version and gap remain immutable provenance; only the
+        effective future taker binding moves forward.
+        """
+
+        if book.venue is not Venue.LIGHTER:
+            return False
+        current_session, current_recovery = _s1b_expected_binding(cycle, Venue.LIGHTER)
+        if current_session is None or current_recovery is None:
+            return False
+        matching_gaps = tuple(
+            gap
+            for gap in cycle.gaps
+            if gap.matches(
+                Venue.LIGHTER,
+                cycle.quote_version.canonical_market,
+                current_session,
+                current_recovery,
+            )
+        )
+        if not matching_gaps:
+            return False
+        latest_gap = max(
+            matching_gaps,
+            key=lambda gap: (
+                gap.gap_start_monotonic_ns,
+                gap.gap_end_monotonic_ns
+                if gap.gap_end_monotonic_ns is not None
+                else _MAX_TIME,
+            ),
+        )
+        recovery_boundary_ns = (
+            latest_gap.gap_end_monotonic_ns
+            if latest_gap.gap_end_monotonic_ns is not None
+            else latest_gap.gap_start_monotonic_ns
+        )
+        if book.received_monotonic_ns < recovery_boundary_ns:
+            return False
+        ready = _processing_ready_ns(event)
+        if (
+            ready is None
+            or ready < book.received_monotonic_ns
+            or event.normalized_ready_monotonic_ns is None
+            or not event.source_identity_complete
+            or not event.identity_metadata_consistent
+            or book.canonical_market != cycle.quote_version.canonical_market
+            or not book.fresh
+            or not book.is_sequence_healthy
+            or (
+                book.stream_session_id == current_session
+                and book.recovery_generation == current_recovery
+            )
+            or book.recovery_generation < current_recovery
+        ):
+            return False
+        cycle.effective_hedge_stream_session_id = book.stream_session_id
+        cycle.effective_hedge_recovery_generation = book.recovery_generation
+        cycle.lighter_recovery_boundary_ns = ready
+        cycle.displaced_book_venues.discard(Venue.LIGHTER)
+        # A new FULL normalized snapshot is a new liquidity witness even if
+        # its visible levels happen to equal the old session's levels.
+        cycle.entry_hedge_consumed_book_signature = None
+        cycle.entry_hedge_consumed_quantity = _ZERO
+        cycle.exit_close_consumed_book_signature = None
+        cycle.exit_close_consumed_quantity = _ZERO
+        return True
+
     def _record_book(self, cycle: _S1bCycle, event: CausalEvent, *, initial: bool = False) -> None:
         book = event.book
         assert book is not None
         if book.canonical_market != cycle.quote_version.canonical_market:
             return
-        expected_session = (
-            cycle.quote_version.stream_session_id
-            if book.venue is Venue.RISEX
-            else cycle.quote_version.hedge_stream_session_id
-        )
-        expected_recovery = (
-            cycle.quote_version.recovery_generation
-            if book.venue is Venue.RISEX
-            else cycle.quote_version.hedge_recovery_generation
-        )
+        expected_session, expected_recovery = _s1b_expected_binding(cycle, book.venue)
         if (
             book.venue not in {Venue.RISEX, Venue.LIGHTER}
             or expected_session is None
@@ -1090,9 +1186,12 @@ class Scv1S1bKernel(CycleKernel):
             or book.stream_session_id != expected_session
             or book.recovery_generation != expected_recovery
         ):
-            if book.venue in {Venue.RISEX, Venue.LIGHTER}:
-                cycle.displaced_book_venues.add(book.venue)
-            return
+            if self._s1b_try_bind_lighter_recovery(cycle, event, book):
+                expected_session, expected_recovery = _s1b_expected_binding(cycle, book.venue)
+            else:
+                if book.venue in {Venue.RISEX, Venue.LIGHTER}:
+                    cycle.displaced_book_venues.add(book.venue)
+                return
         identity_key = _event_identity_key(event)
         signature = self._book_signature(book)
         if identity_key is not None:
@@ -1311,8 +1410,11 @@ class Scv1S1bKernel(CycleKernel):
             action.kind is CycleActionKind.ENTRY_HEDGE
             and action.status is CycleActionStatus.PENDING
             and action.action_id in cycle.scheduled_takers
-            and action.due_ns is None
-            and action.reason in _ENTRY_DEFERRED_REASONS
+            and (
+                action.reason in _RETRYABLE_ACTION_DATA_REASONS
+                or action.due_ns is None
+                and action.reason in _ENTRY_DEFERRED_REASONS
+            )
             for action in cycle.actions
         )
 
@@ -1349,7 +1451,10 @@ class Scv1S1bKernel(CycleKernel):
             action.kind is CycleActionKind.EXIT_HEDGE_CLOSE
             and action.status is CycleActionStatus.PENDING
             and action.action_id in cycle.scheduled_takers
-            and action.due_ns is None
+            and (
+                action.reason in _RETRYABLE_ACTION_DATA_REASONS
+                or action.due_ns is None
+            )
             for action in cycle.actions
         )
 
@@ -1373,12 +1478,47 @@ class Scv1S1bKernel(CycleKernel):
             return
         self._handle_boundary(cycle, at_ns)
 
+    def _s1b_wake_deferred_takers(
+        self,
+        cycle: _S1bCycle,
+        at_ns: int,
+        venue: Venue,
+    ) -> None:
+        """Retry only venue-local data-deferred actions on a new BOOK.
+
+        The original due boundary remains on the action for auditability and
+        is never reinserted into the scheduler.  A new BOOK is the required
+        new evidence; duplicate events and clocks alone cannot cause a retry.
+        """
+
+        if cycle.phase in {_S1bPhase.COMPLETE, _S1bPhase.ABORTED, _S1bPhase.UNRESOLVED}:
+            return
+        candidates = tuple(
+            action
+            for action in cycle.actions
+            if action.kind
+            not in {CycleActionKind.ENTRY_HEDGE, CycleActionKind.EXIT_HEDGE_CLOSE}
+            and _s1b_action_data_deferred(action)
+            and action.action_id in cycle.scheduled_takers
+            and cycle.scheduled_takers[action.action_id][0] is venue
+        )
+        if not candidates:
+            return
+        for action in candidates:
+            self._execute_taker(cycle, action, at_ns)
+            if cycle.unresolved or cycle.policy_blocked:
+                return
+        # Reconcile phase transitions (for example, an unmatched reservation
+        # that became executable) without treating the old due boundary as a
+        # second execution opportunity.
+        self._handle_boundary(cycle, at_ns)
+
     def _s1b_reconsider_pair_on_book(self, cycle: _S1bCycle, at_ns: int) -> None:
         """Commit the first executable pair at a newly ready BOOK boundary."""
 
         if (
             cycle.paired_risex_quantity <= _ZERO
-            or cycle.exit_chosen
+            or (cycle.exit_chosen and cycle.exit_quote is not None)
             or cycle.phase
             not in {
                 _S1bPhase.ENTRY_WAIT,
@@ -1392,7 +1532,22 @@ class Scv1S1bKernel(CycleKernel):
             return
         exit_ready, _ = self._s1b_exit_ready(cycle, at_ns)
         if exit_ready is True:
-            self._s1b_pair_formed(cycle, at_ns)
+            if cycle.phase is _S1bPhase.UNMATCHED_WAIT and not _s1b_pending_actions(
+                cycle,
+                CycleActionKind.UNMATCHED_RISEX_UNWIND,
+            ):
+                self._prepare_exit(cycle, at_ns)
+            elif cycle.phase is _S1bPhase.ENTRY_BARRIER and not _s1b_pending_actions(
+                cycle,
+                CycleActionKind.ENTRY_HEDGE,
+            ) and all(
+                item.cancel_effective_ns is not None
+                and item.cancel_effective_ns <= at_ns
+                for item in cycle.entry_versions
+            ):
+                self._s1b_begin_exit_or_unmatched(cycle, at_ns)
+            else:
+                self._s1b_pair_formed(cycle, at_ns)
 
     def _s1b_execute_due_entry_hedges(
         self,
@@ -1498,14 +1653,9 @@ class Scv1S1bKernel(CycleKernel):
 
         book, book_reason = _select_book(cycle, Venue.LIGHTER, at_ns)
         if book_reason is not None or book is None:
-            self._action_data_failure(
-                cycle,
-                actions[0],
-                book_reason or CycleReason.REQUIRED_ACTION_DATA_MISSING,
-            )
-            for item in actions[1:]:
-                item.status = CycleActionStatus.UNRESOLVED
-                item.reason = (book_reason or CycleReason.REQUIRED_ACTION_DATA_MISSING).value
+            failure_reason = book_reason or CycleReason.REQUIRED_ACTION_DATA_MISSING
+            for item in actions:
+                self._action_data_failure(cycle, item, failure_reason)
             return
         book_signature = _s1b_hedge_book_signature(book)
         if cycle.entry_hedge_consumed_book_signature != book_signature:
@@ -1524,10 +1674,8 @@ class Scv1S1bKernel(CycleKernel):
             return
         step = _venue_quantity_step(cycle, Venue.LIGHTER)
         if step is None:
-            self._action_data_failure(cycle, actions[0], CycleReason.REQUIRED_ACTION_DATA_MISSING)
-            for item in actions[1:]:
-                item.status = CycleActionStatus.UNRESOLVED
-                item.reason = CycleReason.REQUIRED_ACTION_DATA_MISSING.value
+            for item in actions:
+                self._action_data_failure(cycle, item, CycleReason.REQUIRED_ACTION_DATA_MISSING)
             return
         executable = _floor_quantity(min(requested, available), step)
         if executable <= _ZERO:
@@ -2116,16 +2264,30 @@ class Scv1S1bKernel(CycleKernel):
                 if event.book.venue is Venue.LIGHTER:
                     self._s1b_wake_deferred_entry_hedges(cycle, cycle.current_ns)
                     self._s1b_wake_deferred_exit_closes(cycle, cycle.current_ns)
+                self._s1b_wake_deferred_takers(cycle, cycle.current_ns, event.book.venue)
                 self._s1b_reconsider_pair_on_book(cycle, cycle.current_ns)
             return
         if event.kind is CausalEventKind.DATA_GAP:
             gap = event.gap
             assert gap is not None
             cycle.gaps.append(gap)
-            if self._gap_overlaps_s1b(cycle, gap):
-                self._halt(cycle, CycleReason.REQUIRED_ACTION_DATA_GAP)
+            overlaps_before_advance = self._gap_overlaps_s1b(cycle, gap)
             if event.causal_monotonic_ns > cycle.current_ns:
+                # Process all boundaries that precede the first unavailable
+                # instant before classifying the interval.  Otherwise a gap
+                # whose start is in the future would be checked against the
+                # old current time and could be silently omitted.
                 self._run_due_until(cycle, event.causal_monotonic_ns)
+            if overlaps_before_advance or self._gap_overlaps_s1b(cycle, gap):
+                cycle.add_reason(CycleReason.REQUIRED_ACTION_DATA_GAP)
+                # A Lighter-only gap does not make the causally observable
+                # RISEx maker stream ambiguous.  Lighter-dependent actions
+                # defer until a validated new binding; a RISEx gap still
+                # blocks the maker obligation fail-closed.
+                if gap.source_venue is Venue.RISEX:
+                    self._halt(cycle, CycleReason.REQUIRED_ACTION_DATA_GAP)
+                else:
+                    cycle.displaced_book_venues.add(Venue.LIGHTER)
             return
         if event.causal_monotonic_ns > cycle.current_ns:
             self._run_due_until(cycle, event.causal_monotonic_ns)
@@ -2200,16 +2362,7 @@ class Scv1S1bKernel(CycleKernel):
             or gap.canonical_market != cycle.quote_version.canonical_market
         ):
             return False
-        expected_session = (
-            cycle.quote_version.stream_session_id
-            if gap.source_venue is Venue.RISEX
-            else cycle.quote_version.hedge_stream_session_id
-        )
-        expected_recovery = (
-            cycle.quote_version.recovery_generation
-            if gap.source_venue is Venue.RISEX
-            else cycle.quote_version.hedge_recovery_generation
-        )
+        expected_session, expected_recovery = _s1b_expected_binding(cycle, gap.source_venue)
         return (
             expected_session is not None
             and expected_recovery is not None
@@ -2277,7 +2430,21 @@ class Scv1S1bKernel(CycleKernel):
                     for item in cycle.entry_versions
                 )
                 if all_cancelled and not _s1b_pending_actions(cycle, CycleActionKind.ENTRY_HEDGE):
-                    values.append(cycle.current_ns)
+                    # A paired position can reach the barrier while the
+                    # current books are temporarily unusable for exit.  The
+                    # boundary handler records that data deferral and leaves
+                    # the pair pending until a new BOOK wakes it.  Do not
+                    # reinsert the same timestamp: doing so calls the same
+                    # deferred transition again and the no-progress guard
+                    # would incorrectly turn a retryable data condition into
+                    # REQUIRED_ACTION_AMBIGUOUS.
+                    exit_ready, exit_reason = self._s1b_exit_ready(cycle, cycle.current_ns)
+                    if not (
+                        exit_ready is None
+                        and exit_reason is not None
+                        and exit_reason.value in _RETRYABLE_ACTION_DATA_REASONS
+                    ):
+                        values.append(cycle.current_ns)
             if (
                 cycle.max_hold_deadline_ns is not None
                 and not cycle.deadline_forced
@@ -2590,12 +2757,7 @@ class Scv1S1bKernel(CycleKernel):
                     self._execute_taker(cycle, action, at_ns)
             if cycle.unresolved or cycle.policy_blocked:
                 return
-            if cycle.unmatched_entry_quantity <= _ZERO:
-                cycle.unmatched_resolved_ns = at_ns
-                if cycle.deadline_forced:
-                    self._schedule_forced_remaining(cycle, at_ns)
-                else:
-                    self._prepare_exit(cycle, at_ns)
+            self._s1b_after_unmatched_attempt(cycle, at_ns)
             return
         if cycle.phase is _S1bPhase.EXIT_WAIT:
             if (
@@ -2719,6 +2881,31 @@ class Scv1S1bKernel(CycleKernel):
         else:
             self._prepare_exit(cycle, at_ns)
 
+    def _s1b_after_unmatched_attempt(self, cycle: _S1bCycle, at_ns: int) -> None:
+        """Continue paired reduction while retaining an unmatched residue."""
+
+        if cycle.unresolved or cycle.policy_blocked:
+            return
+        if cycle.unmatched_entry_quantity <= _ZERO:
+            cycle.unmatched_resolved_ns = at_ns
+            if cycle.deadline_forced:
+                self._schedule_forced_remaining(cycle, at_ns)
+            else:
+                self._prepare_exit(cycle, at_ns)
+            return
+        if (
+            cycle.paired_risex_quantity > _ZERO
+            and not _s1b_pending_actions(cycle, CycleActionKind.UNMATCHED_RISEX_UNWIND)
+        ):
+            # The residue is already recorded by the completed unmatched
+            # action.  Do not create extra exposure or retry without new
+            # evidence; proceed with the independently executable pair.
+            cycle.add_reason(_POLICY_BLOCKED_RESIDUAL)
+            if cycle.deadline_forced:
+                self._schedule_forced_remaining(cycle, at_ns)
+            else:
+                self._prepare_exit(cycle, at_ns)
+
     def _schedule_unmatched(self, cycle: _S1bCycle, at_ns: int) -> None:
         cycle.forced_used = True
         cycle.add_reason(CycleReason.FORCED_UNWIND)
@@ -2813,7 +3000,11 @@ class Scv1S1bKernel(CycleKernel):
         exit_quote, reason = self._exit_quote_candidate(cycle, decision_ns)
         if exit_quote is None:
             if reason is not CycleReason.EXIT_QUOTE_INVALID:
-                self._halt(cycle, reason or CycleReason.REQUIRED_ACTION_DATA_MISSING)
+                deferred_reason = reason or CycleReason.REQUIRED_ACTION_DATA_MISSING
+                if deferred_reason.value in _RETRYABLE_ACTION_DATA_REASONS:
+                    cycle.add_reason(deferred_reason)
+                    return
+                self._halt(cycle, deferred_reason)
                 return
             cycle.add_reason(CycleReason.EXIT_QUOTE_INVALID)
             self._schedule_forced_remaining(cycle, decision_ns)
@@ -2866,6 +3057,14 @@ class Scv1S1bKernel(CycleKernel):
         cycle.terminal_ns = cycle.current_ns
 
     def _action_data_failure(self, cycle: _S1bCycle, action: _MutableAction, reason: CycleReason) -> None:
+        if reason.value in _RETRYABLE_ACTION_DATA_REASONS:
+            # Keep the original requested/effective/due timestamps.  The
+            # scheduler will not select a past due boundary again, while a
+            # new causally-ready BOOK can explicitly wake this reservation.
+            action.status = CycleActionStatus.PENDING
+            action.reason = reason.value
+            cycle.add_reason(reason)
+            return
         action.status = CycleActionStatus.UNRESOLVED
         action.reason = reason.value
         self._halt(cycle, reason)
@@ -2925,14 +3124,9 @@ class Scv1S1bKernel(CycleKernel):
             return
         book, book_reason = _select_book(cycle, Venue.LIGHTER, at_ns)
         if book_reason is not None or book is None:
-            self._action_data_failure(
-                cycle,
-                actions[0],
-                book_reason or CycleReason.REQUIRED_ACTION_DATA_MISSING,
-            )
-            for action in actions[1:]:
-                action.status = CycleActionStatus.UNRESOLVED
-                action.reason = (book_reason or CycleReason.REQUIRED_ACTION_DATA_MISSING).value
+            failure_reason = book_reason or CycleReason.REQUIRED_ACTION_DATA_MISSING
+            for action in actions:
+                self._action_data_failure(cycle, action, failure_reason)
             return
         book_signature = _s1b_close_book_signature(book)
         if cycle.exit_close_consumed_book_signature != book_signature:
@@ -2951,10 +3145,8 @@ class Scv1S1bKernel(CycleKernel):
             return
         step = _venue_quantity_step(cycle, Venue.LIGHTER)
         if step is None:
-            self._action_data_failure(cycle, actions[0], CycleReason.REQUIRED_ACTION_DATA_MISSING)
-            for action in actions[1:]:
-                action.status = CycleActionStatus.UNRESOLVED
-                action.reason = CycleReason.REQUIRED_ACTION_DATA_MISSING.value
+            for action in actions:
+                self._action_data_failure(cycle, action, CycleReason.REQUIRED_ACTION_DATA_MISSING)
             return
         executable = _floor_quantity(min(requested, available), step)
         if executable <= _ZERO:
@@ -3058,6 +3250,14 @@ class Scv1S1bKernel(CycleKernel):
         )
         cycle.exit_close_consumed_quantity += actual_executed
 
+    @staticmethod
+    def _s1b_unmatched_residue_can_coexist_with_pair(cycle: _S1bCycle, action: _MutableAction) -> bool:
+        return (
+            action.kind is CycleActionKind.UNMATCHED_RISEX_UNWIND
+            and cycle.paired_risex_quantity > _ZERO
+            and cycle.paired_lighter_quantity > _ZERO
+        )
+
     def _execute_taker(self, cycle: _S1bCycle, action: _MutableAction, at_ns: int) -> None:
         if action.kind is CycleActionKind.ENTRY_HEDGE:
             self._s1b_execute_due_entry_hedges(cycle, at_ns)
@@ -3098,6 +3298,9 @@ class Scv1S1bKernel(CycleKernel):
             _s1b_set_action(cycle, action, status=CycleActionStatus.COMPLETED, executed=_ZERO, reason=CycleReason.INSUFFICIENT_DEPTH.value)
             if action.kind is CycleActionKind.ENTRY_HEDGE:
                 cycle.add_reason(CycleReason.INSUFFICIENT_DEPTH)
+            elif self._s1b_unmatched_residue_can_coexist_with_pair(cycle, action):
+                cycle.add_reason(CycleReason.INSUFFICIENT_DEPTH)
+                cycle.add_reason(_POLICY_BLOCKED_RESIDUAL)
             else:
                 self._policy_block(cycle, _POLICY_BLOCKED_RESIDUAL)
             return
@@ -3111,13 +3314,19 @@ class Scv1S1bKernel(CycleKernel):
             _s1b_set_action(cycle, action, status=CycleActionStatus.COMPLETED, executed=_ZERO, reason=failure_reason.value)
             cycle.add_reason(failure_reason)
             if action.kind is not CycleActionKind.ENTRY_HEDGE:
-                self._policy_block(cycle, _POLICY_BLOCKED_MINIMUM)
+                if self._s1b_unmatched_residue_can_coexist_with_pair(cycle, action):
+                    cycle.add_reason(_POLICY_BLOCKED_RESIDUAL)
+                else:
+                    self._policy_block(cycle, _POLICY_BLOCKED_MINIMUM)
             return
         vwap = exact_quantity_vwap(side, executable, tuple(book.bids), tuple(book.asks))
         if not vwap.is_executable or vwap.price is None:
             _s1b_set_action(cycle, action, status=CycleActionStatus.COMPLETED, executed=_ZERO, reason=CycleReason.INSUFFICIENT_DEPTH.value)
             if action.kind is CycleActionKind.ENTRY_HEDGE:
                 cycle.add_reason(CycleReason.INSUFFICIENT_DEPTH)
+            elif self._s1b_unmatched_residue_can_coexist_with_pair(cycle, action):
+                cycle.add_reason(CycleReason.INSUFFICIENT_DEPTH)
+                cycle.add_reason(_POLICY_BLOCKED_RESIDUAL)
             else:
                 self._policy_block(cycle, _POLICY_BLOCKED_RESIDUAL)
             return
@@ -3126,6 +3335,8 @@ class Scv1S1bKernel(CycleKernel):
             cycle.add_reason(CycleReason.MINIMUM_RESIDUE)
             if action.kind is CycleActionKind.ENTRY_HEDGE:
                 cycle.add_reason(CycleReason.HEDGE_PARTIAL)
+            elif self._s1b_unmatched_residue_can_coexist_with_pair(cycle, action):
+                cycle.add_reason(_POLICY_BLOCKED_RESIDUAL)
             else:
                 self._policy_block(cycle, _POLICY_BLOCKED_MINIMUM)
             return
@@ -3314,6 +3525,21 @@ class Scv1S1bKernel(CycleKernel):
 
     clock = advance_clock
 
+    def _s1b_has_unresolved_observation(self, cycle: _S1bCycle) -> bool:
+        if any(_s1b_action_data_deferred(action) for action in cycle.actions):
+            return True
+        if (
+            cycle.exit_chosen
+            and cycle.exit_quote is None
+            and cycle.paired_risex_quantity > _ZERO
+        ):
+            # The pair has already committed the lane to exit, but the
+            # causally required exit BOOK was unavailable at the last
+            # observation.  Keep the known inventory visible while making a
+            # no-recovery finish explicitly incomplete.
+            return True
+        return any(self._gap_overlaps_s1b(cycle, gap) for gap in cycle.gaps)
+
     def finish(self, *, scenario: CycleScenario = CycleScenario.PRIMARY, end_monotonic_ns: int | None = None) -> S1bCycleResult:
         lane = self._lane(scenario)
         if lane.active is None:
@@ -3332,7 +3558,12 @@ class Scv1S1bKernel(CycleKernel):
             if lane.active is not None and isinstance(lane.active, _S1bCycle):
                 cycle = lane.active
                 cycle.observation_end_ns = end_monotonic_ns if end_monotonic_ns is not None else cycle.current_ns
-                if cycle.phase is _S1bPhase.ENTRY_REQUOTE_WAIT and cycle.entry_observed_quantity == _ZERO and not _s1b_pending_actions(cycle):
+                if self._s1b_has_unresolved_observation(cycle):
+                    cycle.unresolved = True
+                    cycle.phase = _S1bPhase.UNRESOLVED
+                    cycle.terminal_ns = cycle.current_ns
+                    self._latch_terminal(lane, cycle)
+                elif cycle.phase is _S1bPhase.ENTRY_REQUOTE_WAIT and cycle.entry_observed_quantity == _ZERO and not _s1b_pending_actions(cycle):
                     cycle.add_reason(CycleReason.NO_ENTRY)
                     cycle.phase = _S1bPhase.ABORTED
                     cycle.terminal_ns = cycle.current_ns
