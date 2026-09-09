@@ -1,5 +1,9 @@
 # Current status
 
+## Final evaluation active; concrete runtime bottleneck — 2026-09-09
+
+Frozen6ad9ba2 run evaluation-final-20260909/pilot-run:16fixture checks PASS; grid764/eligible317 verified. Prefix123Primary rows preserved; start124 unusually slow. Native sample738/741 stacks in list_contains/deep equality, matching cycle.py:_select_book temporal membership complement. Minimal equivalent correction delegated under NEXT_TASK; no economics/policy change. Current PIDs12669/12674 belong to Chief; source402b remains clean/frozen6ad9ba2. No completed economic conclusion yet.
+
 ## Exit continuity accepted; final saved-input evaluation authorized — 2026-09-09
 
 Chief accepts133d533e2e93c5099da1a6b7511f6ffa265a7ac7 after complete diff review, original independent stale-barrier regression, both saved Lighter recoveries and start649 through actual CHANGED36303. Paired0.001240BTC exit is prepared while exact0.000020BTC residue remains; no fabricated fill/deadline change. Chief final fresh isolated Python3.11 suite:4204passed3skipped4failed,exit1. Exact same four legacy s3_envelope_evidence failures reproduce on accepted basee36a9e7 (24passed4failed); no skips/unrelated repairs. These deferred legacy resource-finalization tests remain unresolved, not a new saved-input regression. Builder earlier system-site-packages suite is not clean isolation evidence. Review/logs: evaluation-recovery-chief-20260908/exit-review-133d533/. Both accepted candidates integrated unchanged; next one fresh four-alternative pilot evaluation after small harness verification. No public collection.
