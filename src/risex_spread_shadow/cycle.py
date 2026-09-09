@@ -1278,7 +1278,13 @@ def _select_book(cycle: _MutableCycle, venue: Venue, due_ns: int) -> tuple[BookE
         and observation.processing_ready_ns <= due_ns
         and observation.book.received_monotonic_ns <= due_ns
     ]
-    future = [observation for observation in candidates if observation not in temporal]
+    future = [
+        observation
+        for observation in candidates
+        if observation.processing_ready_ns is None
+        or observation.processing_ready_ns > due_ns
+        or observation.book.received_monotonic_ns > due_ns
+    ]
     fresh_temporal = [
         observation
         for observation in temporal

@@ -24,6 +24,8 @@ from risex_spread_shadow.cycle import (
     CycleReason,
     CycleScenario,
     CycleTerminalState,
+    _BookObservation,
+    _select_book,
 )
 from risex_spread_shadow.causal import CausalEvent, CausalOutcome
 from risex_spread_shadow.economics import build_hypothetical_maker_quote
@@ -634,6 +636,45 @@ def test_book_retention_is_bounded_and_terminal_latch_releases_payloads() -> Non
     terminal = lane.terminal_cycles[-1]
     assert terminal.books == []
     assert terminal.book_identity_keys == set()
+
+
+def test_select_book_partitions_future_books_without_deep_observation_equality() -> None:
+    version, source_books = _version("s2-book-selection-linear")
+    kernel = CycleKernel()
+    assert kernel.admit(version, source_books=source_books).accepted
+    lane = kernel._lane(CycleScenario.PRIMARY)
+    assert lane.active is not None
+    cycle = lane.active
+    base = next(observation for observation in cycle.books if observation.book.venue is Venue.RISEX)
+    future_observations = [
+        _BookObservation(
+            event=base.event,
+            book=replace(base.book, book_revision=index + 10),
+            processing_ready_ns=101 + index,
+            arrival_index=index + 1,
+            identity_complete=True,
+        )
+        for index in range(100)
+    ]
+    cycle.books = [base, *future_observations]
+
+    original_eq = _BookObservation.__eq__
+    equality_calls = 0
+
+    def counted_eq(self: _BookObservation, other: object) -> bool:
+        nonlocal equality_calls
+        equality_calls += 1
+        return original_eq(self, other)
+
+    _BookObservation.__eq__ = counted_eq
+    try:
+        selected, reason = _select_book(cycle, Venue.RISEX, 100)
+    finally:
+        _BookObservation.__eq__ = original_eq
+
+    assert selected is base.book
+    assert reason is None
+    assert equality_calls == 0
 
 
 def test_book_digest_preserves_decimal_equality_without_hiding_conflicts() -> None:
