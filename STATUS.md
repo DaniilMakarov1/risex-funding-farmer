@@ -1,5 +1,9 @@
 # Current status
 
+## Exit continuity accepted; final saved-input evaluation authorized — 2026-09-09
+
+Chief accepts133d533e2e93c5099da1a6b7511f6ffa265a7ac7 after complete diff review, original independent stale-barrier regression, both saved Lighter recoveries and start649 through actual CHANGED36303. Paired0.001240BTC exit is prepared while exact0.000020BTC residue remains; no fabricated fill/deadline change. Chief final fresh isolated Python3.11 suite:4204passed3skipped4failed,exit1. Exact same four legacy s3_envelope_evidence failures reproduce on accepted basee36a9e7 (24passed4failed); no skips/unrelated repairs. These deferred legacy resource-finalization tests remain unresolved, not a new saved-input regression. Builder earlier system-site-packages suite is not clean isolation evidence. Review/logs: evaluation-recovery-chief-20260908/exit-review-133d533/. Both accepted candidates integrated unchanged; next one fresh four-alternative pilot evaluation after small harness verification. No public collection.
+
 ## Exit continuity candidate CHANGES_REQUESTED — 2026-09-08
 
 Candidate06e7ed8635a192d2af1adc7006b76e439019fff4 (basee36a9e7) is NOT_ACCEPTED. Chief independently reproduces a stale-exit barrier defect: paired0.60BTC remains at1.1s; book receipt0.9s is stale at cancellation completion1.6s; deferred _prepare_exit retains ENTRY_BARRIER, repeated current-time boundary triggers REQUIRED_ACTION_AMBIGUOUS and makes known positions nonauthoritative. Builder receives exact fixture and must preserve pending state, fresh-book recovery and deadline with a distinguishing regression. Required representative saved-start evidence and FULL-rooted decoder provenance remain under review. No integration or full pilot.

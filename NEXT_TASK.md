@@ -14,7 +14,9 @@ Candidate3d51e64d18718618785cb2c07efc5589a354412a is independently ACCEPTED: iso
 
 Correct only the proven source-at-execution binding, durable historical-result verification and valid complete-result checks; demonstrate the actual bounded launch/read harness on a small fixture. Empty/malformed/incomplete output or absent terminal cannot become authoritative success. Preserve source/input/child/import identity, exclusive one-shot launch and readable partial outputs. A later docs commit or disappearance of the original checkout must not invalidate previously proven unchanged evidence. No watcher/service/retry/detach or generic framework. Historical process disappearance cause remains UNKNOWN; a reproduced wrapper weakness is not proof of historical attribution.
 
-## B. Bounded venue-specific exit continuity correction
+## B. Bounded venue-specific exit continuity correction — ACCEPTED
+
+Accepted candidate133d533e2e93c5099da1a6b7511f6ffa265a7ac7; acceptance details and baseline test limitations are in STATUS. No further production correction assigned. Chief owns final operational launch in evaluation-final-20260909, using the existing immutable conditional probe and accepted lifecycle.
 
 Diagnostic source9d0c8da88d2afb807b9d8a063d3d119a41c50a59, saved calculation source2e383ac36789feb7712a9237a9e916b0754d085d. New implementation uses a named accepted-base branch codex/spread-v1-exit-continuity in the existing idle diagnostic worktree9d28; preserve the diagnostic branch and evidence. No forced new session if context is recovered clearly.
 
