@@ -3557,6 +3557,50 @@ def _c_active_kernel(name: str) -> tuple[Scv1S1bKernel, int, int]:
     return kernel, 2_500_000_000, 121_000_000_000
 
 
+def _c_replacement_kernel(name: str) -> Scv1S1bKernel:
+    kernel, _, _ = _c_active_kernel(name)
+    kernel.advance(
+        _book(
+            Venue.RISEX,
+            received=2_900_000_000,
+            revision=6,
+            bids=(("99", "10"),),
+            asks=(("105", "10"),),
+        )
+    )
+    kernel.advance(
+        _book(
+            Venue.LIGHTER,
+            received=2_900_000_000,
+            revision=6,
+            bids=(("101", "10"),),
+            asks=(("102", "10"),),
+        )
+    )
+    kernel.advance_clock(3_000_000_000)
+    kernel.advance_clock(3_500_000_000)
+    kernel.advance(
+        _book(
+            Venue.RISEX,
+            received=3_900_000_000,
+            revision=7,
+            bids=(("99", "10"),),
+            asks=(("105", "10"),),
+        )
+    )
+    kernel.advance(
+        _book(
+            Venue.LIGHTER,
+            received=3_900_000_000,
+            revision=7,
+            bids=(("101", "10"),),
+            asks=(("102", "10"),),
+        )
+    )
+    kernel.advance_clock(4_000_000_000)
+    return kernel
+
+
 def test_s1b_c_initial_exit_is_causal_and_closes_flat_with_exact_ledger() -> None:
     kernel, exit_activation_ns, _ = _c_active_kernel("c-initial")
     cycle = kernel._cycle(CycleScenario.PRIMARY)
@@ -3806,6 +3850,283 @@ def test_s1b_c_late_old_quote_fill_reconciles_completed_cancel_quantity() -> Non
     assert cancel.remaining_quantity == D("0")
     assert len(cycle.exit_fills) == 1
     assert cycle.phase.value == "EXIT_REPRICE_WAIT"
+
+
+def test_s1b_c_late_old_fill_after_replacement_commit_is_unknown_without_amendment() -> None:
+    kernel = _c_replacement_kernel("c-old-after-commit")
+    before = kernel.snapshot()
+    assert before is not None
+    late = _trade(
+        "c-old-after-replacement-commit",
+        received=3_200_000_000,
+        normalized=4_100_000_000,
+        quantity=".10",
+        price="99",
+        aggressor=Side.SELL,
+    )
+
+    kernel.advance(late)
+    result = kernel.snapshot()
+    assert result is not None
+    assert result.status is CycleTerminalState.UNRESOLVED
+    assert "EXIT_CAUSAL_UNCERTAINTY" in result.reason_codes
+    assert "LATE_OLDER_EVENT" in result.reason_codes
+    assert result.exit_versions[0]["observed_quantity"] == D("0")
+    assert result.exit_versions[1]["target_quantity"] == D(".20")
+    assert result.exit_versions[1]["remaining_quantity"] == D(".20")
+    replacement_maker = next(
+        action for action in result.actions if action.action_id == "exit-maker:1"
+    )
+    assert replacement_maker.requested_quantity == D(".20")
+    assert replacement_maker.executed_quantity == D("0")
+    assert result.exit_versions[0]["decisions"][-1]["classification"] == "UNCERTAIN"
+    assert (
+        result.exit_versions[0]["decisions"][-1]["reason"]
+        == "LATE_EXIT_FILL_AFTER_REPLACEMENT_COMMIT"
+    )
+    assert result.exit_versions[1]["target_quantity"] == before.exit_versions[1]["target_quantity"]
+
+
+def test_s1b_c_old_quote_fill_before_replacement_decision_remains_valid() -> None:
+    kernel, _, _ = _c_active_kernel("c-old-before-decision")
+    kernel.advance(
+        _trade(
+            "c-old-before-replacement-decision",
+            received=2_800_000_000,
+            normalized=2_800_000_000,
+            quantity=".10",
+            price="99",
+            aggressor=Side.SELL,
+        )
+    )
+    kernel.advance(
+        _book(
+            Venue.RISEX,
+            received=2_900_000_000,
+            revision=6,
+            bids=(("99", "10"),),
+            asks=(("105", "10"),),
+        )
+    )
+    kernel.advance(
+        _book(
+            Venue.LIGHTER,
+            received=2_900_000_000,
+            revision=6,
+            bids=(("101", "10"),),
+            asks=(("102", "10"),),
+        )
+    )
+    result = kernel.snapshot()
+    assert result is not None
+    assert result.status is CycleTerminalState.PENDING
+    assert len(result.exit_versions) == 1
+    assert result.exit_versions[0]["observed_quantity"] == D(".10")
+    assert result.exit_versions[0]["decisions"][-1]["classification"] == "FILL"
+    assert result.exit_versions[0]["decisions"][-1]["reason"] in {
+        "ELIGIBLE_TRADE",
+        "ELIGIBLE_TOUCH_ZERO_QUEUE",
+    }
+    assert all(
+        item["outcome"] == "INITIAL_CANDIDATE"
+        for item in result.exit_repricing
+    )
+
+
+def test_s1b_c_late_old_fill_after_replacement_activation_is_unknown_without_amendment() -> None:
+    kernel = _c_replacement_kernel("c-old-after-activation")
+    kernel.advance(
+        _book(
+            Venue.RISEX,
+            received=4_400_000_000,
+            revision=8,
+            bids=(("99", "10"),),
+            asks=(("105", "10"),),
+        )
+    )
+    kernel.advance(
+        _book(
+            Venue.LIGHTER,
+            received=4_400_000_000,
+            revision=8,
+            bids=(("101", "10"),),
+            asks=(("102", "10"),),
+        )
+    )
+    kernel.advance_clock(4_500_000_000)
+    cycle = kernel._cycle(CycleScenario.PRIMARY)
+    assert cycle is not None and cycle.active_exit_version is not None
+    replacement = cycle.active_exit_version
+    assert replacement.activation_checked
+    assert replacement.activation_post_only is True
+
+    kernel.advance(
+        _trade(
+            "c-old-after-replacement-activation",
+            received=3_200_000_000,
+            normalized=4_700_000_000,
+            quantity=".10",
+            price="99",
+            aggressor=Side.SELL,
+        )
+    )
+    result = kernel.snapshot()
+    assert result is not None
+    assert result.status is CycleTerminalState.UNRESOLVED
+    assert "EXIT_CAUSAL_UNCERTAINTY" in result.reason_codes
+    assert result.exit_versions[1]["target_quantity"] == D(".20")
+    assert result.exit_versions[1]["remaining_quantity"] == D(".20")
+    replacement_maker = next(
+        action for action in result.actions if action.action_id == "exit-maker:1"
+    )
+    assert replacement_maker.requested_quantity == D(".20")
+
+
+def test_s1b_c_historical_exit_gap_blocks_old_working_version_after_reprice() -> None:
+    kernel = _c_replacement_kernel("c-historical-exit-gap")
+    cycle = kernel._cycle(CycleScenario.PRIMARY)
+    assert cycle is not None
+    old = cycle.exit_versions[0]
+    gap = DataGapEvidence(
+        source_venue=Venue.RISEX,
+        canonical_market="BTC",
+        stream_session_id=old.quote.stream_session_id,
+        recovery_generation=old.quote.recovery_generation,
+        gap_start_monotonic_ns=3_100_000_000,
+        gap_end_monotonic_ns=3_400_000_000,
+        reason="C_HISTORICAL_EXIT_GAP",
+    )
+
+    kernel.advance(
+        CausalEvent.from_gap(
+            gap,
+            ingress_received_monotonic_ns=4_100_000_000,
+        )
+    )
+    result = kernel.snapshot()
+    assert result is not None
+    assert result.status is CycleTerminalState.UNRESOLVED
+    assert "REQUIRED_ACTION_DATA_GAP" in result.reason_codes
+    assert result.exit_versions[0]["cancel_effective_ns"] == 3_500_000_000
+    assert result.exit_versions[1]["activation_ns"] == 4_500_000_000
+
+
+def test_s1b_c_initial_offgrid_exit_counts_toward_one_hz_reprice_limit() -> None:
+    version, source_books = _version("c-initial-offgrid-rate", decision_ready=0)
+    kernel = Scv1S1bKernel(
+        fill_model=CycleFillModel.TOUCH_ALLOWED,
+        exit_variant=S1bExitVariant.C_BE_REPRICE_V1,
+    )
+    assert kernel.admit(version, source_books=source_books).accepted
+    kernel.advance(
+        _book(
+            Venue.RISEX,
+            received=400_000_000,
+            revision=2,
+            bids=(("99", "10"),),
+            asks=(("102", "10"),),
+        )
+    )
+    kernel.advance_clock(500_000_000)
+    cycle = kernel._cycle(CycleScenario.PRIMARY)
+    assert cycle is not None and cycle.active_entry_version is not None
+    kernel.advance(
+        _entry_trade(
+            "c-initial-offgrid-rate-entry",
+            1_100_000_000,
+            ".20",
+            price=str(cycle.active_entry_version.quote.price),
+        )
+    )
+    for venue in (Venue.RISEX, Venue.LIGHTER):
+        kernel.advance(
+            _book(
+                venue,
+                received=1_500_000_000,
+                revision=3,
+                bids=(("99", "10"),),
+                asks=(("102", "10"),) if venue is Venue.RISEX else (("100", "10"),),
+            )
+        )
+    kernel.advance_clock(1_600_000_000)
+    for venue in (Venue.RISEX, Venue.LIGHTER):
+        kernel.advance(
+            _book(
+                venue,
+                received=2_000_000_000,
+                revision=4,
+                bids=(("99", "10"),),
+                asks=(("102", "10"),) if venue is Venue.RISEX else (("100", "10"),),
+            )
+        )
+    kernel.advance_clock(2_100_000_000)
+    for venue in (Venue.RISEX, Venue.LIGHTER):
+        kernel.advance(
+            _book(
+                venue,
+                received=2_500_000_000,
+                revision=5,
+                bids=(("99", "10"),),
+                asks=(("102", "10"),) if venue is Venue.RISEX else (("100", "10"),),
+            )
+        )
+    kernel.advance_clock(2_600_000_000)
+    cycle = kernel._cycle(CycleScenario.PRIMARY)
+    assert cycle is not None and cycle.active_exit_version is not None
+    initial = cycle.active_exit_version
+    assert initial.quote.decision_ready_monotonic_ns == 2_100_000_000
+
+    kernel.advance(
+        _book(
+            Venue.RISEX,
+            received=2_900_000_000,
+            revision=6,
+            bids=(("99", "10"),),
+            asks=(("105", "10"),),
+        )
+    )
+    kernel.advance(
+        _book(
+            Venue.LIGHTER,
+            received=2_900_000_000,
+            revision=6,
+            bids=(("101", "10"),),
+            asks=(("102", "10"),),
+        )
+    )
+    kernel.advance_clock(3_000_000_000)
+    cycle = kernel._cycle(CycleScenario.PRIMARY)
+    assert cycle is not None
+    assert cycle.active_exit_version is initial
+    assert initial.cancel_requested_ns is None
+    assert cycle.exit_reprice_decisions[-1]["reason"] == CycleReason.DECISION_RATE_LIMIT.value
+    decision_count = len(cycle.exit_reprice_decisions)
+
+    kernel.advance_clock(3_000_000_000)
+    assert len(cycle.exit_reprice_decisions) == decision_count
+
+    kernel.advance(
+        _book(
+            Venue.RISEX,
+            received=3_900_000_000,
+            revision=7,
+            bids=(("99", "10"),),
+            asks=(("105", "10"),),
+        )
+    )
+    kernel.advance(
+        _book(
+            Venue.LIGHTER,
+            received=3_900_000_000,
+            revision=7,
+            bids=(("101", "10"),),
+            asks=(("102", "10"),),
+        )
+    )
+    kernel.advance_clock(4_000_000_000)
+    assert cycle.active_exit_version is initial
+    assert initial.cancel_requested_ns == 4_000_000_000
+    assert cycle.exit_reprice_pending
 
 
 def test_s1b_c_stale_books_retain_existing_quote_without_reprice_cancel() -> None:

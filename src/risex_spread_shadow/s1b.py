@@ -1659,6 +1659,11 @@ class Scv1S1bKernel(CycleKernel):
             )
         sequence = cycle.exit_version_serial
         cycle.exit_version_serial += 1
+        if cycle.exit_reprice_last_decision_ns is None:
+            # Initial placement, including a baseline fallback off the
+            # collection grid, is still a price decision for C's one-Hz
+            # spacing rule.
+            cycle.exit_reprice_last_decision_ns = decision_ns
         suffix = "" if sequence == 0 else f":{sequence}"
         maker_action_id = "exit-maker" if sequence == 0 else f"exit-maker:{sequence}"
         cancel_action_id = "exit-cancel" if sequence == 0 else f"exit-cancel:{sequence}"
@@ -1724,36 +1729,36 @@ class Scv1S1bKernel(CycleKernel):
         self,
         cycle: _S1bCycle,
         version: _S1bExitVersion,
-        quantity: Decimal,
+        event: CausalEvent,
     ) -> bool:
-        """Make a delayed old-version fill safe before a later quote can fill."""
+        """Keep a committed replacement immutable when an old fill arrives late."""
 
         active = cycle.active_exit_version
         if active is None or active is version:
             return True
-        # A replacement was only allowed to activate after the old cancel was
-        # effective.  If a causally older fill is first processed after that
-        # replacement has itself activated or filled, the two obligations can
-        # no longer be reconciled without inventing a quantity.  Preserve the
-        # observed uncertainty rather than allowing an over-close.
-        if active.activation_checked or active.observed_quantity > _ZERO:
-            cycle.add_reason(CycleReason.EXIT_CAUSAL_UNCERTAINTY)
-            self._halt(cycle, CycleReason.EXIT_CAUSAL_UNCERTAINTY)
-            return False
-        if active.remaining_quantity < quantity:
-            cycle.add_reason(CycleReason.EXIT_CAUSAL_UNCERTAINTY)
-            self._halt(cycle, CycleReason.EXIT_CAUSAL_UNCERTAINTY)
-            return False
-        active.target_quantity -= quantity
-        active.remaining_quantity -= quantity
-        action = _s1b_action(cycle, active.maker_action_id)
-        action.requested_quantity = active.target_quantity
-        if active.remaining_quantity <= _ZERO:
-            action.status = CycleActionStatus.COMPLETED
-            action.executed_quantity = active.target_quantity
-            action.reason = "EXIT_MAKER_FILLED"
-        self._s1b_c_sync_active_exit(cycle)
-        return True
+        # The replacement's quote, target, and action were already committed
+        # at its decision boundary.  A causally older fill cannot amend that
+        # obligation after the fact without inventing a new cancellation or
+        # silently changing the requested quantity.  Preserve both version
+        # descriptors and stop with an explicit UNKNOWN outcome.
+        uncertainty = CausalUncertainty.LATE_OLDER_EVENT.value
+        if uncertainty not in version.uncertainty:
+            version.uncertainty.append(uncertainty)
+        if uncertainty not in cycle.exit_uncertainty:
+            cycle.exit_uncertainty.append(uncertainty)
+        decision = CausalEventDecision(
+            event.kind,
+            event.event_id,
+            event.ingress_received_monotonic_ns,
+            "UNCERTAIN",
+            "LATE_EXIT_FILL_AFTER_REPLACEMENT_COMMIT",
+        )
+        version.decisions.append(decision)
+        cycle.exit_decisions.append(decision)
+        cycle.add_reason(CycleReason.EXIT_CAUSAL_UNCERTAINTY)
+        cycle.add_reason(CycleReason.LATE_OLDER_EVENT)
+        self._halt(cycle, CycleReason.EXIT_CAUSAL_UNCERTAINTY)
+        return False
 
     @staticmethod
     def _s1b_c_reconcile_cancel_after_late_fill(
@@ -2654,7 +2659,7 @@ class Scv1S1bKernel(CycleKernel):
         if consumed <= _ZERO:
             cycle.add_reason(CycleReason.OVER_CLOSE_BLOCKED)
             return
-        if not self._s1b_c_reconcile_late_fill(cycle, version, consumed):
+        if not self._s1b_c_reconcile_late_fill(cycle, version, event):
             return
         version.remaining_quantity -= consumed
         version.observed_quantity += consumed
@@ -2962,8 +2967,6 @@ class Scv1S1bKernel(CycleKernel):
             self._run_due_until(cycle, ready)
 
     def _gap_overlaps_s1b(self, cycle: _S1bCycle, gap: DataGapEvidence) -> bool:
-        if not self._s1b_gap_matches_cycle(cycle, gap):
-            return False
         entry_phase = cycle.phase in {
             _S1bPhase.ENTRY_WAIT,
             _S1bPhase.ENTRY_ACTIVE,
@@ -2973,6 +2976,8 @@ class Scv1S1bKernel(CycleKernel):
             _S1bPhase.UNMATCHED_WAIT,
         }
         if entry_phase:
+            if not self._s1b_gap_matches_cycle(cycle, gap):
+                return False
             start = min((item.activation_ns for item in cycle.entry_versions), default=cycle.current_ns)
         elif cycle.phase in {
             _S1bPhase.EXIT_WAIT,
@@ -2982,6 +2987,37 @@ class Scv1S1bKernel(CycleKernel):
             _S1bPhase.CLOSE_WAIT,
             _S1bPhase.FORCE_WAIT,
         }:
+            if (
+                self.exit_variant is S1bExitVariant.C_BE_REPRICE_V1
+                and cycle.exit_versions
+                and gap.source_venue is Venue.RISEX
+            ):
+                # C has multiple immutable maker windows.  A replacement
+                # cannot erase an older version's exposure interval: check
+                # every version using its own source binding and cancel
+                # boundary before falling back to the current-cycle logic.
+                for version in cycle.exit_versions:
+                    if not gap.matches(
+                        Venue.RISEX,
+                        version.quote.canonical_market,
+                        version.quote.stream_session_id,
+                        version.quote.recovery_generation,
+                    ):
+                        continue
+                    start = version.activation_ns
+                    if start > cycle.current_ns:
+                        if gap.overlaps(start, start):
+                            return True
+                        continue
+                    end = version.cancel_effective_ns or max(
+                        cycle.current_ns,
+                        cycle.max_hold_deadline_ns or cycle.current_ns,
+                    )
+                    if end >= start and gap.overlaps(start, end):
+                        return True
+                return False
+            if not self._s1b_gap_matches_cycle(cycle, gap):
+                return False
             start = cycle.exit_activation_ns or cycle.current_ns
         else:
             return False
@@ -3931,6 +3967,33 @@ class Scv1S1bKernel(CycleKernel):
         if not self._s1b_c_decision_on_grid(cycle, at_ns):
             return
         if cycle.exit_reprice_last_decision_ns == at_ns:
+            return
+        previous_decision_ns = cycle.exit_reprice_last_decision_ns
+        if (
+            previous_decision_ns is not None
+            and at_ns - previous_decision_ns < _D1_DECISION_INTERVAL_NS
+        ):
+            # A grid boundary may be less than one second after an off-grid
+            # initial placement.  Record the rejected boundary and count it
+            # for same-time idempotence, while retaining the committed quote.
+            cycle.exit_reprice_last_decision_ns = at_ns
+            cycle.add_reason(CycleReason.DECISION_RATE_LIMIT)
+            self._s1b_c_record_decision(
+                cycle,
+                at_ns,
+                "RETAINED",
+                CycleReason.DECISION_RATE_LIMIT,
+                detail=(
+                    "C_DECISION_SPACING_NS="
+                    f"{at_ns - previous_decision_ns}"
+                ),
+                quote=(
+                    None
+                    if cycle.active_exit_version is None
+                    else cycle.active_exit_version.quote
+                ),
+                old_version=cycle.active_exit_version,
+            )
             return
         cycle.exit_reprice_last_decision_ns = at_ns
         candidate, reason, detail = self._s1b_c_exit_quote_candidate(cycle, at_ns)
