@@ -1,5 +1,9 @@
 # Current status
 
+## Owner-requested independent audit handoff — 2026-09-09
+
+Owner requests a new Chief session to independently test the completed system and deliver auditor-ready evidence for the next economic decision. NEXT_TASK is now the finite audit contract, including one isolated full suite with raw logs and one independently bound replay of the same saved pilot. Prior economic conclusions remain claims to independently verify. No new collection/policy/production redesign authorized. Predecessor01a0820e-d972-7a33-a4dc-ab6ab9e0a3d6 prepares durable handoff and ceases writes after dispatch; successor must verify predecessor completion before becoming sole Chief. Final-run and earlier stopped-run process IDs are absent; no calculation transfers. Full handoff: independent-audit-handoff-20260909/handoff.json under the existing owner-only evidence root.
+
 ## Saved-pilot economic checkpoint COMPLETE — 2026-09-09
 
 Fresh evaluation-linear-final-20260909/pilot-run completed from clean source3be87b65ddd0a1d9e59f50704edf90ef623ad496 with child exit0, durable COMPLETE and authoritative read. All four alternatives contain764starts/317eligible each, original immutable pilot hash unchanged. Chief independently verified860 fill records, exact positions/cash/fees/fixed stress costs and zero-inventory closure. No prefix stitching. Report and hash-bound acceptance: evaluation-linear-final-20260909/{economic-report.md,chief-final-acceptance.json}; detailed ledger summaries remain owner-only.
