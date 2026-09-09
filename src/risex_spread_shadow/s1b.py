@@ -210,6 +210,13 @@ def _joint_operation_step(left: Decimal, right: Decimal) -> Decimal | None:
     return Decimal(common_units).scaleb(-scale)
 
 
+class S1bExitVariant(StrEnum):
+    """Explicit offline exit behavior selected by the caller."""
+
+    A_B_FIXED_EXIT = "A_B_FIXED_EXIT"
+    C_BE_REPRICE_V1 = "C_BE_REPRICE_V1"
+
+
 class _S1bPhase(StrEnum):
     ENTRY_WAIT = "ENTRY_WAIT"
     ENTRY_ACTIVE = "ENTRY_ACTIVE"
@@ -220,6 +227,7 @@ class _S1bPhase(StrEnum):
     EXIT_WAIT = "EXIT_WAIT"
     EXIT_ACTIVE = "EXIT_ACTIVE"
     EXIT_CANCEL_WAIT = "EXIT_CANCEL_WAIT"
+    EXIT_REPRICE_WAIT = "EXIT_REPRICE_WAIT"
     CLOSE_WAIT = "CLOSE_WAIT"
     FORCE_WAIT = "FORCE_WAIT"
     COMPLETE = "COMPLETE"
@@ -251,6 +259,9 @@ class S1bCycleResult(CycleResult):
     marked_lighter_book_received_monotonic_ns: int | None = None
     simulation_active_duration_ns: int | None = None
     blocked_duration_ns: int | None = None
+    exit_variant: str = "A_B_FIXED_EXIT"
+    exit_versions: tuple[Mapping[str, Any], ...] = ()
+    exit_repricing: tuple[Mapping[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         # ``super()`` without arguments is not reliable in a slotted
@@ -315,6 +326,12 @@ class S1bCycleResult(CycleResult):
         ):
             if value is not None and (not isinstance(value, str) or not value):
                 raise ValueError(f"{name} must be a non-empty string or None")
+        if not isinstance(self.exit_variant, str) or not self.exit_variant:
+            raise ValueError("exit_variant must be a non-empty string")
+        if not isinstance(self.exit_versions, tuple):
+            raise TypeError("exit_versions must be a tuple")
+        if not isinstance(self.exit_repricing, tuple):
+            raise TypeError("exit_repricing must be a tuple")
 
     @property
     def q_cap_quantity(self) -> Decimal:
@@ -373,6 +390,25 @@ class _S1bEntryVersion:
 
 
 @dataclass(slots=True)
+class _S1bExitVersion:
+    quote: CausalRestingQuote
+    sequence: int
+    target_quantity: Decimal
+    activation_ns: int
+    maker_action_id: str
+    cancel_action_id: str
+    cancel_requested_ns: int | None = None
+    cancel_effective_ns: int | None = None
+    observed_quantity: Decimal = _ZERO
+    remaining_quantity: Decimal = _ZERO
+    fills: list[CausalFill] = field(default_factory=list)
+    decisions: list[CausalEventDecision] = field(default_factory=list)
+    uncertainty: list[str] = field(default_factory=list)
+    activation_checked: bool = False
+    activation_post_only: bool | None = None
+
+
+@dataclass(slots=True)
 class _S1bCycle:
     initial_quote_version: QuoteVersion
     quote_version: QuoteVersion
@@ -407,6 +443,13 @@ class _S1bCycle:
     exit_fills: list[CausalFill] = field(default_factory=list)
     exit_decisions: list[CausalEventDecision] = field(default_factory=list)
     exit_uncertainty: list[str] = field(default_factory=list)
+    exit_versions: list[_S1bExitVersion] = field(default_factory=list)
+    active_exit_version: _S1bExitVersion | None = None
+    exit_version_serial: int = 0
+    exit_reprice_pending: bool = False
+    exit_reprice_requested_ns: int | None = None
+    exit_reprice_last_decision_ns: int | None = None
+    exit_reprice_decisions: list[dict[str, Any]] = field(default_factory=list)
     fills: list[CycleFill] = field(default_factory=list)
     fees: list[Any] = field(default_factory=list)
     cashflows: list[Any] = field(default_factory=list)
@@ -733,13 +776,20 @@ class Scv1S1bKernel(CycleKernel):
         *,
         terminal_retention_capacity: int = 64,
         fill_model: CycleFillModel | str,
+        exit_variant: S1bExitVariant | str = S1bExitVariant.A_B_FIXED_EXIT,
     ) -> None:
         model = fill_model if isinstance(fill_model, CycleFillModel) else CycleFillModel(fill_model)
+        variant = (
+            exit_variant
+            if isinstance(exit_variant, S1bExitVariant)
+            else S1bExitVariant(exit_variant)
+        )
         super().__init__(
             policy,
             terminal_retention_capacity=terminal_retention_capacity,
             fill_model=model,
         )
+        self.exit_variant = variant
 
     @staticmethod
     def _scenario(value: CycleScenario) -> CycleScenario:
@@ -955,6 +1005,7 @@ class Scv1S1bKernel(CycleKernel):
             marked_execution_only_pnl_usd=_ZERO,
             observation_end_monotonic_ns=version.decision_ready_monotonic_ns,
             fill_model=self.fill_model,
+            exit_variant=self.exit_variant.value,
         )
         return result
 
@@ -1307,6 +1358,8 @@ class Scv1S1bKernel(CycleKernel):
         return True
 
     def _s1b_exit_candidate(self, cycle: _S1bCycle, event: CausalEvent) -> bool:
+        if self.exit_variant is S1bExitVariant.C_BE_REPRICE_V1:
+            return self._s1b_c_exit_candidate(cycle, event)
         trade = event.trade
         quote = cycle.exit_quote
         if trade is None or quote is None or event.venue is not Venue.RISEX:
@@ -1327,7 +1380,425 @@ class Scv1S1bKernel(CycleKernel):
         crosses, ambiguous = _trade_crosses(quote, trade)
         return crosses or ambiguous
 
+    def _s1b_c_exit_version_window_for(
+        self,
+        cycle: _S1bCycle,
+        event: CausalEvent,
+    ) -> _S1bExitVersion | None:
+        if event.trade is None or event.venue is not Venue.RISEX:
+            return None
+        matches: list[_S1bExitVersion] = []
+        for version in cycle.exit_versions:
+            cutoff = version.cancel_effective_ns or (
+                version.cancel_requested_ns + cycle.delays.cancel_delay_ns
+                if version.cancel_requested_ns is not None
+                else _MAX_TIME
+            )
+            if (
+                version.remaining_quantity > _ZERO
+                and version.activation_ns <= event.causal_monotonic_ns < cutoff
+            ):
+                matches.append(version)
+        return matches[-1] if matches else None
+
+    def _s1b_c_exit_candidate(self, cycle: _S1bCycle, event: CausalEvent) -> bool:
+        trade = event.trade
+        version = self._s1b_c_exit_version_window_for(cycle, event)
+        if trade is None or version is None:
+            return False
+        if not version.activation_checked or version.activation_post_only is not True:
+            return False
+        if trade.aggressor_side is not Side.SELL:
+            return False
+        crosses, ambiguous = _trade_crosses(version.quote, trade)
+        return crosses or ambiguous
+
+    def _s1b_ensure_c_exit_activation(
+        self,
+        cycle: _S1bCycle,
+        version: _S1bExitVersion,
+        at_ns: int,
+    ) -> bool:
+        if at_ns < version.activation_ns:
+            return True
+        if version.activation_checked:
+            self._s1b_c_sync_active_exit(cycle)
+            return version.activation_post_only is True
+        version.activation_checked = True
+        post_only = self._activation_post_only_s1b(cycle, version.quote, version.activation_ns)
+        version.activation_post_only = post_only
+        if cycle.active_exit_version is version:
+            self._s1b_c_sync_active_exit(cycle)
+        if post_only is None:
+            cycle.add_reason(CycleReason.POST_ONLY_ELIGIBILITY_UNKNOWN)
+            version.uncertainty.append(CausalUncertainty.MISSING_CAUSAL_TIMING.value)
+            cycle.exit_uncertainty.append(CausalUncertainty.MISSING_CAUSAL_TIMING.value)
+            self._halt(cycle, CycleReason.POST_ONLY_ELIGIBILITY_UNKNOWN)
+            return False
+        if not post_only:
+            cycle.add_reason(CycleReason.EXIT_QUOTE_INVALID)
+            version.decisions.append(
+                CausalEventDecision(
+                    CausalEventKind.BOOK,
+                    version.quote.source_book_revision_id or version.quote.quote_id,
+                    (
+                        None
+                        if version.quote.source_book is None
+                        else version.quote.source_book.ingress_received_monotonic_ns
+                    ),
+                    "IGNORED",
+                    "POST_ONLY_CROSSING",
+                )
+            )
+            return False
+        return True
+
+    @staticmethod
+    def _s1b_c_balanced_quantity(cycle: _S1bCycle) -> tuple[Decimal | None, str | None]:
+        if cycle.unresolved or cycle.policy_blocked:
+            return None, "UNRESOLVED_EXECUTION"
+        if cycle.unmatched_entry_quantity > _ZERO:
+            return None, "UNMATCHED_RESIDUE"
+        if _s1b_pending_actions(cycle, CycleActionKind.ENTRY_HEDGE):
+            return None, "PENDING_ENTRY_HEDGE"
+        if _s1b_pending_actions(cycle, CycleActionKind.EXIT_HEDGE_CLOSE):
+            return None, "PENDING_EXIT_CLOSE"
+        if cycle.paired_risex_quantity <= _ZERO or cycle.paired_lighter_quantity <= _ZERO:
+            return None, "NO_POSITIVE_PAIR"
+        if cycle.paired_risex_quantity != cycle.paired_lighter_quantity:
+            return None, "PAIRED_QUANTITY_MISMATCH"
+        quantity = cycle.paired_risex_quantity
+        if (
+            cycle.risex_signed_quantity != -quantity
+            or cycle.lighter_signed_quantity != quantity
+        ):
+            return None, "SIGNED_POSITION_MISMATCH"
+        if cycle.exit_remaining_quantity > _ZERO and cycle.exit_remaining_quantity != quantity:
+            return None, "EXIT_REMAINDER_MISMATCH"
+        for venue in (Venue.RISEX, Venue.LIGHTER):
+            step = _venue_quantity_step(cycle, venue)
+            if step is None:
+                return None, f"{venue.value}_GRID_MISSING"
+            if quantity % step != _ZERO:
+                return None, f"{venue.value}_GRID_RESIDUE"
+        return quantity, None
+
+    def _s1b_c_exit_quote_candidate(
+        self,
+        cycle: _S1bCycle,
+        decision_ns: int,
+        *,
+        sequence: int | None = None,
+    ) -> tuple[CausalRestingQuote | None, CycleReason | None, str | None]:
+        quantity, domain_reason = self._s1b_c_balanced_quantity(cycle)
+        if quantity is None:
+            return None, CycleReason.C_OUTSIDE_BALANCED_DOMAIN, domain_reason
+        risex_book, lighter_book, pair_reason = _paired_books(cycle, decision_ns)
+        if pair_reason is not None or risex_book is None or lighter_book is None:
+            return None, pair_reason or CycleReason.REQUIRED_ACTION_DATA_MISSING, "PAIRED_BOOK_UNAVAILABLE"
+        signature = _s1b_close_book_signature(lighter_book)
+        consumed = (
+            cycle.exit_close_consumed_quantity
+            if cycle.exit_close_consumed_book_signature == signature
+            else _ZERO
+        )
+        lighter_levels = _s1b_levels_after_consumed(lighter_book.bids, consumed)
+        if not lighter_levels:
+            return None, CycleReason.C_REPRICE_INVALID, "LIGHTER_SELL_DEPTH_EMPTY"
+        lighter_vwap: ExactVwap = exact_quantity_vwap(
+            Side.SELL,
+            quantity,
+            tuple(lighter_levels),
+            tuple(lighter_book.asks),
+        )
+        if not lighter_vwap.is_executable or lighter_vwap.price is None:
+            return None, CycleReason.C_REPRICE_INVALID, "LIGHTER_SELL_NOT_EXECUTABLE"
+        if not _minimum_ok_with_notional(
+            cycle,
+            Venue.LIGHTER,
+            quantity,
+            lighter_vwap.price,
+            notional_usd=lighter_vwap.notional_usd,
+        ):
+            return None, CycleReason.C_REPRICE_INVALID, "LIGHTER_MINIMUM"
+        tick = cycle.quote_version.quote.risex_tick_size
+        risex_best_ask = risex_book.asks[0].canonical_price if risex_book.asks else None
+        if tick is None or risex_best_ask is None:
+            return None, CycleReason.C_REPRICE_INVALID, "RISEX_TICK_OR_ASK_MISSING"
+        cap = risex_best_ask - tick
+        if cap <= _ZERO:
+            return None, CycleReason.C_REPRICE_INVALID, "POST_ONLY_PRICE_CAP_NON_POSITIVE"
+        stress = cycle.delays.risex_fill_cost_rate
+        numerator = cycle_net_cashflow(cycle) + lighter_vwap.notional_usd * (
+            _ONE - cycle.policy.lighter_taker_fee_rate
+        )
+        denominator = quantity * (_ONE + cycle.policy.risex_maker_fee_rate + stress)
+        if denominator <= _ZERO or not denominator.is_finite():
+            return None, CycleReason.C_REPRICE_INVALID, "BREAK_EVEN_DENOMINATOR_INVALID"
+        raw = numerator / denominator
+        if not raw.is_finite():
+            return None, CycleReason.C_REPRICE_INVALID, "BREAK_EVEN_PRICE_NON_FINITE"
+        maker_price = min((raw / tick).to_integral_value(rounding=ROUND_FLOOR) * tick, cap)
+        if maker_price <= _ZERO:
+            return None, CycleReason.C_REPRICE_INVALID, "BREAK_EVEN_PRICE_NON_POSITIVE"
+        if not _minimum_ok_with_notional(
+            cycle,
+            Venue.RISEX,
+            quantity,
+            maker_price,
+            notional_usd=quantity * maker_price,
+        ):
+            return None, CycleReason.C_REPRICE_INVALID, "RISEX_MINIMUM"
+        serial = cycle.exit_version_serial if sequence is None else sequence
+        suffix = "" if serial == 0 else f":{serial}"
+        return (
+            CausalRestingQuote(
+                quote_id=f"{cycle.initial_quote_version.version_id}:exit{suffix}",
+                quote_version_id=f"{cycle.initial_quote_version.version_id}:exit{suffix}",
+                canonical_market=cycle.quote_version.canonical_market,
+                maker_side=Side.BUY,
+                price=maker_price,
+                quantity=quantity,
+                stream_session_id=cycle.quote_version.stream_session_id,
+                recovery_generation=cycle.quote_version.recovery_generation,
+                decision_ready_monotonic_ns=decision_ns,
+                activation_delay_ns=cycle.delays.activation_delay_ns,
+                cancel_delay_ns=cycle.delays.cancel_delay_ns,
+                cancel_on_first_partial=False,
+                source_book=risex_book,
+                source_book_revision=risex_book.book_revision,
+                source_book_revision_id=risex_book.book_revision_id,
+                source_identity=CausalSourceIdentity.from_book(risex_book),
+                hedge_source_book=lighter_book,
+                hedge_stream_session_id=lighter_book.stream_session_id,
+                hedge_recovery_generation=lighter_book.recovery_generation,
+                hedge_source_book_revision=lighter_book.book_revision,
+                hedge_source_book_revision_id=lighter_book.book_revision_id,
+                tick_size=tick,
+                source_book_freshness_max_age_ns=cycle.policy.input_freshness_max_age_ns,
+            ),
+            None,
+            None,
+        )
+
+    @staticmethod
+    def _s1b_c_record_decision(
+        cycle: _S1bCycle,
+        at_ns: int,
+        outcome: str,
+        reason: CycleReason | str,
+        *,
+        detail: str | None = None,
+        quote: CausalRestingQuote | None = None,
+        old_version: _S1bExitVersion | None = None,
+        new_version_id: str | None = None,
+    ) -> None:
+        value = reason.value if isinstance(reason, CycleReason) else str(reason)
+        item: dict[str, Any] = {
+            "decision_ns": at_ns,
+            "outcome": outcome,
+            "reason": value,
+        }
+        if detail is not None:
+            item["detail"] = detail
+        if quote is not None:
+            source_risex_book_revision_id = quote.source_book_revision_id
+            if source_risex_book_revision_id is None and quote.source_book is not None:
+                source_risex_book_revision_id = quote.source_book.book_revision_id
+            source_lighter_book_revision_id = quote.hedge_source_book_revision_id
+            if source_lighter_book_revision_id is None and quote.hedge_source_book is not None:
+                source_lighter_book_revision_id = quote.hedge_source_book.book_revision_id
+            item.update(
+                {
+                    "price": quote.price,
+                    "quantity": quote.quantity,
+                    "source_risex_book_revision_id": source_risex_book_revision_id,
+                    "source_lighter_book_revision_id": source_lighter_book_revision_id,
+                }
+            )
+        if old_version is not None:
+            item.update(
+                {
+                    "old_version_id": old_version.quote.quote_version,
+                    "old_cancel_action_id": old_version.cancel_action_id,
+                }
+            )
+        if new_version_id is not None:
+            item["new_version_id"] = new_version_id
+        cycle.exit_reprice_decisions.append(item)
+
+    def _s1b_c_register_exit_version(
+        self,
+        cycle: _S1bCycle,
+        quote: CausalRestingQuote,
+        decision_ns: int,
+    ) -> _S1bExitVersion:
+        # The accepted fixed-exit constructor carries the Lighter book object
+        # but predates the explicit hedge revision fields.  C's version
+        # evidence must name both causal book revisions, including when an
+        # off-grid initial placement uses the accepted baseline quote.
+        if quote.hedge_source_book is not None:
+            hedge_book = quote.hedge_source_book
+            quote = replace(
+                quote,
+                hedge_source_book_revision=(
+                    quote.hedge_source_book_revision
+                    if quote.hedge_source_book_revision is not None
+                    else hedge_book.book_revision
+                ),
+                hedge_source_book_revision_id=(
+                    quote.hedge_source_book_revision_id
+                    if quote.hedge_source_book_revision_id is not None
+                    else hedge_book.book_revision_id
+                ),
+                source_book_freshness_max_age_ns=(
+                    quote.source_book_freshness_max_age_ns
+                    if quote.source_book_freshness_max_age_ns is not None
+                    else cycle.policy.input_freshness_max_age_ns
+                ),
+            )
+        sequence = cycle.exit_version_serial
+        cycle.exit_version_serial += 1
+        suffix = "" if sequence == 0 else f":{sequence}"
+        maker_action_id = "exit-maker" if sequence == 0 else f"exit-maker:{sequence}"
+        cancel_action_id = "exit-cancel" if sequence == 0 else f"exit-cancel:{sequence}"
+        version = _S1bExitVersion(
+            quote=quote,
+            sequence=sequence,
+            target_quantity=quote.quantity,
+            activation_ns=decision_ns + cycle.delays.activation_delay_ns,
+            maker_action_id=maker_action_id,
+            cancel_action_id=cancel_action_id,
+            remaining_quantity=quote.quantity,
+        )
+        cycle.exit_versions.append(version)
+        cycle.active_exit_version = version
+        cycle.exit_quote = quote
+        cycle.exit_price = quote.price
+        cycle.exit_activation_ns = version.activation_ns
+        cycle.exit_cancel_requested_ns = None
+        cycle.exit_cancel_effective_ns = None
+        cycle.exit_activation_checked = False
+        cycle.exit_activation_post_only = None
+        cycle.exit_remaining_quantity = version.remaining_quantity
+        cycle.exit_target_quantity = version.target_quantity
+        cycle.exit_reprice_pending = False
+        cycle.exit_reprice_requested_ns = None
+        _add_action(
+            cycle,
+            action_id=maker_action_id,
+            kind=CycleActionKind.EXIT_MAKER,
+            status=CycleActionStatus.PENDING,
+            requested_ns=decision_ns,
+            effective_ns=version.activation_ns,
+            due_ns=cycle.max_hold_deadline_ns,
+            quantity=version.target_quantity,
+            reason="EXIT_RISEX_MAKER_QUOTE",
+        )
+        cycle.phase = _S1bPhase.EXIT_WAIT
+        return version
+
+    def _s1b_c_sync_active_exit(self, cycle: _S1bCycle) -> None:
+        version = cycle.active_exit_version
+        if version is None:
+            cycle.exit_quote = None
+            cycle.exit_activation_ns = None
+            cycle.exit_cancel_requested_ns = None
+            cycle.exit_cancel_effective_ns = None
+            cycle.exit_activation_checked = False
+            cycle.exit_activation_post_only = None
+            cycle.exit_remaining_quantity = max(_ZERO, cycle.paired_risex_quantity)
+            cycle.exit_target_quantity = cycle.exit_remaining_quantity
+            return
+        cycle.exit_quote = version.quote
+        cycle.exit_price = version.quote.price
+        cycle.exit_activation_ns = version.activation_ns
+        cycle.exit_cancel_requested_ns = version.cancel_requested_ns
+        cycle.exit_cancel_effective_ns = version.cancel_effective_ns
+        cycle.exit_activation_checked = version.activation_checked
+        cycle.exit_activation_post_only = version.activation_post_only
+        cycle.exit_remaining_quantity = version.remaining_quantity
+        cycle.exit_target_quantity = version.target_quantity
+
+    def _s1b_c_reconcile_late_fill(
+        self,
+        cycle: _S1bCycle,
+        version: _S1bExitVersion,
+        quantity: Decimal,
+    ) -> bool:
+        """Make a delayed old-version fill safe before a later quote can fill."""
+
+        active = cycle.active_exit_version
+        if active is None or active is version:
+            return True
+        # A replacement was only allowed to activate after the old cancel was
+        # effective.  If a causally older fill is first processed after that
+        # replacement has itself activated or filled, the two obligations can
+        # no longer be reconciled without inventing a quantity.  Preserve the
+        # observed uncertainty rather than allowing an over-close.
+        if active.activation_checked or active.observed_quantity > _ZERO:
+            cycle.add_reason(CycleReason.EXIT_CAUSAL_UNCERTAINTY)
+            self._halt(cycle, CycleReason.EXIT_CAUSAL_UNCERTAINTY)
+            return False
+        if active.remaining_quantity < quantity:
+            cycle.add_reason(CycleReason.EXIT_CAUSAL_UNCERTAINTY)
+            self._halt(cycle, CycleReason.EXIT_CAUSAL_UNCERTAINTY)
+            return False
+        active.target_quantity -= quantity
+        active.remaining_quantity -= quantity
+        action = _s1b_action(cycle, active.maker_action_id)
+        action.requested_quantity = active.target_quantity
+        if active.remaining_quantity <= _ZERO:
+            action.status = CycleActionStatus.COMPLETED
+            action.executed_quantity = active.target_quantity
+            action.reason = "EXIT_MAKER_FILLED"
+        self._s1b_c_sync_active_exit(cycle)
+        return True
+
+    @staticmethod
+    def _s1b_c_reconcile_cancel_after_late_fill(
+        cycle: _S1bCycle,
+        version: _S1bExitVersion,
+        processed_ready_ns: int,
+    ) -> None:
+        """Reconcile an old cancel descriptor after a late causal fill.
+
+        A fill whose causal time precedes cancellation may become ready only
+        after the cancel boundary.  The fill remains valid, but the completed
+        cancel must then expose the version's actual remaining quantity.
+        """
+
+        if version.cancel_effective_ns is None or processed_ready_ns < version.cancel_effective_ns:
+            return
+        cancel = next(
+            (item for item in cycle.actions if item.action_id == version.cancel_action_id),
+            None,
+        )
+        if cancel is None or cancel.status not in {
+            CycleActionStatus.PENDING,
+            CycleActionStatus.COMPLETED,
+        }:
+            return
+        cancel.requested_quantity = version.remaining_quantity
+        reason = (
+            "MAX_HOLD_CANCEL_EFFECTIVE"
+            if cancel.reason.startswith("MAX_HOLD")
+            else "C_REPRICE_CANCEL_EFFECTIVE"
+        )
+        _s1b_set_action(
+            cycle,
+            cancel,
+            status=CycleActionStatus.COMPLETED,
+            executed=version.remaining_quantity,
+            reason=reason,
+        )
+
     def _s1b_ensure_exit_activation(self, cycle: _S1bCycle, at_ns: int) -> bool:
+        if self.exit_variant is S1bExitVariant.C_BE_REPRICE_V1:
+            version = cycle.active_exit_version
+            if version is None:
+                return True
+            return self._s1b_ensure_c_exit_activation(cycle, version, at_ns)
         quote = cycle.exit_quote
         if quote is None or cycle.exit_activation_ns is None:
             return True
@@ -1464,6 +1935,7 @@ class Scv1S1bKernel(CycleKernel):
         if cycle.phase not in {
             _S1bPhase.EXIT_ACTIVE,
             _S1bPhase.EXIT_CANCEL_WAIT,
+            _S1bPhase.EXIT_REPRICE_WAIT,
             _S1bPhase.CLOSE_WAIT,
             _S1bPhase.FORCE_WAIT,
         } or not self._s1b_has_deferred_exit_close(cycle):
@@ -1790,7 +2262,18 @@ class Scv1S1bKernel(CycleKernel):
             self._s1b_pair_formed(cycle, at_ns)
 
     def _s1b_schedule_exit_close(self, cycle: _S1bCycle, requested_ns: int) -> None:
-        maker_closed = cycle.exit_target_quantity - cycle.exit_remaining_quantity
+        if self.exit_variant is S1bExitVariant.C_BE_REPRICE_V1:
+            maker_closed = sum(
+                (
+                    fill.quantity
+                    for fill in cycle.fills
+                    if fill.action_id == "exit-maker"
+                    or fill.action_id.startswith("exit-maker:")
+                ),
+                _ZERO,
+            )
+        else:
+            maker_closed = cycle.exit_target_quantity - cycle.exit_remaining_quantity
         executed_close = sum(
             fill.quantity
             for fill in cycle.fills
@@ -2071,7 +2554,178 @@ class Scv1S1bKernel(CycleKernel):
         if cycle.paired_risex_quantity > 0:
             self._s1b_pair_formed(cycle, ready)
 
+    def _s1b_handle_c_exit_trade(self, cycle: _S1bCycle, event: CausalEvent) -> None:
+        trade = event.trade
+        assert trade is not None
+        version = self._s1b_c_exit_version_window_for(cycle, event)
+        if version is None:
+            cycle.ignored_event_count += 1
+            return
+        quote = version.quote
+        ready = _processing_ready_ns(event)
+        if ready is None:
+            cycle.exit_uncertainty.append(CausalUncertainty.MISSING_CAUSAL_TIMING.value)
+            self._halt(cycle, CycleReason.EXIT_CAUSAL_UNCERTAINTY)
+            return
+        if (
+            event.stream_session_id != quote.stream_session_id
+            or event.recovery_generation != quote.recovery_generation
+        ):
+            cycle.exit_uncertainty.append(CausalUncertainty.RECOVERY_TRANSITION.value)
+            self._halt(cycle, CycleReason.EXIT_CAUSAL_UNCERTAINTY)
+            return
+        if event.causal_monotonic_ns >= version.activation_ns:
+            if not version.activation_checked:
+                if not self._s1b_ensure_c_exit_activation(
+                    cycle,
+                    version,
+                    event.causal_monotonic_ns,
+                ):
+                    if cycle.unresolved:
+                        return
+                    self._s1b_invalidate_exit_at_activation(
+                        cycle,
+                        version.activation_ns,
+                        version=version,
+                    )
+                    return
+            if version.activation_post_only is not True:
+                cycle.ignored_event_count += 1
+                return
+        cutoff = version.cancel_effective_ns or (
+            version.cancel_requested_ns + cycle.delays.cancel_delay_ns
+            if version.cancel_requested_ns is not None
+            else _MAX_TIME
+        )
+        if not version.activation_ns <= event.causal_monotonic_ns < cutoff:
+            cycle.ignored_event_count += 1
+            return
+        if trade.aggressor_side is not Side.SELL:
+            cycle.ignored_event_count += 1
+            decision = CausalEventDecision(
+                event.kind,
+                event.event_id,
+                event.ingress_received_monotonic_ns,
+                "IGNORED",
+                "WRONG_AGGRESSOR_SIDE",
+            )
+            version.decisions.append(decision)
+            cycle.exit_decisions.append(decision)
+            return
+        if not _trade_price_is_tick_aligned(quote, trade):
+            version.uncertainty.append(CausalUncertainty.INVALID_TRADE_PRICE_GRID.value)
+            cycle.exit_uncertainty.append(CausalUncertainty.INVALID_TRADE_PRICE_GRID.value)
+            decision = CausalEventDecision(
+                event.kind,
+                event.event_id,
+                event.ingress_received_monotonic_ns,
+                "UNCERTAIN",
+                CausalUncertainty.INVALID_TRADE_PRICE_GRID.value,
+            )
+            version.decisions.append(decision)
+            cycle.exit_decisions.append(decision)
+            self._halt(cycle, CycleReason.EXIT_CAUSAL_UNCERTAINTY)
+            return
+        crosses, ambiguous = _trade_crosses(quote, trade)
+        if ambiguous:
+            if self.fill_model is CycleFillModel.TOUCH_ALLOWED:
+                crosses = True
+                fill_reason = "ELIGIBLE_TOUCH_ZERO_QUEUE"
+            else:
+                cycle.ignored_event_count += 1
+                decision = CausalEventDecision(
+                    event.kind,
+                    event.event_id,
+                    event.ingress_received_monotonic_ns,
+                    "IGNORED",
+                    "TOUCH_IGNORED_BY_MODEL",
+                )
+                version.decisions.append(decision)
+                cycle.exit_decisions.append(decision)
+                return
+        else:
+            fill_reason = "ELIGIBLE_TRADE"
+        if not crosses or version.remaining_quantity <= _ZERO:
+            cycle.ignored_event_count += 1
+            return
+        identity = event.source_identity
+        assert isinstance(identity, CausalSourceIdentity)
+        consumed = min(trade.canonical_quantity, version.remaining_quantity, cycle.paired_risex_quantity)
+        if consumed <= _ZERO:
+            cycle.add_reason(CycleReason.OVER_CLOSE_BLOCKED)
+            return
+        if not self._s1b_c_reconcile_late_fill(cycle, version, consumed):
+            return
+        version.remaining_quantity -= consumed
+        version.observed_quantity += consumed
+        self._s1b_c_reconcile_cancel_after_late_fill(cycle, version, ready)
+        causal_fill = CausalFill(
+            source_event_id=identity.source_event_id,  # type: ignore[arg-type]
+            source_identity=identity,
+            received_monotonic_ns=event.causal_monotonic_ns,
+            price=quote.price,
+            observed_quantity=trade.canonical_quantity,
+            consumed_quantity=consumed,
+            remaining_quantity=version.remaining_quantity,
+            observed_trade_price=trade.canonical_price,
+            processed_ready_monotonic_ns=ready,
+        )
+        version.fills.append(causal_fill)
+        cycle.exit_fills.append(causal_fill)
+        decision = CausalEventDecision(
+            event.kind,
+            event.event_id,
+            event.ingress_received_monotonic_ns,
+            "FILL",
+            fill_reason,
+            consumed,
+        )
+        version.decisions.append(decision)
+        cycle.exit_decisions.append(decision)
+        exit_action = _s1b_action(cycle, version.maker_action_id)
+        exit_action.executed_quantity = version.observed_quantity
+        exit_action.reason = (
+            "EXIT_MAKER_PARTIAL"
+            if version.remaining_quantity > _ZERO
+            else "EXIT_MAKER_FILLED"
+        )
+        _append_fill(
+            cycle,
+            action_id=version.maker_action_id,
+            venue=Venue.RISEX,
+            side=Side.BUY,
+            role=LiquidityRole.MAKER,
+            quantity=consumed,
+            price=quote.price,
+            reason="EXIT_RISEX_MAKER_FILL",
+            observed_ns=event.causal_monotonic_ns,
+            processing_ns=ready,
+            evidence_id=identity.source_event_id,  # type: ignore[arg-type]
+            source_identity=identity,
+            session=event.stream_session_id,
+            recovery=event.recovery_generation,
+            book_revision_id=None,
+        )
+        cycle.paired_risex_quantity -= consumed
+        if cycle.active_exit_version is version:
+            self._s1b_c_sync_active_exit(cycle)
+        self._s1b_schedule_exit_close(cycle, ready)
+        if version.remaining_quantity == _ZERO:
+            _s1b_set_action(
+                cycle,
+                exit_action,
+                status=CycleActionStatus.COMPLETED,
+                executed=version.target_quantity,
+                reason="EXIT_MAKER_FILLED",
+                evidence_id=identity.source_event_id,
+            )
+            if cycle.active_exit_version is version:
+                cycle.phase = _S1bPhase.CLOSE_WAIT
+
     def _s1b_handle_exit_trade(self, cycle: _S1bCycle, event: CausalEvent) -> None:
+        if self.exit_variant is S1bExitVariant.C_BE_REPRICE_V1:
+            self._s1b_handle_c_exit_trade(cycle, event)
+            return
         trade = event.trade
         assert trade is not None
         quote = cycle.exit_quote
@@ -2201,8 +2855,10 @@ class Scv1S1bKernel(CycleKernel):
             self._s1b_handle_entry_trade(cycle, event)
             return
         if self._s1b_exit_candidate(cycle, event) or cycle.phase in {
+            _S1bPhase.EXIT_WAIT,
             _S1bPhase.EXIT_ACTIVE,
             _S1bPhase.EXIT_CANCEL_WAIT,
+            _S1bPhase.EXIT_REPRICE_WAIT,
         }:
             self._s1b_handle_exit_trade(cycle, event)
             return
@@ -2322,6 +2978,7 @@ class Scv1S1bKernel(CycleKernel):
             _S1bPhase.EXIT_WAIT,
             _S1bPhase.EXIT_ACTIVE,
             _S1bPhase.EXIT_CANCEL_WAIT,
+            _S1bPhase.EXIT_REPRICE_WAIT,
             _S1bPhase.CLOSE_WAIT,
             _S1bPhase.FORCE_WAIT,
         }:
@@ -2478,6 +3135,18 @@ class Scv1S1bKernel(CycleKernel):
                 values.append(cycle.max_hold_deadline_ns)
             if cycle.phase is _S1bPhase.EXIT_CANCEL_WAIT and cycle.exit_cancel_effective_ns is not None:
                 values.append(cycle.exit_cancel_effective_ns)
+            if (
+                cycle.phase is _S1bPhase.EXIT_CANCEL_WAIT
+                and cycle.exit_reprice_pending
+                and cycle.max_hold_deadline_ns is not None
+                and not cycle.deadline_forced
+            ):
+                values.append(cycle.max_hold_deadline_ns)
+            return min(values, default=None)
+        if cycle.phase is _S1bPhase.EXIT_REPRICE_WAIT:
+            values = list(pending)
+            if cycle.max_hold_deadline_ns is not None and not cycle.deadline_forced:
+                values.append(cycle.max_hold_deadline_ns)
             return min(values, default=None)
         if cycle.phase is _S1bPhase.FORCE_WAIT:
             return min(pending, default=None)
@@ -2574,8 +3243,65 @@ class Scv1S1bKernel(CycleKernel):
                 reason="ENTRY_INVALIDATED_NO_ORDER" if invalid else "ENTRY_CANCEL_EFFECTIVE",
             )
 
-    def _s1b_invalidate_exit_at_activation(self, cycle: _S1bCycle, at_ns: int) -> None:
+    def _s1b_invalidate_exit_at_activation(
+        self,
+        cycle: _S1bCycle,
+        at_ns: int,
+        *,
+        version: _S1bExitVersion | None = None,
+    ) -> None:
         """Close an exit quote that failed post-only at its activation boundary."""
+
+        if self.exit_variant is S1bExitVariant.C_BE_REPRICE_V1:
+            invalid_version = version or cycle.active_exit_version
+            if invalid_version is None:
+                self._schedule_forced_remaining(cycle, at_ns)
+                return
+            maker = _s1b_action(cycle, invalid_version.maker_action_id)
+            if maker.status is CycleActionStatus.PENDING:
+                _s1b_set_action(
+                    cycle,
+                    maker,
+                    status=CycleActionStatus.COMPLETED,
+                    executed=invalid_version.observed_quantity,
+                    reason=CycleReason.EXIT_QUOTE_INVALID.value,
+                )
+            cancel = next(
+                (
+                    item
+                    for item in cycle.actions
+                    if item.action_id == invalid_version.cancel_action_id
+                ),
+                None,
+            )
+            if cancel is not None and cancel.status is CycleActionStatus.PENDING:
+                _s1b_set_action(
+                    cycle,
+                    cancel,
+                    status=CycleActionStatus.COMPLETED,
+                    executed=cancel.remaining_quantity,
+                    reason="EXIT_INVALIDATED_NO_ORDER",
+                )
+            invalid_version.cancel_requested_ns = invalid_version.cancel_requested_ns or at_ns
+            invalid_version.cancel_effective_ns = invalid_version.cancel_effective_ns or at_ns
+            invalid_version.remaining_quantity = max(
+                _ZERO,
+                invalid_version.target_quantity - invalid_version.observed_quantity,
+            )
+            if cycle.active_exit_version is invalid_version:
+                cycle.active_exit_version = None
+                self._s1b_c_sync_active_exit(cycle)
+            cycle.add_reason(CycleReason.EXIT_QUOTE_INVALID)
+            self._s1b_c_record_decision(
+                cycle,
+                at_ns,
+                "INVALID",
+                CycleReason.C_REPRICE_INVALID,
+                detail="POST_ONLY_CROSSING_AT_ACTIVATION",
+                quote=invalid_version.quote,
+            )
+            self._schedule_forced_remaining(cycle, at_ns)
+            return
 
         maker = _s1b_action(cycle, "exit-maker")
         observed = cycle.exit_target_quantity - cycle.exit_remaining_quantity
@@ -2612,6 +3338,43 @@ class Scv1S1bKernel(CycleKernel):
     def _s1b_force_exit_deadline(self, cycle: _S1bCycle, at_ns: int) -> None:
         """Start the one immutable completion boundary for an exit maker."""
 
+        if self.exit_variant is S1bExitVariant.C_BE_REPRICE_V1:
+            if cycle.deadline_forced:
+                return
+            cycle.add_reason(CycleReason.MAX_HOLD)
+            cycle.forced_used = True
+            cycle.deadline_forced = True
+            if cycle.exit_reprice_pending:
+                # A re-price cancellation is already in flight.  The
+                # first-fill deadline has priority, but it must not create a
+                # second cancel action or reset the existing effective time.
+                cycle.exit_reprice_pending = False
+                cycle.exit_reprice_requested_ns = None
+                return
+            version = cycle.active_exit_version
+            if version is None:
+                self._schedule_forced_remaining(cycle, at_ns)
+                return
+            if version.cancel_requested_ns is not None:
+                return
+            version.cancel_requested_ns = at_ns
+            version.cancel_effective_ns = at_ns + cycle.delays.cancel_delay_ns
+            cycle.exit_cancel_requested_ns = version.cancel_requested_ns
+            cycle.exit_cancel_effective_ns = version.cancel_effective_ns
+            _add_action(
+                cycle,
+                action_id=version.cancel_action_id,
+                kind=CycleActionKind.EXIT_CANCEL,
+                status=CycleActionStatus.PENDING,
+                requested_ns=at_ns,
+                effective_ns=version.cancel_effective_ns,
+                due_ns=version.cancel_effective_ns,
+                quantity=version.remaining_quantity,
+                reason="MAX_HOLD_CANCEL_REQUESTED",
+            )
+            cycle.phase = _S1bPhase.EXIT_CANCEL_WAIT
+            return
+
         if cycle.exit_cancel_requested_ns is not None:
             return
         cycle.add_reason(CycleReason.MAX_HOLD)
@@ -2631,6 +3394,109 @@ class Scv1S1bKernel(CycleKernel):
             reason="MAX_HOLD_CANCEL_REQUESTED",
         )
         cycle.phase = _S1bPhase.EXIT_CANCEL_WAIT
+
+    def _s1b_c_handle_exit_cancel_boundary(
+        self,
+        cycle: _S1bCycle,
+        at_ns: int,
+    ) -> None:
+        """Resolve one C cancel barrier without forcing a valid re-price."""
+
+        if (
+            cycle.max_hold_deadline_ns is not None
+            and at_ns >= cycle.max_hold_deadline_ns
+            and not cycle.deadline_forced
+        ):
+            self._s1b_force_exit_deadline(cycle, at_ns)
+            if cycle.phase is _S1bPhase.FORCE_WAIT:
+                return
+        version = cycle.active_exit_version
+        if version is not None and version.activation_ns <= at_ns and not version.activation_checked:
+            if not self._s1b_ensure_c_exit_activation(cycle, version, at_ns):
+                if cycle.unresolved:
+                    return
+                self._s1b_invalidate_exit_at_activation(
+                    cycle,
+                    at_ns,
+                    version=version,
+                )
+                return
+        self._s1b_execute_due_exit_closes(cycle, at_ns)
+        if cycle.unresolved or cycle.policy_blocked:
+            return
+        if (
+            version is not None
+            and version.cancel_effective_ns is not None
+            and at_ns >= version.cancel_effective_ns
+        ):
+            cancel = next(
+                (
+                    action
+                    for action in cycle.actions
+                    if action.action_id == version.cancel_action_id
+                ),
+                None,
+            )
+            if cancel is not None:
+                cancel.requested_quantity = version.remaining_quantity
+                _s1b_set_action(
+                    cycle,
+                    cancel,
+                    status=CycleActionStatus.COMPLETED,
+                    executed=version.remaining_quantity,
+                    reason=(
+                        "MAX_HOLD_CANCEL_EFFECTIVE"
+                        if cycle.deadline_forced
+                        else "C_REPRICE_CANCEL_EFFECTIVE"
+                    ),
+                )
+            maker = _s1b_action(cycle, version.maker_action_id)
+            maker.status = CycleActionStatus.COMPLETED
+            maker.executed_quantity = version.observed_quantity
+            maker.reason = (
+                "EXIT_MAKER_CANCELLED_PARTIAL"
+                if version.remaining_quantity > _ZERO
+                else "EXIT_MAKER_FILLED"
+            )
+            if cycle.exit_reprice_pending and not cycle.deadline_forced:
+                cycle.exit_reprice_pending = False
+                cycle.exit_reprice_requested_ns = None
+                cycle.active_exit_version = None
+                self._s1b_c_sync_active_exit(cycle)
+                cycle.phase = _S1bPhase.EXIT_REPRICE_WAIT
+                return
+            cycle.exit_reprice_pending = False
+            cycle.exit_reprice_requested_ns = None
+            cycle.active_exit_version = None
+            self._s1b_c_sync_active_exit(cycle)
+            self._s1b_execute_due_exit_closes(
+                cycle,
+                at_ns,
+                finalize_if_deferred=True,
+            )
+            self._schedule_forced_remaining(cycle, at_ns)
+            return
+        if cycle.deadline_forced and version is None:
+            self._schedule_forced_remaining(cycle, at_ns)
+
+    def _s1b_c_handle_reprice_wait_boundary(
+        self,
+        cycle: _S1bCycle,
+        at_ns: int,
+    ) -> None:
+        self._s1b_execute_due_exit_closes(cycle, at_ns)
+        if cycle.unresolved or cycle.policy_blocked:
+            return
+        if cycle.positions.is_zero and not _s1b_pending_actions(cycle):
+            cycle.phase = _S1bPhase.COMPLETE
+            cycle.terminal_ns = at_ns
+            return
+        if (
+            cycle.max_hold_deadline_ns is not None
+            and at_ns >= cycle.max_hold_deadline_ns
+            and not cycle.deadline_forced
+        ):
+            self._s1b_force_exit_deadline(cycle, at_ns)
 
     def _handle_boundary(self, cycle: _S1bCycle, at_ns: int) -> None:
         if cycle.phase is _S1bPhase.ENTRY_WAIT:
@@ -2785,6 +3651,9 @@ class Scv1S1bKernel(CycleKernel):
                 self._s1b_force_exit_deadline(cycle, at_ns)
             return
         if cycle.phase is _S1bPhase.EXIT_CANCEL_WAIT:
+            if self.exit_variant is S1bExitVariant.C_BE_REPRICE_V1:
+                self._s1b_c_handle_exit_cancel_boundary(cycle, at_ns)
+                return
             if cycle.exit_activation_ns is not None and cycle.exit_activation_ns <= at_ns and not cycle.exit_activation_checked:
                 if not self._s1b_ensure_exit_activation(cycle, at_ns):
                     if cycle.unresolved:
@@ -2818,6 +3687,10 @@ class Scv1S1bKernel(CycleKernel):
                     finalize_if_deferred=True,
                 )
                 self._schedule_forced_remaining(cycle, at_ns)
+            return
+        if cycle.phase is _S1bPhase.EXIT_REPRICE_WAIT:
+            if self.exit_variant is S1bExitVariant.C_BE_REPRICE_V1:
+                self._s1b_c_handle_reprice_wait_boundary(cycle, at_ns)
             return
         if cycle.phase is _S1bPhase.CLOSE_WAIT:
             self._s1b_execute_due_exit_closes(cycle, at_ns)
@@ -2991,13 +3864,148 @@ class Scv1S1bKernel(CycleKernel):
             return False, reason
         return None, reason or CycleReason.REQUIRED_ACTION_DATA_MISSING
 
+    @staticmethod
+    def _s1b_c_decision_on_grid(cycle: _S1bCycle, at_ns: int) -> bool:
+        decision = cycle.initial_quote_version.decision_ready_monotonic_ns
+        return (
+            decision is not None
+            and at_ns >= decision
+            and (at_ns - decision) % _D1_DECISION_INTERVAL_NS == 0
+        )
+
+    def _s1b_c_request_reprice(
+        self,
+        cycle: _S1bCycle,
+        at_ns: int,
+        candidate: CausalRestingQuote,
+    ) -> None:
+        current = cycle.active_exit_version
+        if current is None:
+            new_version = self._s1b_c_register_exit_version(cycle, candidate, at_ns)
+            self._s1b_c_record_decision(
+                cycle,
+                at_ns,
+                "PLACED",
+                CycleReason.C_REPRICE_REQUESTED,
+                quote=candidate,
+                new_version_id=new_version.quote.quote_version,
+            )
+            return
+        if current.cancel_requested_ns is not None:
+            return
+        current.cancel_requested_ns = at_ns
+        current.cancel_effective_ns = at_ns + cycle.delays.cancel_delay_ns
+        cycle.exit_cancel_requested_ns = current.cancel_requested_ns
+        cycle.exit_cancel_effective_ns = current.cancel_effective_ns
+        _add_action(
+            cycle,
+            action_id=current.cancel_action_id,
+            kind=CycleActionKind.EXIT_CANCEL,
+            status=CycleActionStatus.PENDING,
+            requested_ns=at_ns,
+            effective_ns=current.cancel_effective_ns,
+            due_ns=current.cancel_effective_ns,
+            quantity=current.remaining_quantity,
+            reason="C_REPRICE_CANCEL_REQUESTED",
+        )
+        cycle.exit_reprice_pending = True
+        cycle.exit_reprice_requested_ns = at_ns
+        cycle.phase = _S1bPhase.EXIT_CANCEL_WAIT
+        self._s1b_c_record_decision(
+            cycle,
+            at_ns,
+            "REPRICE_REQUESTED",
+            CycleReason.C_REPRICE_REQUESTED,
+            quote=candidate,
+            old_version=current,
+            new_version_id=candidate.quote_version,
+        )
+
+    def _s1b_maybe_reprice_exit(self, cycle: _S1bCycle, at_ns: int) -> None:
+        """Evaluate C's economic exit only at the existing one-second grid."""
+
+        if self.exit_variant is not S1bExitVariant.C_BE_REPRICE_V1:
+            return
+        if cycle.phase not in {_S1bPhase.EXIT_ACTIVE, _S1bPhase.EXIT_REPRICE_WAIT}:
+            return
+        if not self._s1b_c_decision_on_grid(cycle, at_ns):
+            return
+        if cycle.exit_reprice_last_decision_ns == at_ns:
+            return
+        cycle.exit_reprice_last_decision_ns = at_ns
+        candidate, reason, detail = self._s1b_c_exit_quote_candidate(cycle, at_ns)
+        current = cycle.active_exit_version
+        if candidate is None:
+            cycle.add_reason(reason or CycleReason.C_REPRICE_INVALID)
+            self._s1b_c_record_decision(
+                cycle,
+                at_ns,
+                "RETAINED" if current is not None else "UNAVAILABLE",
+                reason or CycleReason.C_REPRICE_INVALID,
+                detail=detail,
+                quote=None if current is None else current.quote,
+                old_version=current,
+            )
+            return
+        if current is not None and candidate.price == current.quote.price:
+            self._s1b_c_record_decision(
+                cycle,
+                at_ns,
+                "UNCHANGED",
+                "PRICE_UNCHANGED",
+                quote=candidate,
+                old_version=current,
+            )
+            return
+        self._s1b_c_request_reprice(cycle, at_ns, candidate)
+
     def _prepare_exit(self, cycle: _S1bCycle, decision_ns: int) -> None:
         if cycle.paired_risex_quantity <= _ZERO:
             if cycle.paired_lighter_quantity <= _ZERO and cycle.unmatched_entry_quantity <= _ZERO:
                 cycle.phase = _S1bPhase.COMPLETE
                 cycle.terminal_ns = decision_ns
             return
-        exit_quote, reason = self._exit_quote_candidate(cycle, decision_ns)
+        if self.exit_variant is S1bExitVariant.C_BE_REPRICE_V1:
+            baseline_quote, baseline_reason = self._exit_quote_candidate(cycle, decision_ns)
+            exit_quote: CausalRestingQuote | None = baseline_quote
+            reason = baseline_reason
+            if self._s1b_c_decision_on_grid(cycle, decision_ns):
+                candidate, candidate_reason, candidate_detail = self._s1b_c_exit_quote_candidate(
+                    cycle,
+                    decision_ns,
+                    sequence=0,
+                )
+                if candidate is not None:
+                    exit_quote = candidate
+                    reason = None
+                    self._s1b_c_record_decision(
+                        cycle,
+                        decision_ns,
+                        "INITIAL_CANDIDATE",
+                        CycleReason.C_REPRICE_REQUESTED,
+                        quote=candidate,
+                    )
+                else:
+                    cycle.add_reason(candidate_reason or CycleReason.C_REPRICE_INVALID)
+                    self._s1b_c_record_decision(
+                        cycle,
+                        decision_ns,
+                        "BASELINE_FALLBACK",
+                        candidate_reason or CycleReason.C_REPRICE_INVALID,
+                        detail=candidate_detail,
+                        quote=baseline_quote,
+                    )
+            else:
+                self._s1b_c_record_decision(
+                    cycle,
+                    decision_ns,
+                    "BASELINE_FALLBACK",
+                    "DECISION_OFF_GRID",
+                    detail="INITIAL_EXIT_PLACEMENT_NOT_ON_COLLECTION_GRID",
+                    quote=baseline_quote,
+                )
+        else:
+            exit_quote, reason = self._exit_quote_candidate(cycle, decision_ns)
         if exit_quote is None:
             if reason is not CycleReason.EXIT_QUOTE_INVALID:
                 deferred_reason = reason or CycleReason.REQUIRED_ACTION_DATA_MISSING
@@ -3011,6 +4019,9 @@ class Scv1S1bKernel(CycleKernel):
             return
         quantity = exit_quote.quantity
         cycle.exit_chosen = True
+        if self.exit_variant is S1bExitVariant.C_BE_REPRICE_V1:
+            self._s1b_c_register_exit_version(cycle, exit_quote, decision_ns)
+            return
         cycle.exit_price = exit_quote.price
         cycle.exit_activation_ns = decision_ns + cycle.delays.activation_delay_ns
         cycle.exit_remaining_quantity = quantity
@@ -3519,6 +4530,12 @@ class Scv1S1bKernel(CycleKernel):
             self._halt(cycle, CycleReason.LATE_OLDER_EVENT)
         else:
             self._run_due_until(cycle, at_monotonic_ns)
+            if cycle.phase not in {
+                _S1bPhase.COMPLETE,
+                _S1bPhase.ABORTED,
+                _S1bPhase.UNRESOLVED,
+            }:
+                self._s1b_maybe_reprice_exit(cycle, at_monotonic_ns)
         lane.last_result = self._result(cycle)
         if cycle.phase in {_S1bPhase.COMPLETE, _S1bPhase.ABORTED, _S1bPhase.UNRESOLVED}:
             self._latch_terminal(lane, cycle)
@@ -3724,6 +4741,17 @@ class Scv1S1bKernel(CycleKernel):
             ),
             simulation_active_duration_ns=active_duration_ns,
             blocked_duration_ns=blocked_duration_ns,
+            exit_variant=self.exit_variant.value,
+            exit_versions=(
+                tuple(self._s1b_c_exit_version_evidence(item) for item in cycle.exit_versions)
+                if self.exit_variant is S1bExitVariant.C_BE_REPRICE_V1
+                else ()
+            ),
+            exit_repricing=(
+                tuple(cycle.exit_reprice_decisions)
+                if self.exit_variant is S1bExitVariant.C_BE_REPRICE_V1
+                else ()
+            ),
         )
 
     def _entry_measurement(self, cycle: _S1bCycle) -> CausalQuoteMeasurement:
@@ -3751,6 +4779,35 @@ class Scv1S1bKernel(CycleKernel):
         )
 
     def _exit_measurement(self, cycle: _S1bCycle) -> CausalQuoteMeasurement | None:
+        if self.exit_variant is S1bExitVariant.C_BE_REPRICE_V1:
+            version = cycle.active_exit_version or (
+                cycle.exit_versions[-1] if cycle.exit_versions else None
+            )
+            if version is None:
+                return None
+            observed = sum((fill.consumed_quantity for fill in version.fills), _ZERO)
+            if cycle.exit_uncertainty:
+                outcome = CausalOutcome.CAUSAL_UNCERTAIN
+            elif observed == version.target_quantity and version.target_quantity > _ZERO:
+                outcome = CausalOutcome.FULL_FILL
+            elif observed > _ZERO:
+                outcome = CausalOutcome.PARTIAL_FILL
+            elif version.cancel_effective_ns is not None and cycle.current_ns >= version.cancel_effective_ns:
+                outcome = CausalOutcome.CANCELLED_NO_FILL
+            else:
+                outcome = CausalOutcome.NO_FILL
+            return _make_causal_measurement(
+                cycle,
+                quote=version.quote,
+                fills=version.fills,
+                decisions=version.decisions,
+                observed_quantity=observed,
+                remaining_quantity=max(_ZERO, version.target_quantity - observed),
+                uncertainty=cycle.exit_uncertainty,
+                effective_cancel_ns=version.cancel_effective_ns,
+                cancel_requested_ns=version.cancel_requested_ns,
+                outcome=outcome,
+            )
         if cycle.exit_quote is None:
             return None
         observed = sum((fill.consumed_quantity for fill in cycle.exit_fills), _ZERO)
@@ -3777,6 +4834,52 @@ class Scv1S1bKernel(CycleKernel):
             outcome=outcome,
         )
 
+    @staticmethod
+    def _s1b_c_exit_version_evidence(version: _S1bExitVersion) -> dict[str, Any]:
+        return {
+            "sequence": version.sequence,
+            "version_id": version.quote.quote_version,
+            "quote_id": version.quote.quote_id,
+            "price": version.quote.price,
+            "target_quantity": version.target_quantity,
+            "observed_quantity": version.observed_quantity,
+            "remaining_quantity": version.remaining_quantity,
+            "decision_ns": version.quote.decision_ready_monotonic_ns,
+            "activation_ns": version.activation_ns,
+            "activation_checked": version.activation_checked,
+            "activation_post_only": version.activation_post_only,
+            "cancel_requested_ns": version.cancel_requested_ns,
+            "cancel_effective_ns": version.cancel_effective_ns,
+            "maker_action_id": version.maker_action_id,
+            "cancel_action_id": version.cancel_action_id,
+            "source_risex_book_revision_id": version.quote.source_book_revision_id,
+            "source_lighter_book_revision_id": version.quote.hedge_source_book_revision_id,
+            "uncertainty": tuple(version.uncertainty),
+            "fills": tuple(
+                {
+                    "source_event_id": fill.source_event_id,
+                    "received_ns": fill.received_monotonic_ns,
+                    "processed_ready_ns": fill.processed_ready_monotonic_ns,
+                    "price": fill.price,
+                    "observed_quantity": fill.observed_quantity,
+                    "consumed_quantity": fill.consumed_quantity,
+                    "remaining_quantity": fill.remaining_quantity,
+                }
+                for fill in version.fills
+            ),
+            "decisions": tuple(
+                {
+                    "kind": decision.kind.value,
+                    "source_event_id": decision.source_event_id,
+                    "received_ns": decision.received_monotonic_ns,
+                    "classification": decision.classification,
+                    "reason": decision.reason,
+                    "consumed_quantity": decision.consumed_quantity,
+                }
+                for decision in version.decisions
+            ),
+        }
+
     def _latch_terminal(self, lane: Any, cycle: _S1bCycle) -> None:
         lane.last_result = self._result(cycle, terminal=True)
         lane.last_terminal_ns = cycle.terminal_ns
@@ -3799,11 +4902,14 @@ def scv1_s1b_policy() -> CyclePolicy:
 
 def _four_s1b_kernels(
     policy: CyclePolicy | None = None,
+    *,
+    exit_variant: S1bExitVariant | str = S1bExitVariant.A_B_FIXED_EXIT,
 ) -> tuple[Scv1S1bKernel, ...]:
     return tuple(
         Scv1S1bKernel(
             policy,
             fill_model=model,
+            exit_variant=exit_variant,
         )
         for model in (CycleFillModel.TRADE_THROUGH_ONLY, CycleFillModel.TOUCH_ALLOWED)
         for _scenario in (CycleScenario.PRIMARY, CycleScenario.STRESS)
@@ -3819,8 +4925,9 @@ def run_scv1_s1b(
     policy: CyclePolicy | None = None,
     source_books: Iterable[BookEvidence] = (),
     end_monotonic_ns: int | None = None,
+    exit_variant: S1bExitVariant | str = S1bExitVariant.A_B_FIXED_EXIT,
 ) -> S1bCycleResult:
-    kernel = Scv1S1bKernel(policy, fill_model=fill_model)
+    kernel = Scv1S1bKernel(policy, fill_model=fill_model, exit_variant=exit_variant)
     return kernel.run(
         quote_version,
         events,
@@ -3837,6 +4944,7 @@ def run_scv1_s1b_alternatives(
     policy: CyclePolicy | None = None,
     source_books: Iterable[BookEvidence] = (),
     end_monotonic_ns: int | None = None,
+    exit_variant: S1bExitVariant | str = S1bExitVariant.A_B_FIXED_EXIT,
 ) -> tuple[S1bCycleResult, S1bCycleResult, S1bCycleResult, S1bCycleResult]:
     materialized = tuple(events)
     books = tuple(source_books)
@@ -3849,6 +4957,7 @@ def run_scv1_s1b_alternatives(
             policy=policy,
             source_books=books,
             end_monotonic_ns=end_monotonic_ns,
+            exit_variant=exit_variant,
         )
         for model in (CycleFillModel.TRADE_THROUGH_ONLY, CycleFillModel.TOUCH_ALLOWED)
         for scenario in (CycleScenario.PRIMARY, CycleScenario.STRESS)
@@ -4170,7 +5279,7 @@ def _d1_result_row(result: S1bCycleResult) -> dict[str, Any]:
     def decimal(value: Decimal | None) -> str | None:
         return None if value is None else str(value)
 
-    return {
+    row = {
         "contract_version": result.contract_version,
         "fill_model": result.fill_model.value,
         "quote_version_id": result.quote_version_id,
@@ -4219,6 +5328,22 @@ def _d1_result_row(result: S1bCycleResult) -> dict[str, Any]:
         "policy_blocked": result.policy_blocked,
         "pending_actions": [action.action_id for action in result.pending_actions],
     }
+    if result.exit_variant == S1bExitVariant.C_BE_REPRICE_V1.value:
+        def json_value(value: Any) -> Any:
+            if isinstance(value, Decimal):
+                return str(value)
+            if isinstance(value, tuple):
+                return [json_value(item) for item in value]
+            if isinstance(value, list):
+                return [json_value(item) for item in value]
+            if isinstance(value, dict):
+                return {key: json_value(item) for key, item in value.items()}
+            return value
+
+        row["exit_variant"] = result.exit_variant
+        row["exit_versions"] = json_value(result.exit_versions)
+        row["exit_repricing"] = json_value(result.exit_repricing)
+    return row
 
 
 def _d1_summary(results: Iterable[S1bCycleResult]) -> dict[str, Any]:
@@ -4279,9 +5404,15 @@ def build_scv1_s1b_d1_report(
     accepted_release: str | None = None,
     expected_records: int | None = None,
     expected_sha256: str | None = None,
+    exit_variant: S1bExitVariant | str = S1bExitVariant.A_B_FIXED_EXIT,
 ) -> dict[str, Any]:
     """Replay persisted ``CYCLE_STREAM_INPUT`` records through four alternatives."""
 
+    selected_exit_variant = (
+        exit_variant
+        if isinstance(exit_variant, S1bExitVariant)
+        else S1bExitVariant(exit_variant)
+    )
     path = Path(source)
     if not path.is_file():
         raise FileNotFoundError(path)
@@ -4300,7 +5431,10 @@ def build_scv1_s1b_d1_report(
     fallback_created_utc = _d1_parse_utc(metadata.get("created_utc")) or _D1_EPOCH_UTC
     frozen = CyclePolicy()
     kernels = {
-        (model, scenario): Scv1S1bKernel(fill_model=model)
+        (model, scenario): Scv1S1bKernel(
+            fill_model=model,
+            exit_variant=selected_exit_variant,
+        )
         for model in CycleFillModel
         for scenario in CycleScenario
     }
@@ -4576,10 +5710,12 @@ def build_scv1_s1b_d1_report(
     return {
         "contract_version": SCV1_S1B_CONTRACT_VERSION,
         "report_kind": "SCV1_S1B_D1_DEVELOPMENT",
+        "exit_variant": selected_exit_variant.value,
         "source": {
             "accepted_release": accepted_release,
             "historical_source_accepted_release": metadata.get("accepted_release"),
             "policy_version": SCV1_S1B_CONTRACT_VERSION,
+            "exit_variant": selected_exit_variant.value,
             "metadata": metadata,
             "policy_provenance": policy_provenance,
             "market_metadata": market_metadata,
