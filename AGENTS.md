@@ -57,6 +57,8 @@ Owner-facing reports are concise Russian; governing files remain English. Lead w
 
 Use descriptive Chief/Builder titles and the native task card when dispatching, returning a candidate or transferring ownership. Include full technical identity in the durable handoff; do not clutter ordinary findings with repeated unavailable fields. If the client cannot provide a card/link, state the concrete limitation once and continue authorized work. Never invent URLs, publish share snapshots, duplicate tasks or resend assignments solely to manufacture navigation. Pin current participants and the last accepted Builder when supported.
 
+Upon completing an assignment or encountering a blocker, Builder must send the result to the assigned Chief task using an available messaging tool. A final response only in Builder's own task does not replace delivery to Chief. If delivery is rejected or unavailable, Builder must preserve the result locally and explicitly state in its own task that Chief has not received it, including the local result path. Repeated status checks by Chief do not replace this delivery.
+
 ## Safety invariants
 
 Public-only research, paper default, points $0. Private/account/fee-reader endpoints, credentials, signing, order preparation/dispatch, testnet/mainnet orders, funds, transfers, withdrawals and strategy execution are prohibited. Secrets never enter chat, arguments, logs, reports, databases, fixtures or Git. Existing private/testnet modules remain isolated and uninvoked. Public collection needs an explicit prospective gate in NEXT_TASK; old smoke/pilot/campaign permissions are not reusable.
