@@ -11,6 +11,8 @@ import asyncio
 from dataclasses import dataclass, replace
 from decimal import Decimal
 import hashlib
+from pathlib import Path
+import re
 import time
 from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
@@ -97,14 +99,31 @@ def _as_order(value: OrderSnapshot | Mapping[str, Any] | None) -> OrderSnapshot 
 
 def _as_receipt(value: MutationReceipt | Mapping[str, Any]) -> MutationReceipt:
     if isinstance(value, MutationReceipt):
-        return value
+        return MutationReceipt(
+            accepted=value.accepted,
+            order_id=value.order_id,
+            tx_hash=_safe_tx_hash(value.tx_hash),
+            error=(
+                None
+                if value.error is None
+                else sanitize_exception(ValueError(value.error))
+            ),
+            response_code=value.response_code,
+        )
     return MutationReceipt(
         accepted=_bool(value.get("accepted", False), "accepted"),
         order_id=None if value.get("order_id") is None else str(value["order_id"]),
-        tx_hash=None if value.get("tx_hash") is None else str(value["tx_hash"]),
+        tx_hash=_safe_tx_hash(value.get("tx_hash")),
         error=None if value.get("error") is None else sanitize_exception(ValueError(str(value["error"]))),
         response_code=value.get("response_code"),
     )
+
+
+def _safe_tx_hash(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text if re.fullmatch(r"0x[0-9a-fA-F]{8,128}", text) else None
 
 
 def _as_page(value: HistoryPage | Mapping[str, Any]) -> HistoryPage:
@@ -134,19 +153,63 @@ class HandoffEngine:
         self.clock = clock or SystemClock()
 
     async def execute(self, config: HandoffConfig) -> HandoffResult:
+        try:
+            journal = DurableJournal(config.journal_path, clock=self.clock.now)
+        except Exception as exc:
+            reason = f"journal unavailable: {sanitize_exception(exc)}"
+            return HandoffResult(
+                outcome=Outcome.UNKNOWN,
+                phase=Phase.RECONCILIATION,
+                run_id="",
+                plan=None,
+                source=None,
+                receiver=None,
+                reason=reason,
+                unknown_reasons=(reason,),
+            )
+        try:
+            journal.acquire_attempt()
+        except Exception as exc:
+            reason = f"attempt ownership unavailable: {sanitize_exception(exc)}"
+            return HandoffResult(
+                outcome=Outcome.UNKNOWN,
+                phase=Phase.RECONCILIATION,
+                run_id=journal.run_id,
+                plan=None,
+                source=None,
+                receiver=None,
+                reason=reason,
+                unknown_reasons=(reason,),
+            )
+        try:
+            return await self._execute_locked(config, journal)
+        finally:
+            journal.release_attempt()
+
+    async def _execute_locked(self, config: HandoffConfig, journal: DurableJournal) -> HandoffResult:
         self._configured_poll_limit = config.max_poll_count
         self._configured_poll_interval = config.poll_interval_seconds
         self._configured_order_timeout = config.order_timeout_seconds
         self._configured_reconcile_timeout = config.reconcile_timeout_seconds
-        journal = DurableJournal(config.journal_path, clock=self.clock.now)
+        self._configured_freshness = config.freshness_seconds
         if journal.has_unresolved_mutation():
             return await self._resume_reconciliation(config, journal)
+        if journal.has_completed_mutation():
+            reason = "journal already contains a completed attempt; use a new owner-only journal path"
+            return HandoffResult(
+                outcome=Outcome.UNKNOWN,
+                phase=Phase.RECONCILIATION,
+                run_id=journal.run_id,
+                plan=None,
+                source=None,
+                receiver=None,
+                reason=reason,
+                unknown_reasons=(reason,),
+            )
         run_id = journal.run_id
-        now = self.clock.now()
-        journal.append("ATTEMPT_STARTED", {"run_id": run_id, "market_id": config.market_id})
         try:
-            plan, source, receiver = await self._preflight(config, journal, run_id, now)
-        except (ContractError, PreflightBlocked) as exc:
+            binding = _config_binding(config, self.client)
+        except Exception as exc:
             reason = sanitize_exception(exc)
             journal.append("PREFLIGHT_BLOCKED", {"reason": reason}, run_id=run_id)
             return HandoffResult(
@@ -157,10 +220,27 @@ class HandoffEngine:
                 source=None,
                 receiver=None,
                 reason=reason,
+                unknown_reasons=(reason,),
             )
-        journal.append("PLAN_REVIEWED", {"plan": plan.as_dict()}, run_id=run_id)
-        if not config.operator_execution_opt_in:
-            journal.append("PREVIEW", {"plan": plan.as_dict()}, run_id=run_id)
+        journal.append("ATTEMPT_STARTED", {"run_id": run_id, "binding": binding})
+        try:
+            plan, source, receiver = await self._preflight(config, journal, run_id)
+        except Exception as exc:
+            reason = _safe_preflight_reason(exc)
+            journal.append("PREFLIGHT_BLOCKED", {"reason": reason}, run_id=run_id)
+            return HandoffResult(
+                outcome=Outcome.FAILED_PREFLIGHT_BLOCKED,
+                phase=Phase.PREFLIGHT,
+                run_id=run_id,
+                plan=None,
+                source=None,
+                receiver=None,
+                reason=reason,
+            )
+        plan_payload = {"plan": plan.as_dict(), "config": binding, "review_required": True}
+        journal.append("PLAN_READY", plan_payload, run_id=run_id)
+        if not config.operator_execution_opt_in or not config.operator_plan_reviewed:
+            journal.append("PREVIEW", plan_payload, run_id=run_id)
             return HandoffResult(
                 outcome=Outcome.PREVIEW,
                 phase=Phase.PREFLIGHT,
@@ -174,6 +254,7 @@ class HandoffEngine:
                     position_after=source.signed_position,
                     order=None,
                     history_complete=True,
+                    dispatched=False,
                 ),
                 receiver=LegReconciliation(
                     account_index=receiver.account_index,
@@ -183,8 +264,11 @@ class HandoffEngine:
                     position_after=receiver.signed_position,
                     order=None,
                     history_complete=True,
+                    dispatched=False,
                 ),
-                reason="execution opt-in is false; no signing or mutation was attempted",
+                reason=(
+                    "explicit plan review and execution opt-in are required; no signing or mutation was attempted"
+                ),
             )
 
         source_receipt: MutationReceipt | None = None
@@ -192,7 +276,10 @@ class HandoffEngine:
         receiver_receipt: MutationReceipt | None = None
         receiver_order: OrderSnapshot | None = None
         unknown_reasons: list[str] = []
+        source_dispatch_attempted = False
+        receiver_dispatch_attempted = False
         try:
+            source_dispatch_attempted = True
             journal.append(
                 "SOURCE_DISPATCH_INTENT",
                 {"plan": plan.source.as_dict()},
@@ -250,30 +337,46 @@ class HandoffEngine:
                     await self.client.account_snapshot(plan.receiver.account_index, plan.receiver.market_id)
                 )
                 source_order = await self._lookup_order(plan.source, source_order.order_id)
+                decision_now = self.clock.now()
                 if source_order is None:
                     unknown_reasons.append("source order disappeared during pre-receiver recheck")
+                elif not self._snapshot_matches(
+                    source_recheck, plan.source, expected_identity=plan.source_identity
+                ):
+                    unknown_reasons.append("source recheck account/market identity conflicts with plan")
+                elif not self._snapshot_matches(
+                    receiver_recheck, plan.receiver, expected_identity=plan.receiver_identity
+                ):
+                    unknown_reasons.append("receiver recheck account/market identity conflicts with plan")
+                elif not self._snapshot_fresh(source_recheck, decision_now, config.freshness_seconds):
+                    unknown_reasons.append("source recheck is stale or from the future before receiver dispatch")
+                elif not self._snapshot_fresh(receiver_recheck, decision_now, config.freshness_seconds):
+                    unknown_reasons.append("receiver recheck is stale or from the future before receiver dispatch")
+                elif not self._time_fresh(source_order.observed_at, decision_now, config.freshness_seconds):
+                    unknown_reasons.append("source order recheck is stale or from the future before receiver dispatch")
                 elif source_recheck.signed_position != source.signed_position:
                     unknown_reasons.append("source position changed before receiver dispatch")
-                elif self.clock.now() - source_recheck.observed_at > config.freshness_seconds:
-                    unknown_reasons.append("source recheck is stale before receiver dispatch")
-                elif source_recheck.observed_at > self.clock.now():
-                    unknown_reasons.append("source recheck is from the future")
                 elif not source_recheck.authorized or not source_recheck.ready:
                     unknown_reasons.append("source recheck authorization/readiness is unproven")
                 elif (
                     source_recheck.margin_available is None
                     or source_recheck.margin_required is None
                     or source_recheck.margin_required > source_recheck.margin_available
+                    or source_recheck.incremental_margin_required is None
+                    or source_recheck.incremental_margin_required > source_recheck.margin_available
+                    or not source_recheck.incremental_margin_evidence
                 ):
                     unknown_reasons.append("source margin recheck is insufficient or missing")
                 elif source_recheck.fee_rate is None:
                     unknown_reasons.append("source fee recheck is missing")
+                elif plan.source_fee_rate is None or source_recheck.fee_rate != plan.source_fee_rate:
+                    unknown_reasons.append("source fee evidence changed before receiver dispatch")
+                elif not self._fee_budget_proven(config, plan.source, source_recheck.fee_rate, config.source_fee_budget):
+                    unknown_reasons.append("source fee budget is no longer proven before receiver dispatch")
+                elif not self._active_orders_match(source_recheck, plan.source, source_order.order_id):
+                    unknown_reasons.append("source recheck contains an additional or conflicting active order")
                 elif receiver_recheck.signed_position != receiver.signed_position:
                     unknown_reasons.append("receiver position changed before receiver dispatch")
-                elif self.clock.now() - receiver_recheck.observed_at > config.freshness_seconds:
-                    unknown_reasons.append("receiver recheck is stale before receiver dispatch")
-                elif receiver_recheck.observed_at > self.clock.now():
-                    unknown_reasons.append("receiver recheck is from the future")
                 elif not receiver_recheck.authorized or not receiver_recheck.ready:
                     unknown_reasons.append("receiver recheck authorization/readiness is unproven")
                 elif receiver_recheck.active_orders:
@@ -282,10 +385,19 @@ class HandoffEngine:
                     receiver_recheck.margin_available is None
                     or receiver_recheck.margin_required is None
                     or receiver_recheck.margin_required > receiver_recheck.margin_available
+                    or receiver_recheck.incremental_margin_required is None
+                    or receiver_recheck.incremental_margin_required > receiver_recheck.margin_available
+                    or not receiver_recheck.incremental_margin_evidence
                 ):
                     unknown_reasons.append("receiver margin recheck is insufficient or missing")
                 elif receiver_recheck.fee_rate is None:
                     unknown_reasons.append("receiver fee recheck is missing")
+                elif plan.receiver_fee_rate is None or receiver_recheck.fee_rate != plan.receiver_fee_rate:
+                    unknown_reasons.append("receiver fee evidence changed before receiver dispatch")
+                elif not self._fee_budget_proven(
+                    config, plan.receiver, receiver_recheck.fee_rate, config.receiver_fee_budget
+                ):
+                    unknown_reasons.append("receiver fee budget is no longer proven before receiver dispatch")
                 elif not self._source_is_resting(source_order, plan.source):
                     unknown_reasons.append("source fill or quantity change before receiver dispatch")
                 else:
@@ -298,6 +410,19 @@ class HandoffEngine:
                 unknown_reasons.append(f"pre-receiver state is unresolved: {sanitize_exception(exc)}")
 
         if unknown_reasons:
+            # A dispatch can be ambiguous before the first order observation.
+            # Resolve the exact client identity once more so an identified
+            # remaining maker can be cancelled safely; a missing identity is
+            # never guessed and remains UNKNOWN.
+            if source_order is None and source_dispatch_attempted:
+                try:
+                    source_order = await self._lookup_order(
+                        plan.source,
+                        source_receipt.order_id if source_receipt is not None else None,
+                        client_order_index=plan.source.client_order_index,
+                    )
+                except Exception as exc:
+                    unknown_reasons.append(f"source cancellation lookup unresolved: {sanitize_exception(exc)}")
             if source_order is not None:
                 await self._cancel_if_safe(plan.source, source_order, journal, run_id, unknown_reasons)
             source_result, receiver_result = await self._reconcile(
@@ -307,6 +432,8 @@ class HandoffEngine:
                 receiver,
                 source_order_id=source_order.order_id if source_order else (source_receipt.order_id if source_receipt else None),
                 receiver_order_id=None,
+                source_dispatched=source_dispatch_attempted,
+                receiver_dispatched=receiver_dispatch_attempted,
                 run_id=run_id,
                 journal=journal,
                 unknown_reasons=unknown_reasons,
@@ -318,10 +445,12 @@ class HandoffEngine:
                 source_result,
                 receiver_result,
                 unknown_reasons,
+                binding=binding,
                 forced_outcome=Outcome.UNKNOWN if any("unknown" in item.lower() or "unresolved" in item.lower() for item in unknown_reasons) else None,
             )
 
         try:
+            receiver_dispatch_attempted = True
             journal.append("RECEIVER_DISPATCH_INTENT", {"plan": plan.receiver.as_dict()}, run_id=run_id)
             receiver_receipt = _as_receipt(await self.client.submit_order(plan.receiver))
             journal.append(
@@ -356,10 +485,14 @@ class HandoffEngine:
 
         # Once B is terminal or uncertain, cancel only this identified A order.
         if source_order is not None:
-            current_source = await self._lookup_order(plan.source, source_order.order_id)
+            try:
+                current_source = await self._lookup_order(plan.source, source_order.order_id)
+            except Exception as exc:
+                current_source = None
+                unknown_reasons.append(f"source cancellation lookup unresolved: {sanitize_exception(exc)}")
             if current_source is not None:
                 await self._cancel_if_safe(plan.source, current_source, journal, run_id, unknown_reasons)
-            else:
+            elif not any("source cancellation lookup unresolved" in item for item in unknown_reasons):
                 unknown_reasons.append("source order disappeared before cancellation reconciliation")
 
         source_result, receiver_result = await self._reconcile(
@@ -369,22 +502,32 @@ class HandoffEngine:
             receiver,
             source_order_id=source_order.order_id if source_order else (source_receipt.order_id if source_receipt else None),
             receiver_order_id=receiver_order.order_id if receiver_order else (receiver_receipt.order_id if receiver_receipt else None),
+            source_dispatched=source_dispatch_attempted,
+            receiver_dispatched=receiver_dispatch_attempted,
             run_id=run_id,
             journal=journal,
             unknown_reasons=unknown_reasons,
         )
-        return await self._finish(journal, run_id, plan, source_result, receiver_result, unknown_reasons)
+        return await self._finish(
+            journal,
+            run_id,
+            plan,
+            source_result,
+            receiver_result,
+            unknown_reasons,
+            binding=binding,
+        )
 
     async def _preflight(
         self,
         config: HandoffConfig,
         journal: DurableJournal,
         run_id: str,
-        now: float,
     ) -> tuple[HandoffPlan, AccountSnapshot, AccountSnapshot]:
         metadata = _as_market(await self.client.market_metadata(config.market_id))
         source = _as_account(await self.client.account_snapshot(_account_from_client(self.client, "source"), config.market_id))
         receiver = _as_account(await self.client.account_snapshot(_account_from_client(self.client, "receiver"), config.market_id))
+        now = self.clock.now()
         # The client must expose account identities explicitly; this prevents a
         # fallback to one shared account or a hidden account discovery call.
         if source.account_index == receiver.account_index:
@@ -431,6 +574,10 @@ class HandoffEngine:
             direction=config.direction,
             quantity=config.quantity,
             created_at=now,
+            source_fee_rate=metadata.source_fee_rate,
+            receiver_fee_rate=metadata.receiver_fee_rate,
+            source_identity=source.source_identity,
+            receiver_identity=receiver.source_identity,
         )
         journal.append(
             "PREFLIGHT_PROVED",
@@ -439,8 +586,11 @@ class HandoffEngine:
                 "symbol": metadata.symbol,
                 "source_account_index": source.account_index,
                 "receiver_account_index": receiver.account_index,
+                "source_identity": source.source_identity,
+                "receiver_identity": receiver.source_identity,
                 "source_position": str(source.signed_position),
                 "receiver_position": str(receiver.signed_position),
+                "binding": _config_binding(config, self.client),
             },
             run_id=run_id,
         )
@@ -464,6 +614,19 @@ class HandoffEngine:
             except Exception as exc:
                 journal.append("ORDER_OBSERVATION_ERROR", {"leg": plan.side, "poll": poll, "reason": sanitize_exception(exc)}, run_id=run_id)
                 order = None
+            if order is not None:
+                if order_id is not None and order.order_id != str(order_id):
+                    journal.append(
+                        "ORDER_OBSERVATION_ERROR",
+                        {"leg": plan.side, "poll": poll, "reason": "order_id_conflict"},
+                        run_id=run_id,
+                    )
+                    order = None
+            if order is not None:
+                observed_now = self.clock.now()
+                if not self._time_fresh(order.observed_at, observed_now, self._configured_freshness):
+                    journal.append("ORDER_OBSERVATION_ERROR", {"leg": plan.side, "poll": poll, "reason": "stale_or_future_order"}, run_id=run_id)
+                    order = None
             if order is not None:
                 journal.append(
                     "ORDER_OBSERVED",
@@ -507,27 +670,77 @@ class HandoffEngine:
         return _as_order(value)
 
     def _order_matches(self, order: OrderSnapshot, plan: OrderPlan) -> bool:
-        return (
+        if order.client_order_index is None:
+            return False
+        identity = (
             order.account_index == plan.account_index
             and order.market_id == plan.market_id
             and order.side.upper() == plan.side
-            and (
-                order.client_order_index is None
-                or str(order.client_order_index) == str(plan.client_order_index)
-            )
+            and str(order.client_order_index) == str(plan.client_order_index)
             and order.reduce_only == plan.reduce_only
             and order.initial_quantity == plan.quantity
-            and order.order_type.upper() in {plan.order_type, plan.order_type.lower()}
-            and order.time_in_force.upper() in {plan.time_in_force, plan.time_in_force.lower()}
+            and order.order_type == plan.order_type
+            and order.time_in_force == plan.time_in_force
         )
+        if not identity or order.price is None:
+            return False
+        if plan.order_type == "LIMIT":
+            return order.price == plan.price
+        # A market order's reported price may be its actual average.  The
+        # submitted bound remains directional: BUY must not exceed it, SELL
+        # must not fall below it.
+        return order.price <= plan.price if plan.side == "BUY" else order.price >= plan.price
+
+    @staticmethod
+    def _snapshot_matches(
+        snapshot: AccountSnapshot,
+        plan: OrderPlan,
+        *,
+        expected_identity: str | None = None,
+    ) -> bool:
+        return (
+            snapshot.account_index == plan.account_index
+            and snapshot.market_id == plan.market_id
+            and (expected_identity is None or snapshot.source_identity == expected_identity)
+        )
+
+    @staticmethod
+    def _snapshot_fresh(snapshot: AccountSnapshot, now: float, freshness: float) -> bool:
+        return HandoffEngine._time_fresh(snapshot.observed_at, now, freshness)
+
+    @staticmethod
+    def _time_fresh(observed_at: float, now: float, freshness: float) -> bool:
+        return observed_at <= now and now - observed_at <= freshness
+
+    def _active_orders_match(self, snapshot: AccountSnapshot, plan: OrderPlan, order_id: str) -> bool:
+        active = tuple(order for order in snapshot.active_orders if order.active)
+        if len(active) != 1:
+            return False
+        order = active[0]
+        return order.order_id == order_id and self._order_matches(order, plan)
 
     def _source_is_resting(self, order: OrderSnapshot, plan: OrderPlan) -> bool:
         return (
             self._order_matches(order, plan)
-            and order.status.lower() in {"open", "active"}
+            and order.status.lower() == "open"
             and order.filled_quantity == 0
             and order.remaining_quantity == plan.quantity
         )
+
+    @staticmethod
+    def _fee_budget_proven(
+        config: HandoffConfig,
+        plan: OrderPlan,
+        fee_rate: Decimal,
+        budget: Decimal,
+    ) -> bool:
+        """Check a fee ceiling only where the submitted price is a ceiling."""
+
+        if plan.order_type == "MARKET" and plan.side == "SELL":
+            # Lighter's SELL taker price is a floor.  It cannot prove a fee
+            # ceiling or gross-notional ceiling before mutation.
+            return False
+        return plan.quantity * plan.price * fee_rate <= budget
 
     async def _cancel_if_safe(
         self,
@@ -545,11 +758,26 @@ class HandoffEngine:
             or order.remaining_quantity <= 0
         ):
             return
+        for event in journal.events:
+            if event.run_id != run_id or event.event != "CANCEL_DISPATCH_INTENT":
+                continue
+            if (
+                str(event.payload.get("account_index")) == str(plan.account_index)
+                and str(event.payload.get("market_id")) == str(plan.market_id)
+                and str(event.payload.get("order_id")) == str(order.order_id)
+            ):
+                return
         try:
             # Recheck the exact owner/market/order immediately before the only
             # cancellation mutation.  Never cancel by a bare client index.
             current = await self._lookup_order(plan, order.order_id)
-            if current is None or not self._order_matches(current, plan) or not current.active:
+            if (
+                current is None
+                or not self._order_matches(current, plan)
+                or current.order_id != order.order_id
+                or not current.active
+                or not self._time_fresh(current.observed_at, self.clock.now(), self._configured_freshness)
+            ):
                 return
             journal.append(
                 "CANCEL_DISPATCH_INTENT",
@@ -588,6 +816,8 @@ class HandoffEngine:
         *,
         source_order_id: str | None,
         receiver_order_id: str | None,
+        source_dispatched: bool,
+        receiver_dispatched: bool,
         run_id: str,
         journal: DurableJournal,
         unknown_reasons: list[str],
@@ -598,6 +828,8 @@ class HandoffEngine:
             plan.source,
             source,
             source_order_id,
+            source_dispatched,
+            plan.source_identity,
             run_id,
             journal,
             unknown_reasons,
@@ -607,6 +839,8 @@ class HandoffEngine:
             plan.receiver,
             receiver,
             receiver_order_id,
+            receiver_dispatched,
+            plan.receiver_identity,
             run_id,
             journal,
             unknown_reasons,
@@ -619,12 +853,16 @@ class HandoffEngine:
         plan: OrderPlan,
         before: AccountSnapshot,
         order_id: str | None,
+        dispatched: bool,
+        expected_identity: str,
         run_id: str,
         journal: DurableJournal,
         unknown_reasons: list[str],
     ) -> LegReconciliation:
         local_unknown: list[str] = []
-        if order_id is None:
+        if expected_identity and before.source_identity != expected_identity:
+            local_unknown.append("initial account identity does not match the bound plan")
+        if dispatched and order_id is None:
             try:
                 discovered = await self._lookup_order(plan, None, client_order_index=plan.client_order_index)
             except Exception as exc:
@@ -635,11 +873,13 @@ class HandoffEngine:
             else:
                 local_unknown.append(f"{plan.side.lower()} order id is missing")
         trades: list[TradeReceipt] = []
-        seen: set[str] = set()
+        seen: dict[tuple[Any, ...], TradeReceipt] = {}
         complete = True
         cursor: str | None = None
         deadline = self.clock.now() + config.reconcile_timeout_seconds
-        for _ in range(max(1, config.max_poll_count)):
+        if dispatched and order_id is None:
+            complete = False
+        for _ in range(max(1, config.max_poll_count)) if dispatched and order_id is not None else ():
             if self.clock.now() > deadline:
                 local_unknown.append("reconciliation deadline exceeded")
                 complete = False
@@ -658,7 +898,6 @@ class HandoffEngine:
                 local_unknown.append(f"trade history read failed: {sanitize_exception(exc)}")
                 complete = False
                 break
-            complete = complete and page.complete
             for trade in page.trades:
                 if trade.account_index != plan.account_index or trade.market_id != plan.market_id:
                     local_unknown.append("trade history contains foreign account/market")
@@ -671,14 +910,31 @@ class HandoffEngine:
                 if trade.side.upper() != plan.side:
                     local_unknown.append("trade side conflicts with planned leg")
                     continue
-                if trade.trade_id in seen:
-                    previous = next(item for item in trades if item.trade_id == trade.trade_id)
-                    if previous != trade:
-                        local_unknown.append("duplicate trade id has conflicting receipt fields")
+                if plan.order_type == "LIMIT" and trade.price != plan.price:
+                    local_unknown.append("limit trade price conflicts with planned price")
                     continue
-                seen.add(trade.trade_id)
+                if plan.order_type == "MARKET":
+                    within_bound = (
+                        trade.price <= plan.price if plan.side == "BUY" else trade.price >= plan.price
+                    )
+                    if not within_bound:
+                        local_unknown.append("market trade price violates the directional worst-price bound")
+                        continue
+                economic_key = _trade_economic_key(trade)
+                previous = seen.get(economic_key)
+                if previous is not None:
+                    # Observation timestamps can change between pages; the
+                    # economic receipt identity must remain stable.
+                    if previous.trade_id != trade.trade_id:
+                        local_unknown.append("economic receipt has conflicting trade identity")
+                    continue
+                if any(item.trade_id == trade.trade_id and _trade_economic_key(item) != economic_key for item in trades):
+                    local_unknown.append("duplicate trade id has conflicting receipt fields")
+                    continue
+                seen[economic_key] = trade
                 trades.append(trade)
             if not page.next_cursor:
+                complete = page.complete
                 break
             if page.next_cursor == cursor:
                 local_unknown.append("trade history cursor repeated")
@@ -686,31 +942,54 @@ class HandoffEngine:
                 break
             cursor = page.next_cursor
         else:
-            local_unknown.append("trade history pagination exceeded configured bound")
-            complete = False
+            if dispatched:
+                local_unknown.append("trade history pagination exceeded configured bound")
+                complete = False
         try:
             after = _as_account(await self.client.account_snapshot(plan.account_index, plan.market_id))
+            after_now = self.clock.now()
+            if not self._snapshot_matches(
+                after, plan, expected_identity=expected_identity
+            ) or not self._snapshot_fresh(
+                after, after_now, config.freshness_seconds
+            ):
+                local_unknown.append("final account identity or freshness is not proven")
         except Exception as exc:
             after = None
             local_unknown.append(f"final account read failed: {sanitize_exception(exc)}")
-        try:
-            order = await self._lookup_order(plan, order_id, client_order_index=plan.client_order_index)
-        except Exception as exc:
-            order = None
-            local_unknown.append(f"final order read failed: {sanitize_exception(exc)}")
-        if order is None:
-            local_unknown.append("final order state is missing")
-        elif not self._order_matches(order, plan):
-            local_unknown.append("final order identity/parameters conflict with plan")
-        elif not order.terminal:
-            local_unknown.append("final order state is not terminal")
-        if not complete:
-            local_unknown.append("trade history is incomplete")
+        order: OrderSnapshot | None = None
+        if dispatched:
+            try:
+                order = await self._lookup_order(plan, order_id, client_order_index=plan.client_order_index)
+                order_now = self.clock.now()
+            except Exception as exc:
+                order = None
+                order_now = self.clock.now()
+                local_unknown.append(f"final order read failed: {sanitize_exception(exc)}")
+            if order is None:
+                local_unknown.append("final order state is missing")
+            elif not self._order_matches(order, plan):
+                local_unknown.append("final order identity/parameters conflict with plan")
+            elif order_id is not None and order.order_id != str(order_id):
+                local_unknown.append("final order identifier conflicts with dispatched order")
+            elif not self._time_fresh(order.observed_at, order_now, config.freshness_seconds):
+                local_unknown.append("final order state is stale or from the future")
+            elif not order.terminal:
+                local_unknown.append("final order state is not terminal")
+            if not complete:
+                local_unknown.append("trade history is incomplete")
+            trade_total = sum((trade.quantity for trade in trades), Decimal(0))
+            if order is not None and order.filled_quantity != trade_total:
+                local_unknown.append("terminal order filled quantity conflicts with trade receipt sum")
+        elif after is not None and after.signed_position != before.signed_position:
+            local_unknown.append("non-dispatched leg position changed unexpectedly")
         expected_delta = (Decimal("-1") if plan.side == "SELL" else Decimal("1")) * sum(
             (trade.quantity for trade in trades), Decimal(0)
         )
-        if after is not None and after.signed_position != before.signed_position + expected_delta:
+        if after is not None and dispatched and after.signed_position != before.signed_position + expected_delta:
             local_unknown.append("final position does not equal independently reconciled trade quantity")
+        if after is not None and any(item.active for item in after.active_orders):
+            local_unknown.append("final account still has an active HOOD order")
         for reason in local_unknown:
             if reason not in unknown_reasons:
                 unknown_reasons.append(reason)
@@ -723,6 +1002,7 @@ class HandoffEngine:
             order=order,
             history_complete=complete and not local_unknown,
             unknown_reasons=tuple(local_unknown),
+            dispatched=dispatched,
         )
         journal.append(
             "LEG_RECONCILED",
@@ -731,6 +1011,42 @@ class HandoffEngine:
                 "order_id": order_id,
                 "trade_ids": [trade.trade_id for trade in trades],
                 "filled_quantity": str(leg.filled_quantity),
+                "fee_total": None if leg.fee_total is None else str(leg.fee_total),
+                "position_before": str(leg.position_before),
+                "position_after": None if leg.position_after is None else str(leg.position_after),
+                "trades": [
+                    {
+                        "trade_id": trade.trade_id,
+                        "account_index": trade.account_index,
+                        "market_id": trade.market_id,
+                        "order_id": trade.order_id,
+                        "side": trade.side,
+                        "quantity": str(trade.quantity),
+                        "price": str(trade.price),
+                        "fee": None if trade.fee is None else str(trade.fee),
+                        "counterparty_account_index": trade.counterparty_account_index,
+                        "observed_at": trade.observed_at,
+                    }
+                    for trade in trades
+                ],
+                "order": None
+                if leg.order is None
+                else {
+                    "order_id": leg.order.order_id,
+                    "client_order_index": leg.order.client_order_index,
+                    "account_index": leg.order.account_index,
+                    "market_id": leg.order.market_id,
+                    "side": leg.order.side,
+                    "order_type": leg.order.order_type,
+                    "time_in_force": leg.order.time_in_force,
+                    "reduce_only": leg.order.reduce_only,
+                    "price": None if leg.order.price is None else str(leg.order.price),
+                    "status": leg.order.status,
+                    "initial_quantity": str(leg.order.initial_quantity),
+                    "remaining_quantity": str(leg.order.remaining_quantity),
+                    "filled_quantity": str(leg.order.filled_quantity),
+                    "observed_at": leg.order.observed_at,
+                },
                 "history_complete": leg.history_complete,
                 "unknown_reasons": list(local_unknown),
             },
@@ -747,23 +1063,21 @@ class HandoffEngine:
         receiver: LegReconciliation,
         unknown_reasons: list[str],
         *,
+        binding: Mapping[str, Any] | None = None,
         forced_outcome: Outcome | None = None,
     ) -> HandoffResult:
+        if source.filled_quantity == plan.quantity and receiver.filled_quantity == plan.quantity:
+            if (
+                source.quantity_against(receiver.account_index) != plan.quantity
+                or receiver.quantity_against(source.account_index) != plan.quantity
+            ):
+                marker = "cross-leg counterparty evidence does not match the requested pair"
+                if marker not in unknown_reasons:
+                    unknown_reasons.append(marker)
         outcome = forced_outcome or self._classify(plan, source, receiver, unknown_reasons)
         phase = Phase.COMPLETE
         reason = None if outcome is Outcome.SUCCESS else (unknown_reasons[0] if unknown_reasons else "one-attempt handoff did not prove full completion")
-        journal.append(
-            "COMPLETE",
-            {
-                "outcome": outcome.value,
-                "reason": reason,
-                "source_filled_quantity": str(source.filled_quantity),
-                "receiver_filled_quantity": str(receiver.filled_quantity),
-                "unknown_reasons": list(dict.fromkeys(unknown_reasons)),
-            },
-            run_id=run_id,
-        )
-        return HandoffResult(
+        result = HandoffResult(
             outcome=outcome,
             phase=phase,
             run_id=run_id,
@@ -773,6 +1087,42 @@ class HandoffEngine:
             reason=reason,
             unknown_reasons=tuple(dict.fromkeys(unknown_reasons)),
         )
+        dispatch_evidence = [
+            {
+                "event": event.event,
+                "at": event.at,
+                "payload": event.payload,
+            }
+            for event in journal.events
+            if event.run_id == run_id
+            and event.event
+            in {
+                "SOURCE_DISPATCH_INTENT",
+                "SOURCE_DISPATCH_RESULT",
+                "SOURCE_DISPATCH_UNKNOWN",
+                "RECEIVER_DISPATCH_INTENT",
+                "RECEIVER_DISPATCH_RESULT",
+                "RECEIVER_DISPATCH_UNKNOWN",
+                "CANCEL_DISPATCH_INTENT",
+                "CANCEL_DISPATCH_RESULT",
+                "CANCEL_DISPATCH_UNKNOWN",
+            }
+        ]
+        journal.append(
+            "COMPLETE",
+            {
+                "outcome": outcome.value,
+                "reason": reason,
+                "binding": dict(binding or {}),
+                "source_filled_quantity": str(source.filled_quantity),
+                "receiver_filled_quantity": str(receiver.filled_quantity),
+                "unknown_reasons": list(dict.fromkeys(unknown_reasons)),
+                "receipt": result.as_dict(),
+                "dispatch_evidence": dispatch_evidence,
+            },
+            run_id=run_id,
+        )
+        return result
 
     def _classify(
         self,
@@ -781,8 +1131,19 @@ class HandoffEngine:
         receiver: LegReconciliation,
         unknown_reasons: Sequence[str],
     ) -> Outcome:
-        if unknown_reasons or source.unknown_reasons or receiver.unknown_reasons:
+        known_partial_reasons = {
+            "source fill observed before receiver dispatch",
+            "source order did not prove exact resting quantity",
+        }
+        unresolved = [
+            reason
+            for reason in (*unknown_reasons, *source.unknown_reasons, *receiver.unknown_reasons)
+            if reason not in known_partial_reasons
+        ]
+        if unresolved:
             return Outcome.UNKNOWN
+        if source.filled_quantity < plan.quantity and not receiver.dispatched and not receiver.trades:
+            return Outcome.PARTIAL
         if source.filled_quantity == plan.quantity and receiver.filled_quantity == plan.quantity:
             expected_source = plan.source_position_before - plan.quantity * plan.direction.sign
             expected_receiver = plan.receiver_position_before + plan.quantity * plan.direction.sign
@@ -793,26 +1154,123 @@ class HandoffEngine:
                 and receiver.order.terminal
                 and source.position_after == expected_source
                 and receiver.position_after == expected_receiver
+                and source.quantity_against(receiver.account_index) == plan.quantity
+                and receiver.quantity_against(source.account_index) == plan.quantity
             ):
                 return Outcome.SUCCESS
+            if source.quantity_against(receiver.account_index) != plan.quantity or receiver.quantity_against(source.account_index) != plan.quantity:
+                return Outcome.UNKNOWN
+            return Outcome.UNKNOWN
+        if receiver.order is None and not receiver.trades and source.filled_quantity < plan.quantity:
+            return Outcome.PARTIAL
         return Outcome.PARTIAL
 
     async def _resume_reconciliation(self, config: HandoffConfig, journal: DurableJournal) -> HandoffResult:
         events = journal.events
-        run_event = next((event for event in reversed(events) if event.event == "SOURCE_DISPATCH_INTENT"), None)
-        plan_event = next((event for event in reversed(events) if event.event == "PLAN_REVIEWED"), None)
-        if run_event is None or plan_event is None:
+        run_id = _unresolved_run_id(events)
+        run_event = (
+            next(
+                (
+                    event
+                    for event in reversed(events)
+                    if event.run_id == run_id and event.event == "SOURCE_DISPATCH_INTENT"
+                ),
+                None,
+            )
+            if run_id is not None
+            else None
+        )
+        plan_event = (
+            next(
+                (
+                    event
+                    for event in reversed(events)
+                    if event.run_id == run_id and event.event in {"PLAN_READY", "PLAN_REVIEWED"}
+                ),
+                None,
+            )
+            if run_id is not None
+            else None
+        )
+        attempt_event = (
+            next(
+                (
+                    event
+                    for event in reversed(events)
+                    if event.run_id == run_id and event.event == "ATTEMPT_STARTED"
+                ),
+                None,
+            )
+            if run_id is not None
+            else None
+        )
+        try:
+            binding = _config_binding(config, self.client)
+        except Exception as exc:
+            reason = f"restart binding cannot be established: {sanitize_exception(exc)}"
+            journal.append("RESTART_BINDING_MISMATCH", {"reason": reason}, run_id=journal.run_id)
+            return HandoffResult(
+                Outcome.UNKNOWN,
+                Phase.RECONCILIATION,
+                journal.run_id,
+                None,
+                None,
+                None,
+                reason,
+                (reason,),
+            )
+        if run_event is None or plan_event is None or attempt_event is None or run_id is None:
             reason = "unresolved journal lacks a complete plan; reconciliation cannot be bound safely"
             return HandoffResult(Outcome.UNKNOWN, Phase.RECONCILIATION, journal.run_id, None, None, None, reason, (reason,))
-        run_id = run_event.run_id
-        plan = _plan_from_dict(plan_event.payload.get("plan"))
+        if attempt_event.payload.get("binding") != binding:
+            reason = "restart configuration/account/environment binding conflicts with the original attempt"
+            journal.append("RESTART_BINDING_MISMATCH", {"reason": reason}, run_id=run_event.run_id)
+            return HandoffResult(Outcome.UNKNOWN, Phase.RECONCILIATION, run_event.run_id, None, None, None, reason, (reason,))
+        try:
+            plan = _plan_from_dict(plan_event.payload.get("plan"))
+        except Exception as exc:
+            reason = f"journal plan cannot be reconstructed safely: {sanitize_exception(exc)}"
+            journal.append("RESTART_RECONCILIATION_BLOCKED", {"reason": reason}, run_id=run_id)
+            return HandoffResult(Outcome.UNKNOWN, Phase.RECONCILIATION, run_id, None, None, None, reason, (reason,))
+        if plan.run_id != run_id:
+            reason = "journal plan run identity conflicts with the unresolved mutation run"
+            journal.append("RESTART_RECONCILIATION_BLOCKED", {"reason": reason}, run_id=run_id)
+            return HandoffResult(Outcome.UNKNOWN, Phase.RECONCILIATION, run_id, None, None, None, reason, (reason,))
+        if not _plan_matches_binding(plan, binding):
+            reason = "journal plan identity/parameters conflict with the original configuration"
+            journal.append("RESTART_RECONCILIATION_BLOCKED", {"reason": reason}, run_id=run_id)
+            return HandoffResult(Outcome.UNKNOWN, Phase.RECONCILIATION, run_id, None, None, None, reason, (reason,))
+        if not plan.source_identity or not plan.receiver_identity:
+            reason = "journal plan lacks immutable source/receiver identities"
+            journal.append("RESTART_RECONCILIATION_BLOCKED", {"reason": reason}, run_id=run_id)
+            return HandoffResult(Outcome.UNKNOWN, Phase.RECONCILIATION, run_id, plan, None, None, reason, (reason,))
+        preflight_event = next(
+            (
+                event
+                for event in reversed(events)
+                if event.run_id == run_id and event.event == "PREFLIGHT_PROVED"
+            ),
+            None,
+        )
+        if (
+            preflight_event is None
+            or preflight_event.payload.get("source_identity") != plan.source_identity
+            or preflight_event.payload.get("receiver_identity") != plan.receiver_identity
+        ):
+            reason = "journal plan account identities are not bound to the original preflight evidence"
+            journal.append("RESTART_RECONCILIATION_BLOCKED", {"reason": reason}, run_id=run_id)
+            return HandoffResult(Outcome.UNKNOWN, Phase.RECONCILIATION, run_id, plan, None, None, reason, (reason,))
         journal.append("RESTART_RECONCILIATION_ONLY", {"plan": plan.as_dict()}, run_id=run_id)
         try:
             source = _as_account(await self.client.account_snapshot(plan.source.account_index, plan.source.market_id))
             receiver = _as_account(await self.client.account_snapshot(plan.receiver.account_index, plan.receiver.market_id))
         except Exception as exc:
             reason = f"restart reconciliation account read failed: {sanitize_exception(exc)}"
-            journal.append("COMPLETE", {"outcome": Outcome.UNKNOWN.value, "reason": reason}, run_id=run_id)
+            journal.append(
+                "RESTART_RECONCILIATION_BLOCKED",
+                {"reason": reason, "binding": dict(binding), "plan": plan.as_dict()},
+                run_id=run_id,
+            )
             return HandoffResult(Outcome.UNKNOWN, Phase.RECONCILIATION, run_id, plan, None, None, reason, (reason,))
         unknown: list[str] = []
         source_before = replace(source, signed_position=plan.source_position_before)
@@ -824,11 +1282,22 @@ class HandoffEngine:
             receiver_before,
             source_order_id=_event_order_id(events, run_id, "SOURCE_DISPATCH_RESULT"),
             receiver_order_id=_event_order_id(events, run_id, "RECEIVER_DISPATCH_RESULT"),
+            source_dispatched=True,
+            receiver_dispatched=any(event.run_id == run_id and event.event == "RECEIVER_DISPATCH_INTENT" for event in events),
             run_id=run_id,
             journal=journal,
             unknown_reasons=unknown,
         )
-        return await self._finish(journal, run_id, plan, source_leg, receiver_leg, unknown, forced_outcome=Outcome.UNKNOWN if unknown else None)
+        return await self._finish(
+            journal,
+            run_id,
+            plan,
+            source_leg,
+            receiver_leg,
+            unknown,
+            binding=binding,
+            forced_outcome=Outcome.UNKNOWN if unknown else None,
+        )
 
     @property
     def _poll_limit(self) -> int:
@@ -853,10 +1322,36 @@ def _account_from_client(client: HandoffClient, role: str) -> int:
     return value
 
 
+def _safe_preflight_reason(exc: BaseException) -> str:
+    """Expose only named, non-sensitive contract conflicts to the operator."""
+
+    if isinstance(exc, PreflightBlocked) and str(exc) == (
+        "Lighter MARKET SELL exposes only a minimum price; the configured gross/fee ceiling cannot be enforced before dispatch"
+    ):
+        return "protocol_conflict_receiver_sell_market_price_floor"
+    return sanitize_exception(exc)
+
+
 def _client_order_index(run_id: str, leg: str) -> int:
     digest = hashlib.sha256(f"{run_id}:{leg}".encode("utf-8")).digest()
     value = int.from_bytes(digest[:6], "big") & ((1 << 47) - 1)
     return value or 1
+
+
+def _unresolved_run_id(events: Sequence[Any]) -> str | None:
+    """Select the newest run that still needs read-only reconciliation."""
+
+    mutation_events = {"SOURCE_DISPATCH_INTENT", "RECEIVER_DISPATCH_INTENT", "CANCEL_DISPATCH_INTENT"}
+    candidates: list[tuple[int, str]] = []
+    for run_id in {event.run_id for event in events}:
+        run_events = [event for event in events if event.run_id == run_id]
+        if not any(event.event in mutation_events for event in run_events):
+            continue
+        last = run_events[-1]
+        if last.event == "COMPLETE" and last.payload.get("outcome") != Outcome.UNKNOWN.value:
+            continue
+        candidates.append((last.sequence, run_id))
+    return max(candidates)[1] if candidates else None
 
 
 def _event_order_id(events: Sequence[Any], run_id: str, event_name: str) -> str | None:
@@ -867,30 +1362,105 @@ def _event_order_id(events: Sequence[Any], run_id: str, event_name: str) -> str 
     return None
 
 
+def _trade_economic_key(trade: TradeReceipt) -> tuple[Any, ...]:
+    return (
+        trade.trade_id,
+        trade.account_index,
+        trade.market_id,
+        trade.order_id,
+        trade.side.upper(),
+        trade.quantity,
+        trade.price,
+        trade.fee,
+        trade.counterparty_account_index,
+    )
+
+
+def _config_binding(config: HandoffConfig, client: HandoffClient) -> dict[str, Any]:
+    return {
+        "market_id": config.market_id,
+        "market_symbol": config.market_symbol.upper(),
+        "environment": config.environment.lower(),
+        "journal_path": config.journal_path,
+        "api_base_url": config.api_base_url,
+        "chain_id": config.chain_id,
+        "api_key_index": config.api_key_index,
+        "source_account_index": _account_from_client(client, "source"),
+        "receiver_account_index": _account_from_client(client, "receiver"),
+        "direction": config.direction.value,
+        "quantity": str(config.quantity),
+        "source_limit_price": str(config.source_limit_price),
+        "receiver_worst_price": str(config.receiver_worst_price),
+        "receiver_price_cap": None if config.receiver_price_cap is None else str(config.receiver_price_cap),
+        "operator_execution_opt_in": config.operator_execution_opt_in,
+        "operator_plan_reviewed": config.operator_plan_reviewed,
+        "max_gross_notional": str(config.max_gross_notional),
+        "source_fee_budget": str(config.source_fee_budget),
+        "receiver_fee_budget": str(config.receiver_fee_budget),
+        "freshness_seconds": config.freshness_seconds,
+        "request_timeout_seconds": config.request_timeout_seconds,
+        "order_timeout_seconds": config.order_timeout_seconds,
+        "reconcile_timeout_seconds": config.reconcile_timeout_seconds,
+        "poll_interval_seconds": config.poll_interval_seconds,
+        "max_poll_count": config.max_poll_count,
+        "client_order_prefix": config.client_order_prefix,
+        "source_order_lifetime_seconds": config.source_order_lifetime_seconds,
+        "auth_token_lifetime_seconds": config.auth_token_lifetime_seconds,
+        "sdk_version": getattr(client, "sdk_version", None),
+        "implementation_fingerprint": _implementation_fingerprint(),
+    }
+
+
+def _implementation_fingerprint() -> str:
+    """Bind a journaled attempt to the exact HCR-1 source files that ran."""
+
+    package_dir = Path(__file__).resolve().parent
+    digest = hashlib.sha256()
+    for name in ("contracts.py", "engine.py", "journal.py", "sdk.py", "cli.py"):
+        path = package_dir / name
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return f"sha256:{digest.hexdigest()}"
+
+
 def _plan_from_dict(value: Any) -> HandoffPlan:
     if not isinstance(value, Mapping):
         raise RuntimeError("journal plan is malformed")
+
+    def exact_int(item: Mapping[str, Any], key: str, *, minimum: int = 0) -> int:
+        value = item.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            raise RuntimeError(f"journal order field {key} is malformed")
+        return value
+
+    def exact_bool(item: Mapping[str, Any], key: str) -> bool:
+        value = item.get(key)
+        if not isinstance(value, bool):
+            raise RuntimeError(f"journal order field {key} is malformed")
+        return value
 
     def order(item: Any) -> OrderPlan:
         if not isinstance(item, Mapping):
             raise RuntimeError("journal order plan is malformed")
         return OrderPlan(
-            account_index=int(item["account_index"]),
-            market_id=int(item["market_id"]),
-            side=str(item["side"]),
+            account_index=exact_int(item, "account_index"),
+            market_id=exact_int(item, "market_id"),
+            side=item.get("side"),
             quantity=Decimal(str(item["quantity"])),
-            quantity_int=int(item["quantity_int"]),
+            quantity_int=exact_int(item, "quantity_int", minimum=1),
             price=Decimal(str(item["price"])),
-            price_int=int(item["price_int"]),
-            order_type=str(item["order_type"]),
-            time_in_force=str(item["time_in_force"]),
-            reduce_only=bool(item["reduce_only"]),
-            order_expiry_ms=int(item["order_expiry_ms"]),
-            client_order_index=int(item["client_order_index"]),
+            price_int=exact_int(item, "price_int", minimum=1),
+            order_type=item.get("order_type"),
+            time_in_force=item.get("time_in_force"),
+            reduce_only=exact_bool(item, "reduce_only"),
+            order_expiry_ms=exact_int(item, "order_expiry_ms"),
+            client_order_index=exact_int(item, "client_order_index"),
         )
 
     return HandoffPlan(
-        run_id=str(value["run_id"]),
+        run_id=value.get("run_id"),
         source=order(value["source"]),
         receiver=order(value["receiver"]),
         source_position_before=Decimal(str(value["source_position_before"])),
@@ -898,7 +1468,35 @@ def _plan_from_dict(value: Any) -> HandoffPlan:
         direction=Direction(value["direction"]),
         quantity=Decimal(str(value["quantity"])),
         created_at=float(value["created_at"]),
+        source_fee_rate=(
+            None if value.get("source_fee_rate") is None else Decimal(str(value["source_fee_rate"]))
+        ),
+        receiver_fee_rate=(
+            None if value.get("receiver_fee_rate") is None else Decimal(str(value["receiver_fee_rate"]))
+        ),
+        source_identity=("" if value.get("source_identity") is None else str(value["source_identity"])),
+        receiver_identity=("" if value.get("receiver_identity") is None else str(value["receiver_identity"])),
     )
+
+
+def _plan_matches_binding(plan: HandoffPlan, binding: Mapping[str, Any]) -> bool:
+    """Keep read-only restart tied to the original configured operation."""
+
+    try:
+        return (
+            plan.source.account_index == int(binding["source_account_index"])
+            and plan.receiver.account_index == int(binding["receiver_account_index"])
+            and plan.source.market_id == int(binding["market_id"])
+            and plan.receiver.market_id == int(binding["market_id"])
+            and plan.direction.value == str(binding["direction"])
+            and plan.quantity == Decimal(str(binding["quantity"]))
+            and plan.source.quantity == plan.quantity
+            and plan.receiver.quantity == plan.quantity
+            and plan.source.price == Decimal(str(binding["source_limit_price"]))
+            and plan.receiver.price == Decimal(str(binding["receiver_worst_price"]))
+        )
+    except (KeyError, TypeError, ValueError, ArithmeticError):
+        return False
 
 
 async def run_handoff(config: HandoffConfig, client: HandoffClient, *, clock: Clock | None = None) -> HandoffResult:

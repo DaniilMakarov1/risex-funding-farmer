@@ -11,6 +11,13 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from typing import Any, Mapping
+from urllib.parse import urlsplit
+
+
+OFFICIAL_MAINNET_API_URL = "https://mainnet.zklighter.elliot.ai"
+OFFICIAL_MAINNET_CHAIN_ID = 304
+SUPPORTED_TIME_IN_FORCE = frozenset({"IOC", "GTT", "POST_ONLY"})
+SUPPORTED_ORDER_TYPES = frozenset({"LIMIT", "MARKET"})
 
 
 class Direction(StrEnum):
@@ -52,16 +59,21 @@ TERMINAL_ORDER_STATUSES = frozenset(
     {
         "filled",
         "canceled",
-        "cancelled",
         "canceled-post-only",
         "canceled-reduce-only",
         "canceled-invalid-balance",
-        "rejected",
-        "expired",
-        "failed",
+        "canceled-position-not-allowed",
+        "canceled-margin-not-allowed",
+        "canceled-too-much-slippage",
+        "canceled-not-enough-liquidity",
+        "canceled-self-trade",
+        "canceled-expired",
+        "canceled-oco",
+        "canceled-child",
+        "canceled-liquidation",
     }
 )
-ACTIVE_ORDER_STATUSES = frozenset({"open", "active", "pending", "in-progress"})
+ACTIVE_ORDER_STATUSES = frozenset({"open", "pending", "in-progress"})
 
 
 class ContractError(ValueError):
@@ -75,6 +87,8 @@ class PreflightBlocked(ContractError):
 def _decimal(value: Any, name: str) -> Decimal:
     if isinstance(value, bool):
         raise ContractError(f"{name} must be a finite decimal")
+    if isinstance(value, float):
+        raise ContractError(f"{name} must use an exact decimal string or Decimal, not float")
     try:
         result = value if isinstance(value, Decimal) else Decimal(str(value))
     except (InvalidOperation, ValueError, TypeError) as exc:
@@ -110,6 +124,60 @@ def _text(value: Any, name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ContractError(f"{name} must be non-empty text")
     return value.strip()
+
+
+def _finite_float(value: Any, name: str) -> float:
+    if isinstance(value, bool):
+        raise ContractError(f"{name} must be a finite positive number")
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ContractError(f"{name} must be a finite positive number") from exc
+    if not 0 < result < float("inf"):
+        raise ContractError(f"{name} must be a finite positive number")
+    return result
+
+
+def _normalize_order_type(value: Any, name: str = "order_type") -> str:
+    if isinstance(value, bool):
+        raise ContractError(f"{name} must be LIMIT or MARKET")
+    if isinstance(value, int):
+        value = {0: "LIMIT", 1: "MARKET"}.get(value)
+    if not isinstance(value, str):
+        raise ContractError(f"{name} must be LIMIT or MARKET")
+    normalized = value.strip().upper().replace("_", "-")
+    normalized = {"LIMIT": "LIMIT", "MARKET": "MARKET"}.get(normalized, normalized)
+    if normalized not in SUPPORTED_ORDER_TYPES:
+        raise ContractError(f"{name} has unsupported value")
+    return normalized
+
+
+def _normalize_time_in_force(value: Any, name: str = "time_in_force") -> str:
+    if isinstance(value, bool):
+        raise ContractError(f"{name} has unsupported value")
+    if isinstance(value, int):
+        value = {0: "IOC", 1: "GTT", 2: "POST_ONLY"}.get(value)
+    if not isinstance(value, str):
+        raise ContractError(f"{name} has unsupported value")
+    normalized = value.strip().upper().replace("-", "_")
+    normalized = {
+        "IMMEDIATE_OR_CANCEL": "IOC",
+        "IOC": "IOC",
+        "GOOD_TILL_TIME": "GTT",
+        "GTT": "GTT",
+        "POST_ONLY": "POST_ONLY",
+    }.get(normalized, normalized)
+    if normalized not in SUPPORTED_TIME_IN_FORCE:
+        raise ContractError(f"{name} has unsupported value")
+    return normalized
+
+
+def _normalize_status(value: Any) -> str:
+    normalized = _text(value, "status").lower().replace("_", "-")
+    known = ACTIVE_ORDER_STATUSES | TERMINAL_ORDER_STATUSES
+    if normalized not in known:
+        raise ContractError("order status is not an official active or terminal value")
+    return normalized
 
 
 def _bool(value: Any, name: str) -> bool:
@@ -255,12 +323,13 @@ class OrderSnapshot:
             or (isinstance(self.client_order_index, str) and not self.client_order_index.strip())
         ):
             raise ContractError("client_order_index must be a non-empty integer/string")
-        _text(self.status, "status")
+        object.__setattr__(self, "status", _normalize_status(self.status))
         side = _text(self.side, "side").upper()
         if side not in {"BUY", "SELL"}:
             raise ContractError("order side must be BUY or SELL")
-        _text(self.order_type, "order_type")
-        _text(self.time_in_force, "time_in_force")
+        object.__setattr__(self, "side", side)
+        object.__setattr__(self, "order_type", _normalize_order_type(self.order_type))
+        object.__setattr__(self, "time_in_force", _normalize_time_in_force(self.time_in_force))
         if not isinstance(self.reduce_only, bool):
             raise ContractError("reduce_only must be bool")
         for value, name in (
@@ -291,16 +360,19 @@ class OrderSnapshot:
                     return value[name]
             return default
 
+        raw_price = pick("price", "base_price")
+        if raw_price is None:
+            raise ContractError("order price is required")
         return cls(
             account_index=_int(pick("account_index", "owner_account_index"), "account_index", minimum=0),
             market_id=_int(pick("market_id", "market_index"), "market_id", minimum=0),
             order_id=_text(pick("order_id", "order_index"), "order_id"),
             client_order_index=pick("client_order_index", "client_order_id"),
-            status=_text(pick("status"), "status"),
-            side=_text(pick("side", default="SELL"), "side"),
-            order_type=_text(pick("type", "order_type", default="unknown"), "order_type"),
-            time_in_force=_text(pick("time_in_force", default="unknown"), "time_in_force"),
-            reduce_only=_bool(pick("reduce_only", default=False), "reduce_only"),
+            status=_normalize_status(pick("status")),
+            side=_text(pick("side"), "side"),
+            order_type=_normalize_order_type(pick("type", "order_type"), "order_type"),
+            time_in_force=_normalize_time_in_force(pick("time_in_force"), "time_in_force"),
+            reduce_only=_bool(pick("reduce_only"), "reduce_only"),
             initial_quantity=_positive(
                 pick("initial_quantity", "initial_base_amount", "base_amount"),
                 "initial_quantity",
@@ -313,11 +385,7 @@ class OrderSnapshot:
                 pick("filled_quantity", "filled_base_amount", default="0"),
                 "filled_quantity",
             ),
-            price=(
-                None
-                if pick("price", "base_price") is None
-                else _positive(pick("price", "base_price"), "price")
-            ),
+            price=_positive(raw_price, "price"),
             observed_at=_timestamp(pick("observed_at", "updated_at", "timestamp"), "observed_at"),
         )
 
@@ -335,6 +403,8 @@ class AccountSnapshot:
     margin_required: Decimal | None
     fee_rate: Decimal | None
     source_identity: str
+    incremental_margin_required: Decimal | None = None
+    incremental_margin_evidence: str = ""
 
     def __post_init__(self) -> None:
         _int(self.account_index, "account_index", minimum=0)
@@ -351,15 +421,23 @@ class AccountSnapshot:
             if value is not None:
                 _nonnegative(value, name)
         _text(self.source_identity, "source_identity")
+        if self.incremental_margin_required is not None:
+            _nonnegative(self.incremental_margin_required, "incremental_margin_required")
+        if self.incremental_margin_evidence:
+            _text(self.incremental_margin_evidence, "incremental_margin_evidence")
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "AccountSnapshot":
         position = value.get("signed_position")
         if position is None:
             raw_position = _decimal(value.get("position"), "position")
-            sign = int(value.get("sign", 1))
+            raw_sign = value.get("sign")
+            if isinstance(raw_sign, bool) or not isinstance(raw_sign, int) or raw_sign not in {-1, 1}:
+                raise ContractError("sign must be -1 or 1 when signed_position is absent")
+            sign = raw_sign
             position = raw_position * sign
         raw_orders = value.get("active_orders", ())
+        raw_incremental_evidence = value.get("incremental_margin_evidence")
         return cls(
             account_index=_int(value.get("account_index"), "account_index", minimum=0),
             market_id=_int(value.get("market_id"), "market_id", minimum=0),
@@ -387,6 +465,16 @@ class AccountSnapshot:
                 else _nonnegative(value.get("fee_rate"), "fee_rate")
             ),
             source_identity=_text(value.get("source_identity"), "source_identity"),
+            incremental_margin_required=(
+                None
+                if value.get("incremental_margin_required") is None
+                else _nonnegative(value.get("incremental_margin_required"), "incremental_margin_required")
+            ),
+            incremental_margin_evidence=(
+                ""
+                if raw_incremental_evidence in (None, "")
+                else _text(raw_incremental_evidence, "incremental_margin_evidence")
+            ),
         )
 
 
@@ -408,8 +496,10 @@ class TradeReceipt:
         _int(self.account_index, "account_index", minimum=0)
         _int(self.market_id, "market_id", minimum=0)
         _text(self.order_id, "order_id")
-        if _text(self.side, "side").upper() not in {"BUY", "SELL"}:
+        side = _text(self.side, "side").upper()
+        if side not in {"BUY", "SELL"}:
             raise ContractError("trade side must be BUY or SELL")
+        object.__setattr__(self, "side", side)
         _positive(self.quantity, "quantity")
         _positive(self.price, "price")
         if self.fee is not None:
@@ -440,7 +530,7 @@ class TradeReceipt:
                 ),
                 "order_id",
             ),
-            side=_text(value.get("side", "BUY"), "side"),
+            side=_text(value.get("side"), "side"),
             quantity=_positive(value.get("quantity", value.get("size", value.get("base_amount"))), "quantity"),
             price=_positive(value.get("price"), "price"),
             fee=(
@@ -493,20 +583,31 @@ class HandoffConfig:
     market_symbol: str = "HOOD"
     environment: str = "mainnet"
     operator_execution_opt_in: bool = False
-    api_base_url: str | None = None
+    operator_plan_reviewed: bool = False
+    api_base_url: str | None = OFFICIAL_MAINNET_API_URL
     api_key_index: int | None = None
-    chain_id: int | None = None
+    chain_id: int | None = OFFICIAL_MAINNET_CHAIN_ID
+    receiver_price_cap: Decimal | None = None
+    auth_token_lifetime_seconds: int = 600
 
     def __post_init__(self) -> None:
         _int(self.market_id, "market_id", minimum=0)
-        direction = self.direction if isinstance(self.direction, Direction) else Direction(self.direction)
+        try:
+            direction = self.direction if isinstance(self.direction, Direction) else Direction(self.direction)
+        except (TypeError, ValueError) as exc:
+            raise ContractError("direction must be LONG or SHORT") from exc
         object.__setattr__(self, "direction", direction)
-        _positive(self.quantity, "quantity")
-        _positive(self.source_limit_price, "source_limit_price")
-        _positive(self.receiver_worst_price, "receiver_worst_price")
-        _positive(self.max_gross_notional, "max_gross_notional")
-        _nonnegative(self.source_fee_budget, "source_fee_budget")
-        _nonnegative(self.receiver_fee_budget, "receiver_fee_budget")
+        for field_name in (
+            "quantity",
+            "source_limit_price",
+            "receiver_worst_price",
+            "max_gross_notional",
+        ):
+            object.__setattr__(self, field_name, _positive(getattr(self, field_name), field_name))
+        for field_name in ("source_fee_budget", "receiver_fee_budget"):
+            object.__setattr__(self, field_name, _nonnegative(getattr(self, field_name), field_name))
+        if self.receiver_price_cap is not None:
+            object.__setattr__(self, "receiver_price_cap", _positive(self.receiver_price_cap, "receiver_price_cap"))
         for value, name in (
             (self.freshness_seconds, "freshness_seconds"),
             (self.request_timeout_seconds, "request_timeout_seconds"),
@@ -514,26 +615,53 @@ class HandoffConfig:
             (self.reconcile_timeout_seconds, "reconcile_timeout_seconds"),
             (self.poll_interval_seconds, "poll_interval_seconds"),
         ):
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < float(value) < float("inf"):
-                raise ContractError(f"{name} must be finite and positive")
+            object.__setattr__(self, name, _finite_float(value, name))
         _int(self.max_poll_count, "max_poll_count", minimum=1)
         _int(self.source_order_lifetime_seconds, "source_order_lifetime_seconds", minimum=300)
         if self.source_order_lifetime_seconds > 30 * 24 * 60 * 60:
             raise ContractError("source_order_lifetime_seconds must not exceed 30 days")
         _text(self.client_order_prefix, "client_order_prefix")
         _text(self.journal_path, "journal_path")
-        if self.market_symbol.upper() != "HOOD":
+        market_symbol = _text(self.market_symbol, "market_symbol").upper()
+        object.__setattr__(self, "market_symbol", market_symbol)
+        environment = _text(self.environment, "environment").lower()
+        object.__setattr__(self, "environment", environment)
+        if market_symbol != "HOOD":
             raise ContractError("only HOOD is supported")
-        if self.environment.lower() not in {"mainnet", "production"}:
+        if environment not in {"mainnet", "production"}:
             raise ContractError("environment must be the future user-operated production venue")
         if not isinstance(self.operator_execution_opt_in, bool):
             raise ContractError("operator_execution_opt_in must be bool")
+        if not isinstance(self.operator_plan_reviewed, bool):
+            raise ContractError("operator_plan_reviewed must be bool")
         if self.api_key_index is not None:
             _int(self.api_key_index, "api_key_index", minimum=4)
             if self.api_key_index > 254:
                 raise ContractError("api_key_index must be in 4..254")
-        if self.chain_id is not None:
-            _int(self.chain_id, "chain_id", minimum=0)
+        if self.api_base_url is None:
+            if self.operator_execution_opt_in:
+                raise ContractError("api_base_url is required for execution")
+        else:
+            parsed = urlsplit(self.api_base_url)
+            normalized_url = self.api_base_url.rstrip("/")
+            if (
+                normalized_url != OFFICIAL_MAINNET_API_URL
+                or parsed.scheme != "https"
+                or parsed.netloc != "mainnet.zklighter.elliot.ai"
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.query
+                or parsed.fragment
+                or parsed.path not in {"", "/"}
+            ):
+                raise ContractError("api_base_url must be the exact official Lighter mainnet endpoint")
+            object.__setattr__(self, "api_base_url", normalized_url)
+        if self.chain_id is None or self.chain_id != OFFICIAL_MAINNET_CHAIN_ID:
+            raise ContractError("chain_id must be official Lighter mainnet chain 304")
+        _int(self.chain_id, "chain_id", minimum=0)
+        _int(self.auth_token_lifetime_seconds, "auth_token_lifetime_seconds", minimum=60)
+        if self.auth_token_lifetime_seconds > 8 * 60 * 60:
+            raise ContractError("auth_token_lifetime_seconds must not exceed the documented 8-hour lifetime")
 
     def integer_order_values(self, metadata: MarketMetadata) -> tuple[int, int, int]:
         return (
@@ -557,11 +685,24 @@ class HandoffConfig:
             raise PreflightBlocked("quantity is below the venue size grid")
         if self.quantity < metadata.minimum_base_amount:
             raise PreflightBlocked("quantity is below the documented base minimum")
-        max_price = max(self.source_limit_price, self.receiver_worst_price)
-        if self.quantity * max_price < metadata.minimum_quote_amount:
-            raise PreflightBlocked("gross notional is below the documented quote minimum")
-        if self.quantity * max_price > self.max_gross_notional:
-            raise PreflightBlocked("gross notional exceeds configured bound")
+        source_notional = self.quantity * self.source_limit_price
+        if source_notional < metadata.minimum_quote_amount:
+            raise PreflightBlocked("source maker notional is below the documented quote minimum")
+        receiver_cap = self.receiver_worst_price
+        if self.direction is Direction.SHORT:
+            if self.receiver_price_cap is None:
+                raise PreflightBlocked(
+                    "receiver SELL worst price is a lower bound; an explicit receiver_price_cap is required to prove a gross/fee cap"
+                )
+            if self.receiver_price_cap < self.receiver_worst_price:
+                raise PreflightBlocked("receiver_price_cap must not be below receiver_worst_price")
+            if self.operator_execution_opt_in:
+                raise PreflightBlocked(
+                    "Lighter MARKET SELL exposes only a minimum price; the configured gross/fee ceiling cannot be enforced before dispatch"
+                )
+            receiver_cap = self.receiver_price_cap
+        if max(source_notional, self.quantity * receiver_cap) > self.max_gross_notional:
+            raise PreflightBlocked("configured gross notional bound is exceeded")
         for snapshot, label in ((source, "source"), (receiver, "receiver")):
             if not snapshot.authorized or not snapshot.ready:
                 raise PreflightBlocked(f"{label} account authorization/readiness is unproven")
@@ -581,6 +722,10 @@ class HandoffConfig:
                 raise PreflightBlocked(f"{label} margin evidence is missing")
             if snapshot.margin_required > snapshot.margin_available:
                 raise PreflightBlocked(f"{label} margin is insufficient")
+            if snapshot.incremental_margin_required is None or not snapshot.incremental_margin_evidence:
+                raise PreflightBlocked(f"{label} incremental planned-operation margin evidence is missing")
+            if snapshot.incremental_margin_required > snapshot.margin_available:
+                raise PreflightBlocked(f"{label} incremental planned-operation margin is insufficient")
         if source.account_index == receiver.account_index:
             raise PreflightBlocked("source and receiver accounts must differ")
         expected = self.direction.sign
@@ -594,8 +739,10 @@ class HandoffConfig:
             raise PreflightBlocked("current source/receiver fee evidence is missing")
         if source.fee_rate is None or receiver.fee_rate is None:
             raise PreflightBlocked("current account fee evidence is missing")
-        source_fee = self.quantity * self.source_limit_price * source.fee_rate
-        receiver_fee = self.quantity * self.receiver_worst_price * receiver.fee_rate
+        if metadata.source_fee_rate != source.fee_rate or metadata.receiver_fee_rate != receiver.fee_rate:
+            raise PreflightBlocked("account fee evidence conflicts with current market fee evidence")
+        source_fee = source_notional * source.fee_rate
+        receiver_fee = self.quantity * receiver_cap * receiver.fee_rate
         if source_fee > self.source_fee_budget:
             raise PreflightBlocked("source fee exceeds configured budget")
         if receiver_fee > self.receiver_fee_budget:
@@ -618,6 +765,24 @@ class OrderPlan:
     reduce_only: bool
     order_expiry_ms: int
     client_order_index: int
+
+    def __post_init__(self) -> None:
+        _int(self.account_index, "account_index", minimum=0)
+        _int(self.market_id, "market_id", minimum=0)
+        side = _text(self.side, "side").upper()
+        if side not in {"BUY", "SELL"}:
+            raise ContractError("order side must be BUY or SELL")
+        object.__setattr__(self, "side", side)
+        object.__setattr__(self, "quantity", _positive(self.quantity, "quantity"))
+        _int(self.quantity_int, "quantity_int", minimum=1)
+        object.__setattr__(self, "price", _positive(self.price, "price"))
+        _int(self.price_int, "price_int", minimum=1)
+        object.__setattr__(self, "order_type", _normalize_order_type(self.order_type))
+        object.__setattr__(self, "time_in_force", _normalize_time_in_force(self.time_in_force))
+        if not isinstance(self.reduce_only, bool):
+            raise ContractError("reduce_only must be bool")
+        _int(self.order_expiry_ms, "order_expiry_ms", minimum=0)
+        _int(self.client_order_index, "client_order_index", minimum=0)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -646,6 +811,57 @@ class HandoffPlan:
     direction: Direction
     quantity: Decimal
     created_at: float
+    source_fee_rate: Decimal | None = None
+    receiver_fee_rate: Decimal | None = None
+    source_identity: str = ""
+    receiver_identity: str = ""
+
+    def __post_init__(self) -> None:
+        try:
+            direction = self.direction if isinstance(self.direction, Direction) else Direction(self.direction)
+        except (TypeError, ValueError) as exc:
+            raise ContractError("direction must be LONG or SHORT") from exc
+        object.__setattr__(self, "direction", direction)
+        _text(self.run_id, "run_id")
+        object.__setattr__(self, "quantity", _positive(self.quantity, "quantity"))
+        object.__setattr__(self, "source_position_before", _decimal(self.source_position_before, "source_position_before"))
+        object.__setattr__(self, "receiver_position_before", _decimal(self.receiver_position_before, "receiver_position_before"))
+        _timestamp(self.created_at, "created_at")
+        for value, name in (
+            (self.source_fee_rate, "source_fee_rate"),
+            (self.receiver_fee_rate, "receiver_fee_rate"),
+        ):
+            if value is not None:
+                object.__setattr__(self, name, _nonnegative(value, name))
+        for value, name in (
+            (self.source_identity, "source_identity"),
+            (self.receiver_identity, "receiver_identity"),
+        ):
+            if value:
+                object.__setattr__(self, name, _text(value, name))
+        if self.source.account_index == self.receiver.account_index:
+            raise ContractError("source and receiver plan accounts must differ")
+        if self.source.market_id != self.receiver.market_id:
+            raise ContractError("source and receiver plan markets must match")
+        if self.source.quantity != self.quantity or self.receiver.quantity != self.quantity:
+            raise ContractError("source and receiver plan quantities must equal configured quantity")
+        if self.source.quantity_int != self.receiver.quantity_int:
+            raise ContractError("source and receiver plan integer quantities must match")
+        if self.source.side != direction.source_side or self.receiver.side != direction.receiver_side:
+            raise ContractError("source/receiver plan sides conflict with direction")
+        if (
+            self.source.order_type != "LIMIT"
+            or self.source.time_in_force != "POST_ONLY"
+            or not self.source.reduce_only
+            or self.source.order_expiry_ms <= 0
+            or self.receiver.order_type != "MARKET"
+            or self.receiver.time_in_force != "IOC"
+            or self.receiver.reduce_only
+            or self.receiver.order_expiry_ms != 0
+        ):
+            raise ContractError("source/receiver plan order semantics are not the HCR-1 contract")
+        if self.source.client_order_index == self.receiver.client_order_index:
+            raise ContractError("source and receiver client order identities must differ")
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -657,6 +873,14 @@ class HandoffPlan:
             "direction": self.direction.value,
             "quantity": _wire_decimal(self.quantity),
             "created_at": self.created_at,
+            "source_fee_rate": (
+                None if self.source_fee_rate is None else _wire_decimal(self.source_fee_rate)
+            ),
+            "receiver_fee_rate": (
+                None if self.receiver_fee_rate is None else _wire_decimal(self.receiver_fee_rate)
+            ),
+            "source_identity": self.source_identity,
+            "receiver_identity": self.receiver_identity,
         }
 
 
@@ -691,6 +915,7 @@ class LegReconciliation:
     order: OrderSnapshot | None
     history_complete: bool
     unknown_reasons: tuple[str, ...] = ()
+    dispatched: bool = True
 
     @property
     def filled_quantity(self) -> Decimal:
@@ -743,10 +968,13 @@ class HandoffResult:
                 "position_before": _wire_decimal(value.position_before),
                 "position_after": None if value.position_after is None else _wire_decimal(value.position_after),
                 "history_complete": value.history_complete,
+                "dispatched": value.dispatched,
                 "unknown_reasons": list(value.unknown_reasons),
                 "trades": [
                     {
                         "trade_id": trade.trade_id,
+                        "account_index": trade.account_index,
+                        "market_id": trade.market_id,
                         "order_id": trade.order_id,
                         "side": trade.side,
                         "quantity": _wire_decimal(trade.quantity),
@@ -759,9 +987,19 @@ class HandoffResult:
                 ],
                 "order": None if value.order is None else {
                     "order_id": value.order.order_id,
+                    "client_order_index": value.order.client_order_index,
+                    "account_index": value.order.account_index,
+                    "market_id": value.order.market_id,
+                    "side": value.order.side,
+                    "order_type": value.order.order_type,
+                    "time_in_force": value.order.time_in_force,
+                    "reduce_only": value.order.reduce_only,
+                    "price": None if value.order.price is None else _wire_decimal(value.order.price),
                     "status": value.order.status,
+                    "initial_quantity": _wire_decimal(value.order.initial_quantity),
                     "remaining_quantity": _wire_decimal(value.order.remaining_quantity),
                     "filled_quantity": _wire_decimal(value.order.filled_quantity),
+                    "observed_at": value.order.observed_at,
                 },
             }
 

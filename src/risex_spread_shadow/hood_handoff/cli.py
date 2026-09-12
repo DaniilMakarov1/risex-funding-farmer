@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from decimal import Decimal, InvalidOperation
 import getpass
 import json
 from pathlib import Path
+import sys
 from typing import Any, Mapping
 
 from .contracts import Direction, HandoffConfig
@@ -26,6 +28,8 @@ class PromptSecretProvider:
         if api_key_index != self._api_key_index or account_index not in self._account_indices:
             raise ValueError("secret request does not match configured account/key index")
         if account_index not in self._values:
+            if not sys.stdin.isatty() or not sys.stderr.isatty():
+                raise RuntimeError("hidden private-key input requires an interactive TTY")
             self._values[account_index] = getpass.getpass(
                 f"Lighter private key for account {account_index} (hidden input): "
             )
@@ -54,6 +58,11 @@ def _parser() -> argparse.ArgumentParser:
         "--i-understand-one-attempt-live-operation",
         action="store_true",
         help="required together with --execute; live verification is otherwise not performed",
+    )
+    parser.add_argument(
+        "--confirm-plan",
+        action="store_true",
+        help="confirm that the printed exact plan, bounds and fee/margin requirements were reviewed",
     )
     return parser
 
@@ -94,9 +103,65 @@ def _config(value: Mapping[str, Any], *, execute: bool) -> HandoffConfig:
     if missing:
         raise SystemExit("config is missing required fields: " + ", ".join(missing))
     kwargs = dict(value)
-    kwargs["direction"] = Direction(kwargs["direction"])
-    kwargs["operator_execution_opt_in"] = execute
+    # A plan review is an interactive act, never a JSON configuration flag.
+    # The only way to set it for this process is the explicit --confirm-plan.
+    kwargs.pop("operator_plan_reviewed", None)
+    decimal_fields = (
+        "quantity",
+        "source_limit_price",
+        "receiver_worst_price",
+        "receiver_price_cap",
+        "max_gross_notional",
+        "source_fee_budget",
+        "receiver_fee_budget",
+    )
+    for name in decimal_fields:
+        if name not in kwargs or kwargs[name] is None:
+            continue
+        if isinstance(kwargs[name], float):
+            raise SystemExit(f"invalid HCR-1 configuration: {name} must be an exact decimal string")
+        try:
+            parsed = Decimal(str(kwargs[name]))
+        except (InvalidOperation, ValueError, TypeError) as exc:
+            raise SystemExit(f"invalid HCR-1 configuration: {name} is not a decimal") from exc
+        if not parsed.is_finite():
+            raise SystemExit(f"invalid HCR-1 configuration: {name} must be finite")
+        kwargs[name] = parsed
+    integer_fields = (
+        "market_id",
+        "max_poll_count",
+        "source_order_lifetime_seconds",
+        "api_key_index",
+        "chain_id",
+        "auth_token_lifetime_seconds",
+    )
+    for name in integer_fields:
+        if name not in kwargs or kwargs[name] is None:
+            continue
+        if isinstance(kwargs[name], bool):
+            raise SystemExit(f"invalid HCR-1 configuration: {name} must be an integer")
+        try:
+            parsed = int(str(kwargs[name]))
+        except (TypeError, ValueError) as exc:
+            raise SystemExit(f"invalid HCR-1 configuration: {name} must be an integer") from exc
+        if not isinstance(kwargs[name], int) and str(kwargs[name]).strip() not in {str(parsed), f"+{parsed}"}:
+            raise SystemExit(f"invalid HCR-1 configuration: {name} must be an exact integer")
+        kwargs[name] = parsed
+    for name in (
+        "freshness_seconds",
+        "request_timeout_seconds",
+        "order_timeout_seconds",
+        "reconcile_timeout_seconds",
+        "poll_interval_seconds",
+    ):
+        if name in kwargs and not isinstance(kwargs[name], bool):
+            try:
+                kwargs[name] = float(str(kwargs[name]))
+            except (TypeError, ValueError) as exc:
+                raise SystemExit(f"invalid HCR-1 configuration: {name} must be numeric") from exc
     try:
+        kwargs["direction"] = Direction(str(kwargs["direction"]).upper())
+        kwargs["operator_execution_opt_in"] = execute
         return HandoffConfig(**kwargs)
     except (TypeError, ValueError) as exc:
         raise SystemExit(f"invalid HCR-1 configuration: {exc}") from exc
@@ -108,6 +173,8 @@ async def _run(args: argparse.Namespace) -> int:
     config_data = _load_json(args.config, "config")
     evidence = _load_json(args.market_evidence, "market evidence")
     config = _config(config_data, execute=args.execute)
+    if args.confirm_plan:
+        object.__setattr__(config, "operator_plan_reviewed", True)
     if args.source_account_index is None or args.receiver_account_index is None:
         raise SystemExit("run requires explicit source and receiver account indices")
     if args.source_account_index == args.receiver_account_index:
@@ -122,7 +189,27 @@ async def _run(args: argparse.Namespace) -> int:
                     "market_id": config.market_id,
                     "market_symbol": config.market_symbol,
                     "direction": config.direction.value,
+                    "source_side": config.direction.source_side,
+                    "receiver_side": config.direction.receiver_side,
                     "quantity": str(config.quantity),
+                    "source_limit_price": str(config.source_limit_price),
+                    "receiver_worst_price": str(config.receiver_worst_price),
+                    "source_order_type": "LIMIT",
+                    "source_time_in_force": "POST_ONLY",
+                    "source_reduce_only": True,
+                    "receiver_order_type": "MARKET",
+                    "receiver_time_in_force": "IOC",
+                    "receiver_reduce_only": False,
+                    "source_fee_budget": str(config.source_fee_budget),
+                    "receiver_fee_budget": str(config.receiver_fee_budget),
+                    "max_gross_notional": str(config.max_gross_notional),
+                    "receiver_price_cap": None if config.receiver_price_cap is None else str(config.receiver_price_cap),
+                    "receiver_bound_semantics": (
+                        "BUY price is a ceiling"
+                        if config.direction is Direction.LONG
+                        else "SELL price is a floor; it cannot cap gross/fee exposure"
+                    ),
+                    "plan_reviewed": config.operator_plan_reviewed,
                     "journal_path": config.journal_path,
                 },
                 sort_keys=True,

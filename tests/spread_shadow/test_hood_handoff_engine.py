@@ -31,6 +31,7 @@ def make_config(path: Path, **overrides) -> HandoffConfig:
         "quantity": Decimal("0.125"),
         "source_limit_price": Decimal("100.25"),
         "receiver_worst_price": Decimal("101.25"),
+        "receiver_price_cap": Decimal("101.25"),
         "max_gross_notional": Decimal("200"),
         "source_fee_budget": Decimal("1"),
         "receiver_fee_budget": Decimal("1"),
@@ -44,6 +45,10 @@ def make_config(path: Path, **overrides) -> HandoffConfig:
         "client_order_prefix": "test-hcr",
         "journal_path": str(path),
         "operator_execution_opt_in": True,
+        "operator_plan_reviewed": True,
+        "api_base_url": "https://mainnet.zklighter.elliot.ai",
+        "api_key_index": 4,
+        "chain_id": 304,
     }
     value.update(overrides)
     return HandoffConfig(**value)
@@ -61,18 +66,20 @@ def account(index: int, position: str, active_orders=()):
             "ready": True,
             "margin_available": "1000",
             "margin_required": "1",
+            "incremental_margin_required": "1",
+            "incremental_margin_evidence": "fixture planned delta",
             "fee_rate": "0.001",
             "source_identity": f"account-{index}",
         }
     )
 
 
-def order(*, account_index, order_id, side, status="open", filled="0", remaining="0.125", reduce_only):
+def order(*, account_index, order_id, side, status="open", filled="0", remaining="0.125", reduce_only, client_order_index=1, price="100.25"):
     return OrderSnapshot(
         account_index=account_index,
         market_id=7,
         order_id=order_id,
-        client_order_index=None,
+        client_order_index=client_order_index,
         status=status,
         side=side,
         order_type="LIMIT" if reduce_only else "MARKET",
@@ -81,7 +88,7 @@ def order(*, account_index, order_id, side, status="open", filled="0", remaining
         initial_quantity=Decimal("0.125"),
         remaining_quantity=Decimal(remaining),
         filled_quantity=Decimal(filled),
-        price=Decimal("100.25"),
+        price=Decimal(price),
         observed_at=NOW,
     )
 
@@ -146,6 +153,8 @@ class FakeClient:
                 order_id="source-1",
                 side=plan.side,
                 reduce_only=True,
+                client_order_index=plan.client_order_index,
+                price=str(plan.price),
             )
             return MutationReceipt(True, "source-1", "tx-source")
         self.receiver_order = order(
@@ -156,6 +165,8 @@ class FakeClient:
             filled="0.125" if self.source_fills else "0",
             remaining="0" if self.source_fills else "0.125",
             reduce_only=False,
+            client_order_index=plan.client_order_index,
+            price=str(plan.price),
         )
         if self.source_fills:
             self.source_position = Decimal("0.875") if self.source_order.side == "SELL" else Decimal("-0.875")
@@ -167,6 +178,8 @@ class FakeClient:
                 filled="0.125",
                 remaining="0",
                 reduce_only=True,
+                client_order_index=self.source_order.client_order_index,
+                price=str(self.source_order.price),
             )
             self.receiver_position = Decimal("0.125") if plan.side == "BUY" else Decimal("-0.125")
         return MutationReceipt(True, "receiver-1", "tx-receiver")
@@ -182,18 +195,20 @@ class FakeClient:
                 filled=str(self.source_order.filled_quantity),
                 remaining="0",
                 reduce_only=True,
+                client_order_index=self.source_order.client_order_index,
+                price=str(self.source_order.price),
             )
         return MutationReceipt(True, order_id, "tx-cancel")
 
     async def list_trades(self, account_index, market_id, *, order_id=None, cursor=None, limit=100):
         if self.source_fills and order_id == "source-1" and account_index == self.source_account_index:
             return HistoryPage(
-                trades=(TradeReceipt("t-source", account_index, 7, "source-1", self.source_order.side, Decimal("0.125"), Decimal("100.25"), Decimal("0.0125"), 999, NOW),),
+                trades=(TradeReceipt("t-source", account_index, 7, "source-1", self.source_order.side, Decimal("0.125"), self.source_order.price, Decimal("0.0125"), self.receiver_account_index, NOW),),
             )
         if self.source_fills and order_id == "receiver-1" and account_index == self.receiver_account_index:
-            trades = [TradeReceipt("t-receiver", account_index, 7, "receiver-1", self.receiver_order.side, Decimal("0.125"), Decimal("101"), Decimal("0.0126"), self.source_account_index, NOW)]
+            trades = [TradeReceipt("t-receiver", account_index, 7, "receiver-1", self.receiver_order.side, Decimal("0.125"), self.receiver_order.price, Decimal("0.0126"), self.source_account_index, NOW)]
             if self.foreign_receipt:
-                trades.append(TradeReceipt("t-foreign", 999, 7, "receiver-1", "BUY", Decimal("0.125"), Decimal("101"), Decimal("0.0126"), None, NOW))
+                trades.append(TradeReceipt("t-foreign", 999, 7, "receiver-1", "BUY", Decimal("0.125"), self.receiver_order.price, Decimal("0.0126"), None, NOW))
             return HistoryPage(trades=tuple(reversed(trades)))
         return HistoryPage()
 
@@ -251,6 +266,8 @@ async def test_partial_source_fill_blocks_receiver_and_cancels_identified_order(
                 filled="0.025",
                 remaining="0.100",
                 reduce_only=True,
+                client_order_index=client.source_order.client_order_index,
+                price=str(client.source_order.price),
             )
         return receipt
 
@@ -275,15 +292,28 @@ async def test_restart_reconciles_without_replaying_intents(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_short_direction_maps_to_buy_then_sell_and_preflight_blocks_opposite(tmp_path):
+async def test_short_direction_maps_to_buy_then_sell_and_live_cap_conflict_blocks(tmp_path):
     client = FakeClient(source_fills=True)
     client.source_position = Decimal("-1")
     client.receiver_position = Decimal("0")
-    result = await run_handoff(
-        make_config(tmp_path / "short.jsonl", direction=Direction.SHORT), client, clock=FakeClock()
+    preview = await run_handoff(
+        make_config(
+            tmp_path / "short-preview.jsonl",
+            direction=Direction.SHORT,
+            operator_execution_opt_in=False,
+        ),
+        client,
+        clock=FakeClock(),
     )
-    assert result.outcome is Outcome.SUCCESS
-    assert [plan.side for plan in client.submissions] == ["BUY", "SELL"]
+    assert preview.outcome is Outcome.PREVIEW
+    assert preview.plan.source.side == "BUY"
+    assert preview.plan.receiver.side == "SELL"
+    result = await run_handoff(
+        make_config(tmp_path / "short-live.jsonl", direction=Direction.SHORT), client, clock=FakeClock()
+    )
+    assert result.outcome is Outcome.FAILED_PREFLIGHT_BLOCKED
+    assert client.submissions == []
+    assert result.reason == "protocol_conflict_receiver_sell_market_price_floor"
 
 
 @pytest.mark.asyncio

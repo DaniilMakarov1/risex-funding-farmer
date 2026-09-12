@@ -1,7 +1,7 @@
 """Explicit, opt-in Lighter SDK/HTTP adapter for HCR-1.
 
 No SDK module is imported at package import time.  Mutation calls use the
-SDK's ``sign_*`` methods and one explicit ``TransactionApi.send_tx`` call.  The
+SDK's ``sign_*`` methods and one explicit ``sendTx`` form request.  The
 combined ``create_order``/``cancel_order`` helpers are intentionally not used,
 because their retry and response boundaries are not suitable for one-attempt
 close/reopen semantics.
@@ -14,6 +14,7 @@ import importlib
 from importlib import metadata as importlib_metadata
 import inspect
 import json
+import re
 import time
 from typing import Any, Callable, Mapping, Protocol
 
@@ -27,6 +28,7 @@ from .contracts import (
     OrderPlan,
     OrderSnapshot,
     TradeReceipt,
+    OFFICIAL_MAINNET_CHAIN_ID,
 )
 from .journal import sanitize_exception
 
@@ -44,6 +46,12 @@ class MissingSdkError(RuntimeError):
 
 class SdkVersionError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class _CachedToken:
+    value: str
+    expires_at: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +124,7 @@ class PlainAioHttp:
                 f"{self.base_url}/{path.lstrip('/')}",
                 params=dict(params),
                 headers={"Authorization": authorization},
+                allow_redirects=False,
             ) as response:
                 raw = await response.text()
                 try:
@@ -128,6 +137,30 @@ class PlainAioHttp:
                 if not isinstance(payload, Mapping):
                     raise RuntimeError("Lighter read response is not an object")
                 return dict(payload)
+
+    async def post_form(self, path: str, *, form: Mapping[str, Any]) -> dict[str, Any]:
+        """Send exactly one mutation request without aiohttp-retry or SDK REST."""
+
+        try:
+            import aiohttp
+        except ImportError as exc:
+            raise MissingSdkError("aiohttp is required for the explicit mutation transport") from exc
+        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                f"{self.base_url}/{path.lstrip('/')}",
+                data=dict(form),
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                allow_redirects=False,
+            ) as response:
+                raw = await response.text()
+                try:
+                    payload = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(f"Lighter mutation response was not JSON (HTTP {response.status})") from exc
+                if not isinstance(payload, Mapping):
+                    raise RuntimeError("Lighter mutation response is not an object")
+                return {**dict(payload), "_http_status": response.status}
 
 
 class LighterSdkClient:
@@ -146,6 +179,7 @@ class LighterSdkClient:
         market_evidence: Mapping[str, Any],
         signer_factory: Callable[..., Any] | None = None,
         api_factory: Callable[..., Any] | None = None,
+        http_factory: Callable[..., Any] | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         if config.api_base_url is None:
@@ -164,9 +198,10 @@ class LighterSdkClient:
         self._clock = clock
         self._signers: dict[int, Any] = {}
         self._apis: dict[int, Any] = {}
-        self._tokens: dict[int, str] = {}
+        self._tokens: dict[int, _CachedToken] = {}
         self._api_client: Any | None = None
-        self._http = PlainAioHttp(config.api_base_url, timeout_seconds=config.request_timeout_seconds)
+        self.sdk_version = REQUIRED_LIGHTER_SDK_VERSION
+        self._http = (http_factory or PlainAioHttp)(config.api_base_url, timeout_seconds=config.request_timeout_seconds)
 
     @staticmethod
     def verify_sdk() -> None:
@@ -200,9 +235,11 @@ class LighterSdkClient:
             "url": self.config.api_base_url,
             "account_index": account_index,
             "api_private_keys": {key_index: private_key},
+            "chain_id": self.config.chain_id,
         }
-        if self.config.chain_id is not None:
-            kwargs["chain_id"] = self.config.chain_id
+        nonce_types = getattr(getattr(module, "nonce_manager", None), "NonceManagerType", None)
+        if nonce_types is not None:
+            kwargs["nonce_management_type"] = nonce_types.API
         signer = factory(**kwargs)
         self._signers[account_index] = signer
         return signer
@@ -220,32 +257,39 @@ class LighterSdkClient:
         if self._api_client is not None:
             return self._api_client
         module = module or self._lighter()
-        # Generated API clients take ApiClient(Configuration), not a URL.  Set
-        # retries=0 explicitly so even read calls cannot silently replay and
-        # mutation send_tx has one observable transport attempt.
+        # Generated API clients take ApiClient(Configuration), not a URL.  Keep
+        # retries disabled (None) so reads and any accidental generated call
+        # cannot silently replay; mutation transport is explicit below.
         configuration = module.Configuration(
             host=self.config.api_base_url,
-            retries=0,
+            retries=None,
         )
         self._api_client = module.ApiClient(configuration)
         return self._api_client
 
     async def _authorization(self, account_index: int) -> str:
-        if account_index in self._tokens:
-            return self._tokens[account_index]
+        cached = self._tokens.get(account_index)
+        if cached is not None and self._clock() < cached.expires_at:
+            return cached.value
         signer = self._signer(account_index)
         key_index = self.config.api_key_index
         assert key_index is not None
+        lifetime = self.config.auth_token_lifetime_seconds
         result = await _await(
             signer.create_auth_token_with_expiry(
-                deadline=int(self.config.request_timeout_seconds),
+                deadline=int(lifetime),
                 api_key_index=key_index,
             )
         )
         token: Any = result[0] if isinstance(result, tuple) else result
+        if isinstance(result, tuple) and len(result) > 1 and result[1]:
+            raise RuntimeError("Lighter auth token request was rejected")
         if not isinstance(token, str) or not token:
             raise RuntimeError("Lighter auth token was not returned")
-        self._tokens[account_index] = token
+        self._tokens[account_index] = _CachedToken(
+            token,
+            self._clock() + max(1.0, float(lifetime) - 1.0),
+        )
         return token
 
     async def market_metadata(self, market_id: int) -> MarketMetadata:
@@ -262,6 +306,7 @@ class LighterSdkClient:
             )
         )
         raw_details = _model_dict(details)
+        _require_success_code(raw_details, "orderBookDetails")
         observed = _select_perp_market(raw_details, market_id)
         evidence = dict(self.market_evidence)
         try:
@@ -281,7 +326,8 @@ class LighterSdkClient:
             raise ContractError("market evidence conflicts with orderBookDetails symbol")
         evidence.setdefault("market_id", market_id)
         evidence.setdefault("symbol", "HOOD")
-        evidence.setdefault("observed_at", self._clock())
+        if "observed_at" not in evidence:
+            raise ContractError("market evidence must include its original observed_at timestamp")
         # Do not infer status/fees/precision/minimums from undocumented SDK
         # attributes.  Merge only exact named fields supplied by the operator.
         observed_aliases = {
@@ -309,18 +355,35 @@ class LighterSdkClient:
                 _request_timeout=self.config.request_timeout_seconds,
             )
         )
+        raw_account_mapping = _model_dict(raw_account)
+        _require_success_code(raw_account_mapping, "account")
         account = _first_mapping(raw_account, "accounts")
-        returned_index = account.get("index", account.get("account_index", account_index))
+        if not {"index", "l1_address", "status", "positions", "available_balance"}.issubset(account):
+            raise ContractError("Lighter account response is missing required identity/state fields")
+        account_identity = account["l1_address"]
+        if not isinstance(account_identity, str) or not account_identity.strip():
+            raise ContractError("Lighter account response has no exact account identity")
+        returned_index = account["index"]
         try:
             if int(returned_index) != account_index:
                 raise ContractError("Lighter account response identity does not match requested account")
         except (TypeError, ValueError) as exc:
             raise ContractError("Lighter account response has no exact account identity") from exc
-        positions = account.get("positions") or []
+        positions = account["positions"]
+        if not isinstance(positions, (list, tuple)):
+            raise ContractError("Lighter account positions field is malformed")
         position: Mapping[str, Any] | None = None
         for candidate in positions:
             candidate_map = _model_dict(candidate)
-            if int(candidate_map.get("market_id", candidate_map.get("market_index", -1))) == market_id:
+            if "market_id" not in candidate_map:
+                raise ContractError("Lighter account position lacks market identity")
+            try:
+                candidate_market_id = int(candidate_map["market_id"])
+            except (TypeError, ValueError) as exc:
+                raise ContractError("Lighter account position has invalid market identity") from exc
+            if candidate_market_id == market_id:
+                if "position" not in candidate_map or "sign" not in candidate_map:
+                    raise ContractError("Lighter account position lacks required sign/position fields")
                 position = candidate_map
                 break
         position = position or {"position": "0", "sign": 1}
@@ -329,7 +392,26 @@ class LighterSdkClient:
         margin_required = account.get("cross_initial_margin_requirement")
         now = self._clock()
         fee_rate_key = "source_fee_rate" if account_index == self.source_account_index else "receiver_fee_rate"
+        incremental_key = (
+            "source_incremental_margin_required"
+            if account_index == self.source_account_index
+            else "receiver_incremental_margin_required"
+        )
+        incremental_evidence_key = (
+            "source_incremental_margin_evidence"
+            if account_index == self.source_account_index
+            else "receiver_incremental_margin_evidence"
+        )
+        status = account["status"]
+        ready = status in (0, 1, "active", "online")
+        if not ready:
+            raise ContractError("Lighter account status is not an approved active value")
         fee_rate = self.market_evidence.get(fee_rate_key)
+        incremental_margin = self.market_evidence.get(incremental_key)
+        incremental_evidence = self.market_evidence.get(incremental_evidence_key, "")
+        if incremental_margin is None or not incremental_evidence:
+            # Do not treat current cross margin as the requirement of adding Q.
+            incremental_margin = None
         return AccountSnapshot.from_mapping(
             {
                 "account_index": account_index,
@@ -339,11 +421,13 @@ class LighterSdkClient:
                 "active_orders": active_orders,
                 "observed_at": now,
                 "authorized": True,
-                "ready": bool(account.get("status", 0) in (0, 1, "active", "online")),
+                "ready": ready,
                 "margin_available": available,
                 "margin_required": margin_required,
                 "fee_rate": fee_rate,
-                "source_identity": str(account.get("l1_address", "")),
+                "source_identity": account_identity.strip(),
+                "incremental_margin_required": incremental_margin,
+                "incremental_margin_evidence": incremental_evidence,
             }
         )
 
@@ -359,17 +443,17 @@ class LighterSdkClient:
                 _request_timeout=self.config.request_timeout_seconds,
             )
         )
-        values = _model_dict(raw).get("orders", [])
+        raw_mapping = _model_dict(raw)
+        _require_success_code(raw_mapping, "accountActiveOrders")
+        if "orders" not in raw_mapping or not isinstance(raw_mapping["orders"], (list, tuple)):
+            raise ContractError("accountActiveOrders response lacks an orders list")
+        values = raw_mapping["orders"]
         result: list[OrderSnapshot] = []
         for item in values:
-            result.append(
-                OrderSnapshot.from_mapping(
-                    {
-                        **_model_dict(item),
-                        "observed_at": self._clock(),
-                    }
-                )
-            )
+            parsed = OrderSnapshot.from_mapping({**_model_dict(item), "observed_at": self._clock()})
+            if parsed.account_index != account_index or parsed.market_id != market_id:
+                raise ContractError("active order response identity does not match requested account/market")
+            result.append(parsed)
         return tuple(result)
 
     async def lookup_order(
@@ -388,7 +472,10 @@ class LighterSdkClient:
             raise ContractError("accountOrders lookup requires the exact client order index")
         params["client_order_indexes"] = str(client_order_index)
         payload = await self._http.get("api/v1/accountOrders", params=params, authorization=token)
-        values = payload.get("orders", [])
+        _require_success_code(payload, "accountOrders")
+        if "orders" not in payload or not isinstance(payload["orders"], (list, tuple)):
+            raise ContractError("accountOrders response lacks an orders list")
+        values = payload["orders"]
         for item in values:
             parsed = OrderSnapshot.from_mapping({**_model_dict(item), "observed_at": self._clock()})
             if order_id is not None and parsed.order_id != str(order_id):
@@ -429,53 +516,102 @@ class LighterSdkClient:
             )
         )
         payload = _model_dict(raw)
+        _require_success_code(payload, "trades")
+        values = payload.get("trades")
+        if not isinstance(values, (list, tuple)):
+            raise ContractError("trades response lacks a trades list")
         trades: list[TradeReceipt] = []
-        for item in payload.get("trades", []):
+        for item in values:
             mapped = _model_dict(item)
-            ask_id = mapped.get("ask_id", mapped.get("ask_id_str"))
-            bid_id = mapped.get("bid_id", mapped.get("bid_id_str"))
-            if order_id is not None:
-                candidate_ids = {
-                    str(mapped.get("order_id", "")),
-                    str(mapped.get("order_index", "")),
-                    str(mapped.get("ask_order_id", "")),
-                    str(mapped.get("bid_order_id", "")),
-                    str(ask_id),
-                    str(bid_id),
-                    str(mapped.get("ask_client_id", "")),
-                    str(mapped.get("bid_client_id", "")),
-                    str(mapped.get("ask_client_id_str", "")),
-                    str(mapped.get("bid_client_id_str", "")),
-                }
-                if str(order_id) not in candidate_ids:
-                    continue
+            required = (
+                "trade_id",
+                "trade_id_str",
+                "market_id",
+                "size",
+                "price",
+                "ask_id",
+                "bid_id",
+                "ask_client_id",
+                "ask_client_id_str",
+                "bid_client_id",
+                "bid_client_id_str",
+                "ask_account_id",
+                "bid_account_id",
+                "timestamp",
+            )
+            if any(key not in mapped for key in required):
+                raise ContractError("trade receipt lacks required official identity/time fields")
+            if (
+                str(mapped["trade_id"]) != str(mapped["trade_id_str"])
+                or str(mapped["ask_client_id"]) != str(mapped["ask_client_id_str"])
+                or str(mapped["bid_client_id"]) != str(mapped["bid_client_id_str"])
+            ):
+                raise ContractError("trade receipt has conflicting numeric/string identities")
             try:
+                receipt_market = int(mapped["market_id"])
+                ask_id = str(mapped["ask_id"])
+                bid_id = str(mapped["bid_id"])
                 ask_account = int(mapped["ask_account_id"])
                 bid_account = int(mapped["bid_account_id"])
             except (KeyError, TypeError, ValueError) as exc:
                 raise ContractError("trade receipt lacks exact ask/bid account identities") from exc
+            if receipt_market != market_id:
+                raise ContractError("trade receipt market identity does not match requested market")
             if account_index not in {ask_account, bid_account}:
                 raise ContractError("trade receipt does not belong to requested account")
             is_ask = account_index == ask_account
-            mapped["order_id"] = str(order_id if order_id is not None else (ask_id if is_ask else bid_id))
+            own_order_id = ask_id if is_ask else bid_id
+            if order_id is not None and own_order_id != str(order_id):
+                continue
+            mapped["order_id"] = own_order_id
             mapped["side"] = "SELL" if is_ask else "BUY"
             mapped["quantity"] = mapped.get("size")
             mapped["counterparty_account_index"] = bid_account if is_ask else ask_account
             mapped["trade_id"] = mapped.get("trade_id_str", mapped.get("trade_id"))
+            mapped["observed_at"] = mapped["timestamp"]
             trades.append(
                 TradeReceipt.from_mapping(
                     {
                         **mapped,
                         "account_index": account_index,
                         "market_id": market_id,
-                        "observed_at": self._clock(),
                     }
                 )
             )
         return HistoryPage(
             trades=tuple(trades),
             next_cursor=payload.get("next_cursor"),
-            complete=not bool(payload.get("next_cursor")) or "next_cursor" in payload,
+            complete=not bool(payload.get("next_cursor")),
+        )
+
+    async def _next_nonce(self, signer: Any, api_key_index: int) -> int:
+        manager = getattr(signer, "nonce_manager", None)
+        method = getattr(manager, "async_next_nonce", None)
+        if method is None:
+            raise ContractError("lighter-sdk nonce manager is unavailable; raw signing cannot use nonce=-1")
+        result = await _await(method(api_key_index))
+        if not isinstance(result, tuple) or len(result) != 2:
+            raise ContractError("lighter-sdk nonce manager returned an unsupported shape")
+        returned_key, nonce = result
+        if (
+            isinstance(returned_key, bool)
+            or not isinstance(returned_key, int)
+            or returned_key != api_key_index
+            or isinstance(nonce, bool)
+            or not isinstance(nonce, int)
+            or nonce < 0
+        ):
+            raise ContractError("lighter-sdk nonce manager returned an invalid account/key nonce")
+        return nonce
+
+    async def _send_signed_tx(self, tx_type: Any, tx_info: Any) -> Mapping[str, Any]:
+        if isinstance(tx_type, bool) or not isinstance(tx_type, int) or not isinstance(tx_info, str) or not tx_info:
+            raise ContractError("lighter-sdk signer returned malformed transaction data")
+        # PlainAioHttp performs exactly one POST to the documented sendTx form
+        # endpoint.  The signed tx body is never journaled or included in errors.
+        return await self._http.post_form(
+            "api/v1/sendTx",
+            form={"tx_type": tx_type, "tx_info": tx_info},
         )
 
     async def submit_order(self, plan: OrderPlan) -> MutationReceipt:
@@ -483,6 +619,8 @@ class LighterSdkClient:
         key_index = self.config.api_key_index
         assert key_index is not None
         try:
+            nonce = await self._next_nonce(signer, key_index)
+            signer_type = type(signer)
             result = await _await(
                 signer.sign_create_order(
                     market_index=plan.market_id,
@@ -490,10 +628,12 @@ class LighterSdkClient:
                     base_amount=plan.quantity_int,
                     price=plan.price_int,
                     is_ask=plan.side == "SELL",
-                    order_type=0 if plan.order_type == "LIMIT" else 1,
-                    time_in_force=2 if plan.time_in_force == "POST_ONLY" else 0,
+                    order_type=getattr(signer_type, "ORDER_TYPE_LIMIT", 0) if plan.order_type == "LIMIT" else getattr(signer_type, "ORDER_TYPE_MARKET", 1),
+                    time_in_force=getattr(signer_type, "ORDER_TIME_IN_FORCE_POST_ONLY", 2) if plan.time_in_force == "POST_ONLY" else getattr(signer_type, "ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL", 0),
                     reduce_only=plan.reduce_only,
                     order_expiry=plan.order_expiry_ms,
+                    skip_nonce=getattr(signer_type, "SKIP_NONCE_OFF", 0),
+                    nonce=nonce,
                     api_key_index=key_index,
                 )
             )
@@ -502,19 +642,12 @@ class LighterSdkClient:
             tx_type, tx_info, tx_hash, error = result
             if error:
                 return MutationReceipt(False, None, _safe_text(tx_hash), sanitize_exception(ValueError(str(error))))
-            tx_api = self._tx_api()
-            response = await _await(
-                tx_api.send_tx(
-                    tx_type=tx_type,
-                    tx_info=tx_info,
-                    _request_timeout=self.config.request_timeout_seconds,
-                )
-            )
+            response = await self._send_signed_tx(tx_type, tx_info)
             code = _response_code(response)
             return MutationReceipt(
                 accepted=code == 200,
                 order_id=None,
-                tx_hash=_safe_text(tx_hash),
+                tx_hash=_safe_text(tx_hash) or _safe_text(_model_dict(response).get("tx_hash")),
                 error=None if code == 200 else f"send_tx response code {code}",
                 response_code=code,
             )
@@ -526,10 +659,14 @@ class LighterSdkClient:
         key_index = self.config.api_key_index
         assert key_index is not None
         try:
+            nonce = await self._next_nonce(signer, key_index)
+            signer_type = type(signer)
             result = await _await(
                 signer.sign_cancel_order(
                     market_index=market_id,
                     order_index=int(order_id),
+                    skip_nonce=getattr(signer_type, "SKIP_NONCE_OFF", 0),
+                    nonce=nonce,
                     api_key_index=key_index,
                 )
             )
@@ -538,38 +675,39 @@ class LighterSdkClient:
             tx_type, tx_info, tx_hash, error = result
             if error:
                 return MutationReceipt(False, order_id, _safe_text(tx_hash), sanitize_exception(ValueError(str(error))))
-            response = await _await(
-                self._tx_api().send_tx(
-                    tx_type=tx_type,
-                    tx_info=tx_info,
-                    _request_timeout=self.config.request_timeout_seconds,
-                )
-            )
+            response = await self._send_signed_tx(tx_type, tx_info)
             code = _response_code(response)
             return MutationReceipt(
                 accepted=code == 200,
                 order_id=order_id,
-                tx_hash=_safe_text(tx_hash),
+                tx_hash=_safe_text(tx_hash) or _safe_text(_model_dict(response).get("tx_hash")),
                 error=None if code == 200 else f"send_tx response code {code}",
                 response_code=code,
             )
         except Exception as exc:
             return MutationReceipt(False, order_id, None, sanitize_exception(exc))
 
-    def _tx_api(self) -> Any:
-        module = self._lighter()
-        return module.TransactionApi(self._generated_api_client(module))
-
-
 def _response_code(value: Any) -> int | None:
     mapping = _model_dict(value)
-    code = mapping.get("code")
+    code = mapping.get("code", mapping.get("_http_status"))
     if code is None:
         return None
     try:
         return int(code)
     except (TypeError, ValueError):
         return None
+
+
+def _require_success_code(payload: Mapping[str, Any], label: str) -> None:
+    code = payload.get("code")
+    if code is None:
+        raise ContractError(f"{label} response lacks required code")
+    try:
+        numeric = int(code)
+    except (TypeError, ValueError) as exc:
+        raise ContractError(f"{label} response code is malformed") from exc
+    if numeric != 200:
+        raise ContractError(f"{label} response was not successful")
 
 
 def _select_perp_market(payload: Mapping[str, Any], market_id: int) -> dict[str, Any]:
@@ -583,8 +721,14 @@ def _select_perp_market(payload: Mapping[str, Any], market_id: int) -> dict[str,
         except (TypeError, ValueError):
             continue
         if candidate_id == market_id:
-            if str(candidate.get("market_type", "perp")).lower() != "perp":
+            market_type = candidate.get("market_type")
+            if not isinstance(market_type, str) or market_type.strip().lower() != "perp":
                 raise ContractError("orderBookDetails identity is not a perpetual market")
+            symbol = candidate.get("symbol")
+            if not isinstance(symbol, str) or not symbol.strip():
+                raise ContractError("orderBookDetails market identity lacks symbol")
+            if symbol.strip().upper() != "HOOD":
+                raise ContractError("orderBookDetails market identity is not HOOD")
             return candidate
     raise ContractError("orderBookDetails response lacks the requested HOOD market")
 
@@ -592,7 +736,10 @@ def _select_perp_market(payload: Mapping[str, Any], market_id: int) -> dict[str,
 def _safe_text(value: Any) -> str | None:
     if value is None:
         return None
-    return sanitize_exception(ValueError(str(value)))
+    text = str(value)
+    if re.fullmatch(r"0x[0-9a-fA-F]{8,128}", text):
+        return text
+    return None
 
 
 __all__ = [

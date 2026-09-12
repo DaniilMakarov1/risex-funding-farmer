@@ -37,6 +37,7 @@ def config(**overrides):
         "quantity": Decimal("0.125"),
         "source_limit_price": Decimal("100.25"),
         "receiver_worst_price": Decimal("101.25"),
+        "receiver_price_cap": Decimal("101.25"),
         "max_gross_notional": Decimal("200"),
         "source_fee_budget": Decimal("1"),
         "receiver_fee_budget": Decimal("1"),
@@ -49,6 +50,9 @@ def config(**overrides):
         "source_order_lifetime_seconds": 300,
         "client_order_prefix": "test-hcr",
         "journal_path": "/tmp/hcr-journal.jsonl",
+        "api_base_url": "https://mainnet.zklighter.elliot.ai",
+        "api_key_index": 4,
+        "chain_id": 304,
     }
     value.update(overrides)
     return HandoffConfig(**value)
@@ -81,6 +85,8 @@ def test_future_evidence_is_blocked():
             "ready": True,
             "margin_available": "100",
             "margin_required": "1",
+            "incremental_margin_required": "1",
+            "incremental_margin_evidence": "fixture planned delta",
             "fee_rate": "0.001",
             "source_identity": "source",
         }
@@ -96,6 +102,8 @@ def test_future_evidence_is_blocked():
             "ready": True,
             "margin_available": "100",
             "margin_required": "1",
+            "incremental_margin_required": "1",
+            "incremental_margin_evidence": "fixture planned delta",
             "fee_rate": "0.001",
             "source_identity": "receiver",
         }
@@ -118,6 +126,8 @@ def test_fee_budget_and_opposite_receiver_fail_before_mutation():
             "ready": True,
             "margin_available": "100",
             "margin_required": "1",
+            "incremental_margin_required": "1",
+            "incremental_margin_evidence": "fixture planned delta",
             "fee_rate": "0.001",
             "source_identity": "0xsource",
         }
@@ -133,6 +143,8 @@ def test_fee_budget_and_opposite_receiver_fail_before_mutation():
             "ready": True,
             "margin_available": "100",
             "margin_required": "1",
+            "incremental_margin_required": "1",
+            "incremental_margin_evidence": "fixture planned delta",
             "fee_rate": "0.001",
             "source_identity": "0xreceiver",
         }

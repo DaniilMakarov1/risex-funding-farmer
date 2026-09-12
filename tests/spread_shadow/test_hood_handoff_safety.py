@@ -46,7 +46,8 @@ def test_cli_help_and_default_mode_are_offline_safe(tmp_path, capsys):
         "source_order_lifetime_seconds": 300,
         "client_order_prefix": "safe",
         "journal_path": str(tmp_path / "journal.jsonl"),
-        "api_base_url": "https://example.invalid",
+        "api_base_url": "https://mainnet.zklighter.elliot.ai",
+        "chain_id": 304,
         "api_key_index": 4,
     }
     evidence = {"market_id": 7}

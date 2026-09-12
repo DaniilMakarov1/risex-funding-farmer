@@ -29,6 +29,7 @@ class FakeSigner:
         self.kwargs = kwargs
         self.sign_calls = []
         self.cancel_calls = []
+        self.nonce_manager = FakeNonceManager()
 
     async def sign_create_order(self, **kwargs):
         self.sign_calls.append(kwargs)
@@ -37,6 +38,27 @@ class FakeSigner:
     async def sign_cancel_order(self, **kwargs):
         self.cancel_calls.append(kwargs)
         return (15, "signed-cancel-info", "0xcancel", None)
+
+    async def create_auth_token_with_expiry(self, **kwargs):
+        return "fixture-token", None
+
+
+class FakeNonceManager:
+    def __init__(self):
+        self.value = 40
+
+    async def async_next_nonce(self, api_key_index):
+        self.value += 1
+        return api_key_index, self.value
+
+
+class FakeHttp:
+    def __init__(self, *args, **kwargs):
+        self.calls = []
+
+    async def post_form(self, path, *, form):
+        self.calls.append((path, dict(form)))
+        return {"code": 200, "tx_hash": "0xserver"}
 
 
 class FakeTxApi:
@@ -79,6 +101,7 @@ class FakeModule:
 
         async def trades(self, **kwargs):
             return {
+                "code": 200,
                 "trades": [
                     {
                         "trade_id": 9,
@@ -88,10 +111,17 @@ class FakeModule:
                         "price": "100.25",
                         "ask_id": 145,
                         "bid_id": 245,
+                        "ask_client_id": 123,
+                        "ask_client_id_str": "123",
+                        "bid_client_id": 456,
+                        "bid_client_id_str": "456",
                         "ask_account_id": 11,
                         "bid_account_id": 22,
                         "is_maker_ask": True,
                         "timestamp": 1000,
+                        "type": "trade",
+                        "tx_hash": "0xtrade",
+                        "usd_amount": "12.53125",
                     }
                 ],
                 "next_cursor": None,
@@ -127,7 +157,8 @@ async def test_sdk_sign_tuple_and_send_are_each_single_explicit_call(monkeypatch
         source_order_lifetime_seconds=300,
         client_order_prefix="sdk-test",
         journal_path="/tmp/sdk-test.jsonl",
-        api_base_url="https://example.invalid",
+        api_base_url="https://mainnet.zklighter.elliot.ai",
+        chain_id=304,
         api_key_index=4,
         operator_execution_opt_in=True,
     )
@@ -138,6 +169,7 @@ async def test_sdk_sign_tuple_and_send_are_each_single_explicit_call(monkeypatch
         secrets=StaticSecretProvider({11: "secret-a", 22: "secret-b"}),
         market_evidence={},
         signer_factory=lambda **kwargs: signer,
+        http_factory=FakeHttp,
     )
     monkeypatch.setattr(LighterSdkClient, "verify_sdk", staticmethod(lambda: None))
     client._lighter = lambda: FakeModule
@@ -158,12 +190,15 @@ async def test_sdk_sign_tuple_and_send_are_each_single_explicit_call(monkeypatch
     receipt = await client.submit_order(plan)
     assert receipt.accepted
     assert len(signer.sign_calls) == 1
-    assert len(FakeTxApi.instances[-1].calls) == 1
-    assert FakeTxApi.instances[-1].calls[0]["tx_type"] == 14
+    assert len(client._http.calls) == 1
+    assert client._http.calls[0][0] == "api/v1/sendTx"
+    assert client._http.calls[0][1]["tx_type"] == 14
+    assert signer.sign_calls[0]["nonce"] == 41
     cancel = await client.cancel_order(11, 7, "99")
     assert cancel.accepted
     assert len(signer.cancel_calls) == 1
-    assert len(FakeTxApi.instances[-1].calls) == 1
+    assert len(client._http.calls) == 2
+    assert signer.cancel_calls[0]["nonce"] == 42
 
 
 @pytest.mark.asyncio
@@ -186,7 +221,8 @@ async def test_official_orderbook_details_schema_is_selected_without_fee_inventi
         source_order_lifetime_seconds=300,
         client_order_prefix="schema-test",
         journal_path="/tmp/schema-test.jsonl",
-        api_base_url="https://example.invalid",
+        api_base_url="https://mainnet.zklighter.elliot.ai",
+        chain_id=304,
         api_key_index=4,
     )
     client = LighterSdkClient(
@@ -202,6 +238,7 @@ async def test_official_orderbook_details_schema_is_selected_without_fee_inventi
             "observed_at": 1000.0,
             "margin_evidence": "accountLimits fixture",
         },
+        signer_factory=lambda **kwargs: FakeSigner(**kwargs),
     )
     monkeypatch.setattr(LighterSdkClient, "verify_sdk", staticmethod(lambda: None))
     client._lighter = lambda: FakeModule
@@ -210,7 +247,6 @@ async def test_official_orderbook_details_schema_is_selected_without_fee_inventi
     assert metadata.price_decimals == 2
     assert metadata.size_decimals == 3
     assert metadata.minimum_quote_amount == Decimal("1")
-    client._tokens[11] = "fixture-token"
     page = await client.list_trades(11, 7, order_id="145")
     assert page.trades[0].order_id == "145"
     assert page.trades[0].side == "SELL"
