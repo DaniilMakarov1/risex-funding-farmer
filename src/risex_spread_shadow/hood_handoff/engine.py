@@ -424,7 +424,6 @@ class HandoffEngine:
                         source_order,
                         plan.metadata_observed_at,
                     )
-                    receiver_mutation_observation_now = decision_now
                     journal.append(
                         "SOURCE_RECHECK_PASS",
                         {"order_id": source_order.order_id, "remaining_quantity": str(source_order.remaining_quantity)},
