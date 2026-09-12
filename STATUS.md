@@ -1,5 +1,9 @@
 # Current status
 
+## HOOD close/reopen utility contract prepared — 2026-09-12
+
+HCR-1 is a new finite development objective after the owner accepted close/reopen at new price instead of preserving source entry/PnL. Accepted main remains 900865d9d979217838e1c5812c0c5bbb47d846f1. No production implementation or live verification is accepted. Chief /root/hood_chief owns isolated governing preparation and review; root is transport/research support; one Luna/max Builder is authorized only under NEXT_TASK. Actual Chief model/effort/speed telemetry is UNKNOWN; Astra/medium and Standard are requested. No code/tests changed or suite needed for this documentation-only checkpoint. No private calls, credentials, signing, market collection or execution performed. Exact SDK reconciliation/cancellation/expiry schemas remain evidence work before implementation. Current scope and acceptance live in NEXT_TASK; historical entries below confer no current operational authority.
+
 ## A/B/C saved-pilot comparison COMPLETE — 2026-09-09
 
 Accepted C implementation f8b11ee37b8435ab11ad4118d3ebebd6662478a4; unchanged default A, durable opt-in contract in SYSTEM_SPEC. Chief reviewed the complete actual diff and independent adverse probes; Builder's final clean isolated Python 3.11.5 suite passed 4241 tests with 3 skips, exit 0. Earlier source/fixture/environment failures remain immutable evidence. No source changes after that test identity.
