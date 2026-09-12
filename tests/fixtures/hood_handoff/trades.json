@@ -1,0 +1,26 @@
+[
+  {
+    "trade_id": "fixture-source-trade",
+    "account_index": 11,
+    "market_id": 7,
+    "order_id": "source-1",
+    "side": "SELL",
+    "quantity": "0.125",
+    "price": "100.25",
+    "fee": "0.0125",
+    "counterparty_account_index": 999,
+    "observed_at": 1000.0
+  },
+  {
+    "trade_id": "fixture-receiver-trade",
+    "account_index": 22,
+    "market_id": 7,
+    "order_id": "receiver-1",
+    "side": "BUY",
+    "quantity": "0.125",
+    "price": "101",
+    "fee": "0.0126",
+    "counterparty_account_index": 11,
+    "observed_at": 1000.0
+  }
+]

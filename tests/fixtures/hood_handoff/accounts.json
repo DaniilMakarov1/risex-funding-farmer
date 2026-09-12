@@ -1,0 +1,28 @@
+[
+  {
+    "account_index": 11,
+    "market_id": 7,
+    "signed_position": "1",
+    "active_orders": [],
+    "observed_at": 1000.0,
+    "authorized": true,
+    "ready": true,
+    "margin_available": "1000",
+    "margin_required": "1",
+    "fee_rate": "0.001",
+    "source_identity": "fixture-source"
+  },
+  {
+    "account_index": 22,
+    "market_id": 7,
+    "signed_position": "0",
+    "active_orders": [],
+    "observed_at": 1000.0,
+    "authorized": true,
+    "ready": true,
+    "margin_available": "1000",
+    "margin_required": "1",
+    "fee_rate": "0.001",
+    "source_identity": "fixture-receiver"
+  }
+]

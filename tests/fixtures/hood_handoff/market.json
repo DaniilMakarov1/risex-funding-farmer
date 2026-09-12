@@ -1,0 +1,13 @@
+{
+  "market_id": 7,
+  "symbol": "HOOD",
+  "status": "active",
+  "price_decimals": 2,
+  "size_decimals": 3,
+  "minimum_base_amount": "0.001",
+  "minimum_quote_amount": "1",
+  "source_fee_rate": "0.001",
+  "receiver_fee_rate": "0.001",
+  "observed_at": 1000.0,
+  "margin_evidence": "fixture-accountLimits"
+}
