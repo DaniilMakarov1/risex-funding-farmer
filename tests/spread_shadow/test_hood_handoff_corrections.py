@@ -5,6 +5,7 @@ import json
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -27,6 +28,7 @@ from risex_spread_shadow.hood_handoff import (
     sanitize_exception,
 )
 from risex_spread_shadow.hood_handoff.cli import PromptSecretProvider, _config, main
+from risex_spread_shadow.hood_handoff.engine import HandoffEngine
 
 from test_hood_handoff_engine import FakeClient, FakeClock, make_config
 from test_hood_handoff_sdk_interface import FakeHttp, FakeModule, FakeSigner
@@ -862,3 +864,132 @@ def test_secret_boundaries_and_tty_guard(monkeypatch):
     monkeypatch.setattr("sys.stderr.isatty", lambda: False)
     with pytest.raises(RuntimeError, match="interactive TTY"):
         provider.private_key(11, 4)
+
+
+@pytest.mark.asyncio
+async def test_mutation_barrier_preserves_observation_age_and_allows_fresh_attempt(monkeypatch, tmp_path):
+    import risex_spread_shadow.hood_handoff.engine as engine_module
+    import risex_spread_shadow.hood_handoff.sdk as sdk_module
+
+    ticks = [100.0]
+    original_engine_time = engine_module.time
+    original_sdk_time = sdk_module.time
+    engine_module.time = SimpleNamespace(monotonic=lambda: ticks[0])
+    sdk_module.time = SimpleNamespace(monotonic=lambda: ticks[0])
+    try:
+        class AdvancingNonce:
+            async def async_next_nonce(self, api_key_index):
+                ticks[0] += 0.006
+                return api_key_index, 41
+
+        config = make_config(
+            tmp_path / "barrier.jsonl",
+            freshness_seconds=0.01,
+            request_timeout_seconds=1,
+        )
+        signer = FakeSigner()
+        signer.nonce_manager = AdvancingNonce()
+        client = LighterSdkClient(
+            config,
+            source_account_index=11,
+            receiver_account_index=22,
+            secrets=StaticSecretProvider({}),
+            market_evidence={},
+            signer_factory=lambda **kwargs: signer,
+            http_factory=FakeHttp,
+        )
+        client._signers[11] = signer
+        plan = OrderPlan(
+            account_index=11,
+            market_id=7,
+            side="SELL",
+            quantity=Decimal("0.125"),
+            quantity_int=125,
+            price=Decimal("100.25"),
+            price_int=10025,
+            order_type="LIMIT",
+            time_in_force="POST_ONLY",
+            reduce_only=True,
+            order_expiry_ms=1_500_000,
+            client_order_index=123,
+        )
+        engine = HandoffEngine(client, clock=FakeClock())
+        stale = SimpleNamespace(observed_at=999.991)
+        stale_plan = engine._mutation_plan(
+            plan,
+            config,
+            observations=(stale,),
+            observation_now=1000.0,
+        )
+        assert stale_plan.mutation_deadline_monotonic == pytest.approx(100.001)
+        rejected = await client.submit_order(stale_plan)
+        assert not rejected.accepted
+        assert signer.sign_calls == []
+        assert client._http.calls == []
+
+        ticks[0] = 200.0
+        fresh_plan = engine._mutation_plan(
+            plan,
+            config,
+            observations=(SimpleNamespace(observed_at=2000.0),),
+            observation_now=2000.0,
+        )
+        accepted = await client.submit_order(fresh_plan)
+        assert accepted.accepted
+        assert len(signer.sign_calls) == 1
+        assert len(client._http.calls) == 1
+    finally:
+        engine_module.time = original_engine_time
+        sdk_module.time = original_sdk_time
+
+
+@pytest.mark.asyncio
+async def test_joint_matching_keeps_known_quantity_and_conflict_separate_from_partial(tmp_path):
+    class Mixed(FakeClient):
+        async def list_trades(self, *args, **kwargs):
+            page = await super().list_trades(*args, **kwargs)
+            expanded = []
+            for trade in page.trades:
+                expanded.extend(
+                    (
+                        replace(trade, trade_id="shared", quantity=Decimal("0.05"), price=Decimal("100.25")),
+                        replace(trade, quantity=Decimal("0.075")),
+                    )
+                )
+            return replace(page, trades=tuple(expanded))
+
+    mixed = await run_handoff(
+        make_config(tmp_path / "mixed-conflict.jsonl"),
+        Mixed(source_fills=True),
+        clock=FakeClock(),
+    )
+    assert mixed.joint_match_quantity == Decimal("0.05")
+    assert mixed.joint_match_status == "CONFLICTING"
+    assert any("0.05" in finding and "CONFLICTING" in finding for finding in mixed.findings)
+
+    class Unrelated(FakeClient):
+        async def list_trades(self, *args, **kwargs):
+            page = await super().list_trades(*args, **kwargs)
+            expanded = []
+            for trade in page.trades:
+                expanded.extend(
+                    (
+                        replace(trade, trade_id="shared", quantity=Decimal("0.05"), price=Decimal("100.25")),
+                        replace(
+                            trade,
+                            trade_id=f"{trade.trade_id}-unrelated",
+                            quantity=Decimal("0.075"),
+                            counterparty_account_index=999,
+                        ),
+                    )
+                )
+            return replace(page, trades=tuple(expanded))
+
+    partial = await run_handoff(
+        make_config(tmp_path / "mixed-unrelated.jsonl"),
+        Unrelated(source_fills=True),
+        clock=FakeClock(),
+    )
+    assert partial.joint_match_quantity == Decimal("0.05")
+    assert partial.joint_match_status == "PARTIAL"
+    assert not any("CONFLICTING" in finding for finding in partial.findings)

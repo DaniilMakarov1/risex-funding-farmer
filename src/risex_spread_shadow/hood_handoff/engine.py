@@ -11,6 +11,7 @@ import asyncio
 from dataclasses import dataclass, replace
 from decimal import Decimal
 import hashlib
+import math
 from pathlib import Path
 import re
 import time
@@ -279,9 +280,15 @@ class HandoffEngine:
         unknown_reasons: list[str] = []
         source_dispatch_attempted = False
         receiver_dispatch_attempted = False
+        receiver_mutation_observations: tuple[Any, ...] = (source, receiver, plan.metadata_observed_at)
+        receiver_mutation_observation_now: float | None = None
         try:
             source_dispatch_attempted = True
-            source_dispatch_plan = self._mutation_plan(plan.source, config)
+            source_dispatch_plan = self._mutation_plan(
+                plan.source,
+                config,
+                observations=(source, receiver, plan.metadata_observed_at),
+            )
             journal.append(
                 "SOURCE_DISPATCH_INTENT",
                 {"plan": source_dispatch_plan.as_dict()},
@@ -411,6 +418,13 @@ class HandoffEngine:
                 elif not self._source_is_resting(source_order, plan.source):
                     unknown_reasons.append("source fill or quantity change before receiver dispatch")
                 else:
+                    receiver_mutation_observations = (
+                        source_recheck,
+                        receiver_recheck,
+                        source_order,
+                        plan.metadata_observed_at,
+                    )
+                    receiver_mutation_observation_now = decision_now
                     journal.append(
                         "SOURCE_RECHECK_PASS",
                         {"order_id": source_order.order_id, "remaining_quantity": str(source_order.remaining_quantity)},
@@ -462,7 +476,12 @@ class HandoffEngine:
 
         try:
             receiver_dispatch_attempted = True
-            receiver_dispatch_plan = self._mutation_plan(plan.receiver, config)
+            receiver_dispatch_plan = self._mutation_plan(
+                plan.receiver,
+                config,
+                observations=receiver_mutation_observations,
+                observation_now=receiver_mutation_observation_now,
+            )
             journal.append("RECEIVER_DISPATCH_INTENT", {"plan": receiver_dispatch_plan.as_dict()}, run_id=run_id)
             receiver_receipt = _as_receipt(
                 await self._bounded(self.client.submit_order(receiver_dispatch_plan), "receiver mutation")
@@ -605,6 +624,7 @@ class HandoffEngine:
             receiver_fee_rate=metadata.receiver_fee_rate,
             source_identity=source.source_identity,
             receiver_identity=receiver.source_identity,
+            metadata_observed_at=metadata.observed_at,
         )
         journal.append(
             "PREFLIGHT_PROVED",
@@ -809,6 +829,21 @@ class HandoffEngine:
                 or not self._time_fresh(current.observed_at, self.clock.now(), self._configured_freshness)
             ):
                 return
+            current_now = self.clock.now()
+            mutation_deadline = self._evidence_deadline(
+                observations=(current,),
+                observation_now=current_now,
+                freshness_seconds=self._configured_freshness,
+                request_timeout_seconds=self._configured_request_timeout,
+            )
+            if mutation_deadline <= time.monotonic():
+                reason = "source cancellation freshness budget expired before mutation"
+                unknown_reasons.append(reason)
+                journal.append("CANCEL_DISPATCH_BLOCKED", {"reason": reason}, run_id=run_id)
+                return
+            set_deadline = getattr(self.client, "set_mutation_deadline", None)
+            if callable(set_deadline):
+                set_deadline(mutation_deadline)
             journal.append(
                 "CANCEL_DISPATCH_INTENT",
                 {
@@ -1396,10 +1431,51 @@ class HandoffEngine:
             raise TimeoutError(f"{label} exceeded configured request timeout") from exc
 
     @staticmethod
-    def _mutation_plan(plan: OrderPlan, config: HandoffConfig) -> OrderPlan:
+    def _evidence_deadline(
+        *,
+        observations: Sequence[Any],
+        observation_now: float,
+        freshness_seconds: float,
+        request_timeout_seconds: float,
+    ) -> float:
+        """Return one monotonic barrier for all evidence used by a mutation."""
+
+        remaining_freshness = freshness_seconds
+        for observation in observations:
+            if observation is None:
+                continue
+            observed_at = getattr(observation, "observed_at", observation)
+            try:
+                observed_at = float(observed_at)
+            except (TypeError, ValueError):
+                return time.monotonic()
+            if not math.isfinite(observed_at) or observed_at > observation_now:
+                return time.monotonic()
+            remaining_freshness = min(
+                remaining_freshness,
+                max(0.0, freshness_seconds - (observation_now - observed_at)),
+            )
+        budget = min(request_timeout_seconds, remaining_freshness)
+        return time.monotonic() + max(0.0, budget)
+
+    def _mutation_plan(
+        self,
+        plan: OrderPlan,
+        config: HandoffConfig,
+        *,
+        observations: Sequence[Any],
+        observation_now: float | None = None,
+    ) -> OrderPlan:
         # The SDK uses this monotonic barrier for nonce reads, signing and the
-        # single sendTx call.  It is set only after the latest state recheck.
-        deadline = time.monotonic() + min(config.request_timeout_seconds, config.freshness_seconds)
+        # single sendTx call.  It preserves the remaining lifetime of every
+        # observation used for this phase; it never renews an old observation.
+        now = self.clock.now() if observation_now is None else observation_now
+        deadline = self._evidence_deadline(
+            observations=observations,
+            observation_now=now,
+            freshness_seconds=config.freshness_seconds,
+            request_timeout_seconds=config.request_timeout_seconds,
+        )
         return replace(plan, mutation_deadline_monotonic=deadline)
 
     async def _sleep(self, seconds: float) -> None:
@@ -1544,7 +1620,9 @@ def _joint_trade_match(
     ):
         conflicts = True
 
-    if matched >= expected_quantity:
+    if conflicts and matched > 0:
+        status = "CONFLICTING"
+    elif matched >= expected_quantity:
         status = "MATCHED"
     elif matched > 0:
         status = "PARTIAL"
@@ -1558,7 +1636,14 @@ def _joint_trade_match(
     elif status == "PARTIAL":
         reasons.append("joint trade matching proves only part of the exposure quantity")
     elif status == "CONFLICTING":
-        reasons.append("joint trade matching is CONFLICTING: trade/order IDs, prices or quantities are incompatible")
+        if matched > 0:
+            reasons.append(
+                "joint trade matching is CONFLICTING:"
+                f" {matched} quantity is compatible but another receipt has incompatible"
+                " trade/order IDs, prices or quantities"
+            )
+        else:
+            reasons.append("joint trade matching is CONFLICTING: trade/order IDs, prices or quantities are incompatible")
     else:
         reasons.append("joint trade matching is KNOWN_ZERO: receipts name no direct source/receiver pair")
     return status, matched, tuple(reasons)
@@ -1702,6 +1787,9 @@ def _plan_from_dict(value: Any) -> HandoffPlan:
         ),
         source_identity=("" if value.get("source_identity") is None else str(value["source_identity"])),
         receiver_identity=("" if value.get("receiver_identity") is None else str(value["receiver_identity"])),
+        metadata_observed_at=(
+            None if value.get("metadata_observed_at") is None else float(value["metadata_observed_at"])
+        ),
     )
 
 

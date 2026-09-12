@@ -201,8 +201,20 @@ class LighterSdkClient:
         self._apis: dict[int, Any] = {}
         self._tokens: dict[int, _CachedToken] = {}
         self._api_client: Any | None = None
+        self._pending_mutation_deadline: float | None = None
         self.sdk_version = REQUIRED_LIGHTER_SDK_VERSION
         self._http = (http_factory or PlainAioHttp)(config.api_base_url, timeout_seconds=config.request_timeout_seconds)
+
+    def set_mutation_deadline(self, deadline: float) -> None:
+        """Bind the next cancellation attempt to the engine's evidence barrier."""
+
+        try:
+            value = float(deadline)
+        except (TypeError, ValueError) as exc:
+            raise ContractError("mutation deadline must be finite") from exc
+        if value != value or value in {float("inf"), float("-inf")} or value <= 0:
+            raise ContractError("mutation deadline must be finite and positive")
+        self._pending_mutation_deadline = value
 
     @staticmethod
     def verify_sdk() -> None:
@@ -720,14 +732,17 @@ class LighterSdkClient:
             return MutationReceipt(False, None, None, sanitize_exception(exc))
 
     async def cancel_order(self, account_index: int, market_id: int, order_id: str) -> MutationReceipt:
+        deadline = self._pending_mutation_deadline
+        self._pending_mutation_deadline = None
         signer = self._signer(account_index)
         key_index = self.config.api_key_index
         assert key_index is not None
         try:
-            deadline = time.monotonic() + min(
-                self.config.request_timeout_seconds,
-                self.config.freshness_seconds,
-            )
+            if deadline is None:
+                deadline = time.monotonic() + min(
+                    self.config.request_timeout_seconds,
+                    self.config.freshness_seconds,
+                )
             nonce = await self._next_nonce(signer, key_index, deadline=deadline)
             if time.monotonic() >= deadline:
                 raise TimeoutError("nonce acquisition crossed the final mutation barrier")

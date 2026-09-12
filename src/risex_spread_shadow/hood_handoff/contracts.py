@@ -849,6 +849,7 @@ class HandoffPlan:
     receiver_fee_rate: Decimal | None = None
     source_identity: str = ""
     receiver_identity: str = ""
+    metadata_observed_at: float | None = None
 
     def __post_init__(self) -> None:
         try:
@@ -861,6 +862,12 @@ class HandoffPlan:
         object.__setattr__(self, "source_position_before", _decimal(self.source_position_before, "source_position_before"))
         object.__setattr__(self, "receiver_position_before", _decimal(self.receiver_position_before, "receiver_position_before"))
         _timestamp(self.created_at, "created_at")
+        if self.metadata_observed_at is not None:
+            object.__setattr__(
+                self,
+                "metadata_observed_at",
+                _timestamp(self.metadata_observed_at, "metadata_observed_at"),
+            )
         for value, name in (
             (self.source_fee_rate, "source_fee_rate"),
             (self.receiver_fee_rate, "receiver_fee_rate"),
@@ -915,6 +922,7 @@ class HandoffPlan:
             ),
             "source_identity": self.source_identity,
             "receiver_identity": self.receiver_identity,
+            "metadata_observed_at": self.metadata_observed_at,
         }
 
 
