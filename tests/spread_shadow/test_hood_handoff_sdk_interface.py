@@ -252,3 +252,6 @@ async def test_official_orderbook_details_schema_is_selected_without_fee_inventi
     assert page.trades[0].side == "SELL"
     assert page.trades[0].quantity == Decimal("0.125")
     assert page.trades[0].counterparty_account_index == 22
+    assert page.trades[0].counterparty_order_id == "245"
+    assert page.trades[0].client_order_index == "123"
+    assert page.trades[0].counterparty_client_order_index == "456"

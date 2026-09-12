@@ -490,6 +490,9 @@ class TradeReceipt:
     fee: Decimal | None
     counterparty_account_index: int | None
     observed_at: float
+    counterparty_order_id: str | None = None
+    counterparty_client_order_index: int | str | None = None
+    client_order_index: int | str | None = None
 
     def __post_init__(self) -> None:
         _text(self.trade_id, "trade_id")
@@ -506,6 +509,23 @@ class TradeReceipt:
             _nonnegative(self.fee, "fee")
         if self.counterparty_account_index is not None:
             _int(self.counterparty_account_index, "counterparty_account_index", minimum=0)
+        if self.counterparty_order_id is not None:
+            _text(self.counterparty_order_id, "counterparty_order_id")
+        if self.counterparty_client_order_index is not None and (
+            isinstance(self.counterparty_client_order_index, bool)
+            or not isinstance(self.counterparty_client_order_index, (int, str))
+            or (
+                isinstance(self.counterparty_client_order_index, str)
+                and not self.counterparty_client_order_index.strip()
+            )
+        ):
+            raise ContractError("counterparty_client_order_index must be a non-empty integer/string")
+        if self.client_order_index is not None and (
+            isinstance(self.client_order_index, bool)
+            or not isinstance(self.client_order_index, (int, str))
+            or (isinstance(self.client_order_index, str) and not self.client_order_index.strip())
+        ):
+            raise ContractError("client_order_index must be a non-empty integer/string")
         _timestamp(self.observed_at, "observed_at")
 
     @classmethod
@@ -544,6 +564,13 @@ class TradeReceipt:
                 else _int(value.get("counterparty_account_index"), "counterparty_account_index", minimum=0)
             ),
             observed_at=_timestamp(value.get("observed_at", value.get("timestamp")), "observed_at"),
+            counterparty_order_id=(
+                None
+                if value.get("counterparty_order_id") is None
+                else _text(value.get("counterparty_order_id"), "counterparty_order_id")
+            ),
+            counterparty_client_order_index=value.get("counterparty_client_order_index"),
+            client_order_index=value.get("client_order_index"),
         )
 
 
@@ -765,6 +792,7 @@ class OrderPlan:
     reduce_only: bool
     order_expiry_ms: int
     client_order_index: int
+    mutation_deadline_monotonic: float | None = None
 
     def __post_init__(self) -> None:
         _int(self.account_index, "account_index", minimum=0)
@@ -783,6 +811,12 @@ class OrderPlan:
             raise ContractError("reduce_only must be bool")
         _int(self.order_expiry_ms, "order_expiry_ms", minimum=0)
         _int(self.client_order_index, "client_order_index", minimum=0)
+        if self.mutation_deadline_monotonic is not None:
+            object.__setattr__(
+                self,
+                "mutation_deadline_monotonic",
+                _finite_float(self.mutation_deadline_monotonic, "mutation_deadline_monotonic"),
+            )
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -927,6 +961,10 @@ class LegReconciliation:
             return None
         return sum((trade.fee or Decimal(0) for trade in self.trades), Decimal(0))
 
+    @property
+    def gross_notional(self) -> Decimal:
+        return sum((trade.quantity * trade.price for trade in self.trades), Decimal(0))
+
     def quantity_against(self, account_index: int) -> Decimal:
         """Quantity whose receipt names the other HCR account explicitly."""
 
@@ -939,6 +977,19 @@ class LegReconciliation:
             Decimal(0),
         )
 
+    @property
+    def counterparty_match_status(self) -> str:
+        """Separate a proven zero from a missing counterparty field."""
+
+        if not self.trades or any(trade.counterparty_account_index is None for trade in self.trades):
+            return "UNKNOWN"
+        return "KNOWN"
+
+    def counterparty_status_against(self, account_index: int) -> str:
+        if not self.trades or any(trade.counterparty_account_index is None for trade in self.trades):
+            return "UNKNOWN"
+        return "MATCHED" if self.quantity_against(account_index) > 0 else "KNOWN_ZERO"
+
 
 @dataclass(frozen=True, slots=True)
 class HandoffResult:
@@ -950,6 +1001,11 @@ class HandoffResult:
     receiver: LegReconciliation | None
     reason: str | None = None
     unknown_reasons: tuple[str, ...] = ()
+    joint_match_status: str = "UNKNOWN"
+    joint_match_quantity: Decimal = Decimal(0)
+    economic_status: str = "UNKNOWN"
+    economic_findings: tuple[str, ...] = ()
+    findings: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         def leg(value: LegReconciliation | None, counterparty: LegReconciliation | None = None) -> Any:
@@ -962,9 +1018,25 @@ class HandoffResult:
                 "counterparty_matched_quantity": (
                     None
                     if counterparty is None
+                    else _wire_decimal(self.joint_match_quantity)
+                ),
+                "counterparty_match_status": (
+                    "UNKNOWN"
+                    if counterparty is None
+                    else self.joint_match_status
+                ),
+                "named_counterparty_quantity": (
+                    None
+                    if counterparty is None
                     else _wire_decimal(value.quantity_against(counterparty.account_index))
                 ),
+                "named_counterparty_status": (
+                    "UNKNOWN"
+                    if counterparty is None
+                    else value.counterparty_status_against(counterparty.account_index)
+                ),
                 "fee_total": None if value.fee_total is None else _wire_decimal(value.fee_total),
+                "gross_notional": _wire_decimal(value.gross_notional),
                 "position_before": _wire_decimal(value.position_before),
                 "position_after": None if value.position_after is None else _wire_decimal(value.position_after),
                 "history_complete": value.history_complete,
@@ -981,6 +1053,9 @@ class HandoffResult:
                         "price": _wire_decimal(trade.price),
                         "fee": None if trade.fee is None else _wire_decimal(trade.fee),
                         "counterparty_account_index": trade.counterparty_account_index,
+                        "counterparty_order_id": trade.counterparty_order_id,
+                        "counterparty_client_order_index": trade.counterparty_client_order_index,
+                        "client_order_index": trade.client_order_index,
                         "observed_at": trade.observed_at,
                     }
                     for trade in value.trades
@@ -1012,6 +1087,13 @@ class HandoffResult:
             "receiver": leg(self.receiver, self.source),
             "reason": self.reason,
             "unknown_reasons": list(self.unknown_reasons),
+            "joint_trade_match": {
+                "status": self.joint_match_status,
+                "quantity": _wire_decimal(self.joint_match_quantity),
+            },
+            "economic_status": self.economic_status,
+            "economic_findings": list(self.economic_findings),
+            "findings": list(self.findings),
         }
 
 

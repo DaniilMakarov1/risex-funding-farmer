@@ -29,7 +29,7 @@ from risex_spread_shadow.hood_handoff import (
 from risex_spread_shadow.hood_handoff.cli import PromptSecretProvider, _config, main
 
 from test_hood_handoff_engine import FakeClient, FakeClock, make_config
-from test_hood_handoff_sdk_interface import FakeModule, FakeSigner
+from test_hood_handoff_sdk_interface import FakeHttp, FakeModule, FakeSigner
 
 
 def _json_config(path: Path, *, direction: str = "LONG") -> dict[str, object]:
@@ -577,6 +577,196 @@ async def test_sdk_auth_token_refresh_is_bounded_by_configured_lifetime(monkeypa
     assert len(signer.auth_calls) == 2
     assert all(call["api_key_index"] == 4 for call in signer.auth_calls)
     assert all(call["deadline"] == 60 for call in signer.auth_calls)
+
+
+@pytest.mark.asyncio
+async def test_exposure_success_does_not_require_direct_counterparty_pair(tmp_path):
+    class Unrelated(FakeClient):
+        async def list_trades(self, *args, **kwargs):
+            page = await super().list_trades(*args, **kwargs)
+            return replace(
+                page,
+                trades=tuple(replace(trade, counterparty_account_index=999) for trade in page.trades),
+            )
+
+    result = await run_handoff(
+        make_config(tmp_path / "unrelated.jsonl"),
+        Unrelated(source_fills=True),
+        clock=FakeClock(),
+    )
+    assert result.outcome is Outcome.SUCCESS
+    assert result.source.filled_quantity == Decimal("0.125")
+    assert result.receiver.filled_quantity == Decimal("0.125")
+    assert result.joint_match_status == "KNOWN_ZERO"
+    assert result.joint_match_quantity == Decimal("0")
+    assert result.as_dict()["source"]["counterparty_match_status"] == "KNOWN_ZERO"
+    assert result.as_dict()["receiver"]["counterparty_matched_quantity"] == "0"
+
+
+@pytest.mark.asyncio
+async def test_joint_match_requires_compatible_shared_trade_identity(tmp_path):
+    contradictory = await run_handoff(
+        make_config(tmp_path / "contradictory-pair.jsonl"),
+        FakeClient(source_fills=True),
+        clock=FakeClock(),
+    )
+    assert contradictory.outcome is Outcome.SUCCESS
+    assert contradictory.source.filled_quantity == Decimal("0.125")
+    assert contradictory.receiver.filled_quantity == Decimal("0.125")
+    assert contradictory.joint_match_status == "CONFLICTING"
+    assert contradictory.joint_match_quantity == Decimal("0")
+    assert contradictory.as_dict()["source"]["counterparty_matched_quantity"] == "0"
+    assert contradictory.as_dict()["source"]["named_counterparty_quantity"] == "0.125"
+    assert any("joint trade matching is CONFLICTING" in item for item in contradictory.findings)
+
+    class Agreed(FakeClient):
+        async def list_trades(self, *args, **kwargs):
+            page = await super().list_trades(*args, **kwargs)
+            return replace(
+                page,
+                trades=tuple(
+                    replace(trade, trade_id="same-trade", price=Decimal("100.25"))
+                    for trade in page.trades
+                ),
+            )
+
+    agreed = await run_handoff(
+        make_config(tmp_path / "agreed-pair.jsonl"),
+        Agreed(source_fills=True),
+        clock=FakeClock(),
+    )
+    assert agreed.outcome is Outcome.SUCCESS
+    assert agreed.joint_match_status == "MATCHED"
+    assert agreed.joint_match_quantity == Decimal("0.125")
+    assert agreed.as_dict()["source"]["counterparty_matched_quantity"] == "0.125"
+
+
+@pytest.mark.asyncio
+async def test_missing_counterparty_is_unknown_separate_from_known_zero(tmp_path):
+    class Missing(FakeClient):
+        async def list_trades(self, *args, **kwargs):
+            page = await super().list_trades(*args, **kwargs)
+            return replace(
+                page,
+                trades=tuple(replace(trade, counterparty_account_index=None) for trade in page.trades),
+            )
+
+    result = await run_handoff(
+        make_config(tmp_path / "missing-counterparty.jsonl"),
+        Missing(source_fills=True),
+        clock=FakeClock(),
+    )
+    assert result.outcome is Outcome.SUCCESS
+    assert result.joint_match_status == "UNKNOWN"
+    assert result.as_dict()["source"]["counterparty_match_status"] == "UNKNOWN"
+
+
+@pytest.mark.asyncio
+async def test_delayed_nonce_cannot_reach_sign_or_dispatch(monkeypatch, tmp_path):
+    class SlowNonce:
+        async def async_next_nonce(self, api_key_index):
+            await asyncio.sleep(0.03)
+            return api_key_index, 41
+
+    signer = FakeSigner()
+    signer.nonce_manager = SlowNonce()
+    config = make_config(tmp_path / "slow-nonce.jsonl", request_timeout_seconds=0.001)
+    client = LighterSdkClient(
+        config,
+        source_account_index=11,
+        receiver_account_index=22,
+        secrets=StaticSecretProvider({}),
+        market_evidence={},
+        signer_factory=lambda **kwargs: signer,
+        http_factory=FakeHttp,
+    )
+    monkeypatch.setattr(LighterSdkClient, "verify_sdk", staticmethod(lambda: None))
+    client._signers[11] = signer
+    plan = OrderPlan(
+        account_index=11,
+        market_id=7,
+        side="SELL",
+        quantity=Decimal("0.125"),
+        quantity_int=125,
+        price=Decimal("100.25"),
+        price_int=10025,
+        order_type="LIMIT",
+        time_in_force="POST_ONLY",
+        reduce_only=True,
+        order_expiry_ms=1_500_000,
+        client_order_index=123,
+    )
+    receipt = await client.submit_order(plan)
+    assert not receipt.accepted
+    assert signer.sign_calls == []
+    assert client._http.calls == []
+
+
+@pytest.mark.asyncio
+async def test_preparation_read_timeout_blocks_without_mutation(tmp_path):
+    class SlowMetadata(FakeClient):
+        async def market_metadata(self, market_id):
+            await asyncio.sleep(0.03)
+            return await super().market_metadata(market_id)
+
+    client = SlowMetadata()
+    result = await run_handoff(
+        make_config(tmp_path / "slow-read.jsonl", request_timeout_seconds=0.001),
+        client,
+        clock=FakeClock(),
+    )
+    assert result.outcome is Outcome.FAILED_PREFLIGHT_BLOCKED
+    assert client.submissions == []
+
+
+@pytest.mark.asyncio
+async def test_actual_fee_economics_are_separate_and_cap_breaches_are_not_success(tmp_path):
+    class FeeDrift(FakeClient):
+        def __init__(self, fee):
+            super().__init__(source_fills=True)
+            self.fee = fee
+
+        async def list_trades(self, *args, **kwargs):
+            page = await super().list_trades(*args, **kwargs)
+            return replace(page, trades=tuple(replace(trade, fee=self.fee) for trade in page.trades))
+
+    for label, fee, expected_status, expected_outcome in (
+        ("below", Decimal("0.5"), "PROVEN", Outcome.SUCCESS),
+        ("at", Decimal("1"), "PROVEN", Outcome.SUCCESS),
+        ("above", Decimal("2"), "VIOLATION", Outcome.UNKNOWN),
+    ):
+        result = await run_handoff(
+            make_config(tmp_path / f"fee-{label}.jsonl"),
+            FeeDrift(fee),
+            clock=FakeClock(),
+        )
+        assert result.outcome is expected_outcome
+        assert result.economic_status == expected_status
+        assert result.source.filled_quantity == Decimal("0.125")
+        assert result.receiver.filled_quantity == Decimal("0.125")
+        if expected_status == "VIOLATION":
+            assert any("observed fee" in item and "budget" in item for item in result.findings)
+            assert any("observed fee" in item for item in result.economic_findings)
+
+
+@pytest.mark.asyncio
+async def test_missing_fee_is_unknown_economics_without_erasing_fill_quantity(tmp_path):
+    class MissingFee(FakeClient):
+        async def list_trades(self, *args, **kwargs):
+            page = await super().list_trades(*args, **kwargs)
+            return replace(page, trades=tuple(replace(trade, fee=None) for trade in page.trades))
+
+    result = await run_handoff(
+        make_config(tmp_path / "missing-fee.jsonl"),
+        MissingFee(source_fills=True),
+        clock=FakeClock(),
+    )
+    assert result.outcome is Outcome.UNKNOWN
+    assert result.economic_status == "UNKNOWN"
+    assert result.source.filled_quantity == Decimal("0.125")
+    assert result.receiver.filled_quantity == Decimal("0.125")
+    assert result.economic_findings
+    assert any("fee economics UNKNOWN" in item for item in result.findings)
 
 
 @pytest.mark.asyncio

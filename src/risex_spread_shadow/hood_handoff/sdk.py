@@ -9,6 +9,7 @@ close/reopen semantics.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 import importlib
 from importlib import metadata as importlib_metadata
@@ -275,11 +276,16 @@ class LighterSdkClient:
         key_index = self.config.api_key_index
         assert key_index is not None
         lifetime = self.config.auth_token_lifetime_seconds
-        result = await _await(
-            signer.create_auth_token_with_expiry(
-                deadline=int(lifetime),
-                api_key_index=key_index,
-            )
+        auth_deadline = time.monotonic() + self.config.request_timeout_seconds
+        result = await self._bounded(
+            _await(
+                signer.create_auth_token_with_expiry(
+                    deadline=int(lifetime),
+                    api_key_index=key_index,
+                )
+            ),
+            auth_deadline,
+            "auth token acquisition",
         )
         token: Any = result[0] if isinstance(result, tuple) else result
         if isinstance(result, tuple) and len(result) > 1 and result[1]:
@@ -298,12 +304,16 @@ class LighterSdkClient:
         # queried once to bind this run to the requested market id.
         module = self._lighter()
         api = module.OrderApi(self._generated_api_client(module))
-        details = await _await(
-            api.order_book_details(
-                market_id=market_id,
-                filter="perp",
-                _request_timeout=self.config.request_timeout_seconds,
-            )
+        details = await self._bounded(
+            _await(
+                api.order_book_details(
+                    market_id=market_id,
+                    filter="perp",
+                    _request_timeout=self.config.request_timeout_seconds,
+                )
+            ),
+            time.monotonic() + self.config.request_timeout_seconds,
+            "orderBookDetails read",
         )
         raw_details = _model_dict(details)
         _require_success_code(raw_details, "orderBookDetails")
@@ -347,13 +357,17 @@ class LighterSdkClient:
     async def account_snapshot(self, account_index: int, market_id: int) -> AccountSnapshot:
         module = self._lighter()
         api = module.AccountApi(self._generated_api_client(module))
-        raw_account = await _await(
-            api.account(
-                by="index",
-                value=str(account_index),
-                active_only=False,
-                _request_timeout=self.config.request_timeout_seconds,
-            )
+        raw_account = await self._bounded(
+            _await(
+                api.account(
+                    by="index",
+                    value=str(account_index),
+                    active_only=False,
+                    _request_timeout=self.config.request_timeout_seconds,
+                )
+            ),
+            time.monotonic() + self.config.request_timeout_seconds,
+            "account read",
         )
         raw_account_mapping = _model_dict(raw_account)
         _require_success_code(raw_account_mapping, "account")
@@ -435,13 +449,17 @@ class LighterSdkClient:
         module = self._lighter()
         api = module.OrderApi(self._generated_api_client(module))
         token = await self._authorization(account_index)
-        raw = await _await(
-            api.account_active_orders(
-                authorization=token,
-                account_index=account_index,
-                market_id=market_id,
-                _request_timeout=self.config.request_timeout_seconds,
-            )
+        raw = await self._bounded(
+            _await(
+                api.account_active_orders(
+                    authorization=token,
+                    account_index=account_index,
+                    market_id=market_id,
+                    _request_timeout=self.config.request_timeout_seconds,
+                )
+            ),
+            time.monotonic() + self.config.request_timeout_seconds,
+            "active orders read",
         )
         raw_mapping = _model_dict(raw)
         _require_success_code(raw_mapping, "accountActiveOrders")
@@ -471,7 +489,11 @@ class LighterSdkClient:
         if client_order_index is None:
             raise ContractError("accountOrders lookup requires the exact client order index")
         params["client_order_indexes"] = str(client_order_index)
-        payload = await self._http.get("api/v1/accountOrders", params=params, authorization=token)
+        payload = await self._bounded(
+            self._http.get("api/v1/accountOrders", params=params, authorization=token),
+            time.monotonic() + self.config.request_timeout_seconds,
+            "accountOrders read",
+        )
         _require_success_code(payload, "accountOrders")
         if "orders" not in payload or not isinstance(payload["orders"], (list, tuple)):
             raise ContractError("accountOrders response lacks an orders list")
@@ -499,21 +521,25 @@ class LighterSdkClient:
         module = self._lighter()
         api = module.OrderApi(self._generated_api_client(module))
         token = await self._authorization(account_index)
-        raw = await _await(
-            api.trades(
-                sort_by="block_height",
-                limit=limit,
-                authorization=token,
-                market_id=market_id,
-                account_index=account_index,
-                order_index=None if order_id is None else int(order_id),
-                sort_dir="asc",
-                cursor=cursor,
-                market_type="perp",
-                type="all",
-                aggregate=False,
-                _request_timeout=self.config.request_timeout_seconds,
-            )
+        raw = await self._bounded(
+            _await(
+                api.trades(
+                    sort_by="block_height",
+                    limit=limit,
+                    authorization=token,
+                    market_id=market_id,
+                    account_index=account_index,
+                    order_index=None if order_id is None else int(order_id),
+                    sort_dir="asc",
+                    cursor=cursor,
+                    market_type="perp",
+                    type="all",
+                    aggregate=False,
+                    _request_timeout=self.config.request_timeout_seconds,
+                )
+            ),
+            time.monotonic() + self.config.request_timeout_seconds,
+            "trades read",
         )
         payload = _model_dict(raw)
         _require_success_code(payload, "trades")
@@ -567,6 +593,13 @@ class LighterSdkClient:
             mapped["side"] = "SELL" if is_ask else "BUY"
             mapped["quantity"] = mapped.get("size")
             mapped["counterparty_account_index"] = bid_account if is_ask else ask_account
+            mapped["counterparty_order_id"] = bid_id if is_ask else ask_id
+            mapped["counterparty_client_order_index"] = (
+                mapped["bid_client_id_str"] if is_ask else mapped["ask_client_id_str"]
+            )
+            mapped["client_order_index"] = (
+                mapped["ask_client_id_str"] if is_ask else mapped["bid_client_id_str"]
+            )
             mapped["trade_id"] = mapped.get("trade_id_str", mapped.get("trade_id"))
             mapped["observed_at"] = mapped["timestamp"]
             trades.append(
@@ -584,12 +617,26 @@ class LighterSdkClient:
             complete=not bool(payload.get("next_cursor")),
         )
 
-    async def _next_nonce(self, signer: Any, api_key_index: int) -> int:
+    async def _bounded(self, awaitable: Any, deadline: float, label: str) -> Any:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"{label} exceeded configured request/freshness deadline")
+        try:
+            return await asyncio.wait_for(awaitable, timeout=remaining)
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(f"{label} exceeded configured request/freshness deadline") from exc
+
+    async def _next_nonce(self, signer: Any, api_key_index: int, *, deadline: float | None = None) -> int:
         manager = getattr(signer, "nonce_manager", None)
         method = getattr(manager, "async_next_nonce", None)
         if method is None:
             raise ContractError("lighter-sdk nonce manager is unavailable; raw signing cannot use nonce=-1")
-        result = await _await(method(api_key_index))
+        if deadline is None:
+            deadline = time.monotonic() + min(
+                self.config.request_timeout_seconds,
+                self.config.freshness_seconds,
+            )
+        result = await self._bounded(method(api_key_index), deadline, "nonce acquisition")
         if not isinstance(result, tuple) or len(result) != 2:
             raise ContractError("lighter-sdk nonce manager returned an unsupported shape")
         returned_key, nonce = result
@@ -619,30 +666,48 @@ class LighterSdkClient:
         key_index = self.config.api_key_index
         assert key_index is not None
         try:
-            nonce = await self._next_nonce(signer, key_index)
-            signer_type = type(signer)
-            result = await _await(
-                signer.sign_create_order(
-                    market_index=plan.market_id,
-                    client_order_index=plan.client_order_index,
-                    base_amount=plan.quantity_int,
-                    price=plan.price_int,
-                    is_ask=plan.side == "SELL",
-                    order_type=getattr(signer_type, "ORDER_TYPE_LIMIT", 0) if plan.order_type == "LIMIT" else getattr(signer_type, "ORDER_TYPE_MARKET", 1),
-                    time_in_force=getattr(signer_type, "ORDER_TIME_IN_FORCE_POST_ONLY", 2) if plan.time_in_force == "POST_ONLY" else getattr(signer_type, "ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL", 0),
-                    reduce_only=plan.reduce_only,
-                    order_expiry=plan.order_expiry_ms,
-                    skip_nonce=getattr(signer_type, "SKIP_NONCE_OFF", 0),
-                    nonce=nonce,
-                    api_key_index=key_index,
+            deadline = plan.mutation_deadline_monotonic
+            if deadline is None:
+                deadline = time.monotonic() + min(
+                    self.config.request_timeout_seconds,
+                    self.config.freshness_seconds,
                 )
+            nonce = await self._next_nonce(signer, key_index, deadline=deadline)
+            if time.monotonic() >= deadline:
+                raise TimeoutError("nonce acquisition crossed the final mutation barrier")
+            signer_type = type(signer)
+            result = await self._bounded(
+                _await(
+                    signer.sign_create_order(
+                        market_index=plan.market_id,
+                        client_order_index=plan.client_order_index,
+                        base_amount=plan.quantity_int,
+                        price=plan.price_int,
+                        is_ask=plan.side == "SELL",
+                        order_type=getattr(signer_type, "ORDER_TYPE_LIMIT", 0) if plan.order_type == "LIMIT" else getattr(signer_type, "ORDER_TYPE_MARKET", 1),
+                        time_in_force=getattr(signer_type, "ORDER_TIME_IN_FORCE_POST_ONLY", 2) if plan.time_in_force == "POST_ONLY" else getattr(signer_type, "ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL", 0),
+                        reduce_only=plan.reduce_only,
+                        order_expiry=plan.order_expiry_ms,
+                        skip_nonce=getattr(signer_type, "SKIP_NONCE_OFF", 0),
+                        nonce=nonce,
+                        api_key_index=key_index,
+                    )
+                ),
+                deadline,
+                "order signing",
             )
             if not isinstance(result, tuple) or len(result) != 4:
                 raise RuntimeError("lighter-sdk sign_create_order returned an unsupported shape")
             tx_type, tx_info, tx_hash, error = result
             if error:
                 return MutationReceipt(False, None, _safe_text(tx_hash), sanitize_exception(ValueError(str(error))))
-            response = await self._send_signed_tx(tx_type, tx_info)
+            if time.monotonic() >= deadline:
+                raise TimeoutError("order signing crossed the final mutation barrier")
+            response = await self._bounded(
+                self._send_signed_tx(tx_type, tx_info),
+                deadline,
+                "order dispatch",
+            )
             code = _response_code(response)
             return MutationReceipt(
                 accepted=code == 200,
@@ -659,23 +724,39 @@ class LighterSdkClient:
         key_index = self.config.api_key_index
         assert key_index is not None
         try:
-            nonce = await self._next_nonce(signer, key_index)
+            deadline = time.monotonic() + min(
+                self.config.request_timeout_seconds,
+                self.config.freshness_seconds,
+            )
+            nonce = await self._next_nonce(signer, key_index, deadline=deadline)
+            if time.monotonic() >= deadline:
+                raise TimeoutError("nonce acquisition crossed the final mutation barrier")
             signer_type = type(signer)
-            result = await _await(
-                signer.sign_cancel_order(
-                    market_index=market_id,
-                    order_index=int(order_id),
-                    skip_nonce=getattr(signer_type, "SKIP_NONCE_OFF", 0),
-                    nonce=nonce,
-                    api_key_index=key_index,
-                )
+            result = await self._bounded(
+                _await(
+                    signer.sign_cancel_order(
+                        market_index=market_id,
+                        order_index=int(order_id),
+                        skip_nonce=getattr(signer_type, "SKIP_NONCE_OFF", 0),
+                        nonce=nonce,
+                        api_key_index=key_index,
+                    )
+                ),
+                deadline,
+                "cancel signing",
             )
             if not isinstance(result, tuple) or len(result) != 4:
                 raise RuntimeError("lighter-sdk sign_cancel_order returned an unsupported shape")
             tx_type, tx_info, tx_hash, error = result
             if error:
                 return MutationReceipt(False, order_id, _safe_text(tx_hash), sanitize_exception(ValueError(str(error))))
-            response = await self._send_signed_tx(tx_type, tx_info)
+            if time.monotonic() >= deadline:
+                raise TimeoutError("cancel signing crossed the final mutation barrier")
+            response = await self._bounded(
+                self._send_signed_tx(tx_type, tx_info),
+                deadline,
+                "cancel dispatch",
+            )
             code = _response_code(response)
             return MutationReceipt(
                 accepted=code == 200,
