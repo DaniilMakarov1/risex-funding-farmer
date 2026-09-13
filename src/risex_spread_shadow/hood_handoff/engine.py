@@ -384,12 +384,6 @@ class HandoffEngine:
                     or not source_recheck.incremental_margin_evidence
                 ):
                     unknown_reasons.append("source margin recheck is insufficient or missing")
-                elif source_recheck.fee_rate is None:
-                    unknown_reasons.append("source fee recheck is missing")
-                elif plan.source_fee_rate is None or source_recheck.fee_rate != plan.source_fee_rate:
-                    unknown_reasons.append("source fee evidence changed before receiver dispatch")
-                elif not self._fee_budget_proven(config, plan.source, source_recheck.fee_rate, config.source_fee_budget):
-                    unknown_reasons.append("source fee budget is no longer proven before receiver dispatch")
                 elif not self._active_orders_match(source_recheck, plan.source, source_order.order_id):
                     unknown_reasons.append("source recheck contains an additional or conflicting active order")
                 elif receiver_recheck.signed_position != receiver.signed_position:
@@ -407,14 +401,6 @@ class HandoffEngine:
                     or not receiver_recheck.incremental_margin_evidence
                 ):
                     unknown_reasons.append("receiver margin recheck is insufficient or missing")
-                elif receiver_recheck.fee_rate is None:
-                    unknown_reasons.append("receiver fee recheck is missing")
-                elif plan.receiver_fee_rate is None or receiver_recheck.fee_rate != plan.receiver_fee_rate:
-                    unknown_reasons.append("receiver fee evidence changed before receiver dispatch")
-                elif not self._fee_budget_proven(
-                    config, plan.receiver, receiver_recheck.fee_rate, config.receiver_fee_budget
-                ):
-                    unknown_reasons.append("receiver fee budget is no longer proven before receiver dispatch")
                 elif not self._source_is_resting(source_order, plan.source):
                     unknown_reasons.append("source fill or quantity change before receiver dispatch")
                 else:
@@ -776,21 +762,6 @@ class HandoffEngine:
             and order.remaining_quantity == plan.quantity
         )
 
-    @staticmethod
-    def _fee_budget_proven(
-        config: HandoffConfig,
-        plan: OrderPlan,
-        fee_rate: Decimal,
-        budget: Decimal,
-    ) -> bool:
-        """Check a fee ceiling only where the submitted price is a ceiling."""
-
-        if plan.order_type == "MARKET" and plan.side == "SELL":
-            # Lighter's SELL taker price is a floor.  It cannot prove a fee
-            # ceiling or gross-notional ceiling before mutation.
-            return False
-        return plan.quantity * plan.price * fee_rate <= budget
-
     async def _cancel_if_safe(
         self,
         plan: OrderPlan,
@@ -1145,14 +1116,9 @@ class HandoffEngine:
         forced_outcome: Outcome | None = None,
     ) -> HandoffResult:
         joint_status, joint_quantity, joint_reasons = _joint_trade_match(source, receiver, plan.quantity)
-        economic_status, economic_findings = _economic_findings(config, source, receiver)
+        economic_status, economic_findings = _economic_findings(source, receiver)
         findings = tuple(dict.fromkeys((*joint_reasons, *economic_findings)))
         outcome = forced_outcome or self._classify(plan, source, receiver, unknown_reasons)
-        # Exposure completion remains independently observable, but a missing
-        # fee or an observed cap breach cannot be reported as an unqualified
-        # bounded SUCCESS.
-        if outcome is Outcome.SUCCESS and economic_status != "PROVEN":
-            outcome = Outcome.UNKNOWN
         phase = Phase.COMPLETE
         reason = (
             None
@@ -1490,11 +1456,6 @@ def _account_from_client(client: HandoffClient, role: str) -> int:
 
 def _safe_preflight_reason(exc: BaseException) -> str:
     """Expose only named, non-sensitive contract conflicts to the operator."""
-
-    if isinstance(exc, PreflightBlocked) and str(exc) == (
-        "Lighter MARKET SELL exposes only a minimum price; the configured gross/fee ceiling cannot be enforced before dispatch"
-    ):
-        return "protocol_conflict_receiver_sell_market_price_floor"
     return sanitize_exception(exc)
 
 
@@ -1649,38 +1610,23 @@ def _joint_trade_match(
 
 
 def _economic_findings(
-    config: HandoffConfig,
     source: LegReconciliation,
     receiver: LegReconciliation,
 ) -> tuple[str, tuple[str, ...]]:
-    """Reconcile observed economics without converting undocumented fee units."""
+    """Report observed economics without turning them into admission gates."""
 
     findings: list[str] = []
     has_unknown = False
-    has_violation = False
-    for label, leg, budget in (
-        ("source", source, config.source_fee_budget),
-        ("receiver", receiver, config.receiver_fee_budget),
-    ):
+    for label, leg in (("source", source), ("receiver", receiver)):
         if not leg.trades:
             continue
         gross = leg.gross_notional
-        if gross > config.max_gross_notional:
-            has_violation = True
-            findings.append(
-                f"{label} observed gross {gross} exceeds configured max_gross_notional {config.max_gross_notional}"
-            )
         fee_total = leg.fee_total
         if fee_total is None:
             has_unknown = True
             findings.append(f"{label} fee economics UNKNOWN: at least one official receipt has no fee")
-        elif fee_total > budget:
-            has_violation = True
-            findings.append(
-                f"{label} observed fee {fee_total} exceeds configured fee budget {budget}"
-            )
-    if has_violation:
-        return "VIOLATION", tuple(findings)
+        else:
+            findings.append(f"{label} observed gross {gross} and fee {fee_total}")
     if has_unknown:
         return "UNKNOWN", tuple(findings)
     return ("PROVEN" if (source.trades or receiver.trades) else "NOT_OBSERVED"), tuple(findings)
@@ -1701,12 +1647,8 @@ def _config_binding(config: HandoffConfig, client: HandoffClient) -> dict[str, A
         "quantity": str(config.quantity),
         "source_limit_price": str(config.source_limit_price),
         "receiver_worst_price": str(config.receiver_worst_price),
-        "receiver_price_cap": None if config.receiver_price_cap is None else str(config.receiver_price_cap),
         "operator_execution_opt_in": config.operator_execution_opt_in,
         "operator_plan_reviewed": config.operator_plan_reviewed,
-        "max_gross_notional": str(config.max_gross_notional),
-        "source_fee_budget": str(config.source_fee_budget),
-        "receiver_fee_budget": str(config.receiver_fee_budget),
         "freshness_seconds": config.freshness_seconds,
         "request_timeout_seconds": config.request_timeout_seconds,
         "order_timeout_seconds": config.order_timeout_seconds,

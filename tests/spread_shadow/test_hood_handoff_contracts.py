@@ -112,7 +112,7 @@ def test_future_evidence_is_blocked():
         config().validate_against(metadata(), source, receiver, 1_005)
 
 
-def test_fee_budget_and_opposite_receiver_fail_before_mutation():
+def test_opposite_receiver_fails_but_legacy_cap_fields_are_not_admission_gates():
     from risex_spread_shadow.hood_handoff import AccountSnapshot
 
     source = AccountSnapshot.from_mapping(
@@ -151,7 +151,9 @@ def test_fee_budget_and_opposite_receiver_fail_before_mutation():
     )
     with pytest.raises(Exception, match="opposite HOOD exposure"):
         config().validate_against(metadata(), source, receiver, 1_005)
-    with pytest.raises(Exception, match="fee exceeds"):
-        config(source_fee_budget=Decimal("0.001")).validate_against(
-            metadata(), source, replace(receiver, signed_position=Decimal("0")), 1_005
-        )
+    assert config(
+        source_fee_budget=Decimal("0.001"),
+        receiver_fee_budget=Decimal("0.001"),
+        max_gross_notional=Decimal("0.001"),
+        receiver_price_cap=Decimal("0.001"),
+    ).validate_against(metadata(), source, replace(receiver, signed_position=Decimal("0")), 1_005) is None

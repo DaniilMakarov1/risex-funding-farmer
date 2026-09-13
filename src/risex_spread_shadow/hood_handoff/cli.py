@@ -62,7 +62,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--confirm-plan",
         action="store_true",
-        help="confirm that the printed exact plan, bounds and fee/margin requirements were reviewed",
+        help="confirm that the printed exact plan, price bounds and readiness/margin requirements were reviewed",
     )
     return parser
 
@@ -84,9 +84,6 @@ def _config(value: Mapping[str, Any], *, execute: bool) -> HandoffConfig:
         "quantity",
         "source_limit_price",
         "receiver_worst_price",
-        "max_gross_notional",
-        "source_fee_budget",
-        "receiver_fee_budget",
         "freshness_seconds",
         "request_timeout_seconds",
         "order_timeout_seconds",
@@ -110,6 +107,8 @@ def _config(value: Mapping[str, Any], *, execute: bool) -> HandoffConfig:
         "quantity",
         "source_limit_price",
         "receiver_worst_price",
+        # These four fields are accepted below only for legacy config/journal
+        # compatibility; they are no longer HCR-1 admission gates.
         "receiver_price_cap",
         "max_gross_notional",
         "source_fee_budget",
@@ -200,14 +199,10 @@ async def _run(args: argparse.Namespace) -> int:
                     "receiver_order_type": "MARKET",
                     "receiver_time_in_force": "IOC",
                     "receiver_reduce_only": False,
-                    "source_fee_budget": str(config.source_fee_budget),
-                    "receiver_fee_budget": str(config.receiver_fee_budget),
-                    "max_gross_notional": str(config.max_gross_notional),
-                    "receiver_price_cap": None if config.receiver_price_cap is None else str(config.receiver_price_cap),
                     "receiver_bound_semantics": (
                         "BUY price is a ceiling"
                         if config.direction is Direction.LONG
-                        else "SELL price is a floor; it cannot cap gross/fee exposure"
+                        else "SELL price is a floor"
                     ),
                     "plan_reviewed": config.operator_plan_reviewed,
                     "journal_path": config.journal_path,

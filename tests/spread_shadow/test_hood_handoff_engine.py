@@ -31,10 +31,6 @@ def make_config(path: Path, **overrides) -> HandoffConfig:
         "quantity": Decimal("0.125"),
         "source_limit_price": Decimal("100.25"),
         "receiver_worst_price": Decimal("101.25"),
-        "receiver_price_cap": Decimal("101.25"),
-        "max_gross_notional": Decimal("200"),
-        "source_fee_budget": Decimal("1"),
-        "receiver_fee_budget": Decimal("1"),
         "freshness_seconds": 10,
         "request_timeout_seconds": 1,
         "order_timeout_seconds": 1,
@@ -292,7 +288,7 @@ async def test_restart_reconciles_without_replaying_intents(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_short_direction_maps_to_buy_then_sell_and_live_cap_conflict_blocks(tmp_path):
+async def test_short_direction_maps_to_buy_then_sell_without_monetary_cap(tmp_path):
     client = FakeClient(source_fills=True)
     client.source_position = Decimal("-1")
     client.receiver_position = Decimal("0")
@@ -309,11 +305,21 @@ async def test_short_direction_maps_to_buy_then_sell_and_live_cap_conflict_block
     assert preview.plan.source.side == "BUY"
     assert preview.plan.receiver.side == "SELL"
     result = await run_handoff(
-        make_config(tmp_path / "short-live.jsonl", direction=Direction.SHORT), client, clock=FakeClock()
+        make_config(
+            tmp_path / "short-live.jsonl",
+            direction=Direction.SHORT,
+            receiver_worst_price=Decimal("250.00"),
+        ),
+        client,
+        clock=FakeClock(),
     )
-    assert result.outcome is Outcome.FAILED_PREFLIGHT_BLOCKED
-    assert client.submissions == []
-    assert result.reason == "protocol_conflict_receiver_sell_market_price_floor"
+    assert result.outcome is Outcome.SUCCESS
+    assert [plan.side for plan in client.submissions] == ["BUY", "SELL"]
+    assert result.source.filled_quantity == Decimal("0.125")
+    assert result.receiver.filled_quantity == Decimal("0.125")
+    assert client.submissions[1].price == Decimal("250.00")
+    assert result.receiver.gross_notional == Decimal("31.25000")
+    assert result.receiver.fee_total == Decimal("0.0126")
 
 
 @pytest.mark.asyncio

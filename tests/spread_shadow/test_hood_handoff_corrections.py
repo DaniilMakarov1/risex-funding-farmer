@@ -41,9 +41,6 @@ def _json_config(path: Path, *, direction: str = "LONG") -> dict[str, object]:
         "quantity": "0.125",
         "source_limit_price": "100.25",
         "receiver_worst_price": "101.25",
-        "max_gross_notional": "200",
-        "source_fee_budget": "1",
-        "receiver_fee_budget": "1",
         "freshness_seconds": "10",
         "request_timeout_seconds": "1",
         "order_timeout_seconds": "1",
@@ -56,7 +53,6 @@ def _json_config(path: Path, *, direction: str = "LONG") -> dict[str, object]:
         "api_base_url": "https://mainnet.zklighter.elliot.ai",
         "chain_id": 304,
         "api_key_index": 4,
-        "receiver_price_cap": "101.25",
     }
 
 
@@ -87,7 +83,10 @@ def test_cli_normalizes_exact_json_and_prints_reviewable_plan(tmp_path, capsys):
     assert preview["receiver_time_in_force"] == "IOC"
     assert preview["source_limit_price"] == "100.25"
     assert preview["receiver_worst_price"] == "101.25"
-    assert preview["max_gross_notional"] == "200"
+    assert "max_gross_notional" not in preview
+    assert "source_fee_budget" not in preview
+    assert "receiver_fee_budget" not in preview
+    assert "receiver_price_cap" not in preview
     assert preview["plan_reviewed"] is False
 
     assert main(
@@ -357,6 +356,28 @@ async def test_restart_binding_mismatch_is_read_only_and_complete_receipt_is_dur
     replay = await run_handoff(make_config(complete_path), replay_client, clock=FakeClock())
     assert replay.outcome is Outcome.UNKNOWN
     assert replay_client.submissions == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_cap_config_is_not_bound_to_new_attempt_journal(tmp_path):
+    path = tmp_path / "legacy-cap-config.jsonl"
+    result = await run_handoff(
+        make_config(
+            path,
+            max_gross_notional=Decimal("0.001"),
+            source_fee_budget=Decimal("0.001"),
+            receiver_fee_budget=Decimal("0.001"),
+            receiver_price_cap=Decimal("0.001"),
+        ),
+        FakeClient(ambiguous_source=True),
+        clock=FakeClock(),
+    )
+    assert result.outcome is Outcome.UNKNOWN
+    journal = path.read_text(encoding="utf-8")
+    assert "max_gross_notional" not in journal
+    assert "source_fee_budget" not in journal
+    assert "receiver_fee_budget" not in journal
+    assert "receiver_price_cap" not in journal
 
 
 @pytest.mark.asyncio
@@ -722,7 +743,7 @@ async def test_preparation_read_timeout_blocks_without_mutation(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_actual_fee_economics_are_separate_and_cap_breaches_are_not_success(tmp_path):
+async def test_actual_fee_economics_are_reported_without_cap_admission(tmp_path):
     class FeeDrift(FakeClient):
         def __init__(self, fee):
             super().__init__(source_fills=True)
@@ -735,7 +756,7 @@ async def test_actual_fee_economics_are_separate_and_cap_breaches_are_not_succes
     for label, fee, expected_status, expected_outcome in (
         ("below", Decimal("0.5"), "PROVEN", Outcome.SUCCESS),
         ("at", Decimal("1"), "PROVEN", Outcome.SUCCESS),
-        ("above", Decimal("2"), "VIOLATION", Outcome.UNKNOWN),
+        ("above", Decimal("2"), "PROVEN", Outcome.SUCCESS),
     ):
         result = await run_handoff(
             make_config(tmp_path / f"fee-{label}.jsonl"),
@@ -746,9 +767,7 @@ async def test_actual_fee_economics_are_separate_and_cap_breaches_are_not_succes
         assert result.economic_status == expected_status
         assert result.source.filled_quantity == Decimal("0.125")
         assert result.receiver.filled_quantity == Decimal("0.125")
-        if expected_status == "VIOLATION":
-            assert any("observed fee" in item and "budget" in item for item in result.findings)
-            assert any("observed fee" in item for item in result.economic_findings)
+        assert any("observed gross" in item and "fee" in item for item in result.economic_findings)
 
 
 @pytest.mark.asyncio
@@ -763,12 +782,36 @@ async def test_missing_fee_is_unknown_economics_without_erasing_fill_quantity(tm
         MissingFee(source_fills=True),
         clock=FakeClock(),
     )
-    assert result.outcome is Outcome.UNKNOWN
+    assert result.outcome is Outcome.SUCCESS
     assert result.economic_status == "UNKNOWN"
     assert result.source.filled_quantity == Decimal("0.125")
     assert result.receiver.filled_quantity == Decimal("0.125")
     assert result.economic_findings
     assert any("fee economics UNKNOWN" in item for item in result.findings)
+
+
+@pytest.mark.asyncio
+async def test_missing_preflight_fee_evidence_does_not_block_proven_exposure(tmp_path):
+    class NoFeeEvidence(FakeClient):
+        async def market_metadata(self, market_id):
+            return replace(
+                await super().market_metadata(market_id),
+                source_fee_rate=None,
+                receiver_fee_rate=None,
+            )
+
+        async def account_snapshot(self, account_index, market_id):
+            return replace(await super().account_snapshot(account_index, market_id), fee_rate=None)
+
+    result = await run_handoff(
+        make_config(tmp_path / "missing-preflight-fee.jsonl"),
+        NoFeeEvidence(source_fills=True),
+        clock=FakeClock(),
+    )
+    assert result.outcome is Outcome.SUCCESS
+    assert result.economic_status == "PROVEN"
+    assert result.source.gross_notional == Decimal("12.53125")
+    assert result.receiver.gross_notional == Decimal("12.65625")
 
 
 @pytest.mark.asyncio

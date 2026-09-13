@@ -595,9 +595,6 @@ class HandoffConfig:
     quantity: Decimal
     source_limit_price: Decimal
     receiver_worst_price: Decimal
-    max_gross_notional: Decimal
-    source_fee_budget: Decimal
-    receiver_fee_budget: Decimal
     freshness_seconds: float
     request_timeout_seconds: float
     order_timeout_seconds: float
@@ -614,8 +611,13 @@ class HandoffConfig:
     api_base_url: str | None = OFFICIAL_MAINNET_API_URL
     api_key_index: int | None = None
     chain_id: int | None = OFFICIAL_MAINNET_CHAIN_ID
-    receiver_price_cap: Decimal | None = None
     auth_token_lifetime_seconds: int = 600
+    # Accepted only to read legacy cap-bearing configuration.  HCR-1 no longer
+    # uses these fields for preflight, dispatch admission, or outcome status.
+    max_gross_notional: Decimal | None = None
+    source_fee_budget: Decimal | None = None
+    receiver_fee_budget: Decimal | None = None
+    receiver_price_cap: Decimal | None = None
 
     def __post_init__(self) -> None:
         _int(self.market_id, "market_id", minimum=0)
@@ -628,11 +630,14 @@ class HandoffConfig:
             "quantity",
             "source_limit_price",
             "receiver_worst_price",
-            "max_gross_notional",
         ):
             object.__setattr__(self, field_name, _positive(getattr(self, field_name), field_name))
+        if self.max_gross_notional is not None:
+            object.__setattr__(self, "max_gross_notional", _positive(self.max_gross_notional, "max_gross_notional"))
         for field_name in ("source_fee_budget", "receiver_fee_budget"):
-            object.__setattr__(self, field_name, _nonnegative(getattr(self, field_name), field_name))
+            value = getattr(self, field_name)
+            if value is not None:
+                object.__setattr__(self, field_name, _nonnegative(value, field_name))
         if self.receiver_price_cap is not None:
             object.__setattr__(self, "receiver_price_cap", _positive(self.receiver_price_cap, "receiver_price_cap"))
         for value, name in (
@@ -715,21 +720,6 @@ class HandoffConfig:
         source_notional = self.quantity * self.source_limit_price
         if source_notional < metadata.minimum_quote_amount:
             raise PreflightBlocked("source maker notional is below the documented quote minimum")
-        receiver_cap = self.receiver_worst_price
-        if self.direction is Direction.SHORT:
-            if self.receiver_price_cap is None:
-                raise PreflightBlocked(
-                    "receiver SELL worst price is a lower bound; an explicit receiver_price_cap is required to prove a gross/fee cap"
-                )
-            if self.receiver_price_cap < self.receiver_worst_price:
-                raise PreflightBlocked("receiver_price_cap must not be below receiver_worst_price")
-            if self.operator_execution_opt_in:
-                raise PreflightBlocked(
-                    "Lighter MARKET SELL exposes only a minimum price; the configured gross/fee ceiling cannot be enforced before dispatch"
-                )
-            receiver_cap = self.receiver_price_cap
-        if max(source_notional, self.quantity * receiver_cap) > self.max_gross_notional:
-            raise PreflightBlocked("configured gross notional bound is exceeded")
         for snapshot, label in ((source, "source"), (receiver, "receiver")):
             if not snapshot.authorized or not snapshot.ready:
                 raise PreflightBlocked(f"{label} account authorization/readiness is unproven")
@@ -762,18 +752,6 @@ class HandoffConfig:
             raise PreflightBlocked("source short position is smaller than Q")
         if receiver.signed_position * expected < 0:
             raise PreflightBlocked("receiver has opposite HOOD exposure")
-        if metadata.source_fee_rate is None or metadata.receiver_fee_rate is None:
-            raise PreflightBlocked("current source/receiver fee evidence is missing")
-        if source.fee_rate is None or receiver.fee_rate is None:
-            raise PreflightBlocked("current account fee evidence is missing")
-        if metadata.source_fee_rate != source.fee_rate or metadata.receiver_fee_rate != receiver.fee_rate:
-            raise PreflightBlocked("account fee evidence conflicts with current market fee evidence")
-        source_fee = source_notional * source.fee_rate
-        receiver_fee = self.quantity * receiver_cap * receiver.fee_rate
-        if source_fee > self.source_fee_budget:
-            raise PreflightBlocked("source fee exceeds configured budget")
-        if receiver_fee > self.receiver_fee_budget:
-            raise PreflightBlocked("receiver fee exceeds configured budget")
         if not metadata.margin_evidence:
             raise PreflightBlocked("minimum/margin evidence is missing")
 

@@ -199,6 +199,28 @@ async def test_sdk_sign_tuple_and_send_are_each_single_explicit_call(monkeypatch
     assert len(signer.cancel_calls) == 1
     assert len(client._http.calls) == 2
     assert signer.cancel_calls[0]["nonce"] == 42
+    short_receiver = OrderPlan(
+        account_index=22,
+        market_id=7,
+        side="SELL",
+        quantity=Decimal("0.125"),
+        quantity_int=125,
+        price=Decimal("250.00"),
+        price_int=25000,
+        order_type="MARKET",
+        time_in_force="IOC",
+        reduce_only=False,
+        order_expiry_ms=0,
+        client_order_index=456,
+    )
+    short_receipt = await client.submit_order(short_receiver)
+    assert short_receipt.accepted
+    assert signer.sign_calls[-1]["is_ask"] is True
+    assert signer.sign_calls[-1]["order_type"] == 1
+    assert signer.sign_calls[-1]["time_in_force"] == 0
+    assert signer.sign_calls[-1]["reduce_only"] is False
+    assert signer.sign_calls[-1]["price"] == 25000
+    assert len(client._http.calls) == 3
 
 
 @pytest.mark.asyncio
