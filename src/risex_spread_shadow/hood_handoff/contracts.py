@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit
 
 
@@ -532,6 +532,7 @@ class AccountMarginEvidence:
         observed_at: float,
         selected_position: Mapping[str, Any] | None,
         account: Mapping[str, Any],
+        position_rows: Sequence[Mapping[str, Any]] | None = None,
         source: str = "account response",
         sdk_version: str | None = None,
     ) -> "AccountMarginEvidence":
@@ -597,6 +598,41 @@ class AccountMarginEvidence:
             invalid_name="account_pending_order_count",
         )
         account_isolated = raw_count(account, "total_isolated_order_count")
+        account_open_lower_bound = selected_open
+        account_pending_lower_bound = selected_pending
+        raw_rows: Any = position_rows
+        if raw_rows is None:
+            raw_rows = account.get("positions", ())
+        if not isinstance(raw_rows, (list, tuple)):
+            invalid.append("position_rows")
+            raw_rows = ()
+        for row in raw_rows:
+            if not isinstance(row, Mapping):
+                invalid.append("position_rows")
+                continue
+            # The selected row was parsed above so its field-specific invalid
+            # names remain distinguishable from account-wide fields.
+            if selected_position is not None and row is selected_position:
+                continue
+            row_open = raw_count(row, "open_order_count", invalid_name="position_row_counts")
+            row_pending = raw_count(row, "pending_order_count", invalid_name="position_row_counts")
+            row_tied = raw_count(row, "position_tied_order_count", invalid_name="position_row_counts")
+            if row_pending is not None and row_open is not None and row_pending > row_open:
+                invalid.append("position_row_counts")
+            if row_tied is not None and row_open is not None and row_tied > row_open:
+                invalid.append("position_row_counts")
+            if row_open is not None:
+                account_open_lower_bound = (
+                    row_open
+                    if account_open_lower_bound is None
+                    else max(account_open_lower_bound, row_open)
+                )
+            if row_pending is not None:
+                account_pending_lower_bound = (
+                    row_pending
+                    if account_pending_lower_bound is None
+                    else max(account_pending_lower_bound, row_pending)
+                )
         if (
             selected_pending is not None
             and selected_open is not None
@@ -621,11 +657,9 @@ class AccountMarginEvidence:
             and account_isolated > account_total
         ):
             invalid.append("account_order_counts")
-        if (
-            account_total is not None
-            and selected_open is not None
-            and selected_open > account_total
-        ):
+        if account_total is not None and account_open_lower_bound is not None and account_open_lower_bound > account_total:
+            invalid.append("account_order_counts")
+        if account_pending is not None and account_pending_lower_bound is not None and account_pending_lower_bound > account_pending:
             invalid.append("account_order_counts")
         return cls(
             account_index=account_index,

@@ -161,6 +161,7 @@ class ReadinessMarketMarginEvidence:
         invalid: list[str] = []
 
         def raw_integer(name: str, *aliases: str) -> int | None:
+            values: list[int] = []
             for candidate in (name, *aliases):
                 if candidate not in value or value[candidate] is None:
                     continue
@@ -168,8 +169,13 @@ class ReadinessMarketMarginEvidence:
                 if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
                     invalid.append(name)
                     return None
-                return raw
-            return None
+                values.append(raw)
+            if not values:
+                return None
+            if len(set(values)) != 1:
+                invalid.append(name)
+                return None
+            return values[0]
 
         default_fraction = raw_integer("default_initial_margin_fraction")
         minimum_fraction = raw_integer(
@@ -681,9 +687,11 @@ class ReadOnlyLighterSdkClient:
         positions = account["positions"]
         if not isinstance(positions, (list, tuple)):
             raise ContractError("Lighter account positions field is malformed")
+        position_rows: list[Mapping[str, Any]] = []
         matching_positions: list[Mapping[str, Any]] = []
         for item in positions:
             candidate = _model_dict(item)
+            position_rows.append(candidate)
             if "market_id" not in candidate:
                 raise ContractError("Lighter account position lacks market identity")
             candidate_market = _strict_integer(candidate["market_id"], "Lighter account position market_id", minimum=0)
@@ -707,6 +715,7 @@ class ReadOnlyLighterSdkClient:
             observed_at=account_observed_at,
             selected_position=selected_position,
             account=account,
+            position_rows=position_rows,
             source="lighter-sdk.account response",
             sdk_version=self.sdk_version,
         )

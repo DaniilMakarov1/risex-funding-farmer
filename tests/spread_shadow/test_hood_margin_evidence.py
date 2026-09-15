@@ -76,6 +76,21 @@ def account_response(index: int, *, positions=None, **overrides):
     return value
 
 
+def account_with_other_market_row(index: int, **overrides):
+    value = account_response(index, **overrides)
+    value["positions"] = [
+        *value["positions"],
+        {
+            "market_id": 99,
+            "open_order_count": 1,
+            "pending_order_count": 1,
+            "position_tied_order_count": 0,
+            "private_key": "secret-other-market-sentinel-must-not-escape",
+        },
+    ]
+    return value
+
+
 class FakeSigner:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
@@ -267,6 +282,11 @@ def test_margin_evidence_rejects_invalid_and_conflicting_values_without_raw_esca
         selected_position={"open_order_count": 1, "pending_order_count": 2}
     )
     assert "selected_order_counts" in selected_conflict.invalid_fields
+    selected_account_conflict = complete_account_evidence(
+        selected_position={"open_order_count": 1, "pending_order_count": 1},
+        account={"total_order_count": 1, "pending_order_count": 0},
+    )
+    assert "account_order_counts" in selected_account_conflict.invalid_fields
     serialized = json.dumps(evidence.as_dict(), sort_keys=True)
     assert "secret-sentinel-must-not-escape" not in serialized
     assert evidence.as_dict()["selected_position"]["initial_margin_fraction"]["raw"] is None
@@ -308,6 +328,32 @@ def test_market_margin_evidence_preserves_raw_values_and_marks_units_unverified(
     )
     assert invalid.status == "INVALID"
     assert set(invalid.invalid_fields) == {"default_initial_margin_fraction", "minimum_initial_margin_fraction"}
+
+    equivalent_aliases = ReadinessMarketMarginEvidence.from_response(
+        {
+            "default_initial_margin_fraction": 500,
+            "minimum_initial_margin_fraction": 100,
+            "min_initial_margin_fraction": 100,
+        },
+        market_id=7,
+        symbol="BTC",
+        observed_at=NOW,
+    )
+    assert equivalent_aliases.status == "OBSERVED"
+    assert equivalent_aliases.as_dict()["minimum_initial_margin_fraction"]["raw"] == 100
+
+    malformed_alias = ReadinessMarketMarginEvidence.from_response(
+        {
+            "default_initial_margin_fraction": 500,
+            "minimum_initial_margin_fraction": 100,
+            "min_initial_margin_fraction": "malformed",
+        },
+        market_id=7,
+        symbol="BTC",
+        observed_at=NOW,
+    )
+    assert malformed_alias.status == "INVALID"
+    assert malformed_alias.as_dict()["minimum_initial_margin_fraction"]["raw"] is None
 
     conflicting = ReadinessMarketMarginEvidence.from_response(
         {"default_initial_margin_fraction": 100, "min_initial_margin_fraction": 200},
@@ -385,6 +431,35 @@ async def test_invalid_market_evidence_is_reported_without_readiness_proof(monke
 
 
 @pytest.mark.asyncio
+async def test_conflicting_market_aliases_are_invalid_through_read_adapter(monkeypatch):
+    monkeypatch.setattr(
+        FakeOrderApi,
+        "market_details",
+        {
+            "symbol": "BTC",
+            "market_id": 7,
+            "market_type": "perp",
+            "status": "active",
+            "min_base_amount": "0.10",
+            "min_quote_amount": "10",
+            "supported_size_decimals": 2,
+            "supported_price_decimals": 1,
+            "default_initial_margin_fraction": 500,
+            "minimum_initial_margin_fraction": 100,
+            "min_initial_margin_fraction": 900,
+        },
+    )
+    result = await run_readiness(readiness_config(), sdk_client(), now=NOW)
+    evidence = result.as_dict()["market"]["margin_evidence"]
+    assert evidence["status"] == "INVALID"
+    assert evidence["invalid_fields"] == ["minimum_initial_margin_fraction"]
+    assert evidence["minimum_initial_margin_fraction"]["raw"] is None
+    check = next(item for item in result.checks if item.name == "market_margin_evidence")
+    assert check.status == "UNKNOWN"
+    assert check.code == "MARKET_MARGIN_EVIDENCE_INVALID"
+
+
+@pytest.mark.asyncio
 async def test_absent_selected_row_is_distinct_and_does_not_prove_flatness_or_readiness():
     client = sdk_client(
         {
@@ -406,7 +481,12 @@ async def test_absent_selected_row_is_distinct_and_does_not_prove_flatness_or_re
 
 @pytest.mark.asyncio
 async def test_other_market_orders_are_retained_without_claiming_selected_market_is_empty():
-    client = sdk_client()
+    client = sdk_client(
+        {
+            11: account_with_other_market_row(11),
+            22: account_with_other_market_row(22),
+        }
+    )
     result = await run_readiness(readiness_config(), client, now=NOW)
     payload = result.as_dict()
     selected_orders = next(item for item in result.checks if item.name == "source_account_active_orders")
@@ -416,6 +496,31 @@ async def test_other_market_orders_are_retained_without_claiming_selected_market
     assert account_evidence["pending_order_count"]["raw"] == 1
     assert "NO_ACCOUNT_WIDE_ORDERS" not in json.dumps(payload)
     assert payload["accounts"]["source"]["margin_evidence"]["status"] == "OBSERVED"
+
+
+@pytest.mark.asyncio
+async def test_other_market_row_lower_bound_conflict_is_not_reported_as_no_orders():
+    client = sdk_client(
+        {
+            11: account_with_other_market_row(
+                11,
+                total_order_count=0,
+                pending_order_count=0,
+                total_isolated_order_count=0,
+            ),
+            22: account_response(22),
+        }
+    )
+    result = await run_readiness(readiness_config(), client, now=NOW)
+    source_evidence = result.as_dict()["accounts"]["source"]["margin_evidence"]
+    assert source_evidence["status"] == "INVALID"
+    assert "account_order_counts" in source_evidence["invalid_fields"]
+    assert source_evidence["account"]["total_order_count"]["raw"] == 0
+    assert source_evidence["account"]["pending_order_count"]["raw"] == 0
+    check = next(item for item in result.checks if item.name == "source_account_margin_evidence")
+    assert check.status == "UNKNOWN"
+    assert check.code == "MARGIN_EVIDENCE_INVALID"
+    assert "NO_ACCOUNT_WIDE_ORDERS" not in json.dumps(result.as_dict())
 
 
 def test_evidence_identity_must_match_snapshot_and_market_metadata():
