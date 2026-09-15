@@ -21,6 +21,11 @@ from .keychain import (
     MacOSKeychainBackend,
     read_hidden_secret,
 )
+from .local_attempt import (
+    LocalAttemptInputError,
+    collect_local_attempt_inputs,
+    run_local_attempt,
+)
 from .readiness import (
     ReadinessCheck,
     ReadinessConfig,
@@ -65,7 +70,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "run",
         nargs="?",
-        choices=("run", "readiness"),
+        choices=("run", "readiness", "local-attempt"),
         help="run the configured utility or the explicit read-only readiness check",
     )
     parser.add_argument("--config", type=Path, help="JSON operator configuration; all numerical bounds are required")
@@ -85,6 +90,18 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--source-limit-price", dest="readiness_source_limit_price")
     parser.add_argument("--receiver-worst-price", dest="readiness_receiver_worst_price")
+    parser.add_argument("--order-timeout-seconds", dest="local_order_timeout_seconds", type=float)
+    parser.add_argument("--reconcile-timeout-seconds", dest="local_reconcile_timeout_seconds", type=float)
+    parser.add_argument("--poll-interval-seconds", dest="local_poll_interval_seconds", type=float)
+    parser.add_argument("--max-poll-count", dest="local_max_poll_count", type=int)
+    parser.add_argument("--source-order-lifetime-seconds", dest="local_source_order_lifetime_seconds", type=int)
+    parser.add_argument("--client-order-prefix", dest="local_client_order_prefix")
+    parser.add_argument(
+        "--attempt-dir",
+        dest="local_attempt_dir",
+        type=Path,
+        help="new owner-only directory for the fixed local diagnostic packet and intent journal",
+    )
     parser.add_argument("--api-base-url", dest="readiness_api_base_url")
     parser.add_argument(
         "--execute",
@@ -376,8 +393,9 @@ def _series_config(
 
 
 def _readiness_config(args: argparse.Namespace) -> ReadinessConfig:
+    readiness_symbol = args.readiness_symbol
     required = {
-        "symbol": args.readiness_symbol,
+        "symbol": readiness_symbol,
         "quantity": args.readiness_quantity,
         "direction": args.readiness_direction,
         "source account": args.source_account_index,
@@ -391,7 +409,7 @@ def _readiness_config(args: argparse.Namespace) -> ReadinessConfig:
         raise SystemExit("readiness is missing required inputs: " + ", ".join(missing))
     try:
         return ReadinessConfig(
-            market_symbol=args.readiness_symbol,
+            market_symbol=readiness_symbol,
             quantity=args.readiness_quantity,
             direction=args.readiness_direction,
             source_account_index=args.source_account_index,
@@ -484,6 +502,76 @@ def _remove_keychain(config: Any, account_indices: tuple[int, ...]) -> int:
     return 0
 
 
+async def _run_local_attempt(args: argparse.Namespace) -> int:
+    """Collect one local plan, then invoke the existing engine once."""
+
+    if args.config is not None or args.market_evidence is not None:
+        raise SystemExit("local-attempt takes direct operator inputs and does not accept config or market-evidence JSON")
+    if args.keychain_remove:
+        raise SystemExit("local-attempt cannot remove Keychain credentials; use the existing run/readiness removal path")
+    if args.confirm_plan:
+        raise SystemExit("local-attempt requires its interactive launch confirmation")
+    if args.i_understand_series_live_operation:
+        raise SystemExit("local-attempt is one PAIRED_OPENING attempt and cannot use the series confirmation")
+    if args.i_understand_one_attempt_live_operation and not args.execute:
+        raise SystemExit("--i-understand-one-attempt-live-operation requires --execute")
+    if args.execute and not args.i_understand_one_attempt_live_operation:
+        raise SystemExit("--execute also requires --i-understand-one-attempt-live-operation")
+    if args.local_attempt_dir is None:
+        raise SystemExit("local-attempt requires --attempt-dir")
+    if args.readiness_api_base_url is not None:
+        raise SystemExit("local-attempt uses the fixed Robinhood Chain endpoint")
+
+    try:
+        inputs = collect_local_attempt_inputs(
+            market_symbol=args.readiness_symbol,
+            quantity=args.readiness_quantity,
+            direction=args.readiness_direction,
+            source_account_index=args.source_account_index,
+            receiver_account_index=args.receiver_account_index,
+            api_key_index=args.api_key_index,
+            attempt_dir=args.local_attempt_dir,
+            source_limit_price=args.readiness_source_limit_price,
+            receiver_worst_price=args.readiness_receiver_worst_price,
+            freshness_seconds=args.readiness_freshness_seconds,
+            request_timeout_seconds=args.readiness_request_timeout_seconds,
+            order_timeout_seconds=args.local_order_timeout_seconds,
+            reconcile_timeout_seconds=args.local_reconcile_timeout_seconds,
+            poll_interval_seconds=args.local_poll_interval_seconds,
+            max_poll_count=args.local_max_poll_count,
+            source_order_lifetime_seconds=args.local_source_order_lifetime_seconds,
+            client_order_prefix=args.local_client_order_prefix,
+            defer_incremental_margin_calculation=bool(args.defer_incremental_margin_calculation),
+        )
+    except LocalAttemptInputError as exc:
+        raise SystemExit(str(exc)) from None
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(f"invalid local-attempt input: {exc}") from None
+
+    account_indices = (inputs.source_account_index, inputs.receiver_account_index)
+
+    def secret_provider_factory(local_inputs: Any) -> Any:
+        if args.keychain or args.keychain_replace:
+            try:
+                return _keychain_provider(
+                    local_inputs.readiness_config(),
+                    account_indices,
+                    replace=args.keychain_replace,
+                )
+            except SystemExit as exc:
+                raise RuntimeError("keychain credential operation failed") from exc
+        return PromptSecretProvider(account_indices, local_inputs.api_key_index)
+
+    result = await run_local_attempt(
+        inputs,
+        execute=args.execute,
+        output_fn=print,
+        secret_provider_factory=secret_provider_factory,
+    )
+    print(json.dumps(result.as_dict(), sort_keys=True, separators=(",", ":")))
+    return result.exit_code
+
+
 async def _run_readiness(args: argparse.Namespace) -> int:
     # Reject every execution/configuration flag before config parsing, client
     # creation, SDK import, or hidden key input.  Readiness is a distinct path.
@@ -558,6 +646,8 @@ async def _run_readiness(args: argparse.Namespace) -> int:
 
 
 async def _run(args: argparse.Namespace) -> int:
+    if args.run == "local-attempt":
+        return await _run_local_attempt(args)
     if args.run == "readiness":
         return await _run_readiness(args)
     if args.config is None:
