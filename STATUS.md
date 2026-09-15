@@ -1,5 +1,17 @@
 # Current status
 
+## HCR-11 automatic local-attempt prices/timing — ACCEPTED OFFLINE
+
+Candidate71bbcb45d67df6ec8c421ddb22df2c88d3028960 accepted by sole Chief01a0a67b-bec7-75d2-9970-e3914b10e445 on2026-09-15. Automatic one-tick mirrored public-book proposal, exact unchanged quantity, receiver bound equal to source, eight declared finite defaults, offline unresolved preview/help, bounded proposal before LAUNCH, credential-free cancellation, original-proposal expiry and fresh exact-price revalidation after keys are implemented. Explicit-price invocation remains supported. No engine, strategy, fee, sizing or flattening change.
+
+Independent full four-file diff and correction reviewed. Nineteen launcher scenarios plus strict malformed identity checks, retained invalid final observations and two default-reader/real-engine/fake-SDK integrations PASS. One consolidated CHANGES_REQUESTED corrected lossy identity coercion and loss of final evidence before normalization. Original1e95ed8 and chief-v1/builder-v1 evidence remain preserved. Final clean isolated Python3.11.5/SDK1.1.2 suite4404passed,3skipped,exit0,124.56seconds. All source/test hashes unchanged and project imports restricted to candidate checkout. Source fingerprint sha256:fb28e6b891474b38b20b8234b284acb89a16e6c8aa9161f8426d93852044599f. Final evidence: original-root spread-shadow-runs/hood-auto-attempt-20260915/chief-v2; Builder correction packet builder-v2.
+
+Builder01a0a67c-a2b0-7a32-af88-068ed518a6fa delivered directly and is complete; branch codex/spread-v1-auto-attempt/worktree hood-auto-attempt preserved. Luna/max VERIFIED; Standard requested, actual speed UNKNOWN. Chief Astra/medium requested, independent telemetry UNKNOWN. No active Builder assignment, financial process, monitoring promise or duplicate Chief. Publication identity is verified separately in chief-v2/publication.json.
+
+Actual credentials, Keychain, private endpoints, signing and orders NOT_RUN by agents. Owner-local attempt remains NOT_RUN; existing owner-live-001 was verified empty/mode0700 without modification. README gives the automatic invocation: no manual numeric price/time questions. Source27331 SELL/receiver27337 BUY, BTC0.00020, keyindex4, Robinhood domain466324 and incremental-margin deferral remain selected. Exact notional is an estimate, not a guaranteed USD16, match or profit. Successful paired opening leaves opposite open inventory. Expired/changed/invalid final checks stop without mutation/repricing/retry; preserve every attempt file and diagnose incomplete results before another operation.
+
+## Historical accepted state
+
 ## HCR-9 local launcher — ACCEPTED OFFLINE
 
 Candidate00eff58940122dd74d558c59af2ca8950a270b6b accepted by Chief01a0a602-2bbb-7dd0-ab24-dc6114efc527 on2026-09-15. Single local paired-opening launcher, exact price/time inputs, source/receiver-bound notionals, Keychain reuse, original fresh metadata, exclusive persistent claim and sanitized fixed diagnostic packet. Same-directory rerun refuses. Recorded engine success survives packet-write error, while launcher reports INCOMPLETE/nonzero. Initial storage failure stops before secrets/SDK. No strategy/engine/policy change.

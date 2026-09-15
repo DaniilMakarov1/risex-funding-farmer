@@ -1,10 +1,10 @@
 # RISEx Spread Shadow and legacy Funding Farmer
 
-## First owner-confirmed agent Mainnet attempt — HCR-9/HCR-10
+## Owner-local paired opening — HCR-11
 
-The HCR-9 local launcher is accepted offline at candidate `00eff58940122dd74d558c59af2ca8950a270b6b`: independent adverse checks and the final clean isolated Python3.11 suite passed4392tests with3skips. No HCR-9 live attempt has been verified. HCR-10 records the owner's project-level permission for confirmed operations; it cannot override platform/system restrictions. In the current Chief task, the owner runs the financial operation locally and the Chief reviews sanitized results. Later materially different actions require the applicable owner confirmation and a capable authorized execution environment.
+HCR-11 is accepted offline at candidate `71bbcb45d67df6ec8c421ddb22df2c88d3028960`: independent adverse checks and the final clean isolated Python3.11 suite passed **4404 tests with 3 skips**, exit0. No live attempt has been run by agents. The owner runs the financial operation locally; the Chief can review its sanitized result packet afterward. HCR-10 project permission does not override platform/system restrictions. Later materially different actions require a fresh applicable owner confirmation.
 
-The selected operation is one BTC paired opening: account27331 posts SELL LIMIT POST_ONLY and account27337 submits BUY MARKET IOC, API key index4, Robinhood deployment. The owner targets approximately USD16 of exposure per leg, with small deviation allowed. Quantity0.00020BTC is an exact reviewable input, not a verified current dollar value. Missing sizing, price or timing inputs may be supplied through the confirmed live flow; the owner does not require a fixed pre-confirmation checklist.
+The selected operation is one BTC paired opening: account27331 posts SELL LIMIT POST_ONLY and account27337 submits BUY MARKET IOC, API key index4, Robinhood deployment. The owner targets approximately USD16 of exposure per leg, with small deviation allowed. Quantity0.00020BTC is an exact reviewable input, not a verified current dollar value. HCR-11 selects prices from the public book and supplies declared finite timing defaults; quantity remains exactly0.00020BTC. No numerical price/time prompts are required.
 
 Full paired opening leaves a SHORT at the source and a LONG at the receiver. It does not automatically close them or guarantee that the two accounts match each other. The limit order's exchange lifetime and the program's waiting deadline are separate settings.
 
@@ -13,9 +13,9 @@ After the program returns, preserve its attempt directory and all files, includi
 For diagnosis, tell the Chief that the attempt has ended and provide its directory path. The Chief can read the sanitized packet in the shared workspace, inspect recorded phases and known/unknown positions, and prepare an offline-tested correction. Never place API keys, authentication tokens or signed payloads in that packet. The required API keys may be exchanged only with the assigned execution agent in the private owner-agent task/chat or through the protected local credential boundary; seed phrases, recovery material and withdrawal credentials remain prohibited. The Chief does not promise continuous monitoring and must not edit or restart an active financial process. Any later materially different financial operation requires fresh owner confirmation after the prior state is resolved.
 
 
-## Local single-attempt command — HCR-9
+## Local single-attempt command — HCR-11
 
-The `local-attempt` entry point collects the required values without a config or market-evidence JSON file. Its default preview is offline. The following execution command is for the owner to run in an interactive terminal after implementation acceptance; the Chief does not launch financial operations in this task.
+The `local-attempt` entry point calculates a public-book proposal without a config or market-evidence JSON file. Its default preview is offline. The following execution command is for the owner to run in an interactive terminal after implementation acceptance; the Chief does not launch financial operations in this task.
 
 ```bash
 cd "/Users/daniilmakarov/Desktop/RISEx Spread Shadow"
@@ -28,13 +28,27 @@ PYTHONPATH=src .venv-hood/bin/python -m risex_spread_shadow.hood_handoff.cli loc
   --execute --i-understand-one-attempt-live-operation
 ```
 
-The attempt directory must be empty and owner-only, or its existing parent must be owner-only. The launch preparation reserves an empty owner-only `owner-live-001` directory; never clear or reuse it once it contains evidence. Remove both execution flags for an offline preview; it still asks for missing price/time inputs but never accesses Keychain or the network. `--help` is also offline.
+The attempt directory must be empty and owner-only, or its existing parent must be owner-only. The launch preparation reserves an empty owner-only `owner-live-001` directory; never clear or reuse it once it contains evidence. Remove both execution flags for an offline preview: it shows the automatic rule, unresolved prices and timing defaults without numeric prompts, Keychain or network access. `--help` is also offline.
 
-The prompts request source limit price, receiver worst price, freshness bound, request timeout, order timeout, reconciliation timeout, polling interval, maximum poll count, and source order lifetime. All prices use exact decimal input. The source order lifetime has the existing minimum of300seconds and is separate from the program's order waiting timeout. No price or timing policy is selected automatically. The unchanged auth-token lifetime is600seconds and is disclosed in preview. The unique client prefix in the example is only a label, not an economic setting.
+With both price flags omitted, source SELL uses best ask minus one tick if that stays strictly above best bid; otherwise it uses best ask. Source BUY mirrors that rule. Receiver worst-price bound equals the source price. Both sides must be valid, fresh and uncrossed. For a synthetic book with bid80000.0, ask80000.2 and tick0.1, SELL proposes80000.1 and estimated notional16.00002USD for0.00020BTC. This is an arithmetic illustration, not a current market quote.
 
-Review the displayed source-limit and receiver-worst-bound notionals to check the intended exposure near USD16. They are quantity multiplied by your price bounds, not actual fills, fees or profit. Type `LAUNCH` only for the displayed operation. Any other response cancels before credential access. Both credentials are loaded through the existing Keychain/hidden-input boundary before fresh market metadata is collected; prompt delays do not refresh old observations. Do not paste keys outside a hidden-key prompt.
+| Local limit | Default |
+| --- | --- |
+| Freshness | 10 seconds |
+| Each request | 5 seconds |
+| Order waiting | 10 seconds |
+| Reconciliation | 20 seconds |
+| Poll interval / maximum count | 0.5 seconds / 40 |
+| Source exchange expiry | 300 seconds |
+| Authentication lifetime | 600 seconds |
 
-The fixed diagnostic files are `attempt-packet.json`, `terminal-result.json`, `exit-status.json`, `intent.jsonl` and the persistent `.attempt.claim`. The packet binds the launcher source fingerprint and original metadata observation. A recorded engine result is separate from complete diagnostic storage: failed finalization returns `INCOMPLETE` with nonzero exit while retaining any already saved result. Missing terminal result stays incomplete. The launcher refuses a nonempty attempt directory before credential access and never creates a replacement attempt automatically.
+These are local finite operating limits, not venue guarantees. Source expiry is separate from order waiting. Existing explicit valid timing overrides remain available. To supply prices explicitly, provide both `--source-limit-price` and `--receiver-worst-price`; one alone is an error. The unique client prefix is only a label.
+
+In automatic execution mode, public metadata/book reads calculate the proposal before credentials are accessed. Review the displayed exact prices, notional estimate and time limits. Type `LAUNCH` to confirm that one proposal; any other response cancels without Keychain/private access. After confirmation, both credentials load through Keychain/hidden input, then fresh metadata/book must validate the approved exact prices. An expired approval, changed automatic price or invalid final observation stops before orders; there is no automatic reprice/retry. Prompt delays never refresh old timestamps. Enter keys only at the hidden-key prompt.
+
+The notional is quantity multiplied by the proposed bound, not a guarantee of USD16, a fill, fees or profit. Price-time priority may match against other participants, and IOC execution may be partial; see [official order and matching rules](https://docs.lighter.xyz/trading/order-types-and-matching).
+
+The fixed diagnostic files are `attempt-packet.json`, `terminal-result.json`, `exit-status.json`, `intent.jsonl` and the persistent `.attempt.claim`. The packet binds the launcher source fingerprint and original proposal/final-check observations and timestamps. A recorded engine result is separate from complete diagnostic storage: failed finalization returns `INCOMPLETE` with nonzero exit while retaining any already saved result. Missing terminal result stays incomplete. The launcher refuses a nonempty attempt directory before credential access and never creates a replacement attempt automatically.
 
 After the process ends, give the Chief the attempt directory path. Preserve every file even after a failure. This launcher does not provide an automatic reconciliation-only command or a retry instruction; an unresolved operation must be inspected before any later separately authorized financial action. A successful paired opening leaves opposite open positions and is not evidence of profit.
 

@@ -3,6 +3,18 @@
 SYSTEM_SPEC_VERSION = 4.2
 SPEC_STATUS = FIRST_RAW_RESEARCH_SCANNER_IMPLEMENTED
 
+## HCR-11 amendment — automatic owner-local proposal and finite defaults
+
+This owner-authorized amendment supersedes HCR-9 manual price/time collection for the local-attempt interface only. Acceptance state is in STATUS/NEXT_TASK. Chief and Builder development/verification are offline synthetic; live operation remains owner-local and NOT_RUN by agents.
+
+With both prices omitted, use a fresh valid two-sided uncrossed public book for the selected perpetual and Robinhood identity. Source SELL proposes best ask minus one price tick when strictly above best bid, otherwise best ask. Source BUY mirrors this rule: best bid plus one tick when strictly below best ask, otherwise best bid. Receiver worst-price bound equals source price. Positive exact grid prices, quantity/grid/minimum and freshness checks remain mandatory. No guessed price, quantity adjustment, matching guarantee or automatic flattening is added. Both explicit prices remain supported; exactly one missing price is an input error.
+
+Omitted operating limits are declared defaults: freshness10s, request5s, order wait10s, reconciliation20s, polling0.5s, maximum40polls, source order expiry300s and authentication lifetime600s. Explicit valid overrides remain supported. These finite local limits are not exchange latency guarantees; order wait and exchange expiry are distinct.
+
+Help/default preview stays offline and displays the automatic rule with unresolved prices. Execute may read public metadata/book before the local LAUNCH confirmation without credentials. Display the exact proposed prices, estimated notionals and timing first. Cancellation accesses no credentials/private endpoints. After confirmation, load keys and freshly revalidate metadata/book against the approved exact prices and the same selection rule. Changed, invalid or expired approval stops before mutation without repricing, retries or repeated prompts. Preserve original observation times and provenance for proposal and final check; input delay cannot renew them. Retain exclusive attempt claim, no replay, secret isolation and truthful missing/recorded terminal distinction. No engine strategy change is authorized.
+
+Official matching reference: https://docs.lighter.xyz/trading/order-types-and-matching (the earlier orders-and-matching URL moved). Matching is price-time priority; crossing post-only orders are cancelled, and taker execution may be partial. Acceptance cannot promise the named accounts will match one another.
+
 ## HCR-10 amendment — confirmation-gated agent mainnet execution and private credential exchange
 
 Runtime qualification: HCR-10 is owner project permission only and never overrides system/platform restrictions. The current Chief task supports owner-local financial launch and sanitized result diagnosis; it does not execute live financial transactions.
