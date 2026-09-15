@@ -1,5 +1,9 @@
 # Current status
 
+## HCR-7A opening-margin evidence diagnosis — AUTHORIZED
+
+Owner supplied the post-Keychain readiness report and confirms continued autonomous work. Both account reads PASS; BTC positions zero/no active orders and .00020 quantity valid at report time. Overall UNKNOWN still reflects absent opening-margin proof and UNSET prices. No actual keys read by agents; local enrollment USER_CONFIRMED. One fresh read-only Builder will identify exact supported margin inputs/formula or an evidence-backed blocker under NEXT_TASK. No production changes, actual Keychain/account/order calls or new market collection; no continuous monitoring. New report identity/summary in original-root spread-shadow-runs/hood-margin-evidence-20260915/chief-v1. HCR-6 remains accepted unchanged.
+
 ## HCR-6 secure local credential persistence — ACCEPTED OFFLINE
 
 Accepted candidate 11bde5bd68177b2476d784f34e3ea9babccf63ed, sole successor Chief 01a0a563-dcbe-7bc0-bcde-f69f1cd3822b. Builder 01a0a572-9cce-7082-b239-ed5ffe98d142 delivered directly and is complete; branch/worktree preserved, no monitoring. Optional native macOS Keychain first-save/reuse/replacement/removal added for explicit readiness/operator execution. No dependencies, plaintext fallback, default preview credential access or trading-policy changes.
