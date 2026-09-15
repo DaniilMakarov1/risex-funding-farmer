@@ -1,5 +1,7 @@
 # Current status
 
+HCR-5 local read-only readiness command IN DEVELOPMENT, new minimal-context Builder to own implementation. Owner confirmed.00020BTC paired opening A27331SHORT/B27337LONG. HCR-4 public sizing2/2 complete; no further public/account/key/signing/order calls authorized for agents. Accepted HCR-3 remains unchanged until review.
+
 ## HCR-3 paired opening — ACCEPTED OFFLINE
 
 Candidate2b06a7b09109c2101e722103b93dc007e31fcdb9 adds explicit PAIRED_OPENING from initially flat accounts: maker opens opposite receiver position, both non-reduce-only. Existing CLOSE_REOPEN remains default. Owner-selected setup is BTC, A27331 SHORT / B27337 LONG, about10–15USD per leg; exact current BTC quantity/prices/time bounds and margin evidence not selected or verified. Live accounts/credentials/signatures/orders NOT_RUN.

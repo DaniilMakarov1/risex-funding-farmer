@@ -3,6 +3,10 @@
 SYSTEM_SPEC_VERSION = 4.0
 SPEC_STATUS = FIRST_RAW_RESEARCH_SCANNER_IMPLEMENTED
 
+## HCR-5 amendment — local readiness inspection (in development)
+
+Owner authorizes a separately invoked read-only diagnostic for the Robinhood paired-opening utility. It checks current market and both account readiness without order mutations. Local user execution may authenticate read endpoints using hidden in-memory API key input; agent development stays offline. Missing incremental opening-margin proof remains UNKNOWN, and missing operator trade bounds remain UNSET. Diagnostics cannot silently promote a quote/balance into an executable plan or bypass accepted trading preflight. Existing no-network default preview and all order semantics remain unchanged. NEXT_TASK defines the finite implementation/verification scope.
+
 ## HCR-3 amendment — paired opening (accepted offline)
 
 Accepted candidate 2b06a7b09109c2101e722103b93dc007e31fcdb9; final clean isolated suite4312 passed,3 skipped, live NOT_RUN. Owner explicitly authorizes an additional mode from initially flat funded accounts: A posts a non-reduce-only SELL LIMIT POST_ONLY opening SHORT; B submits non-reduce-only BUY MARKET IOC opening LONG. This mode does not transfer collateral or preserve an earlier position. It retains sequential variable slices, exact expected opposite position deltas, opening margin for both accounts, bounded prices/freshness/deadlines, durable receipts and no replay. Only independently proven paired success allows another slice. Distinguish operation mode in all bindings and outputs. Existing close/reopen stays the default; its source reduce-only requirement is unchanged. NEXT_TASK defines finite implementation/review criteria. Agents do not execute live trades.
