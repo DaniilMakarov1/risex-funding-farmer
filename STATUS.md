@@ -1,5 +1,9 @@
 # Current status
 
+## Post-HCR-7B semantics diagnosis — environment decision pending
+
+Updated owner report received: account reads PASS, both BTC rows absent, account-wide total/pending/isolated orders0; default/minimum market fractions raw5000/200. Pinned SDK and official kit describe historical touched-market rows; absence can be normal for untouched markets. Response units and actual default account settings are not proven. No production or policy change. Official kit now explicitly identifies api.rh.lighter.xyz as mainnet and api.rh-testnet.lighter.xyz as testnet; credentials/account indices are deployment-specific. Owner asked to choose environment before any new finite scope. Evidence original-root spread-shadow-runs/hood-margin-evidence-20260915/semantics-v1 and owner-report-v2. No private/live calls or new Builder assignment.
+
 ## HCR-7B margin diagnostic evidence — ACCEPTED OFFLINE
 
 Candidate 0582c5819d59569356caecc7c153c5e2d5c4370f accepted after full actual diff review and independent correction probes. Bounded whitelisted account/market response fields preserve raw units, identity and original observations; absent rows remain distinct, conflicting counts/aliases INVALID/UNKNOWN. Final clean isolated Python3.11.5 / SDK1.1.2 suite4362 passed,3 skipped,exit0,127.92seconds; unchanged hashes and candidate import roots verified. Evidence original-root spread-shadow-runs/hood-margin-evidence-20260915/chief-final-v1; initial unaccepted c9ee83c/probes preserved. No execution, price or Keychain behavior changes; actual account/key/order/network calls NOT_RUN.
