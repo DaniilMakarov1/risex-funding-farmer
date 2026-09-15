@@ -37,6 +37,8 @@ This diagnostic does not need fabricated `market-evidence.json`, quantity-to-mar
 
 Read the final JSON `checks` entries. `PASS` means the named condition was established, `BLOCKED` identifies a failed condition, `UNKNOWN` means missing proof/read failure, and `UNSET` identifies an unchosen trade parameter. The overall exit is0 only for READY, otherwise2. READY is read-only diagnostic completion, not a promise of execution or permission to trade; the report always has `execution_authorized:false`.
 
+HCR-7B adds `market.margin_evidence` and `accounts.source/receiver.margin_evidence` to the same command's JSON. These retain returned margin settings, selected-row presence, account-wide order counts and provenance. `OBSERVED` means fields were retained, not that opening margin is sufficient. `INCOMPLETE`, `POSITION_ROW_ABSENT`, `UNAVAILABLE` and `INVALID` distinguish missing or conflicting evidence. Numeric margin units remain `unverified`; other-market rows and arbitrary account fields are not dumped. No extra command flags or key enrollment are required for this update.
+
 The current official account fields expose balance and existing cross-margin requirement but do not establish the incremental margin of these planned orders. Therefore the real adapter reports `MARGIN_EVIDENCE_REQUIRED` / UNKNOWN for that calculation; available balance is not substituted for proof. Prices omitted above also remain UNSET. These are expected explicit limitations, not a failed installation. A separate justified margin calculation/evidence and operator-selected trading bounds are still needed before using the trading path. No live account/auth/order check has been performed by agents.
 
 ## Open opposite positions from balances — HCR-3

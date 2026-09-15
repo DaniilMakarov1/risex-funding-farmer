@@ -3,6 +3,10 @@
 SYSTEM_SPEC_VERSION = 4.0
 SPEC_STATUS = FIRST_RAW_RESEARCH_SCANNER_IMPLEMENTED
 
+## HCR-7B amendment — bounded margin diagnostic evidence (accepted offline)
+
+Readiness reports retain strict whitelisted account/market margin fields with identity, SDK/source and original observation timestamps. Selected-position absence differs from explicit zero. Raw fraction/allocated/cross values carry unverified units; no signing-input encoding is inferred. Returned row counts are conservative consistency evidence against account totals, without exact-equality assumptions or nonselected-row dumps. Malformed/conflicting evidence produces INVALID/UNKNOWN. These diagnostics do not calculate incremental opening margin or select prices; existing UNKNOWN/UNSET and execution_authorized:false remain. No trading-policy or credential behavior change.
+
 ## HCR-6 amendment — optional macOS Keychain persistence (accepted offline)
 
 Accepted candidate 11bde5bd68177b2476d784f34e3ea9babccf63ed; final clean isolated Python3.11 suite4352 passed,3 skipped. Owner requested persistent local API credentials on 2026-09-15. The separately invoked utility may offer opt-in macOS Keychain storage/reuse bound to exact API origin/signing environment, account and key index, with replacement/removal and no plaintext fallback. This supersedes in-memory-only persistence restrictions solely for protected local Keychain storage. Secret exclusion from chat/arguments/environment/files/logs/reports/Git and agent offline-only testing remain. Default preview/help/import stays credential-free. NEXT_TASK holds finite acceptance and pending test-network verification. No execution, margin or price semantics change follows from credential persistence.
