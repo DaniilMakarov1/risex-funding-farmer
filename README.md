@@ -1,5 +1,17 @@
 # RISEx Spread Shadow and legacy Funding Farmer
 
+## One bounded agent-capable Mainnet attempt — HCR-9/HCR-10
+
+The launcher is under implementation and independent review; no HCR-9 live attempt has been verified. HCR-10 permits the assigned execution agent to access the required API keys and run this one bounded operation after the launcher is accepted, all exact inputs are fixed, the full plan is shown and the owner gives a separate explicit launch instruction. The owner may still choose local launch. This authority does not extend to another attempt, series execution or autonomous trading.
+
+The selected operation is one BTC paired opening: account27331 posts SELL LIMIT POST_ONLY and account27337 submits BUY MARKET IOC, API key index4, Robinhood deployment. The owner targets approximately USD16 of exposure per leg, with small deviation allowed. Quantity0.00020BTC is an exact reviewable input, not a verified current dollar value. The utility must not automatically resize or choose prices. The source limit price and receiver worst price, together with finite timing bounds, are selected explicitly by the operator before launch.
+
+Before confirming, review both actions, quantity, price bounds, every timing setting and the resulting positions. Full paired opening leaves a SHORT at the source and a LONG at the receiver. It does not automatically close them or guarantee that the two accounts match each other. The limit order's exchange lifetime and the program's waiting deadline are separate settings.
+
+After the program returns, preserve its attempt directory and all files, including the intent journal. A missing terminal result is an incomplete attempt. A timeout, rejection or unknown response does not establish that both accounts stayed flat. Do not remove or rename evidence to retry, and do not launch another attempt while earlier positions or orders remain unresolved. The same-directory launcher must refuse new submissions.
+
+For diagnosis, tell the Chief that the attempt has ended and provide its directory path. The Chief can read the sanitized packet in the shared workspace, inspect recorded phases and known/unknown positions, and prepare an offline-tested correction. Never place API keys, authentication tokens or signed payloads in that packet. The required API keys may be exchanged only with the assigned execution agent in the private owner-agent task/chat or through the protected local credential boundary; seed phrases, recovery material and withdrawal credentials remain prohibited. The Chief does not promise continuous monitoring and must not edit or restart an active financial process. Any later financial launch requires a new explicit owner decision after the prior state is resolved.
+
 
 ## Optional local API-key storage — HCR-6
 
@@ -7,11 +19,11 @@ Accepted offline candidate `11bde5bd68177b2476d784f34e3ea9babccf63ed`: final cle
 
 Use `--keychain` to save each API key in macOS Keychain on first hidden entry and reuse it on subsequent invocations. This option is supported by readiness and the existing explicitly operator-run execution command. No extra Python package is needed. Stored credentials are bound to the exact HTTPS API origin, signing environment/chain, account index and API key index. Saving a key does not verify that it is correct or grant trading permission.
 
-The first invocation still requires local input for each missing key: earlier in-memory runs did not retain keys. Later invocations with `--keychain` read the matching Keychain entries without requesting the keys again; macOS may still request Keychain access/unlock permission. Keychain denial or failure stops before client/network construction, with no plaintext fallback. Omitting `--keychain` preserves hidden in-memory input each time. No key should be placed in a command, environment variable, JSON file or chat.
+The first invocation still requires input for each missing key: earlier in-memory runs did not retain keys. Later invocations with `--keychain` read the matching Keychain entries without requesting the keys again; macOS may still request Keychain access/unlock permission. Keychain denial or failure stops before client/network construction, with no plaintext fallback. Omitting `--keychain` preserves hidden in-memory input each time. No key may be placed in a command, environment variable, JSON file, Git/GitHub, log or evidence packet. HCR-10 permits the private owner-agent task/chat only for exchange with the assigned execution agent.
 
 To replace stored keys, use `--keychain-replace` instead of `--keychain`; this requests fresh hidden input for both configured accounts and then continues the selected operation. To remove only the matching local records, use `--keychain-remove` instead; it exits after removal without constructing an SDK client or making network requests. For example, take the readiness command below and replace its final `--keychain` with `--keychain-remove`. Removal must not be combined with execution flags or either other Keychain option. Removal does not revoke API keys on the venue.
 
-Help and execution preview remain offline and do not access Keychain even when `--keychain` is present. Agent verification uses synthetic keys/backends; real user keys and actual OS Keychain storage are not accessed in those tests. The current configured Robinhood endpoint has not been established as a valueless test environment. No agent order test follows from credential persistence.
+Help and execution preview remain offline and do not access Keychain even when `--keychain` is present. Builder verification uses synthetic keys/backends; real user keys and actual OS Keychain storage are not accessed in those tests. HCR-10 separately permits the assigned execution agent to use real credentials for the single accepted bounded Mainnet attempt after all live gates and explicit launch confirmation are satisfied. The current configured Robinhood endpoint is real Mainnet, not a valueless test environment.
 
 ## Explicit local margin-calculation deferral — HCR-8
 
@@ -29,7 +41,7 @@ For an existing operator-prepared configuration/evidence pair, the following is 
   --defer-incremental-margin-calculation
 ```
 
-With deferral enabled, the four source/receiver incremental-margin estimate/provenance fields may be omitted from market evidence. Current market identity/grid/minimum evidence and its original timestamp remain required. This command does not choose missing prices or deadlines. Existing local execution/plan-review switches and optional `--keychain` remain separate; the new flag alone never enables execution. Mainnet trading must be run by the owner, not by the agent. The owner's test budget is on Mainnet; no testnet migration is intended.
+With deferral enabled, the four source/receiver incremental-margin estimate/provenance fields may be omitted from market evidence. Current market identity/grid/minimum evidence and its original timestamp remain required. This command does not choose missing prices or deadlines. Existing execution/plan-review switches and optional `--keychain` remain separate; the new flag alone never enables execution. Under HCR-10 the assigned execution agent may run the single bounded Mainnet attempt only after accepted implementation, exact bounds, final plan review and the owner's separate explicit launch instruction. The owner's test budget is on Mainnet; no testnet migration is intended.
 
 ## Local read-only readiness check — HCR-5
 
@@ -49,7 +61,7 @@ cd "/Users/daniilmakarov/Desktop/RISEx Spread Shadow"
 
 Here `LONG` means receiver LONG and source SHORT. Quantity0.00020BTC is the owner-confirmed amount; the command rechecks current minimums rather than assuming the saved dollar estimate. The120-second freshness bound and10-second per-request timeout are explicit **diagnostic** settings allowing time for manual input; they do not set trading deadlines, select prices or grant execution. Age is measured at the final check, and key-entry delay does not renew old data. Change diagnostic bounds explicitly if needed and interpret a stale result accordingly.
 
-Wait for the actual hidden-key prompt for the relevant account. With `--keychain`, a missing record prompts `Lighter private key for account … (hidden input; saved to Keychain):`. Enter the corresponding local API private key and press Enter, then repeat for the other account if prompted. Characters are not echoed. Do not paste keys into the shell before this prompt. With `--keychain`, API keys are persisted in protected macOS Keychain and loaded into process memory when needed; authentication tokens remain in memory. Without that option, keys also remain in memory only. Neither path stores keys in JSON configuration, arguments, environment variables or report files. Use replacement keys for any that were exposed in chat. Non-interactive input is rejected. Normal `--help` and old offline preview do not ask for keys or make requests.
+Wait for the actual hidden-key prompt for the relevant account. With `--keychain`, a missing record prompts `Lighter private key for account … (hidden input; saved to Keychain):`. Enter the corresponding local API private key and press Enter, then repeat for the other account if prompted. Characters are not echoed. Do not paste keys into the shell before this prompt. With `--keychain`, API keys are persisted in protected macOS Keychain and loaded into process memory when needed; authentication tokens remain in memory. Without that option, keys also remain in memory only. Neither path stores keys in JSON configuration, arguments, environment variables or report files. HCR-10 also permits delivery to the assigned agent in the private owner-agent task/chat and an explicit return to the owner there; masked confirmation is the default. Rotate any key exposed outside that private boundary. Non-interactive input remains rejected by the existing CLI. Normal `--help` and old offline preview do not ask for keys or make requests.
 
 This diagnostic does not need fabricated `market-evidence.json`, quantity-to-margin numbers, or trade-execution flags. Combining readiness with `--execute`, either live-operation acknowledgment, `--confirm-plan`, `--config` or `--market-evidence` is rejected before client/key creation. Optional `--source-limit-price` and `--receiver-worst-price` check prices you have already selected; this example intentionally leaves them UNSET. No launch-ready trading file is created.
 
@@ -81,7 +93,7 @@ This is a configuration fragment, not a complete runnable file. Keep all require
 | LONG | SELL, POST_ONLY, reduce-only false | BUY, reduce-only false | A SHORT Q; B LONG Q |
 | SHORT | BUY, POST_ONLY, reduce-only false | SELL, reduce-only false | A LONG Q; B SHORT Q |
 
-The owner's selected orientation is receiver LONG: A27331 opens SHORT and B27337 opens LONG. Both use API key index4 with separate keys entered locally; do not place keys in this file or chat. Before the first slice both selected-market positions must be exactly zero and readiness must be proven. Later slices may increase only the exact positions established by the previously completed children. Internal `expected_source_position`/`expected_receiver_position` fields are not operator settings and are rejected in JSON.
+The owner's selected orientation is receiver LONG: A27331 opens SHORT and B27337 opens LONG. Both use API key index4 with separate keys. Keys may be entered through hidden local input/Keychain or supplied to the assigned agent in the private owner-agent task/chat under HCR-10; never place them in this file, Git/GitHub, configs, logs or evidence. Before the first attempt both selected-market positions must be exactly zero and readiness must be proven. HCR-10 authorizes one bounded attempt, not later series slices. Internal `expected_source_position`/`expected_receiver_position` fields are not operator settings and are rejected in JSON.
 
 The requested first test is roughly10–15USD of BTC exposure per leg, not margin or transferred balance. No current executable BTC quantity or prices have been selected. Quantity inputs are BTC units; check current price, size step and minimums before converting the desired notional. Do not round up beyond the chosen exposure simply to satisfy a minimum. The slice logic, price bounds and stop/reconciliation behavior described below still apply. Source filling before B's admission blocks B; market matching and cancellation can race, leaving unequal positions that require operator attention. The program does not automatically compensate or close those positions.
 
@@ -99,7 +111,7 @@ HCR-2 selects a perpetual instrument by symbol, with BTC as the initial target a
 
 The total is split into sequential pairs. A reduces its existing position with a post-only limit and B opens the same direction with a market IOC. The desired slice is reduced when fresh observed depth within the configured price bounds is insufficient. Venue minimums and quantity increments apply to each slice. Sizes may differ as liquidity changes; random sizes alone do not improve execution. One pair must fully finish and reconcile before the next starts. Partial, unknown or conflicting execution stops the series. The series cannot guarantee direct matching, atomicity, price stability or lower total execution costs.
 
-This closes and reopens exposure at a new entry price, not collateral or historical PnL. B needs its own adequate collateral. API private keys are entered locally with hidden input; never send seed phrases or private keys in chat. Public API checks have confirmed BTC/ETH availability and book responses on the requested deployment; real account readiness, signatures, order execution and receipts remain NOT_RUN.
+This closes and reopens exposure at a new entry price, not collateral or historical PnL. B needs its own adequate collateral. API private keys normally use hidden local input/Keychain; HCR-10 permits sharing only the required API keys with the assigned agent in the private owner-agent task/chat. Seed phrases, wallet recovery material and withdrawal credentials must never be shared. Public API checks have confirmed BTC/ETH availability and book responses on the requested deployment; real account readiness, signatures, order execution and receipts remain NOT_RUN.
 
 ### Configure the Robinhood series
 
@@ -143,7 +155,7 @@ Create `market-evidence.json` using the evidence fields documented below, with t
 
 ### Preview, local keys, and later operator execution
 
-A and B below are distinct **integer Lighter account indices**, not wallet addresses. Each account uses its corresponding Lighter API private key; the configured key index is shared but the keys are separate. Keep keys local and enter them only into the hidden terminal prompt. An address alone cannot authorize this operation.
+A and B below are distinct **integer Lighter account indices**, not wallet addresses. Each account uses its corresponding Lighter API private key; the configured key index is shared but the keys are separate. Use hidden local input/Keychain or the HCR-10 private owner-agent credential boundary; never place keys in Git/GitHub, files, logs, command arguments or evidence. An address alone cannot authorize this operation.
 
 ```bash
 .venv-hood/bin/risex-hood-handoff run \
@@ -168,7 +180,7 @@ Read `outcome` and every child receipt, not only the process exit code. `complet
 Keep the parent journal, every `.child-NNNN` journal, their locks, and the exact code/configuration/account inputs. Restart is read-only reconciliation with respect to orders: it never submits or cancels an order or starts the next child. It can authenticate/read accounts and append journal evidence. A previously completed series returns a blocked/UNKNOWN rerun result while retaining its original completed totals; a recovered interrupted child can have known fills while the overall series remains UNKNOWN. There is no automatic resume switch. Resolve any outstanding orders and position differences before separately choosing a new operation; do not remove journals to force replay. Account receipt/signing/execution compatibility remains live-unverified.
 
 
-Current status (2026-09-15): HCR-1 BOTH/no-monetary-caps implementation `74fbbbf9f298648b643ce9a69353e3abcdcf6c27` passed independent review, 12 adverse fake-SDK probes and the clean isolated Python 3.11 suite (4289 passed, 3 skipped). Operator instructions follow. Live execution is NOT_RUN; no agent account or execution authority is granted.
+Current status (2026-09-15): HCR-1 BOTH/no-monetary-caps implementation `74fbbbf9f298648b643ce9a69353e3abcdcf6c27` passed independent review, 12 adverse fake-SDK probes and the clean isolated Python 3.11 suite (4289 passed, 3 skipped). Operator instructions follow. Live execution remains NOT_RUN. HCR-10 now grants the assigned execution agent narrowly bounded authority for the separate active HCR-9 Robinhood paired-opening attempt after its remaining acceptance/input/launch gates; it does not retroactively authorize this older HOOD example.
 
 ## HOOD close/reopen: operator instructions
 
@@ -250,7 +262,7 @@ For a later operator-authorized execution, add all three flags to the same comma
 --execute --i-understand-one-attempt-live-operation --confirm-plan
 ```
 
-The CLI requests the two Lighter API private keys through hidden interactive TTY input. Never put keys in JSON, shell arguments, environment variables, chat, receipts or logs. The flags permit a real attempt; they are not a simulation mode. Agents did not run this command. No replacement, repricing, compensating trade, repeated completion or multi-wallet loop exists.
+The CLI requests the two Lighter API private keys through hidden interactive TTY input. Never put keys in JSON, shell arguments, environment variables, receipts, logs or Git/GitHub. HCR-10 permits the required API keys only in the private owner-agent credential exchange for its separately bounded active attempt; that exception does not authorize this older command. The flags permit a real attempt; they are not a simulation mode. Agents did not run this historical command. No replacement, repricing, compensating trade, repeated completion or multi-wallet loop exists.
 
 ### Read the result and reconcile
 
