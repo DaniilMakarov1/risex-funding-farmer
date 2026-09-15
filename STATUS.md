@@ -1,5 +1,7 @@
 # Current status
 
+HCR-8 review checkpoint: candidate1bbf3e265bd9126945855089e0a9f6eb4cfae2a8 received directly; full diff reviewed. CHANGES_REQUESTED for sdk.py normalization hiding malformed supplied incremental values when provenance absent, newly admitted by deferral. Independent actual-adapter synthetic probe reproduces -1/NaN/malformed -> None. Same fresh Builder assigned bounded correction and explicit rejection/restart evidence; no formal REJECT, no integration/full suite yet. Packet original-root spread-shadow-runs/hood-margin-deferred-20260915/chief-review-v1. Next action on direct corrected delivery; no periodic monitoring.
+
 ## HCR-8 local incremental margin deferral — AUTHORIZED OFFLINE
 
 Owner explicitly chooses existing Mainnet and defers initial-margin calculation; allocated balances are intended for tests. Environment-choice question resolved. Fresh margin_deferred_builder successfully spawned (prior keychain_builder not reused), isolated codex/spread-v1-margin-deferred/hood-margin-deferred from7168928. Finite operator utility opt-in only, default strict, missing calculation remains unverified and persisted policy-bound. Agents do not execute mainnet financial transactions or access real credentials/accounts. NEXT_TASK defines exact acceptance. No production edits by Chief. Direct Builder delivery, no monitoring.

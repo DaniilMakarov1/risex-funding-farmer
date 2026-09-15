@@ -1,5 +1,7 @@
 # HCR-8 — explicit operator deferral of local incremental margin calculation
 
+HCR-8 review checkpoint: candidate1bbf3e265bd9126945855089e0a9f6eb4cfae2a8 received directly; full diff reviewed. CHANGES_REQUESTED for sdk.py normalization hiding malformed supplied incremental values when provenance absent, newly admitted by deferral. Independent actual-adapter synthetic probe reproduces -1/NaN/malformed -> None. Same fresh Builder assigned bounded correction and explicit rejection/restart evidence; no formal REJECT, no integration/full suite yet. Packet original-root spread-shadow-runs/hood-margin-deferred-20260915/chief-review-v1. Next action on direct corrected delivery; no periodic monitoring.
+
 ## Current owner decision
 
 Owner explicitly selects existing Robinhood Mainnet, describes allocated balances as an expendable test budget, and requests initial-margin calculation be deferred to test the strategy sooner. This supersedes the prior testnet-choice question and mandatory local incremental calculation only within this finite operator-utility change. Mainnet funds remain real financial assets; agents must not access actual keys/accounts, prepare real signed payloads, send/cancel orders or manage actual positions. All development and verification use synthetic offline data. Owner locally runs any later financial execution. No further request to prove this is testnet.
