@@ -1,14 +1,14 @@
-# HCR-2 target resolved — configurable BTC/ETH perpetuals
-
-Owner selected BTC first and configurable symbols including ETH. Early HOOD absence blocker is resolved by explicit target change. Implementation/review remains pending; live NOT_RUN. Root remains sole Chief.
-
-# HCR-2 IN PROGRESS — 2026-09-15
-
-Owner approved variable sequential slices and specifically Robinhood Chain Lighter. Early public compatibility probe confirmed api.rh.lighter.xyz but both market-list endpoints contain no HOOD (57 perpetual, 27 spot markets). TARGET_MARKET_CLARIFICATION_REQUIRED: owner asked for intended ticker/link; no substitution or production implementation yet. Two of twelve public requests used; immutable responses and hashes under spread-shadow-runs/hood-rh-20260915/compatibility-v1/. No Builder or live account test launched. Root remains sole Chief. Active scope and finite public probe bounds are in NEXT_TASK.
-
 # Current status
 
-## HCR-1 BOTH without monetary caps accepted offline — 2026-09-15
+## HCR-2 configurable Robinhood perpetual series — CHANGES_REQUESTED
+
+Owner selected configurable perpetual symbols, BTC first and ETH also supported, with sequential variable slices. Root task 01a096cf-96fc-7f02-b2bb-8bb0a92b8f09 is sole Chief. Visible/pinned Builder 01a0a48c-58c4-7781-ae9b-3a573381d55b owns correction on codex/spread-v1-hood-rh-slices; no second Chief.
+
+Candidate 9e6c1d735b5023617758a3c4c87a8192e837d058 is preserved and NOT_ACCEPTED. Full actual diff reviewed; independent BTC/ETH LONG/SHORT three-slice engine-to-fake-SDK matrix passed. Consolidated review found reproducible interrupted-child effective-price binding loss/nonexistent quantity attribute, completed-journal progress loss, and stale Mapping-book restamping. Builder received one bounded correction assignment and must deliver the corrected result to root. No polling or management heartbeat is required; native result delivery has been verified.
+
+Review and reproductions: spread-shadow-runs/hood-rh-20260915/chief-review-v1/changes-requested.md, adverse_probe.py/adverse-result.json, series_matrix_probe.py/series-matrix-result.json. Original Builder full4298/3 was a host Python3.11.5 run with no immutable raw packet, not isolated acceptance. Chief prepared a fresh isolated venv and dependencies in chief-clean-v1 and owns the final clean full suite after correction (not yet run). Public adapter preliminary BTC/ETH reads succeeded but sdk.py changed during v1; final four allowed public reads reserved for frozen corrected candidate. Public API requests used8/12, no account/key/signing/order calls. Live NOT_RUN. No HCR-2 implementation integrated or published.
+
+## Historical HCR-1 acceptance — 2026-09-15
 
 Current sole Chief is root task `01a096cf-96fc-7f02-b2bb-8bb0a92b8f09`, explicitly appointed by the owner. The separate visible Chief has acknowledged STOP with no active writers/processes and is verified idle/completed; its completed review and publication are preserved. Root independently checked the no-cap delta, matching source/artifact identities and eight engine-to-fake-SDK cases. No new production change is required. Future needed Builders must be visible tasks; no second Chief or standing monitor is active.
 

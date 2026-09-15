@@ -1,5 +1,20 @@
 # RISEx Spread Shadow and legacy Funding Farmer
 
+
+## Robinhood Chain configurable perpetual series — HCR-2
+
+Implementation in progress; the previously accepted HCR-1 command below targets ordinary Lighter mainnet. Do not use that configuration as a Robinhood Chain configuration.
+
+The requested website is https://robinhoodchain.lighter.xyz. Its official API is https://api.rh.lighter.xyz, and Lighter SDK 1.1.2 uses signing domain `466324` for it. This signing identifier is not the EVM wallet chain ID. The deployment must never silently fall back to ordinary Lighter mainnet. Official references: [Lighter deployment mapping](https://github.com/elliottech/lighter-agent-kit/blob/main/install.sh) and [pinned SDK signing domains](https://github.com/elliottech/lighter-python/blob/v1.1.2/lighter/signer_client.py).
+
+HCR-2 selects a perpetual instrument by symbol, with BTC as the initial target and ETH also checked. The program resolves the current market identity rather than treating a historical numeric ID as permanent. Spot pairs and unknown symbols are rejected. Changing the symbol also requires reviewing quantity units, prices and market/account evidence; changing `BTC` to `ETH` does not convert the same numerical quantity into equivalent dollar exposure.
+
+The total is split into sequential pairs. A reduces its existing position with a post-only limit and B opens the same direction with a market IOC. The desired slice is reduced when fresh observed depth within the configured price bounds is insufficient. Venue minimums and quantity increments apply to each slice. Sizes may differ as liquidity changes; random sizes alone do not improve execution. One pair must fully finish and reconcile before the next starts. Partial, unknown or conflicting execution stops the series. The series cannot guarantee direct matching, atomicity, price stability or lower total execution costs.
+
+This closes and reopens exposure at a new entry price, not collateral or historical PnL. B needs its own adequate collateral. API private keys are entered locally with hidden input; never send seed phrases or private keys in chat. Public API checks have confirmed BTC/ETH availability and book responses on the requested deployment; real account readiness, signatures, order execution and receipts remain NOT_RUN.
+
+Final configuration and series commands will be documented here after candidate acceptance.
+
 Current status (2026-09-15): HCR-1 BOTH/no-monetary-caps implementation `74fbbbf9f298648b643ce9a69353e3abcdcf6c27` passed independent review, 12 adverse fake-SDK probes and the clean isolated Python 3.11 suite (4289 passed, 3 skipped). Operator instructions follow. Live execution is NOT_RUN; no agent account or execution authority is granted.
 
 ## HOOD close/reopen: operator instructions
