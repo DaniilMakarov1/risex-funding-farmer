@@ -12,13 +12,11 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
-import getpass
 import importlib
 from importlib import metadata as importlib_metadata
 import inspect
 import math
 import re
-import sys
 import time
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
@@ -33,6 +31,7 @@ from .contracts import (
     decimal_to_integer,
 )
 from .journal import sanitize, sanitize_exception
+from .keychain import read_hidden_secret
 from .sdk import (
     MissingSdkError,
     REQUIRED_LIGHTER_SDK_VERSION,
@@ -307,12 +306,9 @@ class ReadinessSecretProvider:
         if api_key_index != self._api_key_index or account_index not in self._account_indices:
             raise ContractError("secret request does not match readiness account/key index")
         if account_index not in self._values:
-            if not sys.stdin.isatty() or not sys.stderr.isatty():
-                raise RuntimeError("hidden API-key input requires an interactive TTY")
-            value = getpass.getpass(f"Lighter API key for account {account_index} (hidden input): ")
-            if not value:
-                raise RuntimeError("empty API key input")
-            self._values[account_index] = value
+            self._values[account_index] = read_hidden_secret(
+                f"Lighter API key for account {account_index} (hidden input): "
+            )
         return self._values[account_index]
 
     def close(self) -> None:

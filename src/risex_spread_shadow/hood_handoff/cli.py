@@ -5,15 +5,22 @@ from __future__ import annotations
 import argparse
 import asyncio
 from decimal import Decimal, InvalidOperation
-import getpass
 import json
 from pathlib import Path
-import sys
 from typing import Any, Mapping
 
 from .contracts import Direction, HandoffConfig, OperationMode
 from .engine import run_handoff
 from .journal import sanitize_exception
+from .keychain import (
+    KeychainAccessError,
+    KeychainConflictError,
+    KeychainError,
+    KeychainSecretProvider,
+    KeychainUnavailableError,
+    MacOSKeychainBackend,
+    read_hidden_secret,
+)
 from .readiness import (
     ReadinessCheck,
     ReadinessConfig,
@@ -22,7 +29,7 @@ from .readiness import (
     ReadOnlyLighterSdkClient,
     run_readiness,
 )
-from .sdk import LighterSdkClient, SecretProvider
+from .sdk import LighterSdkClient
 from .series import RobinhoodSeriesConfig, run_series
 
 
@@ -38,12 +45,13 @@ class PromptSecretProvider:
         if api_key_index != self._api_key_index or account_index not in self._account_indices:
             raise ValueError("secret request does not match configured account/key index")
         if account_index not in self._values:
-            if not sys.stdin.isatty() or not sys.stderr.isatty():
-                raise RuntimeError("hidden private-key input requires an interactive TTY")
-            self._values[account_index] = getpass.getpass(
+            self._values[account_index] = read_hidden_secret(
                 f"Lighter private key for account {account_index} (hidden input): "
             )
         return self._values[account_index]
+
+    def close(self) -> None:
+        self._values.clear()
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -97,6 +105,26 @@ def _parser() -> argparse.ArgumentParser:
         "--confirm-plan",
         action="store_true",
         help="confirm that the printed exact plan, price bounds and readiness/margin requirements were reviewed",
+    )
+    parser.add_argument(
+        "--keychain",
+        "--use-keychain",
+        "--keychain-reuse",
+        dest="keychain",
+        action="store_true",
+        help="explicitly reuse a matching macOS Keychain credential and save first hidden use",
+    )
+    parser.add_argument(
+        "--keychain-replace",
+        dest="keychain_replace",
+        action="store_true",
+        help="replace the matching Keychain credential with a new hidden value before the run",
+    )
+    parser.add_argument(
+        "--keychain-remove",
+        dest="keychain_remove",
+        action="store_true",
+        help="remove matching local Keychain credentials without creating an SDK client",
     )
     return parser
 
@@ -346,6 +374,83 @@ def _readiness_config(args: argparse.Namespace) -> ReadinessConfig:
         raise SystemExit(f"invalid readiness input: {exc}") from exc
 
 
+def _keychain_provider(
+    config: Any,
+    account_indices: tuple[int, ...],
+    *,
+    replace: bool,
+) -> KeychainSecretProvider:
+    """Construct the explicit Keychain provider after config validation."""
+
+    try:
+        return KeychainSecretProvider.from_config(
+            config,
+            account_indices,
+            backend=MacOSKeychainBackend(),
+            replace=replace,
+        )
+    except KeychainError as exc:
+        raise SystemExit(f"keychain configuration failed: {_keychain_error_text(exc)}") from None
+    except Exception:
+        # A native loader or injected adapter must never expose its exception
+        # text at this CLI boundary.
+        raise SystemExit("keychain configuration failed: Keychain operation failed") from None
+
+
+def _keychain_error_text(exc: KeychainError) -> str:
+    """Describe a Keychain failure without trusting backend exception text."""
+
+    if isinstance(exc, KeychainUnavailableError):
+        return "macOS Keychain is unavailable"
+    if isinstance(exc, KeychainConflictError):
+        return "stored credential exists; explicit replacement is required"
+    if isinstance(exc, KeychainAccessError):
+        return "macOS Keychain access was denied or failed"
+    return "Keychain operation failed"
+
+
+def _prime_keychain(provider: KeychainSecretProvider, account_indices: tuple[int, ...]) -> None:
+    """Resolve all selected credentials before SDK/network construction."""
+
+    try:
+        for account_index in account_indices:
+            provider.private_key(account_index, provider.api_key_index)
+    except KeychainError as exc:
+        # Provider and hidden-input errors contain fixed, non-secret text.  A
+        # backend's arbitrary exception text is sanitized inside the provider.
+        raise SystemExit(f"keychain credential operation failed: {_keychain_error_text(exc)}") from None
+    except RuntimeError:
+        # Keep prompt/terminal failures fixed-text even if a platform wrapper
+        # unexpectedly includes implementation or credential details.
+        raise SystemExit("keychain credential operation failed: hidden input unavailable") from None
+
+
+def _remove_keychain(config: Any, account_indices: tuple[int, ...]) -> int:
+    provider = _keychain_provider(config, account_indices, replace=False)
+    removed: list[dict[str, Any]] = []
+    try:
+        for account_index in account_indices:
+            try:
+                did_remove = provider.remove(account_index)
+            except KeychainError as exc:
+                raise SystemExit(f"keychain removal failed: {_keychain_error_text(exc)}") from None
+            removed.append({"account_index": account_index, "removed": did_remove})
+    finally:
+        provider.close()
+    print(
+        json.dumps(
+            {
+                "outcome": "KEYCHAIN_REMOVED",
+                "execution": "LOCAL_KEYCHAIN",
+                "bindings": removed,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    return 0
+
+
 async def _run_readiness(args: argparse.Namespace) -> int:
     # Reject every execution/configuration flag before config parsing, client
     # creation, SDK import, or hidden key input.  Readiness is a distinct path.
@@ -362,16 +467,30 @@ async def _run_readiness(args: argparse.Namespace) -> int:
         forbidden.append("--config")
     if args.market_evidence is not None:
         forbidden.append("--market-evidence")
+    if args.keychain_remove and (args.keychain or args.keychain_replace):
+        forbidden.append("--keychain-remove with --keychain/--keychain-replace")
     if forbidden:
         raise SystemExit(
             "readiness is read-only and cannot be combined with execution/configuration flags: "
             + ", ".join(forbidden)
         )
     config = _readiness_config(args)
-    secrets = ReadinessSecretProvider(
-        (config.source_account_index, config.receiver_account_index),
-        config.api_key_index,
-    )
+    account_indices = (config.source_account_index, config.receiver_account_index)
+    if args.keychain_remove:
+        return _remove_keychain(config, account_indices)
+    if args.keychain or args.keychain_replace:
+        secrets: Any = _keychain_provider(
+            config,
+            account_indices,
+            replace=args.keychain_replace,
+        )
+        try:
+            _prime_keychain(secrets, account_indices)
+        except SystemExit:
+            secrets.close()
+            raise
+    else:
+        secrets = ReadinessSecretProvider(account_indices, config.api_key_index)
     client = ReadOnlyLighterSdkClient(
         config,
         source_account_index=config.source_account_index,
@@ -406,11 +525,32 @@ async def _run_readiness(args: argparse.Namespace) -> int:
 async def _run(args: argparse.Namespace) -> int:
     if args.run == "readiness":
         return await _run_readiness(args)
-    if args.config is None or args.market_evidence is None:
-        raise SystemExit("run requires --config and --market-evidence")
+    if args.config is None:
+        raise SystemExit("run requires --config")
     config_data = _load_json(args.config, "config")
+    is_series = config_data.get("mode") in {"series", "hcr-2"} or config_data.get("series") is True
+    if args.keychain_remove:
+        if args.execute or args.i_understand_one_attempt_live_operation or args.i_understand_series_live_operation or args.confirm_plan:
+            raise SystemExit("--keychain-remove cannot be combined with execution or plan-review flags")
+        if args.keychain or args.keychain_replace:
+            raise SystemExit("--keychain-remove cannot be combined with --keychain/--keychain-replace")
+        if args.source_account_index is None or args.receiver_account_index is None:
+            raise SystemExit("keychain removal requires explicit source and receiver account indices")
+        if args.source_account_index == args.receiver_account_index:
+            raise SystemExit("source and receiver account indices must differ")
+        config = (
+            _series_config(config_data, execute=False)
+            if is_series
+            else _config(config_data, execute=False)
+        )
+        return _remove_keychain(
+            config,
+            (args.source_account_index, args.receiver_account_index),
+        )
+    if args.market_evidence is None:
+        raise SystemExit("run requires --config and --market-evidence")
     evidence = _load_json(args.market_evidence, "market evidence")
-    if config_data.get("mode") in {"series", "hcr-2"} or config_data.get("series") is True:
+    if is_series:
         series_config = _series_config(config_data, execute=args.execute)
         if args.confirm_plan:
             object.__setattr__(series_config, "operator_plan_reviewed", True)
@@ -455,17 +595,31 @@ async def _run(args: argparse.Namespace) -> int:
             quantity=min(series_config.total_quantity, series_config.desired_slice_quantity),
             journal_path=series_config.journal_path + ".client",
         )
-        secrets: SecretProvider = PromptSecretProvider(
-            (args.source_account_index, args.receiver_account_index), series_config.api_key_index
-        )
-        client = LighterSdkClient(
-            base_config,
-            source_account_index=args.source_account_index,
-            receiver_account_index=args.receiver_account_index,
-            secrets=secrets,
-            market_evidence=evidence,
-        )
-        result = await run_series(series_config, client)
+        account_indices = (args.source_account_index, args.receiver_account_index)
+        if args.keychain or args.keychain_replace:
+            secrets: Any = _keychain_provider(
+                series_config,
+                account_indices,
+                replace=args.keychain_replace,
+            )
+            try:
+                _prime_keychain(secrets, account_indices)
+            except SystemExit:
+                secrets.close()
+                raise
+        else:
+            secrets = PromptSecretProvider(account_indices, series_config.api_key_index)
+        try:
+            client = LighterSdkClient(
+                base_config,
+                source_account_index=args.source_account_index,
+                receiver_account_index=args.receiver_account_index,
+                secrets=secrets,
+                market_evidence=evidence,
+            )
+            result = await run_series(series_config, client)
+        finally:
+            secrets.close()
         print(json.dumps(result.as_dict(), sort_keys=True, separators=(",", ":")))
         return 0 if result.outcome.value in {"SUCCESS", "PARTIAL", "PREVIEW"} else 2
     config = _config(config_data, execute=args.execute)
@@ -512,17 +666,31 @@ async def _run(args: argparse.Namespace) -> int:
     if not args.i_understand_one_attempt_live_operation:
         raise SystemExit("--execute also requires --i-understand-one-attempt-live-operation")
     assert config.api_key_index is not None
-    secrets: SecretProvider = PromptSecretProvider(
-        (args.source_account_index, args.receiver_account_index), config.api_key_index
-    )
-    client = LighterSdkClient(
-        config,
-        source_account_index=args.source_account_index,
-        receiver_account_index=args.receiver_account_index,
-        secrets=secrets,
-        market_evidence=evidence,
-    )
-    result = await run_handoff(config, client)
+    account_indices = (args.source_account_index, args.receiver_account_index)
+    if args.keychain or args.keychain_replace:
+        secrets = _keychain_provider(
+            config,
+            account_indices,
+            replace=args.keychain_replace,
+        )
+        try:
+            _prime_keychain(secrets, account_indices)
+        except SystemExit:
+            secrets.close()
+            raise
+    else:
+        secrets = PromptSecretProvider(account_indices, config.api_key_index)
+    try:
+        client = LighterSdkClient(
+            config,
+            source_account_index=args.source_account_index,
+            receiver_account_index=args.receiver_account_index,
+            secrets=secrets,
+            market_evidence=evidence,
+        )
+        result = await run_handoff(config, client)
+    finally:
+        secrets.close()
     print(json.dumps(result.as_dict(), sort_keys=True, separators=(",", ":")))
     return 0 if result.outcome.value in {"SUCCESS", "PARTIAL", "PREVIEW"} else 2
 
