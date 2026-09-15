@@ -2,7 +2,7 @@
 
 ## HCR-9 owner-local launch and diagnostic packet — AUTHORIZED OFFLINE
 
-Owner accepted local launch with Chief inspecting sanitized local logs. Fresh local_attempt_builder assigned initial read-only interface proposal, isolated hood-local-attempt/codex/spread-v1-local-attempt from5426c04. NEXT_TASK scopes one owner-run paired-opening entry point, explicit missing prices/times, stable no-replay attempt directory, reused Keychain/engine, inspectable terminal packet. No actual agent keys/account/orders/network. Mainnet and deferred calculation settled. No continuous monitor or new strategy. Price bounds requested from owner; local interactive entry remains possible.
+Owner reconfirmed local launch with Chief inspecting sanitized local logs, approximately USD16 per leg, on2026-09-15. Successor Chief01a0a602-2bbb-7dd0-ab24-dc6114efc527 verified root main and preserved Builder checkout clean at9b806d8; previous Chiefs idle, no previous agent active. Fresh /root/local_attempt_builder assigned interface proposal in isolated hood-local-attempt/codex/spread-v1-local-attempt; implementation not yet accepted. NEXT_TASK scopes one owner-run paired-opening entry point, explicit missing prices/times, stable no-replay attempt directory, reused Keychain/engine, inspectable terminal packet. No actual agent keys/account/orders/network. Mainnet and deferred calculation settled. No continuous monitor or new strategy. Price/time bounds remain for explicit local input.
 
 ## HCR-8 optional deferred incremental margin — ACCEPTED OFFLINE
 
