@@ -2,7 +2,7 @@
 
 ## First owner-confirmed agent Mainnet attempt — HCR-9/HCR-10
 
-The launcher is under implementation and independent review; no HCR-9 live attempt has been verified. HCR-10 establishes an owner-confirmed workflow. For each proposed live operation, the assigned execution agent asks the owner to confirm the concrete action in concise language. The owner does not require a fixed checklist of venue/accounts/market, order fields, maximum writes, expected positions or recovery details before confirming. An affirmative reply authorizes that proposed action and its necessary reconciliation/cancellation handling. A materially different action, completion, cancellation or unclear owner intent requires another confirmation before new writes.
+The HCR-9 local launcher is accepted offline at candidate `00eff58940122dd74d558c59af2ca8950a270b6b`: independent adverse checks and the final clean isolated Python3.11 suite passed4392tests with3skips. No HCR-9 live attempt has been verified. HCR-10 records the owner's project-level permission for confirmed operations; it cannot override platform/system restrictions. In the current Chief task, the owner runs the financial operation locally and the Chief reviews sanitized results. Later materially different actions require the applicable owner confirmation and a capable authorized execution environment.
 
 The selected operation is one BTC paired opening: account27331 posts SELL LIMIT POST_ONLY and account27337 submits BUY MARKET IOC, API key index4, Robinhood deployment. The owner targets approximately USD16 of exposure per leg, with small deviation allowed. Quantity0.00020BTC is an exact reviewable input, not a verified current dollar value. Missing sizing, price or timing inputs may be supplied through the confirmed live flow; the owner does not require a fixed pre-confirmation checklist.
 
@@ -12,6 +12,31 @@ After the program returns, preserve its attempt directory and all files, includi
 
 For diagnosis, tell the Chief that the attempt has ended and provide its directory path. The Chief can read the sanitized packet in the shared workspace, inspect recorded phases and known/unknown positions, and prepare an offline-tested correction. Never place API keys, authentication tokens or signed payloads in that packet. The required API keys may be exchanged only with the assigned execution agent in the private owner-agent task/chat or through the protected local credential boundary; seed phrases, recovery material and withdrawal credentials remain prohibited. The Chief does not promise continuous monitoring and must not edit or restart an active financial process. Any later materially different financial operation requires fresh owner confirmation after the prior state is resolved.
 
+
+## Local single-attempt command — HCR-9
+
+The `local-attempt` entry point collects the required values without a config or market-evidence JSON file. Its default preview is offline. The following execution command is for the owner to run in an interactive terminal after implementation acceptance; the Chief does not launch financial operations in this task.
+
+```bash
+cd "/Users/daniilmakarov/Desktop/RISEx Spread Shadow"
+PYTHONPATH=src .venv-hood/bin/python -m risex_spread_shadow.hood_handoff.cli local-attempt \
+  --symbol BTC --quantity 0.00020 --direction LONG \
+  --source-account-index 27331 --receiver-account-index 27337 --api-key-index 4 \
+  --attempt-dir "$PWD/spread-shadow-runs/hood-local-attempt-20260915/owner-live-001" \
+  --client-order-prefix hcr9-owner-001 \
+  --keychain --defer-incremental-margin-calculation \
+  --execute --i-understand-one-attempt-live-operation
+```
+
+The attempt directory must be empty and owner-only, or its existing parent must be owner-only. The launch preparation reserves an empty owner-only `owner-live-001` directory; never clear or reuse it once it contains evidence. Remove both execution flags for an offline preview; it still asks for missing price/time inputs but never accesses Keychain or the network. `--help` is also offline.
+
+The prompts request source limit price, receiver worst price, freshness bound, request timeout, order timeout, reconciliation timeout, polling interval, maximum poll count, and source order lifetime. All prices use exact decimal input. The source order lifetime has the existing minimum of300seconds and is separate from the program's order waiting timeout. No price or timing policy is selected automatically. The unchanged auth-token lifetime is600seconds and is disclosed in preview. The unique client prefix in the example is only a label, not an economic setting.
+
+Review the displayed source-limit and receiver-worst-bound notionals to check the intended exposure near USD16. They are quantity multiplied by your price bounds, not actual fills, fees or profit. Type `LAUNCH` only for the displayed operation. Any other response cancels before credential access. Both credentials are loaded through the existing Keychain/hidden-input boundary before fresh market metadata is collected; prompt delays do not refresh old observations. Do not paste keys outside a hidden-key prompt.
+
+The fixed diagnostic files are `attempt-packet.json`, `terminal-result.json`, `exit-status.json`, `intent.jsonl` and the persistent `.attempt.claim`. The packet binds the launcher source fingerprint and original metadata observation. A recorded engine result is separate from complete diagnostic storage: failed finalization returns `INCOMPLETE` with nonzero exit while retaining any already saved result. Missing terminal result stays incomplete. The launcher refuses a nonempty attempt directory before credential access and never creates a replacement attempt automatically.
+
+After the process ends, give the Chief the attempt directory path. Preserve every file even after a failure. This launcher does not provide an automatic reconciliation-only command or a retry instruction; an unresolved operation must be inspected before any later separately authorized financial action. A successful paired opening leaves opposite open positions and is not evidence of profit.
 
 ## Optional local API-key storage — HCR-6
 
