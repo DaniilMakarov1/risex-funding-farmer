@@ -1,14 +1,16 @@
-Current HCR-2 review checkpoint: c67bc270c68ed4e314e8ebedf91a177536908a05 remains unaccepted; repeat read after successful crash reconciliation loses proven quantities. Same Builder assigned bounded persistence correction with direct result delivery. No duplicate order dispatch in the offline reproduction. Final clean suite/public verification pending; live NOT_RUN. See NEXT_TASK and chief-review-v1/repeat-reconciliation-result.json.
-
 # Current status
 
-## HCR-2 configurable Robinhood perpetual series — CHANGES_REQUESTED
+## HCR-2 configurable Robinhood perpetual series — ACCEPTED
 
-Owner selected configurable perpetual symbols, BTC first and ETH also supported, with sequential variable slices. Root task 01a096cf-96fc-7f02-b2bb-8bb0a92b8f09 is sole Chief. Visible/pinned Builder 01a0a48c-58c4-7781-ae9b-3a573381d55b owns correction on codex/spread-v1-hood-rh-slices; no second Chief.
+Accepted production candidate 393a17c01c73aced1735656c87ef9b4653b96653, Builder branch codex/spread-v1-hood-rh-slices. Root task 01a096cf-96fc-7f02-b2bb-8bb0a92b8f09 remains sole Chief/integration owner. Builder 01a0a48c-58c4-7781-ae9b-3a573381d55b delivered results directly and is complete; no active Builder, duplicate Chief or monitoring process. Luna/max established by explicit Builder role; Standard requested, actual speed UNKNOWN.
 
-Candidate 9e6c1d735b5023617758a3c4c87a8192e837d058 is preserved and NOT_ACCEPTED. Full actual diff reviewed; independent BTC/ETH LONG/SHORT three-slice engine-to-fake-SDK matrix passed. Consolidated review found reproducible interrupted-child effective-price binding loss/nonexistent quantity attribute, completed-journal progress loss, and stale Mapping-book restamping. Builder received one bounded correction assignment and must deliver the corrected result to root. No polling or management heartbeat is required; native result delivery has been verified.
+Configurable current perpetual symbol (BTC first, ETH checked), Robinhood API/signing-domain binding, LONG/SHORT, sequential downward liquidity-aware slices, exact totals, partial/unknown stops, persistent restart receipts and no replay accepted. Public metadata/book compatibility verified; all real account/key/signing/order execution remains NOT_RUN. No live size/account choice made. Manual account/margin evidence and later operator test remain outside completed development.
 
-Review and reproductions: spread-shadow-runs/hood-rh-20260915/chief-review-v1/changes-requested.md, adverse_probe.py/adverse-result.json, series_matrix_probe.py/series-matrix-result.json. Original Builder full4298/3 was a host Python3.11.5 run with no immutable raw packet, not isolated acceptance. Chief prepared a fresh isolated venv and dependencies in chief-clean-v1 and owns the final clean full suite after correction (not yet run). Public adapter preliminary BTC/ETH reads succeeded but sdk.py changed during v1; final four allowed public reads reserved for frozen corrected candidate. Public API requests used8/12, no account/key/signing/order calls. Live NOT_RUN. No HCR-2 implementation integrated or published.
+Independent Chief final clean isolated Python3.11.5 suite: 4303 passed, 3 skipped, exit0, 121.71s. Exact source/import identities and unchanged hashes verified in spread-shadow-runs/hood-rh-20260915/chief-clean-v1. Five independent final probes passed in chief-final-probes-v1, including BTC/ETH LONG/SHORT three-slice fake-SDK integration, independent arithmetic, stale inputs and repeated recovery. Acceptance review is chief-final-probes-v1/acceptance-review.md. Builder raw focused62/0 and manifests preserved in builder-rh-slices-v3. Initial9e6c1d7 and c67bc270 correction findings remain immutable evidence, not accepted releases.
+
+Public gate12/12 GETs consumed. Final frozen-candidate adapter-public-v2 verifies BTCid1 and ETHid0, 250 book records per side, identical before/after source hashes, no signers/accounts. Earlier adapter-public-v1 remains preliminary because sdk.py changed during that run; it is not final acceptance evidence. No further public collection, tuning or real execution authorized by completion.
+
+Chief integrates accepted source and current operator docs only; tested implementation unchanged by documentation/integration commits. Remote publication is verified separately after push. Historical claims below remain preserved.
 
 ## Historical HCR-1 acceptance — 2026-09-15
 

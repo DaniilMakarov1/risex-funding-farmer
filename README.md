@@ -3,7 +3,7 @@
 
 ## Robinhood Chain configurable perpetual series — HCR-2
 
-Implementation in progress; the previously accepted HCR-1 command below targets ordinary Lighter mainnet. Do not use that configuration as a Robinhood Chain configuration.
+Accepted offline and public-adapter verified (2026-09-15), candidate `393a17c01c73aced1735656c87ef9b4653b96653`: clean isolated Python 3.11 suite 4303 passed, 3 skipped. Real account/signing/order execution remains NOT_RUN. The older HCR-1 command below targets ordinary Lighter mainnet; use the Robinhood series configuration in this section for the requested deployment.
 
 The requested website is https://robinhoodchain.lighter.xyz. Its official API is https://api.rh.lighter.xyz, and Lighter SDK 1.1.2 uses signing domain `466324` for it. This signing identifier is not the EVM wallet chain ID. The deployment must never silently fall back to ordinary Lighter mainnet. Official references: [Lighter deployment mapping](https://github.com/elliottech/lighter-agent-kit/blob/main/install.sh) and [pinned SDK signing domains](https://github.com/elliottech/lighter-python/blob/v1.1.2/lighter/signer_client.py).
 
@@ -13,7 +13,72 @@ The total is split into sequential pairs. A reduces its existing position with a
 
 This closes and reopens exposure at a new entry price, not collateral or historical PnL. B needs its own adequate collateral. API private keys are entered locally with hidden input; never send seed phrases or private keys in chat. Public API checks have confirmed BTC/ETH availability and book responses on the requested deployment; real account readiness, signatures, order execution and receipts remain NOT_RUN.
 
-Final configuration and series commands will be documented here after candidate acceptance.
+### Configure the Robinhood series
+
+Install with Python 3.11 and `pip install -e '.[hood-handoff]'` in a dedicated local virtual environment as shown below. The executable retains the name `risex-hood-handoff` for compatibility; `mode: "series"` selects the new configurable-market path. Some legacy help descriptions still say HOOD/one attempt; the series configuration and series execution flag below determine this mode.
+
+Create a local `series-config.json`. The following is a **template, not a runnable trading configuration**: replace every angle-bracket placeholder with your explicitly chosen value. Quantities are units of the selected instrument (BTC for BTC, ETH for ETH), not dollars. Decimal quantities, prices and deviation remain JSON strings; time bounds and integer fields must be JSON numbers.
+
+```json
+{
+  "mode": "series",
+  "environment": "robinhood",
+  "api_base_url": "https://api.rh.lighter.xyz",
+  "chain_id": 466324,
+  "market_symbol": "BTC",
+  "direction": "LONG",
+  "total_quantity": "<total units to close and reopen>",
+  "desired_slice_quantity": "<maximum desired units per pair>",
+  "allowed_price_deviation": "<relative fraction>",
+  "source_limit_price": "<A limit price>",
+  "receiver_worst_price": "<B worst acceptable price>",
+  "freshness_seconds": "<replace with a positive number>",
+  "request_timeout_seconds": "<replace with a positive number>",
+  "order_timeout_seconds": "<replace with a positive number>",
+  "reconcile_timeout_seconds": "<replace with a positive number>",
+  "poll_interval_seconds": "<replace with a positive number>",
+  "max_poll_count": "<replace with a positive integer>",
+  "source_order_lifetime_seconds": "<replace with an integer, 300 through 2592000>",
+  "api_key_index": "<replace with your integer key index, 4 through 254>",
+  "client_order_prefix": "<unique operation label>",
+  "journal_path": "<absolute path in a private local directory>"
+}
+```
+
+`direction` accepts LONG or SHORT. Set `market_symbol` to ETH or another currently listed perpetual symbol to change instruments; review quantities, both prices, and evidence at the same time. `market_id` is optional: the adapter resolves the symbol from the current perpetual catalog; if an ID is supplied it must agree. No hardcoded BTC/ETH-only allowlist exists.
+
+`allowed_price_deviation` is a fraction relative to A's configured limit price: the notation `"0.01"` means 1%, not a recommended setting. For LONG, B's buy ceiling is the tighter of the explicit worst price and A's price multiplied by `(1 + deviation)`, rounded down to the price step. For SHORT, B's sell floor is the stricter of the explicit worst price and A's price multiplied by `(1 - deviation)`, rounded up. A's price stays fixed throughout the series. The program does not automatically chase the market.
+
+Each slice is the minimum of remaining total, desired slice, and observed receiver-side depth inside that bound, rounded down to the venue size step. The public read is bounded to 250 book records per side; it does not claim the complete available liquidity. The timestamp is the local response observation time, not a proven venue publication time. Quantities can differ with changing depth or the final remainder; randomization is not implemented. An insufficient minimum or unusable remainder stops visibly, without rounding upward. Splitting does not guarantee lower slippage.
+
+Create `market-evidence.json` using the evidence fields documented below, with the selected symbol and current market ID instead of HOOD. Evidence must be current and applicable to both accounts and all planned slice sizes. Incremental margin requirements and provenance still require operator-provided evidence; this version does not automatically derive them. Do not use an invented zero or renew a timestamp without renewing its evidence. A long series can stop when this evidence becomes stale. The receiver needs its own collateral.
+
+### Preview, local keys, and later operator execution
+
+A and B below are distinct **integer Lighter account indices**, not wallet addresses. Each account uses its corresponding Lighter API private key; the configured key index is shared but the keys are separate. Keep keys local and enter them only into the hidden terminal prompt. An address alone cannot authorize this operation.
+
+```bash
+.venv-hood/bin/risex-hood-handoff run \
+  --config series-config.json --market-evidence market-evidence.json \
+  --source-account-index A --receiver-account-index B
+```
+
+The default preview makes no network request and asks for no keys. It checks configuration and prints the series inputs, but does not prove account readiness, full evidence validity, or executable slices. Review the source/receiver arguments and chosen direction and bounds separately.
+
+Only for a later operator-run execution, add these three flags to that command:
+
+```text
+--execute --i-understand-series-live-operation --confirm-plan
+```
+
+These flags permit real signing and orders; agents have not used them. The one-attempt acknowledgment from the older HOOD example is not the series acknowledgment. A first operator test can use an explicitly chosen total equal to the desired slice to exercise at most one pair; choose actual size/prices only after checking the current market and accounts. No live size is preselected here.
+
+### Series results and interruption
+
+Read `outcome` and every child receipt, not only the process exit code. `completed_quantity` counts fully validated completed children. `remaining_quantity` is total minus that count; it is **not an instruction to blindly retry**. `actual_source_filled_quantity` and `actual_receiver_filled_quantity` separately report known cumulative leg fills, and can differ after a partial child. `actual_filled_quantity` is a paired quantity summary, not proof the two accounts matched each other. Economic fees/PnL remain separate in child results.
+
+Keep the parent journal, every `.child-NNNN` journal, their locks, and the exact code/configuration/account inputs. Restart is read-only reconciliation with respect to orders: it never submits or cancels an order or starts the next child. It can authenticate/read accounts and append journal evidence. A previously completed series returns a blocked/UNKNOWN rerun result while retaining its original completed totals; a recovered interrupted child can have known fills while the overall series remains UNKNOWN. There is no automatic resume switch. Resolve any outstanding orders and position differences before separately choosing a new operation; do not remove journals to force replay. Account receipt/signing/execution compatibility remains live-unverified.
+
 
 Current status (2026-09-15): HCR-1 BOTH/no-monetary-caps implementation `74fbbbf9f298648b643ce9a69353e3abcdcf6c27` passed independent review, 12 adverse fake-SDK probes and the clean isolated Python 3.11 suite (4289 passed, 3 skipped). Operator instructions follow. Live execution is NOT_RUN; no agent account or execution authority is granted.
 
