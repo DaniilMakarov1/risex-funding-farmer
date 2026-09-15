@@ -82,6 +82,20 @@ def _text(value: Any, name: str) -> str:
     return value.strip()
 
 
+def _timestamp(value: Any, name: str) -> float:
+    """Validate a transport observation without renewing its age."""
+
+    if isinstance(value, bool):
+        raise ContractError(f"{name} must be a timestamp")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ContractError(f"{name} must be a timestamp") from exc
+    if not math.isfinite(parsed) or parsed < 0:
+        raise ContractError(f"{name} must be a finite non-negative timestamp")
+    return parsed
+
+
 @dataclass(frozen=True, slots=True)
 class DepthLevel:
     """One public order-book level after exact decimal validation."""
@@ -412,6 +426,24 @@ class SliceSizing:
         return self.depth_price_bound
 
 
+def _effective_receiver_bound(config: RobinhoodSeriesConfig, price_decimals: int) -> Decimal:
+    """Return the conservative receiver limit implied by operator inputs."""
+
+    _int(price_decimals, "price_decimals")
+    price_step = Decimal(1).scaleb(-price_decimals)
+    if config.direction is Direction.LONG:
+        raw_bound = min(
+            config.receiver_worst_price,
+            config.source_limit_price * (Decimal("1") + config.allowed_price_deviation),
+        )
+        return (raw_bound / price_step).to_integral_value(rounding=ROUND_DOWN) * price_step
+    raw_bound = max(
+        config.receiver_worst_price,
+        config.source_limit_price * (Decimal("1") - config.allowed_price_deviation),
+    )
+    return (raw_bound / price_step).to_integral_value(rounding=ROUND_CEILING) * price_step
+
+
 def size_next_slice(
     config: RobinhoodSeriesConfig,
     metadata: MarketMetadata,
@@ -429,35 +461,31 @@ def size_next_slice(
         raise PreflightBlocked("current market is not the configured Robinhood perpetual")
     if book.symbol.upper() != config.market_symbol or book.market_type.lower() != "perp":
         raise PreflightBlocked("current order book is not the configured Robinhood perpetual")
+    if metadata.venue and metadata.venue.lower() not in {"robinhood", "robinhood-chain"}:
+        raise PreflightBlocked("current market is from the wrong venue")
+    if book.venue.lower() not in {"robinhood", "robinhood-chain"}:
+        raise PreflightBlocked("current order book is from the wrong venue")
     if book.observed_at > now:
         raise PreflightBlocked("order book observation is from the future")
     if now - book.observed_at > config.freshness_seconds:
         raise PreflightBlocked("order book observation is stale")
-    source_reference = config.source_limit_price
-    deviation = config.allowed_price_deviation
-    price_step = Decimal(1).scaleb(-metadata.price_decimals)
+    effective_bound = _effective_receiver_bound(config, metadata.price_decimals)
     if config.direction is Direction.LONG:
-        adverse_limit = source_reference * (Decimal("1") + deviation)
-        raw_bound = min(config.receiver_worst_price, adverse_limit)
-        hard_limit = (raw_bound / price_step).to_integral_value(rounding=ROUND_DOWN) * price_step
-        levels = tuple(level for level in book.asks if level.price <= hard_limit)
+        levels = tuple(level for level in book.asks if level.price <= effective_bound)
     else:
-        adverse_floor = source_reference * (Decimal("1") - deviation)
-        raw_bound = max(config.receiver_worst_price, adverse_floor)
-        hard_floor = (raw_bound / price_step).to_integral_value(rounding=ROUND_CEILING) * price_step
-        levels = tuple(level for level in book.bids if level.price >= hard_floor)
+        levels = tuple(level for level in book.bids if level.price >= effective_bound)
     depth = sum((level.quantity for level in levels), Decimal("0"))
     requested = min(remaining, config.desired_slice_quantity)
     metadata_step = Decimal(1).scaleb(-metadata.size_decimals)
     rounded = (min(requested, depth) / metadata_step).to_integral_value(rounding=ROUND_DOWN) * metadata_step
     if rounded <= 0:
         reason = "no fresh executable depth" if depth <= 0 else "executable depth is below venue size step"
-        return SliceSizing(requested, depth, Decimal("0"), remaining, hard_limit if config.direction is Direction.LONG else hard_floor, book.observed_at, reason)
+        return SliceSizing(requested, depth, Decimal("0"), remaining, effective_bound, book.observed_at, reason)
     if rounded < metadata.minimum_base_amount:
-        return SliceSizing(requested, depth, Decimal("0"), remaining, hard_limit if config.direction is Direction.LONG else hard_floor, book.observed_at, "remaining depth is below venue base minimum")
+        return SliceSizing(requested, depth, Decimal("0"), remaining, effective_bound, book.observed_at, "remaining depth is below venue base minimum")
     if rounded * config.source_limit_price < metadata.minimum_quote_amount:
-        return SliceSizing(requested, depth, Decimal("0"), remaining, hard_limit if config.direction is Direction.LONG else hard_floor, book.observed_at, "remaining depth is below venue quote minimum")
-    return SliceSizing(requested, depth, rounded, remaining, hard_limit if config.direction is Direction.LONG else hard_floor, book.observed_at)
+        return SliceSizing(requested, depth, Decimal("0"), remaining, effective_bound, book.observed_at, "remaining depth is below venue quote minimum")
+    return SliceSizing(requested, depth, rounded, remaining, effective_bound, book.observed_at)
 
 
 @dataclass(frozen=True, slots=True)
@@ -473,6 +501,8 @@ class SeriesResult:
     actual_filled_quantity: Decimal | None = None
     reason: str = ""
     remainder_reason: str = ""
+    actual_source_filled_quantity: Decimal | None = None
+    actual_receiver_filled_quantity: Decimal | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -484,6 +514,16 @@ class SeriesResult:
             "completed_quantity": format(self.completed_quantity, "f"),
             "remaining_quantity": format(self.remaining_quantity, "f"),
             "actual_filled_quantity": None if self.actual_filled_quantity is None else format(self.actual_filled_quantity, "f"),
+            "actual_source_filled_quantity": (
+                None
+                if self.actual_source_filled_quantity is None
+                else format(self.actual_source_filled_quantity, "f")
+            ),
+            "actual_receiver_filled_quantity": (
+                None
+                if self.actual_receiver_filled_quantity is None
+                else format(self.actual_receiver_filled_quantity, "f")
+            ),
             "reason": self.reason,
             "remainder_reason": self.remainder_reason,
             "children": [child.as_dict() for child in self.children],
@@ -553,9 +593,34 @@ class RobinhoodSeriesEngine:
         existing = [event for event in events if event.event.startswith("SERIES_") or event.event.startswith("CHILD_")]
         if events and not existing:
             return self._blocked(config, "journal contains a different operation")
-        series_id = parent.run_id
+        persisted_started = next((event for event in existing if event.event == "SERIES_STARTED"), None)
+        series_id = parent.run_id if persisted_started is None else persisted_started.run_id
         if any(event.event == "SERIES_COMPLETE" for event in existing):
-            return self._result(config, series_id, None, Decimal("0"), config.total_quantity, (), "journal already contains a completed series")
+            try:
+                completed, market_id, source_actual, receiver_actual = self._stored_series_progress(
+                    config,
+                    existing,
+                    source_index,
+                    receiver_index,
+                    require_complete=True,
+                )
+            except Exception as exc:
+                reason = "completed series journal is malformed: " + sanitize_exception(exc)
+                parent.append("SERIES_RESTART_BLOCKED", {"reason": reason})
+                return self._result(config, series_id, None, Decimal("0"), config.total_quantity, (), reason)
+            return self._result(
+                config,
+                series_id,
+                market_id,
+                completed,
+                config.total_quantity - completed,
+                (),
+                "journal already contains a completed series; no mutation was attempted",
+                outcome=Outcome.UNKNOWN,
+                actual_filled_quantity=completed,
+                actual_source_filled_quantity=source_actual,
+                actual_receiver_filled_quantity=receiver_actual,
+            )
         try:
             metadata = await self._resolve_market(config)
             self._validate_market(config, metadata)
@@ -579,7 +644,7 @@ class RobinhoodSeriesEngine:
                 parent.append("SERIES_RESTART_BLOCKED", {"reason": reason})
                 return self._result(config, series_id, metadata.market_id, Decimal("0"), config.total_quantity, (), reason)
             try:
-                restart_result = await self._handle_restart(config, parent, metadata, existing)
+                restart_result = await self._handle_restart(config, parent, metadata, existing, series_id=series_id)
             except Exception as exc:
                 reason = "restart journal is malformed: " + sanitize_exception(exc)
                 parent.append("SERIES_RESTART_BLOCKED", {"reason": reason})
@@ -641,11 +706,10 @@ class RobinhoodSeriesEngine:
                     return self._result(config, series_id, metadata.market_id, completed, remaining, tuple(children), reason)
             try:
                 raw_book = await self._read_book(metadata.market_id)
-                book = raw_book if isinstance(raw_book, OrderBookSnapshot) else OrderBookSnapshot.from_mapping(
-                    raw_book,
-                    market_id=metadata.market_id,
-                    symbol=metadata.symbol,
-                    observed_at=self.clock.now(),
+                book = (
+                    raw_book
+                    if isinstance(raw_book, OrderBookSnapshot)
+                    else self._book_from_mapping(raw_book, metadata)
                 )
                 sizing = size_next_slice(config, metadata, book, remaining_quantity=remaining, now=self.clock.now())
             except Exception as exc:
@@ -670,6 +734,12 @@ class RobinhoodSeriesEngine:
                 reason = "child journal already exists; refusing a possible mutation replay"
                 parent.append("SERIES_STOPPED", {"reason": reason, "child_index": child_index})
                 return self._result(config, series_id, metadata.market_id, completed, remaining, tuple(children), reason)
+            child_config = config.attempt_config(
+                market_id=metadata.market_id,
+                quantity=sizing.rounded_quantity,
+                journal_path=child_path,
+                receiver_worst_price=sizing.effective_receiver_price,
+            )
             parent.append(
                 "CHILD_INTENT",
                 {
@@ -683,13 +753,8 @@ class RobinhoodSeriesEngine:
                     "receiver_position_before": format(expected_receiver, "f"),
                     "sizing": sizing.as_dict(),
                     "binding": binding,
+                    "child_binding": self._child_binding(child_config),
                 },
-            )
-            child_config = config.attempt_config(
-                market_id=metadata.market_id,
-                quantity=sizing.rounded_quantity,
-                journal_path=child_path,
-                receiver_worst_price=sizing.effective_receiver_price,
             )
             child = await run_handoff(child_config, self.client, clock=self.clock)
             children.append(child)
@@ -701,12 +766,17 @@ class RobinhoodSeriesEngine:
                     "quantity": format(sizing.rounded_quantity, "f"),
                     "source_order_id": None if child.source is None else child.source.order_id,
                     "receiver_order_id": None if child.receiver is None else child.receiver.order_id,
+                    "source_filled_quantity": self._journal_leg_quantity(child.source),
+                    "receiver_filled_quantity": self._journal_leg_quantity(child.receiver),
+                    "source_history_complete": None if child.source is None else child.source.history_complete,
+                    "receiver_history_complete": None if child.receiver is None else child.receiver.history_complete,
+                    "unknown_reasons": list(child.unknown_reasons),
                 },
             )
             if child.outcome is not Outcome.SUCCESS:
                 reason = child.reason or f"child {child_index} ended {child.outcome.value}"
                 parent.append("SERIES_STOPPED", {"reason": reason, "child_index": child_index})
-                actual = self._actual_for_child(child)
+                actual = self._cumulative_paired_quantity(completed, child.source, child.receiver)
                 return self._result(
                     config,
                     series_id,
@@ -717,6 +787,12 @@ class RobinhoodSeriesEngine:
                     reason,
                     outcome=child.outcome,
                     actual_filled_quantity=actual,
+                    actual_source_filled_quantity=self._cumulative_leg_quantity(
+                        completed, child.source
+                    ),
+                    actual_receiver_filled_quantity=self._cumulative_leg_quantity(
+                        completed, child.receiver
+                    ),
                 )
             try:
                 self._validate_child_success(
@@ -745,11 +821,288 @@ class RobinhoodSeriesEngine:
                     "remaining_quantity": format(remaining, "f"),
                     "source_position_after": format(expected_source, "f"),
                     "receiver_position_after": format(expected_receiver, "f"),
+                    "source_filled_quantity": format(sizing.rounded_quantity, "f"),
+                    "receiver_filled_quantity": format(sizing.rounded_quantity, "f"),
                 },
             )
             child_index += 1
-        parent.append("SERIES_COMPLETE", {"outcome": Outcome.SUCCESS.value, "completed_quantity": format(completed, "f")})
-        return self._result(config, series_id, metadata.market_id, completed, Decimal("0"), tuple(children), "", outcome=Outcome.SUCCESS)
+        parent.append(
+            "SERIES_COMPLETE",
+            {
+                "outcome": Outcome.SUCCESS.value,
+                "completed_quantity": format(completed, "f"),
+                "market_id": metadata.market_id,
+                "symbol": metadata.symbol,
+            },
+        )
+        return self._result(
+            config,
+            series_id,
+            metadata.market_id,
+            completed,
+            Decimal("0"),
+            tuple(children),
+            "",
+            outcome=Outcome.SUCCESS,
+            actual_filled_quantity=completed,
+            actual_source_filled_quantity=completed,
+            actual_receiver_filled_quantity=completed,
+        )
+
+    @staticmethod
+    def _child_binding(config: HandoffConfig) -> dict[str, Any]:
+        return {
+            "market_id": config.market_id,
+            "market_symbol": config.market_symbol,
+            "direction": config.direction.value,
+            "quantity": format(config.quantity, "f"),
+            "source_limit_price": format(config.source_limit_price, "f"),
+            "receiver_worst_price": format(config.receiver_worst_price, "f"),
+            "journal_path": config.journal_path,
+            "environment": config.environment,
+            "api_base_url": config.api_base_url,
+            "chain_id": config.chain_id,
+        }
+
+    @staticmethod
+    def _journal_leg_quantity(leg: Any) -> str | None:
+        if leg is None or not leg.history_complete:
+            return None
+        return format(leg.filled_quantity, "f")
+
+    @staticmethod
+    def _proven_leg_quantity(leg: Any) -> Decimal | None:
+        if leg is None or not leg.history_complete:
+            return None
+        return leg.filled_quantity
+
+    @classmethod
+    def _cumulative_leg_quantity(cls, completed: Decimal, leg: Any) -> Decimal | None:
+        proven = cls._proven_leg_quantity(leg)
+        return None if proven is None else completed + proven
+
+    @classmethod
+    def _cumulative_paired_quantity(
+        cls,
+        completed: Decimal,
+        source: Any,
+        receiver: Any,
+    ) -> Decimal | None:
+        source_total = cls._cumulative_leg_quantity(completed, source)
+        receiver_total = cls._cumulative_leg_quantity(completed, receiver)
+        if (
+            source_total is None
+            or receiver_total is None
+            or source_total <= 0
+            or receiver_total <= 0
+        ):
+            return None
+        return min(source_total, receiver_total)
+
+    @staticmethod
+    def _paired_totals_or_none(source: Decimal, receiver: Decimal) -> Decimal | None:
+        if source <= 0 or receiver <= 0:
+            return None
+        return min(source, receiver)
+
+    @staticmethod
+    def _book_from_mapping(value: Mapping[str, Any], metadata: MarketMetadata) -> OrderBookSnapshot:
+        if not isinstance(value, Mapping):
+            raise ContractError("order-book mapping is malformed")
+        if "market_id" not in value or "symbol" not in value:
+            raise ContractError("order-book mapping lacks explicit market identity")
+        raw_market_id = value.get("market_id")
+        if isinstance(raw_market_id, bool) or not isinstance(raw_market_id, int):
+            raise ContractError("order-book mapping market_id is malformed")
+        if raw_market_id != metadata.market_id:
+            raise PreflightBlocked("order-book mapping market identity does not match current market")
+        raw_symbol = value.get("symbol")
+        if not isinstance(raw_symbol, str) or raw_symbol.strip().upper() != metadata.symbol.upper():
+            raise PreflightBlocked("order-book mapping symbol does not match current market")
+        raw_market_type = value.get("market_type")
+        if not isinstance(raw_market_type, str) or raw_market_type.strip().lower() != "perp":
+            raise PreflightBlocked("order-book mapping is not a perpetual market")
+        raw_venue = value.get("venue")
+        if not isinstance(raw_venue, str) or raw_venue.strip().lower() not in {"robinhood", "robinhood-chain"}:
+            raise PreflightBlocked("order-book mapping is from the wrong venue")
+        if "observed_at" not in value:
+            raise ContractError("order-book mapping lacks its original observation timestamp")
+        observed_at = _timestamp(value.get("observed_at"), "order-book observed_at")
+        return OrderBookSnapshot.from_mapping(
+            value,
+            market_id=metadata.market_id,
+            symbol=metadata.symbol,
+            observed_at=observed_at,
+            venue=raw_venue,
+        )
+
+    @classmethod
+    def _stored_series_progress(
+        cls,
+        config: RobinhoodSeriesConfig,
+        existing: Sequence[Any],
+        source_account_index: int,
+        receiver_account_index: int,
+        *,
+        require_complete: bool,
+        series_id: str | None = None,
+    ) -> tuple[Decimal, int, Decimal, Decimal]:
+        """Validate persisted parent identity and return proven cumulative totals."""
+
+        started = next((event for event in existing if event.event == "SERIES_STARTED"), None)
+        if started is None or not isinstance(started.payload.get("binding"), Mapping):
+            raise ContractError("series journal lacks its immutable binding")
+        stored_binding = started.payload["binding"]
+        raw_market_id = stored_binding.get("market_id")
+        if isinstance(raw_market_id, bool) or not isinstance(raw_market_id, int) or raw_market_id < 0:
+            raise ContractError("series journal binding has no valid market_id")
+        if config.market_id is not None and config.market_id != raw_market_id:
+            raise ContractError("series journal market_id conflicts with current configuration")
+        expected_binding = config.binding(
+            source_account_index=source_account_index,
+            receiver_account_index=receiver_account_index,
+            resolved_market_id=raw_market_id,
+        )
+        if dict(stored_binding) != expected_binding:
+            raise ContractError("series journal binding conflicts with current selection inputs")
+        if series_id is not None and started.run_id != series_id:
+            raise ContractError("series journal identity conflicts with its parent run")
+
+        intent_events = [event for event in existing if event.event == "CHILD_INTENT"]
+        intents: dict[int, Any] = {}
+        for event in intent_events:
+            raw_index = event.payload.get("child_index")
+            if isinstance(raw_index, bool) or not isinstance(raw_index, int) or raw_index < 0:
+                raise ContractError("series journal child intent index is malformed")
+            if raw_index in intents:
+                raise ContractError("series journal contains duplicate child intent")
+            persisted_intent_binding = event.payload.get("binding")
+            if persisted_intent_binding is not None and persisted_intent_binding != dict(stored_binding):
+                raise ContractError("child intent parent binding conflicts with its series")
+            intents[raw_index] = event
+
+        complete_events = [event for event in existing if event.event == "CHILD_COMPLETE"]
+        by_index: dict[int, Any] = {}
+        for event in complete_events:
+            raw_index = event.payload.get("child_index")
+            if isinstance(raw_index, bool) or not isinstance(raw_index, int) or raw_index < 0:
+                raise ContractError("series journal child completion index is malformed")
+            if raw_index in by_index:
+                raise ContractError("series journal contains duplicate child completion")
+            by_index[raw_index] = event
+        if by_index and set(by_index) != set(range(max(by_index) + 1)):
+            raise ContractError("series journal child completions are not contiguous")
+        completed = Decimal("0")
+        source_actual = Decimal("0")
+        receiver_actual = Decimal("0")
+        for index in sorted(by_index):
+            event = by_index[index]
+            quantity = _positive(event.payload.get("quantity"), "completed child quantity")
+            intent = intents.get(index)
+            if intent is None:
+                raise ContractError("series journal child completion lacks its intent")
+            if _positive(intent.payload.get("quantity"), "child intent quantity") != quantity:
+                raise ContractError("child completion quantity conflicts with its intent")
+            child_binding = intent.payload.get("child_binding")
+            if child_binding is not None:
+                if not isinstance(child_binding, Mapping):
+                    raise ContractError("child intent binding is malformed")
+                if (
+                    child_binding.get("market_id") != raw_market_id
+                    or str(child_binding.get("market_symbol", "")).upper() != config.market_symbol
+                    or child_binding.get("direction") != config.direction.value
+                    or _decimal(child_binding.get("quantity"), "child binding quantity") != quantity
+                    or child_binding.get("journal_path") != cls._child_path(config.journal_path, index)
+                ):
+                    raise ContractError("child intent binding conflicts with its persisted identity")
+            completed += quantity
+            source_value = event.payload.get("source_filled_quantity", format(quantity, "f"))
+            receiver_value = event.payload.get("receiver_filled_quantity", format(quantity, "f"))
+            source_quantity = _positive(source_value, "completed source quantity")
+            receiver_quantity = _positive(receiver_value, "completed receiver quantity")
+            if source_quantity != quantity or receiver_quantity != quantity:
+                raise ContractError("completed child leg quantities do not match the paired quantity")
+            source_actual += source_quantity
+            receiver_actual += receiver_quantity
+            persisted_total = event.payload.get("completed_quantity")
+            if persisted_total is not None and _decimal(persisted_total, "completed cumulative quantity") != completed:
+                raise ContractError("completed child cumulative quantity is inconsistent")
+        if completed > config.total_quantity:
+            raise ContractError("series journal completed quantity exceeds configured total")
+        complete_event = next((event for event in reversed(existing) if event.event == "SERIES_COMPLETE"), None)
+        if require_complete:
+            if complete_event is None:
+                raise ContractError("series journal lacks SERIES_COMPLETE")
+            if complete_event.payload.get("outcome") != Outcome.SUCCESS.value:
+                raise ContractError("series complete event does not prove success")
+            persisted_completed = _decimal(
+                complete_event.payload.get("completed_quantity"),
+                "series completed quantity",
+            )
+            if persisted_completed != completed or persisted_completed != config.total_quantity:
+                raise ContractError("series complete total is inconsistent with child completions")
+            persisted_market_id = complete_event.payload.get("market_id")
+            if persisted_market_id is not None and persisted_market_id != raw_market_id:
+                raise ContractError("series complete market identity is inconsistent")
+            persisted_symbol = complete_event.payload.get("symbol")
+            if persisted_symbol is not None and str(persisted_symbol).upper() != config.market_symbol:
+                raise ContractError("series complete symbol identity is inconsistent")
+        elif complete_event is not None:
+            raise ContractError("series journal has a terminal completion before restart")
+        return completed, raw_market_id, source_actual, receiver_actual
+
+    @classmethod
+    def _restart_child_config(
+        cls,
+        config: RobinhoodSeriesConfig,
+        metadata: MarketMetadata,
+        intent: Any,
+        expected_parent_binding: Mapping[str, Any],
+    ) -> tuple[str, Decimal, HandoffConfig]:
+        if not isinstance(intent.payload, Mapping):
+            raise ContractError("child intent payload is malformed")
+        payload = intent.payload
+        raw_index = payload.get("child_index")
+        if isinstance(raw_index, bool) or not isinstance(raw_index, int) or raw_index < 0:
+            raise ContractError("child intent index is malformed")
+        child_path = payload.get("child_journal_path")
+        expected_path = cls._child_path(config.journal_path, raw_index)
+        if not isinstance(child_path, str) or child_path != expected_path:
+            raise ContractError("child intent journal path conflicts with its parent")
+        if payload.get("binding") != dict(expected_parent_binding):
+            raise ContractError("child intent parent binding conflicts with its series")
+        quantity = _positive(payload.get("quantity"), "child quantity")
+        sizing = payload.get("sizing")
+        if not isinstance(sizing, Mapping):
+            raise ContractError("child intent lacks persisted sizing")
+        persisted_quantity = _positive(sizing.get("rounded_quantity"), "persisted child quantity")
+        if persisted_quantity != quantity:
+            raise ContractError("child intent quantity conflicts with persisted sizing")
+        persisted_bound = _positive(
+            sizing.get("effective_receiver_price", sizing.get("depth_price_bound")),
+            "persisted effective receiver price",
+        )
+        expected_bound = _effective_receiver_bound(config, metadata.price_decimals)
+        if persisted_bound != expected_bound:
+            raise ContractError("child intent effective receiver price conflicts with the configured deviation bound")
+        child_config = config.attempt_config(
+            market_id=metadata.market_id,
+            quantity=quantity,
+            journal_path=child_path,
+            receiver_worst_price=persisted_bound,
+        )
+        persisted_child_binding = payload.get("child_binding")
+        if persisted_child_binding is not None and persisted_child_binding != cls._child_binding(child_config):
+            raise ContractError("child intent binding conflicts with persisted child configuration")
+        return child_path, quantity, child_config
+
+    @staticmethod
+    def _stored_child_result_leg(event: Any, role: str) -> Decimal | None:
+        value = event.payload.get(f"{role}_filled_quantity")
+        history_complete = event.payload.get(f"{role}_history_complete")
+        if value is None or history_complete is not True:
+            return None
+        return _nonnegative(value, f"stored {role} filled quantity")
 
     async def _handle_restart(
         self,
@@ -757,53 +1110,165 @@ class RobinhoodSeriesEngine:
         parent: DurableJournal,
         metadata: MarketMetadata,
         existing: Sequence[Any],
+        *,
+        series_id: str,
     ) -> SeriesResult | None:
-        child_intents = {event.payload.get("child_index"): event for event in existing if event.event == "CHILD_INTENT"}
-        child_results = {event.payload.get("child_index"): event for event in existing if event.event == "CHILD_RESULT"}
-        child_completes = {event.payload.get("child_index"): event for event in existing if event.event == "CHILD_COMPLETE"}
-        completed_before = sum(
-            (_decimal(item.payload.get("quantity"), "completed quantity") for item in child_completes.values()),
-            Decimal("0"),
+        source_index, receiver_index = self._account_indices()
+        completed_before, persisted_market_id, source_actual, receiver_actual = self._stored_series_progress(
+            config,
+            existing,
+            source_index,
+            receiver_index,
+            require_complete=False,
+            series_id=series_id,
         )
+        if persisted_market_id != metadata.market_id:
+            raise ContractError("restart market identity conflicts with current catalog")
+        expected_parent_binding = config.binding(
+            source_account_index=source_index,
+            receiver_account_index=receiver_index,
+            resolved_market_id=metadata.market_id,
+        )
+
+        def event_map(event_name: str) -> dict[int, Any]:
+            result: dict[int, Any] = {}
+            for event in existing:
+                if event.event != event_name:
+                    continue
+                index = event.payload.get("child_index")
+                if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+                    raise ContractError(f"{event_name} child index is malformed")
+                if index in result:
+                    raise ContractError(f"series journal contains duplicate {event_name}")
+                result[index] = event
+            return result
+
+        child_intents = event_map("CHILD_INTENT")
+        child_results = event_map("CHILD_RESULT")
+        child_completes = event_map("CHILD_COMPLETE")
         remaining_before = config.total_quantity - completed_before
-        if completed_before < 0 or completed_before > config.total_quantity:
-            raise ContractError("restart journal completed quantity exceeds configured total")
         pending = sorted(set(child_intents) - set(child_completes))
         if pending:
+            if len(pending) != 1:
+                raise ContractError("series journal contains more than one incomplete child")
             index = pending[-1]
             intent = child_intents[index]
             child_path = intent.payload.get("child_journal_path")
             if not isinstance(child_path, str) or not child_path:
                 reason = "restart child intent lacks a durable child journal binding"
                 parent.append("SERIES_RESTART_BLOCKED", {"reason": reason, "child_index": index})
-                return self._result(config, parent.run_id, metadata.market_id, completed_before, remaining_before, (), reason)
+                return self._result(config, series_id, metadata.market_id, completed_before, remaining_before, (), reason)
             if not Path(child_path).exists():
                 reason = "restart child intent has no child journal; refusing to start a new attempt"
                 parent.append("SERIES_RESTART_BLOCKED", {"reason": reason, "child_index": index})
-                return self._result(config, parent.run_id, metadata.market_id, completed_before, remaining_before, (), reason)
+                return self._result(
+                    config,
+                    series_id,
+                    metadata.market_id,
+                    completed_before,
+                    remaining_before,
+                    (),
+                    reason,
+                    actual_filled_quantity=self._paired_totals_or_none(source_actual, receiver_actual),
+                    actual_source_filled_quantity=source_actual,
+                    actual_receiver_filled_quantity=receiver_actual,
+                )
+            child_path, _quantity, child_config = self._restart_child_config(
+                config,
+                metadata,
+                intent,
+                expected_parent_binding,
+            )
             child_journal = DurableJournal(child_path)
             if child_journal.has_unresolved_mutation():
-                quantity = _positive(intent.payload.get("quantity"), "child quantity")
-                child_config = config.attempt_config(
-                    market_id=metadata.market_id,
-                    quantity=quantity,
-                    journal_path=child_path,
-                )
                 reconciled = await run_handoff(child_config, self.client, clock=self.clock)
-                parent.append("SERIES_RECONCILED_CHILD", {"child_index": index, "outcome": reconciled.outcome.value})
+                reconciled_source = self._cumulative_leg_quantity(completed_before, reconciled.source)
+                reconciled_receiver = self._cumulative_leg_quantity(completed_before, reconciled.receiver)
+                parent.append(
+                    "SERIES_RECONCILED_CHILD",
+                    {
+                        "child_index": index,
+                        "outcome": reconciled.outcome.value,
+                        "source_filled_quantity": self._journal_leg_quantity(reconciled.source),
+                        "receiver_filled_quantity": self._journal_leg_quantity(reconciled.receiver),
+                    },
+                )
                 reason = "restart reconciled the interrupted child; explicit series resume is required"
-                return self._result(config, parent.run_id, metadata.market_id, completed_before, remaining_before, (reconciled,), reason, outcome=Outcome.UNKNOWN, actual_filled_quantity=self._actual_for_child(reconciled))
+                return self._result(
+                    config,
+                    series_id,
+                    metadata.market_id,
+                    completed_before,
+                    remaining_before,
+                    (reconciled,),
+                    reason,
+                    outcome=Outcome.UNKNOWN,
+                    actual_filled_quantity=(
+                        None
+                        if reconciled_source is None or reconciled_receiver is None
+                        else self._paired_totals_or_none(reconciled_source, reconciled_receiver)
+                    ),
+                    actual_source_filled_quantity=reconciled_source,
+                    actual_receiver_filled_quantity=reconciled_receiver,
+                )
             reason = "restart found an incomplete child without an unresolved mutation journal; refusing replay"
             parent.append("SERIES_RESTART_BLOCKED", {"reason": reason, "child_index": index})
-            return self._result(config, parent.run_id, metadata.market_id, completed_before, remaining_before, (), reason)
+            stored_result = child_results.get(index)
+            result_source = (
+                None
+                if stored_result is None or self._stored_child_result_leg(stored_result, "source") is None
+                else source_actual + self._stored_child_result_leg(stored_result, "source")
+            )
+            result_receiver = (
+                None
+                if stored_result is None or self._stored_child_result_leg(stored_result, "receiver") is None
+                else receiver_actual + self._stored_child_result_leg(stored_result, "receiver")
+            )
+            return self._result(
+                config,
+                series_id,
+                metadata.market_id,
+                completed_before,
+                remaining_before,
+                (),
+                reason,
+                actual_filled_quantity=(
+                    None
+                    if result_source is None or result_receiver is None
+                    else self._paired_totals_or_none(result_source, result_receiver)
+                ),
+                actual_source_filled_quantity=result_source,
+                actual_receiver_filled_quantity=result_receiver,
+            )
         if child_completes:
             reason = "restart has completed children; a new child requires a new explicit series run"
             parent.append("SERIES_RESTART_BLOCKED", {"reason": reason})
-            return self._result(config, parent.run_id, metadata.market_id, completed_before, remaining_before, (), reason)
+            return self._result(
+                config,
+                series_id,
+                metadata.market_id,
+                completed_before,
+                remaining_before,
+                (),
+                reason,
+                actual_filled_quantity=self._paired_totals_or_none(source_actual, receiver_actual),
+                actual_source_filled_quantity=source_actual,
+                actual_receiver_filled_quantity=receiver_actual,
+            )
         if child_results and not child_completes:
             reason = "restart has a child result without a durable child completion"
             parent.append("SERIES_RESTART_BLOCKED", {"reason": reason})
-            return self._result(config, parent.run_id, metadata.market_id, completed_before, remaining_before, (), reason)
+            return self._result(
+                config,
+                series_id,
+                metadata.market_id,
+                completed_before,
+                remaining_before,
+                (),
+                reason,
+                actual_source_filled_quantity=source_actual,
+                actual_receiver_filled_quantity=receiver_actual,
+            )
         return None
 
     async def _resolve_market(self, config: RobinhoodSeriesConfig) -> MarketMetadata:
@@ -920,14 +1385,6 @@ class RobinhoodSeriesEngine:
         return str(path.with_name(path.name + f".child-{child_index:04d}"))
 
     @staticmethod
-    def _actual_for_child(child: HandoffResult) -> Decimal | None:
-        if child.outcome is Outcome.SUCCESS:
-            return child.quantity
-        if child.outcome is Outcome.PARTIAL and child.source is not None and child.receiver is not None:
-            return min(child.source.filled_quantity, child.receiver.filled_quantity)
-        return None
-
-    @staticmethod
     def _result(
         config: RobinhoodSeriesConfig,
         series_id: str,
@@ -940,6 +1397,8 @@ class RobinhoodSeriesEngine:
         outcome: Outcome = Outcome.UNKNOWN,
         actual_filled_quantity: Decimal | None = None,
         remainder_reason: str = "",
+        actual_source_filled_quantity: Decimal | None = None,
+        actual_receiver_filled_quantity: Decimal | None = None,
     ) -> SeriesResult:
         return SeriesResult(
             outcome=outcome,
@@ -953,6 +1412,8 @@ class RobinhoodSeriesEngine:
             actual_filled_quantity=actual_filled_quantity,
             reason=reason,
             remainder_reason=remainder_reason,
+            actual_source_filled_quantity=actual_source_filled_quantity,
+            actual_receiver_filled_quantity=actual_receiver_filled_quantity,
         )
 
     @staticmethod

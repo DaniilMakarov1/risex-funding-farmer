@@ -5,6 +5,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+import risex_spread_shadow.hood_handoff.series as series_module
 
 from risex_spread_shadow.hood_handoff import (
     AccountSnapshot,
@@ -13,12 +14,15 @@ from risex_spread_shadow.hood_handoff import (
     Direction,
     DurableJournal,
     HandoffConfig,
+    HandoffResult,
     HistoryPage,
+    LegReconciliation,
     MarketMetadata,
     MutationReceipt,
     OrderBookSnapshot,
     OrderSnapshot,
     Outcome,
+    Phase,
     PreflightBlocked,
     RobinhoodSeriesEngine,
     LighterSdkClient,
@@ -496,3 +500,179 @@ async def test_sdk_order_book_uses_required_bounded_limit(monkeypatch):
     snapshot = await client.order_book(1)
     assert snapshot.symbol == "BTC"
     assert ExactOrderApi.calls == [(1, ROBINHOOD_ORDER_BOOK_LIMIT, 1)]
+
+
+@pytest.mark.asyncio
+async def test_restart_reconciles_persisted_effective_bound_without_new_mutation(tmp_path):
+    class Crash(BaseException):
+        pass
+
+    class CrashAfterReceiver(SeriesClient):
+        def __init__(self):
+            super().__init__([book(("100.5", "1.0"))])
+            self.crash = True
+            self.cancel_calls = 0
+
+        async def submit_order(self, plan):
+            receipt = await super().submit_order(plan)
+            if not plan.reduce_only and self.crash:
+                self.crash = False
+                raise Crash()
+            return receipt
+
+        async def cancel_order(self, account_index, market_id, order_id):
+            self.cancel_calls += 1
+            return await super().cancel_order(account_index, market_id, order_id)
+
+    config = series_config(
+        tmp_path / "restart-effective-bound.jsonl",
+        allowed_price_deviation=Decimal("0.01"),
+        receiver_worst_price=Decimal("105"),
+    )
+    client = CrashAfterReceiver()
+    with pytest.raises(Crash):
+        await run_series(config, client, clock=Clock())
+    before_posts = len(client.submissions)
+    before_cancels = client.cancel_calls
+    assert client.submissions[1].price == Decimal("101.0")
+
+    recovered = await run_series(config, client, clock=Clock())
+    assert recovered.outcome is Outcome.UNKNOWN
+    assert recovered.actual_filled_quantity == Decimal("0.5")
+    assert recovered.actual_source_filled_quantity == Decimal("0.5")
+    assert recovered.actual_receiver_filled_quantity == Decimal("0.5")
+    assert recovered.children and recovered.children[0].source is not None
+    assert recovered.children[0].receiver is not None
+    assert len(client.submissions) == before_posts
+    assert client.cancel_calls == before_cancels
+
+
+@pytest.mark.asyncio
+async def test_completed_restart_preserves_series_identity_and_totals(tmp_path):
+    config = series_config(tmp_path / "completed-restart.jsonl")
+    client = SeriesClient([book(("100.5", "1.0"))])
+    first = await run_series(config, client, clock=Clock())
+    before_posts = len(client.submissions)
+    second = await run_series(config, client, clock=Clock())
+
+    assert first.outcome is Outcome.SUCCESS
+    assert second.outcome is Outcome.UNKNOWN
+    assert second.series_id == first.series_id
+    assert second.market_id == 1
+    assert second.completed_quantity == Decimal("1.0")
+    assert second.remaining_quantity == Decimal("0")
+    assert second.actual_filled_quantity == Decimal("1.0")
+    assert second.actual_source_filled_quantity == Decimal("1.0")
+    assert second.actual_receiver_filled_quantity == Decimal("1.0")
+    assert len(client.submissions) == before_posts
+
+
+@pytest.mark.asyncio
+async def test_partial_child_reports_cumulative_proven_leg_quantities(tmp_path, monkeypatch):
+    config = series_config(tmp_path / "partial-cumulative.jsonl")
+    client = SeriesClient([book(("100.5", "1.0")), book(("100.5", "1.0"))])
+    original_run_handoff = series_module.run_handoff
+    calls = 0
+
+    def leg(account_index, quantity, order_id):
+        return LegReconciliation(
+            account_index=account_index,
+            order_id=order_id,
+            trades=(
+                TradeReceipt(
+                    trade_id=f"trade-{order_id}",
+                    account_index=account_index,
+                    market_id=1,
+                    order_id=order_id,
+                    side="SELL" if account_index == 11 else "BUY",
+                    quantity=quantity,
+                    price=Decimal("100"),
+                    fee=None,
+                    counterparty_account_index=22 if account_index == 11 else 11,
+                    observed_at=NOW,
+                ),
+            ),
+            position_before=Decimal("0"),
+            position_after=Decimal("0"),
+            order=None,
+            history_complete=True,
+        )
+
+    async def fake_run_handoff(child_config, child_client, *, clock):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return await original_run_handoff(child_config, child_client, clock=clock)
+        return HandoffResult(
+            outcome=Outcome.PARTIAL,
+            phase=Phase.RECONCILIATION,
+            run_id="partial-child",
+            plan=None,
+            source=leg(11, Decimal("0.2"), "partial-source"),
+            receiver=leg(22, Decimal("0.1"), "partial-receiver"),
+            reason="receiver partial",
+            unknown_reasons=("receiver partial",),
+        )
+
+    monkeypatch.setattr(series_module, "run_handoff", fake_run_handoff)
+    result = await run_series(config, client, clock=Clock())
+
+    assert result.outcome is Outcome.PARTIAL
+    assert result.completed_quantity == Decimal("0.5")
+    assert result.actual_source_filled_quantity == Decimal("0.7")
+    assert result.actual_receiver_filled_quantity == Decimal("0.6")
+    assert result.actual_filled_quantity == Decimal("0.6")
+
+
+@pytest.mark.asyncio
+async def test_mapping_book_preserves_observation_and_identity(tmp_path):
+    class MappingClient(SeriesClient):
+        def __init__(self, payload):
+            super().__init__([book(("100.5", "1.0"))])
+            self.payload = payload
+
+        async def order_book(self, market_id):
+            return self.payload
+
+    stale = book(("100.5", "1.0"), observed_at=NOW - 100).as_dict()
+    stale_client = MappingClient(stale)
+    stale_result = await run_series(
+        series_config(tmp_path / "stale-mapping.jsonl", freshness_seconds=10),
+        stale_client,
+        clock=Clock(),
+    )
+    assert stale_result.outcome is Outcome.UNKNOWN
+    assert stale_result.reason == "contract_error"
+    assert stale_client.submissions == []
+
+    future = dict(book(("100.5", "1.0"), observed_at=NOW + 1).as_dict())
+    future_client = MappingClient(future)
+    future_result = await run_series(
+        series_config(tmp_path / "future-mapping.jsonl"),
+        future_client,
+        clock=Clock(),
+    )
+    assert future_result.outcome is Outcome.UNKNOWN
+    assert future_client.submissions == []
+
+    contradictory = dict(book(("100.5", "1.0")).as_dict())
+    contradictory["symbol"] = "ETH"
+    contradictory_client = MappingClient(contradictory)
+    contradictory_result = await run_series(
+        series_config(tmp_path / "contradictory-mapping.jsonl"),
+        contradictory_client,
+        clock=Clock(),
+    )
+    assert contradictory_result.outcome is Outcome.UNKNOWN
+    assert contradictory_client.submissions == []
+
+    missing_timestamp = dict(book(("100.5", "1.0")).as_dict())
+    del missing_timestamp["observed_at"]
+    missing_client = MappingClient(missing_timestamp)
+    missing_result = await run_series(
+        series_config(tmp_path / "missing-timestamp.jsonl"),
+        missing_client,
+        clock=Clock(),
+    )
+    assert missing_result.outcome is Outcome.UNKNOWN
+    assert missing_client.submissions == []
