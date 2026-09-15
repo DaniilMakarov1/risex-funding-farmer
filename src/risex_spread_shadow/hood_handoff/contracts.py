@@ -16,6 +16,12 @@ from urllib.parse import urlsplit
 
 OFFICIAL_MAINNET_API_URL = "https://mainnet.zklighter.elliot.ai"
 OFFICIAL_MAINNET_CHAIN_ID = 304
+OFFICIAL_ROBINHOOD_API_URL = "https://api.rh.lighter.xyz"
+OFFICIAL_ROBINHOOD_CHAIN_ID = 466324
+ROBINHOOD_WEBSITE_URL = "https://robinhoodchain.lighter.xyz"
+# Initial public compatibility targets.  Runtime configuration remains
+# open-ended and must resolve the exact current perpetual catalog entry.
+ROBINHOOD_PERPETUAL_SYMBOLS = frozenset({"BTC", "ETH"})
 SUPPORTED_TIME_IN_FORCE = frozenset({"IOC", "GTT", "POST_ONLY"})
 SUPPORTED_ORDER_TYPES = frozenset({"LIMIT", "MARKET"})
 
@@ -241,6 +247,8 @@ class MarketMetadata:
     receiver_fee_rate: Decimal | None
     observed_at: float
     margin_evidence: str = ""
+    market_type: str = "perp"
+    venue: str = ""
 
     def __post_init__(self) -> None:
         _int(self.market_id, "market_id", minimum=0)
@@ -256,6 +264,14 @@ class MarketMetadata:
             _nonnegative(self.receiver_fee_rate, "receiver_fee_rate")
         _timestamp(self.observed_at, "observed_at")
         _text(self.margin_evidence, "margin_evidence")
+        market_type = _text(self.market_type, "market_type").lower()
+        if market_type != "perp":
+            raise ContractError("market_type must be perp")
+        object.__setattr__(self, "market_type", market_type)
+        if self.venue in (None, ""):
+            object.__setattr__(self, "venue", "")
+        else:
+            object.__setattr__(self, "venue", _text(self.venue, "venue").lower())
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "MarketMetadata":
@@ -293,6 +309,12 @@ class MarketMetadata:
             ),
             observed_at=_timestamp(value.get("observed_at"), "observed_at"),
             margin_evidence=_text(value.get("margin_evidence"), "margin_evidence"),
+            market_type=_text(value.get("market_type", "perp"), "market_type").lower(),
+            venue=(
+                ""
+                if value.get("venue") in (None, "")
+                else _text(value.get("venue"), "venue").lower()
+            ),
         )
 
 
@@ -658,10 +680,8 @@ class HandoffConfig:
         object.__setattr__(self, "market_symbol", market_symbol)
         environment = _text(self.environment, "environment").lower()
         object.__setattr__(self, "environment", environment)
-        if market_symbol != "HOOD":
-            raise ContractError("only HOOD is supported")
-        if environment not in {"mainnet", "production"}:
-            raise ContractError("environment must be the future user-operated production venue")
+        if environment not in {"mainnet", "production", "robinhood"}:
+            raise ContractError("environment must be mainnet, production, or robinhood")
         if not isinstance(self.operator_execution_opt_in, bool):
             raise ContractError("operator_execution_opt_in must be bool")
         if not isinstance(self.operator_plan_reviewed, bool):
@@ -670,25 +690,54 @@ class HandoffConfig:
             _int(self.api_key_index, "api_key_index", minimum=4)
             if self.api_key_index > 254:
                 raise ContractError("api_key_index must be in 4..254")
-        if self.api_base_url is None:
-            if self.operator_execution_opt_in:
-                raise ContractError("api_base_url is required for execution")
+        if environment == "robinhood":
+            # The configured symbol is intentionally open-ended.  The current
+            # public catalog must prove its exact perpetual identity at
+            # runtime; BTC/ETH are only the initial compatibility targets.
+            if self.api_base_url is None:
+                if self.operator_execution_opt_in:
+                    raise ContractError("api_base_url is required for Robinhood execution")
+            else:
+                parsed = urlsplit(self.api_base_url)
+                normalized_url = self.api_base_url.rstrip("/")
+                if (
+                    normalized_url != OFFICIAL_ROBINHOOD_API_URL
+                    or parsed.scheme != "https"
+                    or parsed.netloc != "api.rh.lighter.xyz"
+                    or parsed.username is not None
+                    or parsed.password is not None
+                    or parsed.query
+                    or parsed.fragment
+                    or parsed.path not in {"", "/"}
+                ):
+                    raise ContractError("api_base_url must be the exact Robinhood Chain Lighter endpoint")
+                object.__setattr__(self, "api_base_url", normalized_url)
+            if self.chain_id != OFFICIAL_ROBINHOOD_CHAIN_ID:
+                raise ContractError("chain_id must be Robinhood signing domain 466324")
         else:
-            parsed = urlsplit(self.api_base_url)
-            normalized_url = self.api_base_url.rstrip("/")
-            if (
-                normalized_url != OFFICIAL_MAINNET_API_URL
-                or parsed.scheme != "https"
-                or parsed.netloc != "mainnet.zklighter.elliot.ai"
-                or parsed.username is not None
-                or parsed.password is not None
-                or parsed.query
-                or parsed.fragment
-                or parsed.path not in {"", "/"}
-            ):
-                raise ContractError("api_base_url must be the exact official Lighter mainnet endpoint")
-            object.__setattr__(self, "api_base_url", normalized_url)
-        if self.chain_id is None or self.chain_id != OFFICIAL_MAINNET_CHAIN_ID:
+            if market_symbol != "HOOD":
+                raise ContractError("only HOOD is supported")
+            if self.api_base_url is None:
+                if self.operator_execution_opt_in:
+                    raise ContractError("api_base_url is required for execution")
+            else:
+                parsed = urlsplit(self.api_base_url)
+                normalized_url = self.api_base_url.rstrip("/")
+                if (
+                    normalized_url != OFFICIAL_MAINNET_API_URL
+                    or parsed.scheme != "https"
+                    or parsed.netloc != "mainnet.zklighter.elliot.ai"
+                    or parsed.username is not None
+                    or parsed.password is not None
+                    or parsed.query
+                    or parsed.fragment
+                    or parsed.path not in {"", "/"}
+                ):
+                    raise ContractError("api_base_url must be the exact official Lighter mainnet endpoint")
+                object.__setattr__(self, "api_base_url", normalized_url)
+        if self.chain_id is None:
+            raise ContractError("chain_id is required")
+        if environment != "robinhood" and self.chain_id != OFFICIAL_MAINNET_CHAIN_ID:
             raise ContractError("chain_id must be official Lighter mainnet chain 304")
         _int(self.chain_id, "chain_id", minimum=0)
         _int(self.auth_token_lifetime_seconds, "auth_token_lifetime_seconds", minimum=60)
@@ -703,12 +752,17 @@ class HandoffConfig:
         )
 
     def validate_against(self, metadata: MarketMetadata, source: AccountSnapshot, receiver: AccountSnapshot, now: float) -> None:
+        market_label = self.market_symbol.upper()
         if metadata.market_id != self.market_id or source.market_id != self.market_id or receiver.market_id != self.market_id:
-            raise PreflightBlocked("market identity does not match configured HOOD market")
-        if metadata.symbol.upper() != "HOOD":
-            raise PreflightBlocked("market identity is not HOOD")
+            raise PreflightBlocked(f"market identity does not match configured {market_label} market")
+        if metadata.symbol.upper() != market_label:
+            raise PreflightBlocked(f"market identity is not {market_label}")
+        if metadata.market_type.lower() != "perp":
+            raise PreflightBlocked("market identity is not a perpetual")
+        if self.environment == "robinhood" and metadata.venue.lower() not in {"", "robinhood", "robinhood-chain"}:
+            raise PreflightBlocked("market identity is from the wrong venue")
         if metadata.status.lower() not in {"active", "open", "online", "listed"}:
-            raise PreflightBlocked("HOOD market is not active")
+            raise PreflightBlocked(f"{market_label} market is not active")
         try:
             quantity_int, _, _ = self.integer_order_values(metadata)
         except ContractError as exc:
@@ -1104,6 +1158,12 @@ __all__ = [
     "Outcome",
     "Phase",
     "PreflightBlocked",
+    "OFFICIAL_MAINNET_API_URL",
+    "OFFICIAL_MAINNET_CHAIN_ID",
+    "OFFICIAL_ROBINHOOD_API_URL",
+    "OFFICIAL_ROBINHOOD_CHAIN_ID",
+    "ROBINHOOD_PERPETUAL_SYMBOLS",
+    "ROBINHOOD_WEBSITE_URL",
     "TERMINAL_ORDER_STATUSES",
     "TradeReceipt",
     "decimal_to_integer",

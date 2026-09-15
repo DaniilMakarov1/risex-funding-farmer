@@ -35,6 +35,9 @@ from .journal import sanitize_exception
 
 
 REQUIRED_LIGHTER_SDK_VERSION = "1.1.2"
+# The official orderBookOrders endpoint requires a bounded page size.  This is
+# a transport/read bound only; slice quantity remains operator/depth-driven.
+ROBINHOOD_ORDER_BOOK_LIMIT = 250
 
 
 class SecretProvider(Protocol):
@@ -329,7 +332,7 @@ class LighterSdkClient:
         )
         raw_details = _model_dict(details)
         _require_success_code(raw_details, "orderBookDetails")
-        observed = _select_perp_market(raw_details, market_id)
+        observed = _select_perp_market(raw_details, market_id, expected_symbol=self.config.market_symbol)
         evidence = dict(self.market_evidence)
         try:
             evidence_market_id = int(evidence.get("market_id", market_id))
@@ -347,7 +350,10 @@ class LighterSdkClient:
         if "symbol" in observed and "symbol" in evidence and str(observed["symbol"]).upper() != str(evidence["symbol"]).upper():
             raise ContractError("market evidence conflicts with orderBookDetails symbol")
         evidence.setdefault("market_id", market_id)
-        evidence.setdefault("symbol", "HOOD")
+        evidence.setdefault("symbol", self.config.market_symbol)
+        evidence.setdefault("market_type", "perp")
+        if self.config.environment == "robinhood":
+            evidence.setdefault("venue", "robinhood")
         if "observed_at" not in evidence:
             raise ContractError("market evidence must include its original observed_at timestamp")
         # Do not infer status/fees/precision/minimums from undocumented SDK
@@ -365,6 +371,104 @@ class LighterSdkClient:
                     raise ContractError(f"market evidence conflicts with orderBookDetails {source}")
                 evidence[target] = observed[source]
         return MarketMetadata.from_mapping(evidence)
+
+    async def resolve_market(self, symbol: str) -> MarketMetadata:
+        """Resolve the current Robinhood perp ID from the official catalog.
+
+        The resolver is only available for the explicit Robinhood deployment;
+        it never queries or falls back to ordinary Lighter mainnet.
+        """
+
+        requested = str(symbol).strip().upper()
+        if self.config.environment != "robinhood":
+            raise ContractError("symbol resolution is only available for Robinhood Chain")
+        module = self._lighter()
+        api = module.OrderApi(self._generated_api_client(module))
+        details = await self._bounded(
+            _await(
+                api.order_book_details(
+                    filter="perp",
+                    _request_timeout=self.config.request_timeout_seconds,
+                )
+            ),
+            time.monotonic() + self.config.request_timeout_seconds,
+            "Robinhood orderBookDetails catalog read",
+        )
+        payload = _model_dict(details)
+        _require_success_code(payload, "orderBookDetails")
+        observed = _select_perp_market_by_symbol(payload, requested)
+        evidence = dict(self.market_evidence)
+        if "observed_at" not in evidence:
+            raise ContractError("market evidence must include its original observed_at timestamp")
+        if "market_id" in evidence:
+            try:
+                evidence_market_id = int(evidence["market_id"])
+            except (TypeError, ValueError) as exc:
+                raise ContractError("market evidence has no valid market_id") from exc
+            if evidence_market_id != int(observed["market_id"]):
+                raise ContractError("market evidence market_id conflicts with symbol resolution")
+        if "symbol" in evidence and str(evidence["symbol"]).upper() != requested:
+            raise ContractError("market evidence symbol conflicts with symbol resolution")
+        evidence.setdefault("market_id", int(observed["market_id"]))
+        evidence.setdefault("symbol", requested)
+        evidence.setdefault("market_type", "perp")
+        evidence.setdefault("venue", "robinhood")
+        aliases = {
+            "status": "status",
+            "price_decimals": "supported_price_decimals",
+            "size_decimals": "supported_size_decimals",
+            "minimum_base_amount": "min_base_amount",
+            "minimum_quote_amount": "min_quote_amount",
+        }
+        for target, source in aliases.items():
+            if source in observed:
+                if target in evidence and str(evidence[target]) != str(observed[source]):
+                    raise ContractError(f"market evidence conflicts with orderBookDetails {source}")
+                evidence[target] = observed[source]
+        return MarketMetadata.from_mapping(evidence)
+
+    async def resolve_perpetual_market(self, symbol: str) -> MarketMetadata:
+        """Compatibility alias for callers that name the perp explicitly."""
+
+        return await self.resolve_market(symbol)
+
+    async def order_book(self, market_id: int) -> Any:
+        """Read one official public orderBookOrders snapshot.
+
+        The Robinhood response has no reliable venue timestamp, so freshness
+        is bound to this request observation time.  ``transaction_time`` from
+        individual orders is intentionally not used as a book timestamp.
+        """
+
+        if self.config.environment != "robinhood":
+            raise ContractError("Robinhood order-book reads require the Robinhood deployment")
+        module = self._lighter()
+        api = module.OrderApi(self._generated_api_client(module))
+        payload_raw = await self._bounded(
+            _await(
+                api.order_book_orders(
+                    market_id=market_id,
+                    limit=ROBINHOOD_ORDER_BOOK_LIMIT,
+                    _request_timeout=self.config.request_timeout_seconds,
+                )
+            ),
+            time.monotonic() + self.config.request_timeout_seconds,
+            "Robinhood orderBookOrders read",
+        )
+        payload = _model_dict(payload_raw)
+        _require_success_code(payload, "orderBookOrders")
+        from .series import OrderBookSnapshot
+
+        return OrderBookSnapshot.from_mapping(
+            payload,
+            market_id=market_id,
+            symbol=self.config.market_symbol,
+            observed_at=self._clock(),
+            venue="robinhood",
+        )
+
+    async def order_book_snapshot(self, market_id: int) -> Any:
+        return await self.order_book(market_id)
 
     async def account_snapshot(self, account_index: int, market_id: int) -> AccountSnapshot:
         module = self._lighter()
@@ -806,7 +910,12 @@ def _require_success_code(payload: Mapping[str, Any], label: str) -> None:
         raise ContractError(f"{label} response was not successful")
 
 
-def _select_perp_market(payload: Mapping[str, Any], market_id: int) -> dict[str, Any]:
+def _select_perp_market(
+    payload: Mapping[str, Any],
+    market_id: int,
+    *,
+    expected_symbol: str = "HOOD",
+) -> dict[str, Any]:
     values = payload.get("order_book_details")
     if not isinstance(values, (list, tuple)):
         raise ContractError("orderBookDetails response lacks order_book_details")
@@ -823,10 +932,35 @@ def _select_perp_market(payload: Mapping[str, Any], market_id: int) -> dict[str,
             symbol = candidate.get("symbol")
             if not isinstance(symbol, str) or not symbol.strip():
                 raise ContractError("orderBookDetails market identity lacks symbol")
-            if symbol.strip().upper() != "HOOD":
-                raise ContractError("orderBookDetails market identity is not HOOD")
+            if symbol.strip().upper() != expected_symbol.strip().upper():
+                raise ContractError(
+                    f"orderBookDetails market identity is not {expected_symbol.strip().upper()}"
+                )
             return candidate
-    raise ContractError("orderBookDetails response lacks the requested HOOD market")
+    raise ContractError(
+        f"orderBookDetails response lacks the requested {expected_symbol.strip().upper()} market"
+    )
+
+
+def _select_perp_market_by_symbol(payload: Mapping[str, Any], symbol: str) -> dict[str, Any]:
+    values = payload.get("order_book_details")
+    if not isinstance(values, (list, tuple)):
+        raise ContractError("orderBookDetails response lacks order_book_details")
+    expected = symbol.strip().upper()
+    for item in values:
+        candidate = _model_dict(item)
+        candidate_symbol = candidate.get("symbol")
+        if not isinstance(candidate_symbol, str) or candidate_symbol.strip().upper() != expected:
+            continue
+        market_type = candidate.get("market_type")
+        if not isinstance(market_type, str) or market_type.strip().lower() != "perp":
+            raise ContractError("orderBookDetails symbol resolved to a non-perpetual market")
+        try:
+            candidate["market_id"] = int(candidate["market_id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ContractError("orderBookDetails market identity has no valid market_id") from exc
+        return candidate
+    raise ContractError(f"orderBookDetails response lacks the requested {expected} perpetual")
 
 
 def _safe_text(value: Any) -> str | None:
@@ -842,6 +976,7 @@ __all__ = [
     "LighterSdkClient",
     "MissingSdkError",
     "PlainAioHttp",
+    "ROBINHOOD_ORDER_BOOK_LIMIT",
     "REQUIRED_LIGHTER_SDK_VERSION",
     "SecretProvider",
     "SdkVersionError",
