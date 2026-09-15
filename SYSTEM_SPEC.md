@@ -3,9 +3,9 @@
 SYSTEM_SPEC_VERSION = 4.0
 SPEC_STATUS = FIRST_RAW_RESEARCH_SCANNER_IMPLEMENTED
 
-## HCR-3 amendment — paired opening (in development)
+## HCR-3 amendment — paired opening (accepted offline)
 
-Owner explicitly authorizes an additional mode from initially flat funded accounts: A posts a non-reduce-only SELL LIMIT POST_ONLY opening SHORT; B submits non-reduce-only BUY MARKET IOC opening LONG. This mode does not transfer collateral or preserve an earlier position. It retains sequential variable slices, exact expected opposite position deltas, opening margin for both accounts, bounded prices/freshness/deadlines, durable receipts and no replay. Only independently proven paired success allows another slice. Distinguish operation mode in all bindings and outputs. Existing close/reopen stays the default; its source reduce-only requirement is unchanged. NEXT_TASK defines finite implementation/review criteria. Agents do not execute live trades.
+Accepted candidate 2b06a7b09109c2101e722103b93dc007e31fcdb9; final clean isolated suite4312 passed,3 skipped, live NOT_RUN. Owner explicitly authorizes an additional mode from initially flat funded accounts: A posts a non-reduce-only SELL LIMIT POST_ONLY opening SHORT; B submits non-reduce-only BUY MARKET IOC opening LONG. This mode does not transfer collateral or preserve an earlier position. It retains sequential variable slices, exact expected opposite position deltas, opening margin for both accounts, bounded prices/freshness/deadlines, durable receipts and no replay. Only independently proven paired success allows another slice. Distinguish operation mode in all bindings and outputs. Existing close/reopen stays the default; its source reduce-only requirement is unchanged. NEXT_TASK defines finite implementation/review criteria. Agents do not execute live trades.
 
 ## HCR-2 amendment — configurable Robinhood perpetual slices (2026-09-15)
 

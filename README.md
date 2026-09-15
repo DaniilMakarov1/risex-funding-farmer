@@ -1,6 +1,36 @@
 # RISEx Spread Shadow and legacy Funding Farmer
 
 
+## Open opposite positions from balances — HCR-3
+
+The new `PAIRED_OPENING` operation opens opposite perpetual positions from initially flat selected-market positions. It is separate from the default `CLOSE_REOPEN` operation, which still requires an existing source position. It does not transfer collateral, guarantee counterparty matching, or automatically close the resulting positions. The receiver needs its own collateral, and both legs require current opening-margin evidence. Accepted offline candidate `2b06a7b09109c2101e722103b93dc007e31fcdb9`: final clean isolated Python3.11 suite4312 passed,3 skipped; real account/signing/order execution remains NOT_RUN.
+
+Use the complete Robinhood series configuration below and set these fields explicitly:
+
+```json
+{
+  "mode": "series",
+  "operation_mode": "PAIRED_OPENING",
+  "market_symbol": "BTC",
+  "direction": "LONG"
+}
+```
+
+This is a configuration fragment, not a complete runnable file. Keep all required total/slice units, prices, deviation, timing bounds and unique private journal path from the full template. Use `operation_mode` for the operation and `mode: "series"` for sequential slicing; do not confuse these two fields. Omit `operation_mode` or set `CLOSE_REOPEN` to retain the older behavior.
+
+| Receiver direction | Account A: maker limit | Account B: market IOC | Final positions after full Q |
+| --- | --- | --- | --- |
+| LONG | SELL, POST_ONLY, reduce-only false | BUY, reduce-only false | A SHORT Q; B LONG Q |
+| SHORT | BUY, POST_ONLY, reduce-only false | SELL, reduce-only false | A LONG Q; B SHORT Q |
+
+The owner's selected orientation is receiver LONG: A27331 opens SHORT and B27337 opens LONG. Both use API key index4 with separate keys entered locally; do not place keys in this file or chat. Before the first slice both selected-market positions must be exactly zero and readiness must be proven. Later slices may increase only the exact positions established by the previously completed children. Internal `expected_source_position`/`expected_receiver_position` fields are not operator settings and are rejected in JSON.
+
+The requested first test is roughly10–15USD of BTC exposure per leg, not margin or transferred balance. No current executable BTC quantity or prices have been selected. Quantity inputs are BTC units; check current price, size step and minimums before converting the desired notional. Do not round up beyond the chosen exposure simply to satisfy a minimum. The slice logic, price bounds and stop/reconciliation behavior described below still apply. Source filling before B's admission blocks B; market matching and cancellation can race, leaving unequal positions that require operator attention. The program does not automatically compensate or close those positions.
+
+Preview uses the same offline command with source account27331 and receiver account27337; it reports `operation_mode: PAIRED_OPENING`. Series live execution still requires the three explicit flags documented below. An ordinary terminal prompt is not a key-entry form. Hidden key input appears only when the operator-run program actually requests each key from an interactive TTY. There is no running secret-input process and no need to paste keys before that prompt exists.
+
+Existing journals remain bound to their original source/configuration and must be preserved. A journal from a previous release cannot be assumed restart-compatible after this source change; resolve it with its original implementation rather than changing/removing bindings. Mode changes block reuse. Known recovered fills and parent completed-slice quantity can differ after a crash; remaining quantity is not a retry instruction.
+
 ## Robinhood Chain configurable perpetual series — HCR-2
 
 Accepted offline and public-adapter verified (2026-09-15), candidate `393a17c01c73aced1735656c87ef9b4653b96653`: clean isolated Python 3.11 suite 4303 passed, 3 skipped. Real account/signing/order execution remains NOT_RUN. The older HCR-1 command below targets ordinary Lighter mainnet; use the Robinhood series configuration in this section for the requested deployment.

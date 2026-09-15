@@ -1,6 +1,12 @@
 # Current status
 
-HCR-3 paired opening is CHANGES_REQUESTED at candidate3cd0af4ea1c886eee354c3ba4063b2f217518ec0: reproduced operator-field bypass of initial-flat requirement and missing distinguishing adapter/restart/adverse verification. Full review packet in root spread-shadow-runs/hood-paired-open-20260915/chief-review-v1; same fresh Builder corrects and delivers directly. Owner confirmed SHORT A / LONG B from flat balances. Previous Builder was interrupted before HCR-3 implementation and is stopped. Fresh-context Builder will receive the same bounded assignment; direct result delivery and verified sidebar visibility required, no periodic monitoring. HCR-2 below remains the accepted base, not proof of new-mode readiness. No live keys/accounts/signing/orders used.
+## HCR-3 paired opening — ACCEPTED OFFLINE
+
+Candidate2b06a7b09109c2101e722103b93dc007e31fcdb9 adds explicit PAIRED_OPENING from initially flat accounts: maker opens opposite receiver position, both non-reduce-only. Existing CLOSE_REOPEN remains default. Owner-selected setup is BTC, A27331 SHORT / B27337 LONG, about10–15USD per leg; exact current BTC quantity/prices/time bounds and margin evidence not selected or verified. Live accounts/credentials/signatures/orders NOT_RUN.
+
+Chief independently reviewed complete initial/correction diffs, reproduced and verified correction of operator-position override bypass, and ran four complete series-through-real-adapter/fake-signer cases (both directions, success and crash after second receiver mutation followed by repeated reconciliation). Exact .50 opposite positions,4 fake submissions/no replay, mode/chain/quantity/flags verified. Final fresh isolated Python3.11.5 full suite4312 passed,3 skipped,exit0,130.77s; imported source and before/after hashes verified. Root evidence: spread-shadow-runs/hood-paired-open-20260915/chief-final-v1 (review.md, final-manifest.json, full-final.*, independent_probe_v4.py/probe-v4.*). Earlier fixture failures and original unaccepted3cd0af4 preserved. Builder correction-v2 raw packet under its worktree verified against actual source.
+
+Fresh Builder native01a0a508-a914-73b2-b727-c56cfed5e0ab delivered result directly; complete, no standing polling or live process. Chief remains root01a096cf-96fc-7f02-b2bb-8bb0a92b8f09, sole integration owner. Native task navigation succeeded, permanent sidebar listing remains unverified despite pin success; do not claim permanent visibility. Builder branch/worktree preserved. HCR-2 public compatibility evidence remains historical; no new public requests made.
 
 ## HCR-2 configurable Robinhood perpetual series — ACCEPTED
 
