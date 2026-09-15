@@ -26,6 +26,7 @@ from .contracts import (
     OFFICIAL_ROBINHOOD_API_URL,
     OFFICIAL_ROBINHOOD_CHAIN_ID,
     Outcome,
+    OperationMode,
     PreflightBlocked,
 )
 from .engine import Clock, SystemClock, run_handoff
@@ -268,6 +269,8 @@ class RobinhoodSeriesConfig:
     auth_token_lifetime_seconds: int = 600
     operator_execution_opt_in: bool = False
     operator_plan_reviewed: bool = False
+    operation_mode: OperationMode | str = OperationMode.CLOSE_REOPEN
+    mode: OperationMode | str | None = None
 
     def __post_init__(self) -> None:
         symbol = _text(self.market_symbol, "market_symbol").upper()
@@ -277,6 +280,15 @@ class RobinhoodSeriesConfig:
         except (TypeError, ValueError) as exc:
             raise ContractError("direction must be LONG or SHORT") from exc
         object.__setattr__(self, "direction", direction)
+        operation_mode = OperationMode.parse(self.operation_mode)
+        if self.mode is not None:
+            mode_value = OperationMode.parse(self.mode)
+            if operation_mode is not OperationMode.CLOSE_REOPEN and operation_mode is not mode_value:
+                raise ContractError("mode conflicts with operation_mode")
+            operation_mode = mode_value
+        object.__setattr__(self, "operation_mode", operation_mode)
+        if self.mode is not None:
+            object.__setattr__(self, "mode", operation_mode)
         for field_name in (
             "total_quantity",
             "desired_slice_quantity",
@@ -326,6 +338,8 @@ class RobinhoodSeriesConfig:
         quantity: Decimal,
         journal_path: str,
         receiver_worst_price: Decimal | None = None,
+        expected_source_position: Decimal | None = None,
+        expected_receiver_position: Decimal | None = None,
     ) -> HandoffConfig:
         """Create an exact HCR-1 child configuration for one slice."""
 
@@ -356,6 +370,9 @@ class RobinhoodSeriesConfig:
             api_key_index=self.api_key_index,
             chain_id=OFFICIAL_ROBINHOOD_CHAIN_ID,
             auth_token_lifetime_seconds=self.auth_token_lifetime_seconds,
+            operation_mode=self.operation_mode,
+            expected_source_position=expected_source_position,
+            expected_receiver_position=expected_receiver_position,
         )
 
     def binding(
@@ -373,6 +390,8 @@ class RobinhoodSeriesConfig:
             "market_symbol": self.market_symbol,
             "market_id": self.market_id if resolved_market_id is None else resolved_market_id,
             "direction": self.direction.value,
+            "operation_mode": self.operation_mode.value,
+            "mode": self.operation_mode.value,
             "total_quantity": format(self.total_quantity, "f"),
             "desired_slice_quantity": format(self.desired_slice_quantity, "f"),
             "allowed_price_deviation": format(self.allowed_price_deviation, "f"),
@@ -503,11 +522,16 @@ class SeriesResult:
     remainder_reason: str = ""
     actual_source_filled_quantity: Decimal | None = None
     actual_receiver_filled_quantity: Decimal | None = None
+    operation_mode: OperationMode | str = OperationMode.CLOSE_REOPEN
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "operation_mode", OperationMode.parse(self.operation_mode))
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "outcome": self.outcome.value,
             "series_id": self.series_id,
+            "operation_mode": self.operation_mode.value,
             "market_symbol": self.market_symbol,
             "market_id": self.market_id,
             "target_quantity": format(self.target_quantity, "f"),
@@ -768,6 +792,16 @@ class RobinhoodSeriesEngine:
                 quantity=sizing.rounded_quantity,
                 journal_path=child_path,
                 receiver_worst_price=sizing.effective_receiver_price,
+                expected_source_position=(
+                    expected_source
+                    if config.operation_mode is OperationMode.PAIRED_OPENING
+                    else None
+                ),
+                expected_receiver_position=(
+                    expected_receiver
+                    if config.operation_mode is OperationMode.PAIRED_OPENING
+                    else None
+                ),
             )
             parent.append(
                 "CHILD_INTENT",
@@ -776,6 +810,7 @@ class RobinhoodSeriesEngine:
                     "child_journal_path": child_path,
                     "market_id": metadata.market_id,
                     "symbol": metadata.symbol,
+                    "operation_mode": config.operation_mode.value,
                     "quantity": format(sizing.rounded_quantity, "f"),
                     "remaining_before": format(remaining, "f"),
                     "source_position_before": format(expected_source, "f"),
@@ -797,6 +832,7 @@ class RobinhoodSeriesEngine:
                     "receiver_order_id": None if child.receiver is None else child.receiver.order_id,
                     "source_filled_quantity": self._journal_leg_quantity(child.source),
                     "receiver_filled_quantity": self._journal_leg_quantity(child.receiver),
+                    "operation_mode": config.operation_mode.value,
                     "source_history_complete": None if child.source is None else child.source.history_complete,
                     "receiver_history_complete": None if child.receiver is None else child.receiver.history_complete,
                     "unknown_reasons": list(child.unknown_reasons),
@@ -852,6 +888,7 @@ class RobinhoodSeriesEngine:
                     "receiver_position_after": format(expected_receiver, "f"),
                     "source_filled_quantity": format(sizing.rounded_quantity, "f"),
                     "receiver_filled_quantity": format(sizing.rounded_quantity, "f"),
+                    "operation_mode": config.operation_mode.value,
                 },
             )
             child_index += 1
@@ -859,6 +896,7 @@ class RobinhoodSeriesEngine:
             "SERIES_COMPLETE",
             {
                 "outcome": Outcome.SUCCESS.value,
+                "operation_mode": config.operation_mode.value,
                 "completed_quantity": format(completed, "f"),
                 "market_id": metadata.market_id,
                 "symbol": metadata.symbol,
@@ -884,6 +922,8 @@ class RobinhoodSeriesEngine:
             "market_id": config.market_id,
             "market_symbol": config.market_symbol,
             "direction": config.direction.value,
+            "operation_mode": config.operation_mode.value,
+            "mode": config.operation_mode.value,
             "quantity": format(config.quantity, "f"),
             "source_limit_price": format(config.source_limit_price, "f"),
             "receiver_worst_price": format(config.receiver_worst_price, "f"),
@@ -891,6 +931,16 @@ class RobinhoodSeriesEngine:
             "environment": config.environment,
             "api_base_url": config.api_base_url,
             "chain_id": config.chain_id,
+            "expected_source_position": (
+                None
+                if config.expected_source_position is None
+                else format(config.expected_source_position, "f")
+            ),
+            "expected_receiver_position": (
+                None
+                if config.expected_receiver_position is None
+                else format(config.expected_receiver_position, "f")
+            ),
         }
 
     @staticmethod
@@ -1032,6 +1082,17 @@ class RobinhoodSeriesEngine:
                 raise ContractError("series journal child completion lacks its intent")
             if _positive(intent.payload.get("quantity"), "child intent quantity") != quantity:
                 raise ContractError("child completion quantity conflicts with its intent")
+            if config.operation_mode is OperationMode.PAIRED_OPENING:
+                source_before = _decimal(intent.payload.get("source_position_before"), "child source position before")
+                receiver_before = _decimal(intent.payload.get("receiver_position_before"), "child receiver position before")
+                expected_source_before = -completed * config.direction.sign
+                expected_receiver_before = completed * config.direction.sign
+                if source_before != expected_source_before or receiver_before != expected_receiver_before:
+                    raise ContractError("paired child position continuity conflicts with its persisted identity")
+                source_after = _decimal(event.payload.get("source_position_after"), "child source position after")
+                receiver_after = _decimal(event.payload.get("receiver_position_after"), "child receiver position after")
+                if source_after != expected_source_before - quantity * config.direction.sign or receiver_after != expected_receiver_before + quantity * config.direction.sign:
+                    raise ContractError("paired child completion positions conflict with its persisted quantity")
             child_binding = intent.payload.get("child_binding")
             if child_binding is not None:
                 if not isinstance(child_binding, Mapping):
@@ -1040,6 +1101,8 @@ class RobinhoodSeriesEngine:
                     child_binding.get("market_id") != raw_market_id
                     or str(child_binding.get("market_symbol", "")).upper() != config.market_symbol
                     or child_binding.get("direction") != config.direction.value
+                    or child_binding.get("operation_mode", OperationMode.CLOSE_REOPEN.value)
+                    != config.operation_mode.value
                     or _decimal(child_binding.get("quantity"), "child binding quantity") != quantity
                     or child_binding.get("journal_path") != cls._child_path(config.journal_path, index)
                 ):
@@ -1114,11 +1177,23 @@ class RobinhoodSeriesEngine:
         expected_bound = _effective_receiver_bound(config, metadata.price_decimals)
         if persisted_bound != expected_bound:
             raise ContractError("child intent effective receiver price conflicts with the configured deviation bound")
+        if config.operation_mode is OperationMode.PAIRED_OPENING:
+            expected_source_position = _decimal(
+                payload.get("source_position_before"), "child source position before"
+            )
+            expected_receiver_position = _decimal(
+                payload.get("receiver_position_before"), "child receiver position before"
+            )
+        else:
+            expected_source_position = None
+            expected_receiver_position = None
         child_config = config.attempt_config(
             market_id=metadata.market_id,
             quantity=quantity,
             journal_path=child_path,
             receiver_worst_price=persisted_bound,
+            expected_source_position=expected_source_position,
+            expected_receiver_position=expected_receiver_position,
         )
         persisted_child_binding = payload.get("child_binding")
         if persisted_child_binding is not None and persisted_child_binding != cls._child_binding(child_config):
@@ -1423,12 +1498,16 @@ class RobinhoodSeriesEngine:
         if source.account_index == receiver.account_index:
             raise PreflightBlocked("source and receiver accounts must differ")
         expected = config.direction.sign
-        if expected > 0 and source.signed_position < config.total_quantity:
-            raise PreflightBlocked("source position is smaller than the configured total quantity")
-        if expected < 0 and source.signed_position > -config.total_quantity:
-            raise PreflightBlocked("source short position is smaller than the configured total quantity")
-        if receiver.signed_position * expected < 0:
-            raise PreflightBlocked("receiver has opposite exposure")
+        if config.operation_mode is OperationMode.PAIRED_OPENING:
+            if source.signed_position != 0 or receiver.signed_position != 0:
+                raise PreflightBlocked("paired opening requires both selected-market positions to be flat")
+        else:
+            if expected > 0 and source.signed_position < config.total_quantity:
+                raise PreflightBlocked("source position is smaller than the configured total quantity")
+            if expected < 0 and source.signed_position > -config.total_quantity:
+                raise PreflightBlocked("source short position is smaller than the configured total quantity")
+            if receiver.signed_position * expected < 0:
+                raise PreflightBlocked("receiver has opposite exposure")
         for snapshot, label in ((source, "source"), (receiver, "receiver")):
             if not snapshot.authorized or not snapshot.ready:
                 raise PreflightBlocked(f"{label} authorization/readiness is unproven")
@@ -1515,6 +1594,7 @@ class RobinhoodSeriesEngine:
             remainder_reason=remainder_reason,
             actual_source_filled_quantity=actual_source_filled_quantity,
             actual_receiver_filled_quantity=actual_receiver_filled_quantity,
+            operation_mode=config.operation_mode,
         )
 
     @staticmethod
@@ -1528,6 +1608,7 @@ class RobinhoodSeriesEngine:
             completed_quantity=Decimal("0"),
             remaining_quantity=config.total_quantity,
             reason=reason,
+            operation_mode=config.operation_mode,
         )
 
 
