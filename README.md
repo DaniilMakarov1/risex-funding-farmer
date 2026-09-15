@@ -1,8 +1,98 @@
 # RISEx Spread Shadow and legacy Funding Farmer
 
-Current development (2026-09-13): the owner requires both LONG and SHORT and has removed the project-imposed upper gross/fee caps. A simple two-account implementation update is authorized, without replacement mandatory monetary/reference thresholds. Exact quantity, source limit and receiver worst acceptable price, account verification and no-replay protections remain. Candidate18d0c1be730451ded546ae908a2281cbc46afb51 is technically reviewed but not yet BOTH-ready, accepted or integrated. The operation closes Q at A and opens Q in the same direction at B at a new entry; direct matching and atomicity are not guaranteed. Actual fees and execution are reported only when evidenced. Live operation has not been tested; agents have no credential/account/execution authority. NEXT_TASK defines the finite implementation assignment. Operator instructions will accompany accepted integration; research commands below do not perform this operation.
+Current status (2026-09-15): HCR-1 BOTH/no-monetary-caps implementation `74fbbbf9f298648b643ce9a69353e3abcdcf6c27` passed independent review, 12 adverse fake-SDK probes and the clean isolated Python 3.11 suite (4289 passed, 3 skipped). Operator instructions follow. Live execution is NOT_RUN; no agent account or execution authority is granted.
 
+## HOOD close/reopen: operator instructions
 
+The isolated `risex-hood-handoff` utility closes an agreed Q on source A and opens the same Q in the same direction on receiver B at a new entry price. Both LONG and SHORT are implemented. There are no upper gross-notional or fee-budget gates and no mandatory reference-price field. Live operation is NOT_RUN; acceptance covers offline code and fake SDK verification only. This is a two-account operation without guaranteed matching or atomicity. A can fill between the last resting check and B submission. Original entry price, realized PnL, funding and total economic PnL are not transferred or established by exposure SUCCESS.
+
+### Install and prepare files
+
+Use Python 3.11 in a dedicated environment from this checkout:
+
+```bash
+python3.11 -m venv .venv-hood
+.venv-hood/bin/python -m pip install -e '.[hood-handoff]'
+.venv-hood/bin/risex-hood-handoff --help
+```
+
+The adapter requires exactly `lighter-sdk==1.1.2` and fails closed if the SDK is missing or has another version. This optional dependency is separate from normal scanner startup. Use an owner-only journal directory (mode 0700). Keep every original journal and its lock file. Each new, independently chosen attempt uses a unique journal path.
+
+Create `config.json` using this **offline fixture example**, replacing all market, account-key, quantity, price and timing choices with the operator's explicit values. These numbers are not recommended trading settings and market ID 7 is not a current HOOD identification claim. Quantity and prices must be decimal strings on the current venue grid.
+
+```json
+{
+  "market_id": 7,
+  "direction": "LONG",
+  "quantity": "0.125",
+  "source_limit_price": "100.25",
+  "receiver_worst_price": "101.25",
+  "freshness_seconds": 10,
+  "request_timeout_seconds": 1,
+  "order_timeout_seconds": 1,
+  "reconcile_timeout_seconds": 1,
+  "poll_interval_seconds": 0.1,
+  "max_poll_count": 2,
+  "source_order_lifetime_seconds": 300,
+  "client_order_prefix": "owner-chosen-attempt",
+  "journal_path": "/absolute/owner-only/unique-attempt.jsonl",
+  "api_base_url": "https://mainnet.zklighter.elliot.ai",
+  "api_key_index": 4,
+  "chain_id": 304
+}
+```
+
+`direction` is LONG or SHORT. `market_symbol` is HOOD and `environment` is mainnet by default. The CLI uses the same explicit API key index (4–254) for both accounts; each account has its own corresponding Lighter API private key. `source_order_lifetime_seconds` must be 300–2592000 seconds; the adapter converts the absolute expiry to milliseconds. All request/freshness/polling intervals must be finite and positive. Optional `auth_token_lifetime_seconds` defaults to 600 and supports 60–28800 seconds. These protocol ranges do not replace the operator's chosen finite deadlines.
+
+Create a separate `market-evidence.json` containing current, non-secret evidence for this exact market and planned Q. It is a plain JSON object with these fields:
+
+| Fields | Meaning |
+| --- | --- |
+| `market_id`, `symbol` | Exact current perpetual market identity; symbol HOOD. |
+| `observed_at` | Original evidence observation time as Unix seconds; do not refresh the timestamp without refreshing the evidence. |
+| `status`, `price_decimals`, `size_decimals` | Current active status and integer grid precision; the adapter cross-checks supplied values against `orderBookDetails`. |
+| `minimum_base_amount`, `minimum_quote_amount` | Current documented minimums as exact decimal strings; no assumed minimum exemption. |
+| `margin_evidence` | Non-empty provenance for the minimum/margin evidence. |
+| `source_incremental_margin_required`, `receiver_incremental_margin_required` | Exact decimal strings for each planned operation's required margin, with current evidence; do not substitute current cross margin or an invented zero. |
+| `source_incremental_margin_evidence`, `receiver_incremental_margin_evidence` | Non-empty provenance specific to each account and planned operation. |
+| `source_fee_rate`, `receiver_fee_rate` | Optional evidenced decimal rates; omit or use null when unavailable. No fee-budget admission gate. |
+
+The later operator-run adapter reads current account/position/active-order data and requires authorized, ready accounts, adequate margin, source exposure at least Q, and receiver flat or already in the chosen direction. It verifies metadata freshness and identity. The offline preview only checks configuration and prints the plan; it does **not** establish live readiness or validate the entire evidence object.
+
+### Preview and one attempt
+
+Replace A and B below with distinct integer account indices and use the same reviewed files throughout the attempt:
+
+```bash
+.venv-hood/bin/risex-hood-handoff run \
+  --config config.json --market-evidence market-evidence.json \
+  --source-account-index A --receiver-account-index B
+```
+
+This command makes no network request, imports no Lighter SDK and prompts for no keys. Review the account arguments as well as the printed direction, exact Q, prices and journal path.
+
+| Direction | A: close source Q | B: open receiver Q |
+| --- | --- | --- |
+| LONG | SELL LIMIT, POST_ONLY, reduce-only | BUY MARKET, IOC; price is a ceiling |
+| SHORT | BUY LIMIT, POST_ONLY, reduce-only | SELL MARKET, IOC; price is a floor |
+
+For a later operator-authorized execution, add all three flags to the same command:
+
+```text
+--execute --i-understand-one-attempt-live-operation --confirm-plan
+```
+
+The CLI requests the two Lighter API private keys through hidden interactive TTY input. Never put keys in JSON, shell arguments, environment variables, chat, receipts or logs. The flags permit a real attempt; they are not a simulation mode. Agents did not run this command. No replacement, repricing, compensating trade, repeated completion or multi-wallet loop exists.
+
+### Read the result and reconcile
+
+Inspect `outcome`, both legs' exact fills, final positions/order statuses, `unknown_reasons`, `economic_status`, and the durable journal. Exit 0 also covers PARTIAL and PREVIEW, so it alone does not mean success. SUCCESS establishes the specified exposure change only. Missing fee receipts produce economic UNKNOWN while preserving proven exposure; PROVEN economics means observed gross/fees, not all-in PnL. Joint counterparty matching is a separate finding and may be UNKNOWN, KNOWN_ZERO or CONFLICTING.
+
+After an interrupted or UNKNOWN attempt, retain the **same implementation, configuration, account arguments and journal path**. The same explicitly enabled command enters reconciliation-only for an unresolved journal; it may read/authenticate but never replays create or cancel operations. A completed journal rejects another attempt. A binding mismatch, missing evidence or active order can leave UNKNOWN. Do not delete/edit the journal, change its path to retry an unresolved attempt, or assume cancel acknowledgment proves cancellation. An unresolved resting source order may remain until separately handled by its operator or expired.
+
+Old configuration fields `max_gross_notional`, `source_fee_budget`, `receiver_fee_budget` and `receiver_price_cap` are accepted only as validated legacy inputs and have no gating effect. Omit them in new configurations. **Journals from the earlier capped implementation do not migrate automatically:** their implementation/configuration binding differs, so this release returns UNKNOWN before reconciliation reads or mutations. Preserve them and use their exact original implementation/configuration for a separately authorized read-only resolution. Compatibility never permits replay.
+
+The adapter follows the preserved official SDK/API evidence for version 1.1.2. Actual venue availability, receipt completeness, timestamp interpretation, incremental margin evidence and fees were not live-validated. Absent or conflicting evidence must remain visible; offline acceptance is no live execution guarantee.
 
 Historical completed research (2026-09-09): the finite saved-pilot A/B/C comparison and independent review are complete. A (120-second fixed exit) closed 53 conditional episodes, B (300 seconds) closed 43, all net negative. C (120-second causal break-even repricing) has zero proven closures and undefined closed PnL; stale-data activation uncertainty and exact subminimum residues explain the recorded outcomes. Accepted C source f8b11ee37b8435ab11ad4118d3ebebd6662478a4 passed the clean isolated Python 3.11 suite: 4241 passed, 3 skipped. Historical baseline audit qualifications remain in STATUS and original evidence. This confirms bounded calculation correctness, not profitability. Final report/package: `spread-shadow-runs/scanner-v1-20260906/abc-comparison-20260909/chief/ABC-report-ru.md` and `abc-final-package-20260909-v1.tar.gz`. No further calculation or collection is authorized; see NEXT_TASK.
 
@@ -16,7 +106,7 @@ The public-only BTC research CLI models RISEx maker SELL -> Lighter Standard tak
 
 MODEL_POSITIVE/MODEL_NEGATIVE are conditional, MODEL_SENSITIVE identifies assumption sensitivity, POLICY_BLOCKED identifies policy feasibility, DATA_INSUFFICIENT identifies missing/corrupt inputs and NO_EXECUTION_OBSERVED means no fills. Alternatives are not additive or independent; positive open marks are not closed profit. Funding UNKNOWN forbids all-in profitability claims. The first research pilot need not produce profit, but must have functioning saved-data/core/report paths, actual write/read validation, enforced resource limits and explicit loss/overflow status. Full former combined online capacity proof is deferred. Points = $0; legacy Funding Farmer stays frozen.
 
-One Chief GPT-6 Astra medium independently reviews and integrates main; the single visible GPT-5.6 Luna max Builder authorized in NEXT_TASK implements the current separately owned utility in isolated branches/worktrees. AGENTS defines stable process and safety, and NEXT_TASK defines current ownership and acceptance. Updates to main preserve active Builder checkouts and historical evidence. Actual model/effort/speed comes from client evidence, not prose.
+One Chief GPT-6 Astra medium independently reviews and integrates main; the visible GPT-5.6 Luna max Builder completed the separately owned utility in an isolated branch/worktree. No Builder assignment remains active. AGENTS defines stable process and safety, and NEXT_TASK defines current ownership and acceptance. Updates to main preserve active Builder checkouts and historical evidence. Actual model/effort/speed comes from client evidence, not prose.
 
 The completed public authority was limited to one prospectively frozen60-second smoke and one15-minute pilot, with entry/requote cutoff at12:45 and135seconds for completion. Do not automatically repeat collection based on a zero/negative result. Further runs require owner direction. Public-only recording performs no strategy execution; private/account/fee-reader endpoints, credentials, signing/order preparation/dispatch, orders and real funds remain prohibited. WebSocket transport heartbeat remains enabled and never refreshes economic book timestamps.
 
