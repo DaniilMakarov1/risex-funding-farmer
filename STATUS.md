@@ -1,6 +1,6 @@
 # Current status
 
-HCR-3 paired opening is now authorized and IN DEVELOPMENT. Owner confirmed SHORT A / LONG B from flat balances. Previous Builder was interrupted before HCR-3 implementation and is stopped. Fresh-context Builder will receive the same bounded assignment; direct result delivery and verified sidebar visibility required, no periodic monitoring. HCR-2 below remains the accepted base, not proof of new-mode readiness. No live keys/accounts/signing/orders used.
+HCR-3 paired opening is CHANGES_REQUESTED at candidate3cd0af4ea1c886eee354c3ba4063b2f217518ec0: reproduced operator-field bypass of initial-flat requirement and missing distinguishing adapter/restart/adverse verification. Full review packet in root spread-shadow-runs/hood-paired-open-20260915/chief-review-v1; same fresh Builder corrects and delivers directly. Owner confirmed SHORT A / LONG B from flat balances. Previous Builder was interrupted before HCR-3 implementation and is stopped. Fresh-context Builder will receive the same bounded assignment; direct result delivery and verified sidebar visibility required, no periodic monitoring. HCR-2 below remains the accepted base, not proof of new-mode readiness. No live keys/accounts/signing/orders used.
 
 ## HCR-2 configurable Robinhood perpetual series — ACCEPTED
 
