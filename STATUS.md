@@ -1,3 +1,5 @@
+Current HCR-2 review checkpoint: c67bc270c68ed4e314e8ebedf91a177536908a05 remains unaccepted; repeat read after successful crash reconciliation loses proven quantities. Same Builder assigned bounded persistence correction with direct result delivery. No duplicate order dispatch in the offline reproduction. Final clean suite/public verification pending; live NOT_RUN. See NEXT_TASK and chief-review-v1/repeat-reconciliation-result.json.
+
 # Current status
 
 ## HCR-2 configurable Robinhood perpetual series — CHANGES_REQUESTED

@@ -23,6 +23,10 @@ Owner's requested early target verification authorizes up to 12 bounded public H
 
 Candidate9e6c1d735b5023617758a3c4c87a8192e837d058 received CHANGES_REQUESTED, preserved unchanged. Exact review/reproductions are in chief-review-v1 under the active evidence root. Builder corrects the three bounded findings in the same branch and delivers a new candidate and saved focused evidence. Chief owns one final clean isolated Python3.11 full suite in chief-clean-v1 after correction; Builder need not repeat a host full suite. Original host full result is not isolated evidence. No implementation integration before independent acceptance. Root resumes on actual result delivery/blocker; no periodic checks or automated monitoring.
 
+## Follow-up review checkpoint
+
+Corrected candidate c67bc270c68ed4e314e8ebedf91a177536908a05 fixes the initial adverse cases but remains unaccepted. A new distinguishing repeat-restart probe shows that a successfully reconciled child reports actual source/receiver/paired quantity 0.5 on first recovery, then loses all three to UNKNOWN on the next read. No duplicate dispatch occurred. Cause: SERIES_RECONCILED_CHILD is persisted but the terminal-child restart branch reads only CHILD_RESULT. Evidence: chief-review-v1/repeat_reconciliation_probe.py and repeat-reconciliation-result.json. The same Builder owns the bounded persistence correction and regression, and must deliver the new SHA/results directly to Chief. Chief does not poll; final isolated full suite and four remaining public reads wait for the corrected candidate. No production integration or live execution occurred.
+
 ## Prior accepted deliverable (reference)
 
 HCR-1 accepted implementation 74fbbbf9f298648b643ce9a69353e3abcdcf6c27; accepted main before HCR-2 34059cfea0c9fcf5e91707175dae6dbc5d6ac40a. Existing acceptance evidence remains immutable in STATUS and ignored evidence directories. HCR-2 is not accepted yet.
