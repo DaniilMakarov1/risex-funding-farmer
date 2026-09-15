@@ -43,6 +43,38 @@ class Direction(StrEnum):
         return "BUY" if self is Direction.LONG else "SELL"
 
 
+class OperationMode(StrEnum):
+    """The explicit exposure operation represented by one bounded attempt."""
+
+    CLOSE_REOPEN = "CLOSE_REOPEN"
+    PAIRED_OPENING = "PAIRED_OPENING"
+
+    @classmethod
+    def parse(cls, value: Any) -> "OperationMode":
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, str):
+            raise ContractError("operation_mode must be CLOSE_REOPEN or PAIRED_OPENING")
+        normalized = value.strip().upper().replace("-", "_").replace(" ", "_")
+        aliases = {
+            "CLOSE": cls.CLOSE_REOPEN,
+            "CLOSE_REOPEN": cls.CLOSE_REOPEN,
+            "CLOSE_REOPENING": cls.CLOSE_REOPEN,
+            "PAIRED": cls.PAIRED_OPENING,
+            "PAIRED_OPEN": cls.PAIRED_OPENING,
+            "PAIRED_OPENING": cls.PAIRED_OPENING,
+        }
+        try:
+            return aliases[normalized]
+        except KeyError as exc:
+            raise ContractError("operation_mode must be CLOSE_REOPEN or PAIRED_OPENING") from exc
+
+
+# A short public alias keeps call sites readable while the serialized contract
+# remains the explicit operation_mode field.
+HandoffMode = OperationMode
+
+
 class Outcome(StrEnum):
     PREVIEW = "PREVIEW"
     SUCCESS = "SUCCESS"
@@ -640,6 +672,15 @@ class HandoffConfig:
     source_fee_budget: Decimal | None = None
     receiver_fee_budget: Decimal | None = None
     receiver_price_cap: Decimal | None = None
+    operation_mode: OperationMode | str = OperationMode.CLOSE_REOPEN
+    # ``mode`` is accepted as a concise input alias.  It is normalized to the
+    # same canonical operation_mode and is never used as a second policy.
+    mode: OperationMode | str | None = None
+    # Series children bind their exact expected pre-mutation positions here.
+    # Direct one-attempt calls leave both unset; paired opening then requires
+    # both selected-market positions to be flat.
+    expected_source_position: Decimal | None = None
+    expected_receiver_position: Decimal | None = None
 
     def __post_init__(self) -> None:
         _int(self.market_id, "market_id", minimum=0)
@@ -648,6 +689,19 @@ class HandoffConfig:
         except (TypeError, ValueError) as exc:
             raise ContractError("direction must be LONG or SHORT") from exc
         object.__setattr__(self, "direction", direction)
+        operation_mode = OperationMode.parse(self.operation_mode)
+        if self.mode is not None:
+            mode_value = OperationMode.parse(self.mode)
+            if operation_mode is not OperationMode.CLOSE_REOPEN and operation_mode is not mode_value:
+                raise ContractError("mode conflicts with operation_mode")
+            operation_mode = mode_value
+        object.__setattr__(self, "operation_mode", operation_mode)
+        if self.mode is not None:
+            object.__setattr__(self, "mode", operation_mode)
+        for field_name in ("expected_source_position", "expected_receiver_position"):
+            value = getattr(self, field_name)
+            if value is not None:
+                object.__setattr__(self, field_name, _decimal(value, field_name))
         for field_name in (
             "quantity",
             "source_limit_price",
@@ -800,12 +854,27 @@ class HandoffConfig:
         if source.account_index == receiver.account_index:
             raise PreflightBlocked("source and receiver accounts must differ")
         expected = self.direction.sign
-        if expected > 0 and source.signed_position < self.quantity:
-            raise PreflightBlocked("source long position is smaller than Q")
-        if expected < 0 and source.signed_position > -self.quantity:
-            raise PreflightBlocked("source short position is smaller than Q")
-        if receiver.signed_position * expected < 0:
-            raise PreflightBlocked("receiver has opposite HOOD exposure")
+        if self.operation_mode is OperationMode.PAIRED_OPENING:
+            if self.expected_source_position is None and self.expected_receiver_position is None:
+                if source.signed_position != 0 or receiver.signed_position != 0:
+                    raise PreflightBlocked("paired opening requires both selected-market positions to be flat")
+            elif self.expected_source_position is None or self.expected_receiver_position is None:
+                raise PreflightBlocked("paired opening expected source and receiver positions must both be bound")
+            elif source.signed_position != self.expected_source_position:
+                raise PreflightBlocked("source position does not match the expected paired-opening position")
+            elif receiver.signed_position != self.expected_receiver_position:
+                raise PreflightBlocked("receiver position does not match the expected paired-opening position")
+            elif self.expected_source_position * expected > 0:
+                raise PreflightBlocked("paired-opening source position has the receiver direction")
+            elif self.expected_receiver_position * expected < 0:
+                raise PreflightBlocked("paired-opening receiver position has the source direction")
+        else:
+            if expected > 0 and source.signed_position < self.quantity:
+                raise PreflightBlocked("source long position is smaller than Q")
+            if expected < 0 and source.signed_position > -self.quantity:
+                raise PreflightBlocked("source short position is smaller than Q")
+            if receiver.signed_position * expected < 0:
+                raise PreflightBlocked("receiver has opposite HOOD exposure")
         if not metadata.margin_evidence:
             raise PreflightBlocked("minimum/margin evidence is missing")
 
@@ -882,6 +951,7 @@ class HandoffPlan:
     source_identity: str = ""
     receiver_identity: str = ""
     metadata_observed_at: float | None = None
+    operation_mode: OperationMode | str = OperationMode.CLOSE_REOPEN
 
     def __post_init__(self) -> None:
         try:
@@ -889,6 +959,7 @@ class HandoffPlan:
         except (TypeError, ValueError) as exc:
             raise ContractError("direction must be LONG or SHORT") from exc
         object.__setattr__(self, "direction", direction)
+        object.__setattr__(self, "operation_mode", OperationMode.parse(self.operation_mode))
         _text(self.run_id, "run_id")
         object.__setattr__(self, "quantity", _positive(self.quantity, "quantity"))
         object.__setattr__(self, "source_position_before", _decimal(self.source_position_before, "source_position_before"))
@@ -922,19 +993,25 @@ class HandoffPlan:
             raise ContractError("source and receiver plan integer quantities must match")
         if self.source.side != direction.source_side or self.receiver.side != direction.receiver_side:
             raise ContractError("source/receiver plan sides conflict with direction")
+        source_reduce_only = self.operation_mode is OperationMode.CLOSE_REOPEN
         if (
             self.source.order_type != "LIMIT"
             or self.source.time_in_force != "POST_ONLY"
-            or not self.source.reduce_only
+            or self.source.reduce_only != source_reduce_only
             or self.source.order_expiry_ms <= 0
             or self.receiver.order_type != "MARKET"
             or self.receiver.time_in_force != "IOC"
             or self.receiver.reduce_only
             or self.receiver.order_expiry_ms != 0
         ):
-            raise ContractError("source/receiver plan order semantics are not the HCR-1 contract")
+            raise ContractError("source/receiver plan order semantics conflict with the selected operation mode")
         if self.source.client_order_index == self.receiver.client_order_index:
             raise ContractError("source and receiver client order identities must differ")
+        if self.operation_mode is OperationMode.PAIRED_OPENING:
+            if self.source_position_before * direction.sign > 0:
+                raise ContractError("paired-opening source position must be opposite the receiver direction")
+            if self.receiver_position_before * direction.sign < 0:
+                raise ContractError("paired-opening receiver position must follow the receiver direction")
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -955,6 +1032,7 @@ class HandoffPlan:
             "source_identity": self.source_identity,
             "receiver_identity": self.receiver_identity,
             "metadata_observed_at": self.metadata_observed_at,
+            "operation_mode": self.operation_mode.value,
         }
 
 
@@ -1046,8 +1124,14 @@ class HandoffResult:
     economic_status: str = "UNKNOWN"
     economic_findings: tuple[str, ...] = ()
     findings: tuple[str, ...] = ()
+    operation_mode: OperationMode | str = OperationMode.CLOSE_REOPEN
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "operation_mode", OperationMode.parse(self.operation_mode))
 
     def as_dict(self) -> dict[str, Any]:
+        operation_mode = self.plan.operation_mode if self.plan is not None else self.operation_mode
+
         def leg(value: LegReconciliation | None, counterparty: LegReconciliation | None = None) -> Any:
             if value is None:
                 return None
@@ -1122,6 +1206,7 @@ class HandoffResult:
             "outcome": self.outcome.value,
             "phase": self.phase.value,
             "run_id": self.run_id,
+            "operation_mode": operation_mode.value,
             "plan": None if self.plan is None else self.plan.as_dict(),
             "source": leg(self.source, self.receiver),
             "receiver": leg(self.receiver, self.source),
@@ -1146,6 +1231,7 @@ __all__ = [
     "AccountSnapshot",
     "ContractError",
     "Direction",
+    "HandoffMode",
     "HandoffConfig",
     "HandoffPlan",
     "HandoffResult",
@@ -1156,6 +1242,7 @@ __all__ = [
     "OrderPlan",
     "OrderSnapshot",
     "Outcome",
+    "OperationMode",
     "Phase",
     "PreflightBlocked",
     "OFFICIAL_MAINNET_API_URL",

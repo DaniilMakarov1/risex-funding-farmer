@@ -11,7 +11,7 @@ from pathlib import Path
 import sys
 from typing import Any, Mapping
 
-from .contracts import Direction, HandoffConfig
+from .contracts import Direction, HandoffConfig, OperationMode
 from .engine import run_handoff
 from .sdk import LighterSdkClient, SecretProvider
 from .series import RobinhoodSeriesConfig, run_series
@@ -83,6 +83,36 @@ def _load_json(path: Path, label: str) -> Mapping[str, Any]:
     return value
 
 
+def _reject_operator_position_overrides(value: Mapping[str, Any], label: str) -> None:
+    """Keep exact pre-position fields internal to validated series continuity.
+
+    A direct operator JSON object must always enter paired opening from the
+    live flat-account preflight.  The series coordinator supplies these fields
+    only after it has proved the previous child and bound the next child to its
+    cumulative signed positions.  Reject the canonical names and their small
+    input aliases before dataclass construction so an operator cannot use them
+    to authorize a non-flat initial run.
+    """
+
+    reserved = {
+        "expected_source_position",
+        "expected_receiver_position",
+        "expected_source",
+        "expected_receiver",
+        "source_position_before",
+        "receiver_position_before",
+    }
+    compact_reserved = {item.replace("_", "") for item in reserved}
+    for raw_name in value:
+        if not isinstance(raw_name, str):
+            continue
+        normalized = raw_name.strip().lower().replace("-", "_").replace(" ", "_")
+        if normalized in reserved or normalized.replace("_", "") in compact_reserved:
+            raise SystemExit(
+                f"{label} position override {raw_name!r} is reserved for validated series continuity"
+            )
+
+
 def _config(value: Mapping[str, Any], *, execute: bool) -> HandoffConfig:
     required = (
         "market_id",
@@ -105,6 +135,7 @@ def _config(value: Mapping[str, Any], *, execute: bool) -> HandoffConfig:
     missing = [name for name in required if name not in value]
     if missing:
         raise SystemExit("config is missing required fields: " + ", ".join(missing))
+    _reject_operator_position_overrides(value, "config")
     kwargs = dict(value)
     # A plan review is an interactive act, never a JSON configuration flag.
     # The only way to set it for this process is the explicit --confirm-plan.
@@ -166,6 +197,8 @@ def _config(value: Mapping[str, Any], *, execute: bool) -> HandoffConfig:
                 raise SystemExit(f"invalid HCR-1 configuration: {name} must be numeric") from exc
     try:
         kwargs["direction"] = Direction(str(kwargs["direction"]).upper())
+        if "operation_mode" in kwargs:
+            kwargs["operation_mode"] = OperationMode.parse(kwargs["operation_mode"])
         kwargs["operator_execution_opt_in"] = execute
         return HandoffConfig(**kwargs)
     except (TypeError, ValueError) as exc:
@@ -196,8 +229,10 @@ def _series_config(value: Mapping[str, Any], *, execute: bool) -> RobinhoodSerie
     missing = [name for name in required if name not in value]
     if missing:
         raise SystemExit("series config is missing required fields: " + ", ".join(missing))
+    _reject_operator_position_overrides(value, "series config")
     kwargs = dict(value)
-    kwargs.pop("mode", None)
+    if str(kwargs.get("mode", "")).strip().lower() in {"series", "hcr-2"}:
+        kwargs.pop("mode", None)
     kwargs.pop("series", None)
     kwargs.pop("operator_plan_reviewed", None)
     decimal_fields = (
@@ -243,6 +278,8 @@ def _series_config(value: Mapping[str, Any], *, execute: bool) -> RobinhoodSerie
                 raise SystemExit(f"invalid HCR-2 configuration: {name} must be numeric") from exc
     try:
         kwargs["direction"] = Direction(str(kwargs["direction"]).upper())
+        if "operation_mode" in kwargs:
+            kwargs["operation_mode"] = OperationMode.parse(kwargs["operation_mode"])
         kwargs["operator_execution_opt_in"] = execute
         return RobinhoodSeriesConfig(**kwargs)
     except (TypeError, ValueError) as exc:
@@ -270,6 +307,7 @@ async def _run(args: argparse.Namespace) -> int:
                         "execution": "DISABLED",
                         "message": "offline-safe mode: no SDK import, key prompt, signing, or network request",
                         "mode": "series",
+                        "operation_mode": series_config.operation_mode.value,
                         "venue": "robinhood-chain",
                         "website_url": "https://robinhoodchain.lighter.xyz",
                         "api_base_url": series_config.api_base_url,
@@ -328,6 +366,7 @@ async def _run(args: argparse.Namespace) -> int:
                     "market_id": config.market_id,
                     "market_symbol": config.market_symbol,
                     "direction": config.direction.value,
+                    "operation_mode": config.operation_mode.value,
                     "source_side": config.direction.source_side,
                     "receiver_side": config.direction.receiver_side,
                     "quantity": str(config.quantity),
@@ -335,7 +374,7 @@ async def _run(args: argparse.Namespace) -> int:
                     "receiver_worst_price": str(config.receiver_worst_price),
                     "source_order_type": "LIMIT",
                     "source_time_in_force": "POST_ONLY",
-                    "source_reduce_only": True,
+                    "source_reduce_only": config.operation_mode is OperationMode.CLOSE_REOPEN,
                     "receiver_order_type": "MARKET",
                     "receiver_time_in_force": "IOC",
                     "receiver_reduce_only": False,
