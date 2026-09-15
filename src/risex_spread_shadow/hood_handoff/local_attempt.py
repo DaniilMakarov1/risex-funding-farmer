@@ -22,6 +22,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 from typing import Any, Awaitable, Callable, Mapping, Protocol
 
 from .contracts import (
@@ -39,7 +40,12 @@ from .contracts import (
 from .engine import HandoffClient, Clock, SystemClock, run_handoff
 from .journal import sanitize, sanitize_exception
 from .readiness import ReadinessConfig, ReadinessMarketMetadata, ReadOnlyLighterSdkClient
-from .sdk import LighterSdkClient, REQUIRED_LIGHTER_SDK_VERSION, SecretProvider
+from .sdk import (
+    LighterSdkClient,
+    REQUIRED_LIGHTER_SDK_VERSION,
+    ROBINHOOD_ORDER_BOOK_LIMIT,
+    SecretProvider,
+)
 from .series import OrderBookSnapshot
 
 
@@ -693,6 +699,18 @@ def _finite_timestamp(value: Any, error: str) -> float:
     return parsed
 
 
+def _strict_market_id(value: Any) -> int:
+    """Accept only exact integer values or wire integer strings."""
+
+    if isinstance(value, bool):
+        raise ContractError("order-book market_id is malformed")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and re.fullmatch(r"[+-]?[0-9]+", value):
+        return int(value)
+    raise ContractError("order-book market_id is malformed")
+
+
 def _as_order_book_snapshot(value: Any, metadata: MarketMetadata) -> OrderBookSnapshot:
     """Normalize a reader result without inventing its observation timestamp."""
 
@@ -701,11 +719,8 @@ def _as_order_book_snapshot(value: Any, metadata: MarketMetadata) -> OrderBookSn
     if not isinstance(value, Mapping):
         raise ContractError("public order-book response has an unsupported shape")
     if "market_id" in value:
-        try:
-            if int(value["market_id"]) != metadata.market_id:
-                raise ContractError("order-book identity does not match current market")
-        except (TypeError, ValueError) as exc:
-            raise ContractError("order-book market_id is malformed") from exc
+        if _strict_market_id(value["market_id"]) != metadata.market_id:
+            raise ContractError("order-book identity does not match current market")
     if "symbol" in value:
         raw_symbol = value["symbol"]
         if not isinstance(raw_symbol, str) or raw_symbol.strip().upper() != metadata.symbol.upper():
@@ -1015,6 +1030,117 @@ def _book_provenance(value: Any, *, sdk_version: str | None = None) -> dict[str,
     retained["source"] = "lighter-sdk.order_book_orders response"
     retained["sdk_version"] = sdk_version
     return sanitize(retained)
+
+
+def _unvalidated_metadata_provenance(
+    value: Any,
+    *,
+    sdk_version: str | None = None,
+) -> dict[str, Any]:
+    """Capture bounded raw metadata when typed validation cannot complete."""
+
+    if not isinstance(value, Mapping):
+        return {
+            "available": False,
+            "source": "lighter-sdk.order_book_details response",
+            "sdk_version": sdk_version,
+            "observed_at": None,
+            "validation": "UNVALIDATED",
+        }
+    allowed = {
+        "market_id",
+        "symbol",
+        "market_symbol",
+        "market_type",
+        "venue",
+        "status",
+        "price_decimals",
+        "supported_price_decimals",
+        "size_decimals",
+        "supported_size_decimals",
+        "minimum_base_amount",
+        "min_base_amount",
+        "minimum_quote_amount",
+        "min_quote_amount",
+        "observed_at",
+        "source_fee_rate",
+        "receiver_fee_rate",
+        "margin_evidence",
+    }
+    retained = {key: value[key] for key in allowed if key in value}
+    retained.setdefault("observed_at", None)
+    retained.update(
+        {
+            "available": True,
+            "source": "lighter-sdk.order_book_details response",
+            "sdk_version": sdk_version,
+            "validation": "UNVALIDATED",
+        }
+    )
+    return sanitize(retained)
+
+
+def _safe_metadata_provenance(
+    value: Any,
+    *,
+    sdk_version: str | None = None,
+) -> dict[str, Any]:
+    """Retain safe observation evidence even if metadata normalization fails."""
+
+    try:
+        return _metadata_provenance(value, sdk_version=sdk_version)
+    except Exception:
+        return _unvalidated_metadata_provenance(value, sdk_version=sdk_version)
+
+
+def _unvalidated_book_provenance(
+    value: Any,
+    *,
+    sdk_version: str | None = None,
+) -> dict[str, Any]:
+    """Capture bounded raw book evidence without claiming it was valid."""
+
+    if isinstance(value, OrderBookSnapshot):
+        payload = value.as_dict()
+    elif isinstance(value, Mapping):
+        payload = dict(value)
+    else:
+        return {
+            "available": False,
+            "source": "lighter-sdk.order_book_orders response",
+            "sdk_version": sdk_version,
+            "observed_at": None,
+            "validation": "UNVALIDATED",
+        }
+    allowed = {"market_id", "symbol", "market_type", "venue", "observed_at", "bids", "asks"}
+    retained = {key: payload[key] for key in allowed if key in payload}
+    retained.setdefault("observed_at", None)
+    for side in ("bids", "asks"):
+        levels = retained.get(side)
+        if isinstance(levels, (list, tuple)):
+            retained[side] = list(levels)[:ROBINHOOD_ORDER_BOOK_LIMIT]
+    retained.update(
+        {
+            "available": True,
+            "source": "lighter-sdk.order_book_orders response",
+            "sdk_version": sdk_version,
+            "validation": "UNVALIDATED",
+        }
+    )
+    return sanitize(retained)
+
+
+def _safe_book_provenance(
+    value: Any,
+    *,
+    sdk_version: str | None = None,
+) -> dict[str, Any]:
+    """Retain safe observation evidence even if book normalization fails."""
+
+    try:
+        return _book_provenance(value, sdk_version=sdk_version)
+    except Exception:
+        return _unvalidated_book_provenance(value, sdk_version=sdk_version)
 
 
 def _proposal_provenance(
@@ -1685,13 +1811,46 @@ async def run_local_attempt(
         stage = "market_metadata"
         if reader is None:
             reader = (market_reader_factory or default_market_reader_factory)(active_inputs, secrets)
+        if active_inputs.automatic_price_selection:
+            # Establish an honest unavailable final observation before any
+            # post-launch read.  A partial read or malformed response must
+            # still leave a diagnosable final slot in the failure packet.
+            stage = "market_quote_revalidation"
+            final_provenance = {
+                "metadata": None,
+                "book": None,
+                "prices": None,
+            }
+            result_provenance = {
+                "proposal": _compact_provenance(proposal_provenance),
+                "final": _compact_provenance(final_provenance),
+            }
         raw_metadata = await reader.resolve_market(active_inputs.market_symbol)
-        metadata_provenance = _metadata_provenance(
-            raw_metadata,
-            sdk_version=getattr(reader, "sdk_version", None),
+        metadata_provenance = (
+            _safe_metadata_provenance(
+                raw_metadata,
+                sdk_version=getattr(reader, "sdk_version", None),
+            )
+            if active_inputs.automatic_price_selection
+            else _metadata_provenance(
+                raw_metadata,
+                sdk_version=getattr(reader, "sdk_version", None),
+            )
         )
         if not active_inputs.automatic_price_selection:
             result_provenance = metadata_provenance
+        elif final_provenance is not None:
+            final_provenance["metadata"] = metadata_provenance
+            packet = {
+                **packet,
+                "provenance": {
+                    **packet.get("provenance", {}),
+                    "status": "FINAL_REVALIDATION_PENDING",
+                    "metadata": metadata_provenance,
+                    "proposal": proposal_provenance,
+                    "final": final_provenance,
+                },
+            }
         metadata = _as_market_metadata(
             raw_metadata,
             sdk_version=getattr(reader, "sdk_version", None),
@@ -1700,20 +1859,12 @@ async def run_local_attempt(
             raise ContractError("fresh market identity does not match operator symbol")
 
         if active_inputs.automatic_price_selection:
-            stage = "market_quote_revalidation"
             raw_final_book = await _read_public_book(reader, metadata.market_id)
-            final_book = _as_order_book_snapshot(raw_final_book, metadata)
-            final_provenance = {
-                "metadata": _metadata_provenance(
-                    raw_metadata,
-                    sdk_version=getattr(reader, "sdk_version", None),
-                ),
-                "book": _book_provenance(
-                    raw_final_book,
-                    sdk_version=getattr(reader, "sdk_version", None),
-                ),
-                "prices": None,
-            }
+            assert final_provenance is not None
+            final_provenance["book"] = _safe_book_provenance(
+                raw_final_book,
+                sdk_version=getattr(reader, "sdk_version", None),
+            )
             result_provenance = {
                 "proposal": _compact_provenance(proposal_provenance),
                 "final": _compact_provenance(final_provenance),
@@ -1731,6 +1882,7 @@ async def run_local_attempt(
                     "final": final_provenance,
                 },
             }
+            final_book = _as_order_book_snapshot(raw_final_book, metadata)
             revalidation_now = _clock_now(effective_clock)
             final_proposal = select_automatic_prices(
                 active_inputs.direction,

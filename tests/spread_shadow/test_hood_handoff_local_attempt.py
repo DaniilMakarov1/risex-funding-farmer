@@ -375,6 +375,33 @@ def _auto_book(*, bid: str = "99.0", ask: str = "100.0", observed_at: float = 10
     )
 
 
+def _auto_book_mapping(*, market_id: object = 1) -> dict[str, object]:
+    return {
+        "market_id": market_id,
+        "symbol": "BTC",
+        "market_type": "perp",
+        "venue": "robinhood",
+        "observed_at": 1000.0,
+        "bids": [{"price": "99.0", "quantity": "1"}],
+        "asks": [{"price": "100.0", "quantity": "1"}],
+    }
+
+
+def _auto_metadata_mapping(*, market_id: object = 1, observed_at: float = 1000.0) -> dict[str, object]:
+    return {
+        "market_id": market_id,
+        "symbol": "BTC",
+        "status": "active",
+        "price_decimals": 1,
+        "size_decimals": 2,
+        "minimum_base_amount": "0.10",
+        "minimum_quote_amount": "10",
+        "observed_at": observed_at,
+        "market_type": "perp",
+        "venue": "robinhood",
+    }
+
+
 def test_automatic_price_selector_uses_one_tick_and_mirrors_for_both_directions():
     long_proposal = select_automatic_prices(
         Direction.LONG,
@@ -417,6 +444,30 @@ def test_automatic_price_selector_uses_one_tick_and_mirrors_for_both_directions(
     assert tight_short.source_limit_price == Decimal("99.9")
     assert tight_long.used_tick_adjustment is False
     assert tight_short.used_tick_adjustment is False
+
+
+@pytest.mark.parametrize("market_id", (True, 1.5))
+def test_automatic_price_selector_rejects_bool_and_lossy_mapping_identity(market_id):
+    with pytest.raises(ContractError, match="market_id is malformed"):
+        select_automatic_prices(
+            Direction.LONG,
+            metadata(),
+            _auto_book_mapping(market_id=market_id),
+            quantity=Decimal("0.20"),
+            now=1000.0,
+        )
+
+
+@pytest.mark.parametrize("market_id", (1, "1"))
+def test_automatic_price_selector_keeps_exact_integer_mapping_identity_compatibility(market_id):
+    proposal = select_automatic_prices(
+        Direction.LONG,
+        metadata(),
+        _auto_book_mapping(market_id=market_id),
+        quantity=Decimal("0.20"),
+        now=1000.0,
+    )
+    assert proposal.source_limit_price == Decimal("99.9")
 
 
 @pytest.mark.parametrize(
@@ -488,26 +539,53 @@ async def test_automatic_attempt_revalidates_exact_quote_before_synthetic_engine
     class AutoReader:
         sdk_version = "1.1.2"
 
-        def __init__(self, *, changed: bool = False, final_observed_at: float = 1000.0) -> None:
+        def __init__(
+            self,
+            *,
+            changed: bool = False,
+            final_observed_at: float = 1000.0,
+            proposal_observed_at: float = 1000.0,
+            final_bad_identity: bool = False,
+            proposal_bad_identity: object | None = None,
+            final_bad_metadata: bool = False,
+            final_book_failure: bool = False,
+        ) -> None:
             self.metadata_calls = 0
             self.book_calls = 0
             self.changed = changed
             self.final_observed_at = final_observed_at
+            self.proposal_observed_at = proposal_observed_at
+            self.final_bad_identity = final_bad_identity
+            self.proposal_bad_identity = proposal_bad_identity
+            self.final_bad_metadata = final_bad_metadata
+            self.final_book_failure = final_book_failure
 
         async def resolve_market(self, symbol: str):
             trace.append(f"metadata:{symbol}")
             self.metadata_calls += 1
-            return (
-                metadata()
-                if self.metadata_calls == 1
-                else replace(metadata(), observed_at=self.final_observed_at)
-            )
+            if self.metadata_calls == 1:
+                return replace(metadata(), observed_at=self.proposal_observed_at)
+            if self.final_bad_metadata:
+                return _auto_metadata_mapping(observed_at=self.final_observed_at, market_id=True)
+            return replace(metadata(), observed_at=self.final_observed_at)
 
         async def order_book_snapshot(self, market_id: int):
             trace.append(f"book:{market_id}")
             self.book_calls += 1
+            if self.final_book_failure and self.book_calls == 2:
+                raise RuntimeError("synthetic partial public book read")
             ask = "100.2" if self.changed and self.book_calls == 2 else "100.0"
             observed_at = 1000.0 if self.book_calls == 1 else self.final_observed_at
+            if self.proposal_bad_identity is not None and self.book_calls == 1:
+                return {
+                    **_auto_book_mapping(market_id=self.proposal_bad_identity),
+                    "observed_at": observed_at,
+                }
+            if self.final_bad_identity and self.book_calls == 2:
+                return {
+                    **_auto_book_mapping(market_id=2),
+                    "observed_at": observed_at,
+                }
             return _auto_book(ask=ask, observed_at=observed_at)
 
     local_inputs = inputs(
@@ -598,3 +676,103 @@ async def test_automatic_attempt_revalidates_exact_quote_before_synthetic_engine
     assert delayed_packet["provenance"]["status"] == "FINAL_REVALIDATION_FAILED"
     assert delayed_packet["provenance"]["proposal"]["prices"]["observed_at"] == 1000.0
     assert delayed_packet["provenance"]["final"]["prices"]["observed_at"] == 1011.0
+
+    malformed_inputs = inputs(
+        tmp_path / "malformed-final",
+        quantity=Decimal("0.20"),
+        source_limit_price=None,
+        receiver_worst_price=None,
+    )
+    malformed_reader = AutoReader(final_bad_identity=True, proposal_observed_at=999.0)
+    malformed_client = PairedClient()
+    malformed = await run_local_attempt(
+        malformed_inputs,
+        execute=True,
+        input_fn=lambda _: "LAUNCH",
+        output_fn=lambda _: None,
+        secret_provider_factory=lambda _: AutoSecrets(),
+        market_reader_factory=lambda *_: malformed_reader,
+        execution_client_factory=lambda *_: malformed_client,
+        clock=Clock(),
+    )
+    assert malformed.status == "INCOMPLETE"
+    assert malformed_client.submissions == []
+    malformed_packet = json.loads((tmp_path / "malformed-final" / "attempt-packet.json").read_text())
+    assert malformed_packet["provenance"]["status"] == "FINAL_REVALIDATION_FAILED"
+    assert malformed_packet["provenance"]["final"]["book"]["market_id"] == 2
+    assert malformed_packet["provenance"]["final"]["book"]["observed_at"] == 1000.0
+    assert malformed_packet["provenance"]["final"]["prices"] is None
+
+    invalid_metadata_path = tmp_path / "invalid-final-metadata"
+    invalid_metadata_client = PairedClient()
+    invalid_metadata = await run_local_attempt(
+        inputs(
+            invalid_metadata_path,
+            quantity=Decimal("0.20"),
+            source_limit_price=None,
+            receiver_worst_price=None,
+        ),
+        execute=True,
+        input_fn=lambda _: "LAUNCH",
+        output_fn=lambda _: None,
+        secret_provider_factory=lambda _: AutoSecrets(),
+        market_reader_factory=lambda *_: AutoReader(final_bad_metadata=True),
+        execution_client_factory=lambda *_: invalid_metadata_client,
+        clock=Clock(),
+    )
+    assert invalid_metadata.status == "INCOMPLETE"
+    assert invalid_metadata_client.submissions == []
+    invalid_metadata_packet = json.loads(
+        (invalid_metadata_path / "attempt-packet.json").read_text()
+    )
+    assert invalid_metadata_packet["provenance"]["status"] == "FINAL_REVALIDATION_FAILED"
+    assert invalid_metadata_packet["provenance"]["final"]["metadata"]["market_id"] is True
+    assert invalid_metadata_packet["provenance"]["final"]["book"] is None
+    assert invalid_metadata_packet["provenance"]["final"]["prices"] is None
+
+    partial_path = tmp_path / "partial-final-book"
+    partial_client = PairedClient()
+    partial = await run_local_attempt(
+        inputs(
+            partial_path,
+            quantity=Decimal("0.20"),
+            source_limit_price=None,
+            receiver_worst_price=None,
+        ),
+        execute=True,
+        input_fn=lambda _: "LAUNCH",
+        output_fn=lambda _: None,
+        secret_provider_factory=lambda _: AutoSecrets(),
+        market_reader_factory=lambda *_: AutoReader(final_book_failure=True),
+        execution_client_factory=lambda *_: partial_client,
+        clock=Clock(),
+    )
+    assert partial.status == "INCOMPLETE"
+    assert partial_client.submissions == []
+    partial_packet = json.loads((partial_path / "attempt-packet.json").read_text())
+    assert partial_packet["provenance"]["status"] == "FINAL_REVALIDATION_FAILED"
+    assert partial_packet["provenance"]["final"]["metadata"]["observed_at"] == 1000.0
+    assert partial_packet["provenance"]["final"]["book"] is None
+    assert partial_packet["provenance"]["final"]["prices"] is None
+
+    for malformed_identity in (True, 1.5):
+        prelaunch_path = tmp_path / f"malformed-proposal-{malformed_identity}"
+        before = len(trace)
+        prelaunch = await run_local_attempt(
+            inputs(
+                prelaunch_path,
+                quantity=Decimal("0.20"),
+                source_limit_price=None,
+                receiver_worst_price=None,
+            ),
+            execute=True,
+            input_fn=lambda _: (_ for _ in ()).throw(AssertionError("invalid proposal must stop before LAUNCH")),
+            output_fn=lambda _: None,
+            secret_provider_factory=lambda _: (_ for _ in ()).throw(AssertionError("invalid proposal must stop before keys")),
+            market_reader_factory=lambda *_: AutoReader(proposal_bad_identity=malformed_identity),
+            execution_client_factory=lambda *_: (_ for _ in ()).throw(AssertionError("invalid proposal must stop before mutation client")),
+            clock=Clock(),
+        )
+        assert prelaunch.status == "REFUSED"
+        assert not prelaunch_path.exists()
+        assert trace[before:] == ["metadata:BTC", "book:1"]
