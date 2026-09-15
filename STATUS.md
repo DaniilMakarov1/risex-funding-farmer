@@ -1,5 +1,9 @@
 # Current status
 
+## HCR-7B diagnostic evidence extension — AUTHORIZED continuation
+
+Owner asks to remove the agent blockage and continue. No close-agent/limit-setter is exposed in this runtime; existing completed healthy Keychain Builder can be continued with the supported followup tool, remaining within one Builder plus Chief. This supersedes the prior fresh-Builder waiting condition without changing the platform/global settings or cap. Sole Chief retains review; Builder will work on separate preserved hood-margin-evidence/codex/spread-v1-margin-evidence, not the accepted keychain checkout. NEXT_TASK scopes diagnostic margin-field preservation only, no numerical readiness bypass/price or trading changes. Direct result delivery required, no continuous monitoring.
+
 ## HCR-7A margin diagnosis — EVIDENCE_BLOCKED; fresh Builder unavailable
 
 Owner supplied a post-Keychain report and confirms autonomous continuation. Both reads PASS, BTC flat/no selected orders and .00020 valid at report time; overall UNKNOWN still lacks opening-margin proof and concrete prices. Fresh Builder spawn failed `agent thread limit reached`; no new agent started or prior session resumed. Chief performed narrow read-only inspection and rational examples only, no production edits/self-reviewed fix. Report/source hashes/attachment identity under original-root spread-shadow-runs/hood-margin-evidence-20260915/chief-v1. Proposed next diagnostic-field extension and exact evidence gaps are in NEXT_TASK. Reserved unused worktree hood-margin-evidence/codex/spread-v1-margin-evidence preserved at cb314a9. No active worker, polling, actual credentials/account/order calls or new collection. HCR-6 accepted production/tests unchanged.
