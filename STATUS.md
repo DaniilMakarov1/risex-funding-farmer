@@ -1,5 +1,9 @@
 # Current status
 
+## HCR-9 owner-local launch and diagnostic packet — AUTHORIZED OFFLINE
+
+Owner accepted local launch with Chief inspecting sanitized local logs. Fresh local_attempt_builder assigned initial read-only interface proposal, isolated hood-local-attempt/codex/spread-v1-local-attempt from5426c04. NEXT_TASK scopes one owner-run paired-opening entry point, explicit missing prices/times, stable no-replay attempt directory, reused Keychain/engine, inspectable terminal packet. No actual agent keys/account/orders/network. Mainnet and deferred calculation settled. No continuous monitor or new strategy. Price bounds requested from owner; local interactive entry remains possible.
+
 ## HCR-8 optional deferred incremental margin — ACCEPTED OFFLINE
 
 Candidate5a4ae6edb7ea2a77d986b4f0eee1a98493bae0c0 accepted. Explicit paired-opening deferral, strict default, no fabricated estimate, malformed supplied value rejection, durable direct/series/child policy binding. Full initial/correction diff reviewed; independent adapter and LONG/SHORT strict/deferred/restart probes PASS. Final clean isolated Python3.11.5 SDK1.1.2 suite4382 passed3skipped exit0,127.96seconds; unchanged hashes/import roots verified. Evidence original-root spread-shadow-runs/hood-margin-deferred-20260915/chief-final-v1. Previous unaccepted candidate/probes preserved. Fresh Builder01a0a5dc-ca4f-7f30-b584-15d7daf02519 directly delivered and complete, no active assignment/monitoring.
