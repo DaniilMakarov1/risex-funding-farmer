@@ -546,6 +546,14 @@ async def test_restart_reconciles_persisted_effective_bound_without_new_mutation
     assert len(client.submissions) == before_posts
     assert client.cancel_calls == before_cancels
 
+    repeated = await run_series(config, client, clock=Clock())
+    assert repeated.outcome is Outcome.UNKNOWN
+    assert repeated.actual_filled_quantity == Decimal("0.5")
+    assert repeated.actual_source_filled_quantity == Decimal("0.5")
+    assert repeated.actual_receiver_filled_quantity == Decimal("0.5")
+    assert len(client.submissions) == before_posts
+    assert client.cancel_calls == before_cancels
+
 
 @pytest.mark.asyncio
 async def test_completed_restart_preserves_series_identity_and_totals(tmp_path):
@@ -564,6 +572,44 @@ async def test_completed_restart_preserves_series_identity_and_totals(tmp_path):
     assert second.actual_filled_quantity == Decimal("1.0")
     assert second.actual_source_filled_quantity == Decimal("1.0")
     assert second.actual_receiver_filled_quantity == Decimal("1.0")
+    assert len(client.submissions) == before_posts
+
+
+@pytest.mark.asyncio
+async def test_repeated_reconciliation_preserves_prior_completed_slice(tmp_path):
+    class Crash(BaseException):
+        pass
+
+    class CrashOnSecondChild(SeriesClient):
+        def __init__(self):
+            super().__init__([book(("100.5", "1.0"))])
+            self.crash = True
+
+        async def submit_order(self, plan):
+            receipt = await super().submit_order(plan)
+            if not plan.reduce_only and self.crash and self.child_number == 2:
+                self.crash = False
+                raise Crash()
+            return receipt
+
+    config = series_config(tmp_path / "repeat-prior-complete.jsonl")
+    client = CrashOnSecondChild()
+    with pytest.raises(Crash):
+        await run_series(config, client, clock=Clock())
+    before_posts = len(client.submissions)
+
+    reconciled = await run_series(config, client, clock=Clock())
+    assert reconciled.completed_quantity == Decimal("0.5")
+    assert reconciled.actual_filled_quantity == Decimal("1.0")
+    assert reconciled.actual_source_filled_quantity == Decimal("1.0")
+    assert reconciled.actual_receiver_filled_quantity == Decimal("1.0")
+    assert len(client.submissions) == before_posts
+
+    repeated = await run_series(config, client, clock=Clock())
+    assert repeated.completed_quantity == Decimal("0.5")
+    assert repeated.actual_filled_quantity == Decimal("1.0")
+    assert repeated.actual_source_filled_quantity == Decimal("1.0")
+    assert repeated.actual_receiver_filled_quantity == Decimal("1.0")
     assert len(client.submissions) == before_posts
 
 

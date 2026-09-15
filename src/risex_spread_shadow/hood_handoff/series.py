@@ -648,7 +648,36 @@ class RobinhoodSeriesEngine:
             except Exception as exc:
                 reason = "restart journal is malformed: " + sanitize_exception(exc)
                 parent.append("SERIES_RESTART_BLOCKED", {"reason": reason})
-                return self._result(config, series_id, metadata.market_id, Decimal("0"), config.total_quantity, (), reason)
+                try:
+                    persisted_completed, persisted_market_id, persisted_source, persisted_receiver = (
+                        self._stored_series_progress(
+                            config,
+                            existing,
+                            source_index,
+                            receiver_index,
+                            require_complete=False,
+                            series_id=series_id,
+                        )
+                    )
+                except Exception:
+                    persisted_completed = Decimal("0")
+                    persisted_market_id = metadata.market_id
+                    persisted_source = Decimal("0")
+                    persisted_receiver = Decimal("0")
+                return self._result(
+                    config,
+                    series_id,
+                    persisted_market_id,
+                    persisted_completed,
+                    config.total_quantity - persisted_completed,
+                    (),
+                    reason,
+                    actual_filled_quantity=self._paired_totals_or_none(
+                        persisted_source, persisted_receiver
+                    ),
+                    actual_source_filled_quantity=persisted_source,
+                    actual_receiver_filled_quantity=persisted_receiver,
+                )
             if restart_result is not None:
                 return restart_result
             reason = "restart has no safely resumable child state"
@@ -1104,6 +1133,24 @@ class RobinhoodSeriesEngine:
             return None
         return _nonnegative(value, f"stored {role} filled quantity")
 
+    @staticmethod
+    def _stored_reconciled_leg(event: Any, role: str) -> Decimal | None:
+        """Return only a leg quantity whose reconciliation proved history complete."""
+
+        value = event.payload.get(f"{role}_filled_quantity")
+        if value is None or event.payload.get(f"{role}_history_complete") is not True:
+            return None
+        return _nonnegative(value, f"stored reconciled {role} filled quantity")
+
+    @staticmethod
+    def _stored_reconciled_pair(event: Any) -> Decimal | None:
+        value = event.payload.get("paired_filled_quantity")
+        if value is None:
+            return None
+        if event.payload.get("outcome") != Outcome.SUCCESS.value:
+            raise ContractError("stored reconciled pair is not a proven successful child")
+        return _positive(value, "stored reconciled paired quantity")
+
     async def _handle_restart(
         self,
         config: RobinhoodSeriesConfig,
@@ -1146,6 +1193,7 @@ class RobinhoodSeriesEngine:
         child_intents = event_map("CHILD_INTENT")
         child_results = event_map("CHILD_RESULT")
         child_completes = event_map("CHILD_COMPLETE")
+        reconciled_results = event_map("SERIES_RECONCILED_CHILD")
         remaining_before = config.total_quantity - completed_before
         pending = sorted(set(child_intents) - set(child_completes))
         if pending:
@@ -1191,6 +1239,25 @@ class RobinhoodSeriesEngine:
                         "outcome": reconciled.outcome.value,
                         "source_filled_quantity": self._journal_leg_quantity(reconciled.source),
                         "receiver_filled_quantity": self._journal_leg_quantity(reconciled.receiver),
+                        "source_history_complete": (
+                            None if reconciled.source is None else reconciled.source.history_complete
+                        ),
+                        "receiver_history_complete": (
+                            None if reconciled.receiver is None else reconciled.receiver.history_complete
+                        ),
+                        "source_order_id": None if reconciled.source is None else reconciled.source.order_id,
+                        "receiver_order_id": None if reconciled.receiver is None else reconciled.receiver.order_id,
+                        "unknown_reasons": list(reconciled.unknown_reasons),
+                        "paired_filled_quantity": (
+                            self._journal_leg_quantity(reconciled.source)
+                            if reconciled.outcome is Outcome.SUCCESS
+                            and reconciled.source is not None
+                            and reconciled.receiver is not None
+                            and reconciled.source.history_complete
+                            and reconciled.receiver.history_complete
+                            and reconciled.source.filled_quantity == reconciled.receiver.filled_quantity
+                            else None
+                        ),
                     },
                 )
                 reason = "restart reconciled the interrupted child; explicit series resume is required"
@@ -1205,7 +1272,10 @@ class RobinhoodSeriesEngine:
                     outcome=Outcome.UNKNOWN,
                     actual_filled_quantity=(
                         None
-                        if reconciled_source is None or reconciled_receiver is None
+                        if reconciled.outcome is not Outcome.SUCCESS
+                        or reconciled_source is None
+                        or reconciled_receiver is None
+                        or reconciled_source != reconciled_receiver
                         else self._paired_totals_or_none(reconciled_source, reconciled_receiver)
                     ),
                     actual_source_filled_quantity=reconciled_source,
@@ -1214,16 +1284,41 @@ class RobinhoodSeriesEngine:
             reason = "restart found an incomplete child without an unresolved mutation journal; refusing replay"
             parent.append("SERIES_RESTART_BLOCKED", {"reason": reason, "child_index": index})
             stored_result = child_results.get(index)
-            result_source = (
-                None
-                if stored_result is None or self._stored_child_result_leg(stored_result, "source") is None
-                else source_actual + self._stored_child_result_leg(stored_result, "source")
+            reconciled_result = reconciled_results.get(index)
+            if stored_result is not None and reconciled_result is not None:
+                for role in ("source", "receiver"):
+                    if self._stored_child_result_leg(stored_result, role) != self._stored_reconciled_leg(
+                        reconciled_result, role
+                    ):
+                        raise ContractError("child result and reconciliation receipts conflict")
+            source_leg = (
+                self._stored_reconciled_leg(reconciled_result, "source")
+                if reconciled_result is not None
+                else self._stored_child_result_leg(stored_result, "source")
+                if stored_result is not None
+                else None
             )
-            result_receiver = (
-                None
-                if stored_result is None or self._stored_child_result_leg(stored_result, "receiver") is None
-                else receiver_actual + self._stored_child_result_leg(stored_result, "receiver")
+            receiver_leg = (
+                self._stored_reconciled_leg(reconciled_result, "receiver")
+                if reconciled_result is not None
+                else self._stored_child_result_leg(stored_result, "receiver")
+                if stored_result is not None
+                else None
             )
+            result_source = None if source_leg is None else source_actual + source_leg
+            result_receiver = None if receiver_leg is None else receiver_actual + receiver_leg
+            persisted_pair = (
+                None
+                if reconciled_result is None
+                else self._stored_reconciled_pair(reconciled_result)
+            )
+            if persisted_pair is not None and (
+                source_leg is None
+                or receiver_leg is None
+                or persisted_pair != source_leg
+                or persisted_pair != receiver_leg
+            ):
+                raise ContractError("stored reconciled paired quantity conflicts with leg receipts")
             return self._result(
                 config,
                 series_id,
@@ -1235,7 +1330,13 @@ class RobinhoodSeriesEngine:
                 actual_filled_quantity=(
                     None
                     if result_source is None or result_receiver is None
-                    else self._paired_totals_or_none(result_source, result_receiver)
+                    else None
+                    if reconciled_result is not None and persisted_pair is None
+                    else (
+                        completed_before + persisted_pair
+                        if persisted_pair is not None
+                        else self._paired_totals_or_none(result_source, result_receiver)
+                    )
                 ),
                 actual_source_filled_quantity=result_source,
                 actual_receiver_filled_quantity=result_receiver,
