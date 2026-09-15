@@ -71,7 +71,7 @@ Only for a later operator-run execution, add these three flags to that command:
 --execute --i-understand-series-live-operation --confirm-plan
 ```
 
-These flags permit real signing and orders; agents have not used them. The one-attempt acknowledgment from the older HOOD example is not the series acknowledgment. A first operator test can use an explicitly chosen total equal to the desired slice to exercise at most one pair; choose actual size/prices only after checking the current market and accounts. No live size is preselected here.
+These flags permit real signing and orders; agents have not used them. The one-attempt acknowledgment from the older HOOD example is not the series acknowledgment. For a first operator test, choose the total and desired slice explicitly after checking the current market and accounts. Even when total equals desired slice, thinner depth can split it into several sequential pairs. This version has no separate one-pair cap for series mode. No live size is preselected here.
 
 ### Series results and interruption
 
