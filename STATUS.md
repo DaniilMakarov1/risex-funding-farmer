@@ -1,3 +1,7 @@
+# HCR-2 target resolved — configurable BTC/ETH perpetuals
+
+Owner selected BTC first and configurable symbols including ETH. Early HOOD absence blocker is resolved by explicit target change. Implementation/review remains pending; live NOT_RUN. Root remains sole Chief.
+
 # HCR-2 IN PROGRESS — 2026-09-15
 
 Owner approved variable sequential slices and specifically Robinhood Chain Lighter. Early public compatibility probe confirmed api.rh.lighter.xyz but both market-list endpoints contain no HOOD (57 perpetual, 27 spot markets). TARGET_MARKET_CLARIFICATION_REQUIRED: owner asked for intended ticker/link; no substitution or production implementation yet. Two of twelve public requests used; immutable responses and hashes under spread-shadow-runs/hood-rh-20260915/compatibility-v1/. No Builder or live account test launched. Root remains sole Chief. Active scope and finite public probe bounds are in NEXT_TASK.

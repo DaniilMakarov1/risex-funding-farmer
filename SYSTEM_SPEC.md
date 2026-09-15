@@ -3,6 +3,10 @@
 SYSTEM_SPEC_VERSION = 4.0
 SPEC_STATUS = FIRST_RAW_RESEARCH_SCANNER_IMPLEMENTED
 
+## HCR-2 amendment — configurable Robinhood perpetual slices (2026-09-15)
+
+IN DEVELOPMENT, not accepted. Owner authorizes Robinhood Chain Lighter at robinhoodchain.lighter.xyz, configurable perpetual symbol (BTC first, ETH supported), and finite sequential variable liquidity-aware slices. This supersedes HCR-1 HOOD-only and single-attempt-only restrictions only for this new opt-in mode; each child attempt keeps exact quantities, price bounds, secret isolation, durable intent/no-replay, truthful receipts and single paired operation invariants. Ordinary Lighter mainnet is not an implicit substitute. Active finite acceptance and prospective public-probe authority are in NEXT_TASK. No live account/order/signing execution by agents.
+
 ## HOOD close/reopen utility — development contract HCR-1 (2026-09-12)
 
 Status: ACCEPTED_OFFLINE_BOTH_WITHOUT_MONETARY_CAPS (2026-09-15), implementation 74fbbbf9f298648b643ce9a69353e3abcdcf6c27. Live execution NOT_RUN. The owner explicitly requires LONG and SHORT and on2026-09-13 removed the project-imposed upper gross/fee limits. This separately opt-in utility implements the owner's requested Lighter HOOD position close/reopen: A is the owner's account and B the friend's account. The owner accepts reducing an agreed quantity at A and opening the same quantity in the same direction at B at the new execution price. This is not a native position transfer: original entry price and PnL are not preserved. No direct-counterparty matching, two-account atomicity or completed exposure handoff is guaranteed. Historical research policy and default entrypoints remain unchanged.
