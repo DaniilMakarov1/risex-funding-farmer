@@ -416,6 +416,18 @@ def preview_payload(inputs: LocalAttemptInputs) -> dict[str, Any]:
                 "worst_price_bound": format(inputs.receiver_worst_price, "f"),
             },
             "quantity": format(inputs.quantity, "f"),
+            "source_limit_notional": format(
+                inputs.quantity * inputs.source_limit_price,
+                "f",
+            ),
+            "receiver_worst_bound_notional": format(
+                inputs.quantity * inputs.receiver_worst_price,
+                "f",
+            ),
+            "notional_semantics": (
+                "configured price bounds multiplied by exact quantity; bounds/estimates only, "
+                "not fills, execution prices, fees, or profit"
+            ),
             "market_id": "resolved from one fresh current catalog observation after launch",
         },
         "remaining_positions": {
@@ -906,9 +918,24 @@ async def run_local_attempt(
         )
     packet_path = attempt_dir / PACKET_NAME
     journal_path = attempt_dir / JOURNAL_NAME
-    initial = _initial_packet(inputs)
-    _atomic_json(packet_path, initial)
-    _atomic_json(attempt_dir / EXIT_STATUS_NAME, {"status": "PENDING", "exit_code": None, "terminal_result": "MISSING"})
+    try:
+        initial = _initial_packet(inputs)
+        _atomic_json(packet_path, initial)
+        _atomic_json(
+            attempt_dir / EXIT_STATUS_NAME,
+            {"status": "PENDING", "exit_code": None, "terminal_result": "MISSING"},
+        )
+    except Exception as exc:
+        safe_error = sanitize_exception(exc)
+        return LocalAttemptResult(
+            status="INCOMPLETE",
+            exit_code=2,
+            packet_path=packet_path if packet_path.exists() else None,
+            journal_path=journal_path,
+            terminal_status="MISSING",
+            reason=f"initial diagnostic packet failed before secrets: {safe_error}",
+            preview=preview,
+        )
 
     secrets: SecretProvider | None = None
     reader: Any | None = None
@@ -991,6 +1018,35 @@ async def run_local_attempt(
             # packet finalization separately instead of replacing it with a
             # fabricated MISSING result.
             packet_write_error = sanitize_exception(exc)
+        if packet_write_error is not None:
+            try:
+                _atomic_json(
+                    inputs.exit_status_path,
+                    {
+                        "packet_version": PACKET_VERSION,
+                        "status": "INCOMPLETE",
+                        "exit_code": 2,
+                        "terminal_result": "RECORDED",
+                        "diagnostic_finalization": "INCOMPLETE",
+                        "error_class": packet_write_error,
+                    },
+                )
+            except Exception:
+                pass
+            return LocalAttemptResult(
+                status="INCOMPLETE",
+                exit_code=2,
+                packet_path=packet_path,
+                journal_path=journal_path,
+                terminal_status="RECORDED",
+                result=result,
+                reason=(
+                    "terminal result recorded; diagnostic packet finalization "
+                    f"incomplete: {packet_write_error}"
+                ),
+                preview=preview,
+                provenance=metadata_provenance,
+            )
         return LocalAttemptResult(
             status="COMPLETED",
             exit_code=exit_code,
@@ -1010,13 +1066,13 @@ async def run_local_attempt(
         safe_error = sanitize_exception(exc)
         if terminal_recorded and result is not None and exit_code is not None:
             return LocalAttemptResult(
-                status="COMPLETED",
-                exit_code=exit_code,
+                status="INCOMPLETE",
+                exit_code=2,
                 packet_path=packet_path,
                 journal_path=journal_path,
                 terminal_status="RECORDED",
                 result=result,
-                reason=f"terminal result recorded; packet finalization failed: {safe_error}",
+                reason=f"terminal result recorded; diagnostic packet finalization incomplete: {safe_error}",
                 preview=preview,
                 provenance=metadata_provenance,
             )

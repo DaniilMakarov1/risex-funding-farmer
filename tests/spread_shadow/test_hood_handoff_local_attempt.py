@@ -10,6 +10,7 @@ from risex_spread_shadow.hood_handoff import (
     LocalAttemptInputs,
     Outcome,
     collect_local_attempt_inputs,
+    preview_payload,
     run_local_attempt,
 )
 from risex_spread_shadow.hood_handoff import local_attempt
@@ -232,18 +233,40 @@ async def test_missing_terminal_result_is_incomplete_and_secret_free(tmp_path):
     assert terminal["error_class"] == "sdk_error"
 
 
+def test_preview_reports_exact_leg_notionals(tmp_path):
+    preview = preview_payload(
+        inputs(
+            tmp_path / "preview",
+            quantity=Decimal("0.00020"),
+            source_limit_price=Decimal("80000"),
+            receiver_worst_price=Decimal("80100"),
+        )
+    )
+    expected_source = Decimal("0.00020") * Decimal("80000")
+    expected_receiver = Decimal("0.00020") * Decimal("80100")
+    assert format(expected_source, "f") == "16.00000"
+    assert format(expected_receiver, "f") == "16.02000"
+    assert preview["operation"]["source_limit_notional"] == "16.00000"
+    assert preview["operation"]["receiver_worst_bound_notional"] == "16.02000"
+
+
 @pytest.mark.asyncio
-async def test_recorded_terminal_survives_packet_finalization_failure(tmp_path, monkeypatch):
+@pytest.mark.parametrize("failed_file", ("exit-status.json", "attempt-packet.json"))
+async def test_recorded_terminal_survives_packet_finalization_failure(tmp_path, monkeypatch, failed_file):
     original_atomic_json = local_attempt._atomic_json
 
     def fail_final_packet(path, value):
-        if Path(path).name == "attempt-packet.json" and value.get("terminal", {}).get("status") == "RECORDED":
+        path_name = Path(path).name
+        final_packet = path_name == "attempt-packet.json" and value.get("terminal", {}).get("status") == "RECORDED"
+        final_exit = path_name == "exit-status.json" and value.get("status") == "RECORDED"
+        if path_name == failed_file and (final_packet or final_exit):
             raise OSError("private_key=must-not-escape")
         original_atomic_json(path, value)
 
     monkeypatch.setattr(local_attempt, "_atomic_json", fail_final_packet)
+    attempt_path = tmp_path / failed_file.replace(".json", "")
     result = await run_local_attempt(
-        inputs(tmp_path / "finalization", quantity=Decimal("0.20")),
+        inputs(attempt_path, quantity=Decimal("0.20")),
         execute=True,
         input_fn=lambda _: "LAUNCH",
         output_fn=lambda _: None,
@@ -253,13 +276,54 @@ async def test_recorded_terminal_survives_packet_finalization_failure(tmp_path, 
         clock=Clock(),
     )
 
-    assert result.status == "COMPLETED"
+    assert result.status == "INCOMPLETE"
+    assert result.exit_code == 2
     assert result.terminal_status == "RECORDED"
     assert result.result is not None and result.result.outcome is Outcome.SUCCESS
-    assert "packet finalization failed" in (result.reason or "")
-    terminal = json.loads((tmp_path / "finalization" / "terminal-result.json").read_text(encoding="utf-8"))
+    assert "diagnostic packet finalization incomplete" in (result.reason or "")
+    terminal = json.loads((attempt_path / "terminal-result.json").read_text(encoding="utf-8"))
+    exit_status = json.loads((attempt_path / "exit-status.json").read_text(encoding="utf-8"))
     assert terminal["terminal_status"] == "RECORDED"
+    assert terminal["outcome"] == "SUCCESS"
+    assert exit_status["status"] == "INCOMPLETE"
+    assert exit_status["exit_code"] == 2
     assert "must-not-escape" not in (result.reason or "")
+
+
+@pytest.mark.asyncio
+async def test_initial_packet_failure_stops_before_secrets_or_external_calls(tmp_path, monkeypatch):
+    calls: list[str] = []
+
+    def fail_atomic(_path, _value):
+        raise OSError("private_key=must-not-escape")
+
+    def forbidden_secret(_inputs):
+        calls.append("secret")
+        raise AssertionError("secret provider must not be created")
+
+    def forbidden_reader(*_args):
+        calls.append("reader")
+        raise AssertionError("market reader must not be created")
+
+    monkeypatch.setattr(local_attempt, "_atomic_json", fail_atomic)
+    attempt_path = tmp_path / "initial-write-failure"
+    result = await run_local_attempt(
+        inputs(attempt_path),
+        execute=True,
+        input_fn=lambda _: "LAUNCH",
+        output_fn=lambda _: None,
+        secret_provider_factory=forbidden_secret,
+        market_reader_factory=forbidden_reader,
+    )
+
+    assert result.status == "INCOMPLETE"
+    assert result.exit_code == 2
+    assert result.terminal_status == "MISSING"
+    assert "initial diagnostic packet failed before secrets" in (result.reason or "")
+    assert "must-not-escape" not in (result.reason or "")
+    assert calls == []
+    assert (attempt_path / local_attempt.CLAIM_NAME).exists()
+    assert not (attempt_path / local_attempt.PACKET_NAME).exists()
 
 
 def test_cli_local_attempt_direct_flags_stays_offline_without_execute(tmp_path, capsys):
