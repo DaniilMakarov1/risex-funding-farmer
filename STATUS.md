@@ -1,5 +1,7 @@
 # Current status
 
+HCR-3 paired opening is now authorized and IN DEVELOPMENT. Owner confirmed SHORT A / LONG B from flat balances. Existing Builder receives a new isolated bounded implementation assignment and must deliver results directly to sole Chief; no periodic monitoring. HCR-2 below remains the accepted base, not proof of new-mode readiness. No live keys/accounts/signing/orders used.
+
 ## HCR-2 configurable Robinhood perpetual series — ACCEPTED
 
 Accepted production candidate 393a17c01c73aced1735656c87ef9b4653b96653, Builder branch codex/spread-v1-hood-rh-slices. Root task 01a096cf-96fc-7f02-b2bb-8bb0a92b8f09 remains sole Chief/integration owner. Builder 01a0a48c-58c4-7781-ae9b-3a573381d55b delivered results directly and is complete; no active Builder, duplicate Chief or monitoring process. Luna/max established by explicit Builder role; Standard requested, actual speed UNKNOWN.

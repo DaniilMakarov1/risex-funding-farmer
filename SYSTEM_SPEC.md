@@ -3,6 +3,10 @@
 SYSTEM_SPEC_VERSION = 4.0
 SPEC_STATUS = FIRST_RAW_RESEARCH_SCANNER_IMPLEMENTED
 
+## HCR-3 amendment — paired opening (in development)
+
+Owner explicitly authorizes an additional mode from initially flat funded accounts: A posts a non-reduce-only SELL LIMIT POST_ONLY opening SHORT; B submits non-reduce-only BUY MARKET IOC opening LONG. This mode does not transfer collateral or preserve an earlier position. It retains sequential variable slices, exact expected opposite position deltas, opening margin for both accounts, bounded prices/freshness/deadlines, durable receipts and no replay. Only independently proven paired success allows another slice. Distinguish operation mode in all bindings and outputs. Existing close/reopen stays the default; its source reduce-only requirement is unchanged. NEXT_TASK defines finite implementation/review criteria. Agents do not execute live trades.
+
 ## HCR-2 amendment — configurable Robinhood perpetual slices (2026-09-15)
 
 ACCEPTED_OFFLINE_AND_PUBLIC_ADAPTER_VERIFIED, candidate 393a17c01c73aced1735656c87ef9b4653b96653; live execution NOT_RUN. Owner authorizes Robinhood Chain Lighter at robinhoodchain.lighter.xyz, configurable perpetual symbol (BTC first, ETH supported), and finite sequential variable liquidity-aware slices. This supersedes HCR-1 HOOD-only and single-attempt-only restrictions only for this new opt-in mode; each child attempt keeps exact quantities, price bounds, secret isolation, durable intent/no-replay, truthful receipts and single paired operation invariants. Ordinary Lighter mainnet is not an implicit substitute. Active finite acceptance and prospective public-probe authority are in NEXT_TASK. No live account/order/signing execution by agents.
