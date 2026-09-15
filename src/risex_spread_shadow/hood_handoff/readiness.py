@@ -10,7 +10,7 @@ when the operator invokes this command from a local TTY.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal, InvalidOperation
 import importlib
 from importlib import metadata as importlib_metadata
@@ -21,6 +21,7 @@ import time
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from .contracts import (
+    AccountMarginEvidence,
     AccountSnapshot,
     ContractError,
     Direction,
@@ -109,6 +110,131 @@ def _timestamp(value: Any, name: str) -> float:
 
 
 @dataclass(frozen=True, slots=True)
+class ReadinessMarketMarginEvidence:
+    """Whitelisted market margin defaults from one catalog observation."""
+
+    market_id: int
+    symbol: str
+    observed_at: float
+    default_initial_margin_fraction: int | None
+    minimum_initial_margin_fraction: int | None
+    invalid_fields: tuple[str, ...] = ()
+    source: str = "orderBookDetails response"
+    sdk_version: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "market_id", _index(self.market_id, "market_id"))
+        if not isinstance(self.symbol, str) or not self.symbol.strip():
+            raise ContractError("symbol must be non-empty text")
+        object.__setattr__(self, "symbol", self.symbol.strip().upper())
+        object.__setattr__(self, "observed_at", _timestamp(self.observed_at, "observed_at"))
+        for value, name in (
+            (self.default_initial_margin_fraction, "default_initial_margin_fraction"),
+            (self.minimum_initial_margin_fraction, "minimum_initial_margin_fraction"),
+        ):
+            if value is not None:
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise ContractError(f"{name} must be a non-negative integer or None")
+        if not isinstance(self.invalid_fields, tuple) or any(
+            not isinstance(item, str) or not item for item in self.invalid_fields
+        ):
+            raise ContractError("invalid_fields must be a tuple of non-empty names")
+        if not isinstance(self.source, str) or not self.source.strip():
+            raise ContractError("source must be non-empty text")
+        object.__setattr__(self, "source", self.source.strip())
+        if self.sdk_version is not None:
+            if not isinstance(self.sdk_version, str) or not self.sdk_version.strip():
+                raise ContractError("sdk_version must be non-empty text or None")
+            object.__setattr__(self, "sdk_version", self.sdk_version.strip())
+
+    @classmethod
+    def from_response(
+        cls,
+        value: Mapping[str, Any],
+        *,
+        market_id: int,
+        symbol: str,
+        observed_at: float,
+        source: str = "orderBookDetails response",
+        sdk_version: str | None = None,
+    ) -> "ReadinessMarketMarginEvidence":
+        invalid: list[str] = []
+
+        def raw_integer(name: str, *aliases: str) -> int | None:
+            for candidate in (name, *aliases):
+                if candidate not in value or value[candidate] is None:
+                    continue
+                raw = value[candidate]
+                if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+                    invalid.append(name)
+                    return None
+                return raw
+            return None
+
+        default_fraction = raw_integer("default_initial_margin_fraction")
+        minimum_fraction = raw_integer(
+            "minimum_initial_margin_fraction", "min_initial_margin_fraction"
+        )
+        if (
+            default_fraction is not None
+            and minimum_fraction is not None
+            and default_fraction < minimum_fraction
+        ):
+            invalid.append("margin_fractions")
+
+        return cls(
+            market_id=market_id,
+            symbol=symbol,
+            observed_at=observed_at,
+            default_initial_margin_fraction=default_fraction,
+            minimum_initial_margin_fraction=minimum_fraction,
+            invalid_fields=tuple(invalid),
+            source=source,
+            sdk_version=sdk_version,
+        )
+
+    @property
+    def status(self) -> str:
+        if self.source == "not returned":
+            return "UNAVAILABLE"
+        if self.invalid_fields:
+            return "INVALID"
+        if self.default_initial_margin_fraction is None or self.minimum_initial_margin_fraction is None:
+            return "INCOMPLETE"
+        return "OBSERVED"
+
+    @staticmethod
+    def _field(name: str, value: int | None, invalid_fields: tuple[str, ...]) -> dict[str, Any]:
+        invalid = name in invalid_fields
+        present = invalid or value is not None
+        return {
+            "present": present,
+            "valid": False if invalid else (True if present else None),
+            "raw": None if invalid else value,
+            "units": "unverified",
+        }
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "binding": {"market_id": self.market_id, "symbol": self.symbol},
+            "provenance": {
+                "source": self.source,
+                "sdk_version": self.sdk_version,
+                "observed_at": self.observed_at,
+            },
+            "default_initial_margin_fraction": self._field(
+                "default_initial_margin_fraction", self.default_initial_margin_fraction, self.invalid_fields
+            ),
+            "minimum_initial_margin_fraction": self._field(
+                "minimum_initial_margin_fraction", self.minimum_initial_margin_fraction, self.invalid_fields
+            ),
+            "invalid_fields": list(self.invalid_fields),
+            "units_note": "Margin fraction response units are unverified; no signing input encoding was applied.",
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ReadinessMarketMetadata:
     """Current catalog fields needed by readiness, without invented margin evidence."""
 
@@ -122,6 +248,7 @@ class ReadinessMarketMetadata:
     observed_at: float
     market_type: str = "perp"
     venue: str = "robinhood"
+    margin_evidence: ReadinessMarketMarginEvidence | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "market_id", _index(self.market_id, "market_id"))
@@ -140,20 +267,38 @@ class ReadinessMarketMetadata:
             raise ContractError("market_type must be perp")
         object.__setattr__(self, "market_type", "perp")
         object.__setattr__(self, "venue", str(self.venue).strip().lower() or "robinhood")
+        if self.margin_evidence is not None:
+            if not isinstance(self.margin_evidence, ReadinessMarketMarginEvidence):
+                raise ContractError("margin_evidence must be ReadinessMarketMarginEvidence or None")
+            if (
+                self.margin_evidence.market_id != self.market_id
+                or self.margin_evidence.symbol != self.symbol
+                or self.margin_evidence.observed_at > self.observed_at
+            ):
+                raise ContractError("margin_evidence identity does not match market metadata")
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "ReadinessMarketMetadata":
+        market_id = _index(value.get("market_id"), "market_id")
+        symbol = str(value.get("symbol", value.get("market_symbol", "")))
+        observed_at = _timestamp(value.get("observed_at"), "observed_at")
         return cls(
-            market_id=_index(value.get("market_id"), "market_id"),
-            symbol=str(value.get("symbol", value.get("market_symbol", ""))),
+            market_id=market_id,
+            symbol=symbol,
             status=str(value.get("status", "")),
             price_decimals=_index(value.get("price_decimals", value.get("supported_price_decimals")), "price_decimals"),
             size_decimals=_index(value.get("size_decimals", value.get("supported_size_decimals")), "size_decimals"),
             minimum_base_amount=_decimal(value.get("minimum_base_amount", value.get("min_base_amount")), "minimum_base_amount", positive=True),
             minimum_quote_amount=_decimal(value.get("minimum_quote_amount", value.get("min_quote_amount")), "minimum_quote_amount", positive=True),
-            observed_at=_timestamp(value.get("observed_at"), "observed_at"),
+            observed_at=observed_at,
             market_type=str(value.get("market_type", "perp")),
             venue=str(value.get("venue", "robinhood")),
+            margin_evidence=ReadinessMarketMarginEvidence.from_response(
+                value,
+                market_id=market_id,
+                symbol=symbol,
+                observed_at=observed_at,
+            ),
         )
 
 
@@ -463,7 +608,18 @@ class ReadOnlyLighterSdkClient:
         for target, source in aliases.items():
             if target not in values and source in observed:
                 values[target] = observed[source]
-        return ReadinessMarketMetadata.from_mapping(values)
+        metadata = ReadinessMarketMetadata.from_mapping(values)
+        return replace(
+            metadata,
+            margin_evidence=ReadinessMarketMarginEvidence.from_response(
+                observed,
+                market_id=metadata.market_id,
+                symbol=metadata.symbol,
+                observed_at=metadata.observed_at,
+                source="lighter-sdk.order_book_details response",
+                sdk_version=self.sdk_version,
+            ),
+        )
 
     async def order_book_snapshot(self, market_id: int) -> OrderBookSnapshot:
         market_id = _strict_integer(market_id, "market_id", minimum=0)
@@ -537,13 +693,23 @@ class ReadOnlyLighterSdkClient:
                 matching_positions.append(candidate)
         if len(matching_positions) > 1:
             raise ContractError("Lighter account positions contain duplicate selected market records")
-        position = matching_positions[0] if matching_positions else None
-        position = position or {"position": "0", "sign": 1}
+        selected_position = matching_positions[0] if matching_positions else None
+        position = selected_position or {"position": "0", "sign": 1}
         # Account state is public by index; auth is separately required for the
         # active-orders read.  This keeps auth permission distinct from trade
         # dispatch and never treats an auth failure as an empty order list.
         active_orders = await self._active_orders(account_index, market_id)
         active_orders_observed_at = _timestamp(self._clock(), "active orders observation time")
+        margin_evidence = AccountMarginEvidence.from_response(
+            account_index=account_index,
+            market_id=market_id,
+            source_identity=identity.strip(),
+            observed_at=account_observed_at,
+            selected_position=selected_position,
+            account=account,
+            source="lighter-sdk.account response",
+            sdk_version=self.sdk_version,
+        )
         status = account["status"]
         ready = status in (0, 1) or str(status).strip().lower() in {"active", "online"}
         return AccountSnapshot.from_mapping(
@@ -564,6 +730,7 @@ class ReadOnlyLighterSdkClient:
                 # margin delta.  Readiness reports this as UNKNOWN.
                 "incremental_margin_required": None,
                 "incremental_margin_evidence": "",
+                "margin_evidence": margin_evidence,
             }
         )
 
@@ -678,6 +845,12 @@ def _read_failure_code(exc: BaseException) -> str:
 
 
 def _account_details(snapshot: AccountSnapshot) -> dict[str, Any]:
+    margin_evidence = snapshot.margin_evidence or AccountMarginEvidence.unavailable(
+        account_index=snapshot.account_index,
+        market_id=snapshot.market_id,
+        source_identity=snapshot.source_identity,
+        observed_at=snapshot.observed_at,
+    )
     return {
         "account_index": snapshot.account_index,
         "market_id": snapshot.market_id,
@@ -699,7 +872,22 @@ def _account_details(snapshot: AccountSnapshot) -> dict[str, Any]:
         "margin_required": None if snapshot.margin_required is None else format(snapshot.margin_required, "f"),
         "incremental_margin_required": None if snapshot.incremental_margin_required is None else format(snapshot.incremental_margin_required, "f"),
         "incremental_margin_evidence": snapshot.incremental_margin_evidence or None,
+        "margin_evidence": margin_evidence.as_dict(),
     }
+
+
+def _market_margin_details(metadata: ReadinessMarketMetadata | MarketMetadata) -> dict[str, Any]:
+    evidence = getattr(metadata, "margin_evidence", None)
+    if isinstance(evidence, ReadinessMarketMarginEvidence):
+        return evidence.as_dict()
+    return ReadinessMarketMarginEvidence(
+        market_id=metadata.market_id,
+        symbol=metadata.symbol,
+        observed_at=metadata.observed_at,
+        default_initial_margin_fraction=None,
+        minimum_initial_margin_fraction=None,
+        source="not returned",
+    ).as_dict()
 
 
 async def run_readiness(
@@ -743,6 +931,34 @@ async def run_readiness(
             _check(checks, "market_status", "PASS", "MARKET_ACTIVE", "current perpetual is active", market_status=metadata.status)
         else:
             _check(checks, "market_status", "BLOCKED", "MARKET_INACTIVE", "current perpetual is not active", market_status=metadata.status)
+
+        margin_evidence = getattr(metadata, "margin_evidence", None)
+        if isinstance(margin_evidence, ReadinessMarketMarginEvidence):
+            if margin_evidence.invalid_fields:
+                _check(
+                    checks,
+                    "market_margin_evidence",
+                    "UNKNOWN",
+                    "MARKET_MARGIN_EVIDENCE_INVALID",
+                    "current market margin defaults contain invalid or conflicting fields",
+                    invalid_fields=list(margin_evidence.invalid_fields),
+                )
+            elif margin_evidence.status == "INCOMPLETE":
+                _check(
+                    checks,
+                    "market_margin_evidence",
+                    "UNKNOWN",
+                    "MARKET_MARGIN_EVIDENCE_INCOMPLETE",
+                    "current market margin defaults are incomplete; no units or defaults are inferred",
+                )
+            else:
+                _check(
+                    checks,
+                    "market_margin_evidence",
+                    "PASS",
+                    "MARKET_MARGIN_EVIDENCE_OBSERVED",
+                    "current market margin defaults are retained for diagnosis only",
+                )
     except Exception as exc:
         _check(checks, "market_identity", "UNKNOWN", "MARKET_READ_FAILED", "current market identity could not be established", reason=sanitize_exception(exc))
         _check(checks, "market_status", "UNKNOWN", "MARKET_READ_FAILED", "current market status could not be established", reason=sanitize_exception(exc))
@@ -831,7 +1047,17 @@ async def run_readiness(
             _check(checks, f"{prefix}_status", "BLOCKED", "ACCOUNT_INACTIVE", f"{role} account is not active/online")
         else:
             _check(checks, f"{prefix}_status", "PASS", "ACCOUNT_ACTIVE", f"{role} account is active/online")
-        if snapshot.signed_position == 0:
+        margin_evidence = snapshot.margin_evidence
+        if margin_evidence is not None and margin_evidence.selected_position_present is False:
+            _check(
+                checks,
+                f"{prefix}_position",
+                "UNKNOWN",
+                "POSITION_ROW_ABSENT",
+                f"{role} account response has no selected-market position row; flatness is not independently evidenced",
+                signed_position="0",
+            )
+        elif snapshot.signed_position == 0:
             _check(checks, f"{prefix}_position", "PASS", "POSITION_FLAT", f"{role} selected-market position is flat for paired opening", signed_position="0")
         else:
             _check(checks, f"{prefix}_position", "BLOCKED", "POSITION_NOT_FLAT", f"{role} selected-market position is non-flat; paired opening requires flat accounts", signed_position=format(snapshot.signed_position, "f"))
@@ -839,6 +1065,40 @@ async def run_readiness(
             _check(checks, f"{prefix}_active_orders", "BLOCKED", "ACTIVE_ORDERS_PRESENT", f"{role} has active orders on the selected market", count=len(snapshot.active_orders))
         else:
             _check(checks, f"{prefix}_active_orders", "PASS", "NO_ACTIVE_ORDERS", f"{role} has no active selected-market orders")
+        if margin_evidence is not None:
+            if margin_evidence.invalid_fields:
+                _check(
+                    checks,
+                    f"{prefix}_margin_evidence",
+                    "UNKNOWN",
+                    "MARGIN_EVIDENCE_INVALID",
+                    f"{role} returned margin/order evidence contains invalid or conflicting fields",
+                    invalid_fields=list(margin_evidence.invalid_fields),
+                )
+            elif margin_evidence.selected_position_present is False:
+                _check(
+                    checks,
+                    f"{prefix}_margin_evidence",
+                    "UNKNOWN",
+                    "MARGIN_EVIDENCE_POSITION_ROW_ABSENT",
+                    f"{role} margin settings are unavailable because the selected-market position row is absent",
+                )
+            elif margin_evidence.incomplete:
+                _check(
+                    checks,
+                    f"{prefix}_margin_evidence",
+                    "UNKNOWN",
+                    "MARGIN_EVIDENCE_INCOMPLETE",
+                    f"{role} returned margin/order evidence is incomplete; no units or defaults are inferred",
+                )
+            else:
+                _check(
+                    checks,
+                    f"{prefix}_margin_evidence",
+                    "PASS",
+                    "MARGIN_EVIDENCE_OBSERVED",
+                    f"{role} returned margin/order evidence is retained for diagnosis only",
+                )
         if snapshot.margin_available is None or snapshot.margin_required is None:
             missing = []
             if snapshot.margin_available is None:
@@ -922,6 +1182,7 @@ async def run_readiness(
             "minimum_base_amount": format(metadata.minimum_base_amount, "f"),
             "minimum_quote_amount": format(metadata.minimum_quote_amount, "f"),
             "observed_at": metadata.observed_at,
+            "margin_evidence": _market_margin_details(metadata),
         },
         book=None if book is None else book.as_dict(),
         accounts={
@@ -934,6 +1195,7 @@ async def run_readiness(
 __all__ = [
     "ReadinessCheck",
     "ReadinessConfig",
+    "ReadinessMarketMarginEvidence",
     "ReadinessMarketMetadata",
     "ReadinessResult",
     "ReadinessSecretProvider",

@@ -1,6 +1,7 @@
 """Explicit opt-in Lighter HOOD close/reopen utility (HCR-1)."""
 
 from .contracts import (
+    AccountMarginEvidence,
     AccountSnapshot,
     ContractError,
     Direction,
@@ -73,6 +74,7 @@ from .series import (
 from .readiness import (
     ReadinessCheck,
     ReadinessConfig,
+    ReadinessMarketMarginEvidence,
     ReadinessMarketMetadata,
     ReadinessResult,
     ReadinessSecretProvider,
@@ -81,6 +83,7 @@ from .readiness import (
 )
 
 __all__ = [
+    "AccountMarginEvidence",
     "AccountSnapshot",
     "Clock",
     "ContractError",
@@ -152,6 +155,7 @@ __all__ = [
     "size_next_slice",
     "ReadinessCheck",
     "ReadinessConfig",
+    "ReadinessMarketMarginEvidence",
     "ReadinessMarketMetadata",
     "ReadinessResult",
     "ReadinessSecretProvider",

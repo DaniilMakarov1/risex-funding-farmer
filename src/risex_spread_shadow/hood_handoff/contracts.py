@@ -444,6 +444,398 @@ class OrderSnapshot:
         )
 
 
+def _optional_nonnegative_text(value: Any, name: str) -> str | None:
+    """Validate a documented numeric string while preserving its raw text."""
+
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ContractError(f"{name} must be a non-negative numeric string")
+    parsed = _nonnegative(value, name)
+    del parsed
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class AccountMarginEvidence:
+    """Whitelisted, source-bound margin fields from one account response.
+
+    Margin strings are deliberately retained as raw documented values.  Their
+    response units are not inferred from the signing client's basis-point
+    input encoding.  ``invalid_fields`` records rejected optional fields while
+    keeping the rest of the account response usable for diagnostics.
+    """
+
+    account_index: int
+    market_id: int
+    source_identity: str
+    observed_at: float
+    selected_position_present: bool | None
+    selected_margin_mode: int | None
+    selected_initial_margin_fraction: str | None
+    selected_allocated_margin: str | None
+    selected_open_order_count: int | None
+    selected_pending_order_count: int | None
+    selected_position_tied_order_count: int | None
+    account_total_order_count: int | None
+    account_pending_order_count: int | None
+    account_total_isolated_order_count: int | None
+    account_cross_asset_value: str | None
+    account_cross_initial_margin_requirement: str | None
+    account_cross_maintenance_margin_requirement: str | None
+    invalid_fields: tuple[str, ...] = ()
+    source: str = "account response"
+    sdk_version: str | None = None
+
+    def __post_init__(self) -> None:
+        _int(self.account_index, "account_index", minimum=0)
+        _int(self.market_id, "market_id", minimum=0)
+        _text(self.source_identity, "source_identity")
+        _timestamp(self.observed_at, "observed_at")
+        if self.selected_position_present is not None and not isinstance(self.selected_position_present, bool):
+            raise ContractError("selected_position_present must be bool or None")
+        if self.selected_margin_mode is not None:
+            _int(self.selected_margin_mode, "selected_margin_mode", minimum=0)
+        for value, name in (
+            (self.selected_initial_margin_fraction, "selected_initial_margin_fraction"),
+            (self.selected_allocated_margin, "selected_allocated_margin"),
+            (self.account_cross_asset_value, "account_cross_asset_value"),
+            (self.account_cross_initial_margin_requirement, "account_cross_initial_margin_requirement"),
+            (self.account_cross_maintenance_margin_requirement, "account_cross_maintenance_margin_requirement"),
+        ):
+            _optional_nonnegative_text(value, name)
+        for value, name in (
+            (self.selected_open_order_count, "selected_open_order_count"),
+            (self.selected_pending_order_count, "selected_pending_order_count"),
+            (self.selected_position_tied_order_count, "selected_position_tied_order_count"),
+            (self.account_total_order_count, "account_total_order_count"),
+            (self.account_pending_order_count, "account_pending_order_count"),
+            (self.account_total_isolated_order_count, "account_total_isolated_order_count"),
+        ):
+            if value is not None:
+                _int(value, name, minimum=0)
+        if not isinstance(self.invalid_fields, tuple) or any(
+            not isinstance(item, str) or not item for item in self.invalid_fields
+        ):
+            raise ContractError("invalid_fields must be a tuple of non-empty names")
+        _text(self.source, "source")
+        if self.sdk_version is not None:
+            _text(self.sdk_version, "sdk_version")
+
+    @classmethod
+    def from_response(
+        cls,
+        *,
+        account_index: int,
+        market_id: int,
+        source_identity: str,
+        observed_at: float,
+        selected_position: Mapping[str, Any] | None,
+        account: Mapping[str, Any],
+        source: str = "account response",
+        sdk_version: str | None = None,
+    ) -> "AccountMarginEvidence":
+        """Read only the documented margin/count keys from an account row."""
+
+        invalid: list[str] = []
+
+        def raw_text(
+            mapping: Mapping[str, Any], name: str, *, invalid_name: str | None = None
+        ) -> str | None:
+            if name not in mapping or mapping[name] is None:
+                return None
+            value = mapping[name]
+            if not isinstance(value, str) or not value.strip():
+                invalid.append(invalid_name or name)
+                return None
+            try:
+                _optional_nonnegative_text(value, name)
+            except ContractError:
+                invalid.append(invalid_name or name)
+                return None
+            return value
+
+        def raw_count(
+            mapping: Mapping[str, Any], name: str, *, invalid_name: str | None = None
+        ) -> int | None:
+            if name not in mapping or mapping[name] is None:
+                return None
+            value = mapping[name]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                invalid.append(invalid_name or name)
+                return None
+            return value
+
+        def raw_mode(
+            mapping: Mapping[str, Any], name: str, *, invalid_name: str | None = None
+        ) -> int | None:
+            if name not in mapping or mapping[name] is None:
+                return None
+            value = mapping[name]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                invalid.append(invalid_name or name)
+                return None
+            return value
+
+        selected = selected_position or {}
+        selected_present = selected_position is not None
+        selected_open = raw_count(selected, "open_order_count") if selected_present else None
+        selected_pending = (
+            raw_count(
+                selected,
+                "pending_order_count",
+                invalid_name="selected_pending_order_count",
+            )
+            if selected_present
+            else None
+        )
+        selected_tied = raw_count(selected, "position_tied_order_count") if selected_present else None
+        account_total = raw_count(account, "total_order_count")
+        account_pending = raw_count(
+            account,
+            "pending_order_count",
+            invalid_name="account_pending_order_count",
+        )
+        account_isolated = raw_count(account, "total_isolated_order_count")
+        if (
+            selected_pending is not None
+            and selected_open is not None
+            and selected_pending > selected_open
+        ):
+            invalid.append("selected_order_counts")
+        if (
+            selected_tied is not None
+            and selected_open is not None
+            and selected_tied > selected_open
+        ):
+            invalid.append("selected_order_counts")
+        if (
+            account_total is not None
+            and account_pending is not None
+            and account_pending > account_total
+        ):
+            invalid.append("account_order_counts")
+        if (
+            account_total is not None
+            and account_isolated is not None
+            and account_isolated > account_total
+        ):
+            invalid.append("account_order_counts")
+        if (
+            account_total is not None
+            and selected_open is not None
+            and selected_open > account_total
+        ):
+            invalid.append("account_order_counts")
+        return cls(
+            account_index=account_index,
+            market_id=market_id,
+            source_identity=source_identity,
+            observed_at=observed_at,
+            selected_position_present=selected_present,
+            selected_margin_mode=raw_mode(selected, "margin_mode") if selected_present else None,
+            selected_initial_margin_fraction=(
+                raw_text(selected, "initial_margin_fraction") if selected_present else None
+            ),
+            selected_allocated_margin=raw_text(selected, "allocated_margin") if selected_present else None,
+            selected_open_order_count=selected_open,
+            selected_pending_order_count=selected_pending,
+            selected_position_tied_order_count=selected_tied,
+            account_total_order_count=account_total,
+            account_pending_order_count=account_pending,
+            account_total_isolated_order_count=account_isolated,
+            account_cross_asset_value=raw_text(account, "cross_asset_value"),
+            account_cross_initial_margin_requirement=raw_text(account, "cross_initial_margin_requirement"),
+            account_cross_maintenance_margin_requirement=raw_text(
+                account, "cross_maintenance_margin_requirement"
+            ),
+            invalid_fields=tuple(dict.fromkeys(invalid)),
+            source=source,
+            sdk_version=sdk_version,
+        )
+
+    @classmethod
+    def unavailable(
+        cls,
+        *,
+        account_index: int,
+        market_id: int,
+        source_identity: str,
+        observed_at: float,
+    ) -> "AccountMarginEvidence":
+        """Create an explicit unavailable record for legacy/synthetic clients."""
+
+        return cls(
+            account_index=account_index,
+            market_id=market_id,
+            source_identity=source_identity,
+            observed_at=observed_at,
+            selected_position_present=None,
+            selected_margin_mode=None,
+            selected_initial_margin_fraction=None,
+            selected_allocated_margin=None,
+            selected_open_order_count=None,
+            selected_pending_order_count=None,
+            selected_position_tied_order_count=None,
+            account_total_order_count=None,
+            account_pending_order_count=None,
+            account_total_isolated_order_count=None,
+            account_cross_asset_value=None,
+            account_cross_initial_margin_requirement=None,
+            account_cross_maintenance_margin_requirement=None,
+            source="not returned",
+            sdk_version=None,
+        )
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "AccountMarginEvidence":
+        """Construct a validated evidence record from a synthetic response."""
+
+        selected = value.get("selected_position")
+        if selected is not None and not isinstance(selected, Mapping):
+            selected = None
+        account = value.get("account")
+        if not isinstance(account, Mapping):
+            account = value
+        return cls.from_response(
+            account_index=_int(value.get("account_index"), "account_index", minimum=0),
+            market_id=_int(value.get("market_id"), "market_id", minimum=0),
+            source_identity=_text(value.get("source_identity"), "source_identity"),
+            observed_at=_timestamp(value.get("observed_at"), "observed_at"),
+            selected_position=selected,
+            account=account,
+            source=_text(value.get("source", "account response"), "source"),
+            sdk_version=(
+                None
+                if value.get("sdk_version") is None
+                else _text(value.get("sdk_version"), "sdk_version")
+            ),
+        )
+
+    @property
+    def incomplete(self) -> bool:
+        if self.selected_margin_mode not in (0, 1):
+            return True
+        required = (
+            self.selected_position_present,
+            self.selected_margin_mode,
+            self.selected_initial_margin_fraction,
+            self.selected_allocated_margin,
+            self.account_total_order_count,
+            self.account_pending_order_count,
+            self.account_total_isolated_order_count,
+            self.account_cross_asset_value,
+            self.account_cross_initial_margin_requirement,
+        )
+        return any(value is None for value in required)
+
+    @property
+    def status(self) -> str:
+        if self.source == "not returned":
+            return "UNAVAILABLE"
+        if self.invalid_fields:
+            return "INVALID"
+        if self.selected_position_present is False:
+            return "POSITION_ROW_ABSENT"
+        if self.incomplete:
+            return "INCOMPLETE"
+        return "OBSERVED"
+
+    @staticmethod
+    def _field(
+        name: str,
+        value: Any,
+        invalid_fields: tuple[str, ...],
+        units: str,
+        *,
+        invalid_name: str | None = None,
+    ) -> dict[str, Any]:
+        invalid = (invalid_name or name) in invalid_fields or name in invalid_fields
+        present = invalid or value is not None
+        return {
+            "present": present,
+            "valid": False if invalid else (True if present else None),
+            "raw": None if invalid else value,
+            "units": units,
+        }
+
+    def as_dict(self) -> dict[str, Any]:
+        invalid = self.invalid_fields
+        margin_mode = self._field("margin_mode", self.selected_margin_mode, invalid, "enum_raw")
+        if margin_mode["valid"] is False or not margin_mode["present"]:
+            margin_mode["label"] = None
+        else:
+            margin_mode["label"] = {0: "cross", 1: "isolated"}.get(
+                self.selected_margin_mode, "unknown"
+            )
+        return {
+            "status": self.status,
+            "binding": {
+                "account_index": self.account_index,
+                "market_id": self.market_id,
+                "source_identity": self.source_identity,
+            },
+            "provenance": {
+                "source": self.source,
+                "sdk_version": self.sdk_version,
+                "observed_at": self.observed_at,
+            },
+            "selected_position": {
+                "present": self.selected_position_present,
+                "margin_mode": margin_mode,
+                "initial_margin_fraction": self._field(
+                    "initial_margin_fraction", self.selected_initial_margin_fraction, invalid, "unverified"
+                ),
+                "allocated_margin": self._field(
+                    "allocated_margin", self.selected_allocated_margin, invalid, "unverified"
+                ),
+                "open_order_count": self._field("open_order_count", self.selected_open_order_count, invalid, "count"),
+                "pending_order_count": self._field(
+                    "pending_order_count",
+                    self.selected_pending_order_count,
+                    invalid,
+                    "count",
+                    invalid_name="selected_pending_order_count",
+                ),
+                "position_tied_order_count": self._field(
+                    "position_tied_order_count", self.selected_position_tied_order_count, invalid, "count"
+                ),
+            },
+            "account": {
+                "total_order_count": self._field(
+                    "total_order_count", self.account_total_order_count, invalid, "count"
+                ),
+                "pending_order_count": self._field(
+                    "pending_order_count",
+                    self.account_pending_order_count,
+                    invalid,
+                    "count",
+                    invalid_name="account_pending_order_count",
+                ),
+                "total_isolated_order_count": self._field(
+                    "total_isolated_order_count", self.account_total_isolated_order_count, invalid, "count"
+                ),
+                "cross_asset_value": self._field(
+                    "cross_asset_value", self.account_cross_asset_value, invalid, "unverified"
+                ),
+                "cross_initial_margin_requirement": self._field(
+                    "cross_initial_margin_requirement",
+                    self.account_cross_initial_margin_requirement,
+                    invalid,
+                    "unverified",
+                ),
+                "cross_maintenance_margin_requirement": self._field(
+                    "cross_maintenance_margin_requirement",
+                    self.account_cross_maintenance_margin_requirement,
+                    invalid,
+                    "unverified",
+                ),
+            },
+            "invalid_fields": list(invalid),
+            "units_note": "Margin numeric response units are unverified; no signing input encoding was applied.",
+        }
+
+
 @dataclass(frozen=True, slots=True)
 class AccountSnapshot:
     account_index: int
@@ -459,6 +851,7 @@ class AccountSnapshot:
     source_identity: str
     incremental_margin_required: Decimal | None = None
     incremental_margin_evidence: str = ""
+    margin_evidence: AccountMarginEvidence | None = None
 
     def __post_init__(self) -> None:
         _int(self.account_index, "account_index", minimum=0)
@@ -479,6 +872,15 @@ class AccountSnapshot:
             _nonnegative(self.incremental_margin_required, "incremental_margin_required")
         if self.incremental_margin_evidence:
             _text(self.incremental_margin_evidence, "incremental_margin_evidence")
+        if self.margin_evidence is not None:
+            if not isinstance(self.margin_evidence, AccountMarginEvidence):
+                raise ContractError("margin_evidence must be AccountMarginEvidence or None")
+            if (
+                self.margin_evidence.account_index != self.account_index
+                or self.margin_evidence.market_id != self.market_id
+                or self.margin_evidence.source_identity != self.source_identity
+            ):
+                raise ContractError("margin_evidence identity does not match account snapshot")
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "AccountSnapshot":
@@ -492,6 +894,14 @@ class AccountSnapshot:
             position = raw_position * sign
         raw_orders = value.get("active_orders", ())
         raw_incremental_evidence = value.get("incremental_margin_evidence")
+        raw_margin_evidence = value.get("margin_evidence")
+        margin_evidence = (
+            None
+            if raw_margin_evidence is None
+            else raw_margin_evidence
+            if isinstance(raw_margin_evidence, AccountMarginEvidence)
+            else AccountMarginEvidence.from_mapping(raw_margin_evidence)
+        )
         return cls(
             account_index=_int(value.get("account_index"), "account_index", minimum=0),
             market_id=_int(value.get("market_id"), "market_id", minimum=0),
@@ -529,6 +939,7 @@ class AccountSnapshot:
                 if raw_incremental_evidence in (None, "")
                 else _text(raw_incremental_evidence, "incremental_margin_evidence")
             ),
+            margin_evidence=margin_evidence,
         )
 
 
