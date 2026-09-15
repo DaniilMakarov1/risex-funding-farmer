@@ -30,6 +30,7 @@ from .contracts import (
     OrderSnapshot,
     TradeReceipt,
     OFFICIAL_MAINNET_CHAIN_ID,
+    _nonnegative,
 )
 from .journal import sanitize_exception
 
@@ -539,6 +540,10 @@ class LighterSdkClient:
         fee_rate = self.market_evidence.get(fee_rate_key)
         incremental_margin = self.market_evidence.get(incremental_key)
         incremental_evidence = self.market_evidence.get(incremental_evidence_key, "")
+        if incremental_margin is not None:
+            # Validate a supplied estimate before missing provenance can turn
+            # it into an apparently absent value under explicit deferral.
+            _nonnegative(incremental_margin, incremental_key)
         if incremental_margin is None or not incremental_evidence:
             # Do not treat current cross margin as the requirement of adding Q.
             incremental_margin = None

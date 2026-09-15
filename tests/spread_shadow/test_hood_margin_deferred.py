@@ -8,9 +8,11 @@ import pytest
 
 from risex_spread_shadow.hood_handoff import (
     ContractError,
+    LighterSdkClient,
     MutationReceipt,
     OperationMode,
     Outcome,
+    StaticSecretProvider,
     run_handoff,
     run_series,
 )
@@ -255,6 +257,121 @@ async def test_deferred_exchange_rejection_is_not_a_fill_or_replay(tmp_path):
     assert result.receiver.filled_quantity == Decimal("0")
     assert result.receiver.trades == ()
     assert client.cancellations == ["source-0"]
+
+    resumed_client = RejectingMissingIncrementalClient()
+    resumed = await run_handoff(
+        paired_config(path, defer_incremental_margin_calculation=True),
+        resumed_client,
+        clock=Clock(),
+    )
+    assert resumed.outcome is Outcome.UNKNOWN
+    assert resumed_client.submissions == []
+    assert resumed_client.cancellations == []
+    assert "RESTART_RECONCILIATION_ONLY" in path.read_text(encoding="utf-8")
+
+
+class AdapterSnapshotSigner:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+    async def create_auth_token_with_expiry(self, **kwargs):
+        return "synthetic-adapter-token"
+
+
+class AdapterSnapshotAccountApi:
+    def __init__(self, api_client):
+        self.api_client = api_client
+
+    async def account(self, **kwargs):
+        index = int(kwargs["value"])
+        return {
+            "code": 200,
+            "accounts": [
+                {
+                    "index": index,
+                    "l1_address": f"synthetic-adapter-account-{index}",
+                    "status": "active",
+                    "positions": [{"market_id": 1, "position": "0", "sign": 1}],
+                    "available_balance": "100",
+                    "cross_initial_margin_requirement": "1",
+                }
+            ],
+        }
+
+
+class AdapterSnapshotOrderApi:
+    def __init__(self, api_client):
+        self.api_client = api_client
+
+    async def account_active_orders(self, **kwargs):
+        assert kwargs["authorization"] == "synthetic-adapter-token"
+        return {"code": 200, "orders": []}
+
+
+class AdapterSnapshotApiClient:
+    def __init__(self, configuration):
+        self.configuration = configuration
+
+
+class AdapterSnapshotLighter:
+    AccountApi = AdapterSnapshotAccountApi
+    OrderApi = AdapterSnapshotOrderApi
+    ApiClient = AdapterSnapshotApiClient
+
+    class Configuration:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+
+def _adapter_snapshot_client(market_evidence):
+    client = LighterSdkClient(
+        paired_config("/tmp/hcr8-adapter-snapshot.jsonl"),
+        source_account_index=11,
+        receiver_account_index=22,
+        secrets=StaticSecretProvider({11: "synthetic-key-a", 22: "synthetic-key-b"}),
+        market_evidence=market_evidence,
+        signer_factory=AdapterSnapshotSigner,
+        clock=lambda: 1_000.0,
+    )
+    client._lighter = lambda: AdapterSnapshotLighter
+    return client
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("account_index", "incremental_key"),
+    [
+        (11, "source_incremental_margin_required"),
+        (22, "receiver_incremental_margin_required"),
+    ],
+)
+@pytest.mark.parametrize("raw_value", ["-1", "NaN", "malformed"])
+async def test_sdk_adapter_rejects_invalid_supplied_incremental_before_missing_provenance(
+    account_index, incremental_key, raw_value
+):
+    client = _adapter_snapshot_client({incremental_key: raw_value})
+
+    with pytest.raises(ContractError, match="incremental_margin_required"):
+        await client.account_snapshot(account_index, 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("account_index", "incremental_key"),
+    [
+        (11, "source_incremental_margin_required"),
+        (22, "receiver_incremental_margin_required"),
+    ],
+)
+async def test_sdk_adapter_keeps_missing_incremental_unknown_for_explicit_deferral(
+    account_index, incremental_key
+):
+    client = _adapter_snapshot_client({incremental_key: "2"})
+
+    snapshot = await client.account_snapshot(account_index, 1)
+
+    assert snapshot.incremental_margin_required is None
+    assert snapshot.incremental_margin_evidence == ""
 
 
 def test_cli_flag_is_explicit_and_preview_remains_offline(tmp_path, capsys):
