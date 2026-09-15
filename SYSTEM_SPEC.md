@@ -3,9 +3,9 @@
 SYSTEM_SPEC_VERSION = 4.0
 SPEC_STATUS = FIRST_RAW_RESEARCH_SCANNER_IMPLEMENTED
 
-## HCR-6 amendment — optional macOS Keychain persistence (authorized, not yet accepted)
+## HCR-6 amendment — optional macOS Keychain persistence (accepted offline)
 
-Owner requested persistent local API credentials on 2026-09-15. The separately invoked utility may offer opt-in macOS Keychain storage/reuse bound to exact API origin/signing environment, account and key index, with replacement/removal and no plaintext fallback. This supersedes in-memory-only persistence restrictions solely for protected local Keychain storage. Secret exclusion from chat/arguments/environment/files/logs/reports/Git and agent offline-only testing remain. Default preview/help/import stays credential-free. NEXT_TASK holds finite acceptance and pending test-network verification. No execution, margin or price semantics change follows from credential persistence.
+Accepted candidate 11bde5bd68177b2476d784f34e3ea9babccf63ed; final clean isolated Python3.11 suite4352 passed,3 skipped. Owner requested persistent local API credentials on 2026-09-15. The separately invoked utility may offer opt-in macOS Keychain storage/reuse bound to exact API origin/signing environment, account and key index, with replacement/removal and no plaintext fallback. This supersedes in-memory-only persistence restrictions solely for protected local Keychain storage. Secret exclusion from chat/arguments/environment/files/logs/reports/Git and agent offline-only testing remain. Default preview/help/import stays credential-free. NEXT_TASK holds finite acceptance and pending test-network verification. No execution, margin or price semantics change follows from credential persistence.
 
 ## HCR-5 amendment — local readiness inspection (accepted offline)
 

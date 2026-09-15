@@ -1,6 +1,18 @@
 # RISEx Spread Shadow and legacy Funding Farmer
 
 
+## Optional local API-key storage — HCR-6
+
+Accepted offline candidate `11bde5bd68177b2476d784f34e3ea9babccf63ed`: final clean isolated Python3.11 suite **4352 passed, 3 skipped**.
+
+Use `--keychain` to save each API key in macOS Keychain on first hidden entry and reuse it on subsequent invocations. This option is supported by readiness and the existing explicitly operator-run execution command. No extra Python package is needed. Stored credentials are bound to the exact HTTPS API origin, signing environment/chain, account index and API key index. Saving a key does not verify that it is correct or grant trading permission.
+
+The first invocation still requires local input for each missing key: earlier in-memory runs did not retain keys. Later invocations with `--keychain` read the matching Keychain entries without requesting the keys again; macOS may still request Keychain access/unlock permission. Keychain denial or failure stops before client/network construction, with no plaintext fallback. Omitting `--keychain` preserves hidden in-memory input each time. No key should be placed in a command, environment variable, JSON file or chat.
+
+To replace stored keys, use `--keychain-replace` instead of `--keychain`; this requests fresh hidden input for both configured accounts and then continues the selected operation. To remove only the matching local records, use `--keychain-remove` instead; it exits after removal without constructing an SDK client or making network requests. For example, take the readiness command below and replace its final `--keychain` with `--keychain-remove`. Removal must not be combined with execution flags or either other Keychain option. Removal does not revoke API keys on the venue.
+
+Help and execution preview remain offline and do not access Keychain even when `--keychain` is present. Agent verification uses synthetic keys/backends; real user keys and actual OS Keychain storage are not accessed in those tests. The current configured Robinhood endpoint has not been established as a valueless test environment. No agent order test follows from credential persistence.
+
 ## Local read-only readiness check — HCR-5
 
 A separate `readiness` command checks current Robinhood market/account state without sending orders. Accepted offline candidate `3de9e91ac16bd0faa2caeed2efa15c7e5ae82ae4` passed the final clean isolated Python3.11 suite with pinned SDK1.1.2: 4331 passed,3 skipped. This is an operator-run account inspection; agents have tested synthetic reads only. It uses the pinned Lighter SDK1.1.2 and read authentication, with an explicit no-op nonce manager. It never invokes create/cancel/sendTx/transfer/withdraw or mutation nonce methods.
@@ -13,12 +25,13 @@ cd "/Users/daniilmakarov/Desktop/RISEx Spread Shadow"
   --symbol BTC --quantity 0.00020 --direction LONG \
   --source-account-index 27331 --receiver-account-index 27337 \
   --api-key-index 4 \
-  --freshness-seconds 120 --request-timeout-seconds 10
+  --freshness-seconds 120 --request-timeout-seconds 10 \
+  --keychain
 ```
 
 Here `LONG` means receiver LONG and source SHORT. Quantity0.00020BTC is the owner-confirmed amount; the command rechecks current minimums rather than assuming the saved dollar estimate. The120-second freshness bound and10-second per-request timeout are explicit **diagnostic** settings allowing time for manual input; they do not set trading deadlines, select prices or grant execution. Age is measured at the final check, and key-entry delay does not renew old data. Change diagnostic bounds explicitly if needed and interpret a stale result accordingly.
 
-Wait for the actual prompt `Lighter API key for account … (hidden input):`. Enter the corresponding local API private key and press Enter, then repeat for the other account if prompted. Characters are not echoed. Do not paste keys into the shell before this prompt. The keys and authentication tokens remain in process memory, not in JSON configuration, arguments, environment variables or report files. Use replacement keys for any that were exposed in chat. Non-interactive input is rejected. Normal `--help` and old offline preview do not ask for keys or make requests.
+Wait for the actual hidden-key prompt for the relevant account. With `--keychain`, a missing record prompts `Lighter private key for account … (hidden input; saved to Keychain):`. Enter the corresponding local API private key and press Enter, then repeat for the other account if prompted. Characters are not echoed. Do not paste keys into the shell before this prompt. With `--keychain`, API keys are persisted in protected macOS Keychain and loaded into process memory when needed; authentication tokens remain in memory. Without that option, keys also remain in memory only. Neither path stores keys in JSON configuration, arguments, environment variables or report files. Use replacement keys for any that were exposed in chat. Non-interactive input is rejected. Normal `--help` and old offline preview do not ask for keys or make requests.
 
 This diagnostic does not need fabricated `market-evidence.json`, quantity-to-margin numbers, or trade-execution flags. Combining readiness with `--execute`, either live-operation acknowledgment, `--confirm-plan`, `--config` or `--market-evidence` is rejected before client/key creation. Optional `--source-limit-price` and `--receiver-worst-price` check prices you have already selected; this example intentionally leaves them UNSET. No launch-ready trading file is created.
 

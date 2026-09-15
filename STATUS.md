@@ -1,8 +1,12 @@
 # Current status
 
-## HCR-6 credential persistence — authorized, implementation pending
+## HCR-6 secure local credential persistence — ACCEPTED OFFLINE
 
-Sole successor Chief is 01a0a563-dcbe-7bc0-bcde-f69f1cd3822b; predecessor relinquished management in the owner-requested handoff. Accepted base 2bcfb23 verified clean before new work. Owner-supplied READ_ONLY report: both account reads PASS, BTC positions zero/no active BTC orders at report time, overall UNKNOWN due to missing opening-margin proof and UNSET prices. No keys transferred to Chief. Owner authorizes persistent local keys and states allocated balances are test-only. Optional macOS Keychain implementation/offline verification is scoped in NEXT_TASK; exact test environment verification remains pending. No agent live calls, credential access or new collection performed.
+Accepted candidate 11bde5bd68177b2476d784f34e3ea9babccf63ed, sole successor Chief 01a0a563-dcbe-7bc0-bcde-f69f1cd3822b. Builder 01a0a572-9cce-7082-b239-ed5ffe98d142 delivered directly and is complete; branch/worktree preserved, no monitoring. Optional native macOS Keychain first-save/reuse/replacement/removal added for explicit readiness/operator execution. No dependencies, plaintext fallback, default preview credential access or trading-policy changes.
+
+Chief full 5-file diff reviewed; independent native-memory/fake-Security8 and CLI7 behaviors PASS. Clean isolated Python3.11.5/pinnedSDK1.1.2 final suite4352 passed,3 skipped,exit0,129.84s. Exact Builder hashes, source before/after and project import roots verified. Evidence original-root spread-shadow-runs/hood-keychain-20260915/chief-v1. Earlier Builder full failures caused by system Git/Xcode and dirty-source checks remain preserved, resolved in clean final run using existing standalone Git2.53.0; no license/global setting changes. Tested production source remains unchanged through docs/integration.
+
+Actual user credentials and OS Keychain storage/read/write NOT_RUN; first local hidden enrollment remains necessary. User says balances are test-only, but exact valueless execution environment is not established for configured Robinhood API; official-source findings preserved. No agent account/signing/order/market collection performed. Opening-margin proof remains UNKNOWN and price bounds UNSET. Broader order-test request remains incomplete; NEXT_TASK records exact remaining conditions. Owner supplied earlier report established both reads PASS and no selected BTC positions/orders at report time only.
 
 ## HCR-5 local read-only readiness — ACCEPTED OFFLINE
 
