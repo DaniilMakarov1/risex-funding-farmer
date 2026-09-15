@@ -391,9 +391,18 @@ class HandoffEngine:
                     source_recheck.margin_available is None
                     or source_recheck.margin_required is None
                     or source_recheck.margin_required > source_recheck.margin_available
-                    or source_recheck.incremental_margin_required is None
-                    or source_recheck.incremental_margin_required > source_recheck.margin_available
-                    or not source_recheck.incremental_margin_evidence
+                    or (
+                        not config.defer_incremental_margin_calculation
+                        and (
+                            source_recheck.incremental_margin_required is None
+                            or not source_recheck.incremental_margin_evidence
+                        )
+                    )
+                    or (
+                        source_recheck.incremental_margin_required is not None
+                        and source_recheck.incremental_margin_evidence
+                        and source_recheck.incremental_margin_required > source_recheck.margin_available
+                    )
                 ):
                     unknown_reasons.append("source margin recheck is insufficient or missing")
                 elif not self._active_orders_match(source_recheck, plan.source, source_order.order_id):
@@ -408,9 +417,18 @@ class HandoffEngine:
                     receiver_recheck.margin_available is None
                     or receiver_recheck.margin_required is None
                     or receiver_recheck.margin_required > receiver_recheck.margin_available
-                    or receiver_recheck.incremental_margin_required is None
-                    or receiver_recheck.incremental_margin_required > receiver_recheck.margin_available
-                    or not receiver_recheck.incremental_margin_evidence
+                    or (
+                        not config.defer_incremental_margin_calculation
+                        and (
+                            receiver_recheck.incremental_margin_required is None
+                            or not receiver_recheck.incremental_margin_evidence
+                        )
+                    )
+                    or (
+                        receiver_recheck.incremental_margin_required is not None
+                        and receiver_recheck.incremental_margin_evidence
+                        and receiver_recheck.incremental_margin_required > receiver_recheck.margin_available
+                    )
                 ):
                     unknown_reasons.append("receiver margin recheck is insufficient or missing")
                 elif not self._source_is_resting(source_order, plan.source):
@@ -628,6 +646,7 @@ class HandoffEngine:
             receiver_identity=receiver.source_identity,
             metadata_observed_at=metadata.observed_at,
             operation_mode=config.operation_mode,
+            defer_incremental_margin_calculation=config.defer_incremental_margin_calculation,
         )
         journal.append(
             "PREFLIGHT_PROVED",
@@ -1684,6 +1703,7 @@ def _config_binding(config: HandoffConfig, client: HandoffClient) -> dict[str, A
         "direction": config.direction.value,
         "operation_mode": config.operation_mode.value,
         "mode": config.operation_mode.value,
+        "defer_incremental_margin_calculation": config.defer_incremental_margin_calculation,
         "quantity": str(config.quantity),
         "source_limit_price": str(config.source_limit_price),
         "receiver_worst_price": str(config.receiver_worst_price),
@@ -1782,6 +1802,7 @@ def _plan_from_dict(value: Any) -> HandoffPlan:
             None if value.get("metadata_observed_at") is None else float(value["metadata_observed_at"])
         ),
         operation_mode=value.get("operation_mode", value.get("mode", OperationMode.CLOSE_REOPEN.value)),
+        defer_incremental_margin_calculation=value.get("defer_incremental_margin_calculation", False),
     )
 
 
@@ -1797,6 +1818,9 @@ def _plan_matches_binding(plan: HandoffPlan, binding: Mapping[str, Any]) -> bool
             and plan.direction.value == str(binding["direction"])
             and plan.operation_mode.value
             == str(binding.get("operation_mode", binding.get("mode", OperationMode.CLOSE_REOPEN.value)))
+            and isinstance(binding.get("defer_incremental_margin_calculation", False), bool)
+            and plan.defer_incremental_margin_calculation
+            == binding.get("defer_incremental_margin_calculation", False)
             and plan.quantity == Decimal(str(binding["quantity"]))
             and plan.source.quantity == plan.quantity
             and plan.receiver.quantity == plan.quantity

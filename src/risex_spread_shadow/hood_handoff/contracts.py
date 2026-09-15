@@ -1126,6 +1126,9 @@ class HandoffConfig:
     # both selected-market positions to be flat.
     expected_source_position: Decimal | None = None
     expected_receiver_position: Decimal | None = None
+    # HCR-8 opt-in: leave only the local incremental opening-margin estimate
+    # unperformed.  The default remains fail-closed.
+    defer_incremental_margin_calculation: bool = False
 
     def __post_init__(self) -> None:
         _int(self.market_id, "market_id", minimum=0)
@@ -1143,6 +1146,13 @@ class HandoffConfig:
         object.__setattr__(self, "operation_mode", operation_mode)
         if self.mode is not None:
             object.__setattr__(self, "mode", operation_mode)
+        if (
+            self.defer_incremental_margin_calculation is True
+            and operation_mode is not OperationMode.PAIRED_OPENING
+        ):
+            raise ContractError(
+                "defer_incremental_margin_calculation is only supported for PAIRED_OPENING"
+            )
         for field_name in ("expected_source_position", "expected_receiver_position"):
             value = getattr(self, field_name)
             if value is not None:
@@ -1185,6 +1195,8 @@ class HandoffConfig:
             raise ContractError("operator_execution_opt_in must be bool")
         if not isinstance(self.operator_plan_reviewed, bool):
             raise ContractError("operator_plan_reviewed must be bool")
+        if not isinstance(self.defer_incremental_margin_calculation, bool):
+            raise ContractError("defer_incremental_margin_calculation must be bool")
         if self.api_key_index is not None:
             _int(self.api_key_index, "api_key_index", minimum=4)
             if self.api_key_index > 254:
@@ -1292,9 +1304,16 @@ class HandoffConfig:
                 raise PreflightBlocked(f"{label} margin evidence is missing")
             if snapshot.margin_required > snapshot.margin_available:
                 raise PreflightBlocked(f"{label} margin is insufficient")
-            if snapshot.incremental_margin_required is None or not snapshot.incremental_margin_evidence:
+            incremental_margin_missing = (
+                snapshot.incremental_margin_required is None
+                or not snapshot.incremental_margin_evidence
+            )
+            if incremental_margin_missing and not self.defer_incremental_margin_calculation:
                 raise PreflightBlocked(f"{label} incremental planned-operation margin evidence is missing")
-            if snapshot.incremental_margin_required > snapshot.margin_available:
+            if (
+                not incremental_margin_missing
+                and snapshot.incremental_margin_required > snapshot.margin_available
+            ):
                 raise PreflightBlocked(f"{label} incremental planned-operation margin is insufficient")
         if source.account_index == receiver.account_index:
             raise PreflightBlocked("source and receiver accounts must differ")
@@ -1397,6 +1416,7 @@ class HandoffPlan:
     receiver_identity: str = ""
     metadata_observed_at: float | None = None
     operation_mode: OperationMode | str = OperationMode.CLOSE_REOPEN
+    defer_incremental_margin_calculation: bool = False
 
     def __post_init__(self) -> None:
         try:
@@ -1405,6 +1425,8 @@ class HandoffPlan:
             raise ContractError("direction must be LONG or SHORT") from exc
         object.__setattr__(self, "direction", direction)
         object.__setattr__(self, "operation_mode", OperationMode.parse(self.operation_mode))
+        if not isinstance(self.defer_incremental_margin_calculation, bool):
+            raise ContractError("defer_incremental_margin_calculation must be bool")
         _text(self.run_id, "run_id")
         object.__setattr__(self, "quantity", _positive(self.quantity, "quantity"))
         object.__setattr__(self, "source_position_before", _decimal(self.source_position_before, "source_position_before"))
@@ -1478,6 +1500,7 @@ class HandoffPlan:
             "receiver_identity": self.receiver_identity,
             "metadata_observed_at": self.metadata_observed_at,
             "operation_mode": self.operation_mode.value,
+            "defer_incremental_margin_calculation": self.defer_incremental_margin_calculation,
         }
 
 

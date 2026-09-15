@@ -271,6 +271,9 @@ class RobinhoodSeriesConfig:
     operator_plan_reviewed: bool = False
     operation_mode: OperationMode | str = OperationMode.CLOSE_REOPEN
     mode: OperationMode | str | None = None
+    # HCR-8 opt-in: leave only the local incremental opening-margin estimate
+    # unperformed.  The default remains fail-closed.
+    defer_incremental_margin_calculation: bool = False
 
     def __post_init__(self) -> None:
         symbol = _text(self.market_symbol, "market_symbol").upper()
@@ -289,6 +292,13 @@ class RobinhoodSeriesConfig:
         object.__setattr__(self, "operation_mode", operation_mode)
         if self.mode is not None:
             object.__setattr__(self, "mode", operation_mode)
+        if (
+            self.defer_incremental_margin_calculation is True
+            and operation_mode is not OperationMode.PAIRED_OPENING
+        ):
+            raise ContractError(
+                "defer_incremental_margin_calculation is only supported for PAIRED_OPENING"
+            )
         for field_name in (
             "total_quantity",
             "desired_slice_quantity",
@@ -330,6 +340,8 @@ class RobinhoodSeriesConfig:
             raise ContractError("auth_token_lifetime_seconds must not exceed the documented 8-hour lifetime")
         if not isinstance(self.operator_execution_opt_in, bool) or not isinstance(self.operator_plan_reviewed, bool):
             raise ContractError("operator execution and plan review flags must be bool")
+        if not isinstance(self.defer_incremental_margin_calculation, bool):
+            raise ContractError("defer_incremental_margin_calculation must be bool")
 
     def attempt_config(
         self,
@@ -366,6 +378,7 @@ class RobinhoodSeriesConfig:
             environment="robinhood",
             operator_execution_opt_in=self.operator_execution_opt_in,
             operator_plan_reviewed=self.operator_plan_reviewed,
+            defer_incremental_margin_calculation=self.defer_incremental_margin_calculation,
             api_base_url=OFFICIAL_ROBINHOOD_API_URL,
             api_key_index=self.api_key_index,
             chain_id=OFFICIAL_ROBINHOOD_CHAIN_ID,
@@ -392,6 +405,7 @@ class RobinhoodSeriesConfig:
             "direction": self.direction.value,
             "operation_mode": self.operation_mode.value,
             "mode": self.operation_mode.value,
+            "defer_incremental_margin_calculation": self.defer_incremental_margin_calculation,
             "total_quantity": format(self.total_quantity, "f"),
             "desired_slice_quantity": format(self.desired_slice_quantity, "f"),
             "allowed_price_deviation": format(self.allowed_price_deviation, "f"),
@@ -924,6 +938,7 @@ class RobinhoodSeriesEngine:
             "direction": config.direction.value,
             "operation_mode": config.operation_mode.value,
             "mode": config.operation_mode.value,
+            "defer_incremental_margin_calculation": config.defer_incremental_margin_calculation,
             "quantity": format(config.quantity, "f"),
             "source_limit_price": format(config.source_limit_price, "f"),
             "receiver_worst_price": format(config.receiver_worst_price, "f"),

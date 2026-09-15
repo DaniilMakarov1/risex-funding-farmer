@@ -107,6 +107,13 @@ def _parser() -> argparse.ArgumentParser:
         help="confirm that the printed exact plan, price bounds and readiness/margin requirements were reviewed",
     )
     parser.add_argument(
+        "--defer-incremental-margin-calculation",
+        dest="defer_incremental_margin_calculation",
+        action="store_true",
+        default=None,
+        help="explicitly defer only the local incremental opening-margin calculation",
+    )
+    parser.add_argument(
         "--keychain",
         "--use-keychain",
         "--keychain-reuse",
@@ -169,7 +176,12 @@ def _reject_operator_position_overrides(value: Mapping[str, Any], label: str) ->
             )
 
 
-def _config(value: Mapping[str, Any], *, execute: bool) -> HandoffConfig:
+def _config(
+    value: Mapping[str, Any],
+    *,
+    execute: bool,
+    defer_incremental_margin_calculation: bool | None = None,
+) -> HandoffConfig:
     required = (
         "market_id",
         "direction",
@@ -193,6 +205,14 @@ def _config(value: Mapping[str, Any], *, execute: bool) -> HandoffConfig:
         raise SystemExit("config is missing required fields: " + ", ".join(missing))
     _reject_operator_position_overrides(value, "config")
     kwargs = dict(value)
+    if "defer_incremental_margin_calculation" in kwargs and not isinstance(
+        kwargs["defer_incremental_margin_calculation"], bool
+    ):
+        raise SystemExit(
+            "invalid HCR-8 configuration: defer_incremental_margin_calculation must be bool"
+        )
+    if defer_incremental_margin_calculation is not None:
+        kwargs["defer_incremental_margin_calculation"] = defer_incremental_margin_calculation
     # A plan review is an interactive act, never a JSON configuration flag.
     # The only way to set it for this process is the explicit --confirm-plan.
     kwargs.pop("operator_plan_reviewed", None)
@@ -261,7 +281,12 @@ def _config(value: Mapping[str, Any], *, execute: bool) -> HandoffConfig:
         raise SystemExit(f"invalid HCR-1 configuration: {exc}") from exc
 
 
-def _series_config(value: Mapping[str, Any], *, execute: bool) -> RobinhoodSeriesConfig:
+def _series_config(
+    value: Mapping[str, Any],
+    *,
+    execute: bool,
+    defer_incremental_margin_calculation: bool | None = None,
+) -> RobinhoodSeriesConfig:
     """Parse the finite HCR-2 config without inventing numerical defaults."""
 
     required = (
@@ -287,6 +312,14 @@ def _series_config(value: Mapping[str, Any], *, execute: bool) -> RobinhoodSerie
         raise SystemExit("series config is missing required fields: " + ", ".join(missing))
     _reject_operator_position_overrides(value, "series config")
     kwargs = dict(value)
+    if "defer_incremental_margin_calculation" in kwargs and not isinstance(
+        kwargs["defer_incremental_margin_calculation"], bool
+    ):
+        raise SystemExit(
+            "invalid HCR-8 configuration: defer_incremental_margin_calculation must be bool"
+        )
+    if defer_incremental_margin_calculation is not None:
+        kwargs["defer_incremental_margin_calculation"] = defer_incremental_margin_calculation
     if str(kwargs.get("mode", "")).strip().lower() in {"series", "hcr-2"}:
         kwargs.pop("mode", None)
     kwargs.pop("series", None)
@@ -463,6 +496,8 @@ async def _run_readiness(args: argparse.Namespace) -> int:
         forbidden.append("--i-understand-series-live-operation")
     if args.confirm_plan:
         forbidden.append("--confirm-plan")
+    if args.defer_incremental_margin_calculation:
+        forbidden.append("--defer-incremental-margin-calculation")
     if args.config is not None:
         forbidden.append("--config")
     if args.market_evidence is not None:
@@ -530,8 +565,16 @@ async def _run(args: argparse.Namespace) -> int:
     config_data = _load_json(args.config, "config")
     is_series = config_data.get("mode") in {"series", "hcr-2"} or config_data.get("series") is True
     if args.keychain_remove:
-        if args.execute or args.i_understand_one_attempt_live_operation or args.i_understand_series_live_operation or args.confirm_plan:
-            raise SystemExit("--keychain-remove cannot be combined with execution or plan-review flags")
+        if (
+            args.execute
+            or args.i_understand_one_attempt_live_operation
+            or args.i_understand_series_live_operation
+            or args.confirm_plan
+            or args.defer_incremental_margin_calculation
+        ):
+            raise SystemExit(
+                "--keychain-remove cannot be combined with execution, plan-review, or deferral flags"
+            )
         if args.keychain or args.keychain_replace:
             raise SystemExit("--keychain-remove cannot be combined with --keychain/--keychain-replace")
         if args.source_account_index is None or args.receiver_account_index is None:
@@ -539,9 +582,17 @@ async def _run(args: argparse.Namespace) -> int:
         if args.source_account_index == args.receiver_account_index:
             raise SystemExit("source and receiver account indices must differ")
         config = (
-            _series_config(config_data, execute=False)
+            _series_config(
+                config_data,
+                execute=False,
+                defer_incremental_margin_calculation=args.defer_incremental_margin_calculation,
+            )
             if is_series
-            else _config(config_data, execute=False)
+            else _config(
+                config_data,
+                execute=False,
+                defer_incremental_margin_calculation=args.defer_incremental_margin_calculation,
+            )
         )
         return _remove_keychain(
             config,
@@ -551,7 +602,11 @@ async def _run(args: argparse.Namespace) -> int:
         raise SystemExit("run requires --config and --market-evidence")
     evidence = _load_json(args.market_evidence, "market evidence")
     if is_series:
-        series_config = _series_config(config_data, execute=args.execute)
+        series_config = _series_config(
+            config_data,
+            execute=args.execute,
+            defer_incremental_margin_calculation=args.defer_incremental_margin_calculation,
+        )
         if args.confirm_plan:
             object.__setattr__(series_config, "operator_plan_reviewed", True)
         if args.source_account_index is None or args.receiver_account_index is None:
@@ -580,6 +635,7 @@ async def _run(args: argparse.Namespace) -> int:
                         "source_limit_price": str(series_config.source_limit_price),
                         "receiver_worst_price": str(series_config.receiver_worst_price),
                         "plan_reviewed": series_config.operator_plan_reviewed,
+                        "defer_incremental_margin_calculation": series_config.defer_incremental_margin_calculation,
                         "journal_path": series_config.journal_path,
                     },
                     sort_keys=True,
@@ -622,7 +678,11 @@ async def _run(args: argparse.Namespace) -> int:
             secrets.close()
         print(json.dumps(result.as_dict(), sort_keys=True, separators=(",", ":")))
         return 0 if result.outcome.value in {"SUCCESS", "PARTIAL", "PREVIEW"} else 2
-    config = _config(config_data, execute=args.execute)
+    config = _config(
+        config_data,
+        execute=args.execute,
+        defer_incremental_margin_calculation=args.defer_incremental_margin_calculation,
+    )
     if args.confirm_plan:
         object.__setattr__(config, "operator_plan_reviewed", True)
     if args.source_account_index is None or args.receiver_account_index is None:
@@ -657,6 +717,7 @@ async def _run(args: argparse.Namespace) -> int:
                         else "SELL price is a floor"
                     ),
                     "plan_reviewed": config.operator_plan_reviewed,
+                    "defer_incremental_margin_calculation": config.defer_incremental_margin_calculation,
                     "journal_path": config.journal_path,
                 },
                 sort_keys=True,
