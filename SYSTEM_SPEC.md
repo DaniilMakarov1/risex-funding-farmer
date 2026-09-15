@@ -3,6 +3,10 @@
 SYSTEM_SPEC_VERSION = 4.0
 SPEC_STATUS = FIRST_RAW_RESEARCH_SCANNER_IMPLEMENTED
 
+## HCR-6 amendment — optional macOS Keychain persistence (authorized, not yet accepted)
+
+Owner requested persistent local API credentials on 2026-09-15. The separately invoked utility may offer opt-in macOS Keychain storage/reuse bound to exact API origin/signing environment, account and key index, with replacement/removal and no plaintext fallback. This supersedes in-memory-only persistence restrictions solely for protected local Keychain storage. Secret exclusion from chat/arguments/environment/files/logs/reports/Git and agent offline-only testing remain. Default preview/help/import stays credential-free. NEXT_TASK holds finite acceptance and pending test-network verification. No execution, margin or price semantics change follows from credential persistence.
+
 ## HCR-5 amendment — local readiness inspection (accepted offline)
 
 Accepted candidate 3de9e91ac16bd0faa2caeed2efa15c7e5ae82ae4, clean isolated pinned-SDK suite4331 passed,3 skipped; live account/auth NOT_RUN. Owner authorizes a separately invoked read-only diagnostic for the Robinhood paired-opening utility. It checks current market and both account readiness without order mutations. Local user execution may authenticate read endpoints using hidden in-memory API key input; agent development stays offline. Missing incremental opening-margin proof remains UNKNOWN, and missing operator trade bounds remain UNSET. Diagnostics cannot silently promote a quote/balance into an executable plan or bypass accepted trading preflight. Existing no-network default preview and all order semantics remain unchanged. NEXT_TASK defines the finite implementation/verification scope.

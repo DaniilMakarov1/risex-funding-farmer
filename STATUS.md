@@ -1,5 +1,9 @@
 # Current status
 
+## HCR-6 credential persistence — authorized, implementation pending
+
+Sole successor Chief is 01a0a563-dcbe-7bc0-bcde-f69f1cd3822b; predecessor relinquished management in the owner-requested handoff. Accepted base 2bcfb23 verified clean before new work. Owner-supplied READ_ONLY report: both account reads PASS, BTC positions zero/no active BTC orders at report time, overall UNKNOWN due to missing opening-margin proof and UNSET prices. No keys transferred to Chief. Owner authorizes persistent local keys and states allocated balances are test-only. Optional macOS Keychain implementation/offline verification is scoped in NEXT_TASK; exact test environment verification remains pending. No agent live calls, credential access or new collection performed.
+
 ## HCR-5 local read-only readiness — ACCEPTED OFFLINE
 
 Accepted candidate3de9e91ac16bd0faa2caeed2efa15c7e5ae82ae4, Builder branch codex/spread-v1-hood-readiness. Separate readiness CLI checks public market/book and user-local account/auth state, with hidden in-memory keys and no trading mutation surface. Complete diagnostics and unknown opening-margin proof are distinguished; unset prices never become a launch-ready plan. Owner confirmed .00020BTC, A27331SHORT/B27337LONG, keyindex4. README contains exact local invocation with diagnostic freshness120s/read timeout10s, no live order-price/time policy selected.
