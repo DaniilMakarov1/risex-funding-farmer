@@ -13,6 +13,15 @@ from typing import Any, Mapping
 
 from .contracts import Direction, HandoffConfig, OperationMode
 from .engine import run_handoff
+from .journal import sanitize_exception
+from .readiness import (
+    ReadinessCheck,
+    ReadinessConfig,
+    ReadinessResult,
+    ReadinessSecretProvider,
+    ReadOnlyLighterSdkClient,
+    run_readiness,
+)
 from .sdk import LighterSdkClient, SecretProvider
 from .series import RobinhoodSeriesConfig, run_series
 
@@ -45,11 +54,30 @@ def _parser() -> argparse.ArgumentParser:
             "and never imports the Lighter SDK, prompts for keys, or makes a request."
         ),
     )
-    parser.add_argument("run", nargs="?", choices=("run",), help="run the configured one-attempt utility")
+    parser.add_argument(
+        "run",
+        nargs="?",
+        choices=("run", "readiness"),
+        help="run the configured utility or the explicit read-only readiness check",
+    )
     parser.add_argument("--config", type=Path, help="JSON operator configuration; all numerical bounds are required")
     parser.add_argument("--market-evidence", type=Path, help="JSON current orderBookDetails/fee/margin evidence")
     parser.add_argument("--source-account-index", type=int)
     parser.add_argument("--receiver-account-index", type=int)
+    parser.add_argument("--api-key-index", type=int)
+    parser.add_argument("--symbol", "--market-symbol", dest="readiness_symbol")
+    parser.add_argument("--quantity", dest="readiness_quantity")
+    parser.add_argument("--direction", dest="readiness_direction")
+    parser.add_argument("--freshness-seconds", dest="readiness_freshness_seconds", type=float)
+    parser.add_argument(
+        "--request-timeout-seconds",
+        "--read-timeout-seconds",
+        dest="readiness_request_timeout_seconds",
+        type=float,
+    )
+    parser.add_argument("--source-limit-price", dest="readiness_source_limit_price")
+    parser.add_argument("--receiver-worst-price", dest="readiness_receiver_worst_price")
+    parser.add_argument("--api-base-url", dest="readiness_api_base_url")
     parser.add_argument(
         "--execute",
         action="store_true",
@@ -286,7 +314,98 @@ def _series_config(value: Mapping[str, Any], *, execute: bool) -> RobinhoodSerie
         raise SystemExit(f"invalid HCR-2 configuration: {exc}") from exc
 
 
+def _readiness_config(args: argparse.Namespace) -> ReadinessConfig:
+    required = {
+        "symbol": args.readiness_symbol,
+        "quantity": args.readiness_quantity,
+        "direction": args.readiness_direction,
+        "source account": args.source_account_index,
+        "receiver account": args.receiver_account_index,
+        "api key index": args.api_key_index,
+        "freshness seconds": args.readiness_freshness_seconds,
+        "request timeout seconds": args.readiness_request_timeout_seconds,
+    }
+    missing = [name for name, value in required.items() if value is None]
+    if missing:
+        raise SystemExit("readiness is missing required inputs: " + ", ".join(missing))
+    try:
+        return ReadinessConfig(
+            market_symbol=args.readiness_symbol,
+            quantity=args.readiness_quantity,
+            direction=args.readiness_direction,
+            source_account_index=args.source_account_index,
+            receiver_account_index=args.receiver_account_index,
+            api_key_index=args.api_key_index,
+            freshness_seconds=args.readiness_freshness_seconds,
+            request_timeout_seconds=args.readiness_request_timeout_seconds,
+            source_limit_price=args.readiness_source_limit_price,
+            receiver_worst_price=args.readiness_receiver_worst_price,
+            api_base_url=args.readiness_api_base_url or "https://api.rh.lighter.xyz",
+        )
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(f"invalid readiness input: {exc}") from exc
+
+
+async def _run_readiness(args: argparse.Namespace) -> int:
+    # Reject every execution/configuration flag before config parsing, client
+    # creation, SDK import, or hidden key input.  Readiness is a distinct path.
+    forbidden = []
+    if args.execute:
+        forbidden.append("--execute")
+    if args.i_understand_one_attempt_live_operation:
+        forbidden.append("--i-understand-one-attempt-live-operation")
+    if args.i_understand_series_live_operation:
+        forbidden.append("--i-understand-series-live-operation")
+    if args.confirm_plan:
+        forbidden.append("--confirm-plan")
+    if args.config is not None:
+        forbidden.append("--config")
+    if args.market_evidence is not None:
+        forbidden.append("--market-evidence")
+    if forbidden:
+        raise SystemExit(
+            "readiness is read-only and cannot be combined with execution/configuration flags: "
+            + ", ".join(forbidden)
+        )
+    config = _readiness_config(args)
+    secrets = ReadinessSecretProvider(
+        (config.source_account_index, config.receiver_account_index),
+        config.api_key_index,
+    )
+    client = ReadOnlyLighterSdkClient(
+        config,
+        source_account_index=config.source_account_index,
+        receiver_account_index=config.receiver_account_index,
+        secrets=secrets,
+    )
+    try:
+        result = await run_readiness(config, client)
+    except Exception as exc:
+        result = ReadinessResult(
+            outcome="UNKNOWN",
+            config=config,
+            checks=(
+                ReadinessCheck(
+                    "readiness",
+                    "UNKNOWN",
+                    "READINESS_FAILED",
+                    "read-only readiness check failed before completion",
+                    {"reason": sanitize_exception(exc)},
+                ),
+            ),
+        )
+    finally:
+        try:
+            await client.aclose()
+        finally:
+            secrets.close()
+    print(json.dumps(result.as_dict(), sort_keys=True, separators=(",", ":")))
+    return 0 if result.outcome == "READY" else 2
+
+
 async def _run(args: argparse.Namespace) -> int:
+    if args.run == "readiness":
+        return await _run_readiness(args)
     if args.config is None or args.market_evidence is None:
         raise SystemExit("run requires --config and --market-evidence")
     config_data = _load_json(args.config, "config")
