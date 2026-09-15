@@ -1,6 +1,8 @@
 # Current status
 
-## HCR-7B diagnostic evidence extension — AUTHORIZED continuation
+## HCR-7B diagnostic evidence extension — CHANGES_REQUESTED
+
+Candidate c9ee83cb9701e1221347d6c729e345ad0cb83c5c delivered directly, focused8/affected115 reported passing. Chief reviewed full four-file diff and independently reproduced two failures: other-market row counts contradicting zero account totals remain OBSERVED/PASS; conflicting supported minimum-margin aliases silently first-win. Review/probe evidence in original-root spread-shadow-runs/hood-margin-evidence-20260915/chief-review-v1. Bounded correction assigned to existing Builder, exact branch/candidate preserved; final full suite NOT_RUN pending correction. No candidate integration, actual account/Keychain/network calls or trade readiness claim. Owner permits this Builder only to finish HCR-7B; future independent tasks require fresh Builders. Direct result delivery remains required, no status polling.
 
 Owner asks to remove the agent blockage and continue. No close-agent/limit-setter is exposed in this runtime; existing completed healthy Keychain Builder can be continued with the supported followup tool, remaining within one Builder plus Chief. This supersedes the prior fresh-Builder waiting condition without changing the platform/global settings or cap. Sole Chief retains review; Builder will work on separate preserved hood-margin-evidence/codex/spread-v1-margin-evidence, not the accepted keychain checkout. NEXT_TASK scopes diagnostic margin-field preservation only, no numerical readiness bypass/price or trading changes. Direct result delivery required, no continuous monitoring.
 

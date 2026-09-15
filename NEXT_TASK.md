@@ -2,6 +2,10 @@
 
 ## Owner instruction and supported continuation
 
+Latest owner clarification: reuse of keychain_builder is authorized only to finish HCR-7B, including bounded review corrections. Future independent tasks require fresh Builders. Do not interrupt the current assignment or treat this exception as permanent reuse authority. Platform slot release remains unavailable here.
+
+Current review checkpoint: candidate c9ee83cb9701e1221347d6c729e345ad0cb83c5c received directly; Chief full actual diff review and synthetic adapter probes found two count/alias conflict omissions. Consolidated CHANGES_REQUESTED delivered to the same Builder for correction; no formal REJECT. Exact counterexamples and evidence: original-root spread-shadow-runs/hood-margin-evidence-20260915/chief-review-v1/review.md and probe-result.json. Full suite deferred until corrected candidate; no production acceptance/integration. Next action is review directly delivered correction result, then required final verification. No periodic monitoring.
+
 Owner asks to remove the agent-thread blockage and continue. Runtime permits only Chief plus one Builder and exposes no close-agent/limit setter here. Existing Keychain Builder is completed with an accepted clean candidate and verified direct-delivery transport; continue that healthy Builder via the supported followup tool, within the existing cap, on the separate preserved margin-evidence branch/worktree. This operational continuation supersedes the prior fresh-Builder waiting condition; no global settings, safety controls, models or resource caps change. Do not claim the platform limit was removed.
 
 Sole Chief01a0a563-dcbe-7bc0-bcde-f69f1cd3822b owns governing docs/review/integration. Builder native01a0a572-9cce-7082-b239-ed5ffe98d142, role Luna/max, owns only production/tests for this slice in /Users/daniilmakarov/.codex/worktrees/hood-margin-evidence on codex/spread-v1-margin-evidence. Preserve accepted hood-keychain checkout/candidate. Standard requested/speedUNKNOWN. No other worker/spawning/main push. Builder directly delivers READY_FOR_REVIEW or concrete blocker to Chief; no Chief status polling/management heartbeat.
