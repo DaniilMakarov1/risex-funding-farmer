@@ -62,9 +62,17 @@ class PromptSecretProvider:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="risex-hood-handoff",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         description=(
             "Prepare one explicit HOOD close/reopen attempt. Default mode is offline-safe "
             "and never imports the Lighter SDK, prompts for keys, or makes a request."
+        ),
+        epilog=(
+            "HCR-11 local-attempt: omit both price flags to use one fresh public-book proposal "
+            "(source SELL uses best ask minus one tick when strictly above best bid; source BUY "
+            "mirrors that rule; receiver bound equals the selected source price). Omitted timing "
+            "bounds use finite defaults: freshness 10s, request 5s, order 10s, reconciliation "
+            "20s, polling 0.5s, 40 polls, source expiry 300s."
         ),
     )
     parser.add_argument(
@@ -88,8 +96,16 @@ def _parser() -> argparse.ArgumentParser:
         dest="readiness_request_timeout_seconds",
         type=float,
     )
-    parser.add_argument("--source-limit-price", dest="readiness_source_limit_price")
-    parser.add_argument("--receiver-worst-price", dest="readiness_receiver_worst_price")
+    parser.add_argument(
+        "--source-limit-price",
+        dest="readiness_source_limit_price",
+        help="exact explicit source bound; omit together with receiver bound for HCR-11 public-book selection",
+    )
+    parser.add_argument(
+        "--receiver-worst-price",
+        dest="readiness_receiver_worst_price",
+        help="exact explicit receiver bound; one-sided omission is rejected",
+    )
     parser.add_argument("--order-timeout-seconds", dest="local_order_timeout_seconds", type=float)
     parser.add_argument("--reconcile-timeout-seconds", dest="local_reconcile_timeout_seconds", type=float)
     parser.add_argument("--poll-interval-seconds", dest="local_poll_interval_seconds", type=float)
@@ -542,6 +558,10 @@ async def _run_local_attempt(args: argparse.Namespace) -> int:
             source_order_lifetime_seconds=args.local_source_order_lifetime_seconds,
             client_order_prefix=args.local_client_order_prefix,
             defer_incremental_margin_calculation=bool(args.defer_incremental_margin_calculation),
+            automatic_price_selection=(
+                args.readiness_source_limit_price is None
+                and args.readiness_receiver_worst_price is None
+            ),
         )
     except LocalAttemptInputError as exc:
         raise SystemExit(str(exc)) from None
