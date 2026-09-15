@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from decimal import Decimal
 
 import pytest
@@ -204,6 +205,78 @@ async def test_readiness_stale_book_is_blocked_without_refreshing_timestamp():
     assert result.outcome == "BLOCKED"
     assert check(result, "public_book").code == "BOOK_STALE"
     assert check(result, "public_book").details["observed_at"] == NOW - 11
+
+
+@pytest.mark.asyncio
+async def test_readiness_uses_one_final_decision_time_after_normal_read_latency():
+    tick = NOW
+
+    class LatencyClient(FakeReadClient):
+        async def resolve_market(self, symbol):
+            nonlocal tick
+            value = await super().resolve_market(symbol)
+            tick += 1
+            return replace(value, observed_at=tick)
+
+        async def order_book_snapshot(self, market_id):
+            nonlocal tick
+            value = await super().order_book_snapshot(market_id)
+            tick += 1
+            return replace(value, observed_at=tick)
+
+        async def account_snapshot(self, account_index, market_id):
+            nonlocal tick
+            value = await super().account_snapshot(account_index, market_id)
+            tick += 1
+            return replace(value, observed_at=tick)
+
+    result = await run_readiness(readiness_config(), LatencyClient(), clock=lambda: tick)
+    assert result.outcome == "READY"
+    assert check(result, "market_metadata_freshness").code == "MARKET_METADATA_FRESH"
+    assert check(result, "public_book").code == "BOOK_FRESH"
+    assert check(result, "source_account_freshness").details["age_seconds"] == 1
+    assert check(result, "receiver_account_freshness").details["age_seconds"] == 0
+
+
+@pytest.mark.asyncio
+async def test_readiness_preserves_true_future_observation_as_blocked():
+    class FutureMetadataClient(FakeReadClient):
+        async def resolve_market(self, symbol):
+            return replace(await super().resolve_market(symbol), observed_at=NOW + 0.5)
+
+    result = await run_readiness(readiness_config(), FutureMetadataClient(), now=NOW)
+    freshness = check(result, "market_metadata_freshness")
+    assert result.outcome == "BLOCKED"
+    assert freshness.code == "MARKET_METADATA_STALE"
+    assert freshness.details["age_seconds"] == -0.5
+
+
+@pytest.mark.asyncio
+async def test_readiness_detects_an_earlier_account_snapshot_aging_during_later_read():
+    tick = NOW
+
+    class AgingClient(FakeReadClient):
+        async def resolve_market(self, symbol):
+            nonlocal tick
+            tick += 1
+            return replace(await super().resolve_market(symbol), observed_at=tick)
+
+        async def order_book_snapshot(self, market_id):
+            nonlocal tick
+            tick += 1
+            return replace(await super().order_book_snapshot(market_id), observed_at=tick)
+
+        async def account_snapshot(self, account_index, market_id):
+            nonlocal tick
+            value = await super().account_snapshot(account_index, market_id)
+            tick += 1 if account_index == 11 else 5
+            return replace(value, observed_at=tick)
+
+    result = await run_readiness(readiness_config(freshness_seconds=2), AgingClient(), clock=lambda: tick)
+    assert result.outcome == "BLOCKED"
+    assert check(result, "source_account_freshness").code == "ACCOUNT_STATE_STALE"
+    assert check(result, "receiver_account_freshness").code == "ACCOUNT_STATE_FRESH"
+    assert check(result, "source_account_freshness").details["age_seconds"] == 5
 
 
 @pytest.mark.asyncio
@@ -411,4 +484,130 @@ async def test_readonly_sdk_auth_failure_is_unknown_and_cleanup_stays_read_only(
     assert check(result, "receiver_account_authorization").code == "ACCOUNT_READ_AUTH_FAILED"
     assert not hasattr(client, "submit_order")
     assert not hasattr(client, "cancel_order")
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_readonly_sdk_keeps_account_response_observation_before_auth_delay(monkeypatch):
+    tick = NOW
+
+    class DelayedSigner(FakeSigner):
+        async def create_auth_token_with_expiry(self, **kwargs):
+            nonlocal tick
+            tick += 5
+            return await super().create_auth_token_with_expiry(**kwargs)
+
+    client = ReadOnlyLighterSdkClient(
+        readiness_config(),
+        source_account_index=11,
+        receiver_account_index=22,
+        secrets=StaticSecretProvider({11: "synthetic-key-a", 22: "synthetic-key-b"}),
+        signer_factory=DelayedSigner,
+        clock=lambda: tick,
+    )
+    monkeypatch.setattr(ReadOnlyLighterSdkClient, "verify_sdk", staticmethod(lambda: None))
+    client._lighter = lambda: FakeLighter
+    snapshot = await client.account_snapshot(11, 7)
+    assert snapshot.signed_position == 0
+    assert snapshot.observed_at == NOW
+    assert tick == NOW + 5
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_readonly_sdk_rejects_duplicate_selected_market_before_auth(monkeypatch):
+    class DuplicateAccountApi(FakeAccountApi):
+        async def account(self, **kwargs):
+            response = await super().account(**kwargs)
+            response["accounts"][0]["positions"] = [
+                {"market_id": 7, "position": "0", "sign": 1},
+                {"market_id": 7, "position": "1", "sign": 1},
+            ]
+            return response
+
+    class DuplicateLighter(FakeLighter):
+        AccountApi = DuplicateAccountApi
+
+    FakeSigner.instances.clear()
+    client = ReadOnlyLighterSdkClient(
+        readiness_config(),
+        source_account_index=11,
+        receiver_account_index=22,
+        secrets=StaticSecretProvider({11: "synthetic-key-a", 22: "synthetic-key-b"}),
+        signer_factory=FakeSigner,
+        clock=lambda: NOW,
+    )
+    monkeypatch.setattr(ReadOnlyLighterSdkClient, "verify_sdk", staticmethod(lambda: None))
+    client._lighter = lambda: DuplicateLighter
+    result = await run_readiness(readiness_config(), client, now=NOW)
+    assert result.outcome == "BLOCKED"
+    assert check(result, "source_account_position").status == "BLOCKED"
+    assert check(result, "source_account_position").code == "ACCOUNT_POSITION_CONFLICT"
+    assert check(result, "receiver_account_position").code == "ACCOUNT_POSITION_CONFLICT"
+    assert all(item.code != "POSITION_FLAT" for item in result.checks)
+    assert FakeSigner.instances == []
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_index", [True, 11.5])
+async def test_readonly_sdk_rejects_non_integer_account_identity_before_auth(monkeypatch, bad_index):
+    class BadIndexAccountApi(FakeAccountApi):
+        async def account(self, **kwargs):
+            response = await super().account(**kwargs)
+            response["accounts"][0]["index"] = bad_index
+            return response
+
+    class BadIndexLighter(FakeLighter):
+        AccountApi = BadIndexAccountApi
+
+    FakeSigner.instances.clear()
+    client = ReadOnlyLighterSdkClient(
+        readiness_config(),
+        source_account_index=11,
+        receiver_account_index=22,
+        secrets=StaticSecretProvider({11: "synthetic-key-a", 22: "synthetic-key-b"}),
+        signer_factory=FakeSigner,
+        clock=lambda: NOW,
+    )
+    monkeypatch.setattr(ReadOnlyLighterSdkClient, "verify_sdk", staticmethod(lambda: None))
+    client._lighter = lambda: BadIndexLighter
+    result = await run_readiness(readiness_config(), client, now=NOW)
+    assert result.outcome == "BLOCKED"
+    assert check(result, "source_account_identity").code == "ACCOUNT_IDENTITY_CONFLICT"
+    assert check(result, "source_account_position").status == "BLOCKED"
+    assert FakeSigner.instances == []
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_market_id", [True, 7.5])
+async def test_readonly_sdk_rejects_non_integer_position_market_before_auth(monkeypatch, bad_market_id):
+    class BadMarketPositionAccountApi(FakeAccountApi):
+        async def account(self, **kwargs):
+            response = await super().account(**kwargs)
+            response["accounts"][0]["positions"] = [
+                {"market_id": bad_market_id, "position": "0", "sign": 1},
+            ]
+            return response
+
+    class BadMarketPositionLighter(FakeLighter):
+        AccountApi = BadMarketPositionAccountApi
+
+    FakeSigner.instances.clear()
+    client = ReadOnlyLighterSdkClient(
+        readiness_config(),
+        source_account_index=11,
+        receiver_account_index=22,
+        secrets=StaticSecretProvider({11: "synthetic-key-a", 22: "synthetic-key-b"}),
+        signer_factory=FakeSigner,
+        clock=lambda: NOW,
+    )
+    monkeypatch.setattr(ReadOnlyLighterSdkClient, "verify_sdk", staticmethod(lambda: None))
+    client._lighter = lambda: BadMarketPositionLighter
+    result = await run_readiness(readiness_config(), client, now=NOW)
+    assert result.outcome == "BLOCKED"
+    assert check(result, "source_account_identity").code == "ACCOUNT_IDENTITY_CONFLICT"
+    assert check(result, "source_account_position").status == "BLOCKED"
+    assert FakeSigner.instances == []
     await client.aclose()

@@ -17,6 +17,7 @@ import importlib
 from importlib import metadata as importlib_metadata
 import inspect
 import math
+import re
 import sys
 import time
 from typing import Any, Callable, Mapping, Protocol, Sequence
@@ -66,6 +67,22 @@ def _index(value: Any, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ContractError(f"{name} must be a non-negative integer")
     return value
+
+
+def _strict_integer(value: Any, name: str, *, minimum: int | None = None) -> int:
+    """Parse an SDK identity only when its wire value is an exact integer."""
+
+    if isinstance(value, bool):
+        raise ContractError(f"{name} must be an exact integer")
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str) and re.fullmatch(r"[+-]?[0-9]+", value):
+        parsed = int(value)
+    else:
+        raise ContractError(f"{name} must be an exact integer")
+    if minimum is not None and parsed < minimum:
+        raise ContractError(f"{name} must be at least {minimum}")
+    return parsed
 
 
 def _finite_positive(value: Any, name: str) -> float:
@@ -453,6 +470,7 @@ class ReadOnlyLighterSdkClient:
         return ReadinessMarketMetadata.from_mapping(values)
 
     async def order_book_snapshot(self, market_id: int) -> OrderBookSnapshot:
+        market_id = _strict_integer(market_id, "market_id", minimum=0)
         module = self._lighter()
         api = self._api(module, "OrderApi")
         raw = await self._bounded(
@@ -477,6 +495,8 @@ class ReadOnlyLighterSdkClient:
         )
 
     async def account_snapshot(self, account_index: int, market_id: int) -> AccountSnapshot:
+        account_index = _strict_integer(account_index, "account_index", minimum=0)
+        market_id = _strict_integer(market_id, "market_id", minimum=0)
         module = self._lighter()
         api = self._api(module, "AccountApi")
         raw = await self._bounded(
@@ -491,16 +511,16 @@ class ReadOnlyLighterSdkClient:
             time.monotonic() + self.config.request_timeout_seconds,
             "account read",
         )
+        # Preserve the account/position/balance observation before auth and
+        # active-orders reads can take time or prompt for a hidden key.
+        account_observed_at = _timestamp(self._clock(), "account observation time")
         payload = _model_dict(raw)
         _require_success_code(payload, "account")
         account = _first_mapping(raw, "accounts")
         required = {"index", "l1_address", "status", "positions", "available_balance"}
         if not required.issubset(account):
             raise ContractError("Lighter account response is missing required identity/state fields")
-        try:
-            returned_index = int(account["index"])
-        except (TypeError, ValueError) as exc:
-            raise ContractError("Lighter account response has no exact account identity") from exc
+        returned_index = _strict_integer(account["index"], "Lighter account index", minimum=0)
         if returned_index != account_index:
             raise ContractError("Lighter account response identity does not match requested account")
         identity = account["l1_address"]
@@ -509,25 +529,25 @@ class ReadOnlyLighterSdkClient:
         positions = account["positions"]
         if not isinstance(positions, (list, tuple)):
             raise ContractError("Lighter account positions field is malformed")
-        position: Mapping[str, Any] | None = None
+        matching_positions: list[Mapping[str, Any]] = []
         for item in positions:
             candidate = _model_dict(item)
             if "market_id" not in candidate:
                 raise ContractError("Lighter account position lacks market identity")
-            try:
-                candidate_market = int(candidate["market_id"])
-            except (TypeError, ValueError) as exc:
-                raise ContractError("Lighter account position has invalid market identity") from exc
+            candidate_market = _strict_integer(candidate["market_id"], "Lighter account position market_id", minimum=0)
             if candidate_market == market_id:
                 if "position" not in candidate or "sign" not in candidate:
                     raise ContractError("Lighter account position lacks required sign/position fields")
-                position = candidate
-                break
+                matching_positions.append(candidate)
+        if len(matching_positions) > 1:
+            raise ContractError("Lighter account positions contain duplicate selected market records")
+        position = matching_positions[0] if matching_positions else None
         position = position or {"position": "0", "sign": 1}
         # Account state is public by index; auth is separately required for the
         # active-orders read.  This keeps auth permission distinct from trade
         # dispatch and never treats an auth failure as an empty order list.
         active_orders = await self._active_orders(account_index, market_id)
+        active_orders_observed_at = _timestamp(self._clock(), "active orders observation time")
         status = account["status"]
         ready = status in (0, 1) or str(status).strip().lower() in {"active", "online"}
         return AccountSnapshot.from_mapping(
@@ -537,7 +557,7 @@ class ReadOnlyLighterSdkClient:
                 "position": position.get("position", "0"),
                 "sign": position.get("sign", 1),
                 "active_orders": active_orders,
-                "observed_at": self._clock(),
+                "observed_at": min(account_observed_at, active_orders_observed_at),
                 "authorized": True,
                 "ready": ready,
                 "margin_available": account.get("available_balance"),
@@ -552,6 +572,8 @@ class ReadOnlyLighterSdkClient:
         )
 
     async def _active_orders(self, account_index: int, market_id: int) -> tuple[OrderSnapshot, ...]:
+        account_index = _strict_integer(account_index, "account_index", minimum=0)
+        market_id = _strict_integer(market_id, "market_id", minimum=0)
         module = self._lighter()
         api = self._api(module, "OrderApi")
         token = await self._authorization(account_index)
@@ -646,7 +668,9 @@ def _read_failure_code(exc: BaseException) -> str:
     """Classify a read failure without exposing SDK text or secret material."""
 
     text = str(exc).lower()
-    if "identity" in text or "account" in text and "match" in text:
+    if "duplicate selected market" in text:
+        return "ACCOUNT_POSITION_CONFLICT"
+    if "identity" in text or "market_id" in text or "account index" in text or ("account" in text and "match" in text):
         return "ACCOUNT_IDENTITY_CONFLICT"
     if "auth" in text or "token" in text or "private key" in text:
         return "ACCOUNT_READ_AUTH_FAILED"
@@ -687,6 +711,7 @@ async def run_readiness(
     client: ReadinessClient,
     *,
     now: float | None = None,
+    clock: Callable[[], float] | None = None,
 ) -> ReadinessResult:
     """Run one bounded, non-mutating diagnostic against a read-only client."""
 
@@ -695,7 +720,15 @@ async def run_readiness(
     if getattr(client, "receiver_account_index", None) != config.receiver_account_index:
         raise ContractError("readiness client receiver account does not match config")
     checks: list[ReadinessCheck] = []
-    observed_now = time.time() if now is None else _timestamp(now, "now")
+    if now is None:
+        decision_clock = clock or time.time
+    else:
+        fixed_now = _timestamp(now, "now")
+        decision_clock = lambda: fixed_now
+
+    def current_decision_time() -> float:
+        return _timestamp(decision_clock(), "decision time")
+
     metadata: ReadinessMarketMetadata | MarketMetadata | None = None
     book: OrderBookSnapshot | None = None
     snapshots: dict[str, AccountSnapshot | None] = {"source": None, "receiver": None}
@@ -714,11 +747,6 @@ async def run_readiness(
             _check(checks, "market_status", "PASS", "MARKET_ACTIVE", "current perpetual is active", market_status=metadata.status)
         else:
             _check(checks, "market_status", "BLOCKED", "MARKET_INACTIVE", "current perpetual is not active", market_status=metadata.status)
-        metadata_age = observed_now - metadata.observed_at
-        if metadata.observed_at > observed_now or metadata_age > config.freshness_seconds:
-            _check(checks, "market_metadata_freshness", "BLOCKED", "MARKET_METADATA_STALE", "current market metadata is outside the explicit freshness bound", observed_at=metadata.observed_at, age_seconds=metadata_age, freshness_seconds=config.freshness_seconds)
-        else:
-            _check(checks, "market_metadata_freshness", "PASS", "MARKET_METADATA_FRESH", "current market metadata is fresh", observed_at=metadata.observed_at, age_seconds=metadata_age)
     except Exception as exc:
         _check(checks, "market_identity", "UNKNOWN", "MARKET_READ_FAILED", "current market identity could not be established", reason=sanitize_exception(exc))
         _check(checks, "market_status", "UNKNOWN", "MARKET_READ_FAILED", "current market status could not be established", reason=sanitize_exception(exc))
@@ -760,17 +788,6 @@ async def run_readiness(
     else:
         try:
             book = await client.order_book_snapshot(metadata.market_id)
-            age = observed_now - book.observed_at
-            if book.market_id != metadata.market_id or book.symbol.upper() != metadata.symbol.upper() or book.market_type.lower() != "perp" or book.venue.lower() not in {"robinhood", "robinhood-chain"}:
-                _check(checks, "public_book", "BLOCKED", "BOOK_IDENTITY_CONFLICT", "public book identity conflicts with the current market", book_market_id=book.market_id, book_symbol=book.symbol)
-            elif book.observed_at > observed_now or age > config.freshness_seconds:
-                _check(checks, "public_book", "BLOCKED", "BOOK_STALE", "public book is outside the explicit freshness bound", observed_at=book.observed_at, age_seconds=age, freshness_seconds=config.freshness_seconds)
-            elif not book.bids or not book.asks:
-                _check(checks, "public_book", "UNKNOWN", "BOOK_SIDE_MISSING", "public book lacks a bid or ask side")
-            else:
-                best_bid = book.bids[0].price
-                best_ask = book.asks[0].price
-                _check(checks, "public_book", "PASS", "BOOK_FRESH", "bounded public book read is fresh; bid/ask are observations only", observed_at=book.observed_at, age_seconds=age, best_bid=format(best_bid, "f"), best_ask=format(best_ask, "f"), observed_source_notional=format(config.quantity * best_bid, "f"), observed_receiver_notional=format(config.quantity * best_ask, "f"))
         except Exception as exc:
             _check(checks, "public_book", "UNKNOWN", "BOOK_READ_FAILED", "public book could not be read", reason=sanitize_exception(exc))
 
@@ -792,6 +809,7 @@ async def run_readiness(
         except Exception as exc:
             reason = sanitize_exception(exc)
             failure_code = _read_failure_code(exc)
+            failure_status = "BLOCKED" if failure_code in {"ACCOUNT_IDENTITY_CONFLICT", "ACCOUNT_POSITION_CONFLICT"} else "UNKNOWN"
             for suffix, message in (
                 ("authorization", f"{role} read authorization is not established"),
                 ("identity", f"{role} account identity is unavailable"),
@@ -799,7 +817,7 @@ async def run_readiness(
                 ("active_orders", f"{role} active orders are unavailable"),
                 ("margin", f"{role} margin readiness is unavailable"),
             ):
-                _check(checks, f"{prefix}_{suffix}", "UNKNOWN", failure_code, message, reason=reason, account_index=account_index)
+                _check(checks, f"{prefix}_{suffix}", failure_status, failure_code, message, reason=reason, account_index=account_index)
             continue
         if snapshot.account_index != account_index:
             _check(checks, f"{prefix}_identity", "BLOCKED", "ACCOUNT_IDENTITY_CONFLICT", f"{role} read returned a different account index", requested_account_index=account_index, returned_account_index=snapshot.account_index)
@@ -813,11 +831,6 @@ async def run_readiness(
             _check(checks, f"{prefix}_authorization", "PASS", "ACCOUNT_READ_AUTHORIZED", f"{role} account read authorization succeeded", account_index=account_index)
         else:
             _check(checks, f"{prefix}_authorization", "UNKNOWN", "ACCOUNT_READ_UNAUTHORIZED", f"{role} account read authorization is unproven", account_index=account_index)
-        age = observed_now - snapshot.observed_at
-        if snapshot.observed_at > observed_now or age > config.freshness_seconds:
-            _check(checks, f"{prefix}_freshness", "BLOCKED", "ACCOUNT_STATE_STALE", f"{role} account state is outside the explicit freshness bound", observed_at=snapshot.observed_at, age_seconds=age, freshness_seconds=config.freshness_seconds)
-        else:
-            _check(checks, f"{prefix}_freshness", "PASS", "ACCOUNT_STATE_FRESH", f"{role} account state is fresh", observed_at=snapshot.observed_at, age_seconds=age)
         if not snapshot.ready:
             _check(checks, f"{prefix}_status", "BLOCKED", "ACCOUNT_INACTIVE", f"{role} account is not active/online")
         else:
@@ -845,6 +858,42 @@ async def run_readiness(
             _check(checks, f"{prefix}_margin", "BLOCKED", "INCREMENTAL_MARGIN_INSUFFICIENT", f"{role} proven incremental opening margin exceeds available balance", margin_available=format(snapshot.margin_available, "f"), incremental_margin_required=format(snapshot.incremental_margin_required, "f"))
         else:
             _check(checks, f"{prefix}_margin", "PASS", "INCREMENTAL_MARGIN_PROVEN", f"{role} incremental opening margin is explicitly evidenced and available", margin_available=format(snapshot.margin_available, "f"), incremental_margin_required=format(snapshot.incremental_margin_required, "f"), evidence=snapshot.incremental_margin_evidence)
+
+    # Freshness is evaluated against one final decision time after every
+    # required read.  This keeps response observations coherent during normal
+    # latency and lets an earlier market/account snapshot age while later
+    # account reads or local hidden-key input complete.
+    final_now = current_decision_time()
+    if metadata is not None:
+        metadata_age = final_now - metadata.observed_at
+        if metadata.observed_at > final_now or metadata_age > config.freshness_seconds:
+            _check(checks, "market_metadata_freshness", "BLOCKED", "MARKET_METADATA_STALE", "current market metadata is outside the explicit freshness bound", observed_at=metadata.observed_at, age_seconds=metadata_age, freshness_seconds=config.freshness_seconds)
+        else:
+            _check(checks, "market_metadata_freshness", "PASS", "MARKET_METADATA_FRESH", "current market metadata is fresh", observed_at=metadata.observed_at, age_seconds=metadata_age)
+    if book is not None and metadata is not None:
+        age = final_now - book.observed_at
+        try:
+            if book.market_id != metadata.market_id or book.symbol.upper() != metadata.symbol.upper() or book.market_type.lower() != "perp" or book.venue.lower() not in {"robinhood", "robinhood-chain"}:
+                _check(checks, "public_book", "BLOCKED", "BOOK_IDENTITY_CONFLICT", "public book identity conflicts with the current market", book_market_id=book.market_id, book_symbol=book.symbol)
+            elif book.observed_at > final_now or age > config.freshness_seconds:
+                _check(checks, "public_book", "BLOCKED", "BOOK_STALE", "public book is outside the explicit freshness bound", observed_at=book.observed_at, age_seconds=age, freshness_seconds=config.freshness_seconds)
+            elif not book.bids or not book.asks:
+                _check(checks, "public_book", "UNKNOWN", "BOOK_SIDE_MISSING", "public book lacks a bid or ask side")
+            else:
+                best_bid = book.bids[0].price
+                best_ask = book.asks[0].price
+                _check(checks, "public_book", "PASS", "BOOK_FRESH", "bounded public book read is fresh; bid/ask are observations only", observed_at=book.observed_at, age_seconds=age, best_bid=format(best_bid, "f"), best_ask=format(best_ask, "f"), observed_source_notional=format(config.quantity * best_bid, "f"), observed_receiver_notional=format(config.quantity * best_ask, "f"))
+        except Exception as exc:
+            _check(checks, "public_book", "UNKNOWN", "BOOK_READ_FAILED", "public book could not be interpreted", reason=sanitize_exception(exc))
+    for role, snapshot in snapshots.items():
+        if snapshot is None:
+            continue
+        prefix = f"{role}_account"
+        age = final_now - snapshot.observed_at
+        if snapshot.observed_at > final_now or age > config.freshness_seconds:
+            _check(checks, f"{prefix}_freshness", "BLOCKED", "ACCOUNT_STATE_STALE", f"{role} account state is outside the explicit freshness bound", observed_at=snapshot.observed_at, age_seconds=age, freshness_seconds=config.freshness_seconds)
+        else:
+            _check(checks, f"{prefix}_freshness", "PASS", "ACCOUNT_STATE_FRESH", f"{role} account state is fresh", observed_at=snapshot.observed_at, age_seconds=age)
 
     source = snapshots["source"]
     receiver = snapshots["receiver"]
