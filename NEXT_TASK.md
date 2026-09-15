@@ -4,6 +4,10 @@
 
 Owner explicitly approved sequential liquidity-aware variable slices and requires https://robinhoodchain.lighter.xyz, with an early compatibility check before later owner-operated account testing. This supersedes HCR-1 single-attempt-only scope for a finite series, not its per-attempt invariants. Root remains sole Chief. One Builder may implement in an isolated codex/spread-v1-hood-rh-slices worktree; no second Chief. Builder owns hood_handoff source, its tests and dependency changes only; Chief owns governing documents and operator README and sole integration. Requested Builder Luna/max/Standard; report actual client evidence honestly. No other repository implementation may be copied; official venue SDK/docs are protocol references.
 
+## Early compatibility result — target clarification required
+
+Two public GETs completed and original responses preserved in spread-shadow-runs/hood-rh-20260915/compatibility-v1/. Official elliottech/lighter-agent-kit install documentation maps the owner website to https://api.rh.lighter.xyz. orderBooks and orderBookDetails agree: 57 perpetual and 27 spot markets, no HOOD symbol in either. Do not substitute a ticker. Owner has been asked which instrument on this deployment is intended. No Builder dispatched or production changes made; reserved worktree codex/spread-v1-hood-rh-slices remains at governing-contract commit 7bbbba2. Dependent implementation awaits the target answer; no background process or scheduled callback exists. Mainnet chain/signing identity still needs verification when a target is selected. Remaining public request allowance: 10, not a standing collection permission.
+
 ## Finite work and acceptance
 
 1. Establish official website-to-API and signer/network identity for Robinhood deployment; distinguish EVM chain ID from Lighter signing domain. Never silently fall back to ordinary Lighter mainnet. Verify actual HOOD perpetual availability first; absent HOOD or unsupported signing semantics is a concrete blocker, not authority to substitute a market.
