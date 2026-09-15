@@ -3,9 +3,9 @@
 SYSTEM_SPEC_VERSION = 4.0
 SPEC_STATUS = FIRST_RAW_RESEARCH_SCANNER_IMPLEMENTED
 
-## HCR-5 amendment — local readiness inspection (in development)
+## HCR-5 amendment — local readiness inspection (accepted offline)
 
-Owner authorizes a separately invoked read-only diagnostic for the Robinhood paired-opening utility. It checks current market and both account readiness without order mutations. Local user execution may authenticate read endpoints using hidden in-memory API key input; agent development stays offline. Missing incremental opening-margin proof remains UNKNOWN, and missing operator trade bounds remain UNSET. Diagnostics cannot silently promote a quote/balance into an executable plan or bypass accepted trading preflight. Existing no-network default preview and all order semantics remain unchanged. NEXT_TASK defines the finite implementation/verification scope.
+Accepted candidate 3de9e91ac16bd0faa2caeed2efa15c7e5ae82ae4, clean isolated pinned-SDK suite4331 passed,3 skipped; live account/auth NOT_RUN. Owner authorizes a separately invoked read-only diagnostic for the Robinhood paired-opening utility. It checks current market and both account readiness without order mutations. Local user execution may authenticate read endpoints using hidden in-memory API key input; agent development stays offline. Missing incremental opening-margin proof remains UNKNOWN, and missing operator trade bounds remain UNSET. Diagnostics cannot silently promote a quote/balance into an executable plan or bypass accepted trading preflight. Existing no-network default preview and all order semantics remain unchanged. NEXT_TASK defines the finite implementation/verification scope.
 
 ## HCR-3 amendment — paired opening (accepted offline)
 

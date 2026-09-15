@@ -1,6 +1,14 @@
 # Current status
 
-HCR-5 local read-only readiness command CHANGES_REQUESTED at503f086: normal read latency falsely blocks freshness, contradictory duplicate position records falsely appear flat. Exact Chief reproductions/review in root spread-shadow-runs/hood-readiness-20260915/chief-review-v1. Same minimal-context Builder corrects; no final isolated acceptance yet. Owner confirmed.00020BTC paired opening A27331SHORT/B27337LONG. HCR-4 public sizing2/2 complete; no further public/account/key/signing/order calls authorized for agents. Accepted HCR-3 remains unchanged until review.
+## HCR-5 local read-only readiness — ACCEPTED OFFLINE
+
+Accepted candidate3de9e91ac16bd0faa2caeed2efa15c7e5ae82ae4, Builder branch codex/spread-v1-hood-readiness. Separate readiness CLI checks public market/book and user-local account/auth state, with hidden in-memory keys and no trading mutation surface. Complete diagnostics and unknown opening-margin proof are distinguished; unset prices never become a launch-ready plan. Owner confirmed .00020BTC, A27331SHORT/B27337LONG, keyindex4. README contains exact local invocation with diagnostic freshness120s/read timeout10s, no live order-price/time policy selected.
+
+Chief reviewed full initial/correction diffs and independently reproduced normal-latency and contradictory-position fixes, early rejection of6 forbidden flag combinations before any client/key creation, and pinnedSDK1.1.2 read signatures/NONE nonce static semantics. Final clean isolated Python3.11.5 suite4331 passed,3 skipped,exit0,130.63s; all project imports/candidate source hashes before/after and Builder hash packet verified. Root evidence spread-shadow-runs/hood-readiness-20260915/chief-final-v1; original503f086 CHANGES_REQUESTED probes in chief-review-v1. Builder r2 raw focused90 evidence in preserved worktree; original host full4322/3 not final acceptance evidence.
+
+No real account/key/auth/signing/order/public requests in HCR-5. Real adapter explicitly reports missing incremental opening margin UNKNOWN, and quotes without operator prices UNSET; acceptance is diagnostic code, not trade readiness. Public HCR-4 gate2/2 exhausted with saved minimum.00020BTC and indicative15.398240USD; HCR-2 gate12/12 remains historical. No further collection or agent trading authority.
+
+Root01a096cf-96fc-7f02-b2bb-8bb0a92b8f09 remains sole Chief. Fresh Builder01a0a535-58ae-7221-aac8-918440a692d1 delivered final result and is complete; no watcher or active trading/key-input process. Source branch/worktree preserved. Native navigation succeeded, sidebar list still omits child despite successful pin; permanent visibility not claimed. Future independent tasks get new minimal-context Builders.
 
 ## HCR-3 paired opening — ACCEPTED OFFLINE
 

@@ -1,6 +1,31 @@
 # RISEx Spread Shadow and legacy Funding Farmer
 
 
+## Local read-only readiness check — HCR-5
+
+A separate `readiness` command checks current Robinhood market/account state without sending orders. Accepted offline candidate `3de9e91ac16bd0faa2caeed2efa15c7e5ae82ae4` passed the final clean isolated Python3.11 suite with pinned SDK1.1.2: 4331 passed,3 skipped. This is an operator-run account inspection; agents have tested synthetic reads only. It uses the pinned Lighter SDK1.1.2 and read authentication, with an explicit no-op nonce manager. It never invokes create/cancel/sendTx/transfer/withdraw or mutation nonce methods.
+
+The dedicated `.venv-hood` environment is already installed in the project checkout. From your own interactive terminal, run:
+
+```bash
+cd "/Users/daniilmakarov/Desktop/RISEx Spread Shadow"
+.venv-hood/bin/risex-hood-handoff readiness \
+  --symbol BTC --quantity 0.00020 --direction LONG \
+  --source-account-index 27331 --receiver-account-index 27337 \
+  --api-key-index 4 \
+  --freshness-seconds 120 --request-timeout-seconds 10
+```
+
+Here `LONG` means receiver LONG and source SHORT. Quantity0.00020BTC is the owner-confirmed amount; the command rechecks current minimums rather than assuming the saved dollar estimate. The120-second freshness bound and10-second per-request timeout are explicit **diagnostic** settings allowing time for manual input; they do not set trading deadlines, select prices or grant execution. Age is measured at the final check, and key-entry delay does not renew old data. Change diagnostic bounds explicitly if needed and interpret a stale result accordingly.
+
+Wait for the actual prompt `Lighter API key for account … (hidden input):`. Enter the corresponding local API private key and press Enter, then repeat for the other account if prompted. Characters are not echoed. Do not paste keys into the shell before this prompt. The keys and authentication tokens remain in process memory, not in JSON configuration, arguments, environment variables or report files. Use replacement keys for any that were exposed in chat. Non-interactive input is rejected. Normal `--help` and old offline preview do not ask for keys or make requests.
+
+This diagnostic does not need fabricated `market-evidence.json`, quantity-to-margin numbers, or trade-execution flags. Combining readiness with `--execute`, either live-operation acknowledgment, `--confirm-plan`, `--config` or `--market-evidence` is rejected before client/key creation. Optional `--source-limit-price` and `--receiver-worst-price` check prices you have already selected; this example intentionally leaves them UNSET. No launch-ready trading file is created.
+
+Read the final JSON `checks` entries. `PASS` means the named condition was established, `BLOCKED` identifies a failed condition, `UNKNOWN` means missing proof/read failure, and `UNSET` identifies an unchosen trade parameter. The overall exit is0 only for READY, otherwise2. READY is read-only diagnostic completion, not a promise of execution or permission to trade; the report always has `execution_authorized:false`.
+
+The current official account fields expose balance and existing cross-margin requirement but do not establish the incremental margin of these planned orders. Therefore the real adapter reports `MARGIN_EVIDENCE_REQUIRED` / UNKNOWN for that calculation; available balance is not substituted for proof. Prices omitted above also remain UNSET. These are expected explicit limitations, not a failed installation. A separate justified margin calculation/evidence and operator-selected trading bounds are still needed before using the trading path. No live account/auth/order check has been performed by agents.
+
 ## Open opposite positions from balances — HCR-3
 
 The new `PAIRED_OPENING` operation opens opposite perpetual positions from initially flat selected-market positions. It is separate from the default `CLOSE_REOPEN` operation, which still requires an existing source position. It does not transfer collateral, guarantee counterparty matching, or automatically close the resulting positions. The receiver needs its own collateral, and both legs require current opening-margin evidence. Accepted offline candidate `2b06a7b09109c2101e722103b93dc007e31fcdb9`: final clean isolated Python3.11 suite4312 passed,3 skipped; real account/signing/order execution remains NOT_RUN.
