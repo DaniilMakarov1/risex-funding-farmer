@@ -1,3 +1,7 @@
+# HCR-2 IN PROGRESS — 2026-09-15
+
+Owner approved variable sequential slices and specifically Robinhood Chain Lighter. Compatibility research precedes implementation; ordinary Lighter mainnet acceptance does not prove this deployment. No live account test performed. Root is sole Chief. Active scope and finite public probe bounds are in NEXT_TASK.
+
 # Current status
 
 ## HCR-1 BOTH without monetary caps accepted offline — 2026-09-15
