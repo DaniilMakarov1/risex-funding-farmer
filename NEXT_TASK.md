@@ -22,3 +22,9 @@ New Builder owns src/risex_spread_shadow/hood_handoff and relevant tests only in
 Builder must immediately deliver identity and later final result/blocker directly to Chief native01a096cf-96fc-7f02-b2bb-8bb0a92b8f09 using send_message_to_thread. Chief does not continuously poll. If delivery fails, preserve explicit undelivered packet/path. Luna/max explicit role, Standard requested/speedUNKNOWN. Sidebar visibility must be verified honestly; do not create duplicate work solely to manufacture a card. No accumulated prior conversation or chat credentials passed to new Builder.
 
 No agent real account/private/fee/nonce calls, credentials, signing, signed payloads, orders, funds or new public collection. All development tests use offline fixtures. Final operator setup/test is not executed by agents. Multiple wallets, automatic price selection/position closing and transfers remain deferred.
+
+Active fresh Builder native01a0a535-58ae-7221-aac8-918440a692d1, collaboration /root/readiness_builder, title Builder — Robinhood: локальная проверка готовности. Direct identity delivery verified; native navigation succeeded, permanent sidebar visibility remains unverified because list_threads omits child despite successful pin. No duplicate session or standing polling. Chief review plan preserved in root ignored spread-shadow-runs/hood-readiness-20260915/chief-review-v1/review-plan.md.
+
+## Review checkpoint
+
+Candidate503f08699e05a73979fcede0c3c76c9e2d1d3222 CHANGES_REQUESTED: captured pre-read clock falsely marks fresh responses future; duplicate selected-market positions falsely report flat. Root chief-review-v1 has exact review and independent offline reproductions. Same fresh Builder owns correction and direct delivery; no integration/full acceptance yet. Existing Builder full4322/3 was host env without SDK, not required isolated pinned-SDK evidence. Chief owns final clean suite after correction.

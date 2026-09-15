@@ -1,6 +1,6 @@
 # Current status
 
-HCR-5 local read-only readiness command IN DEVELOPMENT, new minimal-context Builder to own implementation. Owner confirmed.00020BTC paired opening A27331SHORT/B27337LONG. HCR-4 public sizing2/2 complete; no further public/account/key/signing/order calls authorized for agents. Accepted HCR-3 remains unchanged until review.
+HCR-5 local read-only readiness command CHANGES_REQUESTED at503f086: normal read latency falsely blocks freshness, contradictory duplicate position records falsely appear flat. Exact Chief reproductions/review in root spread-shadow-runs/hood-readiness-20260915/chief-review-v1. Same minimal-context Builder corrects; no final isolated acceptance yet. Owner confirmed.00020BTC paired opening A27331SHORT/B27337LONG. HCR-4 public sizing2/2 complete; no further public/account/key/signing/order calls authorized for agents. Accepted HCR-3 remains unchanged until review.
 
 ## HCR-3 paired opening — ACCEPTED OFFLINE
 
