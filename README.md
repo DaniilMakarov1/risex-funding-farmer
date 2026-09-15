@@ -13,6 +13,24 @@ To replace stored keys, use `--keychain-replace` instead of `--keychain`; this r
 
 Help and execution preview remain offline and do not access Keychain even when `--keychain` is present. Agent verification uses synthetic keys/backends; real user keys and actual OS Keychain storage are not accessed in those tests. The current configured Robinhood endpoint has not been established as a valueless test environment. No agent order test follows from credential persistence.
 
+## Explicit local margin-calculation deferral — HCR-8
+
+For operator-run `PAIRED_OPENING`, set `"defer_incremental_margin_calculation": true` in the existing run/series JSON configuration, or add `--defer-incremental-margin-calculation` to the existing `run` invocation. The default is false. The flag is rejected for `CLOSE_REOPEN` and for `readiness`; it does not make the readiness diagnostic READY.
+
+This option skips only a missing local incremental opening-margin estimate/provenance. Missing values stay uncalculated; never insert a fabricated zero. Supplied estimates must still be finite and nonnegative, and an evidenced estimate exceeding available margin still blocks. Current account margin/balance checks and all quantity, minimum, price, time, position, identity and reconciliation checks remain. The exact deferral choice is shown in preview/plan and bound to parent/child journals; changing it on restart is rejected. An exchange rejection does not prove a fill and is not automatically retried.
+
+For an existing operator-prepared configuration/evidence pair, the following is an **offline preview command template**. Replace both paths with real files first; it does not send orders or access keys:
+
+```bash
+.venv-hood/bin/risex-hood-handoff run \
+  --config /absolute/path/to/paired-opening-config.json \
+  --market-evidence /absolute/path/to/current-market-evidence.json \
+  --source-account-index 27331 --receiver-account-index 27337 \
+  --defer-incremental-margin-calculation
+```
+
+With deferral enabled, the four source/receiver incremental-margin estimate/provenance fields may be omitted from market evidence. Current market identity/grid/minimum evidence and its original timestamp remain required. This command does not choose missing prices or deadlines. Existing local execution/plan-review switches and optional `--keychain` remain separate; the new flag alone never enables execution. Mainnet trading must be run by the owner, not by the agent. The owner's test budget is on Mainnet; no testnet migration is intended.
+
 ## Local read-only readiness check — HCR-5
 
 A separate `readiness` command checks current Robinhood market/account state without sending orders. Accepted offline candidate `3de9e91ac16bd0faa2caeed2efa15c7e5ae82ae4` passed the final clean isolated Python3.11 suite with pinned SDK1.1.2: 4331 passed,3 skipped. This is an operator-run account inspection; agents have tested synthetic reads only. It uses the pinned Lighter SDK1.1.2 and read authentication, with an explicit no-op nonce manager. It never invokes create/cancel/sendTx/transfer/withdraw or mutation nonce methods.

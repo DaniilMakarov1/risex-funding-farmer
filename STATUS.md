@@ -1,12 +1,10 @@
 # Current status
 
-HCR-8 review checkpoint: candidate1bbf3e265bd9126945855089e0a9f6eb4cfae2a8 received directly; full diff reviewed. CHANGES_REQUESTED for sdk.py normalization hiding malformed supplied incremental values when provenance absent, newly admitted by deferral. Independent actual-adapter synthetic probe reproduces -1/NaN/malformed -> None. Same fresh Builder assigned bounded correction and explicit rejection/restart evidence; no formal REJECT, no integration/full suite yet. Packet original-root spread-shadow-runs/hood-margin-deferred-20260915/chief-review-v1. Next action on direct corrected delivery; no periodic monitoring.
+## HCR-8 optional deferred incremental margin — ACCEPTED OFFLINE
 
-## HCR-8 local incremental margin deferral — AUTHORIZED OFFLINE
+Candidate5a4ae6edb7ea2a77d986b4f0eee1a98493bae0c0 accepted. Explicit paired-opening deferral, strict default, no fabricated estimate, malformed supplied value rejection, durable direct/series/child policy binding. Full initial/correction diff reviewed; independent adapter and LONG/SHORT strict/deferred/restart probes PASS. Final clean isolated Python3.11.5 SDK1.1.2 suite4382 passed3skipped exit0,127.96seconds; unchanged hashes/import roots verified. Evidence original-root spread-shadow-runs/hood-margin-deferred-20260915/chief-final-v1. Previous unaccepted candidate/probes preserved. Fresh Builder01a0a5dc-ca4f-7f30-b584-15d7daf02519 directly delivered and complete, no active assignment/monitoring.
 
-Owner explicitly chooses existing Mainnet and defers initial-margin calculation; allocated balances are intended for tests. Environment-choice question resolved. Fresh margin_deferred_builder successfully spawned (prior keychain_builder not reused), isolated codex/spread-v1-margin-deferred/hood-margin-deferred from7168928. Finite operator utility opt-in only, default strict, missing calculation remains unverified and persisted policy-bound. Agents do not execute mainnet financial transactions or access real credentials/accounts. NEXT_TASK defines exact acceptance. No production edits by Chief. Direct Builder delivery, no monitoring.
-
-Prior semantics/report evidence remains original-root spread-shadow-runs/hood-margin-evidence-20260915/semantics-v1 and owner-report-v2: both BTC rows absent, account counts zero; market raw5000/200; no calculated-margin or exact account-default proof. HCR-8 does not require solving that calculation or silently changing position semantics.
+Owner chooses Mainnet/test budget and postpones calculation. Agents performed no actual account/key/signing/order calls. README includes deferral option and offline preview template; live strategy outcome NOT_RUN, concrete owner run inputs remain missing. NEXT_TASK records exact next boundary. No renewed testnet or calculation requirement.
 
 ## HCR-7B margin diagnostic evidence — ACCEPTED OFFLINE
 

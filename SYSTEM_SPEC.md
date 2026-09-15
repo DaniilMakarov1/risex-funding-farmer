@@ -3,6 +3,10 @@
 SYSTEM_SPEC_VERSION = 4.0
 SPEC_STATUS = FIRST_RAW_RESEARCH_SCANNER_IMPLEMENTED
 
+## HCR-8 amendment — explicit operator margin deferral (accepted offline)
+
+Owner may opt into `defer_incremental_margin_calculation:true` for PAIRED_OPENING in direct/series configuration or via `--defer-incremental-margin-calculation`. Default false remains strict. This supersedes mandatory incremental estimate/provenance only for the explicit deferred path; missing evidence stays uncalculated. Supplied nonfinite/negative/malformed estimates remain rejected, evidenced insufficient estimates still block. Existing balance/current-margin, identity/positions/orders, fees, prices, sizes/minima, timing, reconciliation and no-replay rules remain. Bind policy to plan/parent/child journals and reject changed-policy restart. Exchange rejection is not fill/success. Readiness stays read-only and rejects the execution option. Owner chose Mainnet; actual financial operation is owner-local, agent verification remains synthetic offline.
+
 ## HCR-7B amendment — bounded margin diagnostic evidence (accepted offline)
 
 Readiness reports retain strict whitelisted account/market margin fields with identity, SDK/source and original observation timestamps. Selected-position absence differs from explicit zero. Raw fraction/allocated/cross values carry unverified units; no signing-input encoding is inferred. Returned row counts are conservative consistency evidence against account totals, without exact-equality assumptions or nonselected-row dumps. Malformed/conflicting evidence produces INVALID/UNKNOWN. These diagnostics do not calculate incremental opening margin or select prices; existing UNKNOWN/UNSET and execution_authorized:false remain. No trading-policy or credential behavior change.
