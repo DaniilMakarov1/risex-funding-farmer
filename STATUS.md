@@ -1,8 +1,10 @@
 # Current status
 
-## Post-HCR-7B semantics diagnosis — environment decision pending
+## HCR-8 local incremental margin deferral — AUTHORIZED OFFLINE
 
-Updated owner report received: account reads PASS, both BTC rows absent, account-wide total/pending/isolated orders0; default/minimum market fractions raw5000/200. Pinned SDK and official kit describe historical touched-market rows; absence can be normal for untouched markets. Response units and actual default account settings are not proven. No production or policy change. Official kit now explicitly identifies api.rh.lighter.xyz as mainnet and api.rh-testnet.lighter.xyz as testnet; credentials/account indices are deployment-specific. Owner asked to choose environment before any new finite scope. Evidence original-root spread-shadow-runs/hood-margin-evidence-20260915/semantics-v1 and owner-report-v2. No private/live calls or new Builder assignment.
+Owner explicitly chooses existing Mainnet and defers initial-margin calculation; allocated balances are intended for tests. Environment-choice question resolved. Fresh margin_deferred_builder successfully spawned (prior keychain_builder not reused), isolated codex/spread-v1-margin-deferred/hood-margin-deferred from7168928. Finite operator utility opt-in only, default strict, missing calculation remains unverified and persisted policy-bound. Agents do not execute mainnet financial transactions or access real credentials/accounts. NEXT_TASK defines exact acceptance. No production edits by Chief. Direct Builder delivery, no monitoring.
+
+Prior semantics/report evidence remains original-root spread-shadow-runs/hood-margin-evidence-20260915/semantics-v1 and owner-report-v2: both BTC rows absent, account counts zero; market raw5000/200; no calculated-margin or exact account-default proof. HCR-8 does not require solving that calculation or silently changing position semantics.
 
 ## HCR-7B margin diagnostic evidence — ACCEPTED OFFLINE
 
