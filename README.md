@@ -2,15 +2,15 @@
 
 ## Owner-local paired opening — current unresolved attempt
 
-The owner ran owner-live-003 after manually closing owner002 and confirming both accounts had no positions; readiness also showed no active orders. The new saved terminal result is **UNKNOWN**. Source27331 order562950026284934 was canceled with zero fill and observed position0. Receiver27337 order844424857365178 reported filled0.00020BTC and observed position**+0.00020BTC**. Its trade receipt was rejected as future, so independent trade-history reconciliation remains incomplete. These are saved observations, not a current account read. Displayed reconciled filled0 does not mean no execution.
+The owner ran owner-live-003. A later owner-authorized read-only check (HCR-15) confirmed source27331 position0 and canceled order562950026284934 with zero fill; receiver27337 position**+0.00020BTC**, order844424857365178 filled.00020, and no active BTC orders on either account. Actual trade724281192 bought.00020 at75906.5 from external seller8151, below the75907.1 bound. Gross notional15.181300 is not profit; fees were unavailable. Owner says the receiver position has not been closed.
 
-**Do not launch another opening or reuse/clear the attempt directory while this state remains unresolved.** No automatic flattening or compensation is provided. The current software correction is offline and does not read accounts, cancel orders or close positions.
+**Do not launch another opening or reuse/clear the attempt directory while the existing inventory remains unresolved.** No automatic flattening/compensation is provided. Chief performed read-only authentication/account/order/trade requests, never a financial transaction or position closure.
 
-Preserve the packet, terminal result, exit status, claim and intent journal at:
+Preserve all original files at:
 `/Users/daniilmakarov/Desktop/RISEx Spread Shadow/spread-shadow-runs/hood-launch-flow-20260916/owner-live-003`
-All earlier attempts remain immutable. Manual closure of owner002 does not rewrite its historical UNKNOWN result. Provide the attempt path for sanitized diagnosis; never provide keys, tokens or signed payloads.
+Earlier attempts also remain immutable. Original003 outcome UNKNOWN is not rewritten. Separate later evidence is in `spread-shadow-runs/hood-live-readcheck-20260916/chief-v1`.
 
-HCR-14 candidate2ed6145afd77a45a041fbac9fbd810275543555e is accepted offline:4437 tests passed,3 skipped and18 independent checks passed. It converts official trade timestamp milliseconds to internal seconds while preserving strict future-time rejection. The raw rejected timestamp was not retained, so the exact historical cause cannot be conclusively proven from the saved packet. Offline acceptance does not establish successful live paired execution or resolve open inventory.
+HCR-14 fixed integer trade timestamp milliseconds entering an internal seconds field;4437 tests passed,3 skipped and18 independent checks passed. HCR-15 additionally replayed the actual received trade timestamp1789541676196 through old/new code without network: old code reproduces the original three errors; corrected code reconciles the observed positions and histories as **PARTIAL**, with no unknown reasons. This verifies real-response handling; no new financial lifecycle was run. Successful processing does not guarantee both orders fill or match each other.
 
 ## Local-attempt behavior
 

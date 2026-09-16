@@ -1,10 +1,18 @@
-# HCR-15 — bounded owner-authorized read-only live verification
+# HCR-15 — completed live read-only verification; receiver inventory open
 
-Owner explicitly asks Chief to test independently and confirms receiver position after003 remains open. Owner permits real trading, but system/tool restrictions do not permit Chief financial transactions. Execute only the necessary read-only subset: existing protected Keychain records for27331/27337 key4, Robinhood origin/domain466324, read authentication with NONE nonce manager, current selected BTC account/active-order state and exact owner003 order/trade reads. No create/cancel/sendTx/close/withdraw/transfer/setting changes or automatic retry. No credential enrollment/replacement/deletion. No agents receive credentials. Chief diagnostic probe only; no production implementation, no Builder needed.
+Owner explicitly asked Chief to test independently and confirmed receiver position after003 was not closed. Owner permitted real trading; system/tool restrictions exclude agent financial transactions. Chief completed the authorized necessary read-only subset using existing protected Keychain records for27331/27337 key4 on Robinhood domain466324; read authentication only with NONE nonce manager. No enrollment/replacement/deletion or credential/token output. No create/cancel/sendTx/close/withdraw/transfer/setting changes. No Builder or production edits were needed.
 
-Finite bounds: request5seconds, total60seconds, one request/page for each of two exact order histories (up to100rows each; nonempty cursor remains incomplete), exact order/client identities from immutable003. No unrelated market/account collection. Store only whitelisted secret-free response fields and source/import/config hashes in new owner-only spread-shadow-runs/hood-live-readcheck-20260916/chief-v1. Never log request headers/auth tokens/private keys/arbitrary exceptions. Original attempts unchanged. Offline replay the accepted SDK normalization and engine reconciliation on retained actual response fields without re-entering live execution or writing original journal; retain historical UNKNOWN separately. Finish with evidence/limitations, current observed inventory, and actionable bounded defects if found. New policy changes remain owner decisions. No perpetual monitoring or new launch.
+## Completed finite evidence
+Owner-only original-root spread-shadow-runs/hood-live-readcheck-20260916/chief-v1: readcheck.py/read-result.json, offline replay.py/replay-result.json/replay-events.json, old-code baseline-replay.py/baseline-result.json, manifest.json/report.md. Original003 hashes unchanged. Request5seconds,total60seconds, one trade page per exact order up to100rows; no cursor/incomplete history or read error. Two account/active-order snapshots and two exact order/trade reads. Actual read duration3.93seconds. Keys/tokens remained in memory; resources closed.
 
-Previous accepted implementation and history below remain evidence, not restrictions overriding this newly authorized read-only scope.
+Fresh observed source27331 position0 and canceled sourceorder562950026284934 filled0. Receiver27337 position+.00020BTC; order844424857365178 filled.00020. Trade724281192 at75906.5, rawtimestamp1789541676196milliseconds, gross15.181300; external seller8151/order562950026284939. No active selected-market orders. Fees unavailable, no profit claim.
+
+Network-disabled replay through accepted SDK normalization and engine reconciliation/classification returns PARTIAL, both histories complete, no unknown reasons and exact position/fill agreement. Identical captured response through old4d31ad7 reproduces all three original errors. Accepted codeb1e3370 source unchanged; HCR14 full4437pass3skip remains valid, no duplicate suite. Original003 UNKNOWN remains immutable; this is later independent evidence, not a rewrite or live retry.
+
+## Remaining boundary
+Software/read-only verification complete. Receiver+.00020BTC remains open per owner and latest read. No new financial lifecycle was executed, no new launch command, automatic closure, persistent monitor or strategy change. Owner's requested independent live-order testing cannot be performed by Chief within system/tool restrictions. Actual current inventory and later orders are separate from the completed diagnosis.
+
+Previous accepted software evidence follows (HCR-15 supersedes historical unknown-current-state statements):
 
 # HCR-14 — completed trade timestamp correction; owner003 state unresolved
 
