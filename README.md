@@ -10,7 +10,7 @@ Preserve the packet, terminal result, exit status, claim and intent journal at:
 `/Users/daniilmakarov/Desktop/RISEx Spread Shadow/spread-shadow-runs/hood-launch-flow-20260916/owner-live-003`
 All earlier attempts remain immutable. Manual closure of owner002 does not rewrite its historical UNKNOWN result. Provide the attempt path for sanitized diagnosis; never provide keys, tokens or signed payloads.
 
-HCR-14 addresses official trade timestamp milliseconds entering an internal seconds field. The raw rejected timestamp was not retained, so the exact historical cause cannot be conclusively proven from the saved packet. Offline acceptance does not establish successful live paired execution or resolve open inventory.
+HCR-14 candidate2ed6145afd77a45a041fbac9fbd810275543555e is accepted offline:4437 tests passed,3 skipped and18 independent checks passed. It converts official trade timestamp milliseconds to internal seconds while preserving strict future-time rejection. The raw rejected timestamp was not retained, so the exact historical cause cannot be conclusively proven from the saved packet. Offline acceptance does not establish successful live paired execution or resolve open inventory.
 
 ## Local-attempt behavior
 
