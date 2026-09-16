@@ -2,15 +2,15 @@
 
 ## Owner-local paired opening — current unresolved attempt
 
-The owner ran HCR-12 owner-live-002. The saved terminal result is **UNKNOWN**: source27331 was dispatched and observed at **-0.00020 BTC**; receiver27337 was not dispatched and was observed at0. The source order identity/status and trade history were unresolved. These are saved observations, not a current account read. A displayed filled quantity0 with incomplete history is not proof of no fill.
+The owner ran owner-live-003 after manually closing owner002 and confirming both accounts had no positions; readiness also showed no active orders. The new saved terminal result is **UNKNOWN**. Source27331 order562950026284934 was canceled with zero fill and observed position0. Receiver27337 order844424857365178 reported filled0.00020BTC and observed position**+0.00020BTC**. Its trade receipt was rejected as future, so independent trade-history reconciliation remains incomplete. These are saved observations, not a current account read. Displayed reconciled filled0 does not mean no execution.
 
-**Do not launch another opening or reuse/clear the attempt directory while this state remains unresolved.** A source order expiration does not close a filled position. No automatic flattening or compensation is provided. The current task diagnoses and corrects the software offline; it does not send account requests, cancel orders or close positions.
+**Do not launch another opening or reuse/clear the attempt directory while this state remains unresolved.** No automatic flattening or compensation is provided. The current software correction is offline and does not read accounts, cancel orders or close positions.
 
-Preserve the original packet, terminal result, exit status, claim and intent journal at:
-`/Users/daniilmakarov/Desktop/RISEx Spread Shadow/spread-shadow-runs/hood-launch-flow-20260916/owner-live-002`
-The earlier owner-live-001 is also consumed and must remain unchanged. Provide the attempt path for sanitized diagnosis; never provide keys, authentication tokens or signed payloads as evidence.
+Preserve the packet, terminal result, exit status, claim and intent journal at:
+`/Users/daniilmakarov/Desktop/RISEx Spread Shadow/spread-shadow-runs/hood-launch-flow-20260916/owner-live-003`
+All earlier attempts remain immutable. Manual closure of owner002 does not rewrite its historical UNKNOWN result. Provide the attempt path for sanitized diagnosis; never provide keys, tokens or signed payloads.
 
-HCR-13 candidate4d31ad785d8cef7c7a380863dc3c379ec49824d1 is accepted offline with4424passed/3skipped and16 independent checks. It corrects official order-side parsing, trades request direction, false history-pagination errors and SDK resource cleanup. The exact raw response behind the earlier live contract_error was not captured; its historical cause is not conclusively established. Offline acceptance does not establish successful live paired execution. No new launch command is supplied while the previous attempt remains unresolved.
+HCR-14 addresses official trade timestamp milliseconds entering an internal seconds field. The raw rejected timestamp was not retained, so the exact historical cause cannot be conclusively proven from the saved packet. Offline acceptance does not establish successful live paired execution or resolve open inventory.
 
 ## Local-attempt behavior
 

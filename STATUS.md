@@ -1,5 +1,9 @@
 # Current status
 
+## HCR-14 — timestamp correction in progress; owner-live-003 UNKNOWN
+
+Owner confirmed manual closure of002 and both accounts empty before003. New003 source canceled without fill/observed0; receiver order filled.00020/observed+.00020BTC. Independent receiver history rejected a future timestamp; raw rejected timestamp unavailable. Original attempts immutable. Chief reproduced a realistic epoch-millisecond receipt incorrectly mapped unchanged to seconds. Official Trade example supports milliseconds. Bounded offline correction in NEXT_TASK; no new live operation or automatic compensation. Evidence hood-trade-time-20260916/chief-v1. Fresh Builder creation failed platform thread limit; completed explicit-role Luna/max Builder reassigned to new isolated hood-trade-time branch, old worktrees preserved. Chief owns docs/review/integration, one Chief/one Builder.
+
 ## HCR-13 — ACCEPTED OFFLINE; owner-live-002 remains UNKNOWN
 
 Candidate4d31ad785d8cef7c7a380863dc3c379ec49824d1 independently accepted by Chief01a0a67b-bec7-75d2-9970-e3914b10e445 on2026-09-16. Official order is_ask/required-field normalization, account/market matching, documented descending trades request, truthful missing-ID pagination diagnosis and SDK resource cleanup/fallback implemented. Readiness shares normalization. No strategy/price/size/threshold/fee/dependency change.

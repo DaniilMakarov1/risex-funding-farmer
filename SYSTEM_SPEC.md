@@ -3,6 +3,10 @@
 SYSTEM_SPEC_VERSION = 4.2
 SPEC_STATUS = FIRST_RAW_RESEARCH_SCANNER_IMPLEMENTED
 
+## HCR-14 amendment — official trade timestamp units
+
+The official SDK Trade.timestamp is an integer Unix epoch millisecond value. Normalize it once at the SDK trade-receipt boundary into the internal TradeReceipt.observed_at epoch-seconds field. Require a nonnegative integer (not bool/string/fraction/nonfinite); reject values that cannot produce finite seconds. Do not guess units by magnitude, use transaction_time as a substitute, clamp to local time or relax the existing future-time rejection. Internal normalized receipts remain seconds. Timestamp correction does not establish historical fills, paired matching, flatness or PnL and does not authorize replay/compensation. Preserve original attempt evidence and distinguish exchange order filled quantity/observed positions from independently reconciled receipt quantities.
+
 ## HCR-13 amendment — official order observations and resource lifecycle
 
 Official SDK/HTTP order observations require strict boolean is_ask for side. The deprecated side field may be absent or SDK-defaulted and does not override authoritative is_ask. Required official identity, quantity, status, type, TIF, reduce-only and price fields remain required; no fabricated zero fills or guessed identity. Active-order and client-index lookup normalization must preserve requested account/market identity. The internal normalized OrderSnapshot contract remains unchanged. The accountOrders endpoint remains the documented exact-client-index lookup; no guessed fallback or blind replay is introduced. Trades requests use documented descending order while preserving bounded cursor traversal, exact deduplication and causal reconciliation.
