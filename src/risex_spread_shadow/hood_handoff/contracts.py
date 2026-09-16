@@ -48,13 +48,16 @@ class OperationMode(StrEnum):
 
     CLOSE_REOPEN = "CLOSE_REOPEN"
     PAIRED_OPENING = "PAIRED_OPENING"
+    PAIRED_CLOSING = "PAIRED_CLOSING"
 
     @classmethod
     def parse(cls, value: Any) -> "OperationMode":
         if isinstance(value, cls):
             return value
         if not isinstance(value, str):
-            raise ContractError("operation_mode must be CLOSE_REOPEN or PAIRED_OPENING")
+            raise ContractError(
+                "operation_mode must be CLOSE_REOPEN, PAIRED_OPENING, or PAIRED_CLOSING"
+            )
         normalized = value.strip().upper().replace("-", "_").replace(" ", "_")
         aliases = {
             "CLOSE": cls.CLOSE_REOPEN,
@@ -63,11 +66,16 @@ class OperationMode(StrEnum):
             "PAIRED": cls.PAIRED_OPENING,
             "PAIRED_OPEN": cls.PAIRED_OPENING,
             "PAIRED_OPENING": cls.PAIRED_OPENING,
+            "PAIRED_CLOSE": cls.PAIRED_CLOSING,
+            "PAIRED_CLOSING": cls.PAIRED_CLOSING,
+            "PAIRED_REDUCE": cls.PAIRED_CLOSING,
         }
         try:
             return aliases[normalized]
         except KeyError as exc:
-            raise ContractError("operation_mode must be CLOSE_REOPEN or PAIRED_OPENING") from exc
+            raise ContractError(
+                "operation_mode must be CLOSE_REOPEN, PAIRED_OPENING, or PAIRED_CLOSING"
+            ) from exc
 
 
 # A short public alias keeps call sites readable while the serialized contract
@@ -886,6 +894,12 @@ class AccountSnapshot:
     incremental_margin_required: Decimal | None = None
     incremental_margin_evidence: str = ""
     margin_evidence: AccountMarginEvidence | None = None
+    # The official account response names this quote-currency field
+    # ``available_balance``.  ``margin_available`` remains the established
+    # internal alias used by the HCR-1 admission checks; keeping both values
+    # explicit lets random-cycle sizing require the documented field without
+    # changing the existing engine contract.
+    available_balance: Decimal | None = None
 
     def __post_init__(self) -> None:
         _int(self.account_index, "account_index", minimum=0)
@@ -898,6 +912,7 @@ class AccountSnapshot:
             (self.margin_available, "margin_available"),
             (self.margin_required, "margin_required"),
             (self.fee_rate, "fee_rate"),
+            (self.available_balance, "available_balance"),
         ):
             if value is not None:
                 _nonnegative(value, name)
@@ -949,8 +964,11 @@ class AccountSnapshot:
             ready=_bool(value.get("ready", False), "ready"),
             margin_available=(
                 None
-                if value.get("margin_available") is None
-                else _nonnegative(value.get("margin_available"), "margin_available")
+                if value.get("margin_available", value.get("available_balance")) is None
+                else _nonnegative(
+                    value.get("margin_available", value.get("available_balance")),
+                    "margin_available",
+                )
             ),
             margin_required=(
                 None
@@ -974,6 +992,14 @@ class AccountSnapshot:
                 else _text(raw_incremental_evidence, "incremental_margin_evidence")
             ),
             margin_evidence=margin_evidence,
+            available_balance=(
+                None
+                if value.get("available_balance") is None
+                else _nonnegative(
+                    value.get("available_balance"),
+                    "available_balance",
+                )
+            ),
         )
 
 
@@ -1308,7 +1334,11 @@ class HandoffConfig:
                 snapshot.incremental_margin_required is None
                 or not snapshot.incremental_margin_evidence
             )
-            if incremental_margin_missing and not self.defer_incremental_margin_calculation:
+            if (
+                incremental_margin_missing
+                and self.operation_mode is not OperationMode.PAIRED_CLOSING
+                and not self.defer_incremental_margin_calculation
+            ):
                 raise PreflightBlocked(f"{label} incremental planned-operation margin evidence is missing")
             if (
                 not incremental_margin_missing
@@ -1332,6 +1362,21 @@ class HandoffConfig:
                 raise PreflightBlocked("paired-opening source position has the receiver direction")
             elif self.expected_receiver_position * expected < 0:
                 raise PreflightBlocked("paired-opening receiver position has the source direction")
+        elif self.operation_mode is OperationMode.PAIRED_CLOSING:
+            if self.expected_source_position is not None and source.signed_position != self.expected_source_position:
+                raise PreflightBlocked("source position does not match the expected paired-closing position")
+            if self.expected_receiver_position is not None and receiver.signed_position != self.expected_receiver_position:
+                raise PreflightBlocked("receiver position does not match the expected paired-closing position")
+            if expected > 0:
+                if source.signed_position < self.quantity:
+                    raise PreflightBlocked("paired closing source long position is smaller than Q")
+                if receiver.signed_position > -self.quantity:
+                    raise PreflightBlocked("paired closing receiver short position is smaller than Q")
+            else:
+                if source.signed_position > -self.quantity:
+                    raise PreflightBlocked("paired closing source short position is smaller than Q")
+                if receiver.signed_position < self.quantity:
+                    raise PreflightBlocked("paired closing receiver long position is smaller than Q")
         else:
             if expected > 0 and source.signed_position < self.quantity:
                 raise PreflightBlocked("source long position is smaller than Q")
@@ -1460,7 +1505,11 @@ class HandoffPlan:
             raise ContractError("source and receiver plan integer quantities must match")
         if self.source.side != direction.source_side or self.receiver.side != direction.receiver_side:
             raise ContractError("source/receiver plan sides conflict with direction")
-        source_reduce_only = self.operation_mode is OperationMode.CLOSE_REOPEN
+        source_reduce_only = self.operation_mode in {
+            OperationMode.CLOSE_REOPEN,
+            OperationMode.PAIRED_CLOSING,
+        }
+        receiver_reduce_only = self.operation_mode is OperationMode.PAIRED_CLOSING
         if (
             self.source.order_type != "LIMIT"
             or self.source.time_in_force != "POST_ONLY"
@@ -1468,7 +1517,7 @@ class HandoffPlan:
             or self.source.order_expiry_ms <= 0
             or self.receiver.order_type != "MARKET"
             or self.receiver.time_in_force != "IOC"
-            or self.receiver.reduce_only
+            or self.receiver.reduce_only != receiver_reduce_only
             or self.receiver.order_expiry_ms != 0
         ):
             raise ContractError("source/receiver plan order semantics conflict with the selected operation mode")
@@ -1479,6 +1528,11 @@ class HandoffPlan:
                 raise ContractError("paired-opening source position must be opposite the receiver direction")
             if self.receiver_position_before * direction.sign < 0:
                 raise ContractError("paired-opening receiver position must follow the receiver direction")
+        elif self.operation_mode is OperationMode.PAIRED_CLOSING:
+            if self.source_position_before * direction.sign < 0:
+                raise ContractError("paired-closing source position must follow the source order direction")
+            if self.receiver_position_before * direction.sign > 0:
+                raise ContractError("paired-closing receiver position must oppose the source order direction")
 
     def as_dict(self) -> dict[str, Any]:
         return {

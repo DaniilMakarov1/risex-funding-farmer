@@ -733,6 +733,7 @@ class ReadOnlyLighterSdkClient:
                 "authorized": True,
                 "ready": ready,
                 "margin_available": account.get("available_balance"),
+                "available_balance": account.get("available_balance"),
                 "margin_required": account.get("cross_initial_margin_requirement"),
                 "fee_rate": None,
                 "source_identity": identity.strip(),

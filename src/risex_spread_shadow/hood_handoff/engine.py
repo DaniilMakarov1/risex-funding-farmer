@@ -81,6 +81,9 @@ class SystemClock:
     def now(self) -> float:
         return time.time()
 
+    def monotonic(self) -> float:
+        return time.monotonic()
+
     async def sleep(self, seconds: float) -> None:
         await asyncio.sleep(seconds)
 
@@ -197,6 +200,10 @@ class HandoffEngine:
         self._configured_reconcile_timeout = config.reconcile_timeout_seconds
         self._configured_freshness = config.freshness_seconds
         self._configured_request_timeout = config.request_timeout_seconds
+        requires_incremental_margin = (
+            config.operation_mode is not OperationMode.PAIRED_CLOSING
+            and not config.defer_incremental_margin_calculation
+        )
         if journal.has_unresolved_mutation():
             return await self._resume_reconciliation(config, journal)
         if journal.has_completed_mutation():
@@ -385,7 +392,7 @@ class HandoffEngine:
                     or source_recheck.margin_required is None
                     or source_recheck.margin_required > source_recheck.margin_available
                     or (
-                        not config.defer_incremental_margin_calculation
+                        requires_incremental_margin
                         and (
                             source_recheck.incremental_margin_required is None
                             or not source_recheck.incremental_margin_evidence
@@ -411,7 +418,7 @@ class HandoffEngine:
                     or receiver_recheck.margin_required is None
                     or receiver_recheck.margin_required > receiver_recheck.margin_available
                     or (
-                        not config.defer_incremental_margin_calculation
+                        requires_incremental_margin
                         and (
                             receiver_recheck.incremental_margin_required is None
                             or not receiver_recheck.incremental_margin_evidence
@@ -657,7 +664,8 @@ class HandoffEngine:
                 price_int=source_price_int,
                 order_type="LIMIT",
                 time_in_force="POST_ONLY",
-                reduce_only=config.operation_mode is OperationMode.CLOSE_REOPEN,
+                reduce_only=config.operation_mode
+                in {OperationMode.CLOSE_REOPEN, OperationMode.PAIRED_CLOSING},
                 order_expiry_ms=expiry_ms,
                 client_order_index=source_client_index,
             ),
@@ -671,7 +679,7 @@ class HandoffEngine:
                 price_int=receiver_price_int,
                 order_type="MARKET",
                 time_in_force="IOC",
-                reduce_only=False,
+                reduce_only=config.operation_mode is OperationMode.PAIRED_CLOSING,
                 order_expiry_ms=0,
                 client_order_index=receiver_client_index,
             ),

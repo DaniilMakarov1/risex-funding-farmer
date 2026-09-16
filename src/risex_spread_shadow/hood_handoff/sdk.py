@@ -645,6 +645,7 @@ class LighterSdkClient:
                 "authorized": True,
                 "ready": ready,
                 "margin_available": available,
+                "available_balance": available,
                 "margin_required": margin_required,
                 "fee_rate": fee_rate,
                 "source_identity": account_identity.strip(),

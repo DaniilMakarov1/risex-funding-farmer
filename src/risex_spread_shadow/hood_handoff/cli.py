@@ -27,6 +27,7 @@ from .local_attempt import (
     format_local_attempt_result,
     run_local_attempt,
 )
+from .random_cycle import RandomCycleConfig, run_random_cycle
 from .readiness import (
     ReadinessCheck,
     ReadinessConfig,
@@ -73,13 +74,15 @@ def _parser() -> argparse.ArgumentParser:
             "before LAUNCH; keys then load and one fresh public metadata/book observation selects "
             "the exact source price and equal receiver bound. Omitted timing "
             "bounds use finite defaults: freshness 10s, request 5s, order 10s, reconciliation "
-            "20s, polling 0.5s, 40 polls, source expiry 300s."
+            "20s, polling 0.5s, 40 polls, source expiry 300s. HCR-17 random-cycle "
+            "previews one random integer size tick and a 20..300 second hold; LAUNCH "
+            "then runs exactly one finite opening/close cycle."
         ),
     )
     parser.add_argument(
         "run",
         nargs="?",
-        choices=("run", "readiness", "local-attempt"),
+        choices=("run", "readiness", "local-attempt", "random-cycle"),
         help="run the configured utility or the explicit read-only readiness check",
     )
     parser.add_argument("--config", type=Path, help="JSON operator configuration; all numerical bounds are required")
@@ -442,6 +445,67 @@ def _readiness_config(args: argparse.Namespace) -> ReadinessConfig:
         raise SystemExit(f"invalid readiness input: {exc}") from exc
 
 
+def _random_cycle_config(
+    value: Mapping[str, Any],
+    *,
+    execute: bool,
+    plan_reviewed: bool,
+    defer_incremental_margin_calculation: bool | None = None,
+) -> RandomCycleConfig:
+    """Parse the finite HCR-17 operator binding without sampling or reads."""
+
+    required = (
+        "market_id",
+        "market_symbol",
+        "direction",
+        "source_account_index",
+        "receiver_account_index",
+    )
+    missing = [name for name in required if name not in value]
+    if missing:
+        raise SystemExit("random-cycle config is missing required fields: " + ", ".join(missing))
+    if "cycle_dir" not in value and "journal_path" not in value:
+        raise SystemExit("random-cycle config requires cycle_dir or journal_path")
+    _reject_operator_position_overrides(value, "random-cycle config")
+    kwargs = dict(value)
+    mode = kwargs.pop("mode", None)
+    if mode is not None and str(mode).strip().lower() not in {"random-cycle", "hcr-17", "random"}:
+        raise SystemExit("random-cycle config mode must be random-cycle")
+    kwargs.pop("operator_execution_opt_in", None)
+    kwargs.pop("operator_plan_reviewed", None)
+    if defer_incremental_margin_calculation is not None:
+        kwargs["defer_incremental_margin_calculation"] = defer_incremental_margin_calculation
+    for name in (
+        "market_id",
+        "source_account_index",
+        "receiver_account_index",
+        "max_poll_count",
+        "source_order_lifetime_seconds",
+        "api_key_index",
+        "chain_id",
+        "auth_token_lifetime_seconds",
+    ):
+        if name not in kwargs or kwargs[name] is None:
+            continue
+        raw = kwargs[name]
+        if isinstance(raw, bool):
+            raise SystemExit(f"invalid random-cycle configuration: {name} must be an integer")
+        try:
+            parsed = int(str(raw))
+        except (TypeError, ValueError) as exc:
+            raise SystemExit(f"invalid random-cycle configuration: {name} must be an integer") from exc
+        if not isinstance(raw, int) and str(raw).strip() not in {str(parsed), f"+{parsed}"}:
+            raise SystemExit(f"invalid random-cycle configuration: {name} must be an exact integer")
+        kwargs[name] = parsed
+    kwargs["operator_execution_opt_in"] = execute
+    kwargs["operator_plan_reviewed"] = plan_reviewed
+    try:
+        kwargs["direction"] = Direction(str(kwargs["direction"]).upper())
+        return RandomCycleConfig(**kwargs)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(f"invalid random-cycle configuration: {exc}") from exc
+
+
 def _keychain_provider(
     config: Any,
     account_indices: tuple[int, ...],
@@ -593,6 +657,113 @@ async def _run_local_attempt(args: argparse.Namespace) -> int:
     return result.exit_code
 
 
+async def _run_random_cycle(args: argparse.Namespace, value: Mapping[str, Any]) -> int:
+    """Preview or launch exactly one HCR-17 random cycle."""
+
+    if args.keychain_remove:
+        raise SystemExit("random-cycle cannot remove Keychain credentials; use the existing run/readiness removal path")
+    if args.i_understand_series_live_operation:
+        raise SystemExit("random-cycle is one finite cycle and cannot use the series confirmation")
+    if args.i_understand_one_attempt_live_operation and not args.execute:
+        raise SystemExit("--i-understand-one-attempt-live-operation requires --execute")
+    if args.execute and not args.i_understand_one_attempt_live_operation:
+        raise SystemExit("--execute also requires --i-understand-one-attempt-live-operation")
+    if args.execute and not args.confirm_plan:
+        raise SystemExit("random-cycle execution requires --confirm-plan after the offline preview")
+    config = _random_cycle_config(
+        value,
+        execute=args.execute,
+        plan_reviewed=args.confirm_plan,
+        defer_incremental_margin_calculation=args.defer_incremental_margin_calculation,
+    )
+    if not args.execute:
+        inverse = Direction.SHORT if config.direction is Direction.LONG else Direction.LONG
+        print(
+            json.dumps(
+                {
+                    "outcome": "PREVIEW",
+                    "execution": "DISABLED",
+                    "message": "offline-safe mode: no SDK import, key prompt, signing, or network request",
+                    "mode": "random-cycle",
+                    "operation_mode": "PAIRED_OPENING",
+                    "venue": "robinhood-chain",
+                    "website_url": "https://robinhoodchain.lighter.xyz",
+                    "api_base_url": config.api_base_url,
+                    "chain_id": config.chain_id,
+                    "market_id": config.market_id,
+                    "market_symbol": config.market_symbol,
+                    "direction": config.direction.value,
+                    "source_account_index": config.source_account_index,
+                    "receiver_account_index": config.receiver_account_index,
+                    "source_side": config.direction.source_side,
+                    "receiver_side": config.direction.receiver_side,
+                    "source_order_type": "LIMIT",
+                    "source_time_in_force": "POST_ONLY",
+                    "source_reduce_only": False,
+                    "receiver_order_type": "MARKET",
+                    "receiver_time_in_force": "IOC",
+                    "receiver_reduce_only": False,
+                    "close_direction": inverse.value,
+                    "close_source_side": inverse.source_side,
+                    "close_receiver_side": inverse.receiver_side,
+                    "close_source_reduce_only": True,
+                    "close_receiver_reduce_only": True,
+                    "quantity_policy": "uniform integer legal size tick after fresh metadata/book/accounts; capped by min available balance without leverage",
+                    "hold_policy": "uniform integer seconds in [20,300] after both opening legs are fully reconciled",
+                    "fallback_policy": "repeat reduce-only market attempts for each fresh confirmed residual until exact zero; reconcile, refresh the executable bound and use a unique attempt ID each time; no widening",
+                    "freshness_seconds": config.freshness_seconds,
+                    "request_timeout_seconds": config.request_timeout_seconds,
+                    "order_timeout_seconds": config.order_timeout_seconds,
+                    "reconcile_timeout_seconds": config.reconcile_timeout_seconds,
+                    "poll_interval_seconds": config.poll_interval_seconds,
+                    "max_poll_count": config.max_poll_count,
+                    "source_order_lifetime_seconds": config.source_order_lifetime_seconds,
+                    "auth_token_lifetime_seconds": config.auth_token_lifetime_seconds,
+                    "defer_incremental_margin_calculation": config.defer_incremental_margin_calculation,
+                    "plan_reviewed": config.operator_plan_reviewed,
+                    "journal_path": str(config.journal_path),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        return 0
+    if args.market_evidence is None:
+        raise SystemExit("random-cycle execution requires --market-evidence after the offline preview")
+    if config.api_key_index is None:
+        raise SystemExit("random-cycle execution requires api_key_index")
+    evidence = _load_json(args.market_evidence, "market evidence")
+    account_indices = (config.source_account_index, config.receiver_account_index)
+    if args.keychain or args.keychain_replace:
+        secrets: Any = _keychain_provider(config, account_indices, replace=args.keychain_replace)
+        try:
+            _prime_keychain(secrets, account_indices)
+        except SystemExit:
+            secrets.close()
+            raise
+    else:
+        secrets = PromptSecretProvider(account_indices, config.api_key_index)
+    client: LighterSdkClient | None = None
+    try:
+        # LighterSdkClient consumes only the shared endpoint/timing/auth fields
+        # from RandomCycleConfig; the cycle engine supplies the actual sampled
+        # OrderPlan instances after its fresh post-LAUNCH observations.
+        client = LighterSdkClient(
+            config,  # type: ignore[arg-type]
+            source_account_index=config.source_account_index,
+            receiver_account_index=config.receiver_account_index,
+            secrets=secrets,
+            market_evidence=evidence,
+        )
+        result = await run_random_cycle(config, client)
+    finally:
+        if client is not None:
+            await client.aclose()
+        secrets.close()
+    print(json.dumps(result.as_dict(), sort_keys=True, separators=(",", ":")))
+    return 0 if result.outcome.value in {"SUCCESS", "PARTIAL", "PREVIEW"} else 2
+
+
 async def _run_readiness(args: argparse.Namespace) -> int:
     # Reject every execution/configuration flag before config parsing, client
     # creation, SDK import, or hidden key input.  Readiness is a distinct path.
@@ -674,6 +845,13 @@ async def _run(args: argparse.Namespace) -> int:
     if args.config is None:
         raise SystemExit("run requires --config")
     config_data = _load_json(args.config, "config")
+    is_random_cycle = args.run == "random-cycle" or str(config_data.get("mode", "")).strip().lower() in {
+        "random-cycle",
+        "hcr-17",
+        "random",
+    }
+    if is_random_cycle:
+        return await _run_random_cycle(args, config_data)
     is_series = config_data.get("mode") in {"series", "hcr-2"} or config_data.get("series") is True
     if args.keychain_remove:
         if (
