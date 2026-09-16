@@ -1,3 +1,21 @@
+# HCR-12 — owner-local launch flow correction
+
+## Current finite assignment — IN_PROGRESS
+
+On2026-09-16 the owner requested correction of the observed launch refusals and technical/logical defects, including stale-price handling. Chief01a0a67b-bec7-75d2-9970-e3914b10e445 owns scope, docs, independent review and integration. One fresh explicit-role Luna/max Builder may own launcher/CLI/tests in codex/spread-v1-launch-flow, isolated hood-launch-flow worktree from accepted main6b3b779. Standard requested, actual speed UNKNOWN. No other production writer or standing old Builder assignment.
+
+Agent actions are offline development, saved sanitized packet diagnosis and synthetic testing only. Owner requested autonomous terminal reruns, but the actual live command can send financial orders and must not be invoked by Chief/Builder. No real credentials, Keychain, private endpoints, signing or financial mutation; do not convert the request into a hidden live retry loop.
+
+Observed owner-live-001 is now consumed: exact original proposal75789.8 changed to75778.1 in7.7159002seconds; FINAL_REVALIDATION_FAILED before engine construction, intent journal absent, no orders dispatched by that invocation. This is the accepted strict-price policy firing, not a freshness timeout. Original packet/claim/terminal files are immutable; preserve their source identity and do not remove/reuse or rename the directory to retry. Diagnostic summary/hashes are in original-root spread-shadow-runs/hood-launch-flow-20260916/chief-v1/owner-attempt-diagnosis.json. No current account-position claim is established by this local failure.
+
+Authorized technical correction: make operator output readable and distinguish precise safe local refusal reasons (changed price, expired original proposal, invalid observation, read failure) and known pre-execution stop from unknown execution. Preserve missing terminal as incomplete, existing result/packet compatibility, no-replay claims and no false global FLAT/no-fill claim. Do not expose raw SDK exceptions, secrets or full book dumps. Do not tune limits or change engine/execution strategy.
+
+Pending owner policy choice (asked explicitly in current Chief task): one LAUNCH would approve fixed accounts/direction/exact quantity and the existing automatic one-tick rule; keys would load first, then one fresh public metadata/book snapshot would select exact source price and equal receiver bound without requiring agreement with a pre-confirmation quote. No second price prompt, retry, quantity change or threshold relaxation. Until the owner confirms this specific change, preserve accepted HCR-11 price-confirmation semantics. Builder must wait for Chief's recorded authorization before implementing that dependent behavior.
+
+Acceptance: bounded launcher/CLI changes only; exact literal price/notional tests in both directions; no manual numerical prompts; cancellation/help/preview isolation; stale/invalid actual evidence still blocks; precise refusal classifications with immutable original/terminal packets and no replay; actual launcher-to-engine synthetic integration and adverse failure cases. Chief reviews complete candidate diff and one final clean isolated Python3.11 full suite with source/import hashes. Record final operator instruction and truthful attempt status. Builder delivers exact clean candidate/evidence directly to Chief01a0a67b-bec7-75d2-9970-e3914b10e445; no full-suite duplication by Builder and no self-accept/merge/push.
+
+## Previous accepted HCR-11 contract (superseded only by explicit HCR-12 scope above)
+
 # HCR-11 — completed automatic owner-local attempt interface
 
 ## Completion and ownership
