@@ -15,6 +15,7 @@ import importlib
 from importlib import metadata as importlib_metadata
 import inspect
 import json
+import math
 import re
 import time
 from typing import Any, Callable, Mapping, Protocol
@@ -170,6 +171,22 @@ def _order_snapshot_mapping(value: Any, *, observed_at: float) -> dict[str, Any]
     mapped["side"] = "SELL" if is_ask else "BUY"
     mapped["observed_at"] = observed_at
     return mapped
+
+
+def _trade_timestamp_seconds(value: Any) -> float:
+    """Convert the documented integer millisecond timestamp to seconds."""
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ContractError("trade timestamp must be an integer millisecond value")
+    if value < 0:
+        raise ContractError("trade timestamp must be non-negative milliseconds")
+    try:
+        seconds = value / 1_000.0
+    except OverflowError as exc:
+        raise ContractError("trade timestamp must convert to finite seconds") from exc
+    if not math.isfinite(seconds):
+        raise ContractError("trade timestamp must convert to finite seconds")
+    return seconds
 
 
 class PlainAioHttp:
@@ -764,6 +781,7 @@ class LighterSdkClient:
             )
             if any(key not in mapped for key in required):
                 raise ContractError("trade receipt lacks required official identity/time fields")
+            observed_at = _trade_timestamp_seconds(mapped["timestamp"])
             if (
                 str(mapped["trade_id"]) != str(mapped["trade_id_str"])
                 or str(mapped["ask_client_id"]) != str(mapped["ask_client_id_str"])
@@ -798,7 +816,7 @@ class LighterSdkClient:
                 mapped["ask_client_id_str"] if is_ask else mapped["bid_client_id_str"]
             )
             mapped["trade_id"] = mapped.get("trade_id_str", mapped.get("trade_id"))
-            mapped["observed_at"] = mapped["timestamp"]
+            mapped["observed_at"] = observed_at
             trades.append(
                 TradeReceipt.from_mapping(
                     {
