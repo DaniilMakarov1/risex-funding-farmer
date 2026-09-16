@@ -2,6 +2,9 @@
 
 ## HCR-17 random-size timed close — IN DEVELOPMENT
 
+Correction b346eb502707c7320aa805d7f6b7846b5ba15b8a remains unaccepted: full4473passed3skipped plus original boundary controls PASS, but three new concrete boundary causes reproduced (nested-preflight identity rebinding, invented trade-age cutoff, incomplete live metadata restamped from old evidence). Actual fake-transport SDK/CLI controls verify LAUNCH and fresh300secondhold; stalecontrol stops. Chief-v2/review.md records exact proofs. Fresh explicit-role Builder /root/cycle_boundary_builder now owns narrow correction in codex/spread-v1-cycle-boundaries/hood-cycle-boundaries fromb346eb5; prior Builder complete/released. No concurrentwriters, no agent liveoperations, no main integration. Wait for direct candidate delivery.
+
+
 Candidate b7d09dd27238f7cfb89a3b0ed4a691a2fb343bd2 received and independently reviewed: CHANGES_REQUESTED, not accepted/integrated. Clean isolated Python3.11.5 full4467passed3skipped exit0,126.54seconds, unchanged hashes/import roots. Independent8quantity cases PASS;5lifecycle/evidence probes expose frozen SDK metadata stale after hold, manual hold-position drift adopted asSUCCESS, stale fallback order accepted, premature unknown on first missing fallback lookup, and missing durable fallback trade receipts. CLI also bypasses requiredLAUNCH and requires manual evidence. Consolidated4finding review/repros in original-root spread-shadow-runs/hood-random-cycle-20260916/chief-v1/review.md. Existing HCR17 Builder assigned one correction round in same branch with separate builder-v2 evidence, no new objective or live operations. Native result delivery verified. Chief waits for corrected delivery without status polling; main/operator remaina175e1f.
 
 
