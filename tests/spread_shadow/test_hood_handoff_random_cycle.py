@@ -558,6 +558,60 @@ class ChildIdentityChangeClient(CycleClient):
         return snapshot
 
 
+class TransientIdentityChangeClient(CycleClient):
+    """Return one foreign identity at a chosen post-hold account read."""
+
+    def __init__(self, clock: AdvancingClock, *, target_account: int, target_read: int) -> None:
+        super().__init__(clock)
+        self.target_account = target_account
+        self.target_read = target_read
+        self.reads = 0
+        self.opening_complete = False
+        self.identity_mismatch_count = 0
+
+    async def submit_order(self, plan):
+        receipt = await super().submit_order(plan)
+        if (
+            plan.order_type == "MARKET"
+            and not plan.reduce_only
+            and plan.account_index == self.receiver_account_index
+        ):
+            self.opening_complete = True
+        return receipt
+
+    async def account_snapshot(self, account_index: int, market_id: int) -> AccountSnapshot:
+        snapshot = await super().account_snapshot(account_index, market_id)
+        if (
+            self.opening_complete
+            and self.clock.now() >= NOW + 20
+            and account_index == self.target_account
+        ):
+            self.reads += 1
+            if self.reads == self.target_read:
+                self.identity_mismatch_count += 1
+                return replace(snapshot, source_identity="one-response-foreign-identity")
+        return snapshot
+
+
+class TransientFallbackIdentityClient(CycleClient):
+    """Return one foreign identity during fallback reconciliation."""
+
+    def __init__(self, clock: AdvancingClock, *, target_account: int) -> None:
+        super().__init__(clock, partial_close=True)
+        self.target_account = target_account
+        self.reads = 0
+        self.identity_mismatch_count = 0
+
+    async def account_snapshot(self, account_index: int, market_id: int) -> AccountSnapshot:
+        snapshot = await super().account_snapshot(account_index, market_id)
+        if self.fallback_plans and account_index == self.target_account:
+            self.reads += 1
+            if self.reads == 1:
+                self.identity_mismatch_count += 1
+                return replace(snapshot, source_identity="one-response-foreign-identity")
+        return snapshot
+
+
 class FallbackReceiptTimingClient(CycleClient):
     """Inject historical/future trade receipts without aging order snapshots."""
 
@@ -1159,6 +1213,65 @@ async def test_close_child_recheck_cannot_rebind_identity_before_receiver_mutati
     expected_receiver = Decimal("0.20") if direction is Direction.LONG else Decimal("-0.20")
     assert client.source_position == expected_source
     assert client.receiver_position == expected_receiver
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target_account", [11, 22])
+@pytest.mark.parametrize("target_read", [1, 2, 3])
+async def test_transient_identity_failure_remains_cycle_barrier(
+    tmp_path,
+    target_account,
+    target_read,
+):
+    clock = AdvancingClock()
+    client = TransientIdentityChangeClient(
+        clock,
+        target_account=target_account,
+        target_read=target_read,
+    )
+    result = await run_random_cycle(
+        cycle_config(tmp_path / f"transient-{target_account}-{target_read}"),
+        client,
+        clock=clock,
+        rng=FixedRng(40, 20),
+    )
+
+    assert result.outcome is Outcome.UNKNOWN
+    assert "identity failure barrier" in (result.reason or "")
+    assert client.identity_mismatch_count == 1
+    assert not any(plan.order_type == "MARKET" and plan.reduce_only for plan in client.submissions)
+    assert not client.fallback_plans
+    assert client.source_position == Decimal("-0.40")
+    assert client.receiver_position == Decimal("0.40")
+    if target_read == 3:
+        assert any(plan.order_type == "LIMIT" and plan.reduce_only for plan in client.submissions)
+        assert client.cancellations
+    else:
+        assert not any(plan.order_type == "LIMIT" and plan.reduce_only for plan in client.submissions)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target_account", [11, 22])
+async def test_transient_fallback_identity_failure_blocks_later_account_mutation(
+    tmp_path,
+    target_account,
+):
+    clock = AdvancingClock()
+    client = TransientFallbackIdentityClient(clock, target_account=target_account)
+    result = await run_random_cycle(
+        cycle_config(tmp_path / f"fallback-transient-{target_account}"),
+        client,
+        clock=clock,
+        rng=FixedRng(40, 20),
+    )
+
+    assert result.outcome is Outcome.UNKNOWN
+    assert "identity failure barrier" in (result.reason or "")
+    assert client.identity_mismatch_count == 1
+    assert len(client.fallback_plans) == 1
+    assert not any(plan.account_index == 22 and plan.order_type == "MARKET" for plan in client.fallback_plans)
+    assert client.source_position == Decimal("0")
+    assert client.receiver_position == Decimal("0.20")
 
 
 @pytest.mark.asyncio

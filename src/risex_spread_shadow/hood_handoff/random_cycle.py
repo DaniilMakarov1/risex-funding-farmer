@@ -18,7 +18,7 @@ import math
 import os
 from pathlib import Path
 import random
-from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
+from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
 from urllib.parse import urlsplit
 
 from .contracts import (
@@ -481,11 +481,13 @@ class _BoundMarketClient:
         *,
         source_identity: str | None = None,
         receiver_identity: str | None = None,
+        identity_failure_callback: Callable[[str], None] | None = None,
     ) -> None:
         self._delegate = delegate
         self._metadata = metadata
         self._source_identity = source_identity
         self._receiver_identity = receiver_identity
+        self._identity_failure_callback = identity_failure_callback
         self.source_account_index = delegate.source_account_index
         self.receiver_account_index = delegate.receiver_account_index
         self.sdk_version = getattr(delegate, "sdk_version", None)
@@ -509,7 +511,10 @@ class _BoundMarketClient:
         else:
             raise ContractError("bound account identity does not match configured cycle account")
         if expected_identity is not None and snapshot.source_identity != expected_identity:
-            raise PreflightBlocked(f"{label} account identity changed after it was bound")
+            reason = f"{label} account identity changed after it was bound"
+            if self._identity_failure_callback is not None:
+                self._identity_failure_callback(reason)
+            raise PreflightBlocked(reason)
         return snapshot
 
     def __getattr__(self, name: str) -> Any:
@@ -794,9 +799,17 @@ class RandomCycleEngine:
         self.clock = clock or SystemClock()
         self.rng = rng or random.SystemRandom()
         self._stage = "PREFLIGHT"
+        self._identity_barrier: str | None = None
+
+    def _mark_identity_failure(self, reason: str) -> None:
+        """Keep the first identity mismatch as a cycle-wide dependency barrier."""
+
+        if self._identity_barrier is None:
+            self._identity_barrier = f"identity failure barrier: {reason}"
 
     async def execute(self, config: RandomCycleConfig) -> RandomCycleResult:
         self._stage = "PREFLIGHT"
+        self._identity_barrier = None
         if not config.operator_execution_opt_in or not config.operator_plan_reviewed:
             return RandomCycleResult(
                 outcome=Outcome.PREVIEW,
@@ -942,6 +955,7 @@ class RandomCycleEngine:
                 metadata,
                 source_identity=source.source_identity,
                 receiver_identity=receiver.source_identity,
+                identity_failure_callback=self._mark_identity_failure,
             ),
             clock=self.clock,
         )
@@ -1016,7 +1030,9 @@ class RandomCycleEngine:
             and item.position_after is not None
             for item in fallbacks
         )
-        if (
+        if self._identity_barrier is not None:
+            outcome = Outcome.UNKNOWN
+        elif (
             closing is not None
             and closing.outcome is Outcome.SUCCESS
             and not fallbacks
@@ -1052,7 +1068,8 @@ class RandomCycleEngine:
             None,
         )
         reason = None if outcome is Outcome.SUCCESS else (
-            fallback_reason
+            self._identity_barrier
+            or fallback_reason
             or (closing.reason if closing is not None else fallback_seed)
             or "cycle closure did not prove exact flat positions"
         )
@@ -1109,6 +1126,7 @@ class RandomCycleEngine:
         if not refreshed_bounds.lower_tick <= selection.quantity_tick <= refreshed_bounds.upper_tick:
             raise PreflightBlocked("fresh available balance no longer funds the selected quantity")
         if source.source_identity != initial_source.source_identity or receiver.source_identity != initial_receiver.source_identity:
+            self._mark_identity_failure("account identity changed before opening mutation")
             raise PreflightBlocked("account identity changed before opening mutation")
         del initial_metadata, initial_book
         return metadata, book, source, receiver
@@ -1203,8 +1221,10 @@ class RandomCycleEngine:
             _validate_market_book(config, metadata, book, now)
             source, receiver = await self._accounts(config, now)
             if source.source_identity != opening_plan.source_identity:
+                self._mark_identity_failure("source account identity changed during the holding period")
                 return blocked("source account identity changed during the holding period")
             if receiver.source_identity != opening_plan.receiver_identity:
+                self._mark_identity_failure("receiver account identity changed during the holding period")
                 return blocked("receiver account identity changed during the holding period")
             if source.signed_position != opening_source.position_after:
                 return blocked("source position changed during the holding period")
@@ -1238,6 +1258,7 @@ class RandomCycleEngine:
                     metadata,
                     source_identity=opening_plan.source_identity,
                     receiver_identity=opening_plan.receiver_identity,
+                    identity_failure_callback=self._mark_identity_failure,
                 ),
                 clock=self.clock,
             )
@@ -1267,6 +1288,12 @@ class RandomCycleEngine:
                 {"reason": f"fallback starting account state is unknown: {sanitize_exception(exc)}"},
             )
             return [], None, None
+        if self._identity_barrier is not None:
+            journal.append(
+                "FALLBACK_BLOCKED_IDENTITY_BARRIER",
+                {"reason": self._identity_barrier},
+            )
+            return [], source.signed_position, receiver.signed_position
         if opening.outcome not in {Outcome.PARTIAL, Outcome.SUCCESS}:
             return [], source.signed_position, receiver.signed_position
 
@@ -1282,6 +1309,17 @@ class RandomCycleEngine:
         bound_source = opening.source if bound_result is None else bound_result.source
         bound_receiver = opening.receiver if bound_result is None else bound_result.receiver
         bound_plan = opening.plan if bound_result is None else bound_result.plan
+        if bound_plan is not None:
+            if source.source_identity != bound_plan.source_identity:
+                self._mark_identity_failure("source account identity changed during fallback admission")
+            if receiver.source_identity != bound_plan.receiver_identity:
+                self._mark_identity_failure("receiver account identity changed during fallback admission")
+        if self._identity_barrier is not None:
+            journal.append(
+                "FALLBACK_BLOCKED_IDENTITY_BARRIER",
+                {"reason": self._identity_barrier},
+            )
+            return [], source.signed_position, receiver.signed_position
         if (
             bound_source is None
             or bound_receiver is None
@@ -1398,6 +1436,16 @@ class RandomCycleEngine:
                 attempt_ordinal=attempt_ordinal,
             )
             results.append(result)
+            if self._identity_barrier is not None and result.outcome is not Outcome.UNKNOWN:
+                observed = await fresh_accounts()
+                if observed is None:
+                    return results, None, None
+                final_source, final_receiver = observed
+                journal.append(
+                    "FALLBACK_BLOCKED_IDENTITY_BARRIER",
+                    {"reason": self._identity_barrier},
+                )
+                return results, final_source.signed_position, final_receiver.signed_position
             if result.outcome is Outcome.UNKNOWN:
                 # An ambiguous mutation or reconciliation cannot be followed
                 # by another write on either account.  Preserve any fresh
@@ -1420,6 +1468,7 @@ class RandomCycleEngine:
                 fresh[candidate].source_identity != current[candidate].source_identity
                 for candidate in (config.source_account_index, config.receiver_account_index)
             ):
+                self._mark_identity_failure("fresh account identity changed after the fallback reconciliation")
                 journal.append(
                     "FALLBACK_STOPPED_STATE_CHANGED",
                     {
@@ -1489,6 +1538,7 @@ class RandomCycleEngine:
                 final[candidate].source_identity != current[candidate].source_identity
                 for candidate in (config.source_account_index, config.receiver_account_index)
             ):
+                self._mark_identity_failure("final fallback account identity changed after reconciliation")
                 journal.append(
                     "FALLBACK_STOPPED_STATE_CHANGED",
                     {"reason": "final fallback account identity changed after reconciliation"},
@@ -1781,6 +1831,7 @@ class RandomCycleEngine:
                 expected_position=before.signed_position,
             )
             if current.source_identity != before.source_identity:
+                self._mark_identity_failure("fallback account identity changed before mutation")
                 raise PreflightBlocked("fallback account identity changed before mutation")
             before = current
             side = "SELL" if before.signed_position > 0 else "BUY"
@@ -2049,6 +2100,23 @@ class RandomCycleEngine:
                 "source" if before.account_index == config.source_account_index else "receiver",
                 self.clock.now(),
             )
+            if after.source_identity != before.source_identity:
+                self._mark_identity_failure("fallback final account identity changed after mutation")
+                return finish(
+                    FallbackResult(
+                        before.account_index,
+                        side,
+                        residual,
+                        True,
+                        Outcome.UNKNOWN,
+                        order_id=order.order_id,
+                        filled_quantity=sum((item.quantity for item in trades), Decimal(0)),
+                        position_after=after.signed_position,
+                        reason="fallback final account identity changed after mutation",
+                        attempt=attempt_ordinal,
+                    ),
+                    reconciliation_event="FALLBACK_RECONCILIATION_UNKNOWN",
+                )
         except asyncio.CancelledError:
             finish(
                 FallbackResult(
