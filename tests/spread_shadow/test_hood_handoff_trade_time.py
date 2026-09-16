@@ -35,14 +35,14 @@ def _raw_trade(timestamp: object) -> dict[str, object]:
         "trade_id_str": "16164557907",
         "market_id": 7,
         "size": "0.00020",
-        "price": "75961.0",
-        "ask_id": 562950026284934,
+        "price": "75907.1",
+        "ask_id": 733000000000001,
         "bid_id": 844424857365178,
-        "ask_client_id": 1001,
-        "ask_client_id_str": "1001",
+        "ask_client_id": 3301,
+        "ask_client_id_str": "3301",
         "bid_client_id": 1002,
         "bid_client_id_str": "1002",
-        "ask_account_id": 11,
+        "ask_account_id": 33,
         "bid_account_id": 22,
         "timestamp": timestamp,
         "transaction_time": 1_789_541_676_086_065,
@@ -115,8 +115,9 @@ def _receiver_only_adapter(tmp_path, *, timestamp: object):
         make_config(
             tmp_path / "receiver-only.jsonl",
             operation_mode=OperationMode.PAIRED_OPENING,
-            source_limit_price=Decimal("75960.0"),
-            receiver_worst_price=Decimal("75961.0"),
+            quantity=Decimal("0.00020"),
+            source_limit_price=Decimal("75907.0"),
+            receiver_worst_price=Decimal("75907.1"),
         ),
         source_account_index=11,
         receiver_account_index=22,
@@ -232,7 +233,7 @@ def _receiver_only_adapter(tmp_path, *, timestamp: object):
             time_in_force=plan.time_in_force,
             reduce_only=plan.reduce_only,
             initial_quantity=plan.quantity,
-            remaining_quantity=plan.quantity - Decimal("0.00020"),
+            remaining_quantity=Decimal("0"),
             filled_quantity=Decimal("0.00020"),
             price=plan.price,
             observed_at=NOW,
@@ -276,8 +277,9 @@ async def test_adapter_to_engine_normalizes_realistic_timestamp_and_keeps_receiv
             make_config(
                 tmp_path / "receiver-only.jsonl",
                 operation_mode=OperationMode.PAIRED_OPENING,
-                source_limit_price=Decimal("75960.0"),
-                receiver_worst_price=Decimal("75961.0"),
+                quantity=Decimal("0.00020"),
+                source_limit_price=Decimal("75907.0"),
+                receiver_worst_price=Decimal("75907.1"),
             ),
             client,
             clock=_Clock(),
@@ -287,6 +289,13 @@ async def test_adapter_to_engine_normalizes_realistic_timestamp_and_keeps_receiv
         assert result.receiver.filled_quantity == Decimal("0.00020")
         assert result.source.position_after == Decimal("0")
         assert result.receiver.position_after == Decimal("0.00020")
+        assert result.source.order is not None
+        assert result.source.order.status == "canceled"
+        assert result.source.order.filled_quantity == Decimal("0")
+        assert result.receiver.history_complete
+        assert result.receiver.order is not None
+        assert result.receiver.order.remaining_quantity == Decimal("0")
+        assert result.receiver.filled_quantity * result.plan.receiver.price == Decimal("15.181420")
         assert result.receiver.trades[0].observed_at == 1_789_541_676.073
         assert result.receiver.trades[0].observed_at < NOW
     finally:
@@ -302,8 +311,9 @@ async def test_adapter_to_engine_preserves_true_future_receipt_as_unknown(tmp_pa
             make_config(
                 tmp_path / "future.jsonl",
                 operation_mode=OperationMode.PAIRED_OPENING,
-                source_limit_price=Decimal("75960.0"),
-                receiver_worst_price=Decimal("75961.0"),
+                quantity=Decimal("0.00020"),
+                source_limit_price=Decimal("75907.0"),
+                receiver_worst_price=Decimal("75907.1"),
             ),
             client,
             clock=_Clock(),
