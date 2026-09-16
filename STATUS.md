@@ -1,5 +1,11 @@
 # Current status
 
+## HCR-17 random-size timed close — IN DEVELOPMENT
+
+Owner authorized random BTC gross notional bounded by min fresh free balance without leverage, hold20..300seconds after both confirmed opening fills, paired reduce-only closure and separate reduce-only residual closing. One finite cycle per operator launch. Active contract in NEXT_TASK; code not accepted yet, no agent financial actions. Chief owns review/docs/integration; existing explicit Luna/max Builder owns isolated codex/spread-v1-random-cycle/hood-random-cycle from37eddad. See active contract for bounds, failure semantics and acceptance.
+
+Latest owner-run004 recorded result independently checked: same trade726095596 links source27331 limit562950026401721 and receiver27337 market844424857250329 in both directions, full.00020BTC at75340.4, initial0/0 and final-.00020/+.00020. Exact receipt identities, positions and journal ordering agree. Fees absent. Original owner004 files unchanged; this is historical opening evidence, not current flatness or a closure claim.
+
 ## HCR-16 — ACCEPTED OFFLINE; bounded read latency improved
 
 Candidate52626b616ea9c4008be682972ea4eccc1ea49538 independently accepted. Two account rechecks overlap with same per-request deadlines/counts; final exact source-order lookup and all prior validations remain after both reads. Error/timeout/malformed/cancellation drain siblings before subsequent actions. No trading policy, price, quantity, fees or thresholds changed. Builder focused108pass; Chief14independent cases PASS (3 latency/causal/no-replay,10 adverse including async drain,1 actual HCR15 response replay). Controlled80/120ms delays: median203.509ms to122.069ms,40.018percent improvement only in the two-read window; no live speed claim. Final clean isolated Python3.11.5/SDK1.1.2 full4445passed3skipped exit0,127.17seconds; hashes/import identity unchanged. Fingerprint sha256:8c02f2af3c9a74cebf505c82eb77dd12caf215056554690533bd291457d6729d. Evidence hood-read-latency-20260916/chief-v1. Builder delivered/released; branches/worktrees/evidence preserved. No new live reads or financial transactions; prior observed receiver+.00020 inventory untouched. Publication independently verified separately.
