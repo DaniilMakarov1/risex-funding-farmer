@@ -14,6 +14,8 @@ HCR-14 fixed integer trade timestamp milliseconds entering an internal seconds f
 
 ## Local-attempt behavior
 
+HCR-16 overlaps the two independent account rechecks after the source limit is confirmed resting. The final source-order check still follows both responses, before receiver dispatch; all existing validation and timeout settings remain. Failures/cancellation drain pending reads before further actions. Controlled80/120ms response delays reduced this two-read window from median203.5ms to122.1ms (about40%); this is a synthetic measurement, not live execution speed or a matching guarantee. Accepted candidate52626b6 passed4445 tests/3skips and14independent checks, including replay of saved actual trade responses. No new financial attempt was performed for this optimization.
+
 Selected fixed parameters remain source27331 SELL LIMIT POST_ONLY / receiver27337 BUY MARKET IOC, BTC0.00020, API keyindex4, Robinhood domain466324, explicit incremental-margin deferral. Full paired opening leaves opposite open inventory and does not guarantee the accounts match each other. The notional varies with price; approximatelyUSD16 is not a guaranteed current value or profit.
 
 Preview/help remains offline without credentials or market requests. A future separately authorized owner invocation requires a new empty owner-only attempt directory or an existing owner-only parent. Existing claims/evidence are never cleared to retry.

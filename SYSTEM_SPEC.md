@@ -3,6 +3,10 @@
 SYSTEM_SPEC_VERSION = 4.2
 SPEC_STATUS = FIRST_RAW_RESEARCH_SCANNER_IMPLEMENTED
 
+## HCR-16 amendment — bounded concurrent account rechecks
+
+After exact resting-source confirmation, the source and receiver account rechecks may overlap, with at most two account snapshot operations and the same per-request deadlines. Their results must both complete before the final exact source-order lookup and all existing identity/position/margin/freshness/resting validations. Receiver dispatch remains strictly after these barriers. Read failure, timeout or cancellation must settle/cancel and drain outstanding read tasks before returning to subsequent cleanup/mutation handling. No parallel mutations, extra requests, weaker thresholds or change to limit-first/market-second/cancel-remainder semantics. Controlled-delay speed measurements are separate from unmeasured live execution latency and do not establish paired matching.
+
 ## HCR-14 amendment — official trade timestamp units
 
 The official SDK Trade.timestamp is an integer Unix epoch millisecond value. Normalize it once at the SDK trade-receipt boundary into the internal TradeReceipt.observed_at epoch-seconds field. Require a nonnegative integer (not bool/string/fraction/nonfinite); reject values that cannot produce finite seconds. Do not guess units by magnitude, use transaction_time as a substitute, clamp to local time or relax the existing future-time rejection. Internal normalized receipts remain seconds. Timestamp correction does not establish historical fills, paired matching, flatness or PnL and does not authorize replay/compensation. Preserve original attempt evidence and distinguish exchange order filled quantity/observed positions from independently reconciled receipt quantities.
