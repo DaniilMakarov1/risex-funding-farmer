@@ -1,34 +1,22 @@
 # RISEx Spread Shadow and legacy Funding Farmer
 
-## Owner-local paired opening — HCR-12
+## Owner-local paired opening — current unresolved attempt
 
-HCR-12 is accepted offline at candidate `4204e10bb2af78b5a36622ca2c319fe16f992fbe`: 26 independent synthetic checks and the final clean isolated Python3.11 suite passed **4414 tests with 3 skips**, exit0. No live attempt has been run by agents. The owner runs the financial operation locally; the Chief can review its sanitized result packet afterward. HCR-10 project permission does not override platform/system restrictions. Later materially different actions require a fresh applicable owner confirmation.
+The owner ran HCR-12 owner-live-002. The saved terminal result is **UNKNOWN**: source27331 was dispatched and observed at **-0.00020 BTC**; receiver27337 was not dispatched and was observed at0. The source order identity/status and trade history were unresolved. These are saved observations, not a current account read. A displayed filled quantity0 with incomplete history is not proof of no fill.
 
-The selected operation is one BTC paired opening: account27331 posts SELL LIMIT POST_ONLY and account27337 submits BUY MARKET IOC, API key index4, Robinhood deployment. The owner targets approximately USD16 of exposure per leg, with small deviation allowed. Quantity0.00020BTC is an exact reviewable input, not a verified current dollar value. HCR-12 selects prices from a fresh public book after LAUNCH and key loading, with declared finite timing defaults; quantity remains exactly0.00020BTC. No numerical price/time prompts are required.
+**Do not launch another opening or reuse/clear the attempt directory while this state remains unresolved.** A source order expiration does not close a filled position. No automatic flattening or compensation is provided. The current task diagnoses and corrects the software offline; it does not send account requests, cancel orders or close positions.
 
-Full paired opening leaves a SHORT at the source and a LONG at the receiver. It does not automatically close them or guarantee that the two accounts match each other. The limit order's exchange lifetime and the program's waiting deadline are separate settings.
+Preserve the original packet, terminal result, exit status, claim and intent journal at:
+`/Users/daniilmakarov/Desktop/RISEx Spread Shadow/spread-shadow-runs/hood-launch-flow-20260916/owner-live-002`
+The earlier owner-live-001 is also consumed and must remain unchanged. Provide the attempt path for sanitized diagnosis; never provide keys, authentication tokens or signed payloads as evidence.
 
-After the program returns, preserve its attempt directory and all files, including the intent journal. A missing terminal result is an incomplete attempt. A timeout, rejection or unknown response does not establish that both accounts stayed flat. Do not remove or rename evidence to retry, and do not launch another attempt while earlier positions or orders remain unresolved. The same-directory launcher must refuse new submissions.
+HCR-13 candidate4d31ad785d8cef7c7a380863dc3c379ec49824d1 is accepted offline with4424passed/3skipped and16 independent checks. It corrects official order-side parsing, trades request direction, false history-pagination errors and SDK resource cleanup. The exact raw response behind the earlier live contract_error was not captured; its historical cause is not conclusively established. Offline acceptance does not establish successful live paired execution. No new launch command is supplied while the previous attempt remains unresolved.
 
-For diagnosis, tell the Chief that the attempt has ended and provide its directory path. The Chief can read the sanitized packet in the shared workspace, inspect recorded phases and known/unknown positions, and prepare an offline-tested correction. Never place API keys, authentication tokens or signed payloads in that packet. The required API keys may be exchanged only with the assigned execution agent in the private owner-agent task/chat or through the protected local credential boundary; seed phrases, recovery material and withdrawal credentials remain prohibited. The Chief does not promise continuous monitoring and must not edit or restart an active financial process. Any later materially different financial operation requires fresh owner confirmation after the prior state is resolved.
+## Local-attempt behavior
 
+Selected fixed parameters remain source27331 SELL LIMIT POST_ONLY / receiver27337 BUY MARKET IOC, BTC0.00020, API keyindex4, Robinhood domain466324, explicit incremental-margin deferral. Full paired opening leaves opposite open inventory and does not guarantee the accounts match each other. The notional varies with price; approximatelyUSD16 is not a guaranteed current value or profit.
 
-## Local single-attempt command — HCR-12
-
-The `local-attempt` entry point calculates a public-book proposal without a config or market-evidence JSON file. Its default preview is offline. The following execution command is for the owner to run in an interactive terminal after implementation acceptance; the Chief does not launch financial operations in this task.
-
-```bash
-cd "/Users/daniilmakarov/Desktop/RISEx Spread Shadow"
-PYTHONPATH=src .venv-hood/bin/python -m risex_spread_shadow.hood_handoff.cli local-attempt \
-  --symbol BTC --quantity 0.00020 --direction LONG \
-  --source-account-index 27331 --receiver-account-index 27337 --api-key-index 4 \
-  --attempt-dir "$PWD/spread-shadow-runs/hood-launch-flow-20260916/owner-live-002" \
-  --client-order-prefix hcr12-owner-002 \
-  --keychain --defer-incremental-margin-calculation \
-  --execute --i-understand-one-attempt-live-operation
-```
-
-The attempt directory must be empty and owner-only, or its existing parent must be owner-only. The prior `owner-live-001` directory is consumed and preserved: its HCR-11 run stopped on a changed quote before engine admission. The command names a new `owner-live-002` directory under the existing owner-only HCR-12 parent for a separately confirmed owner invocation. Never clear or reuse an attempt directory containing evidence. Remove both execution flags for an offline preview: it shows the automatic rule, unresolved prices and timing defaults without numeric prompts, Keychain or network access. `--help` is also offline.
+Preview/help remains offline without credentials or market requests. A future separately authorized owner invocation requires a new empty owner-only attempt directory or an existing owner-only parent. Existing claims/evidence are never cleared to retry.
 
 With both price flags omitted, source SELL uses best ask minus one tick if that stays strictly above best bid; otherwise it uses best ask. Source BUY mirrors that rule. Receiver worst-price bound equals the source price. Both sides must be valid, fresh and uncrossed. For a synthetic book with bid80000.0, ask80000.2 and tick0.1, SELL proposes80000.1 and estimated notional16.00002USD for0.00020BTC. This is an arithmetic illustration, not a current market quote.
 

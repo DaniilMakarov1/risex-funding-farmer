@@ -3,6 +3,14 @@
 SYSTEM_SPEC_VERSION = 4.2
 SPEC_STATUS = FIRST_RAW_RESEARCH_SCANNER_IMPLEMENTED
 
+## HCR-13 amendment — official order observations and resource lifecycle
+
+Official SDK/HTTP order observations require strict boolean is_ask for side. The deprecated side field may be absent or SDK-defaulted and does not override authoritative is_ask. Required official identity, quantity, status, type, TIF, reduce-only and price fields remain required; no fabricated zero fills or guessed identity. Active-order and client-index lookup normalization must preserve requested account/market identity. The internal normalized OrderSnapshot contract remains unchanged. The accountOrders endpoint remains the documented exact-client-index lookup; no guessed fallback or blind replay is introduced. Trades requests use documented descending order while preserving bounded cursor traversal, exact deduplication and causal reconciliation.
+
+A skipped history traversal because exchange order identity is missing remains incomplete/UNKNOWN and must not claim pagination exhaustion. Real exhausted pagination retains its configured bound. Source positions are separate from confirmed trade quantities; source-only external fills do not trigger automatic receiver dispatch or flattening.
+
+The execution adapter closes its owned generated client, signer clients and HTTP transport after use. Cleanup clears auth caches, is idempotent, attempts remaining resources when one close fails, and falls back to a signer's nested client if signer cleanup fails. Cleanup does not replace an existing terminal result or fabricate a terminal after interruption. Acceptance and actual owner attempt state remain in STATUS/NEXT_TASK; offline correctness is not proof of the historical live decoder cause or current account state.
+
 ## HCR-12 amendment — select automatic prices after confirmation
 
 Owner explicitly confirmed on2026-09-16 that automatic prices are selected after LAUNCH. This supersedes HCR-11 pre-confirmation exact-price proposal/equality/original-proposal-age gates for automatic local-attempt only. One LAUNCH approves the fixed accounts, direction, exact quantity, declared limits and existing mirrored one-tick rule. Cancellation/help/preview remains offline and credential-free. After confirmation, load credentials, then obtain one fresh public metadata/book observation and select source price with equal receiver bound. Display selected exact prices/notionals without a second price prompt. No automatic retry/requote or quantity change. Explicit-price operation remains compatible.

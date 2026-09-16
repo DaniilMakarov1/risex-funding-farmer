@@ -1,8 +1,12 @@
 # Current status
 
-## HCR-13 — ACTIVE; owner-live-002 UNKNOWN with observed source inventory
+## HCR-13 — ACCEPTED OFFLINE; owner-live-002 remains UNKNOWN
 
-Owner supplied terminal UNKNOWN: source27331 was dispatched and observed at-0.00020BTC; receiver27337 not dispatched and observed0. Order ID/status, cancellation and fill history unresolved. Positions are recorded observations, not a current read. New launch/replay is blocked pending separate reconciliation. Original evidence preserved in hood-launch-flow-20260916/owner-live-002; diagnostic packet/hashes in hood-order-observation-20260916/chief-v1. NEXT_TASK authorizes bounded offline SDK/order-observation, pagination-diagnostic and cleanup corrections. HCR-12 code acceptance below remains valid as offline evidence, not a live success claim.
+Candidate4d31ad785d8cef7c7a380863dc3c379ec49824d1 independently accepted by Chief01a0a67b-bec7-75d2-9970-e3914b10e445 on2026-09-16. Official order is_ask/required-field normalization, account/market matching, documented descending trades request, truthful missing-ID pagination diagnosis and SDK resource cleanup/fallback implemented. Readiness shares normalization. No strategy/price/size/threshold/fee/dependency change.
+
+Full actual four-file diff reviewed;16independent cases PASS, including actual-adapter/engine with fake transport, exact .00020BTC/75961.0/15.192200/source-only PARTIAL/no receiver dispatch, adverse fields/history bounds and9 real SDK aiohttp sessions closed without network requests. Final clean isolated Python3.11.5/SDK1.1.2 suite4424passed,3skipped,exit0,123.59seconds; unchanged hashes and isolated import roots verified. Fingerprint sha256:d3f77617c929b9891a0e924436d4720d20a9e3caffcdc44417d10e5470beabf8. Evidence hood-order-observation-20260916/chief-final-v3; original failures/diagnosis in chief-v1/chief-v2. Builder candidate/worktree/branch preserved and finite assignment released. Process deviations and source limits recorded in final review; publication separately verified.
+
+Actual owner002 still records UNKNOWN: source27331 dispatched/observed-0.00020BTC, receiver27337 undispatched/observed0, order ID/status/cancellation/history unresolved. Current positions/orders not read. Exact raw decoder failure unavailable; do not equate demonstrated schema defect with proven historical cause. Original owner001/002 immutable. No agent real account/key/Keychain/signing/cancellation/order calls, automatic closure or new launch. README provides no new financial invocation while002 remains unresolved. NEXT_TASK records completed software and remaining account-state boundary.
 
 ## HCR-12 post-LAUNCH automatic selection — ACCEPTED OFFLINE
 
