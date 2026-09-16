@@ -1,12 +1,12 @@
 # Current status
 
-## HCR-17 — successor active; WIP_NOT_ACCEPTED
+## HCR-17 — CHANGES_REQUESTED on04a2255
 
-Sole Chief01a0aafe-23fa-7c90-87a6-e807b3f6450a restored current contract fromdb0922e and verified preserved WIP binarydiff485a375c53432a505023f0fa5c492530dc4bb0a125192095744f5c98ee6a4d15 plus all handoff source/test/config hashes. Fresh explicit Builder /root/hcr17_final_builder is assigned three remaining boundary defects in isolated codex/spread-v1-hcr17-boundaries / hood-hcr17-boundaries, basea0fc7f9 with exact copied WIP. Previous sessions released; old branches/worktrees/evidence unchanged. Direct result delivery required, no management polling. Chief owns independent acceptance and sole integration/publication. See NEXT_TASK for complete unchanged objective and constraints.
+Chief independently reviewed full actual candidate diff and ran clean isolated Python3.11.5/SDK1.1.2 fullsuite4481passed3skipped, exit0; unchanged implementation hashes and isolated imports verified. History-age and incomplete-live-minimum corrections pass independent probes; original5controls plus8quantityoracle cases pass. One newly understood identity-continuity cause remains: a single foreign identity response followed by normal responses is forgotten when child preflight falls through to fallback, and fallback final account identity is unchecked. Synthetic cases send later orders and incorrectly reportSUCCESS. Persistent identity failures already stop. Consolidated exact review/counterexamples in owner-only hood-random-cycle-20260916/chief-v3/review.md and adjacent packets.
 
-Candidateb346eb5 remains CHANGES_REQUESTED: prior isolated4473passed3skipped does not resolve independently reproduced child-preflight identity rebinding, erroneous historical fill-age cutoff, or missing live metadata restamped from old evidence. Copied WIP reported31pass4fail and SDK correction not yet implemented. New Builder will supply focused evidence inbuilder-v4; final Chief review/probes/isolated fullsuite pending inchief-v3. Handoff and prior reviews remain immutable in owner-only hood-random-cycle-20260916. Accepted main/operator isa175e1f; HCR17 is not installed or published. No agent financial operations.
+Same healthy fresh Builder /root/hcr17_final_builder (native01a0aaff-5562-7c33-856b-19b30b754276), isolated codex/spread-v1-hcr17-boundaries, owns bounded correction and focused regressions. Chief01a0aafe-23fa-7c90-87a6-e807b3f6450a owns docs/independent final verification/integration. Direct result delivery; no management polling. Candidate04a2255, previous WIP/candidates and evidence preserved; not accepted or installed. Main/operator/remote remaina175e1f. No live reads/trading/credentials.
 
-Latest owner-run004 historical result: trade726095596 links source27331 order562950026401721 and receiver27337 order844424857250329, full.00020BTC at75340.4, initial0/0 and final-.00020/+.00020. Fees/funding UNKNOWN; current positions not read. This is opening evidence, not current flatness. Original owner004 evidence preserved.
+Latest owner004 historical opening remains-.00020/+.00020BTC at recorded time; current positions not read. Fees/funding UNKNOWN, no current-flatness claim.
 
 ## HCR-16 — ACCEPTED OFFLINE; bounded read latency improved
 
