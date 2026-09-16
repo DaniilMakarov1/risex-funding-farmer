@@ -1,12 +1,10 @@
 # Current status
 
-## HCR-17 — CHANGES_REQUESTED on04a2255
+## HCR-17 — CHANGES_REQUESTED oncac2ed7
 
-Chief independently reviewed full actual candidate diff and ran clean isolated Python3.11.5/SDK1.1.2 fullsuite4481passed3skipped, exit0; unchanged implementation hashes and isolated imports verified. History-age and incomplete-live-minimum corrections pass independent probes; original5controls plus8quantityoracle cases pass. One newly understood identity-continuity cause remains: a single foreign identity response followed by normal responses is forgotten when child preflight falls through to fallback, and fallback final account identity is unchecked. Synthetic cases send later orders and incorrectly reportSUCCESS. Persistent identity failures already stop. Consolidated exact review/counterexamples in owner-only hood-random-cycle-20260916/chief-v3/review.md and adjacent packets.
+Candidatecac2ed763718031171c152a7efb283b3e9cfb642 fixes all8prior transient identity cases; independent history/minimum/original controls remain correct. Full correction diff reviewed; clean isolated Python3.11.5/SDK1.1.2 suite4489passed3skipped, exit0, unchanged hashes/imports verified. New concrete cause: malformed/missing identity validation can throw before the barrier callback; parent invalid account/market validation and child response identity fields also bypass early rejection. One-shot missingidentity/wrongaccount probes still permit forbiddenfallback/SUCCESS; child wrongaccount admits closingLIMIT before laterstop. Exact finite correction and packets in owner-only chief-v4/review.md.
 
-Same healthy fresh Builder /root/hcr17_final_builder (native01a0aaff-5562-7c33-856b-19b30b754276), isolated codex/spread-v1-hcr17-boundaries, owns bounded correction and focused regressions. Chief01a0aafe-23fa-7c90-87a6-e807b3f6450a owns docs/independent final verification/integration. Direct result delivery; no management polling. Candidate04a2255, previous WIP/candidates and evidence preserved; not accepted or installed. Main/operator/remote remaina175e1f. No live reads/trading/credentials.
-
-Latest owner004 historical opening remains-.00020/+.00020BTC at recorded time; current positions not read. Fees/funding UNKNOWN, no current-flatness claim.
+Same healthy Builder native01a0aaff-5562-7c33-856b-19b30b754276 owns random_cycle.py and relevant tests on codex/spread-v1-hcr17-boundaries; source/receiver required identity field/decoder exceptions must stop dependent writes. Chief01a0aafe-23fa-7c90-87a6-e807b3f6450a retains sole docs/review/integration. Candidate/evidence preserved; no main integration/installation. Main/operator remaina175e1f. No live operations; historical owner004 positions not read/adopted/closed.
 
 ## HCR-16 — ACCEPTED OFFLINE; bounded read latency improved
 
