@@ -24,6 +24,7 @@ from .keychain import (
 from .local_attempt import (
     LocalAttemptInputError,
     collect_local_attempt_inputs,
+    format_local_attempt_result,
     run_local_attempt,
 )
 from .readiness import (
@@ -68,9 +69,9 @@ def _parser() -> argparse.ArgumentParser:
             "and never imports the Lighter SDK, prompts for keys, or makes a request."
         ),
         epilog=(
-            "HCR-11 local-attempt: omit both price flags to use one fresh public-book proposal "
-            "(source SELL uses best ask minus one tick when strictly above best bid; source BUY "
-            "mirrors that rule; receiver bound equals the selected source price). Omitted timing "
+            "HCR-12 local-attempt: omit both price flags to review the fixed automatic one-tick rule "
+            "before LAUNCH; keys then load and one fresh public metadata/book observation selects "
+            "the exact source price and equal receiver bound. Omitted timing "
             "bounds use finite defaults: freshness 10s, request 5s, order 10s, reconciliation "
             "20s, polling 0.5s, 40 polls, source expiry 300s."
         ),
@@ -99,7 +100,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--source-limit-price",
         dest="readiness_source_limit_price",
-        help="exact explicit source bound; omit together with receiver bound for HCR-11 public-book selection",
+        help="exact explicit source bound; omit together with receiver bound for HCR-12 post-LAUNCH automatic selection",
     )
     parser.add_argument(
         "--receiver-worst-price",
@@ -588,7 +589,7 @@ async def _run_local_attempt(args: argparse.Namespace) -> int:
         output_fn=print,
         secret_provider_factory=secret_provider_factory,
     )
-    print(json.dumps(result.as_dict(), sort_keys=True, separators=(",", ":")))
+    print(format_local_attempt_result(result))
     return result.exit_code
 
 

@@ -1,4 +1,4 @@
-"""Owner-local launcher for one bounded HCR-11 paired-opening attempt.
+"""Owner-local launcher for one bounded HCR-12 paired-opening attempt.
 
 This module is deliberately a thin boundary around the existing HCR-1
 contracts, SDK adapters, journal, and engine.  It owns operator input and the
@@ -6,10 +6,10 @@ small fixed diagnostic packet; it does not implement a second execution
 state machine, retry loop, or storage service.
 
 The execution factory and secret provider are only called after the operator
-has entered the complete plan and explicitly typed ``LAUNCH``.  Automatic mode
-may call the read-only public market reader before that confirmation.  Tests
-inject synthetic factories and therefore never import a live SDK module or
-make a request.
+has entered the fixed plan and explicitly typed ``LAUNCH``.  Automatic mode
+then obtains one fresh public market observation and selects both exact prices
+from that observation.  Tests inject synthetic factories and therefore never
+import a live SDK module or make a request.
 """
 
 from __future__ import annotations
@@ -68,6 +68,28 @@ DEFAULT_RECONCILE_TIMEOUT_SECONDS = 20.0
 DEFAULT_POLL_INTERVAL_SECONDS = 0.5
 DEFAULT_MAX_POLL_COUNT = 40
 DEFAULT_SOURCE_ORDER_LIFETIME_SECONDS = 300
+
+# Stable, secret-free local outcome labels.  They describe the launcher
+# boundary only; the engine's result remains the authority for fills,
+# positions, reconciliation, and any unknown execution state.
+LOCAL_REASON_ATTEMPT_DIRECTORY = "ATTEMPT_DIRECTORY_REFUSED"
+LOCAL_REASON_OPERATOR_CANCELLED = "OPERATOR_CANCELLED"
+LOCAL_REASON_PUBLIC_READ_FAILED = "PUBLIC_READ_FAILED"
+LOCAL_REASON_INVALID_OBSERVATION = "INVALID_PUBLIC_OBSERVATION"
+LOCAL_REASON_STALE_OBSERVATION = "STALE_PUBLIC_OBSERVATION"
+LOCAL_REASON_PRICE_CHANGED = "PRICE_CHANGED_AFTER_LAUNCH"
+LOCAL_REASON_PROPOSAL_EXPIRED = "ORIGINAL_PROPOSAL_EXPIRED"
+LOCAL_REASON_INITIAL_PACKET = "INITIAL_PACKET_WRITE_FAILED"
+LOCAL_REASON_PACKET_WRITE = "PACKET_WRITE_FAILED"
+LOCAL_REASON_PRE_EXECUTION = "PRE_EXECUTION_FAILURE"
+LOCAL_REASON_TERMINAL_MISSING = "TERMINAL_RESULT_MISSING"
+LOCAL_REASON_PACKET_FINALIZATION = "PACKET_FINALIZATION_INCOMPLETE"
+
+EXECUTION_STATE_NOT_STARTED = "NOT_STARTED"
+EXECUTION_STATE_READY = "READY_FOR_ENGINE"
+EXECUTION_STATE_PRE_EXECUTION_STOP = "PRE_EXECUTION_STOP"
+EXECUTION_STATE_UNKNOWN = "UNKNOWN_EXECUTION"
+EXECUTION_STATE_TERMINAL_RECORDED = "TERMINAL_RECORDED"
 
 
 class LocalAttemptInputError(ValueError):
@@ -159,6 +181,122 @@ def _prompt(input_fn: InputFn, prompt: str, name: str) -> str:
 
 def _value_or_prompt(value: Any, input_fn: InputFn, prompt: str, name: str) -> Any:
     return value if value is not None else _prompt(input_fn, prompt, name)
+
+
+def _unresolved_automatic_provenance() -> dict[str, Any]:
+    """Describe the intentionally unresolved pre-launch automatic price slot."""
+
+    return {
+        "status": "UNRESOLVED_BEFORE_LAUNCH",
+        "selection": "one fresh public metadata/book read after LAUNCH",
+        "metadata": None,
+        "book": None,
+        "prices": None,
+    }
+
+
+def _classify_local_error(exc: BaseException, *, stage: str) -> str | None:
+    """Map a boundary failure to a fixed safe reason code.
+
+    Engine-entry knowledge takes precedence over text matching.  Only a few
+    known words from a pre-engine validated contract-like exception are
+    inspected.  The complete exception text is never returned to the operator
+    or persisted; SDK and transport failures therefore remain opaque and
+    secret-free.
+    """
+
+    if stage == "engine":
+        # Once the execution client has been constructed, even a seemingly
+        # harmless exception cannot prove that no mutation was attempted.
+        return LOCAL_REASON_TERMINAL_MISSING
+    if stage == "initial_packet":
+        return LOCAL_REASON_INITIAL_PACKET
+    if stage == "packet":
+        return LOCAL_REASON_PACKET_WRITE
+    if stage == "secret_input":
+        return LOCAL_REASON_PRE_EXECUTION
+    contract_error = isinstance(exc, (ContractError, ValueError, TypeError))
+    if stage in {"market_metadata", "market_book", "market_quote_selection"} and not contract_error:
+        # An opaque SDK/transport exception is a read failure even when its
+        # text happens to contain words such as "stale" or "expired".
+        return LOCAL_REASON_PUBLIC_READ_FAILED
+    if not contract_error:
+        return None
+    text = str(exc).lower()
+    if "price changed" in text or "quote changed" in text:
+        return LOCAL_REASON_PRICE_CHANGED
+    if "proposal" in text and "expired" in text:
+        return LOCAL_REASON_PROPOSAL_EXPIRED
+    if any(token in text for token in ("stale", "expired", "too old")):
+        return LOCAL_REASON_STALE_OBSERVATION
+    if any(
+        token in text
+        for token in (
+            "future",
+            "crossed",
+            "identity",
+            "malformed",
+            "unsupported shape",
+            "must contain",
+            "not active",
+            "wrong venue",
+            "minimum",
+            "grid",
+            "decimals",
+            "symbol",
+        )
+    ):
+        return LOCAL_REASON_INVALID_OBSERVATION
+    if stage in {"market_metadata", "market_book", "market_quote_selection"}:
+        return LOCAL_REASON_INVALID_OBSERVATION
+    return None
+
+
+def _local_failure_message(reason_code: str, safe_error: str | None = None) -> str:
+    """Return concise operator text for a classified local failure."""
+
+    messages = {
+        LOCAL_REASON_ATTEMPT_DIRECTORY: "attempt directory was refused before launch",
+        LOCAL_REASON_OPERATOR_CANCELLED: "operator cancelled before launch; no credentials or orders were used",
+        LOCAL_REASON_PUBLIC_READ_FAILED: "fresh public metadata/book read failed; stopped before engine dispatch",
+        LOCAL_REASON_INVALID_OBSERVATION: "fresh public metadata/book observation was invalid; stopped before engine dispatch",
+        LOCAL_REASON_STALE_OBSERVATION: "fresh public metadata/book observation was stale; stopped before engine dispatch",
+        LOCAL_REASON_PRICE_CHANGED: "approved price changed before execution; stopped before engine dispatch",
+        LOCAL_REASON_PROPOSAL_EXPIRED: "original automatic proposal expired before execution; stopped before engine dispatch",
+        LOCAL_REASON_INITIAL_PACKET: "initial diagnostic packet failed before secrets; stopped before engine dispatch",
+        LOCAL_REASON_PACKET_WRITE: "diagnostic packet could not be recorded; stopped before engine dispatch",
+        LOCAL_REASON_PRE_EXECUTION: "operation stopped before engine dispatch; no terminal result was recorded",
+        LOCAL_REASON_TERMINAL_MISSING: "terminal engine result is missing; execution state is unknown; inspect the journal and known inventory",
+        LOCAL_REASON_PACKET_FINALIZATION: "terminal result recorded; diagnostic packet finalization incomplete",
+    }
+    message = messages.get(reason_code, "local attempt stopped before a complete terminal result")
+    if safe_error is not None and reason_code not in {
+        LOCAL_REASON_OPERATOR_CANCELLED,
+        LOCAL_REASON_ATTEMPT_DIRECTORY,
+    }:
+        return f"{message} (error class: {safe_error})"
+    return message
+
+
+def _execution_packet(state: str, reason_code: str | None = None) -> dict[str, Any]:
+    """Serialize launcher execution knowledge without claiming account state."""
+
+    if state == EXECUTION_STATE_PRE_EXECUTION_STOP:
+        dispatch_status = "NOT_DISPATCHED_BY_THIS_ATTEMPT"
+    elif state == EXECUTION_STATE_NOT_STARTED:
+        dispatch_status = "NOT_ATTEMPTED"
+    elif state == EXECUTION_STATE_READY:
+        dispatch_status = "NOT_DISPATCHED_YET"
+    elif state == EXECUTION_STATE_TERMINAL_RECORDED:
+        dispatch_status = "SEE_TERMINAL_RESULT"
+    else:
+        dispatch_status = "UNKNOWN"
+    return {
+        "state": state,
+        "dispatch_status": dispatch_status,
+        "known_pre_execution_stop": state == EXECUTION_STATE_PRE_EXECUTION_STOP,
+        "reason_code": reason_code,
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -376,7 +514,7 @@ def collect_local_attempt_inputs(
     automatic_price_selection: bool | None = None,
     input_fn: InputFn = input,
 ) -> LocalAttemptInputs:
-    """Normalize direct flags and apply the HCR-11 automatic input policy.
+    """Normalize direct flags and apply the HCR-12 automatic input policy.
 
     The command-line entry point passes ``automatic_price_selection=True``
     when both prices are omitted.  Direct callers receive the same automatic
@@ -433,7 +571,7 @@ def collect_local_attempt_inputs(
             "receiver_worst_price",
         )
 
-    # With the HCR-11 policy the timing values are finite declared defaults;
+    # With the HCR-11/HCR-12 policy the timing values are finite declared defaults;
     # explicit values continue to be validated exactly as before.
     def timing_value(value: Any, default: Any) -> Any:
         return default if value is None else value
@@ -539,7 +677,7 @@ def preview_payload(inputs: LocalAttemptInputs) -> dict[str, Any]:
         "message": (
             "no SDK import, credential access, signing, market request, or order is performed before LAUNCH."
             if not automatic
-            else "prices are unresolved until one fresh public order-book proposal; no credentials or orders are used."
+            else "prices are unresolved until one fresh public metadata/book read after LAUNCH; no credentials or orders are used before confirmation."
         ),
         "config": inputs.as_dict(),
         "operation": {
@@ -568,7 +706,7 @@ def preview_payload(inputs: LocalAttemptInputs) -> dict[str, Any]:
                 "not fills, execution prices, fees, or profit"
             ),
             "market_id": (
-                "resolved from one fresh current catalog observation after public proposal"
+                "resolved from one fresh current catalog/book observation after LAUNCH"
                 if automatic
                 else "resolved from one fresh current catalog observation after launch"
             ),
@@ -617,6 +755,60 @@ def preview_payload(inputs: LocalAttemptInputs) -> dict[str, Any]:
             },
         },
     }
+
+
+def format_local_attempt_preview(inputs: LocalAttemptInputs) -> str:
+    """Render the small human-readable plan shown before the launch token."""
+
+    lines = [
+        "OWNER_LOCAL_PENDING_LAUNCH",
+        (
+            f"venue=robinhood-chain api_base_url={OFFICIAL_ROBINHOOD_API_URL} "
+            f"signing_domain=robinhood-chain chain_id={OFFICIAL_ROBINHOOD_CHAIN_ID}"
+        ),
+        (
+            f"mode=PAIRED_OPENING market={inputs.market_symbol} direction={inputs.direction.value} "
+            f"quantity={format(inputs.quantity, 'f')}"
+        ),
+        (
+            f"accounts=source:{inputs.source_account_index} "
+            f"receiver:{inputs.receiver_account_index} api_key_index:{inputs.api_key_index}"
+        ),
+        (
+            f"source_leg={inputs.direction.source_side} LIMIT POST_ONLY reduce_only=False; "
+            f"receiver_leg={inputs.direction.receiver_side} MARKET IOC reduce_only=False"
+        ),
+    ]
+    if inputs.automatic_price_selection:
+        lines.append(
+            "prices=UNRESOLVED; automatic rule: source SELL uses best ask minus one tick "
+            "when strictly above best bid, source BUY mirrors it, receiver bound equals source"
+        )
+    else:
+        assert inputs.source_limit_price is not None
+        assert inputs.receiver_worst_price is not None
+        lines.append(
+            f"prices=source:{format(inputs.source_limit_price, 'f')} "
+            f"receiver_bound:{format(inputs.receiver_worst_price, 'f')} "
+            f"notionals:{format(inputs.quantity * inputs.source_limit_price, 'f')}/"
+            f"{format(inputs.quantity * inputs.receiver_worst_price, 'f')}"
+        )
+    lines.append(
+        (
+            f"timing=freshness:{inputs.freshness_seconds:g}s request:{inputs.request_timeout_seconds:g}s "
+            f"order:{inputs.order_timeout_seconds:g}s reconcile:{inputs.reconcile_timeout_seconds:g}s "
+            f"poll:{inputs.poll_interval_seconds:g}s max_polls:{inputs.max_poll_count} "
+            f"source_expiry:{inputs.source_order_lifetime_seconds}s auth_lifetime:{inputs.auth_token_lifetime_seconds}s"
+        )
+    )
+    lines.append(
+        "margin_mode="
+        + ("DEFERRED" if inputs.defer_incremental_margin_calculation else "STRICT")
+    )
+    lines.append(
+        "pre-launch: no SDK import, credential access, market request, or order is performed before LAUNCH."
+    )
+    return "\n".join(lines)
 
 
 @dataclass(frozen=True, slots=True)
@@ -744,7 +936,7 @@ def _validate_public_market_and_book(
     freshness_seconds: float,
     quantity: Decimal | None = None,
 ) -> None:
-    """Apply the existing market checks plus the HCR-11 book boundary."""
+    """Apply the existing market checks plus the HCR-12 book boundary."""
 
     if metadata.symbol.upper() == "" or metadata.symbol.upper() != book.symbol.upper():
         raise ContractError("public order-book identity does not match market symbol")
@@ -854,27 +1046,6 @@ def select_automatic_prices(
     )
 
 
-def _validate_original_proposal_fresh(
-    metadata: MarketMetadata,
-    proposal: AutomaticPriceProposal,
-    *,
-    now: float,
-    freshness_seconds: float,
-) -> None:
-    """Reject a proposal that aged during confirmation or key input."""
-
-    for label, observed_at in (
-        ("approved market metadata", metadata.observed_at),
-        ("approved order-book proposal", proposal.observed_at),
-    ):
-        if observed_at > now:
-            raise ContractError(f"{label} is from the future at final revalidation")
-        if now - observed_at > freshness_seconds:
-            raise ContractError(
-                f"{label} expired before final revalidation; confirmation delay cannot refresh it"
-            )
-
-
 # Descriptive alias for callers that prefer a verb over the selector name.
 derive_automatic_prices = select_automatic_prices
 
@@ -899,22 +1070,6 @@ def default_market_reader_factory(
         receiver_account_index=inputs.receiver_account_index,
         secrets=secrets,
     )
-
-
-class _PublicOnlySecretProvider:
-    """Sentinel provider for public proposal reads.
-
-    ``ReadOnlyLighterSdkClient`` does not access a secret for catalog/book
-    methods.  If a future change accidentally requests one during the public
-    phase, fail closed rather than turning proposal collection into a hidden
-    credential prompt.
-    """
-
-    def private_key(self, account_index: int, api_key_index: int) -> str:
-        raise ContractError("public price proposal must not access credentials")
-
-    def close(self) -> None:
-        return None
 
 
 async def _read_public_book(reader: Any, market_id: int) -> Any:
@@ -1143,26 +1298,15 @@ def _safe_book_provenance(
         return _unvalidated_book_provenance(value, sdk_version=sdk_version)
 
 
-def _proposal_provenance(
-    metadata_value: Any,
-    book_value: Any,
-    proposal: AutomaticPriceProposal,
-    *,
-    sdk_version: str | None = None,
-) -> dict[str, Any]:
-    return {
-        "metadata": _metadata_provenance(metadata_value, sdk_version=sdk_version),
-        "book": _book_provenance(book_value, sdk_version=sdk_version),
-        "prices": proposal.as_dict(),
-    }
-
-
 def _compact_provenance(value: Mapping[str, Any] | None) -> dict[str, Any] | None:
     """Keep result/CLI provenance bounded while packets retain full depth."""
 
     if value is None:
         return None
     compact: dict[str, Any] = {}
+    for label in ("status", "selection"):
+        if label in value:
+            compact[label] = value[label]
     for label in ("metadata", "book"):
         item = value.get(label)
         if not isinstance(item, Mapping):
@@ -1188,85 +1332,32 @@ def _compact_provenance(value: Mapping[str, Any] | None) -> dict[str, Any] | Non
     return sanitize(compact)
 
 
-def _proposal_payload(
+def format_local_attempt_selection(
     inputs: LocalAttemptInputs,
     proposal: AutomaticPriceProposal,
-    metadata_value: Any,
-    book_value: Any,
     *,
     sdk_version: str | None = None,
-) -> dict[str, Any]:
-    """Build the short exact plan shown immediately before LAUNCH.
+) -> str:
+    """Render the exact post-launch prices selected from one fresh book."""
 
-    The complete metadata and order-book observation is persisted in the
-    owner-only packet.  The operator-facing line keeps only the values needed
-    to review this one proposal and its finite timing limits.
-    """
-
-    del metadata_value, book_value
-    return {
-        "outcome": "PROPOSAL",
-        "execution": "OWNER_LOCAL_PENDING_LAUNCH",
-        "message": (
-            "one exact price proposal from a fresh public book; type LAUNCH to continue. "
-            "No credentials or orders are used before confirmation."
-        ),
-        "market": {
-            "market_id": proposal.market_id,
-            "symbol": proposal.symbol,
-            "sdk_version": sdk_version,
-            "observed_at": proposal.observed_at,
-        },
-        "accounts": {
-            "source": inputs.source_account_index,
-            "receiver": inputs.receiver_account_index,
-        },
-        "direction": inputs.direction.value,
-        "quantity": format(inputs.quantity, "f"),
-        "source": {
-            "side": inputs.direction.source_side,
-            "order_type": "LIMIT",
-            "time_in_force": "POST_ONLY",
-            "price_bound": format(proposal.source_limit_price, "f"),
-            "notional_estimate": format(inputs.quantity * proposal.source_limit_price, "f"),
-        },
-        "receiver": {
-            "side": inputs.direction.receiver_side,
-            "order_type": "MARKET",
-            "time_in_force": "IOC",
-            "worst_price_bound": format(proposal.receiver_worst_price, "f"),
-            "notional_estimate": format(inputs.quantity * proposal.receiver_worst_price, "f"),
-        },
-        "price_selection": {
-            "automatic": True,
-            "rule": (
-                "SELL source: best ask minus one price tick when strictly above best bid, otherwise best ask; "
-                "BUY source mirrors that rule; receiver bound equals selected source price"
+    return "\n".join(
+        (
+            "POST_LAUNCH_PRICE_SELECTED",
+            (
+                f"market={proposal.symbol}#{proposal.market_id} observation={proposal.observed_at:.6f} "
+                f"best_bid={format(proposal.best_bid, 'f')} best_ask={format(proposal.best_ask, 'f')} "
+                f"tick={format(proposal.price_tick, 'f')} sdk={sdk_version or 'unknown'}"
             ),
-            "best_bid": format(proposal.best_bid, "f"),
-            "best_ask": format(proposal.best_ask, "f"),
-            "price_tick": format(proposal.price_tick, "f"),
-            "used_tick_adjustment": proposal.used_tick_adjustment,
-            "source_limit_price": format(proposal.source_limit_price, "f"),
-            "receiver_worst_price": format(proposal.receiver_worst_price, "f"),
-            "observed_at": proposal.observed_at,
-        },
-        "timing": {
-            "freshness_seconds": inputs.freshness_seconds,
-            "request_timeout_seconds": inputs.request_timeout_seconds,
-            "order_timeout_seconds": inputs.order_timeout_seconds,
-            "reconcile_timeout_seconds": inputs.reconcile_timeout_seconds,
-            "poll_interval_seconds": inputs.poll_interval_seconds,
-            "max_poll_count": inputs.max_poll_count,
-            "source_order_lifetime_seconds": inputs.source_order_lifetime_seconds,
-            "auth_token_lifetime_seconds": inputs.auth_token_lifetime_seconds,
-        },
-        "incremental_margin": (
-            "DEFERRED"
-            if inputs.defer_incremental_margin_calculation
-            else "STRICT"
-        ),
-    }
+            (
+                f"source={inputs.direction.source_side} LIMIT POST_ONLY "
+                f"price={format(proposal.source_limit_price, 'f')} "
+                f"notional={format(inputs.quantity * proposal.source_limit_price, 'f')}; "
+                f"receiver={inputs.direction.receiver_side} MARKET IOC "
+                f"worst_price={format(proposal.receiver_worst_price, 'f')} "
+                f"notional={format(inputs.quantity * proposal.receiver_worst_price, 'f')}"
+            ),
+        )
+    )
 
 
 def _as_market_metadata(value: Any, *, sdk_version: str | None = None) -> MarketMetadata:
@@ -1461,21 +1552,26 @@ def _initial_packet(
     *,
     proposal_provenance: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    unresolved = (
+        _unresolved_automatic_provenance()
+        if inputs.automatic_price_selection and proposal_provenance is None
+        else proposal_provenance
+    )
     provenance: dict[str, Any] = {
-        "status": "PENDING" if proposal_provenance is None else "PROPOSAL_OBSERVED",
+        "status": "PENDING" if unresolved is None else str(unresolved.get("status", "PENDING")),
         "source": (
-            "fresh public lighter-sdk metadata/order-book observation before owner launch"
-            if proposal_provenance is not None
+            "one fresh public lighter-sdk metadata/order-book observation after owner launch"
+            if inputs.automatic_price_selection
             else "fresh lighter-sdk orderBookDetails observation after owner launch"
         ),
         "metadata": None,
-        "proposal": None if proposal_provenance is None else dict(proposal_provenance),
+        "proposal": None if unresolved is None else dict(unresolved),
         "final": None,
     }
-    if proposal_provenance is not None:
-        # Keep the historical metadata path populated for packet consumers
-        # while adding explicit proposal/final provenance for HCR-11.
-        provenance["metadata"] = proposal_provenance.get("metadata")
+    if unresolved is not None:
+        # Keep the historical proposal/final slots present while making it
+        # explicit that automatic prices are unresolved before LAUNCH.
+        provenance["metadata"] = unresolved.get("metadata")
     return {
         "packet_version": PACKET_VERSION,
         "source": {
@@ -1487,6 +1583,7 @@ def _initial_packet(
         "journal_path": str(inputs.journal_path),
         "config": _config_packet(inputs),
         "provenance": provenance,
+        "execution": _execution_packet(EXECUTION_STATE_NOT_STARTED),
         "terminal": {
             "status": "MISSING",
             "result_file": str(inputs.terminal_result_path),
@@ -1536,6 +1633,8 @@ class LocalAttemptResult:
     reason: str | None = None
     preview: Mapping[str, Any] | None = None
     provenance: Mapping[str, Any] | None = None
+    reason_code: str | None = None
+    execution_state: str = EXECUTION_STATE_UNKNOWN
 
     def as_dict(self) -> dict[str, Any]:
         return sanitize(
@@ -1547,11 +1646,54 @@ class LocalAttemptResult:
                 "journal_path": None if self.journal_path is None else str(self.journal_path),
                 "terminal_status": self.terminal_status,
                 "reason": self.reason,
+                "reason_code": self.reason_code,
+                "execution_state": self.execution_state,
+                "known_pre_execution_stop": self.execution_state == EXECUTION_STATE_PRE_EXECUTION_STOP,
                 "preview": None if self.preview is None else dict(self.preview),
                 "provenance": None if self.provenance is None else dict(self.provenance),
                 "result": None if self.result is None else self.result.as_dict(),
             }
         )
+
+
+def format_local_attempt_result(result: LocalAttemptResult) -> str:
+    """Render a concise terminal line without dumping the result payload."""
+
+    lines = [
+        (
+            f"LOCAL_ATTEMPT status={result.status} terminal={result.terminal_status} "
+            f"execution_state={result.execution_state} exit_code={result.exit_code}"
+        )
+    ]
+    if result.reason is not None:
+        code = result.reason_code or "UNCLASSIFIED"
+        lines.append(f"reason={code}: {result.reason}")
+    if result.result is not None:
+        engine = result.result
+        lines.append(
+            f"engine outcome={engine.outcome.value} phase={engine.phase.value}"
+        )
+        if engine.reason is not None:
+            lines.append(f"engine_reason={sanitize(engine.reason)}")
+        if engine.unknown_reasons:
+            unknown = "; ".join(str(sanitize(item)) for item in engine.unknown_reasons)
+            lines.append(f"engine_unknown_reasons={unknown}")
+        inventory: list[str] = []
+        for label, leg in (("source", engine.source), ("receiver", engine.receiver)):
+            if leg is None:
+                continue
+            position = "UNKNOWN" if leg.position_after is None else format(leg.position_after, "f")
+            inventory.append(
+                f"{label}:position_after={position},filled={format(leg.filled_quantity, 'f')}"
+            )
+        lines.append(
+            "inventory=" + ("; ".join(inventory) if inventory else "UNKNOWN")
+        )
+    if result.packet_path is not None:
+        lines.append(f"packet={result.packet_path}")
+    if result.journal_path is not None:
+        lines.append(f"journal={result.journal_path}")
+    return "\n".join(lines)
 
 
 async def _close_resource(value: Any) -> None:
@@ -1586,15 +1728,16 @@ async def run_local_attempt(
 ) -> LocalAttemptResult:
     """Preview or launch one bounded local attempt.
 
-    Automatic prices are proposed from one public metadata/book observation
-    before the launch token is requested.  Credentials are created only after
-    that token and a fresh exact-price revalidation follows key input.  The
-    accepted explicit-price path keeps its historical order and packet shape.
+    Automatic mode keeps prices unresolved while the operator reviews the
+    fixed accounts, direction, quantity, and one-tick rule.  After the exact
+    launch token, keys are loaded and one fresh public metadata/book
+    observation selects both prices.  The explicit-price path keeps its
+    existing order and packet shape.
     """
 
     preview = preview_payload(inputs)
     if output_fn is not None:
-        output_fn(json.dumps(preview, sort_keys=True, separators=(",", ":")))
+        output_fn(format_local_attempt_preview(inputs))
     try:
         _validate_attempt_directory(inputs.attempt_dir)
     except AttemptDirectoryError as exc:
@@ -1606,6 +1749,8 @@ async def run_local_attempt(
             terminal_status="PRESERVED",
             reason=str(exc),
             preview=preview,
+            reason_code=LOCAL_REASON_ATTEMPT_DIRECTORY,
+            execution_state=EXECUTION_STATE_NOT_STARTED,
         )
     if not execute:
         return LocalAttemptResult(
@@ -1615,88 +1760,17 @@ async def run_local_attempt(
             journal_path=None,
             terminal_status="NOT_STARTED",
             preview=preview,
+            execution_state=EXECUTION_STATE_NOT_STARTED,
         )
 
     effective_clock = clock or SystemClock()
     active_inputs = inputs
     proposal: AutomaticPriceProposal | None = None
-    proposal_metadata: Any | None = None
-    proposal_book: Any | None = None
-    proposal_provenance: dict[str, Any] | None = None
-    proposal_reader: Any | None = None
-
-    if inputs.automatic_price_selection:
-        # Resolve the proposal through a read-only adapter before any claim,
-        # key prompt, signer construction or private endpoint access.
-        try:
-            proposal_reader = (market_reader_factory or default_market_reader_factory)(
-                inputs,
-                _PublicOnlySecretProvider(),
-            )
-            raw_metadata = await proposal_reader.resolve_market(inputs.market_symbol)
-            proposal_metadata = _as_market_metadata(
-                raw_metadata,
-                sdk_version=getattr(proposal_reader, "sdk_version", None),
-            )
-            if (
-                proposal_metadata.market_id < 0
-                or proposal_metadata.symbol.upper() != inputs.market_symbol.upper()
-            ):
-                raise ContractError("fresh market identity does not match operator symbol")
-            raw_book = await _read_public_book(proposal_reader, proposal_metadata.market_id)
-            proposal_book = _as_order_book_snapshot(raw_book, proposal_metadata)
-            proposal = select_automatic_prices(
-                inputs.direction,
-                proposal_metadata,
-                proposal_book,
-                quantity=inputs.quantity,
-                now=_clock_now(effective_clock),
-                freshness_seconds=inputs.freshness_seconds,
-            )
-            proposal_provenance = _proposal_provenance(
-                raw_metadata,
-                raw_book,
-                proposal,
-                sdk_version=getattr(proposal_reader, "sdk_version", None),
-            )
-        except Exception as exc:
-            safe_error = sanitize_exception(exc)
-            if proposal_reader is not None:
-                try:
-                    await _close_resource(proposal_reader)
-                except Exception:
-                    pass
-            return LocalAttemptResult(
-                status="REFUSED",
-                exit_code=2,
-                packet_path=None,
-                journal_path=None,
-                terminal_status="NOT_STARTED",
-                reason=f"automatic public price proposal unavailable: {safe_error}",
-                preview=preview,
-                provenance=_compact_provenance(proposal_provenance),
-            )
-        assert proposal is not None
-        active_inputs = replace(
-            inputs,
-            source_limit_price=proposal.source_limit_price,
-            receiver_worst_price=proposal.receiver_worst_price,
-            automatic_price_selection_requested=True,
-        )
-        if output_fn is not None:
-            output_fn(
-                json.dumps(
-                    _proposal_payload(
-                        inputs,
-                        proposal,
-                        proposal_metadata,
-                        proposal_book,
-                        sdk_version=getattr(proposal_reader, "sdk_version", None),
-                    ),
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-            )
+    proposal_provenance: dict[str, Any] | None = (
+        _unresolved_automatic_provenance()
+        if inputs.automatic_price_selection
+        else None
+    )
 
     try:
         response = _prompt(
@@ -1705,49 +1779,36 @@ async def run_local_attempt(
             "launch confirmation",
         )
     except LocalAttemptInputError as exc:
-        if proposal_reader is not None:
-            try:
-                await _close_resource(proposal_reader)
-            except Exception:
-                pass
         return LocalAttemptResult(
             status="CANCELLED",
             exit_code=0,
             packet_path=None,
             journal_path=None,
             terminal_status="NOT_STARTED",
-            reason=str(exc),
+            reason=_local_failure_message(LOCAL_REASON_OPERATOR_CANCELLED),
             preview=preview,
             provenance=_compact_provenance(proposal_provenance),
+            reason_code=LOCAL_REASON_OPERATOR_CANCELLED,
+            execution_state=EXECUTION_STATE_NOT_STARTED,
         )
     if response != LAUNCH_TOKEN:
-        if proposal_reader is not None:
-            try:
-                await _close_resource(proposal_reader)
-            except Exception:
-                pass
         return LocalAttemptResult(
             status="CANCELLED",
             exit_code=0,
             packet_path=None,
             journal_path=None,
             terminal_status="NOT_STARTED",
-            reason=(
-                "operator did not enter the exact launch token; no credentials or orders were used"
-            ),
+            reason=_local_failure_message(LOCAL_REASON_OPERATOR_CANCELLED),
             preview=preview,
             provenance=_compact_provenance(proposal_provenance),
+            reason_code=LOCAL_REASON_OPERATOR_CANCELLED,
+            execution_state=EXECUTION_STATE_NOT_STARTED,
         )
 
     try:
         attempt_dir = _ensure_new_attempt_directory(inputs.attempt_dir)
         _claim_attempt_directory(attempt_dir)
     except AttemptDirectoryError as exc:
-        if proposal_reader is not None:
-            try:
-                await _close_resource(proposal_reader)
-            except Exception:
-                pass
         return LocalAttemptResult(
             status="REFUSED",
             exit_code=2,
@@ -1757,6 +1818,8 @@ async def run_local_attempt(
             reason=str(exc),
             preview=preview,
             provenance=_compact_provenance(proposal_provenance),
+            reason_code=LOCAL_REASON_ATTEMPT_DIRECTORY,
+            execution_state=EXECUTION_STATE_NOT_STARTED,
         )
     packet_path = attempt_dir / PACKET_NAME
     journal_path = attempt_dir / JOURNAL_NAME
@@ -1768,55 +1831,55 @@ async def run_local_attempt(
         _atomic_json(packet_path, initial)
         _atomic_json(
             attempt_dir / EXIT_STATUS_NAME,
-            {"status": "PENDING", "exit_code": None, "terminal_result": "MISSING"},
+            {
+                "status": "PENDING",
+                "exit_code": None,
+                "terminal_result": "MISSING",
+                "execution_state": EXECUTION_STATE_NOT_STARTED,
+            },
         )
     except Exception as exc:
         safe_error = sanitize_exception(exc)
-        if proposal_reader is not None:
-            try:
-                await _close_resource(proposal_reader)
-            except Exception:
-                pass
         return LocalAttemptResult(
             status="INCOMPLETE",
             exit_code=2,
             packet_path=packet_path if packet_path.exists() else None,
             journal_path=journal_path,
             terminal_status="MISSING",
-            reason=f"initial diagnostic packet failed before secrets: {safe_error}",
+            reason=_local_failure_message(LOCAL_REASON_INITIAL_PACKET, safe_error),
             preview=preview,
             provenance=_compact_provenance(proposal_provenance),
+            reason_code=LOCAL_REASON_INITIAL_PACKET,
+            execution_state=EXECUTION_STATE_PRE_EXECUTION_STOP,
         )
 
     secrets: SecretProvider | None = None
-    reader: Any | None = proposal_reader
+    reader: Any | None = None
     execution_client: Any | None = None
     stage = "secret_input"
     packet = initial
     metadata_provenance: dict[str, Any] | None = None
     final_provenance: dict[str, Any] | None = None
     result_provenance: Mapping[str, Any] | None = _compact_provenance(proposal_provenance)
-    final_revalidation_complete = False
-    quote_changed = False
+    selection_complete = False
     config: HandoffConfig | None = None
     terminal_recorded = False
     result: HandoffResult | None = None
     exit_code: int | None = None
     try:
         # This is the first point at which either selected private key may be
-        # requested.  In automatic mode the public reader was already opened
-        # without a secret provider and is reused for final read-only checks.
+        # requested.  Automatic mode deliberately resolves its price only
+        # after these keys have been loaded and the owner has confirmed LAUNCH.
         secrets = secret_provider_factory(active_inputs)
         _prime_secrets(secrets, active_inputs)
-        stage = "market_metadata"
-        if reader is None:
-            reader = (market_reader_factory or default_market_reader_factory)(active_inputs, secrets)
+        stage = "market_quote_selection" if active_inputs.automatic_price_selection else "market_metadata"
         if active_inputs.automatic_price_selection:
             # Establish an honest unavailable final observation before any
             # post-launch read.  A partial read or malformed response must
             # still leave a diagnosable final slot in the failure packet.
-            stage = "market_quote_revalidation"
             final_provenance = {
+                "status": "POST_LAUNCH_SELECTION_PENDING",
+                "selection": "one fresh public metadata/book read after LAUNCH",
                 "metadata": None,
                 "book": None,
                 "prices": None,
@@ -1825,6 +1888,7 @@ async def run_local_attempt(
                 "proposal": _compact_provenance(proposal_provenance),
                 "final": _compact_provenance(final_provenance),
             }
+        reader = (market_reader_factory or default_market_reader_factory)(active_inputs, secrets)
         raw_metadata = await reader.resolve_market(active_inputs.market_symbol)
         metadata_provenance = (
             _safe_metadata_provenance(
@@ -1883,44 +1947,35 @@ async def run_local_attempt(
                 },
             }
             final_book = _as_order_book_snapshot(raw_final_book, metadata)
-            revalidation_now = _clock_now(effective_clock)
-            final_proposal = select_automatic_prices(
+            selected_now = _clock_now(effective_clock)
+            proposal = select_automatic_prices(
                 active_inputs.direction,
                 metadata,
                 final_book,
                 quantity=active_inputs.quantity,
-                now=revalidation_now,
+                now=selected_now,
                 freshness_seconds=active_inputs.freshness_seconds,
             )
-            final_provenance["prices"] = final_proposal.as_dict()
-            assert proposal is not None
-            assert proposal_metadata is not None
-            _validate_original_proposal_fresh(
-                proposal_metadata,
-                proposal,
-                now=revalidation_now,
-                freshness_seconds=active_inputs.freshness_seconds,
-            )
-            quote_changed = proposal is None or (
-                final_proposal.market_id != proposal.market_id
-                or final_proposal.symbol != proposal.symbol
-                or final_proposal.source_limit_price != proposal.source_limit_price
-                or final_proposal.receiver_worst_price != proposal.receiver_worst_price
+            final_provenance["prices"] = proposal.as_dict()
+            final_provenance["status"] = "POST_LAUNCH_SELECTED"
+            active_inputs = replace(
+                active_inputs,
+                source_limit_price=proposal.source_limit_price,
+                receiver_worst_price=proposal.receiver_worst_price,
+                automatic_price_selection_requested=True,
             )
             result_provenance = {
                 "proposal": _compact_provenance(proposal_provenance),
                 "final": _compact_provenance(final_provenance),
             }
-            final_revalidation_complete = True
+            selection_complete = True
             packet = {
                 **packet,
                 "provenance": {
                     **packet.get("provenance", {}),
-                    "status": (
-                        "FINAL_REVALIDATION_FAILED"
-                        if quote_changed
-                        else "FINAL_REVALIDATED"
-                    ),
+                    # Keep the HCR-11 status spelling for packet consumers;
+                    # the final slot now records the one post-LAUNCH selection.
+                    "status": "FINAL_REVALIDATED",
                     "metadata": metadata_provenance,
                     "proposal": proposal_provenance,
                     "final": final_provenance,
@@ -1930,10 +1985,10 @@ async def run_local_attempt(
         config = active_inputs.handoff_config(metadata.market_id)
         packet_provenance: dict[str, Any] = {
             "status": "OBSERVED" if not active_inputs.automatic_price_selection else (
-                "FINAL_REVALIDATION_FAILED" if quote_changed else "FINAL_REVALIDATED"
+                "FINAL_REVALIDATED" if selection_complete else "FINAL_REVALIDATION_FAILED"
             ),
             "source": (
-                "fresh public proposal before owner launch plus exact metadata/order-book revalidation after launch"
+                "one fresh public metadata/order-book selection after owner launch"
                 if active_inputs.automatic_price_selection
                 else "fresh lighter-sdk orderBookDetails observation after owner launch"
             ),
@@ -1945,14 +2000,38 @@ async def run_local_attempt(
             **packet,
             "config": _config_packet(active_inputs, config),
             "provenance": packet_provenance,
+            "execution": _execution_packet(EXECUTION_STATE_READY),
         }
-        # Persist the final price check before entering the engine.  If the
-        # exact quote changed, the catch path preserves this evidence and no
-        # mutation client has been constructed yet.
+        # Persist the selected price and its source observation before entering
+        # the engine.  The packet is the durable evidence barrier for this
+        # launcher; no repricing or retry is possible after it is written.
+        stage = "packet"
         _atomic_json(packet_path, packet)
-        if active_inputs.automatic_price_selection and quote_changed:
-            raise ContractError(
-                "fresh public quote changed after launch; no repricing or retry is permitted"
+        # A process can be interrupted after this point, including while an
+        # engine client or its first dispatch is being admitted.  Persist an
+        # UNKNOWN marker before that admission so a surviving packet never
+        # claims that the engine was not reached.
+        _atomic_json(
+            active_inputs.exit_status_path,
+            {
+                "status": "PENDING",
+                "exit_code": None,
+                "terminal_result": "MISSING",
+                "execution_state": EXECUTION_STATE_UNKNOWN,
+            },
+        )
+        packet = {
+            **packet,
+            "execution": _execution_packet(EXECUTION_STATE_UNKNOWN),
+        }
+        _atomic_json(packet_path, packet)
+        if active_inputs.automatic_price_selection and proposal is not None and output_fn is not None:
+            output_fn(
+                format_local_attempt_selection(
+                    inputs,
+                    proposal,
+                    sdk_version=getattr(reader, "sdk_version", None),
+                )
             )
         await _close_resource(reader)
         reader = None
@@ -1977,6 +2056,7 @@ async def run_local_attempt(
         terminal_recorded = True
         packet = {
             **packet,
+            "execution": _execution_packet(EXECUTION_STATE_TERMINAL_RECORDED),
             "terminal": {
                 "status": "RECORDED",
                 "result_file": str(active_inputs.terminal_result_path),
@@ -2000,6 +2080,7 @@ async def run_local_attempt(
                     "exit_code": exit_code,
                     "terminal_result": "RECORDED",
                     "outcome": result.outcome.value,
+                    "execution_state": EXECUTION_STATE_TERMINAL_RECORDED,
                 },
             )
             _atomic_json(packet_path, packet)
@@ -2016,10 +2097,12 @@ async def run_local_attempt(
                         "packet_version": PACKET_VERSION,
                         "status": "INCOMPLETE",
                         "exit_code": 2,
-                        "terminal_result": "RECORDED",
-                        "diagnostic_finalization": "INCOMPLETE",
-                        "error_class": packet_write_error,
-                    },
+                    "terminal_result": "RECORDED",
+                    "diagnostic_finalization": "INCOMPLETE",
+                    "error_class": packet_write_error,
+                    "reason_code": LOCAL_REASON_PACKET_FINALIZATION,
+                    "execution_state": EXECUTION_STATE_TERMINAL_RECORDED,
+                },
                 )
             except Exception:
                 pass
@@ -2031,11 +2114,15 @@ async def run_local_attempt(
                 terminal_status="RECORDED",
                 result=result,
                 reason=(
-                    "terminal result recorded; diagnostic packet finalization "
-                    f"incomplete: {packet_write_error}"
+                    _local_failure_message(
+                        LOCAL_REASON_PACKET_FINALIZATION,
+                        packet_write_error,
+                    )
                 ),
                 preview=preview,
                 provenance=result_provenance,
+                reason_code=LOCAL_REASON_PACKET_FINALIZATION,
+                execution_state=EXECUTION_STATE_TERMINAL_RECORDED,
             )
         return LocalAttemptResult(
             status="COMPLETED",
@@ -2047,6 +2134,7 @@ async def run_local_attempt(
             reason=None,
             preview=preview,
             provenance=result_provenance,
+            execution_state=EXECUTION_STATE_TERMINAL_RECORDED,
         )
     except Exception as exc:
         safe_error = sanitize_exception(exc)
@@ -2058,32 +2146,48 @@ async def run_local_attempt(
                 journal_path=journal_path,
                 terminal_status="RECORDED",
                 result=result,
-                reason=f"terminal result recorded; diagnostic packet finalization incomplete: {safe_error}",
+                reason=_local_failure_message(
+                    LOCAL_REASON_PACKET_FINALIZATION,
+                    safe_error,
+                ),
                 preview=preview,
                 provenance=result_provenance,
+                reason_code=LOCAL_REASON_PACKET_FINALIZATION,
+                execution_state=EXECUTION_STATE_TERMINAL_RECORDED,
             )
+        reason_code = _classify_local_error(exc, stage=stage) or LOCAL_REASON_TERMINAL_MISSING
+        execution_state = (
+            EXECUTION_STATE_UNKNOWN
+            if stage == "engine"
+            else EXECUTION_STATE_PRE_EXECUTION_STOP
+        )
         if active_inputs.automatic_price_selection and final_provenance is not None:
             result_provenance = {
                 "proposal": _compact_provenance(proposal_provenance),
                 "final": _compact_provenance(final_provenance),
             }
-            if not final_revalidation_complete:
-                packet = {
-                    **packet,
-                    "provenance": {
-                        **packet.get("provenance", {}),
-                        "status": "FINAL_REVALIDATION_FAILED",
-                        "metadata": metadata_provenance,
-                        "proposal": proposal_provenance,
-                        "final": final_provenance,
-                    },
-                }
+            packet = {
+                **packet,
+                "provenance": {
+                    **packet.get("provenance", {}),
+                    "status": (
+                        "FINAL_REVALIDATED"
+                        if selection_complete
+                        else "FINAL_REVALIDATION_FAILED"
+                    ),
+                    "metadata": metadata_provenance,
+                    "proposal": proposal_provenance,
+                    "final": final_provenance,
+                },
+            }
         missing = {
             "packet_version": PACKET_VERSION,
             "terminal_status": "MISSING",
             "terminal_result": None,
             "error_phase": stage,
             "error_class": safe_error,
+            "reason_code": reason_code,
+            "execution_state": execution_state,
             "reason": "operation stopped before a terminal engine result was recorded; inspect the journal and known inventory",
         }
         try:
@@ -2097,15 +2201,20 @@ async def run_local_attempt(
                     "terminal_result": "MISSING",
                     "error_phase": stage,
                     "error_class": safe_error,
+                    "reason_code": reason_code,
+                    "execution_state": execution_state,
                 },
             )
             packet = {
                 **packet,
+                "execution": _execution_packet(execution_state, reason_code),
                 "terminal": {
                     "status": "MISSING",
                     "result_file": str(active_inputs.terminal_result_path),
                     "error_phase": stage,
                     "error_class": safe_error,
+                    "reason_code": reason_code,
+                    "execution_state": execution_state,
                     "reason": "terminal engine result is missing; packet is incomplete",
                 },
                 "exit_status": {
@@ -2126,9 +2235,15 @@ async def run_local_attempt(
             packet_path=packet_path,
             journal_path=journal_path,
             terminal_status="MISSING",
-            reason=f"{stage} failed before terminal result: {safe_error}",
+            reason=(
+                _local_failure_message(reason_code, safe_error)
+                if execution_state == EXECUTION_STATE_PRE_EXECUTION_STOP
+                else _local_failure_message(LOCAL_REASON_TERMINAL_MISSING, safe_error)
+            ),
             preview=preview,
             provenance=result_provenance,
+            reason_code=reason_code,
+            execution_state=execution_state,
         )
     finally:
         if reader is not None:
@@ -2152,6 +2267,11 @@ __all__ = [
     "AUTH_TOKEN_LIFETIME_SECONDS",
     "AttemptDirectoryError",
     "AutomaticPriceProposal",
+    "EXECUTION_STATE_NOT_STARTED",
+    "EXECUTION_STATE_PRE_EXECUTION_STOP",
+    "EXECUTION_STATE_READY",
+    "EXECUTION_STATE_TERMINAL_RECORDED",
+    "EXECUTION_STATE_UNKNOWN",
     "DEFAULT_FRESHNESS_SECONDS",
     "DEFAULT_MAX_POLL_COUNT",
     "DEFAULT_ORDER_TIMEOUT_SECONDS",
@@ -2162,6 +2282,18 @@ __all__ = [
     "EXIT_STATUS_NAME",
     "JOURNAL_NAME",
     "LAUNCH_TOKEN",
+    "LOCAL_REASON_ATTEMPT_DIRECTORY",
+    "LOCAL_REASON_INITIAL_PACKET",
+    "LOCAL_REASON_INVALID_OBSERVATION",
+    "LOCAL_REASON_OPERATOR_CANCELLED",
+    "LOCAL_REASON_PACKET_FINALIZATION",
+    "LOCAL_REASON_PACKET_WRITE",
+    "LOCAL_REASON_PRE_EXECUTION",
+    "LOCAL_REASON_PROPOSAL_EXPIRED",
+    "LOCAL_REASON_PUBLIC_READ_FAILED",
+    "LOCAL_REASON_PRICE_CHANGED",
+    "LOCAL_REASON_STALE_OBSERVATION",
+    "LOCAL_REASON_TERMINAL_MISSING",
     "LocalAttemptInputError",
     "LocalAttemptInputs",
     "LocalAttemptResult",
@@ -2171,6 +2303,9 @@ __all__ = [
     "derive_automatic_prices",
     "default_execution_client_factory",
     "default_market_reader_factory",
+    "format_local_attempt_preview",
+    "format_local_attempt_result",
+    "format_local_attempt_selection",
     "preview_payload",
     "run_local_attempt",
     "select_automatic_prices",
