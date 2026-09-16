@@ -421,6 +421,13 @@ class LighterSdkClient:
         raw_details = _model_dict(details)
         _require_success_code(raw_details, "orderBookDetails")
         observed = _select_perp_market(raw_details, market_id, expected_symbol=self.config.market_symbol)
+        # Operator evidence supplies the durable market contract (minimums,
+        # increments, fees and margin provenance), but its timestamp is not a
+        # timestamp for this request.  orderBookDetails has no universally
+        # usable observation timestamp, so bind this returned snapshot to the
+        # completion of the actual read.  An explicitly timestamped fixture is
+        # retained so stale/future saved responses still fail the normal
+        # freshness checks.
         evidence = dict(self.market_evidence)
         try:
             evidence_market_id = int(evidence.get("market_id", market_id))
@@ -442,8 +449,17 @@ class LighterSdkClient:
         evidence.setdefault("market_type", "perp")
         if self.config.environment == "robinhood":
             evidence.setdefault("venue", "robinhood")
-        if "observed_at" not in evidence:
-            raise ContractError("market evidence must include its original observed_at timestamp")
+        observed_at = observed.get("observed_at")
+        required_live_minimums = ("min_base_amount", "min_quote_amount")
+        complete_live_minimums = all(field in observed and observed[field] is not None for field in required_live_minimums)
+        if complete_live_minimums:
+            if observed_at is None:
+                observed_at = self._clock()
+            evidence["observed_at"] = observed_at
+        elif "observed_at" not in evidence:
+            raise ContractError(
+                "incomplete orderBookDetails cannot establish a fresh market minimum observation"
+            )
         # Do not infer status/fees/precision/minimums from undocumented SDK
         # attributes.  Merge only exact named fields supplied by the operator.
         observed_aliases = {
@@ -645,6 +661,7 @@ class LighterSdkClient:
                 "authorized": True,
                 "ready": ready,
                 "margin_available": available,
+                "available_balance": available,
                 "margin_required": margin_required,
                 "fee_rate": fee_rate,
                 "source_identity": account_identity.strip(),
