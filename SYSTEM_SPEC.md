@@ -3,6 +3,14 @@
 SYSTEM_SPEC_VERSION = 4.2
 SPEC_STATUS = FIRST_RAW_RESEARCH_SCANNER_IMPLEMENTED
 
+## HCR-12 amendment — select automatic prices after confirmation
+
+Owner explicitly confirmed on2026-09-16 that automatic prices are selected after LAUNCH. This supersedes HCR-11 pre-confirmation exact-price proposal/equality/original-proposal-age gates for automatic local-attempt only. One LAUNCH approves the fixed accounts, direction, exact quantity, declared limits and existing mirrored one-tick rule. Cancellation/help/preview remains offline and credential-free. After confirmation, load credentials, then obtain one fresh public metadata/book observation and select source price with equal receiver bound. Display selected exact prices/notionals without a second price prompt. No automatic retry/requote or quantity change. Explicit-price operation remains compatible.
+
+Actual observations retain original timestamps and must pass all freshness/identity/status/grid/minimum checks before engine admission. Waiting for human confirmation or keys cannot age a quote that has not yet been obtained. This changes selection ordering, not actual freshness thresholds, fees, margin choice, matching/position semantics or execution strategy. The local result distinguishes a known stop before engine admission from unknown execution, while missing engine terminals remain incomplete. Safe reason codes and concise readable output must not expose SDK exception text or imply current account-wide FLAT status.
+
+Original consumed attempt directories and diagnostic files remain immutable and cannot be reused. Agents develop/test offline synthetic paths only; acceptance/live state is in STATUS/NEXT_TASK.
+
 ## HCR-11 amendment — automatic owner-local proposal and finite defaults
 
 This owner-authorized amendment supersedes HCR-9 manual price/time collection for the local-attempt interface only. Acceptance state is in STATUS/NEXT_TASK. Chief and Builder development/verification are offline synthetic; live operation remains owner-local and NOT_RUN by agents.

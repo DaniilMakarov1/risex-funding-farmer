@@ -1,5 +1,17 @@
 # Current status
 
+## HCR-12 post-LAUNCH automatic selection — ACCEPTED OFFLINE
+
+Candidate4204e10bb2af78b5a36622ca2c319fe16f992fbe accepted by sole Chief01a0a67b-bec7-75d2-9970-e3914b10e445 on2026-09-16. Owner explicitly approved price selection after LAUNCH. Fixed-plan preview/cancellation is offline; keys load before one fresh public metadata/book selection. Obsolete automatic prequote equality/original-age gates are removed; actual freshness/identity/grid/minimum checks, exact quantity, declared timing, explicit-price compatibility and execution strategy remain unchanged. Concise output retains fixed plan, selected price/notional, engine outcome/reason and known inventory. Local failure reasons distinguish proven pre-engine stop from unknown execution; durable UNKNOWN precedes engine admission, including interruption. Missing terminal remains incomplete and no-replay/evidence/secret boundaries remain intact.
+
+Independent complete candidate diff review and26 synthetic scenarios PASS (23 launcher/adverse,2 actual adapter integrations with fake transport,1 interruption). Final clean isolated Python3.11.5/SDK1.1.2 suite4414passed,3skipped,exit0,125.25seconds; unchanged source/test/config hashes and isolated project imports verified. Source fingerprint sha256:0a63c0a4eff2f9d4812193b57a24c1c26005423e75becff25569a6c182427486. Evidence original-root spread-shadow-runs/hood-launch-flow-20260916/chief-v1; exact clean Builder handoff builder-v1/READY_FOR_REVIEW.md. Publication/operator-source evidence is recorded separately in chief-v1/publication.json.
+
+Builder01a0a8a6-b031-7511-9d47-596bd0520440 delivered directly and completed this finite assignment; codex/spread-v1-launch-flow/hood-launch-flow preserved. Luna/max VERIFIED by role, Standard requested/actual speed UNKNOWN; Chief Astra/medium USER_SELECTED, separate telemetry UNKNOWN. No standing Builder assignment, actual financial process or monitoring promise.
+
+Actual owner-live-001 is consumed and immutable: prior HCR-11 source6b3b779 stopped before engine creation because price75789.8 changed to75778.1 in7.7159002seconds; no intent journal/orders from that invocation. This was not stale data and proves no current account-wide FLAT state. Its four file hashes remain unchanged. README now names owner-live-002 for a separate owner-confirmed invocation. No actual credentials/Keychain/private endpoints/signing/orders were run by agents; HCR-12 live outcome remains NOT_RUN. QuantityBTC0.00020, source27331SELL/receiver27337BUY, keyindex4, domain466324 and margin deferral remain selected.
+
+## Historical accepted state (current behavior and attempt state above supersede these snapshots)
+
 ## HCR-11 automatic local-attempt prices/timing — ACCEPTED OFFLINE
 
 Candidate71bbcb45d67df6ec8c421ddb22df2c88d3028960 accepted by sole Chief01a0a67b-bec7-75d2-9970-e3914b10e445 on2026-09-15. Automatic one-tick mirrored public-book proposal, exact unchanged quantity, receiver bound equal to source, eight declared finite defaults, offline unresolved preview/help, bounded proposal before LAUNCH, credential-free cancellation, original-proposal expiry and fresh exact-price revalidation after keys are implemented. Explicit-price invocation remains supported. No engine, strategy, fee, sizing or flattening change.
@@ -10,7 +22,6 @@ Builder01a0a67c-a2b0-7a32-af88-068ed518a6fa delivered directly and is complete; 
 
 Actual credentials, Keychain, private endpoints, signing and orders NOT_RUN by agents. Owner-local attempt remains NOT_RUN; existing owner-live-001 was verified empty/mode0700 without modification. README gives the automatic invocation: no manual numeric price/time questions. Source27331 SELL/receiver27337 BUY, BTC0.00020, keyindex4, Robinhood domain466324 and incremental-margin deferral remain selected. Exact notional is an estimate, not a guaranteed USD16, match or profit. Successful paired opening leaves opposite open inventory. Expired/changed/invalid final checks stop without mutation/repricing/retry; preserve every attempt file and diagnose incomplete results before another operation.
 
-## Historical accepted state
 
 ## HCR-9 local launcher — ACCEPTED OFFLINE
 
