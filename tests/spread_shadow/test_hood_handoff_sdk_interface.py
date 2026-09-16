@@ -261,11 +261,13 @@ async def test_official_orderbook_details_schema_is_selected_without_fee_inventi
             "margin_evidence": "accountLimits fixture",
         },
         signer_factory=lambda **kwargs: FakeSigner(**kwargs),
+        clock=lambda: 2000.0,
     )
     monkeypatch.setattr(LighterSdkClient, "verify_sdk", staticmethod(lambda: None))
     client._lighter = lambda: FakeModule
     metadata = await client.market_metadata(7)
     assert metadata.symbol == "HOOD"
+    assert metadata.observed_at == 2000.0
     assert metadata.price_decimals == 2
     assert metadata.size_decimals == 3
     assert metadata.minimum_quote_amount == Decimal("1")

@@ -953,3 +953,221 @@ def test_cli_random_cycle_preview_is_explicit_and_does_not_consume_cycle(tmp_pat
     assert preview["hold_policy"].endswith("[20,300] after both opening legs are fully reconciled")
     assert preview["close_source_reduce_only"] is True
     assert not cycle_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_close_refuses_position_drift_from_the_opening_lineage(tmp_path):
+    class HoldDriftClock(AdvancingClock):
+        async def sleep(self, seconds: float) -> None:
+            await super().sleep(seconds)
+            if seconds >= 20:
+                self.client.source_position = Decimal("-0.20")
+
+    clock = HoldDriftClock()
+    client = CycleClient(clock)
+    clock.client = client
+    result = await run_random_cycle(
+        cycle_config(tmp_path / "lineage-drift"),
+        client,
+        clock=clock,
+        rng=FixedRng(40, 20),
+    )
+    assert result.outcome is Outcome.UNKNOWN
+    assert "source position changed" in (result.reason or "")
+    assert [(plan.account_index, plan.reduce_only) for plan in client.submissions] == [
+        (11, False),
+        (22, False),
+    ]
+    assert "CLOSING_BLOCKED" in (tmp_path / "lineage-drift" / "cycle.jsonl").read_text()
+
+
+@pytest.mark.asyncio
+async def test_close_refuses_identity_drift_from_the_opening_lineage(tmp_path):
+    class HoldIdentityClock(AdvancingClock):
+        async def sleep(self, seconds: float) -> None:
+            await super().sleep(seconds)
+            if seconds >= 20:
+                self.client.identity_changed = True
+
+    class HoldIdentityClient(CycleClient):
+        def __init__(self, clock: AdvancingClock) -> None:
+            super().__init__(clock)
+            self.identity_changed = False
+
+        async def account_snapshot(self, account_index: int, market_id: int) -> AccountSnapshot:
+            snapshot = await super().account_snapshot(account_index, market_id)
+            if self.identity_changed and account_index == self.source_account_index:
+                return replace(snapshot, source_identity="manual-account")
+            return snapshot
+
+    clock = HoldIdentityClock()
+    client = HoldIdentityClient(clock)
+    clock.client = client
+    result = await run_random_cycle(
+        cycle_config(tmp_path / "lineage-identity-drift"),
+        client,
+        clock=clock,
+        rng=FixedRng(40, 20),
+    )
+    assert result.outcome is Outcome.UNKNOWN
+    assert "identity changed" in (result.reason or "")
+    assert [(plan.account_index, plan.reduce_only) for plan in client.submissions] == [
+        (11, False),
+        (22, False),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fallback_polls_fresh_terminal_order_and_keeps_failure_reason(tmp_path):
+    class StaleFallbackClient(CycleClient):
+        async def lookup_order(self, *args, **kwargs):
+            value = await super().lookup_order(*args, **kwargs)
+            fallback_ids = {plan.client_order_index for plan in self.fallback_plans}
+            if value is not None and value.client_order_index in fallback_ids:
+                return replace(value, observed_at=self.clock.now() - 100)
+            return value
+
+    clock = AdvancingClock()
+    client = StaleFallbackClient(clock, partial_close=True)
+    result = await run_random_cycle(
+        cycle_config(tmp_path / "stale-fallback"),
+        client,
+        clock=clock,
+        rng=FixedRng(40, 20),
+    )
+    assert result.outcome is Outcome.UNKNOWN
+    assert "fallback order" in (result.reason or "")
+    assert "stale" in (result.reason or "")
+    assert len(client.fallback_plans) == 1
+    assert client.receiver_position == Decimal("0.20")
+
+    class DelayedFallbackClient(CycleClient):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.delayed_order_ids: set[str] = set()
+
+        async def lookup_order(self, *args, **kwargs):
+            value = await super().lookup_order(*args, **kwargs)
+            fallback_ids = {plan.client_order_index for plan in self.fallback_plans}
+            if (
+                value is not None
+                and value.client_order_index in fallback_ids
+                and value.order_id not in self.delayed_order_ids
+            ):
+                self.delayed_order_ids.add(value.order_id)
+                return None
+            return value
+
+    delayed_clock = AdvancingClock()
+    delayed_client = DelayedFallbackClient(delayed_clock, partial_close=True)
+    delayed_result = await run_random_cycle(
+        cycle_config(tmp_path / "delayed-fallback"),
+        delayed_client,
+        clock=delayed_clock,
+        rng=FixedRng(40, 20),
+    )
+    assert delayed_result.outcome is Outcome.SUCCESS
+    assert len(delayed_client.fallback_plans) == 2
+    assert delayed_client.source_position == Decimal("0")
+    assert delayed_client.receiver_position == Decimal("0")
+
+
+@pytest.mark.asyncio
+async def test_fallback_journal_retains_receipts_and_account_state(tmp_path):
+    clock = AdvancingClock()
+    client = CycleClient(clock, partial_close=True)
+    cycle_path = tmp_path / "fallback-evidence"
+    result = await run_random_cycle(
+        cycle_config(cycle_path),
+        client,
+        clock=clock,
+        rng=FixedRng(40, 20),
+    )
+    assert result.outcome is Outcome.SUCCESS
+    rows = [json.loads(line) for line in (cycle_path / "cycle.jsonl").read_text().splitlines()]
+    reconciled = [row for row in rows if row["event"] == "FALLBACK_RECONCILED"]
+    assert len(reconciled) == 2
+    for row in reconciled:
+        payload = row["payload"]
+        assert payload["receipt"]["accepted"] is True
+        assert payload["before"]["source_identity"]
+        assert payload["after"]["signed_position"] == "0.00"
+        assert payload["history_complete"] is True
+        assert payload["history_pages"]
+        assert payload["trades"]
+        assert payload["trades"][0]["trade_id"].startswith("pair-trade-")
+
+
+def test_cli_random_cycle_requires_interactive_launch_before_client_or_keys(tmp_path, monkeypatch, capsys):
+    config_path = tmp_path / "random-cycle.json"
+    evidence_path = tmp_path / "market-evidence.json"
+    cycle_path = tmp_path / "cancelled-cycle"
+    config_path.write_text(
+        json.dumps(
+            {
+                "market_id": 7,
+                "market_symbol": "BTC",
+                "direction": "LONG",
+                "source_account_index": 11,
+                "receiver_account_index": 22,
+                "api_key_index": 4,
+                "cycle_dir": str(cycle_path),
+            }
+        ),
+        encoding="utf-8",
+    )
+    evidence_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr("builtins.input", lambda _prompt: "CANCEL")
+
+    def fail_client(*args, **kwargs):
+        raise AssertionError("SDK client was constructed before LAUNCH")
+
+    monkeypatch.setattr(cli_module, "LighterSdkClient", fail_client)
+    assert cli_module.main(
+        [
+            "random-cycle",
+            "--config",
+            str(config_path),
+            "--market-evidence",
+            str(evidence_path),
+            "--execute",
+            "--i-understand-one-attempt-live-operation",
+            "--confirm-plan",
+        ]
+    ) == 0
+    output = capsys.readouterr().out
+    assert "pending LAUNCH" in output
+    assert "cancelled before LAUNCH" in output
+    assert not cycle_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_fallback_interruption_after_receipt_persists_attempt_evidence(tmp_path):
+    class InterruptingFallbackLookupClient(CycleClient):
+        def __init__(self, clock: AdvancingClock) -> None:
+            super().__init__(clock, partial_close=True)
+            self.interrupted = False
+
+        async def lookup_order(self, *args, **kwargs):
+            value = await super().lookup_order(*args, **kwargs)
+            fallback_ids = {plan.client_order_index for plan in self.fallback_plans}
+            if (
+                value is not None
+                and value.client_order_index in fallback_ids
+                and not self.interrupted
+            ):
+                self.interrupted = True
+                raise asyncio.CancelledError()
+            return value
+
+    clock = AdvancingClock()
+    client = InterruptingFallbackLookupClient(clock)
+    config = cycle_config(tmp_path / "interrupted-fallback-lookup")
+    with pytest.raises(asyncio.CancelledError):
+        await run_random_cycle(config, client, clock=clock, rng=FixedRng(40, 20))
+    rows = [json.loads(line) for line in config.journal_path.read_text().splitlines()]
+    evidence = [row for row in rows if row["event"] == "FALLBACK_ATTEMPT_EVIDENCE"]
+    assert len(evidence) == 1
+    assert evidence[0]["payload"]["receipt"]["order_id"]
+    assert evidence[0]["payload"]["plan"]["reduce_only"] is True
+    assert any(row["event"] == "CYCLE_INTERRUPTED" for row in rows)

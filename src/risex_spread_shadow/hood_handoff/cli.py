@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
-from .contracts import Direction, HandoffConfig, OperationMode
+from .contracts import Direction, HandoffConfig, OperationMode, PreflightBlocked
 from .engine import run_handoff
 from .journal import sanitize_exception
 from .keychain import (
@@ -22,12 +22,13 @@ from .keychain import (
     read_hidden_secret,
 )
 from .local_attempt import (
+    LAUNCH_TOKEN,
     LocalAttemptInputError,
     collect_local_attempt_inputs,
     format_local_attempt_result,
     run_local_attempt,
 )
-from .random_cycle import RandomCycleConfig, run_random_cycle
+from .random_cycle import RandomCycleConfig, RandomCycleEngine, run_random_cycle
 from .readiness import (
     ReadinessCheck,
     ReadinessConfig,
@@ -657,6 +658,26 @@ async def _run_local_attempt(args: argparse.Namespace) -> int:
     return result.exit_code
 
 
+def _prompt_random_cycle_launch(config: RandomCycleConfig) -> bool:
+    """Require the one interactive launch boundary before any secret access."""
+
+    print(
+        "HCR-17 random-cycle pending LAUNCH: "
+        f"market={config.market_symbol} direction={config.direction.value} "
+        f"source={config.source_account_index} receiver={config.receiver_account_index}; "
+        "one random legal quantity tick, one hold in [20,300] seconds, then paired reduce-only close."
+    )
+    try:
+        response = input(f"Type {LAUNCH_TOKEN} to launch this one random cycle: ")
+    except (EOFError, KeyboardInterrupt):
+        print("random-cycle cancelled before LAUNCH; no credentials or orders were used")
+        return False
+    if not isinstance(response, str) or response.strip() != LAUNCH_TOKEN:
+        print("random-cycle cancelled before LAUNCH; no credentials or orders were used")
+        return False
+    return True
+
+
 async def _run_random_cycle(args: argparse.Namespace, value: Mapping[str, Any]) -> int:
     """Preview or launch exactly one HCR-17 random cycle."""
 
@@ -733,6 +754,15 @@ async def _run_random_cycle(args: argparse.Namespace, value: Mapping[str, Any]) 
     if config.api_key_index is None:
         raise SystemExit("random-cycle execution requires api_key_index")
     evidence = _load_json(args.market_evidence, "market evidence")
+    # This check is deliberately read-only.  The engine creates and claims the
+    # slot only after the explicit prompt, while this early validation avoids
+    # touching credentials when an old/occupied attempt would be refused.
+    try:
+        RandomCycleEngine.validate_cycle_directory(config.cycle_dir)
+    except PreflightBlocked as exc:
+        raise SystemExit(f"random-cycle launch refused: {exc}") from None
+    if not _prompt_random_cycle_launch(config):
+        return 0
     account_indices = (config.source_account_index, config.receiver_account_index)
     if args.keychain or args.keychain_replace:
         secrets: Any = _keychain_provider(config, account_indices, replace=args.keychain_replace)

@@ -504,6 +504,108 @@ def _metadata_payload(metadata: MarketMetadata) -> dict[str, Any]:
     }
 
 
+def _order_payload(order: OrderSnapshot | None) -> dict[str, Any] | None:
+    """Serialize one order with only the reconciliation fields we trust."""
+
+    if order is None:
+        return None
+    return {
+        "account_index": order.account_index,
+        "market_id": order.market_id,
+        "order_id": order.order_id,
+        "client_order_index": order.client_order_index,
+        "status": order.status,
+        "side": order.side,
+        "order_type": order.order_type,
+        "time_in_force": order.time_in_force,
+        "reduce_only": order.reduce_only,
+        "initial_quantity": format(order.initial_quantity, "f"),
+        "remaining_quantity": format(order.remaining_quantity, "f"),
+        "filled_quantity": format(order.filled_quantity, "f"),
+        "price": None if order.price is None else format(order.price, "f"),
+        "observed_at": order.observed_at,
+    }
+
+
+def _trade_payload(trade: TradeReceipt) -> dict[str, Any]:
+    """Serialize a sanitized trade receipt for durable post-run review."""
+
+    return {
+        "trade_id": trade.trade_id,
+        "account_index": trade.account_index,
+        "market_id": trade.market_id,
+        "order_id": trade.order_id,
+        "client_order_index": trade.client_order_index,
+        "side": trade.side,
+        "quantity": format(trade.quantity, "f"),
+        "price": format(trade.price, "f"),
+        "fee": None if trade.fee is None else format(trade.fee, "f"),
+        "counterparty_account_index": trade.counterparty_account_index,
+        "counterparty_order_id": trade.counterparty_order_id,
+        "counterparty_client_order_index": trade.counterparty_client_order_index,
+        "observed_at": trade.observed_at,
+    }
+
+
+def _account_payload(account: AccountSnapshot | None) -> dict[str, Any] | None:
+    """Serialize the account state needed to verify a fallback admission."""
+
+    if account is None:
+        return None
+    return {
+        "account_index": account.account_index,
+        "market_id": account.market_id,
+        "signed_position": format(account.signed_position, "f"),
+        "active_orders": [_order_payload(order) for order in account.active_orders],
+        "observed_at": account.observed_at,
+        "authorized": account.authorized,
+        "ready": account.ready,
+        "margin_available": (
+            None if account.margin_available is None else format(account.margin_available, "f")
+        ),
+        "margin_required": (
+            None if account.margin_required is None else format(account.margin_required, "f")
+        ),
+        "fee_rate": None if account.fee_rate is None else format(account.fee_rate, "f"),
+        "source_identity": account.source_identity,
+        "incremental_margin_required": (
+            None
+            if account.incremental_margin_required is None
+            else format(account.incremental_margin_required, "f")
+        ),
+        "incremental_margin_evidence": account.incremental_margin_evidence,
+        "available_balance": (
+            None if account.available_balance is None else format(account.available_balance, "f")
+        ),
+        "margin_evidence": (
+            None if account.margin_evidence is None else account.margin_evidence.as_dict()
+        ),
+    }
+
+
+def _receipt_payload(receipt: MutationReceipt | None) -> dict[str, Any] | None:
+    if receipt is None:
+        return None
+    return {
+        "accepted": receipt.accepted,
+        "order_id": receipt.order_id,
+        "tx_hash": receipt.tx_hash,
+        "response_code": receipt.response_code,
+        "error": receipt.error,
+    }
+
+
+def _history_page_payload(page: Any) -> dict[str, Any]:
+    """Keep page boundaries and every sanitized trade receipt."""
+
+    return {
+        "trades": [_trade_payload(trade) for trade in page.trades],
+        "orders": [_order_payload(order) for order in page.orders],
+        "next_cursor": page.next_cursor,
+        "complete": page.complete,
+    }
+
+
 def _as_book(value: OrderBookSnapshot | Mapping[str, Any], metadata: MarketMetadata) -> OrderBookSnapshot:
     if isinstance(value, OrderBookSnapshot):
         return value
@@ -732,6 +834,28 @@ class RandomCycleEngine:
             raise PreflightBlocked("cycle directory is already consumed")
         os.chmod(path, 0o700)
 
+    @staticmethod
+    def validate_cycle_directory(path: Path) -> None:
+        """Check a cycle slot without creating or consuming it.
+
+        The launcher uses this read-only check after LAUNCH is requested but
+        before it touches a Keychain or constructs an SDK client.  Creation
+        and the durable claim still happen inside ``execute`` so cancelling a
+        prompt does not leave an empty slot that falsely looks consumed.
+        """
+
+        if path.is_symlink():
+            raise PreflightBlocked("cycle directory must not be a symlink")
+        if not path.exists():
+            return
+        if not path.is_dir():
+            raise PreflightBlocked("cycle path exists and is not a directory")
+        info = path.stat()
+        if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            raise PreflightBlocked("cycle directory must be owner-only")
+        if any(path.iterdir()):
+            raise PreflightBlocked("cycle directory is already consumed")
+
     async def _execute_locked(self, config: RandomCycleConfig, journal: DurableJournal) -> RandomCycleResult:
         self._stage = "PREFLIGHT"
         metadata = _as_market(
@@ -836,7 +960,7 @@ class RandomCycleEngine:
             return result
 
         self._stage = "CLOSING"
-        closing, fallback_seed = await self._run_paired_close(config, journal, selection)
+        closing, fallback_seed = await self._run_paired_close(config, journal, selection, opening)
         self._stage = "CLOSING_RECONCILED"
         self._stage = "FALLBACK"
         fallbacks, remaining_source, remaining_receiver = await self._fallback_residuals(
@@ -882,8 +1006,13 @@ class RandomCycleEngine:
             outcome = Outcome.UNKNOWN
         else:
             outcome = Outcome.PARTIAL
+        fallback_reason = next(
+            (item.reason for item in fallbacks if item.reason),
+            None,
+        )
         reason = None if outcome is Outcome.SUCCESS else (
-            (closing.reason if closing is not None else fallback_seed)
+            fallback_reason
+            or (closing.reason if closing is not None else fallback_seed)
             or "cycle closure did not prove exact flat positions"
         )
         result = RandomCycleResult(
@@ -996,21 +1125,58 @@ class RandomCycleEngine:
         config: RandomCycleConfig,
         journal: DurableJournal,
         selection: RandomCycleSelection,
+        opening: HandoffResult,
     ) -> tuple[HandoffResult | None, str | None]:
+        def blocked(reason: str) -> tuple[None, str]:
+            journal.append("CLOSING_BLOCKED", {"reason": reason})
+            return None, reason
+
         try:
+            # Closing is admitted only against the exact, independently
+            # reconciled opening.  A fresh read is evidence for freshness and
+            # readiness; it is never a new baseline that can adopt a manual
+            # or external position change during the hold.
+            if (
+                opening.outcome is not Outcome.SUCCESS
+                or opening.plan is None
+                or opening.source is None
+                or opening.receiver is None
+            ):
+                return blocked("opening reconciliation did not prove close lineage")
+            opening_plan = opening.plan
+            opening_source = opening.source
+            opening_receiver = opening.receiver
+            if (
+                opening_plan.operation_mode is not OperationMode.PAIRED_OPENING
+                or opening_source.position_after is None
+                or opening_receiver.position_after is None
+                or not opening_source.history_complete
+                or not opening_receiver.history_complete
+                or opening_source.unknown_reasons
+                or opening_receiver.unknown_reasons
+            ):
+                return blocked("opening reconciliation is incomplete for a dependent close")
             metadata = _as_market(await self._bounded(self.client.market_metadata(config.market_id), config, "closing market read"))
             book = _as_book(await self._bounded(self._order_book(config.market_id), config, "closing order book read"), metadata)
             now = self.clock.now()
             _validate_market_book(config, metadata, book, now)
             source, receiver = await self._accounts(config, now)
+            if source.source_identity != opening_plan.source_identity:
+                return blocked("source account identity changed during the holding period")
+            if receiver.source_identity != opening_plan.receiver_identity:
+                return blocked("receiver account identity changed during the holding period")
+            if source.signed_position != opening_source.position_after:
+                return blocked("source position changed during the holding period")
+            if receiver.signed_position != opening_receiver.position_after:
+                return blocked("receiver position changed during the holding period")
             source_sign, receiver_sign = _expected_cycle_signs(config.direction)
             source_residual = _position_residual(source.signed_position, source_sign, selection.quantity)
             receiver_residual = _position_residual(receiver.signed_position, receiver_sign, selection.quantity)
             if source_residual is None or receiver_residual is None:
-                return None, "cycle position changed direction or exceeded the selected quantity before paired close"
+                return blocked("cycle position changed direction or exceeded the selected quantity before paired close")
             paired_quantity = min(source_residual, receiver_residual)
             if paired_quantity <= 0:
-                return None, "paired close has no two-account confirmed residual"
+                return blocked("paired close has no two-account confirmed residual")
             close_direction = _inverse(config.direction)
             proposal = select_automatic_prices(close_direction, metadata, book, quantity=paired_quantity, now=now, freshness_seconds=config.freshness_seconds)
             close_config = self._handoff_config(
@@ -1020,8 +1186,8 @@ class RandomCycleEngine:
                 proposal.receiver_worst_price,
                 config.closing_journal_path,
                 OperationMode.PAIRED_CLOSING,
-                source.signed_position,
-                receiver.signed_position,
+                opening_source.position_after,
+                opening_receiver.position_after,
             )
             journal.append("CLOSING_PLAN_READY", {"config": opening_config_binding(close_config), "paired_quantity": format(paired_quantity, "f")})
             closing = await run_handoff(close_config, _BoundMarketClient(self.client, metadata), clock=self.clock)
@@ -1265,6 +1431,28 @@ class RandomCycleEngine:
 
         try:
             final_source, final_receiver = await self._accounts(config, self.clock.now())
+            final = {
+                config.source_account_index: final_source,
+                config.receiver_account_index: final_receiver,
+            }
+            if any(
+                final[candidate].source_identity != current[candidate].source_identity
+                for candidate in (config.source_account_index, config.receiver_account_index)
+            ):
+                journal.append(
+                    "FALLBACK_STOPPED_STATE_CHANGED",
+                    {"reason": "final fallback account identity changed after reconciliation"},
+                )
+                return results, None, None
+            if any(
+                final[candidate].signed_position != current[candidate].signed_position
+                for candidate in (config.source_account_index, config.receiver_account_index)
+            ):
+                journal.append(
+                    "FALLBACK_STOPPED_STATE_CHANGED",
+                    {"reason": "final fallback account position changed after reconciliation"},
+                )
+                return results, None, None
             return results, final_source.signed_position, final_receiver.signed_position
         except asyncio.CancelledError:
             raise
@@ -1275,6 +1463,164 @@ class RandomCycleEngine:
             )
             return results, None, None
 
+    async def _poll_fallback_order(
+        self,
+        config: RandomCycleConfig,
+        journal: DurableJournal,
+        plan: OrderPlan,
+        receipt: MutationReceipt,
+        *,
+        attempt_ordinal: int,
+    ) -> tuple[OrderSnapshot | None, str | None]:
+        """Wait for one fresh terminal observation without resubmitting it."""
+
+        deadline = self.clock.now() + config.order_timeout_seconds
+        last_reason = "fallback order was not visible"
+        for poll in range(1, config.max_poll_count + 1):
+            if self.clock.now() > deadline:
+                break
+            try:
+                raw = await self._bounded(
+                    self.client.lookup_order(
+                        plan.account_index,
+                        plan.market_id,
+                        order_id=receipt.order_id,
+                        client_order_index=plan.client_order_index,
+                    ),
+                    config,
+                    "fallback order read",
+                )
+                order = _as_order(raw)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last_reason = f"fallback order read failed: {sanitize_exception(exc)}"
+                journal.append(
+                    "FALLBACK_ORDER_OBSERVATION",
+                    {
+                        "account_index": plan.account_index,
+                        "attempt": attempt_ordinal,
+                        "poll": poll,
+                        "order": None,
+                        "reason": last_reason,
+                    },
+                )
+                order = None
+            if order is not None:
+                now = self.clock.now()
+                if receipt.order_id is not None and order.order_id != str(receipt.order_id):
+                    return None, "fallback order identifier conflicts with the dispatched receipt"
+                if not self._fallback_order_identity_matches(order, plan):
+                    return None, "fallback order identity or parameters conflict with the plan"
+                if order.observed_at > now:
+                    last_reason = "fallback order observation is from the future"
+                elif now - order.observed_at > config.freshness_seconds:
+                    last_reason = "fallback order observation is stale"
+                elif not order.terminal:
+                    last_reason = "fallback order is not terminal"
+                elif not self._fallback_order_matches(order, plan):
+                    return None, "fallback terminal order fields conflict with the plan"
+                else:
+                    journal.append(
+                        "FALLBACK_ORDER_OBSERVATION",
+                        {
+                            "account_index": plan.account_index,
+                            "attempt": attempt_ordinal,
+                            "poll": poll,
+                            "order": _order_payload(order),
+                        },
+                    )
+                    return order, None
+                journal.append(
+                    "FALLBACK_ORDER_OBSERVATION",
+                    {
+                        "account_index": plan.account_index,
+                        "attempt": attempt_ordinal,
+                        "poll": poll,
+                        "order": _order_payload(order),
+                        "reason": last_reason,
+                    },
+                )
+            if poll < config.max_poll_count:
+                remaining = deadline - self.clock.now()
+                if remaining <= 0:
+                    break
+                await self.clock.sleep(min(config.poll_interval_seconds, remaining))
+        return None, f"fallback order did not become a fresh terminal observation: {last_reason}"
+
+    async def _read_fallback_history(
+        self,
+        config: RandomCycleConfig,
+        plan: OrderPlan,
+        order: OrderSnapshot,
+        *,
+        attempt_ordinal: int,
+    ) -> tuple[list[TradeReceipt], list[Any], str | None]:
+        """Read all bounded history pages for one fallback order."""
+
+        trades: list[TradeReceipt] = []
+        pages: list[Any] = []
+        seen_trade_ids: set[str] = set()
+        cursor: str | None = None
+        deadline = self.clock.now() + config.reconcile_timeout_seconds
+        for page_number in range(1, config.max_poll_count + 1):
+            if self.clock.now() > deadline:
+                return trades, pages, "fallback trade history reconciliation deadline exceeded"
+            try:
+                page = _as_page(
+                    await self._bounded(
+                        self.client.list_trades(
+                            plan.account_index,
+                            plan.market_id,
+                            order_id=order.order_id,
+                            cursor=cursor,
+                            limit=100,
+                        ),
+                        config,
+                        "fallback trade history read",
+                    )
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                return trades, pages, f"fallback trade history read failed: {sanitize_exception(exc)}"
+            pages.append(page)
+            now = self.clock.now()
+            try:
+                for trade in page.trades:
+                    if (
+                        trade.account_index != plan.account_index
+                        or trade.market_id != plan.market_id
+                        or trade.order_id != order.order_id
+                    ):
+                        raise ContractError("fallback trade history contains a foreign or conflicting receipt")
+                    if trade.trade_id in seen_trade_ids:
+                        raise ContractError("fallback trade history contains a duplicate receipt")
+                    seen_trade_ids.add(trade.trade_id)
+                    if trade.observed_at > now:
+                        raise ContractError("fallback trade receipt is from the future")
+                    if now - trade.observed_at > config.freshness_seconds:
+                        raise ContractError("fallback trade receipt is stale")
+                    if trade.side.upper() != plan.side:
+                        raise ContractError("fallback trade side conflicts with the plan")
+                    if not (
+                        trade.price <= plan.price
+                        if plan.side == "BUY"
+                        else trade.price >= plan.price
+                    ):
+                        raise ContractError("fallback trade violates the executable price bound")
+                    trades.append(trade)
+            except Exception as exc:
+                return trades, pages, f"fallback trade reconciliation is unknown: {_cycle_exception_reason(exc)}"
+            if not page.next_cursor:
+                if not page.complete:
+                    return trades, pages, "fallback trade history is incomplete"
+                return trades, pages, None
+            if page.next_cursor == cursor:
+                return trades, pages, "fallback trade history cursor repeated"
+            cursor = page.next_cursor
+        return trades, pages, "fallback trade history pagination exceeded configured bound"
+
     async def _fallback_one(
         self,
         config: RandomCycleConfig,
@@ -1284,13 +1630,85 @@ class RandomCycleEngine:
         *,
         attempt_ordinal: int = 1,
     ) -> FallbackResult:
+        initial_before = before
         side = "SELL" if before.signed_position > 0 else "BUY"
+        metadata: MarketMetadata | None = None
+        book: OrderBookSnapshot | None = None
+        plan: OrderPlan | None = None
+        receipt: MutationReceipt | None = None
+        order: OrderSnapshot | None = None
+        trades: list[TradeReceipt] = []
+        history_pages: list[Any] = []
+        history_complete: bool | None = None
+        after: AccountSnapshot | None = None
+
+        def finish(result: FallbackResult, *, reconciliation_event: str | None = None) -> FallbackResult:
+            evidence = {
+                "account_index": initial_before.account_index,
+                "attempt": attempt_ordinal,
+                "requested_quantity": format(residual, "f"),
+                "outcome": result.outcome.value,
+                "reason": result.reason,
+                "plan": None if plan is None else plan.as_dict(),
+                "receipt": _receipt_payload(receipt),
+                "before": _account_payload(initial_before),
+                "admission_before": _account_payload(before),
+                "after": _account_payload(after),
+                "order": _order_payload(order),
+                "trades": [_trade_payload(trade) for trade in trades],
+                "trade_ids": [trade.trade_id for trade in trades],
+                "history_pages": [_history_page_payload(page) for page in history_pages],
+                "history_complete": history_complete,
+                "market_metadata": None if metadata is None else _metadata_payload(metadata),
+                "order_book_observed_at": None if book is None else book.observed_at,
+            }
+            journal.append("FALLBACK_ATTEMPT_EVIDENCE", evidence)
+            if reconciliation_event is not None:
+                journal.append(reconciliation_event, evidence)
+            return result
+
         if residual <= 0:
-            return FallbackResult(before.account_index, side, residual, False, Outcome.PARTIAL, reason="no confirmed residual position", attempt=attempt_ordinal)
-        metadata = _as_market(await self._bounded(self.client.market_metadata(config.market_id), config, "fallback market read"))
-        book = _as_book(await self._bounded(self._order_book(config.market_id), config, "fallback order book read"), metadata)
-        now = self.clock.now()
-        _validate_market_book(config, metadata, book, now)
+            return finish(
+                FallbackResult(
+                    before.account_index,
+                    side,
+                    residual,
+                    False,
+                    Outcome.PARTIAL,
+                    reason="no confirmed residual position",
+                    attempt=attempt_ordinal,
+                )
+            )
+        try:
+            metadata = _as_market(
+                await self._bounded(
+                    self.client.market_metadata(config.market_id),
+                    config,
+                    "fallback market read",
+                )
+            )
+            book = _as_book(
+                await self._bounded(self._order_book(config.market_id), config, "fallback order book read"),
+                metadata,
+            )
+            _validate_market_book(config, metadata, book, self.clock.now())
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            reason = f"fallback market observation is unknown: {_cycle_exception_reason(exc)}"
+            return finish(
+                FallbackResult(
+                    before.account_index,
+                    side,
+                    residual,
+                    False,
+                    Outcome.UNKNOWN,
+                    reason=reason,
+                    attempt=attempt_ordinal,
+                ),
+                reconciliation_event="FALLBACK_RECONCILIATION_UNKNOWN",
+            )
+
         # Rebind the residual to a fresh account observation after the book
         # read.  A position or identity change between the reconciliation
         # barrier and this mutation must stop this account's fallback rather
@@ -1301,7 +1719,11 @@ class RandomCycleEngine:
                 config,
                 "fallback account recheck",
             )
-            current = current_raw if isinstance(current_raw, AccountSnapshot) else AccountSnapshot.from_mapping(current_raw)
+            current = (
+                current_raw
+                if isinstance(current_raw, AccountSnapshot)
+                else AccountSnapshot.from_mapping(current_raw)
+            )
             label = "source" if before.account_index == config.source_account_index else "receiver"
             _validate_account_fresh(
                 config,
@@ -1313,26 +1735,57 @@ class RandomCycleEngine:
             if current.source_identity != before.source_identity:
                 raise PreflightBlocked("fallback account identity changed before mutation")
             before = current
+            side = "SELL" if before.signed_position > 0 else "BUY"
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
-            return FallbackResult(
-                before.account_index,
-                "SELL" if before.signed_position > 0 else "BUY",
-                residual,
-                False,
-                Outcome.PARTIAL,
-                reason=f"fallback account state changed before mutation: {_cycle_exception_reason(exc)}",
-                attempt=attempt_ordinal,
+            reason = f"fallback account state changed before mutation: {_cycle_exception_reason(exc)}"
+            return finish(
+                FallbackResult(
+                    initial_before.account_index,
+                    side,
+                    residual,
+                    False,
+                    Outcome.PARTIAL,
+                    reason=reason,
+                    attempt=attempt_ordinal,
+                )
             )
         try:
             quantity_int = decimal_to_integer(residual, metadata.size_decimals, "fallback residual quantity")
         except ContractError as exc:
-            return FallbackResult(before.account_index, side, residual, False, Outcome.PARTIAL, reason=str(exc), attempt=attempt_ordinal)
-        if residual < metadata.minimum_base_amount or residual * (book.asks[0].price if side == "BUY" else book.bids[0].price) < metadata.minimum_quote_amount:
-            return FallbackResult(before.account_index, side, residual, False, Outcome.PARTIAL, reason="confirmed residual is below a documented venue minimum", attempt=attempt_ordinal)
+            return finish(
+                FallbackResult(
+                    before.account_index,
+                    side,
+                    residual,
+                    False,
+                    Outcome.PARTIAL,
+                    reason=str(exc),
+                    attempt=attempt_ordinal,
+                )
+            )
         bound = book.asks[0].price if side == "BUY" else book.bids[0].price
+        if (
+            residual < metadata.minimum_base_amount
+            or residual * bound < metadata.minimum_quote_amount
+        ):
+            return finish(
+                FallbackResult(
+                    before.account_index,
+                    side,
+                    residual,
+                    False,
+                    Outcome.PARTIAL,
+                    reason="confirmed residual is below a documented venue minimum",
+                    attempt=attempt_ordinal,
+                )
+            )
         price_int = decimal_to_integer(bound, metadata.price_decimals, "fallback executable price")
-        run_id = journal.run_id
-        client_order_index = _client_order_index(run_id, f"fallback-{attempt_ordinal}-{before.account_index}")
+        client_order_index = _client_order_index(
+            journal.run_id,
+            f"fallback-{attempt_ordinal}-{before.account_index}",
+        )
         plan = OrderPlan(
             account_index=before.account_index,
             market_id=config.market_id,
@@ -1347,104 +1800,301 @@ class RandomCycleEngine:
             order_expiry_ms=0,
             client_order_index=client_order_index,
         )
-        journal.append("FALLBACK_DISPATCH_INTENT", {"plan": plan.as_dict(), "account_index": before.account_index, "attempt": attempt_ordinal})
+        journal.append(
+            "FALLBACK_DISPATCH_INTENT",
+            {
+                "plan": plan.as_dict(),
+                "account_index": before.account_index,
+                "attempt": attempt_ordinal,
+            },
+        )
         try:
-            receipt = _as_receipt(await self._bounded(self.client.submit_order(plan), config, "fallback mutation"))
+            receipt = _as_receipt(
+                await self._bounded(self.client.submit_order(plan), config, "fallback mutation")
+            )
         except asyncio.CancelledError:
-            journal.append("FALLBACK_DISPATCH_UNKNOWN", {"account_index": before.account_index, "attempt": attempt_ordinal, "reason": "cancellation after fallback intent"})
+            reason = "cancellation after fallback intent"
+            journal.append(
+                "FALLBACK_DISPATCH_UNKNOWN",
+                {"account_index": before.account_index, "attempt": attempt_ordinal, "reason": reason},
+            )
+            finish(
+                FallbackResult(
+                    before.account_index,
+                    side,
+                    residual,
+                    True,
+                    Outcome.UNKNOWN,
+                    reason=f"fallback dispatch outcome unknown: {reason}",
+                    attempt=attempt_ordinal,
+                )
+            )
             raise
         except BaseException as exc:
             reason = f"fallback dispatch outcome unknown: {sanitize_exception(exc)}"
-            journal.append("FALLBACK_DISPATCH_UNKNOWN", {"account_index": before.account_index, "attempt": attempt_ordinal, "reason": reason})
-            return FallbackResult(before.account_index, side, residual, True, Outcome.UNKNOWN, reason=reason, attempt=attempt_ordinal)
-        journal.append("FALLBACK_DISPATCH_RESULT", {"account_index": before.account_index, "attempt": attempt_ordinal, "accepted": receipt.accepted, "order_id": receipt.order_id, "error": receipt.error})
-        if not receipt.accepted:
-            return FallbackResult(before.account_index, side, residual, True, Outcome.PARTIAL, order_id=receipt.order_id, reason="fallback reduce-only market was rejected", attempt=attempt_ordinal)
-        order: OrderSnapshot | None = None
-        try:
-            raw = await self._bounded(
-                self.client.lookup_order(before.account_index, config.market_id, order_id=receipt.order_id, client_order_index=client_order_index),
-                config,
-                "fallback order read",
-            )
-            order = _as_order(raw)
-        except Exception as exc:
-            reason = f"fallback order state is unknown: {sanitize_exception(exc)}"
-            journal.append("FALLBACK_RECONCILIATION_UNKNOWN", {"account_index": before.account_index, "attempt": attempt_ordinal, "reason": reason})
-            return FallbackResult(before.account_index, side, residual, True, Outcome.UNKNOWN, order_id=receipt.order_id, reason=reason, attempt=attempt_ordinal)
-        if (
-            order is None
-            or (
-                receipt.order_id is not None
-                and order.order_id != str(receipt.order_id)
-            )
-            or not self._fallback_order_matches(order, plan)
-        ):
-            reason = "fallback order identity or parameters are unresolved"
             journal.append(
-                "FALLBACK_RECONCILIATION_UNKNOWN",
+                "FALLBACK_DISPATCH_UNKNOWN",
                 {"account_index": before.account_index, "attempt": attempt_ordinal, "reason": reason},
             )
-            return FallbackResult(before.account_index, side, residual, True, Outcome.UNKNOWN, order_id=receipt.order_id, reason=reason, attempt=attempt_ordinal)
-        trades: list[TradeReceipt] = []
-        try:
-            page = _as_page(
-                await self._bounded(
-                    self.client.list_trades(before.account_index, config.market_id, order_id=order.order_id, cursor=None, limit=100),
-                    config,
-                    "fallback trade history read",
+            return finish(
+                FallbackResult(
+                    before.account_index,
+                    side,
+                    residual,
+                    True,
+                    Outcome.UNKNOWN,
+                    reason=reason,
+                    attempt=attempt_ordinal,
                 )
             )
-            seen_trade_ids: set[str] = set()
-            for trade in page.trades:
-                if (
-                    trade.account_index != before.account_index
-                    or trade.market_id != config.market_id
-                    or trade.order_id != order.order_id
-                ):
-                    raise ContractError("fallback trade history contains a foreign or conflicting receipt")
-                if trade.trade_id in seen_trade_ids:
-                    raise ContractError("fallback trade history contains a duplicate receipt")
-                seen_trade_ids.add(trade.trade_id)
-                trades.append(trade)
-            if page.next_cursor or not page.complete:
-                raise ContractError("fallback trade history is incomplete")
-            if any(trade.observed_at > self.clock.now() for trade in trades):
-                raise ContractError("fallback trade receipt is from the future")
-            if any(trade.side.upper() != side for trade in trades):
-                raise ContractError("fallback trade side conflicts with the plan")
-            if any((trade.price <= plan.price if side == "BUY" else trade.price >= plan.price) is False for trade in trades):
-                raise ContractError("fallback trade violates the executable price bound")
-        except Exception as exc:
-            reason = f"fallback trade reconciliation is unknown: {sanitize_exception(exc)}"
-            journal.append(
-                "FALLBACK_RECONCILIATION_UNKNOWN",
-                {"account_index": before.account_index, "attempt": attempt_ordinal, "reason": reason},
+        journal.append(
+            "FALLBACK_DISPATCH_RESULT",
+            {
+                "account_index": before.account_index,
+                "attempt": attempt_ordinal,
+                "accepted": receipt.accepted,
+                "order_id": receipt.order_id,
+                "receipt": _receipt_payload(receipt),
+            },
+        )
+        if not receipt.accepted:
+            return finish(
+                FallbackResult(
+                    before.account_index,
+                    side,
+                    residual,
+                    True,
+                    Outcome.PARTIAL,
+                    order_id=receipt.order_id,
+                    reason="fallback reduce-only market was rejected",
+                    attempt=attempt_ordinal,
+                )
             )
-            return FallbackResult(before.account_index, side, residual, True, Outcome.UNKNOWN, order_id=order.order_id, reason=reason, attempt=attempt_ordinal)
+
         try:
-            after_raw = await self._bounded(self.client.account_snapshot(before.account_index, config.market_id), config, "fallback final account read")
-            after = after_raw if isinstance(after_raw, AccountSnapshot) else AccountSnapshot.from_mapping(after_raw)
-            _validate_account_fresh(config, after, "source" if before.account_index == config.source_account_index else "receiver", self.clock.now())
+            order, order_reason = await self._poll_fallback_order(
+                config,
+                journal,
+                plan,
+                receipt,
+                attempt_ordinal=attempt_ordinal,
+            )
+        except asyncio.CancelledError:
+            finish(
+                FallbackResult(
+                    before.account_index,
+                    side,
+                    residual,
+                    True,
+                    Outcome.UNKNOWN,
+                    order_id=receipt.order_id,
+                    reason="fallback order reconciliation was interrupted",
+                    attempt=attempt_ordinal,
+                ),
+                reconciliation_event="FALLBACK_RECONCILIATION_UNKNOWN",
+            )
+            raise
+        except BaseException as exc:
+            reason = f"fallback order reconciliation was interrupted: {sanitize_exception(exc)}"
+            finish(
+                FallbackResult(
+                    before.account_index,
+                    side,
+                    residual,
+                    True,
+                    Outcome.UNKNOWN,
+                    order_id=receipt.order_id,
+                    reason=reason,
+                    attempt=attempt_ordinal,
+                ),
+                reconciliation_event="FALLBACK_RECONCILIATION_UNKNOWN",
+            )
+            raise
+        if order is None:
+            reason = order_reason or "fallback order state is unknown"
+            return finish(
+                FallbackResult(
+                    before.account_index,
+                    side,
+                    residual,
+                    True,
+                    Outcome.UNKNOWN,
+                    order_id=receipt.order_id,
+                    reason=reason,
+                    attempt=attempt_ordinal,
+                ),
+                reconciliation_event="FALLBACK_RECONCILIATION_UNKNOWN",
+            )
+
+        try:
+            history_complete = False
+            trades, history_pages, history_reason = await self._read_fallback_history(
+                config,
+                plan,
+                order,
+                attempt_ordinal=attempt_ordinal,
+            )
+            history_complete = history_reason is None
+        except asyncio.CancelledError:
+            finish(
+                FallbackResult(
+                    before.account_index,
+                    side,
+                    residual,
+                    True,
+                    Outcome.UNKNOWN,
+                    order_id=order.order_id,
+                    filled_quantity=sum((item.quantity for item in trades), Decimal(0)),
+                    reason="fallback trade reconciliation was interrupted",
+                    attempt=attempt_ordinal,
+                ),
+                reconciliation_event="FALLBACK_RECONCILIATION_UNKNOWN",
+            )
+            raise
+        except BaseException as exc:
+            reason = f"fallback trade reconciliation was interrupted: {sanitize_exception(exc)}"
+            finish(
+                FallbackResult(
+                    before.account_index,
+                    side,
+                    residual,
+                    True,
+                    Outcome.UNKNOWN,
+                    order_id=order.order_id,
+                    filled_quantity=sum((item.quantity for item in trades), Decimal(0)),
+                    reason=reason,
+                    attempt=attempt_ordinal,
+                ),
+                reconciliation_event="FALLBACK_RECONCILIATION_UNKNOWN",
+            )
+            raise
+        if history_reason is not None:
+            return finish(
+                FallbackResult(
+                    before.account_index,
+                    side,
+                    residual,
+                    True,
+                    Outcome.UNKNOWN,
+                    order_id=order.order_id,
+                    filled_quantity=sum((item.quantity for item in trades), Decimal(0)),
+                    reason=history_reason,
+                    attempt=attempt_ordinal,
+                ),
+                reconciliation_event="FALLBACK_RECONCILIATION_UNKNOWN",
+            )
+
+        try:
+            after_raw = await self._bounded(
+                self.client.account_snapshot(before.account_index, config.market_id),
+                config,
+                "fallback final account read",
+            )
+            after = (
+                after_raw
+                if isinstance(after_raw, AccountSnapshot)
+                else AccountSnapshot.from_mapping(after_raw)
+            )
+            _validate_account_fresh(
+                config,
+                after,
+                "source" if before.account_index == config.source_account_index else "receiver",
+                self.clock.now(),
+            )
+        except asyncio.CancelledError:
+            finish(
+                FallbackResult(
+                    before.account_index,
+                    side,
+                    residual,
+                    True,
+                    Outcome.UNKNOWN,
+                    order_id=order.order_id,
+                    filled_quantity=sum((item.quantity for item in trades), Decimal(0)),
+                    reason="fallback final account reconciliation was interrupted",
+                    attempt=attempt_ordinal,
+                ),
+                reconciliation_event="FALLBACK_RECONCILIATION_UNKNOWN",
+            )
+            raise
         except Exception as exc:
             reason = f"fallback final position is unknown: {sanitize_exception(exc)}"
-            journal.append(
-                "FALLBACK_RECONCILIATION_UNKNOWN",
-                {"account_index": before.account_index, "attempt": attempt_ordinal, "reason": reason},
+            return finish(
+                FallbackResult(
+                    before.account_index,
+                    side,
+                    residual,
+                    True,
+                    Outcome.UNKNOWN,
+                    order_id=order.order_id,
+                    filled_quantity=sum((item.quantity for item in trades), Decimal(0)),
+                    reason=reason,
+                    attempt=attempt_ordinal,
+                ),
+                reconciliation_event="FALLBACK_RECONCILIATION_UNKNOWN",
             )
-            return FallbackResult(before.account_index, side, residual, True, Outcome.UNKNOWN, order_id=order.order_id, filled_quantity=sum((t.quantity for t in trades), Decimal(0)), reason=reason, attempt=attempt_ordinal)
+        except BaseException as exc:
+            reason = f"fallback final account reconciliation was interrupted: {sanitize_exception(exc)}"
+            finish(
+                FallbackResult(
+                    before.account_index,
+                    side,
+                    residual,
+                    True,
+                    Outcome.UNKNOWN,
+                    order_id=order.order_id,
+                    filled_quantity=sum((item.quantity for item in trades), Decimal(0)),
+                    reason=reason,
+                    attempt=attempt_ordinal,
+                ),
+                reconciliation_event="FALLBACK_RECONCILIATION_UNKNOWN",
+            )
+            raise
         filled = sum((trade.quantity for trade in trades), Decimal(0))
         expected_after = before.signed_position + (-filled if side == "SELL" else filled)
         if order.filled_quantity != filled or after.signed_position != expected_after:
             reason = "fallback order, receipts and position disagree"
-            return FallbackResult(before.account_index, side, residual, True, Outcome.UNKNOWN, order_id=order.order_id, filled_quantity=filled, position_after=after.signed_position, reason=reason, attempt=attempt_ordinal)
-        outcome = Outcome.SUCCESS if filled == residual and after.signed_position == 0 and order.terminal else Outcome.PARTIAL
+            return finish(
+                FallbackResult(
+                    before.account_index,
+                    side,
+                    residual,
+                    True,
+                    Outcome.UNKNOWN,
+                    order_id=order.order_id,
+                    filled_quantity=filled,
+                    position_after=after.signed_position,
+                    reason=reason,
+                    attempt=attempt_ordinal,
+                ),
+                reconciliation_event="FALLBACK_RECONCILIATION_UNKNOWN",
+            )
+        outcome = (
+            Outcome.SUCCESS
+            if filled == residual and after.signed_position == 0 and order.terminal
+            else Outcome.PARTIAL
+        )
         reason = None if outcome is Outcome.SUCCESS else "fallback left a confirmed residual position"
-        journal.append("FALLBACK_RECONCILED", {"account_index": before.account_index, "attempt": attempt_ordinal, "order_id": order.order_id, "filled_quantity": format(filled, "f"), "position_after": format(after.signed_position, "f"), "outcome": outcome.value})
-        return FallbackResult(before.account_index, side, residual, True, outcome, order_id=order.order_id, filled_quantity=filled, position_after=after.signed_position, reason=reason, attempt=attempt_ordinal)
+        return finish(
+            FallbackResult(
+                before.account_index,
+                side,
+                residual,
+                True,
+                outcome,
+                order_id=order.order_id,
+                filled_quantity=filled,
+                position_after=after.signed_position,
+                reason=reason,
+                attempt=attempt_ordinal,
+            ),
+            reconciliation_event="FALLBACK_RECONCILED",
+        )
 
     @staticmethod
-    def _fallback_order_matches(order: OrderSnapshot, plan: OrderPlan) -> bool:
+    def _fallback_order_identity_matches(order: OrderSnapshot, plan: OrderPlan) -> bool:
+        """Match immutable order fields while a terminal state is pending."""
+
         return (
             order.account_index == plan.account_index
             and order.market_id == plan.market_id
@@ -1458,9 +2108,16 @@ class RandomCycleEngine:
             and order.initial_quantity == plan.quantity
             and order.remaining_quantity + order.filled_quantity == order.initial_quantity
             and order.price is not None
-            and (order.price <= plan.price if plan.side == "BUY" else order.price >= plan.price)
-            and order.terminal
+            and (
+                order.price <= plan.price
+                if plan.side == "BUY"
+                else order.price >= plan.price
+            )
         )
+
+    @staticmethod
+    def _fallback_order_matches(order: OrderSnapshot, plan: OrderPlan) -> bool:
+        return RandomCycleEngine._fallback_order_identity_matches(order, plan) and order.terminal
 
     async def _order_book(self, market_id: int) -> OrderBookSnapshot | Mapping[str, Any]:
         method = getattr(self.client, "order_book", None)
