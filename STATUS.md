@@ -1,5 +1,9 @@
 # Current status
 
+## HCR-17 owner-requested session transfer — WIP_NOT_ACCEPTED
+
+Predecessor Builder stopped and directly delivered builder-v3/WIP_HANDOFF.md; exact unchanged WIPdiffsha256485a375c53432a505023f0fa5c492530dc4bb0a125192095744f5c98ee6a4d15 verified by Chief. Twofileschanged;31pass4fail reported focusedtests; SDKfixnotimplemented; no runningprocesses. All work preserved. New Chief will assign a fresh Builder for remaining3boundarycriteria, then independently accept/integrate only after requiredchecks. Full packet original-root spread-shadow-runs/hood-random-cycle-20260916/chief-handoff-v1. Accepted main unchanged; no agent financial writes. Predecessor relinquishes ownership on newChiefdispatch.
+
 ## HCR-17 random-size timed close — IN DEVELOPMENT
 
 Correction b346eb502707c7320aa805d7f6b7846b5ba15b8a remains unaccepted: full4473passed3skipped plus original boundary controls PASS, but three new concrete boundary causes reproduced (nested-preflight identity rebinding, invented trade-age cutoff, incomplete live metadata restamped from old evidence). Actual fake-transport SDK/CLI controls verify LAUNCH and fresh300secondhold; stalecontrol stops. Chief-v2/review.md records exact proofs. Fresh explicit-role Builder /root/cycle_boundary_builder now owns narrow correction in codex/spread-v1-cycle-boundaries/hood-cycle-boundaries fromb346eb5; prior Builder complete/released. No concurrentwriters, no agent liveoperations, no main integration. Wait for direct candidate delivery.
