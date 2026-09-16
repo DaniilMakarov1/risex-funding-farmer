@@ -78,6 +78,27 @@ async def _await(value: Any) -> Any:
     return value
 
 
+async def _close_resource(value: Any) -> bool:
+    """Best-effort close for SDK and injected synthetic resources."""
+
+    if value is None:
+        return True
+    for name in ("aclose", "close"):
+        method = getattr(value, name, None)
+        if not callable(method):
+            continue
+        try:
+            result = method()
+            if inspect.isawaitable(result):
+                await result
+        except BaseException:
+            # Teardown must not replace an already-observed execution result or
+            # turn an interrupted attempt into a false terminal claim.
+            return False
+        return True
+    return False
+
+
 def _model_dict(value: Any) -> dict[str, Any]:
     if isinstance(value, Mapping):
         return dict(value)
@@ -111,12 +132,60 @@ def _first_mapping(value: Any, *keys: str) -> dict[str, Any]:
     return raw
 
 
+def _order_snapshot_mapping(value: Any, *, observed_at: float) -> dict[str, Any]:
+    """Normalize one official Order model without weakening its contract.
+
+    The pinned SDK exposes ``is_ask`` as the authoritative side and labels its
+    ``side`` field as legacy.  Its generated ``from_dict`` also supplies a
+    default ``buy`` side when the wire response omits that legacy field.  The
+    authoritative boolean is therefore required at this SDK boundary; a
+    side-only response remains incomplete rather than being guessed.
+    """
+
+    mapped = _model_dict(value)
+    if "is_ask" not in mapped:
+        if "side" not in mapped:
+            raise ContractError("order response lacks required is_ask/side")
+        raise ContractError("order response lacks required is_ask")
+    is_ask = mapped["is_ask"]
+    if not isinstance(is_ask, bool):
+        raise ContractError("order response is_ask must be bool")
+    required_fields = {
+        "account_index": ("account_index", "owner_account_index"),
+        "market_id": ("market_id", "market_index"),
+        "order_id": ("order_id",),
+        "client_order_index": ("client_order_index",),
+        "status": ("status",),
+        "type": ("type", "order_type"),
+        "time_in_force": ("time_in_force",),
+        "reduce_only": ("reduce_only",),
+        "initial_base_amount": ("initial_quantity", "initial_base_amount", "base_amount"),
+        "remaining_base_amount": ("remaining_quantity", "remaining_base_amount"),
+        "filled_base_amount": ("filled_quantity", "filled_base_amount"),
+        "price": ("price", "base_price"),
+    }
+    for field, aliases in required_fields.items():
+        if not any(alias in mapped and mapped[alias] is not None for alias in aliases):
+            raise ContractError(f"order response lacks required {field}")
+    mapped["side"] = "SELL" if is_ask else "BUY"
+    mapped["observed_at"] = observed_at
+    return mapped
+
+
 class PlainAioHttp:
     """One-request HTTP helper; deliberately does not import aiohttp-retry."""
 
     def __init__(self, base_url: str, *, timeout_seconds: float) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = float(timeout_seconds)
+
+    async def aclose(self) -> None:
+        """Match the adapter lifecycle; request sessions are already scoped."""
+
+        return None
+
+    async def close(self) -> None:
+        await self.aclose()
 
     async def get(self, path: str, *, params: Mapping[str, Any], authorization: str) -> dict[str, Any]:
         try:
@@ -206,6 +275,7 @@ class LighterSdkClient:
         self._tokens: dict[int, _CachedToken] = {}
         self._api_client: Any | None = None
         self._pending_mutation_deadline: float | None = None
+        self._closed = False
         self.sdk_version = REQUIRED_LIGHTER_SDK_VERSION
         self._http = (http_factory or PlainAioHttp)(config.api_base_url, timeout_seconds=config.request_timeout_seconds)
 
@@ -589,7 +659,9 @@ class LighterSdkClient:
         values = raw_mapping["orders"]
         result: list[OrderSnapshot] = []
         for item in values:
-            parsed = OrderSnapshot.from_mapping({**_model_dict(item), "observed_at": self._clock()})
+            parsed = OrderSnapshot.from_mapping(
+                _order_snapshot_mapping(item, observed_at=self._clock())
+            )
             if parsed.account_index != account_index or parsed.market_id != market_id:
                 raise ContractError("active order response identity does not match requested account/market")
             result.append(parsed)
@@ -620,7 +692,11 @@ class LighterSdkClient:
             raise ContractError("accountOrders response lacks an orders list")
         values = payload["orders"]
         for item in values:
-            parsed = OrderSnapshot.from_mapping({**_model_dict(item), "observed_at": self._clock()})
+            parsed = OrderSnapshot.from_mapping(
+                _order_snapshot_mapping(item, observed_at=self._clock())
+            )
+            if parsed.account_index != account_index or parsed.market_id != market_id:
+                raise ContractError("accountOrders response identity does not match requested account/market")
             if order_id is not None and parsed.order_id != str(order_id):
                 continue
             if client_order_index is not None and str(parsed.client_order_index) != str(client_order_index):
@@ -651,7 +727,7 @@ class LighterSdkClient:
                     market_id=market_id,
                     account_index=account_index,
                     order_index=None if order_id is None else int(order_id),
-                    sort_dir="asc",
+                    sort_dir="desc",
                     cursor=cursor,
                     market_type="perp",
                     type="all",
@@ -737,6 +813,44 @@ class LighterSdkClient:
             next_cursor=payload.get("next_cursor"),
             complete=not bool(payload.get("next_cursor")),
         )
+
+    async def aclose(self) -> None:
+        """Close all adapter-owned SDK/HTTP resources exactly once.
+
+        The generated public client owns one HTTP session and each signer owns
+        its own client/session.  A signer's ``close`` method owns its nested
+        client, so that nested object is only closed directly when the signer
+        does not expose a close method.  Cleanup errors are deliberately
+        contained so a terminal handoff result is never replaced by teardown
+        noise.
+        """
+
+        if self._closed:
+            return
+        self._closed = True
+        seen: set[int] = set()
+        self._tokens.clear()
+
+        async def close_once(resource: Any) -> bool:
+            if resource is None or id(resource) in seen:
+                return True
+            seen.add(id(resource))
+            return await _close_resource(resource)
+
+        await close_once(self._api_client)
+        for signer in tuple(self._signers.values()):
+            closed = await close_once(signer)
+            if not closed:
+                # A failing signer close can leave its private generated client
+                # open.  Give that nested session one bounded fallback attempt.
+                await close_once(getattr(signer, "api_client", None))
+        await close_once(self._http)
+        self._signers.clear()
+        self._apis.clear()
+        self._api_client = None
+
+    async def close(self) -> None:
+        await self.aclose()
 
     async def _bounded(self, awaitable: Any, deadline: float, label: str) -> Any:
         remaining = deadline - time.monotonic()

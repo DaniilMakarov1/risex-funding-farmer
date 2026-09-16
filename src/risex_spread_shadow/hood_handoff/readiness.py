@@ -40,6 +40,7 @@ from .sdk import (
     _await,
     _first_mapping,
     _model_dict,
+    _order_snapshot_mapping,
     _require_success_code,
     _select_perp_market_by_symbol,
     ROBINHOOD_ORDER_BOOK_LIMIT,
@@ -768,7 +769,9 @@ class ReadOnlyLighterSdkClient:
             raise ContractError("accountActiveOrders response lacks an orders list")
         result: list[OrderSnapshot] = []
         for item in values:
-            parsed = OrderSnapshot.from_mapping({**_model_dict(item), "observed_at": self._clock()})
+            parsed = OrderSnapshot.from_mapping(
+                _order_snapshot_mapping(item, observed_at=self._clock())
+            )
             if parsed.account_index != account_index or parsed.market_id != market_id:
                 raise ContractError("active order response identity does not match requested account/market")
             result.append(parsed)

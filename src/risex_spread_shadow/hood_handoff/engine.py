@@ -968,9 +968,10 @@ class HandoffEngine:
         complete = True
         cursor: str | None = None
         deadline = self.clock.now() + config.reconcile_timeout_seconds
+        history_requested = dispatched and order_id is not None
         if dispatched and order_id is None:
             complete = False
-        for _ in range(max(1, config.max_poll_count)) if dispatched and order_id is not None else ():
+        for _ in range(max(1, config.max_poll_count)) if history_requested else ():
             if self.clock.now() > deadline:
                 local_unknown.append("reconciliation deadline exceeded")
                 complete = False
@@ -1036,7 +1037,7 @@ class HandoffEngine:
                 break
             cursor = page.next_cursor
         else:
-            if dispatched:
+            if history_requested:
                 local_unknown.append("trade history pagination exceeded configured bound")
                 complete = False
         try:
