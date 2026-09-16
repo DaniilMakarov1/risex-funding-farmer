@@ -1,5 +1,9 @@
 # Current status
 
+## HCR-13 — ACTIVE; owner-live-002 UNKNOWN with observed source inventory
+
+Owner supplied terminal UNKNOWN: source27331 was dispatched and observed at-0.00020BTC; receiver27337 not dispatched and observed0. Order ID/status, cancellation and fill history unresolved. Positions are recorded observations, not a current read. New launch/replay is blocked pending separate reconciliation. Original evidence preserved in hood-launch-flow-20260916/owner-live-002; diagnostic packet/hashes in hood-order-observation-20260916/chief-v1. NEXT_TASK authorizes bounded offline SDK/order-observation, pagination-diagnostic and cleanup corrections. HCR-12 code acceptance below remains valid as offline evidence, not a live success claim.
+
 ## HCR-12 post-LAUNCH automatic selection — ACCEPTED OFFLINE
 
 Candidate4204e10bb2af78b5a36622ca2c319fe16f992fbe accepted by sole Chief01a0a67b-bec7-75d2-9970-e3914b10e445 on2026-09-16. Owner explicitly approved price selection after LAUNCH. Fixed-plan preview/cancellation is offline; keys load before one fresh public metadata/book selection. Obsolete automatic prequote equality/original-age gates are removed; actual freshness/identity/grid/minimum checks, exact quantity, declared timing, explicit-price compatibility and execution strategy remain unchanged. Concise output retains fixed plan, selected price/notional, engine outcome/reason and known inventory. Local failure reasons distinguish proven pre-engine stop from unknown execution; durable UNKNOWN precedes engine admission, including interruption. Missing terminal remains incomplete and no-replay/evidence/secret boundaries remain intact.
