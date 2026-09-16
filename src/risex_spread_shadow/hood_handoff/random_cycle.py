@@ -465,6 +465,30 @@ class RandomCycleClient(HandoffClient, Protocol):
     async def order_book(self, market_id: int) -> OrderBookSnapshot | Mapping[str, Any]: ...
 
 
+class _AccountIdentityFailure(ContractError):
+    """An account response cannot establish the requested identity binding."""
+
+
+def _coerce_cycle_account(
+    raw: AccountSnapshot | Mapping[str, Any],
+    account_index: int,
+    market_id: int,
+) -> AccountSnapshot:
+    """Decode and bind one account response before any dependent mutation."""
+
+    try:
+        snapshot = raw if isinstance(raw, AccountSnapshot) else AccountSnapshot.from_mapping(raw)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        raise _AccountIdentityFailure("account snapshot identity/decoder failure") from exc
+    if snapshot.account_index != account_index or snapshot.market_id != market_id:
+        raise _AccountIdentityFailure("account snapshot returned a different requested account or market")
+    if not isinstance(snapshot.source_identity, str) or not snapshot.source_identity.strip():
+        raise _AccountIdentityFailure("account snapshot source identity is missing or invalid")
+    return snapshot
+
+
 class _BoundMarketClient:
     """Keep pre-mutation metadata and account identities across a child run.
 
@@ -500,8 +524,6 @@ class _BoundMarketClient:
     async def account_snapshot(self, account_index: int, market_id: int) -> AccountSnapshot:
         if market_id != self._metadata.market_id:
             raise ContractError("bound account market identity does not match configured market")
-        raw = await self._delegate.account_snapshot(account_index, market_id)
-        snapshot = raw if isinstance(raw, AccountSnapshot) else AccountSnapshot.from_mapping(raw)
         if account_index == self.source_account_index:
             label = "source"
             expected_identity = self._source_identity
@@ -510,6 +532,16 @@ class _BoundMarketClient:
             expected_identity = self._receiver_identity
         else:
             raise ContractError("bound account identity does not match configured cycle account")
+        try:
+            raw = await self._delegate.account_snapshot(account_index, market_id)
+            snapshot = _coerce_cycle_account(raw, account_index, market_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            reason = f"{label} account identity/read validation failed"
+            if self._identity_failure_callback is not None:
+                self._identity_failure_callback(reason)
+            raise PreflightBlocked(reason) from exc
         if expected_identity is not None and snapshot.source_identity != expected_identity:
             reason = f"{label} account identity changed after it was bound"
             if self._identity_failure_callback is not None:
@@ -1090,10 +1122,8 @@ class RandomCycleEngine:
         return result
 
     async def _accounts(self, config: RandomCycleConfig, now: float | None = None) -> tuple[AccountSnapshot, AccountSnapshot]:
-        source = await self._bounded(self.client.account_snapshot(config.source_account_index, config.market_id), config, "source account read")
-        receiver = await self._bounded(self.client.account_snapshot(config.receiver_account_index, config.market_id), config, "receiver account read")
-        source = source if isinstance(source, AccountSnapshot) else AccountSnapshot.from_mapping(source)
-        receiver = receiver if isinstance(receiver, AccountSnapshot) else AccountSnapshot.from_mapping(receiver)
+        source = await self._read_account(config, config.source_account_index, "source account read")
+        receiver = await self._read_account(config, config.receiver_account_index, "receiver account read")
         # Account observations are stamped by the reads themselves.  Validate
         # against the clock after both have completed so a real transport's
         # small read latency cannot make a fresh response look future-dated.
@@ -1102,6 +1132,26 @@ class RandomCycleEngine:
         _validate_account_fresh(config, source, "source", validation_now)
         _validate_account_fresh(config, receiver, "receiver", validation_now)
         return source, receiver
+
+    async def _read_account(
+        self,
+        config: RandomCycleConfig,
+        account_index: int,
+        label: str,
+    ) -> AccountSnapshot:
+        try:
+            raw = await self._bounded(
+                self.client.account_snapshot(account_index, config.market_id),
+                config,
+                label,
+            )
+            return _coerce_cycle_account(raw, account_index, config.market_id)
+        except asyncio.CancelledError:
+            raise
+        except _AccountIdentityFailure:
+            raise
+        except Exception as exc:
+            raise _AccountIdentityFailure("account snapshot read failed") from exc
 
     async def _revalidate_open(
         self,
@@ -1219,7 +1269,11 @@ class RandomCycleEngine:
             book = _as_book(await self._bounded(self._order_book(config.market_id), config, "closing order book read"), metadata)
             now = self.clock.now()
             _validate_market_book(config, metadata, book, now)
-            source, receiver = await self._accounts(config, now)
+            try:
+                source, receiver = await self._accounts(config, now)
+            except _AccountIdentityFailure:
+                self._mark_identity_failure("closing account identity/read validation failed")
+                raise
             if source.source_identity != opening_plan.source_identity:
                 self._mark_identity_failure("source account identity changed during the holding period")
                 return blocked("source account identity changed during the holding period")
@@ -1282,6 +1336,13 @@ class RandomCycleEngine:
         now = self.clock.now()
         try:
             source, receiver = await self._accounts(config, now)
+        except _AccountIdentityFailure:
+            self._mark_identity_failure("fallback starting account identity/read validation failed")
+            journal.append(
+                "FALLBACK_RECONCILIATION_UNKNOWN",
+                {"reason": self._identity_barrier},
+            )
+            return [], None, None
         except Exception as exc:
             journal.append(
                 "FALLBACK_RECONCILIATION_UNKNOWN",
@@ -1382,6 +1443,13 @@ class RandomCycleEngine:
                 return await self._accounts(config, self.clock.now())
             except asyncio.CancelledError:
                 raise
+            except _AccountIdentityFailure:
+                self._mark_identity_failure("fallback account identity/read validation failed")
+                journal.append(
+                    "FALLBACK_RECONCILIATION_UNKNOWN",
+                    {"reason": self._identity_barrier},
+                )
+                return None
             except Exception as exc:
                 journal.append(
                     "FALLBACK_RECONCILIATION_UNKNOWN",
@@ -1556,6 +1624,13 @@ class RandomCycleEngine:
             return results, final_source.signed_position, final_receiver.signed_position
         except asyncio.CancelledError:
             raise
+        except _AccountIdentityFailure:
+            self._mark_identity_failure("final fallback account identity/read validation failed")
+            journal.append(
+                "FALLBACK_RECONCILIATION_UNKNOWN",
+                {"reason": self._identity_barrier},
+            )
+            return results, None, None
         except Exception as exc:
             journal.append(
                 "FALLBACK_RECONCILIATION_UNKNOWN",
@@ -1812,15 +1887,10 @@ class RandomCycleEngine:
         # barrier and this mutation must stop this account's fallback rather
         # than turn a new/external position into cycle inventory.
         try:
-            current_raw = await self._bounded(
-                self.client.account_snapshot(before.account_index, config.market_id),
+            current = await self._read_account(
                 config,
+                before.account_index,
                 "fallback account recheck",
-            )
-            current = (
-                current_raw
-                if isinstance(current_raw, AccountSnapshot)
-                else AccountSnapshot.from_mapping(current_raw)
             )
             label = "source" if before.account_index == config.source_account_index else "receiver"
             _validate_account_fresh(
@@ -1837,6 +1907,19 @@ class RandomCycleEngine:
             side = "SELL" if before.signed_position > 0 else "BUY"
         except asyncio.CancelledError:
             raise
+        except _AccountIdentityFailure:
+            self._mark_identity_failure("fallback account identity/read validation failed before mutation")
+            return finish(
+                FallbackResult(
+                    initial_before.account_index,
+                    side,
+                    residual,
+                    False,
+                    Outcome.UNKNOWN,
+                    reason="fallback account identity/read validation failed before mutation",
+                    attempt=attempt_ordinal,
+                )
+            )
         except Exception as exc:
             reason = f"fallback account state changed before mutation: {_cycle_exception_reason(exc)}"
             return finish(
@@ -2084,15 +2167,10 @@ class RandomCycleEngine:
             )
 
         try:
-            after_raw = await self._bounded(
-                self.client.account_snapshot(before.account_index, config.market_id),
+            after = await self._read_account(
                 config,
+                before.account_index,
                 "fallback final account read",
-            )
-            after = (
-                after_raw
-                if isinstance(after_raw, AccountSnapshot)
-                else AccountSnapshot.from_mapping(after_raw)
             )
             _validate_account_fresh(
                 config,
@@ -2133,6 +2211,22 @@ class RandomCycleEngine:
                 reconciliation_event="FALLBACK_RECONCILIATION_UNKNOWN",
             )
             raise
+        except _AccountIdentityFailure:
+            self._mark_identity_failure("fallback final account identity/read validation failed after mutation")
+            return finish(
+                FallbackResult(
+                    before.account_index,
+                    side,
+                    residual,
+                    True,
+                    Outcome.UNKNOWN,
+                    order_id=order.order_id,
+                    filled_quantity=sum((item.quantity for item in trades), Decimal(0)),
+                    reason="fallback final account identity/read validation failed after mutation",
+                    attempt=attempt_ordinal,
+                ),
+                reconciliation_event="FALLBACK_RECONCILIATION_UNKNOWN",
+            )
         except Exception as exc:
             reason = f"fallback final position is unknown: {sanitize_exception(exc)}"
             return finish(

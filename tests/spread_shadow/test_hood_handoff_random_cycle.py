@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import replace
+from dataclasses import asdict, replace
 from decimal import Decimal
 import json
 from pathlib import Path
@@ -609,6 +609,63 @@ class TransientFallbackIdentityClient(CycleClient):
             if self.reads == 1:
                 self.identity_mismatch_count += 1
                 return replace(snapshot, source_identity="one-response-foreign-identity")
+        return snapshot
+
+
+class AccountBindingFaultClient(CycleClient):
+    """Inject one malformed account response at a close or fallback boundary."""
+
+    def __init__(
+        self,
+        clock: AdvancingClock,
+        *,
+        fault_kind: str,
+        target_account: int,
+        target_read: int = 1,
+        boundary: str = "close",
+    ) -> None:
+        super().__init__(clock, partial_close=boundary == "fallback")
+        self.fault_kind = fault_kind
+        self.target_account = target_account
+        self.target_read = target_read
+        self.boundary = boundary
+        self.boundary_reads = 0
+        self.fault_injected = False
+
+    def _fault(self, snapshot: AccountSnapshot):
+        if self.fault_kind == "mapping_missing":
+            value = asdict(snapshot)
+            value.pop("source_identity")
+            return value
+        if self.fault_kind == "mapping_empty":
+            value = asdict(snapshot)
+            value["source_identity"] = ""
+            return value
+        if self.fault_kind == "mapping_invalid":
+            value = asdict(snapshot)
+            value["source_identity"] = 99
+            return value
+        if self.fault_kind == "wrong_account":
+            return replace(snapshot, account_index=99)
+        if self.fault_kind == "wrong_market":
+            return replace(snapshot, market_id=99)
+        if self.fault_kind == "decoder":
+            raise ContractError("synthetic account decoder failure")
+        raise AssertionError(f"unknown account fault kind: {self.fault_kind}")
+
+    async def account_snapshot(self, account_index: int, market_id: int):
+        snapshot = await super().account_snapshot(account_index, market_id)
+        if (
+            not self.fault_injected
+            and self.clock.now() >= NOW + 20
+            and account_index == self.target_account
+            and (self.boundary == "close" or self.fallback_plans)
+            and (self.boundary != "close" or not self.fallback_plans)
+        ):
+            self.boundary_reads += 1
+            if self.boundary_reads == self.target_read:
+                self.fault_injected = True
+                return self._fault(snapshot)
         return snapshot
 
 
@@ -1272,6 +1329,80 @@ async def test_transient_fallback_identity_failure_blocks_later_account_mutation
     assert not any(plan.account_index == 22 and plan.order_type == "MARKET" for plan in client.fallback_plans)
     assert client.source_position == Decimal("0")
     assert client.receiver_position == Decimal("0.20")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault_kind",
+    ["mapping_missing", "mapping_empty", "mapping_invalid", "wrong_account", "wrong_market", "decoder"],
+)
+@pytest.mark.parametrize("target_account", [11, 22])
+@pytest.mark.parametrize("target_read", [1, 2, 3])
+async def test_account_identity_binding_fault_is_terminal_before_dependent_writes(
+    tmp_path,
+    fault_kind,
+    target_account,
+    target_read,
+):
+    clock = AdvancingClock()
+    client = AccountBindingFaultClient(
+        clock,
+        fault_kind=fault_kind,
+        target_account=target_account,
+        target_read=target_read,
+    )
+    result = await run_random_cycle(
+        cycle_config(tmp_path / f"account-fault-{fault_kind}-{target_account}-{target_read}"),
+        client,
+        clock=clock,
+        rng=FixedRng(40, 20),
+    )
+
+    assert result.outcome is Outcome.UNKNOWN
+    assert "identity failure barrier" in (result.reason or "")
+    assert client.fault_injected
+    assert not client.fallback_plans
+    assert client.source_position == Decimal("-0.40")
+    assert client.receiver_position == Decimal("0.40")
+    if target_read < 3:
+        assert len(client.submissions) == 2
+        assert not any(plan.reduce_only for plan in client.submissions)
+    else:
+        assert len(client.submissions) == 3
+        assert [plan.reduce_only for plan in client.submissions] == [False, False, True]
+        assert client.cancellations
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault_kind",
+    ["mapping_missing", "mapping_empty", "mapping_invalid", "wrong_account", "wrong_market", "decoder"],
+)
+@pytest.mark.parametrize("target_account", [11, 22])
+async def test_account_identity_binding_fault_stops_fallback_rechecks_and_later_account(
+    tmp_path,
+    fault_kind,
+    target_account,
+):
+    clock = AdvancingClock()
+    client = AccountBindingFaultClient(
+        clock,
+        fault_kind=fault_kind,
+        target_account=target_account,
+        boundary="fallback",
+    )
+    result = await run_random_cycle(
+        cycle_config(tmp_path / f"fallback-account-fault-{fault_kind}-{target_account}"),
+        client,
+        clock=clock,
+        rng=FixedRng(40, 20),
+    )
+
+    assert result.outcome is Outcome.UNKNOWN
+    assert "identity failure barrier" in (result.reason or "")
+    assert client.fault_injected
+    assert len(client.fallback_plans) == 1
+    assert not any(plan.account_index == 22 for plan in client.fallback_plans)
 
 
 @pytest.mark.asyncio
