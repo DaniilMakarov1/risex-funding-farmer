@@ -22,13 +22,13 @@ cd "/Users/daniilmakarov/Desktop/RISEx Spread Shadow"
 PYTHONPATH=src .venv-hood/bin/python -m risex_spread_shadow.hood_handoff.cli local-attempt \
   --symbol BTC --quantity 0.00020 --direction LONG \
   --source-account-index 27331 --receiver-account-index 27337 --api-key-index 4 \
-  --attempt-dir "$PWD/spread-shadow-runs/hood-local-attempt-20260915/owner-live-002" \
+  --attempt-dir "$PWD/spread-shadow-runs/hood-launch-flow-20260916/owner-live-002" \
   --client-order-prefix hcr12-owner-002 \
   --keychain --defer-incremental-margin-calculation \
   --execute --i-understand-one-attempt-live-operation
 ```
 
-The attempt directory must be empty and owner-only, or its existing parent must be owner-only. The prior `owner-live-001` directory is consumed and preserved: its HCR-11 run stopped on a changed quote before engine admission. The command names a new `owner-live-002` directory for a separately confirmed owner invocation. Never clear or reuse an attempt directory containing evidence. Remove both execution flags for an offline preview: it shows the automatic rule, unresolved prices and timing defaults without numeric prompts, Keychain or network access. `--help` is also offline.
+The attempt directory must be empty and owner-only, or its existing parent must be owner-only. The prior `owner-live-001` directory is consumed and preserved: its HCR-11 run stopped on a changed quote before engine admission. The command names a new `owner-live-002` directory under the existing owner-only HCR-12 parent for a separately confirmed owner invocation. Never clear or reuse an attempt directory containing evidence. Remove both execution flags for an offline preview: it shows the automatic rule, unresolved prices and timing defaults without numeric prompts, Keychain or network access. `--help` is also offline.
 
 With both price flags omitted, source SELL uses best ask minus one tick if that stays strictly above best bid; otherwise it uses best ask. Source BUY mirrors that rule. Receiver worst-price bound equals the source price. Both sides must be valid, fresh and uncrossed. For a synthetic book with bid80000.0, ask80000.2 and tick0.1, SELL proposes80000.1 and estimated notional16.00002USD for0.00020BTC. This is an arithmetic illustration, not a current market quote.
 
