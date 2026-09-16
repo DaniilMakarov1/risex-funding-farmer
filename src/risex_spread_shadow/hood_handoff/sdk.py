@@ -450,9 +450,16 @@ class LighterSdkClient:
         if self.config.environment == "robinhood":
             evidence.setdefault("venue", "robinhood")
         observed_at = observed.get("observed_at")
-        if observed_at is None:
-            observed_at = self._clock()
-        evidence["observed_at"] = observed_at
+        required_live_minimums = ("min_base_amount", "min_quote_amount")
+        complete_live_minimums = all(field in observed and observed[field] is not None for field in required_live_minimums)
+        if complete_live_minimums:
+            if observed_at is None:
+                observed_at = self._clock()
+            evidence["observed_at"] = observed_at
+        elif "observed_at" not in evidence:
+            raise ContractError(
+                "incomplete orderBookDetails cannot establish a fresh market minimum observation"
+            )
         # Do not infer status/fees/precision/minimums from undocumented SDK
         # attributes.  Merge only exact named fields supplied by the operator.
         observed_aliases = {

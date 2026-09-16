@@ -279,3 +279,60 @@ async def test_official_orderbook_details_schema_is_selected_without_fee_inventi
     assert page.trades[0].counterparty_order_id == "245"
     assert page.trades[0].client_order_index == "123"
     assert page.trades[0].counterparty_client_order_index == "456"
+
+
+@pytest.mark.asyncio
+async def test_incomplete_live_minimums_do_not_refresh_old_market_evidence(monkeypatch):
+    class IncompleteOrderApi(FakeModule.OrderApi):
+        async def order_book_details(self, **kwargs):
+            payload = await super().order_book_details(**kwargs)
+            payload["order_book_details"][0].pop("min_quote_amount")
+            return payload
+
+    class IncompleteModule(FakeModule):
+        OrderApi = IncompleteOrderApi
+
+    config = HandoffConfig(
+        market_id=7,
+        direction="LONG",
+        quantity=Decimal("0.125"),
+        source_limit_price=Decimal("100.25"),
+        receiver_worst_price=Decimal("101.25"),
+        max_gross_notional=Decimal("200"),
+        source_fee_budget=Decimal("1"),
+        receiver_fee_budget=Decimal("1"),
+        freshness_seconds=10,
+        request_timeout_seconds=1,
+        order_timeout_seconds=1,
+        reconcile_timeout_seconds=1,
+        poll_interval_seconds=0.1,
+        max_poll_count=2,
+        source_order_lifetime_seconds=300,
+        client_order_prefix="missing-minimum-test",
+        journal_path="/tmp/missing-minimum-test.jsonl",
+        api_base_url="https://mainnet.zklighter.elliot.ai",
+        chain_id=304,
+        api_key_index=4,
+    )
+    client = LighterSdkClient(
+        config,
+        source_account_index=11,
+        receiver_account_index=22,
+        secrets=StaticSecretProvider({11: "secret-a", 22: "secret-b"}),
+        market_evidence={
+            "market_id": 7,
+            "symbol": "HOOD",
+            "minimum_quote_amount": "10",
+            "observed_at": 1000.0,
+            "margin_evidence": "saved operator evidence",
+        },
+        signer_factory=lambda **kwargs: FakeSigner(**kwargs),
+        clock=lambda: 1300.0,
+    )
+    monkeypatch.setattr(LighterSdkClient, "verify_sdk", staticmethod(lambda: None))
+    client._lighter = lambda: IncompleteModule
+
+    metadata = await client.market_metadata(7)
+
+    assert metadata.minimum_quote_amount == Decimal("10")
+    assert metadata.observed_at == 1000.0

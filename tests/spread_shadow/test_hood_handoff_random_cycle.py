@@ -515,6 +515,98 @@ class ExternalCloseClient(CycleClient):
         return await super().cancel_order(account_index, market_id, order_id)
 
 
+class ChildIdentityChangeClient(CycleClient):
+    """Change the source account identity at a selected child-close boundary."""
+
+    def __init__(self, clock: AdvancingClock, *, change_phase: str) -> None:
+        super().__init__(clock)
+        self.change_phase = change_phase
+        self.close_reads = 0
+        self.identity_changed = False
+        self.opening_complete = False
+
+    async def submit_order(self, plan):
+        receipt = await super().submit_order(plan)
+        if (
+            plan.order_type == "MARKET"
+            and not plan.reduce_only
+            and plan.account_index == self.receiver_account_index
+        ):
+            self.opening_complete = True
+        return receipt
+
+    async def account_snapshot(self, account_index: int, market_id: int) -> AccountSnapshot:
+        snapshot = await super().account_snapshot(account_index, market_id)
+        # The opening reconciliation happens at the initial clock value.  At
+        # the later hold deadline, the parent close reads both accounts first
+        # (relative reads 1-2), then the nested child preflight reads them
+        # (3-4), and its account recheck starts at read 5.  Stage the identity
+        # change at those child-relative boundaries so parent close admission
+        # remains valid and the child guard is the code under test.
+        if self.opening_complete and self.clock.now() > NOW and not self.identity_changed:
+            self.close_reads += 1
+            if (
+                account_index == self.source_account_index
+                and (
+                    (self.change_phase == "child-preflight" and self.close_reads == 3)
+                    or (self.change_phase == "child-recheck" and self.close_reads == 5)
+                )
+            ):
+                self.identity_changed = True
+        if self.identity_changed and account_index == self.source_account_index:
+            return replace(snapshot, source_identity="foreign-account")
+        return snapshot
+
+
+class FallbackReceiptTimingClient(CycleClient):
+    """Inject historical/future trade receipts without aging order snapshots."""
+
+    def __init__(
+        self,
+        clock: AdvancingClock,
+        *,
+        trade_age: float = 0.0,
+        order_age: float = 0.0,
+    ) -> None:
+        super().__init__(clock, partial_close=True)
+        self.trade_age = trade_age
+        self.order_age = order_age
+        self.fallback_order_ids: set[str] = set()
+
+    async def submit_order(self, plan):
+        receipt = await super().submit_order(plan)
+        if any(candidate is plan for candidate in self.fallback_plans) and receipt.order_id is not None:
+            self.fallback_order_ids.add(str(receipt.order_id))
+        return receipt
+
+    async def lookup_order(self, *args, **kwargs):
+        value = await super().lookup_order(*args, **kwargs)
+        if value is not None and value.order_id in self.fallback_order_ids and self.order_age:
+            return replace(value, observed_at=self.clock.now() - self.order_age)
+        return value
+
+    async def list_trades(self, account_index: int, market_id: int, *, order_id=None, cursor=None, limit=100):
+        page = await super().list_trades(
+            account_index,
+            market_id,
+            order_id=order_id,
+            cursor=cursor,
+            limit=limit,
+        )
+        if str(order_id) not in self.fallback_order_ids or not page.trades or not self.trade_age:
+            return page
+        trades = tuple(
+            replace(trade, observed_at=self.clock.now() - self.trade_age)
+            for trade in page.trades
+        )
+        return HistoryPage(
+            trades=trades,
+            orders=page.orders,
+            next_cursor=page.next_cursor,
+            complete=page.complete,
+        )
+
+
 def cycle_config(path: Path, **overrides) -> RandomCycleConfig:
     values = {
         "market_id": 7,
@@ -1018,6 +1110,58 @@ async def test_close_refuses_identity_drift_from_the_opening_lineage(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("direction", [Direction.LONG, Direction.SHORT])
+async def test_close_child_preflight_cannot_rebind_opening_account_identity(tmp_path, direction):
+    clock = AdvancingClock()
+    client = ChildIdentityChangeClient(clock, change_phase="child-preflight")
+    result = await run_random_cycle(
+        cycle_config(tmp_path / f"child-preflight-{direction.value.lower()}", direction=direction),
+        client,
+        clock=clock,
+        rng=FixedRng(20, 20),
+    )
+
+    assert result.outcome is Outcome.UNKNOWN
+    assert result.closing is not None
+    assert result.closing.outcome is Outcome.FAILED_PREFLIGHT_BLOCKED
+    assert result.closing.reason == "contract_error"
+    assert client.identity_changed
+    assert not [plan for plan in client.submissions if plan.reduce_only]
+    assert not client.fallback_plans
+    expected_source = Decimal("-0.20") if direction is Direction.LONG else Decimal("0.20")
+    expected_receiver = Decimal("0.20") if direction is Direction.LONG else Decimal("-0.20")
+    assert client.source_position == expected_source
+    assert client.receiver_position == expected_receiver
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("direction", [Direction.LONG, Direction.SHORT])
+async def test_close_child_recheck_cannot_rebind_identity_before_receiver_mutation(tmp_path, direction):
+    clock = AdvancingClock()
+    client = ChildIdentityChangeClient(clock, change_phase="child-recheck")
+    result = await run_random_cycle(
+        cycle_config(tmp_path / f"child-recheck-{direction.value.lower()}", direction=direction),
+        client,
+        clock=clock,
+        rng=FixedRng(20, 20),
+    )
+
+    assert result.outcome is Outcome.UNKNOWN
+    assert result.closing is not None
+    assert result.closing.outcome is Outcome.UNKNOWN
+    assert client.identity_changed
+    assert result.closing.unknown_reasons
+    assert any(plan.order_type == "LIMIT" and plan.reduce_only for plan in client.submissions)
+    assert not any(plan.order_type == "MARKET" and plan.reduce_only for plan in client.submissions)
+    assert not client.fallback_plans
+    assert client.cancellations
+    expected_source = Decimal("-0.20") if direction is Direction.LONG else Decimal("0.20")
+    expected_receiver = Decimal("0.20") if direction is Direction.LONG else Decimal("-0.20")
+    assert client.source_position == expected_source
+    assert client.receiver_position == expected_receiver
+
+
+@pytest.mark.asyncio
 async def test_fallback_polls_fresh_terminal_order_and_keeps_failure_reason(tmp_path):
     class StaleFallbackClient(CycleClient):
         async def lookup_order(self, *args, **kwargs):
@@ -1070,6 +1214,47 @@ async def test_fallback_polls_fresh_terminal_order_and_keeps_failure_reason(tmp_
     assert len(delayed_client.fallback_plans) == 2
     assert delayed_client.source_position == Decimal("0")
     assert delayed_client.receiver_position == Decimal("0")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "trade_age, order_age, expected_outcome, expected_reason",
+    [
+        (11.0, 0.0, Outcome.SUCCESS, None),
+        (-1.0, 0.0, Outcome.UNKNOWN, "future"),
+        (11.0, 11.0, Outcome.UNKNOWN, "stale"),
+    ],
+)
+async def test_fallback_history_separates_trade_time_from_order_snapshot_freshness(
+    tmp_path,
+    trade_age,
+    order_age,
+    expected_outcome,
+    expected_reason,
+):
+    clock = AdvancingClock()
+    client = FallbackReceiptTimingClient(
+        clock,
+        trade_age=trade_age,
+        order_age=order_age,
+    )
+    result = await run_random_cycle(
+        cycle_config(tmp_path / f"fallback-receipt-{trade_age}-{order_age}"),
+        client,
+        clock=clock,
+        rng=FixedRng(40, 20),
+    )
+
+    assert result.outcome is expected_outcome
+    if expected_reason is None:
+        assert len(result.fallbacks) == 2
+        assert all(item.outcome is Outcome.SUCCESS for item in result.fallbacks)
+        assert client.source_position == Decimal("0")
+        assert client.receiver_position == Decimal("0")
+    else:
+        assert expected_reason in (result.reason or "")
+        assert len(result.fallbacks) == 1
+        assert result.fallbacks[0].outcome is Outcome.UNKNOWN
 
 
 @pytest.mark.asyncio

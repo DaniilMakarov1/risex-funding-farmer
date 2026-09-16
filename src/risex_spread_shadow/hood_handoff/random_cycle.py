@@ -466,11 +466,26 @@ class RandomCycleClient(HandoffClient, Protocol):
 
 
 class _BoundMarketClient:
-    """Keep the exact pre-mutation metadata while delegating other reads."""
+    """Keep pre-mutation metadata and account identities across a child run.
 
-    def __init__(self, delegate: RandomCycleClient, metadata: MarketMetadata) -> None:
+    ``run_handoff`` performs its own preflight and account rechecks.  A random
+    cycle close has already established the opening account identities before
+    entering that child, so a later account snapshot must be checked against
+    those identities instead of becoming a new binding.
+    """
+
+    def __init__(
+        self,
+        delegate: RandomCycleClient,
+        metadata: MarketMetadata,
+        *,
+        source_identity: str | None = None,
+        receiver_identity: str | None = None,
+    ) -> None:
         self._delegate = delegate
         self._metadata = metadata
+        self._source_identity = source_identity
+        self._receiver_identity = receiver_identity
         self.source_account_index = delegate.source_account_index
         self.receiver_account_index = delegate.receiver_account_index
         self.sdk_version = getattr(delegate, "sdk_version", None)
@@ -479,6 +494,23 @@ class _BoundMarketClient:
         if market_id != self._metadata.market_id:
             raise ContractError("bound market identity does not match configured market")
         return self._metadata
+
+    async def account_snapshot(self, account_index: int, market_id: int) -> AccountSnapshot:
+        if market_id != self._metadata.market_id:
+            raise ContractError("bound account market identity does not match configured market")
+        raw = await self._delegate.account_snapshot(account_index, market_id)
+        snapshot = raw if isinstance(raw, AccountSnapshot) else AccountSnapshot.from_mapping(raw)
+        if account_index == self.source_account_index:
+            label = "source"
+            expected_identity = self._source_identity
+        elif account_index == self.receiver_account_index:
+            label = "receiver"
+            expected_identity = self._receiver_identity
+        else:
+            raise ContractError("bound account identity does not match configured cycle account")
+        if expected_identity is not None and snapshot.source_identity != expected_identity:
+            raise PreflightBlocked(f"{label} account identity changed after it was bound")
+        return snapshot
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._delegate, name)
@@ -903,7 +935,16 @@ class RandomCycleEngine:
         )
         journal.append("OPENING_PLAN_READY", {"config": opening_config_binding(opening_config), "selection": selection.as_dict()})
         self._stage = "OPENING"
-        opening = await run_handoff(opening_config, _BoundMarketClient(self.client, metadata), clock=self.clock)
+        opening = await run_handoff(
+            opening_config,
+            _BoundMarketClient(
+                self.client,
+                metadata,
+                source_identity=source.source_identity,
+                receiver_identity=receiver.source_identity,
+            ),
+            clock=self.clock,
+        )
         self._stage = "OPENING_RECONCILED"
         journal.append("OPENING_COMPLETE", {"result": opening.as_dict()})
         if opening.outcome is not Outcome.SUCCESS:
@@ -1190,7 +1231,16 @@ class RandomCycleEngine:
                 opening_receiver.position_after,
             )
             journal.append("CLOSING_PLAN_READY", {"config": opening_config_binding(close_config), "paired_quantity": format(paired_quantity, "f")})
-            closing = await run_handoff(close_config, _BoundMarketClient(self.client, metadata), clock=self.clock)
+            closing = await run_handoff(
+                close_config,
+                _BoundMarketClient(
+                    self.client,
+                    metadata,
+                    source_identity=opening_plan.source_identity,
+                    receiver_identity=opening_plan.receiver_identity,
+                ),
+                clock=self.clock,
+            )
             journal.append("CLOSING_COMPLETE", {"result": closing.as_dict()})
             return closing, None
         except asyncio.CancelledError:
@@ -1599,8 +1649,6 @@ class RandomCycleEngine:
                     seen_trade_ids.add(trade.trade_id)
                     if trade.observed_at > now:
                         raise ContractError("fallback trade receipt is from the future")
-                    if now - trade.observed_at > config.freshness_seconds:
-                        raise ContractError("fallback trade receipt is stale")
                     if trade.side.upper() != plan.side:
                         raise ContractError("fallback trade side conflicts with the plan")
                     if not (
