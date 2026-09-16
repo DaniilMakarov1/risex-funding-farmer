@@ -353,17 +353,10 @@ class HandoffEngine:
         # A missing/rejected/partially-filled source can never authorize B.
         if not unknown_reasons and source_order is not None and self._source_is_resting(source_order, plan.source):
             try:
-                source_recheck = _as_account(
-                    await self._bounded(
-                        self.client.account_snapshot(plan.source.account_index, plan.source.market_id),
-                        "source recheck account read",
-                    )
-                )
-                receiver_recheck = _as_account(
-                    await self._bounded(
-                        self.client.account_snapshot(plan.receiver.account_index, plan.receiver.market_id),
-                        "receiver recheck account read",
-                    )
+                source_recheck, receiver_recheck = await self._parallel_account_rechecks(
+                    plan.source.account_index,
+                    plan.receiver.account_index,
+                    plan.source.market_id,
                 )
                 source_order = await self._lookup_order(plan.source, source_order.order_id)
                 decision_now = self.clock.now()
@@ -571,6 +564,53 @@ class HandoffEngine:
             config=config,
             binding=binding,
         )
+
+    async def _parallel_account_rechecks(
+        self,
+        source_account_index: int,
+        receiver_account_index: int,
+        market_id: int,
+    ) -> tuple[AccountSnapshot, AccountSnapshot]:
+        """Read the two independent pre-receiver account snapshots together.
+
+        The exact source order is checked by the caller only after both reads
+        have completed.  If either bounded read fails or this task is
+        cancelled, cancel and drain the sibling before propagating the same
+        error so the caller cannot enter its mutation or cleanup path with a
+        live account read.
+        """
+
+        tasks: list[asyncio.Task[Any]] = []
+
+        async def read(account_index: int, label: str) -> AccountSnapshot:
+            value = await self._bounded(
+                self.client.account_snapshot(account_index, market_id),
+                label,
+            )
+            return _as_account(value)
+
+        try:
+            tasks.append(asyncio.create_task(read(source_account_index, "source recheck account read")))
+            tasks.append(asyncio.create_task(read(receiver_account_index, "receiver recheck account read")))
+            source_value, receiver_value = await asyncio.gather(*tasks)
+        except BaseException as exc:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            if not isinstance(exc, asyncio.CancelledError):
+                # Gather wakes on the first failure.  Report the first task in
+                # source/receiver order after both tasks are drained so two
+                # simultaneous read failures cannot change the diagnostic.
+                for task in tasks:
+                    if task.cancelled():
+                        continue
+                    task_error = task.exception()
+                    if task_error is not None:
+                        raise task_error
+            raise
+        return source_value, receiver_value
 
     async def _preflight(
         self,
