@@ -3,7 +3,7 @@
 SYSTEM_SPEC_VERSION = 4.2
 SPEC_STATUS = FIRST_RAW_RESEARCH_SCANNER_IMPLEMENTED
 
-## HCR-17 amendment — owner-selected random cycle (implementation pending)
+## HCR-17 amendment — owner-selected random cycle (accepted offline)
 
 A new one-cycle operator entry point may sample a legal BTC quantity uniformly in integer size ticks from venue minimums up to the smaller fresh available_balance divided by the selected opening price, without leverage multiplication. The same quantity applies to each leg. Missing/invalid balance, empty legal interval, stale data, non-flat initial positions or pending selected-market orders stop admission. Existing fixed-size entry points retain their behavior. A single LAUNCH authorizes the declared random size/timing policies; selection and credentials occur afterward. Persist exact bounds, balances, observation times and sampled values; do not redraw after dispatch.
 
@@ -11,7 +11,7 @@ Following full independently reconciled paired opening, sample and persist one i
 
 When a closing market executes against an external counterparty and our closing limit remains live, cancel the exact own limit and reconcile its terminal state and any cancellation-race fills before sizing the reduce-only market residual. Apply residual closure to each account with partial closing fills. Do not condition closing inventory on successful mutual trade matching. Never infer cancellation, zero residual or a full fill from an accepted mutation response alone.
 
-Exact-flat final positions and no unresolved own orders define closed inventory, separately from joint trade matching and opening success. Remaining known inventory is PARTIAL; unresolved execution is UNKNOWN. Fees/funding absent from evidence remain UNKNOWN. No automatic adoption of previously opened positions, next cycle, background daemon or restart trading. Original cycle/child attempts stay immutable and non-reusable. This amendment is authorized behavior, not a claim of implementation acceptance or live validation; see NEXT_TASK/STATUS.
+Exact-flat final positions and no unresolved own orders define closed inventory, separately from joint trade matching and opening success. Remaining known inventory is PARTIAL; unresolved execution is UNKNOWN. Fees/funding absent from evidence remain UNKNOWN. No automatic adoption of previously opened positions, next cycle, background daemon or restart trading. Original cycle/child attempts stay immutable and non-reusable. This amendment is implemented and accepted offline; it makes no live-validation or current-flatness claim. See NEXT_TASK/STATUS.
 
 ## HCR-16 amendment — bounded concurrent account rechecks
 

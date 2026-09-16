@@ -1,10 +1,12 @@
 # Current status
 
-## HCR-17 — CHANGES_REQUESTED oncac2ed7
+## HCR-17 — ACCEPTED OFFLINE; integration in progress
 
-Candidatecac2ed763718031171c152a7efb283b3e9cfb642 fixes all8prior transient identity cases; independent history/minimum/original controls remain correct. Full correction diff reviewed; clean isolated Python3.11.5/SDK1.1.2 suite4489passed3skipped, exit0, unchanged hashes/imports verified. New concrete cause: malformed/missing identity validation can throw before the barrier callback; parent invalid account/market validation and child response identity fields also bypass early rejection. One-shot missingidentity/wrongaccount probes still permit forbiddenfallback/SUCCESS; child wrongaccount admits closingLIMIT before laterstop. Exact finite correction and packets in owner-only chief-v4/review.md.
+Candidatee2ad3cf35d1d341f4836ed9c4da777e6d4dabb1a independently accepted by sole Chief01a0aafe-23fa-7c90-87a6-e807b3f6450a. One random legal BTC size capped by smaller free balance without leverage, one20..300secondhold after confirmed opening, paired reduce-only close and repeated reconciled residual market closes. Identity/decoder barrier persists across parent/child/fallback reads; old historical trades are not confused with stale snapshots; missing live minimums cannot refresh old evidence.
 
-Same healthy Builder native01a0aaff-5562-7c33-856b-19b30b754276 owns random_cycle.py and relevant tests on codex/spread-v1-hcr17-boundaries; source/receiver required identity field/decoder exceptions must stop dependent writes. Chief01a0aafe-23fa-7c90-87a6-e807b3f6450a retains sole docs/review/integration. Candidate/evidence preserved; no main integration/installation. Main/operator remaina175e1f. No live operations; historical owner004 positions not read/adopted/closed.
+Final clean isolated Python3.11.5/SDK1.1.2:4537passed3skipped exit0,130.48s; unchanged source/tests/config hashes and isolated imports. Full actual diff and correction surroundings independently reviewed;20identity adverse cases, original5behavior controls,8independent quantity cases and actualSDK/CLI synthetic freshness/LAUNCH/minimal-contract checks passed. Evidence hood-random-cycle-20260916/chief-v5; sorted-file-hash fingerprint2296b0a58054cdc8087048f1fa87564a26d616a3c52e743a267c5a59a5feebd1.
+
+Builder native01a0aaff-5562-7c33-856b-19b30b754276 delivered/released; all previous candidates/WIP/branches/worktrees/evidence preserved. Operator config and exact command prepared in owner-only operator-v1 and README. No agent live market/account reads, credentials/Keychain or trading. Historical owner004 inventory not adopted/read/closed; current flatness and fees/funding UNKNOWN. Accepted integration/publication verification is the remaining finite step.
 
 ## HCR-16 — ACCEPTED OFFLINE; bounded read latency improved
 

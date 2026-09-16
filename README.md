@@ -1,16 +1,50 @@
 # RISEx Spread Shadow and legacy Funding Farmer
 
-## Owner-local paired opening — current unresolved attempt
+## HCR-17 one random BTC cycle — accepted offline
 
-The owner ran owner-live-003. A later owner-authorized read-only check (HCR-15) confirmed source27331 position0 and canceled order562950026284934 with zero fill; receiver27337 position**+0.00020BTC**, order844424857365178 filled.00020, and no active BTC orders on either account. Actual trade724281192 bought.00020 at75906.5 from external seller8151, below the75907.1 bound. Gross notional15.181300 is not profit; fees were unavailable. Owner says the receiver position has not been closed.
+Candidatee2ad3cf passed4537tests/3skips in a final clean isolated Python3.11 suite and independent boundary checks. No live trading was performed for acceptance.
 
-**Do not launch another opening or reuse/clear the attempt directory while the existing inventory remains unresolved.** No automatic flattening/compensation is provided. Chief performed read-only authentication/account/order/trade requests, never a financial transaction or position closure.
+The new operator command performs one opening/hold/closing cycle. It draws a legal BTC quantity uniformly in integer size ticks, with gross notional capped by the smaller fresh free account balance without leverage. Receiver27337 opens LONG and source27331 opens SHORT with equal quantity; both accounts must initially be exactly flat in BTC with no active BTC orders. The hold is one random integer20..300seconds, timed from independent confirmation of both opening fills. Then it reverses sides with reduce-only on both legs, followed by separately reconciled market reduce-only attempts for any confirmed residuals. It never starts another opening automatically.
 
-Preserve all original files at:
-`/Users/daniilmakarov/Desktop/RISEx Spread Shadow/spread-shadow-runs/hood-launch-flow-20260916/owner-live-003`
-Earlier attempts also remain immutable. Original003 outcome UNKNOWN is not rewritten. Separate later evidence is in `spread-shadow-runs/hood-live-readcheck-20260916/chief-v1`.
+The operator files are in:
+`/Users/daniilmakarov/Desktop/RISEx Spread Shadow/spread-shadow-runs/hood-random-cycle-20260916/operator-v1/`
 
-HCR-14 fixed integer trade timestamp milliseconds entering an internal seconds field;4437 tests passed,3 skipped and18 independent checks passed. HCR-15 additionally replayed the actual received trade timestamp1789541676196 through old/new code without network: old code reproduces the original three errors; corrected code reconciles the observed positions and histories as **PARTIAL**, with no unknown reasons. This verifies real-response handling; no new financial lifecycle was run. Successful processing does not guarantee both orders fill or match each other.
+- `random-cycle.json` binds BTC market1, source27331/receiver27337, APIkey4, Robinhood endpoint/signing domain466324, the existing timing defaults and the explicitly authorized incremental opening-margin deferral.
+- `market-contract.json` contains only market identity and provenance requirements. It contains no guessed fees, minimums, balances or fresh timestamp. The actual response after LAUNCH must supply current increments/minimums; incomplete or stale evidence stops the dependent action.
+- `cycle-001` is the reserved output slot and is not created by preview. It must be new/empty and owner-only. After use, preserve it permanently; never clear or reuse it to retry.
+
+Offline preview, without credentials or market requests:
+
+```bash
+cd "/Users/daniilmakarov/Desktop/RISEx Spread Shadow"
+operator_dir="/Users/daniilmakarov/Desktop/RISEx Spread Shadow/spread-shadow-runs/hood-random-cycle-20260916/operator-v1"
+.venv-hood/bin/risex-hood-handoff random-cycle \
+  --config "$operator_dir/random-cycle.json"
+```
+
+After reviewing the preview, the owner may start the single declared cycle manually:
+
+```bash
+cd "/Users/daniilmakarov/Desktop/RISEx Spread Shadow"
+operator_dir="/Users/daniilmakarov/Desktop/RISEx Spread Shadow/spread-shadow-runs/hood-random-cycle-20260916/operator-v1"
+.venv-hood/bin/risex-hood-handoff random-cycle \
+  --config "$operator_dir/random-cycle.json" \
+  --market-evidence "$operator_dir/market-contract.json" \
+  --keychain --confirm-plan --execute \
+  --i-understand-one-attempt-live-operation
+```
+
+Type `LAUNCH` once at the prompt. Any other input cancels before SDK/client or credential access. Keep the terminal running through opening, hold and closure. Credentials remain in the protected Keychain/hidden local input; never put keys in these JSON files or command arguments.
+
+The quantity and hold are not operator inputs; they are sampled once and recorded in `cycle.jsonl`, alongside the child opening/closing journals and fallback receipts. Source limit resting is confirmed before receiver market dispatch. Own remaining limits are canceled and cancellation-race fills reconciled before any residual market order. Repeated terminal zero-fill attempts are paced by the existing poll interval and service both accounts fairly. There is no fixed retry count for fully reconciled residuals and therefore no guaranteed completion time in an illiquid market. Every new attempt requires a fresh bound and residual with a unique identity.
+
+Identity/decoder uncertainty, ambiguous execution/cancellation, invalid state or incomplete history stops dependent writes. A later normal snapshot does not erase an identity failure. Rejected or unexecutable below-minimum residuals remain honestly non-flat; no venue-minimum exemption is invented. `SUCCESS` requires reconciled closed inventory; it is separate from matching the other owned account and from profit. `PARTIAL` may still have open inventory, even if process exit is zero. Inspect the result and `cycle.jsonl`; an interrupted process or missing terminal event is incomplete and cannot be restarted blindly. Fees/funding remain UNKNOWN when not evidenced.
+
+### Current inventory boundary
+
+The last independently inspected owner004 opening recorded source-.00020BTC and receiver+.00020BTC, matched trade726095596 at75340.4. Current positions have not been read or closed by this development assignment. The new cycle will not adopt or close that historical inventory and will refuse a new opening if it is still present. Original owner003/004 evidence remains immutable. Historical003 receiver-only execution was independently reconciled separately; it is not the latest account-state observation.
+
+Existing fixed-size `local-attempt` remains available with its prior behavior and does not gain automatic closure. The random-cycle command above is the separate HCR-17 path.
 
 ## Local-attempt behavior
 
