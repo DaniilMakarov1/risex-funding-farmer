@@ -1,12 +1,12 @@
 # Current status
 
-## HCR-17 — ACCEPTED OFFLINE; integration in progress
+## HCR-17 — COMPLETE; accepted offline and installed
 
 Candidatee2ad3cf35d1d341f4836ed9c4da777e6d4dabb1a independently accepted by sole Chief01a0aafe-23fa-7c90-87a6-e807b3f6450a. One random legal BTC size capped by smaller free balance without leverage, one20..300secondhold after confirmed opening, paired reduce-only close and repeated reconciled residual market closes. Identity/decoder barrier persists across parent/child/fallback reads; old historical trades are not confused with stale snapshots; missing live minimums cannot refresh old evidence.
 
 Final clean isolated Python3.11.5/SDK1.1.2:4537passed3skipped exit0,130.48s; unchanged source/tests/config hashes and isolated imports. Full actual diff and correction surroundings independently reviewed;20identity adverse cases, original5behavior controls,8independent quantity cases and actualSDK/CLI synthetic freshness/LAUNCH/minimal-contract checks passed. Evidence hood-random-cycle-20260916/chief-v5; sorted-file-hash fingerprint2296b0a58054cdc8087048f1fa87564a26d616a3c52e743a267c5a59a5feebd1.
 
-Builder native01a0aaff-5562-7c33-856b-19b30b754276 delivered/released; all previous candidates/WIP/branches/worktrees/evidence preserved. Operator config and exact command prepared in owner-only operator-v1 and README. No agent live market/account reads, credentials/Keychain or trading. Historical owner004 inventory not adopted/read/closed; current flatness and fees/funding UNKNOWN. Accepted integration/publication verification is the remaining finite step.
+Builder native01a0aaff-5562-7c33-856b-19b30b754276 delivered/released; all previous candidates/WIP/branches/worktrees/evidence preserved. Operator config and exact command prepared in owner-only operator-v1 and README. No agent live market/account reads, credentials/Keychain or trading. Historical owner004 inventory not adopted/read/closed; current flatness and fees/funding UNKNOWN. Accepted code is installed in the operator checkout with exact tested file hashes/import roots; installed preview and CANCEL-before-LAUNCH passed without consuming cycle-001. Publication identity is recorded in chief-v5/publication.json. The finite software/operator delivery is complete; no live cycle has been run.
 
 ## HCR-16 — ACCEPTED OFFLINE; bounded read latency improved
 
