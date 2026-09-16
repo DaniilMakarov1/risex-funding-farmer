@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import asyncio
 import json
-from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 
@@ -363,6 +363,35 @@ def test_cli_local_attempt_direct_flags_stays_offline_without_execute(tmp_path, 
     assert not (tmp_path / "attempt").exists()
 
 
+def test_cli_automatic_preview_is_concise_and_keeps_fixed_parameters_visible(tmp_path, capsys):
+    assert main([
+        "local-attempt",
+        "--market-symbol", "BTC",
+        "--quantity", "0.00020",
+        "--direction", "LONG",
+        "--source-account-index", "27331",
+        "--receiver-account-index", "27337",
+        "--api-key-index", "4",
+        "--client-order-prefix", "hcr12-prefix",
+        "--attempt-dir", str(tmp_path / "automatic"),
+        "--defer-incremental-margin-calculation",
+    ]) == 0
+    output = capsys.readouterr().out
+    assert "OWNER_LOCAL_PENDING_LAUNCH" in output
+    assert "prices=UNRESOLVED" in output
+    assert "venue=robinhood-chain" in output
+    assert "api_base_url=https://api.rh.lighter.xyz" in output
+    assert "signing_domain=robinhood-chain chain_id=466324" in output
+    assert "source_leg=SELL LIMIT POST_ONLY" in output
+    assert "receiver_leg=BUY MARKET IOC" in output
+    assert "auth_lifetime:600s" in output
+    assert "margin_mode=DEFERRED" in output
+    assert "{" not in output
+    assert "bids" not in output
+    assert "no SDK import" in output
+    assert not (tmp_path / "automatic").exists()
+
+
 def _auto_book(*, bid: str = "99.0", ask: str = "100.0", observed_at: float = 1000.0) -> OrderBookSnapshot:
     return OrderBookSnapshot(
         market_id=1,
@@ -525,7 +554,19 @@ def test_automatic_collector_applies_declared_defaults_without_numeric_prompts(t
 
 
 @pytest.mark.asyncio
-async def test_automatic_attempt_revalidates_exact_quote_before_synthetic_engine(tmp_path):
+@pytest.mark.parametrize(
+    ("direction", "expected_price", "expected_notional"),
+    (
+        ("LONG", Decimal("99.9"), "19.980"),
+        ("SHORT", Decimal("99.1"), "19.820"),
+    ),
+)
+async def test_automatic_attempt_loads_keys_then_selects_one_fresh_book(
+    tmp_path,
+    direction,
+    expected_price,
+    expected_notional,
+):
     trace: list[str] = []
 
     class AutoSecrets:
@@ -539,125 +580,138 @@ async def test_automatic_attempt_revalidates_exact_quote_before_synthetic_engine
     class AutoReader:
         sdk_version = "1.1.2"
 
-        def __init__(
-            self,
-            *,
-            changed: bool = False,
-            final_observed_at: float = 1000.0,
-            proposal_observed_at: float = 1000.0,
-            final_bad_identity: bool = False,
-            proposal_bad_identity: object | None = None,
-            final_bad_metadata: bool = False,
-            final_book_failure: bool = False,
-        ) -> None:
-            self.metadata_calls = 0
-            self.book_calls = 0
-            self.changed = changed
-            self.final_observed_at = final_observed_at
-            self.proposal_observed_at = proposal_observed_at
-            self.final_bad_identity = final_bad_identity
-            self.proposal_bad_identity = proposal_bad_identity
-            self.final_bad_metadata = final_bad_metadata
-            self.final_book_failure = final_book_failure
-
         async def resolve_market(self, symbol: str):
             trace.append(f"metadata:{symbol}")
-            self.metadata_calls += 1
-            if self.metadata_calls == 1:
-                return replace(metadata(), observed_at=self.proposal_observed_at)
-            if self.final_bad_metadata:
-                return _auto_metadata_mapping(observed_at=self.final_observed_at, market_id=True)
-            return replace(metadata(), observed_at=self.final_observed_at)
+            return metadata()
 
         async def order_book_snapshot(self, market_id: int):
             trace.append(f"book:{market_id}")
-            self.book_calls += 1
-            if self.final_book_failure and self.book_calls == 2:
-                raise RuntimeError("synthetic partial public book read")
-            ask = "100.2" if self.changed and self.book_calls == 2 else "100.0"
-            observed_at = 1000.0 if self.book_calls == 1 else self.final_observed_at
-            if self.proposal_bad_identity is not None and self.book_calls == 1:
-                return {
-                    **_auto_book_mapping(market_id=self.proposal_bad_identity),
-                    "observed_at": observed_at,
-                }
-            if self.final_bad_identity and self.book_calls == 2:
-                return {
-                    **_auto_book_mapping(market_id=2),
-                    "observed_at": observed_at,
-                }
-            return _auto_book(ask=ask, observed_at=observed_at)
+            return _auto_book()
 
+    path = tmp_path / "automatic"
     local_inputs = inputs(
-        tmp_path / "automatic",
+        path,
+        direction=direction,
         quantity=Decimal("0.20"),
         source_limit_price=None,
         receiver_worst_price=None,
     )
-    reader = AutoReader()
     client = PairedClient()
-    proposal_output: list[str] = []
+    console: list[str] = []
     result = await run_local_attempt(
         local_inputs,
         execute=True,
         input_fn=lambda _: "LAUNCH",
-        output_fn=proposal_output.append,
+        output_fn=console.append,
         secret_provider_factory=lambda _: AutoSecrets(),
-        market_reader_factory=lambda *_: reader,
+        market_reader_factory=lambda *_: AutoReader(),
+        execution_client_factory=lambda *_: client,
+        clock=Clock(),
+    )
+
+    assert result.status == "COMPLETED"
+    assert [plan.price for plan in client.submissions] == [expected_price, expected_price]
+    assert trace[:4] == ["secret:11:4", "secret:22:4", "metadata:BTC", "book:1"]
+    assert trace[-1] == "secret-close"
+    assert len(console) == 2
+    assert "UNRESOLVED" in console[0]
+    assert "bids" not in console[0]
+    assert "POST_LAUNCH_PRICE_SELECTED" in console[1]
+    assert f"price={expected_price}" in console[1]
+    assert f"notional={expected_notional}" in console[1]
+    packet = json.loads((path / "attempt-packet.json").read_text())
+    assert packet["provenance"]["proposal"]["status"] == "UNRESOLVED_BEFORE_LAUNCH"
+    assert packet["provenance"]["proposal"]["prices"] is None
+    assert packet["provenance"]["final"]["prices"]["source_limit_price"] == format(expected_price, "f")
+    assert packet["execution"]["state"] == "TERMINAL_RECORDED"
+
+
+@pytest.mark.asyncio
+async def test_automatic_price_change_after_launch_is_selected_without_old_expiry_gate(tmp_path):
+    class AutoSecrets:
+        def private_key(self, account_index: int, api_key_index: int) -> str:
+            return "synthetic-secret"
+
+        def close(self) -> None:
+            return None
+
+    class ChangedReader:
+        sdk_version = "1.1.2"
+
+        async def resolve_market(self, symbol: str):
+            return metadata()
+
+        async def order_book_snapshot(self, market_id: int):
+            return _auto_book(ask="100.2")
+
+    client = PairedClient()
+    result = await run_local_attempt(
+        inputs(
+            tmp_path / "changed",
+            quantity=Decimal("0.20"),
+            source_limit_price=None,
+            receiver_worst_price=None,
+        ),
+        execute=True,
+        input_fn=lambda _: "LAUNCH",
+        output_fn=lambda _: None,
+        secret_provider_factory=lambda _: AutoSecrets(),
+        market_reader_factory=lambda *_: ChangedReader(),
         execution_client_factory=lambda *_: client,
         clock=Clock(),
     )
     assert result.status == "COMPLETED"
-    assert [plan.price for plan in client.submissions] == [Decimal("99.9"), Decimal("99.9")]
-    assert len(proposal_output) == 2
-    assert "\"bids\"" not in proposal_output[1]
-    assert json.loads(proposal_output[1])["timing"]["freshness_seconds"] == DEFAULT_FRESHNESS_SECONDS
-    assert trace[:4] == ["metadata:BTC", "book:1", "secret:11:4", "secret:22:4"]
-    assert trace[4:] == ["metadata:BTC", "book:1", "secret-close"]
-    packet = json.loads((tmp_path / "automatic" / "attempt-packet.json").read_text())
-    assert packet["provenance"]["proposal"]["prices"]["source_limit_price"] == "99.9"
-    assert packet["provenance"]["final"]["prices"]["source_limit_price"] == "99.9"
+    assert [plan.price for plan in client.submissions] == [Decimal("100.1"), Decimal("100.1")]
 
-    changed_inputs = inputs(
-        tmp_path / "changed",
-        quantity=Decimal("0.20"),
-        source_limit_price=None,
-        receiver_worst_price=None,
-    )
-    changed_reader = AutoReader(changed=True)
-    changed_client = PairedClient()
-    changed = await run_local_attempt(
-        changed_inputs,
-        execute=True,
-        input_fn=lambda _: "LAUNCH",
-        output_fn=lambda _: None,
-        secret_provider_factory=lambda _: AutoSecrets(),
-        market_reader_factory=lambda *_: changed_reader,
-        execution_client_factory=lambda *_: changed_client,
-        clock=Clock(),
-    )
-    assert changed.status == "INCOMPLETE"
-    assert changed_client.submissions == []
-    changed_packet = json.loads((tmp_path / "changed" / "attempt-packet.json").read_text())
-    assert changed_packet["provenance"]["status"] == "FINAL_REVALIDATION_FAILED"
-    assert changed_packet["provenance"]["final"]["prices"]["source_limit_price"] == "100.1"
 
-    class DelayedClock:
-        def __init__(self) -> None:
-            self.calls = 0
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reader_error", "reason_code"),
+    (
+        ("stale", "STALE_PUBLIC_OBSERVATION"),
+        ("invalid", "INVALID_PUBLIC_OBSERVATION"),
+        ("read", "PUBLIC_READ_FAILED"),
+        ("transport-stale-text", "PUBLIC_READ_FAILED"),
+    ),
+)
+async def test_automatic_invalid_or_stale_actual_evidence_is_a_known_pre_execution_stop(
+    tmp_path,
+    reader_error,
+    reason_code,
+):
+    class AutoSecrets:
+        def private_key(self, account_index: int, api_key_index: int) -> str:
+            return "synthetic-secret"
 
-        def now(self) -> float:
-            self.calls += 1
-            return 1000.0 if self.calls == 1 else 1011.0
-
-        async def sleep(self, seconds: float) -> None:
+        def close(self) -> None:
             return None
 
-    delayed_reader = AutoReader(final_observed_at=1011.0)
-    delayed_client = PairedClient()
-    delayed = await run_local_attempt(
+    class FailingReader:
+        sdk_version = "1.1.2"
+
+        async def resolve_market(self, symbol: str):
+            if reader_error in {"read", "transport-stale-text"}:
+                message = (
+                    "synthetic stale connection while reading public metadata"
+                    if reader_error == "transport-stale-text"
+                    else "synthetic public metadata read failed"
+                )
+                raise RuntimeError(message)
+            return metadata()
+
+        async def order_book_snapshot(self, market_id: int):
+            if reader_error == "stale":
+                return _auto_book(observed_at=989.0)
+            return {
+                **_auto_book_mapping(market_id=2),
+                "observed_at": 1000.0,
+            }
+
+    path = tmp_path / reader_error
+    client = PairedClient()
+    result = await run_local_attempt(
         inputs(
-            tmp_path / "delayed",
+            path,
             quantity=Decimal("0.20"),
             source_limit_price=None,
             receiver_worst_price=None,
@@ -666,48 +720,48 @@ async def test_automatic_attempt_revalidates_exact_quote_before_synthetic_engine
         input_fn=lambda _: "LAUNCH",
         output_fn=lambda _: None,
         secret_provider_factory=lambda _: AutoSecrets(),
-        market_reader_factory=lambda *_: delayed_reader,
-        execution_client_factory=lambda *_: delayed_client,
-        clock=DelayedClock(),
-    )
-    assert delayed.status == "INCOMPLETE"
-    assert delayed_client.submissions == []
-    delayed_packet = json.loads((tmp_path / "delayed" / "attempt-packet.json").read_text())
-    assert delayed_packet["provenance"]["status"] == "FINAL_REVALIDATION_FAILED"
-    assert delayed_packet["provenance"]["proposal"]["prices"]["observed_at"] == 1000.0
-    assert delayed_packet["provenance"]["final"]["prices"]["observed_at"] == 1011.0
-
-    malformed_inputs = inputs(
-        tmp_path / "malformed-final",
-        quantity=Decimal("0.20"),
-        source_limit_price=None,
-        receiver_worst_price=None,
-    )
-    malformed_reader = AutoReader(final_bad_identity=True, proposal_observed_at=999.0)
-    malformed_client = PairedClient()
-    malformed = await run_local_attempt(
-        malformed_inputs,
-        execute=True,
-        input_fn=lambda _: "LAUNCH",
-        output_fn=lambda _: None,
-        secret_provider_factory=lambda _: AutoSecrets(),
-        market_reader_factory=lambda *_: malformed_reader,
-        execution_client_factory=lambda *_: malformed_client,
+        market_reader_factory=lambda *_: FailingReader(),
+        execution_client_factory=lambda *_: client,
         clock=Clock(),
     )
-    assert malformed.status == "INCOMPLETE"
-    assert malformed_client.submissions == []
-    malformed_packet = json.loads((tmp_path / "malformed-final" / "attempt-packet.json").read_text())
-    assert malformed_packet["provenance"]["status"] == "FINAL_REVALIDATION_FAILED"
-    assert malformed_packet["provenance"]["final"]["book"]["market_id"] == 2
-    assert malformed_packet["provenance"]["final"]["book"]["observed_at"] == 1000.0
-    assert malformed_packet["provenance"]["final"]["prices"] is None
+    assert result.status == "INCOMPLETE"
+    assert result.terminal_status == "MISSING"
+    assert result.reason_code == reason_code
+    assert result.execution_state == "PRE_EXECUTION_STOP"
+    assert result.as_dict()["known_pre_execution_stop"] is True
+    assert client.submissions == []
+    terminal = json.loads((path / "terminal-result.json").read_text())
+    assert terminal["terminal_status"] == "MISSING"
+    packet = json.loads((path / "attempt-packet.json").read_text())
+    assert packet["execution"]["state"] == "PRE_EXECUTION_STOP"
+    assert packet["execution"]["dispatch_status"] == "NOT_DISPATCHED_BY_THIS_ATTEMPT"
+    assert packet["provenance"]["status"] == "FINAL_REVALIDATION_FAILED"
 
-    invalid_metadata_path = tmp_path / "invalid-final-metadata"
-    invalid_metadata_client = PairedClient()
-    invalid_metadata = await run_local_attempt(
+
+@pytest.mark.asyncio
+async def test_engine_error_with_stale_text_remains_unknown_execution(tmp_path):
+    class AutoSecrets:
+        def private_key(self, account_index: int, api_key_index: int) -> str:
+            return "synthetic-secret"
+
+        def close(self) -> None:
+            return None
+
+    class Reader:
+        sdk_version = "1.1.2"
+
+        async def resolve_market(self, symbol: str):
+            return metadata()
+
+        async def order_book_snapshot(self, market_id: int):
+            return _auto_book()
+
+    async def engine_error(*_args, **_kwargs):
+        raise RuntimeError("stale engine transport state")
+
+    result = await run_local_attempt(
         inputs(
-            invalid_metadata_path,
+            tmp_path / "engine-error",
             quantity=Decimal("0.20"),
             source_limit_price=None,
             receiver_worst_price=None,
@@ -716,63 +770,78 @@ async def test_automatic_attempt_revalidates_exact_quote_before_synthetic_engine
         input_fn=lambda _: "LAUNCH",
         output_fn=lambda _: None,
         secret_provider_factory=lambda _: AutoSecrets(),
-        market_reader_factory=lambda *_: AutoReader(final_bad_metadata=True),
-        execution_client_factory=lambda *_: invalid_metadata_client,
+        market_reader_factory=lambda *_: Reader(),
+        execution_client_factory=lambda *_: PairedClient(),
+        run_engine=engine_error,
         clock=Clock(),
     )
-    assert invalid_metadata.status == "INCOMPLETE"
-    assert invalid_metadata_client.submissions == []
-    invalid_metadata_packet = json.loads(
-        (invalid_metadata_path / "attempt-packet.json").read_text()
-    )
-    assert invalid_metadata_packet["provenance"]["status"] == "FINAL_REVALIDATION_FAILED"
-    assert invalid_metadata_packet["provenance"]["final"]["metadata"]["market_id"] is True
-    assert invalid_metadata_packet["provenance"]["final"]["book"] is None
-    assert invalid_metadata_packet["provenance"]["final"]["prices"] is None
+    assert result.status == "INCOMPLETE"
+    assert result.reason_code == "TERMINAL_RESULT_MISSING"
+    assert result.execution_state == "UNKNOWN_EXECUTION"
+    assert result.as_dict()["known_pre_execution_stop"] is False
+    assert "stopped before engine dispatch" not in (result.reason or "")
+    packet = json.loads((tmp_path / "engine-error" / "attempt-packet.json").read_text())
+    assert packet["execution"]["state"] == "UNKNOWN_EXECUTION"
+    assert packet["execution"]["dispatch_status"] == "UNKNOWN"
 
-    partial_path = tmp_path / "partial-final-book"
-    partial_client = PairedClient()
-    partial = await run_local_attempt(
-        inputs(
-            partial_path,
-            quantity=Decimal("0.20"),
-            source_limit_price=None,
-            receiver_worst_price=None,
-        ),
-        execute=True,
-        input_fn=lambda _: "LAUNCH",
-        output_fn=lambda _: None,
-        secret_provider_factory=lambda _: AutoSecrets(),
-        market_reader_factory=lambda *_: AutoReader(final_book_failure=True),
-        execution_client_factory=lambda *_: partial_client,
-        clock=Clock(),
-    )
-    assert partial.status == "INCOMPLETE"
-    assert partial_client.submissions == []
-    partial_packet = json.loads((partial_path / "attempt-packet.json").read_text())
-    assert partial_packet["provenance"]["status"] == "FINAL_REVALIDATION_FAILED"
-    assert partial_packet["provenance"]["final"]["metadata"]["observed_at"] == 1000.0
-    assert partial_packet["provenance"]["final"]["book"] is None
-    assert partial_packet["provenance"]["final"]["prices"] is None
 
-    for malformed_identity in (True, 1.5):
-        prelaunch_path = tmp_path / f"malformed-proposal-{malformed_identity}"
-        before = len(trace)
-        prelaunch = await run_local_attempt(
-            inputs(
-                prelaunch_path,
-                quantity=Decimal("0.20"),
-                source_limit_price=None,
-                receiver_worst_price=None,
-            ),
+@pytest.mark.asyncio
+async def test_interruption_after_engine_admission_leaves_unknown_packet_state(tmp_path):
+    class AutoSecrets:
+        def private_key(self, account_index: int, api_key_index: int) -> str:
+            return "synthetic-secret"
+
+        def close(self) -> None:
+            return None
+
+    class Reader:
+        sdk_version = "1.1.2"
+
+        async def resolve_market(self, symbol: str):
+            return metadata()
+
+        async def order_book_snapshot(self, market_id: int):
+            return _auto_book()
+
+    async def interrupted(*_args, **_kwargs):
+        raise asyncio.CancelledError()
+
+    path = tmp_path / "interrupted"
+    with pytest.raises(asyncio.CancelledError):
+        await run_local_attempt(
+            inputs(path, quantity=Decimal("0.20")),
             execute=True,
-            input_fn=lambda _: (_ for _ in ()).throw(AssertionError("invalid proposal must stop before LAUNCH")),
+            input_fn=lambda _: "LAUNCH",
             output_fn=lambda _: None,
-            secret_provider_factory=lambda _: (_ for _ in ()).throw(AssertionError("invalid proposal must stop before keys")),
-            market_reader_factory=lambda *_: AutoReader(proposal_bad_identity=malformed_identity),
-            execution_client_factory=lambda *_: (_ for _ in ()).throw(AssertionError("invalid proposal must stop before mutation client")),
+            secret_provider_factory=lambda _: AutoSecrets(),
+            market_reader_factory=lambda *_: Reader(),
+            execution_client_factory=lambda *_: PairedClient(),
+            run_engine=interrupted,
             clock=Clock(),
         )
-        assert prelaunch.status == "REFUSED"
-        assert not prelaunch_path.exists()
-        assert trace[before:] == ["metadata:BTC", "book:1"]
+    packet = json.loads((path / "attempt-packet.json").read_text())
+    exit_status = json.loads((path / "exit-status.json").read_text())
+    assert packet["execution"]["state"] == "UNKNOWN_EXECUTION"
+    assert packet["execution"]["dispatch_status"] == "UNKNOWN"
+    assert exit_status["execution_state"] == "UNKNOWN_EXECUTION"
+    assert not (path / "terminal-result.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_result_formatter_shows_engine_outcome_and_known_inventory(tmp_path):
+    client = PairedClient(source_fills_before_receiver=True)
+    result = await run_local_attempt(
+        inputs(tmp_path / "engine-failure", quantity=Decimal("0.20")),
+        execute=True,
+        input_fn=lambda _: "LAUNCH",
+        output_fn=lambda _: None,
+        secret_provider_factory=lambda _: Secrets([]),
+        market_reader_factory=lambda _, __: Reader([]),
+        execution_client_factory=lambda *_: client,
+        clock=Clock(),
+    )
+    output = local_attempt.format_local_attempt_result(result)
+    assert "LOCAL_ATTEMPT status=COMPLETED terminal=RECORDED" in output
+    assert "engine outcome=UNKNOWN phase=COMPLETE" in output
+    assert "engine_reason=source fill observed before receiver dispatch" in output
+    assert "inventory=source:position_after=-0.20,filled=0; receiver:position_after=0,filled=0" in output
