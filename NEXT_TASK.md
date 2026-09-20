@@ -6,7 +6,7 @@ On 2026-09-20 the owner explicitly authorized the previously proposed finite imp
 
 ## Ownership and base
 
-Accepted local/operator/remote main is `9359ed063d572c848cfaee8495fc5215bccfc89d`. Sole Chief task `01a0aafe-23fa-7c90-87a6-e807b3f6450a` owns this contract, independent review, integration and publication. One fresh visible Builder task (GPT-5.6 Luna max, reasoning max) owns production code and tests in its managed isolated worktree from branch `codex/spread-v1-simple-launch-builder`; maximum one Chief plus one Builder. Chief is GPT-6 Astra medium USER_SELECTED; actual runtime telemetry and Standard speed are UNKNOWN. Prior Builders are completed/archived and must not be reused. No global settings, credits or resets.
+Accepted local/operator/remote main is `9359ed063d572c848cfaee8495fc5215bccfc89d`. Sole Chief task `01a0aafe-23fa-7c90-87a6-e807b3f6450a` owns this contract, independent review, integration and publication. One fresh visible Builder task (GPT-5.6 Luna max, reasoning max) owns this cohesive production/code-test objective in its managed isolated worktree from branch `codex/spread-v1-simple-launch-builder`. There is no project-wide Builder concurrency cap; additional fresh Builders may be assigned whenever separate non-overlapping objectives make them useful. Chief is GPT-6 Astra medium USER_SELECTED; actual runtime telemetry and Standard speed are UNKNOWN. Prior Builders are completed/archived and must not be reused. No global settings, credits or resets.
 
 ## Required behavior
 
