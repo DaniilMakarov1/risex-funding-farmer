@@ -1,5 +1,9 @@
 # Current status
 
+## HCR-19 — ACTIVE; implementation assigned after contract commit
+
+Owner authorized resilient fresh-price preparation, at most three pre-mutation attempts, one-command `./start`, and concise Russian progress/error output. Exact boundaries are in NEXT_TASK. This is offline software work; no credentials, private/live reads or mutations. The consumed quote-change cycle001 remains immutable and non-reusable; current positions remain unread.
+
 ## HCR-18 — COMPLETE; accepted offline and installed
 
 Candidatea439c080ad8b3e893d2237e9f2ebb443b4b00b08 independently accepted. Fully reconciled early external source fills become knownPARTIAL and use existing reduce-only residual closure; no receiver opening chase or hold. Missing/visible terminal-order variants supported, while stale/identity/readiness/margin/history/cancellation barriers persist. Cycle account reads overlap at maximum2, errors/cancellation drain siblings, no concurrent mutations or policy changes.
