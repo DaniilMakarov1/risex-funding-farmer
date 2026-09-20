@@ -1,8 +1,10 @@
 # Current status
 
-## HCR-18 — IN DEVELOPMENT; owner cycle001 known external fill left unclosed
+## HCR-18 — CHANGES_REQUESTED on54cec8c
 
-Owner2026-09-20 requested bounded correction, safe latency improvement and randomization checks. Acceptedbase/main/operator/remote5ae9745 clean. Originalcycle001 logs independently inspected: fullsource.00027BTC externalfill, receiver undispatched/0, source-.00027 at recorded terminal; complete receipts/history/positions but provisional lookup-miss reason leavesUNKNOWN and disables residual handling. No agent current-account reads or financial operations. Immutable incident/timing/hash packet in hood-cycle-race-latency-20260920/chief-v1. Fresh Builder to implement/test under NEXT_TASK; prior accepted software/evidence preserved.
+Fresh Builder54cec8c has narrow missing-order/sourcefill classification and two-concurrent cycleaccount reads; full actualdiff independently reviewed. Independent4variant stale-prerecheck+lookupmiss cases incorrectly dispatchfallback after a freshness failure (P1);4equivalent visiblefilled-order cases remainUNKNOWN/unclosed (P2). Consolidated finite review/repros in hood-cycle-race-latency-20260920/chief-v2/review.md. Same healthy Builder owns correction, no main installation/publication.
+
+Builder reports145focusedpass, full4540pass4fail3skip. Chief independently confirms the same4S3envelope failures on cleanacceptedbase5ae9745 and candidate, Python3.11.5, underumask022/077; baseline cause unproven, unrelatedfiles unchanged. No skips/legacyrepair. Final isolatedfullsuite still required on correctedcandidate; saved benchmark/replay evidence delivery requested. Originalcycle001 immutable, current inventory not read or changed. Main/operator remain5ae9745.
 
 ## HCR-17 — COMPLETE; accepted offline and installed
 
