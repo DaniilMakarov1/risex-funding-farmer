@@ -10,4 +10,4 @@ else
     export PYTHONPATH="$project_root/src"
 fi
 
-exec python3 -m risex_spread_shadow.hood_handoff.cli simple "$@"
+exec python3 -m risex_spread_shadow.hood_handoff.cli simple --keychain "$@"

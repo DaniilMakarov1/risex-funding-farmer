@@ -64,6 +64,7 @@ CYCLE_JOURNAL_NAME = "cycle.jsonl"
 OPENING_JOURNAL_NAME = "opening.jsonl"
 CLOSING_JOURNAL_NAME = "closing.jsonl"
 LAUNCH_METADATA_NAME = "launch.json"
+ADMISSION_METADATA_NAME = "admission.json"
 
 
 def _require_owner_only_directory(path: Path, *, label: str) -> None:
@@ -95,6 +96,34 @@ def _atomic_launch_metadata(path: Path, payload: Mapping[str, Any]) -> None:
         raise PreflightBlocked("new cycle slot metadata could not be persisted") from exc
     finally:
         os.close(fd)
+
+
+def _validate_launch_metadata(path: Path) -> dict[str, Any]:
+    """Validate the immutable reservation before its one-time admission."""
+
+    metadata_path = path / LAUNCH_METADATA_NAME
+    if metadata_path.is_symlink() or not metadata_path.is_file():
+        raise PreflightBlocked("cycle reservation metadata is missing or unsafe")
+    try:
+        info = metadata_path.stat()
+        if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            raise PreflightBlocked("cycle reservation metadata must be owner-only")
+        value = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except PreflightBlocked:
+        raise
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise PreflightBlocked("cycle reservation metadata is unreadable") from exc
+    if not isinstance(value, Mapping):
+        raise PreflightBlocked("cycle reservation metadata must be one object")
+    if value.get("schema") != "hcr-19-simple-launch-v1":
+        raise PreflightBlocked("cycle reservation metadata has an unknown schema")
+    raw_cycle_dir = value.get("cycle_dir")
+    raw_prefix = value.get("client_order_prefix")
+    if not isinstance(raw_cycle_dir, str) or Path(raw_cycle_dir).resolve() != path.resolve():
+        raise PreflightBlocked("cycle reservation is bound to a different directory")
+    if not isinstance(raw_prefix, str) or not raw_prefix.strip():
+        raise PreflightBlocked("cycle reservation has no client-order prefix")
+    return dict(value)
 
 
 def allocate_cycle_slot(
@@ -941,6 +970,7 @@ class RandomCycleEngine:
         self._stage = "PREFLIGHT"
         self._identity_barrier: str | None = None
         self._selection: RandomCycleSelection | None = None
+        self._cycle_admitted = False
 
     def _mark_identity_failure(self, reason: str) -> None:
         """Keep the first identity mismatch as a cycle-wide dependency barrier."""
@@ -952,6 +982,7 @@ class RandomCycleEngine:
         self._stage = "PREFLIGHT"
         self._identity_barrier = None
         self._selection = None
+        self._cycle_admitted = False
         if not config.operator_execution_opt_in or not config.operator_plan_reviewed:
             return RandomCycleResult(
                 outcome=Outcome.PREVIEW,
@@ -1007,18 +1038,39 @@ class RandomCycleEngine:
             if journal is not None:
                 journal.release_attempt()
 
-    @staticmethod
-    def _prepare_cycle_directory(path: Path) -> None:
+    def _prepare_cycle_directory(self, path: Path) -> None:
         if path.is_symlink():
             raise PreflightBlocked("cycle directory must not be a symlink")
         if not path.exists():
             path.mkdir(mode=0o700)
+            return
         if not path.is_dir():
             raise PreflightBlocked("cycle path exists and is not a directory")
         info = path.stat()
         if info.st_uid != os.geteuid() or info.st_mode & 0o077:
             raise PreflightBlocked("cycle directory must be owner-only")
-        if any(path.iterdir()):
+        children = {item.name for item in path.iterdir()}
+        if not children:
+            os.chmod(path, 0o700)
+            return
+        if children == {LAUNCH_METADATA_NAME}:
+            reservation = _validate_launch_metadata(path)
+            _atomic_launch_metadata(
+                path / ADMISSION_METADATA_NAME,
+                {
+                    "schema": "hcr-19-admission-v1",
+                    "admitted_at": time.time(),
+                    "pid": os.getpid(),
+                    "cycle_dir": str(path),
+                    "client_order_prefix": reservation["client_order_prefix"],
+                },
+            )
+            self._cycle_admitted = True
+            os.chmod(path, 0o700)
+            return
+        if ADMISSION_METADATA_NAME in children:
+            raise PreflightBlocked("cycle directory was already admitted; no mutation was replayed")
+        if children:
             raise PreflightBlocked("cycle directory is already consumed")
         os.chmod(path, 0o700)
 
@@ -1041,7 +1093,15 @@ class RandomCycleEngine:
         info = path.stat()
         if info.st_uid != os.geteuid() or info.st_mode & 0o077:
             raise PreflightBlocked("cycle directory must be owner-only")
-        if any(path.iterdir()):
+        children = {item.name for item in path.iterdir()}
+        if not children:
+            return
+        if children == {LAUNCH_METADATA_NAME}:
+            _validate_launch_metadata(path)
+            return
+        if ADMISSION_METADATA_NAME in children:
+            raise PreflightBlocked("cycle directory was already admitted; no mutation was replayed")
+        if children:
             raise PreflightBlocked("cycle directory is already consumed")
 
     async def _execute_locked(self, config: RandomCycleConfig, journal: DurableJournal) -> RandomCycleResult:
@@ -1478,6 +1538,8 @@ class RandomCycleEngine:
         refreshed_bounds = compute_quantity_bounds(metadata, source, receiver, proposal.source_limit_price)
         if refreshed_bounds.size_step != selection.bounds.size_step:
             raise PreflightBlocked("opening size grid changed before mutation")
+        if selection.quantity_tick < refreshed_bounds.minimum_base_tick or selection.quantity_tick < refreshed_bounds.minimum_quote_tick:
+            raise PreflightBlocked("selected quantity no longer meets a fresh venue minimum")
         if not refreshed_bounds.lower_tick <= selection.quantity_tick <= refreshed_bounds.upper_tick:
             raise PreflightBlocked("fresh available balance no longer funds the selected quantity")
         if initial_source is not None and source.source_identity != initial_source.source_identity:

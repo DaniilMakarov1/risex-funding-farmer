@@ -704,13 +704,21 @@ def _simple_config_value(value: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _print_simple_summary(value: Mapping[str, Any], config_path: Path, operator_dir: Path) -> None:
+def _print_simple_summary(
+    value: Mapping[str, Any],
+    config_path: Path,
+    operator_dir: Path,
+    *,
+    use_keychain: bool,
+) -> None:
     direction = str(value.get("direction", "?")).upper()
     symbol = str(value.get("market_symbol", value.get("symbol", "?"))).upper()
     source = value.get("source_account_index", "?")
     receiver = value.get("receiver_account_index", "?")
-    print(f"Один офлайн-подготовленный цикл: {symbol}, направление {direction}.")
+    credential_route = "сохранённый Keychain" if use_keychain else "скрытый локальный ввод ключей"
+    print(f"Один реальный Robinhood Chain Mainnet цикл: {symbol}, направление {direction}.")
     print(f"Счета: источник {source}, приёмник {receiver}; слот будет выбран после подтверждения.")
+    print(f"После Enter будет использован {credential_route}; до Enter нет чтения рынка или доступа к ключам.")
     print(f"Конфигурация: {config_path}; каталог результатов: {operator_dir}.")
     print("Нажмите Enter, чтобы запустить один цикл. Введите C или CANCEL для отмены.")
 
@@ -748,53 +756,138 @@ def _read_simple_events(path: str | None) -> list[dict[str, Any]]:
     return events
 
 
-def format_random_cycle_result_ru(result: Any) -> str:
+def _simple_event_key(row: Mapping[str, Any]) -> tuple[str, int | None, int | None]:
+    payload = row.get("payload")
+    if not isinstance(payload, Mapping):
+        payload = {}
+    attempt = payload.get("attempt")
+    account_index = payload.get("account_index")
+    return (
+        str(row.get("event")),
+        attempt if isinstance(attempt, int) else None,
+        account_index if isinstance(account_index, int) else None,
+    )
+
+
+def _simple_event_line(row: Mapping[str, Any]) -> str | None:
+    event = row.get("event")
+    payload = row.get("payload")
+    if not isinstance(payload, Mapping):
+        payload = {}
+    attempt = payload.get("attempt")
+    if event == "SELECTION_PROVED":
+        selection = payload.get("selection")
+        if isinstance(selection, Mapping):
+            return f"Выбрано: {selection.get('quantity')} единиц, удержание {selection.get('hold_seconds')} с."
+    if event == "PREPARATION_ATTEMPT":
+        return f"Подготовка: попытка {attempt}/{MAX_PREPARATION_ATTEMPTS}."
+    if event == "PREPARATION_RETRY":
+        return f"Подготовка не завершена; повтор через {payload.get('delay_seconds')} с."
+    if event == "PREPARATION_FAILED":
+        return "Подготовка не прошла; проверяю свежий полный снимок."
+    if event == "PREPARATION_BLOCKED":
+        return "Подготовка остановлена: безопасный повтор запрещён."
+    if event == "PREPARATION_EXHAUSTED":
+        return "Подготовка остановлена: исчерпаны три попытки до записи."
+    if event == "OPENING_PRICE_UPDATED":
+        return (
+            "Котировка обновлена: "
+            f"{payload.get('old_source_price')} → {payload.get('new_source_price')} "
+            f"(попытка {attempt})."
+        )
+    if event == "PREPARATION_ACCEPTED":
+        return f"Подготовка принята (попытка {attempt}); запись ещё не отправлялась."
+    if event == "OPENING_BOUNDS_REFRESHED":
+        return "Свежие минимумы и балансы проверены для сохранённого объёма."
+    if event == "OPENING_PLAN_READY":
+        return "План открытия готов; до следующей границы ордера не отправляются."
+    if event == "FIRST_MUTATION_BOUNDARY":
+        return "Граница первой записи пройдена; дальнейшее состояние определяется журналом открытия."
+    if event == "OPENING_COMPLETE":
+        return "Открытие и его сверка завершены."
+    if event == "HOLD_ANCHORED":
+        return f"Удержание начато: {payload.get('hold_seconds')} с от подтверждённого открытия."
+    if event == "CLOSING_PLAN_READY":
+        return "Закрытие подготовлено по фактическим позициям."
+    if event == "CLOSING_COMPLETE":
+        return "Закрытие и его сверка завершены."
+    if event in {"FALLBACK_ATTEMPT_EVIDENCE", "FALLBACK_RECONCILED", "FALLBACK_RECONCILIATION_UNKNOWN"}:
+        return "Сверка остатка позиции выполнена."
+    return None
+
+
+def _simple_durable_state(cycle_dir: Path) -> tuple[bool, str, str]:
+    cycle_events = _read_simple_events(str(cycle_dir / "cycle.jsonl"))
+    opening_events = _read_simple_events(str(cycle_dir / "opening.jsonl"))
+    all_events = [*cycle_events, *opening_events]
+    boundary = any(
+        row.get("event") == "FIRST_MUTATION_BOUNDARY"
+        or str(row.get("event", "")).endswith("_DISPATCH_INTENT")
+        for row in all_events
+    )
+    source_text = receiver_text = "UNKNOWN"
+    for row in reversed(cycle_events):
+        if row.get("event") != "CYCLE_COMPLETE":
+            continue
+        payload = row.get("payload")
+        if not isinstance(payload, Mapping):
+            continue
+        remaining = payload.get("remaining_positions")
+        if not isinstance(remaining, Mapping):
+            continue
+        if remaining.get("source") is not None:
+            source_text = str(remaining["source"])
+        if remaining.get("receiver") is not None:
+            receiver_text = str(remaining["receiver"])
+        break
+    return boundary, source_text, receiver_text
+
+
+async def _stream_simple_progress(
+    journal_path: Path,
+    emitted_keys: set[tuple[str, int | None, int | None]],
+    stop_event: asyncio.Event,
+) -> None:
+    """Print each durable progress event once while the finite cycle runs."""
+
+    while True:
+        for row in _read_simple_events(str(journal_path)):
+            key = _simple_event_key(row)
+            if key in emitted_keys:
+                continue
+            line = _simple_event_line(row)
+            if line is None:
+                continue
+            print(line, flush=True)
+            emitted_keys.add(key)
+        if stop_event.is_set():
+            return
+        await asyncio.sleep(0.05)
+
+
+def format_random_cycle_result_ru(
+    result: Any,
+    *,
+    emitted_keys: set[tuple[str, int | None, int | None]] | None = None,
+) -> str:
     """Render the simple launch result without replacing the durable JSONL."""
 
     events = _read_simple_events(getattr(result, "journal_path", None))
     lines: list[str] = []
-    seen: set[tuple[str, int | None]] = set()
+    emitted = emitted_keys if emitted_keys is not None else set()
     for row in events:
-        event = row.get("event")
-        payload = row.get("payload")
-        if not isinstance(payload, Mapping):
-            payload = {}
-        attempt = payload.get("attempt")
-        key = (str(event), attempt if isinstance(attempt, int) else None)
-        if key in seen:
+        key = _simple_event_key(row)
+        if key in emitted:
             continue
-        seen.add(key)
-        if event == "PREPARATION_ATTEMPT":
-            lines.append(f"Подготовка: попытка {attempt}/{MAX_PREPARATION_ATTEMPTS}.")
-        elif event == "PREPARATION_RETRY":
-            lines.append(f"Подготовка не завершена; повтор через {payload.get('delay_seconds')} с.")
-        elif event == "OPENING_PRICE_UPDATED":
-            lines.append(
-                "Котировка обновлена: "
-                f"{payload.get('old_source_price')} → {payload.get('new_source_price')} "
-                f"(попытка {attempt})."
-            )
-        elif event == "PREPARATION_ACCEPTED":
-            lines.append(f"Подготовка принята (попытка {attempt}); запись ещё не отправлялась.")
-        elif event == "OPENING_BOUNDS_REFRESHED":
-            lines.append("Свежие минимумы и балансы проверены для сохранённого объёма.")
-        elif event == "OPENING_PLAN_READY":
-            lines.append("План открытия готов; до следующей границы ордера не отправляются.")
-        elif event == "FIRST_MUTATION_BOUNDARY":
-            lines.append("Граница первой записи пройдена; дальнейшее состояние определяется журналом открытия.")
-        elif event == "OPENING_COMPLETE":
-            lines.append("Открытие и его сверка завершены.")
-        elif event == "HOLD_ANCHORED":
-            lines.append(f"Удержание начато: {payload.get('hold_seconds')} с от подтверждённого открытия.")
-        elif event == "CLOSING_PLAN_READY":
-            lines.append("Закрытие подготовлено по фактическим позициям.")
-        elif event == "CLOSING_COMPLETE":
-            lines.append("Закрытие и его сверка завершены.")
-        elif event in {"FALLBACK_ATTEMPT_EVIDENCE", "FALLBACK_RECONCILED", "FALLBACK_RECONCILIATION_UNKNOWN"}:
-            lines.append("Сверка остатка позиции выполнена.")
+        line = _simple_event_line(row)
+        if line is not None:
+            lines.append(line)
+            emitted.add(key)
 
     selection = getattr(result, "selection", None)
-    if selection is not None and not any(line.startswith("Выбрано:") for line in lines):
+    if selection is not None and not any(line.startswith("Выбрано:") for line in lines) and not any(
+        key[0] == "SELECTION_PROVED" for key in emitted
+    ):
         lines.insert(
             0,
             f"Выбрано: {selection.quantity} единиц, удержание {selection.hold_seconds} с.",
@@ -803,19 +896,26 @@ def format_random_cycle_result_ru(result: Any) -> str:
     outcome = getattr(getattr(result, "outcome", None), "value", str(getattr(result, "outcome", "UNKNOWN")))
     source = getattr(result, "remaining_source_position", None)
     receiver = getattr(result, "remaining_receiver_position", None)
+    journal = getattr(result, "journal_path", None)
+    mutation_boundary = False
+    durable_source = durable_receiver = "UNKNOWN"
+    if journal:
+        mutation_boundary, durable_source, durable_receiver = _simple_durable_state(Path(journal).parent)
     source_text = "UNKNOWN" if source is None else format(source, "f")
     receiver_text = "UNKNOWN" if receiver is None else format(receiver, "f")
-    mutation_boundary = any(row.get("event") == "FIRST_MUTATION_BOUNDARY" for row in events)
+    if source is None and durable_source != "UNKNOWN":
+        source_text = durable_source
+    if receiver is None and durable_receiver != "UNKNOWN":
+        receiver_text = durable_receiver
     if outcome == "SUCCESS":
         lines.append("Итог: SUCCESS — обе позиции подтверждённо закрыты.")
     else:
-        may_have_sent = "нет" if not mutation_boundary else "да или неизвестно"
+        may_have_sent = "да или неизвестно" if mutation_boundary else "нет"
         reason = getattr(result, "reason", None) or "результат не подтверждён"
         lines.append(f"Итог: {outcome} — {reason}.")
         lines.append(
             f"Ордер мог быть отправлен: {may_have_sent}; остаток: источник={source_text}, приёмник={receiver_text}."
         )
-        journal = getattr(result, "journal_path", None)
         if journal:
             lines.append(f"Действие: сохранён журнал {journal}; UNKNOWN нельзя трактовать как flat.")
     return "\n".join(lines)
@@ -829,7 +929,12 @@ async def _run_simple(args: argparse.Namespace) -> int:
     config_path = _simple_config_path(args.config)
     value = _load_json(config_path, "simple launcher configuration")
     operator_dir = _simple_operator_dir(config_path)
-    _print_simple_summary(value, config_path, operator_dir)
+    _print_simple_summary(
+        value,
+        config_path,
+        operator_dir,
+        use_keychain=args.keychain or args.keychain_replace,
+    )
     if not _simple_confirmation():
         return 0
 
@@ -864,6 +969,7 @@ async def _run_simple(args: argparse.Namespace) -> int:
     print(f"Новый слот занят: {cycle_dir}; уникальный префикс сохранён в {cycle_dir / 'launch.json'}.")
     secrets: Any | None = None
     client: LighterSdkClient | None = None
+    emitted_keys: set[tuple[str, int | None, int | None]] = set()
     try:
         evidence = _load_json(evidence_path, "market evidence")
         account_indices = (config.source_account_index, config.receiver_account_index)
@@ -879,18 +985,33 @@ async def _run_simple(args: argparse.Namespace) -> int:
             secrets=secrets,
             market_evidence=evidence,
         )
-        result = await run_random_cycle(config, client)
+        stop_progress = asyncio.Event()
+        progress_task = asyncio.create_task(
+            _stream_simple_progress(Path(config.journal_path), emitted_keys, stop_progress)
+        )
+        run_task = asyncio.create_task(run_random_cycle(config, client))
+        await asyncio.sleep(0)
+        try:
+            result = await run_task
+        finally:
+            stop_progress.set()
+            await progress_task
     except asyncio.CancelledError:
+        may_have_sent, source_text, receiver_text = _simple_durable_state(cycle_dir)
+        send_state = "да или неизвестно" if may_have_sent else "нет"
         print(
-            f"Прервано: ордер мог быть отправлен — неизвестно; сохранён журнал {cycle_dir / 'cycle.jsonl'}. "
+            f"Прервано: ордер мог быть отправлен — {send_state}; остаток: "
+            f"источник={source_text}, приёмник={receiver_text}; сохранён журнал {cycle_dir / 'cycle.jsonl'}. "
             "Не повторяйте этот слот и сначала выполните read-only сверку."
         )
         return 2
     except BaseException as exc:
         reason = str(exc) if isinstance(exc, SystemExit) and str(exc) else sanitize_exception(exc)
+        may_have_sent, source_text, receiver_text = _simple_durable_state(cycle_dir)
+        send_state = "да или неизвестно" if may_have_sent else "нет"
         print(
-            f"Ошибка запуска: {reason}. Ордер мог быть отправлен: нет до границы первой записи; "
-            f"позиции: UNKNOWN/UNKNOWN. Действие: сохранён слот {cycle_dir} и журнал "
+            f"Ошибка запуска: {reason}. Ордер мог быть отправлен: {send_state}; "
+            f"позиции: источник={source_text}, приёмник={receiver_text}. Действие: сохранён слот {cycle_dir} и журнал "
             f"{cycle_dir / 'cycle.jsonl'}; не повторяйте его автоматически."
         )
         return 2
@@ -899,7 +1020,7 @@ async def _run_simple(args: argparse.Namespace) -> int:
             await client.aclose()
         if secrets is not None:
             secrets.close()
-    print(format_random_cycle_result_ru(result))
+    print(format_random_cycle_result_ru(result, emitted_keys=emitted_keys))
     return 0 if result.outcome.value in {"SUCCESS", "PARTIAL", "PREVIEW"} else 2
 
 

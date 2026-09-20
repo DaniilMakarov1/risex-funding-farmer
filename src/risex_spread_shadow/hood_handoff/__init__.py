@@ -84,6 +84,7 @@ from .readiness import (
 from .random_cycle import (
     CLOSING_JOURNAL_NAME,
     CYCLE_JOURNAL_NAME,
+    ADMISSION_METADATA_NAME,
     FallbackResult,
     MAX_HOLD_SECONDS,
     MAX_PREPARATION_ATTEMPTS,
@@ -227,6 +228,7 @@ __all__ = [
     "run_readiness",
     "CLOSING_JOURNAL_NAME",
     "CYCLE_JOURNAL_NAME",
+    "ADMISSION_METADATA_NAME",
     "FallbackResult",
     "MAX_HOLD_SECONDS",
     "MAX_PREPARATION_ATTEMPTS",
