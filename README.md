@@ -1,15 +1,15 @@
 # RISEx Spread Shadow and legacy Funding Farmer
 
-## HCR-17 one random BTC cycle — accepted offline
+## HCR-18 one random BTC cycle — accepted offline
 
-**Current owner result:** `operator-v1/cycle-001` has been used and must not be reused or cleared. Its recorded terminal shows source27331 SHORT0.00027BTC after two external fills and receiver27337 zero/undispatched; overall UNKNOWN prevented closure. Current inventory has not been read. HCR-18 is correcting and testing this software path offline; the command below is preserved documentation of the consumed configuration, not a fresh launch instruction. A later release will provide a separate unused slot.
+**Historical owner result:** the HCR-17 `operator-v1/cycle-001` is consumed and must never be cleared or reused. It recorded source27331 SHORT0.00027BTC after two external fills and receiver27337 zero/undispatched. Current inventory has not been read or changed by this software task. The updated configuration below uses a separate unused output slot; a new opening still requires both accounts exactly flat.
 
-Candidatee2ad3cf passed4537tests/3skips in a final clean isolated Python3.11 suite and independent boundary checks. No live trading was performed for acceptance.
+Candidatea439c08 passed4570tests/3skips in a final clean isolated Python3.11 suite. Confirmed external source fills now trigger the existing cycle residual-closing path after complete reconciliation, without a receiver opening chase or hold. Genuine uncertainty still blocks dependent writes. Shared account-read window measured approximately55–57ms to32–33ms with controlled20/30ms read delays; live order/fill latency was not measured and matching to an owned account is not guaranteed.
 
 The new operator command performs one opening/hold/closing cycle. It draws a legal BTC quantity uniformly in integer size ticks, with gross notional capped by the smaller fresh free account balance without leverage. Receiver27337 opens LONG and source27331 opens SHORT with equal quantity; both accounts must initially be exactly flat in BTC with no active BTC orders. The hold is one random integer20..300seconds, timed from independent confirmation of both opening fills. Then it reverses sides with reduce-only on both legs, followed by separately reconciled market reduce-only attempts for any confirmed residuals. It never starts another opening automatically.
 
 The operator files are in:
-`/Users/daniilmakarov/Desktop/RISEx Spread Shadow/spread-shadow-runs/hood-random-cycle-20260916/operator-v1/`
+`/Users/daniilmakarov/Desktop/RISEx Spread Shadow/spread-shadow-runs/hood-cycle-race-latency-20260920/operator-v1/`
 
 - `random-cycle.json` binds BTC market1, source27331/receiver27337, APIkey4, Robinhood endpoint/signing domain466324, the existing timing defaults and the explicitly authorized incremental opening-margin deferral.
 - `market-contract.json` contains only market identity and provenance requirements. It contains no guessed fees, minimums, balances or fresh timestamp. The actual response after LAUNCH must supply current increments/minimums; incomplete or stale evidence stops the dependent action.
@@ -19,7 +19,7 @@ Offline preview, without credentials or market requests:
 
 ```bash
 cd "/Users/daniilmakarov/Desktop/RISEx Spread Shadow"
-operator_dir="/Users/daniilmakarov/Desktop/RISEx Spread Shadow/spread-shadow-runs/hood-random-cycle-20260916/operator-v1"
+operator_dir="/Users/daniilmakarov/Desktop/RISEx Spread Shadow/spread-shadow-runs/hood-cycle-race-latency-20260920/operator-v1"
 .venv-hood/bin/risex-hood-handoff random-cycle \
   --config "$operator_dir/random-cycle.json"
 ```
@@ -28,7 +28,7 @@ After reviewing the preview, the owner may start the single declared cycle manua
 
 ```bash
 cd "/Users/daniilmakarov/Desktop/RISEx Spread Shadow"
-operator_dir="/Users/daniilmakarov/Desktop/RISEx Spread Shadow/spread-shadow-runs/hood-random-cycle-20260916/operator-v1"
+operator_dir="/Users/daniilmakarov/Desktop/RISEx Spread Shadow/spread-shadow-runs/hood-cycle-race-latency-20260920/operator-v1"
 .venv-hood/bin/risex-hood-handoff random-cycle \
   --config "$operator_dir/random-cycle.json" \
   --market-evidence "$operator_dir/market-contract.json" \
@@ -44,7 +44,7 @@ Identity/decoder uncertainty, ambiguous execution/cancellation, invalid state or
 
 ### Current inventory boundary
 
-The last independently inspected owner004 opening recorded source-.00020BTC and receiver+.00020BTC, matched trade726095596 at75340.4. Current positions have not been read or closed by this development assignment. The new cycle will not adopt or close that historical inventory and will refuse a new opening if it is still present. Original owner003/004 evidence remains immutable. Historical003 receiver-only execution was independently reconciled separately; it is not the latest account-state observation.
+The latest supplied cycle001 result recorded source-.00027BTC and receiver0. The new cycle does not adopt or close historical inventory and refuses a new opening while selected-market positions or pending orders remain. Current positions have not been read by this assignment. All original owner attempts remain immutable.
 
 Existing fixed-size `local-attempt` remains available with its prior behavior and does not gain automatic closure. The random-cycle command above is the separate HCR-17 path.
 

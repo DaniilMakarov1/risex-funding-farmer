@@ -1,10 +1,12 @@
 # Current status
 
-## HCR-18 — CHANGES_REQUESTED on54cec8c
+## HCR-18 — ACCEPTED OFFLINE; installation/publication pending
 
-Fresh Builder54cec8c has narrow missing-order/sourcefill classification and two-concurrent cycleaccount reads; full actualdiff independently reviewed. Independent4variant stale-prerecheck+lookupmiss cases incorrectly dispatchfallback after a freshness failure (P1);4equivalent visiblefilled-order cases remainUNKNOWN/unclosed (P2). Consolidated finite review/repros in hood-cycle-race-latency-20260920/chief-v2/review.md. Same healthy Builder owns correction, no main installation/publication.
+Candidatea439c080ad8b3e893d2237e9f2ebb443b4b00b08 independently accepted. Fully reconciled early external source fills become knownPARTIAL and use existing reduce-only residual closure; no receiver opening chase or hold. Missing/visible terminal-order variants supported, while stale/identity/readiness/margin/history/cancellation barriers persist. Cycle account reads overlap at maximum2, errors/cancellation drain siblings, no concurrent mutations or policy changes.
 
-Builder reports145focusedpass, full4540pass4fail3skip. Chief independently confirms the same4S3envelope failures on cleanacceptedbase5ae9745 and candidate, Python3.11.5, underumask022/077; baseline cause unproven, unrelatedfiles unchanged. No skips/legacyrepair. Final isolatedfullsuite still required on correctedcandidate; saved benchmark/replay evidence delivery requested. Originalcycle001 immutable, current inventory not read or changed. Main/operator remain5ae9745.
+Final clean isolated Python3.11.5/SDK1.1.2:4570passed3skipped exit0,126.09s; unchanged hashes and isolated imports. Builder171focusedpass; Chief12race/stale cases,4read-failure cases,8independent rational quantity cases and exact observed-terminal boundary replay passed. Actual transient HTTP responses unavailable, no claim of full transport replay. Earlier4S3envelope failures reproduced on acceptedbase/candidate remain undiagnosed; final fullsuite passes without unrelated code changes or added skips. Controlled20/30ms accountread delays,9repeats: median54.856to32.258ms and56.903to33.009ms for shared opening/closing readwindow; no measured livefill improvement. Evidence hood-cycle-race-latency-20260920/chief-v3.
+
+Originalcycle001 immutable; recorded source-.00027BTC/receiver0, current inventoryNOT_READ. No live/private/Keychain/trading actions. Fresh owner-only operator-v1 configuration prepared in HCR18 evidence with separate unusedcycle001, same policies; admission still requires initiallyflat accounts. Builder stopped after delivery; branches/worktrees/evidence preserved. Publication identity follows separately.
 
 ## HCR-17 — COMPLETE; accepted offline and installed
 

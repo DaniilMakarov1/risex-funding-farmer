@@ -3,6 +3,12 @@
 SYSTEM_SPEC_VERSION = 4.2
 SPEC_STATUS = FIRST_RAW_RESEARCH_SCANNER_IMPLEMENTED
 
+## HCR-18 amendment — reconciled early source fills and cycle reads
+
+An absent or terminal changed source order at the final pre-receiver recheck stops receiver dispatch. Preserve every account identity/freshness/readiness/margin/state check even when the exact source lookup is absent. Only complete independent terminal source order/trade/position reconciliation, unchanged undispatched receiver and no other safety barrier may classify the provisional missing/changed-order observation as known source-only PARTIAL. Preserve the original observation in evidence. The random-cycle caller may then close proven residuals using its existing reduce-only rules; incomplete paired opening never starts a hold or receiver opening chase. Fixed-size handoff callers do not gain automatic residual closure.
+
+Independent source/receiver cycle account reads may overlap at maximum two, with existing per-request deadlines and validation after both complete. Any read/decoder failure, timeout or cancellation cancels and drains siblings before subsequent handling. Mutations remain sequential; final exact maker-order recheck still follows both pre-receiver account reads. All policies, freshness thresholds, quantity/price/minimum rules and unknown barriers remain unchanged. Controlled read-window latency improvement is not a guarantee of intended-counterparty matching or faster live fills.
+
 ## HCR-17 amendment — owner-selected random cycle (accepted offline)
 
 A new one-cycle operator entry point may sample a legal BTC quantity uniformly in integer size ticks from venue minimums up to the smaller fresh available_balance divided by the selected opening price, without leverage multiplication. The same quantity applies to each leg. Missing/invalid balance, empty legal interval, stale data, non-flat initial positions or pending selected-market orders stop admission. Existing fixed-size entry points retain their behavior. A single LAUNCH authorizes the declared random size/timing policies; selection and credentials occur afterward. Persist exact bounds, balances, observation times and sampled values; do not redraw after dispatch.
