@@ -1155,6 +1155,8 @@ class HandoffConfig:
     # HCR-8 opt-in: leave only the local incremental opening-margin estimate
     # unperformed.  The default remains fail-closed.
     defer_incremental_margin_calculation: bool = False
+    # Optional parent lineage ordinal for bounded paired retries.
+    attempt_index: int | None = None
 
     def __post_init__(self) -> None:
         _int(self.market_id, "market_id", minimum=0)
@@ -1223,6 +1225,8 @@ class HandoffConfig:
             raise ContractError("operator_plan_reviewed must be bool")
         if not isinstance(self.defer_incremental_margin_calculation, bool):
             raise ContractError("defer_incremental_margin_calculation must be bool")
+        if self.attempt_index is not None:
+            _int(self.attempt_index, "attempt_index", minimum=1)
         if self.api_key_index is not None:
             _int(self.api_key_index, "api_key_index", minimum=4)
             if self.api_key_index > 254:
@@ -1647,6 +1651,14 @@ class HandoffResult:
     economic_findings: tuple[str, ...] = ()
     findings: tuple[str, ...] = ()
     operation_mode: OperationMode | str = OperationMode.CLOSE_REOPEN
+    # Paired operations may be safely retried only after the source order has
+    # been proven zero-fill, terminal/canceled, and fully reconciled.  This is
+    # deliberately separate from ``outcome``: the child attempt can be a
+    # guarded PARTIAL while the parent still has bounded retry budget.
+    retryable_pair: bool = False
+    attempt_index: int | None = None
+    latency: Mapping[str, Any] | None = None
+    priority_guard: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "operation_mode", OperationMode.parse(self.operation_mode))
@@ -1741,6 +1753,10 @@ class HandoffResult:
             "economic_status": self.economic_status,
             "economic_findings": list(self.economic_findings),
             "findings": list(self.findings),
+            "retryable_pair": self.retryable_pair,
+            "attempt_index": self.attempt_index,
+            "latency": None if self.latency is None else dict(self.latency),
+            "priority_guard": None if self.priority_guard is None else dict(self.priority_guard),
         }
 
 

@@ -344,6 +344,46 @@ class CycleClient:
         return HistoryPage(trades=self.trades.get(str(order_id), ()))
 
 
+class GuardSequenceClient(CycleClient):
+    """Expose one adverse public-book observation for an opening or close guard."""
+
+    def __init__(self, clock: AdvancingClock, bad_calls: set[int], *, same_price: bool = False) -> None:
+        super().__init__(clock)
+        self.bad_calls = set(bad_calls)
+        self.same_price = same_price
+        self.public_book_calls = 0
+
+    async def order_book(self, market_id: int) -> OrderBookSnapshot:
+        self.public_book_calls += 1
+        if self.public_book_calls not in self.bad_calls:
+            return await super().order_book(market_id)
+        if self.source_position == 0:
+            # Opening LONG source is SELL at 100.1.  A 100.0 ask is better;
+            # an anonymous/equivalent 100.1 ask has unproved queue priority.
+            ask_price = Decimal("100.1") if self.same_price else Decimal("100.0")
+            return OrderBookSnapshot(
+                market_id=7,
+                symbol="BTC",
+                bids=(DepthLevel(Decimal("99.0"), Decimal("100"), "guard-bid"),),
+                asks=(DepthLevel(ask_price, Decimal("1"), "foreign-guard-ask", 999),),
+                observed_at=self.clock.now(),
+                market_type="perp",
+                venue="robinhood",
+            )
+        # Paired closing SHORT source is BUY at 100.1.  A 100.2 bid is better;
+        # a 100.1 bid exercises the same-price FIFO-unknown branch.
+        bid_price = Decimal("100.1") if self.same_price else Decimal("100.2")
+        return OrderBookSnapshot(
+            market_id=7,
+            symbol="BTC",
+            bids=(DepthLevel(bid_price, Decimal("1"), "foreign-guard-bid", 999),),
+            asks=(DepthLevel(Decimal("101.0"), Decimal("100"), "guard-ask"),),
+            observed_at=self.clock.now(),
+            market_type="perp",
+            venue="robinhood",
+        )
+
+
 class UnknownFirstFallbackClient(CycleClient):
     def __init__(self, clock: AdvancingClock) -> None:
         super().__init__(clock, partial_close=True)
@@ -1101,6 +1141,161 @@ async def test_one_cycle_opens_holds_and_closes_actual_positions_once(tmp_path, 
     assert "HOLD_ANCHORED" in journal
     assert "CLOSING_PLAN_READY" in journal
     assert "CYCLE_COMPLETE" in journal
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("same_price", "guard_status", "reason_fragment"),
+    [
+        (False, "LOST", "better-priced volume"),
+        (True, "UNKNOWN", "queue/FIFO priority"),
+    ],
+)
+async def test_pre_receiver_priority_guard_cancels_zero_fill_and_retries_with_fresh_identity(
+    tmp_path,
+    same_price,
+    guard_status,
+    reason_fragment,
+):
+    clock = AdvancingClock()
+    client = GuardSequenceClient(clock, {3}, same_price=same_price)
+    cycle_path = tmp_path / f"opening-guard-{guard_status.lower()}"
+    result = await run_random_cycle(
+        cycle_config(cycle_path),
+        client,
+        clock=clock,
+        rng=FixedRng(20, 20),
+    )
+
+    assert result.outcome is Outcome.SUCCESS, result.as_dict()
+    assert result.inventory == "CONFIRMED_FLAT"
+    assert result.paired_execution == "SUCCESS"
+    assert result.economics == "UNKNOWN"
+    assert result.opening is not None
+    assert result.opening.attempt_index == 2
+    assert result.latency is not None
+    for phase in ("opening", "closing"):
+        measured = result.latency[phase]
+        for key in (
+            "public_book_read_seconds",
+            "source_submit_ack_seconds",
+            "source_visibility_seconds",
+            "concurrent_pre_receiver_checks_seconds",
+            "receiver_submit_ack_seconds",
+            "receiver_fill_observation_seconds",
+            "reconciliation_seconds",
+        ):
+            assert measured[key] >= 0
+    assert client.public_book_calls >= 5
+    opening_plans = [plan for plan in client.submissions if plan.order_type == "LIMIT" and not plan.reduce_only]
+    assert len(opening_plans) == 2
+    assert opening_plans[0].client_order_index != opening_plans[1].client_order_index
+    assert any(plan.order_type == "MARKET" and not plan.reduce_only for plan in client.submissions)
+
+    first_rows = [json.loads(line) for line in (cycle_path / "opening.jsonl").read_text().splitlines()]
+    first_guard = [row for row in first_rows if row["event"] == "PRE_RECEIVER_GUARD"]
+    assert first_guard and first_guard[0]["payload"]["status"] == guard_status
+    assert reason_fragment in first_guard[0]["payload"]["priority_reason"]
+    assert first_guard[0]["payload"]["request_finished_at"] >= first_guard[0]["payload"]["request_started_at"]
+    assert first_guard[0]["payload"]["source_order"]["client_order_index"] == opening_plans[0].client_order_index
+    assert not [row for row in first_rows if row["event"] == "RECEIVER_DISPATCH_INTENT"]
+    assert (cycle_path / "opening-attempt-002.jsonl").is_file()
+    second_rows = [
+        json.loads(line)
+        for line in (cycle_path / "opening-attempt-002.jsonl").read_text().splitlines()
+    ]
+    second_guard = [row for row in second_rows if row["event"] == "PRE_RECEIVER_GUARD"]
+    assert second_guard and second_guard[0]["payload"]["status"] == "PROVED"
+    parent_rows = [json.loads(line) for line in (cycle_path / "cycle.jsonl").read_text().splitlines()]
+    retries = [row for row in parent_rows if row["event"] == "PAIR_ATTEMPT_RETRY"]
+    assert len(retries) == 1
+    assert retries[0]["payload"]["next_attempt"] == 2
+
+
+@pytest.mark.asyncio
+async def test_paired_closing_priority_guard_is_symmetric_and_retries_with_new_child_journal(tmp_path):
+    clock = AdvancingClock()
+    # Initial=1, preparation=2, opening guard=3, closing parent read=4,
+    # closing guard=5.  The opening remains clean; only the closing guard is adverse.
+    client = GuardSequenceClient(clock, {5})
+    cycle_path = tmp_path / "closing-guard"
+    result = await run_random_cycle(
+        cycle_config(cycle_path),
+        client,
+        clock=clock,
+        rng=FixedRng(20, 20),
+    )
+
+    assert result.outcome is Outcome.SUCCESS, result.as_dict()
+    assert result.closing is not None
+    assert result.closing.attempt_index == 2
+    assert result.inventory == "CONFIRMED_FLAT"
+    assert (cycle_path / "closing.jsonl").is_file()
+    assert (cycle_path / "closing-attempt-002.jsonl").is_file()
+    first_rows = [json.loads(line) for line in (cycle_path / "closing.jsonl").read_text().splitlines()]
+    first_guard = [row for row in first_rows if row["event"] == "PRE_RECEIVER_GUARD"]
+    assert first_guard and first_guard[0]["payload"]["status"] == "LOST"
+    assert not [row for row in first_rows if row["event"] == "RECEIVER_DISPATCH_INTENT"]
+    second_rows = [
+        json.loads(line)
+        for line in (cycle_path / "closing-attempt-002.jsonl").read_text().splitlines()
+    ]
+    assert [row["payload"]["status"] for row in second_rows if row["event"] == "PRE_RECEIVER_GUARD"] == ["PROVED"]
+    close_sources = [plan for plan in client.submissions if plan.order_type == "LIMIT" and plan.reduce_only]
+    assert len(close_sources) == 2
+    assert close_sources[0].client_order_index != close_sources[1].client_order_index
+
+
+@pytest.mark.asyncio
+async def test_shared_pair_attempt_budget_exhaustion_never_dispatches_receiver_or_reuses_identity(tmp_path):
+    clock = AdvancingClock()
+    # Opening book calls: initial 1, preparation 2, then guard calls 3/5/7.
+    client = GuardSequenceClient(clock, {3, 5, 7})
+    cycle_path = tmp_path / "guard-budget-exhausted"
+    result = await run_random_cycle(
+        cycle_config(cycle_path),
+        client,
+        clock=clock,
+        rng=FixedRng(20, 20),
+    )
+
+    assert result.outcome is Outcome.PARTIAL
+    assert result.paired_execution == "FAILED"
+    assert result.inventory == "CONFIRMED_FLAT"
+    assert result.opening is not None and result.opening.attempt_index == 3
+    opening_sources = [plan for plan in client.submissions if plan.order_type == "LIMIT" and not plan.reduce_only]
+    assert len(opening_sources) == 3
+    assert len({plan.client_order_index for plan in opening_sources}) == 3
+    assert not [plan for plan in client.submissions if plan.order_type == "MARKET" and not plan.reduce_only]
+    rows = [json.loads(line) for line in (cycle_path / "cycle.jsonl").read_text().splitlines()]
+    exhausted = [row for row in rows if row["event"] == "PAIR_ATTEMPT_EXHAUSTED"]
+    assert exhausted
+    assert exhausted[-1]["payload"]["maximum_attempts"] == 3
+
+
+def test_cycle_004_offline_facts_keep_pair_failure_flat_inventory_and_unknown_fees_separate():
+    # Offline facts from cycle-004 are deliberately not treated as a fresh
+    # execution input: receiver filled against a better external maker,
+    # source was terminal zero-fill/canceled, and a later residual close made
+    # both final positions flat.  Fee receipts were absent.
+    opening = SimpleNamespace(
+        outcome=Outcome.PARTIAL,
+        retryable_pair=False,
+        economic_status="UNKNOWN",
+        joint_match_status="KNOWN_ZERO",
+        source=SimpleNamespace(filled_quantity=Decimal("0")),
+        receiver=SimpleNamespace(dispatched=True, filled_quantity=Decimal("0.00023")),
+    )
+    paired_execution, inventory, economics = random_cycle_module._cycle_classifications(
+        opening,
+        None,
+        (),
+        Decimal("0"),
+        Decimal("0"),
+    )
+    assert paired_execution == "FAILED"
+    assert inventory == "CONFIRMED_FLAT"
+    assert economics == "UNKNOWN"
 
 
 @pytest.mark.asyncio
