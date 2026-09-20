@@ -1,8 +1,12 @@
 # Current status
 
-## HCR-20 — ACTIVE; runtime-launch defect diagnosed
+## HCR-20 — ACCEPTED OFFLINE; installation/publication in progress
 
-The owner launch claimed immutable `operator-v1/cycle-002` and stopped before any mutation with `sdk_error`. Exact local diagnosis: root `./start` selected system `/opt/homebrew/bin/python3`, where `lighter` is absent, instead of prepared `.venv-hood/bin/python`, whose `lighter-sdk` distribution is 1.1.2. The cycle journal contains only start and preflight-block events, with no first-mutation boundary or dispatch intent; no order was sent according to durable evidence. Current positions remain NOT_READ. A fresh Builder will correct runtime selection, validate deterministic local prerequisites before slot allocation, improve the Russian cause, preserve cycle-002 and independently verify the next slot is not consumed by offline checks. No live/private action.
+Candidate `2be10d4a49cb74199db21260d94cae864ef5ecc4` independently accepted. Root `./start` now selects project `.venv-hood/bin/python` independent of PATH. The direct simple launcher validates local configuration, owner-only operator directory, market-evidence JSON, exact `lighter-sdk==1.1.2` distribution and module import before allocating a cycle slot. Setup failures are specific Russian errors and touch no Keychain/client/account/network or slot. Successful reservation wording is unambiguous.
+
+Chief full exact-candidate diff reviewed. Independent exact incident replay with system Python produced the missing-SDK cause before slot allocation; cycle directory inventory stayed unchanged. Final clean isolated Python 3.11 suite with candidate-bound import root: 4595 passed, 3 skipped, exit 0 in 118.28 seconds. Builder focused 134 passed and full suite 4595 passed, 3 skipped in 120.80 seconds. The first Chief suite invocation used the operator editable import root and was invalid for candidate acceptance; it produced ten expected old-code/new-test mismatches plus one unrelated timing-string coincidence. The correctly bound clean suite passed without code changes or skips.
+
+Consumed cycle-002 remains immutable: only CYCLE_STARTED then sdk_error preflight block, no first-mutation boundary or dispatch intent. Its incident hashes and diagnosis are preserved under `hood-runtime-launch-20260920/chief-v1`. Current accounts remain NOT_READ; no live/private/Keychain/network/order action was performed.
 
 ## HCR-19 — COMPLETE; accepted offline and installed
 

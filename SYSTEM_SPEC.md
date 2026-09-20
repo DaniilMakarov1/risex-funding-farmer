@@ -3,6 +3,10 @@
 SYSTEM_SPEC_VERSION = 4.2
 SPEC_STATUS = FIRST_RAW_RESEARCH_SCANNER_IMPLEMENTED
 
+## HCR-20 amendment — validate local runtime before reserving a cycle
+
+The repository-root `./start` must execute the project `.venv-hood/bin/python` independent of PATH. A missing or non-executable project interpreter stops with an actionable local Russian error before Python launcher execution. After confirmation but before allocating a cycle slot, the simple launcher validates the complete local configuration, owner-only operator directory, market-evidence JSON readability, exact `lighter-sdk==1.1.2` distribution and `lighter` module import. These checks access no Keychain, client, account or network. Any deterministic local failure creates no cycle directory and must name the setup cause rather than collapse to `sdk_error`. A successfully allocated slot is described as created and reserved and remains immutable. Existing first-mutation, no-replay and execution rules are unchanged.
+
 ## HCR-19 amendment — resilient preparation and simple operator launch
 
 For the random one-cycle path, sample quantity and hold exactly once. Before the first mutation, refresh official metadata, the public book and both accounts, recompute the existing one-tick opening price, and revalidate that same quantity against fresh grid, minimum, balance, identity, flat-position, active-order, readiness and margin facts. An ordinary quote move is accepted and recorded with the old and new price; the opening plan uses the accepted fresh price. A changed quote never authorizes a quantity redraw or a weaker admission check.
