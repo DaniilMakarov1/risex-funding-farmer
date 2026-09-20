@@ -1,8 +1,8 @@
 # Current status
 
-## HCR-19 — BLOCKED BEFORE IMPLEMENTATION; fresh Builder unavailable
+## HCR-19 — ACTIVE; fresh visible Builder dispatch in progress
 
-Owner authorized resilient fresh-price preparation, at most three pre-mutation attempts, one-command `./start`, and concise Russian progress/error output. Exact boundaries are committed in NEXT_TASK at `4e2852a`. Isolated branch/worktree `codex/spread-v1-simple-launch` at that base is clean, but the collaboration platform twice rejected creation of the required fresh explicit-role Builder with `agent thread limit reached`; only the completed historical HCR-18 Builder is available, and AGENTS.md forbids silently reusing it for a new objective. No production or test file has been changed. No credentials, private/live reads or mutations. The consumed quote-change cycle001 remains immutable and non-reusable; current positions remain unread. Resume by assigning the recorded contract to a fresh Builder when a slot is available.
+Owner authorized resilient fresh-price preparation, at most three pre-mutation attempts, one-command `./start`, and concise Russian progress/error output. Exact boundaries are in NEXT_TASK. The historical HCR-18 Builder is completed and archived. The owner explicitly authorized creation of a new Builder by an alternate platform path after the collaboration-agent limit rejected two attempts. A fresh visible Builder task receives the clean contract branch in a managed isolated worktree; no production/test change is accepted until independent Chief review. No credentials, private/live reads or mutations. The consumed quote-change cycle001 remains immutable and non-reusable; current positions remain unread.
 
 ## HCR-18 — COMPLETE; accepted offline and installed
 
