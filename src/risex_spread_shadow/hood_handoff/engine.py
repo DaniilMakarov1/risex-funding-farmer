@@ -1305,6 +1305,13 @@ class HandoffEngine:
             "source fill observed before receiver dispatch",
             "source order did not prove exact resting quantity",
         }
+        if self._known_source_only_partial(plan, source, receiver, unknown_reasons):
+            # The pre-receiver exact-order miss is retained in the durable
+            # evidence, but a later complete source reconciliation proves a
+            # known source-only residual.  That residual is eligible only for
+            # the caller's existing reduce-only cleanup path; it never makes
+            # the receiver dispatch or hold barrier pass.
+            known_partial_reasons.add("source order disappeared during pre-receiver recheck")
         unresolved = [
             reason
             for reason in (*unknown_reasons, *source.unknown_reasons, *receiver.unknown_reasons)
@@ -1330,6 +1337,48 @@ class HandoffEngine:
         if receiver.order is None and not receiver.trades and source.filled_quantity < plan.quantity:
             return Outcome.PARTIAL
         return Outcome.PARTIAL
+
+    @staticmethod
+    def _known_source_only_partial(
+        plan: HandoffPlan,
+        source: LegReconciliation,
+        receiver: LegReconciliation,
+        unknown_reasons: Sequence[str],
+    ) -> bool:
+        """Prove the narrow pre-receiver lookup race is a known residual.
+
+        A source order can disappear between the two bounded account reads
+        and the required final exact-order lookup.  The miss remains a stop
+        reason, while a later terminal order, complete trade history and
+        agreeing final position can prove the source leg independently.  All
+        other unknowns remain barriers, including a missing/conflicting final
+        order, identity drift, incomplete history or a dispatched receiver.
+        """
+
+        provisional_reason = "source order disappeared during pre-receiver recheck"
+        if provisional_reason not in unknown_reasons:
+            return False
+        if any(reason != provisional_reason for reason in unknown_reasons):
+            return False
+        if source.unknown_reasons or receiver.unknown_reasons:
+            return False
+        if not source.dispatched or receiver.dispatched:
+            return False
+        if not source.history_complete or not receiver.history_complete:
+            return False
+        if source.order is None or not source.order.terminal:
+            return False
+        if receiver.order is not None or receiver.trades:
+            return False
+        if receiver.position_after != receiver.position_before:
+            return False
+        if source.filled_quantity <= 0 or source.filled_quantity > plan.quantity:
+            return False
+        if source.order.filled_quantity != source.filled_quantity:
+            return False
+        expected_source = plan.source_position_before - plan.quantity * plan.direction.sign
+        expected_source += (plan.quantity - source.filled_quantity) * plan.direction.sign
+        return source.position_after == expected_source
 
     async def _resume_reconciliation(self, config: HandoffConfig, journal: DurableJournal) -> HandoffResult:
         events = journal.events

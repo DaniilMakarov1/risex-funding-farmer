@@ -354,6 +354,56 @@ class UnknownFirstFallbackClient(CycleClient):
         return await super().list_trades(account_index, market_id, order_id=order_id, cursor=cursor, limit=limit)
 
 
+class ExternalOpeningClient(CycleClient):
+    """Fill the source maker externally after the required recheck barrier."""
+
+    def __init__(self, clock: AdvancingClock, *, direction: Direction, fill_fraction: Decimal):
+        super().__init__(clock)
+        self.direction = direction
+        self.fill_fraction = fill_fraction
+        self.source_lookup_count = 0
+        self.injected = False
+
+    async def lookup_order(self, account_index, market_id, *, order_id=None, client_order_index=None):
+        value = await super().lookup_order(
+            account_index,
+            market_id,
+            order_id=order_id,
+            client_order_index=client_order_index,
+        )
+        if account_index == self.source_account_index and order_id is not None and value is not None:
+            self.source_lookup_count += 1
+            if self.source_lookup_count == 2 and not self.injected:
+                self.injected = True
+                filled = value.initial_quantity * self.fill_fraction
+                value = self._replace_order(
+                    value,
+                    status="filled" if filled == value.initial_quantity else "canceled",
+                    filled_quantity=filled,
+                    remaining_quantity=value.initial_quantity - filled,
+                )
+                self.source_position += -filled if value.side == "SELL" else filled
+                self.trades[value.order_id] = (
+                    TradeReceipt(
+                        f"external-source-{value.order_id}",
+                        self.source_account_index,
+                        value.market_id,
+                        value.order_id,
+                        value.side,
+                        filled,
+                        value.price,
+                        None,
+                        999,
+                        self.clock.now(),
+                        counterparty_order_id="external-maker",
+                        counterparty_client_order_index="external-client",
+                        client_order_index=value.client_order_index,
+                    ),
+                )
+                return None
+        return value
+
+
 class UnknownLaterFallbackClient(CycleClient):
     def __init__(self, clock: AdvancingClock) -> None:
         super().__init__(
@@ -1098,6 +1148,51 @@ async def test_partial_opening_never_starts_hold_and_closes_confirmed_residuals(
     assert client.source_position == Decimal("0")
     assert client.receiver_position == Decimal("0")
     journal = (tmp_path / "partial-open" / "cycle.jsonl").read_text()
+    assert "HOLD_ANCHORED" not in journal
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "direction, fill_fraction",
+    [
+        (Direction.LONG, Decimal("1")),
+        (Direction.SHORT, Decimal("0.5")),
+    ],
+)
+async def test_known_external_source_opening_fill_closes_residual_without_receiver_or_hold(
+    tmp_path,
+    direction,
+    fill_fraction,
+):
+    clock = AdvancingClock()
+    client = ExternalOpeningClient(
+        clock,
+        direction=direction,
+        fill_fraction=fill_fraction,
+    )
+    result = await run_random_cycle(
+        cycle_config(
+            tmp_path / f"external-opening-{direction.value.lower()}",
+            direction=direction,
+        ),
+        client,
+        clock=clock,
+        rng=FixedRng(20, 20),
+    )
+
+    assert result.outcome is Outcome.PARTIAL
+    assert result.opening is not None
+    assert result.opening.outcome is Outcome.PARTIAL
+    assert result.closing is None
+    assert result.fallbacks and all(item.outcome is Outcome.SUCCESS for item in result.fallbacks)
+    assert [(plan.order_type, plan.reduce_only) for plan in client.submissions] == [
+        ("LIMIT", False),
+        ("MARKET", True),
+    ]
+    assert client.source_position == Decimal("0")
+    assert client.receiver_position == Decimal("0")
+    assert clock.sleeps == []
+    journal = (tmp_path / f"external-opening-{direction.value.lower()}" / "cycle.jsonl").read_text()
     assert "HOLD_ANCHORED" not in journal
 
 

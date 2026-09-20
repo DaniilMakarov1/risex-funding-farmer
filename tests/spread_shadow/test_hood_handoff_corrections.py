@@ -252,6 +252,91 @@ async def test_proven_pre_receiver_partial_is_partial_and_never_opens_receiver(t
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "direction, fill_fraction",
+    [
+        (Direction.LONG, Decimal("1")),
+        (Direction.LONG, Decimal("0.5")),
+        (Direction.SHORT, Decimal("1")),
+        (Direction.SHORT, Decimal("0.5")),
+    ],
+)
+async def test_reconciled_source_only_external_fill_after_lookup_miss_is_known_partial(
+    tmp_path,
+    direction,
+    fill_fraction,
+):
+    class ExternalSourceRace(FakeClient):
+        def __init__(self):
+            super().__init__(source_fills=True)
+            self.source_position = Decimal("1") if direction is Direction.LONG else Decimal("-1")
+            self.source_lookup_count = 0
+            self.injected = False
+
+        async def lookup_order(self, account_index, market_id, *, order_id=None, client_order_index=None):
+            value = await super().lookup_order(
+                account_index,
+                market_id,
+                order_id=order_id,
+                client_order_index=client_order_index,
+            )
+            if account_index == self.source_account_index and order_id == "source-1":
+                self.source_lookup_count += 1
+                if self.source_lookup_count == 2 and not self.injected:
+                    self.injected = True
+                    assert self.source_order is not None
+                    filled = self.source_order.initial_quantity * fill_fraction
+                    status = "filled" if filled == self.source_order.initial_quantity else "canceled"
+                    self.source_order = replace(
+                        self.source_order,
+                        status=status,
+                        filled_quantity=filled,
+                        remaining_quantity=self.source_order.initial_quantity - filled,
+                    )
+                    self.source_position += -filled if self.source_order.side == "SELL" else filled
+                    return None
+            return value
+
+        async def list_trades(self, account_index, market_id, *, order_id=None, cursor=None, limit=100):
+            page = await super().list_trades(
+                account_index,
+                market_id,
+                order_id=order_id,
+                cursor=cursor,
+                limit=limit,
+            )
+            if account_index == self.source_account_index and order_id == "source-1" and self.source_order is not None:
+                return replace(
+                    page,
+                    trades=tuple(
+                        replace(trade, quantity=self.source_order.filled_quantity)
+                        for trade in page.trades
+                    ),
+                )
+            return page
+
+    client = ExternalSourceRace()
+    result = await run_handoff(
+        make_config(
+            tmp_path / f"source-only-{direction.value.lower()}-{fill_fraction}.jsonl",
+            direction=direction,
+        ),
+        client,
+        clock=FakeClock(),
+    )
+
+    assert result.outcome is Outcome.PARTIAL, result.as_dict()
+    assert result.reason == "source order disappeared during pre-receiver recheck"
+    assert result.source.filled_quantity == Decimal("0.125") * fill_fraction
+    assert result.source.history_complete
+    assert result.receiver.dispatched is False
+    assert result.receiver.order is None
+    assert result.receiver.trades == ()
+    assert "source order disappeared during pre-receiver recheck" in result.unknown_reasons
+    assert not [plan for plan in client.submissions if not plan.reduce_only]
+
+
+@pytest.mark.asyncio
 async def test_contradictory_terminal_order_cannot_be_success(tmp_path):
     class Contradictory(FakeClient):
         async def lookup_order(self, account_index, market_id, *, order_id=None, client_order_index=None):

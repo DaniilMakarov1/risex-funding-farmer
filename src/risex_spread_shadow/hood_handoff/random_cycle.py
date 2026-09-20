@@ -1122,8 +1122,7 @@ class RandomCycleEngine:
         return result
 
     async def _accounts(self, config: RandomCycleConfig, now: float | None = None) -> tuple[AccountSnapshot, AccountSnapshot]:
-        source = await self._read_account(config, config.source_account_index, "source account read")
-        receiver = await self._read_account(config, config.receiver_account_index, "receiver account read")
+        source, receiver = await self._parallel_accounts(config)
         # Account observations are stamped by the reads themselves.  Validate
         # against the clock after both have completed so a real transport's
         # small read latency cannot make a fresh response look future-dated.
@@ -1131,6 +1130,47 @@ class RandomCycleEngine:
         validation_now = self.clock.now()
         _validate_account_fresh(config, source, "source", validation_now)
         _validate_account_fresh(config, receiver, "receiver", validation_now)
+        return source, receiver
+
+    async def _parallel_accounts(
+        self,
+        config: RandomCycleConfig,
+    ) -> tuple[AccountSnapshot, AccountSnapshot]:
+        """Read the two independent cycle accounts with a bounded fan-out.
+
+        These are read-only observations.  Keep the source/receiver result
+        order stable, cap concurrency at two, and drain the sibling if one
+        read fails or the parent operation is cancelled before any dependent
+        validation or mutation can continue.
+        """
+
+        tasks: list[asyncio.Task[Any]] = []
+        try:
+            tasks.append(
+                asyncio.create_task(
+                    self._read_account(config, config.source_account_index, "source account read")
+                )
+            )
+            tasks.append(
+                asyncio.create_task(
+                    self._read_account(config, config.receiver_account_index, "receiver account read")
+                )
+            )
+            source, receiver = await asyncio.gather(*tasks)
+        except BaseException as exc:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            if not isinstance(exc, asyncio.CancelledError):
+                for task in tasks:
+                    if task.cancelled():
+                        continue
+                    task_error = task.exception()
+                    if task_error is not None:
+                        raise task_error
+            raise
         return source, receiver
 
     async def _read_account(
