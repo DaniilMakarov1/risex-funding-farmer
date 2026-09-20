@@ -886,6 +886,11 @@ def _simple_event_line(row: Mapping[str, Any]) -> str | None:
     if event == "FIRST_MUTATION_BOUNDARY":
         return "Граница первой записи пройдена; дальнейшее состояние определяется журналом открытия."
     if event == "OPENING_COMPLETE":
+        result = payload.get("result")
+        if isinstance(result, Mapping):
+            receiver = result.get("receiver")
+            if isinstance(receiver, Mapping) and receiver.get("dispatched") is False:
+                return "Источник получил наблюдаемое исполнение; ордер приёмника не отправлялся."
         return "Открытие и его сверка завершены."
     if event == "HOLD_ANCHORED":
         return f"Удержание начато: {payload.get('hold_seconds')} с от подтверждённого открытия."
@@ -893,8 +898,43 @@ def _simple_event_line(row: Mapping[str, Any]) -> str | None:
         return "Закрытие подготовлено по фактическим позициям."
     if event == "CLOSING_COMPLETE":
         return "Закрытие и его сверка завершены."
-    if event in {"FALLBACK_ATTEMPT_EVIDENCE", "FALLBACK_RECONCILED", "FALLBACK_RECONCILIATION_UNKNOWN"}:
-        return "Сверка остатка позиции выполнена."
+    if event == "FALLBACK_DISPATCH_RESULT":
+        if payload.get("accepted") is True:
+            return f"Резервный ордер принят (попытка {attempt}, счёт {payload.get('account_index')})."
+        return f"Резервный ордер отклонён (попытка {attempt}, счёт {payload.get('account_index')})."
+    if event == "FALLBACK_ORDER_OBSERVATION_REJECTED":
+        return "Наблюдение резервного ордера отклонено по конфликту идентичности; сохранена карта несовпадений."
+    if event == "FALLBACK_RECONCILED":
+        state = payload.get("reconciliation_state") or "UNKNOWN"
+        order = payload.get("order")
+        status = order.get("status") if isinstance(order, Mapping) else None
+        observed_at = payload.get("position_observed_at")
+        if state == "TERMINAL_ZERO_FILL":
+            detail = f"известный нулевой fill/cancel ({status or 'terminal'})"
+        elif state == "FULL_FILL":
+            detail = "известный полный fill"
+        elif state == "PARTIAL_FILL":
+            detail = "известный partial fill"
+        else:
+            detail = str(state)
+        suffix = "" if observed_at is None else f"; позиция наблюдалась в {observed_at}"
+        return f"Резервная сверка подтверждена: {detail}{suffix}."
+    if event == "FALLBACK_RECONCILIATION_UNKNOWN":
+        return "Сверка резервного ордера неизвестна; дальнейшие записи остановлены."
+    if event == "FALLBACK_POST_ATTEMPT_ACCOUNT_OBSERVATION":
+        source = payload.get("source")
+        receiver = payload.get("receiver")
+        source_at = source.get("observed_at") if isinstance(source, Mapping) else None
+        receiver_at = receiver.get("observed_at") if isinstance(receiver, Mapping) else None
+        return (
+            "Свежие позиции после fallback: "
+            f"источник={source.get('signed_position') if isinstance(source, Mapping) else 'UNKNOWN'} "
+            f"(время {source_at}); "
+            f"приёмник={receiver.get('signed_position') if isinstance(receiver, Mapping) else 'UNKNOWN'} "
+            f"(время {receiver_at})."
+        )
+    if event == "FALLBACK_ATTEMPT_EVIDENCE":
+        return None
     return None
 
 
@@ -989,6 +1029,47 @@ def format_random_cycle_result_ru(
         source_text = durable_source
     if receiver is None and durable_receiver != "UNKNOWN":
         receiver_text = durable_receiver
+
+    source_observed_at = getattr(result, "remaining_source_position_observed_at", None)
+    receiver_observed_at = getattr(result, "remaining_receiver_position_observed_at", None)
+    fallbacks = tuple(getattr(result, "fallbacks", ()) or ())
+    opening = getattr(result, "opening", None)
+    closing = getattr(result, "closing", None)
+    receiver_phase = closing if closing is not None else opening
+    source_account_index = (
+        None
+        if receiver_phase is None or getattr(receiver_phase, "source", None) is None
+        else getattr(receiver_phase.source, "account_index", None)
+    )
+    receiver_account_index = (
+        None
+        if receiver_phase is None or getattr(receiver_phase, "receiver", None) is None
+        else getattr(receiver_phase.receiver, "account_index", None)
+    )
+    for fallback in reversed(fallbacks):
+        if getattr(fallback, "position_observed_at", None) is None:
+            continue
+        if getattr(fallback, "account_index", None) == source_account_index:
+            source_observed_at = source_observed_at or fallback.position_observed_at
+        elif getattr(fallback, "account_index", None) == receiver_account_index:
+            receiver_observed_at = receiver_observed_at or fallback.position_observed_at
+
+    receiver_leg = None if receiver_phase is None else getattr(receiver_phase, "receiver", None)
+    receiver_not_dispatched = receiver_leg is not None and getattr(receiver_leg, "dispatched", True) is False
+    dispatch_rows = [
+        row
+        for row in events
+        if row.get("event") == "FALLBACK_DISPATCH_RESULT"
+        and isinstance(row.get("payload"), Mapping)
+    ]
+    accepted_fallback = any(row["payload"].get("accepted") is True for row in dispatch_rows)
+
+    def position_line(label: str, value: Any, observed_at: Any) -> str:
+        text = "UNKNOWN" if value is None else format(value, "f")
+        if observed_at is None:
+            return f"{label}={text} (время наблюдения UNKNOWN)"
+        return f"{label}={text} (время наблюдения {observed_at})"
+
     if outcome == "SUCCESS":
         lines.append("Итог: SUCCESS — обе позиции подтверждённо закрыты.")
     else:
@@ -1000,6 +1081,38 @@ def format_random_cycle_result_ru(
         )
         if journal:
             lines.append(f"Действие: сохранён журнал {journal}; UNKNOWN нельзя трактовать как flat.")
+    if receiver_not_dispatched:
+        lines.append("Приёмник: ордер не отправлялся; это не отмена уже отправленного ордера.")
+    elif receiver_leg is not None:
+        receiver_order = getattr(receiver_leg, "order", None)
+        receiver_status = getattr(receiver_order, "status", None)
+        if receiver_status is None and isinstance(receiver_order, Mapping):
+            receiver_status = receiver_order.get("status")
+        if receiver_status:
+            lines.append(f"Приёмник: ордер отправлен; известное состояние {receiver_status}.")
+        else:
+            lines.append("Приёмник: ордер отправлен; конечное состояние не подтверждено.")
+    if accepted_fallback:
+        lines.append("Fallback: dispatch принят.")
+    if fallbacks:
+        last_fallback = fallbacks[-1]
+        state = getattr(last_fallback, "reconciliation_state", "UNKNOWN")
+        if state == "TERMINAL_ZERO_FILL":
+            state_text = "известный terminal zero-fill/cancel"
+        elif state == "FULL_FILL":
+            state_text = "известный полный fill"
+        elif state == "PARTIAL_FILL":
+            state_text = "известный partial fill"
+        elif state == "REJECTED":
+            state_text = "известный rejected"
+        else:
+            state_text = "UNKNOWN"
+        lines.append(f"Fallback: последнее состояние — {state_text}.")
+    lines.append(
+        "Последние позиции: "
+        f"{position_line('источник', source, source_observed_at)}; "
+        f"{position_line('приёмник', receiver, receiver_observed_at)}."
+    )
     return "\n".join(lines)
 
 

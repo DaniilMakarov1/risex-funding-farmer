@@ -17,9 +17,11 @@ from risex_spread_shadow.hood_handoff import (
     ContractError,
     DepthLevel,
     Direction,
+    FallbackResult,
     HistoryPage,
     MarketMetadata,
     MutationReceipt,
+    OrderPlan,
     OperationMode,
     OrderBookSnapshot,
     OrderSnapshot,
@@ -32,6 +34,7 @@ from risex_spread_shadow.hood_handoff import (
     compute_quantity_bounds,
     run_random_cycle,
 )
+from risex_spread_shadow.hood_handoff import random_cycle as random_cycle_module
 
 
 NOW = 1_000.0
@@ -865,6 +868,104 @@ class FallbackReceiptTimingClient(CycleClient):
         )
 
 
+class Cycle003ZeroFillThenFillClient(ExternalOpeningClient):
+    """Reproduce cycle-003's terminal zero-fill before a known retry fill."""
+
+    def __init__(self, clock: AdvancingClock) -> None:
+        super().__init__(clock, direction=Direction.LONG, fill_fraction=Decimal("1"))
+        self.zero_fill_seen = False
+
+    async def submit_order(self, plan):
+        receipt = await super().submit_order(plan)
+        if (
+            plan.order_type == "MARKET"
+            and plan.reduce_only
+            and plan.account_index == self.source_account_index
+            and not self.zero_fill_seen
+        ):
+            self.zero_fill_seen = True
+            current = self.orders[(plan.account_index, str(receipt.order_id))]
+            # The fake's normal full fill happened before this read-only
+            # response was shaped; undo only that synthetic position change.
+            self.source_position -= plan.quantity if plan.side == "BUY" else -plan.quantity
+            self._replace_order(
+                current,
+                status="canceled-too-much-slippage",
+                remaining_quantity=Decimal("0"),
+                filled_quantity=Decimal("0"),
+            )
+            self.trades[current.order_id] = ()
+        return receipt
+
+
+class FallbackIdentityConflictClient(CycleClient):
+    def __init__(self, clock: AdvancingClock) -> None:
+        super().__init__(clock, partial_close=True)
+        self.conflict_injected = False
+
+    async def lookup_order(self, *args, **kwargs):
+        value = await super().lookup_order(*args, **kwargs)
+        if value is not None and self.fallback_plans and not self.conflict_injected:
+            self.conflict_injected = True
+            return replace(value, client_order_index="foreign-client-index")
+        return value
+
+
+class FallbackMalformedOrderClient(CycleClient):
+    def __init__(self, clock: AdvancingClock) -> None:
+        super().__init__(clock, partial_close=True)
+
+    async def lookup_order(self, *args, **kwargs):
+        value = await super().lookup_order(*args, **kwargs)
+        if value is not None and self.fallback_plans:
+            malformed = _order_mapping(value)
+            malformed["status"] = "not-an-official-status"
+            return malformed
+        return value
+
+
+class FallbackRejectedClient(CycleClient):
+    def __init__(self, clock: AdvancingClock) -> None:
+        super().__init__(clock, partial_close=True)
+        self.rejected = False
+
+    async def submit_order(self, plan):
+        source_order = self.orders.get(
+            (self.source_account_index, self.latest_order.get(self.source_account_index, ""))
+        )
+        paired_receiver = (
+            plan.order_type == "MARKET"
+            and plan.reduce_only
+            and plan.account_index == self.receiver_account_index
+            and source_order is not None
+            and source_order.status == "open"
+        )
+        if plan.order_type == "MARKET" and plan.reduce_only and not paired_receiver and not self.rejected:
+            self.rejected = True
+            self.submissions.append(plan)
+            return MutationReceipt(False, None, None, error="synthetic venue rejection")
+        return await super().submit_order(plan)
+
+
+def _order_mapping(order: OrderSnapshot) -> dict[str, object]:
+    return {
+        "account_index": order.account_index,
+        "market_id": order.market_id,
+        "order_id": order.order_id,
+        "client_order_index": order.client_order_index,
+        "status": order.status,
+        "side": order.side,
+        "order_type": order.order_type,
+        "time_in_force": order.time_in_force,
+        "reduce_only": order.reduce_only,
+        "initial_quantity": order.initial_quantity,
+        "remaining_quantity": order.remaining_quantity,
+        "filled_quantity": order.filled_quantity,
+        "price": order.price,
+        "observed_at": order.observed_at,
+    }
+
+
 def cycle_config(path: Path, **overrides) -> RandomCycleConfig:
     values = {
         "market_id": 7,
@@ -1112,6 +1213,176 @@ async def test_zero_fill_is_paced_and_does_not_starve_the_other_account(tmp_path
     assert clock.sleeps == pytest.approx([20, 0.01])
     assert client.source_position == Decimal("0")
     assert client.receiver_position == Decimal("0")
+
+
+@pytest.mark.asyncio
+async def test_cycle_003_terminal_zero_fill_is_reconciled_and_retried_without_receiver_dispatch(tmp_path):
+    clock = AdvancingClock()
+    client = Cycle003ZeroFillThenFillClient(clock)
+    cycle_path = tmp_path / "cycle-003-zero-fill"
+    result = await run_random_cycle(
+        cycle_config(cycle_path),
+        client,
+        clock=clock,
+        rng=FixedRng(23, 20),
+    )
+
+    assert result.outcome is Outcome.PARTIAL
+    assert result.opening is not None
+    assert result.opening.receiver is not None
+    assert result.opening.receiver.dispatched is False
+    assert [item.reconciliation_state for item in result.fallbacks] == [
+        "TERMINAL_ZERO_FILL",
+        "FULL_FILL",
+    ]
+    assert result.fallbacks[0].filled_quantity == Decimal("0")
+    assert result.fallbacks[0].position_after == Decimal("-0.23")
+    assert result.fallbacks[0].position_observed_at == NOW
+    assert "source fill observed before receiver dispatch" in (result.opening_reason or "")
+    assert "receiver order was not dispatched" in (result.reason or "")
+    assert "terminal zero-fill/cancel" in (result.reason or "")
+    assert not any(
+        plan.account_index == client.receiver_account_index
+        for plan in client.submissions
+    )
+    assert result.remaining_source_position == Decimal("0")
+    assert result.remaining_receiver_position == Decimal("0")
+    assert result.remaining_source_position_observed_at >= NOW
+    assert result.remaining_receiver_position_observed_at >= NOW
+
+    rows = [json.loads(line) for line in (cycle_path / "cycle.jsonl").read_text().splitlines()]
+    zero_rows = [
+        row
+        for row in rows
+        if row["event"] == "FALLBACK_RECONCILED"
+        and row["payload"].get("reconciliation_state") == "TERMINAL_ZERO_FILL"
+    ]
+    assert len(zero_rows) == 1
+    assert zero_rows[0]["payload"]["order"]["status"] == "canceled-too-much-slippage"
+    assert zero_rows[0]["payload"]["order"]["initial_quantity"] == "0.23"
+    assert zero_rows[0]["payload"]["order"]["remaining_quantity"] == "0"
+    assert zero_rows[0]["payload"]["position_observed_at"] == NOW
+
+
+def test_cycle_003_order_identity_accepts_exact_terminal_zero_fill_shape():
+    plan = OrderPlan(
+        account_index=27331,
+        market_id=1,
+        side="BUY",
+        quantity=Decimal("0.00023"),
+        quantity_int=23,
+        price=Decimal("80387.9"),
+        price_int=803879,
+        order_type="MARKET",
+        time_in_force="IOC",
+        reduce_only=True,
+        order_expiry_ms=0,
+        client_order_index=111033094521616,
+    )
+    order = OrderSnapshot(
+        account_index=27331,
+        market_id=1,
+        order_id="844424849590873",
+        client_order_index=111033094521616,
+        status="canceled-too-much-slippage",
+        side="BUY",
+        order_type="MARKET",
+        time_in_force="IOC",
+        reduce_only=True,
+        initial_quantity=Decimal("0.00023"),
+        remaining_quantity=Decimal("0"),
+        filled_quantity=Decimal("0"),
+        price=Decimal("80387.9"),
+        observed_at=NOW,
+    )
+    assert RandomCycleEngine._fallback_order_identity_matches(order, plan)
+    assert random_cycle_module._fallback_order_mismatch_map(order, plan) == {}
+
+
+@pytest.mark.asyncio
+async def test_fallback_identity_conflict_is_retained_with_exact_sanitized_mismatch_map(tmp_path):
+    clock = AdvancingClock()
+    client = FallbackIdentityConflictClient(clock)
+    result = await run_random_cycle(
+        cycle_config(tmp_path / "fallback-identity-conflict"),
+        client,
+        clock=clock,
+        rng=FixedRng(20, 20),
+    )
+
+    assert result.outcome is Outcome.UNKNOWN
+    assert result.fallbacks[0].outcome is Outcome.UNKNOWN
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "fallback-identity-conflict" / "cycle.jsonl").read_text().splitlines()
+    ]
+    rejected = [row for row in rows if row["event"] == "FALLBACK_ORDER_OBSERVATION_REJECTED"]
+    assert len(rejected) == 1
+    payload = rejected[0]["payload"]
+    assert payload["account_index"] == 11
+    assert payload["market_id"] == 7
+    assert payload["rejected"] is True
+    assert payload["mismatch_map"]["client_order_index"]["expected"]
+    assert payload["mismatch_map"]["client_order_index"]["observed"] == "foreign-client-index"
+    assert set(payload["order"]) == {
+        "account_index",
+        "market_id",
+        "order_id",
+        "client_order_index",
+        "status",
+        "side",
+        "order_type",
+        "time_in_force",
+        "reduce_only",
+        "initial_quantity",
+        "remaining_quantity",
+        "filled_quantity",
+        "price",
+        "observed_at",
+    }
+
+
+@pytest.mark.asyncio
+async def test_fallback_rejection_is_known_and_binds_fresh_position_observation(tmp_path):
+    clock = AdvancingClock()
+    client = FallbackRejectedClient(clock)
+    result = await run_random_cycle(
+        cycle_config(tmp_path / "fallback-rejected"),
+        client,
+        clock=clock,
+        rng=FixedRng(20, 20),
+    )
+
+    assert result.outcome is Outcome.PARTIAL
+    assert result.fallbacks[0].reconciliation_state == "REJECTED"
+    assert result.fallbacks[0].position_after == Decimal("-0.10")
+    assert result.fallbacks[0].position_observed_at == NOW + 20
+    assert result.fallbacks[0].reason == "fallback reduce-only market was rejected"
+    assert len(client.fallback_plans) == 1
+
+
+@pytest.mark.asyncio
+async def test_malformed_fallback_order_observation_remains_unknown_and_stops_mutation(tmp_path):
+    clock = AdvancingClock()
+    client = FallbackMalformedOrderClient(clock)
+    result = await run_random_cycle(
+        cycle_config(tmp_path / "fallback-malformed"),
+        client,
+        clock=clock,
+        rng=FixedRng(20, 20),
+    )
+
+    assert result.outcome is Outcome.UNKNOWN
+    assert result.fallbacks[0].reconciliation_state == "UNKNOWN"
+    assert len(client.fallback_plans) == 1
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "fallback-malformed" / "cycle.jsonl").read_text().splitlines()
+    ]
+    observations = [row for row in rows if row["event"] == "FALLBACK_ORDER_OBSERVATION"]
+    assert observations
+    assert observations[0]["payload"]["order"] is None
+    assert "order read failed" in observations[0]["payload"]["reason"]
 
 
 @pytest.mark.asyncio
@@ -1856,6 +2127,85 @@ async def test_fallback_journal_retains_receipts_and_account_state(tmp_path):
         assert payload["history_pages"]
         assert payload["trades"]
         assert payload["trades"][0]["trade_id"].startswith("pair-trade-")
+
+
+def test_cli_cycle_003_explanation_distinguishes_receiver_fallback_and_timed_positions(tmp_path):
+    journal_path = tmp_path / "cycle.jsonl"
+    journal_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "event": "OPENING_COMPLETE",
+                        "payload": {
+                            "result": {
+                                "receiver": {"dispatched": False},
+                            }
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "event": "FALLBACK_DISPATCH_RESULT",
+                        "payload": {"accepted": True, "attempt": 1, "account_index": 27331},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "event": "FALLBACK_RECONCILED",
+                        "payload": {
+                            "reconciliation_state": "TERMINAL_ZERO_FILL",
+                            "order": {"status": "canceled-too-much-slippage"},
+                            "position_observed_at": 123.0,
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    opening = SimpleNamespace(
+        reason="source fill observed before receiver dispatch",
+        source=SimpleNamespace(account_index=27331),
+        receiver=SimpleNamespace(account_index=27337, dispatched=False, order=None),
+    )
+    fallback = FallbackResult(
+        account_index=27331,
+        side="BUY",
+        requested_quantity=Decimal("0.00023"),
+        attempted=True,
+        outcome=Outcome.PARTIAL,
+        order_id="844424849590873",
+        filled_quantity=Decimal("0"),
+        position_after=Decimal("-0.00023"),
+        reason="fallback terminal zero-fill/cancel left a confirmed residual position",
+        attempt=1,
+        reconciliation_state="TERMINAL_ZERO_FILL",
+        position_observed_at=123.0,
+    )
+    result = SimpleNamespace(
+        outcome=Outcome.PARTIAL,
+        selection=None,
+        remaining_source_position=Decimal("-0.00023"),
+        remaining_receiver_position=Decimal("0"),
+        remaining_source_position_observed_at=123.0,
+        remaining_receiver_position_observed_at=124.0,
+        opening=opening,
+        fallbacks=(fallback,),
+        reason=(
+            "source fill observed before receiver dispatch; receiver order was not dispatched; "
+            "fallback terminal zero-fill/cancel left a confirmed residual position"
+        ),
+        journal_path=str(journal_path),
+    )
+
+    output = cli_module.format_random_cycle_result_ru(result)
+    assert "ордер приёмника не отправлялся" in output
+    assert "Fallback: dispatch принят." in output
+    assert "известный terminal zero-fill/cancel" in output
+    assert "источник=-0.00023 (время наблюдения 123.0)" in output
+    assert "приёмник=0 (время наблюдения 124.0)" in output
 
 
 def test_cli_random_cycle_requires_interactive_launch_before_client_or_keys(tmp_path, monkeypatch, capsys):
