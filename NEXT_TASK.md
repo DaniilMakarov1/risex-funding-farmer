@@ -35,9 +35,7 @@ Cycle-004 proves source account 27331 submitted SELL LIMIT POST_ONLY `0.00026 BT
 
 ## Pair-attempt budget decision
 
-The owner authorized one finite budget and explicitly prohibited multiplying preparation retries by post-placement retries, but did not choose a numeric mutation-attempt cap. No new number may be selected silently. Chief proposal awaiting explicit owner decision: **maximum 3 complete pair attempts total per opening or closing operation**, using the existing `MAX_PREPARATION_ATTEMPTS = 3` as one shared budget. Each consumed preparation attempt or placed source order advances the same lineage; no Cartesian product of preflight and post-placement attempts is allowed. Exhaustion ends with a specific terminal reason and honest inventory state.
-
-Until the owner accepts or replaces that proposal, production implementation of post-placement retry count is blocked. Offline diagnosis, contract work and non-policy design may proceed; no Builder may silently encode a different number or reinterpret `max_poll_count`, timeouts or freshness as the attempt budget.
+On 2026-09-20 the owner explicitly accepted **maximum 3 complete pair attempts total per opening or closing operation**, using the existing `MAX_PREPARATION_ATTEMPTS = 3` as one shared budget. Each consumed preparation attempt or placed source order advances the same lineage; no Cartesian product of preflight and post-placement attempts is allowed. Exhaustion ends with a specific terminal reason and honest inventory state. Do not reinterpret `max_poll_count`, timeouts or freshness as the attempt budget.
 
 ## Mandatory adverse verification
 
