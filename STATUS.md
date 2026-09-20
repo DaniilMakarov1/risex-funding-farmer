@@ -1,5 +1,9 @@
 # Current status
 
+## HCR-20 — ACTIVE; runtime-launch defect diagnosed
+
+The owner launch claimed immutable `operator-v1/cycle-002` and stopped before any mutation with `sdk_error`. Exact local diagnosis: root `./start` selected system `/opt/homebrew/bin/python3`, where `lighter` is absent, instead of prepared `.venv-hood/bin/python`, whose `lighter-sdk` distribution is 1.1.2. The cycle journal contains only start and preflight-block events, with no first-mutation boundary or dispatch intent; no order was sent according to durable evidence. Current positions remain NOT_READ. A fresh Builder will correct runtime selection, validate deterministic local prerequisites before slot allocation, improve the Russian cause, preserve cycle-002 and independently verify the next slot is not consumed by offline checks. No live/private action.
+
 ## HCR-19 — COMPLETE; accepted offline and installed
 
 Candidate `ebabbfaac88ca6d69aef9b15ad396414871e641a` is independently accepted. The random cycle now keeps one sampled quantity/hold, accepts a fresh one-tick price after an ordinary quote move, rechecks the unchanged quantity against fresh bounds and allows at most three safe preparation attempts before any mutation. Deterministic safety failures do not retry; mutation admission permanently disables preparation retry. A root `./start` provides one short Russian confirmation, atomically allocates a unique owner-only cycle slot only after confirmation, shows concise live Russian progress/errors and retains complete JSONL evidence. Legacy CLI remains compatible.
