@@ -1,12 +1,12 @@
 # Current status
 
-## HCR-18 — ACCEPTED OFFLINE; installation/publication pending
+## HCR-18 — COMPLETE; accepted offline and installed
 
 Candidatea439c080ad8b3e893d2237e9f2ebb443b4b00b08 independently accepted. Fully reconciled early external source fills become knownPARTIAL and use existing reduce-only residual closure; no receiver opening chase or hold. Missing/visible terminal-order variants supported, while stale/identity/readiness/margin/history/cancellation barriers persist. Cycle account reads overlap at maximum2, errors/cancellation drain siblings, no concurrent mutations or policy changes.
 
 Final clean isolated Python3.11.5/SDK1.1.2:4570passed3skipped exit0,126.09s; unchanged hashes and isolated imports. Builder171focusedpass; Chief12race/stale cases,4read-failure cases,8independent rational quantity cases and exact observed-terminal boundary replay passed. Actual transient HTTP responses unavailable, no claim of full transport replay. Earlier4S3envelope failures reproduced on acceptedbase/candidate remain undiagnosed; final fullsuite passes without unrelated code changes or added skips. Controlled20/30ms accountread delays,9repeats: median54.856to32.258ms and56.903to33.009ms for shared opening/closing readwindow; no measured livefill improvement. Evidence hood-cycle-race-latency-20260920/chief-v3.
 
-Originalcycle001 immutable; recorded source-.00027BTC/receiver0, current inventoryNOT_READ. No live/private/Keychain/trading actions. Fresh owner-only operator-v1 configuration prepared in HCR18 evidence with separate unusedcycle001, same policies; admission still requires initiallyflat accounts. Builder stopped after delivery; branches/worktrees/evidence preserved. Publication identity follows separately.
+Originalcycle001 immutable; recorded source-.00027BTC/receiver0, current inventoryNOT_READ. No live/private/Keychain/trading actions. Fresh owner-only operator-v1 configuration prepared in HCR18 evidence with separate unusedcycle001, same policies; admission still requires initiallyflat accounts. Builder stopped after delivery; branches/worktrees/evidence preserved. Exact tested source/tests/config hashes match the installed operator checkout81ec49b, Python3.11.5 imports resolve to its src, offline preview and CANCEL-before-LAUNCH passed without consuming the new slot. Original incident journals rehashed unchanged. Final publication identity is recorded separately in chief-v3/publication.json.
 
 ## HCR-17 — COMPLETE; accepted offline and installed
 
