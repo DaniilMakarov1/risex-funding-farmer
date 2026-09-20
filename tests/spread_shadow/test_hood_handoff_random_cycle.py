@@ -24,6 +24,7 @@ from risex_spread_shadow.hood_handoff import (
     PreflightBlocked,
     RandomCycleConfig,
     TradeReceipt,
+    allocate_cycle_slot,
     compute_quantity_bounds,
     run_random_cycle,
 )
@@ -1926,3 +1927,169 @@ async def test_fallback_interruption_after_receipt_persists_attempt_evidence(tmp
     assert evidence[0]["payload"]["receipt"]["order_id"]
     assert evidence[0]["payload"]["plan"]["reduce_only"] is True
     assert any(row["event"] == "CYCLE_INTERRUPTED" for row in rows)
+
+
+class RepricingCycleClient(CycleClient):
+    def __init__(self, clock: AdvancingClock, books: list[OrderBookSnapshot]) -> None:
+        super().__init__(clock)
+        self._books = books
+        self.book_calls = 0
+
+    async def order_book(self, market_id: int) -> OrderBookSnapshot:
+        assert market_id == 7
+        index = min(self.book_calls, len(self._books) - 1)
+        self.book_calls += 1
+        current = self._books[index]
+        return replace(current, observed_at=self.clock.now())
+
+
+class RetryOnceCycleClient(CycleClient):
+    def __init__(self, clock: AdvancingClock) -> None:
+        super().__init__(clock)
+        self.book_calls = 0
+
+    async def order_book(self, market_id: int) -> OrderBookSnapshot:
+        assert market_id == 7
+        self.book_calls += 1
+        if self.book_calls == 2:
+            return replace(book(self.clock.now() - 100), observed_at=self.clock.now() - 100)
+        return book(self.clock.now())
+
+
+class ExhaustedPreparationClient(CycleClient):
+    def __init__(self, clock: AdvancingClock) -> None:
+        super().__init__(clock)
+        self.metadata_calls = 0
+
+    async def market_metadata(self, market_id: int) -> MarketMetadata:
+        self.metadata_calls += 1
+        if self.metadata_calls >= 2:
+            raise TimeoutError("synthetic preparation timeout")
+        return await super().market_metadata(market_id)
+
+
+@pytest.mark.asyncio
+async def test_quote_move_is_accepted_with_same_draw_and_fresh_opening_plan(tmp_path):
+    clock = AdvancingClock()
+    initial = book()
+    moved = OrderBookSnapshot(
+        market_id=7,
+        symbol="BTC",
+        bids=(DepthLevel(Decimal("101.0"), Decimal("100"), "bid-moved"),),
+        asks=(DepthLevel(Decimal("101.2"), Decimal("100"), "ask-moved"),),
+        observed_at=NOW,
+        market_type="perp",
+        venue="robinhood",
+    )
+    client = RepricingCycleClient(clock, [initial, moved])
+    rng = FixedRng(25, 20)
+    result = await run_random_cycle(
+        cycle_config(tmp_path / "repriced"),
+        client,
+        clock=clock,
+        rng=rng,
+    )
+    assert result.outcome is Outcome.SUCCESS
+    assert result.selection is not None
+    assert result.selection.quantity == Decimal("0.25")
+    assert result.selection.hold_seconds == 20
+    assert rng.bounds == [(10, 999), (20, 300)]
+    assert client.submissions[0].price == Decimal("101.1")
+    rows = [json.loads(line) for line in (tmp_path / "repriced" / "cycle.jsonl").read_text().splitlines()]
+    updates = [row["payload"] for row in rows if row["event"] == "OPENING_PRICE_UPDATED"]
+    assert updates == [
+        {
+            "attempt": 1,
+            "old_source_price": "100.1",
+            "new_source_price": "101.1",
+            "old_receiver_bound": "100.1",
+            "new_receiver_bound": "101.1",
+            "old_metadata_observed_at": NOW,
+            "new_metadata_observed_at": NOW,
+            "old_book_observed_at": NOW,
+            "new_book_observed_at": NOW,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stale_preparation_is_retried_without_redrawing_selection(tmp_path):
+    clock = AdvancingClock()
+    client = RetryOnceCycleClient(clock)
+    rng = FixedRng(25, 20)
+    result = await run_random_cycle(
+        cycle_config(tmp_path / "retry-once"),
+        client,
+        clock=clock,
+        rng=rng,
+    )
+    assert result.outcome is Outcome.SUCCESS
+    assert rng.bounds == [(10, 999), (20, 300)]
+    assert clock.sleeps == [0.001, 20]
+    rows = [json.loads(line) for line in (tmp_path / "retry-once" / "cycle.jsonl").read_text().splitlines()]
+    assert [row["payload"]["attempt"] for row in rows if row["event"] == "PREPARATION_ATTEMPT"] == [1, 2]
+    assert len([row for row in rows if row["event"] == "PREPARATION_RETRY"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_preparation_retry_exhaustion_returns_proved_selection_and_never_writes(tmp_path):
+    clock = AdvancingClock()
+    client = ExhaustedPreparationClient(clock)
+    rng = FixedRng(25, 20)
+    result = await run_random_cycle(
+        cycle_config(tmp_path / "retry-exhausted"),
+        client,
+        clock=clock,
+        rng=rng,
+    )
+    assert result.outcome is Outcome.FAILED_PREFLIGHT_BLOCKED
+    assert result.selection is not None
+    assert result.selection.quantity == Decimal("0.25")
+    assert result.selection.hold_seconds == 20
+    assert not client.submissions
+    assert clock.sleeps == [0.001, 0.001]
+    rows = [json.loads(line) for line in (tmp_path / "retry-exhausted" / "cycle.jsonl").read_text().splitlines()]
+    assert [row["payload"]["attempt"] for row in rows if row["event"] == "PREPARATION_ATTEMPT"] == [1, 2, 3]
+    assert len([row for row in rows if row["event"] == "PREPARATION_RETRY"]) == 2
+    assert rows[-1]["event"] == "CYCLE_PREFLIGHT_BLOCKED"
+
+
+def test_allocate_cycle_slot_skips_consumed_directories_and_persists_unique_prefix(tmp_path):
+    operator_dir = tmp_path / "operator"
+    operator_dir.mkdir(mode=0o700)
+    consumed = operator_dir / "cycle-001"
+    consumed.mkdir(mode=0o700)
+    (consumed / "cycle.jsonl").write_text("preserved", encoding="utf-8")
+    cycle_dir, prefix = allocate_cycle_slot(operator_dir, client_order_prefix="owner-cycle")
+    assert cycle_dir == operator_dir / "cycle-002"
+    assert cycle_dir.stat().st_mode & 0o777 == 0o700
+    launch = json.loads((cycle_dir / "launch.json").read_text(encoding="utf-8"))
+    assert launch["cycle_dir"] == str(cycle_dir)
+    assert launch["client_order_prefix"] == prefix
+    assert prefix.startswith("owner-cycle-")
+
+
+def test_simple_launcher_cancel_is_russian_and_does_not_claim_a_slot(tmp_path, monkeypatch, capsys):
+    config_path = tmp_path / "random-cycle.json"
+    operator_dir = tmp_path / "operator"
+    config_path.write_text(
+        json.dumps(
+            {
+                "market_id": 7,
+                "market_symbol": "BTC",
+                "direction": "LONG",
+                "source_account_index": 11,
+                "receiver_account_index": 22,
+                "cycle_dir": str(tmp_path / "old-cycle-001"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("RISEX_HOOD_OPERATOR_DIR", str(operator_dir))
+    monkeypatch.setattr("builtins.input", lambda _prompt: "CANCEL")
+    monkeypatch.setattr(cli_module, "LighterSdkClient", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("client must not be built")))
+    assert cli_module.main(["simple", "--config", str(config_path)]) == 0
+    output = capsys.readouterr().out
+    assert "Один офлайн-подготовленный цикл" in output
+    assert "Отменено до запуска" in output
+    assert not operator_dir.exists()

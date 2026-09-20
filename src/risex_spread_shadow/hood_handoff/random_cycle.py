@@ -11,15 +11,18 @@ cycle.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 import hashlib
+import json
 import math
 import os
 from pathlib import Path
 import random
+import time
 from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
 from urllib.parse import urlsplit
+import uuid
 
 from .contracts import (
     AccountSnapshot,
@@ -56,9 +59,89 @@ from .series import OrderBookSnapshot
 
 MIN_HOLD_SECONDS = 20
 MAX_HOLD_SECONDS = 300
+MAX_PREPARATION_ATTEMPTS = 3
 CYCLE_JOURNAL_NAME = "cycle.jsonl"
 OPENING_JOURNAL_NAME = "opening.jsonl"
 CLOSING_JOURNAL_NAME = "closing.jsonl"
+LAUNCH_METADATA_NAME = "launch.json"
+
+
+def _require_owner_only_directory(path: Path, *, label: str) -> None:
+    if path.is_symlink() or not path.exists() or not path.is_dir():
+        raise PreflightBlocked(f"{label} must be an existing non-symlink directory")
+    try:
+        info = path.stat()
+    except OSError as exc:
+        raise PreflightBlocked(f"{label} cannot be inspected") from exc
+    if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+        raise PreflightBlocked(f"{label} must be owner-only")
+
+
+def _atomic_launch_metadata(path: Path, payload: Mapping[str, Any]) -> None:
+    """Persist the new slot/prefix binding without overwriting evidence."""
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise PreflightBlocked("new cycle slot metadata could not be claimed safely") from exc
+    try:
+        encoded = json.dumps(dict(payload), sort_keys=True, separators=(",", ":")).encode("utf-8")
+        os.write(fd, encoded)
+        os.fsync(fd)
+    except OSError as exc:
+        raise PreflightBlocked("new cycle slot metadata could not be persisted") from exc
+    finally:
+        os.close(fd)
+
+
+def allocate_cycle_slot(
+    operator_dir: Path | str,
+    *,
+    client_order_prefix: str = "hood-cycle",
+) -> tuple[Path, str]:
+    """Atomically reserve the next owner-only cycle directory and prefix.
+
+    This function is intentionally called only after the simple launch
+    confirmation.  Existing directories are never inspected beyond their
+    names and are never overwritten; a newly created directory is retained if
+    metadata persistence fails so a caller cannot accidentally reuse a
+    partially claimed slot.
+    """
+
+    parent = Path(operator_dir)
+    _require_owner_only_directory(parent, label="operator cycle directory")
+    prefix = _text(client_order_prefix, "client_order_prefix")
+    for ordinal in range(1, 1_000_000):
+        candidate = parent / f"cycle-{ordinal:03d}"
+        try:
+            candidate.mkdir(mode=0o700)
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise PreflightBlocked("new cycle directory could not be claimed safely") from exc
+        try:
+            info = candidate.stat()
+            if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+                raise PreflightBlocked("new cycle directory must be owner-only")
+            unique_prefix = f"{prefix}-{time.time_ns()}-{uuid.uuid4().hex[:12]}"
+            _atomic_launch_metadata(
+                candidate / LAUNCH_METADATA_NAME,
+                {
+                    "schema": "hcr-19-simple-launch-v1",
+                    "claimed_at": time.time(),
+                    "cycle_dir": str(candidate),
+                    "client_order_prefix": unique_prefix,
+                },
+            )
+            return candidate, unique_prefix
+        except BaseException:
+            # The claimed directory and any durable partial metadata are
+            # evidence, not a disposable retry target.
+            raise
+    raise PreflightBlocked("no unused cycle directory slot is available")
 
 
 def _decimal(value: Any, name: str, *, positive: bool = False) -> Decimal:
@@ -469,6 +552,10 @@ class _AccountIdentityFailure(ContractError):
     """An account response cannot establish the requested identity binding."""
 
 
+class _RetryablePreparationFailure(PreflightBlocked):
+    """A bounded read/preparation failure that may become valid on refresh."""
+
+
 def _coerce_cycle_account(
     raw: AccountSnapshot | Mapping[str, Any],
     account_index: int,
@@ -823,6 +910,27 @@ def _cycle_exception_reason(exc: BaseException) -> str:
     return sanitize_exception(exc)
 
 
+def _is_retryable_preparation_error(exc: BaseException) -> bool:
+    """Classify only finite pre-mutation facts that a fresh snapshot can fix."""
+
+    if isinstance(exc, _RetryablePreparationFailure):
+        return True
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError, ConnectionError, OSError)):
+        return True
+    if not isinstance(exc, PreflightBlocked):
+        return False
+    reason = str(exc).lower()
+    if any(token in reason for token in ("identity", "authorization", "authorized", "pending", "active cycle-market", "not active", "wrong venue", "minimum", "grid", "margin", "position")):
+        return False
+    if "stale" in reason or "future" in reason:
+        return True
+    if "fresh available balance no longer funds" in reason:
+        return True
+    if "transient" in reason:
+        return True
+    return False
+
+
 class RandomCycleEngine:
     """Execute one sampled cycle and then stop."""
 
@@ -832,6 +940,7 @@ class RandomCycleEngine:
         self.rng = rng or random.SystemRandom()
         self._stage = "PREFLIGHT"
         self._identity_barrier: str | None = None
+        self._selection: RandomCycleSelection | None = None
 
     def _mark_identity_failure(self, reason: str) -> None:
         """Keep the first identity mismatch as a cycle-wide dependency barrier."""
@@ -842,6 +951,7 @@ class RandomCycleEngine:
     async def execute(self, config: RandomCycleConfig) -> RandomCycleResult:
         self._stage = "PREFLIGHT"
         self._identity_barrier = None
+        self._selection = None
         if not config.operator_execution_opt_in or not config.operator_plan_reviewed:
             return RandomCycleResult(
                 outcome=Outcome.PREVIEW,
@@ -889,6 +999,7 @@ class RandomCycleEngine:
                 outcome=Outcome.FAILED_PREFLIGHT_BLOCKED if preflight else Outcome.UNKNOWN,
                 phase=Phase.PREFLIGHT if preflight else Phase.RECONCILIATION,
                 run_id="" if journal is None else journal.run_id,
+                selection=self._selection,
                 reason=reason,
                 journal_path=str(config.journal_path),
             )
@@ -965,20 +1076,40 @@ class RandomCycleEngine:
             metadata_observed_at=metadata.observed_at,
             book_observed_at=book.observed_at,
         )
+        self._selection = selection
         journal.append("SELECTION_PROVED", {"selection": selection.as_dict(), "metadata": _metadata_payload(metadata), "book_observed_at": book.observed_at})
 
-        metadata, book, source, receiver = await self._revalidate_open(config, selection, metadata, book, source, receiver)
+        prepared = await self._prepare_open_with_retries(
+            config,
+            journal,
+            selection,
+            metadata,
+            book,
+            source,
+            receiver,
+        )
+        if isinstance(prepared, RandomCycleResult):
+            return prepared
+        metadata, book, source, receiver, selection = prepared
+        self._selection = selection
         opening_config = self._handoff_config(
             config,
             selection.quantity,
-            proposal.source_limit_price,
-            proposal.receiver_worst_price,
+            selection.opening_source_price,
+            selection.opening_receiver_bound,
             config.opening_journal_path,
             OperationMode.PAIRED_OPENING,
             source.signed_position,
             receiver.signed_position,
         )
         journal.append("OPENING_PLAN_READY", {"config": opening_config_binding(opening_config), "selection": selection.as_dict()})
+        journal.append(
+            "FIRST_MUTATION_BOUNDARY",
+            {
+                "message": "opening handoff admitted; later order state is authoritative only from opening.jsonl",
+                "selection": selection.as_dict(),
+            },
+        )
         self._stage = "OPENING"
         opening = await run_handoff(
             opening_config,
@@ -1190,36 +1321,182 @@ class RandomCycleEngine:
             raise
         except _AccountIdentityFailure:
             raise
+        except (TimeoutError, asyncio.TimeoutError, ConnectionError, OSError) as exc:
+            raise _RetryablePreparationFailure(f"{label} was transiently unavailable") from exc
         except Exception as exc:
             raise _AccountIdentityFailure("account snapshot read failed") from exc
+
+    async def _prepare_open_with_retries(
+        self,
+        config: RandomCycleConfig,
+        journal: DurableJournal,
+        selection: RandomCycleSelection,
+        metadata: MarketMetadata,
+        book: OrderBookSnapshot,
+        source: AccountSnapshot,
+        receiver: AccountSnapshot,
+    ) -> tuple[MarketMetadata, OrderBookSnapshot, AccountSnapshot, AccountSnapshot, RandomCycleSelection] | RandomCycleResult:
+        """Refresh all pre-mutation facts at most three times.
+
+        The first quantity/hold draw is already proved in ``selection``.  A
+        fresh quote may replace only the prices and admissible bounds; it may
+        never trigger another random draw or silently change the selected
+        quantity.  Once this method returns successfully, callers are allowed
+        to cross the first-mutation boundary.  Every failure is handled here
+        so a terminal preflight result retains the proved selection.
+        """
+
+        initial_metadata = metadata
+        initial_book = book
+        initial_source = source
+        initial_receiver = receiver
+        current_selection = selection
+        for attempt in range(1, MAX_PREPARATION_ATTEMPTS + 1):
+            journal.append(
+                "PREPARATION_ATTEMPT",
+                {
+                    "attempt": attempt,
+                    "maximum_attempts": MAX_PREPARATION_ATTEMPTS,
+                    "selected_quantity": format(current_selection.quantity, "f"),
+                    "selected_quantity_tick": current_selection.quantity_tick,
+                    "selected_hold_seconds": current_selection.hold_seconds,
+                },
+            )
+            try:
+                prepared_metadata, prepared_book, prepared_source, prepared_receiver, refreshed_selection = await self._revalidate_open(
+                    config,
+                    current_selection,
+                    initial_metadata=initial_metadata,
+                    initial_book=initial_book,
+                    initial_source=initial_source,
+                    initial_receiver=initial_receiver,
+                )
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:
+                reason = _cycle_exception_reason(exc)
+                retryable = _is_retryable_preparation_error(exc)
+                journal.append(
+                    "PREPARATION_FAILED",
+                    {
+                        "attempt": attempt,
+                        "retryable": retryable,
+                        "reason": reason,
+                    },
+                )
+                if retryable and attempt < MAX_PREPARATION_ATTEMPTS:
+                    journal.append(
+                        "PREPARATION_RETRY",
+                        {
+                            "attempt": attempt,
+                            "next_attempt": attempt + 1,
+                            "reason": reason,
+                            "delay_seconds": config.poll_interval_seconds,
+                        },
+                    )
+                    await self.clock.sleep(config.poll_interval_seconds)
+                    continue
+                journal.append(
+                    "PREPARATION_EXHAUSTED" if retryable else "PREPARATION_BLOCKED",
+                    {
+                        "attempt": attempt,
+                        "maximum_attempts": MAX_PREPARATION_ATTEMPTS,
+                        "reason": reason,
+                        "retryable": retryable,
+                    },
+                )
+                terminal_reason = (
+                    f"opening preparation exhausted after {attempt} attempts: {reason}"
+                    if retryable
+                    else f"opening preparation blocked: {reason}"
+                )
+                result = RandomCycleResult(
+                    outcome=Outcome.FAILED_PREFLIGHT_BLOCKED,
+                    phase=Phase.PREFLIGHT,
+                    run_id=journal.run_id,
+                    selection=current_selection,
+                    reason=terminal_reason,
+                    journal_path=str(config.journal_path),
+                )
+                journal.append("CYCLE_PREFLIGHT_BLOCKED", result.as_dict())
+                return result
+
+            if refreshed_selection.opening_source_price != current_selection.opening_source_price or refreshed_selection.opening_receiver_bound != current_selection.opening_receiver_bound:
+                journal.append(
+                    "OPENING_PRICE_UPDATED",
+                    {
+                        "attempt": attempt,
+                        "old_source_price": format(current_selection.opening_source_price, "f"),
+                        "new_source_price": format(refreshed_selection.opening_source_price, "f"),
+                        "old_receiver_bound": format(current_selection.opening_receiver_bound, "f"),
+                        "new_receiver_bound": format(refreshed_selection.opening_receiver_bound, "f"),
+                        "old_metadata_observed_at": current_selection.metadata_observed_at,
+                        "new_metadata_observed_at": refreshed_selection.metadata_observed_at,
+                        "old_book_observed_at": current_selection.book_observed_at,
+                        "new_book_observed_at": refreshed_selection.book_observed_at,
+                    },
+                )
+            if refreshed_selection.bounds.as_dict() != current_selection.bounds.as_dict():
+                journal.append(
+                    "OPENING_BOUNDS_REFRESHED",
+                    {
+                        "attempt": attempt,
+                        "old_bounds": current_selection.bounds.as_dict(),
+                        "new_bounds": refreshed_selection.bounds.as_dict(),
+                    },
+                )
+            journal.append(
+                "PREPARATION_ACCEPTED",
+                {
+                    "attempt": attempt,
+                    "selection": refreshed_selection.as_dict(),
+                },
+            )
+            return prepared_metadata, prepared_book, prepared_source, prepared_receiver, refreshed_selection
+
+        raise AssertionError("preparation loop returned without a terminal result")
 
     async def _revalidate_open(
         self,
         config: RandomCycleConfig,
         selection: RandomCycleSelection,
-        initial_metadata: MarketMetadata,
-        initial_book: OrderBookSnapshot,
-        initial_source: AccountSnapshot,
-        initial_receiver: AccountSnapshot,
-    ) -> tuple[MarketMetadata, OrderBookSnapshot, AccountSnapshot, AccountSnapshot]:
+        initial_metadata: MarketMetadata | None,
+        initial_book: OrderBookSnapshot | None,
+        initial_source: AccountSnapshot | None,
+        initial_receiver: AccountSnapshot | None,
+    ) -> tuple[MarketMetadata, OrderBookSnapshot, AccountSnapshot, AccountSnapshot, RandomCycleSelection]:
         metadata = _as_market(await self._bounded(self.client.market_metadata(config.market_id), config, "opening revalidation market read"))
         book = _as_book(await self._bounded(self._order_book(config.market_id), config, "opening revalidation order book read"), metadata)
         now = self.clock.now()
         _validate_market_book(config, metadata, book, now)
         proposal = select_automatic_prices(config.direction, metadata, book, now=now, freshness_seconds=config.freshness_seconds)
-        if proposal.source_limit_price != selection.opening_source_price or proposal.receiver_worst_price != selection.opening_receiver_bound:
-            raise PreflightBlocked("opening public quote changed before mutation")
         source, receiver = await self._accounts(config, now)
-        if source.signed_position != initial_source.signed_position or receiver.signed_position != initial_receiver.signed_position:
+        expected_source_position = 0 if initial_source is None else initial_source.signed_position
+        expected_receiver_position = 0 if initial_receiver is None else initial_receiver.signed_position
+        if source.signed_position != expected_source_position or receiver.signed_position != expected_receiver_position:
             raise PreflightBlocked("account position changed before opening mutation")
-        refreshed_bounds = compute_quantity_bounds(metadata, source, receiver, selection.opening_source_price)
+        refreshed_bounds = compute_quantity_bounds(metadata, source, receiver, proposal.source_limit_price)
+        if refreshed_bounds.size_step != selection.bounds.size_step:
+            raise PreflightBlocked("opening size grid changed before mutation")
         if not refreshed_bounds.lower_tick <= selection.quantity_tick <= refreshed_bounds.upper_tick:
             raise PreflightBlocked("fresh available balance no longer funds the selected quantity")
-        if source.source_identity != initial_source.source_identity or receiver.source_identity != initial_receiver.source_identity:
+        if initial_source is not None and source.source_identity != initial_source.source_identity:
+            self._mark_identity_failure("account identity changed before opening mutation")
+            raise PreflightBlocked("account identity changed before opening mutation")
+        if initial_receiver is not None and receiver.source_identity != initial_receiver.source_identity:
             self._mark_identity_failure("account identity changed before opening mutation")
             raise PreflightBlocked("account identity changed before opening mutation")
         del initial_metadata, initial_book
-        return metadata, book, source, receiver
+        refreshed_selection = replace(
+            selection,
+            quantity=selection.quantity_tick * refreshed_bounds.size_step,
+            opening_source_price=proposal.source_limit_price,
+            opening_receiver_bound=proposal.receiver_worst_price,
+            bounds=refreshed_bounds,
+            metadata_observed_at=metadata.observed_at,
+            book_observed_at=book.observed_at,
+        )
+        return metadata, book, source, receiver, refreshed_selection
 
     def _handoff_config(
         self,
