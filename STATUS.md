@@ -1,5 +1,13 @@
 # Current status
 
+## HCR-22 — PAUSED; correction WIP preserved, not accepted
+
+The owner explicitly paused HCR-22 on 2026-09-20 before Chief acceptance. Builder task `01a0bf06-47d0-7772-b9c6-ed1ecb8a318a` is stopped/idle and archived only for UI cleanup after delivering a safe checkpoint. Preserved branch `codex/spread-v1-priority-guard-builder` points to `3c20b9dc62d06afa614762daf038ed1234286a6a`; its tree is identical to correction candidate `09c9204b3f8034199ad277b6ed9da1dace1e8624`, based on unaccepted `bbfed58317d9c3d79a82c30ad78acbb0f820bee3`. Accepted/contract base remains `2ddc3dfc964a3b8fa6cd678051ca0b1ee4d74f9d` on Chief branch `codex/spread-v1-priority-guard-chief`.
+
+The correction claims mandatory exact owner-bound public-book source evidence, fail-closed UNKNOWN/LOST admission, safe bounded retries, paired-closing symmetry, diagnostics, latency evidence and corrected cycle-004 facts. Builder evidence: focused/adverse `201 passed`; clean Python 3.11.5 full suite on exact implementation candidate `09c9204b`: `4620 passed, 3 skipped`, exit 0, 126.69 seconds; diff/compile passed. Chief has not completed the full correction diff review or independent adverse probes, so these results do not establish acceptance. No merge, push, installed update, live validation, account read, Keychain access or financial mutation occurred.
+
+Resume only on explicit owner instruction. The next action is the bounded independent Chief review recorded at the top of `NEXT_TASK.md`; do not dispatch a fresh Builder unless that review produces a justified correction contract.
+
 ## HCR-21 — COMPLETE; accepted and installed
 
 Accepted candidate `d3f98e6b21a6059a2dfbb62cb8e2e507cc1819bf`, based on preserved candidate `ff5309110fe8d27b32100d6287978eb94b7ff522`, is integrated by merge `0c886856b484e0a662ddb9f850be9219da75d271`. Alternate rejected candidate `a4037fa8126912dad000b8bdc7d365a2bb5fde60` remains preserved. The implementation recognizes the exact cycle-003 terminal zero-fill IOC, retains strict identity/mismatch evidence, preserves UNKNOWN mutation barriers, continues only known residuals with fresh bounds, and reports receiver/fallback/position observation facts explicitly. No policy, slippage, quantity, minimum or retry-cap change was made.

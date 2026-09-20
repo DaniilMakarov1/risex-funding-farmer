@@ -1,5 +1,17 @@
 # HCR-22 — fresh-book source-priority admission and bounded pair retry
 
+## PAUSED — safe checkpoint 2026-09-20
+
+The owner explicitly paused HCR-22 before Chief acceptance. Do not resume implementation, review, integration, publication, live validation or account/network access until the owner explicitly resumes this objective.
+
+Builder task `01a0bf06-47d0-7772-b9c6-ed1ecb8a318a` is stopped and idle. Its preserved worktree is `/Users/daniilmakarov/.codex/worktrees/1f3b/RISEx Spread Shadow`; named branch `codex/spread-v1-priority-guard-builder` now points to WIP checkpoint `3c20b9dc62d06afa614762daf038ed1234286a6a`. That WIP commit has no tree delta from correction candidate `09c9204b3f8034199ad277b6ed9da1dace1e8624`, whose parent is unaccepted candidate `bbfed58317d9c3d79a82c30ad78acbb0f820bee3`; the original accepted/contract base is `2ddc3dfc964a3b8fa6cd678051ca0b1ee4d74f9d`.
+
+The correction candidate is `WIP_NOT_ACCEPTED`: Chief has not read its full correction diff, independently verified the adverse behavior, accepted it, merged it or pushed it. Builder reported `git diff --check` and compile success, `201 passed` focused/adverse checks, and one clean Python 3.11.5 full suite on the unchanged implementation tree at `09c9204b`: `4620 passed, 3 skipped`, exit 0 in 126.69 seconds. No new suite was run after the no-tree-delta pause checkpoint.
+
+Known unresolved acceptance boundary: the official live `orderBookOrders` payload shape and owner binding have not been independently confirmed. The candidate intends to fail closed when exact normalized `order_id` plus `owner_account_index` source-level evidence is unavailable. No live/network/account/Keychain/order/cancel operation was performed.
+
+Single next action after explicit resume: the sole Chief reconstructs identity from this checkpoint, confirms the Builder remains stopped, reads the complete `bbfed583..09c9204` diff and relevant surroundings, independently probes the exact-source/anonymous-same-price/no-reader/stale-book and cycle-004 boundaries, and then either accepts/integrates or returns one finite correction contract. Do not restart the Builder merely to inspect this preserved candidate.
+
 ## Finite objective and authority
 
 Correct the race between source POST_ONLY LIMIT placement and receiver MARKET/IOC dispatch for `PAIRED_OPENING` and `PAIRED_CLOSING`. The receiver may be sent only when a fresh public-book observation and the exact source-order observation prove that the intended source quantity is still resting with admissible price-time priority. If priority is lost or cannot be proved, do not send the receiver; reconcile the exact source order and actual positions, and permit a fresh pair attempt only from a proven zero-fill, confirmed terminal/cancel state and the original positions.
