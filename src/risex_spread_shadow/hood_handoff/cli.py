@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from decimal import Decimal, InvalidOperation
+import importlib
 import json
 import os
 from pathlib import Path
@@ -44,7 +45,7 @@ from .readiness import (
     ReadOnlyLighterSdkClient,
     run_readiness,
 )
-from .sdk import LighterSdkClient
+from .sdk import LighterSdkClient, MissingSdkError, SdkVersionError
 from .series import RobinhoodSeriesConfig, run_series
 
 
@@ -704,6 +705,87 @@ def _simple_config_value(value: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _validate_simple_sdk() -> None:
+    """Prove the local SDK distribution and module before claiming a slot.
+
+    The simple launcher is deliberately the only path that reaches the
+    protected credential/client boundary.  Keeping this check here means a
+    system interpreter with no ``lighter`` module fails locally, before a
+    cycle directory can become consumed.
+    """
+
+    try:
+        LighterSdkClient.verify_sdk()
+    except MissingSdkError:
+        raise SystemExit(
+            "Локальная ошибка SDK: требуется установленный lighter-sdk==1.1.2. "
+            "Запустите ./start из проекта после установки зависимостей в .venv-hood."
+        ) from None
+    except SdkVersionError as exc:
+        raise SystemExit(
+            f"Локальная ошибка SDK: {exc}. Установите ровно lighter-sdk==1.1.2 в .venv-hood."
+        ) from None
+    except Exception:
+        raise SystemExit(
+            "Локальная ошибка SDK: не удалось проверить distribution lighter-sdk. "
+            "Переустановите зависимости в .venv-hood."
+        ) from None
+
+    try:
+        importlib.import_module("lighter")
+    except Exception:
+        raise SystemExit(
+            "Локальная ошибка SDK: lighter-sdk==1.1.2 найден, но модуль lighter не импортируется. "
+            "Переустановите зависимости в .venv-hood."
+        ) from None
+
+
+def _validate_simple_local_inputs(
+    value: Mapping[str, Any],
+    *,
+    config_path: Path,
+    operator_dir: Path,
+    evidence_path: Path,
+    defer_incremental_margin_calculation: bool | None,
+) -> tuple[RandomCycleConfig, Mapping[str, Any]]:
+    """Validate all local inputs before the first durable slot mutation."""
+
+    if config_path.is_symlink() or not config_path.is_file():
+        raise SystemExit(f"Локальная ошибка конфигурации: файл недоступен: {config_path}")
+    if operator_dir.is_symlink() or not operator_dir.exists() or not operator_dir.is_dir():
+        raise SystemExit(
+            f"Локальная ошибка каталога циклов: каталог недоступен или не является папкой: {operator_dir}"
+        )
+    try:
+        operator_info = operator_dir.stat()
+    except OSError:
+        raise SystemExit(f"Локальная ошибка каталога циклов: каталог нельзя прочитать: {operator_dir}") from None
+    if operator_info.st_uid != os.geteuid() or operator_info.st_mode & 0o077:
+        raise SystemExit(
+            f"Локальная ошибка каталога циклов: каталог должен быть доступен только владельцу: {operator_dir}"
+        )
+
+    try:
+        config = _random_cycle_config(
+            _simple_config_value(value),
+            execute=True,
+            plan_reviewed=True,
+            defer_incremental_margin_calculation=defer_incremental_margin_calculation,
+        )
+    except SystemExit as exc:
+        detail = str(exc) or "неизвестная ошибка"
+        raise SystemExit(f"Локальная ошибка конфигурации: {detail}") from None
+    if config.api_key_index is None:
+        raise SystemExit("Локальная ошибка конфигурации: требуется api_key_index")
+
+    try:
+        evidence = _load_json(evidence_path, "market evidence")
+    except SystemExit as exc:
+        detail = str(exc) or "файл нельзя прочитать"
+        raise SystemExit(f"Локальная ошибка market evidence: {detail}") from None
+    return config, evidence
+
+
 def _print_simple_summary(
     value: Mapping[str, Any],
     config_path: Path,
@@ -938,17 +1020,19 @@ async def _run_simple(args: argparse.Namespace) -> int:
     if not _simple_confirmation():
         return 0
 
-    # Validation is still local and secret-free.  No Keychain, SDK or account
-    # reader is touched until after the new slot has been durably claimed.
-    base_config = _random_cycle_config(
-        _simple_config_value(value),
-        execute=True,
-        plan_reviewed=True,
+    # Validation is local and secret-free.  The SDK distribution/import,
+    # configuration and evidence must all be valid before the new slot can be
+    # durably claimed.  No Keychain, client, account reader or network path is
+    # touched by these checks.
+    evidence_path = _simple_evidence_path(value, operator_dir, args.market_evidence)
+    base_config, evidence = _validate_simple_local_inputs(
+        value,
+        config_path=config_path,
+        operator_dir=operator_dir,
+        evidence_path=evidence_path,
         defer_incremental_margin_calculation=args.defer_incremental_margin_calculation,
     )
-    evidence_path = _simple_evidence_path(value, operator_dir, args.market_evidence)
-    if base_config.api_key_index is None:
-        raise SystemExit("simple launcher configuration requires api_key_index")
+    _validate_simple_sdk()
     try:
         cycle_dir, client_order_prefix = allocate_cycle_slot(
             operator_dir,
@@ -966,12 +1050,14 @@ async def _run_simple(args: argparse.Namespace) -> int:
         plan_reviewed=True,
         defer_incremental_margin_calculation=args.defer_incremental_margin_calculation,
     )
-    print(f"Новый слот занят: {cycle_dir}; уникальный префикс сохранён в {cycle_dir / 'launch.json'}.")
+    print(
+        f"Новый слот создан и зарезервирован: {cycle_dir}; "
+        f"уникальный префикс сохранён в {cycle_dir / 'launch.json'}."
+    )
     secrets: Any | None = None
     client: LighterSdkClient | None = None
     emitted_keys: set[tuple[str, int | None, int | None]] = set()
     try:
-        evidence = _load_json(evidence_path, "market evidence")
         account_indices = (config.source_account_index, config.receiver_account_index)
         if args.keychain or args.keychain_replace:
             secrets = _keychain_provider(config, account_indices, replace=args.keychain_replace)

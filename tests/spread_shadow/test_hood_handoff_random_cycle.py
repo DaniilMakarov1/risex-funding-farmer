@@ -5,6 +5,8 @@ from dataclasses import asdict, replace
 from decimal import Decimal
 import json
 from pathlib import Path
+import shutil
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -2312,6 +2314,7 @@ async def test_simple_enter_admits_reserved_slot_and_same_slot_replay_is_blocked
         return await real_run_random_cycle(config, client, clock=clock, rng=FixedRng(25, 20))
 
     monkeypatch.setattr("builtins.input", lambda _prompt: "")
+    monkeypatch.setattr(cli_module, "_validate_simple_sdk", lambda: None)
     monkeypatch.setattr(cli_module, "LighterSdkClient", FakeSdkClient)
     monkeypatch.setattr(cli_module, "run_random_cycle", run_with_synthetic_clock)
     assert await cli_module._run(
@@ -2377,6 +2380,7 @@ async def test_simple_exception_reports_durable_mutation_boundary(tmp_path, monk
         raise RuntimeError("synthetic post-launch failure")
 
     monkeypatch.setattr("builtins.input", lambda _prompt: "")
+    monkeypatch.setattr(cli_module, "_validate_simple_sdk", lambda: None)
     monkeypatch.setattr(cli_module, "LighterSdkClient", FakeSdkClient)
     monkeypatch.setattr(cli_module, "run_random_cycle", failing_run)
     assert await cli_module._run(
@@ -2435,6 +2439,7 @@ async def test_simple_progress_is_printed_before_synthetic_terminal_return(tmp_p
         )
 
     monkeypatch.setattr("builtins.input", lambda _prompt: "")
+    monkeypatch.setattr(cli_module, "_validate_simple_sdk", lambda: None)
     monkeypatch.setattr(cli_module, "LighterSdkClient", FakeSdkClient)
     monkeypatch.setattr(cli_module, "run_random_cycle", progress_run)
     assert await cli_module._run(
@@ -2477,9 +2482,194 @@ def test_simple_launcher_cancel_is_russian_and_does_not_claim_a_slot(tmp_path, m
     )
     monkeypatch.setenv("RISEX_HOOD_OPERATOR_DIR", str(operator_dir))
     monkeypatch.setattr("builtins.input", lambda _prompt: "CANCEL")
+    monkeypatch.setattr(cli_module, "_validate_simple_sdk", lambda: None)
     monkeypatch.setattr(cli_module, "LighterSdkClient", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("client must not be built")))
     assert cli_module.main(["simple", "--config", str(config_path)]) == 0
     output = capsys.readouterr().out
     assert "Один реальный Robinhood Chain Mainnet цикл" in output
     assert "Отменено до запуска" in output
     assert not operator_dir.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["missing", "wrong", "broken"])
+async def test_simple_sdk_validation_fails_before_slot_or_keychain(tmp_path, monkeypatch, failure):
+    config_path, operator_dir, evidence_path = _write_simple_launcher_fixture(tmp_path)
+    monkeypatch.setattr("builtins.input", lambda _prompt: "")
+    monkeypatch.setattr(
+        cli_module,
+        "_keychain_provider",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Keychain must not be touched")),
+    )
+
+    if failure == "missing":
+        def missing_sdk() -> None:
+            raise cli_module.MissingSdkError("not installed")
+
+        monkeypatch.setattr(cli_module.LighterSdkClient, "verify_sdk", staticmethod(missing_sdk))
+    elif failure == "wrong":
+        def wrong_sdk() -> None:
+            raise cli_module.SdkVersionError("lighter-sdk 1.1.2 is required, found 1.0.0")
+
+        monkeypatch.setattr(cli_module.LighterSdkClient, "verify_sdk", staticmethod(wrong_sdk))
+    else:
+        monkeypatch.setattr(cli_module.LighterSdkClient, "verify_sdk", staticmethod(lambda: None))
+        real_import = cli_module.importlib.import_module
+
+        def broken_import(name: str):
+            if name == "lighter":
+                raise ImportError("synthetic broken native module")
+            return real_import(name)
+
+        monkeypatch.setattr(cli_module.importlib, "import_module", broken_import)
+
+    with pytest.raises(SystemExit) as caught:
+        await cli_module._run(
+            cli_module._parser().parse_args(
+                [
+                    "simple",
+                    "--config",
+                    str(config_path),
+                    "--market-evidence",
+                    str(evidence_path),
+                ]
+            )
+        )
+    message = str(caught.value)
+    assert "Локальная ошибка SDK" in message
+    assert "1.1.2" in message
+    assert not (operator_dir / "cycle-001").exists()
+
+
+@pytest.mark.asyncio
+async def test_simple_invalid_local_config_or_evidence_does_not_claim_slot(tmp_path, monkeypatch):
+    config_path, operator_dir, evidence_path = _write_simple_launcher_fixture(tmp_path)
+    monkeypatch.setattr("builtins.input", lambda _prompt: "")
+    monkeypatch.setattr(
+        cli_module,
+        "_validate_simple_sdk",
+        lambda: (_ for _ in ()).throw(AssertionError("SDK must follow local validation")),
+    )
+    config_path.write_text(
+        json.dumps(
+            {
+                "market_id": 7,
+                "market_symbol": "BTC",
+                "direction": "LONG",
+                "source_account_index": 11,
+                "receiver_account_index": 11,
+                "api_key_index": 4,
+                "cycle_dir": str(tmp_path / "old-cycle-001"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit, match="Локальная ошибка конфигурации"):
+        await cli_module._run(
+            cli_module._parser().parse_args(["simple", "--config", str(config_path)])
+        )
+    assert not (operator_dir / "cycle-001").exists()
+
+    evidence_root = tmp_path / "evidence"
+    evidence_root.mkdir()
+    config_path, operator_dir, evidence_path = _write_simple_launcher_fixture(evidence_root)
+    evidence_path.unlink()
+    with pytest.raises(SystemExit, match="Локальная ошибка market evidence"):
+        await cli_module._run(
+            cli_module._parser().parse_args(["simple", "--config", str(config_path)])
+        )
+    assert not (operator_dir / "cycle-001").exists()
+
+
+@pytest.mark.asyncio
+async def test_simple_success_reports_created_and_reserved_slot(tmp_path, monkeypatch, capsys):
+    config_path, operator_dir, evidence_path = _write_simple_launcher_fixture(tmp_path)
+
+    class FakeSdkClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def aclose(self):
+            return None
+
+    async def successful_run(config, client):
+        return SimpleNamespace(
+            outcome=Outcome.SUCCESS,
+            selection=None,
+            remaining_source_position=Decimal("0"),
+            remaining_receiver_position=Decimal("0"),
+            reason=None,
+            journal_path=str(config.journal_path),
+        )
+
+    monkeypatch.setattr("builtins.input", lambda _prompt: "")
+    monkeypatch.setattr(cli_module, "_validate_simple_sdk", lambda: None)
+    monkeypatch.setattr(cli_module, "LighterSdkClient", FakeSdkClient)
+    monkeypatch.setattr(cli_module, "run_random_cycle", successful_run)
+    assert await cli_module._run(
+        cli_module._parser().parse_args(
+            ["simple", "--config", str(config_path), "--market-evidence", str(evidence_path)]
+        )
+    ) == 0
+    assert "Новый слот создан и зарезервирован" in capsys.readouterr().out
+    assert (operator_dir / "cycle-001" / "launch.json").exists()
+
+
+def _copy_start_script(tmp_path: Path) -> Path:
+    source = Path(__file__).parents[2] / "start"
+    target = tmp_path / "start"
+    shutil.copy2(source, target)
+    target.chmod(0o755)
+    return target
+
+
+def test_start_uses_project_venv_python_even_when_path_has_other_python(tmp_path):
+    start = _copy_start_script(tmp_path)
+    python_dir = tmp_path / ".venv-hood" / "bin"
+    python_dir.mkdir(parents=True)
+    marker = tmp_path / "selected-python.args"
+    selected_python = python_dir / "python"
+    selected_python.write_text(
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$START_MARKER\"\n",
+        encoding="utf-8",
+    )
+    selected_python.chmod(0o755)
+    path_dir = tmp_path / "path-bin"
+    path_dir.mkdir()
+    path_python = path_dir / "python3"
+    path_python.write_text("#!/bin/sh\nexit 91\n", encoding="utf-8")
+    path_python.chmod(0o755)
+    result = subprocess.run(
+        [str(start)],
+        env={
+            "PATH": f"{path_dir}:/usr/bin:/bin",
+            "START_MARKER": str(marker),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0
+    assert "risex_spread_shadow.hood_handoff.cli" in marker.read_text(encoding="utf-8")
+    assert "simple" in marker.read_text(encoding="utf-8")
+    assert "--keychain" in marker.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("mode", [None, 0o600])
+def test_start_reports_missing_or_non_executable_project_venv_without_running_python(tmp_path, mode):
+    start = _copy_start_script(tmp_path)
+    python_path = tmp_path / ".venv-hood" / "bin" / "python"
+    if mode is not None:
+        python_path.parent.mkdir(parents=True)
+        python_path.write_text("#!/bin/sh\nexit 91\n", encoding="utf-8")
+        python_path.chmod(mode)
+    result = subprocess.run(
+        [str(start)],
+        env={"PATH": "/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "Ошибка запуска" in result.stderr
+    assert ".venv-hood/bin/python" in result.stderr
