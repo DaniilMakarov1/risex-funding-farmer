@@ -1,6 +1,12 @@
 # Current status
 
-## HCR-21 — ACTIVE; cycle-003 reconciliation correction authorized
+## HCR-21 — PAUSED at safe pre-integration checkpoint
+
+The owner explicitly paused Chief and Builder work on 2026-09-20. Accepted local/remote `main` remains `59eb990e63b160021d99b9bf07695873b6c3df4f`; no production candidate was merged, installed or published. Both Builder worktrees were clean at pause: `a4037fa8126912dad000b8bdc7d365a2bb5fde60` on `codex/spread-v1-fallback-reconcile-builder` and `ff5309110fe8d27b32100d6287978eb94b7ff522` on `codex/spread-v1-fallback-reconcile`. The second is the designated correction base. A consolidated correction request was delivered, then work was stopped before any returned follow-up SHA.
+
+Chief review found two remaining issues in `ff530911`: the actual fallback poll path can accept an empty observed `order_id` when an accepted receipt omitted its order ID, and the Russian formatter computes durable position values but drops them from its final line while exception/cancellation output omits durable observation times. Resume only after explicit owner instruction; verify worktree state, finish those two cases with adverse tests, then repeat complete diff review, independent incident/adverse replay and one final clean Python 3.11 suite. Preserve both candidates and all evidence. No live mutation or new cycle occurred.
+
+## HCR-21 incident diagnosis and authorized correction
 
 Owner authorized the complete correction plan plus exact read-only incident inspection. Immutable cycle-003 proves source27331 external full fill `-0.00023 BTC`, receiver27337 never dispatched, and one accepted reduce-only BUY MARKET IOC fallback whose retrieved order was discarded by a generic plan-conflict check. Chief read-only inspection proved exact fallback order `844424849590873`: correct account/market/client identity/BUY/MARKET/IOC/reduce-only/price/initial quantity, status `canceled-too-much-slippage`, filled `0`, remaining `0`, no trades. Source remained `-0.00023 BTC`, receiver `0`, no active BTC orders at observations around `1789892127.81`. Code incorrectly required remaining plus filled to equal initial even for a terminal canceled IOC, misclassified known zero-fill cancellation as identity UNKNOWN and stopped the existing fresh-price residual loop. Sanitized evidence is `hood-cycle-fallback-20260920/chief-v1/live-read-only.json`. A fresh Builder will correct classification, exact mismatch retention and final Russian explanation. Receiver dispatch-after-source-fill remains forbidden; no financial mutation or new cycle was performed.
 

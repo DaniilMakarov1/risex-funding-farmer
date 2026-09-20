@@ -1,6 +1,14 @@
 # HCR-21 — cycle-003 fallback reconciliation and truthful terminal explanation
 
-## Active owner-authorized objective
+## PAUSED owner-authorized objective
+
+The owner explicitly paused HCR-21 on 2026-09-20 before integration. Do not resume Builder work, tests, integration, installation, publication, live reads or any mutation until the owner explicitly says to continue. Preserve all branches, worktrees, commits, journals and evidence exactly.
+
+Safe checkpoint: accepted `main`, Chief and remote remain `59eb990e63b160021d99b9bf07695873b6c3df4f`. Two independently produced, unaccepted clean candidates are preserved: `a4037fa8126912dad000b8bdc7d365a2bb5fde60` in `codex/spread-v1-fallback-reconcile-builder` and `ff5309110fe8d27b32100d6287978eb94b7ff522` in `codex/spread-v1-fallback-reconcile`. Chief review rejected the first because its rejected-dispatch read path can reference `after` before assignment and its helper no longer guarantees a non-empty order ID. The second retains the stronger behavior and is the correction base, but it still requires two finite fixes before review can resume: reject an empty observed order ID through the actual poll path when an accepted receipt has no order ID, and preserve durable position values/timestamps in final plus exception/cancellation Russian output. The correction request was delivered to the Builder, then the owner paused all work before a follow-up candidate was returned. On resume, first verify the Builder/worktree status and continue this same finite correction without starting a third implementation or merging either current candidate.
+
+Completed evidence before pause: exact read-only incident packet `hood-cycle-fallback-20260920/chief-v1/live-read-only.json`; immutable cycle-003 hashes reverified; accepted-base clean Python 3.11 suite `4595 passed, 3 skipped`; candidate `ff530911` reported focused `140 passed` and clean full `4601 passed, 3 skipped`, but remains unaccepted pending the two corrections and independent final verification. No new live cycle or financial mutation occurred.
+
+## Authorized objective after explicit resume
 
 On 2026-09-20 the owner explicitly authorized implementation of the complete correction plan for the latest random-cycle incident. Diagnose the exact read-only state of cycle-003's fallback order, then correct fallback reconciliation, retained mismatch evidence and the operator-facing terminal explanation. Install and publish only after independent Chief review. The owner authorizes exact read-only Robinhood Mainnet account/order/trade inspection for this incident using the existing protected Keychain credentials. No signing mutation, order, cancellation, transfer, leverage/margin change, historical-position adoption or new cycle is authorized.
 
