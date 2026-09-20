@@ -6,6 +6,7 @@ import argparse
 import asyncio
 from decimal import Decimal, InvalidOperation
 import json
+import os
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -28,7 +29,13 @@ from .local_attempt import (
     format_local_attempt_result,
     run_local_attempt,
 )
-from .random_cycle import RandomCycleConfig, RandomCycleEngine, run_random_cycle
+from .random_cycle import (
+    MAX_PREPARATION_ATTEMPTS,
+    RandomCycleConfig,
+    RandomCycleEngine,
+    allocate_cycle_slot,
+    run_random_cycle,
+)
 from .readiness import (
     ReadinessCheck,
     ReadinessConfig,
@@ -83,7 +90,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "run",
         nargs="?",
-        choices=("run", "readiness", "local-attempt", "random-cycle"),
+        choices=("run", "readiness", "local-attempt", "random-cycle", "simple"),
         help="run the configured utility or the explicit read-only readiness check",
     )
     parser.add_argument("--config", type=Path, help="JSON operator configuration; all numerical bounds are required")
@@ -658,6 +665,365 @@ async def _run_local_attempt(args: argparse.Namespace) -> int:
     return result.exit_code
 
 
+_DEFAULT_SIMPLE_OPERATOR_RELATIVE = Path(
+    "spread-shadow-runs/hood-cycle-race-latency-20260920/operator-v1"
+)
+
+
+def _simple_operator_dir(config_path: Path) -> Path:
+    configured = os.environ.get("RISEX_HOOD_OPERATOR_DIR")
+    if configured:
+        return Path(configured)
+    return config_path.parent
+
+
+def _simple_config_path(explicit: Path | None) -> Path:
+    if explicit is not None:
+        return explicit
+    configured = os.environ.get("RISEX_HOOD_CONFIG")
+    if configured:
+        return Path(configured)
+    root = Path(os.environ.get("RISEX_SPREAD_SHADOW_ROOT", Path.cwd()))
+    return root / _DEFAULT_SIMPLE_OPERATOR_RELATIVE / "random-cycle.json"
+
+
+def _simple_evidence_path(value: Mapping[str, Any], operator_dir: Path, explicit: Path | None) -> Path:
+    if explicit is not None:
+        return explicit
+    for key in ("market_evidence", "market_evidence_path"):
+        raw = value.get(key)
+        if raw is not None:
+            return Path(str(raw))
+    return operator_dir / "market-contract.json"
+
+
+def _simple_config_value(value: Mapping[str, Any]) -> dict[str, Any]:
+    result = dict(value)
+    for key in ("market_evidence", "market_evidence_path", "operator_dir"):
+        result.pop(key, None)
+    return result
+
+
+def _print_simple_summary(
+    value: Mapping[str, Any],
+    config_path: Path,
+    operator_dir: Path,
+    *,
+    use_keychain: bool,
+) -> None:
+    direction = str(value.get("direction", "?")).upper()
+    symbol = str(value.get("market_symbol", value.get("symbol", "?"))).upper()
+    source = value.get("source_account_index", "?")
+    receiver = value.get("receiver_account_index", "?")
+    credential_route = "сохранённый Keychain" if use_keychain else "скрытый локальный ввод ключей"
+    print(f"Один реальный Robinhood Chain Mainnet цикл: {symbol}, направление {direction}.")
+    print(f"Счета: источник {source}, приёмник {receiver}; слот будет выбран после подтверждения.")
+    print(f"После Enter будет использован {credential_route}; до Enter нет чтения рынка или доступа к ключам.")
+    print(f"Конфигурация: {config_path}; каталог результатов: {operator_dir}.")
+    print("Нажмите Enter, чтобы запустить один цикл. Введите C или CANCEL для отмены.")
+
+
+def _simple_confirmation() -> bool:
+    try:
+        response = input("Подтверждение (Enter = запуск, C/CANCEL = отмена): ")
+    except (EOFError, KeyboardInterrupt):
+        print("Отменено до запуска: ключи, чтение рынка и ордера не использовались.")
+        return False
+    if not isinstance(response, str) or response.strip().upper() in {"C", "CANCEL", "N", "NO"}:
+        print("Отменено до запуска: ключи, чтение рынка и ордера не использовались.")
+        return False
+    if response.strip():
+        print("Отменено до запуска: для запуска нужно нажать Enter без текста.")
+        return False
+    return True
+
+
+def _read_simple_events(path: str | None) -> list[dict[str, Any]]:
+    if path is None:
+        return []
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    events: list[dict[str, Any]] = []
+    for line in lines:
+        try:
+            value = json.loads(line)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(value, Mapping) and isinstance(value.get("event"), str):
+            events.append(dict(value))
+    return events
+
+
+def _simple_event_key(row: Mapping[str, Any]) -> tuple[str, int | None, int | None]:
+    payload = row.get("payload")
+    if not isinstance(payload, Mapping):
+        payload = {}
+    attempt = payload.get("attempt")
+    account_index = payload.get("account_index")
+    return (
+        str(row.get("event")),
+        attempt if isinstance(attempt, int) else None,
+        account_index if isinstance(account_index, int) else None,
+    )
+
+
+def _simple_event_line(row: Mapping[str, Any]) -> str | None:
+    event = row.get("event")
+    payload = row.get("payload")
+    if not isinstance(payload, Mapping):
+        payload = {}
+    attempt = payload.get("attempt")
+    if event == "SELECTION_PROVED":
+        selection = payload.get("selection")
+        if isinstance(selection, Mapping):
+            return f"Выбрано: {selection.get('quantity')} единиц, удержание {selection.get('hold_seconds')} с."
+    if event == "PREPARATION_ATTEMPT":
+        return f"Подготовка: попытка {attempt}/{MAX_PREPARATION_ATTEMPTS}."
+    if event == "PREPARATION_RETRY":
+        return f"Подготовка не завершена; повтор через {payload.get('delay_seconds')} с."
+    if event == "PREPARATION_FAILED":
+        return "Подготовка не прошла; проверяю свежий полный снимок."
+    if event == "PREPARATION_BLOCKED":
+        return "Подготовка остановлена: безопасный повтор запрещён."
+    if event == "PREPARATION_EXHAUSTED":
+        return "Подготовка остановлена: исчерпаны три попытки до записи."
+    if event == "OPENING_PRICE_UPDATED":
+        return (
+            "Котировка обновлена: "
+            f"{payload.get('old_source_price')} → {payload.get('new_source_price')} "
+            f"(попытка {attempt})."
+        )
+    if event == "PREPARATION_ACCEPTED":
+        return f"Подготовка принята (попытка {attempt}); запись ещё не отправлялась."
+    if event == "OPENING_BOUNDS_REFRESHED":
+        return "Свежие минимумы и балансы проверены для сохранённого объёма."
+    if event == "OPENING_PLAN_READY":
+        return "План открытия готов; до следующей границы ордера не отправляются."
+    if event == "FIRST_MUTATION_BOUNDARY":
+        return "Граница первой записи пройдена; дальнейшее состояние определяется журналом открытия."
+    if event == "OPENING_COMPLETE":
+        return "Открытие и его сверка завершены."
+    if event == "HOLD_ANCHORED":
+        return f"Удержание начато: {payload.get('hold_seconds')} с от подтверждённого открытия."
+    if event == "CLOSING_PLAN_READY":
+        return "Закрытие подготовлено по фактическим позициям."
+    if event == "CLOSING_COMPLETE":
+        return "Закрытие и его сверка завершены."
+    if event in {"FALLBACK_ATTEMPT_EVIDENCE", "FALLBACK_RECONCILED", "FALLBACK_RECONCILIATION_UNKNOWN"}:
+        return "Сверка остатка позиции выполнена."
+    return None
+
+
+def _simple_durable_state(cycle_dir: Path) -> tuple[bool, str, str]:
+    cycle_events = _read_simple_events(str(cycle_dir / "cycle.jsonl"))
+    opening_events = _read_simple_events(str(cycle_dir / "opening.jsonl"))
+    all_events = [*cycle_events, *opening_events]
+    boundary = any(
+        row.get("event") == "FIRST_MUTATION_BOUNDARY"
+        or str(row.get("event", "")).endswith("_DISPATCH_INTENT")
+        for row in all_events
+    )
+    source_text = receiver_text = "UNKNOWN"
+    for row in reversed(cycle_events):
+        if row.get("event") != "CYCLE_COMPLETE":
+            continue
+        payload = row.get("payload")
+        if not isinstance(payload, Mapping):
+            continue
+        remaining = payload.get("remaining_positions")
+        if not isinstance(remaining, Mapping):
+            continue
+        if remaining.get("source") is not None:
+            source_text = str(remaining["source"])
+        if remaining.get("receiver") is not None:
+            receiver_text = str(remaining["receiver"])
+        break
+    return boundary, source_text, receiver_text
+
+
+async def _stream_simple_progress(
+    journal_path: Path,
+    emitted_keys: set[tuple[str, int | None, int | None]],
+    stop_event: asyncio.Event,
+) -> None:
+    """Print each durable progress event once while the finite cycle runs."""
+
+    while True:
+        for row in _read_simple_events(str(journal_path)):
+            key = _simple_event_key(row)
+            if key in emitted_keys:
+                continue
+            line = _simple_event_line(row)
+            if line is None:
+                continue
+            print(line, flush=True)
+            emitted_keys.add(key)
+        if stop_event.is_set():
+            return
+        await asyncio.sleep(0.05)
+
+
+def format_random_cycle_result_ru(
+    result: Any,
+    *,
+    emitted_keys: set[tuple[str, int | None, int | None]] | None = None,
+) -> str:
+    """Render the simple launch result without replacing the durable JSONL."""
+
+    events = _read_simple_events(getattr(result, "journal_path", None))
+    lines: list[str] = []
+    emitted = emitted_keys if emitted_keys is not None else set()
+    for row in events:
+        key = _simple_event_key(row)
+        if key in emitted:
+            continue
+        line = _simple_event_line(row)
+        if line is not None:
+            lines.append(line)
+            emitted.add(key)
+
+    selection = getattr(result, "selection", None)
+    if selection is not None and not any(line.startswith("Выбрано:") for line in lines) and not any(
+        key[0] == "SELECTION_PROVED" for key in emitted
+    ):
+        lines.insert(
+            0,
+            f"Выбрано: {selection.quantity} единиц, удержание {selection.hold_seconds} с.",
+        )
+
+    outcome = getattr(getattr(result, "outcome", None), "value", str(getattr(result, "outcome", "UNKNOWN")))
+    source = getattr(result, "remaining_source_position", None)
+    receiver = getattr(result, "remaining_receiver_position", None)
+    journal = getattr(result, "journal_path", None)
+    mutation_boundary = False
+    durable_source = durable_receiver = "UNKNOWN"
+    if journal:
+        mutation_boundary, durable_source, durable_receiver = _simple_durable_state(Path(journal).parent)
+    source_text = "UNKNOWN" if source is None else format(source, "f")
+    receiver_text = "UNKNOWN" if receiver is None else format(receiver, "f")
+    if source is None and durable_source != "UNKNOWN":
+        source_text = durable_source
+    if receiver is None and durable_receiver != "UNKNOWN":
+        receiver_text = durable_receiver
+    if outcome == "SUCCESS":
+        lines.append("Итог: SUCCESS — обе позиции подтверждённо закрыты.")
+    else:
+        may_have_sent = "да или неизвестно" if mutation_boundary else "нет"
+        reason = getattr(result, "reason", None) or "результат не подтверждён"
+        lines.append(f"Итог: {outcome} — {reason}.")
+        lines.append(
+            f"Ордер мог быть отправлен: {may_have_sent}; остаток: источник={source_text}, приёмник={receiver_text}."
+        )
+        if journal:
+            lines.append(f"Действие: сохранён журнал {journal}; UNKNOWN нельзя трактовать как flat.")
+    return "\n".join(lines)
+
+
+async def _run_simple(args: argparse.Namespace) -> int:
+    """Run the concise Russian HCR-19 launcher after one Enter confirmation."""
+
+    if args.execute or args.confirm_plan or args.i_understand_one_attempt_live_operation:
+        raise SystemExit("simple launcher accepts its single Enter confirmation instead of execution flags")
+    config_path = _simple_config_path(args.config)
+    value = _load_json(config_path, "simple launcher configuration")
+    operator_dir = _simple_operator_dir(config_path)
+    _print_simple_summary(
+        value,
+        config_path,
+        operator_dir,
+        use_keychain=args.keychain or args.keychain_replace,
+    )
+    if not _simple_confirmation():
+        return 0
+
+    # Validation is still local and secret-free.  No Keychain, SDK or account
+    # reader is touched until after the new slot has been durably claimed.
+    base_config = _random_cycle_config(
+        _simple_config_value(value),
+        execute=True,
+        plan_reviewed=True,
+        defer_incremental_margin_calculation=args.defer_incremental_margin_calculation,
+    )
+    evidence_path = _simple_evidence_path(value, operator_dir, args.market_evidence)
+    if base_config.api_key_index is None:
+        raise SystemExit("simple launcher configuration requires api_key_index")
+    try:
+        cycle_dir, client_order_prefix = allocate_cycle_slot(
+            operator_dir,
+            client_order_prefix=base_config.client_order_prefix,
+        )
+    except PreflightBlocked as exc:
+        raise SystemExit(f"не удалось занять новый слот цикла: {exc}") from None
+    launch_value = _simple_config_value(value)
+    launch_value["cycle_dir"] = str(cycle_dir)
+    launch_value.pop("journal_path", None)
+    launch_value["client_order_prefix"] = client_order_prefix
+    config = _random_cycle_config(
+        launch_value,
+        execute=True,
+        plan_reviewed=True,
+        defer_incremental_margin_calculation=args.defer_incremental_margin_calculation,
+    )
+    print(f"Новый слот занят: {cycle_dir}; уникальный префикс сохранён в {cycle_dir / 'launch.json'}.")
+    secrets: Any | None = None
+    client: LighterSdkClient | None = None
+    emitted_keys: set[tuple[str, int | None, int | None]] = set()
+    try:
+        evidence = _load_json(evidence_path, "market evidence")
+        account_indices = (config.source_account_index, config.receiver_account_index)
+        if args.keychain or args.keychain_replace:
+            secrets = _keychain_provider(config, account_indices, replace=args.keychain_replace)
+            _prime_keychain(secrets, account_indices)
+        else:
+            secrets = PromptSecretProvider(account_indices, config.api_key_index)
+        client = LighterSdkClient(
+            config,
+            source_account_index=config.source_account_index,
+            receiver_account_index=config.receiver_account_index,
+            secrets=secrets,
+            market_evidence=evidence,
+        )
+        stop_progress = asyncio.Event()
+        progress_task = asyncio.create_task(
+            _stream_simple_progress(Path(config.journal_path), emitted_keys, stop_progress)
+        )
+        run_task = asyncio.create_task(run_random_cycle(config, client))
+        await asyncio.sleep(0)
+        try:
+            result = await run_task
+        finally:
+            stop_progress.set()
+            await progress_task
+    except asyncio.CancelledError:
+        may_have_sent, source_text, receiver_text = _simple_durable_state(cycle_dir)
+        send_state = "да или неизвестно" if may_have_sent else "нет"
+        print(
+            f"Прервано: ордер мог быть отправлен — {send_state}; остаток: "
+            f"источник={source_text}, приёмник={receiver_text}; сохранён журнал {cycle_dir / 'cycle.jsonl'}. "
+            "Не повторяйте этот слот и сначала выполните read-only сверку."
+        )
+        return 2
+    except BaseException as exc:
+        reason = str(exc) if isinstance(exc, SystemExit) and str(exc) else sanitize_exception(exc)
+        may_have_sent, source_text, receiver_text = _simple_durable_state(cycle_dir)
+        send_state = "да или неизвестно" if may_have_sent else "нет"
+        print(
+            f"Ошибка запуска: {reason}. Ордер мог быть отправлен: {send_state}; "
+            f"позиции: источник={source_text}, приёмник={receiver_text}. Действие: сохранён слот {cycle_dir} и журнал "
+            f"{cycle_dir / 'cycle.jsonl'}; не повторяйте его автоматически."
+        )
+        return 2
+    finally:
+        if client is not None:
+            await client.aclose()
+        if secrets is not None:
+            secrets.close()
+    print(format_random_cycle_result_ru(result, emitted_keys=emitted_keys))
+    return 0 if result.outcome.value in {"SUCCESS", "PARTIAL", "PREVIEW"} else 2
+
+
 def _prompt_random_cycle_launch(config: RandomCycleConfig) -> bool:
     """Require the one interactive launch boundary before any secret access."""
 
@@ -868,6 +1234,8 @@ async def _run_readiness(args: argparse.Namespace) -> int:
 
 
 async def _run(args: argparse.Namespace) -> int:
+    if args.run == "simple":
+        return await _run_simple(args)
     if args.run == "local-attempt":
         return await _run_local_attempt(args)
     if args.run == "readiness":
@@ -1087,4 +1455,4 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-__all__ = ["PromptSecretProvider", "main"]
+__all__ = ["PromptSecretProvider", "format_random_cycle_result_ru", "main"]
