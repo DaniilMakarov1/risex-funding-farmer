@@ -2,6 +2,8 @@
 
 ## HCR-17 one random BTC cycle — accepted offline
 
+**Current owner result:** `operator-v1/cycle-001` has been used and must not be reused or cleared. Its recorded terminal shows source27331 SHORT0.00027BTC after two external fills and receiver27337 zero/undispatched; overall UNKNOWN prevented closure. Current inventory has not been read. HCR-18 is correcting and testing this software path offline; the command below is preserved documentation of the consumed configuration, not a fresh launch instruction. A later release will provide a separate unused slot.
+
 Candidatee2ad3cf passed4537tests/3skips in a final clean isolated Python3.11 suite and independent boundary checks. No live trading was performed for acceptance.
 
 The new operator command performs one opening/hold/closing cycle. It draws a legal BTC quantity uniformly in integer size ticks, with gross notional capped by the smaller fresh free account balance without leverage. Receiver27337 opens LONG and source27331 opens SHORT with equal quantity; both accounts must initially be exactly flat in BTC with no active BTC orders. The hold is one random integer20..300seconds, timed from independent confirmation of both opening fills. Then it reverses sides with reduce-only on both legs, followed by separately reconciled market reduce-only attempts for any confirmed residuals. It never starts another opening automatically.
