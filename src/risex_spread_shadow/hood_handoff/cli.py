@@ -938,7 +938,7 @@ def _simple_event_line(row: Mapping[str, Any]) -> str | None:
     return None
 
 
-def _simple_durable_state(cycle_dir: Path) -> tuple[bool, str, str]:
+def _simple_durable_state(cycle_dir: Path) -> tuple[bool, str, str, Any, Any]:
     cycle_events = _read_simple_events(str(cycle_dir / "cycle.jsonl"))
     opening_events = _read_simple_events(str(cycle_dir / "opening.jsonl"))
     all_events = [*cycle_events, *opening_events]
@@ -947,7 +947,12 @@ def _simple_durable_state(cycle_dir: Path) -> tuple[bool, str, str]:
         or str(row.get("event", "")).endswith("_DISPATCH_INTENT")
         for row in all_events
     )
+
+    # CYCLE_COMPLETE is the durable terminal snapshot.  It may be the only
+    # source available after a result object was lost, so keep its positions
+    # and observation times authoritative for the final renderer.
     source_text = receiver_text = "UNKNOWN"
+    source_observed_at = receiver_observed_at = None
     for row in reversed(cycle_events):
         if row.get("event") != "CYCLE_COMPLETE":
             continue
@@ -955,14 +960,39 @@ def _simple_durable_state(cycle_dir: Path) -> tuple[bool, str, str]:
         if not isinstance(payload, Mapping):
             continue
         remaining = payload.get("remaining_positions")
-        if not isinstance(remaining, Mapping):
-            continue
-        if remaining.get("source") is not None:
+        observed_at = payload.get("remaining_position_observed_at")
+        if isinstance(remaining, Mapping) and remaining.get("source") is not None:
             source_text = str(remaining["source"])
-        if remaining.get("receiver") is not None:
+        if isinstance(remaining, Mapping) and remaining.get("receiver") is not None:
             receiver_text = str(remaining["receiver"])
+        if isinstance(observed_at, Mapping):
+            source_observed_at = observed_at.get("source")
+            receiver_observed_at = observed_at.get("receiver")
         break
-    return boundary, source_text, receiver_text
+    else:
+        # If the process stopped before CYCLE_COMPLETE, retain the latest
+        # paired post-attempt account observation.  This is sufficient to
+        # report a known durable position without implying that an absent
+        # terminal result was successful.
+        for row in cycle_events:
+            if row.get("event") != "FALLBACK_POST_ATTEMPT_ACCOUNT_OBSERVATION":
+                continue
+            payload = row.get("payload")
+            if not isinstance(payload, Mapping):
+                continue
+            source = payload.get("source")
+            receiver = payload.get("receiver")
+            if isinstance(source, Mapping):
+                if source.get("signed_position") is not None:
+                    source_text = str(source["signed_position"])
+                if source.get("observed_at") is not None:
+                    source_observed_at = source["observed_at"]
+            if isinstance(receiver, Mapping):
+                if receiver.get("signed_position") is not None:
+                    receiver_text = str(receiver["signed_position"])
+                if receiver.get("observed_at") is not None:
+                    receiver_observed_at = receiver["observed_at"]
+    return boundary, source_text, receiver_text, source_observed_at, receiver_observed_at
 
 
 async def _stream_simple_progress(
@@ -1021,17 +1051,38 @@ def format_random_cycle_result_ru(
     journal = getattr(result, "journal_path", None)
     mutation_boundary = False
     durable_source = durable_receiver = "UNKNOWN"
+    durable_source_observed_at = durable_receiver_observed_at = None
     if journal:
-        mutation_boundary, durable_source, durable_receiver = _simple_durable_state(Path(journal).parent)
-    source_text = "UNKNOWN" if source is None else format(source, "f")
-    receiver_text = "UNKNOWN" if receiver is None else format(receiver, "f")
-    if source is None and durable_source != "UNKNOWN":
-        source_text = durable_source
-    if receiver is None and durable_receiver != "UNKNOWN":
-        receiver_text = durable_receiver
+        (
+            mutation_boundary,
+            durable_source,
+            durable_receiver,
+            durable_source_observed_at,
+            durable_receiver_observed_at,
+        ) = _simple_durable_state(Path(journal).parent)
+    source_display = source if source is not None else (
+        None if durable_source == "UNKNOWN" else durable_source
+    )
+    receiver_display = receiver if receiver is not None else (
+        None if durable_receiver == "UNKNOWN" else durable_receiver
+    )
+
+    def position_text(value: Any) -> str:
+        if value is None:
+            return "UNKNOWN"
+        if isinstance(value, Decimal):
+            return format(value, "f")
+        return str(value)
+
+    source_text = position_text(source_display)
+    receiver_text = position_text(receiver_display)
 
     source_observed_at = getattr(result, "remaining_source_position_observed_at", None)
     receiver_observed_at = getattr(result, "remaining_receiver_position_observed_at", None)
+    if source_observed_at is None:
+        source_observed_at = durable_source_observed_at
+    if receiver_observed_at is None:
+        receiver_observed_at = durable_receiver_observed_at
     fallbacks = tuple(getattr(result, "fallbacks", ()) or ())
     opening = getattr(result, "opening", None)
     closing = getattr(result, "closing", None)
@@ -1050,9 +1101,11 @@ def format_random_cycle_result_ru(
         if getattr(fallback, "position_observed_at", None) is None:
             continue
         if getattr(fallback, "account_index", None) == source_account_index:
-            source_observed_at = source_observed_at or fallback.position_observed_at
+            if source_observed_at is None:
+                source_observed_at = fallback.position_observed_at
         elif getattr(fallback, "account_index", None) == receiver_account_index:
-            receiver_observed_at = receiver_observed_at or fallback.position_observed_at
+            if receiver_observed_at is None:
+                receiver_observed_at = fallback.position_observed_at
 
     receiver_leg = None if receiver_phase is None else getattr(receiver_phase, "receiver", None)
     receiver_not_dispatched = receiver_leg is not None and getattr(receiver_leg, "dispatched", True) is False
@@ -1065,7 +1118,7 @@ def format_random_cycle_result_ru(
     accepted_fallback = any(row["payload"].get("accepted") is True for row in dispatch_rows)
 
     def position_line(label: str, value: Any, observed_at: Any) -> str:
-        text = "UNKNOWN" if value is None else format(value, "f")
+        text = position_text(value)
         if observed_at is None:
             return f"{label}={text} (время наблюдения UNKNOWN)"
         return f"{label}={text} (время наблюдения {observed_at})"
@@ -1110,8 +1163,8 @@ def format_random_cycle_result_ru(
         lines.append(f"Fallback: последнее состояние — {state_text}.")
     lines.append(
         "Последние позиции: "
-        f"{position_line('источник', source, source_observed_at)}; "
-        f"{position_line('приёмник', receiver, receiver_observed_at)}."
+        f"{position_line('источник', source_display, source_observed_at)}; "
+        f"{position_line('приёмник', receiver_display, receiver_observed_at)}."
     )
     return "\n".join(lines)
 
@@ -1196,22 +1249,39 @@ async def _run_simple(args: argparse.Namespace) -> int:
             stop_progress.set()
             await progress_task
     except asyncio.CancelledError:
-        may_have_sent, source_text, receiver_text = _simple_durable_state(cycle_dir)
+        (
+            may_have_sent,
+            source_text,
+            receiver_text,
+            source_observed_at,
+            receiver_observed_at,
+        ) = _simple_durable_state(cycle_dir)
         send_state = "да или неизвестно" if may_have_sent else "нет"
         print(
             f"Прервано: ордер мог быть отправлен — {send_state}; остаток: "
             f"источник={source_text}, приёмник={receiver_text}; сохранён журнал {cycle_dir / 'cycle.jsonl'}. "
+            f"Времена наблюдения: источник={source_observed_at if source_observed_at is not None else 'UNKNOWN'}, "
+            f"приёмник={receiver_observed_at if receiver_observed_at is not None else 'UNKNOWN'}. "
             "Не повторяйте этот слот и сначала выполните read-only сверку."
         )
         return 2
     except BaseException as exc:
         reason = str(exc) if isinstance(exc, SystemExit) and str(exc) else sanitize_exception(exc)
-        may_have_sent, source_text, receiver_text = _simple_durable_state(cycle_dir)
+        (
+            may_have_sent,
+            source_text,
+            receiver_text,
+            source_observed_at,
+            receiver_observed_at,
+        ) = _simple_durable_state(cycle_dir)
         send_state = "да или неизвестно" if may_have_sent else "нет"
         print(
             f"Ошибка запуска: {reason}. Ордер мог быть отправлен: {send_state}; "
             f"позиции: источник={source_text}, приёмник={receiver_text}. Действие: сохранён слот {cycle_dir} и журнал "
-            f"{cycle_dir / 'cycle.jsonl'}; не повторяйте его автоматически."
+            f"{cycle_dir / 'cycle.jsonl'}. "
+            f"Времена наблюдения: источник={source_observed_at if source_observed_at is not None else 'UNKNOWN'}, "
+            f"приёмник={receiver_observed_at if receiver_observed_at is not None else 'UNKNOWN'}. "
+            "Не повторяйте его автоматически."
         )
         return 2
     finally:

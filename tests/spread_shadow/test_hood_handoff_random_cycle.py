@@ -924,6 +924,39 @@ class FallbackMalformedOrderClient(CycleClient):
         return value
 
 
+class FallbackEmptyOrderIdClient(CycleClient):
+    def __init__(self, clock: AdvancingClock) -> None:
+        super().__init__(clock, partial_close=True)
+        self.receipt_without_order_id = False
+        self.empty_order_id_injected = False
+
+    async def submit_order(self, plan):
+        source_order = self.orders.get(
+            (self.source_account_index, self.latest_order.get(self.source_account_index, ""))
+        )
+        paired_receiver = (
+            plan.order_type == "MARKET"
+            and plan.reduce_only
+            and plan.account_index == self.receiver_account_index
+            and source_order is not None
+            and source_order.status == "open"
+        )
+        receipt = await super().submit_order(plan)
+        if plan.order_type == "MARKET" and plan.reduce_only and not paired_receiver:
+            self.receipt_without_order_id = True
+            return MutationReceipt(True, None, receipt.tx_hash)
+        return receipt
+
+    async def lookup_order(self, *args, **kwargs):
+        value = await super().lookup_order(*args, **kwargs)
+        if value is not None and self.receipt_without_order_id:
+            self.empty_order_id_injected = True
+            malformed = _order_mapping(value)
+            malformed["order_id"] = ""
+            return malformed
+        return value
+
+
 class FallbackRejectedClient(CycleClient):
     def __init__(self, clock: AdvancingClock) -> None:
         super().__init__(clock, partial_close=True)
@@ -1379,6 +1412,31 @@ async def test_malformed_fallback_order_observation_remains_unknown_and_stops_mu
         json.loads(line)
         for line in (tmp_path / "fallback-malformed" / "cycle.jsonl").read_text().splitlines()
     ]
+    observations = [row for row in rows if row["event"] == "FALLBACK_ORDER_OBSERVATION"]
+    assert observations
+    assert observations[0]["payload"]["order"] is None
+    assert "order read failed" in observations[0]["payload"]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_empty_fallback_order_id_is_decoder_unknown_and_blocks_following_mutation(tmp_path):
+    clock = AdvancingClock()
+    client = FallbackEmptyOrderIdClient(clock)
+    cycle_path = tmp_path / "fallback-empty-order-id"
+    result = await run_random_cycle(
+        cycle_config(cycle_path),
+        client,
+        clock=clock,
+        rng=FixedRng(20, 20),
+    )
+
+    assert client.receipt_without_order_id is True
+    assert client.empty_order_id_injected is True
+    assert result.outcome is Outcome.UNKNOWN
+    assert result.fallbacks[0].outcome is Outcome.UNKNOWN
+    assert len(client.fallback_plans) == 1
+    assert client.fallback_plans[0].account_index == client.source_account_index
+    rows = [json.loads(line) for line in (cycle_path / "cycle.jsonl").read_text().splitlines()]
     observations = [row for row in rows if row["event"] == "FALLBACK_ORDER_OBSERVATION"]
     assert observations
     assert observations[0]["payload"]["order"] is None
@@ -2208,6 +2266,41 @@ def test_cli_cycle_003_explanation_distinguishes_receiver_fallback_and_timed_pos
     assert "приёмник=0 (время наблюдения 124.0)" in output
 
 
+def test_cli_uses_durable_terminal_positions_when_result_fields_are_unknown(tmp_path):
+    journal_path = tmp_path / "cycle.jsonl"
+    journal_path.write_text(
+        json.dumps(
+            {
+                "event": "CYCLE_COMPLETE",
+                "payload": {
+                    "remaining_positions": {"source": "-0.00023", "receiver": "0"},
+                    "remaining_position_observed_at": {"source": 123.0, "receiver": 124.0},
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    result = SimpleNamespace(
+        outcome=Outcome.UNKNOWN,
+        selection=None,
+        opening=None,
+        closing=None,
+        fallbacks=(),
+        remaining_source_position=None,
+        remaining_receiver_position=None,
+        remaining_source_position_observed_at=None,
+        remaining_receiver_position_observed_at=None,
+        reason="terminal state was recovered from the journal",
+        journal_path=str(journal_path),
+    )
+
+    output = cli_module.format_random_cycle_result_ru(result)
+    assert "остаток: источник=-0.00023, приёмник=0" in output
+    assert "источник=-0.00023 (время наблюдения 123.0)" in output
+    assert "приёмник=0 (время наблюдения 124.0)" in output
+
+
 def test_cli_random_cycle_requires_interactive_launch_before_client_or_keys(tmp_path, monkeypatch, capsys):
     config_path = tmp_path / "random-cycle.json"
     evidence_path = tmp_path / "market-evidence.json"
@@ -2748,6 +2841,64 @@ async def test_simple_exception_reports_durable_mutation_boundary(tmp_path, monk
     assert expected_state in output
     assert "позиции: источник=UNKNOWN, приёмник=UNKNOWN" in output
     assert str(operator_dir / "cycle-001" / "cycle.jsonl") in output
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["error", "cancel"])
+async def test_simple_failure_reports_durable_positions_and_observation_times(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    failure,
+):
+    config_path, operator_dir, evidence_path = _write_simple_launcher_fixture(tmp_path)
+
+    class FakeSdkClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def aclose(self):
+            return None
+
+    async def failing_run(config, client):
+        Path(config.journal_path).write_text(
+            json.dumps(
+                {
+                    "event": "CYCLE_COMPLETE",
+                    "payload": {
+                        "remaining_positions": {"source": "-0.00023", "receiver": "0"},
+                        "remaining_position_observed_at": {"source": 123.0, "receiver": 124.0},
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        if failure == "cancel":
+            raise asyncio.CancelledError()
+        raise RuntimeError("synthetic post-launch failure")
+
+    monkeypatch.setattr("builtins.input", lambda _prompt: "")
+    monkeypatch.setattr(cli_module, "_validate_simple_sdk", lambda: None)
+    monkeypatch.setattr(cli_module, "LighterSdkClient", FakeSdkClient)
+    monkeypatch.setattr(cli_module, "run_random_cycle", failing_run)
+    assert await cli_module._run(
+        cli_module._parser().parse_args(
+            [
+                "simple",
+                "--config",
+                str(config_path),
+                "--market-evidence",
+                str(evidence_path),
+            ]
+        )
+    ) == 2
+    output = capsys.readouterr().out
+    if failure == "cancel":
+        assert "остаток: источник=-0.00023, приёмник=0" in output
+    else:
+        assert "позиции: источник=-0.00023, приёмник=0" in output
+    assert "Времена наблюдения: источник=123.0, приёмник=124.0." in output
 
 
 @pytest.mark.asyncio
