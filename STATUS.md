@@ -1,5 +1,9 @@
 # Current status
 
+## HCR-18 — IN DEVELOPMENT; owner cycle001 known external fill left unclosed
+
+Owner2026-09-20 requested bounded correction, safe latency improvement and randomization checks. Acceptedbase/main/operator/remote5ae9745 clean. Originalcycle001 logs independently inspected: fullsource.00027BTC externalfill, receiver undispatched/0, source-.00027 at recorded terminal; complete receipts/history/positions but provisional lookup-miss reason leavesUNKNOWN and disables residual handling. No agent current-account reads or financial operations. Immutable incident/timing/hash packet in hood-cycle-race-latency-20260920/chief-v1. Fresh Builder to implement/test under NEXT_TASK; prior accepted software/evidence preserved.
+
 ## HCR-17 — COMPLETE; accepted offline and installed
 
 Candidatee2ad3cf35d1d341f4836ed9c4da777e6d4dabb1a independently accepted by sole Chief01a0aafe-23fa-7c90-87a6-e807b3f6450a. One random legal BTC size capped by smaller free balance without leverage, one20..300secondhold after confirmed opening, paired reduce-only close and repeated reconciled residual market closes. Identity/decoder barrier persists across parent/child/fallback reads; old historical trades are not confused with stale snapshots; missing live minimums cannot refresh old evidence.
