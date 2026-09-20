@@ -1,12 +1,12 @@
 # Current status
 
-## HCR-19 — ACCEPTED OFFLINE; installation/publication in progress
+## HCR-19 — COMPLETE; accepted offline and installed
 
 Candidate `ebabbfaac88ca6d69aef9b15ad396414871e641a` is independently accepted. The random cycle now keeps one sampled quantity/hold, accepts a fresh one-tick price after an ordinary quote move, rechecks the unchanged quantity against fresh bounds and allows at most three safe preparation attempts before any mutation. Deterministic safety failures do not retry; mutation admission permanently disables preparation retry. A root `./start` provides one short Russian confirmation, atomically allocates a unique owner-only cycle slot only after confirmation, shows concise live Russian progress/errors and retains complete JSONL evidence. Legacy CLI remains compatible.
 
 Chief final clean isolated Python 3.11/SDK 1.1.2 suite: 4587 passed, 3 skipped, exit 0 in 117.73 seconds, with unchanged hashes and isolated imports. Independent replay of the exact observed boundary passed: price 80513.6 changed to 80514.2, quantity remained 0.00024, hold remained 287, the actual opening plan used 80514.2, and quantity/hold RNG each ran once. Prefix mismatch blocks before admission or reads. Builder final focused correction: 164 passed; Builder full suite: 4586 passed, 3 skipped. Evidence: `hood-simple-launch-20260920/chief-v1`.
 
-No live/private/Keychain/account/order operation was performed. Consumed incident `operator-v1/cycle-001` remains immutable and non-reusable. Earlier recorded source -0.00027 BTC/receiver zero and current account state remains NOT_READ. Delayed alternate candidates `4226219e` and `ce1354df` are archived and preserved, not integrated. The fixed Builder concurrency limit is removed; each new finite objective still requires a fresh Builder and parallel writers must own non-overlapping files.
+Installed operator checkout imports the exact accepted files from its own `src`. `./start --help` and `CANCEL` both exited 0; cancellation displayed the Russian summary and did not create a new cycle slot. The consumed cycle-001 journal retained SHA-256 `124104c8d37d7c3f42b632ebf1fa51de78e02b464669ee4765113035ae3cfcf4`. No live/private/Keychain/account/order operation was performed. Earlier recorded source -0.00027 BTC/receiver zero and current account state remains NOT_READ. Delayed alternate candidates `4226219e` and `ce1354df` are archived and preserved, not integrated. The fixed Builder concurrency limit is removed; each new finite objective still requires a fresh Builder and parallel writers must own non-overlapping files.
 
 ## HCR-18 — COMPLETE; accepted offline and installed
 
