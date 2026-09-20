@@ -1,5 +1,9 @@
 # Current status
 
+## HCR-21 — ACTIVE; cycle-003 reconciliation correction authorized
+
+Owner authorized the complete correction plan plus exact read-only incident inspection. Immutable cycle-003 proves source27331 external full fill `-0.00023 BTC`, receiver27337 never dispatched, and one accepted reduce-only BUY MARKET IOC fallback whose retrieved order was discarded by a generic plan-conflict check. Cancellation/fill/current position are not proven by the journal. Chief will collect bounded read-only order/account/trade evidence; a fresh Builder will correct exact mismatch retention, observed SDK semantics, known terminal classification and final Russian explanation. Receiver dispatch-after-source-fill remains forbidden; no new financial mutation or cycle.
+
 ## HCR-20 — COMPLETE; accepted offline and installed
 
 Candidate `2be10d4a49cb74199db21260d94cae864ef5ecc4` independently accepted. Root `./start` now selects project `.venv-hood/bin/python` independent of PATH. The direct simple launcher validates local configuration, owner-only operator directory, market-evidence JSON, exact `lighter-sdk==1.1.2` distribution and module import before allocating a cycle slot. Setup failures are specific Russian errors and touch no Keychain/client/account/network or slot. Successful reservation wording is unambiguous.
