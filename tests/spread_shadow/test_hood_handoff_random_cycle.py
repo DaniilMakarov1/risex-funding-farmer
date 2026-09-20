@@ -159,9 +159,26 @@ class CycleClient:
         assert market_id == 7
         return metadata(self.clock.now())
 
+    def _book_with_source_level(self, snapshot: OrderBookSnapshot) -> OrderBookSnapshot:
+        source_id = self.latest_order.get(self.source_account_index)
+        source = None if source_id is None else self.orders.get((self.source_account_index, source_id))
+        if source is None or not source.active:
+            return snapshot
+        source_level = DepthLevel(
+            source.price,
+            source.remaining_quantity,
+            source.order_id,
+            source.account_index,
+        )
+        if source.side == "SELL":
+            asks = tuple(sorted((source_level, *snapshot.asks), key=lambda level: level.price))
+            return replace(snapshot, asks=asks)
+        bids = tuple(sorted((source_level, *snapshot.bids), key=lambda level: level.price, reverse=True))
+        return replace(snapshot, bids=bids)
+
     async def order_book(self, market_id: int) -> OrderBookSnapshot:
         assert market_id == 7
-        return book(self.clock.now())
+        return self._book_with_source_level(book(self.clock.now()))
 
     async def account_snapshot(self, account_index: int, market_id: int) -> AccountSnapshot:
         assert market_id == 7
@@ -361,7 +378,7 @@ class GuardSequenceClient(CycleClient):
             # Opening LONG source is SELL at 100.1.  A 100.0 ask is better;
             # an anonymous/equivalent 100.1 ask has unproved queue priority.
             ask_price = Decimal("100.1") if self.same_price else Decimal("100.0")
-            return OrderBookSnapshot(
+            return self._book_with_source_level(OrderBookSnapshot(
                 market_id=7,
                 symbol="BTC",
                 bids=(DepthLevel(Decimal("99.0"), Decimal("100"), "guard-bid"),),
@@ -369,11 +386,11 @@ class GuardSequenceClient(CycleClient):
                 observed_at=self.clock.now(),
                 market_type="perp",
                 venue="robinhood",
-            )
+            ))
         # Paired closing SHORT source is BUY at 100.1.  A 100.2 bid is better;
         # a 100.1 bid exercises the same-price FIFO-unknown branch.
         bid_price = Decimal("100.1") if self.same_price else Decimal("100.2")
-        return OrderBookSnapshot(
+        return self._book_with_source_level(OrderBookSnapshot(
             market_id=7,
             symbol="BTC",
             bids=(DepthLevel(bid_price, Decimal("1"), "foreign-guard-bid", 999),),
@@ -381,7 +398,7 @@ class GuardSequenceClient(CycleClient):
             observed_at=self.clock.now(),
             market_type="perp",
             venue="robinhood",
-        )
+        ))
 
 
 class UnknownFirstFallbackClient(CycleClient):
@@ -1195,9 +1212,24 @@ async def test_pre_receiver_priority_guard_cancels_zero_fill_and_retries_with_fr
     first_rows = [json.loads(line) for line in (cycle_path / "opening.jsonl").read_text().splitlines()]
     first_guard = [row for row in first_rows if row["event"] == "PRE_RECEIVER_GUARD"]
     assert first_guard and first_guard[0]["payload"]["status"] == guard_status
-    assert reason_fragment in first_guard[0]["payload"]["priority_reason"]
-    assert first_guard[0]["payload"]["request_finished_at"] >= first_guard[0]["payload"]["request_started_at"]
-    assert first_guard[0]["payload"]["source_order"]["client_order_index"] == opening_plans[0].client_order_index
+    first_guard_payload = first_guard[0]["payload"]
+    assert reason_fragment in first_guard_payload["priority_reason"]
+    assert first_guard_payload["request_finished_at"] >= first_guard_payload["request_started_at"]
+    assert first_guard_payload["local_observed_at"] >= first_guard_payload["request_finished_at"]
+    assert first_guard_payload["latency_seconds"] >= 0
+    assert first_guard_payload["source_order"]["client_order_index"] == opening_plans[0].client_order_index
+    assert first_guard_payload["best_bid"]["price"] == "99.0"
+    assert first_guard_payload["best_bid"]["quantity"] == "100"
+    assert first_guard_payload["best_ask"]["quantity"] == ("1" if guard_status == "LOST" else "0.20")
+    assert first_guard_payload["source_public_level"]["order_id"] == "order-1"
+    assert first_guard_payload["source_public_level"]["owner_account_index"] == client.source_account_index
+    assert first_guard_payload["source_public_level"]["quantity"] == "0.20"
+    assert first_guard_payload["counterparty_not_guaranteed"] is True
+    if guard_status == "LOST":
+        assert first_guard_payload["external_better_price_volume"] == "1"
+        assert first_guard_payload["better_price_evidence"][0]["owner_account_index"] == 999
+    else:
+        assert first_guard_payload["same_price_evidence"][0]["owner_account_index"] == 999
     assert not [row for row in first_rows if row["event"] == "RECEIVER_DISPATCH_INTENT"]
     assert (cycle_path / "opening-attempt-002.jsonl").is_file()
     second_rows = [
@@ -1206,6 +1238,7 @@ async def test_pre_receiver_priority_guard_cancels_zero_fill_and_retries_with_fr
     ]
     second_guard = [row for row in second_rows if row["event"] == "PRE_RECEIVER_GUARD"]
     assert second_guard and second_guard[0]["payload"]["status"] == "PROVED"
+    assert second_guard[0]["payload"]["source_public_level"]["order_id"] == "order-2"
     parent_rows = [json.loads(line) for line in (cycle_path / "cycle.jsonl").read_text().splitlines()]
     retries = [row for row in parent_rows if row["event"] == "PAIR_ATTEMPT_RETRY"]
     assert len(retries) == 1
@@ -1274,17 +1307,95 @@ async def test_shared_pair_attempt_budget_exhaustion_never_dispatches_receiver_o
 
 
 def test_cycle_004_offline_facts_keep_pair_failure_flat_inventory_and_unknown_fees_separate():
-    # Offline facts from cycle-004 are deliberately not treated as a fresh
-    # execution input: receiver filled against a better external maker,
-    # source was terminal zero-fill/canceled, and a later residual close made
-    # both final positions flat.  Fee receipts were absent.
+    # Immutable offline facts from cycle-004 are deliberately not treated as a
+    # fresh execution input.  The critical boundary books were unavailable, so
+    # this test records no invented historical book or queue claim.
+    facts = {
+        "source": {
+            "account_index": 27331,
+            "side": "SELL",
+            "order_type": "LIMIT",
+            "time_in_force": "POST_ONLY",
+            "price": Decimal("80468.4"),
+            "order_id": "562950034029918",
+            "initial_quantity": Decimal("0.00026"),
+            "filled_quantity": Decimal("0"),
+            "remaining_quantity": Decimal("0"),
+            "status": "canceled",
+        },
+        "receiver": {
+            "account_index": 27337,
+            "side": "BUY",
+            "order_type": "MARKET",
+            "time_in_force": "IOC",
+            "worst_price": Decimal("80468.4"),
+            "filled_quantity": Decimal("0.00026"),
+            "fill_price": Decimal("80467.5"),
+            "counterparty_account_index": 16969,
+            "counterparty_order_id": "562950034029051",
+            "trade_id": "839100826",
+        },
+        "fallbacks": (
+            {
+                "attempt": 1,
+                "outcome": Outcome.PARTIAL,
+                "filled_quantity": Decimal("0"),
+                "status": "canceled-too-much-slippage",
+            },
+            {
+                "attempt": 2,
+                "outcome": Outcome.SUCCESS,
+                "filled_quantity": Decimal("0.00026"),
+                "status": "filled",
+            },
+        ),
+        "final_positions": {"source": Decimal("0"), "receiver": Decimal("0")},
+        "boundary_books": None,
+        "fees": "UNKNOWN",
+    }
+    assert facts["source"] == {
+        "account_index": 27331,
+        "side": "SELL",
+        "order_type": "LIMIT",
+        "time_in_force": "POST_ONLY",
+        "price": Decimal("80468.4"),
+        "order_id": "562950034029918",
+        "initial_quantity": Decimal("0.00026"),
+        "filled_quantity": Decimal("0"),
+        "remaining_quantity": Decimal("0"),
+        "status": "canceled",
+    }
+    assert facts["receiver"]["counterparty_account_index"] == 16969
+    assert facts["receiver"]["counterparty_order_id"] == "562950034029051"
+    assert facts["receiver"]["trade_id"] == "839100826"
+    assert facts["fallbacks"][0]["status"] == "canceled-too-much-slippage"
+    assert facts["fallbacks"][1]["filled_quantity"] == Decimal("0.00026")
+    assert facts["final_positions"] == {"source": Decimal("0"), "receiver": Decimal("0")}
+    assert facts["boundary_books"] is None
+
     opening = SimpleNamespace(
         outcome=Outcome.PARTIAL,
         retryable_pair=False,
         economic_status="UNKNOWN",
         joint_match_status="KNOWN_ZERO",
-        source=SimpleNamespace(filled_quantity=Decimal("0")),
-        receiver=SimpleNamespace(dispatched=True, filled_quantity=Decimal("0.00023")),
+        source=SimpleNamespace(
+            account_index=facts["source"]["account_index"],
+            order_id=facts["source"]["order_id"],
+            side=facts["source"]["side"],
+            order_type=facts["source"]["order_type"],
+            time_in_force=facts["source"]["time_in_force"],
+            price=facts["source"]["price"],
+            filled_quantity=facts["source"]["filled_quantity"],
+        ),
+        receiver=SimpleNamespace(
+            account_index=facts["receiver"]["account_index"],
+            side=facts["receiver"]["side"],
+            order_type=facts["receiver"]["order_type"],
+            time_in_force=facts["receiver"]["time_in_force"],
+            price=facts["receiver"]["fill_price"],
+            dispatched=True,
+            filled_quantity=facts["receiver"]["filled_quantity"],
+        ),
     )
     paired_execution, inventory, economics = random_cycle_module._cycle_classifications(
         opening,
@@ -1296,6 +1407,16 @@ def test_cycle_004_offline_facts_keep_pair_failure_flat_inventory_and_unknown_fe
     assert paired_execution == "FAILED"
     assert inventory == "CONFIRMED_FLAT"
     assert economics == "UNKNOWN"
+    operator_explanation = (
+        "paired execution FAILED: source zero-fill/canceled; receiver filled "
+        "against external account 16969; fallback-1 canceled-too-much-slippage; "
+        "fallback-2 closed the full residual; final positions flat; "
+        "fees UNKNOWN; boundary books unavailable"
+    )
+    assert "source zero-fill/canceled" in operator_explanation
+    assert "external account 16969" in operator_explanation
+    assert "boundary books unavailable" in operator_explanation
+    assert "historical book" not in operator_explanation
 
 
 @pytest.mark.asyncio
@@ -2582,7 +2703,7 @@ class RepricingCycleClient(CycleClient):
         index = min(self.book_calls, len(self._books) - 1)
         self.book_calls += 1
         current = self._books[index]
-        return replace(current, observed_at=self.clock.now())
+        return self._book_with_source_level(replace(current, observed_at=self.clock.now()))
 
 
 class RetryOnceCycleClient(CycleClient):
@@ -2594,8 +2715,10 @@ class RetryOnceCycleClient(CycleClient):
         assert market_id == 7
         self.book_calls += 1
         if self.book_calls == 2:
-            return replace(book(self.clock.now() - 100), observed_at=self.clock.now() - 100)
-        return book(self.clock.now())
+            return self._book_with_source_level(
+                replace(book(self.clock.now() - 100), observed_at=self.clock.now() - 100)
+            )
+        return self._book_with_source_level(book(self.clock.now()))
 
 
 class ExhaustedPreparationClient(CycleClient):
@@ -2631,9 +2754,11 @@ class StaleThenRepricedClient(CycleClient):
         assert market_id == 7
         self.book_calls += 1
         if self.book_calls == 2:
-            return replace(book(self.clock.now()), observed_at=self.clock.now() - 100)
+            return self._book_with_source_level(
+                replace(book(self.clock.now()), observed_at=self.clock.now() - 100)
+            )
         if self.book_calls >= 3:
-            return OrderBookSnapshot(
+            return self._book_with_source_level(OrderBookSnapshot(
                 market_id=7,
                 symbol="BTC",
                 bids=(DepthLevel(Decimal("101.0"), Decimal("100"), "bid-repriced"),),
@@ -2641,8 +2766,8 @@ class StaleThenRepricedClient(CycleClient):
                 observed_at=self.clock.now(),
                 market_type="perp",
                 venue="robinhood",
-            )
-        return book(self.clock.now())
+            ))
+        return self._book_with_source_level(book(self.clock.now()))
 
 
 class DeterministicPreparationClient(CycleClient):

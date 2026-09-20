@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from decimal import Decimal
+import json
 from pathlib import Path
 
 import pytest
@@ -130,6 +132,36 @@ class PairedClient:
     async def market_metadata(self, market_id: int) -> MarketMetadata:
         assert market_id == 1
         return metadata()
+
+    async def order_book(self, market_id: int) -> OrderBookSnapshot:
+        assert market_id == 1
+        source = self.source_order
+        if source is None or not source.active:
+            source_level = DepthLevel(Decimal("100.0"), Decimal("0.20"), "source-preview", self.source_account_index)
+            source_side = source.side if source is not None else "SELL"
+        else:
+            source_level = DepthLevel(
+                source.price,
+                source.remaining_quantity,
+                source.order_id,
+                source.account_index,
+            )
+            source_side = source.side
+        if source_side == "SELL":
+            asks = (source_level,)
+            bids = (DepthLevel(Decimal("99.0"), Decimal("1"), "bid-guard", 999),)
+        else:
+            bids = (source_level,)
+            asks = (DepthLevel(Decimal("101.0"), Decimal("1"), "ask-guard", 999),)
+        return OrderBookSnapshot(
+            market_id=1,
+            symbol="BTC",
+            bids=bids,
+            asks=asks,
+            observed_at=NOW,
+            market_type="perp",
+            venue="robinhood",
+        )
 
     async def account_snapshot(self, account_index: int, market_id: int) -> AccountSnapshot:
         assert market_id == 1
@@ -281,6 +313,87 @@ class PairedClient:
         return HistoryPage()
 
 
+class NoBookPairedClient(PairedClient):
+    """Model a paired adapter that cannot provide the mandatory fresh book."""
+
+    order_book = None
+
+
+class AdverseBookPairedClient(PairedClient):
+    """Keep the source visible while varying only the public guard evidence."""
+
+    def __init__(self, mode: str) -> None:
+        super().__init__()
+        self.mode = mode
+
+    def _replace_source_level(self, book: OrderBookSnapshot, level: DepthLevel) -> OrderBookSnapshot:
+        assert self.source_order is not None
+        if self.source_order.side == "SELL":
+            return replace(book, asks=(level, *book.asks[1:]))
+        return replace(book, bids=(level, *book.bids[1:]))
+
+    async def order_book(self, market_id: int) -> OrderBookSnapshot:
+        book = await super().order_book(market_id)
+        if self.mode == "stale":
+            return replace(book, observed_at=NOW - 100)
+        if self.mode == "future":
+            return replace(book, observed_at=NOW + 1)
+        assert self.source_order is not None
+        source = self.source_order
+        if self.mode == "exact_absent":
+            return self._replace_source_level(
+                book,
+                DepthLevel(source.price, source.remaining_quantity, "foreign-source", 999),
+            )
+        if self.mode == "anonymous_same_price":
+            level = DepthLevel(source.price, Decimal("0.05"), "anonymous-same-price", None)
+            if source.side == "SELL":
+                return replace(book, asks=(*book.asks, level))
+            return replace(book, bids=(*book.bids, level))
+        if self.mode == "external_same_price":
+            level = DepthLevel(source.price, Decimal("0.05"), "external-same-price", 999)
+            if source.side == "SELL":
+                return replace(book, asks=(*book.asks, level))
+            return replace(book, bids=(*book.bids, level))
+        if self.mode == "wrong_owner":
+            return self._replace_source_level(
+                book,
+                DepthLevel(source.price, source.remaining_quantity, source.order_id, 999),
+            )
+        if self.mode == "wrong_order_id":
+            return self._replace_source_level(
+                book,
+                DepthLevel(source.price, source.remaining_quantity, "wrong-source-id", source.account_index),
+            )
+        if self.mode == "wrong_quantity":
+            return self._replace_source_level(
+                book,
+                DepthLevel(source.price, source.remaining_quantity - Decimal("0.01"), source.order_id, source.account_index),
+            )
+        raise AssertionError(f"unknown adverse book mode: {self.mode}")
+
+
+class WrongExactLookupPairedClient(PairedClient):
+    """Return a conflicting identity only on the exact pre-receiver lookup."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.source_lookup_calls = 0
+
+    async def lookup_order(self, account_index: int, market_id: int, *, order_id=None, client_order_index=None):
+        value = await super().lookup_order(
+            account_index,
+            market_id,
+            order_id=order_id,
+            client_order_index=client_order_index,
+        )
+        if account_index == self.source_account_index and order_id is not None and value is not None:
+            self.source_lookup_calls += 1
+            if self.source_lookup_calls == 2:
+                return replace(value, order_id="conflicting-exact-order-id")
+        return value
+
+
 def _account_snapshot(index: int, position: Decimal, active_orders=(), *, margin=Decimal("100")) -> AccountSnapshot:
     base = account(index, position, margin=margin)
     return AccountSnapshot(
@@ -328,6 +441,8 @@ class SeriesPairedClient(PairedClient):
         return metadata()
 
     async def order_book(self, market_id: int) -> OrderBookSnapshot:
+        if self.source_order is not None and self.source_order.active:
+            return await super().order_book(market_id)
         return self.books[min(self.child_number, len(self.books) - 1)]
 
 
@@ -375,6 +490,94 @@ async def test_paired_opening_plan_is_explicit_and_builds_opposite_positions(tmp
     text = (tmp_path / "paired.jsonl").read_text()
     assert '"operation_mode":"PAIRED_OPENING"' in text
     assert result.as_dict()["operation_mode"] == "PAIRED_OPENING"
+
+
+def _guard_payload(path: Path) -> dict:
+    rows = [
+        json.loads(line)
+        for line in path.read_text().splitlines()
+    ]
+    guards = [row["payload"] for row in rows if row["event"] == "PRE_RECEIVER_GUARD"]
+    assert len(guards) == 1
+    return guards[0]
+
+
+@pytest.mark.asyncio
+async def test_paired_guard_requires_a_fresh_reader_and_never_dispatches_receiver(tmp_path):
+    client = NoBookPairedClient()
+    result = await run_handoff(config(tmp_path / "no-book.jsonl"), client, clock=Clock())
+
+    assert result.outcome is Outcome.UNKNOWN
+    assert [item.account_index for item in client.submissions] == [11]
+    assert client.cancellations == ["source-0"]
+    guard = _guard_payload(tmp_path / "no-book.jsonl")
+    assert guard["status"] == "UNKNOWN"
+    assert guard["book_observed_at"] is None
+    assert guard["source_public_level"] is None
+    assert any("unresolved" in reason for reason in result.unknown_reasons)
+    assert not [item for item in client.submissions if item.account_index == client.receiver_account_index]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "exact_absent",
+        "stale",
+        "future",
+        "anonymous_same_price",
+        "external_same_price",
+        "wrong_owner",
+        "wrong_order_id",
+        "wrong_quantity",
+    ],
+)
+async def test_paired_guard_rejects_incomplete_or_ambiguous_source_public_evidence(tmp_path, mode):
+    client = AdverseBookPairedClient(mode)
+    path = tmp_path / f"{mode}.jsonl"
+    result = await run_handoff(config(path), client, clock=Clock())
+
+    if mode in {"stale", "future"}:
+        assert result.outcome is Outcome.UNKNOWN
+        assert not result.retryable_pair
+    else:
+        assert result.outcome is Outcome.PARTIAL
+        assert result.retryable_pair
+    assert [item.account_index for item in client.submissions] == [11]
+    assert client.cancellations == ["source-0"]
+    assert not [item for item in client.submissions if item.account_index == client.receiver_account_index]
+    guard = _guard_payload(path)
+    assert guard["status"] == "UNKNOWN"
+    assert guard["request_finished_at"] >= guard["request_started_at"]
+    if mode in {"exact_absent", "wrong_owner", "wrong_order_id", "wrong_quantity"}:
+        assert guard["best_bid"] is not None
+        assert guard["best_ask"] is not None
+        assert guard["source_public_level"] is None
+    if mode == "anonymous_same_price":
+        assert guard["source_public_level"]["order_id"] == "source-0"
+        assert guard["same_price_evidence"][0]["owner_account_index"] is None
+    if mode == "external_same_price":
+        assert guard["source_public_level"]["order_id"] == "source-0"
+        assert guard["same_price_evidence"][0]["owner_account_index"] == 999
+    if mode in {"stale", "future"}:
+        assert guard["source_public_level"] is None
+
+
+@pytest.mark.asyncio
+async def test_paired_guard_rejects_conflicting_exact_lookup_identity_without_cancellation(tmp_path):
+    client = WrongExactLookupPairedClient()
+    path = tmp_path / "wrong-exact-lookup.jsonl"
+    result = await run_handoff(config(path), client, clock=Clock())
+
+    assert result.outcome is Outcome.UNKNOWN
+    assert client.source_lookup_calls == 2
+    assert client.cancellations == []
+    assert [item.account_index for item in client.submissions] == [11]
+    assert not [item for item in client.submissions if item.account_index == client.receiver_account_index]
+    assert any("exact order identity" in reason for reason in result.unknown_reasons)
+    guard = _guard_payload(path)
+    assert guard["status"] == "UNKNOWN"
+    assert guard["source_public_level"]["order_id"] == "source-0"
 
 
 @pytest.mark.asyncio

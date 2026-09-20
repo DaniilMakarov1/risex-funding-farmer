@@ -209,6 +209,27 @@ def _book_level(value: Any, label: str) -> dict[str, Any]:
     }
 
 
+def _book_optional_metadata(value: Any, name: str) -> str | int | float | None:
+    """Retain only bounded venue metadata that was actually supplied."""
+
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ContractError(f"{name} is malformed")
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or len(text) > 128:
+            raise ContractError(f"{name} is malformed")
+        return text
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ContractError(f"{name} is malformed")
+        return value
+    raise ContractError(f"{name} is malformed")
+
+
 def _coerce_public_book(value: Any, config: HandoffConfig, now: float) -> dict[str, Any]:
     """Decode one fresh book without trusting SDK object identity implicitly."""
 
@@ -220,6 +241,8 @@ def _coerce_public_book(value: Any, config: HandoffConfig, now: float) -> dict[s
         observed_at = value.get("observed_at")
         bids = value.get("bids")
         asks = value.get("asks")
+        venue_timestamp = value.get("venue_timestamp", value.get("exchange_timestamp"))
+        version = value.get("version", value.get("book_version", value.get("sequence", value.get("seq"))))
     else:
         market_id = getattr(value, "market_id", None)
         symbol = getattr(value, "symbol", None)
@@ -228,6 +251,16 @@ def _coerce_public_book(value: Any, config: HandoffConfig, now: float) -> dict[s
         observed_at = getattr(value, "observed_at", None)
         bids = getattr(value, "bids", None)
         asks = getattr(value, "asks", None)
+        venue_timestamp = getattr(value, "venue_timestamp", None)
+        if venue_timestamp is None:
+            venue_timestamp = getattr(value, "exchange_timestamp", None)
+        version = getattr(value, "version", None)
+        if version is None:
+            version = getattr(value, "book_version", None)
+        if version is None:
+            version = getattr(value, "sequence", None)
+        if version is None:
+            version = getattr(value, "seq", None)
     if isinstance(market_id, bool) or not isinstance(market_id, int) or market_id != config.market_id:
         raise PreflightBlocked("pre-receiver public book market identity conflicts with plan")
     if not isinstance(symbol, str) or symbol.strip().upper() != config.market_symbol.upper():
@@ -250,12 +283,8 @@ def _coerce_public_book(value: Any, config: HandoffConfig, now: float) -> dict[s
         raise PreflightBlocked("pre-receiver public book is stale")
     if not isinstance(bids, (tuple, list)) or not isinstance(asks, (tuple, list)):
         raise PreflightBlocked("pre-receiver public book lacks bids/asks arrays")
-    # A valid public snapshot may have an empty opposite side (for example,
-    # an opening fixture with asks but no bids).  The guard only needs the
-    # source-side levels; reject a completely empty snapshot, which cannot
-    # provide any priority evidence at all.
-    if not bids and not asks:
-        raise PreflightBlocked("pre-receiver public book has no price levels")
+    if not bids or not asks:
+        raise PreflightBlocked("pre-receiver public book is not two-sided")
     parsed_bids = tuple(_book_level(item, f"bid[{index}]") for index, item in enumerate(bids))
     parsed_asks = tuple(_book_level(item, f"ask[{index}]") for index, item in enumerate(asks))
     for levels, descending, label in ((parsed_bids, True, "bids"), (parsed_asks, False, "asks")):
@@ -267,7 +296,7 @@ def _coerce_public_book(value: Any, config: HandoffConfig, now: float) -> dict[s
             ):
                 raise PreflightBlocked(f"pre-receiver public book {label} are not in price order")
             previous = level["price"]
-    if parsed_bids and parsed_asks and parsed_bids[0]["price"] >= parsed_asks[0]["price"]:
+    if parsed_bids[0]["price"] >= parsed_asks[0]["price"]:
         raise PreflightBlocked("pre-receiver public book is crossed")
     identities = [
         level["order_id"]
@@ -276,7 +305,7 @@ def _coerce_public_book(value: Any, config: HandoffConfig, now: float) -> dict[s
     ]
     if len(identities) != len(set(identities)):
         raise PreflightBlocked("pre-receiver public book contains duplicate order identity")
-    return {
+    payload = {
         "market_id": market_id,
         "symbol": symbol.strip().upper(),
         "market_type": market_type.strip().lower(),
@@ -285,6 +314,11 @@ def _coerce_public_book(value: Any, config: HandoffConfig, now: float) -> dict[s
         "bids": parsed_bids,
         "asks": parsed_asks,
     }
+    if venue_timestamp is not None:
+        payload["venue_timestamp"] = _book_optional_metadata(venue_timestamp, "venue timestamp")
+    if version is not None:
+        payload["version"] = _book_optional_metadata(version, "public book version")
+    return payload
 
 
 class HandoffEngine:
@@ -315,10 +349,17 @@ class HandoffEngine:
     async def _parallel_pre_receiver_checks(
         self,
         config: HandoffConfig,
-    ) -> tuple[AccountSnapshot, AccountSnapshot, dict[str, Any] | None, float, float]:
+    ) -> tuple[AccountSnapshot, AccountSnapshot, dict[str, Any], float, float]:
         """Run independent account and public-book reads in one bounded window."""
 
         started = time.perf_counter()
+        book_reader = getattr(self.client, "order_book", None)
+        if not callable(book_reader):
+            book_reader = getattr(self.client, "order_book_snapshot", None)
+        if not callable(book_reader):
+            book_reader = getattr(self.client, "public_order_book", None)
+        if not callable(book_reader):
+            raise ContractError("paired operation requires a public order-book reader")
         account_task = asyncio.create_task(
             self._parallel_account_rechecks(
                 _account_from_client(self.client, "source"),
@@ -326,31 +367,11 @@ class HandoffEngine:
                 config.market_id,
             )
         )
-        # Legacy direct HandoffClient callers can still target the old
-        # non-Robinhood test environment, where the SDK exposes a method name
-        # but deliberately cannot read a Robinhood public book.  The paired
-        # guard is a Robinhood Chain admission check; production cycle/series
-        # configs are always bound to that environment.
-        book_reader = None
-        if (
-            config.environment == "robinhood"
-            and config.operation_mode in {OperationMode.PAIRED_OPENING, OperationMode.PAIRED_CLOSING}
-        ):
-            book_reader = getattr(self.client, "order_book", None)
-            if not callable(book_reader):
-                book_reader = getattr(self.client, "order_book_snapshot", None)
-            if not callable(book_reader):
-                book_reader = getattr(self.client, "public_order_book", None)
-        book_task: asyncio.Task[Any] | None = (
-            None if not callable(book_reader) else asyncio.create_task(self._read_public_book(config))
-        )
+        book_task = asyncio.create_task(self._read_public_book(config))
         try:
-            if book_task is None:
-                source, receiver = await account_task
-                return source, receiver, None, 0.0, max(0.0, time.perf_counter() - started)
             (source, receiver), (book, book_duration) = await asyncio.gather(account_task, book_task)
         except BaseException:
-            tasks = (account_task,) if book_task is None else (account_task, book_task)
+            tasks = (account_task, book_task)
             for task in tasks:
                 if not task.done():
                     task.cancel()
@@ -497,6 +518,11 @@ class HandoffEngine:
         receiver_dispatch_attempted = False
         priority_guard: dict[str, Any] | None = None
         latency: dict[str, float] = {}
+        paired_mode = plan.operation_mode in {OperationMode.PAIRED_OPENING, OperationMode.PAIRED_CLOSING}
+        public_book: dict[str, Any] | None = None
+        source_order_id: str | None = None
+        guard_event_recorded = False
+        guard_request_started_at = self.clock.now() if paired_mode else None
         receiver_mutation_observations: tuple[Any, ...] = (source, receiver, plan.metadata_observed_at)
         receiver_mutation_observation_now: float | None = None
         try:
@@ -550,6 +576,8 @@ class HandoffEngine:
                 require_terminal=False,
             )
             latency["source_visibility_seconds"] = max(0.0, time.perf_counter() - source_visibility_started)
+            if source_order is not None:
+                source_order_id = source_order.order_id
             if source_order is None:
                 unknown_reasons.append("source order identity or status is unresolved")
             elif not self._order_matches(source_order, plan.source):
@@ -561,10 +589,24 @@ class HandoffEngine:
                     {"order_id": source_order.order_id, "filled_quantity": str(source_order.filled_quantity)},
                     run_id=run_id,
                 )
-                await self._cancel_if_safe(plan.source, source_order, journal, run_id, unknown_reasons)
+                await self._cancel_if_safe(
+                    plan.source,
+                    source_order,
+                    journal,
+                    run_id,
+                    unknown_reasons,
+                    expected_order_id=source_order_id,
+                )
             elif not source_order.active or source_order.remaining_quantity != plan.quantity:
                 unknown_reasons.append("source order did not prove exact resting quantity")
-                await self._cancel_if_safe(plan.source, source_order, journal, run_id, unknown_reasons)
+                await self._cancel_if_safe(
+                    plan.source,
+                    source_order,
+                    journal,
+                    run_id,
+                    unknown_reasons,
+                    expected_order_id=source_order_id,
+                )
 
         # A missing/rejected/partially-filled source can never authorize B.
         # Account and public-book reads are independent, so they share one
@@ -576,15 +618,25 @@ class HandoffEngine:
             and self._source_is_resting(source_order, plan.source)
         ):
             pre_receiver_started = time.perf_counter()
-            pre_receiver_request_started_at = self.clock.now()
+            if paired_mode:
+                guard_request_started_at = self.clock.now()
             try:
-                (
-                    source_recheck,
-                    receiver_recheck,
-                    public_book,
-                    book_duration,
-                    parallel_duration,
-                ) = await self._parallel_pre_receiver_checks(config)
+                if paired_mode:
+                    (
+                        source_recheck,
+                        receiver_recheck,
+                        public_book,
+                        book_duration,
+                        parallel_duration,
+                    ) = await self._parallel_pre_receiver_checks(config)
+                else:
+                    source_recheck, receiver_recheck = await self._parallel_account_rechecks(
+                        _account_from_client(self.client, "source"),
+                        _account_from_client(self.client, "receiver"),
+                        config.market_id,
+                    )
+                    book_duration = 0.0
+                    parallel_duration = 0.0
                 latency["public_book_read_seconds"] = book_duration
                 latency["concurrent_pre_receiver_checks_seconds"] = parallel_duration
                 source_order_id = source_order.order_id
@@ -672,43 +724,22 @@ class HandoffEngine:
                     )
                 ):
                     unknown_reasons.append("receiver margin recheck is insufficient or missing")
-                if source_order is not None and not self._source_is_resting(source_order, plan.source):
+                if source_order is None:
+                    unknown_reasons.append("source exact order is missing before receiver dispatch")
+                elif not self._source_exact_resting(source_order, plan.source, source_order_id):
                     if source_order.filled_quantity > 0:
                         unknown_reasons.append("source fill or quantity change before receiver dispatch")
                     elif not source_order.active or source_order.remaining_quantity != plan.quantity:
                         unknown_reasons.append("source order did not prove exact resting quantity")
-                    elif not self._source_exact_resting(source_order, plan.source, source_order_id):
+                    else:
                         unknown_reasons.append("source exact order identity/parameters/remaining mismatch before receiver dispatch")
                 if (
-                    plan.operation_mode in {OperationMode.PAIRED_OPENING, OperationMode.PAIRED_CLOSING}
+                    paired_mode
                     and not unknown_reasons
                     and source_order is not None
                     and public_book is not None
                 ):
                     priority_guard = self._priority_guard(public_book, plan, source_order_id)
-                    priority_guard["source_order"] = {
-                        "order_id": source_order.order_id,
-                        "owner_account_index": source_order.account_index,
-                        "market_id": source_order.market_id,
-                        "client_order_index": source_order.client_order_index,
-                        "side": source_order.side,
-                        "order_type": source_order.order_type,
-                        "time_in_force": source_order.time_in_force,
-                        "price": None if source_order.price is None else str(source_order.price),
-                        "remaining_quantity": str(source_order.remaining_quantity),
-                        "status": source_order.status,
-                        "observed_at": source_order.observed_at,
-                    }
-                    journal.append(
-                        "PRE_RECEIVER_GUARD",
-                        {
-                            **priority_guard,
-                            "request_started_at": pre_receiver_request_started_at,
-                            "request_finished_at": self.clock.now(),
-                            "latency_seconds": parallel_duration,
-                        },
-                        run_id=run_id,
-                    )
                     if priority_guard["status"] != "PROVED":
                         unknown_reasons.append(
                             f"PAIR_GUARD_{priority_guard['status']}: {priority_guard['priority_reason']}"
@@ -731,6 +762,83 @@ class HandoffEngine:
                 latency["pre_receiver_checks_seconds"] = max(
                     0.0, time.perf_counter() - pre_receiver_started
                 )
+                if paired_mode and not guard_event_recorded:
+                    if priority_guard is None:
+                        if public_book is not None and source_order_id is not None:
+                            try:
+                                priority_guard = self._priority_guard(
+                                    public_book,
+                                    plan,
+                                    source_order_id,
+                                )
+                            except Exception as exc:
+                                priority_guard = self._priority_guard_unavailable(
+                                    plan,
+                                    source_order_id,
+                                    f"public priority evidence is malformed: {sanitize_exception(exc)}",
+                                    public_book,
+                                )
+                        else:
+                            priority_guard = self._priority_guard_unavailable(
+                                plan,
+                                source_order_id,
+                                "fresh public-book priority evidence is unavailable",
+                                public_book,
+                            )
+                    if unknown_reasons and priority_guard["status"] == "PROVED":
+                        priority_guard["status"] = "UNKNOWN"
+                        priority_guard["priority_status"] = "UNKNOWN"
+                        priority_guard["priority_reason"] = (
+                            "paired admission checks failed: " + "; ".join(unknown_reasons[:8])
+                        )
+                    if source_order is not None:
+                        priority_guard["source_order"] = {
+                            "order_id": source_order.order_id,
+                            "owner_account_index": source_order.account_index,
+                            "market_id": source_order.market_id,
+                            "client_order_index": source_order.client_order_index,
+                            "side": source_order.side,
+                            "order_type": source_order.order_type,
+                            "time_in_force": source_order.time_in_force,
+                            "price": None if source_order.price is None else str(source_order.price),
+                            "remaining_quantity": str(source_order.remaining_quantity),
+                            "status": source_order.status,
+                            "observed_at": source_order.observed_at,
+                        }
+                    priority_guard["admission_reasons"] = list(unknown_reasons[:8])
+                    journal.append(
+                        "PRE_RECEIVER_GUARD",
+                        {
+                            **priority_guard,
+                            "request_started_at": guard_request_started_at,
+                            "request_finished_at": self.clock.now(),
+                            "local_observed_at": self.clock.now(),
+                            "latency_seconds": latency.get("concurrent_pre_receiver_checks_seconds", 0.0),
+                        },
+                        run_id=run_id,
+                    )
+                    guard_event_recorded = True
+
+        if paired_mode and not guard_event_recorded:
+            priority_guard = self._priority_guard_unavailable(
+                plan,
+                source_order_id,
+                "paired pre-receiver admission did not obtain a complete guard window",
+                public_book,
+            )
+            priority_guard["admission_reasons"] = list(unknown_reasons[:8])
+            journal.append(
+                "PRE_RECEIVER_GUARD",
+                {
+                    **priority_guard,
+                    "request_started_at": guard_request_started_at,
+                    "request_finished_at": self.clock.now(),
+                    "local_observed_at": self.clock.now(),
+                    "latency_seconds": latency.get("concurrent_pre_receiver_checks_seconds", 0.0),
+                },
+                run_id=run_id,
+            )
+            guard_event_recorded = True
 
         if unknown_reasons:
             # A dispatch can be ambiguous before the first order observation.
@@ -747,7 +855,18 @@ class HandoffEngine:
                 except Exception as exc:
                     unknown_reasons.append(f"source cancellation lookup unresolved: {sanitize_exception(exc)}")
             if source_order is not None:
-                await self._cancel_if_safe(plan.source, source_order, journal, run_id, unknown_reasons)
+                await self._cancel_if_safe(
+                    plan.source,
+                    source_order,
+                    journal,
+                    run_id,
+                    unknown_reasons,
+                    expected_order_id=(
+                        source_order_id
+                        if source_order_id is not None
+                        else (source_receipt.order_id if source_receipt is not None else None)
+                    ),
+                )
             reconciliation_started = time.perf_counter()
             source_result, receiver_result = await self._reconcile(
                 config,
@@ -857,7 +976,14 @@ class HandoffEngine:
                 current_source = None
                 unknown_reasons.append(f"source cancellation lookup unresolved: {sanitize_exception(exc)}")
             if current_source is not None:
-                await self._cancel_if_safe(plan.source, current_source, journal, run_id, unknown_reasons)
+                await self._cancel_if_safe(
+                    plan.source,
+                    current_source,
+                    journal,
+                    run_id,
+                    unknown_reasons,
+                    expected_order_id=source_order.order_id,
+                )
             elif not any("source cancellation lookup unresolved" in item for item in unknown_reasons):
                 unknown_reasons.append("source order disappeared before cancellation reconciliation")
 
@@ -1187,6 +1313,52 @@ class HandoffEngine:
         )
 
     @staticmethod
+    def _priority_guard_unavailable(
+        plan: HandoffPlan,
+        source_order_id: str | None,
+        reason: str,
+        public_book: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Build a bounded UNKNOWN guard record when admission evidence is incomplete."""
+
+        payload: dict[str, Any] = {
+            "status": "UNKNOWN",
+            "priority_status": "UNKNOWN",
+            "priority_reason": reason,
+            "source_side": plan.source.side,
+            "source_price": format(plan.source.price, "f"),
+            "source_order_id": None if source_order_id is None else str(source_order_id),
+            "book_observed_at": None if public_book is None else public_book.get("observed_at"),
+            "external_better_price_volume": "0",
+            "better_price_evidence": [],
+            "same_price_evidence": [],
+            "source_public_level": None,
+            "best_bid": None,
+            "best_ask": None,
+            "counterparty_not_guaranteed": True,
+        }
+        if public_book is not None:
+            bids = public_book.get("bids", ())
+            asks = public_book.get("asks", ())
+
+            def level_payload(level: Mapping[str, Any]) -> dict[str, Any]:
+                return {
+                    "price": format(level["price"], "f"),
+                    "quantity": format(level["quantity"], "f"),
+                    "order_id": level["order_id"],
+                    "owner_account_index": level["owner_account_index"],
+                }
+
+            if bids:
+                payload["best_bid"] = level_payload(bids[0])
+            if asks:
+                payload["best_ask"] = level_payload(asks[0])
+            for key in ("venue_timestamp", "version"):
+                if key in public_book:
+                    payload[key] = public_book[key]
+        return payload
+
+    @staticmethod
     def _priority_guard(
         public_book: Mapping[str, Any],
         plan: HandoffPlan,
@@ -1199,50 +1371,57 @@ class HandoffEngine:
         same_price: list[dict[str, Any]] = []
         better_price: list[dict[str, Any]] = []
         better_quantity = Decimal(0)
-        for level in levels:
-            price = level["price"]
-            payload = {
-                "price": format(price, "f"),
+        source_public_level: dict[str, Any] | None = None
+
+        def level_payload(level: Mapping[str, Any]) -> dict[str, Any]:
+            return {
+                "price": format(level["price"], "f"),
                 "quantity": format(level["quantity"], "f"),
                 "order_id": level["order_id"],
                 "owner_account_index": level["owner_account_index"],
             }
+
+        for level in levels:
+            price = level["price"]
+            payload = level_payload(level)
             exact_source_level = (
                 level["order_id"] is not None
                 and level["order_id"] == str(source_order_id)
-                and (
-                    level["owner_account_index"] is None
-                    or level["owner_account_index"] == plan.source.account_index
-                )
+                and level["owner_account_index"] == plan.source.account_index
+                and price == source_price
+                and level["quantity"] == plan.quantity
             )
+            if exact_source_level:
+                source_public_level = payload
+                continue
             is_better = price < source_price if plan.source.side == "SELL" else price > source_price
             if is_better:
-                if not exact_source_level:
-                    better_quantity += level["quantity"]
-                    if len(better_price) < 8:
-                        better_price.append(payload)
-            # Same-price queue evidence must identify an external order, not
-            # merely an anonymous/aggregated depth level.  Without an owner
-            # identity the level may already include this source order, so it
-            # cannot prove an external FIFO predecessor.  Better-price
-            # volume remains adverse even when its owner is not disclosed.
-            elif (
-                price == source_price
-                and not exact_source_level
-                and level["owner_account_index"] is not None
-            ):
+                better_quantity += level["quantity"]
+                if len(better_price) < 8:
+                    better_price.append(payload)
+            elif price == source_price:
                 if len(same_price) < 8:
                     same_price.append(payload)
+
+        reasons: list[str] = []
+        if source_public_level is None:
+            reasons.append(
+                "exact source public level is absent or does not prove owner, order id, price and remaining quantity"
+            )
+        if better_quantity > 0:
+            reasons.append("fresh public book shows better-priced volume")
+        if same_price:
+            reasons.append("fresh public book shows same-price volume; queue/FIFO priority is unproved")
         if better_quantity > 0:
             status = "LOST"
-            reason = "fresh public book shows better-priced volume; receiver admission is forbidden"
-        elif same_price:
+        elif reasons:
             status = "UNKNOWN"
-            reason = "fresh public book shows same-price volume but queue/FIFO priority is unproved"
         else:
             status = "PROVED"
-            reason = "fresh public book shows no external better-price or same-price volume"
-        return {
+        reason = "; ".join(reasons) if reasons else "exact source level is present and no better/same-price external volume is observed"
+        source_levels = public_book["bids"]
+        ask_levels = public_book["asks"]
+        payload = {
             "status": status,
             "priority_status": status,
             "priority_reason": reason,
@@ -1253,9 +1432,16 @@ class HandoffEngine:
             "external_better_price_volume": format(better_quantity, "f"),
             "better_price_evidence": better_price,
             "same_price_evidence": same_price,
+            "source_public_level": source_public_level,
+            "best_bid": None if not source_levels else level_payload(source_levels[0]),
+            "best_ask": None if not ask_levels else level_payload(ask_levels[0]),
             # Public price/level observations do not prove who will fill an IOC.
             "counterparty_not_guaranteed": True,
         }
+        for key in ("venue_timestamp", "version"):
+            if key in public_book:
+                payload[key] = public_book[key]
+        return payload
 
     @staticmethod
     def _retryable_pair_after_guard(
@@ -1296,6 +1482,8 @@ class HandoffEngine:
         journal: DurableJournal,
         run_id: str,
         unknown_reasons: list[str],
+        *,
+        expected_order_id: str | None = None,
     ) -> None:
         operation_mode = (
             OperationMode.CLOSE_REOPEN
@@ -1309,6 +1497,11 @@ class HandoffEngine:
             or not order.active
             or order.remaining_quantity <= 0
         ):
+            return
+        if expected_order_id is not None and order.order_id != str(expected_order_id):
+            reason = "source cancellation lookup returned a different order identity"
+            if reason not in unknown_reasons:
+                unknown_reasons.append(reason)
             return
         for event in journal.events:
             if event.run_id != run_id or event.event != "CANCEL_DISPATCH_INTENT":
@@ -1327,9 +1520,21 @@ class HandoffEngine:
                 current is None
                 or not self._order_matches(current, plan)
                 or current.order_id != order.order_id
+                or (
+                    expected_order_id is not None
+                    and current.order_id != str(expected_order_id)
+                )
                 or not current.active
                 or not self._time_fresh(current.observed_at, self.clock.now(), self._configured_freshness)
             ):
+                if (
+                    current is not None
+                    and expected_order_id is not None
+                    and current.order_id != str(expected_order_id)
+                ):
+                    reason = "source cancellation lookup returned a different order identity"
+                    if reason not in unknown_reasons:
+                        unknown_reasons.append(reason)
                 return
             current_now = self.clock.now()
             mutation_deadline = self._evidence_deadline(
@@ -1766,6 +1971,7 @@ class HandoffEngine:
                 {
                     "source order disappeared during pre-receiver recheck",
                     "source fill or quantity change before receiver dispatch",
+                    "source exact order is missing before receiver dispatch",
                 }
             )
         unresolved = [
@@ -1815,10 +2021,14 @@ class HandoffEngine:
         provisional_reasons = {
             "source order disappeared during pre-receiver recheck",
             "source fill or quantity change before receiver dispatch",
+            "source exact order is missing before receiver dispatch",
         }
         if not any(reason in provisional_reasons for reason in unknown_reasons):
             return False
-        if any(reason not in provisional_reasons for reason in unknown_reasons):
+        if any(
+            reason not in provisional_reasons and not str(reason).startswith("PAIR_GUARD_")
+            for reason in unknown_reasons
+        ):
             return False
         if source.unknown_reasons or receiver.unknown_reasons:
             return False

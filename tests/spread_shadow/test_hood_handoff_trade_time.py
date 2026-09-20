@@ -241,10 +241,45 @@ def _receiver_only_adapter(tmp_path, *, timestamp: object):
         state["receiver_position"] = Decimal("0.00020")
         return MutationReceipt(True, RECEIVER_ORDER_ID, "synthetic-receiver-tx")
 
+    async def order_book(market_id):
+        source_order = state["source_order"]
+        if source_order is None:
+            source_id = "source-preview"
+            source_price = Decimal("75907.0")
+            source_quantity = Decimal("0.00020")
+        else:
+            source_id = source_order.order_id
+            source_price = source_order.price
+            source_quantity = source_order.remaining_quantity
+        return {
+            "market_id": 7,
+            "symbol": "HOOD",
+            "market_type": "perp",
+            "venue": "robinhood",
+            "observed_at": NOW,
+            "bids": [
+                {
+                    "price": "75906.9",
+                    "quantity": "1",
+                    "order_id": "public-bid",
+                    "owner_account_index": 999,
+                }
+            ],
+            "asks": [
+                {
+                    "price": str(source_price),
+                    "quantity": str(source_quantity),
+                    "order_id": source_id,
+                    "owner_account_index": 11,
+                }
+            ],
+        }
+
     client.market_metadata = market_metadata
     client.account_snapshot = account_snapshot
     client.lookup_order = lookup_order
     client.submit_order = submit_order
+    client.order_book = order_book
     return client
 
 
