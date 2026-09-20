@@ -90,7 +90,15 @@ def _atomic_launch_metadata(path: Path, payload: Mapping[str, Any]) -> None:
         raise PreflightBlocked("new cycle slot metadata could not be claimed safely") from exc
     try:
         encoded = json.dumps(dict(payload), sort_keys=True, separators=(",", ":")).encode("utf-8")
-        os.write(fd, encoded)
+        offset = 0
+        while offset < len(encoded):
+            try:
+                written = os.write(fd, encoded[offset:])
+            except InterruptedError:
+                continue
+            if written <= 0:
+                raise OSError("metadata write made no progress")
+            offset += written
         os.fsync(fd)
     except OSError as exc:
         raise PreflightBlocked("new cycle slot metadata could not be persisted") from exc
@@ -98,7 +106,11 @@ def _atomic_launch_metadata(path: Path, payload: Mapping[str, Any]) -> None:
         os.close(fd)
 
 
-def _validate_launch_metadata(path: Path) -> dict[str, Any]:
+def _validate_launch_metadata(
+    path: Path,
+    *,
+    expected_client_order_prefix: str | None = None,
+) -> dict[str, Any]:
     """Validate the immutable reservation before its one-time admission."""
 
     metadata_path = path / LAUNCH_METADATA_NAME
@@ -123,6 +135,8 @@ def _validate_launch_metadata(path: Path) -> dict[str, Any]:
         raise PreflightBlocked("cycle reservation is bound to a different directory")
     if not isinstance(raw_prefix, str) or not raw_prefix.strip():
         raise PreflightBlocked("cycle reservation has no client-order prefix")
+    if expected_client_order_prefix is not None and raw_prefix != expected_client_order_prefix:
+        raise PreflightBlocked("cycle reservation client-order prefix does not match cycle configuration")
     return dict(value)
 
 
@@ -970,7 +984,6 @@ class RandomCycleEngine:
         self._stage = "PREFLIGHT"
         self._identity_barrier: str | None = None
         self._selection: RandomCycleSelection | None = None
-        self._cycle_admitted = False
 
     def _mark_identity_failure(self, reason: str) -> None:
         """Keep the first identity mismatch as a cycle-wide dependency barrier."""
@@ -982,7 +995,6 @@ class RandomCycleEngine:
         self._stage = "PREFLIGHT"
         self._identity_barrier = None
         self._selection = None
-        self._cycle_admitted = False
         if not config.operator_execution_opt_in or not config.operator_plan_reviewed:
             return RandomCycleResult(
                 outcome=Outcome.PREVIEW,
@@ -993,7 +1005,10 @@ class RandomCycleEngine:
             )
         journal: DurableJournal | None = None
         try:
-            self._prepare_cycle_directory(config.cycle_dir)
+            self._prepare_cycle_directory(
+                config.cycle_dir,
+                expected_client_order_prefix=config.client_order_prefix,
+            )
             journal = DurableJournal(config.journal_path, clock=self.clock.now)
             journal.acquire_attempt()
             if journal.events:
@@ -1038,7 +1053,12 @@ class RandomCycleEngine:
             if journal is not None:
                 journal.release_attempt()
 
-    def _prepare_cycle_directory(self, path: Path) -> None:
+    def _prepare_cycle_directory(
+        self,
+        path: Path,
+        *,
+        expected_client_order_prefix: str,
+    ) -> None:
         if path.is_symlink():
             raise PreflightBlocked("cycle directory must not be a symlink")
         if not path.exists():
@@ -1054,7 +1074,10 @@ class RandomCycleEngine:
             os.chmod(path, 0o700)
             return
         if children == {LAUNCH_METADATA_NAME}:
-            reservation = _validate_launch_metadata(path)
+            reservation = _validate_launch_metadata(
+                path,
+                expected_client_order_prefix=expected_client_order_prefix,
+            )
             _atomic_launch_metadata(
                 path / ADMISSION_METADATA_NAME,
                 {
@@ -1065,7 +1088,6 @@ class RandomCycleEngine:
                     "client_order_prefix": reservation["client_order_prefix"],
                 },
             )
-            self._cycle_admitted = True
             os.chmod(path, 0o700)
             return
         if ADMISSION_METADATA_NAME in children:

@@ -2225,6 +2225,46 @@ def test_allocate_cycle_slot_skips_consumed_directories_and_persists_unique_pref
     assert prefix.startswith("owner-cycle-")
 
 
+@pytest.mark.asyncio
+async def test_reserved_launch_prefix_mismatch_blocks_before_reads_and_admission(tmp_path):
+    operator_dir = tmp_path / "operator"
+    operator_dir.mkdir(mode=0o700)
+    cycle_dir, reserved_prefix = allocate_cycle_slot(operator_dir, client_order_prefix="owner-cycle")
+
+    class ReadTrackingClient(CycleClient):
+        def __init__(self, clock: AdvancingClock) -> None:
+            super().__init__(clock)
+            self.read_calls = 0
+
+        async def market_metadata(self, market_id: int) -> MarketMetadata:
+            self.read_calls += 1
+            return await super().market_metadata(market_id)
+
+        async def order_book(self, market_id: int) -> OrderBookSnapshot:
+            self.read_calls += 1
+            return await super().order_book(market_id)
+
+        async def account_snapshot(self, account_index: int, market_id: int) -> AccountSnapshot:
+            self.read_calls += 1
+            return await super().account_snapshot(account_index, market_id)
+
+    client = ReadTrackingClient(AdvancingClock())
+    result = await run_random_cycle(
+        cycle_config(cycle_dir, client_order_prefix="wrong-cycle-prefix"),
+        client,
+        clock=client.clock,
+        rng=FixedRng(25, 20),
+    )
+    assert result.outcome is Outcome.FAILED_PREFLIGHT_BLOCKED
+    assert "client-order prefix does not match" in (result.reason or "")
+    assert client.read_calls == 0
+    assert client.submissions == []
+    assert not (cycle_dir / "admission.json").exists()
+    assert not (cycle_dir / "cycle.jsonl").exists()
+    launch = json.loads((cycle_dir / "launch.json").read_text(encoding="utf-8"))
+    assert launch["client_order_prefix"] == reserved_prefix
+
+
 def _write_simple_launcher_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
     operator_dir = tmp_path / "operator"
     operator_dir.mkdir(mode=0o700)
@@ -2294,10 +2334,15 @@ async def test_simple_enter_admits_reserved_slot_and_same_slot_replay_is_blocked
     assert (cycle_dir / "cycle.jsonl").exists()
 
     launch = json.loads((cycle_dir / "launch.json").read_text(encoding="utf-8"))
+    admission = json.loads((cycle_dir / "admission.json").read_text(encoding="utf-8"))
     replay_config = cycle_config(
         cycle_dir,
         client_order_prefix=launch["client_order_prefix"],
     )
+    assert admission["client_order_prefix"] == launch["client_order_prefix"]
+    cycle_rows = [json.loads(line) for line in (cycle_dir / "cycle.jsonl").read_text().splitlines()]
+    started = next(row for row in cycle_rows if row["event"] == "CYCLE_STARTED")
+    assert started["payload"]["binding"]["client_order_prefix"] == launch["client_order_prefix"]
     replay = await real_run_random_cycle(
         replay_config,
         CycleClient(AdvancingClock()),
