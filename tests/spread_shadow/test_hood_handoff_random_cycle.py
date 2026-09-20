@@ -404,6 +404,32 @@ class ExternalOpeningClient(CycleClient):
         return value
 
 
+class VisibleOpeningClient(ExternalOpeningClient):
+    """Return the terminal source order after the external fill is visible."""
+
+    async def lookup_order(self, account_index, market_id, *, order_id=None, client_order_index=None):
+        was_injected = self.injected
+        value = await super().lookup_order(
+            account_index,
+            market_id,
+            order_id=order_id,
+            client_order_index=client_order_index,
+        )
+        if not was_injected and self.injected and value is None:
+            return self.orders[(account_index, str(order_id))]
+        return value
+
+
+class StaleOpeningClient(ExternalOpeningClient):
+    """Keep both pre-receiver account rechecks outside the freshness budget."""
+
+    async def account_snapshot(self, account_index, market_id):
+        value = await super().account_snapshot(account_index, market_id)
+        if self.orders and not self.injected:
+            return replace(value, observed_at=self.clock.now() - 100)
+        return value
+
+
 class UnknownLaterFallbackClient(CycleClient):
     def __init__(self, clock: AdvancingClock) -> None:
         super().__init__(
@@ -563,6 +589,72 @@ class ExternalCloseClient(CycleClient):
                 self.trades[current.order_id] = ()
             return MutationReceipt(True, current.order_id, f"tx-cancel-race-{current.order_id}")
         return await super().cancel_order(account_index, market_id, order_id)
+
+
+class ExternalClosingSourceRace(ExternalCloseClient):
+    """Fill the paired-closing source maker externally before receiver dispatch."""
+
+    def __init__(
+        self,
+        clock: AdvancingClock,
+        *,
+        direction: Direction,
+        fill_fraction: Decimal,
+        visible: bool,
+    ) -> None:
+        super().__init__(clock)
+        self.direction = direction
+        self.fill_fraction = fill_fraction
+        self.visible = visible
+        self.source_lookup_counts: dict[str, int] = {}
+        self.injected = False
+
+    async def lookup_order(self, account_index, market_id, *, order_id=None, client_order_index=None):
+        value = await super().lookup_order(
+            account_index,
+            market_id,
+            order_id=order_id,
+            client_order_index=client_order_index,
+        )
+        if (
+            value is not None
+            and account_index == self.source_account_index
+            and value.order_type == "LIMIT"
+            and value.reduce_only
+            and self.clock.now() > NOW
+        ):
+            count = self.source_lookup_counts.get(value.order_id, 0) + 1
+            self.source_lookup_counts[value.order_id] = count
+            if count == 2 and not self.injected:
+                filled = value.initial_quantity * self.fill_fraction
+                status = "filled" if filled == value.initial_quantity else "canceled"
+                current = self._replace_order(
+                    value,
+                    status=status,
+                    filled_quantity=filled,
+                    remaining_quantity=value.initial_quantity - filled,
+                )
+                self.source_position += filled if current.side == "BUY" else -filled
+                self.trades[current.order_id] = (
+                    TradeReceipt(
+                        f"external-closing-source-{current.order_id}",
+                        self.source_account_index,
+                        current.market_id,
+                        current.order_id,
+                        current.side,
+                        filled,
+                        current.price,
+                        None,
+                        999,
+                        self.clock.now(),
+                        counterparty_order_id="external-closing-maker",
+                        counterparty_client_order_index="external-closing-client",
+                        client_order_index=current.client_order_index,
+                    ),
+                )
+                self.injected = True
+                return current if self.visible else None
+        return value
 
 
 class ChildIdentityChangeClient(CycleClient):
@@ -1194,6 +1286,145 @@ async def test_known_external_source_opening_fill_closes_residual_without_receiv
     assert clock.sleeps == []
     journal = (tmp_path / f"external-opening-{direction.value.lower()}" / "cycle.jsonl").read_text()
     assert "HOLD_ANCHORED" not in journal
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "direction, fill_fraction",
+    [
+        (Direction.LONG, Decimal("1")),
+        (Direction.LONG, Decimal("0.5")),
+        (Direction.SHORT, Decimal("1")),
+        (Direction.SHORT, Decimal("0.5")),
+    ],
+)
+async def test_visible_external_source_opening_fill_closes_residual_without_receiver_or_hold(
+    tmp_path,
+    direction,
+    fill_fraction,
+):
+    clock = AdvancingClock()
+    client = VisibleOpeningClient(
+        clock,
+        direction=direction,
+        fill_fraction=fill_fraction,
+    )
+    result = await run_random_cycle(
+        cycle_config(
+            tmp_path / f"visible-opening-{direction.value.lower()}-{fill_fraction}",
+            direction=direction,
+        ),
+        client,
+        clock=clock,
+        rng=FixedRng(20, 20),
+    )
+
+    assert result.outcome is Outcome.PARTIAL
+    assert result.opening is not None
+    assert result.opening.outcome is Outcome.PARTIAL
+    assert result.closing is None
+    assert result.fallbacks and all(item.outcome is Outcome.SUCCESS for item in result.fallbacks)
+    assert [(plan.order_type, plan.reduce_only) for plan in client.submissions] == [
+        ("LIMIT", False),
+        ("MARKET", True),
+    ]
+    assert client.source_position == Decimal("0")
+    assert client.receiver_position == Decimal("0")
+    assert clock.sleeps == []
+    journal = (tmp_path / f"visible-opening-{direction.value.lower()}-{fill_fraction}" / "cycle.jsonl").read_text()
+    assert "HOLD_ANCHORED" not in journal
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "direction, fill_fraction",
+    [
+        (Direction.LONG, Decimal("1")),
+        (Direction.LONG, Decimal("0.5")),
+        (Direction.SHORT, Decimal("1")),
+        (Direction.SHORT, Decimal("0.5")),
+    ],
+)
+async def test_stale_pre_receiver_account_recheck_keeps_external_fill_unknown(
+    tmp_path,
+    direction,
+    fill_fraction,
+):
+    clock = AdvancingClock()
+    client = StaleOpeningClient(
+        clock,
+        direction=direction,
+        fill_fraction=fill_fraction,
+    )
+    result = await run_random_cycle(
+        cycle_config(
+            tmp_path / f"stale-opening-{direction.value.lower()}-{fill_fraction}",
+            direction=direction,
+        ),
+        client,
+        clock=clock,
+        rng=FixedRng(20, 20),
+    )
+
+    assert result.outcome is Outcome.UNKNOWN
+    assert result.opening is not None
+    assert result.opening.outcome is Outcome.UNKNOWN
+    assert result.closing is None
+    assert result.fallbacks == ()
+    assert [(plan.order_type, plan.reduce_only) for plan in client.submissions] == [("LIMIT", False)]
+    assert any("recheck is stale" in item for item in result.opening.unknown_reasons)
+    assert not any(plan.account_index == client.receiver_account_index for plan in client.submissions)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "direction, fill_fraction, visible",
+    [
+        (Direction.LONG, Decimal("1"), False),
+        (Direction.LONG, Decimal("0.5"), False),
+        (Direction.SHORT, Decimal("1"), False),
+        (Direction.SHORT, Decimal("0.5"), False),
+        (Direction.LONG, Decimal("1"), True),
+        (Direction.LONG, Decimal("0.5"), True),
+        (Direction.SHORT, Decimal("1"), True),
+        (Direction.SHORT, Decimal("0.5"), True),
+    ],
+)
+async def test_external_source_fill_during_paired_close_is_partial_and_fallback_bounded(
+    tmp_path,
+    direction,
+    fill_fraction,
+    visible,
+):
+    clock = AdvancingClock()
+    client = ExternalClosingSourceRace(
+        clock,
+        direction=direction,
+        fill_fraction=fill_fraction,
+        visible=visible,
+    )
+    result = await run_random_cycle(
+        cycle_config(
+            tmp_path / f"closing-source-{direction.value.lower()}-{fill_fraction}-{visible}",
+            direction=direction,
+        ),
+        client,
+        clock=clock,
+        rng=FixedRng(20, 20),
+    )
+
+    assert result.outcome is Outcome.SUCCESS, result.as_dict()
+    assert result.opening is not None and result.opening.outcome is Outcome.SUCCESS
+    assert result.closing is not None
+    assert result.closing.outcome is Outcome.PARTIAL
+    assert result.closing.receiver.dispatched is False
+    assert result.fallbacks and all(item.outcome is Outcome.SUCCESS for item in result.fallbacks)
+    assert client.submissions[2].account_index == client.source_account_index
+    assert client.submissions[2].order_type == "LIMIT"
+    assert client.submissions[2].reduce_only is True
+    assert client.source_position == Decimal("0")
+    assert client.receiver_position == Decimal("0")
+    assert clock.sleeps == [20]
 
 
 @pytest.mark.asyncio
