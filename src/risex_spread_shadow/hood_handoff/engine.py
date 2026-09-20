@@ -365,29 +365,42 @@ class HandoffEngine:
                     plan.receiver.account_index,
                     plan.source.market_id,
                 )
+                source_order_id = source_order.order_id
                 source_order = await self._lookup_order(plan.source, source_order.order_id)
                 decision_now = self.clock.now()
                 if source_order is None:
                     unknown_reasons.append("source order disappeared during pre-receiver recheck")
-                elif not self._snapshot_matches(
+                if not self._snapshot_matches(
                     source_recheck, plan.source, expected_identity=plan.source_identity
                 ):
                     unknown_reasons.append("source recheck account/market identity conflicts with plan")
-                elif not self._snapshot_matches(
+                if not self._snapshot_matches(
                     receiver_recheck, plan.receiver, expected_identity=plan.receiver_identity
                 ):
                     unknown_reasons.append("receiver recheck account/market identity conflicts with plan")
-                elif not self._snapshot_fresh(source_recheck, decision_now, config.freshness_seconds):
+                if not self._snapshot_fresh(source_recheck, decision_now, config.freshness_seconds):
                     unknown_reasons.append("source recheck is stale or from the future before receiver dispatch")
-                elif not self._snapshot_fresh(receiver_recheck, decision_now, config.freshness_seconds):
+                if not self._snapshot_fresh(receiver_recheck, decision_now, config.freshness_seconds):
                     unknown_reasons.append("receiver recheck is stale or from the future before receiver dispatch")
-                elif not self._time_fresh(source_order.observed_at, decision_now, config.freshness_seconds):
+                if source_order is not None and not self._time_fresh(
+                    source_order.observed_at, decision_now, config.freshness_seconds
+                ):
                     unknown_reasons.append("source order recheck is stale or from the future before receiver dispatch")
-                elif source_recheck.signed_position != source.signed_position:
+                source_fill_visible_in_recheck = (
+                    source_order is not None
+                    and source_order.terminal
+                    and source_order.filled_quantity > 0
+                    and source_recheck.signed_position
+                    == source.signed_position - source_order.filled_quantity * plan.direction.sign
+                )
+                if (
+                    source_recheck.signed_position != source.signed_position
+                    and not source_fill_visible_in_recheck
+                ):
                     unknown_reasons.append("source position changed before receiver dispatch")
-                elif not source_recheck.authorized or not source_recheck.ready:
+                if not source_recheck.authorized or not source_recheck.ready:
                     unknown_reasons.append("source recheck authorization/readiness is unproven")
-                elif (
+                if (
                     source_recheck.margin_available is None
                     or source_recheck.margin_required is None
                     or source_recheck.margin_required > source_recheck.margin_available
@@ -405,15 +418,21 @@ class HandoffEngine:
                     )
                 ):
                     unknown_reasons.append("source margin recheck is insufficient or missing")
-                elif not self._active_orders_match(source_recheck, plan.source, source_order.order_id):
+                source_active_order_matches = self._active_orders_match(
+                    source_recheck, plan.source, source_order_id
+                )
+                source_active_order_was_consumed_by_fill = (
+                    source_fill_visible_in_recheck and not source_recheck.active_orders
+                )
+                if not source_active_order_matches and not source_active_order_was_consumed_by_fill:
                     unknown_reasons.append("source recheck contains an additional or conflicting active order")
-                elif receiver_recheck.signed_position != receiver.signed_position:
+                if receiver_recheck.signed_position != receiver.signed_position:
                     unknown_reasons.append("receiver position changed before receiver dispatch")
-                elif not receiver_recheck.authorized or not receiver_recheck.ready:
+                if not receiver_recheck.authorized or not receiver_recheck.ready:
                     unknown_reasons.append("receiver recheck authorization/readiness is unproven")
-                elif receiver_recheck.active_orders:
+                if receiver_recheck.active_orders:
                     unknown_reasons.append("receiver active HOOD order appeared before receiver dispatch")
-                elif (
+                if (
                     receiver_recheck.margin_available is None
                     or receiver_recheck.margin_required is None
                     or receiver_recheck.margin_required > receiver_recheck.margin_available
@@ -431,9 +450,9 @@ class HandoffEngine:
                     )
                 ):
                     unknown_reasons.append("receiver margin recheck is insufficient or missing")
-                elif not self._source_is_resting(source_order, plan.source):
+                if source_order is not None and not self._source_is_resting(source_order, plan.source):
                     unknown_reasons.append("source fill or quantity change before receiver dispatch")
-                else:
+                if not unknown_reasons and source_order is not None:
                     receiver_mutation_observations = (
                         source_recheck,
                         receiver_recheck,
@@ -1305,6 +1324,18 @@ class HandoffEngine:
             "source fill observed before receiver dispatch",
             "source order did not prove exact resting quantity",
         }
+        if self._known_source_only_partial(plan, source, receiver, unknown_reasons):
+            # The pre-receiver source observation is retained in the durable
+            # evidence, but a later complete source reconciliation proves a
+            # known source-only residual.  That residual is eligible only for
+            # the caller's existing reduce-only cleanup path; it never makes
+            # the receiver dispatch or hold barrier pass.
+            known_partial_reasons.update(
+                {
+                    "source order disappeared during pre-receiver recheck",
+                    "source fill or quantity change before receiver dispatch",
+                }
+            )
         unresolved = [
             reason
             for reason in (*unknown_reasons, *source.unknown_reasons, *receiver.unknown_reasons)
@@ -1330,6 +1361,52 @@ class HandoffEngine:
         if receiver.order is None and not receiver.trades and source.filled_quantity < plan.quantity:
             return Outcome.PARTIAL
         return Outcome.PARTIAL
+
+    @staticmethod
+    def _known_source_only_partial(
+        plan: HandoffPlan,
+        source: LegReconciliation,
+        receiver: LegReconciliation,
+        unknown_reasons: Sequence[str],
+    ) -> bool:
+        """Prove a narrow pre-receiver source observation is a known residual.
+
+        A source order can disappear, or become filled/canceled, between the
+        two bounded account reads and the required final exact-order lookup.
+        The observation remains a stop reason, while a later terminal order,
+        complete trade history and agreeing final position can prove the
+        source leg independently.  All other unknowns remain barriers,
+        including a missing/conflicting final order, identity drift,
+        incomplete history or a dispatched receiver.
+        """
+
+        provisional_reasons = {
+            "source order disappeared during pre-receiver recheck",
+            "source fill or quantity change before receiver dispatch",
+        }
+        if not any(reason in provisional_reasons for reason in unknown_reasons):
+            return False
+        if any(reason not in provisional_reasons for reason in unknown_reasons):
+            return False
+        if source.unknown_reasons or receiver.unknown_reasons:
+            return False
+        if not source.dispatched or receiver.dispatched:
+            return False
+        if not source.history_complete or not receiver.history_complete:
+            return False
+        if source.order is None or not source.order.terminal:
+            return False
+        if receiver.order is not None or receiver.trades:
+            return False
+        if receiver.position_after != receiver.position_before:
+            return False
+        if source.filled_quantity <= 0 or source.filled_quantity > plan.quantity:
+            return False
+        if source.order.filled_quantity != source.filled_quantity:
+            return False
+        expected_source = plan.source_position_before - plan.quantity * plan.direction.sign
+        expected_source += (plan.quantity - source.filled_quantity) * plan.direction.sign
+        return source.position_after == expected_source
 
     async def _resume_reconciliation(self, config: HandoffConfig, journal: DurableJournal) -> HandoffResult:
         events = journal.events

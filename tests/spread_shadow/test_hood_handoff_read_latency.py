@@ -11,10 +11,32 @@ from risex_spread_shadow.hood_handoff import (
     Direction,
     HandoffEngine,
     Outcome,
+    RandomCycleConfig,
+    RandomCycleEngine,
     run_handoff,
 )
 
 from test_hood_handoff_engine import FakeClient, FakeClock, make_config
+
+
+class TimedCycleAccounts(FakeClient):
+    def __init__(self, *, delay: float):
+        super().__init__()
+        self.delay = delay
+        self.active_reads = 0
+        self.max_active_reads = 0
+        self.events: list[tuple[str, float]] = []
+
+    async def account_snapshot(self, account_index, market_id):
+        self.active_reads += 1
+        self.max_active_reads = max(self.max_active_reads, self.active_reads)
+        self.events.append((f"start-{account_index}", perf_counter()))
+        try:
+            await asyncio.sleep(self.delay)
+            return await super().account_snapshot(account_index, market_id)
+        finally:
+            self.events.append((f"end-{account_index}", perf_counter()))
+            self.active_reads -= 1
 
 
 class TimedReadClient(FakeClient):
@@ -87,6 +109,29 @@ async def test_account_rechecks_overlap_against_controlled_sequential_baseline()
     sequential_times = dict(sequential_client.events)
     assert sequential_client.max_active_reads == 1
     assert sequential_times["read-end-11"] <= sequential_times["read-start-22"]
+
+
+@pytest.mark.asyncio
+async def test_random_cycle_account_reads_overlap_with_maximum_two_concurrent_reads(tmp_path):
+    client = TimedCycleAccounts(delay=0.03)
+    config = RandomCycleConfig(
+        market_id=7,
+        market_symbol="BTC",
+        direction=Direction.LONG,
+        source_account_index=11,
+        receiver_account_index=22,
+        cycle_dir=tmp_path / "cycle",
+    )
+    engine = RandomCycleEngine(client, clock=FakeClock())
+
+    source, receiver = await engine._accounts(config)
+
+    assert source.account_index == 11
+    assert receiver.account_index == 22
+    assert client.max_active_reads == 2
+    times = dict(client.events)
+    assert times["start-11"] < times["end-22"]
+    assert times["start-22"] < times["end-11"]
 
 
 @pytest.mark.asyncio
