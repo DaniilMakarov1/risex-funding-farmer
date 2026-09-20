@@ -531,6 +531,8 @@ class FallbackResult:
     position_after: Decimal | None = None
     reason: str | None = None
     attempt: int = 1
+    reconciliation_state: str = "UNKNOWN"
+    position_observed_at: float | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -544,6 +546,8 @@ class FallbackResult:
             "position_after": None if self.position_after is None else format(self.position_after, "f"),
             "reason": self.reason,
             "attempt": self.attempt,
+            "reconciliation_state": self.reconciliation_state,
+            "position_observed_at": self.position_observed_at,
         }
 
 
@@ -558,6 +562,9 @@ class RandomCycleResult:
     fallbacks: tuple[FallbackResult, ...] = ()
     remaining_source_position: Decimal | None = None
     remaining_receiver_position: Decimal | None = None
+    remaining_source_position_observed_at: float | None = None
+    remaining_receiver_position_observed_at: float | None = None
+    opening_reason: str | None = None
     reason: str | None = None
     journal_path: str | None = None
 
@@ -578,6 +585,11 @@ class RandomCycleResult:
                 if self.remaining_receiver_position is None
                 else format(self.remaining_receiver_position, "f"),
             },
+            "remaining_position_observed_at": {
+                "source": self.remaining_source_position_observed_at,
+                "receiver": self.remaining_receiver_position_observed_at,
+            },
+            "opening_reason": self.opening_reason,
             "reason": self.reason,
             "journal_path": self.journal_path,
         }
@@ -724,6 +736,103 @@ def _order_payload(order: OrderSnapshot | None) -> dict[str, Any] | None:
         "price": None if order.price is None else format(order.price, "f"),
         "observed_at": order.observed_at,
     }
+
+
+def _fallback_order_mismatch_map(
+    order: OrderSnapshot,
+    plan: OrderPlan,
+    *,
+    expected_order_id: str | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Return a bounded, JSON-safe field map for one rejected observation.
+
+    The map deliberately separates immutable identity/parameter checks from
+    terminal execution state.  In particular, an IOC venue may report a
+    terminal zero-fill with ``remaining_quantity == 0`` even though its
+    ``initial_quantity`` was positive; that is a valid state observation, not
+    an identity conflict.
+    """
+
+    def value(value: Any) -> Any:
+        if isinstance(value, Decimal):
+            return format(value, "f")
+        return value
+
+    mismatches: dict[str, dict[str, Any]] = {}
+
+    def check(name: str, expected: Any, observed: Any, matches: bool = True) -> None:
+        if matches:
+            return
+        mismatches[name] = {"expected": value(expected), "observed": value(observed)}
+
+    check("account_index", plan.account_index, order.account_index, order.account_index == plan.account_index)
+    check("market_id", plan.market_id, order.market_id, order.market_id == plan.market_id)
+    if expected_order_id is not None:
+        check("order_id", str(expected_order_id), order.order_id, order.order_id == str(expected_order_id))
+    check(
+        "client_order_index",
+        plan.client_order_index,
+        order.client_order_index,
+        order.client_order_index is not None
+        and str(order.client_order_index) == str(plan.client_order_index),
+    )
+    check("side", plan.side, order.side, order.side == plan.side)
+    check("order_type", plan.order_type, order.order_type, order.order_type == plan.order_type)
+    check(
+        "time_in_force",
+        plan.time_in_force,
+        order.time_in_force,
+        order.time_in_force == plan.time_in_force,
+    )
+    check("reduce_only", plan.reduce_only, order.reduce_only, order.reduce_only == plan.reduce_only)
+    check(
+        "initial_quantity",
+        plan.quantity,
+        order.initial_quantity,
+        order.initial_quantity == plan.quantity,
+    )
+    if order.price is None:
+        check("price", plan.price, None, False)
+    else:
+        price_matches = (
+            order.price <= plan.price
+            if plan.side == "BUY"
+            else order.price >= plan.price
+        )
+        expected_price = (
+            f"<= {format(plan.price, 'f')}"
+            if plan.side == "BUY"
+            else f">= {format(plan.price, 'f')}"
+        )
+        check("price", expected_price, order.price, price_matches)
+    return mismatches
+
+
+def _fallback_reconciliation_state(
+    result: FallbackResult,
+    *,
+    receipt: MutationReceipt | None,
+    order: OrderSnapshot | None,
+    trades: Sequence[TradeReceipt],
+    after: AccountSnapshot | None,
+    requested_quantity: Decimal,
+) -> str:
+    """Classify only states proven by the bounded fallback evidence."""
+
+    if result.outcome is Outcome.UNKNOWN:
+        return "UNKNOWN"
+    if receipt is not None and not receipt.accepted:
+        return "REJECTED"
+    if order is None or not order.terminal or after is None:
+        return result.reconciliation_state
+    filled = sum((trade.quantity for trade in trades), Decimal(0))
+    if filled == 0 and not trades:
+        return "TERMINAL_ZERO_FILL"
+    if filled == requested_quantity and after.signed_position == 0 and result.outcome is Outcome.SUCCESS:
+        return "FULL_FILL"
+    if 0 < filled < requested_quantity and result.position_after is not None:
+        return "PARTIAL_FILL"
+    return result.reconciliation_state
 
 
 def _trade_payload(trade: TradeReceipt) -> dict[str, Any]:
@@ -953,6 +1062,70 @@ def _cycle_exception_reason(exc: BaseException) -> str:
     return sanitize_exception(exc)
 
 
+def _cycle_terminal_reason(
+    opening: HandoffResult | None,
+    closing: HandoffResult | None,
+    fallbacks: Sequence[FallbackResult],
+    fallback_seed: str | None,
+) -> str | None:
+    """Keep the opening cause while reporting the deepest later decision."""
+
+    opening_reason = _opening_reason(opening)
+    receiver_not_dispatched = any(
+        phase is not None
+        and phase.receiver is not None
+        and not phase.receiver.dispatched
+        for phase in (opening, closing)
+    )
+    fallback_reason = next(
+        (item.reason for item in reversed(fallbacks) if item.reason),
+        None,
+    )
+    later_reason = fallback_reason or (closing.reason if closing is not None else fallback_seed)
+    parts: list[str] = []
+    if opening_reason:
+        parts.append(opening_reason)
+    if receiver_not_dispatched and not any("not dispatched" in part.lower() for part in parts):
+        parts.append("receiver order was not dispatched")
+    if later_reason:
+        parts.append(
+            later_reason
+            if later_reason.startswith("fallback ")
+            else f"fallback reconciliation: {later_reason}"
+            if fallback_reason
+            else later_reason
+        )
+    if not parts:
+        return None
+    return "; ".join(parts)
+
+
+def _opening_reason(opening: HandoffResult | None) -> str | None:
+    """Retain the primary opening reason and a decisive source-fill fact."""
+
+    if opening is None:
+        return None
+    reasons: list[str] = []
+    if opening.reason:
+        reasons.append(opening.reason)
+    for reason in opening.unknown_reasons:
+        if "source fill observed before receiver dispatch" in reason and not any(
+            "source fill observed before receiver dispatch" in item for item in reasons
+        ):
+            reasons.append(reason)
+    source = opening.source
+    receiver = opening.receiver
+    if (
+        source is not None
+        and source.filled_quantity > 0
+        and receiver is not None
+        and not receiver.dispatched
+        and not any("source fill observed before receiver dispatch" in item for item in reasons)
+    ):
+        reasons.append("source fill observed before receiver dispatch")
+    return "; ".join(reasons) or None
+
+
 def _is_retryable_preparation_error(exc: BaseException) -> bool:
     """Classify only finite pre-mutation facts that a fresh snapshot can fix."""
 
@@ -984,6 +1157,7 @@ class RandomCycleEngine:
         self._stage = "PREFLIGHT"
         self._identity_barrier: str | None = None
         self._selection: RandomCycleSelection | None = None
+        self._last_account_observations: dict[int, AccountSnapshot] = {}
 
     def _mark_identity_failure(self, reason: str) -> None:
         """Keep the first identity mismatch as a cycle-wide dependency barrier."""
@@ -995,6 +1169,7 @@ class RandomCycleEngine:
         self._stage = "PREFLIGHT"
         self._identity_barrier = None
         self._selection = None
+        self._last_account_observations = {}
         if not config.operator_execution_opt_in or not config.operator_plan_reviewed:
             return RandomCycleResult(
                 outcome=Outcome.PREVIEW,
@@ -1223,7 +1398,12 @@ class RandomCycleEngine:
                 )
                 else opening.outcome
             )
-            reason = opening.reason or "paired opening did not prove a complete cycle"
+            reason = _cycle_terminal_reason(
+                opening,
+                None,
+                fallbacks,
+                "paired opening did not prove a complete cycle",
+            )
             result = RandomCycleResult(
                 outcome=outcome,
                 phase=Phase.COMPLETE,
@@ -1233,6 +1413,9 @@ class RandomCycleEngine:
                 fallbacks=tuple(fallbacks),
                 remaining_source_position=remaining_source,
                 remaining_receiver_position=remaining_receiver,
+                remaining_source_position_observed_at=self._last_observed_at(config.source_account_index),
+                remaining_receiver_position_observed_at=self._last_observed_at(config.receiver_account_index),
+                opening_reason=_opening_reason(opening),
                 reason=reason,
                 journal_path=str(config.journal_path),
             )
@@ -1253,6 +1436,7 @@ class RandomCycleEngine:
                 run_id=journal.run_id,
                 selection=selection,
                 opening=opening,
+                opening_reason=_opening_reason(opening),
                 reason=reason,
                 journal_path=str(config.journal_path),
             )
@@ -1308,14 +1492,14 @@ class RandomCycleEngine:
             outcome = Outcome.UNKNOWN
         else:
             outcome = Outcome.PARTIAL
-        fallback_reason = next(
-            (item.reason for item in fallbacks if item.reason),
-            None,
-        )
         reason = None if outcome is Outcome.SUCCESS else (
             self._identity_barrier
-            or fallback_reason
-            or (closing.reason if closing is not None else fallback_seed)
+            or _cycle_terminal_reason(
+                opening,
+                closing,
+                fallbacks,
+                fallback_seed,
+            )
             or "cycle closure did not prove exact flat positions"
         )
         result = RandomCycleResult(
@@ -1328,11 +1512,18 @@ class RandomCycleEngine:
             fallbacks=tuple(fallbacks),
             remaining_source_position=remaining_source,
             remaining_receiver_position=remaining_receiver,
+            remaining_source_position_observed_at=self._last_observed_at(config.source_account_index),
+            remaining_receiver_position_observed_at=self._last_observed_at(config.receiver_account_index),
+            opening_reason=_opening_reason(opening),
             reason=reason,
             journal_path=str(config.journal_path),
         )
         journal.append("CYCLE_COMPLETE", result.as_dict())
         return result
+
+    def _last_observed_at(self, account_index: int) -> float | None:
+        snapshot = self._last_account_observations.get(account_index)
+        return None if snapshot is None else snapshot.observed_at
 
     async def _accounts(self, config: RandomCycleConfig, now: float | None = None) -> tuple[AccountSnapshot, AccountSnapshot]:
         source, receiver = await self._parallel_accounts(config)
@@ -1343,6 +1534,10 @@ class RandomCycleEngine:
         validation_now = self.clock.now()
         _validate_account_fresh(config, source, "source", validation_now)
         _validate_account_fresh(config, receiver, "receiver", validation_now)
+        self._last_account_observations = {
+            source.account_index: source,
+            receiver.account_index: receiver,
+        }
         return source, receiver
 
     async def _parallel_accounts(
@@ -1933,6 +2128,16 @@ class RandomCycleEngine:
                 config.source_account_index: fresh_source,
                 config.receiver_account_index: fresh_receiver,
             }
+            journal.append(
+                "FALLBACK_POST_ATTEMPT_ACCOUNT_OBSERVATION",
+                {
+                    "attempt": attempt_ordinal,
+                    "account_index": account_index,
+                    "reconciliation_state": result.reconciliation_state,
+                    "source": _account_payload(fresh_source),
+                    "receiver": _account_payload(fresh_receiver),
+                },
+            )
             if any(
                 fresh[candidate].source_identity != current[candidate].source_identity
                 for candidate in (config.source_account_index, config.receiver_account_index)
@@ -1965,6 +2170,20 @@ class RandomCycleEngine:
                     },
                 )
                 return results, None, None
+            if (
+                result.reconciliation_state == "REJECTED"
+                and result.position_after is None
+            ):
+                # A rejected dispatch has no order-side position_after, but
+                # the mandatory post-attempt account read is still a distinct
+                # and useful fact.  Bind it to the result without making the
+                # rejected account eligible for another mutation.
+                result = replace(
+                    result,
+                    position_after=fresh[account_index].signed_position,
+                    position_observed_at=fresh[account_index].observed_at,
+                )
+                results[-1] = result
             current = fresh
             fresh_residuals = {
                 candidate: _position_residual(snapshot.signed_position, signs[candidate], selection.quantity)
@@ -1987,7 +2206,7 @@ class RandomCycleEngine:
             # A rejection, below-minimum residual, or another known refusal is
             # terminal for this account.  A fully reconciled known partial is
             # safe to requeue; no fixed attempt count is imposed.
-            if result.position_after is None:
+            if result.reconciliation_state == "REJECTED" or result.position_after is None:
                 blocked.add(account_index)
                 continue
             if result.filled_quantity == 0:
@@ -2052,6 +2271,32 @@ class RandomCycleEngine:
 
         deadline = self.clock.now() + config.order_timeout_seconds
         last_reason = "fallback order was not visible"
+
+        def record(
+            *,
+            poll: int,
+            order: OrderSnapshot | None,
+            reason: str | None = None,
+            mismatch_map: Mapping[str, Any] | None = None,
+            rejected: bool = False,
+        ) -> None:
+            payload: dict[str, Any] = {
+                "account_index": plan.account_index,
+                "market_id": plan.market_id,
+                "attempt": attempt_ordinal,
+                "poll": poll,
+                "order": _order_payload(order),
+            }
+            if reason is not None:
+                payload["reason"] = reason
+            if mismatch_map:
+                payload["mismatch_map"] = dict(mismatch_map)
+            if rejected:
+                payload["rejected"] = True
+            journal.append("FALLBACK_ORDER_OBSERVATION", payload)
+            if rejected:
+                journal.append("FALLBACK_ORDER_OBSERVATION_REJECTED", payload)
+
         for poll in range(1, config.max_poll_count + 1):
             if self.clock.now() > deadline:
                 break
@@ -2071,52 +2316,55 @@ class RandomCycleEngine:
                 raise
             except Exception as exc:
                 last_reason = f"fallback order read failed: {sanitize_exception(exc)}"
-                journal.append(
-                    "FALLBACK_ORDER_OBSERVATION",
-                    {
-                        "account_index": plan.account_index,
-                        "attempt": attempt_ordinal,
-                        "poll": poll,
-                        "order": None,
-                        "reason": last_reason,
-                    },
-                )
+                record(poll=poll, order=None, reason=last_reason)
                 order = None
             if order is not None:
                 now = self.clock.now()
                 if receipt.order_id is not None and order.order_id != str(receipt.order_id):
-                    return None, "fallback order identifier conflicts with the dispatched receipt"
-                if not self._fallback_order_identity_matches(order, plan):
-                    return None, "fallback order identity or parameters conflict with the plan"
+                    mismatch_map = _fallback_order_mismatch_map(
+                        order,
+                        plan,
+                        expected_order_id=str(receipt.order_id),
+                    )
+                    reason = "fallback order identifier conflicts with the dispatched receipt"
+                    record(
+                        poll=poll,
+                        order=order,
+                        reason=reason,
+                        mismatch_map=mismatch_map or {
+                            "order_id": {
+                                "expected": str(receipt.order_id),
+                                "observed": order.order_id,
+                            }
+                        },
+                        rejected=True,
+                    )
+                    return None, reason
+                mismatch_map = _fallback_order_mismatch_map(
+                    order,
+                    plan,
+                    expected_order_id=(None if receipt.order_id is None else str(receipt.order_id)),
+                )
+                if mismatch_map:
+                    reason = "fallback order identity or parameters conflict with the plan"
+                    record(
+                        poll=poll,
+                        order=order,
+                        reason=reason,
+                        mismatch_map=mismatch_map,
+                        rejected=True,
+                    )
+                    return None, reason
                 if order.observed_at > now:
                     last_reason = "fallback order observation is from the future"
                 elif now - order.observed_at > config.freshness_seconds:
                     last_reason = "fallback order observation is stale"
                 elif not order.terminal:
                     last_reason = "fallback order is not terminal"
-                elif not self._fallback_order_matches(order, plan):
-                    return None, "fallback terminal order fields conflict with the plan"
                 else:
-                    journal.append(
-                        "FALLBACK_ORDER_OBSERVATION",
-                        {
-                            "account_index": plan.account_index,
-                            "attempt": attempt_ordinal,
-                            "poll": poll,
-                            "order": _order_payload(order),
-                        },
-                    )
+                    record(poll=poll, order=order)
                     return order, None
-                journal.append(
-                    "FALLBACK_ORDER_OBSERVATION",
-                    {
-                        "account_index": plan.account_index,
-                        "attempt": attempt_ordinal,
-                        "poll": poll,
-                        "order": _order_payload(order),
-                        "reason": last_reason,
-                    },
-                )
+                record(poll=poll, order=order, reason=last_reason)
             if poll < config.max_poll_count:
                 remaining = deadline - self.clock.now()
                 if remaining <= 0:
@@ -2217,11 +2465,28 @@ class RandomCycleEngine:
         after: AccountSnapshot | None = None
 
         def finish(result: FallbackResult, *, reconciliation_event: str | None = None) -> FallbackResult:
+            state = _fallback_reconciliation_state(
+                result,
+                receipt=receipt,
+                order=order,
+                trades=trades,
+                after=after,
+                requested_quantity=residual,
+            )
+            if result.position_observed_at is None and after is not None:
+                result = replace(
+                    result,
+                    reconciliation_state=state,
+                    position_observed_at=after.observed_at,
+                )
+            elif result.reconciliation_state != state:
+                result = replace(result, reconciliation_state=state)
             evidence = {
                 "account_index": initial_before.account_index,
                 "attempt": attempt_ordinal,
                 "requested_quantity": format(residual, "f"),
                 "outcome": result.outcome.value,
+                "reconciliation_state": result.reconciliation_state,
                 "reason": result.reason,
                 "plan": None if plan is None else plan.as_dict(),
                 "receipt": _receipt_payload(receipt),
@@ -2235,6 +2500,7 @@ class RandomCycleEngine:
                 "history_complete": history_complete,
                 "market_metadata": None if metadata is None else _metadata_payload(metadata),
                 "order_book_observed_at": None if book is None else book.observed_at,
+                "position_observed_at": result.position_observed_at,
             }
             journal.append("FALLBACK_ATTEMPT_EVIDENCE", evidence)
             if reconciliation_event is not None:
@@ -2451,6 +2717,7 @@ class RandomCycleEngine:
                     order_id=receipt.order_id,
                     reason="fallback reduce-only market was rejected",
                     attempt=attempt_ordinal,
+                    reconciliation_state="REJECTED",
                 )
             )
 
@@ -2685,7 +2952,17 @@ class RandomCycleEngine:
             if filled == residual and after.signed_position == 0 and order.terminal
             else Outcome.PARTIAL
         )
-        reason = None if outcome is Outcome.SUCCESS else "fallback left a confirmed residual position"
+        if outcome is Outcome.SUCCESS:
+            reconciliation_state = "FULL_FILL"
+            reason = None
+        elif filled == 0 and not trades and order.terminal:
+            reconciliation_state = "TERMINAL_ZERO_FILL"
+            reason = (
+                f"fallback terminal zero-fill/cancel ({order.status}) left a confirmed residual position"
+            )
+        else:
+            reconciliation_state = "PARTIAL_FILL"
+            reason = "fallback partial fill left a confirmed residual position"
         return finish(
             FallbackResult(
                 before.account_index,
@@ -2698,6 +2975,8 @@ class RandomCycleEngine:
                 position_after=after.signed_position,
                 reason=reason,
                 attempt=attempt_ordinal,
+                reconciliation_state=reconciliation_state,
+                position_observed_at=after.observed_at,
             ),
             reconciliation_event="FALLBACK_RECONCILED",
         )
@@ -2707,23 +2986,8 @@ class RandomCycleEngine:
         """Match immutable order fields while a terminal state is pending."""
 
         return (
-            order.account_index == plan.account_index
-            and order.market_id == plan.market_id
-            and order.order_id != ""
-            and order.client_order_index is not None
-            and str(order.client_order_index) == str(plan.client_order_index)
-            and order.side == plan.side
-            and order.order_type == "MARKET"
-            and order.time_in_force == "IOC"
-            and order.reduce_only is True
-            and order.initial_quantity == plan.quantity
-            and order.remaining_quantity + order.filled_quantity == order.initial_quantity
-            and order.price is not None
-            and (
-                order.price <= plan.price
-                if plan.side == "BUY"
-                else order.price >= plan.price
-            )
+            bool(order.order_id)
+            and not _fallback_order_mismatch_map(order, plan)
         )
 
     @staticmethod
