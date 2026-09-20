@@ -1,10 +1,10 @@
 # Current status
 
-## HCR-21 — PAUSED at safe pre-integration checkpoint
+## HCR-21 — RESUMED from safe pre-integration checkpoint
 
-The owner explicitly paused Chief and Builder work on 2026-09-20. Accepted local/remote `main` remains `59eb990e63b160021d99b9bf07695873b6c3df4f`; no production candidate was merged, installed or published. Both Builder worktrees were clean at pause: `a4037fa8126912dad000b8bdc7d365a2bb5fde60` on `codex/spread-v1-fallback-reconcile-builder` and `ff5309110fe8d27b32100d6287978eb94b7ff522` on `codex/spread-v1-fallback-reconcile`. The second is the designated correction base. A consolidated correction request was delivered, then work was stopped before any returned follow-up SHA.
+The owner explicitly resumed Chief and Builder work on 2026-09-20. Accepted local/remote `main` is the documentation checkpoint `8deb2660e05879e214e95a73c2b01fb0213b0dc4`; no production candidate has been merged, installed or published. Both Builder worktrees were clean on recovery: `a4037fa8126912dad000b8bdc7d365a2bb5fde60` on `codex/spread-v1-fallback-reconcile-builder` and `ff5309110fe8d27b32100d6287978eb94b7ff522` on `codex/spread-v1-fallback-reconcile`. The second remains the designated correction base, and its same healthy Builder has resumed the consolidated two-item correction.
 
-Chief review found two remaining issues in `ff530911`: the actual fallback poll path can accept an empty observed `order_id` when an accepted receipt omitted its order ID, and the Russian formatter computes durable position values but drops them from its final line while exception/cancellation output omits durable observation times. Resume only after explicit owner instruction; verify worktree state, finish those two cases with adverse tests, then repeat complete diff review, independent incident/adverse replay and one final clean Python 3.11 suite. Preserve both candidates and all evidence. No live mutation or new cycle occurred.
+Chief review found two remaining issues in `ff530911`: the actual fallback poll path can accept an empty observed `order_id` when an accepted receipt omitted its order ID, and the Russian formatter computes durable position values but drops them from its final line while exception/cancellation output omits durable observation times. Finish those two cases with adverse tests, then repeat complete diff review, independent incident/adverse replay and one final clean Python 3.11 suite. Preserve both candidates and all evidence. Resume did not authorize a live read, mutation or new cycle.
 
 ## HCR-21 incident diagnosis and authorized correction
 
