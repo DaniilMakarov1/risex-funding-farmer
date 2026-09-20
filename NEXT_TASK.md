@@ -1,12 +1,12 @@
 # HCR-19 — resilient pre-mutation repricing and simple operator launch
 
-## Active owner-authorized objective
+## Completed owner-authorized objective
 
 On 2026-09-20 the owner explicitly authorized the previously proposed finite implementation: make an ordinary public-quote move before the first order refresh the opening price instead of terminating the cycle; allow at most three safe preparation attempts before any mutation; provide one short `./start` operator command; and replace raw JSON-first output with concise, intuitive Russian progress/error messages while retaining complete durable evidence. This is offline software work only. It grants no live account read, credential, signing, order, cancellation, historical-position adoption or execution authority.
 
 ## Ownership and base
 
-Accepted local/operator/remote main is `9359ed063d572c848cfaee8495fc5215bccfc89d`. Sole Chief task `01a0aafe-23fa-7c90-87a6-e807b3f6450a` owns this contract, independent review, integration and publication. One fresh visible Builder task (GPT-5.6 Luna max, reasoning max) owns this cohesive production/code-test objective in its managed isolated worktree from branch `codex/spread-v1-simple-launch-builder`. There is no project-wide Builder concurrency cap; additional fresh Builders may be assigned whenever separate non-overlapping objectives make them useful. Chief is GPT-6 Astra medium USER_SELECTED; actual runtime telemetry and Standard speed are UNKNOWN. Prior Builders are completed/archived and must not be reused. No global settings, credits or resets.
+The accepted candidate is `ebabbfaac88ca6d69aef9b15ad396414871e641a`, produced by fresh visible Builder task `01a0bd69-2c26-7ca1-8f9e-74784ed594a0` on branch `codex/spread-v1-simple-launch`. Sole Chief task `01a0aafe-23fa-7c90-87a6-e807b3f6450a` independently reviewed it and owns integration/publication. There is no project-wide Builder concurrency cap; each new finite objective still uses a fresh Builder, and concurrent Builders require non-overlapping ownership. Prior and delayed alternate Builders are completed/archived and must not be reused. No global settings, credits or resets.
 
 ## Required behavior
 
@@ -21,9 +21,9 @@ Accepted local/operator/remote main is `9359ed063d572c848cfaee8495fc5215bccfc89d
 - The observed failure is an evidence fixture: initial opening price `80513.6`, selected `0.00024 BTC`, hold `287`, then quote-change block about 0.589 seconds later, no opening result and no mutation. The second quote was not persisted and must not be invented. New behavior must preserve old and new quotes on future runs and return the known selection on any later preflight terminal result.
 - No policy changes to accounts, direction, leverage, fees, venue minima, 20..300 hold range, one-tick pricing rule, freshness/timeouts, order types, reduce-only semantics or execution matching. Do not optimize unrelated code or claim faster exchange fills.
 
-## Acceptance and finite completion
+## Acceptance and finite completion — PASS
 
-Builder provides clean candidate and focused tests. Cover unchanged quote, one/multiple quote changes, accepted price used by the actual opening plan, refreshed quote-minimum/balance bounds, exactly one quantity/hold draw, success on attempts 1/2/3, exhausted retry, deterministic no-retry, timeout/stale/malformed/identity/non-flat/pending-order controls, no writes before acceptance, and permanent no-retry after mutation admission. Cover automatic unique run directory/no reuse, offline simple preview/cancel with no client/credential/read/directory creation, Russian progress/error mappings for preflight/no-write, post-write UNKNOWN/PARTIAL and SUCCESS, and legacy CLI compatibility. Chief reviews full actual diff and adverse paths, independently replays the observed failure boundary and launcher safety, then runs one final clean isolated Python 3.11 full suite before installation/publication. Operator checkout must import exact tested files; `./start` preview/cancel must pass without credentials or consuming a slot. No live validation.
+The Builder delivered a clean candidate and focused coverage for the required retry, repricing, quantity, mutation-boundary, slot-allocation, Russian-output and compatibility paths. Chief reviewed the full actual diff, required one bounded prefix-binding correction, independently replayed the original quote-change boundary and ran the final clean isolated Python 3.11 suite: 4587 passed, 3 skipped, exit 0 in 117.73 seconds. The replay proved one quantity/hold draw, unchanged 0.00024 BTC and 287-second hold, and opening-plan use of fresh price 80514.2 after old price 80513.6. Live validation was not run. Remaining finite work is installation identity verification, offline `./start` help/cancel without slot consumption, governing-document finalization and publication.
 
 ## Current evidence and inventory boundary
 

@@ -1,10 +1,10 @@
 # RISEx Spread Shadow and legacy Funding Farmer
 
-## HCR-18 one random BTC cycle — accepted offline
+## HCR-19 one-command random BTC cycle — accepted offline
 
-**Historical owner result:** the HCR-17 `operator-v1/cycle-001` is consumed and must never be cleared or reused. It recorded source27331 SHORT0.00027BTC after two external fills and receiver27337 zero/undispatched. Current inventory has not been read or changed by this software task. The updated configuration below uses a separate unused output slot; a new opening still requires both accounts exactly flat.
+**Historical owner result:** `operator-v1/cycle-001` is consumed and must never be cleared or reused. The latest launch stopped safely before any order because the public quote changed during preparation. An earlier cycle recorded source27331 SHORT0.00027BTC and receiver27337 zero. Current inventory has not been read or changed by this software task, and a new opening still requires both accounts exactly flat with no active BTC orders.
 
-Candidatea439c08 passed4570tests/3skips in a final clean isolated Python3.11 suite. Confirmed external source fills now trigger the existing cycle residual-closing path after complete reconciliation, without a receiver opening chase or hold. Genuine uncertainty still blocks dependent writes. Shared account-read window measured approximately55–57ms to32–33ms with controlled20/30ms read delays; live order/fill latency was not measured and matching to an owned account is not guaranteed.
+Candidate `ebabbfaac88ca6d69aef9b15ad396414871e641a` passed 4587 tests with 3 skips in the final clean isolated Python 3.11 suite. During preparation, a normal quote move now refreshes the price instead of ending the launch. The program keeps the originally selected quantity and hold, rechecks that quantity against the fresh price, minimums, balance and account state, and makes at most three safe preparation attempts before any order may be sent. Deterministic safety errors stop immediately. After an order may have been sent, automatic preparation retry is disabled.
 
 The new operator command performs one opening/hold/closing cycle. It draws a legal BTC quantity uniformly in integer size ticks, with gross notional capped by the smaller fresh free account balance without leverage. Receiver27337 opens LONG and source27331 opens SHORT with equal quantity; both accounts must initially be exactly flat in BTC with no active BTC orders. The hold is one random integer20..300seconds, timed from independent confirmation of both opening fills. Then it reverses sides with reduce-only on both legs, followed by separately reconciled market reduce-only attempts for any confirmed residuals. It never starts another opening automatically.
 
@@ -13,30 +13,18 @@ The operator files are in:
 
 - `random-cycle.json` binds BTC market1, source27331/receiver27337, APIkey4, Robinhood endpoint/signing domain466324, the existing timing defaults and the explicitly authorized incremental opening-margin deferral.
 - `market-contract.json` contains only market identity and provenance requirements. It contains no guessed fees, minimums, balances or fresh timestamp. The actual response after LAUNCH must supply current increments/minimums; incomplete or stale evidence stops the dependent action.
-- `cycle-001` is the reserved output slot and is not created by preview. It must be new/empty and owner-only. After use, preserve it permanently; never clear or reuse it to retry.
+- `cycle-001` is consumed evidence. Preserve it permanently. The launcher atomically chooses the next unused owner-only `cycle-NNN` directory and a unique client-order prefix after confirmation.
 
-Offline preview, without credentials or market requests:
-
-```bash
-cd "/Users/daniilmakarov/Desktop/RISEx Spread Shadow"
-operator_dir="/Users/daniilmakarov/Desktop/RISEx Spread Shadow/spread-shadow-runs/hood-cycle-race-latency-20260920/operator-v1"
-.venv-hood/bin/risex-hood-handoff random-cycle \
-  --config "$operator_dir/random-cycle.json"
-```
-
-After reviewing the preview, the owner may start the single declared cycle manually:
+From the project folder, the normal launch is now one command:
 
 ```bash
 cd "/Users/daniilmakarov/Desktop/RISEx Spread Shadow"
-operator_dir="/Users/daniilmakarov/Desktop/RISEx Spread Shadow/spread-shadow-runs/hood-cycle-race-latency-20260920/operator-v1"
-.venv-hood/bin/risex-hood-handoff random-cycle \
-  --config "$operator_dir/random-cycle.json" \
-  --market-evidence "$operator_dir/market-contract.json" \
-  --keychain --confirm-plan --execute \
-  --i-understand-one-attempt-live-operation
+./start
 ```
 
-Type `LAUNCH` once at the prompt. Any other input cancels before SDK/client or credential access. Keep the terminal running through opening, hold and closure. Credentials remain in the protected Keychain/hidden local input; never put keys in these JSON files or command arguments.
+The program shows a short Russian description of the real Robinhood Chain Mainnet cycle. Press Enter to start; enter `C` or `CANCEL` to cancel. Before Enter it does not access Keychain, create an SDK client, read the market/accounts or consume a cycle directory. After Enter it loads credentials from protected Keychain, creates the next cycle slot and begins preparation. Keep the terminal running through opening, hold and closure. Never put keys in JSON files or command arguments.
+
+Live progress is shown in Russian: preparation attempt, selected quantity and hold, accepted price update, first-order boundary, opening, holding, closing and reconciliation. A terminal error says what happened, whether any order may have been sent, known remaining positions and where the immutable journal is stored. Complete structured evidence remains in `cycle.jsonl` and child journals.
 
 The quantity and hold are not operator inputs; they are sampled once and recorded in `cycle.jsonl`, alongside the child opening/closing journals and fallback receipts. Source limit resting is confirmed before receiver market dispatch. Own remaining limits are canceled and cancellation-race fills reconciled before any residual market order. Repeated terminal zero-fill attempts are paced by the existing poll interval and service both accounts fairly. There is no fixed retry count for fully reconciled residuals and therefore no guaranteed completion time in an illiquid market. Every new attempt requires a fresh bound and residual with a unique identity.
 

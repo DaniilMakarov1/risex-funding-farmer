@@ -3,6 +3,14 @@
 SYSTEM_SPEC_VERSION = 4.2
 SPEC_STATUS = FIRST_RAW_RESEARCH_SCANNER_IMPLEMENTED
 
+## HCR-19 amendment — resilient preparation and simple operator launch
+
+For the random one-cycle path, sample quantity and hold exactly once. Before the first mutation, refresh official metadata, the public book and both accounts, recompute the existing one-tick opening price, and revalidate that same quantity against fresh grid, minimum, balance, identity, flat-position, active-order, readiness and margin facts. An ordinary quote move is accepted and recorded with the old and new price; the opening plan uses the accepted fresh price. A changed quote never authorizes a quantity redraw or a weaker admission check.
+
+Preparation permits at most three complete attempts, paced by the existing poll interval, only while no mutation may have been sent. Transient read, timeout, stale-data and changed-preparation facts may retry. Deterministic configuration, identity, authorization, non-flat position, pending-order, missing-minimum and invalid-grid failures stop immediately. After the durable first-mutation boundary, preparation retry is permanently unavailable and all existing reconciliation and no-replay rules apply.
+
+The repository-root `./start` is the owner-facing entry point for the configured Robinhood cycle. Before its single confirmation it reads only local configuration: no Keychain access, client construction, market/account read or cycle-slot claim. After confirmation it atomically claims a new owner-only cycle directory and unique persisted client prefix; old slots remain immutable. Default progress and terminal explanations are concise Russian text, while complete evidence remains in JSONL. A terminal explanation must distinguish whether an order may have been sent and must preserve UNKNOWN or non-flat inventory honestly. Existing full CLI behavior remains available.
+
 ## HCR-18 amendment — reconciled early source fills and cycle reads
 
 An absent or terminal changed source order at the final pre-receiver recheck stops receiver dispatch. Preserve every account identity/freshness/readiness/margin/state check even when the exact source lookup is absent. Only complete independent terminal source order/trade/position reconciliation, unchanged undispatched receiver and no other safety barrier may classify the provisional missing/changed-order observation as known source-only PARTIAL. Preserve the original observation in evidence. The random-cycle caller may then close proven residuals using its existing reduce-only rules; incomplete paired opening never starts a hold or receiver opening chase. Fixed-size handoff callers do not gain automatic residual closure.
