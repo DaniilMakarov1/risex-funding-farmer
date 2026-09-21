@@ -1,12 +1,14 @@
 # Current status
 
-## HCR-22 — PAUSED; correction WIP preserved, not accepted
+## HCR-22 — COMPLETE; exact paired priority guard accepted offline
 
-The owner explicitly paused HCR-22 on 2026-09-20 before Chief acceptance. Builder task `01a0bf06-47d0-7772-b9c6-ed1ecb8a318a` is stopped/idle and archived only for UI cleanup after delivering a safe checkpoint. Preserved branch `codex/spread-v1-priority-guard-builder` points to `3c20b9dc62d06afa614762daf038ed1234286a6a`; its tree is identical to correction candidate `09c9204b3f8034199ad277b6ed9da1dace1e8624`, based on unaccepted `bbfed58317d9c3d79a82c30ad78acbb0f820bee3`. Accepted/contract base remains `2ddc3dfc964a3b8fa6cd678051ca0b1ee4d74f9d` on Chief branch `codex/spread-v1-priority-guard-chief`.
+The owner resumed HCR-22 on 2026-09-21. Correction candidate `09c9204b3f8034199ad277b6ed9da1dace1e8624` was independently reviewed and accepted, then integrated as Chief commits `754b993` and `518ba09`. Preserved Builder checkpoint `3c20b9dc62d06afa614762daf038ed1234286a6a` and the earlier candidate remain available; the Builder stays stopped and archived.
 
-The correction claims mandatory exact owner-bound public-book source evidence, fail-closed UNKNOWN/LOST admission, safe bounded retries, paired-closing symmetry, diagnostics, latency evidence and corrected cycle-004 facts. Builder evidence: focused/adverse `201 passed`; clean Python 3.11.5 full suite on exact implementation candidate `09c9204b`: `4620 passed, 3 skipped`, exit 0, 126.69 seconds; diff/compile passed. Chief has not completed the full correction diff review or independent adverse probes, so these results do not establish acceptance. No merge, push, installed update, live validation, account read, Keychain access or financial mutation occurred.
+Paired opening and closing now require a fresh two-sided public book, the exact active zero-fill POST_ONLY source order, exact owner/order/client/market/side/price/remaining identity, and no external better or unproved same-price priority before receiver dispatch. Missing, stale, future, malformed, anonymous, foreign or conflicting evidence is UNKNOWN; better-priced external volume is LOST. Both states forbid the receiver, permit cancellation only of the exact source identity, and allow a fresh pair attempt only after complete terminal zero-fill reconciliation at original positions. Opening and closing share the owner-approved maximum of three complete attempts with preparation, retain the sampled quantity/hold, and use fresh books and identities.
 
-Resume only on explicit owner instruction. The next action is the bounded independent Chief review recorded at the top of `NEXT_TASK.md`; do not dispatch a fresh Builder unless that review produces a justified correction contract.
+Chief affected integration/adverse suite: `181 passed`. Chief clean isolated Python 3.11.5 full suite on the exact correction tree: `4620 passed, 3 skipped`, exit 0 in 133.79 seconds. The two immutable cycle-004 journals retained their exact hashes and sizes. Five synthetic trials with 80 ms account reads and a 120 ms book read measured median concurrent pre-receiver checks at 124.3 ms and median full pre-receiver checks at 126.2 ms, against a 200 ms sequential delay reference. This is not live latency evidence.
+
+The live venue `orderBookOrders` payload and owner binding remain unconfirmed; unavailable exact owner-bound evidence fails closed. No live validation, network/account read, Keychain access, order, cancellation or other financial mutation was performed for HCR-22.
 
 ## HCR-21 — COMPLETE; accepted and installed
 

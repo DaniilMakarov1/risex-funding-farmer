@@ -1,16 +1,12 @@
 # HCR-22 — fresh-book source-priority admission and bounded pair retry
 
-## PAUSED — safe checkpoint 2026-09-20
+## COMPLETE — independently accepted 2026-09-21
 
-The owner explicitly paused HCR-22 before Chief acceptance. Do not resume implementation, review, integration, publication, live validation or account/network access until the owner explicitly resumes this objective.
+The owner resumed HCR-22. The sole Chief reconstructed the paused state, kept Builder task `01a0bf06-47d0-7772-b9c6-ed1ecb8a318a` stopped, reviewed the complete candidate and correction, and accepted correction candidate `09c9204b3f8034199ad277b6ed9da1dace1e8624`. The implementation was integrated as Chief commits `754b993` and `518ba09`; preserved Builder checkpoint `3c20b9dc62d06afa614762daf038ed1234286a6a` remains unchanged and unmerged as a checkpoint identity.
 
-Builder task `01a0bf06-47d0-7772-b9c6-ed1ecb8a318a` is stopped and idle. Its preserved worktree is `/Users/daniilmakarov/.codex/worktrees/1f3b/RISEx Spread Shadow`; named branch `codex/spread-v1-priority-guard-builder` now points to WIP checkpoint `3c20b9dc62d06afa614762daf038ed1234286a6a`. That WIP commit has no tree delta from correction candidate `09c9204b3f8034199ad277b6ed9da1dace1e8624`, whose parent is unaccepted candidate `bbfed58317d9c3d79a82c30ad78acbb0f820bee3`; the original accepted/contract base is `2ddc3dfc964a3b8fa6cd678051ca0b1ee4d74f9d`.
+Chief verification on the exact correction candidate: affected integration/adverse suite `181 passed`; clean isolated Python 3.11.5 full suite `4620 passed, 3 skipped` in 133.79 seconds; immutable cycle-004 files retained their recorded line counts, byte counts and SHA-256 hashes. Five synthetic successful trials with 80 ms per account read and 120 ms public-book read produced median concurrent pre-receiver checks of 124.3 ms and median complete pre-receiver checks of 126.2 ms, versus a 200 ms sequential delay reference. This is synthetic evidence, not a live latency guarantee.
 
-The correction candidate is `WIP_NOT_ACCEPTED`: Chief has not read its full correction diff, independently verified the adverse behavior, accepted it, merged it or pushed it. Builder reported `git diff --check` and compile success, `201 passed` focused/adverse checks, and one clean Python 3.11.5 full suite on the unchanged implementation tree at `09c9204b`: `4620 passed, 3 skipped`, exit 0 in 126.69 seconds. No new suite was run after the no-tree-delta pause checkpoint.
-
-Known unresolved acceptance boundary: the official live `orderBookOrders` payload shape and owner binding have not been independently confirmed. The candidate intends to fail closed when exact normalized `order_id` plus `owner_account_index` source-level evidence is unavailable. No live/network/account/Keychain/order/cancel operation was performed.
-
-Single next action after explicit resume: the sole Chief reconstructs identity from this checkpoint, confirms the Builder remains stopped, reads the complete `bbfed583..09c9204` diff and relevant surroundings, independently probes the exact-source/anonymous-same-price/no-reader/stale-book and cycle-004 boundaries, and then either accepts/integrates or returns one finite correction contract. Do not restart the Builder merely to inspect this preserved candidate.
+The remaining external boundary is explicit: the official live `orderBookOrders` payload shape and owner binding have not been confirmed in a newly authorized live observation. The implementation fails closed when normalized exact `order_id` plus `owner_account_index` source-level evidence is unavailable. No live validation, network/account/Keychain access, order or cancellation was performed for HCR-22. A new live operation or research objective requires a new owner decision.
 
 ## Finite objective and authority
 
