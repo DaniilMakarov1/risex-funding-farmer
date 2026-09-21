@@ -1499,14 +1499,14 @@ def test_cycle_004_offline_facts_keep_pair_failure_flat_inventory_and_unknown_fe
     )
     fallbacks = (
         FallbackResult(
-            account_index=27331,
-            side="BUY",
+            account_index=27337,
+            side="SELL",
             requested_quantity=Decimal("0.00026"),
             attempted=True,
             outcome=Outcome.PARTIAL,
             order_id="fallback-1",
             filled_quantity=Decimal("0"),
-            position_after=Decimal("-0.00026"),
+            position_after=Decimal("0.00026"),
             reason="terminal zero-fill/cancel",
             attempt=1,
             reconciliation_state="TERMINAL_ZERO_FILL",
@@ -1524,9 +1524,8 @@ def test_cycle_004_offline_facts_keep_pair_failure_flat_inventory_and_unknown_fe
             position_after=Decimal("0"),
             attempt=2,
             reconciliation_state="FULL_FILL",
-            economic_status="PROVEN",
-            economic_findings=("fallback fee economics PROVEN: 1 trade(s), fee 0.0001",),
-            fee_total=Decimal("0.0001"),
+            economic_status="UNKNOWN",
+            economic_findings=("fallback fee economics UNKNOWN: fee was not returned",),
         ),
     )
     paired_execution, inventory, economics = random_cycle_module._cycle_classifications(
@@ -1613,6 +1612,192 @@ def test_cycle_004_offline_facts_keep_pair_failure_flat_inventory_and_unknown_fe
     assert "final inventory known residual" not in operator_explanation
     assert "left a confirmed residual position" not in operator_explanation
     assert "historical book" not in operator_explanation
+
+
+def test_inventory_flatness_requires_causal_terminal_evidence_but_not_fee_evidence():
+    def leg(
+        account_index,
+        *,
+        position_after,
+        dispatched=True,
+        status="filled",
+        filled="0.10",
+        history_complete=True,
+        unknown_reasons=(),
+    ):
+        order = None
+        trades = ()
+        if dispatched:
+            order = OrderSnapshot(
+                account_index=account_index,
+                market_id=7,
+                order_id=f"order-{account_index}-{status}",
+                client_order_index=account_index,
+                status=status,
+                side="BUY",
+                order_type="MARKET",
+                time_in_force="IOC",
+                reduce_only=True,
+                initial_quantity=Decimal("0.10"),
+                remaining_quantity=Decimal("0") if status == "filled" else Decimal("0.10"),
+                filled_quantity=Decimal(filled),
+                price=Decimal("100"),
+                observed_at=NOW,
+            )
+            if Decimal(filled) > 0:
+                trades = (
+                    TradeReceipt(
+                        f"trade-{account_index}",
+                        account_index,
+                        7,
+                        order.order_id,
+                        "BUY",
+                        Decimal(filled),
+                        Decimal("100"),
+                        None,
+                        999,
+                        NOW,
+                    ),
+                )
+        return LegReconciliation(
+            account_index=account_index,
+            order_id=None if order is None else order.order_id,
+            trades=trades,
+            position_before=Decimal("0"),
+            position_after=position_after,
+            order=order,
+            history_complete=history_complete,
+            unknown_reasons=unknown_reasons,
+            dispatched=dispatched,
+        )
+
+    def phase(source, receiver, *, outcome=Outcome.SUCCESS, economics="UNKNOWN"):
+        return SimpleNamespace(
+            outcome=outcome,
+            retryable_pair=False,
+            economic_status=economics,
+            source=source,
+            receiver=receiver,
+        )
+
+    opening = phase(
+        leg(11, position_after=Decimal("0.10")),
+        leg(22, position_after=Decimal("-0.10")),
+    )
+    closing = phase(
+        leg(11, position_after=Decimal("0")),
+        leg(22, position_after=Decimal("0")),
+        outcome=Outcome.UNKNOWN,
+    )
+    assert random_cycle_module._cycle_classifications(
+        opening,
+        closing,
+        (),
+        Decimal("0"),
+        Decimal("0"),
+    )[1] == "CONFIRMED_FLAT"
+
+    no_dispatch = phase(
+        leg(11, position_after=Decimal("0"), dispatched=False),
+        leg(22, position_after=Decimal("0"), dispatched=False),
+    )
+    assert random_cycle_module._cycle_classifications(
+        no_dispatch,
+        None,
+        (),
+        Decimal("0"),
+        Decimal("0"),
+    )[1] == "CONFIRMED_FLAT"
+
+    zero_cancel = phase(
+        leg(11, position_after=Decimal("0"), status="canceled", filled="0"),
+        leg(22, position_after=Decimal("0"), status="canceled", filled="0"),
+        outcome=Outcome.PARTIAL,
+    )
+    assert random_cycle_module._cycle_classifications(
+        zero_cancel,
+        None,
+        (),
+        Decimal("0"),
+        Decimal("0"),
+    )[1] == "CONFIRMED_FLAT"
+
+    live = phase(
+        leg(11, position_after=Decimal("0"), status="open", filled="0", history_complete=False),
+        leg(22, position_after=Decimal("0"), dispatched=False),
+    )
+    assert random_cycle_module._cycle_classifications(
+        live,
+        None,
+        (),
+        Decimal("0"),
+        Decimal("0"),
+    )[1] == "UNKNOWN"
+
+    ambiguous_fallback = FallbackResult(
+        account_index=11,
+        side="SELL",
+        requested_quantity=Decimal("0.10"),
+        attempted=True,
+        outcome=Outcome.UNKNOWN,
+        position_after=Decimal("0"),
+        reconciliation_state="UNKNOWN",
+    )
+    assert random_cycle_module._cycle_classifications(
+        no_dispatch,
+        None,
+        (ambiguous_fallback,),
+        Decimal("0"),
+        Decimal("0"),
+    )[1] == "UNKNOWN"
+
+    output = cli_module.format_random_cycle_result_ru(
+        SimpleNamespace(
+            outcome=Outcome.SUCCESS,
+            inventory="UNKNOWN",
+            paired_execution="SUCCESS",
+            economics="UNKNOWN",
+            remaining_source_position=Decimal("0"),
+            remaining_receiver_position=Decimal("0"),
+            remaining_source_position_observed_at=NOW,
+            remaining_receiver_position_observed_at=NOW,
+            opening=None,
+            closing=None,
+            fallbacks=(),
+            reason=None,
+            journal_path=None,
+            selection=None,
+        )
+    )
+    assert "обе позиции подтверждённо закрыты" not in output
+    assert "flat inventory не подтверждён" in output
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_opening_with_fresh_zero_positions_keeps_inventory_unknown(tmp_path):
+    class AmbiguousOpeningClient(CycleClient):
+        async def submit_order(self, plan):
+            if plan.order_type == "LIMIT" and not plan.reduce_only:
+                self.submissions.append(plan)
+                raise TimeoutError("synthetic response lost after dispatch")
+            return await super().submit_order(plan)
+
+    clock = AdvancingClock()
+    client = AmbiguousOpeningClient(clock)
+    result = await run_random_cycle(
+        cycle_config(tmp_path / "ambiguous-opening"),
+        client,
+        clock=clock,
+        rng=FixedRng(20, 20),
+    )
+
+    assert result.outcome is Outcome.UNKNOWN
+    assert result.inventory == "UNKNOWN"
+    assert result.remaining_source_position == Decimal("0")
+    assert result.remaining_receiver_position == Decimal("0")
+    assert result.remaining_source_position_observed_at is not None
+    assert result.remaining_receiver_position_observed_at is not None
+    assert not [plan for plan in client.submissions if plan.account_index == client.receiver_account_index]
 
 
 def test_cycle_economics_include_fallback_fee_evidence_and_zero_fill_exemption():

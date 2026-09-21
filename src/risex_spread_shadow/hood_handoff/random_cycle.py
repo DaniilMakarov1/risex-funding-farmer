@@ -41,6 +41,7 @@ from .contracts import (
     Phase,
     PreflightBlocked,
     TradeReceipt,
+    TERMINAL_ORDER_STATUSES,
     decimal_to_integer,
 )
 from .engine import (
@@ -1458,6 +1459,62 @@ def _opening_reason(opening: HandoffResult | None) -> str | None:
     return "; ".join(dict.fromkeys(reasons)) or None
 
 
+def _inventory_order_is_terminal(order: Any) -> bool:
+    """Use the order's validated terminal state when proving no live order."""
+
+    terminal = getattr(order, "terminal", None)
+    if isinstance(terminal, bool):
+        return terminal
+    status = getattr(order, "status", None)
+    return isinstance(status, str) and status.strip().lower() in TERMINAL_ORDER_STATUSES
+
+
+def _inventory_leg_is_resolved(leg: Any) -> bool:
+    """Require causal order/history evidence for one final leg state."""
+
+    if leg is None or getattr(leg, "position_after", None) is None:
+        return False
+    if getattr(leg, "unknown_reasons", ()):
+        return False
+    if getattr(leg, "history_complete", False) is not True:
+        return False
+    order = getattr(leg, "order", None)
+    trades = tuple(getattr(leg, "trades", ()) or ())
+    if not getattr(leg, "dispatched", True):
+        # A leg that was never sent is resolved only when the account read
+        # confirms that no order or trade appeared on that path.
+        return order is None and not trades
+    if order is None or not _inventory_order_is_terminal(order):
+        return False
+    if getattr(order, "active", False) is True:
+        return False
+    order_id = getattr(leg, "order_id", None) or getattr(order, "order_id", None)
+    return isinstance(order_id, str) and bool(order_id.strip())
+
+
+def _inventory_phase_is_resolved(phase: Any) -> bool:
+    if phase is None:
+        return False
+    return _inventory_leg_is_resolved(
+        getattr(phase, "source", None)
+    ) and _inventory_leg_is_resolved(getattr(phase, "receiver", None))
+
+
+def _inventory_fallback_is_resolved(fallback: FallbackResult) -> bool:
+    """Accept only bounded terminal/rejected fallback states, independent of fees."""
+
+    if getattr(fallback, "outcome", Outcome.UNKNOWN) == Outcome.UNKNOWN:
+        return False
+    if getattr(fallback, "position_after", None) is None:
+        return False
+    return getattr(fallback, "reconciliation_state", "UNKNOWN") in {
+        "REJECTED",
+        "TERMINAL_ZERO_FILL",
+        "PARTIAL_FILL",
+        "FULL_FILL",
+    }
+
+
 def _cycle_classifications(
     opening: HandoffResult | None,
     closing: HandoffResult | None,
@@ -1470,7 +1527,23 @@ def _cycle_classifications(
     if remaining_source is None or remaining_receiver is None:
         inventory = "UNKNOWN"
     elif remaining_source == 0 and remaining_receiver == 0:
-        inventory = "CONFIRMED_FLAT"
+        phases = [phase for phase in (opening, closing) if phase is not None]
+        causally_resolved = bool(phases) and all(
+            _inventory_phase_is_resolved(phase) for phase in phases
+        )
+        causally_resolved = causally_resolved and all(
+            _inventory_fallback_is_resolved(item) for item in fallbacks
+        )
+        if closing is None and opening is not None and not fallbacks:
+            opening_positions = (
+                getattr(getattr(opening, "source", None), "position_after", None),
+                getattr(getattr(opening, "receiver", None), "position_after", None),
+            )
+            # A successful opening creates exposure.  If no close or fallback
+            # exists, fresh zero reads cannot prove that exposure was resolved.
+            if any(value not in (None, 0) for value in opening_positions):
+                causally_resolved = False
+        inventory = "CONFIRMED_FLAT" if causally_resolved else "UNKNOWN"
     else:
         inventory = "KNOWN_RESIDUAL"
 

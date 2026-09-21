@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import asyncio
+import errno
 import fcntl
 import json
 import os
@@ -42,6 +43,22 @@ _SAFE_ID_KEYS = frozenset(
         "quote_asset_id",
     }
 )
+
+
+def _write_all(fd: int, value: bytes) -> None:
+    """Write one record completely, retrying only an interrupted syscall."""
+
+    offset = 0
+    while offset < len(value):
+        try:
+            written = os.write(fd, value[offset:])
+        except OSError as exc:
+            if isinstance(exc, InterruptedError) or exc.errno == errno.EINTR:
+                continue
+            raise
+        if written <= 0 or written > len(value) - offset:
+            raise OSError("journal write made no progress")
+        offset += written
 
 
 def sanitize(value: Any, *, key: str | None = None) -> Any:
@@ -106,6 +123,7 @@ class DurableJournal:
         self._clock = clock
         self._lock_path = self.path.with_name(self.path.name + ".lock")
         self._lock_fd: int | None = None
+        self._write_failed = False
         self._sequence = self._read_last_sequence()
 
     def _ensure_owned_parent(self) -> None:
@@ -158,8 +176,12 @@ class DurableJournal:
             payload = json.dumps({"pid": os.getpid(), "run_id": self.run_id}, sort_keys=True).encode("utf-8")
             os.ftruncate(fd, 0)
             os.lseek(fd, 0, os.SEEK_SET)
-            os.write(fd, payload)
-            os.fsync(fd)
+            try:
+                _write_all(fd, payload)
+                os.fsync(fd)
+            except BaseException:
+                self._write_failed = True
+                raise
         except Exception:
             try:
                 fcntl.flock(fd, fcntl.LOCK_UN)
@@ -228,6 +250,8 @@ class DurableJournal:
     def append(self, event: str, payload: Mapping[str, Any] | None = None, *, run_id: str | None = None) -> JournalEvent:
         if not isinstance(event, str) or not event.strip():
             raise ValueError("journal event must be non-empty")
+        if self._write_failed:
+            raise RuntimeError("journal write previously failed; refusing further appends")
         resolved_run_id = run_id or self.run_id
         safe_payload = sanitize(dict(payload or {}))
         assert isinstance(safe_payload, dict)
@@ -259,8 +283,15 @@ class DurableJournal:
             if info.st_uid != os.geteuid() or info.st_mode & 0o077:
                 raise RuntimeError("journal must use an owner-only file")
             os.fchmod(fd, 0o600)
-            os.write(fd, encoded)
-            os.fsync(fd)
+            try:
+                _write_all(fd, encoded)
+                os.fsync(fd)
+            except BaseException:
+                # A short/failed append may have left an undecodable suffix.
+                # Preserve that prefix and prevent any later mutation from
+                # treating the journal as a trustworthy append stream.
+                self._write_failed = True
+                raise
         finally:
             os.close(fd)
         try:

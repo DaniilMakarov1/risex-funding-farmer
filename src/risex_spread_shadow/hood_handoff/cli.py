@@ -1135,8 +1135,11 @@ def format_random_cycle_result_ru(
             return f"{label}={text} (время наблюдения UNKNOWN)"
         return f"{label}={text} (время наблюдения {observed_at})"
 
-    if outcome == "SUCCESS":
+    inventory = getattr(result, "inventory", "UNKNOWN")
+    if outcome == "SUCCESS" and inventory == "CONFIRMED_FLAT":
         lines.append("Итог: SUCCESS — обе позиции подтверждённо закрыты.")
+    elif outcome == "SUCCESS":
+        lines.append("Итог: SUCCESS — исполнение завершено, но flat inventory не подтверждён.")
     else:
         may_have_sent = "да или неизвестно" if mutation_boundary else "нет"
         reason = getattr(result, "reason", None) or "результат не подтверждён"
@@ -1147,7 +1150,6 @@ def format_random_cycle_result_ru(
         if journal:
             lines.append(f"Действие: сохранён журнал {journal}; UNKNOWN нельзя трактовать как flat.")
     paired_execution = getattr(result, "paired_execution", "UNKNOWN")
-    inventory = getattr(result, "inventory", "UNKNOWN")
     economics = getattr(result, "economics", "UNKNOWN")
     lines.append(
         "Классификация: "

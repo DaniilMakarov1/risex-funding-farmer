@@ -29,6 +29,7 @@ from risex_spread_shadow.hood_handoff import (
 )
 from risex_spread_shadow.hood_handoff.cli import PromptSecretProvider, _config, main
 from risex_spread_shadow.hood_handoff.engine import HandoffEngine
+from risex_spread_shadow.hood_handoff import journal as journal_module
 
 from test_hood_handoff_engine import FakeClient, FakeClock, make_config
 from test_hood_handoff_sdk_interface import FakeHttp, FakeModule, FakeSigner
@@ -164,6 +165,49 @@ def test_journal_refreshes_sequence_after_a_stale_engine_is_released(tmp_path):
         second.release_attempt()
     events = second.events
     assert [event.sequence for event in events] == [1, 2]
+
+
+def test_journal_completes_short_writes_and_retries_eintr(tmp_path, monkeypatch):
+    path = tmp_path / "evidence" / "short-write.jsonl"
+    journal = DurableJournal(path, run_id="short-write", clock=lambda: 1.0)
+    journal.acquire_attempt()
+    real_write = journal_module.os.write
+    calls = 0
+
+    def short_write(fd, value):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise InterruptedError()
+        return real_write(fd, value[: max(1, len(value) // 2)])
+
+    monkeypatch.setattr(journal_module.os, "write", short_write)
+    try:
+        event = journal.append("SOURCE_DISPATCH_INTENT", {"plan": {"order_id": "safe-id"}})
+    finally:
+        journal.release_attempt()
+
+    assert event.sequence == 1
+    assert journal.events[0].event == "SOURCE_DISPATCH_INTENT"
+    assert calls >= 3
+
+
+@pytest.mark.asyncio
+async def test_journal_intent_write_failure_fails_closed_before_submit(tmp_path, monkeypatch):
+    path = tmp_path / "intent-write-failure.jsonl"
+    real_write = journal_module.os.write
+
+    def fail_intent(fd, value):
+        if b'"event":"SOURCE_DISPATCH_INTENT"' in value:
+            raise OSError("injected intent write failure")
+        return real_write(fd, value)
+
+    monkeypatch.setattr(journal_module.os, "write", fail_intent)
+    client = FakeClient()
+    with pytest.raises(RuntimeError, match="write previously failed"):
+        await run_handoff(make_config(path), client, clock=FakeClock())
+
+    assert client.submissions == []
 
 
 def test_journal_redacts_signed_payload_and_private_key_identifier():
