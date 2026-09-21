@@ -190,68 +190,102 @@ def _trade_timestamp_seconds(value: Any) -> float:
 
 
 class PlainAioHttp:
-    """One-request HTTP helper; deliberately does not import aiohttp-retry."""
+    """Small owned HTTP transport with one reusable connection pool.
+
+    The session is created lazily so importing/constructing the adapter remains
+    credential- and network-free.  Authentication is supplied on each
+    request, and mutation calls continue to disable redirects and retries.
+    """
 
     def __init__(self, base_url: str, *, timeout_seconds: float) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = float(timeout_seconds)
+        self._session: Any | None = None
+        self._session_lock = asyncio.Lock()
+        self._closed = False
+
+    async def _session_for_request(self) -> Any:
+        if self._closed:
+            raise RuntimeError("HTTP transport is closed")
+        session = self._session
+        if session is not None and not bool(getattr(session, "closed", False)):
+            return session
+        try:
+            import aiohttp
+        except ImportError as exc:
+            raise MissingSdkError("aiohttp is required for explicit accountOrders transport") from exc
+        async with self._session_lock:
+            if self._closed:
+                raise RuntimeError("HTTP transport is closed")
+            session = self._session
+            if session is None or bool(getattr(session, "closed", False)):
+                timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
+                session = aiohttp.ClientSession(timeout=timeout)
+                self._session = session
+            return session
 
     async def aclose(self) -> None:
-        """Match the adapter lifecycle; request sessions are already scoped."""
+        """Close the owned session exactly once, including cancellation."""
 
-        return None
+        self._closed = True
+
+        async def detach_and_close() -> None:
+            async with self._session_lock:
+                session, self._session = self._session, None
+            if session is not None:
+                await _await(session.close())
+
+        # Shield the actual close so cancellation of the caller cannot leave
+        # an owned connector behind.  A concurrent/idempotent close simply
+        # detaches no session on its second pass.
+        cleanup = asyncio.create_task(detach_and_close())
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            await asyncio.shield(cleanup)
+            raise
 
     async def close(self) -> None:
         await self.aclose()
 
     async def get(self, path: str, *, params: Mapping[str, Any], authorization: str) -> dict[str, Any]:
-        try:
-            import aiohttp
-        except ImportError as exc:
-            raise MissingSdkError("aiohttp is required for explicit accountOrders transport") from exc
-        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(
-                f"{self.base_url}/{path.lstrip('/')}",
-                params=dict(params),
-                headers={"Authorization": authorization},
-                allow_redirects=False,
-            ) as response:
-                raw = await response.text()
-                try:
-                    payload = json.loads(raw)
-                except json.JSONDecodeError as exc:
-                    raise RuntimeError(f"Lighter response was not JSON (HTTP {response.status})") from exc
-                if response.status < 200 or response.status >= 300:
-                    code = payload.get("code") if isinstance(payload, Mapping) else None
-                    raise RuntimeError(f"Lighter read rejected HTTP {response.status}, code={code}")
-                if not isinstance(payload, Mapping):
-                    raise RuntimeError("Lighter read response is not an object")
-                return dict(payload)
+        session = await self._session_for_request()
+        async with session.get(
+            f"{self.base_url}/{path.lstrip('/')}",
+            params=dict(params),
+            headers={"Authorization": authorization},
+            allow_redirects=False,
+        ) as response:
+            raw = await response.text()
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"Lighter response was not JSON (HTTP {response.status})") from exc
+            if response.status < 200 or response.status >= 300:
+                code = payload.get("code") if isinstance(payload, Mapping) else None
+                raise RuntimeError(f"Lighter read rejected HTTP {response.status}, code={code}")
+            if not isinstance(payload, Mapping):
+                raise RuntimeError("Lighter read response is not an object")
+            return dict(payload)
 
     async def post_form(self, path: str, *, form: Mapping[str, Any]) -> dict[str, Any]:
         """Send exactly one mutation request without aiohttp-retry or SDK REST."""
 
-        try:
-            import aiohttp
-        except ImportError as exc:
-            raise MissingSdkError("aiohttp is required for the explicit mutation transport") from exc
-        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(
-                f"{self.base_url}/{path.lstrip('/')}",
-                data=dict(form),
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                allow_redirects=False,
-            ) as response:
-                raw = await response.text()
-                try:
-                    payload = json.loads(raw)
-                except json.JSONDecodeError as exc:
-                    raise RuntimeError(f"Lighter mutation response was not JSON (HTTP {response.status})") from exc
-                if not isinstance(payload, Mapping):
-                    raise RuntimeError("Lighter mutation response is not an object")
-                return {**dict(payload), "_http_status": response.status}
+        session = await self._session_for_request()
+        async with session.post(
+            f"{self.base_url}/{path.lstrip('/')}",
+            data=dict(form),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            allow_redirects=False,
+        ) as response:
+            raw = await response.text()
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"Lighter mutation response was not JSON (HTTP {response.status})") from exc
+            if not isinstance(payload, Mapping):
+                raise RuntimeError("Lighter mutation response is not an object")
+            return {**dict(payload), "_http_status": response.status}
 
 
 class LighterSdkClient:
@@ -591,6 +625,10 @@ class LighterSdkClient:
         )
         raw_account_mapping = _model_dict(raw_account)
         _require_success_code(raw_account_mapping, "account")
+        # Capture the account/balance/position observation at the account
+        # response boundary.  Active-orders is a separate sequential read and
+        # must not renew the age of this state.
+        account_observed_at = self._clock()
         account = _first_mapping(raw_account, "accounts")
         if not {"index", "l1_address", "status", "positions", "available_balance"}.issubset(account):
             raise ContractError("Lighter account response is missing required identity/state fields")
@@ -615,16 +653,23 @@ class LighterSdkClient:
                 candidate_market_id = int(candidate_map["market_id"])
             except (TypeError, ValueError) as exc:
                 raise ContractError("Lighter account position has invalid market identity") from exc
+            if "market_index" in candidate_map:
+                try:
+                    candidate_market_index = int(candidate_map["market_index"])
+                except (TypeError, ValueError) as exc:
+                    raise ContractError("Lighter account position has invalid market identity") from exc
+                if candidate_market_index != candidate_market_id:
+                    raise ContractError("Lighter account position has conflicting market identity")
             if candidate_market_id == market_id:
                 if "position" not in candidate_map or "sign" not in candidate_map:
                     raise ContractError("Lighter account position lacks required sign/position fields")
+                if position is not None:
+                    raise ContractError("Lighter account response has duplicate selected-market positions")
                 position = candidate_map
-                break
         position = position or {"position": "0", "sign": 1}
         active_orders = await self._active_orders(account_index, market_id)
         available = account.get("available_balance")
         margin_required = account.get("cross_initial_margin_requirement")
-        now = self._clock()
         fee_rate_key = "source_fee_rate" if account_index == self.source_account_index else "receiver_fee_rate"
         incremental_key = (
             "source_incremental_margin_required"
@@ -657,7 +702,7 @@ class LighterSdkClient:
                 "position": position.get("position", "0"),
                 "sign": position.get("sign", 1),
                 "active_orders": active_orders,
-                "observed_at": now,
+                "observed_at": account_observed_at,
                 "authorized": True,
                 "ready": ready,
                 "margin_available": available,
@@ -935,6 +980,11 @@ class LighterSdkClient:
         signer = self._signer(plan.account_index)
         key_index = self.config.api_key_index
         assert key_index is not None
+        # Local nonce/signing/deadline failures are known pre-send failures and
+        # retain the established rejected receipt.  The send boundary is kept
+        # outside this handler: once bytes may have reached sendTx, a timeout,
+        # malformed response or transport exception is execution-unknown and
+        # must propagate to the cycle's reconciliation barrier.
         try:
             deadline = plan.mutation_deadline_monotonic
             if deadline is None:
@@ -973,21 +1023,23 @@ class LighterSdkClient:
                 return MutationReceipt(False, None, _safe_text(tx_hash), sanitize_exception(ValueError(str(error))))
             if time.monotonic() >= deadline:
                 raise TimeoutError("order signing crossed the final mutation barrier")
-            response = await self._bounded(
-                self._send_signed_tx(tx_type, tx_info),
-                deadline,
-                "order dispatch",
-            )
-            code = _response_code(response)
-            return MutationReceipt(
-                accepted=code == 200,
-                order_id=None,
-                tx_hash=_safe_text(tx_hash) or _safe_text(_model_dict(response).get("tx_hash")),
-                error=None if code == 200 else f"send_tx response code {code}",
-                response_code=code,
-            )
         except Exception as exc:
             return MutationReceipt(False, None, None, sanitize_exception(exc))
+        response = await self._bounded(
+            self._send_signed_tx(tx_type, tx_info),
+            deadline,
+            "order dispatch",
+        )
+        code = _response_code(response)
+        if code is None:
+            raise RuntimeError("malformed or undecidable sendTx response")
+        return MutationReceipt(
+            accepted=code == 200,
+            order_id=None,
+            tx_hash=_safe_text(tx_hash) or _safe_text(_model_dict(response).get("tx_hash")),
+            error=None if code == 200 else f"send_tx response code {code}",
+            response_code=code,
+        )
 
     async def cancel_order(self, account_index: int, market_id: int, order_id: str) -> MutationReceipt:
         deadline = self._pending_mutation_deadline
@@ -995,6 +1047,10 @@ class LighterSdkClient:
         signer = self._signer(account_index)
         key_index = self.config.api_key_index
         assert key_index is not None
+        # As with submit_order, keep known pre-send failures as a rejected
+        # local receipt while allowing every post-send uncertainty to reach the
+        # caller.  The caller then preserves unresolved execution and performs
+        # only its bounded read-only reconciliation/cleanup.
         try:
             if deadline is None:
                 deadline = time.monotonic() + min(
@@ -1025,31 +1081,53 @@ class LighterSdkClient:
                 return MutationReceipt(False, order_id, _safe_text(tx_hash), sanitize_exception(ValueError(str(error))))
             if time.monotonic() >= deadline:
                 raise TimeoutError("cancel signing crossed the final mutation barrier")
-            response = await self._bounded(
-                self._send_signed_tx(tx_type, tx_info),
-                deadline,
-                "cancel dispatch",
-            )
-            code = _response_code(response)
-            return MutationReceipt(
-                accepted=code == 200,
-                order_id=order_id,
-                tx_hash=_safe_text(tx_hash) or _safe_text(_model_dict(response).get("tx_hash")),
-                error=None if code == 200 else f"send_tx response code {code}",
-                response_code=code,
-            )
         except Exception as exc:
             return MutationReceipt(False, order_id, None, sanitize_exception(exc))
+        response = await self._bounded(
+            self._send_signed_tx(tx_type, tx_info),
+            deadline,
+            "cancel dispatch",
+        )
+        code = _response_code(response)
+        if code is None:
+            raise RuntimeError("malformed or undecidable sendTx response")
+        return MutationReceipt(
+            accepted=code == 200,
+            order_id=order_id,
+            tx_hash=_safe_text(tx_hash) or _safe_text(_model_dict(response).get("tx_hash")),
+            error=None if code == 200 else f"send_tx response code {code}",
+            response_code=code,
+        )
 
 def _response_code(value: Any) -> int | None:
     mapping = _model_dict(value)
-    code = mapping.get("code", mapping.get("_http_status"))
-    if code is None:
+    # A transport HTTP status is not an application-level sendTx outcome.  A
+    # body code is mandatory; without it, or when a proxy/server 5xx conflicts
+    # with a nominal body success, the wire result remains undecidable.
+    code = mapping.get("code")
+    if code is None or isinstance(code, bool):
         return None
-    try:
-        return int(code)
-    except (TypeError, ValueError):
+    if isinstance(code, int):
+        numeric = code
+    elif isinstance(code, str) and re.fullmatch(r"[0-9]+", code.strip()):
+        numeric = int(code.strip())
+    else:
         return None
+    status = mapping.get("_http_status")
+    if status is not None:
+        if isinstance(status, bool):
+            return None
+        if isinstance(status, int):
+            http_status = status
+        elif isinstance(status, str) and re.fullmatch(r"[0-9]+", status.strip()):
+            http_status = int(status.strip())
+        else:
+            return None
+        if http_status >= 500:
+            return None
+        if http_status != 200 and numeric == 200:
+            return None
+    return numeric
 
 
 def _require_success_code(payload: Mapping[str, Any], label: str) -> None:
