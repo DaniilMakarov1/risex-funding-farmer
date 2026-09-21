@@ -1,5 +1,15 @@
 # Current status
 
+## HCR-22 — COMPLETE; exact paired priority guard accepted offline
+
+The owner resumed HCR-22 on 2026-09-21. Correction candidate `09c9204b3f8034199ad277b6ed9da1dace1e8624` was independently reviewed and accepted, then integrated as Chief commits `754b993` and `518ba09`. Preserved Builder checkpoint `3c20b9dc62d06afa614762daf038ed1234286a6a` and the earlier candidate remain available; the Builder stays stopped and archived.
+
+Paired opening and closing now require a fresh two-sided public book, the exact active zero-fill POST_ONLY source order, exact owner/order/client/market/side/price/remaining identity, and no external better or unproved same-price priority before receiver dispatch. Missing, stale, future, malformed, anonymous, foreign or conflicting evidence is UNKNOWN; better-priced external volume is LOST. Both states forbid the receiver, permit cancellation only of the exact source identity, and allow a fresh pair attempt only after complete terminal zero-fill reconciliation at original positions. Opening and closing share the owner-approved maximum of three complete attempts with preparation, retain the sampled quantity/hold, and use fresh books and identities.
+
+Chief affected integration/adverse suite: `181 passed`. Chief clean isolated Python 3.11.5 full suite on the exact correction tree: `4620 passed, 3 skipped`, exit 0 in 133.79 seconds. The two immutable cycle-004 journals retained their exact hashes and sizes. Five synthetic trials with 80 ms account reads and a 120 ms book read measured median concurrent pre-receiver checks at 124.3 ms and median full pre-receiver checks at 126.2 ms, against a 200 ms sequential delay reference. This is not live latency evidence.
+
+The live venue `orderBookOrders` payload and owner binding remain unconfirmed; unavailable exact owner-bound evidence fails closed. No live validation, network/account read, Keychain access, order, cancellation or other financial mutation was performed for HCR-22.
+
 ## HCR-21 — COMPLETE; accepted and installed
 
 Accepted candidate `d3f98e6b21a6059a2dfbb62cb8e2e507cc1819bf`, based on preserved candidate `ff5309110fe8d27b32100d6287978eb94b7ff522`, is integrated by merge `0c886856b484e0a662ddb9f850be9219da75d271`. Alternate rejected candidate `a4037fa8126912dad000b8bdc7d365a2bb5fde60` remains preserved. The implementation recognizes the exact cycle-003 terminal zero-fill IOC, retains strict identity/mismatch evidence, preserves UNKNOWN mutation barriers, continues only known residuals with fresh bounds, and reports receiver/fallback/position observation facts explicitly. No policy, slippage, quantity, minimum or retry-cap change was made.

@@ -505,6 +505,10 @@ class RandomCycleSelection:
     bounds: RandomQuantityBounds
     metadata_observed_at: float
     book_observed_at: float
+    best_bid_price: Decimal | None = None
+    best_bid_quantity: Decimal | None = None
+    best_ask_price: Decimal | None = None
+    best_ask_quantity: Decimal | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -516,6 +520,12 @@ class RandomCycleSelection:
             "bounds": self.bounds.as_dict(),
             "metadata_observed_at": self.metadata_observed_at,
             "book_observed_at": self.book_observed_at,
+            "bbo": {
+                "bid_price": None if self.best_bid_price is None else format(self.best_bid_price, "f"),
+                "bid_quantity": None if self.best_bid_quantity is None else format(self.best_bid_quantity, "f"),
+                "ask_price": None if self.best_ask_price is None else format(self.best_ask_price, "f"),
+                "ask_quantity": None if self.best_ask_quantity is None else format(self.best_ask_quantity, "f"),
+            },
         }
 
 
@@ -567,6 +577,10 @@ class RandomCycleResult:
     opening_reason: str | None = None
     reason: str | None = None
     journal_path: str | None = None
+    paired_execution: str = "UNKNOWN"
+    inventory: str = "UNKNOWN"
+    economics: str = "UNKNOWN"
+    latency: Mapping[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -592,6 +606,15 @@ class RandomCycleResult:
             "opening_reason": self.opening_reason,
             "reason": self.reason,
             "journal_path": self.journal_path,
+            "paired_execution": self.paired_execution,
+            "inventory": self.inventory,
+            "economics": self.economics,
+            "classifications": {
+                "paired_execution": self.paired_execution,
+                "inventory": self.inventory,
+                "economics": self.economics,
+            },
+            "latency": None if self.latency is None else dict(self.latency),
         }
 
 
@@ -609,6 +632,24 @@ class _AccountIdentityFailure(ContractError):
 
 class _RetryablePreparationFailure(PreflightBlocked):
     """A bounded read/preparation failure that may become valid on refresh."""
+
+
+@dataclass(slots=True)
+class _PairAttemptBudget:
+    """One shared lineage budget for preparation and source placements."""
+
+    limit: int = MAX_PREPARATION_ATTEMPTS
+    used: int = 0
+
+    @property
+    def available(self) -> bool:
+        return self.used < self.limit
+
+    def consume(self) -> int:
+        if not self.available:
+            raise PreflightBlocked(f"shared pair-attempt budget exhausted ({self.used}/{self.limit})")
+        self.used += 1
+        return self.used
 
 
 def _coerce_cycle_account(
@@ -968,6 +1009,14 @@ def _client_order_index(run_id: str, leg: str) -> int:
     return value or 1
 
 
+def _child_journal_path(path: Path, attempt_index: int) -> Path:
+    """Keep the first legacy child name while making later attempts immutable."""
+
+    if attempt_index == 1:
+        return path
+    return path.with_name(f"{path.stem}-attempt-{attempt_index:03d}{path.suffix}")
+
+
 def _inverse(direction: Direction) -> Direction:
     return Direction.SHORT if direction is Direction.LONG else Direction.LONG
 
@@ -1124,6 +1173,101 @@ def _opening_reason(opening: HandoffResult | None) -> str | None:
     ):
         reasons.append("source fill observed before receiver dispatch")
     return "; ".join(reasons) or None
+
+
+def _cycle_classifications(
+    opening: HandoffResult | None,
+    closing: HandoffResult | None,
+    fallbacks: Sequence[FallbackResult],
+    remaining_source: Decimal | None,
+    remaining_receiver: Decimal | None,
+) -> tuple[str, str, str]:
+    """Keep execution, inventory, and economics independent at the terminal boundary."""
+
+    if remaining_source is None or remaining_receiver is None:
+        inventory = "UNKNOWN"
+    elif remaining_source == 0 and remaining_receiver == 0:
+        inventory = "CONFIRMED_FLAT"
+    else:
+        inventory = "KNOWN_RESIDUAL"
+
+    phases = [phase for phase in (opening, closing) if phase is not None]
+    if not phases:
+        paired_execution = "UNKNOWN"
+    elif (
+        opening is not None
+        and opening.source is not None
+        and opening.receiver is not None
+        and opening.receiver.dispatched
+        and opening.receiver.filled_quantity > 0
+        and opening.source.filled_quantity == 0
+        and opening.joint_match_status != "MATCHED"
+    ):
+        # Historical cycle-004 shape: the receiver found an external maker
+        # while the source maker stayed zero-fill/canceled.  A later fallback
+        # may flatten inventory, but that does not turn the intended pair into
+        # a successful paired execution.
+        paired_execution = "FAILED"
+    elif opening is None or opening.outcome is not Outcome.SUCCESS:
+        if opening is not None and opening.retryable_pair:
+            paired_execution = "FAILED"
+        elif opening is not None and opening.outcome is Outcome.PARTIAL:
+            paired_execution = "PARTIAL"
+        elif opening is not None and opening.outcome is Outcome.FAILED_PREFLIGHT_BLOCKED:
+            paired_execution = "FAILED"
+        else:
+            paired_execution = "UNKNOWN"
+    elif closing is None:
+        paired_execution = "UNKNOWN"
+    elif closing.outcome is Outcome.SUCCESS and not fallbacks:
+        paired_execution = "SUCCESS"
+    elif closing.outcome is Outcome.SUCCESS:
+        paired_execution = "PARTIAL"
+    elif closing.retryable_pair:
+        paired_execution = "FAILED"
+    elif closing.outcome is Outcome.PARTIAL:
+        paired_execution = "PARTIAL"
+    elif closing.outcome is Outcome.FAILED_PREFLIGHT_BLOCKED:
+        paired_execution = "FAILED"
+    else:
+        paired_execution = "UNKNOWN"
+
+    if not phases or any(phase.economic_status == "UNKNOWN" for phase in phases):
+        economics = "UNKNOWN"
+    elif all(phase.economic_status == "PROVEN" for phase in phases):
+        economics = "KNOWN"
+    else:
+        economics = "UNKNOWN"
+    return paired_execution, inventory, economics
+
+
+def _cycle_latency(
+    opening: HandoffResult | None,
+    closing: HandoffResult | None,
+) -> dict[str, Any] | None:
+    payload: dict[str, Any] = {}
+    if opening is not None and opening.latency is not None:
+        payload["opening"] = dict(opening.latency)
+    if closing is not None and closing.latency is not None:
+        payload["closing"] = dict(closing.latency)
+    return payload or None
+
+
+def _with_cycle_classifications(result: RandomCycleResult) -> RandomCycleResult:
+    paired_execution, inventory, economics = _cycle_classifications(
+        result.opening,
+        result.closing,
+        result.fallbacks,
+        result.remaining_source_position,
+        result.remaining_receiver_position,
+    )
+    return replace(
+        result,
+        paired_execution=paired_execution,
+        inventory=inventory,
+        economics=economics,
+        latency=_cycle_latency(result.opening, result.closing),
+    )
 
 
 def _is_retryable_preparation_error(exc: BaseException) -> bool:
@@ -1332,10 +1476,19 @@ class RandomCycleEngine:
             bounds=bounds,
             metadata_observed_at=metadata.observed_at,
             book_observed_at=book.observed_at,
+            best_bid_price=book.bids[0].price,
+            best_bid_quantity=book.bids[0].quantity,
+            best_ask_price=book.asks[0].price,
+            best_ask_quantity=book.asks[0].quantity,
         )
         self._selection = selection
         journal.append("SELECTION_PROVED", {"selection": selection.as_dict(), "metadata": _metadata_payload(metadata), "book_observed_at": book.observed_at})
 
+        pair_budget = _PairAttemptBudget()
+        initial_metadata = metadata
+        initial_book = book
+        initial_source = source
+        initial_receiver = receiver
         prepared = await self._prepare_open_with_retries(
             config,
             journal,
@@ -1344,43 +1497,101 @@ class RandomCycleEngine:
             book,
             source,
             receiver,
+            pair_budget,
         )
         if isinstance(prepared, RandomCycleResult):
-            return prepared
+            return _with_cycle_classifications(prepared)
         metadata, book, source, receiver, selection = prepared
         self._selection = selection
-        opening_config = self._handoff_config(
-            config,
-            selection.quantity,
-            selection.opening_source_price,
-            selection.opening_receiver_bound,
-            config.opening_journal_path,
-            OperationMode.PAIRED_OPENING,
-            source.signed_position,
-            receiver.signed_position,
-        )
-        journal.append("OPENING_PLAN_READY", {"config": opening_config_binding(opening_config), "selection": selection.as_dict()})
-        journal.append(
-            "FIRST_MUTATION_BOUNDARY",
-            {
-                "message": "opening handoff admitted; later order state is authoritative only from opening.jsonl",
-                "selection": selection.as_dict(),
-            },
-        )
-        self._stage = "OPENING"
-        opening = await run_handoff(
-            opening_config,
-            _BoundMarketClient(
-                self.client,
-                metadata,
-                source_identity=source.source_identity,
-                receiver_identity=receiver.source_identity,
-                identity_failure_callback=self._mark_identity_failure,
-            ),
-            clock=self.clock,
-        )
-        self._stage = "OPENING_RECONCILED"
-        journal.append("OPENING_COMPLETE", {"result": opening.as_dict()})
+        opening_preparation_result: RandomCycleResult | None = None
+        while True:
+            attempt_index = pair_budget.used
+            opening_path = _child_journal_path(config.opening_journal_path, attempt_index)
+            opening_config = self._handoff_config(
+                config,
+                selection.quantity,
+                selection.opening_source_price,
+                selection.opening_receiver_bound,
+                opening_path,
+                OperationMode.PAIRED_OPENING,
+                source.signed_position,
+                receiver.signed_position,
+                attempt_index=attempt_index,
+            )
+            journal.append(
+                "OPENING_PLAN_READY",
+                {
+                    "config": opening_config_binding(opening_config),
+                    "selection": selection.as_dict(),
+                    "attempt": attempt_index,
+                    "lineage": {"used": pair_budget.used, "limit": pair_budget.limit},
+                },
+            )
+            journal.append(
+                "FIRST_MUTATION_BOUNDARY",
+                {
+                    "message": "opening handoff admitted; later order state is authoritative only from its immutable child journal",
+                    "selection": selection.as_dict(),
+                    "attempt": attempt_index,
+                    "journal_path": opening_config.journal_path,
+                },
+            )
+            self._stage = "OPENING"
+            opening = await run_handoff(
+                opening_config,
+                _BoundMarketClient(
+                    self.client,
+                    metadata,
+                    source_identity=source.source_identity,
+                    receiver_identity=receiver.source_identity,
+                    identity_failure_callback=self._mark_identity_failure,
+                ),
+                clock=self.clock,
+            )
+            self._stage = "OPENING_RECONCILED"
+            journal.append(
+                "OPENING_COMPLETE",
+                {"result": opening.as_dict(), "attempt": attempt_index, "journal_path": opening_config.journal_path},
+            )
+            if not opening.retryable_pair:
+                break
+            if not pair_budget.available:
+                journal.append(
+                    "PAIR_ATTEMPT_EXHAUSTED",
+                    {
+                        "phase": "PAIRED_OPENING",
+                        "attempt": attempt_index,
+                        "maximum_attempts": pair_budget.limit,
+                        "reason": "safe zero-fill guard retry exhausted",
+                    },
+                )
+                break
+            journal.append(
+                "PAIR_ATTEMPT_RETRY",
+                {
+                    "phase": "PAIRED_OPENING",
+                    "from_attempt": attempt_index,
+                    "next_attempt": pair_budget.used + 1,
+                    "reason": opening.reason,
+                    "guard": opening.priority_guard,
+                    "lineage": {"used": pair_budget.used, "limit": pair_budget.limit},
+                },
+            )
+            retry_prepared = await self._prepare_open_with_retries(
+                config,
+                journal,
+                selection,
+                initial_metadata,
+                initial_book,
+                initial_source,
+                initial_receiver,
+                pair_budget,
+            )
+            if isinstance(retry_prepared, RandomCycleResult):
+                opening_preparation_result = retry_prepared
+                break
+            metadata, book, source, receiver, selection = retry_prepared
+            self._selection = selection
         if opening.outcome is not Outcome.SUCCESS:
             fallbacks, remaining_source, remaining_receiver = await self._fallback_residuals(
                 config,
@@ -1402,9 +1613,13 @@ class RandomCycleEngine:
                 opening,
                 None,
                 fallbacks,
-                "paired opening did not prove a complete cycle",
+                (
+                    opening_preparation_result.reason
+                    if opening_preparation_result is not None
+                    else "paired opening did not prove a complete cycle"
+                ),
             )
-            result = RandomCycleResult(
+            result = _with_cycle_classifications(RandomCycleResult(
                 outcome=outcome,
                 phase=Phase.COMPLETE,
                 run_id=journal.run_id,
@@ -1418,7 +1633,7 @@ class RandomCycleEngine:
                 opening_reason=_opening_reason(opening),
                 reason=reason,
                 journal_path=str(config.journal_path),
-            )
+            ))
             journal.append("CYCLE_COMPLETE", result.as_dict())
             return result
 
@@ -1430,7 +1645,7 @@ class RandomCycleEngine:
             await self._wait_hold(selection.hold_seconds, anchor_mono)
         except Exception as exc:
             reason = f"hold timer could not reach its persisted deadline: {sanitize_exception(exc)}"
-            result = RandomCycleResult(
+            result = _with_cycle_classifications(RandomCycleResult(
                 outcome=Outcome.UNKNOWN,
                 phase=Phase.RECONCILIATION,
                 run_id=journal.run_id,
@@ -1439,7 +1654,7 @@ class RandomCycleEngine:
                 opening_reason=_opening_reason(opening),
                 reason=reason,
                 journal_path=str(config.journal_path),
-            )
+            ))
             journal.append("CYCLE_COMPLETE", result.as_dict())
             return result
 
@@ -1502,7 +1717,7 @@ class RandomCycleEngine:
             )
             or "cycle closure did not prove exact flat positions"
         )
-        result = RandomCycleResult(
+        result = _with_cycle_classifications(RandomCycleResult(
             outcome=outcome,
             phase=Phase.COMPLETE,
             run_id=journal.run_id,
@@ -1517,7 +1732,7 @@ class RandomCycleEngine:
             opening_reason=_opening_reason(opening),
             reason=reason,
             journal_path=str(config.journal_path),
-        )
+        ))
         journal.append("CYCLE_COMPLETE", result.as_dict())
         return result
 
@@ -1612,8 +1827,9 @@ class RandomCycleEngine:
         book: OrderBookSnapshot,
         source: AccountSnapshot,
         receiver: AccountSnapshot,
+        budget: _PairAttemptBudget,
     ) -> tuple[MarketMetadata, OrderBookSnapshot, AccountSnapshot, AccountSnapshot, RandomCycleSelection] | RandomCycleResult:
-        """Refresh all pre-mutation facts at most three times.
+        """Refresh all pre-mutation facts inside the shared pair budget.
 
         The first quantity/hold draw is already proved in ``selection``.  A
         fresh quote may replace only the prices and admissible bounds; it may
@@ -1628,12 +1844,15 @@ class RandomCycleEngine:
         initial_source = source
         initial_receiver = receiver
         current_selection = selection
-        for attempt in range(1, MAX_PREPARATION_ATTEMPTS + 1):
+        while budget.available:
+            attempt = budget.consume()
             journal.append(
                 "PREPARATION_ATTEMPT",
                 {
                     "attempt": attempt,
-                    "maximum_attempts": MAX_PREPARATION_ATTEMPTS,
+                    "maximum_attempts": budget.limit,
+                    "budget_used": budget.used,
+                    "budget_remaining": budget.limit - budget.used,
                     "selected_quantity": format(current_selection.quantity, "f"),
                     "selected_quantity_tick": current_selection.quantity_tick,
                     "selected_hold_seconds": current_selection.hold_seconds,
@@ -1661,14 +1880,16 @@ class RandomCycleEngine:
                         "reason": reason,
                     },
                 )
-                if retryable and attempt < MAX_PREPARATION_ATTEMPTS:
+                if retryable and budget.available:
                     journal.append(
                         "PREPARATION_RETRY",
                         {
                             "attempt": attempt,
-                            "next_attempt": attempt + 1,
+                            "next_attempt": budget.used + 1,
                             "reason": reason,
                             "delay_seconds": config.poll_interval_seconds,
+                            "budget_used": budget.used,
+                            "budget_remaining": budget.limit - budget.used,
                         },
                     )
                     await self.clock.sleep(config.poll_interval_seconds)
@@ -1677,24 +1898,26 @@ class RandomCycleEngine:
                     "PREPARATION_EXHAUSTED" if retryable else "PREPARATION_BLOCKED",
                     {
                         "attempt": attempt,
-                        "maximum_attempts": MAX_PREPARATION_ATTEMPTS,
+                        "maximum_attempts": budget.limit,
+                        "budget_used": budget.used,
+                        "budget_remaining": budget.limit - budget.used,
                         "reason": reason,
                         "retryable": retryable,
                     },
                 )
                 terminal_reason = (
-                    f"opening preparation exhausted after {attempt} attempts: {reason}"
+                    f"opening shared pair-attempt budget exhausted after {attempt}/{budget.limit}: {reason}"
                     if retryable
                     else f"opening preparation blocked: {reason}"
                 )
-                result = RandomCycleResult(
+                result = _with_cycle_classifications(RandomCycleResult(
                     outcome=Outcome.FAILED_PREFLIGHT_BLOCKED,
                     phase=Phase.PREFLIGHT,
                     run_id=journal.run_id,
                     selection=current_selection,
                     reason=terminal_reason,
                     journal_path=str(config.journal_path),
-                )
+                ))
                 journal.append("CYCLE_PREFLIGHT_BLOCKED", result.as_dict())
                 return result
 
@@ -1731,7 +1954,7 @@ class RandomCycleEngine:
             )
             return prepared_metadata, prepared_book, prepared_source, prepared_receiver, refreshed_selection
 
-        raise AssertionError("preparation loop returned without a terminal result")
+        raise AssertionError("shared pair-attempt budget returned without a terminal result")
 
     async def _revalidate_open(
         self,
@@ -1774,6 +1997,10 @@ class RandomCycleEngine:
             bounds=refreshed_bounds,
             metadata_observed_at=metadata.observed_at,
             book_observed_at=book.observed_at,
+            best_bid_price=book.bids[0].price,
+            best_bid_quantity=book.bids[0].quantity,
+            best_ask_price=book.asks[0].price,
+            best_ask_quantity=book.asks[0].quantity,
         )
         return metadata, book, source, receiver, refreshed_selection
 
@@ -1787,7 +2014,12 @@ class RandomCycleEngine:
         operation_mode: OperationMode,
         source_position: Decimal,
         receiver_position: Decimal,
+        *,
+        attempt_index: int = 1,
     ) -> HandoffConfig:
+        child_prefix = config.client_order_prefix
+        if attempt_index != 1:
+            child_prefix = f"{child_prefix}-{operation_mode.value.lower()}-{attempt_index:03d}"
         return HandoffConfig(
             market_id=config.market_id,
             market_symbol=config.market_symbol,
@@ -1802,7 +2034,7 @@ class RandomCycleEngine:
             poll_interval_seconds=config.poll_interval_seconds,
             max_poll_count=config.max_poll_count,
             source_order_lifetime_seconds=config.source_order_lifetime_seconds,
-            client_order_prefix=config.client_order_prefix,
+            client_order_prefix=child_prefix,
             journal_path=str(journal_path),
             environment=config.environment,
             operator_execution_opt_in=True,
@@ -1812,6 +2044,7 @@ class RandomCycleEngine:
             chain_id=config.chain_id,
             auth_token_lifetime_seconds=config.auth_token_lifetime_seconds,
             operation_mode=operation_mode,
+            attempt_index=attempt_index,
             expected_source_position=source_position,
             expected_receiver_position=receiver_position,
             # A reduce-only close does not add exposure.  The existing config
@@ -1861,59 +2094,119 @@ class RandomCycleEngine:
                 or opening_receiver.unknown_reasons
             ):
                 return blocked("opening reconciliation is incomplete for a dependent close")
-            metadata = _as_market(await self._bounded(self.client.market_metadata(config.market_id), config, "closing market read"))
-            book = _as_book(await self._bounded(self._order_book(config.market_id), config, "closing order book read"), metadata)
-            now = self.clock.now()
-            _validate_market_book(config, metadata, book, now)
-            try:
-                source, receiver = await self._accounts(config, now)
-            except _AccountIdentityFailure:
-                self._mark_identity_failure("closing account identity/read validation failed")
-                raise
-            if source.source_identity != opening_plan.source_identity:
-                self._mark_identity_failure("source account identity changed during the holding period")
-                return blocked("source account identity changed during the holding period")
-            if receiver.source_identity != opening_plan.receiver_identity:
-                self._mark_identity_failure("receiver account identity changed during the holding period")
-                return blocked("receiver account identity changed during the holding period")
-            if source.signed_position != opening_source.position_after:
-                return blocked("source position changed during the holding period")
-            if receiver.signed_position != opening_receiver.position_after:
-                return blocked("receiver position changed during the holding period")
-            source_sign, receiver_sign = _expected_cycle_signs(config.direction)
-            source_residual = _position_residual(source.signed_position, source_sign, selection.quantity)
-            receiver_residual = _position_residual(receiver.signed_position, receiver_sign, selection.quantity)
-            if source_residual is None or receiver_residual is None:
-                return blocked("cycle position changed direction or exceeded the selected quantity before paired close")
-            paired_quantity = min(source_residual, receiver_residual)
-            if paired_quantity <= 0:
-                return blocked("paired close has no two-account confirmed residual")
-            close_direction = _inverse(config.direction)
-            proposal = select_automatic_prices(close_direction, metadata, book, quantity=paired_quantity, now=now, freshness_seconds=config.freshness_seconds)
-            close_config = self._handoff_config(
-                config,
-                paired_quantity,
-                proposal.source_limit_price,
-                proposal.receiver_worst_price,
-                config.closing_journal_path,
-                OperationMode.PAIRED_CLOSING,
-                opening_source.position_after,
-                opening_receiver.position_after,
-            )
-            journal.append("CLOSING_PLAN_READY", {"config": opening_config_binding(close_config), "paired_quantity": format(paired_quantity, "f")})
-            closing = await run_handoff(
-                close_config,
-                _BoundMarketClient(
-                    self.client,
+            budget = _PairAttemptBudget()
+            while budget.available:
+                attempt_index = budget.consume()
+                metadata = _as_market(
+                    await self._bounded(
+                        self.client.market_metadata(config.market_id),
+                        config,
+                        "closing market read",
+                    )
+                )
+                book = _as_book(
+                    await self._bounded(self._order_book(config.market_id), config, "closing order book read"),
                     metadata,
-                    source_identity=opening_plan.source_identity,
-                    receiver_identity=opening_plan.receiver_identity,
-                    identity_failure_callback=self._mark_identity_failure,
-                ),
-                clock=self.clock,
-            )
-            journal.append("CLOSING_COMPLETE", {"result": closing.as_dict()})
-            return closing, None
+                )
+                now = self.clock.now()
+                _validate_market_book(config, metadata, book, now)
+                try:
+                    source, receiver = await self._accounts(config, now)
+                except _AccountIdentityFailure:
+                    self._mark_identity_failure("closing account identity/read validation failed")
+                    raise
+                if source.source_identity != opening_plan.source_identity:
+                    self._mark_identity_failure("source account identity changed during the holding period")
+                    return blocked("source account identity changed during the holding period")
+                if receiver.source_identity != opening_plan.receiver_identity:
+                    self._mark_identity_failure("receiver account identity changed during the holding period")
+                    return blocked("receiver account identity changed during the holding period")
+                if source.signed_position != opening_source.position_after:
+                    return blocked("source position changed during the holding period")
+                if receiver.signed_position != opening_receiver.position_after:
+                    return blocked("receiver position changed during the holding period")
+                source_sign, receiver_sign = _expected_cycle_signs(config.direction)
+                source_residual = _position_residual(source.signed_position, source_sign, selection.quantity)
+                receiver_residual = _position_residual(receiver.signed_position, receiver_sign, selection.quantity)
+                if source_residual is None or receiver_residual is None:
+                    return blocked("cycle position changed direction or exceeded the selected quantity before paired close")
+                paired_quantity = min(source_residual, receiver_residual)
+                if paired_quantity <= 0:
+                    return blocked("paired close has no two-account confirmed residual")
+                close_direction = _inverse(config.direction)
+                proposal = select_automatic_prices(
+                    close_direction,
+                    metadata,
+                    book,
+                    quantity=paired_quantity,
+                    now=now,
+                    freshness_seconds=config.freshness_seconds,
+                )
+                close_config = self._handoff_config(
+                    config,
+                    paired_quantity,
+                    proposal.source_limit_price,
+                    proposal.receiver_worst_price,
+                    _child_journal_path(config.closing_journal_path, attempt_index),
+                    OperationMode.PAIRED_CLOSING,
+                    opening_source.position_after,
+                    opening_receiver.position_after,
+                    attempt_index=attempt_index,
+                )
+                journal.append(
+                    "CLOSING_PLAN_READY",
+                    {
+                        "config": opening_config_binding(close_config),
+                        "paired_quantity": format(paired_quantity, "f"),
+                        "attempt": attempt_index,
+                        "lineage": {"used": budget.used, "limit": budget.limit},
+                    },
+                )
+                closing = await run_handoff(
+                    close_config,
+                    _BoundMarketClient(
+                        self.client,
+                        metadata,
+                        source_identity=opening_plan.source_identity,
+                        receiver_identity=opening_plan.receiver_identity,
+                        identity_failure_callback=self._mark_identity_failure,
+                    ),
+                    clock=self.clock,
+                )
+                journal.append(
+                    "CLOSING_COMPLETE",
+                    {
+                        "result": closing.as_dict(),
+                        "attempt": attempt_index,
+                        "journal_path": close_config.journal_path,
+                    },
+                )
+                if not closing.retryable_pair:
+                    return closing, None
+                if not budget.available:
+                    reason = f"paired closing shared pair-attempt budget exhausted ({budget.used}/{budget.limit})"
+                    journal.append(
+                        "PAIR_ATTEMPT_EXHAUSTED",
+                        {
+                            "phase": "PAIRED_CLOSING",
+                            "attempt": attempt_index,
+                            "maximum_attempts": budget.limit,
+                            "reason": reason,
+                        },
+                    )
+                    return closing, reason
+                journal.append(
+                    "PAIR_ATTEMPT_RETRY",
+                    {
+                        "phase": "PAIRED_CLOSING",
+                        "from_attempt": attempt_index,
+                        "next_attempt": budget.used + 1,
+                        "reason": closing.reason,
+                        "guard": closing.priority_guard,
+                        "lineage": {"used": budget.used, "limit": budget.limit},
+                    },
+                )
+            return blocked(f"paired closing shared pair-attempt budget exhausted ({budget.used}/{budget.limit})")
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -3039,6 +3332,8 @@ def opening_config_binding(config: HandoffConfig) -> dict[str, Any]:
         "source_limit_price": format(config.source_limit_price, "f"),
         "receiver_worst_price": format(config.receiver_worst_price, "f"),
         "operation_mode": config.operation_mode.value,
+        "attempt_index": config.attempt_index,
+        "client_order_prefix": config.client_order_prefix,
         "expected_source_position": None if config.expected_source_position is None else format(config.expected_source_position, "f"),
         "expected_receiver_position": None if config.expected_receiver_position is None else format(config.expected_receiver_position, "f"),
         "journal_path": config.journal_path,

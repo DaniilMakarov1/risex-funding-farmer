@@ -1,5 +1,13 @@
 # RISEx Spread Shadow and legacy Funding Farmer
 
+## HCR-22 paired source-priority guard — accepted offline
+
+Immediately before the receiver MARKET/IOC leg of a paired opening or paired closing, the program now reads both accounts and a fresh two-sided public book in one bounded concurrent window, then rechecks the exact source POST_ONLY order. The receiver is sent only when the source remains active and zero-filled with the exact owner, order/client identity, market, side, price and full remaining quantity, its exact owner-bound level is present publicly, no external order has a better price, and no external same-price order leaves FIFO priority unproved.
+
+Missing or ambiguous public ownership, a missing exact source level, a stale/future/malformed book, conflicting identity/quantity, or unproved same-price priority stops the receiver as `UNKNOWN`; better-priced external volume stops it as `LOST`. The program cancels only the exact identified source order and retries a pair only after terminal zero-fill reconciliation proves both accounts returned to their original positions. Opening and closing each use one shared maximum of three preparation/pair attempts, with fresh prices, journals and identities while preserving the cycle's sampled quantity and hold. Hold timing starts only after a fully proved opening. Proven one-sided closing residuals continue through the existing reduce-only fallback.
+
+The journals now retain the guard status and reason, BBO, exact source evidence, bounded external better/same-price evidence and measured phase durations. These records do not claim a guaranteed counterparty. The live venue's owner-bound public-book payload has not been newly validated; if exact owner-bound evidence is unavailable, execution fails closed. HCR-22 made no live account read, Keychain access, order or cancellation.
+
 ## HCR-19 one-command random BTC cycle — accepted offline
 
 HCR-21 corrects the `cycle-003` fallback explanation and reconciliation. The source limit filled externally before receiver admission, so the receiver market order was intentionally never sent. The later reduce-only fallback was accepted, then the venue reported a terminal `canceled-too-much-slippage` order with zero fill and zero remaining quantity. That terminal IOC representation is now recognized by its strict identity and parameters, reconciled as a known zero-fill cancellation, and allowed to return to the existing fresh-price residual loop. A foreign, malformed, stale or otherwise ambiguous observation still stops all dependent writes as `UNKNOWN`.

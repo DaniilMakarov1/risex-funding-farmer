@@ -871,6 +871,11 @@ def _simple_event_line(row: Mapping[str, Any]) -> str | None:
         return "Подготовка остановлена: безопасный повтор запрещён."
     if event == "PREPARATION_EXHAUSTED":
         return "Подготовка остановлена: исчерпаны три попытки до записи."
+    if event == "PAIR_ATTEMPT_RETRY":
+        phase = payload.get("phase") or "paired"
+        return f"Парная попытка {phase}: безопасная отмена подтверждена; следующая попытка использует свежие данные и новый identity."
+    if event == "PAIR_ATTEMPT_EXHAUSTED":
+        return "Парная операция остановлена: общий бюджет из трёх попыток исчерпан."
     if event == "OPENING_PRICE_UPDATED":
         return (
             "Котировка обновлена: "
@@ -892,6 +897,12 @@ def _simple_event_line(row: Mapping[str, Any]) -> str | None:
             if isinstance(receiver, Mapping) and receiver.get("dispatched") is False:
                 return "Источник получил наблюдаемое исполнение; ордер приёмника не отправлялся."
         return "Открытие и его сверка завершены."
+    if event == "PRE_RECEIVER_GUARD":
+        status = payload.get("status") or payload.get("priority_status") or "UNKNOWN"
+        reason = payload.get("priority_reason") or "приоритет не подтверждён"
+        if status == "PROVED":
+            return "Приоритет source подтверждён свежей книгой; receiver допущен."
+        return f"Guard до receiver: {status}; {reason}. Receiver не допускается."
     if event == "HOLD_ANCHORED":
         return f"Удержание начато: {payload.get('hold_seconds')} с от подтверждённого открытия."
     if event == "CLOSING_PLAN_READY":
@@ -1134,6 +1145,13 @@ def format_random_cycle_result_ru(
         )
         if journal:
             lines.append(f"Действие: сохранён журнал {journal}; UNKNOWN нельзя трактовать как flat.")
+    paired_execution = getattr(result, "paired_execution", "UNKNOWN")
+    inventory = getattr(result, "inventory", "UNKNOWN")
+    economics = getattr(result, "economics", "UNKNOWN")
+    lines.append(
+        "Классификация: "
+        f"paired_execution={paired_execution}; inventory={inventory}; economics={economics}."
+    )
     if receiver_not_dispatched:
         lines.append("Приёмник: ордер не отправлялся; это не отмена уже отправленного ордера.")
     elif receiver_leg is not None:
