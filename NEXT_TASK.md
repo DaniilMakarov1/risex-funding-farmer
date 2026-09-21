@@ -1,6 +1,12 @@
 # HCR-22 — fresh-book source-priority admission and bounded pair retry
 
-## ACTIVE CORRECTION — three audited acceptance defects
+## COMPLETE — three audited acceptance defects corrected offline
+
+Accepted Builder candidate `701c2f4d6b1076114358b270a64b5beef135b5cf` is integrated as `d406a14d026b71bd3c4b4a5d26fef354ca43968b`. The public book is rechecked after the exact source lookup and its original observation time now bounds the complete receiver mutation through nonce, signing and `sendTx`. Terminal results retain the original pair failure and ordered recovery even when a later fallback produces overall `SUCCESS`, without presenting an earlier residual as current. Fallback executions now contribute explicit bounded fee evidence to whole-cycle economics; any missing fallback fee keeps economics `UNKNOWN`.
+
+Chief reviewed the complete source/test delta and independently ran the four affected suites (`226 passed`) plus one clean isolated Python 3.11 full suite on the exact accepted candidate (`4625 passed, 3 skipped`). The two immutable cycle-004 journal hashes remain unchanged. No live validation, network/account read, Keychain access, signing, order or cancellation was performed.
+
+## Completed correction contract
 
 The owner directed correction after an independent audit of published `main` `00e4c9a0783ad00b4d886a48730b95d1df8a6795`. The sole Chief independently reproduced all three findings. HCR-22 is no longer accepted as complete. Preserve the earlier candidates, published history and immutable cycle-004 evidence; do not rewrite or delete them.
 

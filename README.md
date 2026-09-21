@@ -1,12 +1,14 @@
 # RISEx Spread Shadow and legacy Funding Farmer
 
-## HCR-22 paired source-priority guard — accepted offline
+## HCR-22 paired source-priority guard — audited correction accepted offline
 
 Immediately before the receiver MARKET/IOC leg of a paired opening or paired closing, the program now reads both accounts and a fresh two-sided public book in one bounded concurrent window, then rechecks the exact source POST_ONLY order. The receiver is sent only when the source remains active and zero-filled with the exact owner, order/client identity, market, side, price and full remaining quantity, its exact owner-bound level is present publicly, no external order has a better price, and no external same-price order leaves FIFO priority unproved.
 
 Missing or ambiguous public ownership, a missing exact source level, a stale/future/malformed book, conflicting identity/quantity, or unproved same-price priority stops the receiver as `UNKNOWN`; better-priced external volume stops it as `LOST`. The program cancels only the exact identified source order and retries a pair only after terminal zero-fill reconciliation proves both accounts returned to their original positions. Opening and closing each use one shared maximum of three preparation/pair attempts, with fresh prices, journals and identities while preserving the cycle's sampled quantity and hold. Hold timing starts only after a fully proved opening. Proven one-sided closing residuals continue through the existing reduce-only fallback.
 
-The journals now retain the guard status and reason, BBO, exact source evidence, bounded external better/same-price evidence and measured phase durations. These records do not claim a guaranteed counterparty. The live venue's owner-bound public-book payload has not been newly validated; if exact owner-bound evidence is unavailable, execution fails closed. HCR-22 made no live account read, Keychain access, order or cancellation.
+The book is checked again after the exact source-order lookup, and its original timestamp limits the entire receiver submission through nonce, signature and transmission. If it expires before admission, no receiver intent is created; if the common deadline expires later, the transaction is not transmitted or blindly replayed.
+
+The journals now retain the guard status and reason, BBO, exact source evidence, bounded external better/same-price evidence and measured phase durations. Terminal output keeps the original pair failure, fallback attempts in order and the latest confirmed inventory even after successful recovery. Fallback fills count toward economics; if any fallback trade fee is absent, economics stays `UNKNOWN`, while a proved zero-fill fallback requires no fee. These records do not claim a guaranteed counterparty. The live venue's owner-bound public-book payload has not been newly validated; if exact owner-bound evidence is unavailable, execution fails closed. HCR-22 made no live account read, Keychain access, signing, order or cancellation.
 
 ## HCR-19 one-command random BTC cycle — accepted offline
 

@@ -1,6 +1,12 @@
 # Current status
 
-## HCR-22 — ACTIVE CORRECTION after independent audit
+## HCR-22 — COMPLETE after audited correction
+
+The three independently reproduced defects in published `00e4c9a0783ad00b4d886a48730b95d1df8a6795` are corrected by accepted Builder candidate `701c2f4d6b1076114358b270a64b5beef135b5cf`, integrated as `d406a14d026b71bd3c4b4a5d26fef354ca43968b`. Receiver admission now rechecks book age after exact source lookup and carries that book timestamp into the deadline covering nonce, signing and transmission. Successful fallback recovery retains a truthful durable terminal cause/history and confirmed-flat current state. Fallback fill fees are part of cycle economics, so missing fee evidence remains `UNKNOWN`.
+
+Chief complete-diff review and independent adverse checks passed. Exact-candidate affected suites: `226 passed`. Final clean isolated Python 3.11 suite: `4625 passed, 3 skipped` in 124.03 seconds. Cycle-004 source hashes remain `efbda6822eadf397c07b3e37c45585b97178f6587ff0481c4a00e419f15cbb42` and `b70f67810076fdf918018edc460f3ef6a95a415db26f82a5e312f93d8dae355a`. No live validation, network/account read, Keychain access, signing, order or cancellation was performed.
+
+## Superseded audit state
 
 Published `main` `00e4c9a0783ad00b4d886a48730b95d1df8a6795` retains three independently reproduced acceptance defects, so the prior COMPLETE claim is withdrawn. A public book can be fresh when received but stale after the exact source lookup and still admit the receiver because its timestamp is neither rechecked nor included in the receiver mutation deadline. The cycle-004 terminal formatter selects the older nonempty fallback error after a later successful full close and therefore falsely says a residual remains. Whole-cycle economics ignores fallback trade fees and can report `KNOWN` when a fallback fill has missing fee evidence.
 
