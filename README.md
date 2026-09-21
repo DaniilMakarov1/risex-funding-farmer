@@ -1,5 +1,13 @@
 # RISEx Spread Shadow and legacy Funding Farmer
 
+## HCR-24 recovery and shorter paired path
+
+The SDK prepares both orders before placing the source limit, keeping the signed transactions only in memory. It overlaps source visibility with independent account/book reads and still checks the exact source order and its public owner-bound level before sending the receiver. Early data that merely predates source visibility can be refreshed once; contradictory identities, positions or fills remain blocking evidence. A prepared order is single-use and expires at the stricter preparation/final-check deadline.
+
+Opening and closing no longer deliberately join existing volume when the spread leaves no exclusive improved price. They retry preparation within the existing three-attempt budget while preserving the selected quantity and hold. Delayed trade history receives bounded reconciliation reads; a fully proved source-only fill can reach the existing residual cleanup instead of remaining unresolved solely because the first history response was empty. An external fill is still possible: these changes shorten local work but do not reserve the limit for the receiver.
+
+Cycle-005 is consumed evidence and must not be reused. Its last saved positions were source `-0.00024 BTC`, receiver `0`; this is not a current account check. The agent did not close that historical position. A new opening still requires fresh proof that both accounts are flat and have no pending BTC orders. Batch and cache-only stream execution remain disabled pending sufficient official venue evidence.
+
 ## HCR-23 offline execution audit — accepted
 
 A lost or undecidable sendTx response is unresolved execution: dependent orders stop on both accounts. Do not interpret it as an exchange rejection or retry it blindly. The last observed position and confirmed closed inventory are separate facts; a zero observation cannot resolve an outstanding order. Missing fees remain a separate economic uncertainty even when closure is proved.
@@ -35,7 +43,7 @@ The operator files are in:
 
 - `random-cycle.json` binds BTC market1, source27331/receiver27337, APIkey4, Robinhood endpoint/signing domain466324, the existing timing defaults and the explicitly authorized incremental opening-margin deferral.
 - `market-contract.json` contains only market identity and provenance requirements. It contains no guessed fees, minimums, balances or fresh timestamp. The actual response after LAUNCH must supply current increments/minimums; incomplete or stale evidence stops the dependent action.
-- `cycle-001` through `cycle-004` are consumed evidence. Preserve them permanently. The launcher atomically chooses the next unused owner-only `cycle-NNN` directory and a unique client-order prefix after confirmation.
+- `cycle-001` through `cycle-005` are consumed evidence. Preserve them permanently. The launcher atomically chooses the next unused owner-only `cycle-NNN` directory and a unique client-order prefix after confirmation.
 
 From the project folder, the normal launch is now one command:
 

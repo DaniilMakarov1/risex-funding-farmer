@@ -1,4 +1,8 @@
-# HCR-24 — cycle005 recovery and shorter paired execution path
+# HCR-24 — COMPLETE; offline recovery and faster paired execution
+
+## Completion and next boundary
+
+Recovery85bf379 and fast9fdadcb independently accepted, integrated and installed. Exact clean isolated Python3.11 suite:4677passed3skipped, exit0,136.70s; no foreign imports. Chief adverse probes and full diff reviews passed. Installed source/tests match the tested snapshot; help/CANCEL and immutable cycle004/005 evidence pass. Synthetic identical-delay median inter-leg scheduling window97.611ms to65.783ms; no live latency guarantee. Governing details and earlier environment-failure classification are in STATUS.md. Publication is the final Git step; no further implementation remains. Builders are idle/released, evidence/candidates preserved. Next owner decision is a separately authorized real validation; do not automatically collect markets, read accounts/Keychain or start cycle006. Current account inventory is unknown; cycle005 last saved residual is historical.
 
 ## Owner authority and finite objective
 
@@ -16,9 +20,9 @@ Completion requires full actual diff review, independent incident regressions, a
 
 ## Ownership and delivery
 
-OWNER RESUMED explicitly after pause. Chief verified clean Builder checkpoint780994f1502422ad7a2da2fe99a6b950f19c78cf and read PAUSED_CHECKPOINT.md; no processes were left running. Same healthy /root/hcr24_fast_builder continues on codex/spread-v1-hcr24-fast at /Users/daniilmakarov/.codex/worktrees/hcr24-fast/RISEx Spread Shadow. Prepared-mutation code is WIP_NOT_ACCEPTED; remaining work is coalesced reads, symmetric exclusive-price admission, adverse tests and measured latency evidence. Builder must investigate the two reported baseline failures against exact source/import identity and test ordering; Chief's separate215-test recovery run passed. Completion delivery to Chief remains required. No live authority added.
+Owner pause/resume was honored at preserved WIP780994f. The same healthy fast Builder completed the finite slice and delivered all candidates natively. The two initial baseline failures were stale Desktop imports; exact-worktree192-test replay passed without test weakening. All intermediate candidates remain preserved. No live authority was added.
 
-Recovery slice85bf37945a15d75fd7c1cef5c4b127df25ee6fdc independently accepted for integration on2026-09-21 after full diff review, three Chief incident probes and215 focused tests. Parent544b1cd preserved; its CLI dispatch and retry-erased ContractError defects were corrected in the same healthy Builder session. Recovery is integrated into the Chief candidate only; main/operator publication awaits fast slice and final isolated suite. Next action: fresh fast prepared-dispatch Builder on the integrated Chief base. No live operation authority added.
+Recovery slice85bf37945a15d75fd7c1cef5c4b127df25ee6fdc independently accepted after full diff review, three Chief incident probes and215 focused tests. Parent544b1cd preserved; its CLI dispatch and retry-erased ContractError defects were corrected in the same healthy Builder session. Fast slice corrections fixed API nonce ownership, generic prepared deadlines and loss of contradictory early evidence. No active Builder task remains.
 
 Official-domain research completed: Robinhood sendTxBatch exists but docs do not establish two-account non-interleaving/atomicity/dependent rejection. It stays disabled. Robinhood WebSocket endpoint is documented, but public book levels are anonymous price/size and private feed shapes do not establish a complete aligned account/order/margin snapshot with recoverable continuity for cache-only admission. Full replacement of admission by cached feed is blocked by those evidence gaps; no enabled approximation. Fast prepared REST dispatch remains the implementation route. Sources/precise limitations are preserved in owner evidence review.md. Account-type docs specify standard maker/cancel200ms/taker300ms, but actual account tier is unverified; no fee/tier changes or infrastructure migration are authorized.
 

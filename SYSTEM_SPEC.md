@@ -3,6 +3,16 @@
 SYSTEM_SPEC_VERSION = 4.2
 SPEC_STATUS = FIRST_RAW_RESEARCH_SCANNER_IMPLEMENTED
 
+## HCR-24 amendment — prepared dispatch and causal recovery
+
+Prepare exact source and receiver mutations before exposing the source order when the adapter supports preparation. Prepared transactions stay in memory, belong to the originating client/account/key and exact immutable plan, and are single-use. Account/key/nonces are reserved across preparation and cancellation; an already transmitted nonce cannot be reused, including after ambiguous transport. An invalidated unsent preparation releases its reservation. Receiver transmission is bounded by the stricter prepared and final-evidence deadline, including generic prepared adapters; no signature or transaction body enters durable evidence.
+
+Source visibility may overlap independent account/public-book reads. Exact source lookup and owner-bound public priority proof remain mandatory before receiver transmission. One bounded refresh may replace specifically pre-visibility missing source evidence, only when the first observations prove correct identity, unchanged positions, readiness, margin, freshness and absence of conflicting orders/fills. Contradictory first observations must be preserved and cannot be erased by a later normal snapshot. Already complete early evidence needs no refresh. Missing or ambiguous evidence never authorizes blind simultaneous dispatch.
+
+Random opening and closing preparation require an exclusive improved source price. A one-tick spread that would join existing volume retries preparation before source placement within the same three-attempt budget; selected quantity and hold remain fixed. No price, slippage, fee, timeout or inventory policy is loosened.
+
+Post-action reconciliation may reread temporarily incomplete order/trade/position propagation within existing time/count bounds. Only complete agreeing terminal execution permits existing residual cleanup. Contract/identity failures and genuine foreign orders remain sticky; receiver is never sent after a source fill. Progress distinguishes never-dispatched receiver, confirmed source fill and confirmed zero-fill cancellation. Historical inputs are immutable. Batch submission and cache-only stream admission remain disabled because the required venue ordering/ownership/continuity guarantees are not established.
+
 ## HCR-23 amendment — transport uncertainty, observation age and durable inventory proof
 
 A timeout or exception after entering sendTx, a malformed response, or an undecidable/conflicting HTTP/application response is unresolved execution. It must not become an authoritative rejection or permit a later dependent write on either account. Explicit application rejection and known local failure before transmission remain distinct. The mutation transport sends once without redirects or replay and owns a lazily reused connection pool with request-local authentication and idempotent cleanup.
