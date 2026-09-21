@@ -986,6 +986,56 @@ async def test_delayed_nonce_cannot_reach_sign_or_dispatch(monkeypatch, tmp_path
 
 
 @pytest.mark.asyncio
+async def test_signing_crossing_final_deadline_cannot_reach_send_tx(monkeypatch, tmp_path):
+    import risex_spread_shadow.hood_handoff.sdk as sdk_module
+
+    ticks = [100.0]
+
+    class LateSigner(FakeSigner):
+        async def sign_create_order(self, **kwargs):
+            ticks[0] += 0.02
+            return await super().sign_create_order(**kwargs)
+
+    original_sdk_time = sdk_module.time
+    sdk_module.time = SimpleNamespace(monotonic=lambda: ticks[0])
+    try:
+        signer = LateSigner()
+        client = LighterSdkClient(
+            make_config(tmp_path / "sign-crossing.jsonl"),
+            source_account_index=11,
+            receiver_account_index=22,
+            secrets=StaticSecretProvider({}),
+            market_evidence={},
+            signer_factory=lambda **kwargs: signer,
+            http_factory=FakeHttp,
+        )
+        client._signers[11] = signer
+        plan = OrderPlan(
+            account_index=11,
+            market_id=7,
+            side="SELL",
+            quantity=Decimal("0.125"),
+            quantity_int=125,
+            price=Decimal("100.25"),
+            price_int=10025,
+            order_type="LIMIT",
+            time_in_force="POST_ONLY",
+            reduce_only=True,
+            order_expiry_ms=1_500_000,
+            client_order_index=123,
+            mutation_deadline_monotonic=100.01,
+        )
+
+        receipt = await client.submit_order(plan)
+
+        assert not receipt.accepted
+        assert len(signer.sign_calls) == 1
+        assert client._http.calls == []
+    finally:
+        sdk_module.time = original_sdk_time
+
+
+@pytest.mark.asyncio
 async def test_preparation_read_timeout_blocks_without_mutation(tmp_path):
     class SlowMetadata(FakeClient):
         async def market_metadata(self, market_id):
@@ -1229,6 +1279,15 @@ async def test_mutation_barrier_preserves_observation_age_and_allows_fresh_attem
         assert not rejected.accepted
         assert signer.sign_calls == []
         assert client._http.calls == []
+
+        ticks[0] = 100.0
+        book_bound_plan = engine._mutation_plan(
+            plan,
+            config,
+            observations=(SimpleNamespace(observed_at=100.0), {"observed_at": 99.995}),
+            observation_now=100.0,
+        )
+        assert book_bound_plan.mutation_deadline_monotonic == pytest.approx(100.005)
 
         ticks[0] = 200.0
         fresh_plan = engine._mutation_plan(

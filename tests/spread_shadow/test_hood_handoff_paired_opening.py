@@ -4,6 +4,7 @@ from dataclasses import replace
 from decimal import Decimal
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -394,6 +395,45 @@ class WrongExactLookupPairedClient(PairedClient):
         return value
 
 
+class ExpiringBookClock:
+    """Advance only across the exact source lookup boundary."""
+
+    def __init__(self) -> None:
+        self.value = NOW + 9.9
+
+    def now(self) -> float:
+        return self.value
+
+    async def sleep(self, seconds: float) -> None:
+        return None
+
+
+class ExpiringBookPairedClient(PairedClient):
+    """Return a book fresh at receipt but stale after the exact lookup."""
+
+    def __init__(self, clock: ExpiringBookClock) -> None:
+        super().__init__()
+        self.clock = clock
+        self.source_lookup_calls = 0
+
+    async def order_book(self, market_id: int) -> OrderBookSnapshot:
+        value = await super().order_book(market_id)
+        return replace(value, observed_at=self.clock.now() - 9.9)
+
+    async def lookup_order(self, account_index: int, market_id: int, *, order_id=None, client_order_index=None):
+        value = await super().lookup_order(
+            account_index,
+            market_id,
+            order_id=order_id,
+            client_order_index=client_order_index,
+        )
+        if account_index == self.source_account_index and order_id is not None and value is not None:
+            self.source_lookup_calls += 1
+            if self.source_lookup_calls == 2:
+                self.clock.value += 0.2
+        return value
+
+
 def _account_snapshot(index: int, position: Decimal, active_orders=(), *, margin=Decimal("100")) -> AccountSnapshot:
     base = account(index, position, margin=margin)
     return AccountSnapshot(
@@ -516,6 +556,85 @@ async def test_paired_guard_requires_a_fresh_reader_and_never_dispatches_receive
     assert guard["source_public_level"] is None
     assert any("unresolved" in reason for reason in result.unknown_reasons)
     assert not [item for item in client.submissions if item.account_index == client.receiver_account_index]
+
+
+@pytest.mark.asyncio
+async def test_paired_guard_rechecks_book_freshness_after_exact_source_lookup(tmp_path):
+    clock = ExpiringBookClock()
+    client = ExpiringBookPairedClient(clock)
+    path = tmp_path / "book-expires-during-lookup.jsonl"
+
+    result = await run_handoff(config(path), client, clock=clock)
+
+    assert result.outcome is Outcome.UNKNOWN
+    assert client.source_lookup_calls >= 2
+    assert [item.account_index for item in client.submissions] == [11]
+    assert not [item for item in client.submissions if item.account_index == client.receiver_account_index]
+    assert any("public book recheck is stale" in reason for reason in result.unknown_reasons)
+    guard = _guard_payload(path)
+    assert guard["book_observed_at"] == pytest.approx(NOW)
+    assert guard["status"] == "UNKNOWN"
+    assert any("public book recheck is stale" in reason for reason in guard["admission_reasons"])
+
+
+@pytest.mark.asyncio
+async def test_receiver_deadline_uses_wall_clock_at_plan_construction(monkeypatch, tmp_path):
+    import risex_spread_shadow.hood_handoff.engine as engine_module
+
+    class MutableClock:
+        def __init__(self) -> None:
+            self.value = NOW
+
+        def now(self) -> float:
+            return self.value
+
+        async def sleep(self, seconds: float) -> None:
+            return None
+
+    clock = MutableClock()
+    client = PairedClient()
+    ticks = [500.0]
+    original_time = engine_module.time
+    original_mutation_plan = engine_module.HandoffEngine._mutation_plan
+    calls: list[tuple[object, float]] = []
+    monkeypatch.setattr(
+        engine_module,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: ticks[0],
+            perf_counter=original_time.perf_counter,
+            time=original_time.time,
+        ),
+    )
+
+    def delayed_mutation_plan(self, plan, config, *, observations, observation_now=None):
+        if plan.account_index == client.receiver_account_index:
+            # This is after the guard and immediately before the real plan
+            # construction.  The method must not reuse an earlier guard time.
+            clock.value += 0.2
+            calls.append((observation_now, clock.now()))
+        return original_mutation_plan(
+            self,
+            plan,
+            config,
+            observations=observations,
+            observation_now=observation_now,
+        )
+
+    monkeypatch.setattr(engine_module.HandoffEngine, "_mutation_plan", delayed_mutation_plan)
+    result = await run_handoff(
+        config(
+            tmp_path / "deadline-at-plan.jsonl",
+            request_timeout_seconds=20,
+        ),
+        client,
+        clock=clock,
+    )
+
+    assert result.outcome is Outcome.SUCCESS
+    assert calls == [(None, NOW + 0.2)]
+    receiver_plan = client.submissions[1]
+    assert receiver_plan.mutation_deadline_monotonic == pytest.approx(500.0 + 9.8)
 
 
 @pytest.mark.asyncio

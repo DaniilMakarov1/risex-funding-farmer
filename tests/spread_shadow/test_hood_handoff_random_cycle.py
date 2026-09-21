@@ -18,7 +18,10 @@ from risex_spread_shadow.hood_handoff import (
     DepthLevel,
     Direction,
     FallbackResult,
+    HandoffPlan,
+    HandoffResult,
     HistoryPage,
+    LegReconciliation,
     MarketMetadata,
     MutationReceipt,
     OrderPlan,
@@ -26,9 +29,11 @@ from risex_spread_shadow.hood_handoff import (
     OrderBookSnapshot,
     OrderSnapshot,
     Outcome,
+    Phase,
     PreflightBlocked,
     RandomCycleConfig,
     RandomCycleEngine,
+    RandomCycleResult,
     TradeReceipt,
     allocate_cycle_slot,
     compute_quantity_bounds,
@@ -1151,6 +1156,7 @@ async def test_one_cycle_opens_holds_and_closes_actual_positions_once(tmp_path, 
     assert client.source_position == Decimal("0")
     assert client.receiver_position == Decimal("0")
     assert [(plan.side, plan.reduce_only) for plan in client.submissions] == [*expected_open, *expected_close]
+    assert result.reason is None
     assert all(plan.quantity == Decimal("0.25") for plan in client.submissions)
     assert clock.sleeps == [20]
     journal = (tmp_path / direction.value.lower() / "cycle.jsonl").read_text()
@@ -1373,50 +1379,404 @@ def test_cycle_004_offline_facts_keep_pair_failure_flat_inventory_and_unknown_fe
     assert facts["final_positions"] == {"source": Decimal("0"), "receiver": Decimal("0")}
     assert facts["boundary_books"] is None
 
-    opening = SimpleNamespace(
+    source_order = OrderSnapshot(
+        account_index=facts["source"]["account_index"],
+        market_id=1,
+        order_id=facts["source"]["order_id"],
+        client_order_index=1001,
+        status=facts["source"]["status"],
+        side=facts["source"]["side"],
+        order_type=facts["source"]["order_type"],
+        time_in_force=facts["source"]["time_in_force"],
+        reduce_only=False,
+        initial_quantity=facts["source"]["initial_quantity"],
+        remaining_quantity=facts["source"]["remaining_quantity"],
+        filled_quantity=facts["source"]["filled_quantity"],
+        price=facts["source"]["price"],
+        observed_at=NOW,
+    )
+    receiver_order = OrderSnapshot(
+        account_index=facts["receiver"]["account_index"],
+        market_id=1,
+        order_id="receiver-cycle-004",
+        client_order_index=1002,
+        status="filled",
+        side=facts["receiver"]["side"],
+        order_type=facts["receiver"]["order_type"],
+        time_in_force=facts["receiver"]["time_in_force"],
+        reduce_only=False,
+        initial_quantity=facts["receiver"]["filled_quantity"],
+        remaining_quantity=Decimal("0"),
+        filled_quantity=facts["receiver"]["filled_quantity"],
+        price=facts["receiver"]["fill_price"],
+        observed_at=NOW,
+    )
+    source_plan = OrderPlan(
+        account_index=facts["source"]["account_index"],
+        market_id=1,
+        side="SELL",
+        quantity=Decimal("0.00026"),
+        quantity_int=26,
+        price=facts["source"]["price"],
+        price_int=804684,
+        order_type="LIMIT",
+        time_in_force="POST_ONLY",
+        reduce_only=False,
+        order_expiry_ms=300_000,
+        client_order_index=1001,
+    )
+    receiver_plan = OrderPlan(
+        account_index=facts["receiver"]["account_index"],
+        market_id=1,
+        side="BUY",
+        quantity=Decimal("0.00026"),
+        quantity_int=26,
+        price=facts["receiver"]["worst_price"],
+        price_int=804684,
+        order_type="MARKET",
+        time_in_force="IOC",
+        reduce_only=False,
+        order_expiry_ms=0,
+        client_order_index=1002,
+    )
+    handoff_plan = HandoffPlan(
+        run_id="cycle-004-opening",
+        source=source_plan,
+        receiver=receiver_plan,
+        source_position_before=Decimal("0"),
+        receiver_position_before=Decimal("0"),
+        direction=Direction.LONG,
+        quantity=Decimal("0.00026"),
+        created_at=NOW,
+        source_identity="cycle-004-source",
+        receiver_identity="cycle-004-receiver",
+        metadata_observed_at=NOW,
+        operation_mode=OperationMode.PAIRED_OPENING,
+    )
+    receiver_trade = TradeReceipt(
+        facts["receiver"]["trade_id"],
+        facts["receiver"]["account_index"],
+        1,
+        receiver_order.order_id,
+        "BUY",
+        facts["receiver"]["filled_quantity"],
+        facts["receiver"]["fill_price"],
+        None,
+        facts["receiver"]["counterparty_account_index"],
+        NOW,
+        counterparty_order_id=facts["receiver"]["counterparty_order_id"],
+    )
+    opening = HandoffResult(
         outcome=Outcome.PARTIAL,
-        retryable_pair=False,
-        economic_status="UNKNOWN",
-        joint_match_status="KNOWN_ZERO",
-        source=SimpleNamespace(
-            account_index=facts["source"]["account_index"],
-            order_id=facts["source"]["order_id"],
-            side=facts["source"]["side"],
-            order_type=facts["source"]["order_type"],
-            time_in_force=facts["source"]["time_in_force"],
-            price=facts["source"]["price"],
-            filled_quantity=facts["source"]["filled_quantity"],
-        ),
-        receiver=SimpleNamespace(
-            account_index=facts["receiver"]["account_index"],
-            side=facts["receiver"]["side"],
-            order_type=facts["receiver"]["order_type"],
-            time_in_force=facts["receiver"]["time_in_force"],
-            price=facts["receiver"]["fill_price"],
+        phase=Phase.COMPLETE,
+        run_id="cycle-004-opening-result",
+        plan=handoff_plan,
+        source=LegReconciliation(
+            account_index=source_order.account_index,
+            order_id=source_order.order_id,
+            trades=(),
+            position_before=Decimal("0"),
+            position_after=Decimal("0"),
+            order=source_order,
+            history_complete=True,
             dispatched=True,
-            filled_quantity=facts["receiver"]["filled_quantity"],
+        ),
+        receiver=LegReconciliation(
+            account_index=receiver_order.account_index,
+            order_id=receiver_order.order_id,
+            trades=(receiver_trade,),
+            position_before=Decimal("0"),
+            position_after=Decimal("0.00026"),
+            order=receiver_order,
+            history_complete=True,
+            dispatched=True,
+        ),
+        reason=None,
+        joint_match_status="KNOWN_ZERO",
+        economic_status="UNKNOWN",
+        operation_mode=OperationMode.PAIRED_OPENING,
+        priority_guard={"status": "UNKNOWN", "book_observed_at": None},
+    )
+    fallbacks = (
+        FallbackResult(
+            account_index=27331,
+            side="BUY",
+            requested_quantity=Decimal("0.00026"),
+            attempted=True,
+            outcome=Outcome.PARTIAL,
+            order_id="fallback-1",
+            filled_quantity=Decimal("0"),
+            position_after=Decimal("-0.00026"),
+            reason="terminal zero-fill/cancel",
+            attempt=1,
+            reconciliation_state="TERMINAL_ZERO_FILL",
+            economic_status="PROVEN",
+            economic_findings=("fallback terminal zero-fill: no execution fee was due",),
+        ),
+        FallbackResult(
+            account_index=27337,
+            side="SELL",
+            requested_quantity=Decimal("0.00026"),
+            attempted=True,
+            outcome=Outcome.SUCCESS,
+            order_id="fallback-2",
+            filled_quantity=Decimal("0.00026"),
+            position_after=Decimal("0"),
+            attempt=2,
+            reconciliation_state="FULL_FILL",
+            economic_status="PROVEN",
+            economic_findings=("fallback fee economics PROVEN: 1 trade(s), fee 0.0001",),
+            fee_total=Decimal("0.0001"),
         ),
     )
     paired_execution, inventory, economics = random_cycle_module._cycle_classifications(
         opening,
         None,
-        (),
+        fallbacks,
         Decimal("0"),
         Decimal("0"),
     )
     assert paired_execution == "FAILED"
     assert inventory == "CONFIRMED_FLAT"
     assert economics == "UNKNOWN"
-    operator_explanation = (
-        "paired execution FAILED: source zero-fill/canceled; receiver filled "
-        "against external account 16969; fallback-1 canceled-too-much-slippage; "
-        "fallback-2 closed the full residual; final positions flat; "
-        "fees UNKNOWN; boundary books unavailable"
+    result = random_cycle_module._with_cycle_classifications(RandomCycleResult(
+        outcome=Outcome.PARTIAL,
+        phase=Phase.COMPLETE,
+        run_id="cycle-004-terminal",
+        reason=random_cycle_module._cycle_terminal_reason(
+            opening,
+            None,
+            fallbacks,
+            None,
+            remaining_source=Decimal("0"),
+            remaining_receiver=Decimal("0"),
+            boundary_books_available=False,
+        ),
+        opening_reason=random_cycle_module._opening_reason(opening),
+        opening=opening,
+        closing=None,
+        fallbacks=fallbacks,
+        remaining_source_position=Decimal("0"),
+        remaining_receiver_position=Decimal("0"),
+        remaining_source_position_observed_at=NOW,
+        remaining_receiver_position_observed_at=NOW,
+        paired_execution=paired_execution,
+        inventory=inventory,
+        economics=economics,
+        boundary_books_available=False,
+        journal_path=None,
+    ))
+    serialized = result.as_dict()
+    serialized_text = json.dumps(serialized, sort_keys=True)
+    durable_reason = serialized["reason"]
+    assert durable_reason == result.reason
+    assert serialized["boundary_books_available"] is False
+    assert serialized["opening"]["receiver"]["trades"][0] == {
+        "trade_id": "839100826",
+        "account_index": 27337,
+        "market_id": 1,
+        "order_id": "receiver-cycle-004",
+        "side": "BUY",
+        "quantity": "0.00026",
+        "price": "80467.5",
+        "fee": None,
+        "counterparty_account_index": 16969,
+        "counterparty_order_id": "562950034029051",
+        "counterparty_client_order_index": None,
+        "client_order_index": None,
+        "observed_at": NOW,
+    }
+    expected_facts = (
+        "receiver BUY filled at 80467.5",
+        "receiver filled against better-priced external maker",
+        "fill 80467.5 < 80468.4 (BUY bound)",
+        "better-priced than bound/source 80468.4",
+        "against external account 16969",
+        "external account 16969",
+        "counterparty order 562950034029051",
+        "trade 839100826",
+        "source zero-fill/canceled",
+        "source remained zero-fill/canceled",
+        "fallback attempt 1 terminal-zero-filled",
+        "fallback attempt 2 fully closed the residual",
+        "final inventory confirmed flat",
+        "fees UNKNOWN",
+        "boundary books unavailable",
     )
-    assert "source zero-fill/canceled" in operator_explanation
-    assert "external account 16969" in operator_explanation
-    assert "boundary books unavailable" in operator_explanation
+    for fact in expected_facts:
+        assert fact in durable_reason
+        assert fact in serialized_text
+    operator_explanation = cli_module.format_random_cycle_result_ru(result)
+    for fact in expected_facts:
+        assert fact in operator_explanation
+    assert "final inventory known residual" not in durable_reason
+    assert "final inventory known residual" not in operator_explanation
+    assert "left a confirmed residual position" not in operator_explanation
     assert "historical book" not in operator_explanation
+
+
+def test_cycle_economics_include_fallback_fee_evidence_and_zero_fill_exemption():
+    full_fill = FallbackResult(
+        account_index=11,
+        side="BUY",
+        requested_quantity=Decimal("0.10"),
+        attempted=True,
+        outcome=Outcome.SUCCESS,
+        order_id="fallback-full",
+        filled_quantity=Decimal("0.10"),
+        position_after=Decimal("0"),
+        attempt=1,
+        reconciliation_state="FULL_FILL",
+    )
+    full_order = OrderSnapshot(
+        account_index=11,
+        market_id=7,
+        order_id="fallback-full",
+        client_order_index=1,
+        status="filled",
+        side="BUY",
+        order_type="MARKET",
+        time_in_force="IOC",
+        reduce_only=True,
+        initial_quantity=Decimal("0.10"),
+        remaining_quantity=Decimal("0"),
+        filled_quantity=Decimal("0.10"),
+        price=Decimal("100"),
+        observed_at=NOW,
+    )
+    receipt = MutationReceipt(True, "fallback-full", "0xtx")
+    missing_fee_trade = TradeReceipt(
+        "fallback-trade",
+        11,
+        7,
+        "fallback-full",
+        "BUY",
+        Decimal("0.10"),
+        Decimal("100"),
+        None,
+        22,
+        NOW,
+    )
+    status, findings, fee_total = random_cycle_module._fallback_economic_evidence(
+        full_fill,
+        receipt=receipt,
+        order=full_order,
+        trades=(missing_fee_trade,),
+        history_complete=True,
+    )
+    missing_fee = replace(
+        full_fill,
+        economic_status=status,
+        economic_findings=findings,
+        fee_total=fee_total,
+    )
+    assert status == "UNKNOWN"
+    assert fee_total is None
+    assert "missing fee" in findings[0]
+    assert missing_fee.as_dict()["economic_status"] == "UNKNOWN"
+
+    complete_fee_trade = replace(missing_fee_trade, fee=Decimal("0.001"))
+    status, findings, fee_total = random_cycle_module._fallback_economic_evidence(
+        full_fill,
+        receipt=receipt,
+        order=full_order,
+        trades=(complete_fee_trade,),
+        history_complete=True,
+    )
+    complete_fee = replace(
+        full_fill,
+        economic_status=status,
+        economic_findings=findings,
+        fee_total=fee_total,
+    )
+    assert status == "PROVEN"
+    assert fee_total == Decimal("0.001")
+    assert complete_fee.as_dict()["fee_total"] == "0.001"
+
+    zero_fill = replace(
+        full_fill,
+        outcome=Outcome.PARTIAL,
+        order_id="fallback-zero",
+        filled_quantity=Decimal("0"),
+        position_after=Decimal("0.10"),
+        reconciliation_state="TERMINAL_ZERO_FILL",
+    )
+    zero_order = replace(
+        full_order,
+        order_id="fallback-zero",
+        status="canceled-too-much-slippage",
+        filled_quantity=Decimal("0"),
+    )
+    status, findings, fee_total = random_cycle_module._fallback_economic_evidence(
+        zero_fill,
+        receipt=MutationReceipt(True, "fallback-zero", "0xzero"),
+        order=zero_order,
+        trades=(),
+        history_complete=True,
+    )
+    zero_fill = replace(
+        zero_fill,
+        economic_status=status,
+        economic_findings=findings,
+        fee_total=fee_total,
+    )
+    assert status == "PROVEN"
+    assert fee_total is None
+    assert "no execution fee was due" in findings[0]
+
+    phase = SimpleNamespace(
+        outcome=Outcome.SUCCESS,
+        retryable_pair=False,
+        economic_status="PROVEN",
+        source=None,
+        receiver=None,
+    )
+    assert random_cycle_module._cycle_classifications(
+        phase,
+        None,
+        (missing_fee,),
+        Decimal("0"),
+        Decimal("0"),
+    )[2] == "UNKNOWN"
+    assert random_cycle_module._cycle_classifications(
+        phase,
+        None,
+        (zero_fill, complete_fee),
+        Decimal("0"),
+        Decimal("0"),
+    )[2] == "KNOWN"
+
+
+def test_external_fill_fact_does_not_claim_better_price_without_bound_evidence():
+    phase = SimpleNamespace(
+        plan=SimpleNamespace(
+            source=SimpleNamespace(price=None),
+            receiver=SimpleNamespace(side="BUY", price=None),
+        ),
+        source=SimpleNamespace(
+            account_index=11,
+            filled_quantity=Decimal("0"),
+            order=SimpleNamespace(status="canceled"),
+        ),
+        receiver=SimpleNamespace(
+            account_index=22,
+            dispatched=True,
+            filled_quantity=Decimal("0.1"),
+            trades=(
+                SimpleNamespace(
+                    side="BUY",
+                    price=Decimal("99"),
+                    counterparty_account_index=33,
+                ),
+            ),
+        ),
+    )
+
+    facts = random_cycle_module._external_receiver_fill_facts(phase)
+    assert facts == (
+        "receiver BUY filled at 99 against external account 33; "
+        "source zero-fill/canceled (source remained zero-fill/canceled)",
+    )
 
 
 @pytest.mark.asyncio
@@ -2069,6 +2429,20 @@ async def test_external_source_fill_during_paired_close_is_partial_and_fallback_
     assert result.closing.outcome is Outcome.PARTIAL
     assert result.closing.receiver.dispatched is False
     assert result.fallbacks and all(item.outcome is Outcome.SUCCESS for item in result.fallbacks)
+    assert result.reason is not None
+    assert f"paired closing: {result.closing.reason}" in result.reason
+    assert "fallback attempt 1 fully closed the residual" in result.reason
+    assert "final inventory confirmed flat" in result.reason
+    assert "fees UNKNOWN" in result.reason
+    assert "final inventory known residual" not in result.reason
+    cycle_rows = [
+        json.loads(line)
+        for line in (
+            tmp_path / f"closing-source-{direction.value.lower()}-{fill_fraction}-{visible}" / "cycle.jsonl"
+        ).read_text().splitlines()
+    ]
+    complete_rows = [row for row in cycle_rows if row["event"] == "CYCLE_COMPLETE"]
+    assert complete_rows and complete_rows[-1]["payload"]["reason"] == result.reason
     assert client.submissions[2].account_index == client.source_account_index
     assert client.submissions[2].order_type == "LIMIT"
     assert client.submissions[2].reduce_only is True
