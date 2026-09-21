@@ -978,7 +978,6 @@ def _simple_event_line(row: Mapping[str, Any]) -> str | None:
                 if zero_fill_cancel:
                     return "Источник подтверждён как zero-fill/cancel; ордер приёмника не отправлялся."
                 return "Источник: исполнение не подтверждено; ордер приёмника не отправлялся."
-            return "Источник: исполнение не подтверждено; ордер приёмника не отправлялся."
         return "Открытие и его сверка завершены."
     if event == "PRE_RECEIVER_GUARD":
         status = payload.get("status") or payload.get("priority_status") or "UNKNOWN"

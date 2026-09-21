@@ -3334,6 +3334,18 @@ def test_cli_opening_complete_checks_source_fill_and_distinguishes_zero_fill_can
         "Источник получил подтверждённое исполнение; ордер приёмника не отправлялся."
     )
 
+    dispatched = {
+        "event": "OPENING_COMPLETE",
+        "payload": {"result": {"receiver": {"dispatched": True}}},
+    }
+    assert cli_module._simple_event_line(dispatched) == "Открытие и его сверка завершены."
+
+    unknown_dispatch = {
+        "event": "OPENING_COMPLETE",
+        "payload": {"result": {"receiver": {}}},
+    }
+    assert cli_module._simple_event_line(unknown_dispatch) == "Открытие и его сверка завершены."
+
 
 def test_cli_uses_durable_terminal_positions_when_result_fields_are_unknown(tmp_path):
     journal_path = tmp_path / "cycle.jsonl"

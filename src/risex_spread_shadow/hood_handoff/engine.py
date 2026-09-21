@@ -1767,6 +1767,7 @@ class HandoffEngine:
         last_history_error: str | None = None
         last_account_error: str | None = None
         last_order_error: str | None = None
+        read_validation_barrier = False
         after: AccountSnapshot | None = None
         order: OrderSnapshot | None = None
 
@@ -1843,6 +1844,24 @@ class HandoffEngine:
                             )
                         )
                         last_history_error = None
+                    except ContractError as exc:
+                        reason = f"trade history read failed: {sanitize_exception(exc)}"
+                        add_local_unknown(reason)
+                        read_validation_barrier = True
+                        last_history_error = None
+                        journal.append(
+                            "RECONCILIATION_READ_ERROR",
+                            {
+                                "leg": plan.side,
+                                "kind": "trade_history",
+                                "round": reconcile_round_count,
+                                "reason": reason,
+                                "classification": "CONTRACT_ERROR",
+                            },
+                            run_id=run_id,
+                        )
+                        round_complete = False
+                        break
                     except Exception as exc:
                         last_history_error = f"trade history read failed: {sanitize_exception(exc)}"
                         journal.append(
@@ -1880,6 +1899,21 @@ class HandoffEngine:
                     )
                 )
                 last_account_error = None
+            except ContractError as exc:
+                after = None
+                last_account_error = f"final account read failed: {sanitize_exception(exc)}"
+                read_validation_barrier = True
+                journal.append(
+                    "RECONCILIATION_READ_ERROR",
+                    {
+                        "leg": plan.side,
+                        "kind": "account",
+                        "round": reconcile_round_count,
+                        "reason": last_account_error,
+                        "classification": "CONTRACT_ERROR",
+                    },
+                    run_id=run_id,
+                )
             except Exception as exc:
                 after = None
                 last_account_error = f"final account read failed: {sanitize_exception(exc)}"
@@ -1902,6 +1936,21 @@ class HandoffEngine:
                         client_order_index=plan.client_order_index,
                     )
                     last_order_error = None
+                except ContractError as exc:
+                    order = None
+                    last_order_error = f"final order read failed: {sanitize_exception(exc)}"
+                    read_validation_barrier = True
+                    journal.append(
+                        "RECONCILIATION_READ_ERROR",
+                        {
+                            "leg": plan.side,
+                            "kind": "order",
+                            "round": reconcile_round_count,
+                            "reason": last_order_error,
+                            "classification": "CONTRACT_ERROR",
+                        },
+                        run_id=run_id,
+                    )
                 except Exception as exc:
                     order = None
                     last_order_error = f"final order read failed: {sanitize_exception(exc)}"
@@ -1949,7 +1998,19 @@ class HandoffEngine:
                 elif not self._snapshot_fresh(after, after_now, config.freshness_seconds):
                     account_needs_retry = True
                 if any(item.active for item in after.active_orders):
-                    account_needs_retry = True
+                    reason = "final account still has an active HOOD order"
+                    add_local_unknown(reason)
+                    read_validation_barrier = True
+                    journal.append(
+                        "RECONCILIATION_ACCOUNT_CONFLICT",
+                        {
+                            "leg": plan.side,
+                            "round": reconcile_round_count,
+                            "reason": reason,
+                            "account": self._account_observation_payload(after),
+                        },
+                        run_id=run_id,
+                    )
 
             expected_delta = (Decimal("-1") if plan.side == "SELL" else Decimal("1")) * trade_total
             position_mismatch = (
@@ -1969,6 +2030,7 @@ class HandoffEngine:
                 and not deadline_exceeded
                 and not order_identity_conflict
                 and not account_identity_conflict
+                and not read_validation_barrier
                 and not any(reason == "trade history cursor repeated" for reason in local_unknown)
             )
             needs_retry = bool(
