@@ -328,6 +328,8 @@ class HandoffEngine:
     def __init__(self, client: HandoffClient, *, clock: Clock | None = None) -> None:
         self.client = client
         self.clock = clock or SystemClock()
+        self._last_pre_visibility_refresh = False
+        self._last_pre_visibility_refresh_seconds = 0.0
 
     async def _read_public_book(
         self,
@@ -350,6 +352,8 @@ class HandoffEngine:
     async def _parallel_pre_receiver_checks(
         self,
         config: HandoffConfig,
+        *,
+        visibility_state: dict[str, float | bool | None] | None = None,
     ) -> tuple[AccountSnapshot, AccountSnapshot, dict[str, Any], float, float]:
         """Run independent account and public-book reads in one bounded window."""
 
@@ -361,14 +365,24 @@ class HandoffEngine:
             book_reader = getattr(self.client, "public_order_book", None)
         if not callable(book_reader):
             raise ContractError("paired operation requires a public order-book reader")
-        account_task = asyncio.create_task(
-            self._parallel_account_rechecks(
+        async def read_accounts() -> tuple[AccountSnapshot, AccountSnapshot]:
+            value = await self._parallel_account_rechecks(
                 _account_from_client(self.client, "source"),
                 _account_from_client(self.client, "receiver"),
                 config.market_id,
             )
-        )
-        book_task = asyncio.create_task(self._read_public_book(config))
+            if visibility_state is not None:
+                visibility_state["accounts_finished_at"] = time.perf_counter()
+            return value
+
+        async def read_book() -> tuple[dict[str, Any], float]:
+            value = await self._read_public_book(config)
+            if visibility_state is not None:
+                visibility_state["book_finished_at"] = time.perf_counter()
+            return value
+
+        account_task = asyncio.create_task(read_accounts())
+        book_task = asyncio.create_task(read_book())
         try:
             (source, receiver), (book, book_duration) = await asyncio.gather(account_task, book_task)
         except BaseException:
@@ -378,6 +392,20 @@ class HandoffEngine:
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
+        if visibility_state is not None:
+            visible_at = visibility_state.get("visible_finished_at")
+            component_finished = tuple(
+                value
+                for value in (
+                    visibility_state.get("accounts_finished_at"),
+                    visibility_state.get("book_finished_at"),
+                )
+                if isinstance(value, (int, float))
+            )
+            visibility_state["component_pre_visibility"] = bool(
+                isinstance(visible_at, (int, float))
+                and any(value < visible_at for value in component_finished)
+            )
         return source, receiver, book, book_duration, max(0.0, time.perf_counter() - started)
 
     async def _parallel_source_visibility_and_checks(
@@ -402,16 +430,34 @@ class HandoffEngine:
         """
 
         started = time.perf_counter()
-        visibility_task = asyncio.create_task(
-            self._poll_order(
+        visibility_finished_at: float | None = None
+        visibility_state: dict[str, float | bool | None] = {}
+        checks_finished_at: float | None = None
+
+        async def observe_source() -> OrderSnapshot | None:
+            nonlocal visibility_finished_at
+            value = await self._poll_order(
                 plan,
                 receipt.order_id,
                 journal,
                 run_id,
                 require_terminal=False,
             )
-        )
-        checks_task = asyncio.create_task(self._parallel_pre_receiver_checks(config))
+            visibility_finished_at = time.perf_counter()
+            visibility_state["visible_finished_at"] = visibility_finished_at
+            return value
+
+        async def read_checks() -> tuple[AccountSnapshot, AccountSnapshot, dict[str, Any], float, float]:
+            nonlocal checks_finished_at
+            value = await self._parallel_pre_receiver_checks(
+                config,
+                visibility_state=visibility_state,
+            )
+            checks_finished_at = time.perf_counter()
+            return value
+
+        visibility_task = asyncio.create_task(observe_source())
+        checks_task = asyncio.create_task(read_checks())
         try:
             source_order, checks = await asyncio.gather(visibility_task, checks_task)
         except BaseException:
@@ -420,6 +466,39 @@ class HandoffEngine:
                     task.cancel()
             await asyncio.gather(visibility_task, checks_task, return_exceptions=True)
             raise
+        # Account/book snapshots that completed before source visibility may
+        # legitimately omit the newly accepted order.  Refresh that narrow
+        # absence case once after visibility, while retaining explicit active
+        # foreign-order evidence as a real conflict.  This bounded refresh is
+        # only paid on propagation skew; the common fast path keeps one window.
+        self._last_pre_visibility_refresh = False
+        self._last_pre_visibility_refresh_seconds = 0.0
+        source_account_conflict = source_order is None or any(
+            order.active
+            and (
+                order.order_id != source_order.order_id
+                or not self._order_matches(order, plan)
+            )
+            for order in checks[0].active_orders
+        )
+        if (
+            source_order is not None
+            and visibility_finished_at is not None
+            and checks_finished_at is not None
+            and (
+                checks_finished_at < visibility_finished_at
+                or visibility_state.get("component_pre_visibility") is True
+            )
+            and not source_account_conflict
+            and not checks[1].active_orders
+        ):
+            refresh_started = time.perf_counter()
+            checks = await self._parallel_pre_receiver_checks(config)
+            self._last_pre_visibility_refresh = True
+            self._last_pre_visibility_refresh_seconds = max(
+                0.0,
+                time.perf_counter() - refresh_started,
+            )
         return source_order, checks, max(0.0, time.perf_counter() - started)
 
     async def execute(self, config: HandoffConfig) -> HandoffResult:
@@ -674,6 +753,7 @@ class HandoffEngine:
                         journal,
                         run_id,
                     )
+                    latency["pre_visibility_refresh_seconds"] = self._last_pre_visibility_refresh_seconds
                 else:
                     source_order = await self._poll_order(
                         plan.source,
@@ -1301,6 +1381,15 @@ class HandoffEngine:
         method = getattr(self.client, "submit_prepared_order", None)
         if not callable(method):
             raise ContractError("prepared dispatch client lacks prepared submission")
+        effective_deadline = plan.mutation_deadline_monotonic
+        if final_deadline is not None:
+            effective_deadline = (
+                final_deadline
+                if effective_deadline is None
+                else min(effective_deadline, final_deadline)
+            )
+        if effective_deadline is not None and effective_deadline - time.monotonic() <= 0:
+            raise TimeoutError("prepared order mutation crossed the final mutation barrier")
         try:
             parameters = inspect.signature(method).parameters.values()
             accepts_deadline = any(
@@ -1314,14 +1403,13 @@ class HandoffEngine:
             # surface; the SDK implementation exposes the optional keyword.
             accepts_deadline = False
         invocation = (
-            method(plan, prepared, deadline=final_deadline)
+            method(plan, prepared, deadline=effective_deadline)
             if accepts_deadline
             else method(plan, prepared)
         )
-        return await self._bounded(
-            invocation,
-            "prepared order mutation",
-        )
+        if effective_deadline is None:
+            return await self._bounded(invocation, "prepared order mutation")
+        return await self._bounded(invocation, "prepared order mutation", deadline=effective_deadline)
 
     async def _invalidate_prepared(self, prepared: Any | None) -> None:
         if prepared is None:
@@ -2749,12 +2837,28 @@ class HandoffEngine:
     def _request_timeout(self) -> float:
         return getattr(self, "_configured_request_timeout", 30.0)
 
-    async def _bounded(self, awaitable: Any, label: str) -> Any:
+    async def _bounded(
+        self,
+        awaitable: Any,
+        label: str,
+        *,
+        deadline: float | None = None,
+    ) -> Any:
         """Bound every SDK/read boundary without ever retrying a mutation."""
 
+        timeout = self._request_timeout
+        if deadline is not None:
+            timeout = min(timeout, deadline - time.monotonic())
+            if timeout <= 0:
+                close = getattr(awaitable, "close", None)
+                if callable(close):
+                    close()
+                raise TimeoutError(f"{label} crossed the final mutation barrier")
         try:
-            return await asyncio.wait_for(awaitable, timeout=self._request_timeout)
+            return await asyncio.wait_for(awaitable, timeout=timeout)
         except asyncio.TimeoutError as exc:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(f"{label} crossed the final mutation barrier") from exc
             raise TimeoutError(f"{label} exceeded configured request timeout") from exc
 
     @staticmethod

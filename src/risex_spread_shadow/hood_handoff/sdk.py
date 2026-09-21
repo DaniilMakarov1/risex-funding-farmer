@@ -96,6 +96,8 @@ class PreparedMutation:
     _tx_type: int
     _tx_info: str
     _tx_hash: str | None
+    _owner: object
+    _nonce: int
     _state: str = "READY"
 
     def __repr__(self) -> str:
@@ -398,6 +400,13 @@ class LighterSdkClient:
         # This keeps ownership deterministic when a caller prepares both legs
         # before exposing the source order.
         self._preparation_lock = asyncio.Lock()
+        # The API nonce manager is authoritative but may return the same nonce
+        # until the venue executes it.  Keep ownership in this adapter so two
+        # prepared legs, a cancel, or a second client cannot claim one nonce.
+        self._prepared_owner = object()
+        self._nonce_reservations: dict[tuple[int, int, int], PreparedMutation] = {}
+        self._blocked_nonces: dict[tuple[int, int], set[int]] = {}
+        self._prepared_registry: dict[int, PreparedMutation] = {}
         self._closed = False
         self.sdk_version = REQUIRED_LIGHTER_SDK_VERSION
         self._http = (http_factory or PlainAioHttp)(config.api_base_url, timeout_seconds=config.request_timeout_seconds)
@@ -1038,6 +1047,69 @@ class LighterSdkClient:
             raise ContractError("lighter-sdk nonce manager returned an invalid account/key nonce")
         return nonce
 
+    @staticmethod
+    def _nonce_key(account_index: int, api_key_index: int, nonce: int) -> tuple[int, int, int]:
+        return account_index, api_key_index, nonce
+
+    @staticmethod
+    def _account_key(account_index: int, api_key_index: int) -> tuple[int, int]:
+        return account_index, api_key_index
+
+    def _assert_nonce_available(self, account_index: int, api_key_index: int, nonce: int) -> None:
+        reservation_key = self._nonce_key(account_index, api_key_index, nonce)
+        if reservation_key in self._nonce_reservations:
+            raise ContractError("account/key nonce is already reserved by an active mutation")
+        if nonce in self._blocked_nonces.get(self._account_key(account_index, api_key_index), set()):
+            raise ContractError("account/key nonce was already sent and cannot be reused")
+
+    def _register_prepared(self, prepared: PreparedMutation) -> None:
+        reservation_key = self._nonce_key(
+            prepared.account_index,
+            prepared.api_key_index,
+            prepared._nonce,
+        )
+        self._assert_nonce_available(
+            prepared.account_index,
+            prepared.api_key_index,
+            prepared._nonce,
+        )
+        self._nonce_reservations[reservation_key] = prepared
+        self._prepared_registry[id(prepared)] = prepared
+
+    def _is_owned_prepared(self, prepared: Any) -> bool:
+        return (
+            isinstance(prepared, PreparedMutation)
+            and prepared._owner is self._prepared_owner
+            and self._prepared_registry.get(id(prepared)) is prepared
+        )
+
+    def _release_prepared_reservation(self, prepared: PreparedMutation) -> None:
+        reservation_key = self._nonce_key(
+            prepared.account_index,
+            prepared.api_key_index,
+            prepared._nonce,
+        )
+        if self._nonce_reservations.get(reservation_key) is prepared:
+            self._nonce_reservations.pop(reservation_key, None)
+
+    def _block_nonce(self, account_index: int, api_key_index: int, nonce: int) -> None:
+        self._nonce_reservations.pop(self._nonce_key(account_index, api_key_index, nonce), None)
+        self._blocked_nonces.setdefault(self._account_key(account_index, api_key_index), set()).add(nonce)
+
+    def _consume_prepared_for_send(self, prepared: PreparedMutation) -> bool:
+        if not prepared.consume():
+            return False
+        self._block_nonce(prepared.account_index, prepared.api_key_index, prepared._nonce)
+        return True
+
+    def _invalidate_owned(self, prepared: PreparedMutation) -> None:
+        if not self._is_owned_prepared(prepared):
+            return
+        was_ready = prepared._state == "READY"
+        prepared.invalidate()
+        if was_ready:
+            self._release_prepared_reservation(prepared)
+
     async def _send_signed_tx(self, tx_type: Any, tx_info: Any) -> Mapping[str, Any]:
         if isinstance(tx_type, bool) or not isinstance(tx_type, int) or not isinstance(tx_info, str) or not tx_info:
             raise ContractError("lighter-sdk signer returned malformed transaction data")
@@ -1102,7 +1174,7 @@ class LighterSdkClient:
                 raise ContractError("lighter-sdk signer returned malformed transaction data")
             if time.monotonic() >= deadline:
                 raise TimeoutError("order signing crossed the final mutation barrier")
-            return PreparedMutation(
+            prepared = PreparedMutation(
                 account_index=plan.account_index,
                 api_key_index=key_index,
                 plan_binding=_order_plan_binding(plan),
@@ -1110,7 +1182,11 @@ class LighterSdkClient:
                 _tx_type=tx_type,
                 _tx_info=tx_info,
                 _tx_hash=_safe_text(tx_hash),
+                _owner=self._prepared_owner,
+                _nonce=nonce,
             )
+            self._register_prepared(prepared)
+            return prepared
 
     async def submit_prepared_order(
         self,
@@ -1127,33 +1203,35 @@ class LighterSdkClient:
         """
 
         key_index = self.config.api_key_index
-        if key_index is None or not isinstance(prepared, PreparedMutation):
+        if key_index is None or not isinstance(prepared, PreparedMutation) or not self._is_owned_prepared(prepared):
             return MutationReceipt(False, None, None, "prepared order binding is invalid")
         if deadline is not None:
             try:
                 deadline = float(deadline)
             except (TypeError, ValueError):
-                prepared.invalidate()
+                async with self._preparation_lock:
+                    self._invalidate_owned(prepared)
                 return MutationReceipt(False, None, None, "prepared order deadline is invalid")
             if not math.isfinite(deadline) or deadline <= 0:
-                prepared.invalidate()
+                async with self._preparation_lock:
+                    self._invalidate_owned(prepared)
                 return MutationReceipt(False, None, None, "prepared order deadline is invalid")
-        if not prepared.matches(plan, api_key_index=key_index):
-            prepared.invalidate()
-            return MutationReceipt(False, None, None, "prepared order binding changed or was consumed")
-        if deadline is not None and deadline > prepared.deadline:
-            prepared.invalidate()
-            return MutationReceipt(False, None, None, "prepared order final deadline exceeds its bound")
-        if time.monotonic() >= prepared.deadline or (
-            deadline is not None and time.monotonic() >= deadline
-        ):
-            prepared.invalidate()
-            return MutationReceipt(False, None, None, "prepared order crossed the final mutation barrier")
-        if not prepared.consume():
-            return MutationReceipt(False, None, None, "prepared order was already consumed or invalidated")
+        async with self._preparation_lock:
+            if not prepared.matches(plan, api_key_index=key_index):
+                self._invalidate_owned(prepared)
+                return MutationReceipt(False, None, None, "prepared order binding changed or was consumed")
+            if deadline is not None and deadline > prepared.deadline:
+                self._invalidate_owned(prepared)
+                return MutationReceipt(False, None, None, "prepared order final deadline exceeds its bound")
+            dispatch_deadline = min(prepared.deadline, deadline) if deadline is not None else prepared.deadline
+            if time.monotonic() >= dispatch_deadline:
+                self._invalidate_owned(prepared)
+                return MutationReceipt(False, None, None, "prepared order crossed the final mutation barrier")
+            if not self._consume_prepared_for_send(prepared):
+                return MutationReceipt(False, None, None, "prepared order was already consumed or invalidated")
         response = await self._bounded(
             self._send_signed_tx(prepared._tx_type, prepared._tx_info),
-            min(prepared.deadline, deadline) if deadline is not None else prepared.deadline,
+            dispatch_deadline,
             "order dispatch",
         )
         code = _response_code(response)
@@ -1171,7 +1249,8 @@ class LighterSdkClient:
         """Invalidate an unused preparation after a source-side barrier."""
 
         if isinstance(prepared, PreparedMutation):
-            prepared.invalidate()
+            async with self._preparation_lock:
+                self._invalidate_owned(prepared)
 
     async def submit_order(self, plan: OrderPlan) -> MutationReceipt:
         """Prepare and send one order, retaining the legacy generic surface."""
@@ -1185,7 +1264,6 @@ class LighterSdkClient:
     async def cancel_order(self, account_index: int, market_id: int, order_id: str) -> MutationReceipt:
         deadline = self._pending_mutation_deadline
         self._pending_mutation_deadline = None
-        signer = self._signer(account_index)
         key_index = self.config.api_key_index
         assert key_index is not None
         # As with submit_order, keep known pre-send failures as a rejected
@@ -1198,30 +1276,43 @@ class LighterSdkClient:
                     self.config.request_timeout_seconds,
                     self.config.freshness_seconds,
                 )
-            nonce = await self._next_nonce(signer, key_index, deadline=deadline)
-            if time.monotonic() >= deadline:
-                raise TimeoutError("nonce acquisition crossed the final mutation barrier")
-            signer_type = type(signer)
-            result = await self._bounded(
-                _await(
-                    signer.sign_cancel_order(
-                        market_index=market_id,
-                        order_index=int(order_id),
-                        skip_nonce=getattr(signer_type, "SKIP_NONCE_OFF", 0),
-                        nonce=nonce,
-                        api_key_index=key_index,
-                    )
-                ),
-                deadline,
-                "cancel signing",
-            )
-            if not isinstance(result, tuple) or len(result) != 4:
-                raise RuntimeError("lighter-sdk sign_cancel_order returned an unsupported shape")
-            tx_type, tx_info, tx_hash, error = result
-            if error:
-                return MutationReceipt(False, order_id, _safe_text(tx_hash), sanitize_exception(ValueError(str(error))))
-            if time.monotonic() >= deadline:
-                raise TimeoutError("cancel signing crossed the final mutation barrier")
+            async with self._preparation_lock:
+                signer = self._signer(account_index)
+                nonce = await self._next_nonce(signer, key_index, deadline=deadline)
+                self._assert_nonce_available(account_index, key_index, nonce)
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("nonce acquisition crossed the final mutation barrier")
+                signer_type = type(signer)
+                result = await self._bounded(
+                    _await(
+                        signer.sign_cancel_order(
+                            market_index=market_id,
+                            order_index=int(order_id),
+                            skip_nonce=getattr(signer_type, "SKIP_NONCE_OFF", 0),
+                            nonce=nonce,
+                            api_key_index=key_index,
+                        )
+                    ),
+                    deadline,
+                    "cancel signing",
+                )
+                if not isinstance(result, tuple) or len(result) != 4:
+                    raise RuntimeError("lighter-sdk sign_cancel_order returned an unsupported shape")
+                tx_type, tx_info, tx_hash, error = result
+                if error:
+                    return MutationReceipt(False, order_id, _safe_text(tx_hash), sanitize_exception(ValueError(str(error))))
+                if (
+                    isinstance(tx_type, bool)
+                    or not isinstance(tx_type, int)
+                    or not isinstance(tx_info, str)
+                    or not tx_info
+                ):
+                    raise ContractError("lighter-sdk signer returned malformed transaction data")
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("cancel signing crossed the final mutation barrier")
+                # Cancellation has no PreparedMutation object, so reserve its
+                # nonce directly before releasing the serialized signing lock.
+                self._block_nonce(account_index, key_index, nonce)
         except Exception as exc:
             return MutationReceipt(False, order_id, None, sanitize_exception(exc))
         response = await self._bounded(

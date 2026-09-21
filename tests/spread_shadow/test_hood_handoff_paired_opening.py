@@ -5,6 +5,7 @@ from dataclasses import replace
 from decimal import Decimal
 import json
 from pathlib import Path
+import time
 from time import perf_counter
 from types import SimpleNamespace
 
@@ -197,7 +198,7 @@ class PairedClient:
                 side=plan.side,
                 order_type="LIMIT",
                 time_in_force="POST_ONLY",
-                reduce_only=False,
+                reduce_only=plan.reduce_only,
                 initial_quantity=plan.quantity,
                 remaining_quantity=Decimal("0") if self.source_fills_before_receiver else plan.quantity,
                 filled_quantity=plan.quantity if self.source_fills_before_receiver else Decimal("0"),
@@ -223,7 +224,7 @@ class PairedClient:
             side=plan.side,
             order_type="MARKET",
             time_in_force="IOC",
-            reduce_only=False,
+            reduce_only=plan.reduce_only,
             initial_quantity=plan.quantity,
             remaining_quantity=plan.quantity - fill_quantity,
             filled_quantity=fill_quantity,
@@ -385,6 +386,104 @@ class DelayedPairedClient(PairedClient):
             order_id=order_id,
             client_order_index=client_order_index,
         )
+
+
+class PropagatingPreparedPairedClient(PreparedPairedClient):
+    """Delay source visibility while early account/book reads remain causal."""
+
+    def __init__(self, *, closing: bool = False, foreign_conflict: bool = False) -> None:
+        super().__init__()
+        if closing:
+            self.source_position = Decimal("0.20")
+            self.receiver_position = Decimal("-0.20")
+        self.closing = closing
+        self.foreign_conflict = foreign_conflict
+        self.source_visible = False
+        self.source_dispatch_started = False
+        self.source_lookup_calls = 0
+        self.read_counts = {"account": 0, "book": 0, "lookup": 0}
+
+    def _foreign_order(self) -> OrderSnapshot:
+        return OrderSnapshot(
+            account_index=self.source_account_index,
+            market_id=1,
+            order_id="foreign-active-order",
+            client_order_index=999,
+            status="open",
+            side="SELL",
+            order_type="LIMIT",
+            time_in_force="POST_ONLY",
+            reduce_only=self.closing,
+            initial_quantity=Decimal("0.10"),
+            remaining_quantity=Decimal("0.10"),
+            filled_quantity=Decimal("0"),
+            price=Decimal("99.0"),
+            observed_at=NOW,
+        )
+
+    async def account_snapshot(self, account_index: int, market_id: int) -> AccountSnapshot:
+        self.read_counts["account"] += 1
+        if (
+            account_index == self.source_account_index
+            and not self.source_visible
+            and self.source_dispatch_started
+        ):
+            active = (self._foreign_order(),) if self.foreign_conflict else ()
+            return _account_snapshot(account_index, self.source_position, active)
+        return await super().account_snapshot(account_index, market_id)
+
+    async def order_book(self, market_id: int) -> OrderBookSnapshot:
+        self.read_counts["book"] += 1
+        value = await super().order_book(market_id)
+        if self.source_visible:
+            return value
+        # A source order accepted by the sequencer may be absent from the
+        # first public snapshot.  Leave only a neutral guard level here; the
+        # post-visibility refresh must recover the exact owner-bound level.
+        return replace(
+            value,
+            asks=(DepthLevel(Decimal("101.0"), Decimal("1"), "ask-guard", 999),),
+            bids=(DepthLevel(Decimal("99.0"), Decimal("1"), "bid-guard", 999),),
+        )
+
+    async def lookup_order(
+        self,
+        account_index: int,
+        market_id: int,
+        *,
+        order_id=None,
+        client_order_index=None,
+    ):
+        self.read_counts["lookup"] += 1
+        if account_index == self.source_account_index and order_id is not None:
+            self.source_lookup_calls += 1
+            if self.source_lookup_calls == 1:
+                await asyncio.sleep(0.02)
+                self.source_visible = True
+        return await super().lookup_order(
+            account_index,
+            market_id,
+            order_id=order_id,
+            client_order_index=client_order_index,
+        )
+
+    async def submit_prepared_order(self, plan, prepared, *, deadline=None):
+        if plan.account_index == self.source_account_index:
+            self.source_dispatch_started = True
+        return await super().submit_prepared_order(plan, prepared, deadline=deadline)
+
+
+class DelayedLegacyPreparedPairedClient(LegacyPreparedPairedClient):
+    """Two-argument adapter whose mutation crosses the final deadline."""
+
+    def __init__(self, *, delay: float) -> None:
+        super().__init__()
+        self.delay = delay
+
+    async def submit_prepared_order(self, plan, prepared):
+        if plan.account_index == self.receiver_account_index:
+            await asyncio.sleep(self.delay)
+        return await super().submit_prepared_order(plan, prepared)
 
 
 class NoBookPairedClient(PairedClient):
@@ -692,6 +791,96 @@ async def test_coalesced_source_visibility_reduces_window_without_reducing_reads
     fast_window = fast_result.latency["coalesced_pre_receiver_window_seconds"]
     serial_window = serial_result.latency["coalesced_pre_receiver_window_seconds"]
     assert serial_window > fast_window + delay * 0.5
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("closing", "foreign_conflict"),
+    [(False, False), (True, False), (False, True)],
+)
+async def test_source_propagation_refreshes_only_causal_absence_for_open_and_close(
+    tmp_path,
+    closing,
+    foreign_conflict,
+):
+    client = PropagatingPreparedPairedClient(
+        closing=closing,
+        foreign_conflict=foreign_conflict,
+    )
+    operation_mode = OperationMode.PAIRED_CLOSING if closing else OperationMode.PAIRED_OPENING
+    result = await run_handoff(
+        config(
+            tmp_path / f"propagation-{closing}-{foreign_conflict}.jsonl",
+            operation_mode=operation_mode,
+        ),
+        client,
+        clock=Clock(),
+    )
+
+    if foreign_conflict:
+        assert result.outcome is Outcome.UNKNOWN, result.as_dict()
+        assert any("additional or conflicting active order" in reason for reason in result.unknown_reasons)
+        assert [plan.account_index for plan in client.submissions] == [client.source_account_index]
+        assert result.latency.get("pre_visibility_refresh_seconds") == 0.0
+    else:
+        assert result.outcome is Outcome.SUCCESS, result.as_dict()
+        assert [plan.account_index for plan in client.submissions] == [
+            client.source_account_index,
+            client.receiver_account_index,
+        ]
+        assert result.latency["pre_visibility_refresh_seconds"] > 0
+        assert client.read_counts["account"] >= 6
+        assert client.read_counts["book"] >= 2
+
+
+def _prepared_test_plan(*, account_index: int, deadline: float) -> OrderPlan:
+    return OrderPlan(
+        account_index=account_index,
+        market_id=1,
+        side="SELL" if account_index == 11 else "BUY",
+        quantity=Decimal("0.20"),
+        quantity_int=20,
+        price=Decimal("100.0"),
+        price_int=1000,
+        order_type="LIMIT",
+        time_in_force="POST_ONLY",
+        reduce_only=False,
+        order_expiry_ms=1_500_000,
+        client_order_index=account_index,
+        mutation_deadline_monotonic=deadline,
+    )
+
+
+@pytest.mark.asyncio
+async def test_two_argument_prepared_submission_checks_expired_deadline_before_invocation():
+    client = LegacyPreparedPairedClient()
+    engine = HandoffEngine(client, clock=Clock())
+    plan = _prepared_test_plan(account_index=11, deadline=time.monotonic() - 1)
+    prepared = await client.prepare_order(plan)
+
+    with pytest.raises(TimeoutError, match="final mutation barrier"):
+        await engine._submit_order(
+            plan,
+            prepared=prepared,
+            final_deadline=plan.mutation_deadline_monotonic,
+        )
+    assert client.preparation_events == [("prepare", client.source_account_index)]
+
+
+@pytest.mark.asyncio
+async def test_two_argument_prepared_submission_is_bounded_across_await():
+    client = DelayedLegacyPreparedPairedClient(delay=0.05)
+    engine = HandoffEngine(client, clock=Clock())
+    plan = _prepared_test_plan(account_index=22, deadline=time.monotonic() + 0.01)
+    prepared = await client.prepare_order(plan)
+
+    with pytest.raises(TimeoutError, match="final mutation barrier"):
+        await engine._submit_order(
+            plan,
+            prepared=prepared,
+            final_deadline=plan.mutation_deadline_monotonic,
+        )
+    assert client.preparation_events == [("prepare", client.receiver_account_index)]
 
 
 def _guard_payload(path: Path) -> dict:
