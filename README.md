@@ -16,7 +16,7 @@ The short Russian output now separates these facts: whether the receiver was nev
 
 HCR-20 corrects the first one-command runtime failure. `./start` now always uses this project's `.venv-hood/bin/python`, regardless of the shell PATH. After Enter it verifies the local configuration, market-evidence file and exact `lighter-sdk==1.1.2` installation before reserving the next cycle slot. A missing/broken SDK or local file therefore produces a specific Russian setup error without Keychain, market/account reads or a consumed cycle directory. Historical `cycle-002`, which stopped with `sdk_error` before any order boundary, is preserved and must not be reused.
 
-**Historical owner result:** `operator-v1/cycle-001`, `cycle-002` and `cycle-003` are consumed and must never be cleared or reused. The HCR-21 read-only diagnosis observed source27331 SHORT0.00023BTC and receiver27337 zero with no active BTC orders around timestamp1789892127.81; this is historical evidence, not a current-flatness claim. No position was changed by the software correction. A new opening still requires both accounts exactly flat with no active BTC orders.
+**Historical owner result:** `operator-v1/cycle-001` through `cycle-004` are consumed and must never be cleared or reused. Cycle-004 ended with confirmed flat final positions only after a receiver fill against an external maker and a later residual fallback; missing fee and boundary-book evidence remains UNKNOWN. These are historical observations, not a current-flatness claim. No position was changed by the software correction. A new opening still requires both accounts exactly flat with no active BTC orders.
 
 Candidate `ebabbfaac88ca6d69aef9b15ad396414871e641a` passed 4587 tests with 3 skips in the final clean isolated Python 3.11 suite. During preparation, a normal quote move now refreshes the price instead of ending the launch. The program keeps the originally selected quantity and hold, rechecks that quantity against the fresh price, minimums, balance and account state, and makes at most three safe preparation attempts before any order may be sent. Deterministic safety errors stop immediately. After an order may have been sent, automatic preparation retry is disabled.
 
@@ -27,7 +27,7 @@ The operator files are in:
 
 - `random-cycle.json` binds BTC market1, source27331/receiver27337, APIkey4, Robinhood endpoint/signing domain466324, the existing timing defaults and the explicitly authorized incremental opening-margin deferral.
 - `market-contract.json` contains only market identity and provenance requirements. It contains no guessed fees, minimums, balances or fresh timestamp. The actual response after LAUNCH must supply current increments/minimums; incomplete or stale evidence stops the dependent action.
-- `cycle-001`, `cycle-002` and `cycle-003` are consumed evidence. Preserve them permanently. The launcher atomically chooses the next unused owner-only `cycle-NNN` directory and a unique client-order prefix after confirmation.
+- `cycle-001` through `cycle-004` are consumed evidence. Preserve them permanently. The launcher atomically chooses the next unused owner-only `cycle-NNN` directory and a unique client-order prefix after confirmation.
 
 From the project folder, the normal launch is now one command:
 
