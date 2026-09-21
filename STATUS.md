@@ -1,5 +1,11 @@
 # Current status
 
+## HCR-24 — IN PROGRESS; cycle005 recovery and faster paired path
+
+Owner authorized the finite NEXT_TASK contract after running cycle005 on accepted a4ef37f. Historical cycle005 records source-.00024BTC/receiver0, no receiver/fallback submission on its second attempt, and no current position check has been performed. First fresh Builder owns recovery/diagnostics; Chief independently reproduced all three counterexamples and completed official Robinhood-domain batch/stream research. Next fresh Builder will own fast prepared dispatch after recovery integration to avoid overlapping engine writers. No repeated management polling; native result delivery continues this Chief task.
+
+Batch exists but two-account execution/atomicity guarantees remain unproved. Cache-only feed admission lacks exact public ownership/aligned complete account state evidence. Those paths remain disabled; reduction of serial reads and exact prepared receiver dispatch proceeds. No live account/Keychain/market operation, tier change, new cycle or historical journal edit is authorized by this implementation task. Evidence: ignored owner-only hood-fast-pair-20260921/chief-v1.
+
 ## HCR-23 — COMPLETE; accepted offline and installed
 
 Independent audit of baseline `9d1ce057b331b1e5dc77e4fd38fbe83c330b3764` is complete. Accepted SDK candidate `c589f888699139935b69ccf9844b307141905087` and corrected state candidate `629501331aebc19998127a890b23fb81ea2b74aa` are integrated. SendTx ambiguity now stops dependent writes across both accounts; account observations retain their original age and conflicting position rows are rejected. The HTTP transport reuses one owned session. Journals complete partial/interrupted writes, fail closed after errors and release locks on failed acquisition. Confirmed-flat inventory requires resolved execution and final per-account causal agreement, independently of unknown fees. Cycle004 fixture owner/side/position/fees now match the preserved known facts.
