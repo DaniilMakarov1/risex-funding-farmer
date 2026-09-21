@@ -12,6 +12,13 @@ This authorizes implementation through fresh Builders, offline probes, synthetic
 2. Measure avoidable SDK transport overhead. Reuse explicit HTTP connections only with owned cleanup, request-local authentication, unchanged timeouts and exactly one mutation request without redirect or retry. No increase in account-read fan-out or causal changes. Synthetic measurements must distinguish eliminated setup from unknown live latency.
 3. Chief independently reviews remaining admission/retry/close/fallback, restart/no-replay, sizing and output. Fix concrete counterexamples within established behavior only. Include inaccurate cycle-004 fixture account/side/position and fabricated fee evidence; preserve original journals. Record further bounded findings here before assignment. No generic infrastructure rewrite.
 
+## Additional independently reproduced findings
+
+- Journal `append` ignores a short `os.write`: with an injected half-write it returns SOURCE_DISPATCH_INTENT successfully while the journal cannot be decoded. Require complete durable intent before any mutation; short writes must be completed or fail closed, with no hidden destructive repair or replay. Audit the same bounded write primitive for lock/launch records where directly relevant.
+- A source submit raising TimeoutError, missing terminal order/incomplete trade history, and fresh observed zero positions currently produces overall UNKNOWN but inventory CONFIRMED_FLAT. Preserve observed zero positions separately; confirmed-flat inventory requires no unresolved submitted order and complete causal evidence. No account-only zero observation may upgrade an ambiguous write.
+- Account payload with two selected-market position rows (0 and +0.2) is silently reduced to the first row; an active-orders delay of 3 seconds restamps the earlier position from time1000 to1003. SDK slice must reject duplicate/conflicting identity and preserve original age.
+- Cycle-004 fixture's first fallback incorrectly uses source27331 BUY/-0.00026 instead of receiver27337 SELL/+0.00026; its second fee is fabricated. Correct the fixture from preserved known facts, keeping unavailable fee UNKNOWN.
+
 ## Ownership and completion
 
 Chief task `01a0aafe-23fa-7c90-87a6-e807b3f6450a` owns contract, audit, review and sole integration/push. Fresh Builder sessions use configured Builder role GPT-5.6 Luna max with explicit isolated named worktrees/file ownership; historical Builders are not reused. Standard processing requested; no speed verification claim absent client evidence. Builders must not spawn agents, edit governing files, merge/push main, access credentials or make live requests. Completion returns through collaboration delivery; no management polling loops.
