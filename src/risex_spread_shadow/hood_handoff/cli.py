@@ -896,7 +896,88 @@ def _simple_event_line(row: Mapping[str, Any]) -> str | None:
         if isinstance(result, Mapping):
             receiver = result.get("receiver")
             if isinstance(receiver, Mapping) and receiver.get("dispatched") is False:
-                return "Источник получил наблюдаемое исполнение; ордер приёмника не отправлялся."
+                source = result.get("source")
+                source_order = source.get("order") if isinstance(source, Mapping) else None
+                source_trades = source.get("trades") if isinstance(source, Mapping) else None
+
+                def _decimal(value: Any) -> Decimal | None:
+                    try:
+                        parsed = Decimal(str(value))
+                    except (InvalidOperation, TypeError, ValueError):
+                        return None
+                    return parsed if parsed.is_finite() else None
+
+                source_fill = (
+                    _decimal(source.get("filled_quantity"))
+                    if isinstance(source, Mapping)
+                    else None
+                )
+                order_fill = (
+                    _decimal(source_order.get("filled_quantity"))
+                    if isinstance(source_order, Mapping)
+                    else None
+                )
+                source_order_id = (
+                    source.get("order_id")
+                    if isinstance(source, Mapping)
+                    else None
+                )
+                receipt_quantities: list[Decimal] = []
+                if isinstance(source_trades, list):
+                    for trade in source_trades:
+                        if not isinstance(trade, Mapping):
+                            receipt_quantities = []
+                            break
+                        quantity = _decimal(trade.get("quantity"))
+                        if quantity is None or quantity <= 0:
+                            receipt_quantities = []
+                            break
+                        receipt_quantities.append(quantity)
+                receipt_total = sum(receipt_quantities, Decimal(0))
+                exact_receipts = (
+                    isinstance(source_trades, list)
+                    and bool(source_trades)
+                    and isinstance(source_order, Mapping)
+                    and isinstance(source_order_id, str)
+                    and source_fill is not None
+                    and source_fill > 0
+                    and order_fill is not None
+                    and order_fill > 0
+                    and source_order.get("order_id") == source_order_id
+                    and receipt_total == source_fill == order_fill
+                    and all(
+                        isinstance(trade, Mapping)
+                        and trade.get("order_id") == source_order_id
+                        for trade in source_trades
+                    )
+                )
+                if exact_receipts:
+                    return "Источник получил подтверждённое исполнение; ордер приёмника не отправлялся."
+                zero_fill_cancel = (
+                    isinstance(source, Mapping)
+                    and isinstance(source_order, Mapping)
+                    and str(source_order.get("status", "")).lower() in {
+                        "canceled",
+                        "canceled-post-only",
+                        "canceled-reduce-only",
+                        "canceled-invalid-balance",
+                        "canceled-position-not-allowed",
+                        "canceled-margin-not-allowed",
+                        "canceled-too-much-slippage",
+                        "canceled-not-enough-liquidity",
+                        "canceled-self-trade",
+                        "canceled-expired",
+                        "canceled-oco",
+                        "canceled-child",
+                        "canceled-liquidation",
+                    }
+                    and source_fill == 0
+                    and order_fill == 0
+                    and not source_trades
+                )
+                if zero_fill_cancel:
+                    return "Источник подтверждён как zero-fill/cancel; ордер приёмника не отправлялся."
+                return "Источник: исполнение не подтверждено; ордер приёмника не отправлялся."
         return "Открытие и его сверка завершены."
     if event == "PRE_RECEIVER_GUARD":
         status = payload.get("status") or payload.get("priority_status") or "UNKNOWN"

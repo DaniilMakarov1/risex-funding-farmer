@@ -364,6 +364,204 @@ async def test_proven_pre_receiver_partial_is_partial_and_never_opens_receiver(t
 
 
 @pytest.mark.asyncio
+async def test_terminal_fill_retries_empty_complete_history_before_classifying(tmp_path):
+    class DelayedSourceHistory(FakeClient):
+        def __init__(self):
+            super().__init__(source_fills=True)
+            self.source_history_calls = 0
+
+        async def list_trades(self, account_index, market_id, *, order_id=None, cursor=None, limit=100):
+            if account_index == self.source_account_index and order_id == "source-1":
+                self.source_history_calls += 1
+                if self.source_history_calls == 1:
+                    return HistoryPage(trades=(), next_cursor=None, complete=True)
+            return await super().list_trades(
+                account_index,
+                market_id,
+                order_id=order_id,
+                cursor=cursor,
+                limit=limit,
+            )
+
+    client = DelayedSourceHistory()
+    result = await run_handoff(make_config(tmp_path / "delayed-history.jsonl"), client, clock=FakeClock())
+
+    assert result.outcome is Outcome.SUCCESS, result.as_dict()
+    assert client.source_history_calls == 2
+    assert result.source.filled_quantity == Decimal("0.125")
+    assert result.receiver.filled_quantity == Decimal("0.125")
+    assert not any("terminal order filled quantity conflicts" in item for item in result.unknown_reasons)
+
+
+@pytest.mark.asyncio
+async def test_permanent_empty_history_remains_unknown_without_fabricated_fill(tmp_path):
+    class EmptySourceHistory(FakeClient):
+        def __init__(self):
+            super().__init__(source_fills=True)
+            self.source_history_calls = 0
+
+        async def list_trades(self, account_index, market_id, *, order_id=None, cursor=None, limit=100):
+            if account_index == self.source_account_index and order_id == "source-1":
+                self.source_history_calls += 1
+                return HistoryPage(trades=(), next_cursor=None, complete=True)
+            return await super().list_trades(
+                account_index,
+                market_id,
+                order_id=order_id,
+                cursor=cursor,
+                limit=limit,
+            )
+
+    client = EmptySourceHistory()
+    result = await run_handoff(make_config(tmp_path / "empty-history.jsonl"), client, clock=FakeClock())
+
+    assert result.outcome is Outcome.UNKNOWN, result.as_dict()
+    assert client.source_history_calls == 2
+    assert result.source.filled_quantity == Decimal("0")
+    assert any("terminal order filled quantity conflicts" in item for item in result.unknown_reasons)
+
+
+@pytest.mark.asyncio
+async def test_wrong_trade_order_identity_remains_a_barrier(tmp_path):
+    class WrongTradeIdentity(FakeClient):
+        def __init__(self):
+            super().__init__(source_fills=True)
+
+        async def list_trades(self, account_index, market_id, *, order_id=None, cursor=None, limit=100):
+            page = await super().list_trades(
+                account_index,
+                market_id,
+                order_id=order_id,
+                cursor=cursor,
+                limit=limit,
+            )
+            if account_index == self.source_account_index and page.trades:
+                return HistoryPage(
+                    trades=(replace(page.trades[0], order_id="foreign-order"),),
+                    next_cursor=page.next_cursor,
+                    complete=page.complete,
+                )
+            return page
+
+    result = await run_handoff(make_config(tmp_path / "wrong-trade-order.jsonl"), WrongTradeIdentity(), clock=FakeClock())
+
+    assert result.outcome is Outcome.UNKNOWN, result.as_dict()
+    assert "trade receipt order identity conflicts with requested order" in result.unknown_reasons
+    assert result.source.filled_quantity == Decimal("0")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["history", "account", "order"])
+async def test_contract_decoder_error_is_sticky_before_later_valid_reconciliation_read(tmp_path, fault):
+    class DecoderFault(FakeClient):
+        def __init__(self):
+            super().__init__(source_fills=True)
+            self.receiver_submitted = False
+            self.injected = False
+
+        async def submit_order(self, plan):
+            receipt = await super().submit_order(plan)
+            if not plan.reduce_only:
+                self.receiver_submitted = True
+            return receipt
+
+        async def list_trades(self, account_index, market_id, *, order_id=None, cursor=None, limit=100):
+            if (
+                fault == "history"
+                and self.receiver_submitted
+                and account_index == self.source_account_index
+                and order_id == "source-1"
+                and not self.injected
+            ):
+                self.injected = True
+                raise ContractError("trade receipt does not belong to requested account")
+            return await super().list_trades(
+                account_index,
+                market_id,
+                order_id=order_id,
+                cursor=cursor,
+                limit=limit,
+            )
+
+        async def account_snapshot(self, account_index, market_id):
+            if (
+                fault == "account"
+                and self.receiver_submitted
+                and account_index == self.source_account_index
+                and not self.injected
+            ):
+                self.injected = True
+                raise ContractError("account decoder rejected identity")
+            return await super().account_snapshot(account_index, market_id)
+
+        async def lookup_order(self, account_index, market_id, *, order_id=None, client_order_index=None):
+            if (
+                fault == "order"
+                and self.receiver_submitted
+                and account_index == self.source_account_index
+                and order_id == "source-1"
+                and not self.injected
+            ):
+                self.injected = True
+                raise ContractError("exact order decoder rejected identity")
+            return await super().lookup_order(
+                account_index,
+                market_id,
+                order_id=order_id,
+                client_order_index=client_order_index,
+            )
+
+    client = DecoderFault()
+    result = await run_handoff(
+        make_config(tmp_path / f"decoder-{fault}.jsonl"),
+        client,
+        clock=FakeClock(),
+    )
+
+    assert result.outcome is Outcome.UNKNOWN, result.as_dict()
+    assert any("contract_error" in item for item in result.unknown_reasons)
+    assert client.injected is True
+
+
+@pytest.mark.asyncio
+async def test_foreign_active_order_seen_then_absent_remains_a_barrier(tmp_path):
+    class ForeignActiveOrderRace(FakeClient):
+        def __init__(self):
+            super().__init__(source_fills=True)
+            self.source_reconciliation_reads = 0
+
+        async def account_snapshot(self, account_index, market_id):
+            snapshot = await super().account_snapshot(account_index, market_id)
+            if (
+                self.receiver_order is not None
+                and account_index == self.source_account_index
+            ):
+                self.source_reconciliation_reads += 1
+                if self.source_reconciliation_reads == 1:
+                    foreign = replace(
+                        self.source_order,
+                        order_id="foreign-active",
+                        client_order_index=999,
+                        status="open",
+                        filled_quantity=Decimal("0"),
+                        remaining_quantity=Decimal("0.125"),
+                    )
+                    return replace(snapshot, active_orders=(foreign,))
+            return snapshot
+
+    client = ForeignActiveOrderRace()
+    result = await run_handoff(
+        make_config(tmp_path / "foreign-active-race.jsonl"),
+        client,
+        clock=FakeClock(),
+    )
+
+    assert result.outcome is Outcome.UNKNOWN, result.as_dict()
+    assert "final account still has an active HOOD order" in result.unknown_reasons
+    assert client.source_reconciliation_reads == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "direction, fill_fraction",
     [

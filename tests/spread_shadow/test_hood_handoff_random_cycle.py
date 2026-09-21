@@ -474,6 +474,63 @@ class ExternalOpeningClient(CycleClient):
         return value
 
 
+class AccountPositionLagOpeningClient(CycleClient):
+    """Expose an old position with an already-consumed exact source order."""
+
+    def __init__(self, clock: AdvancingClock, *, foreign_active_order: bool = False) -> None:
+        super().__init__(clock)
+        self.foreign_active_order = foreign_active_order
+        self.injected = False
+
+    async def account_snapshot(self, account_index, market_id):
+        snapshot = await super().account_snapshot(account_index, market_id)
+        if (
+            account_index == self.source_account_index
+            and snapshot.active_orders
+            and not self.injected
+        ):
+            source_order = snapshot.active_orders[0]
+            self._replace_order(
+                source_order,
+                status="filled",
+                filled_quantity=source_order.initial_quantity,
+                remaining_quantity=Decimal("0"),
+            )
+            self.source_position -= source_order.initial_quantity
+            trade = TradeReceipt(
+                "lagged-source-fill",
+                self.source_account_index,
+                market_id,
+                source_order.order_id,
+                source_order.side,
+                source_order.initial_quantity,
+                source_order.price,
+                None,
+                999,
+                self.clock.now(),
+                counterparty_order_id="external-maker",
+                counterparty_client_order_index="external-client",
+                client_order_index=source_order.client_order_index,
+            )
+            self.trades[source_order.order_id] = (trade,)
+            self.injected = True
+            if self.foreign_active_order:
+                foreign = replace(
+                    source_order,
+                    order_id="foreign-order",
+                    client_order_index=999,
+                    status="open",
+                    remaining_quantity=source_order.initial_quantity,
+                    filled_quantity=Decimal("0"),
+                )
+                self._save_order(foreign)
+                return replace(snapshot, active_orders=(foreign,))
+            # Preserve the old position timestamp/quantity while the active
+            # order list has already advanced past the exact source fill.
+            return replace(snapshot, active_orders=())
+        return snapshot
+
+
 class VisibleOpeningClient(ExternalOpeningClient):
     """Return the terminal source order after the external fill is visible."""
 
@@ -2524,6 +2581,57 @@ async def test_known_external_source_opening_fill_closes_residual_without_receiv
 
 
 @pytest.mark.asyncio
+async def test_lagged_source_active_snapshot_is_temporal_fill_and_closes_residual(
+    tmp_path,
+):
+    clock = AdvancingClock()
+    client = AccountPositionLagOpeningClient(clock)
+    result = await run_random_cycle(
+        cycle_config(tmp_path / "lagged-source-opening"),
+        client,
+        clock=clock,
+        rng=FixedRng(20, 20),
+    )
+
+    assert result.outcome is Outcome.PARTIAL
+    assert result.opening is not None
+    assert result.opening.outcome is Outcome.PARTIAL
+    assert result.opening.receiver is not None
+    assert result.opening.receiver.dispatched is False
+    assert result.opening.priority_guard is not None
+    assert result.opening.priority_guard["source_recheck_transition"] == "TEMPORALLY_SKEWED_EXACT_SOURCE_FILL"
+    assert result.opening.priority_guard["source_recheck"]["signed_position"] == "0"
+    assert result.opening.priority_guard["source_recheck"]["active_orders"] == []
+    assert "source recheck contains an additional or conflicting active order" not in result.opening.unknown_reasons
+    assert result.fallbacks and all(item.outcome is Outcome.SUCCESS for item in result.fallbacks)
+    assert [(plan.order_type, plan.reduce_only) for plan in client.submissions] == [
+        ("LIMIT", False),
+        ("MARKET", True),
+    ]
+    assert client.source_position == Decimal("0")
+    assert client.receiver_position == Decimal("0")
+
+
+@pytest.mark.asyncio
+async def test_lagged_source_snapshot_with_foreign_active_order_stays_unknown(tmp_path):
+    clock = AdvancingClock()
+    client = AccountPositionLagOpeningClient(clock, foreign_active_order=True)
+    result = await run_random_cycle(
+        cycle_config(tmp_path / "foreign-active-source"),
+        client,
+        clock=clock,
+        rng=FixedRng(20, 20),
+    )
+
+    assert result.outcome is Outcome.UNKNOWN
+    assert result.opening is not None
+    assert result.opening.receiver is not None
+    assert result.opening.receiver.dispatched is False
+    assert "source recheck contains an additional or conflicting active order" in result.opening.unknown_reasons
+    assert not [plan for plan in client.submissions if plan.order_type == "MARKET"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "direction, fill_fraction",
     [
@@ -3179,6 +3287,64 @@ def test_cli_cycle_003_explanation_distinguishes_receiver_fallback_and_timed_pos
     assert "известный terminal zero-fill/cancel" in output
     assert "источник=-0.00023 (время наблюдения 123.0)" in output
     assert "приёмник=0 (время наблюдения 124.0)" in output
+
+
+def test_cli_opening_complete_checks_source_fill_and_distinguishes_zero_fill_cancel():
+    zero_fill = {
+        "event": "OPENING_COMPLETE",
+        "payload": {
+            "result": {
+                "source": {
+                    "order_id": "source-1",
+                    "filled_quantity": "0",
+                    "trades": [],
+                    "order": {
+                        "order_id": "source-1",
+                        "status": "canceled-post-only",
+                        "filled_quantity": "0",
+                    },
+                },
+                "receiver": {"dispatched": False},
+            }
+        },
+    }
+    line = cli_module._simple_event_line(zero_fill)
+    assert line == "Источник подтверждён как zero-fill/cancel; ордер приёмника не отправлялся."
+    assert "наблюдаемое исполнение" not in line
+
+    filled = {
+        "event": "OPENING_COMPLETE",
+        "payload": {
+            "result": {
+                "source": {
+                    "order_id": "source-1",
+                    "filled_quantity": "0.125",
+                    "trades": [{"order_id": "source-1", "quantity": "0.125"}],
+                    "order": {
+                        "order_id": "source-1",
+                        "status": "filled",
+                        "filled_quantity": "0.125",
+                    },
+                },
+                "receiver": {"dispatched": False},
+            }
+        },
+    }
+    assert cli_module._simple_event_line(filled) == (
+        "Источник получил подтверждённое исполнение; ордер приёмника не отправлялся."
+    )
+
+    dispatched = {
+        "event": "OPENING_COMPLETE",
+        "payload": {"result": {"receiver": {"dispatched": True}}},
+    }
+    assert cli_module._simple_event_line(dispatched) == "Открытие и его сверка завершены."
+
+    unknown_dispatch = {
+        "event": "OPENING_COMPLETE",
+        "payload": {"result": {"receiver": {}}},
+    }
+    assert cli_module._simple_event_line(unknown_dispatch) == "Открытие и его сверка завершены."
 
 
 def test_cli_uses_durable_terminal_positions_when_result_fields_are_unknown(tmp_path):
