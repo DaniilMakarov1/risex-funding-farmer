@@ -523,6 +523,9 @@ class HandoffEngine:
         source_order_id: str | None = None
         guard_event_recorded = False
         guard_request_started_at = self.clock.now() if paired_mode else None
+        source_recheck: AccountSnapshot | None = None
+        receiver_recheck: AccountSnapshot | None = None
+        source_recheck_transition = "UNAVAILABLE"
         receiver_mutation_observations: tuple[Any, ...] = (source, receiver, plan.metadata_observed_at)
         receiver_mutation_observation_now: float | None = None
         try:
@@ -708,7 +711,40 @@ class HandoffEngine:
                 source_active_order_was_consumed_by_fill = (
                     source_fill_visible_in_recheck and not source_recheck.active_orders
                 )
-                if not source_active_order_matches and not source_active_order_was_consumed_by_fill:
+                source_exact_terminal_fill = (
+                    source_order is not None
+                    and self._order_matches(source_order, plan.source)
+                    and source_order.terminal
+                    and source_order.filled_quantity > 0
+                )
+                source_recheck_transition = (
+                    "EXACT_SOURCE_CONSUMED_BY_FILL"
+                    if source_active_order_was_consumed_by_fill
+                    else (
+                        "TEMPORALLY_SKEWED_EXACT_SOURCE_FILL"
+                        if (
+                            source_exact_terminal_fill
+                            and not source_recheck.active_orders
+                            and source_recheck.signed_position == source.signed_position
+                            and source_order is not None
+                            and source_order.observed_at >= source_recheck.observed_at
+                        )
+                        else (
+                            "EXACT_SOURCE_ACTIVE"
+                            if source_active_order_matches
+                            else (
+                                "CONFLICTING_ACTIVE_ORDER"
+                                if source_recheck.active_orders
+                                else "NO_ACTIVE_ORDER"
+                            )
+                        )
+                    )
+                )
+                if (
+                    not source_active_order_matches
+                    and not source_active_order_was_consumed_by_fill
+                    and source_recheck_transition != "TEMPORALLY_SKEWED_EXACT_SOURCE_FILL"
+                ):
                     unknown_reasons.append("source recheck contains an additional or conflicting active order")
                 if receiver_recheck.signed_position != receiver.signed_position:
                     unknown_reasons.append("receiver position changed before receiver dispatch")
@@ -812,10 +848,15 @@ class HandoffEngine:
                             "order_type": source_order.order_type,
                             "time_in_force": source_order.time_in_force,
                             "price": None if source_order.price is None else str(source_order.price),
+                            "initial_quantity": str(source_order.initial_quantity),
+                            "filled_quantity": str(source_order.filled_quantity),
                             "remaining_quantity": str(source_order.remaining_quantity),
                             "status": source_order.status,
                             "observed_at": source_order.observed_at,
                         }
+                    priority_guard["source_recheck"] = self._account_observation_payload(source_recheck)
+                    priority_guard["receiver_recheck"] = self._account_observation_payload(receiver_recheck)
+                    priority_guard["source_recheck_transition"] = source_recheck_transition
                     priority_guard["admission_reasons"] = list(unknown_reasons[:8])
                     journal.append(
                         "PRE_RECEIVER_GUARD",
@@ -1287,6 +1328,50 @@ class HandoffEngine:
     def _time_fresh(observed_at: float, now: float, freshness: float) -> bool:
         return observed_at <= now and now - observed_at <= freshness
 
+    @staticmethod
+    def _order_observation_payload(order: OrderSnapshot) -> dict[str, Any]:
+        """Keep bounded order identity/state evidence without SDK payloads."""
+
+        return {
+            "order_id": order.order_id,
+            "client_order_index": order.client_order_index,
+            "account_index": order.account_index,
+            "market_id": order.market_id,
+            "side": order.side,
+            "order_type": order.order_type,
+            "time_in_force": order.time_in_force,
+            "reduce_only": order.reduce_only,
+            "price": None if order.price is None else str(order.price),
+            "status": order.status,
+            "initial_quantity": str(order.initial_quantity),
+            "remaining_quantity": str(order.remaining_quantity),
+            "filled_quantity": str(order.filled_quantity),
+            "observed_at": order.observed_at,
+        }
+
+    @classmethod
+    def _account_observation_payload(
+        cls,
+        snapshot: AccountSnapshot | None,
+    ) -> dict[str, Any] | None:
+        """Preserve the account/active-order observations used by the guard."""
+
+        if snapshot is None:
+            return None
+        return {
+            "account_index": snapshot.account_index,
+            "market_id": snapshot.market_id,
+            "source_identity": snapshot.source_identity,
+            "signed_position": str(snapshot.signed_position),
+            "observed_at": snapshot.observed_at,
+            "authorized": snapshot.authorized,
+            "ready": snapshot.ready,
+            "active_orders": [
+                cls._order_observation_payload(order)
+                for order in snapshot.active_orders
+            ],
+        }
+
     def _active_orders_match(self, snapshot: AccountSnapshot, plan: OrderPlan, order_id: str) -> bool:
         active = tuple(order for order in snapshot.active_orders if order.active)
         if len(active) != 1:
@@ -1670,131 +1755,286 @@ class HandoffEngine:
                 local_unknown.append(f"{plan.side.lower()} order id is missing")
         trades: list[TradeReceipt] = []
         seen: dict[tuple[Any, ...], TradeReceipt] = {}
-        complete = True
-        cursor: str | None = None
+        complete = not (dispatched and order_id is not None)
         deadline = self.clock.now() + config.reconcile_timeout_seconds
         history_requested = dispatched and order_id is not None
         if dispatched and order_id is None:
             complete = False
-        for _ in range(max(1, config.max_poll_count)) if history_requested else ():
-            if self.clock.now() > deadline:
-                local_unknown.append("reconciliation deadline exceeded")
-                complete = False
-                break
+        history_page_count = 0
+        reconcile_round_count = 0
+        pagination_exhausted = False
+        deadline_exceeded = False
+        last_history_error: str | None = None
+        last_account_error: str | None = None
+        last_order_error: str | None = None
+        after: AccountSnapshot | None = None
+        order: OrderSnapshot | None = None
+
+        def add_local_unknown(reason: str) -> None:
+            if reason not in local_unknown:
+                local_unknown.append(reason)
+
+        def process_history_trade(trade: TradeReceipt) -> None:
+            if trade.account_index != plan.account_index or trade.market_id != plan.market_id:
+                add_local_unknown("trade history contains foreign account/market")
+                return
+            if trade.observed_at > self.clock.now():
+                add_local_unknown("trade receipt is from the future")
+                return
+            if order_id is not None and trade.order_id != order_id:
+                add_local_unknown("trade receipt order identity conflicts with requested order")
+                return
+            if trade.side.upper() != plan.side:
+                add_local_unknown("trade side conflicts with planned leg")
+                return
+            if plan.order_type == "LIMIT" and trade.price != plan.price:
+                add_local_unknown("limit trade price conflicts with planned price")
+                return
+            if plan.order_type == "MARKET":
+                within_bound = (
+                    trade.price <= plan.price if plan.side == "BUY" else trade.price >= plan.price
+                )
+                if not within_bound:
+                    add_local_unknown("market trade price violates the directional worst-price bound")
+                    return
+            economic_key = _trade_economic_key(trade)
+            previous = seen.get(economic_key)
+            if previous is not None:
+                # Observation timestamps can change between pages; the
+                # economic receipt identity must remain stable.
+                if previous.trade_id != trade.trade_id:
+                    add_local_unknown("economic receipt has conflicting trade identity")
+                return
+            if any(item.trade_id == trade.trade_id and _trade_economic_key(item) != economic_key for item in trades):
+                add_local_unknown("duplicate trade id has conflicting receipt fields")
+                return
+            seen[economic_key] = trade
+            trades.append(trade)
+
+        # A terminal order can become visible before its trade history and
+        # account position propagate.  Repeat only bounded read rounds; every
+        # mutation was already settled before this function was entered.
+        max_rounds = max(1, config.max_poll_count)
+        while True:
+            reconcile_round_count += 1
+            round_complete = True
+            if history_requested:
+                cursor: str | None = None
+                while True:
+                    if self.clock.now() > deadline:
+                        deadline_exceeded = True
+                        round_complete = False
+                        break
+                    if history_page_count >= max(1, config.max_poll_count):
+                        pagination_exhausted = bool(cursor)
+                        round_complete = False
+                        break
+                    try:
+                        page = _as_page(
+                            await self._bounded(
+                                self.client.list_trades(
+                                    plan.account_index,
+                                    plan.market_id,
+                                    order_id=order_id,
+                                    cursor=cursor,
+                                    limit=100,
+                                ),
+                                "trade history read",
+                            )
+                        )
+                        last_history_error = None
+                    except Exception as exc:
+                        last_history_error = f"trade history read failed: {sanitize_exception(exc)}"
+                        journal.append(
+                            "RECONCILIATION_READ_ERROR",
+                            {
+                                "leg": plan.side,
+                                "kind": "trade_history",
+                                "round": reconcile_round_count,
+                                "reason": last_history_error,
+                            },
+                            run_id=run_id,
+                        )
+                        round_complete = False
+                        break
+                    history_page_count += 1
+                    for trade in page.trades:
+                        process_history_trade(trade)
+                    if not page.next_cursor:
+                        round_complete = page.complete
+                        break
+                    if page.next_cursor == cursor:
+                        add_local_unknown("trade history cursor repeated")
+                        round_complete = False
+                        break
+                    cursor = page.next_cursor
+                complete = round_complete
+            else:
+                complete = not dispatched
+
             try:
-                page = _as_page(
+                after = _as_account(
                     await self._bounded(
-                        self.client.list_trades(
-                            plan.account_index,
-                            plan.market_id,
-                            order_id=order_id,
-                            cursor=cursor,
-                            limit=100,
-                        ),
-                        "trade history read",
+                        self.client.account_snapshot(plan.account_index, plan.market_id),
+                        "final account read",
                     )
                 )
+                last_account_error = None
             except Exception as exc:
-                local_unknown.append(f"trade history read failed: {sanitize_exception(exc)}")
-                complete = False
-                break
-            for trade in page.trades:
-                if trade.account_index != plan.account_index or trade.market_id != plan.market_id:
-                    local_unknown.append("trade history contains foreign account/market")
-                    continue
-                if trade.observed_at > self.clock.now():
-                    local_unknown.append("trade receipt is from the future")
-                    continue
-                if order_id is not None and trade.order_id != order_id:
-                    continue
-                if trade.side.upper() != plan.side:
-                    local_unknown.append("trade side conflicts with planned leg")
-                    continue
-                if plan.order_type == "LIMIT" and trade.price != plan.price:
-                    local_unknown.append("limit trade price conflicts with planned price")
-                    continue
-                if plan.order_type == "MARKET":
-                    within_bound = (
-                        trade.price <= plan.price if plan.side == "BUY" else trade.price >= plan.price
+                after = None
+                last_account_error = f"final account read failed: {sanitize_exception(exc)}"
+                journal.append(
+                    "RECONCILIATION_READ_ERROR",
+                    {
+                        "leg": plan.side,
+                        "kind": "account",
+                        "round": reconcile_round_count,
+                        "reason": last_account_error,
+                    },
+                    run_id=run_id,
+                )
+
+            if dispatched:
+                try:
+                    order = await self._lookup_order(
+                        plan,
+                        order_id,
+                        client_order_index=plan.client_order_index,
                     )
-                    if not within_bound:
-                        local_unknown.append("market trade price violates the directional worst-price bound")
-                        continue
-                economic_key = _trade_economic_key(trade)
-                previous = seen.get(economic_key)
-                if previous is not None:
-                    # Observation timestamps can change between pages; the
-                    # economic receipt identity must remain stable.
-                    if previous.trade_id != trade.trade_id:
-                        local_unknown.append("economic receipt has conflicting trade identity")
-                    continue
-                if any(item.trade_id == trade.trade_id and _trade_economic_key(item) != economic_key for item in trades):
-                    local_unknown.append("duplicate trade id has conflicting receipt fields")
-                    continue
-                seen[economic_key] = trade
-                trades.append(trade)
-            if not page.next_cursor:
-                complete = page.complete
-                break
-            if page.next_cursor == cursor:
-                local_unknown.append("trade history cursor repeated")
-                complete = False
-                break
-            cursor = page.next_cursor
-        else:
-            if history_requested:
-                local_unknown.append("trade history pagination exceeded configured bound")
-                complete = False
-        try:
-            after = _as_account(
-                await self._bounded(
-                    self.client.account_snapshot(plan.account_index, plan.market_id),
-                    "final account read",
+                    last_order_error = None
+                except Exception as exc:
+                    order = None
+                    last_order_error = f"final order read failed: {sanitize_exception(exc)}"
+                    journal.append(
+                        "RECONCILIATION_READ_ERROR",
+                        {
+                            "leg": plan.side,
+                            "kind": "order",
+                            "round": reconcile_round_count,
+                            "reason": last_order_error,
+                        },
+                        run_id=run_id,
+                    )
+
+            trade_total = sum((trade.quantity for trade in trades), Decimal(0))
+            order_identity_conflict = False
+            order_not_terminal = False
+            order_fill_mismatch = False
+            if dispatched and order is not None:
+                order_now = self.clock.now()
+                if not self._order_matches(order, plan):
+                    add_local_unknown("final order identity/parameters conflict with plan")
+                    order_identity_conflict = True
+                elif order_id is not None and order.order_id != str(order_id):
+                    add_local_unknown("final order identifier conflicts with dispatched order")
+                    order_identity_conflict = True
+                elif not self._time_fresh(order.observed_at, order_now, config.freshness_seconds):
+                    # A stale observation may be replaced by a fresh read in
+                    # the bounded reconciliation window.
+                    order_not_terminal = True
+                elif not order.terminal:
+                    order_not_terminal = True
+                else:
+                    order_fill_mismatch = order.filled_quantity != trade_total
+            elif dispatched and order is None:
+                order_not_terminal = True
+
+            account_identity_conflict = False
+            account_needs_retry = False
+            if after is not None:
+                after_now = self.clock.now()
+                if not self._snapshot_matches(after, plan, expected_identity=expected_identity):
+                    add_local_unknown("final account identity or freshness is not proven")
+                    account_identity_conflict = True
+                elif not self._snapshot_fresh(after, after_now, config.freshness_seconds):
+                    account_needs_retry = True
+                if any(item.active for item in after.active_orders):
+                    account_needs_retry = True
+
+            expected_delta = (Decimal("-1") if plan.side == "SELL" else Decimal("1")) * trade_total
+            position_mismatch = (
+                dispatched
+                and after is not None
+                and not account_identity_conflict
+                and after.signed_position != before.signed_position + expected_delta
+            )
+            if position_mismatch:
+                account_needs_retry = True
+
+            retry_allowed = (
+                reconcile_round_count < max_rounds
+                and history_page_count < max(1, config.max_poll_count)
+                and self.clock.now() <= deadline
+                and not pagination_exhausted
+                and not deadline_exceeded
+                and not order_identity_conflict
+                and not account_identity_conflict
+                and not any(reason == "trade history cursor repeated" for reason in local_unknown)
+            )
+            needs_retry = bool(
+                history_requested
+                and (
+                    not complete
+                    or order_not_terminal
+                    or order_fill_mismatch
+                    or after is None
+                    or bool(last_account_error)
+                    or bool(last_order_error)
+                    or account_needs_retry
                 )
             )
-            after_now = self.clock.now()
-            if not self._snapshot_matches(
-                after, plan, expected_identity=expected_identity
-            ) or not self._snapshot_fresh(
-                after, after_now, config.freshness_seconds
-            ):
-                local_unknown.append("final account identity or freshness is not proven")
-        except Exception as exc:
-            after = None
-            local_unknown.append(f"final account read failed: {sanitize_exception(exc)}")
-        order: OrderSnapshot | None = None
-        if dispatched:
-            try:
-                order = await self._lookup_order(plan, order_id, client_order_index=plan.client_order_index)
-                order_now = self.clock.now()
-            except Exception as exc:
-                order = None
-                order_now = self.clock.now()
-                local_unknown.append(f"final order read failed: {sanitize_exception(exc)}")
-            if order is None:
-                local_unknown.append("final order state is missing")
-            elif not self._order_matches(order, plan):
-                local_unknown.append("final order identity/parameters conflict with plan")
+            if not (retry_allowed and needs_retry):
+                break
+            remaining = deadline - self.clock.now()
+            if remaining <= 0:
+                deadline_exceeded = True
+                break
+            await self._sleep(min(self._poll_interval, remaining))
+
+        if deadline_exceeded:
+            add_local_unknown("reconciliation deadline exceeded")
+            complete = False
+        if pagination_exhausted:
+            add_local_unknown("trade history pagination exceeded configured bound")
+            complete = False
+        if last_history_error is not None:
+            add_local_unknown(last_history_error)
+            complete = False
+        if last_account_error is not None:
+            add_local_unknown(last_account_error)
+        if last_order_error is not None:
+            add_local_unknown(last_order_error)
+        if dispatched and order is None:
+            add_local_unknown("final order state is missing")
+        elif dispatched and order is not None:
+            order_now = self.clock.now()
+            if not self._order_matches(order, plan):
+                add_local_unknown("final order identity/parameters conflict with plan")
             elif order_id is not None and order.order_id != str(order_id):
-                local_unknown.append("final order identifier conflicts with dispatched order")
+                add_local_unknown("final order identifier conflicts with dispatched order")
             elif not self._time_fresh(order.observed_at, order_now, config.freshness_seconds):
-                local_unknown.append("final order state is stale or from the future")
+                add_local_unknown("final order state is stale or from the future")
             elif not order.terminal:
-                local_unknown.append("final order state is not terminal")
+                add_local_unknown("final order state is not terminal")
             if not complete:
-                local_unknown.append("trade history is incomplete")
+                add_local_unknown("trade history is incomplete")
             trade_total = sum((trade.quantity for trade in trades), Decimal(0))
-            if order is not None and order.filled_quantity != trade_total:
-                local_unknown.append("terminal order filled quantity conflicts with trade receipt sum")
-        elif after is not None and after.signed_position != before.signed_position:
-            local_unknown.append("non-dispatched leg position changed unexpectedly")
+            if order.filled_quantity != trade_total:
+                add_local_unknown("terminal order filled quantity conflicts with trade receipt sum")
+        if after is not None and (
+            not self._snapshot_matches(after, plan, expected_identity=expected_identity)
+            or not self._snapshot_fresh(after, self.clock.now(), config.freshness_seconds)
+        ):
+            add_local_unknown("final account identity or freshness is not proven")
+        if after is not None and not dispatched and after.signed_position != before.signed_position:
+            add_local_unknown("non-dispatched leg position changed unexpectedly")
         expected_delta = (Decimal("-1") if plan.side == "SELL" else Decimal("1")) * sum(
             (trade.quantity for trade in trades), Decimal(0)
         )
         if after is not None and dispatched and after.signed_position != before.signed_position + expected_delta:
-            local_unknown.append("final position does not equal independently reconciled trade quantity")
+            add_local_unknown("final position does not equal independently reconciled trade quantity")
         if after is not None and any(item.active for item in after.active_orders):
-            local_unknown.append("final account still has an active HOOD order")
+            add_local_unknown("final account still has an active HOOD order")
         for reason in local_unknown:
             if reason not in unknown_reasons:
                 unknown_reasons.append(reason)

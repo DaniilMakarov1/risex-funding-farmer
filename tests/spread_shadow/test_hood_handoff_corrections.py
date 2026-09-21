@@ -364,6 +364,93 @@ async def test_proven_pre_receiver_partial_is_partial_and_never_opens_receiver(t
 
 
 @pytest.mark.asyncio
+async def test_terminal_fill_retries_empty_complete_history_before_classifying(tmp_path):
+    class DelayedSourceHistory(FakeClient):
+        def __init__(self):
+            super().__init__(source_fills=True)
+            self.source_history_calls = 0
+
+        async def list_trades(self, account_index, market_id, *, order_id=None, cursor=None, limit=100):
+            if account_index == self.source_account_index and order_id == "source-1":
+                self.source_history_calls += 1
+                if self.source_history_calls == 1:
+                    return HistoryPage(trades=(), next_cursor=None, complete=True)
+            return await super().list_trades(
+                account_index,
+                market_id,
+                order_id=order_id,
+                cursor=cursor,
+                limit=limit,
+            )
+
+    client = DelayedSourceHistory()
+    result = await run_handoff(make_config(tmp_path / "delayed-history.jsonl"), client, clock=FakeClock())
+
+    assert result.outcome is Outcome.SUCCESS, result.as_dict()
+    assert client.source_history_calls == 2
+    assert result.source.filled_quantity == Decimal("0.125")
+    assert result.receiver.filled_quantity == Decimal("0.125")
+    assert not any("terminal order filled quantity conflicts" in item for item in result.unknown_reasons)
+
+
+@pytest.mark.asyncio
+async def test_permanent_empty_history_remains_unknown_without_fabricated_fill(tmp_path):
+    class EmptySourceHistory(FakeClient):
+        def __init__(self):
+            super().__init__(source_fills=True)
+            self.source_history_calls = 0
+
+        async def list_trades(self, account_index, market_id, *, order_id=None, cursor=None, limit=100):
+            if account_index == self.source_account_index and order_id == "source-1":
+                self.source_history_calls += 1
+                return HistoryPage(trades=(), next_cursor=None, complete=True)
+            return await super().list_trades(
+                account_index,
+                market_id,
+                order_id=order_id,
+                cursor=cursor,
+                limit=limit,
+            )
+
+    client = EmptySourceHistory()
+    result = await run_handoff(make_config(tmp_path / "empty-history.jsonl"), client, clock=FakeClock())
+
+    assert result.outcome is Outcome.UNKNOWN, result.as_dict()
+    assert client.source_history_calls == 2
+    assert result.source.filled_quantity == Decimal("0")
+    assert any("terminal order filled quantity conflicts" in item for item in result.unknown_reasons)
+
+
+@pytest.mark.asyncio
+async def test_wrong_trade_order_identity_remains_a_barrier(tmp_path):
+    class WrongTradeIdentity(FakeClient):
+        def __init__(self):
+            super().__init__(source_fills=True)
+
+        async def list_trades(self, account_index, market_id, *, order_id=None, cursor=None, limit=100):
+            page = await super().list_trades(
+                account_index,
+                market_id,
+                order_id=order_id,
+                cursor=cursor,
+                limit=limit,
+            )
+            if account_index == self.source_account_index and page.trades:
+                return HistoryPage(
+                    trades=(replace(page.trades[0], order_id="foreign-order"),),
+                    next_cursor=page.next_cursor,
+                    complete=page.complete,
+                )
+            return page
+
+    result = await run_handoff(make_config(tmp_path / "wrong-trade-order.jsonl"), WrongTradeIdentity(), clock=FakeClock())
+
+    assert result.outcome is Outcome.UNKNOWN, result.as_dict()
+    assert "trade receipt order identity conflicts with requested order" in result.unknown_reasons
+    assert result.source.filled_quantity == Decimal("0")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "direction, fill_fraction",
     [
