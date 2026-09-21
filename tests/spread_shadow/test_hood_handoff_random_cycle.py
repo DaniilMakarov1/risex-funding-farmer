@@ -1800,6 +1800,46 @@ async def test_ambiguous_opening_with_fresh_zero_positions_keeps_inventory_unkno
     assert not [plan for plan in client.submissions if plan.account_index == client.receiver_account_index]
 
 
+@pytest.mark.asyncio
+async def test_account_only_flattening_after_partial_close_keeps_inventory_unknown(tmp_path):
+    clock = AdvancingClock()
+    client = CycleClient(clock, partial_close=True)
+    engine = RandomCycleEngine(client, clock=clock, rng=FixedRng(20, 20))
+    original_fallback_residuals = engine._fallback_residuals
+
+    async def account_only_flatten(*args, **kwargs):
+        client.source_position = Decimal("0")
+        client.receiver_position = Decimal("0")
+        return await original_fallback_residuals(*args, **kwargs)
+
+    engine._fallback_residuals = account_only_flatten
+    result = await engine.execute(cycle_config(tmp_path / "account-only-flatten"))
+
+    assert result.outcome is Outcome.PARTIAL, result.as_dict()
+    assert result.closing is not None
+    assert result.closing.source.position_after == Decimal("-0.10")
+    assert result.closing.receiver.position_after == Decimal("0.10")
+    assert result.fallbacks == ()
+    assert result.remaining_source_position == Decimal("0")
+    assert result.remaining_receiver_position == Decimal("0")
+    assert result.inventory == "UNKNOWN"
+
+
+@pytest.mark.asyncio
+async def test_fully_closed_positions_remain_flat_when_fees_are_unknown(tmp_path):
+    clock = AdvancingClock()
+    result = await run_random_cycle(
+        cycle_config(tmp_path / "flat-unknown-fees"),
+        CycleClient(clock),
+        clock=clock,
+        rng=FixedRng(20, 20),
+    )
+
+    assert result.outcome is Outcome.SUCCESS
+    assert result.inventory == "CONFIRMED_FLAT"
+    assert result.economics == "UNKNOWN"
+
+
 def test_cycle_economics_include_fallback_fee_evidence_and_zero_fill_exemption():
     full_fill = FallbackResult(
         account_index=11,

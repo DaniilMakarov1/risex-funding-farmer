@@ -192,6 +192,74 @@ def test_journal_completes_short_writes_and_retries_eintr(tmp_path, monkeypatch)
     assert calls >= 3
 
 
+def test_journal_sequence_refresh_failure_releases_lock(tmp_path, monkeypatch):
+    path = tmp_path / "evidence" / "sequence-refresh.jsonl"
+    first = DurableJournal(path, run_id="first", clock=lambda: 1.0)
+
+    def fail_refresh():
+        raise RuntimeError("injected sequence refresh failure")
+
+    monkeypatch.setattr(first, "_read_last_sequence", fail_refresh)
+    with pytest.raises(RuntimeError, match="sequence refresh"):
+        first.acquire_attempt()
+
+    second = DurableJournal(path, run_id="second", clock=lambda: 2.0)
+    second.acquire_attempt()
+    second.release_attempt()
+
+
+def test_journal_lock_metadata_baseexception_releases_lock(tmp_path, monkeypatch):
+    path = tmp_path / "evidence" / "lock-write.jsonl"
+    real_write = journal_module.os.write
+    calls = 0
+
+    def fail_once(fd, value):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise KeyboardInterrupt()
+        return real_write(fd, value)
+
+    monkeypatch.setattr(journal_module.os, "write", fail_once)
+    first = DurableJournal(path, run_id="first", clock=lambda: 1.0)
+    with pytest.raises(KeyboardInterrupt):
+        first.acquire_attempt()
+    monkeypatch.setattr(journal_module.os, "write", real_write)
+
+    second = DurableJournal(path, run_id="second", clock=lambda: 2.0)
+    second.acquire_attempt()
+    second.release_attempt()
+
+
+def test_journal_failed_append_preserves_existing_prefix(tmp_path, monkeypatch):
+    path = tmp_path / "evidence" / "prefix.jsonl"
+    journal = DurableJournal(path, run_id="prefix", clock=lambda: 1.0)
+    journal.acquire_attempt()
+    try:
+        journal.append("PREFIX", {"value": "durable"})
+        prefix = path.read_bytes()
+        real_write = journal_module.os.write
+        failed = False
+
+        def partial_then_fail(fd, value):
+            nonlocal failed
+            if not failed:
+                failed = True
+                real_write(fd, value[:4])
+                raise OSError("injected partial append failure")
+            return real_write(fd, value)
+
+        monkeypatch.setattr(journal_module.os, "write", partial_then_fail)
+        with pytest.raises(OSError, match="partial append"):
+            journal.append("BROKEN")
+    finally:
+        journal.release_attempt()
+
+    assert path.read_bytes() == prefix + b'{"at'
+    with pytest.raises(RuntimeError, match="journal is unreadable"):
+        DurableJournal(path, run_id="reopen")
+
+
 @pytest.mark.asyncio
 async def test_journal_intent_write_failure_fails_closed_before_submit(tmp_path, monkeypatch):
     path = tmp_path / "intent-write-failure.jsonl"

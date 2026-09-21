@@ -1515,6 +1515,63 @@ def _inventory_fallback_is_resolved(fallback: FallbackResult) -> bool:
     }
 
 
+def _inventory_phase_positions(phase: Any) -> tuple[tuple[int, Decimal], tuple[int, Decimal]] | None:
+    """Return the latest causally reconciled position for both cycle accounts."""
+
+    if phase is None:
+        return None
+    source = getattr(phase, "source", None)
+    receiver = getattr(phase, "receiver", None)
+    if source is None or receiver is None:
+        return None
+    source_index = getattr(source, "account_index", None)
+    receiver_index = getattr(receiver, "account_index", None)
+    source_position = getattr(source, "position_after", None)
+    receiver_position = getattr(receiver, "position_after", None)
+    if (
+        isinstance(source_index, bool)
+        or not isinstance(source_index, int)
+        or isinstance(receiver_index, bool)
+        or not isinstance(receiver_index, int)
+        or source_index == receiver_index
+        or source_position is None
+        or receiver_position is None
+    ):
+        return None
+    return ((source_index, source_position), (receiver_index, receiver_position))
+
+
+def _inventory_chain_matches_final(
+    opening: Any,
+    closing: Any,
+    fallbacks: Sequence[FallbackResult],
+    remaining_source: Decimal,
+    remaining_receiver: Decimal,
+) -> bool:
+    """Bind final account reads to the latest causal phase/fallback evidence."""
+
+    opening_positions = _inventory_phase_positions(opening)
+    latest_positions = _inventory_phase_positions(closing if closing is not None else opening)
+    if opening_positions is None or latest_positions is None:
+        return False
+    if closing is not None and tuple(index for index, _ in opening_positions) != tuple(
+        index for index, _ in latest_positions
+    ):
+        return False
+    expected = dict(latest_positions)
+    for fallback in fallbacks:
+        account_index = getattr(fallback, "account_index", None)
+        position_after = getattr(fallback, "position_after", None)
+        if account_index not in expected or position_after is None:
+            return False
+        expected[account_index] = position_after
+    source_index, receiver_index = (index for index, _ in latest_positions)
+    return (
+        expected[source_index] == remaining_source
+        and expected[receiver_index] == remaining_receiver
+    )
+
+
 def _cycle_classifications(
     opening: HandoffResult | None,
     closing: HandoffResult | None,
@@ -1534,15 +1591,13 @@ def _cycle_classifications(
         causally_resolved = causally_resolved and all(
             _inventory_fallback_is_resolved(item) for item in fallbacks
         )
-        if closing is None and opening is not None and not fallbacks:
-            opening_positions = (
-                getattr(getattr(opening, "source", None), "position_after", None),
-                getattr(getattr(opening, "receiver", None), "position_after", None),
-            )
-            # A successful opening creates exposure.  If no close or fallback
-            # exists, fresh zero reads cannot prove that exposure was resolved.
-            if any(value not in (None, 0) for value in opening_positions):
-                causally_resolved = False
+        causally_resolved = causally_resolved and _inventory_chain_matches_final(
+            opening,
+            closing,
+            fallbacks,
+            remaining_source,
+            remaining_receiver,
+        )
         inventory = "CONFIRMED_FLAT" if causally_resolved else "UNKNOWN"
     else:
         inventory = "KNOWN_RESIDUAL"

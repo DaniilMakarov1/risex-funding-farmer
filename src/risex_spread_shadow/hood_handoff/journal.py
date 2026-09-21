@@ -167,11 +167,18 @@ class DurableJournal:
             os.fchmod(fd, 0o600)
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
-            os.close(fd)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
             raise RuntimeError("journal attempt is already owned by another process") from exc
-        except Exception:
-            os.close(fd)
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
             raise
+        self._lock_fd = fd
         try:
             payload = json.dumps({"pid": os.getpid(), "run_id": self.run_id}, sort_keys=True).encode("utf-8")
             os.ftruncate(fd, 0)
@@ -182,18 +189,16 @@ class DurableJournal:
             except BaseException:
                 self._write_failed = True
                 raise
-        except Exception:
+            # Another engine may have constructed this journal before the lock was
+            # released.  Refresh the sequence while holding the exclusive claim
+            # so the next durable append cannot reuse a sequence number.
+            self._sequence = self._read_last_sequence()
+        except BaseException:
             try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            except OSError:
+                self.release_attempt()
+            except BaseException:
                 pass
-            os.close(fd)
             raise
-        # Another engine may have constructed this journal before the lock was
-        # released.  Refresh the sequence while holding the exclusive claim
-        # so the next durable append cannot reuse a sequence number.
-        self._sequence = self._read_last_sequence()
-        self._lock_fd = fd
 
     def release_attempt(self) -> None:
         fd, self._lock_fd = self._lock_fd, None
