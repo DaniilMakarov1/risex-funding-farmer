@@ -642,6 +642,16 @@ class HandoffEngine:
                 source_order_id = source_order.order_id
                 source_order = await self._lookup_order(plan.source, source_order.order_id)
                 decision_now = self.clock.now()
+                if paired_mode and public_book is not None and not self._time_fresh(
+                    public_book["observed_at"], decision_now, config.freshness_seconds
+                ):
+                    # The book was validated at receipt, but the exact source
+                    # lookup is a causal boundary of receiver admission.  A
+                    # fresh-on-receipt book that expires while that lookup is
+                    # in flight cannot authorize a receiver mutation.
+                    unknown_reasons.append(
+                        "public book recheck is stale or from the future before receiver dispatch"
+                    )
                 if source_order is None:
                     unknown_reasons.append("source order disappeared during pre-receiver recheck")
                 if not self._snapshot_matches(
@@ -749,6 +759,7 @@ class HandoffEngine:
                         source_recheck,
                         receiver_recheck,
                         source_order,
+                        public_book,
                         plan.metadata_observed_at,
                     )
                     journal.append(
@@ -2234,7 +2245,10 @@ class HandoffEngine:
         for observation in observations:
             if observation is None:
                 continue
-            observed_at = getattr(observation, "observed_at", observation)
+            if isinstance(observation, Mapping):
+                observed_at = observation.get("observed_at")
+            else:
+                observed_at = getattr(observation, "observed_at", observation)
             try:
                 observed_at = float(observed_at)
             except (TypeError, ValueError):

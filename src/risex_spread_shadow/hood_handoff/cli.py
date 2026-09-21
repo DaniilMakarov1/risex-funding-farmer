@@ -36,6 +36,7 @@ from .random_cycle import (
     RandomCycleEngine,
     allocate_cycle_slot,
     run_random_cycle,
+    terminal_cycle_facts,
 )
 from .readiness import (
     ReadinessCheck,
@@ -1152,6 +1153,9 @@ def format_random_cycle_result_ru(
         "Классификация: "
         f"paired_execution={paired_execution}; inventory={inventory}; economics={economics}."
     )
+    terminal_facts = terminal_cycle_facts(result)
+    if terminal_facts:
+        lines.append("Терминальные факты: " + "; ".join(terminal_facts) + ".")
     if receiver_not_dispatched:
         lines.append("Приёмник: ордер не отправлялся; это не отмена уже отправленного ордера.")
     elif receiver_leg is not None:

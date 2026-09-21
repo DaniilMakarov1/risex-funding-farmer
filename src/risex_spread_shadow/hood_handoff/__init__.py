@@ -104,6 +104,7 @@ from .random_cycle import (
     run_random_cycle,
     select_random_quantity,
     size_random_quantity,
+    terminal_cycle_facts,
 )
 from .local_attempt import (
     AttemptDirectoryError,
@@ -248,6 +249,7 @@ __all__ = [
     "run_random_cycle",
     "select_random_quantity",
     "size_random_quantity",
+    "terminal_cycle_facts",
     "AttemptDirectoryError",
     "AutomaticPriceProposal",
     "EXECUTION_STATE_NOT_STARTED",

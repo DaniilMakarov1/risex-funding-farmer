@@ -1,14 +1,18 @@
 # Current status
 
-## HCR-22 — COMPLETE; exact paired priority guard accepted offline
+## HCR-22 — COMPLETE after audited correction
 
-The owner resumed HCR-22 on 2026-09-21. Correction candidate `09c9204b3f8034199ad277b6ed9da1dace1e8624` was independently reviewed and accepted, then integrated as Chief commits `754b993` and `518ba09`. Preserved Builder checkpoint `3c20b9dc62d06afa614762daf038ed1234286a6a` and the earlier candidate remain available; the Builder stays stopped and archived.
+The three independently reproduced defects in published `00e4c9a0783ad00b4d886a48730b95d1df8a6795` are corrected by accepted Builder candidate `701c2f4d6b1076114358b270a64b5beef135b5cf`, integrated as `d406a14d026b71bd3c4b4a5d26fef354ca43968b`. Receiver admission now rechecks book age after exact source lookup and carries that book timestamp into the deadline covering nonce, signing and transmission. Successful fallback recovery retains a truthful durable terminal cause/history and confirmed-flat current state. Fallback fill fees are part of cycle economics, so missing fee evidence remains `UNKNOWN`.
 
-Paired opening and closing now require a fresh two-sided public book, the exact active zero-fill POST_ONLY source order, exact owner/order/client/market/side/price/remaining identity, and no external better or unproved same-price priority before receiver dispatch. Missing, stale, future, malformed, anonymous, foreign or conflicting evidence is UNKNOWN; better-priced external volume is LOST. Both states forbid the receiver, permit cancellation only of the exact source identity, and allow a fresh pair attempt only after complete terminal zero-fill reconciliation at original positions. Opening and closing share the owner-approved maximum of three complete attempts with preparation, retain the sampled quantity/hold, and use fresh books and identities.
+Chief complete-diff review and independent adverse checks passed. Exact-candidate affected suites: `226 passed`. Final clean isolated Python 3.11 suite: `4625 passed, 3 skipped` in 124.03 seconds. Cycle-004 source hashes remain `efbda6822eadf397c07b3e37c45585b97178f6587ff0481c4a00e419f15cbb42` and `b70f67810076fdf918018edc460f3ef6a95a415db26f82a5e312f93d8dae355a`. No live validation, network/account read, Keychain access, signing, order or cancellation was performed.
 
-Chief affected integration/adverse suite: `181 passed`. Chief clean isolated Python 3.11.5 full suite on the exact correction tree: `4620 passed, 3 skipped`, exit 0 in 133.79 seconds. The two immutable cycle-004 journals retained their exact hashes and sizes. Five synthetic trials with 80 ms account reads and a 120 ms book read measured median concurrent pre-receiver checks at 124.3 ms and median full pre-receiver checks at 126.2 ms, against a 200 ms sequential delay reference. This is not live latency evidence.
+## Superseded audit state
 
-The live venue `orderBookOrders` payload and owner binding remain unconfirmed; unavailable exact owner-bound evidence fails closed. No live validation, network/account read, Keychain access, order, cancellation or other financial mutation was performed for HCR-22.
+Published `main` `00e4c9a0783ad00b4d886a48730b95d1df8a6795` retains three independently reproduced acceptance defects, so the prior COMPLETE claim is withdrawn. A public book can be fresh when received but stale after the exact source lookup and still admit the receiver because its timestamp is neither rechecked nor included in the receiver mutation deadline. The cycle-004 terminal formatter selects the older nonempty fallback error after a later successful full close and therefore falsely says a residual remains. Whole-cycle economics ignores fallback trade fees and can report `KNOWN` when a fallback fill has missing fee evidence.
+
+The exact correction contract and mandatory regressions are at the top of `NEXT_TASK.md`. Correct priority/owner checks, safe retry rules, fresh identities and the shared three-attempt budget remain in scope and must not be rewritten without a concrete need. Earlier Builder task `01a0bf06-47d0-7772-b9c6-ed1ecb8a318a` remains stopped and archived; this new finite correction requires a fresh Builder session and isolated branch.
+
+The audit changed no code. Targeted Chief probes reproduced `PROVED/SUCCESS` with a 10.1-second-old book under a 10-second threshold, the stale cycle-004 residual reason after a later `FULL_FILL`, and classifications `PARTIAL / CONFIRMED_FLAT / KNOWN` despite unevidenced fallback fees. Immutable cycle-004 files remain unchanged. No live validation, network/account read, Keychain access or financial mutation is authorized or performed.
 
 ## HCR-21 — COMPLETE; accepted and installed
 

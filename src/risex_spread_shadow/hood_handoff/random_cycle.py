@@ -543,6 +543,9 @@ class FallbackResult:
     attempt: int = 1
     reconciliation_state: str = "UNKNOWN"
     position_observed_at: float | None = None
+    economic_status: str = "UNKNOWN"
+    economic_findings: tuple[str, ...] = ()
+    fee_total: Decimal | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -558,6 +561,9 @@ class FallbackResult:
             "attempt": self.attempt,
             "reconciliation_state": self.reconciliation_state,
             "position_observed_at": self.position_observed_at,
+            "economic_status": self.economic_status,
+            "economic_findings": list(self.economic_findings),
+            "fee_total": None if self.fee_total is None else format(self.fee_total, "f"),
         }
 
 
@@ -580,6 +586,8 @@ class RandomCycleResult:
     paired_execution: str = "UNKNOWN"
     inventory: str = "UNKNOWN"
     economics: str = "UNKNOWN"
+    economic_findings: tuple[str, ...] = ()
+    boundary_books_available: bool | None = None
     latency: Mapping[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
@@ -609,6 +617,8 @@ class RandomCycleResult:
             "paired_execution": self.paired_execution,
             "inventory": self.inventory,
             "economics": self.economics,
+            "economic_findings": list(self.economic_findings),
+            "boundary_books_available": self.boundary_books_available,
             "classifications": {
                 "paired_execution": self.paired_execution,
                 "inventory": self.inventory,
@@ -876,6 +886,77 @@ def _fallback_reconciliation_state(
     return result.reconciliation_state
 
 
+def _fallback_economic_evidence(
+    result: FallbackResult,
+    *,
+    receipt: MutationReceipt | None,
+    order: OrderSnapshot | None,
+    trades: Sequence[TradeReceipt],
+    history_complete: bool | None,
+) -> tuple[str, tuple[str, ...], Decimal | None]:
+    """Classify fee evidence for one fully bounded fallback attempt.
+
+    Fallback fills are executions in the cycle's economics, not merely
+    inventory cleanup.  A fee total is reported only when the reconciled
+    history is complete and every observed trade supplies a fee.  A proven
+    zero-fill/rejection has no execution fee requirement, but does not invent
+    a numeric fee value.
+    """
+
+    if trades:
+        if history_complete is not True:
+            return (
+                "UNKNOWN",
+                ("fallback fee economics UNKNOWN: trade history is incomplete",),
+                None,
+            )
+        missing = tuple(trade.trade_id for trade in trades if trade.fee is None)
+        if missing:
+            shown = ", ".join(missing[:8])
+            suffix = "" if len(missing) <= 8 else ", ..."
+            return (
+                "UNKNOWN",
+                (f"fallback fee economics UNKNOWN: missing fee for trade(s) {shown}{suffix}",),
+                None,
+            )
+        total = sum((trade.fee or Decimal(0) for trade in trades), Decimal(0))
+        return (
+            "PROVEN",
+            (f"fallback fee economics PROVEN: {len(trades)} trade(s), fee {total}",),
+            total,
+        )
+
+    if result.outcome is Outcome.UNKNOWN:
+        return (
+            "UNKNOWN",
+            ("fallback fee economics UNKNOWN: execution state is not fully reconciled",),
+            None,
+        )
+    if not result.attempted:
+        return ("PROVEN", ("fallback not dispatched: no execution fee was due",), None)
+    if receipt is not None and not receipt.accepted:
+        return ("PROVEN", ("fallback dispatch rejected: no execution fee was due",), None)
+    if result.reconciliation_state == "TERMINAL_ZERO_FILL":
+        if order is not None and order.terminal and history_complete is True:
+            return (
+                "PROVEN",
+                ("fallback terminal zero-fill: no execution fee was due",),
+                None,
+            )
+        return (
+            "UNKNOWN",
+            ("fallback fee economics UNKNOWN: zero-fill history is incomplete",),
+            None,
+        )
+    if order is not None and order.terminal and history_complete is True:
+        return ("PROVEN", ("fallback reconciled with no execution: no fee was due",), None)
+    return (
+        "UNKNOWN",
+        ("fallback fee economics UNKNOWN: execution fee evidence is incomplete",),
+        None,
+    )
+
+
 def _trade_payload(trade: TradeReceipt) -> dict[str, Any]:
     """Serialize a sanitized trade receipt for durable post-run review."""
 
@@ -1116,37 +1197,234 @@ def _cycle_terminal_reason(
     closing: HandoffResult | None,
     fallbacks: Sequence[FallbackResult],
     fallback_seed: str | None,
+    *,
+    remaining_source: Decimal | None = None,
+    remaining_receiver: Decimal | None = None,
+    boundary_books_available: bool | None = None,
 ) -> str | None:
-    """Keep the opening cause while reporting the deepest later decision."""
+    """Keep the opening cause and ordered recovery without stale residuals."""
 
     opening_reason = _opening_reason(opening)
     receiver_not_dispatched = any(
         phase is not None
-        and phase.receiver is not None
-        and not phase.receiver.dispatched
+        and getattr(phase, "receiver", None) is not None
+        and not getattr(getattr(phase, "receiver", None), "dispatched", True)
         for phase in (opening, closing)
     )
-    fallback_reason = next(
-        (item.reason for item in reversed(fallbacks) if item.reason),
-        None,
-    )
-    later_reason = fallback_reason or (closing.reason if closing is not None else fallback_seed)
     parts: list[str] = []
     if opening_reason:
         parts.append(opening_reason)
     if receiver_not_dispatched and not any("not dispatched" in part.lower() for part in parts):
         parts.append("receiver order was not dispatched")
-    if later_reason:
-        parts.append(
-            later_reason
-            if later_reason.startswith("fallback ")
-            else f"fallback reconciliation: {later_reason}"
-            if fallback_reason
-            else later_reason
-        )
+
+    if (
+        closing is not None
+        and closing.outcome is not Outcome.SUCCESS
+        and closing.reason
+        and closing.reason not in parts
+    ):
+        parts.append(f"paired closing: {closing.reason}")
+
+    fallback_summaries = tuple(_fallback_terminal_summary(item) for item in fallbacks)
+    parts.extend(summary for summary in fallback_summaries if summary)
+    if not fallback_summaries:
+        later_reason = closing.reason if closing is not None else fallback_seed
+        if later_reason:
+            parts.append(later_reason)
+
+    if remaining_source is not None and remaining_receiver is not None:
+        if remaining_source == 0 and remaining_receiver == 0:
+            parts.append("final inventory confirmed flat")
+        else:
+            parts.append(
+                "final inventory known residual: "
+                f"source={remaining_source}, receiver={remaining_receiver}"
+            )
+    if _cycle_economics_unknown(opening, closing, fallbacks):
+        parts.append("fees UNKNOWN")
+    if _boundary_books_available(opening, closing, boundary_books_available) is False:
+        parts.append("boundary books unavailable")
     if not parts:
         return None
     return "; ".join(parts)
+
+
+def _fallback_terminal_summary(item: FallbackResult) -> str | None:
+    """Describe one fallback in order, using its final reconciled state."""
+
+    attempt = item.attempt
+    state = item.reconciliation_state
+    if state == "TERMINAL_ZERO_FILL":
+        return (
+            f"fallback attempt {attempt} terminal-zero-filled "
+            "(terminal zero-fill/cancel)"
+        )
+    if state == "FULL_FILL" and item.filled_quantity == item.requested_quantity:
+        return f"fallback attempt {attempt} fully closed the residual"
+    if state == "PARTIAL_FILL":
+        return f"fallback attempt {attempt} partially filled and left a residual"
+    if state == "REJECTED":
+        return f"fallback attempt {attempt} was rejected"
+    if item.reason:
+        return f"fallback attempt {attempt}: {item.reason}"
+    return f"fallback attempt {attempt}: state UNKNOWN"
+
+
+def _terminal_decimal(value: Any) -> Decimal | None:
+    """Coerce one terminal price without inventing a numeric value."""
+
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = value if isinstance(value, Decimal) else Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return parsed if parsed.is_finite() else None
+
+
+def _external_receiver_fill_facts(phase: Any) -> tuple[str, ...]:
+    """Derive bounded external-maker facts only from compatible receipts."""
+
+    source = getattr(phase, "source", None)
+    receiver = getattr(phase, "receiver", None)
+    if source is None or receiver is None or not getattr(receiver, "dispatched", False):
+        return ()
+    source_filled = getattr(source, "filled_quantity", Decimal(0))
+    receiver_filled = getattr(receiver, "filled_quantity", Decimal(0))
+    if source_filled != 0 or receiver_filled <= 0:
+        return ()
+
+    source_account = getattr(source, "account_index", None)
+    receiver_account = getattr(receiver, "account_index", None)
+    plan = getattr(phase, "plan", None)
+    source_plan = getattr(plan, "source", None)
+    receiver_plan = getattr(plan, "receiver", None)
+    bound_price = _terminal_decimal(getattr(receiver_plan, "price", None))
+    if bound_price is None:
+        bound_price = _terminal_decimal(getattr(source_plan, "price", None))
+    if bound_price is None:
+        source_order = getattr(source, "order", None)
+        bound_price = _terminal_decimal(getattr(source_order, "price", None))
+    direction = str(
+        getattr(receiver_plan, "side", None) or getattr(receiver, "side", "")
+    ).upper()
+    source_order = getattr(source, "order", None)
+    source_status = "" if source_order is None else str(getattr(source_order, "status", "")).lower()
+    source_state = "zero-fill/canceled" if source_status.startswith("cancel") else "zero-fill"
+    facts: list[str] = []
+    for trade in tuple(getattr(receiver, "trades", ()) or ())[:8]:
+        counterparty = getattr(trade, "counterparty_account_index", None)
+        if counterparty is None or counterparty in {source_account, receiver_account}:
+            continue
+        trade_side = str(getattr(trade, "side", "")).upper()
+        fill_price = _terminal_decimal(getattr(trade, "price", None))
+        better = (
+            bound_price is not None
+            and fill_price is not None
+            and direction in {"BUY", "SELL"}
+            and trade_side == direction
+            and (fill_price < bound_price if direction == "BUY" else fill_price > bound_price)
+        )
+        if better:
+            comparator = "<" if direction == "BUY" else ">"
+            fact = (
+                f"receiver {direction} filled at {format(fill_price, 'f')}; "
+                "receiver filled against better-priced external maker: "
+                f"fill {format(fill_price, 'f')} {comparator} {format(bound_price, 'f')} "
+                f"({direction} bound), better-priced than bound/source {format(bound_price, 'f')}; "
+                f"against external account {counterparty}"
+            )
+        else:
+            if direction in {"BUY", "SELL"} and fill_price is not None:
+                fact = (
+                    f"receiver {direction} filled at {format(fill_price, 'f')} "
+                    f"against external account {counterparty}"
+                )
+            else:
+                fact = f"receiver filled against external account {counterparty}"
+        counterparty_order = getattr(trade, "counterparty_order_id", None)
+        trade_id = getattr(trade, "trade_id", None)
+        if counterparty_order is not None:
+            fact += f"; counterparty order {counterparty_order}"
+        if trade_id is not None:
+            fact += f"; trade {trade_id}"
+        facts.append(f"{fact}; source {source_state} (source remained {source_state})")
+    return tuple(dict.fromkeys(facts))
+
+
+def _boundary_books_available(
+    opening: Any,
+    closing: Any,
+    explicit: bool | None = None,
+) -> bool | None:
+    """Classify boundary-book availability without treating missing as false."""
+
+    if explicit is not None:
+        return explicit
+    observed_values: list[Any] = []
+    for phase in (opening, closing):
+        if phase is None:
+            continue
+        guard = getattr(phase, "priority_guard", None)
+        if isinstance(guard, Mapping) and "book_observed_at" in guard:
+            observed_values.append(guard.get("book_observed_at"))
+    if not observed_values:
+        return None
+    return all(value is not None for value in observed_values)
+
+
+def _cycle_economics_unknown(
+    opening: Any,
+    closing: Any,
+    fallbacks: Sequence[FallbackResult],
+) -> bool:
+    phases = [phase for phase in (opening, closing) if phase is not None]
+    return (
+        not phases
+        or any(getattr(phase, "economic_status", "UNKNOWN") != "PROVEN" for phase in phases)
+        or any(item.economic_status != "PROVEN" for item in fallbacks)
+    )
+
+
+def terminal_cycle_facts(result: Any) -> tuple[str, ...]:
+    """Return bounded, production-derived terminal facts for operator output."""
+
+    opening = getattr(result, "opening", None)
+    closing = getattr(result, "closing", None)
+    facts: list[str] = []
+    for phase in (opening, closing):
+        if phase is None:
+            continue
+        source = getattr(phase, "source", None)
+        receiver = getattr(phase, "receiver", None)
+        if source is not None and receiver is not None:
+            facts.extend(_external_receiver_fill_facts(phase))
+    for fallback in tuple(getattr(result, "fallbacks", ()) or ()):
+        summary = _fallback_terminal_summary(fallback)
+        if summary:
+            facts.append(summary)
+
+    inventory = getattr(result, "inventory", "UNKNOWN")
+    if inventory == "CONFIRMED_FLAT":
+        facts.append("final inventory confirmed flat")
+    elif inventory == "KNOWN_RESIDUAL":
+        facts.append("final inventory has a known residual")
+    if getattr(result, "economics", "UNKNOWN") == "UNKNOWN":
+        facts.append("fees UNKNOWN")
+
+    boundary_available = getattr(result, "boundary_books_available", None)
+    if boundary_available is None:
+        raw_boundary_books = getattr(result, "boundary_books", None)
+        if raw_boundary_books is not None or hasattr(result, "boundary_books"):
+            boundary_available = raw_boundary_books is not None
+    if boundary_available is None:
+        boundary_available = _boundary_books_available(
+            opening,
+            closing,
+        )
+    if boundary_available is False:
+        facts.append("boundary books unavailable")
+    return tuple(dict.fromkeys(facts))
 
 
 def _opening_reason(opening: HandoffResult | None) -> str | None:
@@ -1155,24 +1433,29 @@ def _opening_reason(opening: HandoffResult | None) -> str | None:
     if opening is None:
         return None
     reasons: list[str] = []
-    if opening.reason:
-        reasons.append(opening.reason)
-    for reason in opening.unknown_reasons:
+    opening_reason = getattr(opening, "reason", None)
+    if opening_reason:
+        reasons.append(opening_reason)
+    for reason in getattr(opening, "unknown_reasons", ()) or ():
         if "source fill observed before receiver dispatch" in reason and not any(
             "source fill observed before receiver dispatch" in item for item in reasons
         ):
             reasons.append(reason)
-    source = opening.source
-    receiver = opening.receiver
+    source = getattr(opening, "source", None)
+    receiver = getattr(opening, "receiver", None)
     if (
         source is not None
         and source.filled_quantity > 0
         and receiver is not None
-        and not receiver.dispatched
+        and not getattr(receiver, "dispatched", True)
         and not any("source fill observed before receiver dispatch" in item for item in reasons)
     ):
         reasons.append("source fill observed before receiver dispatch")
-    return "; ".join(reasons) or None
+    if source is not None and receiver is not None:
+        for fact in _external_receiver_fill_facts(opening):
+            if fact not in reasons:
+                reasons.append(fact)
+    return "; ".join(dict.fromkeys(reasons)) or None
 
 
 def _cycle_classifications(
@@ -1234,7 +1517,11 @@ def _cycle_classifications(
 
     if not phases or any(phase.economic_status == "UNKNOWN" for phase in phases):
         economics = "UNKNOWN"
-    elif all(phase.economic_status == "PROVEN" for phase in phases):
+    elif any(item.economic_status == "UNKNOWN" for item in fallbacks):
+        economics = "UNKNOWN"
+    elif all(phase.economic_status == "PROVEN" for phase in phases) and all(
+        item.economic_status == "PROVEN" for item in fallbacks
+    ):
         economics = "KNOWN"
     else:
         economics = "UNKNOWN"
@@ -1261,11 +1548,37 @@ def _with_cycle_classifications(result: RandomCycleResult) -> RandomCycleResult:
         result.remaining_source_position,
         result.remaining_receiver_position,
     )
+    economic_findings = tuple(
+        dict.fromkeys(
+            item
+            for phase in (result.opening, result.closing)
+            for item in (getattr(phase, "economic_findings", ()) or ())
+        )
+    )
+    economic_findings = tuple(
+        dict.fromkeys(
+            (*economic_findings,)
+            + tuple(
+                item
+                for fallback in result.fallbacks
+                for item in fallback.economic_findings
+            )
+        )
+    )
+    boundary_books_available = result.boundary_books_available
+    if boundary_books_available is None:
+        raw_boundary_books = getattr(result, "boundary_books", None)
+        if raw_boundary_books is not None or hasattr(result, "boundary_books"):
+            boundary_books_available = raw_boundary_books is not None
+    if boundary_books_available is None:
+        boundary_books_available = _boundary_books_available(result.opening, result.closing)
     return replace(
         result,
         paired_execution=paired_execution,
         inventory=inventory,
         economics=economics,
+        economic_findings=economic_findings,
+        boundary_books_available=boundary_books_available,
         latency=_cycle_latency(result.opening, result.closing),
     )
 
@@ -1618,6 +1931,8 @@ class RandomCycleEngine:
                     if opening_preparation_result is not None
                     else "paired opening did not prove a complete cycle"
                 ),
+                remaining_source=remaining_source,
+                remaining_receiver=remaining_receiver,
             )
             result = _with_cycle_classifications(RandomCycleResult(
                 outcome=outcome,
@@ -1707,16 +2022,23 @@ class RandomCycleEngine:
             outcome = Outcome.UNKNOWN
         else:
             outcome = Outcome.PARTIAL
-        reason = None if outcome is Outcome.SUCCESS else (
-            self._identity_barrier
-            or _cycle_terminal_reason(
-                opening,
-                closing,
-                fallbacks,
-                fallback_seed,
-            )
-            or "cycle closure did not prove exact flat positions"
+        recovered_after_pair_or_fallback = bool(fallbacks) or (
+            closing is not None and closing.outcome is not Outcome.SUCCESS
         )
+        reason = None
+        if outcome is not Outcome.SUCCESS or recovered_after_pair_or_fallback:
+            reason = (
+                self._identity_barrier
+                or _cycle_terminal_reason(
+                    opening,
+                    closing,
+                    fallbacks,
+                    fallback_seed,
+                    remaining_source=remaining_source,
+                    remaining_receiver=remaining_receiver,
+                )
+                or "cycle closure did not prove exact flat positions"
+            )
         result = _with_cycle_classifications(RandomCycleResult(
             outcome=outcome,
             phase=Phase.COMPLETE,
@@ -2766,14 +3088,25 @@ class RandomCycleEngine:
                 after=after,
                 requested_quantity=residual,
             )
-            if result.position_observed_at is None and after is not None:
-                result = replace(
-                    result,
-                    reconciliation_state=state,
-                    position_observed_at=after.observed_at,
-                )
-            elif result.reconciliation_state != state:
-                result = replace(result, reconciliation_state=state)
+            reconciled_result = replace(result, reconciliation_state=state)
+            economic_status, economic_findings, fee_total = _fallback_economic_evidence(
+                reconciled_result,
+                receipt=receipt,
+                order=order,
+                trades=trades,
+                history_complete=history_complete,
+            )
+            result = replace(
+                reconciled_result,
+                position_observed_at=(
+                    reconciled_result.position_observed_at
+                    if reconciled_result.position_observed_at is not None or after is None
+                    else after.observed_at
+                ),
+                economic_status=economic_status,
+                economic_findings=economic_findings,
+                fee_total=fee_total,
+            )
             evidence = {
                 "account_index": initial_before.account_index,
                 "attempt": attempt_ordinal,
@@ -2791,6 +3124,9 @@ class RandomCycleEngine:
                 "trade_ids": [trade.trade_id for trade in trades],
                 "history_pages": [_history_page_payload(page) for page in history_pages],
                 "history_complete": history_complete,
+                "economic_status": result.economic_status,
+                "economic_findings": list(result.economic_findings),
+                "fee_total": None if result.fee_total is None else format(result.fee_total, "f"),
                 "market_metadata": None if metadata is None else _metadata_payload(metadata),
                 "order_book_observed_at": None if book is None else book.observed_at,
                 "position_observed_at": result.position_observed_at,
@@ -3375,4 +3711,5 @@ __all__ = [
     "run_random_cycle",
     "select_random_quantity",
     "size_random_quantity",
+    "terminal_cycle_facts",
 ]
