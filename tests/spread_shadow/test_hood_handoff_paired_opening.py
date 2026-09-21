@@ -391,13 +391,20 @@ class DelayedPairedClient(PairedClient):
 class PropagatingPreparedPairedClient(PreparedPairedClient):
     """Delay source visibility while early account/book reads remain causal."""
 
-    def __init__(self, *, closing: bool = False, foreign_conflict: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        closing: bool = False,
+        foreign_conflict: bool = False,
+        adverse: str | None = None,
+    ) -> None:
         super().__init__()
         if closing:
             self.source_position = Decimal("0.20")
             self.receiver_position = Decimal("-0.20")
         self.closing = closing
         self.foreign_conflict = foreign_conflict
+        self.adverse = adverse
         self.source_visible = False
         self.source_dispatch_started = False
         self.source_lookup_calls = 0
@@ -423,19 +430,39 @@ class PropagatingPreparedPairedClient(PreparedPairedClient):
 
     async def account_snapshot(self, account_index: int, market_id: int) -> AccountSnapshot:
         self.read_counts["account"] += 1
-        if (
-            account_index == self.source_account_index
-            and not self.source_visible
-            and self.source_dispatch_started
-        ):
-            active = (self._foreign_order(),) if self.foreign_conflict else ()
-            return _account_snapshot(account_index, self.source_position, active)
+        if not self.source_visible and self.source_dispatch_started:
+            if account_index == self.source_account_index:
+                active = (self._foreign_order(),) if self.foreign_conflict else ()
+                snapshot = _account_snapshot(account_index, self.source_position, active)
+                if self.adverse == "source_identity":
+                    return replace(
+                        snapshot,
+                        account_index=999,
+                        source_identity="foreign-source",
+                    )
+                if self.adverse == "source_position":
+                    return replace(
+                        snapshot,
+                        signed_position=self.source_position + Decimal("0.10"),
+                    )
+                if self.adverse == "complete":
+                    return await super().account_snapshot(account_index, market_id)
+                return snapshot
+            if account_index == self.receiver_account_index:
+                snapshot = _account_snapshot(account_index, self.receiver_position)
+                if self.adverse == "receiver_identity":
+                    return replace(
+                        snapshot,
+                        account_index=998,
+                        source_identity="foreign-receiver",
+                    )
+                return snapshot
         return await super().account_snapshot(account_index, market_id)
 
     async def order_book(self, market_id: int) -> OrderBookSnapshot:
         self.read_counts["book"] += 1
         value = await super().order_book(market_id)
-        if self.source_visible:
+        if self.source_visible or self.adverse == "complete":
             return value
         # A source order accepted by the sequencer may be absent from the
         # first public snapshot.  Leave only a neutral guard level here; the
@@ -831,6 +858,55 @@ async def test_source_propagation_refreshes_only_causal_absence_for_open_and_clo
         assert result.latency["pre_visibility_refresh_seconds"] > 0
         assert client.read_counts["account"] >= 6
         assert client.read_counts["book"] >= 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("adverse", "reason_fragment"),
+    [
+        ("source_identity", "source recheck account/market identity conflicts"),
+        ("receiver_identity", "receiver recheck account/market identity conflicts"),
+        ("source_position", "source position changed"),
+    ],
+)
+async def test_pre_visibility_adverse_account_evidence_is_sticky(
+    tmp_path,
+    adverse,
+    reason_fragment,
+):
+    client = PropagatingPreparedPairedClient(adverse=adverse)
+    path = tmp_path / f"adverse-{adverse}.jsonl"
+    result = await run_handoff(config(path), client, clock=Clock())
+
+    assert result.outcome is Outcome.UNKNOWN, result.as_dict()
+    assert any(reason_fragment in reason for reason in result.unknown_reasons)
+    assert [plan.account_index for plan in client.submissions] == [client.source_account_index]
+    assert result.latency["pre_visibility_refresh_seconds"] == 0.0
+    guard = _guard_payload(path)
+    first = guard["causal_pre_visibility_observations"]
+    if adverse == "source_identity":
+        assert first["source"]["account_index"] == 999
+        assert first["source"]["source_identity"] == "foreign-source"
+    elif adverse == "receiver_identity":
+        assert first["receiver"]["account_index"] == 998
+        assert first["receiver"]["source_identity"] == "foreign-receiver"
+    else:
+        assert first["source"]["signed_position"] == "0.10"
+
+
+@pytest.mark.asyncio
+async def test_pre_visibility_complete_owner_book_evidence_keeps_fast_path(tmp_path):
+    client = PropagatingPreparedPairedClient(adverse="complete")
+    result = await run_handoff(
+        config(tmp_path / "complete-evidence.jsonl"),
+        client,
+        clock=Clock(),
+    )
+
+    assert result.outcome is Outcome.SUCCESS, result.as_dict()
+    assert result.latency["pre_visibility_refresh_seconds"] == 0.0
+    assert client.read_counts["book"] == 1
+    assert [plan.account_index for plan in client.submissions] == [11, 22]
 
 
 def _prepared_test_plan(*, account_index: int, deadline: float) -> OrderPlan:

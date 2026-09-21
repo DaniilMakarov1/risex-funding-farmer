@@ -330,6 +330,16 @@ class HandoffEngine:
         self.clock = clock or SystemClock()
         self._last_pre_visibility_refresh = False
         self._last_pre_visibility_refresh_seconds = 0.0
+        self._last_pre_visibility_original_checks: tuple[
+            AccountSnapshot,
+            AccountSnapshot,
+            dict[str, Any],
+            float,
+            float,
+        ] | None = None
+        self._visibility_source_baseline: AccountSnapshot | None = None
+        self._visibility_receiver_baseline: AccountSnapshot | None = None
+        self._visibility_requires_incremental_margin = False
 
     async def _read_public_book(
         self,
@@ -408,6 +418,177 @@ class HandoffEngine:
             )
         return source, receiver, book, book_duration, max(0.0, time.perf_counter() - started)
 
+    def _visibility_account_is_eligible(
+        self,
+        snapshot: AccountSnapshot,
+        baseline: AccountSnapshot | None,
+        *,
+        account_index: int,
+        market_id: int,
+    ) -> bool:
+        """Check that an early account read contains no contradictory evidence."""
+
+        if baseline is None:
+            return False
+        if (
+            snapshot.account_index != account_index
+            or snapshot.market_id != market_id
+            or snapshot.source_identity != baseline.source_identity
+            or snapshot.signed_position != baseline.signed_position
+            or not snapshot.authorized
+            or not snapshot.ready
+            or not self._snapshot_fresh(
+                snapshot,
+                self.clock.now(),
+                self._configured_freshness,
+            )
+        ):
+            return False
+        if (
+            snapshot.margin_available is None
+            or snapshot.margin_required is None
+            or snapshot.margin_required > snapshot.margin_available
+        ):
+            return False
+        if self._visibility_requires_incremental_margin and (
+            snapshot.incremental_margin_required is None
+            or not snapshot.incremental_margin_evidence
+        ):
+            return False
+        if (
+            snapshot.incremental_margin_required is not None
+            and snapshot.incremental_margin_evidence
+            and snapshot.incremental_margin_required > snapshot.margin_available
+        ):
+            return False
+        return True
+
+    def _visibility_source_order_status(
+        self,
+        snapshot: AccountSnapshot,
+        plan: OrderPlan,
+        source_order: OrderSnapshot,
+    ) -> str:
+        """Classify source account evidence without treating contradictions as absence."""
+
+        for order in snapshot.active_orders:
+            if order.filled_quantity > 0 or order.remaining_quantity != order.initial_quantity:
+                return "CONFLICT"
+        active = tuple(order for order in snapshot.active_orders if order.active)
+        if not active:
+            return "ABSENT"
+        if len(active) == 1 and (
+            active[0].order_id == source_order.order_id
+            and self._order_matches(active[0], plan)
+            and active[0].filled_quantity == 0
+            and active[0].remaining_quantity == plan.quantity
+        ):
+            return "EXACT"
+        return "CONFLICT"
+
+    @staticmethod
+    def _visibility_receiver_order_status(snapshot: AccountSnapshot) -> str:
+        """Receiver active/fill evidence is always a conflict for this window."""
+
+        if any(
+            order.active or order.filled_quantity > 0
+            for order in snapshot.active_orders
+        ):
+            return "CONFLICT"
+        return "CLEAR"
+
+    def _visibility_book_status(
+        self,
+        public_book: Mapping[str, Any],
+        plan: OrderPlan,
+        source_order: OrderSnapshot,
+    ) -> str:
+        """Classify exact source-book proof while retaining foreign priority evidence."""
+
+        levels = public_book.get("asks" if plan.side == "SELL" else "bids", ())
+        exact_source = False
+        foreign_priority = False
+        source_price = plan.price
+        for level in levels:
+            exact = (
+                level.get("order_id") is not None
+                and str(level.get("order_id")) == str(source_order.order_id)
+                and level.get("owner_account_index") == plan.account_index
+                and level.get("price") == source_price
+                and level.get("quantity") == plan.quantity
+            )
+            if exact:
+                exact_source = True
+                continue
+            price = level.get("price")
+            if price == source_price or (
+                plan.side == "SELL" and price < source_price
+            ) or (
+                plan.side == "BUY" and price > source_price
+            ):
+                foreign_priority = True
+        if foreign_priority:
+            return "CONFLICT"
+        return "EXACT" if exact_source else "ABSENT"
+
+    def _visibility_refresh_is_eligible(
+        self,
+        config: HandoffConfig,
+        plan: OrderPlan,
+        source_order: OrderSnapshot | None,
+        checks: tuple[AccountSnapshot, AccountSnapshot, dict[str, Any], float, float],
+        *,
+        pre_visibility: bool,
+    ) -> bool:
+        """Permit one refresh only when the early window proves causal absence."""
+
+        if (
+            not pre_visibility
+            or source_order is None
+            or not self._source_is_resting(source_order, plan)
+            or not self._time_fresh(
+                source_order.observed_at,
+                self.clock.now(),
+                self._configured_freshness,
+            )
+        ):
+            return False
+        original_source, original_receiver, original_book, _, _ = checks
+        if not self._time_fresh(
+            original_book["observed_at"],
+            self.clock.now(),
+            self._configured_freshness,
+        ):
+            return False
+        if not self._visibility_account_is_eligible(
+            original_source,
+            self._visibility_source_baseline,
+            account_index=plan.account_index,
+            market_id=plan.market_id,
+        ) or not self._visibility_account_is_eligible(
+            original_receiver,
+            self._visibility_receiver_baseline,
+            account_index=(
+                self._visibility_receiver_baseline.account_index
+                if self._visibility_receiver_baseline is not None
+                else -1
+            ),
+            market_id=plan.market_id,
+        ):
+            return False
+        source_status = self._visibility_source_order_status(
+            original_source,
+            plan,
+            source_order,
+        )
+        receiver_status = self._visibility_receiver_order_status(original_receiver)
+        book_status = self._visibility_book_status(original_book, plan, source_order)
+        if source_status == "CONFLICT" or receiver_status == "CONFLICT" or book_status == "CONFLICT":
+            return False
+        # A refresh is useful only when the first window lacks source proof.
+        # Complete owner-bound account and book evidence stays on the fast path.
+        return source_status == "ABSENT" or book_status == "ABSENT"
+
     async def _parallel_source_visibility_and_checks(
         self,
         config: HandoffConfig,
@@ -467,30 +648,27 @@ class HandoffEngine:
             await asyncio.gather(visibility_task, checks_task, return_exceptions=True)
             raise
         # Account/book snapshots that completed before source visibility may
-        # legitimately omit the newly accepted order.  Refresh that narrow
-        # absence case once after visibility, while retaining explicit active
-        # foreign-order evidence as a real conflict.  This bounded refresh is
-        # only paid on propagation skew; the common fast path keeps one window.
+        # legitimately omit the newly accepted order.  Refresh only a
+        # validated causal absence: identity, baseline position, readiness,
+        # margin, fill and conflicting-order evidence remain authoritative.
         self._last_pre_visibility_refresh = False
         self._last_pre_visibility_refresh_seconds = 0.0
-        source_account_conflict = source_order is None or any(
-            order.active
-            and (
-                order.order_id != source_order.order_id
-                or not self._order_matches(order, plan)
-            )
-            for order in checks[0].active_orders
-        )
-        if (
-            source_order is not None
-            and visibility_finished_at is not None
+        pre_visibility = (
+            visibility_finished_at is not None
             and checks_finished_at is not None
             and (
                 checks_finished_at < visibility_finished_at
                 or visibility_state.get("component_pre_visibility") is True
             )
-            and not source_account_conflict
-            and not checks[1].active_orders
+        )
+        if pre_visibility:
+            self._last_pre_visibility_original_checks = checks
+        if self._visibility_refresh_is_eligible(
+            config,
+            plan,
+            source_order,
+            checks,
+            pre_visibility=pre_visibility,
         ):
             refresh_started = time.perf_counter()
             checks = await self._parallel_pre_receiver_checks(config)
@@ -656,12 +834,16 @@ class HandoffEngine:
             float,
         ] | None = None
         coalesced_pre_receiver_window_seconds = 0.0
+        self._last_pre_visibility_original_checks = None
         receiver_mutation_observations: tuple[Any, ...] = (source, receiver, plan.metadata_observed_at)
         receiver_mutation_observation_now: float | None = None
         prepared_source: Any | None = None
         prepared_receiver: Any | None = None
         prepared_source_plan: OrderPlan | None = None
         prepared_receiver_plan: OrderPlan | None = None
+        self._visibility_source_baseline = source
+        self._visibility_receiver_baseline = receiver
+        self._visibility_requires_incremental_margin = requires_incremental_margin
         prepared_dispatch_enabled = self._supports_prepared_dispatch()
         if prepared_dispatch_enabled:
             preparation_started = time.perf_counter()
@@ -1058,6 +1240,15 @@ class HandoffEngine:
                     priority_guard["source_recheck"] = self._account_observation_payload(source_recheck)
                     priority_guard["receiver_recheck"] = self._account_observation_payload(receiver_recheck)
                     priority_guard["source_recheck_transition"] = source_recheck_transition
+                    if self._last_pre_visibility_original_checks is not None:
+                        first_source, first_receiver, first_book, _, _ = (
+                            self._last_pre_visibility_original_checks
+                        )
+                        priority_guard["causal_pre_visibility_observations"] = {
+                            "source": self._account_observation_payload(first_source),
+                            "receiver": self._account_observation_payload(first_receiver),
+                            "book_observed_at": first_book.get("observed_at"),
+                        }
                     priority_guard["admission_reasons"] = list(unknown_reasons[:8])
                     journal.append(
                         "PRE_RECEIVER_GUARD",
