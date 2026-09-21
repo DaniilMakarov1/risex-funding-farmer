@@ -1,12 +1,14 @@
 # Current status
 
-## HCR-23 — COMPLETE; accepted offline
+## HCR-23 — COMPLETE; accepted offline and installed
 
 Independent audit of baseline `9d1ce057b331b1e5dc77e4fd38fbe83c330b3764` is complete. Accepted SDK candidate `c589f888699139935b69ccf9844b307141905087` and corrected state candidate `629501331aebc19998127a890b23fb81ea2b74aa` are integrated. SendTx ambiguity now stops dependent writes across both accounts; account observations retain their original age and conflicting position rows are rejected. The HTTP transport reuses one owned session. Journals complete partial/interrupted writes, fail closed after errors and release locks on failed acquisition. Confirmed-flat inventory requires resolved execution and final per-account causal agreement, independently of unknown fees. Cycle004 fixture owner/side/position/fees now match the preserved known facts.
 
 Chief reviewed every changed production/test diff and reproduced six adverse cases independently before/after. All six final probes pass; independent sizing enumeration passed300 cases. Builder affected state suite216 passed and Chief SDK regressions11 passed. Final clean isolated Python3.11.5 suite on git-archive candidate6295013: **4645 passed,3 skipped**, exit0,127.36s; no foreign project imports. All221 tracked source/test files match the snapshot. Initial four subprocess import failures reproduced unchanged on accepted base and were resolved by installing the candidate project in the dedicated environment, without source/test changes or added skips.
 
 Synthetic transport count improved from three sessions to one for two reads and one mutation; live latency is unmeasured. Original cycle004 journal hashes remain `efbda6822eadf397c07b3e37c45585b97178f6587ff0481c4a00e419f15cbb42` and `b70f67810076fdf918018edc460f3ef6a95a415db26f82a5e312f93d8dae355a`. Evidence/probes/full logs are in ignored owner-only `spread-shadow-runs/hood-offline-audit-20260921/chief-v1`. No live account/market read, Keychain access, real signing/order/cancellation or new live cycle. Existing price, quantity, hold, threshold and retry policies are unchanged. Owner-bound public-book payload and live latency still require separately authorized validation; exact counterparty matching is not guaranteed.
+
+Installed operator imports its own accepted code and all221 source/test files match the tested snapshot. `./start --help` and explicit pre-launch `CANCEL` both exit0 without client/credential access or slot allocation. Only cycle001–004 exist; their cycle004 hashes were reverified after installation. Both fresh Builders delivered their final results and have no further assignment.
 
 ## HCR-22 — COMPLETE after audited correction
 
