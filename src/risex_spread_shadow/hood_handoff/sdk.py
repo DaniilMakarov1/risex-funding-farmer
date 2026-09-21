@@ -111,7 +111,10 @@ class PreparedMutation:
             and self.account_index == plan.account_index
             and self.api_key_index == api_key_index
             and self.plan_binding == _order_plan_binding(plan)
-            and plan.mutation_deadline_monotonic == self.deadline
+            and (
+                plan.mutation_deadline_monotonic is None
+                or plan.mutation_deadline_monotonic == self.deadline
+            )
         )
 
     def invalidate(self) -> None:

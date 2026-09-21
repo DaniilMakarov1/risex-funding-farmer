@@ -1,4 +1,5 @@
 from pathlib import Path
+from dataclasses import replace
 from decimal import Decimal
 
 import pytest
@@ -221,6 +222,142 @@ async def test_sdk_sign_tuple_and_send_are_each_single_explicit_call(monkeypatch
     assert signer.sign_calls[-1]["reduce_only"] is False
     assert signer.sign_calls[-1]["price"] == 25000
     assert len(client._http.calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_prepared_order_is_single_use_and_ambiguous_send_cannot_replay(monkeypatch):
+    class AmbiguousHttp(FakeHttp):
+        async def post_form(self, path, *, form):
+            self.calls.append((path, dict(form)))
+            raise TimeoutError("synthetic response ambiguity")
+
+    config = HandoffConfig(
+        market_id=7,
+        direction="LONG",
+        quantity=Decimal("0.125"),
+        source_limit_price=Decimal("100.25"),
+        receiver_worst_price=Decimal("101.25"),
+        freshness_seconds=10,
+        request_timeout_seconds=1,
+        order_timeout_seconds=1,
+        reconcile_timeout_seconds=1,
+        poll_interval_seconds=0.1,
+        max_poll_count=2,
+        source_order_lifetime_seconds=300,
+        client_order_prefix="prepared-single-use",
+        journal_path="/tmp/prepared-single-use.jsonl",
+        api_base_url="https://mainnet.zklighter.elliot.ai",
+        chain_id=304,
+        api_key_index=4,
+        operator_execution_opt_in=True,
+    )
+    signer = FakeSigner()
+    client = LighterSdkClient(
+        config,
+        source_account_index=11,
+        receiver_account_index=22,
+        secrets=StaticSecretProvider({11: "synthetic-source", 22: "synthetic-receiver"}),
+        market_evidence={},
+        signer_factory=lambda **kwargs: signer,
+        http_factory=AmbiguousHttp,
+    )
+    monkeypatch.setattr(LighterSdkClient, "verify_sdk", staticmethod(lambda: None))
+    client._lighter = lambda: FakeModule
+    plan = OrderPlan(
+        account_index=11,
+        market_id=7,
+        side="SELL",
+        quantity=Decimal("0.125"),
+        quantity_int=125,
+        price=Decimal("100.25"),
+        price_int=10025,
+        order_type="LIMIT",
+        time_in_force="POST_ONLY",
+        reduce_only=True,
+        order_expiry_ms=1_500_000,
+        client_order_index=123,
+    )
+
+    prepared = await client.prepare_order(plan)
+    assert client._http.calls == []
+    assert "signed-create-info" not in repr(prepared)
+    with pytest.raises(TimeoutError, match="order dispatch"):
+        await client.submit_prepared_order(plan, prepared)
+    assert len(client._http.calls) == 1
+
+    replay = await client.submit_prepared_order(plan, prepared)
+    assert not replay.accepted
+    assert "consumed" in (replay.error or "")
+    assert len(client._http.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_prepared_order_invalidates_when_price_binding_changes(monkeypatch):
+    import risex_spread_shadow.hood_handoff.sdk as sdk_module
+
+    config = HandoffConfig(
+        market_id=7,
+        direction="LONG",
+        quantity=Decimal("0.125"),
+        source_limit_price=Decimal("100.25"),
+        receiver_worst_price=Decimal("101.25"),
+        freshness_seconds=10,
+        request_timeout_seconds=1,
+        order_timeout_seconds=1,
+        reconcile_timeout_seconds=1,
+        poll_interval_seconds=0.1,
+        max_poll_count=2,
+        source_order_lifetime_seconds=300,
+        client_order_prefix="prepared-binding",
+        journal_path="/tmp/prepared-binding.jsonl",
+        api_base_url="https://mainnet.zklighter.elliot.ai",
+        chain_id=304,
+        api_key_index=4,
+        operator_execution_opt_in=True,
+    )
+    signer = FakeSigner()
+    client = LighterSdkClient(
+        config,
+        source_account_index=11,
+        receiver_account_index=22,
+        secrets=StaticSecretProvider({11: "synthetic-source", 22: "synthetic-receiver"}),
+        market_evidence={},
+        signer_factory=lambda **kwargs: signer,
+        http_factory=FakeHttp,
+    )
+    monkeypatch.setattr(LighterSdkClient, "verify_sdk", staticmethod(lambda: None))
+    client._lighter = lambda: FakeModule
+    plan = OrderPlan(
+        account_index=11,
+        market_id=7,
+        side="SELL",
+        quantity=Decimal("0.125"),
+        quantity_int=125,
+        price=Decimal("100.25"),
+        price_int=10025,
+        order_type="LIMIT",
+        time_in_force="POST_ONLY",
+        reduce_only=True,
+        order_expiry_ms=1_500_000,
+        client_order_index=123,
+    )
+    prepared = await client.prepare_order(plan)
+    changed = replace(plan, price=Decimal("100.35"), price_int=10035)
+    rejected = await client.submit_prepared_order(changed, prepared)
+    assert not rejected.accepted
+    assert "binding" in (rejected.error or "")
+    assert client._http.calls == []
+    replay = await client.submit_prepared_order(plan, prepared)
+    assert not replay.accepted
+    assert client._http.calls == []
+
+    expired = await client.prepare_order(plan)
+    expired_deadline = expired.deadline
+    monkeypatch.setattr(sdk_module.time, "monotonic", lambda: expired_deadline + 1)
+    expired_receipt = await client.submit_prepared_order(plan, expired)
+    assert not expired_receipt.accepted
+    assert "final mutation barrier" in (expired_receipt.error or "")
+    assert client._http.calls == []
 
 
 @pytest.mark.asyncio

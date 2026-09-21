@@ -406,6 +406,79 @@ class GuardSequenceClient(CycleClient):
         ))
 
 
+class ExclusivePriceSequenceClient(CycleClient):
+    """Return a one-tick, non-exclusive book once before each paired leg."""
+
+    def __init__(
+        self,
+        clock: AdvancingClock,
+        *,
+        direction: Direction,
+        always_bad_opening: bool = False,
+    ) -> None:
+        super().__init__(clock)
+        self.direction = direction
+        self.always_bad_opening = always_bad_opening
+        self.initial_book_seen = False
+        self.opening_bad_calls = 0
+        self.closing_bad_calls = 0
+        self.opening_bad_returned = False
+        self.closing_bad_returned = False
+        self.adverse_book_calls: list[tuple[str, int]] = []
+        self.source_submissions: list[tuple[bool, int, Decimal, int]] = []
+        self.public_book_calls = 0
+
+    def _source_order(self) -> OrderSnapshot | None:
+        source_id = self.latest_order.get(self.source_account_index)
+        return None if source_id is None else self.orders.get((self.source_account_index, source_id))
+
+    def _synthetic_book(self, *, closing: bool) -> OrderBookSnapshot:
+        if closing:
+            # LONG opens a SELL and closes with a BUY (SHORT pricing); SHORT
+            # opens a BUY and closes with a SELL (LONG pricing).
+            if self.direction is Direction.LONG:
+                bids, asks = (Decimal("100.1"),), (Decimal("100.2"),)
+            else:
+                bids, asks = (Decimal("100.0"),), (Decimal("100.1"),)
+        else:
+            if self.direction is Direction.LONG:
+                bids, asks = (Decimal("100.0"),), (Decimal("100.1"),)
+            else:
+                bids, asks = (Decimal("100.1"),), (Decimal("100.2"),)
+        return OrderBookSnapshot(
+            market_id=7,
+            symbol="BTC",
+            bids=(DepthLevel(bids[0], Decimal("100"), "foreign-bid", 999),),
+            asks=(DepthLevel(asks[0], Decimal("100"), "foreign-ask", 999),),
+            observed_at=self.clock.now(),
+            market_type="perp",
+            venue="robinhood",
+        )
+
+    async def order_book(self, market_id: int) -> OrderBookSnapshot:
+        self.public_book_calls += 1
+        if self._source_order() is None:
+            if self.initial_book_seen and (self.always_bad_opening or not self.opening_bad_returned):
+                self.opening_bad_returned = True
+                self.opening_bad_calls += 1
+                self.adverse_book_calls.append(("opening", self.public_book_calls))
+                return self._book_with_source_level(self._synthetic_book(closing=False))
+            self.initial_book_seen = True
+        elif self.source_position != 0 and not self.closing_bad_returned:
+            self.closing_bad_returned = True
+            self.closing_bad_calls += 1
+            self.adverse_book_calls.append(("closing", self.public_book_calls))
+            return self._book_with_source_level(self._synthetic_book(closing=True))
+        return await super().order_book(market_id)
+
+    async def submit_order(self, plan):
+        if plan.order_type == "LIMIT":
+            self.source_submissions.append(
+                (plan.reduce_only, self.public_book_calls, plan.quantity, plan.client_order_index)
+            )
+        return await super().submit_order(plan)
+
+
 class UnknownFirstFallbackClient(CycleClient):
     def __init__(self, clock: AdvancingClock) -> None:
         super().__init__(clock, partial_close=True)
@@ -1221,6 +1294,67 @@ async def test_one_cycle_opens_holds_and_closes_actual_positions_once(tmp_path, 
     assert "HOLD_ANCHORED" in journal
     assert "CLOSING_PLAN_READY" in journal
     assert "CYCLE_COMPLETE" in journal
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("direction", [Direction.LONG, Direction.SHORT])
+async def test_exclusive_price_admission_retries_open_and_close_before_source_exposure(tmp_path, direction):
+    clock = AdvancingClock()
+    client = ExclusivePriceSequenceClient(clock, direction=direction)
+    cycle_path = tmp_path / f"exclusive-{direction.value.lower()}"
+    result = await run_random_cycle(
+        cycle_config(cycle_path, direction=direction),
+        client,
+        clock=clock,
+        rng=FixedRng(20, 20),
+    )
+
+    assert result.outcome is Outcome.SUCCESS, result.as_dict()
+    assert result.selection is not None
+    assert result.selection.quantity == Decimal("0.20")
+    assert result.selection.hold_seconds == 20
+    assert client.opening_bad_calls == 1
+    assert client.closing_bad_calls == 1
+    opening_sources = [item for item in client.source_submissions if not item[0]]
+    closing_sources = [item for item in client.source_submissions if item[0]]
+    assert len(opening_sources) == 1
+    assert len(closing_sources) == 1
+    # The adverse one-tick books were observed before their corresponding
+    # source LIMIT submissions; no unproved same-price queue was joined.
+    adverse_calls = dict(client.adverse_book_calls)
+    assert opening_sources[0][1] > adverse_calls["opening"]
+    assert closing_sources[0][1] > adverse_calls["closing"]
+    rows = [json.loads(line) for line in (cycle_path / "cycle.jsonl").read_text().splitlines()]
+    assert any(row["event"] == "PREPARATION_RETRY" for row in rows)
+    assert any(row["event"] == "CLOSING_PREPARATION_RETRY" for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_exclusive_price_opening_retries_use_only_the_existing_three_attempt_budget(tmp_path):
+    clock = AdvancingClock()
+    client = ExclusivePriceSequenceClient(
+        clock,
+        direction=Direction.LONG,
+        always_bad_opening=True,
+    )
+    cycle_path = tmp_path / "exclusive-budget"
+    result = await run_random_cycle(
+        cycle_config(cycle_path),
+        client,
+        clock=clock,
+        rng=FixedRng(20, 20),
+    )
+
+    assert result.outcome is Outcome.FAILED_PREFLIGHT_BLOCKED, result.as_dict()
+    assert result.selection is not None
+    assert result.selection.quantity == Decimal("0.20")
+    assert result.selection.hold_seconds == 20
+    assert client.opening_bad_calls == 3
+    assert not client.source_submissions
+    rows = [json.loads(line) for line in (cycle_path / "cycle.jsonl").read_text().splitlines()]
+    assert len([row for row in rows if row["event"] == "PREPARATION_RETRY"]) == 2
+    exhausted = [row for row in rows if row["event"] == "PREPARATION_EXHAUSTED"]
+    assert exhausted and exhausted[-1]["payload"]["maximum_attempts"] == 3
 
 
 @pytest.mark.asyncio

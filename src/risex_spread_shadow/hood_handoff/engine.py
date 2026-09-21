@@ -380,6 +380,48 @@ class HandoffEngine:
             raise
         return source, receiver, book, book_duration, max(0.0, time.perf_counter() - started)
 
+    async def _parallel_source_visibility_and_checks(
+        self,
+        config: HandoffConfig,
+        plan: OrderPlan,
+        receipt: MutationReceipt,
+        journal: DurableJournal,
+        run_id: str,
+    ) -> tuple[
+        OrderSnapshot | None,
+        tuple[AccountSnapshot, AccountSnapshot, dict[str, Any], float, float],
+        float,
+    ]:
+        """Overlap independent source visibility with the guarded read window.
+
+        Source order visibility, the two account snapshots, and the public
+        book are all read-only after the source mutation intent is durable.
+        They are drained together before the caller can cancel or dispatch the
+        receiver.  The exact source lookup remains in the caller after this
+        window and therefore remains the final owner-bound admission boundary.
+        """
+
+        started = time.perf_counter()
+        visibility_task = asyncio.create_task(
+            self._poll_order(
+                plan,
+                receipt.order_id,
+                journal,
+                run_id,
+                require_terminal=False,
+            )
+        )
+        checks_task = asyncio.create_task(self._parallel_pre_receiver_checks(config))
+        try:
+            source_order, checks = await asyncio.gather(visibility_task, checks_task)
+        except BaseException:
+            for task in (visibility_task, checks_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(visibility_task, checks_task, return_exceptions=True)
+            raise
+        return source_order, checks, max(0.0, time.perf_counter() - started)
+
     async def execute(self, config: HandoffConfig) -> HandoffResult:
         try:
             journal = DurableJournal(config.journal_path, clock=self.clock.now)
@@ -527,6 +569,14 @@ class HandoffEngine:
         source_recheck: AccountSnapshot | None = None
         receiver_recheck: AccountSnapshot | None = None
         source_recheck_transition = "UNAVAILABLE"
+        coalesced_pre_receiver_checks: tuple[
+            AccountSnapshot,
+            AccountSnapshot,
+            dict[str, Any],
+            float,
+            float,
+        ] | None = None
+        coalesced_pre_receiver_window_seconds = 0.0
         receiver_mutation_observations: tuple[Any, ...] = (source, receiver, plan.metadata_observed_at)
         receiver_mutation_observation_now: float | None = None
         prepared_source: Any | None = None
@@ -535,6 +585,7 @@ class HandoffEngine:
         prepared_receiver_plan: OrderPlan | None = None
         prepared_dispatch_enabled = self._supports_prepared_dispatch()
         if prepared_dispatch_enabled:
+            preparation_started = time.perf_counter()
             try:
                 # Nonces and signatures are acquired before source exposure.
                 # The SDK owns the in-memory single-use state; only the plain
@@ -551,13 +602,17 @@ class HandoffEngine:
                     observations=(source, receiver, plan.metadata_observed_at),
                 )
                 prepared_receiver = await self._prepare_order(prepared_receiver_plan)
-                latency["paired_preparation_seconds"] = 0.0
             except Exception as exc:
                 if prepared_source is not None:
                     await self._invalidate_prepared(prepared_source)
                 if prepared_receiver is not None:
                     await self._invalidate_prepared(prepared_receiver)
                 unknown_reasons.append(f"order preparation failed before source exposure: {sanitize_exception(exc)}")
+            finally:
+                latency["paired_preparation_seconds"] = max(
+                    0.0,
+                    time.perf_counter() - preparation_started,
+                )
         try:
             if not unknown_reasons:
                 source_dispatch_attempted = True
@@ -606,14 +661,36 @@ class HandoffEngine:
             if not source_receipt.accepted:
                 unknown_reasons.append("source dispatch was rejected")
             source_visibility_started = time.perf_counter()
-            source_order = await self._poll_order(
-                plan.source,
-                source_receipt.order_id,
-                journal,
-                run_id,
-                require_terminal=False,
-            )
+            try:
+                if paired_mode and source_receipt.accepted:
+                    (
+                        source_order,
+                        coalesced_pre_receiver_checks,
+                        coalesced_pre_receiver_window_seconds,
+                    ) = await self._parallel_source_visibility_and_checks(
+                        config,
+                        plan.source,
+                        source_receipt,
+                        journal,
+                        run_id,
+                    )
+                else:
+                    source_order = await self._poll_order(
+                        plan.source,
+                        source_receipt.order_id,
+                        journal,
+                        run_id,
+                        require_terminal=False,
+                    )
+            except Exception as exc:
+                unknown_reasons.append(
+                    f"pre-receiver state is unresolved: {sanitize_exception(exc)}"
+                )
             latency["source_visibility_seconds"] = max(0.0, time.perf_counter() - source_visibility_started)
+            if coalesced_pre_receiver_checks is not None:
+                latency["public_book_read_seconds"] = coalesced_pre_receiver_checks[3]
+                latency["concurrent_pre_receiver_checks_seconds"] = coalesced_pre_receiver_checks[4]
+                latency["coalesced_pre_receiver_window_seconds"] = coalesced_pre_receiver_window_seconds
             if source_order is not None:
                 source_order_id = source_order.order_id
             if source_order is None:
@@ -660,13 +737,22 @@ class HandoffEngine:
                 guard_request_started_at = self.clock.now()
             try:
                 if paired_mode:
-                    (
-                        source_recheck,
-                        receiver_recheck,
-                        public_book,
-                        book_duration,
-                        parallel_duration,
-                    ) = await self._parallel_pre_receiver_checks(config)
+                    if coalesced_pre_receiver_checks is None:
+                        (
+                            source_recheck,
+                            receiver_recheck,
+                            public_book,
+                            book_duration,
+                            parallel_duration,
+                        ) = await self._parallel_pre_receiver_checks(config)
+                    else:
+                        (
+                            source_recheck,
+                            receiver_recheck,
+                            public_book,
+                            book_duration,
+                            parallel_duration,
+                        ) = coalesced_pre_receiver_checks
                 else:
                     source_recheck, receiver_recheck = await self._parallel_account_rechecks(
                         _account_from_client(self.client, "source"),
@@ -1011,12 +1097,24 @@ class HandoffEngine:
                 observation_now=receiver_mutation_observation_now,
             )
             receiver_dispatch_plan = prepared_receiver_plan or receiver_admission_plan
+            receiver_final_deadline = receiver_admission_plan.mutation_deadline_monotonic
+            if prepared_receiver_plan is not None:
+                prepared_deadline = prepared_receiver_plan.mutation_deadline_monotonic
+                if (
+                    receiver_final_deadline is not None
+                    and prepared_deadline is not None
+                ):
+                    # Preparation cannot renew the evidence it was bound to.
+                    # The send barrier is the stricter of the prepared and
+                    # final-admission deadlines, so a later final read never
+                    # widens a pre-signed mutation's lifetime.
+                    receiver_final_deadline = min(receiver_final_deadline, prepared_deadline)
             journal.append("RECEIVER_DISPATCH_INTENT", {"plan": receiver_dispatch_plan.as_dict()}, run_id=run_id)
             receiver_receipt = _as_receipt(
                 await self._submit_order(
                     receiver_dispatch_plan,
                     prepared=prepared_receiver,
-                    final_deadline=receiver_admission_plan.mutation_deadline_monotonic,
+                    final_deadline=receiver_final_deadline,
                 )
             )
             latency["receiver_submit_ack_seconds"] = max(0.0, time.perf_counter() - receiver_submit_started)
@@ -1158,9 +1256,32 @@ class HandoffEngine:
     def _supports_prepared_dispatch(self) -> bool:
         """Use the fast path only when the client exposes both halves."""
 
-        return callable(getattr(self.client, "prepare_order", None)) and callable(
-            getattr(self.client, "submit_prepared_order", None)
-        )
+        if not (
+            callable(getattr(self.client, "prepare_order", None))
+            and callable(getattr(self.client, "submit_prepared_order", None))
+        ):
+            return False
+        # A test or adapter may intentionally replace the legacy generic
+        # submit_order surface on one instance.  Keep that explicit override
+        # authoritative instead of silently bypassing it with inherited SDK
+        # preparation methods.
+        if "submit_order" in getattr(self.client, "__dict__", {}):
+            return False
+        client_type = type(self.client)
+
+        def owner(name: str) -> type | None:
+            return next((candidate for candidate in client_type.__mro__ if name in candidate.__dict__), None)
+
+        submit_owner = owner("submit_order")
+        prepared_owner = owner("prepare_order")
+        if (
+            submit_owner is not None
+            and prepared_owner is not None
+            and submit_owner is not prepared_owner
+            and issubclass(submit_owner, prepared_owner)
+        ):
+            return False
+        return True
 
     async def _prepare_order(self, plan: OrderPlan) -> Any:
         method = getattr(self.client, "prepare_order", None)
@@ -1180,8 +1301,25 @@ class HandoffEngine:
         method = getattr(self.client, "submit_prepared_order", None)
         if not callable(method):
             raise ContractError("prepared dispatch client lacks prepared submission")
+        try:
+            parameters = inspect.signature(method).parameters.values()
+            accepts_deadline = any(
+                parameter.name == "deadline"
+                or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+        except (TypeError, ValueError):
+            # A callable without inspectable metadata may still be a generic
+            # adapter.  Its two positional arguments are the compatibility
+            # surface; the SDK implementation exposes the optional keyword.
+            accepts_deadline = False
+        invocation = (
+            method(plan, prepared, deadline=final_deadline)
+            if accepts_deadline
+            else method(plan, prepared)
+        )
         return await self._bounded(
-            method(plan, prepared, deadline=final_deadline),
+            invocation,
             "prepared order mutation",
         )
 

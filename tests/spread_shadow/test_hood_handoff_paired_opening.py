@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from decimal import Decimal
 import json
 from pathlib import Path
+from time import perf_counter
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +15,7 @@ from risex_spread_shadow.hood_handoff import (
     DepthLevel,
     Direction,
     HandoffConfig,
+    HandoffEngine,
     HistoryPage,
     LighterSdkClient,
     MarketMetadata,
@@ -314,6 +317,76 @@ class PairedClient:
         return HistoryPage()
 
 
+class PreparedPairedClient(PairedClient):
+    """Synthetic prepared-dispatch client for fast-path ordering barriers."""
+
+    def __init__(self, *, ambiguous_source: bool = False) -> None:
+        super().__init__()
+        self.ambiguous_source = ambiguous_source
+        self.preparation_events: list[tuple[str, int]] = []
+        self.prepared: list[dict[str, object]] = []
+        self.dispatch_deadlines: list[tuple[int, float | None, float | None]] = []
+
+    async def prepare_order(self, plan):
+        self.preparation_events.append(("prepare", plan.account_index))
+        token = {"plan": plan, "state": "READY"}
+        self.prepared.append(token)
+        return token
+
+    async def submit_prepared_order(self, plan, prepared, *, deadline=None):
+        self.preparation_events.append(("dispatch", plan.account_index))
+        assert prepared["plan"] == plan
+        self.dispatch_deadlines.append(
+            (plan.account_index, plan.mutation_deadline_monotonic, deadline)
+        )
+        if prepared["state"] != "READY":
+            return MutationReceipt(False, None, None, "prepared token was already consumed")
+        prepared["state"] = "CONSUMED"
+        if self.ambiguous_source and plan.account_index == self.source_account_index:
+            raise TimeoutError("synthetic send ambiguity")
+        return await super().submit_order(plan)
+
+    async def invalidate_prepared_order(self, prepared) -> None:
+        if prepared["state"] == "READY":
+            prepared["state"] = "INVALIDATED"
+
+
+class LegacyPreparedPairedClient(PreparedPairedClient):
+    """Keep the generic two-argument prepared submission surface working."""
+
+    async def submit_prepared_order(self, plan, prepared):
+        return await super().submit_prepared_order(plan, prepared)
+
+
+class DelayedPairedClient(PairedClient):
+    """Apply the same synthetic read delay to fast and serial controls."""
+
+    def __init__(self, *, delay: float) -> None:
+        super().__init__()
+        self.delay = delay
+        self.read_counts = {"account": 0, "book": 0, "lookup": 0}
+
+    async def account_snapshot(self, account_index: int, market_id: int) -> AccountSnapshot:
+        self.read_counts["account"] += 1
+        await asyncio.sleep(self.delay)
+        return await super().account_snapshot(account_index, market_id)
+
+    async def order_book(self, market_id: int) -> OrderBookSnapshot:
+        self.read_counts["book"] += 1
+        await asyncio.sleep(self.delay)
+        return await super().order_book(market_id)
+
+    async def lookup_order(self, account_index: int, market_id: int, *, order_id=None, client_order_index=None):
+        self.read_counts["lookup"] += 1
+        await asyncio.sleep(self.delay)
+        return await super().lookup_order(
+            account_index,
+            market_id,
+            order_id=order_id,
+            client_order_index=client_order_index,
+        )
+
+
 class NoBookPairedClient(PairedClient):
     """Model a paired adapter that cannot provide the mandatory fresh book."""
 
@@ -530,6 +603,95 @@ async def test_paired_opening_plan_is_explicit_and_builds_opposite_positions(tmp
     text = (tmp_path / "paired.jsonl").read_text()
     assert '"operation_mode":"PAIRED_OPENING"' in text
     assert result.as_dict()["operation_mode"] == "PAIRED_OPENING"
+
+
+@pytest.mark.asyncio
+async def test_prepared_pair_is_bound_before_source_exposure_and_receiver_dispatch_is_later(tmp_path):
+    client = PreparedPairedClient()
+    result = await run_handoff(config(tmp_path / "prepared-pair.jsonl"), client, clock=Clock())
+
+    assert result.outcome is Outcome.SUCCESS
+    assert client.preparation_events[:3] == [
+        ("prepare", client.source_account_index),
+        ("prepare", client.receiver_account_index),
+        ("dispatch", client.source_account_index),
+    ]
+    assert client.preparation_events[-1] == ("dispatch", client.receiver_account_index)
+    assert [token["state"] for token in client.prepared] == ["CONSUMED", "CONSUMED"]
+    receiver_deadline = client.dispatch_deadlines[-1]
+    assert receiver_deadline[0] == client.receiver_account_index
+    assert receiver_deadline[2] <= receiver_deadline[1]
+    assert not [
+        event
+        for event in client.preparation_events
+        if event == ("prepare", client.receiver_account_index)
+    ][1:]
+
+
+@pytest.mark.asyncio
+async def test_prepared_pair_keeps_two_argument_generic_client_compatibility(tmp_path):
+    client = LegacyPreparedPairedClient()
+    result = await run_handoff(config(tmp_path / "prepared-legacy.jsonl"), client, clock=Clock())
+
+    assert result.outcome is Outcome.SUCCESS
+    assert client.dispatch_deadlines[-1][2] is None
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_prepared_source_send_consumes_source_and_invalidates_receiver(tmp_path):
+    client = PreparedPairedClient(ambiguous_source=True)
+    result = await run_handoff(config(tmp_path / "prepared-ambiguous.jsonl"), client, clock=Clock())
+
+    assert result.outcome is Outcome.UNKNOWN
+    assert client.preparation_events == [
+        ("prepare", client.source_account_index),
+        ("prepare", client.receiver_account_index),
+        ("dispatch", client.source_account_index),
+    ]
+    assert [token["state"] for token in client.prepared] == ["CONSUMED", "INVALIDATED"]
+    assert not [plan for plan in client.submissions if plan.account_index == client.receiver_account_index]
+
+
+@pytest.mark.asyncio
+async def test_coalesced_source_visibility_reduces_window_without_reducing_reads(monkeypatch, tmp_path):
+    delay = 0.03
+    fast_client = DelayedPairedClient(delay=delay)
+    fast_result = await run_handoff(
+        config(tmp_path / "coalesced.jsonl"),
+        fast_client,
+        clock=Clock(),
+    )
+
+    async def serial_source_visibility_and_checks(self, config, plan, receipt, journal, run_id):
+        started = perf_counter()
+        source_order = await self._poll_order(
+            plan,
+            receipt.order_id,
+            journal,
+            run_id,
+            require_terminal=False,
+        )
+        checks = await self._parallel_pre_receiver_checks(config)
+        return source_order, checks, max(0.0, perf_counter() - started)
+
+    monkeypatch.setattr(
+        HandoffEngine,
+        "_parallel_source_visibility_and_checks",
+        serial_source_visibility_and_checks,
+    )
+    serial_client = DelayedPairedClient(delay=delay)
+    serial_result = await run_handoff(
+        config(tmp_path / "serial.jsonl"),
+        serial_client,
+        clock=Clock(),
+    )
+
+    assert fast_result.outcome is Outcome.SUCCESS
+    assert serial_result.outcome is Outcome.SUCCESS
+    assert fast_client.read_counts == serial_client.read_counts
+    fast_window = fast_result.latency["coalesced_pre_receiver_window_seconds"]
+    serial_window = serial_result.latency["coalesced_pre_receiver_window_seconds"]
+    assert serial_window > fast_window + delay * 0.5
 
 
 def _guard_payload(path: Path) -> dict:
