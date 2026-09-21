@@ -11,6 +11,7 @@ import asyncio
 from dataclasses import dataclass, replace
 from decimal import Decimal
 import hashlib
+import inspect
 import math
 from pathlib import Path
 import re
@@ -528,35 +529,68 @@ class HandoffEngine:
         source_recheck_transition = "UNAVAILABLE"
         receiver_mutation_observations: tuple[Any, ...] = (source, receiver, plan.metadata_observed_at)
         receiver_mutation_observation_now: float | None = None
+        prepared_source: Any | None = None
+        prepared_receiver: Any | None = None
+        prepared_source_plan: OrderPlan | None = None
+        prepared_receiver_plan: OrderPlan | None = None
+        prepared_dispatch_enabled = self._supports_prepared_dispatch()
+        if prepared_dispatch_enabled:
+            try:
+                # Nonces and signatures are acquired before source exposure.
+                # The SDK owns the in-memory single-use state; only the plain
+                # order plans are journaled below.
+                prepared_source_plan = self._mutation_plan(
+                    plan.source,
+                    config,
+                    observations=(source, receiver, plan.metadata_observed_at),
+                )
+                prepared_source = await self._prepare_order(prepared_source_plan)
+                prepared_receiver_plan = self._mutation_plan(
+                    plan.receiver,
+                    config,
+                    observations=(source, receiver, plan.metadata_observed_at),
+                )
+                prepared_receiver = await self._prepare_order(prepared_receiver_plan)
+                latency["paired_preparation_seconds"] = 0.0
+            except Exception as exc:
+                if prepared_source is not None:
+                    await self._invalidate_prepared(prepared_source)
+                if prepared_receiver is not None:
+                    await self._invalidate_prepared(prepared_receiver)
+                unknown_reasons.append(f"order preparation failed before source exposure: {sanitize_exception(exc)}")
         try:
-            source_dispatch_attempted = True
-            source_submit_started = time.perf_counter()
-            source_dispatch_plan = self._mutation_plan(
-                plan.source,
-                config,
-                observations=(source, receiver, plan.metadata_observed_at),
-            )
-            journal.append(
-                "SOURCE_DISPATCH_INTENT",
-                {"plan": source_dispatch_plan.as_dict()},
-                run_id=run_id,
-            )
-            source_receipt = _as_receipt(
-                await self._bounded(self.client.submit_order(source_dispatch_plan), "source mutation")
-            )
-            latency["source_submit_ack_seconds"] = max(0.0, time.perf_counter() - source_submit_started)
-            journal.append(
-                "SOURCE_DISPATCH_RESULT",
-                {
-                    "operation_mode": plan.operation_mode.value,
-                    "accepted": source_receipt.accepted,
-                    "order_id": source_receipt.order_id,
-                    "tx_hash": source_receipt.tx_hash,
-                    "response_code": source_receipt.response_code,
-                    "error": source_receipt.error,
-                },
-                run_id=run_id,
-            )
+            if not unknown_reasons:
+                source_dispatch_attempted = True
+                source_submit_started = time.perf_counter()
+                source_dispatch_plan = prepared_source_plan or self._mutation_plan(
+                    plan.source,
+                    config,
+                    observations=(source, receiver, plan.metadata_observed_at),
+                )
+                journal.append(
+                    "SOURCE_DISPATCH_INTENT",
+                    {"plan": source_dispatch_plan.as_dict()},
+                    run_id=run_id,
+                )
+                source_receipt = _as_receipt(
+                    await self._submit_order(
+                        source_dispatch_plan,
+                        prepared=prepared_source,
+                    )
+                )
+                latency["source_submit_ack_seconds"] = max(0.0, time.perf_counter() - source_submit_started)
+                journal.append(
+                    "SOURCE_DISPATCH_RESULT",
+                    {
+                        "operation_mode": plan.operation_mode.value,
+                        "accepted": source_receipt.accepted,
+                        "order_id": source_receipt.order_id,
+                        "tx_hash": source_receipt.tx_hash,
+                        "response_code": source_receipt.response_code,
+                        "error": source_receipt.error,
+                    },
+                    run_id=run_id,
+                )
         except Exception as exc:  # an exception after intent is dispatch-unknown
             if "source_submit_started" in locals():
                 latency["source_submit_ack_seconds"] = max(0.0, time.perf_counter() - source_submit_started)
@@ -566,6 +600,7 @@ class HandoffEngine:
                 {"operation_mode": plan.operation_mode.value, "reason": unknown_reasons[-1]},
                 run_id=run_id,
             )
+            await self._invalidate_prepared(prepared_receiver)
 
         if source_receipt is not None:
             if not source_receipt.accepted:
@@ -893,6 +928,7 @@ class HandoffEngine:
             guard_event_recorded = True
 
         if unknown_reasons:
+            await self._invalidate_prepared(prepared_receiver)
             # A dispatch can be ambiguous before the first order observation.
             # Resolve the exact client identity once more so an identified
             # remaining maker can be cancelled safely; a missing identity is
@@ -968,15 +1004,20 @@ class HandoffEngine:
         try:
             receiver_dispatch_attempted = True
             receiver_submit_started = time.perf_counter()
-            receiver_dispatch_plan = self._mutation_plan(
+            receiver_admission_plan = self._mutation_plan(
                 plan.receiver,
                 config,
                 observations=receiver_mutation_observations,
                 observation_now=receiver_mutation_observation_now,
             )
+            receiver_dispatch_plan = prepared_receiver_plan or receiver_admission_plan
             journal.append("RECEIVER_DISPATCH_INTENT", {"plan": receiver_dispatch_plan.as_dict()}, run_id=run_id)
             receiver_receipt = _as_receipt(
-                await self._bounded(self.client.submit_order(receiver_dispatch_plan), "receiver mutation")
+                await self._submit_order(
+                    receiver_dispatch_plan,
+                    prepared=prepared_receiver,
+                    final_deadline=receiver_admission_plan.mutation_deadline_monotonic,
+                )
             )
             latency["receiver_submit_ack_seconds"] = max(0.0, time.perf_counter() - receiver_submit_started)
             journal.append(
@@ -1113,6 +1154,51 @@ class HandoffEngine:
                         raise task_error
             raise
         return source_value, receiver_value
+
+    def _supports_prepared_dispatch(self) -> bool:
+        """Use the fast path only when the client exposes both halves."""
+
+        return callable(getattr(self.client, "prepare_order", None)) and callable(
+            getattr(self.client, "submit_prepared_order", None)
+        )
+
+    async def _prepare_order(self, plan: OrderPlan) -> Any:
+        method = getattr(self.client, "prepare_order", None)
+        if not callable(method):
+            raise ContractError("prepared dispatch client lacks order preparation")
+        return await self._bounded(method(plan), "order preparation")
+
+    async def _submit_order(
+        self,
+        plan: OrderPlan,
+        *,
+        prepared: Any | None = None,
+        final_deadline: float | None = None,
+    ) -> MutationReceipt | Mapping[str, Any]:
+        if prepared is None:
+            return await self._bounded(self.client.submit_order(plan), "order mutation")
+        method = getattr(self.client, "submit_prepared_order", None)
+        if not callable(method):
+            raise ContractError("prepared dispatch client lacks prepared submission")
+        return await self._bounded(
+            method(plan, prepared, deadline=final_deadline),
+            "prepared order mutation",
+        )
+
+    async def _invalidate_prepared(self, prepared: Any | None) -> None:
+        if prepared is None:
+            return
+        method = getattr(self.client, "invalidate_prepared_order", None)
+        if not callable(method):
+            method = getattr(prepared, "invalidate", None)
+            if callable(method):
+                result = method()
+                if inspect.isawaitable(result):
+                    await result
+            return
+        result = method(prepared)
+        if inspect.isawaitable(result):
+            await result
 
     async def _preflight(
         self,
