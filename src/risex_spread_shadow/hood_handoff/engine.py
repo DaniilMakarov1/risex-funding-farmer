@@ -11,6 +11,7 @@ import asyncio
 from dataclasses import dataclass, replace
 from decimal import Decimal
 import hashlib
+import inspect
 import math
 from pathlib import Path
 import re
@@ -327,6 +328,18 @@ class HandoffEngine:
     def __init__(self, client: HandoffClient, *, clock: Clock | None = None) -> None:
         self.client = client
         self.clock = clock or SystemClock()
+        self._last_pre_visibility_refresh = False
+        self._last_pre_visibility_refresh_seconds = 0.0
+        self._last_pre_visibility_original_checks: tuple[
+            AccountSnapshot,
+            AccountSnapshot,
+            dict[str, Any],
+            float,
+            float,
+        ] | None = None
+        self._visibility_source_baseline: AccountSnapshot | None = None
+        self._visibility_receiver_baseline: AccountSnapshot | None = None
+        self._visibility_requires_incremental_margin = False
 
     async def _read_public_book(
         self,
@@ -349,6 +362,8 @@ class HandoffEngine:
     async def _parallel_pre_receiver_checks(
         self,
         config: HandoffConfig,
+        *,
+        visibility_state: dict[str, float | bool | None] | None = None,
     ) -> tuple[AccountSnapshot, AccountSnapshot, dict[str, Any], float, float]:
         """Run independent account and public-book reads in one bounded window."""
 
@@ -360,14 +375,24 @@ class HandoffEngine:
             book_reader = getattr(self.client, "public_order_book", None)
         if not callable(book_reader):
             raise ContractError("paired operation requires a public order-book reader")
-        account_task = asyncio.create_task(
-            self._parallel_account_rechecks(
+        async def read_accounts() -> tuple[AccountSnapshot, AccountSnapshot]:
+            value = await self._parallel_account_rechecks(
                 _account_from_client(self.client, "source"),
                 _account_from_client(self.client, "receiver"),
                 config.market_id,
             )
-        )
-        book_task = asyncio.create_task(self._read_public_book(config))
+            if visibility_state is not None:
+                visibility_state["accounts_finished_at"] = time.perf_counter()
+            return value
+
+        async def read_book() -> tuple[dict[str, Any], float]:
+            value = await self._read_public_book(config)
+            if visibility_state is not None:
+                visibility_state["book_finished_at"] = time.perf_counter()
+            return value
+
+        account_task = asyncio.create_task(read_accounts())
+        book_task = asyncio.create_task(read_book())
         try:
             (source, receiver), (book, book_duration) = await asyncio.gather(account_task, book_task)
         except BaseException:
@@ -377,7 +402,282 @@ class HandoffEngine:
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
+        if visibility_state is not None:
+            visible_at = visibility_state.get("visible_finished_at")
+            component_finished = tuple(
+                value
+                for value in (
+                    visibility_state.get("accounts_finished_at"),
+                    visibility_state.get("book_finished_at"),
+                )
+                if isinstance(value, (int, float))
+            )
+            visibility_state["component_pre_visibility"] = bool(
+                isinstance(visible_at, (int, float))
+                and any(value < visible_at for value in component_finished)
+            )
         return source, receiver, book, book_duration, max(0.0, time.perf_counter() - started)
+
+    def _visibility_account_is_eligible(
+        self,
+        snapshot: AccountSnapshot,
+        baseline: AccountSnapshot | None,
+        *,
+        account_index: int,
+        market_id: int,
+    ) -> bool:
+        """Check that an early account read contains no contradictory evidence."""
+
+        if baseline is None:
+            return False
+        if (
+            snapshot.account_index != account_index
+            or snapshot.market_id != market_id
+            or snapshot.source_identity != baseline.source_identity
+            or snapshot.signed_position != baseline.signed_position
+            or not snapshot.authorized
+            or not snapshot.ready
+            or not self._snapshot_fresh(
+                snapshot,
+                self.clock.now(),
+                self._configured_freshness,
+            )
+        ):
+            return False
+        if (
+            snapshot.margin_available is None
+            or snapshot.margin_required is None
+            or snapshot.margin_required > snapshot.margin_available
+        ):
+            return False
+        if self._visibility_requires_incremental_margin and (
+            snapshot.incremental_margin_required is None
+            or not snapshot.incremental_margin_evidence
+        ):
+            return False
+        if (
+            snapshot.incremental_margin_required is not None
+            and snapshot.incremental_margin_evidence
+            and snapshot.incremental_margin_required > snapshot.margin_available
+        ):
+            return False
+        return True
+
+    def _visibility_source_order_status(
+        self,
+        snapshot: AccountSnapshot,
+        plan: OrderPlan,
+        source_order: OrderSnapshot,
+    ) -> str:
+        """Classify source account evidence without treating contradictions as absence."""
+
+        for order in snapshot.active_orders:
+            if order.filled_quantity > 0 or order.remaining_quantity != order.initial_quantity:
+                return "CONFLICT"
+        active = tuple(order for order in snapshot.active_orders if order.active)
+        if not active:
+            return "ABSENT"
+        if len(active) == 1 and (
+            active[0].order_id == source_order.order_id
+            and self._order_matches(active[0], plan)
+            and active[0].filled_quantity == 0
+            and active[0].remaining_quantity == plan.quantity
+        ):
+            return "EXACT"
+        return "CONFLICT"
+
+    @staticmethod
+    def _visibility_receiver_order_status(snapshot: AccountSnapshot) -> str:
+        """Receiver active/fill evidence is always a conflict for this window."""
+
+        if any(
+            order.active or order.filled_quantity > 0
+            for order in snapshot.active_orders
+        ):
+            return "CONFLICT"
+        return "CLEAR"
+
+    def _visibility_book_status(
+        self,
+        public_book: Mapping[str, Any],
+        plan: OrderPlan,
+        source_order: OrderSnapshot,
+    ) -> str:
+        """Classify exact source-book proof while retaining foreign priority evidence."""
+
+        levels = public_book.get("asks" if plan.side == "SELL" else "bids", ())
+        exact_source = False
+        foreign_priority = False
+        source_price = plan.price
+        for level in levels:
+            exact = (
+                level.get("order_id") is not None
+                and str(level.get("order_id")) == str(source_order.order_id)
+                and level.get("owner_account_index") == plan.account_index
+                and level.get("price") == source_price
+                and level.get("quantity") == plan.quantity
+            )
+            if exact:
+                exact_source = True
+                continue
+            price = level.get("price")
+            if price == source_price or (
+                plan.side == "SELL" and price < source_price
+            ) or (
+                plan.side == "BUY" and price > source_price
+            ):
+                foreign_priority = True
+        if foreign_priority:
+            return "CONFLICT"
+        return "EXACT" if exact_source else "ABSENT"
+
+    def _visibility_refresh_is_eligible(
+        self,
+        config: HandoffConfig,
+        plan: OrderPlan,
+        source_order: OrderSnapshot | None,
+        checks: tuple[AccountSnapshot, AccountSnapshot, dict[str, Any], float, float],
+        *,
+        pre_visibility: bool,
+    ) -> bool:
+        """Permit one refresh only when the early window proves causal absence."""
+
+        if (
+            not pre_visibility
+            or source_order is None
+            or not self._source_is_resting(source_order, plan)
+            or not self._time_fresh(
+                source_order.observed_at,
+                self.clock.now(),
+                self._configured_freshness,
+            )
+        ):
+            return False
+        original_source, original_receiver, original_book, _, _ = checks
+        if not self._time_fresh(
+            original_book["observed_at"],
+            self.clock.now(),
+            self._configured_freshness,
+        ):
+            return False
+        if not self._visibility_account_is_eligible(
+            original_source,
+            self._visibility_source_baseline,
+            account_index=plan.account_index,
+            market_id=plan.market_id,
+        ) or not self._visibility_account_is_eligible(
+            original_receiver,
+            self._visibility_receiver_baseline,
+            account_index=(
+                self._visibility_receiver_baseline.account_index
+                if self._visibility_receiver_baseline is not None
+                else -1
+            ),
+            market_id=plan.market_id,
+        ):
+            return False
+        source_status = self._visibility_source_order_status(
+            original_source,
+            plan,
+            source_order,
+        )
+        receiver_status = self._visibility_receiver_order_status(original_receiver)
+        book_status = self._visibility_book_status(original_book, plan, source_order)
+        if source_status == "CONFLICT" or receiver_status == "CONFLICT" or book_status == "CONFLICT":
+            return False
+        # A refresh is useful only when the first window lacks source proof.
+        # Complete owner-bound account and book evidence stays on the fast path.
+        return source_status == "ABSENT" or book_status == "ABSENT"
+
+    async def _parallel_source_visibility_and_checks(
+        self,
+        config: HandoffConfig,
+        plan: OrderPlan,
+        receipt: MutationReceipt,
+        journal: DurableJournal,
+        run_id: str,
+    ) -> tuple[
+        OrderSnapshot | None,
+        tuple[AccountSnapshot, AccountSnapshot, dict[str, Any], float, float],
+        float,
+    ]:
+        """Overlap independent source visibility with the guarded read window.
+
+        Source order visibility, the two account snapshots, and the public
+        book are all read-only after the source mutation intent is durable.
+        They are drained together before the caller can cancel or dispatch the
+        receiver.  The exact source lookup remains in the caller after this
+        window and therefore remains the final owner-bound admission boundary.
+        """
+
+        started = time.perf_counter()
+        visibility_finished_at: float | None = None
+        visibility_state: dict[str, float | bool | None] = {}
+        checks_finished_at: float | None = None
+
+        async def observe_source() -> OrderSnapshot | None:
+            nonlocal visibility_finished_at
+            value = await self._poll_order(
+                plan,
+                receipt.order_id,
+                journal,
+                run_id,
+                require_terminal=False,
+            )
+            visibility_finished_at = time.perf_counter()
+            visibility_state["visible_finished_at"] = visibility_finished_at
+            return value
+
+        async def read_checks() -> tuple[AccountSnapshot, AccountSnapshot, dict[str, Any], float, float]:
+            nonlocal checks_finished_at
+            value = await self._parallel_pre_receiver_checks(
+                config,
+                visibility_state=visibility_state,
+            )
+            checks_finished_at = time.perf_counter()
+            return value
+
+        visibility_task = asyncio.create_task(observe_source())
+        checks_task = asyncio.create_task(read_checks())
+        try:
+            source_order, checks = await asyncio.gather(visibility_task, checks_task)
+        except BaseException:
+            for task in (visibility_task, checks_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(visibility_task, checks_task, return_exceptions=True)
+            raise
+        # Account/book snapshots that completed before source visibility may
+        # legitimately omit the newly accepted order.  Refresh only a
+        # validated causal absence: identity, baseline position, readiness,
+        # margin, fill and conflicting-order evidence remain authoritative.
+        self._last_pre_visibility_refresh = False
+        self._last_pre_visibility_refresh_seconds = 0.0
+        pre_visibility = (
+            visibility_finished_at is not None
+            and checks_finished_at is not None
+            and (
+                checks_finished_at < visibility_finished_at
+                or visibility_state.get("component_pre_visibility") is True
+            )
+        )
+        if pre_visibility:
+            self._last_pre_visibility_original_checks = checks
+        if self._visibility_refresh_is_eligible(
+            config,
+            plan,
+            source_order,
+            checks,
+            pre_visibility=pre_visibility,
+        ):
+            refresh_started = time.perf_counter()
+            checks = await self._parallel_pre_receiver_checks(config)
+            self._last_pre_visibility_refresh = True
+            self._last_pre_visibility_refresh_seconds = max(
+                0.0,
+                time.perf_counter() - refresh_started,
+            )
+        return source_order, checks, max(0.0, time.perf_counter() - started)
 
     async def execute(self, config: HandoffConfig) -> HandoffResult:
         try:
@@ -526,37 +826,87 @@ class HandoffEngine:
         source_recheck: AccountSnapshot | None = None
         receiver_recheck: AccountSnapshot | None = None
         source_recheck_transition = "UNAVAILABLE"
+        coalesced_pre_receiver_checks: tuple[
+            AccountSnapshot,
+            AccountSnapshot,
+            dict[str, Any],
+            float,
+            float,
+        ] | None = None
+        coalesced_pre_receiver_window_seconds = 0.0
+        self._last_pre_visibility_original_checks = None
         receiver_mutation_observations: tuple[Any, ...] = (source, receiver, plan.metadata_observed_at)
         receiver_mutation_observation_now: float | None = None
+        prepared_source: Any | None = None
+        prepared_receiver: Any | None = None
+        prepared_source_plan: OrderPlan | None = None
+        prepared_receiver_plan: OrderPlan | None = None
+        self._visibility_source_baseline = source
+        self._visibility_receiver_baseline = receiver
+        self._visibility_requires_incremental_margin = requires_incremental_margin
+        prepared_dispatch_enabled = self._supports_prepared_dispatch()
+        if prepared_dispatch_enabled:
+            preparation_started = time.perf_counter()
+            try:
+                # Nonces and signatures are acquired before source exposure.
+                # The SDK owns the in-memory single-use state; only the plain
+                # order plans are journaled below.
+                prepared_source_plan = self._mutation_plan(
+                    plan.source,
+                    config,
+                    observations=(source, receiver, plan.metadata_observed_at),
+                )
+                prepared_source = await self._prepare_order(prepared_source_plan)
+                prepared_receiver_plan = self._mutation_plan(
+                    plan.receiver,
+                    config,
+                    observations=(source, receiver, plan.metadata_observed_at),
+                )
+                prepared_receiver = await self._prepare_order(prepared_receiver_plan)
+            except Exception as exc:
+                if prepared_source is not None:
+                    await self._invalidate_prepared(prepared_source)
+                if prepared_receiver is not None:
+                    await self._invalidate_prepared(prepared_receiver)
+                unknown_reasons.append(f"order preparation failed before source exposure: {sanitize_exception(exc)}")
+            finally:
+                latency["paired_preparation_seconds"] = max(
+                    0.0,
+                    time.perf_counter() - preparation_started,
+                )
         try:
-            source_dispatch_attempted = True
-            source_submit_started = time.perf_counter()
-            source_dispatch_plan = self._mutation_plan(
-                plan.source,
-                config,
-                observations=(source, receiver, plan.metadata_observed_at),
-            )
-            journal.append(
-                "SOURCE_DISPATCH_INTENT",
-                {"plan": source_dispatch_plan.as_dict()},
-                run_id=run_id,
-            )
-            source_receipt = _as_receipt(
-                await self._bounded(self.client.submit_order(source_dispatch_plan), "source mutation")
-            )
-            latency["source_submit_ack_seconds"] = max(0.0, time.perf_counter() - source_submit_started)
-            journal.append(
-                "SOURCE_DISPATCH_RESULT",
-                {
-                    "operation_mode": plan.operation_mode.value,
-                    "accepted": source_receipt.accepted,
-                    "order_id": source_receipt.order_id,
-                    "tx_hash": source_receipt.tx_hash,
-                    "response_code": source_receipt.response_code,
-                    "error": source_receipt.error,
-                },
-                run_id=run_id,
-            )
+            if not unknown_reasons:
+                source_dispatch_attempted = True
+                source_submit_started = time.perf_counter()
+                source_dispatch_plan = prepared_source_plan or self._mutation_plan(
+                    plan.source,
+                    config,
+                    observations=(source, receiver, plan.metadata_observed_at),
+                )
+                journal.append(
+                    "SOURCE_DISPATCH_INTENT",
+                    {"plan": source_dispatch_plan.as_dict()},
+                    run_id=run_id,
+                )
+                source_receipt = _as_receipt(
+                    await self._submit_order(
+                        source_dispatch_plan,
+                        prepared=prepared_source,
+                    )
+                )
+                latency["source_submit_ack_seconds"] = max(0.0, time.perf_counter() - source_submit_started)
+                journal.append(
+                    "SOURCE_DISPATCH_RESULT",
+                    {
+                        "operation_mode": plan.operation_mode.value,
+                        "accepted": source_receipt.accepted,
+                        "order_id": source_receipt.order_id,
+                        "tx_hash": source_receipt.tx_hash,
+                        "response_code": source_receipt.response_code,
+                        "error": source_receipt.error,
+                    },
+                    run_id=run_id,
+                )
         except Exception as exc:  # an exception after intent is dispatch-unknown
             if "source_submit_started" in locals():
                 latency["source_submit_ack_seconds"] = max(0.0, time.perf_counter() - source_submit_started)
@@ -566,19 +916,43 @@ class HandoffEngine:
                 {"operation_mode": plan.operation_mode.value, "reason": unknown_reasons[-1]},
                 run_id=run_id,
             )
+            await self._invalidate_prepared(prepared_receiver)
 
         if source_receipt is not None:
             if not source_receipt.accepted:
                 unknown_reasons.append("source dispatch was rejected")
             source_visibility_started = time.perf_counter()
-            source_order = await self._poll_order(
-                plan.source,
-                source_receipt.order_id,
-                journal,
-                run_id,
-                require_terminal=False,
-            )
+            try:
+                if paired_mode and source_receipt.accepted:
+                    (
+                        source_order,
+                        coalesced_pre_receiver_checks,
+                        coalesced_pre_receiver_window_seconds,
+                    ) = await self._parallel_source_visibility_and_checks(
+                        config,
+                        plan.source,
+                        source_receipt,
+                        journal,
+                        run_id,
+                    )
+                    latency["pre_visibility_refresh_seconds"] = self._last_pre_visibility_refresh_seconds
+                else:
+                    source_order = await self._poll_order(
+                        plan.source,
+                        source_receipt.order_id,
+                        journal,
+                        run_id,
+                        require_terminal=False,
+                    )
+            except Exception as exc:
+                unknown_reasons.append(
+                    f"pre-receiver state is unresolved: {sanitize_exception(exc)}"
+                )
             latency["source_visibility_seconds"] = max(0.0, time.perf_counter() - source_visibility_started)
+            if coalesced_pre_receiver_checks is not None:
+                latency["public_book_read_seconds"] = coalesced_pre_receiver_checks[3]
+                latency["concurrent_pre_receiver_checks_seconds"] = coalesced_pre_receiver_checks[4]
+                latency["coalesced_pre_receiver_window_seconds"] = coalesced_pre_receiver_window_seconds
             if source_order is not None:
                 source_order_id = source_order.order_id
             if source_order is None:
@@ -625,13 +999,22 @@ class HandoffEngine:
                 guard_request_started_at = self.clock.now()
             try:
                 if paired_mode:
-                    (
-                        source_recheck,
-                        receiver_recheck,
-                        public_book,
-                        book_duration,
-                        parallel_duration,
-                    ) = await self._parallel_pre_receiver_checks(config)
+                    if coalesced_pre_receiver_checks is None:
+                        (
+                            source_recheck,
+                            receiver_recheck,
+                            public_book,
+                            book_duration,
+                            parallel_duration,
+                        ) = await self._parallel_pre_receiver_checks(config)
+                    else:
+                        (
+                            source_recheck,
+                            receiver_recheck,
+                            public_book,
+                            book_duration,
+                            parallel_duration,
+                        ) = coalesced_pre_receiver_checks
                 else:
                     source_recheck, receiver_recheck = await self._parallel_account_rechecks(
                         _account_from_client(self.client, "source"),
@@ -857,6 +1240,15 @@ class HandoffEngine:
                     priority_guard["source_recheck"] = self._account_observation_payload(source_recheck)
                     priority_guard["receiver_recheck"] = self._account_observation_payload(receiver_recheck)
                     priority_guard["source_recheck_transition"] = source_recheck_transition
+                    if self._last_pre_visibility_original_checks is not None:
+                        first_source, first_receiver, first_book, _, _ = (
+                            self._last_pre_visibility_original_checks
+                        )
+                        priority_guard["causal_pre_visibility_observations"] = {
+                            "source": self._account_observation_payload(first_source),
+                            "receiver": self._account_observation_payload(first_receiver),
+                            "book_observed_at": first_book.get("observed_at"),
+                        }
                     priority_guard["admission_reasons"] = list(unknown_reasons[:8])
                     journal.append(
                         "PRE_RECEIVER_GUARD",
@@ -893,6 +1285,7 @@ class HandoffEngine:
             guard_event_recorded = True
 
         if unknown_reasons:
+            await self._invalidate_prepared(prepared_receiver)
             # A dispatch can be ambiguous before the first order observation.
             # Resolve the exact client identity once more so an identified
             # remaining maker can be cancelled safely; a missing identity is
@@ -968,15 +1361,32 @@ class HandoffEngine:
         try:
             receiver_dispatch_attempted = True
             receiver_submit_started = time.perf_counter()
-            receiver_dispatch_plan = self._mutation_plan(
+            receiver_admission_plan = self._mutation_plan(
                 plan.receiver,
                 config,
                 observations=receiver_mutation_observations,
                 observation_now=receiver_mutation_observation_now,
             )
+            receiver_dispatch_plan = prepared_receiver_plan or receiver_admission_plan
+            receiver_final_deadline = receiver_admission_plan.mutation_deadline_monotonic
+            if prepared_receiver_plan is not None:
+                prepared_deadline = prepared_receiver_plan.mutation_deadline_monotonic
+                if (
+                    receiver_final_deadline is not None
+                    and prepared_deadline is not None
+                ):
+                    # Preparation cannot renew the evidence it was bound to.
+                    # The send barrier is the stricter of the prepared and
+                    # final-admission deadlines, so a later final read never
+                    # widens a pre-signed mutation's lifetime.
+                    receiver_final_deadline = min(receiver_final_deadline, prepared_deadline)
             journal.append("RECEIVER_DISPATCH_INTENT", {"plan": receiver_dispatch_plan.as_dict()}, run_id=run_id)
             receiver_receipt = _as_receipt(
-                await self._bounded(self.client.submit_order(receiver_dispatch_plan), "receiver mutation")
+                await self._submit_order(
+                    receiver_dispatch_plan,
+                    prepared=prepared_receiver,
+                    final_deadline=receiver_final_deadline,
+                )
             )
             latency["receiver_submit_ack_seconds"] = max(0.0, time.perf_counter() - receiver_submit_started)
             journal.append(
@@ -1113,6 +1523,99 @@ class HandoffEngine:
                         raise task_error
             raise
         return source_value, receiver_value
+
+    def _supports_prepared_dispatch(self) -> bool:
+        """Use the fast path only when the client exposes both halves."""
+
+        if not (
+            callable(getattr(self.client, "prepare_order", None))
+            and callable(getattr(self.client, "submit_prepared_order", None))
+        ):
+            return False
+        # A test or adapter may intentionally replace the legacy generic
+        # submit_order surface on one instance.  Keep that explicit override
+        # authoritative instead of silently bypassing it with inherited SDK
+        # preparation methods.
+        if "submit_order" in getattr(self.client, "__dict__", {}):
+            return False
+        client_type = type(self.client)
+
+        def owner(name: str) -> type | None:
+            return next((candidate for candidate in client_type.__mro__ if name in candidate.__dict__), None)
+
+        submit_owner = owner("submit_order")
+        prepared_owner = owner("prepare_order")
+        if (
+            submit_owner is not None
+            and prepared_owner is not None
+            and submit_owner is not prepared_owner
+            and issubclass(submit_owner, prepared_owner)
+        ):
+            return False
+        return True
+
+    async def _prepare_order(self, plan: OrderPlan) -> Any:
+        method = getattr(self.client, "prepare_order", None)
+        if not callable(method):
+            raise ContractError("prepared dispatch client lacks order preparation")
+        return await self._bounded(method(plan), "order preparation")
+
+    async def _submit_order(
+        self,
+        plan: OrderPlan,
+        *,
+        prepared: Any | None = None,
+        final_deadline: float | None = None,
+    ) -> MutationReceipt | Mapping[str, Any]:
+        if prepared is None:
+            return await self._bounded(self.client.submit_order(plan), "order mutation")
+        method = getattr(self.client, "submit_prepared_order", None)
+        if not callable(method):
+            raise ContractError("prepared dispatch client lacks prepared submission")
+        effective_deadline = plan.mutation_deadline_monotonic
+        if final_deadline is not None:
+            effective_deadline = (
+                final_deadline
+                if effective_deadline is None
+                else min(effective_deadline, final_deadline)
+            )
+        if effective_deadline is not None and effective_deadline - time.monotonic() <= 0:
+            raise TimeoutError("prepared order mutation crossed the final mutation barrier")
+        try:
+            parameters = inspect.signature(method).parameters.values()
+            accepts_deadline = any(
+                parameter.name == "deadline"
+                or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+        except (TypeError, ValueError):
+            # A callable without inspectable metadata may still be a generic
+            # adapter.  Its two positional arguments are the compatibility
+            # surface; the SDK implementation exposes the optional keyword.
+            accepts_deadline = False
+        invocation = (
+            method(plan, prepared, deadline=effective_deadline)
+            if accepts_deadline
+            else method(plan, prepared)
+        )
+        if effective_deadline is None:
+            return await self._bounded(invocation, "prepared order mutation")
+        return await self._bounded(invocation, "prepared order mutation", deadline=effective_deadline)
+
+    async def _invalidate_prepared(self, prepared: Any | None) -> None:
+        if prepared is None:
+            return
+        method = getattr(self.client, "invalidate_prepared_order", None)
+        if not callable(method):
+            method = getattr(prepared, "invalidate", None)
+            if callable(method):
+                result = method()
+                if inspect.isawaitable(result):
+                    await result
+            return
+        result = method(prepared)
+        if inspect.isawaitable(result):
+            await result
 
     async def _preflight(
         self,
@@ -2525,12 +3028,28 @@ class HandoffEngine:
     def _request_timeout(self) -> float:
         return getattr(self, "_configured_request_timeout", 30.0)
 
-    async def _bounded(self, awaitable: Any, label: str) -> Any:
+    async def _bounded(
+        self,
+        awaitable: Any,
+        label: str,
+        *,
+        deadline: float | None = None,
+    ) -> Any:
         """Bound every SDK/read boundary without ever retrying a mutation."""
 
+        timeout = self._request_timeout
+        if deadline is not None:
+            timeout = min(timeout, deadline - time.monotonic())
+            if timeout <= 0:
+                close = getattr(awaitable, "close", None)
+                if callable(close):
+                    close()
+                raise TimeoutError(f"{label} crossed the final mutation barrier")
         try:
-            return await asyncio.wait_for(awaitable, timeout=self._request_timeout)
+            return await asyncio.wait_for(awaitable, timeout=timeout)
         except asyncio.TimeoutError as exc:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(f"{label} crossed the final mutation barrier") from exc
             raise TimeoutError(f"{label} exceeded configured request timeout") from exc
 
     @staticmethod

@@ -1732,6 +1732,25 @@ def _is_retryable_preparation_error(exc: BaseException) -> bool:
     return False
 
 
+def _exclusive_source_price_available(
+    book: OrderBookSnapshot,
+    direction: Direction,
+    source_price: Decimal,
+) -> bool:
+    """Require one tick of exclusive source improvement before exposure.
+
+    This is a pre-placement guard, so the source order is not present in the
+    public book yet.  Any executable-side volume at the selected price or a
+    better price would leave queue priority unproved; the caller retries
+    preparation within the existing three-attempt lineage budget.
+    """
+
+    levels = book.asks if direction is Direction.LONG else book.bids
+    if direction is Direction.LONG:
+        return all(level.price > source_price for level in levels)
+    return all(level.price < source_price for level in levels)
+
+
 class RandomCycleEngine:
     """Execute one sampled cycle and then stop."""
 
@@ -2420,6 +2439,14 @@ class RandomCycleEngine:
         now = self.clock.now()
         _validate_market_book(config, metadata, book, now)
         proposal = select_automatic_prices(config.direction, metadata, book, now=now, freshness_seconds=config.freshness_seconds)
+        if not _exclusive_source_price_available(
+            book,
+            config.direction,
+            proposal.source_limit_price,
+        ):
+            raise _RetryablePreparationFailure(
+                "public book does not permit an exclusive improved source price"
+            )
         source, receiver = await self._accounts(config, now)
         expected_source_position = 0 if initial_source is None else initial_source.signed_position
         expected_receiver_position = 0 if initial_receiver is None else initial_receiver.signed_position
@@ -2592,6 +2619,47 @@ class RandomCycleEngine:
                     now=now,
                     freshness_seconds=config.freshness_seconds,
                 )
+                if not _exclusive_source_price_available(
+                    book,
+                    close_direction,
+                    proposal.source_limit_price,
+                ):
+                    reason = "public book does not permit an exclusive improved closing source price"
+                    journal.append(
+                        "CLOSING_PREPARATION_FAILED",
+                        {
+                            "attempt": attempt_index,
+                            "reason": reason,
+                            "retryable": True,
+                            "source_price": format(proposal.source_limit_price, "f"),
+                            "book_observed_at": book.observed_at,
+                            "lineage": {"used": budget.used, "limit": budget.limit},
+                        },
+                    )
+                    if budget.available:
+                        journal.append(
+                            "CLOSING_PREPARATION_RETRY",
+                            {
+                                "attempt": attempt_index,
+                                "next_attempt": budget.used + 1,
+                                "reason": reason,
+                                "delay_seconds": config.poll_interval_seconds,
+                                "lineage": {"used": budget.used, "limit": budget.limit},
+                            },
+                        )
+                        await self.clock.sleep(config.poll_interval_seconds)
+                        continue
+                    exhausted = f"paired closing shared pair-attempt budget exhausted ({budget.used}/{budget.limit})"
+                    journal.append(
+                        "PAIR_ATTEMPT_EXHAUSTED",
+                        {
+                            "phase": "PAIRED_CLOSING",
+                            "attempt": attempt_index,
+                            "maximum_attempts": budget.limit,
+                            "reason": reason,
+                        },
+                    )
+                    return None, exhausted
                 close_config = self._handoff_config(
                     config,
                     paired_quantity,

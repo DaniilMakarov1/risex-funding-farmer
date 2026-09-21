@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from decimal import Decimal
 import json
 from pathlib import Path
+import time
+from time import perf_counter
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +16,7 @@ from risex_spread_shadow.hood_handoff import (
     DepthLevel,
     Direction,
     HandoffConfig,
+    HandoffEngine,
     HistoryPage,
     LighterSdkClient,
     MarketMetadata,
@@ -194,7 +198,7 @@ class PairedClient:
                 side=plan.side,
                 order_type="LIMIT",
                 time_in_force="POST_ONLY",
-                reduce_only=False,
+                reduce_only=plan.reduce_only,
                 initial_quantity=plan.quantity,
                 remaining_quantity=Decimal("0") if self.source_fills_before_receiver else plan.quantity,
                 filled_quantity=plan.quantity if self.source_fills_before_receiver else Decimal("0"),
@@ -220,7 +224,7 @@ class PairedClient:
             side=plan.side,
             order_type="MARKET",
             time_in_force="IOC",
-            reduce_only=False,
+            reduce_only=plan.reduce_only,
             initial_quantity=plan.quantity,
             remaining_quantity=plan.quantity - fill_quantity,
             filled_quantity=fill_quantity,
@@ -312,6 +316,201 @@ class PairedClient:
                 )
             )
         return HistoryPage()
+
+
+class PreparedPairedClient(PairedClient):
+    """Synthetic prepared-dispatch client for fast-path ordering barriers."""
+
+    def __init__(self, *, ambiguous_source: bool = False) -> None:
+        super().__init__()
+        self.ambiguous_source = ambiguous_source
+        self.preparation_events: list[tuple[str, int]] = []
+        self.prepared: list[dict[str, object]] = []
+        self.dispatch_deadlines: list[tuple[int, float | None, float | None]] = []
+
+    async def prepare_order(self, plan):
+        self.preparation_events.append(("prepare", plan.account_index))
+        token = {"plan": plan, "state": "READY"}
+        self.prepared.append(token)
+        return token
+
+    async def submit_prepared_order(self, plan, prepared, *, deadline=None):
+        self.preparation_events.append(("dispatch", plan.account_index))
+        assert prepared["plan"] == plan
+        self.dispatch_deadlines.append(
+            (plan.account_index, plan.mutation_deadline_monotonic, deadline)
+        )
+        if prepared["state"] != "READY":
+            return MutationReceipt(False, None, None, "prepared token was already consumed")
+        prepared["state"] = "CONSUMED"
+        if self.ambiguous_source and plan.account_index == self.source_account_index:
+            raise TimeoutError("synthetic send ambiguity")
+        return await super().submit_order(plan)
+
+    async def invalidate_prepared_order(self, prepared) -> None:
+        if prepared["state"] == "READY":
+            prepared["state"] = "INVALIDATED"
+
+
+class LegacyPreparedPairedClient(PreparedPairedClient):
+    """Keep the generic two-argument prepared submission surface working."""
+
+    async def submit_prepared_order(self, plan, prepared):
+        return await super().submit_prepared_order(plan, prepared)
+
+
+class DelayedPairedClient(PairedClient):
+    """Apply the same synthetic read delay to fast and serial controls."""
+
+    def __init__(self, *, delay: float) -> None:
+        super().__init__()
+        self.delay = delay
+        self.read_counts = {"account": 0, "book": 0, "lookup": 0}
+
+    async def account_snapshot(self, account_index: int, market_id: int) -> AccountSnapshot:
+        self.read_counts["account"] += 1
+        await asyncio.sleep(self.delay)
+        return await super().account_snapshot(account_index, market_id)
+
+    async def order_book(self, market_id: int) -> OrderBookSnapshot:
+        self.read_counts["book"] += 1
+        await asyncio.sleep(self.delay)
+        return await super().order_book(market_id)
+
+    async def lookup_order(self, account_index: int, market_id: int, *, order_id=None, client_order_index=None):
+        self.read_counts["lookup"] += 1
+        await asyncio.sleep(self.delay)
+        return await super().lookup_order(
+            account_index,
+            market_id,
+            order_id=order_id,
+            client_order_index=client_order_index,
+        )
+
+
+class PropagatingPreparedPairedClient(PreparedPairedClient):
+    """Delay source visibility while early account/book reads remain causal."""
+
+    def __init__(
+        self,
+        *,
+        closing: bool = False,
+        foreign_conflict: bool = False,
+        adverse: str | None = None,
+    ) -> None:
+        super().__init__()
+        if closing:
+            self.source_position = Decimal("0.20")
+            self.receiver_position = Decimal("-0.20")
+        self.closing = closing
+        self.foreign_conflict = foreign_conflict
+        self.adverse = adverse
+        self.source_visible = False
+        self.source_dispatch_started = False
+        self.source_lookup_calls = 0
+        self.read_counts = {"account": 0, "book": 0, "lookup": 0}
+
+    def _foreign_order(self) -> OrderSnapshot:
+        return OrderSnapshot(
+            account_index=self.source_account_index,
+            market_id=1,
+            order_id="foreign-active-order",
+            client_order_index=999,
+            status="open",
+            side="SELL",
+            order_type="LIMIT",
+            time_in_force="POST_ONLY",
+            reduce_only=self.closing,
+            initial_quantity=Decimal("0.10"),
+            remaining_quantity=Decimal("0.10"),
+            filled_quantity=Decimal("0"),
+            price=Decimal("99.0"),
+            observed_at=NOW,
+        )
+
+    async def account_snapshot(self, account_index: int, market_id: int) -> AccountSnapshot:
+        self.read_counts["account"] += 1
+        if not self.source_visible and self.source_dispatch_started:
+            if account_index == self.source_account_index:
+                active = (self._foreign_order(),) if self.foreign_conflict else ()
+                snapshot = _account_snapshot(account_index, self.source_position, active)
+                if self.adverse == "source_identity":
+                    return replace(
+                        snapshot,
+                        account_index=999,
+                        source_identity="foreign-source",
+                    )
+                if self.adverse == "source_position":
+                    return replace(
+                        snapshot,
+                        signed_position=self.source_position + Decimal("0.10"),
+                    )
+                if self.adverse == "complete":
+                    return await super().account_snapshot(account_index, market_id)
+                return snapshot
+            if account_index == self.receiver_account_index:
+                snapshot = _account_snapshot(account_index, self.receiver_position)
+                if self.adverse == "receiver_identity":
+                    return replace(
+                        snapshot,
+                        account_index=998,
+                        source_identity="foreign-receiver",
+                    )
+                return snapshot
+        return await super().account_snapshot(account_index, market_id)
+
+    async def order_book(self, market_id: int) -> OrderBookSnapshot:
+        self.read_counts["book"] += 1
+        value = await super().order_book(market_id)
+        if self.source_visible or self.adverse == "complete":
+            return value
+        # A source order accepted by the sequencer may be absent from the
+        # first public snapshot.  Leave only a neutral guard level here; the
+        # post-visibility refresh must recover the exact owner-bound level.
+        return replace(
+            value,
+            asks=(DepthLevel(Decimal("101.0"), Decimal("1"), "ask-guard", 999),),
+            bids=(DepthLevel(Decimal("99.0"), Decimal("1"), "bid-guard", 999),),
+        )
+
+    async def lookup_order(
+        self,
+        account_index: int,
+        market_id: int,
+        *,
+        order_id=None,
+        client_order_index=None,
+    ):
+        self.read_counts["lookup"] += 1
+        if account_index == self.source_account_index and order_id is not None:
+            self.source_lookup_calls += 1
+            if self.source_lookup_calls == 1:
+                await asyncio.sleep(0.02)
+                self.source_visible = True
+        return await super().lookup_order(
+            account_index,
+            market_id,
+            order_id=order_id,
+            client_order_index=client_order_index,
+        )
+
+    async def submit_prepared_order(self, plan, prepared, *, deadline=None):
+        if plan.account_index == self.source_account_index:
+            self.source_dispatch_started = True
+        return await super().submit_prepared_order(plan, prepared, deadline=deadline)
+
+
+class DelayedLegacyPreparedPairedClient(LegacyPreparedPairedClient):
+    """Two-argument adapter whose mutation crosses the final deadline."""
+
+    def __init__(self, *, delay: float) -> None:
+        super().__init__()
+        self.delay = delay
+
+    async def submit_prepared_order(self, plan, prepared):
+        if plan.account_index == self.receiver_account_index:
+            await asyncio.sleep(self.delay)
+        return await super().submit_prepared_order(plan, prepared)
 
 
 class NoBookPairedClient(PairedClient):
@@ -530,6 +729,234 @@ async def test_paired_opening_plan_is_explicit_and_builds_opposite_positions(tmp
     text = (tmp_path / "paired.jsonl").read_text()
     assert '"operation_mode":"PAIRED_OPENING"' in text
     assert result.as_dict()["operation_mode"] == "PAIRED_OPENING"
+
+
+@pytest.mark.asyncio
+async def test_prepared_pair_is_bound_before_source_exposure_and_receiver_dispatch_is_later(tmp_path):
+    client = PreparedPairedClient()
+    result = await run_handoff(config(tmp_path / "prepared-pair.jsonl"), client, clock=Clock())
+
+    assert result.outcome is Outcome.SUCCESS
+    assert client.preparation_events[:3] == [
+        ("prepare", client.source_account_index),
+        ("prepare", client.receiver_account_index),
+        ("dispatch", client.source_account_index),
+    ]
+    assert client.preparation_events[-1] == ("dispatch", client.receiver_account_index)
+    assert [token["state"] for token in client.prepared] == ["CONSUMED", "CONSUMED"]
+    receiver_deadline = client.dispatch_deadlines[-1]
+    assert receiver_deadline[0] == client.receiver_account_index
+    assert receiver_deadline[2] <= receiver_deadline[1]
+    assert not [
+        event
+        for event in client.preparation_events
+        if event == ("prepare", client.receiver_account_index)
+    ][1:]
+
+
+@pytest.mark.asyncio
+async def test_prepared_pair_keeps_two_argument_generic_client_compatibility(tmp_path):
+    client = LegacyPreparedPairedClient()
+    result = await run_handoff(config(tmp_path / "prepared-legacy.jsonl"), client, clock=Clock())
+
+    assert result.outcome is Outcome.SUCCESS
+    assert client.dispatch_deadlines[-1][2] is None
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_prepared_source_send_consumes_source_and_invalidates_receiver(tmp_path):
+    client = PreparedPairedClient(ambiguous_source=True)
+    result = await run_handoff(config(tmp_path / "prepared-ambiguous.jsonl"), client, clock=Clock())
+
+    assert result.outcome is Outcome.UNKNOWN
+    assert client.preparation_events == [
+        ("prepare", client.source_account_index),
+        ("prepare", client.receiver_account_index),
+        ("dispatch", client.source_account_index),
+    ]
+    assert [token["state"] for token in client.prepared] == ["CONSUMED", "INVALIDATED"]
+    assert not [plan for plan in client.submissions if plan.account_index == client.receiver_account_index]
+
+
+@pytest.mark.asyncio
+async def test_coalesced_source_visibility_reduces_window_without_reducing_reads(monkeypatch, tmp_path):
+    delay = 0.03
+    fast_client = DelayedPairedClient(delay=delay)
+    fast_result = await run_handoff(
+        config(tmp_path / "coalesced.jsonl"),
+        fast_client,
+        clock=Clock(),
+    )
+
+    async def serial_source_visibility_and_checks(self, config, plan, receipt, journal, run_id):
+        started = perf_counter()
+        source_order = await self._poll_order(
+            plan,
+            receipt.order_id,
+            journal,
+            run_id,
+            require_terminal=False,
+        )
+        checks = await self._parallel_pre_receiver_checks(config)
+        return source_order, checks, max(0.0, perf_counter() - started)
+
+    monkeypatch.setattr(
+        HandoffEngine,
+        "_parallel_source_visibility_and_checks",
+        serial_source_visibility_and_checks,
+    )
+    serial_client = DelayedPairedClient(delay=delay)
+    serial_result = await run_handoff(
+        config(tmp_path / "serial.jsonl"),
+        serial_client,
+        clock=Clock(),
+    )
+
+    assert fast_result.outcome is Outcome.SUCCESS
+    assert serial_result.outcome is Outcome.SUCCESS
+    assert fast_client.read_counts == serial_client.read_counts
+    fast_window = fast_result.latency["coalesced_pre_receiver_window_seconds"]
+    serial_window = serial_result.latency["coalesced_pre_receiver_window_seconds"]
+    assert serial_window > fast_window + delay * 0.5
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("closing", "foreign_conflict"),
+    [(False, False), (True, False), (False, True)],
+)
+async def test_source_propagation_refreshes_only_causal_absence_for_open_and_close(
+    tmp_path,
+    closing,
+    foreign_conflict,
+):
+    client = PropagatingPreparedPairedClient(
+        closing=closing,
+        foreign_conflict=foreign_conflict,
+    )
+    operation_mode = OperationMode.PAIRED_CLOSING if closing else OperationMode.PAIRED_OPENING
+    result = await run_handoff(
+        config(
+            tmp_path / f"propagation-{closing}-{foreign_conflict}.jsonl",
+            operation_mode=operation_mode,
+        ),
+        client,
+        clock=Clock(),
+    )
+
+    if foreign_conflict:
+        assert result.outcome is Outcome.UNKNOWN, result.as_dict()
+        assert any("additional or conflicting active order" in reason for reason in result.unknown_reasons)
+        assert [plan.account_index for plan in client.submissions] == [client.source_account_index]
+        assert result.latency.get("pre_visibility_refresh_seconds") == 0.0
+    else:
+        assert result.outcome is Outcome.SUCCESS, result.as_dict()
+        assert [plan.account_index for plan in client.submissions] == [
+            client.source_account_index,
+            client.receiver_account_index,
+        ]
+        assert result.latency["pre_visibility_refresh_seconds"] > 0
+        assert client.read_counts["account"] >= 6
+        assert client.read_counts["book"] >= 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("adverse", "reason_fragment"),
+    [
+        ("source_identity", "source recheck account/market identity conflicts"),
+        ("receiver_identity", "receiver recheck account/market identity conflicts"),
+        ("source_position", "source position changed"),
+    ],
+)
+async def test_pre_visibility_adverse_account_evidence_is_sticky(
+    tmp_path,
+    adverse,
+    reason_fragment,
+):
+    client = PropagatingPreparedPairedClient(adverse=adverse)
+    path = tmp_path / f"adverse-{adverse}.jsonl"
+    result = await run_handoff(config(path), client, clock=Clock())
+
+    assert result.outcome is Outcome.UNKNOWN, result.as_dict()
+    assert any(reason_fragment in reason for reason in result.unknown_reasons)
+    assert [plan.account_index for plan in client.submissions] == [client.source_account_index]
+    assert result.latency["pre_visibility_refresh_seconds"] == 0.0
+    guard = _guard_payload(path)
+    first = guard["causal_pre_visibility_observations"]
+    if adverse == "source_identity":
+        assert first["source"]["account_index"] == 999
+        assert first["source"]["source_identity"] == "foreign-source"
+    elif adverse == "receiver_identity":
+        assert first["receiver"]["account_index"] == 998
+        assert first["receiver"]["source_identity"] == "foreign-receiver"
+    else:
+        assert first["source"]["signed_position"] == "0.10"
+
+
+@pytest.mark.asyncio
+async def test_pre_visibility_complete_owner_book_evidence_keeps_fast_path(tmp_path):
+    client = PropagatingPreparedPairedClient(adverse="complete")
+    result = await run_handoff(
+        config(tmp_path / "complete-evidence.jsonl"),
+        client,
+        clock=Clock(),
+    )
+
+    assert result.outcome is Outcome.SUCCESS, result.as_dict()
+    assert result.latency["pre_visibility_refresh_seconds"] == 0.0
+    assert client.read_counts["book"] == 1
+    assert [plan.account_index for plan in client.submissions] == [11, 22]
+
+
+def _prepared_test_plan(*, account_index: int, deadline: float) -> OrderPlan:
+    return OrderPlan(
+        account_index=account_index,
+        market_id=1,
+        side="SELL" if account_index == 11 else "BUY",
+        quantity=Decimal("0.20"),
+        quantity_int=20,
+        price=Decimal("100.0"),
+        price_int=1000,
+        order_type="LIMIT",
+        time_in_force="POST_ONLY",
+        reduce_only=False,
+        order_expiry_ms=1_500_000,
+        client_order_index=account_index,
+        mutation_deadline_monotonic=deadline,
+    )
+
+
+@pytest.mark.asyncio
+async def test_two_argument_prepared_submission_checks_expired_deadline_before_invocation():
+    client = LegacyPreparedPairedClient()
+    engine = HandoffEngine(client, clock=Clock())
+    plan = _prepared_test_plan(account_index=11, deadline=time.monotonic() - 1)
+    prepared = await client.prepare_order(plan)
+
+    with pytest.raises(TimeoutError, match="final mutation barrier"):
+        await engine._submit_order(
+            plan,
+            prepared=prepared,
+            final_deadline=plan.mutation_deadline_monotonic,
+        )
+    assert client.preparation_events == [("prepare", client.source_account_index)]
+
+
+@pytest.mark.asyncio
+async def test_two_argument_prepared_submission_is_bounded_across_await():
+    client = DelayedLegacyPreparedPairedClient(delay=0.05)
+    engine = HandoffEngine(client, clock=Clock())
+    plan = _prepared_test_plan(account_index=22, deadline=time.monotonic() + 0.01)
+    prepared = await client.prepare_order(plan)
+
+    with pytest.raises(TimeoutError, match="final mutation barrier"):
+        await engine._submit_order(
+            plan,
+            prepared=prepared,
+            final_deadline=plan.mutation_deadline_monotonic,
+        )
+    assert client.preparation_events == [("prepare", client.receiver_account_index)]
 
 
 def _guard_payload(path: Path) -> dict:
