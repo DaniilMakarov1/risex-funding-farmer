@@ -3,6 +3,16 @@
 SYSTEM_SPEC_VERSION = 4.2
 SPEC_STATUS = FIRST_RAW_RESEARCH_SCANNER_IMPLEMENTED
 
+## HCR-23 amendment — transport uncertainty, observation age and durable inventory proof
+
+A timeout or exception after entering sendTx, a malformed response, or an undecidable/conflicting HTTP/application response is unresolved execution. It must not become an authoritative rejection or permit a later dependent write on either account. Explicit application rejection and known local failure before transmission remain distinct. The mutation transport sends once without redirects or replay and owns a lazily reused connection pool with request-local authentication and idempotent cleanup.
+
+An account snapshot retains the observation time of its account response; a subsequent active-orders read cannot renew position/balance age. Duplicate selected-market position rows and conflicting market identities are invalid rather than evidence of a zero position.
+
+Observed zero positions are not sufficient to certify closed inventory while a submitted order remains unresolved. Inventory proof is separate from fee and counterparty evidence: complete terminal execution and causally agreeing zero positions can establish closed inventory despite unknown fees. Every journal record must be written completely and synchronized before its intent is allowed to authorize a mutation; partial or interrupted writes must complete or fail closed without deleting the original evidence.
+
+These corrections preserve price/size/hold sampling, safety thresholds, retry and residual policy. Verification is offline; actual venue ownership evidence and live latency remain unvalidated.
+
 ## HCR-22 amendment — exact source-priority admission and bounded pair retry
 
 For `PAIRED_OPENING` and `PAIRED_CLOSING`, receiver dispatch requires one fresh bounded pre-receiver window containing independent concurrent account reads and a fresh two-sided public book, followed by an exact source-order lookup. The exact active zero-fill source must match owner account, market, order id, client identity, side, LIMIT/POST_ONLY, reduce-only policy, selected price and full expected remaining quantity. The public source level must match exact order id, owner, side-array, price and quantity. Missing, stale, future, malformed, anonymous or conflicting evidence is `UNKNOWN`; external better-priced volume is `LOST`; external same-price volume without explicit FIFO proof is `UNKNOWN`. `LOST` and `UNKNOWN` forbid receiver dispatch, and public evidence never guarantees a counterparty.

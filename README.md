@@ -1,5 +1,11 @@
 # RISEx Spread Shadow and legacy Funding Farmer
 
+## HCR-23 offline execution audit — accepted
+
+A lost or undecidable sendTx response is unresolved execution: dependent orders stop on both accounts. Do not interpret it as an exchange rejection or retry it blindly. The last observed position and confirmed closed inventory are separate facts; a zero observation cannot resolve an outstanding order. Missing fees remain a separate economic uncertainty even when closure is proved.
+
+The adapter reuses its owned HTTP session to avoid repeated connection setup. Authentication stays local to each request; mutation requests are sent once without redirects. Account timestamps retain the original account-read time instead of being refreshed by a slower active-orders read. These changes do not tune prices, quantities, holds, slippage, freshness or retry limits, and do not guarantee matching an owned order or a particular live latency.
+
 ## HCR-22 paired source-priority guard — audited correction accepted offline
 
 Immediately before the receiver MARKET/IOC leg of a paired opening or paired closing, the program now reads both accounts and a fresh two-sided public book in one bounded concurrent window, then rechecks the exact source POST_ONLY order. The receiver is sent only when the source remains active and zero-filled with the exact owner, order/client identity, market, side, price and full remaining quantity, its exact owner-bound level is present publicly, no external order has a better price, and no external same-price order leaves FIFO priority unproved.

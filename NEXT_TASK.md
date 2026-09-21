@@ -1,4 +1,10 @@
-# HCR-23 — offline execution audit, bounded corrections and measured latency
+# HCR-23 — COMPLETE: offline execution audit and bounded corrections
+
+## Accepted result and next boundary
+
+SDK candidate `c589f888699139935b69ccf9844b307141905087` and state correction `629501331aebc19998127a890b23fb81ea2b74aa` passed independent full-diff review and six adverse Chief probes. Final clean isolated Python3.11 suite:4645 passed,3 skipped, exit0. Current finite implementation objective is complete. Remaining delivery is accepted publication/operator identity verification; evidence is `spread-shadow-runs/hood-offline-audit-20260921/chief-v1`. There is no active Builder assignment or market process. Future live validation requires a new explicit owner action; no automated continuation, real read/sign/order/cancel or new cycle is authorized by this completed audit.
+
+Two extra causes found during independent candidate review were corrected in the same healthy state Builder session: unexplained account-only zeros after partial close could still certify flatness, and failed journal sequence reread leaked its acquired lock. Final per-account evidence must agree with observed positions; lock cleanup now covers every failed acquisition path. No policy changes were made.
 
 ## Objective and authority
 
