@@ -1,6 +1,6 @@
 # RISEx Spread Shadow
 
-This standalone project contains the operator-run Robinhood Chain BTC cycle utility and frozen public/paper research tools. Current work is offline diagnostics and verification (HCR-27); live trading is not part of that assignment. `NEXT_TASK.md` defines the finite authority and acceptance criteria, `STATUS.md` records accepted state, `SYSTEM_SPEC.md` defines behavior, and `AGENTS.md` defines process and safety. Historical experiments and incident narratives are retained in Git and immutable owner-only evidence, not operational permissions.
+This standalone project contains the operator-run Robinhood Chain BTC cycle utility and frozen public/paper research tools. HCR-27 offline diagnostics and verification are complete; the clean Python 3.11 suite passed 4739 tests with 3 existing skips. Live validation was not part of that assignment. `NEXT_TASK.md` defines the finite authority and acceptance criteria, `STATUS.md` records accepted state, `SYSTEM_SPEC.md` defines behavior, and `AGENTS.md` defines process and safety. Historical experiments and incident narratives are retained in Git and immutable owner-only evidence, not operational permissions.
 
 ## Runtime and setup
 
@@ -11,7 +11,7 @@ python3.11 -m venv .venv-hood
 .venv-hood/bin/python -m pip install -e '.[hood-handoff,test]'
 ```
 
-An existing installation does not need to be recreated. The root `start` script selects `.venv-hood/bin/python` regardless of shell PATH and imports this checkout's source. Before reserving a cycle it validates local configuration, owner-only storage, market evidence and the pinned SDK. Help and pre-launch cancellation are offline and consume no cycle slot.
+An existing installation does not need to be recreated. If it contains only runtime dependencies, install the test extras before using pytest: `.venv-hood/bin/python -m pip install -e '.[test]'`. The root `start` script selects `.venv-hood/bin/python` regardless of shell PATH and imports this checkout's source. Before reserving a cycle it validates local configuration, owner-only storage, market evidence and the pinned SDK. Help and pre-launch cancellation are offline and consume no cycle slot.
 
 ```bash
 ./start --help
@@ -60,6 +60,17 @@ Interpret these facts independently:
 | Observation time | Saved account facts are historical, never a current account check. |
 
 After interruption, preserve all evidence and inspect it before any later operation. The random-cycle/simple launcher does not resume trading or automatically close historical inventory. Lower-level handoff/series restart interfaces permit only their existing bound read-only reconciliation; they do not authorize replay or a new cycle. A completed process or exit code 0 alone proves neither paired success nor profit.
+
+## Offline saved-cycle report
+
+The report reads a saved cycle directory or its `cycle.jsonl`; it makes no requests and does not resume execution. For example:
+
+```bash
+.venv-hood/bin/risex-hood-handoff report --path spread-shadow-runs/hood-cycle-race-latency-20260920/operator-v1/cycle-007
+.venv-hood/bin/risex-hood-handoff report --path spread-shadow-runs/hood-cycle-race-latency-20260920/operator-v1/cycle-007 --json
+```
+
+Use `--format both` for human and JSON output; repeat `--path` to report separate cycles without adding their results. `paired_execution.direct_counterparty_match` reports optional exact mutual matching separately from completed exposure. The reader hashes and counts every input record while retaining bounded details; if required detail is omitted, the report is INCOMPLETE and aggregate execution/inventory/fee proofs remain UNKNOWN. Read the report's completeness and issues as well as its individual execution, inventory and fee conclusions. Process exit alone is not trading success. Saved observation times are historical. Latency stages can overlap; unavailable values and uncertain transport are explicit. Do not sum overlapping windows or infer network/exchange/signing time from an uninstrumented interval.
 
 ## Credentials and account diagnostics
 

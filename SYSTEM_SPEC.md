@@ -3,6 +3,16 @@
 SYSTEM_SPEC_VERSION = 4.2
 SPEC_STATUS = FIRST_RAW_RESEARCH_SCANNER_IMPLEMENTED
 
+## HCR-27 amendment — offline saved-cycle diagnostics
+
+The offline report reads existing parent/child journals without creating SDK clients, accessing credentials/Keychain, requesting market/account data, reserving claims or replaying mutations. Inputs and their hashes remain immutable. Report source identity includes file hashes and record provenance. Parse input incrementally and retain bounded explanatory details with exact aggregate counts; detail truncation is explicit, makes the report incomplete and blocks positive aggregate proofs. Irrelevant additive fields do not displace required facts.
+
+Preserve planned actions, durable mutation intentions, observed responses and reconciled trade receipts as distinct facts. An intention does not prove transmission; an accepted response does not prove a fill. Parent and child outcomes remain separate. Missing, malformed, truncated, conflicting, unresolved or causally inconsistent evidence cannot be promoted to paired success, confirmed-flat inventory or proved zero execution. Positive classifications require the same exact identities, Decimal quantities, complete histories, terminal-order and final-position agreement as the accepted execution semantics. Saved historical classifications may be displayed as claims, separately from independently established report conclusions.
+
+Keep paired execution, counterparty matching, inventory, fee completeness and funding/PNL separate. Preserve last observed positions and their times without implying current account state. Missing actual-trade fees, including fallback trades, remain unknown; fully evidenced fees can be reported as complete. Funding absence remains unknown. The report does not invent prices, fills, profit, an executable restart or new trading authority.
+
+Latency diagnostics identify available quote-age, preparation, dispatch-response, visibility, admission and reconciliation measurements for each saved phase/attempt. Overlapping intervals are not additive. Missing observations are unavailable rather than zero; unknown transport is not an acknowledgement; an unsuccessful visibility wait is not a fill observation. Distinguish local duration measurements from wall-clock event intervals and do not attribute unmeasured time to network, exchange or signing. Incident indicators use typed saved evidence and do not label a canceled LIMIT as a canceled IOC from keyword overlap.
+
 ## HCR-26 amendment — late quote and concurrent preflight reads
 
 Opening and closing revalidation overlap independent metadata and account reads, validate accounts, then fetch the final book quote. Revalidate original account observation ages after that book returns before computing/binding prices and quantity bounds. Child handoff preflight overlaps metadata and both account reads, drains all sibling tasks on failure/cancellation, then applies the same complete validation. No account timestamp is renewed and no required final source-priority check is skipped. Exact plan/signature binding and existing mutation deadlines remain mandatory; this ordering reduces local quote age without guaranteeing an owned-counterparty fill.
