@@ -334,3 +334,46 @@ async def test_changed_config_does_not_start_a_child(tmp_path, monkeypatch):
     with pytest.raises(Stop):
         await bot.serve(SimpleNamespace(config=config, owner_id=42), store, 99, 'unused')
     assert store.data['active'] is not None
+
+
+@pytest.mark.parametrize("failed", [False, True])
+async def test_status_during_final_notification_does_not_crash(tmp_path, monkeypatch, failed):
+    reached, release = asyncio.Event(), asyncio.Event()
+    async def launch():
+        if failed:
+            restore_cycle(tmp_path, '003')
+    c = setup(tmp_path, launch)
+    async def delayed_notify(text):
+        if c._runner_finished:
+            reached.set()
+            await release.wait()
+    monkeypatch.setattr(c, 'notify', delayed_notify)
+    await c.handle(update())
+    await reached.wait()
+    try:
+        summary = c.summary()
+        assert summary
+        assert 'Цикл выполняется' not in summary
+        if failed:
+            assert 'заблокированы' in summary
+    finally:
+        release.set()
+        await c.task
+
+
+def test_unreadable_report_has_explicit_safe_message(tmp_path, monkeypatch):
+    c = setup(tmp_path, None)
+    c.store.data['last'] = {'status': 'BLOCKED', 'cycle': 'cycle-001'}
+    def fail(*args): raise OSError('synthetic sensitive detail')
+    monkeypatch.setattr(bot, 'load_saved_cycle_report', fail)
+    text = c.summary()
+    assert 'недоступен' in text
+    assert 'synthetic' not in text
+
+
+def test_malformed_last_state_fails_closed_on_load(tmp_path):
+    c = setup(tmp_path, None)
+    c.store.data['last'] = ['malformed']
+    c.store.save()
+    with pytest.raises(RuntimeError):
+        setup(tmp_path, None)
