@@ -1247,6 +1247,17 @@ def _cycle_exception_reason(exc: BaseException) -> str:
     return sanitize_exception(exc)
 
 
+def _recovery_stop_reason(journal: DurableJournal) -> str | None:
+    """Preserve the terminal recovery refusal even when no order was sent."""
+    for event in reversed(journal.events):
+        if event.event in {
+            "FALLBACK_RECONCILIATION_UNKNOWN", "FALLBACK_STOPPED_STATE_CHANGED",
+            "FALLBACK_BLOCKED_IDENTITY_BARRIER",
+        }:
+            return event.payload.get("reason")
+    return None
+
+
 def _cycle_terminal_reason(
     opening: HandoffResult | None,
     closing: HandoffResult | None,
@@ -1256,6 +1267,7 @@ def _cycle_terminal_reason(
     remaining_source: Decimal | None = None,
     remaining_receiver: Decimal | None = None,
     boundary_books_available: bool | None = None,
+    recovery_reason: str | None = None,
 ) -> str | None:
     """Keep the opening cause and ordered recovery without stale residuals."""
 
@@ -1267,6 +1279,8 @@ def _cycle_terminal_reason(
         for phase in (opening, closing)
     )
     parts: list[str] = []
+    if recovery_reason:
+        parts.append(f"residual closure stopped: {recovery_reason}")
     if opening_reason:
         parts.append(opening_reason)
     if receiver_not_dispatched and not any("not dispatched" in part.lower() for part in parts):
@@ -2244,6 +2258,7 @@ class RandomCycleEngine:
                 ),
                 remaining_source=remaining_source,
                 remaining_receiver=remaining_receiver,
+                recovery_reason=_recovery_stop_reason(journal),
             )
             result = _with_cycle_classifications(RandomCycleResult(
                 outcome=outcome,
@@ -2254,8 +2269,8 @@ class RandomCycleEngine:
                 fallbacks=tuple(fallbacks),
                 remaining_source_position=remaining_source,
                 remaining_receiver_position=remaining_receiver,
-                remaining_source_position_observed_at=self._last_observed_at(config.source_account_index),
-                remaining_receiver_position_observed_at=self._last_observed_at(config.receiver_account_index),
+                remaining_source_position_observed_at=(None if remaining_source is None else self._last_observed_at(config.source_account_index)),
+                remaining_receiver_position_observed_at=(None if remaining_receiver is None else self._last_observed_at(config.receiver_account_index)),
                 opening_reason=_opening_reason(opening),
                 reason=reason,
                 journal_path=str(config.journal_path),
@@ -2347,6 +2362,7 @@ class RandomCycleEngine:
                     fallback_seed,
                     remaining_source=remaining_source,
                     remaining_receiver=remaining_receiver,
+                    recovery_reason=_recovery_stop_reason(journal),
                 )
                 or "cycle closure did not prove exact flat positions"
             )
@@ -2360,8 +2376,8 @@ class RandomCycleEngine:
             fallbacks=tuple(fallbacks),
             remaining_source_position=remaining_source,
             remaining_receiver_position=remaining_receiver,
-            remaining_source_position_observed_at=self._last_observed_at(config.source_account_index),
-            remaining_receiver_position_observed_at=self._last_observed_at(config.receiver_account_index),
+            remaining_source_position_observed_at=(None if remaining_source is None else self._last_observed_at(config.source_account_index)),
+            remaining_receiver_position_observed_at=(None if remaining_receiver is None else self._last_observed_at(config.receiver_account_index)),
             opening_reason=_opening_reason(opening),
             reason=reason,
             journal_path=str(config.journal_path),
@@ -2420,6 +2436,11 @@ class RandomCycleEngine:
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
             if not isinstance(exc, asyncio.CancelledError):
+                # A simultaneous transport error must not hide a conflicting
+                # account identity and turn it into retryable evidence.
+                for task in tasks:
+                    if not task.cancelled() and isinstance(task.exception(), _AccountIdentityFailure):
+                        raise task.exception()
                 for task in tasks:
                     if task.cancelled():
                         continue
@@ -2428,6 +2449,35 @@ class RandomCycleEngine:
                         raise task_error
             raise
         return source, receiver
+
+    async def _recovery_read(
+        self, config: RandomCycleConfig, read: Callable[[], Any],
+        label: str, journal: DurableJournal | None = None,
+    ) -> Any:
+        """Retry only read transport failures; never wrap a mutation here."""
+        deadline = _clock_monotonic(self.clock) + config.reconcile_timeout_seconds
+        for attempt in range(1, config.max_poll_count + 1):
+            remaining = deadline - _clock_monotonic(self.clock)
+            if remaining <= 0:
+                raise _RetryablePreparationFailure(f"{label} recovery read deadline exceeded")
+            try:
+                return await asyncio.wait_for(read(), timeout=remaining)
+            except (_RetryablePreparationFailure, TimeoutError, ConnectionError, OSError) as exc:
+                remaining = deadline - _clock_monotonic(self.clock)
+                retry = attempt < config.max_poll_count and remaining > 0
+                if journal is not None:
+                    journal.append("RECOVERY_READ_RETRY", {
+                        "operation": label, "attempt": attempt, "will_retry": retry,
+                        "reason": _cycle_exception_reason(exc),
+                    })
+                if not retry:
+                    raise
+                await self.clock.sleep(min(config.poll_interval_seconds, remaining))
+
+    async def _recovery_accounts(
+        self, config: RandomCycleConfig, journal: DurableJournal | None = None,
+    ) -> tuple[AccountSnapshot, AccountSnapshot]:
+        return await self._recovery_read(config, lambda: self._accounts(config), "recovery accounts", journal)
 
     async def _read_account(
         self,
@@ -2975,9 +3025,8 @@ class RandomCycleEngine:
         opening: HandoffResult,
         closing: HandoffResult | None,
     ) -> tuple[list[FallbackResult], Decimal | None, Decimal | None]:
-        now = self.clock.now()
         try:
-            source, receiver = await self._accounts(config, now)
+            source, receiver = await self._recovery_accounts(config, journal)
         except _AccountIdentityFailure:
             self._mark_identity_failure("fallback starting account identity/read validation failed")
             journal.append(
@@ -2988,7 +3037,7 @@ class RandomCycleEngine:
         except Exception as exc:
             journal.append(
                 "FALLBACK_RECONCILIATION_UNKNOWN",
-                {"reason": f"fallback starting account state is unknown: {sanitize_exception(exc)}"},
+                {"reason": f"fallback starting account state is unknown: {_cycle_exception_reason(exc)}"},
             )
             return [], None, None
         if self._identity_barrier is not None:
@@ -3098,7 +3147,7 @@ class RandomCycleEngine:
             """Read both accounts after an attempt before any next mutation."""
 
             try:
-                return await self._accounts(config, self.clock.now())
+                return await self._recovery_accounts(config, journal)
             except asyncio.CancelledError:
                 raise
             except _AccountIdentityFailure:
@@ -3111,7 +3160,7 @@ class RandomCycleEngine:
             except Exception as exc:
                 journal.append(
                     "FALLBACK_RECONCILIATION_UNKNOWN",
-                    {"reason": f"fallback account state is unknown: {sanitize_exception(exc)}"},
+                    {"reason": f"fallback account state is unknown: {_cycle_exception_reason(exc)}"},
                 )
                 return None
 
@@ -3279,7 +3328,7 @@ class RandomCycleEngine:
                 pending.append(account_index)
 
         try:
-            final_source, final_receiver = await self._accounts(config, self.clock.now())
+            final_source, final_receiver = await self._recovery_accounts(config, journal)
             final = {
                 config.source_account_index: final_source,
                 config.receiver_account_index: final_receiver,
@@ -3316,7 +3365,7 @@ class RandomCycleEngine:
         except Exception as exc:
             journal.append(
                 "FALLBACK_RECONCILIATION_UNKNOWN",
-                {"reason": f"fallback final account state is unknown: {sanitize_exception(exc)}"},
+                {"reason": f"fallback final account state is unknown: {_cycle_exception_reason(exc)}"},
             )
             return results, None, None
 
@@ -3630,10 +3679,9 @@ class RandomCycleEngine:
         # barrier and this mutation must stop this account's fallback rather
         # than turn a new/external position into cycle inventory.
         try:
-            current = await self._read_account(
-                config,
-                before.account_index,
-                "fallback account recheck",
+            current = await self._recovery_read(
+                config, lambda: self._read_account(config, before.account_index, "fallback account recheck"),
+                "fallback account recheck", journal,
             )
             label = "source" if before.account_index == config.source_account_index else "receiver"
             _validate_account_fresh(
@@ -3648,6 +3696,9 @@ class RandomCycleEngine:
                 raise PreflightBlocked("fallback account identity changed before mutation")
             before = current
             side = "SELL" if before.signed_position > 0 else "BUY"
+            _validate_market_book(config, metadata, book, self.clock.now())
+            if residual != abs(before.signed_position):
+                raise PreflightBlocked("fallback quantity differs from the exact confirmed residual")
         except asyncio.CancelledError:
             raise
         except _AccountIdentityFailure:
@@ -3691,10 +3742,21 @@ class RandomCycleEngine:
                 )
             )
         bound = book.asks[0].price if side == "BUY" else book.bids[0].price
-        if (
+        below_minimum = (
             residual < metadata.minimum_base_amount
             or residual * bound < metadata.minimum_quote_amount
-        ):
+        )
+        # HCR-39: actual Robinhood BTC full-residual MARKET/IOC reduce-only
+        # orders 844424841898572 (.00004) and 844424841891552 (.00007)
+        # filled below both catalog minima. This is observed venue behavior,
+        # not an opening exemption or authority for any other market.
+        residual_minimum_exception = (
+            config.api_base_url.rstrip("/") == OFFICIAL_ROBINHOOD_API_URL.rstrip("/")
+            and config.chain_id == OFFICIAL_ROBINHOOD_CHAIN_ID
+            and config.market_id == metadata.market_id == 1
+            and config.market_symbol == metadata.symbol == "BTC"
+        )
+        if below_minimum and not residual_minimum_exception:
             return finish(
                 FallbackResult(
                     before.account_index,
@@ -3702,10 +3764,21 @@ class RandomCycleEngine:
                     residual,
                     False,
                     Outcome.PARTIAL,
-                    reason="confirmed residual is below a documented venue minimum",
+                    reason=("confirmed residual is below a documented venue minimum: "
+                            f"quantity={residual}, minimum_base={metadata.minimum_base_amount}, "
+                            f"notional={residual * bound}, minimum_quote={metadata.minimum_quote_amount}"),
                     attempt=attempt_ordinal,
                 )
             )
+        if below_minimum:
+            journal.append("FALLBACK_REDUCE_ONLY_MINIMUM_EXCEPTION", {
+                "account_index": before.account_index, "market_id": metadata.market_id,
+                "quantity": str(residual), "notional": str(residual * bound),
+                "minimum_base_amount": str(metadata.minimum_base_amount),
+                "minimum_quote_amount": str(metadata.minimum_quote_amount),
+                "rule": "robinhood_btc_full_residual_reduce_only_market_ioc",
+                "attempt": attempt_ordinal,
+            })
         price_int = decimal_to_integer(bound, metadata.price_decimals, "fallback executable price")
         client_order_index = _client_order_index(
             journal.run_id,
@@ -3911,10 +3984,9 @@ class RandomCycleEngine:
             )
 
         try:
-            after = await self._read_account(
-                config,
-                before.account_index,
-                "fallback final account read",
+            after = await self._recovery_read(
+                config, lambda: self._read_account(config, before.account_index, "fallback final account read"),
+                "fallback final account read", journal,
             )
             _validate_account_fresh(
                 config,
@@ -3972,7 +4044,7 @@ class RandomCycleEngine:
                 reconciliation_event="FALLBACK_RECONCILIATION_UNKNOWN",
             )
         except Exception as exc:
-            reason = f"fallback final position is unknown: {sanitize_exception(exc)}"
+            reason = f"fallback final position is unknown: {_cycle_exception_reason(exc)}"
             return finish(
                 FallbackResult(
                     before.account_index,

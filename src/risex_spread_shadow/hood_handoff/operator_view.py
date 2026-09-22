@@ -284,6 +284,25 @@ def read_execution_notices(path):
     return sorted(notices, key=order)
 
 
+def recovery_reason_text(reason):
+    reason = clean(reason or 'нужна свежая проверка', 260)
+    if 'dispatch outcome unknown' in reason:
+        return 'Неизвестно, дошёл ли закрывающий ордер до биржи. Повторная отправка остановлена до сверки ордера.'
+    if 'transiently unavailable' in reason or 'recovery read deadline exceeded' in reason:
+        return 'Не удалось получить свежие данные счёта за время проверки. Новая команда /close повторит проверку.'
+    if 'active cycle-market' in reason:
+        return 'На счёте есть активные ордера по этому рынку; сначала нужно подтвердить их завершение.'
+    if 'below a documented venue minimum' in reason:
+        return 'Остаток меньше минимального ордера для этого рынка; исключение для закрытия не подтверждено. ' + reason.split(':', 1)[-1].strip()
+    if 'grid' in reason or 'exact integer' in reason:
+        return 'Остаток не укладывается в точный шаг объёма биржи; увеличивать его нельзя.'
+    if 'identity' in reason:
+        return 'Не подтверждена неизменность счёта или ордера; требуется новая сверка.'
+    if 'contract_error' in reason:
+        return 'Проверка данных остановила закрытие. В этом старом журнале точная причина не сохранена.'
+    return reason
+
+
 def close_result_lines(result):
     result = mapping(result)
     label = {'CONFIRMED_FLAT': '✅ Позиции закрыты', 'PARTIAL': '⚠️ Остался незакрытый объём'}.get(result.get('status'), '❔ Закрытие не подтверждено')
@@ -297,7 +316,7 @@ def close_result_lines(result):
     lines.append('Комиссии закрытия: ' + (amount(sum(fees, Decimal(0))) if attempts and all(f is not None for f in fees) else '0' if result.get('status') == 'CONFIRMED_FLAT' and not attempts else 'неизвестны') + '.')
     lines.append('PnL отдельно закрытых позиций неизвестен: история входа не привязана к этой команде.')
     if result.get('status') != 'CONFIRMED_FLAT':
-        lines.append('Причина: ' + clean(result.get('reason') or 'нужна свежая проверка', 200))
+        lines.append('Причина: ' + recovery_reason_text(result.get('reason')))
     lines.append('Новая команда снова проверит текущие счета; старый исход не запрещает её навсегда.')
     return lines
 
@@ -353,6 +372,9 @@ def result_lines(report, *, detailed=False):
     lines.append('PnL сделок до комиссий: ' + amount(pnl.get('gross')) + '; после комиссий: ' + amount(pnl.get('net')) + '.')
     lines.append('PnL указан в валюте котировки, без фандинга. Итог с фандингом неизвестен.')
     if detailed or inventory.get('status') != 'CONFIRMED_FLAT':
+        recovery_reason = mapping(report.get('cycle')).get('recovery_stop_reason')
+        if recovery_reason and inventory.get('status') != 'CONFIRMED_FLAT':
+            lines.append('Закрытие остатка остановлено: ' + recovery_reason_text(recovery_reason))
         lines.append('Последние сохранённые позиции:')
         times = mapping(inventory.get('observed_at'))
         for role in ('source', 'receiver'):

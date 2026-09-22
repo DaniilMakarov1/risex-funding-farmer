@@ -1474,7 +1474,9 @@ class HandoffEngine:
                 try:
                     source_order = await self._lookup_order(
                         plan.source,
-                        source_receipt.order_id if source_receipt is not None else None,
+                        source_order_id if source_order_id is not None else (
+                            source_receipt.order_id if source_receipt is not None else None
+                        ),
                         client_order_index=plan.source.client_order_index,
                     )
                 except Exception as exc:
@@ -1498,7 +1500,9 @@ class HandoffEngine:
                 plan,
                 source,
                 receiver,
-                source_order_id=source_order.order_id if source_order else (source_receipt.order_id if source_receipt else None),
+                source_order_id=source_order_id if source_order_id is not None else (
+                    source_order.order_id if source_order else (source_receipt.order_id if source_receipt else None)
+                ),
                 receiver_order_id=None,
                 source_dispatched=source_dispatch_attempted,
                 receiver_dispatched=receiver_dispatch_attempted,
@@ -1656,7 +1660,9 @@ class HandoffEngine:
             plan,
             source,
             receiver,
-            source_order_id=source_order.order_id if source_order else (source_receipt.order_id if source_receipt else None),
+            source_order_id=source_order_id if source_order_id is not None else (
+                source_order.order_id if source_order else (source_receipt.order_id if source_receipt else None)
+            ),
             receiver_order_id=receiver_order.order_id if receiver_order else (receiver_receipt.order_id if receiver_receipt else None),
             source_dispatched=source_dispatch_attempted,
             receiver_dispatched=receiver_dispatch_attempted,

@@ -1157,7 +1157,11 @@ async def test_paired_guard_rejects_conflicting_exact_lookup_identity_without_ca
     result = await run_handoff(config(path), client, clock=Clock())
 
     assert result.outcome is Outcome.UNKNOWN
-    assert client.source_lookup_calls == 2
+    # Reconciliation retains the original ID and reads it once more, while
+    # the prior conflicting exact lookup still blocks every dependent write.
+    assert client.source_lookup_calls == 3
+    assert result.source.order_id == "source-0"
+    assert not result.retryable_pair
     assert client.cancellations == []
     assert [item.account_index for item in client.submissions] == [11]
     assert not [item for item in client.submissions if item.account_index == client.receiver_account_index]

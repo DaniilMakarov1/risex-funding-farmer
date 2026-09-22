@@ -47,6 +47,8 @@ In Telegram send `/close`. In the terminal:
 
 Enter confirms this one real recovery operation. It checks both configured BTC accounts and prior intents, records the current baseline, and closes only actual positions using the existing reduce-only MARKET/IOC residual logic. It shares the normal operator lock with `./start`; wait for an active operation to finish. Active or unresolved old orders must be reconciled first; this command does not cancel unrelated orders. Known partial/zero fills are reconciled before another attempt; ambiguous execution stops further writes. The result is saved separately in `close-NNN/close.jsonl`. It reports residuals and closure fees when proved; PnL for a manually opened/adopted position remains unknown without entry history. No command starts another cycle automatically.
 
+BTC market 1 recovery also submits exact on-grid residuals below the ordinary opening minimum using reduce-only MARKET/IOC. This narrow rule follows observed filled closure orders of 0.00004 and 0.00007 BTC; it does not increase the residual or guarantee venue acceptance. Other markets and opening orders keep normal minimum checks. Temporary recovery-account read failures are retried within existing bounds; ambiguous sends, conflicting identities and unresolved histories are never replayed. A delayed account read cannot authorize an order against an expired quote.
+
 ## Read the messages
 
 Terminal and Telegram progress shows the two confirmed opening positions, hold duration/start, and **planned closing start in Moscow time**. That time is not a guarantee that all orders and reconciliation finish then. Closing/recovery messages mark opening positions as historical.
@@ -64,6 +66,8 @@ The final result keeps these facts separate:
 | Funding | Excluded from execution PnL; the funding-inclusive total remains unknown without its own evidence. |
 
 The final message states who filled each LIMIT and whether our MARKET filled our LIMIT, external orders, nothing, or was never sent. Proven external fills include account IDs even when the opposite order filled zero. A phase that never ran is marked explicitly. Overall strategy failure, successful residual closure and unknown fees can all be true in the same cycle.
+
+If residual closure stops, the final view also shows its saved reason, including a failure before any closing order was sent. Old generic `contract_error` records are explicitly described as lacking a precise cause; the report does not invent one. A source order ID remains bound to reconciliation even if a later lookup temporarily omits the order.
 
 The SDK now preserves the account's maker/taker venue and integrator fee fields. Both explicitly zero components prove zero. Nonzero integer units are not yet verified for this venue and are retained as raw evidence, not guessed amounts. Old journals missing these fields remain unchanged. Small PnL values are not rounded to cents.
 

@@ -2366,6 +2366,11 @@ def load_saved_cycle_report(path: str | Path) -> dict[str, Any]:
             "outcome": outcome,
             "outcome_source": outcome_source,
             "child_outcomes": child_outcomes,
+            "recovery_stop_reason": next((
+                record.payload.get("reason") for record in reversed(cycle.records if cycle else ())
+                if record.event in {"FALLBACK_RECONCILIATION_UNKNOWN", "FALLBACK_STOPPED_STATE_CHANGED",
+                                    "FALLBACK_BLOCKED_IDENTITY_BARRIER"}
+            ), None),
             "reason": None if not reasons else reasons[0],
             "process_exit_ignored": True,
         },

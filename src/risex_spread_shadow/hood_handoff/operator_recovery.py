@@ -15,7 +15,7 @@ from .journal import DurableJournal, sanitize_exception
 from .keychain import KeychainSecretProvider
 from .operator_control import exclusive_lock
 from .provenance import capture_provenance
-from .random_cycle import RandomCycleEngine, _account_payload, _fallback_order_mismatch_map
+from .random_cycle import RandomCycleEngine, _account_payload, _fallback_order_mismatch_map, _recovery_stop_reason
 from .readiness import ReadOnlyLighterSdkClient
 from .sdk import PlainAioHttp, _order_snapshot_mapping, _require_success_code
 from .telegram_accounts import missing_key
@@ -217,11 +217,11 @@ async def resolve_prior(config, client, operator, *, clock=None):
     return {'previous_intents': len(intents), 'resolved_now': checked, 'inputs': files}
 
 
-async def inspect_current(config, client, operator, *, require_flat, clock=None):
+async def inspect_current(config, client, operator, *, require_flat, clock=None, journal=None):
     """Called under the operator lock; read only, with causal accounts last."""
     engine = RandomCycleEngine(client, clock=clock)
     prior = await resolve_prior(config, client, operator, clock=engine.clock)
-    source, receiver = await engine._accounts(config)
+    source, receiver = await engine._recovery_accounts(config, journal)
     if require_flat and (source.signed_position != 0 or receiver.signed_position != 0):
         raise PreflightBlocked('positions remain; use /close before /run')
     proof = {'status': 'READY' if require_flat else 'CLOSE_READY', 'at': engine.clock.now(),
@@ -281,7 +281,7 @@ async def close_positions(config, client, operator, slot, *, clock=None):
             raise PreflightBlocked('close slot cannot be replayed')
         journal.append('CLOSE_STARTED', {'binding': config.binding(), 'runtime_provenance': capture_provenance(config.binding())})
         try:
-            source, receiver, proof = await inspect_current(config, client, operator, require_flat=False, clock=engine.clock)
+            source, receiver, proof = await inspect_current(config, client, operator, require_flat=False, clock=engine.clock, journal=journal)
             journal.append('CLOSE_BASELINE', proof)
             results, source_after, receiver_after = await engine.close_reconciled_positions(config, journal, source, receiver)
             resolved = source_after is not None and receiver_after is not None and all(
@@ -292,7 +292,8 @@ async def close_positions(config, client, operator, slot, *, clock=None):
                       'positions': [{'account_index': index, 'position': None if pos is None else str(pos)}
                                     for index, pos in ((config.source_account_index, source_after), (config.receiver_account_index, receiver_after))],
                       'attempts': [r.as_dict() for r in results],
-                      'reason': next((r.reason for r in results if r.reason), None)}
+                      'reason': None if flat else (_recovery_stop_reason(journal) or next(
+                          (r.reason for r in reversed(results) if r.reason), None))}
         except Exception as exc:
             result = {'status': 'UNKNOWN', 'at': engine.clock.now(), 'symbol': config.market_symbol,
                       'reason': str(exc) if isinstance(exc, PreflightBlocked) else sanitize_exception(exc)}

@@ -1,9 +1,9 @@
 # Current system specification
 
-SYSTEM_SPEC_VERSION = 5.2
+SYSTEM_SPEC_VERSION = 5.3
 SPEC_STATUS = OPERATOR_ROBINHOOD_CYCLE
 
-This file is the single current behavior contract. It consolidates HCR-1 through HCR-38; newer statements are not layered over contradictory historical amendments. Acceptance/deployment is in STATUS, finite authority in NEXT_TASK, operation in README. Development correctness does not establish live strategy success.
+This file is the single current behavior contract. It consolidates HCR-1 through HCR-39; newer statements are not layered over contradictory historical amendments. Acceptance/deployment is in STATUS, finite authority in NEXT_TASK, operation in README. Development correctness does not establish live strategy success.
 
 ## Product and boundaries
 
@@ -41,7 +41,13 @@ Persist and fully synchronize mutation intent before a single send without redir
 
 Only cancel the exact positively identified own source. Count cancellation-race fills. Require bounded complete order/trade/account history, exact deduplication, terminal order and causal position agreement. Temporarily propagating observations may be reread within existing limits; identity/contract failures remain barriers. An absent source or a source filled during cancellation after a failed public-book guard can become known source-only PARTIAL only after full terminal order/trade/position reconciliation and an unchanged undispatched receiver. Preserve the admission reason, but do not classify proved execution as UNKNOWN merely because that reason contains UNKNOWN. Unrelated identity, history, cancellation or transport uncertainty still blocks dependent writes.
 
-After complete reconciliation, close freshly proved residuals with reduce-only bounded MARKET/IOC, fresh executable-side prices and unique IDs. Cancel/reconcile a remaining own limit first. Reconcile each attempt before sizing the next actual residual; never overlap unresolved orders. Pace terminal zero-fill attempts by the existing poll interval and serve both accounts fairly. Fully reconciled partial fills have no fixed total attempt cap. Exchange rejection, below-minimum residual, invalid/stale/ambiguous state, failed request or interruption stops dependent writes and preserves PARTIAL/UNKNOWN. No widening, size increase/reversal or invented minimum exemption.
+Retain a positively observed source order ID when a later exact lookup temporarily returns no order, including when the accepted response has no order ID. Reconcile history against that retained ID; a conflicting later ID remains a barrier. Missing visibility never permits receiver dispatch or proves cancellation.
+
+After complete reconciliation, close freshly proved residuals with reduce-only bounded MARKET/IOC, fresh executable-side prices and unique IDs. Cancel/reconcile a remaining own limit first. Reconcile each attempt before sizing the next actual residual; never overlap unresolved orders. Pace terminal zero-fill attempts by the existing poll interval and serve both accounts fairly. Fully reconciled partial fills have no fixed total attempt cap. Exchange rejection, ineligible below-minimum residual, invalid/stale/ambiguous state, failed request or interruption stops dependent writes and preserves PARTIAL/UNKNOWN. No widening or size increase/reversal.
+
+For Robinhood BTC market 1 only, exact full-residual reduce-only MARKET/IOC closure may submit an on-grid quantity below catalog base/notional minimums. Actual venue history confirmed filled initial quantities 0.00004 and 0.00007 BTC below catalog 0.00020 BTC / 10 quote; this is observed behavior, not a general documented exemption or guaranteed acceptance. Journal the exception, quantity and current minimums. All opening/paired checks and other markets retain their minimum gates. Never round a residual up; rejection/unknown execution still stops that operation normally.
+
+Recovery account reads may repeat only classified transport/time-out failures within the existing reconciliation timeout, poll interval and maximum poll count. Drain parallel reads, retain identity failures even alongside transport errors, and never repeat a mutation. Revalidate quote freshness after a delayed pre-send account read. Preserve the specific local refusal in terminal evidence, including failures before the first closing intent.
 
 ## Result and accounting contract
 
