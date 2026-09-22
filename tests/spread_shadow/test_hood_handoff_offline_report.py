@@ -795,3 +795,30 @@ def test_report_preserves_sdk_timing_numbers_but_never_invents_percentages(compl
     assert metrics["source_transport_roundtrip_seconds"] == 0.07
     assert metrics["attribution"]["network_only"]["fraction"] is None
     assert metrics["attribution"]["exchange_processing_only"]["fraction"] is None
+
+
+def test_projection_preserves_nested_secret_redaction_and_safe_ids():
+    from risex_spread_shadow.hood_handoff.offline_report import _bounded_json
+
+    value = {'plan': {'api_key_index': 4, 'reason': 'Bearer synthetic-canary',
+                      'private_key': 'synthetic-secret',
+                      'trades': [{'reason': 'private_key=synthetic-canary', 'quantity': '0.20'}]}}
+    projected = _bounded_json(value)
+    assert projected == {'plan': {'api_key_index': 4, 'reason': '[REDACTED]',
+                                 'trades': [{'reason': '[REDACTED]', 'quantity': '0.20'}]}}
+    assert 'synthetic' not in json.dumps(projected)
+
+
+def test_projection_bounds_traversal_before_visiting_omitted_subtrees():
+    from risex_spread_shadow.hood_handoff.offline_report import _bounded_json
+
+    nested = {'reason': 'deep synthetic sentinel'}
+    for _ in range(1500):
+        nested = {'plan': nested}
+    omitted = _bounded_json({'plan': {'unrelated_field': nested}})
+    assert omitted == {'plan': {}}
+    truncated = []
+    projected = _bounded_json(nested, truncated=truncated)
+    assert truncated
+    assert '[DETAIL_TRUNCATED]' in json.dumps(projected)
+    assert 'sentinel' not in json.dumps(projected)
