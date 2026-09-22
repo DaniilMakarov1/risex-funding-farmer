@@ -1,8 +1,12 @@
 # HCR-27 — offline diagnostics, incident regressions and current operator documentation
 
-## Completion
+## Current follow-up — HCR-27 completeness audit
 
-COMPLETED_OFFLINE on 2026-09-22. Final source candidate `ac1c4f20dea79f5dea256b10cd0272ae85a1be42`; clean isolated Python 3.11.5 full suite: 4739 passed, 3 skipped, exit 0. All five requested outcomes are implemented and verified. Preserved all 42 historical hashes and cycle slots 001–007. Evidence: `spread-shadow-runs/hood-diagnostics-20260922/chief-v1/final-suite-v2-identity.json`, `final-reports-v2/verification.json`, and `chief-review-packet.json`. Chief performed final implementation and self-review under the explicit owner override below; no independent review of self-authored corrections is claimed. No live validation, account read, credential access or new execution occurred. No further work or campaign is implicitly authorized by this completed contract.
+ACTIVE on 2026-09-22 at the owner's explicit request to check all five improvements and finish gaps without Builders. Accepted base: 46ed54ee0d2d2e8762f8449374ca02e1f10d76e0. Chief alone owns source, tests, governing documents and integration; self-review is explicit. Routine authorized work is pre-approved. Preserve prior candidates, evidence and all 42 historical hashes.
+
+Concrete remaining scope: expose successful SDK preparation lock/nonce/signing-call durations and transport roundtrip as numeric-only diagnostics without altering dispatch/nonce/deadline behavior; distinguish private order lookup from public-book proof and mark network-only/venue-processing attribution unavailable; expose latest observed orders and unresolved mutation intents in the offline report; add sanitized hash-bound saved incident fixtures and run existing adverse action-sequence regressions without duplicating them. Verify prior crash boundaries and documentation remain satisfied. No new runtime policy, trading authority, collection, credentials or live requests. Final acceptance requires affected tests, exact historical preservation and a clean isolated Python 3.11 full suite; summarize each original improvement honestly, including unavailable historical attribution.
+
+Previous HCR-27 candidate ac1c4f20dea79f5dea256b10cd0272ae85a1be42 passed 4739 tests with 3 skips and remains preserved. The prior statement that all five outcomes were fully complete was too broad: attribution, explicit unresolved-order presentation and portable incident provenance needed the bounded follow-up above.
 
 ## Owner objective and authority
 
