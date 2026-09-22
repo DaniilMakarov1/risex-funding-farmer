@@ -1,4 +1,12 @@
-# HCR-25 — COMPLETE; cycle006 post-only cancellation and quote age
+# HCR-25 — live launch validation completed; STOP
+
+## Terminal result
+
+The one confirmed launch consumed cycle007 on implementation571fcaa. Process exited0; overall PARTIAL, paired_executionFAILED, inventoryCONFIRMED_FLAT, economicsKNOWN. SelectedBTC.00020/hold156s; three source orders were placed then canceled with proven0fills, no receiver sent, no hold/closing/fallback. Attempt1 public exact source level absent (UNKNOWN); attempts2/3 exact owner-bound source levels present but external asks better (LOST). Final observed positions0/0 at1790066281.288543/1790066281.293617. No new cycle may start under this consumed authorization. Current accounts after these observations are not independently re-read. Evidence and immutable slot hashes: hood-live-validation-20260922/chief-v1/result.json. Next work requires a new owner instruction; execution is stopped and no process remains.
+
+## Consumed owner authorization 2026-09-22
+
+Owner explicitly confirmed Chief's proposal to execute ONE real BTC LONG random cycle through installed ./start, using saved Keychain and existing random-cycle.json: Robinhood Chain Mainnet466324, market1, source27331/receiver27337, APIkey4, published implementation571fcaa6a563bd4ec52ab630017eb1d32bd0f60b. Chief /root task01a0aafe-23fa-7c90-87a6-e807b3f6450a is the sole named execution agent. This authorizes required market/account reads, protected credential access, signing, one launch, its configured opening/hold/closing and necessary existing reconciliation/cancellation/residual handling. Use next unique slot, never replay consumed slots. No second cycle, new strategy/policy, transfers/withdrawals or global settings changes. No Builder live access. Retain sanitized journal/output, never expose credentials. After terminal completion/blocked state, inspect evidence, report actual positions and stop; further new writes require a new concrete owner decision. Earlier offline-only boundary below is superseded solely for this one operation.
 
 ## Completion and next boundary
 

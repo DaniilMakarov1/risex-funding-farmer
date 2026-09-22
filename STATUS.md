@@ -1,5 +1,11 @@
 # Current status
 
+## HCR-25 live validation — cycle007 completed without opening
+
+Owner explicitly confirmed one real ./start BTC LONG cycle, executed solely by Chief on published571fcaa using protected Keychain. Selected.00020BTC/156s; engine used all3attempts then stopped. Three identified source LIMITs ended canceled with0fills, receiver never dispatched, no hold/close/fallback. Attempt1 guard UNKNOWN because exact public source level absent; attempt2 ownSELL85814.8 vs externalask85808.2 and attempt3 ownSELL85801.6 vs externalask85796.6 gaveLOST. Exact public owner/order source evidence exists in attempts2/3, but matching remains unproved because receiver was blocked. Final observed positions0/0 at1790066281.288543/1790066281.293617; terminal PARTIAL/pairedFAILED/inventoryCONFIRMED_FLAT/economicsKNOWN, process exit0. This is a failed paired opening with confirmed no executions, not a successful trading cycle.
+
+Measured quote-to-source intent ages1.684/1.157/2.432s; preparations.420/.298/.433s; coalesced source/read windows.715/.603/.721s. No claim of improvement from a controlled live comparison. Original slot007 journals/hashes and sanitized summary are in hood-live-validation-20260922/chief-v1/result.json. Authorization consumed; no repeated launch, no code fix in this operation, no process remains. Full closed-cycle execution is still unvalidated. Further action requires a new concrete owner instruction.
+
 ## HCR-25 — COMPLETE; accepted offline and installed
 
 Accepted corrected candidated61e884219c4faaf91794a041e864e17743fcd8f, integrated as0b5dfe8ac73c2158f575520ae31d8076a6f60b20. Exact reconciled zero-fill canceled-post-only now permits a fresh paired attempt for opening/closing within existing3budget and unique identities. Early-terminal book/account observations survive without claiming priority proof. No-execution fees are explicitly proved; missing actual-trade fees remain UNKNOWN. Terminal opening/closing explanations are phase-specific. SDK preparation overlaps distinct account/key domains while nonce ownership and same-domain mutation serialization remain strict. Original quote time binds freshness/deadline and is measured through source dispatch.
