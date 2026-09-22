@@ -1,6 +1,6 @@
 # RISEx Spread Shadow
 
-This standalone project contains the operator-run Robinhood Chain BTC cycle utility and frozen public/paper research tools. HCR-27 offline diagnostics and verification are complete; the clean Python 3.11 suite passed 4739 tests with 3 existing skips. Live validation was not part of that assignment. `NEXT_TASK.md` defines the finite authority and acceptance criteria, `STATUS.md` records accepted state, `SYSTEM_SPEC.md` defines behavior, and `AGENTS.md` defines process and safety. Historical experiments and incident narratives are retained in Git and immutable owner-only evidence, not operational permissions.
+This standalone project contains the operator-run Robinhood Chain BTC cycle utility and frozen public/paper research tools. HCR-27 offline diagnostics and its completeness audit are implemented; STATUS.md records the exact accepted candidate and verification. Live validation was not part of that assignment. `NEXT_TASK.md` defines the finite authority and acceptance criteria, `STATUS.md` records accepted state, `SYSTEM_SPEC.md` defines behavior, and `AGENTS.md` defines process and safety. Historical experiments and incident narratives are retained in Git and immutable owner-only evidence, not operational permissions.
 
 ## Runtime and setup
 
@@ -71,6 +71,10 @@ The report reads a saved cycle directory or its `cycle.jsonl`; it makes no reque
 ```
 
 Use `--format both` for human and JSON output; repeat `--path` to report separate cycles without adding their results. `paired_execution.direct_counterparty_match` reports optional exact mutual matching separately from completed exposure. The reader hashes and counts every input record while retaining bounded details; if required detail is omitted, the report is INCOMPLETE and aggregate execution/inventory/fee proofs remain UNKNOWN. Read the report's completeness and issues as well as its individual execution, inventory and fee conclusions. Process exit alone is not trading success. Saved observation times are historical. Latency stages can overlap; unavailable values and uncertain transport are explicit. Do not sum overlapping windows or infer network/exchange/signing time from an uninstrumented interval.
+
+New journals measure quote-request elapsed time and per-order preparation lock wait, nonce acquisition, SDK signing-call elapsed time and transport roundtrip. Private source lookup and owner-bound public-book observation are separate: the first saved qualifying public snapshot gives an observation bound, not the exact exchange appearance time. Quote age is split at the plan and dispatch-intent boundaries when timestamps exist. Old journals cannot supply new measurements retroactively. Pure CPU, network-only and exchange-processing fractions remain UNKNOWN; signing-call elapsed time is not CPU time.
+
+`order_state` lists latest saved order observations with their times, unresolved observed orders and unresolved mutation intents. These are historical facts; an empty list does not establish current flatness. Sanitized cycle-003/004/007 fixtures under `tests/fixtures/hood_handoff/` retain source and projection hashes. The report coverage map points to the corresponding incident/action-barrier and crash-boundary regressions.
 
 ## Credentials and account diagnostics
 
