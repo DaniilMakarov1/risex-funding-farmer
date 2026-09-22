@@ -2037,6 +2037,7 @@ class RandomCycleEngine:
                 "OPENING_PLAN_READY",
                 {
                     "config": opening_config_binding(opening_config),
+                    "latency": dict(getattr(self, "_last_quote_read", {})),
                     "selection": selection.as_dict(),
                     "attempt": attempt_index,
                     "lineage": {"used": pair_budget.used, "limit": pair_budget.limit},
@@ -2776,6 +2777,7 @@ class RandomCycleEngine:
                     "CLOSING_PLAN_READY",
                     {
                         "config": opening_config_binding(close_config),
+                        "latency": dict(getattr(self, "_last_quote_read", {})),
                         "paired_quantity": format(paired_quantity, "f"),
                         "attempt": attempt_index,
                         "lineage": {"used": budget.used, "limit": budget.limit},
@@ -3928,7 +3930,15 @@ class RandomCycleEngine:
             method = getattr(self.client, "public_order_book", None)
         if not callable(method):
             raise ContractError("cycle client does not expose an order-book reader")
-        return await method(market_id)
+        started_at = self.clock.now()
+        started = time.perf_counter()
+        result = await method(market_id)
+        self._last_quote_read = {
+            "quote_read_seconds": time.perf_counter() - started,
+            "quote_read_started_at": started_at,
+            "quote_read_finished_at": self.clock.now(),
+        }
+        return result
 
     async def _bounded(self, awaitable: Any, config: RandomCycleConfig, label: str) -> Any:
         try:

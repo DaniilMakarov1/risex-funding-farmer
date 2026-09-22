@@ -322,6 +322,19 @@ def _coerce_public_book(value: Any, config: HandoffConfig, now: float) -> dict[s
     return payload
 
 
+def _prepared_timing_values(prepared: Any, leg: str) -> dict[str, float]:
+    """Export only finite numeric diagnostics, never the prepared token itself."""
+    values = getattr(prepared, "diagnostic_timings", None)
+    if not isinstance(values, dict):
+        return {}
+    return {
+        f"{leg}_{name}": float(value)
+        for name in ("preparation_lock_wait_seconds", "nonce_acquisition_seconds", "signing_call_seconds", "transport_roundtrip_seconds")
+        if isinstance((value := values.get(name)), (int, float))
+        and not isinstance(value, bool) and math.isfinite(value) and value >= 0
+    }
+
+
 class HandoffEngine:
     """Execute or reconcile exactly one close/reopen attempt."""
 
@@ -889,6 +902,8 @@ class HandoffEngine:
                     0.0,
                     time.perf_counter() - preparation_started,
                 )
+        latency.update(_prepared_timing_values(prepared_source, "source"))
+        latency.update(_prepared_timing_values(prepared_receiver, "receiver"))
         try:
             if not unknown_reasons:
                 source_dispatch_attempted = True
@@ -949,6 +964,7 @@ class HandoffEngine:
             )
             await self._invalidate_prepared(prepared_receiver)
 
+        latency.update(_prepared_timing_values(prepared_source, "source"))
         if source_receipt is not None:
             if not source_receipt.accepted:
                 unknown_reasons.append("source dispatch was rejected")
@@ -1537,6 +1553,7 @@ class HandoffEngine:
                 run_id=run_id,
             )
 
+        latency.update(_prepared_timing_values(prepared_receiver, "receiver"))
         if receiver_receipt is not None:
             receiver_visibility_started = time.perf_counter()
             receiver_order = await self._poll_order(
@@ -1961,6 +1978,7 @@ class HandoffEngine:
                         "status": order.status,
                         "filled_quantity": str(order.filled_quantity),
                         "remaining_quantity": str(order.remaining_quantity),
+                        "observed_at": order.observed_at,
                         "poll": poll,
                     },
                     run_id=run_id,

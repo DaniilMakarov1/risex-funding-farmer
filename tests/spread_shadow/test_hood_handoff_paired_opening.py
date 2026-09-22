@@ -1469,3 +1469,28 @@ async def test_paired_series_binds_expected_cumulative_positions(tmp_path):
     assert [item.reduce_only for item in client.submissions] == [False, False, False, False]
     text = (tmp_path / "series.jsonl").read_text()
     assert text.count("PAIRED_OPENING") >= 4
+
+
+@pytest.mark.asyncio
+async def test_engine_persists_only_allowlisted_numeric_preparation_timings(tmp_path):
+    class Token(dict):
+        pass
+    class TimedClient(PreparedPairedClient):
+        async def prepare_order(self, plan):
+            token = Token(await super().prepare_order(plan))
+            token.diagnostic_timings = {"nonce_acquisition_seconds": 0.2, "signing_call_seconds": 0.3,
+                "preparation_lock_wait_seconds": float("nan"), "tx_info": "SYNTHETIC_SIGNED_CANARY"}
+            return token
+        async def submit_prepared_order(self, plan, prepared, *, deadline=None):
+            result = await super().submit_prepared_order(plan, prepared, deadline=deadline)
+            prepared.diagnostic_timings["transport_roundtrip_seconds"] = 0.5
+            return result
+    path = tmp_path / "timings.jsonl"
+    result = await run_handoff(config(path), TimedClient(), clock=Clock())
+    assert result.outcome is Outcome.SUCCESS
+    for leg in ("source", "receiver"):
+        assert result.latency[f"{leg}_nonce_acquisition_seconds"] == 0.2
+        assert result.latency[f"{leg}_signing_call_seconds"] == 0.3
+        assert result.latency[f"{leg}_transport_roundtrip_seconds"] == 0.5
+        assert f"{leg}_preparation_lock_wait_seconds" not in result.latency
+    assert "SYNTHETIC_SIGNED_CANARY" not in path.read_text()

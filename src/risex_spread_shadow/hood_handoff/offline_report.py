@@ -170,6 +170,14 @@ _PROJECTED_KEYS = frozenset(
     }
 )
 
+_PROJECTED_KEYS = _PROJECTED_KEYS | frozenset({
+    "quote_read_seconds", "quote_read_started_at", "quote_read_finished_at",
+    "source_quote_observed_at", "freshness_seconds",
+    *(f"{leg}_{stage}" for leg in ("source", "receiver") for stage in (
+        "preparation_lock_wait_seconds", "nonce_acquisition_seconds", "signing_call_seconds", "transport_roundtrip_seconds",
+    )),
+})
+
 _OMIT_BULKY_KEYS = frozenset(
     {
         "dispatch_evidence",
@@ -1114,6 +1122,50 @@ def _terminal_order_records(files: Sequence[_FileData]) -> list[dict[str, Any]]:
     return values
 
 
+def _order_state_summary(files: Sequence[_FileData], terminal: Sequence[Mapping[str, Any]],
+                         executions: Sequence[Mapping[str, Any]], actions: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Retain last observations and unresolved intent; absence is not flat proof."""
+    latest: dict[tuple[str, str, str], dict[str, Any]] = {}
+    def observe(order: Mapping[str, Any], path: str, at: Any, event: str) -> None:
+        if not order.get("order_id"):
+            return
+        key = (str(order.get("account_index")), str(order.get("market_id")), str(order["order_id"]))
+        observed_at = _finite_number(order.get("observed_at"))
+        row = {"order": dict(order), "observed_at": observed_at, "journal_at": at,
+               "source_file": path, "source_event": event, "historical_only": True}
+        previous = latest.get(key)
+        if previous is None or (_finite_number(at) or 0) >= (_finite_number(previous["journal_at"]) or 0):
+            latest[key] = row
+    for data in files:
+        for record in data.records:
+            if record.event in {"ORDER_OBSERVED", "LEG_RECONCILED", "FALLBACK_ORDER_OBSERVATION"}:
+                order = record.payload.get("order", record.payload)
+                if isinstance(order, Mapping):
+                    observe(order, str(data.path), record["at"], record.event)
+    for row in terminal:
+        order = row.get("order")
+        if isinstance(order, Mapping):
+            # Terminal journal boundaries are authoritative only when the execution resolved.
+            execution = next((e for e in executions if e["source_file"] == row["source_file"] and e["leg"] == row["leg"]
+                              and isinstance(e.get("order"), Mapping) and e["order"].get("order_id") == order.get("order_id")), None)
+            observe(order, row["source_file"], execution["observed_at"] if execution else row.get("observed_at"), row["source_event"])
+    for row in latest.values():
+        order = row["order"]
+        proof = next((e for e in executions if e.get("resolved") and isinstance(e.get("order"), Mapping)
+                      and str(e["order"].get("order_id")) == str(order["order_id"])
+                      and str(e.get("account_index")) == str(order.get("account_index"))
+                      and e["observed_at"] >= (_finite_number(row["journal_at"]) or 0)), None)
+        row["resolution"] = "TERMINAL_PROVEN" if proof else "UNRESOLVED"
+    unresolved_intents = [dict(a) for a in actions if not any(e.get("resolved") and e["source_file"] == a["source_file"]
+        and e["leg"] == ("source" if a["leg"] == "cancel" else a["leg"])
+        and (a.get("attempt") is None or e.get("attempt") == a["attempt"])
+        and e["observed_at"] >= a["intent_at"] for e in executions)]
+    return {"latest_observations": list(latest.values()), "unresolved_intents": unresolved_intents,
+            "unresolved_observed_orders": [r for r in latest.values() if r["resolution"] == "UNRESOLVED"],
+            "completeness": "UNKNOWN" if any(f.issues or f.detail_truncated for f in files) else "RECORDED_EVIDENCE_ONLY",
+            "note": "No current account read; an empty list is not proof that no live order exists."}
+
+
 def _semantic_issues(files: Sequence[_FileData]) -> list[dict[str, Any]]:
     """Detect contradictory identity evidence without judging normal status transitions."""
 
@@ -1300,6 +1352,34 @@ def _latency_reports(
             None,
         )
         values: dict[str, dict[str, Any]] = {}
+        parent = next((f for f in files if f.kind == "cycle"), None)
+        parent_plan = next((r for r in (parent.records if parent else [])
+                            if r.event == f"{data.kind.upper()}_PLAN_READY"
+                            and isinstance(r.payload.get("config"), Mapping)
+                            and Path(str(r.payload["config"].get("journal_path", ""))).name == data.path.name), None)
+        parent_latency = parent_plan.payload.get("latency", {}) if parent_plan else {}
+        if not isinstance(parent_latency, Mapping):
+            parent_latency = {}
+        values["quote_read"] = _latency_measure("quote_read", parent_latency.get("quote_read_seconds"),
+            basis="parent plan latency.quote_read_seconds; elapsed book request, not pure network time", issues=interval_issues)
+        for leg in ("source", "receiver"):
+            for stage in ("preparation_lock_wait", "nonce_acquisition", "signing_call", "transport_roundtrip"):
+                name = f"{leg}_{stage}"
+                values[name] = _latency_measure(name, latency.get(f"{name}_seconds"),
+                    basis=f"numeric SDK {leg} {stage} elapsed interval", overlap=True, issues=interval_issues)
+        public = guard.payload.get("source_public_level") if guard else None
+        public_at = _finite_number(guard.payload.get("book_observed_at")) if guard and isinstance(public, Mapping) else None
+        saved_plan = plan_record.payload.get("plan") if plan_record else None
+        plan_source = saved_plan.get("source", {}) if isinstance(saved_plan, Mapping) else {}
+        public_bound = (public_at is not None and isinstance(plan_source, Mapping)
+                        and public.get("order_id") == guard.payload.get("source_order_id")
+                        and public.get("owner_account_index") == plan_source.get("account_index")
+                        and _decimal_value(public.get("price")) == _decimal_value(plan_source.get("price"))
+                        and _decimal_value(public.get("quantity")) == _decimal_value(plan_source.get("quantity")))
+        public_duration = _duration(source_result["at"], public_at, issues=interval_issues, label="first_persisted_public_visibility") if source_result and public_bound else None
+        values["public_source_observation"] = _latency_measure("public_source_observation", public_duration,
+            basis="source response to first persisted owner-bound public snapshot; upper bound, not first exchange appearance", overlap=True,
+            unavailable_reason="no persisted bound public source snapshot", issues=interval_issues)
         quote_age = latency.get("source_quote_age_seconds", latency.get("quote_age_to_source_dispatch_seconds"))
         values["quote_age"] = _latency_measure("quote_age", quote_age, basis="latency.source_quote_age_seconds", issues=interval_issues, label="quote_age")
         preparation = latency.get("paired_preparation_seconds")
@@ -1413,6 +1493,29 @@ def _latency_reports(
                 )
                 if key in latency
             },
+        }
+        config = plan_record.payload.get("config", {}) if plan_record else {}
+        quote_observed_at = _finite_number(config.get("source_quote_observed_at")) if isinstance(config, Mapping) else None
+        freshness = _finite_number(config.get("freshness_seconds")) if isinstance(config, Mapping) else None
+        intent_boundary = _finite_number(latency.get("source_dispatch_intent_at"))
+        if intent_boundary is None and source_intent is not None:
+            intent_boundary = source_intent["at"]
+        item["quote_age_breakdown"] = {
+            "observed_at": quote_observed_at,
+            "intent_boundary_at": intent_boundary,
+            "basis": "saved engine intent timestamp when available; journal timestamp otherwise; age is not market-priority proof",
+            "quote_to_plan_seconds": _duration(quote_observed_at, plan_record["at"] if plan_record else None, issues=interval_issues, label="quote_to_plan"),
+            "plan_to_intent_seconds": _duration(plan_record["at"] if plan_record else None, intent_boundary, issues=interval_issues, label="plan_to_intent"),
+            "saved_freshness_seconds": freshness,
+            "stale_at_intent": (quote_age > freshness if isinstance(quote_age, (int, float)) and freshness is not None else None),
+        }
+        item["attribution"] = {
+            "network_only": {"status": "UNKNOWN", "fraction": None, "reason": "client request timing includes network, scheduling and remote processing"},
+            "exchange_processing_only": {"status": "UNKNOWN", "fraction": None, "reason": "journal has no exchange receive/processing timestamps"},
+            "local_cpu_only": {"status": "UNKNOWN", "fraction": None, "reason": "SDK signing-call elapsed time is not CPU accounting"},
+            "source_visibility_basis": "private order visibility/coalesced read window; distinct from public source proof",
+            "signing_basis": "SDK signing call with an already acquired nonce; elapsed duration, not a network/CPU split",
+            "not_additive": True,
         }
         # Flat aliases make the report convenient for operators and keep the
         # stage values machine-readable without forcing callers to understand
@@ -1867,9 +1970,14 @@ def _coverage_map() -> dict[str, Any]:
     """Name the existing behavioral evidence behind each offline projection."""
 
     return {
+        "saved_incidents": {
+            "tests": ["tests/spread_shadow/test_hood_handoff_saved_incidents.py::test_saved_incident_projection_preserves_action_sequence_and_provenance"],
+            "fixtures": ["tests/fixtures/hood_handoff/cycle-003.json", "tests/fixtures/hood_handoff/cycle-004.json", "tests/fixtures/hood_handoff/cycle-007.json"],
+            "provenance": "each fixture binds original file SHA-256 and sanitized projection SHA-256; injected faults are explicitly synthetic",
+        },
         "source_disappearance": {
             "signal": "source_disappearance",
-            "tests": ["tests/spread_shadow/test_hood_handoff_corrections.py::test_foreign_active_order_seen_then_absent_remains_a_barrier"],
+            "tests": ["tests/spread_shadow/test_hood_handoff_corrections.py::test_reconciled_source_only_external_fill_after_lookup_miss_is_known_partial"],
         },
         "public_ownership_absent": {
             "signal": "public_ownership_absent",
@@ -1881,11 +1989,14 @@ def _coverage_map() -> dict[str, Any]:
         },
         "delayed_or_incomplete_history": {
             "signal": "delayed_or_incomplete_history",
-            "tests": ["tests/spread_shadow/test_hood_handoff_corrections.py::test_permanent_empty_history_remains_unknown_without_fabricated_fill"],
+            "tests": [
+                "tests/spread_shadow/test_hood_handoff_corrections.py::test_terminal_fill_retries_empty_complete_history_before_classifying",
+                "tests/spread_shadow/test_hood_handoff_corrections.py::test_permanent_empty_history_remains_unknown_without_fabricated_fill",
+            ],
         },
         "canceled_zero_fill_ioc": {
             "signal": "canceled_zero_fill_ioc",
-            "tests": ["tests/spread_shadow/test_hood_handoff_engine.py::test_terminal_receiver_no_fill_is_partial_and_not_success"],
+            "tests": ["tests/spread_shadow/test_hood_handoff_random_cycle.py::test_cycle_003_terminal_zero_fill_is_reconciled_and_retried_without_receiver_dispatch"],
         },
         "canceled_zero_fill_limit": {
             "signal": "canceled_zero_fill_limit",
@@ -2120,6 +2231,7 @@ def load_saved_cycle_report(path: str | Path) -> dict[str, Any]:
         "dispatched_actions": actions,
         "confirmed_fills": fills,
         "terminal_orders": terminal_orders,
+        "order_state": _order_state_summary(all_files, terminal_orders, executions, actions),
         "paired_execution": paired,
         "inventory": inventory,
         "economics": economics,
@@ -2202,6 +2314,9 @@ def render_human(report: Mapping[str, Any]) -> str:
         f"Inventory: {inventory.get('status', 'UNKNOWN')} — source={_display_number(inventory.get('source'))}, receiver={_display_number(inventory.get('receiver'))}.",
         f"Fees: {fees.get('status', 'UNKNOWN')}; funding/PnL: UNKNOWN (отдельная классификация).",
     ]
+    order_state = report.get("order_state", {})
+    if isinstance(order_state, Mapping):
+        lines.append(f"Неразрешённые наблюдавшиеся ордера: {len(order_state.get('unresolved_observed_orders', []))}; неразрешённые намерения: {len(order_state.get('unresolved_intents', []))}. Только сохранённые наблюдения.")
     if report.get("progression_detail_truncated"):
         lines.append(f"Детали ограничены: списки действий и fills могут быть неполными; всего записей {report.get('progression_total_events')}.")
     if issues:
@@ -2219,7 +2334,7 @@ def render_human(report: Mapping[str, Any]) -> str:
                 if not isinstance(item, Mapping):
                     continue
                 available = []
-                for key in ("quote_age", "preparation", "source_dispatch_ack", "source_visibility", "receiver_admission", "receiver_dispatch_ack", "receiver_visibility", "reconciliation"):
+                for key in ("quote_read", "quote_age", "preparation", "source_signing_call", "source_nonce_acquisition", "source_transport_roundtrip", "source_dispatch_ack", "public_source_observation", "source_visibility", "receiver_admission", "receiver_dispatch_ack", "receiver_visibility", "reconciliation"):
                     seconds = item.get(f"{key}_seconds")
                     if seconds is not None:
                         available.append(f"{key}={_display_number(seconds)}s")
@@ -2228,6 +2343,7 @@ def render_human(report: Mapping[str, Any]) -> str:
     notes = report.get("report_notes")
     if isinstance(notes, list) and notes:
         lines.append("Ограничение: " + str(notes[0]))
+    lines.append("Время сети, обработки биржей и локального CPU по отдельности: UNKNOWN; измеренные интервалы могут перекрываться.")
     return "\n".join(lines)
 
 
