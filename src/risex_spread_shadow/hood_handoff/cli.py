@@ -976,6 +976,11 @@ def _simple_event_line(row: Mapping[str, Any]) -> str | None:
                     and not source_trades
                 )
                 if zero_fill_cancel:
+                    if str(source_order.get("status", "")).lower() == "canceled-post-only":
+                        return (
+                            "Источник отменён как canceled-post-only без исполнения; "
+                            "цикл не открыт, ордер приёмника не отправлялся."
+                        )
                     return "Источник подтверждён как zero-fill/cancel; ордер приёмника не отправлялся."
                 return "Источник: исполнение не подтверждено; ордер приёмника не отправлялся."
         return "Открытие и его сверка завершены."
@@ -1239,6 +1244,11 @@ def format_random_cycle_result_ru(
     terminal_facts = terminal_cycle_facts(result)
     if terminal_facts:
         lines.append("Терминальные факты: " + "; ".join(terminal_facts) + ".")
+        if any("canceled-post-only" in fact for fact in terminal_facts):
+            lines.append(
+                "Источник: canceled-post-only без исполнения; цикл не открыт, "
+                "ордер приёмника не отправлялся."
+            )
     if receiver_not_dispatched:
         lines.append("Приёмник: ордер не отправлялся; это не отмена уже отправленного ордера.")
     elif receiver_leg is not None:

@@ -352,6 +352,20 @@ class PreparedPairedClient(PairedClient):
             prepared["state"] = "INVALIDATED"
 
 
+class DelayedPreparedPairedClient(PreparedPairedClient):
+    """Add independent preparation delay so overlap and quote age are measured."""
+
+    def __init__(self, *, delay: float) -> None:
+        super().__init__()
+        self.delay = delay
+        self.prepare_started: list[tuple[int, float]] = []
+
+    async def prepare_order(self, plan):
+        self.prepare_started.append((plan.account_index, perf_counter()))
+        await asyncio.sleep(self.delay)
+        return await super().prepare_order(plan)
+
+
 class LegacyPreparedPairedClient(PreparedPairedClient):
     """Keep the generic two-argument prepared submission surface working."""
 
@@ -761,6 +775,29 @@ async def test_prepared_pair_keeps_two_argument_generic_client_compatibility(tmp
 
     assert result.outcome is Outcome.SUCCESS
     assert client.dispatch_deadlines[-1][2] is None
+
+
+@pytest.mark.asyncio
+async def test_prepared_pair_overlaps_independent_work_and_records_source_quote_age(tmp_path):
+    delay = 0.03
+    client = DelayedPreparedPairedClient(delay=delay)
+    result = await run_handoff(
+        config(
+            tmp_path / "prepared-overlap.jsonl",
+            source_quote_observed_at=NOW - 0.25,
+        ),
+        client,
+        clock=Clock(),
+    )
+
+    assert result.outcome is Outcome.SUCCESS, result.as_dict()
+    assert len(client.prepare_started) == 2
+    assert max(at for _, at in client.prepare_started) - min(at for _, at in client.prepare_started) < delay * 0.5
+    assert result.latency["paired_preparation_seconds"] < delay * 1.8
+    assert result.latency["source_quote_age_seconds"] == pytest.approx(0.25)
+    assert result.latency["quote_age_to_source_dispatch_seconds"] == pytest.approx(0.25)
+    assert result.latency["source_to_receiver_intent_seconds"] >= 0
+    assert result.latency["source_ack_to_receiver_intent_seconds"] >= 0
 
 
 @pytest.mark.asyncio

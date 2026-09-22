@@ -841,6 +841,9 @@ class HandoffEngine:
         prepared_receiver: Any | None = None
         prepared_source_plan: OrderPlan | None = None
         prepared_receiver_plan: OrderPlan | None = None
+        source_dispatch_intent_at: float | None = None
+        source_dispatch_ack_at: float | None = None
+        receiver_dispatch_intent_at: float | None = None
         self._visibility_source_baseline = source
         self._visibility_receiver_baseline = receiver
         self._visibility_requires_incremental_margin = requires_incremental_margin
@@ -854,15 +857,27 @@ class HandoffEngine:
                 prepared_source_plan = self._mutation_plan(
                     plan.source,
                     config,
-                    observations=(source, receiver, plan.metadata_observed_at),
+                    observations=(
+                        source,
+                        receiver,
+                        plan.metadata_observed_at,
+                        config.source_quote_observed_at,
+                    ),
                 )
-                prepared_source = await self._prepare_order(prepared_source_plan)
                 prepared_receiver_plan = self._mutation_plan(
                     plan.receiver,
                     config,
-                    observations=(source, receiver, plan.metadata_observed_at),
+                    observations=(
+                        source,
+                        receiver,
+                        plan.metadata_observed_at,
+                        config.source_quote_observed_at,
+                    ),
                 )
-                prepared_receiver = await self._prepare_order(prepared_receiver_plan)
+                prepared_source, prepared_receiver = await self._prepare_pair(
+                    prepared_source_plan,
+                    prepared_receiver_plan,
+                )
             except Exception as exc:
                 if prepared_source is not None:
                     await self._invalidate_prepared(prepared_source)
@@ -878,10 +893,24 @@ class HandoffEngine:
             if not unknown_reasons:
                 source_dispatch_attempted = True
                 source_submit_started = time.perf_counter()
+                source_dispatch_intent_at = self.clock.now()
+                latency["source_dispatch_intent_at"] = source_dispatch_intent_at
+                if config.source_quote_observed_at is not None:
+                    quote_age = max(
+                        0.0,
+                        source_dispatch_intent_at - config.source_quote_observed_at,
+                    )
+                    latency["quote_age_to_source_dispatch_seconds"] = quote_age
+                    latency["source_quote_age_seconds"] = quote_age
                 source_dispatch_plan = prepared_source_plan or self._mutation_plan(
                     plan.source,
                     config,
-                    observations=(source, receiver, plan.metadata_observed_at),
+                    observations=(
+                        source,
+                        receiver,
+                        plan.metadata_observed_at,
+                        config.source_quote_observed_at,
+                    ),
                 )
                 journal.append(
                     "SOURCE_DISPATCH_INTENT",
@@ -895,6 +924,8 @@ class HandoffEngine:
                     )
                 )
                 latency["source_submit_ack_seconds"] = max(0.0, time.perf_counter() - source_submit_started)
+                source_dispatch_ack_at = self.clock.now()
+                latency["source_dispatch_ack_at"] = source_dispatch_ack_at
                 journal.append(
                     "SOURCE_DISPATCH_RESULT",
                     {
@@ -950,6 +981,10 @@ class HandoffEngine:
                 )
             latency["source_visibility_seconds"] = max(0.0, time.perf_counter() - source_visibility_started)
             if coalesced_pre_receiver_checks is not None:
+                # These observations were already fetched while source
+                # visibility was settling.  Keep them available even when a
+                # terminal source state skips normal receiver admission.
+                source_recheck, receiver_recheck, public_book = coalesced_pre_receiver_checks[:3]
                 latency["public_book_read_seconds"] = coalesced_pre_receiver_checks[3]
                 latency["concurrent_pre_receiver_checks_seconds"] = coalesced_pre_receiver_checks[4]
                 latency["coalesced_pre_receiver_window_seconds"] = coalesced_pre_receiver_window_seconds
@@ -975,7 +1010,23 @@ class HandoffEngine:
                     expected_order_id=source_order_id,
                 )
             elif not source_order.active or source_order.remaining_quantity != plan.quantity:
-                unknown_reasons.append("source order did not prove exact resting quantity")
+                if self._is_exact_canceled_post_only_zero_fill(source_order, plan.source):
+                    reason = "source canceled-post-only zero-fill; receiver was not dispatched"
+                    if reason not in unknown_reasons:
+                        unknown_reasons.append(reason)
+                    journal.append(
+                        "SOURCE_CANCELED_POST_ONLY_ZERO_FILL",
+                        {
+                            "order_id": source_order.order_id,
+                            "status": source_order.status,
+                            "filled_quantity": str(source_order.filled_quantity),
+                            "remaining_quantity": str(source_order.remaining_quantity),
+                            "terminal_reason": "canceled-post-only",
+                        },
+                        run_id=run_id,
+                    )
+                else:
+                    unknown_reasons.append("source order did not prove exact resting quantity")
                 await self._cancel_if_safe(
                     plan.source,
                     source_order,
@@ -1221,6 +1272,18 @@ class HandoffEngine:
                         priority_guard["priority_reason"] = (
                             "paired admission checks failed: " + "; ".join(unknown_reasons[:8])
                         )
+                    if self._is_exact_canceled_post_only_zero_fill(source_order, plan.source):
+                        # The book/account window is retained as evidence, but
+                        # no priority proof was admitted because the source
+                        # was already terminal before the receiver boundary.
+                        priority_guard["status"] = "UNKNOWN"
+                        priority_guard["priority_status"] = "UNKNOWN"
+                        priority_guard["priority_proof_admitted"] = False
+                        priority_guard["priority_reason"] = (
+                            "source canceled-post-only before receiver admission; "
+                            "priority proof was not admitted"
+                        )
+                        priority_guard["terminal_reason"] = "canceled-post-only"
                     if source_order is not None:
                         priority_guard["source_order"] = {
                             "order_id": source_order.order_id,
@@ -1270,6 +1333,44 @@ class HandoffEngine:
                 "paired pre-receiver admission did not obtain a complete guard window",
                 public_book,
             )
+            if self._is_exact_canceled_post_only_zero_fill(source_order, plan.source):
+                # Keep the coalesced book/account evidence while explicitly
+                # recording that no priority proof was admitted after the
+                # source had already reached its terminal post-only outcome.
+                priority_guard["priority_reason"] = (
+                    "source canceled-post-only before receiver admission; "
+                    "priority proof was not admitted"
+                )
+                priority_guard["terminal_reason"] = "canceled-post-only"
+                priority_guard["priority_proof_admitted"] = False
+            if source_order is not None:
+                priority_guard["source_order"] = {
+                    "order_id": source_order.order_id,
+                    "owner_account_index": source_order.account_index,
+                    "market_id": source_order.market_id,
+                    "client_order_index": source_order.client_order_index,
+                    "side": source_order.side,
+                    "order_type": source_order.order_type,
+                    "time_in_force": source_order.time_in_force,
+                    "price": None if source_order.price is None else str(source_order.price),
+                    "initial_quantity": str(source_order.initial_quantity),
+                    "filled_quantity": str(source_order.filled_quantity),
+                    "remaining_quantity": str(source_order.remaining_quantity),
+                    "status": source_order.status,
+                    "observed_at": source_order.observed_at,
+                }
+            priority_guard["source_recheck"] = self._account_observation_payload(source_recheck)
+            priority_guard["receiver_recheck"] = self._account_observation_payload(receiver_recheck)
+            priority_guard["source_recheck_transition"] = source_recheck_transition
+            if self._last_pre_visibility_original_checks is not None:
+                first_source, first_receiver, first_book, _, _ = (
+                    self._last_pre_visibility_original_checks
+                )
+                priority_guard["causal_pre_visibility_observations"] = {
+                    "source": self._account_observation_payload(first_source),
+                    "receiver": self._account_observation_payload(first_receiver),
+                    "book_observed_at": first_book.get("observed_at"),
+                }
             priority_guard["admission_reasons"] = list(unknown_reasons[:8])
             journal.append(
                 "PRE_RECEIVER_GUARD",
@@ -1330,6 +1431,7 @@ class HandoffEngine:
                 0.0, time.perf_counter() - reconciliation_started
             )
             retryable_pair = self._retryable_pair_after_guard(
+                plan,
                 source_result,
                 receiver_result,
                 unknown_reasons,
@@ -1361,6 +1463,18 @@ class HandoffEngine:
         try:
             receiver_dispatch_attempted = True
             receiver_submit_started = time.perf_counter()
+            receiver_dispatch_intent_at = self.clock.now()
+            latency["receiver_dispatch_intent_at"] = receiver_dispatch_intent_at
+            if source_dispatch_intent_at is not None:
+                latency["source_to_receiver_intent_seconds"] = max(
+                    0.0,
+                    receiver_dispatch_intent_at - source_dispatch_intent_at,
+                )
+            if source_dispatch_ack_at is not None:
+                latency["source_ack_to_receiver_intent_seconds"] = max(
+                    0.0,
+                    receiver_dispatch_intent_at - source_dispatch_ack_at,
+                )
             receiver_admission_plan = self._mutation_plan(
                 plan.receiver,
                 config,
@@ -1559,6 +1673,60 @@ class HandoffEngine:
         if not callable(method):
             raise ContractError("prepared dispatch client lacks order preparation")
         return await self._bounded(method(plan), "order preparation")
+
+    async def _prepare_pair(
+        self,
+        source_plan: OrderPlan,
+        receiver_plan: OrderPlan,
+    ) -> tuple[Any, Any]:
+        """Prepare independent account/key legs concurrently and drain failures.
+
+        The SDK keeps nonce reservation and signing state behind its own
+        account/key lock.  Scheduling both preparations together therefore
+        preserves that reservation contract while allowing adapters with
+        independent accounts or keys to overlap their network/signing work.
+        A failed pair invalidates every successful unsent preparation before
+        the caller can expose the source order.
+        """
+
+        tasks = [
+            asyncio.create_task(self._prepare_order(source_plan)),
+            asyncio.create_task(self._prepare_order(receiver_plan)),
+        ]
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        except BaseException:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            results = []
+            for task in tasks:
+                if task.cancelled():
+                    continue
+                try:
+                    results.append(task.result())
+                except BaseException:
+                    continue
+            for prepared in results:
+                await self._invalidate_prepared(prepared)
+            raise
+
+        prepared_values: list[Any] = []
+        failure: BaseException | None = None
+        for result in results:
+            if isinstance(result, BaseException):
+                if failure is None:
+                    failure = result
+            else:
+                prepared_values.append(result)
+        if failure is not None:
+            for prepared in prepared_values:
+                await self._invalidate_prepared(prepared)
+            raise failure
+        if len(prepared_values) != 2:
+            raise ContractError("prepared pair returned an unsupported result")
+        return prepared_values[0], prepared_values[1]
 
     async def _submit_order(
         self,
@@ -1912,6 +2080,32 @@ class HandoffEngine:
         )
 
     @staticmethod
+    def _is_exact_canceled_post_only_zero_fill(
+        order: OrderSnapshot | None,
+        plan: OrderPlan,
+    ) -> bool:
+        """Recognize only the terminal source form eligible for a retry."""
+
+        return bool(
+            order is not None
+            and order.account_index == plan.account_index
+            and order.market_id == plan.market_id
+            and bool(order.order_id)
+            and order.client_order_index is not None
+            and str(order.client_order_index) == str(plan.client_order_index)
+            and order.side == plan.side
+            and order.order_type == "LIMIT"
+            and order.time_in_force == "POST_ONLY"
+            and order.reduce_only == plan.reduce_only
+            and order.initial_quantity == plan.quantity
+            and order.price == plan.price
+            and order.status.lower() == "canceled-post-only"
+            and order.terminal
+            and order.filled_quantity == 0
+            and order.remaining_quantity == 0
+        )
+
+    @staticmethod
     def _priority_guard_unavailable(
         plan: HandoffPlan,
         source_order_id: str | None,
@@ -1924,6 +2118,8 @@ class HandoffEngine:
             "status": "UNKNOWN",
             "priority_status": "UNKNOWN",
             "priority_reason": reason,
+            "book_observation_available": public_book is not None,
+            "priority_proof_admitted": False,
             "source_side": plan.source.side,
             "source_price": format(plan.source.price, "f"),
             "source_order_id": None if source_order_id is None else str(source_order_id),
@@ -2024,6 +2220,8 @@ class HandoffEngine:
             "status": status,
             "priority_status": status,
             "priority_reason": reason,
+            "book_observation_available": True,
+            "priority_proof_admitted": status == "PROVED",
             "source_side": plan.source.side,
             "source_price": format(source_price, "f"),
             "source_order_id": str(source_order_id),
@@ -2044,6 +2242,7 @@ class HandoffEngine:
 
     @staticmethod
     def _retryable_pair_after_guard(
+        plan: HandoffPlan,
         source: LegReconciliation,
         receiver: LegReconciliation,
         unknown_reasons: Sequence[str],
@@ -2051,8 +2250,26 @@ class HandoffEngine:
     ) -> bool:
         if priority_guard is None or priority_guard.get("status") not in {"LOST", "UNKNOWN"}:
             return False
-        if any(not str(reason).startswith("PAIR_GUARD_") for reason in unknown_reasons):
-            return False
+        terminal_source = HandoffEngine._is_exact_canceled_post_only_zero_fill(
+            source.order,
+            plan.source,
+        )
+        if terminal_source:
+            # The terminal source form is checked structurally below.  Its
+            # only permitted top-level barrier is the exact terminal reason;
+            # arbitrary scalar strings cannot opt into retry.
+            if any(
+                str(reason) != "source canceled-post-only zero-fill; receiver was not dispatched"
+                for reason in unknown_reasons
+            ):
+                return False
+        else:
+            status = str(priority_guard.get("status"))
+            expected_reason = (
+                f"PAIR_GUARD_{status}: {priority_guard.get('priority_reason')}"
+            )
+            if any(str(reason) != expected_reason for reason in unknown_reasons):
+                return False
         if (
             not source.dispatched
             or receiver.dispatched
@@ -3269,6 +3486,31 @@ def _joint_trade_match(
     return status, matched, tuple(reasons)
 
 
+def _leg_proves_no_execution(leg: LegReconciliation) -> bool:
+    """Prove that a reconciled leg incurred no execution fee."""
+
+    if (
+        leg.unknown_reasons
+        or not leg.history_complete
+        or not leg.trades
+        and leg.position_after != leg.position_before
+    ):
+        return False
+    if leg.trades:
+        return False
+    if not leg.dispatched:
+        return leg.order is None and leg.position_after == leg.position_before
+    order = leg.order
+    return bool(
+        order is not None
+        and order.terminal
+        and not order.active
+        and order.filled_quantity == 0
+        and order.remaining_quantity == 0
+        and leg.position_after == leg.position_before
+    )
+
+
 def _economic_findings(
     source: LegReconciliation,
     receiver: LegReconciliation,
@@ -3277,9 +3519,16 @@ def _economic_findings(
 
     findings: list[str] = []
     has_unknown = False
+    has_evidence = False
     for label, leg in (("source", source), ("receiver", receiver)):
         if not leg.trades:
+            if _leg_proves_no_execution(leg):
+                findings.append(f"{label} no execution proven; no execution fees were due")
+                has_evidence = True
+            else:
+                has_unknown = True
             continue
+        has_evidence = True
         gross = leg.gross_notional
         fee_total = leg.fee_total
         if fee_total is None:
@@ -3289,7 +3538,7 @@ def _economic_findings(
             findings.append(f"{label} observed gross {gross} and fee {fee_total}")
     if has_unknown:
         return "UNKNOWN", tuple(findings)
-    return ("PROVEN" if (source.trades or receiver.trades) else "NOT_OBSERVED"), tuple(findings)
+    return ("PROVEN" if has_evidence else "UNKNOWN"), tuple(findings)
 
 
 def _config_binding(config: HandoffConfig, client: HandoffClient) -> dict[str, Any]:
@@ -3331,6 +3580,7 @@ def _config_binding(config: HandoffConfig, client: HandoffClient) -> dict[str, A
         "max_poll_count": config.max_poll_count,
         "client_order_prefix": config.client_order_prefix,
         "source_order_lifetime_seconds": config.source_order_lifetime_seconds,
+        "source_quote_observed_at": config.source_quote_observed_at,
         "auth_token_lifetime_seconds": config.auth_token_lifetime_seconds,
         "sdk_version": getattr(client, "sdk_version", None),
         "implementation_fingerprint": _implementation_fingerprint(),

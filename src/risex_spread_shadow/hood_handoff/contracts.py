@@ -1157,6 +1157,10 @@ class HandoffConfig:
     defer_incremental_margin_calculation: bool = False
     # Optional parent lineage ordinal for bounded paired retries.
     attempt_index: int | None = None
+    # Observation time of the public quote used to select the source price.
+    # This is evidence only; when supplied it participates in the existing
+    # freshness/deadline binding and never authorizes repricing.
+    source_quote_observed_at: float | None = None
 
     def __post_init__(self) -> None:
         _int(self.market_id, "market_id", minimum=0)
@@ -1191,6 +1195,12 @@ class HandoffConfig:
             "receiver_worst_price",
         ):
             object.__setattr__(self, field_name, _positive(getattr(self, field_name), field_name))
+        if self.source_quote_observed_at is not None:
+            object.__setattr__(
+                self,
+                "source_quote_observed_at",
+                _timestamp(self.source_quote_observed_at, "source_quote_observed_at"),
+            )
         if self.max_gross_notional is not None:
             object.__setattr__(self, "max_gross_notional", _positive(self.max_gross_notional, "max_gross_notional"))
         for field_name in ("source_fee_budget", "receiver_fee_budget"):
@@ -1349,6 +1359,11 @@ class HandoffConfig:
                 and snapshot.incremental_margin_required > snapshot.margin_available
             ):
                 raise PreflightBlocked(f"{label} incremental planned-operation margin is insufficient")
+        if self.source_quote_observed_at is not None:
+            if self.source_quote_observed_at > now:
+                raise PreflightBlocked("source quote is from the future")
+            if now - self.source_quote_observed_at > self.freshness_seconds:
+                raise PreflightBlocked("source quote is stale")
         if source.account_index == receiver.account_index:
             raise PreflightBlocked("source and receiver accounts must differ")
         expected = self.direction.sign

@@ -1353,6 +1353,32 @@ def _external_receiver_fill_facts(phase: Any) -> tuple[str, ...]:
     return tuple(dict.fromkeys(facts))
 
 
+def _canceled_post_only_zero_fill(phase: Any) -> bool:
+    """Identify the exact terminal source case without trusting a reason string."""
+
+    source = getattr(phase, "source", None)
+    receiver = getattr(phase, "receiver", None)
+    order = None if source is None else getattr(source, "order", None)
+    return bool(
+        source is not None
+        and receiver is not None
+        and getattr(source, "dispatched", False)
+        and not getattr(receiver, "dispatched", True)
+        and getattr(source, "filled_quantity", Decimal(0)) == 0
+        and not getattr(source, "trades", ())
+        and order is not None
+        and str(getattr(order, "status", "")).lower() == "canceled-post-only"
+        and getattr(order, "filled_quantity", Decimal(0)) == 0
+        and getattr(order, "remaining_quantity", Decimal(0)) == 0
+        and getattr(source, "history_complete", False) is True
+        and getattr(receiver, "history_complete", False) is True
+        and not getattr(source, "unknown_reasons", ())
+        and not getattr(receiver, "unknown_reasons", ())
+        and getattr(source, "position_after", None) == getattr(source, "position_before", None)
+        and getattr(receiver, "position_after", None) == getattr(receiver, "position_before", None)
+    )
+
+
 def _boundary_books_available(
     opening: Any,
     closing: Any,
@@ -1396,6 +1422,8 @@ def terminal_cycle_facts(result: Any) -> tuple[str, ...]:
     for phase in (opening, closing):
         if phase is None:
             continue
+        if _canceled_post_only_zero_fill(phase):
+            facts.append("source canceled-post-only zero-fill; cycle not opened")
         source = getattr(phase, "source", None)
         receiver = getattr(phase, "receiver", None)
         if source is not None and receiver is not None:
@@ -1444,6 +1472,8 @@ def _opening_reason(opening: HandoffResult | None) -> str | None:
             reasons.append(reason)
     source = getattr(opening, "source", None)
     receiver = getattr(opening, "receiver", None)
+    if _canceled_post_only_zero_fill(opening):
+        reasons.append("source canceled-post-only zero-fill; cycle not opened")
     if (
         source is not None
         and source.filled_quantity > 0
@@ -1977,6 +2007,7 @@ class RandomCycleEngine:
                 source.signed_position,
                 receiver.signed_position,
                 attempt_index=attempt_index,
+                source_quote_observed_at=selection.book_observed_at,
             )
             journal.append(
                 "OPENING_PLAN_READY",
@@ -2493,6 +2524,7 @@ class RandomCycleEngine:
         receiver_position: Decimal,
         *,
         attempt_index: int = 1,
+        source_quote_observed_at: float | None = None,
     ) -> HandoffConfig:
         child_prefix = config.client_order_prefix
         if attempt_index != 1:
@@ -2524,6 +2556,7 @@ class RandomCycleEngine:
             attempt_index=attempt_index,
             expected_source_position=source_position,
             expected_receiver_position=receiver_position,
+            source_quote_observed_at=source_quote_observed_at,
             # A reduce-only close does not add exposure.  The existing config
             # gate therefore remains strict for the opening only; carrying the
             # opening deferral flag into a close would be an invalid policy
@@ -2670,6 +2703,7 @@ class RandomCycleEngine:
                     opening_source.position_after,
                     opening_receiver.position_after,
                     attempt_index=attempt_index,
+                    source_quote_observed_at=book.observed_at,
                 )
                 journal.append(
                     "CLOSING_PLAN_READY",
@@ -3866,6 +3900,7 @@ def opening_config_binding(config: HandoffConfig) -> dict[str, Any]:
         "operation_mode": config.operation_mode.value,
         "attempt_index": config.attempt_index,
         "client_order_prefix": config.client_order_prefix,
+        "source_quote_observed_at": config.source_quote_observed_at,
         "expected_source_position": None if config.expected_source_position is None else format(config.expected_source_position, "f"),
         "expected_receiver_position": None if config.expected_receiver_position is None else format(config.expected_receiver_position, "f"),
         "journal_path": config.journal_path,
