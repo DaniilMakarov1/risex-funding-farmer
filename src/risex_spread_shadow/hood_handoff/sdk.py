@@ -396,10 +396,11 @@ class LighterSdkClient:
         self._tokens: dict[int, _CachedToken] = {}
         self._api_client: Any | None = None
         self._pending_mutation_deadline: float | None = None
-        # Nonce acquisition and signing are serialized across both accounts.
-        # This keeps ownership deterministic when a caller prepares both legs
-        # before exposing the source order.
-        self._preparation_lock = asyncio.Lock()
+        # Nonce acquisition and signing are serialized per account/key.  A
+        # paired source/receiver preparation may therefore overlap when the
+        # accounts (or keys) are independent, while same-account mutations
+        # retain one nonce owner and deterministic reservation order.
+        self._preparation_locks: dict[tuple[int, int], asyncio.Lock] = {}
         # The API nonce manager is authoritative but may return the same nonce
         # until the venue executes it.  Keep ownership in this adapter so two
         # prepared legs, a cancel, or a second client cannot claim one nonce.
@@ -1055,6 +1056,19 @@ class LighterSdkClient:
     def _account_key(account_index: int, api_key_index: int) -> tuple[int, int]:
         return account_index, api_key_index
 
+    def _preparation_lock_for(self, account_index: int, api_key_index: int) -> asyncio.Lock:
+        """Return the serialization lock for one account/key nonce domain."""
+
+        # Lock creation is synchronous and runs on the event loop.  Once the
+        # lock is returned, every await that can reserve, consume, or release
+        # this account/key nonce is protected by the same object.
+        key = self._account_key(account_index, api_key_index)
+        lock = self._preparation_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._preparation_locks[key] = lock
+        return lock
+
     def _assert_nonce_available(self, account_index: int, api_key_index: int, nonce: int) -> None:
         reservation_key = self._nonce_key(account_index, api_key_index, nonce)
         if reservation_key in self._nonce_reservations:
@@ -1134,7 +1148,7 @@ class LighterSdkClient:
             )
         if time.monotonic() >= deadline:
             raise TimeoutError("order preparation crossed the final mutation barrier")
-        async with self._preparation_lock:
+        async with self._preparation_lock_for(plan.account_index, key_index):
             signer = self._signer(plan.account_index)
             nonce = await self._next_nonce(signer, key_index, deadline=deadline)
             if time.monotonic() >= deadline:
@@ -1209,14 +1223,14 @@ class LighterSdkClient:
             try:
                 deadline = float(deadline)
             except (TypeError, ValueError):
-                async with self._preparation_lock:
+                async with self._preparation_lock_for(prepared.account_index, prepared.api_key_index):
                     self._invalidate_owned(prepared)
                 return MutationReceipt(False, None, None, "prepared order deadline is invalid")
             if not math.isfinite(deadline) or deadline <= 0:
-                async with self._preparation_lock:
+                async with self._preparation_lock_for(prepared.account_index, prepared.api_key_index):
                     self._invalidate_owned(prepared)
                 return MutationReceipt(False, None, None, "prepared order deadline is invalid")
-        async with self._preparation_lock:
+        async with self._preparation_lock_for(prepared.account_index, prepared.api_key_index):
             if not prepared.matches(plan, api_key_index=key_index):
                 self._invalidate_owned(prepared)
                 return MutationReceipt(False, None, None, "prepared order binding changed or was consumed")
@@ -1249,7 +1263,7 @@ class LighterSdkClient:
         """Invalidate an unused preparation after a source-side barrier."""
 
         if isinstance(prepared, PreparedMutation):
-            async with self._preparation_lock:
+            async with self._preparation_lock_for(prepared.account_index, prepared.api_key_index):
                 self._invalidate_owned(prepared)
 
     async def submit_order(self, plan: OrderPlan) -> MutationReceipt:
@@ -1276,7 +1290,7 @@ class LighterSdkClient:
                     self.config.request_timeout_seconds,
                     self.config.freshness_seconds,
                 )
-            async with self._preparation_lock:
+            async with self._preparation_lock_for(account_index, key_index):
                 signer = self._signer(account_index)
                 nonce = await self._next_nonce(signer, key_index, deadline=deadline)
                 self._assert_nonce_available(account_index, key_index, nonce)

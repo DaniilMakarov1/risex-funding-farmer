@@ -1224,7 +1224,12 @@ def _cycle_terminal_reason(
         and closing.reason
         and closing.reason not in parts
     ):
-        parts.append(f"paired closing: {closing.reason}")
+        closing_reason = (
+            _canceled_post_only_fact(closing)
+            if _canceled_post_only_zero_fill(closing)
+            else closing.reason
+        )
+        parts.append(f"paired closing: {closing_reason}")
 
     fallback_summaries = tuple(_fallback_terminal_summary(item) for item in fallbacks)
     parts.extend(summary for summary in fallback_summaries if summary)
@@ -1379,6 +1384,25 @@ def _canceled_post_only_zero_fill(phase: Any) -> bool:
     )
 
 
+def _canceled_post_only_fact(phase: Any) -> str:
+    """Describe a proven source cancellation in the phase that observed it."""
+
+    operation_mode = getattr(phase, "operation_mode", None)
+    if operation_mode is None:
+        plan = getattr(phase, "plan", None)
+        operation_mode = getattr(plan, "operation_mode", None)
+    try:
+        operation_mode = OperationMode.parse(operation_mode)
+    except (ContractError, TypeError, ValueError):
+        operation_mode = OperationMode.PAIRED_OPENING
+    if operation_mode is OperationMode.PAIRED_CLOSING:
+        return (
+            "paired closing source canceled-post-only zero-fill; "
+            "paired close not completed"
+        )
+    return "source canceled-post-only zero-fill; cycle not opened"
+
+
 def _boundary_books_available(
     opening: Any,
     closing: Any,
@@ -1423,7 +1447,7 @@ def terminal_cycle_facts(result: Any) -> tuple[str, ...]:
         if phase is None:
             continue
         if _canceled_post_only_zero_fill(phase):
-            facts.append("source canceled-post-only zero-fill; cycle not opened")
+            facts.append(_canceled_post_only_fact(phase))
         source = getattr(phase, "source", None)
         receiver = getattr(phase, "receiver", None)
         if source is not None and receiver is not None:
@@ -1473,7 +1497,7 @@ def _opening_reason(opening: HandoffResult | None) -> str | None:
     source = getattr(opening, "source", None)
     receiver = getattr(opening, "receiver", None)
     if _canceled_post_only_zero_fill(opening):
-        reasons.append("source canceled-post-only zero-fill; cycle not opened")
+        reasons.append(_canceled_post_only_fact(opening))
     if (
         source is not None
         and source.filled_quantity > 0

@@ -1663,6 +1663,45 @@ async def test_canceled_post_only_zero_fill_retries_closing_before_residual_fall
 
 
 @pytest.mark.asyncio
+async def test_closing_post_only_retry_exhaustion_reports_recovery_without_erasing_opening_dispatch(tmp_path):
+    clock = AdvancingClock()
+    client = PostOnlyCancelClient(clock, closing=True, cancel_count=99)
+    cycle_path = tmp_path / "post-only-closing-exhausted"
+    result = await run_random_cycle(
+        cycle_config(cycle_path),
+        client,
+        clock=clock,
+        rng=FixedRng(20, 20),
+    )
+
+    assert result.outcome is Outcome.SUCCESS, result.as_dict()
+    assert result.opening is not None and result.opening.receiver is not None
+    assert result.opening.receiver.dispatched is True
+    assert result.closing is not None and result.closing.attempt_index == 3
+    close_limits = [
+        plan
+        for plan in client.submissions
+        if plan.order_type == "LIMIT" and plan.reduce_only
+    ]
+    assert len(close_limits) == 3
+    assert len({plan.client_order_index for plan in close_limits}) == 3
+    assert len(client.fallback_plans) == 2
+
+    facts = random_cycle_module.terminal_cycle_facts(result)
+    assert "paired closing source canceled-post-only zero-fill; paired close not completed" in facts
+    assert not any("cycle not opened" in fact for fact in facts)
+    assert result.reason is not None
+    assert "paired closing: paired closing source canceled-post-only zero-fill" in result.reason
+    assert "cycle not opened" not in result.reason
+    output = cli_module.format_random_cycle_result_ru(result)
+    assert "парное закрытие не завершено" in output
+    assert "восстановление продолжено через fallback" in output
+    assert "Приёмник открытия: ордер отправлен" in output
+    assert "Приёмник закрытия: ордер не отправлялся" in output
+    assert "цикл не открыт" not in output
+
+
+@pytest.mark.asyncio
 async def test_canceled_post_only_retry_budget_exhaustion_proves_no_trade_fees(tmp_path):
     clock = AdvancingClock()
     client = PostOnlyCancelClient(clock, cancel_count=99)
