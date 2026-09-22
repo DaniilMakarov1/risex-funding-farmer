@@ -151,10 +151,10 @@ def test_report_distinguishes_planned_receiver_from_never_dispatched_and_keeps_f
     assert len(report["planned_actions"]) == 6
     assert [item for item in report["dispatched_actions"] if item["leg"] == "receiver"] == []
     assert report["paired_execution"]["status"] == "FAILED"
-    assert report["inventory"]["status"] == "CONFIRMED_FLAT"
+    assert report["inventory"]["status"] == "UNKNOWN"
     assert report["confirmed_fills"] == []
     assert report["terminal_orders"] == []
-    assert report["economics"]["fees"]["status"] == "PROVEN"
+    assert report["economics"]["fees"]["status"] == "UNKNOWN"
     assert report["economics"]["funding_pnl"]["status"] == "UNKNOWN"
     first_latency = report["latency"]["opening"][0]
     assert first_latency["receiver_admission_seconds"] == pytest.approx(0.1)
@@ -200,11 +200,11 @@ def test_report_keeps_confirmed_trade_and_fee_unknown_separate_from_inventory(tm
 
     report = load_saved_cycle_report(tmp_path)
 
-    assert len(report["confirmed_fills"]) == 1
-    assert report["confirmed_fills"][0]["trade_id"] == "trade-1"
+    assert report["confirmed_fills"] == []
+    assert any(issue["code"] == "INCOMPLETE_TRADE_HISTORY" for issue in report["issues"])
     assert report["terminal_orders"] == []  # the synthetic receipt intentionally omits an order snapshot
-    assert report["paired_execution"]["status"] == "FAILED"
-    assert report["inventory"]["status"] == "CONFIRMED_FLAT"
+    assert report["paired_execution"]["status"] == "UNKNOWN"
+    assert report["inventory"]["status"] == "UNKNOWN"
     assert report["economics"]["fees"]["status"] == "UNKNOWN"
     assert report["economics"]["funding_pnl"]["status"] == "UNKNOWN"
 
@@ -229,7 +229,7 @@ def test_report_marks_malformed_truncated_and_conflicting_input_without_flat_upg
     assert "SEQUENCE_GAP" in codes
     assert "MALFORMED_JSON" in codes
     assert "TRUNCATED_LINE" in codes
-    assert report["inventory"]["status"] == "CONFIRMED_FLAT"
+    assert report["inventory"]["status"] == "UNKNOWN"
     assert report["dispatched_actions"][0]["status"] == "INTENT_ONLY_UNFINISHED"
 
 
@@ -340,3 +340,200 @@ def test_report_surfaces_conflicting_order_identity_evidence(tmp_path: Path):
 
     assert report["status"] == "INCOMPLETE"
     assert any(issue["code"] == "CONFLICTING_ORDER_EVIDENCE" for issue in report["issues"])
+
+
+def _complete_leg(
+    account_index: int,
+    order_id: str,
+    trade_id: str,
+    quantity: str,
+    counterparty_account_index: int,
+    counterparty_order_id: str,
+    *,
+    fee: str | None = "0.01",
+) -> dict[str, Any]:
+    return {
+        "account_index": account_index,
+        "order_id": order_id,
+        "filled_quantity": quantity,
+        "fee_total": fee,
+        "history_complete": True,
+        "position_after": "0",
+        "trades": [
+            {
+                "trade_id": trade_id,
+                "order_id": order_id,
+                "account_index": account_index,
+                "market_id": 7,
+                "quantity": quantity,
+                "price": "100",
+                "fee": fee,
+                "counterparty_account_index": counterparty_account_index,
+                "counterparty_order_id": counterparty_order_id,
+                "observed_at": 3.0,
+            }
+        ],
+        "order": {
+            "order_id": order_id,
+            "account_index": account_index,
+            "market_id": 7,
+            "filled_quantity": quantity,
+            "remaining_quantity": "0",
+            "status": "filled",
+            "time_in_force": "IOC",
+        },
+    }
+
+
+@pytest.mark.parametrize("fee, expected", [("0.01", "PROVEN"), (None, "UNKNOWN")])
+def test_report_requires_positive_pair_proof_and_separates_fee_completeness(
+    tmp_path: Path,
+    fee: str | None,
+    expected: str,
+):
+    _write(
+        tmp_path / "cycle.jsonl",
+        [
+            _event(1, "CYCLE_STARTED", 1.0, {"binding": {"source_account_index": 11, "receiver_account_index": 22}}),
+            _event(
+                2,
+                "CYCLE_COMPLETE",
+                4.0,
+                {
+                    "outcome": "SUCCESS",
+                    "opening": {"outcome": "SUCCESS"},
+                    "remaining_positions": {"source": "0", "receiver": "0"},
+                    "remaining_position_observed_at": {"source": 3.9, "receiver": 3.9},
+                },
+            ),
+        ],
+    )
+    source = _complete_leg(11, "source-order", "trade-1", "0.20", 22, "receiver-order", fee=fee)
+    receiver = _complete_leg(22, "receiver-order", "trade-1", "0.20", 11, "source-order", fee=fee)
+    _write(
+        tmp_path / "opening.jsonl",
+        [
+            _event(
+                1,
+                "COMPLETE",
+                3.0,
+                {
+                    "outcome": "SUCCESS",
+                    "economic_status": "PROVEN",
+                    "receipt": {"source": source, "receiver": receiver},
+                },
+            )
+        ],
+    )
+
+    report = load_saved_cycle_report(tmp_path)
+
+    assert report["paired_execution"]["status"] == "SUCCESS"
+    assert report["inventory"]["status"] == "CONFIRMED_FLAT"
+    assert report["economics"]["fees"]["status"] == expected
+
+
+def test_report_keeps_parent_unknown_outcome_and_rejects_unequal_receipts(tmp_path: Path):
+    _write(
+        tmp_path / "cycle.jsonl",
+        [
+            _event(1, "CYCLE_STARTED", 1.0, {}),
+            _event(
+                2,
+                "CYCLE_COMPLETE",
+                4.0,
+                {
+                    "outcome": "UNKNOWN",
+                    "opening": {"outcome": "SUCCESS"},
+                    "closing": {"outcome": "UNKNOWN"},
+                    "remaining_positions": {"source": "0", "receiver": "0"},
+                    "remaining_position_observed_at": {"source": 3.9, "receiver": 3.9},
+                },
+            ),
+        ],
+    )
+    source = _complete_leg(11, "source-order", "source-trade", "0.10", 22, "receiver-order")
+    receiver = _complete_leg(22, "receiver-order", "receiver-trade", "0.20", 11, "source-order")
+    _write(
+        tmp_path / "opening.jsonl",
+        [_event(1, "COMPLETE", 3.0, {"outcome": "SUCCESS", "economic_status": "PROVEN", "receipt": {"source": source, "receiver": receiver}})],
+    )
+
+    report = load_saved_cycle_report(tmp_path)
+
+    assert report["cycle"]["outcome"] == "UNKNOWN"
+    assert report["cycle"]["child_outcomes"] == {"opening": "SUCCESS", "closing": "UNKNOWN"}
+    assert report["paired_execution"]["status"] == "UNKNOWN"
+    assert report["economics"]["fees"]["status"] == "PROVEN"
+
+
+def test_report_typed_cancellation_signals_distinguish_ioc_from_post_only(tmp_path: Path):
+    _write(
+        tmp_path / "cycle.jsonl",
+        [
+            _event(1, "CYCLE_STARTED", 1.0, {}),
+            _event(
+                2,
+                "FALLBACK_ATTEMPT_EVIDENCE",
+                2.0,
+                {
+                    "attempt": 1,
+                    "history_complete": True,
+                    "reconciliation_state": "TERMINAL_ZERO_FILL",
+                    "order": {"order_id": "ioc", "status": "canceled", "filled_quantity": "0", "time_in_force": "IOC"},
+                    "trades": [],
+                },
+            ),
+            _event(3, "CYCLE_COMPLETE", 3.0, {"outcome": "PARTIAL", "remaining_positions": {"source": "0", "receiver": "0"}, "remaining_position_observed_at": {"source": 2.9, "receiver": 2.9}}),
+        ],
+    )
+    _write(
+        tmp_path / "opening.jsonl",
+        [
+            _event(
+                1,
+                "LEG_RECONCILED",
+                2.1,
+                {"order": {"order_id": "limit", "status": "canceled", "filled_quantity": "0", "time_in_force": "POST_ONLY"}, "history_complete": True, "filled_quantity": "0", "trades": []},
+            ),
+            _event(2, "COMPLETE", 2.2, {"outcome": "PARTIAL", "receipt": {"source": {"filled_quantity": "0", "history_complete": True, "trades": []}, "receiver": {"filled_quantity": "0", "history_complete": True, "trades": []}}}),
+        ],
+    )
+
+    signals = load_saved_cycle_report(tmp_path)["regression_signals"]
+
+    assert signals["canceled_zero_fill_ioc"]["status"] == "OBSERVED"
+    assert signals["canceled_zero_fill_limit"]["status"] == "OBSERVED"
+
+
+def test_report_marks_reversed_latency_interval_without_clamping(tmp_path: Path):
+    _cycle_parent(tmp_path, child_names=["opening.jsonl"], complete=False)
+    plan = _plan()
+    _write(
+        tmp_path / "opening.jsonl",
+        [
+            _event(1, "PLAN_READY", 5.0, {"plan": plan}),
+            _event(2, "SOURCE_DISPATCH_INTENT", 4.0, {"plan": plan["source"]}),
+            _event(3, "SOURCE_DISPATCH_RESULT", 4.1, {"accepted": True}),
+        ],
+    )
+
+    report = load_saved_cycle_report(tmp_path)
+
+    assert any(issue["code"] == "INVALID_INTERVAL" for issue in report["issues"])
+    assert report["latency"]["opening"][0]["preparation_seconds"] is None
+
+
+def test_report_bounds_detail_but_preserves_exact_source_counts_and_hashes(tmp_path: Path):
+    rows = [_event(index, "NOOP", float(index), {"unrelated_secret": "do-not-echo", "reason": "bounded"}) for index in range(1, 700)]
+    _write(tmp_path / "cycle.jsonl", rows)
+
+    report = load_saved_cycle_report(tmp_path)
+    source = report["source_files"][0]
+
+    assert source["record_count"] == 699
+    assert source["line_count"] == 699
+    assert source["detail_truncated"] is True
+    assert report["progression_total_events"] == 699
+    assert report["progression_detail_truncated"] is True
+    assert "unrelated_secret" not in json.dumps(report, ensure_ascii=False)

@@ -12,13 +12,167 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from collections import Counter, deque
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 import re
 from typing import Any, Iterable, Mapping, Sequence
 
+from .journal import sanitize
+
 
 REPORT_SCHEMA = "hcr-27-offline-cycle-report-v1"
 REPORT_BATCH_SCHEMA = "hcr-27-offline-cycle-report-batch-v1"
+
+# Reports must remain useful on an unexpectedly large or additive journal.
+# The complete input is still hashed and counted, while only a bounded factual
+# projection is retained for detail-oriented sections below.
+MAX_DETAIL_RECORDS = 512
+MAX_DETAIL_HEAD_RECORDS = 256
+MAX_PROJECTED_KEYS = 96
+MAX_PROJECTED_LIST_ITEMS = 64
+MAX_PROJECTED_STRING = 1024
+
+_PROJECTED_KEYS = frozenset(
+    {
+        "accepted",
+        "after",
+        "admission_before",
+        "account_index",
+        "active_orders",
+        "admission_reasons",
+        "attempt",
+        "attempt_index",
+        "at",
+        "authorized",
+        "available_balance",
+        "before",
+        "binding",
+        "book_observation_available",
+        "book_observed_at",
+        "boundary_books_available",
+        "classifications",
+        "client_order_index",
+        "closing",
+        "config",
+        "counterparty_account_index",
+        "counterparty_match_status",
+        "counterparty_matched_quantity",
+        "counterparty_client_order_index",
+        "counterparty_order_id",
+        "direction",
+        "dispatched",
+        "economic_findings",
+        "economic_status",
+        "error",
+        "event",
+        "fee",
+        "fee_rate",
+        "fee_total",
+        "filled_quantity",
+        "findings",
+        "from_attempt",
+        "gross_notional",
+        "history_complete",
+        "hold_seconds",
+        "incremental_margin_evidence",
+        "initial_quantity",
+        "journal_path",
+        "joint_match_quantity",
+        "joint_match_status",
+        "joint_trade_match",
+        "latency",
+        "market_id",
+        "market_metadata",
+        "market_symbol",
+        "maximum_attempts",
+        "named_counterparty_quantity",
+        "named_counterparty_status",
+        "next_attempt",
+        "operation_mode",
+        "order",
+        "order_book_observed_at",
+        "order_expiry_ms",
+        "order_id",
+        "order_type",
+        "outcome",
+        "paired_execution",
+        "paired_quantity",
+        "phase",
+        "plan",
+        "position_after",
+        "position_before",
+        "position_observed_at",
+        "priority_guard",
+        "priority_proof_admitted",
+        "priority_reason",
+        "priority_status",
+        "price",
+        "reason",
+        "receiver",
+        "receiver_account_index",
+        "receiver_filled_quantity",
+        "receiver_identity",
+        "receiver_order_id",
+        "receiver_position",
+        "receiver_public_level",
+        "receiver_recheck_transition",
+        "receipt",
+        "reconciliation_state",
+        "remaining_positions",
+        "remaining_quantity",
+        "retryable_pair",
+        "run_id",
+        "selection",
+        "side",
+        "signed_position",
+        "source",
+        "source_account_index",
+        "source_filled_quantity",
+        "source_identity",
+        "source_order_id",
+        "source_position",
+        "source_public_level",
+        "source_recheck_transition",
+        "status",
+        "time_in_force",
+        "trade_id",
+        "trade_ids",
+        "trades",
+        "tx_hash",
+        "unknown_reasons",
+        "upper_quantity",
+        "quantity",
+        "quantity_int",
+        "request_started_at",
+        "request_finished_at",
+        "response_code",
+        "observed_at",
+        "remaining_position_observed_at",
+        "source_side",
+        "source_price",
+        "external_better_price_volume",
+        "fallbacks",
+        "opening",
+        "receiver_dispatched",
+        "reconciliation_seconds",
+        "history_pages",
+    }
+)
+
+_OMIT_BULKY_KEYS = frozenset(
+    {
+        "dispatch_evidence",
+        "history_pages",
+        "better_price_evidence",
+        "same_price_evidence",
+        "active_orders",
+        "source_recheck",
+        "receiver_recheck",
+        "source_order",
+        "market_metadata",
+    }
+)
 
 
 class OfflineReportError(ValueError):
@@ -42,13 +196,34 @@ class _FileData:
     def __init__(self, path: Path, kind: str) -> None:
         self.path = path
         self.kind = kind
-        self.records: list[_Record] = []
+        self._head: list[_Record] = []
+        self._tail: deque[_Record] = deque(maxlen=MAX_DETAIL_RECORDS - MAX_DETAIL_HEAD_RECORDS)
+        self.record_count = 0
+        self.event_counts: Counter[str] = Counter()
+        self.detail_truncated = False
         self.issues: list[dict[str, Any]] = []
         self.line_count = 0
         self.sha256 = hashlib.sha256()
         self.run_id: str | None = None
         self.missing = False
         self.last_sequence: int | None = None
+
+    @property
+    def records(self) -> list[_Record]:
+        """Return bounded details while preserving deterministic head/tail order."""
+
+        return [*self._head, *self._tail]
+
+    def add_record(self, record: _Record) -> None:
+        self.record_count += 1
+        self.event_counts[record.event] += 1
+        if len(self._head) < MAX_DETAIL_HEAD_RECORDS:
+            self._head.append(record)
+            return
+        before = len(self._tail)
+        self._tail.append(record)
+        if before == len(self._tail) or self.record_count > MAX_DETAIL_RECORDS:
+            self.detail_truncated = True
 
     @property
     def status(self) -> str:
@@ -81,7 +256,10 @@ class _FileData:
             "kind": self.kind,
             "status": self.status,
             "line_count": self.line_count,
-            "record_count": len(self.records),
+            "record_count": self.record_count,
+            "event_counts": dict(sorted(self.event_counts.items())),
+            "detail_records_retained": len(self.records),
+            "detail_truncated": self.detail_truncated,
             "sha256": self.sha256.hexdigest(),
         }
         if self.run_id is not None:
@@ -101,6 +279,18 @@ def _finite_number(value: Any) -> float | None:
     return result if math.isfinite(result) else None
 
 
+def _decimal_value(value: Any) -> Decimal | None:
+    """Parse a finite Decimal without float conversion or underflow."""
+
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        result = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return result if result.is_finite() else None
+
+
 def _copy_json(value: Any) -> Any:
     """Copy only JSON values; journal input is already JSON but may be hostile."""
 
@@ -111,6 +301,46 @@ def _copy_json(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     return str(value)
+
+
+def _bounded_json(value: Any, *, key: str | None = None, depth: int = 0) -> Any:
+    """Sanitize and project JSON values to bounded, factual report detail."""
+
+    if depth > 8:
+        return "[DETAIL_TRUNCATED]"
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        for raw_key, item in list(value.items())[:MAX_PROJECTED_KEYS]:
+            item_key = str(raw_key)
+            if item_key in _OMIT_BULKY_KEYS:
+                continue
+            if item_key not in _PROJECTED_KEYS:
+                continue
+            result[item_key] = _bounded_json(sanitize(item, key=item_key), key=item_key, depth=depth + 1)
+        if len(value) > MAX_PROJECTED_KEYS:
+            result["_detail_keys_omitted"] = len(value) - MAX_PROJECTED_KEYS
+        return result
+    if isinstance(value, (list, tuple)):
+        items = list(value)
+        result = [_bounded_json(sanitize(item), depth=depth + 1) for item in items[:MAX_PROJECTED_LIST_ITEMS]]
+        if len(items) > MAX_PROJECTED_LIST_ITEMS:
+            result.append(f"[DETAIL_ITEMS_OMITTED:{len(items) - MAX_PROJECTED_LIST_ITEMS}]")
+        return result
+    if isinstance(value, str):
+        safe = sanitize(value, key=key)
+        if not isinstance(safe, str):
+            return safe
+        return safe if len(safe) <= MAX_PROJECTED_STRING else safe[:MAX_PROJECTED_STRING] + "…"
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _project_payload(event: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep allowlisted facts only; exact input identity remains in the file hash."""
+
+    projected = _bounded_json(payload)
+    return projected if isinstance(projected, dict) else {}
 
 
 def _read_jsonl(path: Path, kind: str) -> _FileData:
@@ -184,6 +414,9 @@ def _read_jsonl(path: Path, kind: str) -> _FileData:
                 if at_number is None:
                     data.issue("MISSING_FIELD", "at must be a finite number", line=line_number)
                     valid = False
+                elif at_number < 0:
+                    data.issue("INVALID_TIMESTAMP", "at must be non-negative", line=line_number)
+                    valid = False
                 if not isinstance(payload, Mapping):
                     data.issue("MISSING_FIELD", "payload must be a JSON object", line=line_number)
                     valid = False
@@ -209,13 +442,13 @@ def _read_jsonl(path: Path, kind: str) -> _FileData:
                         event=event,
                     )
                 data.last_sequence = sequence
-                data.records.append(
+                data.add_record(
                     _Record(
                         sequence=sequence,
                         run_id=run_id,
                         event=event,
                         at=at_number,
-                        payload=dict(_copy_json(payload)),
+                        payload=_project_payload(event, payload),
                         line=line_number,
                         path=str(path),
                         kind=kind,
@@ -381,7 +614,7 @@ def _plan_legs(plan: Mapping[str, Any]) -> Iterable[tuple[str, Mapping[str, Any]
 def _plan_records(files: Sequence[_FileData]) -> list[dict[str, Any]]:
     planned: list[dict[str, Any]] = []
     for data in files:
-        if data.kind not in {"opening", "closing"}:
+        if data.kind not in {"cycle", "opening", "closing"}:
             continue
         for record in data.records:
             payload = record.payload
@@ -408,18 +641,24 @@ def _plan_records(files: Sequence[_FileData]) -> list[dict[str, Any]]:
                         plan = {
                             "account_index": config.get(f"{leg}_account_index"),
                             "market_id": config.get("market_id"),
-                            "side": (
-                                config.get("direction")
-                                if leg == "source"
-                                else config.get("direction")
-                            ),
                             "quantity": config.get("quantity", payload.get("paired_quantity")),
                             "operation_mode": config.get("operation_mode"),
                         }
+                        # A cycle direction such as LONG is not an order side.
+                        # Keep a side only when the journal explicitly binds it.
+                        explicit_side = config.get(f"{leg}_side") or config.get(f"{leg}_order_side")
+                        if explicit_side is not None:
+                            plan["side"] = explicit_side
                         if any(value is not None for value in plan.values()):
                             planned.append(
                                 {
-                                    "phase": "opening" if record.event.startswith("OPENING") else "closing",
+                                    "phase": (
+                                        "opening"
+                                        if record.event.startswith("OPENING")
+                                        else "closing"
+                                        if record.event.startswith("CLOSING")
+                                        else _phase_for_event(record.event, data.kind)
+                                    ),
                                     "attempt": _attempt_from(payload),
                                     "leg": leg,
                                     "kind": "CYCLE_PLAN",
@@ -471,9 +710,12 @@ def _intent_actions(files: Sequence[_FileData]) -> list[dict[str, Any]]:
                     "source_file": str(data.path),
                     "source_event": event,
                     "intent_recorded": True,
+                    "possible_dispatch": True,
                     "status": "UNKNOWN_INCOMPLETE",
                     "accepted": None,
                     "response_observed": False,
+                    "confirmed_response": False,
+                    "dispatched": False,
                     "plan": _copy_json(payload.get("plan")) if isinstance(payload.get("plan"), Mapping) else None,
                 }
                 actions.append(action)
@@ -507,11 +749,13 @@ def _intent_actions(files: Sequence[_FileData]) -> list[dict[str, Any]]:
                 )
                 continue
             candidate["response_observed"] = True
+            candidate["confirmed_response"] = True
             candidate["response_at"] = record["at"]
             candidate["response_event"] = event
             if event.endswith("_UNKNOWN"):
                 candidate["status"] = "DISPATCHED_UNKNOWN"
                 candidate["accepted"] = None
+                candidate["dispatched"] = False
                 candidate["reason"] = payload.get("reason")
             else:
                 accepted = payload.get("accepted")
@@ -523,6 +767,7 @@ def _intent_actions(files: Sequence[_FileData]) -> list[dict[str, Any]]:
                     if accepted is False
                     else "RESPONSE_MALFORMED"
                 )
+                candidate["dispatched"] = accepted is True
                 if payload.get("error") is not None:
                     candidate["reason"] = payload.get("error")
             if isinstance(payload.get("order_id"), (str, int)):
@@ -542,49 +787,252 @@ def _receipt_from_complete(record: _Record) -> Mapping[str, Any] | None:
     return payload if isinstance(payload.get("source"), Mapping) or isinstance(payload.get("receiver"), Mapping) else None
 
 
-def _fill_records(files: Sequence[_FileData]) -> list[dict[str, Any]]:
-    fills: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str]] = set()
+def _issue(
+    code: str,
+    message: str,
+    *,
+    data: _FileData | None = None,
+    record: _Record | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    value: dict[str, Any] = {"code": code, "message": message}
+    if data is not None:
+        value["path"] = str(data.path)
+    if record is not None:
+        value["line"] = record.get("line")
+        value["event"] = record.event
+    value.update(extra)
+    return value
 
-    def add_trades(
+
+def _plan_context(files: Sequence[_FileData]) -> dict[tuple[str, int | None, str], Mapping[str, Any]]:
+    context: dict[tuple[str, int | None, str], Mapping[str, Any]] = {}
+    for item in _plan_records(files):
+        key = (str(item.get("phase")), item.get("attempt"), str(item.get("leg")))
+        plan = item.get("plan")
+        if isinstance(plan, Mapping):
+            context[key] = plan
+    return context
+
+
+def _execution_evidence(
+    files: Sequence[_FileData],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Collect bounded execution evidence and validate every trade binding."""
+
+    executions: list[dict[str, Any]] = []
+    fills: list[dict[str, Any]] = []
+    issues: list[dict[str, Any]] = []
+    plans = _plan_context(files)
+
+    def append_execution(
         phase: str,
         attempt: int | None,
         leg: str,
-        trades: Any,
+        value: Mapping[str, Any],
         data: _FileData,
         record: _Record,
+        *,
+        fallback: bool = False,
     ) -> None:
-        if not isinstance(trades, list):
+        order = value.get("order") if isinstance(value.get("order"), Mapping) else None
+        plan = plans.get((phase, attempt, leg), {})
+        account_index = value.get("account_index", plan.get("account_index"))
+        market_id = value.get("market_id", plan.get("market_id"))
+        if order is not None:
+            account_index = account_index if account_index is not None else order.get("account_index")
+            market_id = market_id if market_id is not None else order.get("market_id")
+        filled_quantity = value.get("filled_quantity")
+        if filled_quantity is None and order is not None:
+            filled_quantity = order.get("filled_quantity")
+        dispatched = value.get("dispatched") is True or order is not None
+        unknown_reasons = value.get("unknown_reasons")
+        if not isinstance(unknown_reasons, list):
+            unknown_reasons = []
+        history_present = "history_complete" in value
+        history_complete = value.get("history_complete") is True
+        status = order.get("status") if order is not None else None
+        terminal_statuses = {
+            "filled",
+            "canceled",
+            "cancelled",
+            "canceled-post-only",
+            "canceled-too-much-slippage",
+            "canceled-not-enough-liquidity",
+            "rejected",
+            "expired",
+        }
+        order_terminal = isinstance(status, str) and status.lower() in terminal_statuses
+        response_resolved = not dispatched and value.get("accepted") is False
+        resolved = bool(
+            history_complete
+            and not unknown_reasons
+            and (order_terminal or response_resolved or (not dispatched and _decimal_value(filled_quantity) in {None, Decimal(0)}))
+        )
+        execution: dict[str, Any] = {
+            "phase": phase,
+            "attempt": attempt,
+            "leg": leg,
+            "account_index": account_index,
+            "market_id": market_id,
+            "filled_quantity": filled_quantity,
+            "fee_total": value.get("fee_total"),
+            "history_complete": history_complete,
+            "history_present": history_present,
+            "resolved": resolved,
+            "dispatched": dispatched,
+            "accepted": value.get("accepted"),
+            "status": status,
+            "outcome": value.get("outcome", record.payload.get("outcome")),
+            "economic_status": value.get("economic_status", record.payload.get("economic_status")),
+            "unknown_reasons": [item for item in unknown_reasons if isinstance(item, str)],
+            "position_after": value.get("position_after"),
+            "after": _copy_json(value.get("after")) if isinstance(value.get("after"), Mapping) else None,
+            "observed_at": record.get("at"),
+            "order": _copy_json(order) if order is not None else None,
+            "trades": [],
+            "source_file": str(data.path),
+            "source_event": record.event,
+            "line": record.get("line"),
+            "fallback": fallback,
+            "guard_status": (
+                _last_record(data, "PRE_RECEIVER_GUARD").payload.get("status")
+                if _last_record(data, "PRE_RECEIVER_GUARD") is not None
+                else None
+            ),
+        }
+        executions.append(execution)
+
+        trades = value.get("trades")
+        if not isinstance(trades, list) or not trades:
             return
+        if not history_complete:
+            issues.append(
+                _issue(
+                    "INCOMPLETE_TRADE_HISTORY",
+                    "trade receipt is not confirmed by a complete history boundary",
+                    data=data,
+                    record=record,
+                    phase=phase,
+                    attempt=attempt,
+                    leg=leg,
+                )
+            )
+            return
+        valid_trades: list[dict[str, Any]] = []
+        trade_total = Decimal(0)
+        invalid = False
         for trade in trades:
             if not isinstance(trade, Mapping):
+                invalid = True
+                issues.append(_issue("UNBOUND_TRADE_EVIDENCE", "trade receipt is not an object", data=data, record=record, phase=phase, leg=leg))
                 continue
-            quantity = _finite_number(trade.get("quantity"))
-            if quantity is None or quantity <= 0:
+            trade_id = trade.get("trade_id")
+            order_id = trade.get("order_id")
+            quantity = _decimal_value(trade.get("quantity"))
+            price = _decimal_value(trade.get("price"))
+            if not isinstance(trade_id, (str, int)) or not str(trade_id).strip():
+                invalid = True
+                issues.append(_issue("UNBOUND_TRADE_EVIDENCE", "trade_id is missing", data=data, record=record, phase=phase, leg=leg))
                 continue
-            trade_id = str(trade.get("trade_id") or "")
-            order_id = str(trade.get("order_id") or "")
-            key = (phase, leg, trade_id or order_id or f"line-{record.get('line')}-{len(fills)}")
-            if key in seen:
+            if not isinstance(order_id, (str, int)) or not str(order_id).strip():
+                invalid = True
+                issues.append(_issue("UNBOUND_TRADE_EVIDENCE", "trade order_id is missing", data=data, record=record, phase=phase, leg=leg, trade_id=str(trade_id)))
                 continue
-            seen.add(key)
-            fills.append(
-                {
-                    "phase": phase,
-                    "attempt": attempt,
-                    "leg": leg,
-                    "trade_id": trade.get("trade_id"),
-                    "order_id": trade.get("order_id"),
-                    "account_index": trade.get("account_index"),
-                    "quantity": trade.get("quantity"),
-                    "price": trade.get("price"),
-                    "fee": trade.get("fee"),
-                    "observed_at": trade.get("observed_at"),
-                    "source_file": str(data.path),
-                    "source_event": record.event,
-                    "line": record.get("line"),
-                }
+            if quantity is None or quantity <= 0 or price is None:
+                invalid = True
+                issues.append(_issue("UNBOUND_TRADE_EVIDENCE", "trade quantity/price is not finite and positive", data=data, record=record, phase=phase, leg=leg, trade_id=str(trade_id)))
+                continue
+            if account_index is None and trade.get("account_index") is not None:
+                account_index = trade.get("account_index")
+                execution["account_index"] = account_index
+            if account_index is None or trade.get("account_index") is None or str(trade.get("account_index")) != str(account_index):
+                invalid = True
+                issues.append(_issue("UNBOUND_TRADE_EVIDENCE", "trade account does not bind to the reconciled leg", data=data, record=record, phase=phase, leg=leg, trade_id=str(trade_id)))
+                continue
+            expected_order_id = value.get("order_id") or (order.get("order_id") if order is not None else None)
+            if expected_order_id is not None and str(order_id) != str(expected_order_id):
+                invalid = True
+                issues.append(_issue("UNBOUND_TRADE_EVIDENCE", "trade order does not bind to the reconciled order", data=data, record=record, phase=phase, leg=leg, trade_id=str(trade_id)))
+                continue
+            trade_market = trade.get("market_id")
+            if market_id is not None and trade_market is not None and str(trade_market) != str(market_id):
+                invalid = True
+                issues.append(_issue("UNBOUND_TRADE_EVIDENCE", "trade market does not bind to the reconciled leg", data=data, record=record, phase=phase, leg=leg, trade_id=str(trade_id)))
+                continue
+            canonical = {
+                "account_index": str(trade.get("account_index")),
+                "order_id": str(order_id),
+                "quantity": str(quantity),
+                "price": str(price),
+                "counterparty_account_index": trade.get("counterparty_account_index"),
+                "counterparty_order_id": trade.get("counterparty_order_id"),
+            }
+            key = (phase, attempt, leg, str(trade_id))
+            previous = next((item for item in fills if item.get("_dedupe_key") == key), None)
+            if previous is not None:
+                previous_canonical = previous.get("_canonical")
+                if previous_canonical != canonical:
+                    issues.append(_issue("CONFLICTING_TRADE_ID", "repeated trade_id has contradictory binding evidence", data=data, record=record, phase=phase, leg=leg, trade_id=str(trade_id)))
+                    fills[:] = [item for item in fills if item.get("_dedupe_key") != key]
+                    invalid = True
+                continue
+            trade_total += quantity
+            fill = {
+                "phase": phase,
+                "attempt": attempt,
+                "leg": leg,
+                "trade_id": trade.get("trade_id"),
+                "order_id": trade.get("order_id"),
+                "account_index": trade.get("account_index"),
+                "market_id": trade.get("market_id", market_id),
+                "quantity": trade.get("quantity"),
+                "price": trade.get("price"),
+                "fee": trade.get("fee"),
+                "counterparty_account_index": trade.get("counterparty_account_index"),
+                "counterparty_order_id": trade.get("counterparty_order_id"),
+                "counterparty_client_order_index": trade.get("counterparty_client_order_index"),
+                "observed_at": trade.get("observed_at"),
+                "history_complete": True,
+                "source_file": str(data.path),
+                "source_event": record.event,
+                "line": record.get("line"),
+                "_dedupe_key": key,
+                "_canonical": canonical,
+            }
+            valid_trades.append(fill)
+            fills.append(fill)
+        reported = _decimal_value(filled_quantity)
+        if reported is not None and trade_total != reported:
+            invalid = True
+            issues.append(
+                _issue(
+                    "CONFLICTING_FILL_QUANTITY",
+                    "trade receipt total differs from reconciled filled_quantity",
+                    data=data,
+                    record=record,
+                    phase=phase,
+                    attempt=attempt,
+                    leg=leg,
+                    reported_quantity=str(reported),
+                    trade_quantity=str(trade_total),
+                )
             )
+        if invalid:
+            for fill in valid_trades:
+                if fill in fills:
+                    fills.remove(fill)
+            return
+        execution["trades"] = [
+            {key: value for key, value in fill.items() if not key.startswith("_")}
+            for fill in valid_trades
+        ]
+        # A complete, quantity-consistent trade history can resolve an
+        # execution even when an order snapshot was not retained in a compact
+        # synthetic receipt.  Paired SUCCESS still requires counterparty and
+        # phase identity proof below.
+        if valid_trades and execution.get("history_complete") is True:
+            execution["resolved"] = True
 
     for data in files:
         if data.kind in {"opening", "closing"}:
@@ -598,13 +1046,40 @@ def _fill_records(files: Sequence[_FileData]) -> list[dict[str, Any]]:
                 for leg in ("source", "receiver"):
                     value = receipt.get(leg)
                     if isinstance(value, Mapping):
-                        add_trades(data.kind, attempt, leg, value.get("trades"), data, record)
+                        append_execution(data.kind, attempt, leg, value, data, record)
         elif data.kind == "cycle":
+            fallback_evidence_attempts = {
+                _attempt_from(record.payload)
+                for record in data.records
+                if record.event == "FALLBACK_ATTEMPT_EVIDENCE"
+            }
             for record in data.records:
-                if record.event != "FALLBACK_ATTEMPT_EVIDENCE":
+                if record.event not in {"FALLBACK_ATTEMPT_EVIDENCE", "FALLBACK_RECONCILED"}:
                     continue
-                add_trades("fallback", _attempt_from(record.payload), "fallback", record.payload.get("trades"), data, record)
-    return fills
+                if record.event == "FALLBACK_RECONCILED" and _attempt_from(record.payload) in fallback_evidence_attempts:
+                    # FALLBACK_RECONCILED repeats the same attempt boundary;
+                    # the richer ATTEMPT_EVIDENCE row is authoritative.
+                    continue
+                append_execution(
+                    "fallback",
+                    _attempt_from(record.payload),
+                    "fallback",
+                    record.payload,
+                    data,
+                    record,
+                    fallback=True,
+                )
+    for fill in fills:
+        fill.pop("_dedupe_key", None)
+        fill.pop("_canonical", None)
+    return executions, fills, issues
+
+
+def _fill_records(files: Sequence[_FileData]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Return validated fills, execution evidence, and explicit evidence issues."""
+
+    executions, fills, issues = _execution_evidence(files)
+    return fills, executions, issues
 
 
 def _terminal_order_records(files: Sequence[_FileData]) -> list[dict[str, Any]]:
@@ -755,10 +1230,28 @@ def _event_progression(files: Sequence[_FileData]) -> list[dict[str, Any]]:
     return values
 
 
-def _duration(start: float | None, end: float | None) -> float | None:
+def _duration(
+    start: float | None,
+    end: float | None,
+    *,
+    issues: list[dict[str, Any]] | None = None,
+    label: str = "interval",
+) -> float | None:
     if start is None or end is None:
         return None
-    return max(0.0, end - start)
+    if end < start:
+        if issues is not None:
+            issues.append(
+                {
+                    "code": "INVALID_INTERVAL",
+                    "message": "journal interval has an end timestamp before its start timestamp",
+                    "interval": label,
+                    "start_at": start,
+                    "end_at": end,
+                }
+            )
+        return None
+    return end - start
 
 
 def _latency_measure(
@@ -768,8 +1261,21 @@ def _latency_measure(
     basis: str | None = None,
     unavailable_reason: str | None = None,
     overlap: bool = False,
+    issues: list[dict[str, Any]] | None = None,
+    label: str | None = None,
 ) -> dict[str, Any]:
     number = _finite_number(value)
+    if number is not None and number < 0:
+        if issues is not None:
+            issues.append(
+                {
+                    "code": "INVALID_INTERVAL",
+                    "message": "latency measurement is negative",
+                    "interval": label or name,
+                    "value": number,
+                }
+            )
+        number = None
     if number is None:
         return {
             "status": "UNAVAILABLE",
@@ -797,8 +1303,11 @@ def _latency_unknown(name: str, *, basis: str, reason: str) -> dict[str, Any]:
     }
 
 
-def _latency_reports(files: Sequence[_FileData]) -> tuple[dict[str, Any], list[str]]:
+def _latency_reports(
+    files: Sequence[_FileData],
+) -> tuple[dict[str, Any], list[str], list[dict[str, Any]]]:
     reports: dict[str, list[dict[str, Any]]] = {"opening": [], "closing": [], "fallback": []}
+    interval_issues: list[dict[str, Any]] = []
     notes: list[str] = [
         "Latency intervals are local journal/adapter observations; no network, exchange, signing, or sequencer attribution is inferred.",
         "coalesced_pre_receiver_window_seconds, concurrent_pre_receiver_checks_seconds, and public_book_read_seconds overlap and must not be summed.",
@@ -833,18 +1342,18 @@ def _latency_reports(files: Sequence[_FileData]) -> tuple[dict[str, Any], list[s
         )
         values: dict[str, dict[str, Any]] = {}
         quote_age = latency.get("source_quote_age_seconds", latency.get("quote_age_to_source_dispatch_seconds"))
-        values["quote_age"] = _latency_measure("quote_age", quote_age, basis="latency.source_quote_age_seconds")
+        values["quote_age"] = _latency_measure("quote_age", quote_age, basis="latency.source_quote_age_seconds", issues=interval_issues, label="quote_age")
         preparation = latency.get("paired_preparation_seconds")
         if preparation is None and plan_record is not None and source_intent is not None:
-            preparation = _duration(plan_record["at"], source_intent["at"])
+            preparation = _duration(plan_record["at"], source_intent["at"], issues=interval_issues, label="preparation")
             values["preparation"] = _latency_measure(
-                "preparation", preparation, basis="PLAN_READY to SOURCE_DISPATCH_INTENT journal interval"
+                "preparation", preparation, basis="PLAN_READY to SOURCE_DISPATCH_INTENT journal interval", issues=interval_issues, label="preparation"
             )
         else:
-            values["preparation"] = _latency_measure("preparation", preparation, basis="latency.paired_preparation_seconds")
+            values["preparation"] = _latency_measure("preparation", preparation, basis="latency.paired_preparation_seconds", issues=interval_issues, label="preparation")
         source_ack = latency.get("source_submit_ack_seconds")
         if source_ack is None and source_intent is not None and source_result is not None:
-            source_ack = _duration(source_intent["at"], source_result["at"])
+            source_ack = _duration(source_intent["at"], source_result["at"], issues=interval_issues, label="source_dispatch_ack")
         values["source_dispatch_ack"] = (
             _latency_unknown(
                 "source_dispatch_ack",
@@ -853,14 +1362,14 @@ def _latency_reports(files: Sequence[_FileData]) -> tuple[dict[str, Any], list[s
             )
             if source_dispatch_unknown
             else _latency_measure(
-                "source_dispatch_ack", source_ack, basis="latency.source_submit_ack_seconds or intent/result journal interval"
+                "source_dispatch_ack", source_ack, basis="latency.source_submit_ack_seconds or intent/result journal interval", issues=interval_issues, label="source_dispatch_ack"
             )
         )
         source_visibility = latency.get("source_visibility_seconds")
         if source_visibility is None and source_result is not None and source_observed is not None:
-            source_visibility = _duration(source_result["at"], source_observed["at"])
+            source_visibility = _duration(source_result["at"], source_observed["at"], issues=interval_issues, label="source_visibility")
         values["source_visibility"] = _latency_measure(
-            "source_visibility", source_visibility, basis="latency.source_visibility_seconds or result/observation interval"
+            "source_visibility", source_visibility, basis="latency.source_visibility_seconds or result/observation interval", issues=interval_issues, label="source_visibility"
         )
         receiver_admission = latency.get("receiver_admission_seconds")
         if receiver_admission is None and guard is not None:
@@ -868,16 +1377,20 @@ def _latency_reports(files: Sequence[_FileData]) -> tuple[dict[str, Any], list[s
             receiver_admission = _duration(
                 _finite_number(gp.get("request_started_at")),
                 _finite_number(gp.get("request_finished_at")),
+                issues=interval_issues,
+                label="receiver_admission",
             )
         values["receiver_admission"] = _latency_measure(
             "receiver_admission",
             receiver_admission,
             basis="latency.receiver_admission_seconds or PRE_RECEIVER_GUARD request interval",
             unavailable_reason="no complete PRE_RECEIVER_GUARD request interval was persisted",
+            issues=interval_issues,
+            label="receiver_admission",
         )
         receiver_ack = latency.get("receiver_submit_ack_seconds")
         if receiver_ack is None and receiver_intent is not None and receiver_result is not None:
-            receiver_ack = _duration(receiver_intent["at"], receiver_result["at"])
+            receiver_ack = _duration(receiver_intent["at"], receiver_result["at"], issues=interval_issues, label="receiver_dispatch_ack")
         values["receiver_dispatch_ack"] = (
             _latency_unknown(
                 "receiver_dispatch_ack",
@@ -890,16 +1403,20 @@ def _latency_reports(files: Sequence[_FileData]) -> tuple[dict[str, Any], list[s
                 receiver_ack,
                 basis="latency.receiver_submit_ack_seconds or intent/result journal interval",
                 unavailable_reason="receiver dispatch was not recorded or its response boundary is absent",
+                issues=interval_issues,
+                label="receiver_dispatch_ack",
             )
         )
         receiver_visibility = latency.get("receiver_visibility_seconds", latency.get("receiver_fill_observation_seconds"))
         if receiver_visibility is None and receiver_result is not None and receiver_observed is not None:
-            receiver_visibility = _duration(receiver_result["at"], receiver_observed["at"])
+            receiver_visibility = _duration(receiver_result["at"], receiver_observed["at"], issues=interval_issues, label="receiver_visibility")
         values["receiver_visibility"] = _latency_measure(
             "receiver_visibility",
             receiver_visibility,
             basis="latency.receiver_fill_observation_seconds or result/observation interval",
             unavailable_reason="receiver order was not dispatched or terminal observation is absent",
+            issues=interval_issues,
+            label="receiver_visibility",
         )
         reconciliation = latency.get("reconciliation_seconds")
         values["reconciliation"] = _latency_measure(
@@ -907,6 +1424,8 @@ def _latency_reports(files: Sequence[_FileData]) -> tuple[dict[str, Any], list[s
             reconciliation,
             basis="latency.reconciliation_seconds",
             unavailable_reason="COMPLETE latency did not contain reconciliation_seconds",
+            issues=interval_issues,
+            label="reconciliation",
         )
         item: dict[str, Any] = {
             "phase": data.kind,
@@ -951,22 +1470,22 @@ def _latency_reports(files: Sequence[_FileData]) -> tuple[dict[str, Any], list[s
         complete = _last_record(cycle_data, "CYCLE_COMPLETE")
         if first and selection:
             cycle_latency["phase_intervals"].append(
-                {"phase": "selection", "start_at": first["at"], "end_at": selection["at"], "seconds": _duration(first["at"], selection["at"]), "basis": "CYCLE_STARTED to SELECTION_PROVED"}
+                {"phase": "selection", "start_at": first["at"], "end_at": selection["at"], "seconds": _duration(first["at"], selection["at"], issues=interval_issues, label="selection"), "basis": "CYCLE_STARTED to SELECTION_PROVED"}
             )
         if selection and boundary:
             cycle_latency["phase_intervals"].append(
-                {"phase": "preparation", "start_at": selection["at"], "end_at": boundary["at"], "seconds": _duration(selection["at"], boundary["at"]), "basis": "SELECTION_PROVED to FIRST_MUTATION_BOUNDARY; retries are one interval"}
+                {"phase": "preparation", "start_at": selection["at"], "end_at": boundary["at"], "seconds": _duration(selection["at"], boundary["at"], issues=interval_issues, label="cycle_preparation"), "basis": "SELECTION_PROVED to FIRST_MUTATION_BOUNDARY; retries are one interval"}
             )
         hold = _first_record(cycle_data, "HOLD_ANCHORED")
         closing_plan = _first_record(cycle_data, "CLOSING_PLAN_READY")
         closing_complete = _last_record(cycle_data, "CLOSING_COMPLETE")
         if hold and closing_plan:
             cycle_latency["phase_intervals"].append(
-                {"phase": "hold", "start_at": hold["at"], "end_at": closing_plan["at"], "seconds": _duration(hold["at"], closing_plan["at"]), "basis": "HOLD_ANCHORED to CLOSING_PLAN_READY"}
+                {"phase": "hold", "start_at": hold["at"], "end_at": closing_plan["at"], "seconds": _duration(hold["at"], closing_plan["at"], issues=interval_issues, label="hold"), "basis": "HOLD_ANCHORED to CLOSING_PLAN_READY"}
             )
         if closing_plan and closing_complete:
             cycle_latency["phase_intervals"].append(
-                {"phase": "closing", "start_at": closing_plan["at"], "end_at": closing_complete["at"], "seconds": _duration(closing_plan["at"], closing_complete["at"]), "basis": "CLOSING_PLAN_READY to CLOSING_COMPLETE"}
+                {"phase": "closing", "start_at": closing_plan["at"], "end_at": closing_complete["at"], "seconds": _duration(closing_plan["at"], closing_complete["at"], issues=interval_issues, label="closing"), "basis": "CLOSING_PLAN_READY to CLOSING_COMPLETE"}
             )
         fallback_intent = _first_record(cycle_data, "FALLBACK_DISPATCH_INTENT")
         fallback_end = None
@@ -976,14 +1495,21 @@ def _latency_reports(files: Sequence[_FileData]) -> tuple[dict[str, Any], list[s
                 fallback_end = candidate
         if fallback_intent and fallback_end:
             cycle_latency["phase_intervals"].append(
-                {"phase": "fallback", "start_at": fallback_intent["at"], "end_at": fallback_end["at"], "seconds": _duration(fallback_intent["at"], fallback_end["at"]), "basis": "first fallback intent to last durable fallback evidence"}
+                {"phase": "fallback", "start_at": fallback_intent["at"], "end_at": fallback_end["at"], "seconds": _duration(fallback_intent["at"], fallback_end["at"], issues=interval_issues, label="fallback"), "basis": "first fallback intent to last durable fallback evidence"}
             )
         if complete is not None:
             cycle_latency["terminal_at"] = complete["at"]
-    return {"cycle": cycle_latency, **reports}, notes
+    return {"cycle": cycle_latency, **reports}, notes, interval_issues
 
 
-def _positions_from_cycle(cycle: _FileData | None) -> tuple[dict[str, Any], list[str]]:
+def _positions_from_cycle(
+    cycle: _FileData | None,
+    files: Sequence[_FileData],
+    executions: Sequence[Mapping[str, Any]],
+    issues: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any], list[str]]:
+    """Classify inventory only after terminal child and causal position proof."""
+
     notes: list[str] = []
     if cycle is None:
         return {
@@ -993,37 +1519,151 @@ def _positions_from_cycle(cycle: _FileData | None) -> tuple[dict[str, Any], list
             "observed_at": {"source": None, "receiver": None},
             "proof": None,
         }, ["cycle journal was not available for inventory proof"]
+
     complete = _last_record(cycle, "CYCLE_COMPLETE")
     payload = {} if complete is None else complete.payload
     positions = payload.get("remaining_positions")
     observed = payload.get("remaining_position_observed_at")
     if not isinstance(positions, Mapping):
-        observations = [record for record in cycle.records if record.event == "FALLBACK_POST_ATTEMPT_ACCOUNT_OBSERVATION"]
-        if observations:
-            last = observations[-1].payload
-            source = last.get("source") if isinstance(last.get("source"), Mapping) else {}
-            receiver = last.get("receiver") if isinstance(last.get("receiver"), Mapping) else {}
-            positions = {"source": source.get("signed_position"), "receiver": receiver.get("signed_position")}
-            observed = {"source": source.get("observed_at"), "receiver": receiver.get("observed_at")}
-        else:
-            positions = {}
-            observed = {}
-    source = positions.get("source") if isinstance(positions, Mapping) else None
-    receiver = positions.get("receiver") if isinstance(positions, Mapping) else None
-    source_at = observed.get("source") if isinstance(observed, Mapping) else None
-    receiver_at = observed.get("receiver") if isinstance(observed, Mapping) else None
-    source_number = _finite_number(source)
-    receiver_number = _finite_number(receiver)
+        positions = {}
+    if not isinstance(observed, Mapping):
+        observed = {}
+    source = positions.get("source")
+    receiver = positions.get("receiver")
+    source_at = observed.get("source")
+    receiver_at = observed.get("receiver")
+    source_decimal = _decimal_value(source)
+    receiver_decimal = _decimal_value(receiver)
+    source_time = _finite_number(source_at)
+    receiver_time = _finite_number(receiver_at)
+
+    account_roles: dict[str, str] = {}
+    binding = payload.get("binding") if isinstance(payload.get("binding"), Mapping) else {}
+    for role in ("source", "receiver"):
+        value = binding.get(f"{role}_account_index")
+        if value is not None:
+            account_roles[str(value)] = role
+    for record in cycle.records:
+        candidate = record.payload.get("binding")
+        if not isinstance(candidate, Mapping):
+            continue
+        for role in ("source", "receiver"):
+            value = candidate.get(f"{role}_account_index")
+            if value is not None:
+                account_roles[str(value)] = role
+    for candidate in (payload.get("opening"), payload.get("closing")):
+        if not isinstance(candidate, Mapping):
+            continue
+        plan = candidate.get("plan") if isinstance(candidate.get("plan"), Mapping) else {}
+        for role in ("source", "receiver"):
+            leg = plan.get(role)
+            if isinstance(leg, Mapping) and leg.get("account_index") is not None:
+                account_roles[str(leg["account_index"])] = role
+
+    observations: dict[str, list[tuple[float, Decimal]]] = {"source": [], "receiver": []}
+    for execution in executions:
+        at = _finite_number(execution.get("observed_at"))
+        if at is None:
+            continue
+        position_after = _decimal_value(execution.get("position_after"))
+        leg = execution.get("leg")
+        if leg in observations and position_after is not None:
+            observations[str(leg)].append((at, position_after))
+        after = execution.get("after")
+        if isinstance(after, Mapping):
+            labelled = any(isinstance(after.get(role), Mapping) for role in ("source", "receiver"))
+            if labelled:
+                for role in ("source", "receiver"):
+                    account = after.get(role)
+                    if isinstance(account, Mapping):
+                        value = _decimal_value(account.get("signed_position"))
+                        observed_at = _finite_number(account.get("observed_at"))
+                        if value is not None and observed_at is not None:
+                            observations[role].append((observed_at, value))
+            else:
+                role = account_roles.get(str(execution.get("account_index")))
+                value = _decimal_value(after.get("signed_position"))
+                observed_at = _finite_number(after.get("observed_at"))
+                if role is not None and value is not None and observed_at is not None:
+                    observations[role].append((observed_at, value))
+        if execution.get("fallback"):
+            role = account_roles.get(str(execution.get("account_index")))
+            value = _decimal_value(execution.get("position_after"))
+            if role is not None and value is not None:
+                observations[role].append((at, value))
+
+    # Child COMPLETE rows are the authoritative causal observations for their
+    # account roles.  A fallback's account payload is already role-labelled.
+    child_terminal_missing = any(issue.get("code") in {"CHILD_TERMINAL_MISSING", "REFERENCED_CHILD_MISSING"} for issue in issues)
+    structural_uncertainty = any(
+        issue.get("code")
+        in {
+            "MALFORMED_JSON",
+            "INVALID_ENCODING",
+            "TRUNCATED_LINE",
+            "SEQUENCE_GAP",
+            "CONFLICTING_SEQUENCE",
+            "CONFLICTING_RUN_ID",
+            "CONFLICTING_ORDER_EVIDENCE",
+            "CONFLICTING_TRADE_ID",
+            "CONFLICTING_FILL_QUANTITY",
+            "UNBOUND_TRADE_EVIDENCE",
+            "INCOMPLETE_TRADE_HISTORY",
+            "INVALID_INTERVAL",
+        }
+        for issue in issues
+    )
+    child_has_intent = any(
+        data.kind in {"opening", "closing"}
+        and any(record.event.endswith("_DISPATCH_INTENT") for record in data.records)
+        for data in files
+    )
+    fallback_has_intent = any(
+        data.kind == "cycle" and any(record.event == "FALLBACK_DISPATCH_INTENT" for record in data.records)
+        for data in files
+    )
+    child_resolution = all(bool(execution.get("resolved")) for execution in executions)
+    if fallback_has_intent and not any(bool(execution.get("fallback")) for execution in executions):
+        child_resolution = False
+    execution_evidence_present = all(bool(observations[role]) for role in ("source", "receiver"))
+    observed_agrees = True
+    for role, expected in (("source", source_decimal), ("receiver", receiver_decimal)):
+        if expected is None:
+            observed_agrees = False
+            continue
+        latest = max(observations[role], key=lambda item: item[0]) if observations[role] else None
+        if latest is None or latest[1] != expected:
+            observed_agrees = False
+    exact_zero = source_decimal == Decimal(0) and receiver_decimal == Decimal(0)
+    valid_times = source_time is not None and receiver_time is not None and source_time >= 0 and receiver_time >= 0
+    parent_unknown = str(payload.get("outcome", "")).upper() == "UNKNOWN"
     terminal_proof = complete is not None and isinstance(payload.get("remaining_positions"), Mapping)
-    if not terminal_proof or source_at is None or receiver_at is None:
+    causal_latest = {
+        role: (
+            {"observed_at": max(observations[role], key=lambda item: item[0])[0], "position": str(max(observations[role], key=lambda item: item[0])[1])}
+            if observations[role]
+            else None
+        )
+        for role in ("source", "receiver")
+    }
+
+    if source_decimal is None or receiver_decimal is None:
         status = "UNKNOWN"
-        notes.append("flat-looking positions are not promoted without CYCLE_COMPLETE and both observation timestamps")
-    elif source_number == 0 and receiver_number == 0:
+        notes.append("inventory quantities are not finite Decimal values")
+    elif not terminal_proof or not valid_times:
+        status = "UNKNOWN"
+        notes.append("flat-looking positions are not promoted without CYCLE_COMPLETE and both valid observation timestamps")
+    elif parent_unknown or child_terminal_missing or structural_uncertainty or (child_has_intent and not child_resolution):
+        status = "UNKNOWN"
+        notes.append("inventory proof is unknown because a child execution boundary or evidence validation is unresolved")
+    elif not execution_evidence_present or not observed_agrees:
+        status = "UNKNOWN"
+        notes.append("parent position snapshot does not causally agree with terminal child/fallback account observations")
+    elif exact_zero:
         status = "CONFIRMED_FLAT"
-    elif source_number is not None or receiver_number is not None:
-        status = "OPEN_INVENTORY"
     else:
-        status = "UNKNOWN"
+        status = "OPEN_INVENTORY"
+
     return {
         "status": status,
         "source": source,
@@ -1033,51 +1673,55 @@ def _positions_from_cycle(cycle: _FileData | None) -> tuple[dict[str, Any], list
             "event": "CYCLE_COMPLETE" if terminal_proof else None,
             "source_position_present": source is not None,
             "receiver_position_present": receiver is not None,
-            "observation_times_present": source_at is not None and receiver_at is not None,
+            "observation_times_present": valid_times,
+            "exact_decimal_zero": exact_zero,
+            "terminal_child_resolution": child_resolution,
+            "causal_position_observations_present": execution_evidence_present,
+            "causal_position_observations_agree": observed_agrees,
+            "causal_latest": causal_latest,
+            "parent_outcome": payload.get("outcome"),
         },
     }, notes
 
 
-def _economics(files: Sequence[_FileData], fills: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+def _economics(
+    executions: Sequence[Mapping[str, Any]],
+    fills: Sequence[Mapping[str, Any]],
+    evidence_issues: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
     fee_unknown: list[str] = []
     fee_values: list[Any] = []
-    proven_no_execution = False
-    statuses: list[str] = []
-    for data in files:
-        for record in data.records:
-            if record.event not in {"COMPLETE", "FALLBACK_ATTEMPT_EVIDENCE", "FALLBACK_RECONCILED", "CYCLE_COMPLETE"}:
-                continue
-            payload = record.payload
-            for candidate in (payload, payload.get("receipt")):
-                if not isinstance(candidate, Mapping):
-                    continue
-                status = candidate.get("economic_status")
-                if isinstance(status, str):
-                    statuses.append(status)
-                if status == "PROVEN" and not fills:
-                    proven_no_execution = True
-                fee_total = candidate.get("fee_total")
-                if fee_total is not None:
-                    fee_values.append(fee_total)
-                for leg in ("source", "receiver"):
-                    value = candidate.get(leg)
-                    if isinstance(value, Mapping):
-                        if value.get("fee_total") is not None:
-                            fee_values.append(value.get("fee_total"))
-                        if value.get("fee_total") is None and _finite_number(value.get("filled_quantity")) not in (None, 0.0):
-                            fee_unknown.append(f"{data.path}: {leg} fee_total is missing for a filled leg")
-                        for trade in value.get("trades", ()) if isinstance(value.get("trades"), list) else ():
-                            if isinstance(trade, Mapping) and trade.get("fee") is None:
-                                fee_unknown.append(f"{data.path}: {leg} trade fee is missing")
-                if isinstance(payload.get("trades"), list):
-                    for trade in payload["trades"]:
-                        if (
-                            isinstance(trade, Mapping)
-                            and trade.get("fee") is None
-                            and _finite_number(trade.get("quantity")) not in (None, 0.0)
-                        ):
-                            fee_unknown.append(f"{data.path}: fallback trade fee is missing")
-    if fee_unknown:
+    execution_statuses: list[str] = []
+    unresolved: list[str] = []
+    for execution in executions:
+        status = execution.get("economic_status")
+        if isinstance(status, str):
+            execution_statuses.append(status)
+        if execution.get("fee_total") is not None:
+            fee_values.append(execution.get("fee_total"))
+        quantity = _decimal_value(execution.get("filled_quantity"))
+        if quantity is not None and quantity > 0:
+            if execution.get("fee_total") is None:
+                fee_unknown.append(f"{execution.get('source_file')}: {execution.get('leg')} fee_total is missing for a filled leg")
+            for trade in execution.get("trades", ()) if isinstance(execution.get("trades"), list) else ():
+                if isinstance(trade, Mapping) and trade.get("fee") is None:
+                    fee_unknown.append(f"{execution.get('source_file')}: {execution.get('leg')} trade fee is missing")
+        if not execution.get("resolved"):
+            unresolved.append(
+                f"{execution.get('source_file')}: {execution.get('phase')} {execution.get('leg')} execution history is unresolved"
+            )
+    if evidence_issues:
+        unresolved.extend(str(issue.get("message")) for issue in evidence_issues[:20])
+
+    if unresolved:
+        fees = {
+            "status": "UNKNOWN",
+            "complete": False,
+            "reason": "execution history or receipt binding is unresolved",
+            "missing_evidence": list(dict.fromkeys(unresolved))[:20],
+            "known_fee_totals": fee_values,
+        }
+    elif fee_unknown:
         fees = {
             "status": "UNKNOWN",
             "complete": False,
@@ -1085,20 +1729,20 @@ def _economics(files: Sequence[_FileData], fills: Sequence[Mapping[str, Any]]) -
             "missing_evidence": list(dict.fromkeys(fee_unknown)),
             "known_fee_totals": fee_values,
         }
-    elif proven_no_execution or (not fills and any(status == "PROVEN" for status in statuses)):
+    elif fills:
         fees = {
             "status": "PROVEN",
             "complete": True,
-            "reason": "journal proves no execution fee was due for the recorded no-fill legs",
+            "reason": "complete fee receipts are present for every validated fill",
             "missing_evidence": [],
             "known_fee_totals": fee_values,
         }
-    elif fills:
+    elif executions and execution_statuses and all(status == "PROVEN" for status in execution_statuses):
         fees = {
-            "status": "UNKNOWN",
-            "complete": False,
-            "reason": "confirmed fills exist but complete fee evidence is absent",
-            "missing_evidence": ["fee completeness is not proven for every confirmed fill"],
+            "status": "PROVEN",
+            "complete": True,
+            "reason": "terminal history proves no execution fee was due for the recorded no-fill legs",
+            "missing_evidence": [],
             "known_fee_totals": fee_values,
         }
     else:
@@ -1106,7 +1750,7 @@ def _economics(files: Sequence[_FileData], fills: Sequence[Mapping[str, Any]]) -
             "status": "UNKNOWN",
             "complete": False,
             "reason": "journal does not prove fee completeness",
-            "missing_evidence": ["no explicit economic proof"],
+            "missing_evidence": ["no resolved execution fee proof"],
             "known_fee_totals": fee_values,
         }
     return {
@@ -1119,113 +1763,295 @@ def _economics(files: Sequence[_FileData], fills: Sequence[Mapping[str, Any]]) -
 
 
 def _paired_execution(
-    files: Sequence[_FileData],
     actions: Sequence[Mapping[str, Any]],
     fills: Sequence[Mapping[str, Any]],
+    executions: Sequence[Mapping[str, Any]],
+    evidence_issues: Sequence[Mapping[str, Any]],
+    *,
+    parent_payload: Mapping[str, Any] | None = None,
+    parent_complete: bool = False,
 ) -> dict[str, Any]:
-    cycle = next((item for item in files if item.kind == "cycle"), None)
-    parent_complete = _last_record(cycle, "CYCLE_COMPLETE") if cycle else None
-    parent_payload = {} if parent_complete is None else parent_complete.payload
     explicit: str | None = None
     reasons: list[str] = []
+    parent_payload = parent_payload or {}
     for candidate in (parent_payload, parent_payload.get("opening"), parent_payload.get("closing")):
         if isinstance(candidate, Mapping):
             value = candidate.get("paired_execution")
             if isinstance(value, str):
                 explicit = value
-                break
             reasons.extend(_reason_values(candidate))
-    receiver_actions = [item for item in actions if item.get("leg") == "receiver" and item.get("phase") in {"opening", "closing"}]
-    receiver_dispatched = bool(receiver_actions)
+    receiver_actions = [
+        item for item in actions if item.get("leg") == "receiver" and item.get("phase") in {"opening", "closing"}
+    ]
+    receiver_possible_dispatch = bool(receiver_actions)
+    receiver_response_observed = any(item.get("response_observed") is True for item in receiver_actions)
+    receiver_dispatched = any(item.get("dispatched") is True for item in receiver_actions)
     source_fills = [item for item in fills if item.get("leg") == "source" and item.get("phase") in {"opening", "closing"}]
     receiver_fills = [item for item in fills if item.get("leg") == "receiver" and item.get("phase") in {"opening", "closing"}]
     guard_statuses: list[str] = []
-    for data in files:
-        if data.kind in {"opening", "closing"}:
-            for record in _records(data, "PRE_RECEIVER_GUARD"):
-                status = record.payload.get("status")
-                if isinstance(status, str):
-                    guard_statuses.append(status)
-                reasons.extend(_reason_values(record.payload))
-    if explicit:
-        status = explicit
-    elif source_fills and receiver_fills:
-        status = "SUCCESS" if not guard_statuses or "PROVED" in guard_statuses else "UNKNOWN"
-    elif receiver_dispatched and receiver_fills and not source_fills:
-        status = "FAILED"
+    for execution in executions:
+        if execution.get("phase") not in {"opening", "closing"}:
+            continue
+        # Guard status is preserved in the child COMPLETE payload when it is
+        # present; it is not used as a substitute for trade proof.
+        guard_status = execution.get("guard_status")
+        if isinstance(guard_status, str):
+            guard_statuses.append(guard_status)
+
+    def phase_proof(phase: str) -> tuple[bool, str, Decimal | None]:
+        phase_source = [item for item in source_fills if item.get("phase") == phase]
+        phase_receiver = [item for item in receiver_fills if item.get("phase") == phase]
+        source_total = sum((_decimal_value(item.get("quantity")) or Decimal(0) for item in phase_source), Decimal(0))
+        receiver_total = sum((_decimal_value(item.get("quantity")) or Decimal(0) for item in phase_receiver), Decimal(0))
+        source_execs = [item for item in executions if item.get("phase") == phase and item.get("leg") == "source"]
+        receiver_execs = [item for item in executions if item.get("phase") == phase and item.get("leg") == "receiver"]
+        if not phase_source or not phase_receiver:
+            return False, "both source and receiver validated fills are required", None
+        if source_total != receiver_total:
+            return False, "source and receiver confirmed quantities are unequal", None
+        if not source_execs or not receiver_execs or not all(item.get("resolved") for item in (*source_execs, *receiver_execs)):
+            return False, "source/receiver terminal execution evidence is unresolved", None
+        if not all(
+            isinstance(item.get("order"), Mapping)
+            and str(item["order"].get("status", "")).lower()
+            in {"filled", "canceled", "cancelled", "rejected", "expired", "canceled-post-only", "canceled-too-much-slippage", "canceled-not-enough-liquidity"}
+            for item in (*source_execs, *receiver_execs)
+        ):
+            return False, "source/receiver terminal order snapshots are incomplete", None
+        if not all(str(item.get("outcome", "")).upper() == "SUCCESS" for item in (*source_execs, *receiver_execs)):
+            return False, "source/receiver phase outcomes do not both prove SUCCESS", None
+        source_accounts = {str(item.get("account_index")) for item in source_execs if item.get("account_index") is not None}
+        receiver_accounts = {str(item.get("account_index")) for item in receiver_execs if item.get("account_index") is not None}
+        if not source_accounts or not receiver_accounts:
+            return False, "source/receiver account identities are incomplete", None
+        for item in (*phase_source, *phase_receiver):
+            cp_account = item.get("counterparty_account_index")
+            cp_order = item.get("counterparty_order_id")
+            if cp_account is None or cp_order is None:
+                return False, "trade counterparty identity is incomplete", None
+            if item.get("leg") == "source" and str(cp_account) not in receiver_accounts:
+                return False, "source trade counterparty is foreign to receiver account", None
+            if item.get("leg") == "receiver" and str(cp_account) not in source_accounts:
+                return False, "receiver trade counterparty is foreign to source account", None
+        source_trade_ids = {str(item.get("trade_id")) for item in phase_source}
+        receiver_trade_ids = {str(item.get("trade_id")) for item in phase_receiver}
+        if source_trade_ids != receiver_trade_ids:
+            return False, "source/receiver trade identity sets do not agree", None
+        return True, "independently validated source/receiver fills, identities, and terminal phase", source_total
+
+    phase_results: list[dict[str, Any]] = []
+    proven_phases: list[str] = []
+    for phase in ("opening", "closing"):
+        proven, reason, quantity = phase_proof(phase)
+        phase_results.append({"phase": phase, "status": "PROVEN" if proven else "NOT_PROVEN", "quantity": None if quantity is None else str(quantity), "reason": reason})
+        if proven:
+            proven_phases.append(phase)
+
+    issue_codes = {str(item.get("code")) for item in evidence_issues}
+    if proven_phases:
+        status = "SUCCESS"
+        reasons.append("paired execution is independently proven from complete source/receiver trade identities")
+    elif explicit == "SUCCESS":
+        status = "UNKNOWN"
+        reasons.append("explicit SUCCESS was not independently re-proven from complete paired fills")
+    elif receiver_fills and not source_fills:
+        status = "FAILED" if not issue_codes and parent_complete else "UNKNOWN"
         reasons.append("receiver execution was confirmed without a paired source fill")
-    elif not receiver_dispatched and guard_statuses:
-        status = "FAILED"
-        reasons.append("receiver was never dispatched after the pre-receiver guard")
+    elif source_fills and not receiver_fills:
+        status = "FAILED" if receiver_dispatched is False and not issue_codes and parent_complete else "UNKNOWN"
+        reasons.append("source execution was confirmed without a paired receiver fill")
     elif not parent_complete:
         status = "UNKNOWN"
         reasons.append("cycle has no durable terminal classification")
+    elif not receiver_dispatched and guard_statuses and not issue_codes:
+        status = "FAILED"
+        reasons.append("receiver was not confirmed dispatched after the pre-receiver guard")
     else:
         status = "UNKNOWN"
         reasons.append("journals do not prove a paired execution classification")
     if not reasons:
-        reasons.append("paired execution classification is taken from explicit result evidence or conservative leg comparison")
+        reasons.append("paired execution requires positive source/receiver identity and quantity proof")
     return {
         "status": status,
+        "explicit_status": explicit,
+        "receiver_possible_dispatch": receiver_possible_dispatch,
+        "receiver_response_observed": receiver_response_observed,
         "receiver_dispatched": receiver_dispatched,
+        "receiver_fill_observed": bool(receiver_fills),
         "source_confirmed_fill_count": len(source_fills),
         "receiver_confirmed_fill_count": len(receiver_fills),
         "guard_statuses": list(dict.fromkeys(guard_statuses)),
+        "phase_proof": phase_results,
         "reasons": list(dict.fromkeys(reasons))[:20],
     }
 
 
 def _regression_signals(files: Sequence[_FileData], issues: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    text_parts: list[str] = []
     events: set[str] = set()
+    reasons: list[str] = []
+    typed_orders: list[tuple[str, Mapping[str, Any]]] = []
+    incomplete_history: list[str] = []
+    source_disappearance: list[str] = []
+    public_ownership: list[str] = []
+    external_fill: list[str] = []
     for data in files:
         for record in data.records:
             events.add(record.event)
-            text_parts.extend(_reason_values(record.payload))
-            text_parts.append(record.event)
-            text_parts.append(json.dumps(record.payload, ensure_ascii=False, sort_keys=True))
-    text = " ".join(text_parts).lower()
+            values = _reason_values(record.payload)
+            reasons.extend(values)
+            lowered = " ".join(values).lower()
+            if record.event in {"SOURCE_ORDER_DISAPPEARED", "SOURCE_DISAPPEARED"} or "source order disappeared" in lowered or "source order identity or status is unresolved" in lowered:
+                source_disappearance.append(record.event)
+            if record.event == "PRE_RECEIVER_GUARD":
+                public_level = record.payload.get("source_public_level")
+                if public_level is None or "owner" in lowered and ("absent" in lowered or "unproved" in lowered or "does not prove" in lowered):
+                    public_ownership.append(record.event)
+            if record.event in {"SOURCE_FILLED_BEFORE_RECEIVER", "SOURCE_FILL_BEFORE_RECEIVER"} or "source filled before receiver" in lowered or "source fill observed before receiver" in lowered:
+                external_fill.append(record.event)
+            if record.payload.get("history_complete") is False:
+                incomplete_history.append(record.event)
+            if record.event == "COMPLETE":
+                receipt = _receipt_from_complete(record)
+                if isinstance(receipt, Mapping):
+                    for leg in ("source", "receiver"):
+                        value = receipt.get(leg)
+                        if isinstance(value, Mapping):
+                            filled = _decimal_value(value.get("filled_quantity"))
+                            if filled is not None and filled > 0 and value.get("history_complete") is not True:
+                                incomplete_history.append(f"{record.event}:{leg}")
+            for event_key in ("order",):
+                order = record.payload.get(event_key)
+                if isinstance(order, Mapping):
+                    typed_orders.append((record.event, order))
+            if record.event in {"LEG_RECONCILED", "COMPLETE"}:
+                receipt = _receipt_from_complete(record) if record.event == "COMPLETE" else None
+                if isinstance(receipt, Mapping):
+                    for leg in ("source", "receiver"):
+                        value = receipt.get(leg)
+                        if isinstance(value, Mapping) and isinstance(value.get("order"), Mapping):
+                            typed_orders.append((record.event, value["order"]))
+            if record.event in {"FALLBACK_ATTEMPT_EVIDENCE", "FALLBACK_RECONCILED"}:
+                order = record.payload.get("order")
+                if isinstance(order, Mapping):
+                    typed_orders.append((record.event, order))
 
     def signal(name: str, observed: bool, evidence: list[str]) -> dict[str, Any]:
-        return {"status": "OBSERVED" if observed else "NOT_OBSERVED", "evidence": evidence}
+        return {"status": "OBSERVED" if observed else "NOT_OBSERVED", "evidence": list(dict.fromkeys(evidence))[:20]}
+
+    canceled_ioc: list[str] = []
+    canceled_limit: list[str] = []
+    for event, order in typed_orders:
+        status = str(order.get("status", "")).lower()
+        filled = _decimal_value(order.get("filled_quantity"))
+        tif = str(order.get("time_in_force", "")).upper()
+        if status in {"canceled", "cancelled", "canceled-post-only", "canceled-too-much-slippage", "canceled-not-enough-liquidity"} and filled == Decimal(0):
+            if tif == "IOC":
+                canceled_ioc.append(event)
+            elif tif:
+                canceled_limit.append(event)
+
+    transport = [event for event in events if event.endswith("_DISPATCH_UNKNOWN")]
+    issue_codes = [str(issue.get("code")) for issue in issues]
 
     return {
         "source_disappearance": signal(
             "source_disappearance",
-            "source order disappeared" in text or "source order identity or status is unresolved" in text,
-            [event for event in events if "SOURCE" in event and ("UNKNOWN" in event or "OBSERVED" in event)],
+            bool(source_disappearance),
+            source_disappearance,
         ),
         "public_ownership_absent": signal(
             "public_ownership_absent",
-            "owner" in text and ("absent" in text or "does not prove" in text or "unproved" in text),
-            [event for event in events if event == "PRE_RECEIVER_GUARD"],
+            bool(public_ownership),
+            public_ownership,
         ),
         "external_source_fill_before_receiver": signal(
             "external_source_fill_before_receiver",
-            "source_filled_before_receiver" in text or "consumed_by_fill" in text or "source fill observed before receiver" in text,
-            [event for event in events if "SOURCE_FILLED" in event],
+            bool(external_fill),
+            external_fill,
         ),
         "delayed_or_incomplete_history": signal(
             "delayed_or_incomplete_history",
-            "history incomplete" in text or "history" in text and ("delayed" in text or "unknown" in text),
-            ["journal reason/evidence mentions incomplete or unknown history"] if "history" in text else [],
+            bool(incomplete_history) or any(issue.get("code") == "INCOMPLETE_TRADE_HISTORY" for issue in issues),
+            incomplete_history + ["INCOMPLETE_TRADE_HISTORY" for issue in issues if issue.get("code") == "INCOMPLETE_TRADE_HISTORY"],
         ),
         "canceled_zero_fill_ioc": signal(
             "canceled_zero_fill_ioc",
-            "terminal_zero_fill" in text or ("canceled" in text and "filled_quantity\": \"0" in text),
-            [event for event in events if "CANCEL" in event or "FALLBACK" in event],
+            bool(canceled_ioc),
+            canceled_ioc,
+        ),
+        "canceled_zero_fill_limit": signal(
+            "canceled_zero_fill_limit",
+            bool(canceled_limit),
+            canceled_limit,
         ),
         "ambiguous_transport_after_send": signal(
             "ambiguous_transport_after_send",
-            any(event.endswith("_DISPATCH_UNKNOWN") for event in events)
-            or any(issue.get("code") == "ORPHAN_DISPATCH_RESULT" for issue in issues),
-            [event for event in events if event.endswith("_DISPATCH_UNKNOWN")],
+            bool(transport) or any(issue.get("code") == "ORPHAN_DISPATCH_RESULT" for issue in issues),
+            transport + ["ORPHAN_DISPATCH_RESULT" for issue in issues if issue.get("code") == "ORPHAN_DISPATCH_RESULT"],
         ),
         "incomplete_input": signal(
             "incomplete_input",
             bool(issues),
-            [str(issue.get("code")) for issue in issues[:20]],
+            issue_codes[:20],
         ),
+    }
+
+
+def _coverage_map() -> dict[str, Any]:
+    """Name the existing behavioral evidence behind each offline projection."""
+
+    return {
+        "source_disappearance": {
+            "signal": "source_disappearance",
+            "tests": ["tests/spread_shadow/test_hood_handoff_corrections.py::test_foreign_active_order_seen_then_absent_remains_a_barrier"],
+        },
+        "public_ownership_absent": {
+            "signal": "public_ownership_absent",
+            "tests": ["tests/spread_shadow/test_hood_handoff_paired_opening.py::test_paired_guard_rejects_incomplete_or_ambiguous_source_public_evidence"],
+        },
+        "external_source_fill_before_receiver": {
+            "signal": "external_source_fill_before_receiver",
+            "tests": ["tests/spread_shadow/test_hood_handoff_paired_opening.py::test_source_fill_before_receiver_stops_second_leg"],
+        },
+        "delayed_or_incomplete_history": {
+            "signal": "delayed_or_incomplete_history",
+            "tests": ["tests/spread_shadow/test_hood_handoff_corrections.py::test_permanent_empty_history_remains_unknown_without_fabricated_fill"],
+        },
+        "canceled_zero_fill_ioc": {
+            "signal": "canceled_zero_fill_ioc",
+            "tests": ["tests/spread_shadow/test_hood_handoff_engine.py::test_terminal_receiver_no_fill_is_partial_and_not_success"],
+        },
+        "canceled_zero_fill_limit": {
+            "signal": "canceled_zero_fill_limit",
+            "tests": ["tests/spread_shadow/test_hood_handoff_random_cycle.py::test_canceled_post_only_zero_fill_retries_opening_with_preserved_guard_evidence"],
+        },
+        "ambiguous_transport_no_replay": {
+            "signal": "ambiguous_transport_after_send",
+            "tests": [
+                "tests/spread_shadow/test_hood_handoff_sdk_audit.py::test_sdk_transport_timeout_reaches_handoff_unknown_barrier",
+                "tests/spread_shadow/test_hood_handoff_paired_opening.py::test_paired_restart_and_mode_mismatch_never_replay_or_cancel",
+                "tests/spread_shadow/test_hood_handoff_random_cycle.py::test_cycle_interruption_leaves_consumed_journal_and_never_replays",
+            ],
+        },
+        "exact_flat_inventory": {
+            "projection": "inventory",
+            "tests": ["tests/spread_shadow/test_hood_handoff_random_cycle.py::test_inventory_flatness_requires_causal_terminal_evidence_but_not_fee_evidence"],
+        },
+        "fee_complete_and_missing": {
+            "projection": "economics.fees",
+            "tests": [
+                "tests/spread_shadow/test_hood_handoff_corrections.py::test_actual_fee_economics_are_reported_without_cap_admission",
+                "tests/spread_shadow/test_hood_handoff_corrections.py::test_missing_fee_is_unknown_economics_without_erasing_fill_quantity",
+            ],
+        },
+        "crash_boundaries": {
+            "tests": [
+                "tests/spread_shadow/test_hood_handoff_offline_report.py::test_crash_before_response_preserves_intent_and_report_does_not_replay",
+                "tests/spread_shadow/test_hood_handoff_paired_opening.py::test_paired_restart_and_mode_mismatch_never_replay_or_cancel",
+                "tests/spread_shadow/test_hood_handoff_random_cycle.py::test_cycle_interruption_leaves_consumed_journal_and_never_replays",
+            ],
+            "required_observations": ["send count", "cancel count", "inventory UNKNOWN at unresolved restart boundary"],
+        },
     }
 
 
@@ -1293,12 +2119,11 @@ def load_saved_cycle_report(path: str | Path) -> dict[str, Any]:
             if issue not in issues:
                 issues.append(issue)
     issues.extend(_semantic_issues(all_files))
-    fills = _fill_records(all_files)
+    fills, executions, fill_issues = _fill_records(all_files)
+    issues.extend(fill_issues)
     terminal_orders = _terminal_order_records(all_files)
-    latency, latency_notes = _latency_reports(all_files)
-    inventory, inventory_notes = _positions_from_cycle(cycle)
-    economics = _economics(all_files, fills)
-    paired = _paired_execution(all_files, actions, fills)
+    latency, latency_notes, latency_issues = _latency_reports(all_files)
+    issues.extend(latency_issues)
 
     cycle_complete = _last_record(cycle, "CYCLE_COMPLETE") if cycle else None
     interrupted = _last_record(cycle, "CYCLE_INTERRUPTED") if cycle else None
@@ -1308,7 +2133,23 @@ def load_saved_cycle_report(path: str | Path) -> dict[str, Any]:
     cycle_payload = {} if cycle_complete is None else cycle_complete.payload
     opening = cycle_payload.get("opening") if isinstance(cycle_payload.get("opening"), Mapping) else {}
     closing = cycle_payload.get("closing") if isinstance(cycle_payload.get("closing"), Mapping) else {}
-    outcome = opening.get("outcome") or closing.get("outcome") or ("COMPLETE" if terminal else "INCOMPLETE")
+    parent_outcome = cycle_payload.get("outcome")
+    if isinstance(parent_outcome, str) and parent_outcome.strip():
+        outcome = parent_outcome
+        outcome_source = "parent_terminal_outcome"
+    elif isinstance(cycle_payload.get("closing"), Mapping) and isinstance(closing.get("outcome"), str):
+        outcome = closing.get("outcome")
+        outcome_source = "closing_child_outcome"
+    elif isinstance(cycle_payload.get("opening"), Mapping) and isinstance(opening.get("outcome"), str):
+        outcome = opening.get("outcome")
+        outcome_source = "opening_child_outcome"
+    else:
+        outcome = "UNKNOWN" if terminal else "INCOMPLETE"
+        outcome_source = "missing_terminal_outcome" if terminal else "no_terminal_record"
+    child_outcomes: dict[str, Any] = {
+        "opening": opening.get("outcome") if isinstance(opening, Mapping) else None,
+        "closing": closing.get("outcome") if isinstance(closing, Mapping) else None,
+    }
     reason_values: list[str] = []
     for data in all_files:
         for record in data.records:
@@ -1320,6 +2161,17 @@ def load_saved_cycle_report(path: str | Path) -> dict[str, Any]:
     if preflight_blocked is not None:
         reason_values.append("cycle preflight was blocked before completion")
     reasons = list(dict.fromkeys(reason_values))
+
+    inventory, inventory_notes = _positions_from_cycle(cycle, all_files, executions, issues)
+    economics = _economics(executions, fills, fill_issues)
+    paired = _paired_execution(
+        actions,
+        fills,
+        executions,
+        fill_issues,
+        parent_payload=cycle_payload,
+        parent_complete=terminal,
+    )
 
     binding: dict[str, Any] = {}
     for record in (cycle.records if cycle else []):
@@ -1351,11 +2203,15 @@ def load_saved_cycle_report(path: str | Path) -> dict[str, Any]:
             "terminal_event": None if cycle_complete is None else cycle_complete.event,
             "terminal_at": None if cycle_complete is None else cycle_complete["at"],
             "outcome": outcome,
+            "outcome_source": outcome_source,
+            "child_outcomes": child_outcomes,
             "reason": None if not reasons else reasons[0],
             "process_exit_ignored": True,
         },
         "binding": binding,
         "progression": progression,
+        "progression_total_events": sum(data.record_count for data in all_files),
+        "progression_detail_truncated": any(data.detail_truncated for data in all_files),
         "planned_actions": planned,
         "dispatched_actions": actions,
         "confirmed_fills": fills,
@@ -1366,11 +2222,26 @@ def load_saved_cycle_report(path: str | Path) -> dict[str, Any]:
         "latency": latency,
         "reasons": reasons,
         "regression_signals": _regression_signals(all_files, issues),
+        "coverage": _coverage_map(),
+        "source_provenance": {
+            "inputs_are_read_only": True,
+            "files": [
+                {
+                    "path": item["path"],
+                    "kind": item["kind"],
+                    "sha256": item["sha256"],
+                    "line_count": item["line_count"],
+                    "record_count": item["record_count"],
+                }
+                for item in source_files
+            ],
+        },
         "report_notes": list(
             dict.fromkeys(
                 [
                     "Process exit status is not treated as a fill, terminal journal record, or flat-inventory proof.",
                     "A dispatch response accepted by the venue is not itself a confirmed fill; only persisted trade receipts contribute to confirmed_fills.",
+                    "Input payload detail is sanitized, allowlisted, and bounded; line counts, event counts, and SHA-256 hashes cover the complete read-only sources.",
                     *latency_notes,
                     *inventory_notes,
                 ]
