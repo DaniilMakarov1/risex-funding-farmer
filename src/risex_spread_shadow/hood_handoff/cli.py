@@ -30,7 +30,8 @@ from .local_attempt import (
     format_local_attempt_result,
     run_local_attempt,
 )
-from .offline_report import format_report, report_saved_paths
+from .offline_report import format_report, report_saved_paths, load_saved_cycle_report
+from .operator_view import read_lifecycle, lifecycle_lines, result_lines
 from .random_cycle import (
     MAX_PREPARATION_ATTEMPTS,
     RandomCycleConfig,
@@ -853,17 +854,18 @@ def _read_simple_events(path: str | None) -> list[dict[str, Any]]:
     if path is None:
         return []
     try:
-        lines = Path(path).read_text(encoding="utf-8").splitlines()
+        stream = Path(path).open(encoding="utf-8")
     except OSError:
         return []
     events: list[dict[str, Any]] = []
-    for line in lines:
-        try:
-            value = json.loads(line)
-        except (TypeError, json.JSONDecodeError):
-            continue
-        if isinstance(value, Mapping) and isinstance(value.get("event"), str):
-            events.append(dict(value))
+    with stream:
+        for line in stream:
+            try:
+                value = json.loads(line)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(value, Mapping) and isinstance(value.get("event"), str):
+                events.append(dict(value))
     return events
 
 
@@ -1129,14 +1131,21 @@ async def _stream_simple_progress(
     """Print each durable progress event once while the finite cycle runs."""
 
     while True:
-        for row in _read_simple_events(str(journal_path)):
+        rows = await asyncio.to_thread(_read_simple_events, str(journal_path))
+        progress = await asyncio.to_thread(read_lifecycle, journal_path)
+        for row in rows:
             key = _simple_event_key(row)
             if key in emitted_keys:
                 continue
             line = _simple_event_line(row)
+            if row.get("event") == "HOLD_ANCHORED" and progress and progress.get("stage") == "HOLD":
+                line = "\n".join(lifecycle_lines(progress))
             if line is None:
                 continue
-            print(line, flush=True)
+            try:
+                await asyncio.to_thread(print, line, flush=True)
+            except OSError:
+                return  # A closed terminal must not replace the trading result.
             emitted_keys.add(key)
         if stop_event.is_set():
             return
@@ -1149,6 +1158,16 @@ def format_random_cycle_result_ru(
     emitted_keys: set[tuple[str, int | None, int | None]] | None = None,
 ) -> str:
     """Render the simple launch result without replacing the durable JSONL."""
+
+    journal = getattr(result, "journal_path", None)
+    if journal:
+        try:
+            report = load_saved_cycle_report(Path(journal).parent)
+            if report["status"] == "COMPLETE":
+                outcome = report["cycle"].get("outcome", "UNKNOWN")
+                return "\n".join([f"Итог: {outcome}", *result_lines(report, detailed=True), f"Журнал: {journal}"])
+        except Exception:
+            pass  # Preserve the existing incomplete-result diagnostic path.
 
     events = _read_simple_events(getattr(result, "journal_path", None))
     lines: list[str] = []

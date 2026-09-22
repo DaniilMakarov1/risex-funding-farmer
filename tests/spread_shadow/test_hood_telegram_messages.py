@@ -55,7 +55,7 @@ def test_saved_incident_display_preserves_failure_and_historical_times(tmp_path,
     assert 'Последние сохранённые позиции' in full
     assert 'не текущая проверка счетов' in full
     assert 'Историческая позиция' in short
-    assert 'UTC' in full or 'нет данных' in full
+    assert 'МСК' in full or 'нет данных' in full
     assert 'Парное исполнение: ✅ подтверждено' not in full
 
 

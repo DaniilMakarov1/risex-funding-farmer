@@ -850,3 +850,42 @@ async def test_prepared_numeric_timings_separate_nonce_signing_and_transport(mon
     assert not (await client.submit_prepared_order(plan, prepared)).accepted
     assert len(client._http.calls) == 1
     assert "signed-create-info" not in repr(prepared.diagnostic_timings)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('maker_ask,account,role', [(True,11,'maker'),(True,22,'taker'),(False,11,'taker'),(False,22,'maker')])
+@pytest.mark.parametrize('component,expected', [(0,'0'), (123,None), (None,None), (False,None), ('0',None), (-1,None)])
+async def test_actual_trade_fee_components_follow_own_role_without_guessing_units(monkeypatch, maker_ask, account, role, component, expected):
+    class API(FakeModule.OrderApi):
+        async def trades(self, **kwargs):
+            payload = await super().trades(**kwargs)
+            receipt = payload['trades'][0]
+            receipt.update(is_maker_ask=maker_ask, maker_fee=999, taker_fee=999,
+                           integrator_maker_fee=999, integrator_taker_fee=999, fee='777')
+            receipt[role + '_fee'] = component
+            receipt['integrator_' + role + '_fee'] = 0
+            return payload
+    monkeypatch.setattr(FakeModule, 'OrderApi', API)
+    monkeypatch.setattr(LighterSdkClient, 'verify_sdk', staticmethod(lambda: None))
+    client = _constant_nonce_client(prefix='fee-proof')
+    client._lighter = lambda: FakeModule
+    page = await client.list_trades(account, 7)
+    receipt = page.trades[0]
+    assert receipt.fee == (None if expected is None else Decimal(expected))
+    assert receipt.fee_role == role
+    assert receipt.integrator_fee_raw == 0
+    assert receipt.venue_fee_raw == (component if type(component) is int and component >= 0 else None)
+    assert receipt.fee_evidence == ('EXPLICIT_ZERO_OFFICIAL_COMPONENTS' if expected == '0'
+                                    else 'NONZERO_UNIT_UNVERIFIED' if component == 123 else 'MISSING_OR_INVALID_COMPONENTS')
+    await client.aclose()
+
+
+@pytest.mark.parametrize('fields', [
+    {'maker_fee':0}, {'maker_fee':0,'integrator_maker_fee':False},
+    {'maker_fee':0,'integrator_maker_fee':8}, {'maker_fee':0,'integrator_maker_fee':0,'is_maker_ask':1},
+])
+def test_incomplete_integrator_or_role_evidence_never_assumes_free_trade(fields):
+    from risex_spread_shadow.hood_handoff.sdk import _trade_fee_evidence
+    assert _trade_fee_evidence({'is_maker_ask':True, **fields}, is_ask=True, distinct_accounts=True)['fee'] is None
+    assert _trade_fee_evidence({'is_maker_ask':True, 'maker_fee':0, 'integrator_maker_fee':0},
+                               is_ask=True, distinct_accounts=False)['fee'] is None

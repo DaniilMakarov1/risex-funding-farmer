@@ -22,6 +22,7 @@ import aiohttp
 
 from .keychain import MacOSKeychainBackend, read_hidden_secret
 from .offline_report import load_saved_cycle_report
+from .operator_view import read_lifecycle
 from .operator_control import exclusive_lock
 from . import telegram_messages as views
 
@@ -173,9 +174,16 @@ class Controller:
         # can still be alive during that await. It is no longer a running cycle.
         if active is not None and self.task is not None and not self.task.done() and not self._runner_finished:
             added = sorted(set(self.slots()) - set(active['before']))
-            return views.running_message(added)
+            progress = read_lifecycle(self.operator / added[0] / 'cycle.jsonl') if len(added) == 1 else None
+            return views.running_message(added, progress)
         blocked = active is not None
         last = self.store.data['last']
+        # Read-only display also includes completed terminal-launched cycles.
+        # This never clears the controller's durable active/restart barrier.
+        if not blocked and (not last or last.get('status') != 'NOT_LAUNCHED'):
+            slots = self.slots()
+            if slots:
+                last = {'cycle': slots[-1]}
         if not last:
             return views.empty_message(blocked)
         report = self.report(last.get('cycle'))
@@ -189,13 +197,37 @@ class Controller:
         except Exception:
             pass  # Delivery failure never repeats or aborts a cycle.
 
+    async def lifecycle_notices(self):
+        """At most three progress notices during this one owned child run."""
+        sent = set()
+        while True:
+            try:
+                active = self.store.data['active']
+                if active is None:
+                    return
+                added = sorted(set(self.slots()) - set(active['before']))
+                if len(added) == 1:
+                    progress = read_lifecycle(self.operator / added[0] / 'cycle.jsonl')
+                    stage = progress.get('stage') if progress else None
+                    if stage in {'HOLD', 'CLOSING', 'RECOVERY'} and stage not in sent:
+                        sent.add(stage)
+                        # Slow/unavailable delivery cannot hold up the child.
+                        await asyncio.wait_for(self.notify(views.running_message(added, progress)), timeout=10)
+            except (Exception, asyncio.TimeoutError):
+                pass
+            await asyncio.sleep(0.5)
+
     async def run_one(self):
+        notices = asyncio.create_task(self.lifecycle_notices())
         try:
             await self.launch()
             self.finish()
         except Exception:
             self.store.data['last'] = {'status': 'BLOCKED', 'cycle': None}
             self.store.save()  # Keep durable active intent; never automatically retry.
+        finally:
+            notices.cancel()
+            await asyncio.gather(notices, return_exceptions=True)
         self._runner_finished = True
         await self.notify(self.summary_after_task())
 

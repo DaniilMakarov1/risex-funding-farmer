@@ -1018,6 +1018,10 @@ class TradeReceipt:
     counterparty_order_id: str | None = None
     counterparty_client_order_index: int | str | None = None
     client_order_index: int | str | None = None
+    fee_role: str | None = None
+    venue_fee_raw: int | None = None
+    integrator_fee_raw: int | None = None
+    fee_evidence: str | None = None
 
     def __post_init__(self) -> None:
         _text(self.trade_id, "trade_id")
@@ -1052,6 +1056,13 @@ class TradeReceipt:
         ):
             raise ContractError("client_order_index must be a non-empty integer/string")
         _timestamp(self.observed_at, "observed_at")
+        if self.fee_role is not None and self.fee_role not in {"maker", "taker"}:
+            raise ContractError("fee_role must be maker or taker")
+        for name in ("venue_fee_raw", "integrator_fee_raw"):
+            if getattr(self, name) is not None:
+                _int(getattr(self, name), name, minimum=0)
+        if self.fee_evidence is not None:
+            _text(self.fee_evidence, "fee_evidence")
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "TradeReceipt":
@@ -1096,6 +1107,10 @@ class TradeReceipt:
             ),
             counterparty_client_order_index=value.get("counterparty_client_order_index"),
             client_order_index=value.get("client_order_index"),
+            fee_role=value.get("fee_role"),
+            venue_fee_raw=value.get("venue_fee_raw"),
+            integrator_fee_raw=value.get("integrator_fee_raw"),
+            fee_evidence=value.get("fee_evidence"),
         )
 
 
@@ -1755,6 +1770,10 @@ class HandoffResult:
                         "quantity": _wire_decimal(trade.quantity),
                         "price": _wire_decimal(trade.price),
                         "fee": None if trade.fee is None else _wire_decimal(trade.fee),
+                        "fee_role": trade.fee_role,
+                        "venue_fee_raw": trade.venue_fee_raw,
+                        "integrator_fee_raw": trade.integrator_fee_raw,
+                        "fee_evidence": trade.fee_evidence,
                         "counterparty_account_index": trade.counterparty_account_index,
                         "counterparty_order_id": trade.counterparty_order_id,
                         "counterparty_client_order_index": trade.counterparty_client_order_index,

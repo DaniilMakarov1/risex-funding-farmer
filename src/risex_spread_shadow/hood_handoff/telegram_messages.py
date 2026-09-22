@@ -1,10 +1,9 @@
 """Bounded Telegram HTML views; only escaped, sanitized dynamic values."""
 from collections.abc import Mapping
-from datetime import datetime, timezone
 from html import escape
-import math
 
 from .journal import sanitize
+from .operator_view import lifecycle_lines, result_lines, timestamp
 
 READ_MENU = {'keyboard': [[{'text': '/status'}, {'text': '/report'}], [{'text': '/accounts'}, {'text': '/help'}]],
              'resize_keyboard': True, 'is_persistent': True}
@@ -21,17 +20,6 @@ def text(value, limit=80):
 
 def mapping(value):
     return value if isinstance(value, Mapping) else {}
-
-
-def timestamp(value):
-    if isinstance(value, bool) or not isinstance(value, (float, int)):
-        return 'нет данных'
-    try:
-        if not math.isfinite(value) or value < 0:
-            return 'нет данных'
-        return datetime.fromtimestamp(value, timezone.utc).strftime('%d.%m.%Y %H:%M:%S UTC')
-    except (ValueError, OverflowError, OSError):
-        return 'нет данных'
 
 
 def help_message():
@@ -75,11 +63,11 @@ def unknown_message():
             'Для одного реального цикла команда <code>/run</code> должна быть без дополнительных параметров.')
 
 
-def running_message(names):
+def running_message(names, progress=None):
     name = text(', '.join(names[:3])) if names else 'слот ещё не создан'
-    return (f'<b>⏳ Цикл выполняется</b>\nЦикл: <code>{name}</code>\n\n'
-            'Итог ещё не доказан. Новые запуски временно заблокированы.\n'
-            'Обновить: /status')
+    details = '\n'.join(text(line, 500) for line in lifecycle_lines(progress))
+    return (f'<b>⏳ Цикл выполняется</b> · <code>{name}</code>\n{details}\n'
+            'Новые запуски временно заблокированы. /status — обновить')
 
 
 def empty_message(blocked=False):
@@ -102,54 +90,11 @@ def unavailable_message(blocked=False, not_launched=False):
 
 
 def saved_message(name, report, *, blocked=False, detailed=False):
-    report = mapping(report)
-    inventory = mapping(report.get('inventory'))
-    pair = mapping(report.get('paired_execution'))
-    economics = mapping(report.get('economics'))
-    fees = mapping(economics.get('fees'))
-    orders = mapping(report.get('order_state'))
     lines = [f'<b>📋 Результат цикла</b> · <code>{text(name, 32)}</code>']
-    binding = mapping(report.get('binding'))
-    first_side = {'LONG': 'SELL', 'SHORT': 'BUY'}.get(binding.get('direction'))
-    if first_side is not None and all(binding.get(k) is not None for k in ('source_account_index', 'receiver_account_index')):
-        lines += [f'Первый счёт: <code>{text(binding["source_account_index"], 24)}</code> · лимитный {first_side}',
-                  f'Второй счёт: <code>{text(binding["receiver_account_index"], 24)}</code>']
     if blocked:
-        lines += ['<b>⛔ Новые запуски заблокированы</b>']
-    lines += ['', '<b>Результат по журналу</b>',
-              'Полнота данных: ' + ('полные' if report.get('status') == 'COMPLETE' else 'неполные'),
-              'Парное исполнение: ' + {'SUCCESS': '✅ подтверждено', 'FAILED': '⚠️ не состоялось'}.get(pair.get('status'), '❔ не доказано'),
-              'Историческая позиция: ' + {'CONFIRMED_FLAT': '✅ закрытие подтверждено', 'PARTIAL': '⚠️ есть остаток'}.get(inventory.get('status'), '❔ неизвестна'),
-              'Комиссии: ' + ('подтверждены' if fees.get('status') == 'PROVEN' else '❔ неполные данные')]
-    matches = pair.get('direct_counterparty_match')
-    for match in matches[:2] if isinstance(matches, list) else ():
-        match = mapping(match)
-        label = {'opening': 'Открытие', 'closing': 'Закрытие'}.get(match.get('phase'), 'Фаза')
-        volumes = [match.get(key) for key in ('matched_quantity', 'external_source_quantity', 'external_receiver_quantity')]
-        lines += [label + ': свой подтверждённый объём ' + text(volumes[0] if volumes[0] is not None else 'не доказан', 32)
-                  + '; внешний A/B: ' + '/'.join(text(v if v is not None else '?', 32) for v in volumes[1:])]
-        unproved = [match.get(key) for key in ('unproved_source_quantity', 'unproved_receiver_quantity')]
-        lines += ['Контрагент не доказан, A/B: ' + '/'.join(text(v if v is not None else '?', 32) for v in unproved)]
-    intents = orders.get('unresolved_intents')
-    observed = orders.get('unresolved_observed_orders')
-    lines += ['Неразрешённых намерений: ' + (str(len(intents)) if isinstance(intents, list) else 'нет данных'),
-              'Неразрешённых наблюдений ордеров: ' + (str(len(observed)) if isinstance(observed, list) else 'нет данных')]
-    if detailed:
-        times = mapping(inventory.get('observed_at'))
-        lines += ['', '<b>Последние сохранённые позиции</b>']
-        for key, label in [('source', 'Источник'), ('receiver', 'Приёмник')]:
-            value = inventory.get(key)
-            lines += [f'{label}: <code>{text(value if value is not None else "нет данных", 48)}</code>',
-                      f'<i>{timestamp(times.get(key))}</i>']
-        reasons = report.get('reasons')
-        if isinstance(reasons, list) and reasons:
-            lines += ['', '<b>Диагностика журнала</b>']
-            lines += ['• ' + text(reason, 180) for reason in reasons[:2]]
-            if len(reasons) > 2:
-                lines += ['Остальные причины — в локальном отчёте.']
-        lines += ['', '<i>Комиссии не равны итоговой прибыли. Фандинг и PnL требуют отдельного доказательства.</i>']
-    lines += ['', '<i>Это сохранённые наблюдения, не текущая проверка счетов.</i>',
-              '/status — кратко · /report — подробно · /help — команды']
+        lines.append('<b>⛔ Новые запуски заблокированы</b>')
+    lines.extend(text(line, 500) for line in result_lines(report, detailed=detailed))
+    lines.append('/status — кратко · /report — подробно · /accounts — текущие счета')
     return '\n'.join(lines)
 
 

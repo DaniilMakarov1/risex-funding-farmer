@@ -66,6 +66,7 @@ _PROJECTED_KEYS = frozenset(
         "error",
         "event",
         "fee",
+        "fee_role", "venue_fee_raw", "integrator_fee_raw", "fee_evidence",
         "fee_rate",
         "fee_total",
         "filled_quantity",
@@ -73,7 +74,7 @@ _PROJECTED_KEYS = frozenset(
         "from_attempt",
         "gross_notional",
         "history_complete",
-        "hold_seconds",
+        "hold_seconds", "anchor_wall",
         "incremental_margin_evidence",
         "initial_quantity",
         "journal_path",
@@ -1753,10 +1754,62 @@ def _positions_from_cycle(
     }, notes
 
 
+def _closed_execution_pnl(
+    executions: Sequence[Mapping[str, Any]],
+    fills: Sequence[Mapping[str, Any]],
+    issues: Sequence[Mapping[str, Any]],
+    inventory: Mapping[str, Any],
+    *,
+    fees_proven: bool,
+) -> dict[str, Any]:
+    """Cash-flow PnL for a completely reconciled flat-to-flat linear cycle.
+
+    Fills have already passed identity, price, quantity and reuse checks.
+    A shared trade ID belongs once to EACH account, never once to the pair.
+    Funding/account-wide realized PnL is deliberately not substituted here.
+    """
+    result: dict[str, Any] = {"status": "UNKNOWN", "gross": None, "net": None,
+                              "per_account": [], "funding_excluded": True,
+                              "unit": "quote_currency", "reason": "closed flat-to-flat execution is not proven"}
+    if issues or not executions or inventory.get("status") != "CONFIRMED_FLAT" or any(not e.get("resolved") for e in executions):
+        return result
+    # Same timestamp does not reorder closing behind its residual cleanup.
+    # Match the causal chain ordering already verified by the report.
+    ordered = sorted(executions, key=lambda e: (e["observed_at"], {"opening": 0, "closing": 1, "fallback": 2}[e["phase"]], e.get("attempt") or 0))
+    accounts = list(dict.fromkeys(str(e["account_index"]) for e in ordered))
+    if len({str(e["market_id"]) for e in ordered}) != 1:
+        return result
+    rows = []
+    for account in accounts:
+        account_executions = [e for e in ordered if str(e["account_index"]) == account]
+        if _decimal_value(account_executions[0].get("position_before")) != 0 or _decimal_value(account_executions[-1].get("position_after")) != 0:
+            return result
+        trades = [f for f in fills if str(f["account_index"]) == account]
+        signed = sum((Decimal(f["quantity"]) * (1 if f["side"] == "BUY" else -1) for f in trades), Decimal(0))
+        if signed != 0:
+            return result
+        gross = sum((Decimal(f["quantity"]) * Decimal(f["price"]) * (1 if f["side"] == "SELL" else -1) for f in trades), Decimal(0))
+        fees = sum((Decimal(f["fee"]) for f in trades), Decimal(0)) if fees_proven else None
+        rows.append({"account_index": account, "gross": str(gross),
+                     "fees": None if fees is None else str(fees), "net": None if fees is None else str(gross - fees)})
+    result.update(status="PROVEN" if fees_proven else "GROSS_ONLY", per_account=rows,
+                  gross=str(sum((Decimal(r["gross"]) for r in rows), Decimal(0))),
+                  net=str(sum((Decimal(r["net"]) for r in rows), Decimal(0))) if fees_proven else None,
+                  reason="complete flat-to-flat fills; funding excluded" if fees_proven else "gross execution PnL proven; fees incomplete")
+    return result
+
+
+def _holding_summary(cycle):
+    from .operator_view import holding
+    record = _first_record(cycle, "HOLD_ANCHORED") if cycle else None
+    return holding(record.payload, record["at"]) if record else {}
+
+
 def _economics(
     executions: Sequence[Mapping[str, Any]],
     fills: Sequence[Mapping[str, Any]],
     evidence_issues: Sequence[Mapping[str, Any]],
+    inventory: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Prove fees from exact individual receipts, including explicit zero fills."""
     missing: list[str] = []
@@ -1766,8 +1819,8 @@ def _economics(
     for execution in executions:
         trades = execution.get("trades", [])
         fees = [_decimal_value(trade.get("fee")) for trade in trades]
-        if any(fee is None for fee in fees):
-            missing.append(f"{execution.get('phase')} {execution.get('leg')}: trade fee is missing or non-finite")
+        if any(fee is None or fee < 0 for fee in fees):
+            missing.append(f"{execution.get('phase')} {execution.get('leg')}: trade fee is missing, invalid or an unproved rebate")
             continue
         total = sum((fee for fee in fees if fee is not None), Decimal(0))
         recorded = execution.get("fee_total")
@@ -1782,7 +1835,8 @@ def _economics(
             "missing_evidence": list(dict.fromkeys(missing)), "known_fee_totals": totals,
             "total": str(sum((Decimal(t) for t in totals), Decimal(0))) if proven else None,
         },
-        "funding_pnl": {"status": "UNKNOWN", "reason": "saved cycle journals do not independently attribute funding or closed PnL"},
+        "closed_execution_pnl": _closed_execution_pnl(executions, fills, evidence_issues, inventory, fees_proven=proven),
+        "funding_pnl": {"status": "UNKNOWN", "reason": "saved cycle journals do not independently attribute funding"},
     }
 
 
@@ -2230,7 +2284,7 @@ def load_saved_cycle_report(path: str | Path) -> dict[str, Any]:
         if hold is None or closing_plan is None or hold_seconds is None or hold_seconds < 0 or opening_end is None or hold["at"] < opening_end or closing_plan["at"] - hold["at"] < hold_seconds:
             issues.append(_issue("INCOMPLETE_HOLD_EVIDENCE", "closing lacks a causally complete persisted hold interval"))
     inventory, inventory_notes = _positions_from_cycle(cycle, all_files, executions, issues)
-    economics = _economics(executions, fills, issues)
+    economics = _economics(executions, fills, issues, inventory)
     paired = _paired_execution(
         actions,
         fills,
@@ -2280,6 +2334,7 @@ def load_saved_cycle_report(path: str | Path) -> dict[str, Any]:
             "process_exit_ignored": True,
         },
         "binding": binding,
+        "holding": _holding_summary(cycle),
         "progression": progression,
         "progression_total_events": sum(data.record_count for data in all_files),
         "progression_detail_truncated": any(data.detail_truncated for data in all_files),
@@ -2371,7 +2426,8 @@ def render_human(report: Mapping[str, Any]) -> str:
         f"Планы: {len(planned)}; mutation intents: {len(actions)}; подтверждённые fills: {len(fills)}.",
         f"Paired execution: {paired.get('status', 'UNKNOWN')}; receiver dispatched={paired.get('receiver_dispatched', False)}.",
         f"Inventory: {inventory.get('status', 'UNKNOWN')} — source={_display_number(inventory.get('source'))}, receiver={_display_number(inventory.get('receiver'))}.",
-        f"Fees: {fees.get('status', 'UNKNOWN')}; funding/PnL: UNKNOWN (отдельная классификация).",
+        f"Fees: {fees.get('status', 'UNKNOWN')}; total={fees.get('total')}; funding: UNKNOWN (отдельная классификация).",
+        f"Closed execution PnL: {economics.get('closed_execution_pnl', {})}.",
     ]
     order_state = report.get("order_state", {})
     if isinstance(order_state, Mapping):

@@ -614,7 +614,7 @@ def test_real_engine_receipt_defects_cannot_prove_completion(complete_cycle: Pat
     assert report["economics"]["fees"]["status"] == "UNKNOWN"
 
 
-@pytest.mark.parametrize("fee", [None, "NaN", "nonsense"])
+@pytest.mark.parametrize("fee", [None, "NaN", "nonsense", "-0.01"])
 def test_invalid_or_missing_fees_do_not_erase_proven_exposure(complete_cycle: Path, fee):
     def corrupt(rows):
         receipt = next(r["payload"]["receipt"] for r in rows if r["event"] == "COMPLETE")
@@ -624,6 +624,7 @@ def test_invalid_or_missing_fees_do_not_erase_proven_exposure(complete_cycle: Pa
     assert report["paired_execution"]["status"] == "SUCCESS"
     assert report["inventory"]["status"] == "CONFIRMED_FLAT"
     assert report["economics"]["fees"]["status"] == "UNKNOWN"
+    assert report["economics"]["closed_execution_pnl"]["net"] is None
 
 
 def test_fee_total_must_match_individual_receipts(complete_cycle: Path):
@@ -823,3 +824,77 @@ def test_projection_bounds_traversal_before_visiting_omitted_subtrees():
     assert truncated
     assert '[DETAIL_TRUNCATED]' in json.dumps(projected)
     assert 'sentinel' not in json.dumps(projected)
+
+
+def test_closed_pnl_counts_both_own_receipts_and_fees_once(complete_cycle):
+    from decimal import Decimal
+    report = load_saved_cycle_report(complete_cycle)
+    pnl = report['economics']['closed_execution_pnl']
+    # Both accounts open/close 0.20 at 100.1: zero price cash flow,
+    # two fees of 0.01 per account. Shared trade IDs still charge both accounts.
+    assert pnl['status'] == 'PROVEN'
+    assert Decimal(pnl['gross']) == 0
+    assert Decimal(pnl['net']) == Decimal('-0.04')
+    assert len(pnl['per_account']) == 2
+    assert all(Decimal(r['gross']) == 0 and Decimal(r['net']) == Decimal('-0.02') for r in pnl['per_account'])
+    assert pnl['funding_excluded'] is True
+    assert report['economics']['funding_pnl']['status'] == 'UNKNOWN'
+    assert report['holding']['planned_closing_at'] - report['holding']['started_at'] == 20
+
+
+def test_closed_pnl_survives_missing_fees_only_as_gross(complete_cycle):
+    def remove_fee(rows):
+        receipt = next(r['payload']['receipt'] for r in rows if r['event'] == 'COMPLETE')
+        receipt['source']['trades'][0]['fee'] = None
+    _change_records(complete_cycle/'closing.jsonl', remove_fee)
+    r = load_saved_cycle_report(complete_cycle)
+    assert r['economics']['closed_execution_pnl']['status'] == 'GROSS_ONLY'
+    assert r['economics']['closed_execution_pnl']['net'] is None
+    assert r['inventory']['status'] == 'CONFIRMED_FLAT'
+
+
+@pytest.mark.parametrize('defect', ['open', 'pending', 'reuse', 'missing_parent', 'foreign_inventory'])
+def test_closed_pnl_never_promotes_open_unknown_reused_or_nonflat_start(complete_cycle, defect):
+    if defect == 'missing_parent':
+        _change_records(complete_cycle/'cycle.jsonl', lambda rows: rows.pop())
+    else:
+        def corrupt(rows):
+            receipt = next(r['payload']['receipt'] for r in rows if r['event'] == 'COMPLETE')
+            leg = receipt['source']
+            if defect == 'open': leg['position_after'] = '0.1'
+            elif defect == 'pending': leg['order']['status'] = 'open'
+            elif defect == 'reuse': leg['trades'][0]['trade_id'] = 'pair-trade-0'
+            else: leg['position_before'] = '-10'
+        _change_records(complete_cycle/'closing.jsonl', corrupt)
+    r = load_saved_cycle_report(complete_cycle)
+    assert r['economics']['closed_execution_pnl']['status'] == 'UNKNOWN'
+    assert r['economics']['closed_execution_pnl']['gross'] is None
+    assert r['economics']['closed_execution_pnl']['net'] is None
+
+
+def test_partial_paired_close_includes_both_residual_fills_and_fees(tmp_path):
+    import asyncio
+    from dataclasses import replace
+    from decimal import Decimal
+    from test_hood_handoff_random_cycle import AdvancingClock, CycleClient, FixedRng, cycle_config
+    from risex_spread_shadow.hood_handoff import run_random_cycle
+    class Fees(CycleClient):
+        async def list_trades(self, *args, **kwargs):
+            page = await super().list_trades(*args, **kwargs)
+            return replace(page, trades=tuple(replace(t, fee=Decimal('0.003'), fee_role='taker',
+                venue_fee_raw=123, integrator_fee_raw=0, fee_evidence='NORMALIZED_FIXTURE_QUOTE_CURRENCY') for t in page.trades))
+    clock = AdvancingClock()
+    client = Fees(clock, partial_close=True)
+    result = asyncio.run(run_random_cycle(cycle_config(tmp_path), client, clock=clock, rng=FixedRng(20,20)))
+    assert result.outcome.value == 'PARTIAL'
+    r = load_saved_cycle_report(tmp_path)
+    pnl = r['economics']['closed_execution_pnl']
+    # 0.20 each opened at 100.1; half closes mutually there, remaining
+    # short buys 0.10 at ask 100.2, long sells 0.10 at bid 100.0.
+    assert pnl['status'] == 'PROVEN', r['issues']
+    assert Decimal(pnl['gross']) == Decimal('-0.02')
+    assert Decimal(r['economics']['fees']['total']) == Decimal('0.018')
+    assert Decimal(pnl['net']) == Decimal('-0.038')
+    assert len(r['confirmed_fills']) == 6
+    assert all(t['fee_role'] == 'taker' and t['venue_fee_raw'] == 123 for t in r['confirmed_fills'])
+    assert r['inventory']['status'] == 'CONFIRMED_FLAT'

@@ -261,6 +261,33 @@ def _order_snapshot_mapping(value: Any, *, observed_at: float) -> dict[str, Any]
     return mapped
 
 
+def _trade_fee_evidence(value: Mapping[str, Any], *, is_ask: bool, distinct_accounts: bool) -> dict[str, Any]:
+    """Preserve official fee components without guessing the integer unit.
+
+    The pinned SDK exposes role-specific integers, not a quote-currency fee.
+    Explicit zero for BOTH components is unit-independent. Nonzero amounts
+    remain unknown until their units are established for this venue.
+    """
+    maker_ask = value.get("is_maker_ask")
+    result: dict[str, Any] = {"fee": None, "fee_role": None, "venue_fee_raw": None,
+                              "integrator_fee_raw": None, "fee_evidence": "MISSING_OR_INVALID_COMPONENTS"}
+    if not isinstance(maker_ask, bool) or not distinct_accounts:
+        return result
+    role = "maker" if maker_ask == is_ask else "taker"
+    result["fee_role"] = role
+    for output, field in (("venue_fee_raw", f"{role}_fee"), ("integrator_fee_raw", f"integrator_{role}_fee")):
+        raw = value.get(field)
+        if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0:
+            result[output] = raw
+    components = (result["venue_fee_raw"], result["integrator_fee_raw"])
+    if None not in components:
+        if components == (0, 0):
+            result.update(fee="0", fee_evidence="EXPLICIT_ZERO_OFFICIAL_COMPONENTS")
+        else:
+            result["fee_evidence"] = "NONZERO_UNIT_UNVERIFIED"
+    return result
+
+
 def _trade_timestamp_seconds(value: Any) -> float:
     """Convert the documented integer millisecond timestamp to seconds."""
 
@@ -982,6 +1009,7 @@ class LighterSdkClient:
             )
             mapped["trade_id"] = mapped.get("trade_id_str", mapped.get("trade_id"))
             mapped["observed_at"] = observed_at
+            mapped.update(_trade_fee_evidence(mapped, is_ask=is_ask, distinct_accounts=ask_account != bid_account))
             trades.append(
                 TradeReceipt.from_mapping(
                     {

@@ -1693,7 +1693,8 @@ async def test_closing_post_only_retry_exhaustion_reports_recovery_without_erasi
     assert "paired closing: paired closing source canceled-post-only zero-fill" in result.reason
     assert "cycle not opened" not in result.reason
     output = cli_module.format_random_cycle_result_ru(result)
-    assert "парное закрытие не завершено" in output
+    assert "Парное исполнение: ❔ не доказано" in output
+    assert "Историческая позиция: ✅ закрытие подтверждено" in output
     assert "восстановление продолжено через fallback" in output
     assert "Приёмник открытия: ордер отправлен" in output
     assert "Приёмник закрытия: ордер не отправлялся" in output
@@ -2104,6 +2105,10 @@ def test_cycle_004_offline_facts_keep_pair_failure_flat_inventory_and_unknown_fe
         "quantity": "0.00026",
         "price": "80467.5",
         "fee": None,
+        "fee_role": None,
+        "venue_fee_raw": None,
+        "integrator_fee_raw": None,
+        "fee_evidence": None,
         "counterparty_account_index": 16969,
         "counterparty_order_id": "562950034029051",
         "counterparty_client_order_index": None,

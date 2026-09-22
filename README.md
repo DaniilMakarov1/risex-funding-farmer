@@ -1,98 +1,76 @@
 # RISEx Spread Shadow
 
-This standalone project contains the operator-run Robinhood Chain BTC cycle utility and frozen public/paper research tools. STATUS.md records the exact accepted candidate and verification, including HCR-35 faster preparation and strict mutual-execution reporting. Offline validation does not establish live strategy success. `NEXT_TASK.md` defines the finite authority and acceptance criteria, `STATUS.md` records accepted state, `SYSTEM_SPEC.md` defines behavior, and `AGENTS.md` defines process and safety. Historical experiments and incident narratives are retained in Git and immutable owner-only evidence, not operational permissions.
+The active tool runs one owner-requested two-account Robinhood Chain BTC cycle. One account posts a limit and the other sends a price-bounded market order through the public book. Other participants can still trade first; matching our own accounts is proved afterward from exact receipts. Offline tests establish software behavior, not live execution probability.
 
-## Runtime and setup
+Read STATUS.md for accepted versions/results, SYSTEM_SPEC.md for behavior, NEXT_TASK.md for current work/authority and AGENTS.md for process/safety. Historical experiments remain in Git and immutable local evidence.
 
-Use Python 3.11. The cycle utility pins `lighter-sdk==1.1.2` and uses the project-local `.venv-hood`. For a new installation:
+## Setup
+
+Use Python 3.11 and pinned `lighter-sdk==1.1.2`. For a new installation:
 
 ```bash
 python3.11 -m venv .venv-hood
 .venv-hood/bin/python -m pip install -e '.[hood-handoff,test]'
 ```
 
-An existing installation does not need to be recreated. If it contains only runtime dependencies, install the test extras before using pytest: `.venv-hood/bin/python -m pip install -e '.[test]'`. The root `start` script selects `.venv-hood/bin/python` regardless of shell PATH and imports this checkout's source. Before reserving a cycle it validates local configuration, owner-only storage, market evidence and the pinned SDK. Help and pre-launch cancellation are offline and consume no cycle slot.
+Do not recreate an existing installation. If tests are needed in a runtime-only environment, install `'.[test]'` there first. `./start` always selects `.venv-hood/bin/python` and this checkout's source, independently of shell PATH. Help is offline:
 
 ```bash
 ./start --help
-.venv-hood/bin/risex-hood-handoff --help
+.venv-hood/bin/python -m risex_spread_shadow.hood_handoff.cli --help
 .venv-hood/bin/python -m pytest -q
 ```
 
-## Configured operator cycle
-
-The existing operator directory is:
-
-`spread-shadow-runs/hood-cycle-race-latency-20260920/operator-v1/`
-
-`random-cycle.json` selects BTC market 1, account pair 27331 and 27337, API key index 4, Robinhood API/signing domain 466324, existing timing defaults and the explicitly selected incremental opening-margin deferral. `market-contract.json` binds identity/provenance requirements; current grid, minimums, balances and timestamps must come from actual validated observations. Do not invent missing fees or refresh saved timestamps.
-
-The owner-operated command is:
+## Start one real cycle
 
 ```bash
 cd "/Users/daniilmakarov/Desktop/RISEx Spread Shadow"
 ./start
 ```
 
-The prompt describes a real Mainnet cycle. Enter starts it; `C` or `CANCEL` cancels. Before confirmation there is no Keychain/client/network access or cycle reservation. After confirmation the launcher draws one of four equally likely first-account/first-side combinations, atomically reserves the next unused `cycle-NNN` directory with that selection in `launch.json`, then loads protected credentials and prepares one cycle. Keep the terminal running through completion. Existing cycle-001 through cycle-007 are consumed and must never be cleared or reused; this list is historical, and the allocator checks actual directories.
+Enter confirms a real Mainnet cycle; `C` or `CANCEL` cancels. Before confirmation there is no Keychain/network access or slot reservation. Keep the terminal running through completion.
 
-For each normal `./start` or Telegram `/run` cycle, either configured account has a 50% chance to be the source placing the first LIMIT/POST_ONLY order; BUY and SELL each have a 50% chance independently. The receiver is the other account and takes the opposite side with equal BTC quantity. Internal `direction=LONG` means receiver BUY/source SELL; `SHORT` means receiver SELL/source BUY. The selected identities/direction are immutable through preparation, closing and reconciliation, and admission rejects a mismatch with the reservation. Lower-level explicit-plan interfaces retain their specified direction/accounts. Both selected-market positions must initially be exactly zero, with no pending BTC orders. Quantity is sampled once uniformly in legal integer size ticks, capped by the smaller fresh free balance without leverage multiplication. Hold is one sampled integer from 20 through 300 seconds; elapsed holding starts only after independently confirmed paired opening. Actual closure may take longer than the hold.
+The configured directory is `spread-shadow-runs/hood-cycle-race-latency-20260920/operator-v1/`. Its `random-cycle.json` selects BTC market 1, accounts 27331/27337, key index 4, Robinhood signing domain 466324, existing timing defaults and explicit incremental opening-margin deferral. `market-contract.json` binds market/environment evidence; current grids, minimums, balances and timestamps still require validated observations. Do not copy old quotes into current evidence.
 
-Opening and closing obtain their final quote after concurrent account/metadata reads and nonce reservation. The child consumes that exact validated context once, preserving original observation ages and avoiding duplicate account reads after quote selection. Account state and active orders also load concurrently inside the SDK. Both final-price signatures are prepared before exposing the source. Random-cycle pricing requires an exclusive one-tick improvement; a one-tick spread that would merely join existing volume does not qualify. Preparation and safely reconciled paired retries share a maximum of three attempts per opening or closing. Price updates never redraw account roles, side, quantity or hold or loosen bounds.
+Each run reserves a new immutable `cycle-NNN` directory and client prefix. It chooses the first account and BUY/SELL uniformly (four combinations), one legal quantity capped by the smaller free balance without leverage multiplication, and one 20–300 second hold. Roles/quantity/hold never redraw on retry. Both positions must begin exactly flat with no conflicting orders. The first order must rest and pass exact owner/price-priority checks before the other account sends its order. Preparation and safe zero-fill retries share three attempts per phase.
 
-Saved Telegram reports name the selected first account and limit side. `/accounts` uses fixed configuration labels A/B, not per-cycle source/receiver roles.
+HOLD starts only after the full quantity is proved matched between our own orders. Closing reverses the sides and is reduce-only. Known residuals can be closed separately only after complete reconciliation. Unresolved execution stops dependent actions. Normal completion ends the cycle; it never starts the next one automatically.
 
-Both exact orders may be prepared before source exposure. The source LIMIT/POST_ONLY must be confirmed resting before the receiver MARKET/IOC can be transmitted. Receiver admission requires fresh accounts, the exact zero-fill source order and its owner-bound public level, with no better-priced external volume or unproved same-price priority. An external fill can still race the final check; these checks do not guarantee an owned counterparty or atomic execution.
+## Read the messages
 
-HOLD starts only when the full selected quantity is proven to have matched between the two exact own orders. Both accounts reaching the expected positions through external trades is insufficient. External or unproved counterparties stop normal paired progression; known residuals may still be closed through the existing recovery path. A recovered flat result is PARTIAL for the strategy and remains separately confirmed flat for inventory. Telegram reports include the confirmed mutual amount and external/unproved amount on each leg.
+Terminal and Telegram progress shows the two confirmed opening positions, hold duration/start, and **planned closing start in Moscow time**. That time is not a guarantee that all orders and reconciliation finish then. Closing/recovery messages mark opening positions as historical.
 
-Optional numeric fields `max_quote_age_seconds` and `max_source_to_receiver_seconds` in random-cycle JSON add tighter timing bounds; both must be positive and no greater than `freshness_seconds`. The first limits the age of the final source quote; the second limits elapsed time from source dispatch intent to receiver dispatch. Expiry blocks the next dispatch and follows existing cancellation/reconciliation handling. They default to omitted/`null`; HCR-35 does not change the current operator values or claim a calibrated market threshold. The journal records actual quote age, source-to-admission and source-to-receiver intervals for the next operator test.
+The final result keeps these facts separate:
 
-Every fresh cycle process records package file hashes, imported module paths, Git revision/dirty state, Python version and a configuration hash before market preparation. Restart a long-lived controller after a code update so its report formatter uses the accepted version; do so only when its child cycle is inactive. A fresh `./start` process imports current checkout code. Optimized REST remains the active proof source; a WebSocket replacement requires equivalent Robinhood order/ownership evidence first.
-
-Closing reverses both sides with reduce-only orders. Proven cycle residuals use the existing reduce-only fallback only after own pending orders and cancellation-race fills are reconciled. Each residual attempt needs fresh bounds and a unique identity. Reconciled zero-fill attempts are paced; there is no fixed total count for fully reconciled residual attempts and no guaranteed completion time. Uncertain execution blocks dependent writes. The system does not adopt historical positions or start another opening automatically.
-
-## Results and interruption
-
-Preserve `cycle.jsonl`, child opening/closing journals, fallback receipts, configuration, claims and lock files. Never delete a failed slot, edit a journal or change paths to replay an uncertain operation. A missing terminal result is incomplete. A send timeout may mean the order reached the venue; it is not proof of rejection or zero fill.
-
-Interpret these facts independently:
-
-| Fact | Meaning |
+| Field | Meaning |
 | --- | --- |
-| Paired execution | SUCCESS requires full mutual execution between the exact own orders in both opening and closing, with complete reconciliation and no recovery fallback. |
-| Confirmed flat inventory | Resolved terminal execution and causally agreeing final zero positions; isolated zero snapshots are insufficient. |
-| Counterparty matching | Established only by exact trade receipts; flat inventory does not prove it. |
-| Fees/economics | Missing actual-trade fees remain UNKNOWN, including fallback trades. Proven no execution can establish zero execution fees. |
-| Funding and PnL | Unknown funding is not zero. Execution fees or cashflow alone do not establish total profit. |
-| Observation time | Saved account facts are historical, never a current account check. |
+| Paired execution | Full mutual own-order execution must succeed in both opening and closing. Recovery to flat does not make the strategy successful. |
+| Historical position | CONFIRMED_FLAT requires terminal order/trade proof and causal zero positions, not just exit code or a zero snapshot. |
+| Own / external / unproved volume | Exact receipt evidence per opening/closing; A is the first-limit account, B the other. |
+| Fees | Sum of actual proved trade fees, including residual closure; missing fees remain unknown. |
+| Gross execution PnL | SELL notionals minus BUY notionals, only for a complete initial-flat to final-flat cycle. |
+| Net execution PnL | Gross minus all proved commissions, in quote currency. Missing commissions leave net unknown. |
+| Funding | Excluded from execution PnL; the funding-inclusive total remains unknown without its own evidence. |
 
-After interruption, preserve all evidence and inspect it before any later operation. The random-cycle/simple launcher does not resume trading or automatically close historical inventory. Lower-level handoff/series restart interfaces permit only their existing bound read-only reconciliation; they do not authorize replay or a new cycle. A completed process or exit code 0 alone proves neither paired success nor profit.
+The SDK now preserves the account's maker/taker venue and integrator fee fields. Both explicitly zero components prove zero. Nonzero integer units are not yet verified for this venue and are retained as raw evidence, not guessed amounts. Old journals missing these fields remain unchanged. Small PnL values are not rounded to cents.
 
-## Offline saved-cycle report
+After interruption preserve journals/state. A missing terminal or unknown order is not a closed position and cannot be cleared by deleting a lock/state file. The normal launcher never resumes or closes historical inventory automatically; lower-level reconciliation does not authorize replay. `/accounts` is the way to request current selected-market account observations.
 
-The report reads a saved cycle directory or its `cycle.jsonl`; it makes no requests and does not resume execution. For example:
+## Telegram
 
-```bash
-.venv-hood/bin/risex-hood-handoff report --path spread-shadow-runs/hood-cycle-race-latency-20260920/operator-v1/cycle-007
-.venv-hood/bin/risex-hood-handoff report --path spread-shadow-runs/hood-cycle-race-latency-20260920/operator-v1/cycle-007 --json
-```
+Only a fresh exact `/run` from the configured numeric owner in their private chat confirms one real cycle. No parameters, credentials or shell commands are accepted in chat.
 
-Use `--format both` for human and JSON output; repeat `--path` to report separate cycles without adding their results. `paired_execution.direct_counterparty_match` reconstructs exact mutual matching; full matching is required for strategy SUCCESS, while completed exposure remains a separate fact. The reader hashes and counts every input record while retaining bounded details; if required detail is omitted, the report is INCOMPLETE and aggregate execution/inventory/fee proofs remain UNKNOWN. Read the report's completeness and issues as well as its individual execution, inventory and fee conclusions. Process exit alone is not trading success. Saved observation times are historical. Latency stages can overlap; unavailable values and uncertain transport are explicit. Do not sum overlapping windows or infer network/exchange/signing time from an uninstrumented interval.
+| Command | Action |
+| --- | --- |
+| `/run` | Start one real cycle under the same local configuration. |
+| `/status` | Short progress or latest saved result, including a terminal-launched cycle when idle. |
+| `/report` | Saved result plus last position times, per-account fees/PnL and bounded diagnostics. |
+| `/accounts` | Current read-only available balance, selected-market position/orders and observation time for fixed A/B accounts. Other markets are not checked. |
+| `/help` | Explain the commands. |
 
-New journals measure quote-request elapsed time and per-order preparation lock wait, nonce acquisition, SDK signing-call elapsed time and transport roundtrip. Private source lookup and owner-bound public-book observation are separate: the first saved qualifying public snapshot gives an observation bound, not the exact exchange appearance time. Quote age is split at the plan and dispatch-intent boundaries when timestamps exist. Old journals cannot supply new measurements retroactively. Pure CPU, network-only and exchange-processing fractions remain UNKNOWN; signing-call elapsed time is not CPU time.
+Automatic progress notices cover confirmed HOLD, closing and separate residual recovery while a controller-owned cycle runs. Delivery failures/slowness do not cancel or replay trading. Short stages can finish between observations; the final saved report is authoritative. `/status` and `/report` make no venue requests; `/accounts` does not unlock execution or treat missing/stale observations as zero.
 
-`order_state` lists latest saved order observations with their times, unresolved observed orders and unresolved mutation intents. These are historical facts; an empty list does not establish current flatness. Sanitized cycle-003/004/007 fixtures under `tests/fixtures/hood_handoff/` retain source and projection hashes. The report coverage map points to the corresponding incident/action-barrier and crash-boundary regressions.
-
-## Owner-operated Telegram controller
-
-`/accounts` reads both configured accounts on demand using the read-only SDK adapter: available balance (quote currency, not total equity), signed position and active-order count for the configured market, and UTC observation times. Other markets are not checked. Each account can independently be unavailable; failed authentication or timeout never becomes a zero balance/position. Stale observations are labelled. Existing trading keys are read only from Keychain; missing keys never prompt or provision. Reads do not change execution blocks or authorize a launch. The same fresh private-owner checks apply; no account IDs or parameters are accepted in chat. Restart a running controller after updating its code to load this command.
-
-`risex_spread_shadow.hood_handoff.telegram_control` is a separate control interface for the existing configured cycle. The old Funding Farmer Telegram integration remains frozen. Only a fresh exact `/run` message from the configured numeric user ID in that same user's private chat launches one real Mainnet cycle. This command is the operator's launch confirmation; volume and hold selection remain the existing random-cycle policy. `/start` or `/help` explains commands; `/status` and `/report` read local saved state. No credentials, trading parameters, paths or shell commands are accepted in chat.
-
-Messages use Telegram HTML with escaped dynamic values, clear Russian labels and a keyboard containing only `/status`, `/report`, `/accounts` and `/help`. `/status` is brief; `/report` adds saved positions, UTC observation times and bounded journal diagnostics. Paired execution, historical flatness and fee completeness remain separate; a historical zero position is not a current account read. Unknown commands receive help without executing them. Long views are replaced by a complete explanatory message rather than cutting an HTML tag.
-
-Use the project Python directly (no new package installation needed). Replace `YOUR_NUMERIC_USER_ID` locally:
+If the bot is not already provisioned, run locally with the owner's numeric ID:
 
 ```bash
 .venv-hood/bin/python -m risex_spread_shadow.hood_handoff.telegram_control provision \
@@ -100,9 +78,9 @@ Use the project Python directly (no new package installation needed). Replace `Y
   --config spread-shadow-runs/hood-cycle-race-latency-20260920/operator-v1/random-cycle.json
 ```
 
-Provisioning reads the bot token through hidden local input and stores it in native macOS Keychain under the distinct `hood-telegram-control-v1` record. It makes no Telegram or venue request. If this token is already stored, skip provisioning; replacement requires `--replace-token`. Trading keys must already exist in the existing matching Keychain records. A detached runner cannot provision missing trading keys interactively and will stop rather than accept them through Telegram.
+Hidden input stores the bot token in native Keychain (`hood-telegram-control-v1`) without network access. Skip provisioning when already stored; replacement requires `--replace-token`. Trading keys must already be stored in their separately bound records. The detached runner cannot prompt for missing keys.
 
-The operator starts the controller locally:
+Start the controller locally:
 
 ```bash
 .venv-hood/bin/python -m risex_spread_shadow.hood_handoff.telegram_control run \
@@ -110,49 +88,25 @@ The operator starts the controller locally:
   --config spread-shadow-runs/hood-cycle-race-latency-20260920/operator-v1/random-cycle.json
 ```
 
-The computer and controller must remain available for new commands. Incoming polling uses the official [Telegram Bot API](https://core.telegram.org/bots/api#getupdates); old queued commands are discarded at controller startup. Unauthorized, group, forwarded, edited, stale and repeated update IDs cannot launch a cycle. A durable consumed-update marker and active intent precede child launch. A global controller lock survives in the detached child, preventing another controller while a previous child is alive. The existing `simple` launcher also takes an operator-directory lock, excluding concurrent `./start` cycles. Separate lower-level interfaces are not governed by this controller: do not operate them concurrently on these accounts.
+Old queued commands are discarded on startup. Private identity/freshness checks, consumed-update state and active intent prevent duplicate launches. The detached child inherits an instance lock and takes the normal operator lock, excluding another controller/normal launcher. Do not run lower-level interfaces concurrently on these accounts.
 
-Controller state is owner-only under `~/.config/risex-spread-shadow/telegram-control/`, bound to the owner ID, configuration path and configuration/evidence contents. State contains no token. Preserve it and cycle journals on any error; do not clear it to replay a command. Configuration changes require local review and controller restart; a mismatched saved binding fails closed and requires local investigation. There is no automatic relaunch or arbitrary remote reset.
+Stopping the controller does not close positions or kill its child. Restart is blocked while the child retains the lock; afterward complete saved flatness and resolved orders/intents must permit another launch. Owner-only state is under `~/.config/risex-spread-shadow/telegram-control/`, bound to owner/config/evidence. Do not erase it to replay commands. Configuration changes need local review/restart; mismatched binding fails closed. Update an idle controller after code changes; never interrupt an active cycle to deploy.
 
-Stopping the controller does not cancel or kill its detached cycle. After restart, an active child still holds the lock; once it exits, saved terminal evidence must prove historical flat inventory and resolved intents/orders before further launches become available. Incomplete evidence blocks new `/run` commands. A consumed intent with no new slot after child exit is reported as NOT_LAUNCHED, never successful trading. Delivery failure does not repeat or cancel execution; `/report` retrieves the last result. No remote force-stop or automatic closure of historical inventory is provided.
+## Offline diagnosis and other interfaces
 
-## Credentials and account diagnostics
-
-The launcher uses macOS Keychain. Matching entries are bound to API origin, signing environment/domain, account and key index. A missing key is requested through hidden interactive input; Keychain failure stops without plaintext fallback. Credentials never belong in arguments, environment variables, project files, reports or Git. Do not paste a key into an ordinary shell prompt.
-
-The lower-level CLI supports `--keychain`, `--keychain-replace` and `--keychain-remove` as mutually exclusive options. Removal deletes only the matching local record, exits without an SDK client or requests, and does not revoke a venue key. Help and offline previews do not access Keychain.
-
-The separate owner-run `readiness` command authenticates read-only account/market requests, never order submission or cancellation:
+Read a saved cycle without credentials, network or mutation:
 
 ```bash
-.venv-hood/bin/risex-hood-handoff readiness \
-  --symbol BTC --quantity 0.00020 --direction LONG \
-  --source-account-index 27331 --receiver-account-index 27337 \
-  --api-key-index 4 --freshness-seconds 120 --request-timeout-seconds 10 \
-  --keychain
+.venv-hood/bin/python -m risex_spread_shadow.hood_handoff.cli report \
+  --path spread-shadow-runs/hood-cycle-race-latency-20260920/operator-v1/cycle-011
 ```
 
-These are diagnostic bounds, not trading thresholds. Read `checks`: PASS establishes the named condition; BLOCKED is a failed condition; UNKNOWN lacks proof; UNSET is an unchosen parameter. Exit 0 means diagnostic READY, not permission or a promise to trade. `execution_authorized` remains false. Current incremental opening-margin estimates may remain `MARGIN_EVIDENCE_REQUIRED`; available balance is not substituted for that proof.
+Add `--json` for hashes, exact receipts, orders/intents, reasons, accounting and latency. Overlapping durations cannot be added; unavailable time is not zero. Saved facts do not establish current account state.
 
-The configured paired-opening margin deferral skips only missing local incremental-margin calculation/provenance. Missing values remain uncalculated; supplied invalid or insufficient estimates still block. It preserves current account margin/balance, identity, position, quantity, minimum and freshness checks. Readiness and CLOSE_REOPEN do not accept the deferral.
+Keys use native Keychain bound to API/signing environment, account and key index, or hidden local input. No plaintext fallback, arguments, environment variables, project files or logs. `--keychain-replace`/`--keychain-remove` affect the exact local record; removal does not revoke a venue key. Help/previews stay offline.
 
-## Other utility interfaces
+`readiness` is an explicitly invoked read-only diagnostic, never permission to trade. Missing incremental opening-margin proof remains UNKNOWN; the configured opening deferral skips only that missing estimate, not other checks or known insufficiency. `local-attempt` is fixed-quantity paired opening without automatic cycle closure. `run` retains explicit handoff/series and their non-reusable claims. Use their `--help` and SYSTEM_SPEC; none guarantees atomic execution.
 
-`local-attempt` is a separate fixed-quantity paired opening and does not gain random-cycle automatic closure. Its automatic proposal is selected after `LAUNCH`; explicit source and receiver bounds must be supplied together. The diagnostic packet and non-reusable attempt claim are retained even after a failure. Ordinary quote movement is not stale data; missing engine/storage completion remains incomplete.
+Existing series uses a new paired operation per slice. One standing limit consumed by several market orders is a future task; every fragment must satisfy minimum quantity/notional, and balance has not been proved to be the sole constraint.
 
-`run` retains explicit configured single handoff and series interfaces. Default preview is offline; exact quantities, prices, timing, identities and market evidence must be supplied. No historical example grants new execution authority. Use `--help` and `SYSTEM_SPEC.md` for the existing interface contract; preserve the same binding for reconciliation. None of these interfaces provides two-account atomicity or native position transfer.
-
-## Saved research tools and frozen boundaries
-
-The public/paper scanner remains separate from `risex-hood-handoff`. Existing saved-input commands are offline:
-
-```bash
-.venv-hood/bin/risex-spread-shadow record-readback /absolute/run/evidence.jsonl --format table
-.venv-hood/bin/risex-spread-shadow research-report /absolute/run/evidence.jsonl --format json
-.venv-hood/bin/risex-spread-shadow cycle-report /absolute/campaign-root --format json
-.venv-hood/bin/risex-spread-shadow scan-report /absolute/run/evidence.jsonl --format table
-```
-
-`research-report --output-json /absolute/new-report.json` additionally writes an exclusive owner-only report. Research scenarios are conditional alternatives, never additive or independent realized trades. Open marks and unfinished cashflows are not closed profit; funding remains separately unknown. Recording completeness is distinct from data eligibility and economic sufficiency.
-
-Public recording/collection requires a new prospective gate in NEXT_TASK; completed smoke/pilot/CAL windows and claims cannot be reused. The RISEx authenticated fee reader remains quarantined. Legacy Funding Farmer, Telegram, and isolated venue testnet/private modules are frozen and grant no operational authority. This task does not reopen capacity research, old campaigns or another repository.
+Public/paper scanners and legacy Funding Farmer/Telegram/testnet modules remain isolated and frozen. Saved readback/report tools remain offline; new collection or campaigns require a new prospective NEXT_TASK contract. Historical details are preserved in Git at the revision linked in SYSTEM_SPEC.
