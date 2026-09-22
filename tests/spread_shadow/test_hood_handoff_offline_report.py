@@ -800,11 +800,11 @@ def test_report_preserves_sdk_timing_numbers_but_never_invents_percentages(compl
 def test_projection_preserves_nested_secret_redaction_and_safe_ids():
     from risex_spread_shadow.hood_handoff.offline_report import _bounded_json
 
-    value = {'plan': {'api_key_index': 4, 'reason': 'Bearer synthetic-canary',
+    value = {'plan': {'account_index': 4, 'reason': 'Bearer synthetic-canary',
                       'private_key': 'synthetic-secret',
                       'trades': [{'reason': 'private_key=synthetic-canary', 'quantity': '0.20'}]}}
     projected = _bounded_json(value)
-    assert projected == {'plan': {'api_key_index': 4, 'reason': '[REDACTED]',
+    assert projected == {'plan': {'account_index': 4, 'reason': '[REDACTED]',
                                  'trades': [{'reason': '[REDACTED]', 'quantity': '0.20'}]}}
     assert 'synthetic' not in json.dumps(projected)
 
