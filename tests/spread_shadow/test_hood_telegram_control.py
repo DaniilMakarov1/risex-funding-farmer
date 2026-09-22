@@ -196,7 +196,8 @@ def test_token_binding_is_separate_from_trading_keys():
     assert bot.BotBinding().record_account == 'hood-telegram-control-v1'
 
 
-async def test_server_discards_backlog_and_uses_fixed_detached_child(tmp_path, monkeypatch):
+@pytest.mark.parametrize('command,entry', [('/run','simple'),('/close','close-positions')])
+async def test_server_discards_backlog_and_uses_fixed_detached_child(tmp_path, monkeypatch, command, entry):
     tmp_path.chmod(0o700)
     config = tmp_path / 'random-cycle.json'
     config.write_text('{}')
@@ -214,10 +215,10 @@ async def test_server_discards_backlog_and_uses_fixed_detached_child(tmp_path, m
             self.reads += 1
             if self.reads == 1:
                 assert payload['offset'] == -1
-                return [update(10)]
+                return [update(10,command)]
             if self.reads == 2:
                 assert payload['offset'] == 11
-                return [update(11)]
+                return [update(11,command)]
             await completed.wait()
             raise Stop()
     class Session:
@@ -232,7 +233,14 @@ async def test_server_discards_backlog_and_uses_fixed_detached_child(tmp_path, m
         calls.append((args, kwargs))
         return Process()
     real = bot.Controller
-    monkeypatch.setattr(bot, 'Controller', lambda *args, **kwargs: real(*args, now=lambda: 1000))
+    monkeypatch.setattr(bot, 'Controller', lambda *args, **kwargs: real(*args, **kwargs, now=lambda: 1000))
+    from risex_spread_shadow.hood_handoff import cli, operator_recovery
+    checks=[]
+    async def recover(*args, require_flat=True):
+        checks.append(require_flat)
+        return {'status':'READY' if require_flat else 'CLOSE_READY','at':1000}
+    monkeypatch.setattr(cli,'_validate_simple_local_inputs',lambda *a,**k:(object(),{}))
+    monkeypatch.setattr(operator_recovery,'check_recovery',recover)
     monkeypatch.setattr(bot, 'Telegram', API)
     monkeypatch.setattr(bot.aiohttp, 'ClientSession', Session)
     monkeypatch.setattr(bot.asyncio, 'create_subprocess_exec', create)
@@ -241,9 +249,10 @@ async def test_server_discards_backlog_and_uses_fixed_detached_child(tmp_path, m
     monkeypatch.setattr(Path, 'is_file', lambda p: True if str(p).endswith('.venv-hood/bin/python') else original_is_file(p))
     with pytest.raises(Stop):
         await bot.serve(SimpleNamespace(config=config, owner_id=42), store, 99, 'synthetic-token-not-used')
+    assert checks == [command == '/run']
     assert len(calls) == 1
     argv, kwargs = calls[0]
-    assert argv[1:5] == ('-m', 'risex_spread_shadow.hood_handoff.cli', 'simple', '--keychain')
+    assert argv[1:5] == ('-m', 'risex_spread_shadow.hood_handoff.cli', entry, '--keychain')
     assert argv[-2:] == ('--config', str(config))
     assert kwargs['pass_fds'] == (99,)
     assert kwargs['start_new_session'] is True
@@ -320,20 +329,20 @@ async def test_changed_config_does_not_start_a_child(tmp_path, monkeypatch):
             await finished.wait()
             raise Stop()
         async def send(self, owner, text):
-            if 'готовность' in text: finished.set()
+            if 'Новая операция пока не начата' in text: finished.set()
     class Session:
         def __init__(self, **kwargs): pass
         async def __aenter__(self): return self
         async def __aexit__(self, *args): pass
     real = bot.Controller
-    monkeypatch.setattr(bot, 'Controller', lambda *args, **kwargs: real(*args, now=lambda: 1000))
+    monkeypatch.setattr(bot, 'Controller', lambda *args, **kwargs: real(*args, **kwargs, now=lambda: 1000))
     monkeypatch.setattr(bot, 'Telegram', API)
     monkeypatch.setattr(bot.aiohttp, 'ClientSession', Session)
     monkeypatch.setattr(Path, 'is_file', lambda _: True)
     monkeypatch.setattr(bot.asyncio, 'create_subprocess_exec', lambda *args, **kwargs: pytest.fail('changed configuration dispatched'))
     with pytest.raises(Stop):
         await bot.serve(SimpleNamespace(config=config, owner_id=42), store, 99, 'unused')
-    assert store.data['active'] is not None
+    assert store.data['active'] is None
 
 
 @pytest.mark.parametrize("failed", [False, True])

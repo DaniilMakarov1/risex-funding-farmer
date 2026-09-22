@@ -190,7 +190,8 @@ def execution_lines(result, *, phase, attempt=1):
                     or len({t.trade_id for t in trades}) != len(trades)):
                 raise ValueError('unproved leg')
             if value['dispatched']:
-                if order is None or not order.terminal or _fallback_order_mismatch_map(order, plan) or order.filled_quantity != qty:
+                if (order is None or value.get('order_id') != order.order_id or not order.terminal
+                        or _fallback_order_mismatch_map(order, plan) or order.filled_quantity != qty):
                     raise ValueError('unproved terminal order')
             elif order is not None or trades or qty != 0:
                 raise ValueError('unsent leg has fills')
@@ -205,7 +206,9 @@ def execution_lines(result, *, phase, attempt=1):
         except (KeyError, ValueError, TypeError, AttributeError):
             legs[role] = None
     matched = Decimal(0)
-    if all(legs.values()):
+    if (all(legs.values()) and legs['source'].account_index != legs['receiver'].account_index
+            and mapping(plans.get('source')).get('market_id') == mapping(plans.get('receiver')).get('market_id')
+            and mapping(plans.get('source')).get('side') != mapping(plans.get('receiver')).get('side')):
         _, matched, _ = _joint_trade_match(legs['source'], legs['receiver'], number(plans.get('quantity')) or Decimal(0))
     label = 'Открытие' if phase == 'opening' else 'Закрытие'
     lines = [f'{label} · попытка {clean(attempt, 8)}']

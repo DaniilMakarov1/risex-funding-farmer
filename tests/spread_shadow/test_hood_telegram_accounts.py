@@ -180,7 +180,7 @@ async def test_serve_accounts_bound_configuration(tmp_path, monkeypatch, changed
         reads.append(c)
         return inspected
     real = bot.Controller
-    monkeypatch.setattr(bot, 'Controller', lambda *a: real(*a, now=lambda:1000))
+    monkeypatch.setattr(bot, 'Controller', lambda *a, **kw: real(*a, **kw, now=lambda:1000))
     monkeypatch.setattr(bot, 'Telegram', API)
     monkeypatch.setattr(bot.aiohttp, 'ClientSession', Session)
     monkeypatch.setattr(Path, 'is_file', lambda _: True)

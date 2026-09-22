@@ -1,7 +1,7 @@
 """Owner-operated Telegram control. Import, help and tests are offline.
 
-Only the owner's fresh private /run message requests a cycle. This module is
-not started by the coding agent; the operator provisions and runs it locally.
+Only the owner's fresh private /run or /close message requests execution.
+Starting the controller itself never submits orders.
 """
 from __future__ import annotations
 
