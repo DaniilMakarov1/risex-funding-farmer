@@ -1876,8 +1876,10 @@ class RandomCycleEngine:
         tokens = tuple(self._pending_nonces.values())
         self._pending_nonces.clear()
         self._nonce_deadline = None
+        if not tokens:
+            return
         invalidate = getattr(self.client, "invalidate_reserved_nonce", None)
-        if tokens and callable(invalidate):
+        if callable(invalidate):
             await asyncio.gather(*(invalidate(token) for token in tokens))
 
     async def _reserve_preflight_nonces(self, config: RandomCycleConfig) -> None:
