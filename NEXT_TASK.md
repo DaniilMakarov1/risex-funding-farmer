@@ -13,3 +13,5 @@ Completed in candidate `e580369e0c4b439b5d556efd657521e3279e7754`. 276 affected 
 ## Owner-authorized controller startup
 
 The owner explicitly requested a restart after HCR-32 delivery. No existing controller/runner process was found; the controller lock is free and saved active/last are null. Start the accepted updated controller with the existing bound owner and configuration, preserve state and credentials, and verify process/lock/network health. This is controller deployment only: do not send `/run`, synthesize owner commands, query trading accounts or place orders during startup verification. Subsequent operator commands retain existing authorization and safety gates.
+
+Startup completed: PID 76249, controller lock held, established Telegram HTTPS connection, no startup log errors. Existing state and configuration preserved; no owner command synthesized. The controller remains running under operator command ownership. Startup evidence: `spread-shadow-runs/hood-telegram-accounts-20260922/startup/`.
