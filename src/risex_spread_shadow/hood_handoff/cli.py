@@ -976,6 +976,11 @@ def _simple_event_line(row: Mapping[str, Any]) -> str | None:
                     and not source_trades
                 )
                 if zero_fill_cancel:
+                    if str(source_order.get("status", "")).lower() == "canceled-post-only":
+                        return (
+                            "Источник отменён как canceled-post-only без исполнения; "
+                            "цикл не открыт, ордер приёмника не отправлялся."
+                        )
                     return "Источник подтверждён как zero-fill/cancel; ордер приёмника не отправлялся."
                 return "Источник: исполнение не подтверждено; ордер приёмника не отправлялся."
         return "Открытие и его сверка завершены."
@@ -1237,19 +1242,54 @@ def format_random_cycle_result_ru(
         f"paired_execution={paired_execution}; inventory={inventory}; economics={economics}."
     )
     terminal_facts = terminal_cycle_facts(result)
+    opening_canceled = False
+    closing_canceled = False
     if terminal_facts:
         lines.append("Терминальные факты: " + "; ".join(terminal_facts) + ".")
+        opening_canceled = any("cycle not opened" in fact for fact in terminal_facts)
+        closing_canceled = any("paired close not completed" in fact for fact in terminal_facts)
+        if opening_canceled:
+            lines.append(
+                "Источник: canceled-post-only без исполнения; цикл не открыт, "
+                "ордер приёмника не отправлялся."
+            )
+        elif closing_canceled:
+            recovery = "; восстановление продолжено через fallback" if fallbacks else ""
+            lines.append(
+                "Закрытие: source canceled-post-only без исполнения; "
+                f"парное закрытие не завершено{recovery}."
+            )
+
+    opening_receiver_leg = None if opening is None else getattr(opening, "receiver", None)
+    if closing_canceled and opening_receiver_leg is not None:
+        opening_receiver_order = getattr(opening_receiver_leg, "order", None)
+        opening_receiver_status = getattr(opening_receiver_order, "status", None)
+        if opening_receiver_status is None and isinstance(opening_receiver_order, Mapping):
+            opening_receiver_status = opening_receiver_order.get("status")
+        if getattr(opening_receiver_leg, "dispatched", True) is False:
+            lines.append(
+                "Приёмник открытия: ордер не отправлялся; это не отмена уже отправленного ордера."
+            )
+        elif opening_receiver_status:
+            lines.append(
+                f"Приёмник открытия: ордер отправлен; известное состояние {opening_receiver_status}."
+            )
+        else:
+            lines.append("Приёмник открытия: ордер отправлен; конечное состояние не подтверждено.")
+    receiver_label = "Приёмник закрытия" if closing_canceled else "Приёмник"
     if receiver_not_dispatched:
-        lines.append("Приёмник: ордер не отправлялся; это не отмена уже отправленного ордера.")
+        label = receiver_label
+        lines.append(f"{label}: ордер не отправлялся; это не отмена уже отправленного ордера.")
     elif receiver_leg is not None:
         receiver_order = getattr(receiver_leg, "order", None)
         receiver_status = getattr(receiver_order, "status", None)
         if receiver_status is None and isinstance(receiver_order, Mapping):
             receiver_status = receiver_order.get("status")
+        label = receiver_label
         if receiver_status:
-            lines.append(f"Приёмник: ордер отправлен; известное состояние {receiver_status}.")
+            lines.append(f"{label}: ордер отправлен; известное состояние {receiver_status}.")
         else:
-            lines.append("Приёмник: ордер отправлен; конечное состояние не подтверждено.")
+            lines.append(f"{label}: ордер отправлен; конечное состояние не подтверждено.")
     if accepted_fallback:
         lines.append("Fallback: dispatch принят.")
     if fallbacks:

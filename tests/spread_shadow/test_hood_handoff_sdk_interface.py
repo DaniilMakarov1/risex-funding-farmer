@@ -1,13 +1,16 @@
+import asyncio
 import copy
 from pathlib import Path
 from dataclasses import replace
 from decimal import Decimal
+from time import perf_counter
 
 import pytest
 
 from risex_spread_shadow.hood_handoff import (
     ContractError,
     HandoffConfig,
+    HandoffEngine,
     LighterSdkClient,
     OrderPlan,
     REQUIRED_LIGHTER_SDK_VERSION,
@@ -81,6 +84,51 @@ class AmbiguousConstantHttp(FakeHttp):
     async def post_form(self, path, *, form):
         self.calls.append((path, dict(form)))
         raise TimeoutError("synthetic response ambiguity")
+
+
+class DelayedSigner(FakeSigner):
+    """Synthetic signer with shared timing and failure instrumentation."""
+
+    def __init__(self, tracker, **kwargs):
+        super().__init__(**kwargs)
+        self.tracker = tracker
+
+    async def sign_create_order(self, **kwargs):
+        account_index = self.kwargs["account_index"]
+        self.tracker["active"] += 1
+        self.tracker["peak"] = max(self.tracker["peak"], self.tracker["active"])
+        self.tracker["started"].append((account_index, perf_counter()))
+        try:
+            delay = self.tracker["delays"].get(account_index, self.tracker["delay"])
+            await asyncio.sleep(delay)
+            if account_index in self.tracker["fail_accounts"]:
+                raise ContractError(f"synthetic signing failure for account {account_index}")
+            return await super().sign_create_order(**kwargs)
+        finally:
+            self.tracker["active"] -= 1
+
+
+def _delayed_tracker(*, delay=0.03, delays=None, fail_accounts=()):
+    return {
+        "active": 0,
+        "peak": 0,
+        "delay": delay,
+        "delays": {} if delays is None else dict(delays),
+        "fail_accounts": set(fail_accounts),
+        "started": [],
+    }
+
+
+def _delayed_client(prefix: str, tracker) -> LighterSdkClient:
+    return LighterSdkClient(
+        _sdk_config(prefix),
+        source_account_index=11,
+        receiver_account_index=22,
+        secrets=StaticSecretProvider({11: "synthetic-source", 22: "synthetic-receiver"}),
+        market_evidence={},
+        signer_factory=lambda **kwargs: DelayedSigner(tracker, **kwargs),
+        http_factory=FakeHttp,
+    )
 
 
 def _sdk_config(prefix: str) -> HandoffConfig:
@@ -534,6 +582,114 @@ async def test_prepared_sdk_pair_covers_reduce_only_closing_cycle(monkeypatch):
     assert [call["reduce_only"] for call in signer.sign_calls] == [True, True]
     assert [call["nonce"] for call in signer.sign_calls] == [41, 42]
     assert len(client._http.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_sdk_preparation_overlaps_distinct_accounts_but_serializes_same_account(monkeypatch):
+    monkeypatch.setattr(LighterSdkClient, "verify_sdk", staticmethod(lambda: None))
+
+    overlap_tracker = _delayed_tracker()
+    overlap_client = _delayed_client("lock-overlap", overlap_tracker)
+    overlap_client._lighter = lambda: FakeModule
+    source = _sdk_plan(account_index=11, client_order_index=701)
+    receiver = _sdk_plan(
+        account_index=22,
+        order_type="MARKET",
+        time_in_force="IOC",
+        client_order_index=702,
+    )
+    started = perf_counter()
+    source_prepared, receiver_prepared = await asyncio.gather(
+        overlap_client.prepare_order(source),
+        overlap_client.prepare_order(receiver),
+    )
+    overlap_elapsed = perf_counter() - started
+
+    assert overlap_tracker["peak"] == 2
+    assert overlap_tracker["started"]
+    assert max(at for _, at in overlap_tracker["started"]) - min(
+        at for _, at in overlap_tracker["started"]
+    ) < overlap_tracker["delay"] * 0.5
+    assert overlap_elapsed < overlap_tracker["delay"] * 1.8
+    await overlap_client.invalidate_prepared_order(source_prepared)
+    await overlap_client.invalidate_prepared_order(receiver_prepared)
+    assert overlap_client._nonce_reservations == {}
+    assert {item._state for item in overlap_client._prepared_registry.values()} == {"INVALIDATED"}
+
+    serial_tracker = _delayed_tracker()
+    serial_client = _delayed_client("lock-serial", serial_tracker)
+    serial_client._lighter = lambda: FakeModule
+    same_account = _sdk_plan(account_index=11, client_order_index=703)
+    same_account_again = replace(same_account, client_order_index=704)
+    started = perf_counter()
+    first, second = await asyncio.gather(
+        serial_client.prepare_order(same_account),
+        serial_client.prepare_order(same_account_again),
+    )
+    serial_elapsed = perf_counter() - started
+
+    assert serial_tracker["peak"] == 1
+    assert serial_elapsed > overlap_elapsed * 1.35
+    await serial_client.invalidate_prepared_order(first)
+    await serial_client.invalidate_prepared_order(second)
+    assert serial_client._nonce_reservations == {}
+    assert {item._state for item in serial_client._prepared_registry.values()} == {"INVALIDATED"}
+
+
+@pytest.mark.asyncio
+async def test_sdk_prepared_pair_failure_drains_successful_preparation(monkeypatch):
+    tracker = _delayed_tracker(delay=0.01, fail_accounts={22})
+    client = _delayed_client("lock-failure-drain", tracker)
+    client._lighter = lambda: FakeModule
+    monkeypatch.setattr(LighterSdkClient, "verify_sdk", staticmethod(lambda: None))
+
+    with pytest.raises(ContractError, match="synthetic signing failure"):
+        await HandoffEngine(client)._prepare_pair(
+            _sdk_plan(account_index=11, client_order_index=711),
+            _sdk_plan(
+                account_index=22,
+                order_type="MARKET",
+                time_in_force="IOC",
+                client_order_index=712,
+            ),
+        )
+
+    assert tracker["active"] == 0
+    assert client._nonce_reservations == {}
+    assert {item._state for item in client._prepared_registry.values()} == {"INVALIDATED"}
+    assert client._blocked_nonces == {}
+
+
+@pytest.mark.asyncio
+async def test_sdk_prepared_pair_cancellation_drains_registered_source(monkeypatch):
+    tracker = _delayed_tracker(delay=0.05, delays={11: 0.001})
+    client = _delayed_client("lock-cancel-drain", tracker)
+    client._lighter = lambda: FakeModule
+    monkeypatch.setattr(LighterSdkClient, "verify_sdk", staticmethod(lambda: None))
+    pair_task = asyncio.create_task(
+        HandoffEngine(client)._prepare_pair(
+            _sdk_plan(account_index=11, client_order_index=721),
+            _sdk_plan(
+                account_index=22,
+                order_type="MARKET",
+                time_in_force="IOC",
+                client_order_index=722,
+            ),
+        )
+    )
+    for _ in range(100):
+        if client._prepared_registry:
+            break
+        await asyncio.sleep(0.001)
+    assert client._prepared_registry
+    pair_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pair_task
+
+    assert tracker["active"] == 0
+    assert client._nonce_reservations == {}
+    assert {item._state for item in client._prepared_registry.values()} == {"INVALIDATED"}
+    assert client._blocked_nonces == {}
 
 
 @pytest.mark.asyncio

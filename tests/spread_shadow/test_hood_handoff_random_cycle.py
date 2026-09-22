@@ -19,6 +19,7 @@ from risex_spread_shadow.hood_handoff import (
     Direction,
     FallbackResult,
     HandoffPlan,
+    HandoffEngine,
     HandoffResult,
     HistoryPage,
     LegReconciliation,
@@ -364,6 +365,98 @@ class CycleClient:
     async def list_trades(self, account_index: int, market_id: int, *, order_id=None, cursor=None, limit=100):
         assert cursor is None
         return HistoryPage(trades=self.trades.get(str(order_id), ()))
+
+
+class PostOnlyCancelClient(CycleClient):
+    """Cancel exact source POST_ONLY orders to exercise bounded paired retry."""
+
+    def __init__(
+        self,
+        clock: AdvancingClock,
+        *,
+        closing: bool = False,
+        cancel_count: int = 1,
+        terminal_status: str = "canceled-post-only",
+        filled_quantity: Decimal = Decimal("0"),
+        history_complete: bool = True,
+        mutate_position: bool = False,
+        ambiguous_source: bool = False,
+    ) -> None:
+        super().__init__(clock)
+        self.closing = closing
+        self.cancel_count = cancel_count
+        self.terminal_status = terminal_status
+        self.source_filled_quantity = filled_quantity
+        self.history_complete = history_complete
+        self.mutate_position = mutate_position
+        self.ambiguous_source = ambiguous_source
+        self.canceled_source_orders: set[str] = set()
+        self.source_limit_attempts = 0
+
+    def _is_source_limit(self, plan) -> bool:
+        return plan.order_type == "LIMIT" and bool(plan.reduce_only) == self.closing
+
+    async def submit_order(self, plan):
+        source_limit = self._is_source_limit(plan)
+        if source_limit:
+            self.source_limit_attempts += 1
+        receipt = await super().submit_order(plan)
+        if source_limit and self.source_limit_attempts <= self.cancel_count:
+            assert receipt.order_id is not None
+            current = self.orders[(plan.account_index, receipt.order_id)]
+            filled = self.source_filled_quantity
+            assert Decimal("0") <= filled <= current.initial_quantity
+            self._replace_order(
+                current,
+                status=self.terminal_status,
+                remaining_quantity=(
+                    Decimal("0") if filled == 0 else current.initial_quantity - filled
+                ),
+                filled_quantity=filled,
+            )
+            if filled:
+                delta = filled if current.side == "BUY" else -filled
+                self.source_position += delta
+                self.trades[current.order_id] = (
+                    TradeReceipt(
+                        f"post-only-partial-{current.order_id}",
+                        current.account_index,
+                        current.market_id,
+                        current.order_id,
+                        current.side,
+                        filled,
+                        current.price,
+                        None,
+                        999,
+                        self.clock.now(),
+                        client_order_index=current.client_order_index,
+                    ),
+                )
+            else:
+                self.trades[current.order_id] = ()
+            self.canceled_source_orders.add(current.order_id)
+            if self.mutate_position:
+                self.source_position += Decimal("0.01")
+            if self.ambiguous_source:
+                raise TimeoutError("synthetic post-only send ambiguity")
+        return receipt
+
+    async def list_trades(self, account_index: int, market_id: int, *, order_id=None, cursor=None, limit=100):
+        page = await super().list_trades(
+            account_index,
+            market_id,
+            order_id=order_id,
+            cursor=cursor,
+            limit=limit,
+        )
+        if str(order_id) in self.canceled_source_orders and not self.history_complete:
+            return HistoryPage(
+                trades=page.trades,
+                orders=page.orders,
+                next_cursor=page.next_cursor,
+                complete=False,
+            )
+        return page
 
 
 class GuardSequenceClient(CycleClient):
@@ -1501,6 +1594,248 @@ async def test_shared_pair_attempt_budget_exhaustion_never_dispatches_receiver_o
     exhausted = [row for row in rows if row["event"] == "PAIR_ATTEMPT_EXHAUSTED"]
     assert exhausted
     assert exhausted[-1]["payload"]["maximum_attempts"] == 3
+
+
+@pytest.mark.asyncio
+async def test_canceled_post_only_zero_fill_retries_opening_with_preserved_guard_evidence(tmp_path):
+    clock = AdvancingClock()
+    client = PostOnlyCancelClient(clock)
+    cycle_path = tmp_path / "post-only-opening"
+    result = await run_random_cycle(
+        cycle_config(cycle_path),
+        client,
+        clock=clock,
+        rng=FixedRng(20, 20),
+    )
+
+    assert result.outcome is Outcome.SUCCESS, result.as_dict()
+    assert result.opening is not None and result.opening.attempt_index == 2
+    source_limits = [
+        plan
+        for plan in client.submissions
+        if plan.order_type == "LIMIT" and not plan.reduce_only
+    ]
+    assert len(source_limits) == 2
+    assert len({plan.client_order_index for plan in source_limits}) == 2
+    first_rows = [
+        json.loads(line)
+        for line in (cycle_path / "opening.jsonl").read_text().splitlines()
+    ]
+    guard_rows = [row for row in first_rows if row["event"] == "PRE_RECEIVER_GUARD"]
+    assert guard_rows
+    guard = guard_rows[0]["payload"]
+    assert guard["status"] == "UNKNOWN"
+    assert guard["terminal_reason"] == "canceled-post-only"
+    assert guard["book_observation_available"] is True
+    assert guard["priority_proof_admitted"] is False
+    assert guard["book_observed_at"] == NOW
+    assert guard["best_ask"] is not None
+    assert guard["source_recheck"] is not None
+    assert guard["receiver_recheck"] is not None
+    assert any(row["event"] == "SOURCE_CANCELED_POST_ONLY_ZERO_FILL" for row in first_rows)
+    assert not [row for row in first_rows if row["event"] == "RECEIVER_DISPATCH_INTENT"]
+    assert (cycle_path / "opening-attempt-002.jsonl").is_file()
+
+
+@pytest.mark.asyncio
+async def test_canceled_post_only_zero_fill_retries_closing_before_residual_fallbacks(tmp_path):
+    clock = AdvancingClock()
+    client = PostOnlyCancelClient(clock, closing=True)
+    cycle_path = tmp_path / "post-only-closing"
+    result = await run_random_cycle(
+        cycle_config(cycle_path),
+        client,
+        clock=clock,
+        rng=FixedRng(20, 20),
+    )
+
+    assert result.outcome is Outcome.SUCCESS, result.as_dict()
+    assert result.closing is not None and result.closing.attempt_index == 2
+    close_limits = [
+        plan
+        for plan in client.submissions
+        if plan.order_type == "LIMIT" and plan.reduce_only
+    ]
+    assert len(close_limits) == 2
+    assert len({plan.client_order_index for plan in close_limits}) == 2
+    assert not client.fallback_plans
+    assert (cycle_path / "closing-attempt-002.jsonl").is_file()
+
+
+@pytest.mark.asyncio
+async def test_closing_post_only_retry_exhaustion_reports_recovery_without_erasing_opening_dispatch(tmp_path):
+    clock = AdvancingClock()
+    client = PostOnlyCancelClient(clock, closing=True, cancel_count=99)
+    cycle_path = tmp_path / "post-only-closing-exhausted"
+    result = await run_random_cycle(
+        cycle_config(cycle_path),
+        client,
+        clock=clock,
+        rng=FixedRng(20, 20),
+    )
+
+    assert result.outcome is Outcome.SUCCESS, result.as_dict()
+    assert result.opening is not None and result.opening.receiver is not None
+    assert result.opening.receiver.dispatched is True
+    assert result.closing is not None and result.closing.attempt_index == 3
+    close_limits = [
+        plan
+        for plan in client.submissions
+        if plan.order_type == "LIMIT" and plan.reduce_only
+    ]
+    assert len(close_limits) == 3
+    assert len({plan.client_order_index for plan in close_limits}) == 3
+    assert len(client.fallback_plans) == 2
+
+    facts = random_cycle_module.terminal_cycle_facts(result)
+    assert "paired closing source canceled-post-only zero-fill; paired close not completed" in facts
+    assert not any("cycle not opened" in fact for fact in facts)
+    assert result.reason is not None
+    assert "paired closing: paired closing source canceled-post-only zero-fill" in result.reason
+    assert "cycle not opened" not in result.reason
+    output = cli_module.format_random_cycle_result_ru(result)
+    assert "парное закрытие не завершено" in output
+    assert "восстановление продолжено через fallback" in output
+    assert "Приёмник открытия: ордер отправлен" in output
+    assert "Приёмник закрытия: ордер не отправлялся" in output
+    assert "цикл не открыт" not in output
+
+
+@pytest.mark.asyncio
+async def test_canceled_post_only_retry_budget_exhaustion_proves_no_trade_fees(tmp_path):
+    clock = AdvancingClock()
+    client = PostOnlyCancelClient(clock, cancel_count=99)
+    cycle_path = tmp_path / "post-only-budget"
+    result = await run_random_cycle(
+        cycle_config(cycle_path),
+        client,
+        clock=clock,
+        rng=FixedRng(20, 20),
+    )
+
+    assert result.outcome is Outcome.PARTIAL, result.as_dict()
+    assert result.opening is not None and result.opening.attempt_index == 3
+    source_limits = [
+        plan
+        for plan in client.submissions
+        if plan.order_type == "LIMIT" and not plan.reduce_only
+    ]
+    assert len(source_limits) == 3
+    assert len({plan.client_order_index for plan in source_limits}) == 3
+    assert not [
+        plan
+        for plan in client.submissions
+        if plan.order_type == "MARKET" and not plan.reduce_only
+    ]
+    assert result.economics == "KNOWN"
+    assert result.reason is not None
+    assert "canceled-post-only" in result.reason
+    assert "cycle not opened" in result.reason
+    assert "fees UNKNOWN" not in result.reason
+    assert any("no execution proven" in finding for finding in result.economic_findings)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"terminal_status": "canceled"},
+        {"history_complete": False},
+        {"filled_quantity": Decimal("0.10")},
+        {"mutate_position": True},
+        {"ambiguous_source": True},
+    ],
+)
+async def test_canceled_post_only_retry_rejects_adverse_or_incomplete_source_evidence(tmp_path, kwargs):
+    clock = AdvancingClock()
+    client = PostOnlyCancelClient(clock, **kwargs)
+    cycle_path = tmp_path / "post-only-adverse"
+    result = await run_random_cycle(
+        cycle_config(cycle_path),
+        client,
+        clock=clock,
+        rng=FixedRng(20, 20),
+    )
+
+    assert result.opening is not None and result.opening.attempt_index == 1
+    source_limits = [
+        plan
+        for plan in client.submissions
+        if plan.order_type == "LIMIT" and not plan.reduce_only
+    ]
+    assert len(source_limits) == 1
+    assert not [
+        plan
+        for plan in client.submissions
+        if plan.order_type == "LIMIT" and not plan.reduce_only and plan is not source_limits[0]
+    ]
+    assert result.opening.retryable_pair is False
+    assert not any(
+        row["event"] == "PAIR_ATTEMPT_RETRY"
+        for row in (
+            json.loads(line)
+            for line in (cycle_path / "cycle.jsonl").read_text().splitlines()
+        )
+    )
+
+
+def test_canceled_post_only_retry_does_not_accept_an_arbitrary_scalar_reason():
+    source_plan = SimpleNamespace(
+        account_index=11,
+        market_id=7,
+        client_order_index=101,
+        side="SELL",
+        order_type="LIMIT",
+        time_in_force="POST_ONLY",
+        reduce_only=False,
+        quantity=Decimal("0.20"),
+        price=Decimal("100.1"),
+    )
+    plan = SimpleNamespace(source=source_plan)
+    source_order = SimpleNamespace(
+        account_index=11,
+        market_id=7,
+        order_id="source-1",
+        client_order_index=101,
+        side="SELL",
+        order_type="LIMIT",
+        time_in_force="POST_ONLY",
+        reduce_only=False,
+        initial_quantity=Decimal("0.20"),
+        price=Decimal("100.1"),
+        status="canceled-post-only",
+        terminal=True,
+        filled_quantity=Decimal("0"),
+        remaining_quantity=Decimal("0"),
+    )
+    source = SimpleNamespace(
+        dispatched=True,
+        filled_quantity=Decimal("0"),
+        trades=(),
+        history_complete=True,
+        unknown_reasons=(),
+        order=source_order,
+        position_before=Decimal("0"),
+        position_after=Decimal("0"),
+    )
+    receiver = SimpleNamespace(
+        dispatched=False,
+        filled_quantity=Decimal("0"),
+        trades=(),
+        history_complete=True,
+        unknown_reasons=(),
+        order=None,
+        position_before=Decimal("0"),
+        position_after=Decimal("0"),
+    )
+
+    assert not HandoffEngine._retryable_pair_after_guard(
+        plan,
+        source,
+        receiver,
+        ("PAIR_GUARD_UNKNOWN: arbitrary scalar bypass",),
+        {"status": "UNKNOWN", "priority_reason": "arbitrary scalar bypass"},
+    )
 
 
 def test_cycle_004_offline_facts_keep_pair_failure_flat_inventory_and_unknown_fees_separate():
@@ -3443,7 +3778,10 @@ def test_cli_opening_complete_checks_source_fill_and_distinguishes_zero_fill_can
         },
     }
     line = cli_module._simple_event_line(zero_fill)
-    assert line == "Источник подтверждён как zero-fill/cancel; ордер приёмника не отправлялся."
+    assert line == (
+        "Источник отменён как canceled-post-only без исполнения; цикл не открыт, "
+        "ордер приёмника не отправлялся."
+    )
     assert "наблюдаемое исполнение" not in line
 
     filled = {
