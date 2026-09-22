@@ -1,17 +1,7 @@
-# HCR-32 — Telegram account inspection
+# HCR-33 — Random first account and order side
 
-Owner requests a new bot command showing account balances and positions. Chief implements and self-reviews alone, without Builders. Base `70703ea3e1064846bcf836fcf02932d8c932161d`.
+Owner explicitly requests randomization of which configured account places the first limit order and its side. Chief implements and self-reviews alone. Apply to the normal `simple` launcher (`./start` and Telegram `/run`): independently uniform choice of the two configured accounts as source and BUY/SELL for its first limit order, once per newly confirmed cycle. Receiver is the other account and its leg is opposite. Preserve size/hold policies, thresholds, fees, margin checks, reconciliation and no-replay behavior. Low-level explicit-plan interfaces retain their specified identities/direction.
 
-Add owner-only `/accounts` and read-only navigation, using the existing read-only SDK adapter and protected Keychain credentials. Show available balance, configured-market position and active-order count for both configured accounts, observation timestamps, and explicit unavailable/stale states. No claim of all-market flatness or total equity. Missing credentials never prompt or provision. Preserve launch policy, persistent barriers, configuration binding and credential containment. No bot deployment, real orders or live account queries in this implementation task.
+Persist selection with the immutable slot reservation before credentials/client construction or venue requests. Bind admission to that exact selection and retain it through retries, paired close and residual reconciliation. Expose actual selected roles/side in operator output and saved Telegram reports; do not confuse configured account labels with selected roles. No selection redraw to obtain a favorable preflight or retry an admitted slot.
 
-Acceptance: adverse reader/auth/controller/HTML tests, relevant existing read-only adapter regressions, clean isolated Python 3.11 full suite, self-review and documentation, exact tested integration and verified remote main. Preserve historical evidence and private runtime state. Evidence: ignored owner-only `spread-shadow-runs/hood-telegram-accounts-20260922/`.
-
-## Result
-
-Completed in candidate `e580369e0c4b439b5d556efd657521e3279e7754`. 276 affected checks passed. Final isolated Python 3.11.5 suite: 4849 passed, 3 existing optional Extended dependency skips, exit 0, 130.43 seconds. Full diff self-reviewed; exact source imports, 42 historical hashes and unchanged private runtime state verified. Integrate exact tested implementation and verify remote main. No deployment, live reads or execution performed; no continuing campaign assigned.
-
-## Owner-authorized controller startup
-
-The owner explicitly requested a restart after HCR-32 delivery. No existing controller/runner process was found; the controller lock is free and saved active/last are null. Start the accepted updated controller with the existing bound owner and configuration, preserve state and credentials, and verify process/lock/network health. This is controller deployment only: do not send `/run`, synthesize owner commands, query trading accounts or place orders during startup verification. Subsequent operator commands retain existing authorization and safety gates.
-
-Startup completed: PID 76249, controller lock held, established Telegram HTTPS connection, no startup log errors. Existing state and configuration preserved; no owner command synthesized. The controller remains running under operator command ownership. Startup evidence: `spread-shadow-runs/hood-telegram-accounts-20260922/startup/`.
+Acceptance: deterministic all-four-combinations execution tests, adverse persistence/binding/replay checks, relevant report/controller regressions and final isolated Python 3.11 full suite; preserve original evidence. Record self-review, integrate tested source and verify remote main. Owner has authorized software behavior, not a test trade. No synthetic `/run`, live account query or order during verification. Existing controller remains under operator ownership; refresh it after integration only if no active cycle/child, preserving state. Evidence: ignored owner-only `spread-shadow-runs/hood-random-route-20260922/`.
