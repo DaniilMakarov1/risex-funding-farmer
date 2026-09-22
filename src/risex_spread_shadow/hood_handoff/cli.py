@@ -36,6 +36,7 @@ from .random_cycle import (
     RandomCycleConfig,
     RandomCycleEngine,
     allocate_cycle_slot,
+    select_random_route,
     run_random_cycle,
     terminal_cycle_facts,
 )
@@ -822,13 +823,12 @@ def _print_simple_summary(
     *,
     use_keychain: bool,
 ) -> None:
-    direction = str(value.get("direction", "?")).upper()
     symbol = str(value.get("market_symbol", value.get("symbol", "?"))).upper()
     source = value.get("source_account_index", "?")
     receiver = value.get("receiver_account_index", "?")
     credential_route = "сохранённый Keychain" if use_keychain else "скрытый локальный ввод ключей"
-    print(f"Один реальный Robinhood Chain Mainnet цикл: {symbol}, направление {direction}.")
-    print(f"Счета: источник {source}, приёмник {receiver}; слот будет выбран после подтверждения.")
+    print(f"Один реальный Robinhood Chain Mainnet цикл: {symbol}; первый счёт и сторона лимитки случайны.")
+    print(f"Счета: {source} и {receiver}; каждый может первым выставить BUY или SELL (четыре равновероятных варианта).")
     print(f"После Enter будет использован {credential_route}; до Enter нет чтения рынка или доступа к ключам.")
     print(f"Конфигурация: {config_path}; каталог результатов: {operator_dir}.")
     print("Нажмите Enter, чтобы запустить один цикл. Введите C или CANCEL для отмены.")
@@ -1378,14 +1378,17 @@ async def _run_simple_confirmed(args, value, config_path, operator_dir) -> int:
         defer_incremental_margin_calculation=args.defer_incremental_margin_calculation,
     )
     _validate_simple_sdk()
+    route = select_random_route(base_config)
     try:
         cycle_dir, client_order_prefix = allocate_cycle_slot(
             operator_dir,
             client_order_prefix=base_config.client_order_prefix,
+            random_route=route,
         )
     except PreflightBlocked as exc:
         raise SystemExit(f"не удалось занять новый слот цикла: {exc}") from None
     launch_value = _simple_config_value(value)
+    launch_value.update(route)
     launch_value["cycle_dir"] = str(cycle_dir)
     launch_value.pop("journal_path", None)
     launch_value["client_order_prefix"] = client_order_prefix
@@ -1399,6 +1402,8 @@ async def _run_simple_confirmed(args, value, config_path, operator_dir) -> int:
         f"Новый слот создан и зарезервирован: {cycle_dir}; "
         f"уникальный префикс сохранён в {cycle_dir / 'launch.json'}."
     )
+    print(f"Выбрано: первый счёт {config.source_account_index}, лимитный {config.direction.source_side}; "
+          f"второй счёт {config.receiver_account_index}, {config.direction.receiver_side}. Выбор сохранён в launch.json.")
     secrets: Any | None = None
     client: LighterSdkClient | None = None
     emitted_keys: set[tuple[str, int | None, int | None]] = set()

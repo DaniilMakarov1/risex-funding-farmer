@@ -44,7 +44,7 @@ def help_message():
             '/help — эта инструкция\n\n'
             '<b>Запуск реальной торговли</b>\n'
             '<code>/run</code> — отправить команду на один Mainnet-цикл. '
-            'Объём и время удержания выбираются по текущей конфигурации.\n\n'
+            'Первый счёт и сторона лимитки выбираются случайно: четыре равновероятных варианта. Объём и время удержания — по текущей конфигурации.\n\n'
             '<i>Остановка бота не закрывает позиции. При неопределённом результате '
             'новый запуск блокируется до локальной сверки.</i>')
 
@@ -109,6 +109,11 @@ def saved_message(name, report, *, blocked=False, detailed=False):
     fees = mapping(economics.get('fees'))
     orders = mapping(report.get('order_state'))
     lines = [f'<b>📋 Результат цикла</b> · <code>{text(name, 32)}</code>']
+    binding = mapping(report.get('binding'))
+    first_side = {'LONG': 'SELL', 'SHORT': 'BUY'}.get(binding.get('direction'))
+    if first_side is not None and all(binding.get(k) is not None for k in ('source_account_index', 'receiver_account_index')):
+        lines += [f'Первый счёт: <code>{text(binding["source_account_index"], 24)}</code> · лимитный {first_side}',
+                  f'Второй счёт: <code>{text(binding["receiver_account_index"], 24)}</code>']
     if blocked:
         lines += ['<b>⛔ Новые запуски заблокированы</b>']
     lines += ['', '<b>Результат по журналу</b>',
@@ -147,7 +152,7 @@ def accounts_message(result):
     symbol = text(result['symbol'], 24)
     lines = ['<b>💼 Балансы и позиции</b>',
              f'Рынок позиций и ордеров: <code>{symbol}</code>']
-    for role, row in zip(('Источник', 'Приёмник'), result['accounts']):
+    for role, row in zip(('Счёт A', 'Счёт B'), result['accounts']):
         lines += ['', f'<b>{role} · счёт {text(row["index"], 24)}</b>']
         snapshot = row['snapshot']
         if snapshot is None:

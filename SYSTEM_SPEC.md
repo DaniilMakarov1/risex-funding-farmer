@@ -3,6 +3,12 @@
 SYSTEM_SPEC_VERSION = 4.2
 SPEC_STATUS = FIRST_RAW_RESEARCH_SCANNER_IMPLEMENTED
 
+## HCR-33 amendment — random first account and limit side
+
+Normal simple launches, including Telegram `/run`, select uniformly among four combinations of configured first account and BUY/SELL side after local validation/confirmation and before any credential or venue access. Source means the selected first LIMIT/POST_ONLY account; receiver means the other account with opposite side. Internal direction denotes receiver exposure. Preserve existing quantity/hold selection and all execution checks. Explicit-plan lower-level interfaces remain fixed.
+
+Persist the selection once in immutable launch metadata, fsync file and directory entries before further work, and require admission identities/direction to match it. A reservation failure blocks all subsequent access and leaves evidence intact. Never redraw on preflight failure, quote refresh, preparation retry or reconciliation. Source/receiver bindings in cycle and child journals govern actual positions and closure. Existing no-replay admission remains mandatory; historical reservation schemas remain readable. Telegram saved reports show actual selected identities/side; account snapshots use stable A/B labels.
+
 ## HCR-32 amendment — account inspection
 
 The private-owner `/accounts` command uses only the read-only SDK account adapter with existing Keychain keys and bounded concurrent reads of both configured accounts. It reports available balance separately from total equity and scopes position/order observations to the configured market. Preserve exact quantities, identity checks, observation times and explicit stale/unavailable states. Missing keys cannot prompt or provision; raw errors and wallet identities cannot enter Telegram. Account inspection cannot launch orders, clear persistent uncertainty or modify execution policy. Help and saved reports remain offline.

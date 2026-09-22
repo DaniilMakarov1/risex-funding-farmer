@@ -4294,7 +4294,8 @@ def _write_simple_launcher_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
 
 
 @pytest.mark.asyncio
-async def test_simple_enter_admits_reserved_slot_and_same_slot_replay_is_blocked(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("route_draw", [0, 1, 2, 3])
+async def test_simple_enter_admits_reserved_slot_and_same_slot_replay_is_blocked(tmp_path, monkeypatch, capsys, route_draw):
     config_path, operator_dir, evidence_path = _write_simple_launcher_fixture(tmp_path)
     clock = AdvancingClock()
     synthetic_client = CycleClient(clock)
@@ -4303,6 +4304,8 @@ async def test_simple_enter_admits_reserved_slot_and_same_slot_replay_is_blocked
     class FakeSdkClient:
         def __init__(self, *args, **kwargs):
             self._delegate = synthetic_client
+            synthetic_client.source_account_index = kwargs["source_account_index"]
+            synthetic_client.receiver_account_index = kwargs["receiver_account_index"]
 
         def __getattr__(self, name):
             return getattr(self._delegate, name)
@@ -4313,6 +4316,8 @@ async def test_simple_enter_admits_reserved_slot_and_same_slot_replay_is_blocked
     async def run_with_synthetic_clock(config, client):
         return await real_run_random_cycle(config, client, clock=clock, rng=FixedRng(25, 20))
 
+    route_rng = FixedRng(route_draw)
+    monkeypatch.setattr(cli_module, "select_random_route", lambda c: random_cycle_module.select_random_route(c, route_rng))
     monkeypatch.setattr("builtins.input", lambda _prompt: "")
     monkeypatch.setattr(cli_module, "_validate_simple_sdk", lambda: None)
     monkeypatch.setattr(cli_module, "LighterSdkClient", FakeSdkClient)
@@ -4337,6 +4342,20 @@ async def test_simple_enter_admits_reserved_slot_and_same_slot_replay_is_blocked
     assert (cycle_dir / "cycle.jsonl").exists()
 
     launch = json.loads((cycle_dir / "launch.json").read_text(encoding="utf-8"))
+    expected_source = 11 if route_draw in (0, 2) else 22
+    expected_receiver = 22 if expected_source == 11 else 11
+    expected_side = "SELL" if route_draw < 2 else "BUY"
+    assert route_rng.bounds == [(0, 3)]
+    assert launch["random_route"] == {"source_account_index": expected_source,
+        "receiver_account_index": expected_receiver, "direction": "LONG" if route_draw < 2 else "SHORT"}
+    assert synthetic_client.submissions[0].account_index == expected_source
+    assert synthetic_client.submissions[0].side == expected_side
+    assert synthetic_client.submissions[1].account_index == expected_receiver
+    assert synthetic_client.submissions[1].side != expected_side
+    assert synthetic_client.submissions[2].account_index == expected_source
+    assert synthetic_client.submissions[2].side != expected_side
+    assert all(p.reduce_only for p in synthetic_client.submissions[2:])
+    assert synthetic_client.source_position == synthetic_client.receiver_position == 0
     admission = json.loads((cycle_dir / "admission.json").read_text(encoding="utf-8"))
     replay_config = cycle_config(
         cycle_dir,

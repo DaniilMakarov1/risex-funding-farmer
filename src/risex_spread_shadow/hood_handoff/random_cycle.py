@@ -111,6 +111,7 @@ def _validate_launch_metadata(
     path: Path,
     *,
     expected_client_order_prefix: str | None = None,
+    expected_route: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Validate the immutable reservation before its one-time admission."""
 
@@ -138,13 +139,39 @@ def _validate_launch_metadata(
         raise PreflightBlocked("cycle reservation has no client-order prefix")
     if expected_client_order_prefix is not None and raw_prefix != expected_client_order_prefix:
         raise PreflightBlocked("cycle reservation client-order prefix does not match cycle configuration")
+    if "random_route" in value:
+        route = _validate_random_route(value["random_route"])
+        if expected_route is not None and route != dict(expected_route):
+            raise PreflightBlocked("reserved random route does not match cycle configuration")
     return dict(value)
+
+
+def _validate_random_route(value: Any) -> dict[str, Any]:
+    fields = {"source_account_index", "receiver_account_index", "direction"}
+    if not isinstance(value, Mapping) or set(value) != fields:
+        raise PreflightBlocked("invalid reserved random route")
+    source, receiver = value["source_account_index"], value["receiver_account_index"]
+    if (isinstance(source, bool) or not isinstance(source, int) or source < 0
+        or isinstance(receiver, bool) or not isinstance(receiver, int) or receiver < 0
+        or source == receiver or value["direction"] not in ("LONG", "SHORT")):
+        raise PreflightBlocked("invalid reserved random route")
+    return dict(value)
+
+
+def select_random_route(config: "RandomCycleConfig", rng: Any = None) -> dict[str, Any]:
+    """Four equally likely combinations; direction names the receiver exposure."""
+    draw = _draw_integer(random.SystemRandom() if rng is None else rng, 0, 3, "opening route")
+    accounts = (config.source_account_index, config.receiver_account_index)
+    return {"source_account_index": accounts[draw % 2],
+            "receiver_account_index": accounts[1 - draw % 2],
+            "direction": "LONG" if draw < 2 else "SHORT"}
 
 
 def allocate_cycle_slot(
     operator_dir: Path | str,
     *,
     client_order_prefix: str = "hood-cycle",
+    random_route: Mapping[str, Any] | None = None,
 ) -> tuple[Path, str]:
     """Atomically reserve the next owner-only cycle directory and prefix.
 
@@ -155,6 +182,7 @@ def allocate_cycle_slot(
     partially claimed slot.
     """
 
+    route = None if random_route is None else _validate_random_route(random_route)
     parent = Path(operator_dir)
     _require_owner_only_directory(parent, label="operator cycle directory")
     prefix = _text(client_order_prefix, "client_order_prefix")
@@ -175,11 +203,19 @@ def allocate_cycle_slot(
                 candidate / LAUNCH_METADATA_NAME,
                 {
                     "schema": "hcr-19-simple-launch-v1",
+                    **({"random_route": route} if route is not None else {}),
                     "claimed_at": time.time(),
                     "cycle_dir": str(candidate),
                     "client_order_prefix": unique_prefix,
                 },
             )
+            # Persist directory entries as well as launch.json before any key/read.
+            for directory in (candidate, parent):
+                directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
             return candidate, unique_prefix
         except BaseException:
             # The claimed directory and any durable partial metadata are
@@ -1841,6 +1877,8 @@ class RandomCycleEngine:
             self._prepare_cycle_directory(
                 config.cycle_dir,
                 expected_client_order_prefix=config.client_order_prefix,
+                expected_route={key: config.binding()[key] for key in
+                    ("source_account_index", "receiver_account_index", "direction")},
             )
             journal = DurableJournal(config.journal_path, clock=self.clock.now)
             journal.acquire_attempt()
@@ -1891,6 +1929,7 @@ class RandomCycleEngine:
         path: Path,
         *,
         expected_client_order_prefix: str,
+        expected_route: Mapping[str, Any] | None = None,
     ) -> None:
         if path.is_symlink():
             raise PreflightBlocked("cycle directory must not be a symlink")
@@ -1910,6 +1949,7 @@ class RandomCycleEngine:
             reservation = _validate_launch_metadata(
                 path,
                 expected_client_order_prefix=expected_client_order_prefix,
+                expected_route=expected_route,
             )
             _atomic_launch_metadata(
                 path / ADMISSION_METADATA_NAME,
