@@ -76,6 +76,34 @@ New journals measure quote-request elapsed time and per-order preparation lock w
 
 `order_state` lists latest saved order observations with their times, unresolved observed orders and unresolved mutation intents. These are historical facts; an empty list does not establish current flatness. Sanitized cycle-003/004/007 fixtures under `tests/fixtures/hood_handoff/` retain source and projection hashes. The report coverage map points to the corresponding incident/action-barrier and crash-boundary regressions.
 
+## Owner-operated Telegram controller
+
+`risex_spread_shadow.hood_handoff.telegram_control` is a separate control interface for the existing configured cycle. The old Funding Farmer Telegram integration remains frozen. Only a fresh exact `/run` message from the configured numeric user ID in that same user's private chat launches one real Mainnet cycle. This command is the operator's launch confirmation; volume and hold selection remain the existing random-cycle policy. `/start` or `/help` explains commands; `/status` and `/report` read local saved state. No credentials, trading parameters, paths or shell commands are accepted in chat.
+
+Use the project Python directly (no new package installation needed). Replace `YOUR_NUMERIC_USER_ID` locally:
+
+```bash
+.venv-hood/bin/python -m risex_spread_shadow.hood_handoff.telegram_control provision \
+  --owner-id YOUR_NUMERIC_USER_ID \
+  --config spread-shadow-runs/hood-cycle-race-latency-20260920/operator-v1/random-cycle.json
+```
+
+Provisioning reads the bot token through hidden local input and stores it in native macOS Keychain under the distinct `hood-telegram-control-v1` record. It makes no Telegram or venue request. If this token is already stored, skip provisioning; replacement requires `--replace-token`. Trading keys must already exist in the existing matching Keychain records. A detached runner cannot provision missing trading keys interactively and will stop rather than accept them through Telegram.
+
+The operator starts the controller locally:
+
+```bash
+.venv-hood/bin/python -m risex_spread_shadow.hood_handoff.telegram_control run \
+  --owner-id YOUR_NUMERIC_USER_ID \
+  --config spread-shadow-runs/hood-cycle-race-latency-20260920/operator-v1/random-cycle.json
+```
+
+The computer and controller must remain available for new commands. Incoming polling uses the official [Telegram Bot API](https://core.telegram.org/bots/api#getupdates); old queued commands are discarded at controller startup. Unauthorized, group, forwarded, edited, stale and repeated update IDs cannot launch a cycle. A durable consumed-update marker and active intent precede child launch. A global controller lock survives in the detached child, preventing another controller while a previous child is alive. The existing `simple` launcher also takes an operator-directory lock, excluding concurrent `./start` cycles. Separate lower-level interfaces are not governed by this controller: do not operate them concurrently on these accounts.
+
+Controller state is owner-only under `~/.config/risex-spread-shadow/telegram-control/`, bound to the owner ID, configuration path and configuration/evidence contents. State contains no token. Preserve it and cycle journals on any error; do not clear it to replay a command. Configuration changes require local review and controller restart; a mismatched saved binding fails closed and requires local investigation. There is no automatic relaunch or arbitrary remote reset.
+
+Stopping the controller does not cancel or kill its detached cycle. After restart, an active child still holds the lock; once it exits, saved terminal evidence must prove historical flat inventory and resolved intents/orders before further launches become available. Incomplete evidence blocks new `/run` commands. A consumed intent with no new slot after child exit is reported as NOT_LAUNCHED, never successful trading. Delivery failure does not repeat or cancel execution; `/report` retrieves the last result. No remote force-stop or automatic closure of historical inventory is provided.
+
 ## Credentials and account diagnostics
 
 The launcher uses macOS Keychain. Matching entries are bound to API origin, signing environment/domain, account and key index. A missing key is requested through hidden interactive input; Keychain failure stops without plaintext fallback. Credentials never belong in arguments, environment variables, project files, reports or Git. Do not paste a key into an ordinary shell prompt.

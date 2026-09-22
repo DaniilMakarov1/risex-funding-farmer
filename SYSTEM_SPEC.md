@@ -3,6 +3,12 @@
 SYSTEM_SPEC_VERSION = 4.2
 SPEC_STATUS = FIRST_RAW_RESEARCH_SCANNER_IMPLEMENTED
 
+## HCR-30 amendment — operator Telegram control
+
+The owner-operated controller maps only the configured owner's fresh private `/run` command to one existing simple-launcher cycle. Numeric sender and private chat identities must both match; forwarded/edited/stale/repeated updates do not authorize execution. Persist update consumption and an active intent before child creation. No automatic retries of a launch after uncertainty, no remote configuration/credential input and no changes to execution policy.
+
+The child is detached, holds an inherited global controller lock and uses the existing simple-launcher operator lock. Controller loss or notification failure must not kill/replay the cycle. Saved terminal evidence, not process exit, determines whether later launches may proceed. Incomplete or unresolved execution remains blocked. The controller uses native Keychain for its separate token; trading keys remain in their existing protected boundary. Help and offline tests must not initialize credential/network clients. Older Funding Farmer Telegram remains frozen.
+
 ## HCR-27 amendment — offline saved-cycle diagnostics
 
 The offline report reads existing parent/child journals without creating SDK clients, accessing credentials/Keychain, requesting market/account data, reserving claims or replaying mutations. Inputs and their hashes remain immutable. Report source identity includes file hashes and record provenance. Parse input incrementally and retain bounded explanatory details with exact aggregate counts; detail truncation is explicit, makes the report incomplete and blocks positive aggregate proofs. Irrelevant additive fields do not displace required facts.

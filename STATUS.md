@@ -1,5 +1,13 @@
 # Current status
 
+## HCR-30 Telegram controller
+
+Implementation candidate `8edad04ce6a94cbd9bb99b7af540771d2ab53315` adds an owner-operated private-chat controller, native Keychain token provisioning, one-cycle `/run`, local `/status` and `/report`, durable consumed-update and active-intent state, global inherited process lock and simple-launcher operator lock. No execution policy changed. Only the new hood-handoff Telegram interface is unfrozen; old Funding Farmer Telegram remains frozen.
+
+Final clean isolated Python 3.11.5 suite: **4792 passed, 3 existing skips, exit 0**, 138.35 seconds. The 29 controller tests cover private identity, stale/forwarded/edited/repeated messages, concurrent launch, persistence failure, secret containment, detached fixed child arguments, lock inheritance, changed configuration and restart report evidence. Existing 171 random-cycle tests also passed. A separate synthetic child survived cancellation of its asyncio parent wait and normal parent exit. Implementation and review are Chief's own; no independent review claimed.
+
+At the owner's explicit request, the supplied bot token was saved and read-back verified in native Keychain only. Telegram read-only discovery identified `@funnding_bot`; initial getUpdates calls returned no private chat, no pending messages and no webhook. Owner ID remains unbound until observed or supplied. No trading controller was started, no venue credentials read, and no real orders sent. Evidence is in `spread-shadow-runs/hood-telegram-20260922/`; token bytes are excluded. README contains local owner setup/run instructions. Deployment/live control remains unverified.
+
 ## HCR-29 measured diagnostic speed
 
 Candidate `8c723ec74f262fba67a689aace8e3864b6bc129d` avoids repeated recursive sanitization during bounded offline report projection. Key redaction and string redaction still use the existing sanitizer; omitted subtrees are no longer traversed, and depth/list/detail bounds remain conservative. All seven saved JSON reports are byte-identical. All 42 original input hashes are preserved. Runtime trading/order code is unchanged.
