@@ -3,6 +3,10 @@
 SYSTEM_SPEC_VERSION = 4.2
 SPEC_STATUS = FIRST_RAW_RESEARCH_SCANNER_IMPLEMENTED
 
+## HCR-26 amendment — late quote and concurrent preflight reads
+
+Opening and closing revalidation overlap independent metadata and account reads, validate accounts, then fetch the final book quote. Revalidate original account observation ages after that book returns before computing/binding prices and quantity bounds. Child handoff preflight overlaps metadata and both account reads, drains all sibling tasks on failure/cancellation, then applies the same complete validation. No account timestamp is renewed and no required final source-priority check is skipped. Exact plan/signature binding and existing mutation deadlines remain mandatory; this ordering reduces local quote age without guaranteeing an owned-counterparty fill.
+
 ## HCR-25 amendment — terminal post-only cancellation and quote age
 
 An exact source LIMIT/POST_ONLY terminal canceled-post-only order can authorize a fresh paired attempt only after complete zero-fill/empty-trade reconciliation proves both original positions, no receiver dispatch and no other safety barrier. This applies to opening and closing under the existing shared three-attempt preparation/pair budget, with fresh prices and unique identities. Arbitrary cancellation statuses, partial fills, conflicting identity, incomplete history or ambiguous mutation remain non-retryable. Closing preserves its original nonzero paired positions as the retry baseline; exhausted attempts may reach existing proven-residual cleanup.

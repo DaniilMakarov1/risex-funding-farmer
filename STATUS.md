@@ -1,8 +1,12 @@
 # Current status
 
-## HCR-26 — IN PROGRESS
+## HCR-26 — COMPLETE offline; installed
 
-Fresh Builder owns the finite quote-age correction on codex/spread-v1-hcr26-quote-age. Chief independent synthetic cycle-to-handoff baseline with account30ms/book20ms/metadata10ms delays: median opening quote age104.1ms, closing106.4ms; inter-leg35.8/34.9ms. This is not a live latency estimate. Production candidate is not yet accepted. Technical/offline work proceeds; real order execution must be performed by the owner because system/tool restrictions override owner authorization. No new live operation is authorized for the agents. See NEXT_TASK for current scope.
+Accepted Builder candidate0af1d8bbd079da0a7724aa7752aab77e32c05b31 integrated as1d91564. Opening and closing obtain their final book quote after concurrent metadata/account reads. Child preflight reads metadata and both accounts concurrently, cancels/drains siblings on failure and retains full validation. Original observation times, source/receiver deadlines, exact owned-source guard, price/quantity/signature binding and all existing policies remain unchanged.
+
+Chief reviewed the complete actual diff and surrounding validation. Independent full cycle-to-handoff benchmark with equal account30ms/book20ms/metadata10ms delays,3repeats: median opening quote age104.1→37.8ms, closing106.4→40.9ms; inter-leg35.8→34.5ms and34.9→34.7ms. Same22account/5book/3metadata reads. These are synthetic measurements, not live latency or fill guarantees. Independent failure/cancellation drain, accounts aging during late book, future account, nonce reuse, expired preparation, wrong identity, source-fill race and delayed-history probes pass.
+
+Final clean isolated Python3.11 candidate archive suite:4693passed,3skipped,exit0,143.48s; no foreign project imports. All221tracked source/test files in the installed operator checkout match the tested archive; own SDK import/help/CANCEL pass. Slots001–007 and all their JSON/JSONL hashes remain unchanged; no new cycle, account/Keychain access or real signing/order/cancel action. Builder delivered and stopped. Evidence: hood-quote-age-20260922/chief-v1. Real full-cycle performance remains unvalidated; the owner runs real trades and Chief may analyze resulting evidence. System/tool restrictions override permission for agent-executed financial transactions.
 
 ## HCR-25 live validation — cycle007 completed without opening
 

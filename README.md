@@ -1,5 +1,11 @@
 # RISEx Spread Shadow and legacy Funding Farmer
 
+## HCR-26 quote-age correction — accepted offline
+
+The system now obtains the final opening/closing price after the preparatory account reads. Independent preflight reads run concurrently while retaining all freshness, identity and source-priority checks. In a controlled synthetic full-cycle comparison, quote-to-source age fell from104.1to37.8ms for opening and106.4to40.9ms for closing; the inter-leg interval did not increase. These figures do not predict live latency or guarantee that the receiver fills the intended source limit.
+
+Installed code passed the independent clean Python3.11 suite:4693passed,3skipped. Help and pre-launch CANCEL work without consuming a slot. Slots001–007 remain immutable; this correction created no new live cycle. Real execution is performed by the owner; agents can inspect results and correct the software offline. The next real result must independently prove opening, hold, closure, terminal orders and final inventory before it is called a successful cycle.
+
 ## HCR-25 post-only cancellation recovery
 
 A source order canceled by the venue as `canceled-post-only` with fully proved zero execution now permits a fresh paired attempt within the existing maximum of three. The same rule applies to closing before residual fallback; unknown execution, incomplete history, changed positions and conflicting identities still stop retries. This does not guarantee placement: the market may move between quote selection and exchange processing.
@@ -51,7 +57,7 @@ The operator files are in:
 
 - `random-cycle.json` binds BTC market1, source27331/receiver27337, APIkey4, Robinhood endpoint/signing domain466324, the existing timing defaults and the explicitly authorized incremental opening-margin deferral.
 - `market-contract.json` contains only market identity and provenance requirements. It contains no guessed fees, minimums, balances or fresh timestamp. The actual response after LAUNCH must supply current increments/minimums; incomplete or stale evidence stops the dependent action.
-- `cycle-001` through `cycle-006` are consumed evidence. Preserve them permanently. The launcher atomically chooses the next unused owner-only `cycle-NNN` directory and a unique client-order prefix after confirmation.
+- `cycle-001` through `cycle-007` are consumed evidence. Preserve them permanently. The launcher atomically chooses the next unused owner-only `cycle-NNN` directory and a unique client-order prefix after confirmation.
 
 From the project folder, the normal launch is now one command:
 
