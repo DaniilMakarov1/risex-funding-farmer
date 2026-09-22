@@ -1,5 +1,13 @@
 # RISEx Spread Shadow and legacy Funding Farmer
 
+## HCR-25 post-only cancellation recovery
+
+A source order canceled by the venue as `canceled-post-only` with fully proved zero execution now permits a fresh paired attempt within the existing maximum of three. The same rule applies to closing before residual fallback; unknown execution, incomplete history, changed positions and conflicting identities still stop retries. This does not guarantee placement: the market may move between quote selection and exchange processing.
+
+Messages name the venue cancellation and distinguish a cycle that never opened from a paired close that failed and later recovered. A fully proved no-trade attempt has zero execution fees; missing fees on actual trades remain unknown. Already-fetched book/account evidence is retained even if source is first observed canceled. Independent source/receiver preparation now overlaps in the actual SDK, while same-account/key mutations remain serialized. Source quote age and inter-leg timings are recorded for diagnosis.
+
+Cycle-006 is immutable consumed evidence: source canceled-post-only with zero fills, receiver never sent, and both final positions observed zero. No agent checked current positions or sent an order during this correction. Slots001–006 must not be reused; the next unused slot is selected only after operator confirmation.
+
 ## HCR-24 recovery and shorter paired path
 
 The SDK prepares both orders before placing the source limit, keeping the signed transactions only in memory. It overlaps source visibility with independent account/book reads and still checks the exact source order and its public owner-bound level before sending the receiver. Early data that merely predates source visibility can be refreshed once; contradictory identities, positions or fills remain blocking evidence. A prepared order is single-use and expires at the stricter preparation/final-check deadline.
@@ -43,7 +51,7 @@ The operator files are in:
 
 - `random-cycle.json` binds BTC market1, source27331/receiver27337, APIkey4, Robinhood endpoint/signing domain466324, the existing timing defaults and the explicitly authorized incremental opening-margin deferral.
 - `market-contract.json` contains only market identity and provenance requirements. It contains no guessed fees, minimums, balances or fresh timestamp. The actual response after LAUNCH must supply current increments/minimums; incomplete or stale evidence stops the dependent action.
-- `cycle-001` through `cycle-005` are consumed evidence. Preserve them permanently. The launcher atomically chooses the next unused owner-only `cycle-NNN` directory and a unique client-order prefix after confirmation.
+- `cycle-001` through `cycle-006` are consumed evidence. Preserve them permanently. The launcher atomically chooses the next unused owner-only `cycle-NNN` directory and a unique client-order prefix after confirmation.
 
 From the project folder, the normal launch is now one command:
 

@@ -1,8 +1,12 @@
 # Current status
 
-## HCR-25 — IN PROGRESS; cycle006 post-only retry correction
+## HCR-25 — COMPLETE; accepted offline and installed
 
-Owner authorized the finite correction on2026-09-22 after cycle006 ended PARTIAL/CONFIRMED_FLAT. Exact source562950038806674 was canceled-post-only with zero fills/trades; receiver never dispatched. Existing retry admission accepts only PAIR_GUARD_ reasons, so this reconciled zero-fill terminal cancellation stopped after one attempt. Early-terminal handling discarded an already-completed public-book read, while NOT_OBSERVED economics became a misleading fees UNKNOWN warning. Chief independently reproduced opening stop, closing premature residual fallback and unused3-attempt budget. Fresh Builder /root/hcr25_postonly_builder owns production/tests under NEXT_TASK; Chief owns review/publication. Cycle006 hashes preserved in hood-postonly-retry-20260922/chief-v1. No live action is authorized; installed main remains9a2ba016 pending acceptance.
+Accepted corrected candidated61e884219c4faaf91794a041e864e17743fcd8f, integrated as0b5dfe8ac73c2158f575520ae31d8076a6f60b20. Exact reconciled zero-fill canceled-post-only now permits a fresh paired attempt for opening/closing within existing3budget and unique identities. Early-terminal book/account observations survive without claiming priority proof. No-execution fees are explicitly proved; missing actual-trade fees remain UNKNOWN. Terminal opening/closing explanations are phase-specific. SDK preparation overlaps distinct account/key domains while nonce ownership and same-domain mutation serialization remain strict. Original quote time binds freshness/deadline and is measured through source dispatch.
+
+Chief full original/correction diff review and independent adverse probes passed. Incident opening/closing each succeeds after2unique LIMIT attempts; persistent cancellation stops after3. Wrong early identity, duplicate nonce and expired adapter remain blocked; closing exhaustion truthfully reports fallback while retaining opening receiver dispatch. Actual SDK synthetic30ms signer test: distinct-account peak2/32.318ms versus old global-lock peak1/64.56ms. These are synthetic preparation measurements, not live latency or placement guarantees.
+
+Final clean isolated Python3.11/SDK1.1.2 git-archive candidate suite: **4691 passed,3 skipped**, exit0,141.01s, no foreign project imports. Installed221tracked source/test files match snapshot; own SDK import, help/CANCEL and all4cycle006 hashes verified. Slots001–006 preserved; no cycle007. Builder delivered and stopped, all candidates/checkpoints preserved. No live market/account/Keychain/credential/signing/order/cancel operation performed. Historical cycle006 final positions0/0 are not a current account read. Evidence: hood-postonly-retry-20260922/chief-v1 and builder-v1/v2.
 
 ## HCR-24 — COMPLETE; accepted offline and installed
 

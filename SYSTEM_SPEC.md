@@ -3,6 +3,14 @@
 SYSTEM_SPEC_VERSION = 4.2
 SPEC_STATUS = FIRST_RAW_RESEARCH_SCANNER_IMPLEMENTED
 
+## HCR-25 amendment — terminal post-only cancellation and quote age
+
+An exact source LIMIT/POST_ONLY terminal canceled-post-only order can authorize a fresh paired attempt only after complete zero-fill/empty-trade reconciliation proves both original positions, no receiver dispatch and no other safety barrier. This applies to opening and closing under the existing shared three-attempt preparation/pair budget, with fresh prices and unique identities. Arbitrary cancellation statuses, partial fills, conflicting identity, incomplete history or ambiguous mutation remain non-retryable. Closing preserves its original nonzero paired positions as the retry baseline; exhausted attempts may reach existing proven-residual cleanup.
+
+Already-fetched account and two-sided book observations survive early terminal source handling. Observation availability is distinct from admitted public priority proof, which is never established for an already canceled source. Terminal reporting distinguishes an unopened cycle from an unsuccessful paired close followed by recovery. Fully reconciled no-execution legs establish zero execution fees; this does not establish profit, funding or fees for unevidenced actual trades.
+
+Source quote observation time participates in existing freshness/deadline binding and quote-age metrics. Both prepared legs may overlap before source exposure, but the SDK serializes nonce/signing/reservation/consumption/cancellation within each account/API-key domain. Failed or canceled preparation drains work and invalidates successful unsent preparations. No blind repricing, nonce reuse, weaker freshness or changed fee/slippage policy is authorized.
+
 ## HCR-24 amendment — prepared dispatch and causal recovery
 
 Prepare exact source and receiver mutations before exposing the source order when the adapter supports preparation. Prepared transactions stay in memory, belong to the originating client/account/key and exact immutable plan, and are single-use. Account/key/nonces are reserved across preparation and cancellation; an already transmitted nonce cannot be reused, including after ambiguous transport. An invalidated unsent preparation releases its reservation. Receiver transmission is bounded by the stricter prepared and final-evidence deadline, including generic prepared adapters; no signature or transaction body enters durable evidence.

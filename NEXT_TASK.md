@@ -1,4 +1,8 @@
-# HCR-25 — cycle006 post-only cancellation and quote age
+# HCR-25 — COMPLETE; cycle006 post-only cancellation and quote age
+
+## Completion and next boundary
+
+Corrected candidated61e884 independently accepted and integrated as0b5dfe8. Final isolated Python3.11 suite4691passed3skipped, exit0,141.01s, no foreign imports. Independent incident/adverse/SDK-concurrency/closing-report probes pass. Installed source/tests match snapshot; help/CANCEL and immutable cycle006 hashes pass; no new cycle. Builder has no remaining assignment. Chief alone publishes the accepted release; no implementation remains. Further real testing requires explicit owner action; do not automatically start cycle007, collect market/account data or access Keychain. Current positions are unknown; cycle006 last saved positions0/0 are historical. Details/evidence are in STATUS.md and ignored owner-only evidence.
 
 ## Owner authority
 
