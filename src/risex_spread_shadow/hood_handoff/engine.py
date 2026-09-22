@@ -1248,7 +1248,7 @@ class HandoffEngine:
                     if guard_request_started_at is not None:
                         latency["receiver_admission_seconds"] = max(
                             0.0,
-                            guard_finished_at - guard_request_started_at,
+                            time.perf_counter() - pre_receiver_started,
                         )
                         latency["receiver_admission_at"] = guard_finished_at
                     if priority_guard is None:
@@ -1549,10 +1549,11 @@ class HandoffEngine:
             latency["receiver_fill_observation_seconds"] = max(
                 0.0, time.perf_counter() - receiver_visibility_started
             )
-            # A missing terminal order is an unresolved visibility boundary;
-            # do not manufacture a fill-observation timestamp for it.
+            # Terminal visibility and a positive fill are separate observations.
             if receiver_order is not None:
-                latency["receiver_fill_observed_at"] = receiver_order.observed_at
+                latency["receiver_terminal_observed_at"] = receiver_order.observed_at
+                if receiver_order.filled_quantity > 0:
+                    latency["receiver_fill_observed_at"] = receiver_order.observed_at
             latency["receiver_visibility_seconds"] = latency["receiver_fill_observation_seconds"]
             if receiver_order is None:
                 unknown_reasons.append("receiver order identity or terminal status is unresolved")

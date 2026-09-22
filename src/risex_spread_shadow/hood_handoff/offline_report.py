@@ -29,7 +29,6 @@ REPORT_BATCH_SCHEMA = "hcr-27-offline-cycle-report-batch-v1"
 # projection is retained for detail-oriented sections below.
 MAX_DETAIL_RECORDS = 512
 MAX_DETAIL_HEAD_RECORDS = 256
-MAX_PROJECTED_KEYS = 96
 MAX_PROJECTED_LIST_ITEMS = 64
 MAX_PROJECTED_STRING = 1024
 
@@ -157,6 +156,17 @@ _PROJECTED_KEYS = frozenset(
         "receiver_dispatched",
         "reconciliation_seconds",
         "history_pages",
+        "reduce_only", "ready", "owner_account_index", "requested_quantity",
+        "source_position_before", "receiver_position_before",
+        "opening_reason", "closing_reason",
+        "source_quote_age_seconds", "quote_age_to_source_dispatch_seconds",
+        "paired_preparation_seconds", "source_submit_ack_seconds", "source_visibility_seconds",
+        "receiver_admission_seconds", "receiver_submit_ack_seconds", "receiver_visibility_seconds",
+        "receiver_fill_observation_seconds", "coalesced_pre_receiver_window_seconds",
+        "concurrent_pre_receiver_checks_seconds", "public_book_read_seconds", "pre_receiver_checks_seconds",
+        "source_dispatch_intent_at", "source_dispatch_ack_at", "receiver_dispatch_intent_at",
+        "receiver_dispatch_ack_at", "receiver_dispatch_outcome_at", "receiver_fill_observed_at",
+        "receiver_terminal_observed_at", "receiver_admission_at",
     }
 )
 
@@ -166,7 +176,6 @@ _OMIT_BULKY_KEYS = frozenset(
         "history_pages",
         "better_price_evidence",
         "same_price_evidence",
-        "active_orders",
         "source_recheck",
         "receiver_recheck",
         "source_order",
@@ -223,6 +232,8 @@ class _FileData:
         before = len(self._tail)
         self._tail.append(record)
         if before == len(self._tail) or self.record_count > MAX_DETAIL_RECORDS:
+            if not self.detail_truncated:
+                self.issue("DETAIL_TRUNCATED", "bounded report detail omitted journal records; aggregate proofs are unavailable")
             self.detail_truncated = True
 
     @property
@@ -248,7 +259,8 @@ class _FileData:
             item["line"] = line
         if event is not None:
             item["event"] = event
-        self.issues.append(item)
+        if len(self.issues) < MAX_DETAIL_RECORDS:
+            self.issues.append(item)
 
     def as_dict(self) -> dict[str, Any]:
         value: dict[str, Any] = {
@@ -303,43 +315,50 @@ def _copy_json(value: Any) -> Any:
     return str(value)
 
 
-def _bounded_json(value: Any, *, key: str | None = None, depth: int = 0) -> Any:
+def _bounded_json(value: Any, *, key: str | None = None, depth: int = 0, truncated: list[bool] | None = None) -> Any:
     """Sanitize and project JSON values to bounded, factual report detail."""
 
-    if depth > 8:
+    if depth > 16:
+        if truncated is not None:
+            truncated.append(True)
         return "[DETAIL_TRUNCATED]"
     if isinstance(value, Mapping):
         result: dict[str, Any] = {}
-        for raw_key, item in list(value.items())[:MAX_PROJECTED_KEYS]:
+        for raw_key, item in value.items():
             item_key = str(raw_key)
             if item_key in _OMIT_BULKY_KEYS:
                 continue
             if item_key not in _PROJECTED_KEYS:
                 continue
-            result[item_key] = _bounded_json(sanitize(item, key=item_key), key=item_key, depth=depth + 1)
-        if len(value) > MAX_PROJECTED_KEYS:
-            result["_detail_keys_omitted"] = len(value) - MAX_PROJECTED_KEYS
+            result[item_key] = _bounded_json(sanitize(item, key=item_key), key=item_key, depth=depth + 1, truncated=truncated)
         return result
     if isinstance(value, (list, tuple)):
         items = list(value)
-        result = [_bounded_json(sanitize(item), depth=depth + 1) for item in items[:MAX_PROJECTED_LIST_ITEMS]]
+        result = [_bounded_json(sanitize(item), depth=depth + 1, truncated=truncated) for item in items[:MAX_PROJECTED_LIST_ITEMS]]
         if len(items) > MAX_PROJECTED_LIST_ITEMS:
+            if truncated is not None:
+                truncated.append(True)
             result.append(f"[DETAIL_ITEMS_OMITTED:{len(items) - MAX_PROJECTED_LIST_ITEMS}]")
         return result
     if isinstance(value, str):
         safe = sanitize(value, key=key)
         if not isinstance(safe, str):
             return safe
+        if len(safe) > MAX_PROJECTED_STRING and truncated is not None:
+            truncated.append(True)
         return safe if len(safe) <= MAX_PROJECTED_STRING else safe[:MAX_PROJECTED_STRING] + "…"
     if isinstance(value, (int, float, bool)) or value is None:
         return value
     return str(value)
 
 
-def _project_payload(event: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+def _project_payload(event: str, payload: Mapping[str, Any], data: _FileData) -> dict[str, Any]:
     """Keep allowlisted facts only; exact input identity remains in the file hash."""
 
-    projected = _bounded_json(payload)
+    truncated: list[bool] = []
+    projected = _bounded_json(payload, truncated=truncated)
+    if truncated:
+        data.issue("PAYLOAD_TRUNCATED", "required projected detail exceeds the report display bound", event=event)
     return projected if isinstance(projected, dict) else {}
 
 
@@ -448,7 +467,7 @@ def _read_jsonl(path: Path, kind: str) -> _FileData:
                         run_id=run_id,
                         event=event,
                         at=at_number,
-                        payload=_project_payload(event, payload),
+                        payload=_project_payload(event, payload, data),
                         line=line_number,
                         path=str(path),
                         kind=kind,
@@ -736,7 +755,7 @@ def _intent_actions(files: Sequence[_FileData]) -> list[dict[str, Any]]:
                 (
                     item
                     for item in reversed(pending)
-                    if item["leg"] == leg and not item["response_observed"]
+                    if item["leg"] == leg and "response_event" not in item
                 ),
                 None,
             )
@@ -748,8 +767,8 @@ def _intent_actions(files: Sequence[_FileData]) -> list[dict[str, Any]]:
                     event=event,
                 )
                 continue
-            candidate["response_observed"] = True
-            candidate["confirmed_response"] = True
+            candidate["response_observed"] = event.endswith("_RESULT")
+            candidate["confirmed_response"] = event.endswith("_RESULT")
             candidate["response_at"] = record["at"]
             candidate["response_event"] = event
             if event.endswith("_UNKNOWN"):
@@ -773,7 +792,7 @@ def _intent_actions(files: Sequence[_FileData]) -> list[dict[str, Any]]:
             if isinstance(payload.get("order_id"), (str, int)):
                 candidate["order_id"] = str(payload["order_id"])
         for action in pending:
-            if not action["response_observed"]:
+            if "response_event" not in action:
                 action["status"] = "INTENT_ONLY_UNFINISHED"
                 action["reason"] = "journal ended before a matching dispatch result or unknown record"
     return actions
@@ -805,273 +824,206 @@ def _issue(
     return value
 
 
-def _plan_context(files: Sequence[_FileData]) -> dict[tuple[str, int | None, str], Mapping[str, Any]]:
-    context: dict[tuple[str, int | None, str], Mapping[str, Any]] = {}
-    for item in _plan_records(files):
-        key = (str(item.get("phase")), item.get("attempt"), str(item.get("leg")))
-        plan = item.get("plan")
-        if isinstance(plan, Mapping):
-            context[key] = plan
-    return context
-
-
 def _execution_evidence(
     files: Sequence[_FileData],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    """Collect bounded execution evidence and validate every trade binding."""
-
+    """Validate each persisted terminal receipt against its own immutable plan."""
     executions: list[dict[str, Any]] = []
     fills: list[dict[str, Any]] = []
     issues: list[dict[str, Any]] = []
-    plans = _plan_context(files)
+    terminal_statuses = {
+        "filled", "canceled", "cancelled", "canceled-post-only",
+        "canceled-too-much-slippage", "canceled-not-enough-liquidity", "rejected", "expired",
+    }
+    cycle = next((item for item in files if item.kind == "cycle"), None)
+    binding = next((r.payload["binding"] for r in (cycle.records if cycle else [])
+                    if isinstance(r.payload.get("binding"), Mapping)), {})
 
-    def append_execution(
-        phase: str,
-        attempt: int | None,
-        leg: str,
-        value: Mapping[str, Any],
-        data: _FileData,
-        record: _Record,
-        *,
-        fallback: bool = False,
-    ) -> None:
+    def append_execution(data: _FileData, record: _Record, leg: str,
+                         value: Mapping[str, Any], plan: Mapping[str, Any],
+                         attempt: int | None) -> None:
+        fallback = leg == "fallback"
+        phase = "fallback" if fallback else data.kind
         order = value.get("order") if isinstance(value.get("order"), Mapping) else None
-        plan = plans.get((phase, attempt, leg), {})
-        account_index = value.get("account_index", plan.get("account_index"))
-        market_id = value.get("market_id", plan.get("market_id"))
+        after = value.get("after") if isinstance(value.get("after"), Mapping) else {}
+        before = value.get("before") if isinstance(value.get("before"), Mapping) else {}
+        account = value.get("account_index")
+        quantity = _decimal_value(value.get("filled_quantity", order.get("filled_quantity") if order else None))
+        position_before = _decimal_value(value.get("position_before", before.get("signed_position")))
+        position_after = _decimal_value(value.get("position_after", after.get("signed_position")))
+        history = value.get("history_complete") is True
+        receipt = value.get("receipt") if isinstance(value.get("receipt"), Mapping) else {}
+        dispatched = (order is not None or receipt.get("accepted") is True) if fallback else value.get("dispatched")
+        if not isinstance(plan, Mapping):
+            plan = {}
+        invalid = False
+
+        def fail(code: str, message: str) -> None:
+            nonlocal invalid
+            invalid = True
+            issues.append(_issue(code, message, data=data, record=record, phase=phase, leg=leg, attempt=attempt))
+
+        identity_fields = ("account_index", "market_id", "client_order_index", "side", "order_type", "time_in_force", "reduce_only")
+        if not plan or any(plan.get(key) is None for key in identity_fields):
+            fail("UNBOUND_EXECUTION", "terminal leg lacks its complete immutable order plan")
+        if account is None or str(account) != str(plan.get("account_index")):
+            fail("UNBOUND_EXECUTION", "receipt account does not match its order plan")
+        if any(binding.get(k) is None for k in ("source_account_index", "receiver_account_index", "market_id")) or binding.get("source_account_index") == binding.get("receiver_account_index"):
+            fail("UNBOUND_EXECUTION", "parent cycle account/market identity is incomplete")
+        expected_account = binding.get(f"{leg}_account_index")
+        if not fallback and expected_account is not None and str(account) != str(expected_account):
+            fail("UNBOUND_EXECUTION", "child account does not match the parent cycle role")
+        if binding.get("market_id") is not None and str(plan.get("market_id")) != str(binding["market_id"]):
+            fail("UNBOUND_EXECUTION", "child market does not match the parent cycle")
+        if fallback and binding.get("source_account_index") is not None and account not in (binding.get("source_account_index"), binding.get("receiver_account_index")):
+            fail("UNBOUND_EXECUTION", "fallback account is outside the cycle")
+        expected_quantity = _decimal_value(plan.get("quantity"))
+        price_bound = _decimal_value(plan.get("price"))
+        if expected_quantity is None or expected_quantity <= 0 or price_bound is None or price_bound <= 0:
+            fail("UNBOUND_EXECUTION", "order plan lacks positive exact quantity/price")
+        if not history:
+            fail("INCOMPLETE_TRADE_HISTORY", "terminal leg lacks complete trade history")
+        if value.get("unknown_reasons") or not isinstance(dispatched, bool):
+            fail("UNRESOLVED_EXECUTION", "terminal leg has unknown execution or missing dispatch state")
+        if not fallback and not isinstance(value.get("unknown_reasons"), list):
+            fail("UNRESOLVED_EXECUTION", "terminal leg lacks explicit unknown-reasons state")
+        if (value.get("outcome", record.payload.get("outcome")) == "UNKNOWN"):
+            fail("UNRESOLVED_EXECUTION", "terminal execution is explicitly UNKNOWN")
+        if not fallback:
+            intent_present = any(r.event == f"{leg.upper()}_DISPATCH_INTENT" for r in data.records)
+            if intent_present != dispatched:
+                fail("UNRESOLVED_EXECUTION", "terminal dispatch state does not agree with durable intent")
         if order is not None:
-            account_index = account_index if account_index is not None else order.get("account_index")
-            market_id = market_id if market_id is not None else order.get("market_id")
-        filled_quantity = value.get("filled_quantity")
-        if filled_quantity is None and order is not None:
-            filled_quantity = order.get("filled_quantity")
-        dispatched = value.get("dispatched") is True or order is not None
-        unknown_reasons = value.get("unknown_reasons")
-        if not isinstance(unknown_reasons, list):
-            unknown_reasons = []
-        history_present = "history_complete" in value
-        history_complete = value.get("history_complete") is True
-        status = order.get("status") if order is not None else None
-        terminal_statuses = {
-            "filled",
-            "canceled",
-            "cancelled",
-            "canceled-post-only",
-            "canceled-too-much-slippage",
-            "canceled-not-enough-liquidity",
-            "rejected",
-            "expired",
-        }
-        order_terminal = isinstance(status, str) and status.lower() in terminal_statuses
-        response_resolved = not dispatched and value.get("accepted") is False
-        resolved = bool(
-            history_complete
-            and not unknown_reasons
-            and (order_terminal or response_resolved or (not dispatched and _decimal_value(filled_quantity) in {None, Decimal(0)}))
-        )
-        execution: dict[str, Any] = {
-            "phase": phase,
-            "attempt": attempt,
-            "leg": leg,
-            "account_index": account_index,
-            "market_id": market_id,
-            "filled_quantity": filled_quantity,
-            "fee_total": value.get("fee_total"),
-            "history_complete": history_complete,
-            "history_present": history_present,
-            "resolved": resolved,
-            "dispatched": dispatched,
-            "accepted": value.get("accepted"),
-            "status": status,
+            if not dispatched:
+                fail("UNRESOLVED_EXECUTION", "an unsent leg has an order snapshot")
+            for key in identity_fields:
+                if order.get(key) is None or str(order[key]) != str(plan.get(key)):
+                    fail("UNBOUND_EXECUTION", f"terminal order does not match plan field {key}")
+            if not order.get("order_id") or (value.get("order_id") is not None and str(value["order_id"]) != str(order["order_id"])):
+                fail("UNBOUND_EXECUTION", "terminal order ID is missing or contradictory")
+            if str(order.get("status", "")).lower() not in terminal_statuses:
+                fail("UNRESOLVED_EXECUTION", "order snapshot is not terminal")
+            if _decimal_value(order.get("price")) != price_bound or _decimal_value(order.get("initial_quantity")) != expected_quantity:
+                fail("UNBOUND_EXECUTION", "terminal order price/initial quantity differs from plan")
+            remaining = _decimal_value(order.get("remaining_quantity"))
+            if remaining is None or remaining < 0 or quantity is None or quantity < 0 or expected_quantity is None or quantity > expected_quantity or _decimal_value(order.get("filled_quantity")) != quantity:
+                fail("CONFLICTING_FILL_QUANTITY", "terminal order quantities are missing or contradict the leg")
+            if str(order.get("status", "")).lower() == "filled" and (remaining != 0 or quantity != expected_quantity):
+                fail("CONFLICTING_FILL_QUANTITY", "filled order does not prove its full planned quantity")
+            order_at = _finite_number(order.get("observed_at"))
+            if order_at is None or order_at < 0 or order_at > record["at"]:
+                fail("INVALID_INTERVAL", "terminal order observation is missing or after its journal boundary")
+        elif dispatched or not (quantity == 0 or fallback and receipt.get("accepted") is False):
+            fail("UNRESOLVED_EXECUTION", "possible execution has no terminal order snapshot")
+        if fallback and quantity is None and receipt.get("accepted") is False:
+            quantity = Decimal(0)
+        raw_trades = value.get("trades")
+        if not isinstance(raw_trades, list):
+            fail("INCOMPLETE_TRADE_HISTORY", "terminal trade list is missing")
+            raw_trades = []
+        trades: list[dict[str, Any]] = []
+        seen: dict[str, dict[str, Any]] = {}
+        for trade in raw_trades:
+            if not isinstance(trade, Mapping):
+                fail("UNBOUND_TRADE_EVIDENCE", "trade receipt is not an object")
+                continue
+            tid = trade.get("trade_id")
+            if not isinstance(tid, (str, int)) or isinstance(tid, bool) or not str(tid).strip():
+                fail("UNBOUND_TRADE_EVIDENCE", "trade identity is missing")
+                continue
+            if str(tid) in seen:
+                if trade != seen[str(tid)]:
+                    fail("CONFLICTING_TRADE_ID", "repeated trade ID has conflicting receipt fields")
+                continue
+            seen[str(tid)] = dict(trade)
+            tq, tp = _decimal_value(trade.get("quantity")), _decimal_value(trade.get("price"))
+            if tq is None or tq <= 0 or tp is None or tp <= 0:
+                fail("UNBOUND_TRADE_EVIDENCE", "trade quantity/price is not positive finite Decimal")
+            for key in ("account_index", "market_id", "client_order_index", "side"):
+                if trade.get(key) is None or str(trade[key]) != str(plan.get(key)):
+                    fail("UNBOUND_TRADE_EVIDENCE", f"trade does not bind to planned {key}")
+            if order is None or not trade.get("order_id") or str(trade["order_id"]) != str(order.get("order_id")):
+                fail("UNBOUND_TRADE_EVIDENCE", "trade does not bind to reconciled order")
+            if tp is not None and price_bound is not None and ((plan.get("side") == "BUY" and tp > price_bound) or (plan.get("side") == "SELL" and tp < price_bound)):
+                fail("UNBOUND_TRADE_EVIDENCE", "trade price violates the saved planned bound")
+            observed = _finite_number(trade.get("observed_at"))
+            if observed is None or observed < 0 or observed > record["at"]:
+                fail("INVALID_INTERVAL", "trade observation is missing or after terminal evidence")
+            trades.append(dict(trade))
+        trade_total = sum((_decimal_value(t.get("quantity")) or Decimal(0) for t in trades), Decimal(0))
+        if quantity is None or trade_total != quantity:
+            fail("CONFLICTING_FILL_QUANTITY", "complete history sum differs from reconciled quantity")
+        if position_before is None or position_after is None or plan.get("side") not in {"BUY", "SELL"}:
+            fail("UNRESOLVED_EXECUTION", "exact causal positions are missing")
+        elif position_before + (trade_total if plan["side"] == "BUY" else -trade_total) != position_after:
+            fail("CONFLICTING_POSITION", "trade sum does not explain the recorded position change")
+        if fallback and (after.get("active_orders") != [] or str(after.get("account_index")) != str(account) or str(after.get("market_id")) != str(plan.get("market_id"))):
+            fail("UNRESOLVED_EXECUTION", "fallback final account snapshot is incomplete or has active orders")
+        execution = {
+            "phase": phase, "attempt": attempt, "leg": leg, "account_index": account,
+            "market_id": plan.get("market_id"), "plan": dict(plan),
+            "filled_quantity": None if quantity is None else str(quantity),
+            "fee_total": value.get("fee_total"), "history_complete": history,
+            "resolved": not invalid, "dispatched": dispatched,
             "outcome": value.get("outcome", record.payload.get("outcome")),
             "economic_status": value.get("economic_status", record.payload.get("economic_status")),
-            "unknown_reasons": [item for item in unknown_reasons if isinstance(item, str)],
-            "position_after": value.get("position_after"),
-            "after": _copy_json(value.get("after")) if isinstance(value.get("after"), Mapping) else None,
-            "observed_at": record.get("at"),
-            "order": _copy_json(order) if order is not None else None,
-            "trades": [],
-            "source_file": str(data.path),
-            "source_event": record.event,
-            "line": record.get("line"),
-            "fallback": fallback,
-            "guard_status": (
-                _last_record(data, "PRE_RECEIVER_GUARD").payload.get("status")
-                if _last_record(data, "PRE_RECEIVER_GUARD") is not None
-                else None
-            ),
+            "position_before": None if position_before is None else str(position_before),
+            "position_after": None if position_after is None else str(position_after),
+            "after": dict(after), "observed_at": record["at"], "order": order,
+            "trades": trades if not invalid else [], "source_file": str(data.path),
+            "source_event": record.event, "line": record.get("line"), "fallback": fallback,
+            "guard_status": (_last_record(data, "PRE_RECEIVER_GUARD").payload.get("status")
+                             if _last_record(data, "PRE_RECEIVER_GUARD") else None),
         }
         executions.append(execution)
-
-        trades = value.get("trades")
-        if not isinstance(trades, list) or not trades:
-            return
-        if not history_complete:
-            issues.append(
-                _issue(
-                    "INCOMPLETE_TRADE_HISTORY",
-                    "trade receipt is not confirmed by a complete history boundary",
-                    data=data,
-                    record=record,
-                    phase=phase,
-                    attempt=attempt,
-                    leg=leg,
-                )
-            )
-            return
-        valid_trades: list[dict[str, Any]] = []
-        trade_total = Decimal(0)
-        invalid = False
-        for trade in trades:
-            if not isinstance(trade, Mapping):
-                invalid = True
-                issues.append(_issue("UNBOUND_TRADE_EVIDENCE", "trade receipt is not an object", data=data, record=record, phase=phase, leg=leg))
-                continue
-            trade_id = trade.get("trade_id")
-            order_id = trade.get("order_id")
-            quantity = _decimal_value(trade.get("quantity"))
-            price = _decimal_value(trade.get("price"))
-            if not isinstance(trade_id, (str, int)) or not str(trade_id).strip():
-                invalid = True
-                issues.append(_issue("UNBOUND_TRADE_EVIDENCE", "trade_id is missing", data=data, record=record, phase=phase, leg=leg))
-                continue
-            if not isinstance(order_id, (str, int)) or not str(order_id).strip():
-                invalid = True
-                issues.append(_issue("UNBOUND_TRADE_EVIDENCE", "trade order_id is missing", data=data, record=record, phase=phase, leg=leg, trade_id=str(trade_id)))
-                continue
-            if quantity is None or quantity <= 0 or price is None:
-                invalid = True
-                issues.append(_issue("UNBOUND_TRADE_EVIDENCE", "trade quantity/price is not finite and positive", data=data, record=record, phase=phase, leg=leg, trade_id=str(trade_id)))
-                continue
-            if account_index is None and trade.get("account_index") is not None:
-                account_index = trade.get("account_index")
-                execution["account_index"] = account_index
-            if account_index is None or trade.get("account_index") is None or str(trade.get("account_index")) != str(account_index):
-                invalid = True
-                issues.append(_issue("UNBOUND_TRADE_EVIDENCE", "trade account does not bind to the reconciled leg", data=data, record=record, phase=phase, leg=leg, trade_id=str(trade_id)))
-                continue
-            expected_order_id = value.get("order_id") or (order.get("order_id") if order is not None else None)
-            if expected_order_id is not None and str(order_id) != str(expected_order_id):
-                invalid = True
-                issues.append(_issue("UNBOUND_TRADE_EVIDENCE", "trade order does not bind to the reconciled order", data=data, record=record, phase=phase, leg=leg, trade_id=str(trade_id)))
-                continue
-            trade_market = trade.get("market_id")
-            if market_id is not None and trade_market is not None and str(trade_market) != str(market_id):
-                invalid = True
-                issues.append(_issue("UNBOUND_TRADE_EVIDENCE", "trade market does not bind to the reconciled leg", data=data, record=record, phase=phase, leg=leg, trade_id=str(trade_id)))
-                continue
-            canonical = {
-                "account_index": str(trade.get("account_index")),
-                "order_id": str(order_id),
-                "quantity": str(quantity),
-                "price": str(price),
-                "counterparty_account_index": trade.get("counterparty_account_index"),
-                "counterparty_order_id": trade.get("counterparty_order_id"),
-            }
-            key = (phase, attempt, leg, str(trade_id))
-            previous = next((item for item in fills if item.get("_dedupe_key") == key), None)
-            if previous is not None:
-                previous_canonical = previous.get("_canonical")
-                if previous_canonical != canonical:
-                    issues.append(_issue("CONFLICTING_TRADE_ID", "repeated trade_id has contradictory binding evidence", data=data, record=record, phase=phase, leg=leg, trade_id=str(trade_id)))
-                    fills[:] = [item for item in fills if item.get("_dedupe_key") != key]
-                    invalid = True
-                continue
-            trade_total += quantity
-            fill = {
-                "phase": phase,
-                "attempt": attempt,
-                "leg": leg,
-                "trade_id": trade.get("trade_id"),
-                "order_id": trade.get("order_id"),
-                "account_index": trade.get("account_index"),
-                "market_id": trade.get("market_id", market_id),
-                "quantity": trade.get("quantity"),
-                "price": trade.get("price"),
-                "fee": trade.get("fee"),
-                "counterparty_account_index": trade.get("counterparty_account_index"),
-                "counterparty_order_id": trade.get("counterparty_order_id"),
-                "counterparty_client_order_index": trade.get("counterparty_client_order_index"),
-                "observed_at": trade.get("observed_at"),
-                "history_complete": True,
-                "source_file": str(data.path),
-                "source_event": record.event,
-                "line": record.get("line"),
-                "_dedupe_key": key,
-                "_canonical": canonical,
-            }
-            valid_trades.append(fill)
-            fills.append(fill)
-        reported = _decimal_value(filled_quantity)
-        if reported is not None and trade_total != reported:
-            invalid = True
-            issues.append(
-                _issue(
-                    "CONFLICTING_FILL_QUANTITY",
-                    "trade receipt total differs from reconciled filled_quantity",
-                    data=data,
-                    record=record,
-                    phase=phase,
-                    attempt=attempt,
-                    leg=leg,
-                    reported_quantity=str(reported),
-                    trade_quantity=str(trade_total),
-                )
-            )
-        if invalid:
-            for fill in valid_trades:
-                if fill in fills:
-                    fills.remove(fill)
-            return
-        execution["trades"] = [
-            {key: value for key, value in fill.items() if not key.startswith("_")}
-            for fill in valid_trades
-        ]
-        # A complete, quantity-consistent trade history can resolve an
-        # execution even when an order snapshot was not retained in a compact
-        # synthetic receipt.  Paired SUCCESS still requires counterparty and
-        # phase identity proof below.
-        if valid_trades and execution.get("history_complete") is True:
-            execution["resolved"] = True
+        if not invalid:
+            for trade in trades:
+                fills.append({**trade, "phase": phase, "attempt": attempt, "leg": leg,
+                              "history_complete": True, "source_file": str(data.path),
+                              "source_event": record.event, "line": record.get("line")})
 
     for data in files:
         if data.kind in {"opening", "closing"}:
-            for record in data.records:
-                if record.event != "COMPLETE":
-                    continue
-                receipt = _receipt_from_complete(record)
-                if receipt is None:
-                    continue
-                attempt = _attempt_from(record.payload, receipt.get("attempt_index"))
+            complete = _records(data, "COMPLETE")
+            if len(complete) > 1:
+                issues.append(_issue("CONFLICTING_TERMINAL", "child has multiple terminal receipts", data=data))
+            for record in complete:
+                receipt = _receipt_from_complete(record) or {}
+                plan_record = _last_record(data, "PLAN_READY")
+                persisted_plan = plan_record.payload.get("plan", {}) if plan_record else {}
+                plan = receipt.get("plan") if isinstance(receipt.get("plan"), Mapping) else persisted_plan
+                if not isinstance(plan, Mapping):
+                    plan = {}
+                if persisted_plan and plan != persisted_plan:
+                    issues.append(_issue("CONFLICTING_PLAN", "terminal plan differs from PLAN_READY", data=data, record=record))
+                if receipt.get("outcome") is not None and receipt["outcome"] != record.payload.get("outcome"):
+                    issues.append(_issue("CONFLICTING_TERMINAL", "receipt outcome contradicts terminal envelope", data=data, record=record))
+                if receipt.get("run_id") is not None and receipt["run_id"] != data.run_id:
+                    issues.append(_issue("CONFLICTING_RUN_ID", "receipt run identity differs from its journal", data=data, record=record))
                 for leg in ("source", "receiver"):
                     value = receipt.get(leg)
-                    if isinstance(value, Mapping):
-                        append_execution(data.kind, attempt, leg, value, data, record)
+                    if not isinstance(value, Mapping):
+                        issues.append(_issue("INCOMPLETE_EXECUTION", "terminal receipt is missing a required leg", data=data, record=record))
+                        continue
+                    append_execution(data, record, leg, value, plan.get(leg, {}), _attempt_from(record.payload, receipt.get("attempt_index")))
         elif data.kind == "cycle":
-            fallback_evidence_attempts = {
-                _attempt_from(record.payload)
-                for record in data.records
-                if record.event == "FALLBACK_ATTEMPT_EVIDENCE"
-            }
-            for record in data.records:
-                if record.event not in {"FALLBACK_ATTEMPT_EVIDENCE", "FALLBACK_RECONCILED"}:
-                    continue
-                if record.event == "FALLBACK_RECONCILED" and _attempt_from(record.payload) in fallback_evidence_attempts:
-                    # FALLBACK_RECONCILED repeats the same attempt boundary;
-                    # the richer ATTEMPT_EVIDENCE row is authoritative.
-                    continue
-                append_execution(
-                    "fallback",
-                    _attempt_from(record.payload),
-                    "fallback",
-                    record.payload,
-                    data,
-                    record,
-                    fallback=True,
-                )
+            evidence = [r for r in data.records if r.event == "FALLBACK_ATTEMPT_EVIDENCE"]
+            keys = {(_attempt_from(r.payload), r.payload.get("account_index")) for r in evidence}
+            evidence.extend(r for r in data.records if r.event == "FALLBACK_RECONCILED" and (_attempt_from(r.payload), r.payload.get("account_index")) not in keys)
+            for record in evidence:
+                append_execution(data, record, "fallback", record.payload, record.payload.get("plan", {}), _attempt_from(record.payload))
+    by_trade: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     for fill in fills:
-        fill.pop("_dedupe_key", None)
-        fill.pop("_canonical", None)
+        key = (str(fill["account_index"]), str(fill["market_id"]), str(fill["trade_id"]))
+        by_trade.setdefault(key, []).append(fill)
+    reused = [group for group in by_trade.values() if len(group) > 1]
+    for group in reused:
+        issues.append(_issue("REUSED_TRADE_ID", "one account trade appears in multiple execution boundaries", trade_id=group[0]["trade_id"]))
+        for fill in group:
+            fills.remove(fill)
+        for execution in executions:
+            if any(execution["source_file"] == fill["source_file"] and execution["leg"] == fill["leg"] for fill in group):
+                execution["resolved"] = False
     return executions, fills, issues
 
 
@@ -1449,6 +1401,7 @@ def _latency_reports(
                     "receiver_dispatch_ack_at",
                     "receiver_dispatch_outcome_at",
                     "receiver_fill_observed_at",
+                    "receiver_terminal_observed_at",
                     "receiver_admission_at",
                 )
                 if key in latency
@@ -1595,24 +1548,7 @@ def _positions_from_cycle(
     # Child COMPLETE rows are the authoritative causal observations for their
     # account roles.  A fallback's account payload is already role-labelled.
     child_terminal_missing = any(issue.get("code") in {"CHILD_TERMINAL_MISSING", "REFERENCED_CHILD_MISSING"} for issue in issues)
-    structural_uncertainty = any(
-        issue.get("code")
-        in {
-            "MALFORMED_JSON",
-            "INVALID_ENCODING",
-            "TRUNCATED_LINE",
-            "SEQUENCE_GAP",
-            "CONFLICTING_SEQUENCE",
-            "CONFLICTING_RUN_ID",
-            "CONFLICTING_ORDER_EVIDENCE",
-            "CONFLICTING_TRADE_ID",
-            "CONFLICTING_FILL_QUANTITY",
-            "UNBOUND_TRADE_EVIDENCE",
-            "INCOMPLETE_TRADE_HISTORY",
-            "INVALID_INTERVAL",
-        }
-        for issue in issues
-    )
+    structural_uncertainty = bool(issues)
     child_has_intent = any(
         data.kind in {"opening", "closing"}
         and any(record.event.endswith("_DISPATCH_INTENT") for record in data.records)
@@ -1632,7 +1568,7 @@ def _positions_from_cycle(
             observed_agrees = False
             continue
         latest = max(observations[role], key=lambda item: item[0]) if observations[role] else None
-        if latest is None or latest[1] != expected:
+        if latest is None or latest[1] != expected or _finite_number(observed.get(role)) is None or _finite_number(observed[role]) < latest[0] or _finite_number(observed[role]) > complete["at"]:
             observed_agrees = False
     exact_zero = source_decimal == Decimal(0) and receiver_decimal == Decimal(0)
     valid_times = source_time is not None and receiver_time is not None and source_time >= 0 and receiver_time >= 0
@@ -1653,7 +1589,7 @@ def _positions_from_cycle(
     elif not terminal_proof or not valid_times:
         status = "UNKNOWN"
         notes.append("flat-looking positions are not promoted without CYCLE_COMPLETE and both valid observation timestamps")
-    elif parent_unknown or child_terminal_missing or structural_uncertainty or (child_has_intent and not child_resolution):
+    elif parent_unknown or child_terminal_missing or structural_uncertainty or not child_resolution:
         status = "UNKNOWN"
         notes.append("inventory proof is unknown because a child execution boundary or evidence validation is unresolved")
     elif not execution_evidence_present or not observed_agrees:
@@ -1689,76 +1625,31 @@ def _economics(
     fills: Sequence[Mapping[str, Any]],
     evidence_issues: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    fee_unknown: list[str] = []
-    fee_values: list[Any] = []
-    execution_statuses: list[str] = []
-    unresolved: list[str] = []
+    """Prove fees from exact individual receipts, including explicit zero fills."""
+    missing: list[str] = []
+    totals: list[str] = []
+    if evidence_issues or not executions or any(not item.get("resolved") for item in executions):
+        missing.append("execution history or receipt binding is unresolved")
     for execution in executions:
-        status = execution.get("economic_status")
-        if isinstance(status, str):
-            execution_statuses.append(status)
-        if execution.get("fee_total") is not None:
-            fee_values.append(execution.get("fee_total"))
-        quantity = _decimal_value(execution.get("filled_quantity"))
-        if quantity is not None and quantity > 0:
-            if execution.get("fee_total") is None:
-                fee_unknown.append(f"{execution.get('source_file')}: {execution.get('leg')} fee_total is missing for a filled leg")
-            for trade in execution.get("trades", ()) if isinstance(execution.get("trades"), list) else ():
-                if isinstance(trade, Mapping) and trade.get("fee") is None:
-                    fee_unknown.append(f"{execution.get('source_file')}: {execution.get('leg')} trade fee is missing")
-        if not execution.get("resolved"):
-            unresolved.append(
-                f"{execution.get('source_file')}: {execution.get('phase')} {execution.get('leg')} execution history is unresolved"
-            )
-    if evidence_issues:
-        unresolved.extend(str(issue.get("message")) for issue in evidence_issues[:20])
-
-    if unresolved:
-        fees = {
-            "status": "UNKNOWN",
-            "complete": False,
-            "reason": "execution history or receipt binding is unresolved",
-            "missing_evidence": list(dict.fromkeys(unresolved))[:20],
-            "known_fee_totals": fee_values,
-        }
-    elif fee_unknown:
-        fees = {
-            "status": "UNKNOWN",
-            "complete": False,
-            "reason": "at least one confirmed execution has no fee value",
-            "missing_evidence": list(dict.fromkeys(fee_unknown)),
-            "known_fee_totals": fee_values,
-        }
-    elif fills:
-        fees = {
-            "status": "PROVEN",
-            "complete": True,
-            "reason": "complete fee receipts are present for every validated fill",
-            "missing_evidence": [],
-            "known_fee_totals": fee_values,
-        }
-    elif executions and execution_statuses and all(status == "PROVEN" for status in execution_statuses):
-        fees = {
-            "status": "PROVEN",
-            "complete": True,
-            "reason": "terminal history proves no execution fee was due for the recorded no-fill legs",
-            "missing_evidence": [],
-            "known_fee_totals": fee_values,
-        }
-    else:
-        fees = {
-            "status": "UNKNOWN",
-            "complete": False,
-            "reason": "journal does not prove fee completeness",
-            "missing_evidence": ["no resolved execution fee proof"],
-            "known_fee_totals": fee_values,
-        }
+        trades = execution.get("trades", [])
+        fees = [_decimal_value(trade.get("fee")) for trade in trades]
+        if any(fee is None for fee in fees):
+            missing.append(f"{execution.get('phase')} {execution.get('leg')}: trade fee is missing or non-finite")
+            continue
+        total = sum((fee for fee in fees if fee is not None), Decimal(0))
+        recorded = execution.get("fee_total")
+        if recorded is not None and _decimal_value(recorded) != total:
+            missing.append(f"{execution.get('phase')} {execution.get('leg')}: receipt fee total contradicts individual trades")
+        totals.append(str(total))
+    proven = not missing
     return {
-        "fees": fees,
-        "funding_pnl": {
-            "status": "UNKNOWN",
-            "reason": "saved cycle journals do not independently attribute funding or closed PnL",
+        "fees": {
+            "status": "PROVEN" if proven else "UNKNOWN", "complete": proven,
+            "reason": "complete individual fee receipts or resolved no-fill legs" if proven else "fee completeness is not proven",
+            "missing_evidence": list(dict.fromkeys(missing)), "known_fee_totals": totals,
+            "total": str(sum((Decimal(t) for t in totals), Decimal(0))) if proven else None,
         },
+        "funding_pnl": {"status": "UNKNOWN", "reason": "saved cycle journals do not independently attribute funding or closed PnL"},
     }
 
 
@@ -1771,118 +1662,86 @@ def _paired_execution(
     parent_payload: Mapping[str, Any] | None = None,
     parent_complete: bool = False,
 ) -> dict[str, Any]:
-    explicit: str | None = None
-    reasons: list[str] = []
+    """Separate completed two-phase exposure from optional mutual trade matching."""
     parent_payload = parent_payload or {}
-    for candidate in (parent_payload, parent_payload.get("opening"), parent_payload.get("closing")):
-        if isinstance(candidate, Mapping):
-            value = candidate.get("paired_execution")
-            if isinstance(value, str):
-                explicit = value
-            reasons.extend(_reason_values(candidate))
-    receiver_actions = [
-        item for item in actions if item.get("leg") == "receiver" and item.get("phase") in {"opening", "closing"}
-    ]
-    receiver_possible_dispatch = bool(receiver_actions)
-    receiver_response_observed = any(item.get("response_observed") is True for item in receiver_actions)
-    receiver_dispatched = any(item.get("dispatched") is True for item in receiver_actions)
-    source_fills = [item for item in fills if item.get("leg") == "source" and item.get("phase") in {"opening", "closing"}]
-    receiver_fills = [item for item in fills if item.get("leg") == "receiver" and item.get("phase") in {"opening", "closing"}]
-    guard_statuses: list[str] = []
-    for execution in executions:
-        if execution.get("phase") not in {"opening", "closing"}:
-            continue
-        # Guard status is preserved in the child COMPLETE payload when it is
-        # present; it is not used as a substitute for trade proof.
-        guard_status = execution.get("guard_status")
-        if isinstance(guard_status, str):
-            guard_statuses.append(guard_status)
-
-    def phase_proof(phase: str) -> tuple[bool, str, Decimal | None]:
-        phase_source = [item for item in source_fills if item.get("phase") == phase]
-        phase_receiver = [item for item in receiver_fills if item.get("phase") == phase]
-        source_total = sum((_decimal_value(item.get("quantity")) or Decimal(0) for item in phase_source), Decimal(0))
-        receiver_total = sum((_decimal_value(item.get("quantity")) or Decimal(0) for item in phase_receiver), Decimal(0))
-        source_execs = [item for item in executions if item.get("phase") == phase and item.get("leg") == "source"]
-        receiver_execs = [item for item in executions if item.get("phase") == phase and item.get("leg") == "receiver"]
-        if not phase_source or not phase_receiver:
-            return False, "both source and receiver validated fills are required", None
-        if source_total != receiver_total:
-            return False, "source and receiver confirmed quantities are unequal", None
-        if not source_execs or not receiver_execs or not all(item.get("resolved") for item in (*source_execs, *receiver_execs)):
-            return False, "source/receiver terminal execution evidence is unresolved", None
-        if not all(
-            isinstance(item.get("order"), Mapping)
-            and str(item["order"].get("status", "")).lower()
-            in {"filled", "canceled", "cancelled", "rejected", "expired", "canceled-post-only", "canceled-too-much-slippage", "canceled-not-enough-liquidity"}
-            for item in (*source_execs, *receiver_execs)
-        ):
-            return False, "source/receiver terminal order snapshots are incomplete", None
-        if not all(str(item.get("outcome", "")).upper() == "SUCCESS" for item in (*source_execs, *receiver_execs)):
-            return False, "source/receiver phase outcomes do not both prove SUCCESS", None
-        source_accounts = {str(item.get("account_index")) for item in source_execs if item.get("account_index") is not None}
-        receiver_accounts = {str(item.get("account_index")) for item in receiver_execs if item.get("account_index") is not None}
-        if not source_accounts or not receiver_accounts:
-            return False, "source/receiver account identities are incomplete", None
-        for item in (*phase_source, *phase_receiver):
-            cp_account = item.get("counterparty_account_index")
-            cp_order = item.get("counterparty_order_id")
-            if cp_account is None or cp_order is None:
-                return False, "trade counterparty identity is incomplete", None
-            if item.get("leg") == "source" and str(cp_account) not in receiver_accounts:
-                return False, "source trade counterparty is foreign to receiver account", None
-            if item.get("leg") == "receiver" and str(cp_account) not in source_accounts:
-                return False, "receiver trade counterparty is foreign to source account", None
-        source_trade_ids = {str(item.get("trade_id")) for item in phase_source}
-        receiver_trade_ids = {str(item.get("trade_id")) for item in phase_receiver}
-        if source_trade_ids != receiver_trade_ids:
-            return False, "source/receiver trade identity sets do not agree", None
-        return True, "independently validated source/receiver fills, identities, and terminal phase", source_total
-
+    explicit = parent_payload.get("paired_execution")
+    receiver_actions = [a for a in actions if a.get("leg") == "receiver"]
+    receiver_dispatched = any(a.get("dispatched") is True for a in receiver_actions)
+    source_fills = [f for f in fills if f.get("leg") == "source"]
+    receiver_fills = [f for f in fills if f.get("leg") == "receiver"]
     phase_results: list[dict[str, Any]] = []
-    proven_phases: list[str] = []
+    mutual_results: list[dict[str, Any]] = []
     for phase in ("opening", "closing"):
-        proven, reason, quantity = phase_proof(phase)
-        phase_results.append({"phase": phase, "status": "PROVEN" if proven else "NOT_PROVEN", "quantity": None if quantity is None else str(quantity), "reason": reason})
-        if proven:
-            proven_phases.append(phase)
-
-    issue_codes = {str(item.get("code")) for item in evidence_issues}
-    if proven_phases:
+        legs = [e for e in executions if e.get("phase") == phase]
+        positive = [e for e in legs if (_decimal_value(e.get("filled_quantity")) or Decimal(0)) > 0]
+        source = [e for e in positive if e.get("leg") == "source"]
+        receiver = [e for e in positive if e.get("leg") == "receiver"]
+        valid = bool(legs) and all(e.get("resolved") for e in legs) and len(source) == len(receiver) == 1
+        quantity: Decimal | None = None
+        if valid:
+            a, b = source[0], receiver[0]
+            quantity = _decimal_value(a.get("filled_quantity"))
+            valid = (
+                quantity == _decimal_value(b.get("filled_quantity"))
+                and quantity == _decimal_value(a["plan"].get("quantity")) == _decimal_value(b["plan"].get("quantity"))
+                and a.get("account_index") != b.get("account_index")
+                and a.get("market_id") == b.get("market_id")
+                and a["plan"].get("side") != b["plan"].get("side")
+                and all(e.get("outcome") == "SUCCESS" for e in (a, b))
+            )
+        phase_results.append({"phase": phase, "status": "PROVEN" if valid else "NOT_PROVEN", "quantity": str(quantity) if valid else None,
+                              "reason": "complete planned exposure with terminal orders and exact position deltas" if valid else "both complete planned legs are required"})
+        mutual = "UNKNOWN"
+        if valid:
+            a, b = source[0], receiver[0]
+            receiver_trades = {str(t["trade_id"]): t for t in b["trades"]}
+            matched = len(a["trades"]) == len(receiver_trades)
+            foreign = False
+            for t in a["trades"]:
+                other = receiver_trades.get(str(t["trade_id"]))
+                if t.get("counterparty_account_index") not in (None, b["account_index"]):
+                    foreign = True
+                if other is None:
+                    matched = False
+                    continue
+                matched = matched and (
+                    t.get("counterparty_account_index") == b["account_index"]
+                    and other.get("counterparty_account_index") == a["account_index"]
+                    and t.get("counterparty_order_id") == other["order_id"]
+                    and other.get("counterparty_order_id") == t["order_id"]
+                    and t["order_id"] != other["order_id"]
+                    and t["side"] != other["side"]
+                    and _decimal_value(t["quantity"]) == _decimal_value(other["quantity"])
+                    and _decimal_value(t["price"]) == _decimal_value(other["price"])
+                    and (t.get("counterparty_client_order_index") is None or str(t["counterparty_client_order_index"]) == str(other["client_order_index"]))
+                    and (other.get("counterparty_client_order_index") is None or str(other["counterparty_client_order_index"]) == str(t["client_order_index"]))
+                )
+            mutual = "MATCHED" if matched else "NOT_MATCHED" if foreign else "UNKNOWN"
+        mutual_results.append({"phase": phase, "status": mutual})
+    reasons: list[str] = []
+    unresolved = bool(evidence_issues) or not parent_complete or not executions or any(not e.get("resolved") for e in executions)
+    all_phases = all(p["status"] == "PROVEN" for p in phase_results)
+    fallback = any(e.get("fallback") for e in executions)
+    if unresolved:
+        status = "UNKNOWN"
+        reasons.append("complete, consistent terminal execution evidence is required")
+    elif all_phases and phase_results[0]["quantity"] == phase_results[1]["quantity"] and not fallback and parent_payload.get("outcome") == "SUCCESS":
         status = "SUCCESS"
-        reasons.append("paired execution is independently proven from complete source/receiver trade identities")
-    elif explicit == "SUCCESS":
-        status = "UNKNOWN"
-        reasons.append("explicit SUCCESS was not independently re-proven from complete paired fills")
-    elif receiver_fills and not source_fills:
-        status = "FAILED" if not issue_codes and parent_complete else "UNKNOWN"
-        reasons.append("receiver execution was confirmed without a paired source fill")
-    elif source_fills and not receiver_fills:
-        status = "FAILED" if receiver_dispatched is False and not issue_codes and parent_complete else "UNKNOWN"
-        reasons.append("source execution was confirmed without a paired receiver fill")
-    elif not parent_complete:
-        status = "UNKNOWN"
-        reasons.append("cycle has no durable terminal classification")
-    elif not receiver_dispatched and guard_statuses and not issue_codes:
+        reasons.append("opening and closing exposure are independently proven; direct counterparty matching is separate")
+    elif receiver_fills and not source_fills or not receiver_dispatched and not receiver_fills:
         status = "FAILED"
-        reasons.append("receiver was not confirmed dispatched after the pre-receiver guard")
+        reasons.append("the intended paired cycle did not execute both required legs")
     else:
-        status = "UNKNOWN"
-        reasons.append("journals do not prove a paired execution classification")
-    if not reasons:
-        reasons.append("paired execution requires positive source/receiver identity and quantity proof")
+        status = "PARTIAL" if parent_payload.get("outcome") in {"SUCCESS", "PARTIAL"} and receiver_fills and source_fills else "UNKNOWN"
+        reasons.append("a complete paired opening and closing without fallback is not proven")
     return {
-        "status": status,
-        "explicit_status": explicit,
-        "receiver_possible_dispatch": receiver_possible_dispatch,
-        "receiver_response_observed": receiver_response_observed,
-        "receiver_dispatched": receiver_dispatched,
-        "receiver_fill_observed": bool(receiver_fills),
-        "source_confirmed_fill_count": len(source_fills),
-        "receiver_confirmed_fill_count": len(receiver_fills),
-        "guard_statuses": list(dict.fromkeys(guard_statuses)),
-        "phase_proof": phase_results,
-        "reasons": list(dict.fromkeys(reasons))[:20],
+        "status": status, "explicit_status": explicit,
+        "receiver_possible_dispatch": bool(receiver_actions),
+        "receiver_response_observed": any(a.get("response_observed") is True for a in receiver_actions),
+        "receiver_dispatched": receiver_dispatched, "receiver_fill_observed": bool(receiver_fills),
+        "source_confirmed_fill_count": len(source_fills), "receiver_confirmed_fill_count": len(receiver_fills),
+        "guard_statuses": list(dict.fromkeys(str(e["guard_status"]) for e in executions if e.get("guard_status"))),
+        "phase_proof": phase_results, "direct_counterparty_match": mutual_results, "reasons": reasons,
     }
 
 
@@ -2046,7 +1905,7 @@ def _coverage_map() -> dict[str, Any]:
         },
         "crash_boundaries": {
             "tests": [
-                "tests/spread_shadow/test_hood_handoff_offline_report.py::test_crash_before_response_preserves_intent_and_report_does_not_replay",
+                "tests/spread_shadow/test_hood_handoff_offline_report.py::test_engine_crash_boundaries_preserve_unknown_and_never_replay",
                 "tests/spread_shadow/test_hood_handoff_paired_opening.py::test_paired_restart_and_mode_mismatch_never_replay_or_cancel",
                 "tests/spread_shadow/test_hood_handoff_random_cycle.py::test_cycle_interruption_leaves_consumed_journal_and_never_replays",
             ],
@@ -2100,12 +1959,14 @@ def load_saved_cycle_report(path: str | Path) -> dict[str, Any]:
         if data.kind not in {"opening", "closing"} or not data.records:
             continue
         if any(record.event in child_terminal_events for record in data.records):
+            if data.records[-1].event not in child_terminal_events:
+                issues.append(_issue("POST_TERMINAL_RECORD", "child has records after its terminal result", data=data))
             continue
-        if any(record.event.endswith("_DISPATCH_INTENT") for record in data.records):
+        if data.records:
             issues.append(
                 {
                     "code": "CHILD_TERMINAL_MISSING",
-                    "message": "child journal contains mutation intent but no terminal reconciliation record",
+                    "message": "child journal has no durable terminal result",
                     "path": str(data.path),
                 }
             )
@@ -2162,16 +2023,52 @@ def load_saved_cycle_report(path: str | Path) -> dict[str, Any]:
         reason_values.append("cycle preflight was blocked before completion")
     reasons = list(dict.fromkeys(reason_values))
 
+    if not terminal:
+        issues.append(_issue("CYCLE_TERMINAL_MISSING", "cycle has no durable completion"))
+    if cycle and _last_record(cycle, "CYCLE_COMPLETE") is not None and cycle.records[-1].event != "CYCLE_COMPLETE":
+        issues.append(_issue("POST_TERMINAL_RECORD", "cycle contains evidence after its terminal record", data=cycle))
+    if cycle and len(_records(cycle, "CYCLE_COMPLETE")) > 1:
+        issues.append(_issue("CONFLICTING_TERMINAL", "cycle has multiple terminal records", data=cycle))
+    for action in actions:
+        expected_leg = "source" if action["leg"] == "cancel" else action["leg"]
+        matching = [e for e in executions if e["source_file"] == action["source_file"] and e["leg"] == expected_leg
+                    and (action.get("attempt") is None or e.get("attempt") == action["attempt"])
+                    and e["observed_at"] >= action["intent_at"]]
+        if action["leg"] != "cancel" and any(e["resolved"] and e["dispatched"] for e in matching):
+            action["dispatched"] = True
+            action["dispatch_proof"] = "terminal order and complete bound history"
+        if not matching or not all(e["resolved"] for e in matching):
+            issues.append(_issue("UNRESOLVED_INTENT", "mutation intent has no resolved terminal execution", phase=action["phase"], leg=action["leg"]))
+    latest_positions: dict[str, Decimal] = {}
+    for execution in sorted(executions, key=lambda e: (e["observed_at"], {"opening": 0, "closing": 1, "fallback": 2}[e["phase"]], e.get("attempt") or 0)):
+        account = str(execution["account_index"])
+        before = _decimal_value(execution.get("position_before"))
+        after = _decimal_value(execution.get("position_after"))
+        if account in latest_positions and before != latest_positions[account]:
+            issues.append(_issue("CONFLICTING_POSITION_CHAIN", "an execution does not start at the preceding proved account position", account_index=account))
+        if after is not None:
+            latest_positions[account] = after
+    if cycle and any(e["phase"] == "closing" for e in executions):
+        hold = _first_record(cycle, "HOLD_ANCHORED")
+        closing_plan = _first_record(cycle, "CLOSING_PLAN_READY")
+        hold_seconds = _finite_number(hold.payload.get("hold_seconds")) if hold else None
+        opening_end = max((e["observed_at"] for e in executions if e["phase"] == "opening"), default=None)
+        if hold is None or closing_plan is None or hold_seconds is None or hold_seconds < 0 or opening_end is None or hold["at"] < opening_end or closing_plan["at"] - hold["at"] < hold_seconds:
+            issues.append(_issue("INCOMPLETE_HOLD_EVIDENCE", "closing lacks a causally complete persisted hold interval"))
     inventory, inventory_notes = _positions_from_cycle(cycle, all_files, executions, issues)
-    economics = _economics(executions, fills, fill_issues)
+    economics = _economics(executions, fills, issues)
     paired = _paired_execution(
         actions,
         fills,
         executions,
-        fill_issues,
+        issues,
         parent_payload=cycle_payload,
         parent_complete=terminal,
     )
+
+    if paired["status"] == "SUCCESS" and inventory["status"] != "CONFIRMED_FLAT":
+        paired["status"] = "UNKNOWN"
+        paired["reasons"].append("complete cycle success requires causally proved final flat inventory")
 
     binding: dict[str, Any] = {}
     for record in (cycle.records if cycle else []):
@@ -2298,6 +2195,8 @@ def render_human(report: Mapping[str, Any]) -> str:
         f"Inventory: {inventory.get('status', 'UNKNOWN')} — source={_display_number(inventory.get('source'))}, receiver={_display_number(inventory.get('receiver'))}.",
         f"Fees: {fees.get('status', 'UNKNOWN')}; funding/PnL: UNKNOWN (отдельная классификация).",
     ]
+    if report.get("progression_detail_truncated"):
+        lines.append(f"Детали ограничены: списки действий и fills могут быть неполными; всего записей {report.get('progression_total_events')}.")
     if issues:
         lines.append(f"Проблемы входа: {len(issues)}; результат нельзя считать полным.")
     reasons = report.get("reasons")
