@@ -3,6 +3,10 @@
 SYSTEM_SPEC_VERSION = 4.2
 SPEC_STATUS = FIRST_RAW_RESEARCH_SCANNER_IMPLEMENTED
 
+## HCR-32 amendment — account inspection
+
+The private-owner `/accounts` command uses only the read-only SDK account adapter with existing Keychain keys and bounded concurrent reads of both configured accounts. It reports available balance separately from total equity and scopes position/order observations to the configured market. Preserve exact quantities, identity checks, observation times and explicit stale/unavailable states. Missing keys cannot prompt or provision; raw errors and wallet identities cannot enter Telegram. Account inspection cannot launch orders, clear persistent uncertainty or modify execution policy. Help and saved reports remain offline.
+
 ## HCR-30 amendment — operator Telegram control
 
 The owner-operated controller maps only the configured owner's fresh private `/run` command to one existing simple-launcher cycle. Numeric sender and private chat identities must both match; forwarded/edited/stale/repeated updates do not authorize execution. Persist update consumption and an active intent before child creation. No automatic retries of a launch after uncertainty, no remote configuration/credential input and no changes to execution policy.

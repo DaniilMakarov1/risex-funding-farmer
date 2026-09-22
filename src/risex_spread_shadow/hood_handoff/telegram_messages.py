@@ -6,7 +6,7 @@ import math
 
 from .journal import sanitize
 
-READ_MENU = {'keyboard': [[{'text': '/status'}, {'text': '/report'}], [{'text': '/help'}]],
+READ_MENU = {'keyboard': [[{'text': '/status'}, {'text': '/report'}], [{'text': '/accounts'}, {'text': '/help'}]],
              'resize_keyboard': True, 'is_persistent': True}
 
 
@@ -40,6 +40,7 @@ def help_message():
             '<b>Просмотр</b>\n'
             '/status — краткое состояние\n'
             '/report — последний результат и наблюдения\n'
+            '/accounts — балансы и позиции на счетах\n'
             '/help — эта инструкция\n\n'
             '<b>Запуск реальной торговли</b>\n'
             '<code>/run</code> — отправить команду на один Mainnet-цикл. '
@@ -70,7 +71,7 @@ def blocked_message():
 
 def unknown_message():
     return ('<b>Команда не распознана</b>\n'
-            'Используй /status, /report или /help.\n'
+            'Используй /accounts, /status, /report или /help.\n'
             'Для одного реального цикла команда <code>/run</code> должна быть без дополнительных параметров.')
 
 
@@ -135,4 +136,35 @@ def saved_message(name, report, *, blocked=False, detailed=False):
         lines += ['', '<i>Комиссии не равны итоговой прибыли. Фандинг и PnL требуют отдельного доказательства.</i>']
     lines += ['', '<i>Это сохранённые наблюдения, не текущая проверка счетов.</i>',
               '/status — кратко · /report — подробно · /help — команды']
+    return '\n'.join(lines)
+
+
+def accounts_message(result):
+    if result is None:
+        return ('<b>❔ Счета недоступны</b>\n'
+                'Не удалось получить данные. Проверь локальную конфигурацию, '
+                'сохранённые ключи и соединение. Повторить: /accounts')
+    symbol = text(result['symbol'], 24)
+    lines = ['<b>💼 Балансы и позиции</b>',
+             f'Рынок позиций и ордеров: <code>{symbol}</code>']
+    for role, row in zip(('Источник', 'Приёмник'), result['accounts']):
+        lines += ['', f'<b>{role} · счёт {text(row["index"], 24)}</b>']
+        snapshot = row['snapshot']
+        if snapshot is None:
+            lines += ['❔ Данные недоступны. Баланс, позиция и ордера неизвестны.']
+            continue
+        lines += ['⚠️ Устаревшее наблюдение' if row['stale'] else '✅ Данные получены',
+                  f'<i>{timestamp(snapshot.observed_at)}</i>']
+        balance = snapshot.available_balance
+        position = snapshot.signed_position
+        side = 'LONG' if position > 0 else 'SHORT' if position < 0 else 'нет позиции на этом рынке'
+        lines += ['Доступный баланс (валюта котировки): <code>' +
+                  (text(format(balance, 'f'), 48) if balance is not None else 'нет данных') + '</code>',
+                  f'Позиция: <code>{text(format(position, "f"), 48)} {symbol}</code> · {side}',
+                  f'Активных ордеров на рынке: <code>{len(snapshot.active_orders)}</code>']
+        if not snapshot.ready:
+            lines += ['⚠️ Биржа не подтверждает активный статус счёта.']
+    lines += ['', '<i>Доступный баланс не равен полной стоимости счёта. '
+              'Снимки получены отдельно и могут измениться; другие рынки не проверены. '
+              'Проверка не снимает блокировку запуска.</i>', '/accounts — обновить · /help — команды']
     return '\n'.join(lines)

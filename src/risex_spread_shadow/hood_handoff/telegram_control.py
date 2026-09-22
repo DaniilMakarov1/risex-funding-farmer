@@ -119,13 +119,14 @@ class Telegram:
 
 
 class Controller:
-    def __init__(self, owner, config, store, transport, launch, *, now=time.time):
+    def __init__(self, owner, config, store, transport, launch, *, now=time.time, accounts=None):
         self.owner = owner
         self.config = config
         self.operator = config.parent
         self.store = store
         self.transport = transport
         self.launch = launch
+        self.accounts = accounts
         self.now = now
         self.started = now()
         self.task = None
@@ -233,6 +234,13 @@ class Controller:
             await self.notify(views.help_message())
         elif command in ('/status', '/report'):
             await self.notify(self.summary(detailed=command == '/report'))
+        elif command == '/accounts':
+            try:
+                result = await self.accounts() if self.accounts is not None else None
+                response = views.accounts_message(result)
+            except Exception:
+                response = views.accounts_message(None)
+            await self.notify(response)
         elif command == '/run':
             if self.store.data['active'] is not None or self.task is not None and not self.task.done():
                 await self.notify(views.blocked_message())
@@ -275,9 +283,24 @@ async def serve(args, store, lock_fd, token):
         # enter stdin, argv, environment, output logs or Telegram.
         await process.communicate(b'\n')
 
+    async def accounts():
+        if config.read_bytes() != initial_config or evidence.read_bytes() != initial_evidence:
+            raise RuntimeError('configuration changed')
+        from .cli import _validate_simple_local_inputs
+        from .telegram_accounts import read_accounts
+        try:
+            account_config, _ = _validate_simple_local_inputs(
+                json.loads(initial_config), config_path=config,
+                operator_dir=config.parent, evidence_path=evidence,
+                defer_incremental_margin_calculation=None)
+        except SystemExit:
+            raise RuntimeError('account configuration unavailable') from None
+        return await read_accounts(account_config)
+
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=40)) as session:
         api = Telegram(session, token)
         controller = Controller(args.owner_id, config, store, api, launch)
+        controller.accounts = accounts
         # Obtaining the instance lock proves no inherited runner still holds it.
         controller.finish()
         latest = await api.call('getUpdates', offset=-1, timeout=0, allowed_updates=['message'])

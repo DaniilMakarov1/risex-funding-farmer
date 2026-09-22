@@ -102,7 +102,7 @@ async def test_transport_uses_html_and_readonly_keyboard_without_cutting_tags():
         assert payload['link_preview_options']['is_disabled'] is True
         valid(payload['text'])
         buttons = [b['text'] for row in payload['reply_markup']['keyboard'] for b in row]
-        assert buttons == ['/status','/report','/help']
+        assert buttons == ['/status','/report','/accounts','/help']
         assert '/run' not in buttons
     assert 'слишком длинное' in payloads[-1]['text']
 
