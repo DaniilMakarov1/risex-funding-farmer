@@ -2,7 +2,7 @@
 
 ## Owner objective and authority
 
-On 2026-09-22 the owner requested all five proposed improvements: complete latency diagnosis; one offline saved-cycle report; reproducible real-incident regressions; crash-boundary checks; concise current documentation. Accepted baseline is 14b4a9ebb0bc05822944768567cfa1daea6b1e5f (HCR-26 implementation candidate 0af1d8bbd079da0a7724aa7752aab77e32c05b31). This is a finite offline objective, not a new trading campaign.
+On 2026-09-22 the owner requested all five proposed improvements: complete latency diagnosis; one offline saved-cycle report; reproducible real-incident regressions; crash-boundary checks; concise current documentation. Accepted baseline is 14b4a9ebb0bc05822944768567cfa1daea6b1e5f (HCR-26 implementation candidate 0af1d8bbd079da0a7724aa7752aab77e32c05b31). This is a finite offline objective, not a new trading campaign. The owner reconfirmed that routine authorized work is pre-approved: do not request repeat confirmations for edits, offline tests, required dependency setup or local Git operations. Tool restrictions remain in force; report concrete blocked operations to Chief rather than expanding scope or changing security settings.
 
 No live market/account reads, Keychain/credentials, signing, sending/canceling orders, new cycle slots, or background monitoring. No changes to fees, quantity/hold selection, minimums, slippage, freshness/delay thresholds, shared three-attempt budget, residual cleanup policy, exact source priority, inventory/PNL semantics or release authority. Missing measurements remain unknown; historical inputs/results remain immutable. No new infrastructure/platform/dashboard.
 
