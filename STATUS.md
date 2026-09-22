@@ -1,5 +1,9 @@
 # Current status
 
+## HCR-25 — IN PROGRESS; cycle006 post-only retry correction
+
+Owner authorized the finite correction on2026-09-22 after cycle006 ended PARTIAL/CONFIRMED_FLAT. Exact source562950038806674 was canceled-post-only with zero fills/trades; receiver never dispatched. Existing retry admission accepts only PAIR_GUARD_ reasons, so this reconciled zero-fill terminal cancellation stopped after one attempt. Early-terminal handling discarded an already-completed public-book read, while NOT_OBSERVED economics became a misleading fees UNKNOWN warning. Chief independently reproduced opening stop, closing premature residual fallback and unused3-attempt budget. Fresh Builder /root/hcr25_postonly_builder owns production/tests under NEXT_TASK; Chief owns review/publication. Cycle006 hashes preserved in hood-postonly-retry-20260922/chief-v1. No live action is authorized; installed main remains9a2ba016 pending acceptance.
+
 ## HCR-24 — COMPLETE; accepted offline and installed
 
 Accepted recovery85bf37945a15d75fd7c1cef5c4b127df25ee6fdc and fast9fdadcb0fb524aa1142d1ae8b1b5aa19e114e19d are integrated in Chief merge98d41776acc393b799465a89a46f167b7e1a3c02. Chief reviewed complete original/correction diffs and independently reproduced delayed history, temporal source fills, truthful output, duplicate API nonce reservations, expired prepared adapters, delayed visibility and sticky foreign identity. Corrections preserve one-use account/key/client ownership, final evidence deadlines, causal refresh and exact owner-bound source admission. Quantity/hold, fees, slippage, timeouts and residual policy are unchanged; random opening/closing now avoid non-exclusive same-price placement within the existing three-attempt budget.
