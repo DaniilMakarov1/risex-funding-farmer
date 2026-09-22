@@ -1693,7 +1693,7 @@ async def test_closing_post_only_retry_exhaustion_reports_recovery_without_erasi
     assert "paired closing: paired closing source canceled-post-only zero-fill" in result.reason
     assert "cycle not opened" not in result.reason
     output = cli_module.format_random_cycle_result_ru(result)
-    assert "Парное исполнение: ❔ не доказано" in output
+    assert "Парное исполнение: ⚠️ выполнено частично" in output
     assert "Историческая позиция: ✅ закрытие подтверждено" in output
     assert "восстановление продолжено через fallback" in output
     assert "Приёмник открытия: ордер отправлен" in output
@@ -4293,7 +4293,8 @@ def _write_simple_launcher_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("route_draw", [0, 1, 2, 3])
-async def test_simple_enter_admits_reserved_slot_and_same_slot_replay_is_blocked(tmp_path, monkeypatch, capsys, route_draw):
+@pytest.mark.parametrize("no_progress", [False, True])
+async def test_simple_enter_admits_reserved_slot_and_same_slot_replay_is_blocked(tmp_path, monkeypatch, capsys, route_draw, no_progress):
     config_path, operator_dir, evidence_path = _write_simple_launcher_fixture(tmp_path)
     clock = AdvancingClock()
     synthetic_client = CycleClient(clock)
@@ -4320,6 +4321,10 @@ async def test_simple_enter_admits_reserved_slot_and_same_slot_replay_is_blocked
     monkeypatch.setattr(cli_module, "_validate_simple_sdk", lambda: None)
     monkeypatch.setattr(cli_module, "LighterSdkClient", FakeSdkClient)
     monkeypatch.setattr(cli_module, "run_random_cycle", run_with_synthetic_clock)
+    if no_progress:
+        async def forbidden_progress(*args):
+            pytest.fail("hidden Telegram child must not render terminal progress")
+        monkeypatch.setattr(cli_module, "_stream_simple_progress", forbidden_progress)
     assert await cli_module._run(
         cli_module._parser().parse_args(
             [
@@ -4328,13 +4333,13 @@ async def test_simple_enter_admits_reserved_slot_and_same_slot_replay_is_blocked
                 str(config_path),
                 "--market-evidence",
                 str(evidence_path),
-            ]
+            ] + (["--no-progress"] if no_progress else [])
         )
     ) == 0
     output = capsys.readouterr().out
     cycle_dir = operator_dir / "cycle-001"
     assert "SUCCESS" in output
-    assert "Подготовка: попытка" in output
+    assert ("Подготовка: попытка" in output) is not no_progress
     assert (cycle_dir / "launch.json").exists()
     assert (cycle_dir / "admission.json").exists()
     assert (cycle_dir / "cycle.jsonl").exists()

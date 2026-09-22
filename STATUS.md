@@ -1,5 +1,15 @@
 # Current status
 
+## HCR-38 — candidate awaiting release verification
+
+Accepted deployment remains HCR-37 below. The current candidate fixes source-only external attribution in final messages, distinguishes terminal zero-fill/unsent/unattempted phases, and retains external account IDs. It refreshes only the public book when the independently validated accounts already identify the source; original account ages and final exact-order checks remain mandatory. Telegram's hidden child no longer renders discarded terminal progress. New component timings and an allowlisted interface label support later comparisons.
+
+Selected cycle-020…023 journals (cycle-019 comparison) all reconcile flat. Cycle-020 source was filled by account 10196 before receiver dispatch; cycle-021 opened between our accounts but closing source was filled by 26085 and our IOC filled zero; cycle-022 source was filled by 20245 with our IOC zero. Cycle-023 had three terminal zero-fill attempts. The old summary could call source-only external execution UNKNOWN and an unattempted close unproved despite conclusive trade receipts. Corrected offline readback identifies these facts without changing original journals, fees or PnL.
+
+Cycle-021 is attributed to Telegram by durable controller state; other selected cycles lack an explicit interface label. Its LIMIT-to-MARKET intervals were 0.792225 s opening and 0.908964 s closing. Cycle-022 opening was 0.746840 s. These observations do not prove a Telegram-specific penalty. Source responses and coalesced reads dominate; both opening and closing prepare signatures before exposure and use the same admission path. Cycle-023's propagation refreshes repeated four account/order HTTP reads even though only its public source level was absent. The candidate removes these redundant requests, without claiming a measured live speed gain.
+
+Focused first pass: 456 passed, 2 failed (new report timing keys missing from the projection allowlist; a UI assertion still expected the old PARTIAL wording). Both causes were corrected; affected focused pass: 271 passed. Final clean isolated suite, full diff self-review, publication and idle deployment are pending. Evidence: `spread-shadow-runs/hood-report-latency-20260922/solo-v1/`. All 24 selected original files retain their hashes. No agent real orders or cancellations are authorized/performed by this task.
+
 ## HCR-37 — accepted and deployed
 
 Tested implementation: `0709dffc7504898cc926dfb2018ec070f093a1b2`, based on HCR-36 `235ca9c352a20a59bdc405e830906e5de922307b`. Integrated into main and verified on origin/main. The same agent implemented, tested and self-reviewed the full diff; no independent review is claimed.

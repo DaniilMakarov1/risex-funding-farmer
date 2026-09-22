@@ -176,6 +176,9 @@ _PROJECTED_KEYS = _PROJECTED_KEYS | frozenset({
     "max_quote_age_seconds", "max_source_to_receiver_seconds", "source_to_admission_seconds",
     "quote_read_seconds", "quote_read_started_at", "quote_read_finished_at",
     "source_quote_observed_at", "freshness_seconds",
+    "operator_interface", "source_visibility_lookup_seconds", "initial_account_checks_seconds",
+    "initial_public_book_seconds", "final_source_lookup_seconds", "pre_visibility_refresh_seconds",
+    "pre_visibility_refresh_book_only",
     *(f"{leg}_{stage}" for leg in ("source", "receiver") for stage in (
         "preparation_lock_wait_seconds", "nonce_acquisition_seconds", "signing_call_seconds", "transport_roundtrip_seconds", "nonce_reserved_before_quote",
     )),
@@ -1386,6 +1389,9 @@ def _latency_reports(
             parent_latency = {}
         values["quote_read"] = _latency_measure("quote_read", parent_latency.get("quote_read_seconds"),
             basis="parent plan latency.quote_read_seconds; elapsed book request, not pure network time", issues=interval_issues)
+        for name in ("source_visibility_lookup", "initial_account_checks", "initial_public_book", "final_source_lookup"):
+            values[name] = _latency_measure(name, latency.get(f"{name}_seconds"),
+                basis=f"latency.{name}_seconds; local elapsed request interval", overlap=True, issues=interval_issues)
         for leg in ("source", "receiver"):
             for stage in ("preparation_lock_wait", "nonce_acquisition", "signing_call", "transport_roundtrip"):
                 name = f"{leg}_{stage}"
@@ -1501,6 +1507,8 @@ def _latency_reports(
                 "concurrent_pre_receiver_checks_seconds": latency.get("concurrent_pre_receiver_checks_seconds"),
                 "public_book_read_seconds": latency.get("public_book_read_seconds"),
                 "pre_receiver_checks_seconds": latency.get("pre_receiver_checks_seconds"),
+                "pre_visibility_refresh_seconds": latency.get("pre_visibility_refresh_seconds"),
+                "pre_visibility_refresh_book_only": latency.get("pre_visibility_refresh_book_only"),
                 "not_additive": True,
             },
             "timestamps": {
@@ -1856,6 +1864,10 @@ def _paired_execution(
     receiver_dispatched = any(a.get("dispatched") is True for a in receiver_actions)
     source_fills = [f for f in fills if f.get("leg") == "source"]
     receiver_fills = [f for f in fills if f.get("leg") == "receiver"]
+
+    def external_account(value: Any, peer_ids: set[Any]) -> bool:
+        return type(value) is int and value >= 0 and value not in peer_ids
+
     phase_results: list[dict[str, Any]] = []
     mutual_results: list[dict[str, Any]] = []
     for phase in ("opening", "closing"):
@@ -1891,7 +1903,7 @@ def _paired_execution(
             foreign = False
             for t in a["trades"]:
                 other = receiver_trades.get(str(t["trade_id"]))
-                if t.get("counterparty_account_index") not in (None, b["account_index"]):
+                if external_account(t.get("counterparty_account_index"), {b["account_index"]}):
                     foreign = True
                 if other is None:
                     matched = False
@@ -1911,7 +1923,7 @@ def _paired_execution(
                 matched = matched and compatible
                 if compatible:
                     matched_quantity += _decimal_value(t["quantity"]) or Decimal(0)
-            foreign = foreign or any(t.get("counterparty_account_index") not in (None, a["account_index"]) for t in b["trades"])
+            foreign = foreign or any(external_account(t.get("counterparty_account_index"), {a["account_index"]}) for t in b["trades"])
             mutual = (
                 "MATCHED" if valid and matched and matched_quantity == quantity
                 else "NOT_MATCHED" if foreign
@@ -1927,12 +1939,31 @@ def _paired_execution(
             if len(peer_ids) == 1 and None not in peer_ids and own_legs:
                 external = sum((_decimal_value(t.get("quantity")) or Decimal(0)
                                 for e in own_legs for t in e.get("trades", [])
-                                if t.get("counterparty_account_index") is not None
-                                and t.get("counterparty_account_index") not in peer_ids), Decimal(0))
+                                if external_account(t.get("counterparty_account_index"), peer_ids)), Decimal(0))
                 filled = sum((_decimal_value(e.get("filled_quantity")) or Decimal(0) for e in own_legs), Decimal(0))
                 unproved = max(Decimal(0), filled - external - matched_quantity)
             quantities[f"external_{label}_quantity"] = None if external is None else str(external)
             quantities[f"unproved_{label}_quantity"] = None if unproved is None else str(unproved)
+            quantities[f"external_{label}_accounts"] = sorted({
+                t["counterparty_account_index"] for e in own_legs for t in e.get("trades", [])
+                if external is not None and external_account(t.get("counterparty_account_index"), peer_ids)
+            })
+            quantities[f"{label}_state"] = (
+                "UNKNOWN" if not own_legs or any(not e.get("resolved") for e in own_legs)
+                else "UNSENT" if not any(e.get("dispatched") for e in own_legs)
+                else "FILLED" if any((_decimal_value(e.get("filled_quantity")) or Decimal(0)) > 0 for e in own_legs)
+                else "NO_FILL"
+            )
+        phase_resolved = bool(legs) and all(e.get("resolved") for e in legs)
+        if phase_resolved and any((_decimal_value(quantities.get(f"external_{leg}_quantity")) or Decimal(0)) > 0
+                                  for leg in ("source", "receiver")):
+            # External execution is conclusive even when the other leg was
+            # never sent or its IOC filled zero. It needs no reciprocal fill.
+            mutual = "NOT_MATCHED"
+        elif phase_resolved and not positive:
+            mutual = "NO_FILL"
+        elif not legs and parent_complete and not evidence_issues and not any(a.get("phase") == phase for a in actions):
+            mutual = "NOT_ATTEMPTED"
         mutual_results.append({"phase": phase, "status": mutual, **quantities})
     reasons: list[str] = []
     unresolved = bool(evidence_issues) or not parent_complete or not executions or any(not e.get("resolved") for e in executions)
@@ -1951,6 +1982,9 @@ def _paired_execution(
         status = "PARTIAL" if parent_payload.get("outcome") in {"SUCCESS", "PARTIAL"} and receiver_fills and source_fills else "UNKNOWN"
         reasons.append("a complete paired opening and closing without fallback is not proven")
     exposure_status = status
+    if not unresolved and any(p["status"] == "NOT_MATCHED" for p in mutual_results):
+        status = "FAILED"
+        reasons.append("proven external execution prevents full mutual strategy success")
     if status == "SUCCESS" and not all(p["status"] == "MATCHED" for p in mutual_results):
         status = "FAILED" if any(p["status"] == "NOT_MATCHED" for p in mutual_results) else "UNKNOWN"
         reasons.append("full mutual execution with zero external volume is required for strategy success")

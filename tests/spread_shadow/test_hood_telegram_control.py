@@ -254,6 +254,8 @@ async def test_server_discards_backlog_and_uses_fixed_detached_child(tmp_path, m
     argv, kwargs = calls[0]
     assert argv[1:5] == ('-m', 'risex_spread_shadow.hood_handoff.cli', entry, '--keychain')
     assert argv[-2:] == ('--config', str(config))
+    assert '--no-progress' in argv
+    assert kwargs['env']['RISEX_HOOD_OPERATOR_INTERFACE'] == 'telegram'
     assert kwargs['pass_fds'] == (99,)
     assert kwargs['start_new_session'] is True
     assert kwargs['stdout'] == asyncio.subprocess.DEVNULL

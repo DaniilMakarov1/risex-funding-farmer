@@ -4,6 +4,7 @@ from __future__ import annotations
 from functools import lru_cache
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -36,5 +37,8 @@ def capture_provenance(binding: Mapping[str, Any]) -> dict[str, Any]:
                for name, module in sorted(tuple(sys.modules.items()))
                if name.startswith("risex_spread_shadow.hood_handoff")
                and getattr(module, "__file__", None)]
+    declared_interface = os.environ.get('RISEX_HOOD_OPERATOR_INTERFACE')
+    interface = declared_interface if declared_interface in {'telegram', 'terminal'} else 'unknown'
     return {**_implementation(), "configuration_sha256": hashlib.sha256(configuration).hexdigest(),
+            "operator_interface": interface,  # Diagnostic label only, never an authority or execution input.
             "imports": imports, "python_version": sys.version.split()[0]}

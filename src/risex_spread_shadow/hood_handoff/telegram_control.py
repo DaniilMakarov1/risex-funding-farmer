@@ -375,9 +375,10 @@ async def serve(args, store, lock_fd, token):
         env.pop('RISEX_HOOD_OPERATOR_DIR', None)
         env.pop('RISEX_HOOD_CONFIG', None)
         env['PYTHONPATH'] = str(root / 'src')
+        env['RISEX_HOOD_OPERATOR_INTERFACE'] = 'telegram'
         process = await asyncio.create_subprocess_exec(
             str(python), '-m', 'risex_spread_shadow.hood_handoff.cli', action,
-            '--keychain', '--config', str(config), cwd=str(root), env=env,
+            '--keychain', '--no-progress', '--config', str(config), cwd=str(root), env=env,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL, start_new_session=True, pass_fds=(lock_fd,))
         # The owner's /run is the launcher confirmation. No credential bytes

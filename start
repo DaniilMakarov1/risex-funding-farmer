@@ -10,6 +10,7 @@ if [ ! -f "$python_bin" ] || [ ! -x "$python_bin" ]; then
     exit 2
 fi
 export RISEX_SPREAD_SHADOW_ROOT="$project_root"
+export RISEX_HOOD_OPERATOR_INTERFACE=terminal
 if [ -n "${PYTHONPATH-}" ]; then
     export PYTHONPATH="$project_root/src:$PYTHONPATH"
 else

@@ -648,6 +648,7 @@ class HandoffEngine:
         visibility_finished_at: float | None = None
         visibility_state: dict[str, float | bool | None] = {}
         checks_finished_at: float | None = None
+        self._last_visibility_timings = {}
 
         async def observe_source() -> OrderSnapshot | None:
             nonlocal visibility_finished_at
@@ -659,6 +660,7 @@ class HandoffEngine:
                 require_terminal=False,
             )
             visibility_finished_at = time.perf_counter()
+            self._last_visibility_timings["source_visibility_lookup_seconds"] = max(0.0, visibility_finished_at - started)
             visibility_state["visible_finished_at"] = visibility_finished_at
             return value
 
@@ -687,6 +689,9 @@ class HandoffEngine:
         # margin, fill and conflicting-order evidence remain authoritative.
         self._last_pre_visibility_refresh = False
         self._last_pre_visibility_refresh_seconds = 0.0
+        self._last_visibility_timings["initial_account_checks_seconds"] = max(
+            0.0, float(visibility_state.get("accounts_finished_at") or started) - started)
+        self._last_visibility_timings["initial_public_book_seconds"] = checks[3]
         pre_visibility = (
             visibility_finished_at is not None
             and checks_finished_at is not None
@@ -705,7 +710,20 @@ class HandoffEngine:
             pre_visibility=pre_visibility,
         ):
             refresh_started = time.perf_counter()
-            checks = await self._parallel_pre_receiver_checks(config)
+            # When only the public book has not caught up, the independently
+            # validated account snapshots already prove the exact resting
+            # source and unchanged receiver. Keep their original timestamps;
+            # the normal final admission revalidates freshness and exact order.
+            book_only = (
+                self._visibility_source_order_status(checks[0], plan, source_order) == "EXACT"
+                and self._visibility_book_status(checks[2], plan, source_order) == "ABSENT"
+            )
+            if book_only:
+                book, duration = await self._read_public_book(config)
+                checks = (checks[0], checks[1], book, duration, max(0.0, time.perf_counter() - refresh_started))
+            else:
+                checks = await self._parallel_pre_receiver_checks(config)
+            self._last_visibility_timings["pre_visibility_refresh_book_only"] = float(book_only)
             self._last_pre_visibility_refresh = True
             self._last_pre_visibility_refresh_seconds = max(
                 0.0,
@@ -1011,6 +1029,7 @@ class HandoffEngine:
                         run_id,
                     )
                     latency["pre_visibility_refresh_seconds"] = self._last_pre_visibility_refresh_seconds
+                    latency.update(getattr(self, "_last_visibility_timings", {}))
                 else:
                     source_order = await self._poll_order(
                         plan.source,
@@ -1121,7 +1140,9 @@ class HandoffEngine:
                 latency["public_book_read_seconds"] = book_duration
                 latency["concurrent_pre_receiver_checks_seconds"] = parallel_duration
                 source_order_id = source_order.order_id
+                final_lookup_started = time.perf_counter()
                 source_order = await self._lookup_order(plan.source, source_order.order_id)
+                latency["final_source_lookup_seconds"] = max(0.0, time.perf_counter() - final_lookup_started)
                 decision_now = self.clock.now()
                 if source_dispatch_intent_at is not None:
                     latency["source_to_admission_seconds"] = max(0.0, decision_now - source_dispatch_intent_at)

@@ -587,6 +587,22 @@ def test_real_engine_cycle_report_keeps_exact_fees_latency_and_pair_proof(comple
         assert measured["quote_age_seconds"] == saved["source_quote_age_seconds"]
         assert measured["receiver_admission_seconds"] == saved["receiver_admission_seconds"]
         assert measured["overlap"]["public_book_read_seconds"] == saved["public_book_read_seconds"]
+        for name in ("source_visibility_lookup", "initial_account_checks", "initial_public_book", "final_source_lookup"):
+            assert measured[f"{name}_seconds"] == saved[f"{name}_seconds"]
+
+
+@pytest.mark.parametrize("counterparty", [None, -1, True, "999"])
+def test_invalid_counterparty_cannot_be_claimed_as_external(complete_cycle, counterparty):
+    def corrupt(rows):
+        receipt = next(r["payload"]["receipt"] for r in rows if r["event"] == "COMPLETE")
+        receipt["source"]["trades"][0]["counterparty_account_index"] = counterparty
+    _change_records(complete_cycle / "opening.jsonl", corrupt)
+    report = load_saved_cycle_report(complete_cycle)
+    phase = report["paired_execution"]["direct_counterparty_match"][0]
+    assert phase["external_source_quantity"] == "0"
+    assert phase["external_source_accounts"] == []
+    assert phase["unproved_source_quantity"] == "0.20"
+    assert report["paired_execution"]["status"] == "UNKNOWN"
 
 
 @pytest.mark.parametrize("defect", ["missing_order", "missing_market", "foreign_client", "wrong_side", "negative_price", "missing_trade", "incomplete_history", "wrong_position", "unresolved", "missing_dispatch", "active_order"])

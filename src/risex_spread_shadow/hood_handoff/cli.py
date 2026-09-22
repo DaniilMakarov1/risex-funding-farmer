@@ -92,6 +92,8 @@ def _parser() -> argparse.ArgumentParser:
             "then runs exactly one finite opening/close cycle."
         ),
     )
+    parser.add_argument('--no-progress', action='store_true',
+                        help='disable live terminal rendering; execution and final output are unchanged')
     parser.add_argument(
         "run",
         nargs="?",
@@ -1455,16 +1457,16 @@ async def _run_simple_confirmed(args, value, config_path, operator_dir) -> int:
         from .operator_recovery import resolve_prior
         await resolve_prior(config, client, operator_dir)
         stop_progress = asyncio.Event()
-        progress_task = asyncio.create_task(
-            _stream_simple_progress(Path(config.journal_path), emitted_keys, stop_progress)
-        )
+        progress_task = None if getattr(args, 'no_progress', False) else asyncio.create_task(
+            _stream_simple_progress(Path(config.journal_path), emitted_keys, stop_progress))
         run_task = asyncio.create_task(run_random_cycle(config, client))
         await asyncio.sleep(0)
         try:
             result = await run_task
         finally:
             stop_progress.set()
-            await progress_task
+            if progress_task is not None:
+                await progress_task
     except asyncio.CancelledError:
         (
             may_have_sent,

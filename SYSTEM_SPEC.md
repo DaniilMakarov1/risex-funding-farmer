@@ -1,9 +1,9 @@
 # Current system specification
 
-SYSTEM_SPEC_VERSION = 5.1
+SYSTEM_SPEC_VERSION = 5.2
 SPEC_STATUS = OPERATOR_ROBINHOOD_CYCLE
 
-This file is the single current behavior contract. It consolidates HCR-1 through HCR-37; newer statements are not layered over contradictory historical amendments. Acceptance/deployment is in STATUS, finite authority in NEXT_TASK, operation in README. Development correctness does not establish live strategy success.
+This file is the single current behavior contract. It consolidates HCR-1 through HCR-38; newer statements are not layered over contradictory historical amendments. Acceptance/deployment is in STATUS, finite authority in NEXT_TASK, operation in README. Development correctness does not establish live strategy success.
 
 ## Product and boundaries
 
@@ -29,7 +29,7 @@ Prepared mutations stay in memory, owned by the original adapter/account/key and
 
 Receiver admission needs fresh independently read accounts and a two-sided public book, then a final exact source lookup. Source must be active, zero-fill and match account, market, order/client IDs, side, LIMIT/POST_ONLY, reduce-only flag, price and full remaining quantity. Its public level must identify that exact order/owner/side/price/quantity. Better external volume is LOST; same-price volume without explicit FIFO proof, anonymous/missing/stale/future/malformed/conflicting evidence is UNKNOWN. Both block receiver. An already-filled source always blocks receiver; no opening chase.
 
-One bounded refresh may resolve specifically pre-visibility missing source evidence only when earlier observations prove correct identities, unchanged positions, readiness, margin, freshness and no conflicting orders/fills. Contradictory evidence remains sticky. Final public-book age participates in a monotonic send deadline with account, metadata, exact-order and prepared evidence, including nonce/signing/transmission time. Expiry does not authorize replay.
+One bounded refresh may resolve specifically pre-visibility missing source evidence only when earlier observations prove correct identities, unchanged positions, readiness, margin, freshness and no conflicting orders/fills. If the source account already identifies the exact resting source and only the public level is absent, refresh only the book; retain both account snapshots and their original ages. Otherwise refresh accounts and book together. Contradictory evidence remains sticky. Final admission revalidates all observations and reads the exact source again. Final public-book age participates in a monotonic send deadline with account, metadata, exact-order and prepared evidence, including nonce/signing/transmission time. Expiry does not authorize replay.
 
 Default bounds: freshness 10 s; request 5 s; order wait 10 s; reconciliation 20 s; polling 0.5 s; maximum 40 polls; source exchange expiry 300 s; auth lifetime 600 s. Explicit valid overrides remain supported. Optional max_quote_age_seconds and max_source_to_receiver_seconds are absent by default and, if configured, positive and no greater than freshness. Offline timing does not calibrate live thresholds.
 
@@ -55,11 +55,13 @@ After complete reconciliation, close freshly proved residuals with reduce-only b
 
 Journal parent/child source, configuration, account/market/order/client identities, intents/responses, exact trades, positions and original timestamps. Official Trade.timestamp is strict nonnegative integer epoch milliseconds, normalized once to seconds; no magnitude guessing. Official order side uses strict is_ask. Missing required fields/pagination/identity remain unknown; irrelevant additive fields are tolerated. Cleanup closes all owned SDK/signer/HTTP clients idempotently without replacing the terminal result.
 
-At cycle/attempt start record actual imports/package hashes, Git HEAD/dirty state, Python and allowlisted configuration hash. Cache before quote selection; code changes need a fresh runtime. Timing records distinguish quote age, preparation/signing, dispatch response, private visibility, public owner-bound snapshot, admission and reconciliation. Overlapping intervals are not additive; network-only, CPU-only and exchange-only fractions remain unmeasured.
+At cycle/attempt start record actual imports/package hashes, Git HEAD/dirty state, Python and allowlisted configuration hash. The launcher declares telegram/terminal/unknown for diagnostics only, never authority. Cache before quote selection; code changes need a fresh runtime. Timing records distinguish quote age, preparation/signing, dispatch response, private visibility lookup, initial account/book reads, visibility refresh, final exact source lookup, admission and reconciliation. Overlapping intervals are not additive; network-only, CPU-only and exchange-only fractions remain unmeasured.
 
 Offline reports stream immutable saved journals without credentials/network/claims/mutations. Preserve source hashes and record provenance; bound detail and mark truncation incomplete. Separate plans, intents, accepted responses, validated fills and parent/child outcomes. Missing/conflicting/causally invalid input cannot prove success, flatness, zero fees or closed PnL.
 
 Russian terminal/Telegram lifecycle views show confirmed opening account/side/quantity, hold duration/start and planned closing start in Moscow time. Later stages label opening positions as historical, not current. Automatic Telegram notices are finite per owned run (LIMIT acceptance, reconciled own/external/unproved fills per attempt, HOLD, closing and residual recovery); notification failure/slowness cannot delay, cancel or replay the detached trading child. Per-attempt views identify the LIMIT and MARKET accounts, reciprocal own quantity, external account IDs when present, and unproved quantity; they report LIMIT-to-MARKET dispatch and MARKET-response intervals when measured. Acceptance is explicitly not execution. Final views separate matching, historical inventory, commissions, gross/net execution PnL and funding. Saved reports never imply current account state; raw/sensitive errors are sanitized and output bounded.
+
+Final views also state each phase's known own/external quantities and external account IDs. A proved external source fill does not require a receiver fill: distinguish unsent, terminal zero-fill and filled receiver orders. Completely reconciled external execution makes full mutual strategy success FAILED; partial own execution remains partial. Unattempted phases are explicit only with complete evidence. Missing fees do not erase proved execution, and invalid counterparties remain unproved. Telegram's hidden child disables terminal progress rendering; the controller reads journals independently and the same execution path remains active.
 
 ## Telegram and credential boundary
 

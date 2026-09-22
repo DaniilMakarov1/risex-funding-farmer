@@ -63,6 +63,8 @@ The final result keeps these facts separate:
 | Net execution PnL | Gross minus all proved commissions, in quote currency. Missing commissions leave net unknown. |
 | Funding | Excluded from execution PnL; the funding-inclusive total remains unknown without its own evidence. |
 
+The final message states who filled each LIMIT and whether our MARKET filled our LIMIT, external orders, nothing, or was never sent. Proven external fills include account IDs even when the opposite order filled zero. A phase that never ran is marked explicitly. Overall strategy failure, successful residual closure and unknown fees can all be true in the same cycle.
+
 The SDK now preserves the account's maker/taker venue and integrator fee fields. Both explicitly zero components prove zero. Nonzero integer units are not yet verified for this venue and are retained as raw evidence, not guessed amounts. Old journals missing these fields remain unchanged. Small PnL values are not rounded to cents.
 
 After interruption preserve journals/state. A new `/run` checks current positions and all old creation intents again; a failed historical result does not permanently lock the bot. After manually closing positions, send `/run` again. If positions remain, use `/close`. A missing terminal or unknown order is not a closed position and cannot be cleared by deleting a lock/state file. The normal launcher never resumes or closes historical inventory automatically; lower-level reconciliation does not authorize replay. `/accounts` is the way to request current selected-market account observations.
@@ -113,7 +115,7 @@ Read a saved cycle without credentials, network or mutation:
   --path spread-shadow-runs/hood-cycle-race-latency-20260920/operator-v1/cycle-011
 ```
 
-Add `--json` for hashes, exact receipts, orders/intents, reasons, accounting and latency. Overlapping durations cannot be added; unavailable time is not zero. Saved facts do not establish current account state.
+Add `--json` for hashes, exact receipts, orders/intents, reasons, accounting and latency. New runs separately time the initial source lookup, account/book checks, propagation refresh and final source lookup. Launchers record the interface as a diagnostic label; older missing labels cannot prove a channel comparison. Overlapping durations cannot be added; unavailable time is not zero. Saved facts do not establish current account state. Telegram disables the hidden child's terminal progress with `--no-progress`; notifications remain in the separate controller and orders use the same cycle path.
 
 Keys use native Keychain bound to API/signing environment, account and key index, or hidden local input. No plaintext fallback, arguments, environment variables, project files or logs. `--keychain-replace`/`--keychain-remove` affect the exact local record; removal does not revoke a venue key. Help/previews stay offline.
 

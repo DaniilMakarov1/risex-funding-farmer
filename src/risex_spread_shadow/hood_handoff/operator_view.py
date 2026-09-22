@@ -313,19 +313,38 @@ def result_lines(report, *, detailed=False):
         lines.append(f'Первый счёт: {clean(binding.get("source_account_index"), 24)} · лимитный {side} (A); '
                      f'Второй счёт: {clean(binding.get("receiver_account_index"), 24)} (B).')
     lines += [
-        'Парное исполнение: ' + {'SUCCESS': '✅ подтверждено', 'FAILED': '⚠️ не состоялось'}.get(pair.get('status'), '❔ не доказано'),
+        'Парное исполнение: ' + {'SUCCESS': '✅ подтверждено', 'FAILED': '⚠️ не состоялось', 'PARTIAL': '⚠️ выполнено частично'}.get(pair.get('status'), '❔ не доказано'),
         'Историческая позиция: ' + {'CONFIRMED_FLAT': '✅ закрытие подтверждено', 'PARTIAL': '⚠️ есть остаток'}.get(inventory.get('status'), '❔ неизвестна'),
     ]
     matches = pair.get('direct_counterparty_match')
     for value in matches[:2] if isinstance(matches, list) else ():
         value = mapping(value)
         label = {'opening': 'Открытие', 'closing': 'Закрытие'}.get(value.get('phase'), 'Фаза')
-        lines.append(f'{label} · наша LIMIT: наш парный счёт {amount(value.get("matched_quantity"))}; '
-                     f'внешние участники {amount(value.get("external_source_quantity"))}; '
-                     f'не доказано {amount(value.get("unproved_source_quantity"))}.')
-        lines.append(f'{label} · наш MARKET: собрал нашу LIMIT {amount(value.get("matched_quantity"))}; '
-                     f'чужие заявки {amount(value.get("external_receiver_quantity"))}; '
-                     f'не доказано {amount(value.get("unproved_receiver_quantity"))}.')
+        if value.get('status') == 'NOT_ATTEMPTED':
+            lines.append(f'{label}: парные ордера не отправлялись.')
+            continue
+        for role, kind in (('source', 'наша LIMIT'), ('receiver', 'наш MARKET')):
+            prefix = f'{label} · {kind}: '
+            state = value.get(f'{role}_state')
+            if state in {'UNSENT', 'NO_FILL'}:
+                detail = ('не отправлялся.' if role == 'receiver' else 'не отправлялась.') if state == 'UNSENT' else 'ордер отправлен, исполнений нет; ордер завершён.'
+                lines.append(prefix + detail)
+                continue
+            own = number(value.get('matched_quantity'))
+            external = number(value.get(f'external_{role}_quantity'))
+            unproved = number(value.get(f'unproved_{role}_quantity'))
+            parts = []
+            if own:
+                parts.append(('исполнил наш парный счёт' if role == 'source' else 'исполнил нашу LIMIT') + f' — {amount(own)}')
+            if external:
+                ids = value.get(f'external_{role}_accounts', [])
+                ids = ids if isinstance(ids, list) else []
+                who = 'счета ' + ', '.join(clean(i, 24) for i in ids[:3]) if ids else 'внешние участники'
+                parts.append((f'исполнили внешние участники ({who})' if role == 'source' else f'исполнил чужие заявки ({who})')
+                             + f' — {amount(external)}')
+            if unproved:
+                parts.append(f'контрагент не доказан — {amount(unproved)}')
+            lines.append(prefix + ('; '.join(parts) if parts else 'исполнение и контрагент не доказаны') + '.')
     lines.append(hold_line(report.get('holding')))
     lines.append(f'Завершение: {timestamp(mapping(report.get("cycle")).get("terminal_at"))}.')
     lines.append('Комиссии: ' + (amount(fees.get('total')) if fees.get('status') == 'PROVEN' else 'неполные данные, сумма неизвестна') + ' (валюта котировки).')
