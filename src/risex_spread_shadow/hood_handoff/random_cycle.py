@@ -2480,6 +2480,44 @@ class RandomCycleEngine:
 
         raise AssertionError("shared pair-attempt budget returned without a terminal result")
 
+    async def _parallel_revalidation_context(
+        self,
+        config: RandomCycleConfig,
+        *,
+        market_read_label: str,
+    ) -> tuple[MarketMetadata, AccountSnapshot, AccountSnapshot]:
+        """Read metadata and both accounts before taking the final book quote.
+
+        Account and metadata observations are independent read-only inputs for
+        sizing.  The book is intentionally fetched by the caller only after
+        these checks finish, so the source quote is bound as late as possible
+        without reusing or renewing any observation.
+        """
+
+        async def read_metadata() -> MarketMetadata:
+            return _as_market(
+                await self._bounded(
+                    self.client.market_metadata(config.market_id),
+                    config,
+                    market_read_label,
+                )
+            )
+
+        tasks = [
+            asyncio.create_task(read_metadata()),
+            asyncio.create_task(self._accounts(config)),
+        ]
+        try:
+            metadata, accounts = await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        source, receiver = accounts
+        return metadata, source, receiver
+
     async def _revalidate_open(
         self,
         config: RandomCycleConfig,
@@ -2489,10 +2527,18 @@ class RandomCycleEngine:
         initial_source: AccountSnapshot | None,
         initial_receiver: AccountSnapshot | None,
     ) -> tuple[MarketMetadata, OrderBookSnapshot, AccountSnapshot, AccountSnapshot, RandomCycleSelection]:
-        metadata = _as_market(await self._bounded(self.client.market_metadata(config.market_id), config, "opening revalidation market read"))
+        metadata, source, receiver = await self._parallel_revalidation_context(
+            config,
+            market_read_label="opening revalidation market read",
+        )
         book = _as_book(await self._bounded(self._order_book(config.market_id), config, "opening revalidation order book read"), metadata)
         now = self.clock.now()
         _validate_market_book(config, metadata, book, now)
+        # The account observations are retained as read, with their original
+        # timestamps.  Revalidate their age after the final book read so the
+        # late quote cannot make an older account snapshot silently admissible.
+        _validate_account_fresh(config, source, "source", now)
+        _validate_account_fresh(config, receiver, "receiver", now)
         proposal = select_automatic_prices(config.direction, metadata, book, now=now, freshness_seconds=config.freshness_seconds)
         if not _exclusive_source_price_available(
             book,
@@ -2502,7 +2548,6 @@ class RandomCycleEngine:
             raise _RetryablePreparationFailure(
                 "public book does not permit an exclusive improved source price"
             )
-        source, receiver = await self._accounts(config, now)
         expected_source_position = 0 if initial_source is None else initial_source.signed_position
         expected_receiver_position = 0 if initial_receiver is None else initial_receiver.signed_position
         if source.signed_position != expected_source_position or receiver.signed_position != expected_receiver_position:
@@ -2631,24 +2676,22 @@ class RandomCycleEngine:
             budget = _PairAttemptBudget()
             while budget.available:
                 attempt_index = budget.consume()
-                metadata = _as_market(
-                    await self._bounded(
-                        self.client.market_metadata(config.market_id),
+                try:
+                    metadata, source, receiver = await self._parallel_revalidation_context(
                         config,
-                        "closing market read",
+                        market_read_label="closing market read",
                     )
-                )
+                except _AccountIdentityFailure:
+                    self._mark_identity_failure("closing account identity/read validation failed")
+                    raise
                 book = _as_book(
                     await self._bounded(self._order_book(config.market_id), config, "closing order book read"),
                     metadata,
                 )
                 now = self.clock.now()
                 _validate_market_book(config, metadata, book, now)
-                try:
-                    source, receiver = await self._accounts(config, now)
-                except _AccountIdentityFailure:
-                    self._mark_identity_failure("closing account identity/read validation failed")
-                    raise
+                _validate_account_fresh(config, source, "source", now)
+                _validate_account_fresh(config, receiver, "receiver", now)
                 if source.source_identity != opening_plan.source_identity:
                     self._mark_identity_failure("source account identity changed during the holding period")
                     return blocked("source account identity changed during the holding period")
