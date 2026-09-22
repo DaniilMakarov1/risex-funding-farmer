@@ -18,6 +18,7 @@ lighter-testnet-readiness = "risex_farmer.lighter_testnet_readiness:main"
 lighter-testnet-level-c = "risex_farmer.lighter_testnet_lifecycle:main"
 risex-spread-shadow = "risex_spread_shadow.cli:main"
 risex-spread-shadow-fee-read = "risex_spread_shadow.risex_fee_read:main"
+risex-hood-telegram = "risex_spread_shadow.hood_handoff.telegram_control:main"
 risex-hood-handoff = "risex_spread_shadow.hood_handoff.cli:main"
 
 [project.optional-dependencies]

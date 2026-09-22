@@ -1359,6 +1359,12 @@ async def _run_simple(args: argparse.Namespace) -> int:
     if not _simple_confirmation():
         return 0
 
+    from .operator_control import exclusive_lock
+    with exclusive_lock(operator_dir / ".operator-launch.lock"):
+        return await _run_simple_confirmed(args, value, config_path, operator_dir)
+
+
+async def _run_simple_confirmed(args, value, config_path, operator_dir) -> int:
     # Validation is local and secret-free.  The SDK distribution/import,
     # configuration and evidence must all be valid before the new slot can be
     # durably claimed.  No Keychain, client, account reader or network path is
