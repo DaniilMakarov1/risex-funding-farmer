@@ -577,6 +577,7 @@ def test_real_engine_cycle_report_keeps_exact_fees_latency_and_pair_proof(comple
     # Independent four actual adapter trades, each with fee 0.01.
     assert report["economics"]["fees"]["total"] == "0.04"
     assert len(report["confirmed_fills"]) == 4
+    assert len(report["planned_actions"]) == 4
     assert all(p["status"] == "MATCHED" for p in report["paired_execution"]["direct_counterparty_match"])
     for phase in ("opening", "closing"):
         rows = [json.loads(line) for line in (complete_cycle / f"{phase}.jsonl").read_text().splitlines()]

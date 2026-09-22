@@ -630,6 +630,13 @@ def _plan_legs(plan: Mapping[str, Any]) -> Iterable[tuple[str, Mapping[str, Any]
             yield leg, value
 
 
+def _planned_attempt(data: _FileData, payload: Mapping[str, Any]) -> int:
+    complete = _last_record(data, "COMPLETE")
+    receipt = (_receipt_from_complete(complete) or {}) if complete else {}
+    config = payload.get("config") if isinstance(payload.get("config"), Mapping) else {}
+    return _attempt_from(payload) or _attempt_from(config) or _attempt_from(receipt) or _natural_key(data.path)[1]
+
+
 def _plan_records(files: Sequence[_FileData]) -> list[dict[str, Any]]:
     planned: list[dict[str, Any]] = []
     for data in files:
@@ -644,7 +651,7 @@ def _plan_records(files: Sequence[_FileData]) -> list[dict[str, Any]]:
                         planned.append(
                             {
                                 "phase": data.kind,
-                                "attempt": _attempt_from(payload, payload.get("binding", {}).get("attempt_index") if isinstance(payload.get("binding"), Mapping) else None),
+                                "attempt": _planned_attempt(data, payload),
                                 "leg": leg,
                                 "kind": "ORDER_PLAN",
                                 "planned_at": record["at"],
