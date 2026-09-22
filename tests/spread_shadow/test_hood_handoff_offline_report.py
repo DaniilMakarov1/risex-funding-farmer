@@ -763,3 +763,35 @@ def test_payload_trade_truncation_is_explicit_and_cannot_prove_fees(complete_cyc
     assert any(i["code"] == "PAYLOAD_TRUNCATED" for i in report["issues"])
     assert report["economics"]["fees"]["status"] == "UNKNOWN"
     assert report["paired_execution"]["status"] == "UNKNOWN"
+
+
+def test_quote_acquisition_and_public_visibility_have_distinct_evidence(complete_cycle: Path):
+    report = load_saved_cycle_report(complete_cycle)
+    for phase in ("opening", "closing"):
+        metrics = report["latency"][phase][0]
+        assert metrics["quote_read_seconds"] is not None
+        assert metrics["source_visibility_seconds"] is not None
+        assert metrics["public_source_observation_seconds"] is not None
+        assert metrics["attribution"]["local_cpu_only"]["status"] == "UNKNOWN"
+        assert metrics["quote_age_breakdown"]["stale_at_intent"] is False
+    def remove_public(rows):
+        for row in rows:
+            if row["event"] == "PRE_RECEIVER_GUARD": row["payload"]["source_public_level"] = None
+    _change_records(complete_cycle / "opening.jsonl", remove_public)
+    modified = load_saved_cycle_report(complete_cycle)["latency"]["opening"][0]
+    assert modified["source_visibility_seconds"] is not None
+    assert modified["public_source_observation_seconds"] is None
+
+
+def test_report_preserves_sdk_timing_numbers_but_never_invents_percentages(complete_cycle: Path):
+    def add_metrics(rows):
+        for row in rows:
+            if row["event"] == "COMPLETE":
+                row["payload"]["latency"].update(source_signing_call_seconds=0.03, source_nonce_acquisition_seconds=0.02, source_transport_roundtrip_seconds=0.07)
+    _change_records(complete_cycle / "opening.jsonl", add_metrics)
+    metrics = load_saved_cycle_report(complete_cycle)["latency"]["opening"][0]
+    assert metrics["source_signing_call_seconds"] == 0.03
+    assert metrics["source_nonce_acquisition_seconds"] == 0.02
+    assert metrics["source_transport_roundtrip_seconds"] == 0.07
+    assert metrics["attribution"]["network_only"]["fraction"] is None
+    assert metrics["attribution"]["exchange_processing_only"]["fraction"] is None

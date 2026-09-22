@@ -10,7 +10,7 @@ close/reopen semantics.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import importlib
 from importlib import metadata as importlib_metadata
 import inspect
@@ -99,6 +99,8 @@ class PreparedMutation:
     _owner: object
     _nonce: int
     _state: str = "READY"
+    # Numeric diagnostics only; signed payloads/nonces never leave this token.
+    diagnostic_timings: dict[str, float] = field(default_factory=dict, repr=False)
 
     def __repr__(self) -> str:
         return (
@@ -1148,12 +1150,17 @@ class LighterSdkClient:
             )
         if time.monotonic() >= deadline:
             raise TimeoutError("order preparation crossed the final mutation barrier")
+        preparation_started = time.perf_counter()
         async with self._preparation_lock_for(plan.account_index, key_index):
+            lock_acquired = time.perf_counter()
             signer = self._signer(plan.account_index)
+            nonce_started = time.perf_counter()
             nonce = await self._next_nonce(signer, key_index, deadline=deadline)
             if time.monotonic() >= deadline:
                 raise TimeoutError("nonce acquisition crossed the final mutation barrier")
+            nonce_finished = time.perf_counter()
             signer_type = type(signer)
+            signing_started = time.perf_counter()
             result = await self._bounded(
                 _await(
                     signer.sign_create_order(
@@ -1174,6 +1181,7 @@ class LighterSdkClient:
                 deadline,
                 "order signing",
             )
+            signing_finished = time.perf_counter()
             if not isinstance(result, tuple) or len(result) != 4:
                 raise RuntimeError("lighter-sdk sign_create_order returned an unsupported shape")
             tx_type, tx_info, tx_hash, error = result
@@ -1198,6 +1206,11 @@ class LighterSdkClient:
                 _tx_hash=_safe_text(tx_hash),
                 _owner=self._prepared_owner,
                 _nonce=nonce,
+                diagnostic_timings={
+                    "preparation_lock_wait_seconds": lock_acquired - preparation_started,
+                    "nonce_acquisition_seconds": nonce_finished - nonce_started,
+                    "signing_call_seconds": signing_finished - signing_started,
+                },
             )
             self._register_prepared(prepared)
             return prepared
@@ -1243,11 +1256,15 @@ class LighterSdkClient:
                 return MutationReceipt(False, None, None, "prepared order crossed the final mutation barrier")
             if not self._consume_prepared_for_send(prepared):
                 return MutationReceipt(False, None, None, "prepared order was already consumed or invalidated")
-        response = await self._bounded(
-            self._send_signed_tx(prepared._tx_type, prepared._tx_info),
-            dispatch_deadline,
-            "order dispatch",
-        )
+        transport_started = time.perf_counter()
+        try:
+            response = await self._bounded(
+                self._send_signed_tx(prepared._tx_type, prepared._tx_info),
+                dispatch_deadline,
+                "order dispatch",
+            )
+        finally:
+            prepared.diagnostic_timings["transport_roundtrip_seconds"] = time.perf_counter() - transport_started
         code = _response_code(response)
         if code is None:
             raise RuntimeError("malformed or undecidable sendTx response")

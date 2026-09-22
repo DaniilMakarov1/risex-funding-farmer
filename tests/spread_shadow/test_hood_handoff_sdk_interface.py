@@ -805,3 +805,48 @@ async def test_incomplete_live_minimums_do_not_refresh_old_market_evidence(monke
 
     assert metadata.minimum_quote_amount == Decimal("10")
     assert metadata.observed_at == 1000.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport_fails", [False, True])
+async def test_prepared_numeric_timings_separate_nonce_signing_and_transport(monkeypatch, transport_fails):
+    from types import SimpleNamespace
+    import time as real_time
+    import risex_spread_shadow.hood_handoff.sdk as sdk_module
+    ticks = [0.0]
+    class Nonce(FakeNonceManager):
+        async def async_next_nonce(self, index):
+            ticks[0] += 0.2
+            return await super().async_next_nonce(index)
+    class Signer(FakeSigner):
+        def __init__(self):
+            super().__init__()
+            self.nonce_manager = Nonce()
+        async def sign_create_order(self, **kwargs):
+            ticks[0] += 0.3
+            return await super().sign_create_order(**kwargs)
+    class Transport(FakeHttp):
+        async def post_form(self, path, *, form):
+            ticks[0] += 0.5
+            if transport_fails:
+                self.calls.append((path, dict(form)))
+                raise TimeoutError("synthetic lost response")
+            return await super().post_form(path, form=form)
+    monkeypatch.setattr(sdk_module, "time", SimpleNamespace(monotonic=real_time.monotonic, time=real_time.time, perf_counter=lambda: ticks[0]))
+    monkeypatch.setattr(LighterSdkClient, "verify_sdk", staticmethod(lambda: None))
+    signer = Signer()
+    client = _constant_nonce_client(prefix="numeric-timing", signer=signer, http_factory=Transport)
+    client._lighter = lambda: FakeModule
+    plan = _sdk_plan()
+    prepared = await client.prepare_order(plan)
+    assert prepared.diagnostic_timings == {"preparation_lock_wait_seconds": 0.0, "nonce_acquisition_seconds": 0.2, "signing_call_seconds": 0.3}
+    if transport_fails:
+        with pytest.raises(TimeoutError): await client.submit_prepared_order(plan, prepared)
+    else:
+        assert (await client.submit_prepared_order(plan, prepared)).accepted
+    assert prepared.diagnostic_timings["transport_roundtrip_seconds"] == 0.5
+    assert len(client._http.calls) == 1
+    assert len(signer.sign_calls) == 1
+    assert not (await client.submit_prepared_order(plan, prepared)).accepted
+    assert len(client._http.calls) == 1
+    assert "signed-create-info" not in repr(prepared.diagnostic_timings)

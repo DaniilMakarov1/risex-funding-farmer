@@ -1307,7 +1307,7 @@ async def test_signing_crossing_final_deadline_cannot_reach_send_tx(monkeypatch,
             return await super().sign_create_order(**kwargs)
 
     original_sdk_time = sdk_module.time
-    sdk_module.time = SimpleNamespace(monotonic=lambda: ticks[0])
+    sdk_module.time = SimpleNamespace(monotonic=lambda: ticks[0], perf_counter=lambda: ticks[0])
     try:
         signer = LateSigner()
         client = LighterSdkClient(
@@ -1538,7 +1538,7 @@ async def test_mutation_barrier_preserves_observation_age_and_allows_fresh_attem
     original_engine_time = engine_module.time
     original_sdk_time = sdk_module.time
     engine_module.time = SimpleNamespace(monotonic=lambda: ticks[0])
-    sdk_module.time = SimpleNamespace(monotonic=lambda: ticks[0])
+    sdk_module.time = SimpleNamespace(monotonic=lambda: ticks[0], perf_counter=lambda: ticks[0])
     try:
         class AdvancingNonce:
             async def async_next_nonce(self, api_key_index):
