@@ -1,6 +1,14 @@
 # Current status
 
-## Accepted implementation
+## HCR-28 global verification
+
+Candidate `64006758d15ad48cd6fafef04a950f922a3c2431` fixes two reproduced offline-report crashes: container-valued fallback account indexes used as hash keys, and non-object dispatch plans used as mappings during latency extraction. Invalid fallback identity is excluded from execution proof with an explicit issue; malformed source/receiver plans also produce an issue. The report remains INCOMPLETE with UNKNOWN inventory, while retaining other observations and mutation intents. Runtime order execution and policy are unchanged.
+
+Baseline full suite: 4749 passed, 3 existing skips. A separate 416-case malformed-payload probe reproduced 10 crashes before correction and none afterward. Twelve distinguishing regressions failed before the fix; the 65-test report/incident profile passes afterward. Final clean isolated Python 3.11 verification: **4761 passed, 3 existing skips, exit 0**, Python 3.11.5, 135.36 seconds. The skips concern optional frozen Extended testnet dependencies (`x10`, `fast_stark_crypto`); no new skips were added. All seven saved cycle reports render in human/JSON formats; all 42 original file hashes and consumed slots are preserved. Evidence is in `spread-shadow-runs/hood-global-tests-20260922/`.
+
+Chief performed implementation and self-review without Builders. No live requests, credentials, real signing or order/cancellation operations occurred. No claim of exhaustive defect elimination or live performance validation follows from these offline checks.
+
+## Accepted HCR-27 behavior
 
 HCR-27 completeness audit candidate: `0b6be39a325e350618c25ccc746a65704b81e4de`, based on accepted `46ed54ee0d2d2e8762f8449374ca02e1f10d76e0`. The original statement that all five improvements were complete was too broad. This follow-up closes the concrete diagnostic/report/provenance gaps; exact CPU/network/exchange time attribution remains unavailable and is explicitly UNKNOWN.
 
