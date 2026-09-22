@@ -23,6 +23,7 @@ import aiohttp
 from .keychain import MacOSKeychainBackend, read_hidden_secret
 from .offline_report import load_saved_cycle_report
 from .operator_control import exclusive_lock
+from . import telegram_messages as views
 
 
 @dataclass(frozen=True)
@@ -66,6 +67,12 @@ class Store:
             if active is not None and (not isinstance(active, dict) or not isinstance(active.get('before'), list)
                 or not all(isinstance(n, str) and re.fullmatch(r'cycle-[0-9]+', n) for n in active['before'])):
                 raise RuntimeError('invalid active operation state')
+            last = self.data['last']
+            if last is not None and (not isinstance(last, dict)
+                or last.get('status') not in ('NOT_LAUNCHED', 'FINISHED', 'BLOCKED')
+                or last.get('cycle') is not None and (not isinstance(last['cycle'], str)
+                    or re.fullmatch(r'cycle-[0-9]+', last['cycle']) is None)):
+                raise RuntimeError('invalid last operation state')
 
     def save(self):
         temporary = self.directory / f'.state-{uuid.uuid4().hex}'
@@ -102,7 +109,13 @@ class Telegram:
             raise RuntimeError('Telegram transport unavailable') from None
 
     async def send(self, owner, text):
-        await self.call('sendMessage', chat_id=owner, text=text[:4000], protect_content=True)
+        # Never cut HTML inside an entity or tag. Views bound dynamic fields;
+        # an unexpected oversized view degrades to a complete, valid message.
+        if len(text.encode('utf-16-le')) // 2 > 4000:
+            text = '<b>Сообщение слишком длинное</b>\nОткрой полный отчёт локально. /status — краткое состояние.'
+        return await self.call('sendMessage', chat_id=owner, text=text, parse_mode='HTML',
+                              protect_content=True, reply_markup=views.READ_MENU,
+                              link_preview_options={'is_disabled': True})
 
 
 class Controller:
@@ -116,6 +129,7 @@ class Controller:
         self.now = now
         self.started = now()
         self.task = None
+        self._runner_finished = False
 
     def slots(self):
         return sorted(p.name for p in self.operator.glob('cycle-*') if p.is_dir() and re.fullmatch(r'cycle-[0-9]+', p.name))
@@ -126,7 +140,10 @@ class Controller:
         path = self.operator / name
         if path.is_symlink():
             return None
-        return load_saved_cycle_report(path)
+        try:
+            return load_saved_cycle_report(path)
+        except Exception:
+            return None  # No raw exception/credential-bearing payload in chat.
 
     def finish(self):
         active = self.store.data['active']
@@ -149,26 +166,21 @@ class Controller:
             self.store.data['last'] = {'status': 'BLOCKED', 'cycle': None}
         self.store.save()
 
-    def summary(self):
-        if self.task is not None and not self.task.done():
-            added = sorted(set(self.slots()) - set(self.store.data['active']['before']))
-            return 'Цикл выполняется. ' + (', '.join(added) if added else 'Подготовка запуска.')
+    def summary(self, *, detailed=False):
+        active = self.store.data['active']
+        # finish() clears active before awaiting final notification; the task
+        # can still be alive during that await. It is no longer a running cycle.
+        if active is not None and self.task is not None and not self.task.done() and not self._runner_finished:
+            added = sorted(set(self.slots()) - set(active['before']))
+            return views.running_message(added)
+        blocked = active is not None
         last = self.store.data['last']
-        if self.store.data['active'] is not None:
-            prefix = 'Новые запуски заблокированы: предыдущая операция не разрешена по журналам.\n'
-        else:
-            prefix = ''
         if not last:
-            return prefix + 'Запусков через этот контроллер ещё нет.'
+            return views.empty_message(blocked)
         report = self.report(last.get('cycle'))
         if report is None:
-            return prefix + 'Состояние: ' + str(last.get('status', 'UNKNOWN'))
-        return prefix + (f"{last['cycle']}: {report['status']}\n"
-                         f"Парное исполнение: {report['paired_execution']['status']}\n"
-                         f"Историческая позиция: {report['inventory']['status']}\n"
-                         f"Комиссии: {report['economics']['fees']['status']}\n"
-                         f"Неразрешённых намерений: {len(report['order_state']['unresolved_intents'])}\n"
-                         'Это сохранённые наблюдения, не текущая проверка счетов.')
+            return views.unavailable_message(blocked, last.get('status') == 'NOT_LAUNCHED')
+        return views.saved_message(last['cycle'], report, blocked=blocked, detailed=detailed)
 
     async def notify(self, text):
         try:
@@ -183,6 +195,7 @@ class Controller:
         except Exception:
             self.store.data['last'] = {'status': 'BLOCKED', 'cycle': None}
             self.store.save()  # Keep durable active intent; never automatically retry.
+        self._runner_finished = True
         await self.notify(self.summary_after_task())
 
     def summary_after_task(self):
@@ -217,20 +230,20 @@ class Controller:
             return
         command = message.get('text')
         if command in ('/start', '/help'):
-            await self.notify('Управление одним настроенным Mainnet-циклом BTC.\n'
-                              '/run — запустить реальные ордера; объём и удержание выбираются существующей конфигурацией.\n'
-                              '/status — состояние; /report — последний результат.\n'
-                              'Отмены процесса через Telegram нет: прерывание не доказывает закрытие позиции.')
+            await self.notify(views.help_message())
         elif command in ('/status', '/report'):
-            await self.notify(self.summary())
+            await self.notify(self.summary(detailed=command == '/report'))
         elif command == '/run':
             if self.store.data['active'] is not None or self.task is not None and not self.task.done():
-                await self.notify('Запуск уже выполняется или требует локальной сверки. Повторная отправка запрещена.')
+                await self.notify(views.blocked_message())
                 return
             self.store.data['active'] = {'before': self.slots(), 'update_id': uid}
             self.store.save()
+            self._runner_finished = False
             self.task = asyncio.create_task(self.run_one())
-            await self.notify('Команда принята для одного реального цикла. Проверяйте /status.')
+            await self.notify(views.accepted_message(uid))
+        elif isinstance(command, str):
+            await self.notify(views.unknown_message())
 
 
 async def serve(args, store, lock_fd, token):
@@ -275,7 +288,7 @@ async def serve(args, store, lock_fd, token):
             if ids:
                 store.data['offset'] = max(ids) + 1
                 store.save()
-        await controller.notify('Контроллер запущен. Старые команды отброшены. /help')
+        await controller.notify(views.startup_message())
         while True:
             try:
                 updates = await api.call('getUpdates', offset=store.data['offset'], timeout=25,
