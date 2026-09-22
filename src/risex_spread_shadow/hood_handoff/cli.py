@@ -31,7 +31,7 @@ from .local_attempt import (
     run_local_attempt,
 )
 from .offline_report import format_report, report_saved_paths, load_saved_cycle_report
-from .operator_view import read_lifecycle, lifecycle_lines, result_lines
+from .operator_view import read_lifecycle, lifecycle_lines, result_lines, read_execution_notices
 from .random_cycle import (
     MAX_PREPARATION_ATTEMPTS,
     RandomCycleConfig,
@@ -95,7 +95,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "run",
         nargs="?",
-        choices=("run", "readiness", "local-attempt", "random-cycle", "simple", "report", "offline-report"),
+        choices=("run", "readiness", "local-attempt", "random-cycle", "simple", "close-positions", "report", "offline-report"),
         help="run the configured utility or the explicit read-only readiness check",
     )
     parser.add_argument(
@@ -828,6 +828,7 @@ def _print_simple_summary(
     source = value.get("source_account_index", "?")
     receiver = value.get("receiver_account_index", "?")
     credential_route = "сохранённый Keychain" if use_keychain else "скрытый локальный ввод ключей"
+    print(f"\n══ НОВЫЙ ЦИКЛ · {symbol} · Robinhood Chain Mainnet ══")
     print(f"Один реальный Robinhood Chain Mainnet цикл: {symbol}; первый счёт и сторона лимитки случайны.")
     print(f"Счета: {source} и {receiver}; каждый может первым выставить BUY или SELL (четыре равновероятных варианта).")
     print(f"После Enter будет использован {credential_route}; до Enter нет чтения рынка или доступа к ключам.")
@@ -1133,13 +1134,24 @@ async def _stream_simple_progress(
     while True:
         rows = await asyncio.to_thread(_read_simple_events, str(journal_path))
         progress = await asyncio.to_thread(read_lifecycle, journal_path)
+        for notice_key, notice in await asyncio.to_thread(read_execution_notices, journal_path):
+            key = (notice_key, None, None)
+            if key not in emitted_keys:
+                try:
+                    await asyncio.to_thread(print, '\n── ' + notice, flush=True)
+                except OSError:
+                    return
+                emitted_keys.add(key)
         for row in rows:
             key = _simple_event_key(row)
             if key in emitted_keys:
                 continue
             line = _simple_event_line(row)
+            if row.get('event') in {'OPENING_COMPLETE', 'CLOSING_COMPLETE', 'PREPARATION_ACCEPTED',
+                                    'FIRST_MUTATION_BOUNDARY', 'OPENING_BOUNDS_REFRESHED', 'OPENING_PLAN_READY'}:
+                continue
             if row.get("event") == "HOLD_ANCHORED" and progress and progress.get("stage") == "HOLD":
-                line = "\n".join(lifecycle_lines(progress))
+                line = "\n══ УДЕРЖАНИЕ ══\n" + "\n".join(lifecycle_lines(progress))
             if line is None:
                 continue
             try:
@@ -1165,7 +1177,7 @@ def format_random_cycle_result_ru(
             report = load_saved_cycle_report(Path(journal).parent)
             if report["status"] == "COMPLETE":
                 outcome = report["cycle"].get("outcome", "UNKNOWN")
-                return "\n".join([f"Итог: {outcome}", *result_lines(report, detailed=True), f"Журнал: {journal}"])
+                return "\n".join([f"\n══ ИТОГ ЦИКЛА ══\nИтог: {outcome}", *result_lines(report, detailed=True), f"Журнал: {journal}"])
         except Exception:
             pass  # Preserve the existing incomplete-result diagnostic path.
 
@@ -1440,6 +1452,8 @@ async def _run_simple_confirmed(args, value, config_path, operator_dir) -> int:
             secrets=secrets,
             market_evidence=evidence,
         )
+        from .operator_recovery import resolve_prior
+        await resolve_prior(config, client, operator_dir)
         stop_progress = asyncio.Event()
         progress_task = asyncio.create_task(
             _stream_simple_progress(Path(config.journal_path), emitted_keys, stop_progress)
@@ -1494,6 +1508,55 @@ async def _run_simple_confirmed(args, value, config_path, operator_dir) -> int:
             secrets.close()
     print(format_random_cycle_result_ru(result, emitted_keys=emitted_keys))
     return 0 if result.outcome.value in {"SUCCESS", "PARTIAL", "PREVIEW"} else 2
+
+
+async def _run_close_positions(args):
+    """Same operator/credential boundary, explicit adoption of current inventory."""
+    from dataclasses import replace
+    from .operator_control import exclusive_lock
+    from .operator_recovery import allocate_close_slot, close_positions
+    from .operator_view import close_result_lines
+
+    if args.execute or args.confirm_plan or args.i_understand_one_attempt_live_operation:
+        raise SystemExit("close-positions accepts its single Enter confirmation")
+    config_path = _simple_config_path(args.config)
+    value = _load_json(config_path, "operator configuration")
+    operator_dir = _simple_operator_dir(config_path)
+    print("\n══ ЗАКРЫТИЕ ПОЗИЦИЙ ══")
+    print(f"Рынок {value.get('market_symbol', '?')}; счета {value.get('source_account_index')} и {value.get('receiver_account_index')}.")
+    print("Проверить позиции и закрыть имеющиеся ограниченными MARKET/IOC reduce-only ордерами.")
+    print("Enter подтверждает реальную операцию; C/CANCEL — отмена.")
+    if not _simple_confirmation():
+        return 0
+    with exclusive_lock(operator_dir / '.operator-launch.lock'):
+        evidence_path = _simple_evidence_path(value, operator_dir, args.market_evidence)
+        config, evidence = _validate_simple_local_inputs(
+            value, config_path=config_path, operator_dir=operator_dir, evidence_path=evidence_path,
+            defer_incremental_margin_calculation=args.defer_incremental_margin_calculation)
+        _validate_simple_sdk()
+        config = replace(config, operator_execution_opt_in=True, operator_plan_reviewed=True)
+        slot = allocate_close_slot(operator_dir)
+        indices = (config.source_account_index, config.receiver_account_index)
+        secrets = client = None
+        try:
+            if args.keychain or args.keychain_replace:
+                secrets = _keychain_provider(config, indices, replace=args.keychain_replace)
+                _prime_keychain(secrets, indices)
+            else:
+                secrets = PromptSecretProvider(indices, config.api_key_index)
+            client = LighterSdkClient(config, source_account_index=indices[0], receiver_account_index=indices[1],
+                                      secrets=secrets, market_evidence=evidence)
+            result = await close_positions(config, client, operator_dir, slot)
+        finally:
+            try:
+                if client is not None:
+                    await client.aclose()
+            finally:
+                if secrets is not None:
+                    secrets.close()
+        print('\n'.join(close_result_lines(result)))
+        print(f"Журнал: {slot / 'close.jsonl'}")
+        return 0 if result['status'] == 'CONFIRMED_FLAT' else 2
 
 
 def _prompt_random_cycle_launch(config: RandomCycleConfig) -> bool:
@@ -1741,6 +1804,8 @@ async def _run(args: argparse.Namespace) -> int:
         return await _run_offline_report(args)
     if args.run == "simple":
         return await _run_simple(args)
+    if args.run == "close-positions":
+        return await _run_close_positions(args)
     if args.run == "local-attempt":
         return await _run_local_attempt(args)
     if args.run == "readiness":

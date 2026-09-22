@@ -4532,10 +4532,10 @@ async def test_simple_progress_is_printed_before_synthetic_terminal_return(tmp_p
     assert "Подготовка: попытка 1/3." in before_terminal
     assert "Выбрано: 0.25 единиц, удержание 20 с." in before_terminal
     assert "Котировка обновлена: 100.1 → 101.1" in before_terminal
-    assert "Граница первой записи пройдена" in before_terminal
+    assert "Граница первой записи пройдена" not in before_terminal
     assert "Удержание начато: 20 с" in before_terminal
     assert "Закрытие подготовлено" in before_terminal
-    assert "Закрытие и его сверка завершены" in before_terminal
+    assert "Закрытие и его сверка завершены" not in before_terminal
     assert "Итог:" not in before_terminal
 
 
@@ -4748,3 +4748,78 @@ def test_start_reports_missing_or_non_executable_project_venv_without_running_py
     assert result.returncode == 2
     assert "Ошибка запуска" in result.stderr
     assert ".venv-hood/bin/python" in result.stderr
+
+
+class GuardCancellationFillClient(ExternalCloseClient):
+    """Real cycle-012/016/018 shape: guard refuses, then exact cancel-race fill."""
+    def __init__(self, clock, *, closing=False, missing_level=False, adverse=None):
+        super().__init__(clock)
+        self.closing = closing
+        self.missing_level = missing_level
+        self.adverse = adverse
+        self.injected = False
+
+    async def order_book(self, market_id):
+        snapshot = await super().order_book(market_id)
+        current = self.orders.get((11, self.latest_order.get(11, '')))
+        if current and current.active and current.reduce_only == self.closing:
+            # Either no exact public source, or a competing better price.
+            if self.missing_level:
+                return book(self.clock.now())
+            if current.side == 'SELL':
+                return replace(snapshot, bids=(DepthLevel(Decimal('99.9'), Decimal('10'), 'outside-bid', 998),), asks=(DepthLevel(current.price - Decimal('.1'), Decimal('1'), 'foreign', 999), *snapshot.asks))
+            return replace(snapshot, asks=(DepthLevel(Decimal('100.3'), Decimal('10'), 'outside-ask', 998),), bids=(DepthLevel(current.price + Decimal('.1'), Decimal('1'), 'foreign', 999), *snapshot.bids))
+        return snapshot
+
+    async def cancel_order(self, account_index, market_id, order_id):
+        current = self.orders[(account_index, str(order_id))]
+        if current.active and current.reduce_only == self.closing:
+            self.injected = True
+            self._replace_order(current, status='filled', filled_quantity=current.initial_quantity, remaining_quantity=Decimal(0))
+            self.source_position += current.initial_quantity if current.side == 'BUY' else -current.initial_quantity
+            self.trades[current.order_id] = (TradeReceipt('guard-race', 11, 7, current.order_id, current.side,
+                current.initial_quantity, current.price, None, 999, self.clock.now(),
+                counterparty_order_id='foreign', client_order_index=current.client_order_index),)
+            if self.adverse == 'cancel_unknown':
+                raise TimeoutError('ambiguous cancellation')
+            return MutationReceipt(True, current.order_id, 'cancel-race')
+        return await super().cancel_order(account_index, market_id, order_id)
+
+    async def list_trades(self, *args, **kwargs):
+        page = await super().list_trades(*args, **kwargs)
+        if self.injected and self.adverse == 'history':
+            return replace(page, complete=False)
+        return page
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('closing', [False, True])
+@pytest.mark.parametrize('missing_level', [False, True])
+@pytest.mark.parametrize('direction', [Direction.LONG, Direction.SHORT])
+async def test_guard_failure_then_fully_reconciled_source_fill_closes_known_residual(tmp_path, closing, missing_level, direction):
+    clock = AdvancingClock()
+    client = GuardCancellationFillClient(clock, closing=closing, missing_level=missing_level)
+    result = await run_random_cycle(cycle_config(tmp_path/'guard-race', direction=direction), client,
+                                    clock=clock, rng=FixedRng(20, 20))
+    phase = result.closing if closing else result.opening
+    assert client.injected
+    assert phase.outcome is Outcome.PARTIAL
+    assert not phase.receiver.dispatched
+    assert phase.unknown_reasons[0].startswith('PAIR_GUARD_')
+    assert not phase.retryable_pair
+    assert result.inventory == 'CONFIRMED_FLAT'
+    assert client.source_position == client.receiver_position == 0
+    assert len(result.fallbacks) == 1
+    assert not any(p.order_type == 'MARKET' and not p.reduce_only for p in client.submissions[2 if closing else 0:])
+    assert clock.sleeps == ([20] if closing else [])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('adverse', ['history', 'cancel_unknown'])
+async def test_guard_fill_does_not_erase_execution_uncertainty(tmp_path, adverse):
+    clock = AdvancingClock()
+    client = GuardCancellationFillClient(clock, missing_level=True, adverse=adverse)
+    result = await run_random_cycle(cycle_config(tmp_path/'guard-uncertain'), client, clock=clock, rng=FixedRng(20, 20))
+    assert result.outcome is Outcome.UNKNOWN
+    assert not result.fallbacks
+    assert len(client.submissions) == 1

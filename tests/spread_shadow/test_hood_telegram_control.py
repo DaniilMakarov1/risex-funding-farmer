@@ -97,7 +97,7 @@ async def test_ambiguous_launch_exception_blocks_future_commands(tmp_path):
     await c.handle(update(2))
     assert len(calls) == 1
     assert c.store.data['active'] is not None
-    assert 'заблокированы' in c.summary()
+    assert '/run проверит текущую готовность' in c.summary()
 
 
 async def test_notification_failure_never_repeats_launch(tmp_path):
@@ -232,7 +232,7 @@ async def test_server_discards_backlog_and_uses_fixed_detached_child(tmp_path, m
         calls.append((args, kwargs))
         return Process()
     real = bot.Controller
-    monkeypatch.setattr(bot, 'Controller', lambda *args: real(*args, now=lambda: 1000))
+    monkeypatch.setattr(bot, 'Controller', lambda *args, **kwargs: real(*args, now=lambda: 1000))
     monkeypatch.setattr(bot, 'Telegram', API)
     monkeypatch.setattr(bot.aiohttp, 'ClientSession', Session)
     monkeypatch.setattr(bot.asyncio, 'create_subprocess_exec', create)
@@ -320,13 +320,13 @@ async def test_changed_config_does_not_start_a_child(tmp_path, monkeypatch):
             await finished.wait()
             raise Stop()
         async def send(self, owner, text):
-            if 'заблокированы' in text: finished.set()
+            if 'готовность' in text: finished.set()
     class Session:
         def __init__(self, **kwargs): pass
         async def __aenter__(self): return self
         async def __aexit__(self, *args): pass
     real = bot.Controller
-    monkeypatch.setattr(bot, 'Controller', lambda *args: real(*args, now=lambda: 1000))
+    monkeypatch.setattr(bot, 'Controller', lambda *args, **kwargs: real(*args, now=lambda: 1000))
     monkeypatch.setattr(bot, 'Telegram', API)
     monkeypatch.setattr(bot.aiohttp, 'ClientSession', Session)
     monkeypatch.setattr(Path, 'is_file', lambda _: True)
@@ -355,7 +355,7 @@ async def test_status_during_final_notification_does_not_crash(tmp_path, monkeyp
         assert summary
         assert 'Цикл выполняется' not in summary
         if failed:
-            assert 'заблокированы' in summary
+            assert 'сверк' in summary
     finally:
         release.set()
         await c.task

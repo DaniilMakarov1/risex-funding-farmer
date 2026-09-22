@@ -3,7 +3,7 @@ from collections.abc import Mapping
 from html import escape
 
 from .journal import sanitize
-from .operator_view import lifecycle_lines, result_lines, timestamp
+from .operator_view import lifecycle_lines, result_lines, timestamp, close_result_lines
 
 READ_MENU = {'keyboard': [[{'text': '/status'}, {'text': '/report'}], [{'text': '/accounts'}, {'text': '/help'}]],
              'resize_keyboard': True, 'is_persistent': True}
@@ -33,8 +33,10 @@ def help_message():
             '<b>Запуск реальной торговли</b>\n'
             '<code>/run</code> — отправить команду на один Mainnet-цикл. '
             'Первый счёт и сторона лимитки выбираются случайно: четыре равновероятных варианта. Объём и время удержания — по текущей конфигурации.\n\n'
-            '<i>Остановка бота не закрывает позиции. При неопределённом результате '
-            'новый запуск блокируется до локальной сверки.</i>')
+            '<code>/close</code> — проверить оба счёта и закрыть текущие позиции настроенного рынка MARKET reduce-only.\n\n'
+            '<i>После ошибки /run заново проверяет счета и старые ордера. '
+            'После ручного закрытия постоянной блокировки нет. '
+            'Пока операция выполняется или прежний ордер не выяснен, новые ордера не отправляются.</i>')
 
 
 def startup_message():
@@ -52,15 +54,44 @@ def accepted_message(number):
 
 
 def blocked_message():
-    return ('<b>⛔ Новые запуски заблокированы</b>\n'
-            'Предыдущий цикл ещё выполняется либо его результат требует локальной сверки.\n\n'
-            'Проверь /status и /report. Повторная команда не отправит дополнительные ордера.')
+    return ('<b>⏳ Сейчас другая операция или нужна сверка</b>\n'
+            'Параллельные запуски заблокированы. Дождись завершения текущей операции.\n\n'
+            '/status — состояние · /accounts — позиции · /close — проверить и закрыть остаток. '
+            'Следующая /run снова проверит возможность запуска.')
+
+
+def recovery_refused_message(reason):
+    translations = {
+        'positions remain; use /close before /run': 'Есть открытые позиции. Команда /close проверит и закроет их.',
+        'previous order is unresolved or still executable': 'Старый ордер ещё активен или его окончательное состояние не подтверждено.',
+        'source has active cycle-market orders': 'На первом счёте есть активные ордера этого рынка.',
+        'receiver has active cycle-market orders': 'На втором счёте есть активные ордера этого рынка.',
+    }
+    return ('<b>Новая операция пока не начата</b>\n' + text(translations.get(reason, reason), 260)
+            + '\nПостоянного запрета нет: следующая команда повторит проверку. /accounts — текущие позиции.')
+
+
+def close_message(name, result):
+    return '<b>Закрытие позиций</b> · <code>' + text(name, 32) + '</code>\n' + '\n'.join(
+        text(line, 500) for line in close_result_lines(result))
+
+
+def execution_message(notice):
+    return '<b>Исполнение заявок</b>\n' + '\n'.join(text(line, 400) for line in notice.splitlines()[:6])
+
+
+def recovery_checkpoint(proof):
+    if not isinstance(proof, dict) or proof.get('status') != 'READY' or timestamp(proof.get('at')) == 'нет данных':
+        return ''
+    return (f'<b>Последняя сверка: {timestamp(proof["at"])}</b>\n'
+            'Оба счёта были без позиций и активных ордеров; старый запрет снят. '
+            'Новая команда проверит состояние снова.\n\n')
 
 
 def unknown_message():
     return ('<b>Команда не распознана</b>\n'
             'Используй /accounts, /status, /report или /help.\n'
-            'Для одного реального цикла команда <code>/run</code> должна быть без дополнительных параметров.')
+            'Для реальных операций <code>/run</code> и <code>/close</code> должны быть без дополнительных параметров.')
 
 
 def running_message(names, progress=None):
@@ -86,13 +117,13 @@ def unavailable_message(blocked=False, not_launched=False):
     return ('<b>⚠️ Отчёт недоступен</b>\n'
             'Состояние ордеров и позиций по этому ответу определить нельзя. '
             'Проверь сохранённый журнал локально.\n\n' +
-            ('<b>Новые запуски заблокированы.</b>' if blocked else '/status — состояние контроллера'))
+            ('Следующая /run проверит текущую готовность; /close — закрыть остаток.' if blocked else '/status — состояние контроллера'))
 
 
 def saved_message(name, report, *, blocked=False, detailed=False):
     lines = [f'<b>📋 Результат цикла</b> · <code>{text(name, 32)}</code>']
     if blocked:
-        lines.append('<b>⛔ Новые запуски заблокированы</b>')
+        lines.append('<b>⚠️ Прошлый исход требует сверки</b> · /run проверит готовность заново; /close — закрыть остаток.')
     lines.extend(text(line, 500) for line in result_lines(report, detailed=detailed))
     lines.append('/status — кратко · /report — подробно · /accounts — текущие счета')
     return '\n'.join(lines)

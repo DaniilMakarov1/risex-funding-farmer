@@ -1507,11 +1507,7 @@ class HandoffEngine:
                 forced_outcome=(
                     Outcome.PARTIAL
                     if retryable_pair
-                    else (
-                        Outcome.UNKNOWN
-                        if any("unknown" in item.lower() or "unresolved" in item.lower() for item in unknown_reasons)
-                        else None
-                    )
+                    else None
                 ),
                 retryable_pair=retryable_pair,
                 latency=latency,
@@ -3132,6 +3128,13 @@ class HandoffEngine:
                     "source exact order is missing before receiver dispatch",
                 }
             )
+            # Admission uncertainty is distinct from execution uncertainty.
+            # A guard may fail first and the maker fill during cancellation;
+            # there need not be an earlier private "source disappeared" event.
+            known_partial_reasons.update(
+                reason for reason in unknown_reasons
+                if reason.startswith(("PAIR_GUARD_LOST: ", "PAIR_GUARD_UNKNOWN: "))
+            )
         unresolved = [
             reason
             for reason in (*unknown_reasons, *source.unknown_reasons, *receiver.unknown_reasons)
@@ -3177,16 +3180,18 @@ class HandoffEngine:
         """
 
         provisional_reasons = {
+            "source fill observed before receiver dispatch",
+            "source order did not prove exact resting quantity",
             "source order disappeared during pre-receiver recheck",
             "source fill or quantity change before receiver dispatch",
             "source exact order is missing before receiver dispatch",
         }
-        if not any(reason in provisional_reasons for reason in unknown_reasons):
-            return False
-        if any(
-            reason not in provisional_reasons and not str(reason).startswith("PAIR_GUARD_")
-            for reason in unknown_reasons
-        ):
+        def provisional(reason: str) -> bool:
+            return reason in provisional_reasons or reason.startswith(
+                ("PAIR_GUARD_LOST: ", "PAIR_GUARD_UNKNOWN: ")
+            )
+
+        if not unknown_reasons or not all(provisional(reason) for reason in unknown_reasons):
             return False
         if source.unknown_reasons or receiver.unknown_reasons:
             return False

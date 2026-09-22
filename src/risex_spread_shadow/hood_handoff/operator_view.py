@@ -164,6 +164,136 @@ def lifecycle_lines(state):
     return lines
 
 
+def execution_lines(result, *, phase, attempt=1):
+    """Describe exact terminal legs; never infer own matching from positions."""
+    from .contracts import LegReconciliation, OrderPlan, OrderSnapshot, TradeReceipt
+    from .engine import _joint_trade_match
+    from .random_cycle import _fallback_order_mismatch_map
+
+    result = mapping(result)
+    plans = mapping(result.get('plan'))
+    legs = {}
+    for role in ('source', 'receiver'):
+        value = mapping(result.get(role))
+        try:
+            plan = OrderPlan(**plans[role])
+            trades = tuple(TradeReceipt.from_mapping(t) for t in value['trades'])
+            order = OrderSnapshot.from_mapping(value['order']) if value['order'] is not None else None
+            before, after = number(value['position_before']), number(value['position_after'])
+            qty = sum((t.quantity for t in trades), Decimal(0))
+            if (value.get('history_complete') is not True or value.get('unknown_reasons') != []
+                    or type(value.get('dispatched')) is not bool or before is None or after is None
+                    or value.get('account_index') != plan.account_index
+                    or before != number(plans.get(f'{role}_position_before'))
+                    or qty != number(value.get('filled_quantity'))
+                    or after != before + qty * (1 if plan.side == 'BUY' else -1)
+                    or len({t.trade_id for t in trades}) != len(trades)):
+                raise ValueError('unproved leg')
+            if value['dispatched']:
+                if order is None or not order.terminal or _fallback_order_mismatch_map(order, plan) or order.filled_quantity != qty:
+                    raise ValueError('unproved terminal order')
+            elif order is not None or trades or qty != 0:
+                raise ValueError('unsent leg has fills')
+            for t in trades:
+                if (t.account_index != plan.account_index or t.market_id != plan.market_id or t.side != plan.side
+                        or t.order_id != order.order_id or t.observed_at > order.observed_at
+                        or (t.client_order_index is not None and str(t.client_order_index) != str(plan.client_order_index))
+                        or not (t.price <= plan.price if plan.side == 'BUY' else t.price >= plan.price)):
+                    raise ValueError('conflicting receipt')
+            legs[role] = LegReconciliation(plan.account_index, None if order is None else order.order_id,
+                trades, before, after, order, True, dispatched=value['dispatched'])
+        except (KeyError, ValueError, TypeError, AttributeError):
+            legs[role] = None
+    matched = Decimal(0)
+    if all(legs.values()):
+        _, matched, _ = _joint_trade_match(legs['source'], legs['receiver'], number(plans.get('quantity')) or Decimal(0))
+    label = 'Открытие' if phase == 'opening' else 'Закрытие'
+    lines = [f'{label} · попытка {clean(attempt, 8)}']
+    for role, kind in (('source', 'LIMIT'), ('receiver', 'MARKET')):
+        leg = legs[role]
+        peer = mapping(plans.get('receiver' if role == 'source' else 'source')).get('account_index')
+        account = mapping(plans.get(role)).get('account_index', '?')
+        prefix = f'{kind} · счёт {clean(account, 24)}: '
+        if leg is None:
+            lines.append(prefix + 'исполнение и контрагент не доказаны.')
+        elif not leg.dispatched:
+            lines.append(prefix + 'не отправлялся.')
+        elif not leg.trades:
+            lines.append(prefix + 'исполнений нет; заявка завершена.')
+        else:
+            external = sum((t.quantity for t in leg.trades if t.counterparty_account_index is not None
+                            and peer is not None and t.counterparty_account_index != peer), Decimal(0))
+            unproved = max(Decimal(0), leg.filled_quantity - external - matched)
+            pieces = []
+            if matched:
+                pieces.append(f'наш парный счёт — {amount(matched)}')
+            if external:
+                ids = sorted({t.counterparty_account_index for t in leg.trades
+                              if t.counterparty_account_index is not None and t.counterparty_account_index != peer})
+                pieces.append(f'внешние счета {", ".join(str(i) for i in ids[:3])} — {amount(external)}')
+            if unproved:
+                pieces.append(f'контрагент не доказан — {amount(unproved)}')
+            lines.append(prefix + '; '.join(pieces) + '.')
+    latency = mapping(result.get('latency'))
+    gap = number(latency.get('source_to_receiver_intent_seconds'))
+    response = number(latency.get('receiver_submit_ack_seconds'))
+    if gap is not None and gap >= 0:
+        lines.append(f'LIMIT → MARKET: {gap:.3f} с' + (f'; ответ на MARKET: {response:.3f} с.' if response is not None and response >= 0 else '.'))
+    return lines
+
+
+def read_execution_notices(path):
+    """Bounded local child readback off the execution path, including short phases."""
+    from .operator_recovery import journal_rows
+    import re
+    path = Path(path)
+    notices = []
+    try:
+        for child in sorted(path.parent.glob('*.jsonl')):
+            match = re.fullmatch(r'(opening|closing)(?:-attempt-([0-9]{3}))?\.jsonl', child.name)
+            if not match:
+                continue
+            phase, attempt = match[1], int(match[2] or 1)
+            if not 1 <= attempt <= 3:
+                continue
+            plan = {}
+            for row in journal_rows(child):
+                payload = row['payload']
+                if row['event'] in {'PLAN_READY', 'PLAN_REVIEWED'}:
+                    plan = mapping(payload.get('plan', payload))
+                elif row['event'] == 'SOURCE_DISPATCH_RESULT' and payload.get('accepted') is True:
+                    order = mapping(plan.get('source'))
+                    label = 'Открытие' if phase == 'opening' else 'Закрытие'
+                    text = (f'{label} · LIMIT принят биржей: счёт {clean(order.get("account_index", "?"), 24)}, '
+                            f'{clean(order.get("side", "?"))} {amount(order.get("quantity"))} по {amount(order.get("price"))}. '
+                            'Исполнение и контрагент ещё проверяются.')
+                    notices.append((f'{phase}-{attempt}-accepted', text))
+                elif row['event'] == 'COMPLETE':
+                    notices.append((f'{phase}-{attempt}-execution', '\n'.join(execution_lines(
+                        payload.get('receipt'), phase=phase, attempt=attempt))))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return notices  # Incomplete trailing writes can be retried at the next read.
+    return notices
+
+
+def close_result_lines(result):
+    result = mapping(result)
+    label = {'CONFIRMED_FLAT': '✅ Позиции закрыты', 'PARTIAL': '⚠️ Остался незакрытый объём'}.get(result.get('status'), '❔ Закрытие не подтверждено')
+    lines = [label, f'Проверка: {timestamp(result.get("at"))}.']
+    for row in result.get('positions', [])[:2]:
+        lines.append(position_line(row.get('account_index'), row.get('position'), result.get('symbol', '')))
+    attempts = result.get('attempts', [])
+    fees = [number(a.get('fee_total')) for a in attempts]
+    count = str(sum(a.get('attempted') is True for a in attempts)) if 'attempts' in result else 'неизвестно'
+    lines.append(f'MARKET-ордеров отправлено или могла начаться отправка: {count}.')
+    lines.append('Комиссии закрытия: ' + (amount(sum(fees, Decimal(0))) if attempts and all(f is not None for f in fees) else '0' if result.get('status') == 'CONFIRMED_FLAT' and not attempts else 'неизвестны') + '.')
+    lines.append('PnL отдельно закрытых позиций неизвестен: история входа не привязана к этой команде.')
+    if result.get('status') != 'CONFIRMED_FLAT':
+        lines.append('Причина: ' + clean(result.get('reason') or 'нужна свежая проверка', 200))
+    lines.append('Новая команда снова проверит текущие счета; старый исход не запрещает её навсегда.')
+    return lines
+
+
 def result_lines(report, *, detailed=False):
     report = mapping(report)
     inventory, pair = mapping(report.get('inventory')), mapping(report.get('paired_execution'))
@@ -182,9 +312,12 @@ def result_lines(report, *, detailed=False):
     for value in matches[:2] if isinstance(matches, list) else ():
         value = mapping(value)
         label = {'opening': 'Открытие', 'closing': 'Закрытие'}.get(value.get('phase'), 'Фаза')
-        lines.append(f'{label}: свой объём {amount(value.get("matched_quantity"))}; '
-                     f'внешний A/B {amount(value.get("external_source_quantity"))}/{amount(value.get("external_receiver_quantity"))}; '
-                     f'не доказан A/B {amount(value.get("unproved_source_quantity"))}/{amount(value.get("unproved_receiver_quantity"))}.')
+        lines.append(f'{label} · наша LIMIT: наш парный счёт {amount(value.get("matched_quantity"))}; '
+                     f'внешние участники {amount(value.get("external_source_quantity"))}; '
+                     f'не доказано {amount(value.get("unproved_source_quantity"))}.')
+        lines.append(f'{label} · наш MARKET: собрал нашу LIMIT {amount(value.get("matched_quantity"))}; '
+                     f'чужие заявки {amount(value.get("external_receiver_quantity"))}; '
+                     f'не доказано {amount(value.get("unproved_receiver_quantity"))}.')
     lines.append(hold_line(report.get('holding')))
     lines.append(f'Завершение: {timestamp(mapping(report.get("cycle")).get("terminal_at"))}.')
     lines.append('Комиссии: ' + (amount(fees.get('total')) if fees.get('status') == 'PROVEN' else 'неполные данные, сумма неизвестна') + ' (валюта котировки).')

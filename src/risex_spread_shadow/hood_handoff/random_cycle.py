@@ -2790,49 +2790,77 @@ class RandomCycleEngine:
             budget = _PairAttemptBudget()
             while budget.available:
                 attempt_index = budget.consume()
+                preparation_started = time.perf_counter()
                 try:
-                    metadata, source, receiver = await self._parallel_revalidation_context(
-                        config,
-                        market_read_label="closing market read",
+                    try:
+                        metadata, source, receiver = await self._parallel_revalidation_context(
+                            config,
+                            market_read_label="closing market read",
+                        )
+                    except _AccountIdentityFailure:
+                        self._mark_identity_failure("closing account identity/read validation failed")
+                        raise
+                    book = _as_book(
+                        await self._bounded(self._order_book(config.market_id), config, "closing order book read"),
+                        metadata,
                     )
-                except _AccountIdentityFailure:
-                    self._mark_identity_failure("closing account identity/read validation failed")
+                    now = self.clock.now()
+                    _validate_market_book(config, metadata, book, now)
+                    _validate_account_fresh(config, source, "source", now)
+                    _validate_account_fresh(config, receiver, "receiver", now)
+                    if source.source_identity != opening_plan.source_identity:
+                        self._mark_identity_failure("source account identity changed during the holding period")
+                        return blocked("source account identity changed during the holding period")
+                    if receiver.source_identity != opening_plan.receiver_identity:
+                        self._mark_identity_failure("receiver account identity changed during the holding period")
+                        return blocked("receiver account identity changed during the holding period")
+                    if source.signed_position != opening_source.position_after:
+                        return blocked("source position changed during the holding period")
+                    if receiver.signed_position != opening_receiver.position_after:
+                        return blocked("receiver position changed during the holding period")
+                    source_sign, receiver_sign = _expected_cycle_signs(config.direction)
+                    source_residual = _position_residual(source.signed_position, source_sign, selection.quantity)
+                    receiver_residual = _position_residual(receiver.signed_position, receiver_sign, selection.quantity)
+                    if source_residual is None or receiver_residual is None:
+                        return blocked("cycle position changed direction or exceeded the selected quantity before paired close")
+                    paired_quantity = min(source_residual, receiver_residual)
+                    if paired_quantity <= 0:
+                        return blocked("paired close has no two-account confirmed residual")
+                    close_direction = _inverse(config.direction)
+                    proposal = select_automatic_prices(
+                        close_direction,
+                        metadata,
+                        book,
+                        quantity=paired_quantity,
+                        now=now,
+                        freshness_seconds=config.freshness_seconds,
+                    )
+                except asyncio.CancelledError:
                     raise
-                book = _as_book(
-                    await self._bounded(self._order_book(config.market_id), config, "closing order book read"),
-                    metadata,
-                )
-                now = self.clock.now()
-                _validate_market_book(config, metadata, book, now)
-                _validate_account_fresh(config, source, "source", now)
-                _validate_account_fresh(config, receiver, "receiver", now)
-                if source.source_identity != opening_plan.source_identity:
-                    self._mark_identity_failure("source account identity changed during the holding period")
-                    return blocked("source account identity changed during the holding period")
-                if receiver.source_identity != opening_plan.receiver_identity:
-                    self._mark_identity_failure("receiver account identity changed during the holding period")
-                    return blocked("receiver account identity changed during the holding period")
-                if source.signed_position != opening_source.position_after:
-                    return blocked("source position changed during the holding period")
-                if receiver.signed_position != opening_receiver.position_after:
-                    return blocked("receiver position changed during the holding period")
-                source_sign, receiver_sign = _expected_cycle_signs(config.direction)
-                source_residual = _position_residual(source.signed_position, source_sign, selection.quantity)
-                receiver_residual = _position_residual(receiver.signed_position, receiver_sign, selection.quantity)
-                if source_residual is None or receiver_residual is None:
-                    return blocked("cycle position changed direction or exceeded the selected quantity before paired close")
-                paired_quantity = min(source_residual, receiver_residual)
-                if paired_quantity <= 0:
-                    return blocked("paired close has no two-account confirmed residual")
-                close_direction = _inverse(config.direction)
-                proposal = select_automatic_prices(
-                    close_direction,
-                    metadata,
-                    book,
-                    quantity=paired_quantity,
-                    now=now,
-                    freshness_seconds=config.freshness_seconds,
-                )
+                except Exception as exc:
+                    await self._release_preflight_nonces()
+                    reason = _cycle_exception_reason(exc)
+                    retryable = self._identity_barrier is None and _is_retryable_preparation_error(exc)
+                    journal.append("CLOSING_PREPARATION_FAILED", {
+                        "attempt": attempt_index, "reason": reason, "retryable": retryable,
+                        "latency_seconds": max(0.0, time.perf_counter() - preparation_started),
+                        "lineage": {"used": budget.used, "limit": budget.limit},
+                    })
+                    if not retryable:
+                        return blocked(reason)
+                    if not budget.available:
+                        journal.append("PAIR_ATTEMPT_EXHAUSTED", {
+                            "phase": "PAIRED_CLOSING", "attempt": attempt_index,
+                            "maximum_attempts": budget.limit, "reason": reason,
+                        })
+                        return None, f"paired closing shared pair-attempt budget exhausted ({budget.used}/{budget.limit}): {reason}"
+                    journal.append("CLOSING_PREPARATION_RETRY", {
+                        "attempt": attempt_index, "next_attempt": budget.used + 1,
+                        "reason": reason, "delay_seconds": config.poll_interval_seconds,
+                        "lineage": {"used": budget.used, "limit": budget.limit},
+                    })
+                    await self.clock.sleep(config.poll_interval_seconds)
+                    continue
                 if not _exclusive_source_price_available(
                     book,
                     close_direction,
@@ -2890,7 +2918,8 @@ class RandomCycleEngine:
                     "CLOSING_PLAN_READY",
                     {
                         "config": opening_config_binding(close_config),
-                        "latency": dict(getattr(self, "_last_quote_read", {})),
+                        "latency": {**dict(getattr(self, "_last_quote_read", {})),
+                                    "preparation_seconds": max(0.0, time.perf_counter() - preparation_started)},
                         "paired_quantity": format(paired_quantity, "f"),
                         "attempt": attempt_index,
                         "lineage": {"used": budget.used, "limit": budget.limit},
@@ -3028,14 +3057,30 @@ class RandomCycleEngine:
                 {"reason": "cycle residual changed direction or exceeded the selected quantity"},
             )
             return [], source.signed_position, receiver.signed_position
+        return await self.close_reconciled_positions(config, journal, source, receiver)
+
+    async def close_reconciled_positions(
+        self, config: RandomCycleConfig, journal: DurableJournal,
+        source: AccountSnapshot, receiver: AccountSnapshot,
+    ) -> tuple[list[FallbackResult], Decimal | None, Decimal | None]:
+        """Close an explicitly admitted baseline using the existing residual loop.
+
+        The cycle caller proves lineage first. Operator recovery instead proves
+        all previous intents terminal and records an explicitly adopted current
+        baseline before calling. Neither caller may overlap unresolved writes.
+        """
+        _validate_account_fresh(config, source, "source", self.clock.now())
+        _validate_account_fresh(config, receiver, "receiver", self.clock.now())
+        source_residual, receiver_residual = abs(source.signed_position), abs(receiver.signed_position)
+        caps = {source.account_index: source_residual, receiver.account_index: receiver_residual}
         results: list[FallbackResult] = []
         current: dict[int, AccountSnapshot] = {
             config.source_account_index: source,
             config.receiver_account_index: receiver,
         }
         signs = {
-            config.source_account_index: _expected_cycle_signs(config.direction)[0],
-            config.receiver_account_index: _expected_cycle_signs(config.direction)[1],
+            config.source_account_index: 1 if source.signed_position >= 0 else -1,
+            config.receiver_account_index: 1 if receiver.signed_position >= 0 else -1,
         }
         pending = [
             account_index
@@ -3075,7 +3120,7 @@ class RandomCycleEngine:
             if account_index in blocked:
                 continue
             before = current[account_index]
-            residual = _position_residual(before.signed_position, signs[account_index], selection.quantity)
+            residual = _position_residual(before.signed_position, signs[account_index], caps[account_index])
             if residual is None:
                 journal.append(
                     "FALLBACK_STOPPED_STATE_CHANGED",
@@ -3203,7 +3248,7 @@ class RandomCycleEngine:
                 results[-1] = result
             current = fresh
             fresh_residuals = {
-                candidate: _position_residual(snapshot.signed_position, signs[candidate], selection.quantity)
+                candidate: _position_residual(snapshot.signed_position, signs[candidate], caps[candidate])
                 for candidate, snapshot in current.items()
             }
             if any(value is None for value in fresh_residuals.values()):

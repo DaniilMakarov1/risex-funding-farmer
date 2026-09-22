@@ -22,7 +22,7 @@ import aiohttp
 
 from .keychain import MacOSKeychainBackend, read_hidden_secret
 from .offline_report import load_saved_cycle_report
-from .operator_view import read_lifecycle
+from .operator_view import read_lifecycle, read_execution_notices
 from .operator_control import exclusive_lock
 from . import telegram_messages as views
 
@@ -66,13 +66,14 @@ class Store:
                 raise RuntimeError('controller state/configuration mismatch; inspect locally')
             active = self.data['active']
             if active is not None and (not isinstance(active, dict) or not isinstance(active.get('before'), list)
-                or not all(isinstance(n, str) and re.fullmatch(r'cycle-[0-9]+', n) for n in active['before'])):
+                or active.get('action', 'run') not in ('run', 'close')
+                or not all(isinstance(n, str) and re.fullmatch(r'(?:cycle|close)-[0-9]+', n) for n in active['before'])):
                 raise RuntimeError('invalid active operation state')
             last = self.data['last']
             if last is not None and (not isinstance(last, dict)
                 or last.get('status') not in ('NOT_LAUNCHED', 'FINISHED', 'BLOCKED')
                 or last.get('cycle') is not None and (not isinstance(last['cycle'], str)
-                    or re.fullmatch(r'cycle-[0-9]+', last['cycle']) is None)):
+                    or re.fullmatch(r'(?:cycle|close)-[0-9]+', last['cycle']) is None)):
                 raise RuntimeError('invalid last operation state')
 
     def save(self):
@@ -120,7 +121,7 @@ class Telegram:
 
 
 class Controller:
-    def __init__(self, owner, config, store, transport, launch, *, now=time.time, accounts=None):
+    def __init__(self, owner, config, store, transport, launch, *, now=time.time, accounts=None, recovery=None, close=None):
         self.owner = owner
         self.config = config
         self.operator = config.parent
@@ -128,13 +129,26 @@ class Controller:
         self.transport = transport
         self.launch = launch
         self.accounts = accounts
+        self.recovery = recovery
+        self.close = close
+        self._checking = False
         self.now = now
         self.started = now()
         self.task = None
         self._runner_finished = False
 
-    def slots(self):
-        return sorted(p.name for p in self.operator.glob('cycle-*') if p.is_dir() and re.fullmatch(r'cycle-[0-9]+', p.name))
+    def slots(self, action='run'):
+        prefix = 'close' if action == 'close' else 'cycle'
+        return sorted(p.name for p in self.operator.glob(f'{prefix}-*') if p.is_dir() and re.fullmatch(prefix + r'-[0-9]+', p.name))
+
+    def close_report(self, name):
+        from .operator_recovery import load_close_result
+        try:
+            if not isinstance(name, str) or not re.fullmatch(r'close-[0-9]+', name) or (self.operator / name).is_symlink():
+                return None
+            return load_close_result(self.operator / name)
+        except Exception:
+            return None
 
     def report(self, name):
         if not isinstance(name, str) or not re.fullmatch(r'cycle-[0-9]+', name):
@@ -151,7 +165,8 @@ class Controller:
         active = self.store.data['active']
         if active is None:
             return
-        added = sorted(set(self.slots()) - set(active['before']))
+        action = active.get('action', 'run')
+        added = sorted(set(self.slots(action)) - set(active['before']))
         if not added:
             self.store.data['last'] = {'status': 'NOT_LAUNCHED', 'cycle': None}
             self.store.data['active'] = None
@@ -161,6 +176,9 @@ class Controller:
                     and report['inventory']['status'] == 'CONFIRMED_FLAT'
                     and not report['order_state']['unresolved_intents']
                     and not report['order_state']['unresolved_observed_orders'])
+            if action == 'close':
+                report = self.close_report(added[0])
+                safe = report is not None and report.get('status') == 'CONFIRMED_FLAT'
             self.store.data['last'] = {'status': 'FINISHED' if safe else 'BLOCKED', 'cycle': added[0]}
             if safe:
                 self.store.data['active'] = None
@@ -169,15 +187,21 @@ class Controller:
         self.store.save()
 
     def summary(self, *, detailed=False):
+        if self._checking:
+            return '<b>Проверяю текущие позиции и старые ордера</b>\nНовая операция ещё не отправлялась.'
         active = self.store.data['active']
         # finish() clears active before awaiting final notification; the task
         # can still be alive during that await. It is no longer a running cycle.
         if active is not None and self.task is not None and not self.task.done() and not self._runner_finished:
-            added = sorted(set(self.slots()) - set(active['before']))
+            added = sorted(set(self.slots(active.get('action', 'run'))) - set(active['before']))
+            if active.get('action') == 'close':
+                return '<b>⏳ Закрытие позиций выполняется</b>\nПроверяю и закрываю остатки на двух настроенных счетах. /status — состояние'
             progress = read_lifecycle(self.operator / added[0] / 'cycle.jsonl') if len(added) == 1 else None
             return views.running_message(added, progress)
         blocked = active is not None
         last = self.store.data['last']
+        if last and str(last.get('cycle')).startswith('close-'):
+            return views.close_message(last['cycle'], self.close_report(last['cycle']))
         # Read-only display also includes completed terminal-launched cycles.
         # This never clears the controller's durable active/restart barrier.
         if not last or last.get('status') != 'NOT_LAUNCHED':
@@ -189,7 +213,8 @@ class Controller:
         report = self.report(last.get('cycle'))
         if report is None:
             return views.unavailable_message(blocked, last.get('status') == 'NOT_LAUNCHED')
-        return views.saved_message(last['cycle'], report, blocked=blocked, detailed=detailed)
+        checkpoint = views.recovery_checkpoint(self.store.data.get('last_recovery')) if not blocked else ''
+        return checkpoint + views.saved_message(last['cycle'], report, blocked=blocked, detailed=detailed)
 
     async def notify(self, text):
         try:
@@ -198,16 +223,23 @@ class Controller:
             pass  # Delivery failure never repeats or aborts a cycle.
 
     async def lifecycle_notices(self):
-        """At most three progress notices during this one owned child run."""
+        """Finite stage and per-attempt execution notices, outside the child."""
         sent = set()
         while True:
             try:
                 active = self.store.data['active']
                 if active is None:
                     return
+                if active.get('action') == 'close':
+                    return
                 added = sorted(set(self.slots()) - set(active['before']))
                 if len(added) == 1:
-                    progress = read_lifecycle(self.operator / added[0] / 'cycle.jsonl')
+                    path = self.operator / added[0] / 'cycle.jsonl'
+                    progress = await asyncio.to_thread(read_lifecycle, path)
+                    for key, notice in await asyncio.to_thread(read_execution_notices, path):
+                        if key not in sent:
+                            sent.add(key)
+                            await asyncio.wait_for(self.notify(views.execution_message(notice)), timeout=10)
                     stage = progress.get('stage') if progress else None
                     if stage in {'HOLD', 'CLOSING', 'RECOVERY'} and stage not in sent:
                         sent.add(stage)
@@ -217,10 +249,10 @@ class Controller:
                 pass
             await asyncio.sleep(0.5)
 
-    async def run_one(self):
+    async def run_one(self, action='run'):
         notices = asyncio.create_task(self.lifecycle_notices())
         try:
-            await self.launch()
+            await (self.close() if action == 'close' else self.launch())
             self.finish()
         except Exception:
             self.store.data['last'] = {'status': 'BLOCKED', 'cycle': None}
@@ -230,6 +262,38 @@ class Controller:
             await asyncio.gather(notices, return_exceptions=True)
         self._runner_finished = True
         await self.notify(self.summary_after_task())
+
+    async def reconcile_idle(self, *, require_flat=True):
+        """Replace a historical barrier only after a bounded current check."""
+        if self.recovery is None:
+            return False
+        proof = await self.recovery(require_flat=require_flat)
+        expected = 'READY' if require_flat else 'CLOSE_READY'
+        if not isinstance(proof, dict) or proof.get('status') != expected:
+            raise RuntimeError('current readiness is unproved')
+        self.store.data['last_recovery'] = {k: proof.get(k) for k in ('status', 'at', 'previous_intents')}
+        self.store.data['active'] = None
+        self.store.save()
+        return True
+
+    async def admit(self, action, uid):
+        self._checking = True
+        try:
+            if self.recovery is not None:
+                await self.reconcile_idle(require_flat=action == 'run')
+            elif self.store.data['active'] is not None:
+                await self.notify(views.blocked_message())
+                return
+            self.store.data['active'] = {'before': self.slots(action), 'update_id': uid, 'action': action}
+            self.store.save()
+        except Exception as exc:
+            from .contracts import PreflightBlocked
+            reason = str(exc) if isinstance(exc, PreflightBlocked) else 'Проверка недоступна или другая операция ещё выполняется.'
+            await self.notify(views.recovery_refused_message(reason))
+            return
+        finally:
+            self._checking = False
+        await self.run_one(action)
 
     def summary_after_task(self):
         task = self.task
@@ -273,14 +337,19 @@ class Controller:
             except Exception:
                 response = views.accounts_message(None)
             await self.notify(response)
-        elif command == '/run':
-            if self.store.data['active'] is not None or self.task is not None and not self.task.done():
+        elif command in ('/run', '/close'):
+            if self.task is not None and not self.task.done():
                 await self.notify(views.blocked_message())
                 return
-            self.store.data['active'] = {'before': self.slots(), 'update_id': uid}
-            self.store.save()
+            if command == '/close' and self.close is None:
+                await self.notify(views.recovery_refused_message('Команда закрытия не настроена.'))
+                return
+            if self.recovery is None and self.store.data['active'] is not None:
+                await self.notify(views.blocked_message())
+                return
             self._runner_finished = False
-            self.task = asyncio.create_task(self.run_one())
+            self._checking = True
+            self.task = asyncio.create_task(self.admit(command[1:], uid))
             await self.notify(views.accepted_message(uid))
         elif isinstance(command, str):
             await self.notify(views.unknown_message())
@@ -298,7 +367,7 @@ async def serve(args, store, lock_fd, token):
     evidence = _simple_evidence_path(_load_json(config, "controller config"), config.parent, None)
     initial_evidence = evidence.read_bytes()
 
-    async def launch():
+    async def launch(action='simple'):
         if config.read_bytes() != initial_config or evidence.read_bytes() != initial_evidence:
             raise RuntimeError('configuration changed; restart controller after local review')
         # Fixed executable/arguments, no shell and no user-supplied command text.
@@ -307,13 +376,28 @@ async def serve(args, store, lock_fd, token):
         env.pop('RISEX_HOOD_CONFIG', None)
         env['PYTHONPATH'] = str(root / 'src')
         process = await asyncio.create_subprocess_exec(
-            str(python), '-m', 'risex_spread_shadow.hood_handoff.cli', 'simple',
+            str(python), '-m', 'risex_spread_shadow.hood_handoff.cli', action,
             '--keychain', '--config', str(config), cwd=str(root), env=env,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL, start_new_session=True, pass_fds=(lock_fd,))
         # The owner's /run is the launcher confirmation. No credential bytes
         # enter stdin, argv, environment, output logs or Telegram.
         await process.communicate(b'\n')
+
+    async def close():
+        await launch('close-positions')
+
+    async def recovery(*, require_flat=True):
+        if config.read_bytes() != initial_config or evidence.read_bytes() != initial_evidence:
+            raise RuntimeError('configuration changed')
+        from .cli import _validate_simple_local_inputs
+        from .operator_recovery import check_recovery
+        try:
+            account_config, _ = _validate_simple_local_inputs(json.loads(initial_config), config_path=config,
+                operator_dir=config.parent, evidence_path=evidence, defer_incremental_margin_calculation=None)
+        except SystemExit:
+            raise RuntimeError('account configuration unavailable') from None
+        return await check_recovery(account_config, config.parent, require_flat=require_flat)
 
     async def accounts():
         if config.read_bytes() != initial_config or evidence.read_bytes() != initial_evidence:
@@ -331,10 +415,15 @@ async def serve(args, store, lock_fd, token):
 
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=40)) as session:
         api = Telegram(session, token)
-        controller = Controller(args.owner_id, config, store, api, launch)
+        controller = Controller(args.owner_id, config, store, api, launch, recovery=recovery, close=close)
         controller.accounts = accounts
         # Obtaining the instance lock proves no inherited runner still holds it.
         controller.finish()
+        if store.data['active'] is not None:
+            try:
+                await controller.reconcile_idle()
+            except Exception:
+                pass  # Fresh commands retry the check; no automatic order.
         latest = await api.call('getUpdates', offset=-1, timeout=0, allowed_updates=['message'])
         if not isinstance(latest, list):
             raise RuntimeError('invalid Telegram update envelope')

@@ -36,6 +36,17 @@ Each run reserves a new immutable `cycle-NNN` directory and client prefix. It ch
 
 HOLD starts only after the full quantity is proved matched between our own orders. Closing reverses the sides and is reduce-only. Known residuals can be closed separately only after complete reconciliation. Unresolved execution stops dependent actions. Normal completion ends the cycle; it never starts the next one automatically.
 
+## Close current positions explicitly
+
+In Telegram send `/close`. In the terminal:
+
+```bash
+.venv-hood/bin/python -m risex_spread_shadow.hood_handoff.cli close-positions --keychain \
+  --config spread-shadow-runs/hood-cycle-race-latency-20260920/operator-v1/random-cycle.json
+```
+
+Enter confirms this one real recovery operation. It checks both configured BTC accounts and prior intents, records the current baseline, and closes only actual positions using the existing reduce-only MARKET/IOC residual logic. It shares the normal operator lock with `./start`; wait for an active operation to finish. Active or unresolved old orders must be reconciled first; this command does not cancel unrelated orders. Known partial/zero fills are reconciled before another attempt; ambiguous execution stops further writes. The result is saved separately in `close-NNN/close.jsonl`. It reports residuals and closure fees when proved; PnL for a manually opened/adopted position remains unknown without entry history. No command starts another cycle automatically.
+
 ## Read the messages
 
 Terminal and Telegram progress shows the two confirmed opening positions, hold duration/start, and **planned closing start in Moscow time**. That time is not a guarantee that all orders and reconciliation finish then. Closing/recovery messages mark opening positions as historical.
@@ -54,21 +65,22 @@ The final result keeps these facts separate:
 
 The SDK now preserves the account's maker/taker venue and integrator fee fields. Both explicitly zero components prove zero. Nonzero integer units are not yet verified for this venue and are retained as raw evidence, not guessed amounts. Old journals missing these fields remain unchanged. Small PnL values are not rounded to cents.
 
-After interruption preserve journals/state. A missing terminal or unknown order is not a closed position and cannot be cleared by deleting a lock/state file. The normal launcher never resumes or closes historical inventory automatically; lower-level reconciliation does not authorize replay. `/accounts` is the way to request current selected-market account observations.
+After interruption preserve journals/state. A new `/run` checks current positions and all old creation intents again; a failed historical result does not permanently lock the bot. After manually closing positions, send `/run` again. If positions remain, use `/close`. A missing terminal or unknown order is not a closed position and cannot be cleared by deleting a lock/state file. The normal launcher never resumes or closes historical inventory automatically; lower-level reconciliation does not authorize replay. `/accounts` is the way to request current selected-market account observations.
 
 ## Telegram
 
-Only a fresh exact `/run` from the configured numeric owner in their private chat confirms one real cycle. No parameters, credentials or shell commands are accepted in chat.
+Only a fresh exact `/run` or `/close` from the configured numeric owner in their private chat confirms one real operation. No parameters, credentials or shell commands are accepted in chat.
 
 | Command | Action |
 | --- | --- |
-| `/run` | Start one real cycle under the same local configuration. |
+| `/run` | Recheck current readiness, then start one real cycle under the same local configuration. |
+| `/close` | Check both configured accounts and close existing positions of this market with bounded reduce-only MARKET/IOC orders. Zero positions send no orders. |
 | `/status` | Short progress or latest saved result, including a terminal-launched cycle when idle. |
 | `/report` | Saved result plus last position times, per-account fees/PnL and bounded diagnostics. |
 | `/accounts` | Current read-only available balance, selected-market position/orders and observation time for fixed A/B accounts. Other markets are not checked. |
 | `/help` | Explain the commands. |
 
-Automatic progress notices cover confirmed HOLD, closing and separate residual recovery while a controller-owned cycle runs. Delivery failures/slowness do not cancel or replay trading. Short stages can finish between observations; the final saved report is authoritative. `/status` and `/report` make no venue requests; `/accounts` does not unlock execution or treat missing/stale observations as zero.
+Automatic progress notices identify accepted LIMITs and then who filled each LIMIT/MARKET: the exact paired own order, external accounts or unproved counterparties. Opening and closing are separate; dispatch intervals are shown when measured. Notices also cover confirmed HOLD, closing and separate residual recovery while a controller-owned cycle runs. Delivery failures/slowness do not cancel or replay trading. Short stages can finish between observations; the final saved report is authoritative. `/status` and `/report` make no venue requests; `/accounts` does not unlock execution or treat missing/stale observations as zero.
 
 If the bot is not already provisioned, run locally with the owner's numeric ID:
 
@@ -90,7 +102,7 @@ Start the controller locally:
 
 Old queued commands are discarded on startup. Private identity/freshness checks, consumed-update state and active intent prevent duplicate launches. The detached child inherits an instance lock and takes the normal operator lock, excluding another controller/normal launcher. Do not run lower-level interfaces concurrently on these accounts.
 
-Stopping the controller does not close positions or kill its child. Restart is blocked while the child retains the lock; afterward complete saved flatness and resolved orders/intents must permit another launch. Owner-only state is under `~/.config/risex-spread-shadow/telegram-control/`, bound to owner/config/evidence. Do not erase it to replay commands. Configuration changes need local review/restart; mismatched binding fails closed. Update an idle controller after code changes; never interrupt an active cycle to deploy.
+Stopping the controller does not close positions or kill its child. Restart is blocked while the child retains the lock; afterward a fresh read-only check can remove an old administrative barrier when all previous creation intents are terminal and both accounts are flat without active orders. The exact order lookup may omit older orders; bounded inactive history provides terminal proof. Missing evidence still prevents new orders, and a later fresh command retries the check. Owner-only state is under `~/.config/risex-spread-shadow/telegram-control/`, bound to owner/config/evidence. Do not erase it to replay commands. Configuration changes need local review/restart; mismatched binding fails closed. Update an idle controller after code changes; never interrupt an active cycle to deploy.
 
 ## Offline diagnosis and other interfaces
 

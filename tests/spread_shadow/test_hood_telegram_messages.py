@@ -69,7 +69,7 @@ def test_html_injection_and_large_reasons_are_escaped_and_bounded():
     assert '&lt;script&gt;' in message
     assert 'onclick' in plain  # text, never a Telegram entity attribute
     assert 'synthetic-canary' not in message
-    assert 'заблокированы' in message
+    assert 'сверк' in message
     assert len(plain) < 2000
 
 
