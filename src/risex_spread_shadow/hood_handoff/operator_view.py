@@ -275,8 +275,13 @@ def read_execution_notices(path):
                     notices.append((f'{phase}-{attempt}-execution', '\n'.join(execution_lines(
                         payload.get('receipt'), phase=phase, attempt=attempt))))
     except (OSError, ValueError, TypeError, AttributeError):
-        return notices  # Incomplete trailing writes can be retried at the next read.
-    return notices
+        pass  # Incomplete trailing writes can be retried at the next read.
+    # Several phases may finish before a slow display reads them. File-name
+    # ordering puts closing before opening and attempt 2 before attempt 1.
+    def order(notice):
+        phase, attempt, event = notice[0].split('-')
+        return (phase == 'closing', int(attempt), event != 'accepted')
+    return sorted(notices, key=order)
 
 
 def close_result_lines(result):

@@ -197,6 +197,10 @@ async def test_notices_report_real_counterparties_and_timing(tmp_path,kind):
     assert any(text==t for _,t in notices)
     # A missing reciprocal order cannot be described as our successful match.
     if kind=='own':
+        assert [key for key, _ in notices] == [
+            'opening-1-accepted', 'opening-1-execution',
+            'closing-1-accepted', 'closing-1-execution',
+        ]
         saved=phase.as_dict();saved['receiver']['trades'][0]['counterparty_order_id']=None
         assert 'наш парный счёт — 0.2' not in '\n'.join(execution_lines(saved,phase='closing'))
 
