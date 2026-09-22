@@ -80,6 +80,8 @@ New journals measure quote-request elapsed time and per-order preparation lock w
 
 `risex_spread_shadow.hood_handoff.telegram_control` is a separate control interface for the existing configured cycle. The old Funding Farmer Telegram integration remains frozen. Only a fresh exact `/run` message from the configured numeric user ID in that same user's private chat launches one real Mainnet cycle. This command is the operator's launch confirmation; volume and hold selection remain the existing random-cycle policy. `/start` or `/help` explains commands; `/status` and `/report` read local saved state. No credentials, trading parameters, paths or shell commands are accepted in chat.
 
+Messages use Telegram HTML with escaped dynamic values, clear Russian labels and a keyboard containing only `/status`, `/report` and `/help`. `/status` is brief; `/report` adds saved positions, UTC observation times and bounded journal diagnostics. Paired execution, historical flatness and fee completeness remain separate; a historical zero position is not a current account read. Unknown commands receive help without executing them. Long views are replaced by a complete explanatory message rather than cutting an HTML tag.
+
 Use the project Python directly (no new package installation needed). Replace `YOUR_NUMERIC_USER_ID` locally:
 
 ```bash

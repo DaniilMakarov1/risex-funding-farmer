@@ -1,5 +1,13 @@
 # Current status
 
+## HCR-31 Telegram audit and presentation
+
+Candidate `24b063fa25d23804949db26cd741b980b574d100` fixes three reproduced controller defects: status requests during final notification no longer access cleared active state or misreport a finished runner as active; unreadable journals yield an explicit unavailable report without raw error details; malformed last-result state is rejected on load. The complete diff is Chief-implemented and self-reviewed.
+
+Operator messages now use escaped, bounded Telegram HTML, distinct short status/detailed report, Russian result labels, historical position timestamps in UTC and read-only navigation buttons. Raw diagnostics are sanitized and bounded. A too-long message is replaced whole, never sliced through HTML. Existing fresh private-owner `/run`, deduplication, launch/restart locks and trading policy remain unchanged.
+
+Focused validation: 232 passed. Final clean isolated Python 3.11 suite: **4824 passed, 3 existing optional Extended dependency skips, exit 0**, Python 3.11.5, 128.56 seconds. Three failures were reproduced before correction and preserved. Telegram accepted one labelled formatting test message in the verified owner's chat (message 7179), returning bold/code/italic entities. No trading controller or venue operation was started; protected controller state was unchanged. All 42 historical file hashes match. Evidence: `spread-shadow-runs/hood-telegram-review-20260922/`.
+
 ## HCR-30 Telegram controller
 
 Implementation candidate `8edad04ce6a94cbd9bb99b7af540771d2ab53315` adds an owner-operated private-chat controller, native Keychain token provisioning, one-cycle `/run`, local `/status` and `/report`, durable consumed-update and active-intent state, global inherited process lock and simple-launcher operator lock. No execution policy changed. Only the new hood-handoff Telegram interface is unfrozen; old Funding Farmer Telegram remains frozen.
