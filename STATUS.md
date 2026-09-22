@@ -1,5 +1,11 @@
 # Current status
 
+## HCR-29 measured diagnostic speed
+
+Candidate `8c723ec74f262fba67a689aace8e3864b6bc129d` avoids repeated recursive sanitization during bounded offline report projection. Key redaction and string redaction still use the existing sanitizer; omitted subtrees are no longer traversed, and depth/list/detail bounds remain conservative. All seven saved JSON reports are byte-identical. All 42 original input hashes are preserved. Runtime trading/order code is unchanged.
+
+Local warm-filesystem benchmark, nine batches of twenty reports per cycle: cycle-004 median 7.405 ms → 3.979 ms (1.86×), cycle-007 13.477 ms → 6.255 ms (2.15×). Smaller journals show smaller gains; this is report performance, not live execution latency. Evidence/method are in `spread-shadow-runs/hood-speed-20260922/`. Focused checks: 67 passed. Final isolated Python 3.11 suite: **4763 passed, 3 existing optional Extended testnet dependency skips, exit 0**, Python 3.11.5, 133.66 seconds. A new redaction test initially expected a field outside the established report allowlist; its expectation was corrected without broadening the allowlist. Chief implementation/self-review, no Builder.
+
 ## HCR-28 global verification
 
 Candidate `64006758d15ad48cd6fafef04a950f922a3c2431` fixes two reproduced offline-report crashes: container-valued fallback account indexes used as hash keys, and non-object dispatch plans used as mappings during latency extraction. Invalid fallback identity is excluded from execution proof with an explicit issue; malformed source/receiver plans also produce an issue. The report remains INCOMPLETE with UNKNOWN inventory, while retaining other observations and mutation intents. Runtime order execution and policy are unchanged.
