@@ -7,12 +7,18 @@ from time import perf_counter
 import pytest
 
 from risex_spread_shadow.hood_handoff import (
+    AccountSnapshot,
     ContractError,
+    DepthLevel,
     Direction,
     HandoffEngine,
+    MarketMetadata,
+    OrderBookSnapshot,
     Outcome,
+    RandomCycleSelection,
     RandomCycleConfig,
     RandomCycleEngine,
+    compute_quantity_bounds,
     run_handoff,
 )
 
@@ -91,6 +97,112 @@ class TimedReadClient(FakeClient):
         return await super().submit_order(plan)
 
 
+class TimedPreflightClient(FakeClient):
+    """Delay every initial preflight read and retain its overlap evidence."""
+
+    def __init__(self, *, delay: float):
+        super().__init__(source_fills=True)
+        self.delay = delay
+        self.active_reads = 0
+        self.max_active_reads = 0
+        self.events: list[tuple[str, float]] = []
+
+    async def _delayed(self, label: str, operation):
+        self.events.append((f"start-{label}", perf_counter()))
+        self.active_reads += 1
+        self.max_active_reads = max(self.max_active_reads, self.active_reads)
+        try:
+            await asyncio.sleep(self.delay)
+            return await operation()
+        finally:
+            self.events.append((f"end-{label}", perf_counter()))
+            self.active_reads -= 1
+
+    async def market_metadata(self, market_id):
+        return await self._delayed(
+            "metadata",
+            lambda: super(TimedPreflightClient, self).market_metadata(market_id),
+        )
+
+    async def account_snapshot(self, account_index, market_id):
+        return await self._delayed(
+            f"account-{account_index}",
+            lambda: super(TimedPreflightClient, self).account_snapshot(account_index, market_id),
+        )
+
+    async def submit_order(self, plan):
+        self.events.append(("first-submit" if not self.events or not any(label == "first-submit" for label, _ in self.events) else "submit", perf_counter()))
+        return await super().submit_order(plan)
+
+
+class DelayedCycleReads:
+    """Synthetic cycle adapter whose read timing is visible at the boundary."""
+
+    source_account_index = 11
+    receiver_account_index = 22
+
+    def __init__(self, *, account_delay: float, metadata_delay: float, book_delay: float):
+        self.account_delay = account_delay
+        self.metadata_delay = metadata_delay
+        self.book_delay = book_delay
+        self.events: list[tuple[str, float]] = []
+
+    async def market_metadata(self, market_id):
+        self.events.append(("metadata-start", perf_counter()))
+        await asyncio.sleep(self.metadata_delay)
+        self.events.append(("metadata-end", perf_counter()))
+        return MarketMetadata(
+            market_id=market_id,
+            symbol="BTC",
+            status="active",
+            price_decimals=1,
+            size_decimals=2,
+            minimum_base_amount=Decimal("0.10"),
+            minimum_quote_amount=Decimal("10"),
+            source_fee_rate=None,
+            receiver_fee_rate=None,
+            observed_at=1_000.0,
+            margin_evidence="synthetic account limits",
+            market_type="perp",
+            venue="robinhood",
+        )
+
+    async def account_snapshot(self, account_index, market_id):
+        self.events.append((f"account-{account_index}-start", perf_counter()))
+        await asyncio.sleep(self.account_delay)
+        self.events.append((f"account-{account_index}-end", perf_counter()))
+        return AccountSnapshot(
+            account_index=account_index,
+            market_id=market_id,
+            signed_position=Decimal("0"),
+            active_orders=(),
+            observed_at=1_000.0,
+            authorized=True,
+            ready=True,
+            margin_available=Decimal("1000"),
+            margin_required=Decimal("1"),
+            fee_rate=None,
+            source_identity=f"cycle-account-{account_index}",
+            incremental_margin_required=Decimal("1"),
+            incremental_margin_evidence="synthetic opening margin proof",
+            available_balance=Decimal("1000"),
+        )
+
+    async def order_book(self, market_id):
+        self.events.append(("book-start", perf_counter()))
+        await asyncio.sleep(self.book_delay)
+        self.events.append(("book-end", perf_counter()))
+        return OrderBookSnapshot(
+            market_id=market_id,
+            symbol="BTC",
+            bids=(DepthLevel(Decimal("100.0"), Decimal("100"), "bid-1"),),
+            asks=(DepthLevel(Decimal("100.2"), Decimal("100"), "ask-1"),),
+            observed_at=1_000.0,
+            market_type="perp",
+            venue="robinhood",
+        )
+
+
 @pytest.mark.asyncio
 async def test_account_rechecks_overlap_against_controlled_sequential_baseline():
     parallel_client = TimedReadClient(delay=0.03, delay_all=True)
@@ -109,6 +221,31 @@ async def test_account_rechecks_overlap_against_controlled_sequential_baseline()
     sequential_times = dict(sequential_client.events)
     assert sequential_client.max_active_reads == 1
     assert sequential_times["read-end-11"] <= sequential_times["read-start-22"]
+
+
+@pytest.mark.asyncio
+async def test_child_preflight_metadata_and_accounts_overlap_before_source_dispatch(tmp_path):
+    client = TimedPreflightClient(delay=0.03)
+    result = await run_handoff(
+        make_config(tmp_path / "preflight-overlap.jsonl"),
+        client,
+        clock=FakeClock(),
+    )
+
+    assert result.outcome is Outcome.SUCCESS
+    assert client.max_active_reads == 3
+    preflight_end = next(index for index, (label, _) in enumerate(client.events) if label == "first-submit")
+    events: dict[str, float] = {}
+    for label, timestamp in client.events[:preflight_end]:
+        events.setdefault(label, timestamp)
+    assert events["start-metadata"] < events["end-account-11"]
+    assert events["start-account-11"] < events["end-account-22"]
+    assert events["start-account-22"] < events["end-account-11"]
+    assert max(
+        events["end-metadata"],
+        events["end-account-11"],
+        events["end-account-22"],
+    ) <= client.events[preflight_end][1]
 
 
 @pytest.mark.asyncio
@@ -132,6 +269,54 @@ async def test_random_cycle_account_reads_overlap_with_maximum_two_concurrent_re
     times = dict(client.events)
     assert times["start-11"] < times["end-22"]
     assert times["start-22"] < times["end-11"]
+
+
+@pytest.mark.asyncio
+async def test_cycle_revalidation_takes_book_quote_after_accounts(tmp_path):
+    client = DelayedCycleReads(account_delay=0.03, metadata_delay=0.01, book_delay=0.02)
+    config = RandomCycleConfig(
+        market_id=7,
+        market_symbol="BTC",
+        direction=Direction.LONG,
+        source_account_index=11,
+        receiver_account_index=22,
+        cycle_dir=tmp_path / "late-quote",
+    )
+    engine = RandomCycleEngine(client, clock=FakeClock())
+
+    initial_metadata = await client.market_metadata(config.market_id)
+    initial_source = await client.account_snapshot(config.source_account_index, config.market_id)
+    initial_receiver = await client.account_snapshot(config.receiver_account_index, config.market_id)
+    initial_bounds = compute_quantity_bounds(
+        initial_metadata,
+        initial_source,
+        initial_receiver,
+        Decimal("100.1"),
+    )
+    selection = RandomCycleSelection(
+        quantity=Decimal("0.20"),
+        quantity_tick=20,
+        hold_seconds=20,
+        opening_source_price=Decimal("100.1"),
+        opening_receiver_bound=Decimal("100.1"),
+        bounds=initial_bounds,
+        metadata_observed_at=initial_metadata.observed_at,
+        book_observed_at=1_000.0,
+    )
+    refreshed = await engine._revalidate_open(
+        config,
+        selection,
+        initial_metadata=initial_metadata,
+        initial_book=None,
+        initial_source=initial_source,
+        initial_receiver=initial_receiver,
+    )
+    assert refreshed[0].market_id == 7
+    assert refreshed[2].account_index == 11
+    assert refreshed[3].account_index == 22
+    events = dict(client.events)
+    assert events["account-11-end"] <= events["book-start"]
+    assert events["account-22-end"] <= events["book-start"]
 
 
 @pytest.mark.asyncio

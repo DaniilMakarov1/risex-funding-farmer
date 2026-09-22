@@ -1791,21 +1791,43 @@ class HandoffEngine:
         journal: DurableJournal,
         run_id: str,
     ) -> tuple[HandoffPlan, AccountSnapshot, AccountSnapshot]:
-        metadata = _as_market(
-            await self._bounded(self.client.market_metadata(config.market_id), "market metadata read")
-        )
-        source = _as_account(
-            await self._bounded(
-                self.client.account_snapshot(_account_from_client(self.client, "source"), config.market_id),
-                "source account read",
+        source_account_index = _account_from_client(self.client, "source")
+        receiver_account_index = _account_from_client(self.client, "receiver")
+
+        async def read_metadata() -> MarketMetadata:
+            return _as_market(
+                await self._bounded(
+                    self.client.market_metadata(config.market_id),
+                    "market metadata read",
+                )
             )
-        )
-        receiver = _as_account(
-            await self._bounded(
-                self.client.account_snapshot(_account_from_client(self.client, "receiver"), config.market_id),
-                "receiver account read",
+
+        async def read_account(account_index: int, label: str) -> AccountSnapshot:
+            return _as_account(
+                await self._bounded(
+                    self.client.account_snapshot(account_index, config.market_id),
+                    label,
+                )
             )
-        )
+
+        # Metadata and the two account snapshots are independent read-only
+        # observations.  Fetch them in one bounded window, then run the same
+        # complete validation below.  If one read fails, drain every sibling
+        # before returning so no account task remains live across the mutation
+        # boundary.
+        tasks = [
+            asyncio.create_task(read_metadata()),
+            asyncio.create_task(read_account(source_account_index, "source account read")),
+            asyncio.create_task(read_account(receiver_account_index, "receiver account read")),
+        ]
+        try:
+            metadata, source, receiver = await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
         now = self.clock.now()
         # The client must expose account identities explicitly; this prevents a
         # fallback to one shared account or a hidden account discovery call.
