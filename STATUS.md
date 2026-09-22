@@ -1,5 +1,11 @@
 # Current status
 
+## HCR-33 Random first account and limit side
+
+Candidate `99b35ab40b300280d4f4fe89d08b8e70e06b4d19` makes normal simple/Telegram launches choose uniformly among both configured accounts and first-limit BUY/SELL (four combinations). Selection is persisted and directory-synced before credential access, checked at admission, and retained through execution/retries/closure. Size, hold, risk and reconciliation policy are unchanged. Explicit-plan lower-level interfaces remain fixed. Saved Telegram reports display selected identities/side; `/accounts` uses stable A/B labels.
+
+Validation: 281 affected checks; final isolated Python 3.11.5 suite **4873 passed, 3 existing optional Extended dependency skips, exit 0**, 141.08 seconds. Four combinations exercised full simulated paired opening/closing and replay rejection; adverse reservation persistence, malformed metadata and route mismatch covered. Full actual diff self-reviewed; no independent-review claim. Imports verified and original 42 hashes preserved. No live account queries or test trades. Evidence: `spread-shadow-runs/hood-random-route-20260922/`.
+
 ## HCR-32 Telegram account inspection
 
 Candidate `e580369e0c4b439b5d556efd657521e3279e7754` adds private-owner `/accounts` and a navigation button. The command reads both configured accounts concurrently through the existing read-only SDK adapter, showing available balance, configured-market position, active-order count and observation time. Partial failures, stale observations and inactive status are explicit. Missing stored keys cannot prompt/provision; inspection preserves persistent execution barriers and never dispatches orders.
