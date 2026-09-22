@@ -246,3 +246,25 @@ def test_interface_provenance_is_only_an_allowlisted_diagnostic(monkeypatch, dec
     value = capture_provenance({"market_id": 7})
     assert value["operator_interface"] == expected
     assert "synthetic-sensitive-canary" not in json.dumps(value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid", [True, 1.0])
+async def test_invalid_counterparty_equal_to_numeric_account_does_not_prove_own_match(tmp_path, invalid):
+    clock = AdvancingClock()
+    cfg = cycle_config(tmp_path / "strict-own", receiver_account_index=1)
+    client = CycleClient(clock)
+    client.receiver_account_index = 1
+    await run_random_cycle(cfg, client, clock=clock, rng=FixedRng(20, 20))
+    assert load_saved_cycle_report(cfg.cycle_dir)["paired_execution"]["status"] == "SUCCESS"
+    path = cfg.cycle_dir / "opening.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    receipt = next(r["payload"]["receipt"] for r in rows if r["event"] == "COMPLETE")
+    receipt["source"]["trades"][0]["counterparty_account_index"] = invalid
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    report = load_saved_cycle_report(cfg.cycle_dir)
+    phase = report["paired_execution"]["direct_counterparty_match"][0]
+    assert report["paired_execution"]["status"] == "UNKNOWN"
+    assert phase["matched_quantity"] == "0"
+    assert phase["external_source_quantity"] == "0"
+    assert report["inventory"]["status"] == "CONFIRMED_FLAT"

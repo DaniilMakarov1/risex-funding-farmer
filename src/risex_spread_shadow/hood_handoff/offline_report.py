@@ -1909,7 +1909,9 @@ def _paired_execution(
                     matched = False
                     continue
                 compatible = (
-                    t.get("counterparty_account_index") == b["account_index"]
+                    type(t.get("counterparty_account_index")) is int
+                    and type(other.get("counterparty_account_index")) is int
+                    and t.get("counterparty_account_index") == b["account_index"]
                     and other.get("counterparty_account_index") == a["account_index"]
                     and t.get("counterparty_order_id") == other["order_id"]
                     and other.get("counterparty_order_id") == t["order_id"]
