@@ -1,25 +1,13 @@
-# HCR-27 — completeness audit
+# HCR-28 — global offline regression and bounded bug fixes
 
-## Objective and authority
+## Current objective
 
-On 2026-09-22 the owner asked to verify and finish all five previously proposed improvements without Builders or repeat routine confirmations: stage latency, a unified offline run report, reproducible real incidents, crash-boundary verification and current concise documentation. Accepted base: `46ed54ee0d2d2e8762f8449374ca02e1f10d76e0`.
+ACTIVE, owner requested global tests and bug correction on 2026-09-22. Accepted base: `c880e2f79ae39c9dd5fb2f01d4041dbe2f12b824`. Run the complete Python 3.11 offline suite, inspect adverse execution/restart/report boundaries and fix reproduced defects within existing behavior. Preserve historical input hashes and existing regression coverage. No speculative refactoring or policy changes.
 
-The owner's explicit sole-Chief instruction overrides the default role split for this objective. Chief owns implementation, tests, documents, self-review and integration/publication. Self-authored changes are not independently reviewed. Routine authorized edits, offline tests, dependencies, evidence and Git operations are pre-approved within tool restrictions; no global security/settings changes.
+The owner's instruction to work personally without Builders and repeated routine confirmations remains in force. Chief owns source/tests/docs/integration and self-review; no independent review is claimed. Worktree: `/Users/daniilmakarov/.codex/worktrees/hcr28-global`, branch `codex/spread-v1-hcr28-global`. No other writer is assigned.
 
-Scope is offline only. No live market/account reads, credentials/Keychain, real signing, orders/cancellations, new slots or monitoring. Preserve all original evidence and 42 recorded cycle hashes. No changes to fees, sizing/hold, minimums, slippage, freshness/delay, retry budgets, residual cleanup, exact priority, inventory/PnL semantics or trading authority. No other repository, new infrastructure or deferred campaign work.
+## Authority and acceptance
 
-## Acceptance and result
+Offline tests, bounded implementation corrections, dependency setup, local evidence and accepted Git publication are authorized. No live requests, credentials, real signatures/orders/cancellations, new cycle slots or collection. Fees, size/hold, freshness/deadlines, retries, cleanup, ownership/priority and inventory/PnL policy stay unchanged. Other repositories and frozen legacy functionality are outside correction scope; full-suite failures there must be classified, not silently repaired.
 
-Candidate: `0b6be39a325e350618c25ccc746a65704b81e4de`. Final verification: **4749 passed, 3 existing skips, exit 0** in a clean isolated Python 3.11.5 checkout of the exact candidate (134.23 seconds).
-
-- Added only measured gaps: successful quote read, preparation lock wait, nonce acquisition, signing-call elapsed and transport roundtrip. Distinguish private lookup from exact owner-bound public observation and preserve original quote/plan/intent timing. Old missing metrics remain unavailable; pure CPU/network/exchange fractions remain UNKNOWN and are not claimed achieved. No policy tuning.
-- Unified report now exposes latest saved orders with timestamps and unresolved orders/intents, alongside existing plans, dispatch evidence, fills, stop reasons, separate pair/inventory/fee/funding conclusions. It remains streaming, offline, read-only, bounded and conservative on missing/conflicting evidence.
-- Added sanitized hash-bound cycle-003/004/007 fixtures and distinguishing action/provenance assertions. Reused existing adverse execution regressions for source disappearance, external fill before receiver, delayed history, canceled zero-fill IOC and ambiguous transport; corrected inaccurate coverage pointers.
-- Rechecked five existing actual-engine subprocess crash boundaries and restart no-replay/UNKNOWN inventory behavior. No duplicate test campaign or new recovery service.
-- Updated STATUS/README and durable reporting semantics in SYSTEM_SPEC. Prior broad completion claim is corrected. Historical state is not current authority.
-
-Acceptance evidence is stored in owner-only ignored `spread-shadow-runs/hood-diagnostics-20260922/audit-v1/`: exact candidate/import identity, focused/full test outputs, final saved reports and `final-audit.json`. Focused profile passed 459 tests. All 42 original hashes and seven consumed slots are preserved. Real-incident facts matched independently stated report expectations; execution/action barriers use existing regression assertions. Review is Chief self-review.
-
-## Completion boundary
-
-The clean isolated Python 3.11 full suite passed. Integration must preserve the exact tested source; verify main source identity and remote publication before reporting completion. No unchanged-code duplicate full suite is needed. Preserve all candidates/worktrees/evidence. No new live run, real latency measurement, owned-counterparty success or profit is established by completion. New live work requires a concrete owner decision, not reuse of historical permissions.
+Reproduce each concrete defect before correction and add a distinguishing regression when needed. Review actual diff, run affected checks and one final clean isolated Python 3.11 full suite on the exact candidate after code/test changes. Preserve initial failures and all 42 original cycle hashes. Evidence goes in ignored owner-only `spread-shadow-runs/hood-global-tests-20260922/`. Verify integrated source equals tested candidate and remote main before claiming publication. No test result establishes live performance or successful real trading.
