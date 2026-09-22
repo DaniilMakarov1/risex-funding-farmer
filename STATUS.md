@@ -1,5 +1,9 @@
 # Current status
 
+## HCR-26 — IN PROGRESS
+
+Fresh Builder owns the finite quote-age correction on codex/spread-v1-hcr26-quote-age. Chief independent synthetic cycle-to-handoff baseline with account30ms/book20ms/metadata10ms delays: median opening quote age104.1ms, closing106.4ms; inter-leg35.8/34.9ms. This is not a live latency estimate. Production candidate is not yet accepted. Technical/offline work proceeds; real order execution must be performed by the owner because system/tool restrictions override owner authorization. No new live operation is authorized for the agents. See NEXT_TASK for current scope.
+
 ## HCR-25 live validation — cycle007 completed without opening
 
 Owner explicitly confirmed one real ./start BTC LONG cycle, executed solely by Chief on published571fcaa using protected Keychain. Selected.00020BTC/156s; engine used all3attempts then stopped. Three identified source LIMITs ended canceled with0fills, receiver never dispatched, no hold/close/fallback. Attempt1 guard UNKNOWN because exact public source level absent; attempt2 ownSELL85814.8 vs externalask85808.2 and attempt3 ownSELL85801.6 vs externalask85796.6 gaveLOST. Exact public owner/order source evidence exists in attempts2/3, but matching remains unproved because receiver was blocked. Final observed positions0/0 at1790066281.288543/1790066281.293617; terminal PARTIAL/pairedFAILED/inventoryCONFIRMED_FLAT/economicsKNOWN, process exit0. This is a failed paired opening with confirmed no executions, not a successful trading cycle.
