@@ -9,3 +9,5 @@ Acceptance: deterministic all-four-combinations execution tests, adverse persist
 ## Result
 
 Candidate `99b35ab40b300280d4f4fe89d08b8e70e06b4d19` accepted after self-review and 281 affected checks. Final clean isolated Python 3.11.5 full suite: 4873 passed, 3 existing optional Extended dependency skips, exit 0, 141.08 seconds. Four first-account/side combinations tested through full paired execution and closure; persistence and admission failures block access. Original 42 evidence hashes preserved. Integrate exact tested implementation and refresh the idle controller without synthetic trading commands.
+
+Integrated and published; idle controller refreshed to PID 78410. Process, exclusive lock and Telegram HTTPS connection verified, startup log empty. No test trades or synthetic commands. Controller remains under operator command ownership; assignment complete.
