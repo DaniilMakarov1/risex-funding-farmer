@@ -326,6 +326,10 @@ def _copy_json(value: Any) -> Any:
 def _bounded_json(value: Any, *, key: str | None = None, depth: int = 0, truncated: list[bool] | None = None) -> Any:
     """Sanitize and project JSON values to bounded, factual report detail."""
 
+    # Check field policy without recursively sanitizing a subtree that this
+    # bounded projection will visit itself (or omit entirely).
+    if key is not None and sanitize(None, key=key) is not None:
+        return "[REDACTED]"
     if depth > 16:
         if truncated is not None:
             truncated.append(True)
@@ -338,18 +342,18 @@ def _bounded_json(value: Any, *, key: str | None = None, depth: int = 0, truncat
                 continue
             if item_key not in _PROJECTED_KEYS:
                 continue
-            result[item_key] = _bounded_json(sanitize(item, key=item_key), key=item_key, depth=depth + 1, truncated=truncated)
+            result[item_key] = _bounded_json(item, key=item_key, depth=depth + 1, truncated=truncated)
         return result
     if isinstance(value, (list, tuple)):
         items = list(value)
-        result = [_bounded_json(sanitize(item), depth=depth + 1, truncated=truncated) for item in items[:MAX_PROJECTED_LIST_ITEMS]]
+        result = [_bounded_json(item, depth=depth + 1, truncated=truncated) for item in items[:MAX_PROJECTED_LIST_ITEMS]]
         if len(items) > MAX_PROJECTED_LIST_ITEMS:
             if truncated is not None:
                 truncated.append(True)
             result.append(f"[DETAIL_ITEMS_OMITTED:{len(items) - MAX_PROJECTED_LIST_ITEMS}]")
         return result
     if isinstance(value, str):
-        safe = sanitize(value, key=key)
+        safe = sanitize(value)
         if not isinstance(safe, str):
             return safe
         if len(safe) > MAX_PROJECTED_STRING and truncated is not None:
