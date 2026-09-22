@@ -133,7 +133,8 @@ def test_idle_report_includes_new_local_cycle_without_changing_controller_barrie
     assert 'cycle-001' in c.summary()
     assert c.store.data == before
     c.store.data['active'] = {'before':[], 'update_id':1}
-    assert 'cycle-001' not in c.summary()  # Cannot hide blocked intent behind a newer local result.
+    assert 'cycle-001' in c.summary()  # New observations do not resolve an older unknown intent.
+    assert 'заблокированы' in c.summary()
     assert c.store.data['active'] is not None
 
 

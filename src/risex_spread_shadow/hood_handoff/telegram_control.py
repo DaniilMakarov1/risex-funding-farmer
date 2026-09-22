@@ -180,7 +180,7 @@ class Controller:
         last = self.store.data['last']
         # Read-only display also includes completed terminal-launched cycles.
         # This never clears the controller's durable active/restart barrier.
-        if not blocked and (not last or last.get('status') != 'NOT_LAUNCHED'):
+        if not last or last.get('status') != 'NOT_LAUNCHED':
             slots = self.slots()
             if slots:
                 last = {'cycle': slots[-1]}
