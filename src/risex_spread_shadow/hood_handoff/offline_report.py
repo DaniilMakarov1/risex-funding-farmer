@@ -735,6 +735,11 @@ def _intent_actions(files: Sequence[_FileData]) -> list[dict[str, Any]]:
                 if leg is None:
                     continue
                 payload = record.payload
+                if leg in {"source", "receiver"} and (
+                    not isinstance(payload.get("plan"), Mapping) or not payload["plan"]
+                ):
+                    data.issue("INVALID_EVIDENCE_TYPE", "dispatch intent requires a non-empty order plan object",
+                               line=record.get("line"), event=event)
                 action = {
                     "phase": data.kind if data.kind in {"opening", "closing"} else "fallback",
                     "attempt": _attempt_from(payload),
@@ -1022,9 +1027,19 @@ def _execution_evidence(
                         continue
                     append_execution(data, record, leg, value, plan.get(leg, {}), _attempt_from(record.payload, receipt.get("attempt_index")))
         elif data.kind == "cycle":
-            evidence = [r for r in data.records if r.event == "FALLBACK_ATTEMPT_EVIDENCE"]
+            fallback_records = []
+            for record in data.records:
+                if record.event not in {"FALLBACK_ATTEMPT_EVIDENCE", "FALLBACK_RECONCILED"}:
+                    continue
+                account = record.payload.get("account_index")
+                if isinstance(account, bool) or not isinstance(account, int) or account < 0:
+                    issues.append(_issue("INVALID_EVIDENCE_TYPE", "fallback evidence requires a non-negative integer account index",
+                                         data=data, record=record, phase="fallback"))
+                    continue
+                fallback_records.append(record)
+            evidence = [r for r in fallback_records if r.event == "FALLBACK_ATTEMPT_EVIDENCE"]
             keys = {(_attempt_from(r.payload), r.payload.get("account_index")) for r in evidence}
-            evidence.extend(r for r in data.records if r.event == "FALLBACK_RECONCILED" and (_attempt_from(r.payload), r.payload.get("account_index")) not in keys)
+            evidence.extend(r for r in fallback_records if r.event == "FALLBACK_RECONCILED" and (_attempt_from(r.payload), r.payload.get("account_index")) not in keys)
             for record in evidence:
                 append_execution(data, record, "fallback", record.payload, record.payload.get("plan", {}), _attempt_from(record.payload))
     by_trade: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
@@ -1343,12 +1358,14 @@ def _latency_reports(
         source_dispatch_unknown = _first_record(data, "SOURCE_DISPATCH_UNKNOWN") is not None
         receiver_dispatch_unknown = _first_record(data, "RECEIVER_DISPATCH_UNKNOWN") is not None
         guard = _first_record(data, "PRE_RECEIVER_GUARD")
+        source_plan = source_intent.payload.get("plan") if source_intent else None
+        receiver_plan = receiver_intent.payload.get("plan") if receiver_intent else None
         source_observed = next(
-            (record for record in data.records if record.event == "ORDER_OBSERVED" and record.payload.get("account_index") == (source_intent.payload.get("plan", {}).get("account_index") if source_intent else None)),
+            (record for record in data.records if record.event == "ORDER_OBSERVED" and isinstance(source_plan, Mapping) and record.payload.get("account_index") == source_plan.get("account_index")),
             None,
         )
         receiver_observed = next(
-            (record for record in data.records if record.event == "ORDER_OBSERVED" and receiver_intent is not None and record.payload.get("account_index") == receiver_intent.payload.get("plan", {}).get("account_index")),
+            (record for record in data.records if record.event == "ORDER_OBSERVED" and isinstance(receiver_plan, Mapping) and record.payload.get("account_index") == receiver_plan.get("account_index")),
             None,
         )
         values: dict[str, dict[str, Any]] = {}

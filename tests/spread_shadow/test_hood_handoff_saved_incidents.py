@@ -90,3 +90,27 @@ def test_last_observed_live_order_is_not_hidden_by_incomplete_completion(tmp_pat
     assert all(row["historical_only"] for row in state["unresolved_observed_orders"])
     assert state["unresolved_intents"]
     assert report["inventory"]["status"] == "UNKNOWN"
+
+
+@pytest.mark.parametrize('event,key', [
+    ('FALLBACK_ATTEMPT_EVIDENCE', 'account_index'),
+    ('FALLBACK_RECONCILED', 'account_index'),
+    ('SOURCE_DISPATCH_INTENT', 'plan'),
+    ('RECEIVER_DISPATCH_INTENT', 'plan'),
+])
+@pytest.mark.parametrize('invalid', [[], {}, None])
+def test_malformed_incident_identity_returns_incomplete_report(tmp_path, event, key, invalid):
+    fixture = restore(tmp_path, '004')
+    name = 'cycle.jsonl' if event.startswith('FALLBACK') else 'opening.jsonl'
+    rows = fixture['journals'][name]
+    row = next(r for r in rows if r['event'] == event)
+    row['payload'][key] = invalid
+    (tmp_path / name).write_text(''.join(json.dumps(r) + '\n' for r in rows))
+    before = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
+    report = load_saved_cycle_report(tmp_path)
+    assert report['status'] == 'INCOMPLETE'
+    assert report['inventory']['status'] == 'UNKNOWN'
+    assert report['paired_execution']['status'] != 'SUCCESS'
+    assert any(i['code'] == 'INVALID_EVIDENCE_TYPE' for i in report['issues'])
+    assert report['dispatched_actions']
+    assert before == {p.name: p.read_bytes() for p in tmp_path.iterdir()}
