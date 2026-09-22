@@ -30,6 +30,7 @@ from .local_attempt import (
     format_local_attempt_result,
     run_local_attempt,
 )
+from .offline_report import format_report, report_saved_paths
 from .random_cycle import (
     MAX_PREPARATION_ATTEMPTS,
     RandomCycleConfig,
@@ -92,8 +93,35 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "run",
         nargs="?",
-        choices=("run", "readiness", "local-attempt", "random-cycle", "simple"),
+        choices=("run", "readiness", "local-attempt", "random-cycle", "simple", "report", "offline-report"),
         help="run the configured utility or the explicit read-only readiness check",
+    )
+    parser.add_argument(
+        "report_inputs",
+        nargs="*",
+        help="offline report cycle directory or cycle.jsonl (report/offline-report only)",
+    )
+    parser.add_argument(
+        "--path",
+        "--report-path",
+        "--cycle-dir",
+        dest="report_paths",
+        action="append",
+        type=Path,
+        help="saved cycle directory or cycle.jsonl for the offline report; repeat for separate reports",
+    )
+    parser.add_argument(
+        "--format",
+        dest="report_format",
+        choices=("human", "json", "both"),
+        default="human",
+        help="offline report output format",
+    )
+    parser.add_argument(
+        "--json",
+        dest="report_json",
+        action="store_true",
+        help="emit only machine-readable offline report JSON",
     )
     parser.add_argument("--config", type=Path, help="JSON operator configuration; all numerical bounds are required")
     parser.add_argument("--market-evidence", type=Path, help="JSON current orderBookDetails/fee/margin evidence")
@@ -1574,6 +1602,37 @@ async def _run_random_cycle(args: argparse.Namespace, value: Mapping[str, Any]) 
     return 0 if result.outcome.value in {"SUCCESS", "PARTIAL", "PREVIEW"} else 2
 
 
+async def _run_offline_report(args: argparse.Namespace) -> int:
+    """Read saved cycle journals without constructing a client or touching a network."""
+
+    requested: list[Path] = list(args.report_paths or [])
+    requested.extend(Path(item) for item in (args.report_inputs or []))
+    if not requested:
+        raise SystemExit("report requires a cycle directory or cycle.jsonl via --path or a positional path")
+    if args.execute or args.keychain or args.keychain_replace or args.keychain_remove:
+        raise SystemExit("report is offline-only and cannot use execution or Keychain flags")
+    reports = report_saved_paths(requested)
+    output_format = "json" if args.report_json else args.report_format
+    if len(reports) == 1:
+        value: Mapping[str, Any] = reports[0]
+    else:
+        value = {
+            "schema": "hcr-27-offline-cycle-report-batch-v1",
+            "status": "COMPLETE" if all(item.get("status") == "COMPLETE" for item in reports) else "INCOMPLETE",
+            "reports": reports,
+        }
+    if len(reports) > 1 and output_format in {"human", "both"}:
+        print("\n\n".join(format_report(item, output_format="human") for item in reports))
+        if output_format == "both":
+            print(format_report(value, output_format="json"))
+    else:
+        print(format_report(value, output_format=output_format))
+    # The report itself carries the incomplete/unknown state.  A diagnostic
+    # reader remains composable in shell pipelines even when evidence is
+    # partial; it never converts that state into a successful result.
+    return 0
+
+
 async def _run_readiness(args: argparse.Namespace) -> int:
     # Reject every execution/configuration flag before config parsing, client
     # creation, SDK import, or hidden key input.  Readiness is a distinct path.
@@ -1648,6 +1707,8 @@ async def _run_readiness(args: argparse.Namespace) -> int:
 
 
 async def _run(args: argparse.Namespace) -> int:
+    if args.run in {"report", "offline-report"}:
+        return await _run_offline_report(args)
     if args.run == "simple":
         return await _run_simple(args)
     if args.run == "local-attempt":

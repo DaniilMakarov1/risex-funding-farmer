@@ -333,6 +333,10 @@ async def test_rechecks_finish_before_exact_source_lookup_and_receiver_dispatch(
 
     assert result.outcome is Outcome.SUCCESS
     assert client.max_active_reads == 2
+    assert result.latency is not None
+    assert result.latency["receiver_dispatch_ack_at"] >= 0
+    assert result.latency["receiver_fill_observed_at"] >= 0
+    assert result.latency["receiver_visibility_seconds"] >= 0
     labels = [label for label, _ in client.events]
     end_indexes = [index for index, label in enumerate(labels) if label.startswith("read-end-")]
     final_lookup_index = labels.index("final-source-lookup")

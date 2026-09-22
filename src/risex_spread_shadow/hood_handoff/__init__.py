@@ -148,6 +148,17 @@ from .local_attempt import (
     run_local_attempt,
     select_automatic_prices,
 )
+from .offline_report import (
+    REPORT_BATCH_SCHEMA,
+    REPORT_SCHEMA,
+    OfflineReportError,
+    build_cycle_report,
+    format_report,
+    load_saved_cycle_report,
+    render_human,
+    report_saved_cycle,
+    report_saved_paths,
+)
 
 __all__ = [
     "AccountMarginEvidence",
@@ -291,4 +302,13 @@ __all__ = [
     "preview_payload",
     "run_local_attempt",
     "select_automatic_prices",
+    "REPORT_BATCH_SCHEMA",
+    "REPORT_SCHEMA",
+    "OfflineReportError",
+    "build_cycle_report",
+    "format_report",
+    "load_saved_cycle_report",
+    "render_human",
+    "report_saved_cycle",
+    "report_saved_paths",
 ]

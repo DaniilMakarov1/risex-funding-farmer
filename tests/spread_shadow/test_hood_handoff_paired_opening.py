@@ -798,6 +798,10 @@ async def test_prepared_pair_overlaps_independent_work_and_records_source_quote_
     assert result.latency["quote_age_to_source_dispatch_seconds"] == pytest.approx(0.25)
     assert result.latency["source_to_receiver_intent_seconds"] >= 0
     assert result.latency["source_ack_to_receiver_intent_seconds"] >= 0
+    assert result.latency["receiver_admission_seconds"] >= 0
+    assert result.latency["receiver_dispatch_ack_at"] >= result.latency["receiver_dispatch_intent_at"]
+    assert result.latency["receiver_fill_observed_at"] >= 0
+    assert result.latency["receiver_visibility_seconds"] >= 0
 
 
 @pytest.mark.asyncio

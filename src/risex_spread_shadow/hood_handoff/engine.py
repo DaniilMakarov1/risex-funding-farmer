@@ -1244,6 +1244,13 @@ class HandoffEngine:
                     0.0, time.perf_counter() - pre_receiver_started
                 )
                 if paired_mode and not guard_event_recorded:
+                    guard_finished_at = self.clock.now()
+                    if guard_request_started_at is not None:
+                        latency["receiver_admission_seconds"] = max(
+                            0.0,
+                            guard_finished_at - guard_request_started_at,
+                        )
+                        latency["receiver_admission_at"] = guard_finished_at
                     if priority_guard is None:
                         if public_book is not None and source_order_id is not None:
                             try:
@@ -1503,6 +1510,10 @@ class HandoffEngine:
                 )
             )
             latency["receiver_submit_ack_seconds"] = max(0.0, time.perf_counter() - receiver_submit_started)
+            # Persist the wall-clock response boundary separately from the
+            # monotonic duration so an offline report can distinguish an ack
+            # from later order visibility.
+            latency["receiver_dispatch_ack_at"] = self.clock.now()
             journal.append(
                 "RECEIVER_DISPATCH_RESULT",
                 {
@@ -1518,6 +1529,7 @@ class HandoffEngine:
         except Exception as exc:
             if "receiver_submit_started" in locals():
                 latency["receiver_submit_ack_seconds"] = max(0.0, time.perf_counter() - receiver_submit_started)
+            latency["receiver_dispatch_outcome_at"] = self.clock.now()
             unknown_reasons.append(f"receiver dispatch outcome unknown: {sanitize_exception(exc)}")
             journal.append(
                 "RECEIVER_DISPATCH_UNKNOWN",
@@ -1537,6 +1549,10 @@ class HandoffEngine:
             latency["receiver_fill_observation_seconds"] = max(
                 0.0, time.perf_counter() - receiver_visibility_started
             )
+            latency["receiver_fill_observed_at"] = (
+                receiver_order.observed_at if receiver_order is not None else self.clock.now()
+            )
+            latency["receiver_visibility_seconds"] = latency["receiver_fill_observation_seconds"]
             if receiver_order is None:
                 unknown_reasons.append("receiver order identity or terminal status is unresolved")
             elif not self._order_matches(receiver_order, plan.receiver):
