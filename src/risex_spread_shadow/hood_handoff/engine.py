@@ -329,10 +329,29 @@ def _prepared_timing_values(prepared: Any, leg: str) -> dict[str, float]:
         return {}
     return {
         f"{leg}_{name}": float(value)
-        for name in ("preparation_lock_wait_seconds", "nonce_acquisition_seconds", "signing_call_seconds", "transport_roundtrip_seconds")
+        for name in ("preparation_lock_wait_seconds", "nonce_acquisition_seconds", "signing_call_seconds", "transport_roundtrip_seconds", "nonce_reserved_before_quote")
         if isinstance((value := values.get(name)), (int, float))
         and not isinstance(value, bool) and math.isfinite(value) and value >= 0
     }
+
+
+@dataclass(slots=True, repr=False)
+class HandoffPreflightContext:
+    """One child plan's original observations, carried across the final quote."""
+
+    config: HandoffConfig
+    metadata: MarketMetadata
+    source: AccountSnapshot
+    receiver: AccountSnapshot
+    reserved_nonces: Mapping[int, Any]
+    nonce_deadline: float | None = None
+    used: bool = False
+
+    def claim(self, config: HandoffConfig) -> tuple[MarketMetadata, AccountSnapshot, AccountSnapshot]:
+        if self.used or config != self.config:
+            raise PreflightBlocked("prepared preflight context is consumed or bound to another plan")
+        self.used = True
+        return self.metadata, self.source, self.receiver
 
 
 class HandoffEngine:
@@ -353,6 +372,8 @@ class HandoffEngine:
         self._visibility_source_baseline: AccountSnapshot | None = None
         self._visibility_receiver_baseline: AccountSnapshot | None = None
         self._visibility_requires_incremental_margin = False
+        self._preflight_context: HandoffPreflightContext | None = None
+        self._source_dispatch_monotonic: float | None = None
 
     async def _read_public_book(
         self,
@@ -729,6 +750,8 @@ class HandoffEngine:
             journal.release_attempt()
 
     async def _execute_locked(self, config: HandoffConfig, journal: DurableJournal) -> HandoffResult:
+        self._source_dispatch_monotonic = None
+        self._preflight_context = None
         self._configured_poll_limit = config.max_poll_count
         self._configured_poll_interval = config.poll_interval_seconds
         self._configured_order_timeout = config.order_timeout_seconds
@@ -771,7 +794,9 @@ class HandoffEngine:
                 unknown_reasons=(reason,),
                 operation_mode=config.operation_mode,
             )
-        journal.append("ATTEMPT_STARTED", {"run_id": run_id, "binding": binding})
+        from .provenance import capture_provenance
+        journal.append("ATTEMPT_STARTED", {"run_id": run_id, "binding": binding,
+                                            "runtime_provenance": capture_provenance(binding)})
         try:
             plan, source, receiver = await self._preflight(config, journal, run_id)
         except Exception as exc:
@@ -904,11 +929,14 @@ class HandoffEngine:
                 )
         latency.update(_prepared_timing_values(prepared_source, "source"))
         latency.update(_prepared_timing_values(prepared_receiver, "receiver"))
+        if config.max_quote_age_seconds is not None and self.clock.now() - config.source_quote_observed_at > config.max_quote_age_seconds:
+            unknown_reasons.append("source quote latency budget expired before dispatch")
         try:
             if not unknown_reasons:
                 source_dispatch_attempted = True
                 source_submit_started = time.perf_counter()
                 source_dispatch_intent_at = self.clock.now()
+                self._source_dispatch_monotonic = time.monotonic()
                 latency["source_dispatch_intent_at"] = source_dispatch_intent_at
                 if config.source_quote_observed_at is not None:
                     quote_age = max(
@@ -1095,6 +1123,13 @@ class HandoffEngine:
                 source_order_id = source_order.order_id
                 source_order = await self._lookup_order(plan.source, source_order.order_id)
                 decision_now = self.clock.now()
+                if source_dispatch_intent_at is not None:
+                    latency["source_to_admission_seconds"] = max(0.0, decision_now - source_dispatch_intent_at)
+                if config.max_source_to_receiver_seconds is not None and self._source_dispatch_monotonic is not None and (
+                    time.monotonic() - self._source_dispatch_monotonic > config.max_source_to_receiver_seconds
+                    or decision_now - source_dispatch_intent_at > config.max_source_to_receiver_seconds
+                ):
+                    unknown_reasons.append("source-to-receiver latency budget expired before dispatch")
                 if paired_mode and public_book is not None and not self._time_fresh(
                     public_book["observed_at"], decision_now, config.freshness_seconds
                 ):
@@ -1707,7 +1742,9 @@ class HandoffEngine:
         method = getattr(self.client, "prepare_order", None)
         if not callable(method):
             raise ContractError("prepared dispatch client lacks order preparation")
-        return await self._bounded(method(plan), "order preparation")
+        token = None if self._preflight_context is None else self._preflight_context.reserved_nonces.get(plan.account_index)
+        operation = method(plan) if token is None else method(plan, reserved_nonce=token)
+        return await self._bounded(operation, "order preparation")
 
     async def _prepare_pair(
         self,
@@ -1850,25 +1887,39 @@ class HandoffEngine:
         # complete validation below.  If one read fails, drain every sibling
         # before returning so no account task remains live across the mutation
         # boundary.
-        tasks = [
-            asyncio.create_task(read_metadata()),
-            asyncio.create_task(read_account(source_account_index, "source account read")),
-            asyncio.create_task(read_account(receiver_account_index, "receiver account read")),
-        ]
-        try:
-            metadata, source, receiver = await asyncio.gather(*tasks)
-        except BaseException:
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            raise
+        context = getattr(self.client, "handoff_preflight_context", None)
+        if context is not None:
+            if not isinstance(context, HandoffPreflightContext):
+                raise PreflightBlocked("prepared preflight context has an unsupported type")
+            metadata, source, receiver = context.claim(config)
+            self._preflight_context = context
+            if source.account_index != source_account_index or receiver.account_index != receiver_account_index:
+                raise PreflightBlocked("prepared preflight accounts do not match the execution client")
+        else:
+            tasks = [
+                asyncio.create_task(read_metadata()),
+                asyncio.create_task(read_account(source_account_index, "source account read")),
+                asyncio.create_task(read_account(receiver_account_index, "receiver account read")),
+            ]
+            try:
+                metadata, source, receiver = await asyncio.gather(*tasks)
+            except BaseException:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
         now = self.clock.now()
         # The client must expose account identities explicitly; this prevents a
         # fallback to one shared account or a hidden account discovery call.
         if source.account_index == receiver.account_index:
             raise PreflightBlocked("source and receiver accounts must differ")
         config.validate_against(metadata, source, receiver, now)
+        if config.operation_mode in {OperationMode.PAIRED_OPENING, OperationMode.PAIRED_CLOSING} and (
+            (config.direction.source_side == "BUY" and config.receiver_worst_price > config.source_limit_price)
+            or (config.direction.source_side == "SELL" and config.receiver_worst_price < config.source_limit_price)
+        ):
+            raise PreflightBlocked("receiver price bound cannot execute the source limit")
         quantity_int, source_price_int, receiver_price_int = config.integer_order_values(metadata)
         expiry_ms = int(now * 1000) + config.source_order_lifetime_seconds * 1000
         if expiry_ms <= int(now * 1000):
@@ -1931,6 +1982,9 @@ class HandoffEngine:
                 "receiver_identity": receiver.source_identity,
                 "source_position": str(source.signed_position),
                 "receiver_position": str(receiver.signed_position),
+                "context_reused_before_quote": context is not None,
+                "source_observed_at": source.observed_at,
+                "receiver_observed_at": receiver.observed_at,
                 "binding": _config_binding(config, self.client),
             },
             run_id=run_id,
@@ -2962,6 +3016,13 @@ class HandoffEngine:
         economic_status, economic_findings = _economic_findings(source, receiver)
         findings = tuple(dict.fromkeys((*joint_reasons, *economic_findings)))
         outcome = forced_outcome or self._classify(plan, source, receiver, unknown_reasons)
+        mutual_failure = bool(
+            outcome is Outcome.SUCCESS
+            and plan.operation_mode in {OperationMode.PAIRED_OPENING, OperationMode.PAIRED_CLOSING}
+            and (joint_status != "MATCHED" or joint_quantity != plan.quantity)
+        )
+        if mutual_failure:
+            outcome = Outcome.PARTIAL
         phase = Phase.COMPLETE
         reason = (
             None
@@ -2972,6 +3033,8 @@ class HandoffEngine:
                 else (economic_findings[0] if economic_findings else "one-attempt handoff did not prove full completion")
             )
         )
+        if mutual_failure:
+            reason = "full own-account execution was not proven: " + joint_reasons[0]
         result = HandoffResult(
             outcome=outcome,
             phase=phase,
@@ -3376,6 +3439,13 @@ class HandoffEngine:
             freshness_seconds=config.freshness_seconds,
             request_timeout_seconds=config.request_timeout_seconds,
         )
+        if self._preflight_context is not None and self._preflight_context.nonce_deadline is not None:
+            deadline = min(deadline, self._preflight_context.nonce_deadline)
+        if plan.order_type == "LIMIT" and config.max_quote_age_seconds is not None:
+            remaining = config.max_quote_age_seconds - (now - config.source_quote_observed_at)
+            deadline = min(deadline, time.monotonic() + max(0.0, remaining))
+        if plan.order_type == "MARKET" and config.max_source_to_receiver_seconds is not None and self._source_dispatch_monotonic is not None:
+            deadline = min(deadline, self._source_dispatch_monotonic + config.max_source_to_receiver_seconds)
         return replace(plan, mutation_deadline_monotonic=deadline)
 
     async def _sleep(self, seconds: float) -> None:
@@ -3446,7 +3516,7 @@ def _joint_trade_match(
     receiver: LegReconciliation,
     expected_quantity: Decimal,
 ) -> tuple[str, Decimal, tuple[str, ...]]:
-    """Report optional direct pairing without gating independently proven exposure."""
+    """Prove reciprocal trade/order identities without reusing any quantity."""
 
     if not source.trades or not receiver.trades:
         return "UNKNOWN", Decimal(0), ("joint trade matching is UNKNOWN because one leg has no trade receipt",)
@@ -3455,6 +3525,14 @@ def _joint_trade_match(
         for trade in (*source.trades, *receiver.trades)
     ):
         return "UNKNOWN", Decimal(0), ("joint trade matching is UNKNOWN because a counterparty account is missing",)
+    if any(
+        trade.counterparty_order_id is None
+        for leg, peer in ((source, receiver), (receiver, source))
+        for trade in leg.trades if trade.counterparty_account_index == peer.account_index
+    ):
+        return "UNKNOWN", Decimal(0), ("joint trade matching is UNKNOWN because a reciprocal order identity is missing",)
+    if any(len({t.trade_id for t in leg.trades}) != len(leg.trades) for leg in (source, receiver)):
+        return "CONFLICTING", Decimal(0), ("joint trade matching is CONFLICTING: duplicate trade identities",)
 
     used_receiver: set[int] = set()
     matched = Decimal(0)
@@ -3475,11 +3553,9 @@ def _joint_trade_match(
         compatible: list[tuple[int, TradeReceipt]] = []
         for index, receiver_trade in candidates:
             order_ids_compatible = (
-                source_trade.counterparty_order_id is None
-                or source_trade.counterparty_order_id == receiver_trade.order_id
+                source_trade.counterparty_order_id == receiver_trade.order_id
             ) and (
-                receiver_trade.counterparty_order_id is None
-                or receiver_trade.counterparty_order_id == source_trade.order_id
+                receiver_trade.counterparty_order_id == source_trade.order_id
             )
             client_ids_compatible = (
                 source_trade.counterparty_client_order_index is None
@@ -3517,7 +3593,7 @@ def _joint_trade_match(
 
     if conflicts and matched > 0:
         status = "CONFLICTING"
-    elif matched >= expected_quantity:
+    elif matched == expected_quantity:
         status = "MATCHED"
     elif matched > 0:
         status = "PARTIAL"
@@ -3639,6 +3715,8 @@ def _config_binding(config: HandoffConfig, client: HandoffClient) -> dict[str, A
         "client_order_prefix": config.client_order_prefix,
         "source_order_lifetime_seconds": config.source_order_lifetime_seconds,
         "source_quote_observed_at": config.source_quote_observed_at,
+        **{name: getattr(config, name) for name in ("max_quote_age_seconds", "max_source_to_receiver_seconds")
+           if getattr(config, name) is not None},
         "auth_token_lifetime_seconds": config.auth_token_lifetime_seconds,
         "sdk_version": getattr(client, "sdk_version", None),
         "implementation_fingerprint": _implementation_fingerprint(),

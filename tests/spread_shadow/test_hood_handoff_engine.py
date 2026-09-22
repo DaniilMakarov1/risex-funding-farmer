@@ -199,10 +199,10 @@ class FakeClient:
     async def list_trades(self, account_index, market_id, *, order_id=None, cursor=None, limit=100):
         if self.source_fills and order_id == "source-1" and account_index == self.source_account_index:
             return HistoryPage(
-                trades=(TradeReceipt("t-source", account_index, 7, "source-1", self.source_order.side, Decimal("0.125"), self.source_order.price, Decimal("0.0125"), self.receiver_account_index, NOW),),
+                trades=(TradeReceipt("t-source", account_index, 7, "source-1", self.source_order.side, Decimal("0.125"), self.source_order.price, Decimal("0.0125"), self.receiver_account_index, NOW, counterparty_order_id="receiver-1"),),
             )
         if self.source_fills and order_id == "receiver-1" and account_index == self.receiver_account_index:
-            trades = [TradeReceipt("t-receiver", account_index, 7, "receiver-1", self.receiver_order.side, Decimal("0.125"), self.receiver_order.price, Decimal("0.0126"), self.source_account_index, NOW)]
+            trades = [TradeReceipt("t-receiver", account_index, 7, "receiver-1", self.receiver_order.side, Decimal("0.125"), self.receiver_order.price, Decimal("0.0126"), self.source_account_index, NOW, counterparty_order_id="source-1")]
             if self.foreign_receipt:
                 trades.append(TradeReceipt("t-foreign", 999, 7, "receiver-1", "BUY", Decimal("0.125"), self.receiver_order.price, Decimal("0.0126"), None, NOW))
             return HistoryPage(trades=tuple(reversed(trades)))

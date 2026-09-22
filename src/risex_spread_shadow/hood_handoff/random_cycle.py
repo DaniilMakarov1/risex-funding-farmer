@@ -47,6 +47,7 @@ from .contracts import (
 from .engine import (
     Clock,
     HandoffClient,
+    HandoffPreflightContext,
     SystemClock,
     _as_order,
     _as_page,
@@ -54,6 +55,7 @@ from .engine import (
     run_handoff,
 )
 from .journal import DurableJournal, sanitize_exception
+from .provenance import capture_provenance
 from .local_attempt import select_automatic_prices
 from .series import OrderBookSnapshot
 
@@ -297,6 +299,8 @@ class RandomCycleConfig:
     operator_execution_opt_in: bool = False
     operator_plan_reviewed: bool = False
     defer_incremental_margin_calculation: bool = False
+    max_quote_age_seconds: float | None = None
+    max_source_to_receiver_seconds: float | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "market_id", _int(self.market_id, "market_id"))
@@ -336,6 +340,13 @@ class RandomCycleConfig:
         ):
             object.__setattr__(self, name, _finite_time(getattr(self, name), name))
         object.__setattr__(self, "max_poll_count", _int(self.max_poll_count, "max_poll_count", minimum=1))
+        for name in ("max_quote_age_seconds", "max_source_to_receiver_seconds"):
+            value = getattr(self, name)
+            if value is not None:
+                value = _finite_time(value, name)
+                if value > self.freshness_seconds:
+                    raise ContractError(f"{name} must not exceed freshness_seconds")
+                object.__setattr__(self, name, value)
         object.__setattr__(
             self,
             "source_order_lifetime_seconds",
@@ -415,6 +426,8 @@ class RandomCycleConfig:
             "max_poll_count": self.max_poll_count,
             "source_order_lifetime_seconds": self.source_order_lifetime_seconds,
             "defer_incremental_margin_calculation": self.defer_incremental_margin_calculation,
+            **{name: getattr(self, name) for name in ("max_quote_age_seconds", "max_source_to_receiver_seconds")
+               if getattr(self, name) is not None},
         }
 
 
@@ -722,10 +735,9 @@ def _coerce_cycle_account(
 class _BoundMarketClient:
     """Keep pre-mutation metadata and account identities across a child run.
 
-    ``run_handoff`` performs its own preflight and account rechecks.  A random
-    cycle close has already established the opening account identities before
-    entering that child, so a later account snapshot must be checked against
-    those identities instead of becoming a new binding.
+    ``run_handoff`` validates the one-use pre-quote context, then rechecks
+    accounts before receiver admission. A later snapshot must match the
+    established identities instead of becoming a new binding.
     """
 
     def __init__(
@@ -736,12 +748,14 @@ class _BoundMarketClient:
         source_identity: str | None = None,
         receiver_identity: str | None = None,
         identity_failure_callback: Callable[[str], None] | None = None,
+        preflight_context: HandoffPreflightContext | None = None,
     ) -> None:
         self._delegate = delegate
         self._metadata = metadata
         self._source_identity = source_identity
         self._receiver_identity = receiver_identity
         self._identity_failure_callback = identity_failure_callback
+        self.handoff_preflight_context = preflight_context
         self.source_account_index = delegate.source_account_index
         self.receiver_account_index = delegate.receiver_account_index
         self.sdk_version = getattr(delegate, "sdk_version", None)
@@ -1733,6 +1747,9 @@ def _cycle_classifications(
     else:
         paired_execution = "UNKNOWN"
 
+    if paired_execution == "SUCCESS" and not all(phase.mutual_execution_proven for phase in phases):
+        paired_execution = "FAILED" if any(phase.joint_match_status in {"KNOWN_ZERO", "PARTIAL", "CONFLICTING"} for phase in phases) else "UNKNOWN"
+
     if not phases or any(phase.economic_status == "UNKNOWN" for phase in phases):
         economics = "UNKNOWN"
     elif any(item.economic_status == "UNKNOWN" for item in fallbacks):
@@ -1852,6 +1869,59 @@ class RandomCycleEngine:
         self._identity_barrier: str | None = None
         self._selection: RandomCycleSelection | None = None
         self._last_account_observations: dict[int, AccountSnapshot] = {}
+        self._pending_nonces: dict[int, Any] = {}
+        self._nonce_deadline: float | None = None
+
+    async def _release_preflight_nonces(self) -> None:
+        tokens = tuple(self._pending_nonces.values())
+        self._pending_nonces.clear()
+        self._nonce_deadline = None
+        invalidate = getattr(self.client, "invalidate_reserved_nonce", None)
+        if tokens and callable(invalidate):
+            await asyncio.gather(*(invalidate(token) for token in tokens))
+
+    async def _reserve_preflight_nonces(self, config: RandomCycleConfig) -> None:
+        reserve = getattr(self.client, "reserve_order_nonce", None)
+        if not callable(reserve) or not callable(getattr(self.client, "invalidate_reserved_nonce", None)):
+            return
+        # Reservation spans preparation and admission; each individual read
+        # still has its own request timeout. Do not turn that per-request
+        # timeout into a shorter, shared budget for the entire pair.
+        deadline = time.monotonic() + config.freshness_seconds
+        self._nonce_deadline = deadline
+
+        async def read(index: int) -> None:
+            self._pending_nonces[index] = await self._bounded(
+                reserve(index, deadline=deadline), config, "pre-quote nonce reservation")
+
+        tasks = [asyncio.create_task(read(index)) for index in
+                 (config.source_account_index, config.receiver_account_index)]
+        try:
+            await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await self._release_preflight_nonces()
+            raise
+
+    async def _run_prepared_handoff(
+        self, config: HandoffConfig, metadata: MarketMetadata,
+        source: AccountSnapshot, receiver: AccountSnapshot,
+    ) -> HandoffResult:
+        context = HandoffPreflightContext(config, metadata, source, receiver,
+                                           dict(self._pending_nonces), self._nonce_deadline)
+        client = _BoundMarketClient(
+            self.client, metadata, source_identity=source.source_identity,
+            receiver_identity=receiver.source_identity,
+            identity_failure_callback=self._mark_identity_failure,
+            preflight_context=context,
+        )
+        try:
+            return await run_handoff(config, client, clock=self.clock)
+        finally:
+            await self._release_preflight_nonces()
 
     def _mark_identity_failure(self, reason: str) -> None:
         """Keep the first identity mismatch as a cycle-wide dependency barrier."""
@@ -1890,7 +1960,8 @@ class RandomCycleEngine:
                     reason="cycle directory is already consumed; no mutation was replayed",
                     journal_path=str(config.journal_path),
                 )
-            journal.append("CYCLE_STARTED", {"binding": config.binding()})
+            journal.append("CYCLE_STARTED", {"binding": config.binding(),
+                                             "runtime_provenance": capture_provenance(config.binding())})
             return await self._execute_locked(config, journal)
         except asyncio.CancelledError:
             if journal is not None:
@@ -1921,6 +1992,7 @@ class RandomCycleEngine:
                 journal_path=str(config.journal_path),
             )
         finally:
+            await self._release_preflight_nonces()
             if journal is not None:
                 journal.release_attempt()
 
@@ -2093,17 +2165,7 @@ class RandomCycleEngine:
                 },
             )
             self._stage = "OPENING"
-            opening = await run_handoff(
-                opening_config,
-                _BoundMarketClient(
-                    self.client,
-                    metadata,
-                    source_identity=source.source_identity,
-                    receiver_identity=receiver.source_identity,
-                    identity_failure_callback=self._mark_identity_failure,
-                ),
-                clock=self.clock,
-            )
+            opening = await self._run_prepared_handoff(opening_config, metadata, source, receiver)
             self._stage = "OPENING_RECONCILED"
             journal.append(
                 "OPENING_COMPLETE",
@@ -2148,7 +2210,7 @@ class RandomCycleEngine:
                 break
             metadata, book, source, receiver, selection = retry_prepared
             self._selection = selection
-        if opening.outcome is not Outcome.SUCCESS:
+        if not opening.mutual_execution_proven:
             fallbacks, remaining_source, remaining_receiver = await self._fallback_residuals(
                 config,
                 journal,
@@ -2236,7 +2298,7 @@ class RandomCycleEngine:
             outcome = Outcome.UNKNOWN
         elif (
             closing is not None
-            and closing.outcome is Outcome.SUCCESS
+            and closing.mutual_execution_proven
             and not fallbacks
             and remaining_source == 0
             and remaining_receiver == 0
@@ -2249,9 +2311,9 @@ class RandomCycleEngine:
             and remaining_source == 0
             and remaining_receiver == 0
         ):
-            outcome = Outcome.SUCCESS
+            outcome = Outcome.PARTIAL
         elif fallbacks and all_fallback_reconciled and remaining_source == 0 and remaining_receiver == 0:
-            outcome = Outcome.SUCCESS
+            outcome = Outcome.PARTIAL
         elif remaining_source is None or remaining_receiver is None:
             outcome = Outcome.UNKNOWN
         elif closing is not None and closing.outcome in {
@@ -2544,17 +2606,20 @@ class RandomCycleEngine:
                 )
             )
 
+        await self._release_preflight_nonces()
         tasks = [
             asyncio.create_task(read_metadata()),
             asyncio.create_task(self._accounts(config)),
+            asyncio.create_task(self._reserve_preflight_nonces(config)),
         ]
         try:
-            metadata, accounts = await asyncio.gather(*tasks)
+            metadata, accounts, _ = await asyncio.gather(*tasks)
         except BaseException:
             for task in tasks:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            await self._release_preflight_nonces()
             raise
         source, receiver = accounts
         return metadata, source, receiver
@@ -2667,6 +2732,8 @@ class RandomCycleEngine:
             expected_source_position=source_position,
             expected_receiver_position=receiver_position,
             source_quote_observed_at=source_quote_observed_at,
+            max_quote_age_seconds=config.max_quote_age_seconds,
+            max_source_to_receiver_seconds=config.max_source_to_receiver_seconds,
             # A reduce-only close does not add exposure.  The existing config
             # gate therefore remains strict for the opening only; carrying the
             # opening deferral flag into a close would be an invalid policy
@@ -2695,7 +2762,7 @@ class RandomCycleEngine:
             # readiness; it is never a new baseline that can adopt a manual
             # or external position change during the hold.
             if (
-                opening.outcome is not Outcome.SUCCESS
+                not opening.mutual_execution_proven
                 or opening.plan is None
                 or opening.source is None
                 or opening.receiver is None
@@ -2823,17 +2890,7 @@ class RandomCycleEngine:
                         "lineage": {"used": budget.used, "limit": budget.limit},
                     },
                 )
-                closing = await run_handoff(
-                    close_config,
-                    _BoundMarketClient(
-                        self.client,
-                        metadata,
-                        source_identity=opening_plan.source_identity,
-                        receiver_identity=opening_plan.receiver_identity,
-                        identity_failure_callback=self._mark_identity_failure,
-                    ),
-                    clock=self.clock,
-                )
+                closing = await self._run_prepared_handoff(close_config, metadata, source, receiver)
                 journal.append(
                     "CLOSING_COMPLETE",
                     {
@@ -2954,7 +3011,7 @@ class RandomCycleEngine:
         source_sign, receiver_sign = _expected_cycle_signs(config.direction)
         source_residual = _position_residual(source.signed_position, source_sign, selection.quantity)
         receiver_residual = _position_residual(receiver.signed_position, receiver_sign, selection.quantity)
-        if closing is None and opening.outcome is Outcome.SUCCESS:
+        if closing is None and opening.mutual_execution_proven:
             # A missing paired-close phase is an external/state failure; never
             # infer a flat cycle from a read that was not causally reconciled.
             if source_residual == 0 and receiver_residual == 0:

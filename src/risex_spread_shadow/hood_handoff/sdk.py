@@ -79,6 +79,22 @@ def _order_plan_binding(plan: OrderPlan) -> tuple[Any, ...]:
     )
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class ReservedNonce:
+    """Client-owned, unsent account/key reservation; never serialized."""
+
+    account_index: int
+    api_key_index: int
+    deadline: float
+    _nonce: int
+    _owner: object
+    _state: str = "RESERVED"
+    diagnostic_timings: dict[str, float] = field(default_factory=dict, repr=False)
+
+    def __repr__(self) -> str:
+        return f"ReservedNonce(account_index={self.account_index}, state={self._state!r})"
+
+
 @dataclass(slots=True, repr=False)
 class PreparedMutation:
     """One in-memory, single-use signed mutation.
@@ -407,7 +423,7 @@ class LighterSdkClient:
         # until the venue executes it.  Keep ownership in this adapter so two
         # prepared legs, a cancel, or a second client cannot claim one nonce.
         self._prepared_owner = object()
-        self._nonce_reservations: dict[tuple[int, int, int], PreparedMutation] = {}
+        self._nonce_reservations: dict[tuple[int, int, int], PreparedMutation | ReservedNonce] = {}
         self._blocked_nonces: dict[tuple[int, int], set[int]] = {}
         self._prepared_registry: dict[int, PreparedMutation] = {}
         self._closed = False
@@ -695,24 +711,28 @@ class LighterSdkClient:
     async def account_snapshot(self, account_index: int, market_id: int) -> AccountSnapshot:
         module = self._lighter()
         api = module.AccountApi(self._generated_api_client(module))
-        raw_account = await self._bounded(
-            _await(
-                api.account(
-                    by="index",
-                    value=str(account_index),
-                    active_only=False,
-                    _request_timeout=self.config.request_timeout_seconds,
-                )
-            ),
-            time.monotonic() + self.config.request_timeout_seconds,
-            "account read",
-        )
+        async def read_account() -> tuple[Any, float]:
+            raw = await self._bounded(
+                _await(api.account(by="index", value=str(account_index), active_only=False,
+                                   _request_timeout=self.config.request_timeout_seconds)),
+                time.monotonic() + self.config.request_timeout_seconds,
+                "account read",
+            )
+            # Capture this response now, never after waiting for active orders.
+            return raw, self._clock()
+
+        tasks = [asyncio.create_task(read_account()),
+                 asyncio.create_task(self._active_orders(account_index, market_id))]
+        try:
+            (raw_account, account_observed_at), active_orders = await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
         raw_account_mapping = _model_dict(raw_account)
         _require_success_code(raw_account_mapping, "account")
-        # Capture the account/balance/position observation at the account
-        # response boundary.  Active-orders is a separate sequential read and
-        # must not renew the age of this state.
-        account_observed_at = self._clock()
         account = _first_mapping(raw_account, "accounts")
         if not {"index", "l1_address", "status", "positions", "available_balance"}.issubset(account):
             raise ContractError("Lighter account response is missing required identity/state fields")
@@ -751,7 +771,6 @@ class LighterSdkClient:
                     raise ContractError("Lighter account response has duplicate selected-market positions")
                 position = candidate_map
         position = position or {"position": "0", "sign": 1}
-        active_orders = await self._active_orders(account_index, market_id)
         available = account.get("available_balance")
         margin_required = account.get("cross_initial_margin_requirement")
         fee_rate_key = "source_fee_rate" if account_index == self.source_account_index else "receiver_fee_rate"
@@ -1136,8 +1155,48 @@ class LighterSdkClient:
             form={"tx_type": tx_type, "tx_info": tx_info},
         )
 
-    async def prepare_order(self, plan: OrderPlan) -> PreparedMutation:
-        """Acquire one nonce and sign one exact order without sending it."""
+    async def reserve_order_nonce(self, account_index: int, *, deadline: float) -> ReservedNonce:
+        """Acquire and reserve before price selection, without signing or sending."""
+
+        key = self.config.api_key_index
+        if key is None or isinstance(account_index, bool) or not isinstance(account_index, int) or account_index not in {self.source_account_index, self.receiver_account_index}:
+            raise ContractError("nonce reservation account/key is not configured")
+        if isinstance(deadline, bool) or not math.isfinite(deadline) or deadline <= time.monotonic():
+            raise ContractError("nonce reservation deadline is invalid or expired")
+        started = time.perf_counter()
+        async with self._preparation_lock_for(account_index, key):
+            acquired = time.perf_counter()
+            nonce = await self._next_nonce(self._signer(account_index), key, deadline=deadline)
+            finished = time.perf_counter()
+            if time.monotonic() >= deadline:
+                raise TimeoutError("nonce reservation crossed its deadline")
+            self._assert_nonce_available(account_index, key, nonce)
+            token = ReservedNonce(account_index, key, deadline, nonce, self._prepared_owner,
+                                  diagnostic_timings={
+                                      "preparation_lock_wait_seconds": acquired - started,
+                                      "nonce_acquisition_seconds": finished - acquired,
+                                  })
+            self._nonce_reservations[self._nonce_key(account_index, key, nonce)] = token
+            return token
+
+    def _owns_nonce(self, token: Any) -> bool:
+        return bool(
+            isinstance(token, ReservedNonce)
+            and token._owner is self._prepared_owner
+            and token._state == "RESERVED"
+            and self._nonce_reservations.get(self._nonce_key(token.account_index, token.api_key_index, token._nonce)) is token
+        )
+
+    async def invalidate_reserved_nonce(self, token: Any) -> None:
+        if not isinstance(token, ReservedNonce):
+            return
+        async with self._preparation_lock_for(token.account_index, token.api_key_index):
+            if self._owns_nonce(token):
+                self._nonce_reservations.pop(self._nonce_key(token.account_index, token.api_key_index, token._nonce))
+                object.__setattr__(token, "_state", "INVALIDATED")
+
+    async def prepare_order(self, plan: OrderPlan, *, reserved_nonce: ReservedNonce | None = None) -> PreparedMutation:
+        """Sign one exact plan, optionally using a previously reserved nonce."""
 
         key_index = self.config.api_key_index
         if key_index is None:
@@ -1155,7 +1214,18 @@ class LighterSdkClient:
             lock_acquired = time.perf_counter()
             signer = self._signer(plan.account_index)
             nonce_started = time.perf_counter()
-            nonce = await self._next_nonce(signer, key_index, deadline=deadline)
+            if reserved_nonce is None:
+                nonce = await self._next_nonce(signer, key_index, deadline=deadline)
+            else:
+                if (
+                    not self._owns_nonce(reserved_nonce)
+                    or reserved_nonce.account_index != plan.account_index
+                    or reserved_nonce.api_key_index != key_index
+                    or deadline > reserved_nonce.deadline
+                    or time.monotonic() >= reserved_nonce.deadline
+                ):
+                    raise ContractError("reserved nonce identity, state or deadline does not match order")
+                nonce = reserved_nonce._nonce
             if time.monotonic() >= deadline:
                 raise TimeoutError("nonce acquisition crossed the final mutation barrier")
             nonce_finished = time.perf_counter()
@@ -1212,6 +1282,13 @@ class LighterSdkClient:
                     "signing_call_seconds": signing_finished - signing_started,
                 },
             )
+            if reserved_nonce is not None:
+                # Transfer ownership under the same account/key lock. Signing
+                # failure leaves the reservation available only for invalidation.
+                self._nonce_reservations.pop(self._nonce_key(plan.account_index, key_index, nonce))
+                object.__setattr__(reserved_nonce, "_state", "CONSUMED")
+                prepared.diagnostic_timings.update(reserved_nonce.diagnostic_timings)
+                prepared.diagnostic_timings["nonce_reserved_before_quote"] = 1.0
             self._register_prepared(prepared)
             return prepared
 

@@ -121,6 +121,15 @@ def saved_message(name, report, *, blocked=False, detailed=False):
               'Парное исполнение: ' + {'SUCCESS': '✅ подтверждено', 'FAILED': '⚠️ не состоялось'}.get(pair.get('status'), '❔ не доказано'),
               'Историческая позиция: ' + {'CONFIRMED_FLAT': '✅ закрытие подтверждено', 'PARTIAL': '⚠️ есть остаток'}.get(inventory.get('status'), '❔ неизвестна'),
               'Комиссии: ' + ('подтверждены' if fees.get('status') == 'PROVEN' else '❔ неполные данные')]
+    matches = pair.get('direct_counterparty_match')
+    for match in matches[:2] if isinstance(matches, list) else ():
+        match = mapping(match)
+        label = {'opening': 'Открытие', 'closing': 'Закрытие'}.get(match.get('phase'), 'Фаза')
+        volumes = [match.get(key) for key in ('matched_quantity', 'external_source_quantity', 'external_receiver_quantity')]
+        lines += [label + ': свой подтверждённый объём ' + text(volumes[0] if volumes[0] is not None else 'не доказан', 32)
+                  + '; внешний A/B: ' + '/'.join(text(v if v is not None else '?', 32) for v in volumes[1:])]
+        unproved = [match.get(key) for key in ('unproved_source_quantity', 'unproved_receiver_quantity')]
+        lines += ['Контрагент не доказан, A/B: ' + '/'.join(text(v if v is not None else '?', 32) for v in unproved)]
     intents = orders.get('unresolved_intents')
     observed = orders.get('unresolved_observed_orders')
     lines += ['Неразрешённых намерений: ' + (str(len(intents)) if isinstance(intents, list) else 'нет данных'),

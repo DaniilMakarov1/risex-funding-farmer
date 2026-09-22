@@ -641,7 +641,8 @@ def test_counterparty_conflict_is_separate_from_valid_exposure(complete_cycle: P
         receipt["source"]["trades"][0]["counterparty_order_id"] = "different-order"
     _change_records(complete_cycle / "opening.jsonl", corrupt)
     report = load_saved_cycle_report(complete_cycle)
-    assert report["paired_execution"]["status"] == "SUCCESS"
+    assert report["paired_execution"]["status"] == "UNKNOWN"
+    assert report["paired_execution"]["exposure_status"] == "SUCCESS"
     assert report["paired_execution"]["direct_counterparty_match"][0]["status"] == "UNKNOWN"
 
 

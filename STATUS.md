@@ -1,5 +1,13 @@
 # Current status
 
+## HCR-35 Fast guarded mutual execution
+
+Chief implemented and self-reviewed the HCR-34 recommendations alone, as explicitly requested by the owner. No independent review is claimed. The candidate removes repeated post-quote child account reads, reserves unsent account/key nonces before the final quote, overlaps account/active-order SDK reads, and preserves final exact-source/priority admission. Only full reciprocal own-order execution can start HOLD or yield paired strategy SUCCESS; fully reconciled external/mixed execution uses existing residual recovery and reports strategy PARTIAL separately from exact-flat inventory. Reports retain actual mutual/external/unproved quantities, package/import/configuration provenance and timing. Optional stricter timing caps default to absent; live operator policy/configuration is unchanged.
+
+Focused verification: 481 checks passed, followed by 83 affected/additional checks after the final nonce-lifetime and partial-report corrections. Controlled offline comparison with the accepted base, seven cycles and identical 30 ms fake request delays: median account snapshot 65.00 to 31.42 ms; final quote to source intent 74.67 to 8.44 ms (14 opening/closing observations per version); post-quote pair preparation 32.55 to 0.30 ms. These figures do not measure live venue latency or counterparties. Final clean isolated Python 3.11 suite is pending; this candidate is not yet accepted.
+
+Evidence: `spread-shadow-runs/hood-fast-execution-20260922/chief-v1/`. Original cycle-008/009 and audit inputs remain immutable. No credentials, new venue/account collection, orders, controller restart or synthetic Telegram command occurred during implementation. Robinhood stream equivalence remains unproved, so the candidate retains optimized REST. Next operator live test remains a separate stage.
+
 ## HCR-33 Random first account and limit side
 
 Candidate `99b35ab40b300280d4f4fe89d08b8e70e06b4d19` makes normal simple/Telegram launches choose uniformly among both configured accounts and first-limit BUY/SELL (four combinations). Selection is persisted and directory-synced before credential access, checked at admission, and retained through execution/retries/closure. Size, hold, risk and reconciliation policy are unchanged. Explicit-plan lower-level interfaces remain fixed. Saved Telegram reports display selected identities/side; `/accounts` uses stable A/B labels.

@@ -171,10 +171,12 @@ _PROJECTED_KEYS = frozenset(
 )
 
 _PROJECTED_KEYS = _PROJECTED_KEYS | frozenset({
+    "runtime_provenance", "git_head", "dirty", "configuration_sha256", "imports", "module", "files", "path", "sha256", "python_version",
+    "max_quote_age_seconds", "max_source_to_receiver_seconds", "source_to_admission_seconds",
     "quote_read_seconds", "quote_read_started_at", "quote_read_finished_at",
     "source_quote_observed_at", "freshness_seconds",
     *(f"{leg}_{stage}" for leg in ("source", "receiver") for stage in (
-        "preparation_lock_wait_seconds", "nonce_acquisition_seconds", "signing_call_seconds", "transport_roundtrip_seconds",
+        "preparation_lock_wait_seconds", "nonce_acquisition_seconds", "signing_call_seconds", "transport_roundtrip_seconds", "nonce_reserved_before_quote",
     )),
 })
 
@@ -1793,7 +1795,7 @@ def _paired_execution(
     parent_payload: Mapping[str, Any] | None = None,
     parent_complete: bool = False,
 ) -> dict[str, Any]:
-    """Separate completed two-phase exposure from optional mutual trade matching."""
+    """Require full mutual execution while preserving exposure as a separate fact."""
     parent_payload = parent_payload or {}
     explicit = parent_payload.get("paired_execution")
     receiver_actions = [a for a in actions if a.get("leg") == "receiver"]
@@ -1818,12 +1820,17 @@ def _paired_execution(
                 and a.get("account_index") != b.get("account_index")
                 and a.get("market_id") == b.get("market_id")
                 and a["plan"].get("side") != b["plan"].get("side")
-                and all(e.get("outcome") == "SUCCESS" for e in (a, b))
+                and all(e.get("outcome") in {"SUCCESS", "PARTIAL"} for e in (a, b))
             )
         phase_results.append({"phase": phase, "status": "PROVEN" if valid else "NOT_PROVEN", "quantity": str(quantity) if valid else None,
                               "reason": "complete planned exposure with terminal orders and exact position deltas" if valid else "both complete planned legs are required"})
         mutual = "UNKNOWN"
-        if valid:
+        matched_quantity = Decimal(0)
+        receipts_resolved = (
+            len(source) == len(receiver) == 1
+            and all(e.get("resolved") for e in (*source, *receiver))
+        )
+        if receipts_resolved:
             a, b = source[0], receiver[0]
             receiver_trades = {str(t["trade_id"]): t for t in b["trades"]}
             matched = len(a["trades"]) == len(receiver_trades)
@@ -1835,7 +1842,7 @@ def _paired_execution(
                 if other is None:
                     matched = False
                     continue
-                matched = matched and (
+                compatible = (
                     t.get("counterparty_account_index") == b["account_index"]
                     and other.get("counterparty_account_index") == a["account_index"]
                     and t.get("counterparty_order_id") == other["order_id"]
@@ -1847,8 +1854,32 @@ def _paired_execution(
                     and (t.get("counterparty_client_order_index") is None or str(t["counterparty_client_order_index"]) == str(other["client_order_index"]))
                     and (other.get("counterparty_client_order_index") is None or str(other["counterparty_client_order_index"]) == str(t["client_order_index"]))
                 )
-            mutual = "MATCHED" if matched else "NOT_MATCHED" if foreign else "UNKNOWN"
-        mutual_results.append({"phase": phase, "status": mutual})
+                matched = matched and compatible
+                if compatible:
+                    matched_quantity += _decimal_value(t["quantity"]) or Decimal(0)
+            foreign = foreign or any(t.get("counterparty_account_index") not in (None, a["account_index"]) for t in b["trades"])
+            mutual = (
+                "MATCHED" if valid and matched and matched_quantity == quantity
+                else "NOT_MATCHED" if foreign
+                else "PARTIAL" if matched_quantity > 0
+                else "UNKNOWN"
+            )
+        quantities: dict[str, Any] = {"matched_quantity": str(matched_quantity)}
+        for label, peer_label in (("source", "receiver"), ("receiver", "source")):
+            peer_ids = {e.get("account_index") for e in legs if e.get("leg") == peer_label}
+            own_legs = [e for e in legs if e.get("leg") == label]
+            external = None
+            unproved = None
+            if len(peer_ids) == 1 and None not in peer_ids and own_legs:
+                external = sum((_decimal_value(t.get("quantity")) or Decimal(0)
+                                for e in own_legs for t in e.get("trades", [])
+                                if t.get("counterparty_account_index") is not None
+                                and t.get("counterparty_account_index") not in peer_ids), Decimal(0))
+                filled = sum((_decimal_value(e.get("filled_quantity")) or Decimal(0) for e in own_legs), Decimal(0))
+                unproved = max(Decimal(0), filled - external - matched_quantity)
+            quantities[f"external_{label}_quantity"] = None if external is None else str(external)
+            quantities[f"unproved_{label}_quantity"] = None if unproved is None else str(unproved)
+        mutual_results.append({"phase": phase, "status": mutual, **quantities})
     reasons: list[str] = []
     unresolved = bool(evidence_issues) or not parent_complete or not executions or any(not e.get("resolved") for e in executions)
     all_phases = all(p["status"] == "PROVEN" for p in phase_results)
@@ -1858,15 +1889,19 @@ def _paired_execution(
         reasons.append("complete, consistent terminal execution evidence is required")
     elif all_phases and phase_results[0]["quantity"] == phase_results[1]["quantity"] and not fallback and parent_payload.get("outcome") == "SUCCESS":
         status = "SUCCESS"
-        reasons.append("opening and closing exposure are independently proven; direct counterparty matching is separate")
+        reasons.append("opening and closing exposure are independently proven")
     elif receiver_fills and not source_fills or not receiver_dispatched and not receiver_fills:
         status = "FAILED"
         reasons.append("the intended paired cycle did not execute both required legs")
     else:
         status = "PARTIAL" if parent_payload.get("outcome") in {"SUCCESS", "PARTIAL"} and receiver_fills and source_fills else "UNKNOWN"
         reasons.append("a complete paired opening and closing without fallback is not proven")
+    exposure_status = status
+    if status == "SUCCESS" and not all(p["status"] == "MATCHED" for p in mutual_results):
+        status = "FAILED" if any(p["status"] == "NOT_MATCHED" for p in mutual_results) else "UNKNOWN"
+        reasons.append("full mutual execution with zero external volume is required for strategy success")
     return {
-        "status": status, "explicit_status": explicit,
+        "status": status, "exposure_status": exposure_status, "explicit_status": explicit,
         "receiver_possible_dispatch": bool(receiver_actions),
         "receiver_response_observed": any(a.get("response_observed") is True for a in receiver_actions),
         "receiver_dispatched": receiver_dispatched, "receiver_fill_observed": bool(receiver_fills),
@@ -2262,6 +2297,9 @@ def load_saved_cycle_report(path: str | Path) -> dict[str, Any]:
         "coverage": _coverage_map(),
         "source_provenance": {
             "inputs_are_read_only": True,
+            "runtime": [record.payload["runtime_provenance"] for data in all_files for record in data.records
+                        if record.event in {"CYCLE_STARTED", "ATTEMPT_STARTED"}
+                        and isinstance(record.payload.get("runtime_provenance"), Mapping)],
             "files": [
                 {
                     "path": item["path"],

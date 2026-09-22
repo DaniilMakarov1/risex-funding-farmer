@@ -307,7 +307,7 @@ class PairedClient:
                         self.receiver_order.order_id,
                         self.receiver_order.side,
                         self.receiver_order.filled_quantity,
-                        self.receiver_order.price,
+                        self.source_order.price,
                         None,
                         11,
                         NOW,
@@ -1200,7 +1200,7 @@ async def test_source_fill_before_receiver_stops_second_leg(tmp_path):
 async def test_reversed_direction_opens_the_opposite_signed_positions(tmp_path):
     client = PairedClient()
     result = await run_handoff(
-        config(tmp_path / "short.jsonl", direction=Direction.SHORT),
+        config(tmp_path / "short.jsonl", direction=Direction.SHORT, receiver_worst_price=Decimal("100.0")),
         client,
         clock=Clock(),
     )

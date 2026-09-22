@@ -1161,6 +1161,8 @@ class HandoffConfig:
     # This is evidence only; when supplied it participates in the existing
     # freshness/deadline binding and never authorizes repricing.
     source_quote_observed_at: float | None = None
+    max_quote_age_seconds: float | None = None
+    max_source_to_receiver_seconds: float | None = None
 
     def __post_init__(self) -> None:
         _int(self.market_id, "market_id", minimum=0)
@@ -1218,6 +1220,15 @@ class HandoffConfig:
         ):
             object.__setattr__(self, name, _finite_float(value, name))
         _int(self.max_poll_count, "max_poll_count", minimum=1)
+        for name in ("max_quote_age_seconds", "max_source_to_receiver_seconds"):
+            value = getattr(self, name)
+            if value is not None:
+                value = _finite_float(value, name)
+                if value > self.freshness_seconds:
+                    raise ContractError(f"{name} must not exceed freshness_seconds")
+                object.__setattr__(self, name, value)
+        if self.max_quote_age_seconds is not None and self.source_quote_observed_at is None:
+            raise ContractError("max_quote_age_seconds requires source_quote_observed_at")
         _int(self.source_order_lifetime_seconds, "source_order_lifetime_seconds", minimum=300)
         if self.source_order_lifetime_seconds > 30 * 24 * 60 * 60:
             raise ContractError("source_order_lifetime_seconds must not exceed 30 days")
@@ -1678,16 +1689,35 @@ class HandoffResult:
     def __post_init__(self) -> None:
         object.__setattr__(self, "operation_mode", OperationMode.parse(self.operation_mode))
 
+    @property
+    def mutual_execution_proven(self) -> bool:
+        return bool(
+            self.outcome is Outcome.SUCCESS and self.plan is not None
+            and self.joint_match_status == "MATCHED"
+            and self.joint_match_quantity == self.plan.quantity
+            and self.source is not None and self.receiver is not None
+            and self.source.filled_quantity == self.receiver.filled_quantity == self.plan.quantity
+            and self.source.history_complete and self.receiver.history_complete
+            and not self.source.unknown_reasons and not self.receiver.unknown_reasons
+        )
+
     def as_dict(self) -> dict[str, Any]:
         operation_mode = self.plan.operation_mode if self.plan is not None else self.operation_mode
 
         def leg(value: LegReconciliation | None, counterparty: LegReconciliation | None = None) -> Any:
             if value is None:
                 return None
+            external = None if counterparty is None else sum(
+                (trade.quantity for trade in value.trades
+                 if trade.counterparty_account_index is not None
+                 and trade.counterparty_account_index != counterparty.account_index), Decimal(0))
             return {
                 "account_index": value.account_index,
                 "order_id": value.order_id,
                 "filled_quantity": _wire_decimal(value.filled_quantity),
+                "external_counterparty_quantity": None if external is None else _wire_decimal(external),
+                "unproved_counterparty_quantity": None if external is None else _wire_decimal(
+                    max(Decimal(0), value.filled_quantity - external - self.joint_match_quantity)),
                 "counterparty_matched_quantity": (
                     None
                     if counterparty is None
@@ -1756,6 +1786,7 @@ class HandoffResult:
             "phase": self.phase.value,
             "run_id": self.run_id,
             "operation_mode": operation_mode.value,
+            "mutual_execution_proven": self.mutual_execution_proven,
             "plan": None if self.plan is None else self.plan.as_dict(),
             "source": leg(self.source, self.receiver),
             "receiver": leg(self.receiver, self.source),

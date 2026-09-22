@@ -972,19 +972,15 @@ class ChildIdentityChangeClient(CycleClient):
 
     async def account_snapshot(self, account_index: int, market_id: int) -> AccountSnapshot:
         snapshot = await super().account_snapshot(account_index, market_id)
-        # The opening reconciliation happens at the initial clock value.  At
-        # the later hold deadline, the parent close reads both accounts first
-        # (relative reads 1-2), then the nested child preflight reads them
-        # (3-4), and its account recheck starts at read 5.  Stage the identity
-        # change at those child-relative boundaries so parent close admission
-        # remains valid and the child guard is the code under test.
+        # The bound child reuses pre-quote accounts. Post-hold reads 1-2
+        # are preparation; reads 3-4 are the post-placement admission checks.
         if self.opening_complete and self.clock.now() > NOW and not self.identity_changed:
             self.close_reads += 1
             if (
                 account_index == self.source_account_index
                 and (
-                    (self.change_phase == "child-preflight" and self.close_reads == 3)
-                    or (self.change_phase == "child-recheck" and self.close_reads == 5)
+                    (self.change_phase == "child-preflight" and self.close_reads == 1)
+                    or (self.change_phase == "child-recheck" and self.close_reads == 3)
                 )
             ):
                 self.identity_changed = True
@@ -1024,6 +1020,7 @@ class TransientIdentityChangeClient(CycleClient):
             self.reads += 1
             if self.reads == self.target_read:
                 self.identity_mismatch_count += 1
+                self.submissions_at_fault = tuple(self.submissions)
                 return replace(snapshot, source_identity="one-response-foreign-identity")
         return snapshot
 
@@ -1043,6 +1040,7 @@ class TransientFallbackIdentityClient(CycleClient):
             self.reads += 1
             if self.reads == 1:
                 self.identity_mismatch_count += 1
+                self.submissions_at_fault = tuple(self.submissions)
                 return replace(snapshot, source_identity="one-response-foreign-identity")
         return snapshot
 
@@ -1100,6 +1098,7 @@ class AccountBindingFaultClient(CycleClient):
             self.boundary_reads += 1
             if self.boundary_reads == self.target_read:
                 self.fault_injected = True
+                self.submissions_at_fault = tuple(self.submissions)
                 return self._fault(snapshot)
         return snapshot
 
@@ -1674,7 +1673,7 @@ async def test_closing_post_only_retry_exhaustion_reports_recovery_without_erasi
         rng=FixedRng(20, 20),
     )
 
-    assert result.outcome is Outcome.SUCCESS, result.as_dict()
+    assert result.outcome is Outcome.PARTIAL, result.as_dict()
     assert result.opening is not None and result.opening.receiver is not None
     assert result.opening.receiver.dispatched is True
     assert result.closing is not None and result.closing.attempt_index == 3
@@ -2540,7 +2539,7 @@ async def test_partial_paired_close_uses_confirmed_reduce_only_fallback_per_acco
         clock=clock,
         rng=FixedRng(20, 20),
     )
-    assert result.outcome is Outcome.SUCCESS
+    assert result.outcome is Outcome.PARTIAL
     assert len(result.fallbacks) == 2
     assert all(item.outcome is Outcome.SUCCESS for item in result.fallbacks)
     assert [plan.reduce_only for plan in client.submissions] == [False, False, True, True, True, True]
@@ -2569,7 +2568,7 @@ async def test_partial_market_fallback_repeats_fairly_with_unique_ids_and_exact_
         clock=clock,
         rng=FixedRng(40, 20),
     )
-    assert result.outcome is Outcome.SUCCESS
+    assert result.outcome is Outcome.PARTIAL
     assert [item.attempt for item in result.fallbacks] == [1, 2, 3, 4]
     assert [item.account_index for item in result.fallbacks] == [11, 22, 11, 22]
     assert [item.requested_quantity for item in result.fallbacks] == [
@@ -2667,7 +2666,7 @@ async def test_zero_fill_is_paced_and_does_not_starve_the_other_account(tmp_path
         clock=clock,
         rng=FixedRng(40, 20),
     )
-    assert result.outcome is Outcome.SUCCESS
+    assert result.outcome is Outcome.PARTIAL
     assert [item.account_index for item in result.fallbacks] == [11, 22, 22, 11]
     assert result.fallbacks[0].filled_quantity == Decimal("0")
     assert clock.sleeps == pytest.approx([20, 0.01])
@@ -2913,7 +2912,7 @@ async def test_external_receiver_fill_cancels_source_then_closes_own_residual(tm
         clock=clock,
         rng=FixedRng(40, 20),
     )
-    assert result.outcome is Outcome.SUCCESS
+    assert result.outcome is Outcome.PARTIAL
     assert len(client.fallback_plans) == 1
     assert client.fallback_plans[0].account_index == client.source_account_index
     assert client.fallback_plans[0].quantity == Decimal("0.40")
@@ -2941,7 +2940,7 @@ async def test_source_fill_during_cancel_sizes_fallback_from_confirmed_residual(
         clock=clock,
         rng=FixedRng(40, 20),
     )
-    assert result.outcome is Outcome.SUCCESS
+    assert result.outcome is Outcome.PARTIAL
     assert len(client.fallback_plans) == 1
     assert client.fallback_plans[0].quantity == expected_residual
     assert result.fallbacks[0].requested_quantity == expected_residual
@@ -2959,7 +2958,7 @@ async def test_source_fill_during_cancel_can_eliminate_fallback(tmp_path):
         clock=clock,
         rng=FixedRng(20, 20),
     )
-    assert result.outcome is Outcome.SUCCESS
+    assert result.outcome is Outcome.PARTIAL
     assert not client.fallback_plans
     assert result.remaining_source_position == Decimal("0.00")
     assert result.remaining_receiver_position == Decimal("0")
@@ -3225,7 +3224,7 @@ async def test_external_source_fill_during_paired_close_is_partial_and_fallback_
         rng=FixedRng(20, 20),
     )
 
-    assert result.outcome is Outcome.SUCCESS, result.as_dict()
+    assert result.outcome is Outcome.PARTIAL, result.as_dict()
     assert result.opening is not None and result.opening.outcome is Outcome.SUCCESS
     assert result.closing is not None
     assert result.closing.outcome is Outcome.PARTIAL
@@ -3374,7 +3373,7 @@ async def test_close_refuses_identity_drift_from_the_opening_lineage(tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("direction", [Direction.LONG, Direction.SHORT])
-async def test_close_child_preflight_cannot_rebind_opening_account_identity(tmp_path, direction):
+async def test_close_preparation_cannot_rebind_opening_account_identity(tmp_path, direction):
     clock = AdvancingClock()
     client = ChildIdentityChangeClient(clock, change_phase="child-preflight")
     result = await run_random_cycle(
@@ -3385,9 +3384,8 @@ async def test_close_child_preflight_cannot_rebind_opening_account_identity(tmp_
     )
 
     assert result.outcome is Outcome.UNKNOWN
-    assert result.closing is not None
-    assert result.closing.outcome is Outcome.FAILED_PREFLIGHT_BLOCKED
-    assert result.closing.reason == "contract_error"
+    assert result.closing is None
+    assert "identity changed" in result.reason
     assert client.identity_changed
     assert not [plan for plan in client.submissions if plan.reduce_only]
     assert not client.fallback_plans
@@ -3448,15 +3446,13 @@ async def test_transient_identity_failure_remains_cycle_barrier(
     assert result.outcome is Outcome.UNKNOWN
     assert "identity failure barrier" in (result.reason or "")
     assert client.identity_mismatch_count == 1
-    assert not any(plan.order_type == "MARKET" and plan.reduce_only for plan in client.submissions)
+    assert tuple(client.submissions) == client.submissions_at_fault
     assert not client.fallback_plans
-    assert client.source_position == Decimal("-0.40")
-    assert client.receiver_position == Decimal("0.40")
-    if target_read == 3:
-        assert any(plan.order_type == "LIMIT" and plan.reduce_only for plan in client.submissions)
+    assert client.source_position == (Decimal("0") if target_read == 3 else Decimal("-0.40"))
+    assert client.receiver_position == (Decimal("0") if target_read == 3 else Decimal("0.40"))
+    assert len(client.submissions) == target_read + 1
+    if target_read == 2:
         assert client.cancellations
-    else:
-        assert not any(plan.order_type == "LIMIT" and plan.reduce_only for plan in client.submissions)
 
 
 @pytest.mark.asyncio
@@ -3513,15 +3509,12 @@ async def test_account_identity_binding_fault_is_terminal_before_dependent_write
     assert result.outcome is Outcome.UNKNOWN
     assert "identity failure barrier" in (result.reason or "")
     assert client.fault_injected
+    assert tuple(client.submissions) == client.submissions_at_fault
     assert not client.fallback_plans
-    assert client.source_position == Decimal("-0.40")
-    assert client.receiver_position == Decimal("0.40")
-    if target_read < 3:
-        assert len(client.submissions) == 2
-        assert not any(plan.reduce_only for plan in client.submissions)
-    else:
-        assert len(client.submissions) == 3
-        assert [plan.reduce_only for plan in client.submissions] == [False, False, True]
+    assert client.source_position == (Decimal("0") if target_read == 3 else Decimal("-0.40"))
+    assert client.receiver_position == (Decimal("0") if target_read == 3 else Decimal("0.40"))
+    assert len(client.submissions) == target_read + 1
+    if target_read == 2:
         assert client.cancellations
 
 
@@ -3606,7 +3599,7 @@ async def test_fallback_polls_fresh_terminal_order_and_keeps_failure_reason(tmp_
         clock=delayed_clock,
         rng=FixedRng(40, 20),
     )
-    assert delayed_result.outcome is Outcome.SUCCESS
+    assert delayed_result.outcome is Outcome.PARTIAL
     assert len(delayed_client.fallback_plans) == 2
     assert delayed_client.source_position == Decimal("0")
     assert delayed_client.receiver_position == Decimal("0")
@@ -3616,7 +3609,7 @@ async def test_fallback_polls_fresh_terminal_order_and_keeps_failure_reason(tmp_
 @pytest.mark.parametrize(
     "trade_age, order_age, expected_outcome, expected_reason",
     [
-        (11.0, 0.0, Outcome.SUCCESS, None),
+        (11.0, 0.0, Outcome.PARTIAL, None),
         (-1.0, 0.0, Outcome.UNKNOWN, "future"),
         (11.0, 11.0, Outcome.UNKNOWN, "stale"),
     ],
@@ -3664,7 +3657,7 @@ async def test_fallback_journal_retains_receipts_and_account_state(tmp_path):
         clock=clock,
         rng=FixedRng(40, 20),
     )
-    assert result.outcome is Outcome.SUCCESS
+    assert result.outcome is Outcome.PARTIAL
     rows = [json.loads(line) for line in (cycle_path / "cycle.jsonl").read_text().splitlines()]
     reconciled = [row for row in rows if row["event"] == "FALLBACK_RECONCILED"]
     assert len(reconciled) == 2
