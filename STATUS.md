@@ -1,5 +1,11 @@
 # Current status
 
+## HCR-32 Telegram account inspection
+
+Candidate `e580369e0c4b439b5d556efd657521e3279e7754` adds private-owner `/accounts` and a navigation button. The command reads both configured accounts concurrently through the existing read-only SDK adapter, showing available balance, configured-market position, active-order count and observation time. Partial failures, stale observations and inactive status are explicit. Missing stored keys cannot prompt/provision; inspection preserves persistent execution barriers and never dispatches orders.
+
+Validation: 276 affected tests passed; final clean isolated Python 3.11.5 suite **4849 passed, 3 existing optional Extended dependency skips, exit 0**, 130.43 seconds. Full actual diff self-reviewed by Chief; no independent-review claim. Exact import paths verified. All 42 historical evidence hashes and protected controller state unchanged. Evidence: `spread-shadow-runs/hood-telegram-accounts-20260922/`. No live account query, controller deployment or orders performed. A running controller must be restarted locally to load the new command.
+
 ## HCR-31 Telegram audit and presentation
 
 Candidate `24b063fa25d23804949db26cd741b980b574d100` fixes three reproduced controller defects: status requests during final notification no longer access cleared active state or misreport a finished runner as active; unreadable journals yield an explicit unavailable report without raw error details; malformed last-result state is rejected on load. The complete diff is Chief-implemented and self-reviewed.
