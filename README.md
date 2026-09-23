@@ -8,6 +8,14 @@ HCR-41 is published and the idle Telegram controller has been updated. It improv
 
 HCR-42 is accepted and the owner selected an exact opening reserve of 0.10/0.02 quote per account, bound through the operator configuration. The protected controller was restarted after that release as recorded in STATUS. HCR-43 on a separate branch is an offline candidate: it keeps HTTP order submission and the existing paired admission proof, adds local numeric send/cancel timing diagnostics, and reuses the exact source observation before residual cancellation after receiver terminal status. It is not active in the controller. A separate offline-only frame parser now records bounded, redacted synthetic observations; it has no connected feed or trading role. No live latency gain or mutual-fill guarantee is established.
 
+HCR-44 on its isolated branch adds a finite read-only Robinhood stream measurement command. It reads the protected operator configuration and existing Keychain records, then subscribes to configured BTC book and both configured account order channels for one bounded session. It saves only structured projections in an existing owner-only directory, without raw private frames or credentials. This command has no order, cancellation or controller path. Its one-session collection authority and limits are in NEXT_TASK; no trading pilot is yet authorized. Example invocation for the authorized session, after offline verification:
+
+```bash
+python -m risex_spread_shadow.hood_handoff.stream_measurement \
+  --config "/Users/daniilmakarov/Desktop/RISEx Spread Shadow/spread-shadow-runs/hood-cycle-race-latency-20260920/operator-v1/random-cycle.json" \
+  --output "/Users/daniilmakarov/Desktop/RISEx Spread Shadow/spread-shadow-runs/hood-hcr44-stream-measurement-20260923/chief-v1/events.jsonl"
+```
+
 ## Setup
 
 Use Python 3.11 and pinned `lighter-sdk==1.1.2`. For a new installation:
