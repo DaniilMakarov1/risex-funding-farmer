@@ -3107,7 +3107,7 @@ class RandomCycleEngine:
                 for field, current, proved in (
                     ("available_balance", balance, account_baseline_proved),
                     ("mark_price", metadata.mark_price, metadata_baseline_proved),
-                    ("worst_price", worst, book_baseline_proved),
+                    ("worst_price", worst, metadata_baseline_proved and book_baseline_proved),
                     ("required", required, complete_baseline),
                     ("headroom", headroom, complete_baseline),
                     ("fee_rate", parts["fee_rate"], complete_baseline),

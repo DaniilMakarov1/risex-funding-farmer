@@ -215,14 +215,19 @@ async def test_fresh_budget_success_omits_unproved_baseline_delta_and_preserves_
         bounds=bounds, metadata_observed_at=1000, book_observed_at=1000)
     engine = RandomCycleEngine(ReadOnlyClient(), clock=AdvancingClock())
     engine._leverage_fractions = {11: 2500, 22: 2500}
+    initial_book = book()
     engine._opening_plan_evidence = {
         'source': {'account_index': 11, 'account_source_identity': original.source_identity,
-                   'account_observed_at': original.observed_at, 'available_balance': D('20')},
+                   'account_observed_at': original.observed_at, 'available_balance': D('20'),
+                   'book_market_id': initial_book.market_id, 'book_symbol': initial_book.symbol,
+                   'book_observed_at': initial_book.observed_at, 'worst_price': D('100.1')},
         'receiver': {'account_index': 22, 'account_source_identity': original_receiver.source_identity,
-                     'account_observed_at': original_receiver.observed_at, 'available_balance': D('20')},
+                     'account_observed_at': original_receiver.observed_at, 'available_balance': D('20'),
+                     'book_market_id': initial_book.market_id, 'book_symbol': initial_book.symbol,
+                     'book_observed_at': initial_book.observed_at, 'worst_price': D('100.1')},
     }
     journal = DurableJournal(config.journal_path, clock=lambda: 1000)
-    refreshed = await engine._revalidate_open(config, selection, market, book(),
+    refreshed = await engine._revalidate_open(config, selection, market, initial_book,
                                                original, original_receiver, journal=journal)
     assert refreshed[-1].quantity == D('.20')
     assert refreshed[-1].quantity_tick == 20
@@ -232,7 +237,7 @@ async def test_fresh_budget_success_omits_unproved_baseline_delta_and_preserves_
     assert [leg['initial_plan_provenance'] for leg in legs] == ['INCOMPLETE_OR_CONFLICTING'] * 2
     assert all(leg['initial_account_observed_at'] == 1000.0 for leg in legs)
     assert all(leg['initial_metadata_observed_at'] is None for leg in legs)
-    assert all(leg['initial_book_observed_at'] is None for leg in legs)
+    assert all(leg['initial_book_observed_at'] == initial_book.observed_at for leg in legs)
     assert [leg['initial_to_fresh'] for leg in legs] == [
         {'available_balance': '-14.9'}, {'available_balance': '-14.9'}]
     assert all(D(leg['headroom']) >= D('.01') for leg in legs)
