@@ -1,5 +1,13 @@
 # HCR-41 — Audited execution corrections; return for independent review
 
+## Final release handoff — owner authorization
+
+On 2026-09-23 the owner explicitly assigned Chief task `01a0cc6e-175d-7582-a7ad-74a9601e2ca1` sole ownership of the finite HCR-41 integration, publication and idle Telegram-controller update. The independent auditor accepted offline candidate `22296ebfeedd6e382321270e1685f6a861b3cc81` in `/Users/daniilmakarov/Desktop/RISEx Spread Shadow/spread-shadow-runs/hood-hcr41-corrections-20260923/auditor-v7/` and stopped implementation writes and polling. This authorization supersedes the older Chief no-main/no-push/no-activation and auditor-only integration instructions below for this release only. Chief works alone; no further delegation. Preserve all predecessor branches/worktrees/evidence and do not rewrite history or overwrite other writers.
+
+Before runtime changes verify actual local and remote main, branch cleanliness and change authorship, active controller/trading-child processes and instance/operator locks. Integrate only the accepted candidate, resolve any new changes with corresponding checks, update governing documents to the actual accepted/published/activated state, push main and verify remote HEAD. Update the Telegram controller only when no owner trading cycle is active and without clearing state/journals or replaying queued commands. Verify the runtime import source, Python and SDK, and idle controller health without any trading command. If a cycle is active, defer activation with a precise record and no monitor. Preserve a separate owner-only release packet with exact local/remote/runtime identities and results; report back to the auditor task.
+
+No real orders, cancellations, leverage-setting writes, `/run` or `/close` are authorized for Chief in this handoff. The owner will run live controls after release. No new reserve, numeric policy, strategy adjustment or research campaign.
+
 ## V7 return for correction — D4 preparation cancellation only
 
 The auditor returned v6 commit `edc651f5d0a1698223feeb6153875d94ba7c19d3` for one new, reproduced defect. Preserve that branch, commit, clean-suite output and packet unchanged. Current Chief branch `codex/spread-v1-hcr41-preparation-cancel-v7` in `/Users/daniilmakarov/.codex/worktrees/risex-hcr41-preparation-cancel-v7` starts from assignment seed `e70cff08438b00570ec0f175716cf52b144f4a8f`; port the reviewed v6 implementation explicitly, then correct only D4 and its direct tests/docs. Auditor task `01a0c9cd-c8bc-75b0-92b3-04b75270a65e` remains sole acceptance/integration owner. Chief works alone.
