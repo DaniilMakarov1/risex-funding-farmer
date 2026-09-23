@@ -10,7 +10,7 @@ import pytest
 from risex_spread_shadow.hood_handoff.contracts import AccountMarginEvidence, LeverageNotSent, MutationReceipt, Outcome, PreflightBlocked
 from risex_spread_shadow.hood_handoff.operator_recovery import allocate_close_slot, close_positions, inspect_current
 from risex_spread_shadow.hood_handoff.random_cycle import (
-    minimal_sufficient_leverage_fraction, select_random_quantity,
+    OpeningMarginReserve, minimal_sufficient_leverage_fraction, select_random_quantity,
 )
 from test_hood_handoff_random_cycle import (
     AdvancingClock, CycleClient, FixedRng, account, cycle_config, metadata, run_random_cycle,
@@ -169,7 +169,8 @@ async def test_occupied_margin_allows_explicit_reduce_only_close_and_run_refuses
         await inspect_current(cycle_config(tmp_path / "new-cycle"), client, tmp_path,
                               require_flat=True, clock=clock)
     slot = allocate_close_slot(tmp_path)
-    result = await close_positions(cycle_config(slot), client, tmp_path, slot, clock=clock)
+    result = await close_positions(cycle_config(slot, margin_reserve=OpeningMarginReserve(
+        Decimal('0.10'), Decimal('0.02'))), client, tmp_path, slot, clock=clock)
     assert result["status"] == "CONFIRMED_FLAT", result
     assert len(client.submissions) == 1
     assert client.submissions[0].reduce_only is True

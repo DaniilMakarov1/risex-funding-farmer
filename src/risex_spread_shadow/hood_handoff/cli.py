@@ -34,6 +34,7 @@ from .offline_report import format_report, report_saved_paths, load_saved_cycle_
 from .operator_view import read_lifecycle, lifecycle_lines, result_lines, read_execution_notices, read_launch_failure, opening_margin_refusal
 from .random_cycle import (
     MAX_PREPARATION_ATTEMPTS,
+    OpeningMarginReserve,
     RandomCycleConfig,
     RandomCycleEngine,
     _atomic_launch_metadata,
@@ -52,6 +53,28 @@ from .readiness import (
 )
 from .sdk import LighterSdkClient, MissingSdkError, SdkVersionError
 from .series import RobinhoodSeriesConfig, run_series
+
+
+# Owner-selected opening policy. The operator file must state these values
+# explicitly; this constant validates the binding and is not a silent default.
+OWNER_OPENING_MARGIN_RESERVE = OpeningMarginReserve(Decimal("0.10"), Decimal("0.02"))
+
+
+def _parse_opening_margin_reserve(raw: Any) -> OpeningMarginReserve:
+    if not isinstance(raw, Mapping) or set(raw) != {"initial_quote", "dispatch_quote"}:
+        raise SystemExit("margin_reserve requires initial_quote and dispatch_quote")
+    if any(not isinstance(raw[name], str) for name in ("initial_quote", "dispatch_quote")):
+        raise SystemExit("margin_reserve amounts must be exact decimal strings")
+    try:
+        return OpeningMarginReserve(Decimal(raw["initial_quote"]), Decimal(raw["dispatch_quote"]))
+    except (InvalidOperation, ValueError) as exc:
+        raise SystemExit(f"invalid margin_reserve: {exc}") from exc
+
+
+def _require_owner_opening_margin_reserve(config: RandomCycleConfig) -> None:
+    if config.margin_reserve != OWNER_OPENING_MARGIN_RESERVE:
+        raise SystemExit("opening requires explicit per-account margin_reserve "
+                         "initial_quote=0.10 and dispatch_quote=0.02 in operator configuration")
 
 
 class PromptSecretProvider:
@@ -516,6 +539,8 @@ def _random_cycle_config(
         raise SystemExit("random-cycle config mode must be random-cycle")
     kwargs.pop("operator_execution_opt_in", None)
     kwargs.pop("operator_plan_reviewed", None)
+    if "margin_reserve" in kwargs:
+        kwargs["margin_reserve"] = _parse_opening_margin_reserve(kwargs["margin_reserve"])
     if defer_incremental_margin_calculation is not None:
         kwargs["defer_incremental_margin_calculation"] = defer_incremental_margin_calculation
     for name in (
@@ -834,6 +859,7 @@ def _print_simple_summary(
     print(f"\n══ НОВЫЙ ЦИКЛ · {symbol} · Robinhood Chain Mainnet ══")
     print(f"Один реальный Robinhood Chain Mainnet цикл: {symbol}; первый счёт и сторона лимитки случайны.")
     print(f"Счета: {source} и {receiver}; каждый может первым выставить BUY или SELL (четыре равновероятных варианта).")
+    print("Для запуска требуется резерв на каждом счёте: 0.10 при выборе объёма и плеча, 0.02 перед ордерами (валюта баланса).")
     print(f"После Enter будет использован {credential_route}; до Enter нет чтения рынка или доступа к ключам.")
     print(f"Конфигурация: {config_path}; каталог результатов: {operator_dir}.")
     print("Нажмите Enter, чтобы запустить один цикл. Введите C или CANCEL для отмены.")
@@ -1436,6 +1462,7 @@ async def _run_simple_confirmed(args, value, config_path, operator_dir) -> int:
         evidence_path=evidence_path,
         defer_incremental_margin_calculation=args.defer_incremental_margin_calculation,
     )
+    _require_owner_opening_margin_reserve(base_config)
     _validate_simple_sdk()
     route = select_random_route(base_config)
     try:
@@ -1457,6 +1484,7 @@ async def _run_simple_confirmed(args, value, config_path, operator_dir) -> int:
         plan_reviewed=True,
         defer_incremental_margin_calculation=args.defer_incremental_margin_calculation,
     )
+    _require_owner_opening_margin_reserve(config)
     print(
         f"Новый слот создан и зарезервирован: {cycle_dir}; "
         f"уникальный префикс сохранён в {cycle_dir / 'launch.json'}."
@@ -1630,6 +1658,8 @@ async def _run_random_cycle(args: argparse.Namespace, value: Mapping[str, Any]) 
         plan_reviewed=args.confirm_plan,
         defer_incremental_margin_calculation=args.defer_incremental_margin_calculation,
     )
+    if args.execute:
+        _require_owner_opening_margin_reserve(config)
     if not args.execute:
         inverse = Direction.SHORT if config.direction is Direction.LONG else Direction.LONG
         print(

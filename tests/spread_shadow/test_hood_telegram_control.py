@@ -200,7 +200,12 @@ def test_token_binding_is_separate_from_trading_keys():
 async def test_server_discards_backlog_and_uses_fixed_detached_child(tmp_path, monkeypatch, command, entry):
     tmp_path.chmod(0o700)
     config = tmp_path / 'random-cycle.json'
-    config.write_text('{}')
+    config.write_text(json.dumps({
+        'market_id': 7, 'market_symbol': 'BTC', 'direction': 'LONG',
+        'source_account_index': 11, 'receiver_account_index': 22,
+        'cycle_dir': str(tmp_path / 'cycle'), 'api_key_index': 4,
+        'margin_reserve': {'initial_quote': '0.10', 'dispatch_quote': '0.02'},
+    }))
     (tmp_path / 'market-contract.json').write_text('{}')
     store = bot.Store(tmp_path / '.telegram-control', 'binding')
     calls = []
@@ -254,6 +259,9 @@ async def test_server_discards_backlog_and_uses_fixed_detached_child(tmp_path, m
     argv, kwargs = calls[0]
     assert argv[1:5] == ('-m', 'risex_spread_shadow.hood_handoff.cli', entry, '--keychain')
     assert argv[-2:] == ('--config', str(config))
+    parsed = cli._random_cycle_config(json.loads(config.read_text()), execute=True, plan_reviewed=True)
+    cli._require_owner_opening_margin_reserve(parsed)
+    assert parsed.binding()['margin_reserve'] == {'initial_quote': '0.10', 'dispatch_quote': '0.02'}
     assert '--no-progress' in argv
     assert kwargs['env']['RISEX_HOOD_OPERATOR_INTERFACE'] == 'telegram'
     assert kwargs['pass_fds'] == (99,)

@@ -3870,6 +3870,7 @@ def test_cli_random_cycle_requires_interactive_launch_before_client_or_keys(tmp_
                 "receiver_account_index": 22,
                 "api_key_index": 4,
                 "cycle_dir": str(cycle_path),
+                "margin_reserve": {"initial_quote": "0.10", "dispatch_quote": "0.02"},
             }
         ),
         encoding="utf-8",
@@ -4284,6 +4285,7 @@ def _write_simple_launcher_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
                 "receiver_account_index": 22,
                 "api_key_index": 4,
                 "cycle_dir": str(tmp_path / "old-cycle-001"),
+                "margin_reserve": {"initial_quote": "0.10", "dispatch_quote": "0.02"},
                 "api_base_url": "https://api.rh.lighter.xyz",
                 "chain_id": 466324,
                 "operator_dir": str(operator_dir),
@@ -4296,6 +4298,21 @@ def _write_simple_launcher_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
 
 
 @pytest.mark.asyncio
+async def test_simple_missing_owner_reserve_refuses_before_slot_or_sdk(tmp_path, monkeypatch):
+    config_path, operator_dir, evidence_path = _write_simple_launcher_fixture(tmp_path)
+    value = json.loads(config_path.read_text())
+    value.pop('margin_reserve')
+    config_path.write_text(json.dumps(value))
+    monkeypatch.setattr('builtins.input', lambda _prompt: '')
+    monkeypatch.setattr(cli_module, '_validate_simple_sdk',
+                        lambda: pytest.fail('SDK must not be reached'))
+    with pytest.raises(SystemExit, match='initial_quote=0.10 and dispatch_quote=0.02'):
+        await cli_module._run(cli_module._parser().parse_args([
+            'simple', '--config', str(config_path), '--market-evidence', str(evidence_path)]))
+    assert not list(operator_dir.glob('cycle-*'))
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("route_draw", [0, 1, 2, 3])
 @pytest.mark.parametrize("no_progress", [False, True])
 async def test_simple_enter_admits_reserved_slot_and_same_slot_replay_is_blocked(tmp_path, monkeypatch, capsys, route_draw, no_progress):
@@ -4303,6 +4320,7 @@ async def test_simple_enter_admits_reserved_slot_and_same_slot_replay_is_blocked
     clock = AdvancingClock()
     synthetic_client = CycleClient(clock)
     real_run_random_cycle = run_random_cycle
+    launched_configs = []
 
     class FakeSdkClient:
         def __init__(self, *args, **kwargs):
@@ -4317,6 +4335,7 @@ async def test_simple_enter_admits_reserved_slot_and_same_slot_replay_is_blocked
             return None
 
     async def run_with_synthetic_clock(config, client):
+        launched_configs.append(config)
         return await real_run_random_cycle(config, client, clock=clock, rng=FixedRng(25, 20))
 
     route_rng = FixedRng(route_draw)
@@ -4343,6 +4362,9 @@ async def test_simple_enter_admits_reserved_slot_and_same_slot_replay_is_blocked
     output = capsys.readouterr().out
     cycle_dir = operator_dir / "cycle-001"
     assert "SUCCESS" in output
+    assert len(launched_configs) == 1
+    assert launched_configs[0].margin_reserve == random_cycle_module.OpeningMarginReserve(
+        Decimal('0.10'), Decimal('0.02'))
     assert ("Подготовка: попытка" in output) is not no_progress
     assert (cycle_dir / "launch.json").exists()
     assert (cycle_dir / "admission.json").exists()
@@ -4372,6 +4394,8 @@ async def test_simple_enter_admits_reserved_slot_and_same_slot_replay_is_blocked
     cycle_rows = [json.loads(line) for line in (cycle_dir / "cycle.jsonl").read_text().splitlines()]
     started = next(row for row in cycle_rows if row["event"] == "CYCLE_STARTED")
     assert started["payload"]["binding"]["client_order_prefix"] == launch["client_order_prefix"]
+    assert started["payload"]["binding"]["margin_reserve"] == {
+        "initial_quote": "0.10", "dispatch_quote": "0.02"}
     replay = await real_run_random_cycle(
         replay_config,
         CycleClient(AdvancingClock()),

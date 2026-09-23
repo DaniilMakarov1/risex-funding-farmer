@@ -1,4 +1,12 @@
-# HCR-42 v2 — Correct original-budget observation provenance
+# HCR-42 reserve release — owner-selected opening margin policy
+
+## Current finite release assignment
+
+On 2026-09-23 the owner explicitly selected `OpeningMarginReserve(initial_quote=Decimal('0.10'), dispatch_quote=Decimal('0.02'))` for **each** of the two configured accounts and delegated this release to Chief task `01a0cc6e-175d-7582-a7ad-74a9601e2ca1`. These are exact quote-currency amounts, additional to fee and adverse-entry-loss bounds: retain at least 0.10 at initial quantity/IMF planning and at least 0.02 at fresh pre-send admission, with equality allowed. The owner authorized the sole release owner to integrate and publish verified work to main after successful tests and self-review, replacing the former Chief no-integration restriction for this release. No restart, runtime activation, live trading/account read or numeric policy substitution is authorized.
+
+Implement on separate branch `codex/spread-v1-hcr42-reserve-release` from independently accepted offline HCR-42 v2 candidate `494f5815b5a38ca15505c79eb5777da5c70c8f5a`, preserving all predecessor branches and evidence. Bind the chosen exact values through both actual terminal and Telegram owner-operated paths, including child routing, one-cycle configuration, sizing, setting choice, fresh admission and journal/report. Keep per-account accounting, quantity/price/hold and closure invariants. Test adverse boundary/failure behavior and both real configuration paths synthetically; run one final clean isolated Python 3.11 / lighter-sdk 1.1.2 full suite after source edits. Self-review actual diff and, only if accepted, integrate/publish main and verify remote HEAD. Check trading child/lock before changing runtime checkout; do not interrupt it. Produce separate owner-only packet and return result to auditor task `01a0c9cd-c8bc-75b0-92b3-04b75270a65e` through send_message_to_thread. Work alone without subagents.
+
+## Historical HCR-42 v2 assignment — completed offline candidate
 
 ## Current finite correction assignment
 
