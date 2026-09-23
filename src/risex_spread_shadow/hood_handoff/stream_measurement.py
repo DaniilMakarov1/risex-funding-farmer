@@ -83,6 +83,10 @@ class StreamProjection:
     order_events: int = 0
     order_duplicates: int = 0
     order_conflicts: int = 0
+    connected_controls: int = 0
+    server_error_controls: int = 0
+    transport_error_class: str | None = None
+    transport_close_code: int | None = None
     stopped_reason: str | None = None
     last_orders: dict[tuple[int, int], tuple[str, str, str, str]] = field(default_factory=dict)
 
@@ -130,6 +134,13 @@ class StreamProjection:
             self.malformed += 1
             return []
         channel, kind = frame.get("channel"), frame.get("type")
+        if kind == "connected":
+            self.connected_controls += 1
+            return []
+        if isinstance(kind, str) and kind in {"error", "subscription_error", "error/subscribe"}:
+            self.server_error_controls += 1
+            self.stopped_reason = "server_error_control"
+            return []
         if not isinstance(channel, str) or not isinstance(kind, str):
             self.malformed += 1
             return []
@@ -242,6 +253,10 @@ class StreamProjection:
                 "book_gaps": self.book_gaps, "order_events": self.order_events,
                 "order_duplicates": self.order_duplicates,
                 "order_conflicts": self.order_conflicts,
+                "connected_controls": self.connected_controls,
+                "server_error_controls": self.server_error_controls,
+                "transport_error_class": self.transport_error_class,
+                "transport_close_code": self.transport_close_code,
                 "stopped_reason": self.stopped_reason}
 
 
@@ -274,6 +289,7 @@ async def collect_once(identity: StreamIdentity, output: Path, provider: Keychai
                        *, limits: ObserverLimits = ObserverLimits()) -> dict[str, object]:
     """One connection; no automatic retry/reconnect or trading message type."""
     from websockets.asyncio.client import connect
+    from websockets.exceptions import ConnectionClosed, InvalidStatus, PayloadTooBig
 
     if (limits.max_seconds > 600 or limits.max_frames > 15000
             or limits.max_bytes > 20 * 1024 * 1024 or limits.max_frame_bytes > 65536):
@@ -315,8 +331,24 @@ async def collect_once(identity: StreamIdentity, output: Path, provider: Keychai
                         observer.stopped_reason = "frame_count_limit"
                     elif observer.bytes_seen >= limits.max_bytes:
                         observer.stopped_reason = "total_byte_limit"
-        except Exception:
+        except Exception as exc:
             # Exception text may contain the WebSocket auth message or raw frame.
+            if isinstance(exc, PayloadTooBig):
+                observer.transport_error_class = "oversize_decompressed_frame"
+            elif isinstance(exc, ConnectionClosed):
+                observer.transport_error_class = "connection_closed"
+                code = getattr(getattr(exc, "rcvd", None), "code", None)
+                if type(code) is int:
+                    observer.transport_close_code = code
+            elif isinstance(exc, InvalidStatus):
+                observer.transport_error_class = "handshake_status"
+                code = getattr(getattr(exc, "response", None), "status_code", None)
+                if type(code) is int:
+                    observer.transport_close_code = code
+            elif isinstance(exc, OSError):
+                observer.transport_error_class = "socket_error"
+            else:
+                observer.transport_error_class = "other_protocol_error"
             observer.stopped_reason = observer.stopped_reason or "connection_or_protocol_error"
         finally:
             tokens.clear()

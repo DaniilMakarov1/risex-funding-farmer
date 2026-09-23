@@ -141,6 +141,16 @@ def test_limits_reconnect_chronology_and_malformed_frame():
     assert too_big.feed(raw, 1) == [] and too_big.stopped_reason == "frame_limit_bytes"
 
 
+def test_connection_and_server_error_controls_save_no_payload():
+    observer = StreamProjection(StreamIdentity.from_config(config()))
+    assert observer.feed(encoded({"type": "connected", "session": "PRIVATE_TOKEN"}), 1) == []
+    assert observer.connected_controls == 1 and observer.malformed == 0
+    assert observer.feed(encoded({"type": "error", "message": "PRIVATE_TOKEN"}), 2) == []
+    assert observer.stopped_reason == "server_error_control"
+    assert observer.server_error_controls == 1
+    assert "PRIVATE_TOKEN" not in repr(observer.summary())
+
+
 def test_connection_sends_only_three_read_subscriptions_and_saves_projections(monkeypatch, tmp_path):
     identity = StreamIdentity.from_config(config())
     frames = [book("subscribed/order_book", 10), private("filled", filled="0.0002", remaining="0")]
