@@ -2443,6 +2443,8 @@ def load_saved_cycle_report(path: str | Path) -> dict[str, Any]:
                                     "FALLBACK_BLOCKED_IDENTITY_BARRIER"}
             ), None),
             "reason": None if not reasons else reasons[0],
+            "preflight_reason": (None if preflight_blocked is None
+                                 else preflight_blocked.payload.get("reason")),
             "process_exit_ignored": True,
         },
         "binding": binding,

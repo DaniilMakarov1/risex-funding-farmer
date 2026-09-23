@@ -1,5 +1,11 @@
 # Current status
 
+## HCR-42 — offline candidate, not accepted or activated
+
+Owner cycles 051–062 on published HCR-41 produced nine cycles stopped before the first order by fresh margin revalidation, plus one such refusal after a zero-fill retry. Five source LIMIT orders in the remaining cycles yielded four proved zero-fill cancellations after lost price priority and one external fill. The only receiver also filled externally; own reciprocal matched quantity was zero. Historical flat terminal states in 052/053/059 are not current account evidence. The independent read-only review and verified 27-input manifest are in `spread-shadow-runs/hood-postrelease-proposal-review-20260923/auditor-v1/`.
+
+Chief is preparing a separate HCR-42 branch from published main. The candidate adds both-leg fresh margin diagnostics and an explicitly parameterized quote-currency reserve mechanism across sizing, leverage selection and final admission. No numeric reserve has owner approval; the operator path has no configured reserve and retains HCR-41 behavior. Existing timing evidence is being reinterpreted per attempt; no Robinhood stream or live speed/fill improvement is proved. No agent live order, cancellation, account read or runtime change is authorized in this assignment. Acceptance, test results, exact commit and unresolved policy choices belong in the owner-only HCR-42 packet and independent auditor review; do not infer acceptance from this candidate status.
+
 ## HCR-41 — accepted, published and active for owner-triggered runs
 
 The independently accepted offline code commit `22296ebfeedd6e382321270e1685f6a861b3cc81` is in local and remote main through the fast-forward integration `97692e16c54f544dde8436d86570cad97823b2a8`. The previously idle Telegram controller was stopped after proving no active child or operator lock, and restarted from this checkout as PID 66692. Its instance lock is held, operator lock is free, and saved state has no active operation. The release packet at `spread-shadow-runs/hood-hcr41-release-20260923/chief-v1/` records exact identities, checks and the final publication. No agent live order, cancellation, leverage write, `/run` or `/close` occurred.

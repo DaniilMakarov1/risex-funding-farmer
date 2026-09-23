@@ -5,6 +5,7 @@ from decimal import Decimal, InvalidOperation
 import json
 import math
 import os
+import re
 from pathlib import Path
 
 from .journal import sanitize
@@ -71,6 +72,22 @@ def amount(value):
         return clean(str(parsed), 48)
     rendered = format(parsed, 'f')
     return rendered.rstrip('0').rstrip('.') if '.' in rendered else rendered
+
+
+def opening_margin_refusal(reason):
+    """Render only our structured pre-send shortfall; never infer venue fees."""
+    if not isinstance(reason, str):
+        return None
+    matched = re.search(
+        r'(source|receiver) selected quantity exceeds fresh free-balance margin model '
+        r'\(account ([0-9]{1,12}); shortfall ([0-9]+(?:\.[0-9]+)?) quote\)',
+        reason[:500],
+    )
+    if matched is None:
+        return None
+    role = 'первом' if matched[1] == 'source' else 'втором'
+    return (f'Открытие остановлено до ордера: на {role} счёте {matched[2]} '
+            f'не хватает {amount(matched[3])} в валюте баланса для расчётной маржи и запаса.')
 
 
 def timestamp(value):
@@ -360,6 +377,9 @@ def result_lines(report, *, detailed=False):
     economics, binding = mapping(report.get('economics')), mapping(report.get('binding'))
     fees, pnl = mapping(economics.get('fees')), mapping(economics.get('closed_execution_pnl'))
     lines = []
+    refusal = opening_margin_refusal(mapping(report.get('cycle')).get('preflight_reason'))
+    if refusal:
+        lines.append(refusal)
     if binding.get('source_account_index') is not None:
         side = {'LONG': 'SELL', 'SHORT': 'BUY'}.get(binding.get('direction'), '?')
         lines.append(f'Первый счёт: {clean(binding.get("source_account_index"), 24)} · лимитный {side} (A); '

@@ -31,7 +31,7 @@ from .local_attempt import (
     run_local_attempt,
 )
 from .offline_report import format_report, report_saved_paths, load_saved_cycle_report
-from .operator_view import read_lifecycle, lifecycle_lines, result_lines, read_execution_notices, read_launch_failure
+from .operator_view import read_lifecycle, lifecycle_lines, result_lines, read_execution_notices, read_launch_failure, opening_margin_refusal
 from .random_cycle import (
     MAX_PREPARATION_ATTEMPTS,
     RandomCycleConfig,
@@ -903,7 +903,7 @@ def _simple_event_line(row: Mapping[str, Any]) -> str | None:
     if event == "PREPARATION_FAILED":
         return "Подготовка не прошла; проверяю свежий полный снимок."
     if event == "PREPARATION_BLOCKED":
-        return "Подготовка остановлена: безопасный повтор запрещён."
+        return opening_margin_refusal(payload.get("reason")) or "Подготовка остановлена: безопасный повтор запрещён."
     if event == "PREPARATION_EXHAUSTED":
         return "Подготовка остановлена: исчерпаны три попытки до записи."
     if event == "PAIR_ATTEMPT_RETRY":

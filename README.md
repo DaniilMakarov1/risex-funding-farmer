@@ -6,6 +6,8 @@ Read STATUS.md for accepted versions/results, SYSTEM_SPEC.md for behavior, NEXT_
 
 HCR-41 is published and the idle Telegram controller has been updated. It improves residual-close preparation and timing, terminal reports, pre-journal failures and public-book diagnostics. Opening size uses mark-based margin, evidenced fees and adverse entry loss for both accounts while preserving the original absolute 4x cap. A leverage-setting cancellation during local preparation records a durable NOT_SENT and retains cancellation behavior; cancellation after possible transport remains unresolved. An uncertain sent setting can clear after exact terminal sequencer status, consumed nonce and fresh account-state proof; pending or incomplete evidence still blocks a new run. This is sequencer soft finality. Venue-specific reserved margin and final order admission remain unproved. See STATUS.md and NEXT_TASK.md.
 
+An HCR-42 offline candidate on a separate branch adds a detailed fresh-margin calculation for both accounts and a reserve mechanism that would affect size, leverage and final admission together. No reserve value is configured in the running operator tool or accepted as policy. A failed pre-send margin check in the candidate prints the affected account and modeled shortfall; it is not an exchange charge or a current-position observation. The candidate also produces an offline timing view from existing journals; no live latency gain or mutual-fill guarantee is claimed.
+
 ## Setup
 
 Use Python 3.11 and pinned `lighter-sdk==1.1.2`. For a new installation:

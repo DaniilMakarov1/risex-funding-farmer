@@ -273,6 +273,27 @@ def _text(value: Any, name: str) -> str:
 
 
 @dataclass(frozen=True, slots=True)
+class OpeningMarginReserve:
+    """Prospective quote-currency headroom, disabled until explicitly supplied.
+
+    Planning must leave ``initial_quote`` on *each* account after choosing
+    both quantity and IMF. Fresh pre-send evidence may consume the difference
+    but must still leave ``dispatch_quote``. No implicit runtime default exists.
+    """
+
+    initial_quote: Decimal
+    dispatch_quote: Decimal
+
+    def __post_init__(self) -> None:
+        initial = _nonnegative(self.initial_quote, "initial margin reserve")
+        dispatch = _nonnegative(self.dispatch_quote, "dispatch margin reserve")
+        if dispatch > initial:
+            raise ContractError("dispatch margin reserve exceeds initial reserve")
+        object.__setattr__(self, "initial_quote", initial)
+        object.__setattr__(self, "dispatch_quote", dispatch)
+
+
+@dataclass(frozen=True, slots=True)
 class RandomCycleConfig:
     """Fixed operator inputs for one finite cycle.
 
@@ -307,6 +328,7 @@ class RandomCycleConfig:
     defer_incremental_margin_calculation: bool = False
     max_quote_age_seconds: float | None = None
     max_source_to_receiver_seconds: float | None = None
+    margin_reserve: OpeningMarginReserve | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "market_id", _int(self.market_id, "market_id"))
@@ -321,6 +343,8 @@ class RandomCycleConfig:
         if self.source_account_index == self.receiver_account_index:
             raise ContractError("source and receiver accounts must differ")
         object.__setattr__(self, "client_order_prefix", _text(self.client_order_prefix, "client_order_prefix"))
+        if self.margin_reserve is not None and not isinstance(self.margin_reserve, OpeningMarginReserve):
+            raise ContractError("margin_reserve must be an explicit OpeningMarginReserve")
 
         raw_cycle_dir = None if self.cycle_dir is None else Path(self.cycle_dir)
         raw_journal = None if self.journal_path is None else Path(self.journal_path)
@@ -432,6 +456,10 @@ class RandomCycleConfig:
             "max_poll_count": self.max_poll_count,
             "source_order_lifetime_seconds": self.source_order_lifetime_seconds,
             "defer_incremental_margin_calculation": self.defer_incremental_margin_calculation,
+            **({"margin_reserve": {
+                "initial_quote": format(self.margin_reserve.initial_quote, "f"),
+                "dispatch_quote": format(self.margin_reserve.dispatch_quote, "f"),
+            }} if self.margin_reserve is not None else {}),
             **{name: getattr(self, name) for name in ("max_quote_age_seconds", "max_source_to_receiver_seconds")
                if getattr(self, name) is not None},
         }
@@ -496,6 +524,7 @@ def _observed_leverage_fraction(snapshot: AccountSnapshot, label: str) -> int:
 def minimal_sufficient_leverage_fraction(
     available_balance: Decimal, notional: Decimal, market_minimum_fraction: int,
     *, fee_cost: Decimal = Decimal(0), adverse_entry_loss: Decimal = Decimal(0),
+    initial_reserve_quote: Decimal = Decimal(0),
 ) -> int:
     """Largest integer IMF (lowest leverage) that fits the free-balance model.
 
@@ -506,9 +535,10 @@ def minimal_sufficient_leverage_fraction(
     minimum = _int(market_minimum_fraction, "market_minimum_fraction", minimum=1)
     floor = max(2500, minimum)  # 4x maximum; 10000 is 1x.
     cost = _nonnegative(fee_cost, "fee_cost") + _nonnegative(adverse_entry_loss, "adverse_entry_loss")
-    if cost >= balance:
-        raise PreflightBlocked("opening fee and entry loss consume available balance")
-    fraction = min(10000, int(((balance - cost) * 10000 / amount).to_integral_value(rounding=ROUND_FLOOR)))
+    reserve = _nonnegative(initial_reserve_quote, "initial_reserve_quote")
+    if cost + reserve >= balance:
+        raise PreflightBlocked("opening fee, entry loss and reserve consume available balance")
+    fraction = min(10000, int(((balance - cost - reserve) * 10000 / amount).to_integral_value(rounding=ROUND_FLOOR)))
     if fraction < floor:
         raise PreflightBlocked("selected quantity needs more than supported 4x leverage or available margin")
     return fraction
@@ -546,6 +576,7 @@ def compute_quantity_bounds(
     receiver: AccountSnapshot,
     opening_price: Decimal,
     *, receiver_bound: Decimal | None = None, direction: Direction | None = None,
+    initial_reserve_quote: Decimal = Decimal(0),
 ) -> RandomQuantityBounds:
     """Compute legal integer ticks within the owner's fourfold free-balance cap."""
 
@@ -555,6 +586,7 @@ def compute_quantity_bounds(
     step = Decimal(1).scaleb(-metadata.size_decimals)
     source_balance = _available_balance(source, "source")
     receiver_balance = _available_balance(receiver, "receiver")
+    reserve = _nonnegative(initial_reserve_quote, "initial_reserve_quote")
     lower_base = int(
         (metadata.minimum_base_amount / step).to_integral_value(rounding=ROUND_CEILING)
     )
@@ -577,12 +609,13 @@ def compute_quantity_bounds(
                     + parts['fee_cost'] + parts['adverse_entry_loss'])
         original_owner_cap = min(source_balance, receiver_balance) * 10000 / minimum_fraction / price
         upper_quantity = min(original_owner_cap,
-                             source_balance / unit_requirement(source_cost),
-                             receiver_balance / unit_requirement(receiver_cost))
+                             (source_balance - reserve) / unit_requirement(source_cost),
+                             (receiver_balance - reserve) / unit_requirement(receiver_cost))
         upper = int((upper_quantity / step).to_integral_value(rounding=ROUND_FLOOR))
     else:
         upper = int(
-            (min(source_balance, receiver_balance) * 10000 / minimum_fraction / price / step)
+            (min(source_balance - reserve, receiver_balance - reserve)
+             * 10000 / minimum_fraction / price / step)
             .to_integral_value(rounding=ROUND_FLOOR)
         )
     lower = max(lower_base, lower_quote)
@@ -1981,6 +2014,7 @@ class RandomCycleEngine:
         self._identity_barrier: str | None = None
         self._selection: RandomCycleSelection | None = None
         self._leverage_fractions: dict[int, int] = {}
+        self._opening_plan_evidence: dict[str, dict[str, Any]] = {}
         self._last_account_observations: dict[int, AccountSnapshot] = {}
         self._pending_nonces: dict[int, Any] = {}
         self._nonce_deadline: float | None = None
@@ -2049,6 +2083,7 @@ class RandomCycleEngine:
         self._identity_barrier = None
         self._selection = None
         self._leverage_fractions: dict[int, int] = {}
+        self._opening_plan_evidence = {}
         self._last_account_observations = {}
         if not config.operator_execution_opt_in or not config.operator_plan_reviewed:
             return RandomCycleResult(
@@ -2208,7 +2243,9 @@ class RandomCycleEngine:
             freshness_seconds=config.freshness_seconds,
         )
         bounds = compute_quantity_bounds(metadata, source, receiver, proposal.source_limit_price,
-                                         receiver_bound=proposal.receiver_worst_price, direction=config.direction)
+                                         receiver_bound=proposal.receiver_worst_price, direction=config.direction,
+                                         initial_reserve_quote=(config.margin_reserve.initial_quote
+                                                                if config.margin_reserve else Decimal(0)))
         quantity, quantity_tick, hold_seconds = select_random_quantity(bounds, self.rng)
         selection = RandomCycleSelection(
             quantity=quantity,
@@ -2511,6 +2548,7 @@ class RandomCycleEngine:
         original = {source.account_index: source, receiver.account_index: receiver}
         budgets = {}
         targets = {}
+        initial_evidence = {}
         source_side = config.direction.source_side
         for label, account, worst_price, side in (
             ("source", source, selection.opening_source_price, source_side),
@@ -2527,13 +2565,31 @@ class RandomCycleEngine:
             targets[account.account_index] = minimal_sufficient_leverage_fraction(
                 _available_balance(account, label), parts['mark_notional'],
                 metadata.minimum_initial_margin_fraction,
-                fee_cost=parts['fee_cost'], adverse_entry_loss=parts['adverse_entry_loss'])
+                fee_cost=parts['fee_cost'], adverse_entry_loss=parts['adverse_entry_loss'],
+                initial_reserve_quote=(config.margin_reserve.initial_quote
+                                       if config.margin_reserve else Decimal(0)))
+            initial_required = (
+                parts['mark_notional'] * Decimal(targets[account.account_index]) / 10000
+                + parts['fee_cost'] + parts['adverse_entry_loss']
+            )
+            initial_evidence[label] = {
+                'available_balance': _available_balance(account, label),
+                'mark_price': metadata.mark_price,
+                'worst_price': worst_price,
+                'required': initial_required,
+                'headroom': _available_balance(account, label) - initial_required,
+                'fee_rate': parts['fee_rate'],
+            }
         current = {index: _observed_leverage_fraction(account, "source" if index == source.account_index else "receiver")
                    for index, account in original.items()}
         journal.append("LEVERAGE_PLAN", {
             "quantity": format(selection.quantity, "f"), "price": format(selection.opening_source_price, "f"),
             "notional": format(notional, "f"), "target_fraction_bps": targets,
             "observed_fraction_bps": current, "opening_budgets": budgets,
+            "initial_reserve_quote": (None if config.margin_reserve is None
+                                      else format(config.margin_reserve.initial_quote, "f")),
+            "dispatch_reserve_quote": (None if config.margin_reserve is None
+                                       else format(config.margin_reserve.dispatch_quote, "f")),
         })
         for index in (source.account_index, receiver.account_index):
             if current[index] == targets[index]:
@@ -2604,6 +2660,7 @@ class RandomCycleEngine:
             })
             current[index] = effective
         self._leverage_fractions = targets
+        self._opening_plan_evidence = initial_evidence
         self._stage = "PREFLIGHT"
         return source, receiver
 
@@ -2763,6 +2820,7 @@ class RandomCycleEngine:
                 prepared_metadata, prepared_book, prepared_source, prepared_receiver, refreshed_selection = await self._revalidate_open(
                     config,
                     current_selection,
+                    journal=journal,
                     initial_metadata=initial_metadata,
                     initial_book=initial_book,
                     initial_source=initial_source,
@@ -2906,6 +2964,7 @@ class RandomCycleEngine:
         initial_book: OrderBookSnapshot | None,
         initial_source: AccountSnapshot | None,
         initial_receiver: AccountSnapshot | None,
+        journal: DurableJournal | None = None,
     ) -> tuple[MarketMetadata, OrderBookSnapshot, AccountSnapshot, AccountSnapshot, RandomCycleSelection]:
         metadata, source, receiver = await self._parallel_revalidation_context(
             config,
@@ -2920,6 +2979,108 @@ class RandomCycleEngine:
         _validate_account_fresh(config, source, "source", now)
         _validate_account_fresh(config, receiver, "receiver", now)
         proposal = select_automatic_prices(config.direction, metadata, book, now=now, freshness_seconds=config.freshness_seconds)
+        # Record both independent budgets before any one leg's margin result
+        # can suppress the other. These are quote-currency planning bounds,
+        # never observed execution fees or an admission guarantee from venue.
+        dispatch_reserve = config.margin_reserve.dispatch_quote if config.margin_reserve else Decimal(0)
+        budgets: list[dict[str, Any]] = []
+        budget_failures: list[tuple[str, int, Decimal]] = []
+        budget_errors: list[BaseException] = []
+        for account, label, worst, side in (
+            (source, "source", proposal.source_limit_price, config.direction.source_side),
+            (receiver, "receiver", proposal.receiver_worst_price,
+             "BUY" if config.direction.source_side == "SELL" else "SELL"),
+        ):
+            target = self._leverage_fractions.get(account.account_index)
+            plan = self._opening_plan_evidence.get(label, {})
+            initial_account = initial_source if label == "source" else initial_receiver
+            row: dict[str, Any] = {
+                "role": label, "account_index": account.account_index,
+                "quantity": format(selection.quantity, "f"),
+                "target_imf_bps": target, "observed_imf_bps": None,
+                "target_leverage": (None if target is None else format(Decimal(10000) / Decimal(target), "f")),
+                "observed_leverage": None,
+                "available_balance": None, "mark_price": None if metadata.mark_price is None else format(metadata.mark_price, "f"),
+                "worst_price": format(worst, "f"), "fee_rate": None,
+                "fee_rate_provenance": None, "fee_rate_candidates": None, "fee_bound": None,
+                "mark_notional": None, "initial_margin": None,
+                "adverse_entry_loss": None, "total_required": None,
+                "headroom": None, "deficit": None, "shortfall_to_dispatch_reserve": None,
+                "dispatch_reserve_quote": format(dispatch_reserve, "f"),
+                "account_observed_at": account.observed_at,
+                "account_age_seconds": max(0.0, now - account.observed_at),
+                "metadata_observed_at": metadata.observed_at,
+                "metadata_age_seconds": max(0.0, now - metadata.observed_at),
+                "initial_metadata_observed_at": selection.metadata_observed_at,
+                "initial_account_observed_at": None if initial_account is None else initial_account.observed_at,
+                "initial_book_observed_at": selection.book_observed_at,
+                "book_observed_at": book.observed_at,
+                "book_age_seconds": max(0.0, now - book.observed_at),
+                "initial_to_fresh": {}, "status": "UNKNOWN",
+            }
+            if target is None:
+                row["status"] = "NO_TARGET_IMF"
+                budgets.append(row)
+                continue
+            try:
+                row["observed_imf_bps"] = _observed_leverage_fraction(account, label)
+                row["observed_leverage"] = format(
+                    Decimal(10000) / Decimal(row["observed_imf_bps"]), "f"
+                )
+                balance = _available_balance(account, label)
+                row["available_balance"] = format(balance, "f")
+                if account.margin_evidence is not None:
+                    parts = _opening_budget_components(metadata, account, label=label,
+                        quantity=selection.quantity, worst_price=worst, side=side)
+                    fee_cap = ROBINHOOD_MAKER_FEE_CAP if label == "source" else ROBINHOOD_TAKER_FEE_CAP
+                    candidates = {"published_cap": fee_cap}
+                    observed_rate = metadata.source_fee_rate if label == "source" else metadata.receiver_fee_rate
+                    if observed_rate is not None:
+                        candidates["market_observed"] = observed_rate
+                    if account.fee_rate is not None:
+                        candidates["account_observed"] = account.fee_rate
+                    row["fee_rate_candidates"] = {name: format(rate, "f")
+                                                   for name, rate in candidates.items()}
+                    row["fee_rate_provenance"] = [name for name, rate in candidates.items()
+                                                   if rate == parts["fee_rate"]]
+                else:
+                    parts = {"mark_notional": selection.quantity * proposal.source_limit_price,
+                             "fee_cost": Decimal(0), "adverse_entry_loss": Decimal(0), "fee_rate": Decimal(0)}
+                    row["fee_rate_provenance"] = ["synthetic_no_margin_evidence"]
+                initial_margin = parts["mark_notional"] * Decimal(target) / 10000
+                required = initial_margin + parts["fee_cost"] + parts["adverse_entry_loss"]
+                headroom = balance - required
+                row.update({"fee_rate": format(parts["fee_rate"], "f"),
+                            "fee_bound": format(parts["fee_cost"], "f"),
+                            "mark_notional": format(parts["mark_notional"], "f"),
+                            "initial_margin": format(initial_margin, "f"),
+                            "adverse_entry_loss": format(parts["adverse_entry_loss"], "f"),
+                            "total_required": format(required, "f"),
+                            "headroom": format(headroom, "f"),
+                            "deficit": format(max(Decimal(0), -headroom), "f"),
+                            "shortfall_to_dispatch_reserve": format(max(Decimal(0), dispatch_reserve - headroom), "f"),
+                            "status": "ADMITTED" if headroom >= dispatch_reserve else "INSUFFICIENT"})
+                for field, current in (("available_balance", balance), ("mark_price", metadata.mark_price),
+                                       ("worst_price", worst), ("required", required),
+                                       ("headroom", headroom), ("fee_rate", parts["fee_rate"])):
+                    before = plan.get(field)
+                    if before is not None and current is not None:
+                        row["initial_to_fresh"][field] = format(current - before, "f")
+                if headroom < dispatch_reserve:
+                    budget_failures.append((label, account.account_index, dispatch_reserve - headroom))
+            except (PreflightBlocked, ContractError) as exc:
+                row["status"] = "UNKNOWN"
+                row["calculation_error"] = _cycle_exception_reason(exc)
+                budget_errors.append(exc)
+            budgets.append(row)
+        if journal is not None:
+            journal.append("FRESH_OPENING_MARGIN_BUDGET", {
+                "observed_at": now, "quantity": format(selection.quantity, "f"),
+                "initial_reserve_quote": (None if config.margin_reserve is None
+                                          else format(config.margin_reserve.initial_quote, "f")),
+                "dispatch_reserve_quote": format(dispatch_reserve, "f"),
+                "legs": budgets,
+            })
         if not _exclusive_source_price_available(
             book,
             config.direction,
@@ -2932,25 +3093,21 @@ class RandomCycleEngine:
         expected_receiver_position = 0 if initial_receiver is None else initial_receiver.signed_position
         if source.signed_position != expected_source_position or receiver.signed_position != expected_receiver_position:
             raise PreflightBlocked("account position changed before opening mutation")
-        for account, label in ((source, "source"), (receiver, "receiver")):
-            fraction = self._leverage_fractions.get(account.account_index)
-            if fraction is not None:
-                if _observed_leverage_fraction(account, label) != fraction:
-                    raise PreflightBlocked(f"{label} leverage changed before opening mutation")
-                if account.margin_evidence is not None:
-                    side = config.direction.source_side if label == 'source' else (
-                        'BUY' if config.direction.source_side == 'SELL' else 'SELL')
-                    worst = proposal.source_limit_price if label == 'source' else proposal.receiver_worst_price
-                    parts = _opening_budget_components(metadata, account, label=label,
-                        quantity=selection.quantity, worst_price=worst, side=side)
-                    required = (parts['mark_notional'] * Decimal(fraction) / 10000
-                                + parts['fee_cost'] + parts['adverse_entry_loss'])
-                else:
-                    required = selection.quantity * proposal.source_limit_price * Decimal(fraction) / 10000
-                if required > _available_balance(account, label):
-                    raise PreflightBlocked(f"{label} selected quantity exceeds fresh free-balance margin model")
+        if budget_errors:
+            raise budget_errors[0]
+        for row in budgets:
+            if row["target_imf_bps"] is not None and row["observed_imf_bps"] != row["target_imf_bps"]:
+                raise PreflightBlocked(f"{row['role']} leverage changed before opening mutation")
+        if budget_failures:
+            label, account_index, shortfall = budget_failures[0]
+            raise PreflightBlocked(
+                f"{label} selected quantity exceeds fresh free-balance margin model "
+                f"(account {account_index}; shortfall {format(shortfall, 'f')} quote)"
+            )
         refreshed_bounds = compute_quantity_bounds(metadata, source, receiver, proposal.source_limit_price,
-                                                   receiver_bound=proposal.receiver_worst_price, direction=config.direction)
+                                                   receiver_bound=proposal.receiver_worst_price, direction=config.direction,
+                                                   initial_reserve_quote=(config.margin_reserve.dispatch_quote
+                                                                          if config.margin_reserve else Decimal(0)))
         if refreshed_bounds.size_step != selection.bounds.size_step:
             raise PreflightBlocked("opening size grid changed before mutation")
         if selection.quantity_tick < refreshed_bounds.minimum_base_tick or selection.quantity_tick < refreshed_bounds.minimum_quote_tick:

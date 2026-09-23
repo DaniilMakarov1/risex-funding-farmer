@@ -1,4 +1,14 @@
-# HCR-41 — Released for owner-operated validation
+# HCR-42 — Margin headroom diagnosis and measured receiver admission
+
+## Current finite assignment — owner authorization
+
+On 2026-09-23 the owner accepted the independent post-release review and instructed auditor task `01a0c9cd-c8bc-75b0-92b3-04b75270a65e` to assign this bounded correction to Chief task `01a0cc6e-175d-7582-a7ad-74a9601e2ca1`. Chief is the sole implementation owner on branch `codex/spread-v1-hcr42-margin-latency`, worktree `/Users/daniilmakarov/.codex/worktrees/risex-hcr42-margin-latency`, starting from clean local and remote main `e84ccc93b0542d605970ea7815d514be69025c63`. Auditor is the independent acceptance and integration owner. Work alone; no delegates. This assignment supersedes the completed HCR-41 release authority below only for local offline work. No main merge/push, runtime activation/restart, protected account read, real order/cancellation, leverage write, `/run` or `/close` is authorized.
+
+Implement structured, secret-safe fresh margin-budget evidence for both accounts before the first margin block, on success and refusal, with role, exact quantity, observed/target IMF, balances, mark/worst prices, fee-bound provenance, entry loss, total requirement, signed headroom, timestamps/ages and initial-plan deltas. A confirmed deficit should reach concise terminal/Telegram text; unknown components remain unknown. Preserve strict admission and no extra network reads. Implement a coherent parameterized reserve contract across quantity bounds, leverage selection and final admission without silently selecting a new numeric policy. Quantify reviewable reserve options using complete synthetic scenarios; do not claim exact historical prevention counts because failed refreshed components were not journaled. Preserve one quantity draw, supported 1x–4x leverage, owner cap, venue minimums, hold, identity, cancellation, reconciliation and no-replay rules.
+
+Build a per-attempt timing/evidence-age report from existing fields, distinguishing overlapping local durations, wall-clock observations and venue trade timestamps. Add only missing measurements. Examine a small offline-verified latency optimization only if exact order/account/quantity/priority/freshness proof survives; a Robinhood event stream is unverified and no migration is authorized. Test opening and paired closing, adverse races and margin boundaries, then run one final clean isolated Python 3.11 full suite with pinned SDK after source edits. Self-review the full diff; preserve owner-only versioned evidence outside Git and return a clean committed READY_FOR_REVIEW or an honest partial packet to the auditor task. No new numeric reserve default is accepted by the owner in this assignment.
+
+## Historical HCR-41 release — completed
 
 ## Final release handoff — owner authorization
 
