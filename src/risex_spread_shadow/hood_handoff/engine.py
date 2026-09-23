@@ -2085,7 +2085,26 @@ class HandoffEngine:
                 remaining = deadline - self.clock.now()
                 if remaining <= 0:
                     break
-                await self._sleep(min(self._poll_interval, remaining))
+                delay = min(self._poll_interval, remaining)
+                wake = getattr(self.client, "wait_terminal_hint", None) if require_terminal else None
+                if callable(wake):
+                    # A private stream event only wakes the next exact REST
+                    # lookup. It never supplies terminal/admission proof.
+                    wait_started = time.monotonic()
+                    try:
+                        hinted = await asyncio.wait_for(
+                            wake(plan.account_index, plan.client_order_index, order_id, delay),
+                            timeout=delay,
+                        )
+                    except Exception:
+                        hinted = False
+                    if hinted is True:
+                        continue
+                    unslept = delay - (time.monotonic() - wait_started)
+                    if unslept > 0:
+                        await self._sleep(unslept)
+                else:
+                    await self._sleep(delay)
         return None
 
     async def _lookup_order(

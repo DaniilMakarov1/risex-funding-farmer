@@ -339,6 +339,7 @@ async def collect_once(identity: StreamIdentity, output: Path, provider: Keychai
                     if channel.startswith("account_all_orders/"):
                         value["auth"] = tokens[int(channel.rsplit("/", 1)[1])]
                     await socket.send(json.dumps(value, separators=(",", ":")))
+                    value.clear()
                 tokens.clear()
                 while observer.stopped_reason is None:
                     remaining = stop_at - time.monotonic()

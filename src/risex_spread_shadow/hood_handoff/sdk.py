@@ -552,6 +552,10 @@ class LighterSdkClient:
         self._nonce_reservations: dict[tuple[int, int, int], PreparedMutation | ReservedNonce] = {}
         self._blocked_nonces: dict[tuple[int, int], set[int]] = {}
         self._prepared_registry: dict[int, PreparedMutation] = {}
+        self._read_stream_state: Any | None = None
+        self._read_stream_task: asyncio.Task[str] | None = None
+        self._read_stream_stop: asyncio.Event | None = None
+        self._read_stream_started = False
         self._closed = False
         self.sdk_version = REQUIRED_LIGHTER_SDK_VERSION
         self._http = (http_factory or PlainAioHttp)(config.api_base_url, timeout_seconds=config.request_timeout_seconds)
@@ -566,6 +570,79 @@ class LighterSdkClient:
         if value != value or value in {float("inf"), float("-inf")} or value <= 0:
             raise ContractError("mutation deadline must be finite and positive")
         self._pending_mutation_deadline = value
+
+    async def start_read_stream(self, *, ready_timeout: float = 5.0) -> bool:
+        """Warm one read-only stream; keep REST as every execution proof gate."""
+        if self._closed or self._read_stream_started:
+            return False
+        self._read_stream_started = True
+        from .stream_measurement import StreamIdentity
+        from .stream_state import ReadStreamSession, ReadStreamState
+
+        try:
+            identity = StreamIdentity.from_config({
+                "market_id": self.config.market_id,
+                "market_symbol": self.config.market_symbol,
+                "source_account_index": self.source_account_index,
+                "receiver_account_index": self.receiver_account_index,
+                "api_key_index": self.config.api_key_index,
+                "environment": self.config.environment,
+                "api_base_url": self.config.api_base_url,
+                "chain_id": self.config.chain_id,
+            })
+            if (isinstance(ready_timeout, bool) or not isinstance(ready_timeout, (int, float))
+                    or not math.isfinite(ready_timeout) or not 0 < ready_timeout <= 5):
+                return False
+            state = ReadStreamState(identity)
+            stop = asyncio.Event()
+            task = asyncio.create_task(ReadStreamSession(state).run(self.secrets, stop))
+            self._read_stream_state = state
+            self._read_stream_stop = stop
+            self._read_stream_task = task
+            ready = asyncio.create_task(state.wait_subscription_ready(ready_timeout))
+            try:
+                done, _ = await asyncio.wait((ready, task), return_when=asyncio.FIRST_COMPLETED)
+                if ready in done and ready.result() is True and not task.done():
+                    return True
+            finally:
+                if not ready.done():
+                    ready.cancel()
+                    await asyncio.gather(ready, return_exceptions=True)
+            await self.stop_read_stream()
+            return False
+        except asyncio.CancelledError:
+            await self.stop_read_stream()
+            raise
+        except Exception:
+            await self.stop_read_stream()
+            return False
+
+    async def stop_read_stream(self) -> None:
+        stop, task = self._read_stream_stop, self._read_stream_task
+        self._read_stream_stop = None
+        self._read_stream_task = None
+        if stop is not None:
+            stop.set()
+        try:
+            if task is not None:
+                try:
+                    await asyncio.wait_for(task, timeout=5)
+                except asyncio.CancelledError:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                    raise
+                except Exception:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+        finally:
+            self._read_stream_state = None
+
+    async def wait_terminal_hint(self, account: int, client: int,
+                                 order_id: str | None, timeout: float) -> bool:
+        state = self._read_stream_state
+        if state is None or not state.connected:
+            return False
+        return await state.wait_terminal_hint(account, client, order_id, timeout)
 
     @staticmethod
     def verify_sdk() -> None:
@@ -1178,6 +1255,7 @@ class LighterSdkClient:
         if self._closed:
             return
         self._closed = True
+        await self.stop_read_stream()
         seen: set[int] = set()
         self._tokens.clear()
 

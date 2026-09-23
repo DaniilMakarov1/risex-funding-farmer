@@ -10,6 +10,8 @@ HCR-42 is accepted and the owner selected an exact opening reserve of 0.10/0.02 
 
 HCR-44 on its isolated branch adds a finite read-only Robinhood stream measurement command. It reads the protected operator configuration and existing Keychain records, then subscribes to configured BTC book and both configured account order channels for one bounded session. It saves only structured projections in an existing owner-only directory, without raw private frames or credentials. This command has no order, cancellation or controller path. The earlier 64 KiB per-frame limit caused a locally sent close code 1009; the larger chief-v4/v5 sessions received book snapshots and continuous updates, and chief-v5 recognized initial private-order snapshots for both accounts. Neither a live own-order event nor trading admission is established. The following command form requires an unused gate and a new owner-only output path; it is not a trading command:
 
+The branch also contains an optional in-memory read stream for one bounded cycle. Its book and private subscription state expires or clears on gaps and disconnection. An exact terminal event can only trigger an earlier REST lookup; REST remains the source of execution proof. This socket is not enabled by terminal or Telegram, and has not been connected live.
+
 ```bash
 python -m risex_spread_shadow.hood_handoff.stream_measurement \
   --config "/Users/daniilmakarov/Desktop/RISEx Spread Shadow/spread-shadow-runs/hood-cycle-race-latency-20260920/operator-v1/random-cycle.json" \
