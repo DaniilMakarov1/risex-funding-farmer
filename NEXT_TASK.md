@@ -8,6 +8,8 @@ The numeric opening budget is captured before leverage setting, but the current 
 
 No real or protected account reads, orders/cancellations, leverage writes, `/run`, `/close`, runtime activation/restart, main merge/push or new policy choice is authorized. Historical journals and predecessor packets remain immutable.
 
+Correction implementation was tested at source commit `c7f03c9b13dc2c38c91651047b45f92e637b9d07`: focused adverse checks passed 12 tests and the final clean isolated Python 3.11.5 / lighter-sdk 1.1.2 full suite passed 5148 tests, 3 skipped. The branch is READY_FOR_REVIEW, subject to the auditor's independent re-review; neither this status nor passing tests authorize activation or a numeric reserve policy.
+
 ## Historical HCR-42 v1 assignment — returned for correction
 
 ## Current finite assignment — owner authorization
