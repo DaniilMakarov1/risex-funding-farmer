@@ -1,4 +1,4 @@
-# HCR-41 — Audited execution corrections; return for independent review
+# HCR-41 — Released for owner-operated validation
 
 ## Final release handoff — owner authorization
 
@@ -8,13 +8,17 @@ Before runtime changes verify actual local and remote main, branch cleanliness a
 
 No real orders, cancellations, leverage-setting writes, `/run` or `/close` are authorized for Chief in this handoff. The owner will run live controls after release. No new reserve, numeric policy, strategy adjustment or research campaign.
 
-## V7 return for correction — D4 preparation cancellation only
+## Release result and remaining authority
+
+The accepted code was fast-forwarded into local main and published to remote main at `97692e16c54f544dde8436d86570cad97823b2a8`; the remote HEAD was read back at that exact commit. The idle old controller PID 9717 was stopped only after confirming no active state, trading child or operator-lock holder. The replacement PID 66692 runs the main checkout with Python 3.11.5 and lighter-sdk 1.1.2; source imports match the accepted tested code. Its instance lock is held, operator lock is free and saved active operation is absent. The owner-only release packet is `/Users/daniilmakarov/Desktop/RISEx Spread Shadow/spread-shadow-runs/hood-hcr41-release-20260923/chief-v1/`. No trading command was sent. Further live validation is owner-operated and requires a separate concrete decision; the exact final documentation HEAD and publication verification belong in the release packet.
+
+## Historical V7 correction assignment — completed
 
 The auditor returned v6 commit `edc651f5d0a1698223feeb6153875d94ba7c19d3` for one new, reproduced defect. Preserve that branch, commit, clean-suite output and packet unchanged. Current Chief branch `codex/spread-v1-hcr41-preparation-cancel-v7` in `/Users/daniilmakarov/.codex/worktrees/risex-hcr41-preparation-cancel-v7` starts from assignment seed `e70cff08438b00570ec0f175716cf52b144f4a8f`; port the reviewed v6 implementation explicitly, then correct only D4 and its direct tests/docs. Auditor task `01a0c9cd-c8bc-75b0-92b3-04b75270a65e` remains sole acceptance/integration owner. Chief works alone.
 
 D4: an outer `asyncio.wait_for` can cancel `sdk.update_leverage_fraction` during nonce/signing/lock preparation. `CancelledError` bypasses its `except Exception`, leaving only an unresolved intent although transport was never entered. Auditor's actual-adapter synthetic probe is `hood-hcr41-corrections-20260923/auditor-v6/preparation_timeout_probe_v2.py`; v2 establishes nonce started, zero HTTP calls, UNKNOWN and next-run block. V1's cold import did not establish the same race. Add causal pre-transport cancellation/timeout classification with a durable NOT_SENT event and preserve cancellation semantics. Once transport may have begun, cancellation/timeout remains UNKNOWN and is never replayed. Do not treat every `CancelledError` as safe. Verify outer deadline in nonce/signing/lock, explicit cancellation before/after transport, one send only and next-run admission. Run relevant adverse/integration checks and one final clean isolated Python 3.11 full suite with pinned SDK. Save a separate owner-only chief-v7 packet and return for independent review. No new numeric policies, real financial action, activation, merge/push or subagents.
 
-## Authority and ownership
+## Historical authority and ownership — superseded by final release handoff
 
 Owner request on 2026-09-23: give Chief a detailed implementation assignment covering the independent review and require Chief to return the result to the owner auditor for checking. This is a new finite assignment in the existing Chief task, superseding HCR-40's completed ownership arrangement. Preserve the session's model/effort settings. Chief works alone: no builders, subagents or further delegation.
 
