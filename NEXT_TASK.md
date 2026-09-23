@@ -4,7 +4,7 @@
 
 Owner request dated 2026-09-23: hand off to a fresh Chief session using **GPT-6 Sol / Medium**. Work alone, without builders/subagents. The new Chief independently diagnoses and chooses the smallest coherent implementation; predecessor suggestions are hypotheses, not a prescribed patch plan. The Chief is the single implementation/integration owner after dispatch. Predecessor repository writes stop before the new session starts. Use an isolated worktree with a named branch such as `codex/spread-v1-hcr40-margin-recovery`; do not overwrite an occupied branch or another writer's changes.
 
-Accepted main before this documentation handoff: `ddde6d09c9a66eedbd71f24825f3a91b74e079ca`; tested/deployed HCR-39 code: `dd03c9144ec217bb8103133b29d76eec50835cc0`. This handoff changes no runtime code. Read AGENTS, SYSTEM_SPEC, STATUS and README; the older current-behavior specification is not yet an implementation of the newly authorized requirements below.
+Accepted main before this documentation handoff: `ddde6d09c9a66eedbd71f24825f3a91b74e079ca`; tested/deployed HCR-39 code: `dd03c9144ec217bb8103133b29d76eec50835cc0`. The handoff commit changed no runtime code; HCR-40 was subsequently implemented and accepted as recorded in STATUS and SYSTEM_SPEC.
 
 ## Objective and explicit owner changes
 
@@ -47,4 +47,4 @@ Preserve exact quantities, both-account identity, causal inventory, no-replay/un
 
 Arithmetic/positions/execution changes require adverse regressions, relevant integration checks and a final clean isolated Python 3.11 full suite. Verify examples with independently calculated quantities/margins; include unequal balances/settings, fractional/boundary leverage, venue rejection/unknown setting results, insufficient margin with reduce-only positions, existing-position startup and failed /close admission. Update the five governing files concisely to match final behavior. Review the full actual diff, production imports, evidence provenance and original hashes. Publish/deploy only verified work; owner live validation remains separate.
 
-Status: READY_FOR_NEW_CHIEF. First action: recover this bounded assignment and independently inspect the fresh journals/runtime before choosing corrections.
+Status: DONE. HCR-40 implementation `ca10b80d7811e49d842a884099169faef451c805` passed the clean Python 3.11 full suite and was integrated/published. Live trading validation remains NOT_RUN under the tool restriction. This NEXT_TASK grants no further campaign, strategy tuning or agent-initiated real transaction; a new finite owner decision is required for new work.
